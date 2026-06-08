@@ -11979,9 +11979,13 @@ function getPlatformLogoClass(platform) {
   if (platform === "unknown") {
     return "platform-logo-unknown";
   }
-  return platform === "xiaohongshu"
-    ? "platform-logo-xiaohongshu"
-    : "platform-logo-douyin";
+  if (platform === "xiaohongshu") {
+    return "platform-logo-xiaohongshu";
+  }
+  if (platform === "weibo") {
+    return "platform-logo-weibo";
+  }
+  return "platform-logo-douyin";
 }
 
 function getPlatformLogoInnerMarkup(platform) {
@@ -11990,6 +11994,9 @@ function getPlatformLogoInnerMarkup(platform) {
   }
   if (platform === "xiaohongshu") {
     return '<span class="platform-logo-xiaohongshu-inner">小红书</span>';
+  }
+  if (platform === "weibo") {
+    return '<span class="platform-logo-weibo-inner">W</span>';
   }
   return '<span class="platform-logo-douyin-inner">♪</span>';
 }
