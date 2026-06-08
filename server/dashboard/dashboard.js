@@ -7,7 +7,7 @@ let recordsPage = 1;
 let cachedRecords = [];
 
 const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
-const PLATFORM_LABEL = { xiaohongshu: '小红书', douyin: '抖音', unknown: '未知' };
+const PLATFORM_LABEL = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', unknown: '未知' };
 const CATEGORY_LABEL = {
   safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费',
   privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量',

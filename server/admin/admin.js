@@ -263,7 +263,7 @@ async function unfreezeCode(id) {
 
 var cachedRecords = [];
 
-const PLATFORM_LABEL = { xiaohongshu: '小红书', douyin: '抖音', unknown: '未知' };
+const PLATFORM_LABEL = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', unknown: '未知' };
 const NOTE_TYPE_LABEL = { video: '视频', normal: '图文' };
 const ACCOUNT_TYPE_LABEL = { enterprise: '企业号', personal: '个人号', professional: '专业号', '': '' };
 

@@ -269,6 +269,87 @@ export const PLATFORM_REGISTRY = Object.freeze({
       }),
     }),
   }),
+  weibo: Object.freeze({
+    id: "weibo",
+    label: "微博",
+    icon: "weibo",
+    matchers: {
+      hosts: Object.freeze(["weibo.com", "s.weibo.com"]),
+    },
+    pageTypes: Object.freeze([
+      PAGE_TYPE.NOTE_DETAIL,
+      PAGE_TYPE.BLOGGER_PROFILE,
+      PAGE_TYPE.SEARCH_RESULTS,
+    ]),
+    pageTypeRouting: Object.freeze({
+      [PAGE_TYPE.NOTE_DETAIL]: "noteTab",
+      [PAGE_TYPE.BLOGGER_PROFILE]: "bloggerTab",
+      [PAGE_TYPE.SEARCH_RESULTS]: "searchTab",
+    }),
+    tabs: Object.freeze([
+      Object.freeze({
+        id: "noteTab",
+        label: "微博页",
+        recordTypes: Object.freeze(["single_note"]),
+        disabled: true,
+        disabledReason: "微博详情页采集开发中",
+        pageTypes: Object.freeze([PAGE_TYPE.NOTE_DETAIL]),
+      }),
+      Object.freeze({
+        id: "bloggerTab",
+        label: "用户页",
+        recordTypes: Object.freeze(["blogger_profile"]),
+        disabled: true,
+        disabledReason: "微博用户页采集开发中",
+        pageTypes: Object.freeze([PAGE_TYPE.BLOGGER_PROFILE]),
+      }),
+      Object.freeze({
+        id: "searchTab",
+        label: "搜索页",
+        recordTypes: Object.freeze(["keyword_notes"]),
+        disabled: false,
+        disabledReason: "",
+        pageTypes: Object.freeze([PAGE_TYPE.SEARCH_RESULTS]),
+      }),
+    ]),
+    capabilities: Object.freeze({
+      captureNote: false,
+      captureComments: false,
+      captureBlogger: false,
+      captureSearch: true,
+      batchDetailCapture: false,
+      bloggerMetrics: false,
+    }),
+    ui: Object.freeze({
+      copy: Object.freeze({
+        label: "微博",
+        notePageLabel: "微博详情页",
+        bloggerPageLabel: "用户主页",
+        searchPageLabel: "搜索页",
+        noteReadyText: "已就绪：当前是微博详情页（开发中）",
+        noteWrongText: "请前往微博详情页以开始采集",
+        bloggerReadyText: "已就绪：当前是微博用户主页（开发中）",
+        bloggerWrongText: "请前往微博用户主页以开始采集",
+        searchReadyText: "已就绪：当前是微博搜索页，可采集搜索结果",
+        searchWrongText: "请前往微博搜索页（s.weibo.com）以开始采集",
+        captureNoteButtonText: "采集微博数据",
+        captureBloggerButtonText: "采集用户信息",
+        captureSearchButtonText: "采集搜索结果",
+      }),
+      metricDefinitions: Object.freeze({
+        singleNote: Object.freeze([
+          {key: "reposts", label: "转发"},
+          {key: "comments", label: "评论"},
+          {key: "likes", label: "点赞"},
+        ]),
+      }),
+      emptyStates: Object.freeze({}),
+    }),
+    sync: Object.freeze({
+      strategy: "shared",
+      workflowMap: Object.freeze({}),
+    }),
+  }),
 });
 
 function cloneTab(tab) {

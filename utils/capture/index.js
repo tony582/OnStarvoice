@@ -5,12 +5,14 @@
 
 import { xiaohongshuAdapter } from './adapters/xiaohongshu/index.js';
 import { douyinAdapter } from './adapters/douyin/index.js';
+import { weiboAdapter } from './adapters/weibo/index.js';
 import { PAGE_TYPE, SYNC_TYPE } from '../constants.js';
 import { detectPageType, detectPlatformFromUrl } from '../platform/page-routing.js';
 
 const ADAPTERS = {
   xiaohongshu: xiaohongshuAdapter,
   douyin: douyinAdapter,
+  weibo: weiboAdapter,
 };
 
 function getCurrentAdapter() {

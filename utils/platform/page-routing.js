@@ -29,6 +29,7 @@ function getPlatformHostsMap() {
   return {
     xiaohongshu: getPlatformConfig("xiaohongshu").matchers?.hosts || [],
     douyin: getPlatformConfig("douyin").matchers?.hosts || [],
+    weibo: getPlatformConfig("weibo").matchers?.hosts || [],
   };
 }
 
@@ -144,6 +145,43 @@ function detectDouyinPageType(parsedUrl, rawUrl) {
   return PAGE_TYPE.UNSUPPORTED;
 }
 
+function detectWeiboPageType(parsedUrl) {
+  if (!parsedUrl) {
+    return PAGE_TYPE.UNSUPPORTED;
+  }
+
+  const hostname = String(parsedUrl.hostname || "").toLowerCase();
+  const pathname = String(parsedUrl.pathname || "").toLowerCase();
+  const searchParams = parsedUrl.searchParams;
+
+  // s.weibo.com search page
+  if (hostname === "s.weibo.com") {
+    return PAGE_TYPE.SEARCH_RESULTS;
+  }
+
+  // weibo.com/search or search with q param
+  if (pathname.includes("/search") || searchParams.get("q")) {
+    return PAGE_TYPE.SEARCH_RESULTS;
+  }
+
+  // User profile: /u/1234567 or /username
+  if (/^\/u\/\d+\/?$/i.test(pathname)) {
+    return PAGE_TYPE.BLOGGER_PROFILE;
+  }
+
+  // Weibo detail: /username/postId (numeric path segment)
+  if (/^\/[a-z0-9]+\/[a-z0-9]+\/?$/i.test(pathname) && !pathname.includes("/search")) {
+    return PAGE_TYPE.NOTE_DETAIL;
+  }
+
+  // Short URL detail: /detail/4xxxxx
+  if (/^\/detail\/\d+\/?$/i.test(pathname)) {
+    return PAGE_TYPE.NOTE_DETAIL;
+  }
+
+  return PAGE_TYPE.UNSUPPORTED;
+}
+
 export function detectPlatformFromUrl(url) {
   const parsedUrl = parseUrlSafely(String(url || "").trim());
   if (!parsedUrl) {
@@ -167,6 +205,8 @@ export function detectPageType(url, platform) {
       return detectXiaohongshuPageType(normalizedUrl, parsedUrl);
     case "douyin":
       return detectDouyinPageType(parsedUrl, normalizedUrl);
+    case "weibo":
+      return detectWeiboPageType(parsedUrl);
     default:
       return PAGE_TYPE.UNSUPPORTED;
   }
@@ -174,5 +214,5 @@ export function detectPageType(url, platform) {
 
 export function isSupportedCaptureUrl(url) {
   const platform = detectPlatformFromUrl(url);
-  return platform === "xiaohongshu" || platform === "douyin";
+  return platform === "xiaohongshu" || platform === "douyin" || platform === "weibo";
 }
