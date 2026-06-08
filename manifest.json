@@ -1,0 +1,74 @@
+{
+  "manifest_version": 3,
+  "name": "OnStarVoice 舆情虾｜小红书/抖音AI舆情巡检工具",
+  "version": "0.1.0",
+  "description": "小红书/抖音舆情巡检与AI分析工具：支持笔记/视频数据采集、无水印素材下载、视频逐字稿文案提取、批量拆解改写仿写、竞品账号监控、评论与客资采集、主词机会判断、长尾扩词分析、AI选题洞察，支持Excel/CSV导出与飞书同步。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "*://www.xiaohongshu.com/*",
+    "*://www.douyin.com/*",
+    "*://v.douyin.com/*",
+    "https://api.onstarvoice.local/*"
+  ],
+  "action": {
+    "default_icon": {
+      "16": "images/icon16.png",
+      "48": "images/icon48.png",
+      "128": "images/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "images/icon16.png",
+    "48": "images/icon48.png",
+    "128": "images/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.douyin.com/*",
+        "*://v.douyin.com/*"
+      ],
+      "js": [
+        "utils/capture/douyin-interceptor.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://www.xiaohongshu.com/*",
+        "*://www.douyin.com/*",
+        "*://v.douyin.com/*"
+      ],
+      "js": [
+        "content-loader.js"
+      ]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content-v2.js",
+        "utils/*.js",
+        "utils/capture/*.js"
+      ],
+      "matches": [
+        "*://www.xiaohongshu.com/*",
+        "*://www.douyin.com/*",
+        "*://v.douyin.com/*"
+      ]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidebar/sidebar.html"
+  }
+}

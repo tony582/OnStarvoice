@@ -1,0 +1,2598 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0" />
+    <title>OnStarVoice：汽车品牌舆情巡检助手</title>
+    <link
+      rel="stylesheet"
+      href="sidebar.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <div class="header-top">
+          <div
+            class="platform-switcher"
+            id="platformSwitcher">
+            <button
+              type="button"
+              class="platform-trigger"
+              id="btnPlatformMenu"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              title="当前页面平台">
+              <span
+                class="platform-trigger-logo platform-logo platform-logo-douyin"
+                id="currentPlatformLogo"
+                aria-hidden="true">
+                <span class="platform-logo-douyin-inner">♪</span>
+              </span>
+              <span
+                class="platform-trigger-name"
+                id="currentPlatformName"
+                >抖音</span
+              >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="platform-trigger-caret">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+
+            <div
+              class="dropdown-menu platform-menu"
+              id="dropdownPlatformMenu"
+              role="menu"
+              aria-label="平台切换菜单">
+              <button
+                type="button"
+                class="dropdown-item platform-menu-item"
+                data-platform="douyin"
+                role="menuitem">
+                <span
+                  class="platform-logo platform-logo-douyin"
+                  aria-hidden="true">
+                  <span class="platform-logo-douyin-inner">♪</span>
+                </span>
+                <span class="platform-option-name">抖音</span>
+              </button>
+              <button
+                type="button"
+                class="dropdown-item platform-menu-item"
+                data-platform="xiaohongshu"
+                role="menuitem">
+                <span
+                  class="platform-logo platform-logo-xiaohongshu"
+                  aria-hidden="true">
+                  <span class="platform-logo-xiaohongshu-inner">小红书</span>
+                </span>
+                <span class="platform-option-name">小红书</span>
+              </button>
+            </div>
+          </div>
+          <div class="header-actions">
+            <button
+              class="icon-btn"
+              id="btnMoreMenu"
+              title="选项菜单">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="lucide lucide-user-cog">
+                <circle
+                  cx="18"
+                  cy="15"
+                  r="3" />
+                <circle
+                  cx="9"
+                  cy="7"
+                  r="4" />
+                <path d="M10 15H6a4 4 0 0 0-4 4v2" />
+                <path d="m21.7 16.4-.9-.3" />
+                <path d="m15.2 13.9-.9-.3" />
+                <path d="m16.6 18.7.3-.9" />
+                <path d="m19.1 12.2.3-.9" />
+                <path d="m19.6 18.7-.4-1" />
+                <path d="m16.8 12.3-.4-1" />
+                <path d="m14.3 16.6 1-.4" />
+                <path d="m20.7 13.8 1-.4" />
+              </svg>
+            </button>
+
+            <div
+              class="dropdown-menu"
+              id="dropdownMoreMenu">
+              <div
+                class="dropdown-item"
+                id="menuBtnSettings">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-settings">
+                  <path
+                    d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="3" />
+                </svg>
+                系统配置
+              </div>
+              <div
+                class="dropdown-item"
+                id="menuBtnHistory">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-history">
+                  <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                  <path d="M3 3v5h5" />
+                  <path d="M12 7v5l4 2" />
+                </svg>
+                执行明细
+              </div>
+              <a
+                href="#"
+                class="dropdown-item"
+                target="_blank"
+                rel="noopener noreferrer">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-book-open-text">
+                  <path d="M12 7v14" />
+                  <path d="M3 18h6a3 3 0 0 1 3 3V7a3 3 0 0 0-3-3H3z" />
+                  <path d="M21 18h-6a3 3 0 0 0-3 3V7a3 3 0 0 1 3-3h6z" />
+                  <path d="M7 10h2" />
+                  <path d="M15 10h2" />
+                </svg>
+                使用教程
+              </a>
+              <a
+                href="#"
+                class="dropdown-item"
+                target="_blank">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-circle-help">
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="10" />
+                  <path d="M9.09 9a3 3 0 0 1 5.82 1c0 2-3 3-3 3" />
+                  <path d="M12 17h.01" />
+                </svg>
+                常见问题
+              </a>
+              <a
+                href="https://onstarvoice.app/pricing"
+                class="dropdown-item"
+                target="_blank"
+                rel="noopener noreferrer">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-credit-card">
+                  <rect
+                    width="20"
+                    height="14"
+                    x="2"
+                    y="5"
+                    rx="2" />
+                  <path d="M2 10h20" />
+                </svg>
+                购买续费
+              </a>
+              <a
+                href="https://onstarvoice.app/referral"
+                class="dropdown-item"
+                target="_blank"
+                rel="noopener noreferrer">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-wallet-cards">
+                  <path
+                    d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h5" />
+                  <path d="M3 10h18" />
+                  <path d="M16 19h6" />
+                  <path d="M19 16v6" />
+                </svg>
+                邀请有礼
+              </a>
+              <div
+                class="dropdown-item"
+                id="menuBtnCheckUpdate">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-refresh-cw">
+                  <path d="M21 2v6h-6" />
+                  <path d="M3 12a9 9 0 0 1 15.3-6.3L21 8" />
+                  <path d="M3 22v-6h6" />
+                  <path d="M21 12a9 9 0 0 1-15.3 6.3L3 16" />
+                </svg>
+                检查更新
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div
+        class="tab-nav"
+        id="mainTabNav"></div>
+
+      <div
+        class="tab-content"
+        id="mainTabContent">
+        <section
+          class="unsupported-platform-cover"
+          id="unsupportedPlatformCover"
+          hidden>
+          <div class="unsupported-platform-brand">
+            <div class="unsupported-platform-brand-icon-wrap">
+              <img
+                src="../images/icon48.png"
+                alt="OnStarVoice"
+                class="unsupported-platform-brand-icon" />
+            </div>
+            <h2 class="unsupported-platform-brand-title">OnStarVoice</h2>
+            <p class="unsupported-platform-brand-subtitle">
+              前往以下支持平台的作品详情页、账号主页或搜索页，即可开始采集
+            </p>
+          </div>
+
+          <div
+            class="unsupported-platform-grid"
+            id="unsupportedPlatformGrid"></div>
+
+          <div class="unsupported-platform-footer-actions">
+            <a
+              href="#"
+              class="unsupported-platform-footer-btn"
+              target="_blank"
+              rel="noopener noreferrer">
+              使用教程
+            </a>
+            <a
+              href="#"
+              class="unsupported-platform-footer-btn"
+              target="_blank"
+              rel="noopener noreferrer">
+              常见问题
+            </a>
+            <button
+              type="button"
+              class="unsupported-platform-footer-btn is-warning"
+              id="btnOpenRiskModal">
+              风险提示
+            </button>
+          </div>
+        </section>
+
+        <div
+          id="noteTab"
+          class="tab-pane capture-tab-pane is-active">
+          <div class="panel action-panel">
+            <div
+              class="guidance-callout"
+              id="noteTabHint">
+              <div class="guidance-icon">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-info">
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="10" />
+                  <path d="M12 16v-4" />
+                  <path d="M12 8h.01" />
+                </svg>
+              </div>
+              <div class="guidance-content">
+                请前往 当前平台的笔记/作品详情页 以开始采集
+              </div>
+            </div>
+            <div class="action-group">
+              <label
+                class="switch-wrap"
+                id="captureBloggerMetricsSwitchWrap"
+                for="checkboxCaptureBloggerMetrics">
+                <input
+                  type="checkbox"
+                  id="checkboxCaptureBloggerMetrics"
+                  class="switch-input" />
+                <span
+                  class="switch-slider"
+                  aria-hidden="true"></span>
+                <span class="switch-label">附加采集博主粉丝数和赞藏数</span>
+              </label>
+              <label
+                class="switch-wrap"
+                for="checkboxCaptureComments">
+                <input
+                  type="checkbox"
+                  id="checkboxCaptureComments"
+                  class="switch-input" />
+                <span
+                  class="switch-slider"
+                  aria-hidden="true"></span>
+                <span class="switch-label">附加采集评论</span>
+              </label>
+              <div
+                class="form-group"
+                id="commentsMaxDetectedItemsGroup"
+                hidden>
+                <label class="form-label">评论加载上限</label>
+                <input
+                  type="number"
+                  min="1"
+                  class="form-input"
+                  id="inputCommentsMaxDetectedItems"
+                  placeholder="开启评论采集时必填" />
+              </div>
+              <div
+                class="form-group"
+                id="commentLeadsFilterGroup"
+                hidden>
+                <label
+                  class="form-checkbox-wrap"
+                  for="checkboxEnableCommentLeadsFilter">
+                  <input
+                    type="checkbox"
+                    id="checkboxEnableCommentLeadsFilter"
+                    class="form-checkbox-input" />
+                  <span class="form-checkbox-label">评论客资筛选</span>
+                </label>
+              </div>
+              <div class="action-row">
+                <button
+                  class="btn btn-primary btn-grow is-disabled"
+                  id="btnCaptureNote"
+                  disabled>
+                  采集笔记数据
+                </button>
+                <button
+                  class="btn btn-secondary btn-icon-only btn-batch-trigger"
+                  id="btnOpenBatchNote"
+                  title="批量采集作品">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round">
+                    <path d="m12 3 8 4-8 4-8-4 8-4z" />
+                    <path d="m4 11 8 4 8-4" />
+                    <path d="m4 15 8 4 8-4" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div
+          id="bloggerTab"
+          class="tab-pane capture-tab-pane">
+          <div class="panel action-panel">
+            <div
+              class="guidance-callout"
+              id="bloggerTabHint">
+              <div class="guidance-icon">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-info">
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="10" />
+                  <path d="M12 16v-4" />
+                  <path d="M12 8h.01" />
+                </svg>
+              </div>
+              <div class="guidance-content">
+                请前往 当前平台的博主主页 以开始采集
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">博主笔记加载上限</label>
+              <input
+                type="number"
+                min="1"
+                class="form-input"
+                id="inputBloggerMaxDetectedItems"
+                placeholder="默认 100" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">高于以下点赞数才会被采集</label>
+              <input
+                type="number"
+                min="0"
+                class="form-input"
+                id="inputBloggerMinLikes"
+                placeholder="例如 0" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">笔记内容主题筛选</label>
+              <p
+                class="form-hint"
+                id="bloggerKeywordFilterHint">
+                默认匹配标题，开启采集增强可同时匹配正文和标签
+              </p>
+              <input
+                type="text"
+                class="form-input"
+                id="inputBloggerKeywordFilter"
+                placeholder="多个主题词用逗号分隔" />
+            </div>
+            <div
+              class="detail-enhance-card"
+              data-auto-detail-panel>
+              <div class="detail-enhance-title">采集增强</div>
+              <p class="detail-enhance-desc">
+                基础采集只能获取列表页面可见内容，采集增强会自动逐条打开详情页回填正文、互动数据等信息。同时支持附加采集账号数据和评论内容、客资，精确筛选笔记内容主题。
+              </p>
+              <label class="switch-wrap">
+                <input
+                  type="checkbox"
+                  class="switch-input"
+                  data-detail-setting="auto" />
+                <span
+                  class="switch-slider"
+                  aria-hidden="true"></span>
+                <span class="switch-label">采集增强</span>
+              </label>
+              <div
+                class="detail-enhance-options"
+                data-detail-setting-group="options"
+                hidden>
+                <label class="switch-wrap">
+                  <input
+                    type="checkbox"
+                    class="switch-input"
+                    data-detail-setting="metrics" />
+                  <span
+                    class="switch-slider"
+                    aria-hidden="true"></span>
+                  <span class="switch-label">附加博主粉丝数和赞藏数</span>
+                </label>
+                <div class="detail-enhance-comment-block">
+                  <label class="switch-wrap">
+                    <input
+                      type="checkbox"
+                      class="switch-input"
+                      data-detail-setting="comments" />
+                    <span
+                      class="switch-slider"
+                      aria-hidden="true"></span>
+                    <span class="switch-label">附加评论</span>
+                  </label>
+                  <div
+                    class="detail-enhance-comment-settings"
+                    data-detail-setting-group="comments-options"
+                    hidden>
+                    <div
+                      class="form-group detail-enhance-inline-field"
+                      data-detail-setting-group="comments-max-group">
+                      <label class="form-label">评论加载上限</label>
+                      <input
+                        type="number"
+                        min="1"
+                        class="form-input"
+                        data-detail-setting="comments-max-detected-items"
+                        placeholder="开启补采评论时必填" />
+                    </div>
+                    <div
+                      class="form-group detail-enhance-inline-field"
+                      data-detail-setting-group="comments-leads-group">
+                      <label class="form-checkbox-wrap">
+                        <input
+                          type="checkbox"
+                          class="form-checkbox-input"
+                          data-detail-setting="comment-leads" />
+                        <span class="form-checkbox-label">评论客资筛选</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="action-row">
+              <button
+                class="btn btn-primary btn-grow is-disabled"
+                id="btnCaptureBlogger"
+                disabled>
+                采集博主信息&笔记
+              </button>
+              <button
+                class="btn btn-secondary btn-icon-only btn-batch-trigger"
+                id="btnOpenBatchBlogger"
+                title="批量采集博主">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round">
+                  <path d="m12 3 8 4-8 4-8-4 8-4z" />
+                  <path d="m4 11 8 4 8-4" />
+                  <path d="m4 15 8 4 8-4" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div
+          id="searchTab"
+          class="tab-pane capture-tab-pane">
+          <div class="panel action-panel">
+            <div
+              class="guidance-callout"
+              id="searchTabHint">
+              <div class="guidance-icon">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-info">
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="10" />
+                  <path d="M12 16v-4" />
+                  <path d="M12 8h.01" />
+                </svg>
+              </div>
+              <div class="guidance-content">
+                请前往 当前平台的搜索页 以开始采集
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">当前搜索关键词（自动读取）</label>
+              <div class="keyword-strategy-entry-row">
+                <div
+                  class="form-readonly keyword-strategy-current-keyword"
+                  id="currentSearchKeywordText">
+                  未检测到关键词
+                </div>
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-icon-only keyword-strategy-entry-btn"
+                  id="btnToggleKeywordStrategy"
+                  title="关键词策略">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="lucide lucide-wand-2">
+                    <path
+                      d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z" />
+                    <path d="m14 7 3 3" />
+                    <path d="M5 6v4" />
+                    <path d="M19 14v4" />
+                    <path d="M10 2v2" />
+                    <path d="M7 8H3" />
+                    <path d="M21 16h-4" />
+                    <path d="M11 3H9" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- ========== 采集设置（不折叠） ========== -->
+            <div
+              class="search-settings-body"
+              id="searchSettingsBody">
+              <div class="form-group">
+                <label class="form-label">关键词笔记加载上限</label>
+                <input
+                  type="number"
+                  min="1"
+                  class="form-input"
+                  id="inputKeywordMaxDetectedItems"
+                  placeholder="默认 100" />
+              </div>
+              <div class="form-group">
+                <label
+                  class="form-label"
+                  id="labelKeywordMinThreshold">
+                  高于以下点赞数才会被采集
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  class="form-input"
+                  id="inputKeywordMinLikes"
+                  placeholder="例如 0" />
+              </div>
+              <div
+                class="detail-enhance-card"
+                data-auto-detail-panel>
+                <div class="detail-enhance-title">采集增强</div>
+                <p class="detail-enhance-desc">
+                  列表采集只能获取页面可见内容，采集增强会自动逐条打开笔记详情页回填正文、互动数据、图文视频链接等详情。同时支持补采账号数据和评论内容、客资等
+                </p>
+                <label class="switch-wrap">
+                  <input
+                    type="checkbox"
+                    class="switch-input"
+                    data-detail-setting="auto" />
+                  <span
+                    class="switch-slider"
+                    aria-hidden="true"></span>
+                  <span class="switch-label">采集增强</span>
+                </label>
+                <div
+                  class="detail-enhance-options"
+                  data-detail-setting-group="options"
+                  hidden>
+                  <label class="switch-wrap">
+                    <input
+                      type="checkbox"
+                      class="switch-input"
+                      data-detail-setting="metrics" />
+                    <span
+                      class="switch-slider"
+                      aria-hidden="true"></span>
+                    <span class="switch-label">附件博主粉丝数和赞藏数</span>
+                  </label>
+                  <div
+                    class="detail-enhance-comment-settings"
+                    data-detail-setting-group="metrics-options"
+                    hidden>
+                    <div
+                      class="form-group detail-enhance-inline-field"
+                      data-detail-setting-group="low-follower-hit-group">
+                      <label class="form-checkbox-wrap">
+                        <input
+                          type="checkbox"
+                          class="form-checkbox-input"
+                          data-detail-setting="low-follower-hit" />
+                        <span class="form-checkbox-label">低粉爆款筛选</span>
+                      </label>
+                    </div>
+                    <div
+                      class="form-group detail-enhance-inline-field"
+                      data-detail-setting-group="low-follower-hit-threshold-group"
+                      style="margin-top: -4px;"
+                      hidden>
+                      <label class="form-label">粉丝数少于该值才采集</label>
+                      <input
+                        type="number"
+                        min="0"
+                        class="form-input"
+                        data-detail-setting="low-follower-hit-threshold"
+                        placeholder="粉丝数少于该值才纳入缓存，例如 10000" />
+                    </div>
+                  </div>
+                  <div class="detail-enhance-comment-block">
+                    <label class="switch-wrap">
+                      <input
+                        type="checkbox"
+                        class="switch-input"
+                        data-detail-setting="comments" />
+                      <span
+                        class="switch-slider"
+                        aria-hidden="true"></span>
+                      <span class="switch-label">附加评论</span>
+                    </label>
+                    <div
+                      class="detail-enhance-comment-settings"
+                      data-detail-setting-group="comments-options"
+                      hidden>
+                      <div
+                        class="form-group detail-enhance-inline-field"
+                        data-detail-setting-group="comments-max-group">
+                        <label class="form-label">评论加载上限</label>
+                        <input
+                          type="number"
+                          min="1"
+                          class="form-input"
+                          data-detail-setting="comments-max-detected-items"
+                          placeholder="开启补采评论时必填" />
+                      </div>
+                      <div
+                        class="form-group detail-enhance-inline-field"
+                        data-detail-setting-group="comments-leads-group">
+                        <label class="form-checkbox-wrap">
+                          <input
+                            type="checkbox"
+                            class="form-checkbox-input"
+                            data-detail-setting="comment-leads" />
+                          <span class="form-checkbox-label">评论客资筛选</span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ========== 搜索采集卡片 (单采集 + 批量入口) ========== -->
+            <div class="action-row">
+              <button
+                class="btn btn-primary btn-grow is-disabled"
+                id="btnCaptureSearch"
+                disabled>
+                采集当前搜索结果
+              </button>
+              <button
+                class="btn btn-secondary btn-icon-only btn-batch-trigger"
+                id="btnOpenBatchSearch"
+                title="批量关键词笔记采集">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round">
+                  <path d="m12 3 8 4-8 4-8-4 8-4z" />
+                  <path d="m4 11 8 4 8-4" />
+                  <path d="m4 15 8 4 8-4" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div
+          id="monitorTab"
+          class="tab-pane capture-tab-pane">
+          <div class="panel monitor-panel">
+            <div class="monitor-action-card">
+              <div
+                class="guidance-callout monitor-guidance-callout"
+                id="monitorTabHint">
+                <div class="guidance-icon">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="lucide lucide-info">
+                    <circle
+                      cx="12"
+                      cy="12"
+                      r="10" />
+                    <path d="M12 16v-4" />
+                    <path d="M12 8h.01" />
+                  </svg>
+                </div>
+                <div class="guidance-content">
+                  请前往抖音或小红书账号主页后，将当前账号纳入监控。
+                </div>
+              </div>
+
+              <div class="monitor-action-row">
+                <button
+                  class="btn btn-primary btn-full is-disabled"
+                  id="btnMonitorAddCurrent"
+                  type="button"
+                  disabled>
+                  纳入监控
+                </button>
+                <button
+                  class="btn btn-secondary btn-full is-disabled"
+                  id="btnMonitorRunNow"
+                  type="button"
+                  disabled>
+                  立即执行扫描
+                </button>
+              </div>
+            </div>
+
+            <div
+              class="monitor-credit-tip"
+              id="monitorCreditTip">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round">
+                <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+                <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+              </svg>
+              <span
+                >小红书每个账号每次扫描，消耗的积分是抖音的5倍。如果对标账号同时有抖音号，建议优先监控抖音账号更划算。</span
+              >
+            </div>
+
+            <div class="monitor-section">
+              <div class="monitor-section-header">
+                <div class="monitor-section-title-wrap">
+                  <div class="monitor-section-title">监控列表</div>
+                  <div
+                    class="monitor-section-meta"
+                    id="monitorStatsText">
+                    共 0 项
+                  </div>
+                </div>
+              </div>
+              <div
+                class="empty-state monitor-empty-state"
+                id="monitorSubscriptionEmpty">
+                <p>还没有监控项。可在上方或博主信息卡中将账号纳入监控。</p>
+              </div>
+              <div
+                class="monitor-list"
+                id="monitorSubscriptionList"
+                style="display: none"></div>
+            </div>
+          </div>
+        </div>
+
+        <div
+          class="panel data-pool-main"
+          id="mainPoolPanel">
+          <div class="pool-actions">
+            <div
+              style="font-size: 12px; color: var(--text-secondary); line-height: 32px;"
+              id="poolStatsText">
+              共 0 条数据
+            </div>
+            <div style="flex-grow: 1;"></div>
+            <div
+              style="display: flex; gap: var(--spacing-sm); align-items: center;">
+              <button
+                class="action-icon-btn"
+                id="btnClearPool"
+                title="清空记录">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-eraser">
+                  <path
+                    d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                  <path d="M22 21H7" />
+                  <path d="m5 11 9 9" />
+                </svg>
+              </button>
+              <button
+                class="action-icon-btn"
+                id="btnExport"
+                title="导出 CSV">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-file-spreadsheet">
+                  <path
+                    d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+                  <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+                  <path d="M8 13h2" />
+                  <path d="M14 13h2" />
+                  <path d="M8 17h2" />
+                  <path d="M14 17h2" />
+                </svg>
+              </button>
+
+              <button
+                class="btn btn-primary"
+                id="btnSyncAll"
+                style="padding: 4px 12px; font-size: 12px;">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-cloud-upload">
+                  <path
+                    d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+                  <path d="M12 12v9" />
+                  <path d="m16 16-4-4-4 4" />
+                </svg>
+                同步飞书
+              </button>
+            </div>
+          </div>
+
+          <div
+            id="uiDataPoolEmpty"
+            class="empty-state">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <path
+                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line
+                x1="16"
+                y1="13"
+                x2="8"
+                y2="13"></line>
+              <line
+                x1="16"
+                y1="17"
+                x2="8"
+                y2="17"></line>
+              <polyline points="10 9 9 9 8 9"></polyline>
+            </svg>
+            <p>暂无采集数据<br />去支持的平台页面抓取一些吧</p>
+          </div>
+
+          <div
+            id="recordList"
+            style="display: none;"></div>
+        </div>
+
+        <div
+          id="historyTab"
+          class="tab-pane">
+          <div class="panel sync-history-panel">
+            <div
+              class="panel-header"
+              style="align-items: center;">
+              <span>执行明细</span>
+              <button
+                class="action-icon-btn"
+                id="btnClearSyncHistory"
+                title="清空本地同步记录"
+                style="border: none; background: transparent; color: var(--theme-primary); width: 24px; height: 24px; padding: 0;">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-eraser">
+                  <path
+                    d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                  <path d="M22 21H7" />
+                  <path d="m5 11 9 9" />
+                </svg>
+              </button>
+            </div>
+            <div class="pool-actions">
+              <div
+                style="display: flex; align-items: center; gap: var(--spacing-sm); width: 100%;">
+                <div
+                  style="font-size: 12px; color: var(--text-secondary); line-height: 32px; flex: 1;"
+                  id="syncHistoryStatsText">
+                  共 0 条执行记录
+                </div>
+                <div
+                  class="sync-history-filter"
+                  id="syncHistoryPlatformFilter">
+                  <button
+                    class="sync-history-filter-trigger"
+                    id="btnSyncHistoryPlatformFilter"
+                    type="button"
+                    aria-expanded="false">
+                    <span
+                      class="sync-history-filter-label"
+                      id="syncHistoryPlatformFilterLabel"
+                      >全部平台</span
+                    >
+                    <svg
+                      class="sync-history-filter-caret"
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="10"
+                      height="10"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round">
+                      <path d="m6 9 6 6 6-6" />
+                    </svg>
+                  </button>
+                  <div
+                    class="dropdown-menu sync-history-filter-menu"
+                    id="dropdownSyncHistoryPlatformFilter">
+                    <button
+                      class="dropdown-item sync-history-filter-item"
+                      type="button"
+                      data-platform-filter="all">
+                      <span class="sync-history-filter-item-label"
+                        >全部平台</span
+                      >
+                    </button>
+                    <button
+                      class="dropdown-item sync-history-filter-item"
+                      type="button"
+                      data-platform-filter="xiaohongshu">
+                      <span class="sync-history-filter-item-label">小红书</span>
+                    </button>
+                    <button
+                      class="dropdown-item sync-history-filter-item"
+                      type="button"
+                      data-platform-filter="douyin">
+                      <span class="sync-history-filter-item-label">抖音</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div
+              id="syncHistoryEmpty"
+              class="empty-state">
+              <p>暂无执行记录</p>
+            </div>
+            <div
+              id="syncHistoryList"
+              style="display: none;"></div>
+          </div>
+        </div>
+
+        <div
+          id="settingsTab"
+          class="tab-pane">
+          <div
+            class="accordion"
+            id="settingsAccordion">
+            <!-- 工具授权面板 -->
+            <div class="accordion-item is-active">
+              <div class="accordion-header">
+                <span
+                  style="font-weight: var(--font-weight-bold); font-size: var(--font-size-md);"
+                  >产品授权状态</span
+                >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-chevron-down accordion-icon">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
+              <div class="accordion-content">
+                <div
+                  class="auth-card"
+                  id="uiAuthCard">
+                  <div id="uiAuthInfoContent">
+                    <div class="auth-info-row">
+                      <span class="auth-info-label">状态</span>
+                      <span
+                        class="auth-info-value"
+                        id="authStatus"
+                        style="color: var(--status-warning);"
+                        >未验证</span
+                      >
+                    </div>
+                    <div class="auth-info-row">
+                      <span class="auth-info-label">所属账号</span>
+                      <span
+                        class="auth-info-value"
+                        id="uiAuthUserName"
+                        >-</span
+                      >
+                    </div>
+                    <div class="auth-info-row">
+                      <span class="auth-info-label">环境绑定数占用</span>
+                      <span
+                        class="auth-info-value"
+                        id="uiAuthBindings"
+                        >- / 2</span
+                      >
+                    </div>
+                    <div class="auth-info-row">
+                      <span class="auth-info-label auth-info-label-with-help">
+                        激活码积分
+                        <span class="auth-help-popover-wrap">
+                          <button
+                            type="button"
+                            class="auth-help-trigger"
+                            aria-label="查看积分消耗说明">
+                            ?
+                          </button>
+                          <span
+                            class="auth-help-popover"
+                            role="tooltip">
+                            <span class="auth-help-popover-title"
+                              >积分消耗项：</span
+                            >
+                            <span>抖音账号监控扫描：1 积分/次/账号</span>
+                            <span>小红书账号监控扫描：5 积分/次/账号</span>
+                            <span>主搜索词机会判断：3 积分/次</span>
+                            <span>搜索下拉词分析：3 积分/次</span>
+                          </span>
+                        </span>
+                      </span>
+                      <span
+                        class="auth-info-value"
+                        id="uiAuthCredits"
+                        >暂无</span
+                      >
+                    </div>
+                    <div class="auth-info-row">
+                      <span class="auth-info-label">到期时间</span>
+                      <span
+                        class="auth-info-value"
+                        id="uiAuthExpire"
+                        >-</span
+                      >
+                    </div>
+                  </div>
+                  <div
+                    class="form-group"
+                    style="margin-top: var(--spacing-md);">
+                    <label class="form-label">激活码</label>
+                    <div class="auth-code-entry-row">
+                      <div class="secure-input-wrap">
+                        <input
+                          type="password"
+                          class="form-input"
+                          id="inputCode"
+                          placeholder="ACT-XXXX-XXXX" />
+                        <button
+                          type="button"
+                          class="btn-code-visibility"
+                          id="btnCodeVisibility"
+                          aria-label="显示明文"
+                          title="显示明文">
+                          <svg
+                            viewBox="0 0 24 24"
+                            width="18"
+                            height="18"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round">
+                            <path
+                              d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path>
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r="3"></circle>
+                            <path d="M3 3l18 18"></path>
+                          </svg>
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        class="auth-member-tail"
+                        id="btnMemberGroupEntry"
+                        hidden>
+                        <span class="auth-member-tail-title">会员群</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    class="status-bar is-warning auth-claim-hint"
+                    id="uiAuthClaimHint"
+                    hidden>
+                    当前激活码未关联用户账号，认领激活码后，飞书配置和对标监控数据将绑定到您的专属账号，确保数据安全归属。👉<a
+                      class="claim-link"
+                      id="btnGoClaim"
+                      href="#"
+                      >去认领</a
+                    >
+                  </div>
+                  <button
+                    class="btn btn-primary btn-full"
+                    id="btnVerify">
+                    验证并绑定
+                  </button>
+                  <div
+                    class="status-bar"
+                    id="uiAuthFeedback"
+                    style="display: none;"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 飞书配置面板 -->
+            <div class="accordion-item">
+              <div class="accordion-header">
+                <span
+                  style="font-weight: var(--font-weight-bold); font-size: var(--font-size-md);"
+                  >飞书归档目标配置</span
+                >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-chevron-down accordion-icon">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
+              <div class="accordion-content">
+                <div
+                  class="status-bar is-warning auth-claim-hint"
+                  id="uiClaimConfigHint"
+                  style="margin-bottom: var(--spacing-md);"
+                  hidden>
+                  当前激活码未关联用户账号，认领激活码后，飞书配置和对标监控数据将绑定到您的专属账号，确保数据安全归属。👉<a
+                    class="claim-link"
+                    id="btnGoClaimConfig"
+                    href="#"
+                    >去认领</a
+                  >
+                </div>
+                <p
+                  style="font-size: var(--font-size-xs); color: var(--text-tertiary); margin-bottom: var(--spacing-md);">
+                  请填入用于沉淀您笔记和数据资产的飞书多维表格信息。<a
+                    href="#"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >获取模版</a
+                  >
+                </p>
+
+                <div class="form-group">
+                  <label class="form-label">飞书多维表格文档URL</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputFeishuAppToken"
+                    placeholder="https://my.feishu.cn/base/……注意是base" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">单笔记表名</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputTableId"
+                    placeholder="单笔记采集" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">关键词笔记表名</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputKeywordNotesTableName"
+                    placeholder="关键词笔记采集" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">博主信息表名</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputBloggerProfileTableName"
+                    placeholder="博主信息表" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">博主笔记表名</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputBloggerNotesTableName"
+                    placeholder="博主笔记采集" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">客资表</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputCommentLeadsTableName"
+                    placeholder="评论区客资采集" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">监控表名</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputMonitorTableName"
+                    placeholder="监控内容表" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label"
+                    >统一汇报 Webhook（飞书机器人）</label
+                  >
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputReportWebhookUrl"
+                    placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+                </div>
+                <div
+                  class="status-bar"
+                  id="uiConfigFeedback"
+                  style="display: none; margin-top: var(--spacing-xs);"></div>
+              </div>
+            </div>
+
+            <!-- 采集偏好面板 -->
+            <div class="accordion-item">
+              <div class="accordion-header">
+                <span
+                  style="font-weight: var(--font-weight-bold); font-size: var(--font-size-md);"
+                  >采集偏好配置</span
+                >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-chevron-down accordion-icon">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
+              <div class="accordion-content">
+                <p
+                  style="font-size: var(--font-size-xs); color: var(--text-tertiary); margin-bottom: var(--spacing-md);">
+                  共享层用于所有滚动采集/详情补采的场景（评论、博主、关键词搜索），
+                  业务层参数在各页面独立配置。
+                </p>
+                <div class="form-group">
+                  <label class="form-label">同步范围</label>
+                  <select
+                    class="form-input"
+                    id="inputSyncScope">
+                    <option value="pending">仅同步未同步数据（推荐）</option>
+                    <option value="all">同步缓存区全部数据</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">补采范围</label>
+                  <select
+                    class="form-input"
+                    id="inputDetailCaptureScope">
+                    <option value="pending">仅补采未补采详情（推荐）</option>
+                    <option value="all">补采缓存区全部笔记详情</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">随机等待时间（秒）最小值</label>
+                  <input
+                    type="number"
+                    min="1"
+                    class="form-input"
+                    id="inputSharedWaitMinSec"
+                    placeholder="默认 1" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">随机等待时间（秒）最大值</label>
+                  <input
+                    type="number"
+                    min="1"
+                    class="form-input"
+                    id="inputSharedWaitMaxSec"
+                    placeholder="默认 3" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">无新增超时（秒）</label>
+                  <input
+                    type="number"
+                    min="1"
+                    class="form-input"
+                    id="inputSharedStallTimeoutSec"
+                    placeholder="默认 3" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">最大采集时长（秒）</label>
+                  <input
+                    type="number"
+                    min="1"
+                    class="form-input"
+                    id="inputSharedMaxDurationSec"
+                    placeholder="默认 600" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">页面打开超时（秒）</label>
+                  <p class="form-hint">
+                    从点击跳转开始计时，最长等到页面打开成功；超时会判定本次补采失败。
+                  </p>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    class="form-input"
+                    id="inputDetailNavTimeoutMs"
+                    placeholder="默认 90" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">详情页打开后缓冲（秒）</label>
+                  <p class="form-hint">
+                    详情页已打开成功后，再额外等待一段时间，让正文与评论区渲染稳定。
+                  </p>
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    class="form-input"
+                    id="inputDetailAfterNavWaitMs"
+                    placeholder="默认 2" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">博主页打开后缓冲（秒）</label>
+                  <p class="form-hint">
+                    博主页已打开成功后，再额外等待一段时间，让粉丝数与赞藏数刷新完成。
+                  </p>
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    class="form-input"
+                    id="inputProfileAfterNavWaitMs"
+                    placeholder="默认 2" />
+                </div>
+              </div>
+            </div>
+
+            <!-- 客资筛选配置面板 -->
+            <div class="accordion-item">
+              <div class="accordion-header">
+                <span
+                  style="font-weight: var(--font-weight-bold); font-size: var(--font-size-md);"
+                  >评论区客资筛选配置</span
+                >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-chevron-down accordion-icon">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
+              <div class="accordion-content">
+                <div class="form-group">
+                  <label class="form-label">客资关键词（逗号分隔）</label>
+                  <p class="form-hint">命中任一关键词，则视为客资</p>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputCommentLeadsKeywords"
+                    placeholder="如：想买,怎么买,求链接,多少米" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">客资IP（逗号分隔）</label>
+                  <p class="form-hint">与关键词条件为"且"的关系。</p>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="inputCommentLeadsIps"
+                    placeholder="如：广东,北京" />
+                </div>
+              </div>
+            </div>
+
+            <div class="accordion-item">
+              <div class="accordion-header">
+                <span
+                  style="font-weight: var(--font-weight-bold); font-size: var(--font-size-md);"
+                  >账号监控规则</span
+                >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="lucide lucide-chevron-down accordion-icon">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
+              <div class="accordion-content">
+                <p
+                  style="font-size: var(--font-size-xs); color: var(--text-tertiary); margin-bottom: var(--spacing-md);">
+                  修改后立即作用到已纳入监控的账号。
+                </p>
+                <div class="form-group">
+                  <label class="form-label">执行时点</label>
+                  <p class="form-hint">
+                    每天整点扫描监控账号，实际执行最多延迟约 1 小时。
+                  </p>
+                  <select
+                    class="form-input"
+                    id="inputMonitorRunTimes">
+                    <option value="00:00">00:00</option>
+                    <option value="01:00">01:00</option>
+                    <option value="02:00">02:00</option>
+                    <option value="03:00">03:00</option>
+                    <option value="04:00">04:00</option>
+                    <option value="05:00">05:00</option>
+                    <option value="06:00">06:00</option>
+                    <option value="07:00">07:00</option>
+                    <option value="08:00">08:00</option>
+                    <option value="09:00">09:00</option>
+                    <option value="10:00">10:00</option>
+                    <option value="11:00">11:00</option>
+                    <option value="12:00">12:00</option>
+                    <option value="13:00">13:00</option>
+                    <option value="14:00">14:00</option>
+                    <option value="15:00">15:00</option>
+                    <option value="16:00">16:00</option>
+                    <option value="17:00">17:00</option>
+                    <option value="18:00">18:00</option>
+                    <option value="19:00">19:00</option>
+                    <option value="20:00">20:00</option>
+                    <option value="21:00">21:00</option>
+                    <option value="22:00">22:00</option>
+                    <option value="23:00">23:00</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">按发布时间找最新作品</label>
+                  <p class="form-hint">
+                    每次执行，找监控账号前一天发布的作品纳入观察。
+                  </p>
+                  <input
+                    type="hidden"
+                    id="inputMonitorPublishWindow"
+                    value="previous_day" />
+                  <div class="form-input">前一天发布</div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">观察期（小时）</label>
+                  <p class="form-hint">
+                    作品从发布时间起持续观察，超过观察期的不再观测后续数据。
+                  </p>
+                  <select
+                    class="form-input"
+                    id="inputMonitorObserveWindowHours">
+                    <option value="24">24</option>
+                    <option value="48">48</option>
+                    <option value="72">72</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">点赞筛选</label>
+                  <p class="form-hint">
+                    观察期内，点赞数超过该值则视为潜在爆款，需要汇报。
+                  </p>
+                  <input
+                    type="number"
+                    min="0"
+                    class="form-input"
+                    id="inputMonitorLikeThreshold"
+                    placeholder="0" />
+                </div>
+                <div
+                  class="status-bar"
+                  id="uiMonitorSettingsFeedback"
+                  style="display: none; margin-top: var(--spacing-xs);"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div
+          class="panel progress-sticky"
+          id="progressContainer"
+          style="display: none;">
+          <div
+            class="status-bar is-info"
+            id="progressBar"
+            style="margin-bottom: var(--spacing-sm);">
+            <svg
+              viewBox="0 0 24 24"
+              width="16"
+              height="16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <circle
+                cx="12"
+                cy="12"
+                r="10"></circle>
+              <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+            <span id="progressText">正在准备采集...</span>
+          </div>
+          <div style="text-align: center;">
+            <button
+              class="btn btn-secondary btn-full"
+              id="btnCancel"
+              style="padding: 6px; font-size: 13px;">
+              中止任务
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay"
+      id="bindingReplaceModal"
+      aria-hidden="true">
+      <div
+        class="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="bindingReplaceTitle">
+        <div class="modal-header">
+          <h3
+            class="modal-title"
+            id="bindingReplaceTitle">
+            环境已满，请选择要替换的环境
+          </h3>
+          <p
+            class="modal-subtitle"
+            id="bindingReplaceSubtitle">
+            当前激活码已占满 2/2 个环境，被替换环境将立即失效。
+          </p>
+        </div>
+        <div
+          class="binding-replace-list"
+          id="bindingReplaceList"></div>
+        <div class="modal-footer">
+          <button
+            class="btn btn-secondary"
+            id="btnBindingReplaceCancel"
+            type="button">
+            取消
+          </button>
+          <button
+            class="btn btn-primary"
+            id="btnBindingReplaceConfirm"
+            type="button"
+            disabled>
+            确认替换
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay contact-modal-overlay"
+      id="contactModal"
+      aria-hidden="true">
+      <div
+        class="modal-card contact-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="contactModalTitle">
+        <div class="modal-header contact-modal-header">
+          <div class="contact-modal-icon-wrap">
+            <svg
+              class="contact-modal-icon"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />
+              <path d="M8 12h.01" />
+              <path d="M12 12h.01" />
+              <path d="M16 12h.01" />
+            </svg>
+          </div>
+          <h3
+            class="modal-title"
+            id="contactModalTitle">
+            有问题联系我们
+          </h3>
+          <p class="modal-subtitle">反馈问题，提供产品建议或购买激活码</p>
+        </div>
+        <div class="contact-modal-body">
+          <div class="contact-qr-frame">
+            <img
+              class="contact-qr-image"
+              src="../images/wechat.png"
+              alt="联系我们微信二维码" />
+          </div>
+        </div>
+        <p class="contact-modal-tip">请使用微信扫码添加，备注「OnStarVoice」</p>
+        <div class="modal-footer contact-modal-footer">
+          <button
+            class="btn btn-secondary"
+            id="btnContactModalClose"
+            type="button">
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay contact-modal-overlay"
+      id="memberGroupModal"
+      aria-hidden="true">
+      <div
+        class="modal-card contact-modal-card member-group-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="memberGroupModalTitle">
+        <div class="modal-header contact-modal-header">
+          <div class="contact-modal-icon-wrap member-group-modal-icon-wrap">
+            <svg
+              class="contact-modal-icon"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle
+                cx="9"
+                cy="7"
+                r="4" />
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+          </div>
+          <h3
+            class="modal-title"
+            id="memberGroupModalTitle">
+            邀您加入会员群
+          </h3>
+          <p class="modal-subtitle">
+            扫码并备注「MC」加入会员群，可第一时间获取版本升级和实战用法，也可反馈问题与需求建议。
+          </p>
+        </div>
+        <div class="contact-modal-body">
+          <div class="contact-qr-frame">
+            <img
+              class="contact-qr-image"
+              src="../images/wechat.png"
+              alt="会员群二维码" />
+          </div>
+        </div>
+        <label class="member-group-confirm">
+          <input
+            type="checkbox"
+            id="checkboxMemberGroupAdded" />
+          <span>我已添加，关掉提醒</span>
+        </label>
+        <div class="modal-footer member-group-modal-footer">
+          <button
+            class="btn btn-secondary"
+            id="btnMemberGroupLater"
+            type="button">
+            稍后再说
+          </button>
+          <button
+            class="btn btn-primary"
+            id="btnMemberGroupConfirm"
+            type="button">
+            确认
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay"
+      id="riskNoticeModal"
+      aria-hidden="true">
+      <div
+        class="modal-card risk-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="riskNoticeTitle">
+        <div class="modal-header">
+          <h3
+            class="modal-title"
+            id="riskNoticeTitle">
+            风险提示
+          </h3>
+          <p class="modal-subtitle">请合理使用采集功能，降低账号与合规风险</p>
+        </div>
+        <div class="risk-modal-body">
+          <div class="risk-modal-row">
+            <div class="risk-modal-icon">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round">
+                <path
+                  d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+                <path d="M12 9v4" />
+                <path d="M12 17h.01" />
+              </svg>
+            </div>
+            <div class="risk-modal-content">
+              <p>
+                本插件与小红书、抖音等平台<strong>无任何官方关联</strong>，仅为第三方效率工具。
+              </p>
+              <p>
+                采集操作模拟人工行为，仅获取页面可见数据。请勿高频或大量进行数据采集，否则仍有可能触发平台风控机制，导致账号被限制。<strong>建议使用小号进行采集</strong>，切勿使用正在运营的主账号。
+              </p>
+              <p>
+                采集数据仅供学习与运营参考，请勿用于违反平台规则或法律法规的用途，相关责任由使用者自行承担。
+              </p>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <label
+            class="risk-modal-checkbox-label"
+            id="riskNoticeCheckboxLabel"
+            hidden>
+            <input
+              type="checkbox"
+              id="riskNoticeCheckbox" />
+            <span>我已阅读并知晓相关风险</span>
+          </label>
+          <button
+            class="btn btn-secondary"
+            id="btnRiskModalClose"
+            type="button">
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay"
+      id="historyErrorDetailModal"
+      aria-hidden="true">
+      <div
+        class="modal-card history-error-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="historyErrorDetailTitle">
+        <div class="modal-header">
+          <h3
+            class="modal-title"
+            id="historyErrorDetailTitle">
+            错误详情
+          </h3>
+          <p class="modal-subtitle">以下是本次执行返回的完整错误信息</p>
+        </div>
+        <pre
+          class="history-error-detail-box"
+          id="historyErrorDetailText"></pre>
+        <div class="modal-footer">
+          <button
+            class="btn btn-secondary"
+            id="btnCloseHistoryErrorDetail"
+            type="button">
+            关闭
+          </button>
+          <button
+            class="btn btn-primary"
+            id="btnCopyHistoryErrorDetail"
+            type="button">
+            一键复制
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay"
+      id="updateNoticeModal"
+      aria-hidden="true">
+      <div
+        class="modal-card update-notice-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="updateNoticeTitle">
+        <div class="modal-header">
+          <h3
+            class="modal-title"
+            id="updateNoticeTitle">
+            版本更新
+          </h3>
+          <p
+            class="modal-subtitle"
+            id="updateNoticeSubtitle">
+            正在检查版本信息...
+          </p>
+        </div>
+        <div class="update-notice-version-grid">
+          <div class="update-version-item">
+            <span class="update-version-label">当前版本</span>
+            <span
+              class="update-version-tag"
+              id="updateNoticeCurrentVersion"
+              >v-</span
+            >
+          </div>
+          <div class="update-version-item">
+            <span class="update-version-label">最新版本</span>
+            <span
+              class="update-version-tag is-latest"
+              id="updateNoticeLatestVersion"
+              >v-</span
+            >
+          </div>
+        </div>
+        <p
+          class="update-notice-summary"
+          id="updateNoticeSummary">
+          -
+        </p>
+        <div
+          class="update-notice-release-list"
+          id="updateNoticeReleaseNotes"></div>
+        <a
+          class="update-notice-changelog-link"
+          id="updateNoticeChangelog"
+          href="#"
+          target="_blank"
+          rel="noopener noreferrer"
+          >查看更新日志</a
+        >
+        <div class="modal-footer update-notice-footer">
+          <button
+            class="btn btn-secondary"
+            id="btnUpdateNoticeClose"
+            type="button">
+            稍后
+          </button>
+          <button
+            class="btn btn-primary"
+            id="btnUpdateNoticeAction"
+            type="button">
+            立即使用
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay"
+      id="updateGuideModal"
+      aria-hidden="true">
+      <div
+        class="modal-card update-guide-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="updateGuideTitle">
+        <div class="modal-header">
+          <h3
+            class="modal-title"
+            id="updateGuideTitle">
+            扩展页更新指引
+          </h3>
+          <p class="modal-subtitle">
+            打开扩展程序页面后，按下面两步即可手动更新到最新版本
+          </p>
+        </div>
+        <ol class="update-guide-steps">
+          <li>打开右上角“开发者模式”</li>
+          <li>点击左上角 “更新” 按钮，等待几秒后查看版本号</li>
+        </ol>
+        <div class="update-guide-toolbar-mock">
+          <span class="update-guide-chip">加载未打包的扩展程序</span>
+          <span class="update-guide-chip">打包扩展程序</span>
+          <span class="update-guide-chip is-focus">更新</span>
+        </div>
+        <label
+          class="update-guide-checkbox"
+          for="checkboxUpdateGuideSkip">
+          <input
+            type="checkbox"
+            id="checkboxUpdateGuideSkip" />
+          <span>我已了解，下次不再提示</span>
+        </label>
+        <div class="modal-footer">
+          <button
+            class="btn btn-secondary"
+            id="btnUpdateGuideCancel"
+            type="button">
+            返回
+          </button>
+          <button
+            class="btn btn-primary"
+            id="btnUpdateGuideConfirm"
+            type="button">
+            我知道了，去更新
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== 批量操作弹窗 ========== -->
+    <div
+      class="modal-overlay batch-modal-overlay"
+      id="batchModalOverlay"
+      aria-hidden="true">
+      <div
+        class="modal-card batch-modal-card"
+        role="dialog"
+        aria-modal="true">
+        <div class="batch-modal-header">
+          <div class="batch-modal-title-row">
+            <span class="batch-modal-icon">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round">
+                <path d="m12 3 8 4-8 4-8-4 8-4z" />
+                <path d="m4 11 8 4 8-4" />
+                <path d="m4 15 8 4 8-4" />
+              </svg>
+            </span>
+            <h3
+              class="modal-title"
+              id="batchModalTitle">
+              批量采集
+            </h3>
+          </div>
+          <button
+            class="batch-modal-close"
+            id="btnBatchModalClose"
+            title="关闭">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <path d="M18 6L6 18" />
+              <path d="M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <p class="batch-modal-hint">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round">
+            <circle
+              cx="12"
+              cy="12"
+              r="10" />
+            <path d="M12 16v-4" />
+            <path d="M12 8h.01" />
+          </svg>
+          批量操作可能触发风控验证，请控制数量和频率
+        </p>
+
+        <div class="batch-modal-body">
+          <!-- Links pane -->
+          <div
+            class="batch-content-pane"
+            id="batchPaneLinks"
+            hidden>
+            <div class="form-group">
+              <label class="form-label"
+                >笔记 / 作品链接列表
+                <span class="form-label-hint">每行一个</span></label
+              >
+              <textarea
+                class="form-input batch-textarea"
+                id="textareaBatchLinks"
+                placeholder="粘贴作品详情页链接，每行一个…"></textarea>
+            </div>
+            <button
+              class="btn btn-primary btn-full"
+              id="btnRunBatchLinks">
+              开始批量采集
+            </button>
+          </div>
+
+          <!-- Bloggers pane -->
+          <div
+            class="batch-content-pane"
+            id="batchPaneBloggers"
+            hidden>
+            <div class="form-group">
+              <label class="form-label"
+                >博主 ID 或主页链接
+                <span class="form-label-hint">每行一个</span></label
+              >
+              <textarea
+                class="form-input batch-textarea"
+                id="textareaBatchBloggers"
+                placeholder="粘贴博主 ID 或主页链接，每行一个…"></textarea>
+            </div>
+            <button
+              class="btn btn-primary btn-full"
+              id="btnRunBatchBloggers">
+              开始批量采集
+            </button>
+          </div>
+
+          <!-- Keywords pane -->
+          <div
+            class="batch-content-pane"
+            id="batchPaneKeywords"
+            hidden>
+            <div class="batch-keyword-column">
+              <div class="form-group">
+                <label class="form-label"
+                  >手动关键词列表
+                  <span class="form-label-hint"
+                    >每行一个，最多 10 个</span
+                  ></label
+                >
+                <textarea
+                  class="form-input batch-textarea"
+                  id="textareaBatchKeywords"
+                  placeholder="输入要采集的关键词，每行一个，最多 10 个"></textarea>
+                <div
+                  class="batch-keyword-limit"
+                  id="batchKeywordLimitHint">
+                  0 / 10
+                </div>
+              </div>
+            </div>
+            <button
+              class="btn btn-primary btn-full"
+              id="btnRunBatchKeywords">
+              开始批量采集
+            </button>
+          </div>
+
+          <!-- Progress bar (shared) -->
+          <div
+            class="keyword-batch-progress"
+            id="batchProgressContainer"
+            hidden>
+            <div class="keyword-batch-progress-bar">
+              <div
+                class="keyword-batch-progress-fill"
+                id="batchProgressFill"
+                style="width: 0%"></div>
+            </div>
+            <div
+              class="keyword-batch-progress-text"
+              id="batchProgressText">
+              准备就绪
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay batch-modal-overlay"
+      id="keywordStrategyModalOverlay"
+      aria-hidden="true">
+      <div
+        class="modal-card batch-modal-card batch-modal-keyword-strategy-card"
+        role="dialog"
+        aria-modal="true">
+        <div class="batch-modal-header">
+          <div class="batch-modal-title-row">
+            <span class="batch-modal-icon">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round">
+                <path d="m12 3 8 4-8 4-8-4 8-4z" />
+                <path d="m4 11 8 4 8-4" />
+                <path d="m4 15 8 4 8-4" />
+              </svg>
+            </span>
+            <div>
+              <h3
+                class="modal-title"
+                id="keywordStrategyModalTitle">
+                关键词策略
+              </h3>
+            </div>
+          </div>
+          <button
+            class="batch-modal-close"
+            id="btnKeywordStrategyModalClose"
+            title="关闭">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <path d="M18 6L6 18" />
+              <path d="M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <p
+          class="batch-modal-hint"
+          id="keywordStrategyLongtailHint">
+          先按最近半年与最多点赞统一采样，再在当前页面可见地完成主词判断和长尾词下钻。
+        </p>
+
+        <div class="batch-modal-body keyword-strategy-modal-body">
+          <div
+            class="keyword-strategy-tabs"
+            role="tablist"
+            aria-label="关键词策略标签页">
+            <button
+              type="button"
+              class="keyword-strategy-tab is-active"
+              id="btnKeywordStrategyTabOpportunity"
+              data-strategy-tab="opportunity"
+              aria-selected="true">
+              主词机会判断
+            </button>
+            <button
+              type="button"
+              class="keyword-strategy-tab"
+              id="btnKeywordStrategyTabLongtail"
+              data-strategy-tab="longtail"
+              aria-selected="false">
+              长尾词需求分析
+            </button>
+          </div>
+
+          <div
+            class="keyword-strategy-pane"
+            id="keywordStrategyOpportunityPane">
+            <div
+              class="keyword-strategy-placeholder"
+              id="keywordOpportunityIntro">
+              <div id="keywordOpportunityIntroText">
+                <div class="keyword-strategy-placeholder-title">
+                  主词机会判断如何工作？
+                </div>
+                <div class="keyword-strategy-placeholder-text">
+                  当你看到一个大词，不确定还能不能做，或者不知道该从哪个内容角度切进去时，就可以先用这个功能。<br /><br />
+                  你不需要自己一篇篇去翻热门内容，系统会直接帮你判断：<br />
+                  1. 这个赛道下面的<b>选题热度分布</b><br />
+                  2. 哪些<b>内容角度</b>更容易拿到<b>自然流</b><br />
+                  3. 如果你现在开始发内容，优先从哪个方向切入更稳
+                </div>
+              </div>
+              <div
+                class="keyword-strategy-actions"
+                style="margin-top: 12px;">
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  id="btnRunKeywordOpportunity">
+                  开始主词机会判断
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-secondary"
+                  id="btnCancelKeywordOpportunity"
+                  style="display: none;">
+                  停止
+                </button>
+                <button
+                  type="button"
+                  class="action-icon-btn keyword-insight-clear-btn"
+                  id="btnClearKeywordOpportunityResult"
+                  title="清空主词机会判断结果"
+                  hidden>
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="lucide lucide-eraser">
+                    <path
+                      d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                    <path d="M22 21H7" />
+                    <path d="m5 11 9 9" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div
+              class="keyword-strategy-error"
+              id="keywordOpportunityError"
+              hidden></div>
+            <div
+              class="keyword-strategy-result"
+              id="keywordOpportunityResult"></div>
+          </div>
+
+          <div
+            class="keyword-strategy-pane"
+            id="keywordStrategyLongtailPane"
+            hidden>
+            <div class="form-group">
+              <div
+                class="batch-keyword-insight-label-row"
+                id="keywordInsightActionRow">
+                <div class="batch-keyword-insight-header-actions">
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    id="btnExpandKeywords">
+                    开始长尾词需求分析
+                  </button>
+                  <button
+                    type="button"
+                    class="action-icon-btn keyword-insight-clear-btn"
+                    id="btnClearKeywordInsightResult"
+                    title="清空分析和扩展结果"
+                    hidden>
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="lucide lucide-eraser">
+                      <path
+                        d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                      <path d="M22 21H7" />
+                      <path d="m5 11 9 9" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              <div
+                class="keyword-strategy-placeholder"
+                id="keywordInsightIntro">
+                <div class="keyword-strategy-placeholder-title">
+                  长尾词需求分析能帮你做什么？
+                </div>
+                <div class="keyword-strategy-placeholder-text">
+                  当你想知道，用户会从哪些具体问题和角度来搜索这个主题时，就可以用这个功能。<br /><br />
+                  系统会帮你扩展出这个关键词相关的真实搜索词，让你看到用户到底在搜什么、关心什么、卡在哪些具体问题上。<br /><br />
+                  你最终能直接看到：<br />
+                  1. 用户真实会怎么搜索这个主题<br />
+                  2. 哪些具体搜索问题和角度最值得做内容<br />
+                  3. 哪些长尾搜索词更适合帮你布局搜索流量
+                </div>
+                <div
+                  class="keyword-strategy-actions"
+                  style="margin-top: 12px;">
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    id="btnRunKeywordInsight">
+                    开始长尾词需求分析
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div
+              class="keyword-insight-container"
+              id="keywordInsightContainer"
+              hidden>
+              <div
+                class="keyword-insight-summary"
+                id="keywordInsightSummary"></div>
+              <div
+                class="keyword-insight-error"
+                id="keywordInsightError"
+                hidden>
+                <div
+                  class="keyword-insight-error-message"
+                  id="keywordInsightErrorMessage">
+                  当前智能分析暂时不可用，已保留扩展词，可稍后重试或先查看扩展词
+                </div>
+                <div class="keyword-insight-actions">
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    id="btnRetryKeywordAnalysis">
+                    重试分析
+                  </button>
+                </div>
+              </div>
+              <div
+                class="keyword-insight-categories"
+                id="keywordInsightCategories"></div>
+              <div
+                id="expandedKeywordsPanel"
+                hidden>
+                <div class="expanded-keywords-header">
+                  <span
+                    class="expanded-keywords-count"
+                    id="expandedKeywordsCount"
+                    >扩展词: 0 词</span
+                  >
+                </div>
+                <textarea
+                  class="form-input batch-textarea expanded-keywords-textarea"
+                  id="textareaExpandedKeywords"
+                  placeholder="每行一个关键词，支持批量粘贴和删除..."></textarea>
+              </div>
+              <div class="keyword-insight-footer">
+                <button
+                  type="button"
+                  class="btn btn-text-inline"
+                  id="btnViewExpandedKeywords"
+                  hidden>
+                  查看全部扩展词
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script
+      type="module"
+      src="sidebar-logic.js"></script>
+    <script
+      type="module"
+      src="sidebar-ui.js"></script>
+  </body>
+</html>
