@@ -11,7 +11,7 @@ import { ensurePlainAuthCode } from './auth-code.js';
 
 const API_BASE_URL =
   globalThis.__ONSTARVOICE_API_BASE_URL__ ||
-  'https://api.onstarvoice.local';
+  'http://localhost:3000';
 
 // ==================== 通用请求函数 ====================
 
@@ -208,10 +208,10 @@ export async function verify(code, options = {}) {
 // ==================== POST /api/sync ====================
 
 /**
- * 同步数据到飞书
+ * 同步数据到后台
  * @param {Object} params - 同步参数
  * @param {string} params.syncType - 同步类型
- * @param {Object} params.target - 飞书目标配置
+ * @param {Object} params.target - 同步目标配置
  * @param {Object} params.payload - 业务数据
  * @returns {Promise<Object>} 同步结果
  */
@@ -240,7 +240,7 @@ export async function sync({ syncType, target, payload }) {
 /**
  * 批量同步多条记录
  * @param {Array<Object>} records - 记录列表（{ id, type, payload }）
- * @param {Object} target - 飞书目标配置
+ * @param {Object} target - 同步目标配置
  * @returns {Promise<Object>} 批量同步结果
  */
 export async function syncBatch(records, target) {

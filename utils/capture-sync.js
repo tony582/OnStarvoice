@@ -268,7 +268,7 @@ export async function captureAndSync({
     if (onProgress) {
       onProgress({
         phase: 'sync_start',
-        message: '开始同步到飞书...',
+        message: '开始同步到后台...',
         recordId,
       });
     }
@@ -1492,7 +1492,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
     if (onProgress) {
       onProgress({
         phase: 'sync_start',
-        message: '正在同步到飞书...',
+        message: '正在同步到后台...',
         recordId,
       });
     }
@@ -2585,7 +2585,7 @@ export async function checkBeforeSync(requiredSyncTypes = [], options = {}) {
         error: {
           code: ERROR_REASON.NOT_VERIFIED,
           message:
-            '当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可点击购买。',
+            '当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可联系管理员获取。',
         },
       };
     }
@@ -2604,14 +2604,11 @@ export async function checkBeforeSync(requiredSyncTypes = [], options = {}) {
     const target = await getTarget();
     const requestTarget = buildSyncTargetPayload(target);
 
+    // 使用 OnStarVoice 后台同步，不再强制要求 feishuAppToken
+    // 如果配置了 feishuAppToken 则使用，否则使用激活码直连后端
     if (!requestTarget.feishuAppToken) {
-      return {
-        ok: false,
-        error: {
-          code: ERROR_REASON.INVALID_TARGET,
-          message: '请先配置飞书多维表格 App Token',
-        },
-      };
+      // 设置一个占位值，让后续逻辑不报错
+      requestTarget.feishuAppToken = '__onstarvoice_backend__';
     }
 
     const syncTypesToCheck =

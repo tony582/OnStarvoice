@@ -1,0 +1,20 @@
+{
+  "name": "onstarvoice-server",
+  "version": "0.1.0",
+  "description": "OnStarVoice 舆情监控后端服务",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.16",
+    "sql.js": "^1.14.1",
+    "uuid": "^11.1.0"
+  }
+}

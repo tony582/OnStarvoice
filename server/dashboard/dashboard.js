@@ -1,0 +1,330 @@
+/**
+ * OnStarVoice 用户数据中心 — 客户端逻辑
+ */
+
+let authCode = '';
+let recordsPage = 1;
+let cachedRecords = [];
+
+const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
+const PLATFORM_LABEL = { xiaohongshu: '小红书', douyin: '抖音', unknown: '未知' };
+const CATEGORY_LABEL = {
+  safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费',
+  privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量',
+  brand_image: '品牌形象', other: '其他',
+};
+const ACCOUNT_TYPE_LABEL = { enterprise: '企业号', personal: '个人号', professional: '专业号' };
+
+// ==================== API ====================
+
+async function api(path, options) {
+  options = options || {};
+  var headers = {
+    'Content-Type': 'application/json',
+    'x-auth-code': authCode,
+    ...(options.headers || {}),
+  };
+  var fetchOpts = { ...options, headers: headers };
+  if (options.body) fetchOpts.body = JSON.stringify(options.body);
+  var resp = await fetch('/api/user' + path, fetchOpts);
+  return resp.json();
+}
+
+// ==================== Toast ====================
+
+function showToast(msg, type) {
+  type = type || 'info';
+  var el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(function() { el.remove(); }, 3000);
+}
+
+// ==================== Auth ====================
+
+async function doLogin() {
+  var code = document.getElementById('loginCode').value.trim();
+  if (!code) return;
+  authCode = code;
+
+  try {
+    var resp = await fetch('/api/user/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-auth-code': code },
+      body: JSON.stringify({ code: code }),
+    });
+    var data = await resp.json();
+
+    if (data.ok) {
+      document.getElementById('loginOverlay').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      localStorage.setItem('osv_user_code', code);
+      document.getElementById('userInfo').textContent = data.owner || code.slice(0, 8);
+      loadStats();
+      loadRecords();
+    } else {
+      document.getElementById('loginError').style.display = 'block';
+      document.getElementById('loginError').textContent = data.message || '激活码无效';
+    }
+  } catch (err) {
+    document.getElementById('loginError').style.display = 'block';
+    document.getElementById('loginError').textContent = '连接失败: ' + err.message;
+  }
+}
+
+function doLogout() {
+  localStorage.removeItem('osv_user_code');
+  authCode = '';
+  location.reload();
+}
+
+// Enter key
+document.getElementById('loginCode').addEventListener('keyup', function(e) {
+  if (e.key === 'Enter') doLogin();
+});
+
+// Auto-login
+(async function autoLogin() {
+  var saved = localStorage.getItem('osv_user_code');
+  if (!saved) return;
+  authCode = saved;
+  try {
+    var resp = await fetch('/api/user/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-auth-code': saved },
+      body: JSON.stringify({ code: saved }),
+    });
+    var data = await resp.json();
+    if (data.ok) {
+      document.getElementById('loginOverlay').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      document.getElementById('userInfo').textContent = data.owner || saved.slice(0, 8);
+      loadStats();
+      loadRecords();
+    } else {
+      localStorage.removeItem('osv_user_code');
+      authCode = '';
+    }
+  } catch(e) {
+    localStorage.removeItem('osv_user_code');
+    authCode = '';
+  }
+})();
+
+// ==================== Stats ====================
+
+async function loadStats() {
+  var data = await api('/stats?days=7');
+  if (!data.ok) return;
+  var s = data.stats;
+  document.getElementById('statTotal').textContent = s.totalRecords;
+  document.getElementById('statRecent').textContent = s.recentRecords;
+  document.getElementById('statPlatforms').textContent = s.platformDist ? s.platformDist.length : 0;
+}
+
+// ==================== Records ====================
+
+async function loadRecords(page) {
+  recordsPage = page || 1;
+  var platform = document.getElementById('filterPlatform').value || '';
+  var sentiment = document.getElementById('filterSentiment').value || '';
+  var keyword = document.getElementById('filterKeyword').value || '';
+
+  var params = new URLSearchParams({ page: recordsPage, pageSize: 30 });
+  if (platform) params.set('platform', platform);
+  if (sentiment) params.set('sentiment', sentiment);
+  if (keyword) params.set('keyword', keyword);
+
+  var data = await api('/records?' + params);
+  if (!data.ok) return;
+  cachedRecords = data.records;
+
+  var el = document.getElementById('recordsTable');
+  if (data.records.length === 0) {
+    el.innerHTML = '<div class="empty-state">暂无采集数据，请先在扩展中采集并同步</div>';
+    document.getElementById('recordsPagination').innerHTML = '';
+    return;
+  }
+
+  var typeIcon = function(r) {
+    return r.video_url ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>';
+  };
+
+  el.innerHTML = '<table><thead><tr><th>类型</th><th>标题</th><th>平台</th><th>博主</th><th>粉丝</th><th>互动数据</th><th>情感</th><th>评论采集</th><th>采集时间</th></tr></thead><tbody>' +
+    data.records.map(function(r, idx) {
+      var contentPreview = r.content ? r.content.slice(0, 50) : '';
+      if (r.content && r.content.length > 50) contentPreview += '...';
+      return '<tr onclick="showRecordDetail(' + idx + ')">' +
+        '<td>' + typeIcon(r) + '</td>' +
+        '<td><div class="cell-title">' + escHtml(r.title || '(无标题)') + (contentPreview ? '<div class="preview">' + escHtml(contentPreview) + '</div>' : '') + '</div></td>' +
+        '<td>' + (PLATFORM_LABEL[r.platform] || r.platform) + '</td>' +
+        '<td class="cell-truncate">' + escHtml(r.author_name || '-') + '</td>' +
+        '<td class="cell-nowrap">' + (r.author_fans > 0 ? formatNum(r.author_fans) : '-') + '</td>' +
+        '<td class="cell-nowrap">' + r.likes + ' / ' + r.comments_count + ' / ' + r.collects + '</td>' +
+        '<td>' + (r.sentiment ? '<span class="badge badge-' + r.sentiment + '">' + (SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '-') + '</td>' +
+        '<td>' + (r.comments_total_captured > 0 ? r.comments_total_captured + '条' : (r.comments_capture_status || '-')) + '</td>' +
+        '<td class="cell-nowrap">' + (r.created_at ? r.created_at.slice(0, 10) : '-') + '</td>' +
+        '</tr>';
+    }).join('') + '</tbody></table>';
+
+  var p = data.pagination;
+  var pagEl = document.getElementById('recordsPagination');
+  if (p.totalPages <= 1) { pagEl.innerHTML = ''; return; }
+  var html = '<button ' + (p.page <= 1 ? 'disabled' : '') + ' onclick="loadRecords(' + (p.page - 1) + ')">上一页</button>';
+  var start = Math.max(1, p.page - 3);
+  var end = Math.min(p.totalPages, start + 6);
+  for (var i = start; i <= end; i++) {
+    html += '<button class="' + (i === p.page ? 'active' : '') + '" onclick="loadRecords(' + i + ')">' + i + '</button>';
+  }
+  html += '<button ' + (p.page >= p.totalPages ? 'disabled' : '') + ' onclick="loadRecords(' + (p.page + 1) + ')">下一页</button>';
+  pagEl.innerHTML = html;
+}
+
+// ==================== Helpers ====================
+
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function formatNum(n) {
+  if (n >= 10000) return (n / 10000).toFixed(1) + 'w';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function formatDateTime(ts) {
+  if (!ts) return '-';
+  if (typeof ts === 'number') return new Date(ts).toISOString().slice(0, 16).replace('T', ' ');
+  return String(ts).slice(0, 16).replace('T', ' ');
+}
+
+// ==================== Detail Modal ====================
+
+function showRecordDetail(idx) {
+  var r = cachedRecords[idx];
+  if (!r) return;
+
+  var tags = [];
+  try { tags = JSON.parse(r.tags || '[]'); } catch(e) {}
+  var imageUrls = [];
+  try { imageUrls = JSON.parse(r.image_urls || '[]'); } catch(e) {}
+
+  var html = '<table class="detail-table">';
+  var rows = [
+    ['采集平台', PLATFORM_LABEL[r.platform] || r.platform],
+    ['博主', escHtml(r.author_name || '-')],
+    ['博主主页', r.blogger_profile_url ? '<a href="' + r.blogger_profile_url + '" target="_blank">查看主页</a>' : '-'],
+    ['粉丝数', r.author_fans > 0 ? r.author_fans.toLocaleString() : '-'],
+    ['点赞与收藏数', r.blogger_liked_collected > 0 ? r.blogger_liked_collected.toLocaleString() : '-'],
+    ['账号属性', ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '-'],
+    ['标题', escHtml(r.title || '-')],
+    ['笔记链接', r.url ? '<a href="' + r.url + '" target="_blank">' + escHtml(r.url.slice(0, 60)) + (r.url.length > 60 ? '...' : '') + '</a>' : '-'],
+    ['正文', '<div class="detail-content">' + escHtml(r.content || '(无内容)') + '</div>'],
+    ['话题标签', tags.length > 0 ? tags.map(function(t) { return '<span class="tag-chip">' + escHtml(typeof t === 'string' ? t : (t.name || t.tagName || '')) + '</span>'; }).join(' ') : '-'],
+    ['笔记类型', r.video_url ? '视频' : '图文'],
+    ['封面链接', r.cover_url ? '<a href="' + r.cover_url + '" target="_blank">查看封面</a>' : '-'],
+    ['图片链接', imageUrls.length > 0 ? imageUrls.length + ' 张 - <a href="' + imageUrls[0] + '" target="_blank">查看首张</a>' : '-'],
+    ['视频链接', r.video_url ? '<a href="' + r.video_url + '" target="_blank">查看视频</a>' : '-'],
+    ['视频时长', r.video_duration || '-'],
+    ['点赞 / 收藏 / 评论 / 转发', r.likes + ' / ' + r.collects + ' / ' + r.comments_count + ' / ' + r.shares],
+    ['评论内容', r.comments_text ? '<div class="detail-content">' + escHtml(r.comments_text.slice(0, 600)) + (r.comments_text.length > 600 ? '...' : '') + '</div>' : '-'],
+    ['评论采集状态', r.comments_capture_status || '-'],
+    ['评论采集条数', r.comments_total_captured > 0 ? String(r.comments_total_captured) : '-'],
+    ['采集时间', formatDateTime(r.capture_timestamp || r.created_at)],
+    ['笔记编辑时间', r.publish_time || '-'],
+    ['搜索关键词', r.keyword || '-'],
+  ];
+
+  if (r.sentiment) {
+    rows.push(['AI 情感分析', '<span class="badge badge-' + r.sentiment + '">' + (SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>']);
+  }
+  if (r.category) {
+    rows.push(['AI 分类', CATEGORY_LABEL[r.category] || r.category]);
+  }
+  if (r.ai_summary) {
+    rows.push(['AI 摘要', escHtml(r.ai_summary)]);
+  }
+
+  rows.forEach(function(row) {
+    html += '<tr><th>' + row[0] + '</th><td>' + row[1] + '</td></tr>';
+  });
+  html += '</table>';
+
+  document.getElementById('recordDetailContent').innerHTML = html;
+  document.getElementById('recordDetailModal').classList.remove('modal-hidden');
+}
+
+function closeModal() {
+  document.getElementById('recordDetailModal').classList.add('modal-hidden');
+}
+
+// Close on overlay click
+document.getElementById('recordDetailModal').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+// ==================== CSV Export ====================
+
+async function exportRecordsCsv() {
+  showToast('正在导出...', 'info');
+  var platform = document.getElementById('filterPlatform').value || '';
+  var sentiment = document.getElementById('filterSentiment').value || '';
+  var keyword = document.getElementById('filterKeyword').value || '';
+
+  var params = new URLSearchParams({ page: 1, pageSize: 10000 });
+  if (platform) params.set('platform', platform);
+  if (sentiment) params.set('sentiment', sentiment);
+  if (keyword) params.set('keyword', keyword);
+
+  var data = await api('/records?' + params);
+  if (!data.ok || data.records.length === 0) { showToast('没有数据可导出', 'error'); return; }
+
+  var header = [
+    '采集平台', '博主', '博主主页', '封面链接', '标题', '笔记链接', '正文',
+    '话题标签', '图片链接', '评论内容', '笔记类型', '采集时间', '笔记最近编辑时间',
+    '点赞数', '收藏数', '评论数', '转发数', '粉丝数', '点赞与收藏数', '账号属性',
+    '视频链接', '视频时长', '评论采集状态', '评论采集条数'
+  ];
+
+  var rows = data.records.map(function(r) {
+    var tags = []; try { tags = JSON.parse(r.tags || '[]'); } catch(e) {}
+    var imageUrls = []; try { imageUrls = JSON.parse(r.image_urls || '[]'); } catch(e) {}
+    return [
+      PLATFORM_LABEL[r.platform] || r.platform,
+      r.author_name || '',
+      r.blogger_profile_url || '',
+      r.cover_url || '',
+      r.title || '',
+      r.url || '',
+      r.content || '',
+      tags.map(function(t) { return typeof t === 'string' ? t : (t.name || t.tagName || ''); }).join(', '),
+      imageUrls.join('\n'),
+      r.comments_text || '',
+      r.video_url ? '视频' : '图文',
+      formatDateTime(r.capture_timestamp || r.created_at),
+      r.publish_time || '',
+      r.likes, r.collects, r.comments_count, r.shares,
+      r.author_fans, r.blogger_liked_collected,
+      ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '',
+      r.video_url || '', r.video_duration || '',
+      r.comments_capture_status || '', r.comments_total_captured || '',
+    ];
+  });
+
+  var csvContent = [header].concat(rows).map(function(row) {
+    return row.map(function(cell) {
+      var s = String(cell == null ? '' : cell).replace(/"/g, '""');
+      return '"' + s + '"';
+    }).join(',');
+  }).join('\n');
+
+  var blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'onstarvoice-data-' + new Date().toISOString().slice(0, 10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('导出成功 ' + data.records.length + ' 条记录', 'success');
+}

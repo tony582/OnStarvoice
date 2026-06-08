@@ -116,7 +116,7 @@ const SYNC_BATCH_LIMIT_MESSAGE =
   "单次同步上限为 500 条，请分批操作，本次同步前 500 条数据";
 const AUTH_CODE_AUTO_ENCRYPT_DELAY = 600;
 const AUTH_REQUIRED_MESSAGE =
-  "当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可点击购买。";
+  "当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可联系管理员获取。";
 const MONITOR_REQUIRED_MESSAGE = AUTH_REQUIRED_MESSAGE;
 const PAGE_ENHANCE_AUTH_REQUIRED_MESSAGE = AUTH_REQUIRED_MESSAGE;
 const DEFAULT_MONITOR_SETTINGS = Object.freeze({
@@ -1150,7 +1150,7 @@ async function handleConfirmMemberGroupAdded() {
   });
   closeMemberGroupModal();
   await updateMemberGroupEntryVisibility(auth);
-  showMessage("已收起会员群提醒入口", "success");
+  showMessage("已收起交流群提醒入口", "success");
 }
 
 async function maybeOpenMemberGroupModalAfterVerify(auth = getCurrentAuth()) {
@@ -4058,7 +4058,7 @@ async function handleRunKeywordOpportunity() {
           : KEYWORD_OPPORTUNITY_ANALYSIS_COST_CREDITS;
       keywordOpportunityErrorMessage = "";
       showMessage(
-        `积分不足：关键词策略完整分析需 ${requiredCreditsLabel} 积分。增购积分后可继续分析。`,
+        `配额不足：关键词策略完整分析需 ${requiredCreditsLabel} 配额。获取更多配额后可继续分析。`,
         "warning",
       );
       void refreshVerifiedAuthSnapshot();
@@ -4874,7 +4874,7 @@ async function startKeywordAnalysis({force = false} = {}) {
       renderKeywordInsightState();
       persistCurrentBatchDraft();
       showMessage(
-        `积分不足：不影响采集扩展词，但智能分析需 ${requiredCreditsLabel} 积分。增购积分后可继续完整分析。`,
+        `配额不足：不影响采集扩展词，但智能分析需 ${requiredCreditsLabel} 配额。获取更多配额后可继续完整分析。`,
         "warning",
       );
       void refreshVerifiedAuthSnapshot();
@@ -7174,9 +7174,9 @@ function resolveMonitorRunHistoryState(item) {
   if (status === "skipped_no_balance") {
     return {
       monitorStatus: "credit_insufficient",
-      monitorStatusLabel: "积分不足",
+      monitorStatusLabel: "配额不足",
       monitorSyncLabel: "",
-      monitorSummary: "未执行扫描（积分不足）",
+      monitorSummary: "未执行扫描（配额不足）",
       isSuccess: false,
       reason: errorCode || "insufficient_balance",
       message: errorMessage || "insufficient credential credits",
@@ -7354,7 +7354,7 @@ async function handleRunMonitorNow() {
           : monitorStatus === "hit_synced"
             ? "已命中"
             : monitorStatus === "credit_insufficient"
-              ? "积分不足"
+              ? "配额不足"
               : "未命中";
     const monitorSyncLabel =
       monitorStatus === "hit_sync_failed"
@@ -7373,7 +7373,7 @@ async function handleRunMonitorNow() {
       monitorSummaryParts.push(`未命中 ${counts.noHit}`);
     }
     if (counts.creditInsufficient > 0) {
-      monitorSummaryParts.push(`积分不足 ${counts.creditInsufficient}`);
+      monitorSummaryParts.push(`配额不足 ${counts.creditInsufficient}`);
     }
     if (counts.executionFailed > 0) {
       monitorSummaryParts.push(`执行失败 ${counts.executionFailed}`);
@@ -7458,7 +7458,7 @@ async function handleRunMonitorNow() {
       });
       if (counts.creditInsufficient > 0) {
         showMessage(
-          `本次有 ${counts.creditInsufficient} 个监控项因积分不足未执行。增购积分后可立即重试。`,
+          `本次有 ${counts.creditInsufficient} 个监控项因配额不足未执行。获取更多配额后可立即重试。`,
           "warning",
         );
       } else {
@@ -7705,7 +7705,7 @@ async function handleSaveTarget() {
     document.getElementById("inputReportWebhookUrl")?.value.trim() || "";
 
   if (!feishuAppToken) {
-    showMessage("请填写飞书 App Token", "error");
+    showMessage("请填写 App Token", "error");
     return;
   }
 
@@ -8433,7 +8433,7 @@ async function handleSyncAll() {
       showMessage(successMessage, "success");
     } else if (result.ok && remainingCount > 0) {
       showMessage(
-        `本次已同步 ${result.successCount} 条，剩余 ${remainingCount} 条，请再次点击“同步飞书”继续同步${
+        `本次已同步 ${result.successCount} 条，剩余 ${remainingCount} 条，请再次点击“同步后台”继续同步${
           hasLeadsSkippedOnly ? "（客资 0 条，已跳过）" : leadsSummary
         }`,
         "warning",
@@ -8443,7 +8443,7 @@ async function handleSyncAll() {
         remainingCount > 0 ? `，剩余 ${remainingCount} 条待执行` : ""
       }`;
       const partialLeadsMessage = hasLeadsFailure
-        ? `部分成功：内容表已成功 ${contentSuccessCount} 条，客资失败 ${leadsFailedCount} 条，可再次点击“同步飞书”仅重试客资失败记录`
+        ? `部分成功：内容表已成功 ${contentSuccessCount} 条，客资失败 ${leadsFailedCount} 条，可再次点击“同步后台”仅重试失败记录`
         : "";
       showMessage(partialLeadsMessage || baseFailureMessage, "warning");
     }
@@ -8490,7 +8490,7 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
   const auth = getCurrentAuth() || {};
   if (!isAuthVerified(auth)) {
     showMessage(
-      `${sourceLabel}已入池，当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可点击购买。`,
+      `${sourceLabel}已入池，当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可联系管理员获取。`,
       "warning",
     );
     return {
@@ -9408,11 +9408,11 @@ async function openCredentialClaimPage() {
 async function handleGoClaim() {
   const opened = await openCredentialClaimPage();
   if (!opened) {
-    showMessage("打开官网认领页失败，请稍后重试", "error");
+    showMessage("打开绑定页失败，请稍后重试", "error");
     return;
   }
 
-  showMessage("已打开官网认领页，认领完成后请回到插件重新验证。", "info");
+  showMessage("已打开绑定页，绑定完成后请回到插件重新验证。", "info");
 }
 
 function getAuthRequiredMessage() {
@@ -9420,19 +9420,19 @@ function getAuthRequiredMessage() {
 }
 
 function formatCreditsLabel(credits) {
-  return Number.isInteger(credits) && credits > 0 ? `${credits} 积分` : "积分";
+  return Number.isInteger(credits) && credits > 0 ? `${credits} 配额` : "配额";
 }
 
 function getKeywordOpportunityAuthRequiredMessage() {
   return `当前功能需要先验证激活码，主词机会判断将消耗 ${formatCreditsLabel(
     KEYWORD_OPPORTUNITY_ANALYSIS_COST_CREDITS,
-  )}。已有激活码请先在设置中完成验证；还没有请点击购买。`;
+  )}。已有激活码请先在设置中完成验证；还没有请联系管理员获取。`;
 }
 
 function getKeywordInsightAuthRequiredMessage() {
   return `当前功能需要先验证激活码。长尾扩词可先免费使用，继续生成长尾词需求分析将消耗 ${formatCreditsLabel(
     KEYWORD_INSIGHT_ANALYSIS_COST_CREDITS,
-  )}。已有激活码请先在设置中完成验证；还没有请点击购买。`;
+  )}。已有激活码请先在设置中完成验证；还没有请联系管理员获取。`;
 }
 
 function formatKeywordStrategyAccessError(error, fallbackMessage) {
@@ -9460,7 +9460,7 @@ function formatKeywordStrategyAccessError(error, fallbackMessage) {
     return {
       kind: "auth_expired",
       message:
-        "当前激活码已过期，请先续费或购买新激活码，并在设置中重新验证后再使用此功能。",
+        "当前激活码已过期，请先续费或获取新激活码，并在设置中重新验证后再使用此功能。",
     };
   }
 
@@ -9468,7 +9468,7 @@ function formatKeywordStrategyAccessError(error, fallbackMessage) {
     return {
       kind: "auth_frozen",
       message:
-        "当前激活码已被冻结，请联系客服处理；也可购买新激活码后重新验证。",
+        "当前激活码已被冻结，请联系管理员处理。",
     };
   }
 
@@ -9476,7 +9476,7 @@ function formatKeywordStrategyAccessError(error, fallbackMessage) {
     return {
       kind: "binding_limit",
       message:
-        "当前激活码绑定环境已满，请先在设置中替换旧环境，或购买新激活码后再使用此功能。",
+        "当前激活码绑定环境已满，请先在设置中替换旧环境，或联系管理员获取新激活码。",
     };
   }
 
@@ -11691,7 +11691,7 @@ function updateAuthUI(auth) {
       authStatus.textContent = "验证中";
       authStatus.style.color = "var(--status-info)";
     } else if (isVerified && isUnclaimedOwner) {
-      authStatus.textContent = "待认领";
+      authStatus.textContent = "未绑定";
       authStatus.style.color = "var(--status-warning)";
     } else if (isVerified) {
       authStatus.textContent = "已激活";
@@ -12124,7 +12124,7 @@ function buildDetailCaptureBlockerMessage(summary) {
     reasonParts.push(`链接缺失 ${summary.linkMissing} 条`);
   }
 
-  return `当前有 ${summary.capturing} 条记录正在执行采集增强（${parts.join("，")}），暂不允许同步飞书，避免同步过程中数据被覆盖${
+  return `当前有 ${summary.capturing} 条记录正在执行采集增强（${parts.join("，")}），暂不允许同步后台，避免同步过程中数据被覆盖${
     reasonParts.length > 0 ? `。原因分布：${reasonParts.join("，")}` : ""
   }。请等待采集增强完成后再同步。`;
 }

@@ -2,3 +2,7 @@
 ~$*
 *.docx
 node_modules/
+
+server/data/
+server/.env
+server/node_modules/

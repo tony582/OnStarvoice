@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OnStarVoice 数据中心</title>
+  <meta name="description" content="OnStarVoice 用户数据浏览与导出中心">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <!-- 登录 -->
+  <div id="loginOverlay" class="login-overlay">
+    <div class="login-card">
+      <div class="login-logo">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
+      </div>
+      <h2>OnStarVoice 数据中心</h2>
+      <p class="login-subtitle">请输入您的激活码</p>
+      <input type="text" id="loginCode" placeholder="输入激活码" autofocus>
+      <button id="loginBtn" onclick="doLogin()">进入数据中心</button>
+      <p id="loginError" class="login-error" style="display:none">激活码无效</p>
+    </div>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="app" class="app" style="display:none">
+    <!-- 顶栏 -->
+    <header class="app-header">
+      <div class="app-brand">
+        <div class="app-brand-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
+        </div>
+        <span>OnStarVoice 数据中心</span>
+      </div>
+      <div class="app-user">
+        <span id="userInfo"></span>
+        <button class="btn-logout" onclick="doLogout()">退出</button>
+      </div>
+    </header>
+
+    <!-- 统计卡片 -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-value" id="statTotal">-</div>
+        <div class="stat-label">总采集量</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="statRecent">-</div>
+        <div class="stat-label">近 7 天新增</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="statPlatforms">-</div>
+        <div class="stat-label">覆盖平台</div>
+      </div>
+    </div>
+
+    <!-- 工具栏 -->
+    <div class="toolbar">
+      <select id="filterPlatform" onchange="loadRecords()">
+        <option value="">全部平台</option>
+        <option value="xiaohongshu">小红书</option>
+        <option value="douyin">抖音</option>
+      </select>
+      <select id="filterSentiment" onchange="loadRecords()">
+        <option value="">全部情感</option>
+        <option value="positive">正面</option>
+        <option value="neutral">中性</option>
+        <option value="negative">负面</option>
+      </select>
+      <input type="text" id="filterKeyword" placeholder="搜索标题 / 关键词..." onkeyup="if(event.key==='Enter')loadRecords()">
+      <div class="toolbar-spacer"></div>
+      <button class="btn btn-outline" onclick="exportRecordsCsv()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        导出 CSV
+      </button>
+    </div>
+
+    <!-- 数据表格 -->
+    <div id="recordsTable" class="table-wrap"></div>
+    <div id="recordsPagination" class="pagination"></div>
+  </div>
+
+  <!-- 详情弹窗 -->
+  <div id="recordDetailModal" class="modal-overlay modal-hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>记录详情</h3>
+        <button class="modal-close" onclick="closeModal()">&times;</button>
+      </div>
+      <div id="recordDetailContent" class="modal-body"></div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="closeModal()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>

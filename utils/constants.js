@@ -148,11 +148,11 @@ export const API_ENDPOINT = {
   MONITOR_RUN_NOW: "/api/monitor/run-now",
 };
 
-// ==================== 激活码认领相关 ====================
+// ==================== 激活码绑定相关 ====================
 export const UNCLAIMED_CREDENTIAL_OWNER_EMAIL =
   "system+unclaimed-credential@onstarvoice.local";
 export const UNCLAIMED_CREDENTIAL_OWNER_NAME = "Unclaimed Credential Owner";
-export const UNCLAIMED_CREDENTIAL_OWNER_LABEL = "系统待认领账号";
+export const UNCLAIMED_CREDENTIAL_OWNER_LABEL = "系统未绑定账号";
 export const CREDENTIAL_CLAIM_PAGE_URL =
   "https://onstarvoice.local/account/credentials";
 
@@ -202,19 +202,19 @@ export const ERROR_MESSAGE_MAP = {
 
   // 鉴权相关错误
   [ERROR_REASON.EXPIRED]:
-    "激活码已过期，请续费或购买新激活码后重新验证。",
+    "激活码已过期，请续费或联系管理员获取新激活码。",
   [ERROR_REASON.FROZEN]:
-    "激活码已被冻结，请联系客服处理；也可购买新激活码继续使用。",
+    "激活码已被冻结，请联系管理员处理。",
   [ERROR_REASON.BINDING_LIMIT_REACHED]:
-    "当前激活码绑定环境已满。可替换旧环境，或购买新激活码。",
+    "当前激活码绑定环境已满。可替换旧环境，或联系管理员获取新激活码。",
   [ERROR_REASON.VERIFY_FAILED]: "激活码验证失败，请检查激活码是否正确",
   "NOT_VERIFIED":
-    "当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可点击购买。",
+    "当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可联系管理员获取。",
   "INVALID_CODE": "激活码格式不正确，请重新输入",
 
   // 配置相关错误
   [ERROR_REASON.INVALID_PAYLOAD]: "数据格式错误，请检查配置",
-  "INVALID_TARGET": "请先配置飞书多维表格信息",
+  "INVALID_TARGET": "请先配置数据同步目标信息",
   "MISSING_CONFIG": "配置信息不完整，请检查所有必填项",
 
   // 采集相关错误

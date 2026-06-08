@@ -235,7 +235,7 @@
                     rx="2" />
                   <path d="M2 10h20" />
                 </svg>
-                购买续费
+                获取授权
               </a>
               <a
                 href="https://onstarvoice.app/referral"
@@ -914,7 +914,7 @@
                 <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
               </svg>
               <span
-                >小红书每个账号每次扫描，消耗的积分是抖音的5倍。如果对标账号同时有抖音号，建议优先监控抖音账号更划算。</span
+                >小红书每个账号每次扫描耗时较长。如果对标账号同时有抖音号，建议优先监控抖音账号效率更高。</span
               >
             </div>
 
@@ -1020,7 +1020,7 @@
                   <path d="M12 12v9" />
                   <path d="m16 16-4-4-4 4" />
                 </svg>
-                同步飞书
+                同步后台
               </button>
             </div>
           </div>
@@ -1218,35 +1218,7 @@
                         >- / 2</span
                       >
                     </div>
-                    <div class="auth-info-row">
-                      <span class="auth-info-label auth-info-label-with-help">
-                        激活码积分
-                        <span class="auth-help-popover-wrap">
-                          <button
-                            type="button"
-                            class="auth-help-trigger"
-                            aria-label="查看积分消耗说明">
-                            ?
-                          </button>
-                          <span
-                            class="auth-help-popover"
-                            role="tooltip">
-                            <span class="auth-help-popover-title"
-                              >积分消耗项：</span
-                            >
-                            <span>抖音账号监控扫描：1 积分/次/账号</span>
-                            <span>小红书账号监控扫描：5 积分/次/账号</span>
-                            <span>主搜索词机会判断：3 积分/次</span>
-                            <span>搜索下拉词分析：3 积分/次</span>
-                          </span>
-                        </span>
-                      </span>
-                      <span
-                        class="auth-info-value"
-                        id="uiAuthCredits"
-                        >暂无</span
-                      >
-                    </div>
+                    <!-- 积分行已移除 -->
                     <div class="auth-info-row">
                       <span class="auth-info-label">到期时间</span>
                       <span
@@ -1292,26 +1264,10 @@
                           </svg>
                         </button>
                       </div>
-                      <button
-                        type="button"
-                        class="auth-member-tail"
-                        id="btnMemberGroupEntry"
-                        hidden>
-                        <span class="auth-member-tail-title">会员群</span>
-                      </button>
+                      <!-- 会员群入口已移除 -->
                     </div>
                   </div>
-                  <div
-                    class="status-bar is-warning auth-claim-hint"
-                    id="uiAuthClaimHint"
-                    hidden>
-                    当前激活码未关联用户账号，认领激活码后，飞书配置和对标监控数据将绑定到您的专属账号，确保数据安全归属。👉<a
-                      class="claim-link"
-                      id="btnGoClaim"
-                      href="#"
-                      >去认领</a
-                    >
-                  </div>
+                  <!-- 认领提示已移除 -->
                   <button
                     class="btn btn-primary btn-full"
                     id="btnVerify">
@@ -1325,12 +1281,12 @@
               </div>
             </div>
 
-            <!-- 飞书配置面板 -->
+            <!-- 数据同步配置面板 -->
             <div class="accordion-item">
               <div class="accordion-header">
                 <span
                   style="font-weight: var(--font-weight-bold); font-size: var(--font-size-md);"
-                  >飞书归档目标配置</span
+                  >数据同步配置</span
                 >
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -1347,30 +1303,14 @@
                 </svg>
               </div>
               <div class="accordion-content">
-                <div
-                  class="status-bar is-warning auth-claim-hint"
-                  id="uiClaimConfigHint"
-                  style="margin-bottom: var(--spacing-md);"
-                  hidden>
-                  当前激活码未关联用户账号，认领激活码后，飞书配置和对标监控数据将绑定到您的专属账号，确保数据安全归属。👉<a
-                    class="claim-link"
-                    id="btnGoClaimConfig"
-                    href="#"
-                    >去认领</a
-                  >
-                </div>
+                <!-- 认领提示已移除 -->
                 <p
                   style="font-size: var(--font-size-xs); color: var(--text-tertiary); margin-bottom: var(--spacing-md);">
-                  请填入用于沉淀您笔记和数据资产的飞书多维表格信息。<a
-                    href="#"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    >获取模版</a
-                  >
+                  配置数据同步目标，用于沉淀采集的舆情数据。
                 </p>
 
                 <div class="form-group">
-                  <label class="form-label">飞书多维表格文档URL</label>
+                  <label class="form-label">数据表文档URL</label>
                   <input
                     type="text"
                     class="form-input"
@@ -1427,7 +1367,7 @@
                 </div>
                 <div class="form-group">
                   <label class="form-label"
-                    >统一汇报 Webhook（飞书机器人）</label
+                    >统一汇报 Webhook</label
                   >
                   <input
                     type="text"
@@ -1822,7 +1762,7 @@
             id="contactModalTitle">
             有问题联系我们
           </h3>
-          <p class="modal-subtitle">反馈问题，提供产品建议或购买激活码</p>
+          <p class="modal-subtitle">反馈问题或提供产品建议</p>
         </div>
         <div class="contact-modal-body">
           <div class="contact-qr-frame">
@@ -1876,10 +1816,10 @@
           <h3
             class="modal-title"
             id="memberGroupModalTitle">
-            邀您加入会员群
+            加入用户交流群
           </h3>
           <p class="modal-subtitle">
-            扫码并备注「MC」加入会员群，可第一时间获取版本升级和实战用法，也可反馈问题与需求建议。
+            扫码加入交流群，可第一时间获取版本升级和实战用法，也可反馈问题与需求建议。
           </p>
         </div>
         <div class="contact-modal-body">
@@ -1887,7 +1827,7 @@
             <img
               class="contact-qr-image"
               src="../images/wechat.png"
-              alt="会员群二维码" />
+              alt="交流群二维码" />
           </div>
         </div>
         <label class="member-group-confirm">

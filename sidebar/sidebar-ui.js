@@ -48,10 +48,10 @@ const executionSectionCollapsedState = {
 const dataPoolGroupCollapsedState = new Map();
 const PRICING_PAGE_URL = "https://onstarvoice.app/#pricing";
 const PURCHASE_LINK_PHRASES = Object.freeze([
-  "续费或购买新激活码",
-  "购买新激活码",
-  "增购积分",
-  "点击购买",
+  "续费激活码",
+  "获取新激活码",
+  "联系管理员",
+  "获取授权",
 ]);
 const TOAST_DEFAULT_DURATION_MS = 7000;
 const TOAST_FADE_OUT_DURATION_MS = 300;
@@ -1087,7 +1087,7 @@ document.addEventListener("DOMContentLoaded", () => {
         window.clearStatusFeedback?.("uiAuthFeedback");
         if (pendingClaim) {
           authCard.classList.add("is-unclaimed");
-          badge.textContent = "待认领";
+          badge.textContent = "未绑定";
           badge.style.color = "var(--status-warning)";
           if (claimHint) claimHint.hidden = false;
           if (claimConfigHint) claimConfigHint.hidden = false;
@@ -1313,7 +1313,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const syncSectionHtml = renderExecutionSection({
       key: "sync",
       title: "同步记录",
-      subtitle: "飞书同步记录，包括笔记、博主信息、评论等同步任务；可手动清空本地缓存",
+      subtitle: "数据同步记录，包括笔记、博主信息、评论等同步任务；可手动清空本地缓存",
       emptyText: "暂无同步记录",
       content:
         filteredSyncEntries.length > 0
@@ -1835,9 +1835,9 @@ function buildBatchExecutionDetail(batchEntries, monitorById) {
     let line = `${statusIcon} ${name}（${platformLabel}）`;
 
     if (status === "success" || status === "no_hit") {
-      line += `  扫描 ${scanned} · 命中 ${hits} · 积分 ${credits}`;
+      line += `  扫描 ${scanned} · 命中 ${hits} · 消耗 ${credits}`;
     } else if (status === "skipped_no_balance") {
-      line += `  积分不足跳过`;
+      line += `  配额不足跳过`;
     } else if (status === "running") {
       line += `  执行中`;
     } else {
@@ -1855,7 +1855,7 @@ function buildBatchExecutionDetail(batchEntries, monitorById) {
 
   const totalCredits = batchEntries.reduce((sum, e) => sum + Number(e?.costCredits || 0), 0);
   lines.push("");
-  lines.push(`总消耗积分：${totalCredits}`);
+  lines.push(`总消耗额度：${totalCredits}`);
   lines.push(`开始时间：${formatMonitorDateTime(batchEntries[0]?.startedAt)}`);
   const lastFinished = batchEntries.reduce((latest, e) => {
     const t = e?.finishedAt || e?.startedAt;
@@ -1911,7 +1911,7 @@ function getMonitorStatusLabel(status) {
     case "paused":
       return "已暂停";
     case "paused_insufficient_balance":
-      return "积分不足";
+      return "配额不足";
     case "deleted":
       return "已删除";
     case "success":
@@ -1921,7 +1921,7 @@ function getMonitorStatusLabel(status) {
     case "failed":
       return "执行失败";
     case "skipped_no_balance":
-      return "积分不足跳过";
+      return "配额不足跳过";
     case "running":
       return "执行中";
     default:
@@ -2012,7 +2012,7 @@ function getMonitorRecordButtonState(record, recordPlatform) {
       label: "纳入监控",
       disabled: true,
       tooltip:
-        "当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可点击购买。",
+        "当前功能需要激活码授权，已有激活码请在设置中完成验证；还没有可联系管理员获取。",
     };
   }
 
@@ -2052,7 +2052,7 @@ function renderMonitorSubscriptionCard(item, monitorConfig) {
   const nextStatus = status === "active" ? "paused" : "active";
   const insufficientHint =
     status === "paused_insufficient_balance"
-      ? `<div class="monitor-item-hint">${formatRichMessageHtml("该监控项已因积分不足暂停。增购积分后点击“恢复”即可继续执行。")}</div>`
+      ? `<div class="monitor-item-hint">${formatRichMessageHtml("该监控项已因配额不足暂停。获取更多配额后点击“恢复”即可继续执行。")}</div>`
       : "";
 
   return `
@@ -2894,9 +2894,9 @@ function resolveMonitorHistoryPresentation(entry) {
 
   if (status === "credit_insufficient") {
     return {
-      statusLabel: "积分不足",
+      statusLabel: "配额不足",
       statusColor: "var(--status-warning)",
-      summary: fallbackSummary || "未执行扫描（积分不足）",
+      summary: fallbackSummary || "未执行扫描（配额不足）",
     };
   }
 

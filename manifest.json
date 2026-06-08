@@ -14,7 +14,8 @@
     "*://www.xiaohongshu.com/*",
     "*://www.douyin.com/*",
     "*://v.douyin.com/*",
-    "https://api.onstarvoice.local/*"
+    "https://api.onstarvoice.local/*",
+    "http://localhost:3000/*"
   ],
   "action": {
     "default_icon": {
