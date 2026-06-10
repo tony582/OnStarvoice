@@ -7,12 +7,26 @@ import { getSetting } from '../db/init.js';
 
 let transporter = null;
 
-function getTransporter() {
-  const host = getSetting('smtp_host') || process.env.SMTP_HOST;
-  const port = Number(getSetting('smtp_port') || process.env.SMTP_PORT || 465);
-  const secure = (getSetting('smtp_secure') || process.env.SMTP_SECURE || 'true') === 'true';
-  const user = getSetting('smtp_user') || process.env.SMTP_USER;
-  const pass = getSetting('smtp_pass') || process.env.SMTP_PASS;
+function escHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeUrl(value) {
+  const url = String(value || '');
+  return /^https?:\/\//i.test(url) ? url : '';
+}
+
+async function getTransporter(tenantId) {
+  const host = await getSetting('smtp_host', tenantId) || process.env.SMTP_HOST;
+  const port = Number(await getSetting('smtp_port', tenantId) || process.env.SMTP_PORT || 465);
+  const secure = (await getSetting('smtp_secure', tenantId) || process.env.SMTP_SECURE || 'true') === 'true';
+  const user = await getSetting('smtp_user', tenantId) || process.env.SMTP_USER;
+  const pass = await getSetting('smtp_pass', tenantId) || process.env.SMTP_PASS;
 
   if (!host || !user || !pass) {
     return null;
@@ -45,15 +59,15 @@ const LEVEL_COLOR = {
 /**
  * 发送预警邮件
  */
-export async function sendAlertEmail(alert) {
-  const t = getTransporter();
+export async function sendAlertEmail(alert, tenantId = null) {
+  const t = await getTransporter(tenantId);
   if (!t) {
     console.log('[Email] SMTP not configured, skipping notification');
     return;
   }
 
-  const from = getSetting('email_from') || process.env.EMAIL_FROM || '';
-  const to = getSetting('email_to') || process.env.EMAIL_TO || '';
+  const from = await getSetting('email_from', tenantId) || process.env.EMAIL_FROM || '';
+  const to = await getSetting('email_to', tenantId) || process.env.EMAIL_TO || '';
 
   if (!to) {
     console.log('[Email] No recipient configured');
@@ -63,12 +77,13 @@ export async function sendAlertEmail(alert) {
   const levelLabel = LEVEL_LABEL[alert.level] || alert.level;
   const levelColor = LEVEL_COLOR[alert.level] || '#666';
 
-  const subject = `[OnStarVoice 舆情预警] ${levelLabel} ${alert.reason}`;
+  const subject = `[OnStarVoice 星语舆情预警] ${levelLabel} ${alert.reason}`;
+  const alertUrl = safeUrl(alert.url);
 
   const html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto;">
       <div style="background: linear-gradient(135deg, #0077B6 0%, #00B4D8 100%); padding: 20px 24px; border-radius: 12px 12px 0 0;">
-        <h2 style="color: #fff; margin: 0; font-size: 18px;">OnStarVoice 舆情预警</h2>
+        <h2 style="color: #fff; margin: 0; font-size: 18px;">OnStarVoice 星语舆情预警</h2>
       </div>
       <div style="border: 1px solid #E5E7EB; border-top: none; padding: 24px; border-radius: 0 0 12px 12px;">
         <div style="display: flex; align-items: center; margin-bottom: 16px;">
@@ -77,27 +92,27 @@ export async function sendAlertEmail(alert) {
           </span>
         </div>
 
-        <h3 style="margin: 0 0 8px; color: #111827; font-size: 16px;">${alert.title || '(无标题)'}</h3>
+        <h3 style="margin: 0 0 8px; color: #111827; font-size: 16px;">${escHtml(alert.title || '(无标题)')}</h3>
 
         <p style="color: #6B7280; font-size: 14px; line-height: 1.6; margin: 0 0 16px;">
-          ${alert.summary || ''}
+          ${escHtml(alert.summary || '')}
         </p>
 
         <table style="width: 100%; border-collapse: collapse; font-size: 13px; color: #374151;">
           <tr>
             <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6; font-weight: 600; width: 100px;">预警原因</td>
-            <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6;">${alert.reason}</td>
+            <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6;">${escHtml(alert.reason)}</td>
           </tr>
           ${alert.interaction_total ? `
           <tr>
             <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6; font-weight: 600;">总互动量</td>
             <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6;">${alert.interaction_total}</td>
           </tr>` : ''}
-          ${alert.url ? `
+          ${alertUrl ? `
           <tr>
             <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6; font-weight: 600;">原文链接</td>
             <td style="padding: 8px 0; border-bottom: 1px solid #F3F4F6;">
-              <a href="${alert.url}" style="color: #0077B6;">${alert.url}</a>
+              <a href="${escHtml(alertUrl)}" style="color: #0077B6;">${escHtml(alertUrl)}</a>
             </td>
           </tr>` : ''}
           <tr>
@@ -107,7 +122,7 @@ export async function sendAlertEmail(alert) {
         </table>
 
         <div style="margin-top: 24px; padding: 12px; background: #F9FAFB; border-radius: 8px; font-size: 12px; color: #9CA3AF;">
-          此邮件由 OnStarVoice 舆情监控系统自动发送，请勿直接回复。
+          此邮件由 OnStarVoice 星语舆情监控系统自动发送，请勿直接回复。
         </div>
       </div>
     </div>
@@ -120,17 +135,16 @@ export async function sendAlertEmail(alert) {
 /**
  * 发送报表邮件
  */
-export async function sendReportEmail(subject, htmlContent) {
-  const t = getTransporter();
+export async function sendReportEmail(subject, htmlContent, tenantId = null) {
+  const t = await getTransporter(tenantId);
   if (!t) {
-    console.log('[Email] SMTP not configured, skipping report');
-    return;
+    throw new Error('SMTP 未配置，报告未发送');
   }
 
-  const from = getSetting('email_from') || process.env.EMAIL_FROM || '';
-  const to = getSetting('email_to') || process.env.EMAIL_TO || '';
+  const from = await getSetting('email_from', tenantId) || process.env.EMAIL_FROM || '';
+  const to = await getSetting('email_to', tenantId) || process.env.EMAIL_TO || '';
 
-  if (!to) return;
+  if (!to) throw new Error('报告收件人未配置，报告未发送');
 
   await t.sendMail({ from, to, subject, html: htmlContent });
   console.log(`[Email] Report sent to ${to}`);
@@ -139,20 +153,20 @@ export async function sendReportEmail(subject, htmlContent) {
 /**
  * 发送测试邮件
  */
-export async function sendTestEmail() {
-  const t = getTransporter();
+export async function sendTestEmail(tenantId = null) {
+  const t = await getTransporter(tenantId);
   if (!t) {
     throw new Error('SMTP 未配置');
   }
 
-  const from = getSetting('email_from') || process.env.EMAIL_FROM || '';
-  const to = getSetting('email_to') || process.env.EMAIL_TO || '';
+  const from = await getSetting('email_from', tenantId) || process.env.EMAIL_FROM || '';
+  const to = await getSetting('email_to', tenantId) || process.env.EMAIL_TO || '';
 
   if (!to) throw new Error('收件人未配置');
 
   await t.sendMail({
     from, to,
-    subject: '[OnStarVoice] 测试邮件',
+    subject: '[OnStarVoice 星语] 测试邮件',
     html: '<p>这是一封测试邮件，如果你收到了说明邮件通知配置正确。</p>',
   });
 

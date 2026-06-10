@@ -372,12 +372,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
       finalTitle = cleanText(finalTitle);
 
       // 提取封面
-      const coverSelectors = SEARCH_RESULTS_SELECTORS.noteCard.cover;
-      const coverElement = querySelector(coverSelectors, item);
-      let cover = coverElement ? normalizeMediaUrl(coverElement.src) : "";
-      if (isLikelyAvatarUrl(cover)) {
-        cover = "";
-      }
+      const cover = extractCoverImageFromCard(item);
 
       // 提取最近编辑时间
       const publishDateRaw = extractPublishDateFromCard(item);
@@ -393,6 +388,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         extractAuthorFromCard(item, publishDateRaw),
         publishDateRaw,
       );
+      const authorAvatar = extractAuthorAvatarFromCard(item);
 
       // 提取笔记类型
       const noteType = detectKeywordNoteType(item);
@@ -440,6 +436,8 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         title: finalTitle,
         coverImageUrl: cover,
         author: authorName,
+        authorAvatar,
+        avatarUrl: authorAvatar,
         noteType,
         publishDate,
         publishDateRaw,
@@ -546,6 +544,32 @@ function extractTitleFromCard(cardNode) {
   );
 }
 
+function extractCoverImageFromCard(cardNode) {
+  if (!cardNode) return "";
+
+  const candidates = [];
+  const coverSelectors = SEARCH_RESULTS_SELECTORS.noteCard.cover || [];
+  coverSelectors.forEach((selector) => {
+    try {
+      cardNode.querySelectorAll(selector).forEach((element) => {
+        candidates.push(extractImageUrlFromElement(element));
+      });
+    } catch (error) {
+      console.warn("[Capture] Invalid cover selector:", selector, error);
+    }
+  });
+
+  cardNode.querySelectorAll?.("img")?.forEach((element) => {
+    candidates.push(extractImageUrlFromElement(element));
+  });
+
+  return (
+    candidates
+      .map(normalizeMediaUrl)
+      .find((url) => url && !isLikelyAvatarUrl(url)) || ""
+  );
+}
+
 function extractAuthorFromCard(cardNode, publishDateRaw = "") {
   if (!cardNode) return "";
 
@@ -562,6 +586,36 @@ function extractAuthorFromCard(cardNode, publishDateRaw = "") {
   return normalizeAuthorName(
     cleanText(authorHint?.textContent || ""),
     publishDateRaw,
+  );
+}
+
+function extractAuthorAvatarFromCard(cardNode) {
+  if (!cardNode) return "";
+
+  const avatarSelectors = SEARCH_RESULTS_SELECTORS.noteCard.avatar || [];
+  const avatarElement = querySelector(avatarSelectors, cardNode);
+  const directUrl = normalizeMediaUrl(extractImageUrlFromElement(avatarElement));
+  if (isLikelyAvatarUrl(directUrl)) return directUrl;
+
+  const imageElements = Array.from(cardNode.querySelectorAll?.("img") || []);
+  for (const image of imageElements) {
+    const url = normalizeMediaUrl(extractImageUrlFromElement(image));
+    if (isLikelyAvatarUrl(url)) return url;
+  }
+
+  return "";
+}
+
+function extractImageUrlFromElement(element) {
+  if (!element) return "";
+  return (
+    element.getAttribute?.("src") ||
+    element.getAttribute?.("data-src") ||
+    element.getAttribute?.("data-original") ||
+    element.getAttribute?.("data-lazy-src") ||
+    element.currentSrc ||
+    element.src ||
+    ""
   );
 }
 

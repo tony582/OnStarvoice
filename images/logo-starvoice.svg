@@ -1,0 +1,28 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="40" y1="28" x2="216" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="0.55" stop-color="#1D4ED8"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="star" x1="77" y1="67" x2="180" y2="183" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DFF7FF"/>
+    </linearGradient>
+    <filter id="softShadow" x="35" y="42" width="187" height="178" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#0F172A" flood-opacity="0.2"/>
+    </filter>
+  </defs>
+
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
+  <path d="M61 134C61 96.4 91.5 66 129.1 66H140.5C171.6 66 196.8 91.2 196.8 122.3C196.8 153.4 171.6 178.6 140.5 178.6H112.7L78.5 198.8C73.7 201.6 67.9 197.5 68.8 192L74.8 156.8C66.2 144.3 61 136.6 61 134Z" fill="white" fill-opacity="0.18"/>
+
+  <g filter="url(#softShadow)">
+    <path d="M126.7 62.5C129 57.1 136.7 57.1 139 62.5L153.2 95.9C154 97.8 155.5 99.3 157.4 100.1L190.8 114.3C196.2 116.6 196.2 124.3 190.8 126.6L157.4 140.8C155.5 141.6 154 143.1 153.2 145L139 178.4C136.7 183.8 129 183.8 126.7 178.4L112.5 145C111.7 143.1 110.2 141.6 108.3 140.8L74.9 126.6C69.5 124.3 69.5 116.6 74.9 114.3L108.3 100.1C110.2 99.3 111.7 97.8 112.5 95.9L126.7 62.5Z" fill="url(#star)"/>
+    <circle cx="132.8" cy="120.4" r="11.5" fill="#2563EB"/>
+  </g>
+
+  <path d="M164.4 78.8C185.6 87.8 199.9 106.1 203 128.5" stroke="#CFFAFE" stroke-width="11" stroke-linecap="round"/>
+  <path d="M172.2 54.6C204.5 66.3 226.2 94.1 230.2 128.2" stroke="#E0F2FE" stroke-width="9" stroke-linecap="round" opacity="0.82"/>
+  <path d="M84.7 179.9L68.3 198.3C64.6 202.4 57.9 199.2 58.7 193.7L62.6 166.1" stroke="#DFF7FF" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

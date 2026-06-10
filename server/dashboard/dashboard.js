@@ -158,13 +158,13 @@ async function loadRecords(page) {
       return '<tr onclick="showRecordDetail(' + idx + ')">' +
         '<td>' + typeIcon(r) + '</td>' +
         '<td><div class="cell-title">' + escHtml(r.title || '(无标题)') + (contentPreview ? '<div class="preview">' + escHtml(contentPreview) + '</div>' : '') + '</div></td>' +
-        '<td>' + (PLATFORM_LABEL[r.platform] || r.platform) + '</td>' +
+        '<td>' + escHtml(PLATFORM_LABEL[r.platform] || r.platform) + '</td>' +
         '<td class="cell-truncate">' + escHtml(r.author_name || '-') + '</td>' +
         '<td class="cell-nowrap">' + (r.author_fans > 0 ? formatNum(r.author_fans) : '-') + '</td>' +
-        '<td class="cell-nowrap">' + r.likes + ' / ' + r.comments_count + ' / ' + r.collects + '</td>' +
-        '<td>' + (r.sentiment ? '<span class="badge badge-' + r.sentiment + '">' + (SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '-') + '</td>' +
-        '<td>' + (r.comments_total_captured > 0 ? r.comments_total_captured + '条' : (r.comments_capture_status || '-')) + '</td>' +
-        '<td class="cell-nowrap">' + (r.created_at ? r.created_at.slice(0, 10) : '-') + '</td>' +
+        '<td class="cell-nowrap">' + r.likes + ' / ' + r.comments_count + ' / ' + r.collects + ' / ' + (r.shares || 0) + '</td>' +
+        '<td>' + (r.sentiment ? '<span class="badge badge-' + escHtml(r.sentiment) + '">' + escHtml(SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '-') + '</td>' +
+        '<td>' + escHtml(r.comments_total_captured > 0 ? r.comments_total_captured + '条' : (r.comments_capture_status || '-')) + '</td>' +
+        '<td class="cell-nowrap">' + escHtml(r.created_at ? r.created_at.slice(0, 10) : '-') + '</td>' +
         '</tr>';
     }).join('') + '</tbody></table>';
 
@@ -184,7 +184,28 @@ async function loadRecords(page) {
 // ==================== Helpers ====================
 
 function escHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(str == null ? '' : str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+function safeHref(url) {
+  var value = String(url || '');
+  return /^https?:\/\//i.test(value) ? value : '';
+}
+
+function linkHtml(url, label) {
+  var href = safeHref(url);
+  if (!href) return escHtml(label || '-');
+  return '<a href="' + escHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escHtml(label || href) + '</a>';
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  try { return JSON.parse(value || '[]'); } catch(e) { return []; }
 }
 
 function formatNum(n) {
@@ -205,42 +226,40 @@ function showRecordDetail(idx) {
   var r = cachedRecords[idx];
   if (!r) return;
 
-  var tags = [];
-  try { tags = JSON.parse(r.tags || '[]'); } catch(e) {}
-  var imageUrls = [];
-  try { imageUrls = JSON.parse(r.image_urls || '[]'); } catch(e) {}
+  var tags = parseJsonArray(r.tags);
+  var imageUrls = parseJsonArray(r.image_urls);
 
   var html = '<table class="detail-table">';
   var rows = [
-    ['采集平台', PLATFORM_LABEL[r.platform] || r.platform],
+    ['采集平台', escHtml(PLATFORM_LABEL[r.platform] || r.platform)],
     ['博主', escHtml(r.author_name || '-')],
-    ['博主主页', r.blogger_profile_url ? '<a href="' + r.blogger_profile_url + '" target="_blank">查看主页</a>' : '-'],
+    ['博主主页', r.blogger_profile_url ? linkHtml(r.blogger_profile_url, '查看主页') : '-'],
     ['粉丝数', r.author_fans > 0 ? r.author_fans.toLocaleString() : '-'],
     ['点赞与收藏数', r.blogger_liked_collected > 0 ? r.blogger_liked_collected.toLocaleString() : '-'],
-    ['账号属性', ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '-'],
+    ['账号属性', escHtml(ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '-')],
     ['标题', escHtml(r.title || '-')],
-    ['笔记链接', r.url ? '<a href="' + r.url + '" target="_blank">' + escHtml(r.url.slice(0, 60)) + (r.url.length > 60 ? '...' : '') + '</a>' : '-'],
+    ['笔记链接', r.url ? linkHtml(r.url, r.url.slice(0, 60) + (r.url.length > 60 ? '...' : '')) : '-'],
     ['正文', '<div class="detail-content">' + escHtml(r.content || '(无内容)') + '</div>'],
     ['话题标签', tags.length > 0 ? tags.map(function(t) { return '<span class="tag-chip">' + escHtml(typeof t === 'string' ? t : (t.name || t.tagName || '')) + '</span>'; }).join(' ') : '-'],
     ['笔记类型', r.video_url ? '视频' : '图文'],
-    ['封面链接', r.cover_url ? '<a href="' + r.cover_url + '" target="_blank">查看封面</a>' : '-'],
-    ['图片链接', imageUrls.length > 0 ? imageUrls.length + ' 张 - <a href="' + imageUrls[0] + '" target="_blank">查看首张</a>' : '-'],
-    ['视频链接', r.video_url ? '<a href="' + r.video_url + '" target="_blank">查看视频</a>' : '-'],
-    ['视频时长', r.video_duration || '-'],
+    ['封面链接', r.cover_url ? linkHtml(r.cover_url, '查看封面') : '-'],
+    ['图片链接', imageUrls.length > 0 ? imageUrls.length + ' 张 - ' + linkHtml(imageUrls[0], '查看首张') : '-'],
+    ['视频链接', r.video_url ? linkHtml(r.video_url, '查看视频') : '-'],
+    ['视频时长', escHtml(r.video_duration || '-')],
     ['点赞 / 收藏 / 评论 / 转发', r.likes + ' / ' + r.collects + ' / ' + r.comments_count + ' / ' + r.shares],
     ['评论内容', r.comments_text ? '<div class="detail-content">' + escHtml(r.comments_text.slice(0, 600)) + (r.comments_text.length > 600 ? '...' : '') + '</div>' : '-'],
-    ['评论采集状态', r.comments_capture_status || '-'],
+    ['评论采集状态', escHtml(r.comments_capture_status || '-')],
     ['评论采集条数', r.comments_total_captured > 0 ? String(r.comments_total_captured) : '-'],
     ['采集时间', formatDateTime(r.capture_timestamp || r.created_at)],
-    ['笔记编辑时间', r.publish_time || '-'],
-    ['搜索关键词', r.keyword || '-'],
+    ['笔记编辑时间', escHtml(r.publish_time || '-')],
+    ['搜索关键词', escHtml(r.keyword || '-')],
   ];
 
   if (r.sentiment) {
     rows.push(['AI 情感分析', '<span class="badge badge-' + r.sentiment + '">' + (SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>']);
   }
   if (r.category) {
-    rows.push(['AI 分类', CATEGORY_LABEL[r.category] || r.category]);
+    rows.push(['AI 分类', escHtml(CATEGORY_LABEL[r.category] || r.category)]);
   }
   if (r.ai_summary) {
     rows.push(['AI 摘要', escHtml(r.ai_summary)]);

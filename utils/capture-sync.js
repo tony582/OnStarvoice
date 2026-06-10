@@ -127,6 +127,14 @@ function hasCommentLeadsEligibleType(syncTypes = []) {
     : false;
 }
 
+function applySyncPreferencesToPayload(payload = {}, captureSettings = {}) {
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  return {
+    ...safePayload,
+    skipOfficialAccounts: captureSettings.skipOfficialAccounts !== false,
+  };
+}
+
 // ==================== M4-03: 前端接入 sync 调用 ====================
 
 /**
@@ -275,9 +283,13 @@ export async function captureAndSync({
 
     const syncResult =
       recordIds.length === 1
-        ? await syncRecord(recordId, onProgress, { commentLeadsConfig })
+        ? await syncRecord(recordId, onProgress, {
+            captureSettings,
+            commentLeadsConfig,
+          })
         : await syncRecordBatch(recordIds, onProgress, {
             trigger: 'capture_auto',
+            captureSettings,
             commentLeadsConfig,
           });
 
@@ -1520,10 +1532,15 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
     }
 
     const requestTarget = buildSyncTargetPayload(target);
+    const captureSettings = options?.captureSettings || await getCaptureSettings();
     const commentLeadsConfig = normalizeCommentLeadsConfig(
       options?.commentLeadsConfig || {},
     );
     const syncInput = resolveSyncInputForRecord(record, requestTarget);
+    syncInput.payload = applySyncPreferencesToPayload(
+      syncInput.payload,
+      captureSettings,
+    );
     const resolvedTableName = syncInput.tableName || resolveSyncTableName(requestTarget, syncInput.syncType);
 
     console.log('[CaptureSync] Sync request target:', {
@@ -1915,6 +1932,7 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
   const skippedRecordIds = requestedRecordIds.slice(MAX_SYNC_RECORDS_PER_BATCH);
   const target = await getTarget();
   const requestTarget = buildSyncTargetPayload(target);
+  const captureSettings = options?.captureSettings || await getCaptureSettings();
   const commentLeadsConfig = normalizeCommentLeadsConfig(
     options?.commentLeadsConfig || {},
   );
@@ -1929,7 +1947,10 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
       ...record,
       platform: syncInput.platform,
       syncType: syncInput.syncType,
-      syncPayload: syncInput.payload,
+      syncPayload: applySyncPreferencesToPayload(
+        syncInput.payload,
+        captureSettings,
+      ),
       workflow: syncInput.workflow,
       sourceType: record.type,
       retryCommentLeadsOnly:
@@ -2008,6 +2029,8 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
       group.records.map((record) => ({
         id: record.id,
         type: record.syncType || record.type,
+        platform: record.platform,
+        workflow: record.workflow,
         payload: record.syncPayload || record.payload,
       })),
       requestTarget,
@@ -6144,6 +6167,10 @@ function buildKeywordSearchUrl(keyword, platform, baseSearchUrl) {
 
   if (platform === 'douyin') {
     return `https://www.douyin.com/search/${encodedKeyword}?type=video`;
+  }
+
+  if (platform === 'weibo') {
+    return `https://s.weibo.com/weibo?q=${encodedKeyword}`;
   }
 
   // 小红书：统一构造到搜索结果路由，避免把关键词拼到 explore/discovery 等无效路径上

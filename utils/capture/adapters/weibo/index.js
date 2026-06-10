@@ -85,6 +85,6 @@ export const weiboAdapter = {
   },
 
   detectKeywordSortDimension() {
-    return { dimension: "time", source: "default" };
+    return { dimension: "likes", source: "weibo_default" };
   },
 };

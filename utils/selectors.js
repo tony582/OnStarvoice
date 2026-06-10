@@ -341,6 +341,16 @@ export const SEARCH_RESULTS_SELECTORS = {
     ],
     title: [".title", ".note-title", ".card-title", "[data-v-card] .title"],
     cover: [".cover img", ".note-cover img", 'img[src*="xhscdn"]'],
+    avatar: [
+      ".author img",
+      ".user img",
+      ".user-info img",
+      ".avatar img",
+      ".author-avatar img",
+      ".user-avatar img",
+      'img[src*="sns-avatar"]',
+      'img[src*="/avatar/"]',
+    ],
     author: [".author", ".user-name", ".nickname", "[data-v-card] .author"],
     publishDate: [
       "time[datetime]",

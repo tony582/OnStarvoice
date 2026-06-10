@@ -16,6 +16,7 @@ const DEFAULT_RUNTIME = {
 const PLATFORM_HOME_URLS = Object.freeze({
   xiaohongshu: 'https://www.xiaohongshu.com/explore?channel_id=homefeed_recommend',
   douyin: 'https://www.douyin.com/jingxuan',
+  weibo: 'https://s.weibo.com/weibo',
 });
 const SIDEBAR_PAGE_PATH = 'sidebar/sidebar.html';
 
@@ -55,7 +56,7 @@ function getAppVersion() {
 
 function normalizePlatformId(platform) {
   const normalized = String(platform || '').trim().toLowerCase();
-  if (normalized === 'xiaohongshu' || normalized === 'douyin') {
+  if (normalized === 'xiaohongshu' || normalized === 'douyin' || normalized === 'weibo') {
     return normalized;
   }
   return 'unknown';

@@ -12,6 +12,7 @@ export const CAPTURE_SETTINGS_KEYS = {
   ENABLE_COMMENT_LEADS_FILTER: "capture.enableCommentLeadsFilter",
   ENABLE_COMMENT_LEADS_FILTER_ON_DETAIL_CAPTURE:
     "capture.enableCommentLeadsFilterOnDetailCapture",
+  SKIP_OFFICIAL_ACCOUNTS: "capture.skipOfficialAccounts",
   COMMENT_LEADS_KEYWORDS: "capture.commentLeadsKeywords",
   COMMENT_LEADS_IPS: "capture.commentLeadsIps",
   INCLUDE_BLOGGER_METRICS_ON_NOTE_CAPTURE:
@@ -57,6 +58,7 @@ export const DEFAULT_CAPTURE_SETTINGS = {
   includeCommentsOnDetailCapture: false,
   enableCommentLeadsFilter: false,
   enableCommentLeadsFilterOnDetailCapture: false,
+  skipOfficialAccounts: true,
   commentLeadsKeywords: "",
   commentLeadsIps: "",
   includeBloggerMetricsOnNoteCapture: false,
@@ -190,6 +192,10 @@ export async function getCaptureSettings() {
         raw[CAPTURE_SETTINGS_KEYS.ENABLE_COMMENT_LEADS_FILTER],
         DEFAULT_CAPTURE_SETTINGS.enableCommentLeadsFilterOnDetailCapture,
       ),
+    ),
+    skipOfficialAccounts: normalizeBoolean(
+      raw[CAPTURE_SETTINGS_KEYS.SKIP_OFFICIAL_ACCOUNTS],
+      DEFAULT_CAPTURE_SETTINGS.skipOfficialAccounts,
     ),
     commentLeadsKeywords: normalizeText(
       raw[CAPTURE_SETTINGS_KEYS.COMMENT_LEADS_KEYWORDS],
@@ -360,6 +366,10 @@ export async function saveCaptureSettings(updates = {}) {
         next.enableCommentLeadsFilterOnDetailCapture,
         DEFAULT_CAPTURE_SETTINGS.enableCommentLeadsFilterOnDetailCapture,
       ),
+    [CAPTURE_SETTINGS_KEYS.SKIP_OFFICIAL_ACCOUNTS]: normalizeBoolean(
+      next.skipOfficialAccounts,
+      DEFAULT_CAPTURE_SETTINGS.skipOfficialAccounts,
+    ),
     [CAPTURE_SETTINGS_KEYS.COMMENT_LEADS_KEYWORDS]: normalizeText(
       next.commentLeadsKeywords,
       DEFAULT_CAPTURE_SETTINGS.commentLeadsKeywords,

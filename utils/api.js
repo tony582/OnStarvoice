@@ -9,9 +9,15 @@ import { ensurePlainAuthCode } from './auth-code.js';
 
 // ==================== 配置 ====================
 
-const API_BASE_URL =
-  globalThis.__ONSTARVOICE_API_BASE_URL__ ||
-  'http://localhost:3000';
+const API_BASE_URLS = [
+  globalThis.__ONSTARVOICE_API_BASE_URL__,
+  'http://localhost:3001',
+  'http://127.0.0.1:3001',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+].filter(Boolean);
+
+let activeApiBaseUrl = API_BASE_URLS[0];
 
 // ==================== 通用请求函数 ====================
 
@@ -25,7 +31,29 @@ async function request(endpoint, options = {}) {
     timeout = DEFAULT_CONFIG.REQUEST_TIMEOUT,
   } = options;
 
-  const url = `${API_BASE_URL}${endpoint}`;
+  const baseUrls = [activeApiBaseUrl, ...API_BASE_URLS.filter(base => base !== activeApiBaseUrl)];
+  let lastNetworkError = null;
+
+  for (const baseUrl of baseUrls) {
+    const result = await requestOnce(baseUrl, endpoint, { method, body, timeout });
+    if (!result?.__networkError) {
+      activeApiBaseUrl = baseUrl;
+      return result;
+    }
+    lastNetworkError = result;
+  }
+
+  return lastNetworkError;
+}
+
+async function requestOnce(baseUrl, endpoint, options = {}) {
+  const {
+    method = 'POST',
+    body = null,
+    timeout = DEFAULT_CONFIG.REQUEST_TIMEOUT,
+  } = options;
+
+  const url = `${baseUrl}${endpoint}`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -118,12 +146,14 @@ async function request(endpoint, options = {}) {
         message: timeoutError.message,
         error: timeoutError,
         data: null,
+        __networkError: true,
       };
     }
 
     const networkError = {
       reason: ERROR_REASON.NETWORK_ERROR,
-      message: error.message || 'Network error',
+      message: `${error.message || 'Network error'}（后台地址：${baseUrl}）`,
+      url,
     };
 
     return {
@@ -133,6 +163,7 @@ async function request(endpoint, options = {}) {
       message: networkError.message,
       error: networkError,
       data: null,
+      __networkError: true,
     };
   }
 }
@@ -269,6 +300,8 @@ export async function syncBatch(records, target) {
     records: records.map((record) => ({
       recordId: record.id,
       syncType: record.type,
+      platform: record.platform,
+      workflow: record.workflow,
       payload: record.payload,
     })),
   };

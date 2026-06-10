@@ -1,158 +1,105 @@
-import initSqlJs from 'sql.js';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { runMigrations } from './migrate.js';
+import { assertDbConnection, closePool } from './pool.js';
+import { queryAll, queryOne, execute, withTransaction } from './query.js';
+import { ensureBootstrapAdmin } from '../services/auth-service.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-let db = null;
-let dbPath = '';
+let initialized = false;
+let defaultTenantId = null;
 
 export async function initDb() {
-  if (db) return db;
-
-  const dataDir = join(__dirname, '..', 'data');
-  mkdirSync(dataDir, { recursive: true });
-  dbPath = join(dataDir, 'onstarvoice.db');
-
-  const SQL = await initSqlJs();
-
-  if (existsSync(dbPath)) {
-    const fileBuffer = readFileSync(dbPath);
-    db = new SQL.Database(fileBuffer);
-  } else {
-    db = new SQL.Database();
-  }
-
-  db.run('PRAGMA foreign_keys = ON');
-
-  // 建表
-  const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf-8');
-  db.run(schema);
-
-  // 持久化
-  saveDb();
-
-  console.log('[DB] SQLite initialized:', dbPath);
-  return db;
+  if (initialized) return true;
+  await assertDbConnection();
+  await runMigrations();
+  await ensureBootstrapAdmin();
+  initialized = true;
+  console.log('[DB] PostgreSQL initialized');
+  return true;
 }
 
-export function getDb() {
-  if (!db) throw new Error('Database not initialized. Call initDb() first.');
-  return db;
-}
-
-export function saveDb() {
-  if (!db) return;
-  const data = db.export();
-  writeFileSync(dbPath, Buffer.from(data));
-}
-
-// 每 30 秒自动保存
-let saveInterval = null;
 export function startAutoSave() {
-  if (saveInterval) return;
-  saveInterval = setInterval(() => saveDb(), 30000);
+  // PostgreSQL persists writes immediately. This remains as a no-op for old imports.
 }
 
-export function closeDb() {
-  if (saveInterval) { clearInterval(saveInterval); saveInterval = null; }
-  if (db) { saveDb(); db.close(); db = null; console.log('[DB] Connection closed'); }
+export async function closeDb() {
+  await closePool();
+  initialized = false;
+  defaultTenantId = null;
+  console.log('[DB] Connection pool closed');
 }
 
-// ==================== 通用查询辅助（适配 sql.js API）====================
-
-export function getSetting(key) {
-  const stmt = getDb().prepare('SELECT value FROM settings WHERE key = ?');
-  stmt.bind([key]);
-  if (stmt.step()) {
-    const row = stmt.getAsObject();
-    stmt.free();
-    return row.value ?? '';
-  }
-  stmt.free();
-  return '';
+export async function getDefaultTenantId() {
+  if (defaultTenantId) return defaultTenantId;
+  const tenant = await queryOne("SELECT id FROM tenants WHERE name = 'OnStar' ORDER BY created_at LIMIT 1");
+  if (!tenant) throw new Error('Default tenant OnStar is missing. Run migrations first.');
+  defaultTenantId = tenant.id;
+  return defaultTenantId;
 }
 
-export function setSetting(key, value) {
-  getDb().run(
-    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    [key, String(value)]
+export async function getTenantByAuthCode(authCode) {
+  if (!authCode) return null;
+  return await queryOne(`
+    SELECT ac.*, t.name AS tenant_name
+    FROM auth_codes ac
+    JOIN tenants t ON t.id = ac.tenant_id
+    WHERE ac.code = $1
+  `, [authCode]);
+}
+
+export async function getSetting(key, tenantId = null) {
+  const resolvedTenantId = tenantId || await getDefaultTenantId();
+  const row = await queryOne(
+    'SELECT value FROM tenant_settings WHERE tenant_id = $1 AND key = $2',
+    [resolvedTenantId, key]
   );
-  saveDb();
+  return row?.value ?? '';
 }
 
-export function getSettings(...keys) {
+export async function setSetting(key, value, tenantId = null) {
+  const resolvedTenantId = tenantId || await getDefaultTenantId();
+  await execute(`
+    INSERT INTO tenant_settings (tenant_id, key, value, updated_at)
+    VALUES ($1, $2, $3, now())
+    ON CONFLICT (tenant_id, key)
+    DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `, [resolvedTenantId, key, String(value ?? '')]);
+}
+
+export async function getSettings(keys, tenantId = null) {
   const result = {};
   for (const key of keys) {
-    result[key] = getSetting(key);
+    result[key] = await getSetting(key, tenantId);
   }
   return result;
 }
 
-export function setSettings(obj) {
-  const db = getDb();
-  for (const [key, value] of Object.entries(obj)) {
-    db.run(
-      `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-      [key, String(value ?? '')]
-    );
-  }
-  saveDb();
+export async function setSettings(obj, tenantId = null) {
+  const resolvedTenantId = tenantId || await getDefaultTenantId();
+  await withTransaction(async tx => {
+    for (const [key, value] of Object.entries(obj || {})) {
+      await tx.execute(`
+        INSERT INTO tenant_settings (tenant_id, key, value, updated_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (tenant_id, key)
+        DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `, [resolvedTenantId, key, String(value ?? '')]);
+    }
+  });
 }
 
-export function getAllSettings() {
-  const stmt = getDb().prepare('SELECT key, value FROM settings');
+export async function getAllSettings(tenantId = null) {
+  const resolvedTenantId = tenantId || await getDefaultTenantId();
+  const rows = await queryAll(
+    'SELECT key, value FROM tenant_settings WHERE tenant_id = $1 ORDER BY key',
+    [resolvedTenantId]
+  );
   const result = {};
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    result[row.key] = row.value;
-  }
-  stmt.free();
+  for (const row of rows) result[row.key] = row.value;
   return result;
 }
 
-// ==================== sql.js 查询辅助 ====================
-
-/**
- * 执行 SELECT 查询，返回行数组
- */
-export function queryAll(sql, params = []) {
-  const stmt = getDb().prepare(sql);
-  stmt.bind(params);
-  const results = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return results;
-}
-
-/**
- * 执行 SELECT 查询，返回第一行
- */
-export function queryOne(sql, params = []) {
-  const stmt = getDb().prepare(sql);
-  stmt.bind(params);
-  let result = null;
-  if (stmt.step()) {
-    result = stmt.getAsObject();
-  }
-  stmt.free();
-  return result;
-}
-
-/**
- * 执行 INSERT/UPDATE/DELETE，返回 { changes, lastInsertRowid }
- */
-export function execute(sql, params = []) {
-  const db = getDb();
-  db.run(sql, params);
-  const changes = db.getRowsModified();
-  const lastId = queryOne('SELECT last_insert_rowid() as id');
-  saveDb();
-  return { changes, lastInsertRowid: lastId?.id ?? 0 };
-}
+export {
+  queryAll,
+  queryOne,
+  execute,
+  withTransaction,
+};

@@ -1,12 +1,16 @@
 {
   "name": "onstarvoice-server",
   "version": "0.1.0",
-  "description": "OnStarVoice 舆情监控后端服务",
+  "description": "OnStarVoice 星语舆情监控后端服务",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "migrate": "node db/migrate.js",
+    "migrate:legacy": "node scripts/migrate-sqljs-to-postgres.js",
+    "comments:backfill": "node scripts/backfill-comments-workflow.js",
+    "user:create-admin": "node scripts/create-platform-admin.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -14,7 +18,10 @@
     "express": "^4.21.2",
     "node-cron": "^3.0.3",
     "nodemailer": "^6.9.16",
-    "sql.js": "^1.14.1",
+    "pg": "^8.21.0",
     "uuid": "^11.1.0"
+  },
+  "optionalDependencies": {
+    "sql.js": "^1.14.1"
   }
 }

@@ -57,9 +57,8 @@ body {
 .login-logo {
   width: 56px; height: 56px;
   margin: 0 auto 20px;
-  background: linear-gradient(135deg, var(--primary), #1d4ed8);
-  border-radius: 14px;
-  display: flex; align-items: center; justify-content: center;
+  display: block;
+  object-fit: contain;
 }
 
 .login-card h2 {
@@ -132,9 +131,8 @@ body {
 
 .app-brand-icon {
   width: 36px; height: 36px;
-  background: linear-gradient(135deg, var(--primary), #1d4ed8);
-  border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
+  display: block;
+  object-fit: contain;
 }
 
 .app-brand span {

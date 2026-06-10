@@ -1074,9 +1074,9 @@ async function updateMemberGroupEntryVisibility(auth = getCurrentAuth()) {
     return;
   }
 
-  const shouldShow =
-    isAuthVerified(auth) && !(await hasAcknowledgedMemberGroupPrompt(auth));
-  entry.hidden = !shouldShow;
+  // The group QR prompt is no longer part of the activation success flow.
+  // Keep this entry hidden so activation finishes as a clean success notice.
+  entry.hidden = true;
 }
 
 function getMemberGroupModalElements() {
@@ -1158,13 +1158,17 @@ async function maybeOpenMemberGroupModalAfterVerify(auth = getCurrentAuth()) {
     return;
   }
 
-  if (await hasAcknowledgedMemberGroupPrompt(auth)) {
-    await updateMemberGroupEntryVisibility(auth);
-    return;
+  const authCode = normalizeMemberGroupPromptCode(auth?.code);
+  if (authCode && !(await hasAcknowledgedMemberGroupPrompt(auth))) {
+    await saveMemberGroupPromptState({
+      acknowledgedCode: authCode,
+      acknowledgedAt: new Date().toISOString(),
+      suppressed: true,
+    });
   }
 
   await updateMemberGroupEntryVisibility(auth);
-  openMemberGroupModal();
+  closeMemberGroupModal();
 }
 
 function setupMemberGroupModalListeners() {
@@ -2543,6 +2547,7 @@ function setupUIEventListeners() {
   const prefInputs = [
     "inputSyncScope",
     "inputDetailCaptureScope",
+    "checkboxSkipOfficialAccounts",
     "inputCommentsMaxDetectedItems",
     "inputCommentLeadsKeywords",
     "inputCommentLeadsIps",
@@ -5280,7 +5285,7 @@ function renderInsightCardToImage(data) {
 
     const logoSize = 16;
     const gap = 6;
-    const brandText = "OnStarVoice（舆情虾）";
+    const brandText = "OnStarVoice 星语";
     ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
     const brandTW = ctx.measureText(brandText).width;
     const urlText = "https://onstarvoice.app";
@@ -5657,7 +5662,7 @@ function renderKeywordOpportunityCardToImage(data) {
     ctx.fillRect(PAD, y, CONTENT_W, 0.5);
     y += 18;
 
-    const brandText = "OnStarVoice（舆情虾）";
+    const brandText = "OnStarVoice 星语";
     const urlText = "https://onstarvoice.app";
     const logoSize = 16;
     const gap = 6;
@@ -6568,9 +6573,9 @@ async function handleVerify() {
       }
 
       if (result.data?.replacedBinding) {
-        showMessage("激活成功，已替换旧环境", "success");
+        showMessage("激活成功，已替换旧环境并完成后台绑定", "success");
       } else {
-        showMessage("激活成功！", "success");
+        showMessage("激活成功，已完成后台绑定", "success");
       }
       await maybeOpenMemberGroupModalAfterVerify(getCurrentAuth());
     } else {
@@ -7824,6 +7829,13 @@ async function initCaptureSettingsUI() {
         settings.detailCaptureScope,
       );
     }
+    const checkboxSkipOfficialAccounts = document.getElementById(
+      "checkboxSkipOfficialAccounts",
+    );
+    if (checkboxSkipOfficialAccounts) {
+      checkboxSkipOfficialAccounts.checked =
+        settings.skipOfficialAccounts !== false;
+    }
 
     const checkbox = document.getElementById("checkboxCaptureComments");
     if (checkbox) {
@@ -8208,6 +8220,7 @@ async function handleSaveCaptureSettings() {
       includeCommentsOnNoteCapture && enableCommentLeadsFilter;
     const normalizedEnableCommentLeadsFilterOnDetailCapture =
       includeCommentsOnDetailCapture && enableCommentLeadsFilterOnDetailCapture;
+    const skipOfficialAccounts = getSkipOfficialAccountsChecked(current);
     const commentLeadsKeywords = readCommaSeparatedRulesFromInput(
       "inputCommentLeadsKeywords",
       current.commentLeadsKeywords,
@@ -8280,6 +8293,7 @@ async function handleSaveCaptureSettings() {
       enableCommentLeadsFilter: normalizedEnableCommentLeadsFilter,
       enableCommentLeadsFilterOnDetailCapture:
         normalizedEnableCommentLeadsFilterOnDetailCapture,
+      skipOfficialAccounts,
       commentLeadsKeywords,
       commentLeadsIps,
       includeBloggerMetricsOnNoteCapture,
@@ -8405,6 +8419,7 @@ async function handleSyncAll() {
     const result = await syncRecordBatch(limitedTargetIds, handleProgress, {
       trigger: "current_page",
       syncScope,
+      captureSettings: settings,
       commentLeadsConfig,
     });
 
@@ -9525,6 +9540,14 @@ function getCommentLeadsFilterChecked(settings) {
   return Boolean(checkbox.checked);
 }
 
+function getSkipOfficialAccountsChecked(settings) {
+  const checkbox = document.getElementById("checkboxSkipOfficialAccounts");
+  if (!checkbox) {
+    return settings?.skipOfficialAccounts !== false;
+  }
+  return Boolean(checkbox.checked);
+}
+
 function getCaptureBloggerMetricsChecked(settings) {
   const noteTabCheckbox = document.getElementById(
     "checkboxCaptureBloggerMetrics",
@@ -9738,8 +9761,11 @@ function syncAutoDetailCaptureControls({
   const runtime = getCurrentRuntime();
   const resolvedPlatform = platform || getViewPlatform(runtime);
   const capabilities = getPlatformCapabilities(resolvedPlatform);
+  const detailCaptureSupported = Boolean(capabilities.batchDetailCapture);
 
   document.querySelectorAll("[data-auto-detail-panel]").forEach((panel) => {
+    panel.hidden = !detailCaptureSupported;
+
     const autoInput = panel.querySelector('[data-detail-setting="auto"]');
     const commentsInput = panel.querySelector(
       '[data-detail-setting="comments"]',
@@ -9769,6 +9795,16 @@ function syncAutoDetailCaptureControls({
     const lowFollowerHitThresholdGroup = panel.querySelector(
       '[data-detail-setting-group="low-follower-hit-threshold-group"]',
     );
+
+    if (!detailCaptureSupported) {
+      if (options) options.hidden = true;
+      if (commentSettings) commentSettings.hidden = true;
+      if (metricsOptions) metricsOptions.hidden = true;
+      if (lowFollowerHitThresholdGroup) {
+        lowFollowerHitThresholdGroup.hidden = true;
+      }
+      return;
+    }
 
     if (autoInput && autoDetailCapture !== null) {
       autoInput.checked = Boolean(autoDetailCapture);
@@ -10896,7 +10932,7 @@ function normalizeRecordsToSingleNoteCsv(records = []) {
       title: item.title || record.title || "",
       url: item.url || item.noteUrl || payload.detailCaptureNoteUrl || "",
       author: item.author || payload.bloggerName || "",
-      content: "",
+      content: item.content || item.noteContent || item.fullContent || item.body || "",
       likes: firstDefinedMetricValue(item.likes, item.likeCount),
       collects: firstDefinedMetricValue(item.collects, item.collectCount),
       comments: firstDefinedMetricValue(item.comments, item.commentCount),
@@ -11250,6 +11286,7 @@ function buildSearchPageCsvRows(records) {
     "平台",
     "关键词",
     "标题",
+    "正文",
     "链接",
     "作者",
     "笔记最近编辑时间",
@@ -11283,13 +11320,14 @@ function buildSearchPageCsvRows(records) {
       getCsvPlatformLabel(record),
       p.keyword || "",
       item.title || "",
+      item.content || item.noteContent || item.fullContent || item.body || "",
       item.url || "",
       item.author || "",
       item.publishDate || item.publishDateRaw || "",
       formatCsvMetricValue(item.likes, {captured: hasLikes}),
       formatCsvMetricValue(item.collects, {captured: hasCollects}),
       formatCsvMetricValue(item.comments, {captured: hasComments}),
-      platform === "douyin"
+      platform === "douyin" || platform === "weibo"
         ? formatCsvMetricValue(item.shares, {captured: hasShares})
         : "",
       formatCsvMetricValue(item.bloggerFollowersCount, {

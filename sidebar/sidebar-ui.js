@@ -32,6 +32,7 @@ import {
 import {detectPlatformFromUrl} from "../utils/platform/page-routing.js";
 import {buildXiaohongshuCardData} from "./renderers/xiaohongshu.js";
 import {buildDouyinCardData} from "./renderers/douyin.js";
+import {buildWeiboCardData} from "./renderers/weibo.js";
 
 const INSTANT_TOOLTIP_TEXT_ATTR = "data-instant-tooltip";
 const SYNC_HISTORY_FILTER_OPTIONS = Object.freeze([
@@ -1247,6 +1248,7 @@ document.addEventListener("DOMContentLoaded", () => {
         : activeCaptureTab === "searchTab"
           ? renderKeywordTabCards(pageRecords)
           : pageRecords.map((record) => renderRecordCard(record)).join("");
+    bindDataItemThumbFallbacks(listContainer);
   });
 
   const renderExecutionDetailsPanel = () => {
@@ -2138,6 +2140,9 @@ function buildRecordCardData(record) {
   if (recordPlatform === "douyin") {
     return buildDouyinCardData(record, payload, hydratedSinglePayload);
   }
+  if (recordPlatform === "weibo") {
+    return buildWeiboCardData(record, payload, hydratedSinglePayload);
+  }
   return buildXiaohongshuCardData(record, payload, hydratedSinglePayload);
 }
 
@@ -2354,6 +2359,30 @@ function renderPoolGroupToggle({
   `;
 }
 
+function renderDataItemThumb(cover, altText = "cover", emptyText = "无图") {
+  if (!cover) {
+    return `<div class="data-item-thumb-empty">${escapeHtml(emptyText)}</div>`;
+  }
+  return `<img class="data-item-thumb" src="${escapeHtml(cover)}" alt="${escapeHtml(altText)}" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`;
+}
+
+function bindDataItemThumbFallbacks(root = document) {
+  root.querySelectorAll?.("img.data-item-thumb").forEach((img) => {
+    if (img.dataset.thumbFallbackBound === "1") return;
+    img.dataset.thumbFallbackBound = "1";
+    img.addEventListener(
+      "error",
+      () => {
+        const fallback = document.createElement("div");
+        fallback.className = "data-item-thumb-empty";
+        fallback.textContent = img.getAttribute("alt") === "avatar" ? "无头像" : "无图";
+        img.replaceWith(fallback);
+      },
+      {once: true},
+    );
+  });
+}
+
 function renderBloggerTabCards(records) {
   const {groups, otherRecords} = buildGroupedRecords(
     records,
@@ -2514,11 +2543,7 @@ function renderRecordCard(record, options = {}) {
         </div>
         <div class="data-item-body data-item-body-with-side-actions">
           <div class="data-item-thumb-wrap">
-            ${
-              card.cover
-                ? `<img class="data-item-thumb" src="${escapeHtml(card.cover)}" alt="avatar" />`
-                : '<div class="data-item-thumb-empty">无头像</div>'
-            }
+            ${renderDataItemThumb(card.cover, "avatar", "无头像")}
           </div>
           <div class="data-item-main">
             <div class="data-item-title">${escapeHtml(card.profile?.bloggerName || card.title)}</div>
@@ -2557,11 +2582,7 @@ function renderRecordCard(record, options = {}) {
         </div>
         <div class="data-item-body data-item-body-with-side-actions">
           <div class="data-item-thumb-wrap">
-            ${
-              card.cover
-                ? `<img class="data-item-thumb" src="${escapeHtml(card.cover)}" alt="cover" />`
-                : '<div class="data-item-thumb-empty">无图</div>'
-            }
+            ${renderDataItemThumb(card.cover)}
           </div>
           <div class="data-item-main">
             ${renderRecordTitle(card)}
@@ -2591,11 +2612,7 @@ function renderRecordCard(record, options = {}) {
       </div>
       <div class="data-item-body">
         <div class="data-item-thumb-wrap">
-          ${
-            card.cover
-              ? `<img class="data-item-thumb" src="${escapeHtml(card.cover)}" alt="cover" />`
-              : '<div class="data-item-thumb-empty">无图</div>'
-          }
+          ${renderDataItemThumb(card.cover)}
         </div>
         <div class="data-item-main">
           ${renderRecordTitle(card)}

@@ -1,531 +1,1147 @@
-/**
- * OnStarVoice Admin Dashboard Client Logic
- */
-
-let adminToken = '';
-let currentPage = 'dashboard';
-let recordsPage = 1;
-
-const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
-const SENTIMENT_COLOR = { positive: '#10B981', neutral: '#6B7280', negative: '#DC2626' };
-const CATEGORY_LABEL = {
-  safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费',
-  privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量',
-  brand_image: '品牌形象', other: '其他',
+const state = {
+  user: null,
+  tenants: [],
+  tenantId: '',
+  page: 'overview',
+  cache: new Map(),
 };
-const LEVEL_LABEL = { critical: '重度', warning: '中度', info: '轻度' };
-const TYPE_LABEL = { trial: '试用', annual: '年度', permanent: '永久' };
-const STATUS_LABEL = { active: '有效', expired: '已过期', frozen: '已冻结' };
 
-// ==================== API 调用 ====================
+const NAV = [
+  { section: 'Workspace', items: [
+    { id: 'overview', label: '总览' },
+    { id: 'triage', label: '舆情收件箱' },
+    { id: 'issues', label: '问题处置' },
+    { id: 'reports', label: '报告中心' },
+    { id: 'monitor', label: '监控任务' },
+    { id: 'data', label: '数据资产' },
+  ] },
+  { section: 'Administration', internal: true, items: [
+    { id: 'tenants', label: '租户管理' },
+    { id: 'users', label: '用户账号', platformAdmin: true },
+    { id: 'auth-codes', label: '激活码' },
+    { id: 'settings', label: '系统设置' },
+  ] },
+];
+
+const LABELS = {
+  sentiment: { positive: '正面', neutral: '中性', negative: '负面', '': '待标注' },
+  category: {
+    safety_rescue: '安全救援',
+    feature_usage: '功能使用',
+    renewal_billing: '续费收费',
+    privacy: '隐私安全',
+    app_issue: 'App问题',
+    service_quality: '服务质量',
+    brand_image: '品牌形象',
+    other: '其他',
+    '': '待分类',
+  },
+  triage: {
+    unhandled: '新线索',
+    reviewing: '待复核',
+    issue_linked: '已转问题',
+    official_responded: '官方已响应',
+    archived: '已归档',
+    false_positive: '误报',
+  },
+  priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' },
+  issueStatus: {
+    new: '新建',
+    triage: '分诊',
+    in_progress: '处理中',
+    waiting: '等待',
+    review: '复核',
+    resolved: '已解决',
+    closed: '已关闭',
+    ignored: '忽略',
+  },
+  severity: { low: '低', medium: '中', high: '高', critical: '严重' },
+  reportType: { daily: '日报', weekly: '周报', monthly: '月报' },
+  reportStatus: { generating: '生成中', generated: '待发送', sent: '已发送', skipped: '无新增', failed: '失败' },
+  role: {
+    platform_admin: '平台管理员',
+    internal_operator: '内部运营',
+    tenant_admin: '客户管理员',
+    tenant_analyst: '分析员',
+    tenant_viewer: '只读',
+    '': '无',
+  },
+};
+
+document.addEventListener('DOMContentLoaded', boot);
+
+async function boot() {
+  try {
+    const me = await api('/auth/me', { skipTenant: true, quiet: true });
+    if (me.ok) {
+      state.user = me.user;
+      await enterApp();
+      return;
+    }
+  } catch (_) {}
+  showLogin();
+}
 
 async function api(path, options = {}) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'x-admin-token': adminToken,
-    ...options.headers,
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  if (!options.skipTenant && state.tenantId) headers['x-tenant-id'] = state.tenantId;
+  const fetchOptions = {
+    method: options.method || 'GET',
+    credentials: 'same-origin',
+    headers,
   };
-  const fetchOpts = { ...options, headers };
-  if (options.body) fetchOpts.body = JSON.stringify(options.body);
-  const resp = await fetch('/api' + path, fetchOpts);
-  return resp.json();
+  if (options.body !== undefined) fetchOptions.body = JSON.stringify(options.body);
+  const resp = await fetch('/api' + path, fetchOptions);
+  let data;
+  try { data = await resp.json(); } catch (_) { data = { ok: false, message: '响应格式错误' }; }
+  if (!resp.ok && !options.quiet) throw new Error(data.message || data.error || '请求失败');
+  return data;
 }
 
-// ==================== Toast ====================
-
-function showToast(msg, type = 'info') {
-  const el = document.createElement('div');
-  el.className = 'toast toast-' + type;
-  el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 3000);
+function showLogin() {
+  document.getElementById('loginView').hidden = false;
+  document.getElementById('appView').hidden = true;
 }
 
-// ==================== Login ====================
-
-async function doLogin() {
-  const pw = document.getElementById('loginPassword').value.trim();
-  if (!pw) return;
-  adminToken = pw;
-
+async function login() {
+  const email = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const errorEl = document.getElementById('loginError');
+  errorEl.textContent = '';
   try {
-    const resp = await fetch('/api/admin/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-admin-token': pw },
-      body: '{}',
-    });
-    const data = await resp.json();
-
-    if (data.ok) {
-      document.getElementById('loginOverlay').style.display = 'none';
-      document.getElementById('app').style.display = 'flex';
-      localStorage.setItem('osv_admin_token', pw);
-      loadPage('dashboard');
-    } else {
-      document.getElementById('loginError').style.display = 'block';
-      document.getElementById('loginError').textContent = data.message || '密码错误';
-    }
+    const data = await api('/auth/login', { method: 'POST', skipTenant: true, body: { email, password } });
+    state.user = data.user;
+    await enterApp();
   } catch (err) {
-    document.getElementById('loginError').style.display = 'block';
-    document.getElementById('loginError').textContent = '连接服务器失败: ' + err.message;
+    errorEl.textContent = err.message;
   }
 }
 
-// Enter key login
-document.getElementById('loginPassword').addEventListener('keyup', function(e) {
-  if (e.key === 'Enter') doLogin();
-});
+async function logout() {
+  await api('/auth/logout', { method: 'POST', skipTenant: true, quiet: true });
+  state.user = null;
+  state.tenantId = '';
+  state.cache.clear();
+  showLogin();
+}
 
-// Auto-login from saved token
-(async function autoLogin() {
-  const saved = localStorage.getItem('osv_admin_token');
-  if (!saved) return;
-  adminToken = saved;
-  try {
-    const resp = await fetch('/api/admin/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-admin-token': saved },
-      body: '{}',
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      document.getElementById('loginOverlay').style.display = 'none';
-      document.getElementById('app').style.display = 'flex';
-      loadPage('dashboard');
-    } else {
-      // 清除无效的 token
-      localStorage.removeItem('osv_admin_token');
-      adminToken = '';
-    }
-  } catch (e) {
-    localStorage.removeItem('osv_admin_token');
-    adminToken = '';
+async function enterApp() {
+  document.getElementById('loginView').hidden = true;
+  document.getElementById('appView').hidden = false;
+  document.getElementById('userBadge').textContent = `${state.user.name || state.user.email} · ${LABELS.role[state.user.globalRole] || currentTenantRoleLabel()}`;
+  await loadTenants();
+  renderNav();
+  const savedPage = localStorage.getItem('osv_page') || 'overview';
+  loadPage(savedPage);
+}
+
+async function loadTenants() {
+  if (isInternal()) {
+    const data = await api('/admin/tenants', { skipTenant: true });
+    state.tenants = data.tenants || [];
+  } else {
+    state.tenants = (state.user.memberships || [])
+      .filter(m => m.status === 'active')
+      .map(m => ({ id: m.tenantId, name: m.tenantName }));
   }
-})();
+  const saved = localStorage.getItem('osv_tenant_id');
+  state.tenantId = state.tenants.some(t => t.id === saved) ? saved : (state.tenants[0]?.id || '');
+  const select = document.getElementById('tenantSelect');
+  select.innerHTML = state.tenants.map(t => `<option value="${escAttr(t.id)}">${esc(t.name)}</option>`).join('');
+  select.value = state.tenantId;
+  select.disabled = state.tenants.length <= 1;
+}
 
-// ==================== Navigation ====================
+function switchTenant(tenantId) {
+  state.tenantId = tenantId;
+  localStorage.setItem('osv_tenant_id', tenantId);
+  state.cache.clear();
+  loadPage(state.page);
+}
 
-document.querySelectorAll('.sidebar-nav li').forEach(function(li) {
-  li.addEventListener('click', function() {
-    loadPage(li.dataset.page);
-  });
-});
+function renderNav() {
+  const nav = document.getElementById('navList');
+  nav.innerHTML = NAV.map(group => {
+    if (group.internal && !isInternal()) return '';
+    const items = group.items.map(item => {
+      if (item.platformAdmin && state.user.globalRole !== 'platform_admin') return '';
+      return `<button class="nav-item" data-page="${escAttr(item.id)}" onclick="loadPage('${escAttr(item.id)}')"><span>${esc(item.label)}</span></button>`;
+    }).join('');
+    return `<div class="nav-section">${esc(group.section)}</div>${items}`;
+  }).join('');
+}
 
 function loadPage(page) {
-  currentPage = page;
-  document.querySelectorAll('.sidebar-nav li').forEach(function(li) {
-    li.classList.toggle('active', li.dataset.page === page);
+  if (page === 'users' && state.user.globalRole !== 'platform_admin') page = 'overview';
+  if (['tenants', 'auth-codes', 'settings'].includes(page) && !isInternal()) page = 'overview';
+  state.page = page;
+  localStorage.setItem('osv_page', page);
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.page === page));
+  const title = {
+    overview: ['Workspace', '总览'],
+    triage: ['Triage Inbox', '舆情收件箱'],
+    issues: ['Issue Desk', '问题处置'],
+    reports: ['Reports', '报告中心'],
+    monitor: ['Monitoring', '监控任务'],
+    data: ['Data Assets', '数据资产'],
+    tenants: ['Administration', '租户管理'],
+    users: ['Administration', '用户账号'],
+    'auth-codes': ['Administration', '激活码'],
+    settings: ['Administration', '系统设置'],
+  }[page] || ['Workspace', '总览'];
+  document.getElementById('pageEyebrow').textContent = title[0];
+  document.getElementById('pageTitle').textContent = title[1];
+
+  const loaders = {
+    overview: renderOverview,
+    triage: renderTriage,
+    issues: renderIssues,
+    reports: renderReports,
+    monitor: renderMonitor,
+    data: renderData,
+    tenants: renderTenants,
+    users: renderUsers,
+    'auth-codes': renderAuthCodes,
+    settings: renderSettings,
+  };
+  loaders[page]();
+}
+
+async function renderOverview() {
+  const el = content();
+  el.innerHTML = loading();
+  const data = await api('/workspace/overview?days=7');
+  const k = data.kpi || {};
+  el.innerHTML = `
+    <div class="kpi-grid">
+      ${kpi('今日新增', k.today_new)}
+      ${kpi('负面内容', k.negative_period, 'negative')}
+      ${kpi('待处理问题', k.open_issues, 'warning')}
+      ${kpi('高危问题', k.high_open_issues, 'negative')}
+      ${kpi('待分诊', k.unhandled, 'warning')}
+      ${kpi('待标注', k.pending_label)}
+    </div>
+    <div class="layout-grid">
+      <div>
+        ${panel('需要处理', renderPendingRecords(data.pendingRecords || []))}
+        ${panel('风险趋势', renderTrend(data.riskTrend || []))}
+      </div>
+      <div>
+        ${panel('平台覆盖', renderPlatformCoverage(data.platformCoverage || []))}
+        ${panel('报告状态', renderReportMini(data.reports || []))}
+        ${panel('监控健康', renderMonitorMini(data.monitorHealth || []))}
+      </div>
+    </div>
+  `;
+}
+
+async function renderTriage() {
+  const el = content();
+  el.innerHTML = `
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <select id="triageStatus" onchange="loadTriageTable()">
+          <option value="">待处理</option>
+          ${option('unhandled', '新线索')}
+          ${option('reviewing', '待复核')}
+          ${option('issue_linked', '已转问题')}
+          ${option('official_responded', '官方已响应')}
+          ${option('archived', '已归档')}
+          ${option('false_positive', '误报')}
+        </select>
+        <select id="triageSentiment" onchange="loadTriageTable()">
+          <option value="">全部情感</option>
+          ${option('negative', '负面')}
+          ${option('neutral', '中性')}
+          ${option('positive', '正面')}
+        </select>
+        <input id="triageKeyword" placeholder="搜索标题/正文/关键词" onkeydown="if(event.key==='Enter')loadTriageTable()">
+        <button class="secondary" onclick="loadTriageTable()">筛选</button>
+      </div>
+    </div>
+    <div id="triageTable"></div>
+  `;
+  await loadTriageTable();
+}
+
+async function loadTriageTable(page = 1) {
+  const params = new URLSearchParams({
+    page,
+    pageSize: 30,
+    status: valueOf('triageStatus'),
+    queue: valueOf('triageStatus') ? '' : 'active',
+    sentiment: valueOf('triageSentiment'),
+    keyword: valueOf('triageKeyword'),
   });
-  document.querySelectorAll('.page').forEach(function(p) { p.style.display = 'none'; });
-
-  var pageId = {
-    'dashboard': 'pageDashboard',
-    'auth-codes': 'pageAuthCodes',
-    'records': 'pageRecords',
-    'alerts': 'pageAlerts',
-    'settings': 'pageSettings',
-  }[page];
-
-  if (pageId) document.getElementById(pageId).style.display = 'block';
-
-  if (page === 'dashboard') loadDashboard();
-  else if (page === 'auth-codes') loadAuthCodes();
-  else if (page === 'records') loadRecords();
-  else if (page === 'alerts') loadAlerts();
-  else if (page === 'settings') loadSettings();
+  const data = await api('/triage/records?' + params);
+  state.cache.set('triageRecords', data.records || []);
+  document.getElementById('triageTable').innerHTML = recordTable(data.records || [], data.pagination, true, 'loadTriageTable');
 }
 
-// ==================== Dashboard ====================
-
-async function loadDashboard() {
-  var days = document.getElementById('dashboardDays').value || 7;
-  var data = await api('/admin/stats?days=' + days);
-  if (!data.ok) return;
-  var s = data.stats;
-
-  document.getElementById('statTotal').textContent = s.totalRecords;
-  document.getElementById('statRecent').textContent = s.recentRecords;
-  var alertTotal = s.recentAlerts.reduce(function(sum, a) { return sum + a.count; }, 0);
-  document.getElementById('statAlerts').textContent = alertTotal;
-  document.getElementById('statCodes').textContent = s.activeCodes;
-
-  var sentimentEl = document.getElementById('sentimentChart');
-  var totalSentiment = s.sentimentDist.reduce(function(sum, d) { return sum + d.count; }, 0);
-  if (totalSentiment > 0) {
-    sentimentEl.innerHTML = s.sentimentDist.map(function(d) {
-      var pct = (d.count / totalSentiment * 100).toFixed(1);
-      return '<div class="chart-bar"><div class="chart-bar-label">' + (SENTIMENT_LABEL[d.sentiment] || d.sentiment) + '</div><div class="chart-bar-track"><div class="chart-bar-fill" style="width:' + pct + '%;background:' + (SENTIMENT_COLOR[d.sentiment] || '#6B7280') + '">' + pct + '%</div></div><div class="chart-bar-count">' + d.count + '</div></div>';
-    }).join('');
-  } else {
-    sentimentEl.innerHTML = '<div class="empty-state">暂无数据</div>';
-  }
-
-  var categoryEl = document.getElementById('categoryChart');
-  var totalCat = s.categoryDist.reduce(function(sum, d) { return sum + d.count; }, 0);
-  if (totalCat > 0) {
-    categoryEl.innerHTML = s.categoryDist.slice(0, 8).map(function(d) {
-      var pct = (d.count / totalCat * 100).toFixed(1);
-      return '<div class="chart-bar"><div class="chart-bar-label">' + (CATEGORY_LABEL[d.category] || d.category) + '</div><div class="chart-bar-track"><div class="chart-bar-fill" style="width:' + pct + '%;background:var(--primary)">' + pct + '%</div></div><div class="chart-bar-count">' + d.count + '</div></div>';
-    }).join('');
-  } else {
-    categoryEl.innerHTML = '<div class="empty-state">暂无数据</div>';
-  }
-
-  var topEl = document.getElementById('topInteractionTable');
-  if (s.topInteraction.length > 0) {
-    topEl.innerHTML = '<table><thead><tr><th>标题</th><th>平台</th><th>情感</th><th>点赞</th><th>评论</th><th>收藏</th><th>作者</th></tr></thead><tbody>' +
-      s.topInteraction.map(function(r) {
-        return '<tr><td><a href="' + r.url + '" target="_blank" class="truncate-lg" style="display:block">' + (r.title || '(无标题)') + '</a></td><td>' + r.platform + '</td><td>' + (r.sentiment ? '<span class="badge badge-' + r.sentiment + '">' + (SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '-') + '</td><td>' + r.likes + '</td><td>' + r.comments_count + '</td><td>' + r.collects + '</td><td class="truncate">' + (r.author_name || '-') + '</td></tr>';
-      }).join('') + '</tbody></table>';
-  } else {
-    topEl.innerHTML = '<div class="empty-state">暂无数据</div>';
-  }
+async function renderIssues() {
+  const el = content();
+  el.innerHTML = loading();
+  const data = await api('/issues?limit=100');
+  const rows = (data.issues || []).map(i => `
+    <tr>
+      <td><button class="ghost" onclick="openIssue('${escAttr(i.id)}')">${esc(i.title || '未命名问题')}</button><div class="subtext">${esc(i.primary_record_platform || '')} ${esc(i.primary_record_title || '')}</div></td>
+      <td>${badge(LABELS.severity[i.severity] || i.severity, i.severity)}</td>
+      <td>${badge(LABELS.issueStatus[i.status] || i.status, i.status)}</td>
+      <td>${esc(i.owner_name || '未分配')}</td>
+      <td>${n(i.record_count)}</td>
+      <td>${date(i.updated_at)}</td>
+      <td>${canWrite() ? issueActions(i) : ''}</td>
+    </tr>`).join('');
+  el.innerHTML = `<div class="table-wrap"><table><thead><tr><th>问题</th><th>级别</th><th>状态</th><th>负责人</th><th>内容</th><th>更新时间</th><th>操作</th></tr></thead><tbody>${rows || emptyRow(7)}</tbody></table></div>`;
 }
 
-// ==================== Auth Codes ====================
-
-async function loadAuthCodes() {
-  var data = await api('/admin/auth-codes');
-  if (!data.ok) return;
-  var el = document.getElementById('authCodesTable');
-
-  if (data.codes.length === 0) {
-    el.innerHTML = '<div class="empty-state">暂无激活码，点击右上角创建</div>';
-    return;
-  }
-
-  el.innerHTML = '<table><thead><tr><th>激活码</th><th>类型</th><th>状态</th><th>客户</th><th>绑定</th><th>过期时间</th><th>操作</th></tr></thead><tbody>' +
-    data.codes.map(function(c) {
-      var expires = c.expires_at ? new Date(c.expires_at).toLocaleDateString('zh-CN') : '-';
-      var isExpired = c.expires_at && new Date(c.expires_at) < new Date();
-      return '<tr><td><span class="code-display" title="点击复制" onclick="navigator.clipboard.writeText(\'' + c.code + '\');showToast(\'已复制\')">' + c.code + '</span></td><td><span class="badge badge-' + c.type + '">' + (TYPE_LABEL[c.type] || c.type) + '</span></td><td><span class="badge badge-' + (isExpired ? 'expired' : c.status) + '">' + (isExpired ? '已过期' : (STATUS_LABEL[c.status] || c.status)) + '</span></td><td class="truncate">' + (c.owner_name || c.owner_email || '-') + '</td><td>' + c.binding_count + '/' + c.max_bindings + '</td><td>' + expires + '</td><td><button class="btn btn-sm btn-success" onclick="renewCode(' + c.id + ')">续期</button> ' + (c.status === 'active' ? '<button class="btn btn-sm btn-danger" onclick="freezeCode(' + c.id + ')">冻结</button>' : '') + (c.status === 'frozen' ? '<button class="btn btn-sm btn-secondary" onclick="unfreezeCode(' + c.id + ')">解冻</button>' : '') + '</td></tr>';
-    }).join('') + '</tbody></table>';
+async function renderReports() {
+  const el = content();
+  el.innerHTML = `
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <button class="primary" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('daily')">生成日报</button>
+        <button class="secondary" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('weekly')">生成周报</button>
+        <button class="secondary" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('monthly')">生成月报</button>
+      </div>
+    </div>
+    <div id="reportsTable">${loading()}</div>
+  `;
+  await loadReports();
 }
 
-function showCreateCodeModal() {
-  document.getElementById('createCodeModal').classList.remove('modal-hidden');
+async function loadReports() {
+  const data = await api('/reports?limit=100');
+  const rows = (data.reports || []).map(r => `
+    <tr>
+      <td>${badge(LABELS.reportType[r.report_type] || r.report_type, 'neutral')}</td>
+      <td>${esc(dateRange(r.period_start, r.period_end))}<div class="subtext">${esc(r.subject || '')}</div></td>
+      <td>${badge(LABELS.reportStatus[r.status] || r.status, r.status)}</td>
+      <td>${date(r.generated_at || r.created_at)}</td>
+      <td>${date(r.sent_at)}</td>
+      <td><div class="action-row"><button class="secondary" onclick="previewReport('${escAttr(r.id)}')">预览</button><button class="primary" ${!canWrite() ? 'disabled' : ''} onclick="sendReport('${escAttr(r.id)}')">发送</button></div></td>
+    </tr>`).join('');
+  document.getElementById('reportsTable').innerHTML = `<div class="table-wrap"><table><thead><tr><th>类型</th><th>周期</th><th>状态</th><th>生成</th><th>发送</th><th>操作</th></tr></thead><tbody>${rows || emptyRow(6)}</tbody></table></div>`;
 }
 
-function closeModal(id) {
-  document.getElementById(id).classList.add('modal-hidden');
+async function renderMonitor() {
+  const el = content();
+  el.innerHTML = `
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <button class="primary" ${!canWrite() ? 'disabled' : ''} onclick="createSubscription()">新建监控</button>
+      </div>
+    </div>
+    <div id="monitorTable">${loading()}</div>
+  `;
+  const data = await api('/monitor/subscriptions');
+  const rows = (data.subscriptions || []).map(s => `
+    <tr>
+      <td>${esc(s.name || s.keyword)}<div class="subtext">${esc(s.keyword)}</div></td>
+      <td>${esc(platformName(s.platform))}</td>
+      <td>${badge(s.status === 'active' ? '运行中' : s.status, s.status)}</td>
+      <td>${n(s.cadence_minutes)} 分钟</td>
+      <td>${date(s.last_run_at)}</td>
+      <td>${date(s.next_run_at)}</td>
+      <td><button class="secondary" ${!canWrite() ? 'disabled' : ''} onclick="runMonitorNow('${escAttr(s.id)}')">立即执行</button></td>
+    </tr>`).join('');
+  document.getElementById('monitorTable').innerHTML = `<div class="table-wrap"><table><thead><tr><th>任务</th><th>平台</th><th>状态</th><th>频率</th><th>上次</th><th>下次</th><th>操作</th></tr></thead><tbody>${rows || emptyRow(7)}</tbody></table></div>`;
 }
 
-function updateDurationHint() {
-  var type = document.getElementById('newCodeType').value;
-  var daysInput = document.getElementById('newCodeDays');
-  if (type === 'trial') daysInput.placeholder = '默认 7 天';
-  else if (type === 'annual') daysInput.placeholder = '默认 365 天';
-  else daysInput.placeholder = '永久';
+async function renderData() {
+  const el = content();
+  el.innerHTML = `<div id="dataTable">${loading()}</div>`;
+  const data = await api('/triage/records?pageSize=50');
+  state.cache.set('triageRecords', data.records || []);
+  document.getElementById('dataTable').innerHTML = recordTable(data.records || [], data.pagination, false, 'renderDataPage');
 }
 
-async function createAuthCode() {
-  var type = document.getElementById('newCodeType').value;
-  var durationDays = Number(document.getElementById('newCodeDays').value) || undefined;
-  var ownerEmail = document.getElementById('newCodeEmail').value;
-  var ownerName = document.getElementById('newCodeName').value;
-  var maxBindings = Number(document.getElementById('newCodeBindings').value) || 3;
-  var notes = document.getElementById('newCodeNotes').value;
+async function renderDataPage(page) {
+  const data = await api('/triage/records?pageSize=50&page=' + page);
+  state.cache.set('triageRecords', data.records || []);
+  document.getElementById('dataTable').innerHTML = recordTable(data.records || [], data.pagination, false, 'renderDataPage');
+}
 
-  var data = await api('/admin/auth-codes', {
-    method: 'POST',
-    body: { type: type, durationDays: durationDays, ownerEmail: ownerEmail, ownerName: ownerName, maxBindings: maxBindings, notes: notes },
+async function renderTenants() {
+  const data = await api('/admin/tenants', { skipTenant: true });
+  const rows = (data.tenants || []).map(t => `<tr><td>${esc(t.name)}</td><td>${badge(t.status, t.status)}</td><td>${date(t.created_at)}</td></tr>`).join('');
+  content().innerHTML = `<div class="table-wrap"><table><thead><tr><th>租户</th><th>状态</th><th>创建时间</th></tr></thead><tbody>${rows || emptyRow(3)}</tbody></table></div>`;
+}
+
+async function renderUsers() {
+  const el = content();
+  el.innerHTML = `
+    ${panel('创建账号', `
+      <div class="form-grid">
+        <label>邮箱<input id="newUserEmail" type="email"></label>
+        <label>姓名<input id="newUserName"></label>
+        <label>初始密码<input id="newUserPassword" type="password"></label>
+        <label>账号类型<select id="newUserType" onchange="toggleUserFields()"><option value="tenant">客户账号</option><option value="internal">内部账号</option></select></label>
+        <label id="newUserTenantWrap">租户<select id="newUserTenant"></select></label>
+        <label id="newUserTenantRoleWrap">租户角色<select id="newUserRole"><option value="tenant_viewer">只读</option><option value="tenant_analyst">分析员</option><option value="tenant_admin">客户管理员</option></select></label>
+        <label id="newUserGlobalRoleWrap" hidden>内部角色<select id="newUserGlobalRole"><option value="internal_operator">内部运营</option><option value="platform_admin">平台管理员</option></select></label>
+      </div>
+      <div class="toolbar"><div></div><button class="primary" onclick="createUser()">创建账号</button></div>
+    `)}
+    <div id="usersTable">${loading()}</div>
+  `;
+  document.getElementById('newUserTenant').innerHTML = state.tenants.map(t => `<option value="${escAttr(t.id)}">${esc(t.name)}</option>`).join('');
+  toggleUserFields();
+  await loadUsers();
+}
+
+async function loadUsers() {
+  const data = await api('/admin/users', { skipTenant: true });
+  const rows = (data.users || []).map(u => `
+    <tr>
+      <td>${esc(u.name || u.email)}<div class="subtext">${esc(u.email)}</div></td>
+      <td>${badge(u.is_internal ? (LABELS.role[u.global_role] || u.global_role) : tenantRoleText(u.memberships), u.global_role || 'viewer')}</td>
+      <td>${badge(u.status === 'active' ? '启用' : '禁用', u.status)}</td>
+      <td>${date(u.last_login_at)}</td>
+      <td><div class="action-row"><button class="secondary" onclick="resetPassword('${escAttr(u.id)}')">重置密码</button><button class="danger" onclick="setUserStatus('${escAttr(u.id)}','${u.status === 'active' ? 'disabled' : 'active'}')">${u.status === 'active' ? '禁用' : '启用'}</button></div></td>
+    </tr>`).join('');
+  document.getElementById('usersTable').innerHTML = `<div class="table-wrap"><table><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody>${rows || emptyRow(5)}</tbody></table></div>`;
+}
+
+async function renderAuthCodes() {
+  const data = await api('/admin/auth-codes', { skipTenant: true });
+  const rows = (data.codes || []).map(c => `
+    <tr>
+      <td><code>${esc(c.code)}</code><div class="subtext">${esc(c.tenant_name || '')}</div></td>
+      <td>${badge(c.type, c.type)}</td>
+      <td>${badge(c.status, c.status)}</td>
+      <td>${esc(c.owner_name || c.owner_email || '-')}</td>
+      <td>${n(c.binding_count)} / ${n(c.max_bindings)}</td>
+      <td>${date(c.expires_at)}</td>
+    </tr>`).join('');
+  content().innerHTML = `<div class="toolbar"><div></div><button class="primary" onclick="createAuthCode()">创建激活码</button></div><div class="table-wrap"><table><thead><tr><th>激活码</th><th>类型</th><th>状态</th><th>客户</th><th>绑定</th><th>过期</th></tr></thead><tbody>${rows || emptyRow(6)}</tbody></table></div>`;
+}
+
+async function renderSettings() {
+  const [data, officialData] = await Promise.all([
+    api('/admin/settings'),
+    api('/admin/official-accounts'),
+  ]);
+  const s = data.settings || {};
+  content().innerHTML = `
+    <div class="layout-grid">
+      ${panel('AI 模型', `<div class="form-grid"><label>提供商<input id="llm_provider" value="${escAttr(s.llm_provider || '')}"></label><label>模型<input id="llm_model" value="${escAttr(s.llm_model || '')}"></label><label class="full">API Key<input id="llm_api_key" type="password" value=""></label></div><div class="toolbar"><div></div><button class="primary" onclick="saveSettings('llm')">保存</button></div>`)}
+      ${panel('报告时间', `<div class="form-grid"><label>日报时间<input id="report_daily_time" value="${escAttr(s.report_daily_time || '09:00')}"></label><label>周报时间<input id="report_weekly_time" value="${escAttr(s.report_weekly_time || '09:00')}"></label><label>月报日期<input id="report_monthly_day" value="${escAttr(s.report_monthly_day || '1')}"></label><label>月报时间<input id="report_monthly_time" value="${escAttr(s.report_monthly_time || '09:00')}"></label></div><div class="toolbar"><div></div><button class="primary" onclick="saveSettings('report')">保存</button></div>`)}
+      ${panel('邮件发送', renderEmailSettingsForm(s))}
+      ${panel('官方账号识别', renderOfficialAccountsForm(officialData.accounts || []))}
+    </div>
+  `;
+}
+
+function renderEmailSettingsForm(s) {
+  return `
+    <div class="form-grid">
+      <label>SMTP 主机<input id="smtp_host" placeholder="smtp.example.com" value="${escAttr(s.smtp_host || '')}"></label>
+      <label>SMTP 端口<input id="smtp_port" type="number" min="1" placeholder="465" value="${escAttr(s.smtp_port || '465')}"></label>
+      <label>安全连接
+        <select id="smtp_secure">
+          <option value="true" ${s.smtp_secure !== 'false' ? 'selected' : ''}>SSL/TLS（推荐 465）</option>
+          <option value="false" ${s.smtp_secure === 'false' ? 'selected' : ''}>STARTTLS/非 SSL（常见 587）</option>
+        </select>
+      </label>
+      <label>SMTP 账号<input id="smtp_user" autocomplete="username" value="${escAttr(s.smtp_user || '')}"></label>
+      <label class="full">SMTP 密码/授权码<input id="smtp_pass" type="password" autocomplete="new-password" placeholder="${s.smtp_pass ? '已保存，留空不修改' : '邮箱服务商 SMTP 授权码'}"></label>
+      <label>发件人<input id="email_from" placeholder="OnStarVoice <noreply@example.com>" value="${escAttr(s.email_from || '')}"></label>
+      <label>收件人<input id="email_to" placeholder="a@example.com,b@example.com" value="${escAttr(s.email_to || '')}"></label>
+    </div>
+    <p class="subtext">报告发送按钮会把邮件发给“收件人”。多个地址用英文逗号分隔；SMTP 密码留空不会覆盖已保存配置。</p>
+    <div class="toolbar"><div></div><button class="primary" onclick="saveSettings('email')">保存</button></div>
+  `;
+}
+
+function recordTable(records, pagination, withActions, pageHandlerName) {
+  const rows = records.map(r => `
+    <tr>
+      <td>${recordListCell(r)}</td>
+      <td>${esc(r.author_name || '-')}</td>
+      <td>${aiJudgementCell(r)}</td>
+      <td class="number-group">${n(r.likes)} / ${n(r.comments_count)} / ${n(r.collects)} / ${n(r.shares)}</td>
+      <td>${commentRiskCell(r)}</td>
+      <td>${officialResponseCell(r)}</td>
+      <td>${badge(LABELS.triage[r.triage_status] || r.triage_status, r.triage_status)}</td>
+      ${withActions ? `<td>${triageActions(r)}</td>` : ''}
+    </tr>`).join('');
+  const cols = withActions ? 8 : 7;
+  return `<div class="table-wrap"><table><thead><tr><th>内容</th><th>作者</th><th>AI判断</th><th>互动</th><th>评论风险</th><th>官方响应</th><th>处理状态</th>${withActions ? '<th>分流动作</th>' : ''}</tr></thead><tbody>${rows || emptyRow(cols)}</tbody></table></div>${paginationHtml(pagination, pageHandlerName)}`;
+}
+
+function recordListCell(record) {
+  const title = recordTitle(record);
+  const cover = recordImageUrls(record)[0];
+  return `
+    <div class="record-list-cell">
+      ${cover ? imageBox(cover, 'record-row-thumb', title) : `<button class="record-row-thumb is-empty" onclick="openRecord('${escAttr(record.id)}')" aria-label="查看内容"><span>${esc(noteTypeLabel(record.note_type) || platformName(record.platform).slice(0, 2))}</span></button>`}
+      <div class="record-list-main">
+        <div class="record-list-meta">${badge(platformName(record.platform), 'neutral')}<span>${date(record.last_seen_at || record.created_at)}</span></div>
+        <button class="ghost truncate" onclick="openRecord('${escAttr(record.id)}')">${esc(title)}</button>
+        <div class="subtext">${esc(compact(record.content || record.ai_summary || '', 86))}</div>
+      </div>
+    </div>
+  `;
+}
+
+function aiJudgementCell(record) {
+  return `<div class="mini-stack">
+    ${badge(LABELS.sentiment[record.sentiment] || record.sentiment || '待标注', record.sentiment || 'muted')}
+    ${badge(LABELS.category[record.category] || record.category || '待分类', record.category ? 'neutral' : 'muted')}
+  </div>`;
+}
+
+function commentRiskCell(record) {
+  const count = Number(record.negative_comment_count || 0);
+  if (count <= 0) return '<span class="subtext">暂无负面评论</span>';
+  return `<div class="mini-stack">
+    ${badge(`负面评论 ${n(count)}`, 'negative')}
+    <span class="subtext">${esc(compact(record.latest_negative_comment || '', 44))}</span>
+  </div>`;
+}
+
+function officialResponseCell(record) {
+  if (record.official_response_status === 'responded') return badge('官方已响应', 'positive');
+  if (record.official_response_status === 'needs_followup') return badge('响应后仍有风险', 'warning');
+  if (record.official_replied) return badge('已发现回复', 'neutral');
+  return '<span class="subtext">未发现</span>';
+}
+
+function triageActions(r) {
+  if (!canWrite()) return '';
+  return `<div class="action-row">
+    <button class="primary" onclick="linkRecordIssue('${escAttr(r.id)}')">转问题</button>
+    <button class="secondary" onclick="markOfficialResponded('${escAttr(r.id)}')">标为已响应</button>
+    <button class="secondary" onclick="updateTriage('${escAttr(r.id)}','reviewing')">待复核</button>
+    <button class="secondary" onclick="updateTriage('${escAttr(r.id)}','archived')">归档</button>
+    <button class="secondary" onclick="updateTriage('${escAttr(r.id)}','false_positive')">误报</button>
+  </div>`;
+}
+
+function issueActions(i) {
+  return `<div class="action-row">
+    <button class="secondary" onclick="updateIssue('${escAttr(i.id)}','in_progress')">处理</button>
+    <button class="primary" onclick="updateIssue('${escAttr(i.id)}','resolved')">解决</button>
+  </div>`;
+}
+
+async function updateTriage(recordId, status) {
+  await api('/triage/records/' + recordId, { method: 'PATCH', body: { status } });
+  toast('分诊已更新', 'success');
+  if (state.page === 'overview') renderOverview(); else loadTriageTable();
+}
+
+async function markOfficialResponded(recordId) {
+  await api('/records/' + recordId + '/official-response', { method: 'PATCH', body: { status: 'responded' } });
+  toast('已标记为官方已响应', 'success');
+  if (state.page === 'triage') loadTriageTable();
+}
+
+async function linkRecordIssue(recordId) {
+  const title = prompt('问题标题');
+  if (title === null) return;
+  await api('/triage/records/' + recordId + '/issues', { method: 'POST', body: { title } });
+  toast('已转入问题处置', 'success');
+  if (state.page === 'triage') loadTriageTable();
+}
+
+async function openRecord(recordId) {
+  const records = state.cache.get('triageRecords') || [];
+  const record = records.find(r => r.id === recordId);
+  if (!record) return;
+  const images = recordImageUrls(record);
+  const title = recordTitle(record);
+  const originalUrl = safeUrl(record.url);
+  const profileUrl = safeUrl(record.blogger_profile_url);
+  const [commentData, observationData] = await Promise.all([
+    api('/records/' + recordId + '/comments', { quiet: true }).catch(() => ({ comments: [], officialResponses: [] })),
+    api('/records/' + recordId + '/observations', { quiet: true }).catch(() => ({ observations: [] })),
+  ]);
+  const comments = commentData.comments || [];
+  const officialResponses = commentData.officialResponses || [];
+  const observations = observationData.observations || [];
+  openDrawer('舆情内容', title, `
+    <article class="record-detail">
+      <section class="record-hero">
+        ${images[0] ? imageBox(images[0], 'record-cover', title) : `<div class="record-cover is-empty"><span>暂无封面图</span></div>`}
+        <div class="record-summary">
+          <div class="record-badges">
+            ${badge(platformName(record.platform), 'neutral')}
+            ${badge(LABELS.sentiment[record.sentiment] || '待标注', record.sentiment || 'muted')}
+            ${badge(LABELS.category[record.category] || '待分类', record.category ? 'neutral' : 'muted')}
+            ${record.triage_status ? badge(LABELS.triage[record.triage_status] || record.triage_status, record.triage_status) : ''}
+          </div>
+          <div class="record-author-card">
+            ${authorAvatar(record)}
+            <div class="record-author-text">
+              <strong>${esc(record.author_name || '未知作者')}</strong>
+              <span>${esc(authorMeta(record))}</span>
+            </div>
+          </div>
+          <div class="record-stat-grid">
+            ${statTile('点赞', record.likes)}
+            ${statTile('评论', record.comments_count)}
+            ${statTile('收藏', record.collects)}
+            ${statTile('转发', record.shares)}
+          </div>
+          <div class="record-link-row">
+            ${originalUrl ? `<a class="primary-link" href="${escAttr(originalUrl)}" target="_blank" rel="noopener noreferrer">打开原文</a>` : '<span class="subtext">暂无原文链接</span>'}
+            ${profileUrl ? `<a class="secondary-link" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer">博主主页</a>` : ''}
+          </div>
+        </div>
+      </section>
+
+      <div class="record-tabs">
+        <button class="record-tab active" onclick="switchRecordTab(this, 'post')">帖子内容</button>
+        <button class="record-tab" onclick="switchRecordTab(this, 'comments')">评论舆情 ${comments.length ? `(${n(comments.length)})` : ''}</button>
+        <button class="record-tab" onclick="switchRecordTab(this, 'official')">官方响应 ${officialResponses.length ? `(${n(officialResponses.length)})` : ''}</button>
+        <button class="record-tab" onclick="switchRecordTab(this, 'observations')">采集快照</button>
+      </div>
+
+      <section class="record-tab-panel" data-tab-panel="post">
+        <div class="record-section">
+          <h3>正文</h3>
+          <p class="record-content">${esc(record.content || '无正文')}</p>
+        </div>
+        ${images.length > 1 ? `
+          <div class="record-section">
+            <h3>图片</h3>
+            <div class="record-image-grid">
+              ${images.map((url, index) => imageBox(url, 'record-image-tile', `${title} 图片 ${index + 1}`)).join('')}
+            </div>
+          </div>
+        ` : ''}
+      </section>
+
+      <section class="record-tab-panel" data-tab-panel="comments" hidden>
+        ${renderCommentPanel(comments)}
+      </section>
+
+      <section class="record-tab-panel" data-tab-panel="official" hidden>
+        ${renderOfficialResponsePanel(record, officialResponses)}
+      </section>
+
+      <section class="record-tab-panel" data-tab-panel="observations" hidden>
+        ${renderObservationPanel(record, observations)}
+      </section>
+    </article>
+  `);
+}
+
+function switchRecordTab(button, tabName) {
+  const detail = button.closest('.record-detail');
+  detail.querySelectorAll('.record-tab').forEach(tab => tab.classList.toggle('active', tab === button));
+  detail.querySelectorAll('[data-tab-panel]').forEach(panel => {
+    panel.hidden = panel.dataset.tabPanel !== tabName;
   });
-
-  if (data.ok) {
-    showToast('激活码已创建: ' + data.code, 'success');
-    closeModal('createCodeModal');
-    loadAuthCodes();
-  } else {
-    showToast(data.message || '创建失败', 'error');
-  }
 }
 
-async function renewCode(id) {
-  var days = prompt('续期天数:', '365');
-  if (!days) return;
-  var data = await api('/admin/auth-codes/' + id + '/renew', { method: 'POST', body: { durationDays: Number(days) } });
-  if (data.ok) { showToast('续期成功', 'success'); loadAuthCodes(); }
-  else showToast(data.message || '续期失败', 'error');
+function renderCommentPanel(comments) {
+  if (!comments.length) return '<div class="empty-state">暂无独立评论数据。需要在插件采集时开启评论采集。</div>';
+  return `<div class="comment-list">
+    ${comments.map(comment => `
+      <div class="comment-item ${comment.is_negative ? 'negative' : ''}">
+        <div class="comment-head">
+          <strong>${esc(comment.author_name || '未知评论者')}</strong>
+          <span>${esc(comment.published_at || date(comment.created_at))}</span>
+          ${comment.is_official ? badge('官方回复', 'positive') : ''}
+          ${comment.is_negative ? badge(`负面 · ${comment.risk_level || 'low'}`, 'negative') : badge(LABELS.sentiment[comment.sentiment] || '中性', 'muted')}
+        </div>
+        <p>${esc(comment.content || '')}</p>
+        <div class="comment-foot">
+          <span>点赞 ${n(comment.like_count)}${comment.ip_location ? ` · IP ${esc(comment.ip_location)}` : ''}</span>
+          ${canWrite() && comment.is_negative ? `<button class="secondary" onclick="linkCommentIssue('${escAttr(comment.id)}')">转问题</button>` : ''}
+        </div>
+      </div>
+    `).join('')}
+  </div>`;
 }
 
-async function freezeCode(id) {
-  if (!confirm('确定冻结此激活码？')) return;
-  var data = await api('/admin/auth-codes/' + id, { method: 'PATCH', body: { status: 'frozen' } });
-  if (data.ok) { showToast('已冻结', 'success'); loadAuthCodes(); }
+function renderOfficialResponsePanel(record, responses) {
+  return `
+    <div class="record-section">
+      <h3>响应状态</h3>
+      <div class="record-info-grid">
+        ${infoItem('官方状态', officialResponseCell(record), true)}
+        ${infoItem('负面评论', `${n(record.negative_comment_count)} 条`)}
+        ${infoItem('最近负评', date(record.latest_negative_comment_at))}
+        ${infoItem('最后采集', date(record.last_seen_at || record.created_at))}
+      </div>
+    </div>
+    <div class="record-section">
+      <h3>官方回复记录</h3>
+      ${responses.length ? `<div class="comment-list">${responses.map(item => `
+        <div class="comment-item official">
+          <div class="comment-head"><strong>${esc(item.account_name || '官方账号')}</strong><span>${esc(item.published_at || date(item.created_at))}</span>${badge('官方回复', 'positive')}</div>
+          <p>${esc(item.content || '')}</p>
+        </div>
+      `).join('')}</div>` : '<div class="empty-state">暂无官方回复记录</div>'}
+    </div>
+  `;
 }
 
-async function unfreezeCode(id) {
-  var data = await api('/admin/auth-codes/' + id, { method: 'PATCH', body: { status: 'active' } });
-  if (data.ok) { showToast('已解冻', 'success'); loadAuthCodes(); }
+function renderObservationPanel(record, observations) {
+  return `
+    <div class="record-section">
+      <h3>采集信息</h3>
+      <div class="record-info-grid">
+        ${infoItem('关键词', record.keyword || '-')}
+        ${infoItem('内容类型', noteTypeLabel(record.note_type) || '-')}
+        ${infoItem('发布时间', record.publish_time || '-')}
+        ${infoItem('首次发现', date(record.first_seen_at))}
+        ${infoItem('最近采集', date(record.last_seen_at || record.created_at))}
+        ${infoItem('采集次数', `${n(record.seen_count)} 次`)}
+        ${infoItem('评论采集', commentsCaptureLabel(record))}
+        ${infoItem('关联问题', `${n(record.issue_count)} 个`)}
+      </div>
+    </div>
+    <div class="record-section">
+      <h3>快照</h3>
+      ${observations.length ? `<div class="mini-list">${observations.slice(0, 10).map(item => `
+        <div class="mini-item"><strong>${n(item.likes)} 赞 / ${n(item.comments_count)} 评 / ${n(item.collects)} 藏 / ${n(item.shares)} 转</strong><span class="subtext">${date(item.captured_at)} · ${esc(item.keyword || '-')}</span></div>
+      `).join('')}</div>` : '<div class="empty-state">暂无采集快照</div>'}
+    </div>
+  `;
 }
 
-// ==================== Records ====================
-
-var cachedRecords = [];
-
-const PLATFORM_LABEL = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', unknown: '未知' };
-const NOTE_TYPE_LABEL = { video: '视频', normal: '图文' };
-const ACCOUNT_TYPE_LABEL = { enterprise: '企业号', personal: '个人号', professional: '专业号', '': '' };
-
-async function loadRecords(page) {
-  recordsPage = page || 1;
-  var platform = document.getElementById('filterPlatform').value || '';
-  var sentiment = document.getElementById('filterSentiment').value || '';
-  var category = document.getElementById('filterCategory').value || '';
-  var keyword = document.getElementById('filterKeyword').value || '';
-
-  var params = new URLSearchParams({ page: recordsPage, pageSize: 30 });
-  if (platform) params.set('platform', platform);
-  if (sentiment) params.set('sentiment', sentiment);
-  if (category) params.set('category', category);
-  if (keyword) params.set('keyword', keyword);
-
-  var data = await api('/admin/records?' + params);
-  if (!data.ok) return;
-  cachedRecords = data.records;
-
-  var el = document.getElementById('recordsTable');
-  if (data.records.length === 0) {
-    el.innerHTML = '<div class="empty-state">暂无数据</div>';
-    document.getElementById('recordsPagination').innerHTML = '';
-    return;
-  }
-
-  el.innerHTML = '<table><thead><tr><th>标题</th><th>平台</th><th>博主</th><th>粉丝</th><th>情感</th><th>分类</th><th>互动</th><th>评论采集</th><th>时间</th></tr></thead><tbody>' +
-    data.records.map(function(r, idx) {
-      var contentPreview = r.content ? r.content.slice(0, 40) + (r.content.length > 40 ? '...' : '') : '';
-      var noteTypeTag = r.video_url ? '<span style="color:var(--primary);font-size:11px">视频</span>' : '<span style="color:var(--text-muted);font-size:11px">图文</span>';
-      return '<tr onclick="showRecordDetail(' + idx + ')" style="cursor:pointer" title="点击查看详情"><td>' + noteTypeTag + ' <span class="truncate-lg" style="display:inline">' + (r.title || '(无标题)') + '</span>' + (contentPreview ? '<div style="font-size:11px;color:var(--text-muted);margin-top:2px" class="truncate-lg">' + escHtml(contentPreview) + '</div>' : '') + '</td><td>' + (PLATFORM_LABEL[r.platform] || r.platform) + '</td><td class="truncate">' + (r.author_name || '-') + '</td><td>' + (r.author_fans > 0 ? formatNum(r.author_fans) : '-') + '</td><td>' + (r.sentiment ? '<span class="badge badge-' + r.sentiment + '">' + (SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '-') + '</td><td>' + (CATEGORY_LABEL[r.category] || r.category || '-') + '</td><td style="white-space:nowrap">' + r.likes + ' / ' + r.comments_count + ' / ' + r.collects + '</td><td>' + (r.comments_total_captured > 0 ? r.comments_total_captured + '条' : (r.comments_capture_status || '-')) + '</td><td style="white-space:nowrap">' + (r.created_at ? r.created_at.slice(0, 10) : '-') + '</td></tr>';
-    }).join('') + '</tbody></table>';
-
-  var p = data.pagination;
-  var pagEl = document.getElementById('recordsPagination');
-  if (p.totalPages <= 1) { pagEl.innerHTML = ''; return; }
-  var html = '<button ' + (p.page <= 1 ? 'disabled' : '') + ' onclick="loadRecords(' + (p.page - 1) + ')">‹</button>';
-  for (var i = 1; i <= Math.min(p.totalPages, 10); i++) {
-    html += '<button class="' + (i === p.page ? 'active' : '') + '" onclick="loadRecords(' + i + ')">' + i + '</button>';
-  }
-  if (p.totalPages > 10) html += '<span>... ' + p.totalPages + '</span>';
-  html += '<button ' + (p.page >= p.totalPages ? 'disabled' : '') + ' onclick="loadRecords(' + (p.page + 1) + ')">›</button>';
-  pagEl.innerHTML = html;
+async function linkCommentIssue(commentId) {
+  const title = prompt('问题标题', '负面评论跟进');
+  if (title === null) return;
+  await api('/comments/' + commentId + '/issues', { method: 'POST', body: { title } });
+  toast('评论已转入问题处置', 'success');
+  closeDrawer();
+  if (state.page === 'triage') loadTriageTable();
 }
 
-function escHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+async function openIssue(issueId) {
+  const data = await api('/issues/' + issueId);
+  const issue = data.issue;
+  openDrawer('问题处置', issue.title, `
+    <div class="drawer-section">
+      ${metric('状态', badge(LABELS.issueStatus[issue.status] || issue.status, issue.status), true)}
+      ${metric('级别', badge(LABELS.severity[issue.severity] || issue.severity, issue.severity), true)}
+      ${metric('负责人', issue.owner_name || '未分配')}
+      ${metric('截止时间', date(issue.due_at))}
+    </div>
+    <div class="drawer-section"><h3>摘要</h3><p>${esc(issue.summary || '暂无摘要')}</p></div>
+    <div class="drawer-section"><h3>处理建议</h3><p>${esc(issue.suggested_action || '暂无建议')}</p></div>
+    <div class="drawer-section"><h3>关联内容</h3>${(data.records || []).map(r => `<div class="mini-item"><strong>${esc(r.title || r.content || '(无标题)')}</strong><span class="subtext">${esc(platformName(r.platform))} · ${n(r.likes + r.comments_count + r.collects + r.shares)} 互动</span></div>`).join('') || '<div class="empty-state">暂无关联内容</div>'}</div>
+    <div class="drawer-section"><h3>时间线</h3>${(data.events || []).map(e => `<div class="mini-item"><strong>${esc(e.body || e.event_type)}</strong><span class="subtext">${esc(e.actor_name || e.actor_type)} · ${date(e.created_at)}</span></div>`).join('') || '<div class="empty-state">暂无记录</div>'}</div>
+  `);
 }
 
-function formatNum(n) {
-  if (n >= 10000) return (n / 10000).toFixed(1) + 'w';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-  return String(n);
-}
-
-function formatDateTime(ts) {
-  if (!ts) return '-';
-  if (typeof ts === 'number') {
-    var d = new Date(ts);
-    return d.toISOString().slice(0, 16).replace('T', ' ');
-  }
-  return String(ts).slice(0, 16).replace('T', ' ');
-}
-
-function showRecordDetail(idx) {
-  var r = cachedRecords[idx];
-  if (!r) return;
-
-  var tags = [];
-  try { tags = JSON.parse(r.tags || '[]'); } catch(e) {}
-  var imageUrls = [];
-  try { imageUrls = JSON.parse(r.image_urls || '[]'); } catch(e) {}
-
-  var html = '<table class="detail-table">';
-  var rows = [
-    ['采集平台', PLATFORM_LABEL[r.platform] || r.platform],
-    ['博主', r.author_name || '-'],
-    ['博主主页', r.blogger_profile_url ? '<a href="' + r.blogger_profile_url + '" target="_blank">查看</a>' : '-'],
-    ['粉丝数', r.author_fans > 0 ? r.author_fans.toLocaleString() : '-'],
-    ['点赞与收藏数', r.blogger_liked_collected > 0 ? r.blogger_liked_collected.toLocaleString() : '-'],
-    ['账号属性', ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '-'],
-    ['标题', escHtml(r.title || '-')],
-    ['笔记链接', r.url ? '<a href="' + r.url + '" target="_blank">' + r.url.slice(0, 60) + '...</a>' : '-'],
-    ['正文', '<div class="detail-content">' + escHtml(r.content || '-') + '</div>'],
-    ['话题标签', tags.length > 0 ? tags.map(function(t){ return '<span class="tag-chip">' + escHtml(typeof t === 'string' ? t : (t.name || t.tagName || JSON.stringify(t))) + '</span>'; }).join(' ') : '-'],
-    ['笔记类型', r.video_url ? '视频' : '图文'],
-    ['封面链接', r.cover_url ? '<a href="' + r.cover_url + '" target="_blank">查看</a>' : '-'],
-    ['图片链接', imageUrls.length > 0 ? imageUrls.length + ' 张 <a href="' + imageUrls[0] + '" target="_blank">查看首张</a>' : '-'],
-    ['视频链接', r.video_url ? '<a href="' + r.video_url + '" target="_blank">查看</a>' : '-'],
-    ['视频时长', r.video_duration || '-'],
-    ['互动数据', r.likes + ' 赞 / ' + r.collects + ' 藏 / ' + r.comments_count + ' 评 / ' + r.shares + ' 转'],
-    ['评论内容', r.comments_text ? '<div class="detail-content">' + escHtml(r.comments_text.slice(0, 500)) + (r.comments_text.length > 500 ? '...' : '') + '</div>' : '-'],
-    ['评论采集状态', r.comments_capture_status || '-'],
-    ['评论采集条数', r.comments_total_captured > 0 ? r.comments_total_captured : '-'],
-    ['采集时间', formatDateTime(r.capture_timestamp || r.created_at)],
-    ['笔记编辑时间', r.publish_time || '-'],
-    ['关键词', r.keyword || '-'],
-    ['AI 情感', r.sentiment ? (SENTIMENT_LABEL[r.sentiment] || r.sentiment) : '未分析'],
-    ['AI 分类', r.category ? (CATEGORY_LABEL[r.category] || r.category) : '未分析'],
-    ['AI 摘要', r.ai_summary || '未分析'],
-  ];
-
-  rows.forEach(function(row) {
-    html += '<tr><th>' + row[0] + '</th><td>' + row[1] + '</td></tr>';
-  });
-  html += '</table>';
-
-  document.getElementById('recordDetailContent').innerHTML = html;
-  document.getElementById('recordDetailModal').classList.remove('modal-hidden');
-}
-
-async function exportRecordsCsv() {
-  showToast('正在导出...', 'info');
-  var platform = document.getElementById('filterPlatform').value || '';
-  var sentiment = document.getElementById('filterSentiment').value || '';
-  var category = document.getElementById('filterCategory').value || '';
-  var keyword = document.getElementById('filterKeyword').value || '';
-
-  var params = new URLSearchParams({ page: 1, pageSize: 10000 });
-  if (platform) params.set('platform', platform);
-  if (sentiment) params.set('sentiment', sentiment);
-  if (category) params.set('category', category);
-  if (keyword) params.set('keyword', keyword);
-
-  var data = await api('/admin/records?' + params);
-  if (!data.ok || data.records.length === 0) { showToast('没有数据可导出', 'error'); return; }
-
-  var header = [
-    '采集平台', '博主', '博主主页', '封面链接', '标题', '笔记链接', '正文',
-    '话题标签', '图片链接', '评论内容', '笔记类型', '采集时间', '笔记最近编辑时间',
-    '点赞数', '收藏数', '评论数', '转发数', '粉丝数', '点赞与收藏数', '账号属性',
-    '视频链接', '视频时长', '评论采集状态', '评论采集条数', '关键词',
-    'AI情感', 'AI意图', 'AI分类', 'AI摘要'
-  ];
-
-  var rows = data.records.map(function(r) {
-    var tags = []; try { tags = JSON.parse(r.tags || '[]'); } catch(e) {}
-    var imageUrls = []; try { imageUrls = JSON.parse(r.image_urls || '[]'); } catch(e) {}
-    return [
-      PLATFORM_LABEL[r.platform] || r.platform,
-      r.author_name || '',
-      r.blogger_profile_url || '',
-      r.cover_url || '',
-      r.title || '',
-      r.url || '',
-      r.content || '',
-      tags.map(function(t){ return typeof t === 'string' ? t : (t.name || t.tagName || ''); }).join(', '),
-      imageUrls.join('\n'),
-      r.comments_text || '',
-      r.video_url ? '视频' : '图文',
-      formatDateTime(r.capture_timestamp || r.created_at),
-      r.publish_time || '',
-      r.likes, r.collects, r.comments_count, r.shares,
-      r.author_fans, r.blogger_liked_collected,
-      ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '',
-      r.video_url || '', r.video_duration || '',
-      r.comments_capture_status || '', r.comments_total_captured || '',
-      r.keyword || '',
-      SENTIMENT_LABEL[r.sentiment] || r.sentiment || '',
-      r.intent || '',
-      CATEGORY_LABEL[r.category] || r.category || '',
-      r.ai_summary || ''
-    ];
-  });
-
-  var csvContent = [header].concat(rows).map(function(row) {
-    return row.map(function(cell) {
-      var s = String(cell == null ? '' : cell).replace(/"/g, '""');
-      return '"' + s + '"';
-    }).join(',');
-  }).join('\n');
-
-  var blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url;
-  a.download = 'onstarvoice-export-' + new Date().toISOString().slice(0, 10) + '.csv';
-  a.click();
-  URL.revokeObjectURL(url);
-  showToast('导出成功：' + data.records.length + ' 条', 'success');
-}
-
-// ==================== Alerts ====================
-
-async function loadAlerts() {
-  var level = document.getElementById('filterAlertLevel').value || '';
-  var params = level ? '?level=' + level : '';
-  var data = await api('/admin/alerts' + params);
-  if (!data.ok) return;
-
-  var el = document.getElementById('alertsTable');
-  if (data.alerts.length === 0) {
-    el.innerHTML = '<div class="empty-state">暂无预警</div>';
-    return;
-  }
-
-  el.innerHTML = '<table><thead><tr><th>级别</th><th>原因</th><th>标题</th><th>平台</th><th>互动量</th><th>时间</th><th>链接</th></tr></thead><tbody>' +
-    data.alerts.map(function(a) {
-      return '<tr><td><span class="badge badge-' + a.level + '">' + (LEVEL_LABEL[a.level] || a.level) + '</span></td><td class="truncate-lg">' + a.reason + '</td><td class="truncate">' + (a.title || a.record_title || '-') + '</td><td>' + (a.platform || '-') + '</td><td>' + (a.interaction_total || '-') + '</td><td style="white-space:nowrap">' + (a.created_at ? a.created_at.slice(0, 16).replace('T', ' ') : '-') + '</td><td>' + ((a.url || a.record_url) ? '<a href="' + (a.url || a.record_url) + '" target="_blank">查看</a>' : '-') + '</td></tr>';
-    }).join('') + '</tbody></table>';
-}
-
-// ==================== Settings ====================
-
-async function loadSettings() {
-  var data = await api('/admin/settings');
-  if (!data.ok) return;
-  var s = data.raw;
-
-  document.getElementById('settingLlmProvider').value = s.llm_provider || 'gemini';
-  document.getElementById('settingLlmApiKey').value = s.llm_api_key || '';
-  document.getElementById('settingLlmModel').value = s.llm_model || '';
-  document.getElementById('settingLlmEndpoint').value = s.llm_api_endpoint || '';
-  document.getElementById('settingSmtpHost').value = s.smtp_host || '';
-  document.getElementById('settingSmtpPort').value = s.smtp_port || '465';
-  document.getElementById('settingSmtpSecure').value = s.smtp_secure || 'true';
-  document.getElementById('settingSmtpUser').value = s.smtp_user || '';
-  document.getElementById('settingSmtpPass').value = s.smtp_pass || '';
-  document.getElementById('settingEmailFrom').value = s.email_from || '';
-  document.getElementById('settingEmailTo').value = s.email_to || '';
-  document.getElementById('settingAlertThreshold').value = s.alert_high_interaction_threshold || '500';
-  document.getElementById('settingAlertBurstCount').value = s.alert_negative_burst_count || '5';
-  document.getElementById('settingAlertBurstWindow').value = s.alert_negative_burst_window_minutes || '60';
-  document.getElementById('settingAlertKeywords').value = s.alert_high_danger_keywords || '';
-  document.getElementById('settingReportDaily').value = s.report_daily_enabled || 'true';
-  document.getElementById('settingReportWeekly').value = s.report_weekly_enabled || 'true';
-}
-
-async function saveSettings(group) {
-  var body = {};
-  if (group === 'llm') {
-    body = { llm_provider: document.getElementById('settingLlmProvider').value, llm_api_key: document.getElementById('settingLlmApiKey').value, llm_model: document.getElementById('settingLlmModel').value, llm_api_endpoint: document.getElementById('settingLlmEndpoint').value };
-  } else if (group === 'email') {
-    body = { smtp_host: document.getElementById('settingSmtpHost').value, smtp_port: document.getElementById('settingSmtpPort').value, smtp_secure: document.getElementById('settingSmtpSecure').value, smtp_user: document.getElementById('settingSmtpUser').value, smtp_pass: document.getElementById('settingSmtpPass').value, email_from: document.getElementById('settingEmailFrom').value, email_to: document.getElementById('settingEmailTo').value };
-  } else if (group === 'alert') {
-    body = { alert_high_interaction_threshold: document.getElementById('settingAlertThreshold').value, alert_negative_burst_count: document.getElementById('settingAlertBurstCount').value, alert_negative_burst_window_minutes: document.getElementById('settingAlertBurstWindow').value, alert_high_danger_keywords: document.getElementById('settingAlertKeywords').value };
-  } else if (group === 'report') {
-    body = { report_daily_enabled: document.getElementById('settingReportDaily').value, report_weekly_enabled: document.getElementById('settingReportWeekly').value };
-  }
-  var data = await api('/admin/settings', { method: 'PUT', body: body });
-  if (data.ok) showToast('配置已保存', 'success');
-  else showToast('保存失败', 'error');
-}
-
-async function testEmail() {
-  showToast('发送中...', 'info');
-  var data = await api('/admin/test-email', { method: 'POST', body: {} });
-  if (data.ok) showToast(data.message || '发送成功', 'success');
-  else showToast(data.message || '发送失败', 'error');
-}
-
-async function runLabeling() {
-  showToast('正在执行 AI 标签...', 'info');
-  var data = await api('/admin/run-labeling', { method: 'POST', body: { limit: 20 } });
-  if (data.ok) showToast('标签完成: ' + data.labeled + '/' + data.total, 'success');
-  else showToast(data.message || '标签失败', 'error');
+async function updateIssue(issueId, status) {
+  await api('/issues/' + issueId, { method: 'PATCH', body: { status } });
+  toast('问题状态已更新', 'success');
+  renderIssues();
 }
 
 async function generateReport(type) {
-  showToast('正在生成' + (type === 'weekly' ? '周报' : '日报') + '...', 'info');
-  var data = await api('/admin/generate-report', { method: 'POST', body: { type: type } });
-  if (data.ok) showToast(data.message || '已发送', 'success');
-  else showToast(data.message || '生成失败', 'error');
+  const data = await api('/reports/generate', { method: 'POST', body: { type, send: false } });
+  toast(`${LABELS.reportType[type]}已生成`, 'success');
+  await loadReports();
+  if (data.report?.id) previewReport(data.report.id);
+}
+
+async function previewReport(id) {
+  const data = await api('/reports/' + id + '/preview');
+  openDrawer('报告预览', data.report.subject || '报告', `<div class="preview-frame">${data.html || '<div class="empty-state">暂无内容</div>'}</div>`);
+}
+
+async function sendReport(id) {
+  await api('/reports/' + id + '/send', { method: 'POST' });
+  toast('报告已发送', 'success');
+  loadReports();
+}
+
+async function createSubscription() {
+  const keyword = prompt('监控关键词');
+  if (!keyword) return;
+  const platform = prompt('平台：weibo / xiaohongshu / douyin', 'weibo') || '';
+  await api('/monitor/subscriptions', { method: 'POST', body: { keyword, platform, cadenceMinutes: 1440 } });
+  toast('监控任务已创建', 'success');
+  renderMonitor();
+}
+
+async function runMonitorNow(id) {
+  await api('/monitor/run-now', { method: 'POST', body: { subscriptionId: id } });
+  toast('已创建执行任务', 'success');
+}
+
+function toggleUserFields() {
+  const isInternalUser = valueOf('newUserType') === 'internal';
+  document.getElementById('newUserTenantWrap').hidden = isInternalUser;
+  document.getElementById('newUserTenantRoleWrap').hidden = isInternalUser;
+  document.getElementById('newUserGlobalRoleWrap').hidden = !isInternalUser;
+}
+
+async function createUser() {
+  const isInternalUser = valueOf('newUserType') === 'internal';
+  await api('/admin/users', {
+    method: 'POST',
+    skipTenant: true,
+    body: {
+      email: valueOf('newUserEmail'),
+      name: valueOf('newUserName'),
+      password: valueOf('newUserPassword'),
+      isInternal: isInternalUser,
+      globalRole: isInternalUser ? valueOf('newUserGlobalRole') : '',
+      tenantId: isInternalUser ? '' : valueOf('newUserTenant'),
+      role: isInternalUser ? '' : valueOf('newUserRole'),
+    },
+  });
+  toast('账号已创建', 'success');
+  await loadUsers();
+}
+
+async function resetPassword(id) {
+  const password = prompt('输入新密码，至少 8 位');
+  if (!password) return;
+  await api('/admin/users/' + id + '/reset-password', { method: 'POST', skipTenant: true, body: { password } });
+  toast('密码已重置', 'success');
+}
+
+async function setUserStatus(id, status) {
+  await api('/admin/users/' + id, { method: 'PATCH', skipTenant: true, body: { status } });
+  toast('账号状态已更新', 'success');
+  await loadUsers();
+}
+
+async function createAuthCode() {
+  const ownerName = prompt('客户名称') || '';
+  const tenantId = state.tenantId;
+  const data = await api('/admin/auth-codes', { method: 'POST', skipTenant: true, body: { type: 'annual', ownerName, tenantId } });
+  toast('激活码已创建：' + data.code, 'success');
+  renderAuthCodes();
+}
+
+async function saveSettings(group) {
+  const body = {};
+  if (group === 'llm') {
+    body.llm_provider = valueOf('llm_provider');
+    body.llm_model = valueOf('llm_model');
+    if (valueOf('llm_api_key')) body.llm_api_key = valueOf('llm_api_key');
+  } else {
+    if (group === 'report') {
+      body.report_daily_time = valueOf('report_daily_time');
+      body.report_weekly_time = valueOf('report_weekly_time');
+      body.report_monthly_day = valueOf('report_monthly_day');
+      body.report_monthly_time = valueOf('report_monthly_time');
+    }
+    if (group === 'email') {
+      body.smtp_host = valueOf('smtp_host').trim();
+      body.smtp_port = valueOf('smtp_port').trim() || '465';
+      body.smtp_secure = valueOf('smtp_secure') || 'true';
+      body.smtp_user = valueOf('smtp_user').trim();
+      if (valueOf('smtp_pass')) body.smtp_pass = valueOf('smtp_pass');
+      body.email_from = valueOf('email_from').trim();
+      body.email_to = valueOf('email_to').trim();
+    }
+  }
+  await api('/admin/settings', { method: 'PUT', body });
+  toast('设置已保存', 'success');
+}
+
+function renderOfficialAccountsForm(accounts) {
+  const byPlatform = new Map((accounts || []).map(account => [account.platform, account]));
+  const platforms = ['xiaohongshu', 'weibo', 'douyin'];
+  return `
+    <div class="official-account-list">
+      ${platforms.map(platform => officialAccountRow(platform, byPlatform.get(platform))).join('')}
+    </div>
+    <div class="toolbar">
+      <div class="subtext">官方账号发布的内容默认不进入待处理队列；普通用户内容下的官方回复会被记录为处置进展。</div>
+      <button class="primary" onclick="saveOfficialAccounts()">保存官方账号</button>
+    </div>
+  `;
+}
+
+function officialAccountRow(platform, account = {}) {
+  const aliases = parseArray(account.aliases).join(', ');
+  return `
+    <div class="official-account-row" data-platform="${escAttr(platform)}">
+      <strong>${esc(platformName(platform))}</strong>
+      <label>账号名称<input data-field="accountName" value="${escAttr(account.account_name || account.accountName || '')}" placeholder="安吉星OnStar"></label>
+      <label>账号ID<input data-field="accountId" value="${escAttr(account.account_id || account.accountId || '')}" placeholder="可选"></label>
+      <label>主页URL<input data-field="profileUrl" value="${escAttr(account.profile_url || account.profileUrl || '')}" placeholder="可选"></label>
+      <label>别名<input data-field="aliases" value="${escAttr(aliases)}" placeholder="安吉星, OnStar"></label>
+    </div>
+  `;
+}
+
+async function saveOfficialAccounts() {
+  const accounts = Array.from(document.querySelectorAll('.official-account-row')).map(row => {
+    const field = name => row.querySelector(`[data-field="${name}"]`)?.value || '';
+    return {
+      platform: row.dataset.platform,
+      accountName: field('accountName').trim(),
+      accountId: field('accountId').trim(),
+      profileUrl: field('profileUrl').trim(),
+      aliases: field('aliases').split(',').map(v => v.trim()).filter(Boolean),
+      skipContent: true,
+    };
+  }).filter(account => account.platform && account.accountName);
+  await api('/admin/official-accounts', { method: 'PUT', body: { accounts } });
+  toast('官方账号配置已保存', 'success');
+}
+
+function renderPendingRecords(records) {
+  if (!records.length) return '<div class="empty-state">暂无待处理内容</div>';
+  return `<div class="mini-list">${records.map(r => `<div class="mini-item"><strong>${esc(r.title || r.content || '(无标题)')}</strong><span class="subtext">${esc(platformName(r.platform))} · ${badge(LABELS.sentiment[r.sentiment] || '待标注', r.sentiment || 'muted')} · ${n(r.likes + r.comments_count + r.collects + r.shares)} 互动</span></div>`).join('')}</div>`;
+}
+
+function renderTrend(rows) {
+  if (!rows.length) return '<div class="empty-state">暂无趋势数据</div>';
+  return `<div class="mini-list">${rows.map(r => `<div class="metric-line"><span>${esc(r.day)}</span><strong>${n(r.total)} / ${n(r.negative)} 负面</strong></div>`).join('')}</div>`;
+}
+
+function renderPlatformCoverage(rows) {
+  if (!rows.length) return '<div class="empty-state">暂无平台数据</div>';
+  return rows.map(r => metric(platformName(r.platform), `${n(r.count)} 条 · 新增 ${n(r.period_new)} · ${date(r.last_seen_at)}`)).join('');
+}
+
+function renderReportMini(rows) {
+  if (!rows.length) return '<div class="empty-state">暂无报告</div>';
+  return rows.map(r => `<div class="mini-item"><strong>${esc(LABELS.reportType[r.report_type] || r.report_type)} ${badge(LABELS.reportStatus[r.status] || r.status, r.status)}</strong><span class="subtext">${esc(dateRange(r.period_start, r.period_end))}</span></div>`).join('');
+}
+
+function renderMonitorMini(rows) {
+  if (!rows.length) return '<div class="empty-state">暂无监控任务</div>';
+  return rows.map(r => `<div class="mini-item"><strong>${esc(r.name || r.keyword)} ${badge(r.status, r.status)}</strong><span class="subtext">${esc(platformName(r.platform))} · 下次 ${date(r.next_run_at)}</span></div>`).join('');
+}
+
+function paginationHtml(p, handlerName) {
+  if (!p || p.totalPages <= 1) return '';
+  const current = Number(p.page);
+  const total = Number(p.totalPages);
+  return `<div class="toolbar"><div class="subtext">共 ${n(p.total)} 条</div><div class="action-row"><button class="secondary" ${current <= 1 ? 'disabled' : ''} onclick="${escAttr(handlerName)}(${current - 1})">上一页</button><span class="subtext">${current} / ${total}</span><button class="secondary" ${current >= total ? 'disabled' : ''} onclick="${escAttr(handlerName)}(${current + 1})">下一页</button></div></div>`;
+}
+
+function kpi(label, value, tone = '') {
+  return `<div class="kpi ${tone}"><strong>${n(value)}</strong><span>${esc(label)}</span></div>`;
+}
+
+function panel(title, body) {
+  return `<section class="panel"><div class="panel-head"><h2>${esc(title)}</h2></div><div class="panel-body">${body}</div></section>`;
+}
+
+function metric(label, value, raw = false) {
+  return `<div class="metric-line"><span>${esc(label)}</span><strong>${raw ? value : esc(value)}</strong></div>`;
+}
+
+function infoItem(label, value, raw = false) {
+  return `<div class="info-item"><span>${esc(label)}</span><strong>${raw ? value : esc(value)}</strong></div>`;
+}
+
+function statTile(label, value) {
+  return `<div class="stat-tile"><span>${esc(label)}</span><strong>${n(value)}</strong></div>`;
+}
+
+function badge(label, tone = '') {
+  return `<span class="badge ${escAttr(tone || 'muted')}">${esc(label || '-')}</span>`;
+}
+
+function recordTitle(record) {
+  return compact(record.title || record.content || '(无标题)', 72);
+}
+
+function recordImageUrls(record) {
+  const urls = [
+    record.cover_url,
+    ...parseArray(record.image_urls).flatMap(item => {
+      if (typeof item === 'string') return [item];
+      if (item && typeof item === 'object') return [item.url, item.src, item.href, item.coverUrl];
+      return [];
+    }),
+  ];
+  return [...new Set(urls.map(safeUrl).filter(Boolean))].slice(0, 12);
+}
+
+function imageBox(url, className, alt) {
+  const safe = safeUrl(url);
+  if (!safe) return `<div class="${escAttr(className)} is-empty"><span>暂无图片</span></div>`;
+  return `
+    <div class="${escAttr(className)} image-box">
+      <img src="${escAttr(safe)}" alt="${escAttr(alt || '内容图片')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('is-broken'); this.remove();">
+      <span class="image-fallback">图片暂不可用</span>
+    </div>
+  `;
+}
+
+function authorAvatar(record) {
+  const avatar = safeUrl(record.author_avatar);
+  const initial = authorInitial(record.author_name);
+  if (!avatar) return `<div class="record-avatar is-fallback"><span>${esc(initial)}</span></div>`;
+  return `
+    <div class="record-avatar">
+      <img src="${escAttr(avatar)}" alt="${escAttr(record.author_name || '作者头像')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('is-fallback'); this.remove();">
+      <span>${esc(initial)}</span>
+    </div>
+  `;
+}
+
+function authorInitial(value) {
+  const text = String(value || '未').trim();
+  return Array.from(text)[0] || '未';
+}
+
+function authorMeta(record) {
+  const parts = [];
+  if (record.author_fans) parts.push(`粉丝 ${n(record.author_fans)}`);
+  if (record.publish_time) parts.push(record.publish_time);
+  if (record.last_seen_at || record.created_at) parts.push(`采集 ${date(record.last_seen_at || record.created_at)}`);
+  return parts.join(' · ') || '暂无作者补充信息';
+}
+
+function commentsCaptureLabel(record) {
+  const count = Number(record.comments_total_captured || 0);
+  if (count > 0) return `${n(count)} 条已采`;
+  if (record.comments_capture_status) return record.comments_capture_status;
+  return '未采集';
+}
+
+function noteTypeLabel(value) {
+  return {
+    normal: '图文',
+    image: '图文',
+    video: '视频',
+    text: '文字',
+    note: '笔记',
+  }[value] || value || '';
+}
+
+function parseArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [trimmed];
+    }
+  }
+  return [];
+}
+
+function safeUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const url = new URL(raw, window.location.origin);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function compact(value, limit = 80) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= limit) return text;
+  return text.slice(0, Math.max(0, limit - 1)) + '…';
+}
+
+function option(value, label) {
+  return `<option value="${escAttr(value)}">${esc(label)}</option>`;
+}
+
+function content() {
+  return document.getElementById('pageContent');
+}
+
+function loading() {
+  return '<div class="empty-state">加载中...</div>';
+}
+
+function emptyRow(cols) {
+  return `<tr><td colspan="${cols}"><div class="empty-state">暂无数据</div></td></tr>`;
+}
+
+function openDrawer(eyebrow, title, body) {
+  document.getElementById('drawerEyebrow').textContent = eyebrow;
+  document.getElementById('drawerTitle').textContent = title;
+  document.getElementById('drawerBody').innerHTML = body;
+  document.getElementById('drawer').hidden = false;
+  document.getElementById('drawerScrim').hidden = false;
+}
+
+function closeDrawer() {
+  document.getElementById('drawer').hidden = true;
+  document.getElementById('drawerScrim').hidden = true;
+}
+
+function toast(message, type = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = message;
+  document.getElementById('toastHost').appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+
+function isInternal() {
+  return Boolean(state.user?.isInternal && ['platform_admin', 'internal_operator'].includes(state.user.globalRole));
+}
+
+function currentMembership() {
+  return (state.user?.memberships || []).find(m => m.tenantId === state.tenantId);
+}
+
+function currentTenantRoleLabel() {
+  return LABELS.role[currentMembership()?.role || ''] || '成员';
+}
+
+function canWrite() {
+  if (isInternal()) return true;
+  return ['tenant_admin', 'tenant_analyst'].includes(currentMembership()?.role);
+}
+
+function tenantRoleText(memberships) {
+  return (memberships || []).map(m => `${m.tenantName}: ${LABELS.role[m.role] || m.role}`).join(' / ') || '无租户';
+}
+
+function valueOf(id) {
+  return document.getElementById(id)?.value || '';
+}
+
+function n(value) {
+  const num = Number(value || 0);
+  return Number.isFinite(num) ? num.toLocaleString('zh-CN') : '0';
+}
+
+function date(value) {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '-';
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+function dateRange(start, end) {
+  return `${dateOnly(start)} - ${dateOnly(end)}`;
+}
+
+function dateOnly(value) {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '-';
+  return d.toLocaleDateString('zh-CN');
+}
+
+function platformName(value) {
+  return { weibo: '微博', xiaohongshu: '小红书', douyin: '抖音', unknown: '未知' }[value] || value || '全部平台';
+}
+
+function esc(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escAttr(value) {
+  return esc(value).replace(/`/g, '&#96;');
 }

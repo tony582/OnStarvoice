@@ -42,12 +42,12 @@ function buildUserMessage(record) {
   if (record.platform) text += `平台：${record.platform}\n`;
   if (record.tags) {
     try {
-      const tags = JSON.parse(record.tags);
+      const tags = Array.isArray(record.tags) ? record.tags : JSON.parse(record.tags);
       if (tags.length > 0) text += `标签：${tags.join(', ')}\n`;
     } catch {}
   }
-  if (record.likes || record.comments_count || record.collects) {
-    text += `互动：${record.likes}赞 ${record.comments_count}评论 ${record.collects}收藏\n`;
+  if (record.likes || record.comments_count || record.collects || record.shares) {
+    text += `互动：${record.likes}赞 ${record.comments_count}评论 ${record.collects}收藏 ${record.shares || 0}转发\n`;
   }
   return text || '(空内容)';
 }
@@ -86,11 +86,11 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
   return JSON.parse(data.choices?.[0]?.message?.content || '');
 }
 
-function getLLMConfig() {
-  const provider = (getSetting('llm_provider') || process.env.LLM_PROVIDER || 'gemini').toLowerCase();
-  const apiKey = getSetting('llm_api_key') || process.env.LLM_API_KEY || '';
-  const model = getSetting('llm_model') || process.env.LLM_MODEL || '';
-  const endpoint = getSetting('llm_api_endpoint') || process.env.LLM_API_ENDPOINT || '';
+async function getLLMConfig(tenantId) {
+  const provider = ((await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini').toLowerCase();
+  const apiKey = (await getSetting('llm_api_key', tenantId)) || process.env.LLM_API_KEY || '';
+  const model = (await getSetting('llm_model', tenantId)) || process.env.LLM_MODEL || '';
+  const endpoint = (await getSetting('llm_api_endpoint', tenantId)) || process.env.LLM_API_ENDPOINT || '';
   const defaults = {
     gemini: { model: 'gemini-2.0-flash', endpoint: '' },
     openai: { model: 'gpt-4o-mini', endpoint: 'https://api.openai.com/v1' },
@@ -101,29 +101,31 @@ function getLLMConfig() {
   return { provider, apiKey, model: model || d.model, endpoint: endpoint || d.endpoint };
 }
 
-async function callLLM(userMessage) {
-  const config = getLLMConfig();
+async function callLLM(userMessage, tenantId) {
+  const config = await getLLMConfig(tenantId);
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
   if (config.provider === 'gemini') return await callGemini(config.apiKey, config.model, SYSTEM_PROMPT, userMessage);
   return await callOpenAICompatible(config.apiKey, config.model, config.endpoint, SYSTEM_PROMPT, userMessage);
 }
 
 export async function labelRecord(recordId) {
-  const record = queryOne('SELECT * FROM records WHERE id = ?', [recordId]);
+  const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
   if (!record || record.ai_labeled_at) return null;
 
   const userMessage = buildUserMessage(record);
   try {
-    const result = await callLLM(userMessage);
+    const result = await callLLM(userMessage, record.tenant_id);
     if (!result) return null;
-    execute(`
-      UPDATE records SET sentiment = ?, intent = ?, category = ?, subcategory = ?,
-        source_type = ?, ai_summary = ?, ai_confidence = ?,
-        ai_labeled_at = datetime('now'), updated_at = datetime('now')
-      WHERE id = ?
+    await execute(`
+      UPDATE records SET sentiment = $1, intent = $2, category = $3, subcategory = $4,
+        source_type = $5, ai_summary = $6, ai_confidence = $7,
+        ai_result = $8::jsonb,
+        ai_labeled_at = now(), updated_at = now()
+      WHERE id = $9
     `, [
       result.sentiment || '', result.intent || '', result.category || '', result.subcategory || '',
       result.sourceType || result.source_type || '', result.summary || '', result.confidence || 0,
+      JSON.stringify(result),
       recordId,
     ]);
     console.log(`[AI] Record ${recordId} labeled: ${result.sentiment}/${result.category}`);
@@ -135,8 +137,8 @@ export async function labelRecord(recordId) {
 }
 
 export async function labelPendingRecords(limit = 50) {
-  const records = queryAll(
-    'SELECT id FROM records WHERE ai_labeled_at IS NULL ORDER BY created_at DESC LIMIT ?', [limit]
+  const records = await queryAll(
+    'SELECT id FROM records WHERE ai_labeled_at IS NULL ORDER BY created_at DESC LIMIT $1', [limit]
   );
   let labeled = 0;
   for (const record of records) {

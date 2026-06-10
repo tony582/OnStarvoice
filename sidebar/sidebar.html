@@ -5,7 +5,7 @@
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0" />
-    <title>OnStarVoice：汽车品牌舆情巡检助手</title>
+    <title>OnStarVoice 星语｜AI舆情巡检工具</title>
     <link
       rel="stylesheet"
       href="sidebar.css" />
@@ -313,11 +313,11 @@
           <div class="unsupported-platform-brand">
             <div class="unsupported-platform-brand-icon-wrap">
               <img
-                src="../images/icon48.png"
-                alt="OnStarVoice"
+                src="../images/logo-starvoice.svg"
+                alt="OnStarVoice 星语"
                 class="unsupported-platform-brand-icon" />
             </div>
-            <h2 class="unsupported-platform-brand-title">OnStarVoice</h2>
+            <h2 class="unsupported-platform-brand-title">OnStarVoice 星语</h2>
             <p class="unsupported-platform-brand-subtitle">
               前往以下支持平台的作品详情页、账号主页或搜索页，即可开始采集
             </p>
@@ -1446,6 +1446,20 @@
                   </select>
                 </div>
                 <div class="form-group">
+                  <label
+                    class="form-checkbox-wrap"
+                    for="checkboxSkipOfficialAccounts">
+                    <input
+                      type="checkbox"
+                      id="checkboxSkipOfficialAccounts"
+                      class="form-checkbox-input" />
+                    <span class="form-checkbox-label">跳过官方账号发布内容</span>
+                  </label>
+                  <p class="form-hint">
+                    官方账号自己的内容不进入待处理队列；普通用户内容下的官方回复仍会采集为处置进展。
+                  </p>
+                </div>
+                <div class="form-group">
                   <label class="form-label">随机等待时间（秒）最小值</label>
                   <input
                     type="number"
@@ -1790,7 +1804,7 @@
               alt="联系我们微信二维码" />
           </div>
         </div>
-        <p class="contact-modal-tip">请使用微信扫码添加，备注「OnStarVoice」</p>
+        <p class="contact-modal-tip">请使用微信扫码添加，备注「OnStarVoice 星语」</p>
         <div class="modal-footer contact-modal-footer">
           <button
             class="btn btn-secondary"
