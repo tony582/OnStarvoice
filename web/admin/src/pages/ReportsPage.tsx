@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Loader2, FileText, Send } from 'lucide-react'
+import { Loader2, FileText, Send, Eye, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,7 @@ export function ReportsPage() {
   const { canWrite } = useAuth()
   const [reports, setReports] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [preview, setPreview] = useState<{ subject: string; html: string } | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -22,8 +23,14 @@ export function ReportsPage() {
   useEffect(() => { load() }, [])
 
   const generate = async (type: string) => {
-    await api.post('/reports/generate', { type, send: false })
+    const data = await api.post<any>('/reports/generate', { type, send: false })
     load()
+    if (data.report?.id) previewReport(data.report.id)
+  }
+
+  const previewReport = async (id: string) => {
+    const data = await api.get<any>('/reports/' + id + '/preview')
+    setPreview({ subject: data.report?.subject || '报告', html: data.html || '' })
   }
 
   const send = async (id: string) => {
@@ -61,14 +68,40 @@ export function ReportsPage() {
                   <td className="px-4 py-3"><StatusBadge tone={r.status}>{LABELS.reportStatus[r.status] || r.status}</StatusBadge></td>
                   <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(r.generated_at || r.created_at)}</td>
                   <td className="px-4 py-3 text-right">
-                    <Button variant="outline" size="sm" onClick={() => send(r.id)} disabled={!canWrite()}>
-                      <Send className="h-3.5 w-3.5" /> 发送
-                    </Button>
+                    <div className="flex justify-end gap-1">
+                      <Button variant="outline" size="sm" onClick={() => previewReport(r.id)}>
+                        <Eye className="h-3.5 w-3.5" /> 预览
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => send(r.id)} disabled={!canWrite()}>
+                        <Send className="h-3.5 w-3.5" /> 发送
+                      </Button>
+                    </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Preview drawer */}
+      {preview && (
+        <div className="fixed inset-0 z-50 flex justify-end" onClick={() => setPreview(null)}>
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+          <div className="relative z-10 flex h-full w-full max-w-3xl flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-200"
+            onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-border px-6 py-4">
+              <h2 className="text-base font-bold">{preview.subject}</h2>
+              <button onClick={() => setPreview(null)} className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent"><X className="h-5 w-5" /></button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-6">
+              {preview.html ? (
+                <div className="prose prose-sm max-w-none dark:prose-invert" dangerouslySetInnerHTML={{ __html: preview.html }} />
+              ) : (
+                <EmptyState icon={FileText} title="暂无内容" />
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
