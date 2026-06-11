@@ -154,6 +154,7 @@ function getDefaultAuth() {
     credentialCredit: null,
     credential: null,
     binding: null,
+    tenant: null,
   };
 }
 
@@ -557,7 +558,10 @@ export async function addRecord(record) {
   });
 
   dataPool.records.unshift(newRecord);
-  await setDataPool(dataPool);
+  const saved = await setDataPool(dataPool);
+  if (!saved) {
+    throw new Error("本地缓存写入失败，请检查扩展存储空间或稍后重试");
+  }
   return newRecord;
 }
 
@@ -580,7 +584,10 @@ export async function addRecords(records) {
   );
 
   dataPool.records.unshift(...newRecords);
-  await setDataPool(dataPool);
+  const saved = await setDataPool(dataPool);
+  if (!saved) {
+    throw new Error("本地缓存写入失败，请检查扩展存储空间或稍后重试");
+  }
   return newRecords;
 }
 

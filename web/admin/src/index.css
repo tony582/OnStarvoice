@@ -39,7 +39,7 @@
   --fg: #0c0e16;
   --card: #ffffff;
   --card-fg: #0c0e16;
-  --primary: #6366f1;
+  --primary: #2563eb;
   --primary-fg: #ffffff;
   --secondary: #f0f1f5;
   --secondary-fg: #4b5068;
@@ -51,7 +51,7 @@
   --destructive-fg: #ffffff;
   --border: #e4e5ec;
   --input: #e4e5ec;
-  --ring: #6366f1;
+  --ring: #2563eb;
   --sidebar: #0c0e1a;
   --sidebar-fg: #a1a5bd;
   --sidebar-accent: rgba(99,102,241,0.12);
@@ -61,7 +61,7 @@
   --success: #10b981;
   --success-fg: #ffffff;
   --surface: rgba(255,255,255,0.65);
-  --glow: rgba(99,102,241,0.08);
+  --glow: rgba(37,99,235,0.08);
 }
 
 /* ── Dark ─────────────────────────────────── */
@@ -174,3 +174,16 @@ body::before {
 .prose h1, .prose h2, .prose h3 { color: var(--fg); }
 .prose p, .prose li { color: var(--card-fg); }
 .prose a { color: var(--primary); }
+
+.report-preview-content {
+  min-height: 100%;
+  background: #f6f8fb;
+}
+
+.report-preview-content .osv-report {
+  min-height: 100%;
+}
+
+.report-preview-content table {
+  border-collapse: collapse;
+}

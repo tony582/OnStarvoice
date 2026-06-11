@@ -56,6 +56,7 @@ const TRIAGE_LABEL = {
   archived: '已归档',
   false_positive: '误报',
 };
+const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
 
 function escHtml(value) {
   return String(value ?? '')
@@ -166,10 +167,12 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     FROM record_observations ro
     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+      AND ${RELEVANT_RECORD_SQL}
   `;
   const periodWhere = `
     FROM records r
     WHERE r.tenant_id = $1
+      AND ${RELEVANT_RECORD_SQL}
       AND (
         (r.created_at >= $2 AND r.created_at < $3)
         OR EXISTS (
@@ -185,7 +188,9 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     WITH observed AS (
       SELECT DISTINCT
         r.id, r.platform, r.title, r.content, r.url, r.cover_url, r.author_name, r.author_id,
-        r.author_fans, r.sentiment, r.category, r.intent, r.keyword, r.ai_summary,
+        r.author_avatar, r.author_fans, r.blogger_profile_url, r.note_type, r.source_type,
+        r.tags, r.image_urls, r.payload,
+        r.sentiment, r.category, r.intent, r.keyword, r.ai_summary,
         r.likes, r.comments_count, r.collects, r.shares, r.official_response_status,
         r.official_replied, r.negative_comment_count, r.latest_negative_comment_at,
         r.created_at, r.last_seen_at
@@ -195,7 +200,9 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
 
   const total = await scalar(`SELECT COUNT(DISTINCT r.id) as n ${periodWhere}`, params);
   const newRecords = await scalar(
-    'SELECT COUNT(*) as n FROM records WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3',
+    `SELECT COUNT(*) as n FROM records r
+     WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
+       AND ${RELEVANT_RECORD_SQL}`,
     params
   );
   const updatedRecords = await scalar(
@@ -203,7 +210,11 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   );
   const observations = await scalar(
-    'SELECT COUNT(*) as n FROM record_observations WHERE tenant_id = $1 AND captured_at >= $2 AND captured_at < $3',
+    `SELECT COUNT(*) as n
+     FROM record_observations ro
+     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+       AND ${RELEVANT_RECORD_SQL}`,
     params
   );
   const pendingLabel = await scalar(
@@ -271,6 +282,71 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['count', 'negative_count', 'interaction_total']);
 
+  const volumeTrend = normalizeRows(await queryAll(
+    `SELECT
+       to_char(ro.captured_at AT TIME ZONE 'Asia/Shanghai', 'MM-DD') as label,
+       date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') as day_bucket,
+       COUNT(DISTINCT ro.record_id) as total,
+       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'positive') as positive,
+       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'neutral') as neutral,
+       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'negative') as negative,
+       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = '') as pending
+     FROM record_observations ro
+     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+       AND ${RELEVANT_RECORD_SQL}
+     GROUP BY day_bucket, label
+     ORDER BY day_bucket ASC`,
+    params
+  ), ['total', 'positive', 'neutral', 'negative', 'pending']);
+
+  const mediaDistribution = normalizeRows(await queryAll(
+    `${observedCte}
+     SELECT COALESCE(
+       NULLIF(payload->>'mediaType', ''),
+       NULLIF(payload->>'media_type', ''),
+       NULLIF(note_type, ''),
+       NULLIF(source_type, ''),
+       '未采集'
+     ) as media_type,
+       COUNT(*) as count,
+       COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count
+     FROM observed
+     GROUP BY media_type
+     ORDER BY count DESC
+     LIMIT 8`,
+    params
+  ), ['count', 'negative_count']);
+
+  const regionDistribution = normalizeRows(await queryAll(
+    `${observedCte}
+     SELECT COALESCE(
+       NULLIF(payload->>'publishLocation', ''),
+       NULLIF(payload->>'region', ''),
+       NULLIF(payload->>'ipLocation', ''),
+       '未采集'
+     ) as region,
+       COUNT(*) as count,
+       COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count
+     FROM observed
+     GROUP BY region
+     ORDER BY count DESC
+     LIMIT 8`,
+    params
+  ), ['count', 'negative_count']);
+
+  const sentimentSamples = normalizeRows(await queryAll(
+    `${observedCte}
+     SELECT *
+     FROM observed
+     WHERE sentiment <> ''
+     ORDER BY (
+       comments_count * 3 + shares * 3 + likes + collects + COALESCE(negative_comment_count, 0) * 20
+     ) DESC, last_seen_at DESC
+     LIMIT 24`,
+    params
+  ), ['likes', 'comments_count', 'collects', 'shares', 'negative_comment_count', 'author_fans']);
+
   const topNegative = normalizeRows(await queryAll(
     `${observedCte}
      SELECT *
@@ -310,6 +386,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM obs
      JOIN records r ON r.id = obs.record_id AND r.tenant_id = $1
      WHERE obs.snapshots > 1
+       AND ${RELEVANT_RECORD_SQL}
      ORDER BY interaction_growth DESC, obs.last_captured_at DESC
      LIMIT 8`,
     params
@@ -359,37 +436,47 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
   ), ['record_count']);
 
   const alerts = normalizeRows(await queryAll(
-    'SELECT level, COUNT(*) as count FROM alerts WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3 GROUP BY level',
+    `SELECT a.level, COUNT(*) as count
+     FROM alerts a
+     LEFT JOIN records r ON r.id = a.record_id AND r.tenant_id = a.tenant_id
+     WHERE a.tenant_id = $1 AND a.created_at >= $2 AND a.created_at < $3
+       AND (a.record_id IS NULL OR ${RELEVANT_RECORD_SQL})
+     GROUP BY a.level`,
     params
   ), ['count']);
 
   const topAlerts = normalizeRows(await queryAll(
-    `SELECT id, level, title, summary, reason, url, interaction_total, created_at
-     FROM alerts
-     WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
-     ORDER BY CASE level WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END DESC,
-       interaction_total DESC, created_at DESC
+    `SELECT a.id, a.level, a.title, a.summary, a.reason, a.url, a.interaction_total, a.created_at
+     FROM alerts a
+     LEFT JOIN records r ON r.id = a.record_id AND r.tenant_id = a.tenant_id
+     WHERE a.tenant_id = $1 AND a.created_at >= $2 AND a.created_at < $3
+       AND (a.record_id IS NULL OR ${RELEVANT_RECORD_SQL})
+     ORDER BY CASE a.level WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END DESC,
+       a.interaction_total DESC, a.created_at DESC
      LIMIT 6`,
     params
   ), ['interaction_total']);
 
   const commentStats = await queryOne(
     `SELECT
-       COUNT(*) FILTER (WHERE created_at >= $2 AND created_at < $3) as new_comments,
-       COUNT(*) FILTER (WHERE is_negative = true AND last_seen_at >= $2 AND last_seen_at < $3) as negative_comments,
-       COUNT(*) FILTER (WHERE is_official = true AND last_seen_at >= $2 AND last_seen_at < $3) as official_comments
-     FROM record_comments
-     WHERE tenant_id = $1`,
+       COUNT(*) FILTER (WHERE rc.created_at >= $2 AND rc.created_at < $3) as new_comments,
+       COUNT(*) FILTER (WHERE rc.is_negative = true AND rc.last_seen_at >= $2 AND rc.last_seen_at < $3) as negative_comments,
+       COUNT(*) FILTER (WHERE rc.is_official = true AND rc.last_seen_at >= $2 AND rc.last_seen_at < $3) as official_comments
+     FROM record_comments rc
+     JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
+     WHERE rc.tenant_id = $1
+       AND ${RELEVANT_RECORD_SQL}`,
     params
   );
 
   const negativeComments = normalizeRows(await queryAll(
-    `SELECT rc.id, rc.record_id, rc.platform, rc.author_name, rc.content, rc.like_count,
+    `SELECT rc.id, rc.record_id, rc.platform, rc.author_name, rc.author_avatar, rc.content, rc.like_count,
        rc.risk_level, rc.sentiment, rc.category, rc.published_at, rc.last_seen_at,
-       r.title as record_title, r.url as record_url
+       r.title as record_title, r.url as record_url, r.cover_url as record_cover_url, r.author_name as record_author_name
      FROM record_comments rc
      JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
      WHERE rc.tenant_id = $1
+       AND ${RELEVANT_RECORD_SQL}
        AND rc.is_negative = true
        AND rc.last_seen_at >= $2
        AND rc.last_seen_at < $3
@@ -401,10 +488,24 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['like_count']);
 
+  const officialResponses = normalizeRows(await queryAll(
+    `SELECT o.id, o.record_id, o.platform, o.account_name, o.content, o.published_at, o.created_at,
+       r.title as record_title, r.url as record_url
+     FROM official_responses o
+     JOIN records r ON r.id = o.record_id AND r.tenant_id = o.tenant_id
+     WHERE o.tenant_id = $1 AND o.created_at >= $2 AND o.created_at < $3
+       AND ${RELEVANT_RECORD_SQL}
+     ORDER BY o.created_at DESC
+     LIMIT 8`,
+    params
+  ), []);
+
   const officialPeriod = await queryOne(
-    `SELECT COUNT(*) as response_count, COUNT(DISTINCT record_id) as record_count
-     FROM official_responses
-     WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3`,
+    `SELECT COUNT(*) as response_count, COUNT(DISTINCT o.record_id) as record_count
+     FROM official_responses o
+     JOIN records r ON r.id = o.record_id AND r.tenant_id = o.tenant_id
+     WHERE o.tenant_id = $1 AND o.created_at >= $2 AND o.created_at < $3
+       AND ${RELEVANT_RECORD_SQL}`,
     params
   );
 
@@ -423,7 +524,8 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'false_positive') as false_positive
      FROM records r
      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
-     WHERE r.tenant_id = $1`,
+     WHERE r.tenant_id = $1
+       AND ${RELEVANT_RECORD_SQL}`,
     [tenantId]
   );
 
@@ -459,6 +561,11 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     platform,
     intent,
     keyword,
+    volumeTrend,
+    sentimentTrend: volumeTrend,
+    mediaDistribution,
+    regionDistribution,
+    sentimentSamples,
     topNegative,
     topInteraction,
     risingRecords,
@@ -478,6 +585,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
       official_comments: rowNum(commentStats, 'official_comments'),
     },
     negativeComments,
+    officialResponses,
     officialPeriod: {
       response_count: rowNum(officialPeriod, 'response_count'),
       record_count: rowNum(officialPeriod, 'record_count'),
@@ -601,6 +709,205 @@ function buildCollectionRecommendations(stats) {
   return items;
 }
 
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function parseJsonObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+const HOT_TERM_STOP_WORDS = new Set([
+  '安吉星', 'OnStar', 'onstar', '这个', '那个', '因为', '所以', '但是', '就是', '没有', '还是',
+  '一个', '一下', '感觉', '什么', '真的', '可以', '已经', '需要', '大家', '自己', '时候',
+  '小红书', '微博', '抖音', '平台', '内容', '评论', '官方', '用户',
+]);
+
+const DOMAIN_TERMS = [
+  '续费', '收费', '不续费', '救援', '安全', '隐私', '客服', '服务', 'APP', '车机',
+  '定位', '远程启动', '胎压', '气囊', '事故', '召回', '故障', '无法登录', '连接失败',
+  '电话', '到期', '官方回复', '车主', '权益', '价格', '流量', '导航', '被扣费',
+];
+
+function addTerm(counter, term, weight = 1) {
+  const label = String(term || '').replace(/^#+/, '').trim();
+  if (!label || label.length < 2 || HOT_TERM_STOP_WORDS.has(label)) return;
+  counter.set(label, (counter.get(label) || 0) + weight);
+}
+
+function collectTermsFromText(counter, text, weight = 1) {
+  const value = String(text || '');
+  if (!value) return;
+  for (const term of DOMAIN_TERMS) {
+    if (value.toLowerCase().includes(term.toLowerCase())) addTerm(counter, term, weight + 1);
+  }
+  const hashtagMatches = value.match(/#[^#\s,，。；;:：、]{2,24}/g) || [];
+  for (const tag of hashtagMatches) addTerm(counter, tag, weight + 2);
+}
+
+function collectTermsFromRow(counter, row, weight = 1) {
+  addTerm(counter, row.keyword, weight + num(row.count));
+  addTerm(counter, CATEGORY_LABEL[row.category] || row.category, weight);
+  collectTermsFromText(counter, row.title, weight);
+  collectTermsFromText(counter, row.content, weight);
+  collectTermsFromText(counter, row.ai_summary, weight);
+  for (const tag of parseJsonArray(row.tags)) {
+    addTerm(counter, typeof tag === 'string' ? tag : tag?.name || tag?.text, weight + 2);
+  }
+  const payload = parseJsonObject(row.payload);
+  for (const list of [payload.hashtags, payload.topics, payload.tags]) {
+    for (const item of parseJsonArray(list)) addTerm(counter, typeof item === 'string' ? item : item?.name || item?.text, weight + 2);
+  }
+}
+
+function buildHotTerms(stats) {
+  const counter = new Map();
+  for (const row of stats.keyword || []) addTerm(counter, row.keyword, Math.max(2, num(row.count) * 3));
+  for (const row of stats.category || []) addTerm(counter, CATEGORY_LABEL[row.category] || row.category, Math.max(1, num(row.count)));
+  for (const row of [...(stats.topNegative || []), ...(stats.topInteraction || []), ...(stats.sentimentSamples || [])]) {
+    collectTermsFromRow(counter, row, row.sentiment === 'negative' ? 3 : 1);
+  }
+  for (const row of stats.negativeComments || []) {
+    collectTermsFromText(counter, row.content, 3 + Math.min(5, num(row.like_count)));
+    addTerm(counter, CATEGORY_LABEL[row.category] || row.category, 2);
+  }
+  return Array.from(counter.entries())
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label, 'zh-CN'))
+    .slice(0, 36)
+    .map((term, index) => ({
+      ...term,
+      weight: Math.max(12, Math.min(34, 12 + Math.round(term.count / Math.max(1, counter.size ? Math.max(...counter.values()) : 1) * 22))),
+      tone: index % 5,
+    }));
+}
+
+function buildTopicFocus(stats) {
+  const counts = sentimentMap(stats);
+  const rows = stats.sentimentSamples || [];
+  return ['positive', 'neutral', 'negative'].map(sentiment => {
+    const samples = rows.filter(row => row.sentiment === sentiment).slice(0, 5);
+    const categoryCounter = new Map();
+    for (const row of samples) {
+      const label = CATEGORY_LABEL[row.category] || row.category || '未分类';
+      categoryCounter.set(label, (categoryCounter.get(label) || 0) + 1);
+    }
+    return {
+      sentiment,
+      label: SENTIMENT_LABEL[sentiment],
+      count: counts[sentiment] || 0,
+      share: pct(counts[sentiment] || 0, stats.total),
+      categories: Array.from(categoryCounter.entries()).map(([label, count]) => ({ label, count })).slice(0, 4),
+      samples,
+    };
+  });
+}
+
+function reportFocus(type) {
+  if (type === 'weekly') return '本周重点看趋势变化、主题演化、重点问题复盘和行动建议。';
+  if (type === 'monthly') return '本月重点看管理层复盘、重复问题、处置效率和长期风险。';
+  if (type === 'dashboard') return '当前筛选范围内的实时舆情态势、内容风险和处置进展。';
+  return '今日重点看新增风险、待处理线索、官方响应和重点样本。';
+}
+
+function totalInteraction(rows = []) {
+  return rows.reduce((sum, row) => sum + num(row.likes) + num(row.comments_count) + num(row.collects) + num(row.shares), 0);
+}
+
+function buildOpinionIndex(stats, previousStats, negativeRate, previousNegativeRate) {
+  const currentInteraction = totalInteraction(stats.topInteraction || []);
+  const previousInteraction = totalInteraction(previousStats.topInteraction || []);
+  const warningAlerts = alertCount(stats, 'warning');
+  const criticalAlerts = alertCount(stats, 'critical');
+  const previousWarningAlerts = alertCount(previousStats, 'warning');
+  const previousCriticalAlerts = alertCount(previousStats, 'critical');
+  const heat = Math.round(
+    num(stats.total) * 3 +
+    currentInteraction / 40 +
+    num(stats.commentStats?.new_comments) * 1.2 +
+    num(stats.observations) * 0.8
+  );
+  const previousHeat = Math.round(
+    num(previousStats.total) * 3 +
+    previousInteraction / 40 +
+    num(previousStats.commentStats?.new_comments) * 1.2 +
+    num(previousStats.observations) * 0.8
+  );
+  const risk = Math.min(100, Math.round(
+    negativeRate * 1.2 +
+    num(stats.commentStats?.negative_comments) * 3 +
+    num(stats.issueStats?.high_open_issues) * 18 +
+    warningAlerts * 10 +
+    criticalAlerts * 24
+  ));
+  const previousRisk = Math.min(100, Math.round(
+    previousNegativeRate * 1.2 +
+    num(previousStats.commentStats?.negative_comments) * 3 +
+    num(previousStats.issueStats?.high_open_issues) * 18 +
+    previousWarningAlerts * 10 +
+    previousCriticalAlerts * 24
+  ));
+  const response = Math.min(100, Math.round(
+    pct(stats.workflowStats?.issue_linked || 0, Math.max(1, stats.workflowStats?.active_inbox || 0) + num(stats.workflowStats?.issue_linked)) * 0.55 +
+    pct(stats.officialPeriod?.record_count || 0, Math.max(1, stats.total)) * 0.45
+  ));
+  return {
+    heat,
+    heatDelta: delta(heat, previousHeat),
+    risk,
+    riskDelta: delta(risk, previousRisk),
+    response,
+    status: risk >= 70 ? '重点处置' : risk >= 45 ? '风险抬升' : risk >= 20 ? '持续观察' : '平稳',
+  };
+}
+
+function buildPlatformMatrix(stats) {
+  const total = Math.max(1, num(stats.total));
+  return (stats.platform || []).slice(0, 8).map(row => {
+    const interactions = num(row.interaction_total);
+    const negativeCount = num(row.negative_count);
+    const count = num(row.count);
+    return {
+      platform: row.platform,
+      label: PLATFORM_LABEL[row.platform] || row.platform || '未知平台',
+      count,
+      share: pct(count, total),
+      negativeCount,
+      negativeRate: pct(negativeCount, Math.max(1, count)),
+      interactions,
+      heat: Math.round(count * 2 + interactions / 30 + negativeCount * 6),
+    };
+  }).sort((a, b) => b.heat - a.heat);
+}
+
+function buildSentimentStructure(stats, sentimentCounts) {
+  const total = Math.max(1, num(stats.total));
+  const rows = [
+    { key: 'positive', label: '正面', color: '#059669', count: sentimentCounts.positive || 0 },
+    { key: 'neutral', label: '中性', color: '#6B7280', count: sentimentCounts.neutral || 0 },
+    { key: 'negative', label: '负面', color: '#DC2626', count: sentimentCounts.negative || 0 },
+    { key: 'pending', label: '待标注', color: '#CBD5E1', count: stats.pendingLabel || 0 },
+  ];
+  return rows.map(row => ({ ...row, share: pct(row.count, total) }));
+}
+
 function enrichReportData(type, current, previous) {
   const currentSentiment = sentimentMap(current);
   const previousSentiment = sentimentMap(previous);
@@ -613,7 +920,7 @@ function enrichReportData(type, current, previous) {
     .filter(item => item.negative_count > 0)
     .sort((a, b) => b.negative_count - a.negative_count)[0] || null;
   const topKeyword = firstNonEmpty(current.keyword);
-  const typeName = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
+  const typeName = { daily: '日报', weekly: '周报', monthly: '月报', dashboard: '数据看板' }[type] || '报表';
 
   const dashboardCards = [
     { label: '声量', value: n0(current.total), delta: delta(current.total, previous.total), help: '本周期涉及的帖子/内容量' },
@@ -637,6 +944,13 @@ function enrichReportData(type, current, previous) {
       : '本周期暂无明确主题分类。',
     topKeyword ? `高频监控关键词为「${topKeyword.keyword}」，相关内容 ${topKeyword.count} 条。` : '本周期关键词维度样本较少。',
   ];
+  const hotTerms = buildHotTerms(current);
+  const topicFocus = buildTopicFocus(current);
+  const actionItems = buildActionItems(current, negativeRate, riskLevel);
+  const collectionRecommendations = buildCollectionRecommendations(current);
+  const opinionIndex = buildOpinionIndex(current, previous, negativeRate, previousNegativeRate);
+  const platformMatrix = buildPlatformMatrix(current);
+  const sentimentStructure = buildSentimentStructure(current, currentSentiment);
 
   return {
     ...current,
@@ -653,11 +967,31 @@ function enrichReportData(type, current, previous) {
     dominantPlatform,
     dominantCategory,
     negativeCategory,
+    kpis: dashboardCards,
+    platformDistribution: current.platform,
+    topicFocus,
+    hotTerms,
+    riskItems: current.topNegative,
+    commentRisks: current.negativeComments,
+    issueSummary: current.issueStats,
+    officialResponseSummary: current.officialPeriod,
+    actionRecommendations: actionItems,
+    periodFocus: reportFocus(type),
+    opinionIndex,
+    platformMatrix,
+    sentimentStructure,
     dashboardCards,
     executiveSummary,
-    actionItems: buildActionItems(current, negativeRate, riskLevel),
-    collectionRecommendations: buildCollectionRecommendations(current),
+    actionItems,
+    collectionRecommendations,
   };
+}
+
+export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd }) {
+  const previous = previousPeriod(periodStart, periodEnd);
+  const currentStats = await getReportStats(tenantId, periodStart, periodEnd);
+  const previousStats = await getReportStats(tenantId, previous.start, previous.end);
+  return enrichReportData('dashboard', currentStats, previousStats);
 }
 
 function styleBlock() {
@@ -793,7 +1127,7 @@ function renderIssues(issues = []) {
   </table>`;
 }
 
-function buildReportHTML(title, periodLabel, stats) {
+function buildLegacyReportHTML(title, periodLabel, stats) {
   const generatedAt = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
   const riskBg = stats.riskLevel === 'critical'
     ? '#FEF2F2'
@@ -893,7 +1227,474 @@ function buildReportHTML(title, periodLabel, stats) {
     </div>`;
 }
 
-async function upsertReportRun({ tenantId, type, periodStart, periodEnd, subject, html, stats, status }) {
+function reportCss() {
+  return `<style>
+    .osv-report { --bg:#F6F8FB; --surface:#FFFFFF; --text:#111827; --muted:#6B7280; --soft:#9CA3AF; --border:#E5E7EB; --blue:#2563EB; --green:#059669; --red:#DC2626; --orange:#D97706; --teal:#0F766E; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif; background:var(--bg); color:var(--text); padding:24px; }
+    .osv-report * { box-sizing:border-box; }
+    .osv-report a { color:var(--blue); text-decoration:none; }
+    .osv-shell { max-width:1180px; margin:0 auto; display:grid; gap:16px; }
+    .osv-hero { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:22px 24px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:18px; align-items:start; }
+    .osv-kicker { color:var(--blue); font-size:12px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; }
+    .osv-title { margin:6px 0 8px; font-size:26px; line-height:1.22; letter-spacing:0; }
+    .osv-subtitle { color:var(--muted); font-size:13px; line-height:1.7; }
+    .osv-risk { min-width:190px; border:1px solid var(--border); border-radius:8px; padding:14px; background:#FAFCFF; }
+    .osv-risk strong { display:block; font-size:22px; line-height:1.2; }
+    .osv-risk span { display:block; color:var(--muted); font-size:12px; margin-top:6px; }
+    .osv-kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .osv-kpi { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px; min-height:116px; }
+    .osv-kpi label { display:block; color:var(--muted); font-size:12px; font-weight:700; }
+    .osv-kpi strong { display:block; margin-top:6px; font-size:26px; line-height:1.15; font-variant-numeric:tabular-nums; }
+    .osv-kpi small { display:block; margin-top:6px; color:var(--soft); line-height:1.45; }
+    .osv-delta { font-size:12px; font-weight:700; }
+    .osv-up { color:var(--orange); } .osv-down { color:var(--green); } .osv-flat { color:var(--muted); }
+    .osv-grid { display:grid; grid-template-columns:1.35fr .95fr; gap:16px; }
+    .osv-grid-3 { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; }
+    .osv-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+    .osv-card-head { padding:14px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .osv-card-head h3 { margin:0; font-size:15px; }
+    .osv-card-head span { color:var(--muted); font-size:12px; }
+    .osv-card-body { padding:16px; }
+    .osv-index-panel { display:grid; grid-template-columns:1fr 1fr; gap:14px; align-items:stretch; }
+    .osv-index-primary { min-height:190px; border:1px solid var(--border); border-radius:8px; background:#F8FAFC; padding:16px; display:grid; align-content:center; }
+    .osv-index-primary span { color:var(--muted); font-size:12px; font-weight:800; }
+    .osv-index-value { margin-top:6px; font-size:44px; line-height:1; font-weight:900; font-variant-numeric:tabular-nums; color:var(--blue); }
+    .osv-index-status { margin-top:10px; display:inline-flex; width:max-content; min-height:24px; align-items:center; padding:2px 9px; border-radius:999px; background:#EFF6FF; color:var(--blue); font-size:12px; font-weight:800; }
+    .osv-index-bars { display:grid; gap:10px; align-content:center; }
+    .osv-index-item { display:grid; gap:6px; }
+    .osv-index-item header { display:flex; justify-content:space-between; gap:12px; color:#374151; font-size:12px; font-weight:800; }
+    .osv-platform-matrix { display:grid; gap:9px; }
+    .osv-platform-row { display:grid; grid-template-columns:minmax(70px,.8fr) minmax(0,1.4fr) 54px; gap:9px; align-items:center; font-size:12px; }
+    .osv-platform-row strong { color:#111827; }
+    .osv-platform-row span { color:var(--muted); text-align:right; font-variant-numeric:tabular-nums; }
+    .osv-sentiment-layout { display:grid; grid-template-columns:150px minmax(0,1fr); gap:14px; align-items:center; }
+    .osv-donut { width:136px; height:136px; border-radius:50%; display:grid; place-items:center; margin:auto; }
+    .osv-donut-inner { width:76px; height:76px; border-radius:50%; background:#fff; display:grid; place-items:center; text-align:center; box-shadow:inset 0 0 0 1px #E5E7EB; }
+    .osv-donut-inner strong { display:block; font-size:18px; line-height:1.1; }
+    .osv-donut-inner span { display:block; color:var(--muted); font-size:11px; margin-top:3px; }
+    .osv-legend { display:grid; gap:8px; }
+    .osv-legend-row { display:flex; align-items:center; justify-content:space-between; gap:10px; color:#374151; font-size:12px; }
+    .osv-legend-name { display:flex; align-items:center; gap:7px; }
+    .osv-dot { width:9px; height:9px; border-radius:999px; flex:0 0 auto; }
+    .osv-rank-list { display:grid; gap:8px; }
+    .osv-rank-row { display:grid; grid-template-columns:28px minmax(0,1fr) auto; gap:9px; align-items:center; padding:9px 0; border-bottom:1px solid #EEF2F7; font-size:12px; }
+    .osv-rank-row:last-child { border-bottom:0; }
+    .osv-rank-no { display:grid; place-items:center; width:22px; height:22px; border-radius:6px; background:#EFF6FF; color:#2563EB; font-weight:900; }
+    .osv-rank-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#111827; font-weight:700; }
+    .osv-rank-metric { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+    .osv-summary { margin:0; padding-left:18px; color:#374151; line-height:1.8; font-size:13px; }
+    .osv-summary li { margin:4px 0; }
+    .osv-chart { width:100%; min-height:240px; display:block; }
+    .osv-bars { display:grid; gap:10px; }
+    .osv-bar-row { display:grid; gap:5px; }
+    .osv-bar-top { display:flex; justify-content:space-between; gap:10px; font-size:13px; color:#374151; }
+    .osv-track { height:8px; border-radius:999px; background:#F3F4F6; overflow:hidden; }
+    .osv-fill { height:100%; border-radius:999px; background:var(--blue); }
+    .osv-cloud { min-height:260px; display:flex; align-content:center; align-items:center; justify-content:center; gap:10px 14px; flex-wrap:wrap; padding:6px 8px; }
+    .osv-term { font-weight:800; line-height:1.1; color:#2563EB; }
+    .osv-term.t1 { color:#0F766E; } .osv-term.t2 { color:#D97706; } .osv-term.t3 { color:#7C3AED; } .osv-term.t4 { color:#DC2626; }
+    .osv-topic { display:grid; gap:12px; }
+    .osv-topic-box { border:1px solid var(--border); border-radius:8px; padding:13px; background:#FAFCFF; }
+    .osv-topic-box h4 { margin:0 0 8px; font-size:14px; display:flex; justify-content:space-between; gap:12px; }
+    .osv-topic-box p { margin:0; color:var(--muted); font-size:12px; line-height:1.65; }
+    .osv-sample-list { display:grid; gap:10px; }
+    .osv-sample { display:grid; grid-template-columns:58px minmax(0,1fr); gap:12px; padding:12px; border:1px solid var(--border); border-radius:8px; background:#FFFFFF; }
+    .osv-thumb { width:58px; height:58px; border:1px solid var(--border); border-radius:8px; background:#F3F4F6; overflow:hidden; display:grid; place-items:center; color:var(--soft); font-size:11px; font-weight:800; }
+    .osv-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+    .osv-sample h4 { margin:0; font-size:14px; line-height:1.45; }
+    .osv-sample p { margin:5px 0 0; color:#4B5563; font-size:12px; line-height:1.65; }
+    .osv-meta { margin-top:7px; color:var(--muted); font-size:12px; display:flex; flex-wrap:wrap; gap:6px 10px; }
+    .osv-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .osv-table th, .osv-table td { padding:9px 8px; border-bottom:1px solid #EEF2F7; text-align:left; vertical-align:top; }
+    .osv-table th { color:var(--muted); background:#F9FAFB; font-weight:800; }
+    .osv-pill { display:inline-flex; align-items:center; min-height:22px; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:800; background:#F3F4F6; color:#374151; }
+    .osv-pill.red { background:#FEF2F2; color:#DC2626; } .osv-pill.green { background:#ECFDF5; color:#059669; } .osv-pill.blue { background:#EFF6FF; color:#2563EB; } .osv-pill.orange { background:#FFFBEB; color:#D97706; }
+    .osv-footer { color:var(--muted); font-size:12px; line-height:1.7; padding:12px 2px; }
+    .osv-empty { color:var(--soft); font-size:13px; text-align:center; padding:28px; border:1px dashed var(--border); border-radius:8px; background:#FAFCFF; }
+    .osv-screen { min-height:760px; background:#F6F8FB; }
+    .osv-screen .osv-shell { max-width:1360px; }
+    .osv-screen-grid { display:grid; grid-template-columns:340px minmax(0,1fr) 390px; gap:14px; }
+    .osv-screen .osv-card-body { padding:14px; }
+    @media (max-width: 980px) { .osv-report { padding:14px; } .osv-hero, .osv-grid, .osv-grid-3, .osv-screen-grid, .osv-index-panel, .osv-sentiment-layout { grid-template-columns:1fr; } .osv-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } .osv-risk { min-width:0; } }
+    @media (max-width: 560px) { .osv-kpis { grid-template-columns:1fr; } .osv-title { font-size:22px; } }
+  </style>`;
+}
+
+function toneClass(item) {
+  if (!item) return 'flat';
+  if (item.tone === 'up') return 'up';
+  if (item.tone === 'down') return 'down';
+  return 'flat';
+}
+
+function renderReportKpis(cards = []) {
+  return `<div class="osv-kpis">${cards.map(card => `
+    <article class="osv-kpi">
+      <label>${escHtml(card.label)}</label>
+      <strong style="color:${card.tone === 'danger' ? '#DC2626' : card.tone === 'warning' ? '#D97706' : '#111827'}">${escHtml(card.value)}</strong>
+      ${card.delta ? `<div class="osv-delta osv-${toneClass(card.delta)}">较上期 ${escHtml(card.delta.value)}</div>` : '<div class="osv-delta osv-flat">当前状态</div>'}
+      <small>${escHtml(card.help || '')}</small>
+    </article>
+  `).join('')}</div>`;
+}
+
+function renderReportCard(title, body, subtitle = '') {
+  return `<section class="osv-card">
+    <div class="osv-card-head"><h3>${escHtml(title)}</h3>${subtitle ? `<span>${escHtml(subtitle)}</span>` : ''}</div>
+    <div class="osv-card-body">${body}</div>
+  </section>`;
+}
+
+function renderOpinionIndex(stats) {
+  const idx = stats.opinionIndex || { heat: 0, risk: 0, response: 0, status: '平稳', heatDelta: null, riskDelta: null };
+  const riskColor = idx.risk >= 70 ? '#DC2626' : idx.risk >= 45 ? '#D97706' : '#2563EB';
+  return `<div class="osv-index-panel">
+    <div class="osv-index-primary">
+      <span>综合舆情热度指数</span>
+      <div class="osv-index-value">${n0(idx.heat)}</div>
+      <div class="osv-index-status">${escHtml(idx.status)}${idx.heatDelta ? ` · ${escHtml(idx.heatDelta.value)}` : ''}</div>
+      <div style="margin-top:12px;color:#6B7280;font-size:12px;line-height:1.7;">综合声量、互动、评论、采集快照和风险信号，作为本周期态势研判入口。</div>
+    </div>
+    <div class="osv-index-bars">
+      <div class="osv-index-item">
+        <header><span>风险指数</span><strong style="color:${riskColor}">${n0(idx.risk)}</strong></header>
+        <div class="osv-track"><div class="osv-fill" style="width:${Math.min(100, Math.max(3, idx.risk))}%;background:${riskColor};"></div></div>
+      </div>
+      <div class="osv-index-item">
+        <header><span>处置响应指数</span><strong style="color:#059669">${n0(idx.response)}</strong></header>
+        <div class="osv-track"><div class="osv-fill" style="width:${Math.min(100, Math.max(3, idx.response))}%;background:#059669;"></div></div>
+      </div>
+      <div class="osv-index-item">
+        <header><span>负面率</span><strong style="color:#DC2626">${stats.negativeRate}%</strong></header>
+        <div class="osv-track"><div class="osv-fill" style="width:${Math.min(100, Math.max(3, stats.negativeRate))}%;background:#DC2626;"></div></div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderTrendSvg(trend = []) {
+  if (!trend.length) return '<div class="osv-empty">暂无趋势数据</div>';
+  const width = 720;
+  const height = 260;
+  const pad = { left: 36, right: 16, top: 18, bottom: 34 };
+  const maxValue = Math.max(1, ...trend.flatMap(row => [num(row.total), num(row.negative), num(row.positive)]));
+  const x = index => {
+    if (trend.length === 1) return pad.left + (width - pad.left - pad.right) / 2;
+    return pad.left + index * ((width - pad.left - pad.right) / (trend.length - 1));
+  };
+  const y = value => pad.top + (height - pad.top - pad.bottom) * (1 - num(value) / maxValue);
+  const line = key => trend.map((row, index) => `${x(index).toFixed(1)},${y(row[key]).toFixed(1)}`).join(' ');
+  const labels = trend.map((row, index) => `<text x="${x(index).toFixed(1)}" y="${height - 10}" text-anchor="middle" font-size="11" fill="#6B7280">${escHtml(row.label)}</text>`).join('');
+  const grid = [0, 0.25, 0.5, 0.75, 1].map(ratio => {
+    const gy = pad.top + (height - pad.top - pad.bottom) * ratio;
+    return `<line x1="${pad.left}" y1="${gy}" x2="${width - pad.right}" y2="${gy}" stroke="#EEF2F7"/><text x="4" y="${gy + 4}" font-size="10" fill="#9CA3AF">${Math.round(maxValue * (1 - ratio))}</text>`;
+  }).join('');
+  return `<svg class="osv-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="声量和情绪趋势">
+    ${grid}
+    <polyline points="${line('total')}" fill="none" stroke="#2563EB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <polyline points="${line('negative')}" fill="none" stroke="#DC2626" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <polyline points="${line('positive')}" fill="none" stroke="#059669" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    ${trend.map((row, index) => `<circle cx="${x(index).toFixed(1)}" cy="${y(row.total).toFixed(1)}" r="3.5" fill="#2563EB"/>`).join('')}
+    ${labels}
+    <g transform="translate(${pad.left},4)" font-size="11" font-weight="700">
+      <text x="0" y="0" fill="#2563EB">● 声量</text>
+      <text x="58" y="0" fill="#DC2626">● 负面</text>
+      <text x="116" y="0" fill="#059669">● 正面</text>
+    </g>
+  </svg>`;
+}
+
+function renderDistribution(rows = [], { labelKey, valueKey = 'count', total = 0, labelMap = {}, color = '#2563EB', maxRows = 8 }) {
+  const visible = rows.slice(0, maxRows);
+  if (!visible.length) return '<div class="osv-empty">暂无分布数据</div>';
+  const denominator = total || Math.max(1, ...visible.map(row => num(row[valueKey])));
+  return `<div class="osv-bars">${visible.map(row => {
+    const label = labelMap[row[labelKey]] || row[labelKey] || '未采集';
+    const value = num(row[valueKey]);
+    const width = Math.max(3, pct(value, denominator));
+    return `<div class="osv-bar-row">
+      <div class="osv-bar-top"><span>${escHtml(label)}</span><strong>${n0(value)}${total ? ` · ${pct(value, total)}%` : ''}</strong></div>
+      <div class="osv-track"><div class="osv-fill" style="width:${width}%; background:${color};"></div></div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function renderPlatformMatrix(rows = []) {
+  if (!rows.length) return '<div class="osv-empty">暂无平台声量数据</div>';
+  const maxHeat = Math.max(1, ...rows.map(row => num(row.heat)));
+  return `<div class="osv-platform-matrix">${rows.slice(0, 7).map(row => `
+    <div class="osv-platform-row">
+      <strong>${escHtml(row.label)}</strong>
+      <div class="osv-track"><div class="osv-fill" style="width:${Math.max(4, pct(row.heat, maxHeat))}%;background:${row.negativeRate >= 30 ? '#DC2626' : row.negativeRate >= 12 ? '#D97706' : '#2563EB'};"></div></div>
+      <span>${n0(row.count)}条</span>
+    </div>
+    <div class="osv-platform-row" style="grid-template-columns:minmax(70px,.8fr) minmax(0,1.4fr) 54px;margin-top:-5px;color:#6B7280;">
+      <span style="text-align:left;">负面 ${n0(row.negativeCount)}</span>
+      <span style="text-align:left;">互动 ${n0(row.interactions)}</span>
+      <span>${row.share}%</span>
+    </div>
+  `).join('')}</div>`;
+}
+
+function renderSentimentDonut(stats) {
+  const rows = stats.sentimentStructure || [];
+  if (!rows.length) return '<div class="osv-empty">暂无情绪结构</div>';
+  let cursor = 0;
+  const stops = rows.map(row => {
+    const start = cursor;
+    cursor += row.share;
+    return `${row.color} ${start}% ${Math.min(100, cursor)}%`;
+  }).join(', ');
+  const negative = rows.find(row => row.key === 'negative') || { count: 0, share: 0 };
+  return `<div class="osv-sentiment-layout">
+    <div class="osv-donut" style="background:conic-gradient(${stops || '#E5E7EB 0 100%'});">
+      <div class="osv-donut-inner"><strong>${negative.share}%</strong><span>负面占比</span></div>
+    </div>
+    <div class="osv-legend">${rows.map(row => `
+      <div class="osv-legend-row">
+        <span class="osv-legend-name"><i class="osv-dot" style="background:${row.color};"></i>${escHtml(row.label)}</span>
+        <strong>${n0(row.count)} · ${row.share}%</strong>
+      </div>
+    `).join('')}</div>
+  </div>`;
+}
+
+function renderWordCloud(terms = []) {
+  if (!terms.length) return '<div class="osv-empty">暂无热点词，建议补充关键词、正文和评论采集</div>';
+  return `<div class="osv-cloud">${terms.map(term => `
+    <span class="osv-term t${term.tone}" style="font-size:${num(term.weight, 14)}px" title="${escHtml(`${term.label} · ${term.count}`)}">${escHtml(term.label)}</span>
+  `).join('')}</div>`;
+}
+
+function renderHotTermRank(terms = []) {
+  if (!terms.length) return '<div class="osv-empty">暂无热词指数</div>';
+  return `<div class="osv-rank-list">${terms.slice(0, 10).map((term, index) => `
+    <div class="osv-rank-row">
+      <span class="osv-rank-no">${index + 1}</span>
+      <span class="osv-rank-title">${escHtml(term.label)}</span>
+      <strong class="osv-rank-metric">${n0(term.count)}</strong>
+    </div>
+  `).join('')}</div>`;
+}
+
+function renderAlertFeed(rows = []) {
+  if (!rows.length) return '<div class="osv-empty">本周期暂无预警快报</div>';
+  return `<div class="osv-rank-list">${rows.slice(0, 7).map((row, index) => {
+    const tone = row.level === 'critical' ? 'red' : row.level === 'warning' ? 'orange' : 'blue';
+    return `<div class="osv-rank-row" style="grid-template-columns:28px minmax(0,1fr) auto;">
+      <span class="osv-rank-no">${index + 1}</span>
+      <span class="osv-rank-title">${escHtml(compactText(row.title || row.summary || row.reason || '未命名预警', 42))}</span>
+      <span class="osv-pill ${tone}">${escHtml(row.level || 'info')}</span>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function renderTopicFocus(focus = []) {
+  return `<div class="osv-topic">${focus.map(item => {
+    const tone = item.sentiment === 'negative' ? 'red' : item.sentiment === 'positive' ? 'green' : 'blue';
+    const samples = item.samples.map(sample => compactText(sample.title || sample.content || sample.ai_summary || '未命名内容', 42)).filter(Boolean).slice(0, 3);
+    const categoryText = item.categories.map(row => `${row.label} ${row.count}`).join(' / ') || '暂无明显主题';
+    return `<article class="osv-topic-box">
+      <h4><span>${escHtml(item.label)}讨论焦点</span><span class="osv-pill ${tone}">${n0(item.count)} · ${item.share}%</span></h4>
+      <p>主题：${escHtml(categoryText)}</p>
+      <p>样本：${escHtml(samples.join('；') || '暂无代表样本')}</p>
+    </article>`;
+  }).join('')}</div>`;
+}
+
+function renderSampleCards(rows = [], emptyText = '暂无重点样本') {
+  if (!rows.length) return `<div class="osv-empty">${escHtml(emptyText)}</div>`;
+  return `<div class="osv-sample-list">${rows.slice(0, 6).map(row => {
+    const cover = safeUrl(row.cover_url || row.record_cover_url);
+    const url = safeUrl(row.url || row.record_url);
+    const title = compactText(row.title || row.record_title || row.content || '无标题', 74);
+    const summary = compactText(row.ai_summary || row.content || '', 132);
+    return `<article class="osv-sample">
+      <div class="osv-thumb">${cover ? `<img src="${escHtml(cover)}" alt="cover" loading="lazy" referrerpolicy="no-referrer">` : '无图'}</div>
+      <div>
+        <h4>${url ? `<a href="${escHtml(url)}">${escHtml(title)}</a>` : escHtml(title)}</h4>
+        ${summary ? `<p>${escHtml(summary)}</p>` : ''}
+        <div class="osv-meta">
+          <span>${escHtml(PLATFORM_LABEL[row.platform] || row.platform || '未知平台')}</span>
+          <span>${escHtml(row.author_name || row.record_author_name || '未知作者')}</span>
+          <span>${escHtml(interactionText(row))}</span>
+          ${row.negative_comment_count ? `<span class="osv-pill red">负评 ${n0(row.negative_comment_count)}</span>` : ''}
+        </div>
+      </div>
+    </article>`;
+  }).join('')}</div>`;
+}
+
+function renderCommentRiskTable(rows = []) {
+  if (!rows.length) return '<div class="osv-empty">暂无负面评论样本</div>';
+  return `<table class="osv-table"><thead><tr><th>评论</th><th>风险</th><th>来源</th><th>赞</th></tr></thead><tbody>${rows.slice(0, 8).map(row => `
+    <tr>
+      <td><strong>${escHtml(row.author_name || '匿名评论者')}</strong><div>${escHtml(compactText(row.content, 92))}</div></td>
+      <td><span class="osv-pill red">${escHtml(row.risk_level || 'negative')}</span></td>
+      <td>${row.record_url ? `<a href="${escHtml(safeUrl(row.record_url))}">${escHtml(compactText(row.record_title || '原帖', 42))}</a>` : escHtml(compactText(row.record_title || '原帖', 42))}</td>
+      <td>${n0(row.like_count)}</td>
+    </tr>
+  `).join('')}</tbody></table>`;
+}
+
+function renderIssueSummary(stats) {
+  const rows = [
+    ['新增问题', stats.issueStats?.new_issues || 0, 'blue'],
+    ['未关闭', stats.issueStats?.open_issues || 0, 'orange'],
+    ['高危未关闭', stats.issueStats?.high_open_issues || 0, 'red'],
+    ['本期关闭', stats.issueStats?.resolved_issues || 0, 'green'],
+  ];
+  return `<div class="osv-grid-3" style="grid-template-columns:repeat(4,minmax(0,1fr));">${rows.map(row => `
+    <div class="osv-topic-box"><h4><span>${escHtml(row[0])}</span><span class="osv-pill ${row[2]}">${n0(row[1])}</span></h4></div>
+  `).join('')}</div>${renderIssues(stats.topIssues || [])}`;
+}
+
+function renderOfficialResponseList(rows = []) {
+  if (!rows.length) return '<div class="osv-empty">本周期暂无官方响应样本</div>';
+  return `<div class="osv-sample-list">${rows.slice(0, 5).map(row => `
+    <article class="osv-topic-box">
+      <h4><span>${escHtml(row.account_name || '官方账号')}</span><span class="osv-pill green">已响应</span></h4>
+      <p>${escHtml(compactText(row.content, 126))}</p>
+      <p>来源：${row.record_url ? `<a href="${escHtml(safeUrl(row.record_url))}">${escHtml(compactText(row.record_title || '原帖', 54))}</a>` : escHtml(compactText(row.record_title || '原帖', 54))}</p>
+    </article>
+  `).join('')}</div>`;
+}
+
+function buildManagementReportHTML(title, periodLabel, stats) {
+  const generatedAt = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  return `${reportCss()}
+    <main class="osv-report">
+      <div class="osv-shell">
+        <header class="osv-hero">
+          <div>
+            <div class="osv-kicker">OnStarVoice 星语 · Management Report</div>
+            <h1 class="osv-title">${escHtml(title)}</h1>
+            <div class="osv-subtitle">${escHtml(periodLabel)} · ${escHtml(stats.periodFocus)} · 生成时间 ${escHtml(generatedAt)}</div>
+          </div>
+          <aside class="osv-risk">
+            <span>本周期风险等级</span>
+            <strong style="color:${stats.riskColor}">${escHtml(stats.riskLabel)}</strong>
+            <span>负面率 ${stats.negativeRate}% · 待处理 ${n0(stats.workflowStats.active_inbox)} · 高危告警 ${n0(alertCount(stats, 'critical'))}</span>
+          </aside>
+        </header>
+        ${renderReportKpis(stats.dashboardCards)}
+        <section class="osv-grid">
+          ${renderReportCard('舆情态势指数', renderOpinionIndex(stats), '热度 / 风险 / 响应')}
+          ${renderReportCard('平台声量矩阵', renderPlatformMatrix(stats.platformMatrix), '声量、互动与负面率综合排序')}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('管理摘要', renderList(stats.executiveSummary), '结论先行')}
+          ${renderReportCard('行动建议', renderList(stats.actionItems, true), '按处置优先级执行')}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('声量与情绪趋势', renderTrendSvg(stats.volumeTrend), '按采集快照聚合')}
+          ${renderReportCard('热点词云', renderWordCloud(stats.hotTerms), '关键词 / 正文 / 评论')}
+        </section>
+        <section class="osv-grid-3">
+          ${renderReportCard('平台分布', renderDistribution(stats.platformDistribution, { labelKey: 'platform', total: Math.max(stats.total, 1), labelMap: PLATFORM_LABEL, color: '#2563EB' }))}
+          ${renderReportCard('主题分类', renderDistribution(stats.category, { labelKey: 'category', total: Math.max(stats.total, 1), labelMap: CATEGORY_LABEL, color: '#0F766E' }))}
+          ${renderReportCard('媒体/来源类型', renderDistribution(stats.mediaDistribution, { labelKey: 'media_type', total: Math.max(stats.total, 1), color: '#7C3AED' }))}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('情感与内容焦点', renderTopicFocus(stats.topicFocus), '正 / 中 / 负拆解')}
+          ${renderReportCard('地域/发布位置', renderDistribution(stats.regionDistribution, { labelKey: 'region', total: Math.max(stats.total, 1), color: '#D97706' }), '采集不到则显示未采集')}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('重点负面内容', renderSampleCards(stats.riskItems, '暂无重点负面内容'), '按风险和互动排序')}
+          ${renderReportCard('负面评论舆情', renderCommentRiskTable(stats.commentRisks), '评论同样进入舆情判断')}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('问题闭环', renderIssueSummary(stats), '问题状态和负责人')}
+          ${renderReportCard('官方响应', renderOfficialResponseList(stats.officialResponses), `本周期覆盖 ${n0(stats.officialPeriod.record_count)} 条内容`)}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('互动增长内容', renderSampleCards(stats.risingRecords, '暂无互动明显增长内容'), '重复采集快照识别增长')}
+          ${renderReportCard('采集质量与补强', renderList(stats.collectionRecommendations), '用于提升下一期报告准确性')}
+        </section>
+        <footer class="osv-footer">本报告基于公开内容、采集快照、评论舆情、官方响应、告警和问题单自动生成。发送前建议复核重点样本、官方回复语境和处置建议。</footer>
+      </div>
+    </main>`;
+}
+
+function buildDataDashboardHTML(title, periodLabel, stats) {
+  return `${reportCss()}
+    <main class="osv-report osv-screen">
+      <div class="osv-shell">
+        <header class="osv-hero">
+          <div>
+            <div class="osv-kicker">Public Opinion Intelligence Dashboard</div>
+            <h1 class="osv-title">${escHtml(title)} · 报告看板</h1>
+            <div class="osv-subtitle">${escHtml(periodLabel)} · ${escHtml(stats.periodFocus)} · 声量、情绪、热词、风险样本与处置闭环统一呈现</div>
+          </div>
+          <aside class="osv-risk">
+            <span>本期舆情总量</span>
+            <strong>${n0(stats.total)}</strong>
+            <span>新增 ${n0(stats.newRecords)} · 快照 ${n0(stats.observations)} · ${escHtml(stats.riskLabel)}</span>
+          </aside>
+        </header>
+        ${renderReportKpis(stats.dashboardCards)}
+        <section class="osv-grid">
+          ${renderReportCard('舆情态势指数', renderOpinionIndex(stats), '综合热度 / 风险 / 响应')}
+          ${renderReportCard('平台声量矩阵', renderPlatformMatrix(stats.platformMatrix), '声量、互动与负面率综合排序')}
+        </section>
+        <section class="osv-screen-grid">
+          <div style="display:grid;gap:14px;">
+            ${renderReportCard('情绪结构', renderSentimentDonut(stats), '正 / 中 / 负 / 待标注')}
+            ${renderReportCard('主题分类', renderDistribution(stats.category, { labelKey: 'category', total: Math.max(stats.total, 1), labelMap: CATEGORY_LABEL, color: '#0F766E' }))}
+            ${renderReportCard('分流状态', renderDistribution(stats.triagePeriod, { labelKey: 'status', total: Math.max(stats.total, 1), labelMap: TRIAGE_LABEL, color: '#D97706' }))}
+          </div>
+          <div style="display:grid;gap:14px;">
+            ${renderReportCard('声量趋势', renderTrendSvg(stats.volumeTrend), '采集快照趋势')}
+            ${renderReportCard('热议方向', renderWordCloud(stats.hotTerms), '热词云')}
+            ${renderReportCard('热词指数榜', renderHotTermRank(stats.hotTerms), 'TOP 10')}
+          </div>
+          <div style="display:grid;gap:14px;">
+            ${renderReportCard('预警快报', renderAlertFeed(stats.topAlerts), '告警优先级')}
+            ${renderReportCard('高风险内容', renderSampleCards(stats.riskItems.slice(0, 4), '暂无高风险内容'), '帖子/内容样本')}
+            ${renderReportCard('负面评论', renderCommentRiskTable(stats.commentRisks.slice(0, 5)), '评论同样进入舆情')}
+          </div>
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('情感与内容焦点', renderTopicFocus(stats.topicFocus), '正 / 中 / 负拆解')}
+          ${renderReportCard('地域/发布位置', renderDistribution(stats.regionDistribution, { labelKey: 'region', total: Math.max(stats.total, 1), color: '#0F766E' }), '未采集会显示未采集')}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('问题闭环', renderIssueSummary(stats), '新增、未关闭、高危、已关闭')}
+          ${renderReportCard('官方响应', renderOfficialResponseList(stats.officialResponses), `本周期覆盖 ${n0(stats.officialPeriod.record_count)} 条内容`)}
+        </section>
+      </div>
+    </main>`;
+}
+
+function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
+  const kpis = stats.dashboardCards.slice(0, 6);
+  return `${styleBlock()}
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif; max-width:760px; margin:0 auto; background:#F6F8FB; padding:18px; color:#111827;">
+      <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px; overflow:hidden;">
+        <div style="padding:22px 24px; border-bottom:1px solid #E5E7EB;">
+          <div style="font-size:12px; color:#2563EB; font-weight:800;">OnStarVoice 星语 · 邮件摘要</div>
+          <h1 style="margin:8px 0 8px; font-size:22px; line-height:1.3;">${escHtml(title)}</h1>
+          <div style="font-size:13px; color:#6B7280;">${escHtml(periodLabel)} · 风险等级：<strong style="color:${stats.riskColor}">${escHtml(stats.riskLabel)}</strong>${reportId ? ` · 报告ID ${escHtml(reportId)}` : ''}</div>
+        </div>
+        <div style="padding:20px 24px;">
+          <div class="report-grid" style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px;">
+            ${kpis.map(card => `<div class="report-card" style="border:1px solid #E5E7EB; border-radius:8px; padding:12px;">
+              <div style="font-size:12px; color:#6B7280;">${escHtml(card.label)}</div>
+              <div style="font-size:22px; font-weight:800; margin-top:4px;">${escHtml(card.value)}</div>
+              ${card.delta ? `<div style="font-size:12px; color:#6B7280;">较上期 ${escHtml(card.delta.value)}</div>` : ''}
+            </div>`).join('')}
+          </div>
+          ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
+          ${renderSection('行动建议', renderList(stats.actionItems.slice(0, 5), true), '')}
+          ${renderSection('TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 4), '暂无重点风险内容'), '')}
+          ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}
+          ${renderSection('官方响应概况', `<p style="margin:0;color:#374151;font-size:13px;line-height:1.7;">本周期记录官方响应 ${n0(stats.officialPeriod.response_count)} 条，覆盖 ${n0(stats.officialPeriod.record_count)} 条内容；当前待处理/待复核线索 ${n0(stats.workflowStats.active_inbox)} 条。</p>`, '')}
+          <div style="margin-top:22px; padding:12px; background:#F9FAFB; border-radius:8px; color:#6B7280; font-size:12px; line-height:1.7;">完整图表、词云、评论样本和处置看板请在后台「报告中心」打开预览。若邮件发送失败，请检查系统设置中的 SMTP 与收件人配置。</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function upsertReportRun({ tenantId, type, periodStart, periodEnd, subject, html, dashboardHtml, emailHtml, stats, status, template = 'management' }) {
   return await withTransaction(async tx => {
     const run = await tx.queryOne(`
       INSERT INTO report_runs (
@@ -918,7 +1719,7 @@ async function upsertReportRun({ tenantId, type, periodStart, periodEnd, subject
       status,
       subject,
       html,
-      JSON.stringify({ stats }),
+      JSON.stringify({ stats, dashboardHtml, emailHtml, template }),
     ]);
 
     await tx.execute('DELETE FROM report_snapshots WHERE report_run_id = $1', [run.id]);
@@ -935,7 +1736,7 @@ async function listTenantIds() {
   return tenants.map(t => t.id);
 }
 
-export async function generateReport({ tenantId, type = 'daily', send = true, now = new Date() }) {
+export async function generateReport({ tenantId, type = 'daily', send = true, now = new Date(), template = 'management' }) {
   const { start, end } = periodFor(type, now);
   const previous = previousPeriod(start, end);
   const existing = await queryOne(`
@@ -951,16 +1752,18 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
   const title = `OnStarVoice 星语舆情${typeLabel}`;
   const periodLabel = `${dateLabel(start)} - ${dateLabel(end)}`;
   const subject = `[OnStarVoice 星语${typeLabel}] ${periodLabel} ${stats.riskLabel} · 负面率 ${stats.negativeRate}%`;
-  const html = buildReportHTML(title, periodLabel, stats);
+  const html = buildManagementReportHTML(title, periodLabel, stats);
+  const dashboardHtml = buildDataDashboardHTML(title, periodLabel, stats);
+  const emailHtml = buildEmailSummaryHTML(title, periodLabel, stats);
   const hasContent = stats.total > 0 || stats.issueStats.open_issues > 0 || stats.workflowStats.active_inbox > 0;
   const status = hasContent ? (send ? 'generating' : 'generated') : 'skipped';
 
-  let run = await upsertReportRun({ tenantId, type, periodStart: start, periodEnd: end, subject, html, stats, status });
+  let run = await upsertReportRun({ tenantId, type, periodStart: start, periodEnd: end, subject, html, dashboardHtml, emailHtml, stats, status, template });
 
   if (!hasContent || !send) return run;
 
   try {
-    await sendReportEmail(subject, html, tenantId);
+    await sendReportEmail(subject, emailHtml, tenantId);
     await execute("UPDATE report_runs SET status = 'sent', sent_at = now(), updated_at = now() WHERE id = $1", [run.id]);
     run = { ...run, status: 'sent' };
   } catch (err) {
@@ -999,7 +1802,8 @@ export async function resendReport(reportId, tenantId = null) {
   const where = tenantId ? 'id = $1 AND tenant_id = $2' : 'id = $1';
   const report = await queryOne(`SELECT * FROM report_runs WHERE ${where}`, params);
   if (!report) return null;
-  await sendReportEmail(report.subject, report.html, report.tenant_id);
+  const metadata = parseJsonObject(report.metadata);
+  await sendReportEmail(report.subject, metadata.emailHtml || report.html, report.tenant_id);
   await execute('UPDATE report_runs SET sent_at = now(), status = $1, updated_at = now() WHERE id = $2', ['sent', report.id]);
   await execute(`
     INSERT INTO audit_logs (tenant_id, action, target_type, target_id, metadata)

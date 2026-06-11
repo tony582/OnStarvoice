@@ -53,6 +53,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     } else if (queue === 'active') {
       where += `
         AND r.record_type <> 'official_content'
+        AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
         AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
         AND NOT (r.official_response_status = 'responded' AND r.negative_comment_count = 0)
       `;
@@ -84,7 +85,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         r.official_replied, r.official_response_status, r.negative_comment_count,
         r.latest_negative_comment_at, r.last_risk_reopened_at,
         r.sentiment, r.category, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
-        r.seen_count, r.created_at,
+        r.ai_result, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
         COALESCE(rt.owner_name, '') AS triage_owner_name,

@@ -270,7 +270,9 @@ function isSupportedCaptureUrl(url) {
   return (
     /^https?:\/\/www\.xiaohongshu\.com\//i.test(normalized) ||
     /^https?:\/\/www\.douyin\.com\//i.test(normalized) ||
-    /^https?:\/\/v\.douyin\.com\//i.test(normalized)
+    /^https?:\/\/v\.douyin\.com\//i.test(normalized) ||
+    /^https?:\/\/(?:www\.)?weibo\.com\//i.test(normalized) ||
+    /^https?:\/\/s\.weibo\.com\//i.test(normalized)
   );
 }
 
@@ -285,6 +287,12 @@ function detectPlatformFromUrl(url) {
     /^https?:\/\/v\.douyin\.com\//i.test(normalized)
   ) {
     return 'douyin';
+  }
+  if (
+    /^https?:\/\/(?:www\.)?weibo\.com\//i.test(normalized) ||
+    /^https?:\/\/s\.weibo\.com\//i.test(normalized)
+  ) {
+    return 'weibo';
   }
   return 'unknown';
 }
@@ -364,6 +372,33 @@ function detectPageTypeFromUrl(url) {
     }
   }
 
+  if (/(^|\/\/)(?:www\.)?weibo\.com|(^|\/\/)s\.weibo\.com/i.test(normalized)) {
+    let parsedUrl = null;
+    let pathname = '';
+    try {
+      parsedUrl = new URL(rawUrl);
+      pathname = String(parsedUrl.pathname || '').toLowerCase();
+    } catch {
+      pathname = '';
+    }
+
+    if (/s\.weibo\.com/i.test(normalized)) {
+      return 'search_results';
+    }
+    if (pathname.includes('/search') || parsedUrl?.searchParams?.get('q')) {
+      return 'search_results';
+    }
+    if (/^\/u\/\d+\/?$/i.test(pathname)) {
+      return 'blogger_profile';
+    }
+    if (/^\/detail\/\d+\/?$/i.test(pathname)) {
+      return 'note_detail';
+    }
+    if (/^\/[a-z0-9_]+\/[a-z0-9]+\/?$/i.test(pathname)) {
+      return 'note_detail';
+    }
+  }
+
   return 'unknown';
 }
 
@@ -385,7 +420,7 @@ async function syncRuntimeForTabId(tabId, explicitUrl = '') {
 async function ensureContentScriptReady(tabId) {
   const tab = await chrome.tabs.get(tabId);
   if (!isSupportedCaptureUrl(tab?.url)) {
-    throw new Error('当前页面不支持采集，请切换到小红书或抖音页面后重试');
+    throw new Error('当前页面不支持采集，请切换到小红书、抖音或微博页面后重试');
   }
 
   await chrome.scripting.executeScript({

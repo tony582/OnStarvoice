@@ -1060,6 +1060,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const bindings = document.getElementById("uiAuthBindings");
     const expire = document.getElementById("uiAuthExpire");
     const userName = document.getElementById("uiAuthUserName");
+    const tenantName = document.getElementById("uiAuthTenantName");
     const credits = document.getElementById("uiAuthCredits");
     const inputCode = document.getElementById("inputCode");
     const claimHint = document.getElementById("uiAuthClaimHint");
@@ -1071,6 +1072,7 @@ document.addEventListener("DOMContentLoaded", () => {
       !bindings ||
       !expire ||
       !userName ||
+      !tenantName ||
       !credits ||
       !inputCode
     ) {
@@ -1111,6 +1113,7 @@ document.addEventListener("DOMContentLoaded", () => {
         userName.textContent = pendingClaim
           ? UNCLAIMED_CREDENTIAL_OWNER_LABEL
           : authConfig.user?.name || "-";
+        tenantName.textContent = authConfig.tenant?.name || "-";
         credits.textContent = authConfig.credentialCredit
           ? `${authConfig.credentialCredit.remainingCredits ?? 0} / ${authConfig.credentialCredit.totalCredits ?? 0}`
           : "暂无";
@@ -1129,6 +1132,7 @@ document.addEventListener("DOMContentLoaded", () => {
         bindings.textContent = "- / 2";
         expire.textContent = "-";
         userName.textContent = "-";
+        tenantName.textContent = "-";
         credits.textContent = "-";
         break;
 
@@ -1137,6 +1141,7 @@ document.addEventListener("DOMContentLoaded", () => {
         badge.textContent = "验证中...";
         badge.style.color = "var(--status-info)";
         userName.textContent = authConfig.user?.name || "-";
+        tenantName.textContent = authConfig.tenant?.name || "-";
         credits.textContent = authConfig.credentialCredit
           ? `${authConfig.credentialCredit.remainingCredits ?? 0} / ${authConfig.credentialCredit.totalCredits ?? 0}`
           : "-";
@@ -1150,6 +1155,7 @@ document.addEventListener("DOMContentLoaded", () => {
         bindings.textContent = "- / 2";
         expire.textContent = "-";
         userName.textContent = "-";
+        tenantName.textContent = "-";
         credits.textContent = "-";
         break;
     }
@@ -1449,13 +1455,15 @@ function getCurrentPageRecords(records) {
   const activePlatform = document.body.dataset.selectedPlatform || "unknown";
   const types = getRecordTypesForTab(activePlatform, activeCaptureTab);
   return records.filter((record) => {
-    if (!types.includes(record.type)) {
+    const recordType = String(record?.type || record?.recordType || "").trim();
+    if (!types.includes(recordType)) {
       return false;
     }
     if (activePlatform === "unknown") {
       return true;
     }
-    return resolveRecordPlatform(record) === activePlatform;
+    const recordPlatform = resolveRecordPlatform(record);
+    return recordPlatform === activePlatform || recordPlatform === "unknown";
   });
 }
 

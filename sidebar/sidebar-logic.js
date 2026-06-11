@@ -6528,6 +6528,7 @@ async function handleVerify() {
     }
 
     if (result.ok) {
+      const authSnapshot = authSnapshotFromVerifyResult(result);
       await setCurrentAuth({
         verified: true,
         status: AUTH_STATUS.VERIFIED,
@@ -6535,10 +6536,7 @@ async function handleVerify() {
         lastVerifiedAt: new Date().toISOString(),
         message: result.message,
         reason: "none",
-        user: result.data?.user ?? null,
-        credentialCredit: result.data?.credentialCredit ?? null,
-        credential: result.data?.credential ?? null,
-        binding: result.data?.binding ?? null,
+        ...authSnapshot,
       });
 
       try {
@@ -7188,6 +7186,18 @@ function resolveMonitorRunHistoryState(item) {
     };
   }
 
+  if (status === "queued" || status === "pending" || status === "running") {
+    return {
+      monitorStatus: "queued",
+      monitorStatusLabel: "已排队",
+      monitorSyncLabel: "",
+      monitorSummary: status === "running" ? "扫描任务执行中" : "扫描任务已排队",
+      isSuccess: true,
+      reason: ERROR_REASON.NONE,
+      message: status === "running" ? "监控任务执行中" : "已创建监控执行任务",
+    };
+  }
+
   if (status === "no_hit") {
     return {
       monitorStatus: "no_hit",
@@ -7318,7 +7328,9 @@ async function handleRunMonitorNow() {
 
     const counts = normalizedRuns.reduce(
       (acc, current) => {
-        if (current.state.monitorStatus === "hit_synced") {
+        if (current.state.monitorStatus === "queued") {
+          acc.queued += 1;
+        } else if (current.state.monitorStatus === "hit_synced") {
           acc.hitSynced += 1;
         } else if (current.state.monitorStatus === "hit_sync_failed") {
           acc.hitSyncFailed += 1;
@@ -7332,6 +7344,7 @@ async function handleRunMonitorNow() {
         return acc;
       },
       {
+        queued: 0,
         hitSynced: 0,
         hitSyncFailed: 0,
         noHit: 0,
@@ -7348,9 +7361,11 @@ async function handleRunMonitorNow() {
             ? "hit_synced"
             : counts.noHit > 0
               ? "no_hit"
-              : counts.creditInsufficient > 0
-                ? "credit_insufficient"
-                : "no_hit";
+              : counts.queued > 0
+                ? "queued"
+                : counts.creditInsufficient > 0
+                  ? "credit_insufficient"
+                  : "no_hit";
     const monitorStatusLabel =
       monitorStatus === "execution_failed"
         ? "执行失败"
@@ -7360,7 +7375,9 @@ async function handleRunMonitorNow() {
             ? "已命中"
             : monitorStatus === "credit_insufficient"
               ? "配额不足"
-              : "未命中";
+              : monitorStatus === "queued"
+                ? "已排队"
+                : "未命中";
     const monitorSyncLabel =
       monitorStatus === "hit_sync_failed"
         ? "同步失败"
@@ -7379,6 +7396,9 @@ async function handleRunMonitorNow() {
     }
     if (counts.creditInsufficient > 0) {
       monitorSummaryParts.push(`配额不足 ${counts.creditInsufficient}`);
+    }
+    if (counts.queued > 0) {
+      monitorSummaryParts.push(`已排队 ${counts.queued}`);
     }
     if (counts.executionFailed > 0) {
       monitorSummaryParts.push(`执行失败 ${counts.executionFailed}`);
@@ -7404,7 +7424,7 @@ async function handleRunMonitorNow() {
       requestedTotalCount: runItems.length,
       noHitCount: counts.noHit,
       skippedCount: counts.creditInsufficient,
-      successCount: counts.hitSynced,
+      successCount: counts.hitSynced + counts.queued,
       failedCount: counts.hitSyncFailed + counts.executionFailed,
       debugUrl:
         normalizedRuns.find((item) => Boolean(item.debugUrl))?.debugUrl || null,
@@ -7468,7 +7488,9 @@ async function handleRunMonitorNow() {
         );
       } else {
         showMessage(
-          `立即执行完成：已写入 ${runItems.length} 条监控记录`,
+          counts.queued > 0
+            ? `已创建 ${counts.queued} 个监控扫描任务`
+            : `立即执行完成：已写入 ${runItems.length} 条监控记录`,
           hasWarning ? "warning" : "success",
         );
       }
@@ -7501,6 +7523,7 @@ async function refreshVerifiedAuthSnapshot({showFeedback = false} = {}) {
       };
     }
 
+    const authSnapshot = authSnapshotFromVerifyResult(result, auth);
     await setCurrentAuth({
       verified: true,
       status: AUTH_STATUS.VERIFIED,
@@ -7508,10 +7531,7 @@ async function refreshVerifiedAuthSnapshot({showFeedback = false} = {}) {
       lastVerifiedAt: new Date().toISOString(),
       message: result.message || auth.message || "",
       reason: "none",
-      user: result.data?.user ?? auth.user ?? null,
-      credentialCredit: result.data?.credentialCredit ?? null,
-      credential: result.data?.credential ?? auth.credential ?? null,
-      binding: result.data?.binding ?? auth.binding ?? null,
+      ...authSnapshot,
     });
 
     if (showFeedback) {
@@ -7584,6 +7604,26 @@ function resolveMonitorSettingsSaveErrorMessage(message) {
   }
 
   return raw;
+}
+
+function authResponseValue(result, key, fallback = null) {
+  if (result?.data && Object.prototype.hasOwnProperty.call(result.data, key)) {
+    return result.data[key];
+  }
+  if (result && Object.prototype.hasOwnProperty.call(result, key)) {
+    return result[key];
+  }
+  return fallback;
+}
+
+function authSnapshotFromVerifyResult(result, currentAuth = {}) {
+  return {
+    user: authResponseValue(result, "user", currentAuth.user ?? null),
+    tenant: authResponseValue(result, "tenant", currentAuth.tenant ?? null),
+    credentialCredit: authResponseValue(result, "credentialCredit", null),
+    credential: authResponseValue(result, "credential", currentAuth.credential ?? null),
+    binding: authResponseValue(result, "binding", currentAuth.binding ?? null),
+  };
 }
 
 async function handleSaveMonitorSettings() {
@@ -11874,13 +11914,15 @@ function getCurrentPageRecords(inputRecords = null) {
     document.body.dataset.selectedPlatform ||
     getViewPlatform(getCurrentRuntime());
   return records.filter((record) => {
-    if (!currentTypes.has(record.type)) {
+    const recordType = String(record?.type || record?.recordType || "").trim();
+    if (!currentTypes.has(recordType)) {
       return false;
     }
     if (activePlatform === "unknown") {
       return true;
     }
-    return resolveRecordPlatform(record) === activePlatform;
+    const recordPlatform = resolveRecordPlatform(record);
+    return recordPlatform === activePlatform || recordPlatform === "unknown";
   });
 }
 

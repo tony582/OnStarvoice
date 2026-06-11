@@ -5,6 +5,17 @@ import { generateReport, resendReport } from '../services/report-generator.js';
 
 const router = Router();
 
+function metadataObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 router.get('/', requireTenantAccess, async (req, res, next) => {
   try {
     const { type, limit = 50 } = req.query;
@@ -53,7 +64,17 @@ router.get('/:id/preview', requireTenantAccess, async (req, res, next) => {
       'SELECT data FROM report_snapshots WHERE report_run_id = $1 AND tenant_id = $2 ORDER BY created_at DESC LIMIT 1',
       [req.params.id, req.tenantId]
     );
-    return res.json({ ok: true, report, snapshot: snapshot?.data || null, html: report.html });
+    const metadata = metadataObject(report.metadata);
+    const html = report.html || '';
+    return res.json({
+      ok: true,
+      report,
+      snapshot: snapshot?.data || null,
+      html,
+      managementHtml: html,
+      dashboardHtml: metadata.dashboardHtml || html,
+      emailHtml: metadata.emailHtml || html,
+    });
   } catch (err) {
     return next(err);
   }
@@ -61,8 +82,8 @@ router.get('/:id/preview', requireTenantAccess, async (req, res, next) => {
 
 router.post('/generate', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    const { type = 'daily', send = false } = req.body;
-    const report = await generateReport({ tenantId: req.tenantId, type, send: send !== false });
+    const { type = 'daily', send = false, template = 'management' } = req.body;
+    const report = await generateReport({ tenantId: req.tenantId, type, send: send !== false, template });
     return res.json({ ok: true, report });
   } catch (err) {
     return next(err);

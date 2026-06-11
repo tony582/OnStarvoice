@@ -6,6 +6,8 @@ import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
 
 const router = Router();
+const commentWorkflowQueue = [];
+let commentWorkflowRunning = false;
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -24,6 +26,24 @@ function firstArrayValue(...values) {
   return [];
 }
 
+function uniqueArray(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const normalized = typeof value === 'string'
+      ? value.trim()
+      : (value && typeof value === 'object' ? JSON.stringify(value) : String(value || '').trim());
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(value);
+  }
+  return result;
+}
+
+function mergedArrayValue(...values) {
+  return uniqueArray(values.flatMap(value => Array.isArray(value) ? value : []));
+}
+
 function boolValue(value, fallback = false) {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'boolean') return value;
@@ -31,10 +51,68 @@ function boolValue(value, fallback = false) {
   return !['false', '0', 'no', 'off'].includes(String(value).trim().toLowerCase());
 }
 
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function countCommentWorkflowItems(record) {
+  return (
+    parseJsonArray(record.comments_cleaned_items).length +
+    parseJsonArray(record.official_reply_items).length
+  );
+}
+
+function queuedCommentStats(total) {
+  return {
+    queued: true,
+    total,
+    inserted: 0,
+    updated: 0,
+    negative: 0,
+    officialResponses: 0,
+    officialContent: false,
+    officialResponseStatus: 'queued',
+  };
+}
+
+function enqueueCommentWorkflow(task) {
+  if (typeof task !== 'function') return;
+  commentWorkflowQueue.push(task);
+  void drainCommentWorkflowQueue();
+}
+
+async function drainCommentWorkflowQueue() {
+  if (commentWorkflowRunning) return;
+  commentWorkflowRunning = true;
+  try {
+    while (commentWorkflowQueue.length > 0) {
+      const task = commentWorkflowQueue.shift();
+      try {
+        await task();
+      } catch (err) {
+        console.error('[Sync] Queued comment workflow error:', err.message);
+      }
+    }
+  } finally {
+    commentWorkflowRunning = false;
+  }
+}
+
 function normalizeRecord(body) {
   let rawItems;
   if (Array.isArray(body.records)) {
     rawItems = body.records.map(r => ({
+      ...r,
       ...(r.payload || {}),
       syncType: r.syncType || r.type || body.syncType,
       platform: r.platform || r.payload?.platform || body.platform,
@@ -60,9 +138,16 @@ function normalizeRecord(body) {
       }
       return '';
     };
-    const tags = firstArrayValue(dp.tags, listItem.tags, item.tags);
-    const imageUrls = firstArrayValue(dp.imageUrls, listItem.imageUrls, item.imageUrls);
-    const commentsCleanedItems = firstArrayValue(dp.commentsCleanedItems, listItem.commentsCleanedItems, item.commentsCleanedItems);
+    const tags = mergedArrayValue(
+      dp.tags, listItem.tags, item.tags,
+      dp.hashtags, listItem.hashtags, item.hashtags,
+      dp.topics, listItem.topics, item.topics
+    );
+    const imageUrls = firstArrayValue(dp.imageUrls, listItem.imageUrls, item.imageUrls, dp.images, listItem.images, item.images);
+    const commentsCleanedItems = firstArrayValue(
+      dp.commentsCleanedItems, listItem.commentsCleanedItems, item.commentsCleanedItems,
+      dp.commentItems, listItem.commentItems, item.commentItems
+    );
     const officialReplyItems = firstArrayValue(dp.officialReplyItems, listItem.officialReplyItems, item.officialReplyItems);
 
     return {
@@ -77,14 +162,15 @@ function normalizeRecord(body) {
       author_fans: Number(get('bloggerFollowersCount', 'authorFans', 'authorFollowerCount') || 0),
       url: String(get('url', 'noteUrl')),
       cover_url: String(get('coverImageUrl', 'coverUrl', 'cover')),
-      note_type: String(get('noteType', 'type')),
+      note_type: String(get('noteType', 'type', 'mediaType', 'media_type')),
+      source_type: String(get('sourceType', 'source_type')),
       likes: Number(get('likes', 'likeCount', 'attitudes_count', 'attitudesCount') || 0),
       comments_count: Number(get('comments', 'commentCount', 'commentsCount', 'comments_count') || 0),
       collects: Number(get('collects', 'collectCount') || 0),
       shares: Number(get('shares', 'shareCount', 'reposts', 'repostCount', 'repostsCount', 'reposts_count') || 0),
       publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw', 'lastEditedAt')),
       tags: JSON.stringify(tags),
-      blogger_profile_url: String(get('bloggerProfileUrl', 'authorUrl')),
+      blogger_profile_url: String(get('bloggerProfileUrl', 'authorProfileUrl', 'authorUrl', 'profileUrl')),
       image_urls: JSON.stringify(imageUrls),
       comments_text: String(get('commentsMergedText')),
       comments_cleaned_items: JSON.stringify(commentsCleanedItems),
@@ -112,7 +198,8 @@ function queueAiJobs(recordIds) {
   setImmediate(async () => {
     for (const id of recordIds) {
       try {
-        await labelRecord(id);
+        const result = await labelRecord(id);
+        if (result?.relevance === 'irrelevant') continue;
         await checkAlerts(id);
       } catch (err) {
         console.error(`[Sync] AI/alert error for record ${id}:`, err.message);
@@ -133,6 +220,25 @@ async function applyCommentWorkflow(record, result, req) {
   }
 }
 
+function queueCommentWorkflow(record, result, context) {
+  const total = countCommentWorkflowItems(record);
+  enqueueCommentWorkflow(async () => {
+    const commentStats = await applyCommentWorkflow(record, result, context);
+    if (result.action === 'inserted' && !commentStats.officialContent) {
+      queueAiJobs([result.id]);
+    }
+  });
+  return queuedCommentStats(total);
+}
+
+async function applyOrQueueCommentWorkflow(record, result, context) {
+  const commentCount = countCommentWorkflowItems(record);
+  if (commentCount > 0) {
+    return queueCommentWorkflow(record, result, context);
+  }
+  return await applyCommentWorkflow(record, result, context);
+}
+
 router.post('/', requireAuth, async (req, res) => {
   try {
     const records = normalizeRecord(req.body);
@@ -146,9 +252,12 @@ router.post('/', requireAuth, async (req, res) => {
       authCode: req.authCode,
       monitorExecutionId: record.monitorExecutionId,
     });
-    const commentStats = await applyCommentWorkflow(record, result, req);
+    const commentStats = await applyOrQueueCommentWorkflow(record, result, {
+      tenantId: req.tenantId,
+      authCode: req.authCode,
+    });
 
-    if (result.action === 'inserted' && !commentStats.officialContent) queueAiJobs([result.id]);
+    if (result.action === 'inserted' && !commentStats.queued && !commentStats.officialContent) queueAiJobs([result.id]);
 
     return res.json({
       ok: true,
@@ -183,7 +292,10 @@ router.post('/batch', requireAuth, async (req, res) => {
         authCode: req.authCode,
         monitorExecutionId: record.monitorExecutionId,
       });
-      const commentStats = await applyCommentWorkflow(record, result, req);
+      const commentStats = await applyOrQueueCommentWorkflow(record, result, {
+        tenantId: req.tenantId,
+        authCode: req.authCode,
+      });
       results.push({
         ok: true,
         ...result,
@@ -191,13 +303,19 @@ router.post('/batch', requireAuth, async (req, res) => {
         backendRecordId: result.id,
         commentStats,
       });
-      if (result.action === 'inserted' && !commentStats.officialContent) insertedIds.push(result.id);
+      if (result.action === 'inserted' && !commentStats.queued && !commentStats.officialContent) insertedIds.push(result.id);
     } catch (err) {
+      const message = err?.message || '同步失败';
       results.push({
         ok: false,
         recordId: originalRecordId,
         action: 'skipped',
-        error: err.message,
+        reason: 'server_error',
+        message,
+        error: {
+          reason: 'server_error',
+          message,
+        },
       });
     }
   }

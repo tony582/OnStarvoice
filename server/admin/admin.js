@@ -279,16 +279,22 @@ async function renderOverview() {
 async function renderTriage() {
   const el = content();
   const statusTabs = [
-    { value: '', label: '待处理', icon: '📥' },
-    { value: 'unhandled', label: '新线索', icon: '🆕' },
-    { value: 'reviewing', label: '待复核', icon: '🔍' },
-    { value: 'issue_linked', label: '已转问题', icon: '🔗' },
-    { value: 'official_responded', label: '已响应', icon: '✅' },
-    { value: 'archived', label: '已归档', icon: '📦' },
+    { value: '', label: '待处理' },
+    { value: 'unhandled', label: '新线索' },
+    { value: 'reviewing', label: '待复核' },
+    { value: 'issue_linked', label: '已转问题' },
+    { value: 'official_responded', label: '已响应' },
+    { value: 'archived', label: '已归档' },
   ];
   el.innerHTML = `
+    <div class="page-intro">
+      <div>
+        <strong>默认只展示需要处理的线索</strong>
+        <span>已归档、误报、已转问题和官方已响应内容会从默认队列移出，可通过状态筛选查看。</span>
+      </div>
+    </div>
     <div class="filter-tabs" id="triageStatusTabs">
-      ${statusTabs.map(t => `<button class="filter-tab ${t.value === '' ? 'active' : ''}" data-value="${escAttr(t.value)}" onclick="setTriageStatus(this)">${t.icon} ${esc(t.label)}</button>`).join('')}
+      ${statusTabs.map(t => `<button class="filter-tab ${t.value === '' ? 'active' : ''}" data-value="${escAttr(t.value)}" onclick="setTriageStatus(this)">${esc(t.label)}</button>`).join('')}
     </div>
     <div class="toolbar">
       <div class="toolbar-left">
@@ -350,11 +356,38 @@ async function renderIssues() {
 async function renderReports() {
   const el = content();
   el.innerHTML = `
-    <div class="toolbar">
-      <div class="toolbar-left">
-        <button class="primary" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('daily')">生成日报</button>
-        <button class="secondary" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('weekly')">生成周报</button>
-        <button class="secondary" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('monthly')">生成月报</button>
+    <div class="report-workbench">
+      <section class="report-hero-panel">
+        <div>
+          <div class="eyebrow">Report Center</div>
+          <h2>企业舆情报告看板</h2>
+          <p>先生成后台可视化报告，再发送兼容邮件摘要。日报看新增风险，周报看趋势复盘，月报看管理层长期问题。</p>
+        </div>
+        <div class="report-generate-grid">
+          <button class="report-generate-card" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('daily')">
+            <span>日报</span><strong>今日风险与待处理</strong><small>新增线索、负面评论、官方响应</small>
+          </button>
+          <button class="report-generate-card" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('weekly')">
+            <span>周报</span><strong>趋势变化与复盘</strong><small>主题演化、重点问题、行动建议</small>
+          </button>
+          <button class="report-generate-card" ${!canWrite() ? 'disabled' : ''} onclick="generateReport('monthly')">
+            <span>月报</span><strong>管理层总结</strong><small>重复问题、处置效率、长期风险</small>
+          </button>
+        </div>
+      </section>
+      <section class="report-flow-grid">
+        <div class="report-flow-card"><strong>1. 生成</strong><span>聚合帖子、评论、问题、告警和官方响应</span></div>
+        <div class="report-flow-card"><strong>2. 预览</strong><span>检查管理报告、数据看板和邮件摘要</span></div>
+        <div class="report-flow-card"><strong>3. 发送</strong><span>发送给系统设置里的邮件收件人</span></div>
+      </section>
+    </div>
+    <div class="page-intro compact">
+      <div>
+        <strong>历史报告</strong>
+        <span>同周期重复生成会更新同一份报告；发送失败时会保留错误原因，方便补配置后重发。</span>
+      </div>
+      <div class="action-row">
+        <button class="secondary" onclick="loadReports()">刷新</button>
       </div>
     </div>
     <div id="reportsTable">${loading()}</div>
@@ -366,14 +399,14 @@ async function loadReports() {
   const data = await api('/reports?limit=100');
   const rows = (data.reports || []).map(r => `
     <tr>
-      <td>${badge(LABELS.reportType[r.report_type] || r.report_type, 'neutral')}</td>
-      <td>${esc(dateRange(r.period_start, r.period_end))}<div class="subtext">${esc(r.subject || '')}</div></td>
-      <td>${badge(LABELS.reportStatus[r.status] || r.status, r.status)}</td>
+      <td><div class="report-type-cell">${badge(LABELS.reportType[r.report_type] || r.report_type, 'neutral')}<strong>${esc(r.subject || '未命名报告')}</strong></div></td>
+      <td>${esc(dateRange(r.period_start, r.period_end))}</td>
+      <td>${badge(LABELS.reportStatus[r.status] || r.status, r.status)}${r.error_message ? `<div class="subtext danger-text">${esc(r.error_message)}</div>` : ''}</td>
       <td>${date(r.generated_at || r.created_at)}</td>
       <td>${date(r.sent_at)}</td>
       <td><div class="action-row"><button class="secondary" onclick="previewReport('${escAttr(r.id)}')">预览</button><button class="primary" ${!canWrite() ? 'disabled' : ''} onclick="sendReport('${escAttr(r.id)}')">发送</button></div></td>
     </tr>`).join('');
-  document.getElementById('reportsTable').innerHTML = `<div class="table-wrap"><table><thead><tr><th>类型</th><th>周期</th><th>状态</th><th>生成</th><th>发送</th><th>操作</th></tr></thead><tbody>${rows || emptyRow(6)}</tbody></table></div>`;
+  document.getElementById('reportsTable').innerHTML = `<div class="table-wrap report-table"><table><thead><tr><th>报告</th><th>周期</th><th>状态</th><th>生成</th><th>发送</th><th>操作</th></tr></thead><tbody>${rows || emptyRow(6)}</tbody></table></div>`;
 }
 
 async function renderMonitor() {
@@ -478,10 +511,25 @@ async function renderSettings() {
   content().innerHTML = `
     <div class="layout-grid">
       ${panel('AI 模型', `<div class="form-grid"><label>提供商<input id="llm_provider" value="${escAttr(s.llm_provider || '')}"></label><label>模型<input id="llm_model" value="${escAttr(s.llm_model || '')}"></label><label class="full">API Key<input id="llm_api_key" type="password" value=""></label></div><div class="toolbar"><div></div><button class="primary" onclick="saveSettings('llm')">保存</button></div>`)}
+      ${panel('品牌相关性', renderBrandSettingsForm(s))}
       ${panel('报告时间', `<div class="form-grid"><label>日报时间<input id="report_daily_time" value="${escAttr(s.report_daily_time || '09:00')}"></label><label>周报时间<input id="report_weekly_time" value="${escAttr(s.report_weekly_time || '09:00')}"></label><label>月报日期<input id="report_monthly_day" value="${escAttr(s.report_monthly_day || '1')}"></label><label>月报时间<input id="report_monthly_time" value="${escAttr(s.report_monthly_time || '09:00')}"></label></div><div class="toolbar"><div></div><button class="primary" onclick="saveSettings('report')">保存</button></div>`)}
       ${panel('邮件发送', renderEmailSettingsForm(s))}
       ${panel('官方账号识别', renderOfficialAccountsForm(officialData.accounts || []))}
     </div>
+  `;
+}
+
+function renderBrandSettingsForm(s) {
+  return `
+    <div class="form-grid">
+      <label>品牌名<input id="brand_name" value="${escAttr(s.brand_name || '安吉星')}" placeholder="例如：安吉星"></label>
+      <label>品牌别名<input id="brand_aliases" value="${escAttr(s.brand_aliases || 'OnStar, 安吉星')}" placeholder="多个用逗号分隔"></label>
+      <label class="full">业务语境<textarea id="brand_business_context" rows="3" placeholder="说明这个品牌/产品到底做什么">${esc(s.brand_business_context || '汽车车联网、车辆安全救援、远程控制、车况检测、客服、续费和车主服务。')}</textarea></label>
+      <label class="full">强相关词<textarea id="brand_relevance_terms" rows="3" placeholder="多个用逗号或换行分隔">${esc(s.brand_relevance_terms || '车联网, 车主, 车辆, 汽车, 远程启动, 远程控制, 车况检测, 道路救援, 紧急救援, SOS, 续费, 套餐, 客服, App, 车机, 定位, 流量, 别克, 凯迪拉克, 雪佛兰')}</textarea></label>
+      <label class="full">常见误命中词<textarea id="brand_noise_terms" rows="3" placeholder="多个用逗号或换行分隔">${esc(s.brand_noise_terms || '安吉县, 安吉, 地名, 小区, 楼盘, 酒店, 民宿, 景区, 招聘, 店铺, 人名, 谐音, 星座, 明星, 宠物, 餐饮')}</textarea></label>
+    </div>
+    <p class="subtext">AI 会先判断内容是否与当前品牌真实相关。无关内容默认不进入舆情待处理队列，也不计入报告声量、负面率和趋势。</p>
+    <div class="toolbar"><div></div><button class="primary" onclick="saveSettings('brand')">保存</button></div>
   `;
 }
 
@@ -538,6 +586,19 @@ function recordListCell(record) {
 }
 
 function aiJudgementCell(record) {
+  const ai = parseObject(record.ai_result);
+  if (ai.relevance === 'irrelevant') {
+    return `<div class="mini-stack">
+      ${badge('无关内容', 'muted')}
+      <span class="subtext">${esc(compact(ai.relevanceReason || ai.summary || 'AI 判定与当前品牌无关', 44))}</span>
+    </div>`;
+  }
+  if (ai.relevance === 'uncertain') {
+    return `<div class="mini-stack">
+      ${badge('待确认相关性', 'warning')}
+      ${badge(LABELS.sentiment[record.sentiment] || record.sentiment || '待标注', record.sentiment || 'muted')}
+    </div>`;
+  }
   return `<div class="mini-stack">
     ${badge(LABELS.sentiment[record.sentiment] || record.sentiment || '待标注', record.sentiment || 'muted')}
     ${badge(LABELS.category[record.category] || record.category || '待分类', record.category ? 'neutral' : 'muted')}
@@ -565,12 +626,12 @@ function triageActions(r) {
   return `<div class="action-group">
     <button class="primary" onclick="linkRecordIssue('${escAttr(r.id)}')">转问题</button>
     <div class="action-dropdown">
-      <button class="secondary action-more" onclick="this.parentElement.classList.toggle('open')">更多 ▾</button>
+      <button class="secondary action-more" onclick="this.parentElement.classList.toggle('open')">更多</button>
       <div class="action-menu">
-        <button onclick="markOfficialResponded('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">✅ 标为已响应</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','reviewing'); this.closest('.action-dropdown').classList.remove('open')">🔍 待复核</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','archived'); this.closest('.action-dropdown').classList.remove('open')">📦 归档</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','false_positive'); this.closest('.action-dropdown').classList.remove('open')">🚫 误报</button>
+        <button onclick="markOfficialResponded('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">标为已响应</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','reviewing'); this.closest('.action-dropdown').classList.remove('open')">移入待复核</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','archived'); this.closest('.action-dropdown').classList.remove('open')">归档</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','false_positive'); this.closest('.action-dropdown').classList.remove('open')">标为误报</button>
       </div>
     </div>
   </div>`;
@@ -803,13 +864,51 @@ async function generateReport(type) {
 
 async function previewReport(id) {
   const data = await api('/reports/' + id + '/preview');
-  openDrawer('报告预览', data.report.subject || '报告', `<div class="preview-frame">${data.html || '<div class="empty-state">暂无内容</div>'}</div>`);
+  const panes = {
+    management: data.managementHtml || data.html || '',
+    dashboard: data.dashboardHtml || data.html || '',
+    email: data.emailHtml || data.html || '',
+  };
+  openDrawer('报告预览', data.report.subject || '报告', `
+    <div class="report-preview-shell" id="reportPreview_${escAttr(id)}">
+      <div class="report-preview-toolbar">
+        <div class="segmented-control">
+          <button class="active" data-report-tab="management" onclick="switchReportPreviewTab('${escAttr(id)}', 'management')">管理报告</button>
+          <button data-report-tab="dashboard" onclick="switchReportPreviewTab('${escAttr(id)}', 'dashboard')">数据看板</button>
+          <button data-report-tab="email" onclick="switchReportPreviewTab('${escAttr(id)}', 'email')">邮件摘要</button>
+        </div>
+        <div class="report-preview-meta">
+          ${badge(LABELS.reportType[data.report.report_type] || data.report.report_type, 'neutral')}
+          ${badge(LABELS.reportStatus[data.report.status] || data.report.status, data.report.status)}
+        </div>
+      </div>
+      <div class="preview-frame report-preview-pane active" data-report-pane="management">${panes.management || '<div class="empty-state">暂无管理报告</div>'}</div>
+      <div class="preview-frame report-preview-pane" data-report-pane="dashboard">${panes.dashboard || '<div class="empty-state">暂无数据看板</div>'}</div>
+      <div class="preview-frame report-preview-pane" data-report-pane="email">${panes.email || '<div class="empty-state">暂无邮件摘要</div>'}</div>
+    </div>
+  `, { className: 'drawer-wide' });
 }
 
 async function sendReport(id) {
-  await api('/reports/' + id + '/send', { method: 'POST' });
-  toast('报告已发送', 'success');
-  loadReports();
+  try {
+    await api('/reports/' + id + '/send', { method: 'POST' });
+    toast('报告已发送', 'success');
+    loadReports();
+  } catch (err) {
+    toast(err.message || '报告发送失败，请检查邮件配置', 'error');
+    await loadReports();
+  }
+}
+
+function switchReportPreviewTab(id, tab) {
+  const root = document.getElementById('reportPreview_' + id);
+  if (!root) return;
+  root.querySelectorAll('[data-report-tab]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.reportTab === tab);
+  });
+  root.querySelectorAll('[data-report-pane]').forEach(pane => {
+    pane.classList.toggle('active', pane.dataset.reportPane === tab);
+  });
 }
 
 async function createSubscription() {
@@ -880,6 +979,13 @@ async function saveSettings(group) {
     body.llm_model = valueOf('llm_model');
     if (valueOf('llm_api_key')) body.llm_api_key = valueOf('llm_api_key');
   } else {
+    if (group === 'brand') {
+      body.brand_name = valueOf('brand_name').trim();
+      body.brand_aliases = valueOf('brand_aliases').trim();
+      body.brand_business_context = valueOf('brand_business_context').trim();
+      body.brand_relevance_terms = valueOf('brand_relevance_terms').trim();
+      body.brand_noise_terms = valueOf('brand_noise_terms').trim();
+    }
     if (group === 'report') {
       body.report_daily_time = valueOf('report_daily_time');
       body.report_weekly_time = valueOf('report_weekly_time');
@@ -1122,6 +1228,17 @@ function parseArray(value) {
   return [];
 }
 
+function parseObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
 function safeUrl(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -1155,11 +1272,13 @@ function emptyRow(cols) {
   return `<tr><td colspan="${cols}"><div class="empty-state">暂无数据</div></td></tr>`;
 }
 
-function openDrawer(eyebrow, title, body) {
+function openDrawer(eyebrow, title, body, options = {}) {
+  const drawer = document.getElementById('drawer');
   document.getElementById('drawerEyebrow').textContent = eyebrow;
   document.getElementById('drawerTitle').textContent = title;
   document.getElementById('drawerBody').innerHTML = body;
-  document.getElementById('drawer').hidden = false;
+  drawer.className = `drawer ${options.className || ''}`.trim();
+  drawer.hidden = false;
   document.getElementById('drawerScrim').hidden = false;
 }
 

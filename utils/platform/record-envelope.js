@@ -17,6 +17,29 @@ function cloneObject(value) {
   return { ...value };
 }
 
+function compactDuplicateRawPayload(rawPayload, normalizedPayload) {
+  const raw =
+    rawPayload && typeof rawPayload === "object" && !Array.isArray(rawPayload)
+      ? rawPayload
+      : {};
+  const normalized =
+    normalizedPayload &&
+    typeof normalizedPayload === "object" &&
+    !Array.isArray(normalizedPayload)
+      ? normalizedPayload
+      : {};
+
+  try {
+    if (JSON.stringify(raw) === JSON.stringify(normalized)) {
+      return {};
+    }
+  } catch {
+    // Keep the original raw payload when it cannot be compared safely.
+  }
+
+  return cloneObject(raw);
+}
+
 function resolveDirectPlatform(value) {
   const normalized = normalizePlatformId(value);
   return normalized === "unknown" ? "" : normalized;
@@ -76,6 +99,8 @@ export function resolveRecordPlatform(record) {
     meta.sourceUrl,
     record?.sourceUrl,
     payload.platform,
+    payload.sourceUrl,
+    payload.searchUrl,
     payload.url,
     payload.noteUrl,
     payload.detailPageUrl,
@@ -83,6 +108,8 @@ export function resolveRecordPlatform(record) {
     payload.bloggerUrl,
     payload.detailCaptureNoteUrl,
     rawPayload.platform,
+    rawPayload.sourceUrl,
+    rawPayload.searchUrl,
     rawPayload.url,
     firstItem.url,
     firstItem.noteUrl,
@@ -256,16 +283,22 @@ export function normalizeStoredRecord(record = {}) {
 
 export function serializeRecordEnvelope(record = {}) {
   const normalized = normalizeStoredRecord(record);
+  const normalizedPayload = cloneObject(normalized.normalizedPayload);
+  const rawPayload = compactDuplicateRawPayload(
+    normalized.rawPayload,
+    normalizedPayload,
+  );
   return {
     id: normalized.id,
     platform: normalized.platform,
+    type: normalized.recordType,
     sourcePageType: normalized.sourcePageType,
     recordType: normalized.recordType,
     schemaVersion: normalized.schemaVersion,
     title: normalized.title,
     summary: normalized.summary,
-    rawPayload: cloneObject(normalized.rawPayload),
-    normalizedPayload: cloneObject(normalized.normalizedPayload),
+    rawPayload,
+    normalizedPayload,
     meta: {
       ...(normalized.meta && typeof normalized.meta === "object" ? normalized.meta : {}),
     },

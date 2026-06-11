@@ -5,6 +5,7 @@ import { OverviewPage } from '@/pages/OverviewPage'
 import { TriagePage } from '@/pages/TriagePage'
 import { IssuesPage } from '@/pages/IssuesPage'
 import { ReportsPage } from '@/pages/ReportsPage'
+import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { MonitorPage } from '@/pages/MonitorPage'
 import { DataPage } from '@/pages/DataPage'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
@@ -16,6 +17,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   overview: { eyebrow: 'Workspace', title: '总览' },
   triage: { eyebrow: 'Triage Inbox', title: '舆情收件箱' },
   issues: { eyebrow: 'Issue Desk', title: '问题处置' },
+  analytics: { eyebrow: 'Live Analytics', title: '数据看板' },
   reports: { eyebrow: 'Reports', title: '报告中心' },
   monitor: { eyebrow: 'Monitoring', title: '监控任务' },
   data: { eyebrow: 'Data Assets', title: '数据资产' },
@@ -29,6 +31,7 @@ const PAGES: Record<string, React.ComponentType> = {
   overview: OverviewPage,
   triage: TriagePage,
   issues: IssuesPage,
+  analytics: AnalyticsPage,
   reports: ReportsPage,
   monitor: MonitorPage,
   data: DataPage,

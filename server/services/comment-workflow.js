@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
+import { classifyCommentWithAI } from './ai-labeler.js';
 
 const NEGATIVE_KEYWORDS = [
   '投诉', '维权', '差评', '垃圾', '失望', '被骗', '坑', '故障', '坏了', '崩溃',
@@ -8,6 +9,19 @@ const NEGATIVE_KEYWORDS = [
 ];
 
 const CRITICAL_KEYWORDS = ['事故', '失控', '刹车', '起火', '死亡', '伤亡', '泄露', '隐私', '召回'];
+const POSITIVE_PATTERNS = [
+  /不算贵/, /不贵/, /不收费/, /免费/, /可以/, /有用/, /挺有用/, /好用/, /不会不提供服务/,
+  /一直免费/, /没问题/, /还行/, /划算/, /值得/, /正常/, /能用/, /可以用/,
+];
+const LOW_SIGNAL_RENEWAL_PATTERNS = [
+  /没必要续费/, /不用续/, /不续$/, /不续了?$/, /不买了?$/, /用不了几次/, /开的不多/,
+  /一年\d+多.*不算贵/, /不算贵.*救援/, /只是.*不能用.*救援.*免费/,
+];
+const HARD_NEGATIVE_PATTERNS = [
+  /乱扣/, /扣费/, /被骗/, /坑人?/, /垃圾/, /恶心/, /气死/, /投诉/, /维权/, /没人管/,
+  /打不开/, /连不上/, /闪退/, /崩溃/, /故障/, /坏了/, /无法使用/, /完全不能用/,
+  /泄露/, /隐私/, /事故/, /失控/, /起火/, /召回/, /刹车/,
+];
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex');
@@ -48,6 +62,10 @@ function boolValue(value) {
   return !['false', '0', 'no', 'off'].includes(text);
 }
 
+function hasPattern(text, patterns) {
+  return patterns.some(pattern => pattern.test(text));
+}
+
 function commentContent(item) {
   return normalizeText(item?.content || item?.text || item?.commentText || item?.body || '');
 }
@@ -73,14 +91,24 @@ function normalizeComment(item, index) {
   };
 }
 
-function classifyComment(comment, isOfficial) {
+export function classifyComment(comment, isOfficial) {
   if (isOfficial) {
     return { sentiment: 'neutral', category: 'official_response', risk_level: 'none', is_negative: false };
   }
   const text = normalizeComparable(comment.content);
   const matchedCritical = CRITICAL_KEYWORDS.some(keyword => text.includes(keyword.toLowerCase()));
-  const matchedNegative = matchedCritical || NEGATIVE_KEYWORDS.some(keyword => text.includes(keyword.toLowerCase()));
-  if (!matchedNegative) {
+  const matchedHardNegative = matchedCritical || hasPattern(text, HARD_NEGATIVE_PATTERNS);
+  const matchedNegativeWord = NEGATIVE_KEYWORDS.some(keyword => text.includes(keyword.toLowerCase()));
+  const matchedPositive = hasPattern(text, POSITIVE_PATTERNS);
+  const lowSignalRenewal = hasPattern(text, LOW_SIGNAL_RENEWAL_PATTERNS);
+
+  if (lowSignalRenewal && !matchedHardNegative) {
+    return { sentiment: 'neutral', category: 'renewal_billing', risk_level: 'none', is_negative: false };
+  }
+  if (matchedPositive && !matchedHardNegative) {
+    return { sentiment: matchedNegativeWord ? 'neutral' : 'positive', category: '', risk_level: 'none', is_negative: false };
+  }
+  if (!matchedNegativeWord && !matchedHardNegative) {
     return { sentiment: 'neutral', category: '', risk_level: 'none', is_negative: false };
   }
   const riskLevel = matchedCritical ? 'high' : (comment.like_count >= 20 ? 'medium' : 'low');
@@ -90,6 +118,43 @@ function classifyComment(comment, isOfficial) {
   else if (/客服|没人管|服务/.test(text)) category = 'service_quality';
   else if (/安全|事故|召回|失控|泄露|隐私/.test(text)) category = 'safety_rescue';
   return { sentiment: 'negative', category, risk_level: riskLevel, is_negative: true };
+}
+
+function ruleClassificationWithMetadata(ruleClassification) {
+  return {
+    ...ruleClassification,
+    ai_summary: '',
+    ai_result: { ...ruleClassification, classifier: 'rule_comment' },
+  };
+}
+
+function classificationSummary(classification) {
+  return classification.ai_summary || classification.ai_result?.summary || classification.ai_result?.reason || '';
+}
+
+function classificationChanged(comment, next, includeAiResult = false) {
+  const baseChanged =
+    Boolean(comment.is_negative) !== Boolean(next.is_negative) ||
+    comment.sentiment !== next.sentiment ||
+    comment.category !== next.category ||
+    comment.risk_level !== next.risk_level;
+  if (baseChanged) return true;
+  if (!includeAiResult) return false;
+  return normalizeText(comment.ai_summary) !== normalizeText(classificationSummary(next)) ||
+    JSON.stringify(comment.ai_result || {}) !== JSON.stringify(next.ai_result || {});
+}
+
+async function classifyCommentForWorkflow({ tenantId, record = {}, comment, isOfficial }) {
+  const ruleClassification = classifyComment(comment, isOfficial);
+  if (isOfficial) return ruleClassificationWithMetadata(ruleClassification);
+  const aiClassification = await classifyCommentWithAI({
+    tenantId,
+    record,
+    comment,
+    isOfficial,
+    fallback: ruleClassification,
+  });
+  return aiClassification || ruleClassificationWithMetadata(ruleClassification);
 }
 
 function officialAliases(account) {
@@ -133,7 +198,12 @@ function buildCommentHash(recordId, comment) {
 
 async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount }) {
   const contentHash = buildCommentHash(recordId, comment);
-  const classification = classifyComment(comment, Boolean(officialAccount));
+  const classification = await classifyCommentForWorkflow({
+    tenantId,
+    record: comment.recordContext || {},
+    comment,
+    isOfficial: Boolean(officialAccount),
+  });
   let existing = null;
   if (comment.external_comment_id) {
     existing = await tx.queryOne(
@@ -163,17 +233,22 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
         sentiment = $10,
         category = $11,
         risk_level = $12,
-        payload = $13::jsonb,
+        ai_summary = $13,
+        ai_result = $14::jsonb,
+        payload = $15::jsonb,
         last_seen_at = now(),
         seen_count = seen_count + 1,
         updated_at = now()
-      WHERE id = $14
+      WHERE id = $16
       RETURNING *
     `, [
       comment.author_name, comment.author_id, comment.author_avatar, comment.content,
       comment.like_count, comment.published_at, comment.ip_location,
       Boolean(officialAccount), classification.is_negative, classification.sentiment,
-      classification.category, classification.risk_level, JSON.stringify(comment.payload || {}),
+      classification.category, classification.risk_level,
+      classificationSummary(classification),
+      JSON.stringify(classification.ai_result || {}),
+      JSON.stringify(comment.payload || {}),
       existing.id,
     ]);
     return { row, inserted: false, officialAccount };
@@ -184,12 +259,12 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
       tenant_id, record_id, platform, external_comment_id, parent_comment_id,
       author_name, author_id, author_avatar, content, like_count, published_at,
       ip_location, floor_index, is_official, is_negative, sentiment, category,
-      risk_level, content_hash, payload
+      risk_level, ai_summary, ai_result, content_hash, payload
     ) VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10, $11,
       $12, $13, $14, $15, $16, $17,
-      $18, $19, $20::jsonb
+      $18, $19, $20::jsonb, $21, $22::jsonb
     )
     RETURNING *
   `, [
@@ -197,7 +272,11 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
     comment.author_name, comment.author_id, comment.author_avatar, comment.content, comment.like_count,
     comment.published_at, comment.ip_location, comment.floor_index, Boolean(officialAccount),
     classification.is_negative, classification.sentiment, classification.category,
-    classification.risk_level, contentHash, JSON.stringify(comment.payload || {}),
+    classification.risk_level,
+    classificationSummary(classification),
+    JSON.stringify(classification.ai_result || {}),
+    contentHash,
+    JSON.stringify(comment.payload || {}),
   ]);
   return { row, inserted: true, officialAccount };
 }
@@ -283,7 +362,7 @@ export async function upsertRecordComments(recordId, record, context) {
   return await withTransaction(async tx => {
     const accounts = await loadOfficialAccounts(tx, tenantId);
     const currentRecord = await tx.queryOne(
-      'SELECT id, author_name, author_id, platform, record_type, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
+      'SELECT id, title, content, author_name, author_id, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
       [recordId, tenantId]
     );
     if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
@@ -316,6 +395,13 @@ export async function upsertRecordComments(recordId, record, context) {
 
     for (let index = 0; index < comments.length; index++) {
       const comment = normalizeComment(comments[index], index);
+      comment.recordContext = {
+        title: record.title || currentRecord.title,
+        content: record.content || currentRecord.content,
+        platform,
+        sentiment: currentRecord.sentiment,
+        category: currentRecord.category,
+      };
       const officialAccount = isOfficialSubject({
         platform,
         author_name: comment.author_name,
@@ -396,4 +482,127 @@ export async function getComment(tenantId, commentId) {
     'SELECT * FROM record_comments WHERE tenant_id = $1 AND id = $2',
     [tenantId, commentId]
   );
+}
+
+export async function reclassifyComments(tenantId = null, options = {}) {
+  const config = typeof options === 'boolean' ? { useAI: options } : (options || {});
+  const useAI = Boolean(config.useAI);
+  const onlyWithoutAI = Boolean(config.onlyWithoutAI);
+  const limit = Math.max(0, Math.floor(Number(config.limit || 0)));
+  const params = [];
+  let where = 'WHERE 1=1';
+  if (tenantId) {
+    params.push(tenantId);
+    where += ` AND rc.tenant_id = $${params.length}`;
+  }
+  if (config.recordId) {
+    params.push(config.recordId);
+    where += ` AND rc.record_id = $${params.length}`;
+  }
+  if (onlyWithoutAI) {
+    where += " AND (rc.ai_result->>'classifier' IS DISTINCT FROM 'llm_comment')";
+  }
+  let limitSql = '';
+  if (limit > 0) {
+    params.push(limit);
+    limitSql = `LIMIT $${params.length}`;
+  }
+  const comments = await queryAll(`
+    SELECT rc.*,
+      r.title AS record_title,
+      r.content AS record_content,
+      r.platform AS record_platform,
+      r.sentiment AS record_sentiment,
+      r.category AS record_category
+    FROM record_comments rc
+    LEFT JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
+    ${where}
+    ORDER BY rc.last_seen_at DESC, rc.created_at DESC
+    ${limitSql}
+  `, params);
+  const updates = [];
+  let aiUsed = 0;
+  let ruleFallback = 0;
+
+  for (const comment of comments) {
+    const recordContext = {
+      title: comment.record_title,
+      content: comment.record_content,
+      platform: comment.record_platform || comment.platform,
+      sentiment: comment.record_sentiment,
+      category: comment.record_category,
+    };
+    const next = useAI
+      ? await classifyCommentForWorkflow({
+          tenantId: comment.tenant_id,
+          record: recordContext,
+          comment,
+          isOfficial: Boolean(comment.is_official),
+        })
+      : ruleClassificationWithMetadata(classifyComment(comment, comment.is_official));
+    if (next.ai_result?.classifier === 'llm_comment') aiUsed += 1;
+    else ruleFallback += 1;
+    if (!classificationChanged(comment, next, useAI)) continue;
+    updates.push({
+      id: comment.id,
+      tenantId: comment.tenant_id,
+      recordId: comment.record_id,
+      next,
+    });
+  }
+
+  await withTransaction(async tx => {
+    for (const update of updates) {
+      const next = update.next;
+      await tx.execute(`
+        UPDATE record_comments
+        SET is_negative = $1,
+          sentiment = $2,
+          category = $3,
+          risk_level = $4,
+          ai_summary = $5,
+          ai_result = $6::jsonb,
+          updated_at = now()
+        WHERE id = $7 AND tenant_id = $8
+      `, [
+        next.is_negative,
+        next.sentiment,
+        next.category,
+        next.risk_level,
+        classificationSummary(next),
+        JSON.stringify(next.ai_result || {}),
+        update.id,
+        update.tenantId,
+      ]);
+    }
+
+    const recordPairs = new Map();
+    for (const update of updates) {
+      if (update.recordId && update.tenantId) recordPairs.set(update.recordId, update.tenantId);
+    }
+    for (const [recordId, recordTenantId] of recordPairs.entries()) {
+      const aggregate = await aggregateRecordComments(tx, recordTenantId, recordId);
+      const responseStatus = aggregate.negativeCount > 0
+        ? 'needs_followup'
+        : (aggregate.officialCount > 0 ? 'responded' : 'none');
+      await tx.execute(`
+        UPDATE records
+        SET official_replied = $1,
+          official_response_status = $2,
+          negative_comment_count = $3,
+          latest_negative_comment_at = $4,
+          updated_at = now()
+        WHERE id = $5 AND tenant_id = $6
+      `, [
+        aggregate.officialCount > 0,
+        responseStatus,
+        aggregate.negativeCount,
+        aggregate.latestNegativeAt,
+        recordId,
+        recordTenantId,
+      ]);
+    }
+  });
+
+  return { total: comments.length, changed: updates.length, ai: useAI, aiUsed, ruleFallback };
 }

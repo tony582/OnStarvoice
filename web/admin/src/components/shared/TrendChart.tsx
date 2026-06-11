@@ -33,7 +33,7 @@ export function TrendChart({ data }: { data: TrendRow[] }) {
               fontSize: '12px',
               boxShadow: '0 4px 16px rgba(0,0,0,0.1)',
             }}
-            formatter={(value: number, name: string) => [formatNumber(value), name === 'negative' ? '负面' : '总计']}
+            formatter={(value, name) => [formatNumber(Number(value) || 0), name === 'negative' ? '负面' : '总计']}
           />
           <Bar dataKey="total" radius={[4, 4, 0, 0]} maxBarSize={32}>
             {chartData.map((_, i) => (

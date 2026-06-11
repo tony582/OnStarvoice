@@ -397,11 +397,17 @@ function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { record: a
                             <span className="text-sm font-semibold">{c.author_name || '未知评论者'}</span>
                             <span className="text-xs text-muted-foreground">{formatDate(c.published_at || c.created_at)}</span>
                             {c.is_official && <StatusBadge tone="positive">官方回复</StatusBadge>}
+                            {commentClassifier(c) === 'llm_comment' && <StatusBadge tone="neutral">AI</StatusBadge>}
                             <StatusBadge tone={c.is_negative ? 'negative' : (c.sentiment || 'muted')}>
                               {c.is_negative ? `负面 · ${c.risk_level || 'low'}` : (LABELS.sentiment[c.sentiment] || '中性')}
                             </StatusBadge>
                           </div>
                           <p className="text-sm">{c.content}</p>
+                          {c.ai_summary && (
+                            <div className="mt-2 rounded-md bg-muted/50 px-3 py-2 text-xs leading-5 text-muted-foreground">
+                              {c.ai_summary}
+                            </div>
+                          )}
                           <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
                             <span>{formatNumber(c.like_count)} 赞{c.ip_location ? ` · IP ${c.ip_location}` : ''}</span>
                             {canWrite && c.is_negative && (
@@ -541,4 +547,15 @@ function getImages(r: any): string[] {
     }
   } catch {}
   return urls.filter(u => /^https?:\/\//i.test(u))
+}
+
+function commentClassifier(comment: any): string {
+  const aiResult = comment?.ai_result
+  if (!aiResult) return ''
+  if (typeof aiResult === 'object') return aiResult.classifier || ''
+  try {
+    return JSON.parse(aiResult)?.classifier || ''
+  } catch {
+    return ''
+  }
 }

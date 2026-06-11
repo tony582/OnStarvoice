@@ -1,12 +1,12 @@
 import {
-  LayoutGrid, Activity, AlertCircle, FileText, Radar,
+  LayoutGrid, Activity, AlertCircle, FileText, Radar, BarChart3,
   Database, Building2, Users, KeyRound, Settings, ChevronRight,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
 
 const ICON_MAP: Record<string, React.ElementType> = {
-  overview: LayoutGrid, triage: Activity, issues: AlertCircle, reports: FileText,
+  overview: LayoutGrid, triage: Activity, issues: AlertCircle, analytics: BarChart3, reports: FileText,
   monitor: Radar, data: Database, tenants: Building2, users: Users,
   'auth-codes': KeyRound, settings: Settings,
 }
@@ -17,6 +17,7 @@ const NAV = [
       { id: 'overview', label: '总览' },
       { id: 'triage', label: '舆情收件箱' },
       { id: 'issues', label: '问题处置' },
+      { id: 'analytics', label: '数据看板' },
       { id: 'reports', label: '报告中心' },
       { id: 'monitor', label: '监控任务' },
       { id: 'data', label: '数据资产' },

@@ -29,6 +29,7 @@ import recordsRouter from './routes/records.js';
 import commentsRouter from './routes/comments.js';
 import triageRouter from './routes/triage.js';
 import workspaceRouter from './routes/workspace.js';
+import analyticsRouter from './routes/analytics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -38,7 +39,7 @@ const PORT = process.env.PORT || 3000;
 
 // ==================== 中间件 ====================
 
-const configuredCorsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001')
+const configuredCorsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:5173,http://127.0.0.1:5173')
   .split(',')
   .map(origin => origin.trim())
   .filter(Boolean);
@@ -103,6 +104,7 @@ app.use('/api/records', recordsRouter);
 app.use('/api/comments', commentsRouter);
 app.use('/api/triage', triageRouter);
 app.use('/api/workspace', workspaceRouter);
+app.use('/api/analytics', analyticsRouter);
 
 app.post('/api/admin/test-email', requireAdmin, async (req, res) => {
   try { return res.json(await sendTestEmail()); }

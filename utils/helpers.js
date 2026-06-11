@@ -127,7 +127,6 @@ export function parseInteractionCount(str) {
  */
 export function normalizeDate(dateStr) {
   if (!dateStr) {
-    console.warn('[Helpers] Empty date string');
     return getCurrentDateString();
   }
 
@@ -182,12 +181,62 @@ export function normalizeDate(dateStr) {
       }
     }
 
+    // 处理 "YYYY年MM月DD日" 格式
+    const fullChineseDateMatch = str.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?/);
+    if (fullChineseDateMatch) {
+      const year = Number(fullChineseDateMatch[1]);
+      const month = Number(fullChineseDateMatch[2]);
+      const day = Number(fullChineseDateMatch[3]);
+      const date = new Date(year, month - 1, day);
+      if (
+        date.getFullYear() === year &&
+        date.getMonth() === month - 1 &&
+        date.getDate() === day
+      ) {
+        return formatDate(date);
+      }
+    }
+
+    // 处理 "MM月DD日" 格式（平台常用于当年内容）
+    const chineseMonthDayMatch = str.match(/(?:^|[^\d])(\d{1,2})\s*月\s*(\d{1,2})\s*日?/);
+    if (chineseMonthDayMatch) {
+      const month = Number(chineseMonthDayMatch[1]);
+      const day = Number(chineseMonthDayMatch[2]);
+      let year = now.getFullYear();
+      let date = new Date(year, month - 1, day);
+      if (
+        date.getFullYear() === year &&
+        date.getMonth() === month - 1 &&
+        date.getDate() === day
+      ) {
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        if (date.getTime() > tomorrow.getTime()) {
+          year -= 1;
+          date = new Date(year, month - 1, day);
+        }
+        return formatDate(date);
+      }
+    }
+
     // 处理 "MM-DD" 格式（补充年份）
     if (/^\d{1,2}-\d{1,2}$/.test(str)) {
       const [month, day] = str.split('-').map(Number);
-      now.setMonth(month - 1);
-      now.setDate(day);
-      return formatDate(now);
+      let year = now.getFullYear();
+      let date = new Date(year, month - 1, day);
+      if (
+        date.getFullYear() === year &&
+        date.getMonth() === month - 1 &&
+        date.getDate() === day
+      ) {
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        if (date.getTime() > tomorrow.getTime()) {
+          year -= 1;
+          date = new Date(year, month - 1, day);
+        }
+        return formatDate(date);
+      }
     }
 
     // 处理 "YYYY-MM-DD" 格式
@@ -205,10 +254,8 @@ export function normalizeDate(dateStr) {
     }
 
     // 所有策略失败，返回当前日期
-    console.warn('[Helpers] All date parsing strategies failed for:', str);
     return getCurrentDateString();
   } catch (error) {
-    console.error('[Helpers] Date normalization error:', error);
     return getCurrentDateString();
   }
 }

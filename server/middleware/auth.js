@@ -94,7 +94,13 @@ export async function requireTenantAccess(req, res, next) {
  */
 export async function requireAuth(req, res, next) {
   try {
-    const authCode = req.headers['x-auth-code'] || req.body?.authCode || req.body?.code || '';
+    const authCode =
+      req.headers['x-auth-code'] ||
+      req.body?.authCode ||
+      req.body?.code ||
+      req.query?.authCode ||
+      req.query?.code ||
+      '';
     if (!authCode) {
       return res.status(401).json({ ok: false, error: 'missing_auth_code', message: '缺少激活码' });
     }

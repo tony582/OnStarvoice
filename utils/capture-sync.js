@@ -15,6 +15,7 @@ import {
   addRecord,
   addRecords,
   addSyncHistoryEntry,
+  getDataPool,
   getRecord,
   getRecords,
   updateRecord,
@@ -103,6 +104,8 @@ const DEFAULT_BLOGGER_NOTES_TABLE_NAME = '博主笔记采集';
 const DEFAULT_KEYWORD_NOTES_TABLE_NAME = '关键词笔记采集';
 const DEFAULT_COMMENT_LEADS_TABLE_NAME = 'comment_leads';
 const MAX_SYNC_RECORDS_PER_BATCH = 500;
+const MAX_SYNC_RECORDS_PER_REQUEST = 10;
+const MAX_SYNC_REQUEST_PAYLOAD_BYTES = 1_800_000;
 const DEFAULT_CHECK_SYNC_TYPES = [
   SYNC_TYPE.SINGLE_NOTE,
   SYNC_TYPE.COMMENTS,
@@ -130,9 +133,55 @@ function hasCommentLeadsEligibleType(syncTypes = []) {
 function applySyncPreferencesToPayload(payload = {}, captureSettings = {}) {
   const safePayload = payload && typeof payload === 'object' ? payload : {};
   return {
-    ...safePayload,
+    ...compactPayloadForBackendSync(safePayload),
     skipOfficialAccounts: captureSettings.skipOfficialAccounts !== false,
   };
+}
+
+function compactPayloadForBackendSync(payload = {}) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const next = {...source};
+  const items = Array.isArray(source.items)
+    ? source.items
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => compactSyncItemForBackend(item))
+    : [];
+
+  if (items.length > 0) {
+    next.items = items.slice(0, 1);
+    delete next.detailPayload;
+  }
+
+  delete next.detailCaptureDiagnosticMessage;
+  delete next.detailCaptureFailureStage;
+  delete next.detailCaptureFailureCategory;
+  delete next.cardImageCandidates;
+  delete next.cardVideoCandidates;
+  delete next.domLocator;
+  delete next.domMatchHints;
+
+  return compactSyncItemForBackend(next);
+}
+
+function compactSyncItemForBackend(item = {}) {
+  const next = item && typeof item === 'object' ? {...item} : {};
+
+  delete next.domLocator;
+  delete next.domMatchHints;
+  delete next.cardImageCandidates;
+  delete next.cardVideoCandidates;
+  delete next.videoUrls;
+  delete next.audioUrls;
+  delete next.musicUrls;
+  delete next.mediaDiagnostics;
+  delete next.detailDiagnostics;
+  delete next.captureDiagnostics;
+
+  next.videoUrl = '';
+  next.audioUrl = '';
+  next.musicUrl = '';
+
+  return next;
 }
 
 // ==================== M4-03: 前端接入 sync 调用 ====================
@@ -2024,133 +2073,117 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
       continue;
     }
 
-    const groupStartedAt = Date.now();
-    const batchResult = await syncBatch(
-      group.records.map((record) => ({
-        id: record.id,
-        type: record.syncType || record.type,
-        platform: record.platform,
-        workflow: record.workflow,
-        payload: record.syncPayload || record.payload,
-      })),
-      requestTarget,
-    );
+    const requestChunks = splitSyncGroupRecordsForRequests(group.records);
+    for (const chunkRecords of requestChunks) {
+      const groupStartedAt = Date.now();
+      const batchResult = await syncBatch(
+        chunkRecords.map((record) => buildSyncBatchRecord(record)),
+        requestTarget,
+      );
 
-    const batchItems = Array.isArray(batchResult?.data?.items) ? batchResult.data.items : [];
-    const batchItemMap = new Map(
-      batchItems
-        .filter((item) => item && typeof item === 'object' && item.recordId)
-        .map((item) => [item.recordId, item]),
-    );
-    const groupResults = [];
+      const batchItems = Array.isArray(batchResult?.data?.items) ? batchResult.data.items : [];
+      const batchItemMap = new Map(
+        batchItems
+          .filter((item) => item && typeof item === 'object' && item.recordId)
+          .map((item) => [item.recordId, item]),
+      );
+      const groupResults = [];
 
-    for (let i = 0; i < group.records.length; i++) {
-      const record = group.records[i];
-      const item = batchItemMap.get(record.id);
-      const debugUrl =
-        normalizeDebugUrl(item?.debugUrl) ||
-        (batchResult.ok ? extractDebugUrl(batchResult) : '');
-      const success = item?.ok === true;
-      const reason =
-        item?.reason ||
-        (success
-          ? ERROR_REASON.NONE
-          : batchResult.reason || batchResult.error?.reason || 'SYNC_ERROR');
-      const message =
-        item?.message ||
-        (success ? '同步成功' : batchResult.message || batchResult.error?.message || '同步失败');
-      const error = success
-        ? null
-        : {
-            reason,
-            message,
-          };
+      for (let i = 0; i < chunkRecords.length; i++) {
+        const record = chunkRecords[i];
+        const item = batchItemMap.get(record.id);
+        const debugUrl =
+          normalizeDebugUrl(item?.debugUrl) ||
+          (batchResult.ok ? extractDebugUrl(batchResult) : '');
+        const success = item?.ok === true;
+        const reason =
+          item?.reason ||
+          item?.error?.reason ||
+          (success
+            ? ERROR_REASON.NONE
+            : batchResult.reason || batchResult.error?.reason || 'SYNC_ERROR');
+        const message =
+          item?.message ||
+          item?.error?.message ||
+          (success ? '同步成功' : batchResult.message || batchResult.error?.message || '同步失败');
+        const error = success
+          ? null
+          : {
+              reason,
+              message,
+            };
 
-      if (success) {
-        await markRecordSynced(record.id, debugUrl || null);
-      } else {
-        await updateRecord(record.id, {
-          status: RECORD_STATUS.FAILED,
-          lastSyncedAt: Date.now(),
-          lastSyncReason: reason,
-          lastSyncDebugUrl: debugUrl || null,
-        });
-      }
+        if (success) {
+          await markRecordSynced(record.id, debugUrl || null);
+        } else {
+          await updateRecord(record.id, {
+            status: RECORD_STATUS.FAILED,
+            lastSyncedAt: Date.now(),
+            lastSyncReason: reason,
+            lastSyncDebugUrl: debugUrl || null,
+          });
+        }
 
-      results.push({
-        recordId: record.id,
-        platform: record.platform || 'unknown',
-        type: record.syncType || record.type,
-        sourceType: record.sourceType || record.type,
-        workflow: record.workflow || '',
-        noteType:
-          (record.syncType || record.type) === 'single_note'
-            ? getSingleNoteType(record.syncPayload || record.payload)
-            : null,
-        success,
-        reason,
-        message,
-        debugUrl: debugUrl || null,
-        rawResponse: item?.rawResponse || batchResult,
-        error,
-      });
-      groupResults.push({
-        recordId: record.id,
-        platform: record.platform || 'unknown',
-        type: record.syncType || record.type,
-        sourceType: record.sourceType || record.type,
-        workflow: record.workflow || '',
-        noteType:
-          (record.syncType || record.type) === 'single_note'
-            ? getSingleNoteType(record.syncPayload || record.payload)
-            : null,
-        success,
-        reason,
-        message,
-        debugUrl: debugUrl || null,
-        rawResponse: item?.rawResponse || batchResult,
-        error,
-      });
-      processedCount += 1;
-
-      if (onProgress) {
-        onProgress({
-          phase: 'batch_sync',
-          current: processedCount,
-          total: recordIdsToSync.length,
-          message: `正在处理第 ${processedCount}/${recordIdsToSync.length} 条记录...`,
+        const syncResultItem = {
           recordId: record.id,
-        });
-      }
-    }
+          platform: record.platform || 'unknown',
+          type: record.syncType || record.type,
+          sourceType: record.sourceType || record.type,
+          workflow: record.workflow || '',
+          noteType:
+            (record.syncType || record.type) === 'single_note'
+              ? getSingleNoteType(record.syncPayload || record.payload)
+              : null,
+          success,
+          reason,
+          message,
+          debugUrl: debugUrl || null,
+          rawResponse: item?.rawResponse || item || batchResult,
+          error,
+        };
+        results.push(syncResultItem);
+        groupResults.push(syncResultItem);
+        processedCount += 1;
 
-    await addSyncHistoryEntry({
-      trigger: options.trigger || 'manual',
-      syncScope: options.syncScope || 'pending',
-      startedAt: groupStartedAt,
-      finishedAt: Date.now(),
-      totalCount: group.records.length,
-      requestedTotalCount: group.records.length,
-      skippedCount: 0,
-      successCount: groupResults.filter((result) => result.success).length,
-      failedCount: groupResults.filter((result) => !result.success).length,
-      debugUrl: pickBatchDebugUrl(groupResults) || null,
-      platform: group.platform || 'unknown',
-      syncType: group.syncType || '',
-      workflow: group.workflow || '',
-      target: buildSyncHistoryTarget(requestTarget, {
+        if (onProgress) {
+          onProgress({
+            phase: 'batch_sync',
+            current: processedCount,
+            total: recordIdsToSync.length,
+            message: `正在处理第 ${processedCount}/${recordIdsToSync.length} 条记录...`,
+            recordId: record.id,
+          });
+        }
+      }
+
+      await addSyncHistoryEntry({
+        trigger: options.trigger || 'manual',
+        syncScope: options.syncScope || 'pending',
+        startedAt: groupStartedAt,
+        finishedAt: Date.now(),
+        totalCount: chunkRecords.length,
+        requestedTotalCount: chunkRecords.length,
+        skippedCount: 0,
+        successCount: groupResults.filter((result) => result.success).length,
+        failedCount: groupResults.filter((result) => !result.success).length,
+        debugUrl: pickBatchDebugUrl(groupResults) || null,
         platform: group.platform || 'unknown',
         syncType: group.syncType || '',
         workflow: group.workflow || '',
-      }),
-      recordIds: group.records.map((record) => record.id),
-      skippedRecordIds: [],
-      items: groupResults,
-      batchStartedAt: startedAt,
-      batchRequestedTotalCount: requestedRecordIds.length,
-      batchSyncedCount: recordIdsToSync.length,
-      batchSkippedCount: skippedRecordIds.length,
-    });
+        target: buildSyncHistoryTarget(requestTarget, {
+          platform: group.platform || 'unknown',
+          syncType: group.syncType || '',
+          workflow: group.workflow || '',
+        }),
+        recordIds: chunkRecords.map((record) => record.id),
+        skippedRecordIds: [],
+        items: groupResults,
+        batchStartedAt: startedAt,
+        batchRequestedTotalCount: requestedRecordIds.length,
+        batchSyncedCount: recordIdsToSync.length,
+        batchSkippedCount: skippedRecordIds.length,
+      });
+    }
   }
 
   let commentLeadsSyncedCount = 0;
@@ -2532,6 +2565,53 @@ function buildWorkflowSyncGroups(records = []) {
     }
     return left.workflow.localeCompare(right.workflow);
   });
+}
+
+function buildSyncBatchRecord(record) {
+  return {
+    id: record.id,
+    type: record.syncType || record.type,
+    platform: record.platform,
+    workflow: record.workflow,
+    payload: record.syncPayload || record.payload,
+  };
+}
+
+function estimateSyncBatchRecordBytes(record) {
+  try {
+    return JSON.stringify(buildSyncBatchRecord(record)).length;
+  } catch {
+    return MAX_SYNC_REQUEST_PAYLOAD_BYTES;
+  }
+}
+
+function splitSyncGroupRecordsForRequests(records = []) {
+  const chunks = [];
+  let current = [];
+  let currentBytes = 0;
+
+  records.forEach((record) => {
+    const recordBytes = estimateSyncBatchRecordBytes(record);
+    const shouldStartNext =
+      current.length > 0 &&
+      (current.length >= MAX_SYNC_RECORDS_PER_REQUEST ||
+        currentBytes + recordBytes > MAX_SYNC_REQUEST_PAYLOAD_BYTES);
+
+    if (shouldStartNext) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+
+    current.push(record);
+    currentBytes += recordBytes;
+  });
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks;
 }
 
 function getSingleNoteType(payload) {
@@ -4281,7 +4361,7 @@ function normalizeDetailRecordItem(item, payload) {
   const rawItem = item && typeof item === 'object' ? item : {};
   const rawPayload = payload && typeof payload === 'object' ? payload : {};
 
-  return ensureBloggerMetricsFields({
+  return ensureBloggerMetricsFields(sanitizeListItemForStorage({
     ...rawItem,
     bloggerFollowersCount:
       rawItem.bloggerFollowersCount ??
@@ -4302,7 +4382,77 @@ function normalizeDetailRecordItem(item, payload) {
     bloggerAccountType: normalizeBloggerAccountType(
       rawItem.bloggerAccountType || rawPayload.bloggerAccountType,
     ),
-  });
+  }));
+}
+
+function truncateStorageString(value, maxLength = 240) {
+  const text = String(value || '').trim();
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
+function trimStorageStringList(value, maxItems = 3, maxLength = 360) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => truncateStorageString(item, maxLength))
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function sanitizeDomLocatorForStorage(locator) {
+  if (!locator || typeof locator !== 'object') {
+    return locator || null;
+  }
+
+  return {
+    ...locator,
+    className: truncateStorageString(locator.className, 160),
+    textSnippet: truncateStorageString(locator.textSnippet, 100),
+    cssPath: truncateStorageString(locator.cssPath, 240),
+    parentCssPath: truncateStorageString(locator.parentCssPath, 240),
+    imageFingerprints: trimStorageStringList(locator.imageFingerprints, 3, 220),
+    videoFingerprints: trimStorageStringList(locator.videoFingerprints, 2, 220),
+  };
+}
+
+function sanitizeDomMatchHintsForStorage(hints) {
+  if (!hints || typeof hints !== 'object') {
+    return hints || null;
+  }
+
+  return {
+    ...hints,
+    noteUrl: truncateStorageString(hints.noteUrl, 360),
+    noteUrlFingerprint: truncateStorageString(hints.noteUrlFingerprint, 220),
+    coverImageUrl: truncateStorageString(hints.coverImageUrl, 360),
+    coverImageFingerprint: truncateStorageString(
+      hints.coverImageFingerprint,
+      220,
+    ),
+    videoUrl: '',
+    videoUrlFingerprint: '',
+    titleSnippet: truncateStorageString(hints.titleSnippet, 80),
+    authorSnippet: truncateStorageString(hints.authorSnippet, 80),
+  };
+}
+
+function sanitizeListItemForStorage(item) {
+  if (!item || typeof item !== 'object') {
+    return item || {};
+  }
+
+  return {
+    ...item,
+    videoUrl: '',
+    videoUrls: [],
+    audioUrl: '',
+    audioUrls: [],
+    cardImageCandidates: trimStorageStringList(item.cardImageCandidates, 2, 360),
+    cardVideoCandidates: [],
+    domLocator: sanitizeDomLocatorForStorage(item.domLocator),
+    domMatchHints: sanitizeDomMatchHintsForStorage(item.domMatchHints),
+  };
 }
 
 function isDetailCaptureRecordType(type) {

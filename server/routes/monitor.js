@@ -4,14 +4,69 @@ import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js'
 
 const router = Router();
 
+function normalizeText(value) {
+  return String(value || '').trim();
+}
+
+function normalizeMonitorSubscriptionRow(row = {}) {
+  if (!row) return row;
+  return {
+    ...row,
+    accountUrl: row.account_url || '',
+    bloggerUrl: row.account_url || '',
+    bloggerNameSnapshot: row.name || '',
+    bloggerName: row.name || '',
+    platformBloggerId: row.keyword || '',
+    notifyOnNegative: Boolean(row.notify_on_negative),
+    cadenceMinutes: Number(row.cadence_minutes || 0),
+    lastCursor: row.last_cursor || '',
+    lastRunAt: row.last_run_at || null,
+    nextRunAt: row.next_run_at || null,
+    lastError: row.last_error || '',
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function resolveSubscriptionInput(body = {}) {
+  const platform = normalizeText(body.platform);
+  const accountUrl = normalizeText(
+    body.accountUrl || body.bloggerUrl || body.profileUrl || body.authorUrl
+  );
+  const platformBloggerId = normalizeText(
+    body.platformBloggerId || body.bloggerId || body.authorId
+  );
+  const keyword = normalizeText(
+    body.keyword || platformBloggerId || body.bloggerNameSnapshot || body.name || accountUrl
+  );
+  const name = normalizeText(
+    body.name || body.bloggerNameSnapshot || body.bloggerName || keyword
+  );
+
+  return {
+    name,
+    keyword,
+    platform,
+    accountUrl,
+    notifyOnNegative: body.notifyOnNegative ?? 1,
+    cadenceMinutes: Number(body.cadenceMinutes) || 1440,
+  };
+}
+
 router.get('/subscriptions', requireTenantAccess, async (req, res, next) => {
   try {
-    const { status = 'all' } = req.query;
+    const { status = 'all', platform = '' } = req.query;
     const params = [req.tenantId];
     let sql = 'SELECT * FROM monitor_subscriptions WHERE tenant_id = $1';
     if (status !== 'all') { params.push(status); sql += ` AND status = $${params.length}`; }
+    if (platform) { params.push(platform); sql += ` AND platform = $${params.length}`; }
     sql += ' ORDER BY created_at DESC';
-    return res.json({ ok: true, subscriptions: await queryAll(sql, params) });
+    const subscriptions = (await queryAll(sql, params)).map(normalizeMonitorSubscriptionRow);
+    return res.json({
+      ok: true,
+      subscriptions,
+      data: { items: subscriptions },
+    });
   } catch (err) {
     return next(err);
   }
@@ -19,19 +74,75 @@ router.get('/subscriptions', requireTenantAccess, async (req, res, next) => {
 
 router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    const { name, keyword, platform = '', accountUrl = '', notifyOnNegative = 1, cadenceMinutes = 1440 } = req.body;
-    if (!keyword) return res.json({ ok: false, error: 'invalid_request', message: '关键词不能为空' });
-    const result = await execute(`
+    const input = resolveSubscriptionInput(req.body);
+    if (!input.keyword) {
+      return res.json({ ok: false, error: 'invalid_request', message: '账号 ID 或关键词不能为空' });
+    }
+
+    const existing = await queryOne(`
+      SELECT * FROM monitor_subscriptions
+      WHERE tenant_id = $1
+        AND platform = $2
+        AND (
+          keyword = $3
+          OR (account_url <> '' AND account_url = $4)
+        )
+      ORDER BY status = 'deleted', created_at DESC
+      LIMIT 1
+    `, [req.tenantId, input.platform, input.keyword, input.accountUrl]);
+
+    if (existing) {
+      if (existing.status === 'deleted') {
+        const restored = await queryOne(`
+          UPDATE monitor_subscriptions
+          SET status = 'active',
+            name = $1,
+            keyword = $2,
+            account_url = $3,
+            notify_on_negative = $4,
+            cadence_minutes = $5,
+            next_run_at = now(),
+            updated_at = now()
+          WHERE id = $6 AND tenant_id = $7
+          RETURNING *
+        `, [
+          input.name || input.keyword,
+          input.keyword,
+          input.accountUrl,
+          Boolean(input.notifyOnNegative),
+          input.cadenceMinutes,
+          existing.id,
+          req.tenantId,
+        ]);
+        return res.json({
+          ok: true,
+          id: restored.id,
+          data: { restored: true, item: normalizeMonitorSubscriptionRow(restored) },
+        });
+      }
+
+      return res.json({
+        ok: true,
+        id: existing.id,
+        data: { created: false, item: normalizeMonitorSubscriptionRow(existing) },
+      });
+    }
+
+    const result = await queryOne(`
       INSERT INTO monitor_subscriptions (
         tenant_id, name, keyword, platform, account_url, notify_on_negative,
         cadence_minutes, auth_code, next_run_at
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-      RETURNING id
+      RETURNING *
     `, [
-      req.tenantId, name || keyword, keyword, platform, accountUrl,
-      Boolean(notifyOnNegative), Number(cadenceMinutes) || 1440, req.authCode || '',
+      req.tenantId, input.name || input.keyword, input.keyword, input.platform, input.accountUrl,
+      Boolean(input.notifyOnNegative), input.cadenceMinutes, req.authCode || '',
     ]);
-    return res.json({ ok: true, id: result.lastInsertRowid });
+    return res.json({
+      ok: true,
+      id: result.id,
+      data: { created: true, item: normalizeMonitorSubscriptionRow(result) },
+    });
   } catch (err) {
     return next(err);
   }
@@ -209,20 +320,81 @@ router.put('/settings', requireTenantAccess, requireTenantWriter, async (req, re
 
 router.post('/run-now', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    const { subscriptionId } = req.body;
-    const sub = await queryOne(
-      'SELECT * FROM monitor_subscriptions WHERE id = $1 AND tenant_id = $2',
-      [subscriptionId, req.tenantId]
-    );
-    if (!sub) return res.json({ ok: false, error: 'not_found', message: '订阅不存在' });
+    const { subscriptionId, platform = '', limit } = req.body;
+    const params = [req.tenantId];
+    let sql = `
+      SELECT *
+      FROM monitor_subscriptions
+      WHERE tenant_id = $1
+        AND status = 'active'
+    `;
 
-    const result = await execute(`
-      INSERT INTO monitor_executions (tenant_id, subscription_id, status)
-      VALUES ($1, $2, 'pending')
-      RETURNING id
-    `, [req.tenantId, subscriptionId]);
+    if (subscriptionId) {
+      params.push(subscriptionId);
+      sql += ` AND id = $${params.length}`;
+    }
+    if (!subscriptionId && platform) {
+      params.push(platform);
+      sql += ` AND platform = $${params.length}`;
+    }
 
-    return res.json({ ok: true, executionId: result.lastInsertRowid, message: '已创建执行任务' });
+    params.push(Math.min(50, Math.max(1, Number(limit) || 50)));
+    sql += ` ORDER BY created_at DESC LIMIT $${params.length}`;
+
+    const subscriptions = await queryAll(sql, params);
+    if (subscriptionId && subscriptions.length === 0) {
+      return res.json({ ok: false, error: 'not_found', message: '订阅不存在' });
+    }
+
+    const items = [];
+    for (const sub of subscriptions) {
+      const existing = await queryOne(`
+        SELECT id, status
+        FROM monitor_executions
+        WHERE tenant_id = $1
+          AND subscription_id = $2
+          AND status IN ('pending', 'running')
+        ORDER BY created_at DESC
+        LIMIT 1
+      `, [req.tenantId, sub.id]);
+
+      if (existing) {
+        items.push({
+          subscriptionId: sub.id,
+          executionId: existing.id,
+          platform: sub.platform,
+          status: 'queued',
+          queued: true,
+          existing: true,
+        });
+        continue;
+      }
+
+      const result = await queryOne(`
+        INSERT INTO monitor_executions (tenant_id, subscription_id, status)
+        VALUES ($1, $2, 'pending')
+        RETURNING id
+      `, [req.tenantId, sub.id]);
+
+      items.push({
+        subscriptionId: sub.id,
+        executionId: result.id,
+        platform: sub.platform,
+        status: 'queued',
+        queued: true,
+        existing: false,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      executionId: items[0]?.executionId || null,
+      message: items.length > 0 ? `已创建 ${items.length} 个执行任务` : '暂无可执行监控项',
+      data: {
+        items,
+        total: items.length,
+      },
+    });
   } catch (err) {
     return next(err);
   }

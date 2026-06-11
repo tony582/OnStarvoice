@@ -3,7 +3,7 @@ import { withTransaction } from '../db/init.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
-  'tags', 'image_urls', 'comments_text', 'video_url', 'audio_url', 'payload',
+  'tags', 'image_urls', 'comments_text', 'video_url', 'audio_url', 'source_type', 'payload',
 ];
 
 function sha256(value) {
@@ -169,12 +169,13 @@ export async function upsertCapturedRecord(record, context) {
           video_duration = COALESCE(NULLIF($27, ''), video_duration),
           capture_timestamp = COALESCE(NULLIF($28, ''), capture_timestamp),
           keyword = COALESCE(NULLIF($29, ''), keyword),
-          payload = $30::jsonb,
-          auth_code = COALESCE(NULLIF($31, ''), auth_code),
+          source_type = COALESCE(NULLIF($30, ''), source_type),
+          payload = $31::jsonb,
+          auth_code = COALESCE(NULLIF($32, ''), auth_code),
           last_seen_at = now(),
           seen_count = seen_count + 1,
           updated_at = now()
-        WHERE id = $32
+        WHERE id = $33
       `, [
         record.record_type, record.title, record.content,
         record.author_name, record.author_id, record.author_avatar,
@@ -189,6 +190,7 @@ export async function upsertCapturedRecord(record, context) {
         record.video_url, record.audio_url, record.video_duration,
         record.capture_timestamp,
         record.keyword,
+        record.source_type || '',
         payload,
         authCode,
         existing.id,
@@ -224,7 +226,7 @@ export async function upsertCapturedRecord(record, context) {
         video_url, audio_url, video_duration,
         comments_capture_status, comments_total_captured,
         capture_timestamp,
-        keyword, payload, auth_code, content_hash
+        keyword, source_type, payload, auth_code, content_hash
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10,
@@ -236,7 +238,7 @@ export async function upsertCapturedRecord(record, context) {
         $26, $27, $28,
         $29, $30,
         $31,
-        $32, $33::jsonb, $34, $35
+        $32, $33, $34::jsonb, $35, $36
       )
       RETURNING id
     `, [
@@ -251,7 +253,7 @@ export async function upsertCapturedRecord(record, context) {
       record.video_url || '', record.audio_url || '', record.video_duration || '',
       record.comments_capture_status || '', cleanNumber(record.comments_total_captured),
       record.capture_timestamp || '',
-      record.keyword || '', payload, authCode, contentHash,
+      record.keyword || '', record.source_type || '', payload, authCode, contentHash,
     ]);
 
     const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });
