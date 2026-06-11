@@ -8,46 +8,35 @@ interface KpiCardProps {
   tone?: 'default' | 'destructive' | 'warning'
 }
 
-const toneStyles = {
-  default: {
-    iconBg: 'bg-primary/10 text-primary',
-  },
-  destructive: {
-    iconBg: 'bg-destructive/10 text-destructive',
-  },
-  warning: {
-    iconBg: 'bg-warning/10 text-warning',
-  },
+const TONES = {
+  default: { icon: 'from-indigo-500/15 to-indigo-500/5 text-indigo-500 dark:from-indigo-400/15 dark:to-indigo-400/5 dark:text-indigo-400', glow: 'shadow-indigo-500/5' },
+  destructive: { icon: 'from-rose-500/15 to-rose-500/5 text-rose-500 dark:from-rose-400/15 dark:to-rose-400/5 dark:text-rose-400', glow: 'shadow-rose-500/5' },
+  warning: { icon: 'from-amber-500/15 to-amber-500/5 text-amber-500 dark:from-amber-400/15 dark:to-amber-400/5 dark:text-amber-400', glow: 'shadow-amber-500/5' },
 }
 
 export function KpiCard({ label, value, icon: Icon, tone = 'default' }: KpiCardProps) {
-  const styles = toneStyles[tone]
+  const t = TONES[tone]
   return (
-    <div className="group relative overflow-hidden rounded-xl border border-border bg-card p-5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg">
-      {/* Gradient border glow on hover */}
-      <div className="pointer-events-none absolute inset-0 rounded-xl opacity-0 transition-opacity duration-200 group-hover:opacity-100"
-        style={{
-          background: 'linear-gradient(135deg, transparent 40%, rgba(59,130,246,0.08) 100%)',
-          mask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
-          WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
-          WebkitMaskComposite: 'xor',
-          maskComposite: 'exclude',
-          padding: '1px',
-        }}
-      />
-      <div className="flex items-start gap-4">
-        <div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-xl', styles.iconBg)}>
-          <Icon className="h-5 w-5" strokeWidth={1.8} />
+    <div className={cn(
+      'group relative overflow-hidden rounded-2xl border border-border bg-card p-5 transition-all duration-300',
+      'hover:-translate-y-1 hover:shadow-xl', t.glow
+    )}>
+      {/* Corner glow on hover */}
+      <div className="pointer-events-none absolute -right-6 -top-6 h-24 w-24 rounded-full bg-gradient-to-br from-primary/10 to-transparent opacity-0 blur-2xl transition-opacity duration-300 group-hover:opacity-100" />
+
+      <div className="relative flex items-start gap-4">
+        <div className={cn('flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br', t.icon)}>
+          <Icon className="h-[22px] w-[22px]" strokeWidth={1.6} />
         </div>
         <div className="min-w-0">
           <div className={cn(
-            'text-3xl font-extrabold tabular-nums tracking-tight',
-            tone === 'destructive' && 'text-destructive',
-            tone === 'warning' && 'text-warning',
+            'text-[28px] font-extrabold tabular-nums leading-none tracking-tight',
+            tone === 'destructive' && 'text-rose-500 dark:text-rose-400',
+            tone === 'warning' && 'text-amber-500 dark:text-amber-400',
           )}>
             {formatNumber(value)}
           </div>
-          <div className="mt-1 text-xs font-semibold text-muted-foreground">{label}</div>
+          <div className="mt-2 text-[12px] font-semibold text-muted-foreground">{label}</div>
         </div>
       </div>
     </div>

@@ -63,9 +63,11 @@ function AppContent() {
   return (
     <div className="flex min-h-screen">
       <Sidebar activePage={page} onNavigate={navigate} />
-      <main className="ml-60 min-w-0 flex-1 p-8">
+      <main className="ml-[240px] min-w-0 flex-1 px-10 py-8">
         <TopBar eyebrow={config.eyebrow} title={config.title} />
-        <PageComponent key={page} />
+        <div className="animate-fade-up" key={page}>
+          <PageComponent />
+        </div>
       </main>
     </div>
   )
