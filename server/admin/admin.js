@@ -6,6 +6,39 @@ const state = {
   cache: new Map(),
 };
 
+function toggleTheme() {
+  const html = document.documentElement;
+  const isDark = html.getAttribute('data-theme') === 'dark';
+  if (isDark) {
+    html.removeAttribute('data-theme');
+    localStorage.setItem('osv_theme', 'light');
+  } else {
+    html.setAttribute('data-theme', 'dark');
+    localStorage.setItem('osv_theme', 'dark');
+  }
+}
+
+const ICONS = {
+  overview: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+  triage: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>',
+  issues: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+  reports: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+  monitor: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><path d="M20.2 20.2c2.04-2.03.02-7.36-4.5-11.9-4.54-4.52-9.87-6.54-11.9-4.5-2.04 2.03-.02 7.36 4.5 11.9 4.54 4.52 9.87 6.54 11.9 4.5Z"/><path d="M15.7 15.7c4.52-4.54 6.54-9.87 4.5-11.9-2.03-2.04-7.36-.02-11.9 4.5-4.52 4.54-6.54 9.87-4.5 11.9 2.03 2.04 7.36.02 11.9-4.5Z"/></svg>',
+  data: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+  tenants: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>',
+  users: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  'auth-codes': '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
+  settings: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+};
+
+const KPI_ICONS = {
+  today: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>',
+  negative: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  issues: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+  triage: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+  label: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>',
+};
+
 const NAV = [
   { section: 'Workspace', items: [
     { id: 'overview', label: '总览' },
@@ -69,6 +102,13 @@ const LABELS = {
 };
 
 document.addEventListener('DOMContentLoaded', boot);
+
+// Close action dropdowns on outside click
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.action-dropdown')) {
+    document.querySelectorAll('.action-dropdown.open').forEach(d => d.classList.remove('open'));
+  }
+});
 
 async function boot() {
   try {
@@ -165,7 +205,8 @@ function renderNav() {
     if (group.internal && !isInternal()) return '';
     const items = group.items.map(item => {
       if (item.platformAdmin && state.user.globalRole !== 'platform_admin') return '';
-      return `<button class="nav-item" data-page="${escAttr(item.id)}" onclick="loadPage('${escAttr(item.id)}')"><span>${esc(item.label)}</span></button>`;
+      const icon = ICONS[item.id] || '';
+      return `<button class="nav-item" data-page="${escAttr(item.id)}" onclick="loadPage('${escAttr(item.id)}')"><span class="nav-icon">${icon}</span><span>${esc(item.label)}</span></button>`;
     }).join('');
     return `<div class="nav-section">${esc(group.section)}</div>${items}`;
   }).join('');
@@ -214,17 +255,17 @@ async function renderOverview() {
   const k = data.kpi || {};
   el.innerHTML = `
     <div class="kpi-grid">
-      ${kpi('今日新增', k.today_new)}
-      ${kpi('负面内容', k.negative_period, 'negative')}
-      ${kpi('待处理问题', k.open_issues, 'warning')}
-      ${kpi('高危问题', k.high_open_issues, 'negative')}
-      ${kpi('待分诊', k.unhandled, 'warning')}
-      ${kpi('待标注', k.pending_label)}
+      ${kpi('今日新增', k.today_new, '', KPI_ICONS.today)}
+      ${kpi('负面内容', k.negative_period, 'negative', KPI_ICONS.negative)}
+      ${kpi('待处理问题', k.open_issues, 'warning', KPI_ICONS.issues)}
+      ${kpi('高危问题', k.high_open_issues, 'negative', KPI_ICONS.negative)}
+      ${kpi('待分诊', k.unhandled, 'warning', KPI_ICONS.triage)}
+      ${kpi('待标注', k.pending_label, '', KPI_ICONS.label)}
     </div>
     <div class="layout-grid">
       <div>
-        ${panel('需要处理', renderPendingRecords(data.pendingRecords || []))}
-        ${panel('风险趋势', renderTrend(data.riskTrend || []))}
+        ${panel('需要处理', renderPendingRecords(data.pendingRecords || []), 'panel-accent')}
+        ${panel('风险趋势（近7日）', renderTrend(data.riskTrend || []))}
       </div>
       <div>
         ${panel('平台覆盖', renderPlatformCoverage(data.platformCoverage || []))}
@@ -237,31 +278,42 @@ async function renderOverview() {
 
 async function renderTriage() {
   const el = content();
+  const statusTabs = [
+    { value: '', label: '待处理', icon: '📥' },
+    { value: 'unhandled', label: '新线索', icon: '🆕' },
+    { value: 'reviewing', label: '待复核', icon: '🔍' },
+    { value: 'issue_linked', label: '已转问题', icon: '🔗' },
+    { value: 'official_responded', label: '已响应', icon: '✅' },
+    { value: 'archived', label: '已归档', icon: '📦' },
+  ];
   el.innerHTML = `
+    <div class="filter-tabs" id="triageStatusTabs">
+      ${statusTabs.map(t => `<button class="filter-tab ${t.value === '' ? 'active' : ''}" data-value="${escAttr(t.value)}" onclick="setTriageStatus(this)">${t.icon} ${esc(t.label)}</button>`).join('')}
+    </div>
     <div class="toolbar">
       <div class="toolbar-left">
-        <select id="triageStatus" onchange="loadTriageTable()">
-          <option value="">待处理</option>
-          ${option('unhandled', '新线索')}
-          ${option('reviewing', '待复核')}
-          ${option('issue_linked', '已转问题')}
-          ${option('official_responded', '官方已响应')}
-          ${option('archived', '已归档')}
-          ${option('false_positive', '误报')}
-        </select>
         <select id="triageSentiment" onchange="loadTriageTable()">
           <option value="">全部情感</option>
-          ${option('negative', '负面')}
-          ${option('neutral', '中性')}
-          ${option('positive', '正面')}
+          ${option('negative', '🔴 负面')}
+          ${option('neutral', '⚪ 中性')}
+          ${option('positive', '🟢 正面')}
         </select>
-        <input id="triageKeyword" placeholder="搜索标题/正文/关键词" onkeydown="if(event.key==='Enter')loadTriageTable()">
-        <button class="secondary" onclick="loadTriageTable()">筛选</button>
+        <div class="search-box">
+          <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input id="triageKeyword" placeholder="搜索标题、正文、关键词…" onkeydown="if(event.key==='Enter')loadTriageTable()">
+        </div>
       </div>
     </div>
+    <input type="hidden" id="triageStatus" value="">
     <div id="triageTable"></div>
   `;
   await loadTriageTable();
+}
+
+function setTriageStatus(btn) {
+  document.getElementById('triageStatus').value = btn.dataset.value;
+  document.querySelectorAll('#triageStatusTabs .filter-tab').forEach(t => t.classList.toggle('active', t === btn));
+  loadTriageTable();
 }
 
 async function loadTriageTable(page = 1) {
@@ -510,12 +562,17 @@ function officialResponseCell(record) {
 
 function triageActions(r) {
   if (!canWrite()) return '';
-  return `<div class="action-row">
+  return `<div class="action-group">
     <button class="primary" onclick="linkRecordIssue('${escAttr(r.id)}')">转问题</button>
-    <button class="secondary" onclick="markOfficialResponded('${escAttr(r.id)}')">标为已响应</button>
-    <button class="secondary" onclick="updateTriage('${escAttr(r.id)}','reviewing')">待复核</button>
-    <button class="secondary" onclick="updateTriage('${escAttr(r.id)}','archived')">归档</button>
-    <button class="secondary" onclick="updateTriage('${escAttr(r.id)}','false_positive')">误报</button>
+    <div class="action-dropdown">
+      <button class="secondary action-more" onclick="this.parentElement.classList.toggle('open')">更多 ▾</button>
+      <div class="action-menu">
+        <button onclick="markOfficialResponded('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">✅ 标为已响应</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','reviewing'); this.closest('.action-dropdown').classList.remove('open')">🔍 待复核</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','archived'); this.closest('.action-dropdown').classList.remove('open')">📦 归档</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','false_positive'); this.closest('.action-dropdown').classList.remove('open')">🚫 误报</button>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -887,28 +944,59 @@ async function saveOfficialAccounts() {
 }
 
 function renderPendingRecords(records) {
-  if (!records.length) return '<div class="empty-state">暂无待处理内容</div>';
-  return `<div class="mini-list">${records.map(r => `<div class="mini-item"><strong>${esc(r.title || r.content || '(无标题)')}</strong><span class="subtext">${esc(platformName(r.platform))} · ${badge(LABELS.sentiment[r.sentiment] || '待标注', r.sentiment || 'muted')} · ${n(r.likes + r.comments_count + r.collects + r.shares)} 互动</span></div>`).join('')}</div>`;
+  if (!records.length) return emptyState('📭', '暂无待处理内容', '所有舆情内容已处理完毕');
+  return `<div class="mini-list">${records.slice(0, 8).map(r => {
+    const interactions = Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0);
+    return `<div class="mini-item">
+      <div class="mini-item-row"><strong class="truncate">${esc(r.title || r.content || '(无标题)')}</strong>${badge(LABELS.sentiment[r.sentiment] || '待标注', r.sentiment || 'muted')}</div>
+      <span class="subtext">${badge(platformName(r.platform), 'neutral')} <span>${n(interactions)} 互动</span></span>
+    </div>`;
+  }).join('')}</div>`;
 }
 
 function renderTrend(rows) {
-  if (!rows.length) return '<div class="empty-state">暂无趋势数据</div>';
-  return `<div class="mini-list">${rows.map(r => `<div class="metric-line"><span>${esc(r.day)}</span><strong>${n(r.total)} / ${n(r.negative)} 负面</strong></div>`).join('')}</div>`;
+  if (!rows.length) return emptyState('📊', '暂无趋势数据', '采集数据后将显示风险趋势');
+  const maxTotal = Math.max(...rows.map(r => Number(r.total) || 1), 1);
+  return `<div class="trend-chart">${rows.map(r => {
+    const total = Number(r.total) || 0;
+    const neg = Number(r.negative) || 0;
+    const pct = Math.round(total / maxTotal * 100);
+    const negPct = total > 0 ? Math.round(neg / total * 100) : 0;
+    const dayLabel = String(r.day || '').slice(5);
+    return `<div class="trend-bar-group">
+      <div class="trend-bar-wrap">
+        <div class="trend-bar" style="height:${pct}%">
+          ${neg > 0 ? `<div class="trend-bar-neg" style="height:${negPct}%"></div>` : ''}
+        </div>
+      </div>
+      <span class="trend-label">${esc(dayLabel)}</span>
+      <span class="trend-value">${n(total)}</span>
+    </div>`;
+  }).join('')}</div>
+  <div class="trend-legend"><span class="trend-legend-item"><span class="trend-dot trend-dot-total"></span>总计</span><span class="trend-legend-item"><span class="trend-dot trend-dot-neg"></span>负面</span></div>`;
 }
 
 function renderPlatformCoverage(rows) {
-  if (!rows.length) return '<div class="empty-state">暂无平台数据</div>';
-  return rows.map(r => metric(platformName(r.platform), `${n(r.count)} 条 · 新增 ${n(r.period_new)} · ${date(r.last_seen_at)}`)).join('');
+  if (!rows.length) return emptyState('🌐', '暂无平台数据', '开始采集后将显示平台覆盖');
+  const platformIcons = { weibo: '🔴', xiaohongshu: '📕', douyin: '🎵' };
+  return `<div class="platform-list">${rows.map(r => `<div class="platform-row">
+    <span class="platform-icon">${platformIcons[r.platform] || '🌐'}</span>
+    <div class="platform-info">
+      <strong>${esc(platformName(r.platform))}</strong>
+      <span class="subtext">${n(r.count)} 条 · 新增 ${n(r.period_new)}</span>
+    </div>
+    <span class="subtext">${date(r.last_seen_at)}</span>
+  </div>`).join('')}</div>`;
 }
 
 function renderReportMini(rows) {
-  if (!rows.length) return '<div class="empty-state">暂无报告</div>';
-  return rows.map(r => `<div class="mini-item"><strong>${esc(LABELS.reportType[r.report_type] || r.report_type)} ${badge(LABELS.reportStatus[r.status] || r.status, r.status)}</strong><span class="subtext">${esc(dateRange(r.period_start, r.period_end))}</span></div>`).join('');
+  if (!rows.length) return emptyState('📄', '暂无报告', '可在报告中心生成日报/周报');
+  return `<div class="mini-list">${rows.map(r => `<div class="mini-item"><div class="mini-item-row"><strong>${esc(LABELS.reportType[r.report_type] || r.report_type)}</strong>${badge(LABELS.reportStatus[r.status] || r.status, r.status)}</div><span class="subtext">${esc(dateRange(r.period_start, r.period_end))}</span></div>`).join('')}</div>`;
 }
 
 function renderMonitorMini(rows) {
-  if (!rows.length) return '<div class="empty-state">暂无监控任务</div>';
-  return rows.map(r => `<div class="mini-item"><strong>${esc(r.name || r.keyword)} ${badge(r.status, r.status)}</strong><span class="subtext">${esc(platformName(r.platform))} · 下次 ${date(r.next_run_at)}</span></div>`).join('');
+  if (!rows.length) return emptyState('🛰️', '暂无监控任务', '可在监控任务页创建关键词监控');
+  return `<div class="mini-list">${rows.map(r => `<div class="mini-item"><div class="mini-item-row"><strong>${esc(r.name || r.keyword)}</strong>${badge(r.status === 'active' ? '运行中' : r.status, r.status)}</div><span class="subtext">${esc(platformName(r.platform))} · 下次 ${date(r.next_run_at)}</span></div>`).join('')}</div>`;
 }
 
 function paginationHtml(p, handlerName) {
@@ -918,12 +1006,19 @@ function paginationHtml(p, handlerName) {
   return `<div class="toolbar"><div class="subtext">共 ${n(p.total)} 条</div><div class="action-row"><button class="secondary" ${current <= 1 ? 'disabled' : ''} onclick="${escAttr(handlerName)}(${current - 1})">上一页</button><span class="subtext">${current} / ${total}</span><button class="secondary" ${current >= total ? 'disabled' : ''} onclick="${escAttr(handlerName)}(${current + 1})">下一页</button></div></div>`;
 }
 
-function kpi(label, value, tone = '') {
-  return `<div class="kpi ${tone}"><strong>${n(value)}</strong><span>${esc(label)}</span></div>`;
+function kpi(label, value, tone = '', icon = '') {
+  return `<div class="kpi ${tone}">
+    ${icon ? `<div class="kpi-icon">${icon}</div>` : ''}
+    <div class="kpi-content"><strong>${n(value)}</strong><span>${esc(label)}</span></div>
+  </div>`;
 }
 
-function panel(title, body) {
-  return `<section class="panel"><div class="panel-head"><h2>${esc(title)}</h2></div><div class="panel-body">${body}</div></section>`;
+function panel(title, body, extraClass = '') {
+  return `<section class="panel ${extraClass}"><div class="panel-head"><h2>${esc(title)}</h2></div><div class="panel-body">${body}</div></section>`;
+}
+
+function emptyState(icon, title, desc = '') {
+  return `<div class="empty-state"><div class="empty-icon">${icon}</div><div class="empty-title">${esc(title)}</div>${desc ? `<div class="empty-desc">${esc(desc)}</div>` : ''}</div>`;
 }
 
 function metric(label, value, raw = false) {
@@ -1053,7 +1148,7 @@ function content() {
 }
 
 function loading() {
-  return '<div class="empty-state">加载中...</div>';
+  return '<div class="skeleton-grid"><div class="skeleton-row" style="width:60%;height:20px"></div><div class="skeleton-row" style="width:100%;height:48px"></div><div class="skeleton-row" style="width:80%;height:14px"></div><div class="skeleton-row" style="width:45%;height:14px"></div></div>';
 }
 
 function emptyRow(cols) {

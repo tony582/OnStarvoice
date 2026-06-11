@@ -15,6 +15,18 @@ const CATEGORY_LABEL = {
 };
 const ACCOUNT_TYPE_LABEL = { enterprise: '企业号', personal: '个人号', professional: '专业号' };
 
+function toggleTheme() {
+  var html = document.documentElement;
+  var isDark = html.getAttribute('data-theme') === 'dark';
+  if (isDark) {
+    html.removeAttribute('data-theme');
+    localStorage.setItem('osv_theme', 'light');
+  } else {
+    html.setAttribute('data-theme', 'dark');
+    localStorage.setItem('osv_theme', 'dark');
+  }
+}
+
 // ==================== API ====================
 
 async function api(path, options) {
@@ -147,22 +159,30 @@ async function loadRecords(page) {
     return;
   }
 
-  var typeIcon = function(r) {
-    return r.video_url ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>';
+  var thumbHtml = function(r) {
+    var cover = r.cover_url || '';
+    if (!cover) {
+      try { var imgs = JSON.parse(r.image_urls || '[]'); if (imgs.length) cover = typeof imgs[0] === 'string' ? imgs[0] : (imgs[0].url || ''); } catch(e) {}
+    }
+    var icon = r.video_url ? '▶' : '📷';
+    if (cover && /^https?:\/\//i.test(cover)) {
+      return '<div class="cell-thumb"><img src="' + escHtml(cover) + '" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.textContent=\'' + icon + '\'"></div>';
+    }
+    return '<div class="cell-thumb">' + icon + '</div>';
   };
 
-  el.innerHTML = '<table><thead><tr><th>类型</th><th>标题</th><th>平台</th><th>博主</th><th>粉丝</th><th>互动数据</th><th>情感</th><th>评论采集</th><th>采集时间</th></tr></thead><tbody>' +
+  el.innerHTML = '<table><thead><tr><th></th><th>内容</th><th>平台</th><th>博主</th><th>粉丝</th><th>互动数据</th><th>情感</th><th>评论</th><th>时间</th></tr></thead><tbody>' +
     data.records.map(function(r, idx) {
       var contentPreview = r.content ? r.content.slice(0, 50) : '';
       if (r.content && r.content.length > 50) contentPreview += '...';
       return '<tr onclick="showRecordDetail(' + idx + ')">' +
-        '<td>' + typeIcon(r) + '</td>' +
-        '<td><div class="cell-title">' + escHtml(r.title || '(无标题)') + (contentPreview ? '<div class="preview">' + escHtml(contentPreview) + '</div>' : '') + '</div></td>' +
-        '<td>' + escHtml(PLATFORM_LABEL[r.platform] || r.platform) + '</td>' +
+        '<td>' + thumbHtml(r) + '</td>' +
+        '<td><div class="cell-title"><div class="cell-title-text">' + escHtml(r.title || '(无标题)') + '</div>' + (contentPreview ? '<div class="preview">' + escHtml(contentPreview) + '</div>' : '') + '</div></td>' +
+        '<td><span class="badge badge-type">' + escHtml(PLATFORM_LABEL[r.platform] || r.platform) + '</span></td>' +
         '<td class="cell-truncate">' + escHtml(r.author_name || '-') + '</td>' +
         '<td class="cell-nowrap">' + (r.author_fans > 0 ? formatNum(r.author_fans) : '-') + '</td>' +
-        '<td class="cell-nowrap">' + r.likes + ' / ' + r.comments_count + ' / ' + r.collects + ' / ' + (r.shares || 0) + '</td>' +
-        '<td>' + (r.sentiment ? '<span class="badge badge-' + escHtml(r.sentiment) + '">' + escHtml(SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '-') + '</td>' +
+        '<td class="cell-nowrap">' + formatNum(r.likes || 0) + ' / ' + formatNum(r.comments_count || 0) + ' / ' + formatNum(r.collects || 0) + ' / ' + formatNum(r.shares || 0) + '</td>' +
+        '<td>' + (r.sentiment ? '<span class="badge badge-' + escHtml(r.sentiment) + '">' + escHtml(SENTIMENT_LABEL[r.sentiment] || r.sentiment) + '</span>' : '<span class="badge badge-neutral">待标注</span>') + '</td>' +
         '<td>' + escHtml(r.comments_total_captured > 0 ? r.comments_total_captured + '条' : (r.comments_capture_status || '-')) + '</td>' +
         '<td class="cell-nowrap">' + escHtml(r.created_at ? r.created_at.slice(0, 10) : '-') + '</td>' +
         '</tr>';

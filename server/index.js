@@ -79,6 +79,10 @@ app.use((req, res, next) => {
 
 // ==================== 静态文件 ====================
 
+// React 构建产物
+app.use('/admin', express.static(join(__dirname, '..', 'web', 'admin', 'dist')));
+app.use('/dashboard', express.static(join(__dirname, '..', 'web', 'dashboard', 'dist')));
+// 旧版静态文件（向后兼容，作为 fallback）
 app.use('/admin', express.static(join(__dirname, 'admin')));
 app.use('/dashboard', express.static(join(__dirname, 'dashboard')));
 app.use('/images', express.static(join(__dirname, '..', 'images')));
@@ -122,6 +126,14 @@ app.post('/api/admin/generate-report', requireAdmin, async (req, res) => {
 
 app.get('/api/health', (req, res) => {
   return res.json({ ok: true, version: '0.1.0', uptime: process.uptime() });
+});
+
+// SPA fallback — 让 React Router 处理客户端路由
+app.get('/admin/*', (req, res) => {
+  res.sendFile(join(__dirname, '..', 'web', 'admin', 'dist', 'index.html'));
+});
+app.get('/dashboard/*', (req, res) => {
+  res.sendFile(join(__dirname, '..', 'web', 'dashboard', 'dist', 'index.html'));
 });
 
 app.get('/', (req, res) => { res.redirect('/admin'); });

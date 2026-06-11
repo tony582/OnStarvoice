@@ -1,0 +1,75 @@
+import { clsx, type ClassValue } from 'clsx'
+import { twMerge } from 'tailwind-merge'
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+
+export function formatNumber(v: number | string | undefined | null): string {
+  const num = Number(v)
+  if (isNaN(num)) return '0'
+  if (num >= 10000) return (num / 10000).toFixed(1) + '万'
+  return num.toLocaleString('zh-CN')
+}
+
+export function formatDate(v: string | undefined | null): string {
+  if (!v) return '-'
+  try {
+    const d = new Date(v)
+    if (isNaN(d.getTime())) return v
+    const now = new Date()
+    const diff = now.getTime() - d.getTime()
+    if (diff < 60000) return '刚刚'
+    if (diff < 3600000) return Math.floor(diff / 60000) + '分钟前'
+    if (diff < 86400000) return Math.floor(diff / 3600000) + '小时前'
+    return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+  } catch {
+    return v
+  }
+}
+
+export function formatFullDate(v: string | undefined | null): string {
+  if (!v) return '-'
+  try {
+    return new Date(v).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  } catch {
+    return v
+  }
+}
+
+export function compact(text: string, maxLen: number): string {
+  if (!text) return ''
+  return text.length > maxLen ? text.slice(0, maxLen) + '…' : text
+}
+
+export const LABELS = {
+  sentiment: { positive: '正面', neutral: '中性', negative: '负面', '': '待标注' } as Record<string, string>,
+  category: {
+    safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费',
+    privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量',
+    brand_image: '品牌形象', other: '其他', '': '待分类',
+  } as Record<string, string>,
+  triage: {
+    unhandled: '新线索', reviewing: '待复核', issue_linked: '已转问题',
+    official_responded: '官方已响应', archived: '已归档', false_positive: '误报',
+  } as Record<string, string>,
+  priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' } as Record<string, string>,
+  issueStatus: {
+    new: '新建', triage: '分诊', in_progress: '处理中', waiting: '等待',
+    review: '复核', resolved: '已解决', closed: '已关闭', ignored: '忽略',
+  } as Record<string, string>,
+  severity: { low: '低', medium: '中', high: '高', critical: '严重' } as Record<string, string>,
+  reportType: { daily: '日报', weekly: '周报', monthly: '月报' } as Record<string, string>,
+  reportStatus: { generating: '生成中', generated: '待发送', sent: '已发送', skipped: '无新增', failed: '失败' } as Record<string, string>,
+  role: {
+    platform_admin: '平台管理员', internal_operator: '内部运营',
+    tenant_admin: '客户管理员', tenant_analyst: '分析员', tenant_viewer: '只读',
+  } as Record<string, string>,
+  platform: {
+    xiaohongshu: '小红书', douyin: '抖音', weibo: '微博',
+  } as Record<string, string>,
+} as const
+
+export function platformName(key: string): string {
+  return LABELS.platform[key] || key || '-'
+}
