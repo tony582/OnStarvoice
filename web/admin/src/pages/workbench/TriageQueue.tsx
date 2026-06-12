@@ -12,8 +12,10 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
+import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
+import { Rows3, Kanban } from 'lucide-react'
 
 const STATUS_TABS = [
   { value: '', label: '待处理', icon: Inbox },
@@ -29,6 +31,8 @@ interface Pagination { page: number; totalPages: number; total: number }
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
+  const [view, setView] = useState<'list' | 'board'>('list')
+  const [boardNonce, setBoardNonce] = useState(0)
   const [status, setStatus] = useState(initial?.status ?? '')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
@@ -106,28 +110,45 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   return (
     <div className="space-y-5">
-      {/* Status tabs */}
-      <div className="flex flex-wrap gap-2 border-b border-border pb-4">
-        {STATUS_TABS.map(tab => {
-          const Icon = tab.icon
-          return (
-            <button key={tab.value} onClick={() => setStatus(tab.value)}
-              className={cn(
-                'inline-flex items-center gap-2 rounded-md border px-4 py-2 text-[13px] font-medium transition-colors duration-200',
-                status === tab.value
-                  ? 'border-primary bg-primary text-white'
-                  : 'border-border bg-card text-muted-foreground hover:border-primary/50 hover:text-primary'
-              )}>
-              <Icon className="h-3.5 w-3.5" strokeWidth={2} />
-              {tab.label}
+      {/* View switcher + status tabs */}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
+        {view === 'list' ? (
+          <div className="flex flex-wrap gap-2">
+            {STATUS_TABS.map(tab => {
+              const Icon = tab.icon
+              return (
+                <button key={tab.value} onClick={() => setStatus(tab.value)}
+                  className={cn(
+                    'inline-flex items-center gap-2 rounded-md border px-4 py-2 text-[13px] font-medium transition-colors duration-200',
+                    status === tab.value
+                      ? 'border-primary bg-primary text-white'
+                      : 'border-border bg-card text-muted-foreground hover:border-primary/50 hover:text-primary'
+                  )}>
+                  <Icon className="h-3.5 w-3.5" strokeWidth={2} />
+                  {tab.label}
+                </button>
+              )
+            })}
+          </div>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
+            <Kanban className="h-3.5 w-3.5" />拖动卡片即可改变处置状态
+          </span>
+        )}
+        <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
+          {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([v, label, Icon]) => (
+            <button key={v} onClick={() => setView(v)}
+              className={cn('inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors',
+                view === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
+              <Icon className="h-3.5 w-3.5" />{label}
             </button>
-          )
-        })}
+          ))}
+        </div>
       </div>
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-3">
-        {canWrite() && records.length > 0 && (
+        {view === 'list' && canWrite() && records.length > 0 && (
           <button onClick={() => sel.setAll(records.map(r => r.id), !allChecked)}
             className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
             <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
@@ -147,12 +168,21 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         <div className="relative flex-1 max-w-sm">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && load()} placeholder="搜索标题、正文、关键词…" className="pl-9" />
+            onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="pl-9" />
         </div>
       </div>
 
-      {/* Card list */}
-      {loading ? (
+      {/* Board view */}
+      {view === 'board' ? (
+        <TriageBoard
+          sentiment={sentiment}
+          keyword={keyword}
+          reloadKey={`${sentiment}|${boardNonce}`}
+          canWrite={canWrite()}
+          onOpen={setDrawerRecord}
+          refreshBadges={refreshBadges}
+        />
+      ) : loading ? (
         <div className="flex items-center justify-center py-16">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
