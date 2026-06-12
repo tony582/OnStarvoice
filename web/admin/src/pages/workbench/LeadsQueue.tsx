@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import {
   ChevronLeft, ChevronRight, ExternalLink, Loader2, MessageSquareWarning,
-  RefreshCw, Search,
+  RefreshCw, Search, CheckCheck, CircleSlash, Footprints,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { compact, formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
@@ -10,6 +10,9 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
+import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
+import { useAuth } from '@/lib/auth'
+import { useBadges } from '@/lib/badges'
 
 const STATUS_OPTIONS = [
   { value: '', label: '全部状态' },
@@ -18,7 +21,6 @@ const STATUS_OPTIONS = [
   { value: 'resolved', label: '已处理' },
   { value: 'ignored', label: '已忽略' },
 ]
-
 const TYPE_OPTIONS = [
   { value: '', label: '全部类型' },
   { value: 'complaint', label: '投诉维权' },
@@ -29,7 +31,6 @@ const TYPE_OPTIONS = [
   { value: 'brand_risk', label: '品牌风险' },
   { value: 'other', label: '其他跟进' },
 ]
-
 const PRIORITY_OPTIONS = [
   { value: '', label: '全部优先级' },
   { value: 'urgent', label: '紧急' },
@@ -37,7 +38,6 @@ const PRIORITY_OPTIONS = [
   { value: 'normal', label: '普通' },
   { value: 'low', label: '低' },
 ]
-
 const PLATFORM_OPTIONS = [
   { value: '', label: '全部平台' },
   { value: 'xiaohongshu', label: '小红书' },
@@ -45,18 +45,23 @@ const PLATFORM_OPTIONS = [
   { value: 'weibo', label: '微博' },
 ]
 
-export function CommentLeadsPage() {
+export function LeadsQueue({ initial }: { initial?: Record<string, string> }) {
+  const { canWrite } = useAuth()
+  const { refresh: refreshBadges } = useBadges()
   const [leads, setLeads] = useState<any[]>([])
   const [pagination, setPagination] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [status, setStatus] = useState('')
-  const [platform, setPlatform] = useState('')
-  const [leadType, setLeadType] = useState('')
-  const [priority, setPriority] = useState('')
-  const [keyword, setKeyword] = useState('')
+  const [status, setStatus] = useState(initial?.status ?? '')
+  const [platform, setPlatform] = useState(initial?.platform ?? '')
+  const [leadType, setLeadType] = useState(initial?.leadType ?? '')
+  const [priority, setPriority] = useState(initial?.priority ?? '')
+  const [keyword, setKeyword] = useState(initial?.keyword ?? '')
+  const [batchBusy, setBatchBusy] = useState(false)
 
-  const load = async (page = 1) => {
+  const sel = useSelection(`${status}|${platform}|${leadType}|${priority}|${keyword}|${pagination?.page ?? 1}`)
+
+  const load = useCallback(async (page = 1) => {
     setLoading(true)
     setError('')
     try {
@@ -74,22 +79,40 @@ export function CommentLeadsPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [status, platform, leadType, priority, keyword])
 
-  useEffect(() => { load(1) }, [status, platform, leadType, priority])
+  useEffect(() => { load(1) }, [status, platform, leadType, priority]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const reloadAfterMutation = useCallback(async () => {
+    const page = pagination?.page || 1
+    const willEmpty = leads.length <= 1 && page > 1
+    await load(willEmpty ? page - 1 : page)
+    refreshBadges()
+  }, [load, pagination, leads.length, refreshBadges])
 
   const updateLeadStatus = async (id: string, nextStatus: string) => {
     await api.patch('/leads/comments/' + id, { status: nextStatus })
-    await load(pagination?.page || 1)
+    await reloadAfterMutation()
   }
 
+  const runBatch = async (nextStatus: string) => {
+    if (sel.count === 0) return
+    setBatchBusy(true)
+    try {
+      await api.patch('/leads/comments/batch', { ids: [...sel.selected], status: nextStatus })
+      sel.clear()
+      await reloadAfterMutation()
+    } catch (err) { console.error(err) }
+    finally { setBatchBusy(false) }
+  }
+
+  const allChecked = leads.length > 0 && leads.every(l => sel.has(l.id))
+  const someChecked = leads.some(l => sel.has(l.id))
+
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-3 duration-300">
+    <div className="space-y-3">
       <WorkbenchTabs
-        tabs={STATUS_OPTIONS.map(option => ({
-          key: option.value,
-          label: option.value ? option.label : '全部线索',
-        }))}
+        tabs={STATUS_OPTIONS.map(option => ({ key: option.value, label: option.value ? option.label : '全部线索' }))}
         activeKey={status}
         onChange={setStatus}
       />
@@ -129,9 +152,14 @@ export function CommentLeadsPage() {
           <EmptyState icon={MessageSquareWarning} title="暂无评论线索" description="采集评论并完成判断后，需跟进的评论会沉淀到这里" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1100px] text-sm">
+            <table className="w-full min-w-[1140px] text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted">
+                  {canWrite() && (
+                    <th className="w-10 px-4 py-2.5">
+                      <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(l => l.id), !allChecked)} />
+                    </th>
+                  )}
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">原内容 / 评论</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">用户</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">类型</th>
@@ -143,7 +171,10 @@ export function CommentLeadsPage() {
               </thead>
               <tbody className="divide-y divide-border">
                 {leads.map(lead => (
-                  <tr key={lead.id} className="align-top transition-colors hover:bg-muted/30">
+                  <tr key={lead.id} className={`align-top transition-colors hover:bg-muted/30 ${sel.has(lead.id) ? 'bg-primary/[0.04]' : ''}`}>
+                    {canWrite() && (
+                      <td className="px-4 py-3"><Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} /></td>
+                    )}
                     <td className="max-w-[430px] px-4 py-3">
                       <div className="flex items-center gap-2">
                         <StatusBadge tone="neutral">{platformName(lead.platform)}</StatusBadge>
@@ -154,9 +185,7 @@ export function CommentLeadsPage() {
                         )}
                       </div>
                       <div className="mt-2 font-medium leading-5">{lead.record_title || '(无标题)'}</div>
-                      <div className="mt-1 text-xs leading-5 text-foreground">
-                        {lead.comment_content}
-                      </div>
+                      <div className="mt-1 text-xs leading-5 text-foreground">{lead.comment_content}</div>
                       {Array.isArray(lead.matched_keywords) && lead.matched_keywords.length > 0 && (
                         <div className="mt-2 flex flex-wrap gap-1">
                           {lead.matched_keywords.slice(0, 4).map((kw: string) => <StatusBadge key={kw} tone="muted">{kw}</StatusBadge>)}
@@ -176,9 +205,9 @@ export function CommentLeadsPage() {
                     <td className="px-4 py-3 text-xs text-muted-foreground">{formatDate(lead.captured_at)}</td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
-                        <Button variant="outline" size="sm" disabled={lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
-                        <Button variant="outline" size="sm" disabled={lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
-                        <Button variant="ghost" size="sm" disabled={lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
+                        <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
+                        <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
+                        <Button variant="ghost" size="sm" disabled={!canWrite() || lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
                       </div>
                     </td>
                   </tr>
@@ -199,6 +228,20 @@ export function CommentLeadsPage() {
           </div>
         )}
       </WorkbenchTableShell>
+
+      {canWrite() && (
+        <BatchBar
+          count={sel.count}
+          busy={batchBusy}
+          onClear={sel.clear}
+          onAction={key => runBatch(key)}
+          actions={[
+            { key: 'following', label: '跟进', icon: Footprints },
+            { key: 'resolved', label: '处理', icon: CheckCheck },
+            { key: 'ignored', label: '忽略', icon: CircleSlash, tone: 'danger' },
+          ]}
+        />
+      )}
     </div>
   )
 }

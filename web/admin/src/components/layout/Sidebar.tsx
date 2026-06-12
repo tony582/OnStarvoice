@@ -1,29 +1,28 @@
 import {
-  LayoutGrid, Activity, AlertCircle, FileText, Radar, BarChart3,
-  Database, Building2, Users, KeyRound, Settings, ChevronRight, MessageSquareWarning, Target,
+  LayoutGrid, Inbox, FileText, Radar, BarChart3,
+  Database, Building2, Users, KeyRound, Settings, ChevronRight, Target,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
 import { useBadges, type Badges } from '@/lib/badges'
 
 const ICON_MAP: Record<string, React.ElementType> = {
-  overview: LayoutGrid, triage: Activity, issues: AlertCircle, analytics: BarChart3, reports: FileText,
-  leads: MessageSquareWarning, monitor: Radar, 'monitor-hits': Target, data: Database, tenants: Building2, users: Users,
+  overview: LayoutGrid, workbench: Inbox, analytics: BarChart3, reports: FileText,
+  monitor: Radar, 'monitor-hits': Target, data: Database, tenants: Building2, users: Users,
   'auth-codes': KeyRound, settings: Settings,
 }
 
-type NavItem = { id: string; label: string; platformAdmin?: boolean; badgeKey?: keyof Badges }
+// badgeKeys: 该导航项汇总哪些徽标计数(舆情工作台汇总三队列)
+type NavItem = { id: string; label: string; platformAdmin?: boolean; badgeKeys?: Array<keyof Badges> }
 
 const NAV: Array<{ section: string; internal?: boolean; items: NavItem[] }> = [
   {
     section: 'WORKSPACE', items: [
       { id: 'overview', label: '总览' },
-      { id: 'triage', label: '舆情收件箱', badgeKey: 'triagePending' },
-      { id: 'leads', label: '评论线索', badgeKey: 'leadsNew' },
-      { id: 'issues', label: '问题处置', badgeKey: 'issuesOpen' },
+      { id: 'workbench', label: '舆情工作台', badgeKeys: ['triagePending', 'leadsNew', 'issuesOpen'] },
       { id: 'analytics', label: '数据看板' },
       { id: 'reports', label: '报告中心' },
-      { id: 'monitor', label: '监控任务', badgeKey: 'monitorAttention' },
+      { id: 'monitor', label: '监控任务', badgeKeys: ['monitorAttention'] },
       { id: 'monitor-hits', label: '监控命中' },
       { id: 'data', label: '数据资产' },
     ],
@@ -70,7 +69,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                 if (item.platformAdmin && !isPlatformAdmin()) return null
                 const Icon = ICON_MAP[item.id] || LayoutGrid
                 const active = activePage === item.id
-                const badgeCount = item.badgeKey ? badges[item.badgeKey] : 0
+                const badgeCount = (item.badgeKeys || []).reduce((sum, k) => sum + badges[k], 0)
+                const isAttention = item.badgeKeys?.includes('monitorAttention') && item.badgeKeys.length === 1
                 return (
                   <button key={item.id} onClick={() => onNavigate(item.id)}
                     className={cn(
@@ -87,7 +87,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                     {badgeCount > 0 && (
                       <span className={cn(
                         'relative z-10 ml-auto inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
-                        item.badgeKey === 'monitorAttention'
+                        isAttention
                           ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
                           : 'bg-primary/12 text-primary',
                       )}>

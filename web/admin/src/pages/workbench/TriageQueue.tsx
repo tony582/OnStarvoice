@@ -2,8 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Eye, Archive, Ban, Loader2, Bookmark, Link2, CircleCheck,
-  Package, Heart, MessageCircle, Star, Share2, User,
-  Clock, ScanSearch, FileText,
+  Package, Heart, MessageCircle, Star, Share2, User, Clock, ScanSearch, FileText,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
@@ -12,7 +11,9 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
+import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { useAuth } from '@/lib/auth'
+import { useBadges } from '@/lib/badges'
 
 const STATUS_TABS = [
   { value: '', label: '待处理', icon: Inbox },
@@ -25,16 +26,20 @@ const STATUS_TABS = [
 
 interface Pagination { page: number; totalPages: number; total: number }
 
-export function TriagePage() {
+export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
-  const [status, setStatus] = useState('')
-  const [sentiment, setSentiment] = useState('')
-  const [keyword, setKeyword] = useState('')
+  const { refresh: refreshBadges } = useBadges()
+  const [status, setStatus] = useState(initial?.status ?? '')
+  const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
+  const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [records, setRecords] = useState<any[]>([])
   const [pagination, setPagination] = useState<Pagination | null>(null)
   const [loading, setLoading] = useState(true)
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
+  const [batchBusy, setBatchBusy] = useState(false)
+
+  const sel = useSelection(`${status}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -49,7 +54,6 @@ export function TriagePage() {
 
   useEffect(() => { load() }, [load])
 
-  // Click outside to close dropdown
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (!(e.target as HTMLElement).closest('.action-dropdown')) setOpenMenu(null)
@@ -58,29 +62,50 @@ export function TriagePage() {
     return () => document.removeEventListener('click', handler)
   }, [])
 
+  // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
+  const reloadAfterMutation = useCallback(async () => {
+    const page = pagination?.page || 1
+    const willEmpty = records.length <= 1 && page > 1
+    await load(willEmpty ? page - 1 : page)
+    refreshBadges()
+  }, [load, pagination, records.length, refreshBadges])
+
   const updateTriage = async (recordId: string, newStatus: string) => {
     await api.patch('/triage/records/' + recordId, { status: newStatus })
-    load(pagination?.page || 1)
     setOpenMenu(null)
+    await reloadAfterMutation()
   }
 
   const markResponded = async (recordId: string) => {
     await api.patch('/records/' + recordId + '/official-response', { status: 'responded' })
-    load(pagination?.page || 1)
     setOpenMenu(null)
+    await reloadAfterMutation()
   }
 
   const linkIssue = async (recordId: string) => {
     const title = prompt('问题标题（简述负面舆情要点）：')
     if (!title) return
     await api.post('/triage/records/' + recordId + '/issues', { title })
-    load(pagination?.page || 1)
+    await reloadAfterMutation()
+  }
+
+  const runBatch = async (newStatus: string) => {
+    if (sel.count === 0) return
+    setBatchBusy(true)
+    try {
+      await api.patch('/triage/records/batch', { ids: [...sel.selected], status: newStatus })
+      sel.clear()
+      await reloadAfterMutation()
+    } catch (err) { console.error(err) }
+    finally { setBatchBusy(false) }
   }
 
   const interactions = (r: any) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
+  const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
+  const someChecked = records.some(r => sel.has(r.id))
 
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
+    <div className="space-y-5">
       {/* Status tabs */}
       <div className="flex flex-wrap gap-2 border-b border-border pb-4">
         {STATUS_TABS.map(tab => {
@@ -102,6 +127,13 @@ export function TriagePage() {
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-3">
+        {canWrite() && records.length > 0 && (
+          <button onClick={() => sel.setAll(records.map(r => r.id), !allChecked)}
+            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
+            <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
+            全选本页
+          </button>
+        )}
         <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3">
           <span className="text-xs font-semibold text-muted-foreground">情感</span>
           {['', 'negative', 'neutral', 'positive'].map(v => (
@@ -133,6 +165,8 @@ export function TriagePage() {
               key={r.id}
               record={r}
               canWrite={canWrite()}
+              selected={sel.has(r.id)}
+              onToggle={() => sel.toggle(r.id)}
               openMenu={openMenu}
               setOpenMenu={setOpenMenu}
               onLinkIssue={() => linkIssue(r.id)}
@@ -143,7 +177,6 @@ export function TriagePage() {
             />
           ))}
 
-          {/* Pagination */}
           {pagination && pagination.totalPages > 1 && (
             <div className="flex items-center justify-between rounded-lg border border-border bg-card px-5 py-3">
               <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条</span>
@@ -170,19 +203,42 @@ export function TriagePage() {
           onLinkIssue={() => { linkIssue(drawerRecord.id); setDrawerRecord(null) }}
         />
       )}
+
+      {/* Batch action bar */}
+      {canWrite() && (
+        <BatchBar
+          count={sel.count}
+          busy={batchBusy}
+          onClear={sel.clear}
+          onAction={key => runBatch(key)}
+          actions={[
+            { key: 'reviewing', label: '待复核', icon: Eye },
+            { key: 'archived', label: '归档', icon: Archive },
+            { key: 'false_positive', label: '误报', icon: Ban, tone: 'danger' },
+          ]}
+        />
+      )}
     </div>
   )
 }
 
 /* ==================== Record Card ==================== */
-function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
+function RecordCard({ record: r, canWrite, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail }: any) {
   const cover = getCover(r)
   const sentimentColor = r.sentiment === 'negative' ? 'border-l-red-500' : r.sentiment === 'positive' ? 'border-l-emerald-500' : 'border-l-blue-400'
 
   return (
-    <div className={cn('group relative overflow-hidden rounded-lg border border-border bg-card transition-colors duration-200 hover:border-input border-l-[3px]', sentimentColor)}
+    <div className={cn('group relative overflow-hidden rounded-lg border bg-card transition-colors duration-200 border-l-[3px]',
+      selected ? 'border-primary/50 ring-1 ring-primary/30' : 'border-border hover:border-input', sentimentColor)}
       onClick={onOpenDetail} role="button" tabIndex={0}>
       <div className="flex gap-4 p-4">
+        {/* Selection checkbox */}
+        {canWrite && (
+          <div className="flex items-start pt-0.5" onClick={e => e.stopPropagation()}>
+            <Checkbox checked={selected} onChange={onToggle} />
+          </div>
+        )}
+
         {/* Thumbnail */}
         {cover ? (
           <div className="h-20 w-20 shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
@@ -197,7 +253,6 @@ function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, o
 
         {/* Content */}
         <div className="min-w-0 flex-1">
-          {/* Top row: badges */}
           <div className="mb-1.5 flex flex-wrap items-center gap-2">
             <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
             <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
@@ -205,13 +260,9 @@ function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, o
             <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
           </div>
 
-          {/* Title */}
           <h3 className="mb-1 truncate text-sm font-bold leading-snug">{r.title || '(无标题)'}</h3>
-
-          {/* Summary */}
           <p className="mb-2 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{r.content || r.ai_summary || ''}</p>
 
-          {/* Bottom row: author + stats + time */}
           <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             <span className="flex items-center gap-1"><User className="h-3 w-3" />{r.author_name || '未知'}</span>
             <span className="flex items-center gap-1"><Heart className="h-3 w-3" />{formatNumber(r.likes)}</span>
@@ -244,13 +295,11 @@ function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, o
         )}
       </div>
 
-      {/* Hover accent */}
       <div className="pointer-events-none absolute inset-0 rounded-lg border border-primary/0 transition-colors duration-200 group-hover:border-primary/15" />
     </div>
   )
 }
 
-/* ==================== Helpers ==================== */
 function MenuBtn({ icon: Icon, label, onClick }: { icon: React.ElementType; label: string; onClick: () => void }) {
   return (
     <button onClick={onClick} className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">

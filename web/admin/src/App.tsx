@@ -3,13 +3,11 @@ import { NavProvider, useNav } from '@/lib/navigation'
 import { BadgesProvider } from '@/lib/badges'
 import { LoginPage } from '@/pages/LoginPage'
 import { OverviewPage } from '@/pages/OverviewPage'
-import { TriagePage } from '@/pages/TriagePage'
-import { IssuesPage } from '@/pages/IssuesPage'
+import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { ReportsPage } from '@/pages/ReportsPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { MonitorPage } from '@/pages/MonitorPage'
 import { MonitorHitsPage } from '@/pages/MonitorHitsPage'
-import { CommentLeadsPage } from '@/pages/CommentLeadsPage'
 import { DataPage } from '@/pages/DataPage'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -18,10 +16,8 @@ import { Loader2 } from 'lucide-react'
 
 const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   overview: { eyebrow: 'Workspace', title: '总览' },
-  triage: { eyebrow: 'Triage Inbox', title: '舆情收件箱' },
-  issues: { eyebrow: 'Issue Desk', title: '问题处置' },
+  workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
   analytics: { eyebrow: 'Live Analytics', title: '数据看板' },
-  leads: { eyebrow: 'Comment Leads', title: '评论线索' },
   reports: { eyebrow: 'Reports', title: '报告中心' },
   monitor: { eyebrow: 'Monitoring', title: '监控任务' },
   'monitor-hits': { eyebrow: 'Monitoring', title: '监控命中' },
@@ -34,10 +30,8 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
 
 const PAGES: Record<string, React.ComponentType> = {
   overview: OverviewPage,
-  triage: TriagePage,
-  issues: IssuesPage,
+  workbench: WorkbenchPage,
   analytics: AnalyticsPage,
-  leads: CommentLeadsPage,
   reports: ReportsPage,
   monitor: MonitorPage,
   'monitor-hits': MonitorHitsPage,

@@ -1,34 +1,50 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { Loader2, AlertCircle } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { WorkbenchTabs } from '@/components/shared/Workbench'
 import { IssueDrawer } from '@/components/shared/IssueDrawer'
 import { useAuth } from '@/lib/auth'
+import { useBadges } from '@/lib/badges'
 
-export function IssuesPage() {
+const STATUS_TABS = [
+  { key: '', label: '全部' },
+  { key: 'new', label: '新建' },
+  { key: 'triage', label: '分诊' },
+  { key: 'in_progress', label: '处理中' },
+  { key: 'resolved', label: '已解决' },
+  { key: 'closed', label: '已关闭' },
+]
+
+export function IssuesQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
+  const { refresh: refreshBadges } = useBadges()
+  const [status, setStatus] = useState(initial?.status ?? '')
   const [issues, setIssues] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [drawerIssue, setDrawerIssue] = useState<any>(null)
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await api.get<any>('/issues?limit=100')
+      const params = new URLSearchParams({ pageSize: '100' })
+      if (status) params.set('status', status)
+      const data = await api.get<any>('/issues?' + params.toString())
       setIssues(data.issues || [])
     } catch (err) { console.error(err) }
     finally { setLoading(false) }
-  }
+  }, [status])
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [load])
 
-  const updateStatus = async (id: string, status: string) => {
-    await api.patch('/issues/' + id, { status })
-    load()
+  const updateStatus = async (id: string, next: string) => {
+    await api.patch('/issues/' + id, { status: next })
     setDrawerIssue(null)
+    await load()
+    refreshBadges()
   }
 
   const openDetail = async (issueId: string) => {
@@ -38,12 +54,14 @@ export function IssuesPage() {
     } catch (err) { console.error(err) }
   }
 
-  if (loading) return <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
-
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
-      {issues.length === 0 ? (
-        <EmptyState icon={AlertCircle} title="暂无问题" description="在收件箱中将内容转为问题后显示在这里" />
+    <div className="space-y-4">
+      <WorkbenchTabs tabs={STATUS_TABS} activeKey={status} onChange={setStatus} />
+
+      {loading ? (
+        <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
+      ) : issues.length === 0 ? (
+        <EmptyState icon={AlertCircle} title="暂无问题" description="在分诊队列中将内容转为问题后显示在这里" />
       ) : (
         <div className="overflow-hidden rounded-lg border border-border bg-card">
           <table className="w-full text-sm">
@@ -83,7 +101,6 @@ export function IssuesPage() {
         </div>
       )}
 
-      {/* Issue detail drawer */}
       {drawerIssue && (
         <IssueDrawer
           issue={drawerIssue}
