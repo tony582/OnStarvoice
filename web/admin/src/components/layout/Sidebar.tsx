@@ -72,14 +72,11 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                 return (
                   <button key={item.id} onClick={() => onNavigate(item.id)}
                     className={cn(
-                      'group relative flex w-full items-center gap-3 rounded-md px-3 py-[8px] text-[13px] font-medium transition-colors duration-150',
+                      'group relative flex w-full items-center gap-3 rounded-lg px-3 py-[8px] text-[13px] transition-colors duration-150',
                       active
-                        ? 'bg-sidebar-accent text-foreground'
-                        : 'text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground'
+                        ? 'bg-accent font-semibold text-primary'
+                        : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground'
                     )}>
-                    {active && (
-                      <div className="absolute left-0 top-1/2 h-5 w-[2px] -translate-y-1/2 rounded-r bg-primary" />
-                    )}
                     <Icon className={cn('relative z-10 h-[17px] w-[17px] shrink-0 transition-colors', active ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground')} strokeWidth={active ? 2 : 1.6} />
                     <span className="relative z-10">{item.label}</span>
                     {badgeCount > 0 && (
