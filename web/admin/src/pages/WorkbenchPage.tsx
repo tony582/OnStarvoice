@@ -37,15 +37,15 @@ export function WorkbenchPage() {
               key={q.key}
               onClick={() => setQueue(q.key)}
               className={cn(
-                'group relative flex items-center gap-3 rounded-xl border p-4 text-left transition-all duration-200',
+                'group relative flex items-center gap-3 rounded-xl border p-4 text-left shadow-xs transition-all duration-200',
                 active
-                  ? 'border-primary/40 bg-primary/[0.04] shadow-sm'
+                  ? 'border-primary/30 bg-primary/[0.05] shadow-sm'
                   : 'border-border bg-card hover:border-input hover:shadow-sm',
               )}
             >
               <div className={cn(
-                'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors',
-                active ? 'bg-primary text-white' : 'bg-muted text-muted-foreground group-hover:text-foreground',
+                'flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] transition-colors',
+                active ? 'bg-primary text-white shadow-sm' : 'bg-muted text-muted-foreground group-hover:text-foreground',
               )}>
                 <Icon className="h-5 w-5" strokeWidth={active ? 2 : 1.7} />
               </div>

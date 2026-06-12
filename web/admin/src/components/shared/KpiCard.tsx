@@ -10,9 +10,9 @@ interface KpiCardProps {
 }
 
 const TONES = {
-  default: { icon: 'bg-blue-50 text-blue-600 dark:bg-blue-950/30 dark:text-blue-300' },
-  destructive: { icon: 'bg-rose-50 text-rose-600 dark:bg-rose-950/30 dark:text-rose-300' },
-  warning: { icon: 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300' },
+  default: { icon: 'text-muted-foreground', num: '' },
+  destructive: { icon: 'text-rose-500 dark:text-rose-400', num: 'text-rose-500 dark:text-rose-400' },
+  warning: { icon: 'text-amber-500 dark:text-amber-400', num: 'text-amber-600 dark:text-amber-400' },
 }
 
 export function KpiCard({ label, value, icon: Icon, tone = 'default', onClick }: KpiCardProps) {
@@ -23,26 +23,18 @@ export function KpiCard({ label, value, icon: Icon, tone = 'default', onClick }:
     <Tag
       onClick={onClick}
       className={cn(
-        'rounded-lg border border-border bg-card p-5 text-left transition-all duration-150',
+        'group block rounded-xl border border-border bg-card px-4 py-3.5 text-left shadow-xs transition-all duration-150',
         interactive
-          ? 'cursor-pointer hover:border-primary/40 hover:shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/20'
+          ? 'cursor-pointer hover:border-primary/30 hover:shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/20'
           : 'hover:border-input',
       )}
     >
-      <div className="relative flex items-start gap-4">
-        <div className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-md', t.icon)}>
-          <Icon className="h-[22px] w-[22px]" strokeWidth={1.6} />
-        </div>
-        <div className="min-w-0">
-          <div className={cn(
-            'text-[28px] font-extrabold tabular-nums leading-none tracking-tight',
-            tone === 'destructive' && 'text-rose-500 dark:text-rose-400',
-            tone === 'warning' && 'text-amber-500 dark:text-amber-400',
-          )}>
-            {formatNumber(value)}
-          </div>
-          <div className="mt-2 text-[12px] font-medium text-muted-foreground">{label}</div>
-        </div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-[12px] font-medium text-muted-foreground">{label}</span>
+        <Icon className={cn('h-4 w-4 shrink-0 transition-colors', t.icon, interactive && 'group-hover:text-primary')} strokeWidth={1.8} />
+      </div>
+      <div className={cn('mt-2 text-[26px] font-bold tabular-nums leading-none tracking-tight', t.num)}>
+        {formatNumber(value)}
       </div>
     </Tag>
   )

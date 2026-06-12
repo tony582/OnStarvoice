@@ -228,8 +228,8 @@ function RecordCard({ record: r, canWrite, selected, onToggle, openMenu, setOpen
   const sentimentColor = r.sentiment === 'negative' ? 'border-l-red-500' : r.sentiment === 'positive' ? 'border-l-emerald-500' : 'border-l-blue-400'
 
   return (
-    <div className={cn('group relative overflow-hidden rounded-lg border bg-card transition-colors duration-200 border-l-[3px]',
-      selected ? 'border-primary/50 ring-1 ring-primary/30' : 'border-border hover:border-input', sentimentColor)}
+    <div className={cn('group relative overflow-hidden rounded-xl border bg-card shadow-xs transition-all duration-200 border-l-[3px] hover:shadow-sm',
+      selected ? 'border-primary/40 ring-1 ring-primary/25' : 'border-border hover:border-input', sentimentColor)}
       onClick={onOpenDetail} role="button" tabIndex={0}>
       <div className="flex gap-4 p-4">
         {/* Selection checkbox */}

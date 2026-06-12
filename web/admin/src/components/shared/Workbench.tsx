@@ -89,7 +89,7 @@ export function WorkbenchTableShell({
   className?: string
 }) {
   return (
-    <section className={cn('overflow-hidden rounded-lg border border-border bg-card', className)}>
+    <section className={cn('overflow-hidden rounded-xl border border-border bg-card shadow-xs', className)}>
       {children}
     </section>
   )

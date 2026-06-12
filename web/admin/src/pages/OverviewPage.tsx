@@ -140,21 +140,21 @@ function TodoBar({ badges, navigate }: { badges: Badges; navigate: (page: string
               key={item.key}
               onClick={() => navigate(item.page, item.params)}
               className={cn(
-                'group flex items-center gap-3 rounded-xl border border-border bg-card p-4 text-left transition-all duration-200 hover:shadow-sm',
-                done ? 'opacity-70 hover:opacity-100' : t.ring,
+                'group flex items-center gap-3.5 rounded-xl border bg-card p-4 text-left shadow-xs transition-all duration-200 hover:shadow-sm',
+                done ? 'border-border opacity-65 hover:opacity-100' : `border-border ${t.ring}`,
               )}
             >
-              <div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-lg', done ? 'bg-muted text-muted-foreground' : t.chip)}>
-                <Icon className="h-5 w-5" strokeWidth={1.8} />
+              <div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-[10px]', done ? 'bg-muted text-muted-foreground' : t.chip)}>
+                <Icon className="h-[22px] w-[22px]" strokeWidth={1.7} />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-baseline gap-2">
-                  <span className={cn('text-2xl font-extrabold tabular-nums leading-none', done ? 'text-muted-foreground' : t.num)}>{count}</span>
-                  <span className="truncate text-sm font-semibold">{item.label}</span>
+                  <span className={cn('text-[26px] font-bold tabular-nums leading-none tracking-tight', done ? 'text-muted-foreground' : t.num)}>{count}</span>
+                  <span className="truncate text-[13px] font-medium text-foreground">{item.label}</span>
                 </div>
-                <div className="mt-1 truncate text-xs text-muted-foreground">{item.hint}</div>
+                <div className="mt-1.5 truncate text-xs text-muted-foreground">{item.hint}</div>
               </div>
-              <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+              <ArrowRight className={cn('h-4 w-4 shrink-0 transition-all', done ? 'text-muted-foreground' : 'text-muted-foreground/60 group-hover:translate-x-0.5 group-hover:text-foreground')} />
             </button>
           )
         })}
@@ -165,9 +165,12 @@ function TodoBar({ badges, navigate }: { badges: Badges; navigate: (page: string
 
 function Panel({ title, children, accent, onMore }: { title: string; children: React.ReactNode; accent?: boolean; onMore?: () => void }) {
   return (
-    <section className={`overflow-hidden rounded-lg border bg-card transition-colors hover:border-input ${accent ? 'border-primary/15' : 'border-border'}`}>
-      <div className={`flex items-center justify-between border-b px-5 py-3.5 ${accent ? 'border-primary/15' : 'border-border'}`}>
-        <h2 className="text-sm font-bold">{title}</h2>
+    <section className={`overflow-hidden rounded-xl border bg-card shadow-xs ${accent ? 'border-primary/20' : 'border-border'}`}>
+      <div className="flex items-center justify-between border-b border-border px-5 py-3">
+        <div className="flex items-center gap-2">
+          {accent && <span className="h-3.5 w-1 rounded-full bg-primary" />}
+          <h2 className="text-[13px] font-semibold tracking-tight">{title}</h2>
+        </div>
         {onMore && (
           <button onClick={onMore} className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-primary">
             查看全部 <ArrowRight className="h-3 w-3" />
@@ -255,14 +258,18 @@ const HELP_ITEMS = [
 
 function HelpCenter() {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid gap-2 sm:grid-cols-2">
       {HELP_ITEMS.map(item => {
         const Icon = item.icon
         return (
-          <div key={item.title} className="rounded-lg border border-border bg-muted/20 p-4">
-            <Icon className="h-4 w-4 text-primary" />
-            <div className="mt-3 text-sm font-bold">{item.title}</div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">{item.desc}</div>
+          <div key={item.title} className="flex items-center gap-3 rounded-lg border border-border bg-muted/20 px-3.5 py-3 transition-colors hover:bg-muted/40">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+              <Icon className="h-4 w-4" strokeWidth={1.8} />
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-[13px] font-semibold">{item.title}</div>
+              <div className="truncate text-xs text-muted-foreground">{item.desc}</div>
+            </div>
           </div>
         )
       })}
