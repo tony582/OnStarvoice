@@ -6,6 +6,7 @@ interface KpiCardProps {
   value: number | string | undefined
   icon: LucideIcon
   tone?: 'default' | 'destructive' | 'warning'
+  onClick?: () => void
 }
 
 const TONES = {
@@ -14,10 +15,20 @@ const TONES = {
   warning: { icon: 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300' },
 }
 
-export function KpiCard({ label, value, icon: Icon, tone = 'default' }: KpiCardProps) {
+export function KpiCard({ label, value, icon: Icon, tone = 'default', onClick }: KpiCardProps) {
   const t = TONES[tone]
+  const interactive = typeof onClick === 'function'
+  const Tag = interactive ? 'button' : 'div'
   return (
-    <div className="rounded-lg border border-border bg-card p-5 transition-colors duration-150 hover:border-input">
+    <Tag
+      onClick={onClick}
+      className={cn(
+        'rounded-lg border border-border bg-card p-5 text-left transition-all duration-150',
+        interactive
+          ? 'cursor-pointer hover:border-primary/40 hover:shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/20'
+          : 'hover:border-input',
+      )}
+    >
       <div className="relative flex items-start gap-4">
         <div className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-md', t.icon)}>
           <Icon className="h-[22px] w-[22px]" strokeWidth={1.6} />
@@ -33,6 +44,6 @@ export function KpiCard({ label, value, icon: Icon, tone = 'default' }: KpiCardP
           <div className="mt-2 text-[12px] font-medium text-muted-foreground">{label}</div>
         </div>
       </div>
-    </div>
+    </Tag>
   )
 }

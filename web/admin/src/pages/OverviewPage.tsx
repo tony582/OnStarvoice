@@ -1,15 +1,17 @@
 import { useEffect, useState } from 'react'
 import {
-  AlertCircle, BookOpen, Database, FileQuestion, Globe,
+  AlertCircle, ArrowRight, BookOpen, CheckCircle2, Database, FileQuestion, Globe,
   Inbox, Loader2, MessageSquareWarning, Radar, RefreshCw, Sparkles,
   Tag, Target, TrendingUp,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { compact, formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
+import { compact, formatDate, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
 import { KpiCard } from '@/components/shared/KpiCard'
 import { TrendChart } from '@/components/shared/TrendChart'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { useNav, type PageParams } from '@/lib/navigation'
+import { useBadges, type Badges } from '@/lib/badges'
 
 interface OverviewData {
   kpi: Record<string, number>
@@ -25,6 +27,8 @@ interface OverviewData {
 }
 
 export function OverviewPage() {
+  const { navigate } = useNav()
+  const { badges } = useBadges()
   const [data, setData] = useState<OverviewData | null>(null)
   const [loading, setLoading] = useState(true)
 
@@ -47,17 +51,20 @@ export function OverviewPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
+      {/* 今日待办:行动导向,点击直达对应队列(带预置筛选) */}
+      <TodoBar badges={badges} navigate={navigate} />
+
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-6">
-        <KpiCard label="今日新增内容" value={k.today_new} icon={TrendingUp} />
-        <KpiCard label="今日监控命中" value={k.today_monitor_hits} icon={Target} />
-        <KpiCard label="今日评论线索" value={k.today_comment_leads} icon={MessageSquareWarning} tone={Number(k.today_comment_leads || 0) > 0 ? 'warning' : 'default'} />
-        <KpiCard label="活跃监控" value={k.active_monitors} icon={Radar} />
-        <KpiCard label="待处理问题" value={k.open_issues} icon={AlertCircle} tone={Number(k.open_issues || 0) > 0 ? 'warning' : 'default'} />
-        <KpiCard label="待标注内容" value={k.pending_label} icon={Tag} />
+        <KpiCard label="今日新增内容" value={k.today_new} icon={TrendingUp} onClick={() => navigate('data')} />
+        <KpiCard label="今日监控命中" value={k.today_monitor_hits} icon={Target} onClick={() => navigate('monitoring', { tab: 'hits' })} />
+        <KpiCard label="今日评论线索" value={k.today_comment_leads} icon={MessageSquareWarning} tone={Number(k.today_comment_leads || 0) > 0 ? 'warning' : 'default'} onClick={() => navigate('workbench', { queue: 'leads' })} />
+        <KpiCard label="活跃监控" value={k.active_monitors} icon={Radar} onClick={() => navigate('monitoring', { tab: 'tasks' })} />
+        <KpiCard label="待处理问题" value={k.open_issues} icon={AlertCircle} tone={Number(k.open_issues || 0) > 0 ? 'warning' : 'default'} onClick={() => navigate('workbench', { queue: 'issues' })} />
+        <KpiCard label="待标注内容" value={k.pending_label} icon={Tag} onClick={() => navigate('data')} />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(360px,0.85fr)]">
-        <Panel title="今天采集到什么" accent>
+        <Panel title="今天采集到什么" accent onMore={() => navigate('data')}>
           <LatestContent rows={data?.latestContent || []} />
         </Panel>
         <Panel title="帮助中心">
@@ -66,10 +73,10 @@ export function OverviewPage() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <Panel title="评论线索">
+        <Panel title="评论线索" onMore={() => navigate('workbench', { queue: 'leads' })}>
           <LatestCommentLeads rows={data?.latestCommentLeads || []} />
         </Panel>
-        <Panel title="监控命中内容">
+        <Panel title="监控命中内容" onMore={() => navigate('monitoring', { tab: 'hits' })}>
           <LatestMonitorHits rows={data?.latestMonitorHits || []} />
         </Panel>
       </div>
@@ -79,18 +86,18 @@ export function OverviewPage() {
           <Panel title="风险趋势（近7日）">
             <TrendChart data={data?.riskTrend || []} />
           </Panel>
-          <Panel title="需要处理">
-            <PendingRecords records={data?.pendingRecords || []} />
+          <Panel title="需要处理" onMore={() => navigate('workbench', { queue: 'triage' })}>
+            <PendingRecords records={data?.pendingRecords || []} onOpen={() => navigate('workbench', { queue: 'triage' })} />
           </Panel>
         </div>
         <div className="space-y-4 lg:col-span-2">
           <Panel title="平台覆盖">
             <PlatformCoverage rows={data?.platformCoverage || []} />
           </Panel>
-          <Panel title="数据来源">
+          <Panel title="数据来源" onMore={() => navigate('data')}>
             <SourceDistribution rows={data?.sourceDistribution || []} />
           </Panel>
-          <Panel title="监控健康">
+          <Panel title="监控健康" onMore={() => navigate('monitoring', { tab: 'tasks' })}>
             <MonitorMini rows={data?.monitorHealth || []} />
           </Panel>
         </div>
@@ -99,11 +106,73 @@ export function OverviewPage() {
   )
 }
 
-function Panel({ title, children, accent }: { title: string; children: React.ReactNode; accent?: boolean }) {
+const TODO_ITEMS: Array<{ key: keyof Badges; label: string; hint: string; icon: React.ElementType; page: string; params: PageParams; tone: 'primary' | 'amber' | 'rose' }> = [
+  { key: 'triagePending', label: '待分诊内容', hint: '研判舆情、转问题', icon: Inbox, page: 'workbench', params: { queue: 'triage' }, tone: 'primary' },
+  { key: 'leadsNew', label: '新评论线索', hint: '跟进高风险评论', icon: MessageSquareWarning, page: 'workbench', params: { queue: 'leads', status: 'new' }, tone: 'amber' },
+  { key: 'issuesOpen', label: '开放问题', hint: '处置中的舆情问题', icon: AlertCircle, page: 'workbench', params: { queue: 'issues' }, tone: 'rose' },
+  { key: 'monitorAttention', label: '异常监控', hint: '监控任务报错待查', icon: Radar, page: 'monitoring', params: { tab: 'tasks' }, tone: 'amber' },
+]
+
+const TODO_TONES = {
+  primary: { ring: 'hover:border-primary/40', chip: 'bg-primary/10 text-primary', num: 'text-primary' },
+  amber: { ring: 'hover:border-amber-400/50', chip: 'bg-amber-500/12 text-amber-600 dark:text-amber-400', num: 'text-amber-600 dark:text-amber-400' },
+  rose: { ring: 'hover:border-rose-400/50', chip: 'bg-rose-500/12 text-rose-600 dark:text-rose-400', num: 'text-rose-600 dark:text-rose-400' },
+}
+
+function TodoBar({ badges, navigate }: { badges: Badges; navigate: (page: string, params?: PageParams) => void }) {
+  const total = TODO_ITEMS.reduce((sum, item) => sum + badges[item.key], 0)
+  return (
+    <section>
+      <div className="mb-3 flex items-center gap-2">
+        <h2 className="text-sm font-bold">今日待办</h2>
+        {total === 0
+          ? <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400"><CheckCircle2 className="h-3.5 w-3.5" />全部已清空</span>
+          : <span className="text-xs text-muted-foreground">共 <span className="font-semibold text-foreground tabular-nums">{total}</span> 项待处理</span>}
+      </div>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {TODO_ITEMS.map(item => {
+          const Icon = item.icon
+          const count = badges[item.key]
+          const t = TODO_TONES[item.tone]
+          const done = count === 0
+          return (
+            <button
+              key={item.key}
+              onClick={() => navigate(item.page, item.params)}
+              className={cn(
+                'group flex items-center gap-3 rounded-xl border border-border bg-card p-4 text-left transition-all duration-200 hover:shadow-sm',
+                done ? 'opacity-70 hover:opacity-100' : t.ring,
+              )}
+            >
+              <div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-lg', done ? 'bg-muted text-muted-foreground' : t.chip)}>
+                <Icon className="h-5 w-5" strokeWidth={1.8} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2">
+                  <span className={cn('text-2xl font-extrabold tabular-nums leading-none', done ? 'text-muted-foreground' : t.num)}>{count}</span>
+                  <span className="truncate text-sm font-semibold">{item.label}</span>
+                </div>
+                <div className="mt-1 truncate text-xs text-muted-foreground">{item.hint}</div>
+              </div>
+              <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+            </button>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
+function Panel({ title, children, accent, onMore }: { title: string; children: React.ReactNode; accent?: boolean; onMore?: () => void }) {
   return (
     <section className={`overflow-hidden rounded-lg border bg-card transition-colors hover:border-input ${accent ? 'border-primary/15' : 'border-border'}`}>
-      <div className={`border-b px-5 py-3.5 ${accent ? 'border-primary/15' : 'border-border'}`}>
+      <div className={`flex items-center justify-between border-b px-5 py-3.5 ${accent ? 'border-primary/15' : 'border-border'}`}>
         <h2 className="text-sm font-bold">{title}</h2>
+        {onMore && (
+          <button onClick={onMore} className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-primary">
+            查看全部 <ArrowRight className="h-3 w-3" />
+          </button>
+        )}
       </div>
       <div className="p-5">{children}</div>
     </section>
@@ -201,7 +270,7 @@ function HelpCenter() {
   )
 }
 
-function PendingRecords({ records }: { records: any[] }) {
+function PendingRecords({ records, onOpen }: { records: any[]; onOpen?: () => void }) {
   if (!records.length) return <EmptyState icon={Inbox} title="暂无待处理内容" description="所有舆情内容已处理完毕" />
 
   return (
@@ -209,7 +278,8 @@ function PendingRecords({ records }: { records: any[] }) {
       {records.slice(0, 6).map((r, i) => {
         const total = interaction(r)
         return (
-          <div key={i} className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0">
+          <button key={i} onClick={onOpen}
+            className="-mx-2 flex w-[calc(100%+1rem)] items-center justify-between gap-3 rounded-md px-2 py-3 text-left transition-colors first:pt-0 last:pb-0 hover:bg-muted/40">
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium">{r.title || compact(r.content, 60) || '(无标题)'}</div>
               <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
@@ -220,7 +290,7 @@ function PendingRecords({ records }: { records: any[] }) {
             <StatusBadge tone={r.sentiment || 'muted'}>
               {LABELS.sentiment[r.sentiment] || '待标注'}
             </StatusBadge>
-          </div>
+          </button>
         )
       })}
     </div>

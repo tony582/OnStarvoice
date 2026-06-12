@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ChevronLeft, ChevronRight, Database, Download, ExternalLink, Image as ImageIcon,
+  ArrowRight, ChevronLeft, ChevronRight, Database, Download, ExternalLink, Image as ImageIcon,
   Loader2, RefreshCw, Search,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -10,6 +10,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
+import { useNav } from '@/lib/navigation'
 
 type TableKey =
   | 'single_notes'
@@ -48,13 +49,17 @@ const PLATFORM_OPTIONS = [
   { value: 'weibo', label: '微博' },
 ]
 
+const VALID_TABLES: TableKey[] = ['single_notes', 'keyword_notes', 'blogger_profiles', 'blogger_notes', 'comment_leads', 'monitor_content']
+
 export function DataPage() {
-  const [activeTable, setActiveTable] = useState<TableKey>('single_notes')
+  const { params, navigate } = useNav()
+  const initialTable = (VALID_TABLES.includes(params?.table as TableKey) ? params!.table : 'single_notes') as TableKey
+  const [activeTable, setActiveTable] = useState<TableKey>(initialTable)
   const [rows, setRows] = useState<any[]>([])
   const [pagination, setPagination] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [platform, setPlatform] = useState('')
+  const [platform, setPlatform] = useState(params?.platform ?? '')
   const [keyword, setKeyword] = useState('')
   const [expandedCells, setExpandedCells] = useState<Record<string, boolean>>({})
   const [expandResetVersion, setExpandResetVersion] = useState(0)
@@ -129,7 +134,15 @@ export function DataPage() {
               {platform ? platformName(platform) : '全部平台'}
             </span>
           </div>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+            {activeTable === 'comment_leads' && (
+              <button
+                onClick={() => navigate('workbench', { queue: 'leads' })}
+                className="inline-flex items-center gap-1 font-medium text-primary transition-colors hover:underline"
+              >
+                去工作台处理 <ArrowRight className="h-3 w-3" />
+              </button>
+            )}
             <span>{columns.length} 列</span>
           </div>
         </div>
