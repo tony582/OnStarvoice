@@ -59,7 +59,7 @@ function previewHtml(preview: ReportPreview, tab: PreviewTab) {
   return preview.managementHtml
 }
 
-export function ReportsPage() {
+export function ReportsTab() {
   const { canWrite } = useAuth()
   const [reports, setReports] = useState<ReportRun[]>([])
   const [loading, setLoading] = useState(true)

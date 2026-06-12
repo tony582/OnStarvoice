@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Loader2, Radar, Play } from 'lucide-react'
+import { Loader2, Radar, Play, Target } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -7,7 +7,7 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { useAuth } from '@/lib/auth'
 
-export function MonitorPage() {
+export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: string) => void }) {
   const { canWrite } = useAuth()
   const [subs, setSubs] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
@@ -66,9 +66,16 @@ export function MonitorPage() {
                   <td className="px-4 py-3 tabular-nums text-sm">{s.cadence_minutes} 分钟</td>
                   <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(s.last_run_at)}</td>
                   <td className="px-4 py-3 text-right">
-                    <Button variant="outline" size="sm" onClick={() => runNow(s.id)} disabled={!canWrite()}>
-                      <Play className="h-3.5 w-3.5" /> 立即执行
-                    </Button>
+                    <div className="flex justify-end gap-1">
+                      {onViewHits && (
+                        <Button variant="ghost" size="sm" onClick={() => onViewHits(s.id)}>
+                          <Target className="h-3.5 w-3.5" /> 查看命中
+                        </Button>
+                      )}
+                      <Button variant="outline" size="sm" onClick={() => runNow(s.id)} disabled={!canWrite()}>
+                        <Play className="h-3.5 w-3.5" /> 立即执行
+                      </Button>
+                    </div>
                   </td>
                 </tr>
               ))}

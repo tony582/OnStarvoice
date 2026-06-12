@@ -4,10 +4,8 @@ import { BadgesProvider } from '@/lib/badges'
 import { LoginPage } from '@/pages/LoginPage'
 import { OverviewPage } from '@/pages/OverviewPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
-import { ReportsPage } from '@/pages/ReportsPage'
-import { AnalyticsPage } from '@/pages/AnalyticsPage'
-import { MonitorPage } from '@/pages/MonitorPage'
-import { MonitorHitsPage } from '@/pages/MonitorHitsPage'
+import { MonitoringPage } from '@/pages/MonitoringPage'
+import { InsightsPage } from '@/pages/InsightsPage'
 import { DataPage } from '@/pages/DataPage'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -17,10 +15,8 @@ import { Loader2 } from 'lucide-react'
 const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   overview: { eyebrow: 'Workspace', title: '总览' },
   workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
-  analytics: { eyebrow: 'Live Analytics', title: '数据看板' },
-  reports: { eyebrow: 'Reports', title: '报告中心' },
-  monitor: { eyebrow: 'Monitoring', title: '监控任务' },
-  'monitor-hits': { eyebrow: 'Monitoring', title: '监控命中' },
+  monitoring: { eyebrow: 'Monitoring', title: '监控中心' },
+  insights: { eyebrow: 'Insights', title: '分析与报告' },
   data: { eyebrow: 'Data Assets', title: '数据资产' },
   tenants: { eyebrow: 'Administration', title: '租户管理' },
   users: { eyebrow: 'Administration', title: '用户账号' },
@@ -31,10 +27,8 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
 const PAGES: Record<string, React.ComponentType> = {
   overview: OverviewPage,
   workbench: WorkbenchPage,
-  analytics: AnalyticsPage,
-  reports: ReportsPage,
-  monitor: MonitorPage,
-  'monitor-hits': MonitorHitsPage,
+  monitoring: MonitoringPage,
+  insights: InsightsPage,
   data: DataPage,
   tenants: TenantsPage,
   users: UsersPage,

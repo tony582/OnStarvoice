@@ -27,15 +27,15 @@ function interaction(row: any) {
   return Number(row.likes || 0) + Number(row.comments_count || 0) + Number(row.collects || 0) + Number(row.shares || 0)
 }
 
-export function MonitorHitsPage() {
+export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }) {
   const [hits, setHits] = useState<any[]>([])
   const [subscriptions, setSubscriptions] = useState<any[]>([])
   const [pagination, setPagination] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [range, setRange] = useState('7d')
-  const [platform, setPlatform] = useState('')
-  const [subscriptionId, setSubscriptionId] = useState('')
+  const [range, setRange] = useState(initial?.range ?? '7d')
+  const [platform, setPlatform] = useState(initial?.platform ?? '')
+  const [subscriptionId, setSubscriptionId] = useState(initial?.subscriptionId ?? '')
 
   const loadSubscriptions = async () => {
     try {

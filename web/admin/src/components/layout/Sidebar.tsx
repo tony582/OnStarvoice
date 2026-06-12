@@ -1,14 +1,14 @@
 import {
-  LayoutGrid, Inbox, FileText, Radar, BarChart3,
-  Database, Building2, Users, KeyRound, Settings, ChevronRight, Target,
+  LayoutGrid, Inbox, Radar, BarChart3,
+  Database, Building2, Users, KeyRound, Settings, ChevronRight,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
 import { useBadges, type Badges } from '@/lib/badges'
 
 const ICON_MAP: Record<string, React.ElementType> = {
-  overview: LayoutGrid, workbench: Inbox, analytics: BarChart3, reports: FileText,
-  monitor: Radar, 'monitor-hits': Target, data: Database, tenants: Building2, users: Users,
+  overview: LayoutGrid, workbench: Inbox, monitoring: Radar, insights: BarChart3,
+  data: Database, tenants: Building2, users: Users,
   'auth-codes': KeyRound, settings: Settings,
 }
 
@@ -20,10 +20,8 @@ const NAV: Array<{ section: string; internal?: boolean; items: NavItem[] }> = [
     section: 'WORKSPACE', items: [
       { id: 'overview', label: '总览' },
       { id: 'workbench', label: '舆情工作台', badgeKeys: ['triagePending', 'leadsNew', 'issuesOpen'] },
-      { id: 'analytics', label: '数据看板' },
-      { id: 'reports', label: '报告中心' },
-      { id: 'monitor', label: '监控任务', badgeKeys: ['monitorAttention'] },
-      { id: 'monitor-hits', label: '监控命中' },
+      { id: 'monitoring', label: '监控中心', badgeKeys: ['monitorAttention'] },
+      { id: 'insights', label: '分析与报告' },
       { id: 'data', label: '数据资产' },
     ],
   },

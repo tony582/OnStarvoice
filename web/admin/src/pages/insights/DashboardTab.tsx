@@ -51,7 +51,7 @@ function interactions(row: any) {
   return Number(row?.likes || 0) + Number(row?.comments_count || 0) + Number(row?.collects || 0) + Number(row?.shares || 0)
 }
 
-export function AnalyticsPage() {
+export function DashboardTab() {
   const [range, setRange] = useState<RangePreset>('7d')
   const [start, setStart] = useState(inputDate(-6))
   const [end, setEnd] = useState(inputDate())
