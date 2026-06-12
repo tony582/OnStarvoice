@@ -104,6 +104,7 @@ export const STORAGE_KEY = {
   MONITOR: "onstarvoice.monitor",
   DATA_POOL: "onstarvoice.data_pool",
   SYNC_HISTORY: "onstarvoice.sync_history",
+  DIAGNOSTICS: "onstarvoice.diagnostics",
 };
 
 // ==================== 消息类型 ====================
@@ -141,6 +142,7 @@ export const API_ENDPOINT = {
   UPDATE_MANIFEST: "/api/update-manifest",
   KEYWORD_ANALYSIS: "/api/keyword-analysis",
   KEYWORD_OPPORTUNITY: "/api/keyword-opportunity",
+  BENCHMARK_DISCOVERY: "/api/benchmark-discovery",
   MONITOR_SUBSCRIPTIONS: "/api/monitor/subscriptions",
   MONITOR_EXECUTIONS: "/api/monitor/executions",
   MONITOR_SETTINGS: "/api/monitor/settings",
@@ -162,7 +164,8 @@ export const DEFAULT_CONFIG = {
   MAX_RETRY: 3,
   REQUEST_TIMEOUT: 30000, // 30秒
   KEYWORD_ANALYSIS_TIMEOUT: 240000, // 4分钟，给慢模型和网络波动留出缓冲
-  KEYWORD_OPPORTUNITY_TIMEOUT: 240000, // 4分钟，覆盖关键词策略分析
+  KEYWORD_OPPORTUNITY_TIMEOUT: 240000, // 4分钟，覆盖主词机会判断
+  BENCHMARK_DISCOVERY_TIMEOUT: 180000, // 3分钟，覆盖赛道策略账号推荐理由
   MONITOR_RUN_NOW_TIMEOUT: 180000, // 3分钟，覆盖监控立即执行场景
 
   // 采集配置

@@ -163,6 +163,21 @@ function compactPayloadForBackendSync(payload = {}) {
   return compactSyncItemForBackend(next);
 }
 
+// 去重并限制媒体直链数量，避免 payload 膨胀；只保留 http(s) 直链。
+function trimMediaUrlList(list, primary = '', max = 3) {
+  const out = [];
+  const seen = new Set();
+  const push = (value) => {
+    const url = String(value || '').trim();
+    if (!url || !/^https?:\/\//i.test(url) || seen.has(url)) return;
+    seen.add(url);
+    out.push(url);
+  };
+  push(primary);
+  (Array.isArray(list) ? list : []).forEach(push);
+  return out.slice(0, max);
+}
+
 function compactSyncItemForBackend(item = {}) {
   const next = item && typeof item === 'object' ? {...item} : {};
 
@@ -170,16 +185,18 @@ function compactSyncItemForBackend(item = {}) {
   delete next.domMatchHints;
   delete next.cardImageCandidates;
   delete next.cardVideoCandidates;
-  delete next.videoUrls;
-  delete next.audioUrls;
-  delete next.musicUrls;
   delete next.mediaDiagnostics;
   delete next.detailDiagnostics;
   delete next.captureDiagnostics;
 
-  next.videoUrl = '';
-  next.audioUrl = '';
-  next.musicUrl = '';
+  // 保留媒体直链：后台「下载附件」依赖 videoUrl/audioUrl（封面+视频+音频）。
+  // 之前这里整列清空导致采到的视频直链入库即丢，后台只能下封面。
+  next.videoUrls = trimMediaUrlList(next.videoUrls, next.videoUrl);
+  next.audioUrls = trimMediaUrlList(next.audioUrls, next.audioUrl);
+  next.musicUrls = trimMediaUrlList(next.musicUrls, next.musicUrl);
+  next.videoUrl = next.videoUrl || next.videoUrls[0] || '';
+  next.audioUrl = next.audioUrl || next.audioUrls[0] || '';
+  next.musicUrl = next.musicUrl || next.musicUrls[0] || '';
 
   return next;
 }
@@ -1985,6 +2002,11 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
   const commentLeadsConfig = normalizeCommentLeadsConfig(
     options?.commentLeadsConfig || {},
   );
+  const batchMonitorExecutionId =
+    typeof options?.monitorExecutionId === 'string' &&
+    options.monitorExecutionId.trim()
+      ? options.monitorExecutionId.trim()
+      : '';
   const sourceRecords = await getRecords(recordIdsToSync);
   const recordMap = new Map(sourceRecords.map((record) => [record.id, record]));
   const recordsToSync = recordIdsToSync
@@ -1992,6 +2014,10 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
     .filter(Boolean);
   const preparedRecordsToSync = recordsToSync.map((record) => {
     const syncInput = resolveSyncInputForRecord(record, requestTarget);
+    const monitorExecutionId =
+      batchMonitorExecutionId ||
+      String(record?.monitorExecutionId || record?.payload?.monitorExecutionId || '')
+        .trim();
     return {
       ...record,
       platform: syncInput.platform,
@@ -2002,6 +2028,7 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
       ),
       workflow: syncInput.workflow,
       sourceType: record.type,
+      monitorExecutionId,
       retryCommentLeadsOnly:
         commentLeadsConfig.enabled &&
         isCommentLeadsEligibleSyncType(syncInput.syncType) &&
@@ -2573,6 +2600,7 @@ function buildSyncBatchRecord(record) {
     type: record.syncType || record.type,
     platform: record.platform,
     workflow: record.workflow,
+    monitorExecutionId: record.monitorExecutionId || '',
     payload: record.syncPayload || record.payload,
   };
 }
@@ -6470,6 +6498,9 @@ function buildContentRequest(mode, captureParams = {}) {
           captureParams.maxDetectedItems ?? captureParams.maxItems,
         keywordFilter: captureParams.keywordFilter || '',
         profileMetrics: captureParams.profileMetrics,
+        monitorPublishWindow: captureParams.monitorPublishWindow || '',
+        monitorObserveWindowHours: captureParams.monitorObserveWindowHours,
+        monitorLikeThreshold: captureParams.monitorLikeThreshold,
         waitMinMs: captureParams.waitMinMs,
         waitMaxMs: captureParams.waitMaxMs,
         stallTimeoutMs: captureParams.stallTimeoutMs,

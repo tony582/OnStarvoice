@@ -4,11 +4,11 @@ export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInp
   return (
     <input
       className={cn(
-        'flex h-10 w-full rounded-xl border border-border bg-card px-3.5 text-[14px] shadow-sm',
+        'flex h-9 w-full rounded-md border border-input bg-card px-3 text-[13px]',
         'placeholder:text-muted-foreground/50',
-        'transition-all duration-200',
-        'hover:border-primary/30',
-        'focus:border-primary/50 focus:outline-none focus:ring-2 focus:ring-primary/15',
+        'transition-colors duration-150',
+        'hover:border-muted-foreground/35',
+        'focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/10',
         className,
       )}
       {...props}

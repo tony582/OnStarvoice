@@ -219,8 +219,12 @@ export const DOUYIN_DOM_PROFILE = Object.freeze({
           "img[src]",
         ]),
         likes: Object.freeze([
+          ".author-card-user-video-like",
           ".author-card-user-video-like .BgCg_ebQ",
+          '[class*="user-video-like"]',
+          '[class*="video-like"]',
           '[class*="video-like"] span',
+          '[class*="like"]',
           '[class*="like"] span',
         ]),
       }),

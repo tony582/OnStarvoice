@@ -777,6 +777,8 @@ function extractImageUrlFromElement(element) {
     element.src ||
     ""
   );
+}
+
 function extractAuthorProfileUrlFromCard(cardNode) {
   if (!cardNode) return "";
 

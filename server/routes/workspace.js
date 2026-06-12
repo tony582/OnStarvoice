@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { queryAll, queryOne } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
+import { applyResolvedMetrics } from '../utils/metrics.js';
 
 const router = Router();
 
@@ -42,6 +43,23 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       WHERE r.tenant_id = $1
     `, [req.tenantId]);
 
+    const operationsStats = await queryOne(`
+      SELECT
+        (SELECT COUNT(*)
+         FROM record_observations ro
+         WHERE ro.tenant_id = $1
+           AND ro.monitor_execution_id IS NOT NULL
+           AND ro.captured_at >= $2) AS today_monitor_hits,
+        (SELECT COUNT(*)
+         FROM comment_leads cl
+         WHERE cl.tenant_id = $1
+           AND cl.created_at >= $2) AS today_comment_leads,
+        (SELECT COUNT(*)
+         FROM monitor_subscriptions ms
+         WHERE ms.tenant_id = $1
+           AND ms.status = 'active') AS active_monitors
+    `, [req.tenantId, todayStart.toISOString()]);
+
     const pendingRecords = await queryAll(`
       SELECT r.id, r.platform, r.title, r.content, r.author_name, r.url, r.likes, r.comments_count,
         r.collects, r.shares, r.sentiment, r.category, r.last_seen_at,
@@ -77,6 +95,72 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       WHERE tenant_id = $1 AND created_at >= $2
       GROUP BY day
       ORDER BY day ASC
+    `, [req.tenantId, since]);
+
+    const latestContent = await queryAll(`
+      SELECT id, platform, record_type, title, content, author_name, url, likes,
+        comments_count, collects, shares, sentiment, keyword, created_at, last_seen_at
+      FROM records
+      WHERE tenant_id = $1
+      ORDER BY created_at DESC
+      LIMIT 8
+    `, [req.tenantId]);
+
+    const latestCommentLeads = await queryAll(`
+      SELECT *
+      FROM comment_leads
+      WHERE tenant_id = $1
+      ORDER BY captured_at DESC, created_at DESC
+      LIMIT 8
+    `, [req.tenantId]);
+
+    const latestMonitorHits = await queryAll(`
+      SELECT
+        ro.id AS observation_id,
+        ro.captured_at,
+        ro.keyword AS observation_keyword,
+        ms.name AS monitor_name,
+        ms.keyword AS monitor_keyword,
+        r.id AS record_id,
+        r.platform,
+        r.record_type,
+        r.title,
+        r.content,
+        r.author_name,
+        r.url,
+        r.likes,
+        r.comments_count,
+        r.collects,
+        r.shares,
+        r.payload AS record_payload,
+        ro.payload AS observation_payload,
+        r.sentiment,
+        CASE
+          WHEN r.created_at >= ro.captured_at - interval '5 minutes'
+            AND r.created_at <= ro.captured_at + interval '5 minutes'
+          THEN true
+          ELSE false
+        END AS is_new_record
+      FROM record_observations ro
+      JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+      LEFT JOIN monitor_executions me ON me.id = ro.monitor_execution_id AND me.tenant_id = ro.tenant_id
+      LEFT JOIN monitor_subscriptions ms ON ms.id = me.subscription_id AND ms.tenant_id = ro.tenant_id
+      WHERE ro.tenant_id = $1
+        AND ro.monitor_execution_id IS NOT NULL
+      ORDER BY ro.captured_at DESC
+      LIMIT 8
+    `, [req.tenantId]);
+    const normalizedLatestMonitorHits = latestMonitorHits.map(applyResolvedMetrics);
+
+    const sourceDistribution = await queryAll(`
+      SELECT COALESCE(NULLIF(record_type, ''), 'single_note') AS record_type,
+        COUNT(*) AS count,
+        COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
+        MAX(created_at) AS last_created_at
+      FROM records
+      WHERE tenant_id = $1
+      GROUP BY COALESCE(NULLIF(record_type, ''), 'single_note')
+      ORDER BY count DESC
     `, [req.tenantId, since]);
 
     const topIssues = await queryAll(`
@@ -117,9 +201,13 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       ok: true,
       tenant: { id: req.tenantId, name: req.tenantName },
       days,
-      kpi: { ...kpi, ...issueStats, ...triageStats },
+      kpi: { ...kpi, ...issueStats, ...triageStats, ...operationsStats },
       pendingRecords,
+      latestContent,
+      latestCommentLeads,
+      latestMonitorHits: normalizedLatestMonitorHits,
       platformCoverage,
+      sourceDistribution,
       riskTrend,
       topIssues,
       reports,

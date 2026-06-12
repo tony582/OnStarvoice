@@ -160,7 +160,7 @@ async function callLLM(userMessage, tenantId) {
   return await callOpenAICompatible(config.apiKey, config.model, config.endpoint, systemPrompt, userMessage);
 }
 
-async function callLLMWithPrompt(tenantId, systemPrompt, userMessage) {
+export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage) {
   const config = await getLLMConfig(tenantId);
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
   if (config.provider === 'gemini') return await callGemini(config.apiKey, config.model, systemPrompt, userMessage);

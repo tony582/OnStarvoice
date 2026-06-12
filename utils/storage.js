@@ -394,7 +394,7 @@ function getDefaultMonitor() {
     items: [],
     executions: [],
     settings: {
-      publishWindow: "previous_day",
+      publishWindow: "last_24h",
       likeThreshold: 0,
       runTimes: ["10:00"],
       observeWindowHours: 48,

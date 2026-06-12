@@ -82,6 +82,9 @@ export async function captureSingleNote() {
     // 提取互动数据
     const interactions = extractInteractions(noteContext);
 
+    // 提取发布时间
+    const publishDateRaw = extractPublishDateRaw(noteContext);
+
     // 提取最近编辑时间
     const lastEditedAt = extractLastEditedAt(noteContext);
 
@@ -103,6 +106,8 @@ export async function captureSingleNote() {
       likes: interactions.likes,
       collects: interactions.collects,
       comments: interactions.comments,
+      publishTime: publishDateRaw,
+      publishDateRaw,
       lastEditedAt,
       noteType,
       coverImageUrl: media.coverImage,
@@ -967,6 +972,22 @@ function extractInteractionByIcon(type, noteContext = document) {
 /**
  * 提取发布日期（增强版）
  */
+function extractPublishDateRaw(noteContext = document) {
+  const timeElement = noteContext.querySelector("time[datetime]");
+  if (timeElement) {
+    const datetime = timeElement.getAttribute("datetime");
+    if (datetime) {
+      return cleanText(datetime);
+    }
+  }
+
+  const dateElement = querySelector(
+    NOTE_DETAIL_SELECTORS.publishDate,
+    noteContext,
+  );
+  return dateElement ? cleanText(dateElement.textContent) : "";
+}
+
 function extractLastEditedAt(noteContext = document) {
   console.log("[SingleNote] Extracting last edited time...");
 

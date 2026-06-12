@@ -61,6 +61,16 @@ export const LABELS = {
   severity: { low: '低', medium: '中', high: '高', critical: '严重' } as Record<string, string>,
   reportType: { daily: '日报', weekly: '周报', monthly: '月报' } as Record<string, string>,
   reportStatus: { generating: '生成中', generated: '待发送', sent: '已发送', skipped: '无新增', failed: '失败' } as Record<string, string>,
+  leadStatus: { new: '新线索', following: '跟进中', resolved: '已处理', ignored: '已忽略' } as Record<string, string>,
+  leadType: {
+    complaint: '投诉维权', renewal_billing: '续费收费', app_issue: 'App故障',
+    service_quality: '服务求助', safety_privacy: '安全隐私', brand_risk: '品牌风险',
+    other: '其他跟进',
+  } as Record<string, string>,
+  recordType: {
+    single_note: '单笔记', keyword_notes: '关键词笔记', blogger_profile: '博主信息',
+    blogger_notes: '博主笔记', official_content: '官方内容',
+  } as Record<string, string>,
   role: {
     platform_admin: '平台管理员', internal_operator: '内部运营',
     tenant_admin: '客户管理员', tenant_analyst: '分析员', tenant_viewer: '只读',

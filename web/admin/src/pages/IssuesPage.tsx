@@ -44,7 +44,7 @@ export function IssuesPage() {
       {issues.length === 0 ? (
         <EmptyState icon={AlertCircle} title="暂无问题" description="在收件箱中将内容转为问题后显示在这里" />
       ) : (
-        <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <div className="overflow-hidden rounded-lg border border-border bg-card">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-border bg-muted/50">
               <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">问题</th>
@@ -85,8 +85,8 @@ export function IssuesPage() {
       {/* Issue detail drawer */}
       {drawerIssue && (
         <div className="fixed inset-0 z-50 flex justify-end" onClick={() => setDrawerIssue(null)}>
-          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
-          <div className="relative z-10 flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-200"
+          <div className="absolute inset-0 bg-black/35" />
+          <div className="relative z-10 flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200"
             onClick={e => e.stopPropagation()}>
 
             <div className="flex items-center justify-between border-b border-border px-6 py-4">

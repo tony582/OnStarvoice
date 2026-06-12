@@ -87,9 +87,9 @@ export function TriagePage() {
           return (
             <button key={tab.value} onClick={() => setStatus(tab.value)}
               className={cn(
-                'inline-flex items-center gap-2 rounded-full border px-4 py-2 text-[13px] font-semibold transition-all duration-200',
+                'inline-flex items-center gap-2 rounded-md border px-4 py-2 text-[13px] font-medium transition-colors duration-200',
                 status === tab.value
-                  ? 'border-primary bg-primary text-white shadow-sm shadow-primary/25'
+                  ? 'border-primary bg-primary text-white'
                   : 'border-border bg-card text-muted-foreground hover:border-primary/50 hover:text-primary'
               )}>
               <Icon className="h-3.5 w-3.5" strokeWidth={2} />
@@ -144,7 +144,7 @@ export function TriagePage() {
 
           {/* Pagination */}
           {pagination && pagination.totalPages > 1 && (
-            <div className="flex items-center justify-between rounded-xl border border-border bg-card px-5 py-3">
+            <div className="flex items-center justify-between rounded-lg border border-border bg-card px-5 py-3">
               <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条</span>
               <div className="flex items-center gap-1">
                 <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}>
@@ -179,7 +179,7 @@ function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, o
   const sentimentColor = r.sentiment === 'negative' ? 'border-l-red-500' : r.sentiment === 'positive' ? 'border-l-emerald-500' : 'border-l-blue-400'
 
   return (
-    <div className={cn('group relative overflow-hidden rounded-xl border border-border bg-card transition-all duration-200 hover:shadow-md border-l-[3px]', sentimentColor)}
+    <div className={cn('group relative overflow-hidden rounded-lg border border-border bg-card transition-colors duration-200 hover:border-input border-l-[3px]', sentimentColor)}
       onClick={onOpenDetail} role="button" tabIndex={0}>
       <div className="flex gap-4 p-4">
         {/* Thumbnail */}
@@ -231,7 +231,7 @@ function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, o
                 <MoreHorizontal className="h-4 w-4" />
               </Button>
               {openMenu === r.id && (
-                <div className="absolute right-0 top-full z-20 mt-1 w-44 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-xl duration-150">
+                <div className="absolute right-0 top-full z-20 mt-1 w-44 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-sm duration-150">
                   <MenuBtn icon={CheckCircle} label="标为已响应" onClick={onMarkResponded} />
                   <MenuBtn icon={Eye} label="待复核" onClick={() => onUpdateTriage('reviewing')} />
                   <MenuBtn icon={Archive} label="归档" onClick={() => onUpdateTriage('archived')} />
@@ -244,7 +244,7 @@ function RecordCard({ record: r, canWrite, openMenu, setOpenMenu, onLinkIssue, o
       </div>
 
       {/* Hover accent */}
-      <div className="pointer-events-none absolute inset-0 rounded-xl border border-primary/0 transition-all duration-200 group-hover:border-primary/15" />
+      <div className="pointer-events-none absolute inset-0 rounded-lg border border-primary/0 transition-colors duration-200 group-hover:border-primary/15" />
     </div>
   )
 }
@@ -282,10 +282,10 @@ function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { record: a
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+      <div className="absolute inset-0 bg-black/35" />
 
       {/* Drawer */}
-      <div className="relative z-10 flex h-full w-full max-w-2xl flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-200"
+      <div className="relative z-10 flex h-full w-full max-w-2xl flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200"
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
@@ -300,7 +300,7 @@ function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { record: a
           <div className="border-b border-border p-6">
             <div className="flex gap-4">
               {cover ? (
-                <div className="h-28 w-28 shrink-0 overflow-hidden rounded-xl border border-border bg-muted">
+                <div className="h-28 w-28 shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
                   <img src={cover} alt="" className="h-full w-full object-cover" referrerPolicy="no-referrer" />
                 </div>
               ) : null}

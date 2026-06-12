@@ -2008,6 +2008,27 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
   margin-top: var(--spacing-lg);
 }
 
+.sync-history-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sync-history-header-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--theme-primary);
+}
+
+.sync-history-header-btn:hover {
+  background: rgba(92, 89, 232, 0.08);
+  border-color: transparent;
+}
+
 .execution-history-section + .execution-history-section {
   margin-top: var(--spacing-lg);
 }
@@ -3234,6 +3255,10 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   gap: 12px;
 }
 
+.keyword-strategy-loading-card {
+  min-height: 86px;
+}
+
 .keyword-opportunity-summary,
 .keyword-opportunity-block,
 .keyword-strategy-placeholder {
@@ -3542,6 +3567,223 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   font-size: 12px;
   font-weight: var(--font-weight-medium);
   padding: 6px 10px;
+}
+
+.keyword-benchmark-summary {
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  background:
+    linear-gradient(135deg, rgba(15, 118, 110, 0.08) 0%, rgba(255, 255, 255, 0.96) 56%),
+    #ffffff;
+  padding: 12px;
+}
+
+.keyword-benchmark-summary-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.keyword-benchmark-summary-head > div:first-child {
+  min-width: 0;
+}
+
+.keyword-benchmark-summary-text {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+.keyword-benchmark-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.keyword-benchmark-card {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.025);
+  padding: 10px;
+}
+
+.keyword-benchmark-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.keyword-benchmark-rank {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: rgba(15, 118, 110, 0.1);
+  color: var(--theme-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: var(--font-weight-bold, 700);
+  flex-shrink: 0;
+}
+
+.keyword-benchmark-account {
+  min-width: 0;
+  flex: 1;
+}
+
+.keyword-benchmark-name {
+  font-size: 13px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.keyword-benchmark-conclusion {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-primary);
+  line-height: 1.6;
+  font-weight: var(--font-weight-medium);
+}
+
+.keyword-benchmark-angle {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+.keyword-benchmark-evidence,
+.keyword-benchmark-work-list {
+  margin-top: 10px;
+  border-radius: 9px;
+  background: #ffffff;
+  padding: 9px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.keyword-benchmark-section-title {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.keyword-benchmark-evidence p {
+  margin: 5px 0 0;
+  color: var(--text-secondary);
+}
+
+.keyword-benchmark-evidence ul,
+.keyword-benchmark-work-list ul {
+  margin: 5px 0 0;
+  padding-left: 16px;
+}
+
+.keyword-benchmark-evidence li,
+.keyword-benchmark-work-list li {
+  margin: 2px 0;
+}
+
+.keyword-benchmark-work-list a {
+  color: var(--theme-primary);
+  text-decoration: none;
+}
+
+.keyword-benchmark-work-list a:hover {
+  text-decoration: underline;
+}
+
+.keyword-benchmark-work-list em {
+  display: block;
+  margin-top: 1px;
+  font-style: normal;
+  color: var(--text-tertiary);
+}
+
+.keyword-benchmark-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.keyword-benchmark-tags span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.06);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.keyword-benchmark-potential {
+  font-weight: var(--font-weight-semibold);
+}
+
+.keyword-benchmark-potential-high {
+  background: rgba(16, 185, 129, 0.12) !important;
+  color: #047857 !important;
+}
+
+.keyword-benchmark-potential-medium {
+  background: rgba(245, 158, 11, 0.14) !important;
+  color: #92400e !important;
+}
+
+.keyword-benchmark-potential-low {
+  background: rgba(100, 116, 139, 0.12) !important;
+  color: #475569 !important;
+}
+
+.keyword-benchmark-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.keyword-benchmark-action {
+  border: 1px solid rgba(15, 118, 110, 0.18);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--theme-primary);
+  font-size: 11px;
+  line-height: 1;
+  padding: 7px 9px;
+  cursor: pointer;
+}
+
+.keyword-benchmark-action-primary {
+  background: rgba(15, 118, 110, 0.08);
+  border-color: rgba(15, 118, 110, 0.24);
+  color: #047857;
+}
+
+.keyword-benchmark-action:hover:not(:disabled) {
+  background: rgba(15, 118, 110, 0.06);
+}
+
+.keyword-benchmark-action:disabled {
+  color: var(--text-tertiary);
+  cursor: not-allowed;
+}
+
+.keyword-benchmark-empty {
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.04);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 12px;
 }
 
 /* ==================== 关键词裂变 ==================== */

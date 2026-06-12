@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { withTransaction } from '../db/init.js';
+import { parseMetricNumber } from '../utils/metrics.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
@@ -37,8 +38,7 @@ function jsonText(value, fallback) {
 }
 
 function cleanNumber(value) {
-  const n = Number(value || 0);
-  return Number.isFinite(n) ? n : 0;
+  return parseMetricNumber(value, 0);
 }
 
 function meaningful(value) {

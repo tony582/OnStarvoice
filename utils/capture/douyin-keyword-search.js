@@ -3,10 +3,10 @@
  * Search results DOM capture for jingxuan/search and search pages.
  */
 
-import {PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG} from "../constants.js";
-import {cleanText, extractNoteId, normalizeDate} from "../helpers.js";
-import {autoScrollLoad, isCanceled, resetCancelFlag, wait} from "../scroll.js";
-import {getDomProfile} from "../platform/dom-profiles/index.js";
+import { PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG } from "../constants.js";
+import { cleanText, extractNoteId, normalizeDate } from "../helpers.js";
+import { autoScrollLoad, isCanceled, resetCancelFlag, wait } from "../scroll.js";
+import { getDomProfile } from "../platform/dom-profiles/index.js";
 import {
   ensureSectionReady,
   getAttribute,
@@ -19,6 +19,12 @@ import {
   buildReverseMatchHints,
   collectMediaUrlsFromElement,
 } from "./shared/dom-locator.js";
+import {
+  buildFilterApplyStage,
+  buildListParseStage,
+  buildScrollLoadStage,
+  countMissingMetric,
+} from "./stage-diagnostics.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const DEFAULT_SORT_DIMENSION = "likes";
@@ -54,8 +60,8 @@ export async function captureDouyinKeywordNotes({
     const searchRoot = resolveSectionRoot(DOUYIN_DOM_PROFILE, "searchResults");
     const resolvedKeyword = normalizeKeyword(
       keyword ||
-        extractKeywordFromUrl(window.location.href) ||
-        getText(DOUYIN_DOM_PROFILE.searchResults.fields.searchInput, document),
+      extractKeywordFromUrl(window.location.href) ||
+      getText(DOUYIN_DOM_PROFILE.searchResults.fields.searchInput, document),
     );
 
     if (!resolvedKeyword) {
@@ -77,8 +83,8 @@ export async function captureDouyinKeywordNotes({
     );
     const waitRange =
       normalizedWaitMinMs <= normalizedWaitMaxMs
-        ? {min: normalizedWaitMinMs, max: normalizedWaitMaxMs}
-        : {min: normalizedWaitMaxMs, max: normalizedWaitMinMs};
+        ? { min: normalizedWaitMinMs, max: normalizedWaitMaxMs }
+        : { min: normalizedWaitMaxMs, max: normalizedWaitMinMs };
     const normalizedStallTimeoutMs = normalizePositiveInteger(
       stallTimeoutMs,
       3000,
@@ -151,10 +157,10 @@ export async function captureDouyinKeywordNotes({
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
-      scrollStep: async ({noNewContentCount = 0} = {}) => {
-        await scrollDouyinSearchResults(searchRoot, {noNewContentCount});
+      scrollStep: async ({ noNewContentCount = 0 } = {}) => {
+        await scrollDouyinSearchResults(searchRoot, { noNewContentCount });
       },
-      stopWhen: ({currentContentCount, noNewContentCount}) => {
+      stopWhen: ({ currentContentCount, noNewContentCount }) => {
         if (progressStats.detectedCount >= normalizedMaxDetectedItems) {
           return {
             stop: true,
@@ -166,7 +172,7 @@ export async function captureDouyinKeywordNotes({
         if (currentContentCount > lastObservedCount) {
           lastObservedCount = currentContentCount;
           lastGrowthAt = Date.now();
-          return {stop: false};
+          return { stop: false };
         }
 
         if (
@@ -180,7 +186,7 @@ export async function captureDouyinKeywordNotes({
           };
         }
 
-        return {stop: false};
+        return { stop: false };
       },
     });
 
@@ -194,8 +200,16 @@ export async function captureDouyinKeywordNotes({
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
     );
     const items = filteredItems.slice(0, normalizedMaxDetectedItems);
+    const missingMetricCount = countMissingMetric(allItems, "likes");
+    const metricCounts = allItems.map((item) => Number(item.likes || 0));
+    const minMetricCount = metricCounts.length ? Math.min(...metricCounts) : 0;
+    const maxMetricCount = metricCounts.length ? Math.max(...metricCounts) : 0;
+    const zeroMetricCount = metricCounts.filter((count) => count === 0).length;
+    const metricExtractionSuspicious =
+      allItems.length > 0 && maxMetricCount === 0;
 
     const payload = {
+      platform: "douyin",
       keyword: resolvedKeyword,
       searchUrl: window.location.href,
       totalCount: items.length,
@@ -211,31 +225,83 @@ export async function captureDouyinKeywordNotes({
       items,
       captureTimestamp: Date.now(),
     };
+    const stageTrace = [
+      buildScrollLoadStage({
+        label: "抖音搜索结果滚动加载",
+        requestedMaxDetectedItems: normalizedMaxDetectedItems,
+        finalContentCount: allItems.length,
+        scrollResult,
+        maxScrollTimes: normalizedMaxScrollTimes,
+        waitMinMs: waitRange.min,
+        waitMaxMs: waitRange.max,
+        stallTimeoutMs: normalizedStallTimeoutMs,
+        maxDurationMs: normalizedMaxDurationMs,
+      }),
+      buildListParseStage({
+        label: "抖音搜索结果解析",
+        rawTotalCount: allItems.length,
+        parsedCount: allItems.length,
+        missingMetricCount,
+      }),
+      buildFilterApplyStage({
+        label: "抖音搜索点赞筛选",
+        rawTotalCount: allItems.length,
+        filteredBeforeLimitCount: filteredItems.length,
+        filteredCount: items.length,
+        minLikes: normalizedMinLikes,
+        sortDimension: DEFAULT_SORT_DIMENSION,
+        maxDetectedItems: normalizedMaxDetectedItems,
+        missingMetricCount,
+        minMetricCount,
+        maxMetricCount,
+        zeroMetricCount,
+        metricExtractionSuspicious,
+      }),
+    ];
 
     return {
       ok: true,
+      platform: "douyin",
       type: SYNC_TYPE.KEYWORD_NOTES,
       data: payload,
       meta: {
+        platform: "douyin",
+        sourceUrl: window.location.href,
         pageType: PAGE_TYPE.SEARCH_RESULTS,
         captureStartedAt,
         captureFinishedAt: new Date().toISOString(),
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
+          maxScrollTimes: scrollResult.maxScrollTimes,
           completed: scrollResult.completed,
           canceled: scrollResult.canceled,
+          stopReason: scrollResult.stopReason,
+          finalContentCount: scrollResult.finalContentCount,
+          noNewContentCount: scrollResult.noNewContentCount,
+          elapsedMs: scrollResult.elapsedMs,
         },
+      },
+      diagnostics: {
+        stageTrace,
       },
       error: null,
     };
   } catch (error) {
-    console.error("[Douyin][KeywordSearch] Capture failed:", error);
+    const errorMessage = String(error?.message || "");
+    if (errorMessage === "采集已取消") {
+      console.debug("[Douyin][KeywordSearch] Capture canceled");
+    } else {
+      console.error("[Douyin][KeywordSearch] Capture failed:", error);
+    }
 
     return {
       ok: false,
+      platform: "douyin",
       type: SYNC_TYPE.KEYWORD_NOTES,
       data: null,
       meta: {
+        platform: "douyin",
+        sourceUrl: window.location.href,
         pageType: PAGE_TYPE.SEARCH_RESULTS,
         captureStartedAt,
         captureFinishedAt: new Date().toISOString(),
@@ -373,9 +439,10 @@ function collectSearchCards(searchRoot) {
     const card = node.matches?.(".search-result-card")
       ? node
       : node.querySelector?.(".search-result-card") ||
-        node.closest?.(".search-result-card") ||
-        null;
+      node.closest?.(".search-result-card") ||
+      null;
     if (!card) return;
+    if (!hasSearchResultVideoSignal(card)) return;
 
     const key =
       card.id ||
@@ -386,6 +453,30 @@ function collectSearchCards(searchRoot) {
   });
 
   return cards;
+}
+
+function hasSearchResultVideoSignal(card) {
+  if (!card) return false;
+
+  const text = String(card.innerText || "");
+  if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
+    return false;
+  }
+
+  const linkSelectors = [
+    'a[href*="/video/"]',
+    'a[href*="/note/"]',
+    'a[href*="modal_id="]',
+    '[href*="/video/"]',
+    '[href*="/note/"]',
+    '[data-href*="/video/"]',
+    '[data-url*="/video/"]',
+  ].join(",");
+  if (card.matches?.(linkSelectors) || card.querySelector?.(linkSelectors)) {
+    return true;
+  }
+
+  return /^\s*\d{1,2}:\d{2}\s*$/m.test(text);
 }
 
 function resolveSearchCardId(card, index = 0) {
@@ -459,31 +550,72 @@ function resolveSearchCardUrl(card, noteId, tabType) {
 }
 
 function resolveSearchCardTitle(card, noteId, index) {
-  const fromText = cleanText(
-    getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.title, card),
+  const fromLines = resolveSearchCardTitleFromLines(card);
+  if (fromLines) {
+    return fromLines;
+  }
+
+  const titleNode = getFirstMatch(
+    DOUYIN_DOM_PROFILE.searchResults.cards.fields.title,
+    card,
   );
-  if (fromText) {
+  const fromText = normalizeSearchCardTitle(titleNode?.textContent || "");
+  if (fromText && isValidSearchCardTitleLine(fromText)) {
     return fromText;
   }
 
-  const text = cleanText(card?.innerText || "");
+  const text = String(card?.innerText || "").trim();
   const lines = text
     .split(/\n+/)
     .map((line) => cleanText(line))
     .filter(Boolean);
-  const candidate = lines.find(
-    (line) =>
-      line &&
-      !/^@/.test(line) &&
-      !/^·/.test(line) &&
-      !/^\d{1,2}:\d{2}$/.test(line) &&
-      !/^[0-9]+(?:\.[0-9]+)?[万亿kK]?$/.test(line),
-  );
+  const candidate = lines.find((line) => isValidSearchCardTitleLine(line));
   if (candidate) {
-    return candidate;
+    return normalizeSearchCardTitle(candidate);
   }
 
   return `抖音搜索结果 ${noteId || index + 1}`;
+}
+
+function resolveSearchCardTitleFromLines(card) {
+  const text = String(card?.innerText || "").trim();
+  if (!text) return "";
+
+  const lines = text
+    .split(/\n+/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  const titleLine = lines.find((line) => isValidSearchCardTitleLine(line));
+  return normalizeSearchCardTitle(titleLine || "");
+}
+
+function normalizeSearchCardTitle(value) {
+  const text = cleanText(value);
+  if (!text) return "";
+
+  return cleanText(
+    text
+      .replace(/\s+@[^\n]+?\s*[·・]\s*\d{4}年\d{1,2}月\d{1,2}日.*$/u, "")
+      .replace(/\s+@[^\n]+?\s*[·・]\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}.*$/u, ""),
+  );
+}
+
+function isValidSearchCardTitleLine(line) {
+  const text = cleanText(line);
+  if (!text) return false;
+  if (/^相关搜索(?:\s|$|[:：])/.test(text)) return false;
+  if (/^温馨提示$/.test(text)) return false;
+  if (/医美有风险，请谨慎选择/.test(text)) return false;
+  if (/^@/.test(text)) return false;
+  if (/^[·・]/.test(text)) return false;
+  if (/^\d{1,2}:\d{2}$/.test(text)) return false;
+  if (/^[0-9]+(?:\.[0-9]+)?[万亿kK]?$/.test(text)) return false;
+  if (/^\d{4}年\d{1,2}月\d{1,2}日$/.test(text)) return false;
+  if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/.test(text)) return false;
+  if (/^[·・]\s*\d{4}年\d{1,2}月\d{1,2}日$/.test(text)) return false;
+  if (/^\d{1,2}[-/.月]\d{1,2}(?:日)?$/.test(text)) return false;
+  return true;
 }
 
 function resolveSearchCardCover(card) {
@@ -494,9 +626,9 @@ function resolveSearchCardCover(card) {
 
   const imageUrl = normalizeUrl(
     imageNode?.getAttribute?.("src") ||
-      imageNode?.src ||
-      extractBackgroundImageUrl(imageNode) ||
-      extractBackgroundImageUrl(card),
+    imageNode?.src ||
+    extractBackgroundImageUrl(imageNode) ||
+    extractBackgroundImageUrl(card),
   );
   if (imageUrl) {
     return imageUrl;
@@ -560,7 +692,7 @@ function detectSearchTabType() {
 
 async function scrollDouyinSearchResults(
   searchRoot,
-  {noNewContentCount = 0} = {},
+  { noNewContentCount = 0 } = {},
 ) {
   const target = resolveDouyinSearchScrollTarget(searchRoot);
   const distance = resolveDouyinSearchScrollDistance(target, {
@@ -585,7 +717,7 @@ async function scrollDouyinSearchResults(
         inline: "nearest",
         behavior: "instant",
       });
-    } catch {}
+    } catch { }
     await wait(100);
   }
 
@@ -670,7 +802,7 @@ function isWindowScrollTarget(node) {
 
 function resolveDouyinSearchScrollDistance(
   target,
-  {noNewContentCount = 0} = {},
+  { noNewContentCount = 0 } = {},
 ) {
   const viewportHeight =
     Number(target?.clientHeight || 0) || Number(window.innerHeight || 0) || 900;
@@ -699,14 +831,14 @@ async function scrollElementByDistance(node, distance) {
   );
 
   try {
-    node.scrollTo({top: nextTop, behavior: "smooth"});
+    node.scrollTo({ top: nextTop, behavior: "smooth" });
   } catch {
     node.scrollTop = nextTop;
   }
 
   try {
-    node.dispatchEvent(new Event("scroll", {bubbles: true}));
-  } catch {}
+    node.dispatchEvent(new Event("scroll", { bubbles: true }));
+  } catch { }
 
   await wait(160);
 
@@ -723,7 +855,7 @@ async function scrollElementByDistance(node, distance) {
         cancelable: true,
       }),
     );
-  } catch {}
+  } catch { }
 
   await wait(120);
   return Math.abs(Number(node.scrollTop || 0) - beforeTop) >= 1;
@@ -734,7 +866,7 @@ async function scrollWindowByDistance(distance) {
   const nextY = beforeY + Math.max(320, Math.floor(Number(distance) || 0));
 
   try {
-    window.scrollTo({top: nextY, behavior: "smooth"});
+    window.scrollTo({ top: nextY, behavior: "smooth" });
   } catch {
     window.scrollTo(0, nextY);
   }

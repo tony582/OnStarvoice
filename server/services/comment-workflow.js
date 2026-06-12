@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { classifyCommentWithAI } from './ai-labeler.js';
+import { upsertCommentLeadForComment } from './comment-leads.js';
 
 const NEGATIVE_KEYWORDS = [
   '投诉', '维权', '差评', '垃圾', '失望', '被骗', '坑', '故障', '坏了', '崩溃',
@@ -362,7 +363,7 @@ export async function upsertRecordComments(recordId, record, context) {
   return await withTransaction(async tx => {
     const accounts = await loadOfficialAccounts(tx, tenantId);
     const currentRecord = await tx.queryOne(
-      'SELECT id, title, content, author_name, author_id, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
+      'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
       [recordId, tenantId]
     );
     if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
@@ -410,6 +411,13 @@ export async function upsertRecordComments(recordId, record, context) {
       const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount });
       if (result.inserted) inserted += 1;
       else updated += 1;
+      if (!officialAccount) {
+        await upsertCommentLeadForComment(tx, {
+          tenantId,
+          record: currentRecord,
+          comment: result.row,
+        });
+      }
       if (officialAccount) {
         officialResponses += 1;
         await upsertOfficialResponse(tx, {

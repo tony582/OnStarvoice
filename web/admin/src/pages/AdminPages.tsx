@@ -68,7 +68,7 @@ export function UsersPage() {
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
       {/* Create form */}
-      <section className="rounded-xl border border-border bg-card p-5">
+      <section className="rounded-lg border border-border bg-card p-5">
         <h2 className="mb-4 text-sm font-bold">创建账号</h2>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <Field label="邮箱"><Input value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} type="email" /></Field>
@@ -238,7 +238,7 @@ function Spin() { return <div className="flex justify-center py-20"><Loader2 cla
 
 function Table({ heads, children }: { heads: string[]; children: React.ReactNode }) {
   return (
-    <div className="overflow-hidden rounded-xl border border-border bg-card">
+    <div className="overflow-hidden rounded-lg border border-border bg-card">
       <table className="w-full text-sm">
         <thead><tr className="border-b border-border bg-muted/50">
           {heads.map(h => <th key={h} className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">{h}</th>)}
@@ -255,7 +255,7 @@ function Field({ label, children, full }: { label: string; children: React.React
 
 function SettingsCard({ title, onSave, children }: { title: string; onSave: () => void; children: React.ReactNode }) {
   return (
-    <section className="rounded-xl border border-border bg-card p-5">
+    <section className="rounded-lg border border-border bg-card p-5">
       <h2 className="mb-4 text-sm font-bold">{title}</h2>
       {children}
       <div className="mt-4 flex justify-end"><Button size="sm" onClick={onSave}><Save className="h-3.5 w-3.5" /> 保存</Button></div>

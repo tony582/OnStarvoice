@@ -489,10 +489,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const action = message?.action;
   const type = message?.type;
 
-  if (action === 'captureProgress' || action === 'pageLoaded' || action === 'pageChanged') {
+  if (
+    action === 'captureProgress' ||
+    action === 'expandKeywordProgress' ||
+    action === 'pageLoaded' ||
+    action === 'pageChanged'
+  ) {
     (async () => {
       try {
-        if (action === 'captureProgress') {
+        if (action === 'captureProgress' || action === 'expandKeywordProgress') {
           const next = await writeRuntimeState({
             lastActiveTabId: sender?.tab?.id ?? null,
             lastCaptureProgress: message?.progress ?? null,

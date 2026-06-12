@@ -22,6 +22,8 @@ import {expandKeywordViaSuggestions} from "./utils/capture/keyword-expansion.js"
 
 import {detectPageType} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
+import {normalizeTaskContext} from "./utils/task-context.js";
+import {buildContentDiagnostics} from "./utils/diagnostics.js";
 
 console.log("[OnStarVoice V1.0] Content script loaded");
 
@@ -52,59 +54,99 @@ function safeRuntimeSendMessage(message) {
 
 // ==================== 消息监听器 ====================
 
+function attachContentResponseDiagnostics(request, response) {
+  const taskContext = normalizeTaskContext(request);
+  const normalized =
+    response && typeof response === "object"
+      ? response
+      : {ok: false, data: response};
+  const action = String(request?.action || "");
+  if (
+    !taskContext &&
+    normalized?.ok === true &&
+    (action === "detectPageType" || action === "detectSearchSortDimension")
+  ) {
+    return normalized;
+  }
+  const diagnostics = buildContentDiagnostics({
+    action,
+    taskContext,
+    response: normalized,
+    error: normalized?.error || null,
+  });
+
+  return {
+    ...normalized,
+    taskId: normalized.taskId || taskContext?.taskId || "",
+    correlationId:
+      normalized.correlationId || taskContext?.correlationId || "",
+    featureKey: normalized.featureKey || taskContext?.featureKey || "",
+    diagnostics: {
+      ...(normalized.diagnostics && typeof normalized.diagnostics === "object"
+        ? normalized.diagnostics
+        : {}),
+      ...diagnostics,
+    },
+  };
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request?.action !== "detectSearchSortDimension") {
     console.log("[Content] Received message:", request.action);
   }
 
+  const sendResponseWithDiagnostics = (response) => {
+    sendResponse(attachContentResponseDiagnostics(request, response));
+  };
+
   switch (request.action) {
     case "detectPageType":
-      handleDetectPageType(sendResponse);
+      handleDetectPageType(sendResponseWithDiagnostics);
       return true;
 
     case "smartCapture":
-      handleSmartCapture(request, sendResponse);
+      handleSmartCapture(request, sendResponseWithDiagnostics);
       return true;
 
     case "captureSingleNote":
-      handleCaptureSingleNote(request, sendResponse);
+      handleCaptureSingleNote(request, sendResponseWithDiagnostics);
       return true;
 
     case "captureBloggerProfile":
-      handleCaptureBloggerProfile(request, sendResponse);
+      handleCaptureBloggerProfile(request, sendResponseWithDiagnostics);
       return true;
 
     case "captureBloggerNotes":
-      handleCaptureBloggerNotes(request, sendResponse);
+      handleCaptureBloggerNotes(request, sendResponseWithDiagnostics);
       return true;
 
     case "captureKeywordNotes":
-      handleCaptureKeywordNotes(request, sendResponse);
+      handleCaptureKeywordNotes(request, sendResponseWithDiagnostics);
       return true;
 
     case "prepareKeywordStrategyCapture":
-      handlePrepareKeywordStrategyCapture(sendResponse);
+      handlePrepareKeywordStrategyCapture(sendResponseWithDiagnostics);
       return true;
 
     case "expandKeywordSuggestions":
-      handleExpandKeywordSuggestions(request, sendResponse);
+      handleExpandKeywordSuggestions(request, sendResponseWithDiagnostics);
       return true;
 
     case "detectSearchSortDimension":
-      handleDetectSearchSortDimension(sendResponse);
+      handleDetectSearchSortDimension(sendResponseWithDiagnostics);
       return true;
 
     case "captureComments":
-      handleCaptureComments(request, sendResponse);
+      handleCaptureComments(request, sendResponseWithDiagnostics);
       return true;
 
     case "cancelCapture":
-      handleCancelCapture(sendResponse);
+      handleCancelCapture(sendResponseWithDiagnostics);
       return true;
 
     default:
       console.warn("[Content] Unknown action:", request.action);
-      sendResponse({
+      sendResponseWithDiagnostics({
         ok: false,
         error: {code: "UNKNOWN_ACTION", message: "未知操作"},
       });
@@ -231,11 +273,14 @@ async function handleCaptureBloggerNotes(request, sendResponse) {
       minLikes: request.minLikes,
       maxDetectedItems: request.maxDetectedItems ?? request.maxItems,
       keywordFilter: request.keywordFilter || "",
+      monitorPublishWindow: request.monitorPublishWindow || "",
+      monitorObserveWindowHours: request.monitorObserveWindowHours,
+      monitorLikeThreshold: request.monitorLikeThreshold,
       waitMinMs: request.waitMinMs,
       waitMaxMs: request.waitMaxMs,
       stallTimeoutMs: request.stallTimeoutMs,
       maxDurationMs: request.maxDurationMs,
-      maxScrollTimes: request.maxScrollTimes || 50,
+      maxScrollTimes: request.maxScrollTimes,
     });
 
     sendResponse(result);
@@ -303,6 +348,7 @@ async function handleExpandKeywordSuggestions(request, sendResponse) {
         });
       },
       delayBetweenMs: request.delayBetweenMs,
+      suffixLetters: request.suffixLetters,
     });
 
     sendResponse({ok: true, data: result});

@@ -4,6 +4,7 @@ import { labelRecord } from '../services/ai-labeler.js';
 import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
+import { parseMetricNumber, resolveMetricFromPayload } from '../utils/metrics.js';
 
 const router = Router();
 const commentWorkflowQueue = [];
@@ -138,6 +139,19 @@ function normalizeRecord(body) {
       }
       return '';
     };
+    const getPayloadOnly = (...keys) => {
+      for (const k of keys) {
+        if (dp[k] != null && dp[k] !== '') return dp[k];
+        if (listItem[k] != null && listItem[k] !== '') return listItem[k];
+        if (item[k] != null && item[k] !== '') return item[k];
+      }
+      return '';
+    };
+    const metric = (dimension, ...keys) => {
+      const direct = parseMetricNumber(getPayloadOnly(...keys), 0);
+      if (direct > 0) return direct;
+      return resolveMetricFromPayload(item, dimension, keys);
+    };
     const tags = mergedArrayValue(
       dp.tags, listItem.tags, item.tags,
       dp.hashtags, listItem.hashtags, item.hashtags,
@@ -159,15 +173,15 @@ function normalizeRecord(body) {
       author_name: String(get('author', 'authorName')),
       author_id: String(get('authorId', 'authorUserId')),
       author_avatar: String(get('authorAvatar', 'avatarUrl')),
-      author_fans: Number(get('bloggerFollowersCount', 'authorFans', 'authorFollowerCount') || 0),
+      author_fans: parseMetricNumber(get('bloggerFollowersCount', 'authorFans', 'authorFollowerCount'), 0),
       url: String(get('url', 'noteUrl')),
       cover_url: String(get('coverImageUrl', 'coverUrl', 'cover')),
       note_type: String(get('noteType', 'type', 'mediaType', 'media_type')),
       source_type: String(get('sourceType', 'source_type')),
-      likes: Number(get('likes', 'likeCount', 'attitudes_count', 'attitudesCount') || 0),
-      comments_count: Number(get('comments', 'commentCount', 'commentsCount', 'comments_count') || 0),
-      collects: Number(get('collects', 'collectCount') || 0),
-      shares: Number(get('shares', 'shareCount', 'reposts', 'repostCount', 'repostsCount', 'reposts_count') || 0),
+      likes: metric('likes', 'likes', 'likeCount', 'like_count', 'diggCount', 'digg_count', 'attitudes_count', 'attitudesCount'),
+      comments_count: metric('comments', 'comments', 'commentCount', 'comment_count', 'commentsCount', 'comments_count'),
+      collects: metric('collects', 'collects', 'collectCount', 'collect_count', 'collectsCount', 'collects_count'),
+      shares: metric('shares', 'shares', 'shareCount', 'share_count', 'reposts', 'repostCount', 'repost_count', 'repostsCount', 'reposts_count'),
       publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw', 'lastEditedAt')),
       tags: JSON.stringify(tags),
       blogger_profile_url: String(get('bloggerProfileUrl', 'authorProfileUrl', 'authorUrl', 'profileUrl')),
@@ -177,7 +191,7 @@ function normalizeRecord(body) {
       official_reply_detected: boolValue(get('officialReplyDetected'), false),
       official_reply_items: JSON.stringify(officialReplyItems),
       skip_official_accounts: boolValue(get('skipOfficialAccounts'), true),
-      blogger_liked_collected: Number(get('bloggerLikedAndCollectedCount', 'bloggerLikedCollected') || 0),
+      blogger_liked_collected: parseMetricNumber(get('bloggerLikedAndCollectedCount', 'bloggerLikedCollected'), 0),
       blogger_account_type: String(get('bloggerAccountType', 'accountType')),
       video_url: String(get('videoUrl', 'videoLink', 'video_url')),
       audio_url: String(get('audioUrl', 'audio_url')),

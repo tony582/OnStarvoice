@@ -438,8 +438,9 @@ function buildPayloadFromApiDetail(detail, noteId) {
     ? `https://www.douyin.com/user/${secUid}` : null;
 
   // 发布时间：create_time 是 Unix 秒级时间戳
-  const lastEditedAt = detail.create_time
-    ? new Date(detail.create_time * 1000).toISOString() : null;
+  const publishTimestamp = detail.create_time ? detail.create_time * 1000 : null;
+  const lastEditedAt = publishTimestamp
+    ? new Date(publishTimestamp).toISOString() : null;
 
   const title = detail.desc || "";
   const inferredPath = inferDouyinNotePath(noteId, detail);
@@ -479,6 +480,9 @@ function buildPayloadFromApiDetail(detail, noteId) {
     collects: stats.collect_count ?? null,
     comments: stats.comment_count ?? null,
     shares: stats.share_count ?? null,
+    publishTimestamp,
+    publishTime: lastEditedAt || "",
+    publishDateRaw: lastEditedAt || "",
     lastEditedAt,
     noteType,
     coverImageUrl,
@@ -835,6 +839,8 @@ export async function captureDouyinSingleNote({
       collects: interactions.collects,
       comments: interactions.comments,
       shares: interactions.shares,
+      publishTime: publishText,
+      publishDateRaw: publishText,
       lastEditedAt: normalizeDouyinPublishDate(publishText),
       noteType: contextualNoteType,
       type: contextualNoteType,

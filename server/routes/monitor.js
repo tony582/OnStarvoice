@@ -1,11 +1,28 @@
 import { Router } from 'express';
 import { queryOne, queryAll, execute, getAllSettings, setSettings, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { applyResolvedMetrics } from '../utils/metrics.js';
 
 const router = Router();
+const MONITOR_SETTING_KEYS = new Set([
+  'publishWindow',
+  'likeThreshold',
+  'runTimes',
+  'observeWindowHours',
+  'timezone',
+]);
 
 function normalizeText(value) {
   return String(value || '').trim();
+}
+
+function resolveHitsSince(range) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (range === 'today') return today;
+  if (range === '30d') return new Date(Date.now() - 29 * 86400000);
+  if (range === 'all') return null;
+  return new Date(Date.now() - 6 * 86400000);
 }
 
 function normalizeMonitorSubscriptionRow(row = {}) {
@@ -194,6 +211,126 @@ router.get('/executions', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+router.get('/hits', requireTenantAccess, async (req, res, next) => {
+  try {
+    const {
+      platform = '',
+      subscriptionId = '',
+      range = '7d',
+      page = 1,
+      pageSize = 30,
+    } = req.query;
+
+    const params = [req.tenantId];
+    let where = `
+      WHERE ro.tenant_id = $1
+        AND ro.monitor_execution_id IS NOT NULL
+    `;
+
+    const since = resolveHitsSince(String(range));
+    if (since) {
+      params.push(since.toISOString());
+      where += ` AND ro.captured_at >= $${params.length}`;
+    }
+    if (platform) {
+      params.push(platform);
+      where += ` AND r.platform = $${params.length}`;
+    }
+    if (subscriptionId) {
+      params.push(subscriptionId);
+      where += ` AND me.subscription_id = $${params.length}`;
+    }
+
+    const joins = `
+      FROM record_observations ro
+      JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+      LEFT JOIN monitor_executions me ON me.id = ro.monitor_execution_id AND me.tenant_id = ro.tenant_id
+      LEFT JOIN monitor_subscriptions ms ON ms.id = me.subscription_id AND ms.tenant_id = ro.tenant_id
+    `;
+    const rankedCte = `
+      WITH ranked_monitor_hits AS (
+        SELECT
+          ro.id AS observation_id,
+          ro.captured_at,
+          ro.keyword AS observation_keyword,
+          ro.rank_position,
+          ro.interaction_total AS observation_interaction,
+          me.id AS execution_id,
+          me.status AS execution_status,
+          ms.id AS subscription_id,
+          ms.name AS monitor_name,
+          ms.keyword AS monitor_keyword,
+          ms.account_url AS monitor_account_url,
+          r.id AS record_id,
+          r.platform,
+          r.record_type,
+          r.title,
+          r.content,
+          r.url,
+          r.author_name,
+          r.author_fans,
+          r.keyword,
+          r.likes,
+          r.comments_count,
+          r.collects,
+          r.shares,
+          r.payload AS record_payload,
+          ro.payload AS observation_payload,
+          r.sentiment,
+          r.category,
+          r.created_at,
+          r.last_seen_at,
+          CASE
+            WHEN r.created_at >= ro.captured_at - interval '5 minutes'
+              AND r.created_at <= ro.captured_at + interval '5 minutes'
+            THEN true
+            ELSE false
+          END AS is_new_record,
+          ROW_NUMBER() OVER (
+            PARTITION BY ro.tenant_id, ro.record_id, me.subscription_id
+            ORDER BY ro.captured_at DESC, ro.id DESC
+          ) AS monitor_hit_rank
+        ${joins}
+        ${where}
+      )
+    `;
+
+    const total = (await queryOne(`
+      ${rankedCte}
+      SELECT COUNT(*) AS total
+      FROM ranked_monitor_hits
+      WHERE monitor_hit_rank = 1
+    `, params))?.total || 0;
+
+    const limit = Math.min(100, Math.max(1, Number(pageSize) || 30));
+    const offset = (Math.max(1, Number(page)) - 1) * limit;
+    params.push(limit, offset);
+
+    const hits = await queryAll(`
+      ${rankedCte}
+      SELECT *
+      FROM ranked_monitor_hits
+      WHERE monitor_hit_rank = 1
+      ORDER BY captured_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params);
+    const normalizedHits = hits.map(applyResolvedMetrics);
+
+    return res.json({
+      ok: true,
+      hits: normalizedHits,
+      pagination: {
+        page: Number(page),
+        pageSize: limit,
+        total: Number(total || 0),
+        totalPages: Math.ceil(Number(total || 0) / limit),
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.get('/due', requireTenantAccess, async (req, res, next) => {
   try {
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
@@ -301,7 +438,12 @@ router.get('/settings', requireTenantAccess, async (req, res, next) => {
     const all = await getAllSettings(req.tenantId);
     const settings = {};
     for (const [key, value] of Object.entries(all)) {
-      if (key.startsWith('alert_') || key.startsWith('report_')) settings[key] = value;
+      if (key.startsWith('monitor_')) {
+        const plainKey = key.slice('monitor_'.length);
+        if (MONITOR_SETTING_KEYS.has(plainKey)) settings[plainKey] = value;
+        continue;
+      }
+      if (MONITOR_SETTING_KEYS.has(key)) settings[key] = value;
     }
     return res.json({ ok: true, settings });
   } catch (err) {
@@ -311,8 +453,29 @@ router.get('/settings', requireTenantAccess, async (req, res, next) => {
 
 router.put('/settings', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    await setSettings(req.body, req.tenantId);
-    return res.json({ ok: true });
+    const source = req.body?.settings && typeof req.body.settings === 'object'
+      ? req.body.settings
+      : req.body;
+    const nextSettings = {};
+    for (const [key, value] of Object.entries(source || {})) {
+      const plainKey = String(key || '').startsWith('monitor_')
+        ? String(key).slice('monitor_'.length)
+        : String(key || '');
+      if (!MONITOR_SETTING_KEYS.has(plainKey)) continue;
+      nextSettings[`monitor_${plainKey}`] = Array.isArray(value)
+        ? value.join(',')
+        : value;
+    }
+    await setSettings(nextSettings, req.tenantId);
+    return res.json({
+      ok: true,
+      settings: Object.fromEntries(
+        Object.entries(nextSettings).map(([key, value]) => [
+          key.slice('monitor_'.length),
+          String(value ?? ''),
+        ]),
+      ),
+    });
   } catch (err) {
     return next(err);
   }

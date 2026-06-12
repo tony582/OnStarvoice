@@ -6,6 +6,8 @@
 import { API_ENDPOINT, ERROR_REASON, DEFAULT_CONFIG } from './constants.js';
 import { getAuth, getRuntime } from './storage.js';
 import { ensurePlainAuthCode } from './auth-code.js';
+import { appendTaskContext } from './task-context.js';
+import { recordDiagnosticError } from './diagnostics.js';
 
 // ==================== 配置 ====================
 
@@ -55,6 +57,10 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
   } = options;
 
   const url = `${baseUrl}${endpoint}`;
+  const requestBody =
+    body && typeof body === 'object' && !Array.isArray(body)
+      ? appendTaskContext(body)
+      : body;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -65,7 +71,7 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: body ? JSON.stringify(body) : null,
+      body: requestBody ? JSON.stringify(requestBody) : null,
       signal: controller.signal,
     });
 
@@ -87,6 +93,16 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
           error: null,
         };
       }
+
+      void recordDiagnosticError({
+        source: 'api',
+        action: endpoint,
+        status: 'failed',
+        error: {
+          reason: data.reason,
+          message: data.message,
+        },
+      }).catch(() => null);
 
       return {
         ...data,
@@ -120,6 +136,16 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
         url,
       };
 
+      void recordDiagnosticError({
+        source: 'api',
+        action: endpoint,
+        status: 'failed',
+        error,
+        metadata: {
+          httpStatus: response.status,
+        },
+      }).catch(() => null);
+
       return {
         ok: false,
         status: 'error',
@@ -140,6 +166,13 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
         message: 'Request timeout',
       };
 
+      void recordDiagnosticError({
+        source: 'api',
+        action: endpoint,
+        status: 'failed',
+        error: timeoutError,
+      }).catch(() => null);
+
       return {
         ok: false,
         status: 'error',
@@ -156,6 +189,13 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
       message: `${error.message || 'Network error'}（后台地址：${baseUrl}）`,
       url,
     };
+
+    void recordDiagnosticError({
+      source: 'api',
+      action: endpoint,
+      status: 'failed',
+      error: networkError,
+    }).catch(() => null);
 
     return {
       ok: false,
@@ -303,6 +343,7 @@ export async function syncBatch(records, target) {
       syncType: record.type,
       platform: record.platform,
       workflow: record.workflow,
+      monitorExecutionId: record.monitorExecutionId || '',
       payload: record.payload,
     })),
   };
@@ -384,6 +425,27 @@ export async function analyzeKeywordOpportunity({
   });
 }
 
+export async function analyzeBenchmarkDiscovery({
+  keyword = '',
+  platform = '',
+  candidates = [],
+} = {}) {
+  const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (!authCodeResult.ok) {
+    return authCodeResult;
+  }
+
+  return await request(API_ENDPOINT.BENCHMARK_DISCOVERY, {
+    body: {
+      code: authCodeResult.code,
+      keyword,
+      platform,
+      candidates,
+    },
+    timeout: DEFAULT_CONFIG.BENCHMARK_DISCOVERY_TIMEOUT,
+  });
+}
+
 export async function getUpdateManifest() {
   return await request(API_ENDPOINT.UPDATE_MANIFEST, {
     method: 'GET',
@@ -455,6 +517,39 @@ export async function listMonitorExecutions({
   return await request(`${API_ENDPOINT.MONITOR_EXECUTIONS}?${query.toString()}`, {
     method: 'GET',
   });
+}
+
+export async function startMonitorExecution(executionId) {
+  const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (!authCodeResult.ok) {
+    return authCodeResult;
+  }
+
+  return await request(
+    `${API_ENDPOINT.MONITOR_EXECUTIONS}/${encodeURIComponent(executionId)}/start`,
+    {
+      body: {
+        code: authCodeResult.code,
+      },
+    }
+  );
+}
+
+export async function finishMonitorExecution(executionId, result = {}) {
+  const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (!authCodeResult.ok) {
+    return authCodeResult;
+  }
+
+  return await request(
+    `${API_ENDPOINT.MONITOR_EXECUTIONS}/${encodeURIComponent(executionId)}/finish`,
+    {
+      body: {
+        code: authCodeResult.code,
+        ...result,
+      },
+    }
+  );
 }
 
 export async function getMonitorSettings() {

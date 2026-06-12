@@ -44,7 +44,7 @@ export function MonitorPage() {
       ) : subs.length === 0 ? (
         <EmptyState icon={Radar} title="暂无监控任务" description="创建关键词监控以自动采集舆情内容" />
       ) : (
-        <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <div className="overflow-hidden rounded-lg border border-border bg-card">
           <table className="w-full text-sm">
             <thead><tr className="border-b border-border bg-muted/50">
               <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">任务</th>

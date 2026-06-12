@@ -672,7 +672,7 @@
                   type="button"
                   class="btn btn-secondary btn-icon-only keyword-strategy-entry-btn"
                   id="btnToggleKeywordStrategy"
-                  title="关键词策略">
+                  title="赛道策略">
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
                     width="16"
@@ -1077,28 +1077,63 @@
               class="panel-header"
               style="align-items: center;">
               <span>执行明细</span>
-              <button
-                class="action-icon-btn"
-                id="btnClearSyncHistory"
-                title="清空本地同步记录"
-                style="border: none; background: transparent; color: var(--theme-primary); width: 24px; height: 24px; padding: 0;">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="lucide lucide-eraser">
-                  <path
-                    d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
-                  <path d="M22 21H7" />
-                  <path d="m5 11 9 9" />
-                </svg>
-              </button>
+              <div class="sync-history-header-actions">
+                <button
+                  class="action-icon-btn sync-history-header-btn"
+                  id="btnCopyDiagnostics"
+                  type="button"
+                  title="复制诊断信息"
+                  aria-label="复制诊断信息">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="lucide lucide-clipboard-list">
+                    <rect
+                      width="8"
+                      height="4"
+                      x="8"
+                      y="2"
+                      rx="1"
+                      ry="1" />
+                    <path
+                      d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                    <path d="M12 11h4" />
+                    <path d="M12 16h4" />
+                    <path d="M8 11h.01" />
+                    <path d="M8 16h.01" />
+                  </svg>
+                </button>
+                <button
+                  class="action-icon-btn sync-history-header-btn"
+                  id="btnClearSyncHistory"
+                  type="button"
+                  title="清空本地同步记录"
+                  aria-label="清空本地同步记录">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="lucide lucide-eraser">
+                    <path
+                      d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                    <path d="M22 21H7" />
+                    <path d="m5 11 9 9" />
+                  </svg>
+                </button>
+              </div>
             </div>
             <div class="pool-actions">
               <div
@@ -1648,15 +1683,16 @@
                   </select>
                 </div>
                 <div class="form-group">
-                  <label class="form-label">按发布时间找最新作品</label>
+                  <label class="form-label">发布时间范围</label>
                   <p class="form-hint">
-                    每次执行，找监控账号前一天发布的作品纳入观察。
+                    每次执行先读取账号最新作品，再按发布时间严格筛选监控命中。
                   </p>
-                  <input
-                    type="hidden"
-                    id="inputMonitorPublishWindow"
-                    value="previous_day" />
-                  <div class="form-input">前一天发布</div>
+                  <select
+                    class="form-input"
+                    id="inputMonitorPublishWindow">
+                    <option value="last_24h">最近 24 小时发布</option>
+                    <option value="previous_day">昨天发布</option>
+                  </select>
                 </div>
                 <div class="form-group">
                   <label class="form-label">观察期（小时）</label>
@@ -1672,7 +1708,7 @@
                   </select>
                 </div>
                 <div class="form-group">
-                  <label class="form-label">点赞筛选</label>
+                  <label class="form-label">点赞阈值</label>
                   <p class="form-hint">
                     观察期内，点赞数超过该值则视为潜在爆款，需要汇报。
                   </p>
@@ -2324,7 +2360,7 @@
               <h3
                 class="modal-title"
                 id="keywordStrategyModalTitle">
-                关键词策略
+                赛道策略
               </h3>
             </div>
           </div>
@@ -2350,21 +2386,29 @@
         <p
           class="batch-modal-hint"
           id="keywordStrategyLongtailHint">
-          先按最近半年与最多点赞统一采样，再在当前页面可见地完成主词判断和长尾词下钻。
+          先基于当前搜索词判断赛道机会，再找对标账号和分析长尾需求。
         </p>
 
         <div class="batch-modal-body keyword-strategy-modal-body">
           <div
             class="keyword-strategy-tabs"
             role="tablist"
-            aria-label="关键词策略标签页">
+            aria-label="赛道策略标签页">
             <button
               type="button"
               class="keyword-strategy-tab is-active"
               id="btnKeywordStrategyTabOpportunity"
               data-strategy-tab="opportunity"
               aria-selected="true">
-              主词机会判断
+              判断赛道机会
+            </button>
+            <button
+              type="button"
+              class="keyword-strategy-tab"
+              id="btnKeywordStrategyTabBenchmark"
+              data-strategy-tab="benchmark"
+              aria-selected="false">
+              找对标账号
             </button>
             <button
               type="button"
@@ -2372,7 +2416,7 @@
               id="btnKeywordStrategyTabLongtail"
               data-strategy-tab="longtail"
               aria-selected="false">
-              长尾词需求分析
+              分析长尾需求
             </button>
           </div>
 
@@ -2384,11 +2428,11 @@
               id="keywordOpportunityIntro">
               <div id="keywordOpportunityIntroText">
                 <div class="keyword-strategy-placeholder-title">
-                  主词机会判断如何工作？
+                  怎么判断赛道的内容机会？
                 </div>
                 <div class="keyword-strategy-placeholder-text">
-                  当你看到一个大词，不确定还能不能做，或者不知道该从哪个内容角度切进去时，就可以先用这个功能。<br /><br />
-                  你不需要自己一篇篇去翻热门内容，系统会直接帮你判断：<br />
+                  当你搜一个关键词，不确定这个方向你能不能做，或者不知道该从哪个内容角度切进去时，可以先用这个功能。<br /><br />
+                  系统会采样这个词下近半年表现最好的一批内容，帮你判断：<br />
                   1. 这个赛道下面的<b>选题热度分布</b><br />
                   2. 哪些<b>内容角度</b>更容易拿到<b>自然流</b><br />
                   3. 如果你现在开始发内容，优先从哪个方向切入更稳
@@ -2401,7 +2445,7 @@
                   type="button"
                   class="btn btn-primary"
                   id="btnRunKeywordOpportunity">
-                  开始主词机会判断
+                  开始判断赛道机会
                 </button>
                 <button
                   type="button"
@@ -2414,7 +2458,7 @@
                   type="button"
                   class="action-icon-btn keyword-insight-clear-btn"
                   id="btnClearKeywordOpportunityResult"
-                  title="清空主词机会判断结果"
+                  title="清空判断赛道机会结果"
                   hidden>
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -2446,6 +2490,75 @@
 
           <div
             class="keyword-strategy-pane"
+            id="keywordStrategyBenchmarkPane"
+            hidden>
+            <div
+              class="keyword-strategy-placeholder"
+              id="keywordBenchmarkIntro">
+              <div id="keywordBenchmarkIntroText">
+                <div class="keyword-strategy-placeholder-title">
+                  怎么找对标账号？
+                </div>
+                <div class="keyword-strategy-placeholder-text">
+                  当你只知道赛道方向，还不知道该参考谁、该看哪些账号，或者该持续追踪谁时，可以用这个功能。<br /><br />
+                  你不需要自己一个个翻账号主页，系统会直接帮你找到：<br />
+                  1. 哪些账号在这个方向反复产出高表现内容<br />
+                  2. 哪些账号虽然粉丝不高，但有做出爆款的潜质<br />
+                  3. 哪些账号值得打开主页复核，或者纳入监控持续观察
+                </div>
+              </div>
+              <div
+                class="keyword-strategy-actions"
+                style="margin-top: 12px;">
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  id="btnRunBenchmarkDiscovery">
+                  开始找对标账号
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-secondary"
+                  id="btnCancelBenchmarkDiscovery"
+                  style="display: none;">
+                  停止
+                </button>
+                <button
+                  type="button"
+                  class="action-icon-btn keyword-insight-clear-btn"
+                  id="btnClearBenchmarkDiscoveryResult"
+                  title="清空找对标账号结果"
+                  hidden>
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="lucide lucide-eraser">
+                    <path
+                      d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                    <path d="M22 21H7" />
+                    <path d="m5 11 9 9" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div
+              class="keyword-strategy-error"
+              id="keywordBenchmarkError"
+              hidden></div>
+            <div
+              class="keyword-strategy-result"
+              id="keywordBenchmarkResult"></div>
+          </div>
+
+          <div
+            class="keyword-strategy-pane"
             id="keywordStrategyLongtailPane"
             hidden>
             <div class="form-group">
@@ -2457,7 +2570,7 @@
                     type="button"
                     class="btn btn-secondary"
                     id="btnExpandKeywords">
-                    开始长尾词需求分析
+                    开始分析长尾需求
                   </button>
                   <button
                     type="button"
@@ -2488,15 +2601,14 @@
                 class="keyword-strategy-placeholder"
                 id="keywordInsightIntro">
                 <div class="keyword-strategy-placeholder-title">
-                  长尾词需求分析能帮你做什么？
+                  怎么分析长尾需求？
                 </div>
                 <div class="keyword-strategy-placeholder-text">
-                  当你想知道，用户会从哪些具体问题和角度来搜索这个主题时，就可以用这个功能。<br /><br />
-                  系统会帮你扩展出这个关键词相关的真实搜索词，让你看到用户到底在搜什么、关心什么、卡在哪些具体问题上。<br /><br />
-                  你最终能直接看到：<br />
-                  1. 用户真实会怎么搜索这个主题<br />
-                  2. 哪些具体搜索问题和角度最值得做内容<br />
-                  3. 哪些长尾搜索词更适合帮你布局搜索流量
+                  当你想知道用户围绕这个方向具体在搜什么、哪些细分问题值得做内容时，可以用这个功能。<br /><br />
+                  你不需要自己反复试搜索词，系统会直接帮你看到：<br />
+                  1. 用户最常搜索的具体问题和需求角度<br />
+                  2. 哪些长尾需求适合拆成选题或系列内容<br />
+                  3. 哪些搜索词更适合帮你布局搜索流量
                 </div>
                 <div
                   class="keyword-strategy-actions"
@@ -2505,7 +2617,7 @@
                     type="button"
                     class="btn btn-primary"
                     id="btnRunKeywordInsight">
-                    开始长尾词需求分析
+                    开始分析长尾需求
                   </button>
                 </div>
               </div>

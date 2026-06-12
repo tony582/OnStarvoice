@@ -129,7 +129,7 @@ export function ReportsPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
-      <section className="grid gap-5 rounded-xl border border-border bg-card p-5 lg:grid-cols-[minmax(0,1fr)_minmax(420px,0.9fr)]">
+      <section className="grid gap-5 rounded-lg border border-border bg-card p-5 lg:grid-cols-[minmax(0,1fr)_minmax(420px,0.9fr)]">
         <div className="flex min-w-0 flex-col justify-between gap-8">
           <div>
             <div className="text-xs font-bold uppercase tracking-wide text-primary">Report Center</div>
@@ -186,7 +186,7 @@ export function ReportsPage() {
         </div>
       )}
 
-      <section className="rounded-xl border border-border bg-card">
+      <section className="rounded-lg border border-border bg-card">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
           <div>
             <h3 className="text-base font-bold">历史报告</h3>
@@ -292,9 +292,9 @@ function ReportPreviewDrawer({ preview, activeTab, onTabChange, onClose }: {
   const html = previewHtml(preview, activeTab)
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/35 backdrop-blur-sm" />
+      <div className="absolute inset-0 bg-black/35" />
       <div
-        className="relative z-10 flex h-full w-full max-w-[1440px] flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-200"
+        className="relative z-10 flex h-full w-full max-w-[1440px] flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200"
         onClick={e => e.stopPropagation()}
       >
         <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border px-6 py-4">
@@ -323,7 +323,7 @@ function ReportPreviewDrawer({ preview, activeTab, onTabChange, onClose }: {
                   type="button"
                   onClick={() => onTabChange(tab.id)}
                   className={`inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm font-semibold transition ${
-                    active ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'
+                    active ? 'bg-card text-primary' : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
                   <Icon className="h-4 w-4" />

@@ -94,7 +94,7 @@ export function AnalyticsPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
-      <section className="rounded-xl border border-border bg-card p-5">
+      <section className="rounded-lg border border-border bg-card p-5">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <div className="text-xs font-bold uppercase tracking-wide text-primary">Live Analytics</div>
@@ -113,7 +113,7 @@ export function AnalyticsPage() {
                   type="button"
                   onClick={() => setRange(option.id)}
                   className={`h-8 rounded-md px-3 text-xs font-semibold transition ${
-                    range === option.id ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'
+                    range === option.id ? 'bg-card text-primary' : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
                   {option.label}
@@ -158,7 +158,7 @@ export function AnalyticsPage() {
             {kpis.map(item => {
               const Icon = item.icon
               return (
-                <article key={item.label} className="rounded-xl border border-border bg-card p-4">
+                <article key={item.label} className="rounded-lg border border-border bg-card p-4">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-xs font-semibold text-muted-foreground">{item.label}</div>
                     <Icon className={`h-4 w-4 ${item.tone === 'danger' ? 'text-destructive' : item.tone === 'warning' ? 'text-amber-600' : 'text-primary'}`} />
@@ -230,7 +230,7 @@ export function AnalyticsPage() {
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="overflow-hidden rounded-xl border border-border bg-card">
+    <section className="overflow-hidden rounded-lg border border-border bg-card">
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
         <h3 className="text-sm font-bold">{title}</h3>
       </div>

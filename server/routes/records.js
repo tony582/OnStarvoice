@@ -2,8 +2,165 @@ import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
+import { collectRecordMediaUrls, isAllowedMediaHost, streamMediaToResponse } from '../services/media-proxy.js';
 
 const router = Router();
+
+const RECORD_TABLE_TYPES = {
+  single_notes: ['single_note', ''],
+  keyword_notes: ['keyword_notes', 'keyword'],
+  blogger_profiles: ['blogger_profile'],
+  blogger_notes: ['blogger_notes'],
+};
+
+function tablePagination(query) {
+  const page = Math.max(1, Number(query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(query.pageSize) || 50));
+  return { page, pageSize, offset: (page - 1) * pageSize };
+}
+
+function appendCommonRecordFilters({ where, params, query }) {
+  if (query.platform) {
+    params.push(query.platform);
+    where += ` AND platform = $${params.length}`;
+  }
+  if (query.keyword) {
+    const kw = `%${String(query.keyword).trim()}%`;
+    params.push(kw, kw, kw, kw);
+    where += ` AND (
+      title ILIKE $${params.length - 3}
+      OR content ILIKE $${params.length - 2}
+      OR author_name ILIKE $${params.length - 1}
+      OR keyword ILIKE $${params.length}
+    )`;
+  }
+  return where;
+}
+
+async function listRecordTable(req, table) {
+  const types = RECORD_TABLE_TYPES[table];
+  const { page, pageSize, offset } = tablePagination(req.query);
+  const params = [req.tenantId, types];
+  let where = "WHERE tenant_id = $1 AND COALESCE(record_type, '') = ANY($2)";
+  where = appendCommonRecordFilters({ where, params, query: req.query });
+  const total = (await queryOne(`SELECT COUNT(*) AS total FROM records ${where}`, params))?.total || 0;
+  params.push(pageSize, offset);
+  const rows = await queryAll(`
+    SELECT *
+    FROM records
+    ${where}
+    ORDER BY created_at DESC, last_seen_at DESC
+    LIMIT $${params.length - 1} OFFSET $${params.length}
+  `, params);
+  return { rows, pagination: { page, pageSize, total: Number(total || 0), totalPages: Math.ceil(Number(total || 0) / pageSize) } };
+}
+
+async function listCommentLeadTable(req) {
+  const { page, pageSize, offset } = tablePagination(req.query);
+  const params = [req.tenantId];
+  let where = 'WHERE cl.tenant_id = $1';
+  if (req.query.platform) {
+    params.push(req.query.platform);
+    where += ` AND cl.platform = $${params.length}`;
+  }
+  if (req.query.keyword) {
+    const kw = `%${String(req.query.keyword).trim()}%`;
+    params.push(kw, kw, kw, kw);
+    where += ` AND (
+      cl.record_title ILIKE $${params.length - 3}
+      OR cl.comment_content ILIKE $${params.length - 2}
+      OR cl.comment_author_name ILIKE $${params.length - 1}
+      OR cl.comment_ip_location ILIKE $${params.length}
+    )`;
+  }
+  const joins = `
+    FROM comment_leads cl
+    LEFT JOIN record_comments rc ON rc.id = cl.comment_id AND rc.tenant_id = cl.tenant_id
+    LEFT JOIN records r ON r.id = cl.record_id AND r.tenant_id = cl.tenant_id
+  `;
+  const total = (await queryOne(`SELECT COUNT(*) AS total ${joins} ${where}`, params))?.total || 0;
+  params.push(pageSize, offset);
+  const rows = await queryAll(`
+    SELECT
+      cl.*,
+      rc.payload AS comment_payload,
+      rc.author_avatar AS comment_author_avatar,
+      r.blogger_profile_url,
+      r.keyword AS record_keyword,
+      r.payload AS record_payload
+    ${joins}
+    ${where}
+    ORDER BY cl.captured_at DESC, cl.created_at DESC
+    LIMIT $${params.length - 1} OFFSET $${params.length}
+  `, params);
+  return { rows, pagination: { page, pageSize, total: Number(total || 0), totalPages: Math.ceil(Number(total || 0) / pageSize) } };
+}
+
+async function listMonitorContentTable(req) {
+  const { page, pageSize, offset } = tablePagination(req.query);
+  const params = [req.tenantId];
+  let where = `
+    WHERE ro.tenant_id = $1
+      AND ro.monitor_execution_id IS NOT NULL
+  `;
+  if (req.query.platform) {
+    params.push(req.query.platform);
+    where += ` AND r.platform = $${params.length}`;
+  }
+  if (req.query.keyword) {
+    const kw = `%${String(req.query.keyword).trim()}%`;
+    params.push(kw, kw, kw, kw);
+    where += ` AND (
+      r.title ILIKE $${params.length - 3}
+      OR r.content ILIKE $${params.length - 2}
+      OR r.author_name ILIKE $${params.length - 1}
+      OR COALESCE(ms.keyword, ro.keyword, r.keyword, '') ILIKE $${params.length}
+    )`;
+  }
+  const joins = `
+    FROM record_observations ro
+    JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+    LEFT JOIN monitor_executions me ON me.id = ro.monitor_execution_id AND me.tenant_id = ro.tenant_id
+    LEFT JOIN monitor_subscriptions ms ON ms.id = me.subscription_id AND ms.tenant_id = ro.tenant_id
+  `;
+  const rankedCte = `
+    WITH ranked_monitor_content AS (
+      SELECT
+        r.*,
+        ro.id AS observation_id,
+        ro.captured_at AS monitor_captured_at,
+        ro.keyword AS monitor_hit_keyword,
+        ro.rank_position AS monitor_rank_position,
+        ro.interaction_total AS monitor_interaction_total,
+        ms.id AS monitor_subscription_id,
+        ms.name AS monitor_name,
+        ms.keyword AS monitor_keyword,
+        ms.account_url AS monitor_account_url,
+        ROW_NUMBER() OVER (
+          PARTITION BY ro.tenant_id, ro.record_id, me.subscription_id
+          ORDER BY ro.captured_at DESC, ro.id DESC
+        ) AS monitor_observation_rank
+      ${joins}
+      ${where}
+    )
+  `;
+  const total = (await queryOne(`
+    ${rankedCte}
+    SELECT COUNT(*) AS total
+    FROM ranked_monitor_content
+    WHERE monitor_observation_rank = 1
+  `, params))?.total || 0;
+  params.push(pageSize, offset);
+  const rows = await queryAll(`
+    ${rankedCte}
+    SELECT *
+    FROM ranked_monitor_content
+    WHERE monitor_observation_rank = 1
+    ORDER BY monitor_captured_at DESC
+    LIMIT $${params.length - 1} OFFSET $${params.length}
+  `, params);
+  return { rows, pagination: { page, pageSize, total: Number(total || 0), totalPages: Math.ceil(Number(total || 0) / pageSize) } };
+}
 
 async function ensureRecord(req, res) {
   const record = await queryOne(
@@ -25,6 +182,25 @@ router.get('/:id/observations', requireTenantAccess, async (req, res, next) => {
       [req.params.id, req.tenantId]
     );
     return res.json({ ok: true, observations });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/tables/:table', requireTenantAccess, async (req, res, next) => {
+  try {
+    const table = String(req.params.table || '');
+    let result;
+    if (RECORD_TABLE_TYPES[table]) {
+      result = await listRecordTable(req, table);
+    } else if (table === 'comment_leads') {
+      result = await listCommentLeadTable(req);
+    } else if (table === 'monitor_content') {
+      result = await listMonitorContentTable(req);
+    } else {
+      return res.status(404).json({ ok: false, error: 'unknown_table', message: '数据表不存在' });
+    }
+    return res.json({ ok: true, table, ...result });
   } catch (err) {
     return next(err);
   }
@@ -84,6 +260,42 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
       `, [req.tenantId, req.user?.id || '', req.user?.id || null, req.params.id, JSON.stringify({ status: nextStatus, note })]);
     });
     return res.json({ ok: true });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * 媒体透明代理下载：server 带 Referer 抓取直链并流式转发，不落盘。
+ * GET /api/records/:id/media-proxy?url=<媒体直链>&filename=<保存文件名>
+ * 安全：校验记录属于当前租户、url 确实属于该记录、host 在白名单内（防 SSRF/越权）。
+ */
+router.get('/:id/media-proxy', requireTenantAccess, async (req, res, next) => {
+  try {
+    const url = String(req.query.url || '').trim();
+    const filename = String(req.query.filename || 'attachment').trim() || 'attachment';
+    if (!url || !/^https?:\/\//i.test(url)) {
+      return res.status(400).json({ ok: false, error: 'invalid_url', message: '缺少有效的媒体直链' });
+    }
+    if (!isAllowedMediaHost(url)) {
+      return res.status(403).json({ ok: false, error: 'host_not_allowed', message: '该域名不在允许下载的列表内' });
+    }
+
+    const record = await queryOne(
+      `SELECT id, platform, cover_url, image_urls, video_url, audio_url, payload
+       FROM records WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, req.tenantId]
+    );
+    if (!record) {
+      return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    }
+
+    const allowed = collectRecordMediaUrls(record);
+    if (!allowed.has(url)) {
+      return res.status(403).json({ ok: false, error: 'url_not_in_record', message: '该直链不属于这条记录' });
+    }
+
+    return streamMediaToResponse({ url, filename, platform: record.platform, res });
   } catch (err) {
     return next(err);
   }
