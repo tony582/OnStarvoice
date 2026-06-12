@@ -2,8 +2,38 @@ import { Router } from 'express';
 import { queryAll, queryOne } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
 import { applyResolvedMetrics } from '../utils/metrics.js';
+import { ACTIVE_QUEUE_CONDITION } from './triage.js';
 
 const router = Router();
+
+// 侧边栏徽标计数:4 个轻量 COUNT,单次往返。triagePending 与收件箱「待处理队列」同条件。
+router.get('/badges', requireTenantAccess, async (req, res, next) => {
+  try {
+    const row = await queryOne(`
+      SELECT
+        (SELECT COUNT(*)
+         FROM records r
+         LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
+         WHERE r.tenant_id = $1 AND (${ACTIVE_QUEUE_CONDITION})) AS triage_pending,
+        (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new') AS leads_new,
+        (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
+        (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention
+    `, [req.tenantId]);
+
+    return res.json({
+      ok: true,
+      badges: {
+        triagePending: Number(row?.triage_pending || 0),
+        leadsNew: Number(row?.leads_new || 0),
+        issuesOpen: Number(row?.issues_open || 0),
+        monitorAttention: Number(row?.monitor_attention || 0),
+      },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 router.get('/overview', requireTenantAccess, async (req, res, next) => {
   try {

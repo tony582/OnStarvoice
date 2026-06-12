@@ -6,6 +6,16 @@ const router = Router();
 
 const TRIAGE_STATUSES = new Set(['unhandled', 'reviewing', 'issue_linked', 'official_responded', 'archived', 'false_positive']);
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// 收件箱「待处理队列」条件(别名约定: records r / record_triage rt)。
+// workspace.js 的 /badges 计数 import 此常量,保证侧边栏徽标与收件箱列表数字一致。
+export const ACTIVE_QUEUE_CONDITION = `
+  r.record_type <> 'official_content'
+  AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
+  AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
+  AND NOT (r.official_response_status = 'responded' AND r.negative_comment_count = 0)
+`;
 
 function validateStatus(status) {
   return TRIAGE_STATUSES.has(status || '') ? status : null;
@@ -51,12 +61,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     } else if (queue === 'active') {
-      where += `
-        AND r.record_type <> 'official_content'
-        AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
-        AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
-        AND NOT (r.official_response_status = 'responded' AND r.negative_comment_count = 0)
-      `;
+      where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
     }
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
@@ -116,26 +121,96 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+// 批量分诊更新。注意:必须注册在 '/records/:recordId' 之前,否则 'batch' 会被当作 recordId 解析。
+router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const rawIds = req.body?.ids;
+    if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 100) {
+      return res.status(400).json({ ok: false, error: 'invalid_ids', message: 'ids 需为 1-100 个内容ID' });
+    }
+    const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()).filter(Boolean))];
+    const validIds = ids.filter(id => UUID_RE.test(id));
+
+    const status = req.body?.status ? String(req.body.status) : null;
+    const priority = req.body?.priority ? String(req.body.priority) : null;
+    if (status !== null && !validateStatus(status)) {
+      return res.status(400).json({ ok: false, error: 'invalid_status', message: '分诊状态无效' });
+    }
+    if (priority !== null && !validatePriority(priority)) {
+      return res.status(400).json({ ok: false, error: 'invalid_priority', message: '优先级无效' });
+    }
+    if (status === null && priority === null) {
+      return res.status(400).json({ ok: false, error: 'empty_update', message: '没有要更新的字段' });
+    }
+
+    let updatedIds = [];
+    if (validIds.length) {
+      updatedIds = await withTransaction(async tx => {
+        const rows = await tx.queryAll(`
+          INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, updated_at)
+          SELECT r.tenant_id, r.id, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, $6, now()
+          FROM records r
+          WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[])
+          ON CONFLICT (tenant_id, record_id)
+          DO UPDATE SET
+            status = CASE WHEN $3::text IS NOT NULL THEN excluded.status ELSE record_triage.status END,
+            priority = CASE WHEN $4::text IS NOT NULL THEN excluded.priority ELSE record_triage.priority END,
+            owner_user_id = excluded.owner_user_id,
+            owner_name = excluded.owner_name,
+            updated_at = now()
+          RETURNING record_id
+        `, [req.tenantId, validIds, status, priority, req.user?.id || null, req.actorName || '']);
+        await tx.execute(`
+          INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
+          VALUES ($1, $2, $3, $4, 'record.triage_batch_updated', 'record', '', $5::jsonb)
+        `, [
+          req.tenantId,
+          req.actorType || 'system',
+          req.user?.id || req.authCode || '',
+          req.user?.id || null,
+          JSON.stringify({ recordIds: validIds, status, priority, updated: rows.length }),
+        ]);
+        return rows.map(row => String(row.record_id).toLowerCase());
+      });
+    }
+
+    const updatedSet = new Set(updatedIds);
+    const skipped = ids.filter(id => !updatedSet.has(id));
+    return res.json({ ok: true, updated: updatedSet.size, skipped });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    const status = validateStatus(req.body?.status) || 'unhandled';
-    const priority = validatePriority(req.body?.priority) || 'normal';
-    const ownerName = String(req.body?.ownerName || '');
-    const note = String(req.body?.note || '');
+    // 部分更新语义:仅更新请求里携带的字段。
+    // 旧实现会把缺省字段重置(只传 priority 时 status 被打回 unhandled),已修复。
+    const body = req.body || {};
+    const status = body.status ? String(body.status) : null;
+    const priority = body.priority ? String(body.priority) : null;
+    if (status !== null && !validateStatus(status)) {
+      return res.status(400).json({ ok: false, error: 'invalid_status', message: '分诊状态无效' });
+    }
+    if (priority !== null && !validatePriority(priority)) {
+      return res.status(400).json({ ok: false, error: 'invalid_priority', message: '优先级无效' });
+    }
+    const ownerName = Object.prototype.hasOwnProperty.call(body, 'ownerName') ? String(body.ownerName || '') : null;
+    const note = Object.prototype.hasOwnProperty.call(body, 'note') ? String(body.note || '') : null;
 
     const result = await withTransaction(async tx => {
       const record = await tx.queryOne('SELECT id FROM records WHERE id = $1 AND tenant_id = $2', [req.params.recordId, req.tenantId]);
       if (!record) return null;
       const triage = await tx.queryOne(`
         INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, note, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+        VALUES ($1, $2, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, COALESCE($6, ''), COALESCE($7, ''), now())
         ON CONFLICT (tenant_id, record_id)
         DO UPDATE SET
-          status = excluded.status,
-          priority = excluded.priority,
+          status = CASE WHEN $3::text IS NOT NULL THEN excluded.status ELSE record_triage.status END,
+          priority = CASE WHEN $4::text IS NOT NULL THEN excluded.priority ELSE record_triage.priority END,
           owner_user_id = excluded.owner_user_id,
-          owner_name = excluded.owner_name,
-          note = excluded.note,
+          owner_name = CASE WHEN $6::text IS NOT NULL THEN excluded.owner_name ELSE record_triage.owner_name END,
+          note = CASE WHEN $7::text IS NOT NULL THEN excluded.note ELSE record_triage.note END,
           updated_at = now()
         RETURNING *
       `, [req.tenantId, req.params.recordId, status, priority, req.user?.id || null, ownerName, note]);

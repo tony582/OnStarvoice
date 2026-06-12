@@ -87,6 +87,50 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// 批量更新评论线索。注意:必须注册在 '/comments/:id' 之前,否则 'batch' 会被当作 id 解析。
+router.patch('/comments/batch', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const rawIds = req.body?.ids;
+    if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 100) {
+      return res.status(400).json({ ok: false, error: 'invalid_ids', message: 'ids 需为 1-100 个线索ID' });
+    }
+    const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()).filter(Boolean))];
+    const validIds = ids.filter(id => UUID_RE.test(id));
+
+    const status = req.body?.status ? String(req.body.status) : null;
+    const priority = req.body?.priority ? String(req.body.priority) : null;
+    if (status !== null && !LEAD_STATUSES.has(status)) {
+      return res.status(400).json({ ok: false, error: 'invalid_status', message: '线索状态无效' });
+    }
+    if (priority !== null && !LEAD_PRIORITIES.has(priority)) {
+      return res.status(400).json({ ok: false, error: 'invalid_priority', message: '线索优先级无效' });
+    }
+    if (status === null && priority === null) {
+      return res.status(400).json({ ok: false, error: 'empty_update', message: '没有要更新的字段' });
+    }
+
+    let updatedRows = [];
+    if (validIds.length) {
+      updatedRows = await queryAll(`
+        UPDATE comment_leads
+        SET status = COALESCE($3, status),
+          priority = COALESCE($4, priority),
+          updated_at = now()
+        WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        RETURNING id
+      `, [req.tenantId, validIds, status, priority]);
+    }
+
+    const updatedSet = new Set(updatedRows.map(row => String(row.id).toLowerCase()));
+    const skipped = ids.filter(id => !updatedSet.has(id));
+    return res.json({ ok: true, updated: updatedSet.size, skipped });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.patch('/comments/:id', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const status = String(req.body?.status || '');
