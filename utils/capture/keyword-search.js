@@ -13,9 +13,16 @@ import {
   normalizeDate,
   cleanText,
   extractNoteId,
+  randomScrollDistance,
 } from "../helpers.js";
 import {PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG} from "../constants.js";
 import {autoScrollLoad, isCanceled, resetCancelFlag, wait} from "../scroll.js";
+import {
+  buildFilterApplyStage,
+  buildListParseStage,
+  buildScrollLoadStage,
+  countMissingMetric,
+} from "./stage-diagnostics.js";
 
 const KEYWORD_SORT_DIMENSION = {
   LIKES: "likes",
@@ -28,6 +35,9 @@ const SORT_DIMENSION_LABEL_MAP = {
   [KEYWORD_SORT_DIMENSION.COLLECTS]: "收藏",
   [KEYWORD_SORT_DIMENSION.COMMENTS]: "评论",
 };
+
+const MIN_KEYWORD_STALL_TIMEOUT_MS = 15000;
+const REQUIRED_KEYWORD_STALL_ROUNDS = 5;
 
 /**
  * 采集关键词搜索结果
@@ -93,9 +103,9 @@ export async function captureKeywordNotes({
       normalizedWaitMinMs <= normalizedWaitMaxMs
         ? {min: normalizedWaitMinMs, max: normalizedWaitMaxMs}
         : {min: normalizedWaitMaxMs, max: normalizedWaitMinMs};
-    const normalizedStallTimeoutMs = normalizePositiveInteger(
-      stallTimeoutMs,
-      3000,
+    const normalizedStallTimeoutMs = Math.max(
+      normalizePositiveInteger(stallTimeoutMs, 3000),
+      MIN_KEYWORD_STALL_TIMEOUT_MS,
     );
     const normalizedMaxDurationMs = normalizePositiveInteger(
       maxDurationMs,
@@ -113,7 +123,6 @@ export async function captureKeywordNotes({
     };
     let lastGrowthAt = Date.now();
     let lastObservedCount = 0;
-    const requiredStallRounds = 3;
 
     const emitProgress = (progress = {}) => {
       if (!onProgress) return;
@@ -170,6 +179,9 @@ export async function captureKeywordNotes({
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
+      scrollStep: async ({noNewContentCount = 0} = {}) => {
+        await scrollKeywordSearchResults({noNewContentCount});
+      },
       stopWhen: ({currentContentCount, noNewContentCount}) => {
         if (progressStats.detectedCount >= normalizedMaxDetectedItems) {
           return {
@@ -187,7 +199,7 @@ export async function captureKeywordNotes({
 
         if (
           Date.now() - lastGrowthAt >= normalizedStallTimeoutMs &&
-          noNewContentCount >= requiredStallRounds
+          noNewContentCount >= REQUIRED_KEYWORD_STALL_ROUNDS
         ) {
           return {
             stop: true,
@@ -213,6 +225,51 @@ export async function captureKeywordNotes({
         normalizedMinLikes,
     );
     const items = filteredItems.slice(0, normalizedMaxDetectedItems);
+    const missingMetricCount = countMissingMetric(
+      allItems,
+      normalizeSortDimension(resolvedSortDimension),
+    );
+    const metricCounts = allItems.map((item) =>
+      getKeywordMetricCountByDimension(item, resolvedSortDimension),
+    );
+    const minMetricCount = metricCounts.length ? Math.min(...metricCounts) : 0;
+    const maxMetricCount = metricCounts.length ? Math.max(...metricCounts) : 0;
+    const zeroMetricCount = metricCounts.filter((count) => count === 0).length;
+    const metricExtractionSuspicious =
+      allItems.length > 0 && maxMetricCount === 0;
+    const stageTrace = [
+      buildScrollLoadStage({
+        label: "搜索结果滚动加载",
+        requestedMaxDetectedItems: normalizedMaxDetectedItems,
+        finalContentCount: allItems.length,
+        scrollResult,
+        maxScrollTimes: normalizedMaxScrollTimes,
+        waitMinMs: waitRange.min,
+        waitMaxMs: waitRange.max,
+        stallTimeoutMs: normalizedStallTimeoutMs,
+        maxDurationMs: normalizedMaxDurationMs,
+      }),
+      buildListParseStage({
+        label: "搜索结果解析",
+        rawTotalCount: allItems.length,
+        parsedCount: allItems.length,
+        missingMetricCount,
+      }),
+      buildFilterApplyStage({
+        label: "搜索互动阈值筛选",
+        rawTotalCount: allItems.length,
+        filteredBeforeLimitCount: filteredItems.length,
+        filteredCount: items.length,
+        minLikes: normalizedMinLikes,
+        sortDimension: resolvedSortDimension,
+        maxDetectedItems: normalizedMaxDetectedItems,
+        missingMetricCount,
+        minMetricCount,
+        maxMetricCount,
+        zeroMetricCount,
+        metricExtractionSuspicious,
+      }),
+    ];
 
     if (items.length === 0) {
       const sample = allItems.slice(0, 3).map((item) => ({
@@ -268,9 +325,17 @@ export async function captureKeywordNotes({
         captureFinishedAt: new Date().toISOString(),
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
+          maxScrollTimes: scrollResult.maxScrollTimes,
           completed: scrollResult.completed,
           canceled: scrollResult.canceled,
+          stopReason: scrollResult.stopReason,
+          finalContentCount: scrollResult.finalContentCount,
+          noNewContentCount: scrollResult.noNewContentCount,
+          elapsedMs: scrollResult.elapsedMs,
         },
+      },
+      diagnostics: {
+        stageTrace,
       },
       error: null,
     };
@@ -295,6 +360,99 @@ export async function captureKeywordNotes({
 }
 
 // ==================== 辅助函数 ====================
+
+async function scrollKeywordSearchResults({noNewContentCount = 0} = {}) {
+  const target = findKeywordSearchScrollTarget();
+  const strongPush = noNewContentCount >= 2;
+  const distance = randomScrollDistance(
+    strongPush ? 900 : 500,
+    strongPush ? 1800 : 1100,
+  );
+
+  dispatchWheelHint(target, distance);
+
+  if (target === window) {
+    window.scrollBy({
+      top: distance,
+      behavior: "smooth",
+    });
+  } else {
+    target.scrollTo({
+      top: target.scrollTop + distance,
+      behavior: "smooth",
+    });
+  }
+
+  await wait(250);
+}
+
+function findKeywordSearchScrollTarget() {
+  const roots = [
+    querySelector(SEARCH_RESULTS_SELECTORS.container),
+    document.querySelector("#global"),
+    document.querySelector("#app"),
+    document.querySelector("main"),
+    document.scrollingElement,
+    document.documentElement,
+    document.body,
+  ].filter(Boolean);
+
+  for (const root of roots) {
+    const target = findScrollableAncestor(root);
+    if (target) {
+      return target;
+    }
+  }
+
+  return window;
+}
+
+function findScrollableAncestor(startNode) {
+  let node = startNode;
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (isScrollableElement(node)) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+
+  if (isDocumentScrollable()) {
+    return window;
+  }
+  return null;
+}
+
+function isScrollableElement(node) {
+  if (!node || typeof node !== "object" || node === window) return false;
+  const style = window.getComputedStyle(node);
+  const overflowY = style?.overflowY || "";
+  return (
+    (overflowY.includes("auto") || overflowY.includes("scroll")) &&
+    node.scrollHeight > node.clientHeight + 24
+  );
+}
+
+function isDocumentScrollable() {
+  const doc = document.documentElement;
+  return doc.scrollHeight > window.innerHeight + 24;
+}
+
+function dispatchWheelHint(target, distance) {
+  const eventTarget =
+    target === window
+      ? document.scrollingElement || document.documentElement
+      : target;
+  if (!eventTarget?.dispatchEvent) return;
+
+  eventTarget.dispatchEvent(
+    new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: distance,
+      view: window,
+    }),
+  );
+}
 
 /**
  * 从 URL 提取搜索关键词
@@ -389,6 +547,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         publishDateRaw,
       );
       const authorAvatar = extractAuthorAvatarFromCard(item);
+      const authorProfileUrl = extractAuthorProfileUrlFromCard(item);
 
       // 提取笔记类型
       const noteType = detectKeywordNoteType(item);
@@ -438,6 +597,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         author: authorName,
         authorAvatar,
         avatarUrl: authorAvatar,
+        authorProfileUrl,
         noteType,
         publishDate,
         publishDateRaw,
@@ -617,6 +777,22 @@ function extractImageUrlFromElement(element) {
     element.src ||
     ""
   );
+function extractAuthorProfileUrlFromCard(cardNode) {
+  if (!cardNode) return "";
+
+  const candidates = [];
+  const links = cardNode.querySelectorAll(
+    'a[href*="/user/profile/"],a[data-href*="/user/profile/"],a[data-url*="/user/profile/"]',
+  );
+  links.forEach((link) => {
+    candidates.push(link.getAttribute("href") || link.href || "");
+    candidates.push(link.getAttribute("data-href"));
+    candidates.push(link.getAttribute("data-url"));
+    candidates.push(link.dataset?.href);
+    candidates.push(link.dataset?.url);
+  });
+
+  return pickBestAuthorProfileUrl(candidates);
 }
 
 function detectKeywordNoteType(cardNode) {
@@ -1162,6 +1338,24 @@ function pickBestNoteUrl(candidates = []) {
   return "";
 }
 
+function pickBestAuthorProfileUrl(candidates = []) {
+  const uniqueCandidates = new Set();
+  const normalizedCandidates = [];
+
+  candidates.forEach((candidate) => {
+    const normalized = normalizeAbsoluteUrl(candidate);
+    if (!normalized || uniqueCandidates.has(normalized)) {
+      return;
+    }
+    uniqueCandidates.add(normalized);
+    normalizedCandidates.push(normalized);
+  });
+
+  return (
+    normalizedCandidates.find((url) => isXiaohongshuAuthorProfileUrl(url)) || ""
+  );
+}
+
 function scoreNoteUrl(url) {
   if (!isXiaohongshuNoteUrl(url)) {
     return -1;
@@ -1202,6 +1396,12 @@ function isXiaohongshuNoteUrl(url) {
 
 function isUserProfileNotePath(value) {
   return /\/user\/profile\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+(?:[/?#]|$)/i.test(
+    String(value || ""),
+  );
+}
+
+function isXiaohongshuAuthorProfileUrl(value) {
+  return /\/user\/profile\/[a-zA-Z0-9_-]+(?:[/?#]|$)/i.test(
     String(value || ""),
   );
 }
@@ -1398,11 +1598,19 @@ function normalizeNonNegativeInteger(value, fallback) {
 }
 
 function decodeURIComponentSafe(value) {
-  try {
-    return decodeURIComponent(String(value || "").replace(/\+/g, "%20"));
-  } catch {
-    return String(value || "");
+  let decoded = String(value || "").replace(/\+/g, "%20");
+  for (let i = 0; i < 3; i++) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) {
+        return next;
+      }
+      decoded = next;
+    } catch {
+      return decoded;
+    }
   }
+  return decoded;
 }
 
 function normalizeKeyword(value) {

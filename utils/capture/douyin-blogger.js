@@ -9,6 +9,7 @@ import {
   cleanText,
   extractBloggerId,
   extractNoteId,
+  randomScrollDistance,
 } from "../helpers.js";
 import {autoScrollLoad, isCanceled, resetCancelFlag, wait} from "../scroll.js";
 import {getDomProfile} from "../platform/dom-profiles/index.js";
@@ -24,8 +25,16 @@ import {
   buildReverseMatchHints,
   collectMediaUrlsFromElement,
 } from "./shared/dom-locator.js";
+import {
+  buildFilterApplyStage,
+  buildListParseStage,
+  buildScrollLoadStage,
+  countMissingMetric,
+} from "./stage-diagnostics.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
+const MIN_DOUYIN_BLOGGER_STALL_TIMEOUT_MS = 12000;
+const REQUIRED_DOUYIN_BLOGGER_STALL_ROUNDS = 5;
 
 export async function captureDouyinBloggerProfile() {
   const captureStartedAt = new Date().toISOString();
@@ -117,6 +126,7 @@ export async function captureDouyinBloggerNotes({
   maxDetectedItems = null,
   maxItems = null,
   keywordFilter = "",
+  monitorPublishWindow = "",
   waitMinMs = DEFAULT_CONFIG.SCROLL_DELAY_MIN,
   waitMaxMs = DEFAULT_CONFIG.SCROLL_DELAY_MAX,
   stallTimeoutMs = 3000,
@@ -186,13 +196,19 @@ export async function captureDouyinBloggerNotes({
       maxDurationMs,
       DEFAULT_CONFIG.MAX_CAPTURE_DURATION_MS,
     );
-    const normalizedStallTimeoutMs = normalizePositiveInteger(
-      stallTimeoutMs,
-      3000,
+    const normalizedStallTimeoutMs = Math.max(
+      normalizePositiveInteger(stallTimeoutMs, 3000),
+      MIN_DOUYIN_BLOGGER_STALL_TIMEOUT_MS,
     );
     const normalizedMaxScrollTimes = normalizePositiveInteger(
       maxScrollTimes,
-      DEFAULT_CONFIG.MAX_SCROLL_TIMES,
+      Math.max(
+        DEFAULT_CONFIG.MAX_SCROLL_TIMES,
+        Math.ceil(normalizedMaxDetectedItems / 2),
+      ),
+    );
+    const monitorWindow = resolveMonitorProfilePublishWindow(
+      monitorPublishWindow,
     );
 
     const noteMap = new Map();
@@ -204,7 +220,6 @@ export async function captureDouyinBloggerNotes({
     let lastGrowthAt = Date.now();
     let lastObservedCount = 0;
     let stallRounds = 0;
-    const requiredStallRounds = 3;
 
     const emitProgress = (progress = {}) => {
       if (!onProgress) return;
@@ -227,10 +242,18 @@ export async function captureDouyinBloggerNotes({
       const qualifiedCount = allItems.filter(
         (item) => Number(item.likes || 0) >= normalizedMinLikes,
       ).length;
+      const monitorTimeline = summarizeMonitorProfileTimeline(
+        allItems,
+        monitorWindow,
+      );
       progressStats = {
         detectedCount: allItems.length,
         qualifiedCount,
-        filteredCount: Math.min(qualifiedCount, normalizedMaxDetectedItems),
+        filteredCount: Math.min(
+          monitorTimeline.candidateCount || qualifiedCount,
+          normalizedMaxDetectedItems,
+        ),
+        monitorTimeline,
       };
       return progressStats.detectedCount;
     };
@@ -246,11 +269,24 @@ export async function captureDouyinBloggerNotes({
       },
       detectNewContent: () => collectDetectedNotes(),
       maxScrollTimes: normalizedMaxScrollTimes,
-      noNewContentThreshold: DEFAULT_CONFIG.NO_NEW_CONTENT_THRESHOLD,
+      noNewContentThreshold: 0,
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
+      scrollStep: async ({noNewContentCount = 0} = {}) => {
+        await scrollDouyinBloggerNotesResults(notesRoot, {noNewContentCount});
+      },
       stopWhen: ({currentContentCount}) => {
+        if (progressStats.monitorTimeline?.boundaryReached) {
+          return {
+            stop: true,
+            reason: "publish_window_boundary",
+            message:
+              progressStats.monitorTimeline.message ||
+              "已到达监控发布时间窗口边界，结束滚动",
+          };
+        }
+
         if (currentContentCount >= normalizedMaxDetectedItems) {
           return {
             stop: true,
@@ -269,12 +305,12 @@ export async function captureDouyinBloggerNotes({
         stallRounds += 1;
         if (
           Date.now() - lastGrowthAt >= normalizedStallTimeoutMs &&
-          stallRounds >= requiredStallRounds
+          stallRounds >= REQUIRED_DOUYIN_BLOGGER_STALL_ROUNDS
         ) {
           return {
             stop: true,
             reason: "stall_timeout",
-            message: `连续 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动`,
+            message: `连续约 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已探测 ${progressStats.detectedCount} 条，已筛选 ${progressStats.filteredCount} 条）`,
           };
         }
 
@@ -292,11 +328,22 @@ export async function captureDouyinBloggerNotes({
     const likesFiltered = allItems.filter(
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
     );
+    const monitorWindowFiltered = filterMonitorProfileItemsByPublishWindow(
+      likesFiltered,
+      monitorWindow,
+    );
     const filteredItems = parsedKeywords.length
-      ? likesFiltered.filter((item) =>
+      ? monitorWindowFiltered.filter((item) =>
           matchesKeywordFilter(item.title || "", parsedKeywords),
         )
-      : likesFiltered;
+      : monitorWindowFiltered;
+    const missingMetricCount = countMissingMetric(allItems, "likes");
+    const metricCounts = allItems.map((item) => Number(item.likes || 0));
+    const minMetricCount = metricCounts.length ? Math.min(...metricCounts) : 0;
+    const maxMetricCount = metricCounts.length ? Math.max(...metricCounts) : 0;
+    const zeroMetricCount = metricCounts.filter((count) => count === 0).length;
+    const metricExtractionSuspicious =
+      allItems.length > 0 && maxMetricCount === 0;
 
     const items = filteredItems
       .slice(0, normalizedMaxDetectedItems)
@@ -325,12 +372,47 @@ export async function captureDouyinBloggerNotes({
       rawTotalCount: allItems.length,
       minLikes: normalizedMinLikes,
       maxDetectedItems: normalizedMaxDetectedItems,
+      monitorPublishWindow: monitorWindow.key,
       keywordFilter: keywordFilter || "",
       filteredCount: items.length,
       filteredBeforeLimitCount: filteredItems.length,
       items,
       captureTimestamp: Date.now(),
     };
+    const stageTrace = [
+      buildScrollLoadStage({
+        label: "抖音博主作品滚动加载",
+        requestedMaxDetectedItems: normalizedMaxDetectedItems,
+        finalContentCount: allItems.length,
+        scrollResult,
+        maxScrollTimes: normalizedMaxScrollTimes,
+        waitMinMs: waitRange.min,
+        waitMaxMs: waitRange.max,
+        stallTimeoutMs: normalizedStallTimeoutMs,
+        maxDurationMs: normalizedMaxDurationMs,
+      }),
+      buildListParseStage({
+        label: "抖音博主作品解析",
+        rawTotalCount: allItems.length,
+        parsedCount: allItems.length,
+        missingMetricCount,
+      }),
+      buildFilterApplyStage({
+        label: "抖音博主作品筛选",
+        rawTotalCount: allItems.length,
+        filteredBeforeLimitCount: filteredItems.length,
+        filteredCount: items.length,
+        minLikes: normalizedMinLikes,
+        sortDimension: "likes",
+        keywordFilter,
+        maxDetectedItems: normalizedMaxDetectedItems,
+        missingMetricCount,
+        minMetricCount,
+        maxMetricCount,
+        zeroMetricCount,
+        metricExtractionSuspicious,
+      }),
+    ];
 
     return {
       ok: true,
@@ -342,9 +424,17 @@ export async function captureDouyinBloggerNotes({
         captureFinishedAt: new Date().toISOString(),
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
+          maxScrollTimes: scrollResult.maxScrollTimes,
           completed: scrollResult.completed,
           canceled: scrollResult.canceled,
+          stopReason: scrollResult.stopReason,
+          finalContentCount: scrollResult.finalContentCount,
+          noNewContentCount: scrollResult.noNewContentCount,
+          elapsedMs: scrollResult.elapsedMs,
         },
+      },
+      diagnostics: {
+        stageTrace,
       },
       error: null,
     };
@@ -726,7 +816,7 @@ function parseCount(text) {
 }
 
 function extractFallbackLikeCountFromCard(card) {
-  const text = cleanText(card?.innerText || "");
+  const text = String(card?.innerText || "").trim();
   if (!text) return 0;
 
   const lines = text
@@ -759,6 +849,13 @@ function extractLikeCountFromText(text) {
     return 0;
   }
 
+  const leadingMetricMatch = normalized.match(
+    /^(?:置顶\s*)?([0-9]+(?:\.[0-9]+)?(?:亿|万|[kK])?)(?:\s+|$)/i,
+  );
+  if (leadingMetricMatch?.[1]) {
+    return parseCount(leadingMetricMatch[1]);
+  }
+
   if (/^[0-9]+(?:\.[0-9]+)?(?:亿|万|[kK])?$/.test(normalized)) {
     return parseCount(normalized);
   }
@@ -770,7 +867,9 @@ function isNonMetricLikeText(text) {
   return (
     /^\d{1,2}:\d{2}$/.test(text) ||
     /^\d{1,2}[-/.月]\d{1,2}(?:日)?$/.test(text) ||
+    /^\d{1,2}[-/.月]\d{1,2}(?:日)?\s+/.test(text) ||
     /^\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?$/.test(text) ||
+    /^\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?\s+/.test(text) ||
     /^(?:刚刚|昨天|\d+分钟前|\d+小时前|\d+天前)$/.test(text)
   );
 }
@@ -785,6 +884,278 @@ function extractDouyinId() {
   const text = cleanText(document.body?.innerText || "");
   const match = text.match(/抖音号[:：]?\s*([a-zA-Z0-9_-]+)/i);
   return match?.[1] ? cleanText(match[1]) : "";
+}
+
+const MONITOR_PROFILE_DAY_MS = 24 * 60 * 60 * 1000;
+const MONITOR_PROFILE_SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function getMonitorProfileShanghaiDayStartMs(timestamp = Date.now()) {
+  const safeTimestamp = Number.isFinite(Number(timestamp))
+    ? Number(timestamp)
+    : Date.now();
+  return (
+    Math.floor(
+      (safeTimestamp + MONITOR_PROFILE_SHANGHAI_OFFSET_MS) /
+        MONITOR_PROFILE_DAY_MS,
+    ) *
+      MONITOR_PROFILE_DAY_MS -
+    MONITOR_PROFILE_SHANGHAI_OFFSET_MS
+  );
+}
+
+function getMonitorProfileShanghaiDateParts(timestamp = Date.now()) {
+  const date = new Date(
+    Number(timestamp) + MONITOR_PROFILE_SHANGHAI_OFFSET_MS,
+  );
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+  };
+}
+
+function buildMonitorProfileShanghaiTimestamp({
+  year,
+  month,
+  day,
+  hour = 0,
+  minute = 0,
+}) {
+  const timestamp =
+    Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+      0,
+      0,
+    ) - MONITOR_PROFILE_SHANGHAI_OFFSET_MS;
+  return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+
+function resolveMonitorProfilePublishWindow(value = "") {
+  const key = String(value || "").trim();
+  const nowMs = Date.now();
+  if (key === "previous_day") {
+    const todayStartMs = getMonitorProfileShanghaiDayStartMs(nowMs);
+    return {
+      key,
+      strict: true,
+      label: "昨天发布",
+      startMs: todayStartMs - MONITOR_PROFILE_DAY_MS,
+      endMs: todayStartMs,
+    };
+  }
+  if (key === "last_24h") {
+    return {
+      key,
+      strict: true,
+      label: "最近 24 小时发布",
+      startMs: nowMs - MONITOR_PROFILE_DAY_MS,
+      endMs: nowMs,
+    };
+  }
+  return {
+    key: "",
+    strict: false,
+    label: "",
+    startMs: null,
+    endMs: null,
+  };
+}
+
+function resolveMonitorProfileYearForMonthDay(month, day, nowMs) {
+  const {year} = getMonitorProfileShanghaiDateParts(nowMs);
+  const timestamp = buildMonitorProfileShanghaiTimestamp({year, month, day});
+  if (Number.isFinite(timestamp) && timestamp > nowMs + MONITOR_PROFILE_DAY_MS) {
+    return year - 1;
+  }
+  return year;
+}
+
+function parseMonitorProfilePublishTimestamp(value = "", nowMs = Date.now()) {
+  const text = cleanText(value)
+    .replace(/^发布时间[:：]?\s*/i, "")
+    .replace(/^发布于[:：]?\s*/i, "")
+    .replace(/^·\s*/, "")
+    .trim();
+  if (!text) return null;
+
+  let match = text.match(
+    /(\d{4})[年\-/.](\d{1,2})[月\-/.](\d{1,2})日?(?:\s+|T)?(\d{1,2})[:：](\d{2})/,
+  );
+  if (match) {
+    const [, year, month, day, hour, minute] = match;
+    return buildMonitorProfileShanghaiTimestamp({
+      year,
+      month,
+      day,
+      hour,
+      minute,
+    });
+  }
+
+  match = text.match(/(\d{4})[年\-/.](\d{1,2})[月\-/.](\d{1,2})日?/);
+  if (match) {
+    const [, year, month, day] = match;
+    return buildMonitorProfileShanghaiTimestamp({year, month, day});
+  }
+
+  match = text.match(/(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[:：](\d{2})/);
+  if (match) {
+    const [, month, day, hour, minute] = match;
+    const year = resolveMonitorProfileYearForMonthDay(month, day, nowMs);
+    return buildMonitorProfileShanghaiTimestamp({
+      year,
+      month,
+      day,
+      hour,
+      minute,
+    });
+  }
+
+  match = text.match(/(\d{1,2})[-/.](\d{1,2})\s*(\d{1,2})[:：](\d{2})/);
+  if (match) {
+    const [, month, day, hour, minute] = match;
+    const year = resolveMonitorProfileYearForMonthDay(month, day, nowMs);
+    return buildMonitorProfileShanghaiTimestamp({
+      year,
+      month,
+      day,
+      hour,
+      minute,
+    });
+  }
+
+  match = text.match(/(\d{1,2})月(\d{1,2})日/);
+  if (match) {
+    const [, month, day] = match;
+    const year = resolveMonitorProfileYearForMonthDay(month, day, nowMs);
+    return buildMonitorProfileShanghaiTimestamp({year, month, day});
+  }
+
+  match = text.match(/(\d{1,2})[-/.](\d{1,2})/);
+  if (match) {
+    const [, month, day] = match;
+    const year = resolveMonitorProfileYearForMonthDay(month, day, nowMs);
+    return buildMonitorProfileShanghaiTimestamp({year, month, day});
+  }
+
+  match = text.match(/今天\s*(?:(\d{1,2})[:：](\d{2}))?/);
+  if (match) {
+    const {year, month, day} = getMonitorProfileShanghaiDateParts(nowMs);
+    return buildMonitorProfileShanghaiTimestamp({
+      year,
+      month,
+      day,
+      hour: match[1] || 0,
+      minute: match[2] || 0,
+    });
+  }
+
+  match = text.match(/昨天\s*(?:(\d{1,2})[:：](\d{2}))?/);
+  if (match) {
+    const {year, month, day} = getMonitorProfileShanghaiDateParts(nowMs);
+    return buildMonitorProfileShanghaiTimestamp({
+      year,
+      month,
+      day: day - 1,
+      hour: match[1] || 0,
+      minute: match[2] || 0,
+    });
+  }
+
+  match = text.match(/(\d+)\s*分钟前/);
+  if (match) return nowMs - Number(match[1]) * 60 * 1000;
+
+  match = text.match(/(\d+)\s*小时前/);
+  if (match) return nowMs - Number(match[1]) * 60 * 60 * 1000;
+
+  match = text.match(/(\d+)\s*天前/);
+  if (match) {
+    return (
+      getMonitorProfileShanghaiDayStartMs(nowMs) -
+      Number(match[1]) * MONITOR_PROFILE_DAY_MS
+    );
+  }
+
+  if (/刚刚|刚才|现在/.test(text)) return nowMs;
+
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractMonitorProfilePublishText(card) {
+  const text = cleanText(card?.innerText || card?.textContent || "");
+  if (!text) return "";
+  const patterns = [
+    /发布时间[:：]?\s*\d{4}[年\-/.]\d{1,2}[月\-/.]\d{1,2}日?(?:\s+\d{1,2}[:：]\d{2})?/,
+    /\d{4}[年\-/.]\d{1,2}[月\-/.]\d{1,2}日?(?:\s+\d{1,2}[:：]\d{2})?/,
+    /\d{1,2}月\d{1,2}日(?:\s+\d{1,2}[:：]\d{2})?/,
+    /\d{1,2}[-/.]\d{1,2}(?:\s+\d{1,2}[:：]\d{2})?/,
+    /(?:今天|昨天|前天)(?:\s*\d{1,2}[:：]\d{2})?/,
+    /\d+\s*(?:分钟前|小时前|天前)/,
+    /刚刚|刚才|现在/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[0]) {
+      return cleanText(match[0]);
+    }
+  }
+  return "";
+}
+
+function summarizeMonitorProfileTimeline(items = [], monitorWindow = {}) {
+  if (!monitorWindow?.strict) {
+    return {
+      candidateCount: items.length,
+      boundaryReached: false,
+      message: "",
+    };
+  }
+
+  let candidateCount = 0;
+  let boundaryReached = false;
+  for (const item of items) {
+    const timestamp = Number(item.publishTimestamp || 0);
+    const hasTimestamp = Number.isFinite(timestamp) && timestamp > 0;
+    if (!hasTimestamp) {
+      candidateCount += 1;
+      continue;
+    }
+    if (timestamp >= monitorWindow.startMs && timestamp < monitorWindow.endMs) {
+      candidateCount += 1;
+      continue;
+    }
+    if (timestamp < monitorWindow.startMs && !item.isPinned) {
+      boundaryReached = true;
+      break;
+    }
+  }
+
+  return {
+    candidateCount,
+    boundaryReached,
+    message: boundaryReached
+      ? `已刷到早于${monitorWindow.label}的作品，结束滚动`
+      : "",
+  };
+}
+
+function filterMonitorProfileItemsByPublishWindow(items = [], monitorWindow = {}) {
+  if (!monitorWindow?.strict) {
+    return items;
+  }
+  return items.filter((item) => {
+    const timestamp = Number(item.publishTimestamp || 0);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) {
+      return true;
+    }
+    return timestamp >= monitorWindow.startMs && timestamp < monitorWindow.endMs;
+  });
 }
 
 function extractBloggerAccountType(profileRoot) {
@@ -830,7 +1201,8 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
     if (dedupe.has(dedupeKey)) return;
     dedupe.add(dedupeKey);
 
-    const card = link.closest("a, article, li, div") || link;
+    const card = resolveProfileNoteCardContainer(link);
+    const cardText = cleanText(card?.innerText || card?.textContent || "");
     const title = resolveCardTitle(card, noteId);
     const coverImage = normalizeUrl(
       getAttribute(
@@ -842,6 +1214,9 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
     const cardMedia = collectMediaUrlsFromElement(card);
     const likes = resolveProfileCardLikes(card);
     const noteType = /\/note\//i.test(noteUrl) ? "image" : "video";
+    const publishDateRaw = extractMonitorProfilePublishText(card);
+    const publishTimestamp = parseMonitorProfilePublishTimestamp(publishDateRaw);
+    const isPinned = /置顶|pinned/i.test(cardText);
 
     notes.push({
       noteId,
@@ -852,6 +1227,10 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
       coverImageUrl: coverImage,
       author: bloggerName,
       likes,
+      publishTime: publishDateRaw,
+      publishDateRaw,
+      publishTimestamp,
+      isPinned,
       noteType,
       domLocator: buildDomLocator(card),
       domMatchHints: buildReverseMatchHints({
@@ -869,6 +1248,146 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
   });
 
   return notes;
+}
+
+function resolveProfileNoteCardContainer(link) {
+  if (!link?.parentElement) {
+    return link;
+  }
+
+  const candidates = [];
+  let node = link;
+  for (let depth = 0; node && depth < 7; depth += 1) {
+    if (node === document.body || node === document.documentElement) {
+      break;
+    }
+
+    const text = cleanText(node.innerText || node.textContent || "");
+    const detailLinkCount = node.querySelectorAll
+      ? node.querySelectorAll('a[href*="/video/"], a[href*="/note/"]').length
+      : 0;
+    const hasMedia = Boolean(node.querySelector?.("img, video, picture"));
+    const hasPublishText = Boolean(extractMonitorProfilePublishText(node));
+    const hasCardHint =
+      node.matches?.(
+        'article, li, [data-e2e*="post"], [data-e2e*="item"], [class*="card"], [class*="item"]',
+      ) || false;
+    const score =
+      (detailLinkCount === 1 ? 40 : detailLinkCount > 1 ? -40 : 0) +
+      (hasPublishText ? 35 : 0) +
+      (hasCardHint ? 12 : 0) +
+      (hasMedia ? 8 : 0) +
+      (text ? 6 : 0) -
+      depth;
+
+    candidates.push({node, score, textLength: text.length});
+    node = node.parentElement;
+  }
+
+  candidates.sort(
+    (a, b) => b.score - a.score || a.textLength - b.textLength,
+  );
+  return candidates[0]?.node || link;
+}
+
+async function scrollDouyinBloggerNotesResults(
+  notesRoot = null,
+  {noNewContentCount = 0} = {},
+) {
+  const target = findDouyinBloggerNotesScrollTarget(notesRoot);
+  const strongPush = noNewContentCount >= 2;
+  const distance = randomScrollDistance(
+    strongPush ? 900 : 500,
+    strongPush ? 1800 : 1100,
+  );
+
+  dispatchWheelHint(target, distance);
+
+  if (target === window) {
+    window.scrollBy({
+      top: distance,
+      behavior: "smooth",
+    });
+  } else {
+    target.scrollTo({
+      top: target.scrollTop + distance,
+      behavior: "smooth",
+    });
+  }
+
+  await wait(250);
+}
+
+function findDouyinBloggerNotesScrollTarget(notesRoot = null) {
+  const roots = [
+    notesRoot,
+    getFirstMatch(DOUYIN_DOM_PROFILE.bloggerProfile.notesList.rootSelectors),
+    document.querySelector('[data-e2e="user-post-list"]'),
+    document.querySelector('[data-e2e="scroll-list"]'),
+    document.querySelector("#douyin-right-container"),
+    document.querySelector("#root"),
+    document.querySelector("#app"),
+    document.querySelector("main"),
+    document.scrollingElement,
+    document.documentElement,
+    document.body,
+  ].filter(Boolean);
+
+  for (const root of roots) {
+    const target = findScrollableAncestor(root);
+    if (target) {
+      return target;
+    }
+  }
+
+  return window;
+}
+
+function findScrollableAncestor(startNode) {
+  let node = startNode;
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (isScrollableElement(node)) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+
+  if (isDocumentScrollable()) {
+    return window;
+  }
+  return null;
+}
+
+function isScrollableElement(node) {
+  if (!node || typeof node !== "object" || node === window) return false;
+  const style = window.getComputedStyle(node);
+  const overflowY = style?.overflowY || "";
+  return (
+    (overflowY.includes("auto") || overflowY.includes("scroll")) &&
+    node.scrollHeight > node.clientHeight + 24
+  );
+}
+
+function isDocumentScrollable() {
+  const doc = document.documentElement;
+  return doc.scrollHeight > window.innerHeight + 24;
+}
+
+function dispatchWheelHint(target, distance) {
+  const eventTarget =
+    target === window
+      ? document.scrollingElement || document.documentElement
+      : target;
+  if (!eventTarget?.dispatchEvent) return;
+
+  eventTarget.dispatchEvent(
+    new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: distance,
+      view: window,
+    }),
+  );
 }
 
 function resolveCardTitle(card, noteId) {

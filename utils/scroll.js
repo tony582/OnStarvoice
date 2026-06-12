@@ -487,6 +487,8 @@ export async function autoScrollLoad({
       noNewContentCount >= noNewContentThreshold,
     canceled: isCanceled(),
     scrollCount,
+    maxScrollTimes,
+    noNewContentCount,
     finalContentCount: previousContentCount,
     stopReason:
       stopReason ||
