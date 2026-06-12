@@ -27,6 +27,17 @@
   --color-success: var(--success);
   --color-success-foreground: var(--success-fg);
   --color-surface: var(--surface);
+  /* 固定状态色板(Monday 18 色子集)— 明暗双模一致,禁任意 hex,是"颜色不糊"的根因 */
+  --color-status-green: #00c875;
+  --color-status-red: #e2445c;
+  --color-status-darkred: #bb3354;
+  --color-status-orange: #fdab3d;
+  --color-status-amber: #ffcb00;
+  --color-status-grey: #c4c4c4;
+  --color-status-blue: #579bfc;
+  --color-status-indigo: #2f6fed;
+  --color-status-purple: #a25ddc;
+  --color-status-teal: #00c2c7;
   --radius-sm: 5px;
   --radius-md: 7px;
   --radius-lg: 10px;

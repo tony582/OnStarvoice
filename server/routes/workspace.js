@@ -227,11 +227,36 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LIMIT 8
     `, [req.tenantId]);
 
+    // 情感结构(全量,指挥中心中轴)
+    const sentimentBreakdown = await queryOne(`
+      SELECT
+        COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative,
+        COUNT(*) FILTER (WHERE sentiment = 'neutral') AS neutral,
+        COUNT(*) FILTER (WHERE sentiment = 'positive') AS positive,
+        COUNT(*) FILTER (WHERE COALESCE(sentiment, '') = '') AS unlabeled,
+        COUNT(*) AS total
+      FROM records
+      WHERE tenant_id = $1
+    `, [req.tenantId]);
+
+    // 分平台风险(各平台总量与负面数,指挥中心)
+    const platformRisk = await queryAll(`
+      SELECT platform,
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative
+      FROM records
+      WHERE tenant_id = $1
+      GROUP BY platform
+      ORDER BY negative DESC, total DESC
+    `, [req.tenantId]);
+
     return res.json({
       ok: true,
       tenant: { id: req.tenantId, name: req.tenantName },
       days,
       kpi: { ...kpi, ...issueStats, ...triageStats, ...operationsStats },
+      sentimentBreakdown,
+      platformRisk,
       pendingRecords,
       latestContent,
       latestCommentLeads,
