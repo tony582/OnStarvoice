@@ -24,11 +24,13 @@ import {
   wait,
   scrollElementIntoView,
 } from "../scroll.js";
+import {buildCommentLoadStage} from "./stage-diagnostics.js";
 
 const DEFAULT_MAX_ITEMS = 100;
 const COMMENT_CONTENT_MAX_LENGTH = 280;
 const MIN_COMMENTS_STALL_TIMEOUT_MS = 10000;
 const REQUIRED_STALL_ROUNDS = 4;
+const FORCE_STOP_STALL_ROUNDS = 10;
 
 /**
  * 采集笔记评论
@@ -55,6 +57,8 @@ export async function captureComments({
 } = {}) {
   const captureStartedAt = new Date().toISOString();
   resetCancelFlag();
+  // 兼容旧调用参数；评论区懒加载由更长的停滞判断控制。
+  void noNewContentThreshold;
 
   const normalizedMaxDetectedItems = normalizePositiveInteger(
     maxDetectedItems ?? maxItems,
@@ -63,10 +67,6 @@ export async function captureComments({
   const normalizedMaxDurationMs = normalizePositiveInteger(
     maxDurationMs,
     DEFAULT_CONFIG.MAX_CAPTURE_DURATION_MS,
-  );
-  const normalizedNoNewThreshold = normalizePositiveInteger(
-    noNewContentThreshold,
-    DEFAULT_CONFIG.NO_NEW_CONTENT_THRESHOLD,
   );
   const normalizedWaitMinMs = normalizePositiveInteger(
     waitMinMs,
@@ -129,7 +129,7 @@ export async function captureComments({
         return commentsMap.size;
       },
       maxScrollTimes: normalizedMaxScrollTimes,
-      noNewContentThreshold: normalizedNoNewThreshold,
+      noNewContentThreshold: 0,
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
@@ -153,12 +153,16 @@ export async function captureComments({
         if (
           currentContentCount < normalizedMaxDetectedItems &&
           Date.now() - lastGrowthAt >= normalizedStallTimeoutMs &&
-          stallRounds >= REQUIRED_STALL_ROUNDS
+          stallRounds >= REQUIRED_STALL_ROUNDS &&
+          (isCommentAreaExhausted(commentContainer) ||
+            stallRounds >= FORCE_STOP_STALL_ROUNDS)
         ) {
           return {
             stop: true,
             reason: "stall_timeout",
-            message: `连续 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，按当前最大值结束`,
+            message: isCommentAreaExhausted(commentContainer)
+              ? `评论区已接近底部，连续 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，按当前最大值结束`
+              : `连续多轮未触发新增评论，按当前最大值结束`,
           };
         }
         return {stop: false};
@@ -186,6 +190,22 @@ export async function captureComments({
       0,
       normalizedMaxDetectedItems,
     );
+    const stageTrace = [
+      buildCommentLoadStage({
+        label: "小红书评论加载",
+        status: stoppedByUser ? "partial" : "completed",
+        commentsMaxDetectedItems: normalizedMaxDetectedItems,
+        collectedCount: items.length,
+        uniqueCount: commentsMap.size,
+        commentContainerFound: Boolean(commentContainer),
+        scrollResult,
+        maxScrollTimes: normalizedMaxScrollTimes,
+        waitMinMs: waitRange.min,
+        waitMaxMs: waitRange.max,
+        stallTimeoutMs: normalizedStallTimeoutMs,
+        maxDurationMs: normalizedMaxDurationMs,
+      }),
+    ];
 
     const noteTitleElement = querySelector(NOTE_DETAIL_SELECTORS.title);
     const noteTitle = noteTitleElement
@@ -214,11 +234,17 @@ export async function captureComments({
         stoppedByUser,
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
+          maxScrollTimes: scrollResult.maxScrollTimes,
           completed: scrollResult.completed,
           canceled: scrollResult.canceled,
           stopReason: scrollResult.stopReason,
+          finalContentCount: scrollResult.finalContentCount,
+          noNewContentCount: scrollResult.noNewContentCount,
           elapsedMs: scrollResult.elapsedMs,
         },
+      },
+      diagnostics: {
+        stageTrace,
       },
       error: null,
     };
@@ -641,8 +667,11 @@ async function scrollWithinCommentArea(
   const target = findScrollableTarget(container);
   const strongPush = stallRounds >= 2;
   const minDistance = aggressive ? 500 : 300;
-  const maxDistance = strongPush ? 1400 : aggressive ? 1000 : 800;
+  const maxDistance = strongPush ? 1800 : aggressive ? 1100 : 800;
   const distance = randomScrollDistance(minDistance, maxDistance);
+
+  dispatchWheelHint(container, distance);
+  dispatchWheelHint(target, distance);
 
   if (target === window) {
     window.scrollBy({
@@ -659,14 +688,14 @@ async function scrollWithinCommentArea(
 }
 
 function findScrollableTarget(startNode) {
+  const descendant = findScrollableDescendant(startNode);
+  if (descendant) {
+    return descendant;
+  }
+
   let node = startNode;
-  while (node && node !== document.body) {
-    const style = window.getComputedStyle(node);
-    const overflowY = style?.overflowY || "";
-    const isScrollable =
-      (overflowY.includes("auto") || overflowY.includes("scroll")) &&
-      node.scrollHeight > node.clientHeight + 24;
-    if (isScrollable) {
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (isScrollableElement(node)) {
       return node;
     }
     node = node.parentElement;
@@ -676,6 +705,12 @@ function findScrollableTarget(startNode) {
 
 function isCommentAreaExhausted(container) {
   const target = findScrollableTarget(container);
+  if (target === window && !isWindowScrollable()) {
+    return false;
+  }
+  if (target !== window && !isScrollableElement(target)) {
+    return false;
+  }
   const remaining = getRemainingScrollableDistance(target);
   const hasMoreButton = hasLoadMoreHint(container);
   // 既接近底部且没有“加载更多”提示，才认为评论区已探底。
@@ -713,5 +748,50 @@ function findCommentScopeRoot(container) {
     container.closest(".note-scroller, #noteContainer, .note-container") ||
     container.parentElement ||
     container
+  );
+}
+
+function findScrollableDescendant(root) {
+  if (!root?.querySelectorAll) return null;
+  const candidates = Array.from(root.querySelectorAll("*"))
+    .filter(isScrollableElement)
+    .sort((a, b) => getScrollableArea(b) - getScrollableArea(a));
+  return candidates[0] || null;
+}
+
+function isScrollableElement(node) {
+  if (!node || typeof node !== "object" || node === window) return false;
+  const style = window.getComputedStyle(node);
+  const overflowY = style?.overflowY || "";
+  return (
+    (overflowY.includes("auto") || overflowY.includes("scroll")) &&
+    node.scrollHeight > node.clientHeight + 24
+  );
+}
+
+function isWindowScrollable() {
+  const doc = document.documentElement;
+  return doc.scrollHeight > window.innerHeight + 24;
+}
+
+function getScrollableArea(node) {
+  if (!node || node === window) return 0;
+  return Math.max(0, (node.scrollHeight || 0) - (node.clientHeight || 0));
+}
+
+function dispatchWheelHint(target, distance) {
+  const eventTarget =
+    target === window
+      ? document.scrollingElement || document.documentElement
+      : target;
+  if (!eventTarget?.dispatchEvent) return;
+
+  eventTarget.dispatchEvent(
+    new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: distance,
+      view: window,
+    }),
   );
 }

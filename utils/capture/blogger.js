@@ -8,9 +8,20 @@ import {
   querySelector,
   querySelectorAll,
 } from "../selectors.js";
-import {parseInteractionCount, cleanText, extractNoteId} from "../helpers.js";
+import {
+  parseInteractionCount,
+  cleanText,
+  extractNoteId,
+  randomScrollDistance,
+} from "../helpers.js";
 import {PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG} from "../constants.js";
 import {autoScrollLoad, isCanceled, resetCancelFlag, wait} from "../scroll.js";
+import {
+  buildFilterApplyStage,
+  buildListParseStage,
+  buildScrollLoadStage,
+  countMissingMetric,
+} from "./stage-diagnostics.js";
 
 const BLOGGER_CONTENT_TABS = Object.freeze({
   note: Object.freeze({key: "note", label: "笔记", index: 0}),
@@ -24,6 +35,9 @@ const BLOGGER_TAB_PANEL_SELECTORS = Object.freeze([
   ".feeds-tab-container .tab-content-item",
   ".tab-content-item",
 ]);
+
+const MIN_BLOGGER_STALL_TIMEOUT_MS = 12000;
+const REQUIRED_BLOGGER_STALL_ROUNDS = 5;
 
 /**
  * 采集博主信息
@@ -125,7 +139,7 @@ export async function captureBloggerProfile() {
 export async function captureBloggerNotes({
   onProgress = null,
   profileMetrics = null,
-  maxScrollTimes = 50,
+  maxScrollTimes = null,
   minLikes = 0,
   maxDetectedItems = null,
   maxItems = null,
@@ -183,15 +197,17 @@ export async function captureBloggerNotes({
       maxDurationMs,
       DEFAULT_CONFIG.MAX_CAPTURE_DURATION_MS,
     );
-    const normalizedStallTimeoutMs = normalizePositiveInteger(
-      stallTimeoutMs,
-      3000,
+    const normalizedStallTimeoutMs = Math.max(
+      normalizePositiveInteger(stallTimeoutMs, 3000),
+      MIN_BLOGGER_STALL_TIMEOUT_MS,
     );
     const normalizedMaxScrollTimes = normalizePositiveInteger(
       maxScrollTimes,
-      DEFAULT_CONFIG.MAX_SCROLL_TIMES,
+      Math.max(
+        DEFAULT_CONFIG.MAX_SCROLL_TIMES,
+        Math.ceil(normalizedMaxDetectedItems / 2),
+      ),
     );
-    const requiredStallRounds = 3;
     const noteMap = new Map();
     let progressStats = {
       detectedCount: 0,
@@ -244,10 +260,13 @@ export async function captureBloggerNotes({
         return collectDetectedNotes();
       },
       maxScrollTimes: normalizedMaxScrollTimes,
-      noNewContentThreshold: DEFAULT_CONFIG.NO_NEW_CONTENT_THRESHOLD,
+      noNewContentThreshold: 0,
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
+      scrollStep: async ({noNewContentCount = 0} = {}) => {
+        await scrollBloggerNotesResults(activeTab, {noNewContentCount});
+      },
       stopWhen: ({currentContentCount}) => {
         if (currentContentCount >= normalizedMaxDetectedItems) {
           return {
@@ -267,12 +286,12 @@ export async function captureBloggerNotes({
         stallRounds += 1;
         if (
           Date.now() - lastGrowthAt >= normalizedStallTimeoutMs &&
-          stallRounds >= requiredStallRounds
+          stallRounds >= REQUIRED_BLOGGER_STALL_ROUNDS
         ) {
           return {
             stop: true,
             reason: "stall_timeout",
-            message: `连续 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已加载 ${progressStats.detectedCount} 条）`,
+            message: `连续约 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已探测 ${progressStats.detectedCount} 条，已筛选 ${progressStats.filteredCount} 条）`,
           };
         }
         return {stop: false};
@@ -296,6 +315,13 @@ export async function captureBloggerNotes({
           matchesKeywordFilter(item.title || "", parsedKeywords),
         )
       : likesFiltered;
+    const missingMetricCount = countMissingMetric(allItems, "likes");
+    const metricCounts = allItems.map((item) => Number(item.likes || 0));
+    const minMetricCount = metricCounts.length ? Math.min(...metricCounts) : 0;
+    const maxMetricCount = metricCounts.length ? Math.max(...metricCounts) : 0;
+    const zeroMetricCount = metricCounts.filter((count) => count === 0).length;
+    const metricExtractionSuspicious =
+      allItems.length > 0 && maxMetricCount === 0;
     const items = filteredItems
       .slice(0, normalizedMaxDetectedItems)
       .map((item) => ({
@@ -331,6 +357,40 @@ export async function captureBloggerNotes({
       items,
       captureTimestamp: Date.now(),
     };
+    const stageTrace = [
+      buildScrollLoadStage({
+        label: "博主作品滚动加载",
+        requestedMaxDetectedItems: normalizedMaxDetectedItems,
+        finalContentCount: allItems.length,
+        scrollResult,
+        maxScrollTimes: normalizedMaxScrollTimes,
+        waitMinMs: waitRange.min,
+        waitMaxMs: waitRange.max,
+        stallTimeoutMs: normalizedStallTimeoutMs,
+        maxDurationMs: normalizedMaxDurationMs,
+      }),
+      buildListParseStage({
+        label: "博主作品列表解析",
+        rawTotalCount: allItems.length,
+        parsedCount: allItems.length,
+        missingMetricCount,
+      }),
+      buildFilterApplyStage({
+        label: "博主作品筛选",
+        rawTotalCount: allItems.length,
+        filteredBeforeLimitCount: filteredItems.length,
+        filteredCount: items.length,
+        minLikes: normalizedMinLikes,
+        sortDimension: "likes",
+        keywordFilter,
+        maxDetectedItems: normalizedMaxDetectedItems,
+        missingMetricCount,
+        minMetricCount,
+        maxMetricCount,
+        zeroMetricCount,
+        metricExtractionSuspicious,
+      }),
+    ];
 
     return {
       ok: true,
@@ -344,9 +404,17 @@ export async function captureBloggerNotes({
         sourceTabLabel: activeTab.label,
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
+          maxScrollTimes: scrollResult.maxScrollTimes,
           completed: scrollResult.completed,
           canceled: scrollResult.canceled,
+          stopReason: scrollResult.stopReason,
+          finalContentCount: scrollResult.finalContentCount,
+          noNewContentCount: scrollResult.noNewContentCount,
+          elapsedMs: scrollResult.elapsedMs,
         },
+      },
+      diagnostics: {
+        stageTrace,
       },
       error: null,
     };
@@ -372,12 +440,113 @@ export async function captureBloggerNotes({
 
 // ==================== 辅助函数 ====================
 
+async function scrollBloggerNotesResults(
+  activeTab = null,
+  {noNewContentCount = 0} = {},
+) {
+  const target = findBloggerNotesScrollTarget(activeTab);
+  const strongPush = noNewContentCount >= 2;
+  const distance = randomScrollDistance(
+    strongPush ? 900 : 500,
+    strongPush ? 1800 : 1100,
+  );
+
+  dispatchWheelHint(target, distance);
+
+  if (target === window) {
+    window.scrollBy({
+      top: distance,
+      behavior: "smooth",
+    });
+  } else {
+    target.scrollTo({
+      top: target.scrollTop + distance,
+      behavior: "smooth",
+    });
+  }
+
+  await wait(250);
+}
+
+function findBloggerNotesScrollTarget(activeTab = null) {
+  const scope = resolveBloggerNotesScope(activeTab);
+  const roots = [
+    scope,
+    querySelector(BLOGGER_PROFILE_SELECTORS.notesList.container),
+    document.querySelector(".feeds-container"),
+    document.querySelector(".user-feeds"),
+    document.querySelector(".profile-container"),
+    document.querySelector("#global"),
+    document.querySelector("#app"),
+    document.querySelector("main"),
+    document.scrollingElement,
+    document.documentElement,
+    document.body,
+  ].filter(Boolean);
+
+  for (const root of roots) {
+    const target = findScrollableAncestor(root);
+    if (target) {
+      return target;
+    }
+  }
+
+  return window;
+}
+
+function findScrollableAncestor(startNode) {
+  let node = startNode;
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (isScrollableElement(node)) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+
+  if (isDocumentScrollable()) {
+    return window;
+  }
+  return null;
+}
+
+function isScrollableElement(node) {
+  if (!node || typeof node !== "object" || node === window) return false;
+  const style = window.getComputedStyle(node);
+  const overflowY = style?.overflowY || "";
+  return (
+    (overflowY.includes("auto") || overflowY.includes("scroll")) &&
+    node.scrollHeight > node.clientHeight + 24
+  );
+}
+
+function isDocumentScrollable() {
+  const doc = document.documentElement;
+  return doc.scrollHeight > window.innerHeight + 24;
+}
+
+function dispatchWheelHint(target, distance) {
+  const eventTarget =
+    target === window
+      ? document.scrollingElement || document.documentElement
+      : target;
+  if (!eventTarget?.dispatchEvent) return;
+
+  eventTarget.dispatchEvent(
+    new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      deltaY: distance,
+      view: window,
+    }),
+  );
+}
+
 /**
  * 从 URL 提取博主 ID
  */
 function extractBloggerIdFromUrl() {
   const url = window.location.href;
-  const match = url.match(/\/user\/profile\/([a-f0-9]+)/i);
+  const match = url.match(/\/user\/profile\/([a-zA-Z0-9_-]+)/i);
   return match ? match[1] : null;
 }
 
@@ -433,13 +602,7 @@ function extractNoteCards(bloggerName = "", activeTab = null) {
         : bloggerName;
 
       // 提取点赞数
-      const likesElement = querySelector(
-        BLOGGER_PROFILE_SELECTORS.notesList.likes,
-        item,
-      );
-      const likes = likesElement
-        ? parseInteractionCount(cleanText(likesElement.textContent))
-        : 0;
+      const likes = extractBloggerLikeCountFromCard(item);
 
       // 检查重复
       const isDuplicate = notes.some(
@@ -802,6 +965,125 @@ function mergeNotesIntoMap(noteMap, notes = []) {
       ...note,
     });
   });
+}
+
+function extractBloggerLikeCountFromCard(cardNode) {
+  if (!cardNode) return 0;
+
+  const prioritizedNodes = [];
+  const likesElement = querySelector(
+    BLOGGER_PROFILE_SELECTORS.notesList.likes,
+    cardNode,
+  );
+  if (likesElement) {
+    prioritizedNodes.push(likesElement);
+  }
+
+  cardNode
+    .querySelectorAll?.(
+      [
+        ".like-count",
+        '[class*="like-count"]',
+        '[class*="likeCount"]',
+        '[class*="like-wrapper"]',
+        '[class*="likeWrapper"]',
+        '[class*="interaction"]',
+        '[class*="interact"]',
+        '[class*="engage"]',
+        '[aria-label*="点赞"]',
+        '[aria-label*="赞"]',
+        '[title*="点赞"]',
+        '[title*="赞"]',
+      ].join(","),
+    )
+    .forEach((node) => {
+      if (!prioritizedNodes.includes(node)) {
+        prioritizedNodes.push(node);
+      }
+    });
+
+  for (const node of prioritizedNodes) {
+    const parsed = parseBloggerInteractionCount(
+      [
+        node?.textContent,
+        node?.getAttribute?.("aria-label"),
+        node?.getAttribute?.("title"),
+      ]
+        .filter(Boolean)
+        .join(" "),
+      {allowLooseText: true},
+    );
+    if (parsed > 0) {
+      return parsed;
+    }
+  }
+
+  const textNodes = cardNode.querySelectorAll?.("span, div, p, i, em") || [];
+  for (const node of textNodes) {
+    const text = cleanText(node?.textContent || "");
+    if (!text || text.length > 24) continue;
+    const parsed = parseBloggerInteractionCount(text, {
+      allowLooseText: false,
+    });
+    if (parsed > 0) {
+      return parsed;
+    }
+  }
+
+  const rawText = cleanText(cardNode.textContent || "");
+  const unitMatch = rawText.match(/(\d+(?:\.\d+)?\s*(?:万|[wWkK]))/);
+  if (unitMatch?.[1]) {
+    const parsed = parseBloggerInteractionCount(unitMatch[1], {
+      allowLooseText: false,
+    });
+    if (parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return 0;
+}
+
+function parseBloggerInteractionCount(value, {allowLooseText = false} = {}) {
+  const text = cleanText(value || "");
+  if (!text) return 0;
+  if (looksLikeDateOrTime(text)) {
+    return 0;
+  }
+
+  const metricPattern = allowLooseText
+    ? /(\d+(?:\.\d+)?)\s*(万|[wWkK])?/
+    : /^(\d+(?:\.\d+)?)\s*(万|[wWkK])?$/;
+  const match = text.match(metricPattern);
+  if (!match?.[1]) {
+    return 0;
+  }
+
+  const num = Number.parseFloat(match[1]);
+  if (!Number.isFinite(num) || num < 0) {
+    return 0;
+  }
+
+  const unit = String(match[2] || "").toLowerCase();
+  if (unit === "万" || unit === "w") {
+    return Math.round(num * 10000);
+  }
+  if (unit === "k") {
+    return Math.round(num * 1000);
+  }
+
+  return parseInteractionCount(match[1]);
+}
+
+function looksLikeDateOrTime(text) {
+  const normalized = cleanText(text);
+  if (!normalized) return false;
+  return (
+    /\d{1,2}[:：]\d{2}/.test(normalized) ||
+    /^\d{4}[./-]\d{1,2}[./-]\d{1,2}$/.test(normalized) ||
+    /^\d{1,2}[./-]\d{1,2}$/.test(normalized) ||
+    /(分钟前|小时前|天前|刚刚|昨天|今天|前天)/.test(normalized)
+  );
 }
 
 function normalizeBloggerUserId(rawUserId = "") {

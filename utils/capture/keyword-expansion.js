@@ -13,13 +13,31 @@ import { detectPlatformFromUrl } from '../platform/page-routing.js';
 const PLATFORM_SELECTORS = {
   xiaohongshu: {
     searchInput: [
+      'input#search-input',
+      '#search-input textarea',
+      '#search-input input',
+      '#search-input [contenteditable="true"]',
       '#search-input',
+      'textarea[name="aiSearchTextarea"]',
+      '.textarea-container textarea[name="aiSearchTextarea"]',
+      '.textarea-wrapper textarea',
+      'textarea.textarea',
+      'textarea[role="searchbox"]',
+      'textarea[placeholder*="搜索"]',
+      'textarea[placeholder*="输入"]',
+      'input[role="searchbox"]',
       'input[type="search"]',
       'input.search-input',
       '.input-box input',
+      '[class*="search"] textarea',
+      '[class*="Search"] textarea',
       '[class*="search"] input',
+      '[class*="Search"] input',
       'input[placeholder*="搜索"]',
       'input[placeholder*="探索"]',
+      '[contenteditable="true"][role="searchbox"]',
+      '[contenteditable="true"][aria-label*="搜索"]',
+      '[contenteditable="true"][placeholder*="搜索"]',
     ],
     suggestionDropdown: [
       '.sug-box',
@@ -27,8 +45,19 @@ const PLATFORM_SELECTORS = {
       '.sug-container-wrapper',
       '[class*="search-suggest"]',
       '[class*="searchSuggest"]',
+      '[class*="SearchSuggest"]',
       '[class*="suggest"]',
+      '[class*="Suggest"]',
+      '[class*="suggestion"]',
+      '[class*="Suggestion"]',
       '[class*="recommend"]',
+      '[class*="Recommend"]',
+      '[class*="dropdown"]',
+      '[class*="Dropdown"]',
+      '[class*="popover"]',
+      '[class*="Popover"]',
+      '[class*="autocomplete"]',
+      '[class*="auto-complete"]',
       '[role="listbox"]',
     ],
     suggestionItem: [
@@ -37,10 +66,19 @@ const PLATFORM_SELECTORS = {
       '.sug-wrapper .sug-item',
       '[class*="sug-item"]',
       '[class*="suggest-item"]',
+      '[class*="SuggestItem"]',
       '[class*="search-item"]',
+      '[class*="SearchItem"]',
+      '[class*="dropdown"] [class*="item"]',
+      '[class*="Dropdown"] [class*="Item"]',
+      '[class*="popover"] [class*="item"]',
+      '[class*="Popover"] [class*="Item"]',
+      '[class*="option"]',
+      '[class*="Option"]',
       '[role="option"]',
       'li',
       'a',
+      'button',
     ],
   },
   douyin: {
@@ -108,18 +146,46 @@ const PLATFORM_SELECTORS = {
 
 const LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
 
-const DEFAULT_DELAY_MS = 800;
-const DELAY_JITTER_MS = 200;
-const DROPDOWN_WAIT_MS = 1500;
-const DOUYIN_DROPDOWN_WAIT_MS = 2400;
+const DEFAULT_DELAY_MS = 2000;
+const DELAY_JITTER_MS = 500;
+const DROPDOWN_WAIT_MS = 6000;
+const DOUYIN_DROPDOWN_WAIT_MS = 3200;
 const DROPDOWN_POLL_MS = 100;
+const DROPDOWN_STABLE_MS = 500;
+const DROPDOWN_RETRY_WAIT_MS = 1800;
 const WRITE_SYNC_WAIT_MS = 250;
 const WRITE_SYNC_POLL_MS = 16;
 const CARET_SETTLE_ATTEMPTS = 3;
 const CARET_SETTLE_DELAY_MS = 30;
 const XHS_HP_INPUT_SELECTOR = '[button-hp-installed][data-hp-kind="input"]';
-const FOCUS_OVERLAY_ID = 'onstarvoice-keyword-expand-focus-overlay';
-const FOCUS_OVERLAY_STYLE_ID = 'onstarvoice-keyword-expand-focus-style';
+const SEARCH_RESULT_REGION_SELECTOR = [
+  '#search-result-container',
+  '#waterFallScrollContainer',
+  '#search-result',
+  '.search-results',
+  '.search-result-card',
+  '.feeds-container',
+  '.waterfall',
+  '.note-item',
+  '.feed-item',
+  '[data-v-feed]',
+  '[id^="waterfall_item_"]',
+  '[class*="waterfall"]',
+  '[class*="note-item"]',
+  '[class*="feed-item"]',
+].join(',');
+const NOTE_RESULT_LINK_SELECTOR = [
+  'a[href*="/explore/"]',
+  'a[href*="/discovery/item/"]',
+  'a[href*="/search_result/notes/"]',
+  'a[href*="/note/"]',
+].join(',');
+const NOTE_RESULT_MEDIA_SELECTOR = [
+  'img[src*="xhscdn"]',
+  'img[src*="xhscdn.com"]',
+  'img[src*="sns-img"]',
+  'video',
+].join(',');
 
 // ==================== 核心函数 ====================
 
@@ -130,7 +196,7 @@ const FOCUS_OVERLAY_STYLE_ID = 'onstarvoice-keyword-expand-focus-style';
  * @param {string} options.seedKeyword - 种子关键词
  * @param {string} [options.platform] - 平台标识，默认自动检测
  * @param {Function} [options.onProgress] - 进度回调 ({ letter, found, total })
- * @param {number} [options.delayBetweenMs] - 字母间延迟，默认 800ms（±200ms 随机）
+ * @param {number} [options.delayBetweenMs] - 字母间延迟，默认取 DEFAULT_DELAY_MS（±DELAY_JITTER_MS 随机）
  * @returns {Promise<{ expandedKeywords: string[], stats: { totalFound: number, duplicatesRemoved: number } }>}
  */
 export async function expandKeywordViaSuggestions({
@@ -138,6 +204,7 @@ export async function expandKeywordViaSuggestions({
   platform,
   onProgress,
   delayBetweenMs = DEFAULT_DELAY_MS,
+  suffixLetters = LETTERS,
 } = {}) {
   const resolvedPlatform =
     platform || detectPlatformFromUrl(window.location.href);
@@ -145,20 +212,42 @@ export async function expandKeywordViaSuggestions({
   if (!selectors) {
     throw new Error(`不支持的平台: ${resolvedPlatform}`);
   }
+  const resolvedDelayBetweenMs = resolveDelayBetweenMs(delayBetweenMs);
+  const resolvedSuffixLetters = normalizeSuffixLetters(suffixLetters);
 
-  const inputHandle = resolveSearchInputHandle(selectors, resolvedPlatform);
+  const inputHandle = resolveSearchInputHandle(
+    selectors,
+    resolvedPlatform,
+    seedKeyword,
+  );
   if (!inputHandle?.realInput) {
     throw new Error('未找到搜索输入框，请确认当前页面是搜索页');
   }
-  console.info('[KeywordExpand] Input strategy', {
+  const inputDebugInfo = {
     platform: resolvedPlatform,
     usingHpProxy: Boolean(inputHandle.hpInput),
-  });
+    inputTag: inputHandle.realInput.tagName,
+    inputId: inputHandle.realInput.id || '',
+    inputName: inputHandle.realInput.getAttribute?.('name') || '',
+    inputClassName: String(inputHandle.realInput.className || ''),
+    inputValue: readSearchInputValue(inputHandle.realInput),
+    delayBetweenMs: resolvedDelayBetweenMs,
+    delayJitterMs: DELAY_JITTER_MS,
+    dropdownWaitMs: resolveDropdownWaitMs(resolvedPlatform),
+    dropdownRetryWaitMs: resolveRetryDropdownWaitMs(resolvedPlatform),
+    dropdownStableMs: DROPDOWN_STABLE_MS,
+  };
+  writeKeywordExpandDebugInfo(inputDebugInfo);
+  console.info('[KeywordExpand] Input strategy', inputDebugInfo);
 
-  await ensureDocumentInteractiveFocus();
+  await ensureDocumentInteractiveFocus(inputHandle.realInput);
+  await ensureCaretAtEnd(
+    inputHandle.realInput,
+    readSearchInputValue(inputHandle.realInput),
+  );
 
   // 保存原始值以便恢复
-  const originalValue = String(inputHandle.realInput.value || '');
+  const originalValue = readSearchInputValue(inputHandle.realInput);
   try {
     assertNotCanceled();
 
@@ -173,6 +262,9 @@ export async function expandKeywordViaSuggestions({
         seedKeyword,
         selectors,
         resolvedPlatform,
+        {
+          baseKeyword: seedKeyword,
+        },
       );
       for (const s of seedSuggestions) {
         totalFoundRaw++;
@@ -184,13 +276,19 @@ export async function expandKeywordViaSuggestions({
 
       if (onProgress) {
         onProgress({
+          phase: 'keyword_expand',
           letter: '',
           found: seedSuggestions.length,
           total: allSuggestions.length,
+          message: `正在读取主词「${seedKeyword}」联想词，已发现 ${allSuggestions.length} 个`,
         });
       }
 
-      await randomDelay(delayBetweenMs);
+      if (resolvedPlatform === 'xiaohongshu') {
+        await waitMs(200);
+      } else {
+        await randomDelay(resolvedDelayBetweenMs, onProgress);
+      }
     } catch (error) {
       if (isExpandCanceledError(error)) {
         throw error;
@@ -199,7 +297,7 @@ export async function expandKeywordViaSuggestions({
     }
 
     // 循环 a-z
-    for (const letter of LETTERS) {
+    for (const letter of resolvedSuffixLetters) {
       assertNotCanceled();
       const query = seedKeyword + letter;
 
@@ -209,6 +307,10 @@ export async function expandKeywordViaSuggestions({
           query,
           selectors,
           resolvedPlatform,
+          {
+            baseKeyword: seedKeyword,
+            suffixText: letter,
+          },
         );
 
         let foundThisRound = 0;
@@ -223,9 +325,11 @@ export async function expandKeywordViaSuggestions({
 
         if (onProgress) {
           onProgress({
+            phase: 'keyword_expand',
             letter,
             found: foundThisRound,
             total: allSuggestions.length,
+            message: `正在尝试字母 ${letter.toUpperCase()}，本轮新增 ${foundThisRound} 个，累计 ${allSuggestions.length} 个`,
           });
         }
       } catch (error) {
@@ -235,7 +339,7 @@ export async function expandKeywordViaSuggestions({
         // 单个字母失败不中断整个流程
       }
 
-      await randomDelay(delayBetweenMs);
+      await randomDelay(resolvedDelayBetweenMs, onProgress);
     }
 
     assertNotCanceled();
@@ -256,15 +360,39 @@ export async function expandKeywordViaSuggestions({
 /**
  * 向搜索框设值并等待联想下拉，然后提取联想词
  */
-async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
+async function getSuggestionsForInput(
+  inputHandle,
+  query,
+  selectors,
+  platform,
+  {
+    baseKeyword = query,
+    suffixText = '',
+  } = {},
+) {
   assertNotCanceled();
   const { realInput } = inputHandle;
   const dropdownWaitMs = resolveDropdownWaitMs(platform);
+  const dropdownRetryWaitMs = resolveRetryDropdownWaitMs(platform, dropdownWaitMs);
+  const requireCurrentInputSignal =
+    platform === 'xiaohongshu' && Boolean(suffixText);
+  const allowUnchangedDropdown =
+    !suffixText || Boolean(requireCurrentInputSignal);
+  const shouldSkipRetryOnMissingDropdown =
+    requireCurrentInputSignal || (platform === 'xiaohongshu' && !suffixText);
+  const effectiveDropdownWaitMs = shouldSkipRetryOnMissingDropdown
+    ? Math.min(dropdownWaitMs, 2600)
+    : dropdownWaitMs;
+  const dropdownContext = {
+    baseKeyword,
+    allowUnchangedDropdown,
+    requireInputValueSignal: requireCurrentInputSignal ? query : '',
+  };
 
-  await ensureDocumentInteractiveFocus();
+  await ensureDocumentInteractiveFocus(realInput);
 
   // 聚焦输入框
-  await ensureCaretAtEnd(realInput, String(realInput.value || ''));
+  await ensureSearchInputReadyForTyping(realInput);
 
   // 记录当前联想内容，用于检测内容是否刷新
   const prevTexts = extractSuggestionTexts(
@@ -274,11 +402,29 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
       realInput,
       '',
       platform,
+      { baseKeyword },
     ),
     selectors.suggestionItem,
+    {
+      baseKeyword,
+      anchorElement: realInput,
+      platform,
+    },
   ).join('|');
 
-  await writeSearchInputValue(inputHandle, query);
+  const inputWritten = await writeSearchInputQuery(inputHandle, query, platform, {
+    baseKeyword,
+    suffixText,
+  });
+  if (!inputWritten) {
+    console.warn('[KeywordExpand] Search input did not accept query', {
+      query,
+      actual: readSearchInputValue(realInput),
+      platform,
+      usingHpProxy: Boolean(inputHandle.hpInput),
+    });
+    return [];
+  }
   if (platform === 'douyin') {
     dispatchSuggestionTriggerEvents(realInput, query);
   }
@@ -289,11 +435,61 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
     selectors.suggestionItem,
     prevTexts,
     realInput,
-    dropdownWaitMs,
+    effectiveDropdownWaitMs,
     query,
     platform,
+    dropdownContext,
   );
   if (!dropdown) {
+    if (shouldSkipRetryOnMissingDropdown) {
+      const fallbackTexts = extractFallbackSuggestionsFromSearchRoot(
+        query,
+        realInput,
+        selectors.suggestionItem,
+        {
+          baseKeyword,
+          platform,
+        },
+      );
+      if (fallbackTexts.length > 0) {
+        console.info('[KeywordExpand] Suggestions extracted via search root fallback', {
+          query,
+          count: fallbackTexts.length,
+          sample: fallbackTexts.slice(0, 8),
+        });
+        return fallbackTexts;
+      }
+
+      const nearbyFallbackTexts = extractFallbackSuggestionsNearInput(query, realInput, {
+        baseKeyword,
+        query,
+        platform,
+        preferBaseKeywordSignal: platform === 'xiaohongshu',
+      });
+      if (nearbyFallbackTexts.length > 0) {
+        console.info('[KeywordExpand] Suggestions extracted via nearby fallback', {
+          query,
+          count: nearbyFallbackTexts.length,
+          sample: nearbyFallbackTexts.slice(0, 8),
+        });
+        return nearbyFallbackTexts;
+      }
+
+      console.warn('[KeywordExpand] Current query dropdown not ready, skip query', {
+        query,
+        actual: readSearchInputValue(realInput),
+        platform,
+        suffixText,
+        nearbyElementSample: extractNearbyElementTextSample(
+          realInput,
+          query,
+          platform,
+        ),
+        nearbyTextSample: extractNearbyTextSample(realInput, query, platform),
+      });
+      return [];
+    }
+
     // 先做一次无可见字符变化的重触发，避免抖音频繁出现“空格-回退”闪动。
     await refreshInputWithoutMutation(inputHandle, query);
     const silentRetried = await waitForDropdown(
@@ -301,14 +497,21 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
       selectors.suggestionItem,
       prevTexts,
       realInput,
-      dropdownWaitMs,
+      dropdownRetryWaitMs,
       query,
       platform,
+      dropdownContext,
     );
     if (silentRetried) {
       const silentRetriedTexts = extractSuggestionTexts(
         silentRetried,
         selectors.suggestionItem,
+        {
+          query,
+          baseKeyword,
+          anchorElement: realInput,
+          platform,
+        },
       );
       if (silentRetriedTexts.length > 0) {
         console.info('[KeywordExpand] Suggestions extracted', {
@@ -327,12 +530,17 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
       selectors.suggestionItem,
       prevTexts,
       realInput,
-      dropdownWaitMs,
+      dropdownRetryWaitMs,
       query,
       platform,
+      dropdownContext,
     );
     if (!retried) {
-      const fallbackTexts = extractFallbackSuggestionsNearInput(query, realInput);
+      const fallbackTexts = extractFallbackSuggestionsNearInput(query, realInput, {
+        baseKeyword,
+        query,
+        platform,
+      });
       if (fallbackTexts.length > 0) {
         console.info('[KeywordExpand] Suggestions extracted via fallback', {
           query,
@@ -350,11 +558,20 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
         inputFocused: document.activeElement === realInput,
         selectionStart: readSelectionPosition(realInput).start,
         selectionEnd: readSelectionPosition(realInput).end,
-        nearbyTextSample: extractNearbyTextSample(realInput, query),
+        nearbyTextSample: extractNearbyTextSample(realInput, query, platform),
       });
       return [];
     }
-    const retriedTexts = extractSuggestionTexts(retried, selectors.suggestionItem);
+    const retriedTexts = extractSuggestionTexts(
+      retried,
+      selectors.suggestionItem,
+      {
+        query,
+        baseKeyword,
+        anchorElement: realInput,
+        platform,
+      },
+    );
     if (retriedTexts.length === 0) {
       console.warn('[KeywordExpand] No suggestions extracted after retry', {
         query,
@@ -375,9 +592,27 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
   }
 
   // 提取联想词文本
-  const texts = extractSuggestionTexts(dropdown, selectors.suggestionItem);
+  const texts = extractSuggestionTexts(dropdown, selectors.suggestionItem, {
+    query,
+    baseKeyword,
+    anchorElement: realInput,
+    platform,
+  });
   if (texts.length === 0) {
-    const fallbackTexts = extractFallbackSuggestionsNearInput(query, realInput);
+    if (requireCurrentInputSignal) {
+      console.warn('[KeywordExpand] Current query suggestions empty, skip letter', {
+        query,
+        dropdownTextSample: extractSuggestionTextFromDropdown(dropdown).slice(0, 10),
+      });
+      return [];
+    }
+
+    const fallbackTexts = extractFallbackSuggestionsNearInput(query, realInput, {
+      baseKeyword,
+      query,
+      platform,
+      preferBaseKeywordSignal: platform === 'xiaohongshu',
+    });
     if (fallbackTexts.length > 0) {
       console.info('[KeywordExpand] Suggestions extracted via fallback', {
         query,
@@ -393,7 +628,7 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
       itemCount: querySuggestionItems(dropdown, selectors.suggestionItem).length,
       structuredTextSample: extractSuggestionStructuredTexts(dropdown).slice(0, 10),
       dropdownTextSample: extractSuggestionTextFromDropdown(dropdown).slice(0, 10),
-      nearbyTextSample: extractNearbyTextSample(realInput, query),
+      nearbyTextSample: extractNearbyTextSample(realInput, query, platform),
     });
   } else {
     console.info('[KeywordExpand] Suggestions extracted', {
@@ -405,33 +640,112 @@ async function getSuggestionsForInput(inputHandle, query, selectors, platform) {
   return texts;
 }
 
+async function writeSearchInputQuery(
+  inputHandle,
+  query,
+  platform,
+  {
+    baseKeyword = query,
+    suffixText = '',
+  } = {},
+) {
+  const wrote = await writeSearchInputValue(inputHandle, query);
+  if (platform === 'xiaohongshu' && suffixText) {
+    await waitMs(260);
+  }
+  return wrote;
+}
+
 /**
  * 小红书优先写入 hp 代理输入框；其它平台回落到原生 setter。
  */
 async function writeSearchInputValue(inputHandle, value) {
   const { realInput, writeInput, hpInput } = inputHandle;
   if (!realInput || !writeInput) {
-    return;
+    return false;
   }
 
-  await ensureCaretAtEnd(realInput, String(realInput.value || ''));
+  await ensureSearchInputReadyForTyping(realInput);
 
   if (hpInput && writeInput === hpInput) {
+    const previousRealValue = readSearchInputValue(realInput);
     writeHpProxyInputValue(hpInput, value);
-    await waitForInputSync(realInput, value);
+    await waitMs(30);
+    writeNativeInputValue(realInput, value);
+    let synced = await waitForInputSync(realInput, value);
+    if (!synced) {
+      console.warn('[KeywordExpand] HP proxy input did not sync, fallback to real input', {
+        expected: value,
+        actual: readSearchInputValue(realInput),
+      });
+      writeNativeInputValue(realInput, value);
+      synced = await waitForInputSync(realInput, value);
+    } else {
+      notifyRealInputAfterProxyWrite(realInput, value, previousRealValue);
+    }
     await ensureCaretAtEnd(realInput, value);
-    return;
+    return synced;
   }
 
   writeNativeInputValue(realInput, value);
+  const synced = await waitForInputSync(realInput, value);
   await ensureCaretAtEnd(realInput, value);
+  return synced;
+}
+
+async function appendSearchInputText(inputHandle, text) {
+  const { realInput, writeInput, hpInput } = inputHandle;
+  if (!realInput || !writeInput || !text) {
+    return;
+  }
+
+  await ensureCaretAtEnd(realInput, readSearchInputValue(realInput));
+
+  if (hpInput && writeInput === hpInput) {
+    const previousRealValue = readSearchInputValue(realInput);
+    const expectedValue = `${previousRealValue}${text}`;
+    appendTextLikeUser(hpInput, text);
+    const synced = await waitForInputSync(realInput, expectedValue);
+    if (!synced) {
+      console.warn('[KeywordExpand] HP proxy append did not sync, fallback to real input', {
+        expected: expectedValue,
+        actual: readSearchInputValue(realInput),
+      });
+      appendTextLikeUser(realInput, text);
+      if (!(await waitForInputSync(realInput, expectedValue))) {
+        writeNativeInputValue(realInput, expectedValue);
+        await waitForInputSync(realInput, expectedValue);
+      }
+    } else {
+      notifyRealInputAfterProxyWrite(realInput, expectedValue, previousRealValue);
+    }
+    await ensureCaretAtEnd(realInput, readSearchInputValue(realInput));
+    return;
+  }
+
+  const expectedValue = `${readSearchInputValue(realInput)}${text}`;
+  appendTextLikeUser(realInput, text);
+  if (!(await waitForInputSync(realInput, expectedValue))) {
+    writeNativeInputValue(realInput, expectedValue);
+    await waitForInputSync(realInput, expectedValue);
+  }
+  await ensureCaretAtEnd(realInput, readSearchInputValue(realInput));
 }
 
 function writeNativeInputValue(input, value) {
-  const previousValue = String(input?.value || '');
+  const previousValue = readSearchInputValue(input);
 
-  // 只做 focus，避免程序化 click 触发页面风控脚本异常。
-  input.focus();
+  activateSearchInputComponent(input, previousValue);
+
+  if (isContentEditableInput(input)) {
+    writeContentEditableValue(input, value);
+    syncFrameworkValueTracker(input, previousValue);
+    moveCaretToEnd(input, value);
+    dispatchSuggestionTriggerEvents(input, value);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    moveCaretToEnd(input, value);
+    return;
+  }
 
   // native setter 仅对 HTMLInputElement 有效；textarea / contenteditable 等
   // 非 input 元素调用会抛 Illegal invocation，回落到普通赋值。
@@ -469,14 +783,148 @@ function writeNativeInputValue(input, value) {
 }
 
 function writeHpProxyInputValue(input, value) {
-  const previousValue = String(input?.value || '');
+  const previousValue = readSearchInputValue(input);
 
-  input.value = value;
+  setSearchInputValue(input, value);
   syncFrameworkValueTracker(input, previousValue);
   moveCaretToEnd(input, value);
 
   dispatchSuggestionTriggerEvents(input, value);
   input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function notifyRealInputAfterProxyWrite(input, value, previousValue = '') {
+  if (!input) {
+    return;
+  }
+
+  activateSearchInputComponent(input, value);
+  syncFrameworkValueTracker(input, previousValue);
+  moveCaretToEnd(input, value);
+  dispatchSuggestionTriggerEvents(input, value);
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  moveCaretToEnd(input, value);
+}
+
+function appendTextLikeUser(input, text) {
+  for (const char of String(text || '')) {
+    insertSingleCharacterLikeUser(input, char);
+  }
+}
+
+function insertSingleCharacterLikeUser(input, char) {
+  const previousValue = readSearchInputValue(input);
+  const key = resolveKeyboardKey(char);
+  const code = resolveKeyboardCode(char);
+  const keyCode = resolveKeyboardKeyCode(char);
+
+  activateSearchInputComponent(input, previousValue);
+  input.dispatchEvent(
+    new KeyboardEvent('keydown', {
+      key,
+      code,
+      keyCode,
+      which: keyCode,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  dispatchTextInputEvent(input, 'beforeinput', {
+    data: char,
+    inputType: 'insertText',
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  });
+  insertTextAtCaret(input, char);
+  syncFrameworkValueTracker(input, previousValue);
+  dispatchTextInputEvent(input, 'input', {
+    data: char,
+    inputType: 'insertText',
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  });
+  input.dispatchEvent(
+    new KeyboardEvent('keyup', {
+      key,
+      code,
+      keyCode,
+      which: keyCode,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  moveCaretToEnd(input, readSearchInputValue(input));
+}
+
+function insertTextAtCaret(input, text) {
+  if (isContentEditableInput(input)) {
+    insertTextIntoContentEditable(input, text);
+    return;
+  }
+
+  const current = readSearchInputValue(input);
+  const position = current.length;
+  if (typeof input.setRangeText === 'function') {
+    input.setSelectionRange(position, position);
+    input.setRangeText(text, position, position, 'end');
+    return;
+  }
+
+  setSearchInputValue(input, `${current}${text}`);
+}
+
+function insertTextIntoContentEditable(input, text) {
+  const selection = window.getSelection?.();
+  if (!selection || selection.rangeCount === 0 || !input.contains(selection.anchorNode)) {
+    moveCaretToEnd(input, readSearchInputValue(input));
+  }
+
+  const activeSelection = window.getSelection?.();
+  if (!activeSelection || activeSelection.rangeCount === 0) {
+    input.textContent = `${readSearchInputValue(input)}${text}`;
+    return;
+  }
+
+  const range = activeSelection.getRangeAt(0);
+  range.deleteContents();
+  const node = document.createTextNode(text);
+  range.insertNode(node);
+  range.setStartAfter(node);
+  range.setEndAfter(node);
+  range.collapse(false);
+  activeSelection.removeAllRanges();
+  activeSelection.addRange(range);
+}
+
+function readSearchInputValue(input) {
+  if (!input) {
+    return '';
+  }
+
+  if (isContentEditableInput(input)) {
+    return String(input.innerText || input.textContent || '');
+  }
+
+  return String(input.value || '');
+}
+
+function setSearchInputValue(input, value) {
+  if (isContentEditableInput(input)) {
+    writeContentEditableValue(input, value);
+    return;
+  }
+
+  input.value = value;
+}
+
+function writeContentEditableValue(input, value) {
+  input.textContent = String(value || '');
+}
+
+function isContentEditableInput(input) {
+  return Boolean(input?.isContentEditable);
 }
 
 function syncFrameworkValueTracker(input, previousValue) {
@@ -555,8 +1003,13 @@ async function waitForDropdown(
   timeoutMs = DROPDOWN_WAIT_MS,
   query = '',
   platform = '',
+  context = {},
 ) {
   const startedAt = Date.now();
+  let lastTextsKey = '';
+  let lastChangedAt = 0;
+  let lastDropdown = null;
+
   while (Date.now() - startedAt < timeoutMs) {
     assertNotCanceled();
     const el = findBestDropdown(
@@ -565,17 +1018,43 @@ async function waitForDropdown(
       anchorElement,
       query,
       platform,
+      context,
     );
     if (el && isElementVisible(el)) {
-      // 如果提供了 prevTextsKey，检测内容是否已刷新
-      if (prevTextsKey && itemSelectors) {
-        const currentTexts = extractSuggestionTexts(el, itemSelectors).join('|');
-        if (currentTexts && currentTexts !== prevTextsKey) {
-          await waitMs(100);
-          assertNotCanceled();
-          return el;
+      if (
+        context.requireInputValueSignal &&
+        readSearchInputValue(anchorElement) !== context.requireInputValueSignal
+      ) {
+        await waitMs(DROPDOWN_POLL_MS);
+        continue;
+      }
+
+      // 等待词表刷新并稳定，避免读到上一轮残留或平台热榜兜底。
+      if (itemSelectors) {
+        const currentTexts = extractSuggestionTexts(el, itemSelectors, {
+          query,
+          baseKeyword: context.baseKeyword || query,
+          requireQuerySignal: Boolean(context.requireQuerySignal),
+          anchorElement,
+          platform,
+        }).join('|');
+        if (
+          currentTexts &&
+          (!prevTextsKey ||
+            currentTexts !== prevTextsKey ||
+            context.allowUnchangedDropdown)
+        ) {
+          const now = Date.now();
+          if (currentTexts !== lastTextsKey) {
+            lastTextsKey = currentTexts;
+            lastChangedAt = now;
+          }
+          lastDropdown = el;
+          if (now - lastChangedAt >= DROPDOWN_STABLE_MS) {
+            return lastDropdown || el;
+          }
         }
-        // 内容未变化，继续等待
+        // 内容未变化或还没有 seed 相关词，继续等待。
       } else {
         // 没有基准比较，直接等待内容渲染
         await waitMs(150);
@@ -592,21 +1071,64 @@ async function waitForDropdown(
     anchorElement,
     query,
     platform,
+    context,
   );
-  return el && isElementVisible(el) ? el : null;
+  if (!el || !isElementVisible(el)) {
+    return null;
+  }
+  if (
+    context.requireInputValueSignal &&
+    readSearchInputValue(anchorElement) !== context.requireInputValueSignal
+  ) {
+    return null;
+  }
+
+  if (itemSelectors) {
+    const currentTexts = extractSuggestionTexts(el, itemSelectors, {
+      query,
+      baseKeyword: context.baseKeyword || query,
+      requireQuerySignal: Boolean(context.requireQuerySignal),
+      anchorElement,
+      platform,
+    }).join('|');
+    if (
+      !currentTexts ||
+      (currentTexts === prevTextsKey && !context.allowUnchangedDropdown)
+    ) {
+      return null;
+    }
+  }
+
+  if (
+    !dropdownHasSeedSignal(
+      el,
+      context.requireQuerySignal ? query : context.baseKeyword || query,
+    )
+  ) {
+    return null;
+  }
+  return el;
 }
 
 /**
  * 从下拉容器中提取联想词文本
  */
-function extractSuggestionTexts(dropdown, itemSelectors) {
+function extractSuggestionTexts(dropdown, itemSelectors, context = {}) {
   if (!dropdown) return [];
   const seen = new Set();
   const texts = [];
   const items = querySuggestionItems(dropdown, itemSelectors);
 
   for (const item of items) {
-    addSuggestionTextCandidate(texts, seen, normalizeSuggestionText(item));
+    if (isInsideSearchResults(item)) {
+      continue;
+    }
+    addSuggestionTextCandidate(
+      texts,
+      seen,
+      normalizeSuggestionText(item),
+      context,
+    );
   }
 
   if (texts.length > 0) {
@@ -615,7 +1137,7 @@ function extractSuggestionTexts(dropdown, itemSelectors) {
 
   const structuredTexts = extractSuggestionStructuredTexts(dropdown);
   for (const text of structuredTexts) {
-    addSuggestionTextCandidate(texts, seen, text);
+    addSuggestionTextCandidate(texts, seen, text, context);
   }
 
   if (texts.length > 0) {
@@ -624,7 +1146,7 @@ function extractSuggestionTexts(dropdown, itemSelectors) {
 
   const leafTexts = extractSuggestionLeafTexts(dropdown);
   for (const text of leafTexts) {
-    addSuggestionTextCandidate(texts, seen, text);
+    addSuggestionTextCandidate(texts, seen, text, context);
   }
 
   if (texts.length > 0) {
@@ -633,30 +1155,186 @@ function extractSuggestionTexts(dropdown, itemSelectors) {
 
   const textNodeLines = extractSuggestionTextNodeLines(dropdown);
   for (const text of textNodeLines) {
-    addSuggestionTextCandidate(texts, seen, text);
+    addSuggestionTextCandidate(texts, seen, text, context);
   }
 
   const fallbackLines = extractSuggestionTextFromDropdown(dropdown);
   for (const line of fallbackLines) {
-    addSuggestionTextCandidate(texts, seen, line);
+    addSuggestionTextCandidate(texts, seen, line, context);
   }
 
   return texts;
 }
 
-/**
- * 在多个选择器中查找第一个匹配的元素
- */
-function findElement(selectors) {
-  for (const sel of selectors) {
-    const el = document.querySelector(sel);
-    if (el) return el;
+function findElement(selectors, preferredKeyword = '') {
+  const candidates = findEditableSearchInputCandidates(selectors);
+  if (candidates.length === 0) {
+    return null;
   }
-  return null;
+
+  return chooseBestSearchInput(candidates, preferredKeyword);
 }
 
-function resolveSearchInputHandle(selectors, platform) {
-  const realInput = findElement(selectors.searchInput);
+function findEditableSearchInputCandidates(selectors) {
+  const seen = new Set();
+  const candidates = [];
+
+  for (const sel of selectors) {
+    const matches = Array.from(document.querySelectorAll(sel));
+    for (const el of matches) {
+      const editables = resolveEditableSearchInputs(el);
+      for (const editable of editables) {
+        if (!editable || seen.has(editable)) {
+          continue;
+        }
+        seen.add(editable);
+        candidates.push(editable);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function chooseBestSearchInput(candidates, preferredKeyword = '') {
+  const seed = normalizeSuggestionCandidateText(preferredKeyword).toLowerCase();
+  const scored = candidates.map((element, index) => ({
+    element,
+    index,
+    score: scoreSearchInputCandidate(element, seed),
+  }));
+
+  scored.sort((a, b) => {
+    if (a.score !== b.score) {
+      return b.score - a.score;
+    }
+    return a.index - b.index;
+  });
+
+  return scored[0]?.element || null;
+}
+
+function scoreSearchInputCandidate(element, seed = '') {
+  const value = readSearchInputValue(element).trim();
+  const valueLower = value.toLowerCase();
+  const attrs = [
+    element.id,
+    element.className,
+    element.getAttribute?.('name'),
+    element.getAttribute?.('role'),
+    element.getAttribute?.('aria-label'),
+    element.getAttribute?.('placeholder'),
+    element.closest?.('[id], [class]')?.id,
+    element.closest?.('[id], [class]')?.className,
+  ]
+    .map((part) => String(part || '').toLowerCase())
+    .join(' ');
+
+  let score = 0;
+  if (seed && valueLower.includes(seed)) score += 1000;
+  if (value) score += 80;
+  if (/search|搜索|探索/.test(attrs)) score += 80;
+  if (element instanceof HTMLInputElement && element.type === 'search') score += 70;
+  if ((element.getAttribute?.('role') || '').toLowerCase() === 'searchbox') {
+    score += 60;
+  }
+  if (isElementVisible(element)) score += 20;
+  if (/问点点|ai|chat|聊天|对话|assistant|智能助手/.test(attrs)) {
+    score -= seed && valueLower.includes(seed) ? 20 : 320;
+  }
+  if (!value && /问点点|ai|chat|聊天|对话|assistant|智能助手/.test(attrs)) {
+    score -= 180;
+  }
+  return score;
+}
+
+function resolveEditableSearchInput(element) {
+  return resolveEditableSearchInputs(element)[0] || null;
+}
+
+function resolveEditableSearchInputs(element) {
+  if (!element) {
+    return [];
+  }
+
+  if (isEditableSearchInputElement(element)) {
+    return [element];
+  }
+
+  if (typeof element.querySelector !== 'function') {
+    return [];
+  }
+
+  const nestedSelectors = [
+    'input[type="search"]',
+    'input[role="searchbox"]',
+    'input[placeholder*="搜索"]',
+    'input[placeholder*="探索"]',
+    'input',
+    '[contenteditable="true"][role="searchbox"]',
+    '[contenteditable="true"][aria-label*="搜索"]',
+    '[contenteditable="true"][placeholder*="搜索"]',
+    'textarea[role="searchbox"]',
+    'textarea[placeholder*="搜索"]',
+    'textarea[placeholder*="输入"]',
+    'textarea[name="aiSearchTextarea"]',
+    'textarea',
+    '[contenteditable="true"][role="searchbox"]',
+    '[contenteditable="true"][aria-label*="搜索"]',
+    '[contenteditable="true"][placeholder*="搜索"]',
+    '[contenteditable="true"]',
+  ];
+
+  const seen = new Set();
+  const editables = [];
+  for (const selector of nestedSelectors) {
+    const matches = Array.from(element.querySelectorAll(selector));
+    for (const nested of matches) {
+      if (isEditableSearchInputElement(nested) && !seen.has(nested)) {
+        seen.add(nested);
+        editables.push(nested);
+      }
+    }
+  }
+
+  return editables;
+}
+
+function isEditableSearchInputElement(element) {
+  if (!element) {
+    return false;
+  }
+
+  if (element instanceof HTMLTextAreaElement) {
+    return !element.disabled && !element.readOnly;
+  }
+
+  if (element instanceof HTMLInputElement) {
+    const type = String(element.type || 'text').toLowerCase();
+    return (
+      !element.disabled &&
+      !element.readOnly &&
+      !['button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(type)
+    );
+  }
+
+  return isContentEditableInput(element);
+}
+
+function writeKeywordExpandDebugInfo(info) {
+  try {
+    document.documentElement.dataset.onstarvoiceKeywordExpandDebug =
+      JSON.stringify({
+        ...info,
+        writtenAt: new Date().toISOString(),
+      });
+  } catch {
+    // Debug output only; ignore serialization/DOM write failures.
+  }
+}
+
+function resolveSearchInputHandle(selectors, platform, seedKeyword = '') {
+  const realInput = findElement(selectors.searchInput, seedKeyword);
   if (!realInput) {
     return null;
   }
@@ -666,7 +1344,7 @@ function resolveSearchInputHandle(selectors, platform) {
 
   return {
     realInput,
-    writeInput: hpInput || realInput,
+    writeInput: realInput,
     hpInput,
   };
 }
@@ -707,34 +1385,58 @@ function findBestDropdown(
   anchorElement = null,
   query = '',
   platform = '',
+  context = {},
 ) {
   let candidates = findAllElements(dropdownSelectors);
-  if (
-    candidates.length === 0 &&
-    platform === 'douyin' &&
-    query &&
-    anchorElement
-  ) {
-    const structural = findDouyinStructuralDropdown(query, anchorElement);
-    if (structural) {
-      candidates = [structural];
+  if ((platform === 'douyin' || platform === 'xiaohongshu') && query && anchorElement) {
+    const structural = findStructuralSuggestionDropdown(
+      query,
+      anchorElement,
+      platform,
+      context,
+    );
+    if (structural && !candidates.includes(structural)) {
+      candidates = [...candidates, structural];
     }
+
+    const nearby = findNearbySuggestionDropdown(
+      query,
+      anchorElement,
+      platform,
+      context,
+    );
+    if (nearby && !candidates.includes(nearby)) {
+      candidates = [...candidates, nearby];
+    }
+
   }
   if (candidates.length === 0) {
     return null;
   }
 
-  const scored = candidates.map((el) => ({
-    el,
-    visible: isElementVisible(el),
-    itemCount: querySuggestionItems(el, itemSelectors).length,
-    textLineCount: estimateSuggestionLineCount(el),
-    distance: measureDistanceFromAnchor(anchorElement, el),
-  }));
+  const scored = candidates
+    .map((el) => ({
+      el,
+      visible: isElementVisible(el),
+      itemCount: querySuggestionItems(el, itemSelectors).length,
+      textLineCount: estimateSuggestionLineCount(el),
+      relevance: scoreDropdownTextRelevance(el, query, context),
+      inSearchResults: isInsideSearchResults(el),
+      distance: measureDistanceFromAnchor(anchorElement, el),
+    }))
+    .filter(
+      (item) =>
+        item.visible &&
+        !item.inSearchResults &&
+        isWithinSuggestionSearchContext(item.el, anchorElement, platform, {
+          query,
+          baseKeyword: context.baseKeyword || query,
+        }),
+    );
 
   scored.sort((a, b) => {
-    if (a.visible !== b.visible) {
-      return a.visible ? -1 : 1;
+    if (a.relevance !== b.relevance) {
+      return b.relevance - a.relevance;
     }
     if (a.itemCount !== b.itemCount) {
       return b.itemCount - a.itemCount;
@@ -752,38 +1454,61 @@ function findBestDropdown(
 }
 
 /**
- * 抖音专用：当类名选择器全部 miss 时，基于结构寻找联想下拉容器。
- * 抖音新版下拉容器与项使用随机混淆 class（如 .QmcwBilY / .UTRhD9xM），
+ * 当类名选择器 miss 或误命中搜索结果时，基于结构寻找联想下拉容器。
+ * 小红书/抖音新版下拉容器与项常使用随机混淆 class，
  * 没有 data-e2e / suggest / popup 等稳定标识，只能按结构推断：
  *   1. 找到输入框下方 ~600px 内、innerText 以 query 开头的叶子元素
- *   2. 回溯它们的最近共同祖先（包含 ≥3 个候选项的最紧凑容器）
+ *   2. 回溯它们的最近共同祖先（包含 ≥2 个候选项的最紧凑容器）
  */
-function findDouyinStructuralDropdown(query, anchorElement) {
+function findStructuralSuggestionDropdown(
+  query,
+  anchorElement,
+  platform = '',
+  {
+    baseKeyword = '',
+  } = {},
+) {
   if (!query || !anchorElement) return null;
-  // 抖音联想词是拼音/字面混合匹配，item 不一定以 query 字面开头，
-  // 但一定以种子词（去掉末尾 a-z 后缀）开头。
-  const seed = String(query).replace(/[a-zA-Z]+$/, '').trim();
+  // 联想词是拼音/字面混合匹配，item 不一定以 query 字面开头，
+  // 但通常会包含种子词。扩词时优先使用调用方传入的 baseKeyword。
+  const seed = String(baseKeyword || query).trim();
   if (!seed) return null;
   const seedLower = seed.toLowerCase();
   const anchorRect = anchorElement.getBoundingClientRect();
   const items = [];
+  const maxVerticalDistance = platform === 'xiaohongshu' ? 760 : 600;
 
-  const all = document.querySelectorAll('body *');
-  for (const el of all) {
-    if (!(el instanceof HTMLElement)) continue;
-    if (el.childElementCount > 4) continue;
-    if (!isElementVisible(el)) continue;
-    const text = normalizeSuggestionText(el);
-    if (!text || text.length > 40) continue;
-    if (!text.toLowerCase().startsWith(seedLower)) continue;
-    const r = el.getBoundingClientRect();
-    if (r.top < anchorRect.bottom - 4) continue;
-    if (r.top > anchorRect.bottom + 600) continue;
-    if (r.width < 60 || r.height < 16) continue;
-    items.push(el);
+  const scanned = new Set();
+  const scopes = collectSuggestionSearchScopes(anchorElement, platform);
+  for (const scope of scopes) {
+    const all = scope.querySelectorAll('*');
+    for (const el of all) {
+      if (scanned.has(el)) continue;
+      scanned.add(el);
+      if (!(el instanceof HTMLElement)) continue;
+      if (el.childElementCount > 4) continue;
+      if (!isElementVisible(el)) continue;
+      const text = normalizeSuggestionText(el);
+      if (!text || text.length > 40) continue;
+      if (!isLikelySuggestionCandidate(seedLower, text)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top < anchorRect.bottom - 4) continue;
+      if (r.top > anchorRect.bottom + maxVerticalDistance) continue;
+      if (r.width < 60 || r.height < 16) continue;
+      if (isInsideSearchResults(el)) continue;
+      if (
+        !isWithinSuggestionSearchContext(el, anchorElement, platform, {
+          query,
+          baseKeyword: seed,
+        })
+      ) {
+        continue;
+      }
+      items.push(el);
+    }
   }
 
-  if (items.length < 3) return null;
+  if (items.length < 2) return null;
 
   const ancestorCount = new Map();
   for (const item of items) {
@@ -802,7 +1527,7 @@ function findDouyinStructuralDropdown(query, anchorElement) {
   let bestScore = -1;
   let bestCount = 0;
   for (const [ancestor, count] of ancestorCount) {
-    if (count < 3) continue;
+    if (count < 2) continue;
     const childCount = Math.max(ancestor.childElementCount, 1);
     const density = count / childCount;
     const score = density * 100 + Math.min(count, 30);
@@ -850,6 +1575,80 @@ function querySuggestionItems(dropdown, itemSelectors = []) {
   }
 
   return matches;
+}
+
+function findNearbySuggestionDropdown(
+  query,
+  anchorElement,
+  platform = '',
+  context = {},
+) {
+  if (!query || !anchorElement) {
+    return null;
+  }
+
+  const seed = context.baseKeyword || query;
+  const candidates = collectNearbyTextCandidates(anchorElement, platform, {
+    query,
+    baseKeyword: seed,
+  }).filter((candidate) => isLikelySuggestionCandidate(seed, candidate.text));
+  const elements = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const element = candidate.element;
+    if (!(element instanceof HTMLElement) || seen.has(element)) {
+      continue;
+    }
+    seen.add(element);
+    elements.push(element);
+    if (elements.length >= 12) {
+      break;
+    }
+  }
+
+  if (elements.length === 0) {
+    return null;
+  }
+
+  if (elements.length === 1) {
+    return elements[0].parentElement || elements[0];
+  }
+
+  return findCompactCommonSuggestionAncestor(elements, 2);
+}
+
+function findCompactCommonSuggestionAncestor(elements, minimumCount = 2) {
+  const ancestorCount = new Map();
+  for (const element of elements) {
+    let parent = element.parentElement;
+    let depth = 0;
+    while (parent && parent !== document.body && depth < 10) {
+      ancestorCount.set(parent, (ancestorCount.get(parent) || 0) + 1);
+      parent = parent.parentElement;
+      depth++;
+    }
+  }
+
+  let best = null;
+  let bestScore = -1;
+  let bestCount = 0;
+  for (const [ancestor, count] of ancestorCount) {
+    if (count < minimumCount) continue;
+    const childCount = Math.max(ancestor.childElementCount, 1);
+    const density = count / childCount;
+    const score = density * 100 + Math.min(count, 30);
+    if (
+      score > bestScore ||
+      (score === bestScore && count > bestCount)
+    ) {
+      best = ancestor;
+      bestScore = score;
+      bestCount = count;
+    }
+  }
+
+  return best || elements[0].parentElement || elements[0];
 }
 
 function normalizeSuggestionText(node) {
@@ -1087,16 +1886,73 @@ function estimateSuggestionLineCount(el) {
   return Math.min(lines.length, 30);
 }
 
-function extractFallbackSuggestionsNearInput(query, anchorElement) {
+function scoreDropdownTextRelevance(dropdown, query, { baseKeyword = '' } = {}) {
+  const seed = normalizeSuggestionCandidateText(baseKeyword || query).toLowerCase();
+  const fullQuery = normalizeSuggestionCandidateText(query).toLowerCase();
+  if (!seed && !fullQuery) {
+    return 0;
+  }
+
+  const lines = extractSuggestionTextFromDropdown(dropdown)
+    .map((line) => normalizeSuggestionCandidateText(line).toLowerCase())
+    .filter(Boolean);
+
+  let score = 0;
+  for (const line of lines) {
+    if (fullQuery && line.startsWith(fullQuery)) {
+      score += 8;
+    } else if (seed && line.startsWith(seed)) {
+      score += 6;
+    } else if (fullQuery && line.includes(fullQuery)) {
+      score += 4;
+    } else if (seed && line.includes(seed)) {
+      score += 3;
+    }
+  }
+
+  return score;
+}
+
+function extractFallbackSuggestionsNearInput(query, anchorElement, context = {}) {
   const seen = new Set();
   const texts = [];
-  const candidates = collectNearbyTextCandidates(anchorElement);
+  const candidates = [
+    ...collectNearbyElementTextCandidates(
+      anchorElement,
+      context.platform || '',
+      {
+        query,
+        baseKeyword: context.baseKeyword || query,
+      },
+    ),
+    ...collectNearbyTextCandidates(
+      anchorElement,
+      context.platform || '',
+      {
+        query,
+        baseKeyword: context.baseKeyword || query,
+      },
+    ),
+  ];
 
   for (const candidate of candidates) {
-    if (!isLikelySuggestionCandidate(query, candidate.text)) {
+    const requireQuerySignal =
+      !context.preferBaseKeywordSignal &&
+      shouldRequireQuerySignal(
+        query,
+        context.baseKeyword || query,
+      );
+    const relevanceQuery = requireQuerySignal
+      ? query
+      : context.baseKeyword || query;
+    if (!isLikelySuggestionCandidate(relevanceQuery, candidate.text)) {
       continue;
     }
-    addSuggestionTextCandidate(texts, seen, candidate.text);
+    addSuggestionTextCandidate(texts, seen, candidate.text, {
+      query,
+      baseKeyword: context.baseKeyword || query,
+      requireQuerySignal,
+    });
     if (texts.length >= 12) {
       break;
     }
@@ -1105,14 +1961,132 @@ function extractFallbackSuggestionsNearInput(query, anchorElement) {
   return texts;
 }
 
-function extractNearbyTextSample(anchorElement, query) {
-  return collectNearbyTextCandidates(anchorElement)
+function extractFallbackSuggestionsFromSearchRoot(
+  query,
+  anchorElement,
+  itemSelectors,
+  context = {},
+) {
+  const root =
+    findSearchInteractionRoot(anchorElement, context.platform || '') ||
+    anchorElement?.closest?.('#search-input') ||
+    anchorElement?.parentElement ||
+    document.body;
+  if (!root) {
+    return [];
+  }
+
+  const normalizedQuery = normalizeSuggestionCandidateText(query).toLowerCase();
+  const seed = context.baseKeyword || query;
+  const splitTexts = [];
+  for (const text of extractSuggestionTexts(root, itemSelectors, {
+    query,
+    baseKeyword: seed,
+    anchorElement,
+    platform: context.platform || '',
+  })) {
+    splitTexts.push(...splitSuggestionTextBySeed(text, seed));
+  }
+
+  return Array.from(new Set(splitTexts)).filter(
+    (text) =>
+      normalizeSuggestionCandidateText(text).toLowerCase() !== normalizedQuery,
+  );
+}
+
+function splitSuggestionTextBySeed(text, seedKeyword = '') {
+  const normalized = normalizeSuggestionCandidateText(text);
+  const seed = normalizeSuggestionCandidateText(seedKeyword);
+  if (!normalized || !seed) {
+    return normalized ? [normalized] : [];
+  }
+
+  const lower = normalized.toLowerCase();
+  const seedLower = seed.toLowerCase();
+  const positions = [];
+  let index = lower.indexOf(seedLower);
+  while (index >= 0) {
+    positions.push(index);
+    index = lower.indexOf(seedLower, index + seedLower.length);
+  }
+
+  if (positions.length <= 1) {
+    return [normalized];
+  }
+
+  return positions
+    .map((start, i) => {
+      const end = positions[i + 1] ?? normalized.length;
+      return normalizeSuggestionCandidateText(normalized.slice(start, end));
+    })
+    .filter(Boolean);
+}
+
+function collectNearbyElementTextCandidates(anchorElement, platform = '', context = {}) {
+  if (!anchorElement) {
+    return [];
+  }
+
+  const anchorRect = anchorElement.getBoundingClientRect();
+  const candidates = [];
+  const seen = new Set();
+  const scopes = collectSuggestionSearchScopes(anchorElement, platform);
+
+  for (const scope of scopes) {
+    const elements = Array.from(scope.querySelectorAll('*'));
+    for (const element of elements) {
+      if (!(element instanceof HTMLElement)) continue;
+      if (seen.has(element)) continue;
+      seen.add(element);
+      if (element.childElementCount > 4) continue;
+      if (!isElementVisible(element)) continue;
+      if (!isNearbySuggestionRegion(element, anchorRect)) continue;
+      if (isInsideSearchResults(element)) continue;
+      if (!isDropdownPositionedNearAnchor(element, anchorElement, platform)) {
+        continue;
+      }
+
+      const text = normalizeSuggestionText(element);
+      if (!text || shouldSkipSuggestionText(text)) continue;
+      candidates.push({
+        text,
+        element,
+        distance: measureDistanceFromAnchor(anchorElement, element),
+      });
+    }
+  }
+
+  candidates.sort((a, b) => {
+    if (a.distance !== b.distance) {
+      return a.distance - b.distance;
+    }
+    return a.text.length - b.text.length;
+  });
+
+  return candidates;
+}
+
+function extractNearbyTextSample(anchorElement, query, platform = '') {
+  return collectNearbyTextCandidates(anchorElement, platform, {
+    query,
+    baseKeyword: query,
+  })
     .filter((candidate) => isPossiblyRelevantNearbyText(query, candidate.text))
     .slice(0, 8)
     .map((candidate) => candidate.text);
 }
 
-function collectNearbyTextCandidates(anchorElement) {
+function extractNearbyElementTextSample(anchorElement, query, platform = '') {
+  return collectNearbyElementTextCandidates(anchorElement, platform, {
+    query,
+    baseKeyword: query,
+  })
+    .filter((candidate) => isPossiblyRelevantNearbyText(query, candidate.text))
+    .slice(0, 8)
+    .map((candidate) => candidate.text);
+}
+
+function collectNearbyTextCandidates(anchorElement, platform = '', context = {}) {
   if (!anchorElement || typeof document.createTreeWalker !== 'function') {
     return [];
   }
@@ -1120,29 +2094,34 @@ function collectNearbyTextCandidates(anchorElement) {
   const anchorRect = anchorElement.getBoundingClientRect();
   const candidates = [];
   const seen = new Set();
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+  const scopes = collectSuggestionSearchScopes(anchorElement, platform);
 
-  let current = walker.nextNode();
-  while (current) {
-    const parent = current.parentElement;
-    const text = normalizeSuggestionCandidateText(current.textContent);
+  for (const scope of scopes) {
+    const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT, null);
+    let current = walker.nextNode();
+    while (current) {
+      const parent = current.parentElement;
+      const text = normalizeSuggestionCandidateText(current.textContent);
 
-    if (
-      parent &&
-      text &&
-      !seen.has(`${parent.tagName}:${text}`) &&
-      isElementVisible(parent) &&
-      isNearbySuggestionRegion(parent, anchorRect) &&
-      !isInsideSearchResults(parent)
-    ) {
-      seen.add(`${parent.tagName}:${text}`);
-      candidates.push({
+      if (
+        parent &&
+        text &&
+        !seen.has(`${parent.tagName}:${text}`) &&
+        isElementVisible(parent) &&
+        isNearbySuggestionRegion(parent, anchorRect) &&
+        !isInsideSearchResults(parent) &&
+        isWithinSuggestionSearchContext(parent, anchorElement, platform, context)
+      ) {
+        seen.add(`${parent.tagName}:${text}`);
+        candidates.push({
         text,
+        element: parent,
         distance: measureDistanceFromAnchor(anchorElement, parent),
       });
-    }
+      }
 
-    current = walker.nextNode();
+      current = walker.nextNode();
+    }
   }
 
   candidates.sort((a, b) => {
@@ -1179,11 +2158,311 @@ function isNearbySuggestionRegion(element, anchorRect) {
   return rect.top < Math.max(anchorRect.bottom + 720, window.innerHeight * 0.72);
 }
 
+function resolveSuggestionSearchScope(anchorElement, platform = '') {
+  const root = findSearchInteractionRoot(anchorElement, platform);
+  return root || document.body;
+}
+
+function collectSuggestionSearchScopes(anchorElement, platform = '') {
+  const scopes = [];
+  const root = findSearchInteractionRoot(anchorElement, platform);
+  if (root) {
+    scopes.push(root);
+  }
+  if (document.body && !scopes.includes(document.body)) {
+    scopes.push(document.body);
+  }
+  return scopes.length > 0 ? scopes : [document.body].filter(Boolean);
+}
+
+function findSearchInteractionRoot(anchorElement, platform = '') {
+  if (!anchorElement || typeof anchorElement.getBoundingClientRect !== 'function') {
+    return null;
+  }
+
+  const anchorRect = anchorElement.getBoundingClientRect();
+  let node = anchorElement.parentElement;
+  let bestOverlayRoot = null;
+
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (!(node instanceof HTMLElement)) {
+      node = node.parentElement;
+      continue;
+    }
+
+    const rect = node.getBoundingClientRect();
+    const canContainDropdown =
+      rect.width >= 240 &&
+      rect.height >= 120 &&
+      rect.top <= anchorRect.top + 12 &&
+      rect.bottom >= anchorRect.bottom + 80;
+    if (!canContainDropdown) {
+      node = node.parentElement;
+      continue;
+    }
+
+    const attrText = [
+      node.id,
+      node.className,
+      node.getAttribute('role'),
+      node.getAttribute('aria-label'),
+    ]
+      .map((value) => String(value || ''))
+      .join(' ');
+    const style = window.getComputedStyle(node);
+    const zIndex = Number.parseInt(style.zIndex || '0', 10);
+    const overlayLike =
+      ['fixed', 'absolute', 'sticky'].includes(style.position) ||
+      (Number.isFinite(zIndex) && zIndex > 0);
+    const searchLike =
+      /search|sug|suggest|dropdown|popover|modal|dialog|mask|input|query/i.test(
+        attrText,
+      );
+
+    if (searchLike && (overlayLike || platform === 'xiaohongshu')) {
+      return node;
+    }
+
+    if (overlayLike) {
+      bestOverlayRoot = node;
+    }
+
+    node = node.parentElement;
+  }
+
+  return bestOverlayRoot;
+}
+
+function isWithinSuggestionSearchContext(
+  element,
+  anchorElement,
+  platform = '',
+  context = {},
+) {
+  if (!element || !anchorElement) {
+    return true;
+  }
+
+  if (!isDropdownPositionedNearAnchor(element, anchorElement, platform)) {
+    return false;
+  }
+
+  const root = findSearchInteractionRoot(anchorElement, platform);
+  if (!root || root === document.body || root === document.documentElement) {
+    return true;
+  }
+
+  if (root.contains(element)) {
+    return true;
+  }
+
+  if (hasSuggestionSurfaceSignal(element)) {
+    return true;
+  }
+
+  return isLikelyFloatingSuggestionPortal(element, anchorElement, platform, context);
+}
+
+function isLikelyFloatingSuggestionPortal(
+  element,
+  anchorElement,
+  platform = '',
+  { query = '', baseKeyword = '' } = {},
+) {
+  if (!(element instanceof HTMLElement) || isInsideSearchResults(element)) {
+    return false;
+  }
+
+  if (!isDropdownPositionedNearAnchor(element, anchorElement, platform)) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 60 || rect.height < 14 || rect.height > 520) {
+    return false;
+  }
+
+  const seed = normalizeSuggestionCandidateText(baseKeyword || query);
+  if (!seed) {
+    return false;
+  }
+
+  const lines = extractSuggestionTextFromDropdown(element);
+  return lines.some((line) => isLikelySuggestionCandidate(seed, line));
+}
+
+function isDropdownPositionedNearAnchor(element, anchorElement, platform = '') {
+  if (
+    !element ||
+    !anchorElement ||
+    typeof element.getBoundingClientRect !== 'function' ||
+    typeof anchorElement.getBoundingClientRect !== 'function'
+  ) {
+    return true;
+  }
+
+  const rect = element.getBoundingClientRect();
+  const anchorRect = anchorElement.getBoundingClientRect();
+  if (!rect.width || !rect.height) {
+    return false;
+  }
+
+  const maxTopGap = platform === 'xiaohongshu' ? 760 : 620;
+  if (rect.bottom < anchorRect.bottom - 12) {
+    return false;
+  }
+  if (rect.top > anchorRect.bottom + maxTopGap) {
+    return false;
+  }
+
+  const expandedLeft = anchorRect.left - Math.max(360, anchorRect.width * 0.8);
+  const expandedRight =
+    anchorRect.right + Math.max(360, anchorRect.width * 1.2);
+  return rect.right >= expandedLeft && rect.left <= expandedRight;
+}
+
+function hasSuggestionSurfaceSignal(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  const attrText = [
+    element.id,
+    element.className,
+    element.getAttribute('role'),
+    element.getAttribute('aria-label'),
+  ]
+    .map((value) => String(value || ''))
+    .join(' ');
+
+  if (
+    /sug|suggest|search-suggest|dropdown|popover|autocomplete|auto-complete|listbox|option/i.test(
+      attrText,
+    )
+  ) {
+    return true;
+  }
+
+  let node = element.parentElement;
+  let depth = 0;
+  while (node && node !== document.body && depth < 4) {
+    const parentAttrs = [
+      node.id,
+      node.className,
+      node.getAttribute?.('role'),
+      node.getAttribute?.('aria-label'),
+    ]
+      .map((value) => String(value || ''))
+      .join(' ');
+    if (
+      /sug|suggest|search-suggest|dropdown|popover|autocomplete|auto-complete|listbox/i.test(
+        parentAttrs,
+      )
+    ) {
+      return true;
+    }
+    node = node.parentElement;
+    depth++;
+  }
+
+  return false;
+}
+
 function isInsideSearchResults(element) {
-  return Boolean(
+  if (!element || typeof element.closest !== 'function') {
+    return false;
+  }
+
+  if (
     element.closest(
-      '#search-result-container, #waterFallScrollContainer, .search-result-card, [id^="waterfall_item_"], [data-e2e="scroll-list"]',
-    ),
+      `${SEARCH_RESULT_REGION_SELECTOR}, [data-e2e="scroll-list"]`,
+    )
+  ) {
+    return true;
+  }
+
+  let node = element;
+  let depth = 0;
+  while (node && node !== document.body && depth < 8) {
+    if (isLikelyNoteResultContainer(node)) {
+      return true;
+    }
+    node = node.parentElement;
+    depth++;
+  }
+
+  return false;
+}
+
+function isLikelyNoteResultContainer(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (hasSuggestionSurfaceSignal(element)) {
+    return false;
+  }
+
+  const attrText = [
+    element.id,
+    element.className,
+    element.getAttribute('data-v-feed'),
+    element.getAttribute('data-e2e'),
+  ]
+    .map((value) => String(value || ''))
+    .join(' ');
+  if (/waterfall|feed|note-item|search-result|explore/i.test(attrText)) {
+    return true;
+  }
+
+  return Boolean(
+    element.querySelector?.(NOTE_RESULT_LINK_SELECTOR) ||
+      element.querySelector?.(NOTE_RESULT_MEDIA_SELECTOR),
+  );
+}
+
+function isLikelyNoteMetadataText(text) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /^(编辑于|发布于|发表于)?\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}/.test(
+      normalized,
+    ) ||
+    /^\d+\s*(秒|分钟|小时|天|周|月|年)前$/.test(normalized) ||
+    /^[\w\u3400-\u9fff.-]{1,36}\s*(?:\d{4}-\d{2}-\d{2}|\d+\s*(秒|分钟|小时|天|周|月|年)前)$/.test(
+      normalized,
+    )
+  );
+}
+
+function dropdownHasSeedSignal(dropdown, seedKeyword = '') {
+  if (!dropdown) {
+    return false;
+  }
+
+  const seed = normalizeSuggestionCandidateText(seedKeyword).toLowerCase();
+  if (!seed) {
+    return true;
+  }
+
+  const lines = extractSuggestionTextFromDropdown(dropdown)
+    .map((line) => normalizeSuggestionCandidateText(line).toLowerCase())
+    .filter(Boolean);
+
+  return lines.some((line) => line.includes(seed));
+}
+
+function shouldRequireQuerySignal(query, baseKeyword = '') {
+  const normalizedQuery = normalizeSuggestionCandidateText(query).toLowerCase();
+  const normalizedBase = normalizeSuggestionCandidateText(baseKeyword).toLowerCase();
+  return Boolean(
+    normalizedQuery &&
+      normalizedBase &&
+      normalizedQuery !== normalizedBase &&
+      normalizedQuery.startsWith(normalizedBase),
   );
 }
 
@@ -1193,8 +2472,10 @@ function isLikelySuggestionCandidate(query, text) {
   if (!normalizedQuery || !normalizedText) {
     return false;
   }
+  const queryLower = normalizedQuery.toLowerCase();
+  const textLower = normalizedText.toLowerCase();
 
-  if (normalizedText === normalizedQuery) {
+  if (textLower === queryLower) {
     return false;
   }
 
@@ -1202,11 +2483,11 @@ function isLikelySuggestionCandidate(query, text) {
     return false;
   }
 
-  if (normalizedText.startsWith(normalizedQuery)) {
+  if (textLower.startsWith(queryLower)) {
     return true;
   }
 
-  if (normalizedQuery.length >= 2 && normalizedText.includes(normalizedQuery)) {
+  if (queryLower.length >= 2 && textLower.includes(queryLower)) {
     return true;
   }
 
@@ -1238,7 +2519,7 @@ function shouldSkipSuggestionText(text) {
 
   // 排除明显不是联想词的提示文本。
   if (
-    /^(搜索|搜索小红书|清除|取消|历史|历史记录|最近|最近搜索|更多|猜你想搜|大家都在搜|相关搜索|清空历史|删除历史记录|删除|关闭)$/i.test(
+    /^(搜索|搜索小红书|清除|取消|关闭|更多|相关搜索|历史|历史记录|最近|最近搜索|猜你想搜|大家都在搜|清空历史|删除历史记录|删除|综合|笔记|用户|商品|直播|全部|筛选|排序|默认|最热|最新)$/i.test(
       normalized,
     )
   ) {
@@ -1258,13 +2539,41 @@ function shouldSkipSuggestionText(text) {
   return false;
 }
 
-function addSuggestionTextCandidate(texts, seen, text) {
+function addSuggestionTextCandidate(texts, seen, text, context = {}) {
   const normalized = normalizeSuggestionCandidateText(text);
   if (!normalized || seen.has(normalized) || shouldSkipSuggestionText(normalized)) {
     return;
   }
+  if (!passesSuggestionTextContext(normalized, context)) {
+    return;
+  }
   seen.add(normalized);
   texts.push(normalized);
+}
+
+function passesSuggestionTextContext(
+  text,
+  { query = '', baseKeyword = '', requireQuerySignal = false } = {},
+) {
+  const normalized = normalizeSuggestionCandidateText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  if (isLikelyNoteMetadataText(normalized)) {
+    return false;
+  }
+
+  const seed = normalizeSuggestionCandidateText(baseKeyword || query);
+  if (!seed) {
+    return true;
+  }
+
+  if (requireQuerySignal) {
+    return isLikelySuggestionCandidate(query, normalized);
+  }
+
+  return isLikelySuggestionCandidate(seed, normalized);
 }
 
 function normalizeSuggestionCandidateText(text) {
@@ -1285,6 +2594,20 @@ function normalizeSuggestionCandidateText(text) {
 }
 
 function moveCaretToEnd(input, value) {
+  if (isContentEditableInput(input)) {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(input);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch {
+      // ignore for non-selectable elements
+    }
+    return;
+  }
+
   try {
     input.setSelectionRange(value.length, value.length);
   } catch {
@@ -1340,6 +2663,10 @@ function resolveDropdownWaitMs(platform) {
   return platform === 'douyin' ? DOUYIN_DROPDOWN_WAIT_MS : DROPDOWN_WAIT_MS;
 }
 
+function resolveRetryDropdownWaitMs(_platform, initialWaitMs = DROPDOWN_WAIT_MS) {
+  return Math.min(resolveDelayBetweenMs(initialWaitMs), DROPDOWN_RETRY_WAIT_MS);
+}
+
 function isElementVisible(el) {
   if (!el) {
     return false;
@@ -1385,10 +2712,53 @@ function isExpandCanceledError(error) {
 /**
  * 随机延迟
  */
-function randomDelay(baseMs) {
-  const jitter = Math.floor(Math.random() * DELAY_JITTER_MS * 2) - DELAY_JITTER_MS;
-  const ms = Math.max(100, baseMs + jitter);
-  return waitMs(ms);
+async function randomDelay(baseMs, onProgress = null) {
+  const normalizedBaseMs = resolveDelayBetweenMs(baseMs);
+  const jitterLimit = resolveDelayJitterMs(normalizedBaseMs);
+  const jitter = jitterLimit > 0
+    ? Math.floor(Math.random() * jitterLimit * 2) - jitterLimit
+    : 0;
+  const ms = Math.max(100, normalizedBaseMs + jitter);
+  console.info('[KeywordExpand] Delay before next query', {
+    baseMs: normalizedBaseMs,
+    jitterMs: jitter,
+    waitMs: ms,
+  });
+  if (typeof onProgress === 'function') {
+    onProgress({
+      phase: 'keyword_expand_wait',
+      delayMs: ms,
+      message: `等待 ${(ms / 1000).toFixed(1)} 秒后继续扩词`,
+    });
+  }
+  await waitMs(ms);
+}
+
+function resolveDelayJitterMs(baseMs) {
+  if (baseMs < 500) {
+    return 0;
+  }
+  return Math.min(DELAY_JITTER_MS, Math.floor(baseMs * 0.25));
+}
+
+function resolveDelayBetweenMs(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0
+    ? numeric
+    : DEFAULT_DELAY_MS;
+}
+
+function normalizeSuffixLetters(value) {
+  if (!Array.isArray(value)) {
+    return LETTERS;
+  }
+
+  const normalized = value
+    .map((item) => String(item || '').trim())
+    .filter((item) => /^[a-z]$/i.test(item))
+    .map((item) => item.toLowerCase());
+
+  return normalized.length > 0 ? Array.from(new Set(normalized)) : LETTERS;
 }
 
 function waitMs(ms) {
@@ -1401,30 +2771,23 @@ async function waitForInputSync(input, expectedValue) {
 
   while (Date.now() - startedAt < WRITE_SYNC_WAIT_MS) {
     assertNotCanceled();
-    if (String(input?.value || '') === normalizedExpected) {
+    if (readSearchInputValue(input) === normalizedExpected) {
       return true;
     }
     await waitMs(WRITE_SYNC_POLL_MS);
   }
 
-  return String(input?.value || '') === normalizedExpected;
+  return readSearchInputValue(input) === normalizedExpected;
 }
 
 async function ensureCaretAtEnd(input, value) {
+  if (!input) {
+    return false;
+  }
+
   const normalizedValue = String(value || '');
   for (let i = 0; i < CARET_SETTLE_ATTEMPTS; i++) {
-    try {
-      window.focus();
-    } catch {
-      // ignore
-    }
-    try {
-      input.focus({ preventScroll: true });
-    } catch {
-      input.focus();
-    }
-    moveCaretToEnd(input, normalizedValue);
-    input.dispatchEvent(new Event('select', { bubbles: true }));
+    focusSearchInputAtEnd(input, normalizedValue);
 
     const selection = readSelectionPosition(input);
     if (
@@ -1443,7 +2806,247 @@ async function ensureCaretAtEnd(input, value) {
   return false;
 }
 
+async function ensureSearchInputReadyForTyping(input) {
+  if (!input) {
+    return false;
+  }
+
+  const value = readSearchInputValue(input);
+  activateSearchInputComponent(input, value);
+  await waitMs(40);
+  return ensureCaretAtEnd(input, readSearchInputValue(input));
+}
+
+function activateSearchInputComponent(input, value = readSearchInputValue(input)) {
+  if (!input) {
+    return false;
+  }
+
+  const normalizedValue = String(value || '');
+  const targets = resolveSearchActivationTargets(input);
+  for (const target of targets) {
+    dispatchMouseActivationSequence(target, input);
+  }
+
+  focusSearchInputAtEnd(input, normalizedValue);
+  dispatchFocusLifecycleEvents(input);
+  moveCaretToEnd(input, normalizedValue);
+  return document.activeElement === input;
+}
+
+function resolveSearchActivationTargets(input) {
+  const targets = [];
+  const preferredSelectors = [
+    '.textarea-wrapper',
+    '.textarea-container',
+    '.input-box',
+    '[class*="search-input"]',
+    '[class*="SearchInput"]',
+  ];
+
+  for (const selector of preferredSelectors) {
+    const target = input.closest?.(selector);
+    if (target instanceof HTMLElement && !targets.includes(target)) {
+      targets.push(target);
+    }
+  }
+
+  let parent = input.parentElement;
+  let depth = 0;
+  while (parent && parent !== document.body && depth < 3) {
+    if (parent instanceof HTMLElement && !targets.includes(parent)) {
+      targets.push(parent);
+    }
+    parent = parent.parentElement;
+    depth += 1;
+  }
+
+  if (!targets.includes(input)) {
+    targets.push(input);
+  }
+
+  return targets;
+}
+
+function dispatchMouseActivationSequence(target, input) {
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const point = getCaretActivationPoint(input || target);
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    detail: 1,
+    button: 0,
+    buttons: 1,
+    clientX: point.x,
+    clientY: point.y,
+    screenX: Math.round(window.screenX + point.x),
+    screenY: Math.round(window.screenY + point.y),
+  };
+
+  dispatchPointerLikeEvent(target, 'pointerdown', eventInit);
+  target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+  dispatchPointerLikeEvent(target, 'pointerup', {
+    ...eventInit,
+    buttons: 0,
+  });
+  target.dispatchEvent(
+    new MouseEvent('mouseup', {
+      ...eventInit,
+      buttons: 0,
+    }),
+  );
+  target.dispatchEvent(
+    new MouseEvent('click', {
+      ...eventInit,
+      buttons: 0,
+    }),
+  );
+}
+
+function dispatchPointerLikeEvent(target, type, init) {
+  try {
+    if (typeof PointerEvent === 'function') {
+      target.dispatchEvent(
+        new PointerEvent(type, {
+          ...init,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }),
+      );
+      return;
+    }
+  } catch {
+    // Fall through to mouse event for older browsers/pages.
+  }
+
+  target.dispatchEvent(new MouseEvent(type, init));
+}
+
+function getCaretActivationPoint(input) {
+  const rect =
+    typeof input?.getBoundingClientRect === 'function'
+      ? input.getBoundingClientRect()
+      : null;
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return { x: 0, y: 0 };
+  }
+
+  const textEndX = estimateInputTextEndX(input, rect);
+  return {
+    x: Math.round(Math.min(rect.right - 10, Math.max(rect.left + 10, textEndX))),
+    y: Math.round(rect.top + Math.max(12, Math.min(rect.height / 2, 28))),
+  };
+}
+
+function estimateInputTextEndX(input, rect) {
+  try {
+    const style = window.getComputedStyle(input);
+    const value = readSearchInputValue(input);
+    const canvas = estimateInputTextEndX.canvas || document.createElement('canvas');
+    estimateInputTextEndX.canvas = canvas;
+    const ctx = canvas.getContext('2d');
+    ctx.font = style.font || `${style.fontSize || '16px'} ${style.fontFamily || 'sans-serif'}`;
+    const paddingLeft = parseFloat(style.paddingLeft || '0') || 0;
+    const borderLeft = parseFloat(style.borderLeftWidth || '0') || 0;
+    const textWidth = ctx.measureText(value).width;
+    return rect.left + borderLeft + paddingLeft + textWidth + 8;
+  } catch {
+    return rect.left + Math.max(24, rect.width * 0.16);
+  }
+}
+
+function dispatchFocusLifecycleEvents(input) {
+  dispatchFocusEvent(input, 'focusin', true);
+  dispatchFocusEvent(input, 'focus', false);
+}
+
+function dispatchFocusEvent(input, type, bubbles) {
+  try {
+    input.dispatchEvent(
+      new FocusEvent(type, {
+        bubbles,
+        cancelable: false,
+        composed: true,
+        view: window,
+      }),
+    );
+  } catch {
+    input.dispatchEvent(new Event(type, { bubbles, composed: true }));
+  }
+}
+
+function focusSearchInputAtEnd(input, value = readSearchInputValue(input)) {
+  if (!input) {
+    return false;
+  }
+
+  const normalizedValue = String(value || '');
+
+  try {
+    window.focus();
+  } catch {
+    // ignore
+  }
+
+  try {
+    input.scrollIntoView?.({
+      block: 'nearest',
+      inline: 'nearest',
+      behavior: 'instant',
+    });
+  } catch {
+    // ignore browsers without behavior: instant
+    try {
+      input.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    } catch {
+      // ignore
+    }
+  }
+
+  try {
+    input.focus({ preventScroll: true });
+  } catch {
+    try {
+      input.focus();
+    } catch {
+      // ignore
+    }
+  }
+
+  moveCaretToEnd(input, normalizedValue);
+  dispatchFocusLifecycleEvents(input);
+  input.dispatchEvent(new Event('select', { bubbles: true }));
+
+  return document.activeElement === input;
+}
+
 function readSelectionPosition(input) {
+  if (isContentEditableInput(input)) {
+    const valueLength = readSearchInputValue(input).length;
+    const selection = window.getSelection?.();
+    if (
+      selection &&
+      selection.rangeCount > 0 &&
+      input.contains(selection.anchorNode) &&
+      selection.isCollapsed
+    ) {
+      return {
+        start: valueLength,
+        end: valueLength,
+      };
+    }
+    return {
+      start: -1,
+      end: -1,
+    };
+  }
+
   try {
     return {
       start: Number.isFinite(input.selectionStart) ? input.selectionStart : -1,
@@ -1457,190 +3060,10 @@ function readSelectionPosition(input) {
   }
 }
 
-async function ensureDocumentInteractiveFocus() {
+async function ensureDocumentInteractiveFocus(targetInput = null) {
   assertNotCanceled();
-  if (document.hasFocus()) {
-    return true;
+  if (targetInput) {
+    await ensureSearchInputReadyForTyping(targetInput);
   }
-
-  console.info('[KeywordExpand] Waiting for page focus');
-  await waitForUserFocusOnPage();
-  assertNotCanceled();
   return document.hasFocus();
-}
-
-async function waitForUserFocusOnPage() {
-  ensureFocusOverlayStyle();
-
-  const existing = document.getElementById(FOCUS_OVERLAY_ID);
-  if (existing) {
-    existing.remove();
-  }
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let cancelTimer = null;
-
-    const overlay = document.createElement('div');
-    overlay.id = FOCUS_OVERLAY_ID;
-    overlay.innerHTML = `
-      <div class="onstarvoice-keyword-expand-focus-card">
-        <div class="onstarvoice-keyword-expand-focus-title">扩词需要页面焦点</div>
-        <div class="onstarvoice-keyword-expand-focus-desc">点击下方按钮后继续自动扩词</div>
-        <button type="button" class="onstarvoice-keyword-expand-focus-button">点击这里继续</button>
-      </div>
-    `;
-
-    const button = overlay.querySelector('button');
-
-    const cleanup = () => {
-      if (cancelTimer) {
-        clearInterval(cancelTimer);
-        cancelTimer = null;
-      }
-      window.removeEventListener('focus', handleWindowFocus, true);
-      document.removeEventListener('visibilitychange', handleVisibilityChange, true);
-      overlay.removeEventListener('pointerdown', handlePointerDown, true);
-      button?.removeEventListener('click', handleButtonClick, true);
-      overlay.remove();
-    };
-
-    const finish = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      resolve(true);
-    };
-
-    const fail = (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-
-    const checkFocusSoon = () => {
-      window.setTimeout(() => {
-        if (settled) {
-          return;
-        }
-        if (document.hasFocus()) {
-          finish();
-        }
-      }, 30);
-    };
-
-    const handleWindowFocus = () => {
-      checkFocusSoon();
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        checkFocusSoon();
-      }
-    };
-
-    const handlePointerDown = () => {
-      try {
-        window.focus();
-      } catch {
-        // ignore
-      }
-      checkFocusSoon();
-    };
-
-    const handleButtonClick = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      try {
-        window.focus();
-      } catch {
-        // ignore
-      }
-      checkFocusSoon();
-    };
-
-    window.addEventListener('focus', handleWindowFocus, true);
-    document.addEventListener('visibilitychange', handleVisibilityChange, true);
-    overlay.addEventListener('pointerdown', handlePointerDown, true);
-    button?.addEventListener('click', handleButtonClick, true);
-    document.documentElement.appendChild(overlay);
-
-    cancelTimer = window.setInterval(() => {
-      if (settled) {
-        return;
-      }
-      if (isCanceled()) {
-        fail(new Error('EXPAND_KEYWORD_CANCELED'));
-        return;
-      }
-      if (document.hasFocus()) {
-        finish();
-      }
-    }, 100);
-  });
-}
-
-function ensureFocusOverlayStyle() {
-  if (document.getElementById(FOCUS_OVERLAY_STYLE_ID)) {
-    return;
-  }
-
-  const style = document.createElement('style');
-  style.id = FOCUS_OVERLAY_STYLE_ID;
-  style.textContent = `
-    #${FOCUS_OVERLAY_ID} {
-      position: fixed;
-      inset: 0;
-      z-index: 2147483647;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: rgba(0, 0, 0, 0.16);
-      pointer-events: auto;
-    }
-
-    #${FOCUS_OVERLAY_ID} .onstarvoice-keyword-expand-focus-card {
-      width: min(360px, calc(100vw - 32px));
-      padding: 18px;
-      border-radius: 16px;
-      background: rgba(24, 24, 28, 0.96);
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
-      color: #fff;
-      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-      text-align: center;
-    }
-
-    #${FOCUS_OVERLAY_ID} .onstarvoice-keyword-expand-focus-title {
-      font-size: 18px;
-      font-weight: 600;
-      line-height: 1.4;
-    }
-
-    #${FOCUS_OVERLAY_ID} .onstarvoice-keyword-expand-focus-desc {
-      margin-top: 8px;
-      font-size: 14px;
-      line-height: 1.5;
-      color: rgba(255, 255, 255, 0.72);
-    }
-
-    #${FOCUS_OVERLAY_ID} .onstarvoice-keyword-expand-focus-button {
-      margin-top: 16px;
-      width: 100%;
-      min-height: 44px;
-      border: 0;
-      border-radius: 12px;
-      background: #ff2e4d;
-      color: #fff;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-  `;
-
-  document.documentElement.appendChild(style);
 }

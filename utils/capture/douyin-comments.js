@@ -15,6 +15,7 @@ import {
 } from "../scroll.js";
 import {getDomProfile} from "../platform/dom-profiles/index.js";
 import {ensureDetailPageReady} from "./shared/detail-dom.js";
+import {buildCommentLoadStage} from "./stage-diagnostics.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 
@@ -520,6 +521,25 @@ export async function captureDouyinComments({
       0,
       normalizedMaxDetectedItems,
     );
+    const commentDiagnostics = buildCommentCaptureDiagnostics(captureContext);
+    const stageTrace = [
+      buildCommentLoadStage({
+        label: "抖音评论加载",
+        status: stoppedByUser ? "partial" : "completed",
+        commentsMaxDetectedItems: normalizedMaxDetectedItems,
+        collectedCount: items.length,
+        uniqueCount: commentsMap.size,
+        commentContainerFound: Boolean(activeCommentContainer || commentContainer),
+        scrollResult,
+        maxScrollTimes: normalizedMaxScrollTimes,
+        waitMinMs: Math.min(normalizedWaitMinMs, normalizedWaitMaxMs),
+        waitMaxMs: Math.max(normalizedWaitMinMs, normalizedWaitMaxMs),
+        stallTimeoutMs: normalizedStallTimeoutMs,
+        maxDurationMs: normalizedMaxDurationMs,
+        scene,
+        commentDiagnostics,
+      }),
+    ];
 
     return {
       ok: true,
@@ -542,14 +562,20 @@ export async function captureDouyinComments({
         captureStatus,
         stoppedByUser,
         scene,
-        diagnostics: buildCommentCaptureDiagnostics(captureContext),
+        diagnostics: commentDiagnostics,
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
+          maxScrollTimes: scrollResult.maxScrollTimes,
           completed: scrollResult.completed,
           canceled: scrollResult.canceled,
           stopReason: scrollResult.stopReason,
+          finalContentCount: scrollResult.finalContentCount,
+          noNewContentCount: scrollResult.noNewContentCount,
           elapsedMs: scrollResult.elapsedMs,
         },
+      },
+      diagnostics: {
+        stageTrace,
       },
       error: null,
     };
@@ -2418,13 +2444,30 @@ function filterNestedCommentCandidates(
     ),
   );
   const scored = uniqueCandidates
-    .map((node) => ({
-      node,
-      score: scoreLikelyCommentEntryNode(node, resolveCommentSceneProfile(scene)),
-      area: getNodeArea(node),
-      depth: getNodeDepth(node),
-    }))
-    .filter(({score}) => score > 0)
+    .map((node) => {
+      const evaluation = evaluateLikelyCommentEntryNode(
+        node,
+        resolveCommentSceneProfile(scene),
+      );
+      return {
+        node,
+        score: evaluation.score,
+        rejectReason: evaluation.rejectReason,
+        area: getNodeArea(node),
+        depth: getNodeDepth(node),
+      };
+    })
+    .filter(({score, rejectReason}) => {
+      if (score > 0) {
+        return true;
+      }
+      recordCommentReject(
+        captureContext,
+        rejectReason || "score_below_comment_threshold",
+        COMMENT_DIAGNOSTIC_REASON_BUCKET.NODE,
+      );
+      return false;
+    })
     .sort((left, right) => {
       if (right.score !== left.score) return right.score - left.score;
       if (right.depth !== left.depth) return right.depth - left.depth;
@@ -2622,12 +2665,29 @@ function evaluateLikelyCommentEntryNode(
   if (looksLikePrivateMessageNode(node)) {
     return {score: 0, rejectReason: "private_message_like"};
   }
+  if (looksLikeCommentGroupContainer(node, text)) {
+    return {score: 0, rejectReason: "comment_group_container"};
+  }
 
   const rect = safeRect(node);
   let score = 0;
   const hasUserLink = !!node.querySelector('a[href*="/user/"]');
-  const hasUserName = Boolean(queryText(node, profile.userNameSelectors));
-  const hasContent = Boolean(queryText(node, profile.contentSelectors));
+  const userNameText = queryText(node, profile.userNameSelectors);
+  const hasAvatarSignal = hasLikelyCommentAvatarSignal(node);
+  const fallbackUserName =
+    !hasUserLink && !userNameText && hasAvatarSignal
+      ? inferCommentUserNameFromText(node)
+      : "";
+  const hasUserName = Boolean(userNameText || fallbackUserName);
+  const parsedMeta = parseCommentMeta(text);
+  const selectorContent = queryText(node, profile.contentSelectors);
+  const hasContent =
+    Boolean(selectorContent) ||
+    hasLikelyCommentContentCandidate(node, {
+      userName: userNameText || fallbackUserName,
+      publishTime: parsedMeta.publishTime,
+      ipLocation: parsedMeta.ipLocation,
+    });
   const hasMeta = Boolean(queryText(node, profile.metaSelectors)) ||
     /(刚刚|\d+分钟前|\d+小时前|\d+天前|\d+周前|\d+月前|\d+年前)/.test(text);
   const hasLike = Boolean(queryText(node, profile.likesSelectors)) ||
@@ -2663,6 +2723,114 @@ function evaluateLikelyCommentEntryNode(
     score,
     rejectReason: score >= 16 ? "" : "score_below_comment_threshold",
   };
+}
+
+function hasLikelyCommentAvatarSignal(node) {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+
+  return Array.from(node.querySelectorAll("img")).some((image) => {
+    if (!(image instanceof Element) || !isElementVisible(image)) {
+      return false;
+    }
+    const attrs = [
+      image.getAttribute?.("alt") || "",
+      image.getAttribute?.("src") || "",
+      image.getAttribute?.("data-e2e") || "",
+      typeof image.className === "string" ? image.className : "",
+    ].join(" ");
+    return /头像|avatar|aweme-avatar|user/i.test(attrs);
+  });
+}
+
+function looksLikeCommentGroupContainer(node, rawText = "") {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+
+  if (node.matches?.('[data-comment-id], [data-e2e*="comment-item"]')) {
+    return false;
+  }
+
+  const text = cleanText(rawText || node.innerText || node.textContent || "");
+  const userLinkCount = node.querySelectorAll('a[href*="/user/"]').length;
+  const nestedItemCount = node.querySelectorAll(
+    '[data-comment-id], [data-e2e*="comment-item"], [class*="comment-item"], [class*="CommentItem"]',
+  ).length;
+  const timeCount = (
+    text.match(
+      /刚刚|\d+分钟前|\d+小时前|\d+天前|\d+周前|\d+月前|\d+年前|\d{1,2}月\d{1,2}日|\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?/g,
+    ) || []
+  ).length;
+
+  if (nestedItemCount >= 2) {
+    return true;
+  }
+  return userLinkCount >= 2 && timeCount >= 2;
+}
+
+function hasLikelyCommentContentCandidate(
+  node,
+  {userName = "", publishTime = "", ipLocation = "", likes = 0} = {},
+) {
+  const texts = [
+    ...collectCommentTextCandidates(node),
+    ...collectRenderedCommentTextLines(node),
+  ];
+  return texts.some((text) => {
+    const sanitized = sanitizeCommentContentCandidateDetailed(text, {
+      userName,
+      publishTime,
+      ipLocation,
+      likes,
+    });
+    return isLikelyCommentBodyText(sanitized.text);
+  });
+}
+
+function collectRenderedCommentTextLines(node) {
+  const rawText = [node?.innerText, node?.textContent]
+    .map((value) => String(value || ""))
+    .filter(Boolean)
+    .join("\n");
+  if (!rawText) {
+    return [];
+  }
+  return rawText
+    .split(/\n+/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+}
+
+function isLikelyCommentBodyText(text) {
+  const normalized = cleanText(text || "");
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.length > COMMENT_CONTENT_MAX_LENGTH) {
+    return false;
+  }
+  if (
+    /^(相关推荐|大家都在搜|留下你的精彩评论吧|评论区|全部评论(?:[（(]\d+[^）)]*[）)])?|分享|回复|作者回复过|作者赞过|展开\d+条回复|收起|IP属地.*)$/.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  if (looksLikeCommentActionCluster(normalized)) {
+    return false;
+  }
+  if (/^(播放中|\d{2}:\d{2}|\d{2}\/\d{2})$/.test(normalized)) {
+    return false;
+  }
+  if (/^[\d.]+(?:万|亿|w|W|k|K)?$/.test(normalized)) {
+    return false;
+  }
+  if (looksLikeStandaloneCommentMeta(normalized)) {
+    return false;
+  }
+  return getCommentContentScore(normalized) > 0;
 }
 
 function extractComment(node, scene = COMMENT_SCENE.DETAIL_BOTTOM) {
@@ -2997,7 +3165,7 @@ function collectCommentTextCandidates(node) {
   const elements = Array.from(node.querySelectorAll("span, p, div, a, button"));
 
   elements.forEach((element) => {
-    if (!(element instanceof Element) || !isElementVisible(element)) {
+    if (!(element instanceof Element) || !isUsableCommentTextElement(element, node)) {
       return;
     }
     if (element.querySelector('a[href*="/user/"]')) {
@@ -3022,6 +3190,25 @@ function collectCommentTextCandidates(node) {
   candidates.push(...leafTexts);
 
   return Array.from(new Set(candidates));
+}
+
+function isUsableCommentTextElement(element, rootNode) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+  if (isElementVisible(element)) {
+    return true;
+  }
+  if (!(rootNode instanceof Element) || !isElementVisible(rootNode)) {
+    return false;
+  }
+
+  const style = window.getComputedStyle(element);
+  return (
+    style.display !== "none" &&
+    style.visibility !== "hidden" &&
+    style.opacity !== "0"
+  );
 }
 
 function scoreCommentContentCandidate(left, right) {
@@ -3089,9 +3276,12 @@ function sanitizeCommentContentCandidateDetailed(
   }
 
   if (
-    /^(相关推荐|大家都在搜|留下你的精彩评论吧|评论区|全部评论|分享|回复|作者回复过|展开\d+条回复|收起|IP属地.*)$/.test(text)
+    /^(相关推荐|大家都在搜|留下你的精彩评论吧|评论区|全部评论(?:[（(]\d+[^）)]*[）)])?|分享|回复|作者回复过|展开\d+条回复|收起|IP属地.*)$/.test(text)
   ) {
     return {text: "", rejectReason: "known_comment_decoration"};
+  }
+  if (looksLikeCommentActionCluster(text)) {
+    return {text: "", rejectReason: "comment_action_cluster"};
   }
   if (/私信可在[\[【]设置/.test(text) || /隐私设置.*在线状态/.test(text)) {
     return {text: "", rejectReason: "private_message_notice"};
@@ -3120,6 +3310,16 @@ function sanitizeCommentContentCandidateDetailed(
   }
 
   return {text, rejectReason: ""};
+}
+
+function looksLikeCommentActionCluster(text) {
+  const normalized = cleanText(text || "").replace(/\s+/g, "");
+  if (!normalized) {
+    return false;
+  }
+  return /^(?:分享|回复|收起|点赞|作者回复过|作者赞过|展开\d+条回复|\d+(?:\.\d+)?(?:万|亿|w|W|k|K)?)+$/.test(
+    normalized,
+  );
 }
 
 function stripKnownCommentDecorations(
@@ -3967,7 +4167,7 @@ function parseCommentMeta(rawText) {
   }
 
   const timeMatch = normalized.match(
-    /(刚刚|\d+分钟前|\d+小时前|\d+天前|\d+周前|\d+月前|\d{1,2}月\d{1,2}日|\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?)/,
+    /(刚刚|\d+分钟前|\d+小时前|\d+天前|\d+周前|\d+月前|\d+年前|\d{1,2}月\d{1,2}日|\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?)/,
   );
   const publishTime = cleanText(timeMatch?.[1] || "");
   let ipLocation = extractIpLocationFromCommentMeta(normalized, timeMatch);
@@ -4005,6 +4205,10 @@ function extractIpLocationFromCommentMeta(normalizedText, timeMatch = null) {
   );
   if (explicitMatch?.[1]) {
     return cleanText(explicitMatch[1]);
+  }
+
+  if (!timeMatch?.[0] && !/[·•|｜]/.test(normalizedText)) {
+    return "";
   }
 
   const fallbackMatch = normalizedText.match(
