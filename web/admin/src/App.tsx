@@ -1,5 +1,6 @@
-import { useState, useCallback } from 'react'
 import { AuthProvider, useAuth } from '@/lib/auth'
+import { NavProvider, useNav } from '@/lib/navigation'
+import { BadgesProvider } from '@/lib/badges'
 import { LoginPage } from '@/pages/LoginPage'
 import { OverviewPage } from '@/pages/OverviewPage'
 import { TriagePage } from '@/pages/TriagePage'
@@ -48,13 +49,8 @@ const PAGES: Record<string, React.ComponentType> = {
 }
 
 function AppContent() {
-  const { user, loading } = useAuth()
-  const [page, setPage] = useState(() => localStorage.getItem('osv_page') || 'overview')
-
-  const navigate = useCallback((p: string) => {
-    setPage(p)
-    localStorage.setItem('osv_page', p)
-  }, [])
+  const { user, loading, tenantId } = useAuth()
+  const { page, seq, navigate } = useNav()
 
   if (loading) {
     return (
@@ -74,7 +70,8 @@ function AppContent() {
       <Sidebar activePage={page} onNavigate={navigate} />
       <main className="ml-[240px] min-w-0 flex-1 px-8 py-6">
         <TopBar eyebrow={config.eyebrow} title={config.title} />
-        <div className="animate-fade-up" key={page}>
+        {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
+        <div className="animate-fade-up" key={`${page}:${seq}:${tenantId}`}>
           <PageComponent />
         </div>
       </main>
@@ -85,7 +82,11 @@ function AppContent() {
 export default function App() {
   return (
     <AuthProvider>
-      <AppContent />
+      <NavProvider>
+        <BadgesProvider>
+          <AppContent />
+        </BadgesProvider>
+      </NavProvider>
     </AuthProvider>
   )
 }

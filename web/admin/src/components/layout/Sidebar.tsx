@@ -4,6 +4,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
+import { useBadges, type Badges } from '@/lib/badges'
 
 const ICON_MAP: Record<string, React.ElementType> = {
   overview: LayoutGrid, triage: Activity, issues: AlertCircle, analytics: BarChart3, reports: FileText,
@@ -11,16 +12,18 @@ const ICON_MAP: Record<string, React.ElementType> = {
   'auth-codes': KeyRound, settings: Settings,
 }
 
-const NAV = [
+type NavItem = { id: string; label: string; platformAdmin?: boolean; badgeKey?: keyof Badges }
+
+const NAV: Array<{ section: string; internal?: boolean; items: NavItem[] }> = [
   {
     section: 'WORKSPACE', items: [
       { id: 'overview', label: '总览' },
-      { id: 'triage', label: '舆情收件箱' },
-      { id: 'leads', label: '评论线索' },
-      { id: 'issues', label: '问题处置' },
+      { id: 'triage', label: '舆情收件箱', badgeKey: 'triagePending' },
+      { id: 'leads', label: '评论线索', badgeKey: 'leadsNew' },
+      { id: 'issues', label: '问题处置', badgeKey: 'issuesOpen' },
       { id: 'analytics', label: '数据看板' },
       { id: 'reports', label: '报告中心' },
-      { id: 'monitor', label: '监控任务' },
+      { id: 'monitor', label: '监控任务', badgeKey: 'monitorAttention' },
       { id: 'monitor-hits', label: '监控命中' },
       { id: 'data', label: '数据资产' },
     ],
@@ -39,6 +42,7 @@ interface SidebarProps { activePage: string; onNavigate: (page: string) => void 
 
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const { isInternal, isPlatformAdmin } = useAuth()
+  const { badges } = useBadges()
 
   return (
     <aside className="fixed inset-y-0 left-0 z-20 flex w-[240px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
@@ -63,9 +67,10 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                 {group.section}
               </div>
               {group.items.map(item => {
-                if ('platformAdmin' in item && item.platformAdmin && !isPlatformAdmin()) return null
+                if (item.platformAdmin && !isPlatformAdmin()) return null
                 const Icon = ICON_MAP[item.id] || LayoutGrid
                 const active = activePage === item.id
+                const badgeCount = item.badgeKey ? badges[item.badgeKey] : 0
                 return (
                   <button key={item.id} onClick={() => onNavigate(item.id)}
                     className={cn(
@@ -79,7 +84,17 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
                     )}
                     <Icon className={cn('relative z-10 h-[17px] w-[17px] shrink-0 transition-colors', active ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground')} strokeWidth={active ? 2 : 1.6} />
                     <span className="relative z-10">{item.label}</span>
-                    {active && <ChevronRight className="relative z-10 ml-auto h-3.5 w-3.5 text-muted-foreground" />}
+                    {badgeCount > 0 && (
+                      <span className={cn(
+                        'relative z-10 ml-auto inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
+                        item.badgeKey === 'monitorAttention'
+                          ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                          : 'bg-primary/12 text-primary',
+                      )}>
+                        {badgeCount > 99 ? '99+' : badgeCount}
+                      </span>
+                    )}
+                    {active && badgeCount === 0 && <ChevronRight className="relative z-10 ml-auto h-3.5 w-3.5 text-muted-foreground" />}
                   </button>
                 )
               })}
