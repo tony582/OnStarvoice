@@ -195,21 +195,21 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             <thead>
               <tr className="border-b border-border/70">
                 {canWrite() && (
-                  <th className="w-9 py-2.5 pl-4 pr-1">
+                  <th className="w-9 py-3.5 pl-4 pr-1">
                     <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
                   </th>
                 )}
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>
-                <th className="px-3 py-2.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>
-                <th className="hidden px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>
-                {canWrite() && <th className="px-3 py-2.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
+                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
+                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>
+                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
+                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
+                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>
+                <th className="px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>
+                <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>
+                {canWrite() && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
-            <tbody className="divide-y divide-border/55">
+            <tbody className="divide-y divide-border/45">
               {records.map(r => (
                 <RecordRow
                   key={r.id}
@@ -285,11 +285,11 @@ function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenM
   return (
     <tr className={cn('group cursor-pointer transition-colors hover:bg-accent/45', selected && 'bg-primary/[0.05]')} onClick={onOpenDetail}>
       {canWrite && (
-        <td className="py-2.5 pl-4 pr-1 align-middle" onClick={e => e.stopPropagation()}>
+        <td className="py-3.5 pl-4 pr-1 align-middle" onClick={e => e.stopPropagation()}>
           <Checkbox checked={selected} onChange={onToggle} />
         </td>
       )}
-      <td className="px-3 py-2.5 align-middle">
+      <td className="px-3 py-3.5 align-middle">
         <div className="flex items-center gap-3">
           <span className={cn('h-10 w-1 shrink-0 rounded-full', sentimentBar)} />
           {cover ? (
@@ -308,14 +308,14 @@ function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenM
           </div>
         </div>
       </td>
-      <td className="px-3 py-2.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>
-      <td className="px-3 py-2.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
-      <td className="px-3 py-2.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
-      <td className="px-3 py-2.5 align-middle"><RiskSignals record={r} /></td>
-      <td className="px-3 py-2.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>
-      <td className="hidden whitespace-nowrap px-3 py-2.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>
+      <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>
+      <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
+      <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
+      <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>
+      <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>
+      <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>
       {canWrite && (
-        <td className="px-3 py-2.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
+        <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
             <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转问题</Button>
             <div className="action-dropdown relative">
