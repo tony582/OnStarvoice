@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Eye, Archive, Ban, Loader2, Bookmark, Link2, CircleCheck,
-  Package, Heart, MessageCircle, Star, Share2, User, Clock, ScanSearch, FileText,
+  Package, User, ScanSearch, FileText,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
@@ -189,26 +189,46 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ) : records.length === 0 ? (
         <EmptyState icon={Inbox} title="暂无记录" description="调整筛选条件试试" />
       ) : (
-        <div className="space-y-3">
-          {records.map(r => (
-            <RecordCard
-              key={r.id}
-              record={r}
-              canWrite={canWrite()}
-              selected={sel.has(r.id)}
-              onToggle={() => sel.toggle(r.id)}
-              openMenu={openMenu}
-              setOpenMenu={setOpenMenu}
-              onLinkIssue={() => linkIssue(r.id)}
-              onUpdateTriage={(s: string) => updateTriage(r.id, s)}
-              onMarkResponded={() => markResponded(r.id)}
-              onOpenDetail={() => setDrawerRecord(r)}
-              interactions={interactions(r)}
-            />
-          ))}
+        <div className="rounded-xl border border-border bg-card shadow-xs">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border">
+                {canWrite() && (
+                  <th className="w-9 py-2.5 pl-4 pr-1">
+                    <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
+                  </th>
+                )}
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
+                <th className="px-3 py-2.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>
+                <th className="hidden px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>
+                {canWrite() && <th className="px-3 py-2.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {records.map(r => (
+                <RecordRow
+                  key={r.id}
+                  record={r}
+                  canWrite={canWrite()}
+                  selected={sel.has(r.id)}
+                  onToggle={() => sel.toggle(r.id)}
+                  openMenu={openMenu}
+                  setOpenMenu={setOpenMenu}
+                  onLinkIssue={() => linkIssue(r.id)}
+                  onUpdateTriage={(s: string) => updateTriage(r.id, s)}
+                  onMarkResponded={() => markResponded(r.id)}
+                  onOpenDetail={() => setDrawerRecord(r)}
+                  interactions={interactions(r)}
+                />
+              ))}
+            </tbody>
+          </table>
 
           {pagination && pagination.totalPages > 1 && (
-            <div className="flex items-center justify-between rounded-lg border border-border bg-card px-5 py-3">
+            <div className="flex items-center justify-between border-t border-border px-4 py-3">
               <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条</span>
               <div className="flex items-center gap-1">
                 <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}>
@@ -252,68 +272,53 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   )
 }
 
-/* ==================== Record Card ==================== */
-function RecordCard({ record: r, canWrite, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail }: any) {
+/* ==================== Record Row(列表行)==================== */
+function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
-  const sentimentColor = r.sentiment === 'negative' ? 'border-l-red-500' : r.sentiment === 'positive' ? 'border-l-emerald-500' : 'border-l-blue-400'
+  const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
+  const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
 
   return (
-    <div className={cn('group relative overflow-hidden rounded-xl border bg-card shadow-xs transition-all duration-200 border-l-[3px] hover:shadow-sm',
-      selected ? 'border-primary/40 ring-1 ring-primary/25' : 'border-border hover:border-input', sentimentColor)}
-      onClick={onOpenDetail} role="button" tabIndex={0}>
-      <div className="flex gap-4 p-4">
-        {/* Selection checkbox */}
-        {canWrite && (
-          <div className="flex items-start pt-0.5" onClick={e => e.stopPropagation()}>
-            <Checkbox checked={selected} onChange={onToggle} />
-          </div>
-        )}
-
-        {/* Thumbnail */}
-        {cover ? (
-          <div className="h-20 w-20 shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
-            <img src={cover} alt="" className="h-full w-full object-cover" loading="lazy" referrerPolicy="no-referrer"
-              onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
-          </div>
-        ) : (
-          <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-lg border border-dashed border-border bg-muted/50">
-            <FileText className="h-6 w-6 text-muted-foreground/40" />
-          </div>
-        )}
-
-        {/* Content */}
-        <div className="min-w-0 flex-1">
-          <div className="mb-1.5 flex flex-wrap items-center gap-2">
-            <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
-            <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
-            {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
-            <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
-          </div>
-
-          <h3 className="mb-1 truncate text-sm font-bold leading-snug">{r.title || '(无标题)'}</h3>
-          <p className="mb-2 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{r.content || r.ai_summary || ''}</p>
-
-          <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1"><User className="h-3 w-3" />{r.author_name || '未知'}</span>
-            <span className="flex items-center gap-1"><Heart className="h-3 w-3" />{formatNumber(r.likes)}</span>
-            <span className="flex items-center gap-1"><MessageCircle className="h-3 w-3" />{formatNumber(r.comments_count)}</span>
-            <span className="flex items-center gap-1"><Star className="h-3 w-3" />{formatNumber(r.collects)}</span>
-            <span className="flex items-center gap-1"><Share2 className="h-3 w-3" />{formatNumber(r.shares)}</span>
-            <span className="ml-auto flex items-center gap-1"><Clock className="h-3 w-3" />{formatDate(r.last_seen_at || r.created_at)}</span>
+    <tr className={cn('group cursor-pointer transition-colors hover:bg-muted/40', selected && 'bg-primary/[0.04]')} onClick={onOpenDetail}>
+      {canWrite && (
+        <td className="py-2.5 pl-4 pr-1 align-middle" onClick={e => e.stopPropagation()}>
+          <Checkbox checked={selected} onChange={onToggle} />
+        </td>
+      )}
+      <td className="px-3 py-2.5 align-middle">
+        <div className="flex items-center gap-2.5">
+          <span className={cn('h-9 w-[3px] shrink-0 rounded-full', sentimentBar)} />
+          {cover ? (
+            <div className="h-9 w-9 shrink-0 overflow-hidden rounded-md border border-border bg-muted">
+              <img src={cover} alt="" className="h-full w-full object-cover" loading="lazy" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+            </div>
+          ) : (
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-dashed border-border bg-muted/40"><FileText className="h-4 w-4 text-muted-foreground/40" /></div>
+          )}
+          <div className="min-w-0 max-w-[380px]">
+            <div className="truncate text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
+            <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
+              <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
+              {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
+            </div>
           </div>
         </div>
-
-        {/* Actions */}
-        {canWrite && (
-          <div className="flex shrink-0 items-start gap-1" onClick={e => e.stopPropagation()}>
+      </td>
+      <td className="px-3 py-2.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>
+      <td className="px-3 py-2.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
+      <td className="px-3 py-2.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
+      <td className="px-3 py-2.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>
+      <td className="hidden whitespace-nowrap px-3 py-2.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>
+      {canWrite && (
+        <td className="px-3 py-2.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
+          <div className="flex items-center justify-end gap-1">
             <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转问题</Button>
             <div className="action-dropdown relative">
-              <Button variant="outline" size="icon" className="h-8 w-8"
-                onClick={() => setOpenMenu(openMenu === r.id ? null : r.id)}>
+              <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setOpenMenu(openMenu === r.id ? null : r.id)}>
                 <MoreHorizontal className="h-4 w-4" />
               </Button>
               {openMenu === r.id && (
-                <div className="absolute right-0 top-full z-20 mt-1 w-44 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-sm duration-150">
+                <div className="absolute right-0 top-full z-30 mt-1 w-40 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-lg duration-150">
                   <MenuBtn icon={CheckCircle} label="标为已响应" onClick={onMarkResponded} />
                   <MenuBtn icon={Eye} label="待复核" onClick={() => onUpdateTriage('reviewing')} />
                   <MenuBtn icon={Archive} label="归档" onClick={() => onUpdateTriage('archived')} />
@@ -322,11 +327,9 @@ function RecordCard({ record: r, canWrite, selected, onToggle, openMenu, setOpen
               )}
             </div>
           </div>
-        )}
-      </div>
-
-      <div className="pointer-events-none absolute inset-0 rounded-lg border border-primary/0 transition-colors duration-200 group-hover:border-primary/15" />
-    </div>
+        </td>
+      )}
+    </tr>
   )
 }
 
