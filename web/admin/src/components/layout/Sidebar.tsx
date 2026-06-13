@@ -30,8 +30,8 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'content-home', label: '内容总览', icon: Sparkles },
     { id: 'tracks', label: '赛道大盘', icon: TrendingUp },
     { id: 'hits', label: '爆款拆解', icon: Flame, tag: 'NEW' },
-    { id: 'benchmarks', label: '对标账号库', icon: Users2, tag: 'NEW' },
-    { id: 'keywords', label: '选题与扩词', icon: Lightbulb, tag: 'NEW' },
+    { id: 'benchmarks', label: '对标账号库', icon: Users2 },
+    { id: 'keywords', label: '选题与扩词', icon: Lightbulb },
     { id: 'review', label: '内容复盘', icon: LineChart, tag: 'NEW' },
   ],
 }

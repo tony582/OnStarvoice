@@ -662,6 +662,7 @@ function buildBenchmarkRuleAnalysis(candidate) {
 
   return {
     key: candidate.key,
+    authorName: cleanText(candidate.authorName || candidate.author || '', 80),
     recommendationReason: cleanText(recommendationReason, 240),
     focusAssessment: cleanText(focusAssessment, 240),
     growthPotential,
@@ -685,6 +686,7 @@ function mergeBenchmarkAiResult(fallback, aiResult) {
       if (!ai) return base;
       return {
         key: base.key,
+        authorName: base.authorName,
         recommendationReason: cleanText(ai.recommendationReason, 240) || base.recommendationReason,
         focusAssessment: cleanText(ai.focusAssessment, 240) || base.focusAssessment,
         growthPotential: normalizeBenchmarkGrowth(ai.growthPotential, base.growthPotential),
