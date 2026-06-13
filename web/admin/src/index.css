@@ -38,38 +38,42 @@
   --color-status-indigo: #2f6fed;
   --color-status-purple: #a25ddc;
   --color-status-teal: #00c2c7;
-  --radius-sm: 5px;
-  --radius-md: 7px;
-  --radius-lg: 10px;
-  --radius-xl: 13px;
-  --radius-2xl: 16px;
-  --shadow-xs: 0 1px 2px 0 rgb(17 24 39 / 0.04);
-  --shadow-sm: 0 1px 3px 0 rgb(17 24 39 / 0.06), 0 1px 2px -1px rgb(17 24 39 / 0.05);
+  /* 圆角整体加大(Pinterest 式的"软") */
+  --radius-sm: 8px;
+  --radius-md: 11px;
+  --radius-lg: 15px;
+  --radius-xl: 19px;
+  --radius-2xl: 26px;
+  /* 柔和、弥散的浮起阴影,代替硬边框做层次 */
+  --shadow-xs: 0 1px 2px 0 rgb(17 24 39 / 0.05);
+  --shadow-sm: 0 2px 8px -2px rgb(17 24 39 / 0.08), 0 1px 3px -1px rgb(17 24 39 / 0.05);
+  --shadow-md: 0 10px 28px -8px rgb(17 24 39 / 0.12), 0 3px 8px -3px rgb(17 24 39 / 0.07);
+  --shadow-lg: 0 20px 48px -12px rgb(17 24 39 / 0.16), 0 6px 14px -6px rgb(17 24 39 / 0.08);
 }
 
 /* ── Light ────────────────────────────────── */
 :root {
-  --bg: #f6f7f9;
-  --fg: #16181d;
+  --bg: #f7f5f2;            /* 暖白底,告别冷灰 */
+  --fg: #1d1b18;
   --card: #ffffff;
-  --card-fg: #16181d;
+  --card-fg: #1d1b18;
   --primary: #2f6fed;
   --primary-fg: #ffffff;
-  --secondary: #f3f4f6;
-  --secondary-fg: #565a62;
-  --muted: #f3f4f6;
-  --muted-fg: #696e77;
-  --accent: #e8f0ff;
-  --accent-fg: #16181d;
+  --secondary: #f2f0ec;
+  --secondary-fg: #5c5852;
+  --muted: #f2f0ec;
+  --muted-fg: #74706a;
+  --accent: #eaf1ff;
+  --accent-fg: #1d1b18;
   --destructive: #dc2626;
   --destructive-fg: #ffffff;
-  --border: #e6e8ec;
-  --input: #d3d7de;
+  --border: #eae7e1;        /* 更轻更暖的边框,退到背景里 */
+  --input: #ddd9d2;
   --ring: #3a5cd8;
-  --sidebar: #f7f8fa;
-  --sidebar-fg: #565a62;
-  --sidebar-accent: #ebedf1;
-  --sidebar-border: #e6e8ec;
+  --sidebar: #f4f2ee;
+  --sidebar-fg: #5c5852;
+  --sidebar-accent: #eceae4;
+  --sidebar-border: #eae7e1;
   --warning: #c2820b;
   --warning-fg: #ffffff;
   --success: #2f855a;

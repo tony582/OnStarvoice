@@ -53,7 +53,7 @@ function colorOf(tone?: string): ColorKey {
   return (tone && TONE_TO_COLOR[tone]) || 'grey'
 }
 
-const PILL_BASE = 'inline-flex items-center whitespace-nowrap rounded-md px-2 py-0.5 text-[11px] font-semibold leading-[18px]'
+const PILL_BASE = 'inline-flex items-center whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold leading-[18px]'
 
 interface PillProps { tone?: string; children: React.ReactNode; className?: string }
 

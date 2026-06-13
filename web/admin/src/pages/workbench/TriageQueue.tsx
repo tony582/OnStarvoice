@@ -190,10 +190,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ) : records.length === 0 ? (
         <EmptyState icon={Inbox} title="暂无记录" description="调整筛选条件试试" />
       ) : (
-        <div className="rounded-xl border border-border bg-card shadow-xs">
+        <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-sm">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-border">
+              <tr className="border-b border-border/70">
                 {canWrite() && (
                   <th className="w-9 py-2.5 pl-4 pr-1">
                     <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
@@ -209,7 +209,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {canWrite() && <th className="px-3 py-2.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
-            <tbody className="divide-y divide-border">
+            <tbody className="divide-y divide-border/55">
               {records.map(r => (
                 <RecordRow
                   key={r.id}
@@ -283,21 +283,21 @@ function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenM
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
 
   return (
-    <tr className={cn('group cursor-pointer transition-colors hover:bg-muted/40', selected && 'bg-primary/[0.04]')} onClick={onOpenDetail}>
+    <tr className={cn('group cursor-pointer transition-colors hover:bg-accent/45', selected && 'bg-primary/[0.05]')} onClick={onOpenDetail}>
       {canWrite && (
         <td className="py-2.5 pl-4 pr-1 align-middle" onClick={e => e.stopPropagation()}>
           <Checkbox checked={selected} onChange={onToggle} />
         </td>
       )}
       <td className="px-3 py-2.5 align-middle">
-        <div className="flex items-center gap-2.5">
-          <span className={cn('h-9 w-[3px] shrink-0 rounded-full', sentimentBar)} />
+        <div className="flex items-center gap-3">
+          <span className={cn('h-10 w-1 shrink-0 rounded-full', sentimentBar)} />
           {cover ? (
-            <div className="h-9 w-9 shrink-0 overflow-hidden rounded-md border border-border bg-muted">
+            <div className="h-10 w-10 shrink-0 overflow-hidden rounded-xl border border-border/70 bg-muted">
               <img src={cover} alt="" className="h-full w-full object-cover" loading="lazy" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
             </div>
           ) : (
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-dashed border-border bg-muted/40"><FileText className="h-4 w-4 text-muted-foreground/40" /></div>
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-dashed border-border bg-muted/40"><FileText className="h-4 w-4 text-muted-foreground/40" /></div>
           )}
           <div className="min-w-0 max-w-[380px]">
             <div className="truncate text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
