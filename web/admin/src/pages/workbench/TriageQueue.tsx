@@ -112,19 +112,19 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   return (
     <div className="space-y-4">
-      {/* 工具条:状态分段 + 视图切换 + 筛选,收成一个紧凑块(笔记本上少占两层)*/}
-      <div className="space-y-2.5 border-b border-border pb-3.5">
+      {/* 工具条:无边框,靠留白与柔色高亮分隔(Asana 式)*/}
+      <div className="space-y-2 border-b border-border/50 pb-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           {view === 'list' ? (
-            <div className="inline-flex flex-wrap items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
+            <div className="inline-flex flex-wrap items-center gap-0.5">
               {STATUS_TABS.map(tab => {
                 const Icon = tab.icon
                 const on = status === tab.value
                 return (
                   <button key={tab.value} onClick={() => setStatus(tab.value)}
                     className={cn(
-                      'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
-                      on ? 'bg-primary text-white shadow-xs' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                      'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12.5px] font-semibold transition-colors',
+                      on ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                     )}>
                     <Icon className="h-3.5 w-3.5" strokeWidth={2} />
                     {tab.label}
@@ -137,37 +137,38 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               <Kanban className="h-3.5 w-3.5" />拖动卡片即可改变处置状态
             </span>
           )}
-          <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
+          <div className="inline-flex items-center gap-0.5">
             {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([v, label, Icon]) => (
               <button key={v} onClick={() => setView(v)}
-                className={cn('inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors',
-                  view === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
+                className={cn('inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
+                  view === v ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground')}>
                 <Icon className="h-3.5 w-3.5" />{label}
               </button>
             ))}
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-x-1 gap-y-2">
           <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
             <option value="">全部平台</option>
             <option value="xiaohongshu">小红书</option>
             <option value="douyin">抖音</option>
             <option value="weibo">微博</option>
           </WorkbenchSelect>
-          <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
+          <span className="mx-1 h-4 w-px bg-border/70" />
+          <div className="inline-flex items-center gap-0.5">
             {['', 'negative', 'neutral', 'positive'].map(v => (
               <button key={v} onClick={() => setSentiment(v)}
-                className={cn('rounded-md px-2.5 py-1 text-[12px] font-semibold transition-colors',
-                  sentiment === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
+                className={cn('rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
+                  sentiment === v ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground')}>
                 {v === '' ? '全部情感' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
               </button>
             ))}
           </div>
-          <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
+          <div className="relative ml-auto min-w-[200px] flex-1 sm:max-w-xs">
             <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 pl-8 text-[12px]" />
+              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
           </div>
         </div>
       </div>
@@ -190,10 +191,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ) : records.length === 0 ? (
         <EmptyState icon={Inbox} title="暂无记录" description="调整筛选条件试试" />
       ) : (
-        <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-sm">
+        <div className="overflow-hidden rounded-xl bg-card">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-border/70">
+              <tr className="border-b border-border/60">
                 {canWrite() && (
                   <th className="w-9 py-3.5 pl-4 pr-1">
                     <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
@@ -209,7 +210,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {canWrite() && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
-            <tbody className="divide-y divide-border/45">
+            <tbody className="divide-y divide-border/40">
               {records.map(r => (
                 <RecordRow
                   key={r.id}
@@ -230,7 +231,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </table>
 
           {pagination && pagination.totalPages > 1 && (
-            <div className="flex items-center justify-between border-t border-border px-4 py-3">
+            <div className="flex items-center justify-between border-t border-border/50 px-4 py-3">
               <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条</span>
               <div className="flex items-center gap-1">
                 <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}>

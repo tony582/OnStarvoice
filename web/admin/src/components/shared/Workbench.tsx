@@ -18,8 +18,8 @@ export function WorkbenchTabs({
   className?: string
 }) {
   return (
-    <div className={cn('border-b border-border', className)}>
-      <div className="flex min-h-9 items-end gap-1 overflow-x-auto">
+    <div className={cn('border-b border-border/50 pb-2', className)}>
+      <div className="flex min-h-8 items-center gap-0.5 overflow-x-auto">
         {tabs.map(tab => {
           const active = activeKey === tab.key
           return (
@@ -28,15 +28,15 @@ export function WorkbenchTabs({
               type="button"
               onClick={() => onChange(tab.key)}
               className={cn(
-                'mb-[-1px] inline-flex h-8 flex-none items-center gap-2 rounded-t-md border border-transparent px-3 text-[13px] font-medium transition-colors',
+                'inline-flex h-8 flex-none items-center gap-2 rounded-lg px-2.5 text-[12.5px] font-semibold transition-colors',
                 active
-                  ? 'border-border border-b-card bg-card text-foreground'
+                  ? 'bg-accent text-primary'
                   : 'text-muted-foreground hover:bg-muted hover:text-foreground',
               )}
             >
               {tab.label}
               {tab.count !== undefined && (
-                <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
                   {tab.count}
                 </span>
               )}
@@ -73,8 +73,8 @@ export function WorkbenchSelect(props: React.SelectHTMLAttributes<HTMLSelectElem
     <select
       {...rest}
       className={cn(
-        'h-8 rounded-md border border-border bg-card px-2.5 text-[12px] font-medium text-foreground outline-none transition-colors',
-        'hover:border-input focus:border-primary focus:ring-2 focus:ring-primary/10',
+        'h-8 rounded-lg border-transparent bg-transparent px-2 text-[12px] font-semibold text-foreground outline-none transition-colors',
+        'hover:bg-muted focus:bg-muted focus:ring-2 focus:ring-primary/10',
         className,
       )}
     />
@@ -89,7 +89,7 @@ export function WorkbenchTableShell({
   className?: string
 }) {
   return (
-    <section className={cn('overflow-hidden rounded-xl border border-border bg-card shadow-xs', className)}>
+    <section className={cn('overflow-hidden rounded-xl bg-card', className)}>
       {children}
     </section>
   )
