@@ -53,27 +53,27 @@
 
 /* ── Light ────────────────────────────────── */
 :root {
-  --bg: #f7f5f2;            /* 暖白底,告别冷灰 */
-  --fg: #1d1b18;
+  --bg: #ffffff;            /* 内容区纯白(Asana) */
+  --fg: #1e1f21;
   --card: #ffffff;
-  --card-fg: #1d1b18;
+  --card-fg: #1e1f21;
   --primary: #2f6fed;
   --primary-fg: #ffffff;
-  --secondary: #f2f0ec;
-  --secondary-fg: #5c5852;
-  --muted: #f2f0ec;
-  --muted-fg: #74706a;
-  --accent: #eaf1ff;
-  --accent-fg: #1d1b18;
+  --secondary: #f4f5f7;
+  --secondary-fg: #5e6470;
+  --muted: #f3f4f6;
+  --muted-fg: #6b7280;
+  --accent: #eef3ff;
+  --accent-fg: #1e1f21;
   --destructive: #dc2626;
   --destructive-fg: #ffffff;
-  --border: #eae7e1;        /* 更轻更暖的边框,退到背景里 */
-  --input: #ddd9d2;
+  --border: #ededf0;        /* 极浅中性发丝线 */
+  --input: #e4e6ea;
   --ring: #3a5cd8;
-  --sidebar: #f4f2ee;
-  --sidebar-fg: #5c5852;
-  --sidebar-accent: #eceae4;
-  --sidebar-border: #eae7e1;
+  --sidebar: #f6f7f9;       /* 侧栏极浅灰,与纯白内容区靠发丝线分隔 */
+  --sidebar-fg: #5e6470;
+  --sidebar-accent: #ebedf1;
+  --sidebar-border: #ececef;
   --warning: #c2820b;
   --warning-fg: #ffffff;
   --success: #2f855a;
