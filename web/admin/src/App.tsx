@@ -11,6 +11,7 @@ import { EventsPage } from '@/pages/EventsPage'
 import { TracksPage } from '@/pages/TracksPage'
 import { BenchmarksPage } from '@/pages/BenchmarksPage'
 import { KeywordsPage } from '@/pages/KeywordsPage'
+import { ContentHomePage } from '@/pages/ContentHomePage'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -49,6 +50,7 @@ const PAGES: Record<string, React.ComponentType> = {
   tracks: TracksPage,
   benchmarks: BenchmarksPage,
   keywords: KeywordsPage,
+  'content-home': ContentHomePage,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,
