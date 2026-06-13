@@ -1,6 +1,7 @@
 import { Router } from 'express';
-import { queryAll } from '../db/init.js';
+import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
+import { analyzeHit } from '../services/hit-analyzer.js';
 
 const router = Router();
 
@@ -50,6 +51,49 @@ router.get('/keywords', requireTenantAccess, async (req, res, next) => {
     `, [req.tenantId]);
     rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     return res.json({ ok: true, keywords: rows });
+  } catch (err) { return next(err); }
+});
+
+// 爆款拆解:候选 = 已采集的高互动内容(直接用 records,不需新采集)
+router.get('/hits', requireTenantAccess, async (req, res, next) => {
+  try {
+    const platform = String(req.query.platform || '');
+    const params = [req.tenantId];
+    let where = `WHERE r.tenant_id = $1 AND COALESCE(r.title, r.content) <> ''`;
+    if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
+    const rows = await queryAll(`
+      SELECT r.id, r.platform, r.title, r.content, r.author_name, r.cover_url, r.url,
+        r.likes, r.comments_count, r.collects, r.shares, r.tags, r.sentiment, r.category, r.last_seen_at,
+        (r.likes + r.comments_count + r.collects + r.shares) AS interaction,
+        (ha.id IS NOT NULL) AS analyzed
+      FROM records r
+      LEFT JOIN hit_analyses ha ON ha.record_id = r.id AND ha.tenant_id = r.tenant_id
+      ${where}
+      ORDER BY interaction DESC
+      LIMIT 60
+    `, params);
+    return res.json({ ok: true, hits: rows });
+  } catch (err) { return next(err); }
+});
+
+// 拆解一条(已缓存则直接返回,否则算并缓存)
+router.post('/hits/:recordId/analyze', requireTenantAccess, async (req, res, next) => {
+  try {
+    const record = await queryOne(`SELECT * FROM records WHERE id = $1 AND tenant_id = $2`, [req.params.recordId, req.tenantId]);
+    if (!record) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+
+    const cached = await queryOne(`SELECT payload, source FROM hit_analyses WHERE tenant_id = $1 AND record_id = $2`, [req.tenantId, req.params.recordId]);
+    if (cached && !req.query.refresh) {
+      return res.json({ ok: true, analysis: cached.payload, source: cached.source, cached: true });
+    }
+
+    const analysis = await analyzeHit(req.tenantId, record);
+    await execute(`
+      INSERT INTO hit_analyses (tenant_id, record_id, payload, source)
+      VALUES ($1, $2, $3::jsonb, $4)
+      ON CONFLICT (tenant_id, record_id) DO UPDATE SET payload = excluded.payload, source = excluded.source, created_at = now()
+    `, [req.tenantId, req.params.recordId, JSON.stringify(analysis), analysis.source]);
+    return res.json({ ok: true, analysis, source: analysis.source, cached: false });
   } catch (err) { return next(err); }
 });
 
