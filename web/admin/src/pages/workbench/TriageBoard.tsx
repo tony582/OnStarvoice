@@ -18,8 +18,9 @@ const COLUMNS: Array<{ key: ColKey; label: string; dot: string; ring: string }> 
 
 const PER_COL = 60
 
-export function TriageBoard({ sentiment, keyword, reloadKey, canWrite, onOpen, refreshBadges }: {
+export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite, onOpen, refreshBadges }: {
   sentiment: string
+  platform?: string
   keyword: string
   reloadKey: string
   canWrite: boolean
@@ -36,14 +37,14 @@ export function TriageBoard({ sentiment, keyword, reloadKey, canWrite, onOpen, r
     setLoading(true)
     try {
       const results = await Promise.all(COLUMNS.map(c => {
-        const p = new URLSearchParams({ status: c.key, pageSize: String(PER_COL), sentiment, keyword })
+        const p = new URLSearchParams({ status: c.key, pageSize: String(PER_COL), sentiment, platform: platform || '', keyword })
         return api.get<any>('/triage/records?' + p).then(d => [c.key, d.records || []] as const).catch(() => [c.key, []] as const)
       }))
       const next: any = { unhandled: [], reviewing: [], issue_linked: [], official_responded: [], archived: [] }
       for (const [k, recs] of results) next[k] = recs
       setCols(next)
     } finally { setLoading(false) }
-  }, [sentiment, keyword])
+  }, [sentiment, platform, keyword])
 
   useEffect(() => { load() }, [reloadKey]) // eslint-disable-line react-hooks/exhaustive-deps
 

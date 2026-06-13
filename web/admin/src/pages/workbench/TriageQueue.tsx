@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Eye, Archive, Ban, Loader2, Bookmark, Link2, CircleCheck,
-  Package, User, ScanSearch, FileText,
+  Package, User, ScanSearch, FileText, Bell,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
+import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
@@ -35,6 +36,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [boardNonce, setBoardNonce] = useState(0)
   const [status, setStatus] = useState(initial?.status ?? '')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
+  const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [records, setRecords] = useState<any[]>([])
   const [pagination, setPagination] = useState<Pagination | null>(null)
@@ -48,13 +50,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const load = useCallback(async (page = 1) => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: '30', status, queue: status ? '' : 'active', sentiment, keyword })
+      const params = new URLSearchParams({ page: String(page), pageSize: '30', status, queue: status ? '' : 'active', sentiment, platform, keyword })
       const data = await api.get<any>('/triage/records?' + params)
       setRecords(data.records || [])
       setPagination(data.pagination || null)
     } catch (err) { console.error(err) }
     finally { setLoading(false) }
-  }, [status, sentiment, keyword])
+  }, [status, sentiment, platform, keyword])
 
   useEffect(() => { load() }, [load])
 
@@ -147,28 +149,26 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       </div>
 
       {/* Filters */}
-      <div className="flex flex-wrap items-center gap-3">
-        {view === 'list' && canWrite() && records.length > 0 && (
-          <button onClick={() => sel.setAll(records.map(r => r.id), !allChecked)}
-            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
-            <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
-            全选本页
-          </button>
-        )}
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3">
-          <span className="text-xs font-semibold text-muted-foreground">情感</span>
+      <div className="flex flex-wrap items-center gap-2.5">
+        <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
+          <option value="">全部平台</option>
+          <option value="xiaohongshu">小红书</option>
+          <option value="douyin">抖音</option>
+          <option value="weibo">微博</option>
+        </WorkbenchSelect>
+        <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
           {['', 'negative', 'neutral', 'positive'].map(v => (
             <button key={v} onClick={() => setSentiment(v)}
-              className={cn('rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors',
-                sentiment === v ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground')}>
-              {v === '' ? '全部' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
+              className={cn('rounded-md px-2.5 py-1 text-[12px] font-semibold transition-colors',
+                sentiment === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
+              {v === '' ? '全部情感' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
             </button>
           ))}
         </div>
-        <div className="relative flex-1 max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <div className="relative min-w-[220px] flex-1 sm:max-w-xs">
+          <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="pl-9" />
+            onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 pl-8 text-[12px]" />
         </div>
       </div>
 
@@ -176,8 +176,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {view === 'board' ? (
         <TriageBoard
           sentiment={sentiment}
+          platform={platform}
           keyword={keyword}
-          reloadKey={`${sentiment}|${boardNonce}`}
+          reloadKey={`${sentiment}|${platform}|${boardNonce}`}
           canWrite={canWrite()}
           onOpen={setDrawerRecord}
           refreshBadges={refreshBadges}
@@ -202,6 +203,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>
                 <th className="px-3 py-2.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>
                 <th className="hidden px-3 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>
                 {canWrite() && <th className="px-3 py-2.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
@@ -307,6 +309,7 @@ function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenM
       <td className="px-3 py-2.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>
       <td className="px-3 py-2.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
       <td className="px-3 py-2.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
+      <td className="px-3 py-2.5 align-middle"><RiskSignals record={r} /></td>
       <td className="px-3 py-2.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>
       <td className="hidden whitespace-nowrap px-3 py-2.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>
       {canWrite && (
@@ -338,5 +341,31 @@ function MenuBtn({ icon: Icon, label, onClick }: { icon: React.ElementType; labe
     <button onClick={onClick} className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
       <Icon className="h-4 w-4" />{label}
     </button>
+  )
+}
+
+/* 风险信号:预警 / 负面评论数 / 官方回复状态,一眼可扫 */
+function RiskSignals({ record: r }: any) {
+  const alerts = Number(r.alert_count || 0)
+  const neg = Number(r.negative_comment_count || 0)
+  const official = r.official_response_status
+  if (!(alerts > 0 || neg > 0 || (official && official !== 'none'))) {
+    return <span className="text-[11px] text-muted-foreground/40">—</span>
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {alerts > 0 && (
+        <span className="inline-flex items-center gap-0.5 rounded bg-status-red/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-2.5 w-2.5" />预警{alerts}</span>
+      )}
+      {neg > 0 && (
+        <span className="rounded bg-status-orange/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">负评{neg}</span>
+      )}
+      {official === 'responded' && (
+        <span className="rounded bg-status-green/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">已回复</span>
+      )}
+      {official === 'needs_followup' && (
+        <span className="rounded bg-status-amber/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">需跟进</span>
+      )}
+    </div>
   )
 }
