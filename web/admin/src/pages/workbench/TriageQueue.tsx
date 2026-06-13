@@ -110,6 +110,16 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
   const someChecked = records.some(r => sel.has(r.id))
 
+  const narrow = false
+  const drawerProps = drawerRecord ? {
+    record: drawerRecord,
+    onClose: () => setDrawerRecord(null),
+    canWrite: canWrite(),
+    onLinkIssue: () => { linkIssue(drawerRecord.id); setDrawerRecord(null) },
+    onSetStatus: (s: string) => { updateTriage(drawerRecord.id, s); setDrawerRecord(null) },
+    onMarkResponded: () => { markResponded(drawerRecord.id); setDrawerRecord(null) },
+  } : null
+
   return (
     <div className="space-y-4">
       {/* 工具条:无边框,靠留白与柔色高亮分隔(Asana 式)*/}
@@ -201,13 +211,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   </th>
                 )}
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
-                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>
+                {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>}
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
-                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>
-                <th className="px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>
-                <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>
-                {canWrite() && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
+                {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
+                {!narrow && <th className="px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>}
+                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>}
+                {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
@@ -216,6 +226,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   key={r.id}
                   record={r}
                   canWrite={canWrite()}
+                  narrow={narrow}
+                  open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
                   onToggle={() => sel.toggle(r.id)}
                   openMenu={openMenu}
@@ -247,18 +259,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         </div>
       )}
 
-      {/* Record detail drawer */}
-      {drawerRecord && (
-        <RecordDrawer
-          record={drawerRecord}
-          onClose={() => setDrawerRecord(null)}
-          canWrite={canWrite()}
-          onLinkIssue={() => { linkIssue(drawerRecord.id); setDrawerRecord(null) }}
-          onSetStatus={s => { updateTriage(drawerRecord.id, s); setDrawerRecord(null) }}
-          onMarkResponded={() => { markResponded(drawerRecord.id); setDrawerRecord(null) }}
-        />
-      )}
-
       {/* Batch action bar */}
       {canWrite() && (
         <BatchBar
@@ -273,18 +273,21 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           ]}
         />
       )}
+
+      {/* 详情:盖式滑出面板(无遮罩,盖在列表右侧,左侧仍可点)*/}
+      {drawerProps && <RecordDrawer {...drawerProps} />}
     </div>
   )
 }
 
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
 
   return (
-    <tr className={cn('group cursor-pointer transition-colors hover:bg-accent/45', selected && 'bg-primary/[0.05]')} onClick={onOpenDetail}>
+    <tr className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
       {canWrite && (
         <td className="py-3.5 pl-4 pr-1 align-middle" onClick={e => e.stopPropagation()}>
           <Checkbox checked={selected} onChange={onToggle} />
@@ -309,13 +312,13 @@ function RecordRow({ record: r, canWrite, selected, onToggle, openMenu, setOpenM
           </div>
         </div>
       </td>
-      <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>
+      {!narrow && <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>}
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
-      <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>
-      <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>
-      <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>
-      {canWrite && (
+      {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
+      {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
+      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>}
+      {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
             <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转问题</Button>

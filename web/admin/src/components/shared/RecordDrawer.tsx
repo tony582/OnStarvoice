@@ -40,6 +40,12 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
     }).finally(() => setLoading(false))
   }, [r.id])
 
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [onClose])
+
   const images = getImages(r)
   const cover = images[0] || ''
 
@@ -56,12 +62,9 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   ]
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
-      {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/35" />
-
-      {/* Drawer */}
-      <div className="relative z-10 flex h-full w-full max-w-2xl flex-col bg-card shadow-lg animate-in slide-in-from-right duration-200"
+    <div className="pointer-events-none fixed inset-0 z-50 flex justify-end">
+      {/* 盖式:无遮罩,面板盖在内容右侧,左侧列表仍可见可点 */}
+      <div className="pointer-events-auto relative z-10 flex h-full w-full max-w-[460px] flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-200"
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
