@@ -62,9 +62,12 @@ const PAGES: Record<string, React.ComponentType> = {
   settings: SettingsPage,
 }
 
+// 工作台标题随选中队列变化(队列已是侧边栏二级导航)
+const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论线索', issues: '问题处置' }
+
 function AppContent() {
   const { user, loading, tenantId } = useAuth()
-  const { page, seq, navigate } = useNav()
+  const { page, params, seq, navigate } = useNav()
 
   if (loading) {
     return (
@@ -77,13 +80,14 @@ function AppContent() {
   if (!user) return <LoginPage />
 
   const config = PAGE_CONFIG[page] || PAGE_CONFIG.overview
+  const title = page === 'workbench' ? (QUEUE_TITLES[params?.queue || 'triage'] || config.title) : config.title
   const PageComponent = PAGES[page]
 
   return (
     <div className="flex min-h-screen">
       <Sidebar activePage={page} onNavigate={navigate} />
       <main className="ml-[240px] min-w-0 flex-1 px-8 py-5">
-        <TopBar eyebrow={config.eyebrow} title={config.title} />
+        <TopBar eyebrow={config.eyebrow} title={title} />
         {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
         <div className="animate-fade-up" key={`${page}:${seq}:${tenantId}`}>
           {PageComponent ? <PageComponent /> : <ComingSoon pageId={page} />}

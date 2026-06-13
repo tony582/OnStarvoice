@@ -1,70 +1,23 @@
-import { useState } from 'react'
-import { Inbox, MessageSquareWarning, AlertCircle } from 'lucide-react'
-import { cn } from '@/lib/utils'
 import { useNav } from '@/lib/navigation'
-import { useBadges, type Badges } from '@/lib/badges'
 import { TriageQueue } from '@/pages/workbench/TriageQueue'
 import { LeadsQueue } from '@/pages/workbench/LeadsQueue'
 import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
 
 type QueueKey = 'triage' | 'leads' | 'issues'
+const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'issues']
 
-const QUEUES: Array<{ key: QueueKey; label: string; desc: string; icon: React.ElementType; badgeKey: keyof Badges; chip: string; activeBg: string; activeBorder: string }> = [
-  { key: 'triage', label: '内容分诊', desc: '待研判的舆情内容', icon: Inbox, badgeKey: 'triagePending', chip: 'bg-blue-500', activeBg: 'bg-blue-50 dark:bg-blue-950/30', activeBorder: 'border-blue-300 dark:border-blue-800' },
-  { key: 'leads', label: '评论线索', desc: '需跟进的高风险评论', icon: MessageSquareWarning, badgeKey: 'leadsNew', chip: 'bg-amber-500', activeBg: 'bg-amber-50 dark:bg-amber-950/30', activeBorder: 'border-amber-300 dark:border-amber-800' },
-  { key: 'issues', label: '问题处置', desc: '已立项的舆情问题', icon: AlertCircle, badgeKey: 'issuesOpen', chip: 'bg-rose-500', activeBg: 'bg-rose-50 dark:bg-rose-950/30', activeBorder: 'border-rose-300 dark:border-rose-800' },
-]
-
+/**
+ * 舆情工作台:队列(内容分诊/评论线索/问题处置)已移到侧边栏二级导航,
+ * 本页只按导航参数渲染当前队列。切队列由侧边栏 navigate 触发(带 queue 参数,
+ * App 的 key 含 seq 会重挂载本页,从而消费一次性预置筛选)。
+ */
 export function WorkbenchPage() {
   const { params } = useNav()
-  const { badges } = useBadges()
-  const initialQueue = (params?.queue as QueueKey) || 'triage'
-  const [queue, setQueue] = useState<QueueKey>(QUEUES.some(q => q.key === initialQueue) ? initialQueue : 'triage')
-
-  // 仅当当前队列与导航预置队列一致时,透传一次性预置筛选
-  const initial = queue === params?.queue ? params ?? undefined : undefined
+  const queue: QueueKey = QUEUE_KEYS.includes(params?.queue as QueueKey) ? (params!.queue as QueueKey) : 'triage'
+  const initial = params ?? undefined
 
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
-      {/* Queue switcher: 紧凑单行分段,带实时计数(描述移到 hover 提示,省竖向空间) */}
-      <div className="flex flex-wrap items-center gap-2">
-        {QUEUES.map(q => {
-          const Icon = q.icon
-          const active = queue === q.key
-          const count = badges[q.badgeKey]
-          return (
-            <button
-              key={q.key}
-              onClick={() => setQueue(q.key)}
-              title={q.desc}
-              className={cn(
-                'group inline-flex items-center gap-2.5 rounded-xl border px-3.5 py-2 transition-all duration-200',
-                active
-                  ? cn(q.activeBg, q.activeBorder, 'shadow-xs')
-                  : 'border-border bg-card hover:border-input',
-              )}
-            >
-              <div className={cn(
-                'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white',
-                q.chip,
-              )}>
-                <Icon className="h-4 w-4" strokeWidth={2} />
-              </div>
-              <span className="text-[13px] font-semibold text-foreground">{q.label}</span>
-              {count > 0 && (
-                <span className={cn(
-                  'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
-                  active ? 'bg-white/70 text-foreground dark:bg-white/15' : 'bg-muted text-muted-foreground',
-                )}>
-                  {count > 99 ? '99+' : count}
-                </span>
-              )}
-            </button>
-          )
-        })}
-      </div>
-
-      {/* Active queue */}
+    <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
       {queue === 'triage' && <TriageQueue initial={initial} />}
       {queue === 'leads' && <LeadsQueue initial={initial} />}
       {queue === 'issues' && <IssuesQueue initial={initial} />}
