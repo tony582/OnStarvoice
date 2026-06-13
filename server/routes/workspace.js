@@ -35,6 +35,41 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+// 事件中心:把聚类的 issue 当"事件",富集影响力/平台/时间跨度/负面数。
+router.get('/events', requireTenantAccess, async (req, res, next) => {
+  try {
+    const { severity = '', status = '' } = req.query;
+    const params = [req.tenantId];
+    let where = 'WHERE i.tenant_id = $1';
+    if (severity) { params.push(severity); where += ` AND i.severity = $${params.length}`; }
+    if (status === 'open') where += ` AND i.status NOT IN ('resolved', 'closed', 'ignored')`;
+    else if (status) { params.push(status); where += ` AND i.status = $${params.length}`; }
+
+    const events = await queryAll(`
+      SELECT i.id, i.title, i.severity, i.status, i.summary, i.record_count, i.owner_name,
+        i.created_at, i.updated_at,
+        COALESCE(SUM(r.likes + r.comments_count + r.collects + r.shares), 0) AS reach,
+        COUNT(*) FILTER (WHERE r.sentiment = 'negative') AS negative_count,
+        array_remove(array_agg(DISTINCT r.platform), NULL) AS platforms,
+        MIN(r.first_seen_at) AS span_start,
+        MAX(r.last_seen_at) AS span_end
+      FROM issues i
+      LEFT JOIN issue_records ir ON ir.issue_id = i.id AND ir.tenant_id = i.tenant_id
+      LEFT JOIN records r ON r.id = ir.record_id AND r.tenant_id = i.tenant_id
+      ${where}
+      GROUP BY i.id
+      ORDER BY
+        CASE i.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+        reach DESC
+      LIMIT 100
+    `, params);
+
+    return res.json({ ok: true, events });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.get('/overview', requireTenantAccess, async (req, res, next) => {
   try {
     const days = Math.min(90, Math.max(1, Number(req.query.days) || 7));

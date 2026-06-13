@@ -7,6 +7,7 @@ import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
 import { InsightsPage } from '@/pages/InsightsPage'
 import { DataPage } from '@/pages/DataPage'
+import { EventsPage } from '@/pages/EventsPage'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -39,6 +40,7 @@ const PAGES: Record<string, React.ComponentType> = {
   overview: OverviewPage,
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
+  events: EventsPage,
   insights: InsightsPage,
   data: DataPage,
   tenants: TenantsPage,

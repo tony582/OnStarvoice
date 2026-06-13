@@ -22,7 +22,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3, badgeKeys: ['triagePending', 'leadsNew', 'issuesOpen'] },
     { id: 'monitoring', label: '监控中心', icon: Radar, badgeKeys: ['monitorAttention'] },
-    { id: 'events', label: '事件中心', icon: Route, tag: 'NEW' },
+    { id: 'events', label: '事件中心', icon: Route },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },
   ],
