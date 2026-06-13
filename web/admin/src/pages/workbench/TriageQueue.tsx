@@ -253,6 +253,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           onClose={() => setDrawerRecord(null)}
           canWrite={canWrite()}
           onLinkIssue={() => { linkIssue(drawerRecord.id); setDrawerRecord(null) }}
+          onSetStatus={s => { updateTriage(drawerRecord.id, s); setDrawerRecord(null) }}
+          onMarkResponded={() => { markResponded(drawerRecord.id); setDrawerRecord(null) }}
         />
       )}
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
-  ExternalLink, User, FileText, Camera,
+  ExternalLink, User, FileText, Camera, Bell, Archive, Eye,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDate, LABELS, platformName, cn } from '@/lib/utils'
@@ -14,7 +14,14 @@ import { EmptyState } from '@/components/shared/EmptyState'
  * 纯展示 + 回调:抽屉持有的是列表行快照,所有写操作由调用方持有,成功后由调用方
  * reload 列表并关闭抽屉(无单条 GET 端点可回灌)。从舆情收件箱提取以供多队列复用。
  */
-export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { record: any; onClose: () => void; canWrite: boolean; onLinkIssue: () => void }) {
+export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetStatus, onMarkResponded }: {
+  record: any
+  onClose: () => void
+  canWrite: boolean
+  onLinkIssue: () => void
+  onSetStatus?: (status: string) => void
+  onMarkResponded?: () => void
+}) {
   const [tab, setTab] = useState<'content' | 'comments' | 'official' | 'snapshot'>('content')
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
@@ -36,6 +43,11 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { re
   const images = getImages(r)
   const cover = images[0] || ''
 
+  const alerts = Number(r.alert_count || 0)
+  const negComments = Number(r.negative_comment_count || 0)
+  const official = r.official_response_status
+  const hasSignals = alerts > 0 || negComments > 0 || (official && official !== 'none')
+
   const TABS = [
     { id: 'content' as const, label: '帖子内容', icon: FileText },
     { id: 'comments' as const, label: `评论 (${comments.length})`, icon: MessageCircle },
@@ -53,9 +65,10 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { re
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-border px-6 py-4">
+        <div className="flex items-center gap-3 border-b border-border px-6 py-4">
           <h2 className="text-base font-bold">舆情内容详情</h2>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          {r.triage_status && <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>}
+          <button onClick={onClose} className="ml-auto rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
         </div>
 
         {/* Scrollable body */}
@@ -64,44 +77,61 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { re
           <div className="border-b border-border p-6">
             <div className="flex gap-4">
               {cover ? (
-                <div className="h-28 w-28 shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
-                  <img src={cover} alt="" className="h-full w-full object-cover" referrerPolicy="no-referrer" />
+                <div className="h-[88px] w-[88px] shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
+                  <img src={cover} alt="" className="h-full w-full object-cover" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).parentElement!.style.display = 'none' }} />
                 </div>
               ) : null}
               <div className="min-w-0 flex-1">
-                <div className="mb-2 flex flex-wrap gap-2">
+                <div className="mb-2 flex flex-wrap items-center gap-1.5">
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
-                  <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
                 </div>
-                <h3 className="text-base font-bold leading-snug">{r.title || '(无标题)'}</h3>
+                <h3 className="text-[15px] font-bold leading-snug">{r.title || '(无标题)'}</h3>
 
-                {/* Author */}
-                <div className="mt-3 flex items-center gap-2">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted text-xs font-bold text-muted-foreground">
-                    {(r.author_name || '?').slice(0, 1)}
+                {/* Author + links */}
+                <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-[11px] font-bold text-muted-foreground">
+                      {(r.author_name || '?').slice(0, 1)}
+                    </div>
+                    <span className="text-[13px] font-semibold">{r.author_name || '未知作者'}</span>
+                    {r.blogger_fans_count ? <span className="text-[11px] text-muted-foreground">{formatNumber(r.blogger_fans_count)} 粉丝</span> : null}
                   </div>
-                  <div>
-                    <div className="text-sm font-semibold">{r.author_name || '未知作者'}</div>
-                    <div className="text-[11px] text-muted-foreground">{r.blogger_fans_count ? formatNumber(r.blogger_fans_count) + ' 粉丝' : ''}</div>
-                  </div>
+                  {r.url && <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
+                  {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted-foreground hover:text-foreground"><User className="h-3.5 w-3.5" />主页</a>}
                 </div>
               </div>
             </div>
 
-            {/* Stats grid */}
-            <div className="mt-4 grid grid-cols-4 gap-2">
-              <StatTile icon={Heart} label="点赞" value={r.likes} />
-              <StatTile icon={MessageCircle} label="评论" value={r.comments_count} />
-              <StatTile icon={Star} label="收藏" value={r.collects} />
-              <StatTile icon={Share2} label="转发" value={r.shares} />
-            </div>
+            {/* 风险信号条:与列表一致,深看再加最近负评时间 */}
+            {hasSignals && (
+              <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg border border-status-red/20 bg-status-red/[0.035] px-3 py-2.5 dark:bg-status-red/[0.06]">
+                <span className="text-[11px] font-semibold text-muted-foreground">风险信号</span>
+                {alerts > 0 && (
+                  <span className="inline-flex items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span>
+                )}
+                {negComments > 0 && (
+                  <span className="rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span>
+                )}
+                {official === 'responded' && (
+                  <span className="inline-flex items-center gap-1 rounded bg-status-green/15 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300"><CheckCircle className="h-3 w-3" />已官方回复</span>
+                )}
+                {official === 'needs_followup' && (
+                  <span className="rounded bg-status-amber/20 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">需跟进</span>
+                )}
+                {r.latest_negative_comment_at && (
+                  <span className="ml-auto text-[11px] text-muted-foreground">最近负评 {formatDate(r.latest_negative_comment_at)}</span>
+                )}
+              </div>
+            )}
 
-            {/* Links */}
-            <div className="mt-3 flex gap-3">
-              {r.url && <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-sm font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />打开原文</a>}
-              {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"><User className="h-3.5 w-3.5" />博主主页</a>}
+            {/* 互动指标条(紧凑,替代四个胖方块)*/}
+            <div className="mt-4 grid grid-cols-4 divide-x divide-border overflow-hidden rounded-lg border border-border bg-muted/20">
+              <Metric icon={Heart} label="点赞" value={r.likes} />
+              <Metric icon={MessageCircle} label="评论" value={r.comments_count} />
+              <Metric icon={Star} label="收藏" value={r.collects} />
+              <Metric icon={Share2} label="转发" value={r.shares} />
             </div>
           </div>
 
@@ -253,9 +283,11 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { re
 
         {/* Footer actions */}
         {canWrite && (
-          <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
-            <Button variant="outline" onClick={onClose}>关闭</Button>
-            <Button onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转为问题</Button>
+          <div className="flex flex-wrap items-center gap-2 border-t border-border px-6 py-4">
+            {onMarkResponded && <Button variant="outline" size="sm" onClick={onMarkResponded}><CheckCircle className="h-3.5 w-3.5" />标为已响应</Button>}
+            {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('reviewing')}><Eye className="h-3.5 w-3.5" />待复核</Button>}
+            {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('archived')}><Archive className="h-3.5 w-3.5" />归档</Button>}
+            <Button className="ml-auto" onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转为问题</Button>
           </div>
         )}
       </div>
@@ -263,12 +295,11 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue }: { re
   )
 }
 
-function StatTile({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: any }) {
+function Metric({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: any }) {
   return (
-    <div className="rounded-lg bg-muted/50 p-3 text-center">
-      <Icon className="mx-auto mb-1 h-4 w-4 text-muted-foreground" strokeWidth={1.8} />
-      <div className="text-base font-bold tabular-nums">{formatNumber(value)}</div>
-      <div className="text-[10px] font-semibold text-muted-foreground">{label}</div>
+    <div className="px-3 py-2.5">
+      <div className="flex items-center gap-1 text-[10.5px] font-medium text-muted-foreground"><Icon className="h-3 w-3" strokeWidth={2} />{label}</div>
+      <div className="mt-0.5 text-[15px] font-bold tabular-nums">{formatNumber(value)}</div>
     </div>
   )
 }
