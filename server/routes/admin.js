@@ -488,10 +488,42 @@ router.put('/official-accounts', async (req, res, next) => {
       }
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
-        VALUES ($1, 'user', $2, $3, 'official_accounts.updated', 'tenant', $1, $4::jsonb)
-      `, [tenantId, req.user?.id || '', req.user?.id || null, JSON.stringify({ count: accounts.length })]);
+        VALUES ($1, 'user', $2, $3, 'official_accounts.updated', 'tenant', $4, $5::jsonb)
+      `, [tenantId, req.user?.id || '', req.user?.id || null, String(tenantId), JSON.stringify({ count: accounts.length })]);
     });
     return res.json({ ok: true });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 回溯重标:把历史上作者命中官方账号(精确名/别名/ID,且 skip_content)的内容
+// 标为 official_content,使其退出舆情监测队列。匹配规则与 comment-workflow 的 matchesOfficialAccount 对齐。
+router.post('/official-accounts/reclassify', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
+    const result = await execute(`
+      UPDATE records r
+      SET record_type = 'official_content', updated_at = now()
+      WHERE r.tenant_id = $1
+        AND COALESCE(r.record_type, '') <> 'official_content'
+        AND EXISTS (
+          SELECT 1 FROM official_accounts oa
+          WHERE oa.tenant_id = r.tenant_id AND oa.status = 'active' AND oa.skip_content = true
+            AND (COALESCE(oa.platform, '') = '' OR oa.platform = r.platform)
+            AND (
+              (COALESCE(oa.account_id, '') <> '' AND oa.account_id = r.author_id)
+              OR oa.account_name = r.author_name
+              OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) alias WHERE alias = r.author_name)
+            )
+        )
+    `, [tenantId]);
+    const updated = result?.rowCount ?? 0;
+    await execute(`
+      INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
+      VALUES ($1, 'user', $2, $3, 'official_accounts.reclassified', 'tenant', $4, $5::jsonb)
+    `, [tenantId, req.user?.id || '', req.user?.id || null, String(tenantId), JSON.stringify({ updated })]);
+    return res.json({ ok: true, updated });
   } catch (err) {
     return next(err);
   }

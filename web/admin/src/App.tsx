@@ -13,6 +13,7 @@ import { BenchmarksPage } from '@/pages/BenchmarksPage'
 import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentHomePage } from '@/pages/ContentHomePage'
 import { HitsPage } from '@/pages/HitsPage'
+import { OfficialAccountsPage } from '@/pages/OfficialAccountsPage'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -35,6 +36,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   keywords: { eyebrow: 'Content Studio', title: '选题与扩词' },
   review: { eyebrow: 'Content Studio', title: '内容复盘' },
   // 管理
+  'official-accounts': { eyebrow: 'Administration', title: '官方账号管理' },
   tenants: { eyebrow: 'Administration', title: '租户管理' },
   users: { eyebrow: 'Administration', title: '用户账号' },
   'auth-codes': { eyebrow: 'Administration', title: '激活码' },
@@ -53,6 +55,7 @@ const PAGES: Record<string, React.ComponentType> = {
   keywords: KeywordsPage,
   'content-home': ContentHomePage,
   hits: HitsPage,
+  'official-accounts': OfficialAccountsPage,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,

@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Columns3, Radar, Route, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight, ChevronDown,
-  ShieldHalf, Wand2, Check,
+  ShieldHalf, ShieldCheck, Wand2, Check,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -37,6 +37,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
 }
 
 const ADMIN_NAV: NavItem[] = [
+  { id: 'official-accounts', label: '官方账号', icon: ShieldCheck },
   { id: 'tenants', label: '租户管理', icon: Building2 },
   { id: 'users', label: '用户账号', icon: Users, platformAdmin: true },
   { id: 'auth-codes', label: '激活码', icon: KeyRound },
