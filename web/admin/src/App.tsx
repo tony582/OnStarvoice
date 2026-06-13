@@ -1,3 +1,5 @@
+import { useState } from 'react'
+import { cn } from '@/lib/utils'
 import { AuthProvider, useAuth } from '@/lib/auth'
 import { NavProvider, useNav } from '@/lib/navigation'
 import { BadgesProvider } from '@/lib/badges'
@@ -68,6 +70,8 @@ const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '�
 function AppContent() {
   const { user, loading, tenantId } = useAuth()
   const { page, params, seq, navigate } = useNav()
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('osv_sidebar_collapsed') === '1')
+  const toggleCollapse = () => setCollapsed(c => { const next = !c; localStorage.setItem('osv_sidebar_collapsed', next ? '1' : '0'); return next })
 
   if (loading) {
     return (
@@ -85,8 +89,8 @@ function AppContent() {
 
   return (
     <div className="flex min-h-screen">
-      <Sidebar activePage={page} onNavigate={navigate} />
-      <main className="ml-[240px] min-w-0 flex-1 px-8 py-5">
+      <Sidebar activePage={page} onNavigate={navigate} collapsed={collapsed} onToggleCollapse={toggleCollapse} />
+      <main className={cn('min-w-0 flex-1 px-8 py-5 transition-[margin] duration-200', collapsed ? 'ml-14' : 'ml-[256px]')}>
         <TopBar eyebrow={config.eyebrow} title={title} />
         {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
         <div className="animate-fade-up" key={`${page}:${seq}:${tenantId}`}>

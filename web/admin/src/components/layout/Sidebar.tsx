@@ -1,9 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
 import {
   LayoutDashboard, Columns3, Radar, Route, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
-  Building2, Users, KeyRound, Settings, ChevronRight, ChevronDown,
-  ShieldHalf, ShieldCheck, Wand2, Check,
+  Building2, Users, KeyRound, Settings, ChevronRight,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeft,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -51,93 +50,74 @@ const ADMIN_NAV: NavItem[] = [
   { id: 'settings', label: '系统设置', icon: Settings },
 ]
 
-interface SidebarProps { activePage: string; onNavigate: (page: string, params?: Record<string, string>) => void }
+interface SidebarProps {
+  activePage: string
+  onNavigate: (page: string, params?: Record<string, string>) => void
+  collapsed: boolean
+  onToggleCollapse: () => void
+}
 
-export function Sidebar({ activePage, onNavigate }: SidebarProps) {
+export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }: SidebarProps) {
   const { isInternal, isPlatformAdmin } = useAuth()
   const { badges } = useBadges()
   const { workspace, switchWorkspace, params } = useNav()
   const activeQueue = activePage === 'workbench' ? (params?.queue || 'triage') : null
+  const activeWs = WORKSPACES.find(w => w.key === workspace) || WORKSPACES[0]
+  const ActiveWsIcon = activeWs.icon
 
   return (
-    <aside className="fixed inset-y-0 left-0 z-20 flex w-[240px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
-      <div className="flex items-center gap-2.5 px-5 pb-3 pt-5">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
+    <>
+      {/* Level 1:图标轨 —— 工作区切换 + 收起开关(常驻,Asana 式)*/}
+      <aside className="fixed inset-y-0 left-0 z-30 flex w-14 flex-col items-center border-r border-sidebar-border bg-sidebar py-3">
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary">
           <img src="/images/logo-starvoice.svg" alt="" className="h-5 w-5 object-contain brightness-0 invert" />
         </div>
-        <div className="min-w-0">
-          <div className="truncate text-[14px] font-semibold text-foreground">OnStarVoice</div>
-        </div>
-      </div>
-
-      <div className="px-3">
-        <WorkspaceSwitcher current={workspace} onSwitch={switchWorkspace} />
-      </div>
-
-      <nav className="mt-2 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
-        <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-        {isInternal() && (
-          <NavGroup label="ADMIN" items={ADMIN_NAV} activePage={activePage} activeQueue={null} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-        )}
-      </nav>
-
-      <div className="mx-5 h-px bg-sidebar-border" />
-      <div className="px-5 py-3.5">
-        <div className="text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
-      </div>
-    </aside>
-  )
-}
-
-function WorkspaceSwitcher({ current, onSwitch }: { current: Workspace; onSwitch: (ws: Workspace) => void }) {
-  const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
-  const active = WORKSPACES.find(w => w.key === current) || WORKSPACES[0]
-  const ActiveIcon = active.icon
-
-  useEffect(() => {
-    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-
-  return (
-    <div className="relative" ref={ref}>
-      <button
-        onClick={() => setOpen(o => !o)}
-        className="flex w-full items-center gap-2.5 rounded-lg border border-sidebar-border bg-card px-3 py-2 text-left transition-colors hover:border-input"
-      >
-        <ActiveIcon className={cn('h-4 w-4 shrink-0', active.accent)} strokeWidth={2} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[12.5px] font-semibold text-foreground">{active.label}</div>
-          <div className="truncate text-[10px] text-muted-foreground">{active.desc}</div>
-        </div>
-        <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')} />
-      </button>
-
-      {open && (
-        <div className="absolute left-0 right-0 top-full z-30 mt-1.5 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-lg duration-150">
+        <button onClick={onToggleCollapse} title={collapsed ? '展开导航' : '收起导航'}
+          className="mt-2 flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
+          <PanelLeft className="h-[18px] w-[18px]" strokeWidth={1.9} />
+        </button>
+        <div className="my-2.5 h-px w-7 bg-sidebar-border" />
+        <div className="flex flex-col items-center gap-1.5">
           {WORKSPACES.map(w => {
             const Icon = w.icon
-            const isActive = w.key === current
+            const on = w.key === workspace
             return (
-              <button
-                key={w.key}
-                onClick={() => { onSwitch(w.key); setOpen(false) }}
-                className={cn('flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors', isActive ? 'bg-accent' : 'hover:bg-muted')}
-              >
-                <Icon className={cn('h-4 w-4 shrink-0', w.accent)} strokeWidth={2} />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[12.5px] font-semibold text-foreground">{w.label}</div>
-                  <div className="truncate text-[10px] text-muted-foreground">{w.desc}</div>
-                </div>
-                {isActive && <Check className="h-3.5 w-3.5 shrink-0 text-primary" />}
+              <button key={w.key} onClick={() => switchWorkspace(w.key)} title={`${w.label} · ${w.desc}`}
+                className={cn(
+                  'relative flex h-10 w-10 items-center justify-center rounded-xl transition-colors',
+                  on ? 'bg-accent' : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                )}>
+                {on && <span className="absolute -left-2 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-primary" />}
+                <Icon className={cn('h-[19px] w-[19px]', on && activeWs.accent)} strokeWidth={2} />
               </button>
             )
           })}
         </div>
+      </aside>
+
+      {/* Level 2:导航面板(可收起,收起后主区铺满)*/}
+      {!collapsed && (
+        <aside className="fixed inset-y-0 left-14 z-20 flex w-[200px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
+          <div className="flex items-center gap-2.5 px-4 pb-2.5 pt-4">
+            <ActiveWsIcon className={cn('h-[18px] w-[18px] shrink-0', activeWs.accent)} strokeWidth={2} />
+            <div className="min-w-0">
+              <div className="truncate text-[13px] font-bold leading-tight text-foreground">{activeWs.label}</div>
+              <div className="truncate text-[10px] text-muted-foreground">{activeWs.desc}</div>
+            </div>
+          </div>
+
+          <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
+            <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
+            {isInternal() && (
+              <NavGroup label="ADMIN" items={ADMIN_NAV} activePage={activePage} activeQueue={null} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
+            )}
+          </nav>
+
+          <div className="mx-4 h-px bg-sidebar-border" />
+          <div className="px-4 py-3 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
+        </aside>
       )}
-    </div>
+    </>
   )
 }
 
