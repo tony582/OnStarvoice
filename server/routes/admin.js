@@ -502,28 +502,71 @@ router.put('/official-accounts', async (req, res, next) => {
 router.post('/official-accounts/reclassify', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
-    const result = await execute(`
-      UPDATE records r
-      SET record_type = 'official_content', updated_at = now()
-      WHERE r.tenant_id = $1
-        AND COALESCE(r.record_type, '') <> 'official_content'
+    // 命中官方账号的 SQL 谓词(精确名/别名/ID,对齐 comment-workflow.matchesOfficialAccount)
+    const matchSql = (rowAlias) => `EXISTS (
+      SELECT 1 FROM official_accounts oa
+      WHERE oa.tenant_id = ${rowAlias}.tenant_id AND oa.status = 'active'
+        AND (COALESCE(oa.platform, '') = '' OR oa.platform = ${rowAlias}.platform)
+        AND (
+          (COALESCE(oa.account_id, '') <> '' AND oa.account_id = ${rowAlias}.author_id)
+          OR oa.account_name = ${rowAlias}.author_name
+          OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) alias WHERE alias = ${rowAlias}.author_name)
+        )
+    )`;
+
+    // ① 官方"发文" → official_content,退出舆情监测
+    const excluded = (await execute(`
+      UPDATE records r SET record_type = 'official_content', updated_at = now()
+      WHERE r.tenant_id = $1 AND COALESCE(r.record_type, '') <> 'official_content'
         AND EXISTS (
           SELECT 1 FROM official_accounts oa
           WHERE oa.tenant_id = r.tenant_id AND oa.status = 'active' AND oa.skip_content = true
-            AND (COALESCE(oa.platform, '') = '' OR oa.platform = r.platform)
-            AND (
-              (COALESCE(oa.account_id, '') <> '' AND oa.account_id = r.author_id)
-              OR oa.account_name = r.author_name
-              OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) alias WHERE alias = r.author_name)
-            )
+            AND (COALESCE(oa.platform,'')='' OR oa.platform = r.platform)
+            AND ((COALESCE(oa.account_id,'')<>'' AND oa.account_id=r.author_id)
+              OR oa.account_name=r.author_name
+              OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) a WHERE a=r.author_name))
         )
+    `, [tenantId]))?.rowCount ?? 0;
+
+    // ② 官方"回复评论" → 标记 is_official(中性,不计负面/客资)
+    const officialReplies = (await execute(`
+      UPDATE record_comments c
+      SET is_official = true, is_negative = false, sentiment = 'neutral', risk_level = 'none', updated_at = now()
+      WHERE c.tenant_id = $1 AND c.is_official IS DISTINCT FROM true AND ${matchSql('c')}
+    `, [tenantId]))?.rowCount ?? 0;
+
+    // ③ 为官方回复补 official_responses(供详情页"官方响应"展示;每条评论一条,去重)
+    await execute(`
+      INSERT INTO official_responses (tenant_id, record_id, comment_id, official_account_id, platform, account_id, account_name, content, published_at, content_hash)
+      SELECT DISTINCT ON (c.id) c.tenant_id, c.record_id, c.id, oa.id, c.platform, c.author_id,
+        COALESCE(NULLIF(c.author_name,''), oa.account_name), c.content, c.published_at, md5(c.id::text)
+      FROM record_comments c
+      JOIN official_accounts oa ON oa.tenant_id = c.tenant_id AND oa.status = 'active'
+        AND (COALESCE(oa.platform,'')='' OR oa.platform = c.platform)
+        AND ((COALESCE(oa.account_id,'')<>'' AND oa.account_id=c.author_id)
+          OR oa.account_name=c.author_name
+          OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) a WHERE a=c.author_name))
+      WHERE c.tenant_id = $1 AND c.is_official = true
+        AND NOT EXISTS (SELECT 1 FROM official_responses orr WHERE orr.tenant_id = c.tenant_id AND orr.comment_id = c.id)
+      ORDER BY c.id, oa.id
     `, [tenantId]);
-    const updated = result?.rowCount ?? 0;
+
+    // ④ 把"被官方回复过"的内容标记状态(还有负面→需跟进,否则已响应)
+    const repliedRecords = (await execute(`
+      UPDATE records r
+      SET official_replied = true,
+        official_response_status = CASE WHEN r.negative_comment_count > 0 THEN 'needs_followup' ELSE 'responded' END,
+        updated_at = now()
+      WHERE r.tenant_id = $1 AND COALESCE(r.record_type,'') <> 'official_content'
+        AND EXISTS (SELECT 1 FROM record_comments c WHERE c.tenant_id = r.tenant_id AND c.record_id = r.id AND c.is_official = true)
+    `, [tenantId]))?.rowCount ?? 0;
+
     await execute(`
       INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
       VALUES ($1, 'user', $2, $3, 'official_accounts.reclassified', 'tenant', $4, $5::jsonb)
-    `, [tenantId, req.user?.id || '', req.user?.id || null, String(tenantId), JSON.stringify({ updated })]);
-    return res.json({ ok: true, updated });
+    `, [tenantId, req.user?.id || '', req.user?.id || null, String(tenantId), JSON.stringify({ excluded, officialReplies, repliedRecords })]);
+
+    return res.json({ ok: true, updated: excluded, excluded, officialReplies, repliedRecords });
   } catch (err) {
     return next(err);
   }

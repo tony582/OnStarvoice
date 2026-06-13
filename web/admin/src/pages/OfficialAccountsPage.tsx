@@ -60,7 +60,7 @@ export function OfficialAccountsPage() {
     setReclassifying(true); setMsg('')
     try {
       const d = await api.post<any>('/admin/official-accounts/reclassify')
-      setMsg(`回溯完成:已把 ${d.updated} 条历史官方账号内容移出舆情监测。`)
+      setMsg(`回溯完成:移出监测 ${d.excluded ?? 0} 条官方发文;识别官方回复 ${d.officialReplies ?? 0} 条,标记「已官方回复」内容 ${d.repliedRecords ?? 0} 条。`)
     } catch (err) { setMsg('回溯失败:' + (err instanceof Error ? err.message : '')) } finally { setReclassifying(false) }
   }
 
