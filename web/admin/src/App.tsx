@@ -82,7 +82,7 @@ function AppContent() {
   return (
     <div className="flex min-h-screen">
       <Sidebar activePage={page} onNavigate={navigate} />
-      <main className="ml-[240px] min-w-0 flex-1 px-8 py-6">
+      <main className="ml-[240px] min-w-0 flex-1 px-8 py-5">
         <TopBar eyebrow={config.eyebrow} title={config.title} />
         {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
         <div className="animate-fade-up" key={`${page}:${seq}:${tenantId}`}>

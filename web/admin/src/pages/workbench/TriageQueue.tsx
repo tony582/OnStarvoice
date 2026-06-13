@@ -111,64 +111,64 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const someChecked = records.some(r => sel.has(r.id))
 
   return (
-    <div className="space-y-5">
-      {/* View switcher + status tabs */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
-        {view === 'list' ? (
-          <div className="flex flex-wrap gap-2">
-            {STATUS_TABS.map(tab => {
-              const Icon = tab.icon
-              return (
-                <button key={tab.value} onClick={() => setStatus(tab.value)}
-                  className={cn(
-                    'inline-flex items-center gap-2 rounded-md border px-4 py-2 text-[13px] font-medium transition-colors duration-200',
-                    status === tab.value
-                      ? 'border-primary bg-primary text-white'
-                      : 'border-border bg-card text-muted-foreground hover:border-primary/50 hover:text-primary'
-                  )}>
-                  <Icon className="h-3.5 w-3.5" strokeWidth={2} />
-                  {tab.label}
-                </button>
-              )
-            })}
+    <div className="space-y-4">
+      {/* 工具条:状态分段 + 视图切换 + 筛选,收成一个紧凑块(笔记本上少占两层)*/}
+      <div className="space-y-2.5 border-b border-border pb-3.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          {view === 'list' ? (
+            <div className="inline-flex flex-wrap items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
+              {STATUS_TABS.map(tab => {
+                const Icon = tab.icon
+                const on = status === tab.value
+                return (
+                  <button key={tab.value} onClick={() => setStatus(tab.value)}
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
+                      on ? 'bg-primary text-white shadow-xs' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                    )}>
+                    <Icon className="h-3.5 w-3.5" strokeWidth={2} />
+                    {tab.label}
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
+              <Kanban className="h-3.5 w-3.5" />拖动卡片即可改变处置状态
+            </span>
+          )}
+          <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
+            {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([v, label, Icon]) => (
+              <button key={v} onClick={() => setView(v)}
+                className={cn('inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors',
+                  view === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
+                <Icon className="h-3.5 w-3.5" />{label}
+              </button>
+            ))}
           </div>
-        ) : (
-          <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
-            <Kanban className="h-3.5 w-3.5" />拖动卡片即可改变处置状态
-          </span>
-        )}
-        <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
-          {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([v, label, Icon]) => (
-            <button key={v} onClick={() => setView(v)}
-              className={cn('inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors',
-                view === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
-              <Icon className="h-3.5 w-3.5" />{label}
-            </button>
-          ))}
         </div>
-      </div>
 
-      {/* Filters */}
-      <div className="flex flex-wrap items-center gap-2.5">
-        <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
-          <option value="">全部平台</option>
-          <option value="xiaohongshu">小红书</option>
-          <option value="douyin">抖音</option>
-          <option value="weibo">微博</option>
-        </WorkbenchSelect>
-        <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
-          {['', 'negative', 'neutral', 'positive'].map(v => (
-            <button key={v} onClick={() => setSentiment(v)}
-              className={cn('rounded-md px-2.5 py-1 text-[12px] font-semibold transition-colors',
-                sentiment === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
-              {v === '' ? '全部情感' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
-            </button>
-          ))}
-        </div>
-        <div className="relative min-w-[220px] flex-1 sm:max-w-xs">
-          <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 pl-8 text-[12px]" />
+        <div className="flex flex-wrap items-center gap-2">
+          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
+            <option value="">全部平台</option>
+            <option value="xiaohongshu">小红书</option>
+            <option value="douyin">抖音</option>
+            <option value="weibo">微博</option>
+          </WorkbenchSelect>
+          <div className="inline-flex items-center rounded-lg border border-border bg-card p-0.5">
+            {['', 'negative', 'neutral', 'positive'].map(v => (
+              <button key={v} onClick={() => setSentiment(v)}
+                className={cn('rounded-md px-2.5 py-1 text-[12px] font-semibold transition-colors',
+                  sentiment === v ? 'bg-primary text-white' : 'text-muted-foreground hover:text-foreground')}>
+                {v === '' ? '全部情感' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
+              </button>
+            ))}
+          </div>
+          <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
+            <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input value={keyword} onChange={e => setKeyword(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 pl-8 text-[12px]" />
+          </div>
         </div>
       </div>
 

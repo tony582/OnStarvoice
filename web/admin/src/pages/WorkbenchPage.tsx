@@ -25,9 +25,9 @@ export function WorkbenchPage() {
   const initial = queue === params?.queue ? params ?? undefined : undefined
 
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
-      {/* Queue switcher: segmented cards with live counts */}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
+      {/* Queue switcher: 紧凑单行分段,带实时计数(描述移到 hover 提示,省竖向空间) */}
+      <div className="flex flex-wrap items-center gap-2">
         {QUEUES.map(q => {
           const Icon = q.icon
           const active = queue === q.key
@@ -36,33 +36,29 @@ export function WorkbenchPage() {
             <button
               key={q.key}
               onClick={() => setQueue(q.key)}
+              title={q.desc}
               className={cn(
-                'group relative flex items-center gap-3 rounded-xl border p-4 text-left shadow-xs transition-all duration-200',
+                'group inline-flex items-center gap-2.5 rounded-xl border px-3.5 py-2 transition-all duration-200',
                 active
-                  ? cn(q.activeBg, q.activeBorder, 'shadow-sm')
-                  : 'border-border bg-card hover:border-input hover:shadow-sm',
+                  ? cn(q.activeBg, q.activeBorder, 'shadow-xs')
+                  : 'border-border bg-card hover:border-input',
               )}
             >
               <div className={cn(
-                'flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-white shadow-sm transition-transform group-hover:scale-105',
+                'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white',
                 q.chip,
               )}>
-                <Icon className="h-[22px] w-[22px]" strokeWidth={1.9} />
+                <Icon className="h-4 w-4" strokeWidth={2} />
               </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold text-foreground">{q.label}</span>
-                  {count > 0 && (
-                    <span className={cn(
-                      'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
-                      active ? 'bg-white/70 text-foreground dark:bg-white/15' : 'bg-muted text-muted-foreground',
-                    )}>
-                      {count > 99 ? '99+' : count}
-                    </span>
-                  )}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">{q.desc}</div>
-              </div>
+              <span className="text-[13px] font-semibold text-foreground">{q.label}</span>
+              {count > 0 && (
+                <span className={cn(
+                  'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
+                  active ? 'bg-white/70 text-foreground dark:bg-white/15' : 'bg-muted text-muted-foreground',
+                )}>
+                  {count > 99 ? '99+' : count}
+                </span>
+              )}
             </button>
           )
         })}
