@@ -32,6 +32,7 @@ import workspaceRouter from './routes/workspace.js';
 import analyticsRouter from './routes/analytics.js';
 import leadsRouter from './routes/leads.js';
 import keywordOpportunityRouter, { keywordAnalysisRouter, benchmarkDiscoveryRouter } from './routes/keyword-strategy.js';
+import contentRouter from './routes/content.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -111,6 +112,7 @@ app.use('/api/leads', leadsRouter);
 app.use('/api/keyword-analysis', keywordAnalysisRouter);
 app.use('/api/keyword-opportunity', keywordOpportunityRouter);
 app.use('/api/benchmark-discovery', benchmarkDiscoveryRouter);
+app.use('/api/content', contentRouter);
 
 app.post('/api/admin/test-email', requireAdmin, async (req, res) => {
   try { return res.json(await sendTestEmail()); }

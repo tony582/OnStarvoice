@@ -8,6 +8,7 @@ import { MonitoringPage } from '@/pages/MonitoringPage'
 import { InsightsPage } from '@/pages/InsightsPage'
 import { DataPage } from '@/pages/DataPage'
 import { EventsPage } from '@/pages/EventsPage'
+import { TracksPage } from '@/pages/TracksPage'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -43,6 +44,7 @@ const PAGES: Record<string, React.ComponentType> = {
   events: EventsPage,
   insights: InsightsPage,
   data: DataPage,
+  tracks: TracksPage,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,
