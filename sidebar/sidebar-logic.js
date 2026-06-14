@@ -252,8 +252,8 @@ const KEYWORD_SORT_SYNC_INTERVAL_MS = 1800;
 const EXTENSION_UPDATE_MODAL_STATE_KEY = "onstarvoice.updateModalState";
 const RISK_NOTICE_ACKNOWLEDGED_KEY = "onstarvoice.riskNoticeAcknowledged";
 const MEMBER_GROUP_PROMPT_STATE_KEY = "onstarvoice.memberGroupPromptState";
-const DEFAULT_UPDATE_DOWNLOAD_URL = "https://voice.minilife.online";
-const DEFAULT_UPDATE_CHANGELOG_URL = "https://voice.minilife.online";
+const DEFAULT_UPDATE_DOWNLOAD_URL = "https://voice.minilife.online/about";
+const DEFAULT_UPDATE_CHANGELOG_URL = "https://voice.minilife.online/about#changelog";
 const EXTENSION_MANAGEMENT_URL = `chrome://extensions/?id=${chrome.runtime.id}`;
 const EXTENSION_INSTALL_TYPE = Object.freeze({
   NORMAL: "normal",

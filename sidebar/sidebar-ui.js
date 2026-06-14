@@ -47,7 +47,7 @@ const executionSectionCollapsedState = {
   monitor: false,
 };
 const dataPoolGroupCollapsedState = new Map();
-const PRICING_PAGE_URL = "https://voice.minilife.online";
+const PRICING_PAGE_URL = "https://voice.minilife.online/about";
 const PURCHASE_LINK_PHRASES = Object.freeze([
   "续费激活码",
   "获取新激活码",

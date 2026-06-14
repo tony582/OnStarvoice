@@ -91,6 +91,11 @@ app.use('/admin', express.static(join(__dirname, 'admin')));
 app.use('/dashboard', express.static(join(__dirname, 'dashboard')));
 app.use('/images', express.static(join(__dirname, '..', 'images')));
 
+// 关于 / 联系 / 定价 / 更新日志(插件内多处入口指向此页）
+app.get(['/about', '/contact', '/changelog', '/pricing'], (req, res) => {
+  res.sendFile(join(__dirname, 'public', 'about.html'));
+});
+
 // ==================== API 路由 ====================
 
 app.use('/api/auth', authRouter);
