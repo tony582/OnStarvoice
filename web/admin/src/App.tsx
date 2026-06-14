@@ -90,7 +90,10 @@ function AppContent() {
   return (
     <div className="flex min-h-screen">
       <Sidebar activePage={page} onNavigate={navigate} collapsed={collapsed} onToggleCollapse={toggleCollapse} />
-      <main className={cn('min-w-0 flex-1 px-8 py-5 transition-[margin] duration-200', collapsed ? 'ml-14' : 'ml-[256px]')}>
+      <main
+        className={cn('min-w-0 flex-1 py-5 pl-8 transition-[margin] duration-200', collapsed ? 'ml-14' : 'ml-[256px]')}
+        style={{ paddingRight: 'calc(2rem + var(--detail-dock-width, 0px))' }}
+      >
         <TopBar eyebrow={config.eyebrow} title={title} />
         {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
         <div className="animate-fade-up" key={`${page}:${seq}:${tenantId}`}>

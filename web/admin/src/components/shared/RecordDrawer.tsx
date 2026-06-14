@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
   ExternalLink, User, FileText, Camera, Bell, Archive, Eye,
 } from 'lucide-react'
+
+// 详情面板可拖宽,停靠右侧(Asana 式)
+const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDate, LABELS, platformName, cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -27,6 +30,11 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
   const [observations, setObservations] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const [width, setWidth] = useState(() => {
+    const saved = Number(localStorage.getItem('osv_detail_width'))
+    return saved >= PANEL_MIN && saved <= PANEL_MAX ? saved : PANEL_DEFAULT
+  })
 
   useEffect(() => {
     setLoading(true)
@@ -46,6 +54,48 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
     return () => window.removeEventListener('keydown', h)
   }, [onClose])
 
+  // 把停靠宽度写入 CSS 变量,主内容据此让出右边
+  useEffect(() => {
+    document.documentElement.style.setProperty('--detail-dock-width', width + 'px')
+  }, [width])
+  // 关闭/卸载时归零(仅一次,避免改宽时闪一下)
+  useEffect(() => {
+    return () => { document.documentElement.style.setProperty('--detail-dock-width', '0px') }
+  }, [])
+
+  // 窗口变窄时收一下,给列表留出最小空间
+  useEffect(() => {
+    const clamp = () => setWidth(w => Math.min(w, Math.max(PANEL_MIN, window.innerWidth - 340)))
+    clamp()
+    window.addEventListener('resize', clamp)
+    return () => window.removeEventListener('resize', clamp)
+  }, [])
+
+  // 拖拽改宽:拖动时直接改 DOM(不触发重渲染),松手再落库
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = panelRef.current?.offsetWidth ?? width
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    const onMove = (ev: MouseEvent) => {
+      const w = Math.min(PANEL_MAX, Math.max(PANEL_MIN, startW + (startX - ev.clientX)))
+      if (panelRef.current) panelRef.current.style.width = w + 'px'
+      document.documentElement.style.setProperty('--detail-dock-width', w + 'px')
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      document.body.style.userSelect = ''
+      document.body.style.cursor = ''
+      const w = panelRef.current?.offsetWidth ?? width
+      setWidth(w)
+      localStorage.setItem('osv_detail_width', String(w))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
   const images = getImages(r)
   const cover = images[0] || ''
 
@@ -62,10 +112,14 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   ]
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-50 flex justify-end">
-      {/* 盖式:无遮罩,面板盖在内容右侧,左侧列表仍可见可点 */}
-      <div className="pointer-events-auto relative z-10 flex h-full w-full max-w-[460px] flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-200"
-        onClick={e => e.stopPropagation()}>
+    <div ref={panelRef} style={{ width }}
+      className="fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
+      {/* 拖拽分隔条:贯穿到顶,与 banner 一体;hover 出蓝线(Asana) */}
+      <div onMouseDown={startResize} title="拖动调整宽度"
+        className="group absolute left-0 top-0 z-30 flex h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center">
+        <span className="h-full w-px bg-transparent transition-all group-hover:w-[3px] group-hover:bg-primary" />
+      </div>
+      <div className="relative z-10 flex h-full w-full flex-col">
 
         {/* Header */}
         <div className="flex items-center gap-3 border-b border-border/50 px-6 py-4">
