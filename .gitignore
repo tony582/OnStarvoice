@@ -7,3 +7,7 @@ server/data/
 server/.env
 server/.env.production
 server/node_modules/
+
+extension-build/
+extension-build.crx
+extension-build.pem
