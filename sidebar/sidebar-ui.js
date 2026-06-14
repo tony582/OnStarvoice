@@ -47,7 +47,7 @@ const executionSectionCollapsedState = {
   monitor: false,
 };
 const dataPoolGroupCollapsedState = new Map();
-const PRICING_PAGE_URL = "https://onstarvoice.app/#pricing";
+const PRICING_PAGE_URL = "https://voice.minilife.online";
 const PURCHASE_LINK_PHRASES = Object.freeze([
   "续费激活码",
   "获取新激活码",

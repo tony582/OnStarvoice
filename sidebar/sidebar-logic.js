@@ -252,8 +252,8 @@ const KEYWORD_SORT_SYNC_INTERVAL_MS = 1800;
 const EXTENSION_UPDATE_MODAL_STATE_KEY = "onstarvoice.updateModalState";
 const RISK_NOTICE_ACKNOWLEDGED_KEY = "onstarvoice.riskNoticeAcknowledged";
 const MEMBER_GROUP_PROMPT_STATE_KEY = "onstarvoice.memberGroupPromptState";
-const DEFAULT_UPDATE_DOWNLOAD_URL = "https://onstarvoice.app/download";
-const DEFAULT_UPDATE_CHANGELOG_URL = "https://onstarvoice.app/updates";
+const DEFAULT_UPDATE_DOWNLOAD_URL = "https://voice.minilife.online";
+const DEFAULT_UPDATE_CHANGELOG_URL = "https://voice.minilife.online";
 const EXTENSION_MANAGEMENT_URL = `chrome://extensions/?id=${chrome.runtime.id}`;
 const EXTENSION_INSTALL_TYPE = Object.freeze({
   NORMAL: "normal",
@@ -6783,7 +6783,7 @@ function renderInsightCardToImage(data) {
     const brandText = "OnStarVoice 星语";
     ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
     const brandTW = ctx.measureText(brandText).width;
-    const urlText = "https://onstarvoice.app";
+    const urlText = "https://voice.minilife.online";
     ctx.font = `500 10px -apple-system, "PingFang SC", sans-serif`;
     const urlTW = ctx.measureText(urlText).width;
     const pillPadX = 8;
@@ -7158,7 +7158,7 @@ function renderKeywordOpportunityCardToImage(data) {
     y += 18;
 
     const brandText = "OnStarVoice 星语";
-    const urlText = "https://onstarvoice.app";
+    const urlText = "https://voice.minilife.online";
     const logoSize = 16;
     const gap = 6;
     ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
@@ -7482,7 +7482,7 @@ function renderBenchmarkDiscoveryCardToImage(data) {
     y += 18;
 
     const brandText = "OnStarVoice（社媒虾）";
-    const urlText = "https://onstarvoice.app";
+    const urlText = "https://voice.minilife.online";
     const logoSize = 16;
     const gap = 6;
     ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;

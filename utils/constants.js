@@ -156,7 +156,7 @@ export const UNCLAIMED_CREDENTIAL_OWNER_EMAIL =
 export const UNCLAIMED_CREDENTIAL_OWNER_NAME = "Unclaimed Credential Owner";
 export const UNCLAIMED_CREDENTIAL_OWNER_LABEL = "系统未绑定账号";
 export const CREDENTIAL_CLAIM_PAGE_URL =
-  "https://onstarvoice.local/account/credentials";
+  "https://voice.minilife.online";
 
 // ==================== 默认配置 ====================
 export const DEFAULT_CONFIG = {
