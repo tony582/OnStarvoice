@@ -13,9 +13,9 @@ import { recordDiagnosticError } from './diagnostics.js';
 
 const API_BASE_URLS = [
   globalThis.__ONSTARVOICE_API_BASE_URL__,
+  'https://voice.minilife.online',
   'http://localhost:3001',
   'http://127.0.0.1:3001',
-  'https://voice.minilife.online',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
 ].filter(Boolean);

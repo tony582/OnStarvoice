@@ -136,8 +136,8 @@ router.post('/users', requirePlatformAdmin, async (req, res, next) => {
       `, [user.id, req.user.id, JSON.stringify({ email: normalizedEmail })]);
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
-        VALUES ($1, 'user', $2, $2, 'user.created', 'user', $3, $4::jsonb)
-      `, [tenantId || null, req.user.id, user.id, JSON.stringify({ email: normalizedEmail, isInternal: Boolean(isInternal), globalRole, role })]);
+        VALUES ($1::uuid, 'user', $2::text, $3::uuid, 'user.created', 'user', $4::text, $5::jsonb)
+      `, [tenantId || null, String(req.user.id), req.user.id, String(user.id), JSON.stringify({ email: normalizedEmail, isInternal: Boolean(isInternal), globalRole, role })]);
       return user;
     });
 
@@ -193,8 +193,8 @@ router.patch('/users/:id', requirePlatformAdmin, async (req, res, next) => {
 
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
-        VALUES ($1, 'user', $2, $2, 'user.updated', 'user', $3, $4::jsonb)
-      `, [tenantId || null, req.user.id, req.params.id, JSON.stringify(req.body || {})]);
+        VALUES ($1::uuid, 'user', $2::text, $3::uuid, 'user.updated', 'user', $4::text, $5::jsonb)
+      `, [tenantId || null, String(req.user.id), req.user.id, String(req.params.id), JSON.stringify(req.body || {})]);
       return true;
     });
     return res.json({ ok: result });
@@ -226,8 +226,8 @@ router.post('/users/:id/reset-password', requirePlatformAdmin, async (req, res, 
       `, [req.params.id, req.user.id]);
       await tx.execute(`
         INSERT INTO audit_logs (actor_type, actor_id, actor_user_id, action, target_type, target_id)
-        VALUES ('user', $1, $1, 'user.password_reset', 'user', $2)
-      `, [req.user.id, req.params.id]);
+        VALUES ('user', $1::text, $2::uuid, 'user.password_reset', 'user', $3::text)
+      `, [String(req.user.id), req.user.id, req.params.id]);
       return updated;
     });
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '用户不存在' });

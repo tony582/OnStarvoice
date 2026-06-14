@@ -6,7 +6,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { useAuth } from '@/lib/auth'
 
 /* ==================== TenantsPage ==================== */
 export function TenantsPage() {
@@ -68,24 +67,45 @@ export function TenantsPage() {
 
 /* ==================== UsersPage ==================== */
 export function UsersPage() {
-  const { tenants } = useAuth()
+  const [tenants, setTenants] = useState<any[]>([])
   const [users, setUsers] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState('')
   const [form, setForm] = useState({ email: '', name: '', password: '', type: 'tenant', tenantId: '', role: 'tenant_viewer', globalRole: 'internal_operator' })
 
   const load = async () => {
     setLoading(true)
-    const data = await api.get<any>('/admin/users', { skipTenant: true })
-    setUsers(data.users || [])
+    const [u, t] = await Promise.all([
+      api.get<any>('/admin/users', { skipTenant: true }),
+      api.get<any>('/admin/tenants', { skipTenant: true }),
+    ])
+    setUsers(u.users || [])
+    const ts = t.tenants || []
+    setTenants(ts)
+    setForm(f => ({ ...f, tenantId: f.tenantId || ts[0]?.id || '' }))
     setLoading(false)
   }
-  useEffect(() => { load(); if (tenants.length) setForm(f => ({ ...f, tenantId: tenants[0]?.id || '' })) }, [tenants])
+  useEffect(() => { load() }, [])
 
   const createUser = async () => {
-    const body: any = { email: form.email, name: form.name, password: form.password }
-    if (form.type === 'internal') { body.globalRole = form.globalRole } else { body.tenantId = form.tenantId; body.tenantRole = form.role }
-    await api.post('/admin/users', body, { skipTenant: true })
-    load()
+    if (!form.email.trim() || !form.password) { setMsg('邮箱和初始密码必填'); return }
+    if (form.password.length < 8) { setMsg('初始密码至少 8 位'); return }
+    const isInternal = form.type === 'internal'
+    if (!isInternal && !form.tenantId) { setMsg('客户账号请选择租户(没有就先到「租户管理」建)'); return }
+    const body: any = { email: form.email.trim(), name: form.name.trim(), password: form.password, isInternal }
+    if (isInternal) body.globalRole = form.globalRole
+    else { body.tenantId = form.tenantId; body.role = form.role }
+    setBusy(true); setMsg('')
+    try {
+      await api.post('/admin/users', body, { skipTenant: true })
+      const tname = tenants.find(t => t.id === form.tenantId)?.name
+      setMsg(isInternal ? '✅ 内部账号已创建' : `✅ 已为「${tname || ''}」创建账号:${form.email.trim()}`)
+      setForm(f => ({ ...f, email: '', name: '', password: '' }))
+      load()
+    } catch (err) {
+      setMsg('创建失败:' + (err instanceof Error ? err.message : ''))
+    } finally { setBusy(false) }
   }
 
   const resetPwd = async (id: string) => {
@@ -135,7 +155,10 @@ export function UsersPage() {
             </Field>
           )}
         </div>
-        <div className="mt-4 flex justify-end"><Button onClick={createUser}>创建账号</Button></div>
+        <div className="mt-4 flex flex-wrap items-center justify-end gap-3">
+          {msg && <span className={`text-[12.5px] font-medium ${/失败|必填|至少|请选择/.test(msg) ? 'text-status-red' : 'text-status-green'}`}>{msg}</span>}
+          <Button onClick={createUser} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}创建账号</Button>
+        </div>
       </section>
 
       {loading ? <Spin /> : !users.length ? <EmptyState icon={Users} title="暂无用户" /> : (
