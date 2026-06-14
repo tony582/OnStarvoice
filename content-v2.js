@@ -1,5 +1,5 @@
 /**
- * OnStarVoice V1.0 Content Script
+ * StarVoice V1.0 Content Script
  * 在小红书/抖音页面上运行的内容脚本
  *
  * 职责：
@@ -25,7 +25,7 @@ import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
 import {normalizeTaskContext} from "./utils/task-context.js";
 import {buildContentDiagnostics} from "./utils/diagnostics.js";
 
-console.log("[OnStarVoice V1.0] Content script loaded");
+console.log("[StarVoice V1.0] Content script loaded");
 
 function safeRuntimeSendMessage(message) {
   try {

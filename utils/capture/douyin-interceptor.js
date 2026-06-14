@@ -75,11 +75,11 @@
         .slice(0, MAX_MEDIA_CACHE_ENTRIES);
       sessionStorage.setItem(MEDIA_CACHE_KEY, JSON.stringify(next));
       try {
-        console.debug('[OnStarVoice][DouyinInterceptor] media request hit:', normalized);
+        console.debug('[StarVoice][DouyinInterceptor] media request hit:', normalized);
       } catch (_) {}
     } catch (error) {
       try {
-        console.warn('[OnStarVoice][DouyinInterceptor] media request cache failed:', error);
+        console.warn('[StarVoice][DouyinInterceptor] media request cache failed:', error);
       } catch (_) {}
     }
   }
@@ -94,7 +94,7 @@
       wroteSession = true;
     } catch (error) {
       try {
-        console.warn('[OnStarVoice][DouyinInterceptor] sessionStorage write failed:', awemeId, error);
+        console.warn('[StarVoice][DouyinInterceptor] sessionStorage write failed:', awemeId, error);
       } catch (_) {}
     }
     try {
@@ -102,14 +102,14 @@
       wroteLocal = true;
     } catch (error) {
       try {
-        console.warn('[OnStarVoice][DouyinInterceptor] localStorage write failed:', awemeId, error);
+        console.warn('[StarVoice][DouyinInterceptor] localStorage write failed:', awemeId, error);
       } catch (_) {}
     }
     if (wroteSession || wroteLocal) {
       pruneOldEntries();
     } else {
       try {
-        console.warn('[OnStarVoice][DouyinInterceptor] cache write skipped:', awemeId);
+        console.warn('[StarVoice][DouyinInterceptor] cache write skipped:', awemeId);
       } catch (_) {}
     }
   }
@@ -146,7 +146,7 @@
     var extractedCount = extractAndStoreAwemeNodes(json);
     if (extractedCount > 0) {
       try {
-        console.debug('[OnStarVoice][DouyinInterceptor] cached aweme nodes:', extractedCount);
+        console.debug('[StarVoice][DouyinInterceptor] cached aweme nodes:', extractedCount);
       } catch (_) {}
     }
   }
@@ -196,7 +196,7 @@
           }
         } catch (error) {
           try {
-            console.warn('[OnStarVoice][DouyinInterceptor] detail request failed:', normalizedId, endpoint, error);
+            console.warn('[StarVoice][DouyinInterceptor] detail request failed:', normalizedId, endpoint, error);
           } catch (_) {}
         }
       }
@@ -301,7 +301,7 @@
 
         if (isAwemeApiUrl(url)) {
           try {
-            console.debug('[OnStarVoice][DouyinInterceptor] fetch hit:', url);
+            console.debug('[StarVoice][DouyinInterceptor] fetch hit:', url);
           } catch (_) {}
           promise.then(function (response) {
             if (response && response.ok) {
@@ -333,7 +333,7 @@
       appendMediaRequest(this._mcUrl);
       if (isAwemeApiUrl(this._mcUrl)) {
         try {
-          console.debug('[OnStarVoice][DouyinInterceptor] xhr hit:', this._mcUrl);
+          console.debug('[StarVoice][DouyinInterceptor] xhr hit:', this._mcUrl);
         } catch (_) {}
         var self = this;
         this.addEventListener('load', function () {
@@ -366,7 +366,7 @@
   });
 
   try {
-    console.debug('[OnStarVoice][DouyinInterceptor] ready');
+    console.debug('[StarVoice][DouyinInterceptor] ready');
   } catch (_) {}
 
 })();

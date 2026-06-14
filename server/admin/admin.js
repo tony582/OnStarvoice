@@ -546,7 +546,7 @@ function renderEmailSettingsForm(s) {
       </label>
       <label>SMTP 账号<input id="smtp_user" autocomplete="username" value="${escAttr(s.smtp_user || '')}"></label>
       <label class="full">SMTP 密码/授权码<input id="smtp_pass" type="password" autocomplete="new-password" placeholder="${s.smtp_pass ? '已保存，留空不修改' : '邮箱服务商 SMTP 授权码'}"></label>
-      <label>发件人<input id="email_from" placeholder="OnStarVoice <noreply@example.com>" value="${escAttr(s.email_from || '')}"></label>
+      <label>发件人<input id="email_from" placeholder="StarVoice <noreply@example.com>" value="${escAttr(s.email_from || '')}"></label>
       <label>收件人<input id="email_to" placeholder="a@example.com,b@example.com" value="${escAttr(s.email_to || '')}"></label>
     </div>
     <p class="subtext">报告发送按钮会把邮件发给“收件人”。多个地址用英文逗号分隔；SMTP 密码留空不会覆盖已保存配置。</p>

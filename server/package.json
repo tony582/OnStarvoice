@@ -1,7 +1,7 @@
 {
   "name": "onstarvoice-server",
   "version": "0.1.0",
-  "description": "OnStarVoice 星语舆情监控后端服务",
+  "description": "StarVoice 星语舆情监控后端服务",
   "private": true,
   "type": "module",
   "scripts": {

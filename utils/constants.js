@@ -1,5 +1,5 @@
 /**
- * OnStarVoice V1.0 Constants
+ * StarVoice V1.0 Constants
  * 统一常量定义，避免魔法字符串
  */
 

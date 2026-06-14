@@ -82,7 +82,7 @@ function LoginView({ onLogin }: { onLogin: (owner: string) => void }) {
       <div className="relative z-10 w-full max-w-md space-y-6 rounded-2xl border border-border/50 bg-card/80 p-10 shadow-2xl backdrop-blur-xl">
         <div className="flex flex-col items-center">
           <img src="/images/logo-starvoice.svg" alt="" className="mb-5 h-14 w-14 drop-shadow-lg" />
-          <h1 className="bg-gradient-to-r from-primary to-cyan-500 bg-clip-text text-2xl font-extrabold text-transparent">OnStarVoice 星语</h1>
+          <h1 className="bg-gradient-to-r from-primary to-cyan-500 bg-clip-text text-2xl font-extrabold text-transparent">StarVoice 星语</h1>
           <p className="mt-1 text-sm text-muted-foreground">数据中心</p>
         </div>
         <div className="space-y-2">
@@ -144,7 +144,7 @@ function DashboardView({ owner }: { owner: string }) {
           <div className="flex items-center gap-3">
             <img src="/images/logo-starvoice.svg" alt="" className="h-8 w-8" />
             <div>
-              <div className="text-sm font-bold">OnStarVoice 星语</div>
+              <div className="text-sm font-bold">StarVoice 星语</div>
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">数据中心</div>
             </div>
           </div>

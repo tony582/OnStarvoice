@@ -1,5 +1,5 @@
 /**
- * OnStarVoice 用户数据中心 — 客户端逻辑
+ * StarVoice 用户数据中心 — 客户端逻辑
  */
 
 let authCode = '';

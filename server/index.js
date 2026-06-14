@@ -1,5 +1,5 @@
 /**
- * OnStarVoice Backend Server
+ * StarVoice Backend Server
  */
 
 import 'dotenv/config';
@@ -166,7 +166,7 @@ async function start() {
 
   app.listen(PORT, () => {
     console.log(`\n  ╔══════════════════════════════════════════╗`);
-    console.log(`  ║  OnStarVoice 星语 Backend Server         ║`);
+    console.log(`  ║  StarVoice 星语 Backend Server         ║`);
     console.log(`  ║  http://localhost:${PORT}                   ║`);
     console.log(`  ║  Admin: http://localhost:${PORT}/admin       ║`);
     console.log(`  ╚══════════════════════════════════════════╝\n`);

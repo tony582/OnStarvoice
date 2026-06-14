@@ -29,7 +29,7 @@ export function LoginPage() {
           <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-lg border border-border bg-muted/40">
             <img src="/images/logo-starvoice.svg" alt="" className="h-7 w-7" />
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">OnStarVoice</h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground">StarVoice</h1>
           <p className="mt-1.5 text-[13px] font-medium tracking-widest uppercase text-muted-foreground">舆情作战台</p>
         </div>
 

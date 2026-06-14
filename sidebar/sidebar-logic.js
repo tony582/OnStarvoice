@@ -6780,7 +6780,7 @@ function renderInsightCardToImage(data) {
 
     const logoSize = 16;
     const gap = 6;
-    const brandText = "OnStarVoice 星语";
+    const brandText = "StarVoice 星语";
     ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
     const brandTW = ctx.measureText(brandText).width;
     const urlText = "https://voice.minilife.online";
@@ -7157,7 +7157,7 @@ function renderKeywordOpportunityCardToImage(data) {
     ctx.fillRect(PAD, y, CONTENT_W, 0.5);
     y += 18;
 
-    const brandText = "OnStarVoice 星语";
+    const brandText = "StarVoice 星语";
     const urlText = "https://voice.minilife.online";
     const logoSize = 16;
     const gap = 6;
@@ -7481,7 +7481,7 @@ function renderBenchmarkDiscoveryCardToImage(data) {
     ctx.fillRect(PAD, y, CONTENT_W, 0.5);
     y += 18;
 
-    const brandText = "OnStarVoice（社媒虾）";
+    const brandText = "StarVoice（社媒虾）";
     const urlText = "https://voice.minilife.online";
     const logoSize = 16;
     const gap = 6;

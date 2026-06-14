@@ -1,7 +1,7 @@
-# OnStarVoice 部署到阿里云(voice.minilife.online)
+# StarVoice 部署到阿里云(voice.minilife.online)
 
 与 minilife 同一台 ECS(`47.103.125.200`),复用其 node / PM2 / Nginx / PostgreSQL / Certbot。
-OnStarVoice 作为**第二个 PM2 应用**跑在 **3002** 端口(minilife 占 3000),用**独立数据库** `onstarvoice`。
+StarVoice 作为**第二个 PM2 应用**跑在 **3002** 端口(minilife 占 3000),用**独立数据库** `onstarvoice`。
 
 ```
 浏览器/插件 ──► https://voice.minilife.online ──(Nginx 443/80)──► 127.0.0.1:3002 (Express)

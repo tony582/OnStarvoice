@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OnStarVoice 一键部署到阿里云 ECS(与 minilife 同机,二级域名 voice.minilife.online)
+# StarVoice 一键部署到阿里云 ECS(与 minilife 同机,二级域名 voice.minilife.online)
 # 用法:  bash deploy/deploy.sh [服务器IP]
 # 默认 IP 47.103.125.200。需要:① 已配置到该机的 SSH(建议 SSH key 免密)
 #                                ② 已在服务器建库 onstarvoice(见 DEPLOY.md)

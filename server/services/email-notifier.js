@@ -77,13 +77,13 @@ export async function sendAlertEmail(alert, tenantId = null) {
   const levelLabel = LEVEL_LABEL[alert.level] || alert.level;
   const levelColor = LEVEL_COLOR[alert.level] || '#666';
 
-  const subject = `[OnStarVoice 星语舆情预警] ${levelLabel} ${alert.reason}`;
+  const subject = `[StarVoice 星语舆情预警] ${levelLabel} ${alert.reason}`;
   const alertUrl = safeUrl(alert.url);
 
   const html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto;">
       <div style="background: linear-gradient(135deg, #0077B6 0%, #00B4D8 100%); padding: 20px 24px; border-radius: 12px 12px 0 0;">
-        <h2 style="color: #fff; margin: 0; font-size: 18px;">OnStarVoice 星语舆情预警</h2>
+        <h2 style="color: #fff; margin: 0; font-size: 18px;">StarVoice 星语舆情预警</h2>
       </div>
       <div style="border: 1px solid #E5E7EB; border-top: none; padding: 24px; border-radius: 0 0 12px 12px;">
         <div style="display: flex; align-items: center; margin-bottom: 16px;">
@@ -122,7 +122,7 @@ export async function sendAlertEmail(alert, tenantId = null) {
         </table>
 
         <div style="margin-top: 24px; padding: 12px; background: #F9FAFB; border-radius: 8px; font-size: 12px; color: #9CA3AF;">
-          此邮件由 OnStarVoice 星语舆情监控系统自动发送，请勿直接回复。
+          此邮件由 StarVoice 星语舆情监控系统自动发送，请勿直接回复。
         </div>
       </div>
     </div>
@@ -166,7 +166,7 @@ export async function sendTestEmail(tenantId = null) {
 
   await t.sendMail({
     from, to,
-    subject: '[OnStarVoice 星语] 测试邮件',
+    subject: '[StarVoice 星语] 测试邮件',
     html: '<p>这是一封测试邮件，如果你收到了说明邮件通知配置正确。</p>',
   });
 

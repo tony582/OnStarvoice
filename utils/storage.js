@@ -1,5 +1,5 @@
 /**
- * OnStarVoice V1.0 Storage Layer
+ * StarVoice V1.0 Storage Layer
  * 统一封装本地存储
  * 禁止业务层直接操作 chrome.storage
  */

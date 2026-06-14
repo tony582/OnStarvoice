@@ -2735,7 +2735,7 @@ export async function checkBeforeSync(requiredSyncTypes = [], options = {}) {
     const target = await getTarget();
     const requestTarget = buildSyncTargetPayload(target);
 
-    // 使用 OnStarVoice 后台同步，不再强制要求 feishuAppToken
+    // 使用 StarVoice 后台同步，不再强制要求 feishuAppToken
     // 如果配置了 feishuAppToken 则使用，否则使用激活码直连后端
     if (!requestTarget.feishuAppToken) {
       // 设置一个占位值，让后续逻辑不报错

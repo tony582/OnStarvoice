@@ -1199,7 +1199,7 @@ function buildLegacyReportHTML(title, periodLabel, stats) {
     <div class="report-shell" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif; max-width:980px; margin:0 auto; padding:20px; color:#111827; background:#F6F8FB;">
       <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:12px; overflow:hidden;">
         <div style="padding:24px 26px; background:#111827;">
-          <div style="font-size:12px; color:#CBD5E1; font-weight:700; letter-spacing:0;">OnStarVoice 星语 · 舆情报告</div>
+          <div style="font-size:12px; color:#CBD5E1; font-weight:700; letter-spacing:0;">StarVoice 星语 · 舆情报告</div>
           <h2 style="color:#FFFFFF; margin:8px 0 6px; font-size:24px; line-height:1.25;">${escHtml(title)}</h2>
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
             <span style="color:#CBD5E1; font-size:13px;">${escHtml(periodLabel)}</span>
@@ -1566,7 +1566,7 @@ function buildManagementReportHTML(title, periodLabel, stats) {
       <div class="osv-shell">
         <header class="osv-hero">
           <div>
-            <div class="osv-kicker">OnStarVoice 星语 · Management Report</div>
+            <div class="osv-kicker">StarVoice 星语 · Management Report</div>
             <h1 class="osv-title">${escHtml(title)}</h1>
             <div class="osv-subtitle">${escHtml(periodLabel)} · ${escHtml(stats.periodFocus)} · 生成时间 ${escHtml(generatedAt)}</div>
           </div>
@@ -1671,7 +1671,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif; max-width:760px; margin:0 auto; background:#F6F8FB; padding:18px; color:#111827;">
       <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px; overflow:hidden;">
         <div style="padding:22px 24px; border-bottom:1px solid #E5E7EB;">
-          <div style="font-size:12px; color:#2563EB; font-weight:800;">OnStarVoice 星语 · 邮件摘要</div>
+          <div style="font-size:12px; color:#2563EB; font-weight:800;">StarVoice 星语 · 邮件摘要</div>
           <h1 style="margin:8px 0 8px; font-size:22px; line-height:1.3;">${escHtml(title)}</h1>
           <div style="font-size:13px; color:#6B7280;">${escHtml(periodLabel)} · 风险等级：<strong style="color:${stats.riskColor}">${escHtml(stats.riskLabel)}</strong>${reportId ? ` · 报告ID ${escHtml(reportId)}` : ''}</div>
         </div>
@@ -1749,9 +1749,9 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
   const previousStats = await getReportStats(tenantId, previous.start, previous.end);
   const stats = enrichReportData(type, currentStats, previousStats);
   const typeLabel = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
-  const title = `OnStarVoice 星语舆情${typeLabel}`;
+  const title = `StarVoice 星语舆情${typeLabel}`;
   const periodLabel = `${dateLabel(start)} - ${dateLabel(end)}`;
-  const subject = `[OnStarVoice 星语${typeLabel}] ${periodLabel} ${stats.riskLabel} · 负面率 ${stats.negativeRate}%`;
+  const subject = `[StarVoice 星语${typeLabel}] ${periodLabel} ${stats.riskLabel} · 负面率 ${stats.negativeRate}%`;
   const html = buildManagementReportHTML(title, periodLabel, stats);
   const dashboardHtml = buildDataDashboardHTML(title, periodLabel, stats);
   const emailHtml = buildEmailSummaryHTML(title, periodLabel, stats);

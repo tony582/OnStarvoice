@@ -1,5 +1,5 @@
 /**
- * OnStarVoice V1.0 API Layer
+ * StarVoice V1.0 API Layer
  * 封装与后端的通信，统一处理请求和响应
  */
 
