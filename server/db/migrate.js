@@ -1,3 +1,4 @@
+import 'dotenv/config'; // 独立运行迁移时也要加载 .env(否则 DATABASE_URL 缺失会回落到默认弱密码)
 import { readdir, readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join, resolve } from 'path';
