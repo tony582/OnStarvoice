@@ -12,22 +12,56 @@ import { useAuth } from '@/lib/auth'
 export function TenantsPage() {
   const [tenants, setTenants] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
-  useEffect(() => {
-    api.get<any>('/admin/tenants', { skipTenant: true }).then(d => setTenants(d.tenants || [])).finally(() => setLoading(false))
-  }, [])
-  if (loading) return <Spin />
-  if (!tenants.length) return <EmptyState icon={Building2} title="暂无租户" />
+  const [name, setName] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [msg, setMsg] = useState('')
+
+  const load = () => api.get<any>('/admin/tenants', { skipTenant: true })
+    .then(d => setTenants(d.tenants || [])).finally(() => setLoading(false))
+  useEffect(() => { load() }, [])
+
+  const create = async () => {
+    const n = name.trim()
+    if (!n) return
+    setCreating(true); setMsg('')
+    try {
+      const d = await api.post<any>('/admin/tenants', { name: n }, { skipTenant: true })
+      setName('')
+      setMsg(`已创建客户「${d.tenant?.name || n}」。下一步:到「用户账号」给它建管理员,到「激活码」给它生成激活码。`)
+      load()
+    } catch (err) {
+      setMsg('创建失败:' + (err instanceof Error ? err.message : ''))
+    } finally { setCreating(false) }
+  }
+
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
-      <Table heads={['租户', '状态', '创建时间']}>
-        {tenants.map(t => (
-          <tr key={t.id} className="transition-colors hover:bg-muted/30">
-            <td className="px-4 py-3 font-medium">{t.name}</td>
-            <td className="px-4 py-3"><StatusBadge tone={t.status}>{t.status === 'active' ? '启用' : t.status}</StatusBadge></td>
-            <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(t.created_at)}</td>
-          </tr>
-        ))}
-      </Table>
+    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
+      <section className="rounded-xl border border-border bg-card p-5">
+        <h2 className="mb-1 inline-flex items-center gap-1.5 text-sm font-bold"><Building2 className="h-4 w-4 text-primary" />新建客户(租户)</h2>
+        <p className="mb-3 text-[12.5px] text-muted-foreground">每个客户(如「安吉星」)= 一个租户,数据完全隔离。建好后给它建账号、发激活码。</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="min-w-[240px] flex-1">
+            <Field label="客户/租户名称">
+              <Input value={name} onChange={e => setName(e.target.value)} placeholder="例:安吉星 / 上汽通用 / 凯迪拉克"
+                onKeyDown={e => { if (e.key === 'Enter') create() }} />
+            </Field>
+          </div>
+          <Button onClick={create} disabled={creating || !name.trim()}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Building2 className="h-4 w-4" />}新建客户</Button>
+        </div>
+        {msg && <p className="mt-3 text-[12.5px] font-medium text-status-green">{msg}</p>}
+      </section>
+
+      {loading ? <Spin /> : !tenants.length ? <EmptyState icon={Building2} title="暂无租户" /> : (
+        <Table heads={['租户', '状态', '创建时间']}>
+          {tenants.map(t => (
+            <tr key={t.id} className="transition-colors hover:bg-muted/30">
+              <td className="px-4 py-3 font-medium">{t.name}</td>
+              <td className="px-4 py-3"><StatusBadge tone={t.status}>{t.status === 'active' ? '启用' : t.status}</StatusBadge></td>
+              <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(t.created_at)}</td>
+            </tr>
+          ))}
+        </Table>
+      )}
     </div>
   )
 }
@@ -128,28 +162,68 @@ export function UsersPage() {
 
 /* ==================== AuthCodesPage ==================== */
 export function AuthCodesPage() {
-  const { tenants } = useAuth()
   const [codes, setCodes] = useState<any[]>([])
+  const [tenants, setTenants] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [form, setForm] = useState({ tenantId: '', type: 'annual', ownerName: '' })
+  const [creating, setCreating] = useState(false)
+  const [created, setCreated] = useState('')
+
   const load = async () => {
     setLoading(true)
-    const data = await api.get<any>('/admin/auth-codes', { skipTenant: true })
-    setCodes(data.codes || [])
+    const [codeData, tenantData] = await Promise.all([
+      api.get<any>('/admin/auth-codes', { skipTenant: true }),
+      api.get<any>('/admin/tenants', { skipTenant: true }),
+    ])
+    setCodes(codeData.codes || [])
+    const ts = tenantData.tenants || []
+    setTenants(ts)
+    setForm(f => ({ ...f, tenantId: f.tenantId || ts[0]?.id || '' }))
     setLoading(false)
   }
   useEffect(() => { load() }, [])
 
   const create = async () => {
-    const ownerName = prompt('客户名称：')
-    if (!ownerName) return
-    const tenantId = tenants[0]?.id
-    await api.post('/admin/auth-codes', { type: 'annual', ownerName, tenantId }, { skipTenant: true })
-    load()
+    if (!form.tenantId) return
+    setCreating(true); setCreated('')
+    try {
+      const d = await api.post<any>('/admin/auth-codes', {
+        type: form.type,
+        ownerName: form.ownerName.trim(),
+        tenantId: form.tenantId,
+      }, { skipTenant: true })
+      const tname = tenants.find(t => t.id === form.tenantId)?.name || ''
+      setCreated(`已为「${tname}」生成激活码:${d.code}`)
+      setForm(f => ({ ...f, ownerName: '' }))
+      load()
+    } catch (err) {
+      setCreated('创建失败:' + (err instanceof Error ? err.message : ''))
+    } finally { setCreating(false) }
   }
 
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
-      <div><Button onClick={create}>创建激活码</Button></div>
+    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
+      <section className="rounded-xl border border-border bg-card p-5">
+        <h2 className="mb-1 inline-flex items-center gap-1.5 text-sm font-bold"><KeyRound className="h-4 w-4 text-primary" />生成激活码</h2>
+        <p className="mb-3 text-[12.5px] text-muted-foreground">激活码绑定到某个客户(租户),该客户用此码采集的数据全部归属其租户。</p>
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Field label="归属客户(租户)">
+            <select value={form.tenantId} onChange={e => setForm({ ...form, tenantId: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+              {tenants.length === 0 && <option value="">(先到「租户管理」建客户)</option>}
+              {tenants.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+          </Field>
+          <Field label="类型">
+            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+              <option value="trial">试用(7天)</option><option value="annual">年付(1年)</option><option value="permanent">永久</option>
+            </select>
+          </Field>
+          <Field label="备注/联系人(选填)"><Input value={form.ownerName} onChange={e => setForm({ ...form, ownerName: e.target.value })} placeholder="例:安吉星-张经理" /></Field>
+          <div className="flex items-end"><Button className="w-full" onClick={create} disabled={creating || !form.tenantId}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}生成激活码</Button></div>
+        </div>
+        {created && <p className="mt-3 text-[12.5px] font-medium text-status-green">{created}</p>}
+      </section>
+
       {loading ? <Spin /> : !codes.length ? <EmptyState icon={KeyRound} title="暂无激活码" /> : (
         <Table heads={['激活码', '类型', '状态', '客户', '绑定', '过期']}>
           {codes.map(c => (

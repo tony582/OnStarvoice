@@ -25,6 +25,41 @@ router.get('/tenants', async (req, res, next) => {
   }
 });
 
+// 新建租户(= 一个客户)。复制默认租户设置,使新客户开箱即用。
+router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) {
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: '租户名称不能为空' });
+    }
+    const defaultTenantId = await getDefaultTenantId();
+    const tenant = await withTransaction(async tx => {
+      const created = await tx.queryOne(
+        'INSERT INTO tenants (name) VALUES ($1) RETURNING id, name, status, created_at',
+        [name]
+      );
+      // 把默认租户(OnStar)的设置整套复制给新租户:LLM / SMTP / 阈值 / 报表计划等
+      await tx.execute(
+        `INSERT INTO tenant_settings (tenant_id, key, value)
+         SELECT $1, key, value FROM tenant_settings WHERE tenant_id = $2`,
+        [created.id, defaultTenantId]
+      );
+      await tx.execute(
+        `INSERT INTO audit_logs (tenant_id, actor_type, actor_id, action, target_type, target_id, metadata)
+         VALUES ($1::uuid, 'user', $2::text, 'tenant.created', 'tenant', $3::text, $4::jsonb)`,
+        [created.id, String(req.user.id), String(created.id), JSON.stringify({ name })]
+      );
+      return created;
+    });
+    return res.json({ ok: true, tenant });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ ok: false, error: 'tenant_exists', message: '同名租户已存在' });
+    }
+    return next(err);
+  }
+});
+
 router.get('/users', async (req, res, next) => {
   try {
     const users = await queryAll(`
