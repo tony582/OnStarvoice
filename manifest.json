@@ -21,7 +21,7 @@
     "*://*.sinaimg.com/*",
     "*://*.weiboimg.cn/*",
     "*://*.weiboimg.com/*",
-    "https://api.onstarvoice.local/*",
+    "https://voice.minilife.online/*",
     "http://localhost:3000/*",
     "http://localhost:3001/*",
     "http://127.0.0.1:3000/*",
