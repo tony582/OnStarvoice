@@ -311,6 +311,14 @@ export const PLATFORM_REGISTRY = Object.freeze({
         disabledReason: "",
         pageTypes: Object.freeze([PAGE_TYPE.SEARCH_RESULTS]),
       }),
+      Object.freeze({
+        id: "monitorTab",
+        label: "对标监控",
+        recordTypes: Object.freeze([]),
+        disabled: false,
+        disabledReason: "",
+        pageTypes: Object.freeze([]),
+      }),
     ]),
     capabilities: Object.freeze({
       captureNote: true,
