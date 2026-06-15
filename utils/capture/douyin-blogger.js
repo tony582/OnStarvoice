@@ -1189,6 +1189,8 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
 
   const notes = [];
   const dedupe = new Set();
+  // 抖音博主主页头部的「IP属地:X」,下发给该博主每条视频作为发布位置
+  const bloggerIpLocation = extractIpLocation();
 
   linkNodes.forEach((link) => {
     const noteUrl = normalizeUrl(link.getAttribute("href") || link.href || "");
@@ -1220,6 +1222,7 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
 
     notes.push({
       noteId,
+      publishLocation: bloggerIpLocation,
       url: noteUrl,
       noteUrl,
       detailPageUrl: noteUrl,

@@ -603,6 +603,22 @@ function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
       }
     }
 
+    // ---- IP 属地 ----
+    // 微博属地常在 .from 区域末尾的文本节点(如「2小时前 来自 微博 广东」),用省级白名单匹配
+    let region = '';
+    if (fromEl) {
+      const REGIONS = [
+        '北京', '天津', '上海', '重庆', '河北', '山西', '辽宁', '吉林', '黑龙江',
+        '江苏', '浙江', '安徽', '福建', '江西', '山东', '河南', '湖北', '湖南',
+        '广东', '海南', '四川', '贵州', '云南', '陕西', '甘肃', '青海', '台湾',
+        '内蒙古', '广西', '西藏', '宁夏', '新疆', '香港', '澳门',
+      ];
+      const fromText = (fromEl.textContent || '').replace(/\s+/g, ' ');
+      for (const r of REGIONS) {
+        if (fromText.includes(r)) { region = r; break; }
+      }
+    }
+
     // ---- 互动数据 ----
     // 微博新版本可能用多种结构：
     // 方案A: .card-act ul li（经典版）
@@ -711,7 +727,7 @@ function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
       authorUrl: bloggerProfileUrl,
       bloggerAccountType: 'personal',
       source,
-      region: '',
+      region,
       isRetweet,
       mediaHint,
       captureTimestamp: Date.now(),
