@@ -76,7 +76,6 @@ function bridgeFetch(url, timeoutMs = 6000) {
     const id = `wbf_${__weiboFetchSeq++}_${url.length}`;
     let settled = false;
     const onMessage = (event) => {
-      if (event.source !== window) return;
       const d = event.data;
       if (!d || d.__starvoiceWeiboFetchResult !== true || d.id !== id) return;
       settled = true;
