@@ -70,7 +70,7 @@ async function directFetch(url) {
 
 // 经 main-world 桥执行(与页面自身请求一致;mymblog 等接口在 isolated 会失败)
 let __weiboFetchSeq = 0;
-function bridgeFetch(url, timeoutMs = 15000) {
+function bridgeFetch(url, timeoutMs = 6000) {
   if (typeof window === "undefined") return Promise.reject(new Error("no window"));
   return new Promise((resolve, reject) => {
     const id = `wbf_${__weiboFetchSeq++}_${url.length}`;
