@@ -36,12 +36,6 @@
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       const json = await resp.json();
       payload = { __starvoiceWeiboFetchResult: true, id: req.id, ok: true, json };
-      try {
-        const n = Array.isArray(json?.data?.list)
-          ? json.data.list.length
-          : json?.data?.user?.screen_name || "ok";
-        console.log("[StarVoice桥] ✓", req.url.split("?")[0], "→", n);
-      } catch {}
     } catch (err) {
       payload = {
         __starvoiceWeiboFetchResult: true,
@@ -49,7 +43,6 @@
         ok: false,
         error: String((err && err.message) || err),
       };
-      console.log("[StarVoice桥] ✗", req.url.split("?")[0], "→", payload.error);
     }
     window.postMessage(payload, "*");
   });

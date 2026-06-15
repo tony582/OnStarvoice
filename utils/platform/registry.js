@@ -298,7 +298,7 @@ export const PLATFORM_REGISTRY = Object.freeze({
       Object.freeze({
         id: "bloggerTab",
         label: "用户页",
-        recordTypes: Object.freeze(["blogger_profile"]),
+        recordTypes: Object.freeze(["blogger_profile", "blogger_notes"]),
         disabled: false,
         disabledReason: "",
         pageTypes: Object.freeze([PAGE_TYPE.BLOGGER_PROFILE]),
