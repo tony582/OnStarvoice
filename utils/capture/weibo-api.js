@@ -75,6 +75,65 @@ function extractTopics(text) {
   return Array.from(new Set(tags));
 }
 
+// "1,234" / "25.7万" → number
+function parseCounterNum(s) {
+  const t = String(s == null ? "" : s).replace(/[,，\s]/g, "");
+  const m = t.match(/([\d.]+)\s*(亿|万|w|k)?/i);
+  if (!m) return 0;
+  let n = parseFloat(m[1]) || 0;
+  const unit = (m[2] || "").toLowerCase();
+  if (unit === "亿") n *= 1e8;
+  else if (unit === "万" || unit === "w") n *= 1e4;
+  else if (unit === "k") n *= 1e3;
+  return Math.round(n);
+}
+
+// 账号属性:对齐后台标签 personal/professional/enterprise
+function accountTypeFromUser(user) {
+  if (!user || !user.verified) return "personal";
+  // verified_type 0 = 个人认证(黄V/金V);>0 多为机构蓝V
+  return Number(user.verified_type) > 0 ? "enterprise" : "professional";
+}
+
+// post 的 user 对象不带粉丝数/获赞,只有 profile/info 有 → 按 uid 缓存补拉
+const weiboProfileMetricsCache = new Map();
+export async function fetchWeiboProfileMetrics(uid) {
+  if (!uid) return null;
+  if (weiboProfileMetricsCache.has(uid)) return weiboProfileMetricsCache.get(uid);
+  let metrics = null;
+  try {
+    const info = await jsonFetch(`/ajax/profile/info?uid=${uid}`);
+    const u = info?.data?.user || {};
+    const counter = u.status_total_counter || {};
+    metrics = {
+      followersCount: Number(u.followers_count || 0),
+      followingCount: Number(u.friends_count || 0),
+      statusesCount: Number(u.statuses_count || 0),
+      likedCollected: parseCounterNum(counter.like_cnt), // 获赞总数(最接近"点赞与收藏")
+      accountType: accountTypeFromUser(u),
+      bloggerName: u.screen_name || "",
+      avatarUrl: u.avatar_hd || u.avatar_large || u.profile_image_url || "",
+      verified: !!u.verified,
+    };
+  } catch {
+    metrics = null;
+  }
+  weiboProfileMetricsCache.set(uid, metrics);
+  return metrics;
+}
+
+function applyMetricsToPost(post, m) {
+  if (!post || !m) return post;
+  post.authorFans = m.followersCount || post.authorFans || 0;
+  post.bloggerFollowersCount = m.followersCount || 0;
+  post.authorFollowing = m.followingCount || post.authorFollowing || 0;
+  post.bloggerLikedCollected = m.likedCollected || 0;
+  post.bloggerLikedAndCollectedCount = m.likedCollected || 0;
+  post.likedAndCollectedCount = m.likedCollected || 0;
+  if (m.accountType) post.bloggerAccountType = m.accountType;
+  return post;
+}
+
 function imageUrlsFromApiPost(p) {
   const urls = [];
   const infos = p?.pic_infos || {};
@@ -159,12 +218,15 @@ export function normalizeWeiboApiPost(p, ctx = {}) {
     authorName,
     authorAvatar: avatar,
     avatarUrl: avatar,
-    authorFans: Number(user.followers_count || ctx.followersCount || 0),
-    authorFollowing: Number(user.friends_count || 0),
-    bloggerLikedCollected: 0,
+    authorFans: Number(ctx.followersCount || user.followers_count || 0),
+    bloggerFollowersCount: Number(ctx.followersCount || user.followers_count || 0),
+    authorFollowing: Number(ctx.followingCount || user.friends_count || 0),
+    bloggerLikedCollected: Number(ctx.likedCollected || 0),
+    bloggerLikedAndCollectedCount: Number(ctx.likedCollected || 0),
+    likedAndCollectedCount: Number(ctx.likedCollected || 0),
     bloggerProfileUrl: uid ? `https://weibo.com/u/${uid}` : "",
     authorUrl: uid ? `https://weibo.com/u/${uid}` : "",
-    bloggerAccountType: user.verified ? "verified" : "personal",
+    bloggerAccountType: ctx.accountType || accountTypeFromUser(user),
     source: stripHtml(p.source) || "",
     region,
     publishLocation: region,
@@ -179,6 +241,8 @@ export async function fetchWeiboUserProfile(uid) {
   try {
     const info = await jsonFetch(`/ajax/profile/info?uid=${uid}`);
     const u = info?.data?.user || {};
+    const counter = u.status_total_counter || {};
+    const likedCollected = parseCounterNum(counter.like_cnt); // 获赞总数
     result.bloggerName = u.screen_name || "";
     result.avatarUrl = u.avatar_hd || u.avatar_large || u.profile_image_url || "";
     result.description = u.description || "";
@@ -186,9 +250,11 @@ export async function fetchWeiboUserProfile(uid) {
     result.followersCount = Number(u.followers_count || 0);
     result.bloggerFollowersCount = Number(u.followers_count || 0);
     result.statusesCount = Number(u.statuses_count || 0);
-    result.likedAndCollectedCount = 0;
+    result.likedAndCollectedCount = likedCollected;
+    result.bloggerLikedAndCollectedCount = likedCollected;
+    result.bloggerLikedCollected = likedCollected;
     result.verified = !!u.verified;
-    result.bloggerAccountType = u.verified ? "verified" : "personal";
+    result.bloggerAccountType = accountTypeFromUser(u);
   } catch (e) {
     result.infoError = String(e?.message || e);
   }
@@ -214,10 +280,20 @@ export async function fetchWeiboUserPosts(uid, options = {}) {
     minLikes = 0,
     onProgress = null,
     authorName = "",
-    followersCount = 0,
   } = options;
   const posts = [];
   const seen = new Set();
+
+  // 一次性拉博主指标(粉丝/获赞/账号属性),下发给每条 post(post 自身不带粉丝数)
+  const metrics = await fetchWeiboProfileMetrics(uid);
+  const ctx = {
+    uid,
+    authorName: authorName || metrics?.bloggerName || "",
+    followersCount: metrics?.followersCount || options.followersCount || 0,
+    followingCount: metrics?.followingCount || 0,
+    likedCollected: metrics?.likedCollected || 0,
+    accountType: metrics?.accountType || "",
+  };
 
   for (let page = 1; page <= maxPages && posts.length < maxItems; page += 1) {
     let json;
@@ -231,7 +307,7 @@ export async function fetchWeiboUserPosts(uid, options = {}) {
     if (!list.length) break;
 
     list.forEach((p) => {
-      const norm = normalizeWeiboApiPost(p, { uid, authorName, followersCount });
+      const norm = normalizeWeiboApiPost(p, ctx);
       if (!norm) return;
       const key = norm.noteId || norm.url;
       if (key && seen.has(key)) return;
@@ -265,7 +341,16 @@ export async function fetchWeiboStatusByUrl(url = window.location.href) {
   const p = json?.data && typeof json.data === "object" ? json.data : json;
   if (!p || (!p.text_raw && !p.text && !p.mblogid)) return null;
   const uid = String(p?.user?.idstr || p?.user?.id || extractWeiboUid(url) || "");
-  return normalizeWeiboApiPost(p, { uid });
+  const post = normalizeWeiboApiPost(p, {
+    uid,
+    accountType: accountTypeFromUser(p?.user),
+  });
+  // post 的 user 不带粉丝数/获赞 → 按 uid 补拉 profile 指标(缓存)
+  if (post && uid) {
+    const metrics = await fetchWeiboProfileMetrics(uid);
+    if (metrics) applyMetricsToPost(post, metrics);
+  }
+  return post;
 }
 
 // ---- 评论采集(/ajax/statuses/buildComments)----
