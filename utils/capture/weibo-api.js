@@ -1,0 +1,267 @@
+/**
+ * 微博 weibo.com 接口采集（博主主页 / 单条详情）
+ *
+ * weibo.com 的博主页、单条详情是 React SPA(woo-panel / wbpro-feed-content 结构,
+ * 没有 s.weibo.com 的 .card-wrap[mid]),DOM 抓取既脆又抓不全。
+ * 这里改用微博自身的 AJAX 接口取结构化数据(需已登录,同源 fetch 自动带 cookie):
+ *   - 博主资料: /ajax/profile/info + /ajax/profile/detail
+ *   - 博主微博列表: /ajax/statuses/mymblog?uid=&page=
+ *   - 单条详情: /ajax/statuses/show?id=<mblogid>
+ *
+ * 返回的 post 结构对齐 weibo-keyword-search.js extractCardData 的字段。
+ */
+
+const REGION_PREFIX = /^(?:发布于|来自)\s*/;
+
+export function extractWeiboUid(url = window.location.href) {
+  const s = String(url || "");
+  let m = s.match(/weibo\.com\/u\/(\d{5,})/i);
+  if (m) return m[1];
+  m = s.match(/weibo\.com\/(\d{5,})(?:[/?#]|$)/i);
+  if (m) return m[1];
+  return "";
+}
+
+export function extractWeiboMblogid(url = window.location.href) {
+  const s = String(url || "");
+  let m = s.match(/weibo\.com\/\d{5,}\/([A-Za-z0-9]+)/);
+  if (m) return m[1];
+  m = s.match(/weibo\.com\/(?:detail|status)\/([A-Za-z0-9]+)/i);
+  if (m) return m[1];
+  return "";
+}
+
+function jsonFetch(url) {
+  return fetch(url, {
+    credentials: "include",
+    headers: {
+      accept: "application/json, text/plain, */*",
+      "x-requested-with": "XMLHttpRequest",
+    },
+  }).then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))));
+}
+
+function cleanRegion(regionName) {
+  if (!regionName) return "";
+  return String(regionName)
+    .replace(REGION_PREFIX, "")
+    .replace(/^IP属地[:：]\s*/u, "")
+    .trim();
+}
+
+function formatWeiboTime(created) {
+  if (!created) return "";
+  const d = new Date(created);
+  if (Number.isNaN(d.getTime())) return String(created);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function stripHtml(html) {
+  if (!html) return "";
+  const div = document.createElement("div");
+  div.innerHTML = String(html);
+  return (div.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function extractTopics(text) {
+  const tags = [];
+  String(text || "").replace(/#([^#\n]{1,30})#/g, (m, t) => {
+    tags.push(t.trim());
+    return m;
+  });
+  return Array.from(new Set(tags));
+}
+
+function imageUrlsFromApiPost(p) {
+  const urls = [];
+  const infos = p?.pic_infos || {};
+  const ids =
+    Array.isArray(p?.pic_ids) && p.pic_ids.length ? p.pic_ids : Object.keys(infos);
+  ids.forEach((id) => {
+    const info = infos[id];
+    const u =
+      info?.largest?.url ||
+      info?.large?.url ||
+      info?.original?.url ||
+      info?.mw2000?.url ||
+      info?.bmiddle?.url ||
+      info?.thumbnail?.url;
+    if (u) urls.push(u);
+  });
+  // 视频 / 文章 封面兜底
+  if (!urls.length && p?.page_info) {
+    const pic = p.page_info.page_pic;
+    const u =
+      (typeof pic === "string" ? pic : pic?.url || pic?.pic_big) ||
+      p.page_info.pic_url ||
+      p.page_info.pic_big;
+    if (u) urls.push(u);
+  }
+  return Array.from(
+    new Set(urls.filter(Boolean).map((u) => String(u).replace(/^http:\/\//i, "https://"))),
+  );
+}
+
+export function normalizeWeiboApiPost(p, ctx = {}) {
+  if (!p || typeof p !== "object") return null;
+  const user = p.user || {};
+  const uid = String(ctx.uid || user.idstr || user.id || "");
+  const mblogid = p.mblogid || p.bid || "";
+  const text = (p.text_raw || stripHtml(p.text) || "").trim();
+  const imageUrls = imageUrlsFromApiPost(p);
+  const isVideo = !!(
+    p.page_info && /video/i.test(p.page_info.type || p.page_info.object_type || "")
+  );
+  let url = "";
+  if (mblogid && uid) url = `https://weibo.com/${uid}/${mblogid}`;
+  else if (p.id || p.mid) url = `https://weibo.com/detail/${p.id || p.mid}`;
+  const region = cleanRegion(p.region_name);
+  const authorName = user.screen_name || ctx.authorName || "";
+  const avatar = user.avatar_hd || user.avatar_large || user.profile_image_url || "";
+  const title = text.slice(0, 30) || `微博 ${mblogid || ""}`.trim();
+  const noteType = isVideo ? "video" : imageUrls.length ? "image" : "text";
+
+  return {
+    platform: "weibo",
+    noteId: String(p.mid || p.id || mblogid || ""),
+    mblogid,
+    noteType,
+    type: noteType,
+    title,
+    noteTitle: title,
+    content: text,
+    noteContent: text,
+    fullContent: text,
+    body: text,
+    url,
+    noteUrl: url,
+    detailPageUrl: url,
+    coverUrl: imageUrls[0] || "",
+    coverImageUrl: imageUrls[0] || "",
+    imageUrls,
+    videoUrl: "",
+    videoUrls: [],
+    videoDuration: "",
+    publishTime: formatWeiboTime(p.created_at),
+    publishDate: formatWeiboTime(p.created_at),
+    publishDateRaw: p.created_at || "",
+    tags: extractTopics(text),
+    likes: Number(p.attitudes_count || 0),
+    comments: Number(p.comments_count || 0),
+    commentsCount: Number(p.comments_count || 0),
+    collects: 0,
+    shares: Number(p.reposts_count || 0),
+    authorId: uid,
+    author: authorName || "作者未知",
+    authorName,
+    authorAvatar: avatar,
+    avatarUrl: avatar,
+    authorFans: Number(user.followers_count || ctx.followersCount || 0),
+    authorFollowing: Number(user.friends_count || 0),
+    bloggerLikedCollected: 0,
+    bloggerProfileUrl: uid ? `https://weibo.com/u/${uid}` : "",
+    authorUrl: uid ? `https://weibo.com/u/${uid}` : "",
+    bloggerAccountType: user.verified ? "verified" : "personal",
+    source: stripHtml(p.source) || "",
+    region,
+    publishLocation: region,
+    isRetweet: !!p.retweeted_status,
+    mediaHint: imageUrls.length > 0,
+    captureTimestamp: Date.now(),
+  };
+}
+
+export async function fetchWeiboUserProfile(uid) {
+  const result = { bloggerId: uid, platform: "weibo" };
+  try {
+    const info = await jsonFetch(`/ajax/profile/info?uid=${uid}`);
+    const u = info?.data?.user || {};
+    result.bloggerName = u.screen_name || "";
+    result.avatarUrl = u.avatar_hd || u.avatar_large || u.profile_image_url || "";
+    result.description = u.description || "";
+    result.followingCount = Number(u.friends_count || 0);
+    result.followersCount = Number(u.followers_count || 0);
+    result.bloggerFollowersCount = Number(u.followers_count || 0);
+    result.statusesCount = Number(u.statuses_count || 0);
+    result.likedAndCollectedCount = 0;
+    result.verified = !!u.verified;
+    result.bloggerAccountType = u.verified ? "verified" : "personal";
+  } catch (e) {
+    result.infoError = String(e?.message || e);
+  }
+  try {
+    const detail = await jsonFetch(`/ajax/profile/detail?uid=${uid}`);
+    const d = detail?.data || {};
+    result.ipLocation = cleanRegion(d.ip_location);
+    if (!result.description && d.description) result.description = d.description;
+  } catch (e) {
+    result.detailError = String(e?.message || e);
+  }
+  result.bloggerId = uid;
+  result.bloggerUrl = `https://weibo.com/u/${uid}`;
+  result.bloggerProfileUrl = `https://weibo.com/u/${uid}`;
+  result.captureTimestamp = Date.now();
+  return result;
+}
+
+export async function fetchWeiboUserPosts(uid, options = {}) {
+  const {
+    maxItems = 50,
+    maxPages = 12,
+    minLikes = 0,
+    onProgress = null,
+    authorName = "",
+    followersCount = 0,
+  } = options;
+  const posts = [];
+  const seen = new Set();
+
+  for (let page = 1; page <= maxPages && posts.length < maxItems; page += 1) {
+    let json;
+    try {
+      json = await jsonFetch(`/ajax/statuses/mymblog?uid=${uid}&page=${page}&feature=0`);
+    } catch (e) {
+      if (page === 1) throw e;
+      break;
+    }
+    const list = json?.data?.list || [];
+    if (!list.length) break;
+
+    list.forEach((p) => {
+      const norm = normalizeWeiboApiPost(p, { uid, authorName, followersCount });
+      if (!norm) return;
+      const key = norm.noteId || norm.url;
+      if (key && seen.has(key)) return;
+      if (key) seen.add(key);
+      if (Number(norm.likes || 0) < minLikes) return;
+      posts.push(norm);
+    });
+
+    if (onProgress) {
+      onProgress({
+        phase: "loading",
+        message: `已加载 ${posts.length} 条微博(第 ${page} 页)...`,
+        count: posts.length,
+      });
+    }
+    await new Promise((r) => setTimeout(r, 350)); // 轻微限速,降低风控概率
+  }
+
+  return posts.slice(0, maxItems);
+}
+
+export async function fetchWeiboStatusByUrl(url = window.location.href) {
+  const mblogid = extractWeiboMblogid(url);
+  if (!mblogid) return null;
+  let json;
+  try {
+    json = await jsonFetch(`/ajax/statuses/show?id=${mblogid}`);
+  } catch {
+    return null;
+  }
+  const p = json?.data && typeof json.data === "object" ? json.data : json;
+  if (!p || (!p.text_raw && !p.text && !p.mblogid)) return null;
+  const uid = String(p?.user?.idstr || p?.user?.id || extractWeiboUid(url) || "");
+  return normalizeWeiboApiPost(p, { uid });
+}

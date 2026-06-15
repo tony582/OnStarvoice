@@ -259,39 +259,36 @@ function collectImageUrlsFromElementAttributes(root, baseUrl) {
 }
 
 function collectWeiboImageUrls(cardWrap, pageUrl) {
+  // 只在「正文配图区」取图。微博卡片里头像、表情、引用链接卡都带 sinaimg 图片,
+  // 之前扫整卡 + innerHTML 会把它们污染进来(纯文字微博也被误判成有图)。
+  // 实测正文九宫格结构固定为 .media-piclist > ul.mN > li > img(src 为 thumb150/orj360 缩略图)。
   const mediaRoots = [
-    cardWrap.querySelector('[node-type="feed_list_media_prev"]'),
-    cardWrap.querySelector('[node-type="feed_list_media_disp"]'),
-    cardWrap.querySelector('.media'),
-    cardWrap.querySelector('.media-piclist'),
-    cardWrap,
-  ].filter(Boolean);
+    ...cardWrap.querySelectorAll('.media-piclist'),
+    ...cardWrap.querySelectorAll('[node-type="feed_list_media_prev"]'),
+    ...cardWrap.querySelectorAll('[node-type="feed_list_media_disp"]'),
+  ];
   const candidates = [];
 
   mediaRoots.forEach((root) => {
-    root
-      .querySelectorAll?.(
-        'img, [style*="background"], a[href], [action-data], [data-src], [data-original], [data-lazy-src], [data-url]',
-      )
-      .forEach((el) => {
-        if (el.tagName?.toLowerCase() === 'img') {
-          candidates.push(readImageUrlFromElement(el, pageUrl));
-        }
-        candidates.push(
-          normalizeWeiboImageUrl(el.getAttribute?.('href'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('src'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-src'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-original'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-lazy-src'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-url'), pageUrl),
-          normalizeWeiboImageUrl(readUrlFromCssImage(el.getAttribute?.('style')), pageUrl),
-          normalizeWeiboImageUrl(readUrlFromCssImage(el.style?.backgroundImage), pageUrl),
-        );
-      });
-    candidates.push(...collectImageUrlsFromElementAttributes(root, pageUrl));
+    root.querySelectorAll('img').forEach((el) => {
+      candidates.push(readImageUrlFromElement(el, pageUrl));
+    });
+    // 视频封面
+    root.querySelectorAll('video[poster]').forEach((el) => {
+      candidates.push(normalizeWeiboImageUrl(el.getAttribute('poster'), pageUrl));
+    });
+    // 背景图布局
+    root.querySelectorAll('[style*="background"]').forEach((el) => {
+      candidates.push(
+        normalizeWeiboImageUrl(readUrlFromCssImage(el.getAttribute('style')), pageUrl),
+        normalizeWeiboImageUrl(readUrlFromCssImage(el.style?.backgroundImage), pageUrl),
+      );
+    });
+    // 指向原图的链接
+    root.querySelectorAll('a[href]').forEach((el) => {
+      candidates.push(normalizeWeiboImageUrl(el.getAttribute('href'), pageUrl));
+    });
   });
-
-  candidates.push(...extractWeiboImageUrlsFromText(cardWrap.innerHTML || '', pageUrl));
 
   return Array.from(new Set(candidates.filter(Boolean)));
 }

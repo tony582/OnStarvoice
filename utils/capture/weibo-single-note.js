@@ -10,6 +10,7 @@ import {
   expandAllFullTexts,
   wait,
 } from "./weibo-keyword-search.js";
+import { fetchWeiboStatusByUrl } from "./weibo-api.js";
 
 // 从详情页 URL 提取微博 id/bid:
 //   m.weibo.cn/detail/4xxxxx  |  weibo.com/<uid>/<bid>  |  weibo.com/detail/<id>
@@ -51,6 +52,16 @@ export async function captureWeiboSingleNote(options = {}) {
   });
 
   try {
+    // ---- 主路径:AJAX 接口(weibo.com 详情页是 SPA,DOM 抓不到,接口最稳)----
+    try {
+      const apiPost = await fetchWeiboStatusByUrl(window.location.href);
+      if (apiPost && (apiPost.content || (apiPost.imageUrls && apiPost.imageUrls.length))) {
+        return { ok: true, platform: "weibo", type: SYNC_TYPE.SINGLE_NOTE, data: apiPost, meta: meta(), error: null };
+      }
+    } catch {
+      /* 落到 DOM 兜底 */
+    }
+
     expandAllFullTexts();
     await wait(400);
 

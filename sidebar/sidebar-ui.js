@@ -2793,6 +2793,13 @@ function resolveDetailCaptureStatusRow(record) {
     return null;
   }
 
+  // 不支持「逐条采集增强」的平台(如微博:正文/图片/互动数在列表里已完整,
+  // 关键词采集还内联用 API 补全过)不显示该徽章,避免误导成数据缺失。
+  const caps = getPlatformCapabilities(resolveRecordPlatform(record));
+  if (caps && caps.batchDetailCapture === false) {
+    return null;
+  }
+
   const payload = record?.payload || {};
   const status = String(payload.detailCaptureStatus || "not_started")
     .trim()
