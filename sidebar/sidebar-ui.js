@@ -39,6 +39,7 @@ const SYNC_HISTORY_FILTER_OPTIONS = Object.freeze([
   {value: "all", label: "全部平台", title: "查看全部平台的执行明细"},
   {value: "xiaohongshu", label: "小红书", title: "仅查看小红书执行明细"},
   {value: "douyin", label: "抖音", title: "仅查看抖音执行明细"},
+  {value: "weibo", label: "微博", title: "仅查看微博执行明细"},
 ]);
 const CAPTURE_TAB_IDS = new Set(["noteTab", "bloggerTab", "searchTab", "monitorTab"]);
 const syncHistoryErrorDetailCache = new Map();
@@ -1392,7 +1393,9 @@ document.addEventListener("DOMContentLoaded", () => {
       const isReady =
         authConfig?.status === AUTH_STATUS.VERIFIED &&
         runtime?.pageType === PAGE_TYPE.BLOGGER_PROFILE &&
-        (currentPlatform === "douyin" || currentPlatform === "xiaohongshu");
+        (currentPlatform === "douyin" ||
+          currentPlatform === "xiaohongshu" ||
+          currentPlatform === "weibo");
       btnMonitorAddCurrent.disabled = !isReady || exists;
       btnMonitorAddCurrent.classList.toggle("is-disabled", !isReady || exists);
       btnMonitorAddCurrent.textContent = exists ? "已在监控中" : "纳入监控";
@@ -1970,6 +1973,12 @@ function extractBloggerIdFromMonitorUrl(url) {
   if (xiaohongshuMatch?.[1]) {
     return xiaohongshuMatch[1];
   }
+  const weiboMatch =
+    normalized.match(/weibo\.com\/u\/(\d+)/i) ||
+    normalized.match(/weibo\.com\/(\d{5,})(?:[/?#]|$)/i);
+  if (weiboMatch?.[1]) {
+    return weiboMatch[1];
+  }
   const douyinMatch = normalized.match(/\/user\/([a-zA-Z0-9._-]+)/i);
   return douyinMatch?.[1] || "";
 }
@@ -1977,7 +1986,9 @@ function extractBloggerIdFromMonitorUrl(url) {
 function getMonitorRecordButtonState(record, recordPlatform) {
   if (
     record?.type !== "blogger_profile" ||
-    (recordPlatform !== "douyin" && recordPlatform !== "xiaohongshu")
+    (recordPlatform !== "douyin" &&
+      recordPlatform !== "xiaohongshu" &&
+      recordPlatform !== "weibo")
   ) {
     return null;
   }
@@ -1986,8 +1997,9 @@ function getMonitorRecordButtonState(record, recordPlatform) {
   const authConfig = window.getSidebarAuthState?.() || null;
   const monitorConfig = window.getSidebarMonitorState?.() || null;
   const platformBloggerId =
-    recordPlatform === "xiaohongshu"
-      ? extractBloggerIdFromMonitorUrl(payload.bloggerUrl || "")
+    recordPlatform === "xiaohongshu" || recordPlatform === "weibo"
+      ? extractBloggerIdFromMonitorUrl(payload.bloggerUrl || "") ||
+        String(payload.bloggerId || "").trim()
       : String(payload.bloggerId || "").trim();
 
   if (!platformBloggerId) {
