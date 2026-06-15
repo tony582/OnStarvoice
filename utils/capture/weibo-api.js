@@ -285,6 +285,7 @@ export function normalizeWeiboApiPost(p, ctx = {}) {
     likedAndCollectedCount: Number(ctx.likedCollected || 0),
     bloggerProfileUrl: uid ? `https://weibo.com/u/${uid}` : "",
     authorUrl: uid ? `https://weibo.com/u/${uid}` : "",
+    authorProfileUrl: uid ? `https://weibo.com/u/${uid}` : "",
     bloggerAccountType: ctx.accountType || accountTypeFromUser(user),
     source: stripHtml(p.source) || "",
     region,

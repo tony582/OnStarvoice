@@ -722,6 +722,7 @@ export function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
       bloggerLikedCollected: 0,
       bloggerProfileUrl,
       authorUrl: bloggerProfileUrl,
+      authorProfileUrl: bloggerProfileUrl, // 「找对标账号」按此字段定位候选博主主页
       bloggerAccountType: 'personal',
       source,
       region,
