@@ -977,10 +977,8 @@ document.addEventListener("DOMContentLoaded", () => {
       pagePlatform,
       pagePlatform,
       PAGE_TYPE.BLOGGER_PROFILE,
-      pagePlatform === "xiaohongshu"
-        ? "已就绪：当前是小红书账号主页，可一键纳入监控"
-        : "已就绪：当前是抖音账号主页，可一键纳入监控",
-      "请前往抖音或小红书账号主页后，再将当前账号纳入监控",
+      `已就绪：当前是${pagePlatformCopy.label || "该平台"}账号主页，可一键纳入监控`,
+      "请前往抖音、小红书或微博账号主页后，再将当前账号纳入监控",
     );
 
     const keywordFromUrl = extractKeywordFromUrl(
