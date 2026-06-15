@@ -33,6 +33,28 @@ export function extractWeiboMblogid(url = window.location.href) {
   return "";
 }
 
+// URL 解析不到 uid 时(/p/、/n/、自定义域名等),从博主页 DOM 取 owner uid。
+// 头部「粉丝/关注」链接 /u/page/follow/<uid> 最稳定,且一定是博主本人。
+export function extractWeiboUidFromDom() {
+  if (typeof document === "undefined") return "";
+  const followLink = document.querySelector('a[href*="/u/page/follow/"]');
+  if (followLink) {
+    const m = String(followLink.getAttribute("href") || "").match(
+      /\/u\/page\/follow\/(\d+)/,
+    );
+    if (m) return m[1];
+  }
+  const uidEl = document.querySelector("[uid],[data-uid]");
+  const attrUid = uidEl && (uidEl.getAttribute("uid") || uidEl.getAttribute("data-uid"));
+  if (attrUid && /^\d{5,}$/.test(attrUid)) return attrUid;
+  return "";
+}
+
+// 先 URL 后 DOM,尽最大努力拿到博主 uid
+export function resolveWeiboUid(url = window.location.href) {
+  return extractWeiboUid(url) || extractWeiboUidFromDom();
+}
+
 function jsonFetch(url) {
   return fetch(url, {
     credentials: "include",

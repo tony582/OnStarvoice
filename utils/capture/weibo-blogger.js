@@ -8,6 +8,7 @@
 import { SYNC_TYPE, PAGE_TYPE } from "../constants.js";
 import {
   extractWeiboUid,
+  resolveWeiboUid,
   fetchWeiboUserProfile,
   fetchWeiboUserPosts,
 } from "./weibo-api.js";
@@ -56,7 +57,7 @@ function scanMetric(bodyText, labels) {
 // 仅作兜底:接口拿不到时从 DOM 文本里尽力抠资料
 function extractBloggerProfileDataFromDom() {
   const bodyText = cleanText(document.body?.innerText || "");
-  const bloggerId = extractWeiboUid();
+  const bloggerId = resolveWeiboUid();
 
   const nameEl =
     document.querySelector('[class*="ProfileHeader_name"]') ||
@@ -103,7 +104,7 @@ function extractBloggerProfileDataFromDom() {
 }
 
 async function resolveBloggerProfile() {
-  const uid = extractWeiboUid();
+  const uid = resolveWeiboUid();
   if (uid) {
     try {
       const api = await fetchWeiboUserProfile(uid);
@@ -151,7 +152,7 @@ export async function captureWeiboBloggerNotes(options = {}) {
   });
 
   try {
-    const uid = extractWeiboUid();
+    const uid = resolveWeiboUid();
     const profile = await resolveBloggerProfile();
     const bloggerIpLocation = profile.ipLocation || "";
 
