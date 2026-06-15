@@ -414,7 +414,7 @@ async function fetchWeiboLongTextContent(mid) {
   return '';
 }
 
-async function fetchWeiboStatusDetails(mid, baseUrl = window.location.href) {
+export async function fetchWeiboStatusDetails(mid, baseUrl = window.location.href) {
   const normalizedMid = String(mid || '').trim();
   if (!normalizedMid) {
     return { content: '', imageUrls: [] };
@@ -458,7 +458,7 @@ async function fetchWeiboStatusDetails(mid, baseUrl = window.location.href) {
   };
 }
 
-async function hydrateWeiboStatusDetails(posts, { onProgress = null, limit = 20 } = {}) {
+export async function hydrateWeiboStatusDetails(posts, { onProgress = null, limit = 20 } = {}) {
   const candidates = posts
     .filter((post) => {
       return post && post.noteId;
@@ -525,7 +525,7 @@ async function hydrateWeiboStatusDetails(posts, { onProgress = null, limit = 20 
 /**
  * 找到所有微博卡片
  */
-function findAllCards(root = document) {
+export function findAllCards(root = document) {
   // 优先精确匹配
   let cards = root.querySelectorAll('.card-wrap[mid]');
   if (cards.length > 0) {
@@ -549,7 +549,7 @@ function findAllCards(root = document) {
 /**
  * 从单个 .card-wrap 元素提取微博数据
  */
-function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
+export function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
   try {
     const mid = cardWrap.getAttribute('mid') || '';
 
@@ -741,7 +741,7 @@ function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
 /**
  * 滚动页面加载更多内容
  */
-async function scrollToLoadMore(maxScrolls = 3, onProgress = null) {
+export async function scrollToLoadMore(maxScrolls = 3, onProgress = null) {
   let previousHeight = document.body.scrollHeight;
   for (let i = 0; i < maxScrolls; i++) {
     window.scrollTo(0, document.body.scrollHeight);
@@ -758,7 +758,7 @@ async function scrollToLoadMore(maxScrolls = 3, onProgress = null) {
 /**
  * 点击所有「展开全文」按钮
  */
-function expandAllFullTexts() {
+export function expandAllFullTexts() {
   const expandButtons = document.querySelectorAll('a[action-type="fl_unfold"]');
   let clicked = 0;
   expandButtons.forEach(btn => {
@@ -783,7 +783,7 @@ function normalizeNonNegativeInteger(value, fallback) {
   return rounded >= 0 ? rounded : fallback;
 }
 
-function wait(ms) {
+export function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -821,7 +821,7 @@ async function fetchPageDocument(pageUrl) {
   return new DOMParser().parseFromString(html, 'text/html');
 }
 
-function collectPostsFromRoot(root, pageUrl, pageIndex = 1) {
+export function collectPostsFromRoot(root, pageUrl, pageIndex = 1) {
   const cards = findAllCards(root);
   const posts = [];
   cards.forEach((card, idx) => {
@@ -834,7 +834,7 @@ function collectPostsFromRoot(root, pageUrl, pageIndex = 1) {
   };
 }
 
-function dedupePosts(posts = []) {
+export function dedupePosts(posts = []) {
   const seen = new Set();
   return posts.filter((post) => {
     const key = String(post.noteId || post.url || `${post.author}:${post.content}`).trim();
