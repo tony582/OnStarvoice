@@ -33,6 +33,7 @@ import analyticsRouter from './routes/analytics.js';
 import leadsRouter from './routes/leads.js';
 import keywordOpportunityRouter, { keywordAnalysisRouter, benchmarkDiscoveryRouter } from './routes/keyword-strategy.js';
 import contentRouter from './routes/content.js';
+import imageProxyRouter from './routes/image-proxy.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -118,6 +119,7 @@ app.use('/api/keyword-analysis', keywordAnalysisRouter);
 app.use('/api/keyword-opportunity', keywordOpportunityRouter);
 app.use('/api/benchmark-discovery', benchmarkDiscoveryRouter);
 app.use('/api/content', contentRouter);
+app.use('/api/img', imageProxyRouter);
 
 app.post('/api/admin/test-email', requireAdmin, async (req, res) => {
   try { return res.json(await sendTestEmail()); }
