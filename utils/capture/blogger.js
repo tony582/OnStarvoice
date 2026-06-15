@@ -560,6 +560,8 @@ function extractNoteCards(bloggerName = "", activeTab = null) {
   }
   const items = querySelectorAll(BLOGGER_PROFILE_SELECTORS.notesList.item, scope);
   const notes = [];
+  // 博主主页头部的「IP属地:广东」,下发给该博主每条笔记作为发布位置
+  const bloggerIpLocation = extractIpLocation("");
 
   items.forEach((item) => {
     try {
@@ -618,6 +620,7 @@ function extractNoteCards(bloggerName = "", activeTab = null) {
         likes,
         coverImageUrl,
         noteType: detectBloggerNoteType(item),
+        publishLocation: bloggerIpLocation,
       });
     } catch (error) {
       console.warn("[Capture] Failed to extract note card:", error);
