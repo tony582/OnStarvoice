@@ -11,3 +11,8 @@ server/node_modules/
 extension-build/
 extension-build.crx
 extension-build.pem
+
+# 扩展打包产物与签名私钥(勿提交)
+*.pem
+StarVoice.crx
+StarVoice-extension.zip
