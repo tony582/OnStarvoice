@@ -277,6 +277,8 @@ export async function fetchWeiboUserProfile(uid) {
     result.bloggerLikedCollected = likedCollected;
     result.verified = !!u.verified;
     result.bloggerAccountType = accountTypeFromUser(u);
+    // 博主卡只有该状态为 done 才展示粉丝/关注/获赞;接口已拿到,直接标记完成
+    result.bloggerMetricsCaptureStatus = "done";
   } catch (e) {
     result.infoError = String(e?.message || e);
   }
