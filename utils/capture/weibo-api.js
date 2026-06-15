@@ -55,14 +55,52 @@ export function resolveWeiboUid(url = window.location.href) {
   return extractWeiboUid(url) || extractWeiboUidFromDom();
 }
 
-function jsonFetch(url) {
-  return fetch(url, {
+// 内容脚本(isolated world)直连(回退用)
+async function directFetch(url) {
+  const r = await fetch(url, {
     credentials: "include",
     headers: {
       accept: "application/json, text/plain, */*",
       "x-requested-with": "XMLHttpRequest",
     },
-  }).then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))));
+  });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+// 经 main-world 桥执行(与页面自身请求一致;mymblog 等接口在 isolated 会失败)
+let __weiboFetchSeq = 0;
+function bridgeFetch(url, timeoutMs = 15000) {
+  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
+  return new Promise((resolve, reject) => {
+    const id = `wbf_${__weiboFetchSeq++}_${url.length}`;
+    let settled = false;
+    const onMessage = (event) => {
+      if (event.source !== window) return;
+      const d = event.data;
+      if (!d || d.__starvoiceWeiboFetchResult !== true || d.id !== id) return;
+      settled = true;
+      window.removeEventListener("message", onMessage);
+      clearTimeout(timer);
+      if (d.ok) resolve(d.json);
+      else reject(new Error(d.error || "bridge fetch failed"));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      window.removeEventListener("message", onMessage);
+      reject(new Error("bridge timeout"));
+    }, timeoutMs);
+    window.addEventListener("message", onMessage);
+    window.postMessage({ __starvoiceWeiboFetch: true, id, url }, "*");
+  });
+}
+
+async function jsonFetch(url) {
+  try {
+    return await bridgeFetch(url); // 优先 main world(可靠)
+  } catch {
+    return await directFetch(url); // 桥不可用时回退直连
+  }
 }
 
 function cleanRegion(regionName) {
