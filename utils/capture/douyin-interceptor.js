@@ -101,9 +101,25 @@
       localStorage.setItem(CACHE_KEY_PREFIX + awemeId, serialized);
       wroteLocal = true;
     } catch (error) {
-      try {
-        console.warn('[StarVoice][DouyinInterceptor] localStorage write failed:', awemeId, error);
-      } catch (_) {}
+      // 写满(QuotaExceeded):清掉本前缀一半旧缓存后重试一次,自愈并止住刷屏
+      var quota = !!error && (error.name === 'QuotaExceededError' || error.code === 22 || error.code === 1014);
+      if (quota) {
+        try {
+          var ck = [];
+          for (var qi = 0; qi < localStorage.length; qi++) {
+            var k = localStorage.key(qi);
+            if (k && k.indexOf(CACHE_KEY_PREFIX) === 0) ck.push(k);
+          }
+          ck.slice(0, Math.ceil(ck.length / 2)).forEach(function (k) { try { localStorage.removeItem(k); } catch (_) {} });
+          localStorage.setItem(CACHE_KEY_PREFIX + awemeId, serialized);
+          wroteLocal = true;
+        } catch (_) {}
+      }
+      if (!wroteLocal) {
+        try {
+          console.warn('[StarVoice][DouyinInterceptor] localStorage write failed:', awemeId, error);
+        } catch (_) {}
+      }
     }
     if (wroteSession || wroteLocal) {
       pruneOldEntries();
