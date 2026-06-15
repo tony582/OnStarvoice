@@ -1217,12 +1217,33 @@ function proxyImg(url: string): string {
   return s
 }
 
+function thumb(url: string, alt: unknown) {
+  const proxied = proxyImg(url)
+  return (
+    <a
+      href={proxied}
+      target="_blank"
+      rel="noreferrer"
+      title="点击查看大图"
+      className="block transition hover:opacity-80"
+    >
+      <img
+        src={proxied}
+        alt={String(alt || '')}
+        className="h-11 w-11 cursor-zoom-in rounded-md border border-border object-cover"
+        loading="lazy"
+        referrerPolicy="no-referrer"
+      />
+    </a>
+  )
+}
+
 function imageCell(url: unknown, alt: unknown) {
   const src = String(url || '').trim()
   if (!src) {
     return <div className="flex h-11 w-11 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground"><ImageIcon className="h-4 w-4" /></div>
   }
-  return <img src={proxyImg(src)} alt={String(alt || '')} className="h-11 w-11 rounded-md border border-border object-cover" loading="lazy" referrerPolicy="no-referrer" />
+  return thumb(src, alt)
 }
 
 function imagesCell(urls: unknown, alt: unknown) {
@@ -1233,14 +1254,7 @@ function imagesCell(urls: unknown, alt: unknown) {
   return (
     <div className="flex gap-1">
       {list.slice(0, 3).map((url, index) => (
-        <img
-          key={`${url}-${index}`}
-          src={proxyImg(url)}
-          alt={String(alt || '')}
-          className="h-11 w-11 rounded-md border border-border object-cover"
-          loading="lazy"
-          referrerPolicy="no-referrer"
-        />
+        <div key={`${url}-${index}`}>{thumb(url, alt)}</div>
       ))}
     </div>
   )
