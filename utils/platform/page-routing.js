@@ -164,18 +164,24 @@ function detectWeiboPageType(parsedUrl) {
     return PAGE_TYPE.SEARCH_RESULTS;
   }
 
-  // User profile: /u/1234567 or /username
-  if (/^\/u\/\d+\/?$/i.test(pathname)) {
+  // 用户主页:/u/1234567、纯数字 /1234567、/p/100505xxxx、/n/昵称
+  // 新版微博博主页常见形态是 weibo.com/<纯数字uid>(无 /u/ 前缀)
+  if (
+    /^\/u\/\d+\/?$/i.test(pathname) ||
+    /^\/\d+\/?$/i.test(pathname) ||
+    /^\/p\/\d+\/?$/i.test(pathname) ||
+    /^\/n\/[^/]+\/?$/i.test(pathname)
+  ) {
     return PAGE_TYPE.BLOGGER_PROFILE;
   }
 
-  // Weibo detail: /username/postId (numeric path segment)
-  if (/^\/[a-z0-9]+\/[a-z0-9]+\/?$/i.test(pathname) && !pathname.includes("/search")) {
+  // 单条微博详情:/detail/4xxxxx、/status/xxxxx
+  if (/^\/(?:detail|status)\/\w+\/?$/i.test(pathname)) {
     return PAGE_TYPE.NOTE_DETAIL;
   }
 
-  // Short URL detail: /detail/4xxxxx
-  if (/^\/detail\/\d+\/?$/i.test(pathname)) {
+  // 单条微博详情:/uid/bid(两段路径)
+  if (/^\/[a-z0-9]+\/[a-z0-9]+\/?$/i.test(pathname) && !pathname.includes("/search")) {
     return PAGE_TYPE.NOTE_DETAIL;
   }
 

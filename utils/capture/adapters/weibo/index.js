@@ -3,6 +3,9 @@
  * Phase 1: 仅支持搜索页采集
  */
 import { captureWeiboKeywordNotes } from "../../weibo-keyword-search.js";
+import { captureWeiboSingleNote } from "../../weibo-single-note.js";
+import { captureWeiboBloggerProfile, captureWeiboBloggerNotes } from "../../weibo-blogger.js";
+import { captureWeiboComments } from "../../weibo-api.js";
 import { detectPageType } from "../../../platform/page-routing.js";
 import { SYNC_TYPE } from "../../../constants.js";
 
@@ -49,24 +52,24 @@ export const weiboAdapter = {
     return detectPageType(url, "weibo");
   },
 
-  async captureSingleNote() {
-    return buildUnsupportedResult(
+  async captureSingleNote(options = {}) {
+    return normalizeCaptureResult(
+      await captureWeiboSingleNote(options),
       SYNC_TYPE.SINGLE_NOTE,
-      "微博详情页采集功能开发中，敬请期待",
     );
   },
 
-  async captureBloggerProfile() {
-    return buildUnsupportedResult(
+  async captureBloggerProfile(options = {}) {
+    return normalizeCaptureResult(
+      await captureWeiboBloggerProfile(options),
       SYNC_TYPE.BLOGGER_PROFILE,
-      "微博用户页采集功能开发中，敬请期待",
     );
   },
 
   async captureBloggerNotes(options = {}) {
-    return buildUnsupportedResult(
+    return normalizeCaptureResult(
+      await captureWeiboBloggerNotes(options),
       SYNC_TYPE.BLOGGER_NOTES,
-      "微博用户微博列表采集功能开发中，敬请期待",
     );
   },
 
@@ -78,9 +81,9 @@ export const weiboAdapter = {
   },
 
   async captureComments(options = {}) {
-    return buildUnsupportedResult(
+    return normalizeCaptureResult(
+      await captureWeiboComments(options),
       SYNC_TYPE.COMMENTS,
-      "微博评论采集功能开发中，敬请期待",
     );
   },
 

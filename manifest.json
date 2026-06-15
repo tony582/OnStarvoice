@@ -53,6 +53,18 @@
     },
     {
       "matches": [
+        "*://weibo.com/*",
+        "*://www.weibo.com/*",
+        "*://s.weibo.com/*"
+      ],
+      "js": [
+        "utils/capture/weibo-net-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
         "*://www.xiaohongshu.com/*",
         "*://www.douyin.com/*",
         "*://v.douyin.com/*",

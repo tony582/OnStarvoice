@@ -4823,6 +4823,10 @@ function buildFallbackDetailNoteUrl(record) {
   if (platform === 'douyin') {
     return `https://www.douyin.com/${resolveRecordDetailNotePath(record)}/${noteId}`;
   }
+  if (platform === 'weibo') {
+    // 数字 mid 直接走 /detail/<mid>(show/buildComments 都吃数字 mid)
+    return `https://weibo.com/detail/${noteId}`;
+  }
 
   return `https://www.xiaohongshu.com/explore/${noteId}`;
 }
@@ -4926,7 +4930,9 @@ function isSupportedCaptureHostname(hostname) {
     normalized === 'xiaohongshu.com' ||
     normalized.endsWith('.xiaohongshu.com') ||
     normalized === 'douyin.com' ||
-    normalized.endsWith('.douyin.com')
+    normalized.endsWith('.douyin.com') ||
+    normalized === 'weibo.com' ||
+    normalized.endsWith('.weibo.com')
   );
 }
 

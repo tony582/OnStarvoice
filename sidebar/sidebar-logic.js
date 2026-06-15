@@ -8862,6 +8862,15 @@ function extractPlatformMonitorBloggerId(platform, url, fallbackId = "") {
     }
   }
 
+  if (normalizedPlatform === "weibo" && normalizedUrl) {
+    const weiboMatch =
+      normalizedUrl.match(/weibo\.com\/u\/(\d+)/i) ||
+      normalizedUrl.match(/weibo\.com\/(\d{5,})(?:[/?#]|$)/i);
+    if (weiboMatch?.[1]) {
+      return weiboMatch[1];
+    }
+  }
+
   return String(fallbackId || "").trim();
 }
 
@@ -8871,7 +8880,11 @@ function buildMonitorCandidateFromRecord(record) {
   }
 
   const platform = resolveRecordPlatform(record);
-  if (platform !== "douyin" && platform !== "xiaohongshu") {
+  if (
+    platform !== "douyin" &&
+    platform !== "xiaohongshu" &&
+    platform !== "weibo"
+  ) {
     return null;
   }
 
@@ -8922,10 +8935,12 @@ async function captureCurrentMonitorCandidate() {
   const pagePlatform = detectPlatformFromUrl(pageUrl);
 
   if (
-    (pagePlatform !== "douyin" && pagePlatform !== "xiaohongshu") ||
+    (pagePlatform !== "douyin" &&
+      pagePlatform !== "xiaohongshu" &&
+      pagePlatform !== "weibo") ||
     runtime?.pageType !== PAGE_TYPE.BLOGGER_PROFILE
   ) {
-    throw new Error("请先切换到抖音或小红书账号主页");
+    throw new Error("请先切换到抖音、小红书或微博账号主页");
   }
 
   const [tab] = await chrome.tabs.query({
@@ -9080,7 +9095,9 @@ function normalizeMonitorRunnerPlatform(value = "") {
   const normalized = String(value || "")
     .trim()
     .toLowerCase();
-  return normalized === "douyin" || normalized === "xiaohongshu"
+  return normalized === "douyin" ||
+    normalized === "xiaohongshu" ||
+    normalized === "weibo"
     ? normalized
     : "unknown";
 }
@@ -10040,12 +10057,16 @@ async function handleRunMonitorNow() {
       .trim()
       .toLowerCase();
     const currentPlatform =
-      pagePlatform === "douyin" || pagePlatform === "xiaohongshu"
+      pagePlatform === "douyin" ||
+      pagePlatform === "xiaohongshu" ||
+      pagePlatform === "weibo"
         ? pagePlatform
         : filterPlatform;
     const result = await runMonitorNow({
       platform:
-        currentPlatform === "douyin" || currentPlatform === "xiaohongshu"
+        currentPlatform === "douyin" ||
+        currentPlatform === "xiaohongshu" ||
+        currentPlatform === "weibo"
           ? currentPlatform
           : "",
     });
@@ -10115,7 +10136,8 @@ async function handleRunMonitorNow() {
         debugUrl,
         platform:
           normalizedPlatform === "douyin" ||
-          normalizedPlatform === "xiaohongshu"
+          normalizedPlatform === "xiaohongshu" ||
+          normalizedPlatform === "weibo"
             ? normalizedPlatform
             : "unknown",
         monitorBloggerName: String(
@@ -10215,7 +10237,9 @@ async function handleRunMonitorNow() {
     );
     const historyPlatform =
       platforms.length === 1 &&
-      (platforms[0] === "douyin" || platforms[0] === "xiaohongshu")
+      (platforms[0] === "douyin" ||
+        platforms[0] === "xiaohongshu" ||
+        platforms[0] === "weibo")
         ? platforms[0]
         : "unknown";
 

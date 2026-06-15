@@ -1201,12 +1201,49 @@ function linkListCell(urls: unknown, label: string) {
   )
 }
 
+// 小红书/微博/抖音 图片 CDN 有 Referer 防盗链,直接 <img> 引用会 403。
+// 经 /api/img 后端代理(带对应 Referer)取图。
+const PROXY_IMG_HOSTS = /(?:\.sinaimg\.(?:cn|com)|\.weiboimg\.(?:cn|com)|\.xhscdn\.com|\.xiaohongshu\.com|\.douyinpic\.com|\.douyinstatic\.com|\.pstatp\.com|\.byteimg\.com|\.bytecdn\.cn|\.bdxiguaimg\.com)$/i
+function proxyImg(url: string): string {
+  const s = String(url || '').trim()
+  if (!s) return s
+  try {
+    const u = new URL(s, window.location.origin)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return s
+    if (PROXY_IMG_HOSTS.test(u.hostname)) return `/api/img?url=${encodeURIComponent(u.toString())}`
+  } catch {
+    /* 非法 URL,原样返回 */
+  }
+  return s
+}
+
+function thumb(url: string, alt: unknown) {
+  const proxied = proxyImg(url)
+  return (
+    <a
+      href={proxied}
+      target="_blank"
+      rel="noreferrer"
+      title="点击查看大图"
+      className="block transition hover:opacity-80"
+    >
+      <img
+        src={proxied}
+        alt={String(alt || '')}
+        className="h-11 w-11 cursor-zoom-in rounded-md border border-border object-cover"
+        loading="lazy"
+        referrerPolicy="no-referrer"
+      />
+    </a>
+  )
+}
+
 function imageCell(url: unknown, alt: unknown) {
   const src = String(url || '').trim()
   if (!src) {
     return <div className="flex h-11 w-11 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground"><ImageIcon className="h-4 w-4" /></div>
   }
-  return <img src={src} alt={String(alt || '')} className="h-11 w-11 rounded-md border border-border object-cover" loading="lazy" />
+  return thumb(src, alt)
 }
 
 function imagesCell(urls: unknown, alt: unknown) {
@@ -1217,13 +1254,7 @@ function imagesCell(urls: unknown, alt: unknown) {
   return (
     <div className="flex gap-1">
       {list.slice(0, 3).map((url, index) => (
-        <img
-          key={`${url}-${index}`}
-          src={url}
-          alt={String(alt || '')}
-          className="h-11 w-11 rounded-md border border-border object-cover"
-          loading="lazy"
-        />
+        <div key={`${url}-${index}`}>{thumb(url, alt)}</div>
       ))}
     </div>
   )

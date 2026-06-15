@@ -259,39 +259,36 @@ function collectImageUrlsFromElementAttributes(root, baseUrl) {
 }
 
 function collectWeiboImageUrls(cardWrap, pageUrl) {
+  // 只在「正文配图区」取图。微博卡片里头像、表情、引用链接卡都带 sinaimg 图片,
+  // 之前扫整卡 + innerHTML 会把它们污染进来(纯文字微博也被误判成有图)。
+  // 实测正文九宫格结构固定为 .media-piclist > ul.mN > li > img(src 为 thumb150/orj360 缩略图)。
   const mediaRoots = [
-    cardWrap.querySelector('[node-type="feed_list_media_prev"]'),
-    cardWrap.querySelector('[node-type="feed_list_media_disp"]'),
-    cardWrap.querySelector('.media'),
-    cardWrap.querySelector('.media-piclist'),
-    cardWrap,
-  ].filter(Boolean);
+    ...cardWrap.querySelectorAll('.media-piclist'),
+    ...cardWrap.querySelectorAll('[node-type="feed_list_media_prev"]'),
+    ...cardWrap.querySelectorAll('[node-type="feed_list_media_disp"]'),
+  ];
   const candidates = [];
 
   mediaRoots.forEach((root) => {
-    root
-      .querySelectorAll?.(
-        'img, [style*="background"], a[href], [action-data], [data-src], [data-original], [data-lazy-src], [data-url]',
-      )
-      .forEach((el) => {
-        if (el.tagName?.toLowerCase() === 'img') {
-          candidates.push(readImageUrlFromElement(el, pageUrl));
-        }
-        candidates.push(
-          normalizeWeiboImageUrl(el.getAttribute?.('href'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('src'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-src'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-original'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-lazy-src'), pageUrl),
-          normalizeWeiboImageUrl(el.getAttribute?.('data-url'), pageUrl),
-          normalizeWeiboImageUrl(readUrlFromCssImage(el.getAttribute?.('style')), pageUrl),
-          normalizeWeiboImageUrl(readUrlFromCssImage(el.style?.backgroundImage), pageUrl),
-        );
-      });
-    candidates.push(...collectImageUrlsFromElementAttributes(root, pageUrl));
+    root.querySelectorAll('img').forEach((el) => {
+      candidates.push(readImageUrlFromElement(el, pageUrl));
+    });
+    // 视频封面
+    root.querySelectorAll('video[poster]').forEach((el) => {
+      candidates.push(normalizeWeiboImageUrl(el.getAttribute('poster'), pageUrl));
+    });
+    // 背景图布局
+    root.querySelectorAll('[style*="background"]').forEach((el) => {
+      candidates.push(
+        normalizeWeiboImageUrl(readUrlFromCssImage(el.getAttribute('style')), pageUrl),
+        normalizeWeiboImageUrl(readUrlFromCssImage(el.style?.backgroundImage), pageUrl),
+      );
+    });
+    // 指向原图的链接
+    root.querySelectorAll('a[href]').forEach((el) => {
+      candidates.push(normalizeWeiboImageUrl(el.getAttribute('href'), pageUrl));
+    });
   });
-
-  candidates.push(...extractWeiboImageUrlsFromText(cardWrap.innerHTML || '', pageUrl));
 
   return Array.from(new Set(candidates.filter(Boolean)));
 }
@@ -414,7 +411,7 @@ async function fetchWeiboLongTextContent(mid) {
   return '';
 }
 
-async function fetchWeiboStatusDetails(mid, baseUrl = window.location.href) {
+export async function fetchWeiboStatusDetails(mid, baseUrl = window.location.href) {
   const normalizedMid = String(mid || '').trim();
   if (!normalizedMid) {
     return { content: '', imageUrls: [] };
@@ -458,7 +455,7 @@ async function fetchWeiboStatusDetails(mid, baseUrl = window.location.href) {
   };
 }
 
-async function hydrateWeiboStatusDetails(posts, { onProgress = null, limit = 20 } = {}) {
+export async function hydrateWeiboStatusDetails(posts, { onProgress = null, limit = 20 } = {}) {
   const candidates = posts
     .filter((post) => {
       return post && post.noteId;
@@ -525,7 +522,7 @@ async function hydrateWeiboStatusDetails(posts, { onProgress = null, limit = 20 
 /**
  * 找到所有微博卡片
  */
-function findAllCards(root = document) {
+export function findAllCards(root = document) {
   // 优先精确匹配
   let cards = root.querySelectorAll('.card-wrap[mid]');
   if (cards.length > 0) {
@@ -549,7 +546,7 @@ function findAllCards(root = document) {
 /**
  * 从单个 .card-wrap 元素提取微博数据
  */
-function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
+export function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
   try {
     const mid = cardWrap.getAttribute('mid') || '';
 
@@ -725,6 +722,7 @@ function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
       bloggerLikedCollected: 0,
       bloggerProfileUrl,
       authorUrl: bloggerProfileUrl,
+      authorProfileUrl: bloggerProfileUrl, // 「找对标账号」按此字段定位候选博主主页
       bloggerAccountType: 'personal',
       source,
       region,
@@ -741,7 +739,7 @@ function extractCardData(cardWrap, idx, pageUrl = window.location.href) {
 /**
  * 滚动页面加载更多内容
  */
-async function scrollToLoadMore(maxScrolls = 3, onProgress = null) {
+export async function scrollToLoadMore(maxScrolls = 3, onProgress = null) {
   let previousHeight = document.body.scrollHeight;
   for (let i = 0; i < maxScrolls; i++) {
     window.scrollTo(0, document.body.scrollHeight);
@@ -758,7 +756,7 @@ async function scrollToLoadMore(maxScrolls = 3, onProgress = null) {
 /**
  * 点击所有「展开全文」按钮
  */
-function expandAllFullTexts() {
+export function expandAllFullTexts() {
   const expandButtons = document.querySelectorAll('a[action-type="fl_unfold"]');
   let clicked = 0;
   expandButtons.forEach(btn => {
@@ -783,7 +781,7 @@ function normalizeNonNegativeInteger(value, fallback) {
   return rounded >= 0 ? rounded : fallback;
 }
 
-function wait(ms) {
+export function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -821,7 +819,7 @@ async function fetchPageDocument(pageUrl) {
   return new DOMParser().parseFromString(html, 'text/html');
 }
 
-function collectPostsFromRoot(root, pageUrl, pageIndex = 1) {
+export function collectPostsFromRoot(root, pageUrl, pageIndex = 1) {
   const cards = findAllCards(root);
   const posts = [];
   cards.forEach((card, idx) => {
@@ -834,7 +832,7 @@ function collectPostsFromRoot(root, pageUrl, pageIndex = 1) {
   };
 }
 
-function dedupePosts(posts = []) {
+export function dedupePosts(posts = []) {
   const seen = new Set();
   return posts.filter((post) => {
     const key = String(post.noteId || post.url || `${post.author}:${post.content}`).trim();
