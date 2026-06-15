@@ -162,6 +162,8 @@ export async function captureWeiboBloggerNotes(options = {}) {
 
     // ---- 主路径:AJAX 接口 ----
     let posts = [];
+    let __dbgApiCount = 0;
+    let __dbgApiError = "";
     if (uid) {
       try {
         posts = await fetchWeiboUserPosts(uid, {
@@ -171,10 +173,13 @@ export async function captureWeiboBloggerNotes(options = {}) {
           authorName: profile.bloggerName,
           followersCount: profile.followersCount || 0,
         });
+        __dbgApiCount = posts.length;
       } catch (e) {
+        __dbgApiError = String(e?.message || e);
         if (onProgress) onProgress({ phase: "fallback", message: "接口受限,改用页面抓取..." });
       }
     }
+    const __dbgUsedDom = !posts.length;
 
     // ---- 兜底:DOM 抓取 ----
     if (!posts.length) {
@@ -189,6 +194,25 @@ export async function captureWeiboBloggerNotes(options = {}) {
         .filter((p) => Number(p.likes || 0) >= minLikes)
         .slice(0, maxDetectedItems);
     }
+
+    // [调试] 写入 localStorage,导航也冲不掉,便于排查
+    try {
+      window.localStorage.setItem(
+        "__sv_notes_debug",
+        JSON.stringify({
+          uid,
+          bloggerName: profile.bloggerName,
+          apiCount: __dbgApiCount,
+          apiError: __dbgApiError,
+          usedDomFallback: __dbgUsedDom,
+          finalPosts: posts.length,
+          ts: Date.now(),
+        }),
+      );
+      console.log(
+        `[StarVoice笔记] uid=${uid} 接口=${__dbgApiCount} DOM兜底=${__dbgUsedDom} 最终=${posts.length} ${__dbgApiError ? "错误:" + __dbgApiError : ""}`,
+      );
+    } catch {}
 
     // 统一补齐博主信息 + IP属地(单条没带属地时用博主属地兜底)
     posts.forEach((p) => {
