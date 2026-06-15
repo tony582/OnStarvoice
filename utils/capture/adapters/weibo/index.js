@@ -5,6 +5,7 @@
 import { captureWeiboKeywordNotes } from "../../weibo-keyword-search.js";
 import { captureWeiboSingleNote } from "../../weibo-single-note.js";
 import { captureWeiboBloggerProfile, captureWeiboBloggerNotes } from "../../weibo-blogger.js";
+import { captureWeiboComments } from "../../weibo-api.js";
 import { detectPageType } from "../../../platform/page-routing.js";
 import { SYNC_TYPE } from "../../../constants.js";
 
@@ -80,9 +81,9 @@ export const weiboAdapter = {
   },
 
   async captureComments(options = {}) {
-    return buildUnsupportedResult(
+    return normalizeCaptureResult(
+      await captureWeiboComments(options),
       SYNC_TYPE.COMMENTS,
-      "微博评论采集功能开发中，敬请期待",
     );
   },
 

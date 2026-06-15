@@ -314,10 +314,10 @@ export const PLATFORM_REGISTRY = Object.freeze({
     ]),
     capabilities: Object.freeze({
       captureNote: true,
-      captureComments: false,
+      captureComments: true,
       captureBlogger: true,
       captureSearch: true,
-      batchDetailCapture: false,
+      batchDetailCapture: true,
       bloggerMetrics: true,
     }),
     ui: Object.freeze({

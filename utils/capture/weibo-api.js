@@ -11,6 +11,8 @@
  * 返回的 post 结构对齐 weibo-keyword-search.js extractCardData 的字段。
  */
 
+import { SYNC_TYPE, PAGE_TYPE } from "../constants.js";
+
 const REGION_PREFIX = /^(?:发布于|来自)\s*/;
 
 export function extractWeiboUid(url = window.location.href) {
@@ -264,4 +266,150 @@ export async function fetchWeiboStatusByUrl(url = window.location.href) {
   if (!p || (!p.text_raw && !p.text && !p.mblogid)) return null;
   const uid = String(p?.user?.idstr || p?.user?.id || extractWeiboUid(url) || "");
   return normalizeWeiboApiPost(p, { uid });
+}
+
+// ---- 评论采集(/ajax/statuses/buildComments)----
+
+function normalizeWeiboComment(c) {
+  const user = c.user || {};
+  const content = stripHtml(c.text || c.text_raw || "").trim();
+  const region = String(c.source || "").replace(/^来自\s*/u, "").trim();
+  const userId = String(user.idstr || user.id || "");
+  return {
+    commentId: String(c.idstr || c.id || c.rootidstr || ""),
+    content,
+    userName: user.screen_name || "",
+    userId,
+    userUrl: userId ? `https://weibo.com/u/${userId}` : "",
+    ipLocation: region,
+    likes: Number(c.like_counts ?? c.like_count ?? 0),
+  };
+}
+
+// 翻页拉评论。需要数字 mid(非 mblogid);buildComments 用 max_id 游标翻页。
+export async function fetchWeiboComments(mid, uid, options = {}) {
+  const { maxItems = 50, onProgress = null, shouldStop = null } = options;
+  const items = [];
+  const seen = new Set();
+  let maxId = 0;
+
+  for (let guard = 0; guard < 50 && items.length < maxItems; guard += 1) {
+    if (typeof shouldStop === "function" && shouldStop()) break;
+    const params = new URLSearchParams({
+      is_reload: "1",
+      id: String(mid),
+      is_show_bulletin: "2",
+      is_mix: "0",
+      count: "20",
+      uid: String(uid || ""),
+      fetch_level: "0",
+      locale: "zh-CN",
+    });
+    if (maxId) {
+      params.set("max_id", String(maxId));
+      params.set("flow", "0");
+    }
+
+    let cj;
+    try {
+      cj = await jsonFetch(`/ajax/statuses/buildComments?${params.toString()}`);
+    } catch {
+      break;
+    }
+    const list = Array.isArray(cj?.data) ? cj.data : [];
+    if (!list.length) break;
+
+    list.forEach((c) => {
+      const n = normalizeWeiboComment(c);
+      if (!n.content) return;
+      const key = n.commentId || `${n.userId}|${n.content}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      items.push(n);
+    });
+
+    if (onProgress) onProgress({ phase: "comments_loading", count: items.length });
+
+    maxId = Number(cj.max_id || 0);
+    if (!maxId) break;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  return items.slice(0, maxItems);
+}
+
+export async function captureWeiboComments(options = {}) {
+  const {
+    maxDetectedItems = null,
+    maxItems = null,
+    onProgress = null,
+    shouldStop = null,
+  } = options;
+  const captureStartedAt = new Date().toISOString();
+  const meta = (extra = {}) => ({
+    pageType: PAGE_TYPE.NOTE_DETAIL,
+    captureStartedAt,
+    captureFinishedAt: new Date().toISOString(),
+    sourceUrl: window.location.href,
+    ...extra,
+  });
+  const fail = (code, message) => ({
+    ok: false,
+    type: SYNC_TYPE.COMMENTS,
+    data: null,
+    meta: meta(),
+    error: { code, message },
+  });
+
+  try {
+    const mblogid = extractWeiboMblogid(window.location.href);
+    if (!mblogid) {
+      return fail("LINK_MISSING", "未识别到微博 ID,请停在微博详情页");
+    }
+
+    // buildComments 需要数字 mid + uid,用 show 解析
+    let mid = "";
+    let uid = extractWeiboUid();
+    let noteTitle = "";
+    try {
+      const show = await jsonFetch(`/ajax/statuses/show?id=${mblogid}`);
+      const p = show?.data && typeof show.data === "object" ? show.data : show;
+      mid = String(p?.mid || p?.id || "");
+      uid = String(p?.user?.idstr || p?.user?.id || uid || "");
+      noteTitle = String(p?.text_raw || "").replace(/\s+/g, " ").trim().slice(0, 30);
+    } catch {
+      /* 下面统一报错 */
+    }
+    if (!mid) {
+      return fail("CAPTURE_FAILED", "无法解析微博数字 ID(可能未登录或被限流)");
+    }
+
+    const limit = Number(maxDetectedItems ?? maxItems ?? 50) || 50;
+    const items = await fetchWeiboComments(mid, uid, {
+      maxItems: limit,
+      onProgress,
+      shouldStop,
+    });
+    const stoppedByUser = typeof shouldStop === "function" && shouldStop();
+
+    return {
+      ok: true,
+      type: SYNC_TYPE.COMMENTS,
+      data: {
+        noteId: mid,
+        noteUrl: window.location.href,
+        noteTitle,
+        totalCount: items.length,
+        items,
+        captureTimestamp: Date.now(),
+        captureStatus: stoppedByUser ? "stopped" : "completed",
+        stoppedByUser,
+        stopReason: stoppedByUser ? "canceled" : "",
+      },
+      meta: meta({ captureStatus: stoppedByUser ? "stopped" : "completed", stoppedByUser }),
+      error: null,
+    };
+  } catch (error) {
+    return fail("CAPTURE_FAILED", error?.message || String(error));
+  }
 }
