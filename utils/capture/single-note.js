@@ -109,6 +109,7 @@ export async function captureSingleNote() {
       publishTime: publishDateRaw,
       publishDateRaw,
       lastEditedAt,
+      publishLocation: extractPublishLocation(noteContext),
       noteType,
       coverImageUrl: media.coverImage,
       imageUrls: media.images,
@@ -986,6 +987,36 @@ function extractPublishDateRaw(noteContext = document) {
     noteContext,
   );
   return dateElement ? cleanText(dateElement.textContent) : "";
+}
+
+const CN_REGIONS = [
+  "北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林", "黑龙江",
+  "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南",
+  "广东", "海南", "四川", "贵州", "云南", "陕西", "甘肃", "青海", "台湾",
+  "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
+];
+
+// 小红书 IP 属地常贴在发布日期同一元素尾部,如「编辑于 01-01 山东」。
+// 用省级地区白名单兜底,避免把日期/其它文字误当属地。
+function extractPublishLocation(noteContext = document) {
+  try {
+    const dateElement = querySelector(NOTE_DETAIL_SELECTORS.publishDate, noteContext);
+    const text = dateElement ? cleanText(dateElement.textContent) : "";
+    if (!text) return "";
+    const tokens = text.split(/\s+/).filter(Boolean);
+    const last = tokens[tokens.length - 1] || "";
+    if (CN_REGIONS.includes(last)) return last;
+    for (const region of CN_REGIONS) {
+      if (text.includes(region)) return region;
+    }
+    // 境外:小红书会显示国家名,宽松取末尾纯中文 2-6 字且非日期词
+    if (/^[一-龥]{2,6}$/.test(last) && !/(编辑|发布|今天|昨天|周|月|日|前|刚刚)/.test(last)) {
+      return last;
+    }
+    return "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function extractLastEditedAt(noteContext = document) {
