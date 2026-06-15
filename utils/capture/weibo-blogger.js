@@ -212,7 +212,14 @@ export async function captureWeiboBloggerNotes(options = {}) {
 
     return {
       ok: true, platform: "weibo", type: SYNC_TYPE.BLOGGER_NOTES, meta: meta(), error: null,
-      data: { ...profile, totalCount: posts.length, items: posts, notes: posts },
+      data: {
+        ...profile,
+        totalCount: posts.length,
+        rawTotalCount: posts.length, // 侧栏「滚动探测 N 条」读此字段
+        filteredCount: posts.length, // 侧栏「入池 N 条」读此字段
+        items: posts,
+        notes: posts,
+      },
     };
   } catch (error) {
     return {
