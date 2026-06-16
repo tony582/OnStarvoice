@@ -13,6 +13,7 @@ import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar }
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
+import { useTicketDispatch } from '@/components/shared/TicketDispatch'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
@@ -64,6 +65,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [batchBusy, setBatchBusy] = useState(false)
   const [drawer, setDrawer] = useState<any>(null)
   const { ask, dialog } = useNotePrompt()
+  const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
   const sel = useSelection(`${status}|${platform}|${leadType}|${priority}|${keyword}|${pagination?.page ?? 1}`)
 
@@ -102,6 +104,13 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     await api.patch('/leads/comments/' + id, { status: nextStatus, note })
     await reloadAfterMutation()
     return true
+  }
+
+  const dispatchTicket = async (lead: any) => {
+    const r = await dispatch({ summary: lead.comment_content, defaultPriority: lead.priority })
+    if (!r) return
+    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, priority: r.priority, assigneeName: r.assigneeName, note: r.note })
+    await reloadAfterMutation()
   }
 
   const runBatch = async (nextStatus: string) => {
@@ -205,6 +214,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                     <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatDate(lead.captured_at)}</td>
                     <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}>
                       <div className="flex justify-end gap-1">
+                        {!isSales && <Button size="sm" disabled={!canWrite()} onClick={() => dispatchTicket(lead)}>转工单</Button>}
                         <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
                         <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
                         <Button variant="ghost" size="sm" disabled={!canWrite() || lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
@@ -253,6 +263,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
         />
       )}
       {dialog}
+      {dispatchDialog}
     </div>
   )
 }

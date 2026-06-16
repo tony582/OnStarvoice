@@ -2,9 +2,10 @@ import { useNav } from '@/lib/navigation'
 import { TriageQueue } from '@/pages/workbench/TriageQueue'
 import { LeadsQueue } from '@/pages/workbench/LeadsQueue'
 import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
+import { TicketFeedbackQueue } from '@/pages/workbench/TicketFeedbackQueue'
 
-type QueueKey = 'triage' | 'leads' | 'salesleads' | 'issues'
-const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'salesleads', 'issues']
+type QueueKey = 'triage' | 'leads' | 'salesleads' | 'feedback' | 'issues'
+const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'salesleads', 'feedback', 'issues']
 
 /**
  * 舆情工作台:队列(内容分诊/评论线索/问题处置)已移到侧边栏二级导航,
@@ -21,6 +22,7 @@ export function WorkbenchPage() {
       {queue === 'triage' && <TriageQueue initial={initial} />}
       {queue === 'leads' && <LeadsQueue initial={initial} category="opinion" />}
       {queue === 'salesleads' && <LeadsQueue key="sales" initial={initial} category="sales" />}
+      {queue === 'feedback' && <TicketFeedbackQueue />}
       {queue === 'issues' && <IssuesQueue initial={initial} />}
     </div>
   )

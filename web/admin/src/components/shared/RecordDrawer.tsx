@@ -359,7 +359,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
             {onMarkResponded && <Button variant="outline" size="sm" onClick={onMarkResponded}><CheckCircle className="h-3.5 w-3.5" />标为已响应</Button>}
             {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('reviewing')}><Eye className="h-3.5 w-3.5" />待复核</Button>}
             {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('archived')}><Archive className="h-3.5 w-3.5" />归档</Button>}
-            <Button className="ml-auto" onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转为问题</Button>
+            <Button className="ml-auto" onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转工单</Button>
           </div>
         )}
       </div>

@@ -21,13 +21,14 @@ const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof B
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
   { queue: 'salesleads', label: '销售客资', dot: 'bg-emerald-500' },
+  { queue: 'feedback', label: '工单回执', badgeKey: 'ticketsFeedback', dot: 'bg-violet-500' },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
-    { id: 'opinion', label: '舆情处理', icon: ListChecks, badgeKeys: ['opinionPending'] },
-    { id: 'workbench', label: '舆情工作台', icon: Columns3, tag: '旧' },
+    { id: 'workbench', label: '舆情工作台', icon: Columns3 },
+    { id: 'opinion', label: '舆情处理', icon: ListChecks, badgeKeys: ['ticketsPending'] },
     { id: 'monitoring', label: '关注博主', icon: Radar, badgeKeys: ['monitorAttention'] },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },

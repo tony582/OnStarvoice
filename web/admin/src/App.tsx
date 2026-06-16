@@ -26,8 +26,8 @@ import { Loader2 } from 'lucide-react'
 const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   // 舆情风控面
   overview: { eyebrow: 'Command Center', title: '指挥中心 · 态势驾驶舱' },
-  opinion: { eyebrow: 'Opinion Handling', title: '舆情处理' },
-  workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台(旧)' },
+  opinion: { eyebrow: 'Opinion Handling', title: '舆情处理 · 工单' },
+  workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
   monitoring: { eyebrow: 'Monitoring', title: '关注博主' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
@@ -68,7 +68,7 @@ const PAGES: Record<string, React.ComponentType> = {
 }
 
 // 工作台标题随选中队列变化(队列已是侧边栏二级导航)
-const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论分诊', salesleads: '销售客资', issues: '问题处置' }
+const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论分诊', salesleads: '销售客资', feedback: '工单回执', issues: '问题处置' }
 
 function AppContent() {
   const { user, loading, tenantId } = useAuth()

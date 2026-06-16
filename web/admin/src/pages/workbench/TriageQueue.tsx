@@ -14,6 +14,7 @@ import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
+import { useTicketDispatch } from '@/components/shared/TicketDispatch'
 import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
@@ -23,7 +24,7 @@ const STATUS_TABS = [
   { value: '', label: '待处理', icon: Inbox },
   { value: 'unhandled', label: '未处理', icon: Bookmark },
   { value: 'reviewing', label: '待复核', icon: ScanSearch },
-  { value: 'issue_linked', label: '已转问题', icon: Link2 },
+  { value: 'issue_linked', label: '已转工单', icon: Link2 },
   { value: 'official_responded', label: '已响应', icon: CircleCheck },
   { value: 'archived', label: '已归档', icon: Package },
 ]
@@ -46,6 +47,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [batchBusy, setBatchBusy] = useState(false)
   const { ask, dialog } = useNotePrompt()
+  const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
   const sel = useSelection(`${status}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
@@ -96,10 +98,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     await reloadAfterMutation()
   }
 
-  const linkIssue = async (recordId: string) => {
-    const title = await ask({ title: '转为问题', placeholder: '简述负面舆情要点，作为问题标题', confirmLabel: '创建问题' })
-    if (!title || !title.trim()) return
-    await api.post('/triage/records/' + recordId + '/issues', { title })
+  const dispatchTicket = async (record: any) => {
+    const r = await dispatch({ summary: record.title || record.content, defaultPriority: record.triage_priority })
+    if (!r) return
+    await api.post('/tickets', { sourceType: 'content', sourceId: record.id, priority: r.priority, assigneeName: r.assigneeName, note: r.note })
     await reloadAfterMutation()
   }
 
@@ -123,7 +125,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     record: drawerRecord,
     onClose: () => setDrawerRecord(null),
     canWrite: canWrite(),
-    onLinkIssue: () => { linkIssue(drawerRecord.id); setDrawerRecord(null) },
+    onLinkIssue: () => { dispatchTicket(drawerRecord); setDrawerRecord(null) },
     onSetStatus: (s: string) => { updateTriage(drawerRecord.id, s); setDrawerRecord(null) },
     onMarkResponded: () => { markResponded(drawerRecord.id); setDrawerRecord(null) },
   } : null
@@ -240,7 +242,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   onToggle={() => sel.toggle(r.id)}
                   openMenu={openMenu}
                   setOpenMenu={setOpenMenu}
-                  onLinkIssue={() => linkIssue(r.id)}
+                  onLinkIssue={() => dispatchTicket(r)}
                   onUpdateTriage={(s: string) => updateTriage(r.id, s)}
                   onMarkResponded={() => markResponded(r.id)}
                   onOpenDetail={() => setDrawerRecord(r)}
@@ -285,6 +287,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {/* 详情:盖式滑出面板(无遮罩,盖在列表右侧,左侧仍可点)*/}
       {drawerProps && <RecordDrawer {...drawerProps} />}
       {dialog}
+      {dispatchDialog}
     </div>
   )
 }
@@ -331,7 +334,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, open
       {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-end gap-1">
-            <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转问题</Button>
+            <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转工单</Button>
             <div className="action-dropdown relative">
               <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setOpenMenu(openMenu === r.id ? null : r.id)}>
                 <MoreHorizontal className="h-4 w-4" />
