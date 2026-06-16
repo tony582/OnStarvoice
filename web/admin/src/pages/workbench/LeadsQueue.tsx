@@ -93,7 +93,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   }, [load, pagination, leads.length, refreshBadges])
 
   const updateLeadStatus = async (id: string, nextStatus: string) => {
-    await api.patch('/leads/comments/' + id, { status: nextStatus })
+    const note = prompt('处理备注（选填，记录如何跟进 / 结果，便于回看留痕）：', '')
+    if (note === null) return // 取消则不处理，避免误点即消失
+    await api.patch('/leads/comments/' + id, { status: nextStatus, note })
     await reloadAfterMutation()
   }
 
@@ -196,6 +198,15 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                         </div>
                       )}
                       {lead.reason && <div className="mt-2 text-xs leading-5 text-muted-foreground">{compact(lead.reason, 90)}</div>}
+                      {(lead.note || lead.handled_at) && (
+                        <div className="mt-2 rounded-md bg-muted/50 px-2 py-1.5 text-[11px] leading-5 text-muted-foreground">
+                          <span className="font-semibold text-foreground">处理留痕</span>
+                          {lead.note ? `：${compact(lead.note, 80)}` : '：—'}
+                          {(lead.handled_name || lead.handled_at) && (
+                            <span className="ml-1 opacity-70">· {lead.handled_name || '—'}{lead.handled_at ? ` · ${formatDate(lead.handled_at)}` : ''}</span>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <div className="font-medium">{lead.comment_author_name || '-'}</div>

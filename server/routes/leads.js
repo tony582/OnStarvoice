@@ -159,6 +159,18 @@ router.patch('/comments/:id', requireTenantAccess, requireTenantWriter, async (r
       params.push(priority);
       updates.push(`priority = $${params.length}`);
     }
+    // 处理备注留痕(选填):写入 note + 处理人 + 处理时间
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'note')) {
+      params.push(String(req.body.note || ''));
+      updates.push(`note = $${params.length}`);
+    }
+    if (status) {
+      params.push(req.user?.id || null);
+      updates.push(`handled_by = $${params.length}`);
+      params.push(req.user?.name || req.user?.email || '');
+      updates.push(`handled_name = $${params.length}`);
+      updates.push('handled_at = now()');
+    }
     if (!updates.length) {
       return res.status(400).json({ ok: false, error: 'empty_update', message: '没有要更新的字段' });
     }
