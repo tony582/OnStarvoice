@@ -284,6 +284,8 @@ export function SettingsPage() {
     if (group === 'llm') {
       body.llm_provider = settings.llm_provider; body.llm_model = settings.llm_model
       const key = settings._llm_api_key; if (key) body.llm_api_key = key
+    } else if (group === 'brand') {
+      for (const k of ['brand_name', 'brand_aliases', 'brand_business_context', 'brand_relevance_terms', 'brand_noise_terms']) body[k] = settings[k] || ''
     } else if (group === 'email') {
       for (const k of ['smtp_host', 'smtp_port', 'smtp_secure', 'smtp_user', 'smtp_pass', 'email_from', 'email_to']) body[k] = settings[k]
     } else if (group === 'report') {
@@ -305,6 +307,17 @@ export function SettingsPage() {
           <Field label="模型"><Input value={settings.llm_model || ''} onChange={e => u('llm_model', e.target.value)} /></Field>
           <Field label="API Key" full><Input type="password" value={settings._llm_api_key || ''} onChange={e => u('_llm_api_key', e.target.value)} placeholder="留空不修改" /></Field>
         </div>
+      </SettingsCard>
+
+      <SettingsCard title="品牌设置（AI 舆情判断按此租户的品牌语境）" onSave={() => save('brand')}>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="品牌名称"><Input value={settings.brand_name || ''} onChange={e => u('brand_name', e.target.value)} placeholder="如：安吉星" /></Field>
+          <Field label="品牌别名（逗号分隔）"><Input value={settings.brand_aliases || ''} onChange={e => u('brand_aliases', e.target.value)} placeholder="如：OnStar,安吉星" /></Field>
+          <Field label="业务背景" full><Input value={settings.brand_business_context || ''} onChange={e => u('brand_business_context', e.target.value)} placeholder="一句话描述品牌业务，如：车联网服务，提供远程控制/车况检测/道路救援等" /></Field>
+          <Field label="强相关词（逗号分隔）" full><Input value={settings.brand_relevance_terms || ''} onChange={e => u('brand_relevance_terms', e.target.value)} placeholder="出现这些词更可能与品牌相关，如：车主,续费,客服,App" /></Field>
+          <Field label="噪音/排除词（逗号分隔）" full><Input value={settings.brand_noise_terms || ''} onChange={e => u('brand_noise_terms', e.target.value)} placeholder="出现这些词多为无关，如：同名地名/小区/人名" /></Field>
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">留空则回退到系统默认（安吉星）语境。给新公司开租户后，请在这里填该公司自己的品牌，AI 才会按它的语境判舆情。</p>
       </SettingsCard>
 
       <SettingsCard title="报告时间" onSave={() => save('report')}>
