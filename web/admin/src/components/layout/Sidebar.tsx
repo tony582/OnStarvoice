@@ -1,5 +1,5 @@
 import {
-  LayoutDashboard, Columns3, Radar, Route, BarChart3, Database,
+  LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
   ShieldHalf, ShieldCheck, Wand2, PanelLeft,
@@ -29,7 +29,6 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
     { id: 'monitoring', label: '监控中心', icon: Radar, badgeKeys: ['monitorAttention'] },
-    { id: 'events', label: '事件中心', icon: Route },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },
   ],
