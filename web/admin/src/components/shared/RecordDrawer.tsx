@@ -338,6 +338,21 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
           </div>
         </div>
 
+        {/* 处理留痕:状态 / 处理人 / 时间 / 备注 */}
+        {(r.triage_note || r.triage_owner_name) && (
+          <div className="border-t border-border/50 bg-muted/30 px-6 py-3 text-[12px]">
+            <div className="font-semibold text-muted-foreground">处理留痕</div>
+            <div className="mt-1 space-y-0.5 text-muted-foreground">
+              <div>
+                状态：{LABELS.triage[r.triage_status] || r.triage_status || '未处理'}
+                {r.triage_owner_name && <span> · 处理人：{r.triage_owner_name}</span>}
+                {r.triage_updated_at && <span> · {formatDate(r.triage_updated_at)}</span>}
+              </div>
+              {r.triage_note && <div className="text-foreground/80">备注：{r.triage_note}</div>}
+            </div>
+          </div>
+        )}
+
         {/* Footer actions */}
         {canWrite && (
           <div className="flex flex-wrap items-center gap-2 border-t border-border/50 px-6 py-4">

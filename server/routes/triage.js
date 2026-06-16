@@ -95,6 +95,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         COALESCE(rt.priority, 'normal') AS triage_priority,
         COALESCE(rt.owner_name, '') AS triage_owner_name,
         COALESCE(rt.note, '') AS triage_note,
+        rt.updated_at AS triage_updated_at,
         (SELECT COUNT(*) FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id) AS alert_count,
         (SELECT COUNT(*) FROM issue_records ir WHERE ir.record_id = r.id AND ir.tenant_id = r.tenant_id) AS issue_count,
         (

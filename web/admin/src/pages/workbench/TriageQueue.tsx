@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Eye, Archive, Ban, Loader2, Bookmark, Link2, CircleCheck,
-  Package, User, ScanSearch, FileText, Bell,
+  Package, User, ScanSearch, FileText, Bell, ExternalLink,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
@@ -20,7 +20,7 @@ import { Rows3, Kanban } from 'lucide-react'
 
 const STATUS_TABS = [
   { value: '', label: '待处理', icon: Inbox },
-  { value: 'unhandled', label: '新线索', icon: Bookmark },
+  { value: 'unhandled', label: '未处理', icon: Bookmark },
   { value: 'reviewing', label: '待复核', icon: ScanSearch },
   { value: 'issue_linked', label: '已转问题', icon: Link2 },
   { value: 'official_responded', label: '已响应', icon: CircleCheck },
@@ -76,8 +76,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     refreshBadges()
   }, [load, pagination, records.length, refreshBadges])
 
-  const updateTriage = async (recordId: string, newStatus: string) => {
-    await api.patch('/triage/records/' + recordId, { status: newStatus })
+  const updateTriage = async (recordId: string, newStatus: string, opts?: { note?: string }) => {
+    let note = opts?.note
+    if (note === undefined) {
+      const input = prompt('处理备注（选填，记录如何处理 / 原因，便于回看留痕）：', '')
+      if (input === null) { setOpenMenu(null); return } // 取消则不处理，避免误点即消失
+      note = input
+    }
+    await api.patch('/triage/records/' + recordId, { status: newStatus, note })
     setOpenMenu(null)
     await reloadAfterMutation()
   }
@@ -308,6 +314,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, open
             <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
+              {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><ExternalLink className="h-2.5 w-2.5" />原文</a>}
             </div>
           </div>
         </div>
