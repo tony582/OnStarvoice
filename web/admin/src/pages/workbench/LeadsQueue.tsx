@@ -49,7 +49,7 @@ const PLATFORM_OPTIONS = [
 
 export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record<string, string>; category?: 'opinion' | 'sales' }) {
   const isSales = category === 'sales'
-  const noun = isSales ? '销售客资' : '舆情评论'
+  const noun = isSales ? '销售客资' : '评论'
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
   const [leads, setLeads] = useState<any[]>([])

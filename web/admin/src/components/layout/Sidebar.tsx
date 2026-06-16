@@ -19,9 +19,8 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 // 舆情工作台下的二级队列(在侧边栏纵向展开,替代主区横向卡片带)
 const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
-  { queue: 'leads', label: '舆情评论', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
+  { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
   { queue: 'salesleads', label: '销售客资', dot: 'bg-emerald-500' },
-  { queue: 'issues', label: '问题处置', badgeKey: 'issuesOpen', dot: 'bg-rose-500' },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
