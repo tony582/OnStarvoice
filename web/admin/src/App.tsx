@@ -26,7 +26,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   // 舆情风控面
   overview: { eyebrow: 'Command Center', title: '指挥中心 · 态势驾驶舱' },
   workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
-  monitoring: { eyebrow: 'Monitoring', title: '监控中心' },
+  monitoring: { eyebrow: 'Monitoring', title: '关注博主' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
   data: { eyebrow: 'Data Assets', title: '数据底座' },

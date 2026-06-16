@@ -23,7 +23,7 @@ export function MonitoringPage() {
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
       <WorkbenchTabs
-        tabs={[{ key: 'tasks', label: '监控任务' }, { key: 'hits', label: '监控命中' }]}
+        tabs={[{ key: 'tasks', label: '关注的博主' }, { key: 'hits', label: '博主新动态' }]}
         activeKey={tab}
         onChange={key => setTab(key as Tab)}
       />

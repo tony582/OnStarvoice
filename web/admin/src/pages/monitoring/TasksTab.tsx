@@ -42,7 +42,7 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
       {/* Stats 头部 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap gap-3">
-          <Stat label="监控任务" value={formatNumber(subs.length)} icon={Radar} />
+          <Stat label="关注博主" value={formatNumber(subs.length)} icon={Radar} />
           <Stat label="运行中" value={formatNumber(active)} icon={Clock} tone="green" />
           <Stat label="异常" value={formatNumber(errored)} icon={AlertTriangle} tone={errored > 0 ? 'red' : 'default'} />
         </div>
@@ -57,7 +57,7 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
         <WorkbenchTableShell>
           <table className="w-full text-sm">
             <thead><tr className="border-b border-border bg-muted">
-              <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">监控任务</th>
+              <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">博主</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">平台</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">频率</th>

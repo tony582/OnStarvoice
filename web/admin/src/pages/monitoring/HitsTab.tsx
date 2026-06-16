@@ -57,7 +57,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
       setHits(data.hits || [])
       setPagination(data.pagination || null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '监控命中加载失败')
+      setError(err instanceof Error ? err.message : '博主新动态加载失败')
     } finally {
       setLoading(false)
     }
@@ -74,7 +74,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
         onChange={setRange}
       />
 
-      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? hits.length)} 条监控命中`}>
+      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? hits.length)} 条新动态`}>
         <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
           {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
@@ -98,7 +98,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
         {loading ? (
           <div className="flex justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
         ) : !hits.length ? (
-          <EmptyState icon={Radar} title="暂无监控命中" description="执行账号或关键词监控后，命中的内容会出现在这里" />
+          <EmptyState icon={Radar} title="暂无新动态" description="对关注的博主执行扫描后，抓到的新内容会出现在这里" />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[1020px] text-sm">
