@@ -70,8 +70,10 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                 return (
                   <tr key={s.id} className="align-top transition-colors hover:bg-muted/30">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{s.name || s.keyword}</div>
-                      <div className="mt-0.5 text-xs text-muted-foreground">关键词:{s.keyword}</div>
+                      <div className="font-medium">{s.name || s.bloggerName || '博主'}</div>
+                      {(s.account_url || s.accountUrl)
+                        ? <a href={s.account_url || s.accountUrl} target="_blank" rel="noreferrer" className="mt-0.5 inline-block text-xs text-primary hover:underline">博主主页 ↗</a>
+                        : <div className="mt-0.5 text-xs text-muted-foreground">{s.platformBloggerId || s.keyword || '-'}</div>}
                     </td>
                     <td className="px-4 py-3"><StatusBadge tone="neutral">{platformName(s.platform)}</StatusBadge></td>
                     <td className="px-4 py-3">

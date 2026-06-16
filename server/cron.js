@@ -35,6 +35,7 @@ async function enqueueDueMonitorExecutions() {
     SELECT ms.tenant_id, ms.id, 'pending'
     FROM monitor_subscriptions ms
     WHERE ms.status = 'active'
+      AND COALESCE(ms.account_url, '') <> ''
       AND ms.next_run_at <= now()
       AND NOT EXISTS (
         SELECT 1 FROM monitor_executions me
