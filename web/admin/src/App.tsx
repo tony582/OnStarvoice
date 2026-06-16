@@ -71,7 +71,7 @@ const PAGES: Record<string, React.ComponentType> = {
 }
 
 // 工作台标题随选中队列变化(队列已是侧边栏二级导航)
-const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论分诊', feedback: '工单回执', issues: '问题处置' }
+const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论分诊', feedback: '已转工单', issues: '问题处置' }
 
 function AppContent() {
   const { user, loading, tenantId } = useAuth()

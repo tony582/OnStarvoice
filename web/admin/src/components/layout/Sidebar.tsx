@@ -20,7 +20,7 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
-  { queue: 'feedback', label: '工单回执', badgeKey: 'ticketsFeedback', dot: 'bg-violet-500' },
+  { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsFeedback', dot: 'bg-violet-500' },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {

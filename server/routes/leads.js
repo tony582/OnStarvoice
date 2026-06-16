@@ -77,7 +77,10 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     params.push(limit, offset);
 
     const leads = await queryAll(`
-      SELECT *
+      SELECT *,
+        (SELECT content FROM records r WHERE r.id = comment_leads.record_id) AS record_content,
+        (SELECT ai_summary FROM records r WHERE r.id = comment_leads.record_id) AS record_ai_summary,
+        (SELECT sentiment FROM records r WHERE r.id = comment_leads.record_id) AS record_sentiment
       FROM comment_leads
       ${where}
       ORDER BY

@@ -148,22 +148,80 @@ router.get('/', requireTenantAccess, async (req, res, next) => {
   } catch (err) { return next(err); }
 });
 
-// ==================== 工单回执(分诊侧:已处理待确认)====================
-router.get('/feedback', requireTenantAccess, async (req, res, next) => {
+// ==================== 已转工单(分诊侧:看自己转出去的工单进度 + 回执确认)====================
+// view: review=待我确认(pending_review) / progress=客服处理中(pending+doing) / 空=全部未关闭
+router.get('/dispatched', requireTenantAccess, async (req, res, next) => {
   try {
+    const view = String(req.query.view || '');
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 30));
+
+    const counts = {
+      review: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review'`, [req.tenantId]))?.n || 0,
+      progress: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')`, [req.tenantId]))?.n || 0,
+      total: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND status <> 'closed'`, [req.tenantId]))?.n || 0,
+    };
+
     const params = [req.tenantId];
-    const where = `WHERE tenant_id = $1 AND feedback_status = 'pending_review'`;
+    let where = `WHERE tenant_id = $1 AND status <> 'closed'`;
+    if (view === 'review') where += ` AND feedback_status = 'pending_review'`;
+    else if (view === 'progress') where += ` AND status IN ('pending', 'doing')`;
 
     const total = (await queryOne(`SELECT COUNT(*)::int AS total FROM tickets ${where}`, params))?.total || 0;
     params.push(pageSize, (page - 1) * pageSize);
     const items = await queryAll(
       `SELECT ${TICKET_COLUMNS} FROM tickets ${where}
-       ORDER BY handled_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+       ORDER BY (feedback_status = 'pending_review') DESC,
+         CASE status WHEN 'doing' THEN 1 WHEN 'pending' THEN 2 WHEN 'done' THEN 3 ELSE 4 END,
+         updated_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
-    return res.json({ ok: true, items, total, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } });
+    return res.json({ ok: true, items, counts, total, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } });
+  } catch (err) { return next(err); }
+});
+
+// ==================== 工单源详情(原始博文 + AI 分析 + 负面评论)====================
+router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
+  try {
+    const ticket = await queryOne(
+      `SELECT id, source_type, source_record_id, source_comment_id FROM tickets WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, req.tenantId],
+    );
+    if (!ticket) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
+
+    let comment = null;
+    let recordId = ticket.source_record_id;
+    if (ticket.source_type === 'comment' && ticket.source_comment_id) {
+      comment = await queryOne(
+        `SELECT id, comment_content, comment_author_name, comment_ip_location, comment_like_count,
+                reason, ai_result, matched_keywords, lead_type, priority, record_id, record_title, record_url
+         FROM comment_leads WHERE id = $1 AND tenant_id = $2`,
+        [ticket.source_comment_id, req.tenantId],
+      );
+      recordId = comment?.record_id || null;
+    }
+
+    let record = null;
+    let negativeComments = [];
+    if (recordId) {
+      record = await queryOne(
+        `SELECT id, platform, title, content, author_name, url, cover_url, sentiment, category,
+                ai_summary, ai_result, negative_comment_count, likes, comments_count, collects, shares
+         FROM records WHERE id = $1 AND tenant_id = $2`,
+        [recordId, req.tenantId],
+      );
+      if (ticket.source_type === 'content') {
+        negativeComments = await queryAll(
+          `SELECT content, author_name, ip_location, sentiment, ai_summary, like_count
+           FROM record_comments
+           WHERE record_id = $1 AND tenant_id = $2 AND is_negative = true AND is_official = false
+           ORDER BY last_seen_at DESC LIMIT 6`,
+          [recordId, req.tenantId],
+        );
+      }
+    }
+    return res.json({ ok: true, record, comment, negativeComments });
   } catch (err) { return next(err); }
 });
 

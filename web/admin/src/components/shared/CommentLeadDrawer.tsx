@@ -115,11 +115,17 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, noun }
             </section>
           )}
 
-          {/* 原帖 */}
+          {/* 原帖(原始博文 + 帖子AI研判)*/}
           <section>
             <div className="mb-2 text-[11px] font-bold uppercase tracking-wide text-muted-foreground">来源原帖</div>
             <div className="rounded-lg border border-border p-3.5">
               <div className="text-[13px] font-medium leading-snug">{lead.record_title || '(无标题)'}</div>
+              {lead.record_content && (
+                <div className="mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap text-[12px] leading-6 text-muted-foreground">{lead.record_content}</div>
+              )}
+              {lead.record_ai_summary && (
+                <div className="mt-2 rounded-md bg-primary/[0.04] p-2.5 text-[12px] leading-6 text-muted-foreground"><span className="font-semibold text-foreground">帖子AI研判:</span>{lead.record_ai_summary}</div>
+              )}
               {lead.record_url && (
                 <a href={lead.record_url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />查看原帖</a>
               )}

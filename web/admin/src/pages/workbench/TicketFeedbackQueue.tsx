@@ -5,17 +5,27 @@ import { formatDate, formatNumber, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { WorkbenchTableShell, WorkbenchToolbar } from '@/components/shared/Workbench'
-import { useNotePrompt } from '@/components/shared/NotePrompt'
+import { WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { TicketDrawer } from '@/components/shared/TicketDrawer'
+import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
+
+const STATE_TONE: Record<string, string> = { pending: 'orange', doing: 'blue', done: 'positive', dismissed: 'muted' }
+const STATE_LABEL: Record<string, string> = { pending: '待客服领取', doing: '客服处理中', done: '已处理', dismissed: '已忽略' }
+const TABS = [
+  { key: 'review', label: '待确认' },
+  { key: 'progress', label: '处理中' },
+  { key: '', label: '全部' },
+]
 
 export function TicketFeedbackQueue() {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
   const { ask, dialog } = useNotePrompt()
+  const [view, setView] = useState('review')
   const [items, setItems] = useState<any[]>([])
+  const [counts, setCounts] = useState<{ review: number; progress: number; total: number }>({ review: 0, progress: 0, total: 0 })
   const [pagination, setPagination] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -24,15 +34,16 @@ export function TicketFeedbackQueue() {
   const load = useCallback(async (page = 1) => {
     setLoading(true); setError('')
     try {
-      const data = await api.get<any>(`/tickets/feedback?page=${page}&pageSize=30`)
+      const data = await api.get<any>(`/tickets/dispatched?view=${view}&page=${page}&pageSize=30`)
       setItems(data.items || [])
+      setCounts(data.counts || { review: 0, progress: 0, total: 0 })
       setPagination(data.pagination || null)
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败')
     } finally { setLoading(false) }
-  }, [])
+  }, [view])
 
-  useEffect(() => { load(1) }, [load])
+  useEffect(() => { load(1) }, [view]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const review = async (item: any, decision: 'confirm' | 'reopen') => {
     let note: string | undefined
@@ -49,9 +60,18 @@ export function TicketFeedbackQueue() {
 
   return (
     <div className="space-y-4">
-      <p className="text-[13px] text-muted-foreground">客服处理完的工单在这里回执。核对处理结果后【确认归档】闭环;不满意可【打回】让客服重处理。</p>
+      <p className="text-[13px] text-muted-foreground">你转出去的工单都在这里:可看客服处理进度;客服处理完会进「待确认」,核对后【确认归档】闭环,不满意可【打回】。</p>
 
-      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? items.length)} 个待确认`}>
+      <WorkbenchTabs
+        tabs={TABS.map(t => {
+          const n = t.key === 'review' ? counts.review : t.key === 'progress' ? counts.progress : counts.total
+          return { key: t.key, label: `${t.label}${n ? ` (${n})` : ''}` }
+        })}
+        activeKey={view}
+        onChange={setView}
+      />
+
+      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? items.length)} 个工单`}>
         <Button variant="outline" size="sm" onClick={() => load(1)}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
       </WorkbenchToolbar>
 
@@ -60,14 +80,14 @@ export function TicketFeedbackQueue() {
       ) : error ? (
         <EmptyState icon={ClipboardCheck} title="加载失败" description={error} />
       ) : items.length === 0 ? (
-        <EmptyState icon={ClipboardCheck} title="暂无待确认的工单" description="客服处理完工单后,回执会出现在这里等你确认归档" />
+        <EmptyState icon={ClipboardCheck} title="暂无工单" description="在内容分诊 / 评论分诊点【转工单】后,工单会出现在这里供你跟踪" />
       ) : (
         <WorkbenchTableShell>
           <table className="w-full min-w-[920px] text-sm">
             <thead><tr className="border-b border-border bg-muted">
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">工单内容</th>
+              <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">客服状态</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">处理结果</th>
-              <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">结论</th>
               <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
             </tr></thead>
             <tbody className="divide-y divide-border">
@@ -80,20 +100,25 @@ export function TicketFeedbackQueue() {
                       {it.url && <a href={it.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
                     </div>
                     <div className="line-clamp-2 text-[13px] leading-5 text-foreground">{it.item_text || it.title || '(无内容)'}</div>
-                  </td>
-                  <td className="max-w-[320px] px-4 py-3 text-xs">
-                    <div className="leading-5 text-foreground">{it.handle_note || '(无说明)'}</div>
-                    <div className="mt-1 text-muted-foreground">{it.handled_by_name || '-'}{it.handled_at ? ` · ${formatDate(it.handled_at)}` : ''}</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">指派 {it.assignee_name || '公共池'}</div>
                   </td>
                   <td className="px-4 py-3">
-                    <StatusBadge tone={it.status === 'dismissed' ? 'muted' : 'positive'}>{it.status === 'dismissed' ? '已忽略' : '已处理'}</StatusBadge>
+                    <StatusBadge tone={STATE_TONE[it.status] || 'muted'}>{STATE_LABEL[it.status] || it.status}</StatusBadge>
+                    {it.feedback_status === 'pending_review' && <div className="mt-1 text-[10.5px] text-amber-600 dark:text-amber-400">待你确认</div>}
+                    {it.feedback_status === 'reopened' && <div className="mt-1 text-[10.5px] text-muted-foreground">已打回</div>}
+                  </td>
+                  <td className="max-w-[280px] px-4 py-3 text-xs">
+                    {it.handle_note || it.handled_at ? <>
+                      <div className="leading-5 text-foreground">{it.handle_note || '(无说明)'}</div>
+                      <div className="mt-0.5 text-muted-foreground">{it.handled_by_name || '-'}{it.handled_at ? ` · ${formatDate(it.handled_at)}` : ''}</div>
+                    </> : <span className="text-muted-foreground/60">—</span>}
                   </td>
                   <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
                     <div className="flex flex-wrap justify-end gap-1">
-                      {canWrite() ? <>
+                      {canWrite() && it.feedback_status === 'pending_review' ? <>
                         <Button variant="outline" size="sm" onClick={() => review(it, 'confirm')}>确认归档</Button>
                         <Button variant="ghost" size="sm" onClick={() => review(it, 'reopen')}>打回</Button>
-                      </> : <span className="text-[11px] text-muted-foreground">无权限</span>}
+                      </> : <span className="text-[11px] text-muted-foreground/60">跟踪中</span>}
                     </div>
                   </td>
                 </tr>
@@ -116,7 +141,7 @@ export function TicketFeedbackQueue() {
           ticket={drawer}
           canWrite={canWrite()}
           onClose={() => setDrawer(null)}
-          onReview={(decision) => review(drawer, decision)}
+          onReview={drawer.feedback_status === 'pending_review' ? (decision) => review(drawer, decision) : undefined}
         />
       )}
       {dialog}

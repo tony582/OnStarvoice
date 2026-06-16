@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, ExternalLink, FileText, Send, UserCog, Wrench, ClipboardCheck } from 'lucide-react'
-import { formatDate, formatFullDate, LABELS, platformName } from '@/lib/utils'
+import { X, ExternalLink, FileText, Send, UserCog, Wrench, ClipboardCheck, Sparkles, MessageCircle } from 'lucide-react'
+import { api } from '@/lib/api'
+import { formatDate, formatFullDate, formatNumber, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 
@@ -24,10 +25,20 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
   onReview?: (decision: 'confirm' | 'reopen') => void
 }) {
   const panelRef = useRef<HTMLDivElement>(null)
+  const [source, setSource] = useState<{ record: any; comment: any; negativeComments: any[] } | null>(null)
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
     return saved >= PANEL_MIN && saved <= PANEL_MAX ? saved : PANEL_DEFAULT
   })
+
+  useEffect(() => {
+    let alive = true
+    setSource(null)
+    api.get<any>(`/tickets/${t.id}/source`)
+      .then(d => { if (alive) setSource({ record: d.record, comment: d.comment, negativeComments: d.negativeComments || [] }) })
+      .catch(() => { if (alive) setSource({ record: null, comment: null, negativeComments: [] }) })
+    return () => { alive = false }
+  }, [t.id])
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -62,6 +73,10 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
     window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp)
   }
 
+  const kw: string[] = Array.isArray(source?.comment?.matched_keywords)
+    ? source!.comment.matched_keywords
+    : (() => { try { return JSON.parse(source?.comment?.matched_keywords || '[]') } catch { return [] } })()
+
   return (
     <div ref={panelRef} style={{ width }}
       className="fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
@@ -94,6 +109,56 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
             </div>
             {t.author && <div className="mt-2 text-[12px] text-muted-foreground">作者:{t.author}</div>}
           </section>
+
+          {/* 原始博文(评论工单=评论所在帖子;内容工单=帖子正文)*/}
+          {source?.record && (
+            <section>
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-muted-foreground"><FileText className="h-3.5 w-3.5" />{t.source_type === 'comment' ? '评论所在帖子' : '帖子正文'}</div>
+              <div className="rounded-lg border border-border p-3.5">
+                {source.record.title && <div className="text-[13px] font-medium leading-snug">{source.record.title}</div>}
+                <div className="mt-1.5 max-h-44 overflow-y-auto whitespace-pre-wrap text-[12.5px] leading-6 text-muted-foreground">{source.record.content || '(无正文)'}</div>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                  <StatusBadge tone={source.record.sentiment === 'negative' ? 'negative' : source.record.sentiment === 'positive' ? 'positive' : 'muted'}>{LABELS.sentiment[source.record.sentiment] || '待标注'}</StatusBadge>
+                  {source.record.category && <StatusBadge tone="neutral">{LABELS.category?.[source.record.category] || source.record.category}</StatusBadge>}
+                  <span>赞 {formatNumber(source.record.likes)} · 评 {formatNumber(source.record.comments_count)}{source.record.negative_comment_count > 0 ? ` · 负评 ${source.record.negative_comment_count}` : ''}</span>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* AI 研判(帖子)*/}
+          {source?.record?.ai_summary && (
+            <section>
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-muted-foreground"><Sparkles className="h-3.5 w-3.5" />AI 研判</div>
+              <div className="rounded-lg bg-primary/[0.04] p-3.5 text-[12.5px] leading-6 text-muted-foreground">{source.record.ai_summary}</div>
+            </section>
+          )}
+
+          {/* 评论 AI 判断(评论工单)*/}
+          {source?.comment && (source.comment.reason || kw.length > 0) && (
+            <section>
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-muted-foreground"><Sparkles className="h-3.5 w-3.5" />评论 AI 判断</div>
+              <div className="rounded-lg bg-primary/[0.04] p-3.5 text-[12.5px] leading-6">
+                {source.comment.reason && <div className="text-muted-foreground">{source.comment.reason}</div>}
+                {kw.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{kw.slice(0, 12).map((k: string) => <StatusBadge key={k} tone="muted">{k}</StatusBadge>)}</div>}
+              </div>
+            </section>
+          )}
+
+          {/* 负面评论(内容工单)*/}
+          {source && t.source_type === 'content' && source.negativeComments.length > 0 && (
+            <section>
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-muted-foreground"><MessageCircle className="h-3.5 w-3.5" />负面评论 ({source.negativeComments.length})</div>
+              <div className="space-y-2">
+                {source.negativeComments.map((c: any, i: number) => (
+                  <div key={i} className="rounded-lg bg-status-red/[0.05] p-3 text-[12px] leading-5">
+                    <div className="whitespace-pre-wrap">{c.content}</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">{c.author_name || '匿名'}{c.ip_location ? ` · ${c.ip_location}` : ''}{c.like_count ? ` · 赞 ${formatNumber(c.like_count)}` : ''}</div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           {/* 转单信息 */}
           <section>
