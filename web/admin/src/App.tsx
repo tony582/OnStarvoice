@@ -6,6 +6,7 @@ import { BadgesProvider } from '@/lib/badges'
 import { LoginPage } from '@/pages/LoginPage'
 import { OverviewPage } from '@/pages/OverviewPage'
 import { OpinionPage } from '@/pages/OpinionPage'
+import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
 import { InsightsPage } from '@/pages/InsightsPage'
@@ -29,6 +30,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   opinion: { eyebrow: 'Opinion Handling', title: '舆情处理 · 工单' },
   workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
   monitoring: { eyebrow: 'Monitoring', title: '关注博主' },
+  salesleads: { eyebrow: 'Sales Leads', title: '销售客资' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
   data: { eyebrow: 'Data Assets', title: '数据底座' },
@@ -52,6 +54,7 @@ const PAGES: Record<string, React.ComponentType> = {
   opinion: OpinionPage,
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
+  salesleads: SalesLeadsPage,
   events: EventsPage,
   insights: InsightsPage,
   data: DataPage,
@@ -68,7 +71,7 @@ const PAGES: Record<string, React.ComponentType> = {
 }
 
 // 工作台标题随选中队列变化(队列已是侧边栏二级导航)
-const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论分诊', salesleads: '销售客资', feedback: '工单回执', issues: '问题处置' }
+const QUEUE_TITLES: Record<string, string> = { triage: '内容分诊', leads: '评论分诊', feedback: '工单回执', issues: '问题处置' }
 
 function AppContent() {
   const { user, loading, tenantId } = useAuth()

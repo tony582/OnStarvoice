@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
-  CheckCircle, Eye, Archive, Ban, Loader2, Bookmark, Link2, CircleCheck,
-  Package, User, ScanSearch, FileText, Bell, ExternalLink,
+  CheckCircle, Archive, Ban, Loader2,
+  Package, User, FileText, Bell, ExternalLink,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
@@ -22,10 +22,6 @@ import { Rows3, Kanban } from 'lucide-react'
 
 const STATUS_TABS = [
   { value: '', label: '待处理', icon: Inbox },
-  { value: 'unhandled', label: '未处理', icon: Bookmark },
-  { value: 'reviewing', label: '待复核', icon: ScanSearch },
-  { value: 'issue_linked', label: '已转工单', icon: Link2 },
-  { value: 'official_responded', label: '已响应', icon: CircleCheck },
   { value: 'archived', label: '已归档', icon: Package },
 ]
 
@@ -54,7 +50,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const load = useCallback(async (page = 1) => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: '30', status, queue: status ? '' : 'active', sentiment, platform, keyword })
+      const params = new URLSearchParams({ page: String(page), pageSize: '30', sentiment, platform, keyword })
+      if (status === 'archived') params.set('bucket', 'archived')
+      else params.set('queue', 'active')
       const data = await api.get<any>('/triage/records?' + params)
       setRecords(data.records || [])
       setPagination(data.pagination || null)
@@ -236,6 +234,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   key={r.id}
                   record={r}
                   canWrite={canWrite()}
+                  archived={status === 'archived'}
                   narrow={narrow}
                   open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
@@ -277,7 +276,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           onClear={sel.clear}
           onAction={key => runBatch(key)}
           actions={[
-            { key: 'reviewing', label: '待复核', icon: Eye },
             { key: 'archived', label: '归档', icon: Archive },
             { key: 'false_positive', label: '误报', icon: Ban, tone: 'danger' },
           ]}
@@ -293,7 +291,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 }
 
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
@@ -333,22 +331,25 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, open
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>}
       {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
-          <div className="flex items-center justify-end gap-1">
-            <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转工单</Button>
-            <div className="action-dropdown relative">
-              <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setOpenMenu(openMenu === r.id ? null : r.id)}>
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-              {openMenu === r.id && (
-                <div className="absolute right-0 top-full z-30 mt-1 w-40 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-lg duration-150">
-                  <MenuBtn icon={CheckCircle} label="标为已响应" onClick={onMarkResponded} />
-                  <MenuBtn icon={Eye} label="待复核" onClick={() => onUpdateTriage('reviewing')} />
-                  <MenuBtn icon={Archive} label="归档" onClick={() => onUpdateTriage('archived')} />
-                  <MenuBtn icon={Ban} label="误报" onClick={() => onUpdateTriage('false_positive')} />
-                </div>
-              )}
+          {archived ? (
+            <div className="text-right text-[11px] text-muted-foreground/60">已归档</div>
+          ) : (
+            <div className="flex items-center justify-end gap-1">
+              <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转工单</Button>
+              <div className="action-dropdown relative">
+                <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setOpenMenu(openMenu === r.id ? null : r.id)}>
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+                {openMenu === r.id && (
+                  <div className="absolute right-0 top-full z-30 mt-1 w-40 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-lg duration-150">
+                    <MenuBtn icon={CheckCircle} label="标为已响应" onClick={onMarkResponded} />
+                    <MenuBtn icon={Archive} label="归档" onClick={() => onUpdateTriage('archived')} />
+                    <MenuBtn icon={Ban} label="误报" onClick={() => onUpdateTriage('false_positive')} />
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
         </td>
       )}
     </tr>

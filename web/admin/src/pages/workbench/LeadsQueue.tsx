@@ -24,6 +24,11 @@ const STATUS_OPTIONS = [
   { value: 'resolved', label: '已处理' },
   { value: 'ignored', label: '已忽略' },
 ]
+// 评论分诊与内容分诊同构:两个 MECE 桶。转工单后离开分诊视图(在工单系统里跟踪)。
+const OPINION_TABS = [
+  { value: 'pending', label: '待处理' },
+  { value: 'archived', label: '已归档' },
+]
 const TYPE_OPTIONS = [
   { value: '', label: '全部类型' },
   { value: 'complaint', label: '投诉维权' },
@@ -57,7 +62,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [pagination, setPagination] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [status, setStatus] = useState(initial?.status ?? '')
+  const [status, setStatus] = useState(initial?.status ?? (category === 'sales' ? '' : 'pending'))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [leadType, setLeadType] = useState(initial?.leadType ?? '')
   const [priority, setPriority] = useState(initial?.priority ?? '')
@@ -74,7 +79,8 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     setError('')
     try {
       const params = new URLSearchParams({ page: String(page), pageSize: '30', category })
-      if (status) params.set('status', status)
+      if (isSales) { if (status) params.set('status', status) }
+      else params.set('bucket', status || 'pending')
       if (platform) params.set('platform', platform)
       if (leadType && !isSales) params.set('leadType', leadType)
       if (priority) params.set('priority', priority)
@@ -130,7 +136,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   return (
     <div className="space-y-3">
       <WorkbenchTabs
-        tabs={STATUS_OPTIONS.map(option => ({ key: option.value, label: option.value ? option.label : '全部线索' }))}
+        tabs={(isSales ? STATUS_OPTIONS.map(o => ({ key: o.value, label: o.value ? o.label : '全部线索' })) : OPINION_TABS.map(o => ({ key: o.value, label: o.label })))}
         activeKey={status}
         onChange={setStatus}
       />
@@ -214,10 +220,17 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                     <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatDate(lead.captured_at)}</td>
                     <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}>
                       <div className="flex justify-end gap-1">
-                        {!isSales && <Button size="sm" disabled={!canWrite()} onClick={() => dispatchTicket(lead)}>转工单</Button>}
-                        <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
-                        <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
-                        <Button variant="ghost" size="sm" disabled={!canWrite() || lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
+                        {isSales ? <>
+                          <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
+                          <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
+                          <Button variant="ghost" size="sm" disabled={!canWrite() || lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
+                        </> : status === 'archived' ? (
+                          <span className="text-[11px] text-muted-foreground/60">已归档</span>
+                        ) : <>
+                          <Button size="sm" disabled={!canWrite()} onClick={() => dispatchTicket(lead)}>转工单</Button>
+                          <Button variant="outline" size="sm" disabled={!canWrite()} onClick={() => updateLeadStatus(lead.id, 'resolved')}>归档</Button>
+                          <Button variant="ghost" size="sm" disabled={!canWrite()} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
+                        </>}
                       </div>
                     </td>
                   </tr>
@@ -245,9 +258,12 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           busy={batchBusy}
           onClear={sel.clear}
           onAction={key => runBatch(key)}
-          actions={[
+          actions={isSales ? [
             { key: 'following', label: '跟进', icon: Footprints },
             { key: 'resolved', label: '处理', icon: CheckCheck },
+            { key: 'ignored', label: '忽略', icon: CircleSlash, tone: 'danger' },
+          ] : [
+            { key: 'resolved', label: '归档', icon: CheckCheck },
             { key: 'ignored', label: '忽略', icon: CircleSlash, tone: 'danger' },
           ]}
         />

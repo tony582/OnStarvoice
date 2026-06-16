@@ -26,7 +26,14 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
 
     const params = [req.tenantId];
     let where = 'WHERE tenant_id = $1';
-    if (status && LEAD_STATUSES.has(String(status))) {
+    // 评论分诊与内容分诊同构的两个 MECE 桶:待处理(new) / 已归档(resolved+ignored)。
+    // 已转工单(following)不在分诊视图,在工单系统里跟踪。
+    const bucket = String(req.query.bucket || '');
+    if (bucket === 'pending') {
+      where += ` AND status = 'new'`;
+    } else if (bucket === 'archived') {
+      where += ` AND status IN ('resolved', 'ignored')`;
+    } else if (status && LEAD_STATUSES.has(String(status))) {
       params.push(status);
       where += ` AND status = $${params.length}`;
     }

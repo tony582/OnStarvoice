@@ -8,6 +8,7 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
+import { TicketDrawer } from '@/components/shared/TicketDrawer'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
@@ -47,6 +48,7 @@ export function OpinionPage() {
   const [pagination, setPagination] = useState<Pagination | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [drawer, setDrawer] = useState<any>(null)
 
   const load = useCallback(async (page = 1) => {
     setLoading(true); setError('')
@@ -77,6 +79,7 @@ export function OpinionPage() {
       note = v
     }
     await api.patch(`/tickets/${item.id}`, { action, ...(note !== undefined ? { note } : {}) })
+    setDrawer(null)
     await load(pagination?.page ?? 1)
     refreshBadges()
   }
@@ -123,13 +126,13 @@ export function OpinionPage() {
             </tr></thead>
             <tbody className="divide-y divide-border">
               {items.map(it => (
-                <tr key={it.id} className="align-top transition-colors hover:bg-muted/30">
+                <tr key={it.id} onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-muted/30 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
                   <td className="max-w-[440px] px-4 py-3">
                     <div className="mb-1 flex items-center gap-1.5">
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
                       <StatusBadge tone="neutral">{platformName(it.platform)}</StatusBadge>
                       {it.category && <StatusBadge tone="neutral">{LABELS.leadType[it.category] || it.category}</StatusBadge>}
-                      {it.url && <a href={it.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
+                      {it.url && <a href={it.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
                     </div>
                     <div className="line-clamp-2 text-[13px] leading-5 text-foreground">{it.item_text || it.title || '(无内容)'}</div>
                     {it.dispatch_note && <div className="mt-1.5 rounded-md bg-amber-50 px-2 py-1 text-[11px] leading-5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">转单说明:{it.dispatch_note}</div>}
@@ -154,7 +157,7 @@ export function OpinionPage() {
                       <div className="mt-1 text-[10.5px] text-muted-foreground">{FEEDBACK_LABEL[it.feedback_status] || ''}</div>
                     )}
                   </td>
-                  <td className="px-4 py-3">
+                  <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
                     <div className="flex flex-wrap justify-end gap-1">
                       {canWrite() && it.status === 'pending' && <>
                         <Button variant="outline" size="sm" onClick={() => act(it, 'start')}>开始处理</Button>
@@ -184,6 +187,14 @@ export function OpinionPage() {
         </div>
       )}
 
+      {drawer && (
+        <TicketDrawer
+          ticket={drawer}
+          canWrite={canWrite()}
+          onClose={() => setDrawer(null)}
+          onAction={(action) => act(drawer, action, action === 'done' || action === 'dismiss')}
+        />
+      )}
       {dialog}
     </div>
   )

@@ -7,6 +7,7 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchTableShell, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
+import { TicketDrawer } from '@/components/shared/TicketDrawer'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
@@ -18,6 +19,7 @@ export function TicketFeedbackQueue() {
   const [pagination, setPagination] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [drawer, setDrawer] = useState<any>(null)
 
   const load = useCallback(async (page = 1) => {
     setLoading(true); setError('')
@@ -40,6 +42,7 @@ export function TicketFeedbackQueue() {
       note = v
     }
     await api.patch(`/tickets/${item.id}/review`, { decision, ...(note !== undefined ? { note } : {}) })
+    setDrawer(null)
     await load(pagination?.page ?? 1)
     refreshBadges()
   }
@@ -69,12 +72,12 @@ export function TicketFeedbackQueue() {
             </tr></thead>
             <tbody className="divide-y divide-border">
               {items.map(it => (
-                <tr key={it.id} className="align-top transition-colors hover:bg-muted/30">
+                <tr key={it.id} onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-muted/30 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
                   <td className="max-w-[380px] px-4 py-3">
                     <div className="mb-1 flex items-center gap-1.5">
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
                       <StatusBadge tone="neutral">{platformName(it.platform)}</StatusBadge>
-                      {it.url && <a href={it.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
+                      {it.url && <a href={it.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
                     </div>
                     <div className="line-clamp-2 text-[13px] leading-5 text-foreground">{it.item_text || it.title || '(无内容)'}</div>
                   </td>
@@ -85,7 +88,7 @@ export function TicketFeedbackQueue() {
                   <td className="px-4 py-3">
                     <StatusBadge tone={it.status === 'dismissed' ? 'muted' : 'positive'}>{it.status === 'dismissed' ? '已忽略' : '已处理'}</StatusBadge>
                   </td>
-                  <td className="px-4 py-3">
+                  <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
                     <div className="flex flex-wrap justify-end gap-1">
                       {canWrite() ? <>
                         <Button variant="outline" size="sm" onClick={() => review(it, 'confirm')}>确认归档</Button>
@@ -108,6 +111,14 @@ export function TicketFeedbackQueue() {
         </div>
       )}
 
+      {drawer && (
+        <TicketDrawer
+          ticket={drawer}
+          canWrite={canWrite()}
+          onClose={() => setDrawer(null)}
+          onReview={(decision) => review(drawer, decision)}
+        />
+      )}
       {dialog}
     </div>
   )
