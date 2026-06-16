@@ -2,7 +2,7 @@ import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeft,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeft, ListChecks,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -26,7 +26,8 @@ const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof B
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
-    { id: 'workbench', label: '舆情工作台', icon: Columns3 },
+    { id: 'opinion', label: '舆情处理', icon: ListChecks, badgeKeys: ['opinionPending'] },
+    { id: 'workbench', label: '舆情工作台', icon: Columns3, tag: '旧' },
     { id: 'monitoring', label: '关注博主', icon: Radar, badgeKeys: ['monitorAttention'] },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },

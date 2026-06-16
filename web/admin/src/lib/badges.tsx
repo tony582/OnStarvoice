@@ -7,9 +7,10 @@ export interface Badges {
   leadsNew: number
   issuesOpen: number
   monitorAttention: number
+  opinionPending: number
 }
 
-const EMPTY: Badges = { triagePending: 0, leadsNew: 0, issuesOpen: 0, monitorAttention: 0 }
+const EMPTY: Badges = { triagePending: 0, leadsNew: 0, issuesOpen: 0, monitorAttention: 0, opinionPending: 0 }
 
 interface BadgesContextValue {
   badges: Badges

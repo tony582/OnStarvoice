@@ -17,7 +17,15 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
          WHERE r.tenant_id = $1 AND (${ACTIVE_QUEUE_CONDITION})) AS triage_pending,
         (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new') AS leads_new,
         (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
-        (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention
+        (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention,
+        (
+          (SELECT COUNT(*) FROM records
+           WHERE tenant_id = $1 AND opinion_state = 'pending'
+             AND (sentiment = 'negative' OR negative_comment_count > 0))
+          +
+          (SELECT COUNT(*) FROM comment_leads
+           WHERE tenant_id = $1 AND opinion_state = 'pending' AND lead_type <> 'sales_intent')
+        ) AS opinion_pending
     `, [req.tenantId]);
 
     return res.json({
@@ -27,6 +35,7 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         leadsNew: Number(row?.leads_new || 0),
         issuesOpen: Number(row?.issues_open || 0),
         monitorAttention: Number(row?.monitor_attention || 0),
+        opinionPending: Number(row?.opinion_pending || 0),
       },
       generatedAt: new Date().toISOString(),
     });
