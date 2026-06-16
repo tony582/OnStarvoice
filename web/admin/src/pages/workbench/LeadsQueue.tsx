@@ -11,6 +11,7 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
+import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
@@ -60,6 +61,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [priority, setPriority] = useState(initial?.priority ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [batchBusy, setBatchBusy] = useState(false)
+  const [drawer, setDrawer] = useState<any>(null)
 
   const sel = useSelection(`${status}|${platform}|${leadType}|${priority}|${keyword}|${pagination?.page ?? 1}`)
 
@@ -92,11 +94,12 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     refreshBadges()
   }, [load, pagination, leads.length, refreshBadges])
 
-  const updateLeadStatus = async (id: string, nextStatus: string) => {
+  const updateLeadStatus = async (id: string, nextStatus: string): Promise<boolean> => {
     const note = prompt('处理备注（选填，记录如何跟进 / 结果，便于回看留痕）：', '')
-    if (note === null) return // 取消则不处理，避免误点即消失
+    if (note === null) return false // 取消则不处理，避免误点即消失
     await api.patch('/leads/comments/' + id, { status: nextStatus, note })
     await reloadAfterMutation()
+    return true
   }
 
   const runBatch = async (nextStatus: string) => {
@@ -158,7 +161,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           <EmptyState icon={MessageSquareWarning} title={`暂无${noun}`} description={isSales ? '采集评论后，含购买意向/询价/留联系方式的评论会沉淀到这里' : '采集评论并完成判断后，需跟进的负面/风险评论会沉淀到这里'} />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1140px] text-sm">
+            <table className="w-full min-w-[920px] text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted">
                   {canWrite() && (
@@ -166,59 +169,39 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                       <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(l => l.id), !allChecked)} />
                     </th>
                   )}
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">原内容 / 评论</th>
+                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">评论内容</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">用户</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">类型</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">优先级</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">采集时间</th>
+                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">时间</th>
                   <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
                 {leads.map(lead => (
-                  <tr key={lead.id} className={`align-top transition-colors hover:bg-muted/30 ${sel.has(lead.id) ? 'bg-primary/[0.04]' : ''}`}>
+                  <tr key={lead.id} onClick={() => setDrawer(lead)}
+                    className={`cursor-pointer transition-colors hover:bg-muted/40 ${drawer?.id === lead.id ? 'bg-accent' : sel.has(lead.id) ? 'bg-primary/[0.04]' : ''}`}>
                     {canWrite() && (
-                      <td className="px-4 py-3"><Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} /></td>
+                      <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}><Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} /></td>
                     )}
-                    <td className="max-w-[430px] px-4 py-3">
-                      <div className="flex items-center gap-2">
+                    <td className="max-w-[440px] px-4 py-3 align-top">
+                      <div className="line-clamp-2 text-[13px] leading-5 text-foreground">{lead.comment_content || '(无内容)'}</div>
+                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                         <StatusBadge tone="neutral">{platformName(lead.platform)}</StatusBadge>
-                        {lead.record_url && (
-                          <a href={lead.record_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline">
-                            原文 <ExternalLink className="h-3 w-3" />
-                          </a>
-                        )}
+                        <span className="truncate">原帖：{compact(lead.record_title || '(无标题)', 26)}</span>
+                        {(lead.note || lead.handled_at) && <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">已留痕</span>}
                       </div>
-                      <div className="mt-2 font-medium leading-5">{lead.record_title || '(无标题)'}</div>
-                      <div className="mt-1 text-xs leading-5 text-foreground">{lead.comment_content}</div>
-                      {Array.isArray(lead.matched_keywords) && lead.matched_keywords.length > 0 && (
-                        <div className="mt-2 flex flex-wrap gap-1">
-                          {lead.matched_keywords.slice(0, 4).map((kw: string) => <StatusBadge key={kw} tone="muted">{kw}</StatusBadge>)}
-                        </div>
-                      )}
-                      {lead.reason && <div className="mt-2 text-xs leading-5 text-muted-foreground">{compact(lead.reason, 90)}</div>}
-                      {(lead.note || lead.handled_at) && (
-                        <div className="mt-2 rounded-md bg-muted/50 px-2 py-1.5 text-[11px] leading-5 text-muted-foreground">
-                          <span className="font-semibold text-foreground">处理留痕</span>
-                          {lead.note ? `：${compact(lead.note, 80)}` : '：—'}
-                          {(lead.handled_name || lead.handled_at) && (
-                            <span className="ml-1 opacity-70">· {lead.handled_name || '—'}{lead.handled_at ? ` · ${formatDate(lead.handled_at)}` : ''}</span>
-                          )}
-                        </div>
-                      )}
                     </td>
-                    <td className="px-4 py-3">
-                      <div className="font-medium">{lead.comment_author_name || '-'}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">ID {lead.comment_author_id || '-'}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">IP {lead.comment_ip_location || '-'}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">赞 {formatNumber(lead.comment_like_count)}</div>
+                    <td className="px-4 py-3 align-top text-xs">
+                      <div className="font-medium text-foreground">{lead.comment_author_name || '-'}</div>
+                      <div className="mt-0.5 whitespace-nowrap text-muted-foreground">IP {lead.comment_ip_location || '-'} · 赞 {formatNumber(lead.comment_like_count)}</div>
                     </td>
-                    <td className="px-4 py-3"><StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge></td>
-                    <td className="px-4 py-3"><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge></td>
-                    <td className="px-4 py-3"><StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge></td>
-                    <td className="px-4 py-3 text-xs text-muted-foreground">{formatDate(lead.captured_at)}</td>
-                    <td className="px-4 py-3">
+                    <td className="px-4 py-3 align-top"><StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge></td>
+                    <td className="px-4 py-3 align-top"><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge></td>
+                    <td className="px-4 py-3 align-top"><StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge></td>
+                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatDate(lead.captured_at)}</td>
+                    <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}>
                       <div className="flex justify-end gap-1">
                         <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
                         <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
@@ -255,6 +238,16 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
             { key: 'resolved', label: '处理', icon: CheckCheck },
             { key: 'ignored', label: '忽略', icon: CircleSlash, tone: 'danger' },
           ]}
+        />
+      )}
+
+      {drawer && (
+        <CommentLeadDrawer
+          lead={drawer}
+          noun={noun}
+          canWrite={canWrite()}
+          onClose={() => setDrawer(null)}
+          onSetStatus={async (s) => { if (await updateLeadStatus(drawer.id, s)) setDrawer(null) }}
         />
       )}
     </div>
