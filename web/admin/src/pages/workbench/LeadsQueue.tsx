@@ -45,7 +45,9 @@ const PLATFORM_OPTIONS = [
   { value: 'weibo', label: '微博' },
 ]
 
-export function LeadsQueue({ initial }: { initial?: Record<string, string> }) {
+export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record<string, string>; category?: 'opinion' | 'sales' }) {
+  const isSales = category === 'sales'
+  const noun = isSales ? '销售客资' : '舆情评论'
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
   const [leads, setLeads] = useState<any[]>([])
@@ -65,23 +67,23 @@ export function LeadsQueue({ initial }: { initial?: Record<string, string> }) {
     setLoading(true)
     setError('')
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: '30' })
+      const params = new URLSearchParams({ page: String(page), pageSize: '30', category })
       if (status) params.set('status', status)
       if (platform) params.set('platform', platform)
-      if (leadType) params.set('leadType', leadType)
+      if (leadType && !isSales) params.set('leadType', leadType)
       if (priority) params.set('priority', priority)
       if (keyword.trim()) params.set('keyword', keyword.trim())
       const data = await api.get<any>('/leads/comments?' + params.toString())
       setLeads(data.leads || [])
       setPagination(data.pagination || null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '评论线索加载失败')
+      setError(err instanceof Error ? err.message : `${noun}加载失败`)
     } finally {
       setLoading(false)
     }
-  }, [status, platform, leadType, priority, keyword])
+  }, [status, platform, leadType, priority, keyword, category, isSales, noun])
 
-  useEffect(() => { load(1) }, [status, platform, leadType, priority]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load(1) }, [status, platform, leadType, priority, category]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
@@ -117,13 +119,15 @@ export function LeadsQueue({ initial }: { initial?: Record<string, string> }) {
         onChange={setStatus}
       />
 
-      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? leads.length)} 条评论线索`}>
+      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? leads.length)} 条${noun}`}>
         <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
           {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
-        <WorkbenchSelect value={leadType} onChange={e => setLeadType(e.target.value)}>
-          {TYPE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </WorkbenchSelect>
+        {!isSales && (
+          <WorkbenchSelect value={leadType} onChange={e => setLeadType(e.target.value)}>
+            {TYPE_OPTIONS.filter(o => o.value !== 'sales_intent').map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </WorkbenchSelect>
+        )}
         <WorkbenchSelect value={priority} onChange={e => setPriority(e.target.value)}>
           {PRIORITY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
@@ -149,7 +153,7 @@ export function LeadsQueue({ initial }: { initial?: Record<string, string> }) {
         {loading ? (
           <div className="flex justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
         ) : !leads.length ? (
-          <EmptyState icon={MessageSquareWarning} title="暂无评论线索" description="采集评论并完成判断后，需跟进的评论会沉淀到这里" />
+          <EmptyState icon={MessageSquareWarning} title={`暂无${noun}`} description={isSales ? '采集评论后，含购买意向/询价/留联系方式的评论会沉淀到这里' : '采集评论并完成判断后，需跟进的负面/风险评论会沉淀到这里'} />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[1140px] text-sm">
@@ -219,7 +223,7 @@ export function LeadsQueue({ initial }: { initial?: Record<string, string> }) {
 
         {pagination && pagination.totalPages > 1 && (
           <div className="flex items-center justify-between border-t border-border px-4 py-3">
-            <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条线索</span>
+            <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条{noun}</span>
             <div className="flex items-center gap-1">
               <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}><ChevronLeft className="h-4 w-4" /></Button>
               <span className="px-3 text-sm tabular-nums text-muted-foreground">{pagination.page} / {pagination.totalPages}</span>

@@ -57,6 +57,7 @@ export function IssuesQueue({ initial }: { initial?: Record<string, string> }) {
   return (
     <div className="space-y-4">
       <WorkbenchTabs tabs={STATUS_TABS} activeKey={status} onChange={setStatus} />
+      <p className="text-[12px] text-muted-foreground">问题 = 从「内容分诊」点「转问题」升级而来，用于把同一事件下的多条内容归到一起、跨内容跟踪处理进度。</p>
 
       {loading ? (
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>

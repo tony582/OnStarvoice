@@ -3,8 +3,8 @@ import { TriageQueue } from '@/pages/workbench/TriageQueue'
 import { LeadsQueue } from '@/pages/workbench/LeadsQueue'
 import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
 
-type QueueKey = 'triage' | 'leads' | 'issues'
-const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'issues']
+type QueueKey = 'triage' | 'leads' | 'salesleads' | 'issues'
+const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'salesleads', 'issues']
 
 /**
  * 舆情工作台:队列(内容分诊/评论线索/问题处置)已移到侧边栏二级导航,
@@ -19,7 +19,8 @@ export function WorkbenchPage() {
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
       {queue === 'triage' && <TriageQueue initial={initial} />}
-      {queue === 'leads' && <LeadsQueue initial={initial} />}
+      {queue === 'leads' && <LeadsQueue initial={initial} category="opinion" />}
+      {queue === 'salesleads' && <LeadsQueue key="sales" initial={initial} category="sales" />}
       {queue === 'issues' && <IssuesQueue initial={initial} />}
     </div>
   )

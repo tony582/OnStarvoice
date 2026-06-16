@@ -17,9 +17,10 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 ]
 
 // 舆情工作台下的二级队列(在侧边栏纵向展开,替代主区横向卡片带)
-const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey: keyof Badges; dot: string }> = [
+const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
-  { queue: 'leads', label: '评论线索', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
+  { queue: 'leads', label: '舆情评论', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
+  { queue: 'salesleads', label: '销售客资', dot: 'bg-emerald-500' },
   { queue: 'issues', label: '问题处置', badgeKey: 'issuesOpen', dot: 'bg-rose-500' },
 ]
 
@@ -147,7 +148,7 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
                 <span className="absolute bottom-1.5 left-[18px] top-1.5 w-px bg-sidebar-border" />
                 {WORKBENCH_QUEUES.map(q => {
                   const on = onWorkbench && activeQueue === q.queue
-                  const count = badges[q.badgeKey]
+                  const count = q.badgeKey ? badges[q.badgeKey] : 0
                   return (
                     <button key={q.queue} onClick={() => onNavigate('workbench', { queue: q.queue })}
                       className={cn(

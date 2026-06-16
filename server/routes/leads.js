@@ -7,6 +7,7 @@ const router = Router();
 const LEAD_STATUSES = new Set(['new', 'following', 'resolved', 'ignored']);
 const LEAD_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const LEAD_TYPES = new Set([
+  'sales_intent',
   'complaint', 'renewal_billing', 'app_issue', 'service_quality',
   'safety_privacy', 'brand_risk', 'other',
 ]);
@@ -36,6 +37,13 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     if (leadType && LEAD_TYPES.has(String(leadType))) {
       params.push(leadType);
       where += ` AND lead_type = $${params.length}`;
+    }
+    // 大类:sales=销售客资(购买意向),opinion=舆情评论(其余风险类)
+    const category = String(req.query.category || '');
+    if (category === 'sales') {
+      where += ` AND lead_type = 'sales_intent'`;
+    } else if (category === 'opinion') {
+      where += ` AND lead_type <> 'sales_intent'`;
     }
     if (priority && LEAD_PRIORITIES.has(String(priority))) {
       params.push(priority);

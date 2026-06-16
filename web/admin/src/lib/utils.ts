@@ -63,9 +63,9 @@ export const LABELS = {
   reportStatus: { generating: '生成中', generated: '待发送', sent: '已发送', skipped: '无新增', failed: '失败' } as Record<string, string>,
   leadStatus: { new: '新线索', following: '跟进中', resolved: '已处理', ignored: '已忽略' } as Record<string, string>,
   leadType: {
-    complaint: '投诉维权', renewal_billing: '续费收费', app_issue: 'App故障',
-    service_quality: '服务求助', safety_privacy: '安全隐私', brand_risk: '品牌风险',
-    other: '其他跟进',
+    sales_intent: '购买意向', complaint: '投诉维权', renewal_billing: '续费收费',
+    app_issue: 'App故障', service_quality: '服务求助', safety_privacy: '安全隐私',
+    brand_risk: '品牌风险', other: '其他跟进',
   } as Record<string, string>,
   recordType: {
     single_note: '单笔记', keyword_notes: '关键词笔记', blogger_profile: '博主信息',

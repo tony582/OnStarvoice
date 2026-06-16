@@ -1,4 +1,10 @@
 const LEAD_TYPE_KEYWORDS = {
+  // 销售客资:购买意向 / 询价 / 留联系方式(优先识别,归到「销售客资」)
+  sales_intent: [
+    '多少钱', '价格', '报价', '怎么买', '哪里买', '哪买', '在哪买', '求链接', '链接',
+    '优惠', '团购', '想买', '入手', '下单', '购买', '试驾', '预约', '门店', '经销商',
+    '4s', '加微信', '微信', '威信', 'vx', 'v信', '私聊', '私信', '电话', '联系方式',
+  ],
   complaint: ['投诉', '维权', '差评', '坑人', '被骗', '垃圾', '恶心'],
   renewal_billing: ['续费', '收费', '不续费', '乱扣', '扣费', '贵', '年费'],
   app_issue: ['闪退', '打不开', '连不上', '不能用', '故障', '坏了', '无法使用', 'app'],
@@ -6,6 +12,11 @@ const LEAD_TYPE_KEYWORDS = {
   safety_privacy: ['安全', '事故', '召回', '失控', '泄露', '隐私', '刹车', '起火'],
   brand_risk: ['失望', '无语', '拉黑', '避雷', '品牌', '口碑'],
 };
+
+// 销售客资 vs 舆情评论 的归类
+export function isSalesLeadType(leadType) {
+  return String(leadType || '') === 'sales_intent';
+}
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -49,6 +60,10 @@ function matchedKeywordsFor(comment, record = {}) {
 }
 
 function resolveLeadType(comment) {
+  const text0 = normalizeText(comment.content).toLowerCase();
+  // 购买意向优先 → 销售客资
+  if (hasAnyKeyword(text0, LEAD_TYPE_KEYWORDS.sales_intent)) return 'sales_intent';
+
   const category = normalizeText(comment.category);
   if (category === 'safety_rescue' || category === 'privacy') return 'safety_privacy';
   if (category === 'app_issue') return 'app_issue';
