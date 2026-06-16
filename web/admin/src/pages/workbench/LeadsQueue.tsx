@@ -12,6 +12,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
+import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
@@ -62,6 +63,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [batchBusy, setBatchBusy] = useState(false)
   const [drawer, setDrawer] = useState<any>(null)
+  const { ask, dialog } = useNotePrompt()
 
   const sel = useSelection(`${status}|${platform}|${leadType}|${priority}|${keyword}|${pagination?.page ?? 1}`)
 
@@ -95,7 +97,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   }, [load, pagination, leads.length, refreshBadges])
 
   const updateLeadStatus = async (id: string, nextStatus: string): Promise<boolean> => {
-    const note = prompt('处理备注（选填，记录如何跟进 / 结果，便于回看留痕）：', '')
+    const note = await ask({ title: `${noun}处理备注`, placeholder: '例如：已私信用户跟进 / 已转交销售 / 与本品牌无关' })
     if (note === null) return false // 取消则不处理，避免误点即消失
     await api.patch('/leads/comments/' + id, { status: nextStatus, note })
     await reloadAfterMutation()
@@ -250,6 +252,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           onSetStatus={async (s) => { if (await updateLeadStatus(drawer.id, s)) setDrawer(null) }}
         />
       )}
+      {dialog}
     </div>
   )
 }

@@ -13,6 +13,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
+import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
@@ -44,6 +45,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [batchBusy, setBatchBusy] = useState(false)
+  const { ask, dialog } = useNotePrompt()
 
   const sel = useSelection(`${status}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
@@ -79,7 +81,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const updateTriage = async (recordId: string, newStatus: string, opts?: { note?: string }) => {
     let note = opts?.note
     if (note === undefined) {
-      const input = prompt('处理备注（选填，记录如何处理 / 原因，便于回看留痕）：', '')
+      const input = await ask({ title: '内容处理备注', placeholder: '例如：已官方回复 / 已上报 / 误报无需处理' })
       if (input === null) { setOpenMenu(null); return } // 取消则不处理，避免误点即消失
       note = input
     }
@@ -95,8 +97,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }
 
   const linkIssue = async (recordId: string) => {
-    const title = prompt('问题标题（简述负面舆情要点）：')
-    if (!title) return
+    const title = await ask({ title: '转为问题', placeholder: '简述负面舆情要点，作为问题标题', confirmLabel: '创建问题' })
+    if (!title || !title.trim()) return
     await api.post('/triage/records/' + recordId + '/issues', { title })
     await reloadAfterMutation()
   }
@@ -282,6 +284,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
       {/* 详情:盖式滑出面板(无遮罩,盖在列表右侧,左侧仍可点)*/}
       {drawerProps && <RecordDrawer {...drawerProps} />}
+      {dialog}
     </div>
   )
 }
