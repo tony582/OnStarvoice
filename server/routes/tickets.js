@@ -12,7 +12,7 @@ const TICKET_COLUMNS = `
   id, source_type, source_record_id, source_comment_id,
   platform, title, item_text, author, url, cover_url,
   category, priority, status,
-  assignee_name, created_by_name, dispatch_note,
+  assignee_user_id, assignee_name, created_by_name, dispatch_note,
   handle_result, handle_note, handled_by_name, handled_at,
   feedback_status, reviewed_by_name, reviewed_at, review_note,
   created_at, updated_at
@@ -33,8 +33,21 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
       return res.status(400).json({ ok: false, error: 'invalid_source', message: '来源无效' });
     }
     const priority = PRIORITIES.has(String(req.body?.priority)) ? String(req.body.priority) : '';
-    const assigneeName = String(req.body?.assigneeName || '').trim();
     const dispatchNote = String(req.body?.note || '');
+
+    // 指派:优先用 assigneeUserId(下拉选人),校验是本租户在职成员后反查姓名作快照
+    const assigneeUserId = String(req.body?.assigneeUserId || '').trim() || null;
+    let assigneeName = String(req.body?.assigneeName || '').trim();
+    if (assigneeUserId) {
+      const member = await queryOne(
+        `SELECT COALESCE(NULLIF(u.name, ''), u.email) AS display
+         FROM users u JOIN user_memberships m ON m.user_id = u.id
+         WHERE u.id = $1 AND m.tenant_id = $2 AND u.status = 'active' AND m.status = 'active'`,
+        [assigneeUserId, req.tenantId],
+      );
+      if (!member) return res.status(400).json({ ok: false, error: 'invalid_assignee', message: '指派对象不在本租户' });
+      assigneeName = member.display;
+    }
 
     // 防重:同一源若已有未关闭工单,直接返回它
     const existing = await queryOne(
@@ -71,9 +84,9 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
         `INSERT INTO tickets (
            tenant_id, source_type, source_record_id, source_comment_id,
            platform, title, item_text, author, url, cover_url,
-           category, priority, assignee_name,
+           category, priority, assignee_user_id, assignee_name,
            created_by_user_id, created_by_name, dispatch_note
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
          RETURNING ${TICKET_COLUMNS}`,
         [
           req.tenantId, sourceType,
@@ -81,7 +94,7 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           sourceType === 'comment' ? sourceId : null,
           snap.platform || '', snap.title || '', snap.item_text || '', snap.author || '',
           snap.url || '', snap.cover_url || '',
-          snap.category || '', priority || snap.src_priority || 'normal', assigneeName,
+          snap.category || '', priority || snap.src_priority || 'normal', assigneeUserId, assigneeName,
           req.user?.id || null, req.user?.name || req.user?.email || '', dispatchNote,
         ],
       );
@@ -111,7 +124,9 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
 // ==================== 舆情处理(客服侧:工单队列)====================
 router.get('/', requireTenantAccess, async (req, res, next) => {
   try {
-    const status = QUEUE_STATES.includes(String(req.query.status)) ? String(req.query.status) : '';
+    // status: 'open'=待处理(pending+doing 合并) / 'done' / 'dismissed';兼容单值
+    const rawStatus = String(req.query.status || '');
+    const status = rawStatus === 'open' ? 'open' : QUEUE_STATES.includes(rawStatus) ? rawStatus : '';
     const type = ['content', 'comment'].includes(String(req.query.type)) ? String(req.query.type) : '';
     const platform = String(req.query.platform || '');
     const priority = PRIORITIES.has(String(req.query.priority)) ? String(req.query.priority) : '';
@@ -134,7 +149,8 @@ router.get('/', requireTenantAccess, async (req, res, next) => {
 
     const listParams = [...params];
     let listWhere = where;
-    if (status) { listParams.push(status); listWhere += ` AND status = $${listParams.length}`; }
+    if (status === 'open') { listWhere += ` AND status IN ('pending', 'doing')`; }
+    else if (status) { listParams.push(status); listWhere += ` AND status = $${listParams.length}`; }
 
     const total = (await queryOne(`SELECT COUNT(*)::int AS total FROM tickets ${listWhere}`, listParams))?.total || 0;
     listParams.push(pageSize, (page - 1) * pageSize);
@@ -178,6 +194,21 @@ router.get('/dispatched', requireTenantAccess, async (req, res, next) => {
       params,
     );
     return res.json({ ok: true, items, counts, total, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } });
+  } catch (err) { return next(err); }
+});
+
+// ==================== 可指派成员(本租户在职、有写权限的成员)====================
+router.get('/assignees', requireTenantAccess, async (req, res, next) => {
+  try {
+    const items = await queryAll(
+      `SELECT u.id AS "userId", COALESCE(NULLIF(u.name, ''), u.email) AS name, u.email, m.role
+       FROM user_memberships m JOIN users u ON u.id = m.user_id
+       WHERE m.tenant_id = $1 AND m.status = 'active' AND u.status = 'active'
+         AND m.role IN ('tenant_admin', 'tenant_analyst')
+       ORDER BY u.name`,
+      [req.tenantId],
+    );
+    return res.json({ ok: true, items });
   } catch (err) { return next(err); }
 });
 

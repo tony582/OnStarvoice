@@ -112,11 +112,12 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     return true
   }
 
-  const dispatchTicket = async (lead: any) => {
+  const dispatchTicket = async (lead: any): Promise<boolean> => {
     const r = await dispatch({ summary: lead.comment_content, defaultPriority: lead.priority })
-    if (!r) return
-    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, priority: r.priority, assigneeName: r.assigneeName, note: r.note })
+    if (!r) return false
+    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
     await reloadAfterMutation()
+    return true
   }
 
   const runBatch = async (nextStatus: string) => {
@@ -274,8 +275,11 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           lead={drawer}
           noun={noun}
           canWrite={canWrite()}
+          isSales={isSales}
+          bucket={isSales ? '' : status}
           onClose={() => setDrawer(null)}
           onSetStatus={async (s) => { if (await updateLeadStatus(drawer.id, s)) setDrawer(null) }}
+          onDispatch={async () => { if (await dispatchTicket(drawer)) setDrawer(null) }}
         />
       )}
       {dialog}

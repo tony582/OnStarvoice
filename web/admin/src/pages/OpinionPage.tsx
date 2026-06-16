@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2, Inbox, Search, RefreshCw, ChevronLeft, ChevronRight, ExternalLink, UserCog } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
@@ -13,10 +13,9 @@ import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
 const STATE_TABS = [
-  { key: 'pending', label: '待处理' },
-  { key: 'doing', label: '处理中' },
-  { key: 'done', label: '已处理' },
-  { key: 'dismissed', label: '已忽略' },
+  { key: 'open', label: '待处理', countKeys: ['pending', 'doing'] },
+  { key: 'done', label: '已处理', countKeys: ['done'] },
+  { key: 'dismissed', label: '已忽略', countKeys: ['dismissed'] },
 ]
 const TYPE_OPTIONS = [
   { value: '', label: '全部来源' },
@@ -39,7 +38,10 @@ export function OpinionPage() {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
   const { ask, dialog } = useNotePrompt()
-  const [state, setState] = useState('pending')
+  const [state, setState] = useState('open')
+  const [toast, setToast] = useState('')
+  const toastTimer = useRef<number | undefined>(undefined)
+  useEffect(() => () => window.clearTimeout(toastTimer.current), [])
   const [type, setType] = useState('')
   const [platform, setPlatform] = useState('')
   const [keyword, setKeyword] = useState('')
@@ -82,6 +84,11 @@ export function OpinionPage() {
     setDrawer(null)
     await load(pagination?.page ?? 1)
     refreshBadges()
+    if (action === 'done' || action === 'dismiss') {
+      setToast(action === 'done' ? '已处理完成,已回执给分诊确认' : '已忽略,已回执给分诊')
+      window.clearTimeout(toastTimer.current)
+      toastTimer.current = window.setTimeout(() => setToast(''), 2600)
+    }
   }
 
   return (
@@ -89,7 +96,7 @@ export function OpinionPage() {
       <p className="text-[13px] text-muted-foreground">分诊团队转来的工单在这里处理:认领 →「处理中」→ 处理完成。处理完会回执给分诊确认。</p>
 
       <WorkbenchTabs
-        tabs={STATE_TABS.map(t => ({ key: t.key, label: `${t.label}${counts[t.key] ? ` (${counts[t.key]})` : ''}` }))}
+        tabs={STATE_TABS.map(t => { const n = t.countKeys.reduce((s, k) => s + (counts[k] || 0), 0); return { key: t.key, label: `${t.label}${n ? ` (${n})` : ''}` } })}
         activeKey={state}
         onChange={setState}
       />
@@ -113,7 +120,7 @@ export function OpinionPage() {
       ) : error ? (
         <EmptyState icon={Inbox} title="加载失败" description={error} />
       ) : items.length === 0 ? (
-        <EmptyState icon={Inbox} title={`暂无${STATE_LABEL[state]}的工单`} description="分诊团队在「工作台」点【转工单】后,工单会进入这里" />
+        <EmptyState icon={Inbox} title={`暂无${STATE_TABS.find(t => t.key === state)?.label || ''}的工单`} description="分诊团队在「工作台」点【转工单】后,工单会进入这里" />
       ) : (
         <WorkbenchTableShell>
           <table className="w-full min-w-[940px] text-sm">
@@ -159,14 +166,9 @@ export function OpinionPage() {
                   </td>
                   <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
                     <div className="flex flex-wrap justify-end gap-1">
-                      {canWrite() && it.status === 'pending' && <>
-                        <Button variant="outline" size="sm" onClick={() => act(it, 'start')}>开始处理</Button>
-                        <Button variant="outline" size="sm" onClick={() => act(it, 'done', true)}>处理完成</Button>
+                      {canWrite() && (it.status === 'pending' || it.status === 'doing') && <>
+                        <Button size="sm" onClick={() => act(it, 'done', true)}>处理完成</Button>
                         <Button variant="ghost" size="sm" onClick={() => act(it, 'dismiss', true)}>忽略</Button>
-                      </>}
-                      {canWrite() && it.status === 'doing' && <>
-                        <Button variant="outline" size="sm" onClick={() => act(it, 'done', true)}>处理完成</Button>
-                        <Button variant="ghost" size="sm" onClick={() => act(it, 'back')}>退回</Button>
                       </>}
                       {(it.status === 'done' || it.status === 'dismissed') &&
                         <span className="text-[11px] text-muted-foreground">{it.feedback_status === 'pending_review' ? '待分诊确认' : '已完成'}</span>}
@@ -196,6 +198,11 @@ export function OpinionPage() {
         />
       )}
       {dialog}
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 z-[70] -translate-x-1/2 rounded-lg bg-foreground px-4 py-2.5 text-[13px] font-medium text-background shadow-lg animate-in fade-in slide-in-from-bottom-2">
+          {toast}
+        </div>
+      )}
     </div>
   )
 }

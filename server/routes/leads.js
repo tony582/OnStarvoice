@@ -131,12 +131,14 @@ router.patch('/comments/batch', requireTenantAccess, requireTenantWriter, async 
 
     let updatedRows = [];
     if (validIds.length) {
+      // following = 已转工单,批量置 following 仅对销售客资生效,舆情评论跳过(应走转工单)
+      const followingGuard = status === 'following' ? ` AND lead_type = 'sales_intent'` : '';
       updatedRows = await queryAll(`
         UPDATE comment_leads
         SET status = COALESCE($3, status),
           priority = COALESCE($4, priority),
           updated_at = now()
-        WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        WHERE tenant_id = $1 AND id = ANY($2::uuid[])${followingGuard}
         RETURNING id
       `, [req.tenantId, validIds, status, priority]);
     }
@@ -158,6 +160,13 @@ router.patch('/comments/:id', requireTenantAccess, requireTenantWriter, async (r
     if (status) {
       if (!LEAD_STATUSES.has(status)) {
         return res.status(400).json({ ok: false, error: 'invalid_status', message: '线索状态无效' });
+      }
+      // following = 已转工单,只能由 POST /tickets 设置;舆情评论不允许手动置 following
+      if (status === 'following') {
+        const row = await queryOne('SELECT lead_type FROM comment_leads WHERE id = $1 AND tenant_id = $2', [req.params.id, req.tenantId]);
+        if (row && row.lead_type !== 'sales_intent') {
+          return res.status(400).json({ ok: false, error: 'following_via_ticket_only', message: '舆情评论请用「转工单」流转,不要用跟进' });
+        }
       }
       params.push(status);
       updates.push(`status = $${params.length}`);

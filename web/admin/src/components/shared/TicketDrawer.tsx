@@ -193,14 +193,9 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
         {/* Footer 操作 */}
         {canWrite && (onAction || onReview) && (
           <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border/60 px-6 py-3.5">
-            {onAction && t.status === 'pending' && <>
-              <Button variant="outline" size="sm" onClick={() => onAction('start')}>开始处理</Button>
+            {onAction && (t.status === 'pending' || t.status === 'doing') && <>
               <Button size="sm" onClick={() => onAction('done')}>处理完成</Button>
               <Button variant="ghost" size="sm" onClick={() => onAction('dismiss')}>忽略</Button>
-            </>}
-            {onAction && t.status === 'doing' && <>
-              <Button size="sm" onClick={() => onAction('done')}>处理完成</Button>
-              <Button variant="ghost" size="sm" onClick={() => onAction('back')}>退回</Button>
             </>}
             {onAction && (t.status === 'done' || t.status === 'dismissed') &&
               <span className="text-[12px] text-muted-foreground">{t.feedback_status === 'pending_review' ? '已提交,待分诊确认' : '已完成'}</span>}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, ExternalLink, MessageCircle, Footprints, CheckCheck, CircleSlash } from 'lucide-react'
+import { X, ExternalLink, MessageCircle, Footprints, CheckCheck, CircleSlash, Send } from 'lucide-react'
 import { formatNumber, formatDate, formatFullDate, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
@@ -10,12 +10,15 @@ const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
  * 评论线索详情抽屉(舆情评论 / 销售客资 共用)。
  * 右侧停靠、可拖宽(与内容分诊一致),展示原帖 + 评论全文 + 线索判断 + 处理留痕,底部直接处理。
  */
-export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, noun }: {
+export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDispatch, noun, isSales = false, bucket = '' }: {
   lead: any
   onClose: () => void
   canWrite: boolean
   onSetStatus: (status: string) => void
+  onDispatch?: () => void
   noun: string
+  isSales?: boolean
+  bucket?: string
 }) {
   const panelRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(() => {
@@ -148,12 +151,20 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, noun }
           <div className="text-[11px] text-muted-foreground">采集于 {formatDate(lead.captured_at)}</div>
         </div>
 
-        {/* Footer 操作 */}
+        {/* Footer 操作:销售=跟进/处理/忽略;舆情=转工单/归档/忽略(已归档只读)*/}
         {canWrite && (
           <div className="flex items-center justify-end gap-2 border-t border-border/50 px-6 py-3.5">
-            <Act icon={Footprints} label="跟进" status="following" />
-            <Act icon={CheckCheck} label="处理" status="resolved" />
-            <Act icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
+            {isSales ? <>
+              <Act icon={Footprints} label="跟进" status="following" />
+              <Act icon={CheckCheck} label="处理" status="resolved" />
+              <Act icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
+            </> : bucket === 'archived' ? (
+              <span className="text-[12px] text-muted-foreground">已归档,无需操作</span>
+            ) : <>
+              <Button size="sm" onClick={onDispatch}><Send className="h-3.5 w-3.5" />转工单</Button>
+              <Act icon={CheckCheck} label="归档" status="resolved" />
+              <Act icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
+            </>}
           </div>
         )}
       </div>

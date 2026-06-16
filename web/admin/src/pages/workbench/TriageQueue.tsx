@@ -99,7 +99,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const dispatchTicket = async (record: any) => {
     const r = await dispatch({ summary: record.title || record.content, defaultPriority: record.triage_priority })
     if (!r) return
-    await api.post('/tickets', { sourceType: 'content', sourceId: record.id, priority: r.priority, assigneeName: r.assigneeName, note: r.note })
+    await api.post('/tickets', { sourceType: 'content', sourceId: record.id, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
     await reloadAfterMutation()
   }
 
