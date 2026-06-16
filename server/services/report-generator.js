@@ -318,12 +318,22 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['count', 'negative_count']);
 
+  // 地域可能落在 payload 顶层(微博)或嵌在 detailPayload / items[0](小红书/抖音单篇·博主笔记),
+  // 键名有 publishLocation / region / ipLocation / ip_location 等多种,逐层兜底。
   const regionDistribution = normalizeRows(await queryAll(
     `${observedCte}
      SELECT COALESCE(
        NULLIF(payload->>'publishLocation', ''),
        NULLIF(payload->>'region', ''),
        NULLIF(payload->>'ipLocation', ''),
+       NULLIF(payload->>'ip_location', ''),
+       NULLIF(payload->'detailPayload'->>'publishLocation', ''),
+       NULLIF(payload->'detailPayload'->>'region', ''),
+       NULLIF(payload->'detailPayload'->>'ipLocation', ''),
+       NULLIF(payload->'detailPayload'->>'ip_location', ''),
+       NULLIF(payload->'items'->0->>'publishLocation', ''),
+       NULLIF(payload->'items'->0->>'region', ''),
+       NULLIF(payload->'items'->0->>'ipLocation', ''),
        '未采集'
      ) as region,
        COUNT(*) as count,
