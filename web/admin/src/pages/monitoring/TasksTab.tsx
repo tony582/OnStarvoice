@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Loader2, Radar, Play, Target, Plus, Clock, AlertTriangle } from 'lucide-react'
+import { Loader2, Radar, Play, Target, Clock, AlertTriangle } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, platformName, formatNumber } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -29,15 +29,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
 
   useEffect(() => { load() }, [])
 
-  const create = async () => {
-    const keyword = prompt('监控关键词：')
-    if (!keyword) return
-    const platform = prompt('平台 (xiaohongshu / douyin / weibo)：', 'xiaohongshu')
-    if (!platform) return
-    await api.post('/monitor/subscriptions', { keyword, platform, cadenceMinutes: 1440 })
-    load()
-  }
-
   const runNow = async (id: string) => {
     await api.post('/monitor/run-now', { subscriptionId: id })
     load()
@@ -55,13 +46,13 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
           <Stat label="运行中" value={formatNumber(active)} icon={Clock} tone="green" />
           <Stat label="异常" value={formatNumber(errored)} icon={AlertTriangle} tone={errored > 0 ? 'red' : 'default'} />
         </div>
-        <Button onClick={create} disabled={!canWrite()}><Plus className="h-4 w-4" />新建监控</Button>
+        <span className="text-[12px] text-muted-foreground">在扩展「对标监控」里把竞品博主纳入监控,这里查看并执行扫描</span>
       </div>
 
       {loading ? (
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
       ) : subs.length === 0 ? (
-        <EmptyState icon={Radar} title="暂无监控任务" description="创建关键词监控以自动采集舆情内容" />
+        <EmptyState icon={Radar} title="暂无监控账号" description="在扩展「对标监控」标签把竞品博主纳入监控,即可在此查看与执行" />
       ) : (
         <WorkbenchTableShell>
           <table className="w-full text-sm">
