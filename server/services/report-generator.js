@@ -350,7 +350,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        COUNT(*) FILTER (WHERE o.sentiment = 'negative') as negative_count
      FROM observed o
      LEFT JOIN author_loc al ON al.author_id = o.author_id AND COALESCE(o.author_id, '') <> ''
-     GROUP BY region
+     GROUP BY 1
      ORDER BY count DESC
      LIMIT 8`,
     params
@@ -365,7 +365,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM record_comments rc
      JOIN observed o ON o.id = rc.record_id
      WHERE rc.tenant_id = $1 AND rc.is_official = false
-     GROUP BY region
+     GROUP BY 1
      ORDER BY count DESC
      LIMIT 8`,
     params
