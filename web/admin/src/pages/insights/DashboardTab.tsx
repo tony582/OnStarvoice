@@ -218,9 +218,7 @@ export function DashboardTab() {
             <Panel title="媒体/来源类型">
               <Distribution rows={s.mediaDistribution || []} labelKey="media_type" />
             </Panel>
-            <Panel title="地域/发布位置">
-              <Distribution rows={s.regionDistribution || []} labelKey="region" />
-            </Panel>
+            <RegionPanel content={s.regionDistribution || []} comment={s.commentRegionDistribution || []} />
           </section>
         </>
       )}
@@ -361,6 +359,30 @@ function SentimentRing({ rows }: { rows: any[] }) {
         ))}
       </div>
     </div>
+  )
+}
+
+function RegionPanel({ content, comment }: { content: any[]; comment: any[] }) {
+  const [mode, setMode] = useState<'content' | 'comment'>('content')
+  const rows = mode === 'content' ? content : comment
+  return (
+    <section className="overflow-hidden rounded-lg border border-border bg-card">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
+        <h3 className="text-sm font-bold">地域/发布位置</h3>
+        <div className="inline-flex rounded-lg bg-muted p-0.5 text-[12px] font-semibold">
+          {([['content', '内容'], ['comment', '评论']] as const).map(([k, label]) => (
+            <button key={k} onClick={() => setMode(k)}
+              className={`rounded-md px-2.5 py-1 transition-colors ${mode === k ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="p-5">
+        <Distribution rows={rows} labelKey="region" />
+        <p className="mt-3 text-[11px] text-muted-foreground">{mode === 'content' ? '内容地域:博主内容沿用其作者属地回填,仍取不到才记未采集' : '评论地域:取评论自带的 IP 属地,数据最全'}</p>
+      </div>
+    </section>
   )
 }
 

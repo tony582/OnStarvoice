@@ -319,27 +319,52 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['count', 'negative_count']);
 
-  // 地域可能落在 payload 顶层(微博)或嵌在 detailPayload / items[0](小红书/抖音单篇·博主笔记),
-  // 键名有 publishLocation / region / ipLocation / ip_location 等多种,逐层兜底。
+  // 内容地域:本帖 payload 取不到时,用「该作者在别处已知的属地」回填(博主发的内容沿用博主 IP),
+  // 仍取不到才记未采集。OWN_REGION 逐层兜底(顶层/detailPayload/items[0] × publishLocation/region/ipLocation)。
+  const OWN_REGION = `COALESCE(
+    NULLIF(payload->>'publishLocation', ''),
+    NULLIF(payload->>'region', ''),
+    NULLIF(payload->>'ipLocation', ''),
+    NULLIF(payload->>'ip_location', ''),
+    NULLIF(payload->'detailPayload'->>'publishLocation', ''),
+    NULLIF(payload->'detailPayload'->>'region', ''),
+    NULLIF(payload->'detailPayload'->>'ipLocation', ''),
+    NULLIF(payload->'detailPayload'->>'ip_location', ''),
+    NULLIF(payload->'items'->0->>'publishLocation', ''),
+    NULLIF(payload->'items'->0->>'region', ''),
+    NULLIF(payload->'items'->0->>'ipLocation', '')
+  )`;
   const regionDistribution = normalizeRows(await queryAll(
-    `${observedCte}
-     SELECT COALESCE(
-       NULLIF(payload->>'publishLocation', ''),
-       NULLIF(payload->>'region', ''),
-       NULLIF(payload->>'ipLocation', ''),
-       NULLIF(payload->>'ip_location', ''),
-       NULLIF(payload->'detailPayload'->>'publishLocation', ''),
-       NULLIF(payload->'detailPayload'->>'region', ''),
-       NULLIF(payload->'detailPayload'->>'ipLocation', ''),
-       NULLIF(payload->'detailPayload'->>'ip_location', ''),
-       NULLIF(payload->'items'->0->>'publishLocation', ''),
-       NULLIF(payload->'items'->0->>'region', ''),
-       NULLIF(payload->'items'->0->>'ipLocation', ''),
-       '未采集'
-     ) as region,
+    `${observedCte}, author_loc AS (
+       SELECT author_id, mode() WITHIN GROUP (ORDER BY own_region) AS region
+       FROM (
+         SELECT author_id, ${OWN_REGION} AS own_region
+         FROM records
+         WHERE tenant_id = $1 AND COALESCE(author_id, '') <> ''
+       ) s
+       WHERE own_region IS NOT NULL AND own_region <> ''
+       GROUP BY author_id
+     )
+     SELECT COALESCE(${OWN_REGION}, al.region, '未采集') AS region,
        COUNT(*) as count,
-       COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count
-     FROM observed
+       COUNT(*) FILTER (WHERE o.sentiment = 'negative') as negative_count
+     FROM observed o
+     LEFT JOIN author_loc al ON al.author_id = o.author_id AND COALESCE(o.author_id, '') <> ''
+     GROUP BY region
+     ORDER BY count DESC
+     LIMIT 8`,
+    params
+  ), ['count', 'negative_count']);
+
+  // 评论地域:评论自带 IP 属地,数据最全,单列一份口径供「内容 / 评论」切换
+  const commentRegionDistribution = normalizeRows(await queryAll(
+    `${observedCte}
+     SELECT COALESCE(NULLIF(rc.ip_location, ''), '未采集') AS region,
+       COUNT(*) as count,
+       COUNT(*) FILTER (WHERE rc.is_negative) as negative_count
+     FROM record_comments rc
+     JOIN observed o ON o.id = rc.record_id
+     WHERE rc.tenant_id = $1 AND rc.is_official = false
      GROUP BY region
      ORDER BY count DESC
      LIMIT 8`,
@@ -576,6 +601,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     sentimentTrend: volumeTrend,
     mediaDistribution,
     regionDistribution,
+    commentRegionDistribution,
     sentimentSamples,
     topNegative,
     topInteraction,
