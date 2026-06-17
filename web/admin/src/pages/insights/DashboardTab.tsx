@@ -620,7 +620,7 @@ function WordCloud({ terms }: { terms: any[] }) {
   const ref = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(560)
   const [placed, setPlaced] = useState<any[]>([])
-  const H = 300
+  const H = 340
 
   useEffect(() => {
     const el = ref.current
@@ -634,14 +634,16 @@ function WordCloud({ terms }: { terms: any[] }) {
 
   useEffect(() => {
     if (!terms.length || !width) { setPlaced([]); return }
-    const top = terms.slice(0, 50)
+    const top = terms.slice(0, 60)
     const ws = top.map(t => Number(t.weight) || Number(t.count) || 1)
     const max = Math.max(...ws, 1), min = Math.min(...ws)
+    const maxFont = Math.min(58, Math.max(34, Math.round(width / 11)))
     const words = top.map((t, i) => {
       const v = Number(t.weight) || Number(t.count) || 1
+      const ratio = (v - min) / (max - min || 1)
       return {
         text: String(t.label || ''),
-        size: Math.round(14 + (v - min) / (max - min || 1) * 30),
+        size: Math.round(15 + Math.pow(ratio, 0.65) * (maxFont - 15)),
         count: Number(t.count) || 0,
         tone: Number(t.tone) || i,
       }
@@ -650,8 +652,9 @@ function WordCloud({ terms }: { terms: any[] }) {
     const layout = cloud()
       .size([width, H])
       .words(words as any)
-      .padding(2)
-      .rotate(() => (Math.random() < 0.22 ? 90 : 0))
+      .padding(1)
+      .spiral('rectangular') // 矩形螺旋:填满边角,不留大空白
+      .rotate(() => (Math.random() < 0.12 ? 90 : 0))
       .font('sans-serif')
       .fontSize((d: any) => d.size)
       .on('end', (out: any[]) => { if (!cancelled) setPlaced(out) })
