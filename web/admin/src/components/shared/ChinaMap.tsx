@@ -11,12 +11,12 @@ function norm(s: string) {
   return (s || '').replace(/省|市|自治区|特别行政区|壮族|回族|维吾尔族|维吾尔/g, '').trim()
 }
 
-// 投影只拟合大陆主体(排除南海诸岛),路径模块级算一次
+// 排除南海诸岛(九段线区域是一大片,会盖在中部、抢走 hover);拟合大陆主体后只渲染主体
 const PATHS: Array<{ name: string; d: string }> = (() => {
-  const fitFC = { type: 'FeatureCollection', features: FEATURES.filter(f => f.properties?.name !== '南海诸岛') }
-  const projection = geoMercator().fitSize([W, H], fitFC as any)
+  const main = FEATURES.filter(f => f.properties?.name !== '南海诸岛')
+  const projection = geoMercator().fitSize([W, H], { type: 'FeatureCollection', features: main } as any)
   const pg = geoPath(projection as any)
-  return FEATURES.map(f => ({ name: f.properties?.name || '', d: pg(f) || '' })).filter(p => p.d)
+  return main.map(f => ({ name: f.properties?.name || '', d: pg(f) || '' })).filter(p => p.d)
 })()
 
 export default function ChinaMap({ rows }: { rows: any[] }) {
