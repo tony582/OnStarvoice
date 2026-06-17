@@ -94,11 +94,13 @@ function AppContent() {
   const PageComponent = PAGES[page]
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex h-screen overflow-hidden">
       <Sidebar activePage={page} onNavigate={navigate} collapsed={collapsed} onToggleCollapse={toggleCollapse} />
+      {/* 主区是独立滚动容器:滚动条落在主区右缘;抽屉打开时用 margin-right 让位,
+          使主区滚动条与抽屉自身滚动条分处两栏(而非都挤在视口最右)。 */}
       <main
-        className={cn('min-w-0 flex-1 py-5 pl-8 transition-[margin] duration-200', collapsed ? 'ml-14' : 'ml-[256px]')}
-        style={{ paddingRight: 'calc(2rem + var(--detail-dock-width, 0px))' }}
+        className={cn('min-w-0 flex-1 overflow-y-auto px-8 py-5 transition-[margin-left] duration-200', collapsed ? 'ml-14' : 'ml-[256px]')}
+        style={{ marginRight: 'var(--detail-dock-width, 0px)' }}
       >
         <TopBar eyebrow={config.eyebrow} title={title} />
         {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
