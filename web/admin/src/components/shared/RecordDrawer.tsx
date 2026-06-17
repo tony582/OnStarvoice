@@ -261,13 +261,6 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                           )}
                           <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
                             <span>{formatNumber(c.like_count)} 赞{c.ip_location ? ` · IP ${c.ip_location}` : ''}</span>
-                            {canWrite && c.is_negative && (
-                              <Button variant="outline" size="sm" onClick={() => {
-                                const title = prompt('问题标题', '负面评论跟进')
-                                if (!title) return
-                                api.post('/comments/' + c.id + '/issues', { title }).then(onClose)
-                              }}><LinkIcon className="h-3 w-3" />转问题</Button>
-                            )}
                           </div>
                         </div>
                       ))}

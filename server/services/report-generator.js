@@ -51,7 +51,8 @@ const ISSUE_STATUS_LABEL = {
 const TRIAGE_LABEL = {
   unhandled: '待处理',
   reviewing: '待复核',
-  issue_linked: '已转问题',
+  issue_linked: '已转工单',
+  ticketed: '已转工单',
   official_responded: '官方已响应',
   archived: '已归档',
   false_positive: '误报',
@@ -529,7 +530,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        ) as active_inbox,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') as unhandled,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') as reviewing,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'issue_linked') as issue_linked,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) as issue_linked,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'archived') as archived,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'false_positive') as false_positive
      FROM records r

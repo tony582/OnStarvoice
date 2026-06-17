@@ -136,8 +136,24 @@ export async function upsertCommentLeadForComment(tx, { tenantId, record = {}, c
       record_id = excluded.record_id,
       platform = excluded.platform,
       lead_type = excluded.lead_type,
+      -- 复发:已归档(resolved/ignored)或已转工单(ticketed,且无在途工单)的评论,
+      -- 二次采集时点赞较上次明显上涨(>+10),自动回到待处理(new)并记复发时间
+      status = CASE
+        WHEN comment_leads.status IN ('resolved', 'ignored', 'ticketed')
+          AND excluded.comment_like_count > comment_leads.comment_like_count + 10
+          AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.tenant_id = comment_leads.tenant_id AND t.source_comment_id = comment_leads.id AND t.status <> 'closed')
+        THEN 'new'
+        ELSE comment_leads.status
+      END,
+      last_risk_reopened_at = CASE
+        WHEN comment_leads.status IN ('resolved', 'ignored', 'ticketed')
+          AND excluded.comment_like_count > comment_leads.comment_like_count + 10
+          AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.tenant_id = comment_leads.tenant_id AND t.source_comment_id = comment_leads.id AND t.status <> 'closed')
+        THEN now()
+        ELSE comment_leads.last_risk_reopened_at
+      END,
       priority = CASE
-        WHEN comment_leads.status IN ('new', 'following') THEN excluded.priority
+        WHEN comment_leads.status IN ('new', 'following', 'ticketed') THEN excluded.priority
         ELSE comment_leads.priority
       END,
       record_title = excluded.record_title,

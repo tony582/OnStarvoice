@@ -98,18 +98,18 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           req.user?.id || null, req.user?.name || req.user?.email || '', dispatchNote,
         ],
       );
-      // 把源移出分诊队列:内容→已转工单(issue_linked),评论→跟进中(following)
+      // 把源移出分诊队列:内容与评论统一标记为 ticketed(已转工单)
       if (sourceType === 'content') {
         await tx.execute(
           `INSERT INTO record_triage (tenant_id, record_id, status, owner_user_id, owner_name, updated_at)
-           VALUES ($1, $2, 'issue_linked', $3, $4, now())
+           VALUES ($1, $2, 'ticketed', $3, $4, now())
            ON CONFLICT (tenant_id, record_id)
-           DO UPDATE SET status = 'issue_linked', updated_at = now()`,
+           DO UPDATE SET status = 'ticketed', updated_at = now()`,
           [req.tenantId, sourceId, req.user?.id || null, req.user?.name || req.user?.email || ''],
         );
       } else {
         await tx.execute(
-          `UPDATE comment_leads SET status = 'following', updated_at = now()
+          `UPDATE comment_leads SET status = 'ticketed', updated_at = now()
            WHERE id = $1 AND tenant_id = $2`,
           [sourceId, req.tenantId],
         );

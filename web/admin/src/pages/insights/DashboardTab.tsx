@@ -475,7 +475,7 @@ function CommentRisks({ rows }: { rows: any[] }) {
 function WorkflowSummary({ snapshot }: { snapshot: any }) {
   const rows = [
     ['待处理/复核', snapshot.workflowStats?.active_inbox || 0, 'unhandled'],
-    ['已转问题', snapshot.workflowStats?.issue_linked || 0, 'issue_linked'],
+    ['已转工单', snapshot.workflowStats?.issue_linked || 0, 'issue_linked'],
     ['官方已响应', snapshot.workflowStats?.official_responded || 0, 'official_responded'],
     ['已归档', snapshot.workflowStats?.archived || 0, 'archived'],
     ['误报', snapshot.workflowStats?.false_positive || 0, 'false_positive'],

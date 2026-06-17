@@ -62,7 +62,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     } else if (bucket === 'archived') {
-      // 已归档:误报 / 已归档 / 已响应(已转工单的 issue_linked 不在分诊视图,在工单系统里跟踪)
+      // 已归档:误报 / 已归档 / 已响应(已转工单 ticketed 不在分诊视图,在工单系统里跟踪)
       where += ` AND COALESCE(rt.status, 'unhandled') IN ('archived', 'false_positive', 'official_responded')`;
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;

@@ -50,7 +50,7 @@ export const LABELS = {
     brand_image: '品牌形象', other: '其他', '': '待分类',
   } as Record<string, string>,
   triage: {
-    unhandled: '未处理', reviewing: '待复核', issue_linked: '已转工单',
+    unhandled: '未处理', reviewing: '待复核', issue_linked: '已转工单', ticketed: '已转工单',
     official_responded: '官方已响应', archived: '已归档', false_positive: '误报',
   } as Record<string, string>,
   priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' } as Record<string, string>,
@@ -61,7 +61,7 @@ export const LABELS = {
   severity: { low: '低', medium: '中', high: '高', critical: '严重' } as Record<string, string>,
   reportType: { daily: '日报', weekly: '周报', monthly: '月报' } as Record<string, string>,
   reportStatus: { generating: '生成中', generated: '待发送', sent: '已发送', skipped: '无新增', failed: '失败' } as Record<string, string>,
-  leadStatus: { new: '新线索', following: '跟进中', resolved: '已处理', ignored: '已忽略' } as Record<string, string>,
+  leadStatus: { new: '新线索', following: '跟进中', ticketed: '已转工单', resolved: '已处理', ignored: '已忽略' } as Record<string, string>,
   leadType: {
     sales_intent: '购买意向', complaint: '投诉维权', renewal_billing: '续费收费',
     app_issue: 'App故障', service_quality: '服务求助', safety_privacy: '安全隐私',

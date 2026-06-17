@@ -324,10 +324,20 @@ async function applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, pre
   let nextStatus = '';
   let auditAction = '';
 
+  // 已转工单(ticketed/旧 issue_linked)只有在关联工单已关闭时才允许复发,避免在途工单被搅动
+  let dispatchedReopenable = false;
+  if (['ticketed', 'issue_linked'].includes(currentStatus)) {
+    const openTicket = await tx.queryOne(
+      "SELECT 1 FROM tickets WHERE tenant_id = $1 AND source_record_id = $2 AND status <> 'closed' LIMIT 1",
+      [tenantId, recordId]
+    );
+    dispatchedReopenable = !openTicket;
+  }
+
   if (officialRecord) {
     nextStatus = 'official_responded';
     auditAction = 'record.official_content_hidden';
-  } else if (aggregate.negativeCount > previousNegativeCount && ['archived', 'official_responded', 'false_positive'].includes(currentStatus)) {
+  } else if (aggregate.negativeCount > previousNegativeCount && (['archived', 'official_responded', 'false_positive'].includes(currentStatus) || dispatchedReopenable)) {
     nextStatus = 'reviewing';
     auditAction = 'record.reopened_by_comment_risk';
     await tx.execute(

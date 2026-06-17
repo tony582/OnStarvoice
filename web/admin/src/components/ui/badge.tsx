@@ -11,7 +11,7 @@ const TONE_TO_COLOR: Record<string, ColorKey> = {
   unhandled: 'orange', new: 'orange', open: 'orange',
   pending: 'amber', medium: 'amber',
   reviewing: 'purple', generated: 'purple',
-  issue_linked: 'blue', following: 'blue', platform_admin: 'blue',
+  issue_linked: 'blue', ticketed: 'blue', following: 'blue', platform_admin: 'blue',
   official_responded: 'teal', internal_operator: 'teal',
   neutral: 'grey', muted: 'grey', low: 'grey', normal: 'grey',
   closed: 'grey', archived: 'grey', false_positive: 'grey', ignored: 'grey', viewer: 'grey',

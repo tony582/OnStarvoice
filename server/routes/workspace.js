@@ -106,7 +106,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       SELECT
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') AS unhandled,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') AS reviewing,
-        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'issue_linked') AS issue_linked
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) AS issue_linked
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
