@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw,
 } from 'lucide-react'
@@ -12,6 +12,8 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { InfoHint } from '@/components/shared/InfoHint'
+
+const ChinaMap = lazy(() => import('@/components/shared/ChinaMap'))
 
 // 指标口径词典(给"只看报告"的客户:每个指标怎么统计/算)
 const G = {
@@ -264,18 +266,18 @@ export function DashboardTab() {
             <Panel title="媒体/来源类型" hint={G.media}>
               <Distribution rows={s.mediaDistribution || []} labelKey="media_type" labelMap={MEDIA_LABELS} />
             </Panel>
-            <RegionPanel content={s.regionDistribution || []} comment={s.commentRegionDistribution || []} />
-          </section>
-
-          {/* KOL/作者影响力 + 结论与建议(P1,数据已有)*/}
-          <section className="grid gap-4 xl:grid-cols-2">
             <Panel title="重点账号 / 作者影响力" hint="按负面数与互动量综合排序的作者;影响力≈粉丝×互动(近似,非平台官方指数)。">
               <AuthorRank rows={s.topAuthors || []} />
             </Panel>
-            <Panel title="结论与建议" hint="由本期各项异动自动生成的处置建议(actionable)。">
-              <Recommendations items={s.actionItems || s.actionRecommendations || []} />
-            </Panel>
           </section>
+
+          {/* 地域地图(整行,中国省级填色)*/}
+          <RegionPanel content={s.regionDistribution || []} comment={s.commentRegionDistribution || []} />
+
+          {/* 结论与建议 */}
+          <Panel title="结论与建议" hint="由本期各项异动自动生成的处置建议(actionable)。">
+            <Recommendations items={s.actionItems || s.actionRecommendations || []} />
+          </Panel>
         </>
       )}
     </div>
@@ -571,9 +573,17 @@ function RegionPanel({ content, comment }: { content: any[]; comment: any[] }) {
           ))}
         </div>
       </div>
-      <div className="p-5">
-        <Distribution rows={rows} labelKey="region" />
-        <p className="mt-3 text-[11px] text-muted-foreground">{note}</p>
+      <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1.4fr)_minmax(280px,1fr)]">
+        <div>
+          <Suspense fallback={<div className="grid h-[280px] place-items-center"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>}>
+            <ChinaMap rows={rows} />
+          </Suspense>
+        </div>
+        <div className="lg:border-l lg:border-border/50 lg:pl-5">
+          <div className="mb-2 text-[11px] font-bold uppercase tracking-wide text-muted-foreground">省份排行</div>
+          <Distribution rows={rows} labelKey="region" />
+          <p className="mt-3 text-[11px] text-muted-foreground">{note}</p>
+        </div>
       </div>
     </section>
   )
