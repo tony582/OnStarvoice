@@ -49,6 +49,28 @@ function sumInteractions(pm: any[] = []) {
   return pm.reduce((sum, r) => sum + (Number(r.interactions) || 0), 0)
 }
 
+// 媒体/来源类型中文(记录类型 + 笔记类型)
+const MEDIA_LABELS: Record<string, string> = {
+  single_note: '单篇笔记', keyword_notes: '关键词笔记', blogger_notes: '博主笔记',
+  blogger_profile: '博主主页', official_content: '官方内容', comments: '评论',
+  normal: '图文笔记', video: '视频', image: '图文', article: '文章', text: '文字', live: '直播',
+  '未采集': '未知类型', '': '未知类型',
+}
+// 平台品牌色点(让平台板块更有辨识度)
+const PLATFORM_DOT: Record<string, string> = { xiaohongshu: 'bg-status-red', douyin: 'bg-foreground', weibo: 'bg-status-orange' }
+
+function mergeRegions(a: any[] = [], b: any[] = []) {
+  const m = new Map<string, { region: string; count: number; negative_count: number }>()
+  for (const r of [...a, ...b]) {
+    const k = r.region || '未采集'
+    const cur = m.get(k) || { region: k, count: 0, negative_count: 0 }
+    cur.count += Number(r.count) || 0
+    cur.negative_count += Number(r.negative_count) || 0
+    m.set(k, cur)
+  }
+  return [...m.values()].sort((x, y) => y.count - x.count)
+}
+
 type RangePreset = 'today' | 'yesterday' | '7d' | '30d' | '90d' | 'all' | 'custom'
 
 type DashboardResponse = {
@@ -240,9 +262,19 @@ export function DashboardTab() {
 
           <section className="grid gap-4 xl:grid-cols-2">
             <Panel title="媒体/来源类型" hint={G.media}>
-              <Distribution rows={s.mediaDistribution || []} labelKey="media_type" />
+              <Distribution rows={s.mediaDistribution || []} labelKey="media_type" labelMap={MEDIA_LABELS} />
             </Panel>
             <RegionPanel content={s.regionDistribution || []} comment={s.commentRegionDistribution || []} />
+          </section>
+
+          {/* KOL/作者影响力 + 结论与建议(P1,数据已有)*/}
+          <section className="grid gap-4 xl:grid-cols-2">
+            <Panel title="重点账号 / 作者影响力" hint="按负面数与互动量综合排序的作者;影响力≈粉丝×互动(近似,非平台官方指数)。">
+              <AuthorRank rows={s.topAuthors || []} />
+            </Panel>
+            <Panel title="结论与建议" hint="由本期各项异动自动生成的处置建议(actionable)。">
+              <Recommendations items={s.actionItems || s.actionRecommendations || []} />
+            </Panel>
           </section>
         </>
       )}
@@ -292,11 +324,11 @@ function ExecutiveSummary({ s }: { s: any }) {
   const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
   const negRate = Number(s.negativeRate) || 0
   const stats = [
-    { label: '总声量', value: formatNumber(s.total), d: delta(s.total, prev.total), hint: G.volume },
+    { label: '总声量', value: formatNumber(s.total), d: delta(s.total, prev.total), tone: 'accent', hint: G.volume },
+    { label: '互动总量', value: formatNumber(interaction), tone: 'accent', hint: G.interaction },
     { label: '净情感 NSR', value: nsr, d: delta(nsr, nsrOf(prev.sentimentMap)), tone: nsr < 0 ? 'danger' : 'normal', hint: G.nsr },
-    { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
     { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: G.risk },
-    { label: '互动总量', value: formatNumber(interaction), hint: G.interaction },
+    { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
     { label: '新增内容', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
     { label: '待处理', value: formatNumber(s.workflowStats?.active_inbox || 0), tone: (s.workflowStats?.active_inbox || 0) > 0 ? 'warning' : 'normal', hint: G.pending },
     { label: '官方响应率', value: `${officialRate}%`, hint: G.official },
@@ -321,11 +353,16 @@ function ExecutiveSummary({ s }: { s: any }) {
 }
 
 function Stat({ label, value, d, tone, hint }: { label: string; value: React.ReactNode; d?: { pct: number; up: boolean } | null; tone?: string; hint?: string }) {
+  const bg = tone === 'danger' ? 'bg-status-red/[0.07] ring-1 ring-status-red/15'
+    : tone === 'warning' ? 'bg-status-amber/[0.10] ring-1 ring-status-amber/20'
+      : tone === 'accent' ? 'bg-primary/[0.06] ring-1 ring-primary/15'
+        : 'bg-muted/40'
+  const valColor = tone === 'danger' ? 'text-destructive' : tone === 'warning' ? 'text-amber-600' : tone === 'accent' ? 'text-primary' : 'text-foreground'
   return (
-    <div className="rounded-lg bg-muted/40 p-3.5">
+    <div className={`rounded-lg p-3.5 ${bg}`}>
       <div className="flex items-center gap-1 text-[12px] text-muted-foreground">{label}{hint && <InfoHint text={hint} />}</div>
       <div className="mt-1.5 flex items-baseline gap-2">
-        <span className={`text-[22px] font-bold tabular-nums ${tone === 'danger' ? 'text-destructive' : tone === 'warning' ? 'text-amber-600' : 'text-foreground'}`}>{value}</span>
+        <span className={`text-[22px] font-bold tabular-nums ${valColor}`}>{value}</span>
         {d && <span className="text-[11px] font-semibold text-muted-foreground">{d.up ? '↑' : '↓'}{d.pct}%</span>}
       </div>
     </div>
@@ -350,6 +387,41 @@ function TopContent({ rows }: { rows: any[] }) {
         </div>
       ))}
     </div>
+  )
+}
+
+function AuthorRank({ rows }: { rows: any[] }) {
+  if (!rows.length) return <EmptyState icon={BarChart3} title="暂无账号数据" />
+  return (
+    <div className="divide-y divide-border">
+      {rows.slice(0, 8).map((r, i) => (
+        <div key={r.author_name || i} className="grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-3 py-2.5 first:pt-0 last:pb-0">
+          <span className="grid h-6 w-6 place-items-center rounded-md bg-primary/10 text-xs font-black text-primary">{i + 1}</span>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-medium">{r.author_name || '未知作者'}</div>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">粉丝 {formatNumber(r.author_fans)} · {formatNumber(r.count)} 条{Number(r.negative_count) > 0 ? ` · 负面 ${formatNumber(r.negative_count)}` : ''}</div>
+          </div>
+          <span className="text-xs font-semibold tabular-nums text-muted-foreground">{formatNumber(r.interaction_total)} 互动</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function Recommendations({ items }: { items: any[] }) {
+  if (!items.length) return <EmptyState icon={AlertTriangle} title="本周期无显著风险" />
+  return (
+    <ol className="space-y-2.5">
+      {items.slice(0, 7).map((it, i) => {
+        const text = typeof it === 'string' ? it : (it?.text || it?.title || String(it))
+        return (
+          <li key={i} className="flex gap-2.5 text-[13px] leading-6">
+            <span className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full bg-primary/10 text-[11px] font-bold text-primary">{i + 1}</span>
+            <span className="text-foreground">{text}</span>
+          </li>
+        )
+      })}
+    </ol>
   )
 }
 
@@ -427,7 +499,7 @@ function PlatformMatrix({ rows }: { rows: any[] }) {
         return (
           <div key={row.platform || row.label} className="grid gap-2">
             <div className="flex items-center justify-between gap-3 text-sm">
-              <strong>{platformName(row.platform) || row.label}</strong>
+              <strong className="flex items-center gap-1.5"><span className={`h-2 w-2 shrink-0 rounded-full ${PLATFORM_DOT[row.platform] || 'bg-muted-foreground/40'}`} />{platformName(row.platform) || row.label}</strong>
               <span className="text-xs text-muted-foreground">{formatNumber(row.count)} 条 · 负面 {negativeRate}%</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-muted">
@@ -479,14 +551,19 @@ function SentimentRing({ rows }: { rows: any[] }) {
 }
 
 function RegionPanel({ content, comment }: { content: any[]; comment: any[] }) {
-  const [mode, setMode] = useState<'content' | 'comment'>('content')
-  const rows = mode === 'content' ? content : comment
+  const [mode, setMode] = useState<'all' | 'content' | 'comment'>('all')
+  const rows = mode === 'content' ? content : mode === 'comment' ? comment : mergeRegions(content, comment)
+  const note = mode === 'content'
+    ? '内容地域:博主内容沿用其作者属地回填,仍取不到才记未采集'
+    : mode === 'comment'
+      ? '评论地域:取评论自带的 IP 属地,平台原生最全'
+      : '全部:内容(作者属地)+ 评论(评论IP)合并,覆盖最全的地域大盘'
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card">
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
-        <h3 className="text-sm font-bold">地域/发布位置</h3>
+        <h3 className="flex items-center gap-1.5 text-sm font-bold">地域/发布位置<InfoHint text="地域=内容作者属地 + 评论 IP 属地。默认「全部」合并两者(最全);可切单看。内容侧大量「未采集」是源头限制,评论侧最完整。" /></h3>
         <div className="inline-flex rounded-lg bg-muted p-0.5 text-[12px] font-semibold">
-          {([['content', '内容'], ['comment', '评论']] as const).map(([k, label]) => (
+          {([['all', '全部'], ['content', '内容'], ['comment', '评论']] as const).map(([k, label]) => (
             <button key={k} onClick={() => setMode(k)}
               className={`rounded-md px-2.5 py-1 transition-colors ${mode === k ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
               {label}
@@ -496,7 +573,7 @@ function RegionPanel({ content, comment }: { content: any[]; comment: any[] }) {
       </div>
       <div className="p-5">
         <Distribution rows={rows} labelKey="region" />
-        <p className="mt-3 text-[11px] text-muted-foreground">{mode === 'content' ? '内容地域:博主内容沿用其作者属地回填,仍取不到才记未采集' : '评论地域:取评论自带的 IP 属地,数据最全'}</p>
+        <p className="mt-3 text-[11px] text-muted-foreground">{note}</p>
       </div>
     </section>
   )
@@ -528,19 +605,32 @@ function Distribution({ rows, labelKey, labelMap = {} }: { rows: any[]; labelKey
 
 function WordCloud({ terms }: { terms: any[] }) {
   if (!terms.length) return <EmptyState icon={BarChart3} title="暂无热点词" />
-  const colors = ['text-primary', 'text-emerald-600', 'text-amber-600', 'text-violet-600', 'text-destructive']
+  const colors = ['text-primary', 'text-rose-600', 'text-emerald-600', 'text-amber-600', 'text-violet-600', 'text-sky-600']
+  const top = terms.slice(0, 42)
+  const ws = top.map(t => Number(t.weight) || Number(t.count) || 1)
+  const max = Math.max(...ws, 1), min = Math.min(...ws)
+  const fontOf = (w: number) => Math.round(13 + (w - min) / (max - min || 1) * 31) // 13~44px
+  const opacityOf = (w: number) => 0.55 + 0.45 * ((w - min) / (max - min || 1))
+  // 大词居中:按权重降序后从中间向两侧交替排布
+  const sorted = [...top].sort((a, b) => (Number(b.weight) || Number(b.count) || 0) - (Number(a.weight) || Number(a.count) || 0))
+  const arranged: any[] = []
+  sorted.forEach((t, i) => (i % 2 ? arranged.push(t) : arranged.unshift(t)))
   return (
-    <div className="flex min-h-[220px] flex-wrap content-center items-center justify-center gap-x-4 gap-y-3">
-      {terms.slice(0, 36).map((term, index) => (
-        <span
-          key={`${term.label}-${index}`}
-          className={`font-bold leading-none ${colors[Number(term.tone) % colors.length]}`}
-          style={{ fontSize: `${Number(term.weight) || 14}px` }}
-          title={`${term.label} · ${term.count}`}
-        >
-          {term.label}
-        </span>
-      ))}
+    <div className="flex min-h-[240px] flex-wrap content-center items-center justify-center gap-x-3.5 gap-y-1 px-2 py-3">
+      {arranged.map((term, index) => {
+        const w = Number(term.weight) || Number(term.count) || 1
+        const rot = index % 9 === 0 ? '-7deg' : index % 6 === 0 ? '6deg' : '0deg'
+        return (
+          <span
+            key={`${term.label}-${index}`}
+            className={`cursor-default font-bold leading-tight transition-transform hover:scale-110 ${colors[(Number(term.tone) || index) % colors.length]}`}
+            style={{ fontSize: `${fontOf(w)}px`, opacity: opacityOf(w), transform: `rotate(${rot})` }}
+            title={`${term.label} · ${formatNumber(term.count)}`}
+          >
+            {term.label}
+          </span>
+        )
+      })}
     </div>
   )
 }
