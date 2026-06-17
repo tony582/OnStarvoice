@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, PanelLeftOpen, ListChecks, HandCoins,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, ListChecks, HandCoins,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -68,15 +68,8 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
   const [adminOpen, setAdminOpen] = useState(false)
   const adminActive = ADMIN_NAV.some(i => i.id === activePage)
 
-  // 收起:整条侧栏隐藏,左上角浮动「唤出」按钮(Claude Code 式)
-  if (collapsed) {
-    return (
-      <button onClick={onToggleCollapse} title="展开导航"
-        className="fixed left-3 top-3.5 z-40 inline-flex h-9 w-9 items-center justify-center rounded-lg border border-sidebar-border bg-sidebar text-muted-foreground shadow-sm transition-colors hover:text-foreground">
-        <PanelLeftOpen className="h-[18px] w-[18px]" strokeWidth={1.9} />
-      </button>
-    )
-  }
+  // 收起:整条侧栏彻底隐藏(展开按钮在顶栏 TopBar 左侧,主区直接贴边、不留空白)
+  if (collapsed) return null
 
   return (
     <aside className="fixed inset-y-0 left-0 z-30 flex w-[240px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
