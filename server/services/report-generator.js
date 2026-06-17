@@ -303,18 +303,32 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
 
   // 近 14 天滚动趋势(独立于周期长度):日报用来补"近期走势",避免单日只有一个点
   const trailingStart = new Date(periodEnd.getTime() - 14 * 86400000);
+  // 用日历骨架(generate_series)左连观测,零声量的天补 total=0,避免"跌到0"的异动从图里消失
   const trailingTrend = normalizeRows(await queryAll(
-    `SELECT
-       to_char(ro.captured_at AT TIME ZONE 'Asia/Shanghai', 'MM-DD') as label,
-       date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') as day_bucket,
-       COUNT(DISTINCT ro.record_id) as total,
-       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'negative') as negative
-     FROM record_observations ro
-     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
-     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
-       AND ${RELEVANT_RECORD_SQL}
-     GROUP BY day_bucket, label
-     ORDER BY day_bucket ASC`,
+    `WITH days AS (
+       SELECT generate_series(
+         date_trunc('day', $2::timestamptz AT TIME ZONE 'Asia/Shanghai'),
+         date_trunc('day', $3::timestamptz AT TIME ZONE 'Asia/Shanghai') - interval '1 day',
+         interval '1 day'
+       ) AS day_bucket
+     ),
+     obs AS (
+       SELECT date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') AS day_bucket,
+         ro.record_id, r.sentiment
+       FROM record_observations ro
+       JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+       WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+         AND ${RELEVANT_RECORD_SQL}
+     )
+     SELECT
+       to_char(d.day_bucket, 'MM-DD') AS label,
+       d.day_bucket,
+       COUNT(DISTINCT o.record_id) AS total,
+       COUNT(DISTINCT o.record_id) FILTER (WHERE o.sentiment = 'negative') AS negative
+     FROM days d
+     LEFT JOIN obs o ON o.day_bucket = d.day_bucket
+     GROUP BY d.day_bucket
+     ORDER BY d.day_bucket ASC`,
     [tenantId, trailingStart.toISOString(), periodEnd.toISOString()]
   ), ['total', 'negative']);
 
@@ -1728,7 +1742,7 @@ function bucketTrend(rows = [], maxBuckets = 6) {
   for (let i = 0; i < rows.length; i += size) {
     const chunk = rows.slice(i, i + size);
     out.push({
-      label: chunk[0].label,
+      label: chunk.length > 1 ? `${chunk[0].label}~${chunk[chunk.length - 1].label}` : chunk[0].label,
       total: chunk.reduce((s, r) => s + num(r.total), 0),
       negative: chunk.reduce((s, r) => s + num(r.negative), 0),
     });
@@ -1767,7 +1781,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
   } else if (type === 'monthly') {
     body = `
       ${renderSection('管理层复盘摘要', renderList(stats.executiveSummary), '')}
-      ${renderSection('月度声量趋势', trendBars(bucketTrend(stats.volumeTrend, 6), 6), '按周聚合')}
+      ${renderSection('月度声量趋势', trendBars(bucketTrend(stats.volumeTrend, 6), 6), '分段聚合,避免日点拥挤')}
       ${renderSection('月度复盘', `<p style="${P}">处置效率:转工单率 ${dispatchRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置效率 + 口碑环比')}
       ${repeatIssues.length ? renderSection('重复发酵问题', renderIssues(repeatIssues.slice(0, 8)), '关联多条内容/多次出现的问题,需根因处理') : ''}
       ${renderSection('下月策略建议', renderList(stats.actionItems, true), '按优先级执行')}
