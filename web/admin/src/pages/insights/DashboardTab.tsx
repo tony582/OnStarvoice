@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
-  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning,
-  RefreshCw, ShieldCheck, Siren, TrendingUp,
+  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw,
 } from 'lucide-react'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -12,6 +11,43 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { InfoHint } from '@/components/shared/InfoHint'
+
+// 指标口径词典(给"只看报告"的客户:每个指标怎么统计/算)
+const G = {
+  volume: '声量=本期监测到的内容条数(去重)。含老帖在本期被再次采集到的,所以时间范围越大越接近库存量;要看"真正新增"请对照「新增内容」。不含 AI 判定不相关的内容。',
+  newRecords: '新增内容=首次入库时间落在本期内的内容,即本期真正新冒出来的(声量则含老帖复采)。',
+  interaction: '互动总量=点赞+评论+收藏+转发 之和。为采集那一刻的快照,非实时;本系统不采阅读/播放量,故不报"触达人数"。',
+  nsr: '净情感 NSR=(正面−负面)/(正面+负面)×100,范围 −100~+100。只看正负、不计中性,比负面率更敏感反映口碑好坏。',
+  negativeRate: '负面率=负面内容数 ÷ 已 AI 标注内容数 ×100%。分母不含"待标注",AI 覆盖率低时该值会被放大,请对照待标注量解读。',
+  risk: '舆情风险指数(0~100)=负面率/负面评论/高危未关闭问题/告警 加权,封顶 100。≥70 重点处置,≥45 风险抬升,≥20 持续观察。是促处置的相对警戒分,非概率。',
+  heat: '舆情热度指数=内容数/互动/新评论/观测 加权综合,无固定上限;数值本身无绝对含义,只看相对高低与环比。',
+  official: '官方响应率=有官方回复的内容数 ÷ 总声量。',
+  pending: '待处理=进入处置队列、尚未转工单也未归档的内容(已排除官方内容与"已响应且零负评")。',
+  sentiment: '情感由 AI 标注为 正面/中性/负面;"待标注"单列为灰色、不并入中性。',
+  platform: '平台分布=各平台内容条数与负面率;注:平台字段缺失的内容会默认归到小红书,占比可能略有偏差。',
+  category: '主题分类由 AI 归入 9 类(安全救援/续费收费/服务质量 等),其中安全/续费/服务为车企高优先级风险议题。',
+  topInteraction: '按 点赞+评论+收藏+转发 之和排序的高互动内容(采集时刻快照)。',
+  topNegative: '重点负面=按 负评/转发/互动 加权排序的负面内容,可逐条点开核实处置。',
+  negativeComment: '负面评论为评论层风险线索,带风险等级(低~严重),与内容层"负面"是两套口径。',
+  workflow: '处置漏斗:待处理 → 已转工单 → 归档/误报;配合官方响应、未关闭问题看监测→处置闭环。',
+  hotTerms: '热词来自标题/正文/摘要/标签的文本挖掘,与"监控关键词"(只统计监控订阅采集)口径不同。',
+  media: '媒体/来源类型来自内容的类型字段(record_type / mediaType)。',
+}
+
+function delta(cur: number, prev: number) {
+  const c = Number(cur) || 0, p = Number(prev) || 0
+  if (!p) return null
+  const d = Math.round((c - p) / p * 100)
+  return { pct: Math.abs(d), up: d >= 0 }
+}
+function nsrOf(sm: any = {}) {
+  const p = Number(sm.positive) || 0, n = Number(sm.negative) || 0
+  return (p + n) ? Math.round((p - n) / (p + n) * 100) : 0
+}
+function sumInteractions(pm: any[] = []) {
+  return pm.reduce((sum, r) => sum + (Number(r.interactions) || 0), 0)
+}
 
 type RangePreset = 'today' | 'yesterday' | '7d' | '30d' | '90d' | 'all' | 'custom'
 
@@ -80,17 +116,6 @@ export function DashboardTab() {
   useEffect(() => { load() }, [range, start, end])
 
   const s = data?.snapshot
-  const kpis = useMemo(() => {
-    if (!s) return []
-    return [
-      { label: '总声量', value: s.total, icon: TrendingUp, tone: 'normal', help: '筛选范围内被采集或更新的内容' },
-      { label: '新增线索', value: s.newRecords, icon: BarChart3, tone: 'normal', help: '首次进入系统的内容' },
-      { label: '负面率', value: `${s.negativeRate}%`, icon: AlertTriangle, tone: Number(s.negativeRate) >= 20 ? 'danger' : 'normal', help: '负面内容 / 已标注内容' },
-      { label: '负面评论', value: s.commentStats?.negative_comments || 0, icon: MessageSquareWarning, tone: (s.commentStats?.negative_comments || 0) > 0 ? 'danger' : 'normal', help: '评论层风险线索' },
-      { label: '待处理', value: s.workflowStats?.active_inbox || 0, icon: Siren, tone: (s.workflowStats?.active_inbox || 0) > 0 ? 'warning' : 'normal', help: '当前待处理/待复核' },
-      { label: '官方响应', value: s.officialPeriod?.record_count || 0, icon: ShieldCheck, tone: 'normal', help: '筛选范围内有官方回复的内容' },
-    ]
-  }, [s])
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
@@ -154,68 +179,67 @@ export function DashboardTab() {
         <EmptyState icon={BarChart3} title="暂无看板数据" />
       ) : (
         <>
-          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-            {kpis.map(item => {
-              const Icon = item.icon
-              return (
-                <article key={item.label} className="rounded-lg border border-border bg-card p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-xs font-semibold text-muted-foreground">{item.label}</div>
-                    <Icon className={`h-4 w-4 ${item.tone === 'danger' ? 'text-destructive' : item.tone === 'warning' ? 'text-amber-600' : 'text-primary'}`} />
-                  </div>
-                  <div className={`mt-3 text-2xl font-bold tabular-nums ${item.tone === 'danger' ? 'text-destructive' : item.tone === 'warning' ? 'text-amber-600' : 'text-foreground'}`}>
-                    {typeof item.value === 'number' ? formatNumber(item.value) : item.value}
-                  </div>
-                  <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.help}</div>
-                </article>
-              )
-            })}
-          </section>
+          {/* 1. 执行摘要 —— 结论先行 */}
+          <ExecutiveSummary s={s} />
 
+          {/* 2. 声量总览与趋势 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.8fr)]">
-            <Panel title="声量与情绪趋势">
+            <Panel title="声量总览与趋势" hint={G.volume}
+              note={`本期声量 ${formatNumber(s.total)} 条(新增 ${formatNumber(s.newRecords)}、复现 ${formatNumber(s.updatedRecords)}),${trendNote(s)}`}>
               <VolumeTrend rows={s.volumeTrend || []} />
             </Panel>
-            <Panel title="舆情态势指数">
+            <Panel title="舆情态势指数" hint={G.heat}>
               <OpinionIndex snapshot={s} />
             </Panel>
           </section>
 
+          {/* 3. 情感 / 4. 平台 / 主题 */}
           <section className="grid gap-4 xl:grid-cols-3">
-            <Panel title="平台声量矩阵">
-              <PlatformMatrix rows={s.platformMatrix || []} />
-            </Panel>
-            <Panel title="情绪结构">
+            <Panel title="情感分析" hint={G.sentiment}
+              note={`负面率 ${s.negativeRate}%、净情感 NSR ${nsrOf(s.sentimentMap)}${(s.pendingLabel || 0) > 0 ? `;另有 ${formatNumber(s.pendingLabel)} 条待 AI 标注` : ''}`}>
               <SentimentRing rows={s.sentimentStructure || []} />
             </Panel>
-            <Panel title="主题分类">
+            <Panel title="平台分布" hint={G.platform} note={platformNote(s)}>
+              <PlatformMatrix rows={s.platformMatrix || []} />
+            </Panel>
+            <Panel title="主题分类" hint={G.category}>
               <Distribution rows={s.category || []} labelKey="category" labelMap={LABELS.category} />
             </Panel>
           </section>
 
+          {/* 5. 高影响内容 */}
+          <section className="grid gap-4 xl:grid-cols-2">
+            <Panel title="高互动内容 TOP" hint={G.topInteraction}>
+              <TopContent rows={s.topInteraction || []} />
+            </Panel>
+            <Panel title="重点负面内容" hint={G.topNegative}>
+              <RiskItems rows={s.riskItems || s.topNegative || []} />
+            </Panel>
+          </section>
+
+          {/* 6. 负面预警 / 7. 处置闭环 */}
+          <section className="grid gap-4 xl:grid-cols-2">
+            <Panel title="负面评论与风险" hint={G.negativeComment}
+              note={`本期负面评论 ${formatNumber(s.commentStats?.negative_comments || 0)} 条${(s.issueStats?.high_open_issues || 0) > 0 ? `,高危未关闭问题 ${formatNumber(s.issueStats.high_open_issues)} 个` : ''}`}>
+              <CommentRisks rows={s.commentRisks || s.negativeComments || []} />
+            </Panel>
+            <Panel title="处置与闭环" hint={G.workflow} note={workflowNote(s)}>
+              <WorkflowSummary snapshot={s} />
+            </Panel>
+          </section>
+
+          {/* 更多维度 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(390px,0.8fr)]">
-            <Panel title="热点词云">
+            <Panel title="热点词云" hint={G.hotTerms}>
               <WordCloud terms={s.hotTerms || []} />
             </Panel>
-            <Panel title="热词指数榜">
+            <Panel title="热词指数榜" hint={G.hotTerms}>
               <HotTermRank terms={s.hotTerms || []} />
             </Panel>
           </section>
 
           <section className="grid gap-4 xl:grid-cols-2">
-            <Panel title="高风险内容">
-              <RiskItems rows={s.riskItems || []} />
-            </Panel>
-            <Panel title="负面评论舆情">
-              <CommentRisks rows={s.commentRisks || []} />
-            </Panel>
-          </section>
-
-          <section className="grid gap-4 xl:grid-cols-3">
-            <Panel title="处置闭环">
-              <WorkflowSummary snapshot={s} />
-            </Panel>
-            <Panel title="媒体/来源类型">
+            <Panel title="媒体/来源类型" hint={G.media}>
               <Distribution rows={s.mediaDistribution || []} labelKey="media_type" />
             </Panel>
             <RegionPanel content={s.regionDistribution || []} comment={s.commentRegionDistribution || []} />
@@ -226,14 +250,106 @@ export function DashboardTab() {
   )
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, hint, note, children }: { title: string; hint?: string; note?: React.ReactNode; children: React.ReactNode }) {
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card">
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
-        <h3 className="text-sm font-bold">{title}</h3>
+        <h3 className="flex items-center gap-1.5 text-sm font-bold">{title}{hint && <InfoHint text={hint} />}</h3>
       </div>
-      <div className="p-5">{children}</div>
+      <div className="p-5">
+        {children}
+        {note && <p className="mt-3 border-t border-border/50 pt-2.5 text-[11.5px] leading-5 text-muted-foreground"><span className="font-semibold text-foreground">解读 · </span>{note}</p>}
+      </div>
     </section>
+  )
+}
+
+function trendNote(s: any) {
+  const d = delta(s.total, s.previous?.total)
+  return d ? `较上期${d.up ? '上升' : '下降'} ${d.pct}%` : '暂无可比上期'
+}
+function platformNote(s: any) {
+  const rows = s.platformMatrix || []
+  if (!rows.length) return ''
+  const top = rows[0]
+  const worst = [...rows].sort((a, b) => (Number(b.negativeRate) || 0) - (Number(a.negativeRate) || 0))[0]
+  return `主战场「${platformName(top.platform)}」占 ${top.share}%;负面最集中「${platformName(worst.platform)}」(${Number(worst.negativeRate) || 0}%)`
+}
+function workflowNote(s: any) {
+  const w = s.workflowStats || {}
+  const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
+  return `待处理 ${formatNumber(w.active_inbox || 0)}、已转工单 ${formatNumber(w.issue_linked || 0)};官方响应率 ${officialRate}%`
+}
+
+function ExecutiveSummary({ s }: { s: any }) {
+  const prev = s.previous || {}
+  const risk = Number(s.opinionIndex?.risk) || 0
+  const status = s.opinionIndex?.status || '平稳'
+  const lightCls = risk >= 70 ? 'bg-status-red' : risk >= 45 ? 'bg-status-amber' : 'bg-status-green'
+  const riskTone = risk >= 70 ? 'critical' : risk >= 45 ? 'medium' : 'positive'
+  const nsr = nsrOf(s.sentimentMap)
+  const interaction = sumInteractions(s.platformMatrix)
+  const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
+  const negRate = Number(s.negativeRate) || 0
+  const stats = [
+    { label: '总声量', value: formatNumber(s.total), d: delta(s.total, prev.total), hint: G.volume },
+    { label: '净情感 NSR', value: nsr, d: delta(nsr, nsrOf(prev.sentimentMap)), tone: nsr < 0 ? 'danger' : 'normal', hint: G.nsr },
+    { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
+    { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: G.risk },
+    { label: '互动总量', value: formatNumber(interaction), hint: G.interaction },
+    { label: '新增内容', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
+    { label: '待处理', value: formatNumber(s.workflowStats?.active_inbox || 0), tone: (s.workflowStats?.active_inbox || 0) > 0 ? 'warning' : 'normal', hint: G.pending },
+    { label: '官方响应率', value: `${officialRate}%`, hint: G.official },
+  ]
+  return (
+    <section className="rounded-lg border border-border bg-card p-5">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <span className={`h-2.5 w-2.5 rounded-full ${lightCls}`} />
+        <h2 className="text-base font-bold">执行摘要</h2>
+        <StatusBadge tone={riskTone}>风险{status}</StatusBadge>
+      </div>
+      <p className="mt-2 text-[13px] leading-6 text-muted-foreground">
+        本期共监测 <strong className="text-foreground">{formatNumber(s.total)}</strong> 条内容(新增 {formatNumber(s.newRecords)}),
+        负面率 <strong className="text-foreground">{negRate}%</strong>、净情感 NSR <strong className="text-foreground">{nsr}</strong>,
+        舆情风险指数 <strong className="text-foreground">{risk}</strong>({status});待处理 {formatNumber(s.workflowStats?.active_inbox || 0)} 条,官方响应率 {officialRate}%。
+      </p>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {stats.map(st => <Stat key={st.label} {...st} />)}
+      </div>
+    </section>
+  )
+}
+
+function Stat({ label, value, d, tone, hint }: { label: string; value: React.ReactNode; d?: { pct: number; up: boolean } | null; tone?: string; hint?: string }) {
+  return (
+    <div className="rounded-lg bg-muted/40 p-3.5">
+      <div className="flex items-center gap-1 text-[12px] text-muted-foreground">{label}{hint && <InfoHint text={hint} />}</div>
+      <div className="mt-1.5 flex items-baseline gap-2">
+        <span className={`text-[22px] font-bold tabular-nums ${tone === 'danger' ? 'text-destructive' : tone === 'warning' ? 'text-amber-600' : 'text-foreground'}`}>{value}</span>
+        {d && <span className="text-[11px] font-semibold text-muted-foreground">{d.up ? '↑' : '↓'}{d.pct}%</span>}
+      </div>
+    </div>
+  )
+}
+
+function TopContent({ rows }: { rows: any[] }) {
+  if (!rows.length) return <EmptyState icon={BarChart3} title="暂无内容" />
+  return (
+    <div className="divide-y divide-border">
+      {rows.slice(0, 8).map((row, i) => (
+        <div key={row.id || i} className="grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-3 py-2.5 first:pt-0 last:pb-0">
+          <span className="grid h-6 w-6 place-items-center rounded-md bg-primary/10 text-xs font-black text-primary">{i + 1}</span>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-medium">{row.title || compact(row.content || '', 40) || '无标题'}</div>
+            <div className="mt-0.5 flex items-center gap-2 text-[11px] text-muted-foreground">
+              <StatusBadge tone="neutral">{platformName(row.platform)}</StatusBadge>
+              <span className="truncate">{row.author_name || '未知作者'}</span>
+            </div>
+          </div>
+          <span className="text-xs font-semibold tabular-nums text-muted-foreground">{formatNumber(interactions(row))}</span>
+        </div>
+      ))}
+    </div>
   )
 }
 
