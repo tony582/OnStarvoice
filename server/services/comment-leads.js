@@ -1,9 +1,9 @@
 const LEAD_TYPE_KEYWORDS = {
   // 销售客资:购买意向 / 询价 / 留联系方式(优先识别,归到「销售客资」)
   sales_intent: [
-    '多少钱', '价格', '报价', '怎么买', '哪里买', '哪买', '在哪买', '求链接', '链接',
+    '多少钱', '价格', '报价', '怎么买', '哪里买', '哪买', '在哪买', '求链接',
     '优惠', '团购', '想买', '入手', '下单', '购买', '试驾', '预约', '门店', '经销商',
-    '4s', '加微信', '微信', '威信', 'vx', 'v信', '私聊', '私信', '电话', '联系方式',
+    '4s', '加微信', 'vx', 'v信', '联系方式',
   ],
   complaint: ['投诉', '维权', '差评', '坑人', '被骗', '垃圾', '恶心'],
   renewal_billing: ['续费', '收费', '不续费', '乱扣', '扣费', '贵', '年费'],
@@ -60,9 +60,13 @@ function matchedKeywordsFor(comment, record = {}) {
 }
 
 function resolveLeadType(comment) {
-  const text0 = normalizeText(comment.content).toLowerCase();
-  // 购买意向优先 → 销售客资
-  if (hasAnyKeyword(text0, LEAD_TYPE_KEYWORDS.sales_intent)) return 'sales_intent';
+  const text = normalizeText(comment.content).toLowerCase();
+  // 购买意向以 AI 判断为准(salesIntent);AI 未判过时才退回(已收紧的)关键词。
+  // 这样"客服打电话让续费""不续费给我关闭"这类投诉不会被误收进销售客资。
+  const ai = normalizeAiResult(comment.ai_result);
+  const aiJudged = ai && typeof ai === 'object' && Object.prototype.hasOwnProperty.call(ai, 'salesIntent');
+  const isSales = aiJudged ? ai.salesIntent === true : hasAnyKeyword(text, LEAD_TYPE_KEYWORDS.sales_intent);
+  if (isSales) return 'sales_intent';
 
   const category = normalizeText(comment.category);
   if (category === 'safety_rescue' || category === 'privacy') return 'safety_privacy';
@@ -71,7 +75,6 @@ function resolveLeadType(comment) {
   if (category === 'service_quality') return 'service_quality';
   if (category === 'brand_image') return 'brand_risk';
 
-  const text = normalizeText(comment.content).toLowerCase();
   if (hasAnyKeyword(text, LEAD_TYPE_KEYWORDS.complaint)) return 'complaint';
   if (hasAnyKeyword(text, LEAD_TYPE_KEYWORDS.safety_privacy)) return 'safety_privacy';
   if (hasAnyKeyword(text, LEAD_TYPE_KEYWORDS.app_issue)) return 'app_issue';
@@ -92,6 +95,9 @@ function resolvePriority(comment) {
 
 function shouldCreateLead(comment) {
   if (!comment || comment.is_official) return false;
+  // 真实购买意向也要建线索(进销售客资),即便情绪正向/中性
+  const ai = normalizeAiResult(comment.ai_result);
+  if (ai && ai.salesIntent === true) return true;
   const risk = normalizeText(comment.risk_level);
   return Boolean(
     comment.is_negative ||

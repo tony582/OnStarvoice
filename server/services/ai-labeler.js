@@ -262,11 +262,13 @@ function buildCommentSystemPrompt(brand) {
 - “不算贵”“免费”“可以”“有用”“不会不提供服务”“开的不多用不了几次”“不用续”这类通常是中性或正向澄清，不应标为负面。
 - 如果评论只是客观说明、个人选择、轻微吐槽但没有明确问题或诉求，标为 neutral。
 - 如果评论在认可、解释、澄清、推荐，标为 positive 或 neutral。
+- salesIntent(是否真实购买/咨询意向):只有评论方在“想买/询价/求购买链接/问哪里买/问价格优惠/要门店或经销商/留联系方式求购/想试驾预约”等明确成交导向时才 true。注意:吐槽里提到“续费/收费/电话/不续费/贵”、抱怨被催续费、要求退费、对价格不满,都是投诉而非购买意向,salesIntent=false。
 
 只输出 JSON：
 {
   "sentiment": "positive|neutral|negative",
   "isNegative": true|false,
+  "salesIntent": true|false,
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|official_response|other",
   "riskLevel": "none|low|medium|high|critical",
   "confidence": 0.0-1.0,
@@ -324,6 +326,7 @@ function normalizeCommentAiResult(result, fallback) {
       ...result,
       sentiment,
       isNegative: isNegative && sentiment === 'negative',
+      salesIntent: normalizeBoolean(result?.salesIntent ?? result?.sales_intent, false),
       category,
       riskLevel: isNegative ? riskLevel : 'none',
       confidence: Number(result?.confidence ?? fallback?.confidence ?? 0),
