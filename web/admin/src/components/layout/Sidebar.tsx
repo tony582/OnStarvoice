@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
@@ -64,6 +65,8 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
   const { workspace, switchWorkspace, params } = useNav()
   const activeQueue = activePage === 'workbench' ? (params?.queue || 'triage') : null
   const activeWs = WORKSPACES.find(w => w.key === workspace) || WORKSPACES[0]
+  const [adminOpen, setAdminOpen] = useState(false)
+  const adminActive = ADMIN_NAV.some(i => i.id === activePage)
 
   // 收起:整条侧栏隐藏,左上角浮动「唤出」按钮(Claude Code 式)
   if (collapsed) {
@@ -110,13 +113,41 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
 
       <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
         <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-        {isInternal() && (
-          <NavGroup label="ADMIN" items={ADMIN_NAV} activePage={activePage} activeQueue={null} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-        )}
       </nav>
 
+      {/* 底部:平台管理(向上弹出菜单)+ 版本 —— 管理类不进日常导航 */}
+      {isInternal() && (
+        <div className="relative mx-3 mb-1">
+          {adminOpen && (
+            <>
+              <div className="fixed inset-0 z-30" onClick={() => setAdminOpen(false)} />
+              <div className="absolute bottom-[calc(100%+6px)] left-0 right-0 z-40 rounded-xl border border-border bg-card p-1 shadow-lg animate-in fade-in slide-in-from-bottom-1 duration-150">
+                {ADMIN_NAV.map(item => {
+                  if (item.platformAdmin && !isPlatformAdmin()) return null
+                  const Icon = item.icon
+                  const on = activePage === item.id
+                  return (
+                    <button key={item.id} onClick={() => { onNavigate(item.id); setAdminOpen(false) }}
+                      className={cn('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors',
+                        on ? 'bg-accent font-semibold text-primary' : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
+                      <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} />{item.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </>
+          )}
+          <button onClick={() => setAdminOpen(o => !o)}
+            className={cn('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors',
+              adminActive || adminOpen ? 'bg-accent text-primary' : 'text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
+            <Settings className="h-[17px] w-[17px] shrink-0" strokeWidth={1.8} />
+            <span>平台管理</span>
+            <ChevronRight className={cn('ml-auto h-3.5 w-3.5 transition-transform', adminOpen && '-rotate-90')} />
+          </button>
+        </div>
+      )}
       <div className="mx-4 h-px bg-sidebar-border" />
-      <div className="px-4 py-3 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
+      <div className="px-4 py-2.5 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
     </aside>
   )
 }
