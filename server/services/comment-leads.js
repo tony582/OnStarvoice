@@ -59,7 +59,7 @@ function matchedKeywordsFor(comment, record = {}) {
   return Array.from(matched).slice(0, 12);
 }
 
-function resolveLeadType(comment) {
+export function resolveLeadType(comment) {
   const text = normalizeText(comment.content).toLowerCase();
   // 购买意向以 AI 判断为准(salesIntent);AI 未判过时才退回(已收紧的)关键词。
   // 这样"客服打电话让续费""不续费给我关闭"这类投诉不会被误收进销售客资。
@@ -84,7 +84,7 @@ function resolveLeadType(comment) {
   return 'other';
 }
 
-function resolvePriority(comment) {
+export function resolvePriority(comment) {
   const risk = normalizeText(comment.risk_level);
   const likes = cleanNumber(comment.like_count);
   if (risk === 'critical' || risk === 'high') return 'urgent';
@@ -106,7 +106,7 @@ function shouldCreateLead(comment) {
   );
 }
 
-function leadReason(comment) {
+export function leadReason(comment) {
   const aiResult = normalizeAiResult(comment.ai_result);
   return normalizeText(
     comment.ai_summary ||

@@ -1,8 +1,50 @@
 import { Router } from 'express';
-import { queryAll, queryOne } from '../db/init.js';
+import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { resolveLeadType, resolvePriority, leadReason } from '../services/comment-leads.js';
+import { classifyCommentWithAI } from '../services/ai-labeler.js';
 
 const router = Router();
+
+// AI 一键重判:对现有「销售客资」逐条重跑 AI 判购买意向,非购买的移回对应舆情类型。
+router.post('/comments/rejudge-sales', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const limit = Math.min(300, Math.max(1, Number(req.body?.limit) || 100));
+    const totalRow = await queryOne(`SELECT COUNT(*)::int AS n FROM comment_leads WHERE tenant_id = $1 AND lead_type = 'sales_intent'`, [req.tenantId]);
+    const leads = await queryAll(`
+      SELECT cl.id, cl.platform, cl.comment_content, cl.comment_author_name, cl.comment_ip_location, cl.comment_like_count,
+             r.title AS record_title, r.content AS record_content
+      FROM comment_leads cl
+      LEFT JOIN records r ON r.id = cl.record_id AND r.tenant_id = cl.tenant_id
+      WHERE cl.tenant_id = $1 AND cl.lead_type = 'sales_intent'
+      ORDER BY cl.captured_at DESC
+      LIMIT $2
+    `, [req.tenantId, limit]);
+
+    let changed = 0;
+    for (const lead of leads) {
+      const comment = { content: lead.comment_content, author_name: lead.comment_author_name, ip_location: lead.comment_ip_location, like_count: lead.comment_like_count };
+      const record = { title: lead.record_title, content: lead.record_content, platform: lead.platform };
+      let ai = null;
+      try { ai = await classifyCommentWithAI({ tenantId: req.tenantId, record, comment }); } catch { ai = null; }
+      if (!ai) continue;
+      const newType = resolveLeadType({ content: lead.comment_content, category: ai.category, ai_result: ai.ai_result });
+      if (newType === 'sales_intent') continue; // AI 确认仍是购买意向 → 保留
+      await execute(
+        `UPDATE comment_leads SET lead_type = $3, priority = $4, ai_result = $5::jsonb, reason = $6, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2`,
+        [
+          lead.id, req.tenantId, newType,
+          resolvePriority({ risk_level: ai.risk_level, like_count: lead.comment_like_count }),
+          JSON.stringify(ai.ai_result || {}),
+          leadReason({ ai_summary: ai.ai_summary, ai_result: ai.ai_result }),
+        ],
+      );
+      changed += 1;
+    }
+    return res.json({ ok: true, scanned: leads.length, changed, total: totalRow?.n || 0 });
+  } catch (err) { return next(err); }
+});
 
 const LEAD_STATUSES = new Set(['new', 'following', 'resolved', 'ignored']);
 const LEAD_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);

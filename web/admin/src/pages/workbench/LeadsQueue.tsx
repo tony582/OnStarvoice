@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
   ChevronLeft, ChevronRight, ExternalLink, Loader2, MessageSquareWarning,
-  RefreshCw, Search, CheckCheck, CircleSlash, Footprints,
+  RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { compact, formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
@@ -67,6 +67,8 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [leadType, setLeadType] = useState(initial?.leadType ?? '')
   const [priority, setPriority] = useState(initial?.priority ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
+  const [rejudging, setRejudging] = useState(false)
+  const [notice, setNotice] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
   const [drawer, setDrawer] = useState<any>(null)
   const { ask, dialog } = useNotePrompt()
@@ -103,6 +105,21 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     await load(willEmpty ? page - 1 : page)
     refreshBadges()
   }, [load, pagination, leads.length, refreshBadges])
+
+  const rejudgeSales = async () => {
+    setRejudging(true); setNotice('')
+    try {
+      const r = await api.post<any>('/leads/comments/rejudge-sales', { limit: 100 })
+      const tail = (r.total || 0) > (r.scanned || 0) ? `(共 ${r.total} 条,可再点继续)` : ''
+      setNotice(`AI 重判完成:扫描 ${r.scanned} 条,移出 ${r.changed} 条非购买线索到评论分诊${tail}`)
+      await reloadAfterMutation()
+    } catch {
+      setNotice('重判失败,请稍后重试')
+    } finally {
+      setRejudging(false)
+      window.setTimeout(() => setNotice(''), 6000)
+    }
+  }
 
   const updateLeadStatus = async (id: string, nextStatus: string): Promise<boolean> => {
     const note = await ask({ title: `${noun}处理备注`, placeholder: '例如：已私信用户跟进 / 已转交销售 / 与本品牌无关' })
@@ -168,8 +185,15 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
           刷新
         </Button>
+        {isSales && canWrite() && (
+          <Button variant="outline" size="sm" onClick={rejudgeSales} disabled={rejudging} title="用 AI 重新判断现有销售客资是否真为购买意向,非购买的移回评论分诊">
+            <Sparkles className={`h-3.5 w-3.5 ${rejudging ? 'animate-pulse' : ''}`} />
+            {rejudging ? 'AI 重判中…' : 'AI 重判'}
+          </Button>
+        )}
       </WorkbenchToolbar>
 
+      {notice && <div className="rounded-lg border border-primary/20 bg-primary/[0.06] px-4 py-2.5 text-[13px] text-foreground">{notice}</div>}
       {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>}
 
       <WorkbenchTableShell>
