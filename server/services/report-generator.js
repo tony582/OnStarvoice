@@ -301,6 +301,23 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['total', 'positive', 'neutral', 'negative', 'pending']);
 
+  // 近 14 天滚动趋势(独立于周期长度):日报用来补"近期走势",避免单日只有一个点
+  const trailingStart = new Date(periodEnd.getTime() - 14 * 86400000);
+  const trailingTrend = normalizeRows(await queryAll(
+    `SELECT
+       to_char(ro.captured_at AT TIME ZONE 'Asia/Shanghai', 'MM-DD') as label,
+       date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') as day_bucket,
+       COUNT(DISTINCT ro.record_id) as total,
+       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'negative') as negative
+     FROM record_observations ro
+     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+       AND ${RELEVANT_RECORD_SQL}
+     GROUP BY day_bucket, label
+     ORDER BY day_bucket ASC`,
+    [tenantId, trailingStart.toISOString(), periodEnd.toISOString()]
+  ), ['total', 'negative']);
+
   const mediaDistribution = normalizeRows(await queryAll(
     `${observedCte}
      SELECT COALESCE(
@@ -598,6 +615,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     intent,
     keyword,
     volumeTrend,
+    trailingTrend,
     sentimentTrend: volumeTrend,
     mediaDistribution,
     regionDistribution,
@@ -1702,15 +1720,76 @@ function buildDataDashboardHTML(title, periodLabel, stats) {
     </main>`;
 }
 
+// 把按日趋势聚合成不超过 maxBuckets 个桶(月报趋势按周/段聚合,避免 30 个日点拥挤)
+function bucketTrend(rows = [], maxBuckets = 6) {
+  if (rows.length <= maxBuckets) return rows;
+  const size = Math.ceil(rows.length / maxBuckets);
+  const out = [];
+  for (let i = 0; i < rows.length; i += size) {
+    const chunk = rows.slice(i, i + size);
+    out.push({
+      label: chunk[0].label,
+      total: chunk.reduce((s, r) => s + num(r.total), 0),
+      negative: chunk.reduce((s, r) => s + num(r.negative), 0),
+    });
+  }
+  return out;
+}
+
 function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
+  const type = stats.reportKind || 'daily';
+  const typeLabel = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
   const kpis = stats.dashboardCards.slice(0, 6);
+  const P = 'margin:0;color:#374151;font-size:13px;line-height:1.7;';
+
+  const sm = stats.sentimentMap || {}, psm = stats.previousSentimentMap || {};
+  const nsr = (num(sm.positive) + num(sm.negative)) ? Math.round((num(sm.positive) - num(sm.negative)) / (num(sm.positive) + num(sm.negative)) * 100) : 0;
+  const pnsr = (num(psm.positive) + num(psm.negative)) ? Math.round((num(psm.positive) - num(psm.negative)) / (num(psm.positive) + num(psm.negative)) * 100) : 0;
+  const w = stats.workflowStats || {};
+  const dispatched = num(w.issue_linked), inbox = num(w.active_inbox);
+  const dispatchRate = (inbox + dispatched) ? Math.round(dispatched / (inbox + dispatched) * 100) : 0;
+  const officialRate = num(stats.total) ? Math.round(num(stats.officialPeriod?.record_count) / num(stats.total) * 100) : 0;
+  const repeatIssues = (stats.topIssues || []).filter(i => num(i.record_count) > 1);
+  const trendBars = (rows, n) => renderBarRows((rows || []).slice(-n), { labelKey: 'label', valueKey: 'total', color: '#2563EB', maxRows: n });
+  const driftLine = `负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})`;
+  const closeLine = `转工单率 ${dispatchRate}% · 官方响应率 ${officialRate}% · 当前待处理 ${n0(inbox)} 条`;
+
+  let body = '';
+  if (type === 'weekly') {
+    body = `
+      ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
+      ${renderSection('本周声量趋势', trendBars(stats.volumeTrend, 7), '按日聚合')}
+      ${renderSection('情感漂移', `<p style="${P}">${escHtml(driftLine)}</p>`, '本周 vs 上周')}
+      ${renderSection('处置闭环', `<p style="${P}">${escHtml(closeLine)}</p>`, '监测 → 处置效率')}
+      ${renderSection('行动建议', renderList(stats.actionItems.slice(0, 6), true), '')}
+      ${renderSection('本周 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 5), '暂无重点风险内容'), '')}
+      ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}`;
+  } else if (type === 'monthly') {
+    body = `
+      ${renderSection('管理层复盘摘要', renderList(stats.executiveSummary), '')}
+      ${renderSection('月度声量趋势', trendBars(bucketTrend(stats.volumeTrend, 6), 6), '按周聚合')}
+      ${renderSection('月度复盘', `<p style="${P}">处置效率:转工单率 ${dispatchRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置效率 + 口碑环比')}
+      ${repeatIssues.length ? renderSection('重复发酵问题', renderIssues(repeatIssues.slice(0, 8)), '关联多条内容/多次出现的问题,需根因处理') : ''}
+      ${renderSection('下月策略建议', renderList(stats.actionItems, true), '按优先级执行')}
+      ${renderSection('本月 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 6), '暂无重点风险内容'), '')}`;
+  } else {
+    body = `
+      ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
+      ${renderSection('近 14 天声量趋势', trendBars(stats.trailingTrend, 14), '滚动窗口,定位当日异动')}
+      ${renderSection('今日行动建议', renderList(stats.actionItems.slice(0, 5), true), '')}
+      ${renderSection('当日 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 4), '暂无重点风险内容'), '')}
+      ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}
+      ${renderSection('官方响应概况', `<p style="${P}">本周期官方响应 ${n0(stats.officialPeriod.response_count)} 条,覆盖 ${n0(stats.officialPeriod.record_count)} 条内容;当前待处理/待复核 ${n0(inbox)} 条。</p>`, '')}`;
+  }
+
   return `${styleBlock()}
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif; max-width:760px; margin:0 auto; background:#F6F8FB; padding:18px; color:#111827;">
       <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px; overflow:hidden;">
         <div style="padding:22px 24px; border-bottom:1px solid #E5E7EB;">
-          <div style="font-size:12px; color:#2563EB; font-weight:800;">StarVoice 星语 · 邮件摘要</div>
+          <div style="font-size:12px; color:#2563EB; font-weight:800;">StarVoice 星语 · ${escHtml(typeLabel)}</div>
           <h1 style="margin:8px 0 8px; font-size:22px; line-height:1.3;">${escHtml(title)}</h1>
           <div style="font-size:13px; color:#6B7280;">${escHtml(periodLabel)} · 风险等级：<strong style="color:${stats.riskColor}">${escHtml(stats.riskLabel)}</strong>${reportId ? ` · 报告ID ${escHtml(reportId)}` : ''}</div>
+          <div style="margin-top:6px; font-size:12px; color:#9CA3AF;">${escHtml(reportFocus(type))}</div>
         </div>
         <div style="padding:20px 24px;">
           <div class="report-grid" style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px;">
@@ -1720,11 +1799,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
               ${card.delta ? `<div style="font-size:12px; color:#6B7280;">较上期 ${escHtml(card.delta.value)}</div>` : ''}
             </div>`).join('')}
           </div>
-          ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
-          ${renderSection('行动建议', renderList(stats.actionItems.slice(0, 5), true), '')}
-          ${renderSection('TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 4), '暂无重点风险内容'), '')}
-          ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}
-          ${renderSection('官方响应概况', `<p style="margin:0;color:#374151;font-size:13px;line-height:1.7;">本周期记录官方响应 ${n0(stats.officialPeriod.response_count)} 条，覆盖 ${n0(stats.officialPeriod.record_count)} 条内容；当前待处理/待复核线索 ${n0(stats.workflowStats.active_inbox)} 条。</p>`, '')}
+          ${body}
           <div style="margin-top:22px; padding:12px; background:#F9FAFB; border-radius:8px; color:#6B7280; font-size:12px; line-height:1.7;">完整图表、词云、评论样本和处置看板请在后台「报告中心」打开预览。若邮件发送失败，请检查系统设置中的 SMTP 与收件人配置。</div>
         </div>
       </div>
