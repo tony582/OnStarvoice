@@ -2,7 +2,7 @@ import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeft, ListChecks, HandCoins,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, PanelLeftOpen, ListChecks, HandCoins,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -64,61 +64,60 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
   const { workspace, switchWorkspace, params } = useNav()
   const activeQueue = activePage === 'workbench' ? (params?.queue || 'triage') : null
   const activeWs = WORKSPACES.find(w => w.key === workspace) || WORKSPACES[0]
-  const ActiveWsIcon = activeWs.icon
+
+  // 收起:整条侧栏隐藏,左上角浮动「唤出」按钮(Claude Code 式)
+  if (collapsed) {
+    return (
+      <button onClick={onToggleCollapse} title="展开导航"
+        className="fixed left-3 top-3.5 z-40 inline-flex h-9 w-9 items-center justify-center rounded-lg border border-sidebar-border bg-sidebar text-muted-foreground shadow-sm transition-colors hover:text-foreground">
+        <PanelLeftOpen className="h-[18px] w-[18px]" strokeWidth={1.9} />
+      </button>
+    )
+  }
 
   return (
-    <>
-      {/* Level 1:图标轨 —— 工作区切换 + 收起开关(常驻,Asana 式)*/}
-      <aside className="fixed inset-y-0 left-0 z-30 flex w-14 flex-col items-center border-r border-sidebar-border bg-sidebar py-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary">
-          <img src="/images/logo-starvoice.svg" alt="" className="h-5 w-5 object-contain brightness-0 invert" />
+    <aside className="fixed inset-y-0 left-0 z-30 flex w-[240px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
+      {/* 头部:Logo + 隐藏 */}
+      <div className="flex items-center gap-2.5 px-4 pb-1 pt-4">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary">
+          <img src="/images/logo-starvoice.svg" alt="" className="h-[18px] w-[18px] object-contain brightness-0 invert" />
         </div>
-        <button onClick={onToggleCollapse} title={collapsed ? '展开导航' : '收起导航'}
-          className="mt-2 flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
-          <PanelLeft className="h-[18px] w-[18px]" strokeWidth={1.9} />
+        <span className="truncate text-[13px] font-bold text-foreground">StarVoice 星语</span>
+        <button onClick={onToggleCollapse} title="隐藏导航"
+          className="ml-auto rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
+          <PanelLeftClose className="h-[18px] w-[18px]" strokeWidth={1.9} />
         </button>
-        <div className="my-2.5 h-px w-7 bg-sidebar-border" />
-        <div className="flex flex-col items-center gap-1.5">
-          {WORKSPACES.map(w => {
-            const Icon = w.icon
-            const on = w.key === workspace
-            return (
-              <button key={w.key} onClick={() => switchWorkspace(w.key)} title={`${w.label} · ${w.desc}`}
-                className={cn(
-                  'relative flex h-10 w-10 items-center justify-center rounded-xl transition-colors',
-                  on ? 'bg-accent' : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
-                )}>
-                {on && <span className="absolute -left-2 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-primary" />}
-                <Icon className={cn('h-[19px] w-[19px]', on && activeWs.accent)} strokeWidth={2} />
-              </button>
-            )
-          })}
-        </div>
-      </aside>
+      </div>
 
-      {/* Level 2:导航面板(可收起,收起后主区铺满)*/}
-      {!collapsed && (
-        <aside className="fixed inset-y-0 left-14 z-20 flex w-[200px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
-          <div className="flex items-center gap-2.5 px-4 pb-2.5 pt-4">
-            <ActiveWsIcon className={cn('h-[18px] w-[18px] shrink-0', activeWs.accent)} strokeWidth={2} />
-            <div className="min-w-0">
-              <div className="truncate text-[13px] font-bold leading-tight text-foreground">{activeWs.label}</div>
-              <div className="truncate text-[10px] text-muted-foreground">{activeWs.desc}</div>
-            </div>
-          </div>
+      {/* 工作区分段切换:舆情风控 / 内容创意(横向来回切)*/}
+      <div className="mx-3 mt-2 flex gap-1 rounded-xl bg-sidebar-accent/50 p-1">
+        {WORKSPACES.map(w => {
+          const Icon = w.icon
+          const on = w.key === workspace
+          return (
+            <button key={w.key} onClick={() => switchWorkspace(w.key)} title={w.desc}
+              className={cn(
+                'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[12.5px] font-semibold transition-colors',
+                on ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+              )}>
+              <Icon className={cn('h-4 w-4', on && w.accent)} strokeWidth={2} />
+              {w.label}
+            </button>
+          )
+        })}
+      </div>
+      <div className="px-4 pb-0.5 pt-1.5 text-[10px] text-muted-foreground">{activeWs.desc}</div>
 
-          <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
-            <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-            {isInternal() && (
-              <NavGroup label="ADMIN" items={ADMIN_NAV} activePage={activePage} activeQueue={null} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-            )}
-          </nav>
+      <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
+        <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
+        {isInternal() && (
+          <NavGroup label="ADMIN" items={ADMIN_NAV} activePage={activePage} activeQueue={null} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
+        )}
+      </nav>
 
-          <div className="mx-4 h-px bg-sidebar-border" />
-          <div className="px-4 py-3 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
-        </aside>
-      )}
-    </>
+      <div className="mx-4 h-px bg-sidebar-border" />
+      <div className="px-4 py-3 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
+    </aside>
   )
 }
 
