@@ -1,4 +1,5 @@
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import cloud from 'd3-cloud'
 import {
   AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw,
 } from 'lucide-react'
@@ -613,34 +614,72 @@ function Distribution({ rows, labelKey, labelMap = {} }: { rows: any[]; labelKey
   )
 }
 
+const CLOUD_COLORS = ['#2563EB', '#E11D48', '#059669', '#D97706', '#7C3AED', '#0EA5E9', '#DB2777']
+
 function WordCloud({ terms }: { terms: any[] }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [width, setWidth] = useState(560)
+  const [placed, setPlaced] = useState<any[]>([])
+  const H = 300
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const update = () => setWidth(Math.max(280, el.clientWidth || 560))
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!terms.length || !width) { setPlaced([]); return }
+    const top = terms.slice(0, 50)
+    const ws = top.map(t => Number(t.weight) || Number(t.count) || 1)
+    const max = Math.max(...ws, 1), min = Math.min(...ws)
+    const words = top.map((t, i) => {
+      const v = Number(t.weight) || Number(t.count) || 1
+      return {
+        text: String(t.label || ''),
+        size: Math.round(14 + (v - min) / (max - min || 1) * 30),
+        count: Number(t.count) || 0,
+        tone: Number(t.tone) || i,
+      }
+    })
+    let cancelled = false
+    const layout = cloud()
+      .size([width, H])
+      .words(words as any)
+      .padding(2)
+      .rotate(() => (Math.random() < 0.22 ? 90 : 0))
+      .font('sans-serif')
+      .fontSize((d: any) => d.size)
+      .on('end', (out: any[]) => { if (!cancelled) setPlaced(out) })
+    layout.start()
+    return () => { cancelled = true; layout.stop() }
+  }, [terms, width])
+
   if (!terms.length) return <EmptyState icon={BarChart3} title="暂无热点词" />
-  const colors = ['text-primary', 'text-rose-600', 'text-emerald-600', 'text-amber-600', 'text-violet-600', 'text-sky-600']
-  const top = terms.slice(0, 42)
-  const ws = top.map(t => Number(t.weight) || Number(t.count) || 1)
-  const max = Math.max(...ws, 1), min = Math.min(...ws)
-  const fontOf = (w: number) => Math.round(13 + (w - min) / (max - min || 1) * 31) // 13~44px
-  const opacityOf = (w: number) => 0.55 + 0.45 * ((w - min) / (max - min || 1))
-  // 大词居中:按权重降序后从中间向两侧交替排布
-  const sorted = [...top].sort((a, b) => (Number(b.weight) || Number(b.count) || 0) - (Number(a.weight) || Number(a.count) || 0))
-  const arranged: any[] = []
-  sorted.forEach((t, i) => (i % 2 ? arranged.push(t) : arranged.unshift(t)))
   return (
-    <div className="flex min-h-[240px] flex-wrap content-center items-center justify-center gap-x-3.5 gap-y-1 px-2 py-3">
-      {arranged.map((term, index) => {
-        const w = Number(term.weight) || Number(term.count) || 1
-        const rot = index % 9 === 0 ? '-7deg' : index % 6 === 0 ? '6deg' : '0deg'
-        return (
-          <span
-            key={`${term.label}-${index}`}
-            className={`cursor-default font-bold leading-tight transition-transform hover:scale-110 ${colors[(Number(term.tone) || index) % colors.length]}`}
-            style={{ fontSize: `${fontOf(w)}px`, opacity: opacityOf(w), transform: `rotate(${rot})` }}
-            title={`${term.label} · ${formatNumber(term.count)}`}
-          >
-            {term.label}
-          </span>
-        )
-      })}
+    <div ref={ref} className="w-full">
+      <svg width={width} height={H} className="w-full" style={{ display: 'block' }}>
+        <g transform={`translate(${width / 2},${H / 2})`}>
+          {placed.map((d, i) => (
+            <text
+              key={`${d.text}-${i}`}
+              textAnchor="middle"
+              transform={`translate(${d.x},${d.y}) rotate(${d.rotate})`}
+              fontSize={d.size}
+              fontWeight={700}
+              fill={CLOUD_COLORS[d.tone % CLOUD_COLORS.length]}
+              style={{ cursor: 'default' }}
+            >
+              <title>{d.text} · {formatNumber(d.count)}</title>
+              {d.text}
+            </text>
+          ))}
+        </g>
+      </svg>
     </div>
   )
 }
