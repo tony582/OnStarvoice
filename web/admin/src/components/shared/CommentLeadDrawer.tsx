@@ -80,7 +80,7 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
       </div>
       <div className="relative z-10 flex h-full w-full flex-col">
         {/* Header */}
-        <div className="flex items-center gap-3 border-b border-border/50 px-6 py-4">
+        <div className="flex h-14 items-center gap-3 border-b border-border/50 px-6">
           <h2 className="text-base font-bold">{noun}详情</h2>
           <StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge>
           <button onClick={onClose} className="ml-auto rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>

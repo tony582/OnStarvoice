@@ -107,7 +107,7 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
       </div>
       <div className="relative z-10 flex h-full w-full flex-col">
         {/* Header */}
-        <div className="flex items-center gap-2.5 border-b border-border/60 px-6 py-4">
+        <div className="flex h-14 items-center gap-2.5 border-b border-border/60 px-6">
           <h2 className="text-base font-bold">工单详情</h2>
           <StatusBadge tone={STATE_TONE[t.status] || 'muted'}>{STATE_LABEL[t.status] || t.status}</StatusBadge>
           <button onClick={togglePin} title={pinned ? '已钉住:切换工单时保留当前页签' : '钉住面板'}
