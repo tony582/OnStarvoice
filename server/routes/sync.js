@@ -182,7 +182,9 @@ function normalizeRecord(body) {
       comments_count: metric('comments', 'comments', 'commentCount', 'comment_count', 'commentsCount', 'comments_count'),
       collects: metric('collects', 'collects', 'collectCount', 'collect_count', 'collectsCount', 'collects_count'),
       shares: metric('shares', 'shares', 'shareCount', 'share_count', 'reposts', 'repostCount', 'repost_count', 'repostsCount', 'reposts_count'),
-      publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw', 'lastEditedAt')),
+      // lastEditedAt 会被采集端污染成"采集当天"(并非真实发布时间),不再作为发布时间兜底 ——
+      // 否则没采到发布时间的帖子会被冒充成采集日(本 fork 修:发布时间不对的根因之一)。
+      publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw')),
       tags: JSON.stringify(tags),
       blogger_profile_url: String(get('bloggerProfileUrl', 'authorProfileUrl', 'authorUrl', 'profileUrl')),
       image_urls: JSON.stringify(imageUrls),
@@ -246,6 +248,9 @@ function queueCommentWorkflow(record, result, context) {
 }
 
 async function applyOrQueueCommentWorkflow(record, result, context) {
+  // 评论入库走异步队列:每条评论要 await classifyCommentWithAI(LLM 调用,慢),
+  // 不能阻塞同步响应。队列原本"出错静默丢失"的根因是 official_responses 的 ON CONFLICT bug
+  // (有官方评论就整条回滚)—— 那个已修,队列不再无故报错。
   const commentCount = countCommentWorkflowItems(record);
   if (commentCount > 0) {
     return queueCommentWorkflow(record, result, context);

@@ -779,6 +779,11 @@ export async function captureDouyinSingleNote({
       });
     }
     const publishText = extractDouyinPublishText(detailRoot);
+    // 优先用拦截到的 API create_time(最可靠的发布时间戳),DOM 文本兜底。本 fork 自加。
+    const apiCreateTime = readDouyinApiCache(noteId)?.create_time;
+    const resolvedPublishText = apiCreateTime
+      ? new Date(Number(apiCreateTime) * 1000).toISOString()
+      : publishText;
     let media = await observeStableDouyinMedia(noteId, noteUrl);
     printDouyinMediaDiagnostics(media?.diagnostics);
     const expectsVideo =
@@ -839,9 +844,9 @@ export async function captureDouyinSingleNote({
       collects: interactions.collects,
       comments: interactions.comments,
       shares: interactions.shares,
-      publishTime: publishText,
-      publishDateRaw: publishText,
-      lastEditedAt: normalizeDouyinPublishDate(publishText),
+      publishTime: resolvedPublishText,
+      publishDateRaw: resolvedPublishText,
+      lastEditedAt: normalizeDouyinPublishDate(resolvedPublishText),
       noteType: contextualNoteType,
       type: contextualNoteType,
       coverImageUrl: media.coverImage,
@@ -2480,7 +2485,18 @@ function parseDouyinCount(text) {
 }
 
 function extractDouyinPublishText(detailRoot) {
-  return cleanText(getText(DOUYIN_DOM_PROFILE.noteDetail.fields.publishTime, detailRoot));
+  const direct = cleanText(getText(DOUYIN_DOM_PROFILE.noteDetail.fields.publishTime, detailRoot));
+  if (direct) return direct;
+  // 兜底(本 fork 自加;MediaClaw 合并上游时保留):抖音常改混淆类名 / 换 data-e2e,
+  // 这里按文本正则在详情根(退而 document)里找"发布时间:YYYY-MM-DD ...",不依赖易变的选择器。
+  const re = /发布时间[:：]\s*(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}[日]?(?:\s*\d{1,2}[:：]\d{2}(?::\d{2})?)?)/;
+  for (const scope of [detailRoot, document]) {
+    if (!scope) continue;
+    const txt = String(scope.innerText || scope.textContent || "");
+    const m = txt.match(re);
+    if (m && m[1]) return cleanText(m[1]);
+  }
+  return "";
 }
 
 function normalizeDouyinPublishDate(text) {

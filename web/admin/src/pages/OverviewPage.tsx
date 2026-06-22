@@ -7,6 +7,7 @@ import { api } from '@/lib/api'
 import { compact, formatNumber, formatDate, platformName, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { InfoHint } from '@/components/shared/InfoHint'
 import { RecordDrawer } from '@/components/shared/RecordDrawer'
 import { useNav } from '@/lib/navigation'
 import { useBadges } from '@/lib/badges'
@@ -55,10 +56,10 @@ export function OverviewPage() {
 
       {/* Numbers 行 */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <NumberCard label="全网声量" value={formatNumber(k.total_interaction)} sub={`周期新增 ${formatNumber(k.period_new)}`} icon={Radio} onClick={() => navigate('data')} />
-        <NumberCard label="待分诊" value={formatNumber(badges.triagePending)} sub="待人工研判" tone="orange" icon={Inbox} onClick={() => navigate('workbench', { queue: 'triage' })} />
-        <NumberCard label="累计负面" value={formatNumber(sb.negative)} sub={`负面占比 ${negRatio}%`} tone="red" icon={ShieldAlert} onClick={() => navigate('workbench', { queue: 'triage', sentiment: 'negative' })} />
-        <NumberCard label="开放问题" value={formatNumber(k.open_issues)} sub={`高优 ${formatNumber(k.high_open_issues)}`} tone={Number(k.high_open_issues || 0) > 0 ? 'red' : 'default'} icon={AlertOctagon} onClick={() => navigate('workbench', { queue: 'issues' })} />
+        <NumberCard label="互动总量" hint="互动总量=点赞+评论+收藏+转发 之和(全部内容累计),不是内容条数。「声量」才指内容条数,见分析与报告。本系统不采阅读/播放量,不报触达人数。" value={formatNumber(k.total_interaction)} sub={`周期新增内容 ${formatNumber(k.period_new)}`} icon={Radio} onClick={() => navigate('data')} />
+        <NumberCard label="待分诊" hint="待分诊=进入分诊队列、待人工研判的内容(尚未转工单也未归档)。" value={formatNumber(badges.triagePending)} sub="待人工研判" tone="orange" icon={Inbox} onClick={() => navigate('workbench', { queue: 'triage' })} />
+        <NumberCard label="累计负面" hint="累计负面=情感被 AI 标注为负面的内容总数;负面占比=负面 ÷ 已标注内容。" value={formatNumber(sb.negative)} sub={`负面占比 ${negRatio}%`} tone="red" icon={ShieldAlert} onClick={() => navigate('workbench', { queue: 'triage', sentiment: 'negative' })} />
+        <NumberCard label="开放问题" hint="开放问题=未解决/未关闭的问题单(issue);高优=高/紧急级别。" value={formatNumber(k.open_issues)} sub={`高优 ${formatNumber(k.high_open_issues)}`} tone={Number(k.high_open_issues || 0) > 0 ? 'red' : 'default'} icon={AlertOctagon} onClick={() => navigate('workbench', { queue: 'issues' })} />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
@@ -153,18 +154,18 @@ const NUM_TONE = {
   red: 'text-status-red',
 }
 
-function NumberCard({ label, value, sub, icon: Icon, tone = 'default', onClick }: {
-  label: string; value: string; sub?: string; icon: React.ElementType; tone?: keyof typeof NUM_TONE; onClick?: () => void
+function NumberCard({ label, value, sub, icon: Icon, tone = 'default', onClick, hint }: {
+  label: string; value: string; sub?: string; icon: React.ElementType; tone?: keyof typeof NUM_TONE; onClick?: () => void; hint?: string
 }) {
   return (
-    <button onClick={onClick}
-      className="group rounded-xl border border-border bg-card px-4 py-3.5 text-left shadow-xs transition-all duration-150 hover:border-primary/30 hover:shadow-sm">
+    <div onClick={onClick} role="button" tabIndex={0}
+      className="group cursor-pointer rounded-xl border border-border bg-card px-4 py-3.5 text-left shadow-xs transition-all duration-150 hover:border-primary/30 hover:shadow-sm">
       <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-[12px] font-medium text-muted-foreground">{label}</span>
+        <span className="flex items-center gap-1 truncate text-[12px] font-medium text-muted-foreground">{label}{hint && <InfoHint text={hint} />}</span>
         <Icon className="h-4 w-4 shrink-0 text-muted-foreground transition-colors group-hover:text-primary" strokeWidth={1.8} />
       </div>
       <div className={cn('mt-2 text-[26px] font-bold leading-none tabular-nums tracking-tight', NUM_TONE[tone])}>{value}</div>
       {sub && <div className="mt-1.5 text-[10.5px] text-muted-foreground">{sub}</div>}
-    </button>
+    </div>
   )
 }

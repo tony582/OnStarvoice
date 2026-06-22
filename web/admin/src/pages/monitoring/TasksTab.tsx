@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Loader2, Radar, Play, Target, Plus, Clock, AlertTriangle } from 'lucide-react'
+import { Loader2, Radar, Play, Target, Clock, AlertTriangle } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, platformName, formatNumber } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -29,15 +29,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
 
   useEffect(() => { load() }, [])
 
-  const create = async () => {
-    const keyword = prompt('监控关键词：')
-    if (!keyword) return
-    const platform = prompt('平台 (xiaohongshu / douyin / weibo)：', 'xiaohongshu')
-    if (!platform) return
-    await api.post('/monitor/subscriptions', { keyword, platform, cadenceMinutes: 1440 })
-    load()
-  }
-
   const runNow = async (id: string) => {
     await api.post('/monitor/run-now', { subscriptionId: id })
     load()
@@ -51,22 +42,22 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
       {/* Stats 头部 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap gap-3">
-          <Stat label="监控任务" value={formatNumber(subs.length)} icon={Radar} />
+          <Stat label="关注博主" value={formatNumber(subs.length)} icon={Radar} />
           <Stat label="运行中" value={formatNumber(active)} icon={Clock} tone="green" />
           <Stat label="异常" value={formatNumber(errored)} icon={AlertTriangle} tone={errored > 0 ? 'red' : 'default'} />
         </div>
-        <Button onClick={create} disabled={!canWrite()}><Plus className="h-4 w-4" />新建监控</Button>
+        <span className="text-[12px] text-muted-foreground">在扩展「对标监控」里把竞品博主纳入监控,这里查看并执行扫描</span>
       </div>
 
       {loading ? (
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
       ) : subs.length === 0 ? (
-        <EmptyState icon={Radar} title="暂无监控任务" description="创建关键词监控以自动采集舆情内容" />
+        <EmptyState icon={Radar} title="暂无监控账号" description="在扩展「对标监控」标签把竞品博主纳入监控,即可在此查看与执行" />
       ) : (
         <WorkbenchTableShell>
           <table className="w-full text-sm">
             <thead><tr className="border-b border-border bg-muted">
-              <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">监控任务</th>
+              <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">博主</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">平台</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">频率</th>
@@ -79,8 +70,10 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                 return (
                   <tr key={s.id} className="align-top transition-colors hover:bg-muted/30">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{s.name || s.keyword}</div>
-                      <div className="mt-0.5 text-xs text-muted-foreground">关键词:{s.keyword}</div>
+                      <div className="font-medium">{s.name || s.bloggerName || '博主'}</div>
+                      {(s.account_url || s.accountUrl)
+                        ? <a href={s.account_url || s.accountUrl} target="_blank" rel="noreferrer" className="mt-0.5 inline-block text-xs text-primary hover:underline">博主主页 ↗</a>
+                        : <div className="mt-0.5 text-xs text-muted-foreground">{s.platformBloggerId || s.keyword || '-'}</div>}
                     </td>
                     <td className="px-4 py-3"><StatusBadge tone="neutral">{platformName(s.platform)}</StatusBadge></td>
                     <td className="px-4 py-3">

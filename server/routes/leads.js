@@ -1,12 +1,56 @@
 import { Router } from 'express';
-import { queryAll, queryOne } from '../db/init.js';
+import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { resolveLeadType, resolvePriority, leadReason } from '../services/comment-leads.js';
+import { classifyCommentWithAI } from '../services/ai-labeler.js';
+import { formatPublishDate } from '../services/publish-date.js';
 
 const router = Router();
+
+// AI 一键重判:对现有「销售客资」逐条重跑 AI 判购买意向,非购买的移回对应舆情类型。
+router.post('/comments/rejudge-sales', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const limit = Math.min(300, Math.max(1, Number(req.body?.limit) || 100));
+    const totalRow = await queryOne(`SELECT COUNT(*)::int AS n FROM comment_leads WHERE tenant_id = $1 AND lead_type = 'sales_intent'`, [req.tenantId]);
+    const leads = await queryAll(`
+      SELECT cl.id, cl.platform, cl.comment_content, cl.comment_author_name, cl.comment_ip_location, cl.comment_like_count,
+             r.title AS record_title, r.content AS record_content
+      FROM comment_leads cl
+      LEFT JOIN records r ON r.id = cl.record_id AND r.tenant_id = cl.tenant_id
+      WHERE cl.tenant_id = $1 AND cl.lead_type = 'sales_intent'
+      ORDER BY cl.captured_at DESC
+      LIMIT $2
+    `, [req.tenantId, limit]);
+
+    let changed = 0;
+    for (const lead of leads) {
+      const comment = { content: lead.comment_content, author_name: lead.comment_author_name, ip_location: lead.comment_ip_location, like_count: lead.comment_like_count };
+      const record = { title: lead.record_title, content: lead.record_content, platform: lead.platform };
+      let ai = null;
+      try { ai = await classifyCommentWithAI({ tenantId: req.tenantId, record, comment }); } catch { ai = null; }
+      if (!ai) continue;
+      const newType = resolveLeadType({ content: lead.comment_content, category: ai.category, ai_result: ai.ai_result });
+      if (newType === 'sales_intent') continue; // AI 确认仍是购买意向 → 保留
+      await execute(
+        `UPDATE comment_leads SET lead_type = $3, priority = $4, ai_result = $5::jsonb, reason = $6, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2`,
+        [
+          lead.id, req.tenantId, newType,
+          resolvePriority({ risk_level: ai.risk_level, like_count: lead.comment_like_count }),
+          JSON.stringify(ai.ai_result || {}),
+          leadReason({ ai_summary: ai.ai_summary, ai_result: ai.ai_result }),
+        ],
+      );
+      changed += 1;
+    }
+    return res.json({ ok: true, scanned: leads.length, changed, total: totalRow?.n || 0 });
+  } catch (err) { return next(err); }
+});
 
 const LEAD_STATUSES = new Set(['new', 'following', 'resolved', 'ignored']);
 const LEAD_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const LEAD_TYPES = new Set([
+  'sales_intent',
   'complaint', 'renewal_billing', 'app_issue', 'service_quality',
   'safety_privacy', 'brand_risk', 'other',
 ]);
@@ -25,7 +69,14 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
 
     const params = [req.tenantId];
     let where = 'WHERE tenant_id = $1';
-    if (status && LEAD_STATUSES.has(String(status))) {
+    // 评论分诊与内容分诊同构的两个 MECE 桶:待处理(new) / 已归档(resolved+ignored)。
+    // 已转工单(following)不在分诊视图,在工单系统里跟踪。
+    const bucket = String(req.query.bucket || '');
+    if (bucket === 'pending') {
+      where += ` AND status = 'new'`;
+    } else if (bucket === 'archived') {
+      where += ` AND status IN ('resolved', 'ignored')`;
+    } else if (status && LEAD_STATUSES.has(String(status))) {
       params.push(status);
       where += ` AND status = $${params.length}`;
     }
@@ -36,6 +87,13 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     if (leadType && LEAD_TYPES.has(String(leadType))) {
       params.push(leadType);
       where += ` AND lead_type = $${params.length}`;
+    }
+    // 大类:sales=销售客资(购买意向),opinion=舆情评论(其余风险类)
+    const category = String(req.query.category || '');
+    if (category === 'sales') {
+      where += ` AND lead_type = 'sales_intent'`;
+    } else if (category === 'opinion') {
+      where += ` AND lead_type <> 'sales_intent'`;
     }
     if (priority && LEAD_PRIORITIES.has(String(priority))) {
       params.push(priority);
@@ -62,15 +120,22 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     params.push(limit, offset);
 
     const leads = await queryAll(`
-      SELECT *
+      SELECT *,
+        (SELECT content FROM records r WHERE r.id = comment_leads.record_id) AS record_content,
+        (SELECT ai_summary FROM records r WHERE r.id = comment_leads.record_id) AS record_ai_summary,
+        (SELECT sentiment FROM records r WHERE r.id = comment_leads.record_id) AS record_sentiment,
+        (SELECT published_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_published_at
       FROM comment_leads
       ${where}
       ORDER BY
+        ${String(req.query.sort || '') === 'publish' ? 'comment_published_ts DESC NULLS LAST,' : ''}
         CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
         captured_at DESC,
         updated_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
+
+    leads.forEach(l => { l.publish_display = formatPublishDate(l.comment_published_at, l.captured_at); });
 
     return res.json({
       ok: true,
@@ -113,12 +178,14 @@ router.patch('/comments/batch', requireTenantAccess, requireTenantWriter, async 
 
     let updatedRows = [];
     if (validIds.length) {
+      // following = 已转工单,批量置 following 仅对销售客资生效,舆情评论跳过(应走转工单)
+      const followingGuard = status === 'following' ? ` AND lead_type = 'sales_intent'` : '';
       updatedRows = await queryAll(`
         UPDATE comment_leads
         SET status = COALESCE($3, status),
           priority = COALESCE($4, priority),
           updated_at = now()
-        WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        WHERE tenant_id = $1 AND id = ANY($2::uuid[])${followingGuard}
         RETURNING id
       `, [req.tenantId, validIds, status, priority]);
     }
@@ -141,6 +208,13 @@ router.patch('/comments/:id', requireTenantAccess, requireTenantWriter, async (r
       if (!LEAD_STATUSES.has(status)) {
         return res.status(400).json({ ok: false, error: 'invalid_status', message: '线索状态无效' });
       }
+      // following = 已转工单,只能由 POST /tickets 设置;舆情评论不允许手动置 following
+      if (status === 'following') {
+        const row = await queryOne('SELECT lead_type FROM comment_leads WHERE id = $1 AND tenant_id = $2', [req.params.id, req.tenantId]);
+        if (row && row.lead_type !== 'sales_intent') {
+          return res.status(400).json({ ok: false, error: 'following_via_ticket_only', message: '舆情评论请用「转工单」流转,不要用跟进' });
+        }
+      }
       params.push(status);
       updates.push(`status = $${params.length}`);
     }
@@ -150,6 +224,18 @@ router.patch('/comments/:id', requireTenantAccess, requireTenantWriter, async (r
       }
       params.push(priority);
       updates.push(`priority = $${params.length}`);
+    }
+    // 处理备注留痕(选填):写入 note + 处理人 + 处理时间
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'note')) {
+      params.push(String(req.body.note || ''));
+      updates.push(`note = $${params.length}`);
+    }
+    if (status) {
+      params.push(req.user?.id || null);
+      updates.push(`handled_by = $${params.length}`);
+      params.push(req.user?.name || req.user?.email || '');
+      updates.push(`handled_name = $${params.length}`);
+      updates.push('handled_at = now()');
     }
     if (!updates.length) {
       return res.status(400).json({ ok: false, error: 'empty_update', message: '没有要更新的字段' });

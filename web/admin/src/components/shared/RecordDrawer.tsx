@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
-  ExternalLink, User, FileText, Camera, Bell, Archive, Eye,
+  ExternalLink, User, FileText, Camera, Bell, Archive, Eye, Sparkles,
 } from 'lucide-react'
 
 // 详情面板可拖宽,停靠右侧(Asana 式)
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, formatFullDate, LABELS, platformName, cn } from '@/lib/utils'
+import { formatNumber, formatDate, formatFullDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -122,7 +122,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
       <div className="relative z-10 flex h-full w-full flex-col">
 
         {/* Header */}
-        <div className="flex items-center gap-3 border-b border-border/50 px-6 py-4">
+        <div className="flex h-14 items-center gap-3 border-b border-border/50 px-6">
           <h2 className="text-base font-bold">舆情内容详情</h2>
           {r.triage_status && <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>}
           <button onClick={onClose} className="ml-auto rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
@@ -143,6 +143,9 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
+                  {(r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)) && (
+                    <span title="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除" className="cursor-help rounded-md bg-violet-500/15 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+                  )}
                 </div>
                 <h3 className="text-[15px] font-bold leading-snug">{r.title || '(无标题)'}</h3>
 
@@ -157,6 +160,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                   </div>
                   {r.url && <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
                   {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted-foreground hover:text-foreground"><User className="h-3.5 w-3.5" />主页</a>}
+                  {r.publish_display && <span className="text-[12px] text-muted-foreground">发布于 {r.publish_display}</span>}
                 </div>
               </div>
             </div>
@@ -166,7 +170,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
               <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg bg-status-red/[0.05] px-3 py-2.5 dark:bg-status-red/[0.08]">
                 <span className="text-[11px] font-semibold text-muted-foreground">风险信号</span>
                 {alerts > 0 && (
-                  <span className="inline-flex items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span>
+                  <span title={r.alert_reasons || '触发预警'} className="inline-flex cursor-help items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span>
                 )}
                 {negComments > 0 && (
                   <span className="rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span>
@@ -222,6 +226,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                         <p className="text-sm leading-relaxed text-muted-foreground">{r.ai_summary}</p>
                       </div>
                     )}
+                    {hasVideo(r) && <TranscriptSection record={r} canWrite={canWrite} />}
                     {images.length > 1 && (
                       <div>
                         <h4 className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">图片</h4>
@@ -246,7 +251,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                         <div key={i} className={cn('rounded-xl p-4', c.is_negative ? 'bg-status-red/[0.05]' : 'bg-muted/50')}>
                           <div className="mb-1.5 flex items-center gap-2">
                             <span className="text-sm font-semibold">{c.author_name || '未知评论者'}</span>
-                            <span className="text-xs text-muted-foreground">{formatDate(c.published_at || c.created_at)}</span>
+                            <span className="text-xs text-muted-foreground">{c.publish_display || '—'}</span>
                             {c.is_official && <StatusBadge tone="positive">官方回复</StatusBadge>}
                             {commentClassifier(c) === 'llm_comment' && <StatusBadge tone="neutral">AI</StatusBadge>}
                             <StatusBadge tone={c.is_negative ? 'negative' : (c.sentiment || 'muted')}>
@@ -261,13 +266,6 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                           )}
                           <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
                             <span>{formatNumber(c.like_count)} 赞{c.ip_location ? ` · IP ${c.ip_location}` : ''}</span>
-                            {canWrite && c.is_negative && (
-                              <Button variant="outline" size="sm" onClick={() => {
-                                const title = prompt('问题标题', '负面评论跟进')
-                                if (!title) return
-                                api.post('/comments/' + c.id + '/issues', { title }).then(onClose)
-                              }}><LinkIcon className="h-3 w-3" />转问题</Button>
-                            )}
                           </div>
                         </div>
                       ))}
@@ -338,13 +336,28 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
           </div>
         </div>
 
+        {/* 处理留痕:状态 / 处理人 / 时间 / 备注 */}
+        {(r.triage_note || r.triage_owner_name) && (
+          <div className="border-t border-border/50 bg-muted/30 px-6 py-3 text-[12px]">
+            <div className="font-semibold text-muted-foreground">处理留痕</div>
+            <div className="mt-1 space-y-0.5 text-muted-foreground">
+              <div>
+                状态：{LABELS.triage[r.triage_status] || r.triage_status || '未处理'}
+                {r.triage_owner_name && <span> · 处理人：{r.triage_owner_name}</span>}
+                {r.triage_updated_at && <span> · {formatDate(r.triage_updated_at)}</span>}
+              </div>
+              {r.triage_note && <div className="text-foreground/80">备注：{r.triage_note}</div>}
+            </div>
+          </div>
+        )}
+
         {/* Footer actions */}
         {canWrite && (
           <div className="flex flex-wrap items-center gap-2 border-t border-border/50 px-6 py-4">
             {onMarkResponded && <Button variant="outline" size="sm" onClick={onMarkResponded}><CheckCircle className="h-3.5 w-3.5" />标为已响应</Button>}
             {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('reviewing')}><Eye className="h-3.5 w-3.5" />待复核</Button>}
             {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('archived')}><Archive className="h-3.5 w-3.5" />归档</Button>}
-            <Button className="ml-auto" onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转为问题</Button>
+            <Button className="ml-auto" onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转工单</Button>
           </div>
         )}
       </div>
@@ -401,4 +414,176 @@ function commentClassifier(comment: any): string {
   } catch {
     return ''
   }
+}
+
+function hasVideo(r: any): boolean {
+  return Boolean(r?.video_url) || r?.note_type === 'video'
+}
+
+const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media']
+
+/**
+ * 视频逐字稿:用阿里云百炼把视频口播转成文字,补"视频内容盲区"。
+ * 转写异步(后台提交+轮询),这里点击触发后轮询 GET /records/:id/transcript。
+ */
+function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolean }) {
+  const [status, setStatus] = useState<string>(record.transcript_status || 'none')
+  const [text, setText] = useState<string>(record.transcript || '')
+  const [error, setError] = useState<string>(record.transcript_error || '')
+  const [busy, setBusy] = useState(false)
+  const [analysis, setAnalysis] = useState<any>(record.transcript_analysis || null)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [analyzeError, setAnalyzeError] = useState('')
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const stopPoll = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
+
+  const startPoll = () => {
+    stopPoll()
+    pollRef.current = setInterval(async () => {
+      try {
+        const d: any = await api.get(`/records/${record.id}/transcript`)
+        setStatus(d.transcript_status || 'none')
+        setText(d.transcript || '')
+        setError(d.transcript_error || '')
+        if (TRANSCRIPT_TERMINAL.includes(d.transcript_status)) { stopPoll(); setBusy(false) }
+      } catch { /* 单次轮询失败,下个周期再试 */ }
+    }, 3500)
+  }
+
+  // 打开抽屉时主动从库里拉最新逐字稿 + AI 分析(列表行快照可能不含这些字段);在转写中则接着轮询
+  useEffect(() => {
+    let cancelled = false
+    api.get(`/records/${record.id}/transcript`).then((d: any) => {
+      if (cancelled) return
+      setStatus(d.transcript_status || 'none')
+      setText(d.transcript || '')
+      setError(d.transcript_error || '')
+      setAnalysis(d.transcript_analysis || null)
+      if (d.transcript_status === 'pending' || d.transcript_status === 'processing') { setBusy(true); startPoll() }
+    }).catch(() => { /* 拉取失败保持快照初值 */ })
+    return () => { cancelled = true; stopPoll() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const generate = async () => {
+    setBusy(true); setError('')
+    try {
+      const d: any = await api.post(`/records/${record.id}/transcribe`, {})
+      setStatus(d.status || 'pending')
+      if (d.status === 'no_media') { setBusy(false); return }
+      startPoll()
+    } catch (e: any) {
+      setStatus('failed'); setError(e?.message || '触发失败'); setBusy(false)
+    }
+  }
+
+  const analyze = async () => {
+    setAnalyzing(true); setAnalyzeError('')
+    try {
+      const d: any = await api.post(`/records/${record.id}/analyze-transcript`, {})
+      setAnalysis(d.analysis || null)
+    } catch (e: any) {
+      setAnalyzeError(e?.message || 'AI 分析失败')
+    } finally {
+      setAnalyzing(false)
+    }
+  }
+
+  const inProgress = status === 'pending' || status === 'processing'
+  const hasTranscript = status === 'done' && !!text
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">视频逐字稿</h4>
+        {canWrite && !inProgress && (
+          <button onClick={generate} disabled={busy}
+            className="inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileText className="h-3.5 w-3.5" />}
+            {status === 'done' ? '重新生成' : '生成逐字稿'}
+          </button>
+        )}
+      </div>
+      {inProgress ? (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在转写中,约需数十秒…</p>
+      ) : status === 'done' && text ? (
+        <p className="whitespace-pre-wrap text-sm leading-relaxed">{text}</p>
+      ) : status === 'done' ? (
+        <p className="text-sm text-muted-foreground">转写完成但无文本(可能无人声/纯音乐)。</p>
+      ) : status === 'expired' ? (
+        <p className="text-sm text-amber-600 dark:text-amber-400">视频直链已过期,需重新采集后再转写。</p>
+      ) : status === 'no_media' ? (
+        <p className="text-sm text-muted-foreground">该内容无可转写的视频。</p>
+      ) : status === 'failed' ? (
+        <p className="text-sm text-rose-600 dark:text-rose-400">转写失败{error ? `:${error}` : ''}</p>
+      ) : (
+        <p className="text-sm text-muted-foreground">尚未生成。点「生成逐字稿」用 AI 提取视频口播文本。</p>
+      )}
+
+      {hasTranscript && (
+        <div className="mt-4 rounded-lg border border-border/60 bg-muted/30 p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">AI 舆情分析</h4>
+            {canWrite && (
+              <button onClick={analyze} disabled={analyzing}
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
+                {analyzing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                {analysis ? '重新分析' : 'AI 分析'}
+              </button>
+            )}
+          </div>
+          {analyzing ? (
+            <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在分析口播内容…</p>
+          ) : analyzeError ? (
+            <p className="text-sm text-rose-600 dark:text-rose-400">{analyzeError}</p>
+          ) : analysis ? (
+            <TranscriptInsights data={analysis} />
+          ) : (
+            <p className="text-sm text-muted-foreground">点「AI 分析」基于逐字稿提取核心观点 / 情绪 / 槽点 / 品牌风险 / 用户诉求。</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function TranscriptInsights({ data }: { data: any }) {
+  const stance = String(data?.stance || '').toLowerCase()
+  const stanceTone = stance === 'positive' ? 'positive' : stance === 'negative' ? 'negative' : 'neutral'
+  const stanceLabel = stance === 'positive' ? '正面' : stance === 'negative' ? '负面' : '中性'
+  const toList = (v: any): string[] => Array.isArray(v) ? v.filter(Boolean).map(String) : (v ? [String(v)] : [])
+  const keyPoints = toList(data?.keyPoints)
+  const issues = toList(data?.issues)
+  const userNeeds = toList(data?.userNeeds)
+  return (
+    <div className="space-y-2.5 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusBadge tone={stanceTone}>{stanceLabel}</StatusBadge>
+        {data?.summary && <span>{String(data.summary)}</span>}
+      </div>
+      {keyPoints.length > 0 && <InsightList label="核心观点" items={keyPoints} />}
+      {issues.length > 0 && <InsightList label="涉及槽点" items={issues} warn />}
+      {data?.risk && (
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">品牌风险</div>
+          <p className="mt-0.5 leading-relaxed">{String(data.risk)}</p>
+        </div>
+      )}
+      {userNeeds.length > 0 && <InsightList label="用户诉求" items={userNeeds} />}
+    </div>
+  )
+}
+
+function InsightList({ label, items, warn }: { label: string; items: string[]; warn?: boolean }) {
+  return (
+    <div>
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</div>
+      <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
+        {items.map((it, i) => (
+          <li key={i} className={warn ? 'text-amber-700 dark:text-amber-300' : ''}>{it}</li>
+        ))}
+      </ul>
+    </div>
+  )
 }

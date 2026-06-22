@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { formatPublishDate } from '../services/publish-date.js';
 
 const router = Router();
 
@@ -41,6 +42,14 @@ function riskOrderSql() {
   `;
 }
 
+// 列表排序:发布时间 / 互动量可点表头切换升降序;默认(空 sort)走风险优先序。
+function orderBySql(sort, dir) {
+  const d = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  if (sort === 'publish') return `r.published_ts ${d} NULLS LAST, r.last_seen_at DESC`;
+  if (sort === 'interactions') return `(r.likes + r.comments_count + r.collects + r.shares) ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
+  return riskOrderSql();
+}
+
 router.get('/records', requireTenantAccess, async (req, res, next) => {
   try {
     const {
@@ -50,6 +59,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       sentiment = '',
       keyword = '',
       queue = '',
+      sort = '',
+      dir = '',
       page = 1,
       pageSize = 30,
     } = req.query;
@@ -57,11 +68,28 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     let where = 'WHERE r.tenant_id = $1';
     if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
     if (sentiment) { params.push(sentiment); where += ` AND r.sentiment = $${params.length}`; }
+    const bucket = String(req.query.bucket || '');
+    // 先按 bucket/queue 圈定大范围,再叠加具体处置状态(status)与风险(risk)筛选。
+    // 关键:bucket/queue 与 status 必须叠加而非互斥 —— 否则按状态筛选会丢掉 active 队列
+    // 自带的相关性 / 已响应过滤,把无关内容也漏进来。
+    if (bucket === 'archived') {
+      // 已归档:误报 / 已归档 / 已响应(已转工单 ticketed 不在分诊视图,在工单系统里跟踪)
+      where += ` AND COALESCE(rt.status, 'unhandled') IN ('archived', 'false_positive', 'official_responded')`;
+    } else if (queue === 'active') {
+      where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
+    }
     if (status) {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
-    } else if (queue === 'active') {
-      where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
+    }
+    // 风险信号筛选(B 端:一键圈出有预警 / 有负评 / 疑似 KOE 的内容)
+    const risk = String(req.query.risk || '');
+    if (risk === 'alert') {
+      where += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`;
+    } else if (risk === 'negative') {
+      where += ` AND r.negative_comment_count > 0`;
+    } else if (risk === 'koe') {
+      where += ` AND r.source_type IN ('employee', 'dealer')`;
     }
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
@@ -89,13 +117,15 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         r.comments_capture_status, r.comments_total_captured,
         r.official_replied, r.official_response_status, r.negative_comment_count,
         r.latest_negative_comment_at, r.last_risk_reopened_at,
-        r.sentiment, r.category, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
+        r.sentiment, r.category, r.source_type, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
         r.ai_result, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
         COALESCE(rt.owner_name, '') AS triage_owner_name,
         COALESCE(rt.note, '') AS triage_note,
+        rt.updated_at AS triage_updated_at,
         (SELECT COUNT(*) FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id) AS alert_count,
+        (SELECT string_agg(DISTINCT a.reason, ' · ') FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id) AS alert_reasons,
         (SELECT COUNT(*) FROM issue_records ir WHERE ir.record_id = r.id AND ir.tenant_id = r.tenant_id) AS issue_count,
         (
           SELECT rc.content
@@ -107,9 +137,11 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       ${where}
-      ORDER BY ${riskOrderSql()}
+      ORDER BY ${orderBySql(sort, dir)}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
+
+    records.forEach(r => { r.publish_display = formatPublishDate(r.publish_time, r.created_at); });
 
     return res.json({
       ok: true,

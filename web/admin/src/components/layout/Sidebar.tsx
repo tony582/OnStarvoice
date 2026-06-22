@@ -1,8 +1,9 @@
+import { useState } from 'react'
 import {
-  LayoutDashboard, Columns3, Radar, Route, BarChart3, Database,
+  LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeft,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, ListChecks, HandCoins,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -17,18 +18,19 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 ]
 
 // 舆情工作台下的二级队列(在侧边栏纵向展开,替代主区横向卡片带)
-const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey: keyof Badges; dot: string }> = [
+const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
-  { queue: 'leads', label: '评论线索', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
-  { queue: 'issues', label: '问题处置', badgeKey: 'issuesOpen', dot: 'bg-rose-500' },
+  { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
+  { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsFeedback', dot: 'bg-violet-500' },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
-    { id: 'monitoring', label: '监控中心', icon: Radar, badgeKeys: ['monitorAttention'] },
-    { id: 'events', label: '事件中心', icon: Route },
+    { id: 'opinion', label: '舆情处理', icon: ListChecks, badgeKeys: ['ticketsPending'] },
+    { id: 'monitoring', label: '关注博主', icon: Radar, badgeKeys: ['monitorAttention'] },
+    { id: 'salesleads', label: '销售客资', icon: HandCoins },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },
   ],
@@ -63,61 +65,83 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
   const { workspace, switchWorkspace, params } = useNav()
   const activeQueue = activePage === 'workbench' ? (params?.queue || 'triage') : null
   const activeWs = WORKSPACES.find(w => w.key === workspace) || WORKSPACES[0]
-  const ActiveWsIcon = activeWs.icon
+  const [adminOpen, setAdminOpen] = useState(false)
+  const adminActive = ADMIN_NAV.some(i => i.id === activePage)
+
+  // 收起:整条侧栏彻底隐藏(展开按钮在顶栏 TopBar 左侧,主区直接贴边、不留空白)
+  if (collapsed) return null
 
   return (
-    <>
-      {/* Level 1:图标轨 —— 工作区切换 + 收起开关(常驻,Asana 式)*/}
-      <aside className="fixed inset-y-0 left-0 z-30 flex w-14 flex-col items-center border-r border-sidebar-border bg-sidebar py-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary">
-          <img src="/images/logo-starvoice.svg" alt="" className="h-5 w-5 object-contain brightness-0 invert" />
+    <aside className="fixed inset-y-0 left-0 z-30 flex w-[240px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
+      {/* 头部:Logo + 隐藏 */}
+      <div className="flex items-center gap-2.5 px-4 pb-1 pt-4">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary">
+          <img src="/images/logo-starvoice.svg" alt="" className="h-[18px] w-[18px] object-contain brightness-0 invert" />
         </div>
-        <button onClick={onToggleCollapse} title={collapsed ? '展开导航' : '收起导航'}
-          className="mt-2 flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
-          <PanelLeft className="h-[18px] w-[18px]" strokeWidth={1.9} />
+        <span className="truncate text-[13px] font-bold text-foreground">StarVoice 星语</span>
+        <button onClick={onToggleCollapse} title="隐藏导航"
+          className="ml-auto rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
+          <PanelLeftClose className="h-[18px] w-[18px]" strokeWidth={1.9} />
         </button>
-        <div className="my-2.5 h-px w-7 bg-sidebar-border" />
-        <div className="flex flex-col items-center gap-1.5">
-          {WORKSPACES.map(w => {
-            const Icon = w.icon
-            const on = w.key === workspace
-            return (
-              <button key={w.key} onClick={() => switchWorkspace(w.key)} title={`${w.label} · ${w.desc}`}
-                className={cn(
-                  'relative flex h-10 w-10 items-center justify-center rounded-xl transition-colors',
-                  on ? 'bg-accent' : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
-                )}>
-                {on && <span className="absolute -left-2 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-primary" />}
-                <Icon className={cn('h-[19px] w-[19px]', on && activeWs.accent)} strokeWidth={2} />
-              </button>
-            )
-          })}
+      </div>
+
+      {/* 工作区分段切换:舆情风控 / 内容创意(横向来回切)*/}
+      <div className="mx-3 mt-2 flex gap-1 rounded-xl bg-sidebar-accent/50 p-1">
+        {WORKSPACES.map(w => {
+          const Icon = w.icon
+          const on = w.key === workspace
+          return (
+            <button key={w.key} onClick={() => switchWorkspace(w.key)} title={w.desc}
+              className={cn(
+                'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[12.5px] font-semibold transition-colors',
+                on ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+              )}>
+              <Icon className={cn('h-4 w-4', on && w.accent)} strokeWidth={2} />
+              {w.label}
+            </button>
+          )
+        })}
+      </div>
+      <div className="px-4 pb-0.5 pt-1.5 text-[10px] text-muted-foreground">{activeWs.desc}</div>
+
+      <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
+        <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
+      </nav>
+
+      {/* 底部:平台管理(向上弹出菜单)+ 版本 —— 管理类不进日常导航 */}
+      {isInternal() && (
+        <div className="relative mx-3 mb-1">
+          {adminOpen && (
+            <>
+              <div className="fixed inset-0 z-30" onClick={() => setAdminOpen(false)} />
+              <div className="absolute bottom-[calc(100%+6px)] left-0 right-0 z-40 rounded-xl border border-border bg-card p-1 shadow-lg animate-in fade-in slide-in-from-bottom-1 duration-150">
+                {ADMIN_NAV.map(item => {
+                  if (item.platformAdmin && !isPlatformAdmin()) return null
+                  const Icon = item.icon
+                  const on = activePage === item.id
+                  return (
+                    <button key={item.id} onClick={() => { onNavigate(item.id); setAdminOpen(false) }}
+                      className={cn('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors',
+                        on ? 'bg-accent font-semibold text-primary' : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
+                      <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} />{item.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </>
+          )}
+          <button onClick={() => setAdminOpen(o => !o)}
+            className={cn('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors',
+              adminActive || adminOpen ? 'bg-accent text-primary' : 'text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
+            <Settings className="h-[17px] w-[17px] shrink-0" strokeWidth={1.8} />
+            <span>平台管理</span>
+            <ChevronRight className={cn('ml-auto h-3.5 w-3.5 transition-transform', adminOpen && '-rotate-90')} />
+          </button>
         </div>
-      </aside>
-
-      {/* Level 2:导航面板(可收起,收起后主区铺满)*/}
-      {!collapsed && (
-        <aside className="fixed inset-y-0 left-14 z-20 flex w-[200px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
-          <div className="flex items-center gap-2.5 px-4 pb-2.5 pt-4">
-            <ActiveWsIcon className={cn('h-[18px] w-[18px] shrink-0', activeWs.accent)} strokeWidth={2} />
-            <div className="min-w-0">
-              <div className="truncate text-[13px] font-bold leading-tight text-foreground">{activeWs.label}</div>
-              <div className="truncate text-[10px] text-muted-foreground">{activeWs.desc}</div>
-            </div>
-          </div>
-
-          <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
-            <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-            {isInternal() && (
-              <NavGroup label="ADMIN" items={ADMIN_NAV} activePage={activePage} activeQueue={null} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
-            )}
-          </nav>
-
-          <div className="mx-4 h-px bg-sidebar-border" />
-          <div className="px-4 py-3 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
-        </aside>
       )}
-    </>
+      <div className="mx-4 h-px bg-sidebar-border" />
+      <div className="px-4 py-2.5 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
+    </aside>
   )
 }
 
@@ -147,7 +171,7 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
                 <span className="absolute bottom-1.5 left-[18px] top-1.5 w-px bg-sidebar-border" />
                 {WORKBENCH_QUEUES.map(q => {
                   const on = onWorkbench && activeQueue === q.queue
-                  const count = badges[q.badgeKey]
+                  const count = q.badgeKey ? badges[q.badgeKey] : 0
                   return (
                     <button key={q.queue} onClick={() => onNavigate('workbench', { queue: q.queue })}
                       className={cn(

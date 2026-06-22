@@ -50,7 +50,7 @@ export const LABELS = {
     brand_image: '品牌形象', other: '其他', '': '待分类',
   } as Record<string, string>,
   triage: {
-    unhandled: '新线索', reviewing: '待复核', issue_linked: '已转问题',
+    unhandled: '未处理', reviewing: '待复核', issue_linked: '已转工单', ticketed: '已转工单',
     official_responded: '官方已响应', archived: '已归档', false_positive: '误报',
   } as Record<string, string>,
   priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' } as Record<string, string>,
@@ -61,11 +61,11 @@ export const LABELS = {
   severity: { low: '低', medium: '中', high: '高', critical: '严重' } as Record<string, string>,
   reportType: { daily: '日报', weekly: '周报', monthly: '月报' } as Record<string, string>,
   reportStatus: { generating: '生成中', generated: '待发送', sent: '已发送', skipped: '无新增', failed: '失败' } as Record<string, string>,
-  leadStatus: { new: '新线索', following: '跟进中', resolved: '已处理', ignored: '已忽略' } as Record<string, string>,
+  leadStatus: { new: '新线索', following: '跟进中', ticketed: '已转工单', resolved: '已处理', ignored: '已忽略' } as Record<string, string>,
   leadType: {
-    complaint: '投诉维权', renewal_billing: '续费收费', app_issue: 'App故障',
-    service_quality: '服务求助', safety_privacy: '安全隐私', brand_risk: '品牌风险',
-    other: '其他跟进',
+    sales_intent: '购买意向', complaint: '投诉维权', renewal_billing: '续费收费',
+    app_issue: 'App故障', service_quality: '服务求助', safety_privacy: '安全隐私',
+    brand_risk: '品牌风险', other: '其他跟进',
   } as Record<string, string>,
   recordType: {
     single_note: '单笔记', keyword_notes: '关键词笔记', blogger_profile: '博主信息',
@@ -82,4 +82,12 @@ export const LABELS = {
 
 export function platformName(key: string): string {
   return LABELS.platform[key] || key || '-'
+}
+
+// 账号名疑似品牌关联(经销商/员工/营销号):品牌/车型词 + 角色/营销词 → 非真实车主 UGC
+const KOE_BRAND_RE = /(安吉星|onstar|别克|凯迪拉克|雪佛兰|上汽通用|gl8|昂科威|君威|君越|英朗|威朗|科鲁兹|凯越|探界者|创酷|迈锐宝|cadillac|buick|chevrolet)/i
+const KOE_ROLE_RE = /(4s|店|销售|顾问|客服|服务|经销|官方|导购|试驾|售后|服务生|大话|说车|聊车|玩车|车评|讲车|谈车|解读|百科|严选|优选|学堂|课堂|研究所|资讯|那些事|车事)/i
+export function looksLikeKOEName(name?: string | null): boolean {
+  const n = String(name || '')
+  return KOE_BRAND_RE.test(n) && KOE_ROLE_RE.test(n)
 }

@@ -127,6 +127,7 @@ export async function captureDouyinBloggerNotes({
   maxItems = null,
   keywordFilter = "",
   monitorPublishWindow = "",
+  deferKeywordFilter = false,
   waitMinMs = DEFAULT_CONFIG.SCROLL_DELAY_MIN,
   waitMaxMs = DEFAULT_CONFIG.SCROLL_DELAY_MAX,
   stallTimeoutMs = 3000,
@@ -210,8 +211,11 @@ export async function captureDouyinBloggerNotes({
     const monitorWindow = resolveMonitorProfilePublishWindow(
       monitorPublishWindow,
     );
+    const parsedKeywords = parseKeywordFilter(keywordFilter);
+    const shouldFilterByListTitle = parsedKeywords.length && !deferKeywordFilter;
 
     const noteMap = new Map();
+    const emittedCheckpointKeys = new Set();
     let progressStats = {
       detectedCount: 0,
       qualifiedCount: 0,
@@ -230,6 +234,78 @@ export async function captureDouyinBloggerNotes({
         filteredCount: progressStats.filteredCount,
         minLikes: normalizedMinLikes,
         maxDetectedItems: normalizedMaxDetectedItems,
+      });
+    };
+
+    const buildFilteredItems = () => {
+      const allItems = Array.from(noteMap.values());
+      const likesFiltered = allItems.filter(
+        (item) => Number(item.likes || 0) >= normalizedMinLikes,
+      );
+      const filteredItems = shouldFilterByListTitle
+        ? likesFiltered.filter((item) =>
+            matchesKeywordFilter(item.title || "", parsedKeywords),
+          )
+        : likesFiltered;
+      return filteredItems
+        .slice(0, normalizedMaxDetectedItems)
+        .map((item) => ({
+          ...item,
+          bloggerFollowersCount: resolvedMetrics.followersCount,
+          bloggerLikedAndCollectedCount: resolvedMetrics.likedAndCollectedCount,
+          bloggerProfileUrl: resolvedMetrics.profileUrl,
+          bloggerMetricsCaptureStatus: resolvedMetrics.captureStatus,
+          bloggerMetricsCaptureError: resolvedMetrics.captureError,
+          bloggerAccountType: resolvedMetrics.accountType,
+        }));
+    };
+
+    const emitListCheckpoint = () => {
+      if (!onProgress) return;
+      const checkpointItems = buildFilteredItems().filter((item) => {
+        const key = String(item.noteId || item.url || "").trim();
+        if (!key || emittedCheckpointKeys.has(key)) return false;
+        emittedCheckpointKeys.add(key);
+        return true;
+      });
+      if (checkpointItems.length === 0) return;
+
+      emitProgress({
+        phase: "list_checkpoint",
+        message: "正在加载博主作品",
+        listCheckpoint: {
+          type: SYNC_TYPE.BLOGGER_NOTES,
+          platform: "douyin",
+          items: checkpointItems,
+          payload: {
+            bloggerName,
+            bloggerId,
+            douyinId,
+            bloggerUrl: window.location.href,
+            bloggerFollowersCount: resolvedMetrics.followersCount,
+            bloggerLikedAndCollectedCount: resolvedMetrics.likedAndCollectedCount,
+            bloggerProfileUrl: resolvedMetrics.profileUrl,
+            bloggerMetricsCaptureStatus: resolvedMetrics.captureStatus,
+            bloggerMetricsCaptureError: resolvedMetrics.captureError,
+            bloggerAccountType: resolvedMetrics.accountType,
+            totalCount: checkpointItems.length,
+            rawTotalCount: progressStats.detectedCount,
+            minLikes: normalizedMinLikes,
+            maxDetectedItems: normalizedMaxDetectedItems,
+            keywordFilter: keywordFilter || "",
+            keywordFilterMode:
+              deferKeywordFilter && parsedKeywords.length ? "detail" : "title",
+            filteredCount: checkpointItems.length,
+            filteredBeforeLimitCount: progressStats.qualifiedCount,
+            items: checkpointItems,
+            captureTimestamp: Date.now(),
+          },
+          meta: {
+            pageType: PAGE_TYPE.BLOGGER_PROFILE,
+            captureStartedAt,
+            sourceUrl: window.location.href,
+          },
+        },
       });
     };
 
@@ -255,6 +331,7 @@ export async function captureDouyinBloggerNotes({
         ),
         monitorTimeline,
       };
+      emitListCheckpoint();
       return progressStats.detectedCount;
     };
 
@@ -324,7 +401,6 @@ export async function captureDouyinBloggerNotes({
 
     collectDetectedNotes();
     const allItems = Array.from(noteMap.values());
-    const parsedKeywords = parseKeywordFilter(keywordFilter);
     const likesFiltered = allItems.filter(
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
     );
@@ -332,7 +408,7 @@ export async function captureDouyinBloggerNotes({
       likesFiltered,
       monitorWindow,
     );
-    const filteredItems = parsedKeywords.length
+    const filteredItems = shouldFilterByListTitle
       ? monitorWindowFiltered.filter((item) =>
           matchesKeywordFilter(item.title || "", parsedKeywords),
         )
@@ -345,17 +421,7 @@ export async function captureDouyinBloggerNotes({
     const metricExtractionSuspicious =
       allItems.length > 0 && maxMetricCount === 0;
 
-    const items = filteredItems
-      .slice(0, normalizedMaxDetectedItems)
-      .map((item) => ({
-        ...item,
-        bloggerFollowersCount: resolvedMetrics.followersCount,
-        bloggerLikedAndCollectedCount: resolvedMetrics.likedAndCollectedCount,
-        bloggerProfileUrl: resolvedMetrics.profileUrl,
-        bloggerMetricsCaptureStatus: resolvedMetrics.captureStatus,
-        bloggerMetricsCaptureError: resolvedMetrics.captureError,
-        bloggerAccountType: resolvedMetrics.accountType,
-      }));
+    const items = buildFilteredItems();
 
     const payload = {
       bloggerName,
@@ -374,6 +440,7 @@ export async function captureDouyinBloggerNotes({
       maxDetectedItems: normalizedMaxDetectedItems,
       monitorPublishWindow: monitorWindow.key,
       keywordFilter: keywordFilter || "",
+      keywordFilterMode: deferKeywordFilter && parsedKeywords.length ? "detail" : "title",
       filteredCount: items.length,
       filteredBeforeLimitCount: filteredItems.length,
       items,
@@ -1181,7 +1248,7 @@ function resolveBloggerNotesRoot(profileRoot) {
 }
 
 function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
-  const linkNodes = Array.from(
+  const candidateNodes = Array.from(
     (notesRoot || document).querySelectorAll(
       DOUYIN_DOM_PROFILE.bloggerProfile.notesList.cardSelectors.join(", "),
     ),
@@ -1192,8 +1259,9 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
   // 抖音博主主页头部的「IP属地:X」,下发给该博主每条视频作为发布位置
   const bloggerIpLocation = extractIpLocation();
 
-  linkNodes.forEach((link) => {
-    const noteUrl = normalizeUrl(link.getAttribute("href") || link.href || "");
+  candidateNodes.forEach((candidate) => {
+    const card = resolveProfileNoteCardContainer(candidate);
+    const noteUrl = resolveProfileNoteUrl(candidate, card);
     if (!noteUrl) return;
 
     const noteId = extractNoteId(noteUrl);
@@ -1203,7 +1271,6 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
     if (dedupe.has(dedupeKey)) return;
     dedupe.add(dedupeKey);
 
-    const card = resolveProfileNoteCardContainer(link);
     const cardText = cleanText(card?.innerText || card?.textContent || "");
     const title = resolveCardTitle(card, noteId);
     const coverImage = normalizeUrl(
@@ -1215,7 +1282,10 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
     );
     const cardMedia = collectMediaUrlsFromElement(card);
     const likes = resolveProfileCardLikes(card);
-    const noteType = /\/note\//i.test(noteUrl) ? "image" : "video";
+    const noteType =
+      inferProfileCardContentType(card, noteUrl) === "image"
+        ? "image"
+        : "video";
     const publishDateRaw = extractMonitorProfilePublishText(card);
     const publishTimestamp = parseMonitorProfilePublishTimestamp(publishDateRaw);
     const isPinned = /置顶|pinned/i.test(cardText);
@@ -1253,44 +1323,111 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
   return notes;
 }
 
-function resolveProfileNoteCardContainer(link) {
-  if (!link?.parentElement) {
-    return link;
+function resolveProfileNoteUrl(candidate, card = null) {
+  if (!(candidate instanceof Element)) {
+    return "";
   }
 
-  const candidates = [];
-  let node = link;
-  for (let depth = 0; node && depth < 7; depth += 1) {
-    if (node === document.body || node === document.documentElement) {
-      break;
+  const candidates = [
+    candidate.getAttribute?.("href"),
+    candidate.getAttribute?.("data-href"),
+    candidate.getAttribute?.("data-url"),
+    candidate.href,
+    card?.getAttribute?.("href"),
+    card?.getAttribute?.("data-href"),
+    card?.getAttribute?.("data-url"),
+  ];
+
+  for (const value of candidates) {
+    const normalized = normalizeUrl(value);
+    if (/\/(?:video|note)\//i.test(normalized)) {
+      return normalized;
     }
-
-    const text = cleanText(node.innerText || node.textContent || "");
-    const detailLinkCount = node.querySelectorAll
-      ? node.querySelectorAll('a[href*="/video/"], a[href*="/note/"]').length
-      : 0;
-    const hasMedia = Boolean(node.querySelector?.("img, video, picture"));
-    const hasPublishText = Boolean(extractMonitorProfilePublishText(node));
-    const hasCardHint =
-      node.matches?.(
-        'article, li, [data-e2e*="post"], [data-e2e*="item"], [class*="card"], [class*="item"]',
-      ) || false;
-    const score =
-      (detailLinkCount === 1 ? 40 : detailLinkCount > 1 ? -40 : 0) +
-      (hasPublishText ? 35 : 0) +
-      (hasCardHint ? 12 : 0) +
-      (hasMedia ? 8 : 0) +
-      (text ? 6 : 0) -
-      depth;
-
-    candidates.push({node, score, textLength: text.length});
-    node = node.parentElement;
+    if (/[?&]modal_id=/i.test(normalized)) {
+      const noteId = extractNoteId(normalized);
+      if (noteId) {
+        return buildDouyinDetailUrl(
+          noteId,
+          inferProfileCardContentType(card || candidate, normalized),
+        );
+      }
+    }
   }
 
-  candidates.sort(
-    (a, b) => b.score - a.score || a.textLength - b.textLength,
+  const noteId = resolveProfileNoteId(card || candidate);
+  if (/^\d{8,}$/.test(String(noteId || ""))) {
+    return buildDouyinDetailUrl(
+      noteId,
+      inferProfileCardContentType(card || candidate),
+    );
+  }
+
+  return "";
+}
+
+function resolveProfileNoteId(node) {
+  if (!(node instanceof Element)) {
+    return "";
+  }
+
+  const idCandidates = [
+    node.id,
+    getProfileCardIdAttribute(node),
+    node.closest?.("[id^='waterfall_item_']")?.id,
+    getProfileCardIdAttribute(node.closest?.("[data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]")),
+    getProfileCardIdAttribute(node.querySelector?.("[id^='waterfall_item_'], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]")),
+  ];
+
+  for (const candidate of idCandidates) {
+    const match = String(candidate || "").match(/(\d{8,})/);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  const inlineId = String(node.outerHTML || "").match(
+    /(?:aweme_id|awemeId|modal_id|item_id|itemId|data-id|data-aweme-id|data-e2e-aweme-id)["'=:\s]+(\d{8,})/i,
   );
-  return candidates[0]?.node || link;
+  return inlineId?.[1] || "";
+}
+
+function getProfileCardIdAttribute(node) {
+  if (!(node instanceof Element)) {
+    return "";
+  }
+
+  return (
+    node.getAttribute?.("data-e2e-aweme-id") ||
+    node.getAttribute?.("data-aweme-id") ||
+    node.getAttribute?.("data-awemeid") ||
+    node.getAttribute?.("data-id") ||
+    node.getAttribute?.("data-item-id") ||
+    node.getAttribute?.("data-modal-id") ||
+    ""
+  );
+}
+
+function inferProfileCardContentType(card, url = "") {
+  if (/\/note\//i.test(String(url || ""))) {
+    return "image";
+  }
+  if (/\/video\//i.test(String(url || ""))) {
+    return "video";
+  }
+
+  const text = cleanText(card?.innerText || "");
+  if (/图文|图集|图片/.test(text)) {
+    return "image";
+  }
+  if (/^\d{1,2}:\d{2}/m.test(text) || card?.querySelector?.("video")) {
+    return "video";
+  }
+  return "video";
+}
+
+function buildDouyinDetailUrl(noteId, contentType = "video") {
+  const path = contentType === "image" ? "note" : "video";
+  return `https://www.douyin.com/${path}/${noteId}`;
 }
 
 async function scrollDouyinBloggerNotesResults(
@@ -1391,6 +1528,22 @@ function dispatchWheelHint(target, distance) {
       view: window,
     }),
   );
+}
+
+function resolveProfileNoteCardContainer(link) {
+  if (!(link instanceof Element)) {
+    return link || document.body;
+  }
+
+  let node = link;
+  for (let depth = 0; node && depth < 6; depth += 1) {
+    if (node instanceof Element && extractFallbackLikeCountFromCard(node) > 0) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+
+  return link.closest("article, li, div") || link.parentElement || link;
 }
 
 function resolveCardTitle(card, noteId) {

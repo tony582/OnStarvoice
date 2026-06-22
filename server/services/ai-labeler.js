@@ -3,6 +3,7 @@
  */
 
 import { queryOne, queryAll, execute, getSetting } from '../db/init.js';
+import { parsePublishTimestamp } from './publish-date.js';
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -43,7 +44,8 @@ function buildSystemPrompt(brand) {
 强相关语境词：${brand.positiveContextTerms.join('、') || '无'}。
 常见误命中/噪声：${brand.noiseTerms.join('、') || '无'}。
 
-第一步必须先判断内容是否与当前品牌真实相关。搜索关键词命中不代表相关；如果只是地名、人名、小区、楼盘、店铺、谐音、泛词、无车辆/产品/服务语境，判为 irrelevant。
+第一步判断内容是否在【监控范围】内。监控范围 = 上汽通用(SAIC-GM)全系：安吉星(OnStar)及其所属品牌别克、凯迪拉克、雪佛兰，涵盖这些品牌的车型、车机系统、车机壁纸、周边活动、官方/经销商/车主内容等。只要内容真实涉及上汽通用任一品牌/车型/车机/服务/周边(包括"别克/凯迪拉克车机壁纸"这类)，一律判 relevant —— 别克、凯迪拉克、雪佛兰的内容都在监控范围内，不要因为"没出现安吉星三个字"或"只是壁纸/周边"就判无关。
+仅当内容与上汽通用毫无关系才判 irrelevant：纯地名、人名、小区、楼盘、店铺、谐音、泛词，或属其它车企/无关行业、无任何上汽通用语境(例如地名含"安吉"但与汽车无关)。
 如果证据不足但可能相关，判为 uncertain，不要强行判负面或正面。
 只有 relevant 或 uncertain 的内容才继续判断情绪、意图和主题。
 
@@ -76,11 +78,13 @@ function buildSystemPrompt(brand) {
   - brand_image: 品牌评价、竞品对比
   - other: 其他
 - sourceType: ugc(真实车主/普通用户), pgc(自媒体/KOL/测评), employee(疑似员工), dealer(4S店/经销商), other
+  · 重点识别「软文/KOE」:若内容像经销商或员工发的促销软文——例如过度正面无吐槽、含门店/优惠/试驾/报价/留微信电话等营销话术、强调"本店/到店"、像广告而非真实车主体验,优先判 dealer 或 employee(而非 ugc/pgc)。
+  · 账号名信号:安吉星属上汽通用,旗下有凯迪拉克/别克/雪佛兰等品牌。若作者账号名带品牌/车型词(安吉星/别克/凯迪拉克/雪佛兰/上汽通用/GL8/昂科威/君威等)且像围绕该品牌运营(如"大话别克""凯迪拉克的服务生""XX别克4S""安吉星客服"),多为经销商/员工/官方相关,优先判 dealer 或 employee。
 
 规则：
 - irrelevant 内容的 sentiment 固定为 neutral，category 固定为 other，summary 说明为何无关。
 - uncertain 内容的 sentiment 尽量保守，能判断再给 positive/negative，不能判断则 neutral。
-- 不要因为标题里有品牌词或搜索词就直接判 relevant，必须结合正文、标签、作者、平台和业务语境。
+- 真实涉及上汽通用品牌(安吉星/别克/凯迪拉克/雪佛兰)的内容一律 relevant，哪怕只是壁纸、周边、车机话题；只有当"品牌词/搜索词"是谐音、地名、无关行业的巧合命中(无任何上汽通用语境)时，才判 irrelevant。
 - 只输出JSON，不要其他文字。`;
 }
 
@@ -112,6 +116,7 @@ async function callGemini(apiKey, model, systemPrompt, userMessage) {
       contents: [{ parts: [{ text: userMessage }] }],
       generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
     }),
+    signal: AbortSignal.timeout(40000), // 防止 LLM 请求挂死冻住整个评论入库串行队列
   });
   if (!resp.ok) throw new Error(`Gemini API error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
@@ -130,6 +135,7 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
       temperature: 0.1,
       response_format: { type: 'json_object' },
     }),
+    signal: AbortSignal.timeout(40000), // 防止 LLM 请求挂死冻住整个评论入库串行队列
   });
   if (!resp.ok) throw new Error(`LLM API error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
@@ -213,16 +219,19 @@ export async function labelRecord(recordId, options = {}) {
     const rawResult = await callLLM(userMessage, record.tenant_id);
     if (!rawResult) return null;
     const result = normalizeResult(rawResult);
+    const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;
     await execute(`
       UPDATE records SET sentiment = $1, intent = $2, category = $3, subcategory = $4,
         source_type = $5, ai_summary = $6, ai_confidence = $7,
         ai_result = $8::jsonb,
+        published_ts = COALESCE($9, published_ts),
         ai_labeled_at = now(), updated_at = now()
-      WHERE id = $9
+      WHERE id = $10
     `, [
       result.sentiment || '', result.intent || '', result.category || '', result.subcategory || '',
       result.sourceType || result.source_type || '', result.summary || '', result.confidence || 0,
       JSON.stringify(result),
+      publishedTs,
       recordId,
     ]);
     console.log(`[AI] Record ${recordId} labeled: ${result.relevance}/${result.sentiment}/${result.category}`);
@@ -262,11 +271,13 @@ function buildCommentSystemPrompt(brand) {
 - “不算贵”“免费”“可以”“有用”“不会不提供服务”“开的不多用不了几次”“不用续”这类通常是中性或正向澄清，不应标为负面。
 - 如果评论只是客观说明、个人选择、轻微吐槽但没有明确问题或诉求，标为 neutral。
 - 如果评论在认可、解释、澄清、推荐，标为 positive 或 neutral。
+- salesIntent(是否真实购买/咨询意向):只有评论方在“想买/询价/求购买链接/问哪里买/问价格优惠/要门店或经销商/留联系方式求购/想试驾预约”等明确成交导向时才 true。注意:吐槽里提到“续费/收费/电话/不续费/贵”、抱怨被催续费、要求退费、对价格不满,都是投诉而非购买意向,salesIntent=false。
 
 只输出 JSON：
 {
   "sentiment": "positive|neutral|negative",
   "isNegative": true|false,
+  "salesIntent": true|false,
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|official_response|other",
   "riskLevel": "none|low|medium|high|critical",
   "confidence": 0.0-1.0,
@@ -324,6 +335,7 @@ function normalizeCommentAiResult(result, fallback) {
       ...result,
       sentiment,
       isNegative: isNegative && sentiment === 'negative',
+      salesIntent: normalizeBoolean(result?.salesIntent ?? result?.sales_intent, false),
       category,
       riskLevel: isNegative ? riskLevel : 'none',
       confidence: Number(result?.confidence ?? fallback?.confidence ?? 0),
@@ -331,6 +343,61 @@ function normalizeCommentAiResult(result, fallback) {
       classifier: 'llm_comment',
     },
   };
+}
+
+function buildCommentBatchSystemPrompt(brand) {
+  return `你是可配置品牌的社交媒体评论舆情分析专家。当前品牌：${brand.brandName}。
+品牌别名：${brand.brandAliases.join('、') || brand.brandName}。
+业务语境：${brand.businessContext}
+
+你会收到同一篇帖子下的一批评论(JSON 数组,每条带序号 i)。请逐条判断每条评论本身对该品牌/产品/服务的态度与风险。判断要点:
+- 不要只按关键词。“不续费/收费/不能用/贵”可能是事实说明、价格讨论或使用选择,也可能是投诉,要结合语气与上下文。
+- 只有明确抱怨、投诉、故障、乱扣费、服务不满、安全/隐私风险、强烈负面情绪时,isNegative=true。
+- “不算贵/免费/可以/有用/不会不提供服务/开的不多用不了几次/不用续”通常中性或正向,不应判负面。
+- 仅客观说明、个人选择、轻微吐槽且无明确诉求 → neutral;认可、解释、澄清、推荐 → positive 或 neutral。
+- salesIntent:仅当评论方明确“想买/询价/求购买链接/问哪里买/问优惠/要门店或经销商/留联系方式求购/想试驾预约”等成交导向时才 true;吐槽续费/收费/退费/价格不满都是投诉,salesIntent=false。
+
+只输出一个 JSON 对象(顶层不要是数组),格式:
+{"results":[{"i":0,"sentiment":"positive|neutral|negative","isNegative":true|false,"salesIntent":true|false,"category":"safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|official_response|other","riskLevel":"none|low|medium|high|critical","summary":"不超过30字"}]}
+必须为输入里每一条 i 都返回一个对应结果,不得遗漏或改变 i。`;
+}
+
+function buildCommentBatchUserMessage({ record = {}, comments = [] }) {
+  const head = [];
+  if (record.title) head.push(`原帖标题：${record.title}`);
+  if (record.content) head.push(`原帖正文：${String(record.content).slice(0, 800)}`);
+  if (record.category) head.push(`原帖主题：${record.category}`);
+  if (record.sentiment) head.push(`原帖情绪：${record.sentiment}`);
+  if (record.platform) head.push(`平台：${record.platform}`);
+  const arr = comments.map((c, i) => ({
+    i,
+    author: String(c.author_name || '').slice(0, 40),
+    content: String(c.content || '').slice(0, 300),
+    likes: Number(c.like_count || 0),
+    ip: String(c.ip_location || '').slice(0, 20),
+  }));
+  return `${head.join('\n')}\n\n评论数组(逐条判断,按 i 一一对应返回):\n${JSON.stringify(arr)}`;
+}
+
+// 批量评论分类:一次 LLM 调用判一整批同帖评论,把"逐条一调用"压成"一批一调用"。
+// 返回与输入等长的数组,元素为归一化结果或 null(该条 LLM 没返回→由调用方回退规则)。
+// 抛错(超时/接口错)由调用方 catch,整批回退规则。
+export async function classifyCommentsBatch({ tenantId, record = {}, comments = [] }) {
+  if (!comments.length) return [];
+  const brand = await getBrandContext(tenantId);
+  const systemPrompt = buildCommentBatchSystemPrompt(brand);
+  const userMessage = buildCommentBatchUserMessage({ record, comments });
+  const parsed = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+  const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.results) ? parsed.results : []);
+  const byIndex = new Map();
+  for (const item of list) {
+    const idx = Number(item?.i ?? item?.index);
+    if (Number.isInteger(idx)) byIndex.set(idx, item);
+  }
+  return comments.map((_, i) => {
+    const raw = byIndex.get(i);
+    return raw ? normalizeCommentAiResult(raw, null) : null;
+  });
 }
 
 export async function classifyCommentWithAI({ tenantId, record = {}, comment = {}, isOfficial = false, fallback = null }) {

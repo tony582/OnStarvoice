@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import cloud from 'd3-cloud'
 import {
-  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning,
-  RefreshCw, ShieldCheck, Siren, TrendingUp,
+  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw, Sparkles,
 } from 'lucide-react'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -12,6 +12,67 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { InfoHint } from '@/components/shared/InfoHint'
+
+const ChinaMap = lazy(() => import('@/components/shared/ChinaMap'))
+
+// 指标口径词典(给"只看报告"的客户:每个指标怎么统计/算)
+const G = {
+  volume: '声量=本期监测到的内容条数(去重)。含老帖在本期被再次采集到的,所以时间范围越大越接近库存量;要看"真正新增"请对照「新增内容」。不含 AI 判定不相关的内容。',
+  newRecords: '新增内容=首次入库时间落在本期内的内容,即本期真正新冒出来的(声量则含老帖复采)。',
+  interaction: '互动总量=点赞+评论+收藏+转发 之和。为采集那一刻的快照,非实时;本系统不采阅读/播放量,故不报"触达人数"。',
+  nsr: '净情感 NSR=(正面−负面)/(正面+负面)×100,范围 −100~+100。只看正负、不计中性,比负面率更敏感反映口碑好坏。',
+  negativeRate: '负面率=负面内容数 ÷ 已 AI 标注内容数 ×100%。分母不含"待标注",AI 覆盖率低时该值会被放大,请对照待标注量解读。',
+  risk: '舆情风险指数(0~100)=负面率/负面评论/高危未关闭问题/告警 加权,封顶 100。≥70 重点处置,≥45 风险抬升,≥20 持续观察。是促处置的相对警戒分,非概率。',
+  heat: '舆情热度指数=内容数/互动/新评论/观测 加权综合,无固定上限;数值本身无绝对含义,只看相对高低与环比。',
+  official: '官方响应率=有官方回复的内容数 ÷ 总声量。',
+  pending: '待处理=进入处置队列、尚未转工单也未归档的内容(已排除官方内容与"已响应且零负评")。',
+  sentiment: '情感由 AI 标注为 正面/中性/负面;"待标注"单列为灰色、不并入中性。',
+  platform: '平台分布=各平台内容条数与负面率;注:平台字段缺失的内容会默认归到小红书,占比可能略有偏差。',
+  category: '主题分类由 AI 归入 9 类(安全救援/续费收费/服务质量 等),其中安全/续费/服务为车企高优先级风险议题。',
+  topInteraction: '按 点赞+评论+收藏+转发 之和排序的高互动内容(采集时刻快照)。',
+  topNegative: '重点负面=按 负评/转发/互动 加权排序的负面内容,可逐条点开核实处置。',
+  negativeComment: '负面评论为评论层风险线索,带风险等级(低~严重),与内容层"负面"是两套口径。',
+  workflow: '处置漏斗:待处理 → 已转工单 → 归档/误报;配合官方响应、未关闭问题看监测→处置闭环。',
+  hotTerms: '热词来自标题/正文/摘要/标签的文本挖掘,与"监控关键词"(只统计监控订阅采集)口径不同。',
+  media: '媒体/来源类型来自内容的类型字段(record_type / mediaType)。',
+}
+
+function delta(cur: number, prev: number) {
+  const c = Number(cur) || 0, p = Number(prev) || 0
+  if (!p) return null
+  const d = Math.round((c - p) / p * 100)
+  return { pct: Math.abs(d), up: d >= 0 }
+}
+function nsrOf(sm: any = {}) {
+  const p = Number(sm.positive) || 0, n = Number(sm.negative) || 0
+  return (p + n) ? Math.round((p - n) / (p + n) * 100) : 0
+}
+function sumInteractions(pm: any[] = []) {
+  return pm.reduce((sum, r) => sum + (Number(r.interactions) || 0), 0)
+}
+
+// 媒体/来源类型中文(记录类型 + 笔记类型)
+const MEDIA_LABELS: Record<string, string> = {
+  single_note: '单篇笔记', keyword_notes: '关键词笔记', blogger_notes: '博主笔记',
+  blogger_profile: '博主主页', official_content: '官方内容', comments: '评论',
+  normal: '图文笔记', video: '视频', image: '图文', article: '文章', text: '文字', live: '直播',
+  '未采集': '未知类型', '': '未知类型',
+}
+// 平台品牌色点(让平台板块更有辨识度)
+const PLATFORM_DOT: Record<string, string> = { xiaohongshu: 'bg-status-red', douyin: 'bg-foreground', weibo: 'bg-status-orange' }
+
+function mergeRegions(a: any[] = [], b: any[] = []) {
+  const m = new Map<string, { region: string; count: number; negative_count: number }>()
+  for (const r of [...a, ...b]) {
+    const k = r.region || '未采集'
+    const cur = m.get(k) || { region: k, count: 0, negative_count: 0 }
+    cur.count += Number(r.count) || 0
+    cur.negative_count += Number(r.negative_count) || 0
+    m.set(k, cur)
+  }
+  return [...m.values()].sort((x, y) => y.count - x.count)
+}
 
 type RangePreset = 'today' | 'yesterday' | '7d' | '30d' | '90d' | 'all' | 'custom'
 
@@ -80,17 +141,6 @@ export function DashboardTab() {
   useEffect(() => { load() }, [range, start, end])
 
   const s = data?.snapshot
-  const kpis = useMemo(() => {
-    if (!s) return []
-    return [
-      { label: '总声量', value: s.total, icon: TrendingUp, tone: 'normal', help: '筛选范围内被采集或更新的内容' },
-      { label: '新增线索', value: s.newRecords, icon: BarChart3, tone: 'normal', help: '首次进入系统的内容' },
-      { label: '负面率', value: `${s.negativeRate}%`, icon: AlertTriangle, tone: Number(s.negativeRate) >= 20 ? 'danger' : 'normal', help: '负面内容 / 已标注内容' },
-      { label: '负面评论', value: s.commentStats?.negative_comments || 0, icon: MessageSquareWarning, tone: (s.commentStats?.negative_comments || 0) > 0 ? 'danger' : 'normal', help: '评论层风险线索' },
-      { label: '待处理', value: s.workflowStats?.active_inbox || 0, icon: Siren, tone: (s.workflowStats?.active_inbox || 0) > 0 ? 'warning' : 'normal', help: '当前待处理/待复核' },
-      { label: '官方响应', value: s.officialPeriod?.record_count || 0, icon: ShieldCheck, tone: 'normal', help: '筛选范围内有官方回复的内容' },
-    ]
-  }, [s])
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
@@ -154,88 +204,341 @@ export function DashboardTab() {
         <EmptyState icon={BarChart3} title="暂无看板数据" />
       ) : (
         <>
-          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-            {kpis.map(item => {
-              const Icon = item.icon
-              return (
-                <article key={item.label} className="rounded-lg border border-border bg-card p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-xs font-semibold text-muted-foreground">{item.label}</div>
-                    <Icon className={`h-4 w-4 ${item.tone === 'danger' ? 'text-destructive' : item.tone === 'warning' ? 'text-amber-600' : 'text-primary'}`} />
-                  </div>
-                  <div className={`mt-3 text-2xl font-bold tabular-nums ${item.tone === 'danger' ? 'text-destructive' : item.tone === 'warning' ? 'text-amber-600' : 'text-foreground'}`}>
-                    {typeof item.value === 'number' ? formatNumber(item.value) : item.value}
-                  </div>
-                  <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.help}</div>
-                </article>
-              )
-            })}
-          </section>
+          {/* 1. 执行摘要 —— 结论先行 */}
+          <ExecutiveSummary s={s} />
 
+          {/* 1.5 AI 舆情研判 —— 按需触发,LLM 跨样本六维(议题/情绪/诉求/信号/建议,挂样本回链) */}
+          <AiInsightPanel range={range} start={start} end={end} />
+
+          {/* 2. 声量总览与趋势 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.8fr)]">
-            <Panel title="声量与情绪趋势">
+            <Panel title="声量总览与趋势" hint={G.volume}
+              note={`本期声量 ${formatNumber(s.total)} 条(新增 ${formatNumber(s.newRecords)}、复现 ${formatNumber(s.updatedRecords)}),${trendNote(s)}`}>
               <VolumeTrend rows={s.volumeTrend || []} />
             </Panel>
-            <Panel title="舆情态势指数">
+            <Panel title="舆情态势指数" hint={G.heat}>
               <OpinionIndex snapshot={s} />
             </Panel>
           </section>
 
+          {/* 3. 情感 / 4. 平台 / 主题 */}
           <section className="grid gap-4 xl:grid-cols-3">
-            <Panel title="平台声量矩阵">
-              <PlatformMatrix rows={s.platformMatrix || []} />
-            </Panel>
-            <Panel title="情绪结构">
+            <Panel title="情感分析" hint={G.sentiment}
+              note={`负面率 ${s.negativeRate}%、净情感 NSR ${nsrOf(s.sentimentMap)}${(s.pendingLabel || 0) > 0 ? `;另有 ${formatNumber(s.pendingLabel)} 条待 AI 标注` : ''}`}>
               <SentimentRing rows={s.sentimentStructure || []} />
             </Panel>
-            <Panel title="主题分类">
+            <Panel title="平台分布" hint={G.platform} note={platformNote(s)}>
+              <PlatformMatrix rows={s.platformMatrix || []} />
+            </Panel>
+            <Panel title="主题分类" hint={G.category}>
               <Distribution rows={s.category || []} labelKey="category" labelMap={LABELS.category} />
             </Panel>
           </section>
 
+          {/* 5. 高影响内容 */}
+          <section className="grid gap-4 xl:grid-cols-2">
+            <Panel title="高互动内容 TOP" hint={G.topInteraction}>
+              <TopContent rows={s.topInteraction || []} />
+            </Panel>
+            <Panel title="重点负面内容" hint={G.topNegative}>
+              <RiskItems rows={s.riskItems || s.topNegative || []} />
+            </Panel>
+          </section>
+
+          {/* 6. 负面预警 / 7. 处置闭环 */}
+          <section className="grid gap-4 xl:grid-cols-2">
+            <Panel title="负面评论与风险" hint={G.negativeComment}
+              note={`本期负面评论 ${formatNumber(s.commentStats?.negative_comments || 0)} 条${(s.issueStats?.high_open_issues || 0) > 0 ? `,高危未关闭问题 ${formatNumber(s.issueStats.high_open_issues)} 个` : ''}`}>
+              <CommentRisks rows={s.commentRisks || s.negativeComments || []} />
+            </Panel>
+            <Panel title="处置与闭环" hint={G.workflow} note={workflowNote(s)}>
+              <WorkflowSummary snapshot={s} />
+            </Panel>
+          </section>
+
+          {/* 更多维度 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(390px,0.8fr)]">
-            <Panel title="热点词云">
+            <Panel title="热点词云" hint={G.hotTerms}>
               <WordCloud terms={s.hotTerms || []} />
             </Panel>
-            <Panel title="热词指数榜">
+            <Panel title="热词指数榜" hint={G.hotTerms}>
               <HotTermRank terms={s.hotTerms || []} />
             </Panel>
           </section>
 
           <section className="grid gap-4 xl:grid-cols-2">
-            <Panel title="高风险内容">
-              <RiskItems rows={s.riskItems || []} />
+            <Panel title="媒体/来源类型" hint={G.media}>
+              <Distribution rows={s.mediaDistribution || []} labelKey="media_type" labelMap={MEDIA_LABELS} />
             </Panel>
-            <Panel title="负面评论舆情">
-              <CommentRisks rows={s.commentRisks || []} />
+            <Panel title="重点账号 / 作者影响力" hint="按负面数与互动量综合排序的作者;影响力≈粉丝×互动(近似,非平台官方指数)。">
+              <AuthorRank rows={s.topAuthors || []} />
             </Panel>
           </section>
 
-          <section className="grid gap-4 xl:grid-cols-3">
-            <Panel title="处置闭环">
-              <WorkflowSummary snapshot={s} />
-            </Panel>
-            <Panel title="媒体/来源类型">
-              <Distribution rows={s.mediaDistribution || []} labelKey="media_type" />
-            </Panel>
-            <Panel title="地域/发布位置">
-              <Distribution rows={s.regionDistribution || []} labelKey="region" />
-            </Panel>
-          </section>
+          {/* 地域地图(整行,中国省级填色)*/}
+          <RegionPanel content={s.regionDistribution || []} comment={s.commentRegionDistribution || []} />
+
+          {/* 结论与建议 */}
+          <Panel title="结论与建议" hint="由本期各项异动自动生成的处置建议(actionable)。">
+            <Recommendations items={s.actionItems || s.actionRecommendations || []} />
+          </Panel>
         </>
       )}
     </div>
   )
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, hint, note, children }: { title: string; hint?: string; note?: React.ReactNode; children: React.ReactNode }) {
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card">
       <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
-        <h3 className="text-sm font-bold">{title}</h3>
+        <h3 className="flex items-center gap-1.5 text-sm font-bold">{title}{hint && <InfoHint text={hint} />}</h3>
       </div>
-      <div className="p-5">{children}</div>
+      <div className="p-5">
+        {children}
+        {note && <p className="mt-3 border-t border-border/50 pt-2.5 text-[11.5px] leading-5 text-muted-foreground"><span className="font-semibold text-foreground">解读 · </span>{note}</p>}
+      </div>
     </section>
+  )
+}
+
+function AiInsightPanel({ range, start, end }: { range: string; start: string; end: string }) {
+  const [insight, setInsight] = useState<any>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const run = async () => {
+    setLoading(true); setError('')
+    try {
+      const params = new URLSearchParams({ range })
+      if (range === 'custom') { params.set('start', start); params.set('end', end) }
+      const r: any = await api.get('/analytics/ai-insight?' + params.toString())
+      setInsight(r?.insight || null)
+      if (!r?.insight) setError('本期代表样本不足或未配置 LLM,暂无法生成研判。')
+    } catch (e: any) {
+      setError(e?.message || '生成失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+  const map = insight?.sampleMap || {}
+  const arr = (v: any): any[] => (Array.isArray(v) ? v.filter(Boolean) : [])
+  const chips = (ids: any) => {
+    const list = arr(ids)
+    if (!list.length) return null
+    return (
+      <span className="ml-1 inline-flex flex-wrap gap-1 align-middle">
+        {list.map((id: string, i: number) => {
+          const m = map[id] || {}
+          const label = String(m.title || id).slice(0, 14)
+          return m.url
+            ? <a key={i} href={m.url} target="_blank" rel="noreferrer" className="rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-primary hover:underline">{label}</a>
+            : <span key={i} className="rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-muted-foreground">{label}</span>
+        })}
+      </span>
+    )
+  }
+  const topics = arr(insight?.topicClusters)
+  const risks = arr(insight?.sentimentAndRisks)
+  const needs = arr(insight?.userNeeds).map(String)
+  const signals = arr(insight?.brandSignals).map(String)
+  const actions = arr(insight?.actionSuggestions)
+  return (
+    <Panel title="AI 舆情研判" hint="按需触发:用 LLM 对本期代表样本做跨样本研判(议题/情绪/诉求/信号/建议),每条挂可回链原帖的样本;不随看板自动跑,省 token">
+      <div className="space-y-4 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <button onClick={run} disabled={loading}
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {insight ? '重新生成' : '生成 AI 研判'}
+          </button>
+          {!insight && !loading && !error && <span className="text-xs text-muted-foreground">把本期代表样本交给 LLM 跨样本归纳议题与处置建议</span>}
+          {error && <span className="text-xs text-rose-600 dark:text-rose-400">{error}</span>}
+        </div>
+        {insight && (
+          <>
+            {insight.heatTrend && <p className="leading-relaxed"><span className="font-semibold">热度走势 · </span>{String(insight.heatTrend)}</p>}
+            {insight.executiveSummary && <p className="rounded-md bg-muted/40 p-2.5 leading-relaxed">{String(insight.executiveSummary)}</p>}
+            {topics.length > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-bold text-muted-foreground">议题聚类</div>
+                <ul className="space-y-1.5">
+                  {topics.map((t, i) => <li key={i}><span className="font-semibold">{String(t.topic || '')}</span>{t.summary ? `：${String(t.summary)}` : ''}{chips(t.sampleIds)}</li>)}
+                </ul>
+              </div>
+            )}
+            {risks.length > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-bold text-muted-foreground">情绪与争议</div>
+                <ul className="space-y-1.5">
+                  {risks.map((r, i) => (
+                    <li key={i}>
+                      <span className={`mr-1.5 rounded px-1.5 py-0.5 text-[10.5px] font-semibold ${r.level === '高' ? 'bg-status-red/15 text-rose-700 dark:text-rose-300' : r.level === '中' ? 'bg-status-amber/20 text-amber-700 dark:text-amber-300' : 'bg-muted text-muted-foreground'}`}>{String(r.level || '—')}</span>
+                      {String(r.point || '')}{chips(r.sampleIds)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {needs.length > 0 && <InsightChips label="用户诉求" items={needs} />}
+            {signals.length > 0 && <InsightChips label="品牌信号" items={signals} />}
+            {actions.length > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-bold text-muted-foreground">处置建议</div>
+                <ul className="space-y-2">
+                  {actions.map((a, i) => (
+                    <li key={i} className="rounded-md bg-muted/40 p-2.5">
+                      <div className="font-semibold">{String(a.title || '')}{chips(a.sampleIds)}</div>
+                      {a.nextStep && <div className="mt-0.5 text-[13px]"><span className="text-muted-foreground">下一步：</span>{String(a.nextStep)}</div>}
+                      {a.rationale && <div className="mt-0.5 text-[12px] text-muted-foreground">依据：{String(a.rationale)}</div>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Panel>
+  )
+}
+
+function InsightChips({ label, items }: { label: string; items: string[] }) {
+  return (
+    <div>
+      <div className="mb-1 text-xs font-bold text-muted-foreground">{label}</div>
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((it, i) => <span key={i} className="rounded-md bg-muted px-2 py-1 text-[12.5px]">{it}</span>)}
+      </div>
+    </div>
+  )
+}
+
+function trendNote(s: any) {
+  const d = delta(s.total, s.previous?.total)
+  return d ? `较上期${d.up ? '上升' : '下降'} ${d.pct}%` : '暂无可比上期'
+}
+function platformNote(s: any) {
+  const rows = s.platformMatrix || []
+  if (!rows.length) return ''
+  const top = rows[0]
+  const worst = [...rows].sort((a, b) => (Number(b.negativeRate) || 0) - (Number(a.negativeRate) || 0))[0]
+  return `主战场「${platformName(top.platform)}」占 ${top.share}%;负面最集中「${platformName(worst.platform)}」(${Number(worst.negativeRate) || 0}%)`
+}
+function workflowNote(s: any) {
+  const w = s.workflowStats || {}
+  const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
+  return `待处理 ${formatNumber(w.active_inbox || 0)}、已转工单 ${formatNumber(w.issue_linked || 0)};官方响应率 ${officialRate}%`
+}
+
+function ExecutiveSummary({ s }: { s: any }) {
+  const prev = s.previous || {}
+  const risk = Number(s.opinionIndex?.risk) || 0
+  const status = s.opinionIndex?.status || '平稳'
+  const lightCls = risk >= 70 ? 'bg-status-red' : risk >= 45 ? 'bg-status-amber' : 'bg-status-green'
+  const riskTone = risk >= 70 ? 'critical' : risk >= 45 ? 'medium' : 'positive'
+  const nsr = nsrOf(s.sentimentMap)
+  const interaction = sumInteractions(s.platformMatrix)
+  const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
+  const negRate = Number(s.negativeRate) || 0
+  const stats = [
+    { label: '总声量', value: formatNumber(s.total), d: delta(s.total, prev.total), tone: 'accent', hint: G.volume },
+    { label: '互动总量', value: formatNumber(interaction), tone: 'accent', hint: G.interaction },
+    { label: '净情感 NSR', value: nsr, d: delta(nsr, nsrOf(prev.sentimentMap)), tone: nsr < 0 ? 'danger' : 'normal', hint: G.nsr },
+    { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: G.risk },
+    { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
+    { label: '新增内容', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
+    { label: '待处理', value: formatNumber(s.workflowStats?.active_inbox || 0), tone: (s.workflowStats?.active_inbox || 0) > 0 ? 'warning' : 'normal', hint: G.pending },
+    { label: '官方响应率', value: `${officialRate}%`, hint: G.official },
+  ]
+  return (
+    <section className="rounded-lg border border-border bg-card p-5">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <span className={`h-2.5 w-2.5 rounded-full ${lightCls}`} />
+        <h2 className="text-base font-bold">执行摘要</h2>
+        <StatusBadge tone={riskTone}>风险{status}</StatusBadge>
+      </div>
+      <p className="mt-2 text-[13px] leading-6 text-muted-foreground">
+        本期共监测 <strong className="text-foreground">{formatNumber(s.total)}</strong> 条内容(新增 {formatNumber(s.newRecords)}),
+        负面率 <strong className="text-foreground">{negRate}%</strong>、净情感 NSR <strong className="text-foreground">{nsr}</strong>,
+        舆情风险指数 <strong className="text-foreground">{risk}</strong>({status});待处理 {formatNumber(s.workflowStats?.active_inbox || 0)} 条,官方响应率 {officialRate}%。
+      </p>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {stats.map(st => <Stat key={st.label} {...st} />)}
+      </div>
+    </section>
+  )
+}
+
+function Stat({ label, value, d, tone, hint }: { label: string; value: React.ReactNode; d?: { pct: number; up: boolean } | null; tone?: string; hint?: string }) {
+  const bg = tone === 'danger' ? 'bg-status-red/[0.07] ring-1 ring-status-red/15'
+    : tone === 'warning' ? 'bg-status-amber/[0.10] ring-1 ring-status-amber/20'
+      : tone === 'accent' ? 'bg-primary/[0.06] ring-1 ring-primary/15'
+        : 'bg-muted/40'
+  const valColor = tone === 'danger' ? 'text-destructive' : tone === 'warning' ? 'text-amber-600' : tone === 'accent' ? 'text-primary' : 'text-foreground'
+  return (
+    <div className={`rounded-lg p-3.5 ${bg}`}>
+      <div className="flex items-center gap-1 text-[12px] text-muted-foreground">{label}{hint && <InfoHint text={hint} />}</div>
+      <div className="mt-1.5 flex items-baseline gap-2">
+        <span className={`text-[22px] font-bold tabular-nums ${valColor}`}>{value}</span>
+        {d && <span className="text-[11px] font-semibold text-muted-foreground">{d.up ? '↑' : '↓'}{d.pct}%</span>}
+      </div>
+    </div>
+  )
+}
+
+function TopContent({ rows }: { rows: any[] }) {
+  if (!rows.length) return <EmptyState icon={BarChart3} title="暂无内容" />
+  return (
+    <div className="divide-y divide-border">
+      {rows.slice(0, 8).map((row, i) => (
+        <div key={row.id || i} className="grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-3 py-2.5 first:pt-0 last:pb-0">
+          <span className="grid h-6 w-6 place-items-center rounded-md bg-primary/10 text-xs font-black text-primary">{i + 1}</span>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-medium">{row.title || compact(row.content || '', 40) || '无标题'}</div>
+            <div className="mt-0.5 flex items-center gap-2 text-[11px] text-muted-foreground">
+              <StatusBadge tone="neutral">{platformName(row.platform)}</StatusBadge>
+              <span className="truncate">{row.author_name || '未知作者'}</span>
+            </div>
+          </div>
+          <span className="text-xs font-semibold tabular-nums text-muted-foreground">{formatNumber(interactions(row))}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AuthorRank({ rows }: { rows: any[] }) {
+  if (!rows.length) return <EmptyState icon={BarChart3} title="暂无账号数据" />
+  return (
+    <div className="divide-y divide-border">
+      {rows.slice(0, 8).map((r, i) => (
+        <div key={r.author_name || i} className="grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-3 py-2.5 first:pt-0 last:pb-0">
+          <span className="grid h-6 w-6 place-items-center rounded-md bg-primary/10 text-xs font-black text-primary">{i + 1}</span>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-medium">{r.author_name || '未知作者'}</div>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">粉丝 {formatNumber(r.author_fans)} · {formatNumber(r.count)} 条{Number(r.negative_count) > 0 ? ` · 负面 ${formatNumber(r.negative_count)}` : ''}</div>
+          </div>
+          <span className="text-xs font-semibold tabular-nums text-muted-foreground">{formatNumber(r.interaction_total)} 互动</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function Recommendations({ items }: { items: any[] }) {
+  if (!items.length) return <EmptyState icon={AlertTriangle} title="本周期无显著风险" />
+  return (
+    <ol className="space-y-2.5">
+      {items.slice(0, 7).map((it, i) => {
+        const text = typeof it === 'string' ? it : (it?.text || it?.title || String(it))
+        return (
+          <li key={i} className="flex gap-2.5 text-[13px] leading-6">
+            <span className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full bg-primary/10 text-[11px] font-bold text-primary">{i + 1}</span>
+            <span className="text-foreground">{text}</span>
+          </li>
+        )
+      })}
+    </ol>
   )
 }
 
@@ -313,7 +616,7 @@ function PlatformMatrix({ rows }: { rows: any[] }) {
         return (
           <div key={row.platform || row.label} className="grid gap-2">
             <div className="flex items-center justify-between gap-3 text-sm">
-              <strong>{platformName(row.platform) || row.label}</strong>
+              <strong className="flex items-center gap-1.5"><span className={`h-2 w-2 shrink-0 rounded-full ${PLATFORM_DOT[row.platform] || 'bg-muted-foreground/40'}`} />{platformName(row.platform) || row.label}</strong>
               <span className="text-xs text-muted-foreground">{formatNumber(row.count)} 条 · 负面 {negativeRate}%</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-muted">
@@ -364,6 +667,43 @@ function SentimentRing({ rows }: { rows: any[] }) {
   )
 }
 
+function RegionPanel({ content, comment }: { content: any[]; comment: any[] }) {
+  const [mode, setMode] = useState<'all' | 'content' | 'comment'>('all')
+  const rows = mode === 'content' ? content : mode === 'comment' ? comment : mergeRegions(content, comment)
+  const note = mode === 'content'
+    ? '内容地域:博主内容沿用其作者属地回填,仍取不到才记未采集'
+    : mode === 'comment'
+      ? '评论地域:取评论自带的 IP 属地,平台原生最全'
+      : '全部:内容(作者属地)+ 评论(评论IP)合并,覆盖最全的地域大盘'
+  return (
+    <section className="overflow-hidden rounded-lg border border-border bg-card">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
+        <h3 className="flex items-center gap-1.5 text-sm font-bold">地域/发布位置<InfoHint text="地域=内容作者属地 + 评论 IP 属地。默认「全部」合并两者(最全);可切单看。内容侧大量「未采集」是源头限制,评论侧最完整。" /></h3>
+        <div className="inline-flex rounded-lg bg-muted p-0.5 text-[12px] font-semibold">
+          {([['all', '全部'], ['content', '内容'], ['comment', '评论']] as const).map(([k, label]) => (
+            <button key={k} onClick={() => setMode(k)}
+              className={`rounded-md px-2.5 py-1 transition-colors ${mode === k ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1.4fr)_minmax(280px,1fr)]">
+        <div>
+          <Suspense fallback={<div className="grid h-[280px] place-items-center"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>}>
+            <ChinaMap rows={rows} />
+          </Suspense>
+        </div>
+        <div className="lg:border-l lg:border-border/50 lg:pl-5">
+          <div className="mb-2 text-[11px] font-bold uppercase tracking-wide text-muted-foreground">省份排行</div>
+          <Distribution rows={rows} labelKey="region" />
+          <p className="mt-3 text-[11px] text-muted-foreground">{note}</p>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function Distribution({ rows, labelKey, labelMap = {} }: { rows: any[]; labelKey: string; labelMap?: Record<string, string> }) {
   if (!rows.length) return <EmptyState icon={BarChart3} title="暂无分布数据" />
   const total = Math.max(1, rows.reduce((sum, row) => sum + Number(row.count || 0), 0))
@@ -388,21 +728,75 @@ function Distribution({ rows, labelKey, labelMap = {} }: { rows: any[]; labelKey
   )
 }
 
+const CLOUD_COLORS = ['#2563EB', '#E11D48', '#059669', '#D97706', '#7C3AED', '#0EA5E9', '#DB2777']
+
 function WordCloud({ terms }: { terms: any[] }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [width, setWidth] = useState(560)
+  const [placed, setPlaced] = useState<any[]>([])
+  const H = 340
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const update = () => setWidth(Math.max(280, el.clientWidth || 560))
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!terms.length || !width) { setPlaced([]); return }
+    const top = terms.slice(0, 60)
+    const ws = top.map(t => Number(t.weight) || Number(t.count) || 1)
+    const max = Math.max(...ws, 1), min = Math.min(...ws)
+    const maxFont = Math.min(58, Math.max(34, Math.round(width / 11)))
+    const words = top.map((t, i) => {
+      const v = Number(t.weight) || Number(t.count) || 1
+      const ratio = (v - min) / (max - min || 1)
+      return {
+        text: String(t.label || ''),
+        size: Math.round(15 + Math.pow(ratio, 0.65) * (maxFont - 15)),
+        count: Number(t.count) || 0,
+        tone: Number(t.tone) || i,
+      }
+    })
+    let cancelled = false
+    const layout = cloud()
+      .size([width, H])
+      .words(words as any)
+      .padding(1)
+      .spiral('rectangular') // 矩形螺旋:填满边角,不留大空白
+      .rotate(() => (Math.random() < 0.12 ? 90 : 0))
+      .font('sans-serif')
+      .fontSize((d: any) => d.size)
+      .on('end', (out: any[]) => { if (!cancelled) setPlaced(out) })
+    layout.start()
+    return () => { cancelled = true; layout.stop() }
+  }, [terms, width])
+
   if (!terms.length) return <EmptyState icon={BarChart3} title="暂无热点词" />
-  const colors = ['text-primary', 'text-emerald-600', 'text-amber-600', 'text-violet-600', 'text-destructive']
   return (
-    <div className="flex min-h-[220px] flex-wrap content-center items-center justify-center gap-x-4 gap-y-3">
-      {terms.slice(0, 36).map((term, index) => (
-        <span
-          key={`${term.label}-${index}`}
-          className={`font-bold leading-none ${colors[Number(term.tone) % colors.length]}`}
-          style={{ fontSize: `${Number(term.weight) || 14}px` }}
-          title={`${term.label} · ${term.count}`}
-        >
-          {term.label}
-        </span>
-      ))}
+    <div ref={ref} className="w-full">
+      <svg width={width} height={H} className="w-full" style={{ display: 'block' }}>
+        <g transform={`translate(${width / 2},${H / 2})`}>
+          {placed.map((d, i) => (
+            <text
+              key={`${d.text}-${i}`}
+              textAnchor="middle"
+              transform={`translate(${d.x},${d.y}) rotate(${d.rotate})`}
+              fontSize={d.size}
+              fontWeight={700}
+              fill={CLOUD_COLORS[d.tone % CLOUD_COLORS.length]}
+              style={{ cursor: 'default' }}
+            >
+              <title>{d.text} · {formatNumber(d.count)}</title>
+              {d.text}
+            </text>
+          ))}
+        </g>
+      </svg>
     </div>
   )
 }
@@ -475,7 +869,7 @@ function CommentRisks({ rows }: { rows: any[] }) {
 function WorkflowSummary({ snapshot }: { snapshot: any }) {
   const rows = [
     ['待处理/复核', snapshot.workflowStats?.active_inbox || 0, 'unhandled'],
-    ['已转问题', snapshot.workflowStats?.issue_linked || 0, 'issue_linked'],
+    ['已转工单', snapshot.workflowStats?.issue_linked || 0, 'issue_linked'],
     ['官方已响应', snapshot.workflowStats?.official_responded || 0, 'official_responded'],
     ['已归档', snapshot.workflowStats?.archived || 0, 'archived'],
     ['误报', snapshot.workflowStats?.false_positive || 0, 'false_positive'],

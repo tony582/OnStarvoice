@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowRight, ChevronLeft, ChevronRight, Database, Download, ExternalLink, Image as ImageIcon,
+  ArrowRight, ChevronLeft, ChevronRight, Database, Download, ExternalLink, FileText, Image as ImageIcon,
   Loader2, RefreshCw, Search,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -446,7 +446,7 @@ function monitorContentColumns(platform: string): Column[] {
 function aiWorkflowColumns({ includeDuration }: { includeDuration: boolean }): Column[] {
   return [
     ...(includeDuration ? [col('duration', '视频时长', r => textCell(videoDuration(r)))] : []),
-    col('transcript', '视频逐字稿提取', (r, ctx) => longCell(videoTranscript(r), 220, ctx)),
+    col('transcript', '视频逐字稿提取', (r) => <TranscriptCell row={r} />),
     col('script', '视频脚本分析', (r, ctx) => longCell(videoScriptAnalysis(r), 180, ctx)),
     col('scriptOut', '视频脚本分析.输出结果', (r, ctx) => longCell(videoScriptAnalysisOutput(r), 220, ctx)),
     col('commentText', '评论内容', (r, ctx) => longCell(commentText(r), 260, ctx)),
@@ -491,7 +491,7 @@ function singleNoteColumns(platform: string): Column[] {
       col('images', '附件图片', r => imagesCell(imageUrls(r), r.title)),
       col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
       col('duration', '视频时长', r => textCell(videoDuration(r))),
-      col('transcript', '视频逐字稿提取', (r, ctx) => longCell(videoTranscript(r), 220, ctx)),
+      col('transcript', '视频逐字稿提取', (r) => <TranscriptCell row={r} />),
       col('script', '视频脚本分析', (r, ctx) => longCell(videoScriptAnalysis(r), 180, ctx)),
       col('scriptOut', '视频脚本分析.输出结果', (r, ctx) => longCell(videoScriptAnalysisOutput(r), 220, ctx)),
       col('commentText', '评论内容', (r, ctx) => longCell(commentText(r), 260, ctx)),
@@ -527,7 +527,7 @@ function singleNoteColumns(platform: string): Column[] {
       col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
       col('audio', '音频链接', r => linkCell(audioUrl(r), '收听音频')),
       col('duration', '视频时长', r => textCell(videoDuration(r))),
-      col('transcript', '视频逐字稿提取', (r, ctx) => longCell(videoTranscript(r), 220, ctx)),
+      col('transcript', '视频逐字稿提取', (r) => <TranscriptCell row={r} />),
       col('script', '视频脚本分析', (r, ctx) => longCell(videoScriptAnalysis(r), 180, ctx)),
       col('scriptOut', '视频脚本分析.输出结果', (r, ctx) => longCell(videoScriptAnalysisOutput(r), 220, ctx)),
       col('commentText', '评论内容', (r, ctx) => longCell(commentText(r), 260, ctx)),
@@ -565,7 +565,7 @@ function singleNoteColumns(platform: string): Column[] {
     col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
     col('audio', '音频链接', r => linkCell(audioUrl(r), '收听音频')),
     col('duration', '视频时长', r => textCell(videoDuration(r))),
-    col('transcript', '视频逐字稿提取', (r, ctx) => longCell(videoTranscript(r), 220, ctx)),
+    col('transcript', '视频逐字稿提取', (r) => <TranscriptCell row={r} />),
     col('script', '视频脚本分析', (r, ctx) => longCell(videoScriptAnalysis(r), 180, ctx)),
     col('scriptOut', '视频脚本分析.输出结果', (r, ctx) => longCell(videoScriptAnalysisOutput(r), 220, ctx)),
     col('commentText', '评论内容', (r, ctx) => longCell(commentText(r), 260, ctx)),
@@ -1171,6 +1171,71 @@ function AttachmentDownloadCell({ row }: { row: any }) {
           {msg}
         </span>
       )}
+    </div>
+  )
+}
+
+// 视频逐字稿单元:有结果显示文本;没结果给「生成逐字稿」按钮(异步转写 + 轮询)
+const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media']
+function TranscriptCell({ row }: { row: any }) {
+  const initialText = String(row?.transcript || videoTranscript(row) || '')
+  const [status, setStatus] = useState<string>(row?.transcript_status || (initialText ? 'done' : 'none'))
+  const [text, setText] = useState<string>(initialText)
+  const [error, setError] = useState<string>(row?.transcript_error || '')
+  const [busy, setBusy] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const stopPoll = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
+  useEffect(() => stopPoll, [])
+
+  const startPoll = () => {
+    stopPoll()
+    pollRef.current = setInterval(async () => {
+      try {
+        const d: any = await api.get(`/records/${row.id}/transcript`)
+        setStatus(d.transcript_status || 'none'); setText(d.transcript || ''); setError(d.transcript_error || '')
+        if (TRANSCRIPT_TERMINAL.includes(d.transcript_status)) { stopPoll(); setBusy(false) }
+      } catch { /* 下个周期再试 */ }
+    }, 3500)
+  }
+
+  const generate = async () => {
+    if (!row?.id || busy) return
+    setBusy(true); setError('')
+    try {
+      const d: any = await api.post(`/records/${row.id}/transcribe`, {})
+      setStatus(d.status || 'pending')
+      if (d.status === 'no_media') { setBusy(false); return }
+      if (d.status === 'pending' || d.status === 'processing') startPoll()
+      else setBusy(false)
+    } catch (e: any) {
+      setStatus('failed'); setError(e?.message || '触发失败'); setBusy(false)
+    }
+  }
+
+  const inProgress = busy || status === 'pending' || status === 'processing'
+
+  if (status === 'done' && text) {
+    return (
+      <div className="max-w-[220px] whitespace-pre-wrap break-words text-xs leading-5" title={text}>
+        {text.length > 200 ? text.slice(0, 200) + '…' : text}
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={generate}
+        disabled={inProgress}
+        title="用阿里云百炼提取视频口播文字"
+        className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-background px-2 text-xs font-semibold text-primary transition hover:border-primary/40 hover:bg-primary/5 disabled:opacity-60"
+      >
+        {inProgress ? <Loader2 className="h-3 w-3 animate-spin" /> : <FileText className="h-3 w-3" />}
+        {inProgress ? '转写中…' : status === 'done' ? '重新生成' : '生成逐字稿'}
+      </button>
+      {status === 'no_media' && <span className="text-[11px] text-muted-foreground">无可转写视频</span>}
+      {status === 'expired' && <span className="text-[11px] text-amber-600">直链过期,需重采</span>}
+      {status === 'failed' && <span className="text-[11px] text-destructive">{error || '转写失败'}</span>}
     </div>
   )
 }

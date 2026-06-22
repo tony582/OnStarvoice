@@ -15,9 +15,11 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
          FROM records r
          LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
          WHERE r.tenant_id = $1 AND (${ACTIVE_QUEUE_CONDITION})) AS triage_pending,
-        (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new') AS leads_new,
+        (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new' AND lead_type <> 'sales_intent') AS leads_new,
         (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
-        (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention
+        (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention,
+        (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')) AS tickets_pending,
+        (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review') AS tickets_feedback
     `, [req.tenantId]);
 
     return res.json({
@@ -27,9 +29,28 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         leadsNew: Number(row?.leads_new || 0),
         issuesOpen: Number(row?.issues_open || 0),
         monitorAttention: Number(row?.monitor_attention || 0),
+        ticketsPending: Number(row?.tickets_pending || 0),
+        ticketsFeedback: Number(row?.tickets_feedback || 0),
       },
       generatedAt: new Date().toISOString(),
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 评论 AI 精炼进度:评论入库即可见,但 AI 分类(情感/负面/客资意向)在后台批量精炼。
+// 待精炼 = record_comments 里 ai_classified_at IS NULL 的非官方评论。前台据此显示实时进度条。
+router.get('/processing', requireTenantAccess, async (req, res, next) => {
+  try {
+    const row = await queryOne(`
+      SELECT COUNT(DISTINCT rc.record_id) AS pending_posts, COUNT(*) AS pending_comments
+      FROM record_comments rc
+      WHERE rc.tenant_id = $1 AND rc.ai_classified_at IS NULL AND rc.is_official = false
+    `, [req.tenantId]);
+    const pendingPosts = Number(row?.pending_posts || 0);
+    const pendingComments = Number(row?.pending_comments || 0);
+    return res.json({ ok: true, processing: pendingComments > 0, pendingPosts, pendingComments });
   } catch (err) {
     return next(err);
   }
@@ -102,7 +123,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       SELECT
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') AS unhandled,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') AS reviewing,
-        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'issue_linked') AS issue_linked
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) AS issue_linked
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1

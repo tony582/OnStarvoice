@@ -75,7 +75,10 @@ router.get('/subscriptions', requireTenantAccess, async (req, res, next) => {
     const { status = 'all', platform = '' } = req.query;
     const params = [req.tenantId];
     let sql = 'SELECT * FROM monitor_subscriptions WHERE tenant_id = $1';
+    // 监控中心只做对标监控:仅显示账号(博主)订阅(account_url 非空),过滤旧的关键词订阅
+    sql += ` AND COALESCE(account_url, '') <> ''`;
     if (status !== 'all') { params.push(status); sql += ` AND status = $${params.length}`; }
+    else { sql += ` AND status <> 'deleted'`; } // 默认不显示已删除
     if (platform) { params.push(platform); sql += ` AND platform = $${params.length}`; }
     sql += ' ORDER BY created_at DESC';
     const subscriptions = (await queryAll(sql, params)).map(normalizeMonitorSubscriptionRow);

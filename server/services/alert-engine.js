@@ -131,12 +131,44 @@ export async function checkAlerts(recordId) {
   }
 
   const threshold = Number((await getSetting('alert_high_interaction_threshold', record.tenant_id)) || 500);
+  const spreadFloor = Number((await getSetting('alert_spread_floor', record.tenant_id)) || 50);
+  const authorFans = Number(record.author_fans || 0);
 
-  if (record.sentiment === 'negative' && interactionTotal >= threshold) {
+  // 低粉高扩散:小号负面却高扩散(互动 ≥ 粉丝数 且 ≥ 下限)= 疑似水军/突发负面种子;死阈值(500)会漏
+  const lowFansCeil = Number((await getSetting('alert_low_fans_ceiling', record.tenant_id)) || 10000);
+  if (record.sentiment === 'negative' && authorFans > 0 && authorFans < lowFansCeil
+    && interactionTotal >= spreadFloor && interactionTotal >= authorFans) {
+    alerts.push({
+      record_id: recordId,
+      level: 'warning',
+      reason: `低粉高扩散: ${authorFans} 粉博主负面内容互动 ${interactionTotal}(赞粉比异常,疑似水军/突发种子)`,
+      title: record.title,
+      summary: record.ai_summary || record.content?.slice(0, 100) || '',
+      url: record.url,
+      interaction_total: interactionTotal,
+    });
+  }
+
+  // 高互动负面:绝对阈值 OR 高于本租户近14天互动量 p90 基线(抓"绝对量不高但相对异常高"的早期负面)
+  let baselineP90 = 0;
+  if (record.sentiment === 'negative') {
+    const b = await queryOne(
+      `SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY (likes + comments_count + collects + shares)) AS p90,
+              COUNT(*) AS n
+       FROM records WHERE tenant_id = $1 AND created_at >= now() - interval '14 days'`,
+      [record.tenant_id]
+    );
+    if (b && Number(b.n) >= 20) baselineP90 = Math.round(Number(b.p90) || 0);
+  }
+  const relativeHigh = baselineP90 > 0 && interactionTotal >= baselineP90 && interactionTotal >= spreadFloor;
+  if (record.sentiment === 'negative' && (interactionTotal >= threshold || relativeHigh)) {
+    const why = interactionTotal >= threshold
+      ? `总互动量 ${interactionTotal}(绝对阈值 ${threshold})`
+      : `总互动量 ${interactionTotal} 高于近14天基线 p90 ${baselineP90}`;
     alerts.push({
       record_id: recordId,
       level: 'critical',
-      reason: `高互动负面: 总互动量 ${interactionTotal} (阈值 ${threshold})`,
+      reason: `高互动负面: ${why}`,
       title: record.title,
       summary: record.ai_summary || record.content?.slice(0, 100) || '',
       url: record.url,

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { queryOne } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
-import { buildAnalyticsDashboard } from '../services/report-generator.js';
+import { buildAnalyticsDashboard, generateOpinionInsight } from '../services/report-generator.js';
 
 const router = Router();
 
@@ -122,6 +122,24 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
       },
       snapshot,
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 看板按需触发 AI 舆情研判(独立端点,避免拖慢看板加载/每次开都烧 token)
+router.get('/ai-insight', requireTenantAccess, async (req, res, next) => {
+  try {
+    const period = await resolveRange(req.tenantId, req.query);
+    if (period.error) {
+      return res.status(400).json({ ok: false, error: 'invalid_range', message: period.error });
+    }
+    const insight = await generateOpinionInsight({
+      tenantId: req.tenantId,
+      periodStart: period.start,
+      periodEnd: period.end,
+    });
+    return res.json({ ok: true, insight: insight || null });
   } catch (err) {
     return next(err);
   }

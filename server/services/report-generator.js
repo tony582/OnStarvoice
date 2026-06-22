@@ -6,6 +6,7 @@
 
 import { queryOne, queryAll, execute, withTransaction, getSetting } from '../db/init.js';
 import { sendReportEmail } from './email-notifier.js';
+import { callLLMWithPrompt } from './ai-labeler.js';
 
 const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
 const SENTIMENT_COLOR = { positive: '#059669', neutral: '#6B7280', negative: '#DC2626' };
@@ -51,7 +52,8 @@ const ISSUE_STATUS_LABEL = {
 const TRIAGE_LABEL = {
   unhandled: '待处理',
   reviewing: '待复核',
-  issue_linked: '已转问题',
+  issue_linked: '已转工单',
+  ticketed: '已转工单',
   official_responded: '官方已响应',
   archived: '已归档',
   false_positive: '误报',
@@ -300,6 +302,37 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['total', 'positive', 'neutral', 'negative', 'pending']);
 
+  // 近 14 天滚动趋势(独立于周期长度):日报用来补"近期走势",避免单日只有一个点
+  const trailingStart = new Date(periodEnd.getTime() - 14 * 86400000);
+  // 用日历骨架(generate_series)左连观测,零声量的天补 total=0,避免"跌到0"的异动从图里消失
+  const trailingTrend = normalizeRows(await queryAll(
+    `WITH days AS (
+       SELECT generate_series(
+         date_trunc('day', $2::timestamptz AT TIME ZONE 'Asia/Shanghai'),
+         date_trunc('day', $3::timestamptz AT TIME ZONE 'Asia/Shanghai') - interval '1 day',
+         interval '1 day'
+       ) AS day_bucket
+     ),
+     obs AS (
+       SELECT date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') AS day_bucket,
+         ro.record_id, r.sentiment
+       FROM record_observations ro
+       JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+       WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+         AND ${RELEVANT_RECORD_SQL}
+     )
+     SELECT
+       to_char(d.day_bucket, 'MM-DD') AS label,
+       d.day_bucket,
+       COUNT(DISTINCT o.record_id) AS total,
+       COUNT(DISTINCT o.record_id) FILTER (WHERE o.sentiment = 'negative') AS negative
+     FROM days d
+     LEFT JOIN obs o ON o.day_bucket = d.day_bucket
+     GROUP BY d.day_bucket
+     ORDER BY d.day_bucket ASC`,
+    [tenantId, trailingStart.toISOString(), periodEnd.toISOString()]
+  ), ['total', 'negative']);
+
   const mediaDistribution = normalizeRows(await queryAll(
     `${observedCte}
      SELECT COALESCE(
@@ -318,18 +351,53 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     params
   ), ['count', 'negative_count']);
 
+  // 内容地域:本帖 payload 取不到时,用「该作者在别处已知的属地」回填(博主发的内容沿用博主 IP),
+  // 仍取不到才记未采集。OWN_REGION 逐层兜底(顶层/detailPayload/items[0] × publishLocation/region/ipLocation)。
+  const OWN_REGION = `COALESCE(
+    NULLIF(payload->>'publishLocation', ''),
+    NULLIF(payload->>'region', ''),
+    NULLIF(payload->>'ipLocation', ''),
+    NULLIF(payload->>'ip_location', ''),
+    NULLIF(payload->'detailPayload'->>'publishLocation', ''),
+    NULLIF(payload->'detailPayload'->>'region', ''),
+    NULLIF(payload->'detailPayload'->>'ipLocation', ''),
+    NULLIF(payload->'detailPayload'->>'ip_location', ''),
+    NULLIF(payload->'items'->0->>'publishLocation', ''),
+    NULLIF(payload->'items'->0->>'region', ''),
+    NULLIF(payload->'items'->0->>'ipLocation', '')
+  )`;
   const regionDistribution = normalizeRows(await queryAll(
-    `${observedCte}
-     SELECT COALESCE(
-       NULLIF(payload->>'publishLocation', ''),
-       NULLIF(payload->>'region', ''),
-       NULLIF(payload->>'ipLocation', ''),
-       '未采集'
-     ) as region,
+    `${observedCte}, author_loc AS (
+       SELECT author_id, mode() WITHIN GROUP (ORDER BY own_region) AS region
+       FROM (
+         SELECT author_id, ${OWN_REGION} AS own_region
+         FROM records
+         WHERE tenant_id = $1 AND COALESCE(author_id, '') <> ''
+       ) s
+       WHERE own_region IS NOT NULL AND own_region <> ''
+       GROUP BY author_id
+     )
+     SELECT COALESCE(${OWN_REGION}, al.region, '未采集') AS region,
        COUNT(*) as count,
-       COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count
-     FROM observed
-     GROUP BY region
+       COUNT(*) FILTER (WHERE o.sentiment = 'negative') as negative_count
+     FROM observed o
+     LEFT JOIN author_loc al ON al.author_id = o.author_id AND COALESCE(o.author_id, '') <> ''
+     GROUP BY 1
+     ORDER BY count DESC
+     LIMIT 8`,
+    params
+  ), ['count', 'negative_count']);
+
+  // 评论地域:评论自带 IP 属地,数据最全,单列一份口径供「内容 / 评论」切换
+  const commentRegionDistribution = normalizeRows(await queryAll(
+    `${observedCte}
+     SELECT COALESCE(NULLIF(rc.ip_location, ''), '未采集') AS region,
+       COUNT(*) as count,
+       COUNT(*) FILTER (WHERE rc.is_negative) as negative_count
+     FROM record_comments rc
+     JOIN observed o ON o.id = rc.record_id
+     WHERE rc.tenant_id = $1 AND rc.is_official = false
+     GROUP BY 1
      ORDER BY count DESC
      LIMIT 8`,
     params
@@ -519,7 +587,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        ) as active_inbox,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') as unhandled,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') as reviewing,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'issue_linked') as issue_linked,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) as issue_linked,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'archived') as archived,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'false_positive') as false_positive
      FROM records r
@@ -562,9 +630,11 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
     intent,
     keyword,
     volumeTrend,
+    trailingTrend,
     sentimentTrend: volumeTrend,
     mediaDistribution,
     regionDistribution,
+    commentRegionDistribution,
     sentimentSamples,
     topNegative,
     topInteraction,
@@ -908,7 +978,76 @@ function buildSentimentStructure(stats, sentimentCounts) {
   return rows.map(row => ({ ...row, share: pct(row.count, total) }));
 }
 
-function enrichReportData(type, current, previous) {
+// 借鉴 MediaClaw 关键词舆情扫描:用 LLM 对本周期代表样本做跨样本六维研判,
+// 把"统计+模板话术"升级为真 AI 研判;每条议题/建议挂可回链的样本 id(取信管理层/PR)。
+async function buildAiOpinionInsight(tenantId, current) {
+  if (!tenantId) return null;
+  // 分层抽样:除重点负面/增长样本外,从情感样本的头/中/尾各取一截,保证中低互动的早期/长尾负面也进研判
+  const ss = current.sentimentSamples || [];
+  const mid = Math.floor(ss.length / 2);
+  const stratified = [...ss.slice(0, 10), ...ss.slice(mid, mid + 5), ...ss.slice(-5)];
+  const pool = [
+    ...(current.topNegative || []),
+    ...(current.risingRecords || []),
+    ...stratified,
+  ];
+  // 头部断层比:Top1 占 Top5 互动比例,判舆情是被少数爆款主导(易引导/易反转)还是普遍发酵(真实民意)
+  const interOf = (r) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0);
+  const tops = (current.topInteraction || []).map(interOf).sort((a, b) => b - a).slice(0, 5);
+  const topSum = tops.reduce((a, b) => a + b, 0);
+  const cliffPct = topSum > 0 ? Math.round((tops[0] || 0) / topSum * 100) : 0;
+  const seen = new Set();
+  const samples = [];
+  const idMap = {};
+  for (const r of pool) {
+    const id = r.id || r.record_id;
+    if (!id) continue;
+    if (!idMap[id]) idMap[id] = { title: String(r.title || '').slice(0, 80), url: r.url || r.record_url || '' };
+    if (seen.has(id)) continue;
+    seen.add(id);
+    samples.push({
+      id,
+      title: String(r.title || '').slice(0, 80),
+      sentiment: r.sentiment || '',
+      likes: Number(r.likes || 0),
+      comments: Number(r.comments_count || 0),
+      negComments: Number(r.negative_comment_count || 0),
+      summary: String(r.ai_summary || r.content || '').replace(/\s+/g, ' ').slice(0, 160),
+    });
+    if (samples.length >= 30) break;
+  }
+  if (samples.length < 3) return null;
+
+  const brandName = (await getSetting('brand_name', tenantId)) || '目标品牌';
+  const s = sentimentMap(current);
+  const negativeRate = pct(s.negative, current.total);
+  const systemPrompt = `你是「${brandName}」的资深舆情分析师。下面给你本周期统计概览 + 一批代表样本(每条含 id/标题/情感/互动/摘要)。请做**跨样本**的舆情研判,只输出 JSON:
+{
+  "heatTrend": "热度与走势研判(1-2句)",
+  "executiveSummary": "结论先行的管理层摘要(2-4句,点明风险等级、主要矛盾、是否需介入)",
+  "topicClusters": [{"topic":"议题名","summary":"该议题在讲什么/集中度","sampleIds":["命中样本id"]}],
+  "sentimentAndRisks": [{"point":"情绪/争议焦点","level":"高|中|低","sampleIds":["..."]}],
+  "userNeeds": ["从内容反映的用户诉求/需求"],
+  "brandSignals": ["对品牌/产品的具体信号(正或负)"],
+  "actionSuggestions": [{"title":"处置建议","rationale":"依据(哪些样本/信号)","nextStep":"具体下一步动作","sampleIds":["..."]}]
+}
+要求:sampleIds 只能用我给的样本 id;基于事实不臆造;聚类要跨样本归纳而非逐条复述;空字段用空数组/空串;简洁中文。`;
+  const userMessage = `【本周期概览】总量 ${current.total},负面 ${s.negative} 条(负面率 ${negativeRate}%)。
+【热度结构】Top1 内容占 Top5 互动的 ${cliffPct}%(断层比:越高=越被少数爆款主导/易引导易反转,越低=普遍发酵/更接近真实民意;请在 heatTrend 里据此判断本期舆情是"爆款主导"还是"普遍发酵")。
+【代表样本】(${samples.length} 条)
+${samples.map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}负评${x.negComments} | ${x.title} | ${x.summary}`).join('\n')}`;
+
+  try {
+    const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+    if (!result || typeof result !== 'object') return null;
+    return { ...result, sampleMap: idMap };
+  } catch (err) {
+    console.warn('[report] AI 研判失败:', err?.message || err);
+    return null;
+  }
+}
+
+async function enrichReportData(type, current, previous, tenantId) {
   const currentSentiment = sentimentMap(current);
   const previousSentiment = sentimentMap(previous);
   const negativeRate = pct(currentSentiment.negative, current.total);
@@ -951,6 +1090,28 @@ function enrichReportData(type, current, previous) {
   const opinionIndex = buildOpinionIndex(current, previous, negativeRate, previousNegativeRate);
   const platformMatrix = buildPlatformMatrix(current);
   const sentimentStructure = buildSentimentStructure(current, currentSentiment);
+  // LLM 跨样本六维研判:仅邮件/定时报告自动跑(看板改按需触发,避免每次打开都烧 token+延迟)。
+  // 失败/无 key 返回 null,渲染层回落模板;绝不让报告因此崩。
+  let aiInsight = null;
+  if (type !== 'dashboard') {
+    try {
+      aiInsight = await buildAiOpinionInsight(tenantId, current);
+    } catch (e) {
+      console.warn('[report] AI 研判异常:', e?.message || e);
+    }
+  }
+  // AI 研判存在时前置进管理摘要/行动建议:所有 HTML 渲染器自动带上,数字型模板句保留在后
+  const execSummary = aiInsight?.executiveSummary
+    ? [`🤖 AI 研判：${aiInsight.executiveSummary}`, ...executiveSummary]
+    : executiveSummary;
+  const finalActionItems = (aiInsight?.actionSuggestions || []).length
+    ? [
+        ...aiInsight.actionSuggestions
+          .map(a => `${String(a?.title || '').trim()}${a?.nextStep ? '：' + String(a.nextStep).trim() : ''}`)
+          .filter(Boolean),
+        ...actionItems,
+      ]
+    : actionItems;
 
   return {
     ...current,
@@ -981,17 +1142,24 @@ function enrichReportData(type, current, previous) {
     platformMatrix,
     sentimentStructure,
     dashboardCards,
-    executiveSummary,
-    actionItems,
+    executiveSummary: execSummary,
+    actionItems: finalActionItems,
+    aiInsight,
     collectionRecommendations,
   };
+}
+
+// 看板按需触发的 AI 研判(独立于看板加载,避免每次打开都跑 LLM)
+export async function generateOpinionInsight({ tenantId, periodStart, periodEnd }) {
+  const stats = await getReportStats(tenantId, periodStart, periodEnd);
+  return await buildAiOpinionInsight(tenantId, stats);
 }
 
 export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd }) {
   const previous = previousPeriod(periodStart, periodEnd);
   const currentStats = await getReportStats(tenantId, periodStart, periodEnd);
   const previousStats = await getReportStats(tenantId, previous.start, previous.end);
-  return enrichReportData('dashboard', currentStats, previousStats);
+  return await enrichReportData('dashboard', currentStats, previousStats, tenantId);
 }
 
 function styleBlock() {
@@ -1665,15 +1833,76 @@ function buildDataDashboardHTML(title, periodLabel, stats) {
     </main>`;
 }
 
+// 把按日趋势聚合成不超过 maxBuckets 个桶(月报趋势按周/段聚合,避免 30 个日点拥挤)
+function bucketTrend(rows = [], maxBuckets = 6) {
+  if (rows.length <= maxBuckets) return rows;
+  const size = Math.ceil(rows.length / maxBuckets);
+  const out = [];
+  for (let i = 0; i < rows.length; i += size) {
+    const chunk = rows.slice(i, i + size);
+    out.push({
+      label: chunk.length > 1 ? `${chunk[0].label}~${chunk[chunk.length - 1].label}` : chunk[0].label,
+      total: chunk.reduce((s, r) => s + num(r.total), 0),
+      negative: chunk.reduce((s, r) => s + num(r.negative), 0),
+    });
+  }
+  return out;
+}
+
 function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
+  const type = stats.reportKind || 'daily';
+  const typeLabel = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
   const kpis = stats.dashboardCards.slice(0, 6);
+  const P = 'margin:0;color:#374151;font-size:13px;line-height:1.7;';
+
+  const sm = stats.sentimentMap || {}, psm = stats.previousSentimentMap || {};
+  const nsr = (num(sm.positive) + num(sm.negative)) ? Math.round((num(sm.positive) - num(sm.negative)) / (num(sm.positive) + num(sm.negative)) * 100) : 0;
+  const pnsr = (num(psm.positive) + num(psm.negative)) ? Math.round((num(psm.positive) - num(psm.negative)) / (num(psm.positive) + num(psm.negative)) * 100) : 0;
+  const w = stats.workflowStats || {};
+  const dispatched = num(w.issue_linked), inbox = num(w.active_inbox);
+  const dispatchRate = (inbox + dispatched) ? Math.round(dispatched / (inbox + dispatched) * 100) : 0;
+  const officialRate = num(stats.total) ? Math.round(num(stats.officialPeriod?.record_count) / num(stats.total) * 100) : 0;
+  const repeatIssues = (stats.topIssues || []).filter(i => num(i.record_count) > 1);
+  const trendBars = (rows, n) => renderBarRows((rows || []).slice(-n), { labelKey: 'label', valueKey: 'total', color: '#2563EB', maxRows: n });
+  const driftLine = `负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})`;
+  const closeLine = `转工单率 ${dispatchRate}% · 官方响应率 ${officialRate}% · 当前待处理 ${n0(inbox)} 条`;
+
+  let body = '';
+  if (type === 'weekly') {
+    body = `
+      ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
+      ${renderSection('本周声量趋势', trendBars(stats.volumeTrend, 7), '按日聚合')}
+      ${renderSection('情感漂移', `<p style="${P}">${escHtml(driftLine)}</p>`, '本周 vs 上周')}
+      ${renderSection('处置闭环', `<p style="${P}">${escHtml(closeLine)}</p>`, '监测 → 处置效率')}
+      ${renderSection('行动建议', renderList(stats.actionItems.slice(0, 6), true), '')}
+      ${renderSection('本周 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 5), '暂无重点风险内容'), '')}
+      ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}`;
+  } else if (type === 'monthly') {
+    body = `
+      ${renderSection('管理层复盘摘要', renderList(stats.executiveSummary), '')}
+      ${renderSection('月度声量趋势', trendBars(bucketTrend(stats.volumeTrend, 6), 6), '分段聚合,避免日点拥挤')}
+      ${renderSection('月度复盘', `<p style="${P}">处置效率:转工单率 ${dispatchRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置效率 + 口碑环比')}
+      ${repeatIssues.length ? renderSection('重复发酵问题', renderIssues(repeatIssues.slice(0, 8)), '关联多条内容/多次出现的问题,需根因处理') : ''}
+      ${renderSection('下月策略建议', renderList(stats.actionItems, true), '按优先级执行')}
+      ${renderSection('本月 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 6), '暂无重点风险内容'), '')}`;
+  } else {
+    body = `
+      ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
+      ${renderSection('近 14 天声量趋势', trendBars(stats.trailingTrend, 14), '滚动窗口,定位当日异动')}
+      ${renderSection('今日行动建议', renderList(stats.actionItems.slice(0, 5), true), '')}
+      ${renderSection('当日 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 4), '暂无重点风险内容'), '')}
+      ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}
+      ${renderSection('官方响应概况', `<p style="${P}">本周期官方响应 ${n0(stats.officialPeriod.response_count)} 条,覆盖 ${n0(stats.officialPeriod.record_count)} 条内容;当前待处理/待复核 ${n0(inbox)} 条。</p>`, '')}`;
+  }
+
   return `${styleBlock()}
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif; max-width:760px; margin:0 auto; background:#F6F8FB; padding:18px; color:#111827;">
       <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:10px; overflow:hidden;">
         <div style="padding:22px 24px; border-bottom:1px solid #E5E7EB;">
-          <div style="font-size:12px; color:#2563EB; font-weight:800;">StarVoice 星语 · 邮件摘要</div>
+          <div style="font-size:12px; color:#2563EB; font-weight:800;">StarVoice 星语 · ${escHtml(typeLabel)}</div>
           <h1 style="margin:8px 0 8px; font-size:22px; line-height:1.3;">${escHtml(title)}</h1>
           <div style="font-size:13px; color:#6B7280;">${escHtml(periodLabel)} · 风险等级：<strong style="color:${stats.riskColor}">${escHtml(stats.riskLabel)}</strong>${reportId ? ` · 报告ID ${escHtml(reportId)}` : ''}</div>
+          <div style="margin-top:6px; font-size:12px; color:#9CA3AF;">${escHtml(reportFocus(type))}</div>
         </div>
         <div style="padding:20px 24px;">
           <div class="report-grid" style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px;">
@@ -1683,11 +1912,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
               ${card.delta ? `<div style="font-size:12px; color:#6B7280;">较上期 ${escHtml(card.delta.value)}</div>` : ''}
             </div>`).join('')}
           </div>
-          ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
-          ${renderSection('行动建议', renderList(stats.actionItems.slice(0, 5), true), '')}
-          ${renderSection('TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 4), '暂无重点风险内容'), '')}
-          ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}
-          ${renderSection('官方响应概况', `<p style="margin:0;color:#374151;font-size:13px;line-height:1.7;">本周期记录官方响应 ${n0(stats.officialPeriod.response_count)} 条，覆盖 ${n0(stats.officialPeriod.record_count)} 条内容；当前待处理/待复核线索 ${n0(stats.workflowStats.active_inbox)} 条。</p>`, '')}
+          ${body}
           <div style="margin-top:22px; padding:12px; background:#F9FAFB; border-radius:8px; color:#6B7280; font-size:12px; line-height:1.7;">完整图表、词云、评论样本和处置看板请在后台「报告中心」打开预览。若邮件发送失败，请检查系统设置中的 SMTP 与收件人配置。</div>
         </div>
       </div>
@@ -1747,7 +1972,7 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
 
   const currentStats = await getReportStats(tenantId, start, end);
   const previousStats = await getReportStats(tenantId, previous.start, previous.end);
-  const stats = enrichReportData(type, currentStats, previousStats);
+  const stats = await enrichReportData(type, currentStats, previousStats, tenantId);
   const typeLabel = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
   const title = `StarVoice 星语舆情${typeLabel}`;
   const periodLabel = `${dateLabel(start)} - ${dateLabel(end)}`;

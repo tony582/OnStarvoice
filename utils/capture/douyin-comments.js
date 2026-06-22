@@ -769,6 +769,26 @@ async function prepareCommentContainer(
           captureContext,
         });
       }
+      // 本 fork 自加(图文/视频 DOM 差异,MediaClaw 合并上游务必保留):图文 note 详情右侧是
+      // 「相关推荐 | 评论」双 tab,切到「评论」后 comment-list 常因面板折叠(高度 0)过不了
+      // 可见性判定 → 代码退回去误抓「相关推荐」那一列、把推荐当评论滚 → 评论采成 0(且不稳定)。
+      // 只要 DOM 里已有"含评论项"的 comment-list,就直接用它,绝不回落到推荐列。
+      await wait(500);
+      const collapsedCommentList = document.querySelector(
+        '[data-e2e="comment-list"], .comment-mainContent',
+      );
+      if (
+        collapsedCommentList &&
+        collapsedCommentList.querySelector(
+          '[data-e2e="comment-item"], [data-comment-id], [class*="comment-item"]',
+        )
+      ) {
+        setCommentOpenStrategy(
+          captureContext,
+          "content_tab_collapsed_comment_list",
+        );
+        return collapsedCommentList;
+      }
     }
 
     if (!isDouyinNoteDetailPage()) {
@@ -1966,11 +1986,7 @@ function scoreCommentContainerCandidate(
   depth = 0,
   scene = COMMENT_SCENE.DETAIL_BOTTOM,
 ) {
-  if (!node || !isElementVisible(node)) return 0;
-  if (!isVisibleDouyinCommentSurface(node)) return 0;
-
-  const rect = safeRect(node);
-  if (rect.width < 100 || rect.height < 60) return 0;
+  if (!node) return 0;
 
   const profile = resolveCommentSceneProfile(scene);
   const itemCount = Math.max(
@@ -1979,20 +1995,39 @@ function scoreCommentContainerCandidate(
     collectCommentCandidateNodesByStructure(node, scene).length,
   );
   const containerText = cleanText(node.textContent || "");
-  const hasCommentText = /评论/.test(containerText);
-  const hasSingleCommentSignals =
-    itemCount >= 1 &&
-    /(回复|展开\d+条回复|刚刚|\d+分钟前|\d+小时前|\d+天前|\d+周前|\d+月前|\d+年前)/.test(
-      containerText,
-    );
-  if (itemCount < 1 && !hasCommentText) return 0;
-  if (itemCount < 2 && !hasCommentText && !hasSingleCommentSignals) return 0;
 
-  let score = itemCount * 10;
+  // 本 fork 自加(图文/视频 DOM 差异,MediaClaw 合并上游务必保留):
+  // 真正的评论容器一定"含评论项"。图文 note 的评论面板常折叠(高度 0、isElementVisible=false),
+  // 旧判定因"不可见/太矮"把它判 0,转而把【可见、可滚、且带「评论」tab 文字的"相关推荐"列】当评论区
+  // → 推荐当评论滚、评论采成 0(且时灵时不灵)。修法:
+  //   ① 含评论项 → 这就是评论区,即便折叠(高度 0)也接受;
+  //   ② 无评论项 → 必须有"全部评论/评论区/留下你的精彩评论吧"这类强信号(仅含「评论」二字不算,
+  //      相关推荐 tab 也带「评论」),否则判 0,从根上排除相关推荐列。
+  if (itemCount < 1) {
+    if (!isElementVisible(node) || !isVisibleDouyinCommentSurface(node)) return 0;
+    const rect0 = safeRect(node);
+    if (rect0.width < 100 || rect0.height < 60) return 0;
+    if (!/全部评论|评论区|留下你的精彩评论吧/.test(containerText)) return 0;
+    return 5;
+  }
+
+  let score = itemCount * 10 + 10;
   if (isScrollableContainer(node)) score += 18;
   if (/全部评论|评论区|留下你的精彩评论吧/.test(containerText)) score += 8;
   if (node.querySelector?.('[placeholder*="评论"]')) score += 4;
-  if (itemCount >= 1) score += 10;
+  // 本 fork 自加:精准锁定"干净的评论根容器"。图文 note 详情里,外层壳会同时包住
+  // 「相关推荐」+「评论」两个 tab、评论项也被它统计到 → 若按 itemCount 排序会选中外层壳、
+  // 滚动时又滚到推荐。故:① 自身即 comment-list / comment-mainContent → 主导加分;
+  // ② 容器文本里含「相关推荐」(说明它是包住两个 tab 的外层壳,非干净评论区)→ 重罚。
+  if (
+    node.matches?.(
+      '[data-e2e="comment-list"], [data-e2e*="comment-list"], .comment-mainContent, [class*="comment-list"], [class*="CommentList"]',
+    )
+  ) {
+    score += 100;
+  } else if (/相关推荐/.test(containerText)) {
+    score -= 100;
+  }
   score -= depth * 2;
   return score;
 }
@@ -2348,6 +2383,29 @@ function collectVisibleComments(
     candidates = Array.from(listParent.children).filter(
       (node) => node instanceof Element && isElementVisible(node),
     );
+  }
+
+  // ── 抖音过采根治(本 fork 自加;MediaClaw 合并上游时务必保留)──────────────────
+  // 实测(对着真实 DOM 查证):右侧推荐视频(data-e2e="related-video")、页脚
+  // (data-e2e="page-footer")都在评论区容器【之外】,且不带 comment-item 标记;而启发式
+  // 收集器(按头像/用户名/结构找"像评论的")会把它们误收进来。这里把候选【正向圈定】在
+  // [data-e2e="comment-list"] 内,从根上杜绝越界刮到推荐流/页脚。容器不存在时不过滤(保原行为)。
+  {
+    let commentListRoot = null;
+    if (container instanceof Element) {
+      commentListRoot = container.matches('[data-e2e="comment-list"]')
+        ? container
+        : (container.closest('[data-e2e="comment-list"]') ||
+           container.querySelector('[data-e2e="comment-list"]'));
+    }
+    if (!commentListRoot) {
+      commentListRoot = document.querySelector('[data-e2e="comment-list"]');
+    }
+    if (commentListRoot) {
+      candidates = candidates.filter(
+        (node) => node instanceof Element && commentListRoot.contains(node),
+      );
+    }
   }
 
   if (scene === COMMENT_SCENE.CONTENT_FEED) {

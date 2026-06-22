@@ -144,6 +144,7 @@ export async function captureBloggerNotes({
   maxDetectedItems = null,
   maxItems = null,
   keywordFilter = "",
+  deferKeywordFilter = false,
   waitMinMs = DEFAULT_CONFIG.SCROLL_DELAY_MIN,
   waitMaxMs = DEFAULT_CONFIG.SCROLL_DELAY_MAX,
   stallTimeoutMs = 3000,
@@ -208,7 +209,10 @@ export async function captureBloggerNotes({
         Math.ceil(normalizedMaxDetectedItems / 2),
       ),
     );
+    const parsedKeywords = parseKeywordFilter(keywordFilter);
+    const shouldFilterByListTitle = parsedKeywords.length && !deferKeywordFilter;
     const noteMap = new Map();
+    const emittedCheckpointKeys = new Set();
     let progressStats = {
       detectedCount: 0,
       qualifiedCount: 0,
@@ -232,6 +236,81 @@ export async function captureBloggerNotes({
       });
     };
 
+    const buildFilteredItems = () => {
+      const allItems = Array.from(noteMap.values());
+      const likesFiltered = allItems.filter(
+        (item) => item.likes >= normalizedMinLikes,
+      );
+      const filteredItems = shouldFilterByListTitle
+        ? likesFiltered.filter((item) =>
+            matchesKeywordFilter(item.title || "", parsedKeywords),
+          )
+        : likesFiltered;
+      return filteredItems
+        .slice(0, normalizedMaxDetectedItems)
+        .map((item) => ({
+          ...item,
+          bloggerFollowersCount: resolvedMetrics.followersCount,
+          bloggerLikedAndCollectedCount: resolvedMetrics.likedAndCollectedCount,
+          bloggerProfileUrl: resolvedMetrics.profileUrl || window.location.href,
+          bloggerMetricsCaptureStatus: resolvedMetrics.captureStatus,
+          bloggerMetricsCaptureError: resolvedMetrics.captureError,
+          bloggerAccountType: resolvedMetrics.accountType,
+        }));
+    };
+
+    const emitListCheckpoint = () => {
+      if (!onProgress) return;
+      const checkpointItems = buildFilteredItems().filter((item) => {
+        const key = String(item.noteId || item.url || "").trim();
+        if (!key || emittedCheckpointKeys.has(key)) return false;
+        emittedCheckpointKeys.add(key);
+        return true;
+      });
+      if (checkpointItems.length === 0) return;
+
+      emitProgress({
+        phase: "list_checkpoint",
+        message: `正在加载博主作品`,
+        listCheckpoint: {
+          type: SYNC_TYPE.BLOGGER_NOTES,
+          platform: "xiaohongshu",
+          items: checkpointItems,
+          payload: {
+            bloggerName,
+            bloggerId,
+            bloggerUrl: window.location.href,
+            bloggerFollowersCount: resolvedMetrics.followersCount,
+            bloggerLikedAndCollectedCount: resolvedMetrics.likedAndCollectedCount,
+            bloggerProfileUrl: resolvedMetrics.profileUrl || window.location.href,
+            bloggerMetricsCaptureStatus: resolvedMetrics.captureStatus,
+            bloggerMetricsCaptureError: resolvedMetrics.captureError,
+            bloggerAccountType: resolvedMetrics.accountType,
+            sourceTab: activeTab.key,
+            sourceTabLabel: activeTab.label,
+            totalCount: checkpointItems.length,
+            rawTotalCount: progressStats.detectedCount,
+            minLikes: normalizedMinLikes,
+            maxDetectedItems: normalizedMaxDetectedItems,
+            keywordFilter: keywordFilter || "",
+            keywordFilterMode:
+              deferKeywordFilter && parsedKeywords.length ? "detail" : "title",
+            filteredCount: checkpointItems.length,
+            filteredBeforeLimitCount: progressStats.qualifiedCount,
+            items: checkpointItems,
+            captureTimestamp: Date.now(),
+          },
+          meta: {
+            pageType: PAGE_TYPE.BLOGGER_PROFILE,
+            captureStartedAt,
+            sourceUrl: window.location.href,
+            sourceTab: activeTab.key,
+            sourceTabLabel: activeTab.label,
+          },
+        },
+      });
+    };
+
     const collectDetectedNotes = () => {
       mergeNotesIntoMap(noteMap, extractNoteCards(bloggerName, activeTab));
       const allItems = Array.from(noteMap.values());
@@ -243,6 +322,7 @@ export async function captureBloggerNotes({
         qualifiedCount,
         filteredCount: Math.min(qualifiedCount, normalizedMaxDetectedItems),
       };
+      emitListCheckpoint();
       return progressStats.detectedCount;
     };
 
@@ -306,11 +386,8 @@ export async function captureBloggerNotes({
     // 提取全量笔记后按条件筛选入池
     collectDetectedNotes();
     const allItems = Array.from(noteMap.values());
-    const parsedKeywords = parseKeywordFilter(keywordFilter);
-    const likesFiltered = allItems.filter(
-      (item) => item.likes >= normalizedMinLikes,
-    );
-    const filteredItems = parsedKeywords.length
+    const likesFiltered = allItems.filter((item) => item.likes >= normalizedMinLikes);
+    const filteredItems = shouldFilterByListTitle
       ? likesFiltered.filter((item) =>
           matchesKeywordFilter(item.title || "", parsedKeywords),
         )
@@ -322,17 +399,7 @@ export async function captureBloggerNotes({
     const zeroMetricCount = metricCounts.filter((count) => count === 0).length;
     const metricExtractionSuspicious =
       allItems.length > 0 && maxMetricCount === 0;
-    const items = filteredItems
-      .slice(0, normalizedMaxDetectedItems)
-      .map((item) => ({
-        ...item,
-        bloggerFollowersCount: resolvedMetrics.followersCount,
-        bloggerLikedAndCollectedCount: resolvedMetrics.likedAndCollectedCount,
-        bloggerProfileUrl: resolvedMetrics.profileUrl || window.location.href,
-        bloggerMetricsCaptureStatus: resolvedMetrics.captureStatus,
-        bloggerMetricsCaptureError: resolvedMetrics.captureError,
-        bloggerAccountType: resolvedMetrics.accountType,
-      }));
+    const items = buildFilteredItems();
 
     // 构建 payload
     const payload = {
@@ -352,6 +419,7 @@ export async function captureBloggerNotes({
       minLikes: normalizedMinLikes,
       maxDetectedItems: normalizedMaxDetectedItems,
       keywordFilter: keywordFilter || "",
+      keywordFilterMode: deferKeywordFilter && parsedKeywords.length ? "detail" : "title",
       filteredCount: items.length,
       filteredBeforeLimitCount: filteredItems.length,
       items,

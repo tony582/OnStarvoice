@@ -123,6 +123,7 @@ export async function captureKeywordNotes({
     };
     let lastGrowthAt = Date.now();
     let lastObservedCount = 0;
+    const emittedCheckpointKeys = new Set();
 
     const emitProgress = (progress = {}) => {
       if (!onProgress) return;
@@ -138,6 +139,58 @@ export async function captureKeywordNotes({
         sortDimensionLabel,
         sortDimensionSource,
         maxDetectedItems: normalizedMaxDetectedItems,
+      });
+    };
+
+    const buildFilteredItems = () => {
+      const allItems = Array.from(noteMap.values());
+      const filteredItems = allItems.filter(
+        (item) =>
+          getKeywordMetricCountByDimension(item, resolvedSortDimension) >=
+          normalizedMinLikes,
+      );
+      return filteredItems.slice(0, normalizedMaxDetectedItems);
+    };
+
+    const emitListCheckpoint = () => {
+      if (!onProgress) return;
+      const checkpointItems = buildFilteredItems().filter((item) => {
+        const key = String(item.noteId || item.url || "").trim();
+        if (!key || emittedCheckpointKeys.has(key)) return false;
+        emittedCheckpointKeys.add(key);
+        return true;
+      });
+      if (checkpointItems.length === 0) return;
+
+      emitProgress({
+        phase: "list_checkpoint",
+        message: "正在加载搜索结果",
+        listCheckpoint: {
+          type: SYNC_TYPE.KEYWORD_NOTES,
+          platform: "xiaohongshu",
+          items: checkpointItems,
+          payload: {
+            keyword,
+            searchUrl: window.location.href,
+            totalCount: checkpointItems.length,
+            rawTotalCount: progressStats.detectedCount,
+            minLikes: normalizedMinLikes,
+            minInteraction: normalizedMinLikes,
+            sortDimension: resolvedSortDimension,
+            sortDimensionLabel,
+            sortDimensionSource,
+            maxDetectedItems: normalizedMaxDetectedItems,
+            filteredCount: checkpointItems.length,
+            filteredBeforeLimitCount: progressStats.qualifiedCount,
+            items: checkpointItems,
+            captureTimestamp: Date.now(),
+          },
+          meta: {
+            pageType: PAGE_TYPE.SEARCH_RESULTS,
+            captureStartedAt,
+            sourceUrl: window.location.href,
+          },
+        },
       });
     };
 
@@ -158,6 +211,7 @@ export async function captureKeywordNotes({
         qualifiedCount,
         filteredCount: Math.min(qualifiedCount, normalizedMaxDetectedItems),
       };
+      emitListCheckpoint();
       return progressStats.detectedCount;
     };
 
@@ -187,7 +241,7 @@ export async function captureKeywordNotes({
           return {
             stop: true,
             reason: "max_items",
-            message: `达到关键词笔记探测上限（已探测 ${progressStats.detectedCount}/${normalizedMaxDetectedItems} 条，已筛选 ${progressStats.filteredCount} 条）`,
+            message: `达到关键词笔记加载上限（已加载 ${progressStats.detectedCount}/${normalizedMaxDetectedItems} 条，已筛选 ${progressStats.filteredCount} 条）`,
           };
         }
 
@@ -204,7 +258,7 @@ export async function captureKeywordNotes({
           return {
             stop: true,
             reason: "stall_timeout",
-            message: `连续 ${noNewContentCount} 轮、约 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已探测 ${progressStats.detectedCount} 条，已筛选 ${progressStats.filteredCount} 条）`,
+            message: `连续 ${noNewContentCount} 轮、约 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已加载 ${progressStats.detectedCount} 条，已筛选 ${progressStats.filteredCount} 条）`,
           };
         }
         return {stop: false};
@@ -224,7 +278,7 @@ export async function captureKeywordNotes({
         getKeywordMetricCountByDimension(item, resolvedSortDimension) >=
         normalizedMinLikes,
     );
-    const items = filteredItems.slice(0, normalizedMaxDetectedItems);
+    const items = buildFilteredItems();
     const missingMetricCount = countMissingMetric(
       allItems,
       normalizeSortDimension(resolvedSortDimension),

@@ -3,6 +3,9 @@ import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
 import { collectRecordMediaUrls, isAllowedMediaHost, streamMediaToResponse } from '../services/media-proxy.js';
+import { startTranscription } from '../services/transcription.js';
+import { analyzeTranscript } from '../services/transcript-analysis.js';
+import { formatPublishDate } from '../services/publish-date.js';
 
 const router = Router();
 
@@ -224,6 +227,7 @@ router.get('/:id/comments', requireTenantAccess, async (req, res, next) => {
     if (!await ensureRecord(req, res)) return;
     const comments = await getRecordComments(req.tenantId, req.params.id);
     const officialResponses = await getOfficialResponses(req.tenantId, req.params.id);
+    comments.forEach(c => { c.publish_display = formatPublishDate(c.published_at, c.created_at); });
     return res.json({ ok: true, comments, officialResponses });
   } catch (err) {
     return next(err);
@@ -296,6 +300,56 @@ router.get('/:id/media-proxy', requireTenantAccess, async (req, res, next) => {
     }
 
     return streamMediaToResponse({ url, filename, platform: record.platform, res });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/** 逐字稿状态查询(供前端轮询)。GET /api/records/:id/transcript */
+router.get('/:id/transcript', requireTenantAccess, async (req, res, next) => {
+  try {
+    const row = await queryOne(
+      `SELECT transcript_status, transcript, transcript_lang, transcript_error, transcript_updated_at,
+              transcript_analysis, transcript_analysis_at
+       FROM records WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, req.tenantId],
+    );
+    if (!row) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    return res.json({ ok: true, ...row });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * 触发视频逐字稿转写(异步)。POST /api/records/:id/transcribe
+ * 置 pending 并后台调百炼转写,前端轮询记录状态字段(transcript_status/transcript)。
+ * 权限:与「下载附件」(media-proxy)一致用 requireTenantAccess——同为"从记录派生内容",
+ * 任何能查看该记录的成员都可生成(非敏感写操作)。
+ */
+router.post('/:id/transcribe', requireTenantAccess, async (req, res, next) => {
+  try {
+    const result = await startTranscription({ tenantId: req.tenantId, recordId: req.params.id });
+    if (!result.ok && result.error === 'not_found') {
+      return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    }
+    return res.json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * 对逐字稿做 AI 舆情分析(同步)。POST /api/records/:id/analyze-transcript
+ * 需先有逐字稿;结果存 records.transcript_analysis,GET /transcript 一并返回。
+ */
+router.post('/:id/analyze-transcript', requireTenantAccess, async (req, res, next) => {
+  try {
+    const result = await analyzeTranscript({ tenantId: req.tenantId, recordId: req.params.id });
+    if (!result.ok && result.error === 'not_found') return res.status(404).json(result);
+    if (!result.ok && result.error === 'no_transcript') return res.status(400).json(result);
+    if (!result.ok) return res.status(502).json(result);
+    return res.json(result);
   } catch (err) {
     return next(err);
   }
