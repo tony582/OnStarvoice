@@ -89,6 +89,22 @@ export async function requireTenantAccess(req, res, next) {
   }
 }
 
+// 内容创意等"扩展端跑、后台也读"的接口:带授权码(扩展端,api.js 把 code 放在 body)→ 按授权码定租户,
+// 与 /api/sync 一致;否则(后台会话)→ 会话 + 选中租户。
+// 修复:内容创意原用 requireTenantAccess,会话存在时只取"账号第一个成员租户",忽略授权码 →
+// 数据落到登录账号的首个租户(如 OnStar)而非授权码对应租户。
+export async function requireAuthCodeFirst(req, res, next) {
+  const authCode =
+    req.headers['x-auth-code'] ||
+    req.body?.authCode ||
+    req.body?.code ||
+    req.query?.authCode ||
+    req.query?.code ||
+    '';
+  if (authCode) return requireAuth(req, res, next);
+  return requireTenantAccess(req, res, next);
+}
+
 /**
  * 扩展端 / 用户端鉴权中间件
  */

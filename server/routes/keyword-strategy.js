@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { requireTenantAccess } from '../middleware/auth.js';
+import { requireTenantAccess, requireAuthCodeFirst } from '../middleware/auth.js';
 import { callLLMWithPrompt } from '../services/ai-labeler.js';
 import { execute } from '../db/init.js';
 
@@ -531,7 +531,7 @@ async function enhanceKeywordAnalysisWithAI(tenantId, fallback, payload) {
   }
 }
 
-keywordOpportunityRouter.post('/', requireTenantAccess, async (req, res, next) => {
+keywordOpportunityRouter.post('/', requireAuthCodeFirst, async (req, res, next) => {
   try {
     const keyword = cleanText(req.body?.keyword || req.body?.seedKeyword || '', 80);
     const platform = cleanText(req.body?.platform || '', 40);
@@ -555,7 +555,7 @@ keywordOpportunityRouter.post('/', requireTenantAccess, async (req, res, next) =
   }
 });
 
-keywordAnalysisRouter.post('/', requireTenantAccess, async (req, res, next) => {
+keywordAnalysisRouter.post('/', requireAuthCodeFirst, async (req, res, next) => {
   try {
     const seedKeyword = cleanText(req.body?.seedKeyword || req.body?.keyword || '', 80);
     const platform = cleanText(req.body?.platform || '', 40);
@@ -714,7 +714,7 @@ async function enhanceBenchmarkWithAI(tenantId, fallback, payload) {
   }
 }
 
-benchmarkDiscoveryRouter.post('/', requireTenantAccess, async (req, res, next) => {
+benchmarkDiscoveryRouter.post('/', requireAuthCodeFirst, async (req, res, next) => {
   try {
     const keyword = cleanText(req.body?.keyword || '', 80);
     const platform = cleanText(req.body?.platform || '', 40);
