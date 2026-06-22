@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { requireTenantAccess, requireAuthCodeFirst } from '../middleware/auth.js';
 import { callLLMWithPrompt } from '../services/ai-labeler.js';
-import { execute } from '../db/init.js';
+import { execute, getSetting } from '../db/init.js';
 
 const keywordOpportunityRouter = Router();
 export const keywordAnalysisRouter = Router();
@@ -33,7 +33,7 @@ function persistKeywordExpansion(tenantId, seedKeyword, platform, keywordCount, 
     .catch(err => console.warn('[ContentStudio] persist keyword_expansion failed:', err.message));
 }
 
-const TOPIC_DEFINITIONS = [
+const AUTOMOTIVE_TOPIC_DEFINITIONS = [
   {
     id: 'billing',
     name: '价格/续费/套餐价值',
@@ -84,13 +84,85 @@ const TOPIC_DEFINITIONS = [
   },
 ];
 
-const LONGTAIL_CATEGORIES = [
+const AUTOMOTIVE_LONGTAIL_CATEGORIES = [
   { id: 'problem', icon: '!', name: '问题排查', terms: ['不能', '失败', '报错', '故障', '失效', '打不开', '登录', '绑定', '闪退', '没反应'] },
   { id: 'howto', icon: '?', name: '使用教程', terms: ['怎么', '如何', '教程', '设置', '打开', '关闭', '绑定', '激活', '使用'] },
   { id: 'billing', icon: '¥', name: '价格续费', terms: ['收费', '续费', '价格', '套餐', '免费', '到期', '会员', '贵', '流量'] },
   { id: 'compare', icon: '=', name: '对比决策', terms: ['对比', '区别', '哪个好', '值不值', '有用吗', '必要吗', '推荐'] },
   { id: 'scenario', icon: '#', name: '场景需求', terms: ['远程启动', '定位', '救援', '车况', '车机', '钥匙', '隐私', '安全'] },
 ];
+
+// 行业中性分类法(非汽车租户用)。安吉星等汽车租户经 content_topic_profile='automotive' 仍走上面的 AUTOMOTIVE_*,逐字节不变。
+const GENERIC_TOPIC_DEFINITIONS = [
+  {
+    id: 'price_value',
+    name: '价格/性价比',
+    terms: ['价格', '多少钱', '贵', '便宜', '性价比', '值不值', '划算', '优惠', '套餐', '会员', '免费', '收费'],
+    userIntent: '用户想判断值不值得买、花费是否合理，以及不同选择的差别。',
+    whyItWorks: '价格和价值类内容天然带决策压力，容易引发讨论、对比和真实经验补充。',
+    organicNote: '适合用真实花费、权益清单和对比做自然流量内容。',
+  },
+  {
+    id: 'howto',
+    name: '使用教程/上手攻略',
+    terms: ['怎么', '如何', '教程', '攻略', '新手', '入门', '步骤', '技巧', '设置', '使用'],
+    userIntent: '用户想知道怎么用、怎么选、怎么上手。',
+    whyItWorks: '教程类搜索意图明确，能直接解决问题，也容易沉淀为长期流量。',
+    organicNote: '适合做步骤化教程、避坑指南和真实场景演示。',
+  },
+  {
+    id: 'trouble',
+    name: '问题排查/避坑',
+    terms: ['不好', '踩坑', '避雷', '问题', '缺点', '翻车', '后悔', '失望', '难用', '不能用', '故障', '吐槽'],
+    userIntent: '用户想确认有没有坑、值不值得入手。',
+    whyItWorks: '痛点内容评论区活跃，是口碑管理和选题都要关注的方向。',
+    organicNote: '适合用“现象-原因-建议”的结构展开。',
+  },
+  {
+    id: 'experience',
+    name: '真实体验/测评',
+    terms: ['体验', '测评', '分享', '日常', '真实', '实测', '打卡', '种草', '好用', '推荐', '回购'],
+    userIntent: '用户想看真实评价，而不是只看官方宣传。',
+    whyItWorks: '体验型内容门槛低，容易带出评论互动，也能承接种草和避坑需求。',
+    organicNote: '适合用短故事、前后对比和真实使用感受展开。',
+  },
+  {
+    id: 'compare',
+    name: '对比/选择',
+    terms: ['对比', '区别', '哪个好', '排行', '榜', '还是', '选择', '推荐', '必买'],
+    userIntent: '用户在多个选项之间做决策。',
+    whyItWorks: '对比内容直击决策环节，转化和互动都强。',
+    organicNote: '适合做横评、清单和排行型内容。',
+  },
+  {
+    id: 'brand',
+    name: '品牌/官方/活动',
+    terms: ['官方', '品牌', '新品', '上新', '活动', '联名', '门店', '旗舰店', '快闪', '限定'],
+    userIntent: '用户想了解品牌动态、新品和活动信息。',
+    whyItWorks: '品牌官方内容有利于聚拢精准人群，适合承接新品种草和口碑回应。',
+    organicNote: '适合做新品发布、活动种草和门店打卡内容。',
+  },
+];
+
+const GENERIC_LONGTAIL_CATEGORIES = [
+  { id: 'problem', icon: '!', name: '问题排查', terms: ['不好', '踩坑', '避雷', '缺点', '翻车', '后悔', '问题', '失望', '难用'] },
+  { id: 'howto', icon: '?', name: '使用教程', terms: ['怎么', '如何', '教程', '攻略', '新手', '步骤', '技巧', '设置'] },
+  { id: 'billing', icon: '¥', name: '价格性价比', terms: ['价格', '多少钱', '贵', '便宜', '值不值', '优惠', '套餐', '划算', '免费'] },
+  { id: 'compare', icon: '=', name: '对比决策', terms: ['对比', '区别', '哪个好', '排行', '推荐', '值不值', '必买'] },
+  { id: 'scenario', icon: '#', name: '场景需求', terms: ['适合', '场景', '什么时候', '送礼', '自用', '日常', '聚会', '出行'] },
+];
+
+// 内容创意分类法按租户切换:automotive(安吉星等车机租户)→ 原车机分类法;其它 → 行业中性。
+async function pickTopicProfile(tenantId) {
+  const profile = String((await getSetting('content_topic_profile', tenantId)) || 'generic').trim();
+  return profile === 'automotive' ? 'automotive' : 'generic';
+}
+function topicDefsFor(profile) {
+  return profile === 'automotive' ? AUTOMOTIVE_TOPIC_DEFINITIONS : GENERIC_TOPIC_DEFINITIONS;
+}
+function longtailCatsFor(profile) {
+  return profile === 'automotive' ? AUTOMOTIVE_LONGTAIL_CATEGORIES : GENERIC_LONGTAIL_CATEGORIES;
+}
 
 function cleanText(value, maxLength = 1000) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -217,11 +289,11 @@ function itemText(item) {
   return `${item.title} ${item.content} ${item.tags.join(' ')}`.toLowerCase();
 }
 
-function classifyTopic(item) {
+function classifyTopic(item, topicDefs = AUTOMOTIVE_TOPIC_DEFINITIONS) {
   const text = itemText(item);
   let best = null;
   let bestScore = 0;
-  for (const definition of TOPIC_DEFINITIONS) {
+  for (const definition of topicDefs) {
     const score = definition.terms.reduce((sum, term) => sum + (text.includes(String(term).toLowerCase()) ? 1 : 0), 0);
     if (score > bestScore) {
       best = definition;
@@ -260,10 +332,10 @@ function resolveOrganicViability(direction, metrics) {
   return 'low';
 }
 
-function buildTopicDirections(sortedItems, metrics) {
+function buildTopicDirections(sortedItems, metrics, topicDefs = AUTOMOTIVE_TOPIC_DEFINITIONS) {
   const groups = new Map();
   sortedItems.forEach(item => {
-    const topic = classifyTopic(item);
+    const topic = classifyTopic(item, topicDefs);
     if (!groups.has(topic.id)) groups.set(topic.id, { topic, items: [] });
     groups.get(topic.id).items.push(item);
   });
@@ -290,7 +362,7 @@ function buildTopicDirections(sortedItems, metrics) {
     .slice(0, 6);
 }
 
-function buildCoreSubtopics(keyword, items = []) {
+function buildCoreSubtopics(keyword, items = [], topicDefs = AUTOMOTIVE_TOPIC_DEFINITIONS) {
   const stopWords = new Set(['视频', '笔记', '分享', '教程', '官方', '一个', '这个', '怎么', '如何', keyword]);
   const scores = new Map();
   const add = (text, weight = 1) => {
@@ -301,7 +373,7 @@ function buildCoreSubtopics(keyword, items = []) {
 
   items.forEach(item => {
     item.tags.forEach(tag => add(tag, 8 + Math.log10(item.likes + 10)));
-    TOPIC_DEFINITIONS.flatMap(topic => topic.terms).forEach(term => {
+    topicDefs.flatMap(topic => topic.terms).forEach(term => {
       if (itemText(item).includes(String(term).toLowerCase())) add(term, 5 + Math.log10(item.likes + 10));
     });
     cleanText(item.title, 120)
@@ -354,11 +426,11 @@ function buildDistributionSummary(keyword, metrics, directions) {
   return `「${keyword}」当前样本呈现${heat}，主要集中在${topNames}。${cliff}。建议先从更具体的问题场景和对比/答疑型内容切入。`;
 }
 
-function buildOpportunityFallback({ keyword, platform, listItems, representativeSamples }) {
+function buildOpportunityFallback({ keyword, platform, listItems, representativeSamples }, topicDefs = AUTOMOTIVE_TOPIC_DEFINITIONS) {
   const normalizedItems = normalizeItems(listItems, representativeSamples);
   const metrics = computeRuleMetrics(normalizedItems);
-  const directions = buildTopicDirections(metrics.sortedItems, metrics);
-  const coreWinningSubtopics = buildCoreSubtopics(keyword, metrics.sortedItems);
+  const directions = buildTopicDirections(metrics.sortedItems, metrics, topicDefs);
+  const coreWinningSubtopics = buildCoreSubtopics(keyword, metrics.sortedItems, topicDefs);
   const recommendedAngles = buildRecommendedAngles(keyword, directions);
 
   return {
@@ -450,11 +522,11 @@ async function enhanceOpportunityWithAI(tenantId, fallback, payload) {
   }
 }
 
-function categorizeLongtailKeyword(keyword) {
+function categorizeLongtailKeyword(keyword, longtailCats = AUTOMOTIVE_LONGTAIL_CATEGORIES) {
   const text = cleanText(keyword, 80).toLowerCase();
   let best = null;
   let score = 0;
-  for (const category of LONGTAIL_CATEGORIES) {
+  for (const category of longtailCats) {
     const nextScore = category.terms.reduce((sum, term) => sum + (text.includes(String(term).toLowerCase()) ? 1 : 0), 0);
     if (nextScore > score) {
       best = category;
@@ -464,11 +536,11 @@ function categorizeLongtailKeyword(keyword) {
   return best || { id: 'general', icon: '+', name: '泛需求扩展', terms: [] };
 }
 
-function buildKeywordAnalysisFallback({ seedKeyword, keywords, platform }) {
+function buildKeywordAnalysisFallback({ seedKeyword, keywords, platform }, longtailCats = AUTOMOTIVE_LONGTAIL_CATEGORIES) {
   const uniqueKeywords = [...new Set(normalizeArray(keywords).map(item => cleanText(item, 60)).filter(Boolean))];
   const groups = new Map();
   uniqueKeywords.forEach(keyword => {
-    const category = categorizeLongtailKeyword(keyword);
+    const category = categorizeLongtailKeyword(keyword, longtailCats);
     if (!groups.has(category.id)) groups.set(category.id, { category, keywords: [] });
     groups.get(category.id).keywords.push(keyword);
   });
@@ -546,7 +618,8 @@ keywordOpportunityRouter.post('/', requireAuthCodeFirst, async (req, res, next) 
       return res.json({ ok: false, reason: 'insufficient_samples', message: '有效搜索结果不足，暂时无法判断主词机会' });
     }
 
-    const fallback = buildOpportunityFallback({ keyword, platform, listItems, representativeSamples });
+    const topicProfile = await pickTopicProfile(req.tenantId);
+    const fallback = buildOpportunityFallback({ keyword, platform, listItems, representativeSamples }, topicDefsFor(topicProfile));
     const data = await enhanceOpportunityWithAI(req.tenantId, fallback, { keyword, platform, listItems, representativeSamples });
     persistTrackStrategy(req.tenantId, keyword, platform, normalizedItems.length, data);
     return res.json({ ok: true, data });
@@ -567,7 +640,8 @@ keywordAnalysisRouter.post('/', requireAuthCodeFirst, async (req, res, next) => 
       return res.json({ ok: false, reason: 'insufficient_keywords', message: '缺少扩展词，无法生成长尾词需求分析' });
     }
 
-    const fallback = buildKeywordAnalysisFallback({ seedKeyword, keywords, platform });
+    const topicProfile = await pickTopicProfile(req.tenantId);
+    const fallback = buildKeywordAnalysisFallback({ seedKeyword, keywords, platform }, longtailCatsFor(topicProfile));
     const data = await enhanceKeywordAnalysisWithAI(req.tenantId, fallback, { seedKeyword, keywords, platform });
     persistKeywordExpansion(req.tenantId, seedKeyword, platform, keywords.length, data);
     return res.json({ ok: true, data });
