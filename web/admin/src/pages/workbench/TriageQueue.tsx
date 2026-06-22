@@ -3,9 +3,10 @@ import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Archive, Ban, Loader2,
   Package, User, FileText, Bell, ExternalLink,
+  ArrowUp, ArrowDown, ChevronsUpDown,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
+import { formatNumber, formatDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -36,6 +37,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
+  const [triageStatus, setTriageStatus] = useState('')
+  const [risk, setRisk] = useState('')
+  // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量、升降序
+  const [sort, setSort] = useState<{ field: 'publish' | 'interactions'; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
   const [records, setRecords] = useState<any[]>([])
   const [pagination, setPagination] = useState<Pagination | null>(null)
   const [loading, setLoading] = useState(true)
@@ -45,7 +50,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${status}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${status}|${triageStatus}|${risk}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -53,12 +58,20 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const params = new URLSearchParams({ page: String(page), pageSize: '30', sentiment, platform, keyword })
       if (status === 'archived') params.set('bucket', 'archived')
       else params.set('queue', 'active')
+      if (triageStatus) params.set('status', triageStatus)
+      if (risk) params.set('risk', risk)
+      params.set('sort', sort.field)
+      params.set('dir', sort.dir)
       const data = await api.get<any>('/triage/records?' + params)
       setRecords(data.records || [])
       setPagination(data.pagination || null)
     } catch (err) { console.error(err) }
     finally { setLoading(false) }
-  }, [status, sentiment, platform, keyword])
+  }, [status, triageStatus, risk, sentiment, platform, keyword, sort])
+
+  // 点表头排序:点未激活列 → 该列降序;再点已激活列 → 升/降序切换
+  const toggleSort = (field: 'publish' | 'interactions') =>
+    setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   useEffect(() => { load() }, [load])
 
@@ -117,6 +130,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const interactions = (r: any) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
   const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
   const someChecked = records.some(r => sel.has(r.id))
+  // 处置状态筛选项随 tab 自适应:待处理队列只有未处理/待复核,已归档桶有归档/误报/已响应
+  const triageStatusOptions: Array<[string, string]> = status === 'archived'
+    ? [['', '全部状态'], ['archived', '已归档'], ['false_positive', '误报'], ['official_responded', '官方已响应']]
+    : [['', '全部状态'], ['unhandled', '未处理'], ['reviewing', '待复核']]
 
   const narrow = false
   const drawerProps = drawerRecord ? {
@@ -139,7 +156,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 const Icon = tab.icon
                 const on = status === tab.value
                 return (
-                  <button key={tab.value} onClick={() => setStatus(tab.value)}
+                  <button key={tab.value} onClick={() => { setStatus(tab.value); setTriageStatus('') }}
                     className={cn(
                       'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12.5px] font-semibold transition-colors',
                       on ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
@@ -173,6 +190,19 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             <option value="douyin">抖音</option>
             <option value="weibo">微博</option>
           </WorkbenchSelect>
+          {view === 'list' && (
+            <>
+              <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}>
+                {triageStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+              </WorkbenchSelect>
+              <WorkbenchSelect value={risk} onChange={e => setRisk(e.target.value)}>
+                <option value="">全部风险</option>
+                <option value="alert">有预警</option>
+                <option value="negative">有负评</option>
+                <option value="koe">疑似KOE</option>
+              </WorkbenchSelect>
+            </>
+          )}
           <span className="mx-1 h-4 w-px bg-border/70" />
           <div className="inline-flex items-center gap-0.5">
             {['', 'negative', 'neutral', 'positive'].map(v => (
@@ -223,8 +253,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
-                {!narrow && <th className="px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">互动</th>}
-                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">最近</th>}
+                {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
+                {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
                 {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
@@ -328,7 +358,7 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
-      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{formatDate(r.last_seen_at || r.created_at)}</td>}
+      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
       {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
           {archived ? (
@@ -364,18 +394,44 @@ function MenuBtn({ icon: Icon, label, onClick }: { icon: React.ElementType; labe
   )
 }
 
+/* 可排序表头:点击切换该列升/降序,激活列显示实心箭头,未激活显示淡色双箭头 */
+function SortableTh({ label, field, sort, onSort, align = 'left', className = '' }: {
+  label: string
+  field: 'publish' | 'interactions'
+  sort: { field: string; dir: 'asc' | 'desc' }
+  onSort: (field: 'publish' | 'interactions') => void
+  align?: 'left' | 'right'
+  className?: string
+}) {
+  const active = sort.field === field
+  const Arrow = active ? (sort.dir === 'desc' ? ArrowDown : ArrowUp) : ChevronsUpDown
+  return (
+    <th className={cn('px-3 py-3.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground', align === 'right' ? 'text-right' : 'text-left', className)}>
+      <button onClick={() => onSort(field)} title="点击切换排序"
+        className={cn('inline-flex items-center gap-1 align-middle uppercase tracking-wider transition-colors hover:text-foreground', active && 'text-foreground')}>
+        {label}
+        <Arrow className={cn('h-3 w-3', active ? 'opacity-100' : 'opacity-30')} strokeWidth={2.5} />
+      </button>
+    </th>
+  )
+}
+
 /* 风险信号:预警 / 负面评论数 / 官方回复状态,一眼可扫 */
 function RiskSignals({ record: r }: any) {
   const alerts = Number(r.alert_count || 0)
   const neg = Number(r.negative_comment_count || 0)
   const official = r.official_response_status
-  if (!(alerts > 0 || neg > 0 || (official && official !== 'none'))) {
+  const koe = r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)
+  if (!(alerts > 0 || neg > 0 || (official && official !== 'none') || koe)) {
     return <span className="text-[11px] text-muted-foreground/40">—</span>
   }
   return (
     <div className="flex flex-wrap items-center gap-1">
       {alerts > 0 && (
-        <span className="inline-flex items-center gap-0.5 rounded bg-status-red/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-2.5 w-2.5" />预警{alerts}</span>
+        <span title={r.alert_reasons || '触发预警'} className="inline-flex cursor-help items-center gap-0.5 rounded bg-status-red/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-2.5 w-2.5" />预警{alerts}</span>
+      )}
+      {koe && (
+        <span title="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除" className="cursor-help rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
       )}
       {neg > 0 && (
         <span className="rounded bg-status-orange/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">负评{neg}</span>

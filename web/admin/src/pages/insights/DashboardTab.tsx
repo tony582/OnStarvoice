@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import cloud from 'd3-cloud'
 import {
-  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw,
+  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw, Sparkles,
 } from 'lucide-react'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -207,6 +207,9 @@ export function DashboardTab() {
           {/* 1. 执行摘要 —— 结论先行 */}
           <ExecutiveSummary s={s} />
 
+          {/* 1.5 AI 舆情研判 —— 按需触发,LLM 跨样本六维(议题/情绪/诉求/信号/建议,挂样本回链) */}
+          <AiInsightPanel range={range} start={start} end={end} />
+
           {/* 2. 声量总览与趋势 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.8fr)]">
             <Panel title="声量总览与趋势" hint={G.volume}
@@ -296,6 +299,117 @@ function Panel({ title, hint, note, children }: { title: string; hint?: string; 
         {note && <p className="mt-3 border-t border-border/50 pt-2.5 text-[11.5px] leading-5 text-muted-foreground"><span className="font-semibold text-foreground">解读 · </span>{note}</p>}
       </div>
     </section>
+  )
+}
+
+function AiInsightPanel({ range, start, end }: { range: string; start: string; end: string }) {
+  const [insight, setInsight] = useState<any>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const run = async () => {
+    setLoading(true); setError('')
+    try {
+      const params = new URLSearchParams({ range })
+      if (range === 'custom') { params.set('start', start); params.set('end', end) }
+      const r: any = await api.get('/analytics/ai-insight?' + params.toString())
+      setInsight(r?.insight || null)
+      if (!r?.insight) setError('本期代表样本不足或未配置 LLM,暂无法生成研判。')
+    } catch (e: any) {
+      setError(e?.message || '生成失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+  const map = insight?.sampleMap || {}
+  const arr = (v: any): any[] => (Array.isArray(v) ? v.filter(Boolean) : [])
+  const chips = (ids: any) => {
+    const list = arr(ids)
+    if (!list.length) return null
+    return (
+      <span className="ml-1 inline-flex flex-wrap gap-1 align-middle">
+        {list.map((id: string, i: number) => {
+          const m = map[id] || {}
+          const label = String(m.title || id).slice(0, 14)
+          return m.url
+            ? <a key={i} href={m.url} target="_blank" rel="noreferrer" className="rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-primary hover:underline">{label}</a>
+            : <span key={i} className="rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-muted-foreground">{label}</span>
+        })}
+      </span>
+    )
+  }
+  const topics = arr(insight?.topicClusters)
+  const risks = arr(insight?.sentimentAndRisks)
+  const needs = arr(insight?.userNeeds).map(String)
+  const signals = arr(insight?.brandSignals).map(String)
+  const actions = arr(insight?.actionSuggestions)
+  return (
+    <Panel title="AI 舆情研判" hint="按需触发:用 LLM 对本期代表样本做跨样本研判(议题/情绪/诉求/信号/建议),每条挂可回链原帖的样本;不随看板自动跑,省 token">
+      <div className="space-y-4 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <button onClick={run} disabled={loading}
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {insight ? '重新生成' : '生成 AI 研判'}
+          </button>
+          {!insight && !loading && !error && <span className="text-xs text-muted-foreground">把本期代表样本交给 LLM 跨样本归纳议题与处置建议</span>}
+          {error && <span className="text-xs text-rose-600 dark:text-rose-400">{error}</span>}
+        </div>
+        {insight && (
+          <>
+            {insight.heatTrend && <p className="leading-relaxed"><span className="font-semibold">热度走势 · </span>{String(insight.heatTrend)}</p>}
+            {insight.executiveSummary && <p className="rounded-md bg-muted/40 p-2.5 leading-relaxed">{String(insight.executiveSummary)}</p>}
+            {topics.length > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-bold text-muted-foreground">议题聚类</div>
+                <ul className="space-y-1.5">
+                  {topics.map((t, i) => <li key={i}><span className="font-semibold">{String(t.topic || '')}</span>{t.summary ? `：${String(t.summary)}` : ''}{chips(t.sampleIds)}</li>)}
+                </ul>
+              </div>
+            )}
+            {risks.length > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-bold text-muted-foreground">情绪与争议</div>
+                <ul className="space-y-1.5">
+                  {risks.map((r, i) => (
+                    <li key={i}>
+                      <span className={`mr-1.5 rounded px-1.5 py-0.5 text-[10.5px] font-semibold ${r.level === '高' ? 'bg-status-red/15 text-rose-700 dark:text-rose-300' : r.level === '中' ? 'bg-status-amber/20 text-amber-700 dark:text-amber-300' : 'bg-muted text-muted-foreground'}`}>{String(r.level || '—')}</span>
+                      {String(r.point || '')}{chips(r.sampleIds)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {needs.length > 0 && <InsightChips label="用户诉求" items={needs} />}
+            {signals.length > 0 && <InsightChips label="品牌信号" items={signals} />}
+            {actions.length > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-bold text-muted-foreground">处置建议</div>
+                <ul className="space-y-2">
+                  {actions.map((a, i) => (
+                    <li key={i} className="rounded-md bg-muted/40 p-2.5">
+                      <div className="font-semibold">{String(a.title || '')}{chips(a.sampleIds)}</div>
+                      {a.nextStep && <div className="mt-0.5 text-[13px]"><span className="text-muted-foreground">下一步：</span>{String(a.nextStep)}</div>}
+                      {a.rationale && <div className="mt-0.5 text-[12px] text-muted-foreground">依据：{String(a.rationale)}</div>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Panel>
+  )
+}
+
+function InsightChips({ label, items }: { label: string; items: string[] }) {
+  return (
+    <div>
+      <div className="mb-1 text-xs font-bold text-muted-foreground">{label}</div>
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((it, i) => <span key={i} className="rounded-md bg-muted px-2 py-1 text-[12.5px]">{it}</span>)}
+      </div>
+    </div>
   )
 }
 

@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
-import { classifyCommentWithAI } from './ai-labeler.js';
+import { classifyCommentWithAI, classifyCommentsBatch } from './ai-labeler.js';
 import { upsertCommentLeadForComment } from './comment-leads.js';
 
 const NEGATIVE_KEYWORDS = [
@@ -197,14 +197,11 @@ function buildCommentHash(recordId, comment) {
   return sha256(base);
 }
 
-async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount }) {
+// classification:入库用的(规则)分类。aiClassified:是否已是终判(官方评论)。
+// 评论入库不调 LLM —— 新评论先存规则分类、ai_classified_at 留 NULL,由后台 refineCommentsWithAI 精炼。
+async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification = null, aiClassified = false }) {
   const contentHash = buildCommentHash(recordId, comment);
-  const classification = await classifyCommentForWorkflow({
-    tenantId,
-    record: comment.recordContext || {},
-    comment,
-    isOfficial: Boolean(officialAccount),
-  });
+  if (!classification) classification = ruleClassificationWithMetadata(classifyComment(comment, Boolean(officialAccount)));
   let existing = null;
   if (comment.external_comment_id) {
     existing = await tx.queryOne(
@@ -220,6 +217,8 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
   }
 
   if (existing) {
+    // 已存在:只刷新元数据(点赞/内容/最近见到),不动已有分类与 ai_classified_at ——
+    // 否则重采会把后台已 AI 精炼的结果降级回规则、并把它重新标成待精炼。
     const row = await tx.queryOne(`
       UPDATE record_comments SET
         author_name = COALESCE(NULLIF($1, ''), author_name),
@@ -230,27 +229,15 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
         published_at = COALESCE(NULLIF($6, ''), published_at),
         ip_location = COALESCE(NULLIF($7, ''), ip_location),
         is_official = $8,
-        is_negative = $9,
-        sentiment = $10,
-        category = $11,
-        risk_level = $12,
-        ai_summary = $13,
-        ai_result = $14::jsonb,
-        payload = $15::jsonb,
         last_seen_at = now(),
         seen_count = seen_count + 1,
         updated_at = now()
-      WHERE id = $16
+      WHERE id = $9
       RETURNING *
     `, [
       comment.author_name, comment.author_id, comment.author_avatar, comment.content,
       comment.like_count, comment.published_at, comment.ip_location,
-      Boolean(officialAccount), classification.is_negative, classification.sentiment,
-      classification.category, classification.risk_level,
-      classificationSummary(classification),
-      JSON.stringify(classification.ai_result || {}),
-      JSON.stringify(comment.payload || {}),
-      existing.id,
+      Boolean(officialAccount), existing.id,
     ]);
     return { row, inserted: false, officialAccount };
   }
@@ -260,12 +247,13 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
       tenant_id, record_id, platform, external_comment_id, parent_comment_id,
       author_name, author_id, author_avatar, content, like_count, published_at,
       ip_location, floor_index, is_official, is_negative, sentiment, category,
-      risk_level, ai_summary, ai_result, content_hash, payload
+      risk_level, ai_summary, ai_result, content_hash, payload, ai_classified_at
     ) VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10, $11,
       $12, $13, $14, $15, $16, $17,
-      $18, $19, $20::jsonb, $21, $22::jsonb
+      $18, $19, $20::jsonb, $21, $22::jsonb,
+      CASE WHEN $23 THEN now() ELSE NULL END
     )
     RETURNING *
   `, [
@@ -278,6 +266,7 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
     JSON.stringify(classification.ai_result || {}),
     contentHash,
     JSON.stringify(comment.payload || {}),
+    aiClassified,
   ]);
   return { row, inserted: true, officialAccount };
 }
@@ -289,7 +278,7 @@ async function upsertOfficialResponse(tx, { tenantId, recordId, platform, commen
       tenant_id, record_id, comment_id, official_account_id, platform,
       account_name, account_id, content, published_at, content_hash, payload
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-    ON CONFLICT (tenant_id, record_id, content_hash) DO NOTHING
+    ON CONFLICT (tenant_id, record_id, content_hash) WHERE content_hash <> '' DO NOTHING
   `, [
     tenantId, recordId, commentId, officialAccount?.id || null, platform || '',
     comment.author_name || officialAccount?.account_name || '',
@@ -362,33 +351,119 @@ async function applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, pre
   `, [tenantId, auditAction, recordId, JSON.stringify({ previousStatus: currentStatus, nextStatus })]);
 }
 
+// ── 抖音过采兜底(服务端,不动扩展 → 不受 MediaClaw 上游更新影响)─────────────
+// 抖音"评论"会混入【非评论内容】:推荐视频(数十万~百万赞、带话题标签)、页面版权页脚、
+// 视频赞数文本碎片("380.5万 用户名")、UI 碎片。入库前剔掉。依据平台机制:抖音评论结构上
+// 不带话题标签 # ,点赞也到不了视频量级。仅对 douyin 生效,不动小红书/微博。
+const DY_FOOTER_RE = /ICP备|feedback@douyin\.com|增值电信业务经营许可证|网络文化经营许可证|互联网新闻信息服务许可证|算法推荐专项举报/;
+const DY_TOPIC_RE = /#[一-龥a-zA-Z][^#\s）)]{0,29}/;
+const DY_LIKETEXT_RE = /^\d+(\.\d+)?万[\s ]/;
+const DY_UI_FRAG_RE = /^(条回复|@|展开\d+条回复|收起|相关推荐|大家都在搜)$/;
+function isDouyinNonComment(item) {
+  const text = String(item?.content || item?.text || item?.commentText || '').trim();
+  if (!text) return true;
+  if (DY_FOOTER_RE.test(text) || DY_TOPIC_RE.test(text) || DY_LIKETEXT_RE.test(text) || DY_UI_FRAG_RE.test(text)) return true;
+  if (cleanNumber(item?.likes ?? item?.likeCount) > 50000) return true;
+  return false;
+}
+
+// 评论分类提速:逐条 LLM 调用(deepseek-chat 单次慢)是大帖卡死的根因。这里把同帖评论
+// 分批(每批 BATCH_SIZE 条)、限并发(BATCH_CONCURRENCY 批同时跑)走批量分类,且全部在事务之外
+// 算好,再进事务快速入库。AI 精度不变(仍逐条判定),只是把"几百次串行慢调用"压成"几十次并行调用"。
+const BATCH_SIZE = 12;
+const BATCH_CONCURRENCY = 4;
+
+// 限并发 map:最多 limit 个 worker 并行消费 items,按下标顺序写回 results。
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return results;
+}
+
+// 评论写库后:重算负面数/官方回复状态、更新记录、跑分诊流转。
+// Phase A(规则入库后)与 Phase B(AI 精炼后)共用 —— AI 精炼可能改变 is_negative,需重算并可能复发。
+async function finalizeRecordAggregate(tx, { tenantId, recordId, officialRecord, previousNegativeCount }) {
+  const aggregate = await aggregateRecordComments(tx, tenantId, recordId);
+  const responseStatus = aggregate.officialCount > 0
+    ? (aggregate.negativeCount > 0 ? 'needs_followup' : 'responded')
+    : (officialRecord ? 'responded' : 'none');
+  await tx.execute(`
+    UPDATE records
+    SET official_replied = $1,
+      official_response_status = $2,
+      negative_comment_count = $3,
+      latest_negative_comment_at = $4,
+      updated_at = now()
+    WHERE id = $5 AND tenant_id = $6
+  `, [
+    aggregate.officialCount > 0 || officialRecord,
+    responseStatus,
+    aggregate.negativeCount,
+    aggregate.latestNegativeAt,
+    recordId,
+    tenantId,
+  ]);
+  await applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, previousNegativeCount, aggregate });
+  return { aggregate, responseStatus };
+}
+
 export async function upsertRecordComments(recordId, record, context) {
   const tenantId = context.tenantId;
   const platform = record.platform || 'unknown';
-  const comments = [
+  let comments = [
     ...parseJsonArray(record.comments_cleaned_items),
     ...parseJsonArray(record.official_reply_items),
   ].filter(item => commentContent(item));
+  if (platform === 'douyin') {
+    const before = comments.length;
+    comments = comments.filter(item => !isDouyinNonComment(item));
+    if (before > comments.length) {
+      console.log(`[CommentWorkflow] 抖音过采过滤:剔除 ${before - comments.length}/${before} 条非评论(推荐视频/页脚/碎片) record=${recordId}`);
+    }
+  }
 
-  return await withTransaction(async tx => {
-    const accounts = await loadOfficialAccounts(tx, tenantId);
-    const currentRecord = await tx.queryOne(
-      'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
-      [recordId, tenantId]
-    );
-    if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
+  // PHASE 0:只读加载放在事务之外(官方账号表、当前记录),不占用事务连接。
+  const accounts = await loadOfficialAccounts({ queryAll }, tenantId);
+  const currentRecord = await queryOne(
+    'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
+    [recordId, tenantId]
+  );
+  if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
 
-    const officialRecordAccount = isOfficialSubject({
+  const officialRecordAccount = isOfficialSubject({
+    platform,
+    author_name: record.author_name || currentRecord.author_name,
+    author_id: record.author_id || currentRecord.author_id,
+  }, accounts);
+  const shouldSkipOfficialAccounts = record.skip_official_accounts !== false;
+  const officialRecord = Boolean(
+    shouldSkipOfficialAccounts &&
+      officialRecordAccount &&
+      officialRecordAccount.skip_content !== false,
+  );
+
+  // PHASE 1(规则快速分类,不调 LLM):评论以规则分类立即入库、马上可见;
+  // 非官方评论标 aiClassified=false,留给后台 refineCommentsWithAI 批量 AI 精炼。
+  const prepared = comments.map((raw, index) => {
+    const comment = normalizeComment(raw, index);
+    const officialAccount = isOfficialSubject({
       platform,
-      author_name: record.author_name || currentRecord.author_name,
-      author_id: record.author_id || currentRecord.author_id,
+      author_name: comment.author_name,
+      author_id: comment.author_id,
     }, accounts);
-    const shouldSkipOfficialAccounts = record.skip_official_accounts !== false;
-    const officialRecord = Boolean(
-      shouldSkipOfficialAccounts &&
-        officialRecordAccount &&
-        officialRecordAccount.skip_content !== false,
-    );
+    const classification = ruleClassificationWithMetadata(classifyComment(comment, Boolean(officialAccount)));
+    return { comment, officialAccount, classification, aiClassified: Boolean(officialAccount) };
+  });
+
+  // PHASE 2:事务里只做快速写库(无 LLM)。大帖不再把事务开着等几十分钟、也不会因 LLM 超时整篇回滚。
+  return await withTransaction(async tx => {
     let inserted = 0;
     let updated = 0;
     let officialResponses = 0;
@@ -404,30 +479,10 @@ export async function upsertRecordComments(recordId, record, context) {
       `, [recordId, tenantId]);
     }
 
-    for (let index = 0; index < comments.length; index++) {
-      const comment = normalizeComment(comments[index], index);
-      comment.recordContext = {
-        title: record.title || currentRecord.title,
-        content: record.content || currentRecord.content,
-        platform,
-        sentiment: currentRecord.sentiment,
-        category: currentRecord.category,
-      };
-      const officialAccount = isOfficialSubject({
-        platform,
-        author_name: comment.author_name,
-        author_id: comment.author_id,
-      }, accounts);
-      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount });
+    for (const { comment, officialAccount, classification, aiClassified } of prepared) {
+      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification, aiClassified });
       if (result.inserted) inserted += 1;
       else updated += 1;
-      if (!officialAccount) {
-        await upsertCommentLeadForComment(tx, {
-          tenantId,
-          record: currentRecord,
-          comment: result.row,
-        });
-      }
       if (officialAccount) {
         officialResponses += 1;
         await upsertOfficialResponse(tx, {
@@ -439,35 +494,14 @@ export async function upsertRecordComments(recordId, record, context) {
           officialAccount,
         });
       }
+      // 客资生成移到后台 AI 精炼之后(refineCommentsWithAI):用 AI 判定的购买意向,避免规则误判产生假客资。
     }
 
-    const aggregate = await aggregateRecordComments(tx, tenantId, recordId);
-    const responseStatus = aggregate.officialCount > 0
-      ? (aggregate.negativeCount > 0 ? 'needs_followup' : 'responded')
-      : (officialRecord ? 'responded' : 'none');
-    await tx.execute(`
-      UPDATE records
-      SET official_replied = $1,
-        official_response_status = $2,
-        negative_comment_count = $3,
-        latest_negative_comment_at = $4,
-        updated_at = now()
-      WHERE id = $5 AND tenant_id = $6
-    `, [
-      aggregate.officialCount > 0 || officialRecord,
-      responseStatus,
-      aggregate.negativeCount,
-      aggregate.latestNegativeAt,
-      recordId,
-      tenantId,
-    ]);
-
-    await applyTriageWorkflow(tx, {
+    const { aggregate, responseStatus } = await finalizeRecordAggregate(tx, {
       tenantId,
       recordId,
       officialRecord,
       previousNegativeCount: Number(currentRecord.negative_comment_count || 0),
-      aggregate,
     });
 
     return {
@@ -479,6 +513,143 @@ export async function upsertRecordComments(recordId, record, context) {
       officialResponseStatus: responseStatus,
     };
   });
+}
+
+// Phase B(后台 AI 精炼):捞出待精炼(ai_classified_at IS NULL)的非官方评论,按帖分组、
+// 分批并发走批量 LLM,精炼结果回填评论,据此生成客资 + 重算该帖负面数/分诊。
+// LLM 整批失败 → 这批保持 NULL,下轮重试;评论早已入库可见,绝不会因 AI 失败丢成 0 条。
+export async function refineCommentsWithAI({ limit = 300 } = {}) {
+  const pending = await queryAll(`
+    SELECT rc.id, rc.record_id, rc.tenant_id, rc.content, rc.author_name, rc.like_count, rc.ip_location,
+           r.title AS r_title, r.content AS r_content, r.platform AS r_platform,
+           r.sentiment AS r_sentiment, r.category AS r_category, r.record_type AS r_type,
+           r.negative_comment_count AS r_neg
+    FROM record_comments rc
+    JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
+    WHERE rc.ai_classified_at IS NULL AND rc.is_official = false
+    ORDER BY rc.record_id, rc.id
+    LIMIT $1
+  `, [limit]);
+  if (!pending.length) return 0;
+
+  const groups = new Map();
+  for (const c of pending) {
+    if (!groups.has(c.record_id)) groups.set(c.record_id, []);
+    groups.get(c.record_id).push(c);
+  }
+
+  let refined = 0;
+  for (const [recordId, rows] of groups) {
+    const tenantId = rows[0].tenant_id;
+    const record = {
+      title: rows[0].r_title, content: rows[0].r_content, platform: rows[0].r_platform,
+      sentiment: rows[0].r_sentiment, category: rows[0].r_category,
+    };
+    const batches = [];
+    for (let k = 0; k < rows.length; k += BATCH_SIZE) batches.push(rows.slice(k, k + BATCH_SIZE));
+
+    // LLM 调用在事务之外,分批并发
+    const done = await mapLimit(batches, BATCH_CONCURRENCY, async (batch) => {
+      let ai = null;
+      try {
+        ai = await classifyCommentsBatch({
+          tenantId, record,
+          comments: batch.map(c => ({ author_name: c.author_name, content: c.content, like_count: c.like_count, ip_location: c.ip_location })),
+        });
+      } catch (err) {
+        console.error('[CommentRefine] 批量分类失败,留待下轮:', err.message);
+        ai = null;
+      }
+      return { batch, ai };
+    });
+
+    // 写库在一个快事务里(无 LLM)
+    let changed = 0;
+    await withTransaction(async tx => {
+      const recForLead = await tx.queryOne(
+        'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type FROM records WHERE id = $1 AND tenant_id = $2',
+        [recordId, tenantId]
+      );
+      for (const { batch, ai } of done) {
+        if (!ai) continue; // 整批失败:保持待精炼,下轮再来
+        for (let j = 0; j < batch.length; j++) {
+          const cls = ai[j];
+          if (!cls) continue; // 单条缺失:留待下轮
+          const updatedRow = await tx.queryOne(`
+            UPDATE record_comments
+            SET sentiment = $1, is_negative = $2, category = $3, risk_level = $4,
+                ai_summary = $5, ai_result = $6::jsonb, ai_classified_at = now(), updated_at = now()
+            WHERE id = $7
+            RETURNING *
+          `, [cls.sentiment, cls.is_negative, cls.category, cls.risk_level, classificationSummary(cls), JSON.stringify(cls.ai_result || {}), batch[j].id]);
+          if (updatedRow && recForLead) {
+            await upsertCommentLeadForComment(tx, { tenantId, record: recForLead, comment: updatedRow });
+          }
+          changed += 1;
+        }
+      }
+      if (changed > 0) {
+        await finalizeRecordAggregate(tx, {
+          tenantId, recordId,
+          officialRecord: rows[0].r_type === 'official_content',
+          previousNegativeCount: Number(rows[0].r_neg || 0),
+        });
+      }
+    });
+    refined += changed;
+  }
+  return refined;
+}
+
+// 自愈:把"payload 里有评论、但 record_comments 还没入库"的记录重新走一遍入库。
+// 评论数据本就安全存在 records.payload(关键词采集嵌在 items[0].commentsCleanedItems,
+// 单篇在顶层)。给"异步队列因 LLM 挂死卡死 / 进程重启丢失内存队列"兜底。
+// 由 index.js 启动后非阻塞调用;LLM 调用已加超时,不会再卡死。
+export async function reprocessPendingComments({ limit = 2000 } = {}) {
+  const rows = await queryAll(`
+    SELECT r.id, r.tenant_id, r.platform, r.title, r.content, r.author_name, r.author_id,
+           r.url, r.keyword,
+           COALESCE(
+             CASE WHEN jsonb_typeof(r.payload->'items'->0->'commentsCleanedItems') = 'array'
+                  THEN r.payload->'items'->0->'commentsCleanedItems' END,
+             CASE WHEN jsonb_typeof(r.payload->'commentsCleanedItems') = 'array'
+                  THEN r.payload->'commentsCleanedItems' END,
+             '[]'::jsonb) AS cleaned,
+           COALESCE(
+             CASE WHEN jsonb_typeof(r.payload->'items'->0->'officialReplyItems') = 'array'
+                  THEN r.payload->'items'->0->'officialReplyItems' END,
+             CASE WHEN jsonb_typeof(r.payload->'officialReplyItems') = 'array'
+                  THEN r.payload->'officialReplyItems' END,
+             '[]'::jsonb) AS official_reply
+    FROM records r
+    WHERE NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.record_id = r.id)
+      AND (
+        (jsonb_typeof(r.payload->'items'->0->'commentsCleanedItems') = 'array'
+           AND jsonb_array_length(r.payload->'items'->0->'commentsCleanedItems') > 0)
+        OR (jsonb_typeof(r.payload->'commentsCleanedItems') = 'array'
+           AND jsonb_array_length(r.payload->'commentsCleanedItems') > 0)
+      )
+    ORDER BY r.created_at DESC
+    LIMIT $1
+  `, [limit]);
+  if (!rows.length) return 0;
+  console.log(`[Reprocess] 自愈:发现 ${rows.length} 条积压记录待补评论入库`);
+  let fixed = 0;
+  for (const r of rows) {
+    try {
+      await upsertRecordComments(r.id, {
+        platform: r.platform, title: r.title, content: r.content,
+        author_name: r.author_name, author_id: r.author_id, url: r.url, keyword: r.keyword,
+        comments_cleaned_items: JSON.stringify(r.cleaned || []),
+        official_reply_items: JSON.stringify(r.official_reply || []),
+      }, { tenantId: r.tenant_id, authCode: '' });
+      fixed += 1;
+    } catch (err) {
+      console.error(`[Reprocess] record ${r.id} 失败:`, err.message);
+    }
+  }
+  console.log(`[Reprocess] 自愈补回 ${fixed}/${rows.length} 条记录的评论`);
+  return fixed;
 }
 
 export async function getRecordComments(tenantId, recordId) {

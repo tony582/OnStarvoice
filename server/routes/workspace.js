@@ -39,6 +39,23 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+// 评论 AI 精炼进度:评论入库即可见,但 AI 分类(情感/负面/客资意向)在后台批量精炼。
+// 待精炼 = record_comments 里 ai_classified_at IS NULL 的非官方评论。前台据此显示实时进度条。
+router.get('/processing', requireTenantAccess, async (req, res, next) => {
+  try {
+    const row = await queryOne(`
+      SELECT COUNT(DISTINCT rc.record_id) AS pending_posts, COUNT(*) AS pending_comments
+      FROM record_comments rc
+      WHERE rc.tenant_id = $1 AND rc.ai_classified_at IS NULL AND rc.is_official = false
+    `, [req.tenantId]);
+    const pendingPosts = Number(row?.pending_posts || 0);
+    const pendingComments = Number(row?.pending_comments || 0);
+    return res.json({ ok: true, processing: pendingComments > 0, pendingPosts, pendingComments });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 // 事件中心:把聚类的 issue 当"事件",富集影响力/平台/时间跨度/负面数。
 router.get('/events', requireTenantAccess, async (req, res, next) => {
   try {

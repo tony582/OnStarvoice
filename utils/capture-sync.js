@@ -9,7 +9,7 @@
  * 4. 更新同步状态
  */
 
-import { sync, syncBatch, verify } from './api.js';
+import { sync, syncBatch } from './api.js';
 
 import {
   addRecord,
@@ -18,10 +18,12 @@ import {
   getDataPool,
   getRecord,
   getRecords,
+  setDataPool,
   updateRecord,
   markRecordSynced,
   getAuth,
   getTarget,
+  getRuntime,
   updateCapture,
   updateRuntime,
   updateSync,
@@ -48,6 +50,14 @@ import {
   resolveSyncTableName,
 } from './platform/sync-router.js';
 import { parseInteractionCount } from './helpers.js';
+import {appendTaskContext, getActiveTaskContext} from './task-context.js';
+import {
+  recordDiagnosticAction,
+  recordDiagnosticError,
+  recordDiagnosticStage,
+} from './diagnostics.js';
+import {buildDetailEnhanceStage} from './capture/stage-diagnostics.js';
+// 福利中心(welfare-usage.js)未纳入本 fork —— 0.1.7 合并带来的 welfare 埋点已移除,见下方 no-op
 
 const COMMENT_CAPTURE_STATUS = {
   NOT_STARTED: 'not_started',
@@ -63,6 +73,18 @@ const DETAIL_CAPTURE_STATUS = {
   DONE: 'done',
   FAILED: 'failed',
 };
+
+function trackCoreCaptureSuccess(recordCount, metadata = {}) {
+  // 福利中心未纳入本 fork:原 0.1.7 的 welfare 埋点在此 no-op(保留函数壳,调用点不受影响)
+  void recordCount;
+  void metadata;
+}
+
+function trackSyncSuccess(recordCount, metadata = {}) {
+  // 福利中心未纳入本 fork:同上 no-op
+  void recordCount;
+  void metadata;
+}
 
 const DETAIL_CAPTURE_FAILURE_CODE = {
   NONE: 'NONE',
@@ -104,8 +126,29 @@ const DEFAULT_BLOGGER_NOTES_TABLE_NAME = '博主笔记采集';
 const DEFAULT_KEYWORD_NOTES_TABLE_NAME = '关键词笔记采集';
 const DEFAULT_COMMENT_LEADS_TABLE_NAME = 'comment_leads';
 const MAX_SYNC_RECORDS_PER_BATCH = 500;
-const MAX_SYNC_RECORDS_PER_REQUEST = 10;
-const MAX_SYNC_REQUEST_PAYLOAD_BYTES = 1_800_000;
+const MAX_SYNC_RECORDS_PER_REQUEST = 5;
+const MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST = 1024 * 1024;
+const MAX_SYNC_COMMENT_RICH_RECORDS_PER_REQUEST = 1;
+const SYNC_COMMENT_RICH_RECORD_MIN_COMMENTS = 1;
+const SYNC_LARGE_RECORD_BYTES_PER_REQUEST = 256 * 1024;
+const SYNC_BATCH_REQUEST_SPACING_MS = 2000;
+const SYNC_RATE_LIMIT_RETRY_ATTEMPTS = 2;
+const SYNC_RATE_LIMIT_RETRY_BASE_DELAY_MS = 5000;
+const SYNC_RATE_LIMIT_RETRY_MAX_DELAY_MS = 60000;
+const RATE_LIMIT_SYNC_REASONS = new Set([
+  'rate_limited',
+  'too_many_requests',
+  '429',
+]);
+const INDETERMINATE_SYNC_REASONS = new Set([
+  'timeout',
+  'network_error',
+  'coze_timeout',
+  'timeout_budget_exceeded',
+  ERROR_REASON.TIMEOUT,
+  ERROR_REASON.NETWORK_ERROR,
+]);
+const MAX_SYNC_REQUEST_PAYLOAD_BYTES = MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST;
 const DEFAULT_CHECK_SYNC_TYPES = [
   SYNC_TYPE.SINGLE_NOTE,
   SYNC_TYPE.COMMENTS,
@@ -119,15 +162,19 @@ const COMMENT_LEADS_ELIGIBLE_SYNC_TYPES = new Set([
   SYNC_TYPE.BLOGGER_NOTES,
   SYNC_TYPE.KEYWORD_NOTES,
 ]);
+const FRONTEND_SYNC_FAILURE_REASON = 'FRONTEND_SYNC_FAILED';
+const FRONTEND_SYNC_ERROR_MESSAGE_LIMIT = 600;
+const FRONTEND_SYNC_ERROR_STACK_LINE_LIMIT = 8;
+const FRONTEND_SYNC_HISTORY_ITEM_LIMIT = 50;
+const LIST_CAPTURE_RECORD_TYPES = new Set([
+  SYNC_TYPE.BLOGGER_NOTES,
+  SYNC_TYPE.KEYWORD_NOTES,
+]);
 
-function isCommentLeadsEligibleSyncType(syncType) {
-  return COMMENT_LEADS_ELIGIBLE_SYNC_TYPES.has(syncType);
-}
+let activeListCaptureCheckpointSession = null;
 
-function hasCommentLeadsEligibleType(syncTypes = []) {
-  return Array.isArray(syncTypes)
-    ? syncTypes.some((syncType) => isCommentLeadsEligibleSyncType(syncType))
-    : false;
+function isListCaptureRecordType(type) {
+  return LIST_CAPTURE_RECORD_TYPES.has(String(type || '').trim());
 }
 
 function applySyncPreferencesToPayload(payload = {}, captureSettings = {}) {
@@ -202,6 +249,651 @@ function compactSyncItemForBackend(item = {}) {
 }
 
 // ==================== M4-03: 前端接入 sync 调用 ====================
+function createListCaptureCheckpointSession({mode = '', source = ''} = {}) {
+  if (!isListCaptureRecordType(mode)) {
+    return null;
+  }
+
+  return {
+    id: `list_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    mode: String(mode || '').trim(),
+    source: String(source || '').trim(),
+    startedAt: Date.now(),
+    queue: Promise.resolve(),
+    knownKeys: new Set(),
+    savedRecordIds: [],
+    skippedRecordIds: [],
+    savedRecords: [],
+    stats: {
+      savedCount: 0,
+      skippedCount: 0,
+      checkpointCount: 0,
+      detectedCount: 0,
+      filteredCount: 0,
+      lastSavedCount: 0,
+      lastSkippedCount: 0,
+    },
+  };
+}
+
+function beginListCaptureCheckpointSession(options = {}) {
+  const session = createListCaptureCheckpointSession(options);
+  if (session) {
+    activeListCaptureCheckpointSession = session;
+  }
+  return session;
+}
+
+function finishListCaptureCheckpointSession(session) {
+  if (session && activeListCaptureCheckpointSession?.id === session.id) {
+    activeListCaptureCheckpointSession = null;
+  }
+}
+
+function collectListCaptureSessionRecordIds(session) {
+  if (!session) return [];
+  return [
+    ...new Set([
+      ...(session.savedRecordIds || []),
+      ...(session.skippedRecordIds || []),
+    ]),
+  ];
+}
+
+export function getActiveListCaptureCheckpointStats() {
+  const session = activeListCaptureCheckpointSession;
+  if (!session) return null;
+  return {
+    ...session.stats,
+    savedRecordIds: [...session.savedRecordIds],
+    skippedRecordIds: [...session.skippedRecordIds],
+  };
+}
+
+function normalizeIdentityUrl(value) {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('//')) {
+    raw = `https:${raw}`;
+  }
+  if (raw.startsWith('/')) {
+    return raw.replace(/#.*$/, '').replace(/\/$/, '');
+  }
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = '';
+    const removableParams = [
+      'xsec_token',
+      'xsec_source',
+      'source',
+      'share_from_user_hidden',
+      'type',
+      'appuid',
+      'apptime',
+      'timestamp',
+    ];
+    removableParams.forEach((param) => parsed.searchParams.delete(param));
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return raw.replace(/#.*$/, '').replace(/\/$/, '');
+  }
+}
+
+function resolveRecordIdentityPlatform(record = {}) {
+  const payload = record?.payload && typeof record.payload === 'object' ? record.payload : {};
+  const firstItem = Array.isArray(payload.items) ? payload.items[0] || {} : {};
+  const candidates = [
+    record.platform,
+    payload.platform,
+    firstItem.platform,
+    firstItem.url,
+    firstItem.noteUrl,
+    firstItem.detailPageUrl,
+    payload.url,
+    payload.noteUrl,
+    payload.detailPageUrl,
+    payload.searchUrl,
+    payload.bloggerUrl,
+  ];
+
+  for (const candidate of candidates) {
+    const direct = String(candidate || '').trim().toLowerCase();
+    if (direct === 'xiaohongshu' || direct === 'douyin') {
+      return direct;
+    }
+    const inferred = detectPlatformFromUrl(String(candidate || ''));
+    if (inferred === 'xiaohongshu' || inferred === 'douyin') {
+      return inferred;
+    }
+  }
+
+  return 'unknown';
+}
+
+function resolveRecordIdentityKeys(record = {}) {
+  const payload = record?.payload && typeof record.payload === 'object' ? record.payload : {};
+  const firstItem = Array.isArray(payload.items) ? payload.items[0] || {} : {};
+  const platform = resolveRecordIdentityPlatform(record);
+  const noteIdCandidates = [
+    firstItem.noteId,
+    firstItem.id,
+    payload.noteId,
+    extractNoteId(firstItem.url),
+    extractNoteId(firstItem.noteUrl),
+    extractNoteId(firstItem.detailPageUrl),
+    extractNoteId(payload.url),
+    extractNoteId(payload.noteUrl),
+    extractNoteId(payload.detailPageUrl),
+    extractNoteId(payload.detailCaptureNoteUrl),
+  ];
+  const urlCandidates = [
+    firstItem.url,
+    firstItem.noteUrl,
+    firstItem.detailPageUrl,
+    payload.url,
+    payload.noteUrl,
+    payload.detailPageUrl,
+    payload.detailCaptureNoteUrl,
+  ];
+  const keys = [];
+
+  for (const noteId of noteIdCandidates) {
+    const normalized = String(noteId || '').trim();
+    if (normalized) {
+      keys.push(`${platform}:note:${normalized}`);
+      break;
+    }
+  }
+
+  for (const url of urlCandidates) {
+    const normalizedUrl = normalizeIdentityUrl(url);
+    if (normalizedUrl) {
+      keys.push(`${platform}:url:${normalizedUrl}`);
+      break;
+    }
+  }
+
+  return [...new Set(keys)];
+}
+
+function buildDataPoolIdentityIndex(records = []) {
+  const keyToRecord = new Map();
+  (Array.isArray(records) ? records : []).forEach((record) => {
+    if (!isListCaptureRecordType(record?.type || record?.recordType)) return;
+    resolveRecordIdentityKeys(record).forEach((key) => {
+      if (key && !keyToRecord.has(key)) {
+        keyToRecord.set(key, record);
+      }
+    });
+  });
+  return keyToRecord;
+}
+
+function pushUnique(target, values = []) {
+  const seen = new Set(target);
+  values.forEach((value) => {
+    const normalized = String(value || '').trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    target.push(normalized);
+  });
+}
+
+function createListCaptureCacheStats(session, extra = {}) {
+  const safeSession = session || activeListCaptureCheckpointSession;
+  const stats = safeSession?.stats || {};
+  return {
+    savedCount: Number(stats.savedCount || 0),
+    skippedCount: Number(stats.skippedCount || 0),
+    checkpointCount: Number(stats.checkpointCount || 0),
+    detectedCount: Number(stats.detectedCount || 0),
+    filteredCount: Number(stats.filteredCount || 0),
+    lastSavedCount: Number(stats.lastSavedCount || 0),
+    lastSkippedCount: Number(stats.lastSkippedCount || 0),
+    savedRecordIds: safeSession ? [...safeSession.savedRecordIds] : [],
+    skippedRecordIds: safeSession ? [...safeSession.skippedRecordIds] : [],
+    ...extra,
+  };
+}
+
+async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
+  const normalizedRecords = Array.isArray(records) ? records.filter(Boolean) : [];
+  if (normalizedRecords.length === 0) {
+    return {
+      savedRecords: [],
+      skippedCount: 0,
+      skippedRecordIds: [],
+      recordIds: [],
+    };
+  }
+
+  const dataPool = await getDataPool();
+  const existingRecords = Array.isArray(dataPool.records) ? dataPool.records : [];
+  const keyToRecord = buildDataPoolIdentityIndex(existingRecords);
+  const savedRecords = [];
+  const skippedRecordIds = [];
+  let skippedCount = 0;
+
+  for (const record of normalizedRecords) {
+    const recordType = record?.type || record?.recordType;
+    if (!isListCaptureRecordType(recordType)) {
+      savedRecords.push(record);
+      continue;
+    }
+
+    const keys = resolveRecordIdentityKeys(record);
+    const knownInSession = keys.some((key) => session?.knownKeys?.has(key));
+    if (knownInSession) {
+      continue;
+    }
+
+    const existingRecord = keys
+      .map((key) => keyToRecord.get(key))
+      .find(Boolean);
+    if (existingRecord) {
+      skippedCount += 1;
+      const existingId = String(existingRecord.id || '').trim();
+      if (existingId) skippedRecordIds.push(existingId);
+      keys.forEach((key) => session?.knownKeys?.add(key));
+      continue;
+    }
+
+    savedRecords.push(record);
+    keys.forEach((key) => {
+      session?.knownKeys?.add(key);
+      keyToRecord.set(key, record);
+    });
+  }
+
+  if (savedRecords.length > 0) {
+    dataPool.records.unshift(...savedRecords);
+    await setDataPool(dataPool);
+  }
+
+  const savedRecordIds = savedRecords.map((record) => record?.id).filter(Boolean);
+  if (session) {
+    session.stats.savedCount += savedRecords.length;
+    session.stats.skippedCount += skippedCount;
+    session.stats.lastSavedCount = savedRecords.length;
+    session.stats.lastSkippedCount = skippedCount;
+    session.savedRecords.push(...savedRecords);
+    pushUnique(session.savedRecordIds, savedRecordIds);
+    pushUnique(session.skippedRecordIds, skippedRecordIds);
+  }
+
+  return {
+    savedRecords,
+    skippedCount,
+    skippedRecordIds: [...new Set(skippedRecordIds)],
+    recordIds: [...new Set([...savedRecordIds, ...skippedRecordIds])],
+  };
+}
+
+async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
+  const recordsToSave = buildRecordsForStorage(captureResult);
+  if (!isListCaptureRecordType(captureResult?.type)) {
+    if (recordsToSave.length === 0) {
+      return {
+        savedRecords: [],
+        recordIds: [],
+        cacheStats: null,
+      };
+    }
+    const savedRecords =
+      recordsToSave.length === 1
+        ? [await addRecord(recordsToSave[0])]
+        : await addRecords(recordsToSave);
+    const recordIds = savedRecords.map((record) => record?.id).filter(Boolean);
+    return {
+      savedRecords,
+      recordIds,
+      cacheStats: null,
+    };
+  }
+
+  if (session?.queue) {
+    await session.queue.catch(() => null);
+  }
+  const finalSave = await saveRecordsWithCacheDedupe(recordsToSave, {session});
+  const recordIds = [
+    ...new Set([
+      ...(session?.savedRecordIds || []),
+      ...(session?.skippedRecordIds || []),
+      ...finalSave.recordIds,
+    ]),
+  ];
+
+  return {
+    savedRecords: [
+      ...(session?.savedRecords || []),
+      ...finalSave.savedRecords,
+    ],
+    recordIds,
+    cacheStats: createListCaptureCacheStats(session, {
+      finalSkippedCount: finalSave.skippedCount,
+      finalSavedCount: finalSave.savedRecords.length,
+    }),
+  };
+}
+
+export async function processListCaptureCheckpointProgress(progress = {}) {
+  const session = activeListCaptureCheckpointSession;
+  const checkpoint =
+    progress?.listCheckpoint && typeof progress.listCheckpoint === 'object'
+      ? progress.listCheckpoint
+      : null;
+  if (!session || !checkpoint || !isListCaptureRecordType(checkpoint.type)) {
+    return null;
+  }
+
+  const checkpointItems = Array.isArray(checkpoint.items)
+    ? checkpoint.items
+    : Array.isArray(checkpoint.payload?.items)
+      ? checkpoint.payload.items
+      : [];
+  if (checkpointItems.length === 0) {
+    return createListCaptureCacheStats(session);
+  }
+
+  const payloadBase =
+    checkpoint.payload && typeof checkpoint.payload === 'object'
+      ? checkpoint.payload
+      : {};
+  const payload = {
+    ...payloadBase,
+    totalCount: checkpointItems.length,
+    filteredCount: checkpointItems.length,
+    items: checkpointItems,
+    captureTimestamp: payloadBase.captureTimestamp || Date.now(),
+  };
+  const captureResult = {
+    ok: true,
+    type: checkpoint.type,
+    platform: checkpoint.platform || payload.platform || '',
+    data: payload,
+    meta:
+      checkpoint.meta && typeof checkpoint.meta === 'object'
+        ? checkpoint.meta
+        : {},
+  };
+  const recordsToSave = buildRecordsForStorage(captureResult);
+  session.stats.checkpointCount += checkpointItems.length;
+  session.stats.detectedCount = Math.max(
+    session.stats.detectedCount,
+    Number(progress.detectedCount || payload.rawTotalCount || 0) || 0,
+  );
+  session.stats.filteredCount = Math.max(
+    session.stats.filteredCount,
+    Number(progress.filteredCount || payload.filteredCount || 0) || 0,
+  );
+
+  session.queue = session.queue
+    .catch(() => null)
+    .then(() => saveRecordsWithCacheDedupe(recordsToSave, {session}))
+    .catch((error) => {
+      console.warn('[CaptureSync] list checkpoint save failed:', error);
+      return null;
+    });
+
+  await session.queue;
+  return createListCaptureCacheStats(session);
+}
+
+function isCommentLeadsEligibleSyncType(syncType) {
+  return COMMENT_LEADS_ELIGIBLE_SYNC_TYPES.has(syncType);
+}
+
+function hasCommentLeadsEligibleType(syncTypes = []) {
+  return Array.isArray(syncTypes)
+    ? syncTypes.some((syncType) => isCommentLeadsEligibleSyncType(syncType))
+    : false;
+}
+
+function truncateFrontendSyncText(value, limit = FRONTEND_SYNC_ERROR_MESSAGE_LIMIT) {
+  const text = String(value || '').trim();
+  if (!text || text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, limit - 1)}...`;
+}
+
+function normalizeFrontendSyncError(error, {
+  phase = 'sync',
+  source = 'plugin_frontend',
+  fallbackMessage = '前端同步失败',
+} = {}) {
+  const safeError = error && typeof error === 'object' ? error : {};
+  const nestedError =
+    safeError.error && typeof safeError.error === 'object' ? safeError.error : {};
+  const reason = String(
+    safeError.code ||
+      safeError.reason ||
+      nestedError.code ||
+      nestedError.reason ||
+      FRONTEND_SYNC_FAILURE_REASON,
+  ).trim() || FRONTEND_SYNC_FAILURE_REASON;
+  const message = truncateFrontendSyncText(
+    safeError.message ||
+      nestedError.message ||
+      (typeof error === 'string' ? error : '') ||
+      fallbackMessage,
+  );
+  const stack = truncateFrontendSyncText(
+    String(safeError.stack || nestedError.stack || '')
+      .split('\n')
+      .slice(0, FRONTEND_SYNC_ERROR_STACK_LINE_LIMIT)
+      .join('\n'),
+    1600,
+  );
+
+  return {
+    source,
+    phase,
+    reason,
+    code: reason,
+    message,
+    name: String(safeError.name || nestedError.name || '').trim(),
+    stack,
+  };
+}
+
+function resolveFrontendFailurePlatform(syncInputs = []) {
+  const platforms = new Set(
+    syncInputs
+      .map((input) => String(input?.platform || '').trim())
+      .filter(Boolean),
+  );
+  if (platforms.size === 1) {
+    return Array.from(platforms)[0];
+  }
+  if (platforms.size > 1) {
+    return 'mixed';
+  }
+  return 'unknown';
+}
+
+function resolveFrontendFailureSyncType(syncInputs = [], requiredSyncTypes = []) {
+  const syncTypes = new Set(
+    syncInputs
+      .map((input) => String(input?.syncType || '').trim())
+      .filter(Boolean),
+  );
+  if (syncTypes.size === 0 && Array.isArray(requiredSyncTypes)) {
+    requiredSyncTypes
+      .map((syncType) => String(syncType || '').trim())
+      .filter(Boolean)
+      .forEach((syncType) => syncTypes.add(syncType));
+  }
+  if (syncTypes.size === 1) {
+    return Array.from(syncTypes)[0];
+  }
+  if (syncTypes.size > 1) {
+    return 'mixed';
+  }
+  return '';
+}
+
+function buildFrontendFailureItems({
+  records = [],
+  recordIds = [],
+  requestTarget = {},
+  frontendError,
+} = {}) {
+  const items = [];
+  const seenRecordIds = new Set();
+  const limitedRecords = Array.isArray(records)
+    ? records.slice(0, FRONTEND_SYNC_HISTORY_ITEM_LIMIT)
+    : [];
+
+  for (const record of limitedRecords) {
+    const syncInput = resolveSyncInputForRecord(record, requestTarget);
+    const recordId = String(record?.id || '').trim();
+    if (recordId) {
+      seenRecordIds.add(recordId);
+    }
+    items.push({
+      recordId,
+      platform: syncInput.platform || 'unknown',
+      type: syncInput.syncType || record?.type || '',
+      sourceType: record?.type || record?.recordType || '',
+      workflow: syncInput.workflow || 'shared_unknown',
+      noteType: syncInput.syncType === SYNC_TYPE.SINGLE_NOTE
+        ? getSingleNoteType(syncInput.payload || record?.payload)
+        : null,
+      success: false,
+      reason: frontendError.reason,
+      message: frontendError.message,
+      debugUrl: null,
+      rawResponse: null,
+      frontendError,
+      error: {
+        source: frontendError.source,
+        phase: frontendError.phase,
+        reason: frontendError.reason,
+        code: frontendError.code,
+        message: frontendError.message,
+        stack: frontendError.stack,
+      },
+    });
+  }
+
+  if (items.length > 0) {
+    return items;
+  }
+
+  const limitedRecordIds = Array.isArray(recordIds)
+    ? recordIds.slice(0, FRONTEND_SYNC_HISTORY_ITEM_LIMIT)
+    : [];
+  for (const recordId of limitedRecordIds) {
+    const normalizedRecordId = String(recordId || '').trim();
+    if (!normalizedRecordId || seenRecordIds.has(normalizedRecordId)) {
+      continue;
+    }
+    items.push({
+      recordId: normalizedRecordId,
+      platform: 'unknown',
+      type: '',
+      workflow: 'frontend_failure',
+      success: false,
+      reason: frontendError.reason,
+      message: frontendError.message,
+      debugUrl: null,
+      rawResponse: null,
+      frontendError,
+      error: {
+        source: frontendError.source,
+        phase: frontendError.phase,
+        reason: frontendError.reason,
+        code: frontendError.code,
+        message: frontendError.message,
+        stack: frontendError.stack,
+      },
+    });
+  }
+
+  return items;
+}
+
+export async function appendFrontendSyncFailureHistory({
+  records = [],
+  recordIds = [],
+  requiredSyncTypes = [],
+  error,
+  phase = 'sync',
+  source = 'plugin_frontend',
+  trigger = 'manual',
+  syncScope = 'pending',
+  startedAt = Date.now(),
+  fallbackMessage = '前端同步失败',
+} = {}) {
+  try {
+    const safeRecords = Array.isArray(records) ? records.filter(Boolean) : [];
+    const safeRecordIds = Array.isArray(recordIds)
+      ? recordIds.map((recordId) => String(recordId || '').trim()).filter(Boolean)
+      : safeRecords.map((record) => String(record?.id || '').trim()).filter(Boolean);
+    const target = await getTarget();
+    const requestTarget = buildSyncTargetPayload(target);
+    const syncInputs = safeRecords.map((record) =>
+      resolveSyncInputForRecord(record, requestTarget),
+    );
+    const frontendError = normalizeFrontendSyncError(error, {
+      phase,
+      source,
+      fallbackMessage,
+    });
+    const platform = resolveFrontendFailurePlatform(syncInputs);
+    const syncType = resolveFrontendFailureSyncType(syncInputs, requiredSyncTypes);
+    const workflow =
+      syncInputs.length === 1
+        ? syncInputs[0]?.workflow || 'frontend_failure'
+        : 'frontend_failure';
+    const items = buildFrontendFailureItems({
+      records: safeRecords,
+      recordIds: safeRecordIds,
+      requestTarget,
+      frontendError,
+    });
+    const failedCount = Math.max(
+      items.length,
+      safeRecordIds.length,
+      safeRecords.length,
+      1,
+    );
+
+    return await addSyncHistoryEntry({
+      trigger,
+      syncScope,
+      startedAt,
+      finishedAt: Date.now(),
+      totalCount: failedCount,
+      requestedTotalCount: Math.max(safeRecordIds.length, safeRecords.length, failedCount),
+      skippedCount: 0,
+      successCount: 0,
+      failedCount,
+      debugUrl: null,
+      platform,
+      syncType,
+      workflow,
+      target: buildSyncHistoryTarget(requestTarget, {
+        platform,
+        syncType,
+        workflow,
+      }),
+      recordIds: safeRecordIds,
+      skippedRecordIds: [],
+      frontendFailure: true,
+      frontendError,
+      errorMessage: frontendError.message,
+      message: frontendError.message,
+      items,
+    });
+  } catch (historyError) {
+    console.error('[CaptureSync] Append frontend sync failure history failed:', historyError);
+    return null;
+  }
+}
+
+// ==================== M4-03: 前端接入 sync 调用 ====================
 
 /**
  * 采集并同步（完整流程）
@@ -218,6 +910,16 @@ export async function captureAndSync({
   autoSync = true,
   captureParams = {},
 } = {}) {
+  let savedRecords = [];
+  let recordIds = [];
+  let recordId = null;
+  let syncStartedAt = Date.now();
+  let captureCacheStats = null;
+  const checkpointSession = beginListCaptureCheckpointSession({
+    mode,
+    source: 'captureAndSync',
+  });
+
   try {
     // 步骤 1: 开始采集
     if (onProgress) {
@@ -241,6 +943,11 @@ export async function captureAndSync({
 
     // 步骤 3: 检查采集是否成功
     if (!captureResult.ok) {
+      if (checkpointSession?.queue) {
+        await checkpointSession.queue.catch(() => null);
+      }
+      captureCacheStats = createListCaptureCacheStats(checkpointSession);
+      finishListCaptureCheckpointSession(checkpointSession);
       await updateCapture({
         status: CAPTURE_STATUS.FAILED,
         error: captureResult.error,
@@ -252,6 +959,8 @@ export async function captureAndSync({
         captureResult,
         syncResult: null,
         recordId: null,
+        recordIds: collectListCaptureSessionRecordIds(checkpointSession),
+        captureCacheStats,
         error: captureResult.error,
       };
     }
@@ -264,18 +973,20 @@ export async function captureAndSync({
       });
     }
 
-    const recordsToSave = buildRecordsForStorage(captureResult);
-    let savedRecords = [];
-    let recordIds = [];
-    let recordId = null;
+    const saveResult = await saveCaptureResultRecords(captureResult, {
+      session: checkpointSession,
+    });
+    finishListCaptureCheckpointSession(checkpointSession);
+    savedRecords = saveResult.savedRecords || [];
+    recordIds = Array.isArray(saveResult.recordIds) ? saveResult.recordIds : [];
+    captureCacheStats = saveResult.cacheStats || captureCacheStats;
 
-    if (recordsToSave.length > 0) {
-      savedRecords =
-        recordsToSave.length === 1
-          ? [await addRecord(recordsToSave[0])]
-          : await addRecords(recordsToSave);
-      recordIds = savedRecords.map((record) => record?.id).filter(Boolean);
+    if (recordIds.length > 0) {
       recordId = recordIds[0] || null;
+      trackCoreCaptureSuccess(savedRecords.length, {
+        mode,
+        source: 'capture_and_save',
+      });
     }
 
     await updateCapture({
@@ -302,6 +1013,7 @@ export async function captureAndSync({
         syncResult: null,
         recordId,
         recordIds,
+        captureCacheStats,
         error: null,
       };
     }
@@ -323,11 +1035,24 @@ export async function captureAndSync({
     ) {
       requiredSyncTypes.push(SYNC_TYPE.COMMENT_LEADS);
     }
+    syncStartedAt = Date.now();
     const checkResult = await checkBeforeSync(
       requiredSyncTypes,
       { onProgress },
     );
     if (!checkResult.ok) {
+      await appendFrontendSyncFailureHistory({
+        records: savedRecords,
+        recordIds,
+        requiredSyncTypes,
+        error: checkResult.error || checkResult,
+        phase: 'sync_check',
+        source: 'captureAndSync',
+        trigger: 'capture_auto',
+        syncScope: 'pending',
+        startedAt: syncStartedAt,
+        fallbackMessage: '自动同步前检查失败',
+      });
       return {
         ok: false,
         phase: 'check',
@@ -339,23 +1064,20 @@ export async function captureAndSync({
     }
 
     // 步骤 7: 执行同步
+    syncStartedAt = Date.now();
     if (onProgress) {
       onProgress({
         phase: 'sync_start',
-        message: '开始同步到后台...',
+        message: '开始同步到飞书...',
         recordId,
       });
     }
 
     const syncResult =
       recordIds.length === 1
-        ? await syncRecord(recordId, onProgress, {
-            captureSettings,
-            commentLeadsConfig,
-          })
+        ? await syncRecord(recordId, onProgress, { commentLeadsConfig })
         : await syncRecordBatch(recordIds, onProgress, {
             trigger: 'capture_auto',
-            captureSettings,
             commentLeadsConfig,
           });
 
@@ -366,10 +1088,30 @@ export async function captureAndSync({
       syncResult,
       recordId,
       recordIds,
+      captureCacheStats,
       error: syncResult.error || null,
     };
   } catch (error) {
     console.error('[CaptureSync] Capture and sync failed:', error);
+    if (checkpointSession?.queue) {
+      await checkpointSession.queue.catch(() => null);
+    }
+    captureCacheStats = captureCacheStats || createListCaptureCacheStats(checkpointSession);
+    finishListCaptureCheckpointSession(checkpointSession);
+
+    if (autoSync && recordIds.length > 0) {
+      await appendFrontendSyncFailureHistory({
+        records: savedRecords,
+        recordIds,
+        error,
+        phase: 'sync_exception',
+        source: 'captureAndSync',
+        trigger: 'capture_auto',
+        syncScope: 'pending',
+        startedAt: syncStartedAt,
+        fallbackMessage: '自动同步失败',
+      });
+    }
 
     await updateCapture({
       status: CAPTURE_STATUS.FAILED,
@@ -385,6 +1127,8 @@ export async function captureAndSync({
       captureResult: null,
       syncResult: null,
       recordId: null,
+      recordIds: collectListCaptureSessionRecordIds(checkpointSession),
+      captureCacheStats,
       error: {
         code: 'UNEXPECTED_ERROR',
         message: error.message,
@@ -483,6 +1227,10 @@ export async function captureNoteWithOptionalComments({
     }
     const saved = await addRecord(recordsToSave[0]);
     const recordId = saved?.id || null;
+    trackCoreCaptureSuccess(recordId ? 1 : 0, {
+      mode: 'single_note',
+      source: 'single_note_with_enhancement_state',
+    });
 
     await updateCapture({
       status: CAPTURE_STATUS.SUCCESS,
@@ -835,6 +1583,8 @@ export async function batchCaptureDetailsForRecords(
   let successCount = 0;
   let failedCount = 0;
   let filteredCount = 0;
+  let detailKeywordFilterEnabled = false;
+  let detailKeywordFilteredCount = 0;
   let canceled = false;
   let runnerContext = null;
 
@@ -1134,6 +1884,33 @@ export async function batchCaptureDetailsForRecords(
           }
         }
 
+        const detailKeywordFilterResult = evaluateDetailKeywordFilter(
+          record,
+          detailPayload,
+        );
+        if (detailKeywordFilterResult.keywords.length > 0) {
+          detailKeywordFilterEnabled = true;
+        }
+        if (!detailKeywordFilterResult.matched && !stopAfterCurrent) {
+          await deleteRecord(recordId);
+          filteredCount += 1;
+          detailKeywordFilteredCount += 1;
+          if (onProgress) {
+            onProgress({
+              phase: 'detail_item_filtered',
+              message: `第 ${current}/${uniqueRecordIds.length} 条已过滤：未命中主题关键词「${formatDetailKeywordFilterLabel(detailKeywordFilterResult.keywords)}」`,
+              recordId,
+              current,
+              total: uniqueRecordIds.length,
+              successCount,
+              failedCount,
+              filteredCount,
+              runnerTabId: runnerContext.runnerTabId,
+            });
+          }
+          continue;
+        }
+
         if (includeComments && !stopAfterCurrent) {
           activeStage = 'comments_capture';
           if (onProgress) {
@@ -1176,9 +1953,10 @@ export async function batchCaptureDetailsForRecords(
           }
         }
 
-        detailPayload = sanitizeMediaFieldsForStorage(detailPayload);
-
         const latestRecord = (await getRecord(recordId)) || record;
+        detailPayload = sanitizeMediaFieldsForStorage(
+          normalizeDetailPayloadAgainstRecord(latestRecord, detailPayload),
+        );
         const mergedPayload = applyDetailCapturePatch(
           latestRecord.payload,
           createDetailCapturePatch({
@@ -1315,6 +2093,33 @@ export async function batchCaptureDetailsForRecords(
   }
 
   const processedCount = results.length;
+  const failureStageSummary = results.reduce((summary, item) => {
+    if (item?.ok !== false) return summary;
+    const stage = String(item.stage || item.reason || 'unknown').trim() || 'unknown';
+    summary[stage] = (summary[stage] || 0) + 1;
+    return summary;
+  }, {});
+  const enhancementStage = buildDetailEnhanceStage({
+    status: canceled ? 'partial' : failedCount > 0 ? 'completed_with_failures' : 'completed',
+    targetCount: uniqueRecordIds.length,
+    processedCount,
+    successCount,
+    failedCount,
+    filteredCount,
+    keywordFilterMode: detailKeywordFilterEnabled ? 'detail' : '',
+    keywordFilterEnabled: detailKeywordFilterEnabled,
+    keywordFilteredCount: detailKeywordFilteredCount,
+    currentStage: canceled ? 'detail_batch_canceled' : 'detail_batch_done',
+    failureStageSummary,
+  });
+  void recordDiagnosticStage({
+    ...enhancementStage,
+    taskContext: getActiveTaskContext(),
+    featureKey: 'capture.enhancement',
+    parentFeatureKey: 'capture.enhancement',
+    source: 'capture-sync',
+  }).catch(() => null);
+
   if (onProgress) {
     onProgress({
       phase: canceled ? 'detail_batch_canceled' : 'detail_batch_done',
@@ -1339,6 +2144,9 @@ export async function batchCaptureDetailsForRecords(
     failedCount,
     filteredCount,
     results,
+    diagnostics: {
+      stageTrace: [enhancementStage],
+    },
     error: null,
   };
 }
@@ -1401,6 +2209,39 @@ function normalizeSingleNotePayloadForSync(payload) {
 function sanitizeMediaFieldsForStorage(payload) {
   const base = payload && typeof payload === 'object' ? payload : {};
   const platform = resolvePayloadPlatform(base);
+  const noteType = getSingleNoteType(base);
+
+  const sanitizeUrlList = (list) => {
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    const next = [];
+    list.forEach((item) => {
+      const normalized = normalizeMediaUrlForStorage(item);
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      next.push(normalized);
+    });
+    return next;
+  };
+
+  if (noteType === 'image') {
+    const imageUrls = sanitizeUrlList([
+      ...(Array.isArray(base.imageUrls) ? base.imageUrls : []),
+      ...(Array.isArray(base.images) ? base.images : []),
+    ]);
+    const coverImageUrl =
+      normalizeMediaUrlForStorage(base.coverImageUrl) || imageUrls[0] || '';
+    const orderedImageUrls = sanitizeUrlList([
+      coverImageUrl,
+      ...imageUrls,
+    ]);
+
+    return clearPlayableMediaFields({
+      ...base,
+      coverImageUrl,
+      imageUrls: orderedImageUrls,
+    });
+  }
 
   if (platform !== 'douyin') {
     return base;
@@ -1442,6 +2283,88 @@ function sanitizeMediaFieldsForStorage(payload) {
     audioUrls,
     musicUrl: audioUrls[0] || '',
     musicUrls: audioUrls,
+  };
+}
+
+function normalizeDetailPayloadAgainstRecord(record, detailPayload) {
+  const base = detailPayload && typeof detailPayload === 'object'
+    ? {...detailPayload}
+    : {};
+  if (getSingleNoteType(base) !== 'image') {
+    return base;
+  }
+
+  const item = getFirstPayloadItem(record?.payload);
+  const listCoverImageUrl = normalizeMediaUrlForStorage(
+    item?.coverImageUrl ||
+      item?.coverUrl ||
+      item?.coverImage ||
+      item?.cover ||
+      '',
+  );
+  if (!listCoverImageUrl) {
+    return base;
+  }
+
+  const imageUrls = [
+    listCoverImageUrl,
+    ...(Array.isArray(base.imageUrls) ? base.imageUrls : []),
+    ...(Array.isArray(base.images) ? base.images : []),
+  ];
+
+  return {
+    ...base,
+    coverImageUrl: listCoverImageUrl,
+    imageUrls,
+  };
+}
+
+function clearPlayableMediaFields(payload) {
+  const base = payload && typeof payload === 'object' ? payload : {};
+  const media = base.media && typeof base.media === 'object'
+    ? {
+        ...base.media,
+        videoUrl: '',
+        videoURL: '',
+        video_url: '',
+        videoLink: '',
+        video_link: '',
+        playUrl: '',
+        play_url: '',
+        videoUrls: [],
+        videoList: [],
+        videos: [],
+        audioUrl: '',
+        audioURL: '',
+        audio_url: '',
+        musicUrl: '',
+        music_url: '',
+        audioUrls: [],
+        musicUrls: [],
+      }
+    : base.media;
+
+  return {
+    ...base,
+    media,
+    videoUrl: '',
+    videoURL: '',
+    video_url: '',
+    videoLink: '',
+    video_link: '',
+    playUrl: '',
+    play_url: '',
+    videoUrls: [],
+    videoList: [],
+    videos: [],
+    audioUrl: '',
+    audioURL: '',
+    audio_url: '',
+    audioUrls: [],
+    musicUrl: '',
+    music_url: '',
+    musicUrls: [],
+    audioAvailability: 'not_collected',
   };
 }
 
@@ -1798,6 +2721,11 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
           : null,
         error: null,
       };
+      trackSyncSuccess(1, {
+        syncType: syncInput.syncType,
+        workflow: syncInput.workflow,
+        source: 'single_record_sync',
+      });
       await appendSingleSyncHistoryEntry({
         requestTarget,
         syncInput,
@@ -1990,6 +2918,44 @@ async function appendSingleSyncHistoryEntry({
  * @returns {Promise<Object>} 批量同步结果
  */
 export async function syncRecordBatch(recordIds, onProgress = null, options = {}) {
+  try {
+    return await runSyncRecordBatch(recordIds, onProgress, options);
+  } catch (error) {
+    await updateSync({
+      status: SYNC_STATUS.FAILED,
+      error: {
+        code: 'BATCH_SYNC_ERROR',
+        message: error?.message || '批量同步失败',
+      },
+    }).catch(() => null);
+
+    void recordDiagnosticError({
+      taskContext: getActiveTaskContext(),
+      source: 'capture-sync',
+      action: 'syncRecordBatch',
+      status: 'failed',
+      error: {
+        code: 'BATCH_SYNC_ERROR',
+        message: error?.message || '批量同步失败',
+      },
+      metadata: {
+        requestedCount: Array.isArray(recordIds) ? recordIds.length : 0,
+        trigger: options?.trigger || 'manual',
+      },
+    }).catch(() => null);
+
+    if (onProgress) {
+      onProgress({
+        phase: 'sync_failed',
+        message: `批量同步失败: ${error?.message || '未知错误'}`,
+      });
+    }
+
+    throw error;
+  }
+}
+
+async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   const startedAt = Date.now();
   const requestedRecordIds = Array.isArray(recordIds)
     ? recordIds.filter((recordId) => typeof recordId === 'string' && recordId.trim())
@@ -2045,6 +3011,7 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
   );
   const syncGroups = buildWorkflowSyncGroups(contentRecordsToSync);
   let processedCount = 0;
+  let syncPaused = null;
 
   await updateSync({
     status: SYNC_STATUS.SYNCING,
@@ -2095,121 +3062,89 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
   });
   processedCount = results.length;
 
-  for (const group of syncGroups) {
+  for (let groupIndex = 0; groupIndex < syncGroups.length; groupIndex += 1) {
+    const group = syncGroups[groupIndex];
     if (!Array.isArray(group.records) || group.records.length === 0) {
       continue;
     }
 
-    const requestChunks = splitSyncGroupRecordsForRequests(group.records);
-    for (const chunkRecords of requestChunks) {
-      const groupStartedAt = Date.now();
-      const batchResult = await syncBatch(
-        chunkRecords.map((record) => buildSyncBatchRecord(record)),
-        requestTarget,
+    const groupStartedAt = Date.now();
+    const groupResults = await syncGroupRecordsWithRetry({
+      group,
+      requestTarget,
+      onProgress,
+      completedOffset: processedCount,
+      totalCount: recordIdsToSync.length,
+      requestSpacingMs: options?.requestSpacingMs,
+      rateLimitBaseDelayMs: options?.rateLimitBaseDelayMs,
+      rateLimitMaxDelayMs: options?.rateLimitMaxDelayMs,
+      rateLimitRetryAttempts: options?.rateLimitRetryAttempts,
+    });
+    const groupSyncDiagnostics =
+      groupResults?.syncDiagnostics && typeof groupResults.syncDiagnostics === 'object'
+        ? groupResults.syncDiagnostics
+        : null;
+    let groupPaused =
+      groupResults?.syncPaused && typeof groupResults.syncPaused === 'object'
+        ? groupResults.syncPaused
+        : null;
+
+    results.push(...groupResults);
+    processedCount += groupResults.length;
+    if (groupPaused) {
+      const shouldBlockRemainingGroups = groupPaused.blocking !== false;
+      groupPaused = extendSyncPausedMetadata(
+        groupPaused,
+        shouldBlockRemainingGroups
+          ? syncGroups
+              .slice(groupIndex + 1)
+              .flatMap((nextGroup) =>
+                Array.isArray(nextGroup?.records) ? nextGroup.records : [],
+              )
+          : [],
+        {
+          confirmedSuccessCount: results.filter((result) => result.success).length,
+        },
       );
+    }
 
-      const batchItems = Array.isArray(batchResult?.data?.items) ? batchResult.data.items : [];
-      const batchItemMap = new Map(
-        batchItems
-          .filter((item) => item && typeof item === 'object' && item.recordId)
-          .map((item) => [item.recordId, item]),
-      );
-      const groupResults = [];
-
-      for (let i = 0; i < chunkRecords.length; i++) {
-        const record = chunkRecords[i];
-        const item = batchItemMap.get(record.id);
-        const debugUrl =
-          normalizeDebugUrl(item?.debugUrl) ||
-          (batchResult.ok ? extractDebugUrl(batchResult) : '');
-        const success = item?.ok === true;
-        const reason =
-          item?.reason ||
-          item?.error?.reason ||
-          (success
-            ? ERROR_REASON.NONE
-            : batchResult.reason || batchResult.error?.reason || 'SYNC_ERROR');
-        const message =
-          item?.message ||
-          item?.error?.message ||
-          (success ? '同步成功' : batchResult.message || batchResult.error?.message || '同步失败');
-        const error = success
-          ? null
-          : {
-              reason,
-              message,
-            };
-
-        if (success) {
-          await markRecordSynced(record.id, debugUrl || null);
-        } else {
-          await updateRecord(record.id, {
-            status: RECORD_STATUS.FAILED,
-            lastSyncedAt: Date.now(),
-            lastSyncReason: reason,
-            lastSyncDebugUrl: debugUrl || null,
-          });
-        }
-
-        const syncResultItem = {
-          recordId: record.id,
-          platform: record.platform || 'unknown',
-          type: record.syncType || record.type,
-          sourceType: record.sourceType || record.type,
-          workflow: record.workflow || '',
-          noteType:
-            (record.syncType || record.type) === 'single_note'
-              ? getSingleNoteType(record.syncPayload || record.payload)
-              : null,
-          success,
-          reason,
-          message,
-          debugUrl: debugUrl || null,
-          rawResponse: item?.rawResponse || item || batchResult,
-          error,
-        };
-        results.push(syncResultItem);
-        groupResults.push(syncResultItem);
-        processedCount += 1;
-
-        if (onProgress) {
-          onProgress({
-            phase: 'batch_sync',
-            current: processedCount,
-            total: recordIdsToSync.length,
-            message: `正在处理第 ${processedCount}/${recordIdsToSync.length} 条记录...`,
-            recordId: record.id,
-          });
-        }
-      }
-
-      await addSyncHistoryEntry({
-        trigger: options.trigger || 'manual',
-        syncScope: options.syncScope || 'pending',
-        startedAt: groupStartedAt,
-        finishedAt: Date.now(),
-        totalCount: chunkRecords.length,
-        requestedTotalCount: chunkRecords.length,
-        skippedCount: 0,
-        successCount: groupResults.filter((result) => result.success).length,
-        failedCount: groupResults.filter((result) => !result.success).length,
-        debugUrl: pickBatchDebugUrl(groupResults) || null,
+    await addSyncHistoryEntry({
+      trigger: options.trigger || 'manual',
+      syncScope: options.syncScope || 'pending',
+      startedAt: groupStartedAt,
+      finishedAt: Date.now(),
+      totalCount: group.records.length,
+      requestedTotalCount: group.records.length,
+      skippedCount: 0,
+      successCount: groupResults.filter((result) => result.success).length,
+      failedCount: groupResults.filter((result) => !result.success).length,
+      debugUrl: pickBatchDebugUrl(groupResults) || null,
+      platform: group.platform || 'unknown',
+      syncType: group.syncType || '',
+      workflow: group.workflow || '',
+      target: buildSyncHistoryTarget(requestTarget, {
         platform: group.platform || 'unknown',
         syncType: group.syncType || '',
         workflow: group.workflow || '',
-        target: buildSyncHistoryTarget(requestTarget, {
-          platform: group.platform || 'unknown',
-          syncType: group.syncType || '',
-          workflow: group.workflow || '',
-        }),
-        recordIds: chunkRecords.map((record) => record.id),
-        skippedRecordIds: [],
-        items: groupResults,
-        batchStartedAt: startedAt,
-        batchRequestedTotalCount: requestedRecordIds.length,
-        batchSyncedCount: recordIdsToSync.length,
-        batchSkippedCount: skippedRecordIds.length,
+      }),
+      recordIds: group.records.map((record) => record.id),
+      skippedRecordIds: [],
+      items: groupResults,
+      syncRequest: groupSyncDiagnostics,
+      syncPaused: groupPaused,
+      batchStartedAt: startedAt,
+      batchRequestedTotalCount: requestedRecordIds.length,
+      batchSyncedCount: recordIdsToSync.length,
+      batchSkippedCount: skippedRecordIds.length,
+    });
+
+    if (groupPaused) {
+      syncPaused = mergeSyncPausedMetadata(syncPaused, groupPaused, {
+        confirmedSuccessCount: results.filter((result) => result.success).length,
       });
+      if (groupPaused.blocking !== false) {
+        break;
+      }
     }
   }
 
@@ -2251,7 +3186,7 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
     }
   }
 
-  if (commentLeadsConfig.enabled || hasAnyStoredCommentLeads) {
+  if (!syncPaused && (commentLeadsConfig.enabled || hasAnyStoredCommentLeads)) {
     const resultByRecordId = new Map(
       results.map((item) => [String(item?.recordId || ''), item]),
     );
@@ -2467,13 +3402,26 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
 
   // 统计结果
   const successCount = results.filter((r) => r.success).length;
-  const failedCount = results.length - successCount;
+  const failedCount = results.filter(
+    (r) => r.success !== true && r.reason !== 'SYNC_BATCH_PAUSED',
+  ).length;
+  const pausedCount = Number(syncPaused?.pausedCount || 0);
 
-  if (failedCount === 0) {
+  if (failedCount === 0 && pausedCount === 0) {
     await updateSync({
       status: SYNC_STATUS.SUCCESS,
       lastSyncedAt: new Date().toISOString(),
       error: null,
+    });
+  } else if (pausedCount > 0) {
+    await updateSync({
+      status: SYNC_STATUS.FAILED,
+      error: {
+        code: 'BATCH_SYNC_PAUSED',
+        message:
+          syncPaused?.message ||
+          `同步已暂停：已确认成功 ${successCount} 条，剩余 ${pausedCount} 条待继续`,
+      },
     });
   } else {
     await updateSync({
@@ -2488,9 +3436,13 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
   if (onProgress) {
     onProgress({
       phase: 'batch_done',
-      message: `批量同步完成：成功 ${successCount}，失败 ${failedCount}`,
+      message:
+        pausedCount > 0
+          ? `批量同步已暂停：成功 ${successCount}，待继续 ${pausedCount}`
+          : `批量同步完成：成功 ${successCount}，失败 ${failedCount}`,
       successCount,
       failedCount,
+      pausedCount,
     });
   }
 
@@ -2520,11 +3472,23 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
     });
   }
 
+  trackSyncSuccess(successCount, {
+    source: 'batch_record_sync',
+    requestedCount: requestedRecordIds.length,
+    failedCount,
+  });
+
   return {
-    ok: failedCount === 0,
+    ok: failedCount === 0 && pausedCount === 0,
     results,
     successCount,
     failedCount,
+    pausedCount,
+    pausedRecordIds: Array.isArray(syncPaused?.pausedRecordIds)
+      ? syncPaused.pausedRecordIds
+      : [],
+    pausedReason: syncPaused?.reason || '',
+    pausedMessage: syncPaused?.message || '',
     requestedCount: requestedRecordIds.length,
     syncedCount: recordIdsToSync.length,
     skippedCount: skippedRecordIds.length,
@@ -2532,6 +3496,853 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
     commentLeadsSkippedCount,
     commentLeadsFailedCount,
   };
+}
+
+async function syncGroupRecordsWithRetry({
+  group,
+  requestTarget,
+  onProgress = null,
+  completedOffset = 0,
+  totalCount = 0,
+  requestSpacingMs,
+  rateLimitBaseDelayMs,
+  rateLimitMaxDelayMs,
+  rateLimitRetryAttempts,
+} = {}) {
+  const groupRecords = Array.isArray(group?.records) ? group.records : [];
+  const queue = chunkSyncRecordsForRequest(groupRecords).map((records) => ({
+    records,
+  }));
+  const normalizedRequestSpacingMs = normalizeSyncDelayMs(
+    requestSpacingMs,
+    SYNC_BATCH_REQUEST_SPACING_MS,
+  );
+  const normalizedRateLimitBaseDelayMs = normalizeSyncDelayMs(
+    rateLimitBaseDelayMs,
+    SYNC_RATE_LIMIT_RETRY_BASE_DELAY_MS,
+  );
+  const normalizedRateLimitMaxDelayMs = normalizeSyncDelayMs(
+    rateLimitMaxDelayMs,
+    SYNC_RATE_LIMIT_RETRY_MAX_DELAY_MS,
+  );
+  const normalizedRateLimitRetryAttempts = normalizeSyncAttemptCount(
+    rateLimitRetryAttempts,
+    SYNC_RATE_LIMIT_RETRY_ATTEMPTS,
+  );
+  const syncDiagnostics = {
+    maxRecordsPerRequest: MAX_SYNC_RECORDS_PER_REQUEST,
+    maxPayloadBytesPerRequest: MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST,
+    maxCommentRichRecordsPerRequest: MAX_SYNC_COMMENT_RICH_RECORDS_PER_REQUEST,
+    largeRecordBytesPerRequest: SYNC_LARGE_RECORD_BYTES_PER_REQUEST,
+    commentRichRecordCount: groupRecords.filter(isCommentRichSyncRecord).length,
+    requestSpacingMs: normalizedRequestSpacingMs,
+    initialChunkSizes: queue.map((item) => item.records.length),
+    requestCount: 0,
+    chunkSizes: [],
+    rateLimitRetryCount: 0,
+    rateLimitRetryDelaysMs: [],
+    paused: false,
+    pausedReason: '',
+    pausedCount: 0,
+  };
+  const groupResults = [];
+  const nonBlockingPausedRecords = [];
+  const nonBlockingPausedReasons = new Set();
+  let requestIndex = 0;
+  let lastRequestStartedAt = 0;
+  let syncPaused = null;
+
+  const emitProgress = (message, extra = {}) => {
+    if (!onProgress) return;
+    onProgress({
+      phase: 'batch_sync',
+      current: completedOffset + groupResults.length,
+      total: totalCount,
+      message,
+      ...extra,
+    });
+  };
+
+  while (queue.length > 0) {
+    if (syncPaused) {
+      break;
+    }
+
+    const work = queue.shift();
+    const chunkRecords = Array.isArray(work?.records)
+      ? work.records.filter(Boolean)
+      : [];
+
+    if (chunkRecords.length === 0) {
+      continue;
+    }
+
+    requestIndex += 1;
+    const plannedRequestCount = requestIndex + queue.length;
+    emitProgress(
+      plannedRequestCount > 1
+        ? `正在同步第 ${requestIndex}/${plannedRequestCount} 组...`
+        : `正在批量同步 ${chunkRecords.length} 条记录...`,
+    );
+
+    let batchResult = null;
+    for (let attempt = 0; attempt <= normalizedRateLimitRetryAttempts; attempt += 1) {
+      if (lastRequestStartedAt > 0) {
+        await waitForSyncRequestSlot(lastRequestStartedAt, normalizedRequestSpacingMs);
+      }
+
+      lastRequestStartedAt = Date.now();
+      syncDiagnostics.requestCount += 1;
+      syncDiagnostics.chunkSizes.push(chunkRecords.length);
+      batchResult = await runSyncBatchRequest(chunkRecords, requestTarget);
+
+      const attemptItems = getSyncBatchItems(batchResult);
+      const allItemsRateLimited =
+        attemptItems.length > 0 &&
+        attemptItems.every(
+          (item) => item?.ok !== true && isRateLimitedSyncItem(item, batchResult),
+        );
+      if (!isRateLimitedBatchResult(batchResult) && !allItemsRateLimited) {
+        break;
+      }
+
+      if (attempt >= normalizedRateLimitRetryAttempts) {
+        break;
+      }
+
+      const delayMs = resolveRateLimitRetryDelayMs(batchResult, attempt, {
+        baseDelayMs: normalizedRateLimitBaseDelayMs,
+        maxDelayMs: normalizedRateLimitMaxDelayMs,
+      });
+      syncDiagnostics.rateLimitRetryCount += 1;
+      syncDiagnostics.rateLimitRetryDelaysMs.push(delayMs);
+      emitProgress(
+        `同步接口触发限流，${Math.ceil(delayMs / 1000)} 秒后重试当前 ${chunkRecords.length} 条...`,
+      );
+      await sleep(delayMs);
+    }
+
+    const batchItems = getSyncBatchItems(batchResult);
+    const batchItemMap = new Map(
+      batchItems
+        .filter((item) => item && typeof item === 'object' && item.recordId)
+        .map((item) => [item.recordId, item]),
+    );
+
+    if (isRateLimitedBatchResult(batchResult)) {
+      const pausedRecords = [
+        ...nonBlockingPausedRecords,
+        ...chunkRecords,
+        ...collectQueuedSyncRecords(queue),
+      ];
+      syncPaused = buildSyncPausedMetadata({
+        reason: 'rate_limited',
+        message: `同步接口触发限流，已确认成功 ${groupResults.length} 条，剩余 ${pausedRecords.length} 条待稍后继续`,
+        pausedRecords,
+        batchResult,
+        blocking: true,
+      });
+      break;
+    }
+
+    if (batchItems.length === 0 && isIndeterminateBatchResult(batchResult)) {
+      if (canContinueAfterIsolatedSyncPause(chunkRecords)) {
+        nonBlockingPausedRecords.push(...chunkRecords);
+        nonBlockingPausedReasons.add(
+          normalizeBatchFailureReason(batchResult) || 'sync_result_unknown',
+        );
+        emitProgress(
+          `当前记录同步超时，已保留待继续，正在尝试后续记录...`,
+        );
+        continue;
+      }
+
+      const pausedRecords = [
+        ...nonBlockingPausedRecords,
+        ...chunkRecords,
+        ...collectQueuedSyncRecords(queue),
+      ];
+      syncPaused = buildSyncPausedMetadata({
+        reason: normalizeBatchFailureReason(batchResult) || 'sync_result_unknown',
+        message: `同步请求超时或中断，已确认成功 ${groupResults.length} 条，剩余 ${pausedRecords.length} 条待继续`,
+        pausedRecords,
+        batchResult,
+        blocking: true,
+      });
+      break;
+    }
+
+    const pausedRecords = [];
+    const finalResults = [];
+
+    for (const record of chunkRecords) {
+      const item = batchItemMap.get(record.id);
+      const resultItem = buildSyncRecordResultItem(record, item, batchResult);
+
+      if (!resultItem.success && isRateLimitedSyncItem(item, batchResult)) {
+        pausedRecords.push(record);
+        continue;
+      }
+
+      if (!resultItem.success && isIndeterminateSyncItem(item, batchResult)) {
+        pausedRecords.push(record);
+        continue;
+      }
+
+      finalResults.push(resultItem);
+    }
+
+    for (const resultItem of finalResults) {
+      await applySyncRecordResultItem(resultItem);
+      groupResults.push(resultItem);
+
+      emitProgress(`正在处理第 ${completedOffset + groupResults.length}/${totalCount} 条记录...`, {
+        recordId: resultItem.recordId,
+      });
+    }
+
+    if (pausedRecords.length > 0) {
+      if (canContinueAfterIsolatedSyncPause(pausedRecords)) {
+        nonBlockingPausedRecords.push(...pausedRecords);
+        const firstPausedItem = pausedRecords
+          .map((record) => batchItemMap.get(record.id))
+          .find(Boolean);
+        nonBlockingPausedReasons.add(
+          normalizeSyncItemFailureReason(firstPausedItem, batchResult) ||
+            'sync_result_unknown',
+        );
+        emitProgress(
+          `当前记录同步结果未知，已保留待继续，正在尝试后续记录...`,
+        );
+        continue;
+      }
+
+      const remainingRecords = [...pausedRecords, ...collectQueuedSyncRecords(queue)];
+      const firstPausedItem = pausedRecords
+        .map((record) => batchItemMap.get(record.id))
+        .find(Boolean);
+      const pauseReason = isRateLimitedSyncItem(firstPausedItem, batchResult)
+        ? 'rate_limited'
+        : normalizeSyncItemFailureReason(firstPausedItem, batchResult) ||
+          'sync_result_unknown';
+      syncPaused = buildSyncPausedMetadata({
+        reason: pauseReason,
+        message:
+          pauseReason === 'rate_limited'
+            ? `同步接口触发限流，已确认成功 ${groupResults.length} 条，剩余 ${remainingRecords.length} 条待稍后继续`
+            : `同步请求超时或结果未知，已确认成功 ${groupResults.length} 条，剩余 ${remainingRecords.length} 条待继续`,
+        pausedRecords: remainingRecords,
+        batchResult,
+        blocking: true,
+      });
+      break;
+    }
+  }
+
+  if (!syncPaused && nonBlockingPausedRecords.length > 0) {
+    const pausedCount = Array.from(
+      new Set(nonBlockingPausedRecords.map((record) => record?.id).filter(Boolean)),
+    ).length;
+    const primaryReason =
+      Array.from(nonBlockingPausedReasons).find(Boolean) || 'sync_result_unknown';
+    syncPaused = buildSyncPausedMetadata({
+      reason: primaryReason,
+      message: `部分记录同步超时或结果未知，已确认成功 ${groupResults.length} 条，剩余 ${pausedCount} 条待继续`,
+      pausedRecords: nonBlockingPausedRecords,
+      batchResult: null,
+      blocking: false,
+    });
+  }
+
+  if (syncPaused) {
+    syncDiagnostics.paused = true;
+    syncDiagnostics.pausedReason = syncPaused.reason;
+    syncDiagnostics.pausedCount = syncPaused.pausedCount;
+    syncDiagnostics.pausedBlocking = syncPaused.blocking !== false;
+  }
+
+  Object.defineProperty(groupResults, 'syncDiagnostics', {
+    value: syncDiagnostics,
+    enumerable: false,
+  });
+  if (syncPaused) {
+    Object.defineProperty(groupResults, 'syncPaused', {
+      value: syncPaused,
+      enumerable: false,
+    });
+  }
+  return groupResults;
+}
+
+async function runSyncBatchRequest(records, requestTarget) {
+  try {
+    return await syncBatch(records.map(buildSyncBatchRecordInput), requestTarget);
+  } catch (error) {
+    return {
+      ok: false,
+      status: 'error',
+      reason: ERROR_REASON.NETWORK_ERROR,
+      message: error?.message || 'Network error',
+      error: {
+        reason: ERROR_REASON.NETWORK_ERROR,
+        message: error?.message || 'Network error',
+      },
+      data: null,
+    };
+  }
+}
+
+function buildSyncBatchRecordInput(record) {
+  const syncType = record.syncType || record.type;
+  return {
+    id: record.id,
+    type: syncType,
+    payload: buildSyncRequestPayload(syncType, record.syncPayload || record.payload),
+  };
+}
+
+function buildSyncBatchRecordRequestShape(record) {
+  const syncType = record.syncType || record.type;
+  return {
+    recordId: record.id,
+    syncType,
+    payload: buildSyncRequestPayload(syncType, record.syncPayload || record.payload),
+  };
+}
+
+function buildSyncRequestPayload(syncType, payload) {
+  const normalizedType = String(syncType || '').trim();
+  if (
+    normalizedType === SYNC_TYPE.COMMENTS ||
+    normalizedType === SYNC_TYPE.COMMENT_LEADS
+  ) {
+    return payload;
+  }
+  // 恢复 HEAD 行为:内容同步【原样发送】,不剔结构化评论。
+  // 本 fork 没有独立的评论同步通道,服务端靠内容同步包里的 commentsCleanedItems 入库
+  // record_comments → 评论分诊/销售客资/评论时间。上游 0.1.7 的
+  // stripCommentCollectionsForContentSync 为瘦身把这些评论数组剔了,导致关键词笔记采集
+  // 的评论只剩合并文本、进不了表(列表能看到、但弹窗/分诊/客资全空)。故此处不再剔除。
+  return payload;
+}
+
+function stripCommentCollectionsForContentSync(value, seen = new WeakSet()) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  if (seen.has(value)) {
+    return null;
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((item) => stripCommentCollectionsForContentSync(item, seen));
+  }
+
+  const result = {};
+  Object.entries(value).forEach(([key, nestedValue]) => {
+    const isCommentCollection =
+      key === 'commentsCleanedItems' ||
+      key === 'commentsItems' ||
+      key === 'commentItems' ||
+      key === 'commentLeadsItems' ||
+      (key === 'comments' && Array.isArray(nestedValue));
+    if (isCommentCollection) {
+      return;
+    }
+    result[key] = stripCommentCollectionsForContentSync(nestedValue, seen);
+  });
+  return result;
+}
+
+function buildSyncRecordResultItem(record, item, batchResult) {
+  const debugUrl =
+    normalizeDebugUrl(item?.debugUrl) ||
+    (batchResult?.ok ? extractDebugUrl(batchResult) : '');
+  const success = item?.ok === true;
+  const reason =
+    item?.reason ||
+    (success
+      ? ERROR_REASON.NONE
+      : batchResult?.reason ||
+        batchResult?.error?.reason ||
+        batchResult?.error?.code ||
+        'SYNC_ERROR');
+  const message =
+    item?.message ||
+    (success
+      ? '同步成功'
+      : batchResult?.message || batchResult?.error?.message || '同步失败');
+
+  return {
+    recordId: record.id,
+    platform: record.platform || 'unknown',
+    type: record.syncType || record.type,
+    sourceType: record.sourceType || record.type,
+    workflow: record.workflow || '',
+    noteType:
+      (record.syncType || record.type) === 'single_note'
+        ? getSingleNoteType(record.syncPayload || record.payload)
+        : null,
+    success,
+    reason,
+    message,
+    debugUrl: debugUrl || null,
+    rawResponse: item?.rawResponse || batchResult,
+    error: success
+      ? null
+      : {
+          reason,
+          message,
+        },
+  };
+}
+
+async function applySyncRecordResultItem(resultItem) {
+  if (!resultItem?.recordId) return;
+
+  if (resultItem.success) {
+    await markRecordSynced(resultItem.recordId, resultItem.debugUrl || null);
+    return;
+  }
+
+  await updateRecord(resultItem.recordId, {
+    status: RECORD_STATUS.FAILED,
+    lastSyncedAt: Date.now(),
+    lastSyncReason: resultItem.reason,
+    lastSyncDebugUrl: resultItem.debugUrl || null,
+  });
+}
+
+function getSyncBatchItems(batchResult) {
+  return Array.isArray(batchResult?.data?.items) ? batchResult.data.items : [];
+}
+
+function collectQueuedSyncRecords(queue = []) {
+  return Array.isArray(queue)
+    ? queue.flatMap((item) =>
+        Array.isArray(item?.records) ? item.records.filter(Boolean) : [],
+      )
+    : [];
+}
+
+function buildSyncPausedMetadata({
+  reason,
+  message,
+  pausedRecords = [],
+  batchResult = null,
+  blocking = true,
+} = {}) {
+  const pausedRecordIds = Array.from(
+    new Set(
+      (Array.isArray(pausedRecords) ? pausedRecords : [])
+        .map((record) => String(record?.id || '').trim())
+        .filter(Boolean),
+    ),
+  );
+
+  return {
+    reason: String(reason || 'sync_result_unknown').trim() || 'sync_result_unknown',
+    message:
+      String(message || '').trim() ||
+      `同步已暂停，剩余 ${pausedRecordIds.length} 条待继续`,
+    pausedCount: pausedRecordIds.length,
+    pausedRecordIds,
+    rawResponse: batchResult,
+    blocking: blocking !== false,
+  };
+}
+
+function extendSyncPausedMetadata(paused, additionalRecords = [], {
+  confirmedSuccessCount = 0,
+} = {}) {
+  if (!paused || typeof paused !== 'object') {
+    return paused;
+  }
+  const additionalRecordIds = (Array.isArray(additionalRecords) ? additionalRecords : [])
+    .map((record) => String(record?.id || '').trim())
+    .filter(Boolean);
+
+  const pausedRecordIds = Array.from(
+    new Set([
+      ...(Array.isArray(paused.pausedRecordIds) ? paused.pausedRecordIds : []),
+      ...additionalRecordIds,
+    ]),
+  );
+  const reason = String(paused.reason || 'sync_result_unknown').trim();
+
+  return {
+    ...paused,
+    pausedCount: pausedRecordIds.length,
+    pausedRecordIds,
+    message: formatSyncPausedMessage(reason, confirmedSuccessCount, pausedRecordIds.length),
+  };
+}
+
+function mergeSyncPausedMetadata(current, next, {
+  confirmedSuccessCount = 0,
+} = {}) {
+  if (!current || typeof current !== 'object') {
+    return extendSyncPausedMetadata(next, [], { confirmedSuccessCount });
+  }
+  if (!next || typeof next !== 'object') {
+    return extendSyncPausedMetadata(current, [], { confirmedSuccessCount });
+  }
+
+  const pausedRecordIds = Array.from(
+    new Set([
+      ...(Array.isArray(current.pausedRecordIds) ? current.pausedRecordIds : []),
+      ...(Array.isArray(next.pausedRecordIds) ? next.pausedRecordIds : []),
+    ]),
+  );
+  const reasons = [
+    String(current.reason || '').trim(),
+    String(next.reason || '').trim(),
+  ].filter(Boolean);
+  const reason = reasons.includes('rate_limited')
+    ? 'rate_limited'
+    : Array.from(new Set(reasons)).length === 1
+      ? reasons[0]
+      : 'sync_result_unknown';
+
+  return {
+    ...current,
+    ...next,
+    reason,
+    blocking: current.blocking !== false || next.blocking !== false,
+    pausedCount: pausedRecordIds.length,
+    pausedRecordIds,
+    rawResponse: next.rawResponse || current.rawResponse || null,
+    message: formatSyncPausedMessage(reason, confirmedSuccessCount, pausedRecordIds.length),
+  };
+}
+
+function formatSyncPausedMessage(reason, confirmedSuccessCount, pausedCount) {
+  const isRateLimited = String(reason || '').trim() === 'rate_limited';
+  return isRateLimited
+    ? `同步接口触发限流，已确认成功 ${confirmedSuccessCount} 条，剩余 ${pausedCount} 条待稍后继续`
+    : `同步请求超时或结果未知，已确认成功 ${confirmedSuccessCount} 条，剩余 ${pausedCount} 条待继续`;
+}
+
+function normalizeBatchFailureReason(batchResult) {
+  return String(
+    batchResult?.reason ||
+      batchResult?.error?.reason ||
+      batchResult?.error?.code ||
+      batchResult?.data?.reason ||
+      '',
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeBatchFailureMessage(batchResult) {
+  return String(
+    batchResult?.message ||
+      batchResult?.error?.message ||
+      batchResult?.data?.message ||
+      '',
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeSyncItemFailureReason(item, batchResult) {
+  return String(
+    item?.reason ||
+      item?.error?.reason ||
+      item?.error?.code ||
+      normalizeBatchFailureReason(batchResult) ||
+      '',
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeSyncItemFailureMessage(item, batchResult) {
+  return String(
+    item?.message ||
+      item?.error?.message ||
+      normalizeBatchFailureMessage(batchResult) ||
+      '',
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function isRateLimitedBatchResult(batchResult) {
+  if (!batchResult || batchResult?.ok === true) {
+    return false;
+  }
+  return isRateLimitedSyncReason(
+    normalizeBatchFailureReason(batchResult),
+    normalizeBatchFailureMessage(batchResult),
+    batchResult?.error?.httpStatus || batchResult?.httpStatus,
+  );
+}
+
+function isRateLimitedSyncItem(item, batchResult) {
+  if (item?.ok === true) {
+    return false;
+  }
+  return isRateLimitedSyncReason(
+    normalizeSyncItemFailureReason(item, batchResult),
+    normalizeSyncItemFailureMessage(item, batchResult),
+    item?.httpStatus ||
+      item?.error?.httpStatus ||
+      batchResult?.error?.httpStatus ||
+      batchResult?.httpStatus,
+  );
+}
+
+function isRateLimitedSyncReason(reason, message = '', httpStatus = null) {
+  if (Number(httpStatus) === 429) {
+    return true;
+  }
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  if (normalizedReason && RATE_LIMIT_SYNC_REASONS.has(normalizedReason)) {
+    return true;
+  }
+  const searchable = `${normalizedReason} ${String(message || '').toLowerCase()}`;
+  return /(^|\s)429(\s|$)|too many requests|rate limit|rate_limited/.test(searchable);
+}
+
+function isIndeterminateBatchResult(batchResult) {
+  if (!batchResult || batchResult?.ok === true || isRateLimitedBatchResult(batchResult)) {
+    return false;
+  }
+  return isIndeterminateSyncReason(
+    normalizeBatchFailureReason(batchResult),
+    normalizeBatchFailureMessage(batchResult),
+  );
+}
+
+function isIndeterminateSyncItem(item, batchResult) {
+  if (item?.ok === true || isRateLimitedSyncItem(item, batchResult)) {
+    return false;
+  }
+  return isIndeterminateSyncReason(
+    normalizeSyncItemFailureReason(item, batchResult),
+    normalizeSyncItemFailureMessage(item, batchResult),
+  );
+}
+
+function isIndeterminateSyncReason(reason, message = '') {
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  if (normalizedReason && INDETERMINATE_SYNC_REASONS.has(normalizedReason)) {
+    return true;
+  }
+
+  const searchable = `${normalizedReason} ${String(message || '').toLowerCase()}`;
+  return /timeout|timed out|abort|aborted|network|fetch failed/.test(searchable);
+}
+
+function normalizeSyncDelayMs(value, fallback) {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return Math.floor(parsed);
+  }
+  return Math.max(0, Math.floor(Number(fallback) || 0));
+}
+
+function normalizeSyncAttemptCount(value, fallback) {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return Math.floor(parsed);
+  }
+  return Math.max(0, Math.floor(Number(fallback) || 0));
+}
+
+function resolveRateLimitRetryDelayMs(batchResult, attempt, {
+  baseDelayMs,
+  maxDelayMs,
+} = {}) {
+  const explicitMs = Number(
+    batchResult?.data?.retryAfterMs ||
+      batchResult?.data?.retry_after_ms ||
+      batchResult?.retryAfterMs,
+  );
+  if (Number.isFinite(explicitMs) && explicitMs > 0) {
+    return Math.min(Math.floor(explicitMs), maxDelayMs);
+  }
+
+  const explicitSeconds = Number(
+    batchResult?.data?.retryAfterSeconds ||
+      batchResult?.data?.retry_after_seconds ||
+      batchResult?.retryAfterSeconds,
+  );
+  if (Number.isFinite(explicitSeconds) && explicitSeconds > 0) {
+    return Math.min(Math.floor(explicitSeconds * 1000), maxDelayMs);
+  }
+
+  const multiplier = 2 ** Math.max(0, Math.floor(Number(attempt) || 0));
+  return Math.min(Math.max(0, baseDelayMs) * multiplier, maxDelayMs);
+}
+
+function sleep(ms) {
+  const delay = Math.max(0, Math.floor(Number(ms) || 0));
+  if (delay <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function waitForSyncRequestSlot(lastRequestStartedAt, spacingMs) {
+  const spacing = Math.max(0, Math.floor(Number(spacingMs) || 0));
+  if (!lastRequestStartedAt || spacing <= 0) {
+    return;
+  }
+  const elapsedMs = Date.now() - lastRequestStartedAt;
+  if (elapsedMs >= spacing) {
+    return;
+  }
+  await sleep(spacing - elapsedMs);
+}
+
+function canContinueAfterIsolatedSyncPause(records = []) {
+  const safeRecords = (Array.isArray(records) ? records : []).filter(Boolean);
+  return safeRecords.length === 1 && isIsolatedHeavySyncRecord(safeRecords[0]);
+}
+
+function isIsolatedHeavySyncRecord(record = {}) {
+  if (!record || typeof record !== 'object') {
+    return false;
+  }
+  if (isCommentRichSyncRecord(record)) {
+    return true;
+  }
+  return (
+    estimateJsonBytes(buildSyncBatchRecordRequestShape(record)) >=
+    SYNC_LARGE_RECORD_BYTES_PER_REQUEST
+  );
+}
+
+function chunkSyncRecordsForRequest(records = [], options = {}) {
+  if (!Array.isArray(records) || records.length === 0) {
+    return [];
+  }
+
+  const chunkOptions =
+    typeof options === 'number' ? { maxRecords: options } : options || {};
+  const maxRecords = Math.max(
+    1,
+    Math.floor(Number(chunkOptions.maxRecords || MAX_SYNC_RECORDS_PER_REQUEST)) || 1,
+  );
+  const maxPayloadBytes = Math.max(
+    1,
+    Math.floor(
+      Number(
+        chunkOptions.maxPayloadBytes || MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST,
+      ),
+    ) || MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST,
+  );
+  const chunks = [];
+  let currentChunk = [];
+  let currentBytes = 0;
+
+  const flushCurrentChunk = () => {
+    if (currentChunk.length === 0) return;
+    chunks.push(currentChunk);
+    currentChunk = [];
+    currentBytes = 0;
+  };
+
+  for (const record of records) {
+    const recordBytes = estimateJsonBytes(buildSyncBatchRecordRequestShape(record));
+    if (isIsolatedHeavySyncRecord(record)) {
+      flushCurrentChunk();
+      currentChunk.push(record);
+      currentBytes += recordBytes;
+      flushCurrentChunk();
+      continue;
+    }
+
+    const wouldExceedCount = currentChunk.length >= maxRecords;
+    const wouldExceedBytes =
+      currentChunk.length > 0 && currentBytes + recordBytes > maxPayloadBytes;
+
+    if (wouldExceedCount || wouldExceedBytes) {
+      flushCurrentChunk();
+    }
+
+    currentChunk.push(record);
+    currentBytes += recordBytes;
+
+    if (currentChunk.length >= maxRecords || currentBytes >= maxPayloadBytes) {
+      flushCurrentChunk();
+    }
+  }
+
+  flushCurrentChunk();
+  return chunks;
+}
+
+function isCommentRichSyncRecord(record = {}) {
+  const payload =
+    record?.syncPayload && typeof record.syncPayload === 'object'
+      ? record.syncPayload
+      : record?.payload && typeof record.payload === 'object'
+        ? record.payload
+        : {};
+  return countPayloadCommentItems(payload) >= SYNC_COMMENT_RICH_RECORD_MIN_COMMENTS;
+}
+
+function countPayloadCommentItems(value, seen = new Set()) {
+  if (!value || typeof value !== 'object') {
+    return 0;
+  }
+  if (seen.has(value)) {
+    return 0;
+  }
+  seen.add(value);
+
+  let count = 0;
+  const candidates = [
+    value.commentsCleanedItems,
+    value.commentsItems,
+    value.comments,
+  ];
+  candidates.forEach((candidate) => {
+    if (Array.isArray(candidate)) {
+      count += candidate.length;
+    }
+  });
+
+  const mergedText = String(value.commentsMergedText || '').trim();
+  if (mergedText) {
+    count += 1;
+  }
+
+  const detailPayload =
+    value.detailPayload && typeof value.detailPayload === 'object'
+      ? value.detailPayload
+      : null;
+  if (detailPayload) {
+    count += countPayloadCommentItems(detailPayload, seen);
+  }
+
+  if (Array.isArray(value.items)) {
+    value.items.forEach((item) => {
+      count += countPayloadCommentItems(item, seen);
+    });
+  }
+
+  return count;
+}
+
+function estimateJsonBytes(value) {
+  let text = '';
+  try {
+    text = JSON.stringify(value) || '';
+  } catch {
+    return MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST + 1;
+  }
+
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).length;
+  }
+
+  return text.length * 2;
 }
 
 function buildWorkflowSyncGroups(records = []) {
@@ -2613,35 +4424,6 @@ function estimateSyncBatchRecordBytes(record) {
   }
 }
 
-function splitSyncGroupRecordsForRequests(records = []) {
-  const chunks = [];
-  let current = [];
-  let currentBytes = 0;
-
-  records.forEach((record) => {
-    const recordBytes = estimateSyncBatchRecordBytes(record);
-    const shouldStartNext =
-      current.length > 0 &&
-      (current.length >= MAX_SYNC_RECORDS_PER_REQUEST ||
-        currentBytes + recordBytes > MAX_SYNC_REQUEST_PAYLOAD_BYTES);
-
-    if (shouldStartNext) {
-      chunks.push(current);
-      current = [];
-      currentBytes = 0;
-    }
-
-    current.push(record);
-    currentBytes += recordBytes;
-  });
-
-  if (current.length > 0) {
-    chunks.push(current);
-  }
-
-  return chunks;
-}
-
 function getSingleNoteType(payload) {
   const normalized = String(payload?.noteType || payload?.type || '').trim().toLowerCase();
   if (normalized === 'video' || normalized === '视频') {
@@ -2656,7 +4438,18 @@ function getSingleNoteType(payload) {
     return 'image';
   }
 
-  if (payload?.videoUrl || payload?.videoLink || payload?.video_url) {
+  if (
+    payload?.videoUrl ||
+    payload?.videoLink ||
+    payload?.video_url ||
+    payload?.playUrl ||
+    payload?.play_url ||
+    payload?.media?.videoUrl ||
+    payload?.media?.playUrl ||
+    (Array.isArray(payload?.videoUrls) && payload.videoUrls.length > 0) ||
+    (Array.isArray(payload?.videoList) && payload.videoList.length > 0) ||
+    (Array.isArray(payload?.videos) && payload.videos.length > 0)
+  ) {
     return 'video';
   }
 
@@ -2768,27 +4561,8 @@ export async function checkBeforeSync(requiredSyncTypes = [], options = {}) {
       };
     }
 
-    // 检查 3: 重新验证（同步前必须重新 verify）
-    if (onProgress) {
-      onProgress({
-        phase: 'sync_verify',
-        message: '正在校验激活状态...',
-      });
-    }
-    const verifyResult = await verify(auth.code);
-
-    if (!verifyResult.ok) {
-      // 验证失败，清空鉴权状态
-      const { clearAuth } = await import('./storage.js');
-      await clearAuth();
-
-      return {
-        ok: false,
-        error: verifyResult.error,
-      };
-    }
-
-    // 所有检查通过
+    // 后端 sync/syncBatch 会在真正写入前再次校验激活码；这里不再额外
+    // verify，避免每次同步前多唤醒一次 Neon。
     return {
       ok: true,
       error: null,
@@ -3739,6 +5513,7 @@ function cleanCommentsItems(items) {
     const userName = resolveCommentUserName(item);
     const userUrl = resolveCommentUserUrl(item);
     const ipLocation = resolveCommentIpLocation(item);
+    const publishTime = String(item.publishTime || item.publishedAt || item.time || item.date || '').trim();
     const preferredId = String(item.commentId || item.id || '').trim();
     const key =
       preferredId ||
@@ -3753,6 +5528,7 @@ function cleanCommentsItems(items) {
       ...(userId ? { userId } : {}),
       ...(userUrl ? { userUrl } : {}),
       ...(ipLocation ? { ipLocation } : {}),
+      ...(publishTime ? { publishTime } : {}),
     });
   });
 
@@ -4485,6 +6261,97 @@ function sanitizeListItemForStorage(item) {
 
 function isDetailCaptureRecordType(type) {
   return type === SYNC_TYPE.BLOGGER_NOTES || type === SYNC_TYPE.KEYWORD_NOTES;
+}
+
+function parseDetailKeywordFilter(raw) {
+  return String(raw || '')
+    .split(/[,，]/)
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .map((value) => ({
+      value,
+      normalized: value.toLowerCase(),
+    }))
+    .filter((item) => item.normalized);
+}
+
+function getFirstPayloadItem(payload) {
+  return Array.isArray(payload?.items) && payload.items.length > 0
+    ? payload.items[0]
+    : {};
+}
+
+function getDetailKeywordFilterRules(record) {
+  const recordType = record?.type || record?.recordType;
+  if (recordType !== SYNC_TYPE.BLOGGER_NOTES) {
+    return [];
+  }
+
+  const payload = record?.payload && typeof record.payload === 'object'
+    ? record.payload
+    : {};
+  if (String(payload.keywordFilterMode || '').trim() !== 'detail') {
+    return [];
+  }
+
+  return parseDetailKeywordFilter(payload.keywordFilter);
+}
+
+function buildDetailKeywordSearchText(record, detailPayload) {
+  const payload = record?.payload && typeof record.payload === 'object'
+    ? record.payload
+    : {};
+  const firstItem = getFirstPayloadItem(payload);
+  const tags = Array.isArray(detailPayload?.tags)
+    ? detailPayload.tags
+    : [];
+  return [
+    record?.title,
+    firstItem?.title,
+    firstItem?.content,
+    detailPayload?.title,
+    detailPayload?.content,
+    ...tags,
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+export function evaluateDetailKeywordFilter(record, detailPayload) {
+  const rules = getDetailKeywordFilterRules(record);
+  if (rules.length === 0) {
+    return {
+      matched: true,
+      keywords: [],
+      matchedKeywords: [],
+    };
+  }
+
+  const searchText = buildDetailKeywordSearchText(record, detailPayload);
+  const matchedKeywords = rules
+    .filter((rule) => searchText.includes(rule.normalized))
+    .map((rule) => rule.value);
+
+  return {
+    matched: matchedKeywords.length > 0,
+    keywords: rules.map((rule) => rule.value),
+    matchedKeywords,
+  };
+}
+
+function formatDetailKeywordFilterLabel(keywords = []) {
+  const normalized = Array.isArray(keywords)
+    ? keywords.map((keyword) => String(keyword || '').trim()).filter(Boolean)
+    : [];
+  if (normalized.length === 0) {
+    return '未设置';
+  }
+  if (normalized.length <= 3) {
+    return normalized.join('、');
+  }
+  return `${normalized.slice(0, 3).join('、')}等 ${normalized.length} 个`;
 }
 
 function ensureDetailCaptureFields(payload) {
@@ -5676,6 +7543,8 @@ export async function batchCaptureByUrls({
     }
 
     const url = urls[i];
+    let checkpointSession = null;
+    let profileRecordIds = [];
 
     if (onProgress) {
       onProgress({
@@ -5731,7 +7600,6 @@ export async function batchCaptureByUrls({
         });
       }
 
-      let profileRecordIds = [];
       let resolvedProfileMetrics = captureParams.profileMetrics;
       const shouldCaptureBloggerProfileFirst =
         mode === "blogger_notes" &&
@@ -5766,6 +7634,10 @@ export async function batchCaptureByUrls({
           profileRecordIds = savedProfiles
             .map((record) => record?.id)
             .filter(Boolean);
+          trackCoreCaptureSuccess(profileRecordIds.length, {
+            mode: 'blogger_profile',
+            source: 'batch_profile_capture',
+          });
         }
       }
 
@@ -5803,6 +7675,10 @@ export async function batchCaptureByUrls({
                 profileMetrics: resolvedProfileMetrics,
               }
             : captureParams;
+      checkpointSession = beginListCaptureCheckpointSession({
+        mode,
+        source: 'batch_link_capture',
+      });
       const captureResult = await captureInTab(runnerTabId, {
         mode,
         captureParams: effectiveCaptureParams,
@@ -5819,13 +7695,20 @@ export async function batchCaptureByUrls({
 
       // 入池
       if (captureResult?.ok) {
-        const recordsToSave = buildRecordsForStorage(captureResult);
-        if (recordsToSave.length > 0) {
-          const savedRecords =
-            recordsToSave.length === 1
-              ? [await addRecord(recordsToSave[0])]
-              : await addRecords(recordsToSave);
-          const noteRecordIds = savedRecords.map((r) => r?.id).filter(Boolean);
+        const saveResult = await saveCaptureResultRecords(captureResult, {
+          session: checkpointSession,
+        });
+        const savedRecords = Array.isArray(saveResult.savedRecords)
+          ? saveResult.savedRecords
+          : [];
+        const noteRecordIds = Array.isArray(saveResult.recordIds)
+          ? saveResult.recordIds
+          : [];
+        if (noteRecordIds.length > 0) {
+          trackCoreCaptureSuccess(savedRecords.length, {
+            mode,
+            source: 'batch_link_capture',
+          });
           const recordIds = [...profileRecordIds, ...noteRecordIds];
           const enhancementResult =
             mode === "single" && noteRecordIds.length === 1
@@ -5851,6 +7734,7 @@ export async function batchCaptureByUrls({
             canceled: canceledDuringEnhancement,
             commentsResult: enhancementResult?.commentsResult || null,
             bloggerMetricsResult: enhancementResult?.bloggerMetricsResult || null,
+            captureCacheStats: saveResult.cacheStats || null,
             warning:
               enhancementResult && !enhancementResult.ok
                 ? enhancementResult.error?.message || "可选增强采集失败"
@@ -5862,28 +7746,74 @@ export async function batchCaptureByUrls({
             break;
           }
         } else {
-          results.push({ url, ok: true, recordIds: profileRecordIds });
+          results.push({
+            url,
+            ok: true,
+            recordIds: profileRecordIds,
+            captureCacheStats: saveResult.cacheStats || null,
+          });
           successCount++;
         }
       } else {
-        results.push({
-          url,
-          ok: false,
-          error: captureResult?.error?.message || "采集失败",
-        });
-        failedCount++;
+        if (checkpointSession?.queue) {
+          await checkpointSession.queue.catch(() => null);
+        }
+        const partialRecordIds = collectListCaptureSessionRecordIds(
+          checkpointSession,
+        );
+        if (partialRecordIds.length > 0 || profileRecordIds.length > 0) {
+          results.push({
+            url,
+            ok: true,
+            partial: true,
+            recordIds: [...profileRecordIds, ...partialRecordIds],
+            captureCacheStats: createListCaptureCacheStats(checkpointSession),
+            warning: captureResult?.error?.message || "采集未完整完成",
+          });
+          successCount++;
+        } else {
+          results.push({
+            url,
+            ok: false,
+            error: captureResult?.error?.message || "采集失败",
+          });
+          failedCount++;
+        }
       }
     } catch (error) {
       if (isBatchCaptureCanceledError(error)) {
         canceled = true;
         break;
       }
-      results.push({
-        url,
-        ok: false,
-        error: error.message,
-      });
-      failedCount++;
+      if (checkpointSession?.queue) {
+        await checkpointSession.queue.catch(() => null);
+      }
+      const partialRecordIds = collectListCaptureSessionRecordIds(
+        checkpointSession,
+      );
+      if (partialRecordIds.length > 0 || profileRecordIds.length > 0) {
+        results.push({
+          url,
+          ok: true,
+          partial: true,
+          recordIds: [...profileRecordIds, ...partialRecordIds],
+          captureCacheStats: createListCaptureCacheStats(checkpointSession),
+          warning: error.message || "采集未完整完成",
+        });
+        successCount++;
+      } else {
+        results.push({
+          url,
+          ok: false,
+          error: error.message,
+        });
+        failedCount++;
+      }
+    } finally {
+      if (checkpointSession?.queue) {
+        await checkpointSession.queue.catch(() => null);
+      }
+      finishListCaptureCheckpointSession(checkpointSession);
     }
 
     // 随机延迟
@@ -5978,6 +7908,7 @@ export async function batchCaptureByKeywords({
     }
 
     const keyword = keywords[i];
+    let checkpointSession = null;
 
     if (onProgress) {
       onProgress({
@@ -6014,6 +7945,10 @@ export async function batchCaptureByKeywords({
       }
 
       // 在 runner tab 中执行采集
+      checkpointSession = beginListCaptureCheckpointSession({
+        mode: SYNC_TYPE.KEYWORD_NOTES,
+        source: 'batch_keyword_capture',
+      });
       const captureResult = await captureInTab(runnerTabId, {
         mode: 'keyword',
         captureParams: {
@@ -6033,41 +7968,96 @@ export async function batchCaptureByKeywords({
 
       // 入池
       if (captureResult?.ok) {
-        const recordsToSave = buildRecordsForStorage(captureResult);
-        if (recordsToSave.length > 0) {
-          const savedRecords =
-            recordsToSave.length === 1
-              ? [await addRecord(recordsToSave[0])]
-              : await addRecords(recordsToSave);
+        const saveResult = await saveCaptureResultRecords(captureResult, {
+          session: checkpointSession,
+        });
+        const savedRecords = Array.isArray(saveResult.savedRecords)
+          ? saveResult.savedRecords
+          : [];
+        const recordIds = Array.isArray(saveResult.recordIds)
+          ? saveResult.recordIds
+          : [];
+        if (recordIds.length > 0) {
+          trackCoreCaptureSuccess(savedRecords.length, {
+            mode: 'keyword',
+            source: 'batch_keyword_capture',
+          });
           results.push({
             keyword,
             ok: true,
-            recordIds: savedRecords.map((r) => r?.id).filter(Boolean),
+            recordIds,
+            captureCacheStats: saveResult.cacheStats || null,
           });
           successCount++;
         } else {
-          results.push({ keyword, ok: true, recordIds: [] });
+          results.push({
+            keyword,
+            ok: true,
+            recordIds: [],
+            captureCacheStats: saveResult.cacheStats || null,
+          });
           successCount++;
         }
       } else {
-        results.push({
-          keyword,
-          ok: false,
-          error: captureResult?.error?.message || '采集失败',
-        });
-        failedCount++;
+        if (checkpointSession?.queue) {
+          await checkpointSession.queue.catch(() => null);
+        }
+        const partialRecordIds = collectListCaptureSessionRecordIds(
+          checkpointSession,
+        );
+        if (partialRecordIds.length > 0) {
+          results.push({
+            keyword,
+            ok: true,
+            partial: true,
+            recordIds: partialRecordIds,
+            captureCacheStats: createListCaptureCacheStats(checkpointSession),
+            warning: captureResult?.error?.message || '采集未完整完成',
+          });
+          successCount++;
+        } else {
+          results.push({
+            keyword,
+            ok: false,
+            error: captureResult?.error?.message || '采集失败',
+          });
+          failedCount++;
+        }
       }
     } catch (error) {
       if (isBatchCaptureCanceledError(error)) {
         canceled = true;
         break;
       }
-      results.push({
-        keyword,
-        ok: false,
-        error: error.message,
-      });
-      failedCount++;
+      if (checkpointSession?.queue) {
+        await checkpointSession.queue.catch(() => null);
+      }
+      const partialRecordIds = collectListCaptureSessionRecordIds(
+        checkpointSession,
+      );
+      if (partialRecordIds.length > 0) {
+        results.push({
+          keyword,
+          ok: true,
+          partial: true,
+          recordIds: partialRecordIds,
+          captureCacheStats: createListCaptureCacheStats(checkpointSession),
+          warning: error.message || '采集未完整完成',
+        });
+        successCount++;
+      } else {
+        results.push({
+          keyword,
+          ok: false,
+          error: error.message,
+        });
+        failedCount++;
+      }
+    } finally {
+      if (checkpointSession?.queue) {
+        await checkpointSession.queue.catch(() => null);
+      }
+      finishListCaptureCheckpointSession(checkpointSession);
     }
 
     // 关键词间随机延迟（最后一个不延迟）
@@ -6350,7 +8340,7 @@ function buildKeywordSearchUrl(keyword, platform, baseSearchUrl) {
   const encodedKeyword = encodeURIComponent(keyword);
 
   if (platform === 'douyin') {
-    return `https://www.douyin.com/search/${encodedKeyword}?type=video`;
+    return `https://www.douyin.com/search/${encodedKeyword}?type=general`;
   }
 
   if (platform === 'weibo') {
@@ -6442,7 +8432,7 @@ async function captureInActiveTab({
     });
   }
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = await resolveCaptureTargetTab({ mode });
   if (!tab?.id) {
     throw new Error('未找到当前活动标签页');
   }
@@ -6451,6 +8441,86 @@ async function captureInActiveTab({
     mode,
     captureParams,
   });
+}
+
+function resolveExpectedPageTypeForCaptureMode(mode) {
+  switch (mode) {
+    case 'single':
+    case 'comments':
+      return PAGE_TYPE.NOTE_DETAIL;
+    case 'blogger_profile':
+    case 'blogger_notes':
+      return PAGE_TYPE.BLOGGER_PROFILE;
+    case 'keyword':
+      return PAGE_TYPE.SEARCH_RESULTS;
+    default:
+      return '';
+  }
+}
+
+function isSupportedCaptureTab(tab) {
+  const platform = detectPlatformFromUrl(String(tab?.url || ''));
+  return platform === 'xiaohongshu' || platform === 'douyin';
+}
+
+function normalizeSupportedPlatform(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'xiaohongshu' || normalized === 'douyin'
+    ? normalized
+    : '';
+}
+
+function isUsableCaptureTab(tab, runtime, expectedPageType = '') {
+  if (!tab?.id || !isSupportedCaptureTab(tab)) {
+    return false;
+  }
+
+  const tabUrl = String(tab?.url || '');
+  const tabPlatform = detectPlatformFromUrl(tabUrl);
+  const runtimePlatform =
+    normalizeSupportedPlatform(detectPlatformFromUrl(String(runtime?.lastPageUrl || ''))) ||
+    normalizeSupportedPlatform(runtime?.platform);
+
+  if (runtimePlatform && tabPlatform !== runtimePlatform) {
+    return false;
+  }
+
+  if (expectedPageType) {
+    return detectPageType(tabUrl) === expectedPageType;
+  }
+
+  return true;
+}
+
+async function resolveCaptureTargetTab({ mode = 'auto' } = {}) {
+  const expectedPageType = resolveExpectedPageTypeForCaptureMode(mode);
+  const runtime = await getRuntime().catch(() => ({}));
+  const [activeTab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+
+  if (isUsableCaptureTab(activeTab, runtime, expectedPageType)) {
+    return activeTab;
+  }
+
+  const runtimeTabId = Number(runtime?.lastActiveTabId);
+  if (
+    Number.isFinite(runtimeTabId) &&
+    runtimeTabId > 0 &&
+    runtimeTabId !== Number(activeTab?.id)
+  ) {
+    try {
+      const runtimeTab = await chrome.tabs.get(runtimeTabId);
+      if (isUsableCaptureTab(runtimeTab, runtime, expectedPageType)) {
+        return runtimeTab;
+      }
+    } catch {
+      // Fall through to the active tab error path below.
+    }
+  }
+
+  return activeTab || null;
 }
 
 async function captureInTab(
@@ -6465,7 +8535,8 @@ async function captureInTab(
     throw new Error('未找到可用标签页');
   }
 
-  const payload = buildContentRequest(mode, captureParams);
+  const taskContext = getActiveTaskContext();
+  const payload = appendTaskContext(buildContentRequest(mode, captureParams), taskContext);
   const response = await chrome.runtime.sendMessage({
     type: MESSAGE_TYPE.RELAY_TO_CONTENT,
     tabId: normalizedTabId,
@@ -6476,7 +8547,59 @@ async function captureInTab(
     const message =
       response?.error?.message ||
       '无法连接到页面采集脚本，请刷新当前页面后重试';
-    throw new Error(message);
+    const error = new Error(message);
+    void recordDiagnosticError({
+      taskContext,
+      source: 'capture-sync',
+      action: payload?.action || mode,
+      status: 'failed',
+      error,
+      metadata: {
+        phase: 'relay_to_content',
+      },
+    }).catch(() => null);
+    throw error;
+  }
+
+  const contentResponse = response.data;
+  if (contentResponse?.ok === false) {
+    void recordDiagnosticError({
+      taskContext: contentResponse.taskContext || taskContext,
+      source: 'content',
+      action: payload?.action || mode,
+      status: 'failed',
+      error: contentResponse.error || contentResponse,
+      metadata: {
+        phase: 'content_response',
+      },
+    }).catch(() => null);
+  } else {
+    const stageTrace = Array.isArray(contentResponse?.diagnostics?.stageTrace)
+      ? contentResponse.diagnostics.stageTrace
+      : [];
+    for (const stage of stageTrace.slice(0, 12)) {
+      await recordDiagnosticStage({
+        ...stage,
+        taskContext: contentResponse?.taskContext || taskContext,
+        featureKey:
+          stage?.featureKey ||
+          stage?.parentFeatureKey ||
+          contentResponse?.featureKey ||
+          taskContext?.featureKey ||
+          '',
+        source: stage?.source || 'content',
+      }).catch(() => null);
+    }
+    await recordDiagnosticAction({
+      taskContext: contentResponse?.taskContext || taskContext,
+      source: 'content',
+      action: payload?.action || mode,
+      status: 'completed',
+      metadata: {
+        mode,
+        type: contentResponse?.type || '',
+      },
+    }).catch(() => null);
   }
 
   return response.data;
@@ -6503,6 +8626,7 @@ function buildContentRequest(mode, captureParams = {}) {
         maxDetectedItems:
           captureParams.maxDetectedItems ?? captureParams.maxItems,
         keywordFilter: captureParams.keywordFilter || '',
+        deferKeywordFilter: Boolean(captureParams.deferKeywordFilter),
         profileMetrics: captureParams.profileMetrics,
         monitorPublishWindow: captureParams.monitorPublishWindow || '',
         monitorObserveWindowHours: captureParams.monitorObserveWindowHours,

@@ -67,6 +67,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [leadType, setLeadType] = useState(initial?.leadType ?? '')
   const [priority, setPriority] = useState(initial?.priority ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
+  const [sort, setSort] = useState<'default' | 'publish'>('default')
   const [rejudging, setRejudging] = useState(false)
   const [notice, setNotice] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
@@ -87,6 +88,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
       if (leadType && !isSales) params.set('leadType', leadType)
       if (priority) params.set('priority', priority)
       if (keyword.trim()) params.set('keyword', keyword.trim())
+      if (sort === 'publish') params.set('sort', 'publish')
       const data = await api.get<any>('/leads/comments?' + params.toString())
       setLeads(data.leads || [])
       setPagination(data.pagination || null)
@@ -95,7 +97,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     } finally {
       setLoading(false)
     }
-  }, [status, platform, leadType, priority, keyword, category, isSales, noun])
+  }, [status, platform, leadType, priority, keyword, sort, category, isSales, noun])
 
   useEffect(() => { load(1) }, [status, platform, leadType, priority, category]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -171,6 +173,11 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
         <WorkbenchSelect value={priority} onChange={e => setPriority(e.target.value)}>
           {PRIORITY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
+        <button onClick={() => setSort(s => s === 'publish' ? 'default' : 'publish')}
+          title="按评论发布时间从新到旧排序"
+          className={`rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors ${sort === 'publish' ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
+          最新发布
+        </button>
         <div className="relative min-w-[260px] flex-1 sm:flex-none">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -216,7 +223,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">类型</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">优先级</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">时间</th>
+                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">发布时间</th>
                   <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
                 </tr>
               </thead>
@@ -242,7 +249,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                     <td className="px-4 py-3 align-top"><StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge></td>
                     <td className="px-4 py-3 align-top"><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge></td>
                     <td className="px-4 py-3 align-top"><StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge></td>
-                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatDate(lead.captured_at)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{lead.publish_display || '—'}</td>
                     <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}>
                       <div className="flex justify-end gap-1">
                         {isSales ? <>

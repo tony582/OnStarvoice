@@ -3,6 +3,7 @@ import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { resolveLeadType, resolvePriority, leadReason } from '../services/comment-leads.js';
 import { classifyCommentWithAI } from '../services/ai-labeler.js';
+import { formatPublishDate } from '../services/publish-date.js';
 
 const router = Router();
 
@@ -122,15 +123,19 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
       SELECT *,
         (SELECT content FROM records r WHERE r.id = comment_leads.record_id) AS record_content,
         (SELECT ai_summary FROM records r WHERE r.id = comment_leads.record_id) AS record_ai_summary,
-        (SELECT sentiment FROM records r WHERE r.id = comment_leads.record_id) AS record_sentiment
+        (SELECT sentiment FROM records r WHERE r.id = comment_leads.record_id) AS record_sentiment,
+        (SELECT published_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_published_at
       FROM comment_leads
       ${where}
       ORDER BY
+        ${String(req.query.sort || '') === 'publish' ? 'comment_published_ts DESC NULLS LAST,' : ''}
         CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
         captured_at DESC,
         updated_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
+
+    leads.forEach(l => { l.publish_display = formatPublishDate(l.comment_published_at, l.captured_at); });
 
     return res.json({
       ok: true,

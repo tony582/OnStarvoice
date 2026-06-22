@@ -320,6 +320,7 @@ function extractComment(node) {
   const userName = extractCommentUserName(node, userLinkElement);
   const userId = extractCommentUserId(node, userLinkElement, userUrl);
   const ipLocation = extractCommentIpLocation(node);
+  const publishTime = extractCommentTime(node);
 
   const likes = extractCommentLikes(node);
 
@@ -335,9 +336,26 @@ function extractComment(node) {
       userId,
       userUrl,
       ipLocation,
+      publishTime,
       likes,
     },
   };
+}
+
+// 评论发布时间(保守:只接受"像时间"的文本,避免误抓评论正文里的时间词)
+function extractCommentTime(node) {
+  const timeRe = /^(编辑于\s*)?(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}|\d+\s*(?:分钟|小时|天|周|个?月|年)前|昨天|前天|今天|刚刚)/;
+  const candidates = [
+    ...querySelectorAll(["time[datetime]", "time", ".date", ".comment-date", ".create-time"], node),
+    ...querySelectorAll(['[class*="date"]', '[class*="time"]'], node),
+  ];
+  for (const el of candidates) {
+    const dt = cleanText(el?.getAttribute?.("datetime") || "");
+    if (dt && timeRe.test(dt)) return dt;
+    const t = cleanText(el?.textContent || "");
+    if (t && t.length <= 24 && timeRe.test(t)) return t;
+  }
+  return "";
 }
 
 function extractCommentUserName(node, userLinkElement) {

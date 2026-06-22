@@ -103,7 +103,7 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
           <section className="grid grid-cols-2 gap-3 rounded-lg border border-border p-3.5 text-[12px]">
             <Info label="评论者" value={lead.comment_author_name || '-'} />
             <Info label="IP 属地" value={lead.comment_ip_location || '-'} />
-            <Info label="用户 ID" value={lead.comment_author_id || '-'} />
+            <Info label="评论时间" value={lead.publish_display || '-'} />
             <Info label="评论点赞" value={formatNumber(lead.comment_like_count)} />
           </section>
 

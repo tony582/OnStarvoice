@@ -6,6 +6,7 @@
 
 import { queryOne, queryAll, execute, withTransaction, getSetting } from '../db/init.js';
 import { sendReportEmail } from './email-notifier.js';
+import { callLLMWithPrompt } from './ai-labeler.js';
 
 const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
 const SENTIMENT_COLOR = { positive: '#059669', neutral: '#6B7280', negative: '#DC2626' };
@@ -977,7 +978,76 @@ function buildSentimentStructure(stats, sentimentCounts) {
   return rows.map(row => ({ ...row, share: pct(row.count, total) }));
 }
 
-function enrichReportData(type, current, previous) {
+// 借鉴 MediaClaw 关键词舆情扫描:用 LLM 对本周期代表样本做跨样本六维研判,
+// 把"统计+模板话术"升级为真 AI 研判;每条议题/建议挂可回链的样本 id(取信管理层/PR)。
+async function buildAiOpinionInsight(tenantId, current) {
+  if (!tenantId) return null;
+  // 分层抽样:除重点负面/增长样本外,从情感样本的头/中/尾各取一截,保证中低互动的早期/长尾负面也进研判
+  const ss = current.sentimentSamples || [];
+  const mid = Math.floor(ss.length / 2);
+  const stratified = [...ss.slice(0, 10), ...ss.slice(mid, mid + 5), ...ss.slice(-5)];
+  const pool = [
+    ...(current.topNegative || []),
+    ...(current.risingRecords || []),
+    ...stratified,
+  ];
+  // 头部断层比:Top1 占 Top5 互动比例,判舆情是被少数爆款主导(易引导/易反转)还是普遍发酵(真实民意)
+  const interOf = (r) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0);
+  const tops = (current.topInteraction || []).map(interOf).sort((a, b) => b - a).slice(0, 5);
+  const topSum = tops.reduce((a, b) => a + b, 0);
+  const cliffPct = topSum > 0 ? Math.round((tops[0] || 0) / topSum * 100) : 0;
+  const seen = new Set();
+  const samples = [];
+  const idMap = {};
+  for (const r of pool) {
+    const id = r.id || r.record_id;
+    if (!id) continue;
+    if (!idMap[id]) idMap[id] = { title: String(r.title || '').slice(0, 80), url: r.url || r.record_url || '' };
+    if (seen.has(id)) continue;
+    seen.add(id);
+    samples.push({
+      id,
+      title: String(r.title || '').slice(0, 80),
+      sentiment: r.sentiment || '',
+      likes: Number(r.likes || 0),
+      comments: Number(r.comments_count || 0),
+      negComments: Number(r.negative_comment_count || 0),
+      summary: String(r.ai_summary || r.content || '').replace(/\s+/g, ' ').slice(0, 160),
+    });
+    if (samples.length >= 30) break;
+  }
+  if (samples.length < 3) return null;
+
+  const brandName = (await getSetting('brand_name', tenantId)) || '目标品牌';
+  const s = sentimentMap(current);
+  const negativeRate = pct(s.negative, current.total);
+  const systemPrompt = `你是「${brandName}」的资深舆情分析师。下面给你本周期统计概览 + 一批代表样本(每条含 id/标题/情感/互动/摘要)。请做**跨样本**的舆情研判,只输出 JSON:
+{
+  "heatTrend": "热度与走势研判(1-2句)",
+  "executiveSummary": "结论先行的管理层摘要(2-4句,点明风险等级、主要矛盾、是否需介入)",
+  "topicClusters": [{"topic":"议题名","summary":"该议题在讲什么/集中度","sampleIds":["命中样本id"]}],
+  "sentimentAndRisks": [{"point":"情绪/争议焦点","level":"高|中|低","sampleIds":["..."]}],
+  "userNeeds": ["从内容反映的用户诉求/需求"],
+  "brandSignals": ["对品牌/产品的具体信号(正或负)"],
+  "actionSuggestions": [{"title":"处置建议","rationale":"依据(哪些样本/信号)","nextStep":"具体下一步动作","sampleIds":["..."]}]
+}
+要求:sampleIds 只能用我给的样本 id;基于事实不臆造;聚类要跨样本归纳而非逐条复述;空字段用空数组/空串;简洁中文。`;
+  const userMessage = `【本周期概览】总量 ${current.total},负面 ${s.negative} 条(负面率 ${negativeRate}%)。
+【热度结构】Top1 内容占 Top5 互动的 ${cliffPct}%(断层比:越高=越被少数爆款主导/易引导易反转,越低=普遍发酵/更接近真实民意;请在 heatTrend 里据此判断本期舆情是"爆款主导"还是"普遍发酵")。
+【代表样本】(${samples.length} 条)
+${samples.map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}负评${x.negComments} | ${x.title} | ${x.summary}`).join('\n')}`;
+
+  try {
+    const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+    if (!result || typeof result !== 'object') return null;
+    return { ...result, sampleMap: idMap };
+  } catch (err) {
+    console.warn('[report] AI 研判失败:', err?.message || err);
+    return null;
+  }
+}
+
+async function enrichReportData(type, current, previous, tenantId) {
   const currentSentiment = sentimentMap(current);
   const previousSentiment = sentimentMap(previous);
   const negativeRate = pct(currentSentiment.negative, current.total);
@@ -1020,6 +1090,28 @@ function enrichReportData(type, current, previous) {
   const opinionIndex = buildOpinionIndex(current, previous, negativeRate, previousNegativeRate);
   const platformMatrix = buildPlatformMatrix(current);
   const sentimentStructure = buildSentimentStructure(current, currentSentiment);
+  // LLM 跨样本六维研判:仅邮件/定时报告自动跑(看板改按需触发,避免每次打开都烧 token+延迟)。
+  // 失败/无 key 返回 null,渲染层回落模板;绝不让报告因此崩。
+  let aiInsight = null;
+  if (type !== 'dashboard') {
+    try {
+      aiInsight = await buildAiOpinionInsight(tenantId, current);
+    } catch (e) {
+      console.warn('[report] AI 研判异常:', e?.message || e);
+    }
+  }
+  // AI 研判存在时前置进管理摘要/行动建议:所有 HTML 渲染器自动带上,数字型模板句保留在后
+  const execSummary = aiInsight?.executiveSummary
+    ? [`🤖 AI 研判：${aiInsight.executiveSummary}`, ...executiveSummary]
+    : executiveSummary;
+  const finalActionItems = (aiInsight?.actionSuggestions || []).length
+    ? [
+        ...aiInsight.actionSuggestions
+          .map(a => `${String(a?.title || '').trim()}${a?.nextStep ? '：' + String(a.nextStep).trim() : ''}`)
+          .filter(Boolean),
+        ...actionItems,
+      ]
+    : actionItems;
 
   return {
     ...current,
@@ -1050,17 +1142,24 @@ function enrichReportData(type, current, previous) {
     platformMatrix,
     sentimentStructure,
     dashboardCards,
-    executiveSummary,
-    actionItems,
+    executiveSummary: execSummary,
+    actionItems: finalActionItems,
+    aiInsight,
     collectionRecommendations,
   };
+}
+
+// 看板按需触发的 AI 研判(独立于看板加载,避免每次打开都跑 LLM)
+export async function generateOpinionInsight({ tenantId, periodStart, periodEnd }) {
+  const stats = await getReportStats(tenantId, periodStart, periodEnd);
+  return await buildAiOpinionInsight(tenantId, stats);
 }
 
 export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd }) {
   const previous = previousPeriod(periodStart, periodEnd);
   const currentStats = await getReportStats(tenantId, periodStart, periodEnd);
   const previousStats = await getReportStats(tenantId, previous.start, previous.end);
-  return enrichReportData('dashboard', currentStats, previousStats);
+  return await enrichReportData('dashboard', currentStats, previousStats, tenantId);
 }
 
 function styleBlock() {
@@ -1873,7 +1972,7 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
 
   const currentStats = await getReportStats(tenantId, start, end);
   const previousStats = await getReportStats(tenantId, previous.start, previous.end);
-  const stats = enrichReportData(type, currentStats, previousStats);
+  const stats = await enrichReportData(type, currentStats, previousStats, tenantId);
   const typeLabel = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
   const title = `StarVoice 星语舆情${typeLabel}`;
   const periodLabel = `${dateLabel(start)} - ${dateLabel(end)}`;

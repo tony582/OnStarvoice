@@ -89,7 +89,7 @@ export async function captureSingleNote() {
     const lastEditedAt = extractLastEditedAt(noteContext);
 
     // 提取媒体（图片/视频，传入容器）
-    const media = extractMedia(noteContext);
+    const media = extractMedia(noteContext, noteId);
 
     // 构建 payload（统一命名：对齐 payload-contract）
     const captureTimestamp = Date.now();
@@ -1174,39 +1174,44 @@ function resolveNoteType(noteContext = document, media = {}) {
  * @param {HTMLElement} noteContext - 笔记容器元素
  * @returns {Object} 媒体信息
  */
-function extractMedia(noteContext = document) {
+function extractMedia(noteContext = document, noteId = "") {
   console.log("[SingleNote] Extracting media from container...");
   const commentContainers = resolveCommentContainers(noteContext);
+  const isVideoPage = isVideoNotePage(noteContext);
 
   // 在容器内查询视频元素
-  let videoElement = querySelector(NOTE_DETAIL_SELECTORS.video, noteContext);
-  let hasVideo = Boolean(videoElement);
+  let videoElement = isVideoPage
+    ? querySelector(NOTE_DETAIL_SELECTORS.video, noteContext)
+    : null;
+  let hasVideo = Boolean(videoElement || isVideoPage);
 
   // 提取视频 URL（优先可外链 URL，避免 blob:）
-  let videoUrlCandidates = collectPlayableVideoUrls(videoElement);
+  let videoUrlCandidates = isVideoPage
+    ? collectPlayableVideoUrls(videoElement)
+    : [];
   let videoUrl = videoUrlCandidates[0] || "";
 
   // 严格限定 hasVideo：不仅要有元素，要么有有效的长链接，要么带有特定的播放器外壳
-  if (hasVideo && !videoUrl && !isVideoNotePage(noteContext)) {
+  if (hasVideo && !videoUrl && !isVideoPage) {
     // 这可能是一个用来占位或隐藏的 video，过滤掉
     hasVideo = false;
     videoElement = null;
   }
 
   // 去除高风险的全局 video 查询，严格限制在容器内以防止误採背景视频
-  if (!videoUrl && isVideoNotePage(noteContext)) {
+  if (!videoUrl && isVideoPage) {
     console.warn(
       "[SingleNote] Video element not found in container for a video note.",
     );
   }
 
-  if (!videoUrl) {
+  if (isVideoPage && !videoUrl) {
     videoUrl = extractVideoUrlFromMeta();
   }
-  if (!videoUrl) {
+  if (isVideoPage && !videoUrl) {
     videoUrl = extractVideoUrlFromPerformance();
   }
-  if (!videoUrl) {
+  if (isVideoPage && !videoUrl) {
     videoUrl = extractVideoUrlFromPageState();
   }
   if (videoUrl) {
@@ -1218,7 +1223,7 @@ function extractMedia(noteContext = document) {
   let coverImage = "";
   let images = [];
   if (hasVideo) {
-    coverImage = extractVideoCoverImage(videoElement, noteContext);
+    coverImage = extractVideoCoverImage(videoElement, noteContext, noteId);
   } else {
     // 图文优先按 swiper 索引排序并去重（data-swiper-slide-index = 0 即封面）
     const orderedSwiperImages = extractOrderedSwiperImages(noteContext);
@@ -1259,20 +1264,23 @@ function extractMedia(noteContext = document) {
     imageCount: uniqueImages.length,
   });
 
-  const finalVideoUrls = [
-    ...new Set(
-      [
-        videoUrl,
-        ...videoUrlCandidates,
-        extractVideoUrlFromMeta(),
-        extractVideoUrlFromPerformance(),
-        extractVideoUrlFromPageState(),
+  const finalVideoUrls = isVideoPage
+    ? [
+        ...new Set(
+          [
+            videoUrl,
+            ...videoUrlCandidates,
+            extractVideoUrlFromMeta(),
+            extractVideoUrlFromPerformance(),
+            extractVideoUrlFromPageState(),
+          ]
+            .map((url) => normalizeMediaUrl(url))
+            .filter((url) => isValidExternalVideoUrl(url)),
+        ),
       ]
-        .map((url) => normalizeMediaUrl(url))
-        .filter((url) => isValidExternalVideoUrl(url)),
-    ),
-  ];
-  const browserPlayableVideoUrls = buildPreferredXiaohongshuVideoUrls(finalVideoUrls);
+    : [];
+  const browserPlayableVideoUrls =
+    buildPreferredXiaohongshuVideoUrls(finalVideoUrls);
 
   return {
     hasVideo,
@@ -1485,11 +1493,11 @@ function extractVideoUrlFromUnknownState(state) {
   return "";
 }
 
-function extractVideoCoverImage(videoElement, noteContext = document) {
+function extractVideoCoverImage(videoElement, noteContext = document, noteId = "") {
   const candidates = [];
 
   if (videoElement) {
-    candidates.push(videoElement.poster, videoElement.getAttribute("poster"));
+    candidates.push(...extractCoverImageCandidatesFromElement(videoElement));
   }
 
   // 在容器内查询封面元素
@@ -1498,48 +1506,298 @@ function extractVideoCoverImage(videoElement, noteContext = document) {
     noteContext,
   );
   if (coverElement) {
-    candidates.push(
-      extractBackgroundImageUrl(coverElement),
-      coverElement.poster,
-      coverElement.src,
-      coverElement.getAttribute("poster"),
-      coverElement.getAttribute("src"),
-    );
+    candidates.push(...extractCoverImageCandidatesFromElement(coverElement));
   }
 
   // 在容器内查询 xg-poster
   const xgPoster = noteContext.querySelector("xg-poster, .xgplayer-poster");
   if (xgPoster) {
-    candidates.push(extractBackgroundImageUrl(xgPoster));
+    candidates.push(...extractCoverImageCandidatesFromElement(xgPoster));
   }
 
-  // 如果容器内找不到，回退到全局查询（但记录警告）
+  if (noteId) {
+    resolveNoteScopedMediaRoots(noteId).forEach((root) => {
+      candidates.push(...extractCoverImageCandidatesFromElement(root));
+    });
+
+    candidates.push(...extractImageCandidatesFromScriptsByNoteId(noteId));
+  }
+
+  // 如果容器内/当前 noteId 找不到，仅在全局 poster 唯一时回退，避免 SPA 旧播放器污染封面。
   if (candidates.filter(Boolean).length === 0) {
-    console.warn(
-      "[SingleNote] No cover found in container, trying global fallback...",
-    );
-    const globalPoster = document.querySelector("xg-poster, .xgplayer-poster");
-    if (globalPoster) {
-      candidates.push(extractBackgroundImageUrl(globalPoster));
+    const globalPosters = collectGlobalPosterFallbackElements();
+    if (globalPosters.length === 1) {
+      candidates.push(
+        ...extractCoverImageCandidatesFromElement(globalPosters[0]),
+      );
+    } else if (globalPosters.length > 1) {
+      console.warn(
+        "[SingleNote] Multiple global video posters found; skipping ambiguous cover fallback.",
+      );
     }
   }
 
-  // og:image 回退保持不变
+  const usableCandidates = candidates
+    .map((candidate) => cleanImageUrl(candidate))
+    .filter((url) => isLikelyContentImageUrl(url));
+  if (usableCandidates.length > 0) {
+    return usableCandidates[0];
+  }
+
+  // og:image 保留为最后兜底；在小红书 SPA 中它可能是上一条笔记的旧值。
   const metaCover = document.querySelector(
     'meta[property="og:image"], meta[name="og:image"]',
   );
-  if (metaCover) {
-    candidates.push(metaCover.getAttribute("content"));
-  }
-
-  for (const candidate of candidates) {
-    const normalized = cleanImageUrl(candidate);
-    if (normalized && isLikelyContentImageUrl(normalized)) {
-      return normalized;
-    }
+  const normalizedMetaCover = cleanImageUrl(
+    metaCover?.getAttribute("content") || "",
+  );
+  if (normalizedMetaCover && isLikelyContentImageUrl(normalizedMetaCover)) {
+    console.warn(
+      "[SingleNote] Falling back to og:image for video cover; it may be stale on SPA pages.",
+    );
+    return normalizedMetaCover;
   }
 
   return "";
+}
+
+function extractCoverImageCandidatesFromElement(element) {
+  if (!(element instanceof Element)) {
+    return [];
+  }
+
+  const candidates = [
+    extractBackgroundImageUrl(element),
+    element.currentSrc,
+    element.src,
+    element.poster,
+    element.getAttribute?.("poster"),
+    element.getAttribute?.("src"),
+    element.getAttribute?.("data-src"),
+    element.getAttribute?.("data-lazy-src"),
+    element.getAttribute?.("data-origin"),
+    element.getAttribute?.("data-original"),
+    element.dataset?.src,
+    element.dataset?.lazySrc,
+    element.dataset?.origin,
+  ];
+
+  if (element.matches?.("img")) {
+    candidates.push(...extractImageCandidateUrls(element));
+  }
+
+  element
+    .querySelectorAll?.(
+      "img, video[poster], xg-poster, .xgplayer-poster, [style*='background-image']",
+    )
+    .forEach((child) => {
+      if (child.matches?.("img")) {
+        candidates.push(...extractImageCandidateUrls(child));
+      } else {
+        candidates.push(
+          extractBackgroundImageUrl(child),
+          child.poster,
+          child.getAttribute?.("poster"),
+          child.getAttribute?.("src"),
+          child.getAttribute?.("data-src"),
+        );
+      }
+    });
+
+  return [
+    ...new Set(candidates.map((url) => normalizeMediaUrl(url)).filter(Boolean)),
+  ];
+}
+
+function resolveNoteScopedMediaRoots(noteId) {
+  const normalizedNoteId = String(noteId || "").trim();
+  if (!normalizedNoteId) {
+    return [];
+  }
+
+  const escapedNoteId = escapeCssString(normalizedNoteId);
+  const selectors = [
+    `[data-note-id="${escapedNoteId}"]`,
+    `[data-id="${escapedNoteId}"]`,
+    `[data-item-id="${escapedNoteId}"]`,
+    `a[href*="/explore/${escapedNoteId}"]`,
+    `a[href*="/video/${escapedNoteId}"]`,
+    `a[href*="/discovery/item/${escapedNoteId}"]`,
+    `a[href*="${escapedNoteId}"]`,
+    `[data-href*="${escapedNoteId}"]`,
+    `[data-url*="${escapedNoteId}"]`,
+  ];
+
+  const roots = [];
+  const seen = new Set();
+  queryElementsBySelectors(selectors).forEach((element) => {
+    const root = resolveNoteScopedMediaRoot(element, normalizedNoteId);
+    if (!root || seen.has(root)) {
+      return;
+    }
+    seen.add(root);
+    roots.push(root);
+  });
+
+  return roots;
+}
+
+function resolveNoteScopedMediaRoot(element, noteId) {
+  if (!(element instanceof Element)) {
+    return null;
+  }
+
+  if (elementMatchesNoteId(element, noteId)) {
+    return element;
+  }
+
+  const cardRoot = element.closest?.(
+    [
+      ".note-item",
+      ".feed-item",
+      ".explore-item",
+      ".cover",
+      "[data-note-id]",
+      "[data-id]",
+      "[data-item-id]",
+      "article",
+      "li",
+    ].join(","),
+  );
+
+  if (cardRoot && elementMatchesNoteId(cardRoot, noteId)) {
+    return cardRoot;
+  }
+
+  return element;
+}
+
+function elementMatchesNoteId(element, noteId) {
+  if (!(element instanceof Element) || !noteId) {
+    return false;
+  }
+
+  const directValues = [
+    element.getAttribute?.("data-note-id"),
+    element.getAttribute?.("data-id"),
+    element.getAttribute?.("data-item-id"),
+    element.getAttribute?.("href"),
+    element.getAttribute?.("data-href"),
+    element.getAttribute?.("data-url"),
+  ];
+  if (directValues.some((value) => String(value || "").includes(noteId))) {
+    return true;
+  }
+
+  return Boolean(
+    element.querySelector?.(
+      [
+        `a[href*="${escapeCssString(noteId)}"]`,
+        `[data-href*="${escapeCssString(noteId)}"]`,
+        `[data-url*="${escapeCssString(noteId)}"]`,
+      ].join(","),
+    ),
+  );
+}
+
+function queryElementsBySelectors(selectors, root = document) {
+  const elements = [];
+  const seen = new Set();
+
+  selectors.forEach((selector) => {
+    try {
+      root.querySelectorAll?.(selector).forEach((element) => {
+        if (!seen.has(element)) {
+          seen.add(element);
+          elements.push(element);
+        }
+      });
+    } catch {
+      // ignore invalid selector
+    }
+  });
+
+  return elements;
+}
+
+function collectGlobalPosterFallbackElements() {
+  return queryElementsBySelectors([
+    "xg-poster",
+    ".xgplayer-poster",
+    "video[poster]",
+  ]).filter((element) => {
+    const coverCandidates = extractCoverImageCandidatesFromElement(element)
+      .map((url) => cleanImageUrl(url))
+      .filter((url) => isLikelyContentImageUrl(url));
+    return coverCandidates.length > 0 && isElementVisibleEnough(element);
+  });
+}
+
+function extractImageCandidatesFromScriptsByNoteId(noteId) {
+  const normalizedNoteId = String(noteId || "").trim();
+  if (!normalizedNoteId) {
+    return [];
+  }
+
+  const candidates = [];
+  Array.from(document.querySelectorAll("script")).forEach((script) => {
+    const text = script?.textContent || "";
+    if (!text || !text.includes(normalizedNoteId)) {
+      return;
+    }
+
+    let startIndex = 0;
+    while (startIndex >= 0) {
+      const matchIndex = text.indexOf(normalizedNoteId, startIndex);
+      if (matchIndex < 0) {
+        break;
+      }
+      const windowText = text.slice(
+        Math.max(0, matchIndex - 4000),
+        Math.min(text.length, matchIndex + 4000),
+      );
+      const matches = windowText.match(/https?:\\?\/\\?\/[^"'\s\\]+/gi) || [];
+      matches.forEach((url) => candidates.push(decodeScriptUrlCandidate(url)));
+      startIndex = matchIndex + normalizedNoteId.length;
+    }
+  });
+
+  return candidates
+    .map((url) => cleanImageUrl(url))
+    .filter((url) => isLikelyContentImageUrl(url));
+}
+
+function decodeScriptUrlCandidate(url) {
+  return String(url || "")
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&");
+}
+
+function escapeCssString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function isElementVisibleEnough(element) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect?.();
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+
+  const style = window.getComputedStyle?.(element);
+  if (!style) {
+    return true;
+  }
+
+  return (
+    style.display !== "none" &&
+    style.visibility !== "hidden" &&
+    Number.parseFloat(style.opacity || "1") > 0
+  );
 }
 
 function extractVideoDuration(videoElement) {
@@ -1649,11 +1907,20 @@ function isInsideCommentContainer(node, commentContainers = []) {
 
 function extractBackgroundImageUrl(element) {
   if (!element) return "";
-  const holder = element.querySelector('[style*="background-image"]');
-  if (!holder) return "";
-  const style = holder.getAttribute("style") || "";
-  const match = style.match(/background-image\s*:\s*url\((['"]?)(.*?)\1\)/i);
-  return match ? match[2] : "";
+  const holders = [
+    element,
+    ...Array.from(
+      element.querySelectorAll?.('[style*="background-image"]') || [],
+    ),
+  ];
+  for (const holder of holders) {
+    const style = holder.getAttribute?.("style") || "";
+    const match = style.match(/background-image\s*:\s*url\((['"]?)(.*?)\1\)/i);
+    if (match?.[2]) {
+      return match[2];
+    }
+  }
+  return "";
 }
 
 function extractImageCandidateUrls(imageElement) {

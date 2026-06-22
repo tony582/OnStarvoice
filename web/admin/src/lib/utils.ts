@@ -83,3 +83,11 @@ export const LABELS = {
 export function platformName(key: string): string {
   return LABELS.platform[key] || key || '-'
 }
+
+// 账号名疑似品牌关联(经销商/员工/营销号):品牌/车型词 + 角色/营销词 → 非真实车主 UGC
+const KOE_BRAND_RE = /(安吉星|onstar|别克|凯迪拉克|雪佛兰|上汽通用|gl8|昂科威|君威|君越|英朗|威朗|科鲁兹|凯越|探界者|创酷|迈锐宝|cadillac|buick|chevrolet)/i
+const KOE_ROLE_RE = /(4s|店|销售|顾问|客服|服务|经销|官方|导购|试驾|售后|服务生|大话|说车|聊车|玩车|车评|讲车|谈车|解读|百科|严选|优选|学堂|课堂|研究所|资讯|那些事|车事)/i
+export function looksLikeKOEName(name?: string | null): boolean {
+  const n = String(name || '')
+  return KOE_BRAND_RE.test(n) && KOE_ROLE_RE.test(n)
+}

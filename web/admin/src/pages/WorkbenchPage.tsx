@@ -3,6 +3,7 @@ import { TriageQueue } from '@/pages/workbench/TriageQueue'
 import { LeadsQueue } from '@/pages/workbench/LeadsQueue'
 import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
 import { TicketFeedbackQueue } from '@/pages/workbench/TicketFeedbackQueue'
+import { ProcessingBanner } from '@/components/shared/ProcessingBanner'
 
 type QueueKey = 'triage' | 'leads' | 'feedback' | 'issues'
 const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'issues']
@@ -19,6 +20,7 @@ export function WorkbenchPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+      {(queue === 'triage' || queue === 'leads') && <ProcessingBanner />}
       {queue === 'triage' && <TriageQueue initial={initial} />}
       {queue === 'leads' && <LeadsQueue initial={initial} category="opinion" />}
       {queue === 'feedback' && <TicketFeedbackQueue />}

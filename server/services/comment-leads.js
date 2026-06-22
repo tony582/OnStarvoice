@@ -1,3 +1,5 @@
+import { parsePublishTimestamp } from './publish-date.js';
+
 const LEAD_TYPE_KEYWORDS = {
   // 销售客资:购买意向 / 询价 / 留联系方式(优先识别,归到「销售客资」)
   sales_intent: [
@@ -124,18 +126,19 @@ export async function upsertCommentLeadForComment(tx, { tenantId, record = {}, c
   const matchedKeywords = matchedKeywordsFor(comment, record);
   const aiResult = normalizeAiResult(comment.ai_result);
   const recordTitle = normalizeText(record.title || record.content || '').slice(0, 240);
+  const commentPublishedTs = String(comment.published_at || '').trim() ? parsePublishTimestamp(comment.published_at, comment.last_seen_at || comment.created_at) : null;
 
   return await tx.queryOne(`
     INSERT INTO comment_leads (
       tenant_id, record_id, comment_id, platform, lead_type, priority, status,
       record_title, record_url, comment_author_name, comment_author_id,
       comment_ip_location, comment_content, comment_like_count,
-      matched_keywords, reason, ai_result, captured_at
+      matched_keywords, reason, ai_result, captured_at, comment_published_ts
     ) VALUES (
       $1, $2, $3, $4, $5, $6, 'new',
       $7, $8, $9, $10,
       $11, $12, $13,
-      $14::jsonb, $15, $16::jsonb, COALESCE($17::timestamptz, now())
+      $14::jsonb, $15, $16::jsonb, COALESCE($17::timestamptz, now()), $18::timestamptz
     )
     ON CONFLICT (tenant_id, comment_id)
     DO UPDATE SET
@@ -173,6 +176,7 @@ export async function upsertCommentLeadForComment(tx, { tenantId, record = {}, c
       reason = excluded.reason,
       ai_result = excluded.ai_result,
       captured_at = excluded.captured_at,
+      comment_published_ts = excluded.comment_published_ts,
       updated_at = now()
     RETURNING *
   `, [
@@ -193,5 +197,6 @@ export async function upsertCommentLeadForComment(tx, { tenantId, record = {}, c
     leadReason(comment),
     JSON.stringify(aiResult),
     comment.last_seen_at || comment.created_at || null,
+    commentPublishedTs,
   ]);
 }

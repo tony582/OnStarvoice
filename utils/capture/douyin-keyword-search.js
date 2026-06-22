@@ -106,6 +106,7 @@ export async function captureDouyinKeywordNotes({
     };
     let lastGrowthAt = Date.now();
     let lastObservedCount = 0;
+    const emittedCheckpointKeys = new Set();
     const requiredStallRounds = 3;
 
     const emitProgress = (progress = {}) => {
@@ -124,6 +125,56 @@ export async function captureDouyinKeywordNotes({
       });
     };
 
+    const buildFilteredItems = () => {
+      const allItems = Array.from(noteMap.values());
+      const filteredItems = allItems.filter(
+        (item) => Number(item.likes || 0) >= normalizedMinLikes,
+      );
+      return filteredItems.slice(0, normalizedMaxDetectedItems);
+    };
+
+    const emitListCheckpoint = () => {
+      if (!onProgress) return;
+      const checkpointItems = buildFilteredItems().filter((item) => {
+        const key = String(item.noteId || item.url || "").trim();
+        if (!key || emittedCheckpointKeys.has(key)) return false;
+        emittedCheckpointKeys.add(key);
+        return true;
+      });
+      if (checkpointItems.length === 0) return;
+
+      emitProgress({
+        phase: "list_checkpoint",
+        message: "正在加载搜索结果",
+        listCheckpoint: {
+          type: SYNC_TYPE.KEYWORD_NOTES,
+          platform: "douyin",
+          items: checkpointItems,
+          payload: {
+            keyword: resolvedKeyword,
+            searchUrl: window.location.href,
+            totalCount: checkpointItems.length,
+            rawTotalCount: progressStats.detectedCount,
+            minLikes: normalizedMinLikes,
+            minInteraction: normalizedMinLikes,
+            sortDimension: DEFAULT_SORT_DIMENSION,
+            sortDimensionLabel: "点赞",
+            sortDimensionSource: "douyin_default",
+            maxDetectedItems: normalizedMaxDetectedItems,
+            filteredCount: checkpointItems.length,
+            filteredBeforeLimitCount: progressStats.qualifiedCount,
+            items: checkpointItems,
+            captureTimestamp: Date.now(),
+          },
+          meta: {
+            pageType: PAGE_TYPE.SEARCH_RESULTS,
+            captureStartedAt,
+            sourceUrl: window.location.href,
+          },
+        },
+      });
+    };
+
     const collectDetectedNotes = () => {
       mergeNotesIntoMap(
         noteMap,
@@ -139,6 +190,7 @@ export async function captureDouyinKeywordNotes({
         qualifiedCount,
         filteredCount: Math.min(qualifiedCount, normalizedMaxDetectedItems),
       };
+      emitListCheckpoint();
       return progressStats.detectedCount;
     };
 
@@ -165,7 +217,7 @@ export async function captureDouyinKeywordNotes({
           return {
             stop: true,
             reason: "max_items",
-            message: `达到抖音搜索结果探测上限（已探测 ${progressStats.detectedCount}/${normalizedMaxDetectedItems} 条，已筛选 ${progressStats.filteredCount} 条）`,
+            message: `达到抖音搜索结果加载上限（已加载 ${progressStats.detectedCount}/${normalizedMaxDetectedItems} 条，已筛选 ${progressStats.filteredCount} 条）`,
           };
         }
 
@@ -182,7 +234,7 @@ export async function captureDouyinKeywordNotes({
           return {
             stop: true,
             reason: "stall_timeout",
-            message: `连续 ${noNewContentCount} 轮、约 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已探测 ${progressStats.detectedCount} 条，已筛选 ${progressStats.filteredCount} 条）`,
+            message: `连续 ${noNewContentCount} 轮、约 ${Math.floor(normalizedStallTimeoutMs / 1000)} 秒无新增，结束滚动（已加载 ${progressStats.detectedCount} 条，已筛选 ${progressStats.filteredCount} 条）`,
           };
         }
 
@@ -199,7 +251,7 @@ export async function captureDouyinKeywordNotes({
     const filteredItems = allItems.filter(
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
     );
-    const items = filteredItems.slice(0, normalizedMaxDetectedItems);
+    const items = buildFilteredItems();
     const missingMetricCount = countMissingMetric(allItems, "likes");
     const metricCounts = allItems.map((item) => Number(item.likes || 0));
     const minMetricCount = metricCounts.length ? Math.min(...metricCounts) : 0;
@@ -379,6 +431,7 @@ function extractDouyinSearchCards(searchRoot) {
     const title = resolveSearchCardTitle(card, noteId, index);
     const coverImageUrl = resolveSearchCardCover(card);
     const author = resolveSearchCardAuthor(card);
+    const authorProfileUrl = resolveSearchCardAuthorProfileUrl(card, author);
     const cardMedia = collectMediaUrlsFromElement(card);
     const reverseMatchHints = buildReverseMatchHints({
       noteId,
@@ -387,6 +440,7 @@ function extractDouyinSearchCards(searchRoot) {
       videoUrl: cardMedia.videos[0] || "",
       title,
       author,
+      authorProfileUrl,
     });
     const duration = cleanText(
       getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.duration, card),
@@ -406,6 +460,9 @@ function extractDouyinSearchCards(searchRoot) {
       title,
       coverImageUrl,
       author,
+      authorProfileUrl,
+      authorUrl: authorProfileUrl,
+      profileUrl: authorProfileUrl,
       noteType,
       duration,
       publishDate,
@@ -436,16 +493,13 @@ function collectSearchCards(searchRoot) {
   const seen = new Set();
 
   rawNodes.forEach((node) => {
-    const card = node.matches?.(".search-result-card")
-      ? node
-      : node.querySelector?.(".search-result-card") ||
-      node.closest?.(".search-result-card") ||
-      null;
+    const card = resolveSearchCardContainer(node);
     if (!card) return;
-    if (!hasSearchResultVideoSignal(card)) return;
+    if (!hasSearchResultContentSignal(card)) return;
 
     const key =
       card.id ||
+      getSearchCardIdAttribute(card) ||
       `${String(card.className || "").slice(0, 80)}::${cleanText(card.innerText || "").slice(0, 80)}`;
     if (!key || seen.has(key)) return;
     seen.add(key);
@@ -455,7 +509,29 @@ function collectSearchCards(searchRoot) {
   return cards;
 }
 
-function hasSearchResultVideoSignal(card) {
+function resolveSearchCardContainer(node) {
+  if (!(node instanceof Element)) {
+    return null;
+  }
+
+  if (
+    node.matches?.(
+      '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+    )
+  ) {
+    return node;
+  }
+
+  return (
+    node.closest?.(
+      '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+    ) ||
+    node.querySelector?.(".search-result-card") ||
+    null
+  );
+}
+
+function hasSearchResultContentSignal(card) {
   if (!card) return false;
 
   const text = String(card.innerText || "");
@@ -470,9 +546,16 @@ function hasSearchResultVideoSignal(card) {
     '[href*="/video/"]',
     '[href*="/note/"]',
     '[data-href*="/video/"]',
+    '[data-href*="/note/"]',
     '[data-url*="/video/"]',
+    '[data-url*="/note/"]',
   ].join(",");
   if (card.matches?.(linkSelectors) || card.querySelector?.(linkSelectors)) {
+    return true;
+  }
+
+  const cardIdSignal = resolveSearchCardNumericId(card);
+  if (cardIdSignal && hasSearchCardWorkContentSignal(card)) {
     return true;
   }
 
@@ -483,8 +566,8 @@ function resolveSearchCardId(card, index = 0) {
   const idCandidates = [
     card?.id,
     card?.closest?.("[id^='waterfall_item_']")?.id,
-    card?.getAttribute?.("data-id"),
-    card?.getAttribute?.("data-aweme-id"),
+    getSearchCardIdAttribute(card),
+    getSearchCardIdAttribute(card?.querySelector?.("[id^='waterfall_item_'], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]")),
   ];
 
   for (const candidate of idCandidates) {
@@ -504,8 +587,48 @@ function resolveSearchCardId(card, index = 0) {
   return `search_card_${index + 1}`;
 }
 
+function resolveSearchCardNumericId(card) {
+  const id = resolveSearchCardId(card, -1);
+  return /^\d{8,}$/.test(String(id || "")) ? id : "";
+}
+
+function getSearchCardIdAttribute(node) {
+  if (!(node instanceof Element)) {
+    return "";
+  }
+
+  return (
+    node.getAttribute?.("data-e2e-aweme-id") ||
+    node.getAttribute?.("data-aweme-id") ||
+    node.getAttribute?.("data-awemeid") ||
+    node.getAttribute?.("data-id") ||
+    node.getAttribute?.("data-item-id") ||
+    node.getAttribute?.("data-modal-id") ||
+    ""
+  );
+}
+
+function hasSearchCardWorkContentSignal(card) {
+  if (!card) return false;
+
+  const text = cleanText(card.innerText || "");
+  if (/图文|图集|图片/.test(text)) return true;
+  if (/^\d{1,2}:\d{2}/m.test(text)) return true;
+  if (getFirstMatch(DOUYIN_DOM_PROFILE.searchResults.cards.fields.coverImage, card)) {
+    return true;
+  }
+  if (getFirstMatch(DOUYIN_DOM_PROFILE.searchResults.cards.fields.likes, card)) {
+    return true;
+  }
+  return Boolean(resolveSearchCardTitleFromLines(card));
+}
+
 function resolveSearchCardUrl(card, noteId, tabType) {
-  const anchors = Array.from(card?.querySelectorAll?.("a[href]") || []);
+  const anchors = Array.from(
+    card?.querySelectorAll?.(
+      "a[href], a[data-href], a[data-url], [data-href], [data-url]",
+    ) || [],
+  );
   const anchorCandidates = anchors.flatMap((anchor) => [
     anchor.getAttribute("href"),
     anchor.href,
@@ -530,20 +653,24 @@ function resolveSearchCardUrl(card, noteId, tabType) {
       continue;
     }
 
-    const noteId = extractNoteId(normalized);
-    if (!noteId) continue;
+    const candidateNoteId = extractNoteId(normalized);
+    if (!candidateNoteId) continue;
 
     if (/\/(?:video|note)\//i.test(normalized)) {
       return normalized;
     }
 
-    return `https://www.douyin.com/video/${noteId}`;
+    return buildDouyinDetailUrl(
+      candidateNoteId,
+      inferSearchCardContentType(card, normalized, tabType),
+    );
   }
 
   if (/^\d{8,}$/.test(String(noteId || ""))) {
-    if (tabType === "video" || tabType === "general") {
-      return `https://www.douyin.com/video/${noteId}`;
-    }
+    return buildDouyinDetailUrl(
+      noteId,
+      inferSearchCardContentType(card, "", tabType),
+    );
   }
 
   return "";
@@ -652,6 +779,116 @@ function resolveSearchCardAuthor(card) {
   return cleanText(match?.[1] || "");
 }
 
+function resolveSearchCardAuthorProfileUrl(card, author = "") {
+  const authorNodes = collectSearchCardAuthorNodes(card);
+  const candidates = [];
+  const normalizedAuthor = normalizeComparableAuthor(author);
+
+  const pushLinkCandidate = (node, baseScore = 0) => {
+    if (!(node instanceof Element)) return;
+    const rawUrl =
+      node.getAttribute?.("href") ||
+      node.getAttribute?.("data-href") ||
+      node.getAttribute?.("data-url") ||
+      node.href ||
+      "";
+    const url = normalizeDouyinAuthorProfileUrl(rawUrl);
+    if (!url) return;
+
+    const text = normalizeComparableAuthor(node.textContent || "");
+    const authorScore =
+      normalizedAuthor && text && text.includes(normalizedAuthor) ? 20 : 0;
+    candidates.push({
+      url,
+      score: baseScore + authorScore,
+    });
+  };
+
+  authorNodes.forEach((node) => {
+    if (!(node instanceof Element)) return;
+    pushLinkCandidate(node, 80);
+    pushLinkCandidate(
+      node.closest?.(
+        'a[href*="/user/"],a[data-href*="/user/"],a[data-url*="/user/"]',
+      ),
+      70,
+    );
+    node
+      .querySelectorAll?.(
+        'a[href*="/user/"],a[data-href*="/user/"],a[data-url*="/user/"]',
+      )
+      .forEach((link) => pushLinkCandidate(link, 65));
+  });
+
+  card
+    ?.querySelectorAll?.(
+      'a[href*="/user/"],a[data-href*="/user/"],a[data-url*="/user/"]',
+    )
+    .forEach((link) => pushLinkCandidate(link, 40));
+
+  const deduped = new Map();
+  candidates.forEach((candidate) => {
+    const previous = deduped.get(candidate.url);
+    if (!previous || candidate.score > previous.score) {
+      deduped.set(candidate.url, candidate);
+    }
+  });
+
+  const bestCandidate = Array.from(deduped.values()).sort(
+    (left, right) => right.score - left.score,
+  )[0];
+
+  return bestCandidate?.url || "";
+}
+
+function collectSearchCardAuthorNodes(card) {
+  if (!card) return [];
+
+  const nodes = [];
+  const seen = new Set();
+  const push = (node) => {
+    if (!(node instanceof Element) || seen.has(node)) return;
+    seen.add(node);
+    nodes.push(node);
+  };
+
+  (DOUYIN_DOM_PROFILE.searchResults.cards.fields.author || []).forEach(
+    (selector) => {
+      try {
+        if (card.matches?.(selector)) {
+          push(card);
+        }
+        card.querySelectorAll?.(selector).forEach(push);
+      } catch {}
+    },
+  );
+
+  return nodes;
+}
+
+function normalizeDouyinAuthorProfileUrl(raw) {
+  const normalized = normalizeUrl(raw);
+  if (!normalized) return "";
+
+  try {
+    const parsed = new URL(normalized, "https://www.douyin.com");
+    const match = parsed.pathname.match(/\/user\/([^/?#]+)/i);
+    const userId = match?.[1] || "";
+    if (!userId) return "";
+    return `https://www.douyin.com/user/${userId}`;
+  } catch {
+    const match = normalized.match(/\/user\/([^/?#]+)/i);
+    return match?.[1] ? `https://www.douyin.com/user/${match[1]}` : "";
+  }
+}
+
+function normalizeComparableAuthor(value) {
+  return cleanText(value || "")
+    .replace(/^@/, "")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
 function resolveSearchCardPublishDate(card) {
   const direct = cleanText(
     getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.publishDate, card),
@@ -664,16 +901,42 @@ function resolveSearchCardPublishDate(card) {
 }
 
 function resolveSearchCardNoteType(card, noteUrl, tabType) {
-  if (/\/note\//i.test(noteUrl)) {
+  return inferSearchCardContentType(card, noteUrl, tabType) === "image"
+    ? "image"
+    : "video";
+}
+
+function inferSearchCardContentType(card, url = "", tabType = "") {
+  if (/\/note\//i.test(String(url || ""))) {
+    return "image";
+  }
+  if (/\/video\//i.test(String(url || ""))) {
+    return "video";
+  }
+
+  const normalizedTabType = cleanText(tabType || "").toLowerCase();
+  if (
+    /^(?:note|image|photo|photos|pic|picture|tuwen|图文)$/.test(
+      normalizedTabType,
+    )
+  ) {
     return "image";
   }
 
   const text = cleanText(card?.innerText || "");
-  if (/^\d{1,2}:\d{2}/.test(text)) {
+  if (/图文|图集|图片/.test(text)) {
+    return "image";
+  }
+  if (/^\d{1,2}:\d{2}/m.test(text)) {
     return "video";
   }
 
-  return tabType === "video" ? "video" : "video";
+  return "video";
+}
+
+function buildDouyinDetailUrl(noteId, contentType = "video") {
+  const path = contentType === "image" ? "note" : "video";
+  return `https://www.douyin.com/${path}/${noteId}`;
 }
 
 function detectSearchTabType() {

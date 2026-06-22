@@ -35,6 +35,7 @@ import keywordOpportunityRouter, { keywordAnalysisRouter, benchmarkDiscoveryRout
 import contentRouter from './routes/content.js';
 import imageProxyRouter from './routes/image-proxy.js';
 import ticketsRouter from './routes/tickets.js';
+import { asrMediaRouter } from './services/asr-media-host.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -122,6 +123,8 @@ app.use('/api/benchmark-discovery', benchmarkDiscoveryRouter);
 app.use('/api/content', contentRouter);
 app.use('/api/img', imageProxyRouter);
 app.use('/api/tickets', ticketsRouter);
+// 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
+app.use('/api/asr-media', asrMediaRouter);
 
 app.post('/api/admin/test-email', requireAdmin, async (req, res) => {
   try { return res.json(await sendTestEmail()); }
@@ -175,6 +178,58 @@ async function start() {
     console.log(`  ║  Admin: http://localhost:${PORT}/admin       ║`);
     console.log(`  ╚══════════════════════════════════════════╝\n`);
   });
+
+  // 自愈:启动 15s 后(避开启动峰值)非阻塞补回积压的评论入库 ——
+  // 异步队列曾因 LLM 请求挂死而卡死、或进程重启丢失内存队列,导致 record_comments 漏入。
+  // 评论数据本就安全存在 records.payload,这里从 payload 重新入库。LLM 已加超时,不会再卡。
+  setTimeout(() => {
+    import('./services/comment-workflow.js')
+      .then(m => m.reprocessPendingComments())
+      .catch(err => console.error('[Reprocess] 启动自愈失败:', err.message));
+  }, 15000);
+
+  // 后台 AI 精炼:评论已规则入库且可见,这里持续把"未 AI 分类"的评论批量精炼回填。
+  // 自调度循环(不重叠):单轮把积压排干(分多次 limit),再隔 15s 检查;LLM 失败的留到下轮重试。
+  const drainCommentAi = async () => {
+    try {
+      const m = await import('./services/comment-workflow.js');
+      let total = 0;
+      for (let i = 0; i < 30; i++) { // 单轮上限 30×300=9000,防跑飞
+        const n = await m.refineCommentsWithAI({ limit: 300 });
+        total += n;
+        if (n === 0) break;
+      }
+      if (total) console.log(`[CommentRefine] 本轮 AI 精炼 ${total} 条评论`);
+    } catch (err) {
+      console.error('[CommentRefine] 轮询失败:', err.message);
+    } finally {
+      setTimeout(drainCommentAi, 15000);
+    }
+  };
+  setTimeout(drainCommentAi, 20000); // 启动 20s 后开始(让 15s 的 reprocess 先把评论入库)
+
+  // 一次性:上汽通用监控范围放宽(别克/凯迪拉克/雪佛兰/车机壁纸等现算相关)后,
+  // 把存量"原判 irrelevant"的记录重判一遍 —— 该进分诊的自动进,无需重采。gated 只跑一次。
+  setTimeout(async () => {
+    try {
+      const { queryAll } = await import('./db/init.js');
+      const FLAG = 'relabel_saicgm_scope_v3';
+      const done = await queryAll('SELECT 1 FROM schema_migrations WHERE version = $1', [FLAG]);
+      if (done.length) return;
+      const { labelRecord } = await import('./services/ai-labeler.js');
+      const recs = await queryAll("SELECT id FROM records WHERE ai_result->>'relevance' = 'irrelevant'");
+      if (recs.length) {
+        console.log(`[Relabel] 上汽通用范围放宽:重判 ${recs.length} 条原判无关的记录`);
+        for (const r of recs) {
+          try { await labelRecord(r.id, { force: true }); } catch (e) { console.error('[Relabel]', r.id, e.message); }
+        }
+      }
+      await queryAll('INSERT INTO schema_migrations (version) VALUES ($1)', [FLAG]);
+      console.log('[Relabel] 完成');
+    } catch (e) {
+      console.error('[Relabel] 启动重判失败:', e.message);
+    }
+  }, 25000);
 }
 
 start().catch(err => {
