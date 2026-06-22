@@ -2,7 +2,7 @@
 
 面向 **上汽通用 / 安吉星** 的多租户社媒舆情监控平台:Chrome 扩展采集小红书 / 抖音 / 微博内容与评论 → 后端 AI 研判、分诊、客资、工单、报告 → Web 后台运营。
 
-> 部署/运维细节见 [`deploy/DEPLOY.md`](deploy/DEPLOY.md);本文是架构与开发总览。
+> 本文是**架构与开发总览**。另见:运营操作 [`docs/用户操作手册.md`](docs/用户操作手册.md) · 接口参考 [`docs/API接口文档.md`](docs/API接口文档.md) · 部署运维 [`deploy/DEPLOY.md`](deploy/DEPLOY.md)。
 
 ---
 
