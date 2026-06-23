@@ -244,7 +244,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           <div className="overflow-x-auto">
             <table className="w-full min-w-[920px] text-sm">
               <thead>
-                <tr className="border-b border-border bg-muted">
+                <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
                   {canWrite() && (
                     <th className="w-10 px-4 py-2.5">
                       <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(l => l.id), !allChecked)} />
@@ -262,10 +262,10 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                   <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody className="divide-y divide-border/40">
                 {leads.map(lead => (
                   <tr key={lead.id} onClick={() => setDrawer(lead)}
-                    className={`cursor-pointer transition-colors hover:bg-muted/40 ${drawer?.id === lead.id ? 'bg-accent' : sel.has(lead.id) ? 'bg-primary/[0.04]' : ''}`}>
+                    className={`cursor-pointer transition-colors hover:bg-accent/45 ${drawer?.id === lead.id ? 'bg-accent' : sel.has(lead.id) ? 'bg-primary/[0.04]' : ''}`}>
                     {canWrite() && (
                       <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}><Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} /></td>
                     )}

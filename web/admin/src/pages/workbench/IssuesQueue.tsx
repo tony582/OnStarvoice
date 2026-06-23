@@ -64,9 +64,9 @@ export function IssuesQueue({ initial }: { initial?: Record<string, string> }) {
       ) : issues.length === 0 ? (
         <EmptyState icon={AlertCircle} title="暂无问题" description="在分诊队列中将内容转为问题后显示在这里" />
       ) : (
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
+        <div className="overflow-hidden rounded-xl border border-border bg-card">
           <table className="w-full text-sm">
-            <thead><tr className="border-b border-border bg-muted/50">
+            <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
               <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">问题</th>
               <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">级别</th>
               <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">状态</th>
@@ -75,9 +75,9 @@ export function IssuesQueue({ initial }: { initial?: Record<string, string> }) {
               <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">更新时间</th>
               {canWrite() && <th className="px-4 py-3 text-right text-[11px] font-bold uppercase tracking-wide text-muted-foreground">操作</th>}
             </tr></thead>
-            <tbody className="divide-y divide-border">
+            <tbody className="divide-y divide-border/40">
               {issues.map(i => (
-                <tr key={i.id} className="cursor-pointer transition-colors hover:bg-muted/30" onClick={() => openDetail(i.id)}>
+                <tr key={i.id} className="cursor-pointer transition-colors hover:bg-accent/45" onClick={() => openDetail(i.id)}>
                   <td className="px-4 py-3">
                     <div className="font-medium">{i.title || '未命名问题'}</div>
                     <div className="mt-0.5 text-xs text-muted-foreground">{i.primary_record_platform} {i.primary_record_title}</div>

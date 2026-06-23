@@ -56,7 +56,7 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
       ) : (
         <WorkbenchTableShell>
           <table className="w-full text-sm">
-            <thead><tr className="border-b border-border bg-muted">
+            <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">博主</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">平台</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
@@ -64,11 +64,11 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">上次 / 下次</th>
               <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
             </tr></thead>
-            <tbody className="divide-y divide-border">
+            <tbody className="divide-y divide-border/40">
               {subs.map(s => {
                 const err = (s.last_error || '').trim()
                 return (
-                  <tr key={s.id} className="align-top transition-colors hover:bg-muted/30">
+                  <tr key={s.id} className="align-top transition-colors hover:bg-accent/45">
                     <td className="px-4 py-3">
                       <div className="font-medium">{s.name || s.bloggerName || '博主'}</div>
                       {(s.account_url || s.accountUrl)

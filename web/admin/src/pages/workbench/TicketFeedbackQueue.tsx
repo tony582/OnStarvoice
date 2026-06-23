@@ -84,15 +84,15 @@ export function TicketFeedbackQueue() {
       ) : (
         <WorkbenchTableShell>
           <table className="w-full min-w-[920px] text-sm">
-            <thead><tr className="border-b border-border bg-muted">
+            <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">工单内容</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">客服状态</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">处理结果</th>
               <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
             </tr></thead>
-            <tbody className="divide-y divide-border">
+            <tbody className="divide-y divide-border/40">
               {items.map(it => (
-                <tr key={it.id} onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-muted/30 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
+                <tr key={it.id} onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-accent/45 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
                   <td className="max-w-[380px] px-4 py-3">
                     <div className="mb-1 flex items-center gap-1.5">
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>

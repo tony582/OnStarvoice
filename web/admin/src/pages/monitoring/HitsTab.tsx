@@ -103,7 +103,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
           <div className="overflow-x-auto">
             <table className="w-full min-w-[1020px] text-sm">
               <thead>
-                <tr className="border-b border-border bg-muted">
+                <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">命中内容</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">监控项</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">作者</th>
@@ -112,9 +112,9 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">命中时间</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody className="divide-y divide-border/40">
                 {hits.map(hit => (
-                  <tr key={hit.observation_id} className="align-top transition-colors hover:bg-muted/30">
+                  <tr key={hit.observation_id} className="align-top transition-colors hover:bg-accent/45">
                     <td className="max-w-[410px] px-4 py-3">
                       <div className="flex flex-wrap items-center gap-2">
                         <StatusBadge tone="neutral">{platformName(hit.platform)}</StatusBadge>

@@ -186,7 +186,7 @@ export function ReportsTab() {
         </div>
       )}
 
-      <section className="rounded-lg border border-border bg-card">
+      <section className="overflow-hidden rounded-xl border border-border bg-card">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
           <div>
             <h3 className="text-base font-bold">历史报告</h3>
@@ -206,7 +206,7 @@ export function ReportsTab() {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-border bg-muted/50">
+                <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
                   <th className="px-5 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">报告</th>
                   <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">周期</th>
                   <th className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">状态</th>
@@ -214,9 +214,9 @@ export function ReportsTab() {
                   <th className="px-5 py-3 text-right text-[11px] font-bold uppercase tracking-wide text-muted-foreground">操作</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody className="divide-y divide-border/40">
                 {reports.map(report => (
-                  <tr key={report.id} className="transition-colors hover:bg-muted/30">
+                  <tr key={report.id} className="transition-colors hover:bg-accent/45">
                     <td className="min-w-[360px] px-5 py-4">
                       <div className="flex flex-wrap items-center gap-2">
                         <StatusBadge tone="neutral">{LABELS.reportType[report.report_type] || report.report_type}</StatusBadge>
