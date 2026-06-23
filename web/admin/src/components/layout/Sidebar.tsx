@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, ListChecks, HandCoins,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -21,14 +21,13 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
-  { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsFeedback', dot: 'bg-violet-500' },
+  { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsPending', dot: 'bg-violet-500' },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
-    { id: 'opinion', label: '舆情处理', icon: ListChecks, badgeKeys: ['ticketsPending'] },
     { id: 'monitoring', label: '关注博主', icon: Radar, badgeKeys: ['monitorAttention'] },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },

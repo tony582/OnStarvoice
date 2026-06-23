@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { sendXlsx, fmtTs } from '../services/xlsx-export.js';
 
 const router = Router();
 
@@ -36,7 +37,7 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
     const dispatchNote = String(req.body?.note || '');
 
     // 指派:优先用 assigneeUserId(下拉选人),校验是本租户在职成员后反查姓名作快照
-    const assigneeUserId = String(req.body?.assigneeUserId || '').trim() || null;
+    let assigneeUserId = String(req.body?.assigneeUserId || '').trim() || null;
     let assigneeName = String(req.body?.assigneeName || '').trim();
     if (assigneeUserId) {
       const member = await queryOne(
@@ -47,6 +48,10 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
       );
       if (!member) return res.status(400).json({ ok: false, error: 'invalid_assignee', message: '指派对象不在本租户' });
       assigneeName = member.display;
+    } else {
+      // 未指派 → 默认派给转单人本人(转工单即自办)
+      assigneeUserId = req.user?.id || null;
+      assigneeName = req.user?.name || req.user?.email || '';
     }
 
     // 防重:同一源若已有未关闭工单,直接返回它
@@ -165,7 +170,7 @@ router.get('/', requireTenantAccess, async (req, res, next) => {
 });
 
 // ==================== 已转工单(分诊侧:看自己转出去的工单进度 + 回执确认)====================
-// view: review=待我确认(pending_review) / progress=客服处理中(pending+doing) / 空=全部未关闭
+// view: progress=待处理(pending+doing) / closed=已结案 / 空=全部未关闭(review=旧版待确认,保留兼容)
 router.get('/dispatched', requireTenantAccess, async (req, res, next) => {
   try {
     const view = String(req.query.view || '');
@@ -176,17 +181,22 @@ router.get('/dispatched', requireTenantAccess, async (req, res, next) => {
       review: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review'`, [req.tenantId]))?.n || 0,
       progress: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')`, [req.tenantId]))?.n || 0,
       total: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND status <> 'closed'`, [req.tenantId]))?.n || 0,
+      closed: (await queryOne(`SELECT COUNT(*)::int AS n FROM tickets WHERE tenant_id = $1 AND status = 'closed'`, [req.tenantId]))?.n || 0,
     };
 
     const params = [req.tenantId];
     let where = `WHERE tenant_id = $1 AND status <> 'closed'`;
-    if (view === 'review') where += ` AND feedback_status = 'pending_review'`;
+    if (view === 'closed') where = `WHERE tenant_id = $1 AND status = 'closed'`;
+    else if (view === 'review') where += ` AND feedback_status = 'pending_review'`;
     else if (view === 'progress') where += ` AND status IN ('pending', 'doing')`;
 
     const total = (await queryOne(`SELECT COUNT(*)::int AS total FROM tickets ${where}`, params))?.total || 0;
     params.push(pageSize, (page - 1) * pageSize);
     const items = await queryAll(
-      `SELECT ${TICKET_COLUMNS} FROM tickets ${where}
+      `SELECT ${TICKET_COLUMNS},
+         (SELECT COUNT(*)::int FROM ticket_notes tn WHERE tn.ticket_id = tickets.id) AS notes_count,
+         (SELECT tn.body FROM ticket_notes tn WHERE tn.ticket_id = tickets.id ORDER BY tn.created_at DESC LIMIT 1) AS latest_note
+       FROM tickets ${where}
        ORDER BY (feedback_status = 'pending_review') DESC,
          CASE status WHEN 'doing' THEN 1 WHEN 'pending' THEN 2 WHEN 'done' THEN 3 ELSE 4 END,
          updated_at DESC
@@ -194,6 +204,82 @@ router.get('/dispatched', requireTenantAccess, async (req, res, next) => {
       params,
     );
     return res.json({ ok: true, items, counts, total, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } });
+  } catch (err) { return next(err); }
+});
+
+// ==================== 已转工单导出 Excel(按 view 过滤,与列表一致)====================
+router.get('/export', requireTenantAccess, async (req, res, next) => {
+  try {
+    const view = String(req.query.view || '');
+    let where = `WHERE t.tenant_id = $1 AND t.status <> 'closed'`;
+    if (view === 'closed') where = `WHERE t.tenant_id = $1 AND t.status = 'closed'`;
+    else if (view === 'progress') where += ` AND t.status IN ('pending', 'doing')`;
+    // 关联原贴(评论工单经 comment_leads 回溯到 record),补点赞/评论数/发布时间作参考
+    const items = await queryAll(
+      `SELECT t.*, r.title AS post_title, r.author_name AS post_author,
+              r.likes AS post_likes, r.comments_count AS post_comments, r.publish_time AS post_publish_time
+       FROM tickets t
+       LEFT JOIN comment_leads cl ON cl.id = t.source_comment_id AND cl.tenant_id = t.tenant_id
+       LEFT JOIN records r ON r.tenant_id = t.tenant_id AND r.id = COALESCE(t.source_record_id, cl.record_id)
+       ${where}
+       ORDER BY (t.status = 'closed'), CASE t.status WHEN 'doing' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END, t.updated_at DESC`,
+      [req.tenantId],
+    );
+    // 过程备注:一次取全、按工单分组(与抽屉同源,时间正序),完整还原处理过程
+    const ids = items.map((t) => t.id);
+    const notesByTicket = {};
+    if (ids.length) {
+      const allNotes = await queryAll(
+        `SELECT ticket_id, author_name, body, created_at FROM ticket_notes
+         WHERE ticket_id = ANY($1::uuid[]) ORDER BY created_at ASC`,
+        [ids],
+      );
+      for (const n of allNotes) (notesByTicket[n.ticket_id] ||= []).push(`${fmtTs(n.created_at)} ${n.author_name || ''}：${n.body}`);
+    }
+    const STATUS_CN = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已结案' };
+    const PRIORITY_CN = { urgent: '紧急', high: '高', normal: '普通', low: '低' };
+    const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
+    const columns = [
+      { header: '类型', key: 'type', width: 8 },
+      { header: '平台', key: 'platform', width: 10 },
+      { header: '工单内容', key: 'content', width: 44 },
+      { header: '作者', key: 'author', width: 16 },
+      { header: '原贴标题', key: 'postTitle', width: 28 },
+      { header: '原贴点赞', key: 'postLikes', width: 9 },
+      { header: '原贴评论', key: 'postComments', width: 9 },
+      { header: '发布时间', key: 'publishTime', width: 16 },
+      { header: '原文链接', key: 'url', width: 36 },
+      { header: '优先级', key: 'priority', width: 8 },
+      { header: '状态', key: 'status', width: 10 },
+      { header: '处理人', key: 'assignee', width: 14 },
+      { header: '转单人', key: 'dispatcher', width: 14 },
+      { header: '转单说明', key: 'dispatchNote', width: 26 },
+      { header: '处理过程', key: 'process', width: 50 },
+      { header: '结案说明', key: 'closeNote', width: 28 },
+      { header: '结案时间', key: 'closedAt', width: 18 },
+      { header: '创建时间', key: 'createdAt', width: 18 },
+    ];
+    const rows = items.map((t) => ({
+      type: t.source_type === 'comment' ? '评论' : '内容',
+      platform: PLATFORM_CN[t.platform] || t.platform || '',
+      content: t.item_text || t.title || '',
+      author: t.author || '',
+      postTitle: t.post_title || (t.source_type === 'content' ? t.title : '') || '',
+      postLikes: t.post_likes ?? '',
+      postComments: t.post_comments ?? '',
+      publishTime: t.post_publish_time || '',
+      url: t.url || '',
+      priority: PRIORITY_CN[t.priority] || t.priority || '',
+      status: STATUS_CN[t.status] || t.status || '',
+      assignee: t.assignee_name || t.handled_by_name || t.created_by_name || '',
+      dispatcher: t.created_by_name || '',
+      dispatchNote: t.dispatch_note || '',
+      process: (notesByTicket[t.id] || []).join('\n'),
+      closeNote: t.handle_note || '',
+      closedAt: t.status === 'closed' ? fmtTs(t.reviewed_at || t.handled_at) : '',
+      createdAt: fmtTs(t.created_at),
+    }));
+    await sendXlsx(res, { sheetName: '已转工单', columns, rows, filename: `已转工单_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
   } catch (err) { return next(err); }
 });
 
@@ -237,8 +323,9 @@ router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
     let negativeComments = [];
     if (recordId) {
       record = await queryOne(
-        `SELECT id, platform, title, content, author_name, url, cover_url, sentiment, category,
-                ai_summary, ai_result, negative_comment_count, likes, comments_count, collects, shares
+        `SELECT id, platform, title, content, author_name, author_fans, blogger_profile_url, url, cover_url,
+                sentiment, category, ai_summary, ai_result, negative_comment_count,
+                likes, comments_count, collects, shares, publish_time, first_seen_at, last_seen_at, seen_count
          FROM records WHERE id = $1 AND tenant_id = $2`,
         [recordId, req.tenantId],
       );
@@ -252,7 +339,47 @@ router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
         );
       }
     }
-    return res.json({ ok: true, record, comment, negativeComments });
+    // 过程备注(就地处理留痕),按时间正序
+    const notes = await queryAll(
+      `SELECT id, body, author_name, created_at FROM ticket_notes
+       WHERE ticket_id = $1 AND tenant_id = $2 ORDER BY created_at ASC`,
+      [req.params.id, req.tenantId],
+    );
+    return res.json({ ok: true, record, comment, negativeComments, notes });
+  } catch (err) { return next(err); }
+});
+
+// ==================== 过程备注(就地处理留痕)====================
+router.post('/:id/notes', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const body = String(req.body?.body || '').trim();
+    if (!body) return res.status(400).json({ ok: false, error: 'empty_body', message: '备注内容不能为空' });
+    const actor = req.user?.name || req.user?.email || '';
+    const actorId = req.user?.id || null;
+
+    // 工单必须属于本租户
+    const ticket = await queryOne(
+      `SELECT id, status FROM tickets WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, req.tenantId],
+    );
+    if (!ticket) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
+
+    const note = await queryOne(
+      `INSERT INTO ticket_notes (tenant_id, ticket_id, body, author_user_id, author_name)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, body, author_name, created_at`,
+      [req.tenantId, req.params.id, body, actorId, actor],
+    );
+
+    // 首次留痕即视为开始处理:pending → doing
+    if (ticket.status === 'pending') {
+      await queryOne(
+        `UPDATE tickets SET status = 'doing', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
+        [req.params.id, req.tenantId],
+      );
+    }
+
+    return res.json({ ok: true, note });
   } catch (err) { return next(err); }
 });
 
@@ -277,6 +404,21 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
               handle_result = $P, handle_note = COALESCE($P, handle_note),
               handled_by_user_id = $P, handled_by_name = $P, handled_at = now(), updated_at = now()`,
         params: [result, note, actorId, actor],
+      };
+    } else if (action === 'close') {
+      // 结案:就地一步到底(任何非 closed 状态都可结案)。
+      // handled_* 只在尚未有处理人时落本人,已有则保留(不覆盖原始处理人/时间);
+      // reviewed_* 与结案动作一起落本人。
+      sets = {
+        sql: `status = 'closed', feedback_status = 'confirmed',
+              handle_note = COALESCE($P, handle_note),
+              handle_result = COALESCE(NULLIF($P, ''), NULLIF(handle_result, ''), '已结案'),
+              handled_by_user_id = CASE WHEN handled_at IS NULL THEN $P ELSE handled_by_user_id END,
+              handled_by_name = CASE WHEN handled_at IS NULL THEN $P ELSE handled_by_name END,
+              handled_at = COALESCE(handled_at, now()),
+              reviewed_by_user_id = $P, reviewed_by_name = $P, reviewed_at = now(),
+              updated_at = now()`,
+        params: [note, result, actorId, actor, actorId, actor],
       };
     } else {
       return res.status(400).json({ ok: false, error: 'invalid_action', message: '动作无效' });

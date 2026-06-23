@@ -1,40 +1,36 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, ExternalLink, FileText, Sparkles, MessageCircle, UserCog, Workflow, Pin } from 'lucide-react'
+import { X, ExternalLink, FileText, Info, Sparkles, MessageCircle, UserCog, Workflow, Pin, CheckCircle2, Send } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatDate, formatFullDate, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
+import { formatFullDate, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 580
 
-const STATE_TONE: Record<string, string> = { pending: 'orange', doing: 'blue', done: 'positive', dismissed: 'muted', closed: 'muted' }
-const STATE_LABEL: Record<string, string> = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已归档' }
-const FEEDBACK_LABEL: Record<string, string> = { pending_review: '待分诊确认', confirmed: '分诊已确认', reopened: '被打回' }
-
-const TABS = [
-  { key: 'overview', label: '概览' },
-  { key: 'ai', label: 'AI 研判' },
-  { key: 'log', label: '处理记录' },
-]
+const STATE_TONE: Record<string, string> = { pending: 'orange', doing: 'blue', done: 'positive', dismissed: 'muted', closed: 'positive' }
+const STATE_LABEL: Record<string, string> = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已结案' }
 
 /**
- * 工单详情抽屉(舆情处理 / 已转工单 共用)。右侧停靠、可拖宽、可钉住。
- * Tab 分页:概览(原文)/ AI 研判 / 处理记录(时间线)。钉住后切换工单保留当前页签,便于连着看一批。
- * - 客服侧:传 onAction(action) —— done / dismiss
- * - 分诊侧:传 onReview(decision) —— confirm / reopen
+ * 工单详情抽屉(舆情处理 / 已转工单 共用)。单面板(无 Tab),分区用分隔线拉开层次:
+ * 内容 → 基本信息(互动数据 + 作者/主页/发布/采集/原文)→ AI 研判 → 负面评论 → 处理记录(活动流)。
+ * 底部内联「过程备注」,顶部「结案」一键闭环(Asana 式)。右侧停靠、可拖宽、可钉住。
+ * - 已转工单(就地闭环):传 onCloseTicket(结案)
+ * - 舆情处理(客服):传 onAction(done / dismiss)
+ * - 旧分诊回执:传 onReview(confirm / reopen)
  */
-export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview }: {
+export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview, onCloseTicket }: {
   ticket: any
   onClose: () => void
   canWrite: boolean
   onAction?: (action: string) => void
   onReview?: (decision: 'confirm' | 'reopen') => void
+  onCloseTicket?: () => void
 }) {
   const panelRef = useRef<HTMLDivElement>(null)
-  const [source, setSource] = useState<{ record: any; comment: any; negativeComments: any[] } | null>(null)
-  const [tab, setTab] = useState('overview')
+  const [source, setSource] = useState<{ record: any; comment: any; negativeComments: any[]; notes: any[] } | null>(null)
+  const [noteText, setNoteText] = useState('')
+  const [savingNote, setSavingNote] = useState(false)
   const [pinned, setPinned] = useState(() => localStorage.getItem('osv_drawer_pinned') === '1')
-  const pinnedRef = useRef(pinned); pinnedRef.current = pinned
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
     return saved >= PANEL_MIN && saved <= PANEL_MAX ? saved : PANEL_DEFAULT
@@ -42,11 +38,10 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
 
   useEffect(() => {
     let alive = true
-    setSource(null)
-    if (!pinnedRef.current) setTab('overview') // 未钉住:每次打开回到概览;钉住:保留当前页签
+    setSource(null); setNoteText('')
     api.get<any>(`/tickets/${t.id}/source`)
-      .then(d => { if (alive) setSource({ record: d.record, comment: d.comment, negativeComments: d.negativeComments || [] }) })
-      .catch(() => { if (alive) setSource({ record: null, comment: null, negativeComments: [] }) })
+      .then(d => { if (alive) setSource({ record: d.record, comment: d.comment, negativeComments: d.negativeComments || [], notes: d.notes || [] }) })
+      .catch(() => { if (alive) setSource({ record: null, comment: null, negativeComments: [], notes: [] }) })
     return () => { alive = false }
   }, [t.id])
 
@@ -85,6 +80,17 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
 
   const togglePin = () => setPinned(p => { const n = !p; localStorage.setItem('osv_drawer_pinned', n ? '1' : '0'); return n })
 
+  const addNote = async () => {
+    const body = noteText.trim()
+    if (!body || savingNote) return
+    setSavingNote(true)
+    try {
+      const r = await api.post<any>(`/tickets/${t.id}/notes`, { body })
+      setSource(s => s ? { ...s, notes: [...(s.notes || []), r.note] } : s)
+      setNoteText('')
+    } catch { /* ignore */ } finally { setSavingNote(false) }
+  }
+
   const isComment = t.source_type === 'comment'
   const rec = source?.record
   const cmt = source?.comment
@@ -93,10 +99,9 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
     : (() => { try { return JSON.parse(cmt?.matched_keywords || '[]') } catch { return [] } })()
   const hasAI = Boolean(rec?.ai_summary || cmt?.reason || kw.length > 0)
   const negs = source?.negativeComments || []
-
-  const procState = t.status === 'pending' ? 'pending' : t.status === 'doing' ? 'active' : 'done'
-  const reviewState = (t.feedback_status === 'confirmed' || t.feedback_status === 'reopened') ? 'done'
-    : t.feedback_status === 'pending_review' ? 'active' : 'pending'
+  const notes = source?.notes || []
+  const closed = t.status === 'closed'
+  const postUrl = t.url || rec?.url || cmt?.record_url || ''
 
   return (
     <div ref={panelRef} style={{ width }}
@@ -106,135 +111,169 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
         <span className="h-full w-px bg-transparent transition-all group-hover:w-[3px] group-hover:bg-primary" />
       </div>
       <div className="relative z-10 flex h-full w-full flex-col">
-        {/* Header */}
-        <div className="flex h-14 items-center gap-2.5 border-b border-border/60 px-6">
+        {/* Header:标题 + 状态 +(结案)+ 钉住 + 关闭 */}
+        <div className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border/60 px-6">
           <h2 className="text-base font-bold">工单详情</h2>
           <StatusBadge tone={STATE_TONE[t.status] || 'muted'}>{STATE_LABEL[t.status] || t.status}</StatusBadge>
-          <button onClick={togglePin} title={pinned ? '已钉住:切换工单时保留当前页签' : '钉住面板'}
-            className={cn('ml-auto rounded-lg p-1.5 transition-colors', pinned ? 'bg-primary/12 text-primary' : 'text-muted-foreground hover:bg-accent')}>
-            <Pin className={cn('h-[18px] w-[18px]', pinned && 'fill-current')} />
-          </button>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          <div className="ml-auto flex items-center gap-2">
+            {onCloseTicket && (closed
+              ? <span className="inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-600 dark:text-emerald-400"><CheckCircle2 className="h-4 w-4" />已结案</span>
+              : canWrite && <Button size="sm" onClick={onCloseTicket}><CheckCircle2 className="h-3.5 w-3.5" />结案</Button>)}
+            <button onClick={togglePin} title={pinned ? '已钉住:切换工单时保留滚动' : '钉住面板'}
+              className={cn('rounded-lg p-1.5 transition-colors', pinned ? 'bg-primary/12 text-primary' : 'text-muted-foreground hover:bg-accent')}>
+              <Pin className={cn('h-[18px] w-[18px]', pinned && 'fill-current')} />
+            </button>
+            <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          </div>
         </div>
 
-        {/* 摘要条 */}
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border/60 bg-muted/30 px-6 py-2.5">
+        {/* 摘要条:类型 / 平台 / 优先级 / 处理人 / 原文 */}
+        <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border/60 bg-muted/30 px-6 py-2.5">
           <StatusBadge tone={isComment ? 'neutral' : 'active'}>{isComment ? '评论' : '内容'}</StatusBadge>
           <StatusBadge tone="neutral">{platformName(t.platform)}</StatusBadge>
           <StatusBadge tone={t.priority}>{LABELS.priority[t.priority] || t.priority}</StatusBadge>
-          <span className="inline-flex items-center gap-1 text-[12px] text-muted-foreground"><UserCog className="h-3.5 w-3.5" />{t.assignee_name || '公共池'}</span>
-          {t.url && <a href={t.url} target="_blank" rel="noreferrer" className="ml-auto inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
+          <span className="inline-flex items-center gap-1 text-[12px] text-muted-foreground"><UserCog className="h-3.5 w-3.5" />{t.assignee_name || '本人跟进'}</span>
+          {postUrl && <a href={postUrl} target="_blank" rel="noreferrer" className="ml-auto inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
         </div>
 
-        {/* Tab 条 */}
-        <div className="flex items-center gap-0.5 border-b border-border/60 px-4 pt-2">
-          {TABS.map(tb => {
-            const on = tab === tb.key
-            return (
-              <button key={tb.key} onClick={() => setTab(tb.key)}
-                className={cn('relative px-3 pb-2 pt-1 text-[12.5px] font-semibold transition-colors',
-                  on ? 'text-primary' : 'text-muted-foreground hover:text-foreground')}>
-                {tb.label}
-                {on && <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-primary" />}
-              </button>
-            )
-          })}
-        </div>
-
-        {/* Body */}
-        <div className="flex-1 space-y-5 overflow-y-auto px-6 py-5">
-          {tab === 'overview' && <>
-            <Section icon={FileText} title={isComment ? '评论内容' : '帖子正文'}>
-              <Quote>{(!isComment && rec?.content) ? rec.content : (t.item_text || t.title || '(无内容)')}</Quote>
-              {!isComment && rec && <StatRow rec={rec} className="mt-2" />}
-              {t.author && <div className="mt-1.5 text-[12px] text-muted-foreground">作者:{t.author}</div>}
-            </Section>
-            {isComment && rec && (
-              <Section icon={FileText} title="评论所在帖子">
-                <div className="rounded-lg border border-border p-3.5">
-                  {rec.title && <div className="text-[13px] font-medium leading-snug">{rec.title}</div>}
-                  <div className="mt-1.5 max-h-36 overflow-y-auto whitespace-pre-wrap text-[12.5px] leading-6 text-muted-foreground">{rec.content || '(无正文)'}</div>
-                  <StatRow rec={rec} className="mt-2" />
+        {/* Body:单面板,分区用分隔线拉开层次 */}
+        <div className="flex-1 overflow-y-auto">
+          {/* 内容 */}
+          <Section icon={FileText} title={isComment ? '评论内容' : '帖子正文'}>
+            {isComment ? (
+              <>
+                <Quote>{cmt?.comment_content || t.item_text || '(无内容)'}</Quote>
+                <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[12px] text-muted-foreground">
+                  <span>评论作者 <span className="font-medium text-foreground">{cmt?.comment_author_name || t.author || '-'}</span></span>
+                  {cmt?.comment_like_count > 0 && <span>· 赞 {formatNumber(cmt.comment_like_count)}</span>}
+                  {cmt?.comment_ip_location && <span>· {cmt.comment_ip_location}</span>}
                 </div>
-              </Section>
+              </>
+            ) : (
+              <>
+                {(rec?.title || t.title) && <div className="mb-1.5 text-[14px] font-semibold leading-snug text-foreground">{rec?.title || t.title}</div>}
+                <Quote>{rec?.content || t.item_text || '(无正文)'}</Quote>
+              </>
             )}
-            {t.dispatch_note && (
-              <Section icon={Workflow} title="转单说明">
-                <div className="rounded-md bg-amber-50 px-3 py-2 text-[12.5px] leading-6 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">{t.dispatch_note}</div>
-              </Section>
-            )}
-          </>}
+          </Section>
 
-          {tab === 'ai' && (
-            (hasAI || negs.length > 0) ? <>
-              {hasAI && (
-                <Section icon={Sparkles} title="AI 研判">
-                  <div className="space-y-2.5 rounded-lg bg-primary/[0.04] p-3.5">
-                    {rec?.ai_summary && (
-                      <div className="text-[12.5px] leading-6"><span className="font-semibold text-foreground">帖子:</span><span className="text-muted-foreground"> {rec.ai_summary}</span></div>
-                    )}
-                    {(cmt?.reason || kw.length > 0) && (
-                      <div className="text-[12.5px] leading-6">
-                        <span className="font-semibold text-foreground">评论:</span>
-                        {cmt?.reason && <span className="text-muted-foreground"> {cmt.reason}</span>}
-                        {kw.length > 0 && <div className="mt-1.5 flex flex-wrap gap-1">{kw.slice(0, 12).map((k) => <StatusBadge key={k} tone="muted">{k}</StatusBadge>)}</div>}
-                      </div>
-                    )}
-                  </div>
-                </Section>
-              )}
-              {!isComment && negs.length > 0 && (
-                <Section icon={MessageCircle} title={`负面评论 (${negs.length})`}>
-                  <div className="space-y-2">
-                    {negs.map((c, i) => (
-                      <div key={i} className="rounded-lg bg-status-red/[0.05] p-3 text-[12px] leading-5">
-                        <div className="whitespace-pre-wrap text-foreground">{c.content}</div>
-                        <div className="mt-1 text-[11px] text-muted-foreground">{c.author_name || '匿名'}{c.ip_location ? ` · ${c.ip_location}` : ''}{c.like_count ? ` · 赞 ${formatNumber(c.like_count)}` : ''}</div>
-                      </div>
-                    ))}
-                  </div>
-                </Section>
-              )}
-            </> : <EmptyTab text={source ? '该工单暂无 AI 研判(未跑过标注)' : '加载中…'} />
-          )}
-
-          {tab === 'log' && (
-            <Section icon={Workflow} title="处理流程">
-              <div className="relative space-y-3.5 pl-5">
-                <span className="absolute bottom-1.5 left-[4px] top-1.5 w-px bg-border" />
-                <Step state="done" label="转单" meta={`${t.created_by_name || '-'} · ${formatDate(t.created_at)} · 指派 ${t.assignee_name || '公共池'}`} note={t.dispatch_note} noteTone="amber" />
-                <Step
-                  state={procState}
-                  label={`客服处理${t.status === 'doing' ? '(进行中)' : t.status === 'pending' ? '(待领取)' : ''}`}
-                  meta={t.handled_at ? `${t.handled_by_name || '-'} · ${formatFullDate(t.handled_at)}${t.status === 'dismissed' ? ' · 已忽略' : ''}` : (t.status === 'pending' ? '等待客服领取' : '')}
-                  note={t.handle_note}
-                  noteTone="muted"
-                />
-                <Step
-                  state={reviewState}
-                  label={`分诊回执${t.feedback_status === 'pending_review' ? '(待确认)' : ''}`}
-                  meta={t.reviewed_at ? `${t.reviewed_by_name || '-'} · ${formatFullDate(t.reviewed_at)} · ${FEEDBACK_LABEL[t.feedback_status] || ''}` : (t.feedback_status === 'pending_review' ? '等待分诊确认' : '尚未处理完')}
-                  note={t.review_note}
-                  noteTone={t.feedback_status === 'reopened' ? 'rose' : 'muted'}
-                />
+          {/* 基本信息(以源帖 record 为主)*/}
+          {rec && (
+            <Section icon={Info} title={isComment ? '所在帖子 · 基本信息' : '基本信息'}>
+              {isComment && rec.title && <div className="mb-2.5 line-clamp-2 text-[13px] font-medium leading-snug text-foreground">{rec.title}</div>}
+              <div className="grid grid-cols-4 gap-2">
+                <Stat label="点赞" value={rec.likes} />
+                <Stat label="评论" value={rec.comments_count} />
+                <Stat label="收藏" value={rec.collects} />
+                <Stat label="转发" value={rec.shares} />
+              </div>
+              <div className="mt-3 space-y-1.5">
+                <MetaRow label="作者">
+                  <span className="font-medium text-foreground">{rec.author_name || t.author || '-'}</span>
+                  {rec.author_fans > 0 && <span className="text-muted-foreground"> · {formatNumber(rec.author_fans)} 粉丝</span>}
+                  {rec.blogger_profile_url && <a href={rec.blogger_profile_url} target="_blank" rel="noreferrer" className="ml-1.5 inline-flex items-center gap-0.5 font-semibold text-primary hover:underline">博主主页<ExternalLink className="h-3 w-3" /></a>}
+                </MetaRow>
+                {rec.publish_time && <MetaRow label="发布时间">{rec.publish_time}</MetaRow>}
+                <MetaRow label="采集">
+                  首次 {formatFullDate(rec.first_seen_at)} · 最近 {formatFullDate(rec.last_seen_at)}
+                  {rec.seen_count > 0 && <span className="text-muted-foreground"> · 第 {rec.seen_count} 次</span>}
+                </MetaRow>
+                {postUrl && <MetaRow label="原文"><a href={postUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-semibold text-primary hover:underline">打开原文<ExternalLink className="h-3 w-3" /></a></MetaRow>}
+                {(rec.sentiment || rec.category) && (
+                  <MetaRow label="研判">
+                    <span className="inline-flex flex-wrap gap-1 align-middle">
+                      <StatusBadge tone={rec.sentiment === 'negative' ? 'negative' : rec.sentiment === 'positive' ? 'positive' : 'muted'}>{LABELS.sentiment[rec.sentiment] || '待标注'}</StatusBadge>
+                      {rec.category && <StatusBadge tone="neutral">{LABELS.category?.[rec.category] || rec.category}</StatusBadge>}
+                      {rec.negative_comment_count > 0 && <StatusBadge tone="negative">负评 {rec.negative_comment_count}</StatusBadge>}
+                    </span>
+                  </MetaRow>
+                )}
               </div>
             </Section>
           )}
+
+          {/* AI 研判 */}
+          {hasAI && (
+            <Section icon={Sparkles} title="AI 研判">
+              <div className="space-y-2.5 rounded-xl bg-primary/[0.05] p-3.5">
+                {rec?.ai_summary && (
+                  <div className="text-[12.5px] leading-6"><span className="font-semibold text-foreground">帖子:</span><span className="text-muted-foreground"> {rec.ai_summary}</span></div>
+                )}
+                {(cmt?.reason || kw.length > 0) && (
+                  <div className="text-[12.5px] leading-6">
+                    <span className="font-semibold text-foreground">评论:</span>
+                    {cmt?.reason && <span className="text-muted-foreground"> {cmt.reason}</span>}
+                    {kw.length > 0 && <div className="mt-1.5 flex flex-wrap gap-1">{kw.slice(0, 12).map((k) => <StatusBadge key={k} tone="muted">{k}</StatusBadge>)}</div>}
+                  </div>
+                )}
+              </div>
+            </Section>
+          )}
+
+          {/* 负面评论 */}
+          {!isComment && negs.length > 0 && (
+            <Section icon={MessageCircle} title={`负面评论 (${negs.length})`}>
+              <div className="space-y-2">
+                {negs.map((c, i) => (
+                  <div key={i} className="rounded-lg bg-status-red/[0.05] p-3 text-[12px] leading-5">
+                    <div className="whitespace-pre-wrap text-foreground">{c.content}</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">{c.author_name || '匿名'}{c.ip_location ? ` · ${c.ip_location}` : ''}{c.like_count ? ` · 赞 ${formatNumber(c.like_count)}` : ''}</div>
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {/* 处理记录:活动流(转单 → 过程备注 → 结案)*/}
+          <Section icon={Workflow} title="处理记录">
+            <div className="space-y-3">
+              <Entry tone="amber" who={t.created_by_name} when={t.created_at} label="转单"
+                sub={`指派 ${t.assignee_name || '本人跟进'}`} body={t.dispatch_note} />
+              {notes.map((n: any) => (
+                <Entry key={n.id} who={n.author_name} when={n.created_at} body={n.body} />
+              ))}
+              {closed && (
+                <Entry tone="green" who={t.handled_by_name} when={t.handled_at} label="结案"
+                  sub={t.handle_result && t.handle_result !== '已结案' ? t.handle_result : undefined} body={t.handle_note} />
+              )}
+              {!notes.length && !t.dispatch_note && !closed && (
+                <div className="text-[12px] text-muted-foreground">暂无处理记录,可在下方添加过程备注。</div>
+              )}
+            </div>
+          </Section>
         </div>
 
-        {/* Footer 操作(常驻,不随 Tab 变)*/}
-        {canWrite && (onAction || onReview) && (
-          <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border/60 px-6 py-3.5">
-            {onAction && (t.status === 'pending' || t.status === 'doing') && <>
-              <Button size="sm" onClick={() => onAction('done')}>处理完成</Button>
-              <Button variant="ghost" size="sm" onClick={() => onAction('dismiss')}>忽略</Button>
-            </>}
-            {onAction && (t.status === 'done' || t.status === 'dismissed') &&
-              <span className="text-[12px] text-muted-foreground">{t.feedback_status === 'pending_review' ? '已提交,待分诊确认' : '已完成'}</span>}
-            {onReview && <>
-              <Button size="sm" onClick={() => onReview('confirm')}>确认归档</Button>
-              <Button variant="ghost" size="sm" onClick={() => onReview('reopen')}>打回</Button>
-            </>}
+        {/* Footer:内联添加过程备注 + 旧动作(舆情处理/分诊回执)*/}
+        {canWrite && (onCloseTicket || onAction || onReview) && (
+          <div className="shrink-0 border-t border-border/60 px-6 py-3">
+            {!closed && (
+              <div className="flex items-end gap-2">
+                <textarea
+                  value={noteText}
+                  onChange={e => setNoteText(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); addNote() } }}
+                  rows={2}
+                  placeholder="添加过程备注…(记录处理进展,Cmd/Ctrl+Enter 发送)"
+                  className="min-h-[40px] flex-1 resize-none rounded-lg border border-border bg-background px-3 py-2 text-[13px] leading-5 outline-none transition focus:border-primary" />
+                <Button size="sm" onClick={addNote} disabled={savingNote || !noteText.trim()} title="添加过程备注">
+                  <Send className="h-3.5 w-3.5" />{savingNote ? '…' : '添加'}
+                </Button>
+              </div>
+            )}
+            {(onAction || onReview) && (
+              <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
+                {onAction && (t.status === 'pending' || t.status === 'doing') && <>
+                  <Button variant="outline" size="sm" onClick={() => onAction('done')}>处理完成</Button>
+                  <Button variant="ghost" size="sm" onClick={() => onAction('dismiss')}>忽略</Button>
+                </>}
+                {onAction && (t.status === 'done' || t.status === 'dismissed') &&
+                  <span className="text-[12px] text-muted-foreground">{t.feedback_status === 'pending_review' ? '已提交,待分诊确认' : '已完成'}</span>}
+                {onReview && <>
+                  <Button variant="outline" size="sm" onClick={() => onReview('confirm')}>确认归档</Button>
+                  <Button variant="ghost" size="sm" onClick={() => onReview('reopen')}>打回</Button>
+                </>}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -242,54 +281,61 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview 
   )
 }
 
+// 分区:顶部分隔线 + 图标 + 加粗标题,拉开层次
 function Section({ icon: Icon, title, children }: { icon: React.ElementType; title: string; children: React.ReactNode }) {
   return (
-    <section>
-      <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
-        <Icon className="h-3.5 w-3.5" />{title}
+    <section className="border-t border-border/50 px-6 py-4 first:border-t-0">
+      <div className="mb-2.5 flex items-center gap-2">
+        <Icon className="h-4 w-4 text-primary" />
+        <h3 className="text-[13px] font-bold text-foreground">{title}</h3>
       </div>
       {children}
     </section>
   )
 }
 
-function EmptyTab({ text }: { text: string }) {
-  return <div className="flex items-center justify-center py-16 text-[12.5px] text-muted-foreground">{text}</div>
-}
-
 function Quote({ children }: { children: React.ReactNode }) {
   return <div className="max-h-60 overflow-y-auto whitespace-pre-wrap rounded-lg border border-border bg-muted/30 p-3.5 text-[13px] leading-6">{children}</div>
 }
 
-function StatRow({ rec, className = '' }: { rec: any; className?: string }) {
+// 互动数据格子:大数字 + 小标签
+function Stat({ label, value }: { label: string; value: number | undefined }) {
   return (
-    <div className={`flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground ${className}`}>
-      <StatusBadge tone={rec.sentiment === 'negative' ? 'negative' : rec.sentiment === 'positive' ? 'positive' : 'muted'}>{LABELS.sentiment[rec.sentiment] || '待标注'}</StatusBadge>
-      {rec.category && <StatusBadge tone="neutral">{LABELS.category?.[rec.category] || rec.category}</StatusBadge>}
-      <span>赞 {formatNumber(rec.likes)} · 评 {formatNumber(rec.comments_count)}{rec.negative_comment_count > 0 ? ` · 负评 ${rec.negative_comment_count}` : ''}</span>
+    <div className="rounded-lg bg-muted/40 py-2 text-center">
+      <div className="text-[16px] font-bold tabular-nums text-foreground">{formatNumber(value)}</div>
+      <div className="mt-0.5 text-[10.5px] text-muted-foreground">{label}</div>
     </div>
   )
 }
 
-function Step({ state, label, meta, note, noteTone }: {
-  state: 'done' | 'active' | 'pending'
-  label: string
-  meta?: string
-  note?: string
-  noteTone?: 'amber' | 'muted' | 'rose'
-}) {
-  const dot = state === 'done' ? 'bg-primary' : state === 'active' ? 'bg-amber-500' : 'bg-muted-foreground/30'
-  const noteCls = noteTone === 'amber'
-    ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300'
-    : noteTone === 'rose'
-      ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/30 dark:text-rose-300'
-      : 'bg-muted/50 text-muted-foreground'
+// 信息行:左侧固定宽度标签 + 右侧值
+function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="relative">
-      <span className={`absolute -left-[18px] top-1 h-2.5 w-2.5 rounded-full ring-2 ring-card ${dot}`} />
-      <div className={`text-[12.5px] font-semibold ${state === 'pending' ? 'text-muted-foreground' : 'text-foreground'}`}>{label}</div>
-      {meta && <div className="mt-0.5 text-[11px] text-muted-foreground">{meta}</div>}
-      {note && <div className={`mt-1.5 rounded-md px-2.5 py-1.5 text-[12px] leading-5 ${noteCls}`}>{note}</div>}
+    <div className="flex gap-2.5 text-[12.5px] leading-5">
+      <span className="w-[52px] shrink-0 text-muted-foreground">{label}</span>
+      <span className="min-w-0 flex-1 text-foreground">{children}</span>
+    </div>
+  )
+}
+
+// 活动流条目:小圆点 + 人/时间/标签 + 内容气泡
+function Entry({ who, when, body, label, sub, tone }: {
+  who?: string; when?: string; body?: string; label?: string; sub?: string; tone?: 'amber' | 'green'
+}) {
+  const dot = tone === 'amber' ? 'bg-amber-500' : tone === 'green' ? 'bg-emerald-500' : 'bg-primary/50'
+  return (
+    <div className="flex gap-2.5">
+      <span className={cn('mt-[6px] h-2 w-2 shrink-0 rounded-full ring-2 ring-card', dot)} />
+      <div className="min-w-0 flex-1">
+        <div className="text-[12px] leading-5 text-muted-foreground">
+          {label && <span className="font-semibold text-foreground">{label}</span>}
+          {label && <span> · </span>}
+          <span className="font-medium text-foreground">{who || '-'}</span>
+          {when && <span> · {formatFullDate(when)}</span>}
+          {sub && <span> · {sub}</span>}
+        </div>
+        {body && <div className="mt-1 whitespace-pre-wrap rounded-lg bg-muted/50 px-3 py-2 text-[12.5px] leading-5 text-foreground">{body}</div>}
+      </div>
     </div>
   )
 }
