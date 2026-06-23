@@ -37,6 +37,16 @@ export function formatFullDate(v: string | undefined | null): string {
   }
 }
 
+// 精确到秒(采集快照历史用,区分相隔几秒的两次采集)
+export function formatFullDateSec(v: string | undefined | null): string {
+  if (!v) return '-'
+  try {
+    return new Date(v).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  } catch {
+    return v
+  }
+}
+
 export function compact(text: string, maxLen: number): string {
   if (!text) return ''
   return text.length > maxLen ? text.slice(0, maxLen) + '…' : text

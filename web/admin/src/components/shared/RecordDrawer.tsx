@@ -7,7 +7,7 @@ import {
 // 详情面板可拖宽,停靠右侧(Asana 式)
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, formatFullDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -307,8 +307,8 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                       <InfoTile label="关键词" value={r.keyword || '-'} />
                       <InfoTile label="内容类型" value={r.note_type || '-'} />
                       <InfoTile label="发布时间" value={r.publish_time || '-'} />
-                      <InfoTile label="首次发现" value={formatDate(r.first_seen_at)} />
-                      <InfoTile label="最近采集" value={formatDate(r.last_seen_at || r.created_at)} />
+                      <InfoTile label="首次发现" value={formatFullDateSec(r.first_seen_at)} />
+                      <InfoTile label="最近采集" value={formatFullDateSec(r.last_seen_at || r.created_at)} />
                       <InfoTile label="采集次数" value={`${formatNumber(r.seen_count)} 次`} />
                     </div>
                     <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">快照历史</h4>
@@ -324,7 +324,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                               <span className="flex items-center gap-1"><Star className="h-3 w-3 text-muted-foreground" />{formatNumber(o.collects)}</span>
                               <span className="flex items-center gap-1"><Share2 className="h-3 w-3 text-muted-foreground" />{formatNumber(o.shares)}</span>
                             </div>
-                            <span className="text-xs text-muted-foreground">{formatFullDate(o.captured_at)}</span>
+                            <span className="text-xs text-muted-foreground">{formatFullDateSec(o.captured_at)}</span>
                           </div>
                         ))}
                       </div>
