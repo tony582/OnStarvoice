@@ -265,7 +265,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         <EmptyState icon={Inbox} title="暂无记录" description="调整筛选条件试试" />
       ) : (
         <div className="overflow-hidden rounded-xl bg-card">
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[1080px] text-sm">
             <thead>
               <tr className="border-b border-border/60">
                 {canWrite() && (
@@ -282,7 +283,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
                 {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">首次发现</th>}
                 {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">最近采集</th>}
-                {!narrow && <th className="hidden px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
+                {!narrow && <th className="hidden whitespace-nowrap px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
                 {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
@@ -308,6 +309,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               ))}
             </tbody>
           </table>
+          </div>
 
           {pagination && pagination.totalPages > 1 && (
             <div className="flex items-center justify-between border-t border-border/50 px-4 py-3">
@@ -371,8 +373,8 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
           ) : (
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-dashed border-border bg-muted/40"><FileText className="h-4 w-4 text-muted-foreground/40" /></div>
           )}
-          <div className="min-w-0 max-w-[380px]">
-            <div className="truncate text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
+          <div className="min-w-0 max-w-[300px]">
+            <div className="line-clamp-2 text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
             <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
