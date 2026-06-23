@@ -268,7 +268,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <div className="overflow-x-auto">
           <table className="w-full min-w-[1080px] text-sm">
             <thead>
-              <tr className="border-b border-border/60">
+              <tr className="border-b border-border/60 [&>th]:whitespace-nowrap [&>th]:py-2.5">
                 {canWrite() && (
                   <th className="w-9 py-3.5 pl-4 pr-1">
                     <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
