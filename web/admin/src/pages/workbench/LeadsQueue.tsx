@@ -4,7 +4,7 @@ import {
   RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles, Download,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { compact, formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
+import { compact, formatDate, formatFullDate, formatNumber, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -256,6 +256,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">优先级</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">发布时间</th>
+                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">首次发现</th>
+                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">最近采集</th>
+                  <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">采集次数</th>
                   <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
                 </tr>
               </thead>
@@ -287,6 +290,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                     <td className="px-4 py-3 align-top"><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge></td>
                     <td className="px-4 py-3 align-top"><StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge></td>
                     <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{lead.publish_display || '—'}</td>
+                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatFullDate(lead.comment_first_seen_at)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatFullDate(lead.comment_last_seen_at)}</td>
+                    <td className="px-4 py-3 text-right align-top text-xs font-semibold tabular-nums">{formatNumber(lead.comment_seen_count || 1)}</td>
                     <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}>
                       <div className="flex justify-end gap-1">
                         {isSales ? <>

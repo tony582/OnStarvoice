@@ -6,7 +6,7 @@ import {
   ArrowUp, ArrowDown, ChevronsUpDown, Download,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatFullDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -280,7 +280,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
                 {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
-                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">采集</th>}
+                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">首次发现</th>}
+                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">最近采集</th>}
+                {!narrow && <th className="hidden px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
                 {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
@@ -385,13 +387,9 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
-      {!narrow && (
-        <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[10px] text-muted-foreground lg:table-cell">
-          <div className="text-[11px] font-semibold tabular-nums text-foreground">×{r.seen_count || 1} 次</div>
-          <div>首 {formatDate(r.first_seen_at)}</div>
-          <div>近 {formatDate(r.last_seen_at)}</div>
-        </td>
-      )}
+      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatFullDate(r.first_seen_at)}</td>}
+      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatFullDate(r.last_seen_at)}</td>}
+      {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
       {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
           {archived ? (

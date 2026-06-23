@@ -146,7 +146,10 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
         (SELECT ai_summary FROM records r WHERE r.id = comment_leads.record_id) AS record_ai_summary,
         (SELECT sentiment FROM records r WHERE r.id = comment_leads.record_id) AS record_sentiment,
         (SELECT published_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_published_at,
-        (SELECT source_type FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_source_type
+        (SELECT source_type FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_source_type,
+        (SELECT first_seen_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_first_seen_at,
+        (SELECT last_seen_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_last_seen_at,
+        (SELECT seen_count FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_seen_count
       FROM comment_leads
       ${where}
       ORDER BY

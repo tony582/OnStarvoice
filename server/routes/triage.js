@@ -11,6 +11,7 @@ const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博
 const SENTIMENT_CN = { positive: '正面', neutral: '中性', negative: '负面' };
 const TRIAGE_STATUS_CN = { unhandled: '待处理', reviewing: '处理中', issue_linked: '已关联事件', archived: '已归档', false_positive: '误报', official_responded: '官方已响应' };
 const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
+const CATEGORY_CN = { safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费', privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量', brand_image: '品牌形象', other: '其他' };
 
 const TRIAGE_STATUSES = new Set(['unhandled', 'reviewing', 'issue_linked', 'official_responded', 'archived', 'false_positive']);
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
@@ -410,7 +411,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       collects: r.collects,
       shares: r.shares,
       sentiment: SENTIMENT_CN[r.sentiment] || r.sentiment || '',
-      category: r.category,
+      category: CATEGORY_CN[r.category] || r.category || '',
       ai_summary: r.ai_summary,
       negative_comment_count: r.negative_comment_count,
       triage_status: TRIAGE_STATUS_CN[r.triage_status] || r.triage_status || '',
