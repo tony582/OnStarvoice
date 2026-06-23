@@ -6,7 +6,7 @@ import {
   ArrowUp, ArrowDown, ChevronsUpDown, Download,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatFullDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatDateCompact, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -387,8 +387,8 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
-      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatFullDate(r.first_seen_at)}</td>}
-      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatFullDate(r.last_seen_at)}</td>}
+      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>}
+      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>}
       {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
       {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>

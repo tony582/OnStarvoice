@@ -37,6 +37,19 @@ export function formatFullDate(v: string | undefined | null): string {
   }
 }
 
+// 紧凑(列表用,省宽):MM-DD HH:mm,不带年份。精确时间看详情抽屉(到秒)。
+export function formatDateCompact(v: string | undefined | null): string {
+  if (!v) return '-'
+  try {
+    const d = new Date(v)
+    if (isNaN(d.getTime())) return v
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  } catch {
+    return v
+  }
+}
+
 // 精确到秒(采集快照历史用,区分相隔几秒的两次采集)
 export function formatFullDateSec(v: string | undefined | null): string {
   if (!v) return '-'
