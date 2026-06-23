@@ -391,7 +391,8 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
       { header: '采集时间', key: 'captured', width: 18 },
     ];
 
-    await sendXlsx(res, { sheetName: '评论分诊', columns, rows, filename: `评论分诊_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
+    const exportNoun = String(req.query.category || '') === 'sales' ? '销售客资' : '评论分诊';
+    await sendXlsx(res, { sheetName: exportNoun, columns, rows, filename: `${exportNoun}_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
   } catch (err) {
     return next(err);
   }
