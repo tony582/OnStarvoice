@@ -3,7 +3,7 @@ import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Archive, Ban, Loader2,
   Package, User, FileText, Bell, ExternalLink,
-  ArrowUp, ArrowDown, ChevronsUpDown,
+  ArrowUp, ArrowDown, ChevronsUpDown, Download,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
@@ -13,6 +13,7 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
+import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useTicketDispatch } from '@/components/shared/TicketDispatch'
@@ -39,6 +40,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [triageStatus, setTriageStatus] = useState('')
   const [risk, setRisk] = useState('')
+  const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [exporting, setExporting] = useState(false)
   // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量、升降序
   const [sort, setSort] = useState<{ field: 'publish' | 'interactions'; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
   const [records, setRecords] = useState<any[]>([])
@@ -52,22 +55,37 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const sel = useSelection(`${status}|${triageStatus}|${risk}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
+  const filterParams = useCallback(() => {
+    const params = new URLSearchParams({ sentiment, platform, keyword })
+    if (status === 'archived') params.set('bucket', 'archived')
+    else params.set('queue', 'active')
+    if (triageStatus) params.set('status', triageStatus)
+    if (risk) params.set('risk', risk)
+    params.set('sort', sort.field)
+    params.set('dir', sort.dir)
+    captureKeywords.forEach(k => params.append('captureKeyword', k))
+    return params
+  }, [status, triageStatus, risk, sentiment, platform, keyword, sort, captureKeywords])
+
   const load = useCallback(async (page = 1) => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: '30', sentiment, platform, keyword })
-      if (status === 'archived') params.set('bucket', 'archived')
-      else params.set('queue', 'active')
-      if (triageStatus) params.set('status', triageStatus)
-      if (risk) params.set('risk', risk)
-      params.set('sort', sort.field)
-      params.set('dir', sort.dir)
+      const params = filterParams()
+      params.set('page', String(page))
+      params.set('pageSize', '30')
       const data = await api.get<any>('/triage/records?' + params)
       setRecords(data.records || [])
       setPagination(data.pagination || null)
     } catch (err) { console.error(err) }
     finally { setLoading(false) }
-  }, [status, triageStatus, risk, sentiment, platform, keyword, sort])
+  }, [filterParams])
+
+  const exportXlsx = async () => {
+    setExporting(true)
+    try { await api.download('/triage/records/export?' + filterParams().toString(), '内容分诊.xlsx') }
+    catch (err) { console.error(err) }
+    finally { setExporting(false) }
+  }
 
   // 点表头排序:点未激活列 → 该列降序;再点已激活列 → 升/降序切换
   const toggleSort = (field: 'publish' | 'interactions') =>
@@ -201,6 +219,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <option value="negative">有负评</option>
                 <option value="koe">疑似KOE</option>
               </WorkbenchSelect>
+              <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
             </>
           )}
           <span className="mx-1 h-4 w-px bg-border/70" />
@@ -218,6 +237,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             <Input value={keyword} onChange={e => setKeyword(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
           </div>
+          {view === 'list' && (
+            <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
+              <Download className={cn('h-3.5 w-3.5', exporting && 'animate-pulse')} />
+              {exporting ? '导出中…' : '导出'}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -255,6 +280,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
                 {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
+                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">采集</th>}
                 {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
             </thead>
@@ -359,6 +385,13 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
+      {!narrow && (
+        <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[10px] text-muted-foreground lg:table-cell">
+          <div className="text-[11px] font-semibold tabular-nums text-foreground">×{r.seen_count || 1} 次</div>
+          <div>首 {formatDate(r.first_seen_at)}</div>
+          <div>近 {formatDate(r.last_seen_at)}</div>
+        </td>
+      )}
       {canWrite && !narrow && (
         <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
           {archived ? (

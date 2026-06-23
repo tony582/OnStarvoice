@@ -39,6 +39,24 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+// 采集关键词列表(每个关键词=一次采集 session),供内容分诊/评论分诊「采集关键词」多选筛选。按记录数降序。
+router.get('/keywords', requireTenantAccess, async (req, res, next) => {
+  try {
+    const rows = await queryAll(
+      `SELECT keyword, COUNT(*)::int AS count
+       FROM records
+       WHERE tenant_id = $1 AND COALESCE(keyword, '') <> ''
+       GROUP BY keyword
+       ORDER BY count DESC, keyword ASC
+       LIMIT 500`,
+      [req.tenantId],
+    );
+    return res.json({ ok: true, keywords: rows });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 // 评论 AI 精炼进度:评论入库即可见,但 AI 分类(情感/负面/客资意向)在后台批量精炼。
 // 待精炼 = record_comments 里 ai_classified_at IS NULL 的非官方评论。前台据此显示实时进度条。
 router.get('/processing', requireTenantAccess, async (req, res, next) => {

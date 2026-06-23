@@ -2,8 +2,15 @@ import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { formatPublishDate } from '../services/publish-date.js';
+import { sendXlsx, fmtTs } from '../services/xlsx-export.js';
 
 const router = Router();
+
+// 导出用中文标签映射(MAP[v]||v||'')
+const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
+const SENTIMENT_CN = { positive: '正面', neutral: '中性', negative: '负面' };
+const TRIAGE_STATUS_CN = { unhandled: '待处理', reviewing: '处理中', issue_linked: '已关联事件', archived: '已归档', false_positive: '误报', official_responded: '官方已响应' };
+const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
 
 const TRIAGE_STATUSES = new Set(['unhandled', 'reviewing', 'issue_linked', 'official_responded', 'archived', 'false_positive']);
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
@@ -96,6 +103,13 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       const kw = `%${keyword}%`;
       params.push(kw, kw, kw);
       where += ` AND (r.title ILIKE $${params.length - 2} OR r.content ILIKE $${params.length - 1} OR r.keyword ILIKE $${params.length})`;
+    }
+    // 采集关键词多选(每个关键词=一次采集 session)
+    const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
+      .map(s => String(s).trim()).filter(Boolean);
+    if (captureKeywords.length) {
+      params.push(captureKeywords);
+      where += ` AND r.keyword = ANY($${params.length}::text[])`;
     }
 
     const total = (await queryOne(`
@@ -318,6 +332,120 @@ router.post('/records/:recordId/issues', requireTenantAccess, requireTenantWrite
 
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容或问题不存在' });
     return res.json({ ok: true, issue: result });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 导出当前筛选结果为 Excel(与 /records 列表用同一套 where/params,但不分页;排除封面/图片等重字段)
+router.get('/records/export', requireTenantAccess, async (req, res, next) => {
+  try {
+    const {
+      status = '',
+      priority = '',
+      platform = '',
+      sentiment = '',
+      keyword = '',
+      queue = '',
+    } = req.query;
+    const params = [req.tenantId];
+    let where = 'WHERE r.tenant_id = $1';
+    if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
+    if (sentiment) { params.push(sentiment); where += ` AND r.sentiment = $${params.length}`; }
+    const bucket = String(req.query.bucket || '');
+    if (bucket === 'archived') {
+      where += ` AND COALESCE(rt.status, 'unhandled') IN ('archived', 'false_positive', 'official_responded')`;
+    } else if (queue === 'active') {
+      where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
+    }
+    if (status) {
+      params.push(status);
+      where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
+    }
+    const risk = String(req.query.risk || '');
+    if (risk === 'alert') {
+      where += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`;
+    } else if (risk === 'negative') {
+      where += ` AND r.negative_comment_count > 0`;
+    } else if (risk === 'koe') {
+      where += ` AND r.source_type IN ('employee', 'dealer')`;
+    }
+    if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
+    if (keyword) {
+      const kw = `%${keyword}%`;
+      params.push(kw, kw, kw);
+      where += ` AND (r.title ILIKE $${params.length - 2} OR r.content ILIKE $${params.length - 1} OR r.keyword ILIKE $${params.length})`;
+    }
+    const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
+      .map(s => String(s).trim()).filter(Boolean);
+    if (captureKeywords.length) {
+      params.push(captureKeywords);
+      where += ` AND r.keyword = ANY($${params.length}::text[])`;
+    }
+
+    const records = await queryAll(`
+      SELECT
+        r.keyword, r.platform, r.title, r.content, r.author_name, r.author_fans, r.url,
+        r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
+        r.negative_comment_count, r.publish_time, r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
+        COALESCE(rt.status, 'unhandled') AS triage_status,
+        COALESCE(rt.priority, 'normal') AS triage_priority
+      FROM records r
+      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
+      ${where}
+      ORDER BY r.first_seen_at DESC NULLS LAST
+      LIMIT 5000
+    `, params);
+
+    const rows = records.map(r => ({
+      keyword: r.keyword,
+      platform: PLATFORM_CN[r.platform] || r.platform || '',
+      title: r.title,
+      content: String(r.content || '').slice(0, 1000),
+      author_name: r.author_name,
+      author_fans: r.author_fans,
+      url: r.url,
+      likes: r.likes,
+      comments_count: r.comments_count,
+      collects: r.collects,
+      shares: r.shares,
+      sentiment: SENTIMENT_CN[r.sentiment] || r.sentiment || '',
+      category: r.category,
+      ai_summary: r.ai_summary,
+      negative_comment_count: r.negative_comment_count,
+      triage_status: TRIAGE_STATUS_CN[r.triage_status] || r.triage_status || '',
+      triage_priority: PRIORITY_CN[r.triage_priority] || r.triage_priority || '',
+      publish: formatPublishDate(r.publish_time, r.created_at),
+      first_seen: fmtTs(r.first_seen_at),
+      last_seen: fmtTs(r.last_seen_at),
+      seen_count: r.seen_count,
+    }));
+
+    const columns = [
+      { header: '采集关键词', key: 'keyword', width: 18 },
+      { header: '平台', key: 'platform', width: 10 },
+      { header: '标题', key: 'title', width: 40 },
+      { header: '正文', key: 'content', width: 50 },
+      { header: '博主', key: 'author_name', width: 16 },
+      { header: '粉丝数', key: 'author_fans', width: 10 },
+      { header: '链接', key: 'url', width: 30 },
+      { header: '点赞', key: 'likes', width: 8 },
+      { header: '评论数', key: 'comments_count', width: 8 },
+      { header: '收藏', key: 'collects', width: 8 },
+      { header: '转发', key: 'shares', width: 8 },
+      { header: '情感', key: 'sentiment', width: 8 },
+      { header: '分类', key: 'category', width: 12 },
+      { header: 'AI摘要', key: 'ai_summary', width: 40 },
+      { header: '负评数', key: 'negative_comment_count', width: 8 },
+      { header: '处置状态', key: 'triage_status', width: 12 },
+      { header: '优先级', key: 'triage_priority', width: 8 },
+      { header: '发布时间', key: 'publish', width: 18 },
+      { header: '首次发现', key: 'first_seen', width: 18 },
+      { header: '最近采集', key: 'last_seen', width: 18 },
+      { header: '采集次数', key: 'seen_count', width: 8 },
+    ];
+
+    await sendXlsx(res, { sheetName: '内容分诊', columns, rows, filename: `内容分诊_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
   } catch (err) {
     return next(err);
   }

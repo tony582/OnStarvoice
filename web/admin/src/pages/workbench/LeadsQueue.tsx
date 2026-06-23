@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
   ChevronLeft, ChevronRight, ExternalLink, Loader2, MessageSquareWarning,
-  RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles,
+  RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles, Download,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { compact, formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
+import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
@@ -68,6 +69,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [priority, setPriority] = useState(initial?.priority ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [sort, setSort] = useState<'default' | 'publish'>('default')
+  const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [koe, setKoe] = useState('')
+  const [exporting, setExporting] = useState(false)
   const [rejudging, setRejudging] = useState(false)
   const [notice, setNotice] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
@@ -77,18 +81,27 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
 
   const sel = useSelection(`${status}|${platform}|${leadType}|${priority}|${keyword}|${pagination?.page ?? 1}`)
 
+  const filterParams = useCallback(() => {
+    const params = new URLSearchParams({ category })
+    if (isSales) { if (status) params.set('status', status) }
+    else params.set('bucket', status || 'pending')
+    if (platform) params.set('platform', platform)
+    if (leadType && !isSales) params.set('leadType', leadType)
+    if (priority) params.set('priority', priority)
+    if (keyword.trim()) params.set('keyword', keyword.trim())
+    if (sort === 'publish') params.set('sort', 'publish')
+    if (koe && !isSales) params.set('koe', koe)
+    captureKeywords.forEach(k => params.append('captureKeyword', k))
+    return params
+  }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords])
+
   const load = useCallback(async (page = 1) => {
     setLoading(true)
     setError('')
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: '30', category })
-      if (isSales) { if (status) params.set('status', status) }
-      else params.set('bucket', status || 'pending')
-      if (platform) params.set('platform', platform)
-      if (leadType && !isSales) params.set('leadType', leadType)
-      if (priority) params.set('priority', priority)
-      if (keyword.trim()) params.set('keyword', keyword.trim())
-      if (sort === 'publish') params.set('sort', 'publish')
+      const params = filterParams()
+      params.set('page', String(page))
+      params.set('pageSize', '30')
       const data = await api.get<any>('/leads/comments?' + params.toString())
       setLeads(data.leads || [])
       setPagination(data.pagination || null)
@@ -97,9 +110,16 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     } finally {
       setLoading(false)
     }
-  }, [status, platform, leadType, priority, keyword, sort, category, isSales, noun])
+  }, [filterParams, noun])
 
-  useEffect(() => { load(1) }, [status, platform, leadType, priority, category]) // eslint-disable-line react-hooks/exhaustive-deps
+  const exportXlsx = async () => {
+    setExporting(true)
+    try { await api.download('/leads/comments/export?' + filterParams().toString(), `${noun}.xlsx`) }
+    catch { setNotice('导出失败,请稍后重试'); window.setTimeout(() => setNotice(''), 4000) }
+    finally { setExporting(false) }
+  }
+
+  useEffect(() => { load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
@@ -170,9 +190,17 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
             {TYPE_OPTIONS.filter(o => o.value !== 'sales_intent').map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
           </WorkbenchSelect>
         )}
+        {!isSales && (
+          <WorkbenchSelect value={koe} onChange={e => setKoe(e.target.value)}>
+            <option value="">全部来源</option>
+            <option value="hide">隐藏疑似KOE</option>
+            <option value="only">只看疑似KOE</option>
+          </WorkbenchSelect>
+        )}
         <WorkbenchSelect value={priority} onChange={e => setPriority(e.target.value)}>
           {PRIORITY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
+        <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
         <button onClick={() => setSort(s => s === 'publish' ? 'default' : 'publish')}
           title="按评论发布时间从新到旧排序"
           className={`rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors ${sort === 'publish' ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
@@ -191,6 +219,10 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
         <Button variant="outline" size="sm" onClick={() => load(1)} disabled={loading}>
           <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
           刷新
+        </Button>
+        <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
+          <Download className={`h-3.5 w-3.5 ${exporting ? 'animate-pulse' : ''}`} />
+          {exporting ? '导出中…' : '导出'}
         </Button>
         {isSales && canWrite() && (
           <Button variant="outline" size="sm" onClick={rejudgeSales} disabled={rejudging} title="用 AI 重新判断现有销售客资是否真为购买意向,非购买的移回评论分诊">
@@ -243,7 +275,12 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                       </div>
                     </td>
                     <td className="px-4 py-3 align-top text-xs">
-                      <div className="font-medium text-foreground">{lead.comment_author_name || '-'}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-medium text-foreground">{lead.comment_author_name || '-'}</span>
+                        {(lead.comment_source_type === 'dealer' || lead.comment_source_type === 'employee') && (
+                          <span title="作者名含品牌/车型词,疑似经销商/员工软文,非真实车主 UGC" className="shrink-0 cursor-help rounded bg-violet-500/15 px-1 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+                        )}
+                      </div>
                       <div className="mt-0.5 whitespace-nowrap text-muted-foreground">IP {lead.comment_ip_location || '-'} · 赞 {formatNumber(lead.comment_like_count)}</div>
                     </td>
                     <td className="px-4 py-3 align-top"><StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge></td>

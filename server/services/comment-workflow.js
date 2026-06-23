@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { queryAll, queryOne, withTransaction } from '../db/init.js';
+import { queryAll, queryOne, withTransaction, getSetting } from '../db/init.js';
 import { classifyCommentWithAI, classifyCommentsBatch } from './ai-labeler.js';
 import { upsertCommentLeadForComment } from './comment-leads.js';
 
@@ -90,6 +90,18 @@ function normalizeComment(item, index) {
     floor_index: Number.isFinite(Number(item?.floorIndex ?? item?.index)) ? Number(item?.floorIndex ?? item?.index) : index + 1,
     payload: item || {},
   };
+}
+
+// KOE(疑似经销商/员工):作者名命中租户配置的品牌/车型词(tenant_settings.koe_account_terms)→ 'dealer'。
+// 多租户:未配 koe_account_terms 的租户恒为空,不影响。安吉星=上汽通用全系车型。
+function splitKoeTerms(value) {
+  return String(value || '').split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
+}
+function detectKoeSourceType(authorName, koeTerms) {
+  if (!koeTerms || !koeTerms.length) return '';
+  const name = String(authorName || '').toLowerCase();
+  if (!name) return '';
+  return koeTerms.some(t => t && name.includes(String(t).toLowerCase())) ? 'dealer' : '';
 }
 
 export function classifyComment(comment, isOfficial) {
@@ -199,8 +211,9 @@ function buildCommentHash(recordId, comment) {
 
 // classification:入库用的(规则)分类。aiClassified:是否已是终判(官方评论)。
 // 评论入库不调 LLM —— 新评论先存规则分类、ai_classified_at 留 NULL,由后台 refineCommentsWithAI 精炼。
-async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification = null, aiClassified = false }) {
+async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification = null, aiClassified = false, koeTerms = [] }) {
   const contentHash = buildCommentHash(recordId, comment);
+  const sourceType = detectKoeSourceType(comment.author_name, koeTerms);
   if (!classification) classification = ruleClassificationWithMetadata(classifyComment(comment, Boolean(officialAccount)));
   let existing = null;
   if (comment.external_comment_id) {
@@ -229,6 +242,7 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
         published_at = COALESCE(NULLIF($6, ''), published_at),
         ip_location = COALESCE(NULLIF($7, ''), ip_location),
         is_official = $8,
+        source_type = CASE WHEN $10 <> '' THEN $10 ELSE source_type END,
         last_seen_at = now(),
         seen_count = seen_count + 1,
         updated_at = now()
@@ -237,7 +251,7 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
     `, [
       comment.author_name, comment.author_id, comment.author_avatar, comment.content,
       comment.like_count, comment.published_at, comment.ip_location,
-      Boolean(officialAccount), existing.id,
+      Boolean(officialAccount), existing.id, sourceType,
     ]);
     return { row, inserted: false, officialAccount };
   }
@@ -247,13 +261,13 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
       tenant_id, record_id, platform, external_comment_id, parent_comment_id,
       author_name, author_id, author_avatar, content, like_count, published_at,
       ip_location, floor_index, is_official, is_negative, sentiment, category,
-      risk_level, ai_summary, ai_result, content_hash, payload, ai_classified_at
+      risk_level, ai_summary, ai_result, content_hash, payload, ai_classified_at, source_type
     ) VALUES (
       $1, $2, $3, $4, $5,
       $6, $7, $8, $9, $10, $11,
       $12, $13, $14, $15, $16, $17,
       $18, $19, $20::jsonb, $21, $22::jsonb,
-      CASE WHEN $23 THEN now() ELSE NULL END
+      CASE WHEN $23 THEN now() ELSE NULL END, $24
     )
     RETURNING *
   `, [
@@ -266,7 +280,7 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
     JSON.stringify(classification.ai_result || {}),
     contentHash,
     JSON.stringify(comment.payload || {}),
-    aiClassified,
+    aiClassified, sourceType,
   ]);
   return { row, inserted: true, officialAccount };
 }
@@ -436,6 +450,7 @@ export async function upsertRecordComments(recordId, record, context) {
     [recordId, tenantId]
   );
   if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
+  const koeTerms = splitKoeTerms(await getSetting('koe_account_terms', tenantId));
 
   const officialRecordAccount = isOfficialSubject({
     platform,
@@ -480,7 +495,7 @@ export async function upsertRecordComments(recordId, record, context) {
     }
 
     for (const { comment, officialAccount, classification, aiClassified } of prepared) {
-      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification, aiClassified });
+      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification, aiClassified, koeTerms });
       if (result.inserted) inserted += 1;
       else updated += 1;
       if (officialAccount) {
