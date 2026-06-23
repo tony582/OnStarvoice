@@ -10,7 +10,7 @@ export function TopBar({ eyebrow, title, collapsed, onToggleCollapse }: TopBarPr
   const { user, tenants, tenantId, switchTenant, logout } = useAuth()
 
   return (
-    <header className="sticky top-0 z-20 border-b border-border/60 bg-background/80 px-8 backdrop-blur-md">
+    <header className="sticky top-0 z-20 border-b border-border/60 bg-background/80 px-4 backdrop-blur-md">
       <div className="flex h-14 items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-2.5">
           {collapsed && onToggleCollapse && (

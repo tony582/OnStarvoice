@@ -104,7 +104,7 @@ function AppContent() {
       >
         <TopBar eyebrow={config.eyebrow} title={title} collapsed={collapsed} onToggleCollapse={toggleCollapse} />
         {/* key 含 seq:带参导航强制重挂载以消费一次性预置筛选;含 tenantId:切租户即时刷新当前页 */}
-        <div className="animate-fade-up px-8 pb-8 pt-5" key={`${page}:${seq}:${tenantId}`}>
+        <div className="animate-fade-up px-4 pb-8 pt-5" key={`${page}:${seq}:${tenantId}`}>
           {PageComponent ? <PageComponent /> : <ComingSoon pageId={page} />}
         </div>
       </main>
