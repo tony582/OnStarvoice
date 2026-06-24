@@ -955,15 +955,26 @@ function looksLikePublishDate(text) {
   const normalized = cleanText(text || "");
   if (!normalized) return false;
 
-  return (
-    /^\d{4}[./-]\d{1,2}[./-]\d{1,2}$/.test(normalized) ||
-    /^\d{1,2}[./-]\d{1,2}$/.test(normalized) ||
+  // 相对时间
+  if (
     /^\d+\s*分钟前$/.test(normalized) ||
     /^\d+\s*小时前$/.test(normalized) ||
     /^\d+\s*天前$/.test(normalized) ||
     normalized === "刚刚" ||
     normalized === "昨天"
-  );
+  ) {
+    return true;
+  }
+
+  // 绝对日期必须校验 月1-12 / 日1-31，否则价格、比率(如 "17.99"、"12/50")会被误当成日期
+  let m = normalized.match(/^\d{4}[./-](\d{1,2})[./-](\d{1,2})$/);
+  if (!m) m = normalized.match(/^(\d{1,2})[./-](\d{1,2})$/);
+  if (m) {
+    const month = Number(m[1]);
+    const day = Number(m[2]);
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+  }
+  return false;
 }
 
 function pickDateTextCandidate(candidates) {

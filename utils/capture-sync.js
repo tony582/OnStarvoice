@@ -120,7 +120,8 @@ const COMMENT_CONTENT_MAX_LENGTH = 280;
 const DETAIL_CAPTURE_NAV_TIMEOUT_MS = 90000;
 const DETAIL_CAPTURE_NAV_POLL_MS = 280;
 const DETAIL_CAPTURE_AFTER_NAV_WAIT_MS = 2000;
-const PROFILE_AFTER_NAV_WAIT_MS = 2000;
+// 博主主页「小红书号/抖音号」常 ~3.5s 才渲染,2s 太短会回退成内部 ID → 取号失败
+const PROFILE_AFTER_NAV_WAIT_MS = 3500;
 const DEFAULT_BLOGGER_PROFILE_TABLE_NAME = '博主信息表';
 const DEFAULT_BLOGGER_NOTES_TABLE_NAME = '博主笔记采集';
 const DEFAULT_KEYWORD_NOTES_TABLE_NAME = '关键词笔记采集';
@@ -2454,6 +2455,14 @@ function mergeHydratedDetailIntoRecordPayload(record) {
     ...firstItem,
     ...detail,
   };
+
+  // 详情增强若返回空标题/正文(典型:抖音图文 desc 常为空),别用空覆盖搜索卡片已采到的真实值。
+  // 卡片兜底占位「抖音搜索结果 N」不算真标题,不回填;抖音正文=标题,缺正文时用标题补。
+  if (!mergedItem.title && firstItem.title && !/^抖音搜索结果/.test(String(firstItem.title))) {
+    mergedItem.title = firstItem.title;
+  }
+  if (!mergedItem.content && firstItem.content) mergedItem.content = firstItem.content;
+  if (!mergedItem.content && mergedItem.title) mergedItem.content = mergedItem.title;
 
   if (!mergedItem.url && mergedItem.noteUrl) mergedItem.url = mergedItem.noteUrl;
   if (!mergedItem.noteUrl && mergedItem.url) mergedItem.noteUrl = mergedItem.url;
@@ -4966,6 +4975,50 @@ async function captureBloggerMetricsForSingleNoteRecord(
         payload: latestPayload,
       });
 
+      // 抖音号在博主主页上(作品页指标那条路拿不到)→ 补一次"导航到主页 + mode blogger_profile"(=douyin-blogger.js)取抖音号。
+      // 失败不影响主流程(粉丝数已采到)。
+      if (profileUrl && tab?.id && (typeof shouldStop !== 'function' || !shouldStop())) {
+        try {
+          if (onProgress) {
+            onProgress({
+              phase: 'blogger_metrics_extract_douyin_id',
+              message: '正在进入主页提取抖音号...',
+              recordId,
+            });
+          }
+          await openUrlInTab(tab.id, profileUrl, {
+            timeoutMs: detailNavTimeoutMs,
+            shouldStop,
+            active: true,
+          });
+          await waitMsWithStop(
+            profileAfterNavWaitMs,
+            shouldStop,
+            'BATCH_CAPTURE_CANCELED',
+          );
+          const idResult = await captureInTab(tab.id, {
+            mode: 'blogger_profile',
+            captureParams: {},
+          });
+          // 真抖音号在 data.douyinId(extractDouyinId 取「抖音号:xxx」);
+          // data.bloggerId 是 resolveBloggerId=URL 里的 sec_uid(MS4w...),不能用 —— 此前 bug 就在这。
+          const douyinNo = idResult?.ok
+            ? pickHumanAccountNo(idResult.data)
+            : '';
+          if (douyinNo) {
+            latestPayload = applyBloggerMetricsPatch(latestPayload, {
+              bloggerUserId: douyinNo,
+            });
+            await updateRecord(recordId, {
+              status: RECORD_STATUS.DRAFT,
+              payload: latestPayload,
+            });
+          }
+        } catch (idError) {
+          console.warn('[Sidebar] 抖音号补采失败(不影响主流程):', idError);
+        }
+      }
+
       if (onProgress) {
         onProgress({
           phase: 'blogger_metrics_done',
@@ -5990,6 +6043,7 @@ function ensureBloggerMetricsFields(payload) {
     bloggerMetricsCaptureStatus: status,
     bloggerMetricsCaptureError: String(base.bloggerMetricsCaptureError || ''),
     bloggerAccountType: normalizeBloggerAccountType(base.bloggerAccountType),
+    bloggerUserId: String(base.bloggerUserId || ''),
   };
 }
 
@@ -6007,6 +6061,7 @@ function applyBloggerMetricsPatch(payload, patch) {
     bloggerMetricsCaptureError:
       patch.bloggerMetricsCaptureError ?? base.bloggerMetricsCaptureError,
     bloggerAccountType: patch.bloggerAccountType ?? base.bloggerAccountType,
+    bloggerUserId: patch.bloggerUserId ?? base.bloggerUserId,
   };
 }
 
@@ -6017,6 +6072,7 @@ function createBloggerMetricsPatch({
   profileUrl,
   error,
   accountType,
+  bloggerId,
 }) {
   const patch = {
     bloggerMetricsCaptureStatus: status,
@@ -6037,8 +6093,40 @@ function createBloggerMetricsPatch({
   if (accountType !== undefined) {
     patch.bloggerAccountType = normalizeBloggerAccountType(accountType);
   }
+  if (bloggerId !== undefined) {
+    patch.bloggerUserId = String(bloggerId || '');
+  }
 
   return patch;
+}
+
+// 平台「内部 ID」≠「人看的账号号」。绝不能把内部 ID 当成小红书号/抖音号入库:
+//  - 小红书 user_id:24 位十六进制(如 5700cb384775a72931d38e56,来自 /user/profile/xxx)
+//  - 抖音 sec_uid:MS4w 开头长串(如 MS4wLjABAAAA...,来自 /user/xxx)
+// 真正的号是人能搜的字母数字串(小红书号 chengyao1218 / 抖音号 zhangjimin1950)。
+function isInternalAccountNo(value) {
+  const v = String(value || '').trim();
+  if (!v) return true;
+  if (/^[0-9a-f]{24}$/i.test(v)) return true; // 小红书内部 user_id
+  if (/^MS4w/i.test(v)) return true; // 抖音 sec_uid
+  return false;
+}
+
+// 从博主 payload 里挑出「人看的账号号」,按可信度排序,且过滤掉内部 ID。
+function pickHumanAccountNo(payload = {}) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const candidates = [
+    p.bloggerUserId,
+    p.redId,
+    p.douyinId, // 抖音号(extractDouyinId),非 sec_uid
+    p.authorUsername, // 抖音作品页 API unique_id
+    p.bloggerId, // 小红书:此处常是号;但抖音是 sec_uid → 被过滤
+  ];
+  for (const c of candidates) {
+    const v = String(c || '').trim();
+    if (v && !isInternalAccountNo(v)) return v;
+  }
+  return '';
 }
 
 function resolveBloggerMetricsFromProfilePayload(
@@ -6062,6 +6150,8 @@ function resolveBloggerMetricsFromProfilePayload(
       fallbackProfileUrl,
     error: '',
     accountType: safePayload.bloggerAccountType || safePayload.accountType,
+    // 只回填「人看的号」,内部 hex / sec_uid 一律不写(宁可空也不写错)
+    bloggerId: pickHumanAccountNo(safePayload),
   });
 }
 
@@ -6096,6 +6186,8 @@ function resolveBloggerMetricsPatchFromCurrentPayload(
     error: '',
     accountType:
       normalizedPayload.bloggerAccountType || normalizedPayload.accountType,
+    // 抖音号(unique_id,来自作品页 API)→ author_account_no;过滤掉 sec_uid/内部 hex
+    bloggerId: pickHumanAccountNo(normalizedPayload),
   });
 }
 
@@ -7371,6 +7463,10 @@ function isDouyinContentFlowUrl(url = '') {
 
 const BATCH_KEYWORD_DELAY_MIN_MS = 3000;
 const BATCH_KEYWORD_DELAY_MAX_MS = 5000;
+// 不同搜索词之间的随机间隔:分钟级。连续快搜多个关键词(秒级)会触发小红书安全机制(风控),
+// 必须把节奏拉到「几分钟」且随机化(固定节奏也易被识别)。通宵无人值守跑也走这个节奏。
+const BATCH_INTER_KEYWORD_DELAY_MIN_MS = 90 * 1000; // 1.5 分钟
+const BATCH_INTER_KEYWORD_DELAY_MAX_MS = 210 * 1000; // 3.5 分钟
 const BATCH_KEYWORD_NAV_TIMEOUT_MS = 15000;
 const BATCH_KEYWORD_NAV_POLL_MS = 300;
 const BATCH_KEYWORD_AFTER_NAV_WAIT_MS = 2000;
@@ -7880,11 +7976,26 @@ export async function batchCaptureByUrls({
  * @param {Function} [options.shouldStop] - 取消检测函数
  * @returns {Promise<{ ok: boolean, results: Array, stats: Object }>}
  */
+// 采集前切搜索「排序 / 发布时间」:转发到 content 的 applyBatchSearchFilters(复用「找对标账号」的筛选点击);失败不影响采集
+async function applySearchFiltersInTab(tabId, { sort = '', publishTime = '' } = {}) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: Number(tabId),
+      payload: { action: 'applyBatchSearchFilters', sort, publishTime },
+    });
+    return response?.data ?? null;
+  } catch (error) {
+    return null;
+  }
+}
+
 export async function batchCaptureByKeywords({
   keywords = [],
   platform = '',
   baseSearchUrl = '',
   captureParams = {},
+  searchFilters = null,
   onProgress = null,
   shouldStop = null,
 } = {}) {
@@ -7933,6 +8044,20 @@ export async function batchCaptureByKeywords({
         shouldStop,
         'BATCH_CAPTURE_CANCELED',
       );
+
+      // 按需切换搜索「排序 / 发布时间」(综合 + 不限则跳过);失败不影响继续采集
+      if (searchFilters && (searchFilters.sort || searchFilters.publishTime)) {
+        if (onProgress) {
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'filtering',
+            message: `正在切换排序筛选「${keyword}」(${i + 1}/${keywords.length})...`,
+          });
+        }
+        await applySearchFiltersInTab(runnerTabId, searchFilters);
+      }
 
       if (onProgress) {
         onProgress({
@@ -8060,11 +8185,20 @@ export async function batchCaptureByKeywords({
       finishListCaptureCheckpointSession(checkpointSession);
     }
 
-    // 关键词间随机延迟（最后一个不延迟）
+    // 关键词间随机延迟:分钟级(防风控,见常量注释)。最后一个不延迟。
     if (i < keywords.length - 1) {
       const delay =
-        BATCH_KEYWORD_DELAY_MIN_MS +
-        Math.random() * (BATCH_KEYWORD_DELAY_MAX_MS - BATCH_KEYWORD_DELAY_MIN_MS);
+        BATCH_INTER_KEYWORD_DELAY_MIN_MS +
+        Math.random() *
+          (BATCH_INTER_KEYWORD_DELAY_MAX_MS - BATCH_INTER_KEYWORD_DELAY_MIN_MS);
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: keywords.length,
+          phase: 'inter_keyword_delay',
+          message: `已采「${keyword}」，${Math.round(delay / 1000)} 秒后再搜下一个关键词(防风控·随机间隔)…`,
+        });
+      }
       try {
         await waitMsWithStop(delay, shouldStop, 'BATCH_CAPTURE_CANCELED');
       } catch (error) {

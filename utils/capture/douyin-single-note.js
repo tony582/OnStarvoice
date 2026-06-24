@@ -473,6 +473,7 @@ function buildPayloadFromApiDetail(detail, noteId) {
     title,
     author: author.nickname || "",
     authorId: secUid || author.uid || "",
+    authorUsername: author.unique_id || "",
     authorUrl,
     content: title,
     tags,
@@ -2723,6 +2724,7 @@ function supplementDouyinImageNotePayload(payload, noteId = "", apiDetail = null
     url: buildDouyinCanonicalNoteUrl(noteId, "image", apiDetail),
     author: normalizedPayload.author || authorInfo.name || "",
     authorId: normalizedPayload.authorId || authorInfo.userId || "",
+    authorUsername: normalizedPayload.authorUsername || "",
     authorUrl: normalizedPayload.authorUrl || authorInfo.url || "",
     bloggerProfileUrl:
       normalizedPayload.bloggerProfileUrl || authorInfo.url || "",
