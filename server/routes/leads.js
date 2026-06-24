@@ -72,6 +72,28 @@ function leadsOrderSql(sort, dir) {
   return tail;
 }
 
+// 评论日期区间过滤(可切维度)。FROM comment_leads:
+//   发布时间(publish,默认)→ comment_leads.comment_published_ts(直列)
+//   最近采集(recent)/ 首次采集(first)→ record_comments.last_seen_at / first_seen_at(EXISTS 子查询)
+// 列名取自白名单,无注入。
+function appendCommentDateRangeFilter(where, params, query) {
+  const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(query.dateFrom || '')) ? query.dateFrom : '';
+  const dTo = /^\d{4}-\d{2}-\d{2}$/.test(String(query.dateTo || '')) ? query.dateTo : '';
+  if (!dFrom && !dTo) return where;
+  const basis = String(query.dateBasis || 'publish');
+  if (basis === 'publish') {
+    if (dFrom) { params.push(dFrom); where += ` AND comment_published_ts >= $${params.length}::date`; }
+    if (dTo) { params.push(dTo); where += ` AND comment_published_ts < ($${params.length}::date + INTERVAL '1 day')`; }
+    return where;
+  }
+  const col = basis === 'recent' ? 'rc.last_seen_at' : 'rc.first_seen_at';
+  const conds = [];
+  if (dFrom) { params.push(dFrom); conds.push(`${col} >= $${params.length}::date`); }
+  if (dTo) { params.push(dTo); conds.push(`${col} < ($${params.length}::date + INTERVAL '1 day')`); }
+  where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND ${conds.join(' AND ')})`;
+  return where;
+}
+
 router.get('/comments', requireTenantAccess, async (req, res, next) => {
   try {
     const {
@@ -142,6 +164,7 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     } else if (koe === 'hide') {
       where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
     }
+    where = appendCommentDateRangeFilter(where, params, req.query);
 
     const total = (await queryOne(
       `SELECT COUNT(*) AS total FROM comment_leads ${where}`,
@@ -352,6 +375,7 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
     } else if (koe === 'hide') {
       where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
     }
+    where = appendCommentDateRangeFilter(where, params, req.query);
 
     const leads = await queryAll(`
       SELECT *,

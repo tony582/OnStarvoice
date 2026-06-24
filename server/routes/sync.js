@@ -14,6 +14,16 @@ function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+// 内部 ID(非「人看的号」):小红书 24 位 hex user_id / 抖音 sec_uid(MS4w 开头)。
+// account_no 只存「人看的号」(小红书号/抖音号),内部 ID 不入此列。
+function isInternalUid(value) {
+  const s = String(value || '').trim();
+  if (!s) return true;
+  if (/^[0-9a-f]{24}$/i.test(s)) return true;
+  if (/^MS4w/i.test(s)) return true;
+  return false;
+}
+
 function firstPayloadItem(payload) {
   if (!Array.isArray(payload?.items)) return {};
   const item = payload.items.find(entry => isPlainObject(entry));
@@ -187,6 +197,19 @@ function normalizeRecord(body) {
       publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw')),
       tags: JSON.stringify(tags),
       blogger_profile_url: String(get('bloggerProfileUrl', 'authorProfileUrl', 'authorUrl', 'profileUrl')),
+      // 「人看的号」:号采到时落在 bloggerUserId(增强补)/ redId / douyinId(抖音号)/ bloggerId(小红书主页号)。
+      // 逐个取、挑第一个非内部ID的(抖音 bloggerId 是 sec_uid → 被过滤,真号在 douyinId)。
+      author_account_no: String(
+        [
+          get('bloggerUserId'),
+          get('redId'),
+          get('douyinId'),
+          get('authorUsername'),
+          get('bloggerId'),
+        ]
+          .map((v) => String(v || '').trim())
+          .find((v) => v && !isInternalUid(v)) || '',
+      ),
       image_urls: JSON.stringify(imageUrls),
       comments_text: String(get('commentsMergedText')),
       comments_cleaned_items: JSON.stringify(commentsCleanedItems),

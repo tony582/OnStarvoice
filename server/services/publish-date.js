@@ -14,6 +14,13 @@ export function formatPublishDate(raw, fallback = null) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
 }
 
+// 发布时间不可能晚于采集时刻(没采集时刻则用当前),+2天容差:出现未来时间多是抓到正文里的
+// 活动/投票/上线日期等污染,判为不可信(让上层显示「—」而非假的未来日期)。
+function isFuturePublish(d, fbValid) {
+  const ref = fbValid ? fbValid.getTime() : Date.now();
+  return d.getTime() > ref + 2 * 86400000;
+}
+
 export function parsePublishTimestamp(raw, fallback = null) {
   const fb = fallback ? new Date(fallback) : null;
   const fbValid = fb && !Number.isNaN(fb.getTime()) ? fb : null;
@@ -45,7 +52,7 @@ export function parsePublishTimestamp(raw, fallback = null) {
   const ymd = t.match(/(20\d{2})[\-/.年](\d{1,2})[\-/.月](\d{1,2})(?:[日]?\s+(\d{1,2}):(\d{2}))?/u);
   if (ymd) {
     const d = new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]), Number(ymd[4] || 0), Number(ymd[5] || 0));
-    if (!Number.isNaN(d.getTime())) return d;
+    if (!Number.isNaN(d.getTime())) return isFuturePublish(d, fbValid) ? null : d;
   }
   // 仅 MM-DD:按采集年份,若解析出的日期晚于采集时刻则回退一年(跨年)
   const md = t.match(/(?:^|\s)(\d{1,2})[\-/.月](\d{1,2})[日]?/u);
@@ -59,6 +66,6 @@ export function parsePublishTimestamp(raw, fallback = null) {
   }
   // 兜底:Date.parse
   const p = Date.parse(t);
-  if (!Number.isNaN(p)) return new Date(p);
+  if (!Number.isNaN(p)) { const pd = new Date(p); return isFuturePublish(pd, fbValid) ? null : pd; }
   return fbValid;
 }

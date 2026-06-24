@@ -40,12 +40,26 @@ function appendCommonRecordFilters({ where, params, query }) {
   return where;
 }
 
+// 日期区间过滤(可切维度)。cols 给出三档对应的列表达式(已含别名),取自白名单,无注入。
+//   basis: publish(默认) / recent(最近采集) / first(首次采集)
+function appendDateRangeFilter({ where, params, query, cols }) {
+  const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(query.dateFrom || '')) ? query.dateFrom : '';
+  const dTo = /^\d{4}-\d{2}-\d{2}$/.test(String(query.dateTo || '')) ? query.dateTo : '';
+  if (!dFrom && !dTo) return where;
+  const basis = String(query.dateBasis || 'publish');
+  const col = basis === 'first' ? cols.first : basis === 'recent' ? cols.recent : cols.publish;
+  if (dFrom) { params.push(dFrom); where += ` AND ${col} >= $${params.length}::date`; }
+  if (dTo) { params.push(dTo); where += ` AND ${col} < ($${params.length}::date + INTERVAL '1 day')`; }
+  return where;
+}
+
 async function listRecordTable(req, table) {
   const types = RECORD_TABLE_TYPES[table];
   const { page, pageSize, offset } = tablePagination(req.query);
   const params = [req.tenantId, types];
   let where = "WHERE tenant_id = $1 AND COALESCE(record_type, '') = ANY($2)";
   where = appendCommonRecordFilters({ where, params, query: req.query });
+  where = appendDateRangeFilter({ where, params, query: req.query, cols: { publish: 'published_ts', first: 'first_seen_at', recent: 'last_seen_at' } });
   const total = (await queryOne(`SELECT COUNT(*) AS total FROM records ${where}`, params))?.total || 0;
   params.push(pageSize, offset);
   const rows = await queryAll(`
@@ -76,6 +90,7 @@ async function listCommentLeadTable(req) {
       OR cl.comment_ip_location ILIKE $${params.length}
     )`;
   }
+  where = appendDateRangeFilter({ where, params, query: req.query, cols: { publish: 'cl.comment_published_ts', first: 'rc.first_seen_at', recent: 'rc.last_seen_at' } });
   const joins = `
     FROM comment_leads cl
     LEFT JOIN record_comments rc ON rc.id = cl.comment_id AND rc.tenant_id = cl.tenant_id
@@ -120,6 +135,7 @@ async function listMonitorContentTable(req) {
       OR COALESCE(ms.keyword, ro.keyword, r.keyword, '') ILIKE $${params.length}
     )`;
   }
+  where = appendDateRangeFilter({ where, params, query: req.query, cols: { publish: 'r.published_ts', first: 'r.first_seen_at', recent: 'r.last_seen_at' } });
   const joins = `
     FROM record_observations ro
     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
