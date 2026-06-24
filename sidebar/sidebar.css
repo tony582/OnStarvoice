@@ -4394,32 +4394,51 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   color: var(--accent-primary);
   border-color: var(--accent-primary);
 }
-.keyword-batch-progress.is-minimized {
-  position: fixed;
-  bottom: 12px;
-  right: 12px;
-  left: auto;
-  z-index: 9999;
-  width: auto;
-  max-width: 88%;
-  margin: 0;
-  padding: 6px 10px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-color);
-  border-radius: 999px;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+/* 最小化:整个批量弹窗收成右下角小条,只留进度;背景透明 + 不拦点击,页面可正常用 */
+.batch-modal-overlay.is-batch-minimized {
+  background: transparent;
+  pointer-events: none;
 }
-.keyword-batch-progress.is-minimized .keyword-batch-progress-bar {
+.batch-modal-overlay.is-batch-minimized .batch-modal-card {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  left: auto;
+  top: auto;
+  transform: none;
+  width: auto;
+  max-width: 360px;
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  padding: 8px 12px;
+  pointer-events: auto;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+}
+.batch-modal-overlay.is-batch-minimized .batch-modal-header,
+.batch-modal-overlay.is-batch-minimized .batch-modal-hint,
+.batch-modal-overlay.is-batch-minimized .batch-content-pane {
   display: none;
 }
-.keyword-batch-progress.is-minimized .keyword-batch-progress-head {
+.batch-modal-overlay.is-batch-minimized .batch-modal-body {
+  display: block;
+  padding: 0;
+  margin: 0;
+}
+.batch-modal-overlay.is-batch-minimized #batchProgressContainer {
+  margin: 0;
+}
+.batch-modal-overlay.is-batch-minimized .keyword-batch-progress-bar {
+  display: none;
+}
+.batch-modal-overlay.is-batch-minimized .keyword-batch-progress-head {
   margin-bottom: 0;
 }
-.keyword-batch-progress.is-minimized .keyword-batch-progress-text {
+.batch-modal-overlay.is-batch-minimized .keyword-batch-progress-text {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
+  max-width: 240px;
 }
 
 /* Batch trigger button & action row */

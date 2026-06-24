@@ -2645,9 +2645,9 @@ function setupUIEventListeners() {
   document
     .getElementById("btnMinBatchProgress")
     ?.addEventListener("click", () => {
-      const c = document.getElementById("batchProgressContainer");
-      if (!c) return;
-      const minimized = c.classList.toggle("is-minimized");
+      const overlay = document.getElementById("batchModalOverlay");
+      if (!overlay) return;
+      const minimized = overlay.classList.toggle("is-batch-minimized");
       const btn = document.getElementById("btnMinBatchProgress");
       if (btn) btn.textContent = minimized ? "展开 ⊡" : "最小化 ⊟";
     });
@@ -15792,7 +15792,8 @@ function setBatchProgressVisible(scope = "modal", visible = true) {
     container.hidden = !visible;
     if (visible) {
       // 每次新批量都从展开态开始
-      container.classList.remove("is-minimized");
+      const overlay = document.getElementById("batchModalOverlay");
+      if (overlay) overlay.classList.remove("is-batch-minimized");
       const minBtn = document.getElementById("btnMinBatchProgress");
       if (minBtn) minBtn.textContent = "最小化 ⊟";
     }
