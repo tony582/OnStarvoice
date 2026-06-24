@@ -4370,6 +4370,54 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   color: var(--text-tertiary);
 }
 
+/* 批量进度「最小化」按钮 + 缩成右下角小圆条(通宵跑时不挡视野、随时看还在不在跑) */
+.batch-progress-min {
+  float: right;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.batch-progress-min:hover {
+  color: var(--accent-primary);
+}
+.keyword-batch-progress.is-minimized {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  left: auto;
+  z-index: 9999;
+  width: auto;
+  max-width: 84%;
+  margin: 0;
+  padding: 6px 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.keyword-batch-progress.is-minimized .keyword-batch-progress-bar {
+  display: none;
+}
+.keyword-batch-progress.is-minimized .keyword-batch-progress-text {
+  order: 1;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.keyword-batch-progress.is-minimized .batch-progress-min {
+  order: 2;
+  float: none;
+}
+
 /* Batch trigger button & action row */
 .action-row {
   display: flex;

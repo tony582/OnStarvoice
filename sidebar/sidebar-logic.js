@@ -2641,6 +2641,16 @@ function setupUIEventListeners() {
   document
     .getElementById("btnRunBatchKeywords")
     ?.addEventListener("click", handleBatchKeywordCapture);
+  // 批量进度「最小化 / 展开」切换
+  document
+    .getElementById("btnMinBatchProgress")
+    ?.addEventListener("click", () => {
+      const c = document.getElementById("batchProgressContainer");
+      if (!c) return;
+      const minimized = c.classList.toggle("is-minimized");
+      const btn = document.getElementById("btnMinBatchProgress");
+      if (btn) btn.textContent = minimized ? "▢" : "—";
+    });
   document
     .getElementById("keywordInsightError")
     ?.addEventListener("click", (event) => {
@@ -15780,6 +15790,12 @@ function setBatchProgressVisible(scope = "modal", visible = true) {
   const {container, fillEl, textEl} = getBatchProgressElements(scope);
   if (container) {
     container.hidden = !visible;
+    if (visible) {
+      // 每次新批量都从展开态开始
+      container.classList.remove("is-minimized");
+      const minBtn = document.getElementById("btnMinBatchProgress");
+      if (minBtn) minBtn.textContent = "—";
+    }
   }
   if (visible && fillEl) {
     fillEl.style.width = "0%";
