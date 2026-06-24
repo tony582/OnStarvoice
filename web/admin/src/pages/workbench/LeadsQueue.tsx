@@ -13,6 +13,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { MultiSelect } from '@/components/shared/MultiSelect'
+import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
@@ -76,6 +77,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [sort, setSort] = useState<{ field: '' | LeadSortField; dir: 'asc' | 'desc' }>({ field: '', dir: 'desc' })
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [koe, setKoe] = useState('')
   const [exporting, setExporting] = useState(false)
   const [rejudging, setRejudging] = useState(false)
@@ -98,8 +102,11 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     if (sort.field) { params.set('sort', sort.field); params.set('dir', sort.dir) }
     if (koe && !isSales) params.set('koe', koe)
     captureKeywords.forEach(k => params.append('captureKeyword', k))
+    if (dateFrom) params.set('dateFrom', dateFrom)
+    if (dateTo) params.set('dateTo', dateTo)
+    if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords])
+  }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords, dateFrom, dateTo, dateBasis])
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -125,14 +132,14 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     finally { setExporting(false) }
   }
 
-  useEffect(() => { load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 点表头排序:点未激活列 → 降序;再点 → 升/降切换
   const toggleSort = (field: LeadSortField) =>
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
-  const hasActiveFilters = Boolean(platform || leadType.length || priority || keyword || (!isSales && koe) || captureKeywords.length || sort.field)
+  const hasActiveFilters = Boolean(platform || leadType.length || priority || keyword || (!isSales && koe) || captureKeywords.length || sort.field || dateFrom || dateTo)
   const clearFilters = () => {
-    setPlatform(''); setLeadType([]); setPriority(''); setKeyword(''); setKoe(''); setCaptureKeywords([]); setSort({ field: '', dir: 'desc' })
+    setPlatform(''); setLeadType([]); setPriority(''); setKeyword(''); setKoe(''); setCaptureKeywords([]); setSort({ field: '', dir: 'desc' }); setDateFrom(''); setDateTo('')
   }
 
   const reloadAfterMutation = useCallback(async () => {
@@ -213,6 +220,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           {PRIORITY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
         <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
+        <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
         {hasActiveFilters && (
           <button onClick={clearFilters} title="清空所有筛选"
             className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">

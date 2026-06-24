@@ -10,6 +10,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
+import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
 import { useNav } from '@/lib/navigation'
 
 type TableKey =
@@ -61,6 +62,9 @@ export function DataPage() {
   const [error, setError] = useState('')
   const [platform, setPlatform] = useState(params?.platform ?? '')
   const [keyword, setKeyword] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [expandedCells, setExpandedCells] = useState<Record<string, boolean>>({})
   const [expandResetVersion, setExpandResetVersion] = useState(0)
 
@@ -81,6 +85,9 @@ export function DataPage() {
       const params = new URLSearchParams({ page: String(page), pageSize: '50' })
       if (platform) params.set('platform', platform)
       if (keyword.trim()) params.set('keyword', keyword.trim())
+      if (dateFrom) params.set('dateFrom', dateFrom)
+      if (dateTo) params.set('dateTo', dateTo)
+      if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
       const data = await api.get<any>(`/records/tables/${activeTable}?${params.toString()}`)
       setRows(data.rows || [])
       setPagination(data.pagination || null)
@@ -93,7 +100,7 @@ export function DataPage() {
     }
   }
 
-  useEffect(() => { load(1) }, [activeTable, platform])
+  useEffect(() => { load(1) }, [activeTable, platform, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-3 duration-300">
@@ -107,6 +114,7 @@ export function DataPage() {
         <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
           {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
+        <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
         <div className="relative min-w-[260px] flex-1 sm:flex-none">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input

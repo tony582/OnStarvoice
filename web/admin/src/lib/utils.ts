@@ -107,10 +107,30 @@ export function platformName(key: string): string {
   return LABELS.platform[key] || key || '-'
 }
 
-// 账号名疑似品牌关联(经销商/员工/营销号):品牌/车型词 + 角色/营销词 → 非真实车主 UGC
-const KOE_BRAND_RE = /(安吉星|onstar|别克|凯迪拉克|雪佛兰|上汽通用|gl8|昂科威|君威|君越|英朗|威朗|科鲁兹|凯越|探界者|创酷|迈锐宝|cadillac|buick|chevrolet)/i
-const KOE_ROLE_RE = /(4s|店|销售|顾问|客服|服务|经销|官方|导购|试驾|售后|服务生|大话|说车|聊车|玩车|车评|讲车|谈车|解读|百科|严选|优选|学堂|课堂|研究所|资讯|那些事|车事)/i
-export function looksLikeKOEName(name?: string | null): boolean {
-  const n = String(name || '')
-  return KOE_BRAND_RE.test(n) && KOE_ROLE_RE.test(n)
+// 账号名带品牌/车型(全称·简称)= 品牌关联号(非真实车主)。客户口径:名字带品牌车型,不是 4S店 即 KOE。
+// ⚠ 与 server/routes/triage.js 的同名正则保持一致
+const BRAND_MODEL_RE = /(安吉星|onstar|别克|凯迪拉克|凯迪|雪佛兰|buick|cadillac|chevrolet|上汽通用|君越|君威|昂科威|昂科拉|昂科旗|gl8|gl6|英朗|威朗|凯越|微蓝|velite|阅朗|ct4|ct5|ct6|xt4|xt5|xt6|锐歌|lyriq|凯雷德|科鲁兹|科沃兹|迈锐宝|创酷|创界|探界者|开拓者|沃兰多|星迈罗|赛欧|畅巡|景程)/i
+const DEALER_NAME_RE = /(4s|旗舰店|体验中心|服务中心|销售服务|特约|经销|汽贸)/i
+
+// 疑似身份:① 账号名带品牌/车型 → 像门店/经销(或 LLM 判经销)=4S店,否则 =KOE;
+//          ② 名字不带品牌 → 按 LLM source_type:用户(ugc)·KOL 按粉丝分级(KOC<5万/初级<50万/中级<300万/头部≥300万)·4S店·KOE(员工)·其他
+export function identityLabel(sourceType?: string | null, fans?: number | null, name?: string | null): string {
+  const nm = String(name || '')
+  const st = String(sourceType || '')
+  if (BRAND_MODEL_RE.test(nm)) {
+    return (DEALER_NAME_RE.test(nm) || st === 'dealer') ? '4S店' : 'KOE'
+  }
+  if (st === 'dealer') return '4S店'
+  if (st === 'employee') return 'KOE'
+  if (st === 'ugc') return '用户'
+  if (st === 'other') return '其他'
+  if (st === 'pgc') {
+    const f = Number(fans)
+    if (!Number.isFinite(f) || f <= 0) return 'KOL'
+    if (f < 50000) return 'KOC'
+    if (f < 500000) return '初级KOL'
+    if (f < 3000000) return '中级KOL'
+    return '头部KOL'
+  }
+  return ''
 }

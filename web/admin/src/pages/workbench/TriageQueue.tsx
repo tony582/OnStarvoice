@@ -6,7 +6,7 @@ import {
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatDateCompact, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -14,6 +14,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
+import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
 import { MultiSelect } from '@/components/shared/MultiSelect'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
@@ -31,7 +32,8 @@ const STATUS_TABS = [
 
 interface Pagination { page: number; totalPages: number; total: number }
 type SortField = 'publish' | 'interactions' | 'first_seen' | 'last_seen'
-const RISK_OPTIONS = [{ value: 'alert', label: '有预警' }, { value: 'negative', label: '有负评' }, { value: 'koe', label: '疑似KOE' }]
+const RISK_OPTIONS = [{ value: 'alert', label: '有预警' }, { value: 'negative', label: '有负评' }]
+const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
 
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
@@ -44,7 +46,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [triageStatus, setTriageStatus] = useState('')
   const [risk, setRisk] = useState<string[]>([])
+  const [identity, setIdentity] = useState<string[]>([])
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [exporting, setExporting] = useState(false)
   // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量/首次发现/最近采集、升降序
   const [sort, setSort] = useState<{ field: SortField; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
@@ -57,7 +63,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${status}|${triageStatus}|${risk}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${status}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
@@ -65,11 +71,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     else params.set('queue', 'active')
     if (triageStatus) params.set('status', triageStatus)
     risk.forEach(rk => params.append('risk', rk))
+    identity.forEach(id => params.append('identity', id))
     params.set('sort', sort.field)
     params.set('dir', sort.dir)
     captureKeywords.forEach(k => params.append('captureKeyword', k))
+    if (dateFrom) params.set('dateFrom', dateFrom)
+    if (dateTo) params.set('dateTo', dateTo)
+    if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, triageStatus, risk, sentiment, platform, keyword, sort, captureKeywords])
+  }, [status, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, dateFrom, dateTo, dateBasis])
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -96,9 +106,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || captureKeywords.length)
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || dateFrom || dateTo)
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setCaptureKeywords([])
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setDateFrom(''); setDateTo('')
     setSort({ field: 'publish', dir: 'desc' })
   }
 
@@ -212,8 +222,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-1 gap-y-2">
-          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-2">
+          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}
+            className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
             <option value="">全部平台</option>
             <option value="xiaohongshu">小红书</option>
             <option value="douyin">抖音</option>
@@ -221,20 +232,24 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </WorkbenchSelect>
           {view === 'list' && (
             <>
-              <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}>
+              <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}
+                className={cn('bg-muted font-medium hover:bg-muted/70', triageStatus ? 'text-foreground' : 'text-muted-foreground')}>
                 {triageStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
               </WorkbenchSelect>
+              <span className="mx-0.5 h-4 w-px bg-border/60" />
               <MultiSelect label="风险" options={RISK_OPTIONS} value={risk} onChange={setRisk} />
+              <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
               <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
+              <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
             </>
           )}
-          <span className="mx-1 h-4 w-px bg-border/70" />
-          <div className="inline-flex items-center gap-0.5">
-            {['', 'negative', 'neutral', 'positive'].map(v => (
+          <span className="mx-0.5 h-4 w-px bg-border/60" />
+          <div className="inline-flex h-8 items-center rounded-lg bg-muted p-0.5">
+            {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([v, label]) => (
               <button key={v} onClick={() => setSentiment(v)}
-                className={cn('rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
-                  sentiment === v ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground')}>
-                {v === '' ? '全部情感' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
+                className={cn('inline-flex h-7 items-center rounded-md px-2.5 text-[12px] font-medium transition-colors',
+                  sentiment === v ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                {label}
               </button>
             ))}
           </div>
@@ -244,10 +259,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               <X className="h-3.5 w-3.5" />清空
             </button>
           )}
-          <div className="relative ml-auto min-w-[200px] flex-1 sm:max-w-xs">
+          <div className="relative ml-auto w-40 sm:w-52">
             <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
+              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
           </div>
           {view === 'list' && (
             <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
@@ -291,6 +306,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
+                {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
                 {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
                 {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
@@ -399,6 +415,7 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
+      {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>}
@@ -461,13 +478,27 @@ function SortableTh({ label, field, sort, onSort, align = 'left', className = ''
   )
 }
 
+/* 疑似身份:作者来源(ai-labeler LLM 多信号判定);4S店/员工=疑似软文(原 KOE),KOL=自媒体,其余淡化 */
+function IdentityBadge({ sourceType, fans, name }: { sourceType?: string; fans?: number; name?: string }) {
+  const label = identityLabel(sourceType, fans, name)
+  if (!label) return <span className="text-[11px] text-muted-foreground/40">—</span>
+  const strong = label === 'KOE' || label === '4S店'
+  const kol = label === 'KOC' || label.endsWith('KOL')
+  const cls = strong
+    ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
+    : kol
+      ? 'bg-sky-500/12 text-sky-700 dark:text-sky-300'
+      : 'bg-muted text-muted-foreground'
+  const badge = <span className={cn('inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold', strong && 'cursor-help', cls)}>{label}</span>
+  return strong ? <Tooltip text="账号名带品牌/车型,疑似经销商/品牌关联号(非真实车主),研判时建议剔除">{badge}</Tooltip> : badge
+}
+
 /* 风险信号:预警 / 负面评论数 / 官方回复状态,一眼可扫 */
 function RiskSignals({ record: r }: any) {
   const alerts = Number(r.alert_count || 0)
   const neg = Number(r.negative_comment_count || 0)
   const official = r.official_response_status
-  const koe = r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)
-  if (!(alerts > 0 || neg > 0 || (official && official !== 'none') || koe)) {
+  if (!(alerts > 0 || neg > 0 || (official && official !== 'none'))) {
     return <span className="text-[11px] text-muted-foreground/40">—</span>
   }
   return (
@@ -475,11 +506,6 @@ function RiskSignals({ record: r }: any) {
       {alerts > 0 && (
         <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}>
           <span className="inline-flex cursor-help items-center gap-0.5 rounded bg-status-red/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-2.5 w-2.5" />预警{alerts}</span>
-        </Tooltip>
-      )}
-      {koe && (
-        <Tooltip text="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除">
-          <span className="cursor-help rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
         </Tooltip>
       )}
       {neg > 0 && (

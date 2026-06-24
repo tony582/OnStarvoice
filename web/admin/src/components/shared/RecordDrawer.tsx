@@ -7,7 +7,7 @@ import {
 // 详情面板可拖宽,停靠右侧(Asana 式)
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -144,11 +144,11 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
-                  {(r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)) && (
-                    <Tooltip text="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除"><span className="cursor-help rounded-md bg-violet-500/15 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span></Tooltip>
+                  {identityLabel(r.source_type, r.author_fans, r.author_name) && (
+                    <Tooltip text="疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除"><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(identityLabel(r.source_type, r.author_fans, r.author_name)) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{identityLabel(r.source_type, r.author_fans, r.author_name)}</span></Tooltip>
                   )}
                 </div>
-                <h3 className="text-[15px] font-bold leading-snug">{r.title || '(无标题)'}</h3>
+                <h3 className="text-[15px] font-bold leading-snug">{r.title || String(r.content || '').replace(/\s+/g, ' ').trim().slice(0, 40) || '(无标题)'}</h3>
 
                 {/* Author + links */}
                 <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5">
