@@ -2649,7 +2649,7 @@ function setupUIEventListeners() {
       if (!c) return;
       const minimized = c.classList.toggle("is-minimized");
       const btn = document.getElementById("btnMinBatchProgress");
-      if (btn) btn.textContent = minimized ? "▢" : "—";
+      if (btn) btn.textContent = minimized ? "展开 ⊡" : "最小化 ⊟";
     });
   document
     .getElementById("keywordInsightError")
@@ -15794,7 +15794,7 @@ function setBatchProgressVisible(scope = "modal", visible = true) {
       // 每次新批量都从展开态开始
       container.classList.remove("is-minimized");
       const minBtn = document.getElementById("btnMinBatchProgress");
-      if (minBtn) minBtn.textContent = "—";
+      if (minBtn) minBtn.textContent = "最小化 ⊟";
     }
   }
   if (visible && fillEl) {
