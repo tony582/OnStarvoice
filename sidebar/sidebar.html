@@ -2294,18 +2294,31 @@
                 <label class="form-label"
                   >手动关键词列表
                   <span class="form-label-hint"
-                    >每行一个，最多 10 个</span
+                    >每行一个，最多 30 个</span
                   ></label
                 >
                 <textarea
                   class="form-input batch-textarea"
                   id="textareaBatchKeywords"
-                  placeholder="输入要采集的关键词，每行一个，最多 10 个"></textarea>
+                  placeholder="输入要采集的关键词，每行一个，最多 30 个"></textarea>
                 <div
                   class="batch-keyword-limit"
                   id="batchKeywordLimitHint">
-                  0 / 10
+                  0 / 30
                 </div>
+              </div>
+            </div>
+            <div class="form-group batch-auto-loop">
+              <label class="form-label" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600;">
+                <input type="checkbox" id="chkAutoLoop" />
+                🌙 无人值守循环
+                <span class="form-label-hint">跑完一轮自动再跑 · 供专机夜间采集</span>
+              </label>
+              <div style="display:flex;gap:14px;margin-top:6px;align-items:center;font-size:12px;color:#666;">
+                <span>每轮间隔
+                  <input type="number" class="form-input" id="inputLoopGapMin" value="10" min="0" style="width:56px;display:inline-block;padding:2px 6px;" /> 分钟</span>
+                <span>循环轮数
+                  <input type="number" class="form-input" id="inputLoopRounds" placeholder="留空=一直跑" min="0" style="width:96px;display:inline-block;padding:2px 6px;" /></span>
               </div>
             </div>
             <button

@@ -318,7 +318,7 @@ let lastKnownPagePlatform = "unknown";
 let currentUpdateNoticeState = null;
 const KEYWORD_ANALYSIS_STALE_LOCK_MS =
   DEFAULT_CONFIG.KEYWORD_ANALYSIS_TIMEOUT + 5000;
-const MAX_BATCH_KEYWORDS = 10;
+const MAX_BATCH_KEYWORDS = 30;
 const EYE_ICON = `
 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
   <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path>
@@ -7972,6 +7972,19 @@ function getExpandedKeywordsFromTextarea({dedupe = false} = {}) {
   return dedupe ? dedupeKeywords(keywords) : keywords;
 }
 
+// 可中断睡眠:每秒检查 shouldStop,用于无人值守循环的轮次间隔
+function sleepWithStop(ms, shouldStop) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const id = setInterval(() => {
+      if ((shouldStop && shouldStop()) || Date.now() - start >= ms) {
+        clearInterval(id);
+        resolve();
+      }
+    }, 1000);
+  });
+}
+
 async function handleBatchKeywordCapture() {
   if (batchKeywordCaptureInFlight) {
     if (batchKeywordCancelRequested) {
@@ -8084,29 +8097,83 @@ async function handleBatchKeywordCapture() {
 
     setBatchProgressVisible("modal", true);
 
-    const result = await batchCaptureByKeywords({
-      keywords: [...keywords],
-      platform: pagePlatform,
-      baseSearchUrl,
-      captureParams: {
-        minLikes: keywordMinLikes,
-        sortDimension: sortContext.dimension,
-        maxDetectedItems: keywordMaxDetectedItems,
-        waitMinMs: settings.sharedWaitMinMs,
-        waitMaxMs: settings.sharedWaitMaxMs,
-        stallTimeoutMs: settings.sharedStallTimeoutMs,
-        maxDurationMs: settings.sharedMaxDurationMs,
-      },
-      onProgress: (progress) => {
-        updateBatchProgress(progress, "modal");
-      },
-      shouldStop: () => batchKeywordCancelRequested,
-    });
+    // 无人值守循环:跑完一轮(所有关键词)→自动再跑下一轮,轮次间隔可设;
+    // 留空轮数 = 一直跑(夜间专机用)。全程可中断(再点按钮即停)。
+    const autoLoop = !!document.getElementById("chkAutoLoop")?.checked;
+    const roundGapMin = Math.max(0, Number(document.getElementById("inputLoopGapMin")?.value) || 0);
+    const maxRounds = Math.max(0, Number(document.getElementById("inputLoopRounds")?.value) || 0); // 0 = 不限
+    const roundGapMs = roundGapMin * 60 * 1000;
 
-    await refreshDataPool();
+    let result;
+    let round = 0;
+    let totalSuccess = 0;
+    let totalFailed = 0;
+    do {
+      round += 1;
+      result = await batchCaptureByKeywords({
+        keywords: [...keywords],
+        platform: pagePlatform,
+        baseSearchUrl,
+        captureParams: {
+          minLikes: keywordMinLikes,
+          sortDimension: sortContext.dimension,
+          maxDetectedItems: keywordMaxDetectedItems,
+          waitMinMs: settings.sharedWaitMinMs,
+          waitMaxMs: settings.sharedWaitMaxMs,
+          stallTimeoutMs: settings.sharedStallTimeoutMs,
+          maxDurationMs: settings.sharedMaxDurationMs,
+        },
+        onProgress: (progress) => {
+          updateBatchProgress(
+            autoLoop
+              ? { ...progress, message: `第 ${round} 轮 · ${progress.message || ""}` }
+              : progress,
+            "modal",
+          );
+        },
+        shouldStop: () => batchKeywordCancelRequested,
+      });
+
+      await refreshDataPool();
+      totalSuccess += result.stats.success;
+      totalFailed += result.stats.failed;
+
+      if (!result.canceled) {
+        await maybeRunAutoDetailCaptureAfterListCapture(settings, {
+          sourceLabel: "批量关键词搜索结果",
+          recordIds: collectBatchRecordIds(result),
+        });
+      }
+
+      // 终止:被取消 / 没开循环 / 已到指定轮数
+      if (result.canceled || !autoLoop || (maxRounds > 0 && round >= maxRounds)) {
+        break;
+      }
+
+      // 轮次间隔:歇 roundGapMin 分钟再跑下一轮(睡眠中可中断)
+      if (roundGapMs > 0) {
+        updateBatchProgress(
+          {
+            current: 0,
+            total: keywords.length,
+            phase: "waiting",
+            message: `第 ${round} 轮完成（累计成功 ${totalSuccess}），${roundGapMin} 分钟后开始第 ${round + 1} 轮…`,
+            round,
+          },
+          "modal",
+        );
+        await sleepWithStop(roundGapMs, () => batchKeywordCancelRequested);
+      }
+    } while (!batchKeywordCancelRequested);
 
     const stats = result.stats;
-    if (result.canceled) {
+    if (autoLoop) {
+      const stopped = result.canceled || batchKeywordCancelRequested;
+      showMessage(
+        `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}`,
+        stopped ? "warning" : "success",
+      );
+    } else if (result.canceled) {
       showMessage(
         `批量采集已停止：已处理 ${stats.processed}/${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}`,
         "warning",
@@ -8116,10 +8183,6 @@ async function handleBatchKeywordCapture() {
         `批量采集完成：共 ${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}`,
         stats.failed > 0 ? "warning" : "success",
       );
-      await maybeRunAutoDetailCaptureAfterListCapture(settings, {
-        sourceLabel: "批量关键词搜索结果",
-        recordIds: collectBatchRecordIds(result),
-      });
     }
   } catch (error) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
