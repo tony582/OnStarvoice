@@ -62,6 +62,16 @@ const LEAD_TYPES = new Set([
   'safety_privacy', 'brand_risk', 'other',
 ]);
 
+// 评论分诊列表排序:发布时间 / 首次发现 / 最近采集 可点表头升降序;默认走优先级+时间。
+function leadsOrderSql(sort, dir) {
+  const d = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const tail = `CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, captured_at DESC, updated_at DESC`;
+  if (sort === 'publish') return `comment_published_ts ${d} NULLS LAST, ${tail}`;
+  if (sort === 'first_seen') return `comment_first_seen_at ${d} NULLS LAST, ${tail}`;
+  if (sort === 'last_seen') return `comment_last_seen_at ${d} NULLS LAST, ${tail}`;
+  return tail;
+}
+
 router.get('/comments', requireTenantAccess, async (req, res, next) => {
   try {
     const {
@@ -91,9 +101,11 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
       params.push(platform);
       where += ` AND platform = $${params.length}`;
     }
-    if (leadType && LEAD_TYPES.has(String(leadType))) {
-      params.push(leadType);
-      where += ` AND lead_type = $${params.length}`;
+    const leadTypes = (Array.isArray(req.query.leadType) ? req.query.leadType : String(req.query.leadType || '').split(','))
+      .map((s) => String(s).trim()).filter((s) => LEAD_TYPES.has(s));
+    if (leadTypes.length) {
+      params.push(leadTypes);
+      where += ` AND lead_type = ANY($${params.length}::text[])`;
     }
     // 大类:sales=销售客资(购买意向),opinion=舆情评论(其余风险类)
     const category = String(req.query.category || '');
@@ -152,11 +164,7 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
         (SELECT seen_count FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_seen_count
       FROM comment_leads
       ${where}
-      ORDER BY
-        ${String(req.query.sort || '') === 'publish' ? 'comment_published_ts DESC NULLS LAST,' : ''}
-        CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
-        captured_at DESC,
-        updated_at DESC
+      ORDER BY ${leadsOrderSql(req.query.sort, req.query.dir)}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
 
@@ -306,9 +314,11 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
       params.push(platform);
       where += ` AND platform = $${params.length}`;
     }
-    if (leadType && LEAD_TYPES.has(String(leadType))) {
-      params.push(leadType);
-      where += ` AND lead_type = $${params.length}`;
+    const leadTypes = (Array.isArray(req.query.leadType) ? req.query.leadType : String(req.query.leadType || '').split(','))
+      .map((s) => String(s).trim()).filter((s) => LEAD_TYPES.has(s));
+    if (leadTypes.length) {
+      params.push(leadTypes);
+      where += ` AND lead_type = ANY($${params.length}::text[])`;
     }
     const category = String(req.query.category || '');
     if (category === 'sales') {

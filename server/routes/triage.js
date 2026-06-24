@@ -55,7 +55,20 @@ function orderBySql(sort, dir) {
   const d = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   if (sort === 'publish') return `r.published_ts ${d} NULLS LAST, r.last_seen_at DESC`;
   if (sort === 'interactions') return `(r.likes + r.comments_count + r.collects + r.shares) ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
+  if (sort === 'first_seen') return `r.first_seen_at ${d} NULLS LAST, r.last_seen_at DESC`;
+  if (sort === 'last_seen') return `r.last_seen_at ${d} NULLS LAST, r.first_seen_at DESC`;
   return riskOrderSql();
+}
+
+// 风险信号多选筛选(有预警 / 有负评 / 疑似KOE),命中任一即入选(OR)。条件为字面 SQL,不绑定参数。
+function riskWhereClause(reqRisk) {
+  const risks = (Array.isArray(reqRisk) ? reqRisk : String(reqRisk || '').split(','))
+    .map((s) => String(s).trim()).filter(Boolean);
+  const clauses = [];
+  if (risks.includes('alert')) clauses.push(`EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`);
+  if (risks.includes('negative')) clauses.push(`r.negative_comment_count > 0`);
+  if (risks.includes('koe')) clauses.push(`r.source_type IN ('employee', 'dealer')`);
+  return clauses.length ? ` AND (${clauses.join(' OR ')})` : '';
 }
 
 router.get('/records', requireTenantAccess, async (req, res, next) => {
@@ -90,15 +103,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     }
-    // 风险信号筛选(B 端:一键圈出有预警 / 有负评 / 疑似 KOE 的内容)
-    const risk = String(req.query.risk || '');
-    if (risk === 'alert') {
-      where += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`;
-    } else if (risk === 'negative') {
-      where += ` AND r.negative_comment_count > 0`;
-    } else if (risk === 'koe') {
-      where += ` AND r.source_type IN ('employee', 'dealer')`;
-    }
+    // 风险信号多选筛选(B 端:圈出有预警 / 有负评 / 疑似 KOE 的内容,命中任一即入选)
+    where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
       const kw = `%${keyword}%`;
@@ -126,7 +132,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     const records = await queryAll(`
       SELECT
         r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
-        r.author_fans, r.url, r.cover_url, r.image_urls, r.note_type,
+        r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.note_type,
         r.publish_time, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,
@@ -363,14 +369,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     }
-    const risk = String(req.query.risk || '');
-    if (risk === 'alert') {
-      where += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`;
-    } else if (risk === 'negative') {
-      where += ` AND r.negative_comment_count > 0`;
-    } else if (risk === 'koe') {
-      where += ` AND r.source_type IN ('employee', 'dealer')`;
-    }
+    where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
       const kw = `%${keyword}%`;
@@ -394,7 +393,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       ${where}
-      ORDER BY r.first_seen_at DESC NULLS LAST
+      ORDER BY ${orderBySql(req.query.sort, req.query.dir)}
       LIMIT 5000
     `, params);
 

@@ -11,6 +11,7 @@ import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, 
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { Tooltip } from '@/components/shared/Tooltip'
 
 /**
  * 舆情内容详情抽屉(帖子/评论/官方响应/采集快照 四 tab)。
@@ -144,7 +145,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
                   {(r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)) && (
-                    <span title="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除" className="cursor-help rounded-md bg-violet-500/15 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+                    <Tooltip text="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除"><span className="cursor-help rounded-md bg-violet-500/15 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span></Tooltip>
                   )}
                 </div>
                 <h3 className="text-[15px] font-bold leading-snug">{r.title || '(无标题)'}</h3>
@@ -170,10 +171,10 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
               <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg bg-status-red/[0.05] px-3 py-2.5 dark:bg-status-red/[0.08]">
                 <span className="text-[11px] font-semibold text-muted-foreground">风险信号</span>
                 {alerts > 0 && (
-                  <span title={r.alert_reasons || '触发预警'} className="inline-flex cursor-help items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span>
+                  <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}><span className="inline-flex cursor-help items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span></Tooltip>
                 )}
                 {negComments > 0 && (
-                  <span className="rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span>
+                  <Tooltip text="该内容下被判为负面/风险的评论条数;下方可查看具体评论"><span className="cursor-help rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span></Tooltip>
                 )}
                 {official === 'responded' && (
                   <span className="inline-flex items-center gap-1 rounded bg-status-green/15 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300"><CheckCircle className="h-3 w-3" />已官方回复</span>
@@ -384,6 +385,7 @@ function InfoTile({ label, value }: { label: string; value: string }) {
 }
 
 export function getCover(r: any): string {
+  if (r.cover_local) return r.cover_local
   if (r.cover_url) return r.cover_url
   try {
     const imgs = JSON.parse(r.image_urls || '[]')

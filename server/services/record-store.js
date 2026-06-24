@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { withTransaction } from '../db/init.js';
+import { queueCoverLocalization } from './media-store.js';
 import { parseMetricNumber } from '../utils/metrics.js';
 
 const VERSION_FIELDS = [
@@ -120,7 +121,7 @@ export async function upsertCapturedRecord(record, context) {
   const imageUrls = jsonText(record.image_urls, '[]');
   const payload = jsonText(record.payload, '{}');
 
-  return await withTransaction(async tx => {
+  const __result = await withTransaction(async tx => {
     let existing = null;
     if (record.external_id) {
       existing = await tx.queryOne(
@@ -259,6 +260,9 @@ export async function upsertCapturedRecord(record, context) {
     const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });
     return { id: inserted.id, action: 'inserted', observationId };
   });
+  // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
+  if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
+  return __result;
 }
 
 export function serializeRecord(row) {

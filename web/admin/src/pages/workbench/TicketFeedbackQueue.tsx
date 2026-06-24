@@ -54,7 +54,7 @@ export function TicketFeedbackQueue() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       <p className="text-[13px] text-muted-foreground">转出的工单在这里处理:打开工单填写「过程备注」记录处理进展,处理完点【结案】闭环。</p>
 
       <WorkbenchTabs
@@ -80,7 +80,7 @@ export function TicketFeedbackQueue() {
       ) : (
         <WorkbenchTableShell>
           <table className="w-full min-w-[1040px] text-sm">
-            <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
+            <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-3 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">工单内容</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">处理人 / 转单</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
