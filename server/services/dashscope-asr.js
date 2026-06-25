@@ -70,9 +70,20 @@ export async function waitForTranscription({ apiKey, taskId, timeoutMs = 180000,
     const status = String(data?.output?.task_status || '').toUpperCase();
     if (status === 'SUCCEEDED') return data?.output?.results || [];
     if (status === 'FAILED') {
-      throw new Error(
-        `转写任务失败: ${data?.output?.message || data?.message || JSON.stringify(data?.output || data).slice(0, 300)}`,
+      const failMsg = String(
+        data?.output?.message ||
+          data?.output?.code ||
+          data?.message ||
+          JSON.stringify(data?.output || data).slice(0, 300),
       );
+      // 「无有效语音片段」是百炼对"视频无人声/纯BGM卡点"的正常返回(SUCCESS_WITH_NO_VALID_FRAGMENT),
+      // 本质是"成功但无语音",不是真失败 → 用 NO_SPEECH 码,让上层标成中性"无口播"而非红色"转写失败"。
+      if (/NO_VALID_FRAGMENT|NO_SPEECH/i.test(failMsg)) {
+        const e = new Error('该视频无人声/口播,无可转写内容');
+        e.code = 'NO_SPEECH';
+        throw e;
+      }
+      throw new Error(`转写任务失败: ${failMsg}`);
     }
     await sleep(intervalMs);
   }

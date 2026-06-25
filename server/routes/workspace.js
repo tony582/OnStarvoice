@@ -15,7 +15,8 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
          FROM records r
          LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
          WHERE r.tenant_id = $1 AND (${ACTIVE_QUEUE_CONDITION})) AS triage_pending,
-        (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new' AND lead_type <> 'sales_intent') AS leads_new,
+        (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new' AND lead_type <> 'sales_intent'
+          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND r.ai_result->>'relevance' = 'irrelevant')) AS leads_new,
         (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
         (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention,
         (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')) AS tickets_pending,

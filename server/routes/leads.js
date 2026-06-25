@@ -164,6 +164,9 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     } else if (koe === 'hide') {
       where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
     }
+    // 评论分诊只看「相关帖」的评论:父帖被判 irrelevant 的评论不算 lead
+    // (否则竞品/跑题帖——如安吉星里命中关键词实为零跑、吉事桔香茶里误采的凯迪拉克——其评论会冒进客资)
+    where += ` AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND r.ai_result->>'relevance' = 'irrelevant')`;
     where = appendCommentDateRangeFilter(where, params, req.query);
 
     const total = (await queryOne(
@@ -375,6 +378,8 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
     } else if (koe === 'hide') {
       where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
     }
+    // 与列表一致:父帖被判 irrelevant 的评论不导出
+    where += ` AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND r.ai_result->>'relevance' = 'irrelevant')`;
     where = appendCommentDateRangeFilter(where, params, req.query);
 
     const leads = await queryAll(`

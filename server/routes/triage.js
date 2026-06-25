@@ -68,8 +68,21 @@ function isNoteUrl(u) {
   if (/\/user\/profile\/|\/user\//.test(s)) return false; // 主页不是帖子
   return /\/explore\/|\/discovery\/item\/|\/note\/|\/video\/|weibo\.com\/detail\/|m\.weibo\.cn\/|\/search_result\//.test(s);
 }
+// 小红书笔记链接缺非空 xsec_source 会被判 300013(访问频繁)。导出/原文链接补上 pc_search,
+// token 不动即可正常打开(与采集端 ensureXhsNoteUrlSource 同理)。
+function fixXhsNoteSource(u) {
+  const raw = String(u || '');
+  if (!/xiaohongshu\.com/.test(raw)) return raw;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.searchParams.get('xsec_token') && !parsed.searchParams.get('xsec_source')) {
+      parsed.searchParams.set('xsec_source', 'pc_search');
+    }
+    return parsed.toString();
+  } catch { return raw; }
+}
 function postUrl(r) {
-  if (isNoteUrl(r.url)) return r.url;
+  if (isNoteUrl(r.url)) return fixXhsNoteSource(r.url);
   const id = String(r.external_id || '').trim();
   if (!id) return r.url || '';
   if (r.platform === 'xiaohongshu') return `https://www.xiaohongshu.com/explore/${id}`;
@@ -191,8 +204,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
       const kw = `%${keyword}%`;
-      params.push(kw, kw, kw);
-      where += ` AND (r.title ILIKE $${params.length - 2} OR r.content ILIKE $${params.length - 1} OR r.keyword ILIKE $${params.length})`;
+      params.push(kw, kw, kw, kw, kw, kw);
+      where += ` AND (r.title ILIKE $${params.length - 5} OR r.content ILIKE $${params.length - 4} OR r.keyword ILIKE $${params.length - 3} OR r.author_name ILIKE $${params.length - 2} OR r.author_account_no ILIKE $${params.length - 1} OR r.author_id ILIKE $${params.length})`;
     }
     // 采集关键词多选(每个关键词=一次采集 session)
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
@@ -465,8 +478,8 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
       const kw = `%${keyword}%`;
-      params.push(kw, kw, kw);
-      where += ` AND (r.title ILIKE $${params.length - 2} OR r.content ILIKE $${params.length - 1} OR r.keyword ILIKE $${params.length})`;
+      params.push(kw, kw, kw, kw, kw, kw);
+      where += ` AND (r.title ILIKE $${params.length - 5} OR r.content ILIKE $${params.length - 4} OR r.keyword ILIKE $${params.length - 3} OR r.author_name ILIKE $${params.length - 2} OR r.author_account_no ILIKE $${params.length - 1} OR r.author_id ILIKE $${params.length})`;
     }
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
       .map(s => String(s).trim()).filter(Boolean);
@@ -488,7 +501,12 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       SELECT
         r.keyword, r.platform, r.title, r.content, r.author_name, r.author_fans,
         r.author_id, r.author_account_no, r.blogger_profile_url, r.note_type, r.source_type, r.url, r.external_id,
-        COALESCE(NULLIF(r.payload->>'bloggerUserId',''), NULLIF(r.payload->>'redId',''), NULLIF(r.payload->>'douyinId',''), NULLIF(r.payload->>'bloggerId','')) AS payload_account_no,
+        COALESCE(
+          NULLIF(r.payload->>'bloggerUserId',''), NULLIF(r.payload->>'redId',''),
+          NULLIF(r.payload->>'douyinId',''), NULLIF(r.payload->>'bloggerId',''),
+          NULLIF(r.payload->'detailPayload'->>'bloggerUserId',''), NULLIF(r.payload->'detailPayload'->>'redId',''),
+          NULLIF(r.payload->'detailPayload'->>'douyinId',''), NULLIF(r.payload->'detailPayload'->>'bloggerId','')
+        ) AS payload_account_no,
         r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
         r.negative_comment_count, r.publish_time, r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,

@@ -163,18 +163,29 @@ function normalizeRows(rows = [], numberKeys = []) {
   });
 }
 
-async function getReportStats(tenantId, periodStart, periodEnd) {
-  const params = [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
+async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
+  const baseParams = [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
+  // 可选「采集关键词」过滤:仅数据看板按主题/关键词收敛时传入;报告路径不传 → kw 空 → recordFilter 退化、零影响。
+  // 口径与内容分诊一致(精确 r.keyword)。⚠ PG 不允许"绑了却没引用"的参数(会报 could not determine type):
+  //   · 带 recordFilter 的查询用 params(kw 在 $4);
+  //   · 不带 recordFilter 的(issueStats/topIssues)只能用 baseParams($1-$3),绝不能带 kw;
+  //   · workflowStats 的数组是 [tenantId(,kw)] → kw 在 $2,单独用 recordFilterWf。
+  const kw = (Array.isArray(keywords) ? keywords : [])
+    .map((k) => String(k || '').trim())
+    .filter(Boolean);
+  const recordFilter = RELEVANT_RECORD_SQL + (kw.length ? ' AND r.keyword = ANY($4::text[])' : '');
+  const recordFilterWf = RELEVANT_RECORD_SQL + (kw.length ? ' AND r.keyword = ANY($2::text[])' : '');
+  const params = kw.length ? [...baseParams, kw] : baseParams;
   const observedWhere = `
     FROM record_observations ro
     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
-      AND ${RELEVANT_RECORD_SQL}
+      AND ${recordFilter}
   `;
   const periodWhere = `
     FROM records r
     WHERE r.tenant_id = $1
-      AND ${RELEVANT_RECORD_SQL}
+      AND ${recordFilter}
       AND (
         (r.created_at >= $2 AND r.created_at < $3)
         OR EXISTS (
@@ -204,7 +215,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
   const newRecords = await scalar(
     `SELECT COUNT(*) as n FROM records r
      WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
-       AND ${RELEVANT_RECORD_SQL}`,
+       AND ${recordFilter}`,
     params
   );
   const updatedRecords = await scalar(
@@ -216,7 +227,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM record_observations ro
      JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
      WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
-       AND ${RELEVANT_RECORD_SQL}`,
+       AND ${recordFilter}`,
     params
   );
   const pendingLabel = await scalar(
@@ -296,7 +307,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM record_observations ro
      JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
      WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
-       AND ${RELEVANT_RECORD_SQL}
+       AND ${recordFilter}
      GROUP BY day_bucket, label
      ORDER BY day_bucket ASC`,
     params
@@ -319,7 +330,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        FROM record_observations ro
        JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
        WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
-         AND ${RELEVANT_RECORD_SQL}
+         AND ${recordFilter}
      )
      SELECT
        to_char(d.day_bucket, 'MM-DD') AS label,
@@ -330,7 +341,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      LEFT JOIN obs o ON o.day_bucket = d.day_bucket
      GROUP BY d.day_bucket
      ORDER BY d.day_bucket ASC`,
-    [tenantId, trailingStart.toISOString(), periodEnd.toISOString()]
+    [tenantId, trailingStart.toISOString(), periodEnd.toISOString(), ...(kw.length ? [kw] : [])]
   ), ['total', 'negative']);
 
   const mediaDistribution = normalizeRows(await queryAll(
@@ -454,7 +465,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM obs
      JOIN records r ON r.id = obs.record_id AND r.tenant_id = $1
      WHERE obs.snapshots > 1
-       AND ${RELEVANT_RECORD_SQL}
+       AND ${recordFilter}
      ORDER BY interaction_growth DESC, obs.last_captured_at DESC
      LIMIT 8`,
     params
@@ -483,7 +494,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        COUNT(*) FILTER (WHERE status IN ('resolved', 'closed') AND updated_at >= $2 AND updated_at < $3) as resolved_issues
      FROM issues
      WHERE tenant_id = $1`,
-    params
+    baseParams
   );
 
   const topIssues = normalizeRows(await queryAll(
@@ -500,7 +511,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
        CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC,
        updated_at DESC
      LIMIT 8`,
-    params
+    baseParams
   ), ['record_count']);
 
   const alerts = normalizeRows(await queryAll(
@@ -508,7 +519,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM alerts a
      LEFT JOIN records r ON r.id = a.record_id AND r.tenant_id = a.tenant_id
      WHERE a.tenant_id = $1 AND a.created_at >= $2 AND a.created_at < $3
-       AND (a.record_id IS NULL OR ${RELEVANT_RECORD_SQL})
+       AND (a.record_id IS NULL OR ${recordFilter})
      GROUP BY a.level`,
     params
   ), ['count']);
@@ -518,7 +529,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM alerts a
      LEFT JOIN records r ON r.id = a.record_id AND r.tenant_id = a.tenant_id
      WHERE a.tenant_id = $1 AND a.created_at >= $2 AND a.created_at < $3
-       AND (a.record_id IS NULL OR ${RELEVANT_RECORD_SQL})
+       AND (a.record_id IS NULL OR ${recordFilter})
      ORDER BY CASE a.level WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END DESC,
        a.interaction_total DESC, a.created_at DESC
      LIMIT 6`,
@@ -533,7 +544,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM record_comments rc
      JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
      WHERE rc.tenant_id = $1
-       AND ${RELEVANT_RECORD_SQL}`,
+       AND ${recordFilter}`,
     params
   );
 
@@ -544,7 +555,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM record_comments rc
      JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
      WHERE rc.tenant_id = $1
-       AND ${RELEVANT_RECORD_SQL}
+       AND ${recordFilter}
        AND rc.is_negative = true
        AND rc.last_seen_at >= $2
        AND rc.last_seen_at < $3
@@ -562,7 +573,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM official_responses o
      JOIN records r ON r.id = o.record_id AND r.tenant_id = o.tenant_id
      WHERE o.tenant_id = $1 AND o.created_at >= $2 AND o.created_at < $3
-       AND ${RELEVANT_RECORD_SQL}
+       AND ${recordFilter}
      ORDER BY o.created_at DESC
      LIMIT 8`,
     params
@@ -573,7 +584,7 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM official_responses o
      JOIN records r ON r.id = o.record_id AND r.tenant_id = o.tenant_id
      WHERE o.tenant_id = $1 AND o.created_at >= $2 AND o.created_at < $3
-       AND ${RELEVANT_RECORD_SQL}`,
+       AND ${recordFilter}`,
     params
   );
 
@@ -593,8 +604,8 @@ async function getReportStats(tenantId, periodStart, periodEnd) {
      FROM records r
      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
      WHERE r.tenant_id = $1
-       AND ${RELEVANT_RECORD_SQL}`,
-    [tenantId]
+       AND ${recordFilterWf}`,
+    [tenantId, ...(kw.length ? [kw] : [])]
   );
 
   const triagePeriod = normalizeRows(await queryAll(
@@ -1155,10 +1166,10 @@ export async function generateOpinionInsight({ tenantId, periodStart, periodEnd 
   return await buildAiOpinionInsight(tenantId, stats);
 }
 
-export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd }) {
+export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd, keywords = [] }) {
   const previous = previousPeriod(periodStart, periodEnd);
-  const currentStats = await getReportStats(tenantId, periodStart, periodEnd);
-  const previousStats = await getReportStats(tenantId, previous.start, previous.end);
+  const currentStats = await getReportStats(tenantId, periodStart, periodEnd, keywords);
+  const previousStats = await getReportStats(tenantId, previous.start, previous.end, keywords);
   return await enrichReportData('dashboard', currentStats, previousStats, tenantId);
 }
 

@@ -113,7 +113,8 @@ export async function transcribeRecord({ tenantId, recordId }) {
     const { text, lang } = await transcribeFileUrl({ apiKey, fileUrl: staged.publicUrl });
 
     if (!text) {
-      await setStatus(recordId, tenantId, { transcript_status: 'failed', transcript_error: '转写结果为空(可能无人声/纯音乐)' });
+      // 转写成功但无文本 = 视频无人声/纯音乐,不是失败 → 中性 no_speech 态(前端灰字提示,不红)
+      await setStatus(recordId, tenantId, { transcript_status: 'no_speech', transcript_error: '' });
       return;
     }
     await setStatus(recordId, tenantId, {
@@ -124,9 +125,11 @@ export async function transcribeRecord({ tenantId, recordId }) {
     });
   } catch (err) {
     const expired = err?.code === 'EXPIRED';
+    const noSpeech = err?.code === 'NO_SPEECH';
     await setStatus(recordId, tenantId, {
-      transcript_status: expired ? 'expired' : 'failed',
-      transcript_error: String(err?.message || err || '转写失败').slice(0, 500),
+      transcript_status: noSpeech ? 'no_speech' : expired ? 'expired' : 'failed',
+      // 无人声不是错误,清空 error 文案,靠 no_speech 状态在前端显示中性提示
+      transcript_error: noSpeech ? '' : String(err?.message || err || '转写失败').slice(0, 500),
     }).catch(() => {});
   } finally {
     if (staged) await staged.cleanup().catch(() => {});

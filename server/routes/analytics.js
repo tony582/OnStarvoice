@@ -1,6 +1,6 @@
 import { Router } from 'express';
-import { queryOne } from '../db/init.js';
-import { requireTenantAccess } from '../middleware/auth.js';
+import { queryOne, queryAll, execute } from '../db/init.js';
+import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { buildAnalyticsDashboard, generateOpinionInsight } from '../services/report-generator.js';
 
 const router = Router();
@@ -105,10 +105,17 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
       return res.status(400).json({ ok: false, error: 'invalid_range', message: period.error });
     }
 
+    // 数据看板按「采集关键词」收敛(关注主题/临时筛选);多个用逗号分隔。空=全量。
+    const keywords = String(req.query.keywords || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     const snapshot = await buildAnalyticsDashboard({
       tenantId: req.tenantId,
       periodStart: period.start,
       periodEnd: period.end,
+      keywords,
     });
 
     return res.json({
@@ -140,6 +147,96 @@ router.get('/ai-insight', requireTenantAccess, async (req, res, next) => {
       periodEnd: period.end,
     });
     return res.json({ ok: true, insight: insight || null });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// ── 关注主题:数据看板按阶段/主题收敛的「采集关键词」预设 ──────────────
+function cleanKeywords(value) {
+  const arr = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const out = [];
+  for (const k of arr) {
+    const s = String(k || '').trim();
+    if (s && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+router.get('/focus-topics', requireTenantAccess, async (req, res, next) => {
+  try {
+    const topics = await queryAll(
+      `SELECT id, name, keywords, sort_order, created_at, updated_at
+       FROM focus_topics WHERE tenant_id = $1
+       ORDER BY sort_order ASC, created_at ASC`,
+      [req.tenantId],
+    );
+    return res.json({ ok: true, topics });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/focus-topics', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'name_required', message: '主题名不能为空' });
+    const keywords = cleanKeywords(req.body?.keywords);
+    const sortOrder = Number(req.body?.sortOrder) || 0;
+    const topic = await queryOne(
+      `INSERT INTO focus_topics (tenant_id, name, keywords, sort_order)
+       VALUES ($1, $2, $3::jsonb, $4)
+       RETURNING id, name, keywords, sort_order, created_at, updated_at`,
+      [req.tenantId, name, JSON.stringify(keywords), sortOrder],
+    );
+    return res.json({ ok: true, topic });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.patch('/focus-topics/:id', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    const sets = [];
+    const params = [];
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name || '').trim();
+      if (!name) return res.status(400).json({ ok: false, error: 'name_required', message: '主题名不能为空' });
+      params.push(name);
+      sets.push(`name = $${params.length}`);
+    }
+    if (req.body?.keywords !== undefined) {
+      params.push(JSON.stringify(cleanKeywords(req.body.keywords)));
+      sets.push(`keywords = $${params.length}::jsonb`);
+    }
+    if (req.body?.sortOrder !== undefined) {
+      params.push(Number(req.body.sortOrder) || 0);
+      sets.push(`sort_order = $${params.length}`);
+    }
+    if (!sets.length) return res.status(400).json({ ok: false, error: 'nothing_to_update' });
+    sets.push('updated_at = now()');
+    params.push(req.params.id, req.tenantId);
+    const topic = await queryOne(
+      `UPDATE focus_topics SET ${sets.join(', ')}
+       WHERE id = $${params.length - 1} AND tenant_id = $${params.length}
+       RETURNING id, name, keywords, sort_order, created_at, updated_at`,
+      params,
+    );
+    if (!topic) return res.status(404).json({ ok: false, error: 'not_found' });
+    return res.json({ ok: true, topic });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.delete('/focus-topics/:id', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    await execute('DELETE FROM focus_topics WHERE id = $1 AND tenant_id = $2', [req.params.id, req.tenantId]);
+    return res.json({ ok: true });
   } catch (err) {
     return next(err);
   }

@@ -5,6 +5,7 @@ import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
 import { parseMetricNumber, resolveMetricFromPayload } from '../utils/metrics.js';
+import { queryAll } from '../db/init.js';
 
 const router = Router();
 const commentWorkflowQueue = [];
@@ -378,6 +379,31 @@ router.post('/batch', requireAuth, async (req, res) => {
       failed,
     },
   });
+});
+
+// 增量采集:扩展补采前问「这些 external_id 哪些已采全」(detailCaptureStatus=done)。
+// 已采全的扩展就跳过、不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。
+router.post('/captured', requireAuth, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.externalIds) ? req.body.externalIds : [];
+    const externalIds = ids.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 1000);
+    if (externalIds.length === 0) {
+      return res.json({ ok: true, captured: [] });
+    }
+    const platform = String(req.body?.platform || '').trim();
+    const params = [req.tenantId, externalIds];
+    let sql = `SELECT DISTINCT external_id FROM records
+                WHERE tenant_id = $1 AND external_id = ANY($2)
+                  AND payload->>'detailCaptureStatus' = 'done'`;
+    if (platform) {
+      params.push(platform);
+      sql += ` AND platform = $${params.length}`;
+    }
+    const rows = await queryAll(sql, params);
+    return res.json({ ok: true, captured: rows.map((r) => r.external_id) });
+  } catch (err) {
+    return res.json({ ok: false, error: 'server_error', message: err?.message || '查询失败', captured: [] });
+  }
 });
 
 export default router;
