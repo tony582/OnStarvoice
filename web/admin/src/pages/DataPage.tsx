@@ -4,7 +4,7 @@ import {
   Loader2, RefreshCw, Search,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatDate, formatNumber, platformName } from '@/lib/utils'
+import { formatDate, formatNumber, platformName, friendlyError } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Button } from '@/components/ui/button'
@@ -1242,8 +1242,9 @@ function TranscriptCell({ row }: { row: any }) {
         {inProgress ? '转写中…' : status === 'done' ? '重新生成' : '生成逐字稿'}
       </button>
       {status === 'no_media' && <span className="text-[11px] text-muted-foreground">无可转写视频</span>}
+      {status === 'no_speech' && <span className="text-[11px] text-muted-foreground">无人声口播</span>}
       {status === 'expired' && <span className="text-[11px] text-amber-600">直链过期,需重采</span>}
-      {status === 'failed' && <span className="text-[11px] text-destructive">{error || '转写失败'}</span>}
+      {status === 'failed' && <span className="text-[11px] text-destructive">{friendlyError(error)}</span>}
     </div>
   )
 }

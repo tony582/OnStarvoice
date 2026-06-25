@@ -134,3 +134,37 @@ export function identityLabel(sourceType?: string | null, fans?: number | null, 
   }
   return ''
 }
+
+// 把后端/第三方的原始技术报错(ASR 码、HTTP 状态、英文异常)映射成中文友好提示,
+// 不向用户暴露 SUCCESS_WITH_NO_VALID_FRAGMENT 之类的技术码;未知错误给通用提示。
+export function friendlyError(raw?: string | null): string {
+  const s = String(raw || '').trim()
+  if (!s) return '出了点问题,请稍后重试'
+  if (/NO_VALID_FRAGMENT|NO_SPEECH|无人声|无有效语音/i.test(s)) return '该视频无人声口播,无可转写内容'
+  if (/403|过期|expired|防盗链/i.test(s)) return '视频直链已过期,需重新采集后再试'
+  if (/下载媒体|FETCH_FAILED|download|拉取.*失败/i.test(s)) return '视频下载失败,可能链接已失效'
+  if (/超时|timeout/i.test(s)) return '处理超时,请稍后重试'
+  if (/api[\s_-]*key|未配置|密钥/i.test(s)) return '服务未配置,请联系管理员'
+  if (/429|rate.?limit|限流|频繁/i.test(s)) return '请求过于频繁,请稍后再试'
+  if (/网络|network|ECONN|fetch failed|ENOTFOUND|socket/i.test(s)) return '网络异常,请稍后重试'
+  if (/无可转写|no_media/i.test(s)) return '该内容没有可转写的视频'
+  // 兜底:不暴露原始技术码
+  return '处理失败,请稍后重试'
+}
+
+// 平台图片(小红书/抖音/微博 CDN)有 Referer 防盗链 + 签名时效,浏览器直连 <img> 有概率 403/刷不出。
+// 统一经服务端 /api/img 代理(带对应 Referer 取图);本站地址(/media 本地化封面、/api/img 等)与非白名单 URL 原样返回,不二次代理。
+// ⚠ 白名单需与 server/routes/image-proxy.js 的 HOST_RULES 保持一致。
+const PROXY_IMG_HOSTS = /(?:\.sinaimg\.(?:cn|com)|\.weiboimg\.(?:cn|com)|\.xhscdn\.com|\.xiaohongshu\.com|\.douyinpic\.com|\.douyinstatic\.com|\.pstatp\.com|\.byteimg\.com|\.bytecdn\.cn|\.bdxiguaimg\.com)$/i
+export function proxiedImg(url?: string | null): string {
+  const s = String(url || '').trim()
+  if (!s) return s
+  try {
+    const u = new URL(s, window.location.origin)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return s
+    if (PROXY_IMG_HOSTS.test(u.hostname)) return `/api/img?url=${encodeURIComponent(u.toString())}`
+  } catch {
+    /* 非法 URL 原样返回 */
+  }
+  return s
+}
