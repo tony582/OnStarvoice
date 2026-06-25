@@ -2825,6 +2825,15 @@ function resolveDetailCaptureStatusRow(record) {
     return null;
   }
 
+  // 增量采集:这条之前已采过、本次自动跳过(数据已在库/本地),显示"已采过"而非"未执行"
+  if (payload.detailAlreadyCaptured) {
+    return {
+      text: "已采过 · 数据已存在，无需重复增强",
+      textClass: "is-done",
+      actions: "",
+    };
+  }
+
   if (status === "capturing") {
     return {
       text: "采集增强中",

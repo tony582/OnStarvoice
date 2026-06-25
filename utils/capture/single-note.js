@@ -18,6 +18,15 @@ import {
 import {PAGE_TYPE, SYNC_TYPE} from "../constants.js";
 import {wait} from "../scroll.js";
 
+// 小红书风控/安全限制页识别:页面文案「安全限制」+「访问频繁 / 稍后再试 / 300013」。
+// 程序化连续打开多条详情时易触发;识别到后让上层立即停止补采,不要继续硬刷。
+function detectXhsSecurityBlock() {
+  const text = String(document.body?.innerText || "");
+  if (/安全限制/.test(text) && /(访问频繁|稍后再试|300013)/.test(text)) return true;
+  if (/300013/.test(text) && /(访问频繁|稍后再试|安全)/.test(text)) return true;
+  return false;
+}
+
 /**
  * 采集单篇笔记数据
  * @returns {Promise<Object>} 采集结果
@@ -32,6 +41,24 @@ export async function captureSingleNote() {
   await wait(700); // 从 300ms 增加到 700ms
 
   try {
+    // 风控拦截:撞上小红书「安全限制 / 访问频繁 / 300013」页,立即返回,让上层暂停(别再硬刷,越刷越死)
+    if (detectXhsSecurityBlock()) {
+      return {
+        ok: false,
+        type: SYNC_TYPE.SINGLE_NOTE,
+        data: null,
+        meta: {
+          pageType: PAGE_TYPE.NOTE_DETAIL,
+          captureStartedAt,
+          captureFinishedAt: new Date().toISOString(),
+        },
+        error: {
+          code: "XHS_SECURITY_BLOCK",
+          message: "触发小红书安全限制(访问频繁/300013),已暂停采集",
+        },
+      };
+    }
+
     // 阶段 2：等待页面 hydration 完成
     console.log("[SingleNote] Phase 2: Waiting for page hydration...");
     await waitForPageHydration();

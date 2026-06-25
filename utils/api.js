@@ -351,6 +351,30 @@ export async function syncBatch(records, target) {
   return await request(API_ENDPOINT.SYNC_BATCH, { body });
 }
 
+// 增量采集:问后端这批 external_id 哪些已采全(detailCaptureStatus=done)。
+// 返回 { ok, captured:[external_id...] }。失败时 captured 为空(不影响主流程,顶多多采几条)。
+export async function checkCapturedExternalIds({ platform = '', externalIds = [] } = {}) {
+  const ids = Array.isArray(externalIds)
+    ? externalIds.map((x) => String(x || '').trim()).filter(Boolean)
+    : [];
+  if (ids.length === 0) return { ok: true, captured: [] };
+  const runtime = await getRuntime();
+  const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (!authCodeResult.ok) return { ok: false, captured: [] };
+  const body = {
+    code: authCodeResult.code,
+    clientUuid: runtime.clientUuid,
+    appVersion: runtime.appVersion,
+    platform,
+    externalIds: ids,
+  };
+  const result = await request('/api/sync/captured', { body });
+  return {
+    ok: Boolean(result?.ok),
+    captured: Array.isArray(result?.captured) ? result.captured : [],
+  };
+}
+
 export async function getTargetConfig() {
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
   if (!authCodeResult.ok) {

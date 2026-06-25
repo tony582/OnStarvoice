@@ -2494,6 +2494,14 @@ function setupUIEventListeners() {
       );
     });
   document
+    .querySelectorAll('[data-detail-setting="skip-captured"]')
+    .forEach((input) => {
+      input.addEventListener(
+        "change",
+        handleDetailCaptureSkipCapturedToggleChange,
+      );
+    });
+  document
     .querySelectorAll('[data-detail-setting="comment-leads"]')
     .forEach((input) => {
       input.addEventListener(
@@ -3476,11 +3484,16 @@ async function handleCaptureSearchData() {
           taskStatus = "partial";
           searchCaptureCancelRequested = true;
         } else {
-          await maybeRunAutoDetailCaptureAfterListCapture(
+          const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
             resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
             { sourceLabel: "批量搜索结果", recordIds: collectBatchRecordIds(batchResult) },
           );
-          if ((batchResult?.stats?.failed || 0) > 0) taskStatus = "completed_with_failures";
+          if (enhanceResult?.securityBlocked) {
+            // 撞小红书风控:停掉整轮无人值守,别再往下跑(越跑越死)
+            searchCaptureCancelRequested = true;
+            taskStatus = "partial";
+            showMessage("⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。", "warning");
+          } else if ((batchResult?.stats?.failed || 0) > 0) taskStatus = "completed_with_failures";
         }
       } else {
         // 单词:在当前页切筛选 + 单次采集
@@ -3512,7 +3525,11 @@ async function handleCaptureSearchData() {
             resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
             { sourceLabel: "搜索结果", recordIds: actionResult.recordIds },
           );
-          if (enhanceResult?.canceled) {
+          if (enhanceResult?.securityBlocked) {
+            searchCaptureCancelRequested = true;
+            taskStatus = "partial";
+            showMessage("⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。", "warning");
+          } else if (enhanceResult?.canceled) {
             taskStatus = "partial";
             searchCaptureCancelRequested = true;
           } else if (enhanceResult && enhanceResult.ok === false) {
@@ -11028,6 +11045,12 @@ async function initCaptureSettingsUI() {
       enableCommentLeadsFilter: enableCommentLeadsFilterOnDetailCapture,
       includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
     });
+    // 「增量采集」勾选已挪到「点赞数」下面,不在 detail 面板内,单独按 settings 回填(document 级)
+    document
+      .querySelectorAll('[data-detail-setting="skip-captured"]')
+      .forEach((el) => {
+        el.checked = settings.skipAlreadyCapturedOnDetailCapture !== false;
+      });
 
     const inputCommentsMaxDetectedItems = document.getElementById(
       "inputCommentsMaxDetectedItems",
@@ -11281,6 +11304,14 @@ async function handleDetailCaptureBloggerMetricsToggleChange(event) {
     await persistDetailCaptureSettingsFromInputs();
   } catch (error) {
     console.warn("[Sidebar] Save detail blogger metrics toggle failed:", error);
+  }
+}
+
+async function handleDetailCaptureSkipCapturedToggleChange() {
+  try {
+    await persistDetailCaptureSettingsFromInputs();
+  } catch (error) {
+    console.warn("[Sidebar] Save skip-captured toggle failed:", error);
   }
 }
 
@@ -11828,6 +11859,8 @@ async function runDetailCaptureForRecordIds(
       includeBloggerMetrics: Boolean(
         settings?.includeBloggerMetricsOnDetailCapture,
       ),
+      skipAlreadyCaptured:
+        settings?.skipAlreadyCapturedOnDetailCapture !== false,
       enableCommentLeadsFilter: Boolean(
         settings?.enableCommentLeadsFilterOnDetailCapture,
       ),
@@ -12975,6 +13008,15 @@ function getDetailCaptureBloggerMetricsChecked(settings) {
   return Boolean(input.checked);
 }
 
+// 增量采集(跳过已采过的)。无勾选输入时回落 settings,默认 true。
+function getDetailCaptureSkipCapturedChecked(settings) {
+  const input = getActiveDetailCaptureInput("skip-captured");
+  if (!input) {
+    return settings?.skipAlreadyCapturedOnDetailCapture !== false;
+  }
+  return Boolean(input.checked);
+}
+
 function getDetailCaptureLowFollowerHitFilterChecked(settings) {
   const input = getActiveDetailCaptureInput("low-follower-hit");
   if (!input) {
@@ -13013,6 +13055,7 @@ function syncAutoDetailCaptureControls({
   commentsMaxDetectedItems = null,
   enableCommentLeadsFilter = null,
   includeBloggerMetrics = null,
+  skipAlreadyCaptured = null,
   enableLowFollowerHitFilter = null,
   lowFollowerHitThreshold = null,
   forceDisabled = false,
@@ -13037,6 +13080,9 @@ function syncAutoDetailCaptureControls({
       '[data-detail-setting="comment-leads"]',
     );
     const metricsInput = panel.querySelector('[data-detail-setting="metrics"]');
+    const skipCapturedInput = panel.querySelector(
+      '[data-detail-setting="skip-captured"]',
+    );
     const lowFollowerHitInput = panel.querySelector(
       '[data-detail-setting="low-follower-hit"]',
     );
@@ -13080,6 +13126,9 @@ function syncAutoDetailCaptureControls({
     }
     if (metricsInput && includeBloggerMetrics !== null) {
       metricsInput.checked = Boolean(includeBloggerMetrics);
+    }
+    if (skipCapturedInput && skipAlreadyCaptured !== null) {
+      skipCapturedInput.checked = Boolean(skipAlreadyCaptured);
     }
     if (lowFollowerHitInput && enableLowFollowerHitFilter !== null) {
       lowFollowerHitInput.checked = Boolean(enableLowFollowerHitFilter);
@@ -13158,6 +13207,8 @@ async function persistDetailCaptureSettingsFromInputs() {
     includeCommentsOnDetailCapture && enableCommentLeadsFilterOnDetailCapture;
   const includeBloggerMetricsOnDetailCapture =
     getDetailCaptureBloggerMetricsChecked(current);
+  const skipAlreadyCapturedOnDetailCapture =
+    getDetailCaptureSkipCapturedChecked(current);
   const enableLowFollowerHitFilterOnDetailCapture =
     getDetailCaptureLowFollowerHitFilterChecked(current);
   const lowFollowerHitThresholdOnDetailCapture =
@@ -13169,6 +13220,7 @@ async function persistDetailCaptureSettingsFromInputs() {
     commentsMaxDetectedItems: detailCommentsMaxDetectedItems,
     enableCommentLeadsFilter: normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
+    skipAlreadyCaptured: skipAlreadyCapturedOnDetailCapture,
     enableLowFollowerHitFilter: enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThreshold: lowFollowerHitThresholdOnDetailCapture,
   });
@@ -13180,6 +13232,7 @@ async function persistDetailCaptureSettingsFromInputs() {
     enableCommentLeadsFilterOnDetailCapture:
       normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetricsOnDetailCapture,
+    skipAlreadyCapturedOnDetailCapture,
     enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThresholdOnDetailCapture,
   });
@@ -13196,6 +13249,8 @@ function resolveCurrentDetailCaptureSettings(settings = {}) {
       getDetailCaptureCommentLeadsFilterChecked(settings),
     includeBloggerMetricsOnDetailCapture:
       getDetailCaptureBloggerMetricsChecked(settings),
+    skipAlreadyCapturedOnDetailCapture:
+      getDetailCaptureSkipCapturedChecked(settings),
     enableLowFollowerHitFilterOnDetailCapture:
       getDetailCaptureLowFollowerHitFilterChecked(settings),
     lowFollowerHitThresholdOnDetailCapture:
