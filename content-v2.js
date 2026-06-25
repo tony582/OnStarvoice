@@ -128,6 +128,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       handlePrepareKeywordStrategyCapture(sendResponseWithDiagnostics);
       return true;
 
+    case "applyBatchSearchFilters":
+      handleApplyBatchSearchFilters(request, sendResponseWithDiagnostics);
+      return true;
+
     case "expandKeywordSuggestions":
       handleExpandKeywordSuggestions(request, sendResponseWithDiagnostics);
       return true;
@@ -402,6 +406,70 @@ async function handlePrepareKeywordStrategyCapture(sendResponse) {
       },
     });
   }
+}
+
+// 批量采集的「排序 / 发布时间」筛选标签(各平台文案兜底多写几个,点中即用)
+const BATCH_SORT_LABELS = {
+  latest: ["最新", "最新发布", "最新内容", "时间排序", "按时间"],
+  likes: ["最多点赞", "点赞最多", "按点赞"],
+  comments: ["最多评论", "评论最多", "按评论"],
+  collects: ["最多收藏", "收藏最多", "按收藏"],
+};
+const BATCH_TIME_LABELS = {
+  day: ["一天内", "24小时", "近一天", "最近一天"],
+  week: ["一周内", "近一周", "7天内", "最近一周"],
+  month: ["一月内", "近一月", "30天内", "最近一月"],
+  halfyear: ["半年内", "最近半年", "近半年"],
+};
+
+async function handleApplyBatchSearchFilters(request, sendResponse) {
+  try {
+    const result = await applyBatchSearchFilters({
+      sort: request?.sort || "",
+      publishTime: request?.publishTime || "",
+    });
+    sendResponse({ ok: true, data: result });
+  } catch (error) {
+    console.error("[Content] Apply batch search filters failed:", error);
+    sendResponse({ ok: false, error: { code: "APPLY_FILTER_FAILED", message: error.message } });
+  }
+}
+
+// 复用「找对标账号」的筛选点击能力(ensureKeywordStrategyFilterPanelOpen + applyStrategyFilterInSection),
+// 给批量采集在采集前按需切「排序 / 发布时间」。综合/不限 则不改,直接返回。
+async function applyBatchSearchFilters({ sort = "", publishTime = "" } = {}) {
+  const pageType = detectPageType(window.location.href);
+  if (pageType !== "search_results") {
+    return { applied: false, reason: "not_search_page" };
+  }
+  const wantSort = sort && sort !== "comprehensive" && BATCH_SORT_LABELS[sort];
+  const wantTime = publishTime && publishTime !== "all" && BATCH_TIME_LABELS[publishTime];
+  if (!wantSort && !wantTime) {
+    return { applied: false, reason: "no_filter" };
+  }
+  const notes = [];
+  const opened = await ensureKeywordStrategyFilterPanelOpen(notes);
+  if (!opened) {
+    return { applied: false, reason: "panel_not_opened", notes };
+  }
+  let applied = false;
+  if (wantSort) {
+    const ok = await applyStrategyFilterInSection(["排序依据", "排序"], BATCH_SORT_LABELS[sort], notes, "排序");
+    if (ok) {
+      applied = true;
+      await waitForKeywordStrategyUi(2000);
+      await ensureKeywordStrategyFilterPanelOpen(notes);
+      await waitForKeywordStrategyUi(600);
+    }
+  }
+  if (wantTime) {
+    const ok = await applyStrategyFilterInSection(["发布时间", "时间"], BATCH_TIME_LABELS[publishTime], notes, "时间");
+    if (ok) {
+      applied = true;
+      await waitForKeywordStrategyUi(1200);
+    }
+  }
+  return { applied, notes };
 }
 
 async function prepareKeywordStrategyCapture() {

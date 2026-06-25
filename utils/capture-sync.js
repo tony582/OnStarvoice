@@ -9,7 +9,7 @@
  * 4. 更新同步状态
  */
 
-import { sync, syncBatch } from './api.js';
+import { sync, syncBatch, checkCapturedExternalIds } from './api.js';
 
 import {
   addRecord,
@@ -120,7 +120,19 @@ const COMMENT_CONTENT_MAX_LENGTH = 280;
 const DETAIL_CAPTURE_NAV_TIMEOUT_MS = 90000;
 const DETAIL_CAPTURE_NAV_POLL_MS = 280;
 const DETAIL_CAPTURE_AFTER_NAV_WAIT_MS = 2000;
-const PROFILE_AFTER_NAV_WAIT_MS = 2000;
+// 补采详情「条与条之间」的随机间隔。注:小红书 300013 的真因是 xsec_source 为空(见
+// ensureXhsNoteUrlSource),不是请求频率;这里保留小幅随机间隔做基本礼貌,不必拉长。
+const DETAIL_ITEM_DELAY_MIN_MS = 2000;
+const DETAIL_ITEM_DELAY_MAX_MS = 5000;
+// 进博主主页前的小随机抖动:打散「笔记页 → 主页」的连续导航(burst 也是风控信号)。
+const PROFILE_NAV_JITTER_MIN_MS = 1200;
+const PROFILE_NAV_JITTER_MAX_MS = 3200;
+// 博主主页「小红书号/抖音号」常 ~3.5s 才渲染,2s 太短会回退成内部 ID → 取号失败
+const PROFILE_AFTER_NAV_WAIT_MS = 3500;
+// 抖音号(douyinId)批量补采【总开关】。抖音号只在博主主页正文,补它要每个博主多跳一次主页,
+// 会显著拖慢采集。客户当前不需要抖音号 → 默认关闭,= 完美回退到「不进主页」的原行为
+// (零额外导航)。maybeAttachDouyinAccountNo 及两处 hook 代码完整保留,日后客户要号改回 true 即可。
+const ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH = false;
 const DEFAULT_BLOGGER_PROFILE_TABLE_NAME = '博主信息表';
 const DEFAULT_BLOGGER_NOTES_TABLE_NAME = '博主笔记采集';
 const DEFAULT_KEYWORD_NOTES_TABLE_NAME = '关键词笔记采集';
@@ -196,7 +208,15 @@ function compactPayloadForBackendSync(payload = {}) {
 
   if (items.length > 0) {
     next.items = items.slice(0, 1);
-    delete next.detailPayload;
+    // 已补采详情的记录,detailPayload 里才有完整正文/评论/博主指标/小红书号·抖音号。
+    // 同步必须保留它,否则后端 sync 从 detailPayload 取不到这些(尤其号)→ 号永远是空。
+    // 只有纯列表态(从没补采过详情)才删,避免 payload 膨胀。
+    const dp = source.detailPayload;
+    const hasDetailPayload =
+      dp && typeof dp === 'object' && Object.keys(dp).length > 0;
+    if (!hasDetailPayload) {
+      delete next.detailPayload;
+    }
   }
 
   delete next.detailCaptureDiagnosticMessage;
@@ -1513,6 +1533,7 @@ export async function batchCaptureDetailsForRecords(
     detailNavTimeoutMs = null,
     detailAfterNavWaitMs = null,
     profileAfterNavWaitMs = null,
+    skipAlreadyCaptured = null,
   } = {},
 ) {
   const uniqueRecordIds = Array.isArray(recordIds)
@@ -1578,11 +1599,117 @@ export async function batchCaptureDetailsForRecords(
     profileAfterNavWaitMs ?? settings.profileAfterNavWaitMs,
     PROFILE_AFTER_NAV_WAIT_MS,
   );
+
+  // 增量采集:补采前问后端「这些笔记哪些已采全(detailCaptureStatus=done)」,已采全的直接跳过,
+  // 不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。查询失败则不跳过(顶多多采几条,不影响主流程)。
+  const resolvedSkipCaptured =
+    skipAlreadyCaptured ?? settings.skipAlreadyCapturedOnDetailCapture ?? true;
+  let skipRecordIdSet = new Set();
+  if (resolvedSkipCaptured) {
+    try {
+      const idPairs = [];
+      let probePlatform = '';
+      for (const rid of uniqueRecordIds) {
+        const rec = await getRecord(rid);
+        if (!rec) continue;
+        if (!probePlatform) probePlatform = resolveRecordIdentityPlatform(rec);
+        const ext = resolveRecordDetailNoteId(rec);
+        if (ext) {
+          idPairs.push({ recordId: rid, externalId: String(ext), payload: rec.payload });
+        }
+      }
+      const candidateExtIds = new Set(idPairs.map((p) => p.externalId));
+
+      // ① 本地已采全(detailCaptureStatus=done)的 external_id —— 覆盖「循环内 / 同会话」重复,
+      //    不依赖同步到后台(无人值守循环不会每轮自动同步,所以第2轮跳第1轮要靠这个)。
+      const localDone = new Set();
+      try {
+        const pool = await getDataPool();
+        for (const rec of pool?.records || []) {
+          if (String(rec?.payload?.detailCaptureStatus || '') !== 'done') continue;
+          const ext = resolveRecordDetailNoteId(rec);
+          if (ext && candidateExtIds.has(String(ext))) localDone.add(String(ext));
+        }
+      } catch (poolError) {
+        console.warn('[CaptureSync] 本地已采预检失败(忽略):', poolError);
+      }
+
+      // ② 后台已采全的 —— 覆盖「跨夜 / 跨会话」(需之前同步过)
+      const { captured } = await checkCapturedExternalIds({
+        platform: probePlatform,
+        externalIds: idPairs.map((p) => p.externalId),
+      });
+      const capturedSet = new Set(captured);
+
+      skipRecordIdSet = new Set(
+        idPairs
+          .filter(
+            (p) => capturedSet.has(p.externalId) || localDone.has(p.externalId),
+          )
+          .map((p) => p.recordId),
+      );
+
+      // 给跳过的记录打「已采过」标记,卡片据此显示"已采过"而非"未执行采集增强"
+      for (const p of idPairs) {
+        if (
+          skipRecordIdSet.has(p.recordId) &&
+          p.payload &&
+          !p.payload.detailAlreadyCaptured
+        ) {
+          try {
+            await updateRecord(p.recordId, {
+              payload: { ...p.payload, detailAlreadyCaptured: true },
+            });
+          } catch (markError) {
+            console.warn('[CaptureSync] 标记已采过失败(忽略):', markError);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[CaptureSync] 增量采集预检失败(忽略,照常补采):', error);
+      skipRecordIdSet = new Set();
+    }
+  }
+  // 全部已采过 → 不必开补采标签页,直接返回
+  if (skipRecordIdSet.size > 0 && skipRecordIdSet.size === uniqueRecordIds.length) {
+    if (onProgress) {
+      onProgress({
+        phase: 'detail_batch_done',
+        message: `全部 ${uniqueRecordIds.length} 条均已采过,跳过补采`,
+        current: uniqueRecordIds.length,
+        total: uniqueRecordIds.length,
+        successCount: 0,
+        failedCount: 0,
+        filteredCount: uniqueRecordIds.length,
+      });
+    }
+    return {
+      ok: true,
+      canceled: false,
+      securityBlocked: false,
+      total: uniqueRecordIds.length,
+      processedCount: uniqueRecordIds.length,
+      successCount: 0,
+      failedCount: 0,
+      filteredCount: uniqueRecordIds.length,
+      results: [...skipRecordIdSet].map((recordId) => ({
+        recordId,
+        ok: true,
+        reason: 'already_captured',
+        message: '已采过,跳过',
+      })),
+      diagnostics: { stageTrace: [] },
+      error: null,
+    };
+  }
+
   const results = [];
   const bloggerMetricsCache = new Map();
   let successCount = 0;
   let failedCount = 0;
   let filteredCount = 0;
+  let skippedCount = 0; // 增量采集:之前已采过、本次跳过的条数(单列,不混入"过滤")
+  let securityBlocked = false; // 撞上小红书安全限制(访问频繁/300013)→ 立即停整批,别再硬刷
   let detailKeywordFilterEnabled = false;
   let detailKeywordFilteredCount = 0;
   let canceled = false;
@@ -1620,6 +1747,20 @@ export async function batchCaptureDetailsForRecords(
     });
   }
 
+  // 增量采集:开跑前先告诉用户为什么只补一部分(否则客户看到跳过一脸懵)
+  if (onProgress && skipRecordIdSet.size > 0) {
+    const toCaptureCount = uniqueRecordIds.length - skipRecordIdSet.size;
+    onProgress({
+      phase: 'detail_skip_summary',
+      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过),本次只补采 ${toCaptureCount} 条新内容`,
+      current: 0,
+      total: uniqueRecordIds.length,
+      skippedCount: skipRecordIdSet.size,
+      toCaptureCount,
+      runnerTabId: runnerContext.runnerTabId,
+    });
+  }
+
   try {
     for (let index = 0; index < uniqueRecordIds.length; index += 1) {
       if (typeof shouldStop === 'function' && shouldStop()) {
@@ -1629,6 +1770,33 @@ export async function batchCaptureDetailsForRecords(
 
       const recordId = uniqueRecordIds[index];
       const current = index + 1;
+
+      // 增量采集:已采全的直接跳过(不开详情/不进主页)
+      if (skipRecordIdSet.has(recordId)) {
+        skippedCount += 1;
+        results.push({
+          recordId,
+          ok: true,
+          reason: 'already_captured',
+          message: '之前已采过,自动跳过',
+        });
+        if (onProgress) {
+          onProgress({
+            phase: 'detail_item_skipped',
+            message: `第 ${current}/${uniqueRecordIds.length} 条之前已采过,跳过(增量采集)`,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            successCount,
+            failedCount,
+            filteredCount,
+            skippedCount,
+            runnerTabId: runnerContext.runnerTabId,
+          });
+        }
+        continue;
+      }
+
       const record = await getRecord(recordId);
 
       if (!record || !isDetailCaptureRecordType(record.type)) {
@@ -1802,6 +1970,10 @@ export async function batchCaptureDetailsForRecords(
         });
 
         if (!noteResult?.ok) {
+          if (noteResult?.error?.code === 'XHS_SECURITY_BLOCK') {
+            securityBlocked = true; // 撞风控,下面 catch 会停整批
+            throw new Error('XHS_SECURITY_BLOCK');
+          }
           throw new Error(noteResult?.error?.message || '详情采集失败');
         }
 
@@ -1846,7 +2018,14 @@ export async function batchCaptureDetailsForRecords(
               profileAfterNavWaitMs: normalizedProfileAfterNavWaitMs,
               shouldStop,
               cache: bloggerMetricsCache,
+              // 小红书:指标缺时进主页(原语义不变)。抖音保持 false——抖音指标在作品页那步已拿到,
+              // 不能放开此开关去跑小红书的进主页/缓存语义(会污染小红书路径)。
               allowProfileNavigation: recordPlatform !== 'douyin',
+              // 抖音专用:仅为补「抖音号(douyinId)」多进一次主页,与指标早返回解耦。
+              // 真号只在博主主页正文,作品页/详情页拿不到 → 单独 fail-soft 取号。
+              // 受总开关 ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH 控制:当前关闭=不进主页(回退原行为)。
+              allowDouyinIdLookup:
+                ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH && recordPlatform === 'douyin',
             },
           );
           detailPayload = applyBloggerMetricsResultToPayload(
@@ -2065,8 +2244,46 @@ export async function batchCaptureDetailsForRecords(
           });
         }
 
+        if (securityBlocked) {
+          if (onProgress) {
+            onProgress({
+              phase: 'detail_security_blocked',
+              message:
+                '⚠️ 触发小红书安全限制(访问频繁/300013),已暂停补采。建议隔较长时间(如数小时)再跑。',
+              recordId,
+              current,
+              total: uniqueRecordIds.length,
+              successCount,
+              failedCount,
+              filteredCount,
+              runnerTabId: runnerContext.runnerTabId,
+            });
+          }
+          break;
+        }
         if (canceledByUser) {
           break;
+        }
+      }
+
+      // 条与条之间的随机间隔(防风控);最后一条 / 取消 / 风控时不等。
+      if (
+        index < uniqueRecordIds.length - 1 &&
+        !securityBlocked &&
+        !canceled &&
+        !(typeof shouldStop === 'function' && shouldStop())
+      ) {
+        const itemDelay =
+          DETAIL_ITEM_DELAY_MIN_MS +
+          Math.random() * (DETAIL_ITEM_DELAY_MAX_MS - DETAIL_ITEM_DELAY_MIN_MS);
+        try {
+          await waitMsWithStop(itemDelay, shouldStop, 'DETAIL_CAPTURE_CANCELED');
+        } catch (delayError) {
+          if (isDetailCaptureCanceledError(delayError)) {
+            canceled = true;
+            break;
+          }
+          throw delayError;
         }
       }
     }
@@ -2121,16 +2338,18 @@ export async function batchCaptureDetailsForRecords(
   }).catch(() => null);
 
   if (onProgress) {
+    const skipNote = skippedCount > 0 ? `，跳过 ${skippedCount} 条(之前已采过)` : '';
     onProgress({
       phase: canceled ? 'detail_batch_canceled' : 'detail_batch_done',
       message: canceled
-        ? `详情补采已中止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}`
-        : `详情补采完成：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}`,
+        ? `详情补采已中止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+        : `详情补采完成：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`,
       current: processedCount,
       total: uniqueRecordIds.length,
       successCount,
       failedCount,
       filteredCount,
+      skippedCount,
       runnerTabId: runnerContext.runnerTabId,
     });
   }
@@ -2138,11 +2357,13 @@ export async function batchCaptureDetailsForRecords(
   return {
     ok: !canceled && failedCount === 0,
     canceled,
+    securityBlocked, // 撞小红书安全限制 → 主循环据此停整轮无人值守
     total: uniqueRecordIds.length,
     processedCount,
     successCount,
     failedCount,
     filteredCount,
+    skippedCount,
     results,
     diagnostics: {
       stageTrace: [enhancementStage],
@@ -2454,6 +2675,14 @@ function mergeHydratedDetailIntoRecordPayload(record) {
     ...firstItem,
     ...detail,
   };
+
+  // 详情增强若返回空标题/正文(典型:抖音图文 desc 常为空),别用空覆盖搜索卡片已采到的真实值。
+  // 卡片兜底占位「抖音搜索结果 N」不算真标题,不回填;抖音正文=标题,缺正文时用标题补。
+  if (!mergedItem.title && firstItem.title && !/^抖音搜索结果/.test(String(firstItem.title))) {
+    mergedItem.title = firstItem.title;
+  }
+  if (!mergedItem.content && firstItem.content) mergedItem.content = firstItem.content;
+  if (!mergedItem.content && mergedItem.title) mergedItem.content = mergedItem.title;
 
   if (!mergedItem.url && mergedItem.noteUrl) mergedItem.url = mergedItem.noteUrl;
   if (!mergedItem.noteUrl && mergedItem.url) mergedItem.noteUrl = mergedItem.url;
@@ -4966,6 +5195,50 @@ async function captureBloggerMetricsForSingleNoteRecord(
         payload: latestPayload,
       });
 
+      // 抖音号在博主主页上(作品页指标那条路拿不到)→ 补一次"导航到主页 + mode blogger_profile"(=douyin-blogger.js)取抖音号。
+      // 失败不影响主流程(粉丝数已采到)。
+      if (profileUrl && tab?.id && (typeof shouldStop !== 'function' || !shouldStop())) {
+        try {
+          if (onProgress) {
+            onProgress({
+              phase: 'blogger_metrics_extract_douyin_id',
+              message: '正在进入主页提取抖音号...',
+              recordId,
+            });
+          }
+          await openUrlInTab(tab.id, profileUrl, {
+            timeoutMs: detailNavTimeoutMs,
+            shouldStop,
+            active: true,
+          });
+          await waitMsWithStop(
+            profileAfterNavWaitMs,
+            shouldStop,
+            'BATCH_CAPTURE_CANCELED',
+          );
+          const idResult = await captureInTab(tab.id, {
+            mode: 'blogger_profile',
+            captureParams: {},
+          });
+          // 真抖音号在 data.douyinId(extractDouyinId 取「抖音号:xxx」);
+          // data.bloggerId 是 resolveBloggerId=URL 里的 sec_uid(MS4w...),不能用 —— 此前 bug 就在这。
+          const douyinNo = idResult?.ok
+            ? pickHumanAccountNo(idResult.data)
+            : '';
+          if (douyinNo) {
+            latestPayload = applyBloggerMetricsPatch(latestPayload, {
+              bloggerUserId: douyinNo,
+            });
+            await updateRecord(recordId, {
+              status: RECORD_STATUS.DRAFT,
+              payload: latestPayload,
+            });
+          }
+        } catch (idError) {
+          console.warn('[Sidebar] 抖音号补采失败(不影响主流程):', idError);
+        }
+      }
+
       if (onProgress) {
         onProgress({
           phase: 'blogger_metrics_done',
@@ -5190,6 +5463,17 @@ async function captureDouyinBloggerMetricsFromNoteDetail({
   };
 }
 
+// 博主主页缓存 key:只按「host + 路径」(=博主身份),忽略 xsec_token 等 query。
+// 否则同一博主不同帖带的 token 不同 → key 不同 → 缓存不命中 → 重复进同一个主页(多余导航 + 风控)。
+function bloggerProfileCacheKey(profileUrl) {
+  try {
+    const u = new URL(profileUrl);
+    return `${u.hostname}${u.pathname}`;
+  } catch {
+    return String(profileUrl || '');
+  }
+}
+
 async function captureBloggerMetricsForDetailPayload(
   detailPayload,
   {
@@ -5200,6 +5484,7 @@ async function captureBloggerMetricsForDetailPayload(
     shouldStop = null,
     cache = null,
     allowProfileNavigation = true,
+    allowDouyinIdLookup = false,
   } = {},
 ) {
   const normalizedPayload = ensureBloggerMetricsFields(detailPayload);
@@ -5216,6 +5501,19 @@ async function captureBloggerMetricsForDetailPayload(
     { requireBothMetrics: platform === 'douyin' },
   );
   if (directPatch) {
+    // 抖音:作品页指标已齐(directPatch),但 directPatch 多半不含真抖音号
+    // (号只在博主主页正文「抖音号:xxx」,作品页 API 的 unique_id 常缺)。
+    // 在 return 之前、与指标早返回解耦地补一次号(fail-soft,不影响已采到的指标)。
+    if (platform === 'douyin' && allowDouyinIdLookup) {
+      await maybeAttachDouyinAccountNo(directPatch, normalizedPayload, {
+        tabId,
+        noteUrl,
+        detailNavTimeoutMs,
+        profileAfterNavWaitMs,
+        shouldStop,
+        cache,
+      });
+    }
     return {
       ok: true,
       canceled: false,
@@ -5229,6 +5527,37 @@ async function captureBloggerMetricsForDetailPayload(
   }
 
   if (!allowProfileNavigation || platform === 'douyin') {
+    // 抖音指标不全(无 directPatch):不走小红书的进主页指标分支,
+    // 但若允许取号,单独进主页补「抖音号」。
+    // 关键:指标确实没采到 → 用 FAILED 状态承载号,绝不误标 DONE
+    // (否则会把指标为 0 的抖音帖显示成「博主指标已完成」、掩盖失败、抑制重采)。
+    if (platform === 'douyin' && allowDouyinIdLookup) {
+      const idPatch = createBloggerMetricsPatch({
+        status: BLOGGER_METRICS_CAPTURE_STATUS.FAILED,
+        error: '未能从作品详情页直接解析博主指标',
+      });
+      const attached = await maybeAttachDouyinAccountNo(
+        idPatch,
+        normalizedPayload,
+        {
+          tabId,
+          noteUrl,
+          detailNavTimeoutMs,
+          profileAfterNavWaitMs,
+          shouldStop,
+          cache,
+        },
+      );
+      if (attached) {
+        return {
+          ok: true,
+          canceled: false,
+          profileUrl: normalizedPayload.bloggerProfileUrl || '',
+          patch: idPatch,
+          error: '',
+        };
+      }
+    }
     return {
       ok: false,
       canceled: false,
@@ -5247,9 +5576,9 @@ async function captureBloggerMetricsForDetailPayload(
     };
   }
 
-  const cacheKey = profileUrl;
+  const cacheKey = bloggerProfileCacheKey(profileUrl);
   if (cache instanceof Map && cache.has(cacheKey)) {
-    return cache.get(cacheKey);
+    return cache.get(cacheKey); // 同博主一轮只进一次主页
   }
 
   if (typeof shouldStop === 'function' && shouldStop()) {
@@ -5262,6 +5591,11 @@ async function captureBloggerMetricsForDetailPayload(
   }
 
   try {
+    // 打散「笔记页 → 主页」的连续导航(burst 也是风控信号),进主页前小随机抖动
+    await waitMs(
+      PROFILE_NAV_JITTER_MIN_MS +
+        Math.floor(Math.random() * (PROFILE_NAV_JITTER_MAX_MS - PROFILE_NAV_JITTER_MIN_MS)),
+    );
     await openUrlInTab(tabId, profileUrl, {
       timeoutMs: detailNavTimeoutMs,
       shouldStop,
@@ -5336,6 +5670,96 @@ async function captureBloggerMetricsForDetailPayload(
       }
     }
     return failedResult;
+  }
+}
+
+// 抖音专用:仅为补「抖音号(douyinId)」进一次博主主页,复用 cache + jitter + 回原页 + shouldStop,
+// 失败 fail-soft 吞掉(不改指标、不丢记录、不停批)。命中时把真号写进 patch.bloggerUserId 并返回 true。
+// 真号只在主页正文(extractDouyinId「抖音号:xxx」);sec_uid 会被 pickHumanAccountNo 过滤,绝不入库。
+async function maybeAttachDouyinAccountNo(
+  patch,
+  normalizedPayload,
+  {
+    tabId,
+    noteUrl,
+    detailNavTimeoutMs = DETAIL_CAPTURE_NAV_TIMEOUT_MS,
+    profileAfterNavWaitMs = PROFILE_AFTER_NAV_WAIT_MS,
+    shouldStop = null,
+    cache = null,
+  } = {},
+) {
+  // 已有真号(patch 上、或 detailPayload 的 douyinId/authorUsername)→ 跳过导航,省一次进主页。
+  // 展开顺序要点:normalizedPayload 先铺开,再用 patch 的 bloggerUserId 覆盖——
+  // ensureBloggerMetricsFields 总会带个空 bloggerUserId 键,若放后面会把 patch 已有的真号洗掉。
+  const existingNo = pickHumanAccountNo({
+    ...normalizedPayload,
+    bloggerUserId: patch?.bloggerUserId || normalizedPayload.bloggerUserId,
+  });
+  if (existingNo) {
+    if (patch) patch.bloggerUserId = existingNo;
+    return true;
+  }
+
+  const profileUrl = resolveBloggerProfileUrlFromPayload(normalizedPayload);
+  if (!profileUrl || !tabId) return false;
+  if (typeof shouldStop === 'function' && shouldStop()) return false;
+
+  // 与小红书 metrics 缓存分开命名空间('douyinId:' 前缀),避免误命中混用;同博主一轮只进一次主页。
+  const idCacheKey = 'douyinId:' + bloggerProfileCacheKey(profileUrl);
+  if (cache instanceof Map && cache.has(idCacheKey)) {
+    const cachedNo = cache.get(idCacheKey);
+    if (cachedNo && patch) patch.bloggerUserId = cachedNo;
+    return Boolean(cachedNo);
+  }
+
+  try {
+    // 进主页前抖动,打散「笔记页 → 主页」burst(同小红书路)
+    await waitMs(
+      PROFILE_NAV_JITTER_MIN_MS +
+        Math.floor(
+          Math.random() *
+            (PROFILE_NAV_JITTER_MAX_MS - PROFILE_NAV_JITTER_MIN_MS),
+        ),
+    );
+    await openUrlInTab(tabId, profileUrl, {
+      timeoutMs: detailNavTimeoutMs,
+      shouldStop,
+      active: true,
+    });
+    await waitMs(profileAfterNavWaitMs);
+
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      return false;
+    }
+
+    const idResult = await captureInTab(tabId, {
+      mode: 'blogger_profile',
+      captureParams: {},
+    });
+    // 真抖音号在 data.douyinId;data.bloggerId 是 sec_uid(MS4w...),被 pickHumanAccountNo 过滤掉
+    const douyinNo = idResult?.ok ? pickHumanAccountNo(idResult.data) : '';
+    if (cache instanceof Map) {
+      cache.set(idCacheKey, douyinNo || ''); // 失败也缓存空串,同博主一轮不再撞墙
+    }
+    if (douyinNo && patch) {
+      patch.bloggerUserId = douyinNo;
+    }
+    return Boolean(douyinNo);
+  } catch (idError) {
+    console.warn('[CaptureSync] 抖音号补采失败(不影响主流程):', idError);
+    return false;
+  } finally {
+    // 无论成败都回原笔记页 —— 后续还要在【当前页】采评论,不能停在博主主页
+    if (noteUrl) {
+      try {
+        await openUrlInTab(tabId, noteUrl, {
+          timeoutMs: detailNavTimeoutMs,
+          active: true,
+        });
+      } catch (restoreError) {
+        console.warn('[CaptureSync] restore note page failed:', restoreError);
+      }
+    }
   }
 }
 
@@ -5990,6 +6414,7 @@ function ensureBloggerMetricsFields(payload) {
     bloggerMetricsCaptureStatus: status,
     bloggerMetricsCaptureError: String(base.bloggerMetricsCaptureError || ''),
     bloggerAccountType: normalizeBloggerAccountType(base.bloggerAccountType),
+    bloggerUserId: String(base.bloggerUserId || ''),
   };
 }
 
@@ -6007,6 +6432,7 @@ function applyBloggerMetricsPatch(payload, patch) {
     bloggerMetricsCaptureError:
       patch.bloggerMetricsCaptureError ?? base.bloggerMetricsCaptureError,
     bloggerAccountType: patch.bloggerAccountType ?? base.bloggerAccountType,
+    bloggerUserId: patch.bloggerUserId ?? base.bloggerUserId,
   };
 }
 
@@ -6017,6 +6443,7 @@ function createBloggerMetricsPatch({
   profileUrl,
   error,
   accountType,
+  bloggerId,
 }) {
   const patch = {
     bloggerMetricsCaptureStatus: status,
@@ -6037,8 +6464,40 @@ function createBloggerMetricsPatch({
   if (accountType !== undefined) {
     patch.bloggerAccountType = normalizeBloggerAccountType(accountType);
   }
+  if (bloggerId !== undefined) {
+    patch.bloggerUserId = String(bloggerId || '');
+  }
 
   return patch;
+}
+
+// 平台「内部 ID」≠「人看的账号号」。绝不能把内部 ID 当成小红书号/抖音号入库:
+//  - 小红书 user_id:24 位十六进制(如 5700cb384775a72931d38e56,来自 /user/profile/xxx)
+//  - 抖音 sec_uid:MS4w 开头长串(如 MS4wLjABAAAA...,来自 /user/xxx)
+// 真正的号是人能搜的字母数字串(小红书号 chengyao1218 / 抖音号 zhangjimin1950)。
+function isInternalAccountNo(value) {
+  const v = String(value || '').trim();
+  if (!v) return true;
+  if (/^[0-9a-f]{24}$/i.test(v)) return true; // 小红书内部 user_id
+  if (/^MS4w/i.test(v)) return true; // 抖音 sec_uid
+  return false;
+}
+
+// 从博主 payload 里挑出「人看的账号号」,按可信度排序,且过滤掉内部 ID。
+function pickHumanAccountNo(payload = {}) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const candidates = [
+    p.bloggerUserId,
+    p.redId,
+    p.douyinId, // 抖音号(extractDouyinId),非 sec_uid
+    p.authorUsername, // 抖音作品页 API unique_id
+    p.bloggerId, // 小红书:此处常是号;但抖音是 sec_uid → 被过滤
+  ];
+  for (const c of candidates) {
+    const v = String(c || '').trim();
+    if (v && !isInternalAccountNo(v)) return v;
+  }
+  return '';
 }
 
 function resolveBloggerMetricsFromProfilePayload(
@@ -6062,6 +6521,8 @@ function resolveBloggerMetricsFromProfilePayload(
       fallbackProfileUrl,
     error: '',
     accountType: safePayload.bloggerAccountType || safePayload.accountType,
+    // 只回填「人看的号」,内部 hex / sec_uid 一律不写(宁可空也不写错)
+    bloggerId: pickHumanAccountNo(safePayload),
   });
 }
 
@@ -6096,6 +6557,8 @@ function resolveBloggerMetricsPatchFromCurrentPayload(
     error: '',
     accountType:
       normalizedPayload.bloggerAccountType || normalizedPayload.accountType,
+    // 抖音号(unique_id,来自作品页 API)→ author_account_no;过滤掉 sec_uid/内部 hex
+    bloggerId: pickHumanAccountNo(normalizedPayload),
   });
 }
 
@@ -6856,6 +7319,28 @@ async function prepareDetailBatchRunnerContext({
   };
 }
 
+// 小红书笔记详情 URL 必须带非空 xsec_source(搜索结果卡片来的是 pc_search)。
+// 采集时这个值常被弄成空 → 工具直开「?xsec_token=X&xsec_source=」会被判 300013(访问频繁/安全限制),
+// 而人手点进去是同一个 token 但带 xsec_source=pc_search 就正常。这里在导航前补齐(token 不动)。
+function ensureXhsNoteUrlSource(targetUrl) {
+  try {
+    const u = new URL(String(targetUrl));
+    const host = u.hostname.toLowerCase();
+    if (host !== 'xiaohongshu.com' && !host.endsWith('.xiaohongshu.com')) {
+      return targetUrl;
+    }
+    if (!/\/(?:explore|search_result|discovery\/item|note|video)\/[A-Za-z0-9_-]+/.test(u.pathname)) {
+      return targetUrl; // 只修笔记详情,不动主页/搜索页等
+    }
+    if (u.searchParams.get('xsec_token') && !u.searchParams.get('xsec_source')) {
+      u.searchParams.set('xsec_source', 'pc_search');
+    }
+    return u.toString();
+  } catch {
+    return targetUrl;
+  }
+}
+
 async function openUrlInTab(
   tabId,
   targetUrl,
@@ -6866,9 +7351,10 @@ async function openUrlInTab(
   } = {},
 ) {
   const targetNoteId = extractNoteId(targetUrl);
+  const navUrl = ensureXhsNoteUrlSource(targetUrl);
 
   await chrome.tabs.update(tabId, {
-    url: targetUrl,
+    url: navUrl,
     active: Boolean(active),
   });
 
@@ -7371,6 +7857,10 @@ function isDouyinContentFlowUrl(url = '') {
 
 const BATCH_KEYWORD_DELAY_MIN_MS = 3000;
 const BATCH_KEYWORD_DELAY_MAX_MS = 5000;
+// 不同搜索词之间的随机间隔:分钟级。连续快搜多个关键词(秒级)会触发小红书安全机制(风控),
+// 必须把节奏拉到「几分钟」且随机化(固定节奏也易被识别)。通宵无人值守跑也走这个节奏。
+const BATCH_INTER_KEYWORD_DELAY_MIN_MS = 90 * 1000; // 1.5 分钟
+const BATCH_INTER_KEYWORD_DELAY_MAX_MS = 210 * 1000; // 3.5 分钟
 const BATCH_KEYWORD_NAV_TIMEOUT_MS = 15000;
 const BATCH_KEYWORD_NAV_POLL_MS = 300;
 const BATCH_KEYWORD_AFTER_NAV_WAIT_MS = 2000;
@@ -7880,11 +8370,26 @@ export async function batchCaptureByUrls({
  * @param {Function} [options.shouldStop] - 取消检测函数
  * @returns {Promise<{ ok: boolean, results: Array, stats: Object }>}
  */
+// 采集前切搜索「排序 / 发布时间」:转发到 content 的 applyBatchSearchFilters(复用「找对标账号」的筛选点击);失败不影响采集
+async function applySearchFiltersInTab(tabId, { sort = '', publishTime = '' } = {}) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: Number(tabId),
+      payload: { action: 'applyBatchSearchFilters', sort, publishTime },
+    });
+    return response?.data ?? null;
+  } catch (error) {
+    return null;
+  }
+}
+
 export async function batchCaptureByKeywords({
   keywords = [],
   platform = '',
   baseSearchUrl = '',
   captureParams = {},
+  searchFilters = null,
   onProgress = null,
   shouldStop = null,
 } = {}) {
@@ -7933,6 +8438,20 @@ export async function batchCaptureByKeywords({
         shouldStop,
         'BATCH_CAPTURE_CANCELED',
       );
+
+      // 按需切换搜索「排序 / 发布时间」(综合 + 不限则跳过);失败不影响继续采集
+      if (searchFilters && (searchFilters.sort || searchFilters.publishTime)) {
+        if (onProgress) {
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'filtering',
+            message: `正在切换排序筛选「${keyword}」(${i + 1}/${keywords.length})...`,
+          });
+        }
+        await applySearchFiltersInTab(runnerTabId, searchFilters);
+      }
 
       if (onProgress) {
         onProgress({
@@ -8060,11 +8579,20 @@ export async function batchCaptureByKeywords({
       finishListCaptureCheckpointSession(checkpointSession);
     }
 
-    // 关键词间随机延迟（最后一个不延迟）
+    // 关键词间随机延迟:分钟级(防风控,见常量注释)。最后一个不延迟。
     if (i < keywords.length - 1) {
       const delay =
-        BATCH_KEYWORD_DELAY_MIN_MS +
-        Math.random() * (BATCH_KEYWORD_DELAY_MAX_MS - BATCH_KEYWORD_DELAY_MIN_MS);
+        BATCH_INTER_KEYWORD_DELAY_MIN_MS +
+        Math.random() *
+          (BATCH_INTER_KEYWORD_DELAY_MAX_MS - BATCH_INTER_KEYWORD_DELAY_MIN_MS);
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: keywords.length,
+          phase: 'inter_keyword_delay',
+          message: `已采「${keyword}」，${Math.round(delay / 1000)} 秒后再搜下一个关键词(防风控·随机间隔)…`,
+        });
+      }
       try {
         await waitMsWithStop(delay, shouldStop, 'BATCH_CAPTURE_CANCELED');
       } catch (error) {

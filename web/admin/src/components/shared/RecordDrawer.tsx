@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
-  ExternalLink, User, FileText, Camera, Bell, Archive, Eye, Sparkles,
+  ExternalLink, User, FileText, Camera, Bell, Archive, Eye, Sparkles, ZoomIn,
 } from 'lucide-react'
 
 // 详情面板可拖宽,停靠右侧(Asana 式)
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { Tooltip } from '@/components/shared/Tooltip'
 
 /**
  * 舆情内容详情抽屉(帖子/评论/官方响应/采集快照 四 tab)。
@@ -30,6 +31,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
   const [observations, setObservations] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [lightbox, setLightbox] = useState<string>('') // 点击放大的图片 URL(''=关闭)
   const panelRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
@@ -49,10 +51,10 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   }, [r.id])
 
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') { if (lightbox) setLightbox(''); else onClose() } }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose])
+  }, [onClose, lightbox])
 
   // 把停靠宽度写入 CSS 变量,主内容据此让出右边
   useEffect(() => {
@@ -97,7 +99,9 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   }
 
   const images = getImages(r)
-  const cover = images[0] || ''
+  // 封面优先用本地化副本(/media,静态可靠、不走代理);只有无本地副本才回落 CDN 代理。
+  // 之前用 images[0]=proxiedImg(cover_url) 总是绕道 /api/img,白白放着 cover_local 不用。
+  const cover = getCover(r) || images[0] || ''
 
   const alerts = Number(r.alert_count || 0)
   const negComments = Number(r.negative_comment_count || 0)
@@ -134,20 +138,22 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
           <div className="border-b border-border/50 p-6">
             <div className="flex gap-4">
               {cover ? (
-                <div className="h-[88px] w-[88px] shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
-                  <img src={cover} alt="" className="h-full w-full object-cover" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).parentElement!.style.display = 'none' }} />
-                </div>
+                <button type="button" onClick={() => setLightbox(cover)} title="点击放大"
+                  className="group relative h-[88px] w-[88px] shrink-0 cursor-zoom-in overflow-hidden rounded-lg border border-border bg-muted">
+                  <img src={cover} alt="" className="h-full w-full object-cover transition group-hover:scale-105" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).parentElement!.style.display = 'none' }} />
+                  <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/25 group-hover:opacity-100"><ZoomIn className="h-4 w-4 text-white" /></span>
+                </button>
               ) : null}
               <div className="min-w-0 flex-1">
                 <div className="mb-2 flex flex-wrap items-center gap-1.5">
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
-                  {(r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)) && (
-                    <span title="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除" className="cursor-help rounded-md bg-violet-500/15 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+                  {identityLabel(r.source_type, r.author_fans, r.author_name) && (
+                    <Tooltip text="疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除"><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(identityLabel(r.source_type, r.author_fans, r.author_name)) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{identityLabel(r.source_type, r.author_fans, r.author_name)}</span></Tooltip>
                   )}
                 </div>
-                <h3 className="text-[15px] font-bold leading-snug">{r.title || '(无标题)'}</h3>
+                <h3 className="text-[15px] font-bold leading-snug">{r.title || String(r.content || '').replace(/\s+/g, ' ').trim().slice(0, 40) || '(无标题)'}</h3>
 
                 {/* Author + links */}
                 <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5">
@@ -156,10 +162,10 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                       {(r.author_name || '?').slice(0, 1)}
                     </div>
                     <span className="text-[13px] font-semibold">{r.author_name || '未知作者'}</span>
-                    {r.blogger_fans_count ? <span className="text-[11px] text-muted-foreground">{formatNumber(r.blogger_fans_count)} 粉丝</span> : null}
+                    <span className="text-[11px] text-muted-foreground">粉丝 {Number(r.author_fans) > 0 ? formatNumber(r.author_fans) : '-'}</span>
                   </div>
                   {r.url && <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
-                  {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted-foreground hover:text-foreground"><User className="h-3.5 w-3.5" />主页</a>}
+                  {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a>}
                   {r.publish_display && <span className="text-[12px] text-muted-foreground">发布于 {r.publish_display}</span>}
                 </div>
               </div>
@@ -170,10 +176,10 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
               <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg bg-status-red/[0.05] px-3 py-2.5 dark:bg-status-red/[0.08]">
                 <span className="text-[11px] font-semibold text-muted-foreground">风险信号</span>
                 {alerts > 0 && (
-                  <span title={r.alert_reasons || '触发预警'} className="inline-flex cursor-help items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span>
+                  <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}><span className="inline-flex cursor-help items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span></Tooltip>
                 )}
                 {negComments > 0 && (
-                  <span className="rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span>
+                  <Tooltip text="该内容下被判为负面/风险的评论条数;下方可查看具体评论"><span className="cursor-help rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span></Tooltip>
                 )}
                 {official === 'responded' && (
                   <span className="inline-flex items-center gap-1 rounded bg-status-green/15 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300"><CheckCircle className="h-3 w-3" />已官方回复</span>
@@ -232,9 +238,11 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                         <h4 className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">图片</h4>
                         <div className="grid grid-cols-3 gap-2">
                           {images.map((url: string, i: number) => (
-                            <div key={i} className="overflow-hidden rounded-lg border border-border bg-muted aspect-square">
-                              <img src={url} alt="" className="h-full w-full object-cover" referrerPolicy="no-referrer" />
-                            </div>
+                            <button type="button" key={i} onClick={() => setLightbox(url)} title="点击放大"
+                              className="group relative aspect-square cursor-zoom-in overflow-hidden rounded-lg border border-border bg-muted">
+                              <img src={url} alt="" className="h-full w-full object-cover transition group-hover:scale-105" referrerPolicy="no-referrer" />
+                              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/25 group-hover:opacity-100"><ZoomIn className="h-4 w-4 text-white" /></span>
+                            </button>
                           ))}
                         </div>
                       </div>
@@ -361,6 +369,17 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
           </div>
         )}
       </div>
+
+      {/* 图片放大 lightbox:页内浮层,点背景 / × / Esc 关闭,不开新窗口 */}
+      {lightbox && (
+        <div onClick={() => setLightbox('')}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-8 animate-in fade-in duration-150">
+          <button type="button" onClick={() => setLightbox('')} title="关闭(Esc)"
+            className="absolute right-5 top-5 rounded-full bg-white/10 p-2 text-white transition hover:bg-white/20"><X className="h-5 w-5" /></button>
+          <img src={lightbox} alt="" referrerPolicy="no-referrer" onClick={e => e.stopPropagation()}
+            className="max-h-[90vh] max-w-[90vw] cursor-default rounded-lg object-contain shadow-2xl" />
+        </div>
+      )}
     </div>
   )
 }
@@ -384,12 +403,16 @@ function InfoTile({ label, value }: { label: string; value: string }) {
 }
 
 export function getCover(r: any): string {
-  if (r.cover_url) return r.cover_url
-  try {
-    const imgs = JSON.parse(r.image_urls || '[]')
-    if (imgs.length) return typeof imgs[0] === 'string' ? imgs[0] : (imgs[0]?.url || '')
-  } catch {}
-  return ''
+  let raw = ''
+  if (r.cover_local) raw = r.cover_local            // 本地化封面(/media),proxiedImg 原样放行
+  else if (r.cover_url) raw = r.cover_url
+  else {
+    try {
+      const imgs = JSON.parse(r.image_urls || '[]')
+      if (imgs.length) raw = typeof imgs[0] === 'string' ? imgs[0] : (imgs[0]?.url || '')
+    } catch {}
+  }
+  return proxiedImg(raw)                             // CDN 图走 /api/img 代理,防直连防盗链刷不出
 }
 
 export function getImages(r: any): string[] {
@@ -402,7 +425,7 @@ export function getImages(r: any): string[] {
       if (url && !urls.includes(url)) urls.push(url)
     }
   } catch {}
-  return urls.filter(u => /^https?:\/\//i.test(u))
+  return urls.filter(u => /^https?:\/\//i.test(u)).map(proxiedImg)
 }
 
 function commentClassifier(comment: any): string {
@@ -515,8 +538,10 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
         <p className="text-sm text-amber-600 dark:text-amber-400">视频直链已过期,需重新采集后再转写。</p>
       ) : status === 'no_media' ? (
         <p className="text-sm text-muted-foreground">该内容无可转写的视频。</p>
+      ) : status === 'no_speech' ? (
+        <p className="text-sm text-muted-foreground">该视频无人声口播,无可转写的逐字稿。</p>
       ) : status === 'failed' ? (
-        <p className="text-sm text-rose-600 dark:text-rose-400">转写失败{error ? `:${error}` : ''}</p>
+        <p className="text-sm text-rose-600 dark:text-rose-400">转写失败:{friendlyError(error)}</p>
       ) : (
         <p className="text-sm text-muted-foreground">尚未生成。点「生成逐字稿」用 AI 提取视频口播文本。</p>
       )}
@@ -536,7 +561,7 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
           {analyzing ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在分析口播内容…</p>
           ) : analyzeError ? (
-            <p className="text-sm text-rose-600 dark:text-rose-400">{analyzeError}</p>
+            <p className="text-sm text-rose-600 dark:text-rose-400">{friendlyError(analyzeError)}</p>
           ) : analysis ? (
             <TranscriptInsights data={analysis} />
           ) : (

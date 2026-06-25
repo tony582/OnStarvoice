@@ -4,6 +4,7 @@
 node_modules/
 
 server/data/
+media/
 server/.env
 server/.env.production
 server/node_modules/

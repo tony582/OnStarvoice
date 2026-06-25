@@ -107,10 +107,64 @@ export function platformName(key: string): string {
   return LABELS.platform[key] || key || '-'
 }
 
-// 账号名疑似品牌关联(经销商/员工/营销号):品牌/车型词 + 角色/营销词 → 非真实车主 UGC
-const KOE_BRAND_RE = /(安吉星|onstar|别克|凯迪拉克|雪佛兰|上汽通用|gl8|昂科威|君威|君越|英朗|威朗|科鲁兹|凯越|探界者|创酷|迈锐宝|cadillac|buick|chevrolet)/i
-const KOE_ROLE_RE = /(4s|店|销售|顾问|客服|服务|经销|官方|导购|试驾|售后|服务生|大话|说车|聊车|玩车|车评|讲车|谈车|解读|百科|严选|优选|学堂|课堂|研究所|资讯|那些事|车事)/i
-export function looksLikeKOEName(name?: string | null): boolean {
-  const n = String(name || '')
-  return KOE_BRAND_RE.test(n) && KOE_ROLE_RE.test(n)
+// 账号名带品牌/车型(全称·简称)= 品牌关联号(非真实车主)。客户口径:名字带品牌车型,不是 4S店 即 KOE。
+// ⚠ 与 server/routes/triage.js 的同名正则保持一致
+const BRAND_MODEL_RE = /(安吉星|onstar|别克|凯迪拉克|凯迪|雪佛兰|buick|cadillac|chevrolet|上汽通用|君越|君威|昂科威|昂科拉|昂科旗|gl8|gl6|英朗|威朗|凯越|微蓝|velite|阅朗|ct4|ct5|ct6|xt4|xt5|xt6|锐歌|lyriq|凯雷德|科鲁兹|科沃兹|迈锐宝|创酷|创界|探界者|开拓者|沃兰多|星迈罗|赛欧|畅巡|景程)/i
+const DEALER_NAME_RE = /(4s|旗舰店|体验中心|服务中心|销售服务|特约|经销|汽贸)/i
+
+// 疑似身份:① 账号名带品牌/车型 → 像门店/经销(或 LLM 判经销)=4S店,否则 =KOE;
+//          ② 名字不带品牌 → 按 LLM source_type:用户(ugc)·KOL 按粉丝分级(KOC<5万/初级<50万/中级<300万/头部≥300万)·4S店·KOE(员工)·其他
+export function identityLabel(sourceType?: string | null, fans?: number | null, name?: string | null): string {
+  const nm = String(name || '')
+  const st = String(sourceType || '')
+  if (BRAND_MODEL_RE.test(nm)) {
+    return (DEALER_NAME_RE.test(nm) || st === 'dealer') ? '4S店' : 'KOE'
+  }
+  if (st === 'dealer') return '4S店'
+  if (st === 'employee') return 'KOE'
+  if (st === 'ugc') return '用户'
+  if (st === 'other') return '其他'
+  if (st === 'pgc') {
+    const f = Number(fans)
+    if (!Number.isFinite(f) || f <= 0) return 'KOL'
+    if (f < 50000) return 'KOC'
+    if (f < 500000) return '初级KOL'
+    if (f < 3000000) return '中级KOL'
+    return '头部KOL'
+  }
+  return ''
+}
+
+// 把后端/第三方的原始技术报错(ASR 码、HTTP 状态、英文异常)映射成中文友好提示,
+// 不向用户暴露 SUCCESS_WITH_NO_VALID_FRAGMENT 之类的技术码;未知错误给通用提示。
+export function friendlyError(raw?: string | null): string {
+  const s = String(raw || '').trim()
+  if (!s) return '出了点问题,请稍后重试'
+  if (/NO_VALID_FRAGMENT|NO_SPEECH|无人声|无有效语音/i.test(s)) return '该视频无人声口播,无可转写内容'
+  if (/403|过期|expired|防盗链/i.test(s)) return '视频直链已过期,需重新采集后再试'
+  if (/下载媒体|FETCH_FAILED|download|拉取.*失败/i.test(s)) return '视频下载失败,可能链接已失效'
+  if (/超时|timeout/i.test(s)) return '处理超时,请稍后重试'
+  if (/api[\s_-]*key|未配置|密钥/i.test(s)) return '服务未配置,请联系管理员'
+  if (/429|rate.?limit|限流|频繁/i.test(s)) return '请求过于频繁,请稍后再试'
+  if (/网络|network|ECONN|fetch failed|ENOTFOUND|socket/i.test(s)) return '网络异常,请稍后重试'
+  if (/无可转写|no_media/i.test(s)) return '该内容没有可转写的视频'
+  // 兜底:不暴露原始技术码
+  return '处理失败,请稍后重试'
+}
+
+// 平台图片(小红书/抖音/微博 CDN)有 Referer 防盗链 + 签名时效,浏览器直连 <img> 有概率 403/刷不出。
+// 统一经服务端 /api/img 代理(带对应 Referer 取图);本站地址(/media 本地化封面、/api/img 等)与非白名单 URL 原样返回,不二次代理。
+// ⚠ 白名单需与 server/routes/image-proxy.js 的 HOST_RULES 保持一致。
+const PROXY_IMG_HOSTS = /(?:\.sinaimg\.(?:cn|com)|\.weiboimg\.(?:cn|com)|\.xhscdn\.com|\.xiaohongshu\.com|\.douyinpic\.com|\.douyinstatic\.com|\.pstatp\.com|\.byteimg\.com|\.bytecdn\.cn|\.bdxiguaimg\.com)$/i
+export function proxiedImg(url?: string | null): string {
+  const s = String(url || '').trim()
+  if (!s) return s
+  try {
+    const u = new URL(s, window.location.origin)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return s
+    if (PROXY_IMG_HOSTS.test(u.hostname)) return `/api/img?url=${encodeURIComponent(u.toString())}`
+  } catch {
+    /* 非法 URL 原样返回 */
+  }
+  return s
 }

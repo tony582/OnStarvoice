@@ -61,7 +61,7 @@ export async function captureDouyinBloggerProfile() {
     const metrics = extractBloggerMetrics(infoRoot);
     const ipLocation = extractIpLocation();
     const accountType = extractBloggerAccountType(infoRoot);
-    const douyinId = extractDouyinId();
+    const douyinId = await extractDouyinIdWithRetry();
 
     const hasMetricSignal =
       metrics.followingCount > 0 ||
@@ -951,6 +951,17 @@ function extractDouyinId() {
   const text = cleanText(document.body?.innerText || "");
   const match = text.match(/抖音号[:：]?\s*([a-zA-Z0-9_-]+)/i);
   return match?.[1] ? cleanText(match[1]) : "";
+}
+
+// 抖音号(「抖音号:xxx」)常比头像/昵称晚渲染(程序化打开主页时尤甚)。
+// 单次提取会落空 → 回退成 sec_uid。这里轮询等待,直到出现或超时(~6 秒)。
+async function extractDouyinIdWithRetry(maxAttempts = 12, delayMs = 500) {
+  let id = extractDouyinId();
+  for (let attempt = 0; attempt < maxAttempts && !id; attempt += 1) {
+    await wait(delayMs);
+    id = extractDouyinId();
+  }
+  return id;
 }
 
 const MONITOR_PROFILE_DAY_MS = 24 * 60 * 60 * 1000;

@@ -12,6 +12,84 @@ const SENTIMENT_CN = { positive: '正面', neutral: '中性', negative: '负面'
 const TRIAGE_STATUS_CN = { unhandled: '待处理', reviewing: '处理中', issue_linked: '已关联事件', archived: '已归档', false_positive: '误报', official_responded: '官方已响应' };
 const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
 const CATEGORY_CN = { safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费', privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量', brand_image: '品牌形象', other: '其他' };
+const NOTE_TYPE_CN = { image: '图文', video: '视频', normal: '图文' };
+// 账号名带品牌/车型(全称·简称)= 品牌关联号(非真实车主)。⚠ 与 web/admin utils.ts 的同名正则保持一致。
+const BRAND_MODEL_RE = /(安吉星|onstar|别克|凯迪拉克|凯迪|雪佛兰|buick|cadillac|chevrolet|上汽通用|君越|君威|昂科威|昂科拉|昂科旗|gl8|gl6|英朗|威朗|凯越|微蓝|velite|阅朗|ct4|ct5|ct6|xt4|xt5|xt6|锐歌|lyriq|凯雷德|科鲁兹|科沃兹|迈锐宝|创酷|创界|探界者|开拓者|沃兰多|星迈罗|赛欧|畅巡|景程)/i;
+const DEALER_NAME_RE = /(4s|旗舰店|体验中心|服务中心|销售服务|特约|经销|汽贸)/i;
+
+// 疑似身份:① 账号名带品牌/车型 → 像门店/经销(或 LLM 判经销)=4S店,否则 =KOE;
+//          ② 名字不带品牌 → 按 LLM source_type;pgc(KOL)按粉丝分级(KOC<5万/初级<50万/中级<300万/头部≥300万)。空值导出「未判定」。
+function identityLabel(sourceType, fans, name) {
+  const nm = String(name || '');
+  const st = String(sourceType || '');
+  if (BRAND_MODEL_RE.test(nm)) {
+    return (DEALER_NAME_RE.test(nm) || st === 'dealer') ? '4S店' : 'KOE';
+  }
+  if (st === 'dealer') return '4S店';
+  if (st === 'employee') return 'KOE';
+  if (st === 'ugc') return '用户';
+  if (st === 'other') return '其他';
+  if (st === 'pgc') {
+    const f = Number(fans);
+    if (!Number.isFinite(f) || f <= 0) return 'KOL';
+    if (f < 50000) return 'KOC';
+    if (f < 500000) return '初级KOL';
+    if (f < 3000000) return '中级KOL';
+    return '头部KOL';
+  }
+  return '未判定';
+}
+
+// 内部 ID(非「人看的号」):小红书 24 位 hex user_id / 抖音 sec_uid(MS4w 开头)。
+// 这些不是小红书号/抖音号,导出绝不能冒充成用户ID(此前 bug:存量记录把它们当号导出)。
+// 微博 /u/{uid} 是纯数字公开 uid(人能搜),保留。
+function isInternalUid(v) {
+  const s = String(v || '').trim();
+  if (!s) return true;
+  if (/^[0-9a-f]{24}$/i.test(s)) return true; // 小红书内部 user_id
+  if (/^MS4w/i.test(s)) return true; // 抖音 sec_uid
+  return false;
+}
+
+// 平台用户ID:只显示「人看的真号」(小红书号/抖音号)——可能在 account_no 列,也可能在
+// payload 的 bloggerId/douyinId/redId 里。没有真号就留空,绝不退回内部 hex/sec_uid 假ID。
+// (按用户要求:只留真ID,假ID一律不显示。)author_id / profileUrl 参数保留兼容调用,不再用作兜底。
+function platformUserId(authorId, profileUrl, accountNo, payloadNo) {
+  for (const cand of [accountNo, payloadNo]) {
+    const v = String(cand || '').trim();
+    if (v && !isInternalUid(v)) return v; // 真·人看的号(最准)
+  }
+  return ''; // 没有真号 → 空,不显示假ID
+}
+
+// 帖子链接:优先用采到的真实帖子URL(含 xsec_token,可直接打开);若那其实是主页/缺失,用 external_id 按平台重建。
+function isNoteUrl(u) {
+  const s = String(u || '');
+  if (/\/user\/profile\/|\/user\//.test(s)) return false; // 主页不是帖子
+  return /\/explore\/|\/discovery\/item\/|\/note\/|\/video\/|weibo\.com\/detail\/|m\.weibo\.cn\/|\/search_result\//.test(s);
+}
+// 小红书笔记链接缺非空 xsec_source 会被判 300013(访问频繁)。导出/原文链接补上 pc_search,
+// token 不动即可正常打开(与采集端 ensureXhsNoteUrlSource 同理)。
+function fixXhsNoteSource(u) {
+  const raw = String(u || '');
+  if (!/xiaohongshu\.com/.test(raw)) return raw;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.searchParams.get('xsec_token') && !parsed.searchParams.get('xsec_source')) {
+      parsed.searchParams.set('xsec_source', 'pc_search');
+    }
+    return parsed.toString();
+  } catch { return raw; }
+}
+function postUrl(r) {
+  if (isNoteUrl(r.url)) return fixXhsNoteSource(r.url);
+  const id = String(r.external_id || '').trim();
+  if (!id) return r.url || '';
+  if (r.platform === 'xiaohongshu') return `https://www.xiaohongshu.com/explore/${id}`;
+  if (r.platform === 'douyin') return r.note_type === 'image' ? `https://www.douyin.com/note/${id}` : `https://www.douyin.com/video/${id}`;
+  if (r.platform === 'weibo') return `https://weibo.com/detail/${id}`;
+  return r.url || '';
+}
 
 const TRIAGE_STATUSES = new Set(['unhandled', 'reviewing', 'issue_linked', 'official_responded', 'archived', 'false_positive']);
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
@@ -55,7 +133,38 @@ function orderBySql(sort, dir) {
   const d = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   if (sort === 'publish') return `r.published_ts ${d} NULLS LAST, r.last_seen_at DESC`;
   if (sort === 'interactions') return `(r.likes + r.comments_count + r.collects + r.shares) ${d} NULLS LAST, r.published_ts DESC NULLS LAST`;
+  if (sort === 'first_seen') return `r.first_seen_at ${d} NULLS LAST, r.last_seen_at DESC`;
+  if (sort === 'last_seen') return `r.last_seen_at ${d} NULLS LAST, r.first_seen_at DESC`;
   return riskOrderSql();
+}
+
+// 风险信号多选筛选(有预警 / 有负评),命中任一即入选(OR)。条件为字面 SQL,不绑定参数。
+// 注:作者身份(原"疑似KOE")已从风险信号拆出,改为独立的「疑似身份」维度(见 identityWhereClause)。
+function riskWhereClause(reqRisk) {
+  const risks = (Array.isArray(reqRisk) ? reqRisk : String(reqRisk || '').split(','))
+    .map((s) => String(s).trim()).filter(Boolean);
+  const clauses = [];
+  if (risks.includes('alert')) clauses.push(`EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`);
+  if (risks.includes('negative')) clauses.push(`r.negative_comment_count > 0`);
+  return clauses.length ? ` AND (${clauses.join(' OR ')})` : '';
+}
+
+// 疑似身份多选筛选:与 identityLabel 同口径,SQL 里按 (author_name, source_type) 推导。
+// 正则是字面 SQL(无用户输入),id 经白名单映射,无注入风险。
+function identityWhereClause(reqIdentity) {
+  const ids = (Array.isArray(reqIdentity) ? reqIdentity : String(reqIdentity || '').split(','))
+    .map((s) => String(s).trim()).filter(Boolean);
+  const brand = `(COALESCE(r.author_name,'') ~* '${BRAND_MODEL_RE.source}')`;
+  const dealerName = `(COALESCE(r.author_name,'') ~* '${DEALER_NAME_RE.source}')`;
+  const SQL = {
+    dealer: `((${brand} AND (${dealerName} OR r.source_type = 'dealer')) OR (NOT ${brand} AND r.source_type = 'dealer'))`,
+    koe: `((${brand} AND NOT (${dealerName} OR r.source_type = 'dealer')) OR (NOT ${brand} AND r.source_type = 'employee'))`,
+    user: `(NOT ${brand} AND r.source_type = 'ugc')`,
+    kol: `(NOT ${brand} AND r.source_type = 'pgc')`,
+    other: `(NOT ${brand} AND r.source_type = 'other')`,
+  };
+  const clauses = ids.map((id) => SQL[id]).filter(Boolean);
+  return clauses.length ? ` AND (${clauses.join(' OR ')})` : '';
 }
 
 router.get('/records', requireTenantAccess, async (req, res, next) => {
@@ -90,20 +199,13 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     }
-    // 风险信号筛选(B 端:一键圈出有预警 / 有负评 / 疑似 KOE 的内容)
-    const risk = String(req.query.risk || '');
-    if (risk === 'alert') {
-      where += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`;
-    } else if (risk === 'negative') {
-      where += ` AND r.negative_comment_count > 0`;
-    } else if (risk === 'koe') {
-      where += ` AND r.source_type IN ('employee', 'dealer')`;
-    }
+    // 风险信号多选筛选(B 端:圈出有预警 / 有负评 / 疑似 KOE 的内容,命中任一即入选)
+    where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
       const kw = `%${keyword}%`;
-      params.push(kw, kw, kw);
-      where += ` AND (r.title ILIKE $${params.length - 2} OR r.content ILIKE $${params.length - 1} OR r.keyword ILIKE $${params.length})`;
+      params.push(kw, kw, kw, kw, kw, kw);
+      where += ` AND (r.title ILIKE $${params.length - 5} OR r.content ILIKE $${params.length - 4} OR r.keyword ILIKE $${params.length - 3} OR r.author_name ILIKE $${params.length - 2} OR r.author_account_no ILIKE $${params.length - 1} OR r.author_id ILIKE $${params.length})`;
     }
     // 采集关键词多选(每个关键词=一次采集 session)
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
@@ -112,6 +214,15 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(captureKeywords);
       where += ` AND r.keyword = ANY($${params.length}::text[])`;
     }
+    where += identityWhereClause(req.query.identity);
+    // 按采集时间(首次发现)区间导出/筛选,避免 Excel 越积越大;仅接受 YYYY-MM-DD
+    const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || '')) ? req.query.dateFrom : '';
+    const dTo = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateTo || '')) ? req.query.dateTo : '';
+    // 日期维度可切换:发布时间(published_ts,默认)/ 最近采集(last_seen_at)/ 首次采集(first_seen_at)。列名白名单,无注入
+    const dbasis = String(req.query.dateBasis || 'publish');
+    const dateCol = dbasis === 'first' ? 'r.first_seen_at' : dbasis === 'recent' ? 'r.last_seen_at' : 'r.published_ts';
+    if (dFrom) { params.push(dFrom); where += ` AND ${dateCol} >= $${params.length}::date`; }
+    if (dTo) { params.push(dTo); where += ` AND ${dateCol} < ($${params.length}::date + INTERVAL '1 day')`; }
 
     const total = (await queryOne(`
       SELECT COUNT(*) AS total
@@ -126,7 +237,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     const records = await queryAll(`
       SELECT
         r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
-        r.author_fans, r.url, r.cover_url, r.image_urls, r.note_type,
+        r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.note_type,
         r.publish_time, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,
@@ -363,19 +474,12 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     }
-    const risk = String(req.query.risk || '');
-    if (risk === 'alert') {
-      where += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id)`;
-    } else if (risk === 'negative') {
-      where += ` AND r.negative_comment_count > 0`;
-    } else if (risk === 'koe') {
-      where += ` AND r.source_type IN ('employee', 'dealer')`;
-    }
+    where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     if (keyword) {
       const kw = `%${keyword}%`;
-      params.push(kw, kw, kw);
-      where += ` AND (r.title ILIKE $${params.length - 2} OR r.content ILIKE $${params.length - 1} OR r.keyword ILIKE $${params.length})`;
+      params.push(kw, kw, kw, kw, kw, kw);
+      where += ` AND (r.title ILIKE $${params.length - 5} OR r.content ILIKE $${params.length - 4} OR r.keyword ILIKE $${params.length - 3} OR r.author_name ILIKE $${params.length - 2} OR r.author_account_no ILIKE $${params.length - 1} OR r.author_id ILIKE $${params.length})`;
     }
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
       .map(s => String(s).trim()).filter(Boolean);
@@ -383,10 +487,26 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       params.push(captureKeywords);
       where += ` AND r.keyword = ANY($${params.length}::text[])`;
     }
+    where += identityWhereClause(req.query.identity);
+    // 按采集时间(首次发现)区间导出/筛选,避免 Excel 越积越大;仅接受 YYYY-MM-DD
+    const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || '')) ? req.query.dateFrom : '';
+    const dTo = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateTo || '')) ? req.query.dateTo : '';
+    // 日期维度可切换:发布时间(published_ts,默认)/ 最近采集(last_seen_at)/ 首次采集(first_seen_at)。列名白名单,无注入
+    const dbasis = String(req.query.dateBasis || 'publish');
+    const dateCol = dbasis === 'first' ? 'r.first_seen_at' : dbasis === 'recent' ? 'r.last_seen_at' : 'r.published_ts';
+    if (dFrom) { params.push(dFrom); where += ` AND ${dateCol} >= $${params.length}::date`; }
+    if (dTo) { params.push(dTo); where += ` AND ${dateCol} < ($${params.length}::date + INTERVAL '1 day')`; }
 
     const records = await queryAll(`
       SELECT
-        r.keyword, r.platform, r.title, r.content, r.author_name, r.author_fans, r.url,
+        r.keyword, r.platform, r.title, r.content, r.author_name, r.author_fans,
+        r.author_id, r.author_account_no, r.blogger_profile_url, r.note_type, r.source_type, r.url, r.external_id,
+        COALESCE(
+          NULLIF(r.payload->>'bloggerUserId',''), NULLIF(r.payload->>'redId',''),
+          NULLIF(r.payload->>'douyinId',''), NULLIF(r.payload->>'bloggerId',''),
+          NULLIF(r.payload->'detailPayload'->>'bloggerUserId',''), NULLIF(r.payload->'detailPayload'->>'redId',''),
+          NULLIF(r.payload->'detailPayload'->>'douyinId',''), NULLIF(r.payload->'detailPayload'->>'bloggerId','')
+        ) AS payload_account_no,
         r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
         r.negative_comment_count, r.publish_time, r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
@@ -394,18 +514,22 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       ${where}
-      ORDER BY r.first_seen_at DESC NULLS LAST
+      ORDER BY ${orderBySql(req.query.sort, req.query.dir)}
       LIMIT 5000
     `, params);
 
     const rows = records.map(r => ({
       keyword: r.keyword,
       platform: PLATFORM_CN[r.platform] || r.platform || '',
-      title: r.title,
+      title: r.title || String(r.content || '').replace(/\s+/g, ' ').trim().slice(0, 80),
       content: String(r.content || '').slice(0, 1000),
       author_name: r.author_name,
       author_fans: r.author_fans,
-      url: r.url,
+      author_uid: platformUserId(r.author_id, r.blogger_profile_url, r.author_account_no, r.payload_account_no),
+      blogger_url: r.blogger_profile_url || '',
+      identity: identityLabel(r.source_type, r.author_fans, r.author_name),
+      note_type: NOTE_TYPE_CN[r.note_type] || '',
+      url: postUrl(r),
       likes: r.likes,
       comments_count: r.comments_count,
       collects: r.collects,
@@ -425,11 +549,15 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     const columns = [
       { header: '采集关键词', key: 'keyword', width: 18 },
       { header: '平台', key: 'platform', width: 10 },
+      { header: '发布形式', key: 'note_type', width: 10 },
       { header: '标题', key: 'title', width: 40 },
       { header: '正文', key: 'content', width: 50 },
       { header: '博主', key: 'author_name', width: 16 },
       { header: '粉丝数', key: 'author_fans', width: 10 },
-      { header: '链接', key: 'url', width: 30 },
+      { header: '用户ID', key: 'author_uid', width: 22 },
+      { header: '博主主页', key: 'blogger_url', width: 32 },
+      { header: '疑似身份', key: 'identity', width: 12 },
+      { header: '帖子链接', key: 'url', width: 34 },
       { header: '点赞', key: 'likes', width: 8 },
       { header: '评论数', key: 'comments_count', width: 8 },
       { header: '收藏', key: 'collects', width: 8 },

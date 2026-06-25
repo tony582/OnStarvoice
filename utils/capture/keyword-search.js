@@ -564,7 +564,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
 
   items.forEach((item, index) => {
     try {
-      const noteUrl = extractNoteUrlFromCard(item);
+      const noteUrl = ensureXhsNoteUrlSource(extractNoteUrlFromCard(item));
       if (!noteUrl) {
         return;
       }
@@ -955,15 +955,26 @@ function looksLikePublishDate(text) {
   const normalized = cleanText(text || "");
   if (!normalized) return false;
 
-  return (
-    /^\d{4}[./-]\d{1,2}[./-]\d{1,2}$/.test(normalized) ||
-    /^\d{1,2}[./-]\d{1,2}$/.test(normalized) ||
+  // 相对时间
+  if (
     /^\d+\s*分钟前$/.test(normalized) ||
     /^\d+\s*小时前$/.test(normalized) ||
     /^\d+\s*天前$/.test(normalized) ||
     normalized === "刚刚" ||
     normalized === "昨天"
-  );
+  ) {
+    return true;
+  }
+
+  // 绝对日期必须校验 月1-12 / 日1-31，否则价格、比率(如 "17.99"、"12/50")会被误当成日期
+  let m = normalized.match(/^\d{4}[./-](\d{1,2})[./-](\d{1,2})$/);
+  if (!m) m = normalized.match(/^(\d{1,2})[./-](\d{1,2})$/);
+  if (m) {
+    const month = Number(m[1]);
+    const day = Number(m[2]);
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+  }
+  return false;
 }
 
 function pickDateTextCandidate(candidates) {
@@ -1410,6 +1421,25 @@ function pickBestAuthorProfileUrl(candidates = []) {
   return (
     normalizedCandidates.find((url) => isXiaohongshuAuthorProfileUrl(url)) || ""
   );
+}
+
+// 小红书笔记 URL 必须带非空 xsec_source(搜索卡片是 pc_search)。卡片 href 里这个值常是空的,
+// 空 source 直开会被判 300013(访问频繁)。采集即补齐,保证存库/导出「帖子链接」「原文」都能开。
+function ensureXhsNoteUrlSource(url) {
+  const raw = String(url || "");
+  if (!raw) return raw;
+  try {
+    const u = new URL(raw, window.location.href);
+    const host = u.hostname.toLowerCase();
+    if (host !== "xiaohongshu.com" && !host.endsWith(".xiaohongshu.com")) return raw;
+    if (!/\/(?:explore|search_result|discovery\/item|note|video)\/[A-Za-z0-9_-]+/.test(u.pathname)) return raw;
+    if (u.searchParams.get("xsec_token") && !u.searchParams.get("xsec_source")) {
+      u.searchParams.set("xsec_source", "pc_search");
+    }
+    return u.toString();
+  } catch {
+    return raw;
+  }
 }
 
 function scoreNoteUrl(url) {

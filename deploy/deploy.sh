@@ -23,7 +23,7 @@ if [ ! -f "$ROOT/server/.env.production" ]; then
 fi
 
 echo "▶ 同步后端 + admin 产物 + images 到 $SERVER:$APP_DIR …"
-ssh "root@$SERVER" "mkdir -p $APP_DIR/server $APP_DIR/web/admin/dist $APP_DIR/images"
+ssh "root@$SERVER" "mkdir -p $APP_DIR/server $APP_DIR/web/admin/dist $APP_DIR/images $APP_DIR/media/covers"
 rsync -avz --delete --exclude node_modules --exclude '.env' "$ROOT/server/"          "root@$SERVER:$APP_DIR/server/"
 rsync -avz --delete                                          "$ROOT/web/admin/dist/" "root@$SERVER:$APP_DIR/web/admin/dist/"
 rsync -avz --delete                                          "$ROOT/images/"         "root@$SERVER:$APP_DIR/images/"

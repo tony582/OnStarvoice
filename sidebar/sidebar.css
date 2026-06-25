@@ -4370,6 +4370,21 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   color: var(--text-tertiary);
 }
 
+/* 批量弹窗内的细粒度采集明细(探测/筛选/防反爬等待),合并自外部蓝色进度条 */
+.keyword-batch-progress-detail {
+  margin-top: 6px;
+  padding: 7px 10px;
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--theme-primary);
+  background: var(--theme-primary-light);
+  border-radius: var(--radius-md);
+  word-break: break-word;
+}
+.keyword-batch-progress-detail[hidden] {
+  display: none;
+}
+
 /* Batch trigger button & action row */
 .action-row {
   display: flex;
@@ -4637,4 +4652,110 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
 }
 .keyword-expand-input-row .form-input {
   flex: 1;
+}
+
+/* 批量弹窗 — 采集设置(排序/发布时间 + 无人值守循环),统一卡片风格 */
+.batch-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.batch-settings-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--bg-main);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+}
+.batch-settings-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.batch-settings-sub {
+  font-weight: 400;
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+.batch-field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.batch-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.batch-field > span {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+.batch-select,
+.batch-num-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  background: #fff;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  transition: border-color 0.2s;
+}
+.batch-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 7px 30px 7px 10px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.batch-num-input {
+  padding: 7px 10px;
+}
+.batch-select:hover,
+.batch-num-input:hover {
+  border-color: #c7ccd9;
+}
+.batch-select:focus,
+.batch-num-input:focus {
+  outline: none;
+  border-color: var(--theme-primary);
+}
+.batch-num-input::placeholder {
+  color: var(--text-tertiary);
+}
+.batch-loop-toggle {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+}
+.batch-loop-toggle input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--theme-primary);
+  cursor: pointer;
+}
+.batch-loop-toggle-text {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.batch-loop-fields {
+  transition: opacity 0.2s;
+}
+.batch-loop-fields.is-disabled {
+  opacity: 0.45;
+  pointer-events: none;
 }

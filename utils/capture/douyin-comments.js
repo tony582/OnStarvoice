@@ -393,6 +393,39 @@ export async function captureDouyinComments({
       captureContext,
     });
     if (!commentContainer) {
+      // 图文常见:评论容器在 DOM 里但折叠/不可见,靠"可见性"门控的查找拿不到 → 误报"采集失败"。
+      // 严格正向判定"确证零评论"(全页 0 评论项 且 抖音自身空态标记 抢首评/暂无评论)才干净返回 0 条;
+      // 不满足(=可能有评论只是这次没找到)仍抛错走重试,绝不把真有评论的吞成空。
+      if (detectDouyinConfirmedEmptyComments()) {
+        setCommentOpenStrategy(captureContext, "confirmed_empty_no_comments");
+        const emptyDiagnostics = buildCommentCaptureDiagnostics(captureContext);
+        return {
+          ok: true,
+          type: SYNC_TYPE.COMMENTS,
+          data: {
+            noteId,
+            noteUrl: window.location.href,
+            noteTitle: resolveNoteTitle(),
+            totalCount: 0,
+            items: [],
+            captureTimestamp: Date.now(),
+            captureStatus: "done",
+            stoppedByUser: false,
+            stopReason: "no_comments",
+          },
+          meta: {
+            pageType: PAGE_TYPE.NOTE_DETAIL,
+            captureStartedAt,
+            captureFinishedAt: new Date().toISOString(),
+            captureStatus: "done",
+            stoppedByUser: false,
+            scene,
+            diagnostics: emptyDiagnostics,
+          },
+          diagnostics: {stageTrace: []},
+          error: null,
+        };
+      }
       throw new Error("无法找到评论区容器");
     }
 
@@ -3983,6 +4016,28 @@ function findEmptyCommentStateNode(scope) {
       return /^(暂无评论|还没有评论|暂时没有评论)$/.test(text);
     }) || null
   );
+}
+
+// 确证「零评论」——只用正向信号,且两重缺一不可:
+//   ① 全页找不到任何评论项(comment-item / comment-id / class*=comment-item);
+//   ② 出现抖音自身的空评论标记(抢首评/抢沙发=只在 0 评论时出现的"抢首评"按钮,或 暂无评论 占位)。
+// 实测两条真·零评论图文都满足:抢首评恒 true(可靠),暂无评论偶发(占位会闪,故只作补充信号)。
+// 有评论的帖永远不会同时满足:有评论项 → ①不成立;有评论时抖音不显示抢首评/暂无评论 → ②不成立。
+// 因此绝不会把"有评论只是这次没找到容器"误吞成 0。
+function detectDouyinConfirmedEmptyComments() {
+  try {
+    if (
+      document.querySelector(
+        '[data-e2e="comment-item"],[data-comment-id],[class*="comment-item"]',
+      )
+    ) {
+      return false; // 页面里已有评论项 → 不是空,绝不短路
+    }
+    const bodyText = cleanText(document.body?.innerText || "");
+    return /抢首评|抢沙发|暂无评论|还没有评论|暂时没有评论/.test(bodyText);
+  } catch {
+    return false;
+  }
 }
 
 function queryAllWithin(context, selectors) {

@@ -288,6 +288,7 @@ let batchUrlCancelRequested = false;
 let batchUrlCaptureMode = "";
 let batchKeywordCaptureInFlight = false;
 let batchKeywordCancelRequested = false;
+let searchCaptureCancelRequested = false;
 let activeBatchRunnerTabId = null;
 let monitorRunInFlight = false;
 let monitorRunCancelRequested = false;
@@ -318,7 +319,7 @@ let lastKnownPagePlatform = "unknown";
 let currentUpdateNoticeState = null;
 const KEYWORD_ANALYSIS_STALE_LOCK_MS =
   DEFAULT_CONFIG.KEYWORD_ANALYSIS_TIMEOUT + 5000;
-const MAX_BATCH_KEYWORDS = 10;
+const MAX_BATCH_KEYWORDS = 30;
 const EYE_ICON = `
 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
   <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path>
@@ -2493,6 +2494,14 @@ function setupUIEventListeners() {
       );
     });
   document
+    .querySelectorAll('[data-detail-setting="skip-captured"]')
+    .forEach((input) => {
+      input.addEventListener(
+        "change",
+        handleDetailCaptureSkipCapturedToggleChange,
+      );
+    });
+  document
     .querySelectorAll('[data-detail-setting="comment-leads"]')
     .forEach((input) => {
       input.addEventListener(
@@ -2641,6 +2650,28 @@ function setupUIEventListeners() {
   document
     .getElementById("btnRunBatchKeywords")
     ?.addEventListener("click", handleBatchKeywordCapture);
+  // 无人值守循环:勾选才点亮「每轮间隔 / 循环轮数」输入
+  // 勾选「无人值守循环」才点亮对应的「每轮间隔 / 循环轮数」(批量 + 搜索页各一组,按 id 精确定位,避免互相串)
+  const bindAutoLoopFields = (chkId, fieldsId) => {
+    const chk = document.getElementById(chkId);
+    const sync = () =>
+      document.getElementById(fieldsId)?.classList.toggle("is-disabled", !chk?.checked);
+    chk?.addEventListener("change", sync);
+    sync();
+  };
+  bindAutoLoopFields("chkAutoLoop", "batchLoopFields");
+  bindAutoLoopFields("chkSearchAutoLoop", "searchLoopFields");
+  // 搜索页「批量多个关键词」开关:切换 单词自动读取 / 多词文本框 + 按钮文案
+  const chkSearchBatchEl = document.getElementById("chkSearchBatchMode");
+  const syncSearchBatchMode = () => {
+    const on = !!chkSearchBatchEl?.checked;
+    document.getElementById("searchSingleKeywordGroup")?.toggleAttribute("hidden", on);
+    document.getElementById("searchBatchKeywordGroup")?.toggleAttribute("hidden", !on);
+    const capBtn = document.getElementById("btnCaptureSearch");
+    if (capBtn) capBtn.textContent = on ? "批量采集" : "采集当前搜索结果";
+  };
+  chkSearchBatchEl?.addEventListener("change", syncSearchBatchMode);
+  syncSearchBatchMode();
   document
     .getElementById("keywordInsightError")
     ?.addEventListener("click", (event) => {
@@ -3258,6 +3289,27 @@ async function handleCaptureBloggerData() {
   }
 }
 
+// 搜索页:在当前激活 tab 应用排序/发布时间筛选(复用 content 的 applyBatchSearchFilters,失败不阻断采集)
+async function applySearchFiltersOnActiveTab(tabId, { sort = "", publishTime = "" } = {}) {
+  if ((!sort && !publishTime) || !Number.isFinite(Number(tabId))) return;
+  try {
+    await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: Number(tabId),
+      payload: { action: "applyBatchSearchFilters", sort, publishTime },
+    });
+  } catch (error) {
+    console.warn("[Sidebar] 搜索页筛选切换失败(不影响采集):", error);
+  }
+}
+
+function getSearchBatchKeywordsFromTextarea() {
+  return String(document.getElementById("textareaSearchBatchKeywords")?.value || "")
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 async function handleCaptureSearchData() {
   const runtime = getCurrentRuntime();
   const selectedPlatform = getViewPlatform(runtime);
@@ -3282,22 +3334,43 @@ async function handleCaptureSearchData() {
   }
 
   let activeTabUrl = runtime?.lastPageUrl || "";
+  let searchActiveTabId = null;
   try {
     const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
     if (tab?.url) {
       activeTabUrl = tab.url;
     }
+    if (tab?.id != null) searchActiveTabId = tab.id;
   } catch {
     // ignore and fallback to runtime url
   }
 
-  const keyword = extractKeywordFromUrl(activeTabUrl);
-  if (!keyword) {
-    showMessage(
-      "当前页面未检测到关键词。请先在搜索页输入关键词并点击搜索后再采集",
-      "warning",
-    );
-    return;
+  // 批量多词模式:从文本框读多个关键词;否则单词:从当前搜索页读
+  const searchBatchMode = !!document.getElementById("chkSearchBatchMode")?.checked;
+  let searchKeywords = [];
+  let keyword = "";
+  if (searchBatchMode) {
+    const rawKw = getSearchBatchKeywordsFromTextarea();
+    if (rawKw.length === 0) {
+      showMessage("请输入至少一个关键词（每行一个）", "warning");
+      return;
+    }
+    if (rawKw.length > MAX_BATCH_KEYWORDS) {
+      showMessage(`单次最多批量采集 ${MAX_BATCH_KEYWORDS} 个关键词`, "warning");
+      return;
+    }
+    searchKeywords = dedupeKeywords(rawKw);
+    keyword = searchKeywords[0];
+  } else {
+    keyword = extractKeywordFromUrl(activeTabUrl);
+    if (!keyword) {
+      showMessage(
+        "当前页面未检测到关键词。请先在搜索页输入关键词并点击搜索后再采集",
+        "warning",
+      );
+      return;
+    }
+    searchKeywords = [keyword];
   }
 
   const taskContext = beginSidebarTask({
@@ -3337,40 +3410,153 @@ async function handleCaptureSearchData() {
       settings.keywordMaxDetectedItems,
     );
 
-    const actionResult = await runCaptureAction({
-      mode: "keyword",
-      captureParams: {
-        keyword,
-        minLikes: keywordMinLikes,
-        sortDimension: sortContext.dimension,
-        maxDetectedItems: keywordMaxDetectedItems,
-        waitMinMs: settings.sharedWaitMinMs,
-        waitMaxMs: settings.sharedWaitMaxMs,
-        stallTimeoutMs: settings.sharedStallTimeoutMs,
-        maxDurationMs: settings.sharedMaxDurationMs,
-      },
-      progressMessage: keyword
-        ? `正在采集搜索结果（关键词：${keyword}）...`
-        : "正在采集搜索结果...",
-      successMessage: `搜索笔记采集成功，已加入缓存池（${sortLabel}≥${keywordMinLikes}，探测上限 ${keywordMaxDetectedItems}）`,
-      keepProgressOpen: true,
-    });
+    // 搜索页:排序/发布时间筛选 + 循环轮数 + 定时启动(复用批量那套能力)
+    searchCaptureCancelRequested = false;
+    const rawSearchSort = document.getElementById("selectSearchSort")?.value || "";
+    const rawSearchTime = document.getElementById("selectSearchPublishTime")?.value || "";
+    const searchFilters = {
+      sort: rawSearchSort === "comprehensive" ? "" : rawSearchSort,
+      publishTime: rawSearchTime === "all" ? "" : rawSearchTime,
+    };
+    const searchAutoLoop = !!document.getElementById("chkSearchAutoLoop")?.checked;
+    const searchGapMin = Math.max(0, Number(document.getElementById("inputSearchLoopGapMin")?.value) || 0);
+    const searchMaxRounds = Math.max(1, Math.floor(Number(document.getElementById("inputSearchLoopRounds")?.value)) || 1);
+    const searchGapMs = searchGapMin * 60 * 1000;
 
-    if (actionResult?.ok) {
-      const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
-        resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
-        {
-          sourceLabel: "搜索结果",
-          recordIds: actionResult.recordIds,
-        },
-      );
-      if (enhanceResult?.canceled) {
-        taskStatus = "partial";
-      } else if (enhanceResult && enhanceResult.ok === false) {
-        taskStatus = "completed_with_failures";
+    // 定时启动:等到指定时刻再开跑(可中断,显倒计时)
+    const searchScheduledStr = document.getElementById("inputSearchScheduledStart")?.value || "";
+    if (searchScheduledStr) {
+      const targetMs = new Date(searchScheduledStr).getTime();
+      if (Number.isFinite(targetMs) && targetMs > Date.now()) {
+        const targetLabel = new Date(searchScheduledStr).toLocaleString("zh-CN");
+        let lastSec = -1;
+        await sleepWithStop(targetMs - Date.now(), () => {
+          if (searchCaptureCancelRequested) return true;
+          const remain = Math.max(0, Math.ceil((targetMs - Date.now()) / 1000));
+          if (remain !== lastSec) {
+            lastSec = remain;
+            const h = Math.floor(remain / 3600);
+            const m = Math.floor((remain % 3600) / 60);
+            const s = remain % 60;
+            showProgress(`⏰ 定时采集:将于 ${targetLabel} 开始(还剩 ${h > 0 ? h + "时" : ""}${m}分${s}秒)`, "info");
+          }
+          return false;
+        });
+        if (searchCaptureCancelRequested) {
+          taskStatus = "skipped";
+          showMessage("已取消定时采集", "warning");
+          return;
+        }
       }
-    } else {
-      taskStatus = "failed";
+    }
+
+    let searchRound = 0;
+    do {
+      searchRound += 1;
+      if (searchBatchMode) {
+        // 批量多词:逐词在 runner tab(=当前 tab)采,排序/发布时间由 batchCaptureByKeywords 内部逐词应用
+        activeBatchRunnerTabId = searchActiveTabId ? Number(searchActiveTabId) : null;
+        const batchResult = await batchCaptureByKeywords({
+          keywords: [...searchKeywords],
+          platform: pagePlatform,
+          baseSearchUrl: activeTabUrl,
+          searchFilters,
+          captureParams: {
+            minLikes: keywordMinLikes,
+            sortDimension: sortContext.dimension,
+            maxDetectedItems: keywordMaxDetectedItems,
+            waitMinMs: settings.sharedWaitMinMs,
+            waitMaxMs: settings.sharedWaitMaxMs,
+            stallTimeoutMs: settings.sharedStallTimeoutMs,
+            maxDurationMs: settings.sharedMaxDurationMs,
+          },
+          onProgress: (p) =>
+            showProgress(
+              searchAutoLoop
+                ? `第 ${searchRound} 轮 · ${p?.message || ""}`
+                : p?.message || "正在批量采集...",
+              "info",
+            ),
+          shouldStop: () => searchCaptureCancelRequested,
+        });
+        await refreshDataPool();
+        if (batchResult?.canceled) {
+          taskStatus = "partial";
+          searchCaptureCancelRequested = true;
+        } else {
+          const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
+            resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
+            { sourceLabel: "批量搜索结果", recordIds: collectBatchRecordIds(batchResult) },
+          );
+          if (enhanceResult?.securityBlocked) {
+            // 撞小红书风控:停掉整轮无人值守,别再往下跑(越跑越死)
+            searchCaptureCancelRequested = true;
+            taskStatus = "partial";
+            showMessage("⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。", "warning");
+          } else if ((batchResult?.stats?.failed || 0) > 0) taskStatus = "completed_with_failures";
+        }
+      } else {
+        // 单词:在当前页切筛选 + 单次采集
+        if (searchFilters.sort || searchFilters.publishTime) {
+          await applySearchFiltersOnActiveTab(searchActiveTabId, searchFilters);
+          await sleepWithStop(1500, () => searchCaptureCancelRequested);
+        }
+        const actionResult = await runCaptureAction({
+          mode: "keyword",
+          captureParams: {
+            keyword,
+            minLikes: keywordMinLikes,
+            sortDimension: sortContext.dimension,
+            maxDetectedItems: keywordMaxDetectedItems,
+            waitMinMs: settings.sharedWaitMinMs,
+            waitMaxMs: settings.sharedWaitMaxMs,
+            stallTimeoutMs: settings.sharedStallTimeoutMs,
+            maxDurationMs: settings.sharedMaxDurationMs,
+          },
+          progressMessage: searchAutoLoop
+            ? `第 ${searchRound} 轮 · 正在采集搜索结果（关键词：${keyword}）...`
+            : `正在采集搜索结果（关键词：${keyword}）...`,
+          successMessage: `搜索笔记采集成功，已加入缓存池（${sortLabel}≥${keywordMinLikes}，探测上限 ${keywordMaxDetectedItems}）`,
+          keepProgressOpen: true,
+        });
+
+        if (actionResult?.ok) {
+          const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
+            resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
+            { sourceLabel: "搜索结果", recordIds: actionResult.recordIds },
+          );
+          if (enhanceResult?.securityBlocked) {
+            searchCaptureCancelRequested = true;
+            taskStatus = "partial";
+            showMessage("⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。", "warning");
+          } else if (enhanceResult?.canceled) {
+            taskStatus = "partial";
+            searchCaptureCancelRequested = true;
+          } else if (enhanceResult && enhanceResult.ok === false) {
+            taskStatus = "completed_with_failures";
+          }
+        } else if (searchCaptureCancelRequested) {
+          taskStatus = "partial";
+        } else {
+          taskStatus = "failed";
+        }
+      }
+
+      // 终止:取消 / 没开循环 / 到轮数(单轮失败不停,继续按计划跑)
+      if (searchCaptureCancelRequested || !searchAutoLoop || searchRound >= searchMaxRounds) {
+        break;
+      }
+      if (searchGapMs > 0) {
+        showProgress(`第 ${searchRound} 轮完成,${searchGapMin} 分钟后开始第 ${searchRound + 1} 轮…`, "info");
+        await sleepWithStop(searchGapMs, () => searchCaptureCancelRequested);
+      }
+    } while (!searchCaptureCancelRequested);
+
+    if (searchAutoLoop) {
+      showMessage(
+        `无人值守搜索采集${searchCaptureCancelRequested ? "已停止" : "结束"}:共跑 ${searchRound} 轮`,
+        searchCaptureCancelRequested ? "warning" : "success",
+      );
     }
   } catch (error) {
     console.error("[Sidebar] Capture search failed:", error);
@@ -3387,6 +3573,7 @@ async function handleCaptureSearchData() {
       },
     });
     hideProgress();
+    searchCaptureCancelRequested = false;
   }
 }
 
@@ -7972,6 +8159,19 @@ function getExpandedKeywordsFromTextarea({dedupe = false} = {}) {
   return dedupe ? dedupeKeywords(keywords) : keywords;
 }
 
+// 可中断睡眠:每秒检查 shouldStop,用于无人值守循环的轮次间隔
+function sleepWithStop(ms, shouldStop) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const id = setInterval(() => {
+      if ((shouldStop && shouldStop()) || Date.now() - start >= ms) {
+        clearInterval(id);
+        resolve();
+      }
+    }, 1000);
+  });
+}
+
 async function handleBatchKeywordCapture() {
   if (batchKeywordCaptureInFlight) {
     if (batchKeywordCancelRequested) {
@@ -7979,12 +8179,21 @@ async function handleBatchKeywordCapture() {
       return;
     }
     batchKeywordCancelRequested = true;
+    // 取消时若正在「采集增强」逐条補采(用 detailBatch 标志 + 独立 runner tab),也要一并停,
+    // 否则在增强阶段点终止会继续補采、停不下来。
+    if (detailBatchCaptureInFlight) {
+      detailBatchCancelRequested = true;
+    }
     const btnBatch = document.getElementById("btnRunBatchKeywords");
     if (btnBatch) {
       btnBatch.textContent = "停止中...";
     }
+    const batchCancelTabId =
+      detailBatchCaptureInFlight && Number.isFinite(Number(detailBatchRunnerTabId))
+        ? Number(detailBatchRunnerTabId)
+        : activeBatchRunnerTabId;
     try {
-      await requestCaptureCancelSignal(activeBatchRunnerTabId);
+      await requestCaptureCancelSignal(batchCancelTabId);
     } catch (error) {
       console.warn("[Sidebar] Batch keyword cancel failed:", error);
     }
@@ -8084,29 +8293,131 @@ async function handleBatchKeywordCapture() {
 
     setBatchProgressVisible("modal", true);
 
-    const result = await batchCaptureByKeywords({
-      keywords: [...keywords],
-      platform: pagePlatform,
-      baseSearchUrl,
-      captureParams: {
-        minLikes: keywordMinLikes,
-        sortDimension: sortContext.dimension,
-        maxDetectedItems: keywordMaxDetectedItems,
-        waitMinMs: settings.sharedWaitMinMs,
-        waitMaxMs: settings.sharedWaitMaxMs,
-        stallTimeoutMs: settings.sharedStallTimeoutMs,
-        maxDurationMs: settings.sharedMaxDurationMs,
-      },
-      onProgress: (progress) => {
-        updateBatchProgress(progress, "modal");
-      },
-      shouldStop: () => batchKeywordCancelRequested,
-    });
+    // 无人值守循环:跑完一轮(所有关键词)→自动再跑下一轮,轮次间隔可设;
+    // 留空轮数 = 一直跑(夜间专机用)。全程可中断(再点按钮即停)。
+    const autoLoop = !!document.getElementById("chkAutoLoop")?.checked;
+    const roundGapMin = Math.max(0, Number(document.getElementById("inputLoopGapMin")?.value) || 0);
+    const maxRounds = Math.max(1, Math.floor(Number(document.getElementById("inputLoopRounds")?.value)) || 1); // 留空/0 = 1 轮(不做无限,防风控)
+    const roundGapMs = roundGapMin * 60 * 1000;
+    // 采集排序 / 发布时间(默认「综合 + 不限」归一为空 → 不触发筛选点击);复用「找对标账号」的筛选点击能力
+    const rawSort = document.getElementById("selectBatchSort")?.value || "";
+    const rawPublishTime = document.getElementById("selectBatchPublishTime")?.value || "";
+    const searchFilters = {
+      sort: rawSort === "comprehensive" ? "" : rawSort,
+      publishTime: rawPublishTime === "all" ? "" : rawPublishTime,
+    };
 
-    await refreshDataPool();
+    let result;
+    let round = 0;
+    let totalSuccess = 0;
+    let totalFailed = 0;
+
+    // 定时启动:指定了开始时刻则等到那一刻再开跑(可中断),等待期间显示倒计时
+    const scheduledStartStr = document.getElementById("inputBatchScheduledStart")?.value || "";
+    if (scheduledStartStr) {
+      const targetMs = new Date(scheduledStartStr).getTime();
+      if (Number.isFinite(targetMs) && targetMs > Date.now()) {
+        const targetLabel = new Date(scheduledStartStr).toLocaleString("zh-CN");
+        setBatchProgressVisible("modal", true);
+        let lastShownSec = -1;
+        await sleepWithStop(targetMs - Date.now(), () => {
+          if (batchKeywordCancelRequested) return true;
+          const remainSec = Math.max(0, Math.ceil((targetMs - Date.now()) / 1000));
+          if (remainSec !== lastShownSec) {
+            lastShownSec = remainSec;
+            const h = Math.floor(remainSec / 3600);
+            const m = Math.floor((remainSec % 3600) / 60);
+            const s = remainSec % 60;
+            updateBatchProgress(
+              {
+                current: 0,
+                total: keywords.length,
+                phase: "scheduled-waiting",
+                message: `⏰ 定时采集:将于 ${targetLabel} 开始(还剩 ${h > 0 ? h + "时" : ""}${m}分${s}秒)`,
+              },
+              "modal",
+            );
+          }
+          return false;
+        });
+        if (batchKeywordCancelRequested) {
+          showMessage("已取消定时采集", "warning");
+          return; // finally 会复位状态/按钮
+        }
+      }
+    }
+
+    do {
+      round += 1;
+      result = await batchCaptureByKeywords({
+        keywords: [...keywords],
+        platform: pagePlatform,
+        baseSearchUrl,
+        searchFilters,
+        captureParams: {
+          minLikes: keywordMinLikes,
+          sortDimension: sortContext.dimension,
+          maxDetectedItems: keywordMaxDetectedItems,
+          waitMinMs: settings.sharedWaitMinMs,
+          waitMaxMs: settings.sharedWaitMaxMs,
+          stallTimeoutMs: settings.sharedStallTimeoutMs,
+          maxDurationMs: settings.sharedMaxDurationMs,
+        },
+        onProgress: (progress) => {
+          // 进入「导航 / 切筛选 / 等待」阶段时清掉上一条采集明细,等本条列表采集再刷新
+          if (progress.phase && progress.phase !== "capturing") {
+            setBatchProgressDetail("");
+          }
+          updateBatchProgress(
+            autoLoop
+              ? { ...progress, message: `第 ${round} 轮 · ${progress.message || ""}` }
+              : progress,
+            "modal",
+          );
+        },
+        shouldStop: () => batchKeywordCancelRequested,
+      });
+
+      await refreshDataPool();
+      totalSuccess += result.stats.success;
+      totalFailed += result.stats.failed;
+
+      if (!result.canceled) {
+        await maybeRunAutoDetailCaptureAfterListCapture(settings, {
+          sourceLabel: "批量关键词搜索结果",
+          recordIds: collectBatchRecordIds(result),
+        });
+      }
+
+      // 终止:被取消 / 没开循环 / 已到指定轮数
+      if (result.canceled || !autoLoop || round >= maxRounds) {
+        break;
+      }
+
+      // 轮次间隔:歇 roundGapMin 分钟再跑下一轮(睡眠中可中断)
+      if (roundGapMs > 0) {
+        updateBatchProgress(
+          {
+            current: 0,
+            total: keywords.length,
+            phase: "waiting",
+            message: `第 ${round} 轮完成（累计成功 ${totalSuccess}），${roundGapMin} 分钟后开始第 ${round + 1} 轮…`,
+            round,
+          },
+          "modal",
+        );
+        await sleepWithStop(roundGapMs, () => batchKeywordCancelRequested);
+      }
+    } while (!batchKeywordCancelRequested);
 
     const stats = result.stats;
-    if (result.canceled) {
+    if (autoLoop) {
+      const stopped = result.canceled || batchKeywordCancelRequested;
+      showMessage(
+        `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}`,
+        stopped ? "warning" : "success",
+      );
+    } else if (result.canceled) {
       showMessage(
         `批量采集已停止：已处理 ${stats.processed}/${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}`,
         "warning",
@@ -8116,10 +8427,6 @@ async function handleBatchKeywordCapture() {
         `批量采集完成：共 ${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}`,
         stats.failed > 0 ? "warning" : "success",
       );
-      await maybeRunAutoDetailCaptureAfterListCapture(settings, {
-        sourceLabel: "批量关键词搜索结果",
-        recordIds: collectBatchRecordIds(result),
-      });
     }
   } catch (error) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
@@ -8128,6 +8435,7 @@ async function handleBatchKeywordCapture() {
     batchKeywordCaptureInFlight = false;
     batchKeywordCancelRequested = false;
     activeBatchRunnerTabId = null;
+    setBatchProgressDetail("");
 
     const btnBatch = document.getElementById("btnRunBatchKeywords");
     if (btnBatch) {
@@ -8228,6 +8536,7 @@ async function runCaptureAction({
 async function handleCancel() {
   console.log("[Sidebar] Cancel clicked");
   setCancelFlag(true);
+  searchCaptureCancelRequested = true;
   hideProgressPanelOnly();
   let relayTabId = null;
   if (detailBatchCaptureInFlight) {
@@ -10736,6 +11045,12 @@ async function initCaptureSettingsUI() {
       enableCommentLeadsFilter: enableCommentLeadsFilterOnDetailCapture,
       includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
     });
+    // 「增量采集」勾选已挪到「点赞数」下面,不在 detail 面板内,单独按 settings 回填(document 级)
+    document
+      .querySelectorAll('[data-detail-setting="skip-captured"]')
+      .forEach((el) => {
+        el.checked = settings.skipAlreadyCapturedOnDetailCapture !== false;
+      });
 
     const inputCommentsMaxDetectedItems = document.getElementById(
       "inputCommentsMaxDetectedItems",
@@ -10989,6 +11304,14 @@ async function handleDetailCaptureBloggerMetricsToggleChange(event) {
     await persistDetailCaptureSettingsFromInputs();
   } catch (error) {
     console.warn("[Sidebar] Save detail blogger metrics toggle failed:", error);
+  }
+}
+
+async function handleDetailCaptureSkipCapturedToggleChange() {
+  try {
+    await persistDetailCaptureSettingsFromInputs();
+  } catch (error) {
+    console.warn("[Sidebar] Save skip-captured toggle failed:", error);
   }
 }
 
@@ -11536,6 +11859,8 @@ async function runDetailCaptureForRecordIds(
       includeBloggerMetrics: Boolean(
         settings?.includeBloggerMetricsOnDetailCapture,
       ),
+      skipAlreadyCaptured:
+        settings?.skipAlreadyCapturedOnDetailCapture !== false,
       enableCommentLeadsFilter: Boolean(
         settings?.enableCommentLeadsFilterOnDetailCapture,
       ),
@@ -12112,6 +12437,17 @@ function syncRuntimeCaptureProgress(runtime) {
   }
   if (isTerminalProgressPhase(phase)) {
     hideProgressPanelOnly();
+    if (batchKeywordCaptureInFlight) {
+      setBatchProgressDetail("");
+    }
+    return;
+  }
+
+  // 批量关键词采集进行中:把底层细粒度进度(探测/筛选/防反爬等待)镜像到弹窗明细行,
+  // 并收起外部蓝色进度条 + 中止按钮(统一并入弹窗,避免重复)
+  if (batchKeywordCaptureInFlight) {
+    setBatchProgressDetail(buildCaptureProgressText(progress));
+    hideProgressPanelOnly();
     return;
   }
 
@@ -12672,6 +13008,15 @@ function getDetailCaptureBloggerMetricsChecked(settings) {
   return Boolean(input.checked);
 }
 
+// 增量采集(跳过已采过的)。无勾选输入时回落 settings,默认 true。
+function getDetailCaptureSkipCapturedChecked(settings) {
+  const input = getActiveDetailCaptureInput("skip-captured");
+  if (!input) {
+    return settings?.skipAlreadyCapturedOnDetailCapture !== false;
+  }
+  return Boolean(input.checked);
+}
+
 function getDetailCaptureLowFollowerHitFilterChecked(settings) {
   const input = getActiveDetailCaptureInput("low-follower-hit");
   if (!input) {
@@ -12710,6 +13055,7 @@ function syncAutoDetailCaptureControls({
   commentsMaxDetectedItems = null,
   enableCommentLeadsFilter = null,
   includeBloggerMetrics = null,
+  skipAlreadyCaptured = null,
   enableLowFollowerHitFilter = null,
   lowFollowerHitThreshold = null,
   forceDisabled = false,
@@ -12734,6 +13080,9 @@ function syncAutoDetailCaptureControls({
       '[data-detail-setting="comment-leads"]',
     );
     const metricsInput = panel.querySelector('[data-detail-setting="metrics"]');
+    const skipCapturedInput = panel.querySelector(
+      '[data-detail-setting="skip-captured"]',
+    );
     const lowFollowerHitInput = panel.querySelector(
       '[data-detail-setting="low-follower-hit"]',
     );
@@ -12777,6 +13126,9 @@ function syncAutoDetailCaptureControls({
     }
     if (metricsInput && includeBloggerMetrics !== null) {
       metricsInput.checked = Boolean(includeBloggerMetrics);
+    }
+    if (skipCapturedInput && skipAlreadyCaptured !== null) {
+      skipCapturedInput.checked = Boolean(skipAlreadyCaptured);
     }
     if (lowFollowerHitInput && enableLowFollowerHitFilter !== null) {
       lowFollowerHitInput.checked = Boolean(enableLowFollowerHitFilter);
@@ -12855,6 +13207,8 @@ async function persistDetailCaptureSettingsFromInputs() {
     includeCommentsOnDetailCapture && enableCommentLeadsFilterOnDetailCapture;
   const includeBloggerMetricsOnDetailCapture =
     getDetailCaptureBloggerMetricsChecked(current);
+  const skipAlreadyCapturedOnDetailCapture =
+    getDetailCaptureSkipCapturedChecked(current);
   const enableLowFollowerHitFilterOnDetailCapture =
     getDetailCaptureLowFollowerHitFilterChecked(current);
   const lowFollowerHitThresholdOnDetailCapture =
@@ -12866,6 +13220,7 @@ async function persistDetailCaptureSettingsFromInputs() {
     commentsMaxDetectedItems: detailCommentsMaxDetectedItems,
     enableCommentLeadsFilter: normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
+    skipAlreadyCaptured: skipAlreadyCapturedOnDetailCapture,
     enableLowFollowerHitFilter: enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThreshold: lowFollowerHitThresholdOnDetailCapture,
   });
@@ -12877,6 +13232,7 @@ async function persistDetailCaptureSettingsFromInputs() {
     enableCommentLeadsFilterOnDetailCapture:
       normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetricsOnDetailCapture,
+    skipAlreadyCapturedOnDetailCapture,
     enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThresholdOnDetailCapture,
   });
@@ -12893,6 +13249,8 @@ function resolveCurrentDetailCaptureSettings(settings = {}) {
       getDetailCaptureCommentLeadsFilterChecked(settings),
     includeBloggerMetricsOnDetailCapture:
       getDetailCaptureBloggerMetricsChecked(settings),
+    skipAlreadyCapturedOnDetailCapture:
+      getDetailCaptureSkipCapturedChecked(settings),
     enableLowFollowerHitFilterOnDetailCapture:
       getDetailCaptureLowFollowerHitFilterChecked(settings),
     lowFollowerHitThresholdOnDetailCapture:
@@ -15711,6 +16069,17 @@ function getBatchProgressElements(scope = "modal") {
     fillEl: document.getElementById("batchProgressFill"),
     textEl: document.getElementById("batchProgressText"),
   };
+}
+
+// 弹窗内细粒度采集明细行:空则隐藏
+function setBatchProgressDetail(text) {
+  const el = document.getElementById("batchProgressDetail");
+  if (!el) {
+    return;
+  }
+  const t = String(text || "").trim();
+  el.textContent = t;
+  el.hidden = !t;
 }
 
 function setBatchProgressVisible(scope = "modal", visible = true) {

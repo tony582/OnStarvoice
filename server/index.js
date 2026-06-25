@@ -36,6 +36,7 @@ import contentRouter from './routes/content.js';
 import imageProxyRouter from './routes/image-proxy.js';
 import ticketsRouter from './routes/tickets.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
+import { ensureMediaDirs, backfillRecentCovers, MEDIA_DIR } from './services/media-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -93,6 +94,8 @@ app.use('/dashboard', express.static(join(__dirname, '..', 'web', 'dashboard', '
 app.use('/admin', express.static(join(__dirname, 'admin')));
 app.use('/dashboard', express.static(join(__dirname, 'dashboard')));
 app.use('/images', express.static(join(__dirname, '..', 'images')));
+// 封面落地的本地副本(在 rsync 之外的 MEDIA_DIR,部署不清空)
+app.use('/media', express.static(MEDIA_DIR, { maxAge: '7d' }));
 
 // 关于 / 联系 / 定价 / 更新日志(插件内多处入口指向此页）
 app.get(['/about', '/contact', '/changelog', '/pricing'], (req, res) => {
@@ -169,6 +172,7 @@ app.use((err, req, res, next) => {
 
 async function start() {
   await initDb();
+  ensureMediaDirs();
   startCronJobs();
 
   app.listen(PORT, () => {
@@ -187,6 +191,13 @@ async function start() {
       .then(m => m.reprocessPendingComments())
       .catch(err => console.error('[Reprocess] 启动自愈失败:', err.message));
   }, 15000);
+
+  // 封面落地:启动 25s 后回填近 24h 采集、还没落地的封面(链接多半还有效,过期的自动跳过)
+  setTimeout(() => {
+    backfillRecentCovers()
+      .then(n => { if (n) console.log(`[CoverStore] 启动回填:尝试 ${n} 条封面落地`); })
+      .catch(() => {});
+  }, 25000);
 
   // 后台 AI 精炼:评论已规则入库且可见,这里持续把"未 AI 分类"的评论批量精炼回填。
   // 自调度循环(不重叠):单轮把积压排干(分多次 limit),再隔 15s 检查;LLM 失败的留到下轮重试。

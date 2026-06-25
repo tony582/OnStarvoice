@@ -1,13 +1,14 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import cloud from 'd3-cloud'
 import {
-  AlertTriangle, BarChart3, CalendarDays, Loader2, MessageSquareWarning, RefreshCw, Sparkles,
+  AlertTriangle, BarChart3, CalendarDays, ChevronDown, Loader2, MessageSquareWarning, RefreshCw, Sparkles, Star, X,
 } from 'lucide-react'
+import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { api } from '@/lib/api'
-import { compact, formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
+import { compact, formatDate, formatNumber, LABELS, platformName, proxiedImg } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -112,6 +113,86 @@ function interactions(row: any) {
   return Number(row?.likes || 0) + Number(row?.comments_count || 0) + Number(row?.collects || 0) + Number(row?.shares || 0)
 }
 
+interface FocusTopic { id: string; name: string; keywords: string[]; sort_order: number }
+
+// 关注主题 + 采集关键词:数据看板按阶段/主题收敛。预设(存阶段)+ 临时筛选两用。
+function FocusTopicBar({ keywords, setKeywords }: { keywords: string[]; setKeywords: (v: string[]) => void }) {
+  const [topics, setTopics] = useState<FocusTopic[]>([])
+  const [activeId, setActiveId] = useState('')
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  const loadTopics = () => api.get<any>('/analytics/focus-topics').then(d => setTopics(d.topics || [])).catch(() => {})
+  useEffect(() => { loadTopics() }, [])
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('click', h)
+    return () => document.removeEventListener('click', h)
+  }, [])
+
+  const active = topics.find(t => t.id === activeId) || null
+  const norm = (a: string[]) => [...(a || [])].sort().join('')
+  const dirty = !!active && norm(active.keywords) !== norm(keywords)
+
+  const pickTopic = (t: FocusTopic) => { setActiveId(t.id); setKeywords(t.keywords || []); setOpen(false) }
+  const clearAll = () => { setActiveId(''); setKeywords([]) }
+  const saveAsNew = async () => {
+    const name = window.prompt('给这个关注主题起个名(如:新车上市期 / 壁纸功能期):')?.trim()
+    if (!name) return
+    setBusy(true)
+    try {
+      const d = await api.post<any>('/analytics/focus-topics', { name, keywords })
+      await loadTopics()
+      if (d?.topic?.id) setActiveId(d.topic.id)
+    } finally { setBusy(false) }
+  }
+  const updateActive = async () => {
+    if (!active) return
+    setBusy(true)
+    try { await api.patch('/analytics/focus-topics/' + active.id, { keywords }); await loadTopics() }
+    finally { setBusy(false) }
+  }
+  const removeTopic = async (id: string) => {
+    if (!window.confirm('删除这个关注主题?(只删主题,不影响内容)')) return
+    setBusy(true)
+    try { await api.delete('/analytics/focus-topics/' + id); if (activeId === id) clearAll(); await loadTopics() }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-border pt-4">
+      <span className="inline-flex items-center gap-1 text-xs font-semibold text-muted-foreground"><Star className="h-3.5 w-3.5" />关注主题</span>
+      <div className="relative" ref={ref}>
+        <button type="button" onClick={() => setOpen(o => !o)}
+          className={`inline-flex h-8 items-center gap-1 rounded-lg border border-border px-2.5 text-[12px] font-medium transition hover:bg-accent ${active ? 'text-primary' : 'text-muted-foreground'}`}>
+          {active ? active.name : '全部内容'}
+          <ChevronDown className="h-3 w-3" />
+        </button>
+        {open && (
+          <div className="absolute left-0 top-full z-30 mt-1 w-64 rounded-lg border border-border bg-card p-1.5 shadow-lg">
+            <button onClick={clearAll} className={`flex w-full items-center rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-accent ${!active ? 'font-semibold text-primary' : ''}`}>全部内容(不限主题)</button>
+            {topics.map(t => (
+              <div key={t.id} className="group flex items-center gap-1 rounded-md hover:bg-accent">
+                <button onClick={() => pickTopic(t)} className={`flex flex-1 items-center justify-between px-2 py-1.5 text-left text-[12px] ${t.id === activeId ? 'font-semibold text-primary' : ''}`}>
+                  <span className="truncate" title={t.name}>{t.name}</span>
+                  <span className="ml-2 shrink-0 text-[10px] text-muted-foreground">{(t.keywords || []).length}词</span>
+                </button>
+                <button onClick={() => removeTopic(t.id)} title="删除主题" className="mr-1 rounded p-0.5 text-muted-foreground opacity-0 transition hover:text-rose-600 group-hover:opacity-100"><X className="h-3 w-3" /></button>
+              </div>
+            ))}
+            {topics.length === 0 && <div className="px-2 py-3 text-center text-[11px] text-muted-foreground">还没有主题。选好关键词后点「存为主题」。</div>}
+          </div>
+        )}
+      </div>
+      <KeywordFilter value={keywords} onChange={setKeywords} />
+      {keywords.length > 0 && <Button variant="outline" size="sm" disabled={busy} onClick={saveAsNew}>存为主题</Button>}
+      {dirty && <Button variant="outline" size="sm" disabled={busy} onClick={updateActive}>更新「{active!.name}」</Button>}
+      {(keywords.length > 0 || active) && <button onClick={clearAll} className="text-[11px] text-muted-foreground hover:text-foreground">清空</button>}
+    </div>
+  )
+}
+
 export function DashboardTab() {
   const [range, setRange] = useState<RangePreset>('7d')
   const [start, setStart] = useState(inputDate(-6))
@@ -119,6 +200,7 @@ export function DashboardTab() {
   const [data, setData] = useState<DashboardResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [keywords, setKeywords] = useState<string[]>([]) // 关注主题/临时关键词:空=全量
 
   const load = async () => {
     setLoading(true)
@@ -129,6 +211,7 @@ export function DashboardTab() {
         params.set('start', start)
         params.set('end', end)
       }
+      if (keywords.length) params.set('keywords', keywords.join(','))
       const result = await api.get<DashboardResponse>('/analytics/dashboard?' + params.toString())
       setData(result)
     } catch (err) {
@@ -138,7 +221,7 @@ export function DashboardTab() {
     }
   }
 
-  useEffect(() => { load() }, [range, start, end])
+  useEffect(() => { load() }, [range, start, end, keywords])
 
   const s = data?.snapshot
 
@@ -176,6 +259,7 @@ export function DashboardTab() {
             </Button>
           </div>
         </div>
+        <FocusTopicBar keywords={keywords} setKeywords={setKeywords} />
         {range === 'custom' && (
           <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border pt-4">
             <label className="grid gap-1 text-xs font-semibold text-muted-foreground">
@@ -821,7 +905,7 @@ function RiskItems({ rows }: { rows: any[] }) {
   return (
     <div className="space-y-3">
       {rows.slice(0, 6).map(row => {
-        const cover = row.cover_url || row.record_cover_url || ''
+        const cover = proxiedImg(row.cover_url || row.record_cover_url || '')
         const title = row.title || row.record_title || compact(row.content || '', 50) || '无标题'
         return (
           <article key={row.id || title} className="grid grid-cols-[58px_minmax(0,1fr)] gap-3 rounded-lg border border-border p-3">

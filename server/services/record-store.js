@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { withTransaction } from '../db/init.js';
+import { queueCoverLocalization } from './media-store.js';
 import { parseMetricNumber } from '../utils/metrics.js';
 
 const VERSION_FIELDS = [
@@ -120,7 +121,7 @@ export async function upsertCapturedRecord(record, context) {
   const imageUrls = jsonText(record.image_urls, '[]');
   const payload = jsonText(record.payload, '{}');
 
-  return await withTransaction(async tx => {
+  const __result = await withTransaction(async tx => {
     let existing = null;
     if (record.external_id) {
       existing = await tx.queryOne(
@@ -146,23 +147,23 @@ export async function upsertCapturedRecord(record, context) {
           author_name = COALESCE(NULLIF($4, ''), author_name),
           author_id = COALESCE(NULLIF($5, ''), author_id),
           author_avatar = COALESCE(NULLIF($6, ''), author_avatar),
-          author_fans = $7,
+          author_fans = COALESCE(NULLIF($7, 0), author_fans),
           url = COALESCE(NULLIF($8, ''), url),
           canonical_url = COALESCE(NULLIF($9, ''), canonical_url),
           cover_url = COALESCE(NULLIF($10, ''), cover_url),
           note_type = COALESCE(NULLIF($11, ''), note_type),
-          likes = $12,
-          comments_count = $13,
-          collects = $14,
-          shares = $15,
+          likes = COALESCE(NULLIF($12, 0), likes),
+          comments_count = COALESCE(NULLIF($13, 0), comments_count),
+          collects = COALESCE(NULLIF($14, 0), collects),
+          shares = COALESCE(NULLIF($15, 0), shares),
           publish_time = COALESCE(NULLIF($16, ''), publish_time),
           tags = CASE WHEN $17::jsonb <> '[]'::jsonb THEN $17::jsonb ELSE tags END,
           blogger_profile_url = COALESCE(NULLIF($18, ''), blogger_profile_url),
           image_urls = CASE WHEN $19::jsonb <> '[]'::jsonb THEN $19::jsonb ELSE image_urls END,
           comments_text = COALESCE(NULLIF($20, ''), comments_text),
           comments_capture_status = COALESCE(NULLIF($21, ''), comments_capture_status),
-          comments_total_captured = $22,
-          blogger_liked_collected = $23,
+          comments_total_captured = COALESCE(NULLIF($22, 0), comments_total_captured),
+          blogger_liked_collected = COALESCE(NULLIF($23, 0), blogger_liked_collected),
           blogger_account_type = COALESCE(NULLIF($24, ''), blogger_account_type),
           video_url = COALESCE(NULLIF($25, ''), video_url),
           audio_url = COALESCE(NULLIF($26, ''), audio_url),
@@ -170,7 +171,11 @@ export async function upsertCapturedRecord(record, context) {
           capture_timestamp = COALESCE(NULLIF($28, ''), capture_timestamp),
           keyword = COALESCE(NULLIF($29, ''), keyword),
           source_type = COALESCE(NULLIF($30, ''), source_type),
-          payload = $31::jsonb,
+          payload = CASE
+            WHEN ($31::jsonb->>'detailCaptureStatus') = 'done' THEN $31::jsonb
+            WHEN (payload->>'detailCaptureStatus') = 'done' THEN payload
+            ELSE $31::jsonb
+          END,
           auth_code = COALESCE(NULLIF($32, ''), auth_code),
           last_seen_at = now(),
           seen_count = seen_count + 1,
@@ -259,6 +264,9 @@ export async function upsertCapturedRecord(record, context) {
     const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });
     return { id: inserted.id, action: 'inserted', observationId };
   });
+  // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
+  if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
+  return __result;
 }
 
 export function serializeRecord(row) {

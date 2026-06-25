@@ -68,15 +68,32 @@ export async function captureBloggerProfile() {
     const bioElement = querySelector(BLOGGER_PROFILE_SELECTORS.bio);
     const bio = bioElement ? cleanText(bioElement.textContent) : "";
 
-    // 提取小红书号
+    // 提取小红书号:body-text「小红书号:xxx」优先(锚定关键词,绝不会抓到 .id 等脏数据);
+    // 选择器仅当其文本确含「小红书号」时才采信(否则 .id/.user-id 命中别的元素会把脏值当成号)。
+    const readRedIdOnce = () => {
+      const fromText = extractBloggerUserIdFromText(
+        cleanText(document.body?.innerText || ""),
+      );
+      if (fromText) return fromText;
+      const el = querySelector(BLOGGER_PROFILE_SELECTORS.userId);
+      const t = el ? cleanText(el.textContent) : "";
+      return /小红书号/.test(t) ? normalizeBloggerUserId(t) : "";
+    };
+
     const userIdElement = querySelector(BLOGGER_PROFILE_SELECTORS.userId);
-    const userId = userIdElement ? cleanText(userIdElement.textContent) : "";
-    const normalizedUserId =
-      normalizeBloggerUserId(userId) ||
-      extractBloggerUserIdFromText(cleanText(document.body?.innerText || ""));
-    const ipLocation = extractIpLocation(userId);
+    const ipLocation = extractIpLocation(
+      userIdElement ? cleanText(userIdElement.textContent) : "",
+    );
+    let normalizedUserId = readRedIdOnce();
 
     const metrics = await extractBloggerMetricsFromCurrentPageWithRetry();
+
+    // 号常比粉丝数更晚渲染(程序化打开主页时尤甚)→ 首次提空会回退成 URL 内部 hex。
+    // 这里轮询等待,直到"小红书号"出现或超时(最多 ~8 秒),确保拿到真正的小红书号。
+    for (let attempt = 0; attempt < 16 && !normalizedUserId; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      normalizedUserId = readRedIdOnce();
+    }
 
     // 构建 payload
     const payload = {

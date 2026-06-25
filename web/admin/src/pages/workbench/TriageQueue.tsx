@@ -3,10 +3,10 @@ import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
   CheckCircle, Archive, Ban, Loader2,
   Package, User, FileText, Bell, ExternalLink,
-  ArrowUp, ArrowDown, ChevronsUpDown, Download,
+  ArrowUp, ArrowDown, ChevronsUpDown, Download, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatDateCompact, LABELS, platformName, cn, looksLikeKOEName } from '@/lib/utils'
+import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -14,6 +14,9 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
+import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
+import { MultiSelect } from '@/components/shared/MultiSelect'
+import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useTicketDispatch } from '@/components/shared/TicketDispatch'
@@ -28,6 +31,9 @@ const STATUS_TABS = [
 ]
 
 interface Pagination { page: number; totalPages: number; total: number }
+type SortField = 'publish' | 'interactions' | 'first_seen' | 'last_seen'
+const RISK_OPTIONS = [{ value: 'alert', label: '有预警' }, { value: 'negative', label: '有负评' }]
+const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
 
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
@@ -39,11 +45,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [triageStatus, setTriageStatus] = useState('')
-  const [risk, setRisk] = useState('')
+  const [risk, setRisk] = useState<string[]>([])
+  const [identity, setIdentity] = useState<string[]>([])
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [exporting, setExporting] = useState(false)
-  // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量、升降序
-  const [sort, setSort] = useState<{ field: 'publish' | 'interactions'; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
+  // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量/首次发现/最近采集、升降序
+  const [sort, setSort] = useState<{ field: SortField; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
   const [records, setRecords] = useState<any[]>([])
   const [pagination, setPagination] = useState<Pagination | null>(null)
   const [loading, setLoading] = useState(true)
@@ -53,19 +63,23 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${status}|${triageStatus}|${risk}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${status}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
     if (status === 'archived') params.set('bucket', 'archived')
     else params.set('queue', 'active')
     if (triageStatus) params.set('status', triageStatus)
-    if (risk) params.set('risk', risk)
+    risk.forEach(rk => params.append('risk', rk))
+    identity.forEach(id => params.append('identity', id))
     params.set('sort', sort.field)
     params.set('dir', sort.dir)
     captureKeywords.forEach(k => params.append('captureKeyword', k))
+    if (dateFrom) params.set('dateFrom', dateFrom)
+    if (dateTo) params.set('dateTo', dateTo)
+    if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, triageStatus, risk, sentiment, platform, keyword, sort, captureKeywords])
+  }, [status, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, dateFrom, dateTo, dateBasis])
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -88,8 +102,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }
 
   // 点表头排序:点未激活列 → 该列降序;再点已激活列 → 升/降序切换
-  const toggleSort = (field: 'publish' | 'interactions') =>
+  const toggleSort = (field: SortField) =>
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
+
+  // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || dateFrom || dateTo)
+  const clearFilters = () => {
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setDateFrom(''); setDateTo('')
+    setSort({ field: 'publish', dir: 'desc' })
+  }
 
   useEffect(() => { load() }, [load])
 
@@ -164,9 +185,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   } : null
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       {/* 工具条:无边框,靠留白与柔色高亮分隔(Asana 式)*/}
-      <div className="space-y-2 border-b border-border/50 pb-3">
+      <div className="space-y-2 border-b border-border/50 pb-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           {view === 'list' ? (
             <div className="inline-flex flex-wrap items-center gap-0.5">
@@ -201,8 +222,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-1 gap-y-2">
-          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-2">
+          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}
+            className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
             <option value="">全部平台</option>
             <option value="xiaohongshu">小红书</option>
             <option value="douyin">抖音</option>
@@ -210,32 +232,37 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </WorkbenchSelect>
           {view === 'list' && (
             <>
-              <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}>
+              <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}
+                className={cn('bg-muted font-medium hover:bg-muted/70', triageStatus ? 'text-foreground' : 'text-muted-foreground')}>
                 {triageStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
               </WorkbenchSelect>
-              <WorkbenchSelect value={risk} onChange={e => setRisk(e.target.value)}>
-                <option value="">全部风险</option>
-                <option value="alert">有预警</option>
-                <option value="negative">有负评</option>
-                <option value="koe">疑似KOE</option>
-              </WorkbenchSelect>
+              <span className="mx-0.5 h-4 w-px bg-border/60" />
+              <MultiSelect label="风险" options={RISK_OPTIONS} value={risk} onChange={setRisk} />
+              <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
               <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
+              <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
             </>
           )}
-          <span className="mx-1 h-4 w-px bg-border/70" />
-          <div className="inline-flex items-center gap-0.5">
-            {['', 'negative', 'neutral', 'positive'].map(v => (
+          <span className="mx-0.5 h-4 w-px bg-border/60" />
+          <div className="inline-flex h-8 items-center rounded-lg bg-muted p-0.5">
+            {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([v, label]) => (
               <button key={v} onClick={() => setSentiment(v)}
-                className={cn('rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
-                  sentiment === v ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground')}>
-                {v === '' ? '全部情感' : v === 'negative' ? '负面' : v === 'neutral' ? '中性' : '正面'}
+                className={cn('inline-flex h-7 items-center rounded-md px-2.5 text-[12px] font-medium transition-colors',
+                  sentiment === v ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                {label}
               </button>
             ))}
           </div>
-          <div className="relative ml-auto min-w-[200px] flex-1 sm:max-w-xs">
+          {hasActiveFilters && (
+            <button onClick={clearFilters} title="清空所有筛选"
+              className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+              <X className="h-3.5 w-3.5" />清空
+            </button>
+          )}
+          <div className="relative ml-auto w-40 sm:w-52">
             <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、关键词…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
+              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
           </div>
           {view === 'list' && (
             <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
@@ -268,7 +295,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <div className="overflow-x-auto">
           <table className="w-full min-w-[1080px] text-sm">
             <thead>
-              <tr className="border-b border-border/60 [&>th]:whitespace-nowrap [&>th]:py-2.5">
+              <tr className="border-b border-border/60 [&>th]:whitespace-nowrap [&>th]:py-3">
                 {canWrite() && (
                   <th className="w-9 py-3.5 pl-4 pr-1">
                     <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
@@ -279,10 +306,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
+                {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
                 {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
-                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">首次发现</th>}
-                {!narrow && <th className="hidden px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">最近采集</th>}
+                {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
+                {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <th className="hidden whitespace-nowrap px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
                 {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
               </tr>
@@ -379,6 +407,7 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
               {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><ExternalLink className="h-2.5 w-2.5" />原文</a>}
+              {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
             </div>
           </div>
         </div>
@@ -387,6 +416,7 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
+      {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>}
@@ -430,9 +460,9 @@ function MenuBtn({ icon: Icon, label, onClick }: { icon: React.ElementType; labe
 /* 可排序表头:点击切换该列升/降序,激活列显示实心箭头,未激活显示淡色双箭头 */
 function SortableTh({ label, field, sort, onSort, align = 'left', className = '' }: {
   label: string
-  field: 'publish' | 'interactions'
+  field: SortField
   sort: { field: string; dir: 'asc' | 'desc' }
-  onSort: (field: 'publish' | 'interactions') => void
+  onSort: (field: SortField) => void
   align?: 'left' | 'right'
   className?: string
 }) {
@@ -449,25 +479,40 @@ function SortableTh({ label, field, sort, onSort, align = 'left', className = ''
   )
 }
 
+/* 疑似身份:作者来源(ai-labeler LLM 多信号判定);4S店/员工=疑似软文(原 KOE),KOL=自媒体,其余淡化 */
+function IdentityBadge({ sourceType, fans, name }: { sourceType?: string; fans?: number; name?: string }) {
+  const label = identityLabel(sourceType, fans, name)
+  if (!label) return <span className="text-[11px] text-muted-foreground/40">—</span>
+  const strong = label === 'KOE' || label === '4S店'
+  const kol = label === 'KOC' || label.endsWith('KOL')
+  const cls = strong
+    ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
+    : kol
+      ? 'bg-sky-500/12 text-sky-700 dark:text-sky-300'
+      : 'bg-muted text-muted-foreground'
+  const badge = <span className={cn('inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold', strong && 'cursor-help', cls)}>{label}</span>
+  return strong ? <Tooltip text="账号名带品牌/车型,疑似经销商/品牌关联号(非真实车主),研判时建议剔除">{badge}</Tooltip> : badge
+}
+
 /* 风险信号:预警 / 负面评论数 / 官方回复状态,一眼可扫 */
 function RiskSignals({ record: r }: any) {
   const alerts = Number(r.alert_count || 0)
   const neg = Number(r.negative_comment_count || 0)
   const official = r.official_response_status
-  const koe = r.source_type === 'employee' || r.source_type === 'dealer' || looksLikeKOEName(r.author_name)
-  if (!(alerts > 0 || neg > 0 || (official && official !== 'none') || koe)) {
+  if (!(alerts > 0 || neg > 0 || (official && official !== 'none'))) {
     return <span className="text-[11px] text-muted-foreground/40">—</span>
   }
   return (
     <div className="flex flex-wrap items-center gap-1">
       {alerts > 0 && (
-        <span title={r.alert_reasons || '触发预警'} className="inline-flex cursor-help items-center gap-0.5 rounded bg-status-red/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-2.5 w-2.5" />预警{alerts}</span>
-      )}
-      {koe && (
-        <span title="疑似经销商/员工/品牌关联账号发布的软文,非真实车主 UGC,研判时建议剔除" className="cursor-help rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+        <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}>
+          <span className="inline-flex cursor-help items-center gap-0.5 rounded bg-status-red/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-2.5 w-2.5" />预警{alerts}</span>
+        </Tooltip>
       )}
       {neg > 0 && (
-        <span className="rounded bg-status-orange/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">负评{neg}</span>
+        <Tooltip text="该内容下被判为负面/风险的评论条数;点开详情可查看具体评论">
+          <span className="cursor-help rounded bg-status-orange/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">负评{neg}</span>
+        </Tooltip>
       )}
       {official === 'responded' && (
         <span className="rounded bg-status-green/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">已回复</span>

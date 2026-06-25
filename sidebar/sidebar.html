@@ -515,6 +515,18 @@
                 placeholder="例如 0" />
             </div>
             <div class="form-group">
+              <label class="switch-wrap">
+                <input
+                  type="checkbox"
+                  class="switch-input"
+                  data-detail-setting="skip-captured"
+                  checked />
+                <span class="switch-slider" aria-hidden="true"></span>
+                <span class="switch-label">增量采集(跳过已采过的笔记)</span>
+              </label>
+              <p class="form-hint">采集增强时自动跳过之前已采过的笔记,减少重复导航、防风控、提速。</p>
+            </div>
+            <div class="form-group">
               <label class="form-label">笔记内容主题筛选</label>
               <p
                 class="form-hint"
@@ -660,7 +672,12 @@
                 请前往 当前平台的搜索页 以开始采集
               </div>
             </div>
-            <div class="form-group">
+            <label class="batch-loop-toggle" style="margin-bottom: 10px;">
+              <input type="checkbox" id="chkSearchBatchMode" />
+              <span class="batch-loop-toggle-text">批量多个关键词</span>
+              <span class="batch-settings-sub">勾选 = 输入多个词逐个采;不勾 = 采当前搜索页</span>
+            </label>
+            <div class="form-group" id="searchSingleKeywordGroup">
               <label class="form-label">当前搜索关键词（自动读取）</label>
               <div class="keyword-strategy-entry-row">
                 <div
@@ -698,6 +715,14 @@
               </div>
             </div>
 
+            <div class="form-group" id="searchBatchKeywordGroup" hidden>
+              <label class="form-label">批量关键词列表 <span class="form-label-hint">每行一个，最多 30 个</span></label>
+              <textarea
+                class="form-input batch-textarea"
+                id="textareaSearchBatchKeywords"
+                placeholder="输入要采集的关键词，每行一个，最多 30 个"></textarea>
+            </div>
+
             <!-- ========== 采集设置（不折叠） ========== -->
             <div
               class="search-settings-body"
@@ -723,6 +748,69 @@
                   class="form-input"
                   id="inputKeywordMinLikes"
                   placeholder="例如 0" />
+              </div>
+              <div class="form-group">
+                <label class="switch-wrap">
+                  <input
+                    type="checkbox"
+                    class="switch-input"
+                    data-detail-setting="skip-captured"
+                    checked />
+                  <span class="switch-slider" aria-hidden="true"></span>
+                  <span class="switch-label">增量采集(跳过已采过的笔记)</span>
+                </label>
+                <p class="form-hint">采集增强时自动跳过之前已采过的笔记,减少重复导航、防风控、提速。</p>
+              </div>
+              <div class="form-group batch-settings">
+                <div class="batch-settings-block">
+                  <div class="batch-settings-head">
+                    采集排序 / 范围
+                    <span class="batch-settings-sub">小红书 / 抖音通用 · 采集前自动切换</span>
+                  </div>
+                  <div class="batch-field-grid">
+                    <label class="batch-field">
+                      <span>排序</span>
+                      <select class="batch-select" id="selectSearchSort">
+                        <option value="comprehensive">综合(默认)</option>
+                        <option value="latest">最新</option>
+                        <option value="likes">最多点赞</option>
+                        <option value="comments">最多评论</option>
+                        <option value="collects">最多收藏</option>
+                      </select>
+                    </label>
+                    <label class="batch-field">
+                      <span>发布时间</span>
+                      <select class="batch-select" id="selectSearchPublishTime">
+                        <option value="all">不限(默认)</option>
+                        <option value="day">一天内</option>
+                        <option value="week">一周内</option>
+                        <option value="month">一月内</option>
+                        <option value="halfyear">半年内</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+                <div class="batch-settings-block">
+                  <label class="batch-field">
+                    <span>定时启动 <span class="batch-settings-sub">留空 = 立即;指定则到点才开跑</span></span>
+                    <input type="datetime-local" class="batch-num-input" id="inputSearchScheduledStart" />
+                  </label>
+                  <label class="batch-loop-toggle">
+                    <input type="checkbox" id="chkSearchAutoLoop" />
+                    <span class="batch-loop-toggle-text">🌙 无人值守循环</span>
+                    <span class="batch-settings-sub">跑完一轮自动再跑 · 供专机夜间采集</span>
+                  </label>
+                  <div class="batch-field-grid batch-loop-fields is-disabled" id="searchLoopFields">
+                    <label class="batch-field">
+                      <span>每轮间隔(分钟)</span>
+                      <input type="number" class="batch-num-input" id="inputSearchLoopGapMin" value="10" min="0" />
+                    </label>
+                    <label class="batch-field">
+                      <span>循环轮数</span>
+                      <input type="number" class="batch-num-input" id="inputSearchLoopRounds" placeholder="留空 = 1 轮" min="1" />
+                    </label>
+                  </div>
+                </div>
               </div>
               <div
                 class="detail-enhance-card"
@@ -834,25 +922,6 @@
                 id="btnCaptureSearch"
                 disabled>
                 采集当前搜索结果
-              </button>
-              <button
-                class="btn btn-secondary btn-icon-only btn-batch-trigger"
-                id="btnOpenBatchSearch"
-                title="批量关键词笔记采集">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round">
-                  <path d="m12 3 8 4-8 4-8-4 8-4z" />
-                  <path d="m4 11 8 4 8-4" />
-                  <path d="m4 15 8 4 8-4" />
-                </svg>
               </button>
             </div>
           </div>
@@ -2294,17 +2363,68 @@
                 <label class="form-label"
                   >手动关键词列表
                   <span class="form-label-hint"
-                    >每行一个，最多 10 个</span
+                    >每行一个，最多 30 个</span
                   ></label
                 >
                 <textarea
                   class="form-input batch-textarea"
                   id="textareaBatchKeywords"
-                  placeholder="输入要采集的关键词，每行一个，最多 10 个"></textarea>
+                  placeholder="输入要采集的关键词，每行一个，最多 30 个"></textarea>
                 <div
                   class="batch-keyword-limit"
                   id="batchKeywordLimitHint">
-                  0 / 10
+                  0 / 30
+                </div>
+              </div>
+            </div>
+            <div class="form-group batch-settings">
+              <div class="batch-settings-block">
+                <div class="batch-settings-head">
+                  采集排序 / 范围
+                  <span class="batch-settings-sub">小红书 / 抖音通用 · 采集前自动切换</span>
+                </div>
+                <div class="batch-field-grid">
+                  <label class="batch-field">
+                    <span>排序</span>
+                    <select class="batch-select" id="selectBatchSort">
+                      <option value="comprehensive">综合(默认)</option>
+                      <option value="latest">最新</option>
+                      <option value="likes">最多点赞</option>
+                      <option value="comments">最多评论</option>
+                      <option value="collects">最多收藏</option>
+                    </select>
+                  </label>
+                  <label class="batch-field">
+                    <span>发布时间</span>
+                    <select class="batch-select" id="selectBatchPublishTime">
+                      <option value="all">不限(默认)</option>
+                      <option value="day">一天内</option>
+                      <option value="week">一周内</option>
+                      <option value="month">一月内</option>
+                      <option value="halfyear">半年内</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+              <div class="batch-settings-block">
+                <label class="batch-field">
+                  <span>定时启动 <span class="batch-settings-sub">留空 = 立即;指定则到点才开跑(配合无人值守=夜里定点开采)</span></span>
+                  <input type="datetime-local" class="batch-num-input" id="inputBatchScheduledStart" />
+                </label>
+                <label class="batch-loop-toggle">
+                  <input type="checkbox" id="chkAutoLoop" />
+                  <span class="batch-loop-toggle-text">🌙 无人值守循环</span>
+                  <span class="batch-settings-sub">跑完一轮自动再跑 · 供专机夜间采集</span>
+                </label>
+                <div class="batch-field-grid batch-loop-fields is-disabled" id="batchLoopFields">
+                  <label class="batch-field">
+                    <span>每轮间隔(分钟)</span>
+                    <input type="number" class="batch-num-input" id="inputLoopGapMin" value="10" min="0" />
+                  </label>
+                  <label class="batch-field">
+                    <span>循环轮数</span>
+                    <input type="number" class="batch-num-input" id="inputLoopRounds" placeholder="留空 = 1 轮" min="1" />
+                  </label>
                 </div>
               </div>
             </div>
@@ -2326,11 +2446,8 @@
                 id="batchProgressFill"
                 style="width: 0%"></div>
             </div>
-            <div
-              class="keyword-batch-progress-text"
-              id="batchProgressText">
-              准备就绪
-            </div>
+            <div class="keyword-batch-progress-text" id="batchProgressText">准备就绪</div>
+            <div class="keyword-batch-progress-detail" id="batchProgressDetail" hidden></div>
           </div>
         </div>
       </div>

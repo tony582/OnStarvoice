@@ -5,6 +5,7 @@ import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
 import { parseMetricNumber, resolveMetricFromPayload } from '../utils/metrics.js';
+import { queryAll } from '../db/init.js';
 
 const router = Router();
 const commentWorkflowQueue = [];
@@ -12,6 +13,16 @@ let commentWorkflowRunning = false;
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+// 内部 ID(非「人看的号」):小红书 24 位 hex user_id / 抖音 sec_uid(MS4w 开头)。
+// account_no 只存「人看的号」(小红书号/抖音号),内部 ID 不入此列。
+function isInternalUid(value) {
+  const s = String(value || '').trim();
+  if (!s) return true;
+  if (/^[0-9a-f]{24}$/i.test(s)) return true;
+  if (/^MS4w/i.test(s)) return true;
+  return false;
 }
 
 function firstPayloadItem(payload) {
@@ -187,6 +198,19 @@ function normalizeRecord(body) {
       publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw')),
       tags: JSON.stringify(tags),
       blogger_profile_url: String(get('bloggerProfileUrl', 'authorProfileUrl', 'authorUrl', 'profileUrl')),
+      // 「人看的号」:号采到时落在 bloggerUserId(增强补)/ redId / douyinId(抖音号)/ bloggerId(小红书主页号)。
+      // 逐个取、挑第一个非内部ID的(抖音 bloggerId 是 sec_uid → 被过滤,真号在 douyinId)。
+      author_account_no: String(
+        [
+          get('bloggerUserId'),
+          get('redId'),
+          get('douyinId'),
+          get('authorUsername'),
+          get('bloggerId'),
+        ]
+          .map((v) => String(v || '').trim())
+          .find((v) => v && !isInternalUid(v)) || '',
+      ),
       image_urls: JSON.stringify(imageUrls),
       comments_text: String(get('commentsMergedText')),
       comments_cleaned_items: JSON.stringify(commentsCleanedItems),
@@ -355,6 +379,31 @@ router.post('/batch', requireAuth, async (req, res) => {
       failed,
     },
   });
+});
+
+// 增量采集:扩展补采前问「这些 external_id 哪些已采全」(detailCaptureStatus=done)。
+// 已采全的扩展就跳过、不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。
+router.post('/captured', requireAuth, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.externalIds) ? req.body.externalIds : [];
+    const externalIds = ids.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 1000);
+    if (externalIds.length === 0) {
+      return res.json({ ok: true, captured: [] });
+    }
+    const platform = String(req.body?.platform || '').trim();
+    const params = [req.tenantId, externalIds];
+    let sql = `SELECT DISTINCT external_id FROM records
+                WHERE tenant_id = $1 AND external_id = ANY($2)
+                  AND payload->>'detailCaptureStatus' = 'done'`;
+    if (platform) {
+      params.push(platform);
+      sql += ` AND platform = $${params.length}`;
+    }
+    const rows = await queryAll(sql, params);
+    return res.json({ ok: true, captured: rows.map((r) => r.external_id) });
+  } catch (err) {
+    return res.json({ ok: false, error: 'server_error', message: err?.message || '查询失败', captured: [] });
+  }
 });
 
 export default router;

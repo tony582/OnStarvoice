@@ -2,15 +2,19 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   ChevronLeft, ChevronRight, ExternalLink, Loader2, MessageSquareWarning,
   RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles, Download,
+  X, ArrowUp, ArrowDown, ChevronsUpDown,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { compact, formatDate, formatDateCompact, formatNumber, LABELS, platformName } from '@/lib/utils'
+import { compact, formatDate, formatDateCompact, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
+import { MultiSelect } from '@/components/shared/MultiSelect'
+import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
+import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
@@ -53,6 +57,9 @@ const PLATFORM_OPTIONS = [
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
 ]
+// 类型多选选项(去掉「全部」与 sales_intent)
+const LEAD_TYPE_MULTI = TYPE_OPTIONS.filter(o => o.value && o.value !== 'sales_intent').map(o => ({ value: o.value, label: o.label }))
+type LeadSortField = 'publish' | 'first_seen' | 'last_seen'
 
 export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record<string, string>; category?: 'opinion' | 'sales' }) {
   const isSales = category === 'sales'
@@ -65,11 +72,14 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [error, setError] = useState('')
   const [status, setStatus] = useState(initial?.status ?? (category === 'sales' ? '' : 'pending'))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
-  const [leadType, setLeadType] = useState(initial?.leadType ?? '')
+  const [leadType, setLeadType] = useState<string[]>(initial?.leadType ? [initial.leadType] : [])
   const [priority, setPriority] = useState(initial?.priority ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
-  const [sort, setSort] = useState<'default' | 'publish'>('default')
+  const [sort, setSort] = useState<{ field: '' | LeadSortField; dir: 'asc' | 'desc' }>({ field: '', dir: 'desc' })
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [koe, setKoe] = useState('')
   const [exporting, setExporting] = useState(false)
   const [rejudging, setRejudging] = useState(false)
@@ -86,14 +96,17 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     if (isSales) { if (status) params.set('status', status) }
     else params.set('bucket', status || 'pending')
     if (platform) params.set('platform', platform)
-    if (leadType && !isSales) params.set('leadType', leadType)
+    if (!isSales) leadType.forEach(t => params.append('leadType', t))
     if (priority) params.set('priority', priority)
     if (keyword.trim()) params.set('keyword', keyword.trim())
-    if (sort === 'publish') params.set('sort', 'publish')
+    if (sort.field) { params.set('sort', sort.field); params.set('dir', sort.dir) }
     if (koe && !isSales) params.set('koe', koe)
     captureKeywords.forEach(k => params.append('captureKeyword', k))
+    if (dateFrom) params.set('dateFrom', dateFrom)
+    if (dateTo) params.set('dateTo', dateTo)
+    if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords])
+  }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords, dateFrom, dateTo, dateBasis])
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -119,7 +132,15 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     finally { setExporting(false) }
   }
 
-  useEffect(() => { load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 点表头排序:点未激活列 → 降序;再点 → 升/降切换
+  const toggleSort = (field: LeadSortField) =>
+    setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
+  const hasActiveFilters = Boolean(platform || leadType.length || priority || keyword || (!isSales && koe) || captureKeywords.length || sort.field || dateFrom || dateTo)
+  const clearFilters = () => {
+    setPlatform(''); setLeadType([]); setPriority(''); setKeyword(''); setKoe(''); setCaptureKeywords([]); setSort({ field: '', dir: 'desc' }); setDateFrom(''); setDateTo('')
+  }
 
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
@@ -186,9 +207,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
         {!isSales && (
-          <WorkbenchSelect value={leadType} onChange={e => setLeadType(e.target.value)}>
-            {TYPE_OPTIONS.filter(o => o.value !== 'sales_intent').map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-          </WorkbenchSelect>
+          <MultiSelect label="类型" options={LEAD_TYPE_MULTI} value={leadType} onChange={setLeadType} width="w-52" />
         )}
         {!isSales && (
           <WorkbenchSelect value={koe} onChange={e => setKoe(e.target.value)}>
@@ -201,11 +220,13 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           {PRIORITY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </WorkbenchSelect>
         <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
-        <button onClick={() => setSort(s => s === 'publish' ? 'default' : 'publish')}
-          title="按评论发布时间从新到旧排序"
-          className={`rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors ${sort === 'publish' ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
-          最新发布
-        </button>
+        <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
+        {hasActiveFilters && (
+          <button onClick={clearFilters} title="清空所有筛选"
+            className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+            <X className="h-3.5 w-3.5" />清空
+          </button>
+        )}
         <div className="relative min-w-[260px] flex-1 sm:flex-none">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -244,7 +265,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
           <div className="overflow-x-auto">
             <table className="w-full min-w-[920px] text-sm">
               <thead>
-                <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
+                <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-3 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
                   {canWrite() && (
                     <th className="w-10 px-4 py-2.5">
                       <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(l => l.id), !allChecked)} />
@@ -255,9 +276,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">类型</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">优先级</th>
                   <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">发布时间</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">首次发现</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">最近采集</th>
+                  <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} />
+                  <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} />
+                  <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} />
                   <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">采集次数</th>
                   <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
                 </tr>
@@ -281,7 +302,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                       <div className="flex items-center gap-1.5">
                         <span className="font-medium text-foreground">{lead.comment_author_name || '-'}</span>
                         {(lead.comment_source_type === 'dealer' || lead.comment_source_type === 'employee') && (
-                          <span title="作者名含品牌/车型词,疑似经销商/员工软文,非真实车主 UGC" className="shrink-0 cursor-help rounded bg-violet-500/15 px-1 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+                          <Tooltip text="作者名含品牌/车型词,疑似经销商/员工软文,非真实车主 UGC,研判时建议剔除">
+                            <span className="shrink-0 cursor-help rounded bg-violet-500/15 px-1 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
+                          </Tooltip>
                         )}
                       </div>
                       <div className="mt-0.5 whitespace-nowrap text-muted-foreground">IP {lead.comment_ip_location || '-'} · 赞 {formatNumber(lead.comment_like_count)}</div>
@@ -359,5 +382,27 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
       {dialog}
       {dispatchDialog}
     </div>
+  )
+}
+
+/* 可排序表头:点击切换该列升/降序,激活列实心箭头,未激活淡色双箭头 */
+function SortableTh({ label, field, sort, onSort, align = 'left', className = '' }: {
+  label: string
+  field: LeadSortField
+  sort: { field: string; dir: 'asc' | 'desc' }
+  onSort: (field: LeadSortField) => void
+  align?: 'left' | 'right'
+  className?: string
+}) {
+  const active = sort.field === field
+  const Arrow = active ? (sort.dir === 'desc' ? ArrowDown : ArrowUp) : ChevronsUpDown
+  return (
+    <th className={cn('px-4 py-2.5 text-[12px] font-medium text-muted-foreground', align === 'right' ? 'text-right' : 'text-left', className)}>
+      <button onClick={() => onSort(field)} title="点击切换排序"
+        className={cn('inline-flex items-center gap-1 align-middle uppercase tracking-wider transition-colors hover:text-foreground', active && 'text-foreground')}>
+        {label}
+        <Arrow className={cn('h-3 w-3', active ? 'opacity-100' : 'opacity-30')} strokeWidth={2.5} />
+      </button>
+    </th>
   )
 }
