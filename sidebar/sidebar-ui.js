@@ -1060,7 +1060,6 @@ document.addEventListener("DOMContentLoaded", () => {
     const expire = document.getElementById("uiAuthExpire");
     const userName = document.getElementById("uiAuthUserName");
     const tenantName = document.getElementById("uiAuthTenantName");
-    const credits = document.getElementById("uiAuthCredits");
     const inputCode = document.getElementById("inputCode");
     const claimHint = document.getElementById("uiAuthClaimHint");
     const claimConfigHint = document.getElementById("uiClaimConfigHint");
@@ -1072,7 +1071,6 @@ document.addEventListener("DOMContentLoaded", () => {
       !expire ||
       !userName ||
       !tenantName ||
-      !credits ||
       !inputCode
     ) {
       return;
@@ -1113,9 +1111,6 @@ document.addEventListener("DOMContentLoaded", () => {
           ? UNCLAIMED_CREDENTIAL_OWNER_LABEL
           : authConfig.user?.name || "-";
         tenantName.textContent = authConfig.tenant?.name || "-";
-        credits.textContent = authConfig.credentialCredit
-          ? `${authConfig.credentialCredit.remainingCredits ?? 0} / ${authConfig.credentialCredit.totalCredits ?? 0}`
-          : "暂无";
         break;
 
       case AUTH_STATUS.FAILED:
@@ -1132,7 +1127,6 @@ document.addEventListener("DOMContentLoaded", () => {
         expire.textContent = "-";
         userName.textContent = "-";
         tenantName.textContent = "-";
-        credits.textContent = "-";
         break;
 
       case AUTH_STATUS.VERIFYING:
@@ -1141,9 +1135,6 @@ document.addEventListener("DOMContentLoaded", () => {
         badge.style.color = "var(--status-info)";
         userName.textContent = authConfig.user?.name || "-";
         tenantName.textContent = authConfig.tenant?.name || "-";
-        credits.textContent = authConfig.credentialCredit
-          ? `${authConfig.credentialCredit.remainingCredits ?? 0} / ${authConfig.credentialCredit.totalCredits ?? 0}`
-          : "-";
         break;
 
       case AUTH_STATUS.IDLE:
@@ -1155,7 +1146,6 @@ document.addEventListener("DOMContentLoaded", () => {
         expire.textContent = "-";
         userName.textContent = "-";
         tenantName.textContent = "-";
-        credits.textContent = "-";
         break;
     }
   });

@@ -476,6 +476,27 @@ function createListCaptureCacheStats(session, extra = {}) {
   };
 }
 
+// 本 fork 自加(合并上游务必保留):列表去重命中「已存记录」时,把这次采到的【易变互动数】
+// (点赞/评论/收藏/转发)就地刷新进已存记录 —— 否则同一帖第二次起永远停在首采的旧/空值,
+// 监控命中的互动数永远不更新(codex/gemini review #6,实测确诊)。
+// 只动这 4 个数值字段,绝不动 title/cover/detailPayload/号/评论;0/空不覆盖已有好值
+// (对齐后端 record-store 的 COALESCE NULLIF 0)。命中并更新返回 true。
+function refreshListCaptureMetricsInPlace(existingRecord, freshRecord) {
+  const existingItem = existingRecord?.payload?.items?.[0];
+  const freshItem = freshRecord?.payload?.items?.[0];
+  if (!existingItem || typeof existingItem !== 'object') return false;
+  if (!freshItem || typeof freshItem !== 'object') return false;
+  let changed = false;
+  for (const field of ['likes', 'comments', 'collects', 'shares']) {
+    const next = parseInteractionCount(freshItem[field]);
+    if (!(next > 0)) continue; // 0/空:这次没采到,不覆盖已有好值
+    if (parseInteractionCount(existingItem[field]) === next) continue; // 没变化,不动
+    existingItem[field] = next;
+    changed = true;
+  }
+  return changed;
+}
+
 async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
   const normalizedRecords = Array.isArray(records) ? records.filter(Boolean) : [];
   if (normalizedRecords.length === 0) {
@@ -490,7 +511,8 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
   const dataPool = await getDataPool();
   const existingRecords = Array.isArray(dataPool.records) ? dataPool.records : [];
   const keyToRecord = buildDataPoolIdentityIndex(existingRecords);
-  const savedRecords = [];
+  const savedRecords = []; // 全新记录:入本地池(unshift)+ 同步
+  const refreshedRecords = []; // 已存但刷新了互动数:就地改 + 同步,但不 unshift(避免本地重复)
   const skippedRecordIds = [];
   let skippedCount = 0;
 
@@ -513,8 +535,14 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     if (existingRecord) {
       skippedCount += 1;
       const existingId = String(existingRecord.id || '').trim();
-      if (existingId) skippedRecordIds.push(existingId);
       keys.forEach((key) => session?.knownKeys?.add(key));
+      // 不再整条丢弃:把这次采到的互动数就地刷新进已存记录并纳入同步;
+      // 没刷新到(0/空/没变)才按「已采过」计入 skipped。
+      if (refreshListCaptureMetricsInPlace(existingRecord, record)) {
+        refreshedRecords.push(existingRecord);
+      } else if (existingId) {
+        skippedRecordIds.push(existingId);
+      }
       continue;
     }
 
@@ -526,23 +554,28 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
   }
 
   if (savedRecords.length > 0) {
-    dataPool.records.unshift(...savedRecords);
+    dataPool.records.unshift(...savedRecords); // 只 unshift 全新记录
+  }
+  if (savedRecords.length > 0 || refreshedRecords.length > 0) {
+    // 刷新的记录是 dataPool.records 内的引用、已就地改 → 一并持久化
     await setDataPool(dataPool);
   }
 
-  const savedRecordIds = savedRecords.map((record) => record?.id).filter(Boolean);
+  // 全新 + 已存刷新的,都回传给调用方同步(后端按新互动数 upsert)
+  const syncRecords = [...savedRecords, ...refreshedRecords];
+  const savedRecordIds = syncRecords.map((record) => record?.id).filter(Boolean);
   if (session) {
-    session.stats.savedCount += savedRecords.length;
+    session.stats.savedCount += savedRecords.length; // 统计「新增」只算全新,刷新不计新增
     session.stats.skippedCount += skippedCount;
     session.stats.lastSavedCount = savedRecords.length;
     session.stats.lastSkippedCount = skippedCount;
-    session.savedRecords.push(...savedRecords);
+    session.savedRecords.push(...syncRecords);
     pushUnique(session.savedRecordIds, savedRecordIds);
     pushUnique(session.skippedRecordIds, skippedRecordIds);
   }
 
   return {
-    savedRecords,
+    savedRecords: syncRecords,
     skippedCount,
     skippedRecordIds: [...new Set(skippedRecordIds)],
     recordIds: [...new Set([...savedRecordIds, ...skippedRecordIds])],

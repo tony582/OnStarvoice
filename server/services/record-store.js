@@ -177,6 +177,7 @@ export async function upsertCapturedRecord(record, context) {
             ELSE $31::jsonb
           END,
           auth_code = COALESCE(NULLIF($32, ''), auth_code),
+          author_account_no = COALESCE(NULLIF($34, ''), author_account_no),
           last_seen_at = now(),
           seen_count = seen_count + 1,
           updated_at = now()
@@ -199,6 +200,7 @@ export async function upsertCapturedRecord(record, context) {
         payload,
         authCode,
         existing.id,
+        record.author_account_no || '', // $34:人看的号(空不覆盖,见 COALESCE NULLIF)
       ]);
 
       const observationId = await insertObservation(tx, { tenantId, recordId: existing.id, authCode, monitorExecutionId, record: { ...record, payload } });
@@ -231,7 +233,7 @@ export async function upsertCapturedRecord(record, context) {
         video_url, audio_url, video_duration,
         comments_capture_status, comments_total_captured,
         capture_timestamp,
-        keyword, source_type, payload, auth_code, content_hash
+        keyword, source_type, payload, auth_code, content_hash, author_account_no
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10,
@@ -243,7 +245,7 @@ export async function upsertCapturedRecord(record, context) {
         $26, $27, $28,
         $29, $30,
         $31,
-        $32, $33, $34::jsonb, $35, $36
+        $32, $33, $34::jsonb, $35, $36, $37
       )
       RETURNING id
     `, [
@@ -259,6 +261,7 @@ export async function upsertCapturedRecord(record, context) {
       record.comments_capture_status || '', cleanNumber(record.comments_total_captured),
       record.capture_timestamp || '',
       record.keyword || '', record.source_type || '', payload, authCode, contentHash,
+      record.author_account_no || '', // $37:人看的号
     ]);
 
     const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });

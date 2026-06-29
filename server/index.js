@@ -102,6 +102,11 @@ app.get(['/about', '/contact', '/changelog', '/pricing'], (req, res) => {
   res.sendFile(join(__dirname, 'public', 'about.html'));
 });
 
+// 使用教程 / 常见问题(插件「使用教程」「常见问题」入口指向此页;#guide / #faq 锚点定位)
+app.get(['/help', '/guide', '/faq', '/tutorial'], (req, res) => {
+  res.sendFile(join(__dirname, 'public', 'help.html'));
+});
+
 // ==================== API 路由 ====================
 
 app.use('/api/auth', authRouter);

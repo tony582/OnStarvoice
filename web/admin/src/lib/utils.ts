@@ -28,6 +28,19 @@ export function formatDate(v: string | undefined | null): string {
   }
 }
 
+// 到期日:绝对日期(YYYY-MM-DD) + 剩余天数,已过期返回 expired=true 供飘红。
+// 注意:不要用 formatDate(那是相对"多久前",对未来日期 diff 为负会恒落进"刚刚"分支)。
+export function formatExpiry(v: string | undefined | null): { text: string; expired: boolean } {
+  if (!v) return { text: '-', expired: false }
+  const d = new Date(v)
+  if (isNaN(d.getTime())) return { text: v, expired: false }
+  const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  const diffDays = Math.ceil((d.getTime() - Date.now()) / 86400000)
+  if (diffDays < 0) return { text: `${dateStr}(已过期)`, expired: true }
+  if (diffDays === 0) return { text: `${dateStr}(今天到期)`, expired: false }
+  return { text: `${dateStr}(剩 ${diffDays} 天)`, expired: false }
+}
+
 export function formatFullDate(v: string | undefined | null): string {
   if (!v) return '-'
   try {

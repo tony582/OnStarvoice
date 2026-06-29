@@ -13,6 +13,9 @@ extension-build/
 extension-build.crx
 extension-build.pem
 
+# 本地 Claude Code 恢复历史，不属于产品源码
+claude_history/
+
 # 扩展打包产物与签名私钥(勿提交)
 *.pem
 StarVoice.crx

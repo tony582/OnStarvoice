@@ -247,7 +247,14 @@ export async function captureDouyinBloggerNotes({
             matchesKeywordFilter(item.title || "", parsedKeywords),
           )
         : likesFiltered;
-      return filteredItems
+      // 本 fork 修(review #2):账号监控的发布时间窗(严格昨天/24h)必须作用到最终 items ——
+      // checkpoint 与最终结果都经此函数;否则窗口算了却不生效,会一直刷到很早的旧帖(刷到2024)。
+      // 无 strict 窗口(非监控采集)时 filterMonitorProfileItemsByPublishWindow 直接 no-op,不受影响。
+      const windowFiltered = filterMonitorProfileItemsByPublishWindow(
+        filteredItems,
+        monitorWindow,
+      );
+      return windowFiltered
         .slice(0, normalizedMaxDetectedItems)
         .map((item) => ({
           ...item,

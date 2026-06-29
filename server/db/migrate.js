@@ -123,8 +123,18 @@ export async function runMigrations() {
     const appliedRows = await client.query('SELECT version FROM schema_migrations');
     const applied = new Set(appliedRows.rows.map(row => row.version));
 
+    // 破坏性「清库」迁移(reset_captured_data / reset_anjixing 等会 DELETE records/issues/…)移出自动链:
+    // 默认启动时【不跑】—— 否则备份恢复、或拿生产数据灌一个 schema_migrations 不同步的新库时,启动即清库。
+    // 需要时显式 ALLOW_RESET_MIGRATIONS=1 启动一次(或单独跑 maintenance)。已 applied 的不受影响。
+    const RESET_MIGRATION_RE = /reset/i;
+    const allowReset = process.env.ALLOW_RESET_MIGRATIONS === '1';
+
     for (const file of files) {
       if (applied.has(file)) continue;
+      if (RESET_MIGRATION_RE.test(file) && !allowReset) {
+        console.warn(`[DB] 跳过破坏性 reset 迁移 ${file}(不自动执行;需 ALLOW_RESET_MIGRATIONS=1 才跑)`);
+        continue;
+      }
       const sql = await readFile(join(migrationsDir, file), 'utf8');
       console.log(`[DB] Applying migration ${file}`);
       await client.query('BEGIN');

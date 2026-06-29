@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Loader2, Building2, Users, KeyRound, Settings as SettingsIcon, Save } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatDate, LABELS } from '@/lib/utils'
+import { formatDate, formatExpiry, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -248,17 +248,20 @@ export function AuthCodesPage() {
       </section>
 
       {loading ? <Spin /> : !codes.length ? <EmptyState icon={KeyRound} title="暂无激活码" /> : (
-        <Table heads={['激活码', '类型', '状态', '客户', '绑定', '过期']}>
-          {codes.map(c => (
+        <Table heads={['激活码', '类型', '状态', '客户', '绑定', '到期日']}>
+          {codes.map(c => {
+            const exp = formatExpiry(c.expires_at)
+            return (
             <tr key={c.id} className="transition-colors hover:bg-muted/30">
               <td className="px-4 py-3"><code className="rounded bg-muted px-2 py-0.5 text-xs font-mono">{c.code}</code><div className="mt-0.5 text-xs text-muted-foreground">{c.tenant_name}</div></td>
               <td className="px-4 py-3"><StatusBadge tone="neutral">{c.type}</StatusBadge></td>
               <td className="px-4 py-3"><StatusBadge tone={c.status}>{c.status}</StatusBadge></td>
               <td className="px-4 py-3 text-sm">{c.owner_name || c.owner_email || '-'}</td>
               <td className="px-4 py-3 tabular-nums text-sm">{c.binding_count} / {c.max_bindings}</td>
-              <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(c.expires_at)}</td>
+              <td className={`px-4 py-3 text-sm ${exp.expired ? 'text-destructive' : 'text-muted-foreground'}`}>{exp.text}</td>
             </tr>
-          ))}
+            )
+          })}
         </Table>
       )}
     </div>

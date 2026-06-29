@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>StarVoice 星语 · 使用教程与常见问题</title>
+  <meta name="description" content="StarVoice 星语 使用教程与常见问题 —— 激活、采集、评论与客资、防风控、数据查看。" />
+  <style>
+    :root { --fg:#1d1f23; --muted:#6b7280; --line:#ececf0; --primary:#2f6fed; --bg:#f7f8fa; --card:#fff; --warn:#b45309; --warnbg:#fff7ed; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg);
+      font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",system-ui,sans-serif;
+      -webkit-font-smoothing:antialiased; line-height:1.6; }
+    a { color:var(--primary); }
+    .wrap { max-width:760px; margin:0 auto; padding:32px 20px 64px; }
+    header { display:flex; align-items:center; gap:12px; padding:8px 0 16px; }
+    .logo { width:40px; height:40px; border-radius:11px; background:var(--primary);
+      display:flex; align-items:center; justify-content:center; color:#fff; font-weight:800; font-size:18px; }
+    h1 { font-size:20px; margin:0; }
+    .sub { color:var(--muted); font-size:13px; margin-top:2px; }
+    /* 顶部锚点导航 */
+    .nav { position:sticky; top:0; z-index:5; display:flex; gap:8px; padding:10px 0;
+      background:linear-gradient(var(--bg) 70%, transparent); margin-bottom:4px; }
+    .nav a { text-decoration:none; font-size:13.5px; font-weight:600; color:var(--muted);
+      border:1px solid var(--line); background:var(--card); border-radius:99px; padding:6px 14px; }
+    .nav a:hover { color:var(--primary); border-color:var(--primary); }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:24px; margin-top:18px; scroll-margin-top:60px; }
+    h2 { font-size:16px; margin:0 0 14px; display:flex; align-items:center; gap:8px; }
+    h2 .dot { width:7px; height:7px; border-radius:99px; background:var(--primary); }
+    h3 { font-size:14px; margin:20px 0 8px; }
+    p { margin:0 0 10px; }
+    .muted { color:var(--muted); font-size:13.5px; }
+    /* 步骤 */
+    .steps { list-style:none; margin:0; padding:0; counter-reset:s; }
+    .steps > li { position:relative; padding:0 0 16px 40px; counter-increment:s; }
+    .steps > li:before { content:counter(s); position:absolute; left:0; top:0;
+      width:26px; height:26px; border-radius:99px; background:#eef3ff; color:var(--primary);
+      font-weight:800; font-size:13px; display:flex; align-items:center; justify-content:center; }
+    .steps > li:not(:last-child):after { content:""; position:absolute; left:13px; top:30px; bottom:2px;
+      width:1px; background:var(--line); }
+    .steps b { font-size:14.5px; }
+    .steps .d { color:#33363d; font-size:13.5px; margin-top:2px; }
+    /* 表格 */
+    table { width:100%; border-collapse:collapse; font-size:13.5px; margin:6px 0 4px; }
+    th, td { border:1px solid var(--line); padding:8px 10px; text-align:left; }
+    th { background:#fafbfc; color:var(--muted); font-weight:600; }
+    td b { color:var(--fg); }
+    /* 提示框 */
+    .tip { display:flex; gap:10px; background:var(--warnbg); border:1px solid #fed7aa; color:var(--warn);
+      border-radius:11px; padding:12px 14px; font-size:13.5px; margin:12px 0 2px; }
+    .tip svg { flex:none; margin-top:2px; }
+    .kbd { font-size:12.5px; background:#f1f3f6; border:1px solid var(--line); border-radius:6px; padding:1px 6px; }
+    /* FAQ */
+    .faq { margin-top:2px; }
+    details { border-top:1px dashed var(--line); padding:12px 0; }
+    details:first-of-type { border-top:none; }
+    summary { cursor:pointer; font-weight:600; font-size:14px; list-style:none; display:flex; gap:8px; align-items:flex-start; }
+    summary::-webkit-details-marker { display:none; }
+    summary:before { content:"＋"; color:var(--primary); font-weight:800; flex:none; }
+    details[open] summary:before { content:"－"; }
+    details .a { color:#33363d; font-size:13.5px; margin:8px 0 0 18px; }
+    footer { text-align:center; color:var(--muted); font-size:12px; margin-top:28px; }
+    footer a { margin:0 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo"><svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M9 4 L10.4 10.4 L16 12 L10.4 13.6 L9 20 L7.6 13.6 L2 12 L7.6 10.4 Z" fill="#fff"/><path d="M17.4 8 A5 5 0 0 1 17.4 16" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/><path d="M20.1 5.5 A8 8 0 0 1 20.1 18.5" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" opacity="0.7"/></svg></div>
+      <div>
+        <h1>StarVoice 星语 · 帮助中心</h1>
+        <div class="sub">社媒舆情智能巡检 · 小红书 / 抖音 / 微博</div>
+      </div>
+    </header>
+
+    <div class="nav">
+      <a href="#guide">使用教程</a>
+      <a href="#faq">常见问题</a>
+      <a href="/about">关于与联系</a>
+    </div>
+
+    <!-- ==================== 使用教程 ==================== -->
+    <section class="card" id="guide">
+      <h2><span class="dot"></span>使用教程</h2>
+      <p class="muted">StarVoice 星语 是一款浏览器侧边栏扩展:在小红书 / 抖音 / 微博的页面上一键采集作品、评论与博主数据,自动归集到云端后台(并可同步飞书),用于品牌舆情巡检与内容研究。</p>
+
+      <h3>五步快速上手</h3>
+      <ol class="steps">
+        <li>
+          <b>安装并固定扩展</b>
+          <div class="d">安装后点浏览器右上角拼图图标,把「StarVoice 星语」固定到工具栏。点击图标即可在右侧打开侧边栏面板。</div>
+        </li>
+        <li>
+          <b>激活绑定</b>
+          <div class="d">在侧栏展开「产品授权状态」,输入客户经理提供的<b>激活码</b>(形如 <span class="kbd">OSV-A-XXXXXXXX</span>),点「验证并绑定」。绑定成功后会显示所属客户、到期时间与环境绑定数。每个激活码可绑定固定数量的环境(浏览器),达上限可在验证时替换旧环境。</div>
+        </li>
+        <li>
+          <b>(可选)配置数据同步</b>
+          <div class="d">若贵司使用飞书多维表,展开「数据同步配置」填入飞书 App Token 与表格信息,采集结果会同步进表。<b>即使不配置飞书,数据也会进入云端后台</b>,不影响使用。</div>
+        </li>
+        <li>
+          <b>到平台页面采集</b>
+          <div class="d">打开小红书 / 抖音 / 微博对应页面,侧栏会自动识别页面类型并切到对应标签(内容页 / 主页 / 搜索页),按提示点采集即可。三种采集方式见下。</div>
+        </li>
+        <li>
+          <b>查看数据</b>
+          <div class="d">采集的数据进入云端后台 <a href="/admin" target="_blank" rel="noopener">voice.minilife.online/admin</a>(用后台账号登录),在「舆情风控 / 内容创意」工作区查看分诊、看板与报告;若配置了飞书则同步到飞书表。</div>
+        </li>
+      </ol>
+
+      <h3>支持的平台与页面</h3>
+      <table>
+        <thead><tr><th>平台</th><th>内容页(单篇)</th><th>主页(博主)</th><th>搜索页(关键词)</th><th>对标监控</th></tr></thead>
+        <tbody>
+          <tr><td><b>小红书</b></td><td>笔记页</td><td>博主页</td><td>搜索页</td><td>支持</td></tr>
+          <tr><td><b>抖音</b></td><td>作品页</td><td>账号页</td><td>搜索页</td><td>支持</td></tr>
+          <tr><td><b>微博</b></td><td>微博页</td><td>用户页</td><td>搜索页</td><td>支持</td></tr>
+        </tbody>
+      </table>
+
+      <h3>三种采集方式</h3>
+      <p class="muted"><b>① 内容页 —— 采单篇作品 + 评论。</b>打开任意一条笔记 / 视频 / 微博的<b>详情页</b>,侧栏切到「内容页」,点采集即可拿到这篇的正文、点赞 / 收藏 / 评论 / 转发指标,以及评论区内容。</p>
+      <p class="muted"><b>② 主页 —— 采某个博主的作品列表。</b>打开博主 / 账号 / 用户<b>主页</b>,侧栏切到「主页」,可批量采集 TA 的作品。支持<b>增量采集</b>(自动跳过已采过的)与<b>评论补采</b>。</p>
+      <p class="muted"><b>③ 搜索页 —— 按关键词批量采。</b>在平台内搜索关键词后,侧栏切到「搜索页」,可按关键词批量采集结果。可设置<b>点赞阈值</b>(只采高于该热度的)、<b>排序维度</b>,并开启<b>无人值守循环</b>挂机连采。</p>
+
+      <h3>评论与客资筛选</h3>
+      <p class="muted">在「评论区客资筛选配置」中可设定识别规则,系统会对评论作者作<b>疑似身份分级</b>(如 4S 店 / 同行 KOE / KOL / 真实用户),并识别销售客资线索,便于在后台研判时一键剔除非真实车主、聚焦真实声音。</p>
+
+      <h3>账号监控规则 / 对标监控</h3>
+      <p class="muted">在「账号监控规则」中可登记需要持续关注的账号(自有号或竞品对标号),配合后台监控中心做定期巡检与对比。</p>
+
+      <h3>采集偏好配置</h3>
+      <p class="muted">在「采集偏好配置」中可调整增量采集、抖音号补采、采集条间隔等。<b>条间隔</b>用于控制采集节奏、降低被平台风控的概率,默认值已较稳妥,通常无需改动。</p>
+
+      <div class="tip">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+        <div><b>防风控小贴士:</b>保持平台账号已登录;不要长时间高频连采;一旦页面弹出「安全验证 / 滑块」,请先<b>停止采集</b>、手动完成验证、稍候再继续。扩展已内置撞到风控即停的保护,但合理节奏仍是关键。</div>
+      </div>
+    </section>
+
+    <!-- ==================== 常见问题 ==================== -->
+    <section class="card" id="faq">
+      <h2><span class="dot"></span>常见问题</h2>
+      <div class="faq">
+
+        <details open>
+          <summary>支持哪些平台?</summary>
+          <div class="a">小红书、抖音、微博。在这三个平台的作品详情页、博主主页或搜索结果页打开侧栏即可采集。</div>
+        </details>
+
+        <details>
+          <summary>激活码绑定数满了怎么办?</summary>
+          <div class="a">每个激活码限定可绑定的环境(浏览器)数量。达上限时,在「验证并绑定」过程中可选择<b>替换</b>某个旧环境;若确需更多席位,请联系我们扩容。</div>
+        </details>
+
+        <details>
+          <summary>采集到的数据在哪里看?</summary>
+          <div class="a">统一进入云端后台 <a href="/admin" target="_blank" rel="noopener">voice.minilife.online/admin</a>,用后台账号登录后在「舆情风控 / 内容创意」工作区查看。若你在扩展里配置了飞书同步,则同时写入飞书多维表。</div>
+        </details>
+
+        <details>
+          <summary>为什么有的作品评论数 / 点赞数显示 0?</summary>
+          <div class="a">个别页面的版式差异会导致某项计数没读到,此时会回落为 0,<b>不影响</b>正文与评论内容的采集。刷新页面后重新采集通常即可恢复。</div>
+        </details>
+
+        <details>
+          <summary>采集时弹出「安全验证」或被限制?</summary>
+          <div class="a">这是平台的风控机制。请<b>停止当前采集</b>,在页面上手动完成验证(滑块 / 短信等),降低频率后再继续。扩展内置了「撞到风控即停」的保护以免越刷越严。</div>
+        </details>
+
+        <details>
+          <summary>笔记 / 图文的评论采不全?</summary>
+          <div class="a">请确保页面已滚动到评论区并展开「查看全部评论」,评论较多时采集需要一定时间逐步加载。如仍异常,可刷新后重采。</div>
+        </details>
+
+        <details>
+          <summary>扩展控制台里一直有一些报错,要紧吗?</summary>
+          <div class="a">大多是良性提示,不影响使用。例如 <span class="kbd">[SingleNote] Failed to extract … count</span> 是个别计数没读到、<span class="kbd">[CaptureSync] DETAIL_CAPTURE_CANCELED</span> 是你中途停止采集时的正常提示;此外浏览器还会记录所访问网站自身的 CSP 报错,与本扩展无关。如遇到明显影响功能的错误,请联系我们。</div>
+        </details>
+
+        <details>
+          <summary>怎么更新到最新版?</summary>
+          <div class="a">点侧栏右上角菜单的「检查更新」查看版本;企业客户版由我们提供新的安装包,按提示重新加载扩展即可。更新内容见 <a href="/changelog" target="_blank" rel="noopener">更新日志</a>。</div>
+        </details>
+
+        <details>
+          <summary>数据安全与隔离怎么保证?</summary>
+          <div class="a">采用多租户体系,每家客户拥有独立空间、数据完全隔离,通过专属激活码与后台账号开通,互不可见。</div>
+        </details>
+
+        <details>
+          <summary>遇到问题找谁?</summary>
+          <div class="a">采集、登录或激活码相关问题,欢迎随时通过 <a href="/about" target="_blank" rel="noopener">关于与联系</a> 页的微信 / 邮箱 / 电话与我们联系,我们会尽快协助。</div>
+        </details>
+
+      </div>
+    </section>
+
+    <footer>
+      <a href="#guide">使用教程</a>·<a href="#faq">常见问题</a>·<a href="/about">关于与联系</a>
+      <div style="margin-top:6px">© StarVoice 星语 · voice.minilife.online</div>
+    </footer>
+  </div>
+</body>
+</html>

@@ -1432,6 +1432,16 @@ function setupContactModalListeners() {
     closeContactModal();
   });
 
+  // 二维码图加载失败时隐藏整个二维码框。原来用内联 onerror= 会违反扩展 CSP(script-src 'self')
+  // 被拦下并刷错,改成 JS 绑定既消错又能真正生效。
+  const qrImage = overlay.querySelector(".contact-qr-image");
+  if (qrImage) {
+    qrImage.addEventListener("error", () => {
+      const frame = qrImage.closest(".contact-qr-frame");
+      if (frame) frame.style.display = "none";
+    });
+  }
+
   contactModalListenersBound = true;
 }
 
