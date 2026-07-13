@@ -120,6 +120,7 @@ const DEFAULT_KEYWORD_NOTES_TABLE_NAME = "关键词笔记采集";
 const DEFAULT_COMMENT_LEADS_TABLE_NAME = "评论区客资采集";
 const DEFAULT_MONITOR_TABLE_NAME = "监控内容表";
 const DEFAULT_SINGLE_NOTE_TABLE_NAME = "单笔记采集";
+const NOTE_DETAIL_LOADING_TEXT = "正在等待笔记内容加载完成，请等页面不再显示“加载中”后再采集";
 const MAX_SYNC_RECORDS_PER_BATCH = 500;
 const SYNC_SCOPE_PENDING = "pending";
 const SYNC_SCOPE_ALL = "all";
@@ -317,6 +318,7 @@ let lastRuntimePageTypeForKeywordSort = PAGE_TYPE.UNKNOWN;
 let manualSelectedPlatform = "";
 let lastKnownPagePlatform = "unknown";
 let currentUpdateNoticeState = null;
+let activeCaptureExecutionLockId = "";
 const KEYWORD_ANALYSIS_STALE_LOCK_MS =
   DEFAULT_CONFIG.KEYWORD_ANALYSIS_TIMEOUT + 5000;
 const MAX_BATCH_KEYWORDS = 30;
@@ -344,8 +346,186 @@ const BATCH_MODE_META = {
 const BATCH_DRAFT_SESSION_KEY = "onstarvoice.batchDraftByPlatform";
 const BATCH_DRAFT_LEGACY_KEYS = ["expandedKeywords", "expandedSeedKeyword"];
 const BATCH_DRAFT_PLATFORMS = new Set(["xiaohongshu", "douyin", "unknown"]);
+const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
+const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
+const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
+const KEYWORD_PLAN_RECONCILE_INTERVAL_MS = 5 * 1000;
+const KEYWORD_PLAN_MODES = new Set([
+  "daily",
+  "custom_dates",
+]);
+const KEYWORD_PLAN_MODE_LABELS = {
+  daily: "每天",
+  custom_dates: "指定日期清单",
+};
+const KEYWORD_PLAN_STATUS_LABELS = {
+  started: "已启动",
+  running: "运行中",
+  completed: "已完成",
+  failed: "失败",
+  canceled: "已取消",
+  skipped: "已跳过",
+};
+const KEYWORD_PLAN_CONTROL_IDS = {
+  modal: {
+    enabled: "chkKeywordPlanEnabled",
+    mode: "selectKeywordPlanMode",
+    startTime: "inputKeywordPlanStartTime",
+    jitter: "inputKeywordPlanJitterMin",
+    customDates: "textareaKeywordPlanCustomDates",
+    customGroup: "keywordPlanCustomDatesGroup",
+    status: "keywordPlanStatus",
+    sort: "selectBatchSort",
+    publishTime: "selectBatchPublishTime",
+    contentType: "selectBatchContentType",
+    searchScope: "selectBatchScope",
+    distance: "selectBatchDistance",
+    videoDuration: "selectBatchVideoDuration",
+    autoLoop: "chkAutoLoop",
+    roundGap: "inputLoopGapMin",
+    maxRounds: "inputLoopRounds",
+    keywords: "textareaBatchKeywords",
+  },
+  search: {
+    enabled: "chkSearchKeywordPlanEnabled",
+    mode: "selectSearchKeywordPlanMode",
+    startTime: "inputSearchKeywordPlanStartTime",
+    jitter: "inputSearchKeywordPlanJitterMin",
+    customDates: "textareaSearchKeywordPlanCustomDates",
+    customGroup: "searchKeywordPlanCustomDatesGroup",
+    status: "searchKeywordPlanStatus",
+    sort: "selectSearchSort",
+    publishTime: "selectSearchPublishTime",
+    contentType: "selectSearchContentType",
+    searchScope: "selectSearchScope",
+    distance: "selectSearchDistance",
+    videoDuration: "selectSearchVideoDuration",
+    autoLoop: "chkSearchAutoLoop",
+    roundGap: "inputSearchLoopGapMin",
+    maxRounds: "inputSearchLoopRounds",
+    keywords: "textareaSearchBatchKeywords",
+  },
+};
+const SEARCH_FILTER_FIELD_META = {
+  sort: {
+    defaultValue: "comprehensive",
+    storageDefault: "",
+  },
+  publishTime: {
+    defaultValue: "all",
+    storageDefault: "",
+  },
+  contentType: {
+    defaultValue: "all",
+    storageDefault: "",
+  },
+  searchScope: {
+    defaultValue: "all",
+    storageDefault: "",
+  },
+  distance: {
+    defaultValue: "all",
+    storageDefault: "",
+  },
+  videoDuration: {
+    defaultValue: "all",
+    storageDefault: "",
+  },
+};
+const SEARCH_FILTER_SCOPE_META = {
+  search: {
+    hint: "searchFilterPlatformHint",
+    contentTypeField: "searchContentTypeField",
+    contentTypeLabel: "searchContentTypeLabel",
+    searchScopeField: "searchScopeField",
+    distanceField: "searchDistanceField",
+    videoDurationField: "searchVideoDurationField",
+  },
+  modal: {
+    hint: "batchFilterPlatformHint",
+    contentTypeField: "batchContentTypeField",
+    contentTypeLabel: "batchContentTypeLabel",
+    searchScopeField: "batchScopeField",
+    distanceField: "batchDistanceField",
+    videoDurationField: "batchVideoDurationField",
+  },
+};
+const PLATFORM_SEARCH_FILTER_OPTIONS = {
+  xiaohongshu: {
+    platformLabel: "小红书",
+    contentTypeLabel: "笔记类型",
+    sort: [
+      {value: "comprehensive", label: "综合(默认)"},
+      {value: "latest", label: "最新"},
+      {value: "likes", label: "最多点赞"},
+      {value: "comments", label: "最多评论"},
+      {value: "collects", label: "最多收藏"},
+    ],
+    publishTime: [
+      {value: "all", label: "不限(默认)"},
+      {value: "day", label: "一天内"},
+      {value: "week", label: "一周内"},
+      {value: "halfyear", label: "半年内"},
+    ],
+    contentType: [
+      {value: "all", label: "不限(默认)"},
+      {value: "video", label: "视频"},
+      {value: "image", label: "图文"},
+    ],
+    searchScope: [
+      {value: "all", label: "不限(默认)"},
+      {value: "viewed", label: "已看过"},
+      {value: "unviewed", label: "未看过"},
+      {value: "followed", label: "已关注"},
+    ],
+    distance: [
+      {value: "all", label: "不限(默认)"},
+      {value: "city", label: "同城"},
+      {value: "nearby", label: "附近"},
+    ],
+    videoDuration: [],
+  },
+  douyin: {
+    platformLabel: "抖音",
+    contentTypeLabel: "内容形式",
+    sort: [
+      {value: "comprehensive", label: "综合排序(默认)"},
+      {value: "latest", label: "最新发布"},
+      {value: "likes", label: "最多点赞"},
+    ],
+    publishTime: [
+      {value: "all", label: "不限(默认)"},
+      {value: "day", label: "一天内"},
+      {value: "week", label: "一周内"},
+      {value: "halfyear", label: "半年内"},
+    ],
+    contentType: [
+      {value: "all", label: "不限(默认)"},
+      {value: "video", label: "视频"},
+      {value: "image", label: "图文"},
+    ],
+    searchScope: [
+      {value: "all", label: "不限(默认)"},
+      {value: "followed", label: "关注的人"},
+      {value: "viewed", label: "最近看过"},
+      {value: "unviewed", label: "还未看过"},
+    ],
+    distance: [],
+    videoDuration: [
+      {value: "all", label: "不限(默认)"},
+      {value: "under_1m", label: "1分钟以下"},
+      {value: "1_5m", label: "1-5分钟"},
+      {value: "over_5m", label: "5分钟以上"},
+    ],
+  },
+};
 let batchDraftByPlatform = {};
 let activeBatchDraftPlatform = "";
+let keywordPlanState = null;
+let keywordPlanReconcileTimer = null;
+let keywordPlanReconcileInFlight = false;
+let keywordPlanProgressCountdownTimer = null;
+let keywordPlanProgressCountdownToken = 0;
 
 function createEmptyKeywordInsightState() {
   return {
@@ -884,6 +1064,848 @@ function getBatchKeywordsFromTextarea() {
   return parseKeywordsFromMultilineInput(textarea?.value || "");
 }
 
+function normalizeKeywordPlanMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "holidays") {
+    return "custom_dates";
+  }
+  return KEYWORD_PLAN_MODES.has(normalized) ? normalized : "daily";
+}
+
+function normalizeKeywordPlanScope(scope = "modal") {
+  return scope === "search" ? "search" : "modal";
+}
+
+function getKeywordPlanControl(scope, name) {
+  const normalizedScope = normalizeKeywordPlanScope(scope);
+  const id = KEYWORD_PLAN_CONTROL_IDS[normalizedScope]?.[name];
+  return id ? document.getElementById(id) : null;
+}
+
+function normalizeSearchFilterPlatform(platform = "") {
+  const normalized = String(platform || "").trim().toLowerCase();
+  return normalized === "douyin" ? "douyin" : "xiaohongshu";
+}
+
+function getSearchFilterConfig(platform = "") {
+  return PLATFORM_SEARCH_FILTER_OPTIONS[normalizeSearchFilterPlatform(platform)] ||
+    PLATFORM_SEARCH_FILTER_OPTIONS.xiaohongshu;
+}
+
+function isDefaultSearchFilterValue(field, value) {
+  const meta = SEARCH_FILTER_FIELD_META[field] || {};
+  const normalized = String(value || "").trim();
+  return (
+    !normalized ||
+    normalized === String(meta.defaultValue || "") ||
+    normalized === String(meta.storageDefault || "")
+  );
+}
+
+function normalizeSearchFilterValueForStorage(field, value) {
+  return isDefaultSearchFilterValue(field, value)
+    ? ""
+    : String(value || "").trim().toLowerCase();
+}
+
+function renderSearchFilterSelectOptions(select, options = [], preferredValue = "") {
+  if (!select) {
+    return "";
+  }
+  const safeOptions = Array.isArray(options) ? options : [];
+  const fallbackValue = safeOptions[0]?.value || "";
+  const preferred = String(preferredValue || "").trim();
+  const hasPreferred = safeOptions.some((option) => option.value === preferred);
+  const nextValue = hasPreferred ? preferred : fallbackValue;
+
+  select.textContent = "";
+  safeOptions.forEach((option) => {
+    const optionEl = document.createElement("option");
+    optionEl.value = option.value;
+    optionEl.textContent = option.label;
+    select.appendChild(optionEl);
+  });
+  select.value = nextValue;
+  return nextValue;
+}
+
+function getSearchFilterSelectValue(scope, field) {
+  const control = getKeywordPlanControl(scope, field);
+  const meta = SEARCH_FILTER_FIELD_META[field] || {};
+  return String(control?.value || meta.defaultValue || "").trim();
+}
+
+function collectSearchFiltersFromControls(scope = "modal") {
+  const normalizedScope = normalizeKeywordPlanScope(scope);
+  return Object.keys(SEARCH_FILTER_FIELD_META).reduce((filters, field) => {
+    const value = normalizeSearchFilterValueForStorage(
+      field,
+      getSearchFilterSelectValue(normalizedScope, field),
+    );
+    if (value) {
+      filters[field] = value;
+    }
+    return filters;
+  }, {});
+}
+
+function populateSearchFilterControlsFromFilters(
+  scope = "modal",
+  filters = {},
+  platform = "",
+) {
+  syncSearchFilterControlsForPlatform(platform, {
+    scope,
+    values: filters,
+  });
+}
+
+function syncSearchFilterControlsForPlatform(
+  platform = "",
+  {scope = null, values = null} = {},
+) {
+  const runtime = getCurrentRuntime();
+  const normalizedPlatform = normalizeSearchFilterPlatform(
+    platform || getViewPlatform(runtime),
+  );
+  const config = getSearchFilterConfig(normalizedPlatform);
+  const scopes = typeof scope === "string" ? [normalizeKeywordPlanScope(scope)] : ["search", "modal"];
+
+  scopes.forEach((itemScope) => {
+    const currentValues = values || {};
+    Object.keys(SEARCH_FILTER_FIELD_META).forEach((field) => {
+      const options = config[field] || [];
+      const control = getKeywordPlanControl(itemScope, field);
+      const preferred =
+        currentValues[field] ||
+        control?.value ||
+        SEARCH_FILTER_FIELD_META[field]?.defaultValue ||
+        "";
+      renderSearchFilterSelectOptions(control, options, preferred);
+    });
+
+    const meta = SEARCH_FILTER_SCOPE_META[itemScope] || {};
+    const hintEl = meta.hint ? document.getElementById(meta.hint) : null;
+    if (hintEl) {
+      hintEl.textContent = `${config.platformLabel}筛选项 · 采集前自动切换`;
+    }
+    const contentTypeLabel = meta.contentTypeLabel
+      ? document.getElementById(meta.contentTypeLabel)
+      : null;
+    if (contentTypeLabel) {
+      contentTypeLabel.textContent = config.contentTypeLabel || "内容类型";
+    }
+
+    [
+      ["contentTypeField", config.contentType],
+      ["searchScopeField", config.searchScope],
+      ["distanceField", config.distance],
+      ["videoDurationField", config.videoDuration],
+    ].forEach(([metaKey, options]) => {
+      const fieldEl = meta[metaKey] ? document.getElementById(meta[metaKey]) : null;
+      if (fieldEl) {
+        fieldEl.hidden = !Array.isArray(options) || options.length === 0;
+      }
+    });
+  });
+}
+
+function forEachKeywordPlanScope(callback) {
+  ["search", "modal"].forEach((scope) => callback(scope));
+}
+
+function normalizeDateListText(value) {
+  return Array.from(
+    new Set(
+      String(value || "")
+        .split(/[\s,，;；]+/g)
+        .map((item) => item.trim())
+        .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item)),
+    ),
+  ).join("\n");
+}
+
+function getDateListFromText(value) {
+  const normalized = normalizeDateListText(value);
+  return normalized ? normalized.split("\n").filter(Boolean) : [];
+}
+
+function renderSearchKeywordPlanDateChips() {
+  const chipsEl = document.getElementById("searchKeywordPlanDateChips");
+  const textarea = getKeywordPlanControl("search", "customDates");
+  if (!chipsEl || !textarea) {
+    return;
+  }
+  const dates = getDateListFromText(textarea.value);
+  chipsEl.textContent = "";
+  if (dates.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "keyword-plan-date-empty";
+    empty.textContent = "暂无指定日期";
+    chipsEl.appendChild(empty);
+    return;
+  }
+  dates.forEach((date) => {
+    const chip = document.createElement("span");
+    chip.className = "keyword-plan-date-chip";
+    chip.textContent = date;
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.dataset.keywordPlanDateRemove = date;
+    removeButton.setAttribute("aria-label", `移除 ${date}`);
+    removeButton.textContent = "×";
+    chip.appendChild(removeButton);
+    chipsEl.appendChild(chip);
+  });
+}
+
+function setSearchKeywordPlanDateList(dates = []) {
+  const textarea = getKeywordPlanControl("search", "customDates");
+  if (!textarea) {
+    return;
+  }
+  textarea.value = normalizeDateListText(dates.join("\n"));
+  renderSearchKeywordPlanDateChips();
+  renderKeywordPlanStatus(keywordPlanState, "search");
+}
+
+function addSearchKeywordPlanDateFromPicker() {
+  const input = document.getElementById("inputSearchKeywordPlanDatePicker");
+  const value = String(input?.value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    showMessage("请选择要加入无人值守计划的运行日期", "warning");
+    return;
+  }
+  const textarea = getKeywordPlanControl("search", "customDates");
+  const dates = getDateListFromText(textarea?.value || "");
+  setSearchKeywordPlanDateList([...dates, value]);
+  if (input) {
+    input.value = "";
+  }
+}
+
+function handleSearchKeywordPlanDateChipClick(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+  const button = target.closest("[data-keyword-plan-date-remove]");
+  if (!(button instanceof HTMLElement)) {
+    return;
+  }
+  const removeDate = String(button.dataset.keywordPlanDateRemove || "").trim();
+  const textarea = getKeywordPlanControl("search", "customDates");
+  const dates = getDateListFromText(textarea?.value || "").filter(
+    (date) => date !== removeDate,
+  );
+  setSearchKeywordPlanDateList(dates);
+}
+
+function parseSearchManualScheduledStart(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const timeOnlyMatch = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (timeOnlyMatch) {
+    const hours = Number(timeOnlyMatch[1]);
+    const minutes = Number(timeOnlyMatch[2]);
+    const seconds = Number(timeOnlyMatch[3] || 0);
+    if (
+      hours >= 0 &&
+      hours <= 23 &&
+      minutes >= 0 &&
+      minutes <= 59 &&
+      seconds >= 0 &&
+      seconds <= 59
+    ) {
+      const target = new Date();
+      target.setHours(hours, minutes, seconds, 0);
+      return {
+        targetMs: target.getTime(),
+        label: `今天 ${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`,
+      };
+    }
+  }
+
+  const targetMs = new Date(raw).getTime();
+  if (!Number.isFinite(targetMs)) {
+    return {targetMs: NaN, label: raw};
+  }
+  return {
+    targetMs,
+    label: new Date(targetMs).toLocaleString("zh-CN"),
+  };
+}
+
+function setSearchExecutionMode(mode = "manual") {
+  const normalizedMode = mode === "plan" ? "plan" : "manual";
+  document
+    .querySelectorAll("[data-search-execution-mode]")
+    .forEach((tab) => {
+      const isActive = tab.getAttribute("data-search-execution-mode") === normalizedMode;
+      tab.classList.toggle("is-active", isActive);
+      tab.setAttribute("aria-selected", isActive ? "true" : "false");
+    });
+  const manualPane = document.getElementById("searchManualExecutionPane");
+  const planPane = document.getElementById("searchPlanExecutionPane");
+  const manualActionRow = document.getElementById("searchManualActionRow");
+  if (manualPane) {
+    manualPane.hidden = normalizedMode !== "manual";
+  }
+  if (planPane) {
+    planPane.hidden = normalizedMode !== "plan";
+  }
+  if (manualActionRow) {
+    manualActionRow.hidden = normalizedMode !== "manual";
+  }
+}
+
+function readNonNegativeNumberInput(inputId, fallback = 0) {
+  const raw = document.getElementById(inputId)?.value;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function readPositiveNumberInput(inputId, fallback = 1) {
+  const raw = document.getElementById(inputId)?.value;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function collectKeywordPlanFromInputs(scope = "modal") {
+  const normalizedScope = normalizeKeywordPlanScope(scope);
+  const runtime = getCurrentRuntime();
+  const selectedPlatform = getViewPlatform(runtime);
+  const roundGapMin = readNonNegativeNumberInput(
+    KEYWORD_PLAN_CONTROL_IDS[normalizedScope].roundGap,
+    10,
+  );
+  const maxRounds = readPositiveNumberInput(
+    KEYWORD_PLAN_CONTROL_IDS[normalizedScope].maxRounds,
+    1,
+  );
+  const keywords =
+    normalizedScope === "search"
+      ? dedupeKeywords(getSearchBatchKeywordsFromTextarea())
+      : dedupeKeywords(getBatchKeywordsFromTextarea());
+  return {
+    enabled: Boolean(
+      getKeywordPlanControl(normalizedScope, "enabled")?.checked,
+    ),
+    platform:
+      selectedPlatform && selectedPlatform !== "unknown"
+        ? selectedPlatform
+        : "xiaohongshu",
+    mode: normalizeKeywordPlanMode(
+      getKeywordPlanControl(normalizedScope, "mode")?.value,
+    ),
+    startTime:
+      getKeywordPlanControl(normalizedScope, "startTime")?.value || "09:00",
+    randomOffsetMin: readNonNegativeNumberInput(
+      KEYWORD_PLAN_CONTROL_IDS[normalizedScope].jitter,
+      20,
+    ),
+    keywords: keywords.slice(0, MAX_BATCH_KEYWORDS),
+    searchFilters: collectSearchFiltersFromControls(normalizedScope),
+    autoLoop: maxRounds > 1,
+    roundGapMin,
+    maxRounds,
+    holidayDates: "",
+    customDates: normalizeDateListText(
+      getKeywordPlanControl(normalizedScope, "customDates")?.value,
+    ),
+  };
+}
+
+function syncKeywordPlanDateFields(scope = null) {
+  const scopes = typeof scope === "string" ? [scope] : ["search", "modal"];
+  scopes.forEach((itemScope) => {
+    const normalizedScope = normalizeKeywordPlanScope(itemScope);
+    const mode = normalizeKeywordPlanMode(
+      getKeywordPlanControl(normalizedScope, "mode")?.value,
+    );
+    const customGroup = getKeywordPlanControl(normalizedScope, "customGroup");
+    if (customGroup) {
+      customGroup.hidden = mode !== "custom_dates";
+    }
+    if (normalizedScope === "search") {
+      renderSearchKeywordPlanDateChips();
+    }
+  });
+}
+
+function formatKeywordPlanRunTime(value) {
+  const timestamp = Date.parse(value || "");
+  if (!Number.isFinite(timestamp)) {
+    return "";
+  }
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function renderKeywordPlanStatus(plan = keywordPlanState, scope = null) {
+  const scopes = typeof scope === "string" ? [scope] : ["search", "modal"];
+  scopes.forEach((itemScope) => {
+    const normalizedScope = normalizeKeywordPlanScope(itemScope);
+    const statusEl = getKeywordPlanControl(normalizedScope, "status");
+    if (!statusEl) {
+      return;
+    }
+    const checked = Boolean(
+      getKeywordPlanControl(normalizedScope, "enabled")?.checked,
+    );
+    if (checked !== Boolean(plan?.enabled)) {
+      statusEl.textContent = checked ? "保存后启用计划" : "保存后关闭计划";
+      return;
+    }
+    if (!plan?.enabled) {
+      statusEl.textContent = "计划未启用";
+      return;
+    }
+    const keywordCount = Array.isArray(plan.keywords) ? plan.keywords.length : 0;
+    const modeLabel =
+      KEYWORD_PLAN_MODE_LABELS[normalizeKeywordPlanMode(plan.mode)] || "每天";
+    const lastRunStatus = String(plan.lastRunStatus || "");
+    const isRunningPlan =
+      lastRunStatus === "started" || lastRunStatus === "running";
+    const nextRunText = isRunningPlan
+      ? ""
+      : formatKeywordPlanRunTime(plan.nextRunAt);
+    const nextPart = isRunningPlan
+      ? "当前运行中"
+      : nextRunText
+        ? `下次 ${nextRunText}`
+        : "暂无可运行日期";
+    const lastRunStatusLabel =
+      KEYWORD_PLAN_STATUS_LABELS[lastRunStatus] || lastRunStatus;
+    const lastPart = plan.lastRunStatus
+      ? `；${isRunningPlan ? "当前" : "上次"} ${lastRunStatusLabel}${plan.lastRunMessage ? `：${plan.lastRunMessage}` : ""}`
+      : "";
+    statusEl.textContent = `已启用 · ${modeLabel} · ${keywordCount} 个关键词 · ${nextPart}${lastPart}`;
+  });
+  syncKeywordPlanProgressPanel(plan);
+}
+
+function isKeywordPlanRunning(plan = {}) {
+  const status = String(plan?.lastRunStatus || "").trim();
+  return status === "started" || status === "running";
+}
+
+function clearKeywordPlanProgressCountdown() {
+  keywordPlanProgressCountdownToken += 1;
+  if (keywordPlanProgressCountdownTimer) {
+    clearInterval(keywordPlanProgressCountdownTimer);
+    keywordPlanProgressCountdownTimer = null;
+  }
+}
+
+function buildKeywordPlanProgressText(plan = {}) {
+  const progress =
+    plan?.lastRunProgress && typeof plan.lastRunProgress === "object"
+      ? plan.lastRunProgress
+      : {};
+  const message =
+    String(progress.message || plan?.lastRunMessage || "").trim() ||
+    "无人值守计划运行中";
+  const current = Number(progress.current);
+  const total = Number(progress.total);
+  const round = Number(progress.round);
+  const maxRounds = Number(plan?.maxRounds);
+  const keyword = String(progress.keyword || "").trim();
+  const parts = ["无人值守采集"];
+  const shouldShowRound =
+    Number.isFinite(round) &&
+    round > 0 &&
+    ((Number.isFinite(maxRounds) && maxRounds > 1) || round > 1);
+
+  if (shouldShowRound) {
+    parts.push(`第 ${round} 轮`);
+  }
+  if (Number.isFinite(total) && total > 0) {
+    const normalizedCurrent =
+      Number.isFinite(current) && current > 0
+        ? Math.min(Math.floor(current), Math.floor(total))
+        : 0;
+    parts.push(`${normalizedCurrent}/${Math.floor(total)}`);
+  }
+  if (keyword) {
+    parts.push(`「${keyword}」`);
+  }
+
+  return `${parts.join(" · ")}：${message}`;
+}
+
+function renderKeywordPlanProgressText(progressText, plan = {}) {
+  const text = buildKeywordPlanProgressText(plan);
+  const progress =
+    plan?.lastRunProgress && typeof plan.lastRunProgress === "object"
+      ? plan.lastRunProgress
+      : {};
+  const remainingMs = Number(progress.remainingMs);
+  const canCountdown =
+    Number.isFinite(remainingMs) &&
+    remainingMs > 0 &&
+    /秒后/.test(text);
+
+  clearKeywordPlanProgressCountdown();
+  if (!canCountdown) {
+    progressText.textContent = text;
+    return;
+  }
+
+  const token = keywordPlanProgressCountdownToken;
+  // 以「上报时刻」为锚(updatedAt 是测得 remainingMs 的时刻),得到绝对截止时刻;
+  // 这样即便 5 秒一次的 reconcile / storage 用陈旧的相对 remainingMs 反复重调,
+  // deadline 也恒指向同一真实时刻——底部条平滑走到 0、不再循环(词2也不再"假卡")。
+  // updatedAt 缺失/非法时回退旧行为,绝不更差。
+  const reportedAt = Date.parse(progress.updatedAt);
+  const deadline =
+    (Number.isFinite(reportedAt) ? reportedAt : Date.now()) + remainingMs;
+  const render = () => {
+    if (token !== keywordPlanProgressCountdownToken) {
+      return;
+    }
+    const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    if (seconds > 0) {
+      progressText.textContent = text.replace(/\d+\s*秒后/g, `${seconds} 秒后`);
+      return;
+    }
+    progressText.textContent = text.replace(
+      /\d+\s*秒后再搜下一个关键词\(防风控·随机间隔\)[…\.]*/g,
+      "正在切换到下一个关键词...",
+    );
+    clearKeywordPlanProgressCountdown();
+  };
+  render();
+  keywordPlanProgressCountdownTimer = setInterval(render, 1000);
+}
+
+function hasVisibleLocalCaptureProgress() {
+  return (
+    batchKeywordCaptureInFlight ||
+    batchUrlCaptureInFlight ||
+    detailBatchCaptureInFlight ||
+    monitorRunInFlight ||
+    keywordBenchmarkInFlight ||
+    keywordOpportunityInFlight ||
+    keywordExpandInFlight
+  );
+}
+
+function hideKeywordPlanProgressPanelIfOwned() {
+  const progressContainer = document.getElementById("progressContainer");
+  if (!progressContainer || progressContainer.dataset.progressSource !== "keyword-plan") {
+    return;
+  }
+  clearKeywordPlanProgressCountdown();
+  progressContainer.style.display = "none";
+  delete progressContainer.dataset.progressSource;
+  const btnCancel = document.getElementById("btnCancel");
+  if (btnCancel) {
+    btnCancel.textContent = "中止任务";
+    btnCancel.style.display = "none";
+  }
+}
+
+function syncKeywordPlanProgressPanel(plan = keywordPlanState) {
+  // runner tab(无人值守聚焦页,URL 带 unattendedRun=xxx):它自身就是批量采集执行页,
+  // 「词间随机延迟」阶段全局底部条(#progressContainer)是空闲的,需要用它显示倒计时,
+  // 故不再对 runner tab 整体提前 return。观察侧栏(无该 query)行为完全不变。
+  const isUnattendedRunnerTab = Boolean(getUnattendedRunRequestIdFromUrl());
+  if (!plan?.enabled || !isKeywordPlanRunning(plan)) {
+    hideKeywordPlanProgressPanelIfOwned();
+    return;
+  }
+  // 观察侧栏:本地有可见采集进度时让位给本地进度条;
+  // runner tab 的本地采集就是这次计划本身,不让位(否则又整轮不显示)。
+  if (
+    (!isUnattendedRunnerTab && hasVisibleLocalCaptureProgress()) ||
+    isUnsupportedPlatformCoverVisible()
+  ) {
+    return;
+  }
+
+  const progressContainer = document.getElementById("progressContainer");
+  const progressText = document.getElementById("progressText");
+  if (!progressContainer || !progressText) {
+    return;
+  }
+  progressContainer.dataset.progressSource = "keyword-plan";
+  progressContainer.style.display = "block";
+  renderKeywordPlanProgressText(progressText, plan);
+  const progressBar = document.getElementById("progressBar");
+  if (progressBar) {
+    progressBar.className = "status-bar is-info";
+  }
+  const btnCancel = document.getElementById("btnCancel");
+  if (btnCancel) {
+    btnCancel.textContent = "中止任务";
+    btnCancel.style.display = "inline-block";
+  }
+}
+
+async function cancelUnattendedKeywordPlanFromSidebar() {
+  const progress =
+    keywordPlanState?.lastRunProgress &&
+    typeof keywordPlanState.lastRunProgress === "object"
+      ? keywordPlanState.lastRunProgress
+      : {};
+  const runnerTabId = Number(progress.runnerTabId);
+  const progressText = document.getElementById("progressText");
+  const btnCancel = document.getElementById("btnCancel");
+  if (progressText) {
+    progressText.textContent = "正在中止无人值守任务...";
+  }
+  if (btnCancel) {
+    btnCancel.textContent = "停止中...";
+    btnCancel.disabled = true;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:cancel-unattended-keyword-run",
+      message: "用户手动中止无人值守计划",
+      tabId: Number.isFinite(runnerTabId) && runnerTabId > 0 ? runnerTabId : null,
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error?.message || "中止无人值守任务失败");
+    }
+    await loadKeywordPlanUI({preserveInputs: true});
+    showMessage("正在中止无人值守任务...", "warning");
+  } catch (error) {
+    console.warn("[Sidebar] Cancel unattended keyword plan failed:", error);
+    showMessage("中止无人值守任务失败: " + error.message, "error");
+  } finally {
+    if (btnCancel) {
+      btnCancel.disabled = false;
+      btnCancel.textContent = "中止任务";
+    }
+  }
+}
+
+function populateKeywordPlanUI(plan = {}) {
+  keywordPlanState = plan || null;
+  forEachKeywordPlanScope((scope) => {
+    const enabledInput = getKeywordPlanControl(scope, "enabled");
+    if (enabledInput) {
+      enabledInput.checked = Boolean(plan?.enabled);
+    }
+    const modeInput = getKeywordPlanControl(scope, "mode");
+    if (modeInput) {
+      modeInput.value = normalizeKeywordPlanMode(plan?.mode);
+    }
+    const startInput = getKeywordPlanControl(scope, "startTime");
+    if (startInput) {
+      startInput.value = String(plan?.startTime || "09:00");
+    }
+    const jitterInput = getKeywordPlanControl(scope, "jitter");
+    if (jitterInput) {
+      jitterInput.value = String(Number(plan?.randomOffsetMin) || 0);
+    }
+    const autoLoopInput = getKeywordPlanControl(scope, "autoLoop");
+    if (autoLoopInput) {
+      autoLoopInput.checked = true;
+    }
+    const roundGapInput = getKeywordPlanControl(scope, "roundGap");
+    if (roundGapInput) {
+      roundGapInput.value = String(Math.max(0, Number(plan?.roundGapMin) || 10));
+    }
+    const maxRoundsInput = getKeywordPlanControl(scope, "maxRounds");
+    if (maxRoundsInput) {
+      maxRoundsInput.value = String(Math.max(1, Number(plan?.maxRounds) || 1));
+    }
+    const customTextarea = getKeywordPlanControl(scope, "customDates");
+    if (customTextarea) {
+      customTextarea.value = normalizeDateListText(
+        plan?.customDates || plan?.holidayDates,
+      );
+    }
+  });
+
+  const keywords = Array.isArray(plan?.keywords) ? plan.keywords : [];
+  const planPlatform =
+    plan?.platform ||
+    getViewPlatform(getCurrentRuntime()) ||
+    "xiaohongshu";
+  forEachKeywordPlanScope((scope) => {
+    const textarea = getKeywordPlanControl(scope, "keywords");
+    if (textarea && !textarea.value.trim() && keywords.length > 0) {
+      textarea.value = keywords.join("\n");
+    }
+    populateSearchFilterControlsFromFilters(
+      scope,
+      plan?.searchFilters || {},
+      planPlatform,
+    );
+  });
+  updateBatchKeywordInputState();
+
+  syncKeywordPlanDateFields();
+  renderKeywordPlanStatus(plan);
+}
+
+async function loadKeywordPlanUI({preserveInputs = false} = {}) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:get-unattended-keyword-plan",
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error?.message || "读取计划失败");
+    }
+    const plan = response.data || {};
+    if (preserveInputs) {
+      keywordPlanState = plan;
+      renderKeywordPlanStatus(plan);
+    } else {
+      populateKeywordPlanUI(plan);
+    }
+    return plan;
+  } catch (error) {
+    console.warn("[Sidebar] Load unattended keyword plan failed:", error);
+    renderKeywordPlanStatus(null);
+    return null;
+  }
+}
+
+function shouldRefreshDataPoolForKeywordPlan(plan = {}) {
+  const status = String(plan?.lastRunStatus || "").trim();
+  return (
+    status === "started" ||
+    status === "running" ||
+    status === "completed" ||
+    status === "failed" ||
+    status === "canceled"
+  );
+}
+
+async function reconcileKeywordPlanFromSidebar() {
+  if (keywordPlanReconcileInFlight || getUnattendedRunRequestIdFromUrl()) {
+    return;
+  }
+  keywordPlanReconcileInFlight = true;
+  try {
+    const plan = await loadKeywordPlanUI({preserveInputs: true});
+    if (shouldRefreshDataPoolForKeywordPlan(plan)) {
+      await refreshDataPoolThrottled();
+    }
+    await maybeClaimAndRunUnattendedKeywordPlan({allowPending: true});
+  } finally {
+    keywordPlanReconcileInFlight = false;
+  }
+}
+
+function startKeywordPlanReconcileTimer() {
+  stopKeywordPlanReconcileTimer();
+  if (getUnattendedRunRequestIdFromUrl()) {
+    return;
+  }
+  keywordPlanReconcileTimer = setInterval(() => {
+    reconcileKeywordPlanFromSidebar().catch((error) => {
+      console.warn("[Sidebar] Reconcile unattended keyword plan failed:", error);
+    });
+  }, KEYWORD_PLAN_RECONCILE_INTERVAL_MS);
+}
+
+function stopKeywordPlanReconcileTimer() {
+  if (keywordPlanReconcileTimer) {
+    clearInterval(keywordPlanReconcileTimer);
+    keywordPlanReconcileTimer = null;
+  }
+}
+
+function setupKeywordPlanStorageListener() {
+  if (!chrome?.storage?.onChanged) {
+    return;
+  }
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") {
+      return;
+    }
+    if (changes?.[KEYWORD_PLAN_STORAGE_KEY]) {
+      const plan = changes[KEYWORD_PLAN_STORAGE_KEY].newValue || null;
+      keywordPlanState = plan;
+      renderKeywordPlanStatus(plan);
+      if (shouldRefreshDataPoolForKeywordPlan(plan)) {
+        refreshDataPoolThrottled().catch((error) => {
+          console.warn(
+            "[Sidebar] Failed to refresh pool during keyword plan update:",
+            error,
+          );
+        });
+      }
+    }
+    if (changes?.[KEYWORD_RUN_REQUEST_STORAGE_KEY]) {
+      handleUnattendedRunRequestStorageChange(
+        changes[KEYWORD_RUN_REQUEST_STORAGE_KEY].newValue || null,
+      );
+    }
+  });
+}
+
+function handleUnattendedRunRequestStorageChange(request) {
+  const requestId = getUnattendedRunRequestIdFromUrl();
+  if (!requestId || !request || request.id !== requestId) {
+    return;
+  }
+  if (String(request.status || "") !== "canceled") {
+    return;
+  }
+
+  setCancelFlag(true);
+  batchKeywordCancelRequested = true;
+  detailBatchCancelRequested = true;
+  searchCaptureCancelRequested = true;
+  const progressTabId = Number(request?.progress?.runnerTabId);
+  const relayTabId =
+    (Number.isFinite(Number(detailBatchRunnerTabId)) && Number(detailBatchRunnerTabId)) ||
+    (Number.isFinite(Number(activeBatchRunnerTabId)) && Number(activeBatchRunnerTabId)) ||
+    (Number.isFinite(progressTabId) && progressTabId > 0 ? progressTabId : null);
+  requestCaptureCancelSignal(relayTabId).catch((error) => {
+    console.warn("[Sidebar] Relay unattended cancel from storage failed:", error);
+  });
+}
+
+async function handleSaveKeywordPlan(scope = "modal") {
+  try {
+    const plan = collectKeywordPlanFromInputs(scope);
+    if (plan.enabled && plan.keywords.length === 0) {
+      showMessage("启用无人值守计划前，请先填写至少一个关键词", "warning");
+      return;
+    }
+    if (plan.enabled && plan.mode === "custom_dates" && !plan.customDates) {
+      showMessage("指定日期清单需要填写至少一个运行日期", "warning");
+      return;
+    }
+
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:save-unattended-keyword-plan",
+      plan,
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error?.message || "保存计划失败");
+    }
+    populateKeywordPlanUI(response.data || plan);
+    showMessage(plan.enabled ? "无人值守计划已保存" : "无人值守计划已关闭", "success");
+  } catch (error) {
+    console.error("[Sidebar] Save unattended keyword plan failed:", error);
+    showMessage("保存无人值守计划失败: " + error.message, "error");
+  }
+}
+
 function updateBatchKeywordInputState() {
   const hintEl = document.getElementById("batchKeywordLimitHint");
   const btn = document.getElementById("btnRunBatchKeywords");
@@ -1002,6 +2024,7 @@ export async function initSidebar() {
 
   // 绑定 UI 事件
   setupUIEventListeners();
+  setupKeywordPlanStorageListener();
 
   await showRiskNoticeIfNeeded();
 
@@ -1017,6 +2040,9 @@ export async function initSidebar() {
 
   // 更新 UI
   updateUI();
+  syncSearchFilterControlsForPlatform(getViewPlatform(getCurrentRuntime()));
+  await loadKeywordPlanUI();
+  startKeywordPlanReconcileTimer();
   if (repairedDetailCapture.count > 0) {
     showMessage(
       `${repairedDetailCapture.count} 条采集增强任务因页面或插件中断已标记为失败，可点击 ↻ 重试`,
@@ -1054,6 +2080,10 @@ export async function initSidebar() {
     populateMonitorSettingsForm(DEFAULT_MONITOR_SETTINGS);
   }
 
+  void maybeClaimAndRunUnattendedKeywordPlan({allowPending: true}).catch((error) => {
+    console.error("[Sidebar] Initial unattended keyword plan failed:", error);
+  });
+
   console.log("[Sidebar] Initialized");
 }
 
@@ -1068,6 +2098,7 @@ function setupStateSubscriptions() {
     console.log("[Sidebar] Runtime updated:", runtime);
     window.getSidebarRuntimeState = () => runtime;
     updatePlatformUI(runtime);
+    syncSearchFilterControlsForPlatform(getViewPlatform(runtime));
     updatePageTypeUI(runtime?.pageType || PAGE_TYPE.UNKNOWN);
     const currentPageType = runtime?.pageType || PAGE_TYPE.UNKNOWN;
     const currentPageUrl = String(runtime?.lastPageUrl || "");
@@ -2491,6 +3522,11 @@ function setupUIEventListeners() {
     input.addEventListener("change", handleAutoDetailCaptureToggleChange);
   });
   document
+    .querySelectorAll('[data-detail-setting="auto-sync"]')
+    .forEach((input) => {
+      input.addEventListener("change", handleDetailCaptureAutoSyncToggleChange);
+    });
+  document
     .querySelectorAll('[data-detail-setting="comments"]')
     .forEach((input) => {
       input.addEventListener("change", handleDetailCaptureCommentsToggleChange);
@@ -2509,6 +3545,14 @@ function setupUIEventListeners() {
       input.addEventListener(
         "change",
         handleDetailCaptureSkipCapturedToggleChange,
+      );
+    });
+  document
+    .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
+    .forEach((input) => {
+      input.addEventListener(
+        "change",
+        handleDetailCaptureCommentCountRecheckToggleChange,
       );
     });
   document
@@ -2561,6 +3605,14 @@ function setupUIEventListeners() {
   if (btnCaptureSearch) {
     btnCaptureSearch.addEventListener("click", handleCaptureSearchData);
   }
+  document
+    .querySelectorAll("[data-search-execution-mode]")
+    .forEach((tab) => {
+      tab.addEventListener("click", () =>
+        setSearchExecutionMode(tab.getAttribute("data-search-execution-mode")),
+      );
+    });
+  setSearchExecutionMode("manual");
   document
     .getElementById("btnToggleKeywordStrategy")
     ?.addEventListener("click", () => toggleKeywordStrategyPanel());
@@ -2660,12 +3712,50 @@ function setupUIEventListeners() {
   document
     .getElementById("btnRunBatchKeywords")
     ?.addEventListener("click", handleBatchKeywordCapture);
-  // 无人值守循环:勾选才点亮「每轮间隔 / 循环轮数」输入
-  // 勾选「无人值守循环」才点亮对应的「每轮间隔 / 循环轮数」(批量 + 搜索页各一组,按 id 精确定位,避免互相串)
+  document
+    .getElementById("btnSaveKeywordPlan")
+    ?.addEventListener("click", () => handleSaveKeywordPlan("modal"));
+  document
+    .getElementById("btnSaveSearchKeywordPlan")
+    ?.addEventListener("click", () => handleSaveKeywordPlan("search"));
+  document
+    .getElementById("btnAddSearchKeywordPlanDate")
+    ?.addEventListener("click", addSearchKeywordPlanDateFromPicker);
+  document
+    .getElementById("inputSearchKeywordPlanDatePicker")
+    ?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") {
+        return;
+      }
+      event.preventDefault();
+      addSearchKeywordPlanDateFromPicker();
+    });
+  document
+    .getElementById("searchKeywordPlanDateChips")
+    ?.addEventListener("click", handleSearchKeywordPlanDateChipClick);
+  document
+    .getElementById("selectKeywordPlanMode")
+    ?.addEventListener("change", () => syncKeywordPlanDateFields("modal"));
+  document
+    .getElementById("selectSearchKeywordPlanMode")
+    ?.addEventListener("change", () => syncKeywordPlanDateFields("search"));
+  document
+    .getElementById("chkKeywordPlanEnabled")
+    ?.addEventListener("change", () =>
+      renderKeywordPlanStatus(keywordPlanState, "modal"),
+    );
+  document
+    .getElementById("chkSearchKeywordPlanEnabled")
+    ?.addEventListener("change", () =>
+      renderKeywordPlanStatus(keywordPlanState, "search"),
+    );
+  // 轮次设置已合并进「无人值守计划」:执行轮数 > 1 即循环,不再单独暴露第二个开关。
   const bindAutoLoopFields = (chkId, fieldsId) => {
     const chk = document.getElementById(chkId);
     const sync = () =>
-      document.getElementById(fieldsId)?.classList.toggle("is-disabled", !chk?.checked);
+      document
+        .getElementById(fieldsId)
+        ?.classList.toggle("is-disabled", chk && !chk.checked && !chk.hidden);
     chk?.addEventListener("change", sync);
     sync();
   };
@@ -2678,7 +3768,7 @@ function setupUIEventListeners() {
     document.getElementById("searchSingleKeywordGroup")?.toggleAttribute("hidden", on);
     document.getElementById("searchBatchKeywordGroup")?.toggleAttribute("hidden", !on);
     const capBtn = document.getElementById("btnCaptureSearch");
-    if (capBtn) capBtn.textContent = on ? "批量采集" : "采集当前搜索结果";
+    if (capBtn) capBtn.textContent = on ? "开始批量采集" : "采集当前搜索结果";
   };
   chkSearchBatchEl?.addEventListener("change", syncSearchBatchMode);
   syncSearchBatchMode();
@@ -3000,6 +4090,7 @@ async function handlePlatformMenuSwitch(targetPlatform) {
     if (manualSelectedPlatform || selectedPlatform !== pagePlatform) {
       manualSelectedPlatform = "";
       updatePlatformUI(runtime);
+      syncSearchFilterControlsForPlatform(getViewPlatform(runtime));
       updatePageTypeUI(runtime?.pageType || PAGE_TYPE.UNKNOWN);
       await refreshDataPool();
     }
@@ -3042,6 +4133,10 @@ async function handleCaptureNoteData() {
   }
   if (runtime?.pageType !== PAGE_TYPE.NOTE_DETAIL) {
     showMessage("请先切换到笔记/作品详情页", "error");
+    return;
+  }
+  if (isNoteDetailPending(runtime)) {
+    showMessage(resolveNoteDetailPendingText(runtime), "warning");
     return;
   }
 
@@ -3299,14 +4394,20 @@ async function handleCaptureBloggerData() {
   }
 }
 
-// 搜索页:在当前激活 tab 应用排序/发布时间筛选(复用 content 的 applyBatchSearchFilters,失败不阻断采集)
-async function applySearchFiltersOnActiveTab(tabId, { sort = "", publishTime = "" } = {}) {
-  if ((!sort && !publishTime) || !Number.isFinite(Number(tabId))) return;
+// 搜索页:在当前激活 tab 应用排序/范围筛选(复用 content 的 applyBatchSearchFilters,失败不阻断采集)
+function hasActiveSearchFilters(searchFilters = {}) {
+  return Object.values(searchFilters || {}).some((value) =>
+    Boolean(String(value || "").trim()),
+  );
+}
+
+async function applySearchFiltersOnActiveTab(tabId, searchFilters = {}) {
+  if (!hasActiveSearchFilters(searchFilters) || !Number.isFinite(Number(tabId))) return;
   try {
     await chrome.runtime.sendMessage({
       type: MESSAGE_TYPE.RELAY_TO_CONTENT,
       tabId: Number(tabId),
-      payload: { action: "applyBatchSearchFilters", sort, publishTime },
+      payload: { action: "applyBatchSearchFilters", ...searchFilters },
     });
   } catch (error) {
     console.warn("[Sidebar] 搜索页筛选切换失败(不影响采集):", error);
@@ -3394,6 +4495,7 @@ async function handleCaptureSearchData() {
   });
   let taskStatus = "completed";
   let taskError = null;
+  let executionLock = null;
 
   try {
     const settings = resolveCurrentDetailCaptureSettings(
@@ -3405,6 +4507,14 @@ async function handleCaptureSearchData() {
         message: PAGE_ENHANCE_AUTH_REQUIRED_MESSAGE,
       })
     ) {
+      taskStatus = "skipped";
+      return;
+    }
+    executionLock = await acquireCaptureExecutionLock({
+      owner: "manual_search_capture",
+      label: searchBatchMode ? "手动批量关键词采集" : "手动搜索页采集",
+    });
+    if (!executionLock) {
       taskStatus = "skipped";
       return;
     }
@@ -3420,25 +4530,27 @@ async function handleCaptureSearchData() {
       settings.keywordMaxDetectedItems,
     );
 
-    // 搜索页:排序/发布时间筛选 + 循环轮数 + 定时启动(复用批量那套能力)
+    // 搜索页手动采集只负责本次执行；无人值守轮次由计划流程读取。
     searchCaptureCancelRequested = false;
-    const rawSearchSort = document.getElementById("selectSearchSort")?.value || "";
-    const rawSearchTime = document.getElementById("selectSearchPublishTime")?.value || "";
-    const searchFilters = {
-      sort: rawSearchSort === "comprehensive" ? "" : rawSearchSort,
-      publishTime: rawSearchTime === "all" ? "" : rawSearchTime,
-    };
-    const searchAutoLoop = !!document.getElementById("chkSearchAutoLoop")?.checked;
-    const searchGapMin = Math.max(0, Number(document.getElementById("inputSearchLoopGapMin")?.value) || 0);
-    const searchMaxRounds = Math.max(1, Math.floor(Number(document.getElementById("inputSearchLoopRounds")?.value)) || 1);
-    const searchGapMs = searchGapMin * 60 * 1000;
+    const searchFilters = collectSearchFiltersFromControls("search");
+    const searchAutoLoop = false;
 
-    // 定时启动:等到指定时刻再开跑(可中断,显倒计时)
+    // 手动延迟启动:只支持今天的 HH:mm,老版本 datetime-local 值仍兼容。
     const searchScheduledStr = document.getElementById("inputSearchScheduledStart")?.value || "";
-    if (searchScheduledStr) {
-      const targetMs = new Date(searchScheduledStr).getTime();
-      if (Number.isFinite(targetMs) && targetMs > Date.now()) {
-        const targetLabel = new Date(searchScheduledStr).toLocaleString("zh-CN");
+    const scheduledStart = parseSearchManualScheduledStart(searchScheduledStr);
+    if (scheduledStart) {
+      const {targetMs, label: targetLabel} = scheduledStart;
+      if (!Number.isFinite(targetMs)) {
+        taskStatus = "skipped";
+        showMessage("当天延迟启动时间格式不正确", "warning");
+        return;
+      }
+      if (targetMs <= Date.now()) {
+        taskStatus = "skipped";
+        showMessage("当天延迟启动时间已过，请选择稍后的时间或留空立即采集", "warning");
+        return;
+      }
+      if (targetMs > Date.now()) {
         let lastSec = -1;
         await sleepWithStop(targetMs - Date.now(), () => {
           if (searchCaptureCancelRequested) return true;
@@ -3480,6 +4592,52 @@ async function handleCaptureSearchData() {
             stallTimeoutMs: settings.sharedStallTimeoutMs,
             maxDurationMs: settings.sharedMaxDurationMs,
           },
+          afterKeywordCapture: settings.autoDetailCaptureAfterListCapture
+            ? async ({keyword: capturedKeyword, recordIds}) => {
+                await refreshDataPool();
+                const currentDetailSettings =
+                  resolveCurrentDetailCaptureSettings(
+                    await getCaptureSettings(),
+                  );
+                const enhanceResult =
+                  await maybeRunAutoDetailCaptureAfterListCapture(
+                    currentDetailSettings,
+                    {
+                      sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
+                      recordIds,
+                    },
+                  );
+                if (enhanceResult?.securityBlocked) {
+                  // 撞小红书风控:停掉整轮无人值守,别再往下跑(越跑越死)
+                  searchCaptureCancelRequested = true;
+                  taskStatus = "partial";
+                  showMessage(
+                    "⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。",
+                    "warning",
+                  );
+                  return {...enhanceResult, canceled: true};
+                }
+                if (enhanceResult?.canceled) {
+                  searchCaptureCancelRequested = true;
+                  taskStatus = "partial";
+                  return enhanceResult;
+                }
+                if (enhanceResult && enhanceResult.ok === false) {
+                  taskStatus = "completed_with_failures";
+                }
+                const syncResult = await maybeRunAutoSyncAfterDetailCapture(
+                  currentDetailSettings,
+                  {
+                    sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
+                    recordIds,
+                  },
+                );
+                if (syncResult && syncResult.ok === false) {
+                  taskStatus = "completed_with_failures";
+                }
+                return enhanceResult;
+              }
+            : null,
           onProgress: (p) =>
             showProgress(
               searchAutoLoop
@@ -3490,24 +4648,42 @@ async function handleCaptureSearchData() {
           shouldStop: () => searchCaptureCancelRequested,
         });
         await refreshDataPool();
+        const retryDetailSettings = resolveCurrentDetailCaptureSettings(
+          await getCaptureSettings(),
+        );
+        const retryResult = await retryFailedEnhancementsAfterRound({
+          round: searchRound,
+          roundLabel: searchAutoLoop ? `第 ${searchRound} 轮` : "",
+          batchResult,
+          settings: retryDetailSettings,
+          shouldStop: () => searchCaptureCancelRequested,
+          updateProgress: (progress) =>
+            showProgress(progress?.message || "正在重试采集增强失败项...", "info"),
+        });
+        if (retryResult?.securityBlocked) {
+          searchCaptureCancelRequested = true;
+          taskStatus = "partial";
+          showMessage(
+            "⚠️ 重试采集增强时触发小红书安全限制，已停止本次任务。建议隔较长时间(数小时)再跑。",
+            "warning",
+          );
+        } else if (retryResult?.canceled) {
+          searchCaptureCancelRequested = true;
+          taskStatus = "partial";
+        } else if (retryResult && Number(retryResult.failedCount || 0) > 0) {
+          taskStatus = "completed_with_failures";
+        }
         if (batchResult?.canceled) {
           taskStatus = "partial";
           searchCaptureCancelRequested = true;
         } else {
-          const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
-            resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
-            { sourceLabel: "批量搜索结果", recordIds: collectBatchRecordIds(batchResult) },
-          );
-          if (enhanceResult?.securityBlocked) {
-            // 撞小红书风控:停掉整轮无人值守,别再往下跑(越跑越死)
-            searchCaptureCancelRequested = true;
-            taskStatus = "partial";
-            showMessage("⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。", "warning");
-          } else if ((batchResult?.stats?.failed || 0) > 0) taskStatus = "completed_with_failures";
+          if ((batchResult?.stats?.failed || 0) > 0) {
+            taskStatus = "completed_with_failures";
+          }
         }
       } else {
         // 单词:在当前页切筛选 + 单次采集
-        if (searchFilters.sort || searchFilters.publishTime) {
+        if (hasActiveSearchFilters(searchFilters)) {
           await applySearchFiltersOnActiveTab(searchActiveTabId, searchFilters);
           await sleepWithStop(1500, () => searchCaptureCancelRequested);
         }
@@ -3531,8 +4707,11 @@ async function handleCaptureSearchData() {
         });
 
         if (actionResult?.ok) {
+          const currentDetailSettings = resolveCurrentDetailCaptureSettings(
+            await getCaptureSettings(),
+          );
           const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
-            resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
+            currentDetailSettings,
             { sourceLabel: "搜索结果", recordIds: actionResult.recordIds },
           );
           if (enhanceResult?.securityBlocked) {
@@ -3545,6 +4724,15 @@ async function handleCaptureSearchData() {
           } else if (enhanceResult && enhanceResult.ok === false) {
             taskStatus = "completed_with_failures";
           }
+          if (!enhanceResult?.securityBlocked && !enhanceResult?.canceled) {
+            const syncResult = await maybeRunAutoSyncAfterDetailCapture(
+              currentDetailSettings,
+              { sourceLabel: "搜索结果", recordIds: actionResult.recordIds },
+            );
+            if (syncResult && syncResult.ok === false) {
+              taskStatus = "completed_with_failures";
+            }
+          }
         } else if (searchCaptureCancelRequested) {
           taskStatus = "partial";
         } else {
@@ -3552,13 +4740,9 @@ async function handleCaptureSearchData() {
         }
       }
 
-      // 终止:取消 / 没开循环 / 到轮数(单轮失败不停,继续按计划跑)
-      if (searchCaptureCancelRequested || !searchAutoLoop || searchRound >= searchMaxRounds) {
+      // 手动采集只跑一次；批量多词的逐词执行由 batchCaptureByKeywords 负责。
+      if (searchCaptureCancelRequested || !searchAutoLoop) {
         break;
-      }
-      if (searchGapMs > 0) {
-        showProgress(`第 ${searchRound} 轮完成,${searchGapMin} 分钟后开始第 ${searchRound + 1} 轮…`, "info");
-        await sleepWithStop(searchGapMs, () => searchCaptureCancelRequested);
       }
     } while (!searchCaptureCancelRequested);
 
@@ -3584,6 +4768,9 @@ async function handleCaptureSearchData() {
     });
     hideProgress();
     searchCaptureCancelRequested = false;
+    if (executionLock) {
+      await releaseCaptureExecutionLock(executionLock.id);
+    }
   }
 }
 
@@ -8169,7 +9356,7 @@ function getExpandedKeywordsFromTextarea({dedupe = false} = {}) {
   return dedupe ? dedupeKeywords(keywords) : keywords;
 }
 
-// 可中断睡眠:每秒检查 shouldStop,用于无人值守循环的轮次间隔
+// 可中断睡眠:每秒检查 shouldStop,用于循环采集的轮次间隔
 function sleepWithStop(ms, shouldStop) {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -8182,11 +9369,188 @@ function sleepWithStop(ms, shouldStop) {
   });
 }
 
-async function handleBatchKeywordCapture() {
+function shouldRetryEnhanceFailure(item = {}) {
+  if (!item || item.ok !== false || !item.recordId) {
+    return false;
+  }
+  const reason = String(item.reason || item.code || "").trim().toUpperCase();
+  const category = String(item.category || "").trim().toLowerCase();
+  if (
+    reason === "CANCELED" ||
+    reason === "DETAIL_CAPTURE_CANCELED" ||
+    reason === "XHS_SECURITY_BLOCK" ||
+    category === "user_canceled"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function collectFailedEnhanceRecordIds(batchResult = {}) {
+  const failedRecordIds = [];
+  const seen = new Set();
+  const append = (recordId) => {
+    const normalized = String(recordId || "").trim();
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    failedRecordIds.push(normalized);
+  };
+
+  (Array.isArray(batchResult?.results) ? batchResult.results : []).forEach(
+    (keywordResult) => {
+      const enhanceResult = keywordResult?.enhanceResult;
+      if (
+        !enhanceResult ||
+        enhanceResult.securityBlocked ||
+        enhanceResult.canceled
+      ) {
+        return;
+      }
+      const detailResults = Array.isArray(enhanceResult.results)
+        ? enhanceResult.results
+        : [];
+      detailResults.forEach((item) => {
+        if (shouldRetryEnhanceFailure(item)) {
+          append(item.recordId);
+        }
+      });
+    },
+  );
+
+  return failedRecordIds;
+}
+
+function collectSuccessfulDetailRecordIds(detailResult = {}) {
+  return [
+    ...new Set(
+      (Array.isArray(detailResult?.results) ? detailResult.results : [])
+        .filter((item) => item?.ok && item?.recordId)
+        .map((item) => String(item.recordId || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+async function retryFailedEnhancementsAfterRound({
+  round = 1,
+  roundLabel = "",
+  batchResult = null,
+  settings = null,
+  notifyProgress = null,
+  waitForegroundTabId = null,
+  shouldStop = null,
+  updateProgress = null,
+} = {}) {
+  if (!Boolean(settings?.autoDetailCaptureAfterListCapture)) {
+    return null;
+  }
+  if (batchResult?.canceled || batchResult?.securityBlocked) {
+    return null;
+  }
+
+  const failedRecordIds = collectFailedEnhanceRecordIds(batchResult);
+  if (failedRecordIds.length === 0) {
+    return null;
+  }
+  if (typeof shouldStop === "function" && shouldStop()) {
+    return null;
+  }
+
+  const prefix = String(roundLabel || "").trim();
+  const messagePrefix = prefix ? `${prefix} · ` : "";
+  const retryIntro = {
+    current: 0,
+    total: failedRecordIds.length,
+    round,
+    phase: "enhance_retry_waiting",
+    message: `${messagePrefix}采集增强有 ${failedRecordIds.length} 条失败，3 秒后自动重试一次...`,
+  };
+  updateProgress?.(retryIntro);
+  notifyProgress?.(retryIntro);
+  await sleepWithStop(3000, shouldStop);
+  if (typeof shouldStop === "function" && shouldStop()) {
+    return {
+      canceled: true,
+      retryRecordIds: failedRecordIds,
+    };
+  }
+
+  const retryResult = await runDetailCaptureForRecordIds(
+    failedRecordIds,
+    settings,
+    {
+      progressMessage: `正在重试采集增强失败项（0/${failedRecordIds.length}）...`,
+      waitForegroundTabId,
+      onProgress: (progress = {}) => {
+        const retryProgress = {
+          ...progress,
+          round,
+          phase: progress.phase || "enhance_retrying",
+          message: `${messagePrefix}自动重试增强失败项：${progress.message || "执行中..."}`,
+        };
+        updateProgress?.(retryProgress);
+        notifyProgress?.(retryProgress);
+      },
+    },
+  );
+
+  await refreshDataPool();
+  const successRecordIds = collectSuccessfulDetailRecordIds(retryResult);
+  if (
+    successRecordIds.length > 0 &&
+    !retryResult?.securityBlocked &&
+    !retryResult?.canceled
+  ) {
+    await maybeRunAutoSyncAfterDetailCapture(settings, {
+      sourceLabel: `${prefix || "本轮"}增强失败重试成功项`,
+      recordIds: successRecordIds,
+    });
+  }
+
+  const retryDone = {
+    current: failedRecordIds.length,
+    total: failedRecordIds.length,
+    round,
+    phase: retryResult?.canceled ? "enhance_retry_canceled" : "enhance_retry_done",
+    message: retryResult?.canceled
+      ? `${messagePrefix}增强失败重试已中止：成功 ${retryResult?.successCount || 0}，失败 ${retryResult?.failedCount || 0}`
+      : `${messagePrefix}增强失败重试完成：成功 ${retryResult?.successCount || 0}，失败 ${retryResult?.failedCount || 0}`,
+  };
+  updateProgress?.(retryDone);
+  notifyProgress?.(retryDone);
+
+  return {
+    ...retryResult,
+    retryRecordIds: failedRecordIds,
+    successRecordIds,
+  };
+}
+
+async function handleBatchKeywordCapture(options = {}) {
+  const runOptions =
+    options && typeof options === "object" && typeof options.preventDefault !== "function"
+      ? options
+      : {};
+  const notifyProgress =
+    typeof runOptions.onProgress === "function" ? runOptions.onProgress : null;
+  const waitForegroundTabId = Number.isFinite(
+    Number(runOptions.waitForegroundTabId),
+  )
+    ? Number(runOptions.waitForegroundTabId)
+    : null;
+  const executionLockOwner =
+    String(runOptions.executionLockOwner || "").trim() ||
+    "manual_batch_keyword_capture";
+  const executionLockLabel =
+    String(runOptions.executionLockLabel || "").trim() ||
+    "手动批量关键词采集";
+
   if (batchKeywordCaptureInFlight) {
     if (batchKeywordCancelRequested) {
       showMessage("正在取消批量采集...", "warning");
-      return;
+      return {started: false, canceled: true, reason: "正在取消批量采集"};
     }
     batchKeywordCancelRequested = true;
     // 取消时若正在「采集增强」逐条補采(用 detailBatch 标志 + 独立 runner tab),也要一并停,
@@ -8208,12 +9572,12 @@ async function handleBatchKeywordCapture() {
       console.warn("[Sidebar] Batch keyword cancel failed:", error);
     }
     showMessage("正在取消批量采集...", "warning");
-    return;
+    return {started: false, canceled: true, reason: "正在取消批量采集"};
   }
 
   if (batchUrlCaptureInFlight) {
     showMessage("已有批量任务执行中，请先停止当前任务", "warning");
-    return;
+    return {started: false, reason: "已有批量任务执行中"};
   }
 
   const runtime = getCurrentRuntime();
@@ -8225,31 +9589,32 @@ async function handleBatchKeywordCapture() {
       `当前数据视图是${platformCopy.label}，请切换到对应平台页面后再采集`,
       "error",
     );
-    return;
+    return {started: false, reason: "当前数据视图与页面平台不一致"};
   }
   if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
     showMessage("请先切换到搜索页", "error");
-    return;
+    return {started: false, reason: "当前页面不是搜索结果页"};
   }
   if (!getPlatformCapabilities(pagePlatform).captureSearch) {
     showMessage("当前平台暂不支持搜索结果采集", "warning");
-    return;
+    return {started: false, reason: "当前平台暂不支持搜索结果采集"};
   }
 
   const rawKeywords = getBatchKeywordsFromTextarea();
   if (rawKeywords.length === 0) {
     showMessage("请输入至少一个关键词（每行一个）", "warning");
-    return;
+    return {started: false, reason: "未填写关键词"};
   }
   if (rawKeywords.length > MAX_BATCH_KEYWORDS) {
     showMessage(`单次最多批量采集 ${MAX_BATCH_KEYWORDS} 个关键词`, "warning");
-    return;
+    return {started: false, reason: `关键词超过 ${MAX_BATCH_KEYWORDS} 个`};
   }
 
   const keywords = dedupeKeywords(rawKeywords);
   updateBatchKeywordInputState();
   persistCurrentBatchDraft();
 
+  let executionLock = null;
   try {
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
@@ -8260,7 +9625,14 @@ async function handleBatchKeywordCapture() {
         message: PAGE_ENHANCE_AUTH_REQUIRED_MESSAGE,
       })
     ) {
-      return;
+      return {started: false, reason: "采集增强需要先完成授权验证"};
+    }
+    executionLock = await acquireCaptureExecutionLock({
+      owner: executionLockOwner,
+      label: executionLockLabel,
+    });
+    if (!executionLock) {
+      return {started: false, reason: "已有采集任务运行中"};
     }
 
     const sortContext = await syncKeywordSortDimensionFromPage({
@@ -8303,19 +9675,18 @@ async function handleBatchKeywordCapture() {
 
     setBatchProgressVisible("modal", true);
 
-    // 无人值守循环:跑完一轮(所有关键词)→自动再跑下一轮,轮次间隔可设;
-    // 留空轮数 = 一直跑(夜间专机用)。全程可中断(再点按钮即停)。
-    const autoLoop = !!document.getElementById("chkAutoLoop")?.checked;
+    // 执行轮数:1 轮即普通采集,大于 1 才按轮次间隔继续跑。
     const roundGapMin = Math.max(0, Number(document.getElementById("inputLoopGapMin")?.value) || 0);
     const maxRounds = Math.max(1, Math.floor(Number(document.getElementById("inputLoopRounds")?.value)) || 1); // 留空/0 = 1 轮(不做无限,防风控)
+    const autoLoop = maxRounds > 1;
     const roundGapMs = roundGapMin * 60 * 1000;
-    // 采集排序 / 发布时间(默认「综合 + 不限」归一为空 → 不触发筛选点击);复用「找对标账号」的筛选点击能力
-    const rawSort = document.getElementById("selectBatchSort")?.value || "";
-    const rawPublishTime = document.getElementById("selectBatchPublishTime")?.value || "";
-    const searchFilters = {
-      sort: rawSort === "comprehensive" ? "" : rawSort,
-      publishTime: rawPublishTime === "all" ? "" : rawPublishTime,
-    };
+    // 采集排序 / 范围(默认值归一为空 → 不触发筛选点击);复用「找对标账号」的筛选点击能力
+    // 无人值守直接用计划里已归一化的 searchFilters,绕开"设控件→回读"的回环
+    // (避免重渲染扰动/平台专属字段被抹);手动批量不传该项 → 仍回读 modal 控件。
+    const searchFilters =
+      runOptions.searchFilters && typeof runOptions.searchFilters === "object"
+        ? runOptions.searchFilters
+        : collectSearchFiltersFromControls("modal");
 
     let result;
     let round = 0;
@@ -8347,12 +9718,18 @@ async function handleBatchKeywordCapture() {
               },
               "modal",
             );
+            notifyProgress?.({
+              current: 0,
+              total: keywords.length,
+              phase: "scheduled-waiting",
+              message: `定时采集:将于 ${targetLabel} 开始(还剩 ${h > 0 ? h + "时" : ""}${m}分${s}秒)`,
+            });
           }
           return false;
         });
         if (batchKeywordCancelRequested) {
           showMessage("已取消定时采集", "warning");
-          return; // finally 会复位状态/按钮
+          return {started: true, canceled: true, reason: "已取消定时采集"}; // finally 会复位状态/按钮
         }
       }
     }
@@ -8373,17 +9750,72 @@ async function handleBatchKeywordCapture() {
           stallTimeoutMs: settings.sharedStallTimeoutMs,
           maxDurationMs: settings.sharedMaxDurationMs,
         },
+        waitForegroundTabId,
+        afterKeywordCapture: settings.autoDetailCaptureAfterListCapture
+          ? async ({
+              keyword: capturedKeyword,
+              current: keywordCurrent,
+              total: keywordTotal,
+              recordIds,
+              runnerTabId,
+            }) => {
+              await refreshDataPool();
+              const enhanceResult =
+                await maybeRunAutoDetailCaptureAfterListCapture(settings, {
+                  sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
+                  recordIds,
+                  waitForegroundTabId,
+                  onProgress: notifyProgress
+                    ? (detailProgress = {}) =>
+                        notifyProgress({
+                          ...detailProgress,
+                          current: keywordCurrent,
+                          total: keywordTotal,
+                          keyword: capturedKeyword,
+                          phase: detailProgress.phase || "enhancing",
+                          message:
+                            detailProgress.message ||
+                            `正在增强关键词「${capturedKeyword}」的采集结果`,
+                          runnerTabId:
+                            detailProgress.runnerTabId || runnerTabId || null,
+                        })
+                    : null,
+                });
+              if (enhanceResult?.securityBlocked) {
+                batchKeywordCancelRequested = true;
+                showMessage(
+                  "⚠️ 触发小红书安全限制(访问频繁),已停止无人值守。建议隔较长时间(数小时)再跑。",
+                  "warning",
+                );
+                return {...enhanceResult, canceled: true};
+              }
+              if (enhanceResult?.canceled) {
+                batchKeywordCancelRequested = true;
+                return enhanceResult;
+              }
+              await maybeRunAutoSyncAfterDetailCapture(
+                settings,
+                {
+                  sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
+                  recordIds,
+                },
+              );
+              return enhanceResult;
+            }
+          : null,
         onProgress: (progress) => {
           // 进入「导航 / 切筛选 / 等待」阶段时清掉上一条采集明细,等本条列表采集再刷新
           if (progress.phase && progress.phase !== "capturing") {
             setBatchProgressDetail("");
           }
+          const progressForUi = autoLoop
+            ? { ...progress, round, message: `第 ${round} 轮 · ${progress.message || ""}` }
+            : { ...progress, round };
           updateBatchProgress(
-            autoLoop
-              ? { ...progress, message: `第 ${round} 轮 · ${progress.message || ""}` }
-              : progress,
+            progressForUi,
             "modal",
           );
+          notifyProgress?.(progressForUi);
         },
         shouldStop: () => batchKeywordCancelRequested,
       });
@@ -8392,28 +9824,46 @@ async function handleBatchKeywordCapture() {
       totalSuccess += result.stats.success;
       totalFailed += result.stats.failed;
 
-      if (!result.canceled) {
-        await maybeRunAutoDetailCaptureAfterListCapture(settings, {
-          sourceLabel: "批量关键词搜索结果",
-          recordIds: collectBatchRecordIds(result),
-        });
+      const retryResult = await retryFailedEnhancementsAfterRound({
+        round,
+        roundLabel: autoLoop ? `第 ${round} 轮` : "",
+        batchResult: result,
+        settings,
+        notifyProgress,
+        waitForegroundTabId,
+        shouldStop: () => batchKeywordCancelRequested,
+        updateProgress: (progress) => updateBatchProgress(progress, "modal"),
+      });
+      if (retryResult?.securityBlocked) {
+        batchKeywordCancelRequested = true;
+        showMessage(
+          "⚠️ 重试采集增强时触发小红书安全限制，已停止本次任务。建议隔较长时间(数小时)再跑。",
+          "warning",
+        );
+      }
+      if (retryResult?.canceled) {
+        batchKeywordCancelRequested = true;
       }
 
       // 终止:被取消 / 没开循环 / 已到指定轮数
-      if (result.canceled || !autoLoop || round >= maxRounds) {
+      if (batchKeywordCancelRequested || result.canceled || !autoLoop || round >= maxRounds) {
         break;
       }
 
       // 轮次间隔:歇 roundGapMin 分钟再跑下一轮(睡眠中可中断)
       if (roundGapMs > 0) {
         updateBatchProgress(
-          {
-            current: 0,
-            total: keywords.length,
-            phase: "waiting",
-            message: `第 ${round} 轮完成（累计成功 ${totalSuccess}），${roundGapMin} 分钟后开始第 ${round + 1} 轮…`,
-            round,
-          },
+          (() => {
+            const waitProgress = {
+              current: 0,
+              total: keywords.length,
+              phase: "waiting",
+              message: `第 ${round} 轮完成（累计成功 ${totalSuccess}），${roundGapMin} 分钟后开始第 ${round + 1} 轮…`,
+              round,
+            };
+            notifyProgress?.(waitProgress);
+            return waitProgress;
+          })(),
           "modal",
         );
         await sleepWithStop(roundGapMs, () => batchKeywordCancelRequested);
@@ -8438,13 +9888,30 @@ async function handleBatchKeywordCapture() {
         stats.failed > 0 ? "warning" : "success",
       );
     }
+    return {
+      started: true,
+      ok: !result?.canceled,
+      canceled: Boolean(result?.canceled || batchKeywordCancelRequested),
+      result,
+      rounds: round,
+      totalSuccess,
+      totalFailed,
+    };
   } catch (error) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
     showMessage("批量采集失败: " + error.message, "error");
+    return {
+      started: true,
+      ok: false,
+      error: error.message,
+    };
   } finally {
     batchKeywordCaptureInFlight = false;
     batchKeywordCancelRequested = false;
     activeBatchRunnerTabId = null;
+    if (executionLock) {
+      await releaseCaptureExecutionLock(executionLock.id);
+    }
     setBatchProgressDetail("");
 
     const btnBatch = document.getElementById("btnRunBatchKeywords");
@@ -8454,6 +9921,401 @@ async function handleBatchKeywordCapture() {
       btnBatch.classList.remove("btn-danger");
     }
     updateBatchKeywordInputState();
+  }
+}
+
+async function reportUnattendedKeywordRun(requestId, patch = {}) {
+  if (!requestId) {
+    return null;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:update-unattended-keyword-run",
+      requestId,
+      patch,
+    });
+    return response?.data || null;
+  } catch (error) {
+    console.warn("[Sidebar] Update unattended keyword run failed:", error);
+    return null;
+  }
+}
+
+function createUnattendedKeywordProgressReporter(requestId) {
+  let lastMessage = "";
+  let lastReportedAt = 0;
+  return (progress = {}) => {
+    if (!requestId) {
+      return;
+    }
+    const message = String(progress?.message || "无人值守计划运行中").trim();
+    const now = Date.now();
+    if (message === lastMessage && now - lastReportedAt < 1500) {
+      return;
+    }
+    lastMessage = message;
+    lastReportedAt = now;
+    void reportUnattendedKeywordRun(requestId, {
+      status: "running",
+      message,
+      progress: {
+        current: Number.isFinite(Number(progress?.current))
+          ? Number(progress.current)
+          : 0,
+        total: Number.isFinite(Number(progress?.total)) ? Number(progress.total) : 0,
+        keyword: String(progress?.keyword || ""),
+        phase: String(progress?.phase || ""),
+        message,
+        recordId: String(progress?.recordId || ""),
+        runnerTabId: Number.isFinite(Number(progress?.runnerTabId))
+          ? Number(progress.runnerTabId)
+          : null,
+        remainingMs: Number.isFinite(Number(progress?.remainingMs))
+          ? Number(progress.remainingMs)
+          : null,
+        round: Number.isFinite(Number(progress?.round))
+          ? Number(progress.round)
+          : null,
+        updatedAt: new Date().toISOString(),
+      },
+    }).catch(() => null);
+  };
+}
+
+async function acquireCaptureExecutionLock({
+  owner = "manual",
+  label = "采集任务",
+} = {}) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:acquire-capture-lock",
+      owner,
+      label,
+    });
+    if (response?.ok && response.data?.id) {
+      activeCaptureExecutionLockId = response.data.id;
+      return response.data;
+    }
+    const activeLabel = response?.data?.label || "其他采集任务";
+    showMessage(`${activeLabel}正在运行，本次任务暂不能启动`, "warning");
+    return null;
+  } catch (error) {
+    console.warn("[Sidebar] Acquire capture execution lock failed:", error);
+    return {
+      id: "",
+      degraded: true,
+    };
+  }
+}
+
+async function releaseCaptureExecutionLock(lockId = activeCaptureExecutionLockId) {
+  if (!lockId) {
+    activeCaptureExecutionLockId = "";
+    return;
+  }
+  try {
+    await chrome.runtime.sendMessage({
+      type: "onstarvoice:release-capture-lock",
+      lockId,
+    });
+  } catch (error) {
+    console.warn("[Sidebar] Release capture execution lock failed:", error);
+  } finally {
+    if (activeCaptureExecutionLockId === lockId) {
+      activeCaptureExecutionLockId = "";
+    }
+  }
+}
+
+function getUnattendedRunRequestIdFromUrl() {
+  try {
+    return new URLSearchParams(window.location.search).get(
+      UNATTENDED_RUN_QUERY_KEY,
+    );
+  } catch {
+    return "";
+  }
+}
+
+async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}) {
+  const requestId = getUnattendedRunRequestIdFromUrl();
+  if (!requestId && !allowPending) {
+    return;
+  }
+  if (!requestId && (batchKeywordCaptureInFlight || batchUrlCaptureInFlight)) {
+    return;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:claim-unattended-keyword-run",
+      requestId,
+    });
+    if (!response?.ok || !response.data) {
+      if (requestId) {
+        showMessage("未找到可执行的无人值守计划任务", "warning");
+      }
+      return;
+    }
+    await runUnattendedKeywordPlanRequest(response.data);
+  } catch (error) {
+    console.error("[Sidebar] Claim unattended keyword run failed:", error);
+    showMessage("启动无人值守计划失败: " + error.message, "error");
+    await reportUnattendedKeywordRun(requestId, {
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      message: error.message,
+      error: {
+        message: error.message,
+      },
+    });
+  }
+}
+
+function buildSidebarKeywordSearchUrl(keyword, platform, baseSearchUrl = "") {
+  const encodedKeyword = encodeURIComponent(keyword);
+  if (platform === "douyin") {
+    return `https://www.douyin.com/search/${encodedKeyword}?type=general`;
+  }
+  if (platform === "weibo") {
+    return `https://s.weibo.com/weibo?q=${encodedKeyword}`;
+  }
+
+  const xhsDefaultSearchUrl = new URL("https://www.xiaohongshu.com/search_result");
+  xhsDefaultSearchUrl.searchParams.set("source", "web_explore_feed");
+  xhsDefaultSearchUrl.searchParams.set("type", "51");
+  if (baseSearchUrl) {
+    try {
+      const parsed = new URL(baseSearchUrl);
+      const pathname = String(parsed.pathname || "").toLowerCase();
+      const isXhsSearchPath =
+        pathname.includes("/search_result") ||
+        pathname.includes("/web/search_result") ||
+        pathname.includes("/search/result");
+      if (isXhsSearchPath) {
+        parsed.searchParams.set("keyword", keyword);
+        return parsed.toString();
+      }
+      const nextSearchUrl = new URL(xhsDefaultSearchUrl.toString());
+      const source = String(parsed.searchParams.get("source") || "").trim();
+      const type = String(parsed.searchParams.get("type") || "").trim();
+      if (source) nextSearchUrl.searchParams.set("source", source);
+      if (type) nextSearchUrl.searchParams.set("type", type);
+      nextSearchUrl.searchParams.set("keyword", keyword);
+      return nextSearchUrl.toString();
+    } catch {
+      // fallback below
+    }
+  }
+  xhsDefaultSearchUrl.searchParams.set("keyword", keyword);
+  return xhsDefaultSearchUrl.toString();
+}
+
+async function waitForActiveTabReady(tabId, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(Number(tabId));
+      if (String(tab?.status || "") === "complete") {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return false;
+}
+
+async function waitForRuntimeSearchPage(platform, timeoutMs = 8000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const runtime = getCurrentRuntime();
+    if (
+      getPagePlatform(runtime) === platform &&
+      runtime?.pageType === PAGE_TYPE.SEARCH_RESULTS
+    ) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return false;
+}
+
+async function navigateActiveTabToKeywordSearchForPlan({
+  keyword = "",
+  platform = "xiaohongshu",
+  baseSearchUrl = "",
+  tabId = null,
+} = {}) {
+  let targetTab = null;
+  if (Number.isFinite(Number(tabId)) && Number(tabId) > 0) {
+    try {
+      targetTab = await chrome.tabs.get(Number(tabId));
+    } catch {
+      targetTab = null;
+    }
+  }
+  if (!targetTab?.id) {
+    const [activeTab] = await chrome.tabs.query({active: true, currentWindow: true});
+    targetTab = activeTab || null;
+  }
+  if (!targetTab?.id) {
+    throw new Error("未找到可用于无人值守采集的标签页");
+  }
+  const searchUrl = buildSidebarKeywordSearchUrl(keyword, platform, baseSearchUrl);
+  if (Number.isFinite(Number(targetTab.windowId)) && Number(targetTab.windowId) >= 0) {
+    await chrome.windows.update(Number(targetTab.windowId), {focused: true});
+  }
+  await chrome.tabs.update(targetTab.id, {
+    url: searchUrl,
+    active: true,
+  });
+  const isTabReady = await waitForActiveTabReady(targetTab.id);
+  const isSearchRuntimeReady = await waitForRuntimeSearchPage(platform);
+  if (!isTabReady || !isSearchRuntimeReady) {
+    throw new Error("搜索结果页尚未就绪，无法启动无人值守采集");
+  }
+}
+
+async function runUnattendedKeywordPlanRequest(request) {
+  const requestId = String(request?.id || "").trim();
+  const plan = request?.planSnapshot || {};
+  const keywords = dedupeKeywords(
+    Array.isArray(plan.keywords) ? plan.keywords : [],
+  ).slice(0, MAX_BATCH_KEYWORDS);
+  const platform = String(plan.platform || "xiaohongshu").trim();
+
+  if (keywords.length === 0) {
+    throw new Error("无人值守计划没有可执行关键词");
+  }
+  if (batchKeywordCaptureInFlight || batchUrlCaptureInFlight) {
+    throw new Error("已有批量任务执行中，无法启动无人值守计划");
+  }
+
+  await reportUnattendedKeywordRun(requestId, {
+    status: "running",
+    startedAt: new Date().toISOString(),
+    message: "无人值守计划已触发，准备调用循环采集流程",
+  });
+
+  let switchResult = null;
+  try {
+    switchResult = await chrome.runtime.sendMessage({
+      type: "onstarvoice:switch-platform-tab",
+      platform,
+    });
+    if (!switchResult?.ok) {
+      throw new Error(
+        switchResult?.error?.message || "打开平台页面失败，无法执行计划",
+      );
+    }
+  } catch (error) {
+    throw new Error(`打开平台页面失败：${error.message}`);
+  }
+
+  try {
+    await sleepWithStop(1200, () => false);
+    closeBatchModal();
+
+    const textarea = document.getElementById("textareaBatchKeywords");
+    if (textarea) {
+      textarea.value = keywords.join("\n");
+      updateBatchKeywordInputState();
+    }
+    syncSearchFilterControlsForPlatform(platform, {
+      scope: "modal",
+      values: plan.searchFilters || {},
+    });
+    syncDetailCaptureControlsFromStoredSettings(await getCaptureSettings(), {
+      platform,
+    });
+
+    const autoLoopInput = document.getElementById("chkAutoLoop");
+    if (autoLoopInput) {
+      autoLoopInput.checked = true;
+      document
+        .getElementById("batchLoopFields")
+        ?.classList.remove("is-disabled");
+    }
+    const loopGapInput = document.getElementById("inputLoopGapMin");
+    if (loopGapInput) {
+      loopGapInput.value = String(Math.max(0, Number(plan.roundGapMin) || 0));
+    }
+    const loopRoundsInput = document.getElementById("inputLoopRounds");
+    if (loopRoundsInput) {
+      loopRoundsInput.value = String(Math.max(1, Number(plan.maxRounds) || 1));
+    }
+    const scheduledInput = document.getElementById("inputBatchScheduledStart");
+    if (scheduledInput) {
+      scheduledInput.value = "";
+    }
+
+    await navigateActiveTabToKeywordSearchForPlan({
+      keyword: keywords[0],
+      platform,
+      tabId: switchResult?.data?.tabId,
+      baseSearchUrl: String(
+        switchResult?.data?.url || getCurrentRuntime()?.lastPageUrl || "",
+      ).trim(),
+    });
+
+    await reportUnattendedKeywordRun(requestId, {
+      status: "running",
+      message: "已交给循环采集流程执行",
+      progress: {
+        current: 0,
+        total: keywords.length,
+        phase: "delegated_to_batch_loop",
+      },
+    });
+
+    const reportKeywordProgress =
+      createUnattendedKeywordProgressReporter(requestId);
+    const batchRunResult = await handleBatchKeywordCapture({
+      onProgress: reportKeywordProgress,
+      waitForegroundTabId: null,
+      executionLockOwner: "unattended_keyword_plan",
+      executionLockLabel: "无人值守计划",
+      searchFilters: plan.searchFilters || {},
+    });
+    if (!batchRunResult?.started) {
+      throw new Error(batchRunResult?.reason || "循环采集流程未启动");
+    }
+    if (batchRunResult?.ok === false && batchRunResult?.error) {
+      throw new Error(batchRunResult.error);
+    }
+    if (batchRunResult?.canceled) {
+      await reportUnattendedKeywordRun(requestId, {
+        status: "canceled",
+        finishedAt: new Date().toISOString(),
+        message: batchRunResult.reason || "无人值守计划已取消",
+      });
+      return;
+    }
+
+    const stats = batchRunResult?.result?.stats || {};
+    const message = `无人值守计划已完成：共 ${Number(stats.total || 0)} 个关键词，成功 ${Number(stats.success || 0)}，失败 ${Number(stats.failed || 0)}`;
+    await reportUnattendedKeywordRun(requestId, {
+      status: "completed",
+      finishedAt: new Date().toISOString(),
+      message,
+    });
+  } catch (error) {
+    console.error("[Sidebar] Unattended keyword plan failed:", error);
+    showMessage("无人值守计划失败: " + error.message, "error");
+    await reportUnattendedKeywordRun(requestId, {
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      message: error.message,
+      error: {
+        message: error.message,
+      },
+    });
+    throw error;
+  } finally {
+    closeBatchModal();
+    await loadKeywordPlanUI();
   }
 }
 
@@ -8545,12 +10407,19 @@ async function runCaptureAction({
  */
 async function handleCancel() {
   console.log("[Sidebar] Cancel clicked");
+  const progressContainer = document.getElementById("progressContainer");
+  if (progressContainer?.dataset.progressSource === "keyword-plan") {
+    await cancelUnattendedKeywordPlanFromSidebar();
+    return;
+  }
   setCancelFlag(true);
   searchCaptureCancelRequested = true;
   hideProgressPanelOnly();
   let relayTabId = null;
+  let shouldFinalizeDetailCapture = false;
   if (detailBatchCaptureInFlight) {
     detailBatchCancelRequested = true;
+    shouldFinalizeDetailCapture = true;
     if (Number.isFinite(Number(detailBatchRunnerTabId))) {
       relayTabId = Number(detailBatchRunnerTabId);
     }
@@ -8578,7 +10447,11 @@ async function handleCancel() {
     console.warn("[Sidebar] Cancel relay failed:", error);
   }
 
-  showMessage("正在取消...", "info");
+  if (shouldFinalizeDetailCapture) {
+    await finalizeInterruptedDetailCaptureAfterCancel();
+  } else {
+    showMessage("正在取消...", "info");
+  }
 }
 
 /**
@@ -10987,6 +12860,8 @@ async function initCaptureSettingsUI() {
     );
     const autoDetailCaptureAfterListCapture =
       authVerified && Boolean(settings.autoDetailCaptureAfterListCapture);
+    const autoSyncAfterDetailCapture =
+      authVerified && Boolean(settings.autoSyncAfterDetailCapture);
     const includeCommentsOnDetailCapture =
       authVerified && Boolean(settings.includeCommentsOnDetailCapture);
     const detailCommentsMaxDetectedItems = Number(
@@ -11001,12 +12876,14 @@ async function initCaptureSettingsUI() {
     if (
       !authVerified &&
       (settings.autoDetailCaptureAfterListCapture ||
+        settings.autoSyncAfterDetailCapture ||
         settings.includeCommentsOnDetailCapture ||
         settings.enableCommentLeadsFilterOnDetailCapture ||
         settings.includeBloggerMetricsOnDetailCapture)
     ) {
       await saveCaptureSettings({
         autoDetailCaptureAfterListCapture: false,
+        autoSyncAfterDetailCapture: false,
         includeCommentsOnDetailCapture: false,
         enableCommentLeadsFilterOnDetailCapture: false,
         includeBloggerMetricsOnDetailCapture: false,
@@ -11050,6 +12927,7 @@ async function initCaptureSettingsUI() {
     });
     syncAutoDetailCaptureControls({
       autoDetailCapture: autoDetailCaptureAfterListCapture,
+      autoSync: autoSyncAfterDetailCapture,
       includeComments: includeCommentsOnDetailCapture,
       commentsMaxDetectedItems: detailCommentsMaxDetectedItems,
       enableCommentLeadsFilter: enableCommentLeadsFilterOnDetailCapture,
@@ -11060,6 +12938,11 @@ async function initCaptureSettingsUI() {
       .querySelectorAll('[data-detail-setting="skip-captured"]')
       .forEach((el) => {
         el.checked = settings.skipAlreadyCapturedOnDetailCapture !== false;
+      });
+    document
+      .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
+      .forEach((el) => {
+        el.checked = settings.recaptureCommentsOnCountIncrease !== false;
       });
 
     const inputCommentsMaxDetectedItems = document.getElementById(
@@ -11261,15 +13144,42 @@ async function handleAutoDetailCaptureToggleChange(event) {
       }
       syncAutoDetailCaptureControls({
         autoDetailCapture: false,
+        autoSync: false,
       });
       await persistDetailCaptureSettingsFromInputs();
       return;
     }
-    syncAutoDetailCaptureControls({autoDetailCapture: checked});
+    syncAutoDetailCaptureControls({
+      autoDetailCapture: checked,
+      autoSync: checked ? null : false,
+    });
     updateBloggerKeywordFilterHint();
     await persistDetailCaptureSettingsFromInputs();
   } catch (error) {
     console.warn("[Sidebar] Save auto detail capture toggle failed:", error);
+  }
+}
+
+async function handleDetailCaptureAutoSyncToggleChange(event) {
+  try {
+    const checked = Boolean(event?.target?.checked);
+    if (checked && !ensureAuthVerifiedOrWarn()) {
+      if (event?.target) {
+        event.target.checked = false;
+      }
+      syncAutoDetailCaptureControls({autoSync: false});
+      await persistDetailCaptureSettingsFromInputs();
+      return;
+    }
+    if (checked) {
+      syncAutoDetailCaptureControls({
+        autoDetailCapture: true,
+        autoSync: true,
+      });
+    }
+    await persistDetailCaptureSettingsFromInputs();
+  } catch (error) {
+    console.warn("[Sidebar] Save detail auto sync toggle failed:", error);
   }
 }
 
@@ -11322,6 +13232,14 @@ async function handleDetailCaptureSkipCapturedToggleChange() {
     await persistDetailCaptureSettingsFromInputs();
   } catch (error) {
     console.warn("[Sidebar] Save skip-captured toggle failed:", error);
+  }
+}
+
+async function handleDetailCaptureCommentCountRecheckToggleChange() {
+  try {
+    await persistDetailCaptureSettingsFromInputs();
+  } catch (error) {
+    console.warn("[Sidebar] Save comment-count-recheck toggle failed:", error);
   }
 }
 
@@ -11418,6 +13336,9 @@ async function handleSaveCaptureSettings() {
     );
     const autoDetailCaptureAfterListCapture =
       getAutoDetailCaptureChecked(current);
+    const autoSyncAfterDetailCapture =
+      autoDetailCaptureAfterListCapture &&
+      getDetailCaptureAutoSyncChecked(current);
     const includeCommentsOnNoteCapture = getCaptureCommentsChecked(current);
     const includeCommentsOnDetailCapture =
       getDetailCaptureCommentsChecked(current);
@@ -11443,6 +13364,8 @@ async function handleSaveCaptureSettings() {
       getCaptureBloggerMetricsChecked(current);
     const includeBloggerMetricsOnDetailCapture =
       getDetailCaptureBloggerMetricsChecked(current);
+    const recaptureCommentsOnCountIncrease =
+      getDetailCaptureCommentCountRecheckChecked(current);
     const sharedWaitMinMs =
       readSecondsInput(
         "inputSharedWaitMinSec",
@@ -11494,6 +13417,7 @@ async function handleSaveCaptureSettings() {
 
     await saveCaptureSettings({
       autoDetailCaptureAfterListCapture,
+      autoSyncAfterDetailCapture,
       commentsMaxDetectedItems,
       syncScope,
       detailCaptureScope,
@@ -11508,6 +13432,7 @@ async function handleSaveCaptureSettings() {
       commentLeadsIps,
       includeBloggerMetricsOnNoteCapture,
       includeBloggerMetricsOnDetailCapture,
+      recaptureCommentsOnCountIncrease,
       sharedWaitMinMs,
       sharedWaitMaxMs,
       sharedStallTimeoutMs,
@@ -11534,15 +13459,26 @@ async function handleSaveCaptureSettings() {
  */
 async function handleSyncAll() {
   if (detailBatchCaptureInFlight) {
-    showMessage("正在执行采集增强，请等待完成后再同步", "warning");
-    return;
+    const shouldStopAndSync = confirm(
+      "当前正在执行采集增强。是否立即中止采集增强，并同步已经采到的数据？\n\n未完成增强的记录会标记为“任务中断”，后续可再次重试增强。",
+    );
+    if (!shouldStopAndSync) {
+      showMessage("正在执行采集增强，请等待完成后再同步", "warning");
+      return;
+    }
+    await stopDetailCaptureAndReleaseForSync();
   }
 
   const settings = await getCaptureSettings();
   const syncScope = readSyncScopeFromInput(settings.syncScope);
   const commentLeadsConfig = buildCommentLeadsConfigFromSettings(settings);
   const commentLeadsEnabled = Boolean(commentLeadsConfig.enabled);
-  const pageRecords = getCurrentPageRecords();
+  let pageRecords = getCurrentPageRecords();
+  const repairedInterruptedDetails =
+    await repairInterruptedDetailCaptureRecordsBeforeSync(pageRecords);
+  if (repairedInterruptedDetails.count > 0) {
+    pageRecords = getCurrentPageRecords();
+  }
   const orderedAllRecords = prioritizeRecordsForSync(pageRecords);
   const pendingRecords = pageRecords.filter(
     (record) => record.status !== "synced",
@@ -11708,6 +13644,93 @@ async function handleSyncAll() {
   }
 }
 
+async function repairInterruptedDetailCaptureRecordsBeforeSync(records = []) {
+  const hasCapturingRecord = (Array.isArray(records) ? records : []).some(
+    (record) => {
+      if (!isDetailCaptureRecord(record) || isDetailCaptureDone(record)) {
+        return false;
+      }
+      const status = String(record?.payload?.detailCaptureStatus || "")
+        .trim()
+        .toLowerCase();
+      return status === "capturing";
+    },
+  );
+  if (!hasCapturingRecord) {
+    return {count: 0, recordIds: []};
+  }
+
+  try {
+    const result = await repairInterruptedDetailCaptureRecords();
+    if (Number(result?.count || 0) > 0) {
+      await refreshDataPool();
+      showMessage(
+        `已恢复 ${result.count} 条异常中断的采集增强记录，可继续同步`,
+        "warning",
+      );
+    }
+    return result || {count: 0, recordIds: []};
+  } catch (error) {
+    console.warn(
+      "[Sidebar] Repair interrupted detail capture before sync failed:",
+      error,
+    );
+    return {count: 0, recordIds: []};
+  }
+}
+
+async function stopDetailCaptureAndReleaseForSync() {
+  detailBatchCancelRequested = true;
+  const relayTabId = Number.isFinite(Number(detailBatchRunnerTabId))
+    ? Number(detailBatchRunnerTabId)
+    : null;
+
+  try {
+    if (relayTabId) {
+      await requestCaptureCancelSignal(relayTabId);
+    } else {
+      await requestCaptureCancelSignal();
+    }
+  } catch (error) {
+    console.warn("[Sidebar] Stop detail capture before sync failed:", error);
+  }
+
+  const startedAt = Date.now();
+  while (detailBatchCaptureInFlight && Date.now() - startedAt < 3000) {
+    await sleep(200);
+  }
+
+  const result = await finalizeInterruptedDetailCaptureAfterCancel();
+  detailBatchCaptureInFlight = false;
+  detailBatchCancelRequested = false;
+  detailBatchRunnerTabId = null;
+  updateDataPoolUI(getCurrentDataPool());
+  updatePageTypeUI(getCurrentRuntime()?.pageType || PAGE_TYPE.UNKNOWN);
+  return result;
+}
+
+async function finalizeInterruptedDetailCaptureAfterCancel() {
+  try {
+    const result = await repairInterruptedDetailCaptureRecords();
+    if (Number(result?.count || 0) > 0) {
+      await refreshDataPool();
+      showMessage(
+        `已中止采集增强，并保留已采到的数据；${result.count} 条进行中记录已标记为中断，可继续同步`,
+        "warning",
+      );
+      return result;
+    }
+  } catch (error) {
+    console.warn(
+      "[Sidebar] Finalize interrupted detail capture after cancel failed:",
+      error,
+    );
+  }
+
+  showMessage("正在取消...", "info");
+  return {count: 0, recordIds: []};
+}
+
 function prioritizeRecordsForSync(records = []) {
   if (!Array.isArray(records) || records.length === 0) {
     return [];
@@ -11729,7 +13752,12 @@ function prioritizeRecordsForSync(records = []) {
 
 async function maybeRunAutoDetailCaptureAfterListCapture(
   settings,
-  {sourceLabel = "当前列表", recordIds = null} = {},
+  {
+    sourceLabel = "当前列表",
+    recordIds = null,
+    onProgress = null,
+    waitForegroundTabId = null,
+  } = {},
 ) {
   if (!Boolean(settings?.autoDetailCaptureAfterListCapture)) {
     return {
@@ -11797,6 +13825,8 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
 
   const result = await runDetailCaptureForRecordIds(targetRecordIds, settings, {
     progressMessage: `正在执行采集增强（0/${targetRecordIds.length}）...`,
+    onProgress,
+    waitForegroundTabId,
   });
 
   if (result.canceled) {
@@ -11827,10 +13857,144 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
   return result;
 }
 
+async function maybeRunAutoSyncAfterDetailCapture(
+  settings,
+  {sourceLabel = "当前列表", recordIds = null} = {},
+) {
+  if (!Boolean(settings?.autoSyncAfterDetailCapture)) {
+    return {
+      skipped: true,
+      reason: "disabled",
+    };
+  }
+
+  const normalizedRecordIds = Array.isArray(recordIds)
+    ? [
+        ...new Set(
+          recordIds
+            .filter((recordId) => typeof recordId === "string")
+            .map((recordId) => recordId.trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+
+  if (normalizedRecordIds.length === 0) {
+    return {
+      skipped: true,
+      reason: "no_records",
+    };
+  }
+
+  try {
+    const records = await getRecords(normalizedRecordIds);
+    const recordMap = new Map(records.map((record) => [record.id, record]));
+    const targetRecordIds = normalizedRecordIds.filter((recordId) =>
+      recordMap.has(recordId),
+    );
+
+    if (targetRecordIds.length === 0) {
+      return {
+        skipped: true,
+        reason: "records_missing",
+      };
+    }
+
+    const targetRecords = targetRecordIds.map((recordId) =>
+      recordMap.get(recordId),
+    );
+    const commentLeadsConfig = buildCommentLeadsConfigFromSettings(settings);
+    const requiredTypes = targetRecords
+      .map(
+        (record) =>
+          resolveSyncInputForRecord(record)?.syncType ||
+          record?.type ||
+          record?.recordType,
+      )
+      .filter(Boolean);
+
+    if (
+      commentLeadsConfig.enabled &&
+      requiredTypes.some(
+        (syncType) =>
+          syncType === SYNC_TYPE.SINGLE_NOTE ||
+          syncType === SYNC_TYPE.COMMENTS ||
+          syncType === SYNC_TYPE.BLOGGER_NOTES ||
+          syncType === SYNC_TYPE.KEYWORD_NOTES,
+      )
+    ) {
+      requiredTypes.push(SYNC_TYPE.COMMENT_LEADS);
+    }
+
+    showProgress(`${sourceLabel}采集增强完成，正在自动同步后台...`);
+    const checkResult = await checkBeforeSync(requiredTypes, {
+      onProgress: handleProgress,
+    });
+    if (!checkResult.ok) {
+      const errorMsg =
+        ERROR_MESSAGE_MAP[checkResult.error?.code] ||
+        checkResult.error?.message ||
+        "自动同步前检查失败";
+      showMessage(`${sourceLabel}自动同步未执行：${errorMsg}`, "warning");
+      return {
+        ok: false,
+        phase: "check",
+        error: checkResult.error,
+      };
+    }
+
+    const result = await syncRecordBatch(targetRecordIds, handleProgress, {
+      trigger: "detail_auto",
+      syncScope: SYNC_SCOPE_PENDING,
+      captureSettings: settings,
+      commentLeadsConfig,
+    });
+
+    await Promise.all([refreshDataPool(), refreshSyncHistory()]);
+
+    const leadsSyncedCount = Number(result.commentLeadsSyncedCount || 0);
+    const leadsSkippedCount = Number(result.commentLeadsSkippedCount || 0);
+    const leadsFailedCount = Number(result.commentLeadsFailedCount || 0);
+    const leadsSummary =
+      leadsSyncedCount > 0 || leadsSkippedCount > 0 || leadsFailedCount > 0
+        ? `（客资：成功 ${leadsSyncedCount} / 跳过 ${leadsSkippedCount} / 失败 ${leadsFailedCount}）`
+        : "";
+    const skippedMessage =
+      Number(result.skippedCount || 0) > 0
+        ? `，剩余 ${result.skippedCount} 条待再次同步`
+        : "";
+
+    if (result.ok) {
+      showMessage(
+        `${sourceLabel}已自动同步后台：${result.successCount} 条${skippedMessage}${leadsSummary}`,
+        "success",
+      );
+    } else {
+      showMessage(
+        `${sourceLabel}自动同步部分失败：成功 ${result.successCount}，失败 ${result.failedCount}${skippedMessage}${leadsSummary}`,
+        "warning",
+      );
+    }
+
+    return result;
+  } catch (error) {
+    console.error("[Sidebar] Auto sync after detail capture failed:", error);
+    showMessage(`${sourceLabel}自动同步失败: ${error.message}`, "warning");
+    await Promise.all([refreshDataPool(), refreshSyncHistory()]).catch(
+      () => null,
+    );
+    return {
+      ok: false,
+      phase: "sync",
+      error,
+    };
+  }
+}
+
 async function runDetailCaptureForRecordIds(
   recordIds,
   settings,
-  {progressMessage = ""} = {},
+  {progressMessage = "", onProgress = null, waitForegroundTabId = null} = {},
 ) {
   const normalizedRecordIds = Array.isArray(recordIds)
     ? [
@@ -11862,8 +14026,14 @@ async function runDetailCaptureForRecordIds(
   );
 
   try {
+    const handleDetailProgress = (progress = {}) => {
+      handleProgress(progress);
+      if (typeof onProgress === "function") {
+        onProgress(progress);
+      }
+    };
     const result = await batchCaptureDetailsForRecords(normalizedRecordIds, {
-      onProgress: handleProgress,
+      onProgress: handleDetailProgress,
       shouldStop: () => detailBatchCancelRequested,
       includeComments: Boolean(settings?.includeCommentsOnDetailCapture),
       includeBloggerMetrics: Boolean(
@@ -11871,6 +14041,8 @@ async function runDetailCaptureForRecordIds(
       ),
       skipAlreadyCaptured:
         settings?.skipAlreadyCapturedOnDetailCapture !== false,
+      recaptureCommentsOnCountIncrease:
+        settings?.recaptureCommentsOnCountIncrease !== false,
       enableCommentLeadsFilter: Boolean(
         settings?.enableCommentLeadsFilterOnDetailCapture,
       ),
@@ -11884,6 +14056,7 @@ async function runDetailCaptureForRecordIds(
       detailNavTimeoutMs: settings?.detailNavTimeoutMs,
       detailAfterNavWaitMs: settings?.detailAfterNavWaitMs,
       profileAfterNavWaitMs: settings?.profileAfterNavWaitMs,
+      waitForegroundTabId,
     });
 
     await refreshDataPool();
@@ -12968,6 +15141,14 @@ function getAutoDetailCaptureChecked(settings) {
   return Boolean(input.checked);
 }
 
+function getDetailCaptureAutoSyncChecked(settings) {
+  const input = getActiveDetailCaptureInput("auto-sync");
+  if (!input) {
+    return Boolean(settings?.autoSyncAfterDetailCapture);
+  }
+  return Boolean(input.checked);
+}
+
 function getDetailCaptureCommentsChecked(settings) {
   const input = getActiveDetailCaptureInput("comments");
   if (!input) {
@@ -13027,6 +15208,14 @@ function getDetailCaptureSkipCapturedChecked(settings) {
   return Boolean(input.checked);
 }
 
+function getDetailCaptureCommentCountRecheckChecked(settings) {
+  const input = getActiveDetailCaptureInput("comment-count-recheck");
+  if (!input) {
+    return settings?.recaptureCommentsOnCountIncrease !== false;
+  }
+  return Boolean(input.checked);
+}
+
 function getDetailCaptureLowFollowerHitFilterChecked(settings) {
   const input = getActiveDetailCaptureInput("low-follower-hit");
   if (!input) {
@@ -13061,11 +15250,13 @@ function readNonNegativeIntegerFromRawValue(rawValue, fallback) {
 
 function syncAutoDetailCaptureControls({
   autoDetailCapture = null,
+  autoSync = null,
   includeComments = null,
   commentsMaxDetectedItems = null,
   enableCommentLeadsFilter = null,
   includeBloggerMetrics = null,
   skipAlreadyCaptured = null,
+  recaptureCommentsOnCountIncrease = null,
   enableLowFollowerHitFilter = null,
   lowFollowerHitThreshold = null,
   forceDisabled = false,
@@ -13080,6 +15271,9 @@ function syncAutoDetailCaptureControls({
     panel.hidden = !detailCaptureSupported;
 
     const autoInput = panel.querySelector('[data-detail-setting="auto"]');
+    const autoSyncInput = panel.querySelector(
+      '[data-detail-setting="auto-sync"]',
+    );
     const commentsInput = panel.querySelector(
       '[data-detail-setting="comments"]',
     );
@@ -13124,6 +15318,9 @@ function syncAutoDetailCaptureControls({
 
     if (autoInput && autoDetailCapture !== null) {
       autoInput.checked = Boolean(autoDetailCapture);
+    }
+    if (autoSyncInput && autoSync !== null) {
+      autoSyncInput.checked = Boolean(autoSync);
     }
     if (commentsInput && includeComments !== null) {
       commentsInput.checked = Boolean(includeComments);
@@ -13175,6 +15372,10 @@ function syncAutoDetailCaptureControls({
     if (autoInput) {
       autoInput.disabled = forceDisabled || !capabilities.batchDetailCapture;
     }
+    if (autoSyncInput) {
+      autoSyncInput.disabled =
+        forceDisabled || !autoChecked || !capabilities.batchDetailCapture;
+    }
     const commentsControlDisabled =
       forceDisabled ||
       !autoChecked ||
@@ -13201,12 +15402,90 @@ function syncAutoDetailCaptureControls({
         !capabilities.bloggerMetrics;
     }
   });
+
+  document
+    .querySelectorAll('[data-detail-setting="skip-captured"]')
+    .forEach((input) => {
+      if (skipAlreadyCaptured !== null) {
+        input.checked = Boolean(skipAlreadyCaptured);
+      }
+      input.disabled = forceDisabled || !detailCaptureSupported;
+    });
+
+  document
+    .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
+    .forEach((input) => {
+      if (recaptureCommentsOnCountIncrease !== null) {
+        input.checked = Boolean(recaptureCommentsOnCountIncrease);
+      }
+      const skipCapturedEnabled = document.querySelector(
+        '[data-detail-setting="skip-captured"]:checked',
+      );
+      input.disabled =
+        forceDisabled ||
+        !detailCaptureSupported ||
+        !capabilities.captureComments ||
+        !skipCapturedEnabled;
+      input
+        .closest(".incremental-exception-group")
+        ?.classList.toggle("is-disabled", Boolean(input.disabled));
+      input.title = !capabilities.captureComments
+        ? `${getPlatformCopy(resolvedPlatform).label}当前版本暂不支持评论采集`
+        : !skipCapturedEnabled
+          ? "开启“跳过已增强笔记”后生效"
+          : "";
+    });
+}
+
+function syncDetailCaptureControlsFromStoredSettings(settings = {}, {platform = ""} = {}) {
+  const autoDetailCapture = Boolean(settings?.autoDetailCaptureAfterListCapture);
+  const defaultCommentsMaxDetectedItems = Number(
+    DEFAULT_CAPTURE_SETTINGS.detailCommentsMaxDetectedItems ||
+      DEFAULT_CAPTURE_SETTINGS.commentsMaxDetectedItems ||
+      100,
+  );
+  const defaultLowFollowerHitThreshold = Number(
+    DEFAULT_CAPTURE_SETTINGS.lowFollowerHitThreshold || 10000,
+  );
+
+  syncAutoDetailCaptureControls({
+    autoDetailCapture,
+    autoSync:
+      autoDetailCapture && Boolean(settings?.autoSyncAfterDetailCapture),
+    includeComments: Boolean(settings?.includeCommentsOnDetailCapture),
+    commentsMaxDetectedItems: readPositiveIntegerFromRawValue(
+      settings?.detailCommentsMaxDetectedItems ??
+        settings?.commentsMaxDetectedItems,
+      defaultCommentsMaxDetectedItems,
+    ),
+    enableCommentLeadsFilter: Boolean(
+      settings?.enableCommentLeadsFilterOnDetailCapture,
+    ),
+    includeBloggerMetrics: Boolean(
+      settings?.includeBloggerMetricsOnDetailCapture,
+    ),
+    skipAlreadyCaptured: settings?.skipAlreadyCapturedOnDetailCapture !== false,
+    recaptureCommentsOnCountIncrease:
+      settings?.recaptureCommentsOnCountIncrease !== false,
+    enableLowFollowerHitFilter: Boolean(
+      settings?.enableLowFollowerHitFilterOnDetailCapture,
+    ),
+    lowFollowerHitThreshold: readNonNegativeIntegerFromRawValue(
+      settings?.lowFollowerHitThresholdOnDetailCapture ??
+        settings?.lowFollowerHitThreshold,
+      defaultLowFollowerHitThreshold,
+    ),
+    platform,
+  });
 }
 
 async function persistDetailCaptureSettingsFromInputs() {
   const current = await getCaptureSettings();
   const autoDetailCaptureAfterListCapture =
     getAutoDetailCaptureChecked(current);
+  const autoSyncAfterDetailCapture =
+    autoDetailCaptureAfterListCapture &&
+    getDetailCaptureAutoSyncChecked(current);
   const includeCommentsOnDetailCapture =
     getDetailCaptureCommentsChecked(current);
   const detailCommentsMaxDetectedItems =
@@ -13219,6 +15498,8 @@ async function persistDetailCaptureSettingsFromInputs() {
     getDetailCaptureBloggerMetricsChecked(current);
   const skipAlreadyCapturedOnDetailCapture =
     getDetailCaptureSkipCapturedChecked(current);
+  const recaptureCommentsOnCountIncrease =
+    getDetailCaptureCommentCountRecheckChecked(current);
   const enableLowFollowerHitFilterOnDetailCapture =
     getDetailCaptureLowFollowerHitFilterChecked(current);
   const lowFollowerHitThresholdOnDetailCapture =
@@ -13226,32 +15507,41 @@ async function persistDetailCaptureSettingsFromInputs() {
 
   syncAutoDetailCaptureControls({
     autoDetailCapture: autoDetailCaptureAfterListCapture,
+    autoSync: autoSyncAfterDetailCapture,
     includeComments: includeCommentsOnDetailCapture,
     commentsMaxDetectedItems: detailCommentsMaxDetectedItems,
     enableCommentLeadsFilter: normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
     skipAlreadyCaptured: skipAlreadyCapturedOnDetailCapture,
+    recaptureCommentsOnCountIncrease,
     enableLowFollowerHitFilter: enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThreshold: lowFollowerHitThresholdOnDetailCapture,
   });
 
   await saveCaptureSettings({
     autoDetailCaptureAfterListCapture,
+    autoSyncAfterDetailCapture,
     includeCommentsOnDetailCapture,
     detailCommentsMaxDetectedItems,
     enableCommentLeadsFilterOnDetailCapture:
       normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetricsOnDetailCapture,
     skipAlreadyCapturedOnDetailCapture,
+    recaptureCommentsOnCountIncrease,
     enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThresholdOnDetailCapture,
   });
 }
 
 function resolveCurrentDetailCaptureSettings(settings = {}) {
+  const autoDetailCaptureAfterListCapture =
+    getAutoDetailCaptureChecked(settings);
   return {
     ...settings,
-    autoDetailCaptureAfterListCapture: getAutoDetailCaptureChecked(settings),
+    autoDetailCaptureAfterListCapture,
+    autoSyncAfterDetailCapture:
+      autoDetailCaptureAfterListCapture &&
+      getDetailCaptureAutoSyncChecked(settings),
     includeCommentsOnDetailCapture: getDetailCaptureCommentsChecked(settings),
     detailCommentsMaxDetectedItems:
       getDetailCaptureCommentsMaxDetectedItems(settings),
@@ -13261,6 +15551,8 @@ function resolveCurrentDetailCaptureSettings(settings = {}) {
       getDetailCaptureBloggerMetricsChecked(settings),
     skipAlreadyCapturedOnDetailCapture:
       getDetailCaptureSkipCapturedChecked(settings),
+    recaptureCommentsOnCountIncrease:
+      getDetailCaptureCommentCountRecheckChecked(settings),
     enableLowFollowerHitFilterOnDetailCapture:
       getDetailCaptureLowFollowerHitFilterChecked(settings),
     lowFollowerHitThresholdOnDetailCapture:
@@ -14149,7 +16441,7 @@ function buildNotePageCsvRows(records) {
         p.commentsMergedText || "",
         isVideoNotePayload(p) ? "视频" : "图文",
         formatDateTime(p.captureTimestamp || record.createdAt),
-        formatDateTime(firstDefinedMetricValue(p.lastEditedAt, p.publishDate)),
+        resolveNotePublishCsvValue(p),
         formatCsvMetricValue(p.likes, {captured: hasLikes}),
         formatCsvMetricValue(p.collects, {captured: hasCollects}),
         formatCsvMetricValue(p.comments, {captured: hasComments}),
@@ -14687,6 +16979,44 @@ function formatDateTime(timestamp) {
   }
 }
 
+function resolveNotePublishCsvValue(payload = {}) {
+  const rawPublishText = firstNonEmptyText(
+    payload.publishTime,
+    payload.publishDateRaw,
+  );
+  if (rawPublishText) return rawPublishText;
+
+  const lastEditedAt = firstDefinedMetricValue(payload.lastEditedAt);
+  if (
+    lastEditedAt &&
+    !isLikelyCaptureDateFallback(lastEditedAt, payload.captureTimestamp)
+  ) {
+    return formatDateTime(lastEditedAt);
+  }
+
+  return firstNonEmptyText(payload.publishDate);
+}
+
+function isLikelyCaptureDateFallback(timestamp, captureTimestamp) {
+  if (!timestamp || !captureTimestamp) return false;
+  const edited = new Date(timestamp);
+  const captured = new Date(captureTimestamp);
+  if (
+    Number.isNaN(edited.getTime()) ||
+    Number.isNaN(captured.getTime())
+  ) {
+    return false;
+  }
+  return (
+    edited.getFullYear() === captured.getFullYear() &&
+    edited.getMonth() === captured.getMonth() &&
+    edited.getDate() === captured.getDate() &&
+    edited.getHours() === 0 &&
+    edited.getMinutes() === 0 &&
+    edited.getSeconds() === 0
+  );
+}
+
 function getCsvPlatformLabel(record) {
   return getPlatformCopy(resolveRecordPlatform(record)).label;
 }
@@ -14895,6 +17225,21 @@ function setPrimaryCaptureButtonDisabled(button, disabled) {
   button.classList.toggle("is-disabled", nextDisabled);
 }
 
+function isNoteDetailPending(runtime) {
+  return (
+    runtime?.pageType === PAGE_TYPE.NOTE_DETAIL &&
+    runtime?.detailReady === false
+  );
+}
+
+function resolveNoteDetailPendingText(runtime = {}) {
+  const reason = String(runtime.detailReadyReason || "").trim();
+  if (reason === "loading") {
+    return NOTE_DETAIL_LOADING_TEXT;
+  }
+  return "正在等待笔记标题、正文或素材加载完成，加载完成后即可采集";
+}
+
 /**
  * 更新页面类型 UI
  */
@@ -14908,8 +17253,9 @@ function updatePageTypeUI(pageType) {
   const selectedCapabilities = getPlatformCapabilities(selectedPlatform);
   const isPlatformMatched = selectedPlatform === pagePlatform;
   const inDetailBatch = detailBatchCaptureInFlight;
+  const noteDetailPending = isPlatformMatched && isNote && isNoteDetailPending(runtime);
   const allowCommentsToggle =
-    !inDetailBatch && selectedCapabilities.captureComments;
+    !noteDetailPending && !inDetailBatch && selectedCapabilities.captureComments;
   const platformCopy = getPlatformCopy(selectedPlatform);
 
   const btnCaptureNote = document.getElementById("btnCaptureNote");
@@ -14947,7 +17293,7 @@ function updatePageTypeUI(pageType) {
 
   setPrimaryCaptureButtonDisabled(
     btnCaptureNote,
-    !isNote || inDetailBatch || !isPlatformMatched,
+    !isNote || noteDetailPending || inDetailBatch || !isPlatformMatched,
   );
   if (checkboxCaptureBloggerMetrics) {
     checkboxCaptureBloggerMetrics.disabled =
@@ -15006,7 +17352,12 @@ function updatePageTypeUI(pageType) {
     btnCaptureBlogger.textContent = platformCopy.captureBloggerButtonText;
   }
   if (btnCaptureSearch) {
-    btnCaptureSearch.textContent = platformCopy.captureSearchButtonText;
+    const isSearchBatchMode = Boolean(
+      document.getElementById("chkSearchBatchMode")?.checked,
+    );
+    btnCaptureSearch.textContent = isSearchBatchMode
+      ? "开始批量采集"
+      : platformCopy.captureSearchButtonText;
   }
   if (currentSearchKeywordText) {
     if (currentSearchKeyword) {
@@ -15306,7 +17657,7 @@ function syncPlatformSettingsCapabilityUI(platform = "unknown") {
     document.getElementById("inputCommentLeadsTableName"),
     ...Array.from(
       document.querySelectorAll(
-        '[data-detail-setting="comments-max-detected-items"], [data-detail-setting="comment-leads"]',
+        '[data-detail-setting="comments-max-detected-items"], [data-detail-setting="comment-leads"], [data-detail-setting="comment-count-recheck"]',
       ),
     ),
     document.getElementById("batchDetailIncludeComments"),
@@ -15730,6 +18081,7 @@ function showProgress(message, showUI = true) {
   const showPanel = Boolean(showUI) && !isUnsupportedPlatformCoverVisible();
   const progressContainer = document.getElementById("progressContainer");
   if (progressContainer) {
+    progressContainer.dataset.progressSource = "capture";
     progressContainer.style.display = showPanel ? "block" : "none";
   }
 
@@ -15757,6 +18109,7 @@ function hideProgressPanelOnly() {
   const progressContainer = document.getElementById("progressContainer");
   if (progressContainer) {
     progressContainer.style.display = "none";
+    delete progressContainer.dataset.progressSource;
   }
 
   const btnCancel = document.getElementById("btnCancel");
@@ -15852,6 +18205,7 @@ if (document.readyState === "loading") {
 
 window.addEventListener("beforeunload", () => {
   stopKeywordSortSyncTimer();
+  stopKeywordPlanReconcileTimer();
 });
 
 /* ==================== 批量采集操作执行 ==================== */
@@ -15897,7 +18251,15 @@ async function handleRunBatchLinks() {
     return;
   }
 
+  let executionLock = null;
   try {
+    executionLock = await acquireCaptureExecutionLock({
+      owner: "manual_batch_links_capture",
+      label: "手动批量作品采集",
+    });
+    if (!executionLock) {
+      return;
+    }
     const noteBatchSettings = await resolveNoteBatchCaptureSettings();
     const [tab] = await chrome.tabs.query({
       active: true,
@@ -15947,6 +18309,9 @@ async function handleRunBatchLinks() {
     batchUrlCancelRequested = false;
     batchUrlCaptureMode = "";
     activeBatchRunnerTabId = null;
+    if (executionLock) {
+      await releaseCaptureExecutionLock(executionLock.id);
+    }
     btn.textContent = "启动批量采集";
     btn.classList.add("btn-primary");
     btn.classList.remove("btn-danger");
@@ -15994,7 +18359,15 @@ async function handleRunBatchBloggers() {
     return;
   }
 
+  let executionLock = null;
   try {
+    executionLock = await acquireCaptureExecutionLock({
+      owner: "manual_batch_bloggers_capture",
+      label: "手动批量博主采集",
+    });
+    if (!executionLock) {
+      return;
+    }
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
     );
@@ -16067,9 +18440,23 @@ async function handleRunBatchBloggers() {
     batchUrlCancelRequested = false;
     batchUrlCaptureMode = "";
     activeBatchRunnerTabId = null;
+    if (executionLock) {
+      await releaseCaptureExecutionLock(executionLock.id);
+    }
     btn.textContent = "启动批量采集";
     btn.classList.add("btn-primary");
     btn.classList.remove("btn-danger");
+  }
+}
+
+let batchProgressCountdownTimer = null;
+let batchProgressCountdownToken = 0;
+
+function clearBatchProgressCountdown() {
+  batchProgressCountdownToken += 1;
+  if (batchProgressCountdownTimer) {
+    clearInterval(batchProgressCountdownTimer);
+    batchProgressCountdownTimer = null;
   }
 }
 
@@ -16094,6 +18481,9 @@ function setBatchProgressDetail(text) {
 
 function setBatchProgressVisible(scope = "modal", visible = true) {
   const {container, fillEl, textEl} = getBatchProgressElements(scope);
+  if (!visible) {
+    clearBatchProgressCountdown();
+  }
   if (container) {
     container.hidden = !visible;
   }
@@ -16107,6 +18497,7 @@ function setBatchProgressVisible(scope = "modal", visible = true) {
 
 function updateBatchProgress(progress, scope = "modal") {
   const {container, fillEl, textEl} = getBatchProgressElements(scope);
+  clearBatchProgressCountdown();
 
   if (container) {
     container.hidden = false;
@@ -16118,6 +18509,30 @@ function updateBatchProgress(progress, scope = "modal") {
   }
 
   if (textEl) {
-    textEl.textContent = progress.message || "执行中...";
+    const message = String(progress.message || "执行中...");
+    const remainingMs = Number(progress.remainingMs);
+    const canLocalCountdown =
+      Number.isFinite(remainingMs) &&
+      remainingMs > 0 &&
+      /秒后/.test(message);
+    if (!canLocalCountdown) {
+      textEl.textContent = message;
+      return;
+    }
+
+    const token = batchProgressCountdownToken;
+    const deadline = Date.now() + remainingMs;
+    const render = () => {
+      if (token !== batchProgressCountdownToken) {
+        return;
+      }
+      const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      textEl.textContent = message.replace(/\d+\s*秒后/g, `${seconds} 秒后`);
+      if (seconds <= 0) {
+        clearBatchProgressCountdown();
+      }
+    };
+    render();
+    batchProgressCountdownTimer = setInterval(render, 1000);
   }
 }

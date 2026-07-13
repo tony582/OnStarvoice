@@ -36,6 +36,10 @@ const SEARCH_KEYWORD_QUERY_KEYS = new Set([
   "searchkey",
   "search_word",
 ]);
+const DOUYIN_NON_SEARCH_REGION_LABEL_PATTERN =
+  /(?:相关推荐|相关搜索|大家都在搜|大家还在搜|热门搜索|猜你想搜|相关视频|更多视频|TA的作品|更多作品|看过还看)/u;
+const DOUYIN_SHELL_TITLE_PATTERN =
+  /^(?:精选|推荐|AI搜索|AI 搜索|关注|朋友|我的|直播|放映厅|短剧|充钻石|充值|钻石|充值钻石|客户端|客户群|下载客户端|桌面快捷访问|壁纸|通知|私信|投稿|客服|搜索|抖音|抖音小助手)$/u;
 
 export async function captureDouyinKeywordNotes({
   keyword = "",
@@ -533,6 +537,9 @@ function resolveSearchCardContainer(node) {
 
 function hasSearchResultContentSignal(card) {
   if (!card) return false;
+  if (isInsideDouyinNonSearchResultRegion(card)) {
+    return false;
+  }
 
   const text = String(card.innerText || "");
   if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
@@ -677,6 +684,11 @@ function resolveSearchCardUrl(card, noteId, tabType) {
 }
 
 function resolveSearchCardTitle(card, noteId, index) {
+  const fromStructuredNode = resolveSearchCardTitleFromStructuredNodes(card);
+  if (fromStructuredNode) {
+    return fromStructuredNode;
+  }
+
   const fromLines = resolveSearchCardTitleFromLines(card);
   if (fromLines) {
     return fromLines;
@@ -704,16 +716,97 @@ function resolveSearchCardTitle(card, noteId, index) {
   return `抖音搜索结果 ${noteId || index + 1}`;
 }
 
+function resolveSearchCardTitleFromStructuredNodes(card) {
+  if (!(card instanceof Element)) {
+    return "";
+  }
+
+  const selectors = buildSearchCardTitleSelectors();
+  const seen = new Set();
+  const candidates = [];
+  const pushNode = (node, index) => {
+    if (!(node instanceof Element) || seen.has(node)) return;
+    seen.add(node);
+    const text = pickBestSearchCardTitleLineFromText(node.textContent || "");
+    const score = scoreSearchCardTitleNode(node, text, index);
+    if (score > Number.NEGATIVE_INFINITY) {
+      candidates.push({text, score, index});
+    }
+  };
+
+  selectors.forEach((selector, selectorIndex) => {
+    try {
+      if (card.matches?.(selector)) {
+        pushNode(card, selectorIndex);
+      }
+      card.querySelectorAll?.(selector).forEach((node, nodeIndex) => {
+        pushNode(node, selectorIndex * 100 + nodeIndex);
+      });
+    } catch {}
+  });
+
+  return (
+    candidates.sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return left.index - right.index;
+    })[0]?.text || ""
+  );
+}
+
+function buildSearchCardTitleSelectors() {
+  const selectors = new Set();
+  (DOUYIN_DOM_PROFILE.searchResults.cards.fields.title || []).forEach(
+    (selector) => {
+      if (!selector) return;
+      selectors.add(selector);
+      selectors.add(selector.replace(/\.search-result-card\s+/g, ""));
+    },
+  );
+  return Array.from(selectors).filter(Boolean);
+}
+
+function scoreSearchCardTitleNode(node, text = "", index = 0) {
+  if (!(node instanceof Element) || !isValidSearchCardTitleLine(text)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  let score = scoreSearchCardTitleLine(text, index);
+  const attrs = [
+    node.getAttribute?.("data-e2e") || "",
+    node.getAttribute?.("aria-label") || "",
+    typeof node.className === "string" ? node.className : "",
+  ].join(" ");
+  if (/BjLsdJMi|K4Ja9W9H|desc|title/i.test(attrs)) score += 80;
+  if (/author|nickname|user/i.test(attrs)) score -= 120;
+  if (/^(?:p|h1|h2|h3)$/i.test(node.tagName || "")) score += 20;
+  if (node.closest?.('a[href*="/user/"], a[data-href*="/user/"]')) score -= 120;
+  return score;
+}
+
 function resolveSearchCardTitleFromLines(card) {
   const text = String(card?.innerText || "").trim();
   if (!text) return "";
 
-  const lines = text
+  return pickBestSearchCardTitleLineFromText(text);
+}
+
+function pickBestSearchCardTitleLineFromText(text = "") {
+  const lines = String(text || "")
     .split(/\n+/)
     .map((line) => cleanText(line))
     .filter(Boolean);
 
-  const titleLine = lines.find((line) => isValidSearchCardTitleLine(line));
+  const titleLine = lines
+    .map((line, index) => ({
+      line,
+      index,
+      score: scoreSearchCardTitleLine(line, index),
+    }))
+    .filter((item) => item.score > Number.NEGATIVE_INFINITY)
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return left.index - right.index;
+    })[0]?.line;
   return normalizeSearchCardTitle(titleLine || "");
 }
 
@@ -731,6 +824,8 @@ function normalizeSearchCardTitle(value) {
 function isValidSearchCardTitleLine(line) {
   const text = cleanText(line);
   if (!text) return false;
+  if (looksLikeDouyinShellTitleText(text)) return false;
+  if (/^(?:图文|图集|图片)$/.test(text)) return false;
   if (/^相关搜索(?:\s|$|[:：])/.test(text)) return false;
   if (/^温馨提示$/.test(text)) return false;
   if (/医美有风险，请谨慎选择/.test(text)) return false;
@@ -743,6 +838,81 @@ function isValidSearchCardTitleLine(line) {
   if (/^[·・]\s*\d{4}年\d{1,2}月\d{1,2}日$/.test(text)) return false;
   if (/^\d{1,2}[-/.月]\d{1,2}(?:日)?$/.test(text)) return false;
   return true;
+}
+
+function scoreSearchCardTitleLine(line, index = 0) {
+  const text = cleanText(line);
+  if (!isValidSearchCardTitleLine(text)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  let score = 80 - Math.min(30, Math.max(0, Number(index || 0)));
+  const compact = text.replace(/\s+/g, "");
+  if (/#\S+/.test(text)) score += 36;
+  if (text.length >= 12) score += 18;
+  if (text.length >= 24) score += 14;
+  if (/[，。！？、；：]/.test(text)) score += 8;
+  if (/^(?:点赞|评论|收藏|转发|分享|作者|粉丝|获赞|关注|已关注)/.test(text)) {
+    score -= 60;
+  }
+  if (compact.length <= 4 && !/#\S+/.test(text)) {
+    score -= 45;
+  }
+  return score;
+}
+
+function looksLikeDouyinShellTitleText(text = "") {
+  const normalized = cleanText(text);
+  if (!normalized) return false;
+  const compact = normalized.replace(/\s+/g, "");
+  if (DOUYIN_SHELL_TITLE_PATTERN.test(normalized)) return true;
+  if (DOUYIN_SHELL_TITLE_PATTERN.test(compact)) return true;
+  if (
+    /^(?:(?:精选|推荐|AI搜索|关注|朋友|我的|直播|放映厅|短剧|充钻石|客户端|客户群|壁纸|通知|私信|投稿|客服|搜索|抖音|抖音小助手)){2,}$/u.test(
+      compact,
+    )
+  ) {
+    return true;
+  }
+  if (/^(?:充值|充)(?:钻石)?$/u.test(compact)) return true;
+  if (/^(?:下载客户端|桌面快捷访问|下载客户端桌面快捷访问)$/u.test(compact)) {
+    return true;
+  }
+  return false;
+}
+
+function isInsideDouyinNonSearchResultRegion(card) {
+  if (!(card instanceof Element)) {
+    return false;
+  }
+
+  if (
+    card.closest?.(
+      '[data-e2e="comment-list"], [aria-label*="评论"], [class*="comment"], [class*="Comment"]',
+    )
+  ) {
+    return true;
+  }
+
+  let current = card.parentElement;
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    const attrs = [
+      current.getAttribute?.("aria-label") || "",
+      current.getAttribute?.("data-e2e") || "",
+      current.id || "",
+      typeof current.className === "string" ? current.className : "",
+    ].join(" ");
+    const attrText = cleanText(attrs);
+    if (
+      DOUYIN_NON_SEARCH_REGION_LABEL_PATTERN.test(attrText) ||
+      /(?:related|recommend|suggest)/i.test(attrText)
+    ) {
+      return true;
+    }
+    current = current.parentElement;
+  }
+
+  return false;
 }
 
 function resolveSearchCardCover(card) {

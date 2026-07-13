@@ -479,8 +479,8 @@ function createListCaptureCacheStats(session, extra = {}) {
 // 本 fork 自加(合并上游务必保留):列表去重命中「已存记录」时,把这次采到的【易变互动数】
 // (点赞/评论/收藏/转发)就地刷新进已存记录 —— 否则同一帖第二次起永远停在首采的旧/空值,
 // 监控命中的互动数永远不更新(codex/gemini review #6,实测确诊)。
-// 只动这 4 个数值字段,绝不动 title/cover/detailPayload/号/评论;0/空不覆盖已有好值
-// (对齐后端 record-store 的 COALESCE NULLIF 0)。命中并更新返回 true。
+// 只动这 4 个数值字段,绝不动 title/cover/detailPayload/号/评论。只要本次列表明确带了指标,
+// 就允许覆盖(包括 0 和下降),这样删除评论/取消点赞也能反映到基础数据。
 function refreshListCaptureMetricsInPlace(existingRecord, freshRecord) {
   const existingItem = existingRecord?.payload?.items?.[0];
   const freshItem = freshRecord?.payload?.items?.[0];
@@ -488,13 +488,100 @@ function refreshListCaptureMetricsInPlace(existingRecord, freshRecord) {
   if (!freshItem || typeof freshItem !== 'object') return false;
   let changed = false;
   for (const field of ['likes', 'comments', 'collects', 'shares']) {
+    if (!hasMetricValue(freshItem, field)) continue;
     const next = parseInteractionCount(freshItem[field]);
-    if (!(next > 0)) continue; // 0/空:这次没采到,不覆盖已有好值
-    if (parseInteractionCount(existingItem[field]) === next) continue; // 没变化,不动
+    const previous = parseInteractionCount(existingItem[field]);
+    if (previous === next) continue; // 没变化,不动
+    if (
+      field === 'comments' &&
+      String(existingRecord?.payload?.detailCaptureStatus || '') === DETAIL_CAPTURE_STATUS.DONE &&
+      normalizeOptionalCount(existingRecord?.payload?.detailCommentCountBaseline) === null
+    ) {
+      existingRecord.payload.detailCommentCountBaseline = previous;
+    }
     existingItem[field] = next;
     changed = true;
   }
   return changed;
+}
+
+function hasMetricValue(item = {}, field) {
+  if (!item || typeof item !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(item, field)) return false;
+  const value = item[field];
+  return value !== undefined && value !== null && value !== '';
+}
+
+function collectKeywordMatchLabels(record = {}) {
+  const payload = record?.payload && typeof record.payload === 'object' ? record.payload : {};
+  const firstItem = Array.isArray(payload.items) ? payload.items[0] || {} : {};
+  const candidates = [
+    payload.keyword,
+    payload.searchKeyword,
+    payload.matchedKeyword,
+    payload.matchedKeywords,
+    payload.keywords,
+    firstItem.keyword,
+    firstItem.searchKeyword,
+    firstItem.matchedKeyword,
+    firstItem.matchedKeywords,
+  ];
+  const labels = [];
+  const seen = new Set();
+  const append = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    const label = String(value || '').trim();
+    const key = label.toLowerCase();
+    if (!label || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    labels.push(label);
+  };
+  candidates.forEach(append);
+  return labels;
+}
+
+function mergeKeywordMatchLabelsInPlace(existingRecord, freshRecord) {
+  const recordType = String(existingRecord?.type || existingRecord?.recordType || '').trim();
+  if (recordType !== SYNC_TYPE.KEYWORD_NOTES) {
+    return false;
+  }
+  const existingPayload =
+    existingRecord?.payload && typeof existingRecord.payload === 'object'
+      ? existingRecord.payload
+      : null;
+  if (!existingPayload) {
+    return false;
+  }
+
+  const byKey = new Map();
+  collectKeywordMatchLabels(existingRecord).forEach((label) => {
+    byKey.set(label.toLowerCase(), label);
+  });
+  const beforeSize = byKey.size;
+  collectKeywordMatchLabels(freshRecord).forEach((label) => {
+    const key = label.toLowerCase();
+    if (!byKey.has(key)) {
+      byKey.set(key, label);
+    }
+  });
+  if (byKey.size === beforeSize) {
+    return false;
+  }
+
+  const matchedKeywords = Array.from(byKey.values());
+  existingPayload.matchedKeywords = matchedKeywords;
+  const existingItem = Array.isArray(existingPayload.items)
+    ? existingPayload.items[0]
+    : null;
+  if (existingItem && typeof existingItem === 'object') {
+    existingItem.matchedKeywords = matchedKeywords;
+  }
+  return true;
 }
 
 async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
@@ -538,7 +625,12 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
       keys.forEach((key) => session?.knownKeys?.add(key));
       // 不再整条丢弃:把这次采到的互动数就地刷新进已存记录并纳入同步;
       // 没刷新到(0/空/没变)才按「已采过」计入 skipped。
-      if (refreshListCaptureMetricsInPlace(existingRecord, record)) {
+      const keywordLabelsChanged =
+        mergeKeywordMatchLabelsInPlace(existingRecord, record);
+      if (
+        refreshListCaptureMetricsInPlace(existingRecord, record) ||
+        keywordLabelsChanged
+      ) {
         refreshedRecords.push(existingRecord);
       } else if (existingId) {
         skippedRecordIds.push(existingId);
@@ -1190,6 +1282,143 @@ export async function captureAndSync({
   }
 }
 
+async function captureAndSaveInTab({
+  tabId,
+  mode = 'auto',
+  captureParams = {},
+  onProgress = null,
+  checkpointSource = 'captureAndSaveInTab',
+} = {}) {
+  let savedRecords = [];
+  let captureCacheStats = null;
+  const checkpointSession = beginListCaptureCheckpointSession({
+    mode,
+    source: checkpointSource,
+  });
+
+  try {
+    if (onProgress) {
+      onProgress({
+        phase: 'capture_start',
+        message: '开始采集数据...',
+      });
+    }
+    await updateCapture({
+      status: CAPTURE_STATUS.CAPTURING,
+      error: null,
+    });
+
+    const captureResult = await captureInTab(tabId, {
+      mode,
+      captureParams,
+    });
+
+    if (!captureResult?.ok) {
+      if (checkpointSession?.queue) {
+        await checkpointSession.queue.catch(() => null);
+      }
+      captureCacheStats = createListCaptureCacheStats(checkpointSession);
+      const partialRecordIds =
+        collectListCaptureSessionRecordIds(checkpointSession);
+      finishListCaptureCheckpointSession(checkpointSession);
+      await updateCapture({
+        status: CAPTURE_STATUS.FAILED,
+        error: captureResult?.error || {
+          code: 'CAPTURE_FAILED',
+          message: '采集失败',
+        },
+      });
+
+      return {
+        ok: false,
+        phase: 'capture',
+        captureResult,
+        savedRecords: [],
+        recordIds: partialRecordIds,
+        captureCacheStats,
+        error: captureResult?.error || null,
+      };
+    }
+
+    if (onProgress) {
+      onProgress({
+        phase: 'saving',
+        message: '保存到本地数据池...',
+      });
+    }
+    const saveResult = await saveCaptureResultRecords(captureResult, {
+      session: checkpointSession,
+    });
+    finishListCaptureCheckpointSession(checkpointSession);
+    savedRecords = Array.isArray(saveResult.savedRecords)
+      ? saveResult.savedRecords
+      : [];
+    const recordIds = Array.isArray(saveResult.recordIds)
+      ? saveResult.recordIds
+      : [];
+    captureCacheStats = saveResult.cacheStats || null;
+
+    await updateCapture({
+      status: CAPTURE_STATUS.SUCCESS,
+      lastCapturedAt: new Date().toISOString(),
+      error: null,
+    });
+
+    if (recordIds.length > 0) {
+      trackCoreCaptureSuccess(savedRecords.length, {
+        mode,
+        source: checkpointSource,
+      });
+    }
+    if (onProgress) {
+      onProgress({
+        phase: 'saved',
+        message: `已保存到本地（${recordIds.length} 条）`,
+        recordIds,
+      });
+    }
+
+    return {
+      ok: true,
+      phase: 'saved',
+      captureResult,
+      savedRecords,
+      recordIds,
+      captureCacheStats,
+      error: null,
+    };
+  } catch (error) {
+    if (checkpointSession?.queue) {
+      await checkpointSession.queue.catch(() => null);
+    }
+    captureCacheStats =
+      captureCacheStats || createListCaptureCacheStats(checkpointSession);
+    const partialRecordIds = collectListCaptureSessionRecordIds(
+      checkpointSession,
+    );
+    finishListCaptureCheckpointSession(checkpointSession);
+    await updateCapture({
+      status: CAPTURE_STATUS.FAILED,
+      error: {
+        code: 'UNEXPECTED_ERROR',
+        message: error.message,
+      },
+    });
+    return {
+      ok: false,
+      phase: 'error',
+      captureResult: null,
+      savedRecords: [],
+      recordIds: partialRecordIds,
+      captureCacheStats,
+      error: {
+        code: 'UNEXPECTED_ERROR',
+        message: error.message,
+      },
+    };
+  }
+}
+
 /**
  * 单条笔记采集（可选评论），并将评论合并回同一条 single_note 记录
  */
@@ -1549,6 +1778,22 @@ export async function retryDetailCaptureForRecord(
 }
 
 /**
+ * 从抖音作品 URL 或 noteId 中提取纯数字作品 ID,用于补采时的"防串号"比对。
+ * 抖音作品 ID 是长数字串;URL 形如 /video/{id}、/note/{id} 或 ?modal_id={id}。
+ * 提取不到时返回空串(调用方遇空串则不做比对,保持原行为、不误杀)。
+ */
+function extractDouyinDetailGuardItemId(source) {
+  const raw = String(source || '').trim();
+  if (!raw) return '';
+  if (/^\d{6,}$/.test(raw)) return raw;
+  const modalMatch = raw.match(/[?&]modal_id=(\d{6,})/);
+  if (modalMatch) return modalMatch[1];
+  const pathMatch = raw.match(/\/(?:video|note)\/(\d{6,})/);
+  if (pathMatch) return pathMatch[1];
+  return '';
+}
+
+/**
  * 批量补采博主/关键词记录的笔记详情，回填到原记录 payload
  */
 export async function batchCaptureDetailsForRecords(
@@ -1567,6 +1812,8 @@ export async function batchCaptureDetailsForRecords(
     detailAfterNavWaitMs = null,
     profileAfterNavWaitMs = null,
     skipAlreadyCaptured = null,
+    recaptureCommentsOnCountIncrease = null,
+    waitForegroundTabId = null,
   } = {},
 ) {
   const uniqueRecordIds = Array.isArray(recordIds)
@@ -1637,7 +1884,15 @@ export async function batchCaptureDetailsForRecords(
   // 不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。查询失败则不跳过(顶多多采几条,不影响主流程)。
   const resolvedSkipCaptured =
     skipAlreadyCaptured ?? settings.skipAlreadyCapturedOnDetailCapture ?? true;
+  const resolvedRecaptureCommentsOnIncrease =
+    Boolean(includeComments) &&
+    Boolean(
+      recaptureCommentsOnCountIncrease ??
+        settings.recaptureCommentsOnCountIncrease ??
+        true,
+    );
   let skipRecordIdSet = new Set();
+  let recaptureCommentRecordIdSet = new Set();
   if (resolvedSkipCaptured) {
     try {
       const idPairs = [];
@@ -1648,7 +1903,12 @@ export async function batchCaptureDetailsForRecords(
         if (!probePlatform) probePlatform = resolveRecordIdentityPlatform(rec);
         const ext = resolveRecordDetailNoteId(rec);
         if (ext) {
-          idPairs.push({ recordId: rid, externalId: String(ext), payload: rec.payload });
+          idPairs.push({
+            recordId: rid,
+            externalId: String(ext),
+            payload: rec.payload,
+            commentsCount: resolveRecordListCommentsCount(rec),
+          });
         }
       }
       const candidateExtIds = new Set(idPairs.map((p) => p.externalId));
@@ -1656,31 +1916,68 @@ export async function batchCaptureDetailsForRecords(
       // ① 本地已采全(detailCaptureStatus=done)的 external_id —— 覆盖「循环内 / 同会话」重复,
       //    不依赖同步到后台(无人值守循环不会每轮自动同步,所以第2轮跳第1轮要靠这个)。
       const localDone = new Set();
+      const localDoneStatusByExt = new Map();
       try {
         const pool = await getDataPool();
         for (const rec of pool?.records || []) {
           if (String(rec?.payload?.detailCaptureStatus || '') !== 'done') continue;
           const ext = resolveRecordDetailNoteId(rec);
-          if (ext && candidateExtIds.has(String(ext))) localDone.add(String(ext));
+          if (ext && candidateExtIds.has(String(ext))) {
+            const normalizedExt = String(ext);
+            localDone.add(normalizedExt);
+            localDoneStatusByExt.set(
+              normalizedExt,
+              buildCapturedCommentStatus(rec),
+            );
+          }
         }
       } catch (poolError) {
         console.warn('[CaptureSync] 本地已采预检失败(忽略):', poolError);
       }
 
       // ② 后台已采全的 —— 覆盖「跨夜 / 跨会话」(需之前同步过)
-      const { captured } = await checkCapturedExternalIds({
+      const { captured, items: remoteCapturedItems = [] } = await checkCapturedExternalIds({
         platform: probePlatform,
         externalIds: idPairs.map((p) => p.externalId),
       });
       const capturedSet = new Set(captured);
-
-      skipRecordIdSet = new Set(
-        idPairs
-          .filter(
-            (p) => capturedSet.has(p.externalId) || localDone.has(p.externalId),
-          )
-          .map((p) => p.recordId),
+      const remoteDoneStatusByExt = new Map(
+        remoteCapturedItems
+          .map((item) => [
+            String(item?.externalId || '').trim(),
+            {
+              commentsCount: normalizeOptionalCount(item?.commentsCount),
+              commentsBaselineCount: normalizeOptionalCount(
+                item?.commentsBaselineCount,
+              ),
+              hasBaseline: normalizeOptionalCount(item?.commentsBaselineCount) !== null,
+            },
+          ])
+          .filter(([externalId]) => externalId),
       );
+
+      const nextSkipRecordIds = [];
+      const nextRecaptureCommentRecordIds = [];
+      idPairs.forEach((p) => {
+        const isCaptured =
+          capturedSet.has(p.externalId) || localDone.has(p.externalId);
+        if (!isCaptured) return;
+        const shouldRecaptureComments =
+          resolvedRecaptureCommentsOnIncrease &&
+          hasCommentCountIncreasedSinceLastCapture({
+            currentCommentsCount: p.commentsCount,
+            localStatus: localDoneStatusByExt.get(p.externalId),
+            remoteStatus: remoteDoneStatusByExt.get(p.externalId),
+          });
+        if (shouldRecaptureComments) {
+          nextRecaptureCommentRecordIds.push(p.recordId);
+          return;
+        }
+        nextSkipRecordIds.push(p.recordId);
+      });
+
+      skipRecordIdSet = new Set(nextSkipRecordIds);
+      recaptureCommentRecordIdSet = new Set(nextRecaptureCommentRecordIds);
 
       // 给跳过的记录打「已采过」标记,卡片据此显示"已采过"而非"未执行采集增强"
       for (const p of idPairs) {
@@ -1701,6 +1998,7 @@ export async function batchCaptureDetailsForRecords(
     } catch (error) {
       console.warn('[CaptureSync] 增量采集预检失败(忽略,照常补采):', error);
       skipRecordIdSet = new Set();
+      recaptureCommentRecordIdSet = new Set();
     }
   }
   // 全部已采过 → 不必开补采标签页,直接返回
@@ -1783,9 +2081,13 @@ export async function batchCaptureDetailsForRecords(
   // 增量采集:开跑前先告诉用户为什么只补一部分(否则客户看到跳过一脸懵)
   if (onProgress && skipRecordIdSet.size > 0) {
     const toCaptureCount = uniqueRecordIds.length - skipRecordIdSet.size;
+    const recaptureSuffix =
+      recaptureCommentRecordIdSet.size > 0
+        ? `，${recaptureCommentRecordIdSet.size} 条评论数增加将重采评论`
+        : '';
     onProgress({
       phase: 'detail_skip_summary',
-      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过),本次只补采 ${toCaptureCount} 条新内容`,
+      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过)${recaptureSuffix},本次只补采 ${toCaptureCount} 条`,
       current: 0,
       total: uniqueRecordIds.length,
       skippedCount: skipRecordIdSet.size,
@@ -2022,6 +2324,71 @@ export async function batchCaptureDetailsForRecords(
             mergedText: '',
           }),
         );
+
+        // 防串号:抖音原视频失效时会"倒计时自动跳去播放推荐视频",此刻页面已是别人的作品,
+        // 继续采评论就会把推荐视频的评论错配到本记录上。比对"目标作品ID"与"当前页实际采到的作品ID",
+        // 不一致即判定原视频已失效,跳过本条、绝不合并,从根上杜绝串评论。
+        // (任一 ID 提取不到就不比对,保持原行为、避免误杀。)
+        if (recordPlatform === 'douyin') {
+          const targetItemId = extractDouyinDetailGuardItemId(noteUrl);
+          const capturedItemId =
+            extractDouyinDetailGuardItemId(detailPayload?.noteId) ||
+            extractDouyinDetailGuardItemId(detailPayload?.url) ||
+            extractDouyinDetailGuardItemId(noteResult?.data?.url);
+          if (targetItemId && capturedItemId && targetItemId !== capturedItemId) {
+            const latestRecord = (await getRecord(recordId)) || record;
+            const failure = buildDetailCaptureFailure(
+              DETAIL_CAPTURE_FAILURE_CODE.NOTE_CAPTURE_FAILED,
+              'note_capture',
+              '原视频已失效(页面跳去播放其它作品),已跳过以防采错评论',
+            );
+            const mismatchDiagnostic = `目标作品 ${targetItemId} / 实际页面 ${capturedItemId}`;
+            const failedPayload = applyDetailCapturePatch(
+              latestRecord.payload,
+              createDetailCapturePatch({
+                status: DETAIL_CAPTURE_STATUS.FAILED,
+                startedAt,
+                finishedAt: Date.now(),
+                error: failure.userMessage,
+                failureCode: failure.code,
+                failureStage: failure.stage,
+                failureCategory: failure.category,
+                diagnosticMessage: mismatchDiagnostic,
+                noteUrl,
+              }),
+            );
+            await updateRecord(recordId, {
+              status: RECORD_STATUS.DRAFT,
+              payload: failedPayload,
+            });
+
+            results.push({
+              recordId,
+              ok: false,
+              reason: failure.code,
+              category: failure.category,
+              stage: failure.stage,
+              message: failure.userMessage,
+              diagnosticMessage: mismatchDiagnostic,
+            });
+            failedCount += 1;
+
+            if (onProgress) {
+              onProgress({
+                phase: 'detail_item_failed',
+                message: `第 ${current}/${uniqueRecordIds.length} 条已跳过:原视频失效(页面跳去其它作品)`,
+                recordId,
+                current,
+                total: uniqueRecordIds.length,
+                successCount,
+                failedCount,
+                filteredCount,
+                runnerTabId: runnerContext.runnerTabId,
+              });
+            }
+            continue;
+          }
+        }
         detailPayload = ensureBloggerMetricsFields(detailPayload);
 
         let stopAfterCurrent = false;
@@ -2160,7 +2527,11 @@ export async function batchCaptureDetailsForRecords(
             computedAt: Date.now(),
           }).payload;
 
-          if (commentsResult.stoppedByUser) {
+          if (
+            commentsResult.stoppedByUser &&
+            typeof shouldStop === 'function' &&
+            shouldStop()
+          ) {
             stopAfterCurrent = true;
           }
         }
@@ -2169,8 +2540,17 @@ export async function batchCaptureDetailsForRecords(
         detailPayload = sanitizeMediaFieldsForStorage(
           normalizeDetailPayloadAgainstRecord(latestRecord, detailPayload),
         );
+        const nextPayloadBase = { ...latestRecord.payload };
+        const nextCommentBaseline = includeComments
+          ? resolveRecordListCommentsCount(latestRecord) ??
+            resolveRecordListCommentsCount(record) ??
+            normalizeOptionalCount(detailPayload.comments)
+          : null;
+        if (nextCommentBaseline !== null) {
+          nextPayloadBase.detailCommentCountBaseline = nextCommentBaseline;
+        }
         const mergedPayload = applyDetailCapturePatch(
-          latestRecord.payload,
+          nextPayloadBase,
           createDetailCapturePatch({
             status: DETAIL_CAPTURE_STATUS.DONE,
             startedAt,
@@ -2309,8 +2689,32 @@ export async function batchCaptureDetailsForRecords(
         const itemDelay =
           DETAIL_ITEM_DELAY_MIN_MS +
           Math.random() * (DETAIL_ITEM_DELAY_MAX_MS - DETAIL_ITEM_DELAY_MIN_MS);
+        await activateTabForReliableTimer(waitForegroundTabId);
+        const reportDetailDelayProgress = (remainingMs = itemDelay) => {
+          if (!onProgress) {
+            return;
+          }
+          const seconds = Math.ceil(Math.max(0, Number(remainingMs) || 0) / 1000);
+          onProgress({
+            phase: 'detail_item_delay',
+            message: `第 ${current}/${uniqueRecordIds.length} 条详情补采完成，${seconds} 秒后补采下一条...`,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            successCount,
+            failedCount,
+            filteredCount,
+            remainingMs,
+            runnerTabId: runnerContext.runnerTabId,
+          });
+        };
+        reportDetailDelayProgress(itemDelay);
         try {
-          await waitMsWithStop(itemDelay, shouldStop, 'DETAIL_CAPTURE_CANCELED');
+          await waitMsWithStopAndTick(itemDelay, shouldStop, {
+            errorMessage: 'DETAIL_CAPTURE_CANCELED',
+            tickMs: 1000,
+            onTick: reportDetailDelayProgress,
+          });
         } catch (delayError) {
           if (isDetailCaptureCanceledError(delayError)) {
             canceled = true;
@@ -4446,7 +4850,8 @@ function sleep(ms) {
   if (delay <= 0) {
     return Promise.resolve();
   }
-  return new Promise((resolve) => setTimeout(resolve, delay));
+  // 走可靠时钟(Worker),后台标签页里不被 Chrome 节流;见 waitMs 上方注释。
+  return waitMs(delay);
 }
 
 async function waitForSyncRequestSlot(lastRequestStartedAt, spacingMs) {
@@ -6413,6 +6818,87 @@ function normalizeNonNegativeNumber(value) {
   return Math.floor(num);
 }
 
+function normalizeOptionalCount(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const parsed = parseInteractionCount(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return Math.floor(parsed);
+}
+
+function pickFirstCountFromSources(sources = [], keys = []) {
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+      const count = normalizeOptionalCount(source[key]);
+      if (count !== null) return count;
+    }
+  }
+  return null;
+}
+
+function resolveRecordListCommentsCount(record = {}) {
+  const payload =
+    record?.payload && typeof record.payload === 'object'
+      ? record.payload
+      : {};
+  const firstItem =
+    Array.isArray(payload.items) && payload.items[0] && typeof payload.items[0] === 'object'
+      ? payload.items[0]
+      : {};
+  return pickFirstCountFromSources([firstItem, payload], [
+    'comments',
+    'commentCount',
+    'comment_count',
+    'commentsCount',
+    'comments_count',
+  ]);
+}
+
+function buildCapturedCommentStatus(record = {}) {
+  const payload =
+    record?.payload && typeof record.payload === 'object'
+      ? record.payload
+      : {};
+  const baseline = normalizeOptionalCount(payload.detailCommentCountBaseline);
+  return {
+    commentsCount: resolveRecordListCommentsCount(record),
+    commentsBaselineCount: baseline,
+    hasBaseline: baseline !== null,
+  };
+}
+
+function resolveCapturedCommentBaseline({ localStatus = null, remoteStatus = null } = {}) {
+  if (localStatus?.hasBaseline && localStatus.commentsBaselineCount !== null) {
+    return localStatus.commentsBaselineCount;
+  }
+  if (remoteStatus?.hasBaseline && remoteStatus.commentsBaselineCount !== null) {
+    return remoteStatus.commentsBaselineCount;
+  }
+  if (remoteStatus?.commentsCount !== null && remoteStatus?.commentsCount !== undefined) {
+    return remoteStatus.commentsCount;
+  }
+  if (localStatus?.commentsCount !== null && localStatus?.commentsCount !== undefined) {
+    return localStatus.commentsCount;
+  }
+  return null;
+}
+
+function hasCommentCountIncreasedSinceLastCapture({
+  currentCommentsCount = null,
+  localStatus = null,
+  remoteStatus = null,
+} = {}) {
+  const current = normalizeOptionalCount(currentCommentsCount);
+  if (current === null) return false;
+  const baseline = resolveCapturedCommentBaseline({ localStatus, remoteStatus });
+  return baseline !== null && current > baseline;
+}
+
 function isValidBloggerMetricsStatus(status) {
   return (
     status === BLOGGER_METRICS_CAPTURE_STATUS.NOT_STARTED ||
@@ -7521,9 +8007,67 @@ function isCaptureCanceledResult(result) {
   );
 }
 
+// ── 可靠时钟:后台标签页免疫 Chrome 计时器节流 ─────────────────────────────
+// Chrome 对隐藏超约 5 分钟的标签页做强力节流:页面 setTimeout 被对齐到约 1 分钟
+// 一次。无人值守的编排代码跑在隐藏 runner 标签页里,全靠 setTimeout 等待/轮询,
+// 被节流后整个流程以分钟级爬行(「第一个词正常、第二个词起假死」的根因)。
+// Worker 线程的计时器不受页面可见性节流,用它做时钟;创建失败自动回退 setTimeout。
+let reliableTimerWorker = null;
+let reliableTimerSeq = 0;
+const reliableTimerPending = new Map();
+
+function getReliableTimerWorker() {
+  if (reliableTimerWorker !== null) {
+    return reliableTimerWorker;
+  }
+  try {
+    reliableTimerWorker = new Worker(
+      chrome.runtime.getURL('utils/timer-worker.js'),
+    );
+    reliableTimerWorker.onmessage = (event) => {
+      const id = event?.data?.id;
+      const resolve = reliableTimerPending.get(id);
+      if (resolve) {
+        reliableTimerPending.delete(id);
+        resolve();
+      }
+    };
+    reliableTimerWorker.onerror = () => {
+      // Worker 挂了:把悬着的等待用 setTimeout 兜底放行,并永久回退旧方式
+      const pending = [...reliableTimerPending.values()];
+      reliableTimerPending.clear();
+      try {
+        reliableTimerWorker.terminate();
+      } catch {
+        // ignore
+      }
+      reliableTimerWorker = false;
+      pending.forEach((resolve) => setTimeout(resolve, 50));
+    };
+  } catch {
+    reliableTimerWorker = false;
+  }
+  return reliableTimerWorker;
+}
+
 function waitMs(ms) {
+  const delay = Math.max(0, Number(ms) || 0);
+  const worker = getReliableTimerWorker();
+  if (!worker) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, delay);
+    });
+  }
   return new Promise((resolve) => {
-    setTimeout(resolve, Math.max(0, Number(ms) || 0));
+    reliableTimerSeq += 1;
+    const id = reliableTimerSeq;
+    reliableTimerPending.set(id, resolve);
+    try {
+      worker.postMessage({ id, ms: delay });
+    } catch {
+      reliableTimerPending.delete(id);
+      setTimeout(resolve, delay);
+    }
   });
 }
 
@@ -7542,6 +8086,56 @@ async function waitMsWithStop(ms, shouldStop, errorMessage = 'BATCH_CAPTURE_CANC
     const remaining = Math.min(step, total - elapsed);
     await waitMs(remaining);
     elapsed += remaining;
+  }
+}
+
+async function waitMsWithStopAndTick(
+  ms,
+  shouldStop,
+  {
+    errorMessage = 'BATCH_CAPTURE_CANCELED',
+    tickMs = 1000,
+    onTick = null,
+  } = {},
+) {
+  const total = Math.max(0, Number(ms) || 0);
+  if (total <= 0) {
+    return;
+  }
+
+  const startedAt = Date.now();
+  let lastRemainingSeconds = -1;
+  while (Date.now() - startedAt < total) {
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      throw new Error(errorMessage);
+    }
+    const remainingMs = Math.max(0, total - (Date.now() - startedAt));
+    const remainingSeconds = Math.ceil(remainingMs / 1000);
+    if (
+      typeof onTick === 'function' &&
+      remainingSeconds !== lastRemainingSeconds
+    ) {
+      lastRemainingSeconds = remainingSeconds;
+      onTick(remainingMs);
+    }
+    await waitMs(Math.min(Math.max(100, Number(tickMs) || 1000), remainingMs));
+  }
+}
+
+async function activateTabForReliableTimer(tabId) {
+  const numericTabId = Number(tabId);
+  if (!Number.isFinite(numericTabId) || numericTabId <= 0) {
+    return false;
+  }
+  try {
+    const tab = await chrome.tabs.get(numericTabId);
+    if (Number.isFinite(Number(tab?.windowId)) && Number(tab.windowId) >= 0) {
+      await chrome.windows.update(Number(tab.windowId), { focused: true });
+    }
+    await chrome.tabs.update(numericTabId, { active: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -7583,10 +8177,13 @@ async function captureCommentsForCurrentNote({
     .trim()
     .toLowerCase();
   const partial = captureStatus === COMMENT_CAPTURE_STATUS.PARTIAL;
+  const stoppedByUser = Boolean(
+    result.data?.stoppedByUser || result.meta?.stoppedByUser,
+  );
 
   return {
     status: partial ? COMMENT_CAPTURE_STATUS.PARTIAL : COMMENT_CAPTURE_STATUS.DONE,
-    stoppedByUser: partial,
+    stoppedByUser,
     cleanedItems,
     mergedText: buildCommentsMergedText(cleanedItems),
     error: '',
@@ -7890,13 +8487,19 @@ function isDouyinContentFlowUrl(url = '') {
 
 const BATCH_KEYWORD_DELAY_MIN_MS = 3000;
 const BATCH_KEYWORD_DELAY_MAX_MS = 5000;
-// 不同搜索词之间的随机间隔:分钟级。连续快搜多个关键词(秒级)会触发小红书安全机制(风控),
-// 必须把节奏拉到「几分钟」且随机化(固定节奏也易被识别)。通宵无人值守跑也走这个节奏。
-const BATCH_INTER_KEYWORD_DELAY_MIN_MS = 90 * 1000; // 1.5 分钟
-const BATCH_INTER_KEYWORD_DELAY_MAX_MS = 210 * 1000; // 3.5 分钟
+// 不同搜索词之间的随机间隔:保持随机化,但不要把多关键词任务拖得过长。
+const BATCH_INTER_KEYWORD_DELAY_MIN_MS = 30 * 1000;
+const BATCH_INTER_KEYWORD_DELAY_MAX_MS = 90 * 1000;
 const BATCH_KEYWORD_NAV_TIMEOUT_MS = 15000;
 const BATCH_KEYWORD_NAV_POLL_MS = 300;
 const BATCH_KEYWORD_AFTER_NAV_WAIT_MS = 2000;
+const BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS = 12000;
+const BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS = 5000;
+const BATCH_KEYWORD_RESULTS_STABLE_POLLS = 2;
+// 抖音搜索 URL 常被改写/二次编码,"网址里的关键词"经常和目标词字面对不上。
+// 切词那步(switchDouyinKeywordSearchInTab)已先确认过页面切到了新词,这里再强判 keywordMatched 是冗余的,
+// 只会在"卡片其实已经出现"时白白空等到超时。给一个宽限期:超过它仍未字面匹配但卡片稳定,就放行。
+const BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS = 6000;
 
 async function runBatchSingleNoteEnhancements(
   recordId,
@@ -8399,22 +9002,68 @@ export async function batchCaptureByUrls({
  * @param {string} options.platform - 平台标识 ('xiaohongshu' | 'douyin')
  * @param {string} options.baseSearchUrl - 当前搜索页 URL（用于构建同平台搜索 URL）
  * @param {Object} options.captureParams - 传给 captureKeywordNotes 的参数
+ * @param {Function} [options.afterKeywordCapture] - 单个关键词入池后触发，可用于立即采集增强
  * @param {Function} [options.onProgress] - 进度回调 ({ current, total, keyword, phase })
  * @param {Function} [options.shouldStop] - 取消检测函数
  * @returns {Promise<{ ok: boolean, results: Array, stats: Object }>}
  */
-// 采集前切搜索「排序 / 发布时间」:转发到 content 的 applyBatchSearchFilters(复用「找对标账号」的筛选点击);失败不影响采集
-async function applySearchFiltersInTab(tabId, { sort = '', publishTime = '' } = {}) {
+function hasActiveBatchSearchFilters(searchFilters = {}) {
+  return Object.values(searchFilters || {}).some((value) =>
+    Boolean(String(value || '').trim()),
+  );
+}
+
+// 采集前切搜索「排序 / 范围」:转发到 content 的 applyBatchSearchFilters(复用「找对标账号」的筛选点击);失败不影响采集
+async function applySearchFiltersInTab(tabId, searchFilters = {}) {
   try {
     const response = await chrome.runtime.sendMessage({
       type: MESSAGE_TYPE.RELAY_TO_CONTENT,
       tabId: Number(tabId),
-      payload: { action: 'applyBatchSearchFilters', sort, publishTime },
+      payload: { action: 'applyBatchSearchFilters', ...searchFilters },
     });
     return response?.data ?? null;
   } catch (error) {
     return null;
   }
+}
+
+function formatEnhanceSkipReason(reason = '') {
+  const normalized = String(reason || '').trim();
+  const reasonMap = {
+    disabled: '未开启',
+    auth_required: '未授权',
+    unsupported_platform: '当前平台不支持',
+    no_target_records: '没有待增强记录',
+    missing_note_url: '缺少可访问链接',
+    no_record_ids: '本关键词没有可增强记录',
+  };
+  return reasonMap[normalized] || normalized || '无可增强记录';
+}
+
+function buildInterKeywordDelayMessage({
+  keyword = '',
+  delay = 0,
+  hasEnhanceStep = false,
+  keywordResult = null,
+} = {}) {
+  const seconds = Math.round(Number(delay || 0) / 1000);
+  if (!hasEnhanceStep) {
+    return `已采「${keyword}」，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
+  }
+
+  const enhanceStatus = String(keywordResult?.enhanceStatus || '').trim();
+  if (enhanceStatus === 'done') {
+    return `已完成「${keyword}」列表采集与采集增强，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
+  }
+  if (enhanceStatus === 'skipped') {
+    const reason = formatEnhanceSkipReason(keywordResult?.enhanceSkipReason);
+    return `已采「${keyword}」，采集增强已跳过（${reason}），${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
+  }
+  if (enhanceStatus === 'failed') {
+    return `已采「${keyword}」，采集增强未完整完成，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
+  }
+
+  return `已采「${keyword}」，采集增强未执行，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
 }
 
 export async function batchCaptureByKeywords({
@@ -8423,6 +9072,8 @@ export async function batchCaptureByKeywords({
   baseSearchUrl = '',
   captureParams = {},
   searchFilters = null,
+  afterKeywordCapture = null,
+  waitForegroundTabId = null,
   onProgress = null,
   shouldStop = null,
 } = {}) {
@@ -8446,15 +9097,17 @@ export async function batchCaptureByKeywords({
     }
 
     const keyword = keywords[i];
-    let checkpointSession = null;
+    let keywordResult = null;
 
     if (onProgress) {
       onProgress({
         current: i + 1,
         total: keywords.length,
         keyword,
-        phase: 'navigating',
-        message: `正在导航到关键词「${keyword}」(${i + 1}/${keywords.length})...`,
+        phase: isDouyinPlatform(platform) ? 'submitting_search' : 'navigating',
+        message: isDouyinPlatform(platform)
+          ? `正在切换并搜索关键词「${keyword}」(${i + 1}/${keywords.length})...`
+          : `正在导航到关键词「${keyword}」(${i + 1}/${keywords.length})...`,
       });
     }
 
@@ -8462,8 +9115,17 @@ export async function batchCaptureByKeywords({
       // 构建搜索 URL
       const searchUrl = buildKeywordSearchUrl(keyword, platform, baseSearchUrl);
 
-      // 导航到搜索页
-      await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
+      if (isDouyinPlatform(platform)) {
+        await switchDouyinKeywordSearchInTab(
+          runnerTabId,
+          keyword,
+          searchUrl,
+          shouldStop,
+        );
+      } else {
+        // 导航到搜索页
+        await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
+      }
 
       // 等待页面渲染
       await waitMsWithStop(
@@ -8471,20 +9133,91 @@ export async function batchCaptureByKeywords({
         shouldStop,
         'BATCH_CAPTURE_CANCELED',
       );
-
-      // 按需切换搜索「排序 / 发布时间」(综合 + 不限则跳过);失败不影响继续采集
-      if (searchFilters && (searchFilters.sort || searchFilters.publishTime)) {
-        if (onProgress) {
-          onProgress({
-            current: i + 1,
-            total: keywords.length,
-            keyword,
-            phase: 'filtering',
-            message: `正在切换排序筛选「${keyword}」(${i + 1}/${keywords.length})...`,
-          });
-        }
-        await applySearchFiltersInTab(runnerTabId, searchFilters);
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: keywords.length,
+          keyword,
+          phase: 'waiting_results',
+          message: `正在等待「${keyword}」搜索结果加载(${i + 1}/${keywords.length})...`,
+        });
       }
+      await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
+        keyword,
+      });
+
+      // 按需切换搜索「排序 / 范围」(默认值则跳过)。
+      // 关键:筛选后结果没加载(如抖音「服务出现异常」)绝不能继续采——后面的重试会
+      // 重新点搜索,把筛选清空,采回来的就是未筛选(可能好几年前)的内容(客户投诉根源)。
+      // 抖音撞到异常页时,像手动一样重新点一次搜索并把筛选重挂;仍失败则本词判失败跳过,宁缺勿错。
+      if (hasActiveBatchSearchFilters(searchFilters)) {
+        let filteredResultsReady = false;
+        const maxFilterAttempts = isDouyinPlatform(platform) ? 2 : 1;
+        for (
+          let filterAttempt = 0;
+          filterAttempt < maxFilterAttempts && !filteredResultsReady;
+          filterAttempt += 1
+        ) {
+          if (filterAttempt > 0) {
+            // 上一轮筛选后页面异常:重新提交搜索(会重置筛选,故下面必须重挂)
+            if (onProgress) {
+              onProgress({
+                current: i + 1,
+                total: keywords.length,
+                keyword,
+                phase: 'filtering',
+                message: `「${keyword}」筛选后页面异常，正在重新搜索并重挂筛选(${i + 1}/${keywords.length})...`,
+              });
+            }
+            await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
+            await waitMsWithStop(2000, shouldStop, 'BATCH_CAPTURE_CANCELED');
+            await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
+              keyword,
+            });
+          }
+          if (onProgress) {
+            onProgress({
+              current: i + 1,
+              total: keywords.length,
+              keyword,
+              phase: 'filtering',
+              message: `正在切换排序筛选「${keyword}」(${i + 1}/${keywords.length})...`,
+            });
+          }
+          await applySearchFiltersInTab(runnerTabId, searchFilters);
+          await closeKeywordSearchFilterPanelInTab(runnerTabId);
+          await waitMsWithStop(
+            1200,
+            shouldStop,
+            'BATCH_CAPTURE_CANCELED',
+          );
+          if (onProgress) {
+            onProgress({
+              current: i + 1,
+              total: keywords.length,
+              keyword,
+              phase: 'waiting_results',
+              message: `正在等待「${keyword}」筛选后的结果加载(${i + 1}/${keywords.length})...`,
+            });
+          }
+          filteredResultsReady = await waitForKeywordSearchResultsInTab(
+            runnerTabId,
+            platform,
+            shouldStop,
+            {
+              keyword,
+              timeoutMs: 12000,
+              stablePolls: 1,
+            },
+          );
+        }
+        if (!filteredResultsReady) {
+          throw new Error(
+            `「${keyword}」筛选后搜索结果未加载(页面服务异常或筛选后无结果)，已跳过以免采到未筛选内容`,
+          );
+        }
+      }
+      await closeKeywordSearchFilterPanelInTab(runnerTabId);
 
       if (onProgress) {
         onProgress({
@@ -8496,18 +9229,87 @@ export async function batchCaptureByKeywords({
         });
       }
 
-      // 在 runner tab 中执行采集
-      checkpointSession = beginListCaptureCheckpointSession({
-        mode: SYNC_TYPE.KEYWORD_NOTES,
-        source: 'batch_keyword_capture',
-      });
-      const captureResult = await captureInTab(runnerTabId, {
-        mode: 'keyword',
-        captureParams: {
-          ...captureParams,
+      const runKeywordCapture = () =>
+        captureAndSaveInTab({
+          tabId: runnerTabId,
+          mode: 'keyword',
+          captureParams: {
+            ...captureParams,
+            keyword,
+          },
+          checkpointSource: 'batch_keyword_capture',
+          onProgress: onProgress
+            ? (progress = {}) => {
+                onProgress({
+                  ...progress,
+                  current: i + 1,
+                  total: keywords.length,
+                  keyword,
+                  message:
+                    progress.message ||
+                    `正在采集「${keyword}」(${i + 1}/${keywords.length})...`,
+                });
+              }
+            : null,
+        });
+      let captureRunResult = await runKeywordCapture();
+      let captureResult = captureRunResult?.captureResult || null;
+      if (isEmptyKeywordCaptureResult(captureResult)) {
+        if (onProgress) {
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'waiting_results',
+            message: `搜索结果仍在加载，准备重试「${keyword}」(${i + 1}/${keywords.length})...`,
+          });
+        }
+        if (isDouyinPlatform(platform)) {
+          await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
+        }
+        const reportRetryWaitProgress = (remainingMs = BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS) => {
+          if (!onProgress) {
+            return;
+          }
+          const seconds = Math.ceil(Math.max(0, Number(remainingMs) || 0) / 1000);
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'waiting_results',
+            remainingMs,
+            message: `搜索结果仍在加载，${seconds} 秒后重试「${keyword}」(${i + 1}/${keywords.length})...`,
+          });
+        };
+        reportRetryWaitProgress();
+        await waitMsWithStopAndTick(
+          BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS,
+          shouldStop,
+          {
+            errorMessage: 'BATCH_CAPTURE_CANCELED',
+            tickMs: 1000,
+            onTick: reportRetryWaitProgress,
+          },
+        );
+        await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
           keyword,
-        },
-      });
+        });
+        // 抖音上面刚重新点了搜索,已挂的筛选会被清空:配置了筛选就必须重挂再采,
+        // 否则采到的是未筛选(可能好几年前)的内容。
+        if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
+          await applySearchFiltersInTab(runnerTabId, searchFilters);
+          await closeKeywordSearchFilterPanelInTab(runnerTabId);
+          await waitMsWithStop(1200, shouldStop, 'BATCH_CAPTURE_CANCELED');
+          await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
+            keyword,
+            timeoutMs: 12000,
+            stablePolls: 1,
+          });
+        }
+        await closeKeywordSearchFilterPanelInTab(runnerTabId);
+        captureRunResult = await runKeywordCapture();
+        captureResult = captureRunResult?.captureResult || null;
+      }
 
       if (isCaptureCanceledResult(captureResult)) {
         canceled = true;
@@ -8518,61 +9320,69 @@ export async function batchCaptureByKeywords({
         break;
       }
 
-      // 入池
-      if (captureResult?.ok) {
-        const saveResult = await saveCaptureResultRecords(captureResult, {
-          session: checkpointSession,
-        });
-        const savedRecords = Array.isArray(saveResult.savedRecords)
-          ? saveResult.savedRecords
+      if (captureRunResult?.ok) {
+        const savedRecords = Array.isArray(captureRunResult.savedRecords)
+          ? captureRunResult.savedRecords
           : [];
-        const recordIds = Array.isArray(saveResult.recordIds)
-          ? saveResult.recordIds
+        const recordIds = Array.isArray(captureRunResult.recordIds)
+          ? captureRunResult.recordIds
           : [];
         if (recordIds.length > 0) {
-          trackCoreCaptureSuccess(savedRecords.length, {
-            mode: 'keyword',
-            source: 'batch_keyword_capture',
-          });
-          results.push({
+          keywordResult = {
             keyword,
             ok: true,
             recordIds,
-            captureCacheStats: saveResult.cacheStats || null,
-          });
+            captureCacheStats: captureRunResult.captureCacheStats || null,
+          };
+          results.push(keywordResult);
           successCount++;
+        } else if (isEmptyKeywordCaptureResult(captureResult)) {
+          keywordResult = {
+            keyword,
+            ok: false,
+            error: '搜索结果未加载或未采到可入池记录',
+            captureCacheStats: captureRunResult.captureCacheStats || null,
+          };
+          results.push(keywordResult);
+          failedCount++;
         } else {
-          results.push({
+          keywordResult = {
             keyword,
             ok: true,
             recordIds: [],
-            captureCacheStats: saveResult.cacheStats || null,
-          });
+            captureCacheStats: captureRunResult.captureCacheStats || null,
+          };
+          results.push(keywordResult);
           successCount++;
         }
       } else {
-        if (checkpointSession?.queue) {
-          await checkpointSession.queue.catch(() => null);
-        }
-        const partialRecordIds = collectListCaptureSessionRecordIds(
-          checkpointSession,
-        );
+        const partialRecordIds = Array.isArray(captureRunResult?.recordIds)
+          ? captureRunResult.recordIds
+          : [];
         if (partialRecordIds.length > 0) {
-          results.push({
+          keywordResult = {
             keyword,
             ok: true,
             partial: true,
             recordIds: partialRecordIds,
-            captureCacheStats: createListCaptureCacheStats(checkpointSession),
-            warning: captureResult?.error?.message || '采集未完整完成',
-          });
+            captureCacheStats: captureRunResult?.captureCacheStats || null,
+            warning:
+              captureRunResult?.error?.message ||
+              captureResult?.error?.message ||
+              '采集未完整完成',
+          };
+          results.push(keywordResult);
           successCount++;
         } else {
-          results.push({
+          keywordResult = {
             keyword,
             ok: false,
-            error: captureResult?.error?.message || '采集失败',
-          });
+            error:
+              captureRunResult?.error?.message ||
+              captureResult?.error?.message ||
+              '采集失败',
+          };
+          results.push(keywordResult);
           failedCount++;
         }
       }
@@ -8581,35 +9391,127 @@ export async function batchCaptureByKeywords({
         canceled = true;
         break;
       }
-      if (checkpointSession?.queue) {
-        await checkpointSession.queue.catch(() => null);
-      }
-      const partialRecordIds = collectListCaptureSessionRecordIds(
-        checkpointSession,
-      );
-      if (partialRecordIds.length > 0) {
-        results.push({
-          keyword,
-          ok: true,
-          partial: true,
-          recordIds: partialRecordIds,
-          captureCacheStats: createListCaptureCacheStats(checkpointSession),
-          warning: error.message || '采集未完整完成',
-        });
-        successCount++;
-      } else {
-        results.push({
-          keyword,
-          ok: false,
-          error: error.message,
-        });
-        failedCount++;
-      }
+      keywordResult = {
+        keyword,
+        ok: false,
+        error: error.message,
+      };
+      results.push(keywordResult);
+      failedCount++;
     } finally {
-      if (checkpointSession?.queue) {
-        await checkpointSession.queue.catch(() => null);
+      // captureAndSaveInTab owns its own checkpoint session.
+    }
+
+    const keywordRecordIds = Array.isArray(keywordResult?.recordIds)
+      ? keywordResult.recordIds.filter(
+          (recordId) => typeof recordId === 'string' && recordId.trim(),
+        )
+      : [];
+    const canRunAfterKeywordCapture =
+      !canceled && keywordResult?.ok && typeof afterKeywordCapture === 'function';
+    if (
+      canRunAfterKeywordCapture &&
+      keywordRecordIds.length === 0 &&
+      onProgress
+    ) {
+      keywordResult.enhanceStatus = 'skipped';
+      keywordResult.enhanceSkipReason = 'no_record_ids';
+      onProgress({
+        current: i + 1,
+        total: keywords.length,
+        keyword,
+        phase: 'enhance_skipped',
+        message: `关键词「${keyword}」没有采到可入池记录，跳过采集增强`,
+        recordIds: [],
+        runnerTabId,
+      });
+    }
+    if (canRunAfterKeywordCapture && keywordRecordIds.length > 0) {
+      keywordResult.enhanceStatus = 'running';
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: keywords.length,
+          keyword,
+          phase: 'enhancing',
+          message: `正在增强关键词「${keyword}」的采集结果(${i + 1}/${keywords.length})...`,
+          recordIds: keywordRecordIds,
+          runnerTabId,
+        });
       }
-      finishListCaptureCheckpointSession(checkpointSession);
+
+      try {
+        const enhanceResult = await afterKeywordCapture({
+          keyword,
+          current: i + 1,
+          total: keywords.length,
+          recordIds: keywordRecordIds,
+          result: keywordResult,
+          runnerTabId,
+        });
+
+        if (enhanceResult !== undefined) {
+          keywordResult.enhanceResult = enhanceResult;
+        }
+        if (enhanceResult?.skipped && onProgress) {
+          keywordResult.enhanceStatus = 'skipped';
+          keywordResult.enhanceSkipReason = enhanceResult.reason || '';
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'enhance_skipped',
+            message: `关键词「${keyword}」采集增强已跳过：${formatEnhanceSkipReason(enhanceResult.reason)}`,
+            recordIds: keywordRecordIds,
+            runnerTabId,
+          });
+        }
+        if (enhanceResult?.securityBlocked) {
+          keywordResult.enhanceStatus = 'failed';
+          keywordResult.securityBlocked = true;
+          canceled = true;
+          break;
+        }
+        if (
+          enhanceResult?.canceled ||
+          (typeof shouldStop === 'function' && shouldStop())
+        ) {
+          keywordResult.enhanceStatus = 'failed';
+          keywordResult.canceled = true;
+          canceled = true;
+          break;
+        }
+        if (enhanceResult && enhanceResult.ok === false) {
+          keywordResult.enhanceStatus = 'failed';
+          keywordResult.partial = true;
+          keywordResult.warning =
+            enhanceResult?.error?.message || keywordResult.warning || '采集增强未完整完成';
+        } else if (!enhanceResult?.skipped) {
+          keywordResult.enhanceStatus = 'done';
+        }
+      } catch (error) {
+        if (isBatchCaptureCanceledError(error)) {
+          keywordResult.enhanceStatus = 'failed';
+          keywordResult.canceled = true;
+          canceled = true;
+          break;
+        }
+        keywordResult.enhanceStatus = 'failed';
+        keywordResult.partial = true;
+        keywordResult.warning =
+          error?.message || keywordResult.warning || '采集增强失败';
+        if (onProgress) {
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'enhance_failed',
+            message: `关键词「${keyword}」采集增强失败：${keywordResult.warning}`,
+            recordIds: keywordRecordIds,
+            runnerTabId,
+          });
+        }
+      }
     }
 
     // 关键词间随机延迟:分钟级(防风控,见常量注释)。最后一个不延迟。
@@ -8618,16 +9520,33 @@ export async function batchCaptureByKeywords({
         BATCH_INTER_KEYWORD_DELAY_MIN_MS +
         Math.random() *
           (BATCH_INTER_KEYWORD_DELAY_MAX_MS - BATCH_INTER_KEYWORD_DELAY_MIN_MS);
-      if (onProgress) {
+      await activateTabForReliableTimer(waitForegroundTabId);
+      const reportDelayProgress = (remainingMs = delay) => {
+        if (!onProgress) {
+          return;
+        }
         onProgress({
           current: i + 1,
           total: keywords.length,
+          keyword,
           phase: 'inter_keyword_delay',
-          message: `已采「${keyword}」，${Math.round(delay / 1000)} 秒后再搜下一个关键词(防风控·随机间隔)…`,
+          remainingMs,
+          runnerTabId,
+          message: buildInterKeywordDelayMessage({
+            keyword,
+            delay: remainingMs,
+            hasEnhanceStep: typeof afterKeywordCapture === 'function',
+            keywordResult,
+          }),
         });
-      }
+      };
+      reportDelayProgress(delay);
       try {
-        await waitMsWithStop(delay, shouldStop, 'BATCH_CAPTURE_CANCELED');
+        await waitMsWithStopAndTick(delay, shouldStop, {
+          errorMessage: 'BATCH_CAPTURE_CANCELED',
+          tickMs: 1000,
+          onTick: reportDelayProgress,
+        });
       } catch (error) {
         if (isBatchCaptureCanceledError(error)) {
           canceled = true;
@@ -8949,6 +9868,203 @@ function buildKeywordSearchUrl(keyword, platform, baseSearchUrl) {
   return xhsDefaultSearchUrl.toString();
 }
 
+function isDouyinPlatform(platform = '') {
+  return String(platform || '').trim().toLowerCase() === 'douyin';
+}
+
+async function submitKeywordSearchInTab(
+  tabId,
+  platform = '',
+  keyword = '',
+  shouldStop = null,
+) {
+  if (!isDouyinPlatform(platform)) {
+    return false;
+  }
+  if (typeof shouldStop === 'function' && shouldStop()) {
+    throw new Error('BATCH_CAPTURE_CANCELED');
+  }
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+
+  const result = await chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: (expectedKeyword) => {
+        const normalize = (value) =>
+          String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+        const decode = (value) => {
+          try {
+            return decodeURIComponent(String(value || ''));
+          } catch {
+            return String(value || '');
+          }
+        };
+        const expected = normalize(expectedKeyword);
+        const isVisible = (node) => {
+          if (!(node instanceof HTMLElement)) {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return (
+            rect.width > 4 &&
+            rect.height > 4 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity || 1) > 0.01
+          );
+        };
+        const getInputValue = (node) => {
+          if (!node) {
+            return '';
+          }
+          return String(node.value || node.textContent || '').trim();
+        };
+        const input =
+          Array.from(
+            document.querySelectorAll(
+              '[data-e2e="searchbar-input"], input[type="search"], input[placeholder*="搜索"], textarea, [contenteditable="true"]',
+            ),
+          ).find(isVisible) || null;
+        const currentUrl = new URL(window.location.href);
+        const urlKeyword = decode(
+          currentUrl.pathname.split('/search/')[1]?.split('/')[0] || '',
+        );
+        const inputKeyword = getInputValue(input);
+        const keywordMatched =
+          !expected ||
+          normalize(urlKeyword) === expected ||
+          normalize(inputKeyword).includes(expected);
+        if (!keywordMatched) {
+          return {
+            clicked: false,
+            reason: 'keyword_not_matched',
+            urlKeyword,
+            inputKeyword,
+          };
+        }
+
+        const buttonSelectors = [
+          '[data-e2e="searchbar-button"]',
+          'button[type="submit"]',
+          '[role="button"][aria-label*="搜索"]',
+          'button[aria-label*="搜索"]',
+        ];
+        const selectorButton = buttonSelectors
+          .map((selector) => document.querySelector(selector))
+          .find(isVisible);
+        const textButton =
+          selectorButton ||
+          Array.from(document.querySelectorAll('button, [role="button"], a'))
+            .filter(isVisible)
+            .find((node) => normalize(node.textContent) === normalize('搜索'));
+        const button = textButton;
+        if (!button) {
+          if (input) {
+            input.focus?.();
+            input.dispatchEvent(
+              new KeyboardEvent('keydown', {
+                key: 'Enter',
+                code: 'Enter',
+                bubbles: true,
+                cancelable: true,
+              }),
+            );
+            input.dispatchEvent(
+              new KeyboardEvent('keyup', {
+                key: 'Enter',
+                code: 'Enter',
+                bubbles: true,
+                cancelable: true,
+              }),
+            );
+            return {clicked: true, via: 'enter'};
+          }
+          return {clicked: false, reason: 'button_not_found'};
+        }
+
+        button.scrollIntoView?.({block: 'center', inline: 'center'});
+        button.dispatchEvent(
+          new PointerEvent('pointerdown', {
+            bubbles: true,
+            cancelable: true,
+            pointerType: 'mouse',
+            button: 0,
+          }),
+        );
+        button.dispatchEvent(
+          new MouseEvent('mousedown', {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+          }),
+        );
+        button.dispatchEvent(
+          new PointerEvent('pointerup', {
+            bubbles: true,
+            cancelable: true,
+            pointerType: 'mouse',
+            button: 0,
+          }),
+        );
+        button.dispatchEvent(
+          new MouseEvent('mouseup', {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+          }),
+        );
+        button.click?.();
+        return {clicked: true, via: 'button'};
+      },
+      args: [keyword],
+    })
+    .then(([scriptResult]) => scriptResult?.result || null)
+    .catch(() => null);
+
+  return Boolean(result?.clicked);
+}
+
+async function switchDouyinKeywordSearchInTab(
+  tabId,
+  keyword = '',
+  targetUrl = '',
+  shouldStop = null,
+) {
+  const navigationContext = parseKeywordSearchNavigationContext(targetUrl);
+  if (typeof shouldStop === 'function' && shouldStop()) {
+    throw new Error('BATCH_CAPTURE_CANCELED');
+  }
+
+  if (!(await isKeywordSearchTargetReadyInTab(tabId, navigationContext))) {
+    await chrome.tabs.update(tabId, {
+      url: targetUrl,
+      active: true,
+    });
+    const ready = await waitForKeywordSearchTargetReadyInTab(
+      tabId,
+      navigationContext,
+      shouldStop,
+      6000,
+    );
+    // 抖音 URL/搜索框的关键词字面常和目标词对不上,导致"就绪判断"误判未就绪(页面其实已切好)。
+    // 这里不再因判否而抛错让整个词失败:判定就绪就继续;判不出也只是给页面固定加载时间后照常往下走,
+    // 由后面的 waitForKeywordSearchResultsInTab(卡片稳定即放行)兜底判断有没有真结果。
+    if (!ready) {
+      await waitMsWithStop(
+        BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
+        shouldStop,
+        'BATCH_CAPTURE_CANCELED',
+      );
+    }
+  }
+
+  await submitKeywordSearchInTab(tabId, 'douyin', keyword, shouldStop);
+}
+
 /**
  * 导航到搜索 URL 并等待页面加载完成
  */
@@ -8958,7 +10074,9 @@ async function navigateToSearchUrl(tabId, targetUrl, shouldStop) {
     active: true,
   });
 
+  const navigationContext = parseKeywordSearchNavigationContext(targetUrl);
   const startedAt = Date.now();
+  let reachedComplete = false;
   while (Date.now() - startedAt < BATCH_KEYWORD_NAV_TIMEOUT_MS) {
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('BATCH_CAPTURE_CANCELED');
@@ -8971,14 +10089,799 @@ async function navigateToSearchUrl(tabId, targetUrl, shouldStop) {
       throw new Error(error?.message || '读取标签页状态失败');
     }
 
-    if (String(tab?.status || '') === 'complete') {
+    const tabComplete = String(tab?.status || '') === 'complete';
+    if (tabComplete) {
+      reachedComplete = true;
+    }
+
+    if (
+      tabComplete &&
+      isKeywordSearchTabUrlReady(tab?.url || '', navigationContext)
+    ) {
+      return;
+    }
+
+    if (
+      navigationContext.platform === 'douyin' &&
+      await isKeywordSearchTargetReadyInTab(tabId, navigationContext)
+    ) {
+      return;
+    }
+
+    if (
+      await isKeywordSearchDomReadyInTab(tabId, {
+        platform: navigationContext.platform,
+        keyword: navigationContext.keyword,
+      })
+    ) {
       return;
     }
 
     await waitMs(BATCH_KEYWORD_NAV_POLL_MS);
   }
 
+  if (
+    navigationContext.platform === 'douyin' &&
+    await isKeywordSearchTargetReadyInTab(tabId, navigationContext)
+  ) {
+    return;
+  }
+
+  // 就绪判断在 15s 内没命中,并不代表导航失败:小红书是 SPA,导航后常把 URL 的 keyword
+  // 参数改写/二次编码(甚至丢失),且搜索结果页的笔记链接是 /search_result/ 而非 /explore/,
+  // 于是 isKeywordSearchTabUrlReady(要求 keyword 参数严格相等)与 isKeywordSearchDomReadyInTab
+  // (小红书选择器多为 /explore/,且命中卡片后仍 return keywordMatched)会在"结果其实已经
+  // 渲染出来"时双双误判未就绪,白白空等到超时再把整词判失败跳过。
+  // 类比已修的抖音切词:只要文档确实完成过加载(导航已真实发生),就不再抛错,把"到底有没有
+  // 结果"交给随后的 waitForKeywordSearchResultsInTab(含关键词字面宽限期 + 卡片稳定即放行)兜底。
+  // 仅当文档从未加载完成(导航真的没发生/一直卡在 loading)时才按超时抛错。
+  if (reachedComplete) {
+    return;
+  }
+
   throw new Error('搜索页导航超时');
+}
+
+function parseKeywordSearchNavigationContext(targetUrl = '') {
+  try {
+    const url = new URL(String(targetUrl || ''));
+    const host = url.hostname.toLowerCase();
+    if (host.includes('douyin.com')) {
+      const keyword = decodeURIComponent(
+        url.pathname.split('/search/')[1]?.split('/')[0] || '',
+      );
+      return {platform: 'douyin', keyword};
+    }
+    if (host.includes('xiaohongshu.com')) {
+      return {
+        platform: 'xiaohongshu',
+        keyword: url.searchParams.get('keyword') || '',
+      };
+    }
+  } catch {
+    // ignore malformed URLs
+  }
+  return {platform: '', keyword: ''};
+}
+
+function isKeywordSearchTabUrlReady(currentUrl = '', {platform = '', keyword = ''} = {}) {
+  const platformKey = String(platform || '').toLowerCase();
+  const expectedKeyword = String(keyword || '').trim();
+  if (!platformKey || !expectedKeyword) {
+    return true;
+  }
+  try {
+    const url = new URL(String(currentUrl || ''));
+    const host = url.hostname.toLowerCase();
+    let currentKeyword = '';
+    if (platformKey === 'douyin' && host.includes('douyin.com')) {
+      currentKeyword = decodeURIComponent(
+        url.pathname.split('/search/')[1]?.split('/')[0] || '',
+      );
+    } else if (platformKey === 'xiaohongshu' && host.includes('xiaohongshu.com')) {
+      currentKeyword = url.searchParams.get('keyword') || '';
+    } else if (platformKey === 'weibo' && host.includes('weibo.com')) {
+      currentKeyword = url.searchParams.get('q') || '';
+    }
+    const normalize = (value) =>
+      String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+    return normalize(currentKeyword) === normalize(expectedKeyword);
+  } catch {
+    return false;
+  }
+}
+
+async function isKeywordSearchTargetReadyInTab(
+  tabId,
+  {platform = '', keyword = ''} = {},
+) {
+  const platformKey = String(platform || '').trim().toLowerCase();
+  const expectedKeyword = String(keyword || '').trim();
+  if (!platformKey || !expectedKeyword) {
+    return false;
+  }
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+
+  return chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: (platformName, expectedKeywordValue) => {
+        const normalize = (value) =>
+          String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+        const decode = (value) => {
+          try {
+            return decodeURIComponent(String(value || ''));
+          } catch {
+            return String(value || '');
+          }
+        };
+        const platformKeyInner = String(platformName || '').toLowerCase();
+        const expected = normalize(expectedKeywordValue);
+        const url = new URL(window.location.href);
+        const urlKeyword =
+          platformKeyInner === 'douyin'
+            ? decode(url.pathname.split('/search/')[1]?.split('/')[0] || '')
+            : url.searchParams.get('keyword') ||
+              url.searchParams.get('query') ||
+              url.searchParams.get('q') ||
+              '';
+        const inputKeyword =
+          Array.from(
+            document.querySelectorAll(
+              '[data-e2e="searchbar-input"], input[type="search"], input[placeholder*="搜索"], textarea, [contenteditable="true"]',
+            ),
+          )
+            .map((node) => node.value || node.textContent || '')
+            .map((value) => String(value || '').trim())
+            .find(Boolean) || '';
+        const ready =
+          Boolean(expected) &&
+          (normalize(urlKeyword) === expected ||
+            normalize(inputKeyword).includes(expected));
+        console.log('[星语诊断] 切词就绪判断', {
+          expected,
+          urlKeyword,
+          inputKeyword,
+          ready,
+          href: window.location.href,
+        });
+        return ready;
+      },
+      args: [platform, keyword],
+    })
+    .then(([result]) => Boolean(result?.result))
+    .catch(() => false);
+}
+
+async function waitForKeywordSearchTargetReadyInTab(
+  tabId,
+  navigationContext = {},
+  shouldStop = null,
+  timeoutMs = 6000,
+) {
+  const startedAt = Date.now();
+  const timeout = Math.max(0, Number(timeoutMs) || 0);
+  while (Date.now() - startedAt < timeout) {
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      throw new Error('BATCH_CAPTURE_CANCELED');
+    }
+    if (await isKeywordSearchTargetReadyInTab(tabId, navigationContext)) {
+      return true;
+    }
+    await waitMs(BATCH_KEYWORD_NAV_POLL_MS);
+  }
+  return false;
+}
+
+async function isKeywordSearchDomReadyInTab(
+  tabId,
+  {platform = '', keyword = ''} = {},
+) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+
+  return chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: (platformName, expectedKeyword) => {
+        const normalizeText = (value) =>
+          String(value || '')
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '');
+        const decode = (value) => {
+          try {
+            return decodeURIComponent(String(value || ''));
+          } catch {
+            return String(value || '');
+          }
+        };
+        const platformKey = String(platformName || '').toLowerCase();
+        const expected = normalizeText(expectedKeyword);
+        const selectorsByPlatform = {
+          xiaohongshu: [
+            '.feeds-container a[href*="/explore/"]',
+            '.note-item',
+            '.feed-item',
+            '.cover',
+            'a[href*="/explore/"]',
+            '[data-v-feed] a',
+            'section a[href*="/explore/"]',
+          ],
+          douyin: [
+            '#search-result-container .search-result-card',
+            '#waterFallScrollContainer .search-result-card',
+            '#search-result-container [id^="waterfall_item_"]',
+            '#waterFallScrollContainer [id^="waterfall_item_"]',
+            '.search-result-card',
+            '[data-e2e-aweme-id]',
+            '[data-aweme-id]',
+            '[data-awemeid]',
+            '[data-id]',
+            '[data-item-id]',
+            '[data-modal-id]',
+            '[id^="waterfall_item_"]',
+            'a[href*="/video/"]',
+            'a[href*="/note/"]',
+            'a[href*="modal_id="]',
+            'a[data-href*="/video/"]',
+            'a[data-href*="/note/"]',
+            'a[data-url*="/video/"]',
+            'a[data-url*="/note/"]',
+          ],
+        };
+        const selectors =
+          selectorsByPlatform[platformKey] ||
+          Object.values(selectorsByPlatform).flat();
+        const url = new URL(window.location.href);
+        const urlKeyword =
+          url.searchParams.get('keyword') ||
+          url.searchParams.get('query') ||
+          url.searchParams.get('q') ||
+          (platformKey === 'douyin'
+            ? decode(url.pathname.split('/search/')[1]?.split('/')[0] || '')
+            : '');
+        const inputKeyword =
+          Array.from(
+            document.querySelectorAll('input, textarea, [contenteditable="true"]'),
+          )
+            .map((node) => node.value || node.textContent || '')
+            .map((value) => String(value || '').trim())
+            .find(Boolean) || '';
+        const keywordMatched =
+          !expected ||
+          normalizeText(urlKeyword) === expected ||
+          normalizeText(inputKeyword).includes(expected);
+        const isVisible = (node) => {
+          if (!(node instanceof Element)) {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return (
+            rect.width > 8 &&
+            rect.height > 8 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity || 1) > 0.01
+          );
+        };
+        const hasVisibleMedia = (node) =>
+          Boolean(
+            node?.querySelector?.(
+              'img[src], video, canvas, [style*="background-image"]',
+            ),
+          );
+        const hasDouyinResultSignal = (node) => {
+          if (!(node instanceof Element)) {
+            return false;
+          }
+          const text = String(node.innerText || node.textContent || '');
+          if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
+            return false;
+          }
+          const linkSelectors = [
+            'a[href*="/video/"]',
+            'a[href*="/note/"]',
+            'a[href*="modal_id="]',
+            '[href*="/video/"]',
+            '[href*="/note/"]',
+            '[data-href*="/video/"]',
+            '[data-href*="/note/"]',
+            '[data-url*="/video/"]',
+            '[data-url*="/note/"]',
+          ].join(',');
+          return (
+            node.matches?.(linkSelectors) ||
+            node.querySelector?.(linkSelectors) ||
+            /^\s*\d{1,2}:\d{2}\s*$/m.test(text) ||
+            hasVisibleMedia(node)
+          );
+        };
+        let cardCount = 0;
+        const seenNodes = new Set();
+        for (const selector of selectors) {
+          try {
+            document.querySelectorAll(selector).forEach((node) => {
+              const item =
+                platformKey === 'douyin'
+                  ? node.closest?.(
+                      '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+                    ) || node
+                  : node.closest?.('.note-item, .feed-item, section, [data-v-feed] a') ||
+                    node;
+              if (!item || seenNodes.has(item)) {
+                return;
+              }
+              if (
+                platformKey === 'douyin' &&
+                !hasDouyinResultSignal(item) &&
+                !isVisible(item)
+              ) {
+                return;
+              }
+              seenNodes.add(item);
+              cardCount += 1;
+            });
+          } catch {
+            // ignore invalid selectors
+          }
+        }
+        if (platformKey === 'douyin' && cardCount <= 0) {
+          const durationHits = Array.from(document.querySelectorAll('span, div'))
+            .filter((node) => /^\s*\d{1,2}:\d{2}\s*$/.test(node.textContent || ''))
+            .filter(isVisible).length;
+          const searchTabsVisible =
+            /综合/.test(document.body?.innerText || '') &&
+            /视频/.test(document.body?.innerText || '');
+          if (durationHits > 0 && searchTabsVisible) {
+            cardCount = durationHits;
+          }
+          if (cardCount <= 0 && searchTabsVisible) {
+            const mediaCards = new Set();
+            Array.from(
+              document.querySelectorAll(
+                'main img[src], main video, #search-result-container img[src], #search-result-container video, #waterFallScrollContainer img[src], #waterFallScrollContainer video, [data-e2e="scroll-list"] img[src], [data-e2e="scroll-list"] video',
+              ),
+            ).forEach((node) => {
+              const card =
+                node.closest?.(
+                  'a[href], article, li, section, [role="listitem"], .search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+                ) || node.parentElement;
+              if (!card || !isVisible(card)) {
+                return;
+              }
+              const text = String(card.innerText || card.textContent || '');
+              if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
+                return;
+              }
+              mediaCards.add(card);
+            });
+            if (mediaCards.size > 0) {
+              cardCount = mediaCards.size;
+            }
+          }
+        }
+        if (cardCount <= 0) {
+          if (platformKey === 'douyin' && keywordMatched) {
+            const bodyText = String(document.body?.innerText || '');
+            const hasSearchShell =
+              document.readyState !== 'loading' &&
+              (Boolean(
+                document.querySelector(
+                  '[data-e2e="searchbar-input"], input[placeholder*="搜索"], #search-result-container, #waterFallScrollContainer',
+                ),
+              ) ||
+                (/综合/.test(bodyText) && /视频|用户|直播/.test(bodyText)));
+            if (hasSearchShell) {
+              return true;
+            }
+          }
+          return false;
+        }
+        return keywordMatched;
+      },
+      args: [platform, keyword],
+    })
+    .then(([result]) => Boolean(result?.result))
+    .catch(() => false);
+}
+
+function isEmptyKeywordCaptureResult(captureResult) {
+  if (!captureResult?.ok) {
+    return false;
+  }
+
+  const payload =
+    captureResult.data && typeof captureResult.data === 'object'
+      ? captureResult.data
+      : {};
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const rawTotalCount = Number(payload.rawTotalCount || payload.totalCount || 0);
+  const filteredCount = Number(payload.filteredCount || items.length || 0);
+  return items.length === 0 && rawTotalCount === 0 && filteredCount === 0;
+}
+
+async function waitForKeywordSearchResultsInTab(
+  tabId,
+  platform = '',
+  shouldStop = null,
+  {
+    timeoutMs = BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS,
+    keyword = '',
+    stablePolls = BATCH_KEYWORD_RESULTS_STABLE_POLLS,
+  } = {},
+) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+
+  const startedAt = Date.now();
+  const timeout = Math.max(0, Number(timeoutMs) || 0);
+  const requiredStablePolls = Math.max(1, Math.floor(Number(stablePolls) || 1));
+  let lastSignature = '';
+  let lastCardCount = -1;
+  let stableCount = 0;
+  while (Date.now() - startedAt < timeout) {
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      throw new Error('BATCH_CAPTURE_CANCELED');
+    }
+
+    const snapshot = await chrome.scripting
+      .executeScript({
+        target: {tabId: normalizedTabId},
+        func: (platformName, expectedKeyword) => {
+          const normalizeText = (value) =>
+            String(value || '')
+              .trim()
+              .toLowerCase()
+              .replace(/\s+/g, '');
+          const decode = (value) => {
+            try {
+              return decodeURIComponent(String(value || ''));
+            } catch {
+              return String(value || '');
+            }
+          };
+          const expected = normalizeText(expectedKeyword);
+          const platformKey = String(platformName || '').toLowerCase();
+          const selectorsByPlatform = {
+            xiaohongshu: [
+              '.feeds-container a[href*="/explore/"]',
+              '.note-item',
+              '.feed-item',
+              '.cover',
+              'a[href*="/explore/"]',
+              '[data-v-feed] a',
+              'section a[href*="/explore/"]',
+            ],
+            douyin: [
+              '#search-result-container .search-result-card',
+              '#waterFallScrollContainer .search-result-card',
+              '#search-result-container [id^="waterfall_item_"]',
+              '#waterFallScrollContainer [id^="waterfall_item_"]',
+              '.search-result-card',
+              '[data-e2e-aweme-id]',
+              '[data-aweme-id]',
+              '[data-awemeid]',
+              '[data-id]',
+              '[data-item-id]',
+              '[data-modal-id]',
+              '[id^="waterfall_item_"]',
+              'a[href*="/video/"]',
+              'a[href*="/note/"]',
+              'a[href*="modal_id="]',
+              'a[data-href*="/video/"]',
+              'a[data-href*="/note/"]',
+              'a[data-url*="/video/"]',
+              'a[data-url*="/note/"]',
+            ],
+          };
+          const selectors =
+            selectorsByPlatform[platformKey] ||
+            Object.values(selectorsByPlatform).flat();
+          const isVisible = (node) => {
+            if (!(node instanceof Element)) {
+              return false;
+            }
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return (
+              rect.width > 8 &&
+              rect.height > 8 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden' &&
+              Number(style.opacity || 1) > 0.01
+            );
+          };
+          const hasVisibleMedia = (node) =>
+            Boolean(
+              node?.querySelector?.(
+                'img[src], video, canvas, [style*="background-image"]',
+              ),
+            );
+          const hasDouyinResultSignal = (node) => {
+            if (!(node instanceof Element)) {
+              return false;
+            }
+            const text = String(node.innerText || node.textContent || '');
+            if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
+              return false;
+            }
+            const linkSelectors = [
+              'a[href*="/video/"]',
+              'a[href*="/note/"]',
+              'a[href*="modal_id="]',
+              '[href*="/video/"]',
+              '[href*="/note/"]',
+              '[data-href*="/video/"]',
+              '[data-href*="/note/"]',
+              '[data-url*="/video/"]',
+              '[data-url*="/note/"]',
+            ].join(',');
+            return (
+              node.matches?.(linkSelectors) ||
+              node.querySelector?.(linkSelectors) ||
+              /^\s*\d{1,2}:\d{2}\s*$/m.test(text) ||
+              hasVisibleMedia(node)
+            );
+          };
+          const cardNodes = [];
+          const seenNodes = new Set();
+          selectors.forEach((selector) => {
+            try {
+              document.querySelectorAll(selector).forEach((node) => {
+                const item =
+                  platformKey === 'douyin'
+                    ? node.closest?.(
+                        '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+                      ) || node
+                    : node.closest?.('.note-item, .feed-item, section, [data-v-feed] a') ||
+                      node;
+                if (!item || seenNodes.has(item)) {
+                  return;
+                }
+                if (
+                  platformKey === 'douyin' &&
+                  !hasDouyinResultSignal(item) &&
+                  !isVisible(item)
+                ) {
+                  return;
+                }
+                seenNodes.add(item);
+                cardNodes.push(item);
+              });
+            } catch {
+              // ignore invalid selector in platform fallbacks
+            }
+          });
+          if (platformKey === 'douyin' && cardNodes.length <= 0) {
+            Array.from(document.querySelectorAll('span, div'))
+              .filter((node) => /^\s*\d{1,2}:\d{2}\s*$/.test(node.textContent || ''))
+              .filter(isVisible)
+              .forEach((node) => {
+                const item =
+                  node.closest?.(
+                    '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+                  ) || node.parentElement || node;
+                if (!item || seenNodes.has(item)) {
+                  return;
+                }
+                seenNodes.add(item);
+                cardNodes.push(item);
+              });
+            if (cardNodes.length <= 0) {
+              const bodyText = String(document.body?.innerText || '');
+              const searchTabsVisible =
+                /综合/.test(bodyText) && /视频/.test(bodyText);
+              if (searchTabsVisible) {
+                Array.from(
+                  document.querySelectorAll(
+                    'main img[src], main video, #search-result-container img[src], #search-result-container video, #waterFallScrollContainer img[src], #waterFallScrollContainer video, [data-e2e="scroll-list"] img[src], [data-e2e="scroll-list"] video',
+                  ),
+                ).forEach((node) => {
+                  const item =
+                    node.closest?.(
+                      'a[href], article, li, section, [role="listitem"], .search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+                    ) || node.parentElement || node;
+                  if (!item || seenNodes.has(item) || !isVisible(item)) {
+                    return;
+                  }
+                  const text = String(item.innerText || item.textContent || '');
+                  if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
+                    return;
+                  }
+                  seenNodes.add(item);
+                  cardNodes.push(item);
+                });
+              }
+            }
+          }
+
+          const url = new URL(window.location.href);
+          const urlKeyword =
+            url.searchParams.get('keyword') ||
+            url.searchParams.get('query') ||
+            url.searchParams.get('q') ||
+            (platformKey === 'douyin'
+              ? decode(url.pathname.split('/search/')[1]?.split('/')[0] || '')
+              : '');
+          const inputKeyword = Array.from(
+            document.querySelectorAll('input, textarea, [contenteditable="true"]'),
+          )
+            .map((node) => node.value || node.textContent || '')
+            .map((value) => String(value || '').trim())
+            .find(Boolean) || '';
+          const keywordMatched =
+            !expected ||
+            normalizeText(urlKeyword) === expected ||
+            normalizeText(inputKeyword).includes(expected);
+          const signature = cardNodes
+            .slice(0, 8)
+            .map((node) => {
+              const link = node.matches?.('a[href]') ? node : node.querySelector?.('a[href]');
+              return [
+                link?.getAttribute?.('href') || '',
+                node.textContent || '',
+              ].join('|');
+            })
+            .join('||')
+            .slice(0, 2000);
+          return {
+            cardCount: cardNodes.length,
+            keywordMatched,
+            signature,
+          };
+        },
+        args: [platform, keyword],
+      })
+      .then(([result]) => result?.result || null)
+      .catch(() => null);
+
+    const cardCount = Number(snapshot?.cardCount || 0);
+    const signature = String(snapshot?.signature || '');
+    const keywordMatched = Boolean(snapshot?.keywordMatched);
+    // 宽限期内仍要求关键词字面对上(防抢跑、防读到上一个词的旧结果);
+    // 超过宽限期后,只要结果卡片稳定出现就放行,不再因抖音 URL 编码对不上而空等到超时。
+    const keywordMatchGraceElapsed =
+      Date.now() - startedAt >= BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS;
+    const resultsAccepted =
+      cardCount > 0 && (keywordMatched || keywordMatchGraceElapsed);
+    if (
+      resultsAccepted &&
+      signature &&
+      signature === lastSignature &&
+      cardCount === lastCardCount
+    ) {
+      stableCount += 1;
+    } else {
+      stableCount = resultsAccepted ? 1 : 0;
+      lastSignature = signature;
+      lastCardCount = cardCount;
+    }
+
+    if (resultsAccepted && stableCount >= requiredStablePolls) {
+      return true;
+    }
+
+    await waitMsWithStop(
+      Math.min(500, Math.max(100, BATCH_KEYWORD_NAV_POLL_MS)),
+      shouldStop,
+      'BATCH_CAPTURE_CANCELED',
+    );
+  }
+
+  return false;
+}
+
+async function closeKeywordSearchFilterPanelInTab(tabId) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+
+  return chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: async () => {
+        const normalize = (value) =>
+          String(value || '').trim().replace(/\s+/g, '');
+        const isVisible = (node) => {
+          if (!(node instanceof HTMLElement)) {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return (
+            rect.width > 1 &&
+            rect.height > 1 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity || 1) > 0.01
+          );
+        };
+        const panelLabels = [
+          '排序依据',
+          '排序',
+          '发布时间',
+          '笔记类型',
+          '内容形式',
+          '搜索范围',
+          '位置距离',
+          '视频时长',
+        ].map(normalize);
+        const findPanel = () => {
+          const nodes = document.querySelectorAll(
+            '[class*="filter"], [class*="panel"], [class*="dropdown"], [class*="popup"], [class*="overlay"], [class*="screen"], section, aside, div',
+          );
+          for (const node of nodes) {
+            if (!(node instanceof HTMLElement) || !isVisible(node)) {
+              continue;
+            }
+            const text = normalize(node.innerText || node.textContent || '');
+            if (text.length > 2200) {
+              continue;
+            }
+            const hits = panelLabels.filter((label) => text.includes(label)).length;
+            if (hits >= 2) {
+              return node;
+            }
+          }
+          return null;
+        };
+        const clickNode = (node) => {
+          node.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+          node.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+          node.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+        };
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const panel = findPanel();
+        if (!panel) {
+          return true;
+        }
+        const closeTexts = ['收起', '完成', '确定', '关闭'].map(normalize);
+        const candidates = Array.from(
+          document.querySelectorAll('button, [role="button"], a, span, div'),
+        ).map((node) => {
+          if (!(node instanceof HTMLElement) || !isVisible(node)) {
+            return null;
+          }
+          const text = normalize(node.innerText || node.textContent || '');
+          if (!closeTexts.some((label) => text === label || text.includes(label))) {
+            return null;
+          }
+          return (
+            node.closest('button, [role="button"], a, [class*="close"], [class*="fold"], [class*="collapse"]') ||
+            node
+          );
+        }).filter(Boolean);
+        for (const candidate of candidates.slice(0, 6)) {
+          clickNode(candidate);
+          await wait(350);
+          if (!findPanel()) {
+            return true;
+          }
+        }
+        document.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Escape',
+            code: 'Escape',
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+        await wait(350);
+        return !findPanel();
+      },
+    })
+    .then(([result]) => Boolean(result?.result))
+    .catch(() => false);
 }
 
 async function captureInActiveTab({

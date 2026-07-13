@@ -97,6 +97,9 @@ function getDefaultRuntime() {
   return {
     platform: "unknown",
     pageType: PAGE_TYPE.UNKNOWN,
+    detailReady: null,
+    detailReadyReason: "",
+    detailReadyCheckedAt: 0,
     clientUuid: "",
     clientLabel: "",
     appVersion: "2.0.0",

@@ -11,6 +11,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { initDb, closeDb, queryAll, queryOne, execute, getDefaultTenantId } from '../db/init.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
+import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -148,6 +149,8 @@ function legacyRecordToSyncRecord(row) {
   const extractedTitle = String(get('title', 'noteTitle'));
   const extractedContent = String(get('content', 'noteContent', 'fullContent', 'body', 'desc'));
   const extractedAuthor = String(get('author_name', 'authorName', 'author'));
+  const rawPublishTime = String(get('publish_time', 'publishTime', 'publishDate', 'publishDateRaw', 'lastEditedAt'));
+  const publishTime = stripPublishLocation(rawPublishTime) || rawPublishTime;
   const hasStableIdentity = Boolean(
     extractedExternalId || extractedUrl || extractedTitle || extractedContent || get('author_id', 'authorId') || extractedAuthor
   );
@@ -168,7 +171,8 @@ function legacyRecordToSyncRecord(row) {
     comments_count: metric(row.comments_count, 'comments', 'comments', 'commentCount', 'commentsCount', 'comments_count'),
     collects: metric(row.collects, 'collects', 'collects', 'collectCount'),
     shares: metric(row.shares, 'shares', 'shares', 'shareCount', 'reposts', 'repostCount', 'repostsCount', 'reposts_count'),
-    publish_time: String(get('publish_time', 'publishTime', 'publishDate', 'publishDateRaw', 'lastEditedAt')),
+    publish_time: publishTime,
+    publish_location: String(get('publish_location', 'publishLocation', 'region', 'ipLocation', 'ip_location') || extractPublishLocation(rawPublishTime)),
     tags: stringArrayJson(row.tags && row.tags !== '[]' ? row.tags : firstArrayValue(detailPayload.tags, listItem.tags, payload.tags)),
     blogger_profile_url: String(get('blogger_profile_url', 'bloggerProfileUrl', 'authorUrl')),
     image_urls: stringArrayJson(row.image_urls && row.image_urls !== '[]' ? row.image_urls : firstArrayValue(detailPayload.imageUrls, listItem.imageUrls, payload.imageUrls)),

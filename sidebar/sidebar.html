@@ -523,9 +523,21 @@
                   data-detail-setting="skip-captured"
                   checked />
                 <span class="switch-slider" aria-hidden="true"></span>
-                <span class="switch-label">增量采集(跳过已采过的笔记)</span>
+                <span class="switch-label">跳过已增强笔记</span>
               </label>
-              <p class="form-hint">采集增强时自动跳过之前已采过的笔记,减少重复导航、防风控、提速。</p>
+              <p class="form-hint">采集增强时，已完成增强的笔记不再重复打开详情页，减少重复导航、防风控、提速。</p>
+            </div>
+            <div class="form-group incremental-exception-group">
+              <label class="switch-wrap">
+                <input
+                  type="checkbox"
+                  class="switch-input"
+                  data-detail-setting="comment-count-recheck"
+                  checked />
+                <span class="switch-slider" aria-hidden="true"></span>
+                <span class="switch-label">例外：评论数增加时重采评论</span>
+              </label>
+              <p class="form-hint">仅在上方开启且“附加评论”开启时生效：本次列表评论数高于上次增强基线，才重新打开详情补采评论；相同或减少则只更新基础指标。</p>
             </div>
             <div class="form-group">
               <label class="form-label">笔记内容主题筛选</label>
@@ -561,6 +573,16 @@
                 class="detail-enhance-options"
                 data-detail-setting-group="options"
                 hidden>
+                <label class="switch-wrap">
+                  <input
+                    type="checkbox"
+                    class="switch-input"
+                    data-detail-setting="auto-sync" />
+                  <span
+                    class="switch-slider"
+                    aria-hidden="true"></span>
+                  <span class="switch-label">增强后自动同步后台</span>
+                </label>
                 <label class="switch-wrap">
                   <input
                     type="checkbox"
@@ -673,10 +695,126 @@
                 请前往 当前平台的搜索页 以开始采集
               </div>
             </div>
+            <div class="batch-settings-block search-execution-card">
+              <div
+                class="search-execution-tabs"
+                role="tablist"
+                aria-label="搜索采集执行方式">
+                <button
+                  type="button"
+                  class="search-execution-tab is-active"
+                  id="btnSearchExecutionManual"
+                  data-search-execution-mode="manual"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="searchManualExecutionPane">
+                  手动采集
+                </button>
+                <button
+                  type="button"
+                  class="search-execution-tab"
+                  id="btnSearchExecutionPlan"
+                  data-search-execution-mode="plan"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="searchPlanExecutionPane">
+                  无人值守
+                </button>
+              </div>
+
+              <div
+                class="search-execution-pane"
+                id="searchManualExecutionPane"
+                role="tabpanel"
+                aria-labelledby="btnSearchExecutionManual">
+                <div class="batch-settings-head">
+                  手动采集
+                  <span class="batch-settings-sub">立即采集，或设置今天稍晚自动开始一次</span>
+                </div>
+                <label class="batch-field">
+                  <span>当天延迟启动 <span class="batch-settings-sub">留空 = 立即；只对本次手动采集生效</span></span>
+                  <input
+                    type="time"
+                    class="batch-num-input"
+                    id="inputSearchScheduledStart" />
+                </label>
+              </div>
+
+              <div
+                class="search-execution-pane"
+                id="searchPlanExecutionPane"
+                role="tabpanel"
+                aria-labelledby="btnSearchExecutionPlan"
+                hidden>
+                <label class="batch-loop-toggle">
+                  <input type="checkbox" id="chkSearchKeywordPlanEnabled" />
+                  <span class="batch-loop-toggle-text">启用无人值守计划</span>
+                  <span class="batch-settings-sub">按日期和时间自动启动这一组关键词；执行轮数大于 1 即循环</span>
+                </label>
+                <input type="checkbox" id="chkSearchAutoLoop" checked hidden />
+                <div class="batch-field-grid" id="searchKeywordPlanFields">
+                  <label class="batch-field">
+                    <span>运行规则</span>
+                    <select class="batch-select" id="selectSearchKeywordPlanMode">
+                      <option value="daily">每天</option>
+                      <option value="custom_dates">指定日期清单</option>
+                    </select>
+                  </label>
+                  <label class="batch-field">
+                    <span>开始时间</span>
+                    <input type="time" class="batch-num-input" id="inputSearchKeywordPlanStartTime" value="09:00" />
+                  </label>
+                  <label class="batch-field">
+                    <span>随机偏移(分钟)</span>
+                    <input type="number" class="batch-num-input" id="inputSearchKeywordPlanJitterMin" value="20" min="0" max="240" />
+                  </label>
+                </div>
+                <div class="batch-field-grid batch-loop-fields" id="searchLoopFields">
+                  <label class="batch-field">
+                    <span>每轮间隔(分钟)</span>
+                    <input type="number" class="batch-num-input" id="inputSearchLoopGapMin" value="10" min="0" />
+                  </label>
+                  <label class="batch-field">
+                    <span>执行轮数</span>
+                    <input type="number" class="batch-num-input" id="inputSearchLoopRounds" value="1" min="1" />
+                  </label>
+                </div>
+                <div class="batch-field keyword-plan-date-field" id="searchKeywordPlanCustomDatesGroup" hidden>
+                  <span>运行日期 <span class="batch-settings-sub">可按调休/假期自由添加</span></span>
+                  <div class="keyword-plan-date-row">
+                    <input
+                      type="date"
+                      class="batch-num-input"
+                      id="inputSearchKeywordPlanDatePicker" />
+                    <button
+                      type="button"
+                      class="btn btn-secondary btn-sm"
+                      id="btnAddSearchKeywordPlanDate">
+                      添加日期
+                    </button>
+                  </div>
+                  <div
+                    class="keyword-plan-date-chips"
+                    id="searchKeywordPlanDateChips"
+                    aria-live="polite"></div>
+                  <textarea
+                    class="form-input batch-plan-textarea"
+                    id="textareaSearchKeywordPlanCustomDates"
+                    placeholder="2026-07-07&#10;2026-07-08"
+                    hidden></textarea>
+                </div>
+                <div class="batch-schedule-actions">
+                  <button type="button" class="btn btn-secondary btn-sm" id="btnSaveSearchKeywordPlan">
+                    保存计划
+                  </button>
+                  <span class="batch-schedule-status" id="searchKeywordPlanStatus">计划未启用</span>
+                </div>
+              </div>
+            </div>
             <label class="batch-loop-toggle" style="margin-bottom: 10px;">
               <input type="checkbox" id="chkSearchBatchMode" />
               <span class="batch-loop-toggle-text">批量多个关键词</span>
-              <span class="batch-settings-sub">勾选 = 输入多个词逐个采;不勾 = 采当前搜索页</span>
+              <span class="batch-settings-sub">勾选 = 输入多个词逐个采；不勾 = 采当前搜索页</span>
             </label>
             <div class="form-group" id="searchSingleKeywordGroup">
               <label class="form-label">当前搜索关键词（自动读取）</label>
@@ -758,57 +896,58 @@
                     data-detail-setting="skip-captured"
                     checked />
                   <span class="switch-slider" aria-hidden="true"></span>
-                  <span class="switch-label">增量采集(跳过已采过的笔记)</span>
+                  <span class="switch-label">跳过已增强笔记</span>
                 </label>
-                <p class="form-hint">采集增强时自动跳过之前已采过的笔记,减少重复导航、防风控、提速。</p>
+                <p class="form-hint">采集增强时，已完成增强的笔记不再重复打开详情页，减少重复导航、防风控、提速。</p>
+              </div>
+              <div class="form-group incremental-exception-group">
+                <label class="switch-wrap">
+                  <input
+                    type="checkbox"
+                    class="switch-input"
+                    data-detail-setting="comment-count-recheck"
+                    checked />
+                  <span class="switch-slider" aria-hidden="true"></span>
+                  <span class="switch-label">例外：评论数增加时重采评论</span>
+                </label>
+                <p class="form-hint">仅在上方开启且“附加评论”开启时生效：本次列表评论数高于上次增强基线，才重新打开详情补采评论；相同或减少则只更新基础指标。</p>
               </div>
               <div class="form-group batch-settings">
                 <div class="batch-settings-block">
                   <div class="batch-settings-head">
                     采集排序 / 范围
-                    <span class="batch-settings-sub">小红书 / 抖音通用 · 采集前自动切换</span>
+                    <span class="batch-settings-sub" id="searchFilterPlatformHint">按当前平台显示可用筛选 · 采集前自动切换</span>
                   </div>
                   <div class="batch-field-grid">
                     <label class="batch-field">
                       <span>排序</span>
                       <select class="batch-select" id="selectSearchSort">
-                        <option value="comprehensive">综合(默认)</option>
-                        <option value="latest">最新</option>
-                        <option value="likes">最多点赞</option>
-                        <option value="comments">最多评论</option>
-                        <option value="collects">最多收藏</option>
                       </select>
                     </label>
                     <label class="batch-field">
                       <span>发布时间</span>
                       <select class="batch-select" id="selectSearchPublishTime">
-                        <option value="all">不限(默认)</option>
-                        <option value="day">一天内</option>
-                        <option value="week">一周内</option>
-                        <option value="month">一月内</option>
-                        <option value="halfyear">半年内</option>
                       </select>
                     </label>
-                  </div>
-                </div>
-                <div class="batch-settings-block">
-                  <label class="batch-field">
-                    <span>定时启动 <span class="batch-settings-sub">留空 = 立即;指定则到点才开跑</span></span>
-                    <input type="datetime-local" class="batch-num-input" id="inputSearchScheduledStart" />
-                  </label>
-                  <label class="batch-loop-toggle">
-                    <input type="checkbox" id="chkSearchAutoLoop" />
-                    <span class="batch-loop-toggle-text">🌙 无人值守循环</span>
-                    <span class="batch-settings-sub">跑完一轮自动再跑 · 供专机夜间采集</span>
-                  </label>
-                  <div class="batch-field-grid batch-loop-fields is-disabled" id="searchLoopFields">
-                    <label class="batch-field">
-                      <span>每轮间隔(分钟)</span>
-                      <input type="number" class="batch-num-input" id="inputSearchLoopGapMin" value="10" min="0" />
+                    <label class="batch-field" id="searchContentTypeField">
+                      <span id="searchContentTypeLabel">内容类型</span>
+                      <select class="batch-select" id="selectSearchContentType">
+                      </select>
                     </label>
-                    <label class="batch-field">
-                      <span>循环轮数</span>
-                      <input type="number" class="batch-num-input" id="inputSearchLoopRounds" placeholder="留空 = 1 轮" min="1" />
+                    <label class="batch-field" id="searchScopeField">
+                      <span>搜索范围</span>
+                      <select class="batch-select" id="selectSearchScope">
+                      </select>
+                    </label>
+                    <label class="batch-field" id="searchDistanceField">
+                      <span>位置距离</span>
+                      <select class="batch-select" id="selectSearchDistance">
+                      </select>
+                    </label>
+                    <label class="batch-field" id="searchVideoDurationField">
+                      <span>视频时长</span>
+                      <select class="batch-select" id="selectSearchVideoDuration">
+                      </select>
                     </label>
                   </div>
                 </div>
@@ -834,6 +973,16 @@
                   class="detail-enhance-options"
                   data-detail-setting-group="options"
                   hidden>
+                  <label class="switch-wrap">
+                    <input
+                      type="checkbox"
+                      class="switch-input"
+                      data-detail-setting="auto-sync" />
+                    <span
+                      class="switch-slider"
+                      aria-hidden="true"></span>
+                    <span class="switch-label">增强后自动同步后台</span>
+                  </label>
                   <label class="switch-wrap">
                     <input
                       type="checkbox"
@@ -917,7 +1066,7 @@
             </div>
 
             <!-- ========== 搜索采集卡片 (单采集 + 批量入口) ========== -->
-            <div class="action-row">
+            <div class="action-row" id="searchManualActionRow">
               <button
                 class="btn btn-primary btn-grow is-disabled"
                 id="btnCaptureSearch"
@@ -2381,50 +2530,88 @@
               <div class="batch-settings-block">
                 <div class="batch-settings-head">
                   采集排序 / 范围
-                  <span class="batch-settings-sub">小红书 / 抖音通用 · 采集前自动切换</span>
+                  <span class="batch-settings-sub" id="batchFilterPlatformHint">按当前平台显示可用筛选 · 采集前自动切换</span>
                 </div>
                 <div class="batch-field-grid">
                   <label class="batch-field">
                     <span>排序</span>
                     <select class="batch-select" id="selectBatchSort">
-                      <option value="comprehensive">综合(默认)</option>
-                      <option value="latest">最新</option>
-                      <option value="likes">最多点赞</option>
-                      <option value="comments">最多评论</option>
-                      <option value="collects">最多收藏</option>
                     </select>
                   </label>
                   <label class="batch-field">
                     <span>发布时间</span>
                     <select class="batch-select" id="selectBatchPublishTime">
-                      <option value="all">不限(默认)</option>
-                      <option value="day">一天内</option>
-                      <option value="week">一周内</option>
-                      <option value="month">一月内</option>
-                      <option value="halfyear">半年内</option>
+                    </select>
+                  </label>
+                  <label class="batch-field" id="batchContentTypeField">
+                    <span id="batchContentTypeLabel">内容类型</span>
+                    <select class="batch-select" id="selectBatchContentType">
+                    </select>
+                  </label>
+                  <label class="batch-field" id="batchScopeField">
+                    <span>搜索范围</span>
+                    <select class="batch-select" id="selectBatchScope">
+                    </select>
+                  </label>
+                  <label class="batch-field" id="batchDistanceField">
+                    <span>位置距离</span>
+                    <select class="batch-select" id="selectBatchDistance">
+                    </select>
+                  </label>
+                  <label class="batch-field" id="batchVideoDurationField">
+                    <span>视频时长</span>
+                    <select class="batch-select" id="selectBatchVideoDuration">
                     </select>
                   </label>
                 </div>
               </div>
               <div class="batch-settings-block">
                 <label class="batch-field">
-                  <span>定时启动 <span class="batch-settings-sub">留空 = 立即;指定则到点才开跑(配合无人值守=夜里定点开采)</span></span>
+                  <span>手动延迟启动 <span class="batch-settings-sub">留空 = 立即；只对点击“开始批量采集”的这一次生效</span></span>
                   <input type="datetime-local" class="batch-num-input" id="inputBatchScheduledStart" />
                 </label>
                 <label class="batch-loop-toggle">
-                  <input type="checkbox" id="chkAutoLoop" />
-                  <span class="batch-loop-toggle-text">🌙 无人值守循环</span>
-                  <span class="batch-settings-sub">跑完一轮自动再跑 · 供专机夜间采集</span>
+                  <input type="checkbox" id="chkKeywordPlanEnabled" />
+                  <span class="batch-loop-toggle-text">无人值守计划</span>
+                  <span class="batch-settings-sub">按日期和时间自动启动这一组关键词；执行轮数大于 1 即循环</span>
                 </label>
-                <div class="batch-field-grid batch-loop-fields is-disabled" id="batchLoopFields">
+                <input type="checkbox" id="chkAutoLoop" checked hidden />
+                <div class="batch-field-grid" id="keywordPlanFields">
+                  <label class="batch-field">
+                    <span>运行规则</span>
+                    <select class="batch-select" id="selectKeywordPlanMode">
+                      <option value="daily">每天</option>
+                      <option value="custom_dates">指定日期清单</option>
+                    </select>
+                  </label>
+                  <label class="batch-field">
+                    <span>开始时间</span>
+                    <input type="time" class="batch-num-input" id="inputKeywordPlanStartTime" value="09:00" />
+                  </label>
+                  <label class="batch-field">
+                    <span>随机偏移(分钟)</span>
+                    <input type="number" class="batch-num-input" id="inputKeywordPlanJitterMin" value="20" min="0" max="240" />
+                  </label>
+                </div>
+                <div class="batch-field-grid batch-loop-fields" id="batchLoopFields">
                   <label class="batch-field">
                     <span>每轮间隔(分钟)</span>
                     <input type="number" class="batch-num-input" id="inputLoopGapMin" value="10" min="0" />
                   </label>
                   <label class="batch-field">
-                    <span>循环轮数</span>
-                    <input type="number" class="batch-num-input" id="inputLoopRounds" placeholder="留空 = 1 轮" min="1" />
+                    <span>执行轮数</span>
+                    <input type="number" class="batch-num-input" id="inputLoopRounds" value="1" min="1" />
                   </label>
+                </div>
+                <label class="batch-field keyword-plan-date-field" id="keywordPlanCustomDatesGroup" hidden>
+                  <span>运行日期 <span class="batch-settings-sub">每行一个 YYYY-MM-DD，可按调休/假期自由添加</span></span>
+                  <textarea class="form-input batch-plan-textarea" id="textareaKeywordPlanCustomDates" placeholder="2026-07-07&#10;2026-07-08"></textarea>
+                </label>
+                <div class="batch-schedule-actions">
+                  <button type="button" class="btn btn-secondary btn-sm" id="btnSaveKeywordPlan">
+                    保存计划
+                  </button>
+                  <span class="batch-schedule-status" id="keywordPlanStatus">计划未启用</span>
                 </div>
               </div>
             </div>

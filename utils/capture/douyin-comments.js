@@ -93,6 +93,16 @@ const DETAIL_TAB_CANDIDATE_SELECTORS = Object.freeze([
   "div",
 ]);
 
+const NON_COMMENT_RECOMMENDATION_LABEL_PATTERN =
+  /^(相关推荐|大家都在搜|大家还在搜|相关搜索|热门搜索|猜你想搜|相关视频|更多视频|TA的作品|更多作品|看过还看)/;
+
+const NON_COMMENT_DETAIL_LINK_SELECTORS = Object.freeze([
+  'a[href*="/video/"]',
+  'a[href*="/note/"]',
+  'a[href*="/search/"]',
+  'a[href*="/hashtag/"]',
+]);
+
 const DOUYIN_AUTHOR_ENTRY_SELECTORS = Object.freeze([
   'img.fiWP27dC',
   '[data-click-from="click_icon"] img.fiWP27dC',
@@ -2506,10 +2516,13 @@ function appendExtractedCommentsFromCandidates(
     }
     incrementCommentDiagnostic(captureContext, "extractedCount", 1);
     const comment = extraction.comment;
-    const existing = commentsMap.get(comment.key);
+    const existingKey =
+      (commentsMap.has(comment.key) && comment.key) ||
+      findExistingCommentKeyBySemantic(commentsMap, comment.semanticKey);
+    const existing = existingKey ? commentsMap.get(existingKey) : null;
     if (existing) {
       if (scoreExtractedCommentData(comment.data) > scoreExtractedCommentData(existing)) {
-        commentsMap.set(comment.key, comment.data);
+        commentsMap.set(existingKey, comment.data);
         incrementCommentDiagnostic(captureContext, "updatedCount", 1);
       }
       continue;
@@ -2753,6 +2766,9 @@ function evaluateLikelyCommentEntryNode(
   if (looksLikeRecommendationContentCardNode(node, text)) {
     return {score: 0, rejectReason: "recommendation_content_card"};
   }
+  if (looksLikeNonCommentRecommendationContext(node, text)) {
+    return {score: 0, rejectReason: "non_comment_recommendation_context"};
+  }
   if (looksLikePrivateMessageNode(node)) {
     return {score: 0, rejectReason: "private_message_like"};
   }
@@ -2950,6 +2966,13 @@ function extractCommentDetailed(node, scene = COMMENT_SCENE.DETAIL_BOTTOM) {
       reasonBucket: COMMENT_DIAGNOSTIC_REASON_BUCKET.NODE,
     };
   }
+  if (looksLikeNonCommentRecommendationContext(node)) {
+    return {
+      comment: null,
+      rejectReason: "non_comment_recommendation_context",
+      reasonBucket: COMMENT_DIAGNOSTIC_REASON_BUCKET.NODE,
+    };
+  }
   if (looksLikePrivateMessageNode(node)) {
     return {
       comment: null,
@@ -3004,19 +3027,33 @@ function extractCommentDetailed(node, scene = COMMENT_SCENE.DETAIL_BOTTOM) {
 
   const commentId = resolveCommentId(node, content, userId, likes);
   const semanticKey = resolveCommentSemanticKey({
-    commentId,
+    commentId: "",
     userId,
     userName,
     content,
     publishTime,
     ipLocation,
     isReply: isReplyNode(node),
+    preferDirectId: false,
   });
-  const key = semanticKey || commentId || `${userId || "anonymous"}|${content}`;
+  const key =
+    resolveCommentSemanticKey({
+      commentId,
+      userId,
+      userName,
+      content,
+      publishTime,
+      ipLocation,
+      isReply: isReplyNode(node),
+    }) ||
+    semanticKey ||
+    commentId ||
+    `${userId || "anonymous"}|${content}`;
 
   return {
     comment: {
       key,
+      semanticKey,
       data: {
         commentId,
         userName,
@@ -3079,7 +3116,7 @@ function extractCommentUserName(
     if (!(element instanceof Element) || !isElementVisible(element)) {
       return;
     }
-    const text = cleanText(element.textContent || "");
+    const text = normalizeCommentUserNameText(element.textContent || "");
     if (!text) {
       return;
     }
@@ -3205,7 +3242,7 @@ function extractCommentContentDetailed(
 
 function inferCommentUserNameFromText(node) {
   const texts = Array.from(node.querySelectorAll('a[href*="/user/"], span, div, p'))
-    .map((child) => cleanText(child.textContent || ""))
+    .map((child) => normalizeCommentUserNameText(child.textContent || ""))
     .filter(Boolean);
   const ranked = texts
     .map((text) => ({
@@ -3259,7 +3296,7 @@ function collectCommentTextCandidates(node) {
     if (!(element instanceof Element) || !isUsableCommentTextElement(element, node)) {
       return;
     }
-    if (element.querySelector('a[href*="/user/"]')) {
+    if (looksLikeCommentIdentityElement(element, node)) {
       return;
     }
     const text = cleanText(element.textContent || "");
@@ -3610,7 +3647,17 @@ function looksLikeRecommendationPlaybackNode(node, rawText = "") {
   const hasReplySignals = /回复|展开\d+条回复/.test(text);
   const hasCommentHeading = /全部评论|留下你的精彩评论吧|评论区/.test(text);
   const hasManyMedia = (node?.querySelectorAll?.("img").length || 0) >= 1;
+  const hasPrimaryWorkInfo =
+    node?.matches?.('[data-e2e="video-info"]') ||
+    Boolean(
+      node?.querySelector?.(
+        'video, [data-e2e="video-desc"], [data-e2e="video-player-digg"], [data-e2e="feed-comment-icon"]',
+      ),
+    );
 
+  if (hasPrimaryWorkInfo && !hasReplySignals && !hasCommentHeading) {
+    return true;
+  }
   if ((hasDuration || hasPlayback) && !hasReplySignals && hasManyMedia) {
     return true;
   }
@@ -3660,6 +3707,158 @@ function looksLikeRecommendationContentCardNode(node, rawText = "") {
   }
 
   return false;
+}
+
+function looksLikeNonCommentRecommendationContext(node, rawText = "") {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+  if (node.closest?.('[data-comment-id], [data-e2e*="comment-item"]')) {
+    return false;
+  }
+
+  const text = cleanText(rawText || node.innerText || node.textContent || "");
+  const normalized = text.replace(/\s+/g, "");
+  const hasReplySignals = /回复|展开\d+条回复|作者回复过/.test(text);
+  const hasCommentSurfaceLabel = /全部评论|评论区|留下你的精彩评论吧/.test(text);
+
+  if (
+    !hasReplySignals &&
+    NON_COMMENT_RECOMMENDATION_LABEL_PATTERN.test(normalized)
+  ) {
+    return true;
+  }
+
+  if (!hasReplySignals && hasNonCommentDetailLinks(node)) {
+    return true;
+  }
+
+  if (!hasReplySignals && hasNearbyNonCommentRecommendationHeading(node)) {
+    return true;
+  }
+
+  return (
+    !hasReplySignals &&
+    !hasCommentSurfaceLabel &&
+    hasRecommendationContainerAttributes(node)
+  );
+}
+
+function hasNonCommentDetailLinks(node) {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+  if (node.querySelector?.('[placeholder*="评论"]')) {
+    return false;
+  }
+  return queryWithinOrSelf(node, NON_COMMENT_DETAIL_LINK_SELECTORS).some(
+    (element) => element instanceof Element && isElementVisible(element),
+  );
+}
+
+function hasNearbyNonCommentRecommendationHeading(node) {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+
+  const nodeRect = safeRect(node);
+  let current = node.parentElement;
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    if (!(current instanceof Element) || !isElementVisible(current)) {
+      current = current?.parentElement || null;
+      continue;
+    }
+
+    const headings = Array.from(current.children || []).filter((child) => {
+      if (!(child instanceof Element) || child.contains(node)) {
+        return false;
+      }
+      const childText = cleanText(child.textContent || "").replace(/\s+/g, "");
+      return NON_COMMENT_RECOMMENDATION_LABEL_PATTERN.test(childText);
+    });
+
+    const headingBeforeNode = headings.some((heading) => {
+      const headingRect = safeRect(heading);
+      return headingRect.top <= nodeRect.top + 4;
+    });
+    if (headingBeforeNode) {
+      return true;
+    }
+
+    current = current.parentElement;
+  }
+
+  return false;
+}
+
+function hasRecommendationContainerAttributes(node) {
+  let current = node instanceof Element ? node : null;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    const attrs = [
+      current.getAttribute?.("data-e2e") || "",
+      current.getAttribute?.("aria-label") || "",
+      current.getAttribute?.("role") || "",
+      current.id || "",
+      typeof current.className === "string" ? current.className : "",
+    ].join(" ");
+    if (/recommend|related|suggest|search|aweme|waterfall/i.test(attrs)) {
+      return true;
+    }
+    current = current.parentElement;
+  }
+  return false;
+}
+
+function looksLikeCommentIdentityElement(element, rootNode) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+
+  if (
+    element.matches?.('a[href*="/user/"]') ||
+    element.closest?.('a[href*="/user/"]') ||
+    element.querySelector?.('a[href*="/user/"]')
+  ) {
+    return true;
+  }
+
+  const attrs = [
+    element.getAttribute?.("data-e2e") || "",
+    element.getAttribute?.("data-click-from") || "",
+    element.getAttribute?.("href") || "",
+    typeof element.className === "string" ? element.className : "",
+  ].join(" ");
+  if (
+    /comment-content|CommentContent|body-text|JrWL1Ykc|C7LroK_h|WFJiGxr7/i.test(
+      attrs,
+    )
+  ) {
+    return false;
+  }
+  if (/comment-user|CommentUser|nickname|user-name|name-|JS0ztEHa|BT7MlqJC|title/i.test(attrs)) {
+    return true;
+  }
+
+  const text = cleanText(element.textContent || "");
+  if (!text || !(rootNode instanceof Element)) {
+    return false;
+  }
+  const normalizedText = normalizeCommentUserNameText(text);
+  if (!normalizedText || normalizedText !== text) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeCommentUserNameText(rawText) {
+  let text = cleanText(rawText || "");
+  if (!text || text === "作者") {
+    return "";
+  }
+  if (text.length > 2) {
+    text = text.replace(/\s*作者$/, "").trim();
+  }
+  return text;
 }
 
 function isLikelyNonCommentContentRecord({
@@ -3718,9 +3917,10 @@ function resolveCommentSemanticKey({
   publishTime = "",
   ipLocation = "",
   isReply = false,
+  preferDirectId = true,
 } = {}) {
   const directId = cleanText(commentId);
-  if (directId) {
+  if (preferDirectId && directId) {
     return `id:${directId}`;
   }
 
@@ -3736,6 +3936,31 @@ function resolveCommentSemanticKey({
     "anonymous";
   const time = cleanText(publishTime) || "";
   return `${isReply ? "reply" : "comment"}|${identity}|${normalizedContent}|${time}`;
+}
+
+function findExistingCommentKeyBySemantic(commentsMap, semanticKey = "") {
+  const normalized = cleanText(semanticKey);
+  if (!normalized || !(commentsMap instanceof Map)) {
+    return "";
+  }
+
+  for (const [key, item] of commentsMap.entries()) {
+    const existingSemanticKey = resolveCommentSemanticKey({
+      commentId: "",
+      userId: item?.userId || "",
+      userName: item?.userName || "",
+      content: item?.content || "",
+      publishTime: item?.publishTime || "",
+      ipLocation: item?.ipLocation || "",
+      isReply: Boolean(item?.isReply),
+      preferDirectId: false,
+    });
+    if (existingSemanticKey && existingSemanticKey === normalized) {
+      return key;
+    }
+  }
+
+  return "";
 }
 
 function normalizeCommentSemanticText(text) {

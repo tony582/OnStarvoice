@@ -57,6 +57,7 @@ const PURCHASE_LINK_PHRASES = Object.freeze([
 ]);
 const TOAST_DEFAULT_DURATION_MS = 7000;
 const TOAST_FADE_OUT_DURATION_MS = 300;
+const NOTE_DETAIL_LOADING_TEXT = "正在等待笔记内容加载完成，请等页面不再显示“加载中”后再采集";
 
 function isUnclaimedCredentialOwner(authConfig) {
   if (authConfig?.status !== AUTH_STATUS.VERIFIED) {
@@ -74,6 +75,14 @@ function isUnclaimedCredentialOwner(authConfig) {
     ownerEmail === UNCLAIMED_CREDENTIAL_OWNER_EMAIL.toLowerCase() ||
     ownerName === UNCLAIMED_CREDENTIAL_OWNER_NAME.toLowerCase()
   );
+}
+
+function resolveNoteDetailPendingText(runtimeConfig = {}) {
+  const reason = String(runtimeConfig.detailReadyReason || "").trim();
+  if (reason === "loading") {
+    return NOTE_DETAIL_LOADING_TEXT;
+  }
+  return "正在等待笔记标题、正文或素材加载完成，加载完成后即可采集";
 }
 
 function initInstantTooltips() {
@@ -905,6 +914,7 @@ document.addEventListener("DOMContentLoaded", () => {
       expectedPageType,
       readyText,
       wrongPageText,
+      options = {},
     ) => {
       if (!hintEl || !btnEl) return;
 
@@ -919,13 +929,24 @@ document.addEventListener("DOMContentLoaded", () => {
         pageType === expectedPageType &&
         currentPagePlatform === expectedPlatform
       ) {
-        guidanceContent.textContent = readyText;
-        guidanceCallout.style.color = "var(--status-success)";
-        guidanceCallout.style.background = "rgba(0, 185, 107, 0.08)";
-        guidanceCallout.style.borderColor = "rgba(0, 185, 107, 0.2)";
-        guidanceIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check-circle"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>`;
-        btnEl.disabled = false;
-        btnEl.classList.remove("is-disabled");
+        const extraReady = options.ready !== false;
+        if (extraReady) {
+          guidanceContent.textContent = readyText;
+          guidanceCallout.style.color = "var(--status-success)";
+          guidanceCallout.style.background = "rgba(0, 185, 107, 0.08)";
+          guidanceCallout.style.borderColor = "rgba(0, 185, 107, 0.2)";
+          guidanceIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check-circle"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>`;
+          btnEl.disabled = false;
+          btnEl.classList.remove("is-disabled");
+        } else {
+          btnEl.disabled = true;
+          btnEl.classList.add("is-disabled");
+          guidanceCallout.style.background = "rgba(245, 158, 11, 0.1)";
+          guidanceCallout.style.borderColor = "rgba(245, 158, 11, 0.2)";
+          guidanceCallout.style.color = "var(--status-warning)";
+          guidanceIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-info"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>`;
+          guidanceContent.textContent = options.pendingText || wrongPageText;
+        }
       } else {
         btnEl.disabled = true;
         btnEl.classList.add("is-disabled");
@@ -947,6 +968,10 @@ document.addEventListener("DOMContentLoaded", () => {
       PAGE_TYPE.NOTE_DETAIL,
       pagePlatformCopy.noteReadyText,
       pagePlatformCopy.noteWrongText,
+      {
+        ready: runtimeConfig.detailReady !== false,
+        pendingText: resolveNoteDetailPendingText(runtimeConfig),
+      },
     );
 
     updateGuidance(
@@ -2166,7 +2191,68 @@ function getHydratedSingleNotePayload(record) {
   if (!payload.detailPayload || typeof payload.detailPayload !== "object") {
     return null;
   }
-  return payload.detailPayload;
+  const listItem =
+    Array.isArray(payload.items) && payload.items[0] && typeof payload.items[0] === "object"
+      ? payload.items[0]
+      : {};
+  const detailPayload = payload.detailPayload;
+  const fallbackImageUrls = collectHydratedMediaUrls(
+    detailPayload.imageUrls,
+    detailPayload.images,
+    listItem.imageUrls,
+    listItem.images,
+    listItem.cardImageCandidates,
+    listItem.coverImageUrl,
+    listItem.coverUrl,
+    listItem.coverImage,
+    listItem.cover,
+  );
+  const fallbackCover =
+    normalizeHydratedMediaUrl(detailPayload.coverImageUrl) ||
+    normalizeHydratedMediaUrl(detailPayload.coverUrl) ||
+    normalizeHydratedMediaUrl(detailPayload.coverImage) ||
+    fallbackImageUrls[0] ||
+    "";
+  const imageUrls = collectHydratedMediaUrls(
+    fallbackCover,
+    detailPayload.imageUrls,
+    detailPayload.images,
+    fallbackImageUrls,
+  );
+
+  return {
+    ...listItem,
+    ...detailPayload,
+    coverImageUrl: fallbackCover,
+    imageUrls,
+  };
+}
+
+function collectHydratedMediaUrls(...sources) {
+  const out = [];
+  const seen = new Set();
+  const append = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    const normalized = normalizeHydratedMediaUrl(value);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  sources.forEach(append);
+  return out;
+}
+
+function normalizeHydratedMediaUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("//")) return `https:${raw}`;
+  if (/^http:\/\//i.test(raw)) return raw.replace(/^http:\/\//i, "https://");
+  return /^https:\/\//i.test(raw) ? raw : "";
 }
 
 function formatMetricDisplay(value, {captured = true} = {}) {
@@ -2266,21 +2352,42 @@ function resolveKeywordGroupDescriptor(record) {
     typeof payload.items[0] === "object"
       ? payload.items[0]
       : {};
-  const keyword =
-    [
-      payload.keyword,
-      payload.searchKeyword,
-      firstItem.keyword,
-      firstItem.searchKeyword,
-    ]
-      .map((item) => String(item || "").trim())
-      .find(Boolean) || "未识别关键词";
-  const key = normalizeGroupNameKey(keyword) || `keyword:${record?.id || "unknown"}`;
-
-  return {
-    key,
-    label: keyword,
+  const candidates = [
+    payload.keyword,
+    payload.searchKeyword,
+    payload.matchedKeyword,
+    payload.matchedKeywords,
+    payload.keywords,
+    firstItem.keyword,
+    firstItem.searchKeyword,
+    firstItem.matchedKeyword,
+    firstItem.matchedKeywords,
+  ];
+  const keywords = [];
+  const seen = new Set();
+  const appendKeyword = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(appendKeyword);
+      return;
+    }
+    const keyword = String(value || "").trim();
+    const key = normalizeGroupNameKey(keyword);
+    if (!keyword || !key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    keywords.push(keyword);
   };
+  candidates.forEach(appendKeyword);
+
+  if (keywords.length === 0) {
+    keywords.push("未识别关键词");
+  }
+
+  return keywords.map((keyword) => ({
+    key: normalizeGroupNameKey(keyword) || `keyword:${record?.id || "unknown"}`,
+    label: keyword,
+  }));
 }
 
 function buildGroupedRecords(records, descriptorResolver, groupType = "group") {
@@ -2301,45 +2408,59 @@ function buildGroupedRecords(records, descriptorResolver, groupType = "group") {
       return;
     }
 
-    const descriptor = descriptorResolver(record);
-    const normalizedName = normalizeGroupNameKey(descriptor.label);
-    let group = recordsByIdentity.get(descriptor.key);
-    if (!group && normalizedName) {
-      group = groupsByName.get(normalizedName);
-    }
+    const descriptors = []
+      .concat(descriptorResolver(record) || [])
+      .filter((descriptor) => descriptor && typeof descriptor === "object");
+    const usedGroupKeysForRecord = new Set();
 
-    if (!group) {
-      group = {
-        identity: descriptor.key || `${groupType}:${record?.id || groups.length}`,
-        label: descriptor.label || "未命名分组",
-        profileRecords: [],
-        noteRecords: [],
-      };
-      groups.push(group);
-      recordsByIdentity.set(group.identity, group);
-      if (normalizedName) {
-        groupsByName.set(normalizedName, group);
+    descriptors.forEach((descriptor) => {
+      const normalizedName = normalizeGroupNameKey(descriptor.label);
+      let group = recordsByIdentity.get(descriptor.key);
+      if (!group && normalizedName) {
+        group = groupsByName.get(normalizedName);
       }
-    } else {
-      if (
-        String(group.label || "").trim() === "未知博主" &&
-        String(descriptor.label || "").trim()
-      ) {
-        group.label = descriptor.label;
-      }
-      if (descriptor.key && !recordsByIdentity.has(descriptor.key)) {
-        recordsByIdentity.set(descriptor.key, group);
-      }
-      if (normalizedName && !groupsByName.has(normalizedName)) {
-        groupsByName.set(normalizedName, group);
-      }
-    }
 
-    if (type === "blogger_profile") {
-      group.profileRecords.push(record);
-      return;
-    }
-    group.noteRecords.push(record);
+      if (!group) {
+        group = {
+          identity: descriptor.key || `${groupType}:${record?.id || groups.length}`,
+          label: descriptor.label || "未命名分组",
+          profileRecords: [],
+          noteRecords: [],
+        };
+        groups.push(group);
+        recordsByIdentity.set(group.identity, group);
+        if (normalizedName) {
+          groupsByName.set(normalizedName, group);
+        }
+      } else {
+        if (
+          String(group.label || "").trim() === "未知博主" &&
+          String(descriptor.label || "").trim()
+        ) {
+          group.label = descriptor.label;
+        }
+        if (descriptor.key && !recordsByIdentity.has(descriptor.key)) {
+          recordsByIdentity.set(descriptor.key, group);
+        }
+        if (normalizedName && !groupsByName.has(normalizedName)) {
+          groupsByName.set(normalizedName, group);
+        }
+      }
+
+      const groupKey = String(group.identity || normalizedName || "").trim();
+      if (groupKey && usedGroupKeysForRecord.has(groupKey)) {
+        return;
+      }
+      if (groupKey) {
+        usedGroupKeysForRecord.add(groupKey);
+      }
+
+      if (type === "blogger_profile") {
+        group.profileRecords.push(record);
+        return;
+      }
+      group.noteRecords.push(record);
+    });
   });
 
   return {groups, otherRecords};

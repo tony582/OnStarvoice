@@ -807,6 +807,7 @@ function renderObservationPanel(record, observations) {
         ${infoItem('关键词', record.keyword || '-')}
         ${infoItem('内容类型', noteTypeLabel(record.note_type) || '-')}
         ${infoItem('发布时间', record.publish_time || '-')}
+        ${infoItem('发布位置', record.publish_location || '-')}
         ${infoItem('首次发现', date(record.first_seen_at))}
         ${infoItem('最近采集', date(record.last_seen_at || record.created_at))}
         ${infoItem('采集次数', `${n(record.seen_count)} 次`)}
@@ -1191,6 +1192,7 @@ function authorMeta(record) {
   const parts = [];
   if (record.author_fans) parts.push(`粉丝 ${n(record.author_fans)}`);
   if (record.publish_time) parts.push(record.publish_time);
+  if (record.publish_location) parts.push(record.publish_location);
   if (record.last_seen_at || record.created_at) parts.push(`采集 ${date(record.last_seen_at || record.created_at)}`);
   return parts.join(' · ') || '暂无作者补充信息';
 }

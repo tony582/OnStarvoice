@@ -272,6 +272,7 @@ function showRecordDetail(idx) {
     ['评论采集条数', r.comments_total_captured > 0 ? String(r.comments_total_captured) : '-'],
     ['采集时间', formatDateTime(r.capture_timestamp || r.created_at)],
     ['笔记编辑时间', escHtml(r.publish_time || '-')],
+    ['发布位置', escHtml(r.publish_location || '-')],
     ['搜索关键词', escHtml(r.keyword || '-')],
   ];
 

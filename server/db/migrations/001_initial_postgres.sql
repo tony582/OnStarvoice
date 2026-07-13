@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS records (
   collects INTEGER NOT NULL DEFAULT 0,
   shares INTEGER NOT NULL DEFAULT 0,
   publish_time TEXT NOT NULL DEFAULT '',
+  publish_location TEXT NOT NULL DEFAULT '',
   tags JSONB NOT NULL DEFAULT '[]'::jsonb,
   blogger_profile_url TEXT NOT NULL DEFAULT '',
   image_urls JSONB NOT NULL DEFAULT '[]'::jsonb,

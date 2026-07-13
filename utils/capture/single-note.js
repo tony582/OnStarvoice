@@ -1069,7 +1069,7 @@ function extractLastEditedAt(noteContext = document) {
   );
   if (!dateElement) {
     console.warn("[SingleNote] Publish date element not found");
-    return Date.now(); // 使用当前时间作为兜底
+    return "";
   }
 
   const dateText = cleanText(dateElement.textContent);
@@ -1077,8 +1077,8 @@ function extractLastEditedAt(noteContext = document) {
 
   const timestamp = parseLastEditedTimestamp(dateText);
   if (!Number.isFinite(timestamp)) {
-    console.warn("[SingleNote] Last edited parse failed, using current time");
-    return Date.now();
+    console.warn("[SingleNote] Last edited parse failed");
+    return "";
   }
 
   console.log("[SingleNote] Final last edited timestamp:", timestamp);
@@ -1093,8 +1093,54 @@ function parseLastEditedTimestamp(rawText) {
     .trim();
   const now = new Date();
 
+  // YYYY-MM-DD / YYYY年MM月DD日, 可带时间和 IP 属地。
+  let match = text.match(
+    /(20\d{2})[年\-/\.](\d{1,2})[月\-/\.](\d{1,2})日?(?:\s*(\d{1,2})[:：](\d{2}))?/,
+  );
+  if (match) {
+    const [, y, m, d, hh = "0", mm = "0"] = match;
+    return createPublishDateTimestamp(
+      Number.parseInt(y, 10),
+      Number.parseInt(m, 10),
+      Number.parseInt(d, 10),
+      Number.parseInt(hh, 10),
+      Number.parseInt(mm, 10),
+    );
+  }
+
+  // MM-DD / MM月DD日, 可带时间和 IP 属地, 如「06-19 山西」。
+  match = text.match(
+    /(?:^|[^\d])(\d{1,2})[\-/.月](\d{1,2})日?(?:\s*(\d{1,2})[:：](\d{2}))?/,
+  );
+  if (match) {
+    const [, m, d, hh = "0", mm = "0"] = match;
+    let year = now.getFullYear();
+    let timestamp = createPublishDateTimestamp(
+      year,
+      Number.parseInt(m, 10),
+      Number.parseInt(d, 10),
+      Number.parseInt(hh, 10),
+      Number.parseInt(mm, 10),
+    );
+    if (Number.isFinite(timestamp)) {
+      const tomorrow = new Date(now);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      if (timestamp > tomorrow.getTime()) {
+        year -= 1;
+        timestamp = createPublishDateTimestamp(
+          year,
+          Number.parseInt(m, 10),
+          Number.parseInt(d, 10),
+          Number.parseInt(hh, 10),
+          Number.parseInt(mm, 10),
+        );
+      }
+      return timestamp;
+    }
+  }
+
   // 昨天 17:46
-  let match = text.match(/昨天\s*(\d{1,2})[:：](\d{2})/);
+  match = text.match(/昨天\s*(\d{1,2})[:：](\d{2})/);
   if (match) {
     const [, hh, mm] = match;
     return new Date(
@@ -1123,45 +1169,30 @@ function parseLastEditedTimestamp(rawText) {
     ).getTime();
   }
 
-  // YYYY-MM-DD HH:mm / YYYY年MM月DD日 HH:mm
-  match = text.match(
-    /(\d{4})[年\-/\.](\d{1,2})[月\-/\.](\d{1,2})日?\s*(\d{1,2})[:：](\d{2})/,
-  );
-  if (match) {
-    const [, y, m, d, hh, mm] = match;
-    return new Date(
-      Number.parseInt(y, 10),
-      Number.parseInt(m, 10) - 1,
-      Number.parseInt(d, 10),
-      Number.parseInt(hh, 10),
-      Number.parseInt(mm, 10),
-      0,
-      0,
-    ).getTime();
-  }
-
-  // MM-DD HH:mm
-  match = text.match(/(\d{1,2})-(\d{1,2})\s*(\d{1,2})[:：](\d{2})/);
-  if (match) {
-    const [, m, d, hh, mm] = match;
-    return new Date(
-      now.getFullYear(),
-      Number.parseInt(m, 10) - 1,
-      Number.parseInt(d, 10),
-      Number.parseInt(hh, 10),
-      Number.parseInt(mm, 10),
-      0,
-      0,
-    ).getTime();
-  }
-
   // 兜底：沿用旧逻辑，至少保留日期（分钟置 00）
   const normalizedDate = normalizeDate(text);
-  if (normalizedDate) {
+  if (
+    normalizedDate &&
+    /(刚刚|昨天|天前|小时前|分钟前|\d{4}[年\-/.]\d{1,2}|\d{1,2}\s*月\s*\d{1,2})/.test(
+      text,
+    )
+  ) {
     return new Date(`${normalizedDate}T00:00:00`).getTime();
   }
 
   return NaN;
+}
+
+function createPublishDateTimestamp(year, month, day, hour = 0, minute = 0) {
+  const date = new Date(year, month - 1, day, hour, minute, 0, 0);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return NaN;
+  }
+  return date.getTime();
 }
 
 /**

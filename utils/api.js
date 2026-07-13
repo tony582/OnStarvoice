@@ -352,15 +352,16 @@ export async function syncBatch(records, target) {
 }
 
 // 增量采集:问后端这批 external_id 哪些已采全(detailCaptureStatus=done)。
-// 返回 { ok, captured:[external_id...] }。失败时 captured 为空(不影响主流程,顶多多采几条)。
+// 返回 { ok, captured:[external_id...], items:[{ externalId, commentsCount, commentsBaselineCount }] }。
+// 失败时 captured/items 为空(不影响主流程,顶多多采几条)。
 export async function checkCapturedExternalIds({ platform = '', externalIds = [] } = {}) {
   const ids = Array.isArray(externalIds)
     ? externalIds.map((x) => String(x || '').trim()).filter(Boolean)
     : [];
-  if (ids.length === 0) return { ok: true, captured: [] };
+  if (ids.length === 0) return { ok: true, captured: [], items: [] };
   const runtime = await getRuntime();
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
-  if (!authCodeResult.ok) return { ok: false, captured: [] };
+  if (!authCodeResult.ok) return { ok: false, captured: [], items: [] };
   const body = {
     code: authCodeResult.code,
     clientUuid: runtime.clientUuid,
@@ -372,6 +373,7 @@ export async function checkCapturedExternalIds({ platform = '', externalIds = []
   return {
     ok: Boolean(result?.ok),
     captured: Array.isArray(result?.captured) ? result.captured : [],
+    items: Array.isArray(result?.items) ? result.items : [],
   };
 }
 

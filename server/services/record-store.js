@@ -5,7 +5,8 @@ import { parseMetricNumber } from '../utils/metrics.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
-  'tags', 'image_urls', 'comments_text', 'video_url', 'audio_url', 'source_type', 'payload',
+  'tags', 'image_urls', 'comments_text', 'video_url', 'audio_url', 'source_type',
+  'publish_location', 'payload',
 ];
 
 function sha256(value) {
@@ -39,6 +40,11 @@ function jsonText(value, fallback) {
 }
 
 function cleanNumber(value) {
+  return parseMetricNumber(value, 0);
+}
+
+function cleanOptionalNumber(value) {
+  if (value == null || value === '') return null;
   return parseMetricNumber(value, 0);
 }
 
@@ -152,10 +158,10 @@ export async function upsertCapturedRecord(record, context) {
           canonical_url = COALESCE(NULLIF($9, ''), canonical_url),
           cover_url = COALESCE(NULLIF($10, ''), cover_url),
           note_type = COALESCE(NULLIF($11, ''), note_type),
-          likes = COALESCE(NULLIF($12, 0), likes),
-          comments_count = COALESCE(NULLIF($13, 0), comments_count),
-          collects = COALESCE(NULLIF($14, 0), collects),
-          shares = COALESCE(NULLIF($15, 0), shares),
+          likes = COALESCE($12::integer, likes),
+          comments_count = COALESCE($13::integer, comments_count),
+          collects = COALESCE($14::integer, collects),
+          shares = COALESCE($15::integer, shares),
           publish_time = COALESCE(NULLIF($16, ''), publish_time),
           tags = CASE WHEN $17::jsonb <> '[]'::jsonb THEN $17::jsonb ELSE tags END,
           blogger_profile_url = COALESCE(NULLIF($18, ''), blogger_profile_url),
@@ -178,6 +184,7 @@ export async function upsertCapturedRecord(record, context) {
           END,
           auth_code = COALESCE(NULLIF($32, ''), auth_code),
           author_account_no = COALESCE(NULLIF($34, ''), author_account_no),
+          publish_location = COALESCE(NULLIF($35, ''), publish_location),
           last_seen_at = now(),
           seen_count = seen_count + 1,
           updated_at = now()
@@ -187,7 +194,7 @@ export async function upsertCapturedRecord(record, context) {
         record.author_name, record.author_id, record.author_avatar,
         cleanNumber(record.author_fans),
         record.url, canonicalUrl, record.cover_url, record.note_type,
-        cleanNumber(record.likes), cleanNumber(record.comments_count), cleanNumber(record.collects), cleanNumber(record.shares),
+        cleanOptionalNumber(record.likes), cleanOptionalNumber(record.comments_count), cleanOptionalNumber(record.collects), cleanOptionalNumber(record.shares),
         record.publish_time, tags,
         record.blogger_profile_url, imageUrls,
         record.comments_text, record.comments_capture_status, cleanNumber(record.comments_total_captured),
@@ -201,6 +208,7 @@ export async function upsertCapturedRecord(record, context) {
         authCode,
         existing.id,
         record.author_account_no || '', // $34:人看的号(空不覆盖,见 COALESCE NULLIF)
+        record.publish_location || '',
       ]);
 
       const observationId = await insertObservation(tx, { tenantId, recordId: existing.id, authCode, monitorExecutionId, record: { ...record, payload } });
@@ -233,7 +241,8 @@ export async function upsertCapturedRecord(record, context) {
         video_url, audio_url, video_duration,
         comments_capture_status, comments_total_captured,
         capture_timestamp,
-        keyword, source_type, payload, auth_code, content_hash, author_account_no
+        keyword, source_type, payload, auth_code, content_hash, author_account_no,
+        publish_location
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10,
@@ -245,7 +254,8 @@ export async function upsertCapturedRecord(record, context) {
         $26, $27, $28,
         $29, $30,
         $31,
-        $32, $33, $34::jsonb, $35, $36, $37
+        $32, $33, $34::jsonb, $35, $36, $37,
+        $38
       )
       RETURNING id
     `, [
@@ -262,6 +272,7 @@ export async function upsertCapturedRecord(record, context) {
       record.capture_timestamp || '',
       record.keyword || '', record.source_type || '', payload, authCode, contentHash,
       record.author_account_no || '', // $37:人看的号
+      record.publish_location || '',
     ]);
 
     const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });

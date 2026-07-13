@@ -509,7 +509,7 @@ function buildPayloadFromApiDetail(detail, noteId) {
 
 function isLikelyVideoContext(noteUrl = "") {
   const normalized = String(noteUrl || window.location.href || "");
-  return /\/video\//i.test(normalized) || /modal_id=/i.test(normalized);
+  return /\/video\//i.test(normalized);
 }
 
 function isUsableApiPayload(payload, detail, options = {}) {
@@ -789,8 +789,7 @@ export async function captureDouyinSingleNote({
     printDouyinMediaDiagnostics(media?.diagnostics);
     const expectsVideo =
       isLikelyVideoContext(noteUrl) ||
-      Boolean(new URL(window.location.href).searchParams.get("modal_id")) ||
-      media.hasVideo;
+      (media.hasVideo && !hasDouyinDomImagePostLabel(detailRoot));
     console.log("[Douyin][SingleNote][Attempt 0]", {
       noteId,
       noteUrl,
@@ -829,6 +828,7 @@ export async function captureDouyinSingleNote({
         imageUrls: media.images,
       },
       apiDetail: readDouyinApiCache(noteId),
+      detailRoot,
       media,
     });
 
@@ -2781,6 +2781,7 @@ function resolveDouyinContextualNoteType({
   noteId = "",
   apiDetail = null,
   noteUrl = "",
+  detailRoot = null,
   media = null,
 } = {}) {
   const normalizedPayload =
@@ -2797,14 +2798,18 @@ function resolveDouyinContextualNoteType({
     ...(Array.isArray(normalizedPayload.imageUrls) ? normalizedPayload.imageUrls : []),
     ...extractDouyinImageUrlsFromApiDetail(apiDetail),
     ...(Array.isArray(media?.images) ? media.images : []),
+    ...(detailRoot ? extractDouyinImageUrlsFromDomScope(detailRoot) : []),
   ]).filter((url) => isPossibleDouyinImageUrl(url));
   const hasImageCounter = hasDouyinImagePager();
+  const hasDomImageLabel = hasDouyinDomImagePostLabel(detailRoot);
 
   if (
     /\/note\//i.test(normalizedUrl) ||
     currentPath === "note" ||
+    hasDomImageLabel ||
     images.length >= 2 ||
-    hasImageCounter
+    hasImageCounter ||
+    (images.length >= 1 && !hasReliableDouyinVideoMedia(media, apiDetail))
   ) {
     return "image";
   }
@@ -2819,6 +2824,45 @@ function resolveDouyinContextualNoteType({
   }
 
   return "video";
+}
+
+function hasDouyinDomImagePostLabel(scope = null) {
+  const root = scope instanceof Element ? scope : document;
+  let nodes = [];
+  try {
+    nodes = Array.from(root.querySelectorAll("span, div, p, button"));
+  } catch {
+    nodes = [];
+  }
+
+  return nodes.some((node) => {
+    if (!isElementVisible(node)) {
+      return false;
+    }
+    const text = cleanText(node.textContent || "");
+    if (!text || text.length > 12) {
+      return false;
+    }
+    return /^(图文|图集|图片)$/.test(text) || /^\d+\s*\/\s*\d+$/.test(text);
+  });
+}
+
+function hasReliableDouyinVideoMedia(media = null, apiDetail = null) {
+  if (apiDetail?.video?.duration || apiDetail?.video?.play_addr || apiDetail?.video?.playAddr) {
+    return true;
+  }
+  if (hasStrongVideoIdentityMatch(media)) {
+    return true;
+  }
+  const selectedVideoUrl = normalizeUrl(
+    media?.videoUrl || media?.diagnostics?.selected?.videoUrl || "",
+  );
+  if (!selectedVideoUrl) {
+    return false;
+  }
+  return Boolean(
+    Number(media?.videoDuration || 0) > 0 && getSelectedVideoScore(media) >= 260,
+  );
 }
 
 function hasDouyinImagePager() {

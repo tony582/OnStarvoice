@@ -1034,6 +1034,16 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
   margin: 0 0 var(--spacing-xs);
 }
 
+.incremental-exception-group {
+  margin-left: 40px;
+  padding-left: var(--spacing-md);
+  border-left: 2px solid var(--border-color);
+}
+
+.incremental-exception-group.is-disabled {
+  opacity: 0.58;
+}
+
 .form-hint-warning {
   color: var(--status-warning);
 }
@@ -4669,6 +4679,79 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   border: 1px solid var(--border-light);
   border-radius: 10px;
 }
+.search-execution-card {
+  gap: 12px;
+}
+.search-execution-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+}
+.search-execution-tab {
+  border: none;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s, color 0.2s;
+}
+.search-execution-tab:hover {
+  color: var(--theme-primary);
+}
+.search-execution-tab.is-active {
+  background: var(--theme-primary-light);
+  color: var(--theme-primary);
+}
+.search-execution-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.keyword-plan-date-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.keyword-plan-date-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 30px;
+}
+.keyword-plan-date-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--theme-primary-light);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--theme-primary);
+  font-size: var(--font-size-xs);
+  line-height: 1.2;
+}
+.keyword-plan-date-chip button {
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+}
+.keyword-plan-date-empty {
+  color: var(--text-tertiary);
+  font-size: var(--font-size-xs);
+  line-height: 30px;
+}
 .batch-settings-head {
   display: flex;
   align-items: baseline;
@@ -4758,4 +4841,26 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
 .batch-loop-fields.is-disabled {
   opacity: 0.45;
   pointer-events: none;
+}
+.batch-plan-textarea {
+  min-height: 68px;
+  resize: vertical;
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+.keyword-plan-date-field {
+  margin: 0;
+}
+.batch-schedule-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.batch-schedule-status {
+  flex: 1;
+  min-width: 180px;
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  line-height: 1.45;
 }

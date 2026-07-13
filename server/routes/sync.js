@@ -5,6 +5,7 @@ import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
 import { parseMetricNumber, resolveMetricFromPayload } from '../utils/metrics.js';
+import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
 import { queryAll } from '../db/init.js';
 
 const router = Router();
@@ -159,9 +160,12 @@ function normalizeRecord(body) {
       return '';
     };
     const metric = (dimension, ...keys) => {
-      const direct = parseMetricNumber(getPayloadOnly(...keys), 0);
-      if (direct > 0) return direct;
-      return resolveMetricFromPayload(item, dimension, keys);
+      const rawMetric = getPayloadOnly(...keys);
+      if (rawMetric !== '') {
+        return parseMetricNumber(rawMetric, 0);
+      }
+      const resolved = resolveMetricFromPayload(item, dimension, keys);
+      return resolved > 0 ? resolved : null;
     };
     const tags = mergedArrayValue(
       dp.tags, listItem.tags, item.tags,
@@ -174,6 +178,12 @@ function normalizeRecord(body) {
       dp.commentItems, listItem.commentItems, item.commentItems
     );
     const officialReplyItems = firstArrayValue(dp.officialReplyItems, listItem.officialReplyItems, item.officialReplyItems);
+    const rawPublishTime = String(get('publishTime', 'publishDate', 'publishDateRaw'));
+    const publishLocation = String(
+      get('publishLocation', 'publish_location', 'region', 'ipLocation', 'ip_location') ||
+      extractPublishLocation(rawPublishTime)
+    );
+    const publishTime = stripPublishLocation(rawPublishTime) || rawPublishTime;
 
     return {
       external_id: String(get('noteId', 'id', 'externalId')),
@@ -195,7 +205,8 @@ function normalizeRecord(body) {
       shares: metric('shares', 'shares', 'shareCount', 'share_count', 'reposts', 'repostCount', 'repost_count', 'repostsCount', 'reposts_count'),
       // lastEditedAt 会被采集端污染成"采集当天"(并非真实发布时间),不再作为发布时间兜底 ——
       // 否则没采到发布时间的帖子会被冒充成采集日(本 fork 修:发布时间不对的根因之一)。
-      publish_time: String(get('publishTime', 'publishDate', 'publishDateRaw')),
+      publish_time: publishTime,
+      publish_location: publishLocation,
       tags: JSON.stringify(tags),
       blogger_profile_url: String(get('bloggerProfileUrl', 'authorProfileUrl', 'authorUrl', 'profileUrl')),
       // 「人看的号」:号采到时落在 bloggerUserId(增强补)/ redId / douyinId(抖音号)/ bloggerId(小红书主页号)。
@@ -392,15 +403,30 @@ router.post('/captured', requireAuth, async (req, res) => {
     }
     const platform = String(req.body?.platform || '').trim();
     const params = [req.tenantId, externalIds];
-    let sql = `SELECT DISTINCT external_id FROM records
+    let sql = `SELECT DISTINCT ON (external_id)
+                  external_id,
+                  comments_count,
+                  payload->>'detailCommentCountBaseline' AS detail_comment_count_baseline
+                FROM records
                 WHERE tenant_id = $1 AND external_id = ANY($2)
                   AND payload->>'detailCaptureStatus' = 'done'`;
     if (platform) {
       params.push(platform);
       sql += ` AND platform = $${params.length}`;
     }
+    sql += ' ORDER BY external_id, updated_at DESC';
     const rows = await queryAll(sql, params);
-    return res.json({ ok: true, captured: rows.map((r) => r.external_id) });
+    return res.json({
+      ok: true,
+      captured: rows.map((r) => r.external_id),
+      items: rows.map((r) => ({
+        externalId: r.external_id,
+        commentsCount: Number(r.comments_count || 0),
+        commentsBaselineCount: Number(
+          r.detail_comment_count_baseline || r.comments_count || 0,
+        ),
+      })),
+    });
   } catch (err) {
     return res.json({ ok: false, error: 'server_error', message: err?.message || '查询失败', captured: [] });
   }

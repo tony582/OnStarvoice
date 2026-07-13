@@ -152,16 +152,23 @@ export async function initRuntime() {
   if (tab?.id && isSupportedCaptureUrl(tab.url || "")) {
     const pageType = await detectPageTypeForTab(tab);
     const platform = detectPlatformFromUrl(tab.url || "");
+    const samePageUrl = String(currentRuntime.lastPageUrl || "") === String(tab.url || "");
     currentRuntime = {
       ...currentRuntime,
       platform,
       pageType,
+      detailReady: samePageUrl ? currentRuntime.detailReady ?? null : null,
+      detailReadyReason: samePageUrl ? currentRuntime.detailReadyReason || "" : "",
+      detailReadyCheckedAt: samePageUrl ? Number(currentRuntime.detailReadyCheckedAt) || 0 : 0,
       lastActiveTabId: tab.id,
       lastPageUrl: tab.url || "",
     };
     await updateRuntime({
       platform,
       pageType,
+      detailReady: currentRuntime.detailReady,
+      detailReadyReason: currentRuntime.detailReadyReason,
+      detailReadyCheckedAt: currentRuntime.detailReadyCheckedAt,
       lastActiveTabId: tab.id,
       lastPageUrl: tab.url || "",
     });

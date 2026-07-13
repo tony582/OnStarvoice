@@ -202,7 +202,7 @@ async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
       SELECT DISTINCT
         r.id, r.platform, r.title, r.content, r.url, r.cover_url, r.author_name, r.author_id,
         r.author_avatar, r.author_fans, r.blogger_profile_url, r.note_type, r.source_type,
-        r.tags, r.image_urls, r.payload,
+        r.tags, r.image_urls, r.payload, r.publish_location,
         r.sentiment, r.category, r.intent, r.keyword, r.ai_summary,
         r.likes, r.comments_count, r.collects, r.shares, r.official_response_status,
         r.official_replied, r.negative_comment_count, r.latest_negative_comment_at,
@@ -365,6 +365,7 @@ async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
   // 内容地域:本帖 payload 取不到时,用「该作者在别处已知的属地」回填(博主发的内容沿用博主 IP),
   // 仍取不到才记未采集。OWN_REGION 逐层兜底(顶层/detailPayload/items[0] × publishLocation/region/ipLocation)。
   const OWN_REGION = `COALESCE(
+    NULLIF(publish_location, ''),
     NULLIF(payload->>'publishLocation', ''),
     NULLIF(payload->>'region', ''),
     NULLIF(payload->>'ipLocation', ''),

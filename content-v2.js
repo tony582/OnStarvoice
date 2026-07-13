@@ -24,6 +24,7 @@ import {detectPageType} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
 import {normalizeTaskContext} from "./utils/task-context.js";
 import {buildContentDiagnostics} from "./utils/diagnostics.js";
+import {startContentPageStateReporting} from "./utils/content-page-state.js";
 
 console.log("[StarVoice V1.0] Content script loaded");
 
@@ -408,18 +409,42 @@ async function handlePrepareKeywordStrategyCapture(sendResponse) {
   }
 }
 
-// 批量采集的「排序 / 发布时间」筛选标签(各平台文案兜底多写几个,点中即用)
+// 批量采集的「排序 / 范围」筛选标签(各平台文案兜底多写几个,点中即用)
 const BATCH_SORT_LABELS = {
+  comprehensive: ["综合", "综合排序"],
   latest: ["最新", "最新发布", "最新内容", "时间排序", "按时间"],
   likes: ["最多点赞", "点赞最多", "按点赞"],
   comments: ["最多评论", "评论最多", "按评论"],
   collects: ["最多收藏", "收藏最多", "按收藏"],
 };
 const BATCH_TIME_LABELS = {
+  all: ["不限", "全部"],
   day: ["一天内", "24小时", "近一天", "最近一天"],
   week: ["一周内", "近一周", "7天内", "最近一周"],
   month: ["一月内", "近一月", "30天内", "最近一月"],
   halfyear: ["半年内", "最近半年", "近半年"],
+};
+const BATCH_CONTENT_TYPE_LABELS = {
+  all: ["不限", "全部"],
+  video: ["视频"],
+  image: ["图文", "图文笔记"],
+};
+const BATCH_SEARCH_SCOPE_LABELS = {
+  all: ["不限", "全部"],
+  followed: ["已关注", "关注的人", "关注"],
+  viewed: ["已看过", "最近看过", "看过"],
+  unviewed: ["未看过", "还未看过", "未看"],
+};
+const BATCH_DISTANCE_LABELS = {
+  all: ["不限", "全部"],
+  city: ["同城"],
+  nearby: ["附近"],
+};
+const BATCH_VIDEO_DURATION_LABELS = {
+  all: ["不限", "全部"],
+  under_1m: ["1分钟以下", "一分钟以下"],
+  "1_5m": ["1-5分钟", "1～5分钟", "1至5分钟"],
+  over_5m: ["5分钟以上", "五分钟以上"],
 };
 
 async function handleApplyBatchSearchFilters(request, sendResponse) {
@@ -427,6 +452,10 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
     const result = await applyBatchSearchFilters({
       sort: request?.sort || "",
       publishTime: request?.publishTime || "",
+      contentType: request?.contentType || "",
+      searchScope: request?.searchScope || "",
+      distance: request?.distance || "",
+      videoDuration: request?.videoDuration || "",
     });
     sendResponse({ ok: true, data: result });
   } catch (error) {
@@ -435,16 +464,120 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
   }
 }
 
+function shouldApplyBatchFilter(value = "", defaultValue = "") {
+  const normalized = String(value || "").trim();
+  return Boolean(normalized && normalized !== defaultValue && normalized !== "all");
+}
+
+function getBatchFilterSectionCandidates(field, platform) {
+  if (field === "contentType") {
+    return platform === "douyin"
+      ? ["内容形式", "作品类型", "类型", "内容类型", "笔记类型"]
+      : ["笔记类型", "内容类型", "类型"];
+  }
+  const sections = {
+    sort: ["排序依据", "排序"],
+    publishTime: ["发布时间", "时间"],
+    searchScope: ["搜索范围", "范围"],
+    distance: ["位置距离", "距离"],
+    videoDuration: ["视频时长", "时长"],
+  };
+  return sections[field] || [];
+}
+
+async function applyBatchFilterOption({
+  field,
+  value,
+  labels,
+  notes,
+  platform,
+  displayLabel,
+} = {}) {
+  if (!labels) {
+    return false;
+  }
+  const ok = await applyStrategyFilterInSection(
+    getBatchFilterSectionCandidates(field, platform),
+    labels,
+    notes,
+    displayLabel,
+  );
+  if (ok) {
+    await waitForKeywordStrategyUi(
+      platform === "douyin" ? randomStrategyDelay(1800, 2800) : 1000,
+    );
+    await ensureKeywordStrategyFilterPanelOpen(notes);
+    await waitForKeywordStrategyUi(
+      platform === "douyin" ? randomStrategyDelay(500, 900) : 300,
+    );
+  }
+  return ok;
+}
+
 // 复用「找对标账号」的筛选点击能力(ensureKeywordStrategyFilterPanelOpen + applyStrategyFilterInSection),
-// 给批量采集在采集前按需切「排序 / 发布时间」。综合/不限 则不改,直接返回。
-async function applyBatchSearchFilters({ sort = "", publishTime = "" } = {}) {
+// 给批量采集在采集前按需切「排序 / 范围」。默认值则不改,直接返回。
+async function applyBatchSearchFilters({
+  sort = "",
+  publishTime = "",
+  contentType = "",
+  searchScope = "",
+  distance = "",
+  videoDuration = "",
+} = {}) {
   const pageType = detectPageType(window.location.href);
   if (pageType !== "search_results") {
     return { applied: false, reason: "not_search_page" };
   }
-  const wantSort = sort && sort !== "comprehensive" && BATCH_SORT_LABELS[sort];
-  const wantTime = publishTime && publishTime !== "all" && BATCH_TIME_LABELS[publishTime];
-  if (!wantSort && !wantTime) {
+  const platform = /douyin\.com/i.test(window.location.href)
+    ? "douyin"
+    : /xiaohongshu\.com/i.test(window.location.href)
+      ? "xiaohongshu"
+      : "unknown";
+  const filterRequests = [
+    {
+      field: "sort",
+      value: sort,
+      defaultValue: "comprehensive",
+      labels: BATCH_SORT_LABELS[sort],
+      displayLabel: "排序",
+    },
+    {
+      field: "publishTime",
+      value: publishTime,
+      defaultValue: "all",
+      labels: BATCH_TIME_LABELS[publishTime],
+      displayLabel: "时间",
+    },
+    {
+      field: "contentType",
+      value: contentType,
+      defaultValue: "all",
+      labels: BATCH_CONTENT_TYPE_LABELS[contentType],
+      displayLabel: "内容类型",
+    },
+    {
+      field: "searchScope",
+      value: searchScope,
+      defaultValue: "all",
+      labels: BATCH_SEARCH_SCOPE_LABELS[searchScope],
+      displayLabel: "搜索范围",
+    },
+    {
+      field: "distance",
+      value: distance,
+      defaultValue: "all",
+      labels: BATCH_DISTANCE_LABELS[distance],
+      displayLabel: "位置距离",
+    },
+    {
+      field: "videoDuration",
+      value: videoDuration,
+      defaultValue: "all",
+      labels: BATCH_VIDEO_DURATION_LABELS[videoDuration],
+      displayLabel: "视频时长",
+    },
+  ].filter((item) => shouldApplyBatchFilter(item.value, item.defaultValue));
+  if (filterRequests.length === 0) {
     return { applied: false, reason: "no_filter" };
   }
   const notes = [];
@@ -453,22 +586,17 @@ async function applyBatchSearchFilters({ sort = "", publishTime = "" } = {}) {
     return { applied: false, reason: "panel_not_opened", notes };
   }
   let applied = false;
-  if (wantSort) {
-    const ok = await applyStrategyFilterInSection(["排序依据", "排序"], BATCH_SORT_LABELS[sort], notes, "排序");
+  for (const request of filterRequests) {
+    const ok = await applyBatchFilterOption({
+      ...request,
+      notes,
+      platform,
+    });
     if (ok) {
       applied = true;
-      await waitForKeywordStrategyUi(2000);
-      await ensureKeywordStrategyFilterPanelOpen(notes);
-      await waitForKeywordStrategyUi(600);
     }
   }
-  if (wantTime) {
-    const ok = await applyStrategyFilterInSection(["发布时间", "时间"], BATCH_TIME_LABELS[publishTime], notes, "时间");
-    if (ok) {
-      applied = true;
-      await waitForKeywordStrategyUi(1200);
-    }
-  }
+  await closeKeywordStrategyFilterPanel(notes);
   return { applied, notes };
 }
 
@@ -558,7 +686,10 @@ async function ensureKeywordStrategyFilterPanelOpen(notes = []) {
   if (findStrategyFilterPanel()) {
     return true;
   }
-  if (findStrategyClickableByText(["最多点赞", "点赞最多", "半年内"])) {
+  // 只认「筛选」下拉展开后才可见的文案。"最多点赞/点赞最多"在小红书搜索页的常驻
+  // 排序条上也有,会把"面板已打开"判错——后果是从不去点开「筛选」下拉,发布时间/
+  // 笔记类型等下拉内选项被静默跳过(批量采集"筛选没生效"的根因之一)。
+  if (findStrategyClickableByText(["半年内", "综合排序", "笔记类型"])) {
     return true;
   }
 
@@ -582,7 +713,8 @@ async function ensureKeywordStrategyFilterPanelOpen(notes = []) {
       return true;
     }
     if (
-      findStrategyClickableByText(["最多点赞", "点赞最多", "半年内", "综合排序"])
+      // 同上:只认下拉展开后才可见的文案,防止常驻排序条造成"已打开"误判
+      findStrategyClickableByText(["半年内", "综合排序", "笔记类型"])
     ) {
       return true;
     }
@@ -605,6 +737,8 @@ function findStrategyFilterPanel() {
     "时间",
     "视频时长",
     "搜索范围",
+    "位置距离",
+    "距离",
   ];
   const normalized = sectionTexts.map((t) => normalizeStrategyText(t));
 
@@ -624,6 +758,48 @@ function findStrategyFilterPanel() {
     if (normalized.filter((s) => text.includes(s)).length >= 2) return div;
   }
   return null;
+}
+
+async function closeKeywordStrategyFilterPanel(notes = []) {
+  const panel = findStrategyFilterPanel();
+  if (!panel) {
+    return true;
+  }
+
+  const closeCandidates = [
+    ...(findOptionCandidatesInFilterSection(
+      panel,
+      ["收起", "关闭"],
+      ["收起", "完成", "确定"],
+    ) || []),
+    ...findStrategyClickableCandidatesByText(["收起", "完成", "确定", "关闭"]),
+  ];
+  for (const candidate of closeCandidates.slice(0, 4)) {
+    if (!(candidate instanceof HTMLElement) || !isStrategyNodeVisible(candidate)) {
+      continue;
+    }
+    clickStrategyElement(candidate);
+    await waitForKeywordStrategyUi(500);
+    if (!findStrategyFilterPanel()) {
+      return true;
+    }
+  }
+
+  document.dispatchEvent(
+    new KeyboardEvent("keydown", {
+      key: "Escape",
+      code: "Escape",
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  await waitForKeywordStrategyUi(500);
+  if (!findStrategyFilterPanel()) {
+    return true;
+  }
+
+  notes.push("筛选面板未自动收起");
+  return false;
 }
 
 function findStrategyFilterTrigger() {
@@ -720,57 +896,91 @@ function findOptionCandidatesInFilterSection(panel, sectionLabel, optionTexts) {
     .filter(Boolean);
   const normalizedOptions = optionTexts.map((t) => normalizeStrategyText(t));
   const searchRoot = panel || document.body;
+  const matches = [];
 
-  let sectionEl = null;
+  findStrategySectionLabelNodes(searchRoot, normalizedSections).forEach(
+    (sectionEl) => {
+      findStrategySectionOptionContainers(sectionEl, normalizedOptions).forEach(
+        ({container, containerScore}) => {
+          container
+            .querySelectorAll('span, div, button, a, li, [role="button"]')
+            .forEach((node) => {
+              if (!(node instanceof HTMLElement) || !isStrategyNodeVisible(node))
+                return;
+              const text = normalizeStrategyText(
+                node.innerText || node.textContent || "",
+              );
+              if (!text || text.length > 16) return;
+              for (const opt of normalizedOptions) {
+                if (text !== opt) continue;
+                let score =
+                  20 + containerScore - estimateStrategyNodeArea(node) / 100000;
+                if (node.closest('button, [role="button"], a, li')) score += 2;
+                if (isLeafStrategyNode(node)) score += 1;
+                if (isStrategyControlActive(node)) score += 1;
+                matches.push({node, score});
+              }
+            });
+        },
+      );
+    },
+  );
+
+  const seen = new Set();
+  return matches
+    .sort((left, right) => right.score - left.score)
+    .map((item) => item.node)
+    .filter((node) => {
+      if (seen.has(node)) return false;
+      seen.add(node);
+      return true;
+    });
+}
+
+function findStrategySectionLabelNodes(searchRoot, normalizedSections = []) {
+  if (!searchRoot || normalizedSections.length === 0) {
+    return [];
+  }
+
+  const matches = [];
   for (const el of searchRoot.querySelectorAll("*")) {
-    if (!(el instanceof HTMLElement)) continue;
-    const raw = (el.textContent || "").replace(/\s+/g, "").trim();
+    if (!(el instanceof HTMLElement) || !isStrategyNodeVisible(el)) {
+      continue;
+    }
+    const raw = normalizeStrategyText(el.textContent || "");
     if (
       normalizedSections.some(
         (section) => raw === section && raw.length <= section.length + 2,
       )
     ) {
-      sectionEl = el;
-      break;
+      matches.push(el);
     }
   }
-  if (!sectionEl) return null;
 
-  let container = sectionEl.parentElement;
-  if (!container) return null;
-  const containerText = normalizeStrategyText(container.innerText || "");
-  if (!normalizedOptions.some((opt) => containerText.includes(opt))) {
-    container = container.parentElement;
-    if (!container) return null;
-  }
+  return matches.sort(
+    (left, right) => estimateStrategyNodeArea(left) - estimateStrategyNodeArea(right),
+  );
+}
 
-  let bestNode = null;
-  let bestScore = -1;
-  const matches = [];
-  for (const node of container.querySelectorAll(
-    'span, div, button, a, li, [role="button"]',
-  )) {
-    if (!(node instanceof HTMLElement) || !isStrategyNodeVisible(node))
-      continue;
-    const text = normalizeStrategyText(
-      node.innerText || node.textContent || "",
-    );
-    if (!text || text.length > 12) continue;
-    for (const opt of normalizedOptions) {
-      if (text !== opt) continue;
-      let score = 10 - estimateStrategyNodeArea(node) / 100000;
-      if (node.closest('button, [role="button"], a, li')) score += 2;
-      if (isLeafStrategyNode(node)) score += 1;
-      matches.push({node, score});
-      if (score > bestScore) {
-        bestNode = node;
-        bestScore = score;
+function findStrategySectionOptionContainers(sectionEl, normalizedOptions = []) {
+  const containers = [];
+  let container = sectionEl?.parentElement || null;
+
+  for (let depth = 0; container && depth < 5; depth += 1) {
+    if (container instanceof HTMLElement && isStrategyNodeVisible(container)) {
+      const text = normalizeStrategyText(container.innerText || container.textContent || "");
+      const hasOption = normalizedOptions.some((opt) => text.includes(opt));
+      if (hasOption && text.length <= 800) {
+        containers.push({
+          container,
+          containerScore: 10 - depth * 2 - estimateStrategyNodeArea(container) / 100000,
+        });
       }
     }
+    container = container.parentElement;
   }
-  return matches
-    .sort((left, right) => right.score - left.score)
-    .map((item) => item.node);
+
+  return containers;
 }
 
 async function applyStrategyFilterInSection(
@@ -787,7 +997,7 @@ async function applyStrategyFilterInSection(
       ? findOptionCandidatesInFilterSection(panel, sectionLabel, optionTexts)
       : [];
     const targets =
-      panelTargets.length > 0
+      panelTargets.length > 0 || panel
         ? panelTargets
         : findStrategyClickableCandidatesByText(optionTexts);
 
@@ -986,7 +1196,7 @@ function clickStrategyElement(node) {
     clientX: cx,
     clientY: cy,
     pointerId: 1,
-    pointerType: "touch",
+    pointerType: "mouse",
     isPrimary: true,
   };
   const mouseOpts = {
@@ -995,58 +1205,46 @@ function clickStrategyElement(node) {
     view: window,
     clientX: cx,
     clientY: cy,
-  };
-  const touchList =
-    typeof Touch === "function"
-      ? [
-          new Touch({
-            identifier: Date.now(),
-            target: clickable,
-            clientX: cx,
-            clientY: cy,
-            pageX: window.scrollX + cx,
-            pageY: window.scrollY + cy,
-            radiusX: 10,
-            radiusY: 10,
-            force: 0.5,
-          }),
-        ]
-      : [];
-  const touchOpts = {
-    bubbles: true,
-    cancelable: true,
-    view: window,
-    touches: touchList,
-    targetTouches: touchList,
-    changedTouches: touchList,
+    button: 0,
   };
 
-  clickable.dispatchEvent(new PointerEvent("pointerover", pointerOpts));
-  clickable.dispatchEvent(new PointerEvent("pointerenter", pointerOpts));
+  clickable.dispatchEvent(new MouseEvent("mousemove", mouseOpts));
   clickable.dispatchEvent(new MouseEvent("mouseover", mouseOpts));
-  clickable.dispatchEvent(new MouseEvent("mouseenter", mouseOpts));
-  if (typeof TouchEvent === "function" && touchList.length > 0) {
-    clickable.dispatchEvent(new TouchEvent("touchstart", touchOpts));
-  }
-  clickable.dispatchEvent(new PointerEvent("pointerdown", pointerOpts));
-  clickable.dispatchEvent(new MouseEvent("mousedown", mouseOpts));
-  if (typeof TouchEvent === "function" && touchList.length > 0) {
+  if (typeof PointerEvent === "function") {
+    clickable.dispatchEvent(new PointerEvent("pointerover", pointerOpts));
     clickable.dispatchEvent(
-      new TouchEvent("touchend", {
-        ...touchOpts,
-        touches: [],
-        targetTouches: [],
+      new PointerEvent("pointerdown", {
+        ...pointerOpts,
+        buttons: 1,
       }),
     );
   }
-  clickable.dispatchEvent(new PointerEvent("pointerup", pointerOpts));
+  clickable.dispatchEvent(
+    new MouseEvent("mousedown", {
+      ...mouseOpts,
+      buttons: 1,
+    }),
+  );
+  if (typeof PointerEvent === "function") {
+    clickable.dispatchEvent(
+      new PointerEvent("pointerup", {
+        ...pointerOpts,
+        buttons: 0,
+      }),
+    );
+  }
   clickable.dispatchEvent(new MouseEvent("mouseup", mouseOpts));
   clickable.dispatchEvent(new MouseEvent("click", mouseOpts));
-  clickable.click();
 }
 
 async function waitForKeywordStrategyUi(ms = 300) {
   await new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function randomStrategyDelay(minMs, maxMs) {
+  const min = Math.max(0, Number(minMs) || 0);
+  const max = Math.max(min, Number(maxMs) || min);
+  return Math.round(min + Math.random() * (max - min));
 }
 
 /**
@@ -1104,82 +1302,6 @@ function handleCancelCapture(sendResponse) {
 
 // ==================== 页面生命周期 ====================
 
-/**
- * 上报当前页面状态到 background
- */
-function reportPageState(action) {
-  const url = window.location.href;
-  const platform = /xiaohongshu\.com/i.test(url)
-    ? "xiaohongshu"
-    : /douyin\.com/i.test(url)
-      ? "douyin"
-      : "unknown";
-  safeRuntimeSendMessage({
-    action,
-    url,
-    platform,
-    pageType: detectPageType(url),
-  });
-}
-
-function createUrlChangeReporter() {
-  let lastUrl = window.location.href;
-  let pendingTimer = null;
-
-  const flush = () => {
-    pendingTimer = null;
-    const url = window.location.href;
-    if (url === lastUrl) {
-      return;
-    }
-
-    lastUrl = url;
-    reportPageState("pageChanged");
-  };
-
-  return () => {
-    if (pendingTimer) {
-      clearTimeout(pendingTimer);
-    }
-    pendingTimer = setTimeout(flush, 80);
-  };
-}
-
-const notifyUrlChanged = createUrlChangeReporter();
-
-/**
- * 首次注入时立即上报一次，避免错过 window.load
- */
-reportPageState("pageLoaded");
-
-window.addEventListener(
-  "load",
-  () => {
-    reportPageState("pageLoaded");
-  },
-  {once: true},
-);
-
-/**
- * URL 变化时通知 background (SPA 页面)
- */
-new MutationObserver(() => {
-  notifyUrlChanged();
-}).observe(document, {subtree: true, childList: true});
-
-window.addEventListener("popstate", notifyUrlChanged);
-window.addEventListener("hashchange", notifyUrlChanged);
-
-const rawPushState = history.pushState;
-history.pushState = function patchedPushState(...args) {
-  const result = rawPushState.apply(this, args);
-  notifyUrlChanged();
-  return result;
-};
-
-const rawReplaceState = history.replaceState;
-history.replaceState = function patchedReplaceState(...args) {
-  const result = rawReplaceState.apply(this, args);
-  notifyUrlChanged();
-  return result;
-};
+startContentPageStateReporting({
+  sendMessage: safeRuntimeSendMessage,
+});

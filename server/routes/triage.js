@@ -238,7 +238,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       SELECT
         r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
         r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.note_type,
-        r.publish_time, r.blogger_profile_url,
+        r.publish_time, r.publish_location, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,
         r.official_replied, r.official_response_status, r.negative_comment_count,
@@ -508,7 +508,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
           NULLIF(r.payload->'detailPayload'->>'douyinId',''), NULLIF(r.payload->'detailPayload'->>'bloggerId','')
         ) AS payload_account_no,
         r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
-        r.negative_comment_count, r.publish_time, r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
+        r.negative_comment_count, r.publish_time, r.publish_location, r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority
       FROM records r
@@ -541,6 +541,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       triage_status: TRIAGE_STATUS_CN[r.triage_status] || r.triage_status || '',
       triage_priority: PRIORITY_CN[r.triage_priority] || r.triage_priority || '',
       publish: formatPublishDate(r.publish_time, r.created_at),
+      publish_location: r.publish_location || '',
       first_seen: fmtTs(r.first_seen_at),
       last_seen: fmtTs(r.last_seen_at),
       seen_count: r.seen_count,
@@ -569,6 +570,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: '处置状态', key: 'triage_status', width: 12 },
       { header: '优先级', key: 'triage_priority', width: 8 },
       { header: '发布时间', key: 'publish', width: 18 },
+      { header: '发布位置', key: 'publish_location', width: 10 },
       { header: '首次发现', key: 'first_seen', width: 18 },
       { header: '最近采集', key: 'last_seen', width: 18 },
       { header: '采集次数', key: 'seen_count', width: 8 },
