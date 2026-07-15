@@ -22,8 +22,6 @@ export const CAPTURE_SETTINGS_KEYS = {
     "capture.includeBloggerMetricsOnDetailCapture",
   SKIP_ALREADY_CAPTURED_ON_DETAIL_CAPTURE:
     "capture.skipAlreadyCapturedOnDetailCapture",
-  RECAPTURE_COMMENTS_ON_COUNT_INCREASE:
-    "capture.recaptureCommentsOnCountIncrease",
   ENABLE_LOW_FOLLOWER_HIT_FILTER: "capture.enableLowFollowerHitFilter",
   ENABLE_LOW_FOLLOWER_HIT_FILTER_ON_DETAIL_CAPTURE:
     "capture.enableLowFollowerHitFilterOnDetailCapture",
@@ -70,7 +68,6 @@ export const DEFAULT_CAPTURE_SETTINGS = {
   includeBloggerMetricsOnNoteCapture: false,
   includeBloggerMetricsOnDetailCapture: false,
   skipAlreadyCapturedOnDetailCapture: true,
-  recaptureCommentsOnCountIncrease: true,
   enableLowFollowerHitFilter: false,
   enableLowFollowerHitFilterOnDetailCapture: false,
   lowFollowerHitThreshold: 10000,
@@ -224,10 +221,6 @@ export async function getCaptureSettings() {
     skipAlreadyCapturedOnDetailCapture: normalizeBoolean(
       raw[CAPTURE_SETTINGS_KEYS.SKIP_ALREADY_CAPTURED_ON_DETAIL_CAPTURE],
       DEFAULT_CAPTURE_SETTINGS.skipAlreadyCapturedOnDetailCapture,
-    ),
-    recaptureCommentsOnCountIncrease: normalizeBoolean(
-      raw[CAPTURE_SETTINGS_KEYS.RECAPTURE_COMMENTS_ON_COUNT_INCREASE],
-      DEFAULT_CAPTURE_SETTINGS.recaptureCommentsOnCountIncrease,
     ),
     includeBloggerMetricsOnDetailCapture: normalizeBoolean(
       raw[CAPTURE_SETTINGS_KEYS.INCLUDE_BLOGGER_METRICS_ON_DETAIL_CAPTURE],
@@ -416,11 +409,6 @@ export async function saveCaptureSettings(updates = {}) {
       normalizeBoolean(
         next.skipAlreadyCapturedOnDetailCapture,
         DEFAULT_CAPTURE_SETTINGS.skipAlreadyCapturedOnDetailCapture,
-      ),
-    [CAPTURE_SETTINGS_KEYS.RECAPTURE_COMMENTS_ON_COUNT_INCREASE]:
-      normalizeBoolean(
-        next.recaptureCommentsOnCountIncrease,
-        DEFAULT_CAPTURE_SETTINGS.recaptureCommentsOnCountIncrease,
       ),
     [CAPTURE_SETTINGS_KEYS.ENABLE_LOW_FOLLOWER_HIT_FILTER]: normalizeBoolean(
       next.enableLowFollowerHitFilter,

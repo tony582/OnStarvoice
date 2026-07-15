@@ -46,6 +46,25 @@ async function setItem(key, value) {
   }
 }
 
+let dataPoolMutationQueue = Promise.resolve();
+
+/**
+ * 串行执行数据池的读-改-写，避免采集与后台同步并行时用旧快照互相覆盖。
+ */
+export async function runDataPoolMutation(mutation) {
+  if (typeof mutation !== "function") {
+    throw new TypeError("data pool mutation must be a function");
+  }
+
+  const execute = () => Promise.resolve().then(mutation);
+  const result = dataPoolMutationQueue.then(execute, execute);
+  dataPoolMutationQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return await result;
+}
+
 /**
  * 通用删除函数
  */
@@ -548,33 +567,9 @@ function getDefaultSyncHistory() {
  * 添加记录到数据池
  */
 export async function addRecord(record) {
-  const dataPool = await getDataPool();
-  const newRecord = normalizeStoredRecord({
-    id: record?.id || generateRecordId(),
-    ...record,
-    status: record?.status || RECORD_STATUS.DRAFT,
-    createdAt: record?.createdAt || Date.now(),
-    updatedAt: Date.now(),
-    lastSyncedAt: record?.lastSyncedAt || null,
-    lastSyncReason: record?.lastSyncReason || ERROR_REASON.NONE,
-    lastSyncDebugUrl: record?.lastSyncDebugUrl || null,
-  });
-
-  dataPool.records.unshift(newRecord);
-  const saved = await setDataPool(dataPool);
-  if (!saved) {
-    throw new Error("本地缓存写入失败，请检查扩展存储空间或稍后重试");
-  }
-  return newRecord;
-}
-
-/**
- * 批量添加记录
- */
-export async function addRecords(records) {
-  const dataPool = await getDataPool();
-  const newRecords = records.map((record) =>
-    normalizeStoredRecord({
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    const newRecord = normalizeStoredRecord({
       id: record?.id || generateRecordId(),
       ...record,
       status: record?.status || RECORD_STATUS.DRAFT,
@@ -583,82 +578,120 @@ export async function addRecords(records) {
       lastSyncedAt: record?.lastSyncedAt || null,
       lastSyncReason: record?.lastSyncReason || ERROR_REASON.NONE,
       lastSyncDebugUrl: record?.lastSyncDebugUrl || null,
-    }),
-  );
+    });
 
-  dataPool.records.unshift(...newRecords);
-  const saved = await setDataPool(dataPool);
-  if (!saved) {
-    throw new Error("本地缓存写入失败，请检查扩展存储空间或稍后重试");
-  }
-  return newRecords;
+    dataPool.records.unshift(newRecord);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("本地缓存写入失败，请检查扩展存储空间或稍后重试");
+    }
+    return newRecord;
+  });
+}
+
+/**
+ * 批量添加记录
+ */
+export async function addRecords(records) {
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    const newRecords = records.map((record) =>
+      normalizeStoredRecord({
+        id: record?.id || generateRecordId(),
+        ...record,
+        status: record?.status || RECORD_STATUS.DRAFT,
+        createdAt: record?.createdAt || Date.now(),
+        updatedAt: Date.now(),
+        lastSyncedAt: record?.lastSyncedAt || null,
+        lastSyncReason: record?.lastSyncReason || ERROR_REASON.NONE,
+        lastSyncDebugUrl: record?.lastSyncDebugUrl || null,
+      }),
+    );
+
+    dataPool.records.unshift(...newRecords);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("本地缓存写入失败，请检查扩展存储空间或稍后重试");
+    }
+    return newRecords;
+  });
 }
 
 /**
  * 更新记录
  */
 export async function updateRecord(recordId, updates) {
-  const dataPool = await getDataPool();
-  const index = dataPool.records.findIndex((r) => r.id === recordId);
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    const index = dataPool.records.findIndex((r) => r.id === recordId);
 
-  if (index === -1) {
-    console.error(`[Storage] Record not found: ${recordId}`);
-    return false;
-  }
+    if (index === -1) {
+      console.error(`[Storage] Record not found: ${recordId}`);
+      return false;
+    }
 
-  const normalizedUpdates = normalizeRecordUpdates(updates);
-  dataPool.records[index] = {
-    ...dataPool.records[index],
-    ...normalizedUpdates,
-    updatedAt: Date.now(),
-  };
-  dataPool.records[index] = normalizeStoredRecord(dataPool.records[index]);
+    const normalizedUpdates = normalizeRecordUpdates(updates);
+    dataPool.records[index] = {
+      ...dataPool.records[index],
+      ...normalizedUpdates,
+      updatedAt: Date.now(),
+    };
+    dataPool.records[index] = normalizeStoredRecord(dataPool.records[index]);
 
-  await setDataPool(dataPool);
-  return true;
+    await setDataPool(dataPool);
+    return true;
+  });
 }
 
 /**
  * 删除记录
  */
 export async function deleteRecord(recordId) {
-  const dataPool = await getDataPool();
-  dataPool.records = dataPool.records.filter((r) => r.id !== recordId);
-  await setDataPool(dataPool);
-  return true;
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    dataPool.records = dataPool.records.filter((r) => r.id !== recordId);
+    await setDataPool(dataPool);
+    return true;
+  });
 }
 
 /**
  * 批量删除记录
  */
 export async function deleteRecords(recordIds) {
-  const dataPool = await getDataPool();
-  const idsSet = new Set(recordIds);
-  dataPool.records = dataPool.records.filter((r) => !idsSet.has(r.id));
-  await setDataPool(dataPool);
-  return true;
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    const idsSet = new Set(recordIds);
+    dataPool.records = dataPool.records.filter((r) => !idsSet.has(r.id));
+    await setDataPool(dataPool);
+    return true;
+  });
 }
 
 /**
  * 清空所有记录
  */
 export async function clearAllRecords() {
-  const dataPool = await getDataPool();
-  dataPool.records = [];
-  await setDataPool(dataPool);
-  return true;
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    dataPool.records = [];
+    await setDataPool(dataPool);
+    return true;
+  });
 }
 
 /**
  * 清空已同步记录
  */
 export async function clearSyncedRecords() {
-  const dataPool = await getDataPool();
-  dataPool.records = dataPool.records.filter(
-    (r) => r.status !== RECORD_STATUS.SYNCED,
-  );
-  await setDataPool(dataPool);
-  return true;
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    dataPool.records = dataPool.records.filter(
+      (r) => r.status !== RECORD_STATUS.SYNCED,
+    );
+    await setDataPool(dataPool);
+    return true;
+  });
 }
 
 /**

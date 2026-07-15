@@ -1034,16 +1034,6 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
   margin: 0 0 var(--spacing-xs);
 }
 
-.incremental-exception-group {
-  margin-left: 40px;
-  padding-left: var(--spacing-md);
-  border-left: 2px solid var(--border-color);
-}
-
-.incremental-exception-group.is-disabled {
-  opacity: 0.58;
-}
-
 .form-hint-warning {
   color: var(--status-warning);
 }

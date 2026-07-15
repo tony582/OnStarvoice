@@ -101,6 +101,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   };
 
   switch (request.action) {
+    case "ping":
+      sendResponseWithDiagnostics({ok: true, ready: true});
+      return false;
+
     case "detectPageType":
       handleDetectPageType(sendResponseWithDiagnostics);
       return true;

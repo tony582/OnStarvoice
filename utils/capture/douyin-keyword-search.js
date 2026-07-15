@@ -25,6 +25,10 @@ import {
   buildScrollLoadStage,
   countMissingMetric,
 } from "./stage-diagnostics.js";
+import {
+  isDouyinOwnProfileUrl,
+  normalizeDouyinAuthorName,
+} from "./douyin-author.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const DEFAULT_SORT_DIMENSION = "likes";
@@ -937,19 +941,22 @@ function resolveSearchCardCover(card) {
 }
 
 function resolveSearchCardAuthor(card) {
-  const direct = cleanText(
+  const direct = normalizeDouyinAuthorName(
     getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.author, card),
-  ).replace(/^@/, "");
+  );
   if (direct) {
     return direct;
   }
 
   const text = cleanText(card?.innerText || "");
   const match = text.match(/@([^\s@·#]+)/);
-  return cleanText(match?.[1] || "");
+  return normalizeDouyinAuthorName(match?.[1] || "");
 }
 
 function resolveSearchCardAuthorProfileUrl(card, author = "") {
+  if (!normalizeDouyinAuthorName(author)) {
+    return "";
+  }
   const authorNodes = collectSearchCardAuthorNodes(card);
   const candidates = [];
   const normalizedAuthor = normalizeComparableAuthor(author);
@@ -1038,7 +1045,7 @@ function collectSearchCardAuthorNodes(card) {
 
 function normalizeDouyinAuthorProfileUrl(raw) {
   const normalized = normalizeUrl(raw);
-  if (!normalized) return "";
+  if (!normalized || isDouyinOwnProfileUrl(normalized)) return "";
 
   try {
     const parsed = new URL(normalized, "https://www.douyin.com");

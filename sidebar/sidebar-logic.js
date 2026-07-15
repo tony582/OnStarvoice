@@ -48,6 +48,7 @@ import {
   saveCaptureSettings,
   DEFAULT_CAPTURE_SETTINGS,
 } from "../utils/capture-settings.js";
+import {createRecordSyncQueue} from "../utils/record-sync-queue.js";
 import {addSyncHistoryEntry, getRecords} from "../utils/storage.js";
 
 import {
@@ -319,6 +320,15 @@ let manualSelectedPlatform = "";
 let lastKnownPagePlatform = "unknown";
 let currentUpdateNoticeState = null;
 let activeCaptureExecutionLockId = "";
+let captureExecutionLockHeartbeatTimer = null;
+let captureExecutionLockHeartbeatLockId = "";
+let captureExecutionLockHeartbeatInFlight = false;
+let captureExecutionLockInitialHolderTabId = null;
+const CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const CAPTURE_EXECUTION_LOCK_HOLDER_ID =
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `sidebar-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const KEYWORD_ANALYSIS_STALE_LOCK_MS =
   DEFAULT_CONFIG.KEYWORD_ANALYSIS_TIMEOUT + 5000;
 const MAX_BATCH_KEYWORDS = 30;
@@ -350,6 +360,7 @@ const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
 const KEYWORD_PLAN_RECONCILE_INTERVAL_MS = 5 * 1000;
+const UNATTENDED_RUN_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const KEYWORD_PLAN_MODES = new Set([
   "daily",
   "custom_dates",
@@ -365,6 +376,7 @@ const KEYWORD_PLAN_STATUS_LABELS = {
   failed: "失败",
   canceled: "已取消",
   skipped: "已跳过",
+  deferred: "等待重试",
 };
 const KEYWORD_PLAN_CONTROL_IDS = {
   modal: {
@@ -3548,14 +3560,6 @@ function setupUIEventListeners() {
       );
     });
   document
-    .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
-    .forEach((input) => {
-      input.addEventListener(
-        "change",
-        handleDetailCaptureCommentCountRecheckToggleChange,
-      );
-    });
-  document
     .querySelectorAll('[data-detail-setting="comment-leads"]')
     .forEach((input) => {
       input.addEventListener(
@@ -4496,11 +4500,15 @@ async function handleCaptureSearchData() {
   let taskStatus = "completed";
   let taskError = null;
   let executionLock = null;
+  let streamingSyncQueue = null;
+  let streamingSyncResult = null;
+  let streamingSyncDrained = false;
 
   try {
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
     );
+    streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings);
     if (
       settings.autoDetailCaptureAfterListCapture &&
       !ensureAuthVerifiedOrWarn({
@@ -4599,14 +4607,32 @@ async function handleCaptureSearchData() {
                   resolveCurrentDetailCaptureSettings(
                     await getCaptureSettings(),
                   );
-                const enhanceResult =
-                  await maybeRunAutoDetailCaptureAfterListCapture(
+                let enhanceResult = null;
+                try {
+                  enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
                     currentDetailSettings,
                     {
                       sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                       recordIds,
+                      onItemSettled: streamingSyncQueue?.enabled
+                        ? (progress) =>
+                            routeDetailItemToStreamingSync(
+                              streamingSyncQueue,
+                              progress,
+                              {
+                                sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                              },
+                            )
+                        : null,
                     },
                   );
+                } finally {
+                  if (streamingSyncQueue?.enabled) {
+                    streamingSyncQueue.enqueueMissing(recordIds, {
+                      sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                    });
+                  }
+                }
                 if (enhanceResult?.securityBlocked) {
                   // 撞小红书风控:停掉整轮无人值守,别再往下跑(越跑越死)
                   searchCaptureCancelRequested = true;
@@ -4625,13 +4651,15 @@ async function handleCaptureSearchData() {
                 if (enhanceResult && enhanceResult.ok === false) {
                   taskStatus = "completed_with_failures";
                 }
-                const syncResult = await maybeRunAutoSyncAfterDetailCapture(
-                  currentDetailSettings,
-                  {
-                    sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
-                    recordIds,
-                  },
-                );
+                const syncResult = streamingSyncQueue?.enabled
+                  ? null
+                  : await maybeRunAutoSyncAfterDetailCapture(
+                      currentDetailSettings,
+                      {
+                        sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
+                        recordIds,
+                      },
+                    );
                 if (syncResult && syncResult.ok === false) {
                   taskStatus = "completed_with_failures";
                 }
@@ -4641,8 +4669,14 @@ async function handleCaptureSearchData() {
           onProgress: (p) =>
             showProgress(
               searchAutoLoop
-                ? `第 ${searchRound} 轮 · ${p?.message || ""}`
-                : p?.message || "正在批量采集...",
+                ? appendStreamingSyncSummary(
+                    `第 ${searchRound} 轮 · ${p?.message || ""}`,
+                    streamingSyncQueue,
+                  )
+                : appendStreamingSyncSummary(
+                    p?.message || "正在批量采集...",
+                    streamingSyncQueue,
+                  ),
               "info",
             ),
           shouldStop: () => searchCaptureCancelRequested,
@@ -4659,6 +4693,7 @@ async function handleCaptureSearchData() {
           shouldStop: () => searchCaptureCancelRequested,
           updateProgress: (progress) =>
             showProgress(progress?.message || "正在重试采集增强失败项...", "info"),
+          streamingSyncQueue,
         });
         if (retryResult?.securityBlocked) {
           searchCaptureCancelRequested = true;
@@ -4710,10 +4745,30 @@ async function handleCaptureSearchData() {
           const currentDetailSettings = resolveCurrentDetailCaptureSettings(
             await getCaptureSettings(),
           );
-          const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
-            currentDetailSettings,
-            { sourceLabel: "搜索结果", recordIds: actionResult.recordIds },
-          );
+          let enhanceResult = null;
+          try {
+            enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
+              currentDetailSettings,
+              {
+                sourceLabel: "搜索结果",
+                recordIds: actionResult.recordIds,
+                onItemSettled: streamingSyncQueue?.enabled
+                  ? (progress) =>
+                      routeDetailItemToStreamingSync(
+                        streamingSyncQueue,
+                        progress,
+                        {sourceLabel: "搜索结果笔记"},
+                      )
+                  : null,
+              },
+            );
+          } finally {
+            if (streamingSyncQueue?.enabled) {
+              streamingSyncQueue.enqueueMissing(actionResult.recordIds, {
+                sourceLabel: "搜索结果笔记",
+              });
+            }
+          }
           if (enhanceResult?.securityBlocked) {
             searchCaptureCancelRequested = true;
             taskStatus = "partial";
@@ -4725,10 +4780,12 @@ async function handleCaptureSearchData() {
             taskStatus = "completed_with_failures";
           }
           if (!enhanceResult?.securityBlocked && !enhanceResult?.canceled) {
-            const syncResult = await maybeRunAutoSyncAfterDetailCapture(
-              currentDetailSettings,
-              { sourceLabel: "搜索结果", recordIds: actionResult.recordIds },
-            );
+            const syncResult = streamingSyncQueue?.enabled
+              ? null
+              : await maybeRunAutoSyncAfterDetailCapture(
+                  currentDetailSettings,
+                  {sourceLabel: "搜索结果", recordIds: actionResult.recordIds},
+                );
             if (syncResult && syncResult.ok === false) {
               taskStatus = "completed_with_failures";
             }
@@ -4746,6 +4803,27 @@ async function handleCaptureSearchData() {
       }
     } while (!searchCaptureCancelRequested);
 
+    streamingSyncResult = await drainStreamingDetailSyncQueue(
+      streamingSyncQueue,
+      {
+        round: searchRound,
+        updateProgress: (progress) => showProgress(progress.message, "info"),
+      },
+    );
+    streamingSyncDrained = true;
+    if (Number(streamingSyncResult?.failedCount || 0) > 0) {
+      taskStatus = "completed_with_failures";
+    } else if (
+      streamingSyncQueue?.enabled &&
+      Number(streamingSyncResult?.enqueuedCount || 0) > 0 &&
+      !streamingSyncResult?.blocked
+    ) {
+      showMessage(
+        `已采数据已同步后台：成功 ${Number(streamingSyncResult?.successCount || 0)} 条，跳过 ${Number(streamingSyncResult?.skippedCount || 0)} 条`,
+        "success",
+      );
+    }
+
     if (searchAutoLoop) {
       showMessage(
         `无人值守搜索采集${searchCaptureCancelRequested ? "已停止" : "结束"}:共跑 ${searchRound} 轮`,
@@ -4758,6 +4836,14 @@ async function handleCaptureSearchData() {
     taskError = error;
     showMessage("操作失败: " + error.message, "error");
   } finally {
+    if (streamingSyncQueue?.enabled && !streamingSyncDrained) {
+      streamingSyncResult = await drainStreamingDetailSyncQueue(
+        streamingSyncQueue,
+      ).catch((error) => {
+        console.warn("[Sidebar] Drain manual streaming sync failed:", error);
+        return streamingSyncQueue.getStats();
+      });
+    }
     finishSidebarTask(taskContext, {
       status: taskStatus,
       error: taskError,
@@ -4768,6 +4854,7 @@ async function handleCaptureSearchData() {
     });
     hideProgress();
     searchCaptureCancelRequested = false;
+    activeBatchRunnerTabId = null;
     if (executionLock) {
       await releaseCaptureExecutionLock(executionLock.id);
     }
@@ -9433,6 +9520,111 @@ function collectSuccessfulDetailRecordIds(detailResult = {}) {
   ];
 }
 
+function createStreamingDetailAutoSyncQueue(settings) {
+  return createRecordSyncQueue({
+    enabled: Boolean(
+      settings?.autoDetailCaptureAfterListCapture &&
+        settings?.autoSyncAfterDetailCapture,
+    ),
+    processRecord: async ({recordId, meta = {}}) => {
+      const result = await maybeRunAutoSyncAfterDetailCapture(settings, {
+        sourceLabel: String(meta?.sourceLabel || "当前笔记"),
+        recordIds: [recordId],
+        silent: true,
+        refreshAfter: false,
+      });
+      return {
+        ...result,
+        blocked: result?.phase === "check",
+        skipped:
+          Boolean(result?.skipped) ||
+          (Number(result?.successCount || 0) === 0 &&
+            Number(result?.skippedCount || 0) > 0),
+      };
+    },
+  });
+}
+
+function routeDetailItemToStreamingSync(
+  streamingSyncQueue,
+  progress = {},
+  {sourceLabel = "当前笔记"} = {},
+) {
+  if (!streamingSyncQueue?.enabled) {
+    return;
+  }
+  const recordId = String(progress?.recordId || "").trim();
+  if (!recordId) {
+    return;
+  }
+  if (String(progress?.phase || "") === "detail_item_filtered") {
+    streamingSyncQueue.markSeen(recordId);
+    return;
+  }
+  streamingSyncQueue.enqueue(recordId, {sourceLabel});
+}
+
+function formatStreamingSyncSummary(stats = {}) {
+  if (!stats?.enabled || Number(stats.enqueuedCount || 0) === 0) {
+    return "";
+  }
+  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}`;
+}
+
+function appendStreamingSyncSummary(message, streamingSyncQueue) {
+  const summary = formatStreamingSyncSummary(streamingSyncQueue?.getStats?.());
+  return summary ? `${String(message || "").trim()} · ${summary}` : message;
+}
+
+async function drainStreamingDetailSyncQueue(
+  streamingSyncQueue,
+  {round = null, updateProgress = null, notifyProgress = null} = {},
+) {
+  if (!streamingSyncQueue?.enabled) {
+    return streamingSyncQueue?.getStats?.() || null;
+  }
+
+  const before = streamingSyncQueue.getStats();
+  if (Number(before.remainingCount || 0) > 0) {
+    const waitingProgress = {
+      current: Number(before.processedCount || 0),
+      total: Number(before.enqueuedCount || 0),
+      round,
+      phase: "streaming_sync_drain",
+      message: `采集已结束，正在上传剩余 ${Number(before.remainingCount || 0)} 条数据...`,
+    };
+    updateProgress?.(waitingProgress);
+    notifyProgress?.(waitingProgress);
+  }
+
+  const result = await streamingSyncQueue.drain();
+  await Promise.all([refreshDataPool(), refreshSyncHistory()]).catch(
+    () => null,
+  );
+  const doneProgress = {
+    current: Number(result.processedCount || 0),
+    total: Number(result.enqueuedCount || 0),
+    round,
+    phase: "streaming_sync_done",
+    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}`,
+  };
+  updateProgress?.(doneProgress);
+  notifyProgress?.(doneProgress);
+
+  if (result.blocked) {
+    showMessage(
+      `边采边同步未执行：${result.error?.message || "同步前检查失败"}`,
+      "warning",
+    );
+  } else if (Number(result.failedCount || 0) > 0) {
+    showMessage(
+      `边采边同步部分失败：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}`,
+      "warning",
+    );
+  }
+  return result;
+}
+
 async function retryFailedEnhancementsAfterRound({
   round = 1,
   roundLabel = "",
@@ -9442,6 +9634,7 @@ async function retryFailedEnhancementsAfterRound({
   waitForegroundTabId = null,
   shouldStop = null,
   updateProgress = null,
+  streamingSyncQueue = null,
 } = {}) {
   if (!Boolean(settings?.autoDetailCaptureAfterListCapture)) {
     return null;
@@ -9477,31 +9670,47 @@ async function retryFailedEnhancementsAfterRound({
     };
   }
 
-  const retryResult = await runDetailCaptureForRecordIds(
-    failedRecordIds,
-    settings,
-    {
-      progressMessage: `正在重试采集增强失败项（0/${failedRecordIds.length}）...`,
-      waitForegroundTabId,
-      onProgress: (progress = {}) => {
-        const retryProgress = {
-          ...progress,
-          round,
-          phase: progress.phase || "enhance_retrying",
-          message: `${messagePrefix}自动重试增强失败项：${progress.message || "执行中..."}`,
-        };
-        updateProgress?.(retryProgress);
-        notifyProgress?.(retryProgress);
+  let retryResult = null;
+  try {
+    retryResult = await runDetailCaptureForRecordIds(
+      failedRecordIds,
+      settings,
+      {
+        progressMessage: `正在重试采集增强失败项（0/${failedRecordIds.length}）...`,
+        waitForegroundTabId,
+        onItemSettled: streamingSyncQueue?.enabled
+          ? (progress) =>
+              routeDetailItemToStreamingSync(streamingSyncQueue, progress, {
+                sourceLabel: `${prefix || "本轮"}增强失败重试项`,
+              })
+          : null,
+        onProgress: (progress = {}) => {
+          const retryProgress = {
+            ...progress,
+            round,
+            phase: progress.phase || "enhance_retrying",
+            message: `${messagePrefix}自动重试增强失败项：${progress.message || "执行中..."}`,
+          };
+          updateProgress?.(retryProgress);
+          notifyProgress?.(retryProgress);
+        },
       },
-    },
-  );
+    );
+  } finally {
+    if (streamingSyncQueue?.enabled) {
+      streamingSyncQueue.enqueueMissing(failedRecordIds, {
+        sourceLabel: `${prefix || "本轮"}增强失败重试项`,
+      });
+    }
+  }
 
   await refreshDataPool();
   const successRecordIds = collectSuccessfulDetailRecordIds(retryResult);
   if (
     successRecordIds.length > 0 &&
     !retryResult?.securityBlocked &&
-    !retryResult?.canceled
+    !retryResult?.canceled &&
+    !streamingSyncQueue?.enabled
   ) {
     await maybeRunAutoSyncAfterDetailCapture(settings, {
       sourceLabel: `${prefix || "本轮"}增强失败重试成功项`,
@@ -9615,10 +9824,14 @@ async function handleBatchKeywordCapture(options = {}) {
   persistCurrentBatchDraft();
 
   let executionLock = null;
+  let streamingSyncQueue = null;
+  let streamingSyncResult = null;
+  let streamingSyncDrained = false;
   try {
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
     );
+    streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings);
     if (
       settings.autoDetailCaptureAfterListCapture &&
       !ensureAuthVerifiedOrWarn({
@@ -9760,27 +9973,48 @@ async function handleBatchKeywordCapture(options = {}) {
               runnerTabId,
             }) => {
               await refreshDataPool();
-              const enhanceResult =
-                await maybeRunAutoDetailCaptureAfterListCapture(settings, {
-                  sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
-                  recordIds,
-                  waitForegroundTabId,
-                  onProgress: notifyProgress
-                    ? (detailProgress = {}) =>
-                        notifyProgress({
-                          ...detailProgress,
-                          current: keywordCurrent,
-                          total: keywordTotal,
-                          keyword: capturedKeyword,
-                          phase: detailProgress.phase || "enhancing",
-                          message:
-                            detailProgress.message ||
-                            `正在增强关键词「${capturedKeyword}」的采集结果`,
-                          runnerTabId:
-                            detailProgress.runnerTabId || runnerTabId || null,
-                        })
-                    : null,
-                });
+              let enhanceResult = null;
+              try {
+                enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
+                  settings,
+                  {
+                    sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
+                    recordIds,
+                    waitForegroundTabId,
+                    onItemSettled: streamingSyncQueue?.enabled
+                      ? (progress) =>
+                          routeDetailItemToStreamingSync(
+                            streamingSyncQueue,
+                            progress,
+                            {
+                              sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                            },
+                          )
+                      : null,
+                    onProgress: notifyProgress
+                      ? (detailProgress = {}) =>
+                          notifyProgress({
+                            ...detailProgress,
+                            current: keywordCurrent,
+                            total: keywordTotal,
+                            keyword: capturedKeyword,
+                            phase: detailProgress.phase || "enhancing",
+                            message:
+                              detailProgress.message ||
+                              `正在增强关键词「${capturedKeyword}」的采集结果`,
+                            runnerTabId:
+                              detailProgress.runnerTabId || runnerTabId || null,
+                          })
+                      : null,
+                  },
+                );
+              } finally {
+                if (streamingSyncQueue?.enabled) {
+                  streamingSyncQueue.enqueueMissing(recordIds, {
+                    sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                  });
+                }
+              }
               if (enhanceResult?.securityBlocked) {
                 batchKeywordCancelRequested = true;
                 showMessage(
@@ -9793,13 +10027,12 @@ async function handleBatchKeywordCapture(options = {}) {
                 batchKeywordCancelRequested = true;
                 return enhanceResult;
               }
-              await maybeRunAutoSyncAfterDetailCapture(
-                settings,
-                {
+              if (!streamingSyncQueue?.enabled) {
+                await maybeRunAutoSyncAfterDetailCapture(settings, {
                   sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                   recordIds,
-                },
-              );
+                });
+              }
               return enhanceResult;
             }
           : null,
@@ -9811,6 +10044,10 @@ async function handleBatchKeywordCapture(options = {}) {
           const progressForUi = autoLoop
             ? { ...progress, round, message: `第 ${round} 轮 · ${progress.message || ""}` }
             : { ...progress, round };
+          progressForUi.message = appendStreamingSyncSummary(
+            progressForUi.message,
+            streamingSyncQueue,
+          );
           updateBatchProgress(
             progressForUi,
             "modal",
@@ -9833,6 +10070,7 @@ async function handleBatchKeywordCapture(options = {}) {
         waitForegroundTabId,
         shouldStop: () => batchKeywordCancelRequested,
         updateProgress: (progress) => updateBatchProgress(progress, "modal"),
+        streamingSyncQueue,
       });
       if (retryResult?.securityBlocked) {
         batchKeywordCancelRequested = true;
@@ -9870,21 +10108,32 @@ async function handleBatchKeywordCapture(options = {}) {
       }
     } while (!batchKeywordCancelRequested);
 
+    streamingSyncResult = await drainStreamingDetailSyncQueue(
+      streamingSyncQueue,
+      {
+        round,
+        updateProgress: (progress) => updateBatchProgress(progress, "modal"),
+        notifyProgress,
+      },
+    );
+    streamingSyncDrained = true;
+
     const stats = result.stats;
+    const syncSummary = formatStreamingSyncSummary(streamingSyncResult);
     if (autoLoop) {
       const stopped = result.canceled || batchKeywordCancelRequested;
       showMessage(
-        `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}`,
+        `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
         stopped ? "warning" : "success",
       );
     } else if (result.canceled) {
       showMessage(
-        `批量采集已停止：已处理 ${stats.processed}/${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}`,
+        `批量采集已停止：已处理 ${stats.processed}/${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}${syncSummary ? `；${syncSummary}` : ""}`,
         "warning",
       );
     } else {
       showMessage(
-        `批量采集完成：共 ${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}`,
+        `批量采集完成：共 ${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}${syncSummary ? `；${syncSummary}` : ""}`,
         stats.failed > 0 ? "warning" : "success",
       );
     }
@@ -9896,6 +10145,7 @@ async function handleBatchKeywordCapture(options = {}) {
       rounds: round,
       totalSuccess,
       totalFailed,
+      streamingSync: streamingSyncResult,
     };
   } catch (error) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
@@ -9906,6 +10156,15 @@ async function handleBatchKeywordCapture(options = {}) {
       error: error.message,
     };
   } finally {
+    if (streamingSyncQueue?.enabled && !streamingSyncDrained) {
+      streamingSyncResult = await drainStreamingDetailSyncQueue(
+        streamingSyncQueue,
+        {notifyProgress},
+      ).catch((error) => {
+        console.warn("[Sidebar] Drain streaming sync after batch failed:", error);
+        return streamingSyncQueue.getStats();
+      });
+    }
     batchKeywordCaptureInFlight = false;
     batchKeywordCancelRequested = false;
     activeBatchRunnerTabId = null;
@@ -9939,6 +10198,38 @@ async function reportUnattendedKeywordRun(requestId, patch = {}) {
     console.warn("[Sidebar] Update unattended keyword run failed:", error);
     return null;
   }
+}
+
+function startUnattendedKeywordRunHeartbeat(requestId) {
+  if (!requestId) {
+    return () => {};
+  }
+
+  let stopped = false;
+  let reportInFlight = false;
+  const reportHeartbeat = async () => {
+    if (stopped || reportInFlight) {
+      return;
+    }
+    reportInFlight = true;
+    try {
+      await reportUnattendedKeywordRun(requestId, {
+        heartbeatAt: new Date().toISOString(),
+      });
+    } finally {
+      reportInFlight = false;
+    }
+  };
+
+  void reportHeartbeat();
+  const timerId = setInterval(
+    reportHeartbeat,
+    UNATTENDED_RUN_HEARTBEAT_INTERVAL_MS,
+  );
+  return () => {
+    stopped = true;
+    clearInterval(timerId);
+  };
 }
 
 function createUnattendedKeywordProgressReporter(requestId) {
@@ -9987,13 +10278,26 @@ async function acquireCaptureExecutionLock({
   label = "采集任务",
 } = {}) {
   try {
+    let holderTabId = null;
+    try {
+      const [activeTab] = await chrome.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+      holderTabId = activeTab?.id ?? null;
+    } catch {
+      // MessageSender.tab/documentId 仍会由 background 作为可信持有者信息。
+    }
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:acquire-capture-lock",
       owner,
       label,
+      holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
+      holderTabId,
     });
     if (response?.ok && response.data?.id) {
       activeCaptureExecutionLockId = response.data.id;
+      startCaptureExecutionLockHeartbeat(response.data.id, holderTabId);
       return response.data;
     }
     const activeLabel = response?.data?.label || "其他采集任务";
@@ -10001,25 +10305,128 @@ async function acquireCaptureExecutionLock({
     return null;
   } catch (error) {
     console.warn("[Sidebar] Acquire capture execution lock failed:", error);
-    return {
-      id: "",
-      degraded: true,
-    };
+    showMessage("无法确认采集任务状态，请刷新扩展后重试", "error");
+    return null;
   }
+}
+
+function stopCaptureExecutionLockHeartbeat(lockId = "") {
+  if (
+    lockId &&
+    captureExecutionLockHeartbeatLockId &&
+    captureExecutionLockHeartbeatLockId !== lockId
+  ) {
+    return;
+  }
+  if (captureExecutionLockHeartbeatTimer) {
+    clearInterval(captureExecutionLockHeartbeatTimer);
+    captureExecutionLockHeartbeatTimer = null;
+  }
+  captureExecutionLockHeartbeatLockId = "";
+  captureExecutionLockHeartbeatInFlight = false;
+  captureExecutionLockInitialHolderTabId = null;
+}
+
+function resolveCaptureExecutionLockRunnerTabId(fallbackTabId = null) {
+  const candidates = [
+    detailBatchRunnerTabId,
+    activeBatchRunnerTabId,
+    fallbackTabId,
+    captureExecutionLockInitialHolderTabId,
+  ];
+  for (const candidate of candidates) {
+    const tabId = Number(candidate);
+    if (Number.isFinite(tabId) && tabId > 0) {
+      return tabId;
+    }
+  }
+  return null;
+}
+
+function handleCaptureExecutionLockLost(lockId) {
+  if (!lockId || activeCaptureExecutionLockId !== lockId) {
+    return;
+  }
+  const relayTabId = resolveCaptureExecutionLockRunnerTabId();
+  stopCaptureExecutionLockHeartbeat(lockId);
+  activeCaptureExecutionLockId = "";
+  setCancelFlag(true);
+  searchCaptureCancelRequested = true;
+  batchKeywordCancelRequested = true;
+  batchUrlCancelRequested = true;
+  detailBatchCancelRequested = true;
+  void requestCaptureCancelSignal(relayTabId).catch((error) => {
+    console.warn("[Sidebar] Relay cancel after capture lock loss failed:", error);
+  });
+  showMessage("采集任务锁已失效，本次任务正在停止，请重新启动", "error");
+}
+
+async function renewCaptureExecutionLock(lockId, holderTabId = null) {
+  if (
+    !lockId ||
+    activeCaptureExecutionLockId !== lockId ||
+    captureExecutionLockHeartbeatInFlight
+  ) {
+    return;
+  }
+  captureExecutionLockHeartbeatInFlight = true;
+  try {
+    const currentRunnerTabId = resolveCaptureExecutionLockRunnerTabId(
+      holderTabId,
+    );
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:renew-capture-lock",
+      lockId,
+      holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
+      holderTabId: currentRunnerTabId,
+    });
+    if (!response?.ok) {
+      console.warn("[Sidebar] Capture execution lock renewal rejected:", {
+        lockId,
+        reason: response?.reason || "unknown",
+      });
+      handleCaptureExecutionLockLost(lockId);
+    }
+  } catch (error) {
+    // service worker 被唤醒或短暂重启时保留本地任务，下一次心跳会重试；
+    // 真正失联的锁会由 background 的租约期限回收。
+    console.warn("[Sidebar] Renew capture execution lock failed:", error);
+  } finally {
+    captureExecutionLockHeartbeatInFlight = false;
+  }
+}
+
+function startCaptureExecutionLockHeartbeat(lockId, holderTabId = null) {
+  stopCaptureExecutionLockHeartbeat();
+  captureExecutionLockHeartbeatLockId = lockId;
+  const normalizedHolderTabId = Number(holderTabId);
+  captureExecutionLockInitialHolderTabId =
+    Number.isFinite(normalizedHolderTabId) && normalizedHolderTabId > 0
+      ? normalizedHolderTabId
+      : null;
+  captureExecutionLockHeartbeatTimer = setInterval(() => {
+    void renewCaptureExecutionLock(lockId);
+  }, CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS);
 }
 
 async function releaseCaptureExecutionLock(lockId = activeCaptureExecutionLockId) {
   if (!lockId) {
-    activeCaptureExecutionLockId = "";
-    return;
+    return false;
   }
+  stopCaptureExecutionLockHeartbeat(lockId);
   try {
-    await chrome.runtime.sendMessage({
+    const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:release-capture-lock",
       lockId,
+      holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
     });
+    if (!response?.ok) {
+      console.warn("[Sidebar] Capture execution lock release rejected:", lockId);
+    }
+    return Boolean(response?.ok);
   } catch (error) {
     console.warn("[Sidebar] Release capture execution lock failed:", error);
+    return false;
   } finally {
     if (activeCaptureExecutionLockId === lockId) {
       activeCaptureExecutionLockId = "";
@@ -10046,6 +10453,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     return;
   }
 
+  let stopHeartbeat = () => {};
   try {
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:claim-unattended-keyword-run",
@@ -10057,6 +10465,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
       }
       return;
     }
+    stopHeartbeat = startUnattendedKeywordRunHeartbeat(response.data.id);
     await runUnattendedKeywordPlanRequest(response.data);
   } catch (error) {
     console.error("[Sidebar] Claim unattended keyword run failed:", error);
@@ -10069,6 +10478,8 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
         message: error.message,
       },
     });
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -12939,12 +13350,6 @@ async function initCaptureSettingsUI() {
       .forEach((el) => {
         el.checked = settings.skipAlreadyCapturedOnDetailCapture !== false;
       });
-    document
-      .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
-      .forEach((el) => {
-        el.checked = settings.recaptureCommentsOnCountIncrease !== false;
-      });
-
     const inputCommentsMaxDetectedItems = document.getElementById(
       "inputCommentsMaxDetectedItems",
     );
@@ -13235,14 +13640,6 @@ async function handleDetailCaptureSkipCapturedToggleChange() {
   }
 }
 
-async function handleDetailCaptureCommentCountRecheckToggleChange() {
-  try {
-    await persistDetailCaptureSettingsFromInputs();
-  } catch (error) {
-    console.warn("[Sidebar] Save comment-count-recheck toggle failed:", error);
-  }
-}
-
 async function handleDetailCaptureLowFollowerHitToggleChange(event) {
   try {
     const checked = Boolean(event?.target?.checked);
@@ -13364,8 +13761,6 @@ async function handleSaveCaptureSettings() {
       getCaptureBloggerMetricsChecked(current);
     const includeBloggerMetricsOnDetailCapture =
       getDetailCaptureBloggerMetricsChecked(current);
-    const recaptureCommentsOnCountIncrease =
-      getDetailCaptureCommentCountRecheckChecked(current);
     const sharedWaitMinMs =
       readSecondsInput(
         "inputSharedWaitMinSec",
@@ -13432,7 +13827,6 @@ async function handleSaveCaptureSettings() {
       commentLeadsIps,
       includeBloggerMetricsOnNoteCapture,
       includeBloggerMetricsOnDetailCapture,
-      recaptureCommentsOnCountIncrease,
       sharedWaitMinMs,
       sharedWaitMaxMs,
       sharedStallTimeoutMs,
@@ -13704,6 +14098,9 @@ async function stopDetailCaptureAndReleaseForSync() {
   detailBatchCaptureInFlight = false;
   detailBatchCancelRequested = false;
   detailBatchRunnerTabId = null;
+  if (activeCaptureExecutionLockId) {
+    void renewCaptureExecutionLock(activeCaptureExecutionLockId);
+  }
   updateDataPoolUI(getCurrentDataPool());
   updatePageTypeUI(getCurrentRuntime()?.pageType || PAGE_TYPE.UNKNOWN);
   return result;
@@ -13750,12 +14147,20 @@ function prioritizeRecordsForSync(records = []) {
   return [...bloggerProfiles, ...others];
 }
 
+const DETAIL_ITEM_SETTLED_PHASES = new Set([
+  "detail_item_done",
+  "detail_item_failed",
+  "detail_item_skipped",
+  "detail_item_filtered",
+]);
+
 async function maybeRunAutoDetailCaptureAfterListCapture(
   settings,
   {
     sourceLabel = "当前列表",
     recordIds = null,
     onProgress = null,
+    onItemSettled = null,
     waitForegroundTabId = null,
   } = {},
 ) {
@@ -13826,6 +14231,7 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
   const result = await runDetailCaptureForRecordIds(targetRecordIds, settings, {
     progressMessage: `正在执行采集增强（0/${targetRecordIds.length}）...`,
     onProgress,
+    onItemSettled,
     waitForegroundTabId,
   });
 
@@ -13859,7 +14265,13 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
 
 async function maybeRunAutoSyncAfterDetailCapture(
   settings,
-  {sourceLabel = "当前列表", recordIds = null} = {},
+  {
+    sourceLabel = "当前列表",
+    recordIds = null,
+    silent = false,
+    refreshAfter = true,
+    syncProgress = null,
+  } = {},
 ) {
   if (!Boolean(settings?.autoSyncAfterDetailCapture)) {
     return {
@@ -13885,6 +14297,13 @@ async function maybeRunAutoSyncAfterDetailCapture(
       reason: "no_records",
     };
   }
+
+  const progressHandler =
+    typeof syncProgress === "function"
+      ? syncProgress
+      : silent
+        ? null
+        : handleProgress;
 
   try {
     const records = await getRecords(normalizedRecordIds);
@@ -13926,16 +14345,20 @@ async function maybeRunAutoSyncAfterDetailCapture(
       requiredTypes.push(SYNC_TYPE.COMMENT_LEADS);
     }
 
-    showProgress(`${sourceLabel}采集增强完成，正在自动同步后台...`);
+    if (!silent) {
+      showProgress(`${sourceLabel}采集增强完成，正在自动同步后台...`);
+    }
     const checkResult = await checkBeforeSync(requiredTypes, {
-      onProgress: handleProgress,
+      onProgress: progressHandler,
     });
     if (!checkResult.ok) {
       const errorMsg =
         ERROR_MESSAGE_MAP[checkResult.error?.code] ||
         checkResult.error?.message ||
         "自动同步前检查失败";
-      showMessage(`${sourceLabel}自动同步未执行：${errorMsg}`, "warning");
+      if (!silent) {
+        showMessage(`${sourceLabel}自动同步未执行：${errorMsg}`, "warning");
+      }
       return {
         ok: false,
         phase: "check",
@@ -13943,14 +14366,16 @@ async function maybeRunAutoSyncAfterDetailCapture(
       };
     }
 
-    const result = await syncRecordBatch(targetRecordIds, handleProgress, {
+    const result = await syncRecordBatch(targetRecordIds, progressHandler, {
       trigger: "detail_auto",
       syncScope: SYNC_SCOPE_PENDING,
       captureSettings: settings,
       commentLeadsConfig,
     });
 
-    await Promise.all([refreshDataPool(), refreshSyncHistory()]);
+    if (refreshAfter) {
+      await Promise.all([refreshDataPool(), refreshSyncHistory()]);
+    }
 
     const leadsSyncedCount = Number(result.commentLeadsSyncedCount || 0);
     const leadsSkippedCount = Number(result.commentLeadsSkippedCount || 0);
@@ -13964,25 +14389,31 @@ async function maybeRunAutoSyncAfterDetailCapture(
         ? `，剩余 ${result.skippedCount} 条待再次同步`
         : "";
 
-    if (result.ok) {
-      showMessage(
-        `${sourceLabel}已自动同步后台：${result.successCount} 条${skippedMessage}${leadsSummary}`,
-        "success",
-      );
-    } else {
-      showMessage(
-        `${sourceLabel}自动同步部分失败：成功 ${result.successCount}，失败 ${result.failedCount}${skippedMessage}${leadsSummary}`,
-        "warning",
-      );
+    if (!silent) {
+      if (result.ok) {
+        showMessage(
+          `${sourceLabel}已自动同步后台：${result.successCount} 条${skippedMessage}${leadsSummary}`,
+          "success",
+        );
+      } else {
+        showMessage(
+          `${sourceLabel}自动同步部分失败：成功 ${result.successCount}，失败 ${result.failedCount}${skippedMessage}${leadsSummary}`,
+          "warning",
+        );
+      }
     }
 
     return result;
   } catch (error) {
     console.error("[Sidebar] Auto sync after detail capture failed:", error);
-    showMessage(`${sourceLabel}自动同步失败: ${error.message}`, "warning");
-    await Promise.all([refreshDataPool(), refreshSyncHistory()]).catch(
-      () => null,
-    );
+    if (!silent) {
+      showMessage(`${sourceLabel}自动同步失败: ${error.message}`, "warning");
+    }
+    if (refreshAfter) {
+      await Promise.all([refreshDataPool(), refreshSyncHistory()]).catch(
+        () => null,
+      );
+    }
     return {
       ok: false,
       phase: "sync",
@@ -13994,7 +14425,12 @@ async function maybeRunAutoSyncAfterDetailCapture(
 async function runDetailCaptureForRecordIds(
   recordIds,
   settings,
-  {progressMessage = "", onProgress = null, waitForegroundTabId = null} = {},
+  {
+    progressMessage = "",
+    onProgress = null,
+    onItemSettled = null,
+    waitForegroundTabId = null,
+  } = {},
 ) {
   const normalizedRecordIds = Array.isArray(recordIds)
     ? [
@@ -14031,6 +14467,15 @@ async function runDetailCaptureForRecordIds(
       if (typeof onProgress === "function") {
         onProgress(progress);
       }
+      if (
+        typeof onItemSettled === "function" &&
+        DETAIL_ITEM_SETTLED_PHASES.has(String(progress?.phase || "")) &&
+        String(progress?.recordId || "").trim()
+      ) {
+        Promise.resolve(onItemSettled(progress)).catch((error) => {
+          console.warn("[Sidebar] Detail item settled callback failed:", error);
+        });
+      }
     };
     const result = await batchCaptureDetailsForRecords(normalizedRecordIds, {
       onProgress: handleDetailProgress,
@@ -14041,8 +14486,6 @@ async function runDetailCaptureForRecordIds(
       ),
       skipAlreadyCaptured:
         settings?.skipAlreadyCapturedOnDetailCapture !== false,
-      recaptureCommentsOnCountIncrease:
-        settings?.recaptureCommentsOnCountIncrease !== false,
       enableCommentLeadsFilter: Boolean(
         settings?.enableCommentLeadsFilterOnDetailCapture,
       ),
@@ -14065,6 +14508,9 @@ async function runDetailCaptureForRecordIds(
     detailBatchCaptureInFlight = false;
     detailBatchCancelRequested = false;
     detailBatchRunnerTabId = null;
+    if (activeCaptureExecutionLockId) {
+      void renewCaptureExecutionLock(activeCaptureExecutionLockId);
+    }
     updateDataPoolUI(getCurrentDataPool());
     updatePageTypeUI(getCurrentRuntime()?.pageType || PAGE_TYPE.UNKNOWN);
   }
@@ -14477,7 +14923,15 @@ function handleProgress(progress) {
 
   if (phase.startsWith("detail_")) {
     if (Number.isFinite(Number(progress?.runnerTabId))) {
-      detailBatchRunnerTabId = Number(progress.runnerTabId);
+      const nextRunnerTabId = Number(progress.runnerTabId);
+      const runnerChanged = detailBatchRunnerTabId !== nextRunnerTabId;
+      detailBatchRunnerTabId = nextRunnerTabId;
+      if (runnerChanged && activeCaptureExecutionLockId) {
+        void renewCaptureExecutionLock(
+          activeCaptureExecutionLockId,
+          nextRunnerTabId,
+        );
+      }
     }
   }
 
@@ -15208,14 +15662,6 @@ function getDetailCaptureSkipCapturedChecked(settings) {
   return Boolean(input.checked);
 }
 
-function getDetailCaptureCommentCountRecheckChecked(settings) {
-  const input = getActiveDetailCaptureInput("comment-count-recheck");
-  if (!input) {
-    return settings?.recaptureCommentsOnCountIncrease !== false;
-  }
-  return Boolean(input.checked);
-}
-
 function getDetailCaptureLowFollowerHitFilterChecked(settings) {
   const input = getActiveDetailCaptureInput("low-follower-hit");
   if (!input) {
@@ -15256,7 +15702,6 @@ function syncAutoDetailCaptureControls({
   enableCommentLeadsFilter = null,
   includeBloggerMetrics = null,
   skipAlreadyCaptured = null,
-  recaptureCommentsOnCountIncrease = null,
   enableLowFollowerHitFilter = null,
   lowFollowerHitThreshold = null,
   forceDisabled = false,
@@ -15412,29 +15857,6 @@ function syncAutoDetailCaptureControls({
       input.disabled = forceDisabled || !detailCaptureSupported;
     });
 
-  document
-    .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
-    .forEach((input) => {
-      if (recaptureCommentsOnCountIncrease !== null) {
-        input.checked = Boolean(recaptureCommentsOnCountIncrease);
-      }
-      const skipCapturedEnabled = document.querySelector(
-        '[data-detail-setting="skip-captured"]:checked',
-      );
-      input.disabled =
-        forceDisabled ||
-        !detailCaptureSupported ||
-        !capabilities.captureComments ||
-        !skipCapturedEnabled;
-      input
-        .closest(".incremental-exception-group")
-        ?.classList.toggle("is-disabled", Boolean(input.disabled));
-      input.title = !capabilities.captureComments
-        ? `${getPlatformCopy(resolvedPlatform).label}当前版本暂不支持评论采集`
-        : !skipCapturedEnabled
-          ? "开启“跳过已增强笔记”后生效"
-          : "";
-    });
 }
 
 function syncDetailCaptureControlsFromStoredSettings(settings = {}, {platform = ""} = {}) {
@@ -15465,8 +15887,6 @@ function syncDetailCaptureControlsFromStoredSettings(settings = {}, {platform = 
       settings?.includeBloggerMetricsOnDetailCapture,
     ),
     skipAlreadyCaptured: settings?.skipAlreadyCapturedOnDetailCapture !== false,
-    recaptureCommentsOnCountIncrease:
-      settings?.recaptureCommentsOnCountIncrease !== false,
     enableLowFollowerHitFilter: Boolean(
       settings?.enableLowFollowerHitFilterOnDetailCapture,
     ),
@@ -15498,8 +15918,6 @@ async function persistDetailCaptureSettingsFromInputs() {
     getDetailCaptureBloggerMetricsChecked(current);
   const skipAlreadyCapturedOnDetailCapture =
     getDetailCaptureSkipCapturedChecked(current);
-  const recaptureCommentsOnCountIncrease =
-    getDetailCaptureCommentCountRecheckChecked(current);
   const enableLowFollowerHitFilterOnDetailCapture =
     getDetailCaptureLowFollowerHitFilterChecked(current);
   const lowFollowerHitThresholdOnDetailCapture =
@@ -15513,7 +15931,6 @@ async function persistDetailCaptureSettingsFromInputs() {
     enableCommentLeadsFilter: normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
     skipAlreadyCaptured: skipAlreadyCapturedOnDetailCapture,
-    recaptureCommentsOnCountIncrease,
     enableLowFollowerHitFilter: enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThreshold: lowFollowerHitThresholdOnDetailCapture,
   });
@@ -15527,7 +15944,6 @@ async function persistDetailCaptureSettingsFromInputs() {
       normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetricsOnDetailCapture,
     skipAlreadyCapturedOnDetailCapture,
-    recaptureCommentsOnCountIncrease,
     enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThresholdOnDetailCapture,
   });
@@ -15551,8 +15967,6 @@ function resolveCurrentDetailCaptureSettings(settings = {}) {
       getDetailCaptureBloggerMetricsChecked(settings),
     skipAlreadyCapturedOnDetailCapture:
       getDetailCaptureSkipCapturedChecked(settings),
-    recaptureCommentsOnCountIncrease:
-      getDetailCaptureCommentCountRecheckChecked(settings),
     enableLowFollowerHitFilterOnDetailCapture:
       getDetailCaptureLowFollowerHitFilterChecked(settings),
     lowFollowerHitThresholdOnDetailCapture:
@@ -17657,7 +18071,7 @@ function syncPlatformSettingsCapabilityUI(platform = "unknown") {
     document.getElementById("inputCommentLeadsTableName"),
     ...Array.from(
       document.querySelectorAll(
-        '[data-detail-setting="comments-max-detected-items"], [data-detail-setting="comment-leads"], [data-detail-setting="comment-count-recheck"]',
+        '[data-detail-setting="comments-max-detected-items"], [data-detail-setting="comment-leads"]',
       ),
     ),
     document.getElementById("batchDetailIncludeComments"),
@@ -18206,6 +18620,11 @@ if (document.readyState === "loading") {
 window.addEventListener("beforeunload", () => {
   stopKeywordSortSyncTimer();
   stopKeywordPlanReconcileTimer();
+  stopCaptureExecutionLockHeartbeat();
+});
+
+window.addEventListener("pagehide", () => {
+  stopCaptureExecutionLockHeartbeat();
 });
 
 /* ==================== 批量采集操作执行 ==================== */

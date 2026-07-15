@@ -18,6 +18,7 @@ import {
   getDataPool,
   getRecord,
   getRecords,
+  runDataPoolMutation,
   setDataPool,
   updateRecord,
   markRecordSynced,
@@ -57,6 +58,10 @@ import {
   recordDiagnosticStage,
 } from './diagnostics.js';
 import {buildDetailEnhanceStage} from './capture/stage-diagnostics.js';
+import {
+  isDouyinOwnProfileUrl,
+  pickDouyinAuthorName,
+} from './capture/douyin-author.js';
 // 福利中心(welfare-usage.js)未纳入本 fork —— 0.1.7 合并带来的 welfare 埋点已移除,见下方 no-op
 
 const COMMENT_CAPTURE_STATUS = {
@@ -595,83 +600,85 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     };
   }
 
-  const dataPool = await getDataPool();
-  const existingRecords = Array.isArray(dataPool.records) ? dataPool.records : [];
-  const keyToRecord = buildDataPoolIdentityIndex(existingRecords);
-  const savedRecords = []; // 全新记录:入本地池(unshift)+ 同步
-  const refreshedRecords = []; // 已存但刷新了互动数:就地改 + 同步,但不 unshift(避免本地重复)
-  const skippedRecordIds = [];
-  let skippedCount = 0;
+  return await runDataPoolMutation(async () => {
+    const dataPool = await getDataPool();
+    const existingRecords = Array.isArray(dataPool.records) ? dataPool.records : [];
+    const keyToRecord = buildDataPoolIdentityIndex(existingRecords);
+    const savedRecords = []; // 全新记录:入本地池(unshift)+ 同步
+    const refreshedRecords = []; // 已存但刷新了互动数:就地改 + 同步,但不 unshift(避免本地重复)
+    const skippedRecordIds = [];
+    let skippedCount = 0;
 
-  for (const record of normalizedRecords) {
-    const recordType = record?.type || record?.recordType;
-    if (!isListCaptureRecordType(recordType)) {
-      savedRecords.push(record);
-      continue;
-    }
-
-    const keys = resolveRecordIdentityKeys(record);
-    const knownInSession = keys.some((key) => session?.knownKeys?.has(key));
-    if (knownInSession) {
-      continue;
-    }
-
-    const existingRecord = keys
-      .map((key) => keyToRecord.get(key))
-      .find(Boolean);
-    if (existingRecord) {
-      skippedCount += 1;
-      const existingId = String(existingRecord.id || '').trim();
-      keys.forEach((key) => session?.knownKeys?.add(key));
-      // 不再整条丢弃:把这次采到的互动数就地刷新进已存记录并纳入同步;
-      // 没刷新到(0/空/没变)才按「已采过」计入 skipped。
-      const keywordLabelsChanged =
-        mergeKeywordMatchLabelsInPlace(existingRecord, record);
-      if (
-        refreshListCaptureMetricsInPlace(existingRecord, record) ||
-        keywordLabelsChanged
-      ) {
-        refreshedRecords.push(existingRecord);
-      } else if (existingId) {
-        skippedRecordIds.push(existingId);
+    for (const record of normalizedRecords) {
+      const recordType = record?.type || record?.recordType;
+      if (!isListCaptureRecordType(recordType)) {
+        savedRecords.push(record);
+        continue;
       }
-      continue;
+
+      const keys = resolveRecordIdentityKeys(record);
+      const knownInSession = keys.some((key) => session?.knownKeys?.has(key));
+      if (knownInSession) {
+        continue;
+      }
+
+      const existingRecord = keys
+        .map((key) => keyToRecord.get(key))
+        .find(Boolean);
+      if (existingRecord) {
+        skippedCount += 1;
+        const existingId = String(existingRecord.id || '').trim();
+        keys.forEach((key) => session?.knownKeys?.add(key));
+        // 不再整条丢弃:把这次采到的互动数就地刷新进已存记录并纳入同步;
+        // 没刷新到(0/空/没变)才按「已采过」计入 skipped。
+        const keywordLabelsChanged =
+          mergeKeywordMatchLabelsInPlace(existingRecord, record);
+        if (
+          refreshListCaptureMetricsInPlace(existingRecord, record) ||
+          keywordLabelsChanged
+        ) {
+          refreshedRecords.push(existingRecord);
+        } else if (existingId) {
+          skippedRecordIds.push(existingId);
+        }
+        continue;
+      }
+
+      savedRecords.push(record);
+      keys.forEach((key) => {
+        session?.knownKeys?.add(key);
+        keyToRecord.set(key, record);
+      });
     }
 
-    savedRecords.push(record);
-    keys.forEach((key) => {
-      session?.knownKeys?.add(key);
-      keyToRecord.set(key, record);
-    });
-  }
+    if (savedRecords.length > 0) {
+      dataPool.records.unshift(...savedRecords); // 只 unshift 全新记录
+    }
+    if (savedRecords.length > 0 || refreshedRecords.length > 0) {
+      // 刷新的记录是 dataPool.records 内的引用、已就地改 → 一并持久化
+      await setDataPool(dataPool);
+    }
 
-  if (savedRecords.length > 0) {
-    dataPool.records.unshift(...savedRecords); // 只 unshift 全新记录
-  }
-  if (savedRecords.length > 0 || refreshedRecords.length > 0) {
-    // 刷新的记录是 dataPool.records 内的引用、已就地改 → 一并持久化
-    await setDataPool(dataPool);
-  }
+    // 全新 + 已存刷新的,都回传给调用方同步(后端按新互动数 upsert)
+    const syncRecords = [...savedRecords, ...refreshedRecords];
+    const savedRecordIds = syncRecords.map((record) => record?.id).filter(Boolean);
+    if (session) {
+      session.stats.savedCount += savedRecords.length; // 统计「新增」只算全新,刷新不计新增
+      session.stats.skippedCount += skippedCount;
+      session.stats.lastSavedCount = savedRecords.length;
+      session.stats.lastSkippedCount = skippedCount;
+      session.savedRecords.push(...syncRecords);
+      pushUnique(session.savedRecordIds, savedRecordIds);
+      pushUnique(session.skippedRecordIds, skippedRecordIds);
+    }
 
-  // 全新 + 已存刷新的,都回传给调用方同步(后端按新互动数 upsert)
-  const syncRecords = [...savedRecords, ...refreshedRecords];
-  const savedRecordIds = syncRecords.map((record) => record?.id).filter(Boolean);
-  if (session) {
-    session.stats.savedCount += savedRecords.length; // 统计「新增」只算全新,刷新不计新增
-    session.stats.skippedCount += skippedCount;
-    session.stats.lastSavedCount = savedRecords.length;
-    session.stats.lastSkippedCount = skippedCount;
-    session.savedRecords.push(...syncRecords);
-    pushUnique(session.savedRecordIds, savedRecordIds);
-    pushUnique(session.skippedRecordIds, skippedRecordIds);
-  }
-
-  return {
-    savedRecords: syncRecords,
-    skippedCount,
-    skippedRecordIds: [...new Set(skippedRecordIds)],
-    recordIds: [...new Set([...savedRecordIds, ...skippedRecordIds])],
-  };
+    return {
+      savedRecords: syncRecords,
+      skippedCount,
+      skippedRecordIds: [...new Set(skippedRecordIds)],
+      recordIds: [...new Set([...savedRecordIds, ...skippedRecordIds])],
+    };
+  });
 }
 
 async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
@@ -1812,7 +1819,6 @@ export async function batchCaptureDetailsForRecords(
     detailAfterNavWaitMs = null,
     profileAfterNavWaitMs = null,
     skipAlreadyCaptured = null,
-    recaptureCommentsOnCountIncrease = null,
     waitForegroundTabId = null,
   } = {},
 ) {
@@ -1884,15 +1890,7 @@ export async function batchCaptureDetailsForRecords(
   // 不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。查询失败则不跳过(顶多多采几条,不影响主流程)。
   const resolvedSkipCaptured =
     skipAlreadyCaptured ?? settings.skipAlreadyCapturedOnDetailCapture ?? true;
-  const resolvedRecaptureCommentsOnIncrease =
-    Boolean(includeComments) &&
-    Boolean(
-      recaptureCommentsOnCountIncrease ??
-        settings.recaptureCommentsOnCountIncrease ??
-        true,
-    );
   let skipRecordIdSet = new Set();
-  let recaptureCommentRecordIdSet = new Set();
   if (resolvedSkipCaptured) {
     try {
       const idPairs = [];
@@ -1907,7 +1905,6 @@ export async function batchCaptureDetailsForRecords(
             recordId: rid,
             externalId: String(ext),
             payload: rec.payload,
-            commentsCount: resolveRecordListCommentsCount(rec),
           });
         }
       }
@@ -1916,7 +1913,6 @@ export async function batchCaptureDetailsForRecords(
       // ① 本地已采全(detailCaptureStatus=done)的 external_id —— 覆盖「循环内 / 同会话」重复,
       //    不依赖同步到后台(无人值守循环不会每轮自动同步,所以第2轮跳第1轮要靠这个)。
       const localDone = new Set();
-      const localDoneStatusByExt = new Map();
       try {
         const pool = await getDataPool();
         for (const rec of pool?.records || []) {
@@ -1925,10 +1921,6 @@ export async function batchCaptureDetailsForRecords(
           if (ext && candidateExtIds.has(String(ext))) {
             const normalizedExt = String(ext);
             localDone.add(normalizedExt);
-            localDoneStatusByExt.set(
-              normalizedExt,
-              buildCapturedCommentStatus(rec),
-            );
           }
         }
       } catch (poolError) {
@@ -1936,48 +1928,21 @@ export async function batchCaptureDetailsForRecords(
       }
 
       // ② 后台已采全的 —— 覆盖「跨夜 / 跨会话」(需之前同步过)
-      const { captured, items: remoteCapturedItems = [] } = await checkCapturedExternalIds({
+      const { captured } = await checkCapturedExternalIds({
         platform: probePlatform,
         externalIds: idPairs.map((p) => p.externalId),
       });
       const capturedSet = new Set(captured);
-      const remoteDoneStatusByExt = new Map(
-        remoteCapturedItems
-          .map((item) => [
-            String(item?.externalId || '').trim(),
-            {
-              commentsCount: normalizeOptionalCount(item?.commentsCount),
-              commentsBaselineCount: normalizeOptionalCount(
-                item?.commentsBaselineCount,
-              ),
-              hasBaseline: normalizeOptionalCount(item?.commentsBaselineCount) !== null,
-            },
-          ])
-          .filter(([externalId]) => externalId),
-      );
 
       const nextSkipRecordIds = [];
-      const nextRecaptureCommentRecordIds = [];
       idPairs.forEach((p) => {
         const isCaptured =
           capturedSet.has(p.externalId) || localDone.has(p.externalId);
         if (!isCaptured) return;
-        const shouldRecaptureComments =
-          resolvedRecaptureCommentsOnIncrease &&
-          hasCommentCountIncreasedSinceLastCapture({
-            currentCommentsCount: p.commentsCount,
-            localStatus: localDoneStatusByExt.get(p.externalId),
-            remoteStatus: remoteDoneStatusByExt.get(p.externalId),
-          });
-        if (shouldRecaptureComments) {
-          nextRecaptureCommentRecordIds.push(p.recordId);
-          return;
-        }
         nextSkipRecordIds.push(p.recordId);
       });
 
       skipRecordIdSet = new Set(nextSkipRecordIds);
-      recaptureCommentRecordIdSet = new Set(nextRecaptureCommentRecordIds);
 
       // 给跳过的记录打「已采过」标记,卡片据此显示"已采过"而非"未执行采集增强"
       for (const p of idPairs) {
@@ -1998,7 +1963,6 @@ export async function batchCaptureDetailsForRecords(
     } catch (error) {
       console.warn('[CaptureSync] 增量采集预检失败(忽略,照常补采):', error);
       skipRecordIdSet = new Set();
-      recaptureCommentRecordIdSet = new Set();
     }
   }
   // 全部已采过 → 不必开补采标签页,直接返回
@@ -2081,13 +2045,9 @@ export async function batchCaptureDetailsForRecords(
   // 增量采集:开跑前先告诉用户为什么只补一部分(否则客户看到跳过一脸懵)
   if (onProgress && skipRecordIdSet.size > 0) {
     const toCaptureCount = uniqueRecordIds.length - skipRecordIdSet.size;
-    const recaptureSuffix =
-      recaptureCommentRecordIdSet.size > 0
-        ? `，${recaptureCommentRecordIdSet.size} 条评论数增加将重采评论`
-        : '';
     onProgress({
       phase: 'detail_skip_summary',
-      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过)${recaptureSuffix},本次只补采 ${toCaptureCount} 条`,
+      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过),本次只补采 ${toCaptureCount} 条`,
       current: 0,
       total: uniqueRecordIds.length,
       skippedCount: skipRecordIdSet.size,
@@ -2823,18 +2783,25 @@ export function resolveSyncInputForRecord(record, target = {}) {
 
   const recordType = String(record.type || record.recordType || '').trim();
   if (isRecordHydratedAsSingleNote(record)) {
+    const payload = sanitizeDouyinPayloadAuthorsForSync(
+      record,
+      mergeHydratedDetailIntoRecordPayload(record),
+    );
     return buildPlatformSyncInput(record, target, {
       recordType,
       syncType: recordType,
-      payload: mergeHydratedDetailIntoRecordPayload(record),
+      payload,
     });
   }
 
+  const payload = sanitizeDouyinPayloadAuthorsForSync(
+    record,
+    record.payload && typeof record.payload === 'object' ? record.payload : {},
+  );
   return buildPlatformSyncInput(record, target, {
     recordType,
     syncType: recordType,
-    payload:
-      record.payload && typeof record.payload === 'object' ? record.payload : {},
+    payload,
   });
 }
 
@@ -2945,14 +2912,19 @@ function sanitizeMediaFieldsForStorage(payload) {
 }
 
 function normalizeDetailPayloadAgainstRecord(record, detailPayload) {
-  const base = detailPayload && typeof detailPayload === 'object'
-    ? {...detailPayload}
-    : {};
+  const item = getFirstPayloadItem(record?.payload);
+  const base = protectDouyinDetailAuthorAgainstListItem(
+    record,
+    detailPayload && typeof detailPayload === 'object'
+      ? {...detailPayload}
+      : {},
+    item,
+  );
+
   if (getSingleNoteType(base) !== 'image') {
     return base;
   }
 
-  const item = getFirstPayloadItem(record?.payload);
   const listCoverImageUrl = normalizeMediaUrlForStorage(
     item?.coverImageUrl ||
       item?.coverUrl ||
@@ -2975,6 +2947,120 @@ function normalizeDetailPayloadAgainstRecord(record, detailPayload) {
     coverImageUrl: listCoverImageUrl,
     imageUrls,
   };
+}
+
+function protectDouyinDetailAuthorAgainstListItem(
+  record,
+  detailPayload,
+  listItem,
+) {
+  const base = detailPayload && typeof detailPayload === 'object'
+    ? detailPayload
+    : {};
+  const platform = String(
+    record?.platform || base?.platform || resolvePayloadPlatform(base),
+  ).trim().toLowerCase();
+  if (platform !== 'douyin') {
+    return base;
+  }
+
+  const detailAuthor = pickDouyinAuthorName(
+    base.author,
+    base.authorName,
+    base.nickname,
+    base.bloggerName,
+  );
+  const listAuthor = pickDouyinAuthorName(
+    listItem?.author,
+    listItem?.authorName,
+    listItem?.nickname,
+    listItem?.bloggerName,
+  );
+  const author = detailAuthor || listAuthor;
+  const authorUrl = pickTrustedDouyinAuthorUrl(
+    detailAuthor
+      ? [
+          base.authorProfileUrl,
+          base.authorUrl,
+          base.bloggerProfileUrl,
+          base.profileUrl,
+        ]
+      : [],
+    [
+      listItem?.authorProfileUrl,
+      listItem?.authorUrl,
+      listItem?.bloggerProfileUrl,
+      listItem?.profileUrl,
+    ],
+  );
+  const detailAuthorId = String(base.authorId || base.bloggerId || '').trim();
+  const listAuthorId = String(
+    listItem?.authorId || listItem?.bloggerId || '',
+  ).trim();
+  const authorId = detailAuthor && !/^self$/i.test(detailAuthorId)
+    ? detailAuthorId
+    : listAuthorId;
+
+  base.author = author;
+  base.authorName = author;
+  if (Object.prototype.hasOwnProperty.call(base, 'nickname')) {
+    base.nickname = author;
+  }
+  if (Object.prototype.hasOwnProperty.call(base, 'bloggerName')) {
+    base.bloggerName = author;
+  }
+  base.authorId = authorId;
+  base.authorUrl = authorUrl;
+  base.bloggerProfileUrl = authorUrl;
+  if (Object.prototype.hasOwnProperty.call(base, 'authorProfileUrl')) {
+    base.authorProfileUrl = authorUrl;
+  }
+  if (Object.prototype.hasOwnProperty.call(base, 'profileUrl')) {
+    base.profileUrl = authorUrl;
+  }
+  return base;
+}
+
+function pickTrustedDouyinAuthorUrl(...candidateGroups) {
+  for (const candidates of candidateGroups) {
+    for (const candidate of candidates || []) {
+      const url = String(candidate || '').trim();
+      if (url && !isDouyinOwnProfileUrl(url)) return url;
+    }
+  }
+  return '';
+}
+
+function sanitizeDouyinPayloadAuthorsForSync(record, payload) {
+  const base = payload && typeof payload === 'object' ? payload : {};
+  const platform = String(
+    record?.platform || base.platform || resolvePayloadPlatform(base),
+  ).trim().toLowerCase();
+  if (platform !== 'douyin') {
+    return base;
+  }
+
+  const next = {...base};
+  const items = Array.isArray(base.items) ? base.items : [];
+  const firstItem = items[0] && typeof items[0] === 'object' ? items[0] : null;
+  if (items.length > 0) {
+    next.items = items.map((item) =>
+      item && typeof item === 'object'
+        ? protectDouyinDetailAuthorAgainstListItem(record, {...item}, null)
+        : item,
+    );
+  } else {
+    protectDouyinDetailAuthorAgainstListItem(record, next, null);
+  }
+
+  if (base.detailPayload && typeof base.detailPayload === 'object') {
+    next.detailPayload = protectDouyinDetailAuthorAgainstListItem(
+      record,
+      {...base.detailPayload},
+      firstItem,
+    );
+  }
+  return next;
 }
 
 function clearPlayableMediaFields(payload) {
@@ -3112,6 +3198,7 @@ function mergeHydratedDetailIntoRecordPayload(record) {
     ...firstItem,
     ...detail,
   };
+  protectDouyinDetailAuthorAgainstListItem(record, mergedItem, firstItem);
 
   // 详情增强若返回空标题/正文(典型:抖音图文 desc 常为空),别用空覆盖搜索卡片已采到的真实值。
   // 卡片兜底占位「抖音搜索结果 N」不算真标题,不回填;抖音正文=标题,缺正文时用标题补。
@@ -6857,46 +6944,6 @@ function resolveRecordListCommentsCount(record = {}) {
     'commentsCount',
     'comments_count',
   ]);
-}
-
-function buildCapturedCommentStatus(record = {}) {
-  const payload =
-    record?.payload && typeof record.payload === 'object'
-      ? record.payload
-      : {};
-  const baseline = normalizeOptionalCount(payload.detailCommentCountBaseline);
-  return {
-    commentsCount: resolveRecordListCommentsCount(record),
-    commentsBaselineCount: baseline,
-    hasBaseline: baseline !== null,
-  };
-}
-
-function resolveCapturedCommentBaseline({ localStatus = null, remoteStatus = null } = {}) {
-  if (localStatus?.hasBaseline && localStatus.commentsBaselineCount !== null) {
-    return localStatus.commentsBaselineCount;
-  }
-  if (remoteStatus?.hasBaseline && remoteStatus.commentsBaselineCount !== null) {
-    return remoteStatus.commentsBaselineCount;
-  }
-  if (remoteStatus?.commentsCount !== null && remoteStatus?.commentsCount !== undefined) {
-    return remoteStatus.commentsCount;
-  }
-  if (localStatus?.commentsCount !== null && localStatus?.commentsCount !== undefined) {
-    return localStatus.commentsCount;
-  }
-  return null;
-}
-
-function hasCommentCountIncreasedSinceLastCapture({
-  currentCommentsCount = null,
-  localStatus = null,
-  remoteStatus = null,
-} = {}) {
-  const current = normalizeOptionalCount(currentCommentsCount);
-  if (current === null) return false;
-  const baseline = resolveCapturedCommentBaseline({ localStatus, remoteStatus });
-  return baseline !== null && current > baseline;
 }
 
 function isValidBloggerMetricsStatus(status) {

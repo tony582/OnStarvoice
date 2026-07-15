@@ -26,6 +26,12 @@ import {
   getText,
   resolveDetailRoot,
 } from "./shared/detail-dom.js";
+import {
+  isDouyinOwnProfileUrl,
+  isDouyinShellAuthorName,
+  normalizeDouyinAuthorName,
+  pickDouyinAuthorName,
+} from "./douyin-author.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const DOUYIN_INLINE_BLOGGER_METRICS_SELECTORS = Object.freeze([
@@ -471,7 +477,7 @@ function buildPayloadFromApiDetail(detail, noteId) {
     noteId: String(noteId),
     url: buildDouyinCanonicalNoteUrl(noteId, noteType, detail),
     title,
-    author: author.nickname || "",
+    author: normalizeDouyinAuthorName(author.nickname || ""),
     authorId: secUid || author.uid || "",
     authorUsername: author.unique_id || "",
     authorUrl,
@@ -1295,7 +1301,7 @@ function getNodeArea(node) {
 
 function extractDouyinAuthorInfo(detailRoot) {
   const authorCardScope = findDouyinAuthorCardScope(detailRoot);
-  const linkElement =
+  const candidateLink =
     findPreferredDouyinAuthorLink(authorCardScope || detailRoot) ||
     findPreferredDouyinAuthorLink(detailRoot) ||
     getFirstMatch(
@@ -1303,6 +1309,9 @@ function extractDouyinAuthorInfo(detailRoot) {
       authorCardScope || detailRoot,
     ) ||
     null;
+  const linkElement = isRejectedDouyinAuthorElement(candidateLink)
+    ? null
+    : candidateLink;
 
   let nameText =
     findPreferredDouyinAuthorName(authorCardScope || detailRoot) ||
@@ -1317,7 +1326,7 @@ function extractDouyinAuthorInfo(detailRoot) {
     nameText = findDouyinAuthorNameByUrl(url, authorCardScope || detailRoot);
   }
 
-  const name = cleanText(nameText).replace(/^@/, "");
+  const name = normalizeDouyinAuthorName(nameText);
   const userId = extractBloggerId(url) || "";
 
   return {
@@ -1340,6 +1349,7 @@ function findDouyinAuthorCardScope(detailRoot = null) {
     try {
       scope.querySelectorAll('a[href*="/user/"]').forEach((link) => {
         if (!(link instanceof Element) || !isElementVisible(link)) return;
+        if (isRejectedDouyinAuthorElement(link)) return;
         const rect = link.getBoundingClientRect();
         if (rect.left < window.innerWidth * 0.5) return;
         if (rect.top < 0 || rect.top > window.innerHeight * 0.45) return;
@@ -1393,6 +1403,7 @@ function findPreferredDouyinAuthorLink(detailRoot) {
     try {
       context.querySelectorAll('a[href*="/user/"]').forEach((node) => {
         if (!(node instanceof Element) || !isElementVisible(node)) return;
+        if (isRejectedDouyinAuthorElement(node)) return;
         if (!isLikelyDouyinUserEntry(node)) return;
         const actionable =
           node.closest?.('a[href*="/user/"]') ||
@@ -1422,8 +1433,8 @@ function findPreferredDouyinAuthorName(detailRoot) {
   }
 
   const textCandidates = [
-    cleanText(preferredLink.textContent || ""),
-    cleanText(
+    normalizeDouyinAuthorName(preferredLink.textContent || ""),
+    normalizeDouyinAuthorName(
       preferredLink.querySelector?.('[data-e2e="feed-video-nickname"]')?.textContent || "",
     ),
   ].filter(Boolean);
@@ -1462,7 +1473,8 @@ function findDouyinAuthorNameByUrl(authorUrl = "", detailRoot = null) {
       } catch {}
 
       for (const link of matchedLinks) {
-        const directText = cleanText(link.textContent || "").replace(/^@/, "");
+        if (isRejectedDouyinAuthorElement(link)) continue;
+        const directText = normalizeDouyinAuthorName(link.textContent || "");
         if (directText) {
           return directText;
         }
@@ -1472,7 +1484,7 @@ function findDouyinAuthorNameByUrl(authorUrl = "", detailRoot = null) {
           const textCandidates = Array.from(
             current.querySelectorAll('a[href*="/user/"], span, div, p, h1, h2, h3'),
           )
-            .map((node) => cleanText(node.textContent || "").replace(/^@/, ""))
+            .map((node) => normalizeDouyinAuthorName(node.textContent || ""))
             .filter((text) => {
               if (!text) return false;
               if (text.length > 32) return false;
@@ -2159,6 +2171,7 @@ function findStrictDouyinAvatarTrigger(scope = null) {
 
 function scoreDouyinAuthorEntryCandidate(node) {
   if (!(node instanceof Element)) return 0;
+  if (isRejectedDouyinAuthorElement(node)) return 0;
   const rect = node.getBoundingClientRect();
   const text = cleanText(node.textContent || "");
   const attrText = [
@@ -2192,6 +2205,7 @@ function scoreDouyinAuthorEntryCandidate(node) {
 function isLikelyDouyinUserEntry(actionable, sourceNode = null) {
   const nodes = [actionable, sourceNode].filter((node) => node instanceof Element);
   if (nodes.length === 0) return false;
+  if (nodes.some((node) => isRejectedDouyinAuthorElement(node))) return false;
 
   return nodes.some((node) => {
     const text = cleanText(node.textContent || "");
@@ -2209,6 +2223,16 @@ function isLikelyDouyinUserEntry(actionable, sourceNode = null) {
       /^@/.test(text)
     );
   });
+}
+
+function isRejectedDouyinAuthorElement(node) {
+  if (!(node instanceof Element)) return false;
+  const text = cleanText(node.textContent || "");
+  const href =
+    node.getAttribute?.("href") ||
+    node.closest?.('a[href*="/user/"]')?.getAttribute?.("href") ||
+    "";
+  return isDouyinShellAuthorName(text) || isDouyinOwnProfileUrl(href);
 }
 
 function isLikelyRightRailTarget(node) {
@@ -2722,7 +2746,7 @@ function supplementDouyinImageNotePayload(payload, noteId = "", apiDetail = null
     noteType: "image",
     type: "image",
     url: buildDouyinCanonicalNoteUrl(noteId, "image", apiDetail),
-    author: normalizedPayload.author || authorInfo.name || "",
+    author: pickDouyinAuthorName(normalizedPayload.author, authorInfo.name),
     authorId: normalizedPayload.authorId || authorInfo.userId || "",
     authorUsername: normalizedPayload.authorUsername || "",
     authorUrl: normalizedPayload.authorUrl || authorInfo.url || "",

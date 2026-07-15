@@ -27,9 +27,16 @@ const SCHEDULE_MODES = new Set([
 ]);
 const MIN_SCHEDULE_LEAD_MS = 60 * 1000;
 const MAX_SCHEDULE_LOOKAHEAD_DAYS = 400;
-const CAPTURE_EXECUTION_LOCK_TTL_MS = 12 * 60 * 60 * 1000;
+// 采集锁使用短租约并由持有侧栏续租。这样侧栏刷新、关闭或崩溃后，
+// 不会再留下最长 12 小时且界面不可见的“幽灵任务”。
+const CAPTURE_EXECUTION_LOCK_LEASE_MS = 2 * 60 * 1000;
+const CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION = 1;
+const UNATTENDED_LOCK_RETRY_DELAY_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_CLAIM_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_RUN_ACTIVE_GRACE_MS = 5 * 60 * 1000;
+const CONTENT_SCRIPT_READY_TIMEOUT_MS = 10 * 1000;
+const CONTENT_RELAY_DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
+const CONTENT_RELAY_MAX_TIMEOUT_MS = 11 * 60 * 1000;
 const UNATTENDED_RUN_TERMINAL_STATUSES = new Set([
   'completed',
   'failed',
@@ -378,17 +385,8 @@ async function isUnattendedRunRequestActive(request) {
     return false;
   }
 
-  const runnerTabId = Number(request.runnerTabId);
-  if (Number.isFinite(runnerTabId) && runnerTabId > 0) {
-    try {
-      await chrome.tabs.get(runnerTabId);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   const timestamp =
+    parseTimestampMs(request.heartbeatAt) ||
     parseTimestampMs(request.updatedAt) ||
     parseTimestampMs(request.claimedAt) ||
     parseTimestampMs(request.createdAt);
@@ -400,7 +398,20 @@ async function isUnattendedRunRequestActive(request) {
     status === 'pending'
       ? UNATTENDED_RUN_CLAIM_GRACE_MS
       : UNATTENDED_RUN_ACTIVE_GRACE_MS;
-  return Date.now() - timestamp <= graceMs;
+  if (Date.now() - timestamp > graceMs) {
+    return false;
+  }
+
+  const runnerTabId = Number(request.runnerTabId);
+  if (Number.isFinite(runnerTabId) && runnerTabId > 0) {
+    try {
+      await chrome.tabs.get(runnerTabId);
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 async function markUnattendedRunRequestStale(request, message) {
@@ -477,16 +488,10 @@ async function relayCancelToTabs(tabIds = []) {
   return successCount;
 }
 
-async function releaseUnattendedKeywordPlanLock({ includeLegacyManualBatch = false } = {}) {
+async function releaseUnattendedKeywordPlanLock() {
   const activeLock = await readActiveCaptureExecutionLock();
   const owner = String(activeLock?.owner || '');
-  if (
-    !activeLock ||
-    (
-      owner !== 'unattended_keyword_plan' &&
-      !(includeLegacyManualBatch && owner === 'manual_batch_keyword_capture')
-    )
-  ) {
+  if (!activeLock || owner !== 'unattended_keyword_plan') {
     return false;
   }
   return await releaseCaptureExecutionLock(activeLock.id);
@@ -554,76 +559,238 @@ async function saveUnattendedKeywordPlan(
   return nextPlan;
 }
 
-function normalizeCaptureExecutionLock(value) {
+let captureExecutionLockOperationQueue = Promise.resolve();
+
+function runCaptureExecutionLockOperation(operation) {
+  const pending = captureExecutionLockOperationQueue.then(operation, operation);
+  captureExecutionLockOperationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function normalizeCaptureExecutionLock(value, { allowExpired = false } = {}) {
   if (!value || typeof value !== 'object') {
     return null;
   }
-  const expiresAt = Number(value.expiresAt);
-  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+  const id = String(value.id || '');
+  const storedExpiresAt = Number(value.expiresAt);
+  if (!id || !Number.isFinite(storedExpiresAt)) {
     return null;
   }
+
+  const schemaVersion = Number(value.schemaVersion) || 0;
+  let expiresAt = storedExpiresAt;
+  if (schemaVersion < CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION) {
+    // 旧版没有持有页面或续租凭证。扩展升级会销毁旧执行上下文，
+    // 因此继续信任这类 12 小时锁只会把用户再次困在幽灵锁中。
+    expiresAt = 0;
+  }
+  if (!allowExpired && expiresAt <= Date.now()) {
+    return null;
+  }
+
+  const holderTabId = Number(value.holderTabId);
   return {
-    id: String(value.id || ''),
+    id,
     owner: String(value.owner || 'unknown'),
     label: String(value.label || '正在运行的采集任务'),
     startedAt: String(value.startedAt || ''),
     updatedAt: String(value.updatedAt || ''),
     expiresAt,
+    schemaVersion,
+    holderId: String(value.holderId || ''),
+    holderDocumentId: String(value.holderDocumentId || ''),
+    holderTabId:
+      Number.isFinite(holderTabId) && holderTabId > 0 ? holderTabId : null,
   };
 }
 
-async function readActiveCaptureExecutionLock() {
+async function getCaptureExecutionLockHolderState(lock) {
+  if (!lock?.holderDocumentId || typeof chrome.runtime.getContexts !== 'function') {
+    return 'unknown';
+  }
+  try {
+    const contexts = await chrome.runtime.getContexts({
+      documentIds: [lock.holderDocumentId],
+    });
+    if (!Array.isArray(contexts)) {
+      return 'unknown';
+    }
+    return contexts.length > 0 ? 'alive' : 'gone';
+  } catch (error) {
+    console.warn('[Background] Failed to inspect capture lock holder:', error);
+    return 'unknown';
+  }
+}
+
+async function removeStaleCaptureExecutionLock(lock, reason) {
+  if (lock?.holderTabId) {
+    await relayCancelToTabs([lock.holderTabId]).catch(() => 0);
+  }
+  await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
+  console.warn('[Background] Removed stale capture execution lock:', {
+    id: lock?.id || '',
+    owner: lock?.owner || 'unknown',
+    reason,
+  });
+}
+
+async function readActiveCaptureExecutionLockUnsafe() {
   const stored = await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock);
-  const activeLock = normalizeCaptureExecutionLock(
-    stored[STORAGE_KEYS.captureExecutionLock],
-  );
-  if (!activeLock && stored[STORAGE_KEYS.captureExecutionLock]) {
-    await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock).catch(() => {});
+  const storedLock = stored[STORAGE_KEYS.captureExecutionLock];
+  if (!storedLock) {
+    return null;
+  }
+
+  const activeLock = normalizeCaptureExecutionLock(storedLock, {
+    allowExpired: true,
+  });
+  if (!activeLock) {
+    await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
+    return null;
+  }
+  if (activeLock.expiresAt <= Date.now()) {
+    await removeStaleCaptureExecutionLock(activeLock, 'lease_expired');
+    return null;
+  }
+
+  const holderState = await getCaptureExecutionLockHolderState(activeLock);
+  if (holderState === 'gone') {
+    await removeStaleCaptureExecutionLock(activeLock, 'holder_document_gone');
+    return null;
   }
   return activeLock;
+}
+
+async function readActiveCaptureExecutionLock() {
+  return await runCaptureExecutionLockOperation(
+    readActiveCaptureExecutionLockUnsafe,
+  );
 }
 
 async function acquireCaptureExecutionLock({
   owner = 'unknown',
   label = '采集任务',
-  ttlMs = CAPTURE_EXECUTION_LOCK_TTL_MS,
+  holderId = '',
+  holderDocumentId = '',
+  holderTabId = null,
 } = {}) {
-  const activeLock = await readActiveCaptureExecutionLock();
-  if (activeLock) {
-    return {
-      ok: false,
-      lock: activeLock,
-    };
-  }
+  return await runCaptureExecutionLockOperation(async () => {
+    const activeLock = await readActiveCaptureExecutionLockUnsafe();
+    if (activeLock) {
+      return {
+        ok: false,
+        lock: activeLock,
+      };
+    }
 
-  const now = Date.now();
-  const lock = {
-    id: createUuid(),
-    owner: String(owner || 'unknown'),
-    label: String(label || '采集任务'),
-    startedAt: new Date(now).toISOString(),
-    updatedAt: new Date(now).toISOString(),
-    expiresAt: now + Math.max(60 * 1000, Number(ttlMs) || CAPTURE_EXECUTION_LOCK_TTL_MS),
-  };
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.captureExecutionLock]: lock,
+    const now = Date.now();
+    const normalizedHolderTabId = Number(holderTabId);
+    const lock = {
+      id: createUuid(),
+      owner: String(owner || 'unknown'),
+      label: String(label || '采集任务'),
+      startedAt: new Date(now).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+      expiresAt: now + CAPTURE_EXECUTION_LOCK_LEASE_MS,
+      schemaVersion: CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION,
+      holderId: String(holderId || ''),
+      holderDocumentId: String(holderDocumentId || ''),
+      holderTabId:
+        Number.isFinite(normalizedHolderTabId) && normalizedHolderTabId > 0
+          ? normalizedHolderTabId
+          : null,
+    };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureExecutionLock]: lock,
+    });
+    return {
+      ok: true,
+      lock,
+    };
   });
-  return {
-    ok: true,
-    lock,
-  };
 }
 
-async function releaseCaptureExecutionLock(lockId = '') {
-  const activeLock = await readActiveCaptureExecutionLock();
-  if (!activeLock) {
+async function renewCaptureExecutionLock({
+  lockId = '',
+  holderId = '',
+  holderDocumentId = '',
+  holderTabId = null,
+} = {}) {
+  return await runCaptureExecutionLockOperation(async () => {
+    if (!lockId || !holderId) {
+      return {ok: false, lock: null, reason: 'missing_holder'};
+    }
+
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock);
+    const lock = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    if (!lock || lock.id !== lockId) {
+      return {ok: false, lock, reason: 'lock_replaced'};
+    }
+    if (lock.holderId && lock.holderId !== holderId) {
+      return {ok: false, lock, reason: 'holder_mismatch'};
+    }
+    if (
+      lock.holderDocumentId &&
+      lock.holderDocumentId !== String(holderDocumentId || '')
+    ) {
+      return {ok: false, lock, reason: 'document_mismatch'};
+    }
+
+    const now = Date.now();
+    const normalizedHolderTabId = Number(holderTabId);
+    const renewedLock = {
+      ...lock,
+      schemaVersion: CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION,
+      holderId,
+      holderDocumentId:
+        lock.holderDocumentId || String(holderDocumentId || ''),
+      holderTabId:
+        Number.isFinite(normalizedHolderTabId) && normalizedHolderTabId > 0
+          ? normalizedHolderTabId
+          : lock.holderTabId,
+      updatedAt: new Date(now).toISOString(),
+      expiresAt: now + CAPTURE_EXECUTION_LOCK_LEASE_MS,
+    };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureExecutionLock]: renewedLock,
+    });
+    return {ok: true, lock: renewedLock, reason: ''};
+  });
+}
+
+async function releaseCaptureExecutionLock(
+  lockId = '',
+  {holderId = '', holderDocumentId = '', requireHolder = false} = {},
+) {
+  return await runCaptureExecutionLockOperation(async () => {
+    if (!lockId) {
+      return false;
+    }
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock);
+    const activeLock = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    if (!activeLock) {
+      return true;
+    }
+    if (activeLock.id !== lockId) {
+      return false;
+    }
+    if (
+      requireHolder &&
+      ((activeLock.holderId && activeLock.holderId !== holderId) ||
+        (activeLock.holderDocumentId &&
+          activeLock.holderDocumentId !== String(holderDocumentId || '')))
+    ) {
+      return false;
+    }
+    await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
     return true;
-  }
-  if (lockId && activeLock.id !== lockId) {
-    return false;
-  }
-  await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
-  return true;
+  });
 }
 
 async function syncUnattendedKeywordAlarm(plan) {
@@ -752,8 +919,19 @@ async function handleUnattendedKeywordAlarm() {
         );
         return;
       } else {
-        await releaseCaptureExecutionLock(activeLock.id);
-        activeLock = null;
+        const retryAt = new Date(now.getTime() + UNATTENDED_LOCK_RETRY_DELAY_MS);
+        await saveUnattendedKeywordPlan(
+          {
+            ...plan,
+            lastRunAt: now.toISOString(),
+            lastRunStatus: 'deferred',
+            lastRunMessage: `${activeLock.label}正在运行，无人值守计划将在 5 分钟后重试`,
+            lastRunProgress: null,
+            nextRunAt: retryAt.toISOString(),
+          },
+          {recomputeNext: false},
+        );
+        return;
       }
     }
 
@@ -1210,18 +1388,105 @@ async function ensureContentScriptReady(tabId) {
   });
 }
 
+function getContentRelayTimeoutMs(payload = {}) {
+  const action = String(payload?.action || '');
+  if (
+    action === 'ping' ||
+    action === 'cancelCapture' ||
+    action === 'detectPageType' ||
+    action === 'detectSearchSortDimension'
+  ) {
+    return 10 * 1000;
+  }
+
+  const requestedDurationMs = Number(payload?.maxDurationMs);
+  if (Number.isFinite(requestedDurationMs) && requestedDurationMs > 0) {
+    return Math.min(
+      CONTENT_RELAY_MAX_TIMEOUT_MS,
+      Math.max(2 * 60 * 1000, requestedDurationMs + 30 * 1000),
+    );
+  }
+
+  return CONTENT_RELAY_DEFAULT_TIMEOUT_MS;
+}
+
+async function sendContentMessageWithTimeout(tabId, payload, timeoutMs) {
+  let timeoutId = null;
+  try {
+    return await Promise.race([
+      chrome.tabs.sendMessage(tabId, payload ?? {}),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          const error = new Error(
+            `页面采集脚本超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应，已跳过当前步骤`,
+          );
+          error.code = 'CONTENT_RELAY_TIMEOUT';
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function waitForContentScriptReady(tabId, {
+  timeoutMs = CONTENT_SCRIPT_READY_TIMEOUT_MS,
+  pollMs = 200,
+} = {}) {
+  const startedAt = Date.now();
+  let lastError = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const response = await sendContentMessageWithTimeout(
+        tabId,
+        { action: 'ping' },
+        Math.min(1500, timeoutMs),
+      );
+      if (response?.ok) {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  throw lastError || new Error('页面采集脚本加载超时，请刷新平台页面后重试');
+}
+
+async function cancelTimedOutContentCapture(tabId) {
+  try {
+    await sendContentMessageWithTimeout(
+      tabId,
+      { action: 'cancelCapture' },
+      5000,
+    );
+  } catch {
+    // The timed-out page may already have lost its content-script receiver.
+  }
+}
+
 async function relayToContentWithRetry(tabId, payload) {
+  const timeoutMs = getContentRelayTimeoutMs(payload);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return await chrome.tabs.sendMessage(tabId, payload ?? {});
+      return await sendContentMessageWithTimeout(tabId, payload, timeoutMs);
     } catch (error) {
+      if (error?.code === 'CONTENT_RELAY_TIMEOUT') {
+        await cancelTimedOutContentCapture(tabId);
+        throw error;
+      }
       if (!isTransientContentRelayError(error) || attempt === 1) {
         throw error;
       }
 
       await waitForTabReady(tabId).catch(() => null);
       await ensureContentScriptReady(tabId);
-      await new Promise((resolve) => setTimeout(resolve, 160));
+      await waitForContentScriptReady(tabId);
     }
   }
 
@@ -1404,27 +1669,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: true, data: null });
           return;
         }
+        const senderTabId = Number(sender?.tab?.id);
+        const isSameRunnerTab =
+          Boolean(requestId) &&
+          Number.isFinite(senderTabId) &&
+          senderTabId > 0 &&
+          Number(request.runnerTabId) === senderTabId;
+        const isSameRunnerResume =
+          isSameRunnerTab &&
+          new Set(['claimed', 'started', 'running']).has(
+            String(request.status || ''),
+          );
         if (
-          request.status === 'claimed' &&
-          (await isUnattendedRunRequestActive(request))
+          request.status !== 'pending' &&
+          (await isUnattendedRunRequestActive(request)) &&
+          !isSameRunnerResume
         ) {
           sendResponse({ ok: true, data: null });
           return;
         }
         if (
           request.status !== 'pending' &&
-          request.status !== 'claimed'
+          request.status !== 'claimed' &&
+          !isSameRunnerResume
         ) {
           sendResponse({ ok: true, data: null });
           return;
         }
 
+        const claimedAt = new Date().toISOString();
         const nextRequest = {
           ...request,
           status: 'claimed',
-          claimedAt: request.claimedAt || new Date().toISOString(),
+          claimedAt,
+          heartbeatAt: claimedAt,
           runnerTabId: sender?.tab?.id ?? request.runnerTabId ?? null,
-          updatedAt: new Date().toISOString(),
+          updatedAt: claimedAt,
+          resumeCount: isSameRunnerResume
+            ? Math.max(0, Number(request.resumeCount) || 0) + 1
+            : Math.max(0, Number(request.resumeCount) || 0),
+          message: isSameRunnerResume
+            ? '检测到运行页刷新，正在从已有采集数据恢复任务'
+            : request.message,
         };
         await chrome.storage.local.set({
           [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
@@ -1521,7 +1807,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           explicitTabId,
           progressRunnerTabId,
         ]);
-        await releaseUnattendedKeywordPlanLock({ includeLegacyManualBatch: true });
+        await releaseUnattendedKeywordPlanLock();
 
         const now = new Date();
         const plan = await readUnattendedKeywordPlan();
@@ -1552,14 +1838,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await acquireCaptureExecutionLock({
           owner: message?.owner,
           label: message?.label,
-          ttlMs: message?.ttlMs,
+          holderId: message?.holderId,
+          holderDocumentId: sender?.documentId,
+          holderTabId: message?.holderTabId ?? sender?.tab?.id,
         });
         sendResponse({ ok: result.ok, data: result.lock });
         return;
       }
 
+      if (type === 'onstarvoice:renew-capture-lock') {
+        const result = await renewCaptureExecutionLock({
+          lockId: message?.lockId,
+          holderId: message?.holderId,
+          holderDocumentId: sender?.documentId,
+          holderTabId: message?.holderTabId ?? sender?.tab?.id,
+        });
+        sendResponse({
+          ok: result.ok,
+          data: result.lock,
+          reason: result.reason,
+        });
+        return;
+      }
+
       if (type === 'onstarvoice:release-capture-lock') {
-        const released = await releaseCaptureExecutionLock(message?.lockId);
+        const released = await releaseCaptureExecutionLock(message?.lockId, {
+          holderId: message?.holderId,
+          holderDocumentId: sender?.documentId,
+          requireHolder: true,
+        });
         sendResponse({ ok: released });
         return;
       }
