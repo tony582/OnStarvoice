@@ -1,8 +1,17 @@
+try {
+  importScripts('utils/task-center.js');
+} catch (error) {
+  // 测试或旧交付快照中可能暂时没有任务中心脚本。后台可靠性逻辑仍可运行，
+  // 等脚本可用后会自动把同一份请求镜像到任务账本。
+  console.warn('[onstarvoice] task center core unavailable', error);
+}
+
 const STORAGE_KEYS = {
   runtime: 'onstarvoice.runtime',
   unattendedKeywordPlan: 'onstarvoice.unattendedKeywordPlan',
   unattendedKeywordRunRequest: 'onstarvoice.unattendedKeywordRunRequest',
   captureExecutionLock: 'onstarvoice.captureExecutionLock',
+  taskLedger: 'onstarvoice.taskLedger',
 };
 
 const DEFAULT_RUNTIME = {
@@ -21,6 +30,7 @@ const DEFAULT_RUNTIME = {
 };
 
 const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
+const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
 const SCHEDULE_MODES = new Set([
   'daily',
@@ -34,7 +44,14 @@ const CAPTURE_EXECUTION_LOCK_LEASE_MS = 2 * 60 * 1000;
 const CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION = 1;
 const UNATTENDED_LOCK_RETRY_DELAY_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_CLAIM_GRACE_MS = 2 * 60 * 1000;
-const UNATTENDED_RUN_ACTIVE_GRACE_MS = 5 * 60 * 1000;
+const UNATTENDED_RUN_ACTIVE_GRACE_MS = 3 * 60 * 1000;
+const UNATTENDED_RUN_BUSINESS_STALL_MS = 6 * 60 * 1000;
+const UNATTENDED_SUPERVISOR_PERIOD_MINUTES = 1;
+const UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS = 2.5 * 60 * 1000;
+const UNATTENDED_SUPERVISOR_WAKE_GRACE_MS = 2 * 60 * 1000;
+const UNATTENDED_SUPERVISOR_LOCK_WAIT_MS = 5 * 60 * 1000;
+const UNATTENDED_RUN_SCHEMA_VERSION = 2;
+const UNATTENDED_MAX_RECOVERY_ATTEMPTS = 2;
 const CONTENT_SCRIPT_READY_TIMEOUT_MS = 10 * 1000;
 const CONTENT_RELAY_DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
 const CONTENT_RELAY_MAX_TIMEOUT_MS = 11 * 60 * 1000;
@@ -45,11 +62,21 @@ const CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS = 20 * 1000;
 const CAPTURE_REQUEST_ABORT_TTL_MS = 15 * 60 * 1000;
 const UNATTENDED_RUN_TERMINAL_STATUSES = new Set([
   'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
   'failed',
   'canceled',
   'skipped',
+  'needs_action',
+]);
+const UNATTENDED_RUN_REPORTABLE_STATUSES = new Set([
+  'started',
+  'running',
+  ...UNATTENDED_RUN_TERMINAL_STATUSES,
 ]);
 let unattendedKeywordAlarmInFlight = false;
+let unattendedSupervisorInFlight = false;
+let lastUnattendedSupervisorTickAt = 0;
 const contentRelayHeartbeatByRequestId = new Map();
 const abortedCaptureRequestIds = new Map();
 const settledCaptureRequestIds = new Map();
@@ -238,6 +265,7 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     runnerTabId: Number.isFinite(runnerTabId) && runnerTabId > 0 ? runnerTabId : null,
     recordId: String(progress.recordId || ''),
     remainingMs: Number.isFinite(remainingMs) ? remainingMs : null,
+    waitUntil: String(progress.waitUntil || ''),
     message: String(progress.message || fallbackMessage || ''),
     updatedAt: String(progress.updatedAt || new Date().toISOString()),
   };
@@ -367,12 +395,59 @@ async function readUnattendedKeywordPlan() {
   );
 }
 
+let unattendedRunMutationQueue = Promise.resolve();
+let taskLedgerMutationQueue = Promise.resolve();
+
+function runUnattendedRunMutation(operation) {
+  const pending = unattendedRunMutationQueue.then(operation, operation);
+  unattendedRunMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runTaskLedgerMutation(operation) {
+  const pending = taskLedgerMutationQueue.then(operation, operation);
+  taskLedgerMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function normalizeUnattendedRunRequest(request) {
+  if (!request || typeof request !== 'object' || !String(request.id || '')) {
+    return null;
+  }
+  const createdAt =
+    String(request.createdAt || request.updatedAt || '') || new Date().toISOString();
+  const heartbeatAt = String(
+    request.heartbeatAt || request.claimedAt || request.updatedAt || createdAt,
+  );
+  const businessProgressAt = String(
+    request.businessProgressAt ||
+      request.progress?.updatedAt ||
+      request.startedAt ||
+      request.claimedAt ||
+      request.updatedAt ||
+      createdAt,
+  );
+  return {
+    ...request,
+    schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
+    id: String(request.id),
+    attemptId: String(request.attemptId || `legacy-${request.id}`),
+    attemptNumber: Math.max(1, Number(request.attemptNumber) || 1),
+    progressSeq: Math.max(0, Number(request.progressSeq) || 0),
+    recoveryCount: Math.max(0, Number(request.recoveryCount) || 0),
+    createdAt,
+    heartbeatAt,
+    businessProgressAt,
+  };
+}
+
 async function readUnattendedKeywordRunRequest() {
   const stored = await chrome.storage.local.get(
     STORAGE_KEYS.unattendedKeywordRunRequest,
   );
-  const request = stored[STORAGE_KEYS.unattendedKeywordRunRequest];
-  return request && typeof request === 'object' ? request : null;
+  return normalizeUnattendedRunRequest(
+    stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+  );
 }
 
 function isTerminalUnattendedRunStatus(status) {
@@ -382,6 +457,445 @@ function isTerminalUnattendedRunStatus(status) {
 function parseTimestampMs(value) {
   const timestamp = Date.parse(String(value || ''));
   return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+
+function getUnattendedTaskCenterCore() {
+  const core = globalThis.OnStarvoiceTaskCenterCore;
+  return core && typeof core === 'object' ? core : null;
+}
+
+function buildTaskCenterCheckpointFromUnattendedRequest(request) {
+  const source =
+    request?.checkpoint && typeof request.checkpoint === 'object'
+      ? request.checkpoint
+      : {};
+  const keywordResults = Array.isArray(source.keywordResults)
+    ? source.keywordResults
+    : [];
+  const collect = (statuses) =>
+    Array.from(
+      new Set(
+        keywordResults
+          .filter((entry) => statuses.has(String(entry?.status || '')))
+          .map((entry) => String(entry?.keyword || '').trim())
+          .filter(Boolean),
+      ),
+    );
+  const attempts = keywordResults.reduce((result, entry) => {
+    const keyword = String(entry?.keyword || '').trim();
+    if (keyword) {
+      result[keyword] = Math.max(0, Number(entry?.attemptCount) || 0);
+    }
+    return result;
+  }, {});
+  return {
+    round: Math.max(1, Number(source.round) || 1),
+    keywordIndex: Math.max(
+      0,
+      Number(source.keywordIndex ?? source.activeKeywordIndex) || 0,
+    ),
+    currentKeyword: String(
+      source.currentKeyword || source.activeKeyword || request?.progress?.keyword || '',
+    ),
+    phase: String(source.phase || source.activePhase || request?.progress?.phase || ''),
+    completedKeywords:
+      keywordResults.length > 0
+        ? collect(new Set(['completed']))
+        : Array.isArray(source.completedKeywords)
+          ? source.completedKeywords
+          : [],
+    failedKeywords:
+      keywordResults.length > 0
+        ? collect(new Set(['failed', 'partial']))
+        : Array.isArray(source.failedKeywords)
+          ? source.failedKeywords
+          : [],
+    skippedKeywords:
+      keywordResults.length > 0
+        ? collect(new Set(['skipped']))
+        : Array.isArray(source.skippedKeywords)
+          ? source.skippedKeywords
+          : [],
+    keywordResults: keywordResults.slice(0, 500).map((entry) => ({
+      round: Math.max(1, Number(entry?.round) || 1),
+      index: Math.max(0, Number(entry?.index) || 0),
+      keyword: String(entry?.keyword || '').trim(),
+      status: String(entry?.status || '').trim(),
+      attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
+      savedCount: Math.max(0, Number(entry?.savedCount) || 0),
+      error: String(entry?.error || '').trim(),
+      finishedAt: String(entry?.finishedAt || ''),
+    })),
+    attempts:
+      keywordResults.length > 0
+        ? attempts
+        : source.attempts && typeof source.attempts === 'object'
+          ? source.attempts
+          : {},
+  };
+}
+
+function buildUnattendedTaskCounts(request, previousCounts = {}) {
+  const summary =
+    request?.summary && typeof request.summary === 'object'
+      ? request.summary
+      : {};
+  const counts =
+    request?.counts && typeof request.counts === 'object'
+      ? request.counts
+      : {};
+  const read = (name, aliases = []) => {
+    const values = [counts[name], ...aliases.map((alias) => summary[alias])];
+    const value = values.find((candidate) => Number.isFinite(Number(candidate)));
+    return value == null
+      ? Math.max(0, Number(previousCounts?.[name]) || 0)
+      : Math.max(0, Math.floor(Number(value)));
+  };
+  const completed = read('success', ['success', 'completed']);
+  const failed = read('failed', ['failed']);
+  const skipped = read('skipped', ['skipped']);
+  const warnings = read('warnings', ['partial', 'warnings']);
+  const total = read('total', ['total']);
+  return {
+    total,
+    processed: read('processed', ['processed']) ||
+      Math.min(total || Number.MAX_SAFE_INTEGER, completed + failed + skipped + warnings),
+    saved: read('saved', ['saved']),
+    success: completed,
+    failed,
+    skipped,
+    retried: read('retried', ['retries', 'retried']),
+    warnings,
+  };
+}
+
+function buildUnattendedTaskRun(request, previousRun = null) {
+  const normalized = normalizeUnattendedRunRequest(request);
+  if (!normalized) {
+    return null;
+  }
+  const plan = normalizeUnattendedKeywordPlan(normalized.planSnapshot || {});
+  return {
+    ...(previousRun && typeof previousRun === 'object' ? previousRun : {}),
+    id: normalized.id,
+    taskType: 'unattended_keyword_capture',
+    featureKey: 'unattended_keyword_plan',
+    source: 'unattended_supervisor',
+    status: String(normalized.status || 'pending'),
+    platform: plan.platform,
+    trigger: String(normalized.reason || 'schedule'),
+    title: '无人值守关键词采集',
+    attemptId: normalized.attemptId,
+    attemptNumber: normalized.attemptNumber,
+    progressSeq: normalized.progressSeq,
+    heartbeatAt: normalized.heartbeatAt,
+    businessProgressAt: normalized.businessProgressAt,
+    progress: normalizeUnattendedRunProgress(
+      normalized.progress,
+      normalized.message,
+    ),
+    counts: buildUnattendedTaskCounts(normalized, previousRun?.counts),
+    checkpoint: buildTaskCenterCheckpointFromUnattendedRequest(normalized),
+    message: String(normalized.message || ''),
+    error:
+      normalized.error && typeof normalized.error === 'object'
+        ? normalized.error
+        : null,
+    runnerTabId:
+      Number.isFinite(Number(normalized.runnerTabId)) &&
+      Number(normalized.runnerTabId) > 0
+        ? Number(normalized.runnerTabId)
+        : null,
+    metadata: {
+      ...(previousRun?.metadata && typeof previousRun.metadata === 'object'
+        ? previousRun.metadata
+        : {}),
+      recoveryCount: normalized.recoveryCount,
+      maxRecoveryAttempts: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+      recoveryReason: String(normalized.recoveryReason || ''),
+      recoveryWaitUntil: String(normalized.recoveryWaitUntil || ''),
+      scheduledMode: plan.mode,
+      keywordCount: plan.keywords.length,
+      keywords: plan.keywords,
+      parentRequestId: String(normalized.parentRequestId || ''),
+      recoveryMode: String(normalized.recoveryMode || ''),
+    },
+    createdAt: normalized.createdAt,
+    startedAt: String(normalized.startedAt || normalized.claimedAt || ''),
+    updatedAt: String(normalized.updatedAt || normalized.createdAt),
+    finishedAt: String(normalized.finishedAt || ''),
+    legacy: false,
+    incomplete: false,
+  };
+}
+
+function fallbackUpsertUnattendedTaskRun(
+  rawLedger,
+  taskRun,
+  { previousAttemptId = '', allowAttemptTransition = false } = {},
+) {
+  const ledger =
+    rawLedger && typeof rawLedger === 'object'
+      ? {
+          ...rawLedger,
+          version: Number(rawLedger.version) || 1,
+          runs: Array.isArray(rawLedger.runs) ? [...rawLedger.runs] : [],
+        }
+      : {version: 1, runs: [], updatedAt: ''};
+  const index = ledger.runs.findIndex((item) => item?.id === taskRun.id);
+  const current = index >= 0 ? ledger.runs[index] : null;
+  if (
+    current &&
+    current.attemptId &&
+    taskRun.attemptId &&
+    current.attemptId !== taskRun.attemptId &&
+    (!allowAttemptTransition || current.attemptId !== previousAttemptId)
+  ) {
+    return {accepted: false, reason: 'attempt_mismatch', ledger, run: current};
+  }
+  if (current && isTerminalUnattendedRunStatus(current.status)) {
+    return {accepted: false, reason: 'terminal_absorbed', ledger, run: current};
+  }
+  const nextRun = {...(current || {}), ...taskRun};
+  if (index >= 0) {
+    ledger.runs[index] = nextRun;
+  } else {
+    ledger.runs.unshift(nextRun);
+  }
+  ledger.updatedAt = new Date().toISOString();
+  return {accepted: true, reason: current ? 'merged' : 'created', ledger, run: nextRun};
+}
+
+function upsertUnattendedTaskLedger(
+  rawLedger,
+  request,
+  {
+    previousRequest = null,
+    allowAttemptTransition = false,
+    event = null,
+    now = new Date().toISOString(),
+  } = {},
+) {
+  const core = getUnattendedTaskCenterCore();
+  let ledger = rawLedger;
+  if (core?.normalizeTaskLedger) {
+    ledger = core.normalizeTaskLedger(rawLedger, {now});
+  }
+  const existingRun = Array.isArray(ledger?.runs)
+    ? ledger.runs.find((item) => item?.id === request?.id) || null
+    : null;
+  let taskRun = buildUnattendedTaskRun(request, existingRun);
+  if (!taskRun) {
+    return {ledger, run: null, accepted: false, reason: 'invalid_id'};
+  }
+  if (event && core?.appendTaskEvent) {
+    taskRun = core.appendTaskEvent(taskRun, event, {now});
+  } else if (event) {
+    taskRun.events = [
+      ...(Array.isArray(existingRun?.events) ? existingRun.events : []),
+      {
+        type: String(event.type || 'status'),
+        message: String(event.message || ''),
+        at: String(event.at || now),
+      },
+    ].slice(-100);
+  }
+  if (core?.upsertTaskRun) {
+    return core.upsertTaskRun(ledger, taskRun, {
+      now,
+      attemptId: String(previousRequest?.attemptId || request.attemptId || ''),
+      allowAttemptTransition,
+    });
+  }
+  return fallbackUpsertUnattendedTaskRun(ledger, taskRun, {
+    previousAttemptId: String(previousRequest?.attemptId || ''),
+    allowAttemptTransition,
+  });
+}
+
+function buildPlanMirrorForUnattendedRequest(plan, request, now) {
+  const terminal = isTerminalUnattendedRunStatus(request.status);
+  const progress = normalizeUnattendedRunProgress(
+    request.progress,
+    request.message,
+  );
+  return normalizeUnattendedKeywordPlan({
+    ...plan,
+    lastRunAt:
+      String(
+        terminal
+          ? request.finishedAt || request.updatedAt || now
+          : request.updatedAt || request.startedAt || request.createdAt || now,
+      ) || now,
+    lastRunStatus: String(request.status || ''),
+    lastRunMessage:
+      String(request.message || '') || String(request.error?.message || ''),
+    // 终态也保留最后一次业务进度，供任务中心和晨间摘要解释卡在哪里。
+    lastRunProgress: progress,
+    updatedAt: now,
+  });
+}
+
+async function persistUnattendedRunMutation(
+  request,
+  {
+    previousRequest = null,
+    allowAttemptTransition = false,
+    event = null,
+    mirrorPlan = true,
+  } = {},
+) {
+  return await runTaskLedgerMutation(async () => {
+    const normalized = normalizeUnattendedRunRequest(request);
+    if (!normalized) {
+      return {request: null, plan: null, ledger: null};
+    }
+    const now = String(normalized.updatedAt || new Date().toISOString());
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.unattendedKeywordPlan,
+      STORAGE_KEYS.taskLedger,
+    ]);
+    const plan = normalizeUnattendedKeywordPlan(
+      stored[STORAGE_KEYS.unattendedKeywordPlan],
+    );
+    const ledgerResult = upsertUnattendedTaskLedger(
+      stored[STORAGE_KEYS.taskLedger],
+      normalized,
+      {previousRequest, allowAttemptTransition, event, now},
+    );
+    if (ledgerResult.accepted === false) {
+      const error = new Error(
+        `task ledger rejected unattended mutation: ${ledgerResult.reason || 'unknown'}`,
+      );
+      error.code = 'UNATTENDED_LEDGER_REJECTED';
+      throw error;
+    }
+    const nextPlan = mirrorPlan
+      ? buildPlanMirrorForUnattendedRequest(plan, normalized, now)
+      : plan;
+    const values = {
+      [STORAGE_KEYS.unattendedKeywordRunRequest]: normalized,
+      [STORAGE_KEYS.taskLedger]: ledgerResult.ledger,
+    };
+    if (mirrorPlan) {
+      values[STORAGE_KEYS.unattendedKeywordPlan] = nextPlan;
+    }
+    await chrome.storage.local.set(values);
+    return {
+      request: normalized,
+      plan: nextPlan,
+      ledger: ledgerResult.ledger,
+      ledgerAccepted: ledgerResult.accepted,
+      ledgerReason: ledgerResult.reason,
+    };
+  });
+}
+
+async function readTaskLedger() {
+  return await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const rawLedger = stored[STORAGE_KEYS.taskLedger];
+    const core = getUnattendedTaskCenterCore();
+    if (core?.normalizeTaskLedger) {
+      return core.normalizeTaskLedger(rawLedger, {now: new Date().toISOString()});
+    }
+    return rawLedger && typeof rawLedger === 'object'
+      ? {
+          ...rawLedger,
+          version: Number(rawLedger.version) || 1,
+          runs: Array.isArray(rawLedger.runs) ? rawLedger.runs : [],
+          updatedAt: String(rawLedger.updatedAt || ''),
+        }
+      : {version: 1, runs: [], updatedAt: ''};
+  });
+}
+
+async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}) {
+  return await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const core = getUnattendedTaskCenterCore();
+    const now = new Date().toISOString();
+    let ledger = core?.normalizeTaskLedger
+      ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
+      : stored[STORAGE_KEYS.taskLedger] || {version: 1, runs: [], updatedAt: ''};
+    const sourceRun =
+      run && typeof run === 'object' && !Array.isArray(run) ? run : {};
+    const sourcePatch =
+      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+    const taskId = String(sourcePatch.id || sourceRun.id || '').trim();
+    if (!taskId) {
+      return {accepted: false, reason: 'invalid_id', data: null, ledger};
+    }
+    const existing = Array.isArray(ledger?.runs)
+      ? ledger.runs.find((item) => item?.id === taskId) || null
+      : null;
+    let nextRun = {...(existing || {}), ...sourceRun, ...sourcePatch, id: taskId};
+    if (!nextRun.taskType && nextRun.kind) {
+      nextRun.taskType = nextRun.kind;
+    }
+    if (event && typeof event === 'object') {
+      if (core?.appendTaskEvent) {
+        nextRun = core.appendTaskEvent(nextRun, event, {now});
+      } else {
+        nextRun.events = [
+          ...(Array.isArray(existing?.events) ? existing.events : []),
+          {...event, at: String(event.at || now)},
+        ].slice(-100);
+      }
+    }
+    const result = core?.upsertTaskRun
+      ? core.upsertTaskRun(ledger, nextRun, {
+          now,
+          attemptId: String(
+            sourcePatch.expectedAttemptId ||
+              sourceRun.expectedAttemptId ||
+              nextRun.attemptId ||
+              '',
+          ),
+        })
+      : fallbackUpsertUnattendedTaskRun(ledger, nextRun, {
+          previousAttemptId: String(nextRun.attemptId || ''),
+        });
+    if (result.accepted) {
+      await chrome.storage.local.set({[STORAGE_KEYS.taskLedger]: result.ledger});
+    }
+    return {
+      accepted: Boolean(result.accepted),
+      reason: String(result.reason || ''),
+      data: result.run || null,
+      ledger: result.ledger,
+    };
+  });
+}
+
+async function resolveSupersededNeedsActionTask(
+  taskId,
+  successorTaskId,
+  message = '已由新的恢复任务接管',
+) {
+  const ledger = await readTaskLedger();
+  const previousRun = Array.isArray(ledger?.runs)
+    ? ledger.runs.find((run) => run?.id === taskId)
+    : null;
+  if (!previousRun || previousRun.status !== 'needs_action') {
+    return null;
+  }
+  return await upsertTaskLedgerRun({
+    patch: {
+      id: previousRun.id,
+      status: 'canceled',
+      finishedAt: new Date().toISOString(),
+      message,
+      metadata: {
+        ...(previousRun.metadata || {}),
+        recoveredByTaskId: successorTaskId,
+      },
+    },
+    event: {
+      type: 'superseded',
+      message,
+    },
+  });
 }
 
 async function isUnattendedRunRequestActive(request) {
@@ -424,50 +938,57 @@ async function isUnattendedRunRequestActive(request) {
 }
 
 async function markUnattendedRunRequestStale(request, message) {
-  if (
-    !request ||
-    typeof request !== 'object' ||
-    isTerminalUnattendedRunStatus(request.status)
-  ) {
-    return;
-  }
-
-  const nextRequest = {
-    ...request,
-    status: 'failed',
-    finishedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    message,
-    error: {
+  return await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      (request?.id && current.id !== request.id) ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return current;
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...current,
+      status: 'failed',
+      finishedAt: now,
+      updatedAt: now,
       message,
-    },
-  };
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+      error: {message, code: 'UNATTENDED_STALE'},
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {type: 'failed', message, at: now},
+    });
+    return nextRequest;
   });
 }
 
-async function cancelUnattendedKeywordRunRequest(message) {
-  const request = await readUnattendedKeywordRunRequest();
-  if (
-    !request ||
-    typeof request !== 'object' ||
-    isTerminalUnattendedRunStatus(request.status)
-  ) {
-    return null;
-  }
-
-  const nextRequest = {
-    ...request,
-    status: 'canceled',
-    finishedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    message,
-  };
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {}) {
+  return await runUnattendedRunMutation(async () => {
+    const request = await readUnattendedKeywordRunRequest();
+    if (
+      !request ||
+      (requestId && request.id !== requestId) ||
+      (isTerminalUnattendedRunStatus(request.status) &&
+        request.status !== 'needs_action')
+    ) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...request,
+      status: 'canceled',
+      finishedAt: now,
+      updatedAt: now,
+      message,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: request,
+      event: {type: 'canceled', message, at: now},
+    });
+    return nextRequest;
   });
-  return nextRequest;
 }
 
 async function relayCancelToTabs(tabIds = []) {
@@ -483,18 +1004,75 @@ async function relayCancelToTabs(tabIds = []) {
     try {
       // 取消是"应秒回"的操作:若某个 tab 的 content script 卡死,不应无限阻塞其它 tab 的取消。
       // 只在此取消路径加 5s 超时守卫,主采集中继(relay-to-content)不受影响。
-      await Promise.race([
+      const response = await Promise.race([
         relayToContentWithRetry(tabId, { action: 'cancelCapture' }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('cancel relay timeout')), 5000),
         ),
       ]);
+      if (!response?.ok) {
+        throw new Error(
+          response?.error?.message || 'cancel relay was not acknowledged',
+        );
+      }
       successCount += 1;
     } catch (error) {
       console.warn('[Background] Relay unattended cancel failed:', tabId, error);
     }
   }
   return successCount;
+}
+
+async function stopPreviousUnattendedCaptureForResume(lock) {
+  const holderTabId = Number(lock?.holderTabId);
+  if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
+    return {ok: true, method: 'no_target'};
+  }
+
+  const relayedCount = await relayCancelToTabs([holderTabId]);
+  if (relayedCount > 0) {
+    return {ok: true, method: 'cancel_acknowledged'};
+  }
+
+  // 卡死或断网时 content script 可能无法确认取消。刷新平台页会销毁旧的
+  // content 执行上下文，是恢复前唯一可确认的硬停止；刷新本身失败则禁止新执行。
+  try {
+    await chrome.tabs.reload(holderTabId);
+    return {ok: true, method: 'tab_reloaded'};
+  } catch (reloadError) {
+    try {
+      await chrome.tabs.get(holderTabId);
+    } catch {
+      return {ok: true, method: 'tab_missing'};
+    }
+    console.warn(
+      '[Background] Could not confirm previous unattended capture stopped:',
+      holderTabId,
+      reloadError,
+    );
+    return {
+      ok: false,
+      method: 'stop_unconfirmed',
+      error: reloadError,
+    };
+  }
+}
+
+async function stopUnattendedCaptureTargetsForRecovery(tabIds = []) {
+  const uniqueTabIds = [
+    ...new Set(
+      tabIds
+        .map((tabId) => Number(tabId))
+        .filter((tabId) => Number.isFinite(tabId) && tabId > 0),
+    ),
+  ];
+  for (const holderTabId of uniqueTabIds) {
+    const result = await stopPreviousUnattendedCaptureForResume({holderTabId});
+    if (!result.ok) {
+      return {...result, holderTabId};
+    }
+  }
+  return {ok: true, method: uniqueTabIds.length ? 'all_stopped' : 'no_target'};
 }
 
 async function releaseUnattendedKeywordPlanLock() {
@@ -506,10 +1084,41 @@ async function releaseUnattendedKeywordPlanLock() {
   return await releaseCaptureExecutionLock(activeLock.id);
 }
 
+async function snapshotUnattendedKeywordPlanLock() {
+  const activeLock = await readActiveCaptureExecutionLock();
+  return String(activeLock?.owner || '') === 'unattended_keyword_plan'
+    ? activeLock
+    : null;
+}
+
+async function cancelAndReleaseUnattendedExecutionTargets(
+  lockSnapshot,
+  tabIds = [],
+) {
+  const relayedCount = await relayCancelToTabs([
+    ...tabIds,
+    lockSnapshot?.holderTabId,
+  ]);
+  if (lockSnapshot?.id) {
+    await releaseCaptureExecutionLock(lockSnapshot.id).catch(() => false);
+  }
+  return relayedCount;
+}
+
 async function cleanupDisabledUnattendedKeywordPlanRuntime() {
   const message = '无人值守计划已关闭，已取消未完成任务';
+  // 状态切换前捕获旧锁和平台页。列表采集阶段 progress 可能尚未带 runnerTabId，
+  // 若先释放锁再取消，旧 content capture 会继续与下一任务并行。
+  const request = await readUnattendedKeywordRunRequest();
+  const progress = normalizeUnattendedRunProgress(
+    request?.progress,
+    request?.message,
+  );
+  const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
   await cancelUnattendedKeywordRunRequest(message);
-  await releaseUnattendedKeywordPlanLock();
+  await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
+    progress?.runnerTabId,
+  ]);
 }
 
 async function resolveUnattendedPlanLockState(activeLock) {
@@ -544,7 +1153,11 @@ function normalizeScheduleReference(value) {
 
 async function saveUnattendedKeywordPlan(
   plan,
-  { recomputeNext = true, from = null } = {},
+  {
+    recomputeNext = true,
+    from = null,
+    preserveRunState = true,
+  } = {},
 ) {
   const normalized = normalizeUnattendedKeywordPlan({
     ...plan,
@@ -553,13 +1166,31 @@ async function saveUnattendedKeywordPlan(
   const nextRunAt = recomputeNext
     ? computeNextUnattendedRunAt(normalized, normalizeScheduleReference(from))
     : normalized.nextRunAt;
-  const nextPlan = {
-    ...normalized,
-    nextRunAt,
-  };
-
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.unattendedKeywordPlan]: nextPlan,
+  const nextPlan = await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.unattendedKeywordPlan,
+    );
+    const currentPlan = normalizeUnattendedKeywordPlan(
+      stored[STORAGE_KEYS.unattendedKeywordPlan],
+    );
+    const preservedRunState =
+      preserveRunState && currentPlan.lastRunStatus
+        ? {
+            lastRunAt: currentPlan.lastRunAt,
+            lastRunStatus: currentPlan.lastRunStatus,
+            lastRunMessage: currentPlan.lastRunMessage,
+            lastRunProgress: currentPlan.lastRunProgress,
+          }
+        : {};
+    const next = {
+      ...normalized,
+      ...preservedRunState,
+      nextRunAt,
+    };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordPlan]: next,
+    });
+    return next;
   });
   await syncUnattendedKeywordAlarm(nextPlan);
   if (!nextPlan.enabled) {
@@ -632,8 +1263,14 @@ async function getCaptureExecutionLockHolderState(lock) {
 }
 
 async function removeStaleCaptureExecutionLock(lock, reason) {
-  if (lock?.holderTabId) {
-    await relayCancelToTabs([lock.holderTabId]).catch(() => 0);
+  const stopResult = await stopPreviousUnattendedCaptureForResume(lock);
+  if (!stopResult.ok) {
+    console.warn('[Background] Kept stale capture lock because its page could not be stopped:', {
+      id: lock?.id || '',
+      owner: lock?.owner || 'unknown',
+      reason,
+    });
+    return false;
   }
   await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
   console.warn('[Background] Removed stale capture execution lock:', {
@@ -641,6 +1278,7 @@ async function removeStaleCaptureExecutionLock(lock, reason) {
     owner: lock?.owner || 'unknown',
     reason,
   });
+  return true;
 }
 
 async function readActiveCaptureExecutionLockUnsafe() {
@@ -658,14 +1296,20 @@ async function readActiveCaptureExecutionLockUnsafe() {
     return null;
   }
   if (activeLock.expiresAt <= Date.now()) {
-    await removeStaleCaptureExecutionLock(activeLock, 'lease_expired');
-    return null;
+    const removed = await removeStaleCaptureExecutionLock(
+      activeLock,
+      'lease_expired',
+    );
+    return removed ? null : activeLock;
   }
 
   const holderState = await getCaptureExecutionLockHolderState(activeLock);
   if (holderState === 'gone') {
-    await removeStaleCaptureExecutionLock(activeLock, 'holder_document_gone');
-    return null;
+    const removed = await removeStaleCaptureExecutionLock(
+      activeLock,
+      'holder_document_gone',
+    );
+    return removed ? null : activeLock;
   }
   return activeLock;
 }
@@ -674,6 +1318,18 @@ async function readActiveCaptureExecutionLock() {
   return await runCaptureExecutionLockOperation(
     readActiveCaptureExecutionLockUnsafe,
   );
+}
+
+async function readStoredCaptureExecutionLock() {
+  return await runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.captureExecutionLock,
+    );
+    return normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+  });
 }
 
 async function acquireCaptureExecutionLock({
@@ -716,6 +1372,54 @@ async function acquireCaptureExecutionLock({
       ok: true,
       lock,
     };
+  });
+}
+
+async function transferOrReserveUnattendedCaptureExecutionLock({
+  holderId = '',
+  holderDocumentId = '',
+  holderTabId = null,
+} = {}) {
+  const normalizedHolderId = String(holderId || '');
+  const normalizedDocumentId = String(holderDocumentId || '');
+  if (!normalizedHolderId || !normalizedDocumentId) {
+    return null;
+  }
+  return await runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock);
+    let lock = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    const now = Date.now();
+    // 即使租约在休眠期间过期，也要保留旧 holderTabId。它是列表采集早期
+    // 唯一可靠的 content 目标；先转移并确认停止旧页面，再允许恢复。
+    if (lock && String(lock.owner || '') !== 'unattended_keyword_plan') {
+      return null;
+    }
+
+    const normalizedHolderTabId = Number(holderTabId);
+    const transferred = {
+      ...(lock || {}),
+      id: lock?.id || createUuid(),
+      owner: 'unattended_keyword_plan',
+      label: lock?.label || '无人值守计划',
+      startedAt: lock?.startedAt || new Date(now).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+      expiresAt: now + CAPTURE_EXECUTION_LOCK_LEASE_MS,
+      schemaVersion: CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION,
+      holderId: normalizedHolderId,
+      holderDocumentId: normalizedDocumentId,
+      holderTabId:
+        lock?.holderTabId ||
+        (Number.isFinite(normalizedHolderTabId) && normalizedHolderTabId > 0
+          ? normalizedHolderTabId
+          : null),
+    };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureExecutionLock]: transferred,
+    });
+    return transferred;
   });
 }
 
@@ -853,21 +1557,354 @@ async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
 }
 
 async function createUnattendedKeywordRunRequest(plan, { reason = 'alarm' } = {}) {
-  const request = {
-    id: createUuid(),
-    type: 'keyword_batch',
-    status: 'pending',
-    reason,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    planSnapshot: normalizeUnattendedKeywordPlan(plan),
-    progress: null,
-    error: null,
-  };
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.unattendedKeywordRunRequest]: request,
+  return await runUnattendedRunMutation(async () => {
+    const existing = await readUnattendedKeywordRunRequest();
+    if (existing && !isTerminalUnattendedRunStatus(existing.status)) {
+      return existing;
+    }
+    const now = new Date().toISOString();
+    const request = {
+      schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
+      id: createUuid(),
+      attemptId: createUuid(),
+      attemptNumber: 1,
+      progressSeq: 0,
+      recoveryCount: 0,
+      type: 'keyword_batch',
+      status: 'pending',
+      reason,
+      createdAt: now,
+      updatedAt: now,
+      heartbeatAt: now,
+      businessProgressAt: now,
+      planSnapshot: normalizeUnattendedKeywordPlan(plan),
+      progress: null,
+      error: null,
+      message: '已创建无人值守任务，等待运行页领取',
+    };
+    await persistUnattendedRunMutation(request, {
+      event: {type: 'created', message: '已创建无人值守任务', at: now},
+    });
+    if (existing?.status === 'needs_action') {
+      await resolveSupersededNeedsActionTask(
+        existing.id,
+        request.id,
+        '新的计划任务已开始，旧任务结果已保留',
+      );
+    }
+    return request;
   });
-  return request;
+}
+
+async function bindUnattendedRunnerTab(request, runnerTabId) {
+  const normalizedTabId = Number(runnerTabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return request;
+  }
+  return await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request.id ||
+      current.attemptId !== request.attemptId ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return current;
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...current,
+      runnerTabId: normalizedTabId,
+      updatedAt: now,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event:
+        Number(current.runnerTabId) === normalizedTabId
+          ? null
+          : {
+              type: 'runner_bound',
+              message: '无人值守运行页已连接',
+              at: now,
+            },
+    });
+    return nextRequest;
+  });
+}
+
+async function claimUnattendedKeywordRun({
+  requestId = '',
+  senderTabId = null,
+  senderDocumentId = '',
+  holderId = '',
+} = {}) {
+  return await runUnattendedRunMutation(async () => {
+    const request = await readUnattendedKeywordRunRequest();
+    if (!request || (requestId && request.id !== requestId)) {
+      return {accepted: false, reason: 'not_found', data: null};
+    }
+    if (isTerminalUnattendedRunStatus(request.status)) {
+      return {accepted: false, reason: 'terminal', data: null};
+    }
+
+    const normalizedSenderTabId = Number(senderTabId);
+    const assignedRunnerTabId = Number(request.runnerTabId);
+    if (
+      request.status === 'pending' &&
+      Number.isFinite(assignedRunnerTabId) &&
+      assignedRunnerTabId > 0 &&
+      assignedRunnerTabId !== normalizedSenderTabId
+    ) {
+      return {accepted: false, reason: 'runner_mismatch', data: null};
+    }
+    const isSameRunnerTab =
+      Boolean(requestId) &&
+      Number.isFinite(normalizedSenderTabId) &&
+      normalizedSenderTabId > 0 &&
+      Number(request.runnerTabId) === normalizedSenderTabId;
+    const isSameRunnerResume =
+      isSameRunnerTab &&
+      new Set(['claimed', 'started', 'running', 'recovering']).has(
+        String(request.status || ''),
+      );
+    if (request.status !== 'pending' && !isSameRunnerResume) {
+      return {accepted: false, reason: 'not_claimable', data: null};
+    }
+
+    let transferredLock = null;
+    if (isSameRunnerResume) {
+      transferredLock = await transferOrReserveUnattendedCaptureExecutionLock({
+        holderId,
+        holderDocumentId: senderDocumentId,
+        holderTabId: request?.progress?.runnerTabId,
+      });
+      if (!transferredLock) {
+        const blockedAt = new Date().toISOString();
+        const blockedMessage =
+          '检测到其他采集任务已占用执行锁，已阻止无人值守任务并行恢复；请等待当前任务结束后在任务中心重试';
+        const blockedRequest = {
+          ...request,
+          status: 'needs_action',
+          recoveryPendingLaunch: false,
+          finishedAt: blockedAt,
+          updatedAt: blockedAt,
+          message: blockedMessage,
+          error: {
+            code: 'CAPTURE_LOCK_CONFLICT',
+            message: blockedMessage,
+          },
+        };
+        await persistUnattendedRunMutation(blockedRequest, {
+          previousRequest: request,
+          event: {
+            type: 'needs_action',
+            message: blockedMessage,
+            at: blockedAt,
+          },
+        });
+        return {
+          accepted: false,
+          reason: 'capture_lock_conflict',
+          data: blockedRequest,
+          lock: null,
+        };
+      }
+      // runner 刷新时旧页面编排已经消失。只有旧 content 执行确认停止（或其
+      // 页面已被硬刷新/关闭）后，才允许新页面从检查点继续。
+      const stopResult = await stopPreviousUnattendedCaptureForResume(
+        transferredLock,
+      );
+      if (!stopResult.ok) {
+        const blockedAt = new Date().toISOString();
+        const blockedMessage =
+          '旧采集页面未能安全停止，已阻止自动继续；请在任务中心取消任务或人工检查页面后重试';
+        const blockedRequest = {
+          ...request,
+          status: 'needs_action',
+          recoveryPendingLaunch: false,
+          finishedAt: blockedAt,
+          updatedAt: blockedAt,
+          message: blockedMessage,
+          error: {
+            code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
+            message: blockedMessage,
+          },
+        };
+        await persistUnattendedRunMutation(blockedRequest, {
+          previousRequest: request,
+          event: {
+            type: 'needs_action',
+            message: blockedMessage,
+            at: blockedAt,
+          },
+        });
+        return {
+          accepted: false,
+          reason: 'previous_capture_stop_unconfirmed',
+          data: blockedRequest,
+          lock: transferredLock,
+        };
+      }
+    }
+
+    const claimedAt = new Date().toISOString();
+    const nextRequest = {
+      ...request,
+      status: 'claimed',
+      claimedAt,
+      heartbeatAt: claimedAt,
+      // 刷新 runner 只是控制面恢复，不是业务进展。保留旧业务时钟，避免
+      // 刷新页面把正常 roundGap 或卡顿检测的基准偷偷向后推。
+      businessProgressAt: isSameRunnerResume
+        ? request.businessProgressAt
+        : claimedAt,
+      runnerTabId:
+        Number.isFinite(normalizedSenderTabId) && normalizedSenderTabId > 0
+          ? normalizedSenderTabId
+          : request.runnerTabId ?? null,
+      updatedAt: claimedAt,
+      resumeCount: isSameRunnerResume
+        ? Math.max(0, Number(request.resumeCount) || 0) + 1
+        : Math.max(0, Number(request.resumeCount) || 0),
+      message: isSameRunnerResume
+        ? '检测到运行页刷新，正在从已有采集数据恢复任务'
+        : String(request.message || '无人值守运行页已领取任务'),
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: request,
+      event: {
+        type: isSameRunnerResume ? 'runner_resumed' : 'claimed',
+        message: nextRequest.message,
+        at: claimedAt,
+      },
+    });
+    return {
+      accepted: true,
+      reason: isSameRunnerResume ? 'resumed' : 'claimed',
+      data: nextRequest,
+      lock: transferredLock,
+    };
+  });
+}
+
+async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch = {}} = {}) {
+  return await runUnattendedRunMutation(async () => {
+    const request = await readUnattendedKeywordRunRequest();
+    if (!request || !requestId || request.id !== requestId) {
+      return {accepted: false, reason: 'not_found', data: null};
+    }
+    if (!attemptId || request.attemptId !== attemptId) {
+      return {accepted: false, reason: 'attempt_mismatch', data: request};
+    }
+    if (isTerminalUnattendedRunStatus(request.status)) {
+      return {accepted: false, reason: 'terminal', data: request};
+    }
+
+    const safePatch =
+      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+    const allowedPatchFields = [
+      'status',
+      'message',
+      'progress',
+      'checkpoint',
+      'summary',
+      'counts',
+      'error',
+      'startedAt',
+      'finishedAt',
+      'heartbeatAt',
+      'waitUntil',
+      'recoveryWaitUntil',
+    ];
+    const acceptedPatch = Object.fromEntries(
+      allowedPatchFields
+        .filter((field) => Object.prototype.hasOwnProperty.call(safePatch, field))
+        .map((field) => [field, safePatch[field]]),
+    );
+    const now = new Date().toISOString();
+    const hasProgress =
+      safePatch.progress &&
+      typeof safePatch.progress === 'object' &&
+      !Array.isArray(safePatch.progress);
+    const hasCheckpoint =
+      safePatch.checkpoint &&
+      typeof safePatch.checkpoint === 'object' &&
+      !Array.isArray(safePatch.checkpoint);
+    const hasBusinessProgress = hasProgress || hasCheckpoint;
+    let nextProgressSeq = request.progressSeq;
+    if (hasProgress) {
+      const suppliedProgressSeq = Number(safePatch.progressSeq);
+      if (
+        Number.isFinite(suppliedProgressSeq) &&
+        suppliedProgressSeq <= request.progressSeq
+      ) {
+        return {accepted: false, reason: 'stale_progress', data: request};
+      }
+      nextProgressSeq = Number.isFinite(suppliedProgressSeq)
+        ? Math.floor(suppliedProgressSeq)
+        : request.progressSeq + 1;
+    }
+
+    const requestedStatus = String(safePatch.status || '').trim();
+    const nextStatus = UNATTENDED_RUN_REPORTABLE_STATUSES.has(requestedStatus)
+      ? requestedStatus
+      : request.status;
+    const normalizedProgress = hasProgress
+      ? normalizeUnattendedRunProgress(safePatch.progress, safePatch.message)
+      : request.progress || null;
+    let waitUntil = String(request.recoveryWaitUntil || '');
+    if (Object.prototype.hasOwnProperty.call(safePatch, 'waitUntil')) {
+      waitUntil = String(safePatch.waitUntil || '');
+    } else if (
+      Object.prototype.hasOwnProperty.call(safePatch, 'recoveryWaitUntil')
+    ) {
+      waitUntil = String(safePatch.recoveryWaitUntil || '');
+    } else if (
+      safePatch.progress &&
+      Object.prototype.hasOwnProperty.call(safePatch.progress, 'waitUntil')
+    ) {
+      waitUntil = String(safePatch.progress.waitUntil || '');
+    }
+    const nextRequest = {
+      ...request,
+      ...acceptedPatch,
+      schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
+      id: request.id,
+      attemptId: request.attemptId,
+      attemptNumber: request.attemptNumber,
+      progressSeq: nextProgressSeq,
+      progress: normalizedProgress,
+      status: nextStatus,
+      heartbeatAt: safePatch.heartbeatAt ? now : request.heartbeatAt,
+      businessProgressAt: hasBusinessProgress ? now : request.businessProgressAt,
+      recoveryWaitUntil: waitUntil,
+      updatedAt: now,
+    };
+    if (isTerminalUnattendedRunStatus(nextStatus)) {
+      nextRequest.finishedAt = String(safePatch.finishedAt || now);
+    }
+    delete nextRequest.requestId;
+
+    const statusChanged = nextStatus !== request.status;
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: request,
+      event:
+        statusChanged || hasBusinessProgress
+          ? {
+              type: statusChanged
+                ? nextStatus
+                : hasCheckpoint
+                  ? 'checkpoint'
+                  : 'progress',
+              message: String(
+                nextRequest.message || nextRequest.progress?.message || '',
+              ),
+              at: now,
+            }
+          : null,
+    });
+    return {accepted: true, reason: 'updated', data: nextRequest};
+  });
 }
 
 async function launchUnattendedKeywordRun(plan, { reason = 'alarm' } = {}) {
@@ -876,14 +1913,784 @@ async function launchUnattendedKeywordRun(plan, { reason = 'alarm' } = {}) {
     return null;
   }
 
-  const platformTab = await activateOrCreatePlatformTab(normalizedPlan.platform);
   const request = await createUnattendedKeywordRunRequest(normalizedPlan, {
     reason,
   });
-  await openUnattendedRunnerTab(request.id, {
-    windowId: platformTab?.windowId,
-  });
+  try {
+    const platformTab = await activateOrCreatePlatformTab(normalizedPlan.platform);
+    const runnerTab = await openUnattendedRunnerTab(request.id, {
+      windowId: platformTab?.windowId,
+    });
+    await bindUnattendedRunnerTab(request, runnerTab?.id);
+  } catch (error) {
+    await markUnattendedRunRequestStale(
+      request,
+      `创建无人值守运行页失败：${error?.message || '未知错误'}`,
+    );
+    throw error;
+  }
   return request;
+}
+
+function getUnattendedRecoveryBlockReason(request) {
+  const code = String(request?.error?.code || '').toLowerCase();
+  const text = [
+    request?.message,
+    request?.error?.message,
+    request?.progress?.message,
+    request?.progress?.phase,
+  ]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+  const blockedCode = /captcha|login|auth|security|risk|forbidden|account/.test(code);
+  const blockedText =
+    /验证码|人机验证|登录失效|请登录|重新登录|账号异常|账号限制|安全验证|访问受限|风控|captcha|login required|security check/.test(
+      text,
+    );
+  if (!blockedCode && !blockedText) {
+    return '';
+  }
+  if (/login|auth/.test(code) || /登录/.test(text)) {
+    return '登录状态已失效，需要用户重新登录后继续';
+  }
+  return '平台触发安全验证或账号限制，已停止自动重试';
+}
+
+function getUnattendedWaitUntilMs(request) {
+  const candidates = [
+    request?.wakeGraceUntil,
+    request?.recoveryWaitUntil,
+    request?.waitUntil,
+    request?.progress?.waitUntil,
+  ];
+  const timestamps = candidates
+    .map((candidate) => parseTimestampMs(candidate))
+    .filter((timestamp) => Number.isFinite(timestamp));
+  return timestamps.length > 0 ? Math.max(...timestamps) : NaN;
+}
+
+async function assessUnattendedRunHealth(
+  request,
+  {nowMs = Date.now(), removedTabId = null, ignoreWakeGrace = false} = {},
+) {
+  if (!request || isTerminalUnattendedRunStatus(request.status)) {
+    return {healthy: true, reason: 'terminal'};
+  }
+  const waitUntilMs = getUnattendedWaitUntilMs(request);
+  if (!ignoreWakeGrace && Number.isFinite(waitUntilMs) && waitUntilMs > nowMs) {
+    return {healthy: true, reason: 'protected_wait', waitUntil: waitUntilMs};
+  }
+
+  const status = String(request.status || '');
+  const createdAt = parseTimestampMs(request.createdAt);
+  if (
+    status === 'pending' &&
+    (!Number.isFinite(createdAt) || nowMs - createdAt > UNATTENDED_RUN_CLAIM_GRACE_MS)
+  ) {
+    return {healthy: false, reason: 'claim_timeout'};
+  }
+
+  const runnerTabId = Number(request.runnerTabId);
+  if (Number.isFinite(runnerTabId) && runnerTabId > 0) {
+    if (Number(removedTabId) === runnerTabId) {
+      return {healthy: false, reason: 'runner_tab_closed'};
+    }
+    try {
+      await chrome.tabs.get(runnerTabId);
+    } catch {
+      return {healthy: false, reason: 'runner_tab_missing'};
+    }
+  } else if (!new Set(['pending', 'recovering']).has(status)) {
+    return {healthy: false, reason: 'runner_tab_missing'};
+  }
+
+  if (!new Set(['pending', 'recovering']).has(status)) {
+    const heartbeatAt = parseTimestampMs(request.heartbeatAt);
+    if (
+      !Number.isFinite(heartbeatAt) ||
+      nowMs - heartbeatAt > UNATTENDED_RUN_ACTIVE_GRACE_MS
+    ) {
+      return {healthy: false, reason: 'runner_heartbeat_stale'};
+    }
+    const businessProgressAt = parseTimestampMs(request.businessProgressAt);
+    if (
+      !Number.isFinite(businessProgressAt) ||
+      nowMs - businessProgressAt > UNATTENDED_RUN_BUSINESS_STALL_MS
+    ) {
+      return {healthy: false, reason: 'business_progress_stalled'};
+    }
+  }
+
+  return {healthy: true, reason: 'active'};
+}
+
+function formatUnattendedRecoveryReason(reason) {
+  const messages = {
+    claim_timeout: '运行页未在规定时间内领取任务',
+    runner_tab_closed: '运行页已被关闭',
+    runner_tab_missing: '运行页已不存在',
+    runner_heartbeat_stale: '运行页心跳中断',
+    business_progress_stalled: '采集业务长时间没有新进展',
+  };
+  return messages[String(reason || '')] || '无人值守任务运行异常';
+}
+
+async function deferPendingUnattendedRecoveryForLock(request, activeLock) {
+  return await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request.id ||
+      current.attemptId !== request.attemptId ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return null;
+    }
+    const now = new Date();
+    const waitUntil = new Date(
+      now.getTime() + UNATTENDED_SUPERVISOR_LOCK_WAIT_MS,
+    ).toISOString();
+    const message = `${activeLock.label || '手动采集任务'}正在运行，自动恢复将在 5 分钟后重试`;
+    const nextRequest = {
+      ...current,
+      status: 'recovering',
+      recoveryPendingLaunch: true,
+      recoveryWaitUntil: waitUntil,
+      updatedAt: now.toISOString(),
+      message,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {type: 'recovery_deferred', message, at: now.toISOString()},
+    });
+    return nextRequest;
+  });
+}
+
+async function markUnattendedRecoveryStopUnconfirmed(request, message) {
+  return await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request?.id ||
+      current.attemptId !== request?.attemptId ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return current;
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...current,
+      status: 'needs_action',
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      finishedAt: now,
+      updatedAt: now,
+      message,
+      error: {
+        code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
+        message,
+      },
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {type: 'needs_action', message, at: now},
+    });
+    return nextRequest;
+  });
+}
+
+async function launchPendingUnattendedRecovery(request) {
+  const storedLock = await readStoredCaptureExecutionLock();
+  const activeLock =
+    storedLock && String(storedLock.owner || '') !== 'unattended_keyword_plan'
+      ? await readActiveCaptureExecutionLock()
+      : storedLock;
+  if (activeLock && String(activeLock.owner || '') !== 'unattended_keyword_plan') {
+    return {
+      recovered: false,
+      deferred: true,
+      request: await deferPendingUnattendedRecoveryForLock(request, activeLock),
+    };
+  }
+  if (activeLock && String(activeLock.owner || '') === 'unattended_keyword_plan') {
+    const stopResult = await stopUnattendedCaptureTargetsForRecovery([
+      activeLock.holderTabId,
+      request?.progress?.runnerTabId,
+    ]);
+    if (!stopResult.ok) {
+      const message =
+        '旧采集页面未能安全停止，本次恢复已暂停；请人工检查页面后从任务中心重试';
+      const blockedRequest = await markUnattendedRecoveryStopUnconfirmed(
+        request,
+        message,
+      );
+      return {
+        recovered: false,
+        deferred: false,
+        terminal: true,
+        request: blockedRequest || request,
+        reason: 'previous_capture_stop_unconfirmed',
+      };
+    }
+    await releaseCaptureExecutionLock(activeLock.id);
+  }
+
+  const pendingRequest = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request.id ||
+      current.attemptId !== request.attemptId ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...current,
+      status: 'pending',
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      runnerTabId: null,
+      heartbeatAt: now,
+      businessProgressAt: now,
+      updatedAt: now,
+      message: `正在启动第 ${current.attemptNumber} 次无人值守运行`,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {type: 'recovery_launching', message: nextRequest.message, at: now},
+    });
+    return nextRequest;
+  });
+  if (!pendingRequest) {
+    return {recovered: false, reason: 'fenced'};
+  }
+
+  try {
+    const plan = normalizeUnattendedKeywordPlan(pendingRequest.planSnapshot || {});
+    const platformTab = await activateOrCreatePlatformTab(plan.platform);
+    const runnerTab = await openUnattendedRunnerTab(pendingRequest.id, {
+      windowId: platformTab?.windowId,
+    });
+    const boundRequest = await bindUnattendedRunnerTab(
+      pendingRequest,
+      runnerTab?.id,
+    );
+    return {recovered: true, request: boundRequest || pendingRequest};
+  } catch (error) {
+    const message = `自动恢复运行页失败：${error?.message || '未知错误'}`;
+    const deferredRequest = await runUnattendedRunMutation(async () => {
+      const current = await readUnattendedKeywordRunRequest();
+      if (
+        !current ||
+        current.id !== pendingRequest.id ||
+        current.attemptId !== pendingRequest.attemptId ||
+        isTerminalUnattendedRunStatus(current.status)
+      ) {
+        return current;
+      }
+      const now = new Date();
+      const launchFailures =
+        Math.max(0, Number(current.recoveryLaunchFailures) || 0) + 1;
+      const exhausted = launchFailures >= UNATTENDED_MAX_RECOVERY_ATTEMPTS;
+      const exhaustedMessage = `${message}；运行页连续启动失败 ${launchFailures} 次，请人工检查`;
+      const nextRequest = {
+        ...current,
+        status: exhausted ? 'needs_action' : 'recovering',
+        recoveryPendingLaunch: !exhausted,
+        recoveryWaitUntil: exhausted
+          ? ''
+          : new Date(
+              now.getTime() + UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
+            ).toISOString(),
+        recoveryLaunchFailures: launchFailures,
+        finishedAt: exhausted ? now.toISOString() : '',
+        updatedAt: now.toISOString(),
+        message: exhausted ? exhaustedMessage : message,
+        error: {
+          code: exhausted
+            ? 'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED'
+            : 'RECOVERY_LAUNCH_FAILED',
+          message: exhausted ? exhaustedMessage : message,
+        },
+      };
+      await persistUnattendedRunMutation(nextRequest, {
+        previousRequest: current,
+        event: {
+          type: exhausted ? 'needs_action' : 'recovery_launch_failed',
+          message: nextRequest.message,
+          at: now.toISOString(),
+        },
+      });
+      return nextRequest;
+    });
+    return {
+      recovered: false,
+      deferred: deferredRequest?.status !== 'needs_action',
+      terminal: deferredRequest?.status === 'needs_action',
+      request: deferredRequest,
+      reason:
+        deferredRequest?.status === 'needs_action'
+          ? 'recovery_launch_exhausted'
+          : 'recovery_launch_failed',
+    };
+  }
+}
+
+async function recoverUnattendedKeywordRunRequest(request, health) {
+  const blockReason = getUnattendedRecoveryBlockReason(request);
+  // request.runnerTabId 指向扩展自己的 runner 页面，不是注入 content script 的平台页；
+  // 平台页在列表阶段未必已经写入 progress.runnerTabId，因此在释放旧锁之前也要
+  // 捕获锁的 holderTabId。恢复只取消这两个旧执行目标，避免误伤新 attempt。
+  const oldExecutionLock = await readStoredCaptureExecutionLock();
+  const oldUnattendedLock =
+    String(oldExecutionLock?.owner || '') === 'unattended_keyword_plan'
+      ? oldExecutionLock
+      : null;
+  const oldRunnerTabIds = [
+    request.progress?.runnerTabId,
+    oldUnattendedLock?.holderTabId,
+  ];
+  const transition = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request.id ||
+      current.attemptId !== request.attemptId ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return {action: 'fenced', request: current};
+    }
+    const now = new Date().toISOString();
+    if (blockReason) {
+      const nextRequest = {
+        ...current,
+        status: 'needs_action',
+        finishedAt: now,
+        updatedAt: now,
+        message: blockReason,
+        error: {
+          ...(current.error && typeof current.error === 'object'
+            ? current.error
+            : {}),
+          code: 'UNATTENDED_RECOVERY_BLOCKED',
+          message: blockReason,
+        },
+      };
+      await persistUnattendedRunMutation(nextRequest, {
+        previousRequest: current,
+        event: {type: 'needs_action', message: blockReason, at: now},
+      });
+      return {action: 'terminal', request: nextRequest};
+    }
+
+    const recoveryCount = Math.max(0, Number(current.recoveryCount) || 0);
+    if (recoveryCount >= UNATTENDED_MAX_RECOVERY_ATTEMPTS) {
+      const reasonText = formatUnattendedRecoveryReason(health.reason);
+      const message = `${reasonText}，自动恢复已达到 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次，请人工检查后继续`;
+      const nextRequest = {
+        ...current,
+        status: 'needs_action',
+        finishedAt: now,
+        updatedAt: now,
+        message,
+        error: {code: 'UNATTENDED_RECOVERY_EXHAUSTED', message},
+      };
+      await persistUnattendedRunMutation(nextRequest, {
+        previousRequest: current,
+        event: {type: 'needs_action', message, at: now},
+      });
+      return {action: 'terminal', request: nextRequest};
+    }
+
+    const nextRecoveryCount = recoveryCount + 1;
+    const reasonText = formatUnattendedRecoveryReason(health.reason);
+    const message = `${reasonText}，正在自动恢复（${nextRecoveryCount}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS}）`;
+    const nextRequest = {
+      ...current,
+      attemptId: createUuid(),
+      attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
+      progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
+      recoveryCount: nextRecoveryCount,
+      recoveryReason: String(health.reason || ''),
+      recoveryPendingLaunch: true,
+      recoveryLaunchFailures: 0,
+      recoveryWaitUntil: '',
+      status: 'recovering',
+      runnerTabId: null,
+      heartbeatAt: now,
+      businessProgressAt: now,
+      updatedAt: now,
+      message,
+      error: null,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      allowAttemptTransition: true,
+      event: {type: 'auto_recovery', message, at: now},
+    });
+    return {action: 'recover', request: nextRequest};
+  });
+
+  if (transition.action === 'fenced') {
+    return {recovered: false, reason: 'fenced', request: transition.request};
+  }
+  const stopResult = await stopUnattendedCaptureTargetsForRecovery(
+    oldRunnerTabIds,
+  );
+  if (!stopResult.ok) {
+    const message =
+      '旧采集页面未能安全停止，已阻止自动恢复；请人工检查页面后从任务中心继续';
+    const blockedRequest = await markUnattendedRecoveryStopUnconfirmed(
+      transition.request,
+      message,
+    );
+    return {
+      recovered: false,
+      terminal: true,
+      reason: 'previous_capture_stop_unconfirmed',
+      request: blockedRequest || transition.request,
+    };
+  }
+  if (oldUnattendedLock?.id) {
+    await releaseCaptureExecutionLock(oldUnattendedLock.id).catch(() => false);
+  }
+  if (transition.action === 'terminal') {
+    return {recovered: false, terminal: true, request: transition.request};
+  }
+  return await launchPendingUnattendedRecovery(transition.request);
+}
+
+function buildManualRecoveryCheckpoint(request, mode) {
+  const source =
+    request?.checkpoint && typeof request.checkpoint === 'object'
+      ? request.checkpoint
+      : {};
+  const checkpoint = {
+    ...source,
+    keywordResults: Array.isArray(source.keywordResults)
+      ? source.keywordResults.map((entry) => ({...entry}))
+      : [],
+    completedKeywords: Array.isArray(source.completedKeywords)
+      ? [...source.completedKeywords]
+      : [],
+    failedKeywords: Array.isArray(source.failedKeywords)
+      ? [...source.failedKeywords]
+      : [],
+    skippedKeywords: Array.isArray(source.skippedKeywords)
+      ? [...source.skippedKeywords]
+      : [],
+    attempts:
+      source.attempts && typeof source.attempts === 'object'
+        ? {...source.attempts}
+        : {},
+  };
+  if (mode === 'failed') {
+    return {
+      schemaVersion: 1,
+      round: 1,
+      activeKeywordIndex: 0,
+      activeKeyword: '',
+      activePhase: 'pending',
+      keywordResults: [],
+      updatedAt: new Date().toISOString(),
+      keywordIndex: 0,
+      currentKeyword: '',
+      phase: '',
+      completedKeywords: [],
+      failedKeywords: [],
+      skippedKeywords: [],
+      attempts: {},
+    };
+  }
+  if (mode === 'skip_current') {
+    const currentKeyword = String(
+      checkpoint.activeKeyword ||
+        checkpoint.currentKeyword ||
+        request?.progress?.keyword ||
+        '',
+    ).trim();
+    const round = Math.max(1, Number(checkpoint.round) || 1);
+    const resultIndex = checkpoint.keywordResults.findIndex(
+      (entry) =>
+        String(entry?.keyword || '').trim() === currentKeyword &&
+        Math.max(1, Number(entry?.round) || 1) === round,
+    );
+    const skippedEntry = {
+      ...(resultIndex >= 0 ? checkpoint.keywordResults[resultIndex] : {}),
+      round,
+      index: Math.max(
+        0,
+        Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex) || 0,
+      ),
+      keyword: currentKeyword,
+      status: 'skipped',
+      finishedAt: new Date().toISOString(),
+    };
+    if (currentKeyword) {
+      if (resultIndex >= 0) checkpoint.keywordResults[resultIndex] = skippedEntry;
+      else checkpoint.keywordResults.push(skippedEntry);
+    }
+    if (currentKeyword && !checkpoint.skippedKeywords.includes(currentKeyword)) {
+      checkpoint.skippedKeywords.push(currentKeyword);
+    }
+    checkpoint.failedKeywords = checkpoint.failedKeywords.filter(
+      (keyword) => keyword !== currentKeyword,
+    );
+    checkpoint.keywordIndex = Math.max(0, Number(checkpoint.keywordIndex) || 0) + 1;
+    checkpoint.activeKeywordIndex = Math.max(
+      0,
+      Number(checkpoint.activeKeywordIndex) || 0,
+    ) + 1;
+    checkpoint.currentKeyword = '';
+    checkpoint.activeKeyword = '';
+    checkpoint.phase = '';
+    checkpoint.activePhase = 'pending';
+    checkpoint.updatedAt = new Date().toISOString();
+  }
+  return checkpoint;
+}
+
+async function manuallyRecoverUnattendedKeywordRun({requestId = '', mode = 'remaining'} = {}) {
+  const normalizedMode = new Set(['remaining', 'failed', 'skip_current']).has(mode)
+    ? mode
+    : 'remaining';
+  const created = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (!current || !requestId || current.id !== requestId) {
+      return {accepted: false, reason: 'not_found', request: null};
+    }
+    if (!isTerminalUnattendedRunStatus(current.status)) {
+      return {accepted: false, reason: 'not_recoverable', request: current};
+    }
+
+    const now = new Date().toISOString();
+    const checkpoint = buildManualRecoveryCheckpoint(current, normalizedMode);
+    let planSnapshot = normalizeUnattendedKeywordPlan(current.planSnapshot || {});
+    if (normalizedMode === 'failed') {
+      const taskCheckpoint = buildTaskCenterCheckpointFromUnattendedRequest(current);
+      const failedKeywords = taskCheckpoint.failedKeywords.filter(Boolean);
+      if (failedKeywords.length === 0) {
+        return {
+          accepted: false,
+          reason: 'no_failed_keywords',
+          request: current,
+        };
+      }
+      planSnapshot = normalizeUnattendedKeywordPlan({
+        ...planSnapshot,
+        keywords: failedKeywords,
+        // “仅重试失败项”是一次有界补偿，不继承原多轮循环；否则第 N 轮的
+        // 单个失败词会从第 1 轮重新跑满全部轮次，造成重复采集和风控风险。
+        autoLoop: false,
+        maxRounds: 1,
+        roundGapMin: 0,
+      });
+    } else if (normalizedMode === 'skip_current') {
+      const skippedKeyword = String(
+        current.checkpoint?.activeKeyword ||
+          current.checkpoint?.currentKeyword ||
+          current.progress?.keyword ||
+          '',
+      ).trim();
+      if (!skippedKeyword) {
+        return {
+          accepted: false,
+          reason: 'no_current_keyword',
+          request: current,
+        };
+      }
+      planSnapshot = normalizeUnattendedKeywordPlan({
+        ...planSnapshot,
+        keywords: planSnapshot.keywords.filter(
+          (keyword) => keyword !== skippedKeyword,
+        ),
+      });
+      if (planSnapshot.keywords.length === 0) {
+        return {
+          accepted: false,
+          reason: 'no_remaining_keywords',
+          request: current,
+        };
+      }
+    }
+    const labels = {
+      remaining: '继续采集剩余关键词',
+      failed: '仅重试失败关键词',
+      skip_current: '跳过当前项并继续',
+    };
+    const nextRequest = {
+      ...current,
+      schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
+      id: createUuid(),
+      parentRequestId: current.id,
+      attemptId: createUuid(),
+      attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
+      progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
+      recoveryCount: Math.max(0, Number(current.recoveryCount) || 0),
+      manualRecoveryCount:
+        Math.max(0, Number(current.manualRecoveryCount) || 0) + 1,
+      recoveryMode: normalizedMode,
+      recoveryReason: 'manual_recovery',
+      recoveryPendingLaunch: true,
+      recoveryLaunchFailures: 0,
+      recoveryWaitUntil: '',
+      type: 'keyword_batch',
+      status: 'recovering',
+      reason: 'manual_recovery',
+      createdAt: now,
+      claimedAt: '',
+      startedAt: '',
+      finishedAt: '',
+      updatedAt: now,
+      heartbeatAt: now,
+      businessProgressAt: now,
+      runnerTabId: null,
+      planSnapshot,
+      checkpoint,
+      progress: null,
+      error: null,
+      message: labels[normalizedMode],
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      event: {
+        type: 'manual_recovery',
+        message: labels[normalizedMode],
+        at: now,
+      },
+    });
+    return {
+      accepted: true,
+      reason: 'created',
+      request: nextRequest,
+      previousRequest: current,
+    };
+  });
+  if (!created.accepted) {
+    return created;
+  }
+  if (created.previousRequest?.status === 'needs_action') {
+    await resolveSupersededNeedsActionTask(
+      created.previousRequest.id,
+      created.request.id,
+      '用户已创建新的恢复任务',
+    );
+  }
+  const launchResult = await launchPendingUnattendedRecovery(created.request);
+  return {
+    accepted: Boolean(launchResult.recovered || launchResult.deferred),
+    reason: launchResult.deferred ? 'deferred' : launchResult.recovered ? 'recovered' : launchResult.reason,
+    request: launchResult.request || created.request,
+  };
+}
+
+async function applyUnattendedWakeGrace(request, reason = 'wake') {
+  return await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request.id ||
+      current.attemptId !== request.attemptId ||
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return current;
+    }
+    const now = new Date();
+    const existingGraceUntil = parseTimestampMs(current.wakeGraceUntil);
+    if (Number.isFinite(existingGraceUntil) && existingGraceUntil > now.getTime()) {
+      return current;
+    }
+    const wakeGraceUntil = new Date(
+      now.getTime() + UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
+    ).toISOString();
+    const nextRequest = {
+      ...current,
+      wakeGraceUntil,
+      updatedAt: now.toISOString(),
+      wakeReason: reason,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {
+        type: 'wake_grace',
+        message: '检测到浏览器或电脑恢复，等待运行页重新连接',
+        at: now.toISOString(),
+      },
+    });
+    return nextRequest;
+  });
+}
+
+async function superviseUnattendedKeywordRun({
+  removedTabId = null,
+  applyWakeGrace = false,
+  scheduledTime = null,
+  reason = 'alarm',
+} = {}) {
+  if (unattendedSupervisorInFlight) {
+    return {skipped: true, reason: 'in_flight'};
+  }
+  unattendedSupervisorInFlight = true;
+  try {
+    const nowMs = Date.now();
+    let request = await readUnattendedKeywordRunRequest();
+    if (!request || isTerminalUnattendedRunStatus(request.status)) {
+      lastUnattendedSupervisorTickAt = nowMs;
+      return {healthy: true, reason: 'no_active_request'};
+    }
+    const previousSupervisorTickAt = lastUnattendedSupervisorTickAt;
+    const supervisorGap = previousSupervisorTickAt
+      ? nowMs - previousSupervisorTickAt
+      : 0;
+    const normalizedScheduledTime = Number(scheduledTime);
+    const alarmDelay =
+      scheduledTime != null &&
+      Number.isFinite(normalizedScheduledTime) &&
+      normalizedScheduledTime > 0
+      ? Math.max(0, nowMs - normalizedScheduledTime)
+      : 0;
+    lastUnattendedSupervisorTickAt = nowMs;
+
+    const removedCurrentRunner =
+      Number.isFinite(Number(removedTabId)) &&
+      Number(removedTabId) === Number(request.runnerTabId);
+    const wokeFromSuspension =
+      applyWakeGrace ||
+      supervisorGap > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS ||
+      alarmDelay > UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS;
+    if (wokeFromSuspension && !removedCurrentRunner) {
+      request = await applyUnattendedWakeGrace(request, reason);
+      return {healthy: true, reason: 'wake_grace', request};
+    }
+
+    if (request.status === 'recovering' && request.recoveryPendingLaunch) {
+      const waitUntil = parseTimestampMs(request.recoveryWaitUntil);
+      if (Number.isFinite(waitUntil) && waitUntil > nowMs) {
+        return {healthy: true, reason: 'recovery_wait', request};
+      }
+      return await launchPendingUnattendedRecovery(request);
+    }
+
+    const health = await assessUnattendedRunHealth(request, {
+      nowMs,
+      removedTabId,
+      ignoreWakeGrace: removedCurrentRunner,
+    });
+    if (health.healthy) {
+      return health;
+    }
+    return await recoverUnattendedKeywordRunRequest(request, health);
+  } finally {
+    unattendedSupervisorInFlight = false;
+  }
+}
+
+async function syncUnattendedSupervisorAlarm() {
+  await chrome.alarms.create(UNATTENDED_SUPERVISOR_ALARM_NAME, {
+    periodInMinutes: UNATTENDED_SUPERVISOR_PERIOD_MINUTES,
+  });
 }
 
 async function handleUnattendedKeywordAlarm() {
@@ -905,6 +2712,17 @@ async function handleUnattendedKeywordAlarm() {
       return;
     }
 
+    // 计划闹钟与监督闹钟可能在唤醒时同时触发。只要已有未终结请求，
+    // 就先监督/恢复它，绝不另建第二个 runner 绕过 attempt fencing。
+    const existingRequest = await readUnattendedKeywordRunRequest();
+    if (
+      existingRequest &&
+      !isTerminalUnattendedRunStatus(existingRequest.status)
+    ) {
+      await superviseUnattendedKeywordRun({reason: 'schedule_alarm'});
+      return;
+    }
+
     let activeLock = await readActiveCaptureExecutionLock();
     if (activeLock) {
       const lockState = await resolveUnattendedPlanLockState(activeLock);
@@ -912,7 +2730,7 @@ async function handleUnattendedKeywordAlarm() {
         await releaseCaptureExecutionLock(activeLock.id);
         await markUnattendedRunRequestStale(
           lockState.request,
-          '无人值守任务已失去运行页面，已清理旧锁并准备重跑',
+          '无人值守旧锁已失去对应运行请求，已安全清理',
         );
         activeLock = null;
       } else if (lockState.type === 'active_unattended') {
@@ -938,7 +2756,7 @@ async function handleUnattendedKeywordAlarm() {
             lastRunProgress: null,
             nextRunAt: retryAt.toISOString(),
           },
-          {recomputeNext: false},
+          {recomputeNext: false, preserveRunState: false},
         );
         return;
       }
@@ -1957,25 +3775,43 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
     .catch((error) => {
       console.error('[onstarvoice] failed to sync unattended alarm on install', error);
     });
+  syncUnattendedSupervisorAlarm().catch((error) => {
+    console.error('[onstarvoice] failed to sync unattended supervisor on install', error);
+  });
 });
 
 chrome.runtime.onStartup.addListener(() => {
   ensureRuntimeState().catch((error) => {
     console.error('[onstarvoice] failed to initialize runtime on startup', error);
   });
-  reconcileUnattendedKeywordPlanSchedule({ launchDue: true })
+  syncUnattendedSupervisorAlarm()
+    .then(() =>
+      superviseUnattendedKeywordRun({
+        applyWakeGrace: true,
+        reason: 'browser_startup',
+      }),
+    )
+    .then(() => reconcileUnattendedKeywordPlanSchedule({ launchDue: true }))
     .catch((error) => {
       console.error('[onstarvoice] failed to sync unattended alarm on startup', error);
     });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm?.name !== UNATTENDED_KEYWORD_ALARM_NAME) {
+  if (alarm?.name === UNATTENDED_SUPERVISOR_ALARM_NAME) {
+    superviseUnattendedKeywordRun({
+      reason: 'supervisor_alarm',
+      scheduledTime: alarm?.scheduledTime,
+    }).catch((error) => {
+      console.error('[onstarvoice] unattended supervisor failed', error);
+    });
     return;
   }
-  handleUnattendedKeywordAlarm().catch((error) => {
-    console.error('[onstarvoice] unattended keyword alarm failed', error);
-  });
+  if (alarm?.name === UNATTENDED_KEYWORD_ALARM_NAME) {
+    handleUnattendedKeywordAlarm().catch((error) => {
+      console.error('[onstarvoice] unattended keyword alarm failed', error);
+    });
+  }
 });
 
 chrome.action.onClicked.addListener((tab) => {
@@ -1998,6 +3834,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
   syncRuntimeForTabId(tabId, changeInfo.url || tab.url || '').catch((error) => {
     console.warn('[onstarvoice] failed to sync runtime on tab update', error);
+  });
+});
+
+chrome.tabs.onRemoved?.addListener((tabId) => {
+  superviseUnattendedKeywordRun({
+    removedTabId: tabId,
+    reason: 'runner_tab_removed',
+  }).catch((error) => {
+    console.error('[onstarvoice] unattended runner removal check failed', error);
   });
 });
 
@@ -2121,6 +3966,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      if (type === 'onstarvoice:get-task-ledger') {
+        const ledger = await readTaskLedger();
+        sendResponse({ok: true, data: ledger});
+        return;
+      }
+
+      if (type === 'onstarvoice:upsert-task-run') {
+        const result = await upsertTaskLedgerRun({
+          run: message?.run || message?.task || null,
+          patch: message?.patch || null,
+          event: message?.event || null,
+        });
+        sendResponse({
+          ok: true,
+          data: result.data,
+          accepted: result.accepted,
+          reason: result.reason,
+        });
+        return;
+      }
+
       if (type === 'onstarvoice:get-unattended-keyword-plan') {
         const plan = await reconcileUnattendedKeywordPlanSchedule({
           launchDue: true,
@@ -2137,133 +4003,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (type === 'onstarvoice:claim-unattended-keyword-run') {
         const requestId = String(message?.requestId || '').trim();
-        const stored = await chrome.storage.local.get(
-          STORAGE_KEYS.unattendedKeywordRunRequest,
-        );
-        const request = stored[STORAGE_KEYS.unattendedKeywordRunRequest];
-        if (!request || (requestId && request.id !== requestId)) {
-          sendResponse({ ok: true, data: null });
-          return;
-        }
-        const senderTabId = Number(sender?.tab?.id);
-        const isSameRunnerTab =
-          Boolean(requestId) &&
-          Number.isFinite(senderTabId) &&
-          senderTabId > 0 &&
-          Number(request.runnerTabId) === senderTabId;
-        const isSameRunnerResume =
-          isSameRunnerTab &&
-          new Set(['claimed', 'started', 'running']).has(
-            String(request.status || ''),
-          );
-        if (
-          request.status !== 'pending' &&
-          (await isUnattendedRunRequestActive(request)) &&
-          !isSameRunnerResume
-        ) {
-          sendResponse({ ok: true, data: null });
-          return;
-        }
-        if (
-          request.status !== 'pending' &&
-          request.status !== 'claimed' &&
-          !isSameRunnerResume
-        ) {
-          sendResponse({ ok: true, data: null });
-          return;
-        }
-
-        const claimedAt = new Date().toISOString();
-        const nextRequest = {
-          ...request,
-          status: 'claimed',
-          claimedAt,
-          heartbeatAt: claimedAt,
-          runnerTabId: sender?.tab?.id ?? request.runnerTabId ?? null,
-          updatedAt: claimedAt,
-          resumeCount: isSameRunnerResume
-            ? Math.max(0, Number(request.resumeCount) || 0) + 1
-            : Math.max(0, Number(request.resumeCount) || 0),
-          message: isSameRunnerResume
-            ? '检测到运行页刷新，正在从已有采集数据恢复任务'
-            : request.message,
-        };
-        await chrome.storage.local.set({
-          [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+        const result = await claimUnattendedKeywordRun({
+          requestId,
+          senderTabId: sender?.tab?.id,
+          senderDocumentId: sender?.documentId,
+          holderId: String(message?.holderId || ''),
         });
-        sendResponse({ ok: true, data: nextRequest });
+        sendResponse({
+          ok: true,
+          data: result.data,
+          accepted: result.accepted,
+          reason: result.reason,
+          lock: result.lock || null,
+        });
         return;
       }
 
       if (type === 'onstarvoice:update-unattended-keyword-run') {
-        const requestId = String(message?.requestId || '').trim();
-        const patch =
-          message?.patch && typeof message.patch === 'object'
-            ? message.patch
-            : {};
-        const stored = await chrome.storage.local.get(
-          STORAGE_KEYS.unattendedKeywordRunRequest,
-        );
-        const request = stored[STORAGE_KEYS.unattendedKeywordRunRequest];
-        if (!request || (requestId && request.id !== requestId)) {
-          sendResponse({ ok: true, data: null });
-          return;
-        }
-        if (isTerminalUnattendedRunStatus(request.status)) {
-          sendResponse({ ok: true, data: request });
-          return;
-        }
-
-        const nextRequest = {
-          ...request,
-          ...patch,
-          id: request.id,
-          updatedAt: new Date().toISOString(),
-        };
-        await chrome.storage.local.set({
-          [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+        const result = await updateUnattendedKeywordRun({
+          requestId: String(message?.requestId || '').trim(),
+          attemptId: String(message?.attemptId || '').trim(),
+          patch: message?.patch,
         });
+        sendResponse({
+          ok: true,
+          data: result.data,
+          accepted: result.accepted,
+          reason: result.reason,
+        });
+        return;
+      }
 
-        const mirroredStatus = new Set([
-          'started',
-          'running',
-          'completed',
-          'failed',
-          'canceled',
-          'skipped',
-        ]);
-        if (mirroredStatus.has(String(nextRequest.status || ''))) {
-          const plan = await readUnattendedKeywordPlan();
-          const isTerminalStatus = isTerminalUnattendedRunStatus(nextRequest.status);
-          const nextPlan = normalizeUnattendedKeywordPlan({
-            ...plan,
-            lastRunAt:
-              String(
-                isTerminalStatus
-                  ? nextRequest.finishedAt || nextRequest.updatedAt || ''
-                  : nextRequest.updatedAt || nextRequest.startedAt || '',
-              ) ||
-              String(nextRequest.updatedAt || '') ||
-              new Date().toISOString(),
-            lastRunStatus: String(nextRequest.status || ''),
-            lastRunMessage:
-              String(nextRequest.message || '') ||
-              String(nextRequest.error?.message || '') ||
-              '',
-            lastRunProgress: isTerminalStatus
-              ? null
-              : normalizeUnattendedRunProgress(
-                  nextRequest.progress,
-                  nextRequest.message,
-                ),
-            updatedAt: new Date().toISOString(),
-          });
-          await chrome.storage.local.set({
-            [STORAGE_KEYS.unattendedKeywordPlan]: nextPlan,
-          });
-        }
-
-        sendResponse({ ok: true, data: nextRequest });
+      if (type === 'onstarvoice:recover-unattended-keyword-run') {
+        const result = await manuallyRecoverUnattendedKeywordRun({
+          requestId: String(message?.requestId || '').trim(),
+          mode: String(message?.mode || 'remaining').trim(),
+        });
+        sendResponse({
+          ok: result.accepted,
+          data: result.request || null,
+          accepted: result.accepted,
+          reason: result.reason,
+        });
         return;
       }
 
@@ -2272,18 +4053,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           String(message?.message || '').trim() ||
           '用户手动中止无人值守计划';
         const request = await readUnattendedKeywordRunRequest();
+        const requestedId = String(message?.requestId || '').trim();
+        if (requestedId && request?.id !== requestedId) {
+          sendResponse({
+            ok: false,
+            data: null,
+            accepted: false,
+            reason: 'request_mismatch',
+          });
+          return;
+        }
+        if (
+          request &&
+          isTerminalUnattendedRunStatus(request.status) &&
+          request.status !== 'needs_action'
+        ) {
+          sendResponse({
+            ok: true,
+            accepted: true,
+            reason: 'already_terminal',
+            data: {
+              request,
+              plan: await readUnattendedKeywordPlan(),
+              relayedCount: 0,
+            },
+          });
+          return;
+        }
         const progress = normalizeUnattendedRunProgress(
           request?.progress,
           request?.message,
         );
         const explicitTabId = Number(message?.tabId);
         const progressRunnerTabId = Number(progress?.runnerTabId);
-        const canceledRequest = await cancelUnattendedKeywordRunRequest(reason);
-        const relayedCount = await relayCancelToTabs([
-          explicitTabId,
-          progressRunnerTabId,
-        ]);
-        await releaseUnattendedKeywordPlanLock();
+        // 必须在把请求改成 canceled 之前捕获旧锁；锁的 holderTabId 是列表
+        // 导航/初始采集阶段唯一可靠的平台页身份。
+        const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
+        const canceledRequest = await cancelUnattendedKeywordRunRequest(reason, {
+          requestId: requestedId,
+        });
+        if (!canceledRequest) {
+          sendResponse({
+            ok: false,
+            data: request || null,
+            accepted: false,
+            reason: isTerminalUnattendedRunStatus(request?.status)
+              ? 'terminal'
+              : 'request_mismatch',
+          });
+          return;
+        }
+        const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
+          lockSnapshot,
+          [explicitTabId, progressRunnerTabId],
+        );
 
         const now = new Date();
         const plan = await readUnattendedKeywordPlan();
@@ -2293,7 +4116,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             lastRunAt: now.toISOString(),
             lastRunStatus: 'canceled',
             lastRunMessage: reason,
-            lastRunProgress: null,
+            lastRunProgress: progress,
             nextRunAt: '',
           },
           { recomputeNext: true, from: buildScheduleReferenceAfterDate(now) },
@@ -2301,6 +4124,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         sendResponse({
           ok: true,
+          accepted: true,
+          reason: 'canceled',
           data: {
             request: canceledRequest,
             plan: nextPlan,

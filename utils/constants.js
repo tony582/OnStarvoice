@@ -104,6 +104,9 @@ export const STORAGE_KEY = {
   MONITOR: "onstarvoice.monitor",
   DATA_POOL: "onstarvoice.data_pool",
   SYNC_HISTORY: "onstarvoice.sync_history",
+  TASK_LEDGER: "onstarvoice.taskLedger",
+  UNATTENDED_KEYWORD_PLAN: "onstarvoice.unattendedKeywordPlan",
+  UNATTENDED_KEYWORD_RUN_REQUEST: "onstarvoice.unattendedKeywordRunRequest",
   DIAGNOSTICS: "onstarvoice.diagnostics",
 };
 

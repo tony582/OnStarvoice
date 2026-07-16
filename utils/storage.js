@@ -608,6 +608,50 @@ function getDefaultSyncHistory() {
   };
 }
 
+// ==================== Task Center ====================
+
+/**
+ * 获取统一任务账本。任务中心只通过这一层读取本地任务状态，避免 UI
+ * 依赖具体存储结构；旧版本或损坏的值会降级为空账本。
+ */
+export async function getTaskLedger() {
+  const taskLedger = await getItem(STORAGE_KEY.TASK_LEDGER);
+  if (!taskLedger || typeof taskLedger !== "object" || Array.isArray(taskLedger)) {
+    return getDefaultTaskLedger();
+  }
+
+  return {
+    ...getDefaultTaskLedger(),
+    ...taskLedger,
+    version: Number(taskLedger.version || taskLedger.schemaVersion) || 1,
+    runs: Array.isArray(taskLedger.runs) ? taskLedger.runs : [],
+    updatedAt: taskLedger.updatedAt || taskLedger.lastUpdatedAt || null,
+  };
+}
+
+/**
+ * 获取升级前最近一次无人值守计划/请求，仅用于任务中心兼容展示。
+ * 这里不改写旧数据，也不会把缺失字段推断成完整历史。
+ */
+export async function getLegacyTaskCenterState() {
+  const [plan, request] = await Promise.all([
+    getItem(STORAGE_KEY.UNATTENDED_KEYWORD_PLAN),
+    getItem(STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST),
+  ]);
+  return {
+    plan,
+    request,
+  };
+}
+
+function getDefaultTaskLedger() {
+  return {
+    version: 1,
+    runs: [],
+    updatedAt: null,
+  };
+}
+
 // ==================== Data Pool Records ====================
 
 /**
@@ -887,6 +931,7 @@ export async function clearAll() {
   await removeItem(STORAGE_KEY.MONITOR);
   await removeItem(STORAGE_KEY.DATA_POOL);
   await removeItem(STORAGE_KEY.SYNC_HISTORY);
+  await removeItem(STORAGE_KEY.TASK_LEDGER);
   return true;
 }
 

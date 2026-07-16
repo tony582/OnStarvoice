@@ -70,6 +70,7 @@ import {
   dedupeNormalizedCommentItems,
   resolveCommentMergeLimit,
 } from './comment-dedupe.js';
+import {isUnattendedSafetyBlock} from './unattended-keyword-run.js';
 import {
   isDouyinOwnProfileUrl,
   pickDouyinAuthorName,
@@ -9453,6 +9454,7 @@ export async function batchCaptureByUrls({
  * @param {string} options.baseSearchUrl - 当前搜索页 URL（用于构建同平台搜索 URL）
  * @param {Object} options.captureParams - 传给 captureKeywordNotes 的参数
  * @param {Function} [options.afterKeywordCapture] - 单个关键词入池后触发，可用于立即采集增强
+ * @param {Function} [options.onKeywordSettled] - 单个关键词收口后触发，用于持久化无人值守检查点
  * @param {Function} [options.onProgress] - 进度回调 ({ current, total, keyword, phase })
  * @param {Function} [options.shouldStop] - 取消检测函数
  * @returns {Promise<{ ok: boolean, results: Array, stats: Object }>}
@@ -9523,6 +9525,7 @@ export async function batchCaptureByKeywords({
   captureParams = {},
   searchFilters = null,
   afterKeywordCapture = null,
+  onKeywordSettled = null,
   waitForegroundTabId = null,
   onProgress = null,
   shouldStop = null,
@@ -9534,12 +9537,30 @@ export async function batchCaptureByKeywords({
   const sourceTab = await getCurrentActiveTab();
   const runnerCtx = await prepareDetailBatchRunnerContext({ sourceTab });
   const { runnerTabId } = runnerCtx;
+  const externalOnProgress =
+    typeof onProgress === 'function' ? onProgress : null;
+  onProgress = externalOnProgress
+    ? (progress) => {
+        try {
+          const callbackResult = externalOnProgress(progress);
+          if (callbackResult?.catch) {
+            callbackResult.catch((error) => {
+              console.warn('[CaptureSync] Batch progress callback failed:', error);
+            });
+          }
+        } catch (error) {
+          console.warn('[CaptureSync] Batch progress callback failed:', error);
+        }
+      }
+    : null;
 
   const results = [];
   let successCount = 0;
   let failedCount = 0;
   let canceled = false;
+  let securityBlocked = false;
 
+  try {
   for (let i = 0; i < keywords.length; i++) {
     if (typeof shouldStop === 'function' && shouldStop()) {
       canceled = true;
@@ -9845,11 +9866,21 @@ export async function batchCaptureByKeywords({
         keyword,
         ok: false,
         error: error.message,
+        securityBlocked: isUnattendedSafetyBlock(error),
       };
       results.push(keywordResult);
       failedCount++;
     } finally {
       // captureAndSaveInTab owns its own checkpoint session.
+    }
+
+    if (
+      keywordResult?.ok === false &&
+      (keywordResult.securityBlocked || isUnattendedSafetyBlock(keywordResult.error))
+    ) {
+      keywordResult.securityBlocked = true;
+      securityBlocked = true;
+      canceled = true;
     }
 
     const keywordRecordIds = Array.isArray(keywordResult?.recordIds)
@@ -9876,6 +9907,7 @@ export async function batchCaptureByKeywords({
         runnerTabId,
       });
     }
+    let stopAfterKeyword = Boolean(keywordResult?.securityBlocked);
     if (canRunAfterKeywordCapture && keywordRecordIds.length > 0) {
       keywordResult.enhanceStatus = 'running';
       if (onProgress) {
@@ -9919,24 +9951,28 @@ export async function batchCaptureByKeywords({
         if (enhanceResult?.securityBlocked) {
           keywordResult.enhanceStatus = 'failed';
           keywordResult.securityBlocked = true;
+          securityBlocked = true;
           canceled = true;
-          break;
+          stopAfterKeyword = true;
         }
         if (
-          enhanceResult?.canceled ||
-          (typeof shouldStop === 'function' && shouldStop())
+          !stopAfterKeyword &&
+          (
+            enhanceResult?.canceled ||
+            (typeof shouldStop === 'function' && shouldStop())
+          )
         ) {
           keywordResult.enhanceStatus = 'failed';
           keywordResult.canceled = true;
           canceled = true;
-          break;
+          stopAfterKeyword = true;
         }
-        if (enhanceResult && enhanceResult.ok === false) {
+        if (!stopAfterKeyword && enhanceResult && enhanceResult.ok === false) {
           keywordResult.enhanceStatus = 'failed';
           keywordResult.partial = true;
           keywordResult.warning =
             enhanceResult?.error?.message || keywordResult.warning || '采集增强未完整完成';
-        } else if (!enhanceResult?.skipped) {
+        } else if (!stopAfterKeyword && !enhanceResult?.skipped) {
           keywordResult.enhanceStatus = 'done';
         }
       } catch (error) {
@@ -9944,24 +9980,48 @@ export async function batchCaptureByKeywords({
           keywordResult.enhanceStatus = 'failed';
           keywordResult.canceled = true;
           canceled = true;
-          break;
-        }
-        keywordResult.enhanceStatus = 'failed';
-        keywordResult.partial = true;
-        keywordResult.warning =
-          error?.message || keywordResult.warning || '采集增强失败';
-        if (onProgress) {
-          onProgress({
-            current: i + 1,
-            total: keywords.length,
-            keyword,
-            phase: 'enhance_failed',
-            message: `关键词「${keyword}」采集增强失败：${keywordResult.warning}`,
-            recordIds: keywordRecordIds,
-            runnerTabId,
-          });
+          stopAfterKeyword = true;
+        } else {
+          keywordResult.enhanceStatus = 'failed';
+          keywordResult.partial = true;
+          keywordResult.warning =
+            error?.message || keywordResult.warning || '采集增强失败';
+          if (isUnattendedSafetyBlock(error)) {
+            keywordResult.securityBlocked = true;
+            securityBlocked = true;
+            canceled = true;
+            stopAfterKeyword = true;
+          }
+          if (onProgress) {
+            onProgress({
+              current: i + 1,
+              total: keywords.length,
+              keyword,
+              phase: 'enhance_failed',
+              message: `关键词「${keyword}」采集增强失败：${keywordResult.warning}`,
+              recordIds: keywordRecordIds,
+              runnerTabId,
+            });
+          }
         }
       }
+    }
+
+    if (keywordResult && typeof onKeywordSettled === 'function') {
+      await onKeywordSettled({
+        current: i + 1,
+        total: keywords.length,
+        keyword,
+        result: keywordResult,
+        recordIds: keywordRecordIds,
+        runnerTabId,
+        securityBlocked: Boolean(keywordResult.securityBlocked),
+        canceled: Boolean(keywordResult.canceled),
+      });
+    }
+
+    if (stopAfterKeyword) {
+      break;
     }
 
     // 关键词间随机延迟:分钟级(防风控,见常量注释)。最后一个不延迟。
@@ -10007,15 +10067,6 @@ export async function batchCaptureByKeywords({
     }
   }
 
-  // 恢复原始页面
-  if (runnerCtx.shouldRestoreSourcePage && runnerCtx.sourcePageUrl) {
-    try {
-      await chrome.tabs.update(runnerTabId, { url: runnerCtx.sourcePageUrl });
-    } catch {
-      // ignore restore failure
-    }
-  }
-
   if (onProgress) {
     onProgress({
       current: successCount + failedCount,
@@ -10031,6 +10082,7 @@ export async function batchCaptureByKeywords({
   return {
     ok: !canceled && failedCount === 0,
     canceled,
+    securityBlocked,
     results,
     stats: {
       total: keywords.length,
@@ -10039,6 +10091,16 @@ export async function batchCaptureByKeywords({
       failed: failedCount,
     },
   };
+  } finally {
+    // 检查点持久化或外部回调失败时也必须恢复 runner 原页，避免页面永久停在半途关键词。
+    if (runnerCtx.shouldRestoreSourcePage && runnerCtx.sourcePageUrl) {
+      try {
+        await chrome.tabs.update(runnerTabId, { url: runnerCtx.sourcePageUrl });
+      } catch {
+        // ignore restore failure
+      }
+    }
+  }
 }
 
 export async function lightSampleByKeywords({

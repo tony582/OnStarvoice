@@ -9,7 +9,13 @@ import {
   refreshMonitor,
   refreshDataPool,
   refreshSyncHistory,
+  refreshTaskLedger,
+  refreshTaskCenterLegacyState,
 } from "./state.js";
+import {
+  initializeTaskCenterInteractions,
+  renderTaskCenterPanel,
+} from "./task-center-ui.js";
 import {
   ERROR_MESSAGE_MAP,
   MESSAGE_TYPE,
@@ -390,7 +396,11 @@ document.addEventListener("DOMContentLoaded", () => {
       void refreshAuth();
       window.requestAuthRefresh?.();
     } else if (targetId === "historyTab") {
-      void refreshSyncHistory();
+      void Promise.all([
+        refreshSyncHistory(),
+        refreshTaskLedger(),
+        refreshTaskCenterLegacyState(),
+      ]);
       window.requestExecutionDetailRefresh?.();
     } else if (targetId === "monitorTab") {
       void refreshMonitor();
@@ -1272,105 +1282,23 @@ document.addEventListener("DOMContentLoaded", () => {
     bindDataItemThumbFallbacks(listContainer);
   });
 
-  const renderExecutionDetailsPanel = () => {
-    const historyStats = document.getElementById("syncHistoryStatsText");
-    const historyEmpty = document.getElementById("syncHistoryEmpty");
-    const historyList = document.getElementById("syncHistoryList");
-    const selectedPlatform = getSelectedSyncHistoryPlatform();
-    const historyConfig = window.getSidebarSyncHistoryState?.() || {entries: []};
-    const monitorConfig = window.getSidebarMonitorState?.() || {};
-
-    if (!historyStats || !historyEmpty || !historyList) {
-      return;
-    }
-
-    const syncEntries = (Array.isArray(historyConfig.entries) ? historyConfig.entries : [])
-      .filter((entry) => String(entry?.trigger || "").trim() !== "monitor_run_now");
-    const localMonitorEntries = (Array.isArray(historyConfig.entries)
-      ? historyConfig.entries
-      : []
-    ).filter((entry) => String(entry?.trigger || "").trim() === "monitor_run_now");
-    const remoteMonitorEntries = Array.isArray(monitorConfig.executions)
-      ? monitorConfig.executions
-      : [];
-    const monitorById = new Map(
-      (Array.isArray(monitorConfig.items) ? monitorConfig.items : []).map((item) => [
-        String(item?.id || "").trim(),
-        item,
-      ]),
-    );
-
-    const filterByPlatform = (entry) => {
-      if (selectedPlatform === "all") {
-        return true;
-      }
-      return String(entry?.platform || "unknown").trim().toLowerCase() === selectedPlatform;
-    };
-
-    const filterRemoteMonitorByPlatform = (entry) => {
-      if (selectedPlatform === "all") {
-        return true;
-      }
-      const monitorItem = monitorById.get(String(entry?.subscriptionId || "").trim()) || {};
-      const platform = String(entry?.platform || monitorItem?.platform || "unknown")
-        .trim()
-        .toLowerCase();
-      return platform === selectedPlatform;
-    };
-
-    const filteredSyncEntries = syncEntries.filter(filterByPlatform);
-    const filteredLocalMonitorEntries = localMonitorEntries.filter(filterByPlatform);
-    const filteredRemoteMonitorEntries = remoteMonitorEntries.filter(
-      filterRemoteMonitorByPlatform,
-    );
-    const filteredMonitorCount =
-      filteredLocalMonitorEntries.length + filteredRemoteMonitorEntries.length;
-    const totalCount = filteredSyncEntries.length + filteredMonitorCount;
-
-    historyStats.textContent =
-      selectedPlatform === "all"
-        ? `共 ${totalCount} 条执行记录`
-        : `显示 ${totalCount} 条 · 同步 ${filteredSyncEntries.length} / 监控 ${filteredMonitorCount}`;
-    syncHistoryErrorDetailCache.clear();
-
-    const syncSectionHtml = renderExecutionSection({
-      key: "sync",
-      title: "同步记录",
-      subtitle: "数据同步记录，包括笔记、博主信息、评论等同步任务；可手动清空本地缓存",
-      emptyText: "暂无同步记录",
-      content:
-        filteredSyncEntries.length > 0
-          ? filteredSyncEntries
-              .map((entry, index) =>
-                renderSyncExecutionHistoryCard(entry, `sync-${index}`),
-              )
-              .join("")
-          : "",
-    });
-
-    const monitorSectionHtml = renderExecutionSection({
-      key: "monitor",
-      title: "监控记录",
-      subtitle: "包含本地触发监控批次，以及后端监控执行明细；自动保留最近 7 天，不支持手动清空",
-      emptyText: resolveMonitorExecutionEmptyText(monitorConfig),
-      content: [
-        ...filteredLocalMonitorEntries.map((entry, index) =>
-          renderLocalMonitorExecutionCard(entry, `monitor-local-${index}`),
-        ),
-        ...groupRemoteExecutionsByBatch(filteredRemoteMonitorEntries).map(
-          (batch, index) => renderBatchExecutionCard(batch, monitorConfig, `monitor-batch-${index}`),
-        ),
-      ].join(""),
-    });
-
-    historyEmpty.style.display = "none";
-    historyList.style.display = "block";
-    historyList.innerHTML = `${syncSectionHtml}${monitorSectionHtml}`;
-  };
+  const renderExecutionDetailsPanel = () => renderTaskCenterPanel();
+  initializeTaskCenterInteractions(renderExecutionDetailsPanel);
 
   subscribe("syncHistory", (historyConfig) => {
     if (!historyConfig) return;
     window.getSidebarSyncHistoryState = () => historyConfig;
+    renderExecutionDetailsPanel();
+  });
+
+  subscribe("taskLedger", (taskLedger) => {
+    if (!taskLedger) return;
+    window.getSidebarTaskLedgerState = () => taskLedger;
+    renderExecutionDetailsPanel();
+  });
+
+  subscribe("taskCenterLegacy", (legacyState) => {
+    window.getSidebarTaskCenterLegacyState = () => legacyState || {};
     renderExecutionDetailsPanel();
   });
 
@@ -1465,6 +1393,8 @@ document.addEventListener("DOMContentLoaded", () => {
   void refreshMonitor();
   void refreshDataPool();
   void refreshSyncHistory();
+  void refreshTaskLedger();
+  void refreshTaskCenterLegacyState();
 });
 
 function getCurrentPageRecords(records) {
@@ -1483,6 +1413,7 @@ function getCurrentPageRecords(records) {
     return recordPlatform === activePlatform || recordPlatform === "unknown";
   });
 }
+
 
 function formatHistoryTargetTable(target) {
   if (!target || typeof target !== "object") {

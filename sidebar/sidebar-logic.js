@@ -93,7 +93,19 @@ import {
 import {
   beginTaskContext,
   completeTaskContext,
+  getActiveTaskContext,
 } from "../utils/task-context.js";
+import {
+  advanceUnattendedCheckpointRound,
+  findUnattendedResumeKeyword,
+  isUnattendedSafetyBlock,
+  mergeKeywordAttemptResults,
+  normalizeUnattendedKeywordCheckpoint,
+  reconcileEnhancementRetryCheckpoint,
+  resolveCompletedCheckpointKeywords,
+  settleUnattendedKeywordCheckpoint,
+  summarizeUnattendedKeywordCheckpoint,
+} from "../utils/unattended-keyword-run.js";
 import {
   AUTH_CODE_VIEW_MODE,
   ensureEncryptedAuthCode,
@@ -155,6 +167,112 @@ const MONITOR_PUBLISH_WINDOW_OPTIONS = new Set(
 );
 const MONITOR_DAY_MS = 24 * 60 * 60 * 1000;
 const MONITOR_SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
+let lastTaskLedgerProgressAt = 0;
+
+function resolveTaskCenterTitle(taskType = "task", featureKey = "") {
+  const labels = {
+    "capture.single_note": "作品采集",
+    "capture.blogger": "博主采集",
+    "capture.search": "搜索页采集",
+    "capture.keyword_batch": "批量关键词采集",
+    "capture.comments": "评论采集",
+    "capture.enhancement": "采集增强",
+    "sync.lark": "数据同步",
+    "benchmark.account_discovery": "对标账号分析",
+  };
+  return labels[featureKey] ||
+    (taskType === "capture"
+      ? "采集任务"
+      : taskType === "sync"
+        ? "同步任务"
+        : taskType === "monitor"
+          ? "监控任务"
+          : "执行任务");
+}
+
+function normalizeTaskCenterStatus(status = "running") {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "partial") return "completed_with_failures";
+  if (normalized === "success") return "completed";
+  if (normalized === "error") return "failed";
+  return normalized || "running";
+}
+
+async function reportSidebarTaskRun(run = {}, event = null) {
+  if (!run?.id) return null;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:upsert-task-run",
+      run,
+      event,
+    });
+    return response?.data || null;
+  } catch (error) {
+    console.warn("[Sidebar] Update task center ledger failed:", error);
+    return null;
+  }
+}
+
+function buildSidebarTaskRun(taskContext, patch = {}) {
+  if (!taskContext?.taskId) return null;
+  const contextMetadata =
+    taskContext.metadata && typeof taskContext.metadata === "object"
+      ? taskContext.metadata
+      : {};
+  const summaryMetadata =
+    patch.summary && typeof patch.summary === "object" && !Array.isArray(patch.summary)
+      ? patch.summary
+      : {};
+  const metadata = {...contextMetadata, ...summaryMetadata};
+  const runtime = getCurrentRuntime() || {};
+  const now = new Date().toISOString();
+  const status = normalizeTaskCenterStatus(patch.status || "running");
+  return {
+    id: taskContext.taskId,
+    taskType: String(taskContext.taskType || "task"),
+    kind: String(taskContext.taskType || "task"),
+    featureKey: String(taskContext.featureKey || ""),
+    title: resolveTaskCenterTitle(
+      taskContext.taskType,
+      taskContext.featureKey,
+    ),
+    platform: String(metadata.platform || runtime.platform || "unknown"),
+    trigger: metadata.retry ? "retry" : "manual",
+    status,
+    createdAt: String(taskContext.startedAt || now),
+    startedAt: String(taskContext.startedAt || now),
+    updatedAt: now,
+    businessProgressAt: String(patch.businessProgressAt || now),
+    counts: {
+      total: Math.max(
+        0,
+        Number(metadata.totalCount ?? metadata.keywordCount ?? patch?.progress?.total) || 0,
+      ),
+      processed: Math.max(
+        0,
+        Number(metadata.processedCount ?? patch?.progress?.current) || 0,
+      ),
+      saved: Math.max(0, Number(metadata.savedCount) || 0),
+      success: Math.max(0, Number(metadata.successCount) || 0),
+      failed: Math.max(0, Number(metadata.failedCount) || 0),
+      skipped: Math.max(0, Number(metadata.skippedCount) || 0),
+      retried: Math.max(0, Number(metadata.retryCount) || 0),
+      warnings: Math.max(0, Number(metadata.warningCount) || 0),
+    },
+    finishedAt:
+      new Set([
+        "completed",
+        "completed_with_failures",
+        "failed",
+        "canceled",
+      ]).has(status)
+        ? now
+        : "",
+    metadata,
+    ...patch,
+    status,
+  };
+}
 
 function beginSidebarTask({
   taskType = "task",
@@ -175,6 +293,13 @@ function beginSidebarTask({
     status: "started",
     metadata,
   }).catch(() => null);
+
+  const taskRun = buildSidebarTaskRun(taskContext, {status: "running"});
+  void reportSidebarTaskRun(taskRun, {
+    type: "task_started",
+    status: "running",
+    message: `${taskRun?.title || "任务"}已开始`,
+  });
 
   return taskContext;
 }
@@ -197,6 +322,25 @@ function finishSidebarTask(
     status,
     metadata,
   }).catch(() => null);
+
+  const taskRun = buildSidebarTaskRun(completedContext, {
+    status: normalizeTaskCenterStatus(status),
+    summary: metadata,
+    error: error
+      ? {
+          code: String(error?.code || ""),
+          message: String(error?.message || error || ""),
+        }
+      : null,
+  });
+  void reportSidebarTaskRun(taskRun, {
+    type: "task_finished",
+    status: taskRun?.status || status,
+    message:
+      taskRun?.status === "completed"
+        ? `${taskRun.title}已完成`
+        : `${taskRun?.title || "任务"}已结束`,
+  });
 
   if (error) {
     void recordDiagnosticError({
@@ -332,6 +476,7 @@ let manualSelectedPlatform = "";
 let lastKnownPagePlatform = "unknown";
 let currentUpdateNoticeState = null;
 let activeCaptureExecutionLockId = "";
+let adoptedUnattendedCaptureExecutionLockId = "";
 let captureExecutionLockHeartbeatTimer = null;
 let captureExecutionLockHeartbeatLockId = "";
 let captureExecutionLockHeartbeatInFlight = false;
@@ -373,6 +518,18 @@ const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
 const KEYWORD_PLAN_RECONCILE_INTERVAL_MS = 5 * 1000;
 const UNATTENDED_RUN_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const UNATTENDED_PROTECTED_WAIT_TICK_MS = 30 * 1000;
+const UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS = 1500;
+const UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
+const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 2;
+const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
+const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
+let activeUnattendedRunRequestId = "";
+let activeUnattendedRunAttemptId = "";
+let activeUnattendedProgressSeq = 0;
+let activeUnattendedAttemptRejected = false;
+let lastUnattendedContentProgressAt = 0;
+let lastUnattendedContentProgressFingerprint = "";
 const KEYWORD_PLAN_MODES = new Set([
   "daily",
   "custom_dates",
@@ -384,7 +541,10 @@ const KEYWORD_PLAN_MODE_LABELS = {
 const KEYWORD_PLAN_STATUS_LABELS = {
   started: "已启动",
   running: "运行中",
+  recovering: "自动恢复中",
   completed: "已完成",
+  completed_with_failures: "部分完成",
+  needs_action: "需要处理",
   failed: "失败",
   canceled: "已取消",
   skipped: "已跳过",
@@ -1901,14 +2061,8 @@ function handleUnattendedRunRequestStorageChange(request) {
   batchKeywordCancelRequested = true;
   detailBatchCancelRequested = true;
   searchCaptureCancelRequested = true;
-  const progressTabId = Number(request?.progress?.runnerTabId);
-  const relayTabId =
-    (Number.isFinite(Number(detailBatchRunnerTabId)) && Number(detailBatchRunnerTabId)) ||
-    (Number.isFinite(Number(activeBatchRunnerTabId)) && Number(activeBatchRunnerTabId)) ||
-    (Number.isFinite(progressTabId) && progressTabId > 0 ? progressTabId : null);
-  requestCaptureCancelSignal(relayTabId).catch((error) => {
-    console.warn("[Sidebar] Relay unattended cancel from storage failed:", error);
-  });
+  // background 在状态切换前已捕获旧 lock holder 并精确转发取消。这里仅停止
+  // 本地编排；若再发送无 captureRequestId 的全页取消，迟到消息可能误伤新 attempt。
 }
 
 async function handleSaveKeywordPlan(scope = "modal") {
@@ -3534,10 +3688,111 @@ async function renderAuthCodeInput(auth = getCurrentAuth()) {
 
 // ==================== UI 事件监听 ====================
 
+async function handleTaskCenterAction(event) {
+  const detail = event?.detail && typeof event.detail === "object"
+    ? event.detail
+    : {};
+  const rawAction = String(detail.action || "").trim();
+  const action =
+    rawAction === "stop_keep"
+      ? "stop"
+      : rawAction === "resume_remaining"
+        ? "continue_remaining"
+        : rawAction;
+  const taskId = String(detail.taskId || detail.id || "").trim();
+  if (!action) return;
+
+  if (action === "view_results") {
+    window.activateSidebarTab?.("searchTab");
+    return;
+  }
+
+  if (action === "keep_results") {
+    if (!taskId) {
+      showMessage("未找到要保留的任务，请刷新任务中心后重试", "warning");
+      return;
+    }
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "onstarvoice:cancel-unattended-keyword-run",
+        requestId: taskId,
+        message: "用户选择保留已有结果，不再自动恢复",
+      });
+      if (!response?.ok) {
+        throw new Error(response?.reason || response?.error?.message || "任务状态更新失败");
+      }
+      showMessage("已保留当前结果，任务不会自动重试", "success");
+    } catch (error) {
+      showMessage("保留结果失败: " + error.message, "error");
+    }
+    return;
+  }
+
+  if (action === "stop") {
+    if (taskId) {
+      try {
+        const unattendedResponse = await chrome.runtime.sendMessage({
+          type: "onstarvoice:cancel-unattended-keyword-run",
+          requestId: taskId,
+          message: "用户从任务中心停止任务并保留已有结果",
+        });
+        if (unattendedResponse?.ok) {
+          showMessage("正在停止任务并保留已有结果...", "warning");
+          return;
+        }
+      } catch (error) {
+        console.warn("[Sidebar] Cancel task center unattended run failed:", error);
+      }
+    }
+    const activeTask = getActiveTaskContext();
+    if (!taskId || activeTask?.taskId === taskId) {
+      await handleCancel();
+      showMessage("正在停止任务并保留已有结果...", "warning");
+      return;
+    }
+    showMessage("这条任务已不在当前页面执行，已刷新任务状态", "warning");
+    return;
+  }
+
+  const recoveryModeByAction = {
+    continue_remaining: "remaining",
+    retry_failed: "failed",
+    skip_current: "skip_current",
+  };
+  const mode = recoveryModeByAction[action];
+  if (!mode || !taskId) return;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:recover-unattended-keyword-run",
+      requestId: taskId,
+      mode,
+    });
+    if (!response?.ok) {
+      throw new Error(response?.reason || response?.error?.message || "无法恢复任务");
+    }
+    showMessage(
+      mode === "failed"
+        ? "已安排仅重试失败关键词"
+        : mode === "skip_current"
+          ? "已跳过当前项并继续剩余任务"
+          : "已从检查点继续剩余任务",
+      "success",
+    );
+    await loadKeywordPlanUI();
+  } catch (error) {
+    showMessage("恢复任务失败: " + error.message, "error");
+  }
+}
+
 /**
  * 设置 UI 事件监听
  */
 function setupUIEventListeners() {
+  document.addEventListener(
+    "onstarvoice:task-center-action",
+    handleTaskCenterAction,
+  );
   const btnCaptureNote = document.getElementById("btnCaptureNote");
   if (btnCaptureNote) {
     btnCaptureNote.addEventListener("click", handleCaptureNoteData);
@@ -3956,17 +4211,82 @@ function setupUIEventListeners() {
   // Init More Menu Dropdown
   const btnMoreMenu = document.getElementById("btnMoreMenu");
   const dropdownMoreMenu = document.getElementById("dropdownMoreMenu");
+  const getMoreMenuItems = () =>
+    dropdownMoreMenu
+      ? Array.from(dropdownMoreMenu.querySelectorAll(".dropdown-item"))
+      : [];
+  const setMoreMenuOpen = (
+    open,
+    {restoreFocus = false, focusEdge = ""} = {},
+  ) => {
+    if (!btnMoreMenu || !dropdownMoreMenu) return;
+    const nextOpen = Boolean(open);
+    dropdownMoreMenu.classList.toggle("is-active", nextOpen);
+    btnMoreMenu.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+    if (restoreFocus) {
+      btnMoreMenu.focus();
+    } else if (nextOpen && focusEdge) {
+      requestAnimationFrame(() => {
+        const items = getMoreMenuItems();
+        const target = focusEdge === "last" ? items.at(-1) : items[0];
+        target?.focus();
+      });
+    }
+  };
   if (btnMoreMenu && dropdownMoreMenu) {
+    dropdownMoreMenu
+      .querySelectorAll(".dropdown-item")
+      .forEach((item) => item.setAttribute("role", "menuitem"));
     btnMoreMenu.addEventListener("click", (e) => {
       e.stopPropagation();
-      dropdownMoreMenu.classList.toggle("is-active");
+      const nextOpen = !dropdownMoreMenu.classList.contains("is-active");
+      setMoreMenuOpen(nextOpen, {focusEdge: nextOpen ? "first" : ""});
+    });
+    dropdownMoreMenu.addEventListener("click", (event) => {
+      if (event.target.closest(".dropdown-item")) {
+        setMoreMenuOpen(false, {restoreFocus: true});
+      }
+    });
+    dropdownMoreMenu.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMoreMenuOpen(false, {restoreFocus: true});
+        return;
+      }
+      if (!new Set(["ArrowDown", "ArrowUp", "Home", "End"]).has(event.key)) {
+        return;
+      }
+      const items = getMoreMenuItems();
+      if (items.length === 0) return;
+      event.preventDefault();
+      const activeIndex = items.indexOf(document.activeElement);
+      const nextIndex =
+        event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? items.length - 1
+            : event.key === "ArrowUp"
+              ? (activeIndex <= 0 ? items.length : activeIndex) - 1
+              : (activeIndex + 1) % items.length;
+      items[nextIndex]?.focus();
+    });
+    btnMoreMenu.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMoreMenuOpen(false, {restoreFocus: true});
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setMoreMenuOpen(true, {
+          focusEdge: event.key === "ArrowUp" ? "last" : "first",
+        });
+      }
     });
     document.addEventListener("click", (e) => {
       if (
         !dropdownMoreMenu.contains(e.target) &&
         !btnMoreMenu.contains(e.target)
       ) {
-        dropdownMoreMenu.classList.remove("is-active");
+        setMoreMenuOpen(false);
       }
     });
   }
@@ -4004,7 +4324,7 @@ function setupUIEventListeners() {
   if (menuBtnSettings) {
     menuBtnSettings.addEventListener("click", () => {
       window.activateSidebarTab("settingsTab");
-      if (dropdownMoreMenu) dropdownMoreMenu.classList.remove("is-active");
+      setMoreMenuOpen(false);
     });
   }
 
@@ -4012,7 +4332,7 @@ function setupUIEventListeners() {
   if (menuBtnHistory) {
     menuBtnHistory.addEventListener("click", () => {
       window.activateSidebarTab("historyTab");
-      if (dropdownMoreMenu) dropdownMoreMenu.classList.remove("is-active");
+      setMoreMenuOpen(false);
     });
   }
 
@@ -4023,7 +4343,7 @@ function setupUIEventListeners() {
         trigger: "manual",
         openModalWhenLatest: true,
       });
-      if (dropdownMoreMenu) dropdownMoreMenu.classList.remove("is-active");
+      setMoreMenuOpen(false);
     });
   }
 
@@ -4031,7 +4351,7 @@ function setupUIEventListeners() {
   if (menuBtnContact) {
     menuBtnContact.addEventListener("click", () => {
       openContactModal();
-      if (dropdownMoreMenu) dropdownMoreMenu.classList.remove("is-active");
+      setMoreMenuOpen(false);
     });
   }
   setupContactModalListeners();
@@ -9541,13 +9861,32 @@ function getExpandedKeywordsFromTextarea({dedupe = false} = {}) {
 }
 
 // 可中断睡眠:每秒检查 shouldStop,用于循环采集的轮次间隔
-function sleepWithStop(ms, shouldStop) {
+function sleepWithStop(
+  ms,
+  shouldStop,
+  {onTick = null, tickEveryMs = 30 * 1000} = {},
+) {
   return new Promise((resolve) => {
     const start = Date.now();
+    const finishAt = start + Math.max(0, Number(ms) || 0);
+    let lastTickAt = 0;
     const id = setInterval(() => {
-      if ((shouldStop && shouldStop()) || Date.now() - start >= ms) {
+      const now = Date.now();
+      if ((shouldStop && shouldStop()) || now >= finishAt) {
         clearInterval(id);
         resolve();
+        return;
+      }
+      if (
+        typeof onTick === "function" &&
+        (lastTickAt === 0 || now - lastTickAt >= Math.max(1000, tickEveryMs))
+      ) {
+        lastTickAt = now;
+        try {
+          onTick(Math.max(0, finishAt - now));
+        } catch (error) {
+          console.warn("[Sidebar] Wait progress callback failed:", error);
+        }
       }
     }, 1000);
   });
@@ -9852,6 +10191,12 @@ async function handleBatchKeywordCapture(options = {}) {
   const executionLockLabel =
     String(runOptions.executionLockLabel || "").trim() ||
     "手动批量关键词采集";
+  if (
+    executionLockOwner === "unattended_keyword_plan" &&
+    activeUnattendedAttemptRejected
+  ) {
+    return {started: false, canceled: true, reason: "当前执行已被新的恢复任务接管"};
+  }
 
   if (batchKeywordCaptureInFlight) {
     if (batchKeywordCancelRequested) {
@@ -9924,6 +10269,13 @@ async function handleBatchKeywordCapture(options = {}) {
   let streamingSyncQueue = null;
   let streamingSyncResult = null;
   let streamingSyncDrained = false;
+  let sidebarTaskContext = null;
+  let sidebarTaskStatus = "failed";
+  let sidebarTaskError = null;
+  let sidebarTaskMetadata = {
+    platform: pagePlatform,
+    keywordCount: keywords.length,
+  };
   try {
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
@@ -9943,6 +10295,19 @@ async function handleBatchKeywordCapture(options = {}) {
     });
     if (!executionLock) {
       return {started: false, reason: "已有采集任务运行中"};
+    }
+    if (
+      executionLockOwner === "unattended_keyword_plan" &&
+      activeUnattendedAttemptRejected
+    ) {
+      return {started: false, canceled: true, reason: "当前执行已被新的恢复任务接管"};
+    }
+    if (executionLockOwner !== "unattended_keyword_plan") {
+      sidebarTaskContext = beginSidebarTask({
+        taskType: "capture",
+        featureKey: "capture.keyword_batch",
+        metadata: sidebarTaskMetadata,
+      });
     }
 
     const sortContext = await syncKeywordSortDimensionFromPage({
@@ -9997,11 +10362,38 @@ async function handleBatchKeywordCapture(options = {}) {
       runOptions.searchFilters && typeof runOptions.searchFilters === "object"
         ? runOptions.searchFilters
         : collectSearchFiltersFromControls("modal");
+    const resumeCheckpoint =
+      runOptions.resumeCheckpoint &&
+      typeof runOptions.resumeCheckpoint === "object"
+        ? runOptions.resumeCheckpoint
+        : null;
+    const onKeywordSettled =
+      typeof runOptions.onKeywordSettled === "function"
+        ? runOptions.onKeywordSettled
+        : null;
+    const maxKeywordAttempts = Math.max(
+      1,
+      Math.min(3, Number(runOptions.maxKeywordAttempts) || 1),
+    );
 
     let result;
-    let round = 0;
-    let totalSuccess = 0;
-    let totalFailed = 0;
+    const resumeRound = resumeCheckpoint
+      ? Math.min(maxRounds, Math.max(1, Number(resumeCheckpoint.round) || 1))
+      : 1;
+    let round = resumeRound - 1;
+    const previousKeywordResults = Array.isArray(resumeCheckpoint?.keywordResults)
+      ? resumeCheckpoint.keywordResults
+      : [];
+    let totalSuccess = previousKeywordResults.filter(
+      (entry) =>
+        Math.max(1, Number(entry?.round) || 1) < resumeRound &&
+        String(entry?.status || "") === "completed",
+    ).length;
+    let totalFailed = previousKeywordResults.filter(
+      (entry) =>
+        Math.max(1, Number(entry?.round) || 1) < resumeRound &&
+        String(entry?.status || "") === "failed",
+    ).length;
 
     // 定时启动:指定了开始时刻则等到那一刻再开跑(可中断),等待期间显示倒计时
     const scheduledStartStr = document.getElementById("inputBatchScheduledStart")?.value || "";
@@ -10046,8 +10438,26 @@ async function handleBatchKeywordCapture(options = {}) {
 
     do {
       round += 1;
-      result = await batchCaptureByKeywords({
-        keywords: [...keywords],
+      const completedBeforeRun = resolveCompletedCheckpointKeywords(
+        resumeCheckpoint,
+        round,
+      );
+      const exhaustedBeforeRun = previousKeywordResults.filter(
+        (entry) =>
+          Math.max(1, Number(entry?.round) || 1) === round &&
+          String(entry?.status || "") === "failed" &&
+          Math.max(0, Number(entry?.attemptCount) || 0) >= maxKeywordAttempts,
+      );
+      const exhaustedKeywords = new Set(
+        exhaustedBeforeRun.map((entry) => String(entry?.keyword || "").trim()),
+      );
+      let pendingKeywords = keywords.filter(
+        (keyword) =>
+          !completedBeforeRun.has(keyword) && !exhaustedKeywords.has(keyword),
+      );
+      let keywordAttempt = 1;
+      const baseBatchOptions = {
+        keywords: [...pendingKeywords],
         platform: pagePlatform,
         baseSearchUrl,
         searchFilters,
@@ -10061,6 +10471,23 @@ async function handleBatchKeywordCapture(options = {}) {
           maxDurationMs: settings.sharedMaxDurationMs,
         },
         waitForegroundTabId,
+        onKeywordSettled: onKeywordSettled
+          ? async (settled = {}) => {
+              const originalIndex = Math.max(
+                0,
+                keywords.indexOf(String(settled.keyword || "").trim()),
+              );
+              await onKeywordSettled({
+                ...settled,
+                current: originalIndex + 1,
+                total: keywords.length,
+                originalIndex,
+                round,
+                attempt: keywordAttempt,
+                maxAttempts: maxKeywordAttempts,
+              });
+            }
+          : null,
         afterKeywordCapture: settings.autoDetailCaptureAfterListCapture
           ? async ({
               keyword: capturedKeyword,
@@ -10138,9 +10565,20 @@ async function handleBatchKeywordCapture(options = {}) {
           if (progress.phase && progress.phase !== "capturing") {
             setBatchProgressDetail("");
           }
+          const progressKeyword = String(progress?.keyword || "").trim();
+          const originalIndex = progressKeyword
+            ? keywords.indexOf(progressKeyword)
+            : -1;
+          const normalizedProgress = {
+            ...progress,
+            current: originalIndex >= 0 ? originalIndex + 1 : progress.current,
+            total: keywords.length,
+            attempt: keywordAttempt,
+            maxAttempts: maxKeywordAttempts,
+          };
           const progressForUi = autoLoop
-            ? { ...progress, round, message: `第 ${round} 轮 · ${progress.message || ""}` }
-            : { ...progress, round };
+            ? { ...normalizedProgress, round, message: `第 ${round} 轮 · ${progress.message || ""}` }
+            : { ...normalizedProgress, round };
           progressForUi.message = appendStreamingSyncSummary(
             progressForUi.message,
             streamingSyncQueue,
@@ -10152,24 +10590,142 @@ async function handleBatchKeywordCapture(options = {}) {
           notifyProgress?.(progressForUi);
         },
         shouldStop: () => batchKeywordCancelRequested,
-      });
+      };
+
+      let mergedAttemptResult = {
+        ok: exhaustedBeforeRun.length === 0,
+        canceled: false,
+        securityBlocked: false,
+        results: exhaustedBeforeRun.map((entry) => ({
+          keyword: String(entry?.keyword || ""),
+          ok: false,
+          error: String(entry?.error || "已达自动重试上限"),
+          retryExhausted: true,
+        })),
+        stats: {
+          total: keywords.length,
+          processed: completedBeforeRun.size + exhaustedBeforeRun.length,
+          success: completedBeforeRun.size,
+          failed: exhaustedBeforeRun.length,
+        },
+      };
+
+      while (pendingKeywords.length > 0) {
+        const attemptResult = await batchCaptureByKeywords({
+          ...baseBatchOptions,
+          keywords: [...pendingKeywords],
+        });
+        mergedAttemptResult = mergeKeywordAttemptResults({
+          previous: mergedAttemptResult,
+          next: attemptResult,
+          allKeywords: keywords,
+          completedBeforeRun,
+        });
+        if (
+          attemptResult?.canceled ||
+          attemptResult?.securityBlocked ||
+          batchKeywordCancelRequested
+        ) {
+          break;
+        }
+
+        pendingKeywords = (Array.isArray(attemptResult?.results)
+          ? attemptResult.results
+          : []
+        )
+          .filter((item) => item?.ok !== true)
+          .map((item) => String(item?.keyword || "").trim())
+          .filter(Boolean);
+        if (resumeCheckpoint && onKeywordSettled) {
+          pendingKeywords = pendingKeywords.filter((keyword) => {
+            const checkpointEntry = (Array.isArray(resumeCheckpoint.keywordResults)
+              ? resumeCheckpoint.keywordResults
+              : []
+            ).find(
+              (entry) =>
+                Math.max(1, Number(entry?.round) || 1) === round &&
+                String(entry?.keyword || "").trim() === keyword,
+            );
+            return (
+              !checkpointEntry ||
+              Math.max(0, Number(checkpointEntry.attemptCount) || 0) <
+                maxKeywordAttempts
+            );
+          });
+        }
+        if (
+          pendingKeywords.length === 0 ||
+          keywordAttempt >= maxKeywordAttempts
+        ) {
+          break;
+        }
+
+        keywordAttempt += 1;
+        const retryDelay =
+          UNATTENDED_KEYWORD_RETRY_MIN_MS +
+          Math.random() *
+            (UNATTENDED_KEYWORD_RETRY_MAX_MS - UNATTENDED_KEYWORD_RETRY_MIN_MS);
+        const retryProgress = {
+          current: 0,
+          total: keywords.length,
+          round,
+          attempt: keywordAttempt,
+          maxAttempts: maxKeywordAttempts,
+          phase: "keyword_retry_wait",
+          remainingMs: retryDelay,
+          message: `${Math.ceil(retryDelay / 1000)} 秒后自动重试 ${pendingKeywords.length} 个失败关键词（第 ${keywordAttempt}/${maxKeywordAttempts} 次）`,
+        };
+        updateBatchProgress(retryProgress, "modal");
+        notifyProgress?.(retryProgress);
+        await sleepWithStop(retryDelay, () => batchKeywordCancelRequested);
+      }
+
+      result = mergedAttemptResult;
 
       await refreshDataPool();
       totalSuccess += result.stats.success;
       totalFailed += result.stats.failed;
 
-      const retryResult = await retryFailedEnhancementsAfterRound({
-        round,
-        roundLabel: autoLoop ? `第 ${round} 轮` : "",
-        batchResult: result,
-        settings,
-        notifyProgress,
-        waitForegroundTabId,
-        shouldStop: () => batchKeywordCancelRequested,
-        updateProgress: (progress) => updateBatchProgress(progress, "modal"),
-        streamingSyncQueue,
-      });
+      const retryResult =
+        result?.securityBlocked || result?.canceled
+          ? null
+          : await retryFailedEnhancementsAfterRound({
+              round,
+              roundLabel: autoLoop ? `第 ${round} 轮` : "",
+              batchResult: result,
+              settings,
+              notifyProgress,
+              waitForegroundTabId,
+              shouldStop: () => batchKeywordCancelRequested,
+              updateProgress: (progress) => updateBatchProgress(progress, "modal"),
+              streamingSyncQueue,
+            });
+      if (
+        retryResult &&
+        !retryResult.securityBlocked &&
+        !retryResult.canceled &&
+        Array.isArray(retryResult.successRecordIds) &&
+        retryResult.successRecordIds.length > 0
+      ) {
+        const reconciled = reconcileEnhancementRetryCheckpoint({
+          checkpoint: resumeCheckpoint || {},
+          keywords,
+          round,
+          batchResults: result?.results || [],
+          successRecordIds: retryResult.successRecordIds,
+        });
+        if (reconciled.changed && resumeCheckpoint) {
+          Object.assign(resumeCheckpoint, reconciled.checkpoint);
+          if (typeof onKeywordSettled?.persist === "function") {
+            await onKeywordSettled.persist({
+              summary: reconciled.summary,
+              message: `第 ${round} 轮增强重试成功，已更新 ${reconciled.completedKeywords.length} 个关键词检查点`,
+            });
+          }
+        }
+      }
       if (retryResult?.securityBlocked) {
+        result.securityBlocked = true;
         batchKeywordCancelRequested = true;
         showMessage(
           "⚠️ 重试采集增强时触发小红书安全限制，已停止本次任务。建议隔较长时间(数小时)再跑。",
@@ -10185,23 +10741,76 @@ async function handleBatchKeywordCapture(options = {}) {
         break;
       }
 
+      // 进入等待前先把检查点推进到下一轮。这样在间隔中休眠、断网或关页后，
+      // 恢复会直接从下一轮首词继续，不会重放已经完成的轮次或再等一整段间隔。
+      if (resumeCheckpoint) {
+        Object.assign(
+          resumeCheckpoint,
+          advanceUnattendedCheckpointRound({
+            checkpoint: resumeCheckpoint,
+            keywords,
+            completedRound: round,
+            maxRounds,
+          }),
+        );
+      }
+
       // 轮次间隔:歇 roundGapMin 分钟再跑下一轮(睡眠中可中断)
       if (roundGapMs > 0) {
-        updateBatchProgress(
-          (() => {
-            const waitProgress = {
-              current: 0,
-              total: keywords.length,
-              phase: "waiting",
-              message: `第 ${round} 轮完成（累计成功 ${totalSuccess}），${roundGapMin} 分钟后开始第 ${round + 1} 轮…`,
-              round,
-            };
-            notifyProgress?.(waitProgress);
-            return waitProgress;
-          })(),
-          "modal",
+        const waitUntil = new Date(Date.now() + roundGapMs).toISOString();
+        const buildWaitProgress = (remainingMs) => ({
+          current: 0,
+          total: keywords.length,
+          phase: "waiting_next_round",
+          remainingMs,
+          message: `第 ${round} 轮完成（累计成功 ${totalSuccess}），约 ${Math.max(1, Math.ceil(remainingMs / 60000))} 分钟后开始第 ${round + 1} 轮…`,
+          round,
+        });
+        const waitProgress = buildWaitProgress(roundGapMs);
+        updateBatchProgress(waitProgress, "modal");
+        notifyProgress?.(waitProgress);
+        if (typeof onKeywordSettled?.persist === "function") {
+          await onKeywordSettled.persist({
+            message: waitProgress.message,
+            waitUntil,
+          });
+        }
+        await sleepWithStop(
+          roundGapMs,
+          () => batchKeywordCancelRequested,
+          {
+            onTick: (remainingMs) => {
+              const progress = buildWaitProgress(remainingMs);
+              updateBatchProgress(progress, "modal");
+              notifyProgress?.(progress);
+            },
+          },
         );
-        await sleepWithStop(roundGapMs, () => batchKeywordCancelRequested);
+        if (!batchKeywordCancelRequested) {
+          const nextRoundProgress = {
+            current: 0,
+            total: keywords.length,
+            phase: "starting_next_round",
+            message: `第 ${round + 1} 轮准备开始`,
+            round: round + 1,
+          };
+          updateBatchProgress(nextRoundProgress, "modal");
+          notifyProgress?.(nextRoundProgress);
+        }
+        if (
+          !batchKeywordCancelRequested &&
+          typeof onKeywordSettled?.persist === "function"
+        ) {
+          await onKeywordSettled.persist({
+            message: `第 ${round + 1} 轮准备开始`,
+            waitUntil: "",
+          });
+        }
+      } else if (typeof onKeywordSettled?.persist === "function") {
+        await onKeywordSettled.persist({
+          message: `第 ${round + 1} 轮准备开始`,
+          waitUntil: "",
+        });
       }
     } while (!batchKeywordCancelRequested);
 
@@ -10234,10 +10843,26 @@ async function handleBatchKeywordCapture(options = {}) {
         stats.failed > 0 ? "warning" : "success",
       );
     }
+    sidebarTaskStatus =
+      result?.canceled || batchKeywordCancelRequested
+        ? "canceled"
+        : totalFailed > 0
+          ? "completed_with_failures"
+          : "completed";
+    sidebarTaskMetadata = {
+      ...sidebarTaskMetadata,
+      rounds: round,
+      successCount: totalSuccess,
+      failedCount: totalFailed,
+    };
     return {
       started: true,
-      ok: !result?.canceled,
+      ok:
+        !result?.canceled &&
+        !result?.securityBlocked &&
+        totalFailed === 0,
       canceled: Boolean(result?.canceled || batchKeywordCancelRequested),
+      securityBlocked: Boolean(result?.securityBlocked),
       result,
       rounds: round,
       totalSuccess,
@@ -10246,6 +10871,8 @@ async function handleBatchKeywordCapture(options = {}) {
     };
   } catch (error) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
+    sidebarTaskStatus = "failed";
+    sidebarTaskError = error;
     showMessage("批量采集失败: " + error.message, "error");
     return {
       started: true,
@@ -10253,6 +10880,13 @@ async function handleBatchKeywordCapture(options = {}) {
       error: error.message,
     };
   } finally {
+    if (sidebarTaskContext) {
+      finishSidebarTask(sidebarTaskContext, {
+        status: sidebarTaskStatus,
+        error: sidebarTaskError,
+        metadata: sidebarTaskMetadata,
+      });
+    }
     if (streamingSyncQueue?.enabled && !streamingSyncDrained) {
       streamingSyncResult = await drainStreamingDetailSyncQueue(
         streamingSyncQueue,
@@ -10280,21 +10914,105 @@ async function handleBatchKeywordCapture(options = {}) {
   }
 }
 
-async function reportUnattendedKeywordRun(requestId, patch = {}) {
+function activateUnattendedRunRequest(request = {}) {
+  activeUnattendedRunRequestId = String(request?.id || "").trim();
+  activeUnattendedRunAttemptId = String(request?.attemptId || "").trim();
+  activeUnattendedProgressSeq = Math.max(0, Number(request?.progressSeq) || 0);
+  activeUnattendedAttemptRejected = false;
+  lastUnattendedContentProgressAt = 0;
+  lastUnattendedContentProgressFingerprint = "";
+}
+
+function clearActiveUnattendedRunRequest(requestId = "") {
+  if (
+    requestId &&
+    activeUnattendedRunRequestId &&
+    activeUnattendedRunRequestId !== requestId
+  ) {
+    return;
+  }
+  activeUnattendedRunRequestId = "";
+  activeUnattendedRunAttemptId = "";
+  activeUnattendedProgressSeq = 0;
+  activeUnattendedAttemptRejected = false;
+  lastUnattendedContentProgressAt = 0;
+  lastUnattendedContentProgressFingerprint = "";
+}
+
+function stopRejectedUnattendedAttempt(reason = "attempt_mismatch") {
+  if (activeUnattendedAttemptRejected) {
+    return;
+  }
+  activeUnattendedAttemptRejected = true;
+  batchKeywordCancelRequested = true;
+  detailBatchCancelRequested = true;
+  // attempt 已由 background 换代时，只停止旧侧栏本地编排。后台会在启动新 attempt
+  // 前按旧 runner 精确取消；这里若再发不带 captureRequestId 的全页取消，迟到回包
+  // 可能误伤复用同一平台标签页的新 attempt。
+  console.warn("[Sidebar] Stopping stale unattended attempt:", reason);
+}
+
+async function reportUnattendedKeywordRun(
+  requestId,
+  patch = {},
+  {attemptId = activeUnattendedRunAttemptId, quiet = false} = {},
+) {
   if (!requestId) {
-    return null;
+    return {ok: false, accepted: false, reason: "missing_request_id", data: null};
   }
   try {
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:update-unattended-keyword-run",
       requestId,
+      attemptId: String(attemptId || ""),
       patch,
     });
-    return response?.data || null;
+    const accepted = response?.accepted !== false && response?.ok !== false;
+    const reason = String(response?.reason || "");
+    if (
+      !accepted &&
+      (reason === "attempt_mismatch" || reason === "terminal")
+    ) {
+      stopRejectedUnattendedAttempt(reason);
+    }
+    return {
+      ok: response?.ok !== false,
+      accepted,
+      reason,
+      data: response?.data || null,
+    };
   } catch (error) {
-    console.warn("[Sidebar] Update unattended keyword run failed:", error);
-    return null;
+    if (!quiet) {
+      console.warn("[Sidebar] Update unattended keyword run failed:", error);
+    }
+    return {
+      ok: false,
+      accepted: false,
+      reason: "transport_error",
+      data: null,
+      error,
+    };
   }
+}
+
+async function reportUnattendedTerminalRun(requestId, patch = {}) {
+  let lastResult = null;
+  for (const delayMs of UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      await sleep(delayMs);
+    }
+    lastResult = await reportUnattendedKeywordRun(requestId, patch, {
+      quiet: delayMs < UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS.at(-1),
+    });
+    if (
+      lastResult.accepted ||
+      lastResult.reason === "terminal" ||
+      lastResult.reason === "attempt_mismatch"
+    ) {
+      return lastResult;
+    }
+  }
+  return lastResult;
 }
 
 function startUnattendedKeywordRunHeartbeat(requestId) {
@@ -10310,9 +11028,15 @@ function startUnattendedKeywordRunHeartbeat(requestId) {
     }
     reportInFlight = true;
     try {
-      await reportUnattendedKeywordRun(requestId, {
+      const result = await reportUnattendedKeywordRun(requestId, {
         heartbeatAt: new Date().toISOString(),
       });
+      if (
+        result?.reason === "attempt_mismatch" ||
+        result?.reason === "terminal"
+      ) {
+        stopped = true;
+      }
     } finally {
       reportInFlight = false;
     }
@@ -10343,9 +11067,20 @@ function createUnattendedKeywordProgressReporter(requestId) {
     }
     lastMessage = message;
     lastReportedAt = now;
+    activeUnattendedProgressSeq += 1;
+    const remainingMs = Number.isFinite(Number(progress?.remainingMs))
+      ? Math.max(0, Number(progress.remainingMs))
+      : null;
+    const updatedAt = new Date().toISOString();
     void reportUnattendedKeywordRun(requestId, {
       status: "running",
       message,
+      progressSeq: activeUnattendedProgressSeq,
+      businessProgressAt: updatedAt,
+      waitUntil:
+        remainingMs !== null
+          ? new Date(Date.now() + remainingMs).toISOString()
+          : "",
       progress: {
         current: Number.isFinite(Number(progress?.current))
           ? Number(progress.current)
@@ -10358,22 +11093,162 @@ function createUnattendedKeywordProgressReporter(requestId) {
         runnerTabId: Number.isFinite(Number(progress?.runnerTabId))
           ? Number(progress.runnerTabId)
           : null,
-        remainingMs: Number.isFinite(Number(progress?.remainingMs))
-          ? Number(progress.remainingMs)
-          : null,
+        remainingMs,
         round: Number.isFinite(Number(progress?.round))
           ? Number(progress.round)
           : null,
-        updatedAt: new Date().toISOString(),
+        updatedAt,
       },
     }).catch(() => null);
   };
+}
+
+function resolveUnattendedProtectedWaitUntilMs(
+  request = {},
+  fallbackNotBeforeMs = 0,
+) {
+  const candidates = [
+    request?.recoveryWaitUntil,
+    request?.waitUntil,
+    request?.progress?.waitUntil,
+  ]
+    .map((value) => Date.parse(String(value || "")))
+    .filter((value) => Number.isFinite(value));
+  const fallback = Number(fallbackNotBeforeMs);
+  if (Number.isFinite(fallback) && fallback > 0) {
+    candidates.push(fallback);
+  }
+  return candidates.length > 0 ? Math.max(...candidates) : 0;
+}
+
+async function reportUnattendedProtectedWaitState(
+  requestId,
+  {
+    waitUntilMs = 0,
+    remainingMs = 0,
+    phase = "waiting_next_round",
+    message = "等待下一轮采集",
+    round = null,
+  } = {},
+) {
+  let lastResult = null;
+  for (const delayMs of [0, 300, 900]) {
+    if (delayMs > 0) await sleep(delayMs);
+    if (
+      activeUnattendedAttemptRejected ||
+      batchKeywordCancelRequested ||
+      detailBatchCancelRequested
+    ) {
+      return false;
+    }
+    activeUnattendedProgressSeq += 1;
+    const updatedAt = new Date().toISOString();
+    lastResult = await reportUnattendedKeywordRun(requestId, {
+      status: "running",
+      progressSeq: activeUnattendedProgressSeq,
+      waitUntil:
+        Number.isFinite(Number(waitUntilMs)) && Number(waitUntilMs) > 0
+          ? new Date(Number(waitUntilMs)).toISOString()
+          : "",
+      message,
+      progress: {
+        current: 0,
+        total: 0,
+        keyword: "",
+        phase,
+        message,
+        remainingMs: Math.max(0, Number(remainingMs) || 0),
+        round: Number.isFinite(Number(round)) ? Number(round) : null,
+        updatedAt,
+      },
+    });
+    if (lastResult?.accepted) return true;
+    if (
+      lastResult?.reason === "attempt_mismatch" ||
+      lastResult?.reason === "terminal"
+    ) {
+      return false;
+    }
+  }
+  const error = new Error("无法确认无人值守等待边界，已停止本次执行");
+  error.code = "UNATTENDED_WAIT_STATE_WRITE_FAILED";
+  throw error;
+}
+
+async function waitForUnattendedProtectedStart(
+  request,
+  {fallbackNotBeforeMs = 0, round = null} = {},
+) {
+  const requestId = String(request?.id || "").trim();
+  if (!requestId) return false;
+  const waitUntilMs = resolveUnattendedProtectedWaitUntilMs(
+    request,
+    fallbackNotBeforeMs,
+  );
+  const hadWaitMarker = Boolean(
+    String(request?.recoveryWaitUntil || request?.waitUntil || request?.progress?.waitUntil || "").trim(),
+  );
+
+  while (waitUntilMs > Date.now()) {
+    if (
+      activeUnattendedAttemptRejected ||
+      batchKeywordCancelRequested ||
+      detailBatchCancelRequested
+    ) {
+      return false;
+    }
+    const remainingMs = Math.max(0, waitUntilMs - Date.now());
+    const message = `上一轮已完成，约 ${Math.max(1, Math.ceil(remainingMs / 60000))} 分钟后继续采集`;
+    const accepted = await reportUnattendedProtectedWaitState(requestId, {
+      waitUntilMs,
+      remainingMs,
+      message,
+      round,
+    });
+    if (!accepted) return false;
+    await sleepWithStop(
+      Math.min(remainingMs, UNATTENDED_PROTECTED_WAIT_TICK_MS),
+      () =>
+        activeUnattendedAttemptRejected ||
+        batchKeywordCancelRequested ||
+        detailBatchCancelRequested,
+    );
+  }
+
+  if (
+    activeUnattendedAttemptRejected ||
+    batchKeywordCancelRequested ||
+    detailBatchCancelRequested
+  ) {
+    return false;
+  }
+  if (!hadWaitMarker && !(Number(fallbackNotBeforeMs) > 0)) {
+    return true;
+  }
+  return await reportUnattendedProtectedWaitState(requestId, {
+    waitUntilMs: 0,
+    remainingMs: 0,
+    phase: "protected_wait_complete",
+    message: "防风控等待已结束，准备继续采集",
+    round,
+  });
 }
 
 async function acquireCaptureExecutionLock({
   owner = "manual",
   label = "采集任务",
 } = {}) {
+  if (
+    owner === "unattended_keyword_plan" &&
+    activeCaptureExecutionLockId &&
+    adoptedUnattendedCaptureExecutionLockId === activeCaptureExecutionLockId
+  ) {
+    return await validateAdoptedUnattendedCaptureExecutionLock({
+      lockId: activeCaptureExecutionLockId,
+      owner,
+      label,
+    });
+  }
   try {
     let holderTabId = null;
     try {
@@ -10394,6 +11269,7 @@ async function acquireCaptureExecutionLock({
     });
     if (response?.ok && response.data?.id) {
       activeCaptureExecutionLockId = response.data.id;
+      adoptedUnattendedCaptureExecutionLockId = "";
       startCaptureExecutionLockHeartbeat(response.data.id, holderTabId);
       return response.data;
     }
@@ -10451,15 +11327,20 @@ function handleCaptureExecutionLockLost(lockId) {
   }
   const relayTabId = resolveCaptureExecutionLockRunnerTabId();
   stopCaptureExecutionLockHeartbeat(lockId);
+  if (adoptedUnattendedCaptureExecutionLockId === lockId) {
+    adoptedUnattendedCaptureExecutionLockId = "";
+  }
   activeCaptureExecutionLockId = "";
   setCancelFlag(true);
   searchCaptureCancelRequested = true;
   batchKeywordCancelRequested = true;
   batchUrlCancelRequested = true;
   detailBatchCancelRequested = true;
-  void requestCaptureCancelSignal(relayTabId).catch((error) => {
-    console.warn("[Sidebar] Relay cancel after capture lock loss failed:", error);
-  });
+  if (!activeUnattendedRunRequestId) {
+    void requestCaptureCancelSignal(relayTabId).catch((error) => {
+      console.warn("[Sidebar] Relay cancel after capture lock loss failed:", error);
+    });
+  }
   showMessage("采集任务锁已失效，本次任务正在停止，请重新启动", "error");
 }
 
@@ -10511,6 +11392,52 @@ function startCaptureExecutionLockHeartbeat(lockId, holderTabId = null) {
   }, CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS);
 }
 
+async function validateAdoptedUnattendedCaptureExecutionLock({
+  lockId,
+  owner,
+  label,
+}) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:renew-capture-lock",
+      lockId,
+      holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
+      holderTabId: resolveCaptureExecutionLockRunnerTabId(),
+    });
+    if (
+      !response?.ok ||
+      activeCaptureExecutionLockId !== lockId ||
+      adoptedUnattendedCaptureExecutionLockId !== lockId
+    ) {
+      handleCaptureExecutionLockLost(lockId);
+      return null;
+    }
+    return {
+      ...(response.data || {}),
+      id: lockId,
+      owner,
+      label,
+      holderTabId:
+        response.data?.holderTabId ?? captureExecutionLockInitialHolderTabId,
+    };
+  } catch (error) {
+    console.warn("[Sidebar] Validate adopted capture lock failed:", error);
+    handleCaptureExecutionLockLost(lockId);
+    return null;
+  }
+}
+
+function adoptUnattendedCaptureExecutionLock(lock = null) {
+  const lockId = String(lock?.id || "").trim();
+  if (!lockId) {
+    return false;
+  }
+  activeCaptureExecutionLockId = lockId;
+  adoptedUnattendedCaptureExecutionLockId = lockId;
+  startCaptureExecutionLockHeartbeat(lockId, lock?.holderTabId);
+  return true;
+}
+
 async function releaseCaptureExecutionLock(lockId = activeCaptureExecutionLockId) {
   if (!lockId) {
     return false;
@@ -10530,6 +11457,9 @@ async function releaseCaptureExecutionLock(lockId = activeCaptureExecutionLockId
     console.warn("[Sidebar] Release capture execution lock failed:", error);
     return false;
   } finally {
+    if (adoptedUnattendedCaptureExecutionLockId === lockId) {
+      adoptedUnattendedCaptureExecutionLockId = "";
+    }
     if (activeCaptureExecutionLockId === lockId) {
       activeCaptureExecutionLockId = "";
     }
@@ -10556,32 +11486,81 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
   }
 
   let stopHeartbeat = () => {};
+  let claimedRequestId = requestId;
+  let claimedAdoptedLockId = "";
   try {
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:claim-unattended-keyword-run",
       requestId,
+      holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
     });
-    if (!response?.ok || !response.data) {
+    if (
+      response?.accepted === false &&
+      response?.reason === "previous_capture_stop_unconfirmed"
+    ) {
+      if (response.lock) {
+        adoptUnattendedCaptureExecutionLock(response.lock);
+      }
+      showMessage(
+        "旧采集页面未能安全停止，已阻止自动继续；请在任务中心取消任务或检查页面后重试",
+        "error",
+      );
+      return;
+    }
+    if (
+      response?.accepted === false &&
+      response?.reason === "capture_lock_conflict"
+    ) {
+      showMessage(
+        "其他采集任务已占用执行锁，无人值守恢复已暂停；请等待当前任务结束后从任务中心重试",
+        "warning",
+      );
+      return;
+    }
+    if (!response?.ok || response?.accepted === false || !response.data) {
       if (requestId) {
         showMessage("未找到可执行的无人值守计划任务", "warning");
       }
       return;
     }
-    stopHeartbeat = startUnattendedKeywordRunHeartbeat(response.data.id);
+    claimedRequestId = String(response.data.id || requestId || "").trim();
+    activateUnattendedRunRequest(response.data);
+    if (response.lock && adoptUnattendedCaptureExecutionLock(response.lock)) {
+      claimedAdoptedLockId = String(response.lock.id || "").trim();
+    }
+    stopHeartbeat = startUnattendedKeywordRunHeartbeat(claimedRequestId);
+    const ready = await waitForUnattendedProtectedStart(response.data, {
+      round: response.data?.checkpoint?.round,
+    });
+    if (!ready) {
+      return;
+    }
     await runUnattendedKeywordPlanRequest(response.data);
   } catch (error) {
     console.error("[Sidebar] Claim unattended keyword run failed:", error);
-    showMessage("启动无人值守计划失败: " + error.message, "error");
-    await reportUnattendedKeywordRun(requestId, {
-      status: "failed",
-      finishedAt: new Date().toISOString(),
-      message: error.message,
-      error: {
+    if (
+      !activeUnattendedAttemptRejected &&
+      !error?.unattendedTerminalReported
+    ) {
+      showMessage("启动无人值守计划失败: " + error.message, "error");
+      await reportUnattendedTerminalRun(claimedRequestId, {
+        status: "failed",
+        finishedAt: new Date().toISOString(),
         message: error.message,
-      },
-    });
+        error: {
+          message: error.message,
+        },
+      });
+    }
   } finally {
     stopHeartbeat();
+    clearActiveUnattendedRunRequest(claimedRequestId);
+    if (
+      claimedAdoptedLockId &&
+      activeCaptureExecutionLockId === claimedAdoptedLockId
+    ) {
+      await releaseCaptureExecutionLock(claimedAdoptedLockId);
+    }
   }
 }
 
@@ -10691,6 +11670,129 @@ async function navigateActiveTabToKeywordSearchForPlan({
   }
 }
 
+function buildUnattendedTaskCounts(
+  checkpoint = {},
+  summary = summarizeUnattendedKeywordCheckpoint(checkpoint),
+  overrides = {},
+) {
+  const total = Math.max(
+    0,
+    Number(overrides.total) ||
+      (Array.isArray(checkpoint?.keywordResults)
+        ? checkpoint.keywordResults.length
+        : 0),
+  );
+  return {
+    total,
+    processed: Math.max(0, Number(overrides.processed) || total),
+    saved: Math.max(0, Number(overrides.saved ?? summary.saved) || 0),
+    success: Math.max(
+      0,
+      Number(overrides.success ?? summary.completed) || 0,
+    ),
+    failed: Math.max(0, Number(overrides.failed ?? summary.failed) || 0),
+    skipped: Math.max(0, Number(overrides.skipped ?? summary.skipped) || 0),
+    retried: Math.max(0, Number(overrides.retried ?? summary.retries) || 0),
+    warnings: Math.max(0, Number(overrides.warnings ?? summary.partial) || 0),
+  };
+}
+
+function createUnattendedKeywordCheckpointReporter({
+  requestId,
+  checkpoint,
+  keywords,
+} = {}) {
+  const persist = async ({
+    summary = null,
+    message = "",
+    waitUntil,
+  } = {}) => {
+    const checkpointSummary = summary || summarizeUnattendedKeywordCheckpoint(checkpoint);
+    let reportResult = null;
+    for (const delayMs of [0, 300, 900]) {
+      if (delayMs > 0) await sleep(delayMs);
+      const reportPatch = {
+        checkpoint: {
+          ...checkpoint,
+          keywordResults: checkpoint.keywordResults.map((entry) => ({...entry})),
+        },
+        summary: checkpointSummary,
+        counts: buildUnattendedTaskCounts(checkpoint, checkpointSummary),
+        message,
+        businessProgressAt: checkpoint.updatedAt,
+      };
+      if (waitUntil !== undefined) {
+        reportPatch.waitUntil = String(waitUntil || "");
+      }
+      reportResult = await reportUnattendedKeywordRun(requestId, reportPatch);
+      if (
+        reportResult?.accepted ||
+        reportResult?.reason === "attempt_mismatch" ||
+        reportResult?.reason === "terminal"
+      ) {
+        break;
+      }
+    }
+    if (!reportResult?.accepted) {
+      const error = new Error(
+        reportResult?.reason === "attempt_mismatch"
+          ? "当前执行已被新的恢复任务接管"
+          : "无法保存无人值守检查点，已停止继续执行",
+      );
+      error.code =
+        reportResult?.reason === "attempt_mismatch"
+          ? "UNATTENDED_ATTEMPT_REPLACED"
+          : "UNATTENDED_CHECKPOINT_WRITE_FAILED";
+      throw error;
+    }
+    return reportResult;
+  };
+
+  const reportSettled = async ({
+    round = 1,
+    originalIndex = 0,
+    keyword = "",
+    result = {},
+    recordIds = [],
+    attempt = 1,
+    maxAttempts = UNATTENDED_KEYWORD_MAX_ATTEMPTS,
+    securityBlocked = false,
+    canceled = false,
+  } = {}) => {
+    const normalizedKeyword = String(keyword || "").trim();
+    if (!normalizedKeyword) {
+      return;
+    }
+    const settled = settleUnattendedKeywordCheckpoint({
+      checkpoint,
+      keywords,
+      round,
+      originalIndex,
+      keyword: normalizedKeyword,
+      result,
+      recordIds,
+      attempt,
+      maxAttempts,
+      securityBlocked,
+      canceled,
+    });
+    Object.assign(checkpoint, settled.checkpoint);
+    const status = settled.entry?.status || "failed";
+    const summary = settled.summary;
+    await persist({
+      summary,
+      message:
+        status === "completed"
+          ? `已保存关键词「${normalizedKeyword}」的任务检查点`
+          : status === "retrying"
+            ? `关键词「${normalizedKeyword}」暂时失败，准备有界重试`
+            : `关键词「${normalizedKeyword}」已收口为${status === "partial" ? "部分完成" : "失败"}`,
+    });
+  };
+  reportSettled.persist = persist;
+  return reportSettled;
+}
+
 async function runUnattendedKeywordPlanRequest(request) {
   const requestId = String(request?.id || "").trim();
   const plan = request?.planSnapshot || {};
@@ -10698,19 +11800,86 @@ async function runUnattendedKeywordPlanRequest(request) {
     Array.isArray(plan.keywords) ? plan.keywords : [],
   ).slice(0, MAX_BATCH_KEYWORDS);
   const platform = String(plan.platform || "xiaohongshu").trim();
+  const plannedRounds = Math.max(1, Number(plan.maxRounds) || 1);
+  const checkpoint = normalizeUnattendedKeywordCheckpoint(request, keywords, {
+    maxRounds: plannedRounds,
+  });
+  let resumeKeyword = findUnattendedResumeKeyword(checkpoint, keywords);
 
   if (keywords.length === 0) {
     throw new Error("无人值守计划没有可执行关键词");
+  }
+  if (!resumeKeyword && Math.max(1, Number(checkpoint.round) || 1) < plannedRounds) {
+    // 兼容旧版本在「本轮完成、下一轮尚未落盘」窗口留下的检查点。
+    // 以检查点/业务时钟中的较晚者作为保守间隔起点，避免崩溃窗口直接跳过
+    // 防风控 roundGap；若已有显式 waitUntil，则沿用更晚的那个边界。
+    const roundGapMs = Math.max(0, Number(plan.roundGapMin) || 0) * 60 * 1000;
+    const checkpointUpdatedAt = Date.parse(String(checkpoint.updatedAt || ""));
+    const businessProgressAt = Date.parse(String(request?.businessProgressAt || ""));
+    const legacyWaitBase = Math.max(
+      Number.isFinite(checkpointUpdatedAt) ? checkpointUpdatedAt : 0,
+      Number.isFinite(businessProgressAt) ? businessProgressAt : 0,
+    );
+    const ready = await waitForUnattendedProtectedStart(request, {
+      fallbackNotBeforeMs:
+        legacyWaitBase > 0 && roundGapMs > 0
+          ? legacyWaitBase + roundGapMs
+          : 0,
+      round: checkpoint.round,
+    });
+    if (!ready) return;
+    // 等待边界确认后再推进恢复边界，避免恢复后重复上一轮或再次导航旧轮次。
+    Object.assign(
+      checkpoint,
+      advanceUnattendedCheckpointRound({
+        checkpoint,
+        keywords,
+        completedRound: checkpoint.round,
+        maxRounds: plannedRounds,
+      }),
+    );
+    resumeKeyword = findUnattendedResumeKeyword(checkpoint, keywords);
+  }
+  if (!resumeKeyword) {
+    const summary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+    const status = summary.failed > 0 ? "completed_with_failures" : "completed";
+    await reportUnattendedTerminalRun(requestId, {
+      status,
+      finishedAt: new Date().toISOString(),
+      checkpoint,
+      summary,
+      counts: {
+        total: checkpoint.keywordResults.length,
+        processed: checkpoint.keywordResults.length,
+        saved: summary.saved,
+        success: summary.completed,
+        failed: summary.failed,
+        skipped: summary.skipped,
+        retried: summary.retries,
+      },
+      message:
+        status === "completed"
+          ? "检查点显示全部关键词均已完成，无需重复采集"
+          : "检查点显示剩余关键词均已达到重试上限，已保留现有结果",
+    });
+    return;
   }
   if (batchKeywordCaptureInFlight || batchUrlCaptureInFlight) {
     throw new Error("已有批量任务执行中，无法启动无人值守计划");
   }
 
-  await reportUnattendedKeywordRun(requestId, {
+  const startReport = await reportUnattendedKeywordRun(requestId, {
     status: "running",
     startedAt: new Date().toISOString(),
-    message: "无人值守计划已触发，准备调用循环采集流程",
+    checkpoint,
+    message:
+      checkpoint.keywordResults.length > 0
+        ? `无人值守计划正在从关键词「${resumeKeyword}」恢复`
+        : "无人值守计划已触发，准备调用循环采集流程",
   });
+  if (!startReport?.accepted) {
+    throw new Error("无人值守任务已被其它恢复尝试接管");
+  }
 
   let switchResult = null;
   try {
@@ -10765,7 +11934,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     }
 
     await navigateActiveTabToKeywordSearchForPlan({
-      keyword: keywords[0],
+      keyword: resumeKeyword,
       platform,
       tabId: switchResult?.data?.tabId,
       baseSearchUrl: String(
@@ -10773,20 +11942,35 @@ async function runUnattendedKeywordPlanRequest(request) {
       ).trim(),
     });
 
-    await reportUnattendedKeywordRun(requestId, {
+    const delegatedReport = await reportUnattendedKeywordRun(requestId, {
       status: "running",
       message: "已交给循环采集流程执行",
+      checkpoint,
       progress: {
         current: 0,
         total: keywords.length,
         phase: "delegated_to_batch_loop",
       },
     });
+    if (!delegatedReport?.accepted) {
+      const error = new Error("当前执行已被新的恢复任务接管");
+      error.code = "UNATTENDED_ATTEMPT_REPLACED";
+      throw error;
+    }
 
     const reportKeywordProgress =
       createUnattendedKeywordProgressReporter(requestId);
+    const reportKeywordCheckpoint =
+      createUnattendedKeywordCheckpointReporter({
+        requestId,
+        checkpoint,
+        keywords,
+      });
     const batchRunResult = await handleBatchKeywordCapture({
       onProgress: reportKeywordProgress,
+      onKeywordSettled: reportKeywordCheckpoint,
+      resumeCheckpoint: checkpoint,
+      maxKeywordAttempts: UNATTENDED_KEYWORD_MAX_ATTEMPTS,
       waitForegroundTabId: null,
       executionLockOwner: "unattended_keyword_plan",
       executionLockLabel: "无人值守计划",
@@ -10798,33 +11982,101 @@ async function runUnattendedKeywordPlanRequest(request) {
     if (batchRunResult?.ok === false && batchRunResult?.error) {
       throw new Error(batchRunResult.error);
     }
+    if (batchRunResult?.securityBlocked) {
+      const safetyMessage =
+        "检测到验证码、登录失效或平台安全限制，已暂停整批任务且不会自动连续重试";
+      const safetySummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+      await reportUnattendedTerminalRun(requestId, {
+        status: "needs_action",
+        finishedAt: new Date().toISOString(),
+        checkpoint,
+        summary: safetySummary,
+        counts: buildUnattendedTaskCounts(checkpoint, safetySummary),
+        message: safetyMessage,
+        error: {code: "PLATFORM_SAFETY_BLOCK", message: safetyMessage},
+      });
+      return;
+    }
     if (batchRunResult?.canceled) {
-      await reportUnattendedKeywordRun(requestId, {
+      const canceledSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+      await reportUnattendedTerminalRun(requestId, {
         status: "canceled",
         finishedAt: new Date().toISOString(),
+        checkpoint,
+        summary: canceledSummary,
+        counts: buildUnattendedTaskCounts(checkpoint, canceledSummary),
         message: batchRunResult.reason || "无人值守计划已取消",
       });
       return;
     }
 
-    const stats = batchRunResult?.result?.stats || {};
-    const message = `无人值守计划已完成：共 ${Number(stats.total || 0)} 个关键词，成功 ${Number(stats.success || 0)}，失败 ${Number(stats.failed || 0)}`;
-    await reportUnattendedKeywordRun(requestId, {
-      status: "completed",
+    const checkpointSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+    const checkpointProcessed =
+      Math.max(0, Number(checkpointSummary.completed) || 0) +
+      Math.max(0, Number(checkpointSummary.failed) || 0) +
+      Math.max(0, Number(checkpointSummary.partial) || 0) +
+      Math.max(0, Number(checkpointSummary.skipped) || 0);
+    const stats = {
+      total: Math.max(
+        keywords.length * Math.max(1, Number(batchRunResult?.rounds) || 1),
+        checkpointProcessed,
+      ),
+      success:
+        checkpointProcessed > 0
+          ? Math.max(0, Number(checkpointSummary.completed) || 0)
+          : Math.max(0, Number(batchRunResult?.totalSuccess) || 0),
+      failed:
+        checkpointProcessed > 0
+          ? Math.max(0, Number(checkpointSummary.failed) || 0) +
+            Math.max(0, Number(checkpointSummary.partial) || 0)
+          : Math.max(0, Number(batchRunResult?.totalFailed) || 0),
+      skipped:
+        checkpointProcessed > 0
+          ? Math.max(0, Number(checkpointSummary.skipped) || 0)
+          : 0,
+    };
+    const summary = {
+      ...checkpointSummary,
+      total: stats.total,
+      success: stats.success,
+      failed: stats.failed,
+    };
+    const status = stats.failed > 0 ? "completed_with_failures" : "completed";
+    const message = `无人值守计划${stats.failed > 0 ? "部分" : ""}完成：共 ${stats.total} 个关键词次，成功 ${stats.success}，失败 ${stats.failed}`;
+    await reportUnattendedTerminalRun(requestId, {
+      status,
       finishedAt: new Date().toISOString(),
+      checkpoint,
+      summary,
+      counts: buildUnattendedTaskCounts(checkpoint, summary, {
+        total: stats.total,
+        processed: stats.success + stats.failed + stats.skipped,
+        success: stats.success,
+        failed: stats.failed,
+        skipped: stats.skipped,
+      }),
       message,
     });
   } catch (error) {
     console.error("[Sidebar] Unattended keyword plan failed:", error);
-    showMessage("无人值守计划失败: " + error.message, "error");
-    await reportUnattendedKeywordRun(requestId, {
-      status: "failed",
-      finishedAt: new Date().toISOString(),
-      message: error.message,
-      error: {
+    if (!activeUnattendedAttemptRejected) {
+      const safetyBlocked = isUnattendedSafetyBlock(error);
+      const failureSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+      showMessage("无人值守计划失败: " + error.message, "error");
+      await reportUnattendedTerminalRun(requestId, {
+        status: safetyBlocked ? "needs_action" : "failed",
+        finishedAt: new Date().toISOString(),
+        checkpoint,
+        summary: failureSummary,
+        counts: buildUnattendedTaskCounts(checkpoint, failureSummary),
         message: error.message,
-      },
-    });
+        error: {
+          code: safetyBlocked ? "PLATFORM_SAFETY_BLOCK" : error?.code || "",
+          message: error.message,
+        },
+      });
+      error.unattendedTerminalReported = true;
+    }
     throw error;
   } finally {
     closeBatchModal();
@@ -11451,7 +12703,15 @@ async function loadMonitorExecutions({force = false, limit = 50} = {}) {
     return [];
   }
 
-  const items = Array.isArray(result.data?.items) ? result.data.items : [];
+  const items = Array.isArray(result.data?.items)
+    ? result.data.items
+    : Array.isArray(result.data?.executions)
+      ? result.data.executions
+      : Array.isArray(result.executions)
+        ? result.executions
+        : Array.isArray(result.items)
+          ? result.items
+          : [];
   await setCurrentMonitor({
     executions: items,
     isLoadingExecutions: false,
@@ -15592,8 +16852,111 @@ function publishCommentProgressToRuntime(progress) {
 /**
  * 处理进度回调
  */
+function reportActiveSidebarTaskProgress(progress = {}) {
+  const taskContext = getActiveTaskContext();
+  if (!taskContext?.taskId) return;
+  const now = Date.now();
+  if (now - lastTaskLedgerProgressAt < 1500) return;
+  lastTaskLedgerProgressAt = now;
+  const phase = String(progress?.phase || "");
+  const status =
+    phase === "network_paused"
+      ? "paused"
+      : phase.includes("recover") || phase === "system_resumed"
+        ? "recovering"
+        : "running";
+  const progressPatch = {
+    current: Number.isFinite(Number(progress?.current))
+      ? Number(progress.current)
+      : 0,
+    total: Number.isFinite(Number(progress?.total))
+      ? Number(progress.total)
+      : 0,
+    phase,
+    message: String(progress?.message || ""),
+    recordId: String(progress?.recordId || ""),
+    keyword: String(progress?.keyword || ""),
+    savedCount: Number.isFinite(Number(progress?.savedCount))
+      ? Number(progress.savedCount)
+      : Number.isFinite(Number(progress?.collectedCount))
+        ? Number(progress.collectedCount)
+        : null,
+  };
+  const taskRun = buildSidebarTaskRun(taskContext, {
+    status,
+    progress: progressPatch,
+    businessProgressAt: new Date(now).toISOString(),
+  });
+  void reportSidebarTaskRun(taskRun, {
+    type: "progress",
+    status,
+    phase,
+    message: progressPatch.message,
+  });
+}
+
+function reportActiveUnattendedContentProgress(progress = {}) {
+  if (
+    !activeUnattendedRunRequestId ||
+    !activeUnattendedRunAttemptId ||
+    activeUnattendedAttemptRejected
+  ) {
+    return;
+  }
+  const phase = String(progress?.phase || "").trim();
+  const message = String(progress?.message || "").trim();
+  const fingerprint = JSON.stringify({
+    phase,
+    message,
+    captureRequestId: String(progress?.captureRequestId || ""),
+    recordId: String(progress?.recordId || ""),
+    keyword: String(progress?.keyword || ""),
+    current: Number(progress?.current) || 0,
+    count: Number(progress?.count) || 0,
+    detectedCount: Number(progress?.detectedCount) || 0,
+    qualifiedCount: Number(progress?.qualifiedCount) || 0,
+    filteredCount: Number(progress?.filteredCount) || 0,
+    collectedCount: Number(progress?.collectedCount) || 0,
+    savedCount: Number(progress?.savedCount) || 0,
+  });
+  if (!phase && !message) return;
+  if (fingerprint === lastUnattendedContentProgressFingerprint) return;
+  const now = Date.now();
+  if (
+    now - lastUnattendedContentProgressAt <
+    UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+  lastUnattendedContentProgressAt = now;
+  lastUnattendedContentProgressFingerprint = fingerprint;
+  activeUnattendedProgressSeq += 1;
+  void reportUnattendedKeywordRun(activeUnattendedRunRequestId, {
+    status: "running",
+    progressSeq: activeUnattendedProgressSeq,
+    progress: {
+      current: Number.isFinite(Number(progress?.current))
+        ? Number(progress.current)
+        : Number(progress?.detectedCount) || Number(progress?.collectedCount) || 0,
+      total: Number.isFinite(Number(progress?.total)) ? Number(progress.total) : 0,
+      keyword: String(progress?.keyword || ""),
+      phase,
+      message: message || "采集内容持续更新中",
+      recordId: String(progress?.recordId || ""),
+      savedCount: Number.isFinite(Number(progress?.savedCount))
+        ? Number(progress.savedCount)
+        : Number.isFinite(Number(progress?.collectedCount))
+          ? Number(progress.collectedCount)
+          : null,
+      updatedAt: new Date(now).toISOString(),
+    },
+  }).catch(() => null);
+}
+
 function handleProgress(progress) {
   console.log("[Sidebar] Progress:", progress);
+  reportActiveUnattendedContentProgress(progress);
+  reportActiveSidebarTaskProgress(progress);
 
   // 如果进入了单项的评论采集阶段，全局进度条无需显示，因为卡片上已有进度和停止按钮
   const phase = String(progress?.phase || "");

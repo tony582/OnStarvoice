@@ -6,6 +6,7 @@ import {
   getMonitor,
   getRuntime,
   getSync,
+  getTaskLedger,
 } from "./storage.js";
 import {resolveCanonicalFeatureKey} from "./features/registry.js";
 import {normalizeTaskContext, serializeTaskContext} from "./task-context.js";
@@ -422,13 +423,14 @@ export function buildContentDiagnostics({
 }
 
 async function resolveSnapshotRuntime() {
-  const [runtime, auth, capture, sync, monitor, dataPool] = await Promise.all([
+  const [runtime, auth, capture, sync, monitor, dataPool, taskLedger] = await Promise.all([
     getRuntime().catch(() => ({})),
     getAuth().catch(() => ({})),
     getCapture().catch(() => ({})),
     getSync().catch(() => ({})),
     getMonitor().catch(() => ({})),
     getDataPool().catch(() => ({})),
+    getTaskLedger().catch(() => ({runs: []})),
   ]);
   const page = safeUrlParts(runtime?.lastPageUrl || "");
   return {
@@ -438,7 +440,48 @@ async function resolveSnapshotRuntime() {
     sync,
     monitor,
     dataPool,
+    taskLedger,
     page,
+  };
+}
+
+function buildTaskCenterDiagnostics(taskLedger = {}) {
+  const runs = Array.isArray(taskLedger?.runs) ? taskLedger.runs : [];
+  const activeStatuses = new Set([
+    "pending",
+    "running",
+    "recovering",
+    "paused",
+    "needs_action",
+  ]);
+  const safeRuns = runs.slice(0, 10).map((run) => ({
+    id: normalizeText(run?.id, 120),
+    kind: normalizeText(run?.kind, 80),
+    status: normalizeText(run?.status, 80),
+    platform: normalizeText(run?.platform, 80),
+    trigger: normalizeText(run?.trigger, 80),
+    attemptNumber: Number(run?.attemptNumber) || 0,
+    progressSeq: Number(run?.progressSeq) || 0,
+    heartbeatAt: normalizeText(run?.heartbeatAt, 80),
+    businessProgressAt: normalizeText(run?.businessProgressAt, 80),
+    updatedAt: normalizeText(run?.updatedAt, 80),
+    finishedAt: normalizeText(run?.finishedAt, 80),
+    progress: {
+      current: Number(run?.progress?.current) || 0,
+      total: Number(run?.progress?.total) || 0,
+      phase: normalizeText(run?.progress?.phase, 80),
+      message: normalizeText(run?.progress?.message, 180),
+    },
+    counts: sanitizeMetadata(run?.counts || run?.summary || {}),
+    error: run?.error
+      ? normalizeError(run.error, "task_run_error")
+      : null,
+  }));
+  return {
+    totalCount: runs.length,
+    activeCount: runs.filter((run) => activeStatuses.has(String(run?.status || "")))
+      .length,
+    recentRuns: safeRuns,
   };
 }
 
@@ -501,6 +544,7 @@ export async function buildDiagnosticsReport(extra = {}) {
       syncedCount: records.filter((record) => record?.status === "synced").length,
       failedCount: records.filter((record) => record?.status === "failed").length,
     },
+    taskCenter: buildTaskCenterDiagnostics(snapshot.taskLedger),
     recentActions: state.recentActions.slice(0, 10),
     recentErrors: state.recentErrors.slice(0, 10),
     recentStages: state.recentStages.slice(0, 20),

@@ -97,7 +97,12 @@
             <button
               class="icon-btn"
               id="btnMoreMenu"
-              title="选项菜单">
+              type="button"
+              title="选项菜单"
+              aria-label="选项菜单"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              aria-controls="dropdownMoreMenu">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="18"
@@ -131,10 +136,12 @@
 
             <div
               class="dropdown-menu"
-              id="dropdownMoreMenu">
-              <div
+              id="dropdownMoreMenu"
+              role="menu">
+              <button
                 class="dropdown-item"
-                id="menuBtnSettings">
+                id="menuBtnSettings"
+                type="button">
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
                   width="16"
@@ -154,10 +161,11 @@
                     r="3" />
                 </svg>
                 系统配置
-              </div>
-              <div
+              </button>
+              <button
                 class="dropdown-item"
-                id="menuBtnHistory">
+                id="menuBtnHistory"
+                type="button">
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
                   width="16"
@@ -173,8 +181,8 @@
                   <path d="M3 3v5h5" />
                   <path d="M12 7v5l4 2" />
                 </svg>
-                执行明细
-              </div>
+                任务中心
+              </button>
               <a
                 href="https://voice.minilife.online/help#guide"
                 class="dropdown-item"
@@ -274,9 +282,10 @@
                 </svg>
                 联系我们
               </a>
-              <div
+              <button
                 class="dropdown-item"
-                id="menuBtnCheckUpdate">
+                id="menuBtnCheckUpdate"
+                type="button">
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
                   width="16"
@@ -294,7 +303,7 @@
                   <path d="M21 12a9 9 0 0 1-15.3 6.3L3 16" />
                 </svg>
                 检查更新
-              </div>
+              </button>
             </div>
           </div>
         </div>
@@ -1271,7 +1280,10 @@
             <div
               class="panel-header"
               style="align-items: center;">
-              <span>执行明细</span>
+              <div class="task-center-heading">
+                <span>任务中心</span>
+                <span class="task-center-heading-note">查看进行中、需处理和历史任务</span>
+              </div>
               <div class="sync-history-header-actions">
                 <button
                   class="action-icon-btn sync-history-header-btn"
@@ -1309,8 +1321,8 @@
                   class="action-icon-btn sync-history-header-btn"
                   id="btnClearSyncHistory"
                   type="button"
-                  title="清空本地同步记录"
-                  aria-label="清空本地同步记录">
+                  title="仅清空升级前的本地同步记录"
+                  aria-label="仅清空升级前的本地同步记录">
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
                     width="16"
@@ -1330,81 +1342,92 @@
                 </button>
               </div>
             </div>
-            <div class="pool-actions">
-              <div
-                style="display: flex; align-items: center; gap: var(--spacing-sm); width: 100%;">
-                <div
-                  style="font-size: 12px; color: var(--text-secondary); line-height: 32px; flex: 1;"
-                  id="syncHistoryStatsText">
-                  共 0 条执行记录
-                </div>
-                <div
-                  class="sync-history-filter"
-                  id="syncHistoryPlatformFilter">
-                  <button
-                    class="sync-history-filter-trigger"
-                    id="btnSyncHistoryPlatformFilter"
-                    type="button"
-                    aria-expanded="false">
-                    <span
-                      class="sync-history-filter-label"
-                      id="syncHistoryPlatformFilterLabel"
-                      >全部平台</span
-                    >
-                    <svg
-                      class="sync-history-filter-caret"
-                      xmlns="http://www.w3.org/2000/svg"
-                      width="10"
-                      height="10"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round">
-                      <path d="m6 9 6 6 6-6" />
-                    </svg>
-                  </button>
-                  <div
-                    class="dropdown-menu sync-history-filter-menu"
-                    id="dropdownSyncHistoryPlatformFilter">
-                    <button
-                      class="dropdown-item sync-history-filter-item"
-                      type="button"
-                      data-platform-filter="all">
-                      <span class="sync-history-filter-item-label"
-                        >全部平台</span
-                      >
-                    </button>
-                    <button
-                      class="dropdown-item sync-history-filter-item"
-                      type="button"
-                      data-platform-filter="xiaohongshu">
-                      <span class="sync-history-filter-item-label">小红书</span>
-                    </button>
-                    <button
-                      class="dropdown-item sync-history-filter-item"
-                      type="button"
-                      data-platform-filter="douyin">
-                      <span class="sync-history-filter-item-label">抖音</span>
-                    </button>
-                    <button
-                      class="dropdown-item sync-history-filter-item"
-                      type="button"
-                      data-platform-filter="weibo">
-                      <span class="sync-history-filter-item-label">微博</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
+            <div
+              class="task-center-summary"
+              aria-label="任务状态摘要">
+              <button
+                class="task-center-summary-item is-running"
+                type="button"
+                data-task-summary-filter="running"
+                aria-label="筛选进行中任务">
+                <span class="task-center-summary-label">进行中</span>
+                <strong id="taskCenterRunningCount">0</strong>
+              </button>
+              <button
+                class="task-center-summary-item is-attention"
+                type="button"
+                data-task-summary-filter="attention"
+                aria-label="筛选需要处理的任务">
+                <span class="task-center-summary-label">需处理</span>
+                <strong id="taskCenterAttentionCount">0</strong>
+              </button>
+              <button
+                class="task-center-summary-item is-history"
+                type="button"
+                data-task-summary-filter="history"
+                aria-label="筛选历史任务">
+                <span class="task-center-summary-label">历史</span>
+                <strong id="taskCenterHistoryCount">0</strong>
+              </button>
+            </div>
+            <p
+              id="taskCenterStatusLive"
+              class="sr-only"
+              aria-live="polite"
+              aria-atomic="true"></p>
+            <div class="task-center-filter-grid" aria-label="任务筛选">
+              <label class="task-center-filter-field">
+                <span>状态</span>
+                <select id="taskCenterStatusFilter">
+                  <option value="all">全部状态</option>
+                  <option value="running">进行中</option>
+                  <option value="attention">需处理</option>
+                  <option value="history">历史任务</option>
+                </select>
+              </label>
+              <label class="task-center-filter-field">
+                <span>类型</span>
+                <select id="taskCenterTypeFilter">
+                  <option value="all">全部类型</option>
+                  <option value="capture">采集</option>
+                  <option value="keyword">关键词</option>
+                  <option value="comment">评论</option>
+                  <option value="sync">同步</option>
+                  <option value="monitor">监控</option>
+                </select>
+              </label>
+              <label class="task-center-filter-field">
+                <span>平台</span>
+                <select id="taskCenterPlatformFilter">
+                  <option value="all">全部平台</option>
+                  <option value="xiaohongshu">小红书</option>
+                  <option value="douyin">抖音</option>
+                  <option value="weibo">微博</option>
+                  <option value="mixed">多平台</option>
+                </select>
+              </label>
+              <label class="task-center-filter-field">
+                <span>时间</span>
+                <select id="taskCenterTimeFilter">
+                  <option value="all">全部时间</option>
+                  <option value="today">今天</option>
+                  <option value="7d">近 7 天</option>
+                  <option value="30d">近 30 天</option>
+                </select>
+              </label>
+            </div>
+            <div class="task-center-list-meta">
+              <span id="syncHistoryStatsText" aria-live="polite">共 0 个任务</span>
+              <span class="task-center-legacy-note">清空仅影响旧同步记录</span>
             </div>
             <div
               id="syncHistoryEmpty"
               class="empty-state">
-              <p>暂无执行记录</p>
+              <p>暂无符合条件的任务<br />调整筛选条件后再看看</p>
             </div>
             <div
               id="syncHistoryList"
+              class="task-center-list"
               style="display: none;"></div>
           </div>
         </div>
@@ -2273,6 +2296,103 @@
             type="button">
             一键复制
           </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="modal-overlay task-center-detail-overlay"
+      id="taskCenterDetailModal"
+      aria-hidden="true">
+      <div
+        class="modal-card task-center-detail-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="taskCenterDetailTitle">
+        <div class="task-center-detail-header">
+          <div class="task-center-detail-title-wrap">
+            <span
+              class="task-center-status-badge"
+              id="taskCenterDetailStatus">任务详情</span>
+            <h3
+              class="modal-title"
+              id="taskCenterDetailTitle">任务详情</h3>
+            <p
+              class="modal-subtitle"
+              id="taskCenterDetailSubtitle"></p>
+          </div>
+          <button
+            class="action-icon-btn task-center-detail-close"
+            id="btnCloseTaskCenterDetail"
+            type="button"
+            aria-label="关闭任务详情">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        </div>
+        <div class="task-center-detail-scroll">
+          <div
+            class="task-center-detail-overview"
+            id="taskCenterDetailOverview"></div>
+          <section
+            class="task-center-detail-section"
+            id="taskCenterDetailProgressSection"
+            hidden>
+            <h4>执行进度</h4>
+            <div id="taskCenterDetailProgress"></div>
+          </section>
+          <section
+            class="task-center-detail-section"
+            id="taskCenterDetailTimelineSection"
+            hidden>
+            <h4>时间线</h4>
+            <ol
+              class="task-center-timeline"
+              id="taskCenterDetailTimeline"></ol>
+          </section>
+          <section
+            class="task-center-detail-section"
+            id="taskCenterDetailKeywordsSection"
+            hidden>
+            <h4>关键词明细</h4>
+            <div
+              class="task-center-keyword-list"
+              id="taskCenterDetailKeywords"></div>
+          </section>
+          <section
+            class="task-center-detail-section is-error"
+            id="taskCenterDetailErrorSection"
+            hidden>
+            <h4>错误信息</h4>
+            <pre
+              class="history-error-detail-box"
+              id="taskCenterDetailError"></pre>
+          </section>
+          <p
+            class="task-center-incomplete-note"
+            id="taskCenterDetailIncomplete"
+            hidden>
+            这是升级前的历史记录，部分执行过程无法还原。
+          </p>
+        </div>
+        <div
+          class="modal-footer task-center-detail-actions"
+          id="taskCenterDetailActions">
+          <button
+            class="btn btn-secondary"
+            id="btnTaskCenterDetailDone"
+            type="button">关闭</button>
         </div>
       </div>
     </div>

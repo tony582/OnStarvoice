@@ -13,6 +13,8 @@ import {
   getMonitor,
   getDataPool,
   getSyncHistory,
+  getTaskLedger,
+  getLegacyTaskCenterState,
   updateRuntime,
   updateAuth,
   updateCapture,
@@ -71,12 +73,23 @@ function bindStorageListeners() {
     }
 
     const runtimeChange = changes[STORAGE_KEY.RUNTIME];
-    if (!runtimeChange || !runtimeChange.newValue) {
-      return;
+    if (runtimeChange?.newValue) {
+      currentRuntime = runtimeChange.newValue;
+      notifyListeners('runtime', currentRuntime);
     }
 
-    currentRuntime = runtimeChange.newValue;
-    notifyListeners('runtime', currentRuntime);
+    const taskLedgerChange = changes[STORAGE_KEY.TASK_LEDGER];
+    if (taskLedgerChange) {
+      currentTaskLedger = normalizeTaskLedgerState(taskLedgerChange.newValue);
+      notifyListeners('taskLedger', currentTaskLedger);
+    }
+
+    if (
+      changes[STORAGE_KEY.UNATTENDED_KEYWORD_PLAN] ||
+      changes[STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST]
+    ) {
+      void refreshTaskCenterLegacyState();
+    }
   });
 
   storageListenerBound = true;
@@ -473,6 +486,54 @@ export async function refreshSyncHistory() {
   return currentSyncHistory;
 }
 
+// ==================== 任务中心状态 ====================
+
+let currentTaskLedger = null;
+let currentTaskCenterLegacy = null;
+
+function normalizeTaskLedgerState(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    ...source,
+    version: Number(source.version || source.schemaVersion) || 1,
+    runs: Array.isArray(source.runs) ? source.runs : [],
+    updatedAt: source.updatedAt || source.lastUpdatedAt || null,
+  };
+}
+
+export async function initTaskLedger() {
+  currentTaskLedger = normalizeTaskLedgerState(await getTaskLedger());
+  notifyListeners('taskLedger', currentTaskLedger);
+  return currentTaskLedger;
+}
+
+export function getCurrentTaskLedger() {
+  return currentTaskLedger;
+}
+
+export async function refreshTaskLedger() {
+  currentTaskLedger = normalizeTaskLedgerState(await getTaskLedger());
+  notifyListeners('taskLedger', currentTaskLedger);
+  return currentTaskLedger;
+}
+
+export async function initTaskCenterLegacyState() {
+  currentTaskCenterLegacy = await getLegacyTaskCenterState();
+  notifyListeners('taskCenterLegacy', currentTaskCenterLegacy);
+  return currentTaskCenterLegacy;
+}
+
+export function getCurrentTaskCenterLegacyState() {
+  return currentTaskCenterLegacy;
+}
+
+export async function refreshTaskCenterLegacyState() {
+  currentTaskCenterLegacy = await getLegacyTaskCenterState();
+  notifyListeners('taskCenterLegacy', currentTaskCenterLegacy);
+  return currentTaskCenterLegacy;
+}
+
 // ==================== 全量初始化 ====================
 
 /**
@@ -490,6 +551,8 @@ export async function initAllStates() {
     initMonitor(),
     initDataPool(),
     initSyncHistory(),
+    initTaskLedger(),
+    initTaskCenterLegacyState(),
   ]);
 }
 
@@ -508,5 +571,7 @@ export function getStateSnapshot() {
     monitor: currentMonitor,
     dataPool: currentDataPool,
     syncHistory: currentSyncHistory,
+    taskLedger: currentTaskLedger,
+    taskCenterLegacy: currentTaskCenterLegacy,
   };
 }
