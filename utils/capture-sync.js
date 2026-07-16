@@ -59,6 +59,18 @@ import {
 } from './diagnostics.js';
 import {buildDetailEnhanceStage} from './capture/stage-diagnostics.js';
 import {
+  clearInterruptedCommentObservation,
+  repairInterruptedCommentPayload,
+} from './capture-recovery.js';
+import {
+  createCaptureRequestId,
+  ensureCommentCaptureIdentity,
+} from './capture-request.js';
+import {
+  dedupeNormalizedCommentItems,
+  resolveCommentMergeLimit,
+} from './comment-dedupe.js';
+import {
   isDouyinOwnProfileUrl,
   pickDouyinAuthorName,
 } from './capture/douyin-author.js';
@@ -1639,7 +1651,7 @@ export async function captureNoteWithOptionalComments({
 }
 
 /**
- * 仅重试某条 single_note 记录的评论采集与合并
+ * 仅重试某条记录的评论采集与合并
  */
 export async function retryCommentsForRecord(
   recordId,
@@ -1651,14 +1663,21 @@ export async function retryCommentsForRecord(
 ) {
   try {
     const record = await getRecord(recordId);
-    if (!record || record.type !== SYNC_TYPE.SINGLE_NOTE) {
+    const isSingleNoteRecord = record?.type === SYNC_TYPE.SINGLE_NOTE;
+    const isHydratedDetailRecord = Boolean(
+      record &&
+        isDetailCaptureRecordType(record.type) &&
+        record.payload?.detailPayload &&
+        typeof record.payload.detailPayload === 'object',
+    );
+    if (!record || (!isSingleNoteRecord && !isHydratedDetailRecord)) {
       return {
         ok: false,
         phase: 'invalid_record',
         recordId,
         error: {
           code: 'RECORD_NOT_FOUND',
-          message: '记录不存在或不是单篇笔记记录',
+          message: '记录不存在或没有可继续采集评论的详情数据',
         },
       };
     }
@@ -1676,19 +1695,24 @@ export async function retryCommentsForRecord(
       };
     }
 
+    const activeTab = await getCurrentActiveTab();
+    const activeTabId = Number(activeTab?.id);
+    if (!Number.isFinite(activeTabId) || activeTabId <= 0) {
+      throw new Error('未找到当前活动标签页');
+    }
+    const commentCaptureIdentity = await ensureCommentCaptureIdentity({
+      runnerTabId: activeTabId,
+    });
     if (onProgress) {
       onProgress({
         phase: 'comments_opening',
         message: '正在打开对应笔记详情页...',
         recordId,
         noteUrl,
+        captureRequestId: commentCaptureIdentity.captureRequestId,
+        runnerTabId: commentCaptureIdentity.runnerTabId,
+        captureAction: 'captureComments',
       });
-    }
-
-    const activeTab = await getCurrentActiveTab();
-    const activeTabId = Number(activeTab?.id);
-    if (!Number.isFinite(activeTabId) || activeTabId <= 0) {
-      throw new Error('未找到当前活动标签页');
     }
 
     const settings = await getCaptureSettings();
@@ -1701,13 +1725,26 @@ export async function retryCommentsForRecord(
       DETAIL_CAPTURE_AFTER_NAV_WAIT_MS,
     );
 
-    await openUrlInTab(activeTabId, noteUrl, {
+    await openUrlInTab(commentCaptureIdentity.runnerTabId, noteUrl, {
       timeoutMs: navTimeoutMs,
       active: true,
     });
     await waitMs(afterNavWaitMs);
 
-    return await captureCommentsForSingleNoteRecord(recordId, {
+    if (isSingleNoteRecord) {
+      return await captureCommentsForSingleNoteRecord(recordId, {
+        commentsMaxDetectedItems:
+          commentsMaxDetectedItems ?? commentsMaxItems,
+        captureRequestId: commentCaptureIdentity.captureRequestId,
+        runnerTabId: commentCaptureIdentity.runnerTabId,
+        onProgress,
+      });
+    }
+
+    return await captureCommentsForHydratedDetailRecord(recordId, {
+      tabId: commentCaptureIdentity.runnerTabId,
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      settings,
       commentsMaxDetectedItems:
         commentsMaxDetectedItems ?? commentsMaxItems,
       onProgress,
@@ -2452,6 +2489,9 @@ export async function batchCaptureDetailsForRecords(
 
         if (includeComments && !stopAfterCurrent) {
           activeStage = 'comments_capture';
+          const commentCaptureIdentity = await ensureCommentCaptureIdentity({
+            runnerTabId: runnerContext.runnerTabId,
+          });
           if (onProgress) {
             onProgress({
               phase: 'detail_comments_capturing',
@@ -2464,12 +2504,19 @@ export async function batchCaptureDetailsForRecords(
               filteredCount,
               includeComments: true,
               commentsMaxDetectedItems: normalizedCommentsMaxDetectedItems,
-              runnerTabId: runnerContext.runnerTabId,
+              captureRequestId: commentCaptureIdentity.captureRequestId,
+              runnerTabId: commentCaptureIdentity.runnerTabId,
+              captureAction: 'captureComments',
             });
           }
 
           const commentsResult = await captureCommentsForCurrentNote({
-            tabId: runnerContext.runnerTabId,
+            tabId: commentCaptureIdentity.runnerTabId,
+            captureRequestId: commentCaptureIdentity.captureRequestId,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            existingItems: record.payload?.detailPayload?.commentsCleanedItems,
             maxDetectedItems: normalizedCommentsMaxDetectedItems,
             maxDurationMs: settings.sharedMaxDurationMs,
             waitMinMs: settings.sharedWaitMinMs,
@@ -5448,6 +5495,8 @@ async function captureCommentsForSingleNoteRecord(
     enableCommentLeadsFilter = null,
     commentsMaxDetectedItems = null,
     commentsMaxItems = null,
+    captureRequestId = '',
+    runnerTabId = null,
     onProgress = null,
   } = {},
 ) {
@@ -5464,6 +5513,11 @@ async function captureCommentsForSingleNoteRecord(
     };
   }
 
+  const commentCaptureIdentity = await ensureCommentCaptureIdentity({
+    captureRequestId,
+    runnerTabId,
+    resolveRunnerTab: () => resolveCaptureTargetTab({mode: 'comments'}),
+  });
   const settings = await getCaptureSettings();
   const commentLeadsConfig = buildCommentLeadsConfigFromSettings({
     ...settings,
@@ -5479,7 +5533,7 @@ async function captureCommentsForSingleNoteRecord(
   await updateRecord(recordId, {
     status: RECORD_STATUS.DRAFT,
     payload: applyCommentStatusToPayload(
-      record.payload,
+      clearInterruptedCommentObservation(record.payload),
       createCommentStatusPatch({
         status: COMMENT_CAPTURE_STATUS.CAPTURING,
         startedAt,
@@ -5496,14 +5550,19 @@ async function captureCommentsForSingleNoteRecord(
       message: '评论采集中（0条）',
       recordId,
       collectedCount: 0,
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      captureAction: 'captureComments',
     });
   }
 
   let commentsResult = null;
   try {
-    commentsResult = await captureInActiveTab({
+    commentsResult = await captureInTab(commentCaptureIdentity.runnerTabId, {
       mode: 'comments',
       captureParams: {
+        captureRequestId: commentCaptureIdentity.captureRequestId,
+        recordId,
         onlyLevel1: false,
         maxDetectedItems,
         maxDurationMs: settings.sharedMaxDurationMs,
@@ -5516,7 +5575,7 @@ async function captureCommentsForSingleNoteRecord(
     commentsResult = {
       ok: false,
       error: {
-        code: 'CAPTURE_FAILED',
+        code: String(error?.code || 'CAPTURE_FAILED'),
         message: error.message || '评论采集失败',
       },
     };
@@ -5524,7 +5583,9 @@ async function captureCommentsForSingleNoteRecord(
 
   if (!commentsResult.ok) {
     const latestRecord = await getRecord(recordId);
-    const basePayload = latestRecord?.payload || record.payload;
+    const basePayload = clearInterruptedCommentObservation(
+      latestRecord?.payload || record.payload,
+    );
     const failedPayload = applyCommentStatusToPayload(
       basePayload,
       createCommentStatusPatch({
@@ -5545,6 +5606,10 @@ async function captureCommentsForSingleNoteRecord(
         phase: 'comments_failed',
         message: '评论采集失败，可点击重试',
         recordId,
+        captureRequestId: commentCaptureIdentity.captureRequestId,
+        runnerTabId: commentCaptureIdentity.runnerTabId,
+        captureAction: 'captureComments',
+        error: commentsResult.error || null,
       });
     }
 
@@ -5552,28 +5617,58 @@ async function captureCommentsForSingleNoteRecord(
       ok: false,
       phase: 'comments_failed',
       recordId,
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
       error: commentsResult.error || { code: 'CAPTURE_FAILED', message: '评论采集失败' },
     };
   }
 
   const rawItems = Array.isArray(commentsResult.data?.items) ? commentsResult.data.items : [];
-  const cleanedItems = cleanCommentsItems(rawItems);
+  const existingItems = Array.isArray(record.payload?.commentsCleanedItems)
+    ? record.payload.commentsCleanedItems
+    : [];
+  const effectiveMaxDetectedItems = resolveCommentMergeLimit(
+    maxDetectedItems,
+    existingItems.length,
+  );
+  const cleanedItems = cleanCommentsItems([
+    ...existingItems,
+    ...rawItems,
+  ]).slice(0, effectiveMaxDetectedItems);
   const isPartial =
     commentsResult.data?.captureStatus === COMMENT_CAPTURE_STATUS.PARTIAL ||
     commentsResult.meta?.captureStatus === COMMENT_CAPTURE_STATUS.PARTIAL;
+  const stoppedByUser = Boolean(
+    commentsResult.data?.stoppedByUser || commentsResult.meta?.stoppedByUser,
+  );
+  const stoppedByStall = Boolean(
+    commentsResult.data?.stoppedByStall || commentsResult.meta?.stoppedByStall,
+  );
+  const stopReason = String(
+    commentsResult.data?.stopReason ||
+      commentsResult.meta?.scrollInfo?.stopReason ||
+      '',
+  );
+  const stoppedByNetwork = stopReason === 'network_timeout';
   const finalStatus = isPartial ? COMMENT_CAPTURE_STATUS.PARTIAL : COMMENT_CAPTURE_STATUS.DONE;
   const finishedAt = Date.now();
   const mergedText = buildCommentsMergedText(cleanedItems);
   const latestRecord = await getRecord(recordId);
-  const basePayload = latestRecord?.payload || record.payload;
+  const basePayload = clearInterruptedCommentObservation(
+    latestRecord?.payload || record.payload,
+  );
   let mergedPayload = applyCommentStatusToPayload(
     basePayload,
     createCommentStatusPatch({
       status: finalStatus,
       startedAt,
       finishedAt,
-      stoppedByUser: isPartial,
-      error: '',
+      stoppedByUser,
+      error: stoppedByStall
+        ? stoppedByNetwork
+          ? '网络中断超过 2 分钟，已保留当前结果；联网后可继续采集'
+          : '检测到页面卡顿，已保留当前结果；可继续采集'
+        : '',
       cleanedItems,
       mergedText,
     }),
@@ -5593,11 +5688,22 @@ async function captureCommentsForSingleNoteRecord(
   if (onProgress) {
     onProgress({
       phase: isPartial ? 'comments_partial' : 'comments_done',
-      message: isPartial
-        ? `评论已手动停止并合并（${cleanedItems.length}条）`
+      message: stoppedByStall
+        ? stoppedByNetwork
+          ? `网络中断超过 2 分钟，已保留 ${cleanedItems.length} 条；联网后可继续采集`
+          : `评论页面卡顿，已保留 ${cleanedItems.length} 条；可继续采集`
+        : isPartial
+          ? `评论已手动停止并合并（${cleanedItems.length}条）`
         : `评论已合并（${cleanedItems.length}条）`,
       recordId,
       collectedCount: cleanedItems.length,
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      captureAction: 'captureComments',
+      stoppedByUser,
+      stoppedByStall,
+      stoppedByNetwork,
+      stopReason,
     });
   }
 
@@ -5605,8 +5711,14 @@ async function captureCommentsForSingleNoteRecord(
     ok: true,
     phase: isPartial ? 'comments_partial' : 'comments_done',
     recordId,
+    captureRequestId: commentCaptureIdentity.captureRequestId,
+    runnerTabId: commentCaptureIdentity.runnerTabId,
     commentsCount: cleanedItems.length,
     partial: isPartial,
+    stoppedByUser,
+    stoppedByStall,
+    stoppedByNetwork,
+    stopReason,
     error: null,
   };
 }
@@ -6445,8 +6557,7 @@ function createCommentStatusPatch({
 }
 
 function cleanCommentsItems(items) {
-  const dedupe = new Set();
-  const cleaned = [];
+  const normalized = [];
 
   items.forEach((item) => {
     if (!item || typeof item !== 'object') return;
@@ -6464,13 +6575,8 @@ function cleanCommentsItems(items) {
     const ipLocation = resolveCommentIpLocation(item);
     const publishTime = String(item.publishTime || item.publishedAt || item.time || item.date || '').trim();
     const preferredId = String(item.commentId || item.id || '').trim();
-    const key =
-      preferredId ||
-      `${userId || 'anonymous'}|${normalizedContent.toLowerCase()}|${likes}`;
-
-    if (!key || dedupe.has(key)) return;
-    dedupe.add(key);
-    cleaned.push({
+    normalized.push({
+      ...(preferredId ? { commentId: preferredId } : {}),
       content: normalizedContent,
       likes,
       ...(userName ? { userName } : {}),
@@ -6481,7 +6587,7 @@ function cleanCommentsItems(items) {
     });
   });
 
-  return cleaned;
+  return dedupeNormalizedCommentItems(normalized);
 }
 
 function buildCommentsMergedText(items) {
@@ -7681,6 +7787,51 @@ export async function repairInterruptedDetailCaptureRecords() {
   };
 }
 
+export async function repairInterruptedCommentCaptureRecords() {
+  const dataPool = await getDataPool();
+  const records = Array.isArray(dataPool?.records) ? dataPool.records : [];
+  const repairedRecordIds = [];
+
+  for (const record of records) {
+    if (!record || !record.id) continue;
+    const payload =
+      record.payload && typeof record.payload === 'object' ? record.payload : {};
+    let nextPayload = payload;
+    let changed = false;
+
+    if (record.type === SYNC_TYPE.SINGLE_NOTE) {
+      const repaired = repairInterruptedCommentPayload(payload);
+      nextPayload = repaired.payload;
+      changed = repaired.changed;
+    } else if (
+      isDetailCaptureRecordType(record.type) &&
+      payload.detailPayload &&
+      typeof payload.detailPayload === 'object'
+    ) {
+      const repaired = repairInterruptedCommentPayload(payload.detailPayload);
+      if (repaired.changed) {
+        nextPayload = {
+          ...payload,
+          detailPayload: repaired.payload,
+        };
+        changed = true;
+      }
+    }
+
+    if (!changed) continue;
+    await updateRecord(record.id, {
+      status: RECORD_STATUS.DRAFT,
+      payload: nextPayload,
+    });
+    repairedRecordIds.push(record.id);
+  }
+
+  return {
+    count: repairedRecordIds.length,
+    recordIds: repairedRecordIds,
+  };
+}
+
 function resolveRecordNoteUrl(record) {
   if (!record || !record.payload || typeof record.payload !== 'object') {
     return '';
@@ -8073,10 +8224,13 @@ function getReliableTimerWorker() {
     );
     reliableTimerWorker.onmessage = (event) => {
       const id = event?.data?.id;
-      const resolve = reliableTimerPending.get(id);
-      if (resolve) {
+      const pending = reliableTimerPending.get(id);
+      if (pending) {
         reliableTimerPending.delete(id);
-        resolve();
+        if (pending.fallbackTimer) {
+          clearTimeout(pending.fallbackTimer);
+        }
+        pending.resolve();
       }
     };
     reliableTimerWorker.onerror = () => {
@@ -8089,7 +8243,12 @@ function getReliableTimerWorker() {
         // ignore
       }
       reliableTimerWorker = false;
-      pending.forEach((resolve) => setTimeout(resolve, 50));
+      pending.forEach((item) => {
+        if (item.fallbackTimer) {
+          clearTimeout(item.fallbackTimer);
+        }
+        setTimeout(item.resolve, 50);
+      });
     };
   } catch {
     reliableTimerWorker = false;
@@ -8108,12 +8267,22 @@ function waitMs(ms) {
   return new Promise((resolve) => {
     reliableTimerSeq += 1;
     const id = reliableTimerSeq;
-    reliableTimerPending.set(id, resolve);
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      reliableTimerPending.delete(id);
+      resolve();
+    };
+    // Worker 若静默丢失且没有触发 onerror，墙钟兜底仍会在页面恢复后放行。
+    const fallbackTimer = setTimeout(finish, delay + 2000);
+    reliableTimerPending.set(id, {resolve: finish, fallbackTimer});
     try {
       worker.postMessage({ id, ms: delay });
     } catch {
       reliableTimerPending.delete(id);
-      setTimeout(resolve, delay);
+      clearTimeout(fallbackTimer);
+      setTimeout(finish, delay);
     }
   });
 }
@@ -8188,36 +8357,78 @@ async function activateTabForReliableTimer(tabId) {
 
 async function captureCommentsForCurrentNote({
   tabId,
+  captureRequestId = '',
+  recordId = '',
+  current = 0,
+  total = 0,
+  existingItems = [],
   maxDetectedItems,
   maxDurationMs,
   waitMinMs,
   waitMaxMs,
   stallTimeoutMs,
 }) {
-  const result = await captureInTab(tabId, {
-    mode: 'comments',
-    captureParams: {
-      onlyLevel1: false,
-      maxDetectedItems,
-      maxDurationMs,
-      waitMinMs,
-      waitMaxMs,
-      stallTimeoutMs,
-    },
+  const savedItems = Array.isArray(existingItems) ? existingItems : [];
+  const commentCaptureIdentity = await ensureCommentCaptureIdentity({
+    captureRequestId,
+    runnerTabId: tabId,
   });
+  let result = null;
+  try {
+    result = await captureInTab(commentCaptureIdentity.runnerTabId, {
+      mode: 'comments',
+      captureParams: {
+        captureRequestId: commentCaptureIdentity.captureRequestId,
+        recordId,
+        current,
+        total,
+        onlyLevel1: false,
+        maxDetectedItems,
+        maxDurationMs,
+        waitMinMs,
+        waitMaxMs,
+        stallTimeoutMs,
+      },
+    });
+  } catch (error) {
+    return {
+      status: COMMENT_CAPTURE_STATUS.FAILED,
+      stoppedByUser: false,
+      stoppedByStall: false,
+      stoppedByNetwork: false,
+      stopReason: '',
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      cleanedItems: savedItems,
+      mergedText: buildCommentsMergedText(savedItems),
+      error: error?.message || '评论采集失败',
+    };
+  }
 
   if (!result?.ok) {
     return {
       status: COMMENT_CAPTURE_STATUS.FAILED,
       stoppedByUser: false,
-      cleanedItems: [],
-      mergedText: '',
+      stoppedByStall: false,
+      stoppedByNetwork: false,
+      stopReason: '',
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      cleanedItems: savedItems,
+      mergedText: buildCommentsMergedText(savedItems),
       error: result?.error?.message || '评论采集失败',
     };
   }
 
   const rawItems = Array.isArray(result.data?.items) ? result.data.items : [];
-  const cleanedItems = cleanCommentsItems(rawItems);
+  const effectiveMaxDetectedItems = resolveCommentMergeLimit(
+    maxDetectedItems,
+    savedItems.length,
+  );
+  const cleanedItems = cleanCommentsItems([
+    ...savedItems,
+    ...rawItems,
+  ]).slice(0, effectiveMaxDetectedItems);
   const captureStatus = String(
     result.data?.captureStatus || result.meta?.captureStatus || '',
   )
@@ -8227,47 +8438,235 @@ async function captureCommentsForCurrentNote({
   const stoppedByUser = Boolean(
     result.data?.stoppedByUser || result.meta?.stoppedByUser,
   );
+  const stoppedByStall = Boolean(
+    result.data?.stoppedByStall || result.meta?.stoppedByStall,
+  );
+  const stopReason = String(
+    result.data?.stopReason || result.meta?.scrollInfo?.stopReason || '',
+  );
+  const stoppedByNetwork = stopReason === 'network_timeout';
 
   return {
     status: partial ? COMMENT_CAPTURE_STATUS.PARTIAL : COMMENT_CAPTURE_STATUS.DONE,
     stoppedByUser,
+    stoppedByStall,
+    stoppedByNetwork,
+    stopReason,
+    captureRequestId: commentCaptureIdentity.captureRequestId,
+    runnerTabId: commentCaptureIdentity.runnerTabId,
     cleanedItems,
     mergedText: buildCommentsMergedText(cleanedItems),
-    error: '',
+    error: stoppedByStall
+      ? stoppedByNetwork
+        ? '网络中断超过 2 分钟，已保留当前结果；联网后可继续采集'
+        : '检测到页面卡顿，已保留当前结果；可继续采集'
+      : '',
   };
 }
 
-function applyCommentResultToSingleNotePayload(payload, result) {
+async function captureCommentsForHydratedDetailRecord(
+  recordId,
+  {
+    tabId,
+    captureRequestId = '',
+    settings = {},
+    commentsMaxDetectedItems = null,
+    onProgress = null,
+  } = {},
+) {
+  const record = await getRecord(recordId);
+  const detailPayload = record?.payload?.detailPayload;
+  if (
+    !record ||
+    !isDetailCaptureRecordType(record.type) ||
+    !detailPayload ||
+    typeof detailPayload !== 'object'
+  ) {
+    return {
+      ok: false,
+      phase: 'invalid_record',
+      recordId,
+      error: {
+        code: 'RECORD_NOT_HYDRATED',
+        message: '记录缺少详情数据，无法仅继续评论采集',
+      },
+    };
+  }
+
+  const commentCaptureIdentity = await ensureCommentCaptureIdentity({
+    captureRequestId,
+    runnerTabId: tabId,
+    resolveRunnerTab: () => resolveCaptureTargetTab({mode: 'comments'}),
+  });
+  const maxDetectedItems = normalizeCommentsMaxDetectedItems(
+    settings.detailCommentsMaxDetectedItems ?? commentsMaxDetectedItems,
+    settings.commentsMaxDetectedItems,
+  );
+  const startedAt = Date.now();
+  const latestBeforeStart = (await getRecord(recordId)) || record;
+  const latestDetailPayload =
+    latestBeforeStart.payload?.detailPayload &&
+    typeof latestBeforeStart.payload.detailPayload === 'object'
+      ? latestBeforeStart.payload.detailPayload
+      : detailPayload;
+  const capturingDetailPayload = applyCommentStatusToPayload(
+    clearInterruptedCommentObservation(latestDetailPayload),
+    createCommentStatusPatch({
+      status: COMMENT_CAPTURE_STATUS.CAPTURING,
+      startedAt,
+      finishedAt: 0,
+      stoppedByUser: false,
+      error: '',
+    }),
+  );
+  await updateRecord(recordId, {
+    status: RECORD_STATUS.DRAFT,
+    payload: {
+      ...latestBeforeStart.payload,
+      detailPayload: capturingDetailPayload,
+    },
+  });
+  if (onProgress) {
+    onProgress({
+      phase: 'comments_capturing',
+      message: `正在继续评论采集（已有 ${Number(capturingDetailPayload.commentsTotalCaptured) || 0} 条）`,
+      recordId,
+      collectedCount: Number(capturingDetailPayload.commentsTotalCaptured) || 0,
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      captureAction: 'captureComments',
+    });
+  }
+
+  const result = await captureCommentsForCurrentNote({
+    tabId: commentCaptureIdentity.runnerTabId,
+    captureRequestId: commentCaptureIdentity.captureRequestId,
+    recordId,
+    current: 1,
+    total: 1,
+    existingItems: capturingDetailPayload.commentsCleanedItems,
+    maxDetectedItems,
+    maxDurationMs: settings.sharedMaxDurationMs,
+    waitMinMs: settings.sharedWaitMinMs,
+    waitMaxMs: settings.sharedWaitMaxMs,
+    stallTimeoutMs: settings.sharedStallTimeoutMs,
+  });
+  let nextDetailPayload = applyCommentResultToSingleNotePayload(
+    capturingDetailPayload,
+    result,
+  );
+  const commentLeadsConfig = buildCommentLeadsConfigFromSettings({
+    ...settings,
+    enableCommentLeadsFilter:
+      settings.enableCommentLeadsFilterOnDetailCapture ??
+      settings.enableCommentLeadsFilter,
+  });
+  nextDetailPayload = applyCommentLeadsToPayload({
+    syncType: SYNC_TYPE.SINGLE_NOTE,
+    payload: nextDetailPayload,
+    commentLeadsConfig,
+    computedAt: Date.now(),
+  }).payload;
+
+  const latestRecord = (await getRecord(recordId)) || record;
+  await updateRecord(recordId, {
+    status: RECORD_STATUS.DRAFT,
+    payload: {
+      ...latestRecord.payload,
+      detailPayload: nextDetailPayload,
+    },
+  });
+
+  const failed = result.status === COMMENT_CAPTURE_STATUS.FAILED;
+  const partial = result.status === COMMENT_CAPTURE_STATUS.PARTIAL;
+  const phase = failed
+    ? 'comments_failed'
+    : partial
+      ? 'comments_partial'
+      : 'comments_done';
+  if (onProgress) {
+    onProgress({
+      phase,
+      message: failed
+        ? '评论采集失败，可在记录卡片继续'
+        : partial
+          ? result.stoppedByStall
+            ? result.stoppedByNetwork
+              ? `网络中断超过 2 分钟，已保留 ${result.cleanedItems.length} 条；联网后可继续采集`
+              : `评论页面卡顿，已保留 ${result.cleanedItems.length} 条；可继续采集`
+            : `评论已手动停止并合并（${result.cleanedItems.length}条）`
+          : `评论已合并（${result.cleanedItems.length}条）`,
+      recordId,
+      collectedCount: result.cleanedItems.length,
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      captureAction: 'captureComments',
+      stoppedByUser: Boolean(result.stoppedByUser),
+      stoppedByStall: Boolean(result.stoppedByStall),
+      stoppedByNetwork: Boolean(result.stoppedByNetwork),
+      stopReason: String(result.stopReason || ''),
+      error: failed
+        ? {code: 'CAPTURE_FAILED', message: result.error || '评论采集失败'}
+        : null,
+    });
+  }
+
+  return {
+    ok: !failed,
+    phase,
+    recordId,
+    captureRequestId: commentCaptureIdentity.captureRequestId,
+    runnerTabId: commentCaptureIdentity.runnerTabId,
+    commentsCount: result.cleanedItems.length,
+    partial,
+    stoppedByUser: Boolean(result.stoppedByUser),
+    stoppedByStall: Boolean(result.stoppedByStall),
+    stoppedByNetwork: Boolean(result.stoppedByNetwork),
+    stopReason: String(result.stopReason || ''),
+    error: failed
+      ? {code: 'CAPTURE_FAILED', message: result.error || '评论采集失败'}
+      : null,
+  };
+}
+
+export function applyCommentResultToSingleNotePayload(payload, result) {
   const now = Date.now();
+  const payloadWithoutPreviousObservation =
+    clearInterruptedCommentObservation(payload);
 
   if (result.status === COMMENT_CAPTURE_STATUS.FAILED) {
     return applyCommentStatusToPayload(
-      payload,
+      payloadWithoutPreviousObservation,
       createCommentStatusPatch({
         status: COMMENT_CAPTURE_STATUS.FAILED,
         startedAt: now,
         finishedAt: now,
         stoppedByUser: false,
         error: result.error || '评论采集失败',
+        cleanedItems: Array.isArray(result.cleanedItems)
+          ? result.cleanedItems
+          : null,
+        mergedText:
+          typeof result.mergedText === 'string' ? result.mergedText : null,
       }),
     );
   }
 
   return applyCommentStatusToPayload(
-    payload,
+    payloadWithoutPreviousObservation,
     createCommentStatusPatch({
       status: result.status,
       startedAt: now,
       finishedAt: now,
       stoppedByUser: Boolean(result.stoppedByUser),
-      error: '',
+      error: result.stoppedByStall ? result.error || '评论采集中断' : '',
       cleanedItems: Array.isArray(result.cleanedItems) ? result.cleanedItems : [],
       mergedText: String(result.mergedText || ''),
     }),
   );
 }
 
-function applyCommentLeadsToPayload({
+export function applyCommentLeadsToPayload({
   syncType,
   payload,
   commentLeadsConfig,
@@ -8561,6 +8960,7 @@ async function runBatchSingleNoteEnhancements(
     detailNavTimeoutMs = null,
     profileAfterNavWaitMs = null,
     preferWorksTabForBloggerMetrics = null,
+    runnerTabId = null,
     shouldStop = null,
     onProgress = null,
   } = {},
@@ -8579,6 +8979,7 @@ async function runBatchSingleNoteEnhancements(
       return;
     }
     onProgress({
+      ...progress,
       current,
       total,
       url,
@@ -8639,6 +9040,7 @@ async function runBatchSingleNoteEnhancements(
       commentsResult = await captureCommentsForSingleNoteRecord(recordId, {
         commentsMaxDetectedItems,
         enableCommentLeadsFilter,
+        runnerTabId,
         onProgress: emitProgress,
       });
       if (!commentsResult?.ok) {
@@ -8889,6 +9291,7 @@ export async function batchCaptureByUrls({
                   url,
                   current: i + 1,
                   total: urls.length,
+                  runnerTabId,
                   shouldStop,
                   onProgress,
                   ...singleNoteEnhancementOptions,
@@ -11047,7 +11450,20 @@ async function captureInTab(
   }
 
   const taskContext = getActiveTaskContext();
-  const payload = appendTaskContext(buildContentRequest(mode, captureParams), taskContext);
+  const captureRequestId =
+    String(captureParams?.captureRequestId || '').trim() ||
+    createCaptureRequestId('capture');
+  const payload = appendTaskContext(
+    {
+      ...buildContentRequest(mode, captureParams),
+      captureRequestId,
+      recordId: String(captureParams?.recordId || ''),
+      current: Number(captureParams?.current) || 0,
+      total: Number(captureParams?.total) || 0,
+      runnerTabId: normalizedTabId,
+    },
+    taskContext,
+  );
   const response = await chrome.runtime.sendMessage({
     type: MESSAGE_TYPE.RELAY_TO_CONTENT,
     tabId: normalizedTabId,
@@ -11059,6 +11475,7 @@ async function captureInTab(
       response?.error?.message ||
       '无法连接到页面采集脚本，请刷新当前页面后重试';
     const error = new Error(message);
+    error.code = String(response?.error?.code || 'RELAY_TO_CONTENT_FAILED');
     void recordDiagnosticError({
       taskContext,
       source: 'capture-sync',

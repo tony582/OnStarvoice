@@ -112,11 +112,27 @@ export async function captureComments({
     const scrollResult = await autoScrollLoad({
       onProgress: (progress) => {
         if (onProgress) {
+          const isConnectivityProgress =
+            progress?.phase === "network_paused" ||
+            progress?.phase === "network_resumed" ||
+            progress?.phase === "network_timeout" ||
+            progress?.phase === "system_resumed";
+          if (
+            progress?.phase === "network_resumed" ||
+            progress?.phase === "system_resumed"
+          ) {
+            lastGrowthAt = Date.now();
+            stallRounds = 0;
+          }
           onProgress({
             ...progress,
-            phase: "comments_collecting",
+            phase: isConnectivityProgress
+              ? progress.phase
+              : "comments_collecting",
             collectedCount: commentsMap.size,
-            message: `评论采集中（${commentsMap.size}条）`,
+            message: isConnectivityProgress
+              ? progress.message
+              : `评论采集中（${commentsMap.size}条）`,
           });
         }
       },
@@ -133,6 +149,7 @@ export async function captureComments({
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
+      resetCancelOnStart: false,
       stopWhen: ({currentContentCount}) => {
         if (currentContentCount > lastObservedCount) {
           lastObservedCount = currentContentCount;
@@ -185,7 +202,8 @@ export async function captureComments({
     );
 
     const stoppedByUser = isCanceled();
-    const captureStatus = stoppedByUser ? "partial" : "done";
+    const stoppedByStall = Boolean(scrollResult?.stalled);
+    const captureStatus = stoppedByUser || stoppedByStall ? "partial" : "done";
     const items = Array.from(commentsMap.values()).slice(
       0,
       normalizedMaxDetectedItems,
@@ -193,7 +211,7 @@ export async function captureComments({
     const stageTrace = [
       buildCommentLoadStage({
         label: "小红书评论加载",
-        status: stoppedByUser ? "partial" : "completed",
+        status: captureStatus === "partial" ? "partial" : "completed",
         commentsMaxDetectedItems: normalizedMaxDetectedItems,
         collectedCount: items.length,
         uniqueCount: commentsMap.size,
@@ -224,6 +242,7 @@ export async function captureComments({
         captureTimestamp: Date.now(),
         captureStatus,
         stoppedByUser,
+        stoppedByStall,
         stopReason: stoppedByUser ? "canceled" : scrollResult.stopReason || "",
       },
       meta: {
@@ -232,6 +251,7 @@ export async function captureComments({
         captureFinishedAt: new Date().toISOString(),
         captureStatus,
         stoppedByUser,
+        stoppedByStall,
         scrollInfo: {
           scrollCount: scrollResult.scrollCount,
           maxScrollTimes: scrollResult.maxScrollTimes,

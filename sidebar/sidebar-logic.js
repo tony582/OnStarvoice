@@ -33,6 +33,7 @@ import {
   retryCommentsForRecord,
   batchCaptureDetailsForRecords,
   repairInterruptedDetailCaptureRecords,
+  repairInterruptedCommentCaptureRecords,
   resolveSyncInputForRecord,
   syncRecordBatch,
   checkBeforeSync,
@@ -82,6 +83,7 @@ import {
   CREDENTIAL_CLAIM_PAGE_URL,
 } from "../utils/constants.js";
 import {setCancelFlag, wait} from "../utils/scroll.js";
+import {repairInterruptedCommentPayload} from "../utils/capture-recovery.js";
 import {
   buildDiagnosticsText,
   recordDiagnosticAction,
@@ -102,6 +104,10 @@ import {
 import {extractNoteId} from "../utils/helpers.js";
 import {detectPlatformFromUrl} from "../utils/platform/page-routing.js";
 import {
+  buildCaptureRecoveryAnnouncementKey,
+  resolveCaptureRecoveryView,
+} from "../utils/capture-recovery-ui.js";
+import {
   getPlatformCapabilities,
   getPlatformCopy,
   getRecordTypesForTab,
@@ -109,6 +115,12 @@ import {
 } from "./platform-registry.js";
 
 let activeCommentsCaptureRecordId = "";
+let activeCommentsCaptureTabId = null;
+let activeCommentsCaptureRequestId = "";
+let activeRecoveryProgress = null;
+let activeRecoveryRunnerTabId = null;
+let captureRecoveryFreshnessTimer = null;
+const suppressedCaptureRecoveryKeys = new Set();
 const commentCaptureTerminalStatusByRecordId = new Map();
 let detailBatchCaptureInFlight = false;
 let detailBatchCancelRequested = false;
@@ -1614,7 +1626,14 @@ function hasVisibleLocalCaptureProgress() {
     monitorRunInFlight ||
     keywordBenchmarkInFlight ||
     keywordOpportunityInFlight ||
-    keywordExpandInFlight
+    keywordExpandInFlight ||
+    [
+      "network_paused",
+      "network_resumed",
+      "system_resumed",
+      "capture_recovering",
+      "capture_canceling",
+    ].includes(String(activeRecoveryProgress?.phase || ""))
   );
 }
 
@@ -1656,6 +1675,7 @@ function syncKeywordPlanProgressPanel(plan = keywordPlanState) {
   if (!progressContainer || !progressText) {
     return;
   }
+  resetCaptureRecoveryUI({hidePanel: false, clearState: true});
   progressContainer.dataset.progressSource = "keyword-plan";
   progressContainer.style.display = "block";
   renderKeywordPlanProgressText(progressText, plan);
@@ -2019,16 +2039,40 @@ export async function initSidebar() {
   await initAllStates();
 
   let repairedDetailCapture = {count: 0, recordIds: []};
+  let repairedCommentCapture = {count: 0, recordIds: []};
+  let canRepairInterruptedCapture = false;
   try {
-    repairedDetailCapture = await repairInterruptedDetailCaptureRecords();
-    if (repairedDetailCapture.count > 0) {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:get-capture-lock",
+    });
+    // 另一个仍存活的侧栏/标签页持有任务锁时，不能把它正在跑的记录误判中断。
+    canRepairInterruptedCapture = Boolean(response?.ok && !response?.data);
+  } catch (error) {
+    console.warn("[Sidebar] inspect capture lock before repair failed:", error);
+  }
+  if (canRepairInterruptedCapture) {
+    try {
+      repairedDetailCapture = await repairInterruptedDetailCaptureRecords();
+    } catch (error) {
+      console.warn(
+        "[Sidebar] repair interrupted detail capture records failed:",
+        error,
+      );
+    }
+    try {
+      repairedCommentCapture = await repairInterruptedCommentCaptureRecords();
+    } catch (error) {
+      console.warn(
+        "[Sidebar] repair interrupted comment capture records failed:",
+        error,
+      );
+    }
+    if (
+      repairedDetailCapture.count > 0 ||
+      repairedCommentCapture.count > 0
+    ) {
       await refreshDataPool();
     }
-  } catch (error) {
-    console.warn(
-      "[Sidebar] repairInterruptedDetailCaptureRecords failed:",
-      error,
-    );
   }
 
   // 订阅状态变化
@@ -2052,6 +2096,8 @@ export async function initSidebar() {
 
   // 更新 UI
   updateUI();
+  syncRuntimeCaptureProgress(getCurrentRuntime());
+  await syncRuntimeCommentProgress(getCurrentRuntime());
   syncSearchFilterControlsForPlatform(getViewPlatform(getCurrentRuntime()));
   await loadKeywordPlanUI();
   startKeywordPlanReconcileTimer();
@@ -2060,6 +2106,19 @@ export async function initSidebar() {
       `${repairedDetailCapture.count} 条采集增强任务因页面或插件中断已标记为失败，可点击 ↻ 重试`,
       "warning",
     );
+  }
+  if (repairedCommentCapture.count > 0) {
+    showMessage(
+      `${repairedCommentCapture.count} 条评论采集因断网、休眠或页面中断已停止等待；可在提示或记录卡片中继续，已落盘数据不会丢失`,
+      "warning",
+    );
+    renderCaptureRecoveryUI({
+      phase: "interrupted_repaired",
+      recordId: String(repairedCommentCapture.recordIds?.[0] || ""),
+      interruptedCount: repairedCommentCapture.count,
+      captureAction: "captureComments",
+      updatedAt: Date.now(),
+    });
   }
   checkExtensionUpdate({trigger: "auto"}).catch((error) => {
     console.warn("[Sidebar] Initial update check failed:", error);
@@ -3821,6 +3880,12 @@ function setupUIEventListeners() {
   if (btnCancel) {
     btnCancel.addEventListener("click", handleCancel);
   }
+  document
+    .getElementById("btnRetryRecovery")
+    ?.addEventListener("click", handleRetryRecovery);
+  document
+    .getElementById("btnDismissRecovery")
+    ?.addEventListener("click", handleDismissRecovery);
 
   const btnVerify = document.getElementById("btnVerify");
   if (btnVerify) {
@@ -4206,6 +4271,14 @@ async function handleCaptureNoteData() {
         showMessage("笔记采集成功，已加入缓存池", "success");
       } else if (result.phase === "comments_partial") {
         taskStatus = "partial";
+        renderCaptureRecoveryUI({
+          ...(result.commentsResult || {}),
+          phase: "comments_partial",
+          recordId: result.recordId,
+          collectedCount: Number(result.commentsResult?.commentsCount || 0),
+          captureAction: "captureComments",
+          updatedAt: Date.now(),
+        });
         showMessage(
           includeBloggerMetrics
             ? "笔记已入池，评论已手动停止并合并，博主指标已回填"
@@ -4234,13 +4307,22 @@ async function handleCaptureNoteData() {
       const metricsFailed = Boolean(
         result.bloggerMetricsResult && result.bloggerMetricsResult.ok === false,
       );
+      if (commentsFailed) {
+        renderCaptureRecoveryUI({
+          phase: "comments_failed",
+          recordId: result.recordId,
+          captureAction: "captureComments",
+          error: result.commentsResult?.error || null,
+          updatedAt: Date.now(),
+        });
+      }
       if (commentsFailed && metricsFailed) {
         showMessage(
-          "笔记已入池，评论与博主指标采集失败（评论可点击 ↻ 重试）",
+          "笔记已入池，评论与博主指标采集失败（可在记录卡片继续评论）",
           "warning",
         );
       } else if (commentsFailed) {
-        showMessage("笔记已入池，评论采集失败，可点击 ↻ 仅重试评论", "warning");
+        showMessage("笔记已入池，评论采集失败，可在记录卡片继续评论", "warning");
       } else if (metricsFailed) {
         showMessage("笔记已入池，博主指标采集失败，不影响主流程", "warning");
       } else {
@@ -4269,6 +4351,8 @@ async function handleCaptureNoteData() {
     showMessage("操作失败: " + error.message, "error");
   } finally {
     activeCommentsCaptureRecordId = "";
+    activeCommentsCaptureTabId = null;
+    activeCommentsCaptureRequestId = "";
     finishSidebarTask(taskContext, {
       status: taskStatus,
       error: taskError,
@@ -9393,7 +9477,10 @@ async function requestKeywordExpandCancel() {
   showMessage("正在停止扩词...", "warning");
 }
 
-async function requestCaptureCancelSignal(preferTabId = null) {
+async function requestCaptureCancelSignal(
+  preferTabId = null,
+  captureRequestId = "",
+) {
   let relayTabId = Number(preferTabId);
   if (!Number.isFinite(relayTabId) || relayTabId <= 0) {
     const [tab] = await chrome.tabs.query({
@@ -9407,11 +9494,21 @@ async function requestCaptureCancelSignal(preferTabId = null) {
     return false;
   }
 
-  await chrome.runtime.sendMessage({
-    type: MESSAGE_TYPE.RELAY_TO_CONTENT,
-    tabId: relayTabId,
-    payload: {action: "cancelCapture"},
-  });
+  const normalizedRequestId = String(captureRequestId || "").trim();
+  const response = normalizedRequestId
+    ? await chrome.runtime.sendMessage({
+        type: MESSAGE_TYPE.CANCEL_CAPTURE,
+        tabId: relayTabId,
+        captureRequestId: normalizedRequestId,
+      })
+    : await chrome.runtime.sendMessage({
+        type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+        tabId: relayTabId,
+        payload: {action: "cancelCapture"},
+      });
+  if (response?.ok === false) {
+    throw new Error(response?.error?.message || "取消请求发送失败");
+  }
   return true;
 }
 
@@ -10301,7 +10398,10 @@ async function acquireCaptureExecutionLock({
       return response.data;
     }
     const activeLabel = response?.data?.label || "其他采集任务";
-    showMessage(`${activeLabel}正在运行，本次任务暂不能启动`, "warning");
+    showMessage(
+      `${activeLabel}仍在运行，可能位于其他标签页；若长时间没有进度，底部会显示原因和取消入口`,
+      "warning",
+    );
     return null;
   } catch (error) {
     console.warn("[Sidebar] Acquire capture execution lock failed:", error);
@@ -10331,6 +10431,8 @@ function resolveCaptureExecutionLockRunnerTabId(fallbackTabId = null) {
   const candidates = [
     detailBatchRunnerTabId,
     activeBatchRunnerTabId,
+    activeRecoveryRunnerTabId,
+    activeCommentsCaptureTabId,
     fallbackTabId,
     captureExecutionLockInitialHolderTabId,
   ];
@@ -10823,10 +10925,52 @@ async function handleCancel() {
     await cancelUnattendedKeywordPlanFromSidebar();
     return;
   }
+  const isRecoveryCancel =
+    progressContainer?.dataset.progressSource === "capture-recovery" &&
+    progressContainer?.dataset.recoveryCancelable === "true";
+  const recoveryRequestId = isRecoveryCancel
+    ? String(
+        activeRecoveryProgress?.captureRequestId ||
+          progressContainer?.dataset.captureRequestId ||
+          "",
+      ).trim()
+    : "";
+  const cancelRequestId =
+    recoveryRequestId ||
+    (activeCommentsCaptureRecordId
+      ? String(activeCommentsCaptureRequestId || "").trim()
+      : "");
+  const isRequestScopedCommentCancel = Boolean(
+    !isRecoveryCancel &&
+      cancelRequestId &&
+      activeCommentsCaptureRecordId,
+  );
+  const shouldShowCancelingProgress =
+    isRecoveryCancel || isRequestScopedCommentCancel;
+  const recoverySnapshot = isRecoveryCancel
+    ? {...activeRecoveryProgress}
+    : isRequestScopedCommentCancel
+      ? {
+          phase: "comments_capturing",
+          recordId: activeCommentsCaptureRecordId,
+          runnerTabId: activeCommentsCaptureTabId,
+          captureRequestId: cancelRequestId,
+          captureAction: "captureComments",
+        }
+      : null;
   setCancelFlag(true);
   searchCaptureCancelRequested = true;
-  hideProgressPanelOnly();
-  let relayTabId = null;
+  if (shouldShowCancelingProgress) {
+    renderCaptureRecoveryUI({
+      ...recoverySnapshot,
+      phase: "capture_canceling",
+      message: "正在取消当前任务并保存可用结果…",
+      updatedAt: Date.now(),
+    });
+  } else {
+    hideProgressPanelOnly();
+  }
+  let relayTabId = isRecoveryCancel ? activeRecoveryRunnerTabId : null;
   let shouldFinalizeDetailCapture = false;
   if (detailBatchCaptureInFlight) {
     detailBatchCancelRequested = true;
@@ -10847,20 +10991,37 @@ async function handleCancel() {
     monitorRunCancelRequested = true;
     relayTabId = relayTabId || activeBatchRunnerTabId;
   }
+  if (
+    activeCommentsCaptureRecordId &&
+    Number.isFinite(Number(activeCommentsCaptureTabId))
+  ) {
+    relayTabId = relayTabId || Number(activeCommentsCaptureTabId);
+  }
 
   try {
     if (relayTabId) {
-      await requestCaptureCancelSignal(relayTabId);
+      await requestCaptureCancelSignal(relayTabId, cancelRequestId);
     } else {
-      await requestCaptureCancelSignal();
+      await requestCaptureCancelSignal(null, cancelRequestId);
     }
   } catch (error) {
     console.warn("[Sidebar] Cancel relay failed:", error);
+    if (shouldShowCancelingProgress) {
+      if (isRecoveryCancel) {
+        renderCaptureRecoveryUI({
+          ...recoverySnapshot,
+          updatedAt: Date.now(),
+        });
+      } else {
+        resetCaptureRecoveryUI({hidePanel: true, clearState: true});
+      }
+      showMessage("取消请求发送失败，请检查网络后再试", "error");
+    }
   }
 
   if (shouldFinalizeDetailCapture) {
     await finalizeInterruptedDetailCaptureAfterCancel();
-  } else {
+  } else if (!shouldShowCancelingProgress) {
     showMessage("正在取消...", "info");
   }
 }
@@ -14098,6 +14259,9 @@ async function stopDetailCaptureAndReleaseForSync() {
   detailBatchCaptureInFlight = false;
   detailBatchCancelRequested = false;
   detailBatchRunnerTabId = null;
+  activeCommentsCaptureRecordId = "";
+  activeCommentsCaptureTabId = null;
+  activeCommentsCaptureRequestId = "";
   if (activeCaptureExecutionLockId) {
     void renewCaptureExecutionLock(activeCaptureExecutionLockId);
   }
@@ -14508,6 +14672,9 @@ async function runDetailCaptureForRecordIds(
     detailBatchCaptureInFlight = false;
     detailBatchCancelRequested = false;
     detailBatchRunnerTabId = null;
+    activeCommentsCaptureRecordId = "";
+    activeCommentsCaptureTabId = null;
+    activeCommentsCaptureRequestId = "";
     if (activeCaptureExecutionLockId) {
       void renewCaptureExecutionLock(activeCaptureExecutionLockId);
     }
@@ -14677,22 +14844,91 @@ async function handleRecordListClick(event) {
   }
 }
 
+async function repairStaleCommentCaptureCard(recordId) {
+  const {getRecord, updateRecord} = await import("../utils/storage.js");
+  const record = await getRecord(recordId);
+  if (!record) return false;
+  const payload =
+    record.payload && typeof record.payload === "object" ? record.payload : {};
+  let nextPayload = payload;
+  let changed = false;
+
+  if (record.type === "single_note") {
+    const repaired = repairInterruptedCommentPayload(payload);
+    nextPayload = repaired.payload;
+    changed = repaired.changed;
+  } else if (
+    payload.detailPayload &&
+    typeof payload.detailPayload === "object"
+  ) {
+    const repaired = repairInterruptedCommentPayload(payload.detailPayload);
+    if (repaired.changed) {
+      nextPayload = {...payload, detailPayload: repaired.payload};
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await updateRecord(recordId, {payload: nextPayload});
+    await refreshDataPool();
+  }
+  return changed;
+}
+
 async function handleStopCommentsCapture(recordId) {
-  activeCommentsCaptureRecordId = recordId;
+  const runtimeProgress = getCurrentRuntime()?.lastCaptureProgress || {};
+  const runtimePhase = String(runtimeProgress?.phase || "")
+    .trim()
+    .toLowerCase();
+  const runtimeIsCommentCapture =
+    runtimePhase.startsWith("comments_") ||
+    runtimePhase === "detail_comments_capturing" ||
+    String(runtimeProgress?.captureAction || "") === "captureComments";
+  const runtimeRecordId = String(runtimeProgress?.recordId || "").trim();
+  const runtimeAction = String(runtimeProgress?.captureAction || "").trim();
+  const runtimeMatches =
+    runtimeRecordId === recordId &&
+    ACTIVE_COMMENT_PROGRESS_PHASES.has(runtimePhase) &&
+    runtimeIsCommentCapture;
+  const runtimeExplicitlyConflicts = Boolean(
+    runtimePhase &&
+      ((runtimeRecordId && runtimeRecordId !== recordId) ||
+        (runtimeAction && runtimeAction !== "captureComments")),
+  );
+  const localMatches =
+    activeCommentsCaptureRecordId === recordId &&
+    !runtimeExplicitlyConflicts;
+
+  if (!runtimeMatches && !localMatches) {
+    await repairStaleCommentCaptureCard(recordId).catch((error) => {
+      console.warn("[Sidebar] Repair stale comment card failed:", error);
+    });
+    showMessage(
+      "这条记录的运行状态已经过期，已转为可继续状态；当前其他任务不会被取消",
+      "warning",
+    );
+    return;
+  }
+
+  if (runtimeMatches) {
+    updateActiveCommentCaptureIdentity(runtimeProgress);
+  }
   await handleCancel();
 }
 
 async function handleRetryCommentsCapture(recordId) {
-  const runtime = getCurrentRuntime();
-  if (runtime?.pageType !== PAGE_TYPE.NOTE_DETAIL) {
-    showMessage("请先切换到对应笔记详情页，再重试评论采集", "error");
-    return;
-  }
-
   const settings = await getCaptureSettings();
   const commentsMaxDetectedItems = readCommentsMaxDetectedItemsFromInput(
     settings.commentsMaxDetectedItems,
   );
+
+  const executionLock = await acquireCaptureExecutionLock({
+    owner: "manual_comments_retry",
+    label: "评论采集",
+  });
+  if (!executionLock) {
+    return false;
+  }
 
   const taskContext = beginSidebarTask({
     taskType: "capture",
@@ -14706,7 +14942,7 @@ async function handleRetryCommentsCapture(recordId) {
   let taskStatus = "completed";
   let taskError = null;
 
-  showProgress("正在重试评论采集...", false);
+  showProgress("正在打开对应作品并继续评论采集...", false);
   activeCommentsCaptureRecordId = recordId;
 
   try {
@@ -14718,7 +14954,14 @@ async function handleRetryCommentsCapture(recordId) {
     if (result.ok) {
       if (result.phase === "comments_partial") {
         taskStatus = "partial";
-        showMessage("评论采集已手动停止并合并", "warning");
+        showMessage(
+          result.stoppedByNetwork
+            ? "网络中断超过 2 分钟，已保留当前评论；联网后可继续当前项"
+            : result.stoppedByStall
+              ? "检测到页面卡顿，已保留当前评论；可继续当前项"
+            : "评论采集已手动停止并合并",
+          "warning",
+        );
       } else {
         showMessage("评论采集已完成并合并", "success");
       }
@@ -14739,6 +14982,8 @@ async function handleRetryCommentsCapture(recordId) {
     showMessage("重试评论失败: " + error.message, "error");
   } finally {
     activeCommentsCaptureRecordId = "";
+    activeCommentsCaptureTabId = null;
+    activeCommentsCaptureRequestId = "";
     finishSidebarTask(taskContext, {
       status: taskStatus,
       error: taskError,
@@ -14748,7 +14993,9 @@ async function handleRetryCommentsCapture(recordId) {
       },
     });
     hideProgress();
+    await releaseCaptureExecutionLock(executionLock.id);
   }
+  return true;
 }
 
 async function handleRetryDetailCapture(recordId) {
@@ -14906,6 +15153,442 @@ async function handleDownloadRecordMedia(recordId) {
   }
 }
 
+const CAPTURE_RECOVERY_PHASES = new Set([
+  "network_paused",
+  "network_resumed",
+  "network_timeout",
+  "system_resumed",
+  "capture_recovering",
+  "capture_canceling",
+  "capture_stalled",
+  "comments_partial",
+  "comments_failed",
+  "interrupted_repaired",
+]);
+const CAPTURE_RECOVERY_UI_STALE_MS = 5 * 60 * 1000;
+const ACTIVE_COMMENT_PROGRESS_PHASES = new Set([
+  "comments_opening",
+  "comments_collecting",
+  "comments_capturing",
+  "detail_comments_capturing",
+  "network_paused",
+  "network_resumed",
+  "system_resumed",
+  "capture_recovering",
+  "capture_canceling",
+]);
+
+function isCaptureRecoveryPhase(phase) {
+  return CAPTURE_RECOVERY_PHASES.has(String(phase || "").trim().toLowerCase());
+}
+
+function buildCaptureRecoverySuppressionKey(progress = {}) {
+  const phase = String(progress?.phase || "").trim().toLowerCase();
+  const recordId = String(progress?.recordId || "").trim();
+  const captureRequestId = String(progress?.captureRequestId || "").trim();
+  if (!phase || !recordId) return "";
+  return `${phase}|${recordId}|${captureRequestId}`;
+}
+
+function clearSuppressedCaptureRecoveryForRecord(recordId) {
+  const normalizedRecordId = String(recordId || "").trim();
+  if (!normalizedRecordId) return;
+  for (const key of suppressedCaptureRecoveryKeys) {
+    if (key.split("|")[1] === normalizedRecordId) {
+      suppressedCaptureRecoveryKeys.delete(key);
+    }
+  }
+}
+
+function updateActiveCommentCaptureIdentity(progress = {}) {
+  const recordId = String(progress?.recordId || "").trim();
+  if (!recordId) return;
+  if (
+    activeCommentsCaptureRecordId &&
+    activeCommentsCaptureRecordId !== recordId
+  ) {
+    activeCommentsCaptureTabId = null;
+    activeCommentsCaptureRequestId = "";
+  }
+  activeCommentsCaptureRecordId = recordId;
+
+  const runnerTabId = Number(progress?.runnerTabId);
+  if (Number.isFinite(runnerTabId) && runnerTabId > 0) {
+    activeCommentsCaptureTabId = runnerTabId;
+  }
+  const captureRequestId = String(progress?.captureRequestId || "").trim();
+  if (captureRequestId) {
+    activeCommentsCaptureRequestId = captureRequestId;
+  }
+}
+
+function setRecoveryCopy(elementId, value) {
+  const element = document.getElementById(elementId);
+  if (!element) return;
+  const text = String(value || "").trim();
+  if (element.textContent !== text) {
+    element.textContent = text;
+  }
+  const shouldHide = !text;
+  if (element.hidden !== shouldHide) {
+    element.hidden = shouldHide;
+  }
+}
+
+function isRecoveryActionAvailable(button) {
+  return Boolean(
+    button &&
+      !button.hidden &&
+      !button.disabled &&
+      button.style.display !== "none",
+  );
+}
+
+function handoffRecoveryFocus({
+  previousActiveElement,
+  progressContainer,
+  btnRetry,
+  btnDismiss,
+  btnCancel,
+}) {
+  const recoveryActions = [btnRetry, btnDismiss, btnCancel].filter(Boolean);
+  if (!recoveryActions.includes(previousActiveElement)) return;
+  if (isRecoveryActionAvailable(previousActiveElement)) return;
+
+  const nextAction = [btnRetry, btnDismiss, btnCancel].find(
+    isRecoveryActionAvailable,
+  );
+  const nextFocus = nextAction || progressContainer;
+  try {
+    nextFocus?.focus({preventScroll: true});
+  } catch {
+    nextFocus?.focus();
+  }
+}
+
+function resetCaptureRecoveryUI({hidePanel = false, clearState = true} = {}) {
+  if (captureRecoveryFreshnessTimer) {
+    clearTimeout(captureRecoveryFreshnessTimer);
+    captureRecoveryFreshnessTimer = null;
+  }
+  const progressContainer = document.getElementById("progressContainer");
+  if (progressContainer) {
+    if (
+      hidePanel &&
+      progressContainer.dataset.progressSource === "capture-recovery"
+    ) {
+      progressContainer.style.display = "none";
+      delete progressContainer.dataset.progressSource;
+    }
+    delete progressContainer.dataset.recoveryPinned;
+    delete progressContainer.dataset.recoveryCancelable;
+    delete progressContainer.dataset.recordId;
+    delete progressContainer.dataset.captureRequestId;
+    delete progressContainer.dataset.recoveryAnnouncementKey;
+  }
+
+  setRecoveryCopy("progressBadge", "");
+  setRecoveryCopy("progressReason", "");
+  setRecoveryCopy("progressNextStep", "");
+
+  for (const id of ["btnRetryRecovery", "btnDismissRecovery"]) {
+    const button = document.getElementById(id);
+    if (button) {
+      button.hidden = true;
+      button.disabled = false;
+    }
+  }
+
+  const btnCancel = document.getElementById("btnCancel");
+  if (btnCancel) {
+    btnCancel.hidden = false;
+    btnCancel.textContent = "中止任务";
+    btnCancel.disabled = false;
+  }
+
+  if (clearState) {
+    activeRecoveryProgress = null;
+    activeRecoveryRunnerTabId = null;
+  }
+}
+
+function renderCaptureRecoveryUI(progress) {
+  const source = progress && typeof progress === "object" ? progress : {};
+  const sourceRecordId = String(source.recordId || "").trim();
+  const previousRecordId = String(
+    activeRecoveryProgress?.recordId || "",
+  ).trim();
+  const canReuseIdentity =
+    Boolean(sourceRecordId) && sourceRecordId === previousRecordId;
+  const canReuseCommentIdentity =
+    Boolean(sourceRecordId) &&
+    sourceRecordId === activeCommentsCaptureRecordId;
+  const normalizedProgress = {
+    ...source,
+    captureRequestId:
+      String(source.captureRequestId || "").trim() ||
+      (canReuseIdentity
+        ? String(activeRecoveryProgress?.captureRequestId || "").trim()
+        : "") ||
+      (canReuseCommentIdentity
+        ? String(activeCommentsCaptureRequestId || "").trim()
+        : ""),
+    runnerTabId:
+      Number(source.runnerTabId) ||
+      (canReuseIdentity ? Number(activeRecoveryRunnerTabId) || null : null) ||
+      (canReuseCommentIdentity
+        ? Number(activeCommentsCaptureTabId) || null
+        : null),
+    captureAction:
+      String(source.captureAction || "").trim() ||
+      (canReuseIdentity
+        ? String(activeRecoveryProgress?.captureAction || "").trim()
+        : ""),
+  };
+  const phase = String(normalizedProgress.phase || "").trim().toLowerCase();
+  const suppressionKey = buildCaptureRecoverySuppressionKey(
+    normalizedProgress,
+  );
+  if (suppressionKey && suppressedCaptureRecoveryKeys.has(suppressionKey)) {
+    return false;
+  }
+  const canRetry =
+    (phase === "comments_partial" ||
+      phase === "comments_failed" ||
+      phase === "interrupted_repaired") &&
+    Boolean(String(normalizedProgress.recordId || "").trim());
+  const view = resolveCaptureRecoveryView(normalizedProgress, {canRetry});
+  if (!view.visible || isUnsupportedPlatformCoverVisible()) {
+    return false;
+  }
+  if (captureRecoveryFreshnessTimer) {
+    clearTimeout(captureRecoveryFreshnessTimer);
+    captureRecoveryFreshnessTimer = null;
+  }
+
+  const progressContainer = document.getElementById("progressContainer");
+  const progressBar = document.getElementById("progressBar");
+  const progressText = document.getElementById("progressText");
+  if (!progressContainer || !progressBar || !progressText) {
+    return false;
+  }
+  if (progressContainer.dataset.progressSource === "keyword-plan") {
+    clearKeywordPlanProgressCountdown();
+  }
+
+  const tone = ["info", "success", "warning", "error", "danger"].includes(
+    view.tone,
+  )
+    ? view.tone
+    : "info";
+  const announcementKey = buildCaptureRecoveryAnnouncementKey(view);
+  const shouldUpdateAnnouncement =
+    progressContainer.dataset.recoveryAnnouncementKey !== announcementKey;
+  const previousActiveElement = document.activeElement;
+  progressContainer.dataset.progressSource = "capture-recovery";
+  progressContainer.dataset.recoveryPinned = view.pinned ? "true" : "false";
+  progressContainer.dataset.recoveryCancelable = view.showCancel
+    ? "true"
+    : "false";
+  if (view.recordId) {
+    progressContainer.dataset.recordId = view.recordId;
+  } else {
+    delete progressContainer.dataset.recordId;
+  }
+  if (view.captureRequestId) {
+    progressContainer.dataset.captureRequestId = view.captureRequestId;
+  } else {
+    delete progressContainer.dataset.captureRequestId;
+  }
+  progressContainer.style.display = "block";
+
+  const btnRetry = document.getElementById("btnRetryRecovery");
+  const btnDismiss = document.getElementById("btnDismissRecovery");
+  const btnCancel = document.getElementById("btnCancel");
+  if (shouldUpdateAnnouncement) {
+    progressContainer.dataset.recoveryAnnouncementKey = announcementKey;
+    progressBar.className = `status-bar capture-recovery-status is-${tone}`;
+    if (progressText.textContent !== view.title) {
+      progressText.textContent = view.title;
+    }
+    progressText.hidden = false;
+    setRecoveryCopy("progressBadge", view.statusLabel);
+    setRecoveryCopy("progressReason", view.detail);
+    setRecoveryCopy("progressNextStep", view.nextStep);
+
+    if (btnRetry) {
+      btnRetry.hidden = !view.showRetry;
+      btnRetry.disabled = !view.showRetry;
+      btnRetry.textContent = view.retryLabel || "继续当前项";
+    }
+    if (btnDismiss) {
+      btnDismiss.hidden = !view.showDismiss;
+      btnDismiss.disabled = false;
+      btnDismiss.textContent = view.dismissLabel || "保留结果";
+    }
+    if (btnCancel) {
+      btnCancel.hidden = !view.showCancel;
+      btnCancel.style.display = view.showCancel ? "inline-flex" : "none";
+      btnCancel.disabled = false;
+      btnCancel.textContent = view.cancelLabel || "取消并保留";
+    }
+    handoffRecoveryFocus({
+      previousActiveElement,
+      progressContainer,
+      btnRetry,
+      btnDismiss,
+      btnCancel,
+    });
+  }
+
+  activeRecoveryProgress = {...normalizedProgress, ...view};
+  const runnerTabId = Number(
+    view.runnerTabId || normalizedProgress.runnerTabId,
+  );
+  activeRecoveryRunnerTabId =
+    Number.isFinite(runnerTabId) && runnerTabId > 0 ? runnerTabId : null;
+  const isCommentRecovery =
+    phase.startsWith("comments_") ||
+    String(normalizedProgress.captureAction || "") === "captureComments";
+  if (isCommentRecovery && view.recordId) {
+    updateActiveCommentCaptureIdentity({
+      ...normalizedProgress,
+      recordId: view.recordId,
+      runnerTabId: activeRecoveryRunnerTabId,
+      captureRequestId: view.captureRequestId,
+    });
+  }
+  const numericUpdatedAt = Number(normalizedProgress.updatedAt);
+  const parsedUpdatedAt = Date.parse(String(normalizedProgress.updatedAt || ""));
+  const updatedAt =
+    Number.isFinite(numericUpdatedAt) && numericUpdatedAt > 0
+      ? numericUpdatedAt
+      : parsedUpdatedAt;
+  if (Number.isFinite(updatedAt) && updatedAt > 0) {
+    activeRecoveryProgress.updatedAt = updatedAt;
+    const identity = [
+      phase,
+      view.recordId,
+      view.captureRequestId,
+      String(updatedAt),
+    ].join("|");
+    captureRecoveryFreshnessTimer = setTimeout(() => {
+      const activeIdentity = [
+        String(activeRecoveryProgress?.phase || ""),
+        String(activeRecoveryProgress?.recordId || ""),
+        String(activeRecoveryProgress?.captureRequestId || ""),
+        String(Number(activeRecoveryProgress?.updatedAt) || 0),
+      ].join("|");
+      if (activeIdentity === identity) {
+        resetCaptureRecoveryUI({hidePanel: true, clearState: true});
+      }
+    }, Math.min(
+      CAPTURE_RECOVERY_UI_STALE_MS,
+      Math.max(50, updatedAt + CAPTURE_RECOVERY_UI_STALE_MS - Date.now()),
+    ));
+  }
+  return true;
+}
+
+async function handleRetryRecovery() {
+  const progressContainer = document.getElementById("progressContainer");
+  const recordId = String(
+    activeRecoveryProgress?.recordId ||
+      progressContainer?.dataset.recordId ||
+      "",
+  ).trim();
+  if (!recordId) {
+    showMessage("当前提示没有可继续的评论记录，请从记录卡片重试", "warning");
+    return;
+  }
+  const snapshot = activeRecoveryProgress
+    ? {...activeRecoveryProgress}
+    : null;
+  const suppressionKey = buildCaptureRecoverySuppressionKey(snapshot);
+  if (suppressionKey) {
+    suppressedCaptureRecoveryKeys.add(suppressionKey);
+  }
+  const started = await handleRetryCommentsCapture(recordId);
+  if (started === false && suppressionKey) {
+    suppressedCaptureRecoveryKeys.delete(suppressionKey);
+    if (snapshot) {
+      renderCaptureRecoveryUI({...snapshot, updatedAt: Date.now()});
+    }
+  }
+}
+
+function handleDismissRecovery() {
+  const snapshot = activeRecoveryProgress
+    ? {...activeRecoveryProgress}
+    : null;
+  const suppressionKey = buildCaptureRecoverySuppressionKey(snapshot);
+  if (suppressionKey) {
+    suppressedCaptureRecoveryKeys.add(suppressionKey);
+    while (suppressedCaptureRecoveryKeys.size > 200) {
+      const oldestKey = suppressedCaptureRecoveryKeys.values().next().value;
+      if (!oldestKey) break;
+      suppressedCaptureRecoveryKeys.delete(oldestKey);
+    }
+  }
+  resetCaptureRecoveryUI({hidePanel: true, clearState: true});
+  if (!snapshot) return;
+
+  const clearPersistedProgress = (updatedAt = 0) =>
+    Promise.resolve(
+      chrome.runtime.sendMessage({
+        type: MESSAGE_TYPE.CLEAR_CAPTURE_PROGRESS,
+        phase: String(snapshot.phase || ""),
+        recordId: String(snapshot.recordId || ""),
+        captureRequestId: String(snapshot.captureRequestId || ""),
+        updatedAt,
+      }),
+    );
+  void clearPersistedProgress(Number(snapshot.updatedAt) || 0).catch((error) => {
+    console.warn("[Sidebar] Clear dismissed recovery progress failed:", error);
+  });
+  if (String(snapshot.captureRequestId || "").trim()) {
+    setTimeout(() => {
+      void clearPersistedProgress(0).catch(() => null);
+    }, 250);
+  }
+}
+
+function publishCommentProgressToRuntime(progress) {
+  const phase = String(progress?.phase || "").trim();
+  if (!phase.startsWith("comments_")) {
+    return;
+  }
+  const recordId = String(progress?.recordId || "").trim();
+  if (!recordId) {
+    return;
+  }
+  const sameRecoveryRecord =
+    String(activeRecoveryProgress?.recordId || "").trim() === recordId;
+  const payload = {
+    ...progress,
+    recordId,
+    captureAction: "captureComments",
+    captureRequestId:
+      String(progress?.captureRequestId || "").trim() ||
+      (sameRecoveryRecord
+        ? String(activeRecoveryProgress?.captureRequestId || "").trim()
+        : ""),
+    runnerTabId:
+      Number(progress?.runnerTabId) ||
+      (sameRecoveryRecord ? Number(activeRecoveryRunnerTabId) || null : null),
+    updatedAt: Date.now(),
+  };
+  void Promise.resolve(
+    chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.CAPTURE_PROGRESS,
+      payload,
+    }),
+  )
+    .catch((error) => {
+      console.warn("[Sidebar] Publish comment progress failed:", error);
+    });
+}
+
 /**
  * 处理进度回调
  */
@@ -14916,9 +15599,15 @@ function handleProgress(progress) {
   const phase = String(progress?.phase || "");
   const progressRecordId =
     typeof progress?.recordId === "string" ? progress.recordId.trim() : "";
+  if (progressRecordId && ACTIVE_COMMENT_PROGRESS_PHASES.has(phase)) {
+    clearSuppressedCaptureRecoveryForRecord(progressRecordId);
+  }
   const progressContainer = document.getElementById("progressContainer");
-  if (isTerminalProgressPhase(phase)) {
-    hideProgressPanelOnly();
+  const recoveryRendered = renderCaptureRecoveryUI(progress);
+  publishCommentProgressToRuntime(progress);
+  const isTerminalPhase = isTerminalProgressPhase(phase);
+  if (isTerminalPhase && !recoveryRendered) {
+    hideProgressPanelOnly({force: true});
   }
 
   if (phase.startsWith("detail_")) {
@@ -14935,13 +15624,26 @@ function handleProgress(progress) {
     }
   }
 
-  if (phase.startsWith("comments_")) {
-    if (progressContainer) {
+  if (phase.startsWith("comments_") && !recoveryRendered) {
+    if (progressContainer?.dataset.progressSource === "capture-recovery") {
+      resetCaptureRecoveryUI({hidePanel: true, clearState: true});
+    } else if (progressContainer) {
       progressContainer.style.display = "none";
     }
-  } else {
+  } else if (!recoveryRendered && !isTerminalPhase) {
+    if (progressContainer?.dataset.progressSource === "capture-recovery") {
+      resetCaptureRecoveryUI({hidePanel: false, clearState: true});
+      progressContainer.dataset.progressSource = "capture";
+    }
     if (progressContainer && !isUnsupportedPlatformCoverVisible()) {
       progressContainer.style.display = "block";
+    }
+    const btnCancel = document.getElementById("btnCancel");
+    if (btnCancel && progressContainer?.style.display !== "none") {
+      btnCancel.hidden = false;
+      btnCancel.disabled = false;
+      btnCancel.textContent = "中止任务";
+      btnCancel.style.display = "inline-flex";
     }
     // 否则正常更新全局进度消息
     const progressText = document.getElementById("progressText");
@@ -14955,8 +15657,17 @@ function handleProgress(progress) {
     }
   }
 
-  if (progressRecordId) {
-    activeCommentsCaptureRecordId = progressRecordId;
+  const isCommentProgress =
+    phase.startsWith("comments_") ||
+    phase === "detail_comments_capturing" ||
+    ((phase === "network_paused" ||
+      phase === "network_resumed" ||
+      phase === "network_timeout" ||
+      phase === "system_resumed") &&
+      Boolean(progressRecordId));
+
+  if (progressRecordId && isCommentProgress) {
+    updateActiveCommentCaptureIdentity(progress);
   }
 
   if (phase === "comments_capturing" && progressRecordId) {
@@ -15011,13 +15722,17 @@ function handleProgress(progress) {
       );
     });
   }
+  if (
+    terminalCommentStatus &&
+    activeCommentsCaptureRecordId === progressRecordId
+  ) {
+    activeCommentsCaptureRecordId = "";
+    activeCommentsCaptureTabId = null;
+    activeCommentsCaptureRequestId = "";
+  }
 }
 
 async function syncRuntimeCommentProgress(runtime) {
-  if (!activeCommentsCaptureRecordId) {
-    return;
-  }
-
   const progress = runtime?.lastCaptureProgress;
   if (!progress) {
     return;
@@ -15025,6 +15740,16 @@ async function syncRuntimeCommentProgress(runtime) {
   const phase = String(progress.phase || "");
   if (!phase.startsWith("comments_")) {
     return;
+  }
+  const progressRecordId = String(progress?.recordId || "").trim();
+  if (progressRecordId) {
+    updateActiveCommentCaptureIdentity(progress);
+  }
+  if (!activeCommentsCaptureRecordId) {
+    return;
+  }
+  if (phase === "comments_collecting" || phase === "comments_capturing") {
+    hideProgressPanelOnly({force: true});
   }
   if (phase === "comments_capturing") {
     clearCommentCaptureTerminalStatus(activeCommentsCaptureRecordId);
@@ -15043,6 +15768,9 @@ async function syncRuntimeCommentProgress(runtime) {
           ? String(progress?.error?.message || progress?.message || "")
           : "",
     });
+    activeCommentsCaptureRecordId = "";
+    activeCommentsCaptureTabId = null;
+    activeCommentsCaptureRequestId = "";
     return;
   }
   if (!Number.isFinite(Number(progress.collectedCount))) {
@@ -15059,21 +15787,44 @@ async function syncRuntimeCommentProgress(runtime) {
 }
 
 function syncRuntimeCaptureProgress(runtime) {
-  if (detailBatchCaptureInFlight) {
-    return;
-  }
-
   const progress = runtime?.lastCaptureProgress;
   if (!progress) {
+    const progressContainer = document.getElementById("progressContainer");
+    if (
+      progressContainer?.dataset.progressSource === "capture-recovery" &&
+      String(activeRecoveryProgress?.phase || "") !== "interrupted_repaired"
+    ) {
+      resetCaptureRecoveryUI({hidePanel: true, clearState: true});
+    }
     return;
   }
 
   const phase = String(progress.phase || "");
-  if (!phase || phase.startsWith("comments_")) {
+  if (ACTIVE_COMMENT_PROGRESS_PHASES.has(phase)) {
+    clearSuppressedCaptureRecoveryForRecord(progress?.recordId);
+  }
+  const isRecoveryPhase = isCaptureRecoveryPhase(phase);
+  const recoveryRendered = isRecoveryPhase
+    ? renderCaptureRecoveryUI(progress)
+    : false;
+  if (isRecoveryPhase && !recoveryRendered) {
+    resetCaptureRecoveryUI({hidePanel: true, clearState: true});
+  }
+  if (recoveryRendered) {
+    return;
+  }
+  if (detailBatchCaptureInFlight && !isRecoveryPhase) {
+    return;
+  }
+  if (!phase) {
+    return;
+  }
+  if (phase.startsWith("comments_")) {
+    hideProgressPanelOnly({force: true});
     return;
   }
   if (isTerminalProgressPhase(phase)) {
-    hideProgressPanelOnly();
+    hideProgressPanelOnly({force: true});
     if (batchKeywordCaptureInFlight) {
       setBatchProgressDetail("");
     }
@@ -15095,13 +15846,13 @@ function syncRuntimeCaptureProgress(runtime) {
   }
 
   if (isUnsupportedPlatformCoverVisible()) {
-    hideProgressPanelOnly();
+    hideProgressPanelOnly({force: true});
     return;
   }
 
   // 仅在本次会话已经主动展示进度面板时，才继续用 runtime 进度刷新。
   // 避免旧任务遗留的 progress 在空闲状态下重新弹出。
-  if (progressContainer.style.display === "none") {
+  if (progressContainer.style.display === "none" && !isRecoveryPhase) {
     return;
   }
 
@@ -15110,8 +15861,19 @@ function syncRuntimeCaptureProgress(runtime) {
     return;
   }
 
+  if (progressContainer.dataset.progressSource === "capture-recovery") {
+    resetCaptureRecoveryUI({hidePanel: false, clearState: true});
+  }
+  progressContainer.dataset.progressSource = "capture";
   progressContainer.style.display = "block";
   progressText.textContent = nextMessage;
+  const btnCancel = document.getElementById("btnCancel");
+  if (btnCancel) {
+    btnCancel.hidden = false;
+    btnCancel.disabled = false;
+    btnCancel.textContent = "中止任务";
+    btnCancel.style.display = "inline-flex";
+  }
   const progressBar = document.getElementById("progressBar");
   if (progressBar) {
     progressBar.className = "status-bar is-info";
@@ -18492,6 +19254,13 @@ function isUnsupportedPlatformCoverVisible() {
  * 显示进度
  */
 function showProgress(message, showUI = true) {
+  if (
+    document.getElementById("progressContainer")?.dataset.progressSource ===
+    "keyword-plan"
+  ) {
+    clearKeywordPlanProgressCountdown();
+  }
+  resetCaptureRecoveryUI({hidePanel: false, clearState: true});
   const showPanel = Boolean(showUI) && !isUnsupportedPlatformCoverVisible();
   const progressContainer = document.getElementById("progressContainer");
   if (progressContainer) {
@@ -18504,7 +19273,7 @@ function showProgress(message, showUI = true) {
   if (progressText && showPanel) {
     progressText.textContent = message;
     if (progressBar) {
-      progressBar.className = "status-bar is-info";
+      progressBar.className = "status-bar capture-recovery-status is-info";
     }
   }
 
@@ -18513,14 +19282,24 @@ function showProgress(message, showUI = true) {
   // 显示取消按钮
   const btnCancel = document.getElementById("btnCancel");
   if (btnCancel && showPanel) {
+    btnCancel.hidden = false;
     btnCancel.style.display = "inline-block";
   } else if (btnCancel) {
     btnCancel.style.display = "none";
   }
 }
 
-function hideProgressPanelOnly() {
+function hideProgressPanelOnly({force = false} = {}) {
   const progressContainer = document.getElementById("progressContainer");
+  if (
+    !force &&
+    progressContainer?.dataset.progressSource === "capture-recovery" &&
+    progressContainer?.dataset.recoveryPinned === "true"
+  ) {
+    return;
+  }
+  const wasRecovery =
+    progressContainer?.dataset.progressSource === "capture-recovery";
   if (progressContainer) {
     progressContainer.style.display = "none";
     delete progressContainer.dataset.progressSource;
@@ -18529,6 +19308,9 @@ function hideProgressPanelOnly() {
   const btnCancel = document.getElementById("btnCancel");
   if (btnCancel) {
     btnCancel.style.display = "none";
+  }
+  if (wasRecovery) {
+    resetCaptureRecoveryUI({hidePanel: false, clearState: true});
   }
 }
 

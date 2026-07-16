@@ -28,6 +28,9 @@ import {startContentPageStateReporting} from "./utils/content-page-state.js";
 
 console.log("[StarVoice V1.0] Content script loaded");
 
+let activeCommentsCaptureRequestId = "";
+const activeCaptureRequestIds = new Set();
+
 function safeRuntimeSendMessage(message) {
   try {
     if (
@@ -110,23 +113,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
 
     case "smartCapture":
-      handleSmartCapture(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleSmartCapture(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "captureSingleNote":
-      handleCaptureSingleNote(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleCaptureSingleNote(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "captureBloggerProfile":
-      handleCaptureBloggerProfile(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleCaptureBloggerProfile(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "captureBloggerNotes":
-      handleCaptureBloggerNotes(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleCaptureBloggerNotes(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "captureKeywordNotes":
-      handleCaptureKeywordNotes(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleCaptureKeywordNotes(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "prepareKeywordStrategyCapture":
@@ -138,7 +151,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
 
     case "expandKeywordSuggestions":
-      handleExpandKeywordSuggestions(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleExpandKeywordSuggestions(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "detectSearchSortDimension":
@@ -146,11 +161,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
 
     case "captureComments":
-      handleCaptureComments(request, sendResponseWithDiagnostics);
+      runTrackedCaptureRequest(request, () =>
+        handleCaptureComments(request, sendResponseWithDiagnostics),
+      );
       return true;
 
     case "cancelCapture":
-      handleCancelCapture(sendResponseWithDiagnostics);
+      handleCancelCapture(request, sendResponseWithDiagnostics);
       return true;
 
     default:
@@ -164,6 +181,53 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // ==================== 消息处理函数 ====================
+
+function runTrackedCaptureRequest(request, handler) {
+  const requestId = String(request?.captureRequestId || "").trim();
+  if (requestId) {
+    activeCaptureRequestIds.add(requestId);
+  }
+
+  let result;
+  try {
+    // Invoke synchronously so each handler resets its cancellation flag before a
+    // matching cancel message can interleave with the request startup.
+    result = handler();
+  } catch (error) {
+    if (requestId) {
+      activeCaptureRequestIds.delete(requestId);
+    }
+    throw error;
+  }
+
+  void Promise.resolve(result)
+    .catch((error) => {
+      console.error("[Content] Tracked capture handler failed:", error);
+    })
+    .finally(() => {
+      if (requestId) {
+        activeCaptureRequestIds.delete(requestId);
+      }
+    });
+}
+
+function reportCaptureProgress(request, progress = {}) {
+  const source = progress && typeof progress === "object" ? progress : {};
+  safeRuntimeSendMessage({
+    action: "captureProgress",
+    progress: {
+      ...source,
+      captureRequestId: String(request?.captureRequestId || ""),
+      recordId: String(request?.recordId || source.recordId || ""),
+      current: Number(request?.current) || source.current,
+      total: Number(request?.total) || source.total,
+      runnerTabId: Number(request?.runnerTabId) || source.runnerTabId || null,
+      captureAction: String(request?.action || source.captureAction || ""),
+      recoveryMaxAttempts: 1,
+      updatedAt: Date.now(),
+    },
+  });
+}
 
 /**
  * 处理页面类型检测
@@ -191,11 +255,7 @@ async function handleSmartCapture(request, sendResponse) {
     const result = await smartCapture({
       mode: request.mode || "auto",
       onProgress: (progress) => {
-        // 发送进度更新到 background
-        safeRuntimeSendMessage({
-          action: "captureProgress",
-          progress,
-        });
+        reportCaptureProgress(request, progress);
       },
     });
 
@@ -273,10 +333,7 @@ async function handleCaptureBloggerNotes(request, sendResponse) {
 
     const result = await captureBloggerNotes({
       onProgress: (progress) => {
-        safeRuntimeSendMessage({
-          action: "captureProgress",
-          progress,
-        });
+        reportCaptureProgress(request, progress);
       },
       profileMetrics: request.profileMetrics,
       minLikes: request.minLikes,
@@ -314,10 +371,7 @@ async function handleCaptureKeywordNotes(request, sendResponse) {
     const result = await captureKeywordNotes({
       keyword: request.keyword,
       onProgress: (progress) => {
-        safeRuntimeSendMessage({
-          action: "captureProgress",
-          progress,
-        });
+        reportCaptureProgress(request, progress);
       },
       minLikes: request.minLikes,
       sortDimension: request.sortDimension,
@@ -1255,15 +1309,29 @@ function randomStrategyDelay(minMs, maxMs) {
  * 处理评论采集
  */
 async function handleCaptureComments(request, sendResponse) {
+  const requestId =
+    String(request?.captureRequestId || "").trim() ||
+    `comments_${Date.now().toString(36)}`;
+  if (activeCommentsCaptureRequestId) {
+    sendResponse({
+      ok: false,
+      type: "comments",
+      data: null,
+      error: {
+        code: "COMMENTS_CAPTURE_ALREADY_RUNNING",
+        message: "当前页面已有评论采集在运行，请先停止或等待其结束",
+      },
+    });
+    return;
+  }
+
+  activeCommentsCaptureRequestId = requestId;
   try {
     resetCancelFlag();
 
     const result = await captureComments({
       onProgress: (progress) => {
-        safeRuntimeSendMessage({
-          action: "captureProgress",
-          progress,
-        });
+        reportCaptureProgress(request, progress);
       },
       onlyLevel1: Boolean(request.onlyLevel1),
       maxDetectedItems: request.maxDetectedItems ?? request.maxItems,
@@ -1285,16 +1353,30 @@ async function handleCaptureComments(request, sendResponse) {
       data: null,
       error: {code: "CAPTURE_FAILED", message: error.message},
     });
+  } finally {
+    if (activeCommentsCaptureRequestId === requestId) {
+      activeCommentsCaptureRequestId = "";
+    }
   }
 }
 
 /**
  * 处理取消采集
  */
-function handleCancelCapture(sendResponse) {
+function handleCancelCapture(request, sendResponse) {
   try {
-    setCancelFlag(true);
-    sendResponse({ok: true, message: "取消信号已发送"});
+    const targetRequestId = String(request?.captureRequestId || "").trim();
+    const matched =
+      !targetRequestId || activeCaptureRequestIds.has(targetRequestId);
+    if (matched) {
+      setCancelFlag(true);
+    }
+    sendResponse({
+      ok: true,
+      message: matched ? "取消信号已发送" : "目标采集已不在当前页面运行",
+      captureRequestId: targetRequestId,
+      matched,
+    });
   } catch (error) {
     console.error("[Content] Cancel capture failed:", error);
     sendResponse({

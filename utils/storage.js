@@ -12,6 +12,7 @@ import {
   RECORD_STATUS,
   ERROR_REASON,
   PAGE_TYPE,
+  MESSAGE_TYPE,
 } from "./constants.js";
 import {
   normalizeStoredRecord,
@@ -105,8 +106,52 @@ export async function setRuntime(runtime) {
  * 更新 runtime 部分字段
  */
 export async function updateRuntime(updates) {
+  const patch =
+    updates && typeof updates === "object" && !Array.isArray(updates)
+      ? updates
+      : {};
+  const runtimeApi =
+    typeof chrome !== "undefined" && chrome?.runtime ? chrome.runtime : null;
+  const allowDirectFallback = !String(runtimeApi?.id || "").trim();
+
+  if (runtimeApi?.sendMessage) {
+    try {
+      const response = await runtimeApi.sendMessage({
+        type: MESSAGE_TYPE.UPDATE_RUNTIME,
+        updates: patch,
+      });
+      if (response?.ok === true) {
+        return true;
+      }
+      if (response !== undefined) {
+        console.error("[Storage] Background runtime update failed:", response?.error);
+        return false;
+      }
+      if (!allowDirectFallback) {
+        console.error("[Storage] Background runtime update returned no response");
+        return false;
+      }
+    } catch (error) {
+      const message = String(error?.message || error || "");
+      const noReceiver =
+        message.includes("Receiving end does not exist") ||
+        message.includes("Could not establish connection");
+      if (!noReceiver || !allowDirectFallback) {
+        console.error("[Storage] Failed to delegate runtime update:", error);
+        return false;
+      }
+    }
+  }
+
+  if (!allowDirectFallback) {
+    console.error("[Storage] Background runtime writer is unavailable");
+    return false;
+  }
+
+  // 仅 Node 测试等没有真实 extension id 的环境保留原 API 的降级行为。
+  // 真实扩展即使后台暂时不可用也不能跨上下文直写同一 runtime key。
   const current = await getRuntime();
-  return await setRuntime({...current, ...updates});
+  return await setRuntime({...current, ...patch});
 }
 
 /**
@@ -123,6 +168,8 @@ function getDefaultRuntime() {
     clientLabel: "",
     appVersion: "2.0.0",
     lastActiveTabId: null,
+    lastCaptureProgress: null,
+    lastCaptureProgressAt: 0,
     lastPageUrl: "",
     lastUpdatedAt: Date.now(),
   };

@@ -479,12 +479,28 @@ export async function captureDouyinComments({
     const scrollResult = await autoScrollLoad({
       onProgress: (progress) => {
         if (!onProgress) return;
+        const isConnectivityProgress =
+          progress?.phase === "network_paused" ||
+          progress?.phase === "network_resumed" ||
+          progress?.phase === "network_timeout" ||
+          progress?.phase === "system_resumed";
+        if (
+          progress?.phase === "network_resumed" ||
+          progress?.phase === "system_resumed"
+        ) {
+          lastGrowthAt = Date.now();
+          stallRounds = 0;
+        }
         onProgress({
           ...progress,
-          phase: "comments_collecting",
+          phase: isConnectivityProgress
+            ? progress.phase
+            : "comments_collecting",
           collectedCount: commentsMap.size,
           maxDetectedItems: normalizedMaxDetectedItems,
-          message: `评论采集中（${commentsMap.size}条）`,
+          message: isConnectivityProgress
+            ? progress.message
+            : `评论采集中（${commentsMap.size}条）`,
         });
       },
       detectNewContent: () => {
@@ -503,6 +519,7 @@ export async function captureDouyinComments({
       maxDurationMs: normalizedMaxDurationMs,
       waitMinMs: Math.min(normalizedWaitMinMs, normalizedWaitMaxMs),
       waitMaxMs: Math.max(normalizedWaitMinMs, normalizedWaitMaxMs),
+      resetCancelOnStart: false,
       stopWhen: ({currentContentCount}) => {
         const currentContainer = resolveActiveCommentContainer();
         if (currentContentCount > lastObservedCount) {
@@ -559,7 +576,8 @@ export async function captureDouyinComments({
     );
 
     const stoppedByUser = isCanceled();
-    const captureStatus = stoppedByUser ? "partial" : "done";
+    const stoppedByStall = Boolean(scrollResult?.stalled);
+    const captureStatus = stoppedByUser || stoppedByStall ? "partial" : "done";
     const items = Array.from(commentsMap.values()).slice(
       0,
       normalizedMaxDetectedItems,
@@ -568,7 +586,7 @@ export async function captureDouyinComments({
     const stageTrace = [
       buildCommentLoadStage({
         label: "抖音评论加载",
-        status: stoppedByUser ? "partial" : "completed",
+        status: captureStatus === "partial" ? "partial" : "completed",
         commentsMaxDetectedItems: normalizedMaxDetectedItems,
         collectedCount: items.length,
         uniqueCount: commentsMap.size,
@@ -596,6 +614,7 @@ export async function captureDouyinComments({
         captureTimestamp: Date.now(),
         captureStatus,
         stoppedByUser,
+        stoppedByStall,
         stopReason: stoppedByUser ? "canceled" : scrollResult.stopReason || "",
       },
       meta: {
@@ -604,6 +623,7 @@ export async function captureDouyinComments({
         captureFinishedAt: new Date().toISOString(),
         captureStatus,
         stoppedByUser,
+        stoppedByStall,
         scene,
         diagnostics: commentDiagnostics,
         scrollInfo: {

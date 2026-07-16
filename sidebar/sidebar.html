@@ -1926,33 +1926,75 @@
         <div
           class="panel progress-sticky"
           id="progressContainer"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          tabindex="-1"
           style="display: none;">
           <div
-            class="status-bar is-info"
+            class="status-bar capture-recovery-status is-info"
             id="progressBar"
             style="margin-bottom: var(--spacing-sm);">
-            <svg
-              viewBox="0 0 24 24"
-              width="16"
-              height="16"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round">
-              <circle
-                cx="12"
-                cy="12"
-                r="10"></circle>
-              <polyline points="12 6 12 12 16 14"></polyline>
-            </svg>
-            <span id="progressText">正在准备采集...</span>
+            <span
+              class="capture-recovery-marker"
+              aria-hidden="true">
+              <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round">
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+              </svg>
+            </span>
+            <div class="capture-recovery-copy">
+              <div class="capture-recovery-heading">
+                <strong
+                  class="capture-recovery-title"
+                  id="progressText"
+                  >正在准备采集...</strong
+                >
+                <span
+                  class="capture-recovery-badge"
+                  id="progressBadge"
+                  hidden></span>
+              </div>
+              <div
+                class="capture-recovery-reason"
+                id="progressReason"
+                hidden></div>
+              <div
+                class="capture-recovery-next-step"
+                id="progressNextStep"
+                hidden></div>
+            </div>
           </div>
-          <div style="text-align: center;">
+          <div class="capture-recovery-actions">
             <button
-              class="btn btn-secondary btn-full"
+              class="btn btn-primary capture-recovery-action"
+              id="btnRetryRecovery"
+              type="button"
+              hidden>
+              继续当前项
+            </button>
+            <button
+              class="btn btn-outline capture-recovery-action"
+              id="btnDismissRecovery"
+              type="button"
+              hidden>
+              保留结果
+            </button>
+            <button
+              class="btn btn-secondary capture-recovery-action"
               id="btnCancel"
-              style="padding: 6px; font-size: 13px;">
+              type="button">
               中止任务
             </button>
           </div>

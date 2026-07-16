@@ -16,6 +16,7 @@ const DEFAULT_RUNTIME = {
   detailReadyCheckedAt: 0,
   lastActiveTabId: null,
   lastCaptureProgress: null,
+  lastCaptureProgressAt: 0,
   lastPageUrl: '',
 };
 
@@ -37,6 +38,11 @@ const UNATTENDED_RUN_ACTIVE_GRACE_MS = 5 * 60 * 1000;
 const CONTENT_SCRIPT_READY_TIMEOUT_MS = 10 * 1000;
 const CONTENT_RELAY_DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
 const CONTENT_RELAY_MAX_TIMEOUT_MS = 11 * 60 * 1000;
+const CONTENT_RELAY_INACTIVITY_TIMEOUT_MS = 90 * 1000;
+const CONTENT_RELAY_WATCHDOG_TICK_MS = 1000;
+const CONTENT_RELAY_SUSPEND_GAP_MS = 15 * 1000;
+const CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS = 20 * 1000;
+const CAPTURE_REQUEST_ABORT_TTL_MS = 15 * 60 * 1000;
 const UNATTENDED_RUN_TERMINAL_STATUSES = new Set([
   'completed',
   'failed',
@@ -44,6 +50,9 @@ const UNATTENDED_RUN_TERMINAL_STATUSES = new Set([
   'skipped',
 ]);
 let unattendedKeywordAlarmInFlight = false;
+const contentRelayHeartbeatByRequestId = new Map();
+const abortedCaptureRequestIds = new Map();
+const settledCaptureRequestIds = new Map();
 const DEFAULT_UNATTENDED_KEYWORD_PLAN = Object.freeze({
   enabled: false,
   platform: 'xiaohongshu',
@@ -1031,41 +1040,76 @@ async function readRuntimeState() {
   };
 }
 
-async function writeRuntimeState(patch) {
-  const current = await readRuntimeState();
-  const next = {
-    ...current,
-    ...patch,
-  };
+let runtimeMutationQueue = Promise.resolve();
 
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.runtime]: next,
+/**
+ * Serializes every runtime read-modify-write operation. The queue tail always
+ * resolves, so one failed storage write cannot block later runtime updates.
+ */
+function runRuntimeMutation(mutation) {
+  if (typeof mutation !== 'function') {
+    throw new TypeError('runtime mutation must be a function');
+  }
+
+  const execute = () => Promise.resolve().then(mutation);
+  const result = runtimeMutationQueue.then(execute, execute);
+  runtimeMutationQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function writeRuntimeState(patchOrFactory) {
+  return await runRuntimeMutation(async () => {
+    const current = await readRuntimeState();
+    const patch =
+      typeof patchOrFactory === 'function'
+        ? await patchOrFactory(current)
+        : patchOrFactory;
+    const next = {
+      ...current,
+      ...(patch && typeof patch === 'object' ? patch : {}),
+    };
+
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.runtime]: next,
+    });
+
+    return next;
   });
-
-  return next;
 }
 
 async function ensureRuntimeState() {
-  const current = await readRuntimeState();
-  const nextPatch = {};
+  return await runRuntimeMutation(async () => {
+    const current = await readRuntimeState();
+    const nextPatch = {};
 
-  if (!current.clientUuid) {
-    nextPatch.clientUuid = createUuid();
-  }
+    if (!current.clientUuid) {
+      nextPatch.clientUuid = createUuid();
+    }
 
-  if (!current.clientLabel) {
-    nextPatch.clientLabel = getPlatformLabel();
-  }
+    if (!current.clientLabel) {
+      nextPatch.clientLabel = getPlatformLabel();
+    }
 
-  if (!current.appVersion) {
-    nextPatch.appVersion = getAppVersion();
-  }
+    if (!current.appVersion) {
+      nextPatch.appVersion = getAppVersion();
+    }
 
-  if (Object.keys(nextPatch).length === 0) {
-    return current;
-  }
+    if (Object.keys(nextPatch).length === 0) {
+      return current;
+    }
 
-  return writeRuntimeState(nextPatch);
+    const next = {
+      ...current,
+      ...nextPatch,
+    };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.runtime]: next,
+    });
+    return next;
+  });
 }
 
 async function openSidePanelForTab(tabId) {
@@ -1410,24 +1454,343 @@ function getContentRelayTimeoutMs(payload = {}) {
   return CONTENT_RELAY_DEFAULT_TIMEOUT_MS;
 }
 
+function normalizeCaptureProgress(progress = null, senderTabId = null) {
+  const source = progress && typeof progress === 'object' ? progress : {};
+  const updatedAt = Date.now();
+  const explicitRunnerTabId = Number(source.runnerTabId);
+  const fallbackTabId = Number(senderTabId);
+  return {
+    ...source,
+    runnerTabId:
+      Number.isFinite(explicitRunnerTabId) && explicitRunnerTabId > 0
+        ? explicitRunnerTabId
+        : Number.isFinite(fallbackTabId) && fallbackTabId > 0
+          ? fallbackTabId
+          : null,
+    updatedAt,
+    heartbeatAt: updatedAt,
+  };
+}
+
+function getCaptureRequestId(payload = {}) {
+  return String(payload?.captureRequestId || '').trim();
+}
+
+function pruneExpiredCaptureRequestAborts(now = Date.now()) {
+  for (const [requestId, abortedAt] of abortedCaptureRequestIds.entries()) {
+    if (now - Number(abortedAt || 0) >= CAPTURE_REQUEST_ABORT_TTL_MS) {
+      abortedCaptureRequestIds.delete(requestId);
+    }
+  }
+}
+
+function markCaptureRequestAborted(requestId) {
+  const normalized = String(requestId || '').trim();
+  if (!normalized) return false;
+  const now = Date.now();
+  pruneExpiredCaptureRequestAborts(now);
+  abortedCaptureRequestIds.set(normalized, now);
+  return true;
+}
+
+function isCaptureRequestAborted(requestId) {
+  const normalized = String(requestId || '').trim();
+  if (!normalized) return false;
+  pruneExpiredCaptureRequestAborts();
+  return abortedCaptureRequestIds.has(normalized);
+}
+
+function pruneExpiredSettledCaptureRequests(now = Date.now()) {
+  for (const [requestId, settledAt] of settledCaptureRequestIds.entries()) {
+    if (now - Number(settledAt || 0) >= CAPTURE_REQUEST_ABORT_TTL_MS) {
+      settledCaptureRequestIds.delete(requestId);
+    }
+  }
+}
+
+function markCaptureRequestSettled(requestId) {
+  const normalized = String(requestId || '').trim();
+  if (!normalized) return;
+  const now = Date.now();
+  pruneExpiredSettledCaptureRequests(now);
+  settledCaptureRequestIds.set(normalized, now);
+}
+
+function isCaptureRequestSettled(requestId) {
+  const normalized = String(requestId || '').trim();
+  if (!normalized) return false;
+  pruneExpiredSettledCaptureRequests();
+  return settledCaptureRequestIds.has(normalized);
+}
+
+function buildCanceledContentResponse(payload = {}, response = null) {
+  const action = String(payload?.action || '');
+  if (action !== 'captureComments') {
+    return null;
+  }
+  const source = response && typeof response === 'object' ? response : {};
+  const sourceData =
+    source.data && typeof source.data === 'object' ? source.data : {};
+  const sourceMeta =
+    source.meta && typeof source.meta === 'object' ? source.meta : {};
+  const finishedAt = new Date().toISOString();
+  return {
+    ...source,
+    ok: true,
+    type: source.type || 'comments',
+    data: {
+      ...sourceData,
+      items: Array.isArray(sourceData.items) ? sourceData.items : [],
+      totalCount: Number.isFinite(Number(sourceData.totalCount))
+        ? Number(sourceData.totalCount)
+        : Array.isArray(sourceData.items)
+          ? sourceData.items.length
+          : 0,
+      captureStatus: 'partial',
+      stoppedByUser: true,
+      stoppedByStall: Boolean(sourceData.stoppedByStall),
+      stopReason: 'canceled',
+    },
+    meta: {
+      ...sourceMeta,
+      captureStatus: 'partial',
+      stoppedByUser: true,
+      stoppedByStall: Boolean(sourceMeta.stoppedByStall),
+      captureFinishedAt: sourceMeta.captureFinishedAt || finishedAt,
+      stopReason: 'canceled',
+    },
+    error: null,
+  };
+}
+
+function resolveAbortedCaptureRequest(payload = {}, response = null) {
+  const canceledResponse = buildCanceledContentResponse(payload, response);
+  if (canceledResponse) {
+    return canceledResponse;
+  }
+  throw createContentRelayWatchdogError(
+    'CAPTURE_CANCELED',
+    '用户已取消当前采集任务',
+  );
+}
+
+function beginContentRelayHeartbeat(payload = {}) {
+  // cancelCapture carries the target request id for request-scoped cancellation,
+  // but it must not replace/delete the heartbeat owned by the in-flight capture.
+  if (String(payload?.action || '') === 'cancelCapture') return '';
+  const requestId = getCaptureRequestId(payload);
+  if (!requestId) return '';
+  const now = Date.now();
+  contentRelayHeartbeatByRequestId.set(requestId, {
+    updatedAt: now,
+    phase: 'request_started',
+  });
+  return requestId;
+}
+
+function markContentRelayHeartbeat(progress = {}) {
+  const requestId = getCaptureRequestId(progress);
+  if (!requestId || !contentRelayHeartbeatByRequestId.has(requestId)) {
+    return;
+  }
+  contentRelayHeartbeatByRequestId.set(requestId, {
+    updatedAt: Number(progress?.updatedAt) || Date.now(),
+    phase: String(progress?.phase || ''),
+  });
+}
+
+function createContentRelayWatchdogError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function writeContentRelayRecoveryProgress(tabId, payload, attempt) {
+  const requestId = getCaptureRequestId(payload);
+  await writeRuntimeState((runtime) => {
+    const previous =
+      requestId && runtime?.lastCaptureProgress?.captureRequestId === requestId
+        ? runtime.lastCaptureProgress
+        : {};
+    const progress = normalizeCaptureProgress(
+      {
+        ...previous,
+        phase: 'capture_recovering',
+        message: `检测到页面卡顿，正在自动恢复当前步骤（第 ${attempt} 次）`,
+        captureRequestId: requestId,
+        recordId: String(payload?.recordId || previous?.recordId || ''),
+        current: Number(payload?.current) || previous?.current || 0,
+        total: Number(payload?.total) || previous?.total || 0,
+        runnerTabId: Number(payload?.runnerTabId) || Number(tabId) || null,
+        recoveryAttempt: attempt,
+        recoveryMaxAttempts: 1,
+        captureAction: String(payload?.action || previous?.captureAction || ''),
+      },
+      tabId,
+    );
+    return {
+      lastActiveTabId: tabId,
+      lastCaptureProgress: progress,
+      lastCaptureProgressAt: progress.updatedAt,
+    };
+  });
+}
+
+async function writeCaptureCancelingProgress(tabId, requestId) {
+  await writeRuntimeState((runtime) => {
+    const previous =
+      requestId && runtime?.lastCaptureProgress?.captureRequestId === requestId
+        ? runtime.lastCaptureProgress
+        : {};
+    const progress = normalizeCaptureProgress(
+      {
+        ...previous,
+        phase: 'capture_canceling',
+        message: '正在取消当前任务并保存可用结果…',
+        captureRequestId: requestId,
+        runnerTabId: Number(previous?.runnerTabId) || Number(tabId) || null,
+      },
+      tabId,
+    );
+    return {
+      lastActiveTabId: tabId,
+      lastCaptureProgress: progress,
+      lastCaptureProgressAt: progress.updatedAt,
+    };
+  });
+}
+
+async function clearStoredCaptureProgress({
+  captureRequestId = '',
+  recordId = '',
+  phase = '',
+  updatedAt = 0,
+} = {}) {
+  const expectedRequestId = String(captureRequestId || '').trim();
+  const expectedRecordId = String(recordId || '').trim();
+  const expectedPhase = String(phase || '').trim();
+  const expectedUpdatedAt = Number(updatedAt) || 0;
+  return await runRuntimeMutation(async () => {
+    const runtime = await readRuntimeState();
+    const current = runtime?.lastCaptureProgress;
+    if (!current || typeof current !== 'object') {
+      return false;
+    }
+
+    if (
+      (expectedRequestId &&
+        String(current.captureRequestId || '').trim() !== expectedRequestId) ||
+      (expectedRecordId &&
+        String(current.recordId || '').trim() !== expectedRecordId) ||
+      (expectedPhase && String(current.phase || '').trim() !== expectedPhase) ||
+      (expectedUpdatedAt && Number(current.updatedAt) !== expectedUpdatedAt)
+    ) {
+      return false;
+    }
+
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.runtime]: {
+        ...runtime,
+        lastCaptureProgress: null,
+        lastCaptureProgressAt: 0,
+      },
+    });
+    return true;
+  });
+}
+
 async function sendContentMessageWithTimeout(tabId, payload, timeoutMs) {
-  let timeoutId = null;
+  const requestId = beginContentRelayHeartbeat(payload);
+  const inactivityTimeoutMs = requestId
+    ? CONTENT_RELAY_INACTIVITY_TIMEOUT_MS
+    : 0;
+  let watchdogId = null;
+  let activeElapsedMs = 0;
+  let lastWatchdogAt = Date.now();
+
   try {
     return await Promise.race([
       chrome.tabs.sendMessage(tabId, payload ?? {}),
       new Promise((_, reject) => {
-        timeoutId = setTimeout(() => {
-          const error = new Error(
-            `页面采集脚本超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应，已跳过当前步骤`,
+        const checkWatchdog = () => {
+          const now = Date.now();
+          const tickGapMs = Math.max(0, now - lastWatchdogAt);
+          const heartbeat = requestId
+            ? contentRelayHeartbeatByRequestId.get(requestId)
+            : null;
+          const heartbeatAgeBeforeTickMs = heartbeat
+            ? now - Number(heartbeat.updatedAt || 0)
+            : Number.POSITIVE_INFINITY;
+          const networkPauseIsAlive =
+            heartbeat?.phase === 'network_paused' &&
+            heartbeatAgeBeforeTickMs <= CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS;
+
+          // 合盖休眠/系统冻结会让定时器整体停摆。唤醒后的大间隔不计入
+          // 采集用时，并给原页面一次恢复心跳的机会，而不是立刻误判超时。
+          if (tickGapMs > CONTENT_RELAY_SUSPEND_GAP_MS) {
+            if (requestId) {
+              contentRelayHeartbeatByRequestId.set(requestId, {
+                updatedAt: now,
+                phase: 'system_resumed',
+              });
+            }
+          } else if (!networkPauseIsAlive) {
+            activeElapsedMs += tickGapMs;
+          }
+          lastWatchdogAt = now;
+
+          const latestHeartbeat = requestId
+            ? contentRelayHeartbeatByRequestId.get(requestId)
+            : null;
+          const heartbeatAgeMs = latestHeartbeat
+            ? now - Number(latestHeartbeat.updatedAt || 0)
+            : 0;
+          const latestNetworkPauseIsAlive =
+            latestHeartbeat?.phase === 'network_paused' &&
+            heartbeatAgeMs <= CONTENT_NETWORK_PAUSE_HEARTBEAT_GRACE_MS;
+
+          if (
+            inactivityTimeoutMs > 0 &&
+            !latestNetworkPauseIsAlive &&
+            heartbeatAgeMs >= inactivityTimeoutMs
+          ) {
+            reject(
+              createContentRelayWatchdogError(
+                'CONTENT_RELAY_STALLED',
+                `页面超过 ${Math.ceil(inactivityTimeoutMs / 1000)} 秒没有采集进度，正在自动恢复当前步骤`,
+              ),
+            );
+            return;
+          }
+
+          if (activeElapsedMs >= timeoutMs) {
+            reject(
+              createContentRelayWatchdogError(
+                'CONTENT_RELAY_TIMEOUT',
+                `页面采集脚本超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应，已停止当前步骤`,
+              ),
+            );
+            return;
+          }
+
+          watchdogId = setTimeout(
+            checkWatchdog,
+            CONTENT_RELAY_WATCHDOG_TICK_MS,
           );
-          error.code = 'CONTENT_RELAY_TIMEOUT';
-          reject(error);
-        }, timeoutMs);
+        };
+
+        watchdogId = setTimeout(
+          checkWatchdog,
+          CONTENT_RELAY_WATCHDOG_TICK_MS,
+        );
       }),
     ]);
   } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
+    if (watchdogId) {
+      clearTimeout(watchdogId);
+    }
+    if (requestId) {
+      contentRelayHeartbeatByRequestId.delete(requestId);
     }
   }
 }
@@ -1458,11 +1821,14 @@ async function waitForContentScriptReady(tabId, {
   throw lastError || new Error('页面采集脚本加载超时，请刷新平台页面后重试');
 }
 
-async function cancelTimedOutContentCapture(tabId) {
+async function cancelTimedOutContentCapture(tabId, captureRequestId = '') {
   try {
     await sendContentMessageWithTimeout(
       tabId,
-      { action: 'cancelCapture' },
+      {
+        action: 'cancelCapture',
+        captureRequestId: String(captureRequestId || '').trim(),
+      },
       5000,
     );
   } catch {
@@ -1470,27 +1836,114 @@ async function cancelTimedOutContentCapture(tabId) {
   }
 }
 
-async function relayToContentWithRetry(tabId, payload) {
-  const timeoutMs = getContentRelayTimeoutMs(payload);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await sendContentMessageWithTimeout(tabId, payload, timeoutMs);
-    } catch (error) {
-      if (error?.code === 'CONTENT_RELAY_TIMEOUT') {
-        await cancelTimedOutContentCapture(tabId);
-        throw error;
-      }
-      if (!isTransientContentRelayError(error) || attempt === 1) {
-        throw error;
-      }
-
-      await waitForTabReady(tabId).catch(() => null);
-      await ensureContentScriptReady(tabId);
-      await waitForContentScriptReady(tabId);
+async function reloadStalledCaptureTab(tabId, { shouldAbort = null } = {}) {
+  if (typeof chrome.tabs.reload === 'function') {
+    await chrome.tabs.reload(tabId);
+  } else {
+    const tab = await chrome.tabs.get(tabId);
+    const url = String(tab?.url || '').trim();
+    if (!url) {
+      throw new Error('无法重新加载卡住的采集页面');
     }
+    await chrome.tabs.update(tabId, {url});
+  }
+  if (typeof shouldAbort === 'function' && shouldAbort()) {
+    return false;
   }
 
-  throw new Error('failed to relay message to content script');
+  // 等待 reload 真正进入 loading，避免立刻读到刷新前的 complete 状态。
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  if (typeof shouldAbort === 'function' && shouldAbort()) {
+    return false;
+  }
+  await waitForTabReady(tabId, {timeoutMs: 30 * 1000});
+  if (typeof shouldAbort === 'function' && shouldAbort()) {
+    return false;
+  }
+  await ensureContentScriptReady(tabId);
+  if (typeof shouldAbort === 'function' && shouldAbort()) {
+    return false;
+  }
+  await waitForContentScriptReady(tabId);
+  return !(typeof shouldAbort === 'function' && shouldAbort());
+}
+
+async function relayToContentWithRetry(tabId, payload) {
+  const timeoutMs = getContentRelayTimeoutMs(payload);
+  const requestId = getCaptureRequestId(payload);
+  if (requestId) {
+    settledCaptureRequestIds.delete(requestId);
+  }
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (requestId && isCaptureRequestAborted(requestId)) {
+        return resolveAbortedCaptureRequest(payload);
+      }
+      try {
+        const response = await sendContentMessageWithTimeout(
+          tabId,
+          payload,
+          timeoutMs,
+        );
+        if (requestId && isCaptureRequestAborted(requestId)) {
+          return resolveAbortedCaptureRequest(payload, response);
+        }
+        return response;
+      } catch (error) {
+        if (
+          error?.code === 'CONTENT_RELAY_TIMEOUT' ||
+          error?.code === 'CONTENT_RELAY_STALLED'
+        ) {
+          await cancelTimedOutContentCapture(tabId, requestId);
+          if (requestId && isCaptureRequestAborted(requestId)) {
+            return resolveAbortedCaptureRequest(payload);
+          }
+          if (error?.code === 'CONTENT_RELAY_STALLED' && attempt === 0) {
+            await writeContentRelayRecoveryProgress(
+              tabId,
+              payload,
+              attempt + 1,
+            ).catch(() => null);
+            if (requestId && isCaptureRequestAborted(requestId)) {
+              return resolveAbortedCaptureRequest(payload);
+            }
+            const reloadCompleted = await reloadStalledCaptureTab(tabId, {
+              shouldAbort: () =>
+                Boolean(requestId && isCaptureRequestAborted(requestId)),
+            });
+            if (
+              !reloadCompleted ||
+              (requestId && isCaptureRequestAborted(requestId))
+            ) {
+              return resolveAbortedCaptureRequest(payload);
+            }
+            continue;
+          }
+          throw error;
+        }
+        if (!isTransientContentRelayError(error) || attempt === 1) {
+          throw error;
+        }
+
+        await waitForTabReady(tabId).catch(() => null);
+        if (requestId && isCaptureRequestAborted(requestId)) {
+          return resolveAbortedCaptureRequest(payload);
+        }
+        await ensureContentScriptReady(tabId);
+        await waitForContentScriptReady(tabId);
+      }
+    }
+
+    throw new Error('failed to relay message to content script');
+  } finally {
+    if (requestId) {
+      abortedCaptureRequestIds.delete(requestId);
+      markCaptureRequestSettled(requestId);
+      await clearStoredCaptureProgress({captureRequestId: requestId}).catch(
+        () => false,
+      );
+    }
+  }
 }
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
@@ -1562,9 +2015,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         if (action === 'captureProgress' || action === 'expandKeywordProgress') {
+          const normalizedProgress = normalizeCaptureProgress(
+            message?.progress,
+            sender?.tab?.id,
+          );
+          if (action === 'captureProgress') {
+            markContentRelayHeartbeat(normalizedProgress);
+          }
           const next = await writeRuntimeState({
             lastActiveTabId: sender?.tab?.id ?? null,
-            lastCaptureProgress: message?.progress ?? null,
+            lastCaptureProgress: normalizedProgress,
+            lastCaptureProgressAt: normalizedProgress.updatedAt,
           });
 
           sendResponse({
@@ -1642,6 +2103,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ok: true,
           data: runtime,
         });
+        return;
+      }
+
+      if (type === 'onstarvoice:update-runtime') {
+        const updates =
+          message?.updates &&
+          typeof message.updates === 'object' &&
+          !Array.isArray(message.updates)
+            ? message.updates
+            : {};
+        const runtime = await writeRuntimeState({
+          ...updates,
+          lastUpdatedAt: Date.now(),
+        });
+        sendResponse({ ok: true, data: runtime });
         return;
       }
 
@@ -1884,14 +2360,87 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:capture-progress') {
+        const incomingProgress =
+          message?.payload && typeof message.payload === 'object'
+            ? message.payload
+            : {};
+        const incomingRequestId = getCaptureRequestId(incomingProgress);
+        const incomingPhase = String(incomingProgress?.phase || '').trim();
+        const isTerminalCommentProgress = new Set([
+          'comments_done',
+          'comments_partial',
+          'comments_failed',
+        ]).has(incomingPhase);
+        if (
+          incomingRequestId &&
+          isCaptureRequestSettled(incomingRequestId) &&
+          !isTerminalCommentProgress
+        ) {
+          sendResponse({ ok: true, data: { ignored: true } });
+          return;
+        }
+        const normalizedProgress = normalizeCaptureProgress(
+          incomingProgress,
+          sender?.tab?.id,
+        );
+        markContentRelayHeartbeat(normalizedProgress);
         const next = await writeRuntimeState({
           lastActiveTabId: sender?.tab?.id ?? null,
-          lastCaptureProgress: message?.payload ?? null,
+          lastCaptureProgress: normalizedProgress,
+          lastCaptureProgressAt: normalizedProgress.updatedAt,
         });
         sendResponse({
           ok: true,
           data: {
             lastCaptureProgress: next.lastCaptureProgress,
+          },
+        });
+        return;
+      }
+
+      if (type === 'onstarvoice:clear-capture-progress') {
+        const cleared = await clearStoredCaptureProgress({
+          captureRequestId: message?.captureRequestId,
+          recordId: message?.recordId,
+          phase: message?.phase,
+          updatedAt: message?.updatedAt,
+        });
+        sendResponse({ ok: true, data: { cleared } });
+        return;
+      }
+
+      if (type === 'onstarvoice:cancel-capture') {
+        const tabId = Number(message?.tabId);
+        const requestId = String(message?.captureRequestId || '').trim();
+        if (!Number.isFinite(tabId) || tabId <= 0) {
+          throw new Error('invalid tabId');
+        }
+        if (requestId && isCaptureRequestSettled(requestId)) {
+          await clearStoredCaptureProgress({
+            captureRequestId: requestId,
+          }).catch(() => false);
+          sendResponse({
+            ok: true,
+            data: {
+              captureRequestId: requestId,
+              runnerTabId: tabId,
+              canceled: false,
+              alreadySettled: true,
+            },
+          });
+          return;
+        }
+        if (requestId) {
+          markCaptureRequestAborted(requestId);
+          await writeCaptureCancelingProgress(tabId, requestId).catch(() => null);
+        }
+        await cancelTimedOutContentCapture(tabId, requestId);
+        sendResponse({
+          ok: true,
+          data: {
+            captureRequestId: requestId,
+            runnerTabId: tabId,
+            canceled: true,
           },
         });
         return;
@@ -1923,7 +2472,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({
         ok: false,
         error: {
-          code: 'runtime_error',
+          code: String(error?.code || 'runtime_error'),
           message: error instanceof Error ? error.message : 'unknown runtime error',
         },
       });

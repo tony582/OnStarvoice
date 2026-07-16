@@ -116,10 +116,12 @@ export const MESSAGE_TYPE = {
   // 运行时信息
   GET_CLIENT_ENV: "onstarvoice:get-client-env",
   GET_EXTENSION_STATE: "onstarvoice:get-extension-state",
+  UPDATE_RUNTIME: "onstarvoice:update-runtime",
 
   // 内容脚本通信
   RELAY_TO_CONTENT: "onstarvoice:relay-to-content",
   CAPTURE_PROGRESS: "onstarvoice:capture-progress",
+  CLEAR_CAPTURE_PROGRESS: "onstarvoice:clear-capture-progress",
 
   // 采集指令
   CAPTURE_SINGLE_NOTE: "onstarvoice:capture-single-note",

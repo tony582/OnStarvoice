@@ -24,8 +24,12 @@ function createEvent() {
 function createHarness() {
   const storage = {};
   const sentTabMessages = [];
+  const reloadedTabIds = [];
   let uuidCounter = 0;
   let contextMode = "alive";
+  let tabMessageHandler = null;
+  let reloadHook = null;
+  let nextRuntimeSetError = null;
   const unrefSetTimeout = (handler, delay, ...args) => {
     const timer = setTimeout(handler, delay, ...args);
     timer.unref?.();
@@ -55,6 +59,14 @@ function createHarness() {
       return {...storage};
     },
     async set(values) {
+      if (
+        nextRuntimeSetError &&
+        Object.hasOwn(values, "onstarvoice.runtime")
+      ) {
+        const error = nextRuntimeSetError;
+        nextRuntimeSetError = null;
+        throw error;
+      }
       Object.assign(storage, values);
     },
     async remove(keys) {
@@ -99,16 +111,29 @@ function createHarness() {
       onUpdated: createEvent(),
       async sendMessage(tabId, payload) {
         sentTabMessages.push({tabId, payload});
+        if (typeof tabMessageHandler === "function") {
+          return await tabMessageHandler(tabId, payload);
+        }
         return {ok: true};
       },
       async get(tabId) {
-        return {id: tabId};
+        return {
+          id: tabId,
+          status: "complete",
+          url: "https://www.xiaohongshu.com/explore/test-note",
+        };
       },
       async query() {
         return [];
       },
       async update(tabId, patch) {
         return {id: tabId, ...patch};
+      },
+      async reload(tabId) {
+        reloadedTabIds.push(tabId);
+        if (typeof reloadHook === "function") {
+          await reloadHook(tabId);
+        }
       },
       async create(options) {
         return {id: 99, ...options};
@@ -158,9 +183,16 @@ function createHarness() {
       `  readActiveCaptureExecutionLock,\n` +
       `  releaseCaptureExecutionLock,\n` +
       `  renewCaptureExecutionLock,\n` +
+      `  normalizeCaptureProgress,\n` +
+      `  writeRuntimeState,\n` +
+      `  clearStoredCaptureProgress,\n` +
+      `  markCaptureRequestAborted,\n` +
+      `  isCaptureRequestAborted,\n` +
+      `  relayToContentWithRetry,\n` +
       `  handleUnattendedKeywordAlarm,\n` +
       `  releaseUnattendedKeywordPlanLock,\n` +
       `  flush: () => captureExecutionLockOperationQueue,\n` +
+      `  flushRuntime: () => runtimeMutationQueue,\n` +
       `};`,
     context,
     {filename: "background.js"},
@@ -169,15 +201,478 @@ function createHarness() {
   return {
     api: context.__captureLockTestApi,
     chrome,
+    reloadedTabIds,
     sentTabMessages,
+    failNextRuntimeSet(error = new Error("runtime set failed")) {
+      nextRuntimeSetError = error;
+    },
+    sendBackgroundMessage(message, sender = {}) {
+      const listener = runtime.onMessage.listeners[0];
+      if (typeof listener !== "function") {
+        return Promise.reject(new Error("background message listener missing"));
+      }
+      return new Promise((resolve) => {
+        let responded = false;
+        const keepChannelOpen = listener(
+          message,
+          sender,
+          (response) => {
+            responded = true;
+            resolve(response);
+          },
+        );
+        if (keepChannelOpen !== true && !responded) {
+          resolve(undefined);
+        }
+      });
+    },
     setContextMode(mode) {
       contextMode = mode;
+    },
+    setReloadHook(handler) {
+      reloadHook = handler;
+    },
+    setTabMessageHandler(handler) {
+      tabMessageHandler = handler;
     },
     storage,
   };
 }
 
 const LOCK_KEY = "onstarvoice.captureExecutionLock";
+
+test("capture progress is persisted with heartbeat and runner metadata", () => {
+  const harness = createHarness();
+  const before = Date.now();
+  const progress = harness.api.normalizeCaptureProgress(
+    {
+      phase: "comments_collecting",
+      captureRequestId: "capture-1",
+      recordId: "record-1",
+    },
+    22,
+  );
+
+  assert.equal(progress.captureRequestId, "capture-1");
+  assert.equal(progress.recordId, "record-1");
+  assert.equal(progress.runnerTabId, 22);
+  assert.ok(progress.updatedAt >= before);
+  assert.equal(progress.heartbeatAt, progress.updatedAt);
+});
+
+test("concurrent progress and page-state messages preserve both runtime patches", async () => {
+  const harness = createHarness();
+  const sender = {
+    tab: {
+      id: 22,
+      url: "https://www.xiaohongshu.com/explore/test-note",
+    },
+  };
+
+  const [progressResponse, pageResponse] = await Promise.all([
+    harness.sendBackgroundMessage(
+      {
+        action: "captureProgress",
+        progress: {
+          phase: "comments_collecting",
+          captureRequestId: "request-concurrent",
+          recordId: "record-concurrent",
+        },
+      },
+      sender,
+    ),
+    harness.sendBackgroundMessage(
+      {
+        action: "pageStateChanged",
+        url: sender.tab.url,
+        platform: "xiaohongshu",
+        pageType: "note_detail",
+        detailReady: true,
+        detailReadyReason: "ready",
+        detailReadyCheckedAt: 4567,
+      },
+      sender,
+    ),
+  ]);
+
+  assert.equal(progressResponse.ok, true);
+  assert.equal(pageResponse.ok, true);
+  const runtime = harness.storage["onstarvoice.runtime"];
+  assert.equal(runtime.lastCaptureProgress.captureRequestId, "request-concurrent");
+  assert.equal(runtime.lastCaptureProgress.recordId, "record-concurrent");
+  assert.equal(runtime.lastPageUrl, sender.tab.url);
+  assert.equal(runtime.platform, "xiaohongshu");
+  assert.equal(runtime.pageType, "note_detail");
+  assert.equal(runtime.detailReady, true);
+});
+
+test("a stale clear queued after progress B cannot erase progress B", async () => {
+  const harness = createHarness();
+  const runtimeKey = "onstarvoice.runtime";
+  harness.storage[runtimeKey] = {
+    lastCaptureProgress: {
+      phase: "comments_partial",
+      captureRequestId: "request-a",
+      recordId: "record-a",
+      updatedAt: 1000,
+    },
+    lastCaptureProgressAt: 1000,
+  };
+
+  const progressB = {
+    phase: "comments_collecting",
+    captureRequestId: "request-b",
+    recordId: "record-b",
+    updatedAt: 2000,
+  };
+  const [, cleared] = await Promise.all([
+    harness.api.writeRuntimeState({
+      lastCaptureProgress: progressB,
+      lastCaptureProgressAt: progressB.updatedAt,
+    }),
+    harness.api.clearStoredCaptureProgress({captureRequestId: "request-a"}),
+  ]);
+
+  assert.equal(cleared, false);
+  assert.equal(
+    harness.storage[runtimeKey].lastCaptureProgress.captureRequestId,
+    "request-b",
+  );
+  assert.equal(harness.storage[runtimeKey].lastCaptureProgressAt, 2000);
+});
+
+test("runtime mutation queue continues after a rejected storage write", async () => {
+  const harness = createHarness();
+  const runtimeKey = "onstarvoice.runtime";
+  harness.failNextRuntimeSet(new Error("injected runtime write failure"));
+
+  await assert.rejects(
+    harness.api.writeRuntimeState({platform: "douyin"}),
+    /injected runtime write failure/,
+  );
+  await harness.api.writeRuntimeState({pageType: "search_results"});
+  await harness.api.flushRuntime();
+
+  assert.equal(harness.storage[runtimeKey].platform, "unknown");
+  assert.equal(harness.storage[runtimeKey].pageType, "search_results");
+});
+
+test("delegated runtime updates use the background mutation writer", async () => {
+  const harness = createHarness();
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-runtime",
+    updates: {
+      lastActiveTabId: 88,
+      platform: "weibo",
+      pageType: "search_results",
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.lastActiveTabId, 88);
+  assert.equal(response.data.platform, "weibo");
+  assert.equal(response.data.pageType, "search_results");
+  assert.ok(Number(response.data.lastUpdatedAt) > 0);
+});
+
+test("storage updateRuntime delegates in extensions and only falls back without an extension id", async () => {
+  const originalChrome = globalThis.chrome;
+  const runtimeKey = "onstarvoice.runtime";
+  const delegatedMessages = [];
+  let directWrites = 0;
+
+  try {
+    globalThis.chrome = {
+      runtime: {
+        id: "runtime-writer-test",
+        async sendMessage(message) {
+          delegatedMessages.push(message);
+          return {ok: true, data: {platform: message.updates.platform}};
+        },
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {
+            directWrites += 1;
+          },
+        },
+      },
+    };
+    const storageApi = await import(
+      new URL("../utils/storage.js?runtime-mutation-test", import.meta.url)
+    );
+
+    assert.equal(await storageApi.updateRuntime({platform: "douyin"}), true);
+    assert.equal(delegatedMessages.length, 1);
+    assert.equal(
+      delegatedMessages[0].type,
+      "onstarvoice:update-runtime",
+    );
+    assert.equal(delegatedMessages[0].updates.platform, "douyin");
+    assert.equal(directWrites, 0);
+
+    globalThis.chrome = {
+      runtime: {
+        id: "runtime-writer-test",
+        async sendMessage() {
+          throw new Error(
+            "Could not establish connection. Receiving end does not exist.",
+          );
+        },
+      },
+      storage: {
+        local: {
+          async get() {
+            return {};
+          },
+          async set() {
+            directWrites += 1;
+          },
+        },
+      },
+    };
+
+    const originalConsoleError = console.error;
+    const delegatedErrors = [];
+    console.error = (...args) => delegatedErrors.push(args);
+    try {
+      assert.equal(await storageApi.updateRuntime({platform: "weibo"}), false);
+    } finally {
+      console.error = originalConsoleError;
+    }
+    assert.equal(delegatedErrors.length, 1);
+    assert.equal(directWrites, 0);
+
+    const fallbackStorage = {
+      [runtimeKey]: {
+        platform: "xiaohongshu",
+        lastCaptureProgress: {captureRequestId: "preserve-me"},
+      },
+    };
+    globalThis.chrome = {
+      runtime: {
+        async sendMessage() {
+          throw new Error(
+            "Could not establish connection. Receiving end does not exist.",
+          );
+        },
+      },
+      storage: {
+        local: {
+          async get(key) {
+            return Object.hasOwn(fallbackStorage, key)
+              ? {[key]: fallbackStorage[key]}
+              : {};
+          },
+          async set(values) {
+            Object.assign(fallbackStorage, values);
+          },
+        },
+      },
+    };
+
+    assert.equal(
+      await storageApi.updateRuntime({pageType: "note_detail"}),
+      true,
+    );
+    assert.equal(fallbackStorage[runtimeKey].platform, "xiaohongshu");
+    assert.equal(fallbackStorage[runtimeKey].pageType, "note_detail");
+    assert.equal(
+      fallbackStorage[runtimeKey].lastCaptureProgress.captureRequestId,
+      "preserve-me",
+    );
+  } finally {
+    if (originalChrome === undefined) {
+      delete globalThis.chrome;
+    } else {
+      globalThis.chrome = originalChrome;
+    }
+  }
+});
+
+test("capture progress clears only when the dismissed identity still matches", async () => {
+  const harness = createHarness();
+  const runtimeKey = "onstarvoice.runtime";
+  harness.storage[runtimeKey] = {
+    lastCaptureProgress: {
+      phase: "comments_partial",
+      recordId: "record-clear",
+      captureRequestId: "request-clear",
+      updatedAt: 1234,
+    },
+    lastCaptureProgressAt: 1234,
+  };
+
+  const staleClear = await harness.api.clearStoredCaptureProgress({
+    phase: "comments_partial",
+    recordId: "record-clear",
+    captureRequestId: "request-clear",
+    updatedAt: 999,
+  });
+  assert.equal(staleClear, false);
+  assert.equal(
+    harness.storage[runtimeKey].lastCaptureProgress.captureRequestId,
+    "request-clear",
+  );
+
+  const matchedClear = await harness.api.clearStoredCaptureProgress({
+    phase: "comments_partial",
+    recordId: "record-clear",
+    captureRequestId: "request-clear",
+    updatedAt: 1234,
+  });
+  assert.equal(matchedClear, true);
+  assert.equal(harness.storage[runtimeKey].lastCaptureProgress, null);
+  assert.equal(harness.storage[runtimeKey].lastCaptureProgressAt, 0);
+});
+
+test("a settled relay clears recovery progress for the same request", async () => {
+  const harness = createHarness();
+  const runtimeKey = "onstarvoice.runtime";
+  harness.storage[runtimeKey] = {
+    lastCaptureProgress: {
+      phase: "capture_recovering",
+      captureRequestId: "request-settled",
+      updatedAt: 2000,
+    },
+    lastCaptureProgressAt: 2000,
+  };
+
+  await harness.api.relayToContentWithRetry(22, {
+    action: "captureKeywordNotes",
+    captureRequestId: "request-settled",
+  });
+
+  assert.equal(harness.storage[runtimeKey].lastCaptureProgress, null);
+});
+
+test("an aborted comment request returns a retryable partial without starting content", async () => {
+  const harness = createHarness();
+  harness.api.markCaptureRequestAborted("comments-aborted-before-start");
+
+  const response = await harness.api.relayToContentWithRetry(22, {
+    action: "captureComments",
+    captureRequestId: "comments-aborted-before-start",
+    recordId: "record-1",
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.captureStatus, "partial");
+  assert.equal(response.data.stoppedByUser, true);
+  assert.equal(response.meta.stoppedByUser, true);
+  assert.equal(response.data.stopReason, "canceled");
+  assert.equal(response.data.items.length, 0);
+  assert.equal(harness.sentTabMessages.length, 0);
+});
+
+test("an aborted non-comment request fails closed instead of returning capture data", async () => {
+  const harness = createHarness();
+  harness.api.markCaptureRequestAborted("keyword-aborted-before-start");
+
+  await assert.rejects(
+    harness.api.relayToContentWithRetry(22, {
+      action: "captureKeywordNotes",
+      captureRequestId: "keyword-aborted-before-start",
+    }),
+    (error) => {
+      assert.equal(error.code, "CAPTURE_CANCELED");
+      return true;
+    },
+  );
+  assert.equal(harness.sentTabMessages.length, 0);
+});
+
+test("an in-flight aborted non-comment response cannot escape as success", async () => {
+  const harness = createHarness();
+  const requestId = "keyword-aborted-after-start";
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload.action === "captureKeywordNotes") {
+      harness.api.markCaptureRequestAborted(requestId);
+      return {ok: true, data: {items: [{id: "must-not-escape"}]}};
+    }
+    return {ok: true};
+  });
+
+  await assert.rejects(
+    harness.api.relayToContentWithRetry(22, {
+      action: "captureKeywordNotes",
+      captureRequestId: requestId,
+    }),
+    (error) => {
+      assert.equal(error.code, "CAPTURE_CANCELED");
+      return true;
+    },
+  );
+});
+
+test("cancel during stalled-tab reload fences the second comments attempt", async () => {
+  const harness = createHarness();
+  const requestId = "comments-canceled-during-reload";
+  let captureAttempts = 0;
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload.action === "captureComments") {
+      captureAttempts += 1;
+      const error = new Error("stalled");
+      error.code = "CONTENT_RELAY_STALLED";
+      throw error;
+    }
+    return {ok: true};
+  });
+  harness.setReloadHook(() => {
+    harness.api.markCaptureRequestAborted(requestId);
+  });
+
+  const response = await harness.api.relayToContentWithRetry(33, {
+    action: "captureComments",
+    captureRequestId: requestId,
+    recordId: "record-reload",
+  });
+
+  assert.equal(captureAttempts, 1);
+  assert.deepEqual(harness.reloadedTabIds, [33]);
+  assert.equal(response.data.captureStatus, "partial");
+  assert.equal(response.data.stoppedByUser, true);
+  const cancelMessage = harness.sentTabMessages.find(
+    ({payload}) => payload.action === "cancelCapture",
+  );
+  assert.equal(cancelMessage.payload.captureRequestId, requestId);
+});
+
+test("comment cancellation preserves returned items and forces stoppedByUser", async () => {
+  const harness = createHarness();
+  const requestId = "comments-canceled-with-items";
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload.action === "captureComments") {
+      harness.api.markCaptureRequestAborted(requestId);
+      return {
+        ok: true,
+        type: "comments",
+        data: {
+          items: [{id: "comment-1", content: "保留我"}],
+          totalCount: 1,
+          captureStatus: "partial",
+          stoppedByUser: false,
+        },
+        meta: {captureStatus: "partial", stoppedByUser: false},
+      };
+    }
+    return {ok: true};
+  });
+
+  const response = await harness.api.relayToContentWithRetry(44, {
+    action: "captureComments",
+    captureRequestId: requestId,
+  });
+
+  assert.equal(response.data.items.length, 1);
+  assert.equal(response.data.items[0].id, "comment-1");
+  assert.equal(response.data.stoppedByUser, true);
+  assert.equal(response.meta.stoppedByUser, true);
+  assert.equal(response.data.stopReason, "canceled");
+});
 
 test("concurrent acquisition grants exactly one lock", async () => {
   const harness = createHarness();

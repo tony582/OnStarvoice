@@ -16,6 +16,15 @@ import { DEFAULT_CONFIG } from './constants.js';
 
 let cancelFlag = false;
 
+const SMOOTH_SCROLL_FALLBACK_MIN_MS = 1500;
+const SMOOTH_SCROLL_FALLBACK_PADDING_MS = 1000;
+const CAPTURE_STEP_TIMEOUT_MS = 30 * 1000;
+const NETWORK_HEARTBEAT_INTERVAL_MS = 5000;
+const CAPTURE_SUSPEND_GAP_MS = 15 * 1000;
+// MV3 后台消息通道不适合无限等待。短断网自动续，长断网主动收口为
+// partial/failed，交给持久化的 ↻ 入口继续，避免再次出现 Forever。
+const NETWORK_PAUSE_MAX_MS = 2 * 60 * 1000;
+
 /**
  * 设置取消标志
  */
@@ -46,20 +55,57 @@ export function resetCancelFlag() {
  * @returns {Promise<void>}
  */
 export async function smoothScrollTo(targetY, duration = 500) {
+  const normalizedTargetY = Number.isFinite(Number(targetY))
+    ? Number(targetY)
+    : Number(window.scrollY) || 0;
+  const normalizedDuration = Math.max(0, Number(duration) || 0);
+
+  // requestAnimationFrame 会在后台标签页、合盖休眠或页面冻结时暂停。
+  // 隐藏页直接落点，避免采集 Promise 永远等不到下一帧。
+  if (normalizedDuration <= 0 || document.hidden) {
+    window.scrollTo(0, normalizedTargetY);
+    return;
+  }
+
   return new Promise((resolve) => {
-    const startY = window.scrollY;
-    const distance = targetY - startY;
+    const startY = Number(window.scrollY) || 0;
+    const distance = normalizedTargetY - startY;
     const startTime = Date.now();
+    let frameId = null;
+    let fallbackTimer = null;
+    let settled = false;
+
+    const finish = ({snapToTarget = true} = {}) => {
+      if (settled) return;
+      settled = true;
+      if (frameId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(frameId);
+      }
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+      }
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (snapToTarget) {
+        window.scrollTo(0, normalizedTargetY);
+      }
+      resolve();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        finish();
+      }
+    };
 
     function scroll() {
       if (isCanceled()) {
-        resolve();
+        finish({snapToTarget: false});
         return;
       }
 
       const currentTime = Date.now();
       const elapsed = currentTime - startTime;
-      const progress = Math.min(elapsed / duration, 1);
+      const progress = Math.min(elapsed / normalizedDuration, 1);
 
       // 缓动函数（easeInOutQuad）
       const easeProgress =
@@ -70,13 +116,26 @@ export async function smoothScrollTo(targetY, duration = 500) {
       window.scrollTo(0, startY + distance * easeProgress);
 
       if (progress < 1) {
-        requestAnimationFrame(scroll);
+        frameId = requestAnimationFrame(scroll);
       } else {
-        resolve();
+        finish();
       }
     }
 
-    requestAnimationFrame(scroll);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    fallbackTimer = setTimeout(
+      finish,
+      Math.max(
+        SMOOTH_SCROLL_FALLBACK_MIN_MS,
+        normalizedDuration + SMOOTH_SCROLL_FALLBACK_PADDING_MS,
+      ),
+    );
+
+    try {
+      frameId = requestAnimationFrame(scroll);
+    } catch {
+      finish();
+    }
   });
 }
 
@@ -127,25 +186,103 @@ export async function randomScroll(
  * @returns {Promise<void>}
  */
 export async function wait(ms) {
+  const delay = Math.max(0, Number(ms) || 0);
+  if (delay <= 0 || isCanceled()) return;
+
   return new Promise((resolve) => {
-    const checkInterval = 100; // 每100ms检查一次取消标志
-    let elapsed = 0;
+    const deadline = Date.now() + delay;
+    let timer = null;
 
-    const timer = setInterval(() => {
-      elapsed += checkInterval;
+    const finish = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      resolve();
+    };
 
-      if (isCanceled()) {
-        clearInterval(timer);
-        resolve();
+    const check = () => {
+      if (isCanceled() || Date.now() >= deadline) {
+        finish();
         return;
       }
+      timer = setTimeout(check, Math.min(100, Math.max(1, deadline - Date.now())));
+    };
 
-      if (elapsed >= ms) {
-        clearInterval(timer);
-        resolve();
-      }
-    }, checkInterval);
+    timer = setTimeout(check, Math.min(100, delay));
   });
+}
+
+function isOffline() {
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
+
+async function waitForNetworkRecovery(onProgress) {
+  if (!isOffline()) {
+    return {pausedDurationMs: 0, timedOut: false};
+  }
+
+  const offlineStartedAt = Date.now();
+  while (isOffline() && !isCanceled()) {
+    const offlineElapsedMs = Math.max(0, Date.now() - offlineStartedAt);
+    if (offlineElapsedMs >= NETWORK_PAUSE_MAX_MS) {
+      if (onProgress) {
+        onProgress({
+          phase: 'network_timeout',
+          message: '网络中断超过 2 分钟，已停止当前步骤；恢复联网后可点击 ↻ 继续',
+          offlineSince: offlineStartedAt,
+          offlineElapsedMs,
+        });
+      }
+      return {pausedDurationMs: offlineElapsedMs, timedOut: true};
+    }
+    if (onProgress) {
+      onProgress({
+        phase: 'network_paused',
+        message: '网络已断开，采集已暂停；恢复联网后会自动继续当前项',
+        offlineSince: offlineStartedAt,
+        offlineElapsedMs: Date.now() - offlineStartedAt,
+      });
+    }
+    await wait(NETWORK_HEARTBEAT_INTERVAL_MS);
+  }
+
+  if (!isCanceled() && onProgress) {
+    onProgress({
+      phase: 'network_resumed',
+      message: '网络已恢复，正在继续当前项',
+      offlineSince: offlineStartedAt,
+      offlineElapsedMs: Date.now() - offlineStartedAt,
+    });
+  }
+  return {
+    pausedDurationMs: Math.max(0, Date.now() - offlineStartedAt),
+    timedOut: false,
+  };
+}
+
+function createCaptureStepTimeoutError(timeoutMs) {
+  const error = new Error(`页面滚动步骤超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应`);
+  error.code = 'CAPTURE_STEP_TIMEOUT';
+  return error;
+}
+
+async function runCaptureStepWithTimeout(step, timeoutMs = CAPTURE_STEP_TIMEOUT_MS) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(step),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(createCaptureStepTimeoutError(timeoutMs)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
@@ -265,12 +402,39 @@ export async function autoScrollLoad({
   waitMaxMs = DEFAULT_CONFIG.SCROLL_DELAY_MAX,
   scrollStep = null,
   stopWhen = null,
+  stepTimeoutMs = CAPTURE_STEP_TIMEOUT_MS,
+  resetCancelOnStart = true,
 } = {}) {
   let scrollCount = 0;
   let noNewContentCount = 0;
   let previousContentCount = 0;
   let stopReason = '';
   const startedAt = Date.now();
+  let pausedDurationMs = 0;
+  let lastActiveCheckpointAt = startedAt;
+  const getActiveElapsedMs = () =>
+    Math.max(0, Date.now() - startedAt - pausedDurationMs);
+  const checkpointActiveClock = ({skipGapAccounting = false} = {}) => {
+    const now = Date.now();
+    const gapMs = Math.max(0, now - lastActiveCheckpointAt);
+    lastActiveCheckpointAt = now;
+    if (skipGapAccounting || gapMs <= CAPTURE_SUSPEND_GAP_MS) {
+      return 0;
+    }
+    // 正常单步都有独立的 30 秒超时；超过阈值的整段定时器冻结主要来自
+    // 合盖、系统休眠或浏览器冻结，不应吞掉用户配置的有效采集时长。
+    pausedDurationMs += gapMs;
+    noNewContentCount = 0;
+    if (onProgress) {
+      onProgress({
+        phase: 'system_resumed',
+        message: '检测到电脑休眠或页面冻结，正在恢复当前采集步骤',
+        suspendedDurationMs: gapMs,
+        elapsedMs: getActiveElapsedMs(),
+      });
+    }
+    return gapMs;
+  };
   const hasFixedNoNewThreshold =
     Number.isFinite(Number(noNewContentThreshold)) &&
     Number(noNewContentThreshold) > 0;
@@ -290,7 +454,7 @@ export async function autoScrollLoad({
         scrollCount,
         currentContentCount,
         noNewContentCount,
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: getActiveElapsedMs(),
       });
     } catch (error) {
       console.warn('[Scroll] stopWhen callback failed:', error);
@@ -307,16 +471,31 @@ export async function autoScrollLoad({
         phase: stopReason,
         message: stopResult.message || '满足停止条件，结束采集',
         currentContentCount,
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: getActiveElapsedMs(),
       });
     }
     return true;
   };
 
-  // 重置取消标志
-  resetCancelFlag();
+  // 大多数独立滚动任务由这里初始化取消状态；评论采集在进入本函数前还有
+  // DOM 初始化阶段，必须保留用户在那段时间发出的停止信号。
+  if (resetCancelOnStart) {
+    resetCancelFlag();
+  }
 
   while (scrollCount < maxScrollTimes && !isCanceled()) {
+    checkpointActiveClock();
+    const beforeScrollNetworkPause = await waitForNetworkRecovery(onProgress);
+    pausedDurationMs += beforeScrollNetworkPause.pausedDurationMs;
+    checkpointActiveClock({skipGapAccounting: true});
+    if (beforeScrollNetworkPause.timedOut) {
+      stopReason = 'network_timeout';
+      break;
+    }
+    if (isCanceled()) {
+      break;
+    }
+
     scrollCount++;
 
     // 报告进度
@@ -335,6 +514,7 @@ export async function autoScrollLoad({
     if (detectNewContent) {
       try {
         currentContentCount = await detectNewContent();
+        checkpointActiveClock();
       } catch (error) {
         console.error('[Scroll] Detect content failed:', error);
       }
@@ -381,14 +561,14 @@ export async function autoScrollLoad({
       }
     }
 
-    if (maxDurationMs > 0 && Date.now() - startedAt >= maxDurationMs) {
+    if (maxDurationMs > 0 && getActiveElapsedMs() >= maxDurationMs) {
       stopReason = 'max_duration';
       if (onProgress) {
         onProgress({
           scrollCount,
           phase: 'max_duration',
           message: '达到最大采集时长，停止采集',
-          elapsedMs: Date.now() - startedAt,
+          elapsedMs: getActiveElapsedMs(),
         });
       }
       break;
@@ -405,20 +585,46 @@ export async function autoScrollLoad({
     }
 
     // 随机滚动（可由调用方覆盖）
-    if (typeof scrollStep === 'function') {
-      await scrollStep({
-        scrollCount,
-        currentContentCount,
-        noNewContentCount,
-        elapsedMs: Date.now() - startedAt,
-      });
-    } else {
-      await randomScroll();
+    try {
+      if (typeof scrollStep === 'function') {
+        await runCaptureStepWithTimeout(
+          () =>
+            scrollStep({
+              scrollCount,
+              currentContentCount,
+              noNewContentCount,
+              elapsedMs: getActiveElapsedMs(),
+            }),
+          Math.max(1000, Number(stepTimeoutMs) || CAPTURE_STEP_TIMEOUT_MS),
+        );
+      } else {
+        await runCaptureStepWithTimeout(
+          () => randomScroll(),
+          Math.max(1000, Number(stepTimeoutMs) || CAPTURE_STEP_TIMEOUT_MS),
+        );
+      }
+      checkpointActiveClock();
+    } catch (error) {
+      if (error?.code !== 'CAPTURE_STEP_TIMEOUT') {
+        throw error;
+      }
+      stopReason = 'step_timeout';
+      if (onProgress) {
+        onProgress({
+          scrollCount,
+          phase: 'capture_stalled',
+          message: '检测到页面滚动卡住，已停止旧步骤并保留当前采集结果',
+          currentContentCount,
+          elapsedMs: getActiveElapsedMs(),
+        });
+      }
+      break;
     }
 
     if (detectNewContent) {
       try {
         currentContentCount = await detectNewContent();
+        checkpointActiveClock();
         if (currentContentCount > previousContentCount) {
           noNewContentCount = 0;
           previousContentCount = currentContentCount;
@@ -439,6 +645,17 @@ export async function autoScrollLoad({
     }
 
     // 随机等待（模拟人类行为）
+    const beforeWaitNetworkPause = await waitForNetworkRecovery(onProgress);
+    pausedDurationMs += beforeWaitNetworkPause.pausedDurationMs;
+    checkpointActiveClock({skipGapAccounting: true});
+    if (beforeWaitNetworkPause.timedOut) {
+      stopReason = 'network_timeout';
+      break;
+    }
+    if (isCanceled()) {
+      break;
+    }
+
     const plannedWaitMs = Math.floor(
       Math.random() * (Math.max(waitMinMs, waitMaxMs) - Math.min(waitMinMs, waitMaxMs) + 1)
     ) + Math.min(waitMinMs, waitMaxMs);
@@ -452,6 +669,7 @@ export async function autoScrollLoad({
     }
 
     await wait(plannedWaitMs);
+    checkpointActiveClock();
 
     // 检查是否被取消
     if (isCanceled()) {
@@ -495,7 +713,11 @@ export async function autoScrollLoad({
       (hasFixedNoNewThreshold && noNewContentCount >= noNewContentThreshold
         ? 'no_new'
         : ''),
-    elapsedMs: Date.now() - startedAt,
+    elapsedMs: getActiveElapsedMs(),
+    pausedDurationMs,
+    stalled:
+      stopReason === 'step_timeout' || stopReason === 'network_timeout',
+    networkTimedOut: stopReason === 'network_timeout',
   };
 }
 

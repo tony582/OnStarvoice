@@ -30,6 +30,7 @@ import {
   resolveRecordPlatform,
 } from "./platform-registry.js";
 import {detectPlatformFromUrl} from "../utils/platform/page-routing.js";
+import {resolveCommentCaptureStatusView} from "../utils/capture-recovery-ui.js";
 import {buildXiaohongshuCardData} from "./renderers/xiaohongshu.js";
 import {buildDouyinCardData} from "./renderers/douyin.js";
 import {buildWeiboCardData} from "./renderers/weibo.js";
@@ -2806,11 +2807,19 @@ function buildRecordStatusRows(record) {
     .map((statusRow) => {
       const mainText = statusRow?.text || "";
       const mainTextClass = statusRow?.textClass || "";
+      const detail = String(statusRow?.detail || "").trim();
       const actions = statusRow?.actions || "";
 
       return `
         <div class="comment-status-row">
-          <div class="comment-status-text ${mainTextClass}">${escapeHtml(mainText)}</div>
+          <div class="comment-status-copy">
+            <div class="comment-status-title ${mainTextClass}">${escapeHtml(mainText)}</div>
+            ${
+              detail
+                ? `<div class="comment-status-detail">${escapeHtml(detail)}</div>`
+                : ""
+            }
+          </div>
           <div class="comment-status-actions">${actions}</div>
         </div>
       `;
@@ -2834,8 +2843,7 @@ function resolveCommentStatusRow(record) {
 
   const payload = effectivePayload;
   const status = String(payload.commentsCaptureStatus || "not_started");
-  const total = Number(payload.commentsTotalCaptured || 0);
-  const errorText = String(payload.commentsCaptureError || "").trim();
+  const commentView = resolveCommentCaptureStatusView(payload);
   const leadsEnabled = Boolean(payload.commentLeadsEnabled);
   const leadsItems = Array.isArray(payload.commentLeadsItems)
     ? payload.commentLeadsItems
@@ -2852,42 +2860,35 @@ function resolveCommentStatusRow(record) {
     leadsTotal !== null ||
     Boolean(leadsSyncStatus);
 
-  let text = "评论未采集";
-  let textClass = "";
+  let text = commentView.title;
+  let detail = commentView.detail;
+  let textClass =
+    status === "capturing"
+      ? "is-capturing"
+      : status === "done"
+        ? "is-done"
+        : status === "partial"
+          ? "is-partial"
+          : status === "failed"
+            ? "is-failed"
+            : "";
   let actions = "";
 
-  if (status === "capturing") {
-    text = `评论采集中（${total}条）`;
-    textClass = "is-capturing";
+  if (commentView.action === "cancel") {
     actions = `
       <button
-        class="icon-btn is-stop btn-stop-comments"
+        class="comment-status-action is-stop btn-stop-comments"
         type="button"
-        title="停止评论采集"
-        data-id="${escapeHtml(record.id)}">■</button>
+        title="停止当前评论采集并保留已保存结果"
+        data-id="${escapeHtml(record.id)}">${escapeHtml(commentView.actionLabel)}</button>
     `;
-  } else if (status === "done") {
-    text = `评论已合并（${total}条）`;
-    textClass = "is-done";
-  } else if (status === "partial") {
-    text = `已手动停止（${total}条）`;
-    textClass = "is-partial";
+  } else if (commentView.action === "retry") {
     actions = `
       <button
-        class="icon-btn is-retry btn-retry-comments"
+        class="comment-status-action is-retry btn-retry-comments"
         type="button"
-        title="仅重试评论采集"
-        data-id="${escapeHtml(record.id)}">↻</button>
-    `;
-  } else if (status === "failed") {
-    text = `评论采集失败${errorText ? `：${errorText}` : ""}`;
-    textClass = "is-failed";
-    actions = `
-      <button
-        class="icon-btn is-retry btn-retry-comments"
-        type="button"
-        title="仅重试评论采集"
-        data-id="${escapeHtml(record.id)}">↻</button>
+        title="继续当前作品的评论采集"
+        data-id="${escapeHtml(record.id)}">${escapeHtml(commentView.actionLabel)}</button>
     `;
   }
 
@@ -2895,9 +2896,12 @@ function resolveCommentStatusRow(record) {
     text += ` · 客资命中（${resolvedLeadsTotal}条）`;
   }
   if (hasLeadsSignal && leadsSyncStatus === "failed") {
-    text += leadsSyncError
-      ? ` · 客资同步失败：${leadsSyncError}`
-      : " · 客资同步失败";
+    detail = [
+      detail,
+      leadsSyncError ? `客资同步失败：${leadsSyncError}` : "客资同步失败",
+    ]
+      .filter(Boolean)
+      .join("；");
     textClass = "is-failed";
   } else if (hasLeadsSignal && leadsSyncStatus === "skipped") {
     text += " · 客资 0 条，已跳过";
@@ -2906,7 +2910,7 @@ function resolveCommentStatusRow(record) {
     }
   }
 
-  return {text, textClass, actions};
+  return {text, textClass, detail, actions};
 }
 
 function resolveDetailCaptureStatusRow(record) {

@@ -108,6 +108,10 @@ body {
   --status-warning: #ff8f00;
   --status-error: #f54a45;
   --status-info: #4087e5;
+  --status-success-text: #067647;
+  --status-warning-text: #854d0e;
+  --status-error-text: #b42318;
+  --status-info-text: #175cd3;
 
   /* Spacing */
   --spacing-xs: 4px;
@@ -875,9 +879,134 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
   bottom: 0;
   z-index: 100;
   margin-bottom: 0;
+  border: 1px solid var(--border-light);
   border-bottom-left-radius: 0;
   border-bottom-right-radius: 0;
   box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.capture-recovery-status,
+#progressBar {
+  align-items: flex-start;
+  margin-top: 0;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+}
+
+.capture-recovery-status.is-info,
+#progressBar.is-info {
+  border-color: rgba(64, 135, 229, 0.22);
+  color: var(--status-info-text);
+}
+
+.capture-recovery-status.is-warning,
+#progressBar.is-warning {
+  border-color: rgba(255, 143, 0, 0.26);
+  color: var(--status-warning-text);
+}
+
+.capture-recovery-status.is-success,
+#progressBar.is-success {
+  border-color: rgba(0, 185, 107, 0.24);
+  color: var(--status-success-text);
+}
+
+.capture-recovery-status.is-danger,
+.capture-recovery-status.is-error,
+#progressBar.is-danger,
+#progressBar.is-error {
+  background: rgba(245, 74, 69, 0.1);
+  border-color: rgba(245, 74, 69, 0.24);
+  color: var(--status-error-text);
+}
+
+.capture-recovery-marker {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
+  opacity: 0.9;
+}
+
+.capture-recovery-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.capture-recovery-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+}
+
+.capture-recovery-title {
+  min-width: 0;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.capture-recovery-badge {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.capture-recovery-reason,
+.capture-recovery-next-step {
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.capture-recovery-reason {
+  color: var(--text-primary);
+}
+
+.capture-recovery-next-step {
+  color: var(--text-secondary);
+}
+
+.capture-recovery-reason[hidden],
+.capture-recovery-next-step[hidden],
+.capture-recovery-badge[hidden],
+.capture-recovery-action[hidden] {
+  display: none;
+}
+
+.capture-recovery-actions {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs);
+}
+
+.capture-recovery-action {
+  min-height: 32px;
+  min-width: 108px;
+  flex: 1 1 108px;
+  padding: 6px 12px;
+  font-size: var(--font-size-xs);
+}
+
+.capture-recovery-action:focus-visible,
+.comment-status-action:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 
 .panel-header {
@@ -1001,6 +1130,11 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
 .status-bar.is-warning {
   background: rgba(255, 143, 0, 0.1);
   color: var(--status-warning);
+}
+
+.status-bar.is-danger {
+  background: rgba(245, 74, 69, 0.1);
+  color: var(--status-error);
 }
 
 .status-bar a,
@@ -1947,45 +2081,107 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
 
 .comment-status-row {
   margin-top: var(--spacing-sm);
-  padding: 6px 8px;
+  padding: 7px 8px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-light);
   background: var(--bg-hover);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: var(--spacing-xs);
+  gap: var(--spacing-sm);
+}
+
+.comment-status-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .comment-status-text {
   min-width: 0;
   font-size: var(--font-size-xs);
   color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
-.comment-status-text.is-capturing {
-  color: var(--status-info);
+.comment-status-title {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-secondary);
 }
 
-.comment-status-text.is-done {
-  color: var(--status-success);
+.comment-status-detail {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
 }
 
-.comment-status-text.is-partial {
-  color: var(--status-warning);
+.comment-status-text.is-capturing,
+.comment-status-title.is-capturing {
+  color: var(--status-info-text);
 }
 
-.comment-status-text.is-failed {
-  color: var(--status-error);
+.comment-status-text.is-done,
+.comment-status-title.is-done {
+  color: var(--status-success-text);
+}
+
+.comment-status-text.is-partial,
+.comment-status-title.is-partial {
+  color: var(--status-warning-text);
+}
+
+.comment-status-text.is-failed,
+.comment-status-title.is-failed {
+  color: var(--status-error-text);
 }
 
 .comment-status-actions {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
+  align-self: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: var(--spacing-xs);
+}
+
+.comment-status-action {
+  width: auto;
+  min-width: 0;
+  min-height: 26px;
+  height: auto;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-full);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.comment-status-action:hover:not(:disabled) {
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  border-color: currentColor;
+}
+
+.comment-status-action.is-retry {
+  color: var(--status-info-text);
+  border-color: rgba(64, 135, 229, 0.35);
+}
+
+.comment-status-action.is-stop {
+  color: var(--status-error-text);
+  border-color: rgba(245, 74, 69, 0.3);
 }
 
 .comment-status-error-hint {
