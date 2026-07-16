@@ -406,7 +406,9 @@ router.post('/captured', requireAuth, async (req, res) => {
     let sql = `SELECT DISTINCT ON (external_id)
                   external_id,
                   comments_count,
-                  payload->>'detailCommentCountBaseline' AS detail_comment_count_baseline
+                  payload->>'detailCommentCountBaseline' AS detail_comment_count_baseline,
+                  payload->>'detailCaptureFinishedAt' AS detail_capture_finished_at,
+                  updated_at
                 FROM records
                 WHERE tenant_id = $1 AND external_id = ANY($2)
                   AND payload->>'detailCaptureStatus' = 'done'`;
@@ -419,13 +421,23 @@ router.post('/captured', requireAuth, async (req, res) => {
     return res.json({
       ok: true,
       captured: rows.map((r) => r.external_id),
-      items: rows.map((r) => ({
-        externalId: r.external_id,
-        commentsCount: Number(r.comments_count || 0),
-        commentsBaselineCount: Number(
-          r.detail_comment_count_baseline || r.comments_count || 0,
-        ),
-      })),
+      items: rows.map((r) => {
+        const payloadCapturedAt = Number(r.detail_capture_finished_at || 0);
+        const rowUpdatedAt = Date.parse(String(r.updated_at || ''));
+        return {
+          externalId: r.external_id,
+          commentsCount: Number(r.comments_count || 0),
+          commentsBaselineCount: Number(
+            r.detail_comment_count_baseline || r.comments_count || 0,
+          ),
+          capturedAt:
+            Number.isFinite(payloadCapturedAt) && payloadCapturedAt > 0
+              ? payloadCapturedAt
+              : Number.isFinite(rowUpdatedAt) && rowUpdatedAt > 0
+                ? rowUpdatedAt
+                : 0,
+        };
+      }),
     });
   } catch (err) {
     return res.json({ ok: false, error: 'server_error', message: err?.message || '查询失败', captured: [] });

@@ -6,6 +6,19 @@ try {
   console.warn('[onstarvoice] task center core unavailable', error);
 }
 
+importScripts(
+  'utils/runtime-tab-policy.js',
+  'utils/capture/debug-session.js',
+  'utils/capture/task-tab-group.js',
+  'utils/capture/task-runtime.js',
+  'utils/capture/task-owner.js',
+);
+
+const runtimeTabPolicy = globalThis.OnStarvoiceRuntimeTabPolicy;
+const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
+const CAPTURE_TASK_GROUP_TITLE =
+  captureTaskTabGroupApi.DEFAULT_GROUP_TITLE || 'StarVoice 采集任务';
+
 const STORAGE_KEYS = {
   runtime: 'onstarvoice.runtime',
   unattendedKeywordPlan: 'onstarvoice.unattendedKeywordPlan',
@@ -26,6 +39,8 @@ const DEFAULT_RUNTIME = {
   lastActiveTabId: null,
   lastCaptureProgress: null,
   lastCaptureProgressAt: 0,
+  captureDebugSession: null,
+  captureTaskCancellation: null,
   lastPageUrl: '',
 };
 
@@ -80,6 +95,11 @@ let lastUnattendedSupervisorTickAt = 0;
 const contentRelayHeartbeatByRequestId = new Map();
 const abortedCaptureRequestIds = new Map();
 const settledCaptureRequestIds = new Map();
+let captureDebugSessionManager = null;
+let captureTaskTabGroupManager = null;
+let captureTaskOwnerCoordinator = null;
+const captureTaskPendingWorkerTabIds = new Map();
+const captureTaskCleanupInProgress = new Set();
 const DEFAULT_UNATTENDED_KEYWORD_PLAN = Object.freeze({
   enabled: false,
   platform: 'xiaohongshu',
@@ -1002,6 +1022,10 @@ async function relayCancelToTabs(tabIds = []) {
   let successCount = 0;
   for (const tabId of uniqueTabIds) {
     try {
+      await captureDebugSessionManager?.stopByTab(
+        tabId,
+        'unattended_cancel_requested',
+      );
       // 取消是"应秒回"的操作:若某个 tab 的 content script 卡死,不应无限阻塞其它 tab 的取消。
       // 只在此取消路径加 5s 超时守卫,主采集中继(relay-to-content)不受影响。
       const response = await Promise.race([
@@ -2898,10 +2922,172 @@ async function writeRuntimeState(patchOrFactory) {
   });
 }
 
+async function cleanupStaleCaptureRuntimeSession(session) {
+  if (!session || typeof session !== 'object') return;
+  const sourceTabId = resolveCaptureTaskTabId(
+    session.sourceTabId,
+    session.tabId,
+  );
+  const workerTabIds = Array.isArray(session.workerTabIds)
+    ? [
+        ...new Set(
+          session.workerTabIds
+            .map((tabId) => resolveCaptureTaskTabId(tabId))
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  const taskGroupId =
+    session.groupId === null ||
+    session.groupId === undefined ||
+    session.groupId === ''
+      ? -1
+      : Number(session.groupId);
+  const originalGroupId =
+    session.originalGroupId === null ||
+    session.originalGroupId === undefined ||
+    session.originalGroupId === ''
+      ? -1
+      : Number(session.originalGroupId);
+  let verifiedTaskGroup = false;
+  if (Number.isSafeInteger(taskGroupId) && taskGroupId >= 0) {
+    try {
+      const taskGroup = await chrome.tabGroups.get(taskGroupId);
+      verifiedTaskGroup =
+        String(taskGroup?.title || '').trim() === CAPTURE_TASK_GROUP_TITLE;
+    } catch (error) {
+      const message = String(error?.message || error || '');
+      if (
+        /no (?:tab )?group with id|not found|does not exist|invalid group id/iu.test(
+          message,
+        )
+      ) {
+        verifiedTaskGroup = false;
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  let sourceTab = null;
+  if (verifiedTaskGroup && sourceTabId) {
+    try {
+      const candidate = await chrome.tabs.get(sourceTabId);
+      if (candidate?.groupId === taskGroupId) sourceTab = candidate;
+    } catch (error) {
+      const message = String(error?.message || error || '');
+      if (/no tab with id|not found|does not exist|invalid tab id/iu.test(message)) {
+        sourceTab = null;
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  const verifiedWorkerTabIds = [];
+  if (verifiedTaskGroup) {
+    for (const workerTabId of workerTabIds) {
+      try {
+        const workerTab = await chrome.tabs.get(workerTabId);
+        if (workerTab?.groupId === taskGroupId) {
+          verifiedWorkerTabIds.push(workerTabId);
+        }
+      } catch (error) {
+        const message = String(error?.message || error || '');
+        if (
+          !/no tab with id|not found|does not exist|invalid tab id/iu.test(
+            message,
+          )
+        ) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  if (chrome.action?.setBadgeText) {
+    await chrome.action.setBadgeText({text: ''}).catch(() => null);
+  }
+  if (sourceTab) {
+    await chrome.debugger.detach({tabId: sourceTab.id}).catch((error) => {
+      const message = String(error?.message || error || '');
+      if (/not attached|no tab with given id|target closed/iu.test(message)) {
+        return;
+      }
+      throw error;
+    });
+  }
+  if (verifiedWorkerTabIds.length > 0) {
+    await closeCaptureTaskWorkerTabs(verifiedWorkerTabIds);
+  }
+  if (!sourceTab) return;
+  if (Number.isSafeInteger(originalGroupId) && originalGroupId >= 0) {
+    try {
+      await chrome.tabs.group({
+        groupId: originalGroupId,
+        tabIds: [sourceTab.id],
+      });
+      return;
+    } catch {
+      // The user's former group no longer exists; ungroup below.
+    }
+  }
+  try {
+    await chrome.tabs.ungroup([sourceTab.id]);
+  } catch (error) {
+    const message = String(error?.message || error || '');
+    if (
+      /no tab with id|not found|does not exist|not in a group|invalid tab id/iu.test(
+        message,
+      )
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
 async function ensureRuntimeState() {
   return await runRuntimeMutation(async () => {
     const current = await readRuntimeState();
     const nextPatch = {};
+
+    if (
+      current.captureDebugSession &&
+      captureDebugSessionManager?.getActiveSessions().length === 0
+    ) {
+      const staleTaskId = String(
+        current.captureDebugSession?.taskId || '',
+      ).trim();
+      if (staleTaskId) {
+        nextPatch.captureTaskCancellation = buildCaptureTaskCancellation(
+          staleTaskId,
+          'extension_runtime_restarted',
+        );
+      }
+      nextPatch.lastCaptureProgress = {
+        ...(current.lastCaptureProgress &&
+        typeof current.lastCaptureProgress === 'object'
+          ? current.lastCaptureProgress
+          : {}),
+        phase: 'canceled',
+        message: '扩展已重新加载，上一采集任务已安全停止',
+        updatedAt: new Date().toISOString(),
+      };
+      // Fence every downstream write before touching debugger, workers or groups.
+      // If cleanup fails, the runtime ownership snapshot remains for the next retry.
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.runtime]: {
+          ...current,
+          ...nextPatch,
+        },
+      });
+      await cleanupStaleCaptureRuntimeSession(current.captureDebugSession);
+      nextPatch.captureDebugSession = null;
+      if (staleTaskId) {
+        captureTaskOwnerCoordinator?.clearTask(staleTaskId);
+      }
+    }
 
     if (!current.clientUuid) {
       nextPatch.clientUuid = createUuid();
@@ -3084,31 +3270,34 @@ async function waitForTabReady(tabId, {
 }
 
 function isSupportedCaptureUrl(url) {
-  const normalized = String(url || '');
-  return (
-    /^https?:\/\/www\.xiaohongshu\.com\//i.test(normalized) ||
-    /^https?:\/\/www\.douyin\.com\//i.test(normalized) ||
-    /^https?:\/\/v\.douyin\.com\//i.test(normalized) ||
-    /^https?:\/\/(?:www\.)?weibo\.com\//i.test(normalized) ||
-    /^https?:\/\/s\.weibo\.com\//i.test(normalized)
-  );
+  return detectPlatformFromUrl(url) !== 'unknown';
 }
 
 function detectPlatformFromUrl(url) {
-  const normalized = String(url || '').trim().toLowerCase();
-  if (!normalized) return 'unknown';
-  if (/^https?:\/\/(?:www\.)?xiaohongshu\.com\//i.test(normalized)) {
+  let hostname = '';
+  try {
+    const parsed = new URL(String(url || '').trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return 'unknown';
+    }
+    hostname = String(parsed.hostname || '').trim().toLowerCase();
+  } catch {
+    return 'unknown';
+  }
+  if (hostname === 'xiaohongshu.com' || hostname === 'www.xiaohongshu.com') {
     return 'xiaohongshu';
   }
   if (
-    /^https?:\/\/(?:www\.)?douyin\.com\//i.test(normalized) ||
-    /^https?:\/\/v\.douyin\.com\//i.test(normalized)
+    hostname === 'douyin.com' ||
+    hostname === 'www.douyin.com' ||
+    hostname === 'v.douyin.com'
   ) {
     return 'douyin';
   }
   if (
-    /^https?:\/\/(?:www\.)?weibo\.com\//i.test(normalized) ||
-    /^https?:\/\/s\.weibo\.com\//i.test(normalized)
+    hostname === 'weibo.com' ||
+    hostname === 'www.weibo.com' ||
+    hostname === 's.weibo.com'
   ) {
     return 'weibo';
   }
@@ -3764,6 +3953,677 @@ async function relayToContentWithRetry(tabId, payload) {
   }
 }
 
+captureTaskTabGroupManager =
+  captureTaskTabGroupApi.createManager({
+    tabsApi: chrome.tabs,
+    tabGroupsApi: chrome.tabGroups,
+    groupTitle: CAPTURE_TASK_GROUP_TITLE,
+  });
+
+captureDebugSessionManager =
+  globalThis.OnStarvoiceCaptureDebugSession.createManager({
+    debuggerApi: chrome.debugger,
+    onStateChange: async (session, metadata = {}) => {
+      if (chrome.action?.setBadgeText) {
+        await Promise.allSettled([
+          chrome.action.setBadgeText({text: session ? '1' : ''}),
+          chrome.action.setBadgeBackgroundColor({color: '#6f5cff'}),
+          chrome.action.setBadgeTextColor
+            ? chrome.action.setBadgeTextColor({color: '#ffffff'})
+            : Promise.resolve(),
+        ]);
+      }
+      const previousTaskId = String(metadata?.previous?.taskId || '').trim();
+      const preserveCleanupSnapshot = Boolean(
+        !session &&
+          metadata?.previous?.persistent &&
+          previousTaskId &&
+          captureTaskCleanupInProgress.has(previousTaskId),
+      );
+      const runtimeSession = preserveCleanupSnapshot
+        ? {
+            ...metadata.previous,
+            state: 'detaching',
+            cleanupPending: true,
+          }
+        : session;
+      const patch = {captureDebugSession: runtimeSession};
+      if (session?.persistent && session.progress) {
+        patch.lastCaptureProgress = session.progress;
+      } else if (session && metadata.reason === 'capture_started') {
+        patch.lastCaptureProgress = {
+          phase: 'debug_session_attached',
+          message: `AI 已接管当前页面 · ${session.label}`,
+          ...(session.persistent
+            ? {captureTaskId: session.taskId}
+            : {listCaptureRunId: session.runId}),
+          debugSessionState: session.state,
+          debugSessionTabId: session.tabId,
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      await writeRuntimeState(patch);
+    },
+    onUnexpectedDetach: async ({session, reason}) => {
+      await handleUnexpectedCaptureDebugDetach({session, reason});
+    },
+  });
+
+function createCaptureTaskError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function getCaptureTaskRequest(message) {
+  const payload =
+    message?.payload && typeof message.payload === 'object'
+      ? message.payload
+      : {};
+  return {...message, ...payload};
+}
+
+function requireCaptureTaskId(request) {
+  const taskId = String(request?.taskId || '').trim();
+  if (!taskId) {
+    throw createCaptureTaskError(
+      'invalid_capture_task',
+      '采集任务缺少 taskId',
+    );
+  }
+  return taskId;
+}
+
+function resolveCaptureTaskTabId(...values) {
+  for (const value of values) {
+    const tabId = Number(value);
+    if (Number.isSafeInteger(tabId) && tabId > 0) return tabId;
+  }
+  return null;
+}
+
+async function requireConnectedCaptureTaskOwner(
+  taskId,
+  {attempts = 8, delayMs = 50} = {},
+) {
+  const normalizedTaskId = String(taskId || '').trim();
+  const maxAttempts = Math.max(1, Math.floor(Number(attempts) || 1));
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const owner = captureTaskOwnerCoordinator?.getOwner(normalizedTaskId);
+    if (owner?.connected === true) return owner;
+    if (attempt + 1 < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw createCaptureTaskError(
+    'capture_task_owner_disconnected',
+    '控制面板未连接，已取消启动采集任务',
+  );
+}
+
+async function beginCaptureTask(message, sender) {
+  const request = getCaptureTaskRequest(message);
+  const taskId = requireCaptureTaskId(request);
+  const ownerRequired = request.ownerRequired === true;
+  const sourceTabId = resolveCaptureTaskTabId(
+    request.sourceTabId,
+    request.tabId,
+    sender?.tab?.id,
+  );
+  if (!sourceTabId) {
+    throw createCaptureTaskError(
+      'invalid_capture_task_source_tab',
+      '采集任务缺少有效的来源 Tab',
+    );
+  }
+  const sourceTab = await chrome.tabs.get(sourceTabId);
+  const detectedPlatform = detectPlatformFromUrl(sourceTab?.url || '');
+  const requestedPlatform = normalizePlatformId(request.platform);
+  const sourcePlatform = detectedPlatform;
+  if (!new Set(['xiaohongshu', 'douyin']).has(sourcePlatform)) {
+    throw createCaptureTaskError(
+      'capture_task_platform_unsupported',
+      '任务级 Debug 当前仅支持小红书和抖音',
+    );
+  }
+  if (
+    requestedPlatform !== 'unknown' &&
+    requestedPlatform !== sourcePlatform
+  ) {
+    throw createCaptureTaskError(
+      'capture_task_platform_mismatch',
+      '任务平台与来源页面不一致，已拒绝启动浏览器接管',
+    );
+  }
+
+  if (ownerRequired) {
+    await requireConnectedCaptureTaskOwner(taskId);
+  }
+
+  const existingSession =
+    captureDebugSessionManager.getSessionByTaskId(taskId);
+  const existingGroup = captureTaskTabGroupManager.getTask(taskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
+  if (
+    (!existingSession && existingGroup) ||
+    pendingWorkerTabIds.length > 0
+  ) {
+    throw createCaptureTaskError(
+      'capture_task_cleanup_pending',
+      '上一采集任务仍在安全清理工作页，请稍后重试',
+    );
+  }
+  const conflictingGroup = captureTaskTabGroupManager
+    .getActiveTasks()
+    .find((candidate) => candidate?.taskId !== taskId);
+  if (conflictingGroup) {
+    throw createCaptureTaskError(
+      'capture_task_group_busy',
+      '已有采集标签组正在运行，请先结束当前任务',
+    );
+  }
+  if (existingSession && existingSession.tabId !== sourceTabId) {
+    throw createCaptureTaskError(
+      'capture_task_source_mismatch',
+      '该采集任务已经绑定到另一个来源 Tab',
+    );
+  }
+  const activeDebugSession = captureDebugSessionManager
+    .getActiveSessions()
+    .find(Boolean);
+  if (
+    activeDebugSession &&
+    (activeDebugSession.state !== 'attached' ||
+      !activeDebugSession.persistent ||
+      activeDebugSession.taskId !== taskId ||
+      activeDebugSession.tabId !== sourceTabId)
+  ) {
+    throw createCaptureTaskError(
+      'capture_task_debug_busy',
+      '已有页面处于 AI Debug 采集任务，请先结束当前任务',
+    );
+  }
+  if (!existingSession) {
+    if (typeof chrome.debugger?.getTargets !== 'function') {
+      throw createCaptureTaskError(
+        'capture_task_debug_preflight_unavailable',
+        '当前浏览器无法确认页面调试占用状态，未启动采集任务',
+      );
+    }
+    let targets = [];
+    try {
+      targets = await chrome.debugger.getTargets();
+    } catch (error) {
+      throw createCaptureTaskError(
+        'capture_task_debug_preflight_failed',
+        `无法确认页面调试占用状态：${String(error?.message || error || '未知错误')}`,
+      );
+    }
+    const occupied = (Array.isArray(targets) ? targets : []).some(
+      (target) =>
+        target?.attached === true &&
+        Number(target?.tabId) === sourceTabId,
+    );
+    if (occupied) {
+      throw createCaptureTaskError(
+        'capture_task_debug_busy',
+        '当前页面已被 DevTools 或其他调试任务占用，请关闭后重试',
+      );
+    }
+  }
+  let group = null;
+  let session = null;
+
+  try {
+    group = await captureTaskTabGroupManager.begin({
+      taskId,
+      sourceTabId,
+      title: CAPTURE_TASK_GROUP_TITLE,
+    });
+    session = await captureDebugSessionManager.start({
+      tabId: sourceTabId,
+      runId:
+        String(request.runId || '').trim() ||
+        existingSession?.runId ||
+        `capture-task:${taskId}`,
+      label: String(request.label || '').trim() || '采集任务',
+      pageTitle: sourceTab?.title || '',
+      pageUrl: sourceTab?.url || '',
+      platform: sourcePlatform,
+      persistent: true,
+      taskId,
+      progress: request.progress ?? null,
+      workerTabIds: existingSession?.workerTabIds || [],
+      groupId: group.groupId,
+      originalGroupId: group.originalGroupId,
+      minimized: Boolean(request.minimized),
+    });
+
+    const update = {taskId, groupId: group.groupId};
+    if (Object.prototype.hasOwnProperty.call(request, 'progress')) {
+      update.progress = request.progress;
+    }
+    if (Object.prototype.hasOwnProperty.call(request, 'minimized')) {
+      update.minimized = Boolean(request.minimized);
+    }
+    if (Object.prototype.hasOwnProperty.call(request, 'label')) {
+      update.label = request.label;
+    }
+    session = await captureDebugSessionManager.updateTask(update);
+    if (ownerRequired) {
+      await requireConnectedCaptureTaskOwner(taskId);
+    }
+    await writeRuntimeState({captureTaskCancellation: null});
+    return {taskId, session, group};
+  } catch (error) {
+    if (session || group || existingSession || existingGroup) {
+      try {
+        await releaseCaptureTaskResourcesWithRetry(
+          {
+            taskId,
+            reason: 'capture_task_begin_rollback',
+            debugSnapshot: session || existingSession,
+          },
+          {attempts: 3},
+        );
+      } catch (cleanupError) {
+        console.warn(
+          '[CaptureTask] begin rollback remains pending:',
+          cleanupError,
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function updateCaptureTask(message) {
+  const request = getCaptureTaskRequest(message);
+  const taskId = requireCaptureTaskId(request);
+  const update = {taskId};
+  for (const field of ['progress', 'label', 'minimized']) {
+    if (Object.prototype.hasOwnProperty.call(request, field)) {
+      update[field] = request[field];
+    }
+  }
+  const session = await captureDebugSessionManager.updateTask(update);
+  return {taskId, session};
+}
+
+async function registerCaptureTaskTab(message, sender) {
+  const request = getCaptureTaskRequest(message);
+  const taskId = requireCaptureTaskId(request);
+  const role = globalThis.OnStarvoiceCaptureTaskTabGroup.normalizeTaskTabRole(
+    request.role,
+  );
+  if (!role) {
+    throw createCaptureTaskError(
+      'invalid_capture_task_tab_role',
+      '采集工作页角色仅支持 worker 或 detail_worker',
+    );
+  }
+  const workerTabId = resolveCaptureTaskTabId(
+    request.workerTabId,
+    request.tabId,
+    sender?.tab?.id,
+  );
+  if (!workerTabId) {
+    throw createCaptureTaskError(
+      'invalid_capture_worker_tab',
+      '采集任务缺少有效的工作 Tab',
+    );
+  }
+  if (!captureDebugSessionManager.getSessionByTaskId(taskId)) {
+    throw createCaptureTaskError(
+      'capture_task_not_found',
+      '没有找到正在运行的持久采集任务',
+    );
+  }
+
+  const group = await captureTaskTabGroupManager.register({
+    taskId,
+    tabId: workerTabId,
+    role,
+  });
+  let session;
+  try {
+    session = await captureDebugSessionManager.registerWorkerTab({
+      taskId,
+      tabId: workerTabId,
+      groupId: group.groupId,
+    });
+  } catch (error) {
+    await captureTaskTabGroupManager.unregister({
+      taskId,
+      tabId: workerTabId,
+    }).catch(() => null);
+    throw error;
+  }
+  return {taskId, role, session, group};
+}
+
+async function closeCaptureTaskWorkerTabs(workerTabIds = []) {
+  return await globalThis.OnStarvoiceCaptureTaskRuntime.closeWorkerTabsIndividually(
+    workerTabIds,
+    {
+      removeTab: (tabId) => chrome.tabs.remove(tabId),
+    },
+  );
+}
+
+async function closeTrackedCaptureTaskWorkerTabs(taskId, workerTabIds = []) {
+  try {
+    const result = await closeCaptureTaskWorkerTabs(workerTabIds);
+    captureTaskPendingWorkerTabIds.delete(taskId);
+    return result;
+  } catch (error) {
+    const failedTabIds = Array.isArray(error?.failedTabIds)
+      ? error.failedTabIds
+      : workerTabIds;
+    captureTaskPendingWorkerTabIds.set(taskId, failedTabIds);
+    throw error;
+  }
+}
+
+function getTrackedCaptureTaskWorkers(taskId, ...snapshots) {
+  return globalThis.OnStarvoiceCaptureTaskRuntime.collectWorkerTabIds(
+    ...snapshots,
+    {
+      workerTabIds: captureTaskPendingWorkerTabIds.get(taskId) || [],
+    },
+  );
+}
+
+function buildCaptureTaskWorkerSnapshot(taskId, debugSnapshot, groupSnapshot) {
+  return {
+    ...(groupSnapshot || {}),
+    workerTabIds: getTrackedCaptureTaskWorkers(
+      taskId,
+      debugSnapshot,
+      groupSnapshot,
+    ),
+  };
+}
+
+function reportCaptureTaskCancellationPublishError(error, stage) {
+  console.warn(
+    `[CaptureTask] cancellation ${stage} failed; cleanup continues:`,
+    error,
+  );
+}
+
+async function writeCaptureTaskCancellationFailSoft(cancellation, patch) {
+  return await globalThis.OnStarvoiceCaptureTaskRuntime.publishCancellationFailSoft({
+    cancellation,
+    notify: (value) => {
+      captureTaskOwnerCoordinator?.notifyCanceled(value.taskId, value);
+    },
+    writeState: writeRuntimeState,
+    patch,
+    onError: reportCaptureTaskCancellationPublishError,
+  });
+}
+
+function buildCaptureTaskCancellation(taskId, reason) {
+  return {
+    taskId: String(taskId || '').trim(),
+    reason: String(reason || 'capture_task_canceled').trim(),
+    requestedAt: new Date().toISOString(),
+  };
+}
+
+async function publishCaptureTaskCancellation(taskId, reason) {
+  const cancellation = buildCaptureTaskCancellation(taskId, reason);
+  await writeCaptureTaskCancellationFailSoft(cancellation, {
+    captureTaskCancellation: cancellation,
+    lastCaptureProgress: {
+      phase: 'canceled',
+      message:
+        cancellation.reason === 'sidebar_owner_disconnected'
+          ? '控制面板已关闭，采集任务已安全停止'
+          : '浏览器 Debug 接管已取消，整项采集正在停止',
+      captureTaskId: cancellation.taskId,
+      updatedAt: cancellation.requestedAt,
+    },
+  });
+  return cancellation;
+}
+
+async function relayCaptureTaskCancellation(session, reason) {
+  if (!session) return [];
+  const cancelListRunId = session.persistent
+    ? session.activeListRunId
+    : session.runId;
+  const cancelPayload = {
+    action: 'cancelCapture',
+    debugDetachReason: reason,
+    ...(cancelListRunId ? {listCaptureRunId: cancelListRunId} : {}),
+  };
+  const targetTabIds = [
+    session.tabId,
+    ...(Array.isArray(session.workerTabIds) ? session.workerTabIds : []),
+  ]
+    .map((tabId) => resolveCaptureTaskTabId(tabId))
+    .filter(Boolean);
+  return await Promise.allSettled(
+    [...new Set(targetTabIds)].map((tabId) =>
+      Promise.race([
+        relayToContentWithRetry(tabId, cancelPayload),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('capture task cancel relay timeout')),
+            1500,
+          ),
+        ),
+      ]),
+    ),
+  );
+}
+
+async function releaseCaptureTaskResources({
+  taskId,
+  reason,
+  debugSnapshot = null,
+} = {}) {
+  const activeDebugSnapshot =
+    debugSnapshot || captureDebugSessionManager.getSessionByTaskId(taskId);
+  const groupSnapshot = captureTaskTabGroupManager.getTask(taskId);
+  const workerSnapshot = buildCaptureTaskWorkerSnapshot(
+    taskId,
+    activeDebugSnapshot,
+    groupSnapshot,
+  );
+  const cleanupSnapshot = {
+    ...(groupSnapshot || {}),
+    ...(activeDebugSnapshot || {}),
+    taskId,
+    persistent: true,
+    tabId:
+      resolveCaptureTaskTabId(
+        activeDebugSnapshot?.tabId,
+        groupSnapshot?.sourceTabId,
+      ) || null,
+    sourceTabId:
+      resolveCaptureTaskTabId(
+        activeDebugSnapshot?.sourceTabId,
+        activeDebugSnapshot?.tabId,
+        groupSnapshot?.sourceTabId,
+      ) || null,
+    workerTabIds: workerSnapshot.workerTabIds,
+    state: 'detaching',
+    cleanupPending: true,
+    cleanupReason: String(reason || 'capture_task_finished').trim(),
+  };
+  captureTaskCleanupInProgress.add(taskId);
+  if (activeDebugSnapshot || groupSnapshot || workerSnapshot.workerTabIds.length > 0) {
+    await writeRuntimeState({captureDebugSession: cleanupSnapshot}).catch(
+      (error) => {
+        console.warn(
+          '[CaptureTask] failed to persist cleanup ownership snapshot:',
+          error,
+        );
+      },
+    );
+  }
+
+  try {
+    const result = await globalThis.OnStarvoiceCaptureTaskRuntime.endTaskResources({
+      taskId,
+      reason,
+      debugSnapshot: activeDebugSnapshot,
+      groupSnapshot: workerSnapshot,
+      stopDebug: ({taskId: activeTaskId, reason: stopReason}) =>
+        captureDebugSessionManager.stopByTaskId(activeTaskId, stopReason),
+      endGroup: ({taskId: activeTaskId, reason: stopReason}) =>
+        captureTaskTabGroupManager.end({
+          taskId: activeTaskId,
+          reason: stopReason,
+        }),
+      closeWorkerTabs: (workerTabIds) =>
+        closeTrackedCaptureTaskWorkerTabs(taskId, workerTabIds),
+    });
+    captureTaskPendingWorkerTabIds.delete(taskId);
+    captureTaskOwnerCoordinator?.clearTask(taskId);
+    await writeRuntimeState({captureDebugSession: null}).catch((error) => {
+      console.warn('[CaptureTask] failed to clear cleanup snapshot:', error);
+    });
+    return result;
+  } finally {
+    captureTaskCleanupInProgress.delete(taskId);
+  }
+}
+
+async function releaseCaptureTaskResourcesWithRetry(
+  options,
+  {attempts = 2, retryDelayMs = 250} = {},
+) {
+  const maxAttempts = Math.max(1, Math.floor(Number(attempts) || 1));
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await releaseCaptureTaskResources(options);
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function endCaptureTask(message) {
+  const request = getCaptureTaskRequest(message);
+  const taskId = requireCaptureTaskId(request);
+  const reason =
+    String(request.reason || '').trim() || 'capture_task_finished';
+  const status = String(request.status || '').trim().toLowerCase();
+  const canceled =
+    status === 'canceled' ||
+    /(?:^|_)(?:cancel|canceled|cancelled)(?:_|$)/u.test(reason) ||
+    reason === 'user_cancel_requested';
+  if (canceled) {
+    const session = captureDebugSessionManager.getSessionByTaskId(taskId);
+    await publishCaptureTaskCancellation(taskId, reason);
+    await relayCaptureTaskCancellation(session, reason);
+  }
+  return await releaseCaptureTaskResourcesWithRetry({taskId, reason});
+}
+
+async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
+  if (!session) return;
+  if (!session.persistent || !session.taskId) {
+    await relayCaptureTaskCancellation(session, reason);
+    return;
+  }
+
+  await publishCaptureTaskCancellation(session.taskId, 'native_debug_canceled');
+  await relayCaptureTaskCancellation(session, reason);
+  try {
+    await releaseCaptureTaskResourcesWithRetry(
+      {
+        taskId: session.taskId,
+        reason: 'debugger_detached',
+        debugSnapshot: session,
+      },
+      {attempts: 3},
+    );
+  } catch (error) {
+    console.warn(
+      '[CaptureDebugSession] failed to finish externally canceled task:',
+      error,
+    );
+  }
+}
+
+async function handleAbandonedCaptureTask({taskId} = {}) {
+  const normalizedTaskId = String(taskId || '').trim();
+  if (!normalizedTaskId) return;
+  const session = captureDebugSessionManager.getSessionByTaskId(normalizedTaskId);
+  const group = captureTaskTabGroupManager.getTask(normalizedTaskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(normalizedTaskId);
+  if (!session && !group && pendingWorkerTabIds.length === 0) return;
+
+  await publishCaptureTaskCancellation(
+    normalizedTaskId,
+    'sidebar_owner_disconnected',
+  );
+  await relayCaptureTaskCancellation(session, 'sidebar_owner_disconnected');
+  try {
+    await releaseCaptureTaskResourcesWithRetry(
+      {
+        taskId: normalizedTaskId,
+        reason: 'sidebar_owner_disconnected',
+        debugSnapshot: session,
+      },
+      {attempts: 3},
+    );
+  } catch (error) {
+    console.warn(
+      '[CaptureTaskOwner] failed to finish abandoned capture task:',
+      error,
+    );
+  }
+}
+
+async function setCaptureTaskMinimized(message) {
+  const request = getCaptureTaskRequest(message);
+  const taskId = requireCaptureTaskId(request);
+  const session = await captureDebugSessionManager.setMinimized({
+    taskId,
+    minimized: Boolean(request.minimized),
+  });
+  return {taskId, session};
+}
+
+captureTaskOwnerCoordinator =
+  globalThis.OnStarvoiceCaptureTaskOwner.createCoordinator({
+    onAbandoned: handleAbandonedCaptureTask,
+  });
+
+async function handleCaptureRuntimeTabRemoved(tabId) {
+  const session = captureDebugSessionManager.getSession(tabId);
+  if (session?.persistent && session.taskId) {
+    await publishCaptureTaskCancellation(session.taskId, 'source_tab_removed');
+    await relayCaptureTaskCancellation(session, 'source_tab_removed');
+    try {
+      await releaseCaptureTaskResourcesWithRetry(
+        {
+          taskId: session.taskId,
+          reason: 'source_tab_removed',
+          debugSnapshot: session,
+        },
+        {attempts: 3},
+      );
+    } catch (error) {
+      console.warn('[CaptureTask] source-tab cleanup remains pending:', error);
+    }
+    return;
+  }
+  await captureDebugSessionManager.handleTabRemoved(tabId);
+  await captureTaskTabGroupManager.handleTabRemoved(tabId);
+}
+
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   if (reason === 'install') {
     chrome.storage.local.remove('onstarvoice.riskNoticeAcknowledged').catch(() => {});
@@ -3837,13 +4697,26 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   });
 });
 
-chrome.tabs.onRemoved?.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener((tabId) => {
+  handleCaptureRuntimeTabRemoved(tabId).catch((error) => {
+    console.warn('[onstarvoice] capture task tab cleanup failed', error);
+  });
   superviseUnattendedKeywordRun({
     removedTabId: tabId,
     reason: 'runner_tab_removed',
   }).catch((error) => {
     console.error('[onstarvoice] unattended runner removal check failed', error);
   });
+});
+
+chrome.tabs.onReplaced?.addListener((_addedTabId, removedTabId) => {
+  handleCaptureRuntimeTabRemoved(removedTabId).catch((error) => {
+    console.warn('[onstarvoice] capture task replaced-tab cleanup failed', error);
+  });
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  captureTaskOwnerCoordinator.attachPort(port);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -3867,9 +4740,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (action === 'captureProgress') {
             markContentRelayHeartbeat(normalizedProgress);
           }
+          const progressPatch = runtimeTabPolicy.buildCaptureProgressPatch(
+            sender?.tab,
+            normalizedProgress,
+          );
           const next = await writeRuntimeState({
-            lastActiveTabId: sender?.tab?.id ?? null,
-            lastCaptureProgress: normalizedProgress,
+            ...progressPatch,
             lastCaptureProgressAt: normalizedProgress.updatedAt,
           });
 
@@ -3877,6 +4753,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ok: true,
             data: {
               lastCaptureProgress: next.lastCaptureProgress,
+            },
+          });
+          return;
+        }
+
+        if (!runtimeTabPolicy.shouldAdoptPageState(sender?.tab)) {
+          const current = await readRuntimeState();
+          sendResponse({
+            ok: true,
+            data: {
+              ignoredInactiveTab: true,
+              platform: current.platform,
+              pageType: current.pageType,
+              detailReady: current.detailReady,
+              detailReadyReason: current.detailReadyReason,
+              lastPageUrl: current.lastPageUrl,
             },
           });
           return;
@@ -4184,6 +5076,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      if (type === 'onstarvoice:begin-capture-task') {
+        const data = await beginCaptureTask(message, sender);
+        sendResponse({ok: true, data});
+        return;
+      }
+
+      if (type === 'onstarvoice:update-capture-task') {
+        const data = await updateCaptureTask(message);
+        sendResponse({ok: true, data});
+        return;
+      }
+
+      if (type === 'onstarvoice:register-capture-task-tab') {
+        const data = await registerCaptureTaskTab(message, sender);
+        sendResponse({ok: true, data});
+        return;
+      }
+
+      if (type === 'onstarvoice:end-capture-task') {
+        const data = await endCaptureTask(message);
+        sendResponse({ok: true, data});
+        return;
+      }
+
+      if (type === 'onstarvoice:set-capture-task-minimized') {
+        const data = await setCaptureTaskMinimized(message);
+        sendResponse({ok: true, data});
+        return;
+      }
+
       if (type === 'onstarvoice:capture-progress') {
         const incomingProgress =
           message?.payload && typeof message.payload === 'object'
@@ -4209,9 +5131,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sender?.tab?.id,
         );
         markContentRelayHeartbeat(normalizedProgress);
+        const progressPatch = runtimeTabPolicy.buildCaptureProgressPatch(
+          sender?.tab,
+          normalizedProgress,
+        );
         const next = await writeRuntimeState({
-          lastActiveTabId: sender?.tab?.id ?? null,
-          lastCaptureProgress: normalizedProgress,
+          ...progressPatch,
           lastCaptureProgressAt: normalizedProgress.updatedAt,
         });
         sendResponse({
@@ -4277,11 +5202,127 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           throw new Error('invalid tabId');
         }
 
-        const response = await relayToContentWithRetry(
-          tabId,
-          message?.payload ?? {},
-        );
-        await writeRuntimeState({ lastActiveTabId: tabId });
+        const sourcePayload =
+          message?.payload && typeof message.payload === 'object'
+            ? message.payload
+            : {};
+        const contentAction = String(sourcePayload.action || '');
+        let relayTab = null;
+        try {
+          relayTab = await chrome.tabs.get(tabId);
+        } catch {
+          relayTab = null;
+        }
+        const existingDebugSession =
+          captureDebugSessionManager.getSession(tabId);
+        if (
+          contentAction === 'cancelCapture' &&
+          !existingDebugSession?.persistent
+        ) {
+          await captureDebugSessionManager.stopByTab(
+            tabId,
+            'user_cancel_requested',
+          );
+        }
+
+        const platform = detectPlatformFromUrl(relayTab?.url || '');
+        const isListCaptureAction =
+          globalThis.OnStarvoiceCaptureDebugSession.isListCaptureAction(
+            contentAction,
+          );
+        const supportedListPlatform =
+          platform === 'xiaohongshu' || platform === 'douyin';
+        let persistentRelayTaskId = '';
+        if (existingDebugSession?.persistent && isListCaptureAction) {
+          if (!supportedListPlatform) {
+            throw createCaptureTaskError(
+              'capture_task_platform_unsupported',
+              '任务来源页已离开小红书或抖音，已拒绝继续浏览器接管',
+            );
+          }
+          if (
+            existingDebugSession.platform &&
+            existingDebugSession.platform !== platform
+          ) {
+            throw createCaptureTaskError(
+              'capture_task_platform_mismatch',
+              '任务来源页平台已变化，已拒绝继续浏览器接管',
+            );
+          }
+          persistentRelayTaskId = String(
+            sourcePayload.taskId || sourcePayload.taskContext?.taskId || '',
+          ).trim();
+          if (
+            !persistentRelayTaskId ||
+            persistentRelayTaskId !== existingDebugSession.taskId
+          ) {
+            throw createCaptureTaskError(
+              'capture_task_relay_mismatch',
+              '列表采集子运行与当前浏览器接管任务不一致',
+            );
+          }
+        }
+        const debugEligible =
+          supportedListPlatform && isListCaptureAction;
+        let debugSession = null;
+        let debugSessionStartedByRelay = false;
+        let relayPayload = sourcePayload;
+        if (debugEligible) {
+          const listRunId =
+            globalThis.OnStarvoiceCaptureDebugSession.resolveListRelayRunId(
+              sourcePayload.listCaptureRunId,
+              createUuid,
+            );
+          if (existingDebugSession?.persistent) {
+            if (listRunId === persistentRelayTaskId) {
+              throw createCaptureTaskError(
+                'list_capture_run_id_conflict',
+                '列表子运行编号不能复用任务编号',
+              );
+            }
+            debugSession = await captureDebugSessionManager.updateTask({
+              taskId: existingDebugSession.taskId,
+              activeListRunId: listRunId,
+            });
+          } else {
+            const label =
+              contentAction === 'captureKeywordNotes'
+                ? sourcePayload.keyword
+                  ? `搜索「${String(sourcePayload.keyword).slice(0, 48)}」`
+                  : '搜索结果采集'
+                : '博主作品采集';
+            debugSession = await captureDebugSessionManager.start({
+              tabId,
+              runId: listRunId,
+              label,
+              pageTitle: relayTab?.title || '',
+              pageUrl: relayTab?.url || '',
+              platform,
+            });
+            debugSessionStartedByRelay = !existingDebugSession;
+          }
+          relayPayload = {
+            ...sourcePayload,
+            listCaptureRunId: listRunId,
+          };
+        }
+
+        let response;
+        try {
+          response = await relayToContentWithRetry(tabId, relayPayload);
+        } finally {
+          if (debugSession && debugSessionStartedByRelay) {
+            await captureDebugSessionManager.stop({
+              tabId,
+              runId: debugSession.runId,
+              reason: 'capture_relay_finished',
+            });
+          }
+        }
+        const runtimePatch = runtimeTabPolicy.buildRelayRuntimePatch(relayTab);
+        if (Object.keys(runtimePatch).length > 0) {
+          await writeRuntimeState(runtimePatch);
+        }
         sendResponse({ ok: true, data: response ?? null });
         return;
       }

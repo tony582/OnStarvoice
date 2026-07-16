@@ -642,9 +642,12 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         return;
       }
       dedupe.add(dedupeKey);
+      const domCaptureKey = `xiaohongshu:${String(noteId).trim()}`;
+      item.setAttribute?.("data-osv-capture-key", domCaptureKey);
 
       notes.push({
         noteId,
+        domCaptureKey,
         url: noteUrl,
         title: finalTitle,
         coverImageUrl: cover,

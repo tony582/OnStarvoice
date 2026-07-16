@@ -59,6 +59,14 @@ import {
 } from './diagnostics.js';
 import {buildDetailEnhanceStage} from './capture/stage-diagnostics.js';
 import {
+  DETAIL_RUNNER_MODE,
+  closeOwnedDetailRunnerTab,
+  closeOwnedDetailRunnerTabs,
+  createDedicatedDetailRunnerTab,
+  normalizeDetailRunnerMode,
+} from './capture/detail-runner.js';
+import {createDetailPrefetchPipeline} from './capture/detail-prefetch-pipeline.js';
+import {
   clearInterruptedCommentObservation,
   repairInterruptedCommentPayload,
 } from './capture-recovery.js';
@@ -91,6 +99,197 @@ const DETAIL_CAPTURE_STATUS = {
   DONE: 'done',
   FAILED: 'failed',
 };
+
+const CAPTURE_TASK_MESSAGE_TYPE = Object.freeze({
+  BEGIN: 'onstarvoice:begin-capture-task',
+  UPDATE: 'onstarvoice:update-capture-task',
+  REGISTER_TAB: 'onstarvoice:register-capture-task-tab',
+  END: 'onstarvoice:end-capture-task',
+});
+const activeCaptureTaskSessions = new Map();
+
+function normalizeCaptureTaskId(value) {
+  return String(value || '').trim().slice(0, 120);
+}
+
+function resolveActiveCaptureTaskSession(taskId = '') {
+  const normalizedTaskId = normalizeCaptureTaskId(taskId);
+  if (!normalizedTaskId) return null;
+  const session = activeCaptureTaskSessions.get(normalizedTaskId);
+  return session?.state === 'active' ? session : null;
+}
+
+async function sendCaptureTaskLifecycleMessage(
+  type,
+  payload,
+  {chromeApi = globalThis.chrome} = {},
+) {
+  if (!chromeApi?.runtime || typeof chromeApi.runtime.sendMessage !== 'function') {
+    return {ok: false, skipped: true, reason: 'runtime_unavailable'};
+  }
+
+  try {
+    const response = await chromeApi.runtime.sendMessage({type, ...payload});
+    if (response?.ok !== true) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: String(response?.error?.code || 'task_session_unavailable'),
+        response: response ?? null,
+      };
+    }
+    return {ok: true, data: response.data ?? null};
+  } catch (error) {
+    console.debug(
+      '[CaptureSync] capture task lifecycle message unavailable (ignored):',
+      error?.message || error,
+    );
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'task_session_unavailable',
+      error,
+    };
+  }
+}
+
+export async function beginCaptureTaskSession(
+  {
+    taskId = '',
+    tabId = null,
+    label = '',
+    platform = '',
+    ownerRequired = false,
+  } = {},
+  options = {},
+) {
+  const normalizedTaskId = normalizeCaptureTaskId(taskId);
+  const normalizedTabId = Number(tabId);
+  if (
+    !normalizedTaskId ||
+    !Number.isSafeInteger(normalizedTabId) ||
+    normalizedTabId <= 0
+  ) {
+    return {ok: false, skipped: true, reason: 'invalid_task_session'};
+  }
+
+  const existing = resolveActiveCaptureTaskSession(normalizedTaskId);
+  if (existing) {
+    return {ok: true, active: true, reused: true, taskId: normalizedTaskId};
+  }
+
+  const result = await sendCaptureTaskLifecycleMessage(
+    CAPTURE_TASK_MESSAGE_TYPE.BEGIN,
+    {
+      taskId: normalizedTaskId,
+      tabId: normalizedTabId,
+      label: String(label || '').trim().slice(0, 120),
+      platform: String(platform || '').trim().toLowerCase().slice(0, 40),
+      ownerRequired: ownerRequired === true,
+    },
+    options,
+  );
+  if (!result.ok) {
+    return {...result, active: false, taskId: normalizedTaskId};
+  }
+
+  activeCaptureTaskSessions.set(normalizedTaskId, {
+    taskId: normalizedTaskId,
+    tabId: normalizedTabId,
+    state: 'active',
+  });
+  return {...result, active: true, taskId: normalizedTaskId};
+}
+
+export async function updateCaptureTaskSession(
+  {taskId = '', progress = {}} = {},
+  options = {},
+) {
+  const session = resolveActiveCaptureTaskSession(taskId);
+  if (!session) {
+    return {ok: true, skipped: true, reason: 'no_active_task_session'};
+  }
+
+  return await sendCaptureTaskLifecycleMessage(
+    CAPTURE_TASK_MESSAGE_TYPE.UPDATE,
+    {
+      taskId: session.taskId,
+      progress:
+        progress && typeof progress === 'object' && !Array.isArray(progress)
+          ? progress
+          : {},
+    },
+    options,
+  );
+}
+
+export async function registerCaptureTaskTab(
+  {taskId = '', tabId = null, role = 'worker'} = {},
+  options = {},
+) {
+  const normalizedTaskId = normalizeCaptureTaskId(taskId);
+  const session = normalizedTaskId
+    ? resolveActiveCaptureTaskSession(normalizedTaskId)
+    : null;
+  const normalizedTabId = Number(tabId);
+  if (!session) {
+    return {ok: true, skipped: true, reason: 'no_active_task_session'};
+  }
+  if (!Number.isSafeInteger(normalizedTabId) || normalizedTabId <= 0) {
+    return {ok: false, skipped: true, reason: 'invalid_task_tab'};
+  }
+
+  return await sendCaptureTaskLifecycleMessage(
+    CAPTURE_TASK_MESSAGE_TYPE.REGISTER_TAB,
+    {
+      taskId: session.taskId,
+      tabId: normalizedTabId,
+      role: String(role || 'worker').trim().toLowerCase().slice(0, 40),
+    },
+    options,
+  );
+}
+
+export async function endCaptureTaskSession(
+  {taskId = '', reason = 'completed', status = 'completed'} = {},
+  options = {},
+) {
+  const session = resolveActiveCaptureTaskSession(taskId);
+  if (!session) {
+    return {ok: true, skipped: true, reason: 'no_active_task_session'};
+  }
+
+  session.state = 'ending';
+  const endPayload = {
+    taskId: session.taskId,
+    reason: String(reason || 'completed').trim().slice(0, 120),
+    status: String(status || 'completed').trim().slice(0, 80),
+  };
+  let result = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    result = await sendCaptureTaskLifecycleMessage(
+      CAPTURE_TASK_MESSAGE_TYPE.END,
+      endPayload,
+      options,
+    );
+    const terminallyAbsent =
+      result?.reason === 'capture_task_not_found' ||
+      result?.response?.error?.code === 'capture_task_not_found';
+    if (result?.ok === true || terminallyAbsent || attempt === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  const terminallyAbsent =
+    result?.reason === 'capture_task_not_found' ||
+    result?.response?.error?.code === 'capture_task_not_found';
+  if (result?.ok === true || terminallyAbsent) {
+    if (activeCaptureTaskSessions.get(session.taskId) === session) {
+      activeCaptureTaskSessions.delete(session.taskId);
+    }
+  } else {
+    session.state = 'active';
+  }
+  return result;
+}
 
 function trackCoreCaptureSuccess(recordCount, metadata = {}) {
   // 福利中心未纳入本 fork:原 0.1.7 的 welfare 埋点在此 no-op(保留函数壳,调用点不受影响)
@@ -142,6 +341,9 @@ const DETAIL_CAPTURE_AFTER_NAV_WAIT_MS = 2000;
 // ensureXhsNoteUrlSource),不是请求频率;这里保留小幅随机间隔做基本礼貌,不必拉长。
 const DETAIL_ITEM_DELAY_MIN_MS = 2000;
 const DETAIL_ITEM_DELAY_MAX_MS = 5000;
+const DETAIL_PREFETCH_WORKER_COUNT = 2;
+const DETAIL_PREFETCH_NAV_GAP_MS = 3000;
+const DETAIL_PREFETCH_STOP_TIMEOUT_MS = 1500;
 // 进博主主页前的小随机抖动:打散「笔记页 → 主页」的连续导航(burst 也是风控信号)。
 const PROFILE_NAV_JITTER_MIN_MS = 1200;
 const PROFILE_NAV_JITTER_MAX_MS = 3200;
@@ -266,6 +468,9 @@ function trimMediaUrlList(list, primary = '', max = 3) {
 function compactSyncItemForBackend(item = {}) {
   const next = item && typeof item === 'object' ? {...item} : {};
 
+  // captureTrace 只用于扩展本地的「页面标记 ↔ 记录 ↔ 详情任务」寻址，
+  // 不是后端业务字段。避免仅因 trace 状态变化扩大同步 payload。
+  delete next.captureTrace;
   delete next.domLocator;
   delete next.domMatchHints;
   delete next.cardImageCandidates;
@@ -286,6 +491,441 @@ function compactSyncItemForBackend(item = {}) {
   return next;
 }
 
+function normalizeCaptureTraceSequence(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    (typeof value === 'string' && !value.trim())
+  ) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeCaptureTrace(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const sequence = normalizeCaptureTraceSequence(value.sequence);
+  const runId = String(value.runId || '').trim();
+  const identityKey = String(value.identityKey || '').trim();
+  if (sequence === null && !runId && !identityKey) {
+    return null;
+  }
+
+  return {
+    ...value,
+    version: value.version ?? 1,
+    runId,
+    sequence,
+    identityKey,
+    state: String(value.state || '').trim(),
+    recordId: String(value.recordId || '').trim(),
+  };
+}
+
+function normalizeCompleteCaptureTrace(value) {
+  const normalized = normalizeCaptureTrace(value);
+  if (
+    !normalized ||
+    Number(normalized.version) !== 1 ||
+    !normalized.runId ||
+    normalized.sequence === null ||
+    !normalized.identityKey ||
+    !normalized.state
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function selectBestCaptureTrace(candidates = []) {
+  const normalized = (Array.isArray(candidates) ? candidates : [])
+    .map((candidate) => normalizeCaptureTrace(candidate))
+    .filter(Boolean);
+  return (
+    normalized.find((candidate) => normalizeCompleteCaptureTrace(candidate)) ||
+    normalized[0] ||
+    null
+  );
+}
+
+function resolveCaptureTraceFromPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const firstItem = Array.isArray(payload.items) ? payload.items[0] : null;
+  return selectBestCaptureTrace([
+    payload.captureTrace,
+    firstItem?.captureTrace,
+  ]);
+}
+
+function resolveCaptureTraceFromRecord(record) {
+  if (!record || typeof record !== 'object') {
+    return null;
+  }
+  return selectBestCaptureTrace([
+    record.captureTrace,
+    resolveCaptureTraceFromPayload(record.payload),
+    resolveCaptureTraceFromPayload(record.normalizedPayload),
+    resolveCaptureTraceFromPayload(record.rawPayload),
+    record.meta?.captureTrace,
+  ]);
+}
+
+function bindCaptureTrace(trace, recordId, state = 'saved') {
+  const normalized = normalizeCompleteCaptureTrace(trace);
+  if (!normalized) {
+    return null;
+  }
+  return {
+    ...normalized,
+    recordId: String(recordId || normalized.recordId || '').trim(),
+    state: String(state || normalized.state || '').trim(),
+  };
+}
+
+function applyCaptureTraceToPayload(payload, trace) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const normalized = normalizeCompleteCaptureTrace(trace);
+  if (!normalized) {
+    return source;
+  }
+
+  const next = {
+    ...source,
+    captureTrace: {...normalized},
+  };
+  if (Array.isArray(source.items) && source.items.length > 0) {
+    next.items = source.items.map((item, index) =>
+      index === 0 && item && typeof item === 'object'
+        ? {...item, captureTrace: {...normalized}}
+        : item,
+    );
+  }
+  return next;
+}
+
+function applyCaptureTraceToRecord(record, trace) {
+  if (!record || typeof record !== 'object') {
+    return record;
+  }
+  const normalized = normalizeCompleteCaptureTrace(trace);
+  if (!normalized) {
+    return record;
+  }
+
+  const nextPayload = applyCaptureTraceToPayload(
+    record.payload || record.normalizedPayload,
+    normalized,
+  );
+  const rawPayload =
+    record.rawPayload && typeof record.rawPayload === 'object'
+      ? record.rawPayload
+      : {};
+  const nextRawPayload =
+    Object.keys(rawPayload).length > 0
+      ? applyCaptureTraceToPayload(rawPayload, normalized)
+      : rawPayload;
+  return {
+    ...record,
+    rawPayload: nextRawPayload,
+    normalizedPayload: nextPayload,
+    payload: nextPayload,
+  };
+}
+
+function buildCaptureTraceBinding(trace) {
+  const normalized = normalizeCompleteCaptureTrace(trace);
+  if (!normalized || !normalized.recordId) {
+    return null;
+  }
+  return {
+    version: normalized.version,
+    runId: normalized.runId,
+    sequence: normalized.sequence,
+    identityKey: normalized.identityKey,
+    recordId: normalized.recordId,
+    state: normalized.state,
+  };
+}
+
+function compareCaptureTraceBindings(left, right) {
+  const leftSequence = normalizeCaptureTraceSequence(left?.sequence);
+  const rightSequence = normalizeCaptureTraceSequence(right?.sequence);
+  if (leftSequence !== null || rightSequence !== null) {
+    if (leftSequence === null) return 1;
+    if (rightSequence === null) return -1;
+    if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+  }
+  const runCompare = String(left?.runId || '').localeCompare(
+    String(right?.runId || ''),
+  );
+  if (runCompare !== 0) return runCompare;
+  return String(left?.identityKey || '').localeCompare(
+    String(right?.identityKey || ''),
+  );
+}
+
+function mergeCaptureTraceBinding(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const sameRun =
+    String(existing.runId || '') === String(incoming.runId || '');
+  const sameIdentity =
+    String(existing.identityKey || '') === String(incoming.identityKey || '');
+  if (!sameRun || !sameIdentity) {
+    return incoming;
+  }
+  const existingSequence = normalizeCaptureTraceSequence(existing.sequence);
+  const incomingSequence = normalizeCaptureTraceSequence(incoming.sequence);
+  return {
+    ...existing,
+    ...incoming,
+    sequence:
+      existingSequence !== null && incomingSequence !== null
+        ? Math.min(existingSequence, incomingSequence)
+        : incomingSequence ?? existingSequence,
+  };
+}
+
+function sortCaptureTraceBindings(bindings = []) {
+  const byRecordId = new Map();
+  (Array.isArray(bindings) ? bindings : []).forEach((binding) => {
+    const normalized = buildCaptureTraceBinding(binding);
+    if (!normalized) return;
+    const key = normalized.recordId;
+    byRecordId.set(
+      key,
+      mergeCaptureTraceBinding(byRecordId.get(key), normalized),
+    );
+  });
+  return [...byRecordId.values()].sort(compareCaptureTraceBindings);
+}
+
+function upsertCaptureTraceBindings(target, bindings = []) {
+  if (!Array.isArray(target)) return [];
+  const sorted = sortCaptureTraceBindings([...target, ...bindings]);
+  target.splice(0, target.length, ...sorted);
+  return target;
+}
+
+function orderRecordIdsByCaptureTrace(recordIds = [], bindings = []) {
+  const uniqueRecordIds = [
+    ...new Set(
+      (Array.isArray(recordIds) ? recordIds : [])
+        .map((recordId) => String(recordId || '').trim())
+        .filter(Boolean),
+    ),
+  ];
+  const recordIdSet = new Set(uniqueRecordIds);
+  const ordered = sortCaptureTraceBindings(bindings)
+    .map((binding) => binding.recordId)
+    .filter((recordId) => recordIdSet.has(recordId));
+  const orderedSet = new Set(ordered);
+  uniqueRecordIds.forEach((recordId) => {
+    if (!orderedSet.has(recordId)) {
+      ordered.push(recordId);
+    }
+  });
+  return ordered;
+}
+
+function buildCaptureTraceEventFields(recordOrTrace) {
+  const candidate =
+    recordOrTrace &&
+    typeof recordOrTrace === 'object' &&
+    ('runId' in recordOrTrace || 'identityKey' in recordOrTrace || 'sequence' in recordOrTrace)
+      ? normalizeCaptureTrace(recordOrTrace)
+      : resolveCaptureTraceFromRecord(recordOrTrace);
+  const trace = normalizeCompleteCaptureTrace(candidate);
+  return {
+    captureSequence: trace?.sequence ?? null,
+    captureRunId: String(trace?.runId || ''),
+    captureIdentityKey: String(trace?.identityKey || ''),
+  };
+}
+
+function formatCaptureTraceMarker(fields = {}, fallbackSequence = null) {
+  const sequence = normalizeCaptureTraceSequence(fields.captureSequence);
+  const hasCompleteTrace = Boolean(
+    sequence !== null &&
+      String(fields.captureRunId || '').trim() &&
+      String(fields.captureIdentityKey || '').trim(),
+  );
+  if (hasCompleteTrace) {
+    return `标记 #${sequence}`;
+  }
+  const itemNumber = normalizeCaptureTraceSequence(fallbackSequence);
+  return itemNumber === null
+    ? '未关联页面标记'
+    : `第 ${itemNumber} 条（未关联页面标记）`;
+}
+
+function formatCaptureTraceProgressLabel(
+  fields = {},
+  current = null,
+  total = null,
+) {
+  const sequence = normalizeCaptureTraceSequence(fields.captureSequence);
+  const hasCompleteTrace = Boolean(
+    sequence !== null &&
+      String(fields.captureRunId || '').trim() &&
+      String(fields.captureIdentityKey || '').trim(),
+  );
+  const currentNumber = normalizeCaptureTraceSequence(current);
+  const totalNumber = normalizeCaptureTraceSequence(total);
+  const position =
+    currentNumber === null
+      ? ''
+      : totalNumber === null
+        ? `第 ${currentNumber} 条`
+        : `第 ${currentNumber}/${totalNumber} 条`;
+  if (!hasCompleteTrace) {
+    return position
+      ? `${position}（未关联页面标记）`
+      : '未关联页面标记';
+  }
+  return position ? `标记 #${sequence}（${position}）` : `标记 #${sequence}`;
+}
+
+async function reportProgressFailSoft(onProgress, payload, context = 'capture') {
+  if (typeof onProgress !== 'function') {
+    return false;
+  }
+  try {
+    await Promise.resolve(onProgress(payload));
+    return true;
+  } catch (error) {
+    console.warn(
+      `[CaptureSync] ${context} progress callback failed (ignored):`,
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
+function transitionRecordCaptureTrace(record, payload, state) {
+  const trace = resolveCaptureTraceFromRecord({
+    ...(record && typeof record === 'object' ? record : {}),
+    payload,
+  });
+  const boundTrace = bindCaptureTrace(trace, record?.id, state);
+  return {
+    payload: boundTrace
+      ? applyCaptureTraceToPayload(payload, boundTrace)
+      : payload,
+    trace: boundTrace,
+    binding: buildCaptureTraceBinding(boundTrace),
+  };
+}
+
+async function sendCaptureTraceBindingsToTab(tabId, bindings = []) {
+  const normalizedTabId = Number(tabId);
+  const normalizedBindings = sortCaptureTraceBindings(bindings).filter(
+    (binding) =>
+      binding.runId &&
+      binding.identityKey &&
+      binding.sequence !== null &&
+      binding.recordId,
+  );
+  if (
+    !Number.isFinite(normalizedTabId) ||
+    normalizedTabId <= 0 ||
+    normalizedBindings.length === 0
+  ) {
+    return false;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: normalizedTabId,
+      payload: appendTaskContext(
+        {
+          action: 'updateListCaptureTraceBindings',
+          bindings: normalizedBindings,
+        },
+        getActiveTaskContext(),
+      ),
+    });
+    if (response?.ok === false) {
+      console.debug(
+        '[CaptureSync] capture trace binding relay ignored:',
+        response?.error?.message || 'content unavailable',
+      );
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.debug(
+      '[CaptureSync] capture trace binding relay failed (ignored):',
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
+async function requestCaptureCancelInTabFailSoft(tabId, reason = '') {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isSafeInteger(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: normalizedTabId,
+      payload: appendTaskContext(
+        {
+          action: 'cancelCapture',
+          reason: String(reason || '').trim().slice(0, 120),
+        },
+        getActiveTaskContext(),
+      ),
+    });
+    return response?.ok !== false;
+  } catch (error) {
+    console.warn(
+      '[CaptureSync] cancel active detail worker failed (ignored):',
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
+async function persistAndPublishCaptureTraceState({
+  recordId,
+  state,
+  record = null,
+  tabId = null,
+} = {}) {
+  try {
+    const latestRecord = record || (recordId ? await getRecord(recordId) : null);
+    const trace = bindCaptureTrace(
+      resolveCaptureTraceFromRecord(latestRecord),
+      recordId || latestRecord?.id,
+      state,
+    );
+    const binding = buildCaptureTraceBinding(trace);
+    if (!latestRecord || !trace || !binding) {
+      return null;
+    }
+    const nextPayload = applyCaptureTraceToPayload(latestRecord.payload, trace);
+    await updateRecord(latestRecord.id, {payload: nextPayload});
+    await sendCaptureTraceBindingsToTab(tabId, [binding]);
+    return trace;
+  } catch (error) {
+    console.debug(
+      '[CaptureSync] capture trace state update failed (ignored):',
+      error?.message || error,
+    );
+    return null;
+  }
+}
+
 // ==================== M4-03: 前端接入 sync 调用 ====================
 function createListCaptureCheckpointSession({mode = '', source = ''} = {}) {
   if (!isListCaptureRecordType(mode)) {
@@ -299,8 +939,11 @@ function createListCaptureCheckpointSession({mode = '', source = ''} = {}) {
     startedAt: Date.now(),
     queue: Promise.resolve(),
     knownKeys: new Set(),
+    recordIdByKey: new Map(),
+    recordIds: [],
     savedRecordIds: [],
     skippedRecordIds: [],
+    traceBindings: [],
     savedRecords: [],
     stats: {
       savedCount: 0,
@@ -330,12 +973,14 @@ function finishListCaptureCheckpointSession(session) {
 
 function collectListCaptureSessionRecordIds(session) {
   if (!session) return [];
-  return [
-    ...new Set([
+  return orderRecordIdsByCaptureTrace(
+    [
+      ...(session.recordIds || []),
       ...(session.savedRecordIds || []),
       ...(session.skippedRecordIds || []),
-    ]),
-  ];
+    ],
+    session.traceBindings,
+  );
 }
 
 export function getActiveListCaptureCheckpointStats() {
@@ -345,6 +990,7 @@ export function getActiveListCaptureCheckpointStats() {
     ...session.stats,
     savedRecordIds: [...session.savedRecordIds],
     skippedRecordIds: [...session.skippedRecordIds],
+    traceBindings: sortCaptureTraceBindings(session.traceBindings),
   };
 }
 
@@ -490,6 +1136,9 @@ function createListCaptureCacheStats(session, extra = {}) {
     lastSkippedCount: Number(stats.lastSkippedCount || 0),
     savedRecordIds: safeSession ? [...safeSession.savedRecordIds] : [],
     skippedRecordIds: safeSession ? [...safeSession.skippedRecordIds] : [],
+    traceBindings: safeSession
+      ? sortCaptureTraceBindings(safeSession.traceBindings)
+      : [],
     ...extra,
   };
 }
@@ -602,6 +1251,57 @@ function mergeKeywordMatchLabelsInPlace(existingRecord, freshRecord) {
   return true;
 }
 
+function mergeCaptureTraceIntoExistingRecord(existingRecord, freshRecord) {
+  const freshTrace = resolveCaptureTraceFromRecord(freshRecord);
+  if (!existingRecord || !freshTrace) {
+    return {changed: false, binding: null};
+  }
+
+  const currentTrace = resolveCaptureTraceFromRecord(existingRecord);
+  let nextTrace = bindCaptureTrace(freshTrace, existingRecord.id, 'saved');
+  if (
+    currentTrace &&
+    currentTrace.runId === nextTrace?.runId &&
+    currentTrace.identityKey === nextTrace?.identityKey &&
+    currentTrace.sequence !== null &&
+    nextTrace?.sequence !== null &&
+    currentTrace.sequence < nextTrace.sequence
+  ) {
+    nextTrace = {...nextTrace, sequence: currentTrace.sequence};
+  }
+  if (!nextTrace) {
+    return {changed: false, binding: null};
+  }
+
+  const currentComparable = currentTrace
+    ? JSON.stringify(bindCaptureTrace(currentTrace, existingRecord.id, currentTrace.state))
+    : '';
+  const nextComparable = JSON.stringify(nextTrace);
+  if (currentComparable === nextComparable) {
+    return {
+      changed: false,
+      binding: buildCaptureTraceBinding(nextTrace),
+    };
+  }
+
+  const updatedRecord = applyCaptureTraceToRecord(existingRecord, nextTrace);
+  Object.assign(existingRecord, updatedRecord, {updatedAt: Date.now()});
+  return {
+    changed: true,
+    binding: buildCaptureTraceBinding(nextTrace),
+  };
+}
+
+function uniqueRecordsById(records = []) {
+  const byId = new Map();
+  (Array.isArray(records) ? records : []).forEach((record) => {
+    const recordId = String(record?.id || '').trim();
+    if (!recordId || byId.has(recordId)) return;
+    byId.set(recordId, record);
+  });
+  return [...byId.values()];
+}
+
 async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
   const normalizedRecords = Array.isArray(records) ? records.filter(Boolean) : [];
   if (normalizedRecords.length === 0) {
@@ -610,6 +1310,8 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
       skippedCount: 0,
       skippedRecordIds: [],
       recordIds: [],
+      syncRecordIds: [],
+      traceBindings: [],
     };
   }
 
@@ -701,6 +1403,8 @@ async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
       return {
         savedRecords: [],
         recordIds: [],
+        syncRecordIds: [],
+        traceBindings: [],
         cacheStats: null,
       };
     }
@@ -708,10 +1412,20 @@ async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
       recordsToSave.length === 1
         ? [await addRecord(recordsToSave[0])]
         : await addRecords(recordsToSave);
-    const recordIds = savedRecords.map((record) => record?.id).filter(Boolean);
+    const traceBindings = sortCaptureTraceBindings(
+      savedRecords
+        .map((record) => buildCaptureTraceBinding(resolveCaptureTraceFromRecord(record)))
+        .filter(Boolean),
+    );
+    const recordIds = orderRecordIdsByCaptureTrace(
+      savedRecords.map((record) => record?.id).filter(Boolean),
+      traceBindings,
+    );
     return {
       savedRecords,
       recordIds,
+      syncRecordIds: recordIds,
+      traceBindings,
       cacheStats: null,
     };
   }
@@ -720,20 +1434,31 @@ async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
     await session.queue.catch(() => null);
   }
   const finalSave = await saveRecordsWithCacheDedupe(recordsToSave, {session});
-  const recordIds = [
-    ...new Set([
-      ...(session?.savedRecordIds || []),
-      ...(session?.skippedRecordIds || []),
+  const traceBindings = sortCaptureTraceBindings([
+    ...(session?.traceBindings || []),
+    ...finalSave.traceBindings,
+  ]);
+  const recordIds = orderRecordIdsByCaptureTrace(
+    [
+      ...collectListCaptureSessionRecordIds(session),
       ...finalSave.recordIds,
-    ]),
-  ];
+    ],
+    traceBindings,
+  );
+  const savedRecords = uniqueRecordsById([
+    ...(session?.savedRecords || []),
+    ...finalSave.savedRecords,
+  ]);
+  const syncRecordIds = orderRecordIdsByCaptureTrace(
+    savedRecords.map((record) => record?.id),
+    traceBindings,
+  );
 
   return {
-    savedRecords: [
-      ...(session?.savedRecords || []),
-      ...finalSave.savedRecords,
-    ],
+    savedRecords,
     recordIds,
+    syncRecordIds,
+    traceBindings,
     cacheStats: createListCaptureCacheStats(session, {
       finalSkippedCount: finalSave.skippedCount,
       finalSavedCount: finalSave.savedRecords.length,
@@ -1074,10 +1799,15 @@ export async function captureAndSync({
   onProgress = null,
   autoSync = true,
   captureParams = {},
+  shouldStop = null,
+  signal = null,
 } = {}) {
   let savedRecords = [];
   let recordIds = [];
+  let syncRecordIds = [];
+  let traceBindings = [];
   let recordId = null;
+  let sourceCaptureTabId = null;
   let syncStartedAt = Date.now();
   let captureCacheStats = null;
   const checkpointSession = beginListCaptureCheckpointSession({
@@ -1104,6 +1834,12 @@ export async function captureAndSync({
       mode,
       onProgress,
       captureParams,
+      onTargetTab: (tab) => {
+        const resolvedTabId = Number(tab?.id);
+        if (Number.isFinite(resolvedTabId) && resolvedTabId > 0) {
+          sourceCaptureTabId = resolvedTabId;
+        }
+      },
     });
 
     // 步骤 3: 检查采集是否成功
@@ -1112,6 +1848,10 @@ export async function captureAndSync({
         await checkpointSession.queue.catch(() => null);
       }
       captureCacheStats = createListCaptureCacheStats(checkpointSession);
+      traceBindings = sortCaptureTraceBindings(
+        checkpointSession?.traceBindings || [],
+      );
+      await sendCaptureTraceBindingsToTab(sourceCaptureTabId, traceBindings);
       finishListCaptureCheckpointSession(checkpointSession);
       await updateCapture({
         status: CAPTURE_STATUS.FAILED,
@@ -1125,6 +1865,7 @@ export async function captureAndSync({
         syncResult: null,
         recordId: null,
         recordIds: collectListCaptureSessionRecordIds(checkpointSession),
+        traceBindings,
         captureCacheStats,
         error: captureResult.error,
       };
@@ -1144,7 +1885,14 @@ export async function captureAndSync({
     finishListCaptureCheckpointSession(checkpointSession);
     savedRecords = saveResult.savedRecords || [];
     recordIds = Array.isArray(saveResult.recordIds) ? saveResult.recordIds : [];
+    syncRecordIds = Array.isArray(saveResult.syncRecordIds)
+      ? saveResult.syncRecordIds
+      : [];
+    traceBindings = Array.isArray(saveResult.traceBindings)
+      ? saveResult.traceBindings
+      : [];
     captureCacheStats = saveResult.cacheStats || captureCacheStats;
+    await sendCaptureTraceBindingsToTab(sourceCaptureTabId, traceBindings);
 
     if (recordIds.length > 0) {
       recordId = recordIds[0] || null;
@@ -1166,11 +1914,12 @@ export async function captureAndSync({
         message: `已保存到本地（${recordIds.length} 条）`,
         recordId,
         recordIds,
+        traceBindings,
       });
     }
 
     // 步骤 5: 如果不自动同步，到此结束
-    if (!autoSync || recordIds.length === 0) {
+    if (!autoSync || syncRecordIds.length === 0) {
       return {
         ok: true,
         phase: 'saved',
@@ -1178,12 +1927,24 @@ export async function captureAndSync({
         syncResult: null,
         recordId,
         recordIds,
+        traceBindings,
         captureCacheStats,
         error: null,
       };
     }
 
     // 步骤 6: 执行同步前检查（M4-05）
+    if (isSyncCancellationRequested(shouldStop, signal)) {
+      return {
+        ...buildCanceledSyncResult(),
+        phase: 'canceled',
+        captureResult,
+        syncResult: null,
+        recordId,
+        recordIds,
+        traceBindings,
+      };
+    }
     if (onProgress) {
       onProgress({
         phase: 'sync_check',
@@ -1205,10 +1966,21 @@ export async function captureAndSync({
       requiredSyncTypes,
       { onProgress },
     );
+    if (isSyncCancellationRequested(shouldStop, signal)) {
+      return {
+        ...buildCanceledSyncResult(),
+        phase: 'canceled',
+        captureResult,
+        syncResult: null,
+        recordId,
+        recordIds,
+        traceBindings,
+      };
+    }
     if (!checkResult.ok) {
       await appendFrontendSyncFailureHistory({
         records: savedRecords,
-        recordIds,
+        recordIds: syncRecordIds,
         requiredSyncTypes,
         error: checkResult.error || checkResult,
         phase: 'sync_check',
@@ -1224,6 +1996,8 @@ export async function captureAndSync({
         captureResult,
         syncResult: null,
         recordId,
+        recordIds,
+        traceBindings,
         error: checkResult.error,
       };
     }
@@ -1239,11 +2013,17 @@ export async function captureAndSync({
     }
 
     const syncResult =
-      recordIds.length === 1
-        ? await syncRecord(recordId, onProgress, { commentLeadsConfig })
-        : await syncRecordBatch(recordIds, onProgress, {
+      syncRecordIds.length === 1
+        ? await syncRecord(syncRecordIds[0], onProgress, {
+            commentLeadsConfig,
+            shouldStop,
+            signal,
+          })
+        : await syncRecordBatch(syncRecordIds, onProgress, {
             trigger: 'capture_auto',
             commentLeadsConfig,
+            shouldStop,
+            signal,
           });
 
     return {
@@ -1253,6 +2033,7 @@ export async function captureAndSync({
       syncResult,
       recordId,
       recordIds,
+      traceBindings,
       captureCacheStats,
       error: syncResult.error || null,
     };
@@ -1264,10 +2045,10 @@ export async function captureAndSync({
     captureCacheStats = captureCacheStats || createListCaptureCacheStats(checkpointSession);
     finishListCaptureCheckpointSession(checkpointSession);
 
-    if (autoSync && recordIds.length > 0) {
+    if (autoSync && syncRecordIds.length > 0) {
       await appendFrontendSyncFailureHistory({
         records: savedRecords,
-        recordIds,
+        recordIds: syncRecordIds,
         error,
         phase: 'sync_exception',
         source: 'captureAndSync',
@@ -1293,6 +2074,10 @@ export async function captureAndSync({
       syncResult: null,
       recordId: null,
       recordIds: collectListCaptureSessionRecordIds(checkpointSession),
+      traceBindings:
+        traceBindings.length > 0
+          ? traceBindings
+          : sortCaptureTraceBindings(checkpointSession?.traceBindings || []),
       captureCacheStats,
       error: {
         code: 'UNEXPECTED_ERROR',
@@ -1311,6 +2096,7 @@ async function captureAndSaveInTab({
 } = {}) {
   let savedRecords = [];
   let captureCacheStats = null;
+  let traceBindings = [];
   const checkpointSession = beginListCaptureCheckpointSession({
     mode,
     source: checkpointSource,
@@ -1340,6 +2126,10 @@ async function captureAndSaveInTab({
       captureCacheStats = createListCaptureCacheStats(checkpointSession);
       const partialRecordIds =
         collectListCaptureSessionRecordIds(checkpointSession);
+      traceBindings = sortCaptureTraceBindings(
+        checkpointSession?.traceBindings || [],
+      );
+      await sendCaptureTraceBindingsToTab(tabId, traceBindings);
       finishListCaptureCheckpointSession(checkpointSession);
       await updateCapture({
         status: CAPTURE_STATUS.FAILED,
@@ -1355,6 +2145,7 @@ async function captureAndSaveInTab({
         captureResult,
         savedRecords: [],
         recordIds: partialRecordIds,
+        traceBindings,
         captureCacheStats,
         error: captureResult?.error || null,
       };
@@ -1376,7 +2167,11 @@ async function captureAndSaveInTab({
     const recordIds = Array.isArray(saveResult.recordIds)
       ? saveResult.recordIds
       : [];
+    traceBindings = Array.isArray(saveResult.traceBindings)
+      ? saveResult.traceBindings
+      : [];
     captureCacheStats = saveResult.cacheStats || null;
+    await sendCaptureTraceBindingsToTab(tabId, traceBindings);
 
     await updateCapture({
       status: CAPTURE_STATUS.SUCCESS,
@@ -1395,6 +2190,7 @@ async function captureAndSaveInTab({
         phase: 'saved',
         message: `已保存到本地（${recordIds.length} 条）`,
         recordIds,
+        traceBindings,
       });
     }
 
@@ -1404,6 +2200,7 @@ async function captureAndSaveInTab({
       captureResult,
       savedRecords,
       recordIds,
+      traceBindings,
       captureCacheStats,
       error: null,
     };
@@ -1430,6 +2227,10 @@ async function captureAndSaveInTab({
       captureResult: null,
       savedRecords: [],
       recordIds: partialRecordIds,
+      traceBindings:
+        traceBindings.length > 0
+          ? traceBindings
+          : sortCaptureTraceBindings(checkpointSession?.traceBindings || []),
       captureCacheStats,
       error: {
         code: 'UNEXPECTED_ERROR',
@@ -1857,7 +2658,9 @@ export async function batchCaptureDetailsForRecords(
     detailAfterNavWaitMs = null,
     profileAfterNavWaitMs = null,
     skipAlreadyCaptured = null,
+    recaptureCommentsOnCountIncrease = null,
     waitForegroundTabId = null,
+    captureTaskId = '',
   } = {},
 ) {
   const uniqueRecordIds = Array.isArray(recordIds)
@@ -1928,7 +2731,15 @@ export async function batchCaptureDetailsForRecords(
   // 不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。查询失败则不跳过(顶多多采几条,不影响主流程)。
   const resolvedSkipCaptured =
     skipAlreadyCaptured ?? settings.skipAlreadyCapturedOnDetailCapture ?? true;
+  const resolvedRecaptureCommentsOnIncrease =
+    Boolean(includeComments) &&
+    Boolean(
+      recaptureCommentsOnCountIncrease ??
+        settings.recaptureCommentsOnCountIncrease ??
+        true,
+    );
   let skipRecordIdSet = new Set();
+  let recaptureCommentRecordIdSet = new Set();
   if (resolvedSkipCaptured) {
     try {
       const idPairs = [];
@@ -1943,6 +2754,7 @@ export async function batchCaptureDetailsForRecords(
             recordId: rid,
             externalId: String(ext),
             payload: rec.payload,
+            commentsCount: resolveRecordListCommentsCount(rec),
           });
         }
       }
@@ -1951,6 +2763,7 @@ export async function batchCaptureDetailsForRecords(
       // ① 本地已采全(detailCaptureStatus=done)的 external_id —— 覆盖「循环内 / 同会话」重复,
       //    不依赖同步到后台(无人值守循环不会每轮自动同步,所以第2轮跳第1轮要靠这个)。
       const localDone = new Set();
+      const localDoneStatusByExt = new Map();
       try {
         const pool = await getDataPool();
         for (const rec of pool?.records || []) {
@@ -1959,6 +2772,10 @@ export async function batchCaptureDetailsForRecords(
           if (ext && candidateExtIds.has(String(ext))) {
             const normalizedExt = String(ext);
             localDone.add(normalizedExt);
+            localDoneStatusByExt.set(
+              normalizedExt,
+              buildCapturedCommentStatus(rec),
+            );
           }
         }
       } catch (poolError) {
@@ -1966,21 +2783,51 @@ export async function batchCaptureDetailsForRecords(
       }
 
       // ② 后台已采全的 —— 覆盖「跨夜 / 跨会话」(需之前同步过)
-      const { captured } = await checkCapturedExternalIds({
+      const {captured, items: remoteCapturedItems = []} =
+        await checkCapturedExternalIds({
         platform: probePlatform,
         externalIds: idPairs.map((p) => p.externalId),
       });
       const capturedSet = new Set(captured);
+      const remoteDoneStatusByExt = new Map(
+        remoteCapturedItems
+          .map((item) => [
+            String(item?.externalId || '').trim(),
+            {
+              commentsCount: normalizeOptionalCount(item?.commentsCount),
+              commentsBaselineCount: normalizeOptionalCount(
+                item?.commentsBaselineCount,
+              ),
+              capturedAt: normalizeOptionalTimestamp(item?.capturedAt),
+              hasBaseline:
+                normalizeOptionalCount(item?.commentsBaselineCount) !== null,
+            },
+          ])
+          .filter(([externalId]) => externalId),
+      );
 
       const nextSkipRecordIds = [];
+      const nextRecaptureCommentRecordIds = [];
       idPairs.forEach((p) => {
         const isCaptured =
           capturedSet.has(p.externalId) || localDone.has(p.externalId);
         if (!isCaptured) return;
+        const shouldRecaptureComments =
+          resolvedRecaptureCommentsOnIncrease &&
+          hasCommentCountIncreasedSinceLastCapture({
+            currentCommentsCount: p.commentsCount,
+            localStatus: localDoneStatusByExt.get(p.externalId),
+            remoteStatus: remoteDoneStatusByExt.get(p.externalId),
+          });
+        if (shouldRecaptureComments) {
+          nextRecaptureCommentRecordIds.push(p.recordId);
+          return;
+        }
         nextSkipRecordIds.push(p.recordId);
       });
 
       skipRecordIdSet = new Set(nextSkipRecordIds);
+      recaptureCommentRecordIdSet = new Set(nextRecaptureCommentRecordIds);
 
       // 给跳过的记录打「已采过」标记,卡片据此显示"已采过"而非"未执行采集增强"
       for (const p of idPairs) {
@@ -2001,12 +2848,36 @@ export async function batchCaptureDetailsForRecords(
     } catch (error) {
       console.warn('[CaptureSync] 增量采集预检失败(忽略,照常补采):', error);
       skipRecordIdSet = new Set();
+      recaptureCommentRecordIdSet = new Set();
     }
   }
   // 全部已采过 → 不必开补采标签页,直接返回
   if (skipRecordIdSet.size > 0 && skipRecordIdSet.size === uniqueRecordIds.length) {
+    const skippedResults = [];
+    for (let index = 0; index < uniqueRecordIds.length; index += 1) {
+      const recordId = uniqueRecordIds[index];
+      const record = await getRecord(recordId);
+      const captureTraceFields = buildCaptureTraceEventFields(record);
+      const markerLabel = formatCaptureTraceMarker(
+        captureTraceFields,
+        index + 1,
+      );
+      await persistAndPublishCaptureTraceState({
+        recordId,
+        state: 'skipped',
+        record,
+        tabId: activeTab?.id,
+      });
+      skippedResults.push({
+        recordId,
+        ok: true,
+        reason: 'already_captured',
+        message: `${markerLabel} 已采过，跳过`,
+        ...captureTraceFields,
+      });
+    }
     if (onProgress) {
-      onProgress({
+      await reportProgressFailSoft(onProgress, {
         phase: 'detail_batch_done',
         message: `全部 ${uniqueRecordIds.length} 条均已采过,跳过补采`,
         current: uniqueRecordIds.length,
@@ -2014,7 +2885,7 @@ export async function batchCaptureDetailsForRecords(
         successCount: 0,
         failedCount: 0,
         filteredCount: uniqueRecordIds.length,
-      });
+      }, 'detail batch done');
     }
     return {
       ok: true,
@@ -2025,12 +2896,7 @@ export async function batchCaptureDetailsForRecords(
       successCount: 0,
       failedCount: 0,
       filteredCount: uniqueRecordIds.length,
-      results: [...skipRecordIdSet].map((recordId) => ({
-        recordId,
-        ok: true,
-        reason: 'already_captured',
-        message: '已采过,跳过',
-      })),
+      results: skippedResults,
       diagnostics: { stageTrace: [] },
       error: null,
     };
@@ -2043,15 +2909,25 @@ export async function batchCaptureDetailsForRecords(
   let filteredCount = 0;
   let skippedCount = 0; // 增量采集:之前已采过、本次跳过的条数(单列,不混入"过滤")
   let securityBlocked = false; // 撞上小红书安全限制(访问频繁/300013)→ 立即停整批,别再硬刷
+  let runnerInterrupted = false; // 任一 owned 工作页被关闭/中断后立即停批,绝不新建替代 worker
   let detailKeywordFilterEnabled = false;
   let detailKeywordFilteredCount = 0;
   let canceled = false;
   let runnerContext = null;
+  const runnerContexts = [];
+  let detailPrefetchPipeline = null;
+  let doubleBufferFallbackReason = '';
+  let activeDetailItemContext = null;
+  let batchUnexpectedError = null;
+  const fatalCancelRequestedTabIds = new Set();
 
   try {
     runnerContext = await prepareDetailBatchRunnerContext({
       sourceTab: activeTab,
+      runnerMode: DETAIL_RUNNER_MODE.DEDICATED_TAB,
+      indexOffset: 1,
     });
+    runnerContexts.push(runnerContext);
   } catch (error) {
     return {
       ok: false,
@@ -2068,55 +2944,305 @@ export async function batchCaptureDetailsForRecords(
     };
   }
 
-  if (onProgress) {
-    onProgress({
-      phase: 'detail_batch_start',
-      message: `开始批量补采详情（前台模式，共 ${uniqueRecordIds.length} 条）`,
-      current: 0,
-      total: uniqueRecordIds.length,
-      successCount,
-      failedCount,
+  const normalizedCaptureTaskId = normalizeCaptureTaskId(captureTaskId);
+  const taskTabRegistration = await registerCaptureTaskTab({
+    taskId: normalizedCaptureTaskId,
+    tabId: runnerContext.runnerTabId,
+    role: 'detail_worker',
+  });
+  const requiredTaskRegistrationMissing =
+    Boolean(normalizedCaptureTaskId) &&
+    (taskTabRegistration?.ok !== true || taskTabRegistration?.skipped === true);
+  if (taskTabRegistration?.ok === false || requiredTaskRegistrationMissing) {
+    await closeOwnedDetailRunnerTab({
       runnerTabId: runnerContext.runnerTabId,
-    });
+      sourceTabId: runnerContext.sourceTabId,
+      ownsRunnerTab: runnerContext.ownsRunnerTab,
+    }).catch(() => false);
+    return {
+      ok: false,
+      canceled: false,
+      total: uniqueRecordIds.length,
+      processedCount: 0,
+      successCount: 0,
+      failedCount: 0,
+      results: [],
+      error: {
+        code: 'TASK_TAB_GROUP_UNAVAILABLE',
+        message:
+          taskTabRegistration?.response?.error?.message ||
+          (taskTabRegistration?.skipped
+            ? '当前详情采集任务已失去浏览器接管状态'
+            : '') ||
+          '详情采集工作页无法加入当前任务标签组',
+      },
+    };
   }
+
+  const remainingDetailCount = Math.max(
+    0,
+    uniqueRecordIds.length - skipRecordIdSet.size,
+  );
+  if (
+    normalizedCaptureTaskId &&
+    remainingDetailCount >= DETAIL_PREFETCH_WORKER_COUNT
+  ) {
+    let standbyContext = null;
+    try {
+      standbyContext = await prepareDetailBatchRunnerContext({
+        sourceTab: activeTab,
+        runnerMode: DETAIL_RUNNER_MODE.DEDICATED_TAB,
+        indexOffset: 2,
+      });
+      if (
+        runnerContexts.some(
+          (context) => context.runnerTabId === standbyContext.runnerTabId,
+        )
+      ) {
+        throw new Error('双缓冲工作页编号冲突');
+      }
+      const standbyRegistration = await registerCaptureTaskTab({
+        taskId: normalizedCaptureTaskId,
+        tabId: standbyContext.runnerTabId,
+        role: 'detail_worker',
+      });
+      const standbyRegistrationMissing =
+        standbyRegistration?.ok !== true ||
+        standbyRegistration?.skipped === true;
+      if (standbyRegistrationMissing) {
+        const error = new Error(
+          standbyRegistration?.response?.error?.message ||
+            '预加载工作页未能加入当前任务标签组',
+        );
+        error.code = 'DETAIL_STANDBY_REGISTRATION_FAILED';
+        throw error;
+      }
+      runnerContexts.push(standbyContext);
+    } catch (error) {
+      doubleBufferFallbackReason =
+        error?.message || '第二个工作页不可用，已降级为单工作页';
+      if (standbyContext) {
+        await closeOwnedDetailRunnerTab({
+          runnerTabId: standbyContext.runnerTabId,
+          sourceTabId: standbyContext.sourceTabId,
+          ownsRunnerTab: standbyContext.ownsRunnerTab,
+        }).catch(() => false);
+      }
+      console.warn(
+        '[CaptureSync] detail double buffer unavailable, using one worker:',
+        error,
+      );
+    }
+  }
+
+  const shouldStopDetailBatch = () => {
+    if (detailPrefetchPipeline?.getFatalError()) return true;
+    if (typeof shouldStop !== 'function') return false;
+    try {
+      return Boolean(shouldStop());
+    } catch {
+      return true;
+    }
+  };
+
+  detailPrefetchPipeline = createDetailPrefetchPipeline({
+    workerTabs: runnerContexts.map((context, index) => ({
+      tabId: context.runnerTabId,
+      label: `工作页 ${String.fromCharCode(65 + index)}`,
+    })),
+    minNavigationGapMs: DETAIL_PREFETCH_NAV_GAP_MS,
+    stopTimeoutMs: DETAIL_PREFETCH_STOP_TIMEOUT_MS,
+    shouldStop,
+    isFatalError: isDetailSecurityBlockError,
+    navigate: async ({tabId, url, shouldStop: pipelineShouldStop}) => {
+      await openUrlInTab(tabId, url, {
+        timeoutMs: normalizedDetailNavTimeoutMs,
+        shouldStop: pipelineShouldStop,
+        active: false,
+      });
+      await probeDetailPreloadSafety(tabId);
+    },
+    onTransition: ({type, slot, snapshot, error}) => {
+      const fatalNavigationFailure =
+        (type === 'navigation_failed' ||
+          type === 'external_navigation_failed') &&
+        isDetailSecurityBlockError(error);
+      if (fatalNavigationFailure) {
+        securityBlocked = true;
+        const activeTabId = Number(snapshot?.activeTabId);
+        if (
+          Number.isSafeInteger(activeTabId) &&
+          activeTabId > 0 &&
+          !fatalCancelRequestedTabIds.has(activeTabId)
+        ) {
+          fatalCancelRequestedTabIds.add(activeTabId);
+          void requestCaptureCancelInTabFailSoft(
+            activeTabId,
+            'standby_security_blocked',
+          );
+        }
+      }
+      if (!onProgress || !slot) return;
+      if (type === 'navigation_started' && slot.mode === 'prefetch') {
+        void reportProgressFailSoft(onProgress, {
+          phase: 'detail_item_prefetch_loading',
+          message: `${slot.label} 正在预加载下一条详情...`,
+          recordId: slot.recordId,
+          runnerTabId: slot.tabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: snapshot?.activeTabId || null,
+          workerRevision: snapshot?.revision || 0,
+          workerStates: snapshot?.slots || [],
+        }, 'detail prefetch loading');
+      } else if (type === 'navigation_ready' && slot.mode === 'prefetch') {
+        void reportProgressFailSoft(onProgress, {
+          phase: 'detail_item_prefetch_ready',
+          message: `${slot.label} 已加载下一条，等待当前采集完成`,
+          recordId: slot.recordId,
+          runnerTabId: slot.tabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: snapshot?.activeTabId || null,
+          workerMode: snapshot?.mode || '',
+          workerRevision: snapshot?.revision || 0,
+          workerStates: snapshot?.slots || [],
+        }, 'detail prefetch ready');
+      } else if (type === 'collection_finished') {
+        void reportProgressFailSoft(onProgress, {
+          phase: 'detail_worker_released',
+          message: `${slot.label} 已完成当前详情，等待下一条`,
+          runnerTabId: slot.tabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: snapshot?.activeTabId || null,
+          workerMode: snapshot?.mode || '',
+          workerRevision: snapshot?.revision || 0,
+          workerStates: snapshot?.slots || [],
+        }, 'detail worker released');
+      }
+    },
+  });
+
+  const discardPrefetchForRecord = (recordId) => {
+    const normalizedRecordId = String(recordId || '').trim();
+    if (!normalizedRecordId) return false;
+    const slot = detailPrefetchPipeline
+      .snapshot()
+      .slots.find(
+        (candidate) =>
+          candidate.recordId === normalizedRecordId &&
+          candidate.url &&
+          candidate.state !== 'collecting',
+      );
+    return slot
+      ? detailPrefetchPipeline.discard({
+          recordId: normalizedRecordId,
+          url: slot.url,
+        })
+      : false;
+  };
+
+  const throwIfDetailPrefetchFatal = () => {
+    const error = detailPrefetchPipeline?.getFatalError() || null;
+    if (!error) return;
+    securityBlocked = true;
+    throw error;
+  };
+
+  await reportProgressFailSoft(onProgress, {
+    phase: 'detail_batch_start',
+    message:
+      runnerContexts.length > 1
+        ? `已启动双工作页：A 采集、B 预加载，共 ${uniqueRecordIds.length} 条`
+        : `已启动 1 个详情采集工作页，共 ${uniqueRecordIds.length} 条${doubleBufferFallbackReason ? '（双缓冲已安全降级）' : ''}`,
+    current: 0,
+    total: uniqueRecordIds.length,
+    successCount,
+    failedCount,
+    runnerTabId: runnerContext.runnerTabId,
+    runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+    activeRunnerTabId: null,
+    workerMode:
+      runnerContexts.length > 1 ? 'double_buffer' : 'single_worker',
+    workerRevision: detailPrefetchPipeline.snapshot().revision,
+    workerStates: detailPrefetchPipeline.snapshot().slots,
+    fallbackReason: doubleBufferFallbackReason,
+    sourceTabId: runnerContext.sourceTabId,
+    runnerRole: 'detail_worker',
+  }, 'detail batch start');
 
   // 增量采集:开跑前先告诉用户为什么只补一部分(否则客户看到跳过一脸懵)
   if (onProgress && skipRecordIdSet.size > 0) {
     const toCaptureCount = uniqueRecordIds.length - skipRecordIdSet.size;
+    const recaptureSuffix =
+      recaptureCommentRecordIdSet.size > 0
+        ? `，${recaptureCommentRecordIdSet.size} 条评论数增加将重采评论`
+        : '';
     onProgress({
       phase: 'detail_skip_summary',
-      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过),本次只补采 ${toCaptureCount} 条`,
+      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过)${recaptureSuffix},本次只补采 ${toCaptureCount} 条`,
       current: 0,
       total: uniqueRecordIds.length,
       skippedCount: skipRecordIdSet.size,
       toCaptureCount,
       runnerTabId: runnerContext.runnerTabId,
-    });
+    }, 'detail skip summary');
   }
 
   try {
     for (let index = 0; index < uniqueRecordIds.length; index += 1) {
-      if (typeof shouldStop === 'function' && shouldStop()) {
-        canceled = true;
+      if (shouldStopDetailBatch()) {
+        if (detailPrefetchPipeline.getFatalError()) {
+          securityBlocked = true;
+        } else {
+          canceled = true;
+        }
         break;
       }
 
       const recordId = uniqueRecordIds[index];
       const current = index + 1;
+      const record = await getRecord(recordId);
+      const captureTraceFields = buildCaptureTraceEventFields(record);
+      const markerLabel = formatCaptureTraceMarker(
+        captureTraceFields,
+        current,
+      );
+      const progressLabel = formatCaptureTraceProgressLabel(
+        captureTraceFields,
+        current,
+        uniqueRecordIds.length,
+      );
+      activeDetailItemContext = {
+        recordId,
+        record,
+        current,
+        noteUrl: '',
+        startedAt: 0,
+        activeStage: 'prepare',
+        captureTraceFields,
+        markerLabel,
+        progressLabel,
+      };
 
       // 增量采集:已采全的直接跳过(不开详情/不进主页)
       if (skipRecordIdSet.has(recordId)) {
         skippedCount += 1;
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'skipped',
+          record,
+          tabId: runnerContext.sourceTabId,
+        });
         results.push({
           recordId,
           ok: true,
           reason: 'already_captured',
-          message: '之前已采过,自动跳过',
+          message: `${markerLabel} 之前已采过，自动跳过`,
+          ...captureTraceFields,
         });
         if (onProgress) {
-          onProgress({
+          await reportProgressFailSoft(onProgress, {
             phase: 'detail_item_skipped',
-            message: `第 ${current}/${uniqueRecordIds.length} 条之前已采过,跳过(增量采集)`,
+            message: `${progressLabel}：之前已采过，跳过（增量采集）`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -2125,35 +3251,43 @@ export async function batchCaptureDetailsForRecords(
             filteredCount,
             skippedCount,
             runnerTabId: runnerContext.runnerTabId,
-          });
+            ...captureTraceFields,
+          }, 'detail item skipped');
         }
+        activeDetailItemContext = null;
         continue;
       }
 
-      const record = await getRecord(recordId);
-
       if (!record || !isDetailCaptureRecordType(record.type)) {
+        discardPrefetchForRecord(recordId);
         const failure = buildDetailCaptureFailure(
           DETAIL_CAPTURE_FAILURE_CODE.INVALID_RECORD,
           'prepare',
           '记录不存在或类型不支持补采详情',
         );
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'failed',
+          record,
+          tabId: runnerContext.sourceTabId,
+        });
         const result = {
           recordId,
           ok: false,
           reason: failure.code,
           category: failure.category,
           stage: failure.stage,
-          message: failure.userMessage,
+          message: `${markerLabel}：${failure.userMessage}`,
           diagnosticMessage: failure.diagnosticMessage,
+          ...captureTraceFields,
         };
         results.push(result);
         failedCount += 1;
 
         if (onProgress) {
-          onProgress({
+          await reportProgressFailSoft(onProgress, {
             phase: 'detail_item_failed',
-            message: `第 ${current}/${uniqueRecordIds.length} 条补采失败：记录无效`,
+            message: `${progressLabel}：补采失败，记录无效`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -2161,13 +3295,16 @@ export async function batchCaptureDetailsForRecords(
             failedCount,
             filteredCount,
             runnerTabId: runnerContext.runnerTabId,
-          });
+            ...captureTraceFields,
+          }, 'detail invalid record');
         }
+        activeDetailItemContext = null;
         continue;
       }
 
       const noteUrl = resolveRecordNoteUrl(record);
       if (!noteUrl) {
+        discardPrefetchForRecord(recordId);
         const latestRecord = (await getRecord(recordId)) || record;
         const failure = buildDetailCaptureFailure(
           DETAIL_CAPTURE_FAILURE_CODE.LINK_MISSING,
@@ -2188,10 +3325,18 @@ export async function batchCaptureDetailsForRecords(
             noteUrl: '',
           }),
         );
+        const failedTraceTransition = transitionRecordCaptureTrace(
+          latestRecord,
+          failedPayload,
+          'failed',
+        );
         await updateRecord(recordId, {
           status: RECORD_STATUS.DRAFT,
-          payload: failedPayload,
+          payload: failedTraceTransition.payload,
         });
+        await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+          failedTraceTransition.binding,
+        ]);
 
         const result = {
           recordId,
@@ -2199,16 +3344,17 @@ export async function batchCaptureDetailsForRecords(
           reason: failure.code,
           category: failure.category,
           stage: failure.stage,
-          message: failure.userMessage,
+          message: `${markerLabel}：${failure.userMessage}`,
           diagnosticMessage: failure.diagnosticMessage,
+          ...captureTraceFields,
         };
         results.push(result);
         failedCount += 1;
 
         if (onProgress) {
-          onProgress({
+          await reportProgressFailSoft(onProgress, {
             phase: 'detail_item_failed',
-            message: `第 ${current}/${uniqueRecordIds.length} 条补采失败：缺少笔记链接`,
+            message: `${progressLabel}：补采失败，缺少笔记链接`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -2216,12 +3362,20 @@ export async function batchCaptureDetailsForRecords(
             failedCount,
             filteredCount,
             runnerTabId: runnerContext.runnerTabId,
-          });
+            ...captureTraceFields,
+          }, 'detail missing link');
         }
+        activeDetailItemContext = null;
         continue;
       }
 
       const startedAt = Date.now();
+      activeDetailItemContext = {
+        ...activeDetailItemContext,
+        noteUrl,
+        startedAt,
+        activeStage: 'capturing',
+      };
       const capturingPayload = applyDetailCapturePatch(
         record.payload,
         createDetailCapturePatch({
@@ -2236,16 +3390,32 @@ export async function batchCaptureDetailsForRecords(
           noteUrl,
         }),
       );
+      const capturingTraceTransition = transitionRecordCaptureTrace(
+        record,
+        capturingPayload,
+        'capturing',
+      );
 
       await updateRecord(recordId, {
         status: RECORD_STATUS.DRAFT,
-        payload: capturingPayload,
+        payload: capturingTraceTransition.payload,
       });
+      activeDetailItemContext = {
+        ...activeDetailItemContext,
+        captureStarted: true,
+        record: {
+          ...record,
+          payload: capturingTraceTransition.payload,
+        },
+      };
+      await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+        capturingTraceTransition.binding,
+      ]);
 
       if (onProgress) {
-        onProgress({
+        await reportProgressFailSoft(onProgress, {
           phase: 'detail_item_capturing',
-          message: `正在补采第 ${current}/${uniqueRecordIds.length} 条详情...`,
+          message: `正在补采 ${progressLabel} 的详情...`,
           recordId,
           current,
           total: uniqueRecordIds.length,
@@ -2254,19 +3424,125 @@ export async function batchCaptureDetailsForRecords(
           failedCount,
           filteredCount,
           runnerTabId: runnerContext.runnerTabId,
-        });
+          ...captureTraceFields,
+        }, 'detail item capturing');
       }
 
       let activeStage = 'navigation';
-      try {
-        await openUrlInTab(runnerContext.runnerTabId, noteUrl, {
-          timeoutMs: normalizedDetailNavTimeoutMs,
-          shouldStop,
-          active: runnerContext.openTabAsActive,
+      activeDetailItemContext.activeStage = activeStage;
+      let detailWorkerLease = null;
+      let nextPrefetchCandidate = null;
+      let nextPrefetchCandidatePromise = null;
+      captureCurrentDetail: try {
+        const stalePrefetchSlot = detailPrefetchPipeline
+          .snapshot()
+          .slots.find(
+            (slot) =>
+              slot.recordId === recordId &&
+              slot.url &&
+              slot.url !== noteUrl &&
+              slot.state !== 'collecting',
+          );
+        if (stalePrefetchSlot) {
+          detailPrefetchPipeline.discard({
+            recordId,
+            url: stalePrefetchSlot.url,
+          });
+        }
+        if (
+          runnerContexts.length > 1 &&
+          !securityBlocked &&
+          !shouldStopDetailBatch()
+        ) {
+          nextPrefetchCandidatePromise = findNextDetailPrefetchCandidate({
+            recordIds: uniqueRecordIds,
+            startIndex: index + 1,
+            skipRecordIdSet,
+          }).catch((error) => {
+            console.warn(
+              '[CaptureSync] resolve next detail prefetch candidate failed (ignored):',
+              error?.message || error,
+            );
+            return null;
+          });
+        }
+        detailWorkerLease = await detailPrefetchPipeline.acquire({
+          recordId,
+          url: noteUrl,
         });
-        await waitMs(normalizedDetailAfterNavWaitMs);
+        runnerContext =
+          runnerContexts.find(
+            (context) => context.runnerTabId === detailWorkerLease.tabId,
+          ) || runnerContext;
+        activeDetailItemContext.runnerTabId = runnerContext.runnerTabId;
+        const workerSnapshot = detailPrefetchPipeline.snapshot();
+        await reportProgressFailSoft(onProgress, {
+          phase: 'detail_worker_promoted',
+          message: detailWorkerLease.prefetched
+            ? `${detailWorkerLease.label} 已加载完成，开始采集 ${progressLabel}`
+            : `${detailWorkerLease.label} 正在采集 ${progressLabel}`,
+          recordId,
+          current,
+          total: uniqueRecordIds.length,
+          runnerTabId: runnerContext.runnerTabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: runnerContext.runnerTabId,
+          workerMode: workerSnapshot.mode,
+          workerRevision: workerSnapshot.revision,
+          workerStates: workerSnapshot.slots,
+          ...captureTraceFields,
+        }, 'detail worker promoted');
 
-        if (typeof shouldStop === 'function' && shouldStop()) {
+        // 真正的 A/B ping-pong：当前页一取得唯一 COLLECTING lease，另一页就
+        // 立即排队加载下一条。standby 只导航与做安全探测，不读取正文/主页/评论；
+        // 下一轮仍须等当前 lease 释放后才能晋升为 COLLECTING。
+        nextPrefetchCandidate = nextPrefetchCandidatePromise
+          ? await nextPrefetchCandidatePromise
+          : null;
+        if (
+          nextPrefetchCandidate &&
+          !securityBlocked &&
+          !shouldStopDetailBatch()
+        ) {
+          const prefetchResult = detailPrefetchPipeline.prefetch(
+            nextPrefetchCandidate,
+            {excludeTabId: detailWorkerLease.tabId},
+          );
+          if (prefetchResult.started || prefetchResult.reused) {
+            const prefetchSnapshot = detailPrefetchPipeline.snapshot();
+            await reportProgressFailSoft(onProgress, {
+              phase: 'detail_item_prefetch_queued',
+              message: `${detailWorkerLease.label} 正在采集当前条；另一工作页已排队预加载下一条`,
+              recordId,
+              nextRecordId: nextPrefetchCandidate.recordId,
+              current,
+              total: uniqueRecordIds.length,
+              runnerTabId: runnerContext.runnerTabId,
+              runnerTabIds: runnerContexts.map(
+                (context) => context.runnerTabId,
+              ),
+              activeRunnerTabId: runnerContext.runnerTabId,
+              prefetchRunnerTabId: prefetchResult.tabId,
+              workerMode: prefetchSnapshot.mode,
+              workerRevision: prefetchSnapshot.revision,
+              workerStates: prefetchSnapshot.slots,
+              ...captureTraceFields,
+            }, 'detail prefetch queued');
+          }
+        }
+
+        const remainingHydrationWaitMs = Math.max(
+          0,
+          normalizedDetailAfterNavWaitMs -
+            Math.max(0, Date.now() - Number(detailWorkerLease.readyAt || 0)),
+        );
+        await waitMsWithStop(
+          remainingHydrationWaitMs,
+          shouldStopDetailBatch,
+          'DETAIL_CAPTURE_CANCELED',
+        );
+
+        if (shouldStopDetailBatch()) {
           throw new Error('DETAIL_CAPTURE_CANCELED');
         }
 
@@ -2293,6 +3569,25 @@ export async function batchCaptureDetailsForRecords(
           shouldApplyLowFollowerHitFilter;
 
         activeStage = 'note_capture';
+        activeDetailItemContext.activeStage = activeStage;
+        const noteCaptureWorkerSnapshot = detailPrefetchPipeline.snapshot();
+        await reportProgressFailSoft(onProgress, {
+          phase: 'detail_note_capture_started',
+          message:
+            runnerContexts.length > 1
+              ? `${progressLabel}：正在读取当前笔记；另一工作页并行预加载下一条`
+              : `${progressLabel}：正在读取当前笔记`,
+          recordId,
+          current,
+          total: uniqueRecordIds.length,
+          runnerTabId: runnerContext.runnerTabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: runnerContext.runnerTabId,
+          workerMode: noteCaptureWorkerSnapshot.mode,
+          workerRevision: noteCaptureWorkerSnapshot.revision,
+          workerStates: noteCaptureWorkerSnapshot.slots,
+          ...captureTraceFields,
+        }, 'detail note capture started');
         const noteResult = await captureInTab(runnerContext.runnerTabId, {
           mode: 'single',
           captureParams: {
@@ -2302,7 +3597,12 @@ export async function batchCaptureDetailsForRecords(
           },
         });
 
+        throwIfDetailPrefetchFatal();
+
         if (!noteResult?.ok) {
+          if (isCaptureCanceledResult(noteResult)) {
+            throw new Error('DETAIL_CAPTURE_CANCELED');
+          }
           if (noteResult?.error?.code === 'XHS_SECURITY_BLOCK') {
             securityBlocked = true; // 撞风控,下面 catch 会停整批
             throw new Error('XHS_SECURITY_BLOCK');
@@ -2355,10 +3655,18 @@ export async function batchCaptureDetailsForRecords(
                 noteUrl,
               }),
             );
+            const failedTraceTransition = transitionRecordCaptureTrace(
+              latestRecord,
+              failedPayload,
+              'failed',
+            );
             await updateRecord(recordId, {
               status: RECORD_STATUS.DRAFT,
-              payload: failedPayload,
+              payload: failedTraceTransition.payload,
             });
+            await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+              failedTraceTransition.binding,
+            ]);
 
             results.push({
               recordId,
@@ -2366,15 +3674,16 @@ export async function batchCaptureDetailsForRecords(
               reason: failure.code,
               category: failure.category,
               stage: failure.stage,
-              message: failure.userMessage,
+              message: `${markerLabel}：${failure.userMessage}`,
               diagnosticMessage: mismatchDiagnostic,
+              ...captureTraceFields,
             });
             failedCount += 1;
 
             if (onProgress) {
-              onProgress({
+              await reportProgressFailSoft(onProgress, {
                 phase: 'detail_item_failed',
-                message: `第 ${current}/${uniqueRecordIds.length} 条已跳过:原视频失效(页面跳去其它作品)`,
+                message: `${progressLabel}：已跳过，原视频失效（页面跳去其它作品）`,
                 recordId,
                 current,
                 total: uniqueRecordIds.length,
@@ -2382,9 +3691,11 @@ export async function batchCaptureDetailsForRecords(
                 failedCount,
                 filteredCount,
                 runnerTabId: runnerContext.runnerTabId,
-              });
+                ...captureTraceFields,
+              }, 'detail item mismatch');
             }
-            continue;
+            activeDetailItemContext = null;
+            break captureCurrentDetail;
           }
         }
         detailPayload = ensureBloggerMetricsFields(detailPayload);
@@ -2392,10 +3703,11 @@ export async function batchCaptureDetailsForRecords(
         let stopAfterCurrent = false;
         if (shouldCaptureBloggerMetricsForRecord) {
           activeStage = 'blogger_metrics_capture';
+          activeDetailItemContext.activeStage = activeStage;
           if (onProgress) {
-            onProgress({
+            await reportProgressFailSoft(onProgress, {
               phase: 'detail_blogger_metrics_capturing',
-              message: `第 ${current}/${uniqueRecordIds.length} 条正在采集博主指标...`,
+              message: `${progressLabel}：正在采集博主指标...`,
               recordId,
               current,
               total: uniqueRecordIds.length,
@@ -2404,7 +3716,8 @@ export async function batchCaptureDetailsForRecords(
               filteredCount,
               includeBloggerMetrics: true,
               runnerTabId: runnerContext.runnerTabId,
-            });
+              ...captureTraceFields,
+            }, 'detail blogger metrics');
           }
 
           const metricsResult = await captureBloggerMetricsForDetailPayload(
@@ -2414,7 +3727,7 @@ export async function batchCaptureDetailsForRecords(
               noteUrl,
               detailNavTimeoutMs: normalizedDetailNavTimeoutMs,
               profileAfterNavWaitMs: normalizedProfileAfterNavWaitMs,
-              shouldStop,
+              shouldStop: shouldStopDetailBatch,
               cache: bloggerMetricsCache,
               // 小红书:指标缺时进主页(原语义不变)。抖音保持 false——抖音指标在作品页那步已拿到,
               // 不能放开此开关去跑小红书的进主页/缓存语义(会污染小红书路径)。
@@ -2424,8 +3737,26 @@ export async function batchCaptureDetailsForRecords(
               // 受总开关 ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH 控制:当前关闭=不进主页(回退原行为)。
               allowDouyinIdLookup:
                 ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH && recordPlatform === 'douyin',
+              navigate: async (
+                navigationTabId,
+                navigationUrl,
+                navigationOptions = {},
+              ) =>
+                await detailPrefetchPipeline.runExternalNavigation(async () => {
+                  await openUrlInTab(navigationTabId, navigationUrl, {
+                    ...navigationOptions,
+                    shouldStop: shouldStopDetailBatch,
+                  });
+                  await probeDetailPreloadSafety(navigationTabId);
+                }),
             },
           );
+          const metricsNavigationFatalError =
+            detailPrefetchPipeline.getFatalError();
+          if (metricsNavigationFatalError) {
+            securityBlocked = true;
+            throw metricsNavigationFatalError;
+          }
           detailPayload = applyBloggerMetricsResultToPayload(
             detailPayload,
             metricsResult,
@@ -2436,17 +3767,38 @@ export async function batchCaptureDetailsForRecords(
           }
         }
 
+        throwIfDetailPrefetchFatal();
+
         if (shouldApplyLowFollowerHitFilter && !stopAfterCurrent) {
           const followerCount = parseInteractionCount(
             detailPayload.bloggerFollowersCount,
           );
           if (followerCount > Number(resolvedLowFollowerHitThreshold)) {
+            const filteredBinding = buildCaptureTraceBinding(
+              bindCaptureTrace(
+                resolveCaptureTraceFromRecord(record),
+                recordId,
+                'filtered',
+              ),
+            );
+            await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+              filteredBinding,
+            ]);
             const { deleteRecord } = await import('./storage.js');
             await deleteRecord(recordId);
+            filteredCount += 1;
+            results.push({
+              recordId,
+              ok: true,
+              filtered: true,
+              reason: 'low_follower_filtered',
+              message: `${markerLabel} 已过滤：粉丝数 ${followerCount} 超过阈值 ${resolvedLowFollowerHitThreshold}`,
+              ...captureTraceFields,
+            });
             if (onProgress) {
-              onProgress({
+              await reportProgressFailSoft(onProgress, {
                 phase: 'detail_item_filtered',
-                message: `第 ${current}/${uniqueRecordIds.length} 条已过滤：粉丝数 ${followerCount} 超过阈值 ${resolvedLowFollowerHitThreshold}`,
+                message: `${progressLabel}：已过滤，粉丝数 ${followerCount} 超过阈值 ${resolvedLowFollowerHitThreshold}`,
                 recordId,
                 current,
                 total: uniqueRecordIds.length,
@@ -2454,10 +3806,11 @@ export async function batchCaptureDetailsForRecords(
                 failedCount,
                 filteredCount,
                 runnerTabId: runnerContext.runnerTabId,
-              });
+                ...captureTraceFields,
+              }, 'detail low follower filtered');
             }
-            filteredCount += 1;
-            continue;
+            activeDetailItemContext = null;
+            break captureCurrentDetail;
           }
         }
 
@@ -2469,13 +3822,31 @@ export async function batchCaptureDetailsForRecords(
           detailKeywordFilterEnabled = true;
         }
         if (!detailKeywordFilterResult.matched && !stopAfterCurrent) {
+          const filteredBinding = buildCaptureTraceBinding(
+            bindCaptureTrace(
+              resolveCaptureTraceFromRecord(record),
+              recordId,
+              'filtered',
+            ),
+          );
+          await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+            filteredBinding,
+          ]);
           await deleteRecord(recordId);
           filteredCount += 1;
           detailKeywordFilteredCount += 1;
+          results.push({
+            recordId,
+            ok: true,
+            filtered: true,
+            reason: 'detail_keyword_filtered',
+            message: `${markerLabel} 已过滤：未命中主题关键词「${formatDetailKeywordFilterLabel(detailKeywordFilterResult.keywords)}」`,
+            ...captureTraceFields,
+          });
           if (onProgress) {
-            onProgress({
+            await reportProgressFailSoft(onProgress, {
               phase: 'detail_item_filtered',
-              message: `第 ${current}/${uniqueRecordIds.length} 条已过滤：未命中主题关键词「${formatDetailKeywordFilterLabel(detailKeywordFilterResult.keywords)}」`,
+              message: `${progressLabel}：已过滤，未命中主题关键词「${formatDetailKeywordFilterLabel(detailKeywordFilterResult.keywords)}」`,
               recordId,
               current,
               total: uniqueRecordIds.length,
@@ -2483,9 +3854,11 @@ export async function batchCaptureDetailsForRecords(
               failedCount,
               filteredCount,
               runnerTabId: runnerContext.runnerTabId,
-            });
+              ...captureTraceFields,
+            }, 'detail keyword filtered');
           }
-          continue;
+          activeDetailItemContext = null;
+          break captureCurrentDetail;
         }
 
         if (includeComments && !stopAfterCurrent) {
@@ -2494,9 +3867,9 @@ export async function batchCaptureDetailsForRecords(
             runnerTabId: runnerContext.runnerTabId,
           });
           if (onProgress) {
-            onProgress({
+            await reportProgressFailSoft(onProgress, {
               phase: 'detail_comments_capturing',
-              message: `第 ${current}/${uniqueRecordIds.length} 条正在采集评论...`,
+              message: `${progressLabel}：正在采集评论...`,
               recordId,
               current,
               total: uniqueRecordIds.length,
@@ -2537,12 +3910,13 @@ export async function batchCaptureDetailsForRecords(
 
           if (
             commentsResult.stoppedByUser &&
-            typeof shouldStop === 'function' &&
-            shouldStop()
+            shouldStopDetailBatch()
           ) {
             stopAfterCurrent = true;
           }
         }
+
+        throwIfDetailPrefetchFatal();
 
         const latestRecord = (await getRecord(recordId)) || record;
         detailPayload = sanitizeMediaFieldsForStorage(
@@ -2572,28 +3946,42 @@ export async function batchCaptureDetailsForRecords(
             detailPayload,
           }),
         );
+        const doneTraceTransition = transitionRecordCaptureTrace(
+          latestRecord,
+          mergedPayload,
+          stopAfterCurrent ? 'cancelled' : 'done',
+        );
 
         const preview = buildDetailCapturePreview(record, detailPayload);
+        const latePrefetchFatalError = detailPrefetchPipeline.getFatalError();
+        if (latePrefetchFatalError) {
+          securityBlocked = true;
+          throw latePrefetchFatalError;
+        }
         await updateRecord(recordId, {
           status: RECORD_STATUS.DRAFT,
-          payload: mergedPayload,
+          payload: doneTraceTransition.payload,
           title: preview.title,
           summary: preview.summary,
         });
+        await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+          doneTraceTransition.binding,
+        ]);
 
         const result = {
           recordId,
           ok: true,
           reason: 'none',
-          message: '详情补采成功',
+          message: `${markerLabel} 详情补采成功`,
+          ...captureTraceFields,
         };
         results.push(result);
         successCount += 1;
 
         if (onProgress) {
-          onProgress({
+          await reportProgressFailSoft(onProgress, {
             phase: 'detail_item_done',
-            message: `第 ${current}/${uniqueRecordIds.length} 条详情补采成功`,
+            message: `${progressLabel}：详情补采成功`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -2601,21 +3989,44 @@ export async function batchCaptureDetailsForRecords(
             failedCount,
             filteredCount,
             runnerTabId: runnerContext.runnerTabId,
-          });
+            ...captureTraceFields,
+          }, 'detail item done');
         }
+
+        activeDetailItemContext = null;
 
         if (stopAfterCurrent) {
           canceled = true;
           break;
         }
       } catch (error) {
-        const canceledByUser = isDetailCaptureCanceledError(error);
+        const pipelineFatalError = detailPrefetchPipeline.getFatalError();
+        if (pipelineFatalError || isDetailSecurityBlockError(error)) {
+          securityBlocked = true;
+        }
+        const effectiveError = pipelineFatalError || error;
+        const canceledByUser =
+          !pipelineFatalError && isDetailCaptureCanceledError(effectiveError);
         if (canceledByUser) {
           canceled = true;
         }
-        const failure = classifyDetailCaptureFailure(error, {
+        const failure = classifyDetailCaptureFailure(effectiveError, {
           stage: activeStage,
         });
+        const runnerContextInterrupted = Boolean(
+          runnerContext?.ownsRunnerTab &&
+            failure.code === DETAIL_CAPTURE_FAILURE_CODE.CONTEXT_INTERRUPTED,
+        );
+        if (runnerContextInterrupted) {
+          runnerInterrupted = true;
+        }
+        const terminalTraceState = canceledByUser
+          ? 'cancelled'
+          : securityBlocked
+            ? 'security_blocked'
+            : runnerContextInterrupted
+              ? 'runner_interrupted'
+              : 'failed';
 
         const latestRecord = (await getRecord(recordId)) || record;
         const failedPayload = applyDetailCapturePatch(
@@ -2632,10 +4043,18 @@ export async function batchCaptureDetailsForRecords(
             noteUrl,
           }),
         );
+        const failedTraceTransition = transitionRecordCaptureTrace(
+          latestRecord,
+          failedPayload,
+          terminalTraceState,
+        );
         await updateRecord(recordId, {
           status: RECORD_STATUS.DRAFT,
-          payload: failedPayload,
+          payload: failedTraceTransition.payload,
         });
+        await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+          failedTraceTransition.binding,
+        ]);
 
         const result = {
           recordId,
@@ -2643,18 +4062,28 @@ export async function batchCaptureDetailsForRecords(
           reason: failure.code,
           category: failure.category,
           stage: failure.stage,
-          message: failure.userMessage,
+          message: `${markerLabel}：${failure.userMessage}`,
           diagnosticMessage: failure.diagnosticMessage,
+          canceled: canceledByUser,
+          securityBlocked,
+          runnerInterrupted: runnerContextInterrupted,
+          ...captureTraceFields,
         };
         results.push(result);
-        failedCount += 1;
+        if (!canceledByUser) {
+          failedCount += 1;
+        }
 
         if (onProgress) {
-          onProgress({
-            phase: 'detail_item_failed',
-            message: canceledByUser
-              ? `补采已中止（已处理 ${results.length}/${uniqueRecordIds.length} 条）`
-              : `第 ${current}/${uniqueRecordIds.length} 条补采失败：${result.message}`,
+          await reportProgressFailSoft(onProgress, {
+            phase: canceledByUser
+              ? 'detail_item_cancelled'
+              : 'detail_item_failed',
+            message: runnerContextInterrupted
+              ? `处理 ${markerLabel} 时详情采集工作页已关闭或中断，本批停止（已处理 ${results.length}/${uniqueRecordIds.length} 条）`
+              : canceledByUser
+                ? `${progressLabel}：补采已中止（已处理 ${results.length}/${uniqueRecordIds.length} 条）`
+                : `${progressLabel}：补采失败，${failure.userMessage}`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -2662,15 +4091,15 @@ export async function batchCaptureDetailsForRecords(
             failedCount,
             filteredCount,
             runnerTabId: runnerContext.runnerTabId,
-          });
+            ...captureTraceFields,
+          }, canceledByUser ? 'detail item cancelled' : 'detail item failed');
         }
 
         if (securityBlocked) {
           if (onProgress) {
-            onProgress({
+            await reportProgressFailSoft(onProgress, {
               phase: 'detail_security_blocked',
-              message:
-                '⚠️ 触发小红书安全限制(访问频繁/300013),已暂停补采。建议隔较长时间(如数小时)再跑。',
+              message: `⚠️ ${markerLabel} 触发小红书安全限制（访问频繁/300013），已暂停补采。建议隔较长时间（如数小时）再跑。`,
               recordId,
               current,
               total: uniqueRecordIds.length,
@@ -2678,12 +4107,40 @@ export async function batchCaptureDetailsForRecords(
               failedCount,
               filteredCount,
               runnerTabId: runnerContext.runnerTabId,
-            });
+              ...captureTraceFields,
+            }, 'detail security blocked');
           }
+          activeDetailItemContext = null;
+          break;
+        }
+        if (runnerInterrupted) {
+          if (onProgress) {
+            await reportProgressFailSoft(onProgress, {
+              phase: 'detail_runner_interrupted',
+              message: `处理 ${markerLabel} 时详情采集工作页已关闭或中断，已停止剩余详情采集`,
+              recordId,
+              current,
+              total: uniqueRecordIds.length,
+              successCount,
+              failedCount,
+              filteredCount,
+              runnerTabId: runnerContext.runnerTabId,
+              sourceTabId: runnerContext.sourceTabId,
+              runnerRole: 'detail_worker',
+              ...captureTraceFields,
+            }, 'detail runner interrupted');
+          }
+          activeDetailItemContext = null;
           break;
         }
         if (canceledByUser) {
+          activeDetailItemContext = null;
           break;
+        }
+        activeDetailItemContext = null;
+      } finally {
+        if (detailWorkerLease) {
+          detailPrefetchPipeline.release(detailWorkerLease);
         }
       }
 
@@ -2691,8 +4148,9 @@ export async function batchCaptureDetailsForRecords(
       if (
         index < uniqueRecordIds.length - 1 &&
         !securityBlocked &&
+        !runnerInterrupted &&
         !canceled &&
-        !(typeof shouldStop === 'function' && shouldStop())
+        !shouldStopDetailBatch()
       ) {
         const itemDelay =
           DETAIL_ITEM_DELAY_MIN_MS +
@@ -2703,9 +4161,9 @@ export async function batchCaptureDetailsForRecords(
             return;
           }
           const seconds = Math.ceil(Math.max(0, Number(remainingMs) || 0) / 1000);
-          onProgress({
+          void reportProgressFailSoft(onProgress, {
             phase: 'detail_item_delay',
-            message: `第 ${current}/${uniqueRecordIds.length} 条详情补采完成，${seconds} 秒后补采下一条...`,
+            message: `${progressLabel}：详情处理完成，${seconds} 秒后补采下一条...`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -2714,16 +4172,22 @@ export async function batchCaptureDetailsForRecords(
             filteredCount,
             remainingMs,
             runnerTabId: runnerContext.runnerTabId,
-          });
+            ...captureTraceFields,
+          }, 'detail item delay');
         };
         reportDetailDelayProgress(itemDelay);
         try {
-          await waitMsWithStopAndTick(itemDelay, shouldStop, {
+          await waitMsWithStopAndTick(itemDelay, shouldStopDetailBatch, {
             errorMessage: 'DETAIL_CAPTURE_CANCELED',
             tickMs: 1000,
             onTick: reportDetailDelayProgress,
           });
         } catch (delayError) {
+          const delayFatalError = detailPrefetchPipeline.getFatalError();
+          if (delayFatalError) {
+            securityBlocked = true;
+            throw delayFatalError;
+          }
           if (isDetailCaptureCanceledError(delayError)) {
             canceled = true;
             break;
@@ -2732,8 +4196,212 @@ export async function batchCaptureDetailsForRecords(
         }
       }
     }
+  } catch (error) {
+    const pipelineFatalError = detailPrefetchPipeline?.getFatalError() || null;
+    if (pipelineFatalError || isDetailSecurityBlockError(error)) {
+      securityBlocked = true;
+    }
+    const effectiveError = pipelineFatalError || error;
+    let stopRequested = false;
+    if (!pipelineFatalError && typeof shouldStop === 'function') {
+      try {
+        stopRequested = Boolean(shouldStop());
+      } catch (stopError) {
+        console.warn(
+          '[CaptureSync] detail stop predicate failed (ignored):',
+          stopError?.message || stopError,
+        );
+      }
+    }
+    const canceledByUser =
+      !pipelineFatalError &&
+      (isDetailCaptureCanceledError(effectiveError) || stopRequested);
+    batchUnexpectedError = canceledByUser || securityBlocked ? null : effectiveError;
+    if (canceledByUser) {
+      canceled = true;
+    }
+
+    const context = activeDetailItemContext;
+    if (context?.recordId) {
+      try {
+        let latestRecord = context.record;
+        try {
+          latestRecord =
+            (await getRecord(context.recordId)) || context.record;
+        } catch (readError) {
+          console.warn(
+            '[CaptureSync] detail terminal record read failed (using snapshot):',
+            readError?.message || readError,
+          );
+        }
+        const latestTrace = resolveCaptureTraceFromRecord(latestRecord);
+        const detailStatus = String(
+          latestRecord?.payload?.detailCaptureStatus || '',
+        )
+          .trim()
+          .toLowerCase();
+        const traceState = String(latestTrace?.state || '')
+          .trim()
+          .toLowerCase();
+        if (
+          latestRecord &&
+          (context.captureStarted ||
+            detailStatus === DETAIL_CAPTURE_STATUS.CAPTURING ||
+            traceState === 'capturing')
+        ) {
+          const failure = classifyDetailCaptureFailure(effectiveError, {
+            stage: context.activeStage || 'unknown',
+          });
+          const runnerContextInterrupted = Boolean(
+            runnerContext?.ownsRunnerTab &&
+              failure.code ===
+                DETAIL_CAPTURE_FAILURE_CODE.CONTEXT_INTERRUPTED,
+          );
+          if (runnerContextInterrupted) {
+            runnerInterrupted = true;
+          }
+          const terminalTraceState = canceledByUser
+            ? 'cancelled'
+            : securityBlocked
+              ? 'security_blocked'
+              : runnerContextInterrupted
+                ? 'runner_interrupted'
+                : 'failed';
+          const failedPayload = applyDetailCapturePatch(
+            latestRecord.payload,
+            createDetailCapturePatch({
+              status: DETAIL_CAPTURE_STATUS.FAILED,
+              startedAt: context.startedAt || Date.now(),
+              finishedAt: Date.now(),
+              error: failure.userMessage,
+              failureCode: failure.code,
+              failureStage: failure.stage,
+              failureCategory: failure.category,
+              diagnosticMessage: failure.diagnosticMessage,
+              noteUrl: context.noteUrl || '',
+            }),
+          );
+          const terminalTraceTransition = transitionRecordCaptureTrace(
+            latestRecord,
+            failedPayload,
+            terminalTraceState,
+          );
+          try {
+            await updateRecord(context.recordId, {
+              status: RECORD_STATUS.DRAFT,
+              payload: terminalTraceTransition.payload,
+            });
+          } catch (updateError) {
+            console.warn(
+              '[CaptureSync] detail terminal record update failed (ignored):',
+              updateError?.message || updateError,
+            );
+          }
+          await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [
+            terminalTraceTransition.binding,
+          ]);
+
+          if (!results.some((item) => item?.recordId === context.recordId)) {
+            results.push({
+              recordId: context.recordId,
+              ok: false,
+              reason: failure.code,
+              category: failure.category,
+              stage: failure.stage,
+              message: `${context.markerLabel}：${failure.userMessage}`,
+              diagnosticMessage: failure.diagnosticMessage,
+              canceled: canceledByUser,
+              securityBlocked,
+              runnerInterrupted: runnerContextInterrupted,
+              ...context.captureTraceFields,
+            });
+            if (!canceledByUser) {
+              failedCount += 1;
+            }
+          }
+
+          await reportProgressFailSoft(onProgress, {
+            phase: canceledByUser
+              ? 'detail_item_cancelled'
+              : 'detail_item_failed',
+            message: canceledByUser
+              ? `${context.progressLabel}：补采已中止`
+              : `${context.progressLabel}：补采异常终止，${failure.userMessage}`,
+            recordId: context.recordId,
+            current: context.current || results.length,
+            total: uniqueRecordIds.length,
+            successCount,
+            failedCount,
+            filteredCount,
+            runnerTabId: runnerContext.runnerTabId,
+            ...context.captureTraceFields,
+          }, 'detail top-level recovery');
+        }
+      } catch (recoveryError) {
+        console.warn(
+          '[CaptureSync] detail trace terminal recovery failed (ignored):',
+          recoveryError?.message || recoveryError,
+        );
+      }
+    }
+    activeDetailItemContext = null;
   } finally {
-    if (runnerContext.shouldRestoreSourcePage) {
+    if (detailPrefetchPipeline) {
+      await detailPrefetchPipeline.stop().catch((error) => {
+        console.warn('[CaptureSync] stop detail prefetch pipeline failed:', error);
+      });
+    }
+    const ownedRunnerContexts = runnerContexts.filter(
+      (context) => context?.ownsRunnerTab,
+    );
+    if (ownedRunnerContexts.length > 0) {
+      try {
+        const closedResults = await closeOwnedDetailRunnerTabs(
+          ownedRunnerContexts.map((context) => ({
+            runnerTabId: context.runnerTabId,
+            sourceTabId: context.sourceTabId,
+            ownsRunnerTab: true,
+          })),
+        );
+        const closedCount = closedResults.filter((item) => item.closed).length;
+        await reportProgressFailSoft(onProgress, {
+          phase: 'detail_runner_closed',
+          message:
+            closedCount > 0
+              ? `${closedCount} 个详情工作页已安全关闭`
+              : '详情工作页已由用户关闭',
+          current: results.length,
+          total: uniqueRecordIds.length,
+          successCount,
+          failedCount,
+          filteredCount,
+          runnerTabId: runnerContext?.runnerTabId || null,
+          runnerTabIds: ownedRunnerContexts.map(
+            (context) => context.runnerTabId,
+          ),
+          sourceTabId: runnerContext?.sourceTabId || null,
+          runnerRole: 'detail_worker',
+        }, 'detail runners closed');
+      } catch (error) {
+        console.warn('[CaptureSync] close detail runner tabs failed:', error);
+        await reportProgressFailSoft(onProgress, {
+          phase: 'detail_runner_cleanup_failed',
+          message: '详情采集已停止，但部分工作页未能自动关闭，请手动关闭',
+          current: results.length,
+          total: uniqueRecordIds.length,
+          successCount,
+          failedCount,
+          filteredCount,
+          runnerTabId: runnerContext?.runnerTabId || null,
+          runnerTabIds: ownedRunnerContexts.map(
+            (context) => context.runnerTabId,
+          ),
+          failedRunnerTabIds: error?.failedTabIds || [],
+          sourceTabId: runnerContext?.sourceTabId || null,
+          runnerRole: 'detail_worker',
+        }, 'detail runners cleanup failed');
+      }
+    } else if (runnerContext?.shouldRestoreSourcePage) {
       void restoreSourcePageIfNeeded(
         runnerContext.runnerTabId,
         runnerContext.sourcePageUrl,
@@ -2742,7 +4410,7 @@ export async function batchCaptureDetailsForRecords(
       ).catch((error) => {
         console.warn('[CaptureSync] restore source page failed:', error);
       });
-    } else if (runnerContext.shouldRestoreRuntimeContext) {
+    } else if (runnerContext?.shouldRestoreRuntimeContext) {
       void restoreSourceRuntimeContextIfNeeded({
         tabId: runnerContext.runnerTabId,
         sourcePageUrl: runnerContext.sourcePageUrl,
@@ -2762,7 +4430,12 @@ export async function batchCaptureDetailsForRecords(
     return summary;
   }, {});
   const enhancementStage = buildDetailEnhanceStage({
-    status: canceled ? 'partial' : failedCount > 0 ? 'completed_with_failures' : 'completed',
+    status:
+      canceled || runnerInterrupted || securityBlocked
+        ? 'partial'
+        : batchUnexpectedError || failedCount > 0
+          ? 'completed_with_failures'
+          : 'completed',
     targetCount: uniqueRecordIds.length,
     processedCount,
     successCount,
@@ -2771,7 +4444,15 @@ export async function batchCaptureDetailsForRecords(
     keywordFilterMode: detailKeywordFilterEnabled ? 'detail' : '',
     keywordFilterEnabled: detailKeywordFilterEnabled,
     keywordFilteredCount: detailKeywordFilteredCount,
-    currentStage: canceled ? 'detail_batch_canceled' : 'detail_batch_done',
+    currentStage: canceled
+      ? 'detail_batch_canceled'
+      : securityBlocked
+        ? 'detail_security_blocked'
+        : runnerInterrupted
+          ? 'detail_batch_interrupted'
+          : batchUnexpectedError
+            ? 'detail_batch_failed'
+            : 'detail_batch_done',
     failureStageSummary,
   });
   void recordDiagnosticStage({
@@ -2784,11 +4465,25 @@ export async function batchCaptureDetailsForRecords(
 
   if (onProgress) {
     const skipNote = skippedCount > 0 ? `，跳过 ${skippedCount} 条(之前已采过)` : '';
-    onProgress({
-      phase: canceled ? 'detail_batch_canceled' : 'detail_batch_done',
+    await reportProgressFailSoft(onProgress, {
+      phase: canceled
+        ? 'detail_batch_canceled'
+        : securityBlocked
+          ? 'detail_security_blocked'
+          : runnerInterrupted
+            ? 'detail_batch_interrupted'
+            : batchUnexpectedError
+              ? 'detail_batch_failed'
+              : 'detail_batch_done',
       message: canceled
         ? `详情补采已中止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
-        : `详情补采完成：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`,
+        : securityBlocked
+          ? `详情补采遇到安全验证并已停止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+          : runnerInterrupted
+            ? `详情工作页中断，已停止剩余任务：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+            : batchUnexpectedError
+              ? `详情补采异常终止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+              : `详情补采完成：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`,
       current: processedCount,
       total: uniqueRecordIds.length,
       successCount,
@@ -2796,12 +4491,18 @@ export async function batchCaptureDetailsForRecords(
       filteredCount,
       skippedCount,
       runnerTabId: runnerContext.runnerTabId,
-    });
+    }, 'detail batch terminal');
   }
 
   return {
-    ok: !canceled && failedCount === 0,
+    ok:
+      !canceled &&
+      !runnerInterrupted &&
+      !securityBlocked &&
+      !batchUnexpectedError &&
+      failedCount === 0,
     canceled,
+    runnerInterrupted,
     securityBlocked, // 撞小红书安全限制 → 主循环据此停整轮无人值守
     total: uniqueRecordIds.length,
     processedCount,
@@ -2813,7 +4514,13 @@ export async function batchCaptureDetailsForRecords(
     diagnostics: {
       stageTrace: [enhancementStage],
     },
-    error: null,
+    error: batchUnexpectedError
+      ? {
+          code: 'UNEXPECTED_ERROR',
+          message:
+            batchUnexpectedError?.message || '详情补采发生未预期错误',
+        }
+      : null,
   };
 }
 
@@ -3282,6 +4989,69 @@ function mergeHydratedDetailIntoRecordPayload(record) {
   };
 }
 
+function isSyncCancellationRequested(shouldStop, signal = null) {
+  if (signal?.aborted === true) return true;
+  if (typeof shouldStop !== 'function') return false;
+  try {
+    return shouldStop() === true;
+  } catch {
+    return true;
+  }
+}
+
+function buildCanceledSyncResult(overrides = {}) {
+  return {
+    ok: false,
+    canceled: true,
+    skipped: true,
+    reason: 'capture_task_canceled',
+    message: '任务已取消，未继续同步',
+    error: null,
+    ...overrides,
+  };
+}
+
+async function resetCanceledSyncState() {
+  await updateSync({
+    status: SYNC_STATUS.IDLE,
+    error: null,
+  }).catch(() => null);
+}
+
+function buildCanceledBatchSyncResult({
+  requestedRecordIds = [],
+  recordIdsToSync = [],
+  skippedRecordIds = [],
+  results = [],
+  commentLeadsSyncedCount = 0,
+  commentLeadsSkippedCount = 0,
+  commentLeadsFailedCount = 0,
+  commentLeadsCanceledRecordIds = [],
+} = {}) {
+  const completedRecordIds = new Set(
+    results.map((result) => String(result?.recordId || '').trim()).filter(Boolean),
+  );
+  const canceledRecordIds = recordIdsToSync.filter(
+    (recordId) => !completedRecordIds.has(recordId),
+  );
+  return buildCanceledSyncResult({
+    skipped: false,
+    results,
+    successCount: results.filter((result) => result?.success === true).length,
+    failedCount: results.filter((result) => result?.success === false).length,
+    canceledCount: canceledRecordIds.length,
+    canceledRecordIds,
+    requestedCount: requestedRecordIds.length,
+    syncedCount: recordIdsToSync.length - canceledRecordIds.length,
+    skippedCount: skippedRecordIds.length,
+    commentLeadsSyncedCount,
+    commentLeadsSkippedCount,
+    commentLeadsFailedCount,
+    commentLeadsCanceledCount: commentLeadsCanceledRecordIds.length,
+    commentLeadsCanceledRecordIds: [...commentLeadsCanceledRecordIds],
+  });
+}
+
 /**
  * 同步单条记录
  * @param {string} recordId - 记录 ID
@@ -3290,7 +5060,13 @@ function mergeHydratedDetailIntoRecordPayload(record) {
  */
 export async function syncRecord(recordId, onProgress = null, options = {}) {
   const startedAt = Date.now();
+  const shouldStop = options?.shouldStop;
+  const signal = options?.signal || null;
   try {
+    if (isSyncCancellationRequested(shouldStop, signal)) {
+      await resetCanceledSyncState();
+      return buildCanceledSyncResult({recordId});
+    }
     if (onProgress) {
       onProgress({
         phase: 'sync_start',
@@ -3343,11 +5119,19 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
     });
 
     // 调用后端 sync API
-    const syncResult = await sync({
-      syncType: syncInput.syncType,
-      target: requestTarget,
-      payload: syncInput.payload,
-    });
+    const syncResult = await sync(
+      {
+        syncType: syncInput.syncType,
+        target: requestTarget,
+        payload: syncInput.payload,
+      },
+      {shouldStop, signal},
+    );
+
+    if (syncResult?.canceled) {
+      await resetCanceledSyncState();
+      return buildCanceledSyncResult({recordId, rawResponse: syncResult});
+    }
 
     const debugUrl = extractDebugUrl(syncResult);
 
@@ -3401,11 +5185,42 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
             matchedCount: leadResult.matchedCount,
           };
         } else if (leadResult.payload) {
-          const leadsSyncResult = await sync({
-            syncType: SYNC_TYPE.COMMENT_LEADS,
-            target: requestTarget,
-            payload: leadResult.payload,
-          });
+          if (isSyncCancellationRequested(shouldStop, signal)) {
+            await updateRecord(recordId, {
+              status: RECORD_STATUS.FAILED,
+              lastSyncedAt: Date.now(),
+              lastSyncReason: 'COMMENT_LEADS_SYNC_CANCELED',
+            });
+            await resetCanceledSyncState();
+            return buildCanceledSyncResult({
+              recordId,
+              partialContentSuccess: true,
+            });
+          }
+          const leadsSyncResult = await sync(
+            {
+              syncType: SYNC_TYPE.COMMENT_LEADS,
+              target: requestTarget,
+              payload: leadResult.payload,
+            },
+            {shouldStop, signal},
+          );
+          if (leadsSyncResult?.canceled) {
+            await updateRecord(recordId, {
+              status: RECORD_STATUS.FAILED,
+              lastSyncedAt: Date.now(),
+              lastSyncReason: 'COMMENT_LEADS_SYNC_CANCELED',
+            });
+            await resetCanceledSyncState();
+            return buildCanceledSyncResult({
+              recordId,
+              partialContentSuccess: true,
+              rawResponse: {
+                content: syncResult,
+                commentLeads: leadsSyncResult,
+              },
+            });
+          }
           const leadsDebugUrl = extractDebugUrl(leadsSyncResult);
           if (!leadsSyncResult.ok) {
             const syncErrorMessage =
@@ -3758,12 +5573,30 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
 
 async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   const startedAt = Date.now();
+  const shouldStop = options?.shouldStop;
+  const signal = options?.signal || null;
   const requestedRecordIds = Array.isArray(recordIds)
     ? recordIds.filter((recordId) => typeof recordId === 'string' && recordId.trim())
     : [];
   const recordIdsToSync = requestedRecordIds.slice(0, MAX_SYNC_RECORDS_PER_BATCH);
   const skippedRecordIds = requestedRecordIds.slice(MAX_SYNC_RECORDS_PER_BATCH);
+  if (isSyncCancellationRequested(shouldStop, signal)) {
+    await resetCanceledSyncState();
+    return buildCanceledBatchSyncResult({
+      requestedRecordIds,
+      recordIdsToSync,
+      skippedRecordIds,
+    });
+  }
   const target = await getTarget();
+  if (isSyncCancellationRequested(shouldStop, signal)) {
+    await resetCanceledSyncState();
+    return buildCanceledBatchSyncResult({
+      requestedRecordIds,
+      recordIdsToSync,
+      skippedRecordIds,
+    });
+  }
   const requestTarget = buildSyncTargetPayload(target);
   const captureSettings = options?.captureSettings || await getCaptureSettings();
   const commentLeadsConfig = normalizeCommentLeadsConfig(
@@ -3799,8 +5632,10 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       retryCommentLeadsOnly:
         commentLeadsConfig.enabled &&
         isCommentLeadsEligibleSyncType(syncInput.syncType) &&
-        String(record?.lastSyncReason || '').trim().toUpperCase() ===
+        [
           'COMMENT_LEADS_SYNC_FAILED',
+          'COMMENT_LEADS_SYNC_CANCELED',
+        ].includes(String(record?.lastSyncReason || '').trim().toUpperCase()),
     };
   });
   const results = [];
@@ -3813,6 +5648,7 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   const syncGroups = buildWorkflowSyncGroups(contentRecordsToSync);
   let processedCount = 0;
   let syncPaused = null;
+  let syncCanceled = false;
 
   await updateSync({
     status: SYNC_STATUS.SYNCING,
@@ -3864,6 +5700,10 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   processedCount = results.length;
 
   for (let groupIndex = 0; groupIndex < syncGroups.length; groupIndex += 1) {
+    if (isSyncCancellationRequested(shouldStop, signal)) {
+      syncCanceled = true;
+      break;
+    }
     const group = syncGroups[groupIndex];
     if (!Array.isArray(group.records) || group.records.length === 0) {
       continue;
@@ -3880,6 +5720,8 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       rateLimitBaseDelayMs: options?.rateLimitBaseDelayMs,
       rateLimitMaxDelayMs: options?.rateLimitMaxDelayMs,
       rateLimitRetryAttempts: options?.rateLimitRetryAttempts,
+      shouldStop,
+      signal,
     });
     const groupSyncDiagnostics =
       groupResults?.syncDiagnostics && typeof groupResults.syncDiagnostics === 'object'
@@ -3892,6 +5734,9 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
 
     results.push(...groupResults);
     processedCount += groupResults.length;
+    if (groupResults?.syncCanceled === true) {
+      syncCanceled = true;
+    }
     if (groupPaused) {
       const shouldBlockRemainingGroups = groupPaused.blocking !== false;
       groupPaused = extendSyncPausedMetadata(
@@ -3939,6 +5784,10 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       batchSkippedCount: skippedRecordIds.length,
     });
 
+    if (syncCanceled) {
+      break;
+    }
+
     if (groupPaused) {
       syncPaused = mergeSyncPausedMetadata(syncPaused, groupPaused, {
         confirmedSuccessCount: results.filter((result) => result.success).length,
@@ -3952,6 +5801,7 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   let commentLeadsSyncedCount = 0;
   let commentLeadsSkippedCount = 0;
   let commentLeadsFailedCount = 0;
+  const commentLeadsCanceledRecordIds = [];
   const commentLeadHistoryItems = [];
   const hasAnyStoredCommentLeads = preparedRecordsToSync.some((record) =>
     hasStoredCommentLeadsPayload(record.syncType, record.syncPayload),
@@ -3959,6 +5809,10 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
 
   if (commentLeadsConfig.enabled && leadsRetryRecords.length > 0) {
     for (const record of leadsRetryRecords) {
+      if (isSyncCancellationRequested(shouldStop, signal)) {
+        syncCanceled = true;
+        break;
+      }
       const debugUrl = normalizeDebugUrl(record?.lastSyncDebugUrl || '');
       results.push({
         recordId: record.id,
@@ -3987,7 +5841,11 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
     }
   }
 
-  if (!syncPaused && (commentLeadsConfig.enabled || hasAnyStoredCommentLeads)) {
+  if (
+    !syncCanceled &&
+    !syncPaused &&
+    (commentLeadsConfig.enabled || hasAnyStoredCommentLeads)
+  ) {
     const resultByRecordId = new Map(
       results.map((item) => [String(item?.recordId || ''), item]),
     );
@@ -4001,7 +5859,27 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       );
     });
 
-    for (const record of eligibleRecords) {
+    const markCommentLeadsCanceled = async (records = []) => {
+      for (const pendingRecord of records) {
+        if (!pendingRecord?.id) continue;
+        if (!commentLeadsCanceledRecordIds.includes(pendingRecord.id)) {
+          commentLeadsCanceledRecordIds.push(pendingRecord.id);
+        }
+        await updateRecord(pendingRecord.id, {
+          status: RECORD_STATUS.FAILED,
+          lastSyncedAt: Date.now(),
+          lastSyncReason: 'COMMENT_LEADS_SYNC_CANCELED',
+        });
+      }
+    };
+
+    for (let eligibleIndex = 0; eligibleIndex < eligibleRecords.length; eligibleIndex += 1) {
+      const record = eligibleRecords[eligibleIndex];
+      if (isSyncCancellationRequested(shouldStop, signal)) {
+        syncCanceled = true;
+        await markCommentLeadsCanceled(eligibleRecords.slice(eligibleIndex));
+        break;
+      }
       const existingResult = resultByRecordId.get(record.id);
       const leadResult = buildCommentLeadsPayloadForRecord(
         {
@@ -4060,11 +5938,19 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
         continue;
       }
 
-      const leadSyncResult = await sync({
-        syncType: SYNC_TYPE.COMMENT_LEADS,
-        target: requestTarget,
-        payload: leadResult.payload,
-      });
+      const leadSyncResult = await sync(
+        {
+          syncType: SYNC_TYPE.COMMENT_LEADS,
+          target: requestTarget,
+          payload: leadResult.payload,
+        },
+        {shouldStop, signal},
+      );
+      if (leadSyncResult?.canceled) {
+        syncCanceled = true;
+        await markCommentLeadsCanceled(eligibleRecords.slice(eligibleIndex));
+        break;
+      }
       const leadsDebugUrl = extractDebugUrl(leadSyncResult);
       if (leadSyncResult.ok) {
         commentLeadsSyncedCount += 1;
@@ -4201,6 +6087,26 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
     }
   }
 
+  if (syncCanceled || isSyncCancellationRequested(shouldStop, signal)) {
+    await resetCanceledSyncState();
+    if (onProgress) {
+      onProgress({
+        phase: 'sync_canceled',
+        message: '任务已取消，未继续同步',
+      });
+    }
+    return buildCanceledBatchSyncResult({
+      requestedRecordIds,
+      recordIdsToSync,
+      skippedRecordIds,
+      results,
+      commentLeadsSyncedCount,
+      commentLeadsSkippedCount,
+      commentLeadsFailedCount,
+      commentLeadsCanceledRecordIds,
+    });
+  }
+
   // 统计结果
   const successCount = results.filter((r) => r.success).length;
   const failedCount = results.filter(
@@ -4309,6 +6215,8 @@ async function syncGroupRecordsWithRetry({
   rateLimitBaseDelayMs,
   rateLimitMaxDelayMs,
   rateLimitRetryAttempts,
+  shouldStop = null,
+  signal = null,
 } = {}) {
   const groupRecords = Array.isArray(group?.records) ? group.records : [];
   const queue = chunkSyncRecordsForRequest(groupRecords).map((records) => ({
@@ -4352,6 +6260,7 @@ async function syncGroupRecordsWithRetry({
   let requestIndex = 0;
   let lastRequestStartedAt = 0;
   let syncPaused = null;
+  let syncCanceled = false;
 
   const emitProgress = (message, extra = {}) => {
     if (!onProgress) return;
@@ -4365,6 +6274,10 @@ async function syncGroupRecordsWithRetry({
   };
 
   while (queue.length > 0) {
+    if (isSyncCancellationRequested(shouldStop, signal)) {
+      syncCanceled = true;
+      break;
+    }
     if (syncPaused) {
       break;
     }
@@ -4388,14 +6301,40 @@ async function syncGroupRecordsWithRetry({
 
     let batchResult = null;
     for (let attempt = 0; attempt <= normalizedRateLimitRetryAttempts; attempt += 1) {
+      if (isSyncCancellationRequested(shouldStop, signal)) {
+        syncCanceled = true;
+        break;
+      }
       if (lastRequestStartedAt > 0) {
-        await waitForSyncRequestSlot(lastRequestStartedAt, normalizedRequestSpacingMs);
+        const waitCompleted = await waitForSyncRequestSlot(
+          lastRequestStartedAt,
+          normalizedRequestSpacingMs,
+          shouldStop,
+          signal,
+        );
+        if (!waitCompleted) {
+          syncCanceled = true;
+          break;
+        }
       }
 
+      if (isSyncCancellationRequested(shouldStop, signal)) {
+        syncCanceled = true;
+        break;
+      }
       lastRequestStartedAt = Date.now();
       syncDiagnostics.requestCount += 1;
       syncDiagnostics.chunkSizes.push(chunkRecords.length);
-      batchResult = await runSyncBatchRequest(chunkRecords, requestTarget);
+      batchResult = await runSyncBatchRequest(
+        chunkRecords,
+        requestTarget,
+        shouldStop,
+        signal,
+      );
+      if (batchResult?.canceled) {
+        syncCanceled = true;
+        break;
+      }
 
       const attemptItems = getSyncBatchItems(batchResult);
       const allItemsRateLimited =
@@ -4420,8 +6359,18 @@ async function syncGroupRecordsWithRetry({
       emitProgress(
         `同步接口触发限流，${Math.ceil(delayMs / 1000)} 秒后重试当前 ${chunkRecords.length} 条...`,
       );
-      await sleep(delayMs);
+      const retryWaitCompleted = await waitForCancelableSyncDelay(
+        delayMs,
+        shouldStop,
+        signal,
+      );
+      if (!retryWaitCompleted) {
+        syncCanceled = true;
+        break;
+      }
     }
+
+    if (syncCanceled) break;
 
     const batchItems = getSyncBatchItems(batchResult);
     const batchItemMap = new Map(
@@ -4561,6 +6510,9 @@ async function syncGroupRecordsWithRetry({
     syncDiagnostics.pausedCount = syncPaused.pausedCount;
     syncDiagnostics.pausedBlocking = syncPaused.blocking !== false;
   }
+  if (syncCanceled) {
+    syncDiagnostics.canceled = true;
+  }
 
   Object.defineProperty(groupResults, 'syncDiagnostics', {
     value: syncDiagnostics,
@@ -4572,12 +6524,27 @@ async function syncGroupRecordsWithRetry({
       enumerable: false,
     });
   }
+  if (syncCanceled) {
+    Object.defineProperty(groupResults, 'syncCanceled', {
+      value: true,
+      enumerable: false,
+    });
+  }
   return groupResults;
 }
 
-async function runSyncBatchRequest(records, requestTarget) {
+async function runSyncBatchRequest(
+  records,
+  requestTarget,
+  shouldStop = null,
+  signal = null,
+) {
   try {
-    return await syncBatch(records.map(buildSyncBatchRecordInput), requestTarget);
+    return await syncBatch(
+      records.map(buildSyncBatchRecordInput),
+      requestTarget,
+      {shouldStop, signal},
+    );
   } catch (error) {
     return {
       ok: false,
@@ -4989,16 +6956,42 @@ function sleep(ms) {
   return waitMs(delay);
 }
 
-async function waitForSyncRequestSlot(lastRequestStartedAt, spacingMs) {
+async function waitForCancelableSyncDelay(
+  delayMs,
+  shouldStop = null,
+  signal = null,
+  pollMs = 100,
+) {
+  let remainingMs = Math.max(0, Math.floor(Number(delayMs) || 0));
+  const intervalMs = Math.max(25, Math.floor(Number(pollMs) || 100));
+  while (remainingMs > 0) {
+    if (isSyncCancellationRequested(shouldStop, signal)) return false;
+    const currentDelayMs = Math.min(intervalMs, remainingMs);
+    await sleep(currentDelayMs);
+    remainingMs -= currentDelayMs;
+  }
+  return !isSyncCancellationRequested(shouldStop, signal);
+}
+
+async function waitForSyncRequestSlot(
+  lastRequestStartedAt,
+  spacingMs,
+  shouldStop = null,
+  signal = null,
+) {
   const spacing = Math.max(0, Math.floor(Number(spacingMs) || 0));
   if (!lastRequestStartedAt || spacing <= 0) {
-    return;
+    return !isSyncCancellationRequested(shouldStop, signal);
   }
   const elapsedMs = Date.now() - lastRequestStartedAt;
   if (elapsedMs >= spacing) {
-    return;
+    return !isSyncCancellationRequested(shouldStop, signal);
   }
-  await sleep(spacing - elapsedMs);
+  return await waitForCancelableSyncDelay(
+    spacing - elapsedMs,
+    shouldStop,
+    signal,
+  );
 }
 
 function canContinueAfterIsolatedSyncPause(records = []) {
@@ -6123,6 +8116,7 @@ async function captureBloggerMetricsForDetailPayload(
     cache = null,
     allowProfileNavigation = true,
     allowDouyinIdLookup = false,
+    navigate = openUrlInTab,
   } = {},
 ) {
   const normalizedPayload = ensureBloggerMetricsFields(detailPayload);
@@ -6150,6 +8144,7 @@ async function captureBloggerMetricsForDetailPayload(
         profileAfterNavWaitMs,
         shouldStop,
         cache,
+        navigate,
       });
     }
     return {
@@ -6184,6 +8179,7 @@ async function captureBloggerMetricsForDetailPayload(
           profileAfterNavWaitMs,
           shouldStop,
           cache,
+          navigate,
         },
       );
       if (attached) {
@@ -6234,7 +8230,7 @@ async function captureBloggerMetricsForDetailPayload(
       PROFILE_NAV_JITTER_MIN_MS +
         Math.floor(Math.random() * (PROFILE_NAV_JITTER_MAX_MS - PROFILE_NAV_JITTER_MIN_MS)),
     );
-    await openUrlInTab(tabId, profileUrl, {
+    await navigate(tabId, profileUrl, {
       timeoutMs: detailNavTimeoutMs,
       shouldStop,
       active: true,
@@ -6260,7 +8256,7 @@ async function captureBloggerMetricsForDetailPayload(
 
     if (noteUrl) {
       try {
-        await openUrlInTab(tabId, noteUrl, {
+        await navigate(tabId, noteUrl, {
           timeoutMs: detailNavTimeoutMs,
           shouldStop,
           active: true,
@@ -6299,8 +8295,9 @@ async function captureBloggerMetricsForDetailPayload(
     }
     if (noteUrl) {
       try {
-        await openUrlInTab(tabId, noteUrl, {
+        await navigate(tabId, noteUrl, {
           timeoutMs: detailNavTimeoutMs,
+          shouldStop,
           active: true,
         });
       } catch (restoreError) {
@@ -6324,6 +8321,7 @@ async function maybeAttachDouyinAccountNo(
     profileAfterNavWaitMs = PROFILE_AFTER_NAV_WAIT_MS,
     shouldStop = null,
     cache = null,
+    navigate = openUrlInTab,
   } = {},
 ) {
   // 已有真号(patch 上、或 detailPayload 的 douyinId/authorUsername)→ 跳过导航,省一次进主页。
@@ -6359,7 +8357,7 @@ async function maybeAttachDouyinAccountNo(
             (PROFILE_NAV_JITTER_MAX_MS - PROFILE_NAV_JITTER_MIN_MS),
         ),
     );
-    await openUrlInTab(tabId, profileUrl, {
+    await navigate(tabId, profileUrl, {
       timeoutMs: detailNavTimeoutMs,
       shouldStop,
       active: true,
@@ -6390,8 +8388,9 @@ async function maybeAttachDouyinAccountNo(
     // 无论成败都回原笔记页 —— 后续还要在【当前页】采评论,不能停在博主主页
     if (noteUrl) {
       try {
-        await openUrlInTab(tabId, noteUrl, {
+        await navigate(tabId, noteUrl, {
           timeoutMs: detailNavTimeoutMs,
+          shouldStop,
           active: true,
         });
       } catch (restoreError) {
@@ -7023,6 +9022,14 @@ function normalizeOptionalCount(value) {
   return Math.floor(parsed);
 }
 
+function normalizeOptionalTimestamp(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return Math.floor(numeric);
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function pickFirstCountFromSources(sources = [], keys = []) {
   for (const source of sources) {
     if (!source || typeof source !== 'object') continue;
@@ -7051,6 +9058,61 @@ function resolveRecordListCommentsCount(record = {}) {
     'commentsCount',
     'comments_count',
   ]);
+}
+
+function buildCapturedCommentStatus(record = {}) {
+  const payload =
+    record?.payload && typeof record.payload === 'object'
+      ? record.payload
+      : {};
+  const baseline = normalizeOptionalCount(payload.detailCommentCountBaseline);
+  return {
+    commentsCount: resolveRecordListCommentsCount(record),
+    commentsBaselineCount: baseline,
+    capturedAt:
+      normalizeOptionalTimestamp(payload.detailCaptureFinishedAt) ??
+      normalizeOptionalTimestamp(record?.updatedAt),
+    hasBaseline: baseline !== null,
+  };
+}
+
+function resolveCapturedCommentBaseline({localStatus = null, remoteStatus = null} = {}) {
+  const readBaseline = (status) => {
+    if (status?.hasBaseline && status.commentsBaselineCount !== null) {
+      return normalizeOptionalCount(status.commentsBaselineCount);
+    }
+    return normalizeOptionalCount(status?.commentsCount);
+  };
+  const localBaseline = readBaseline(localStatus);
+  const remoteBaseline = readBaseline(remoteStatus);
+  if (localBaseline === null) return remoteBaseline;
+  if (remoteBaseline === null) return localBaseline;
+
+  const localCapturedAt = normalizeOptionalTimestamp(localStatus?.capturedAt);
+  const remoteCapturedAt = normalizeOptionalTimestamp(remoteStatus?.capturedAt);
+  if (localCapturedAt !== null && remoteCapturedAt !== null) {
+    if (localCapturedAt > remoteCapturedAt) return localBaseline;
+    if (remoteCapturedAt > localCapturedAt) return remoteBaseline;
+  } else if (localCapturedAt !== null) {
+    return localBaseline;
+  } else if (remoteCapturedAt !== null) {
+    return remoteBaseline;
+  }
+
+  // Legacy snapshots have no comparable capture time. The larger baseline is
+  // the fail-safe choice: it avoids treating stale local data as new growth.
+  return Math.max(localBaseline, remoteBaseline);
+}
+
+function hasCommentCountIncreasedSinceLastCapture({
+  currentCommentsCount = null,
+  localStatus = null,
+  remoteStatus = null,
+} = {}) {
+  const current = normalizeOptionalCount(currentCommentsCount);
+  if (current === null) return false;
+  const baseline = resolveCapturedCommentBaseline({localStatus, remoteStatus});
+  return baseline !== null && current > baseline;
 }
 
 function isValidBloggerMetricsStatus(status) {
@@ -8010,6 +10072,8 @@ async function getCurrentActiveTab() {
 
 async function prepareDetailBatchRunnerContext({
   sourceTab,
+  runnerMode = DETAIL_RUNNER_MODE.SOURCE_TAB,
+  indexOffset = 1,
 } = {}) {
   const sourceTabId = Number(sourceTab?.id);
   if (!Number.isFinite(sourceTabId) || sourceTabId <= 0) {
@@ -8024,14 +10088,37 @@ async function prepareDetailBatchRunnerContext({
     sourcePlatform === 'douyin' &&
     sourcePageType === PAGE_TYPE.BLOGGER_PROFILE;
 
+  const normalizedRunnerMode = normalizeDetailRunnerMode(runnerMode);
+  if (normalizedRunnerMode === DETAIL_RUNNER_MODE.DEDICATED_TAB) {
+    const runnerTab = await createDedicatedDetailRunnerTab({
+      sourceTab,
+      indexOffset,
+    });
+    return {
+      sourceTabId,
+      sourcePageUrl,
+      sourcePageScrollY,
+      sourcePlatform,
+      sourcePageType,
+      runnerMode: normalizedRunnerMode,
+      runnerTabId: Number(runnerTab.id),
+      openTabAsActive: false,
+      ownsRunnerTab: true,
+      shouldRestoreSourcePage: false,
+      shouldRestoreRuntimeContext: false,
+    };
+  }
+
   return {
     sourceTabId,
     sourcePageUrl,
     sourcePageScrollY,
     sourcePlatform,
     sourcePageType,
+    runnerMode: normalizedRunnerMode,
     runnerTabId: sourceTabId,
     openTabAsActive: true,
+    ownsRunnerTab: false,
     shouldRestoreSourcePage: !shouldKeepLastDetailPageOpen,
     shouldRestoreRuntimeContext: shouldKeepLastDetailPageOpen,
   };
@@ -8100,6 +10187,97 @@ async function openUrlInTab(
   }
 
   throw new Error('打开页面超时，请稍后重试');
+}
+
+async function probeDetailPreloadSafety(tabId) {
+  if (!globalThis.chrome?.scripting?.executeScript) {
+    return {ok: true, skipped: true};
+  }
+  try {
+    const [execution] = await chrome.scripting.executeScript({
+      target: {tabId: Number(tabId)},
+      func: () => {
+        const title = String(document.title || '').trim();
+        const bodyText = String(document.body?.innerText || '')
+          .replace(/\s+/gu, ' ')
+          .trim()
+          .slice(0, 12000);
+        const currentUrl = String(location.href || '');
+        const xhsBlocked =
+          (/安全限制/u.test(bodyText) &&
+            /(访问频繁|稍后再试|300013)/u.test(bodyText)) ||
+          (/300013/u.test(bodyText) &&
+            /(访问频繁|稍后再试|安全)/u.test(bodyText));
+        const challengeBlocked =
+          /(验证码中间页|请完成下列验证后继续|请完成验证|captcha|challenge)/iu.test(
+            `${title} ${bodyText}`,
+          );
+        return {
+          currentUrl,
+          title,
+          blocked: xhsBlocked || challengeBlocked,
+          code: xhsBlocked ? 'XHS_SECURITY_BLOCK' : 'PAGE_CHALLENGE_BLOCK',
+          message: xhsBlocked
+            ? '触发小红书安全限制(访问频繁/300013)'
+            : challengeBlocked
+              ? '详情预加载遇到验证码或风险验证页'
+              : '',
+        };
+      },
+    });
+    const result = execution?.result || {};
+    if (result.blocked) {
+      const error = new Error(result.message || '详情预加载遇到安全验证页');
+      error.code = result.code || 'PAGE_CHALLENGE_BLOCK';
+      error.currentUrl = result.currentUrl || '';
+      throw error;
+    }
+    return {ok: true, ...result};
+  } catch (error) {
+    if (
+      error?.code === 'XHS_SECURITY_BLOCK' ||
+      error?.code === 'PAGE_CHALLENGE_BLOCK'
+    ) {
+      throw error;
+    }
+    console.warn(
+      '[CaptureSync] detail preload safety probe unavailable (ignored):',
+      error?.message || error,
+    );
+    return {ok: true, skipped: true};
+  }
+}
+
+function isDetailSecurityBlockError(error) {
+  const code = String(error?.code || '').trim().toUpperCase();
+  const message = String(error?.message || error || '').trim();
+  return (
+    code === 'XHS_SECURITY_BLOCK' ||
+    code === 'PAGE_CHALLENGE_BLOCK' ||
+    code === 'HTTP_429' ||
+    code === 'RATE_LIMITED' ||
+    /300013|安全限制|访问频繁|验证码|captcha|challenge|too many requests|\b429\b/iu.test(
+      message,
+    )
+  );
+}
+
+async function findNextDetailPrefetchCandidate({
+  recordIds,
+  startIndex,
+  skipRecordIdSet,
+} = {}) {
+  const candidates = Array.isArray(recordIds) ? recordIds : [];
+  for (let index = Math.max(0, Number(startIndex) || 0); index < candidates.length; index += 1) {
+    const recordId = candidates[index];
+    if (skipRecordIdSet?.has(recordId)) continue;
+    const record = await getRecord(recordId);
+    if (!record || !isDetailCaptureRecordType(record.type)) continue;
+    const url = resolveRecordNoteUrl(record);
+    if (!url) continue;
+    return {recordId, url, index};
+  }
+  return null;
 }
 
 function isTargetNoteOpened(currentUrl, targetUrl, targetNoteId = '') {
@@ -8407,6 +10585,15 @@ async function captureCommentsForCurrentNote({
   }
 
   if (!result?.ok) {
+    if (isDetailSecurityBlockError(result?.error)) {
+      const error = new Error(
+        result?.error?.message || '评论采集遇到安全验证，已停止详情批次',
+      );
+      error.code =
+        String(result?.error?.code || '').trim().toUpperCase() ||
+        'PAGE_CHALLENGE_BLOCK';
+      throw error;
+    }
     return {
       status: COMMENT_CAPTURE_STATUS.FAILED,
       stoppedByUser: false,
@@ -8816,7 +11003,7 @@ function buildRecordsForStorage(captureResult) {
         items: [normalizedItem],
       });
       const preview = buildRecordPreview(type, nextPayload);
-      return {
+      const record = {
         ...createRecordEnvelope({
           platform,
           type,
@@ -8826,22 +11013,34 @@ function buildRecordsForStorage(captureResult) {
         title: preview.title,
         summary: preview.summary,
       };
+      const boundTrace = bindCaptureTrace(
+        normalizedItem.captureTrace,
+        record.id,
+        'saved',
+      );
+      return boundTrace
+        ? applyCaptureTraceToRecord(record, boundTrace)
+        : record;
     });
   }
 
   const preview = buildRecordPreview(type, payload);
-  return [
-    {
-      ...createRecordEnvelope({
-        platform,
-        type,
-        data: payload,
-        meta,
-      }),
-      title: preview.title,
-      summary: preview.summary,
-    },
-  ];
+  const record = {
+    ...createRecordEnvelope({
+      platform,
+      type,
+      data: payload,
+      meta,
+    }),
+    title: preview.title,
+    summary: preview.summary,
+  };
+  const boundTrace = bindCaptureTrace(
+    resolveCaptureTraceFromPayload(payload),
+    record.id,
+    'saved',
+  );
+  return [boundTrace ? applyCaptureTraceToRecord(record, boundTrace) : record];
 }
 
 function buildRecordPreview(type, payload) {
@@ -9700,6 +11899,9 @@ export async function batchCaptureByKeywords({
         });
       }
 
+      // One keyword owns one child list run; an empty-result retry reuses it,
+      // while the next keyword receives a different run id.
+      const listCaptureRunId = createCaptureRequestId('list-run');
       const runKeywordCapture = () =>
         captureAndSaveInTab({
           tabId: runnerTabId,
@@ -9707,6 +11909,7 @@ export async function batchCaptureByKeywords({
           captureParams: {
             ...captureParams,
             keyword,
+            listCaptureRunId,
           },
           checkpointSource: 'batch_keyword_capture',
           onProgress: onProgress
@@ -11400,6 +13603,7 @@ async function captureInActiveTab({
   mode = 'auto',
   onProgress = null,
   captureParams = {},
+  onTargetTab = null,
 } = {}) {
   if (onProgress) {
     onProgress({
@@ -11411,6 +13615,13 @@ async function captureInActiveTab({
   const tab = await resolveCaptureTargetTab({ mode });
   if (!tab?.id) {
     throw new Error('未找到当前活动标签页');
+  }
+  if (typeof onTargetTab === 'function') {
+    try {
+      onTargetTab(tab);
+    } catch {
+      // 仅用于回写本地 trace，回调失败不影响采集。
+    }
   }
 
   return captureInTab(tab.id, {
@@ -11612,6 +13823,7 @@ function buildContentRequest(mode, captureParams = {}) {
     case 'blogger_notes':
       return {
         action: 'captureBloggerNotes',
+        listCaptureRunId: captureParams.listCaptureRunId,
         minLikes: captureParams.minLikes,
         maxDetectedItems:
           captureParams.maxDetectedItems ?? captureParams.maxItems,
@@ -11630,6 +13842,7 @@ function buildContentRequest(mode, captureParams = {}) {
     case 'keyword':
       return {
         action: 'captureKeywordNotes',
+        listCaptureRunId: captureParams.listCaptureRunId,
         keyword: captureParams.keyword || '',
         minLikes: captureParams.minLikes,
         sortDimension: captureParams.sortDimension,

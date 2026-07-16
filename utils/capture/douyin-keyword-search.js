@@ -459,9 +459,12 @@ function extractDouyinSearchCards(searchRoot) {
       ? normalizeSearchDate(publishDateRaw)
       : "";
     const noteType = resolveSearchCardNoteType(card, noteUrl, tabType);
+    const domCaptureKey = `douyin:${String(noteId).trim()}`;
+    card.setAttribute?.("data-osv-capture-key", domCaptureKey);
 
     notes.push({
       noteId,
+      domCaptureKey,
       url: noteUrl,
       noteUrl,
       detailPageUrl: noteUrl,

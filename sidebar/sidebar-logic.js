@@ -43,6 +43,9 @@ import {
   batchCaptureByUrls,
   lightSampleByKeywords,
   captureTabContent,
+  beginCaptureTaskSession,
+  updateCaptureTaskSession,
+  endCaptureTaskSession,
 } from "../utils/capture-sync.js";
 import {
   getCaptureSettings,
@@ -137,6 +140,10 @@ const commentCaptureTerminalStatusByRecordId = new Map();
 let detailBatchCaptureInFlight = false;
 let detailBatchCancelRequested = false;
 let detailBatchRunnerTabId = null;
+const detailBatchRunnerTabIds = new Set();
+let detailBatchWorkerStates = [];
+let detailBatchWorkerMode = "";
+let detailBatchWorkerRevision = 0;
 let lastProgressSyncAt = 0;
 let lastPoolRefreshAt = 0;
 const DEFAULT_BLOGGER_PROFILE_TABLE_NAME = "博主信息表";
@@ -354,6 +361,110 @@ function finishSidebarTask(
   }
 }
 
+async function resolveCaptureTaskSourceTabId({
+  preferredTabId = null,
+  platform = "",
+} = {}) {
+  const expectedPlatform = String(platform || "").trim().toLowerCase();
+  const matchesSourcePage = (tab) => {
+    const tabId = Number(tab?.id);
+    if (!Number.isSafeInteger(tabId) || tabId <= 0) return false;
+    return (
+      !expectedPlatform ||
+      detectPlatformFromUrl(tab?.url || "") === expectedPlatform
+    );
+  };
+  const visitedTabIds = new Set();
+  const readTabById = async (candidateTabId) => {
+    const tabId = Number(candidateTabId);
+    if (
+      !Number.isSafeInteger(tabId) ||
+      tabId <= 0 ||
+      visitedTabIds.has(tabId)
+    ) {
+      return null;
+    }
+    visitedTabIds.add(tabId);
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      return matchesSourcePage(tab) ? tabId : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const preferredSourceTabId = await readTabById(preferredTabId);
+  if (preferredSourceTabId) return preferredSourceTabId;
+
+  try {
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    if (matchesSourcePage(activeTab)) {
+      return Number(activeTab.id);
+    }
+  } catch {
+    // ignore and fallback to the last supported source tab
+  }
+
+  return await readTabById(getCurrentRuntime()?.lastActiveTabId);
+}
+
+function resolveCaptureTaskTerminalStatus({
+  taskStatus = "completed",
+  error = null,
+  canceled = false,
+} = {}) {
+  if (canceled) return {reason: "canceled", status: "canceled"};
+  if (error || taskStatus === "failed") {
+    return {reason: "failed", status: "failed"};
+  }
+  if (taskStatus === "skipped") {
+    return {reason: "skipped", status: "skipped"};
+  }
+  if (
+    taskStatus === "partial" ||
+    taskStatus === "completed_with_failures"
+  ) {
+    return {
+      reason: "completed_with_failures",
+      status: taskStatus,
+    };
+  }
+  return {reason: "completed", status: "completed"};
+}
+
+async function startRequiredCaptureTaskSession(options = {}) {
+  const taskId = String(options?.taskId || "").trim();
+  const platform = String(options?.platform || "").trim().toLowerCase();
+  if (!new Set(["xiaohongshu", "douyin"]).has(platform)) {
+    const error = new Error("任务级 AI Debug 当前仅支持小红书和抖音");
+    error.code = "capture_task_platform_unsupported";
+    throw error;
+  }
+  bindCaptureTaskOwner(taskId);
+  const result = await beginCaptureTaskSession({
+    ...options,
+    ownerRequired: true,
+  });
+  if (result?.ok === true && result?.active === true) {
+    return result;
+  }
+  releaseCaptureTaskOwner(taskId);
+  const reason = String(
+    result?.response?.error?.message ||
+      result?.error?.message ||
+      result?.reason ||
+      "任务接管初始化失败",
+  ).trim();
+  const error = new Error(`无法启动 AI Debug 任务：${reason}`);
+  error.code = String(
+    result?.response?.error?.code || result?.reason || "capture_task_unavailable",
+  );
+  throw error;
+}
+
 const DEFAULT_MONITOR_SETTINGS = Object.freeze({
   publishWindow: MONITOR_PUBLISH_WINDOW.LAST_24H,
   likeThreshold: 0,
@@ -433,6 +544,8 @@ let authVerifyInFlight = false;
 let contactModalListenersBound = false;
 let memberGroupModalListenersBound = false;
 let riskModalListenersBound = false;
+let debugSessionPanelMinimized = false;
+let debugSessionPanelListenersBound = false;
 let updateModalListenersBound = false;
 let updateGuideModalListenersBound = false;
 let keywordSortDimension = KEYWORD_SORT_DIMENSION.LIKES;
@@ -448,6 +561,11 @@ let batchKeywordCaptureInFlight = false;
 let batchKeywordCancelRequested = false;
 let searchCaptureCancelRequested = false;
 let activeBatchRunnerTabId = null;
+const CAPTURE_TASK_OWNER_PORT_NAME = "osv.capture.sidebar-owner.v1";
+let captureTaskOwnerPort = null;
+let captureTaskOwnerClosing = false;
+let captureTaskOwnerTaskId = "";
+let lastCaptureTaskCancellationKey = "";
 let monitorRunInFlight = false;
 let monitorRunCancelRequested = false;
 let keywordAnalysisInFlight = false;
@@ -502,6 +620,128 @@ const EYE_OFF_ICON = `
   <path d="M3 3l18 18"></path>
 </svg>
 `;
+
+function postCaptureTaskOwnerMessage(message) {
+  if (!captureTaskOwnerPort) return false;
+  try {
+    captureTaskOwnerPort.postMessage(message);
+    return true;
+  } catch (error) {
+    console.warn("[Sidebar] Capture task owner message failed:", error);
+    return false;
+  }
+}
+
+function bindCaptureTaskOwner(taskId) {
+  const normalizedTaskId = String(taskId || "").trim();
+  if (!normalizedTaskId) return;
+  captureTaskOwnerTaskId = normalizedTaskId;
+  if (!captureTaskOwnerPort && !captureTaskOwnerClosing) {
+    connectCaptureTaskOwnerPort();
+  }
+  postCaptureTaskOwnerMessage({
+    type: "capture-owner:bind",
+    taskId: normalizedTaskId,
+  });
+}
+
+function releaseCaptureTaskOwner(taskId) {
+  const normalizedTaskId = String(taskId || captureTaskOwnerTaskId || "").trim();
+  if (!normalizedTaskId) return;
+  postCaptureTaskOwnerMessage({
+    type: "capture-owner:unbind",
+    taskId: normalizedTaskId,
+  });
+  if (captureTaskOwnerTaskId === normalizedTaskId) {
+    captureTaskOwnerTaskId = "";
+  }
+}
+
+function applyCaptureTaskCancellation(cancellation = {}) {
+  const taskId = String(cancellation?.taskId || "").trim();
+  if (!taskId || taskId !== captureTaskOwnerTaskId) return;
+  const cancellationKey = `${taskId}:${String(
+    cancellation?.requestedAt || cancellation?.reason || "canceled",
+  )}`;
+  if (cancellationKey === lastCaptureTaskCancellationKey) return;
+  lastCaptureTaskCancellationKey = cancellationKey;
+
+  setCancelFlag(true);
+  searchCaptureCancelRequested = true;
+  batchKeywordCancelRequested = true;
+  detailBatchCancelRequested = true;
+  batchUrlCancelRequested = true;
+  monitorRunCancelRequested = true;
+  const taskWorkerTabIds = Array.isArray(
+    getCurrentRuntime()?.captureDebugSession?.workerTabIds,
+  )
+    ? getCurrentRuntime().captureDebugSession.workerTabIds
+    : [];
+  const fallbackTabId =
+    (Number.isSafeInteger(Number(activeBatchRunnerTabId)) &&
+      Number(activeBatchRunnerTabId)) ||
+    null;
+  requestDetailRunnerCancelSignals({
+    extraTabIds: taskWorkerTabIds,
+    fallbackTabId,
+  }).catch((error) => {
+    console.warn("[Sidebar] Relay native Debug cancellation failed:", error);
+  });
+  showMessage(
+    cancellation?.reason === "sidebar_owner_disconnected"
+      ? "控制面板已关闭，采集任务已安全停止"
+      : "浏览器 Debug 接管已取消，整项采集正在停止",
+    "warning",
+  );
+}
+
+function syncCaptureTaskOwnerFromRuntime(runtime = {}) {
+  const cancellation = runtime?.captureTaskCancellation;
+  if (cancellation && typeof cancellation === "object") {
+    applyCaptureTaskCancellation(cancellation);
+  }
+}
+
+function connectCaptureTaskOwnerPort() {
+  if (captureTaskOwnerClosing || captureTaskOwnerPort) return;
+  let port;
+  try {
+    port = chrome.runtime.connect({name: CAPTURE_TASK_OWNER_PORT_NAME});
+  } catch (error) {
+    console.warn("[Sidebar] Capture task owner port unavailable:", error);
+    return;
+  }
+  captureTaskOwnerPort = port;
+  port.onMessage.addListener((message) => {
+    if (message?.type !== "capture-owner:canceled") return;
+    applyCaptureTaskCancellation({
+      ...(message?.payload && typeof message.payload === "object"
+        ? message.payload
+        : {}),
+      ...message,
+    });
+  });
+  port.onDisconnect.addListener(() => {
+    if (captureTaskOwnerPort === port) {
+      captureTaskOwnerPort = null;
+    }
+    if (!captureTaskOwnerClosing) {
+      setTimeout(() => {
+        if (captureTaskOwnerClosing || captureTaskOwnerPort) return;
+        connectCaptureTaskOwnerPort();
+        if (captureTaskOwnerTaskId) {
+          bindCaptureTaskOwner(captureTaskOwnerTaskId);
+        }
+      }, 150);
+    }
+  });
+  if (captureTaskOwnerTaskId) {
+    postCaptureTaskOwnerMessage({
+      type: "capture-owner:bind",
+      taskId: captureTaskOwnerTaskId,
+    });
+  }
+}
 
 // ==================== 批量操作弹窗逻辑 ====================
 
@@ -2191,6 +2431,8 @@ export async function initSidebar() {
 
   // 初始化所有状态
   await initAllStates();
+  connectCaptureTaskOwnerPort();
+  syncCaptureTaskOwnerFromRuntime(getCurrentRuntime() || {});
 
   let repairedDetailCapture = {count: 0, recordIds: []};
   let repairedCommentCapture = {count: 0, recordIds: []};
@@ -2234,6 +2476,7 @@ export async function initSidebar() {
 
   // 绑定 UI 事件
   setupUIEventListeners();
+  setupDebugSessionPanelControls();
   setupKeywordPlanStorageListener();
 
   await showRiskNoticeIfNeeded();
@@ -2338,6 +2581,8 @@ function setupStateSubscriptions() {
       });
     }
     syncRuntimeCaptureProgress(runtime);
+    renderCaptureDebugSession(runtime);
+    syncCaptureTaskOwnerFromRuntime(runtime);
     syncRuntimeCommentProgress(runtime).catch((error) => {
       console.warn("[Sidebar] Failed to sync runtime comment progress:", error);
     });
@@ -2388,6 +2633,321 @@ function setupStateSubscriptions() {
     window.getSidebarMonitorState = () => monitor;
     updateDataPoolUI(getCurrentDataPool());
   });
+}
+
+function resolveCaptureTaskStep(progress = {}) {
+  const phase = String(progress?.phase || "debug_session_attached").toLowerCase();
+  if (
+    phase.includes("sync") ||
+    phase.includes("upload") ||
+    phase.includes("check_before")
+  ) {
+    return 4;
+  }
+  if (phase.startsWith("detail_") || phase.includes("enhanc")) {
+    return 3;
+  }
+  if (
+    phase.includes("saving") ||
+    phase === "saved" ||
+    phase.includes("marked") ||
+    phase.includes("binding") ||
+    phase === "completed"
+  ) {
+    return 2;
+  }
+  if (
+    phase === "debug_session_attached" ||
+    phase.includes("initial") ||
+    phase.includes("analy")
+  ) {
+    return 0;
+  }
+  return 1;
+}
+
+function resolveCaptureTaskPercent(progress = {}) {
+  const explicit = Number(progress?.progressPercent);
+  if (!Number.isFinite(explicit)) return null;
+  return Math.max(0, Math.min(100, Math.round(explicit)));
+}
+
+function buildCaptureTaskStats(progress = {}) {
+  const parts = [];
+  const detectedCount = Number(progress?.detectedCount);
+  const markedCount = Number(progress?.markedCount ?? progress?.filteredCount);
+  const current = Number(progress?.current);
+  const total = Number(progress?.total);
+  if (Number.isFinite(detectedCount) && detectedCount > 0) {
+    parts.push(`已读取 ${Math.floor(detectedCount)} 条`);
+  }
+  if (Number.isFinite(markedCount) && markedCount > 0) {
+    parts.push(`已标记 ${Math.floor(markedCount)} 条`);
+  }
+  if (
+    Number.isFinite(current) &&
+    Number.isFinite(total) &&
+    total > 0 &&
+    current >= 0
+  ) {
+    parts.push(`当前 ${Math.min(Math.floor(current), Math.floor(total))}/${Math.floor(total)}`);
+  }
+  return parts.join(" · ");
+}
+
+async function setCaptureTaskPanelMinimized(minimized) {
+  debugSessionPanelMinimized = Boolean(minimized);
+  renderCaptureDebugSession(getCurrentRuntime() || {});
+  const session = getCurrentRuntime()?.captureDebugSession;
+  const taskId = String(session?.taskId || session?.runId || "").trim();
+  if (!taskId) return;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "onstarvoice:set-capture-task-minimized",
+      taskId,
+      minimized: Boolean(minimized),
+    });
+    if (response?.ok === false) {
+      throw new Error(response?.error?.message || "更新任务状态页失败");
+    }
+  } catch (error) {
+    console.warn("[Sidebar] Persist task surface visibility failed:", error);
+  }
+}
+
+function renderCaptureTaskWorkers(progress = {}) {
+  const panel = document.getElementById("debugSessionWorkers");
+  const modeLabel = document.getElementById("debugSessionWorkerMode");
+  if (!panel) return;
+  const workerStates = Array.isArray(progress?.workerStates)
+    ? progress.workerStates.slice(0, 2)
+    : [];
+  panel.hidden = workerStates.length === 0;
+  if (workerStates.length === 0) return;
+
+  if (modeLabel) {
+    modeLabel.textContent =
+      progress?.workerMode === "double_buffer" && workerStates.length > 1
+        ? "双缓冲 · 单条采集"
+        : "单工作页";
+  }
+
+  const current = Math.max(0, Number(progress?.current) || 0);
+  const total = Math.max(0, Number(progress?.total) || 0);
+  panel.querySelectorAll("[data-worker-index]").forEach((row) => {
+    const index = Number(row.getAttribute("data-worker-index"));
+    const worker = workerStates[index];
+    row.hidden = !worker;
+    if (!worker) return;
+    const state = String(worker.state || "idle").trim().toLowerCase();
+    const safeState = [
+      "idle",
+      "queued",
+      "loading",
+      "ready",
+      "collecting",
+      "failed",
+    ].includes(state)
+      ? state
+      : "idle";
+    row.setAttribute("data-state", safeState);
+    const title = row.querySelector(".debug-session-worker-copy strong");
+    const detail = row.querySelector(".debug-session-worker-copy small");
+    const hasCollectingPeer = workerStates.some(
+      (candidate, candidateIndex) =>
+        candidateIndex !== index &&
+        String(candidate?.state || "").trim().toLowerCase() === "collecting",
+    );
+    if (title) title.textContent = worker.label || `工作页 ${index + 1}`;
+    if (detail) {
+      const statusText = {
+        idle: "等待下一条",
+        queued:
+          worker.mode === "prefetch" ? "已排队，等待安全导航间隔" : "准备打开当前详情",
+        loading:
+          worker.mode === "prefetch" ? "正在预加载下一条" : "正在打开当前详情",
+        ready: hasCollectingPeer
+          ? "下一条已加载，等待当前条完成"
+          : "下一条已加载，等待安全切换",
+        collecting:
+          total > 0 ? `正在采集 ${Math.min(current, total)}/${total}` : "正在采集详情",
+        failed: "页面加载失败，任务正在停止",
+      }[safeState];
+      detail.textContent = statusText;
+    }
+    row.setAttribute(
+      "aria-label",
+      `${worker.label || `工作页 ${index + 1}`}：${detail?.textContent || "等待任务"}`,
+    );
+  });
+}
+
+function renderCaptureDebugSession(runtime = {}) {
+  const panel = document.getElementById("debugSessionPanel");
+  const dock = document.getElementById("debugSessionDock");
+  if (!panel) return;
+  const session = runtime?.captureDebugSession;
+  const sessionTabId = Number(session?.sourceTabId ?? session?.tabId);
+  const active =
+    session?.state === "attached" &&
+    Number.isSafeInteger(sessionTabId) &&
+    sessionTabId > 0;
+  if (!active) debugSessionPanelMinimized = false;
+  if (active && typeof session?.minimized === "boolean") {
+    debugSessionPanelMinimized = session.minimized;
+  }
+  panel.hidden = !active || debugSessionPanelMinimized;
+  panel.setAttribute(
+    "data-minimized",
+    String(active && debugSessionPanelMinimized),
+  );
+  if (dock) {
+    dock.hidden = !active || !debugSessionPanelMinimized;
+    dock.setAttribute("data-tab-id", active ? String(sessionTabId) : "");
+  }
+  if (!active) {
+    panel.removeAttribute("data-run-id");
+    panel.removeAttribute("data-task-id");
+    panel.removeAttribute("data-tab-id");
+    panel.removeAttribute("data-active-step");
+    return;
+  }
+  panel.setAttribute("data-run-id", String(session.runId || ""));
+  panel.setAttribute("data-task-id", String(session.taskId || session.runId || ""));
+  panel.setAttribute("data-tab-id", String(sessionTabId));
+
+  const platform = String(
+    session.platform || detectPlatformFromUrl(session.pageUrl || runtime.lastPageUrl || ""),
+  ).trim() || "xiaohongshu";
+  const logo = document.getElementById("debugSessionLogo");
+  if (logo) {
+    logo.className = `debug-session-logo platform-logo ${getPlatformLogoClass(platform)}`;
+    logo.innerHTML = getPlatformLogoInnerMarkup(platform);
+  }
+  const title = document.getElementById("debugSessionPageTitle");
+  const url = document.getElementById("debugSessionPageUrl");
+  if (title) title.textContent = String(session.pageTitle || session.label || "当前采集页面");
+  if (url) url.textContent = String(session.pageUrl || runtime.lastPageUrl || "");
+
+  const progress =
+    session?.progress && typeof session.progress === "object"
+      ? session.progress
+      : runtime?.lastCaptureProgress && typeof runtime.lastCaptureProgress === "object"
+        ? runtime.lastCaptureProgress
+        : {};
+  const markedCount = Math.max(
+    0,
+    Number(progress.markedCount ?? progress.filteredCount) || 0,
+  );
+  const activeStep = resolveCaptureTaskStep(progress);
+  const percent = resolveCaptureTaskPercent(progress);
+  panel.setAttribute("data-active-step", String(activeStep));
+
+  const progressTrack = panel.querySelector(".debug-session-progress-track");
+  const progressBar = document.getElementById("debugSessionProgressBar");
+  const progressPercent = document.getElementById("debugSessionProgressPercent");
+  const currentMessage = document.getElementById("debugSessionCurrentMessage");
+  const stats = document.getElementById("debugSessionStats");
+  const dockStatus = document.getElementById("debugSessionDockStatus");
+  const message = String(
+    progress?.message || session?.message || "AI 正在分析当前页面…",
+  ).trim();
+  if (progressTrack) {
+    progressTrack.classList.toggle("is-indeterminate", percent === null);
+    if (percent === null) {
+      progressTrack.removeAttribute("aria-valuenow");
+      progressTrack.setAttribute("aria-valuetext", message || "任务进行中");
+    } else {
+      progressTrack.setAttribute("aria-valuenow", String(percent));
+      progressTrack.setAttribute("aria-valuetext", `${percent}%`);
+    }
+  }
+  if (progressBar) {
+    progressBar.style.width = percent === null ? "" : `${percent}%`;
+  }
+  if (progressPercent) {
+    progressPercent.hidden = percent === null;
+    progressPercent.textContent = percent === null ? "—" : `${percent}%`;
+  }
+  if (currentMessage) currentMessage.textContent = message;
+  if (dockStatus) dockStatus.textContent = message || "点击查看进度";
+  if (stats) {
+    const statsText = buildCaptureTaskStats(progress);
+    stats.textContent = statsText;
+    stats.hidden = !statsText;
+  }
+  renderCaptureTaskWorkers(progress);
+
+  const numberingLabel = document.getElementById("debugSessionNumberingLabel");
+  if (numberingLabel) {
+    numberingLabel.textContent = markedCount > 0
+      ? `正在标记采集结果 · ${markedCount} 条`
+      : "正在标记采集结果";
+  }
+  const detailLabel = document.getElementById("debugSessionDetailLabel");
+  if (detailLabel) {
+    const current = Math.max(0, Number(progress?.current) || 0);
+    const total = Math.max(0, Number(progress?.total) || 0);
+    detailLabel.textContent =
+      activeStep === 3 && total > 0
+        ? `正在补采笔记详情 · ${Math.min(current, total)}/${total}`
+        : "正在补采笔记详情";
+  }
+  panel.querySelectorAll("[data-debug-step]").forEach((step) => {
+    const index = Number(step.getAttribute("data-debug-step"));
+    step.classList.toggle("is-complete", index < activeStep);
+    step.classList.toggle("is-active", index === activeStep);
+    step.classList.toggle("is-pending", index > activeStep);
+  });
+}
+
+function setupDebugSessionPanelControls() {
+  if (debugSessionPanelListenersBound) return;
+  const minimize = document.getElementById("btnDebugSessionMinimize");
+  const dock = document.getElementById("debugSessionDock");
+  const focus = document.getElementById("btnDebugSessionFocusTab");
+  const stop = document.getElementById("btnDebugSessionStop");
+  if (!minimize || !dock || !focus || !stop) return;
+
+  minimize.addEventListener("click", async () => {
+    await setCaptureTaskPanelMinimized(true);
+  });
+  dock.addEventListener("click", async () => {
+    await setCaptureTaskPanelMinimized(false);
+  });
+  focus.addEventListener("click", async () => {
+    const session = getCurrentRuntime()?.captureDebugSession;
+    const workerTabIds = Array.isArray(session?.workerTabIds)
+      ? session.workerTabIds
+      : [];
+    const tabId = Number(
+      workerTabIds[workerTabIds.length - 1] ?? session?.sourceTabId ?? session?.tabId,
+    );
+    if (!Number.isSafeInteger(tabId) || tabId <= 0) return;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      await chrome.tabs.update(tabId, {active: true});
+      if (Number.isSafeInteger(Number(tab.windowId))) {
+        await chrome.windows.update(Number(tab.windowId), {focused: true});
+      }
+    } catch (error) {
+      showMessage(`无法定位采集页：${error?.message || error}`, "error");
+    }
+  });
+  stop.addEventListener("click", async () => {
+    if (stop.disabled) return;
+    stop.disabled = true;
+    stop.textContent = "正在停止…";
+    try {
+      await handleCancel();
+    } finally {
+      setTimeout(() => {
+        stop.disabled = false;
+        stop.textContent = "停止";
+      }, 1200);
+    }
+  });
+  debugSessionPanelListenersBound = true;
 }
 
 function setupAuthCodeInputListeners() {
@@ -3874,6 +4434,14 @@ function setupUIEventListeners() {
       );
     });
   document
+    .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
+    .forEach((input) => {
+      input.addEventListener(
+        "change",
+        handleDetailCaptureCommentCountRecheckToggleChange,
+      );
+    });
+  document
     .querySelectorAll('[data-detail-setting="comment-leads"]')
     .forEach((input) => {
       input.addEventListener(
@@ -4714,6 +5282,16 @@ async function handleCaptureBloggerData() {
   showProgress("正在采集博主信息...");
 
   try {
+    const sourceTabId = await resolveCaptureTaskSourceTabId({
+      platform: pagePlatform,
+    });
+    await startRequiredCaptureTaskSession({
+      taskId: taskContext.taskId,
+      tabId: sourceTabId,
+      label: "博主主页采集",
+      platform: pagePlatform,
+    });
+
     const profileResult = await captureAndSync({
       mode: "blogger_profile",
       onProgress: handleProgress,
@@ -4778,19 +5356,36 @@ async function handleCaptureBloggerData() {
     successMsg += `，探测上限 ${bloggerMaxDetectedItems}）`;
     showMessage(successMsg, "success");
     await refreshDataPool();
-    await maybeRunAutoDetailCaptureAfterListCapture(
+    const enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
       resolveCurrentDetailCaptureSettings(await getCaptureSettings()),
       {
         sourceLabel: "博主笔记",
         recordIds: notesResult.recordIds,
+        captureTaskId: taskContext.taskId,
       },
     );
+    if (enhanceResult?.securityBlocked || enhanceResult?.canceled) {
+      taskStatus = "partial";
+    } else if (enhanceResult && enhanceResult.ok === false) {
+      taskStatus = "completed_with_failures";
+    }
   } catch (error) {
     console.error("[Sidebar] Capture blogger failed:", error);
     taskStatus = "failed";
     taskError = error;
     showMessage("操作失败: " + error.message, "error");
   } finally {
+    const terminal = resolveCaptureTaskTerminalStatus({
+      taskStatus,
+      error: taskError,
+    });
+    const captureTaskEnd = await endCaptureTaskSession({
+      taskId: taskContext.taskId,
+      ...terminal,
+    });
+    if (captureTaskEnd?.ok === true) {
+      releaseCaptureTaskOwner(taskContext.taskId);
+    }
     finishSidebarTask(taskContext, {
       status: taskStatus,
       error: taskError,
@@ -4912,7 +5507,9 @@ async function handleCaptureSearchData() {
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
     );
-    streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings);
+    streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings, {
+      shouldStop: () => searchCaptureCancelRequested,
+    });
     if (
       settings.autoDetailCaptureAfterListCapture &&
       !ensureAuthVerifiedOrWarn({
@@ -4984,6 +5581,19 @@ async function handleCaptureSearchData() {
       }
     }
 
+    const sourceTabId = await resolveCaptureTaskSourceTabId({
+      preferredTabId: searchActiveTabId,
+      platform: pagePlatform,
+    });
+    await startRequiredCaptureTaskSession({
+      taskId: taskContext.taskId,
+      tabId: sourceTabId,
+      label: searchBatchMode
+        ? `批量搜索采集 · ${searchKeywords.length} 个关键词`
+        : `搜索「${keyword}」`,
+      platform: pagePlatform,
+    });
+
     let searchRound = 0;
     do {
       searchRound += 1;
@@ -5018,6 +5628,7 @@ async function handleCaptureSearchData() {
                     {
                       sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                       recordIds,
+                      captureTaskId: taskContext.taskId,
                       onItemSettled: streamingSyncQueue?.enabled
                         ? (progress) =>
                             routeDetailItemToStreamingSync(
@@ -5062,6 +5673,7 @@ async function handleCaptureSearchData() {
                       {
                         sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                         recordIds,
+                        shouldStop: () => searchCaptureCancelRequested,
                       },
                     );
                 if (syncResult && syncResult.ok === false) {
@@ -5070,7 +5682,8 @@ async function handleCaptureSearchData() {
                 return enhanceResult;
               }
             : null,
-          onProgress: (p) =>
+          onProgress: (p) => {
+            handleProgress(p);
             showProgress(
               searchAutoLoop
                 ? appendStreamingSyncSummary(
@@ -5082,7 +5695,8 @@ async function handleCaptureSearchData() {
                     streamingSyncQueue,
                   ),
               "info",
-            ),
+            );
+          },
           shouldStop: () => searchCaptureCancelRequested,
         });
         await refreshDataPool();
@@ -5156,6 +5770,7 @@ async function handleCaptureSearchData() {
               {
                 sourceLabel: "搜索结果",
                 recordIds: actionResult.recordIds,
+                captureTaskId: taskContext.taskId,
                 onItemSettled: streamingSyncQueue?.enabled
                   ? (progress) =>
                       routeDetailItemToStreamingSync(
@@ -5188,7 +5803,11 @@ async function handleCaptureSearchData() {
               ? null
               : await maybeRunAutoSyncAfterDetailCapture(
                   currentDetailSettings,
-                  {sourceLabel: "搜索结果", recordIds: actionResult.recordIds},
+                  {
+                    sourceLabel: "搜索结果",
+                    recordIds: actionResult.recordIds,
+                    shouldStop: () => searchCaptureCancelRequested,
+                  },
                 );
             if (syncResult && syncResult.ok === false) {
               taskStatus = "completed_with_failures";
@@ -5247,6 +5866,21 @@ async function handleCaptureSearchData() {
         console.warn("[Sidebar] Drain manual streaming sync failed:", error);
         return streamingSyncQueue.getStats();
       });
+    }
+    if (streamingSyncResult?.canceled && taskStatus === "completed") {
+      taskStatus = "partial";
+    }
+    const terminal = resolveCaptureTaskTerminalStatus({
+      taskStatus,
+      error: taskError,
+      canceled: searchCaptureCancelRequested,
+    });
+    const captureTaskEnd = await endCaptureTaskSession({
+      taskId: taskContext.taskId,
+      ...terminal,
+    });
+    if (captureTaskEnd?.ok === true) {
+      releaseCaptureTaskOwner(taskContext.taskId);
     }
     finishSidebarTask(taskContext, {
       status: taskStatus,
@@ -9832,6 +10466,35 @@ async function requestCaptureCancelSignal(
   return true;
 }
 
+function getKnownDetailRunnerTabIds(extraTabIds = []) {
+  const tabIds = new Set(detailBatchRunnerTabIds);
+  const activeTabId = Number(detailBatchRunnerTabId);
+  if (Number.isSafeInteger(activeTabId) && activeTabId > 0) {
+    tabIds.add(activeTabId);
+  }
+  for (const value of Array.isArray(extraTabIds) ? extraTabIds : []) {
+    const tabId = Number(value);
+    if (Number.isSafeInteger(tabId) && tabId > 0) tabIds.add(tabId);
+  }
+  return [...tabIds];
+}
+
+async function requestDetailRunnerCancelSignals({
+  extraTabIds = [],
+  fallbackTabId = null,
+} = {}) {
+  const runnerTabIds = getKnownDetailRunnerTabIds(extraTabIds);
+  if (runnerTabIds.length === 0) {
+    return await requestCaptureCancelSignal(fallbackTabId);
+  }
+  const settled = await Promise.allSettled(
+    runnerTabIds.map((tabId) => requestCaptureCancelSignal(tabId)),
+  );
+  return settled.some(
+    (result) => result.status === "fulfilled" && result.value === true,
+  );
+}
+
 function parseKeywordsFromMultilineInput(rawText = "") {
   return String(rawText || "")
     .split(/\r?\n/g)
@@ -9956,18 +10619,25 @@ function collectSuccessfulDetailRecordIds(detailResult = {}) {
   ];
 }
 
-function createStreamingDetailAutoSyncQueue(settings) {
+function createStreamingDetailAutoSyncQueue(
+  settings,
+  {shouldStop = null, signal = null} = {},
+) {
   return createRecordSyncQueue({
     enabled: Boolean(
       settings?.autoDetailCaptureAfterListCapture &&
         settings?.autoSyncAfterDetailCapture,
     ),
-    processRecord: async ({recordId, meta = {}}) => {
+    shouldStop,
+    signal,
+    processRecord: async ({recordId, meta = {}, signal: jobSignal = null}) => {
       const result = await maybeRunAutoSyncAfterDetailCapture(settings, {
         sourceLabel: String(meta?.sourceLabel || "当前笔记"),
         recordIds: [recordId],
         silent: true,
         refreshAfter: false,
+        shouldStop,
+        signal: jobSignal || signal,
       });
       return {
         ...result,
@@ -10148,10 +10818,19 @@ async function retryFailedEnhancementsAfterRound({
     !retryResult?.canceled &&
     !streamingSyncQueue?.enabled
   ) {
-    await maybeRunAutoSyncAfterDetailCapture(settings, {
+    const retrySyncResult = await maybeRunAutoSyncAfterDetailCapture(settings, {
       sourceLabel: `${prefix || "本轮"}增强失败重试成功项`,
       recordIds: successRecordIds,
+      shouldStop,
     });
+    if (retrySyncResult?.canceled) {
+      return {
+        ...retryResult,
+        canceled: true,
+        retryRecordIds: failedRecordIds,
+        successRecordIds,
+      };
+    }
   }
 
   const retryDone = {
@@ -10213,12 +10892,15 @@ async function handleBatchKeywordCapture(options = {}) {
     if (btnBatch) {
       btnBatch.textContent = "停止中...";
     }
-    const batchCancelTabId =
-      detailBatchCaptureInFlight && Number.isFinite(Number(detailBatchRunnerTabId))
-        ? Number(detailBatchRunnerTabId)
-        : activeBatchRunnerTabId;
     try {
-      await requestCaptureCancelSignal(batchCancelTabId);
+      if (detailBatchCaptureInFlight) {
+        await requestDetailRunnerCancelSignals({
+          extraTabIds: getCurrentRuntime()?.captureDebugSession?.workerTabIds,
+          fallbackTabId: activeBatchRunnerTabId,
+        });
+      } else {
+        await requestCaptureCancelSignal(activeBatchRunnerTabId);
+      }
     } catch (error) {
       console.warn("[Sidebar] Batch keyword cancel failed:", error);
     }
@@ -10280,7 +10962,9 @@ async function handleBatchKeywordCapture(options = {}) {
     const settings = resolveCurrentDetailCaptureSettings(
       await getCaptureSettings(),
     );
-    streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings);
+    streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings, {
+      shouldStop: () => batchKeywordCancelRequested,
+    });
     if (
       settings.autoDetailCaptureAfterListCapture &&
       !ensureAuthVerifiedOrWarn({
@@ -10555,6 +11239,7 @@ async function handleBatchKeywordCapture(options = {}) {
                 await maybeRunAutoSyncAfterDetailCapture(settings, {
                   sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                   recordIds,
+                  shouldStop: () => batchKeywordCancelRequested,
                 });
               }
               return enhanceResult;
@@ -10880,13 +11565,6 @@ async function handleBatchKeywordCapture(options = {}) {
       error: error.message,
     };
   } finally {
-    if (sidebarTaskContext) {
-      finishSidebarTask(sidebarTaskContext, {
-        status: sidebarTaskStatus,
-        error: sidebarTaskError,
-        metadata: sidebarTaskMetadata,
-      });
-    }
     if (streamingSyncQueue?.enabled && !streamingSyncDrained) {
       streamingSyncResult = await drainStreamingDetailSyncQueue(
         streamingSyncQueue,
@@ -10894,6 +11572,13 @@ async function handleBatchKeywordCapture(options = {}) {
       ).catch((error) => {
         console.warn("[Sidebar] Drain streaming sync after batch failed:", error);
         return streamingSyncQueue.getStats();
+      });
+    }
+    if (sidebarTaskContext) {
+      finishSidebarTask(sidebarTaskContext, {
+        status: sidebarTaskStatus,
+        error: sidebarTaskError,
+        metadata: sidebarTaskMetadata,
       });
     }
     batchKeywordCaptureInFlight = false;
@@ -12210,6 +12895,7 @@ async function handleCancel() {
           captureAction: "captureComments",
         }
       : null;
+  const captureTaskSession = getCurrentRuntime()?.captureDebugSession;
   setCancelFlag(true);
   searchCaptureCancelRequested = true;
   if (shouldShowCancelingProgress) {
@@ -12250,6 +12936,20 @@ async function handleCancel() {
     relayTabId = relayTabId || Number(activeCommentsCaptureTabId);
   }
 
+  if (!relayTabId) {
+    const taskWorkerTabIds = Array.isArray(captureTaskSession?.workerTabIds)
+      ? captureTaskSession.workerTabIds
+      : [];
+    relayTabId = Number(
+      taskWorkerTabIds[taskWorkerTabIds.length - 1] ??
+        captureTaskSession?.sourceTabId ??
+        captureTaskSession?.tabId,
+    );
+    if (!Number.isSafeInteger(relayTabId) || relayTabId <= 0) {
+      relayTabId = null;
+    }
+  }
+
   try {
     if (relayTabId) {
       await requestCaptureCancelSignal(relayTabId, cancelRequestId);
@@ -12268,6 +12968,24 @@ async function handleCancel() {
         resetCaptureRecoveryUI({hidePanel: true, clearState: true});
       }
       showMessage("取消请求发送失败，请检查网络后再试", "error");
+    }
+  }
+
+  const captureTaskId = String(captureTaskSession?.taskId || "").trim();
+  if (captureTaskSession?.persistent && captureTaskId) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "onstarvoice:end-capture-task",
+        taskId: captureTaskId,
+        reason: "user_cancel_requested",
+        status: "canceled",
+      });
+      if (response?.ok === false) {
+        throw new Error(response?.error?.message || "停止 AI Debug 任务失败");
+      }
+    } catch (error) {
+      console.warn("[Sidebar] Persistent capture task stop failed:", error);
+      showMessage("采集取消信号已发送，但浏览器接管仍在释放，请再点一次停止", "warning");
     }
   }
 
@@ -13987,6 +14705,7 @@ async function executeMonitorRunItem({
         monitorExecutionId: executionId,
         captureSettings,
         commentLeadsConfig: buildCommentLeadsConfigFromSettings(captureSettings),
+        shouldStop,
       },
     );
     const syncStats = summarizeMonitorSyncResult(syncResult);
@@ -14771,6 +15490,11 @@ async function initCaptureSettingsUI() {
       .forEach((el) => {
         el.checked = settings.skipAlreadyCapturedOnDetailCapture !== false;
       });
+    document
+      .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
+      .forEach((el) => {
+        el.checked = settings.recaptureCommentsOnCountIncrease !== false;
+      });
     const inputCommentsMaxDetectedItems = document.getElementById(
       "inputCommentsMaxDetectedItems",
     );
@@ -15061,6 +15785,14 @@ async function handleDetailCaptureSkipCapturedToggleChange() {
   }
 }
 
+async function handleDetailCaptureCommentCountRecheckToggleChange() {
+  try {
+    await persistDetailCaptureSettingsFromInputs();
+  } catch (error) {
+    console.warn("[Sidebar] Save comment-count-recheck toggle failed:", error);
+  }
+}
+
 async function handleDetailCaptureLowFollowerHitToggleChange(event) {
   try {
     const checked = Boolean(event?.target?.checked);
@@ -15182,6 +15914,8 @@ async function handleSaveCaptureSettings() {
       getCaptureBloggerMetricsChecked(current);
     const includeBloggerMetricsOnDetailCapture =
       getDetailCaptureBloggerMetricsChecked(current);
+    const recaptureCommentsOnCountIncrease =
+      getDetailCaptureCommentCountRecheckChecked(current);
     const sharedWaitMinMs =
       readSecondsInput(
         "inputSharedWaitMinSec",
@@ -15248,6 +15982,7 @@ async function handleSaveCaptureSettings() {
       commentLeadsIps,
       includeBloggerMetricsOnNoteCapture,
       includeBloggerMetricsOnDetailCapture,
+      recaptureCommentsOnCountIncrease,
       sharedWaitMinMs,
       sharedWaitMaxMs,
       sharedStallTimeoutMs,
@@ -15496,16 +16231,11 @@ async function repairInterruptedDetailCaptureRecordsBeforeSync(records = []) {
 
 async function stopDetailCaptureAndReleaseForSync() {
   detailBatchCancelRequested = true;
-  const relayTabId = Number.isFinite(Number(detailBatchRunnerTabId))
-    ? Number(detailBatchRunnerTabId)
-    : null;
 
   try {
-    if (relayTabId) {
-      await requestCaptureCancelSignal(relayTabId);
-    } else {
-      await requestCaptureCancelSignal();
-    }
+    await requestDetailRunnerCancelSignals({
+      extraTabIds: getCurrentRuntime()?.captureDebugSession?.workerTabIds,
+    });
   } catch (error) {
     console.warn("[Sidebar] Stop detail capture before sync failed:", error);
   }
@@ -15586,6 +16316,7 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
     onProgress = null,
     onItemSettled = null,
     waitForegroundTabId = null,
+    captureTaskId = "",
   } = {},
 ) {
   if (!Boolean(settings?.autoDetailCaptureAfterListCapture)) {
@@ -15657,6 +16388,7 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
     onProgress,
     onItemSettled,
     waitForegroundTabId,
+    captureTaskId,
   });
 
   if (result.canceled) {
@@ -15695,8 +16427,27 @@ async function maybeRunAutoSyncAfterDetailCapture(
     silent = false,
     refreshAfter = true,
     syncProgress = null,
+    shouldStop = null,
+    signal = null,
   } = {},
 ) {
+  const stopRequested = () => {
+    if (signal?.aborted === true) return true;
+    if (typeof shouldStop !== "function") return false;
+    try {
+      return shouldStop() === true;
+    } catch {
+      return true;
+    }
+  };
+  const canceledResult = () => ({
+    ok: false,
+    canceled: true,
+    skipped: true,
+    reason: "capture_task_canceled",
+    message: "任务已取消，未继续同步",
+  });
+
   if (!Boolean(settings?.autoSyncAfterDetailCapture)) {
     return {
       skipped: true,
@@ -15731,6 +16482,7 @@ async function maybeRunAutoSyncAfterDetailCapture(
 
   try {
     const records = await getRecords(normalizedRecordIds);
+    if (stopRequested()) return canceledResult();
     const recordMap = new Map(records.map((record) => [record.id, record]));
     const targetRecordIds = normalizedRecordIds.filter((recordId) =>
       recordMap.has(recordId),
@@ -15775,6 +16527,7 @@ async function maybeRunAutoSyncAfterDetailCapture(
     const checkResult = await checkBeforeSync(requiredTypes, {
       onProgress: progressHandler,
     });
+    if (stopRequested()) return canceledResult();
     if (!checkResult.ok) {
       const errorMsg =
         ERROR_MESSAGE_MAP[checkResult.error?.code] ||
@@ -15795,7 +16548,11 @@ async function maybeRunAutoSyncAfterDetailCapture(
       syncScope: SYNC_SCOPE_PENDING,
       captureSettings: settings,
       commentLeadsConfig,
+      shouldStop: stopRequested,
+      signal,
     });
+
+    if (result?.canceled) return canceledResult();
 
     if (refreshAfter) {
       await Promise.all([refreshDataPool(), refreshSyncHistory()]);
@@ -15829,6 +16586,7 @@ async function maybeRunAutoSyncAfterDetailCapture(
 
     return result;
   } catch (error) {
+    if (stopRequested()) return canceledResult();
     console.error("[Sidebar] Auto sync after detail capture failed:", error);
     if (!silent) {
       showMessage(`${sourceLabel}自动同步失败: ${error.message}`, "warning");
@@ -15854,6 +16612,7 @@ async function runDetailCaptureForRecordIds(
     onProgress = null,
     onItemSettled = null,
     waitForegroundTabId = null,
+    captureTaskId = "",
   } = {},
 ) {
   const normalizedRecordIds = Array.isArray(recordIds)
@@ -15879,6 +16638,10 @@ async function runDetailCaptureForRecordIds(
   detailBatchCaptureInFlight = true;
   detailBatchCancelRequested = false;
   detailBatchRunnerTabId = null;
+  detailBatchRunnerTabIds.clear();
+  detailBatchWorkerStates = [];
+  detailBatchWorkerMode = "";
+  detailBatchWorkerRevision = 0;
   updateDataPoolUI(getCurrentDataPool());
   updatePageTypeUI(getCurrentRuntime()?.pageType || PAGE_TYPE.UNKNOWN);
   showProgress(
@@ -15910,6 +16673,8 @@ async function runDetailCaptureForRecordIds(
       ),
       skipAlreadyCaptured:
         settings?.skipAlreadyCapturedOnDetailCapture !== false,
+      recaptureCommentsOnCountIncrease:
+        settings?.recaptureCommentsOnCountIncrease !== false,
       enableCommentLeadsFilter: Boolean(
         settings?.enableCommentLeadsFilterOnDetailCapture,
       ),
@@ -15924,6 +16689,7 @@ async function runDetailCaptureForRecordIds(
       detailAfterNavWaitMs: settings?.detailAfterNavWaitMs,
       profileAfterNavWaitMs: settings?.profileAfterNavWaitMs,
       waitForegroundTabId,
+      captureTaskId,
     });
 
     await refreshDataPool();
@@ -15932,6 +16698,10 @@ async function runDetailCaptureForRecordIds(
     detailBatchCaptureInFlight = false;
     detailBatchCancelRequested = false;
     detailBatchRunnerTabId = null;
+    detailBatchRunnerTabIds.clear();
+    detailBatchWorkerStates = [];
+    detailBatchWorkerMode = "";
+    detailBatchWorkerRevision = 0;
     activeCommentsCaptureRecordId = "";
     activeCommentsCaptureTabId = null;
     activeCommentsCaptureRequestId = "";
@@ -16954,12 +17724,44 @@ function reportActiveUnattendedContentProgress(progress = {}) {
 }
 
 function handleProgress(progress) {
+  const incomingPhase = String(progress?.phase || "");
+  const incomingWorkerRevision = Number(progress?.workerRevision);
+  const hasWorkerRevision =
+    Number.isSafeInteger(incomingWorkerRevision) && incomingWorkerRevision >= 0;
+  if (
+    Array.isArray(progress?.workerStates) &&
+    (!hasWorkerRevision || incomingWorkerRevision >= detailBatchWorkerRevision)
+  ) {
+    detailBatchWorkerStates = progress.workerStates.map((state) => ({...state}));
+    if (hasWorkerRevision) {
+      detailBatchWorkerRevision = incomingWorkerRevision;
+    }
+  }
+  if (typeof progress?.workerMode === "string" && progress.workerMode.trim()) {
+    detailBatchWorkerMode = progress.workerMode.trim();
+  }
+  if (incomingPhase.startsWith("detail_") && detailBatchWorkerStates.length > 0) {
+    progress = {
+      ...progress,
+      workerStates: detailBatchWorkerStates.map((state) => ({...state})),
+      workerMode: progress?.workerMode || detailBatchWorkerMode,
+      workerRevision: Math.max(
+        detailBatchWorkerRevision,
+        hasWorkerRevision ? incomingWorkerRevision : 0,
+      ),
+      runnerTabIds:
+        Array.isArray(progress?.runnerTabIds) && progress.runnerTabIds.length > 0
+          ? progress.runnerTabIds
+          : getKnownDetailRunnerTabIds(),
+    };
+  }
   console.log("[Sidebar] Progress:", progress);
+  void updateCaptureTaskSession({taskId: captureTaskOwnerTaskId, progress});
   reportActiveUnattendedContentProgress(progress);
   reportActiveSidebarTaskProgress(progress);
 
   // 如果进入了单项的评论采集阶段，全局进度条无需显示，因为卡片上已有进度和停止按钮
-  const phase = String(progress?.phase || "");
+  const phase = incomingPhase;
   const progressRecordId =
     typeof progress?.recordId === "string" ? progress.recordId.trim() : "";
   if (progressRecordId && ACTIVE_COMMENT_PROGRESS_PHASES.has(phase)) {
@@ -17253,9 +18055,14 @@ function buildCaptureProgressText(progress) {
   const maxDetectedItems = normalizeProgressCount(
     progress?.maxDetectedItems ?? progress?.maxItems,
   );
+  const markedCount = normalizeProgressCount(progress?.markedCount);
 
   if (detectedCount === null || filteredCount === null) {
-    return message;
+    if (markedCount === null) {
+      return message;
+    }
+    const markedText = `页面已标记 ${markedCount} 条`;
+    return message ? `${message} · ${markedText}` : markedText;
   }
 
   const detailParts = [];
@@ -17267,8 +18074,8 @@ function buildCaptureProgressText(progress) {
   }
 
   const statsText = `已探测 ${detectedCount} 条，已筛选 ${filteredCount} 条${
-    detailParts.length > 0 ? `（${detailParts.join("，")}）` : ""
-  }`;
+    markedCount !== null ? `，页面已标记 ${markedCount} 条` : ""
+  }${detailParts.length > 0 ? `（${detailParts.join("，")}）` : ""}`;
 
   if (!message) {
     return statsText;
@@ -17787,6 +18594,14 @@ function getDetailCaptureSkipCapturedChecked(settings) {
   return Boolean(input.checked);
 }
 
+function getDetailCaptureCommentCountRecheckChecked(settings) {
+  const input = getActiveDetailCaptureInput("comment-count-recheck");
+  if (!input) {
+    return settings?.recaptureCommentsOnCountIncrease !== false;
+  }
+  return Boolean(input.checked);
+}
+
 function getDetailCaptureLowFollowerHitFilterChecked(settings) {
   const input = getActiveDetailCaptureInput("low-follower-hit");
   if (!input) {
@@ -17827,6 +18642,7 @@ function syncAutoDetailCaptureControls({
   enableCommentLeadsFilter = null,
   includeBloggerMetrics = null,
   skipAlreadyCaptured = null,
+  recaptureCommentsOnCountIncrease = null,
   enableLowFollowerHitFilter = null,
   lowFollowerHitThreshold = null,
   forceDisabled = false,
@@ -17982,6 +18798,30 @@ function syncAutoDetailCaptureControls({
       input.disabled = forceDisabled || !detailCaptureSupported;
     });
 
+  document
+    .querySelectorAll('[data-detail-setting="comment-count-recheck"]')
+    .forEach((input) => {
+      if (recaptureCommentsOnCountIncrease !== null) {
+        input.checked = Boolean(recaptureCommentsOnCountIncrease);
+      }
+      const skipCapturedEnabled = document.querySelector(
+        '[data-detail-setting="skip-captured"]:checked',
+      );
+      input.disabled =
+        forceDisabled ||
+        !detailCaptureSupported ||
+        !capabilities.captureComments ||
+        !skipCapturedEnabled;
+      input
+        .closest(".incremental-exception-group")
+        ?.classList.toggle("is-disabled", Boolean(input.disabled));
+      input.title = !capabilities.captureComments
+        ? `${getPlatformCopy(resolvedPlatform).label}当前版本暂不支持评论采集`
+        : !skipCapturedEnabled
+          ? "开启“跳过已增强笔记”后生效"
+          : "";
+    });
+
 }
 
 function syncDetailCaptureControlsFromStoredSettings(settings = {}, {platform = ""} = {}) {
@@ -18012,6 +18852,8 @@ function syncDetailCaptureControlsFromStoredSettings(settings = {}, {platform = 
       settings?.includeBloggerMetricsOnDetailCapture,
     ),
     skipAlreadyCaptured: settings?.skipAlreadyCapturedOnDetailCapture !== false,
+    recaptureCommentsOnCountIncrease:
+      settings?.recaptureCommentsOnCountIncrease !== false,
     enableLowFollowerHitFilter: Boolean(
       settings?.enableLowFollowerHitFilterOnDetailCapture,
     ),
@@ -18043,6 +18885,8 @@ async function persistDetailCaptureSettingsFromInputs() {
     getDetailCaptureBloggerMetricsChecked(current);
   const skipAlreadyCapturedOnDetailCapture =
     getDetailCaptureSkipCapturedChecked(current);
+  const recaptureCommentsOnCountIncrease =
+    getDetailCaptureCommentCountRecheckChecked(current);
   const enableLowFollowerHitFilterOnDetailCapture =
     getDetailCaptureLowFollowerHitFilterChecked(current);
   const lowFollowerHitThresholdOnDetailCapture =
@@ -18056,6 +18900,7 @@ async function persistDetailCaptureSettingsFromInputs() {
     enableCommentLeadsFilter: normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetrics: includeBloggerMetricsOnDetailCapture,
     skipAlreadyCaptured: skipAlreadyCapturedOnDetailCapture,
+    recaptureCommentsOnCountIncrease,
     enableLowFollowerHitFilter: enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThreshold: lowFollowerHitThresholdOnDetailCapture,
   });
@@ -18069,6 +18914,7 @@ async function persistDetailCaptureSettingsFromInputs() {
       normalizedEnableCommentLeadsFilterOnDetailCapture,
     includeBloggerMetricsOnDetailCapture,
     skipAlreadyCapturedOnDetailCapture,
+    recaptureCommentsOnCountIncrease,
     enableLowFollowerHitFilterOnDetailCapture,
     lowFollowerHitThresholdOnDetailCapture,
   });
@@ -18092,6 +18938,8 @@ function resolveCurrentDetailCaptureSettings(settings = {}) {
       getDetailCaptureBloggerMetricsChecked(settings),
     skipAlreadyCapturedOnDetailCapture:
       getDetailCaptureSkipCapturedChecked(settings),
+    recaptureCommentsOnCountIncrease:
+      getDetailCaptureCommentCountRecheckChecked(settings),
     enableLowFollowerHitFilterOnDetailCapture:
       getDetailCaptureLowFollowerHitFilterChecked(settings),
     lowFollowerHitThresholdOnDetailCapture:
@@ -20196,7 +21044,7 @@ function syncPlatformSettingsCapabilityUI(platform = "unknown") {
     document.getElementById("inputCommentLeadsTableName"),
     ...Array.from(
       document.querySelectorAll(
-        '[data-detail-setting="comments-max-detected-items"], [data-detail-setting="comment-leads"]',
+        '[data-detail-setting="comments-max-detected-items"], [data-detail-setting="comment-leads"], [data-detail-setting="comment-count-recheck"]',
       ),
     ),
     document.getElementById("batchDetailIncludeComments"),
@@ -20694,6 +21542,7 @@ function isTerminalProgressPhase(phase) {
     normalized === "completed" ||
     normalized === "detail_batch_done" ||
     normalized === "detail_batch_canceled" ||
+    normalized === "detail_batch_interrupted" ||
     normalized === "blogger_metrics_done" ||
     normalized === "blogger_metrics_failed" ||
     normalized === "batch_done" ||
@@ -20763,6 +21612,9 @@ if (document.readyState === "loading") {
 }
 
 window.addEventListener("beforeunload", () => {
+  captureTaskOwnerClosing = true;
+  captureTaskOwnerPort?.disconnect?.();
+  captureTaskOwnerPort = null;
   stopKeywordSortSyncTimer();
   stopKeywordPlanReconcileTimer();
   stopCaptureExecutionLockHeartbeat();

@@ -1,14 +1,17 @@
 {
   "manifest_version": 3,
   "name": "StarVoice 星语",
-  "version": "0.3.34",
+  "version": "0.3.35",
   "description": "小红书/抖音/微博AI舆情巡检工具：支持笔记/视频/微博数据采集、评论与客资采集、竞品账号监控、AI选题洞察、Excel/CSV导出与飞书同步。",
   "permissions": [
     "activeTab",
+    "debugger",
     "scripting",
     "downloads",
     "storage",
     "alarms",
+    "tabs",
+    "tabGroups",
     "sidePanel"
   ],
   "host_permissions": [

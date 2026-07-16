@@ -696,9 +696,12 @@ function extractNoteCards(bloggerName = "", activeTab = null) {
         (note) => note.noteId === noteId || (url && note.url === url),
       );
       if (isDuplicate) return;
+      const domCaptureKey = `xiaohongshu:${String(noteId).trim()}`;
+      item.setAttribute?.("data-osv-capture-key", domCaptureKey);
 
       notes.push({
         noteId,
+        domCaptureKey,
         url,
         title: cleanText(title),
         author: author || bloggerName,

@@ -14,6 +14,18 @@ const taskCenterCoreSource = await readFile(
   resolve(repoRoot, "utils/task-center.js"),
   "utf8",
 );
+const phase5RuntimeSources = await Promise.all(
+  [
+    "utils/runtime-tab-policy.js",
+    "utils/capture/debug-session.js",
+    "utils/capture/task-tab-group.js",
+    "utils/capture/task-runtime.js",
+    "utils/capture/task-owner.js",
+  ].map(async (path) => ({
+    path,
+    source: await readFile(resolve(repoRoot, path), "utf8"),
+  })),
+);
 
 function createEvent() {
   const listeners = [];
@@ -37,6 +49,7 @@ function createHarness() {
   let contextMode = "alive";
   let tabMessageHandler = null;
   let tabCreateHandler = null;
+  let tabGetHandler = null;
   let reloadHook = null;
   let nextRuntimeSetError = null;
   const unrefSetTimeout = (handler, delay, ...args) => {
@@ -89,6 +102,7 @@ function createHarness() {
     onInstalled: createEvent(),
     onStartup: createEvent(),
     onMessage: createEvent(),
+    onConnect: createEvent(),
     getManifest: () => ({version: "test"}),
     getURL: (path) => `chrome-extension://test/${path}`,
     async getContexts({documentIds}) {
@@ -122,6 +136,7 @@ function createHarness() {
       onActivated: createEvent(),
       onUpdated: createEvent(),
       onRemoved: createEvent(),
+      onReplaced: createEvent(),
       async sendMessage(tabId, payload) {
         sentTabMessages.push({tabId, payload});
         if (typeof tabMessageHandler === "function") {
@@ -133,8 +148,13 @@ function createHarness() {
         if (missingTabIds.has(Number(tabId))) {
           throw new Error("No tab with id");
         }
+        if (typeof tabGetHandler === "function") {
+          return await tabGetHandler(tabId);
+        }
         return {
           id: tabId,
+          windowId: 1,
+          groupId: -1,
           status: "complete",
           url: "https://www.xiaohongshu.com/explore/test-note",
         };
@@ -160,6 +180,30 @@ function createHarness() {
         const tab = {id: 99 + createdTabs.length, ...options};
         createdTabs.push(tab);
         return tab;
+      },
+      async group() {
+        return 1;
+      },
+      async ungroup() {},
+      async remove(tabId) {
+        missingTabIds.add(Number(tabId));
+      },
+    },
+    tabGroups: {
+      async get(groupId) {
+        return {id: groupId, title: "StarVoice 采集任务"};
+      },
+      async update(groupId, patch) {
+        return {id: groupId, ...patch};
+      },
+    },
+    debugger: {
+      onDetach: createEvent(),
+      async attach() {},
+      async detach() {},
+      async sendCommand() {},
+      async getTargets() {
+        return [];
       },
     },
     sidePanel: {
@@ -208,6 +252,9 @@ function createHarness() {
   });
 
   vm.runInContext(taskCenterCoreSource, context, {filename: "utils/task-center.js"});
+  for (const {path, source} of phase5RuntimeSources) {
+    vm.runInContext(source, context, {filename: path});
+  }
   vm.runInContext(
     `${backgroundSource}\n;globalThis.__captureLockTestApi = {\n` +
       `  acquireCaptureExecutionLock,\n` +
@@ -284,6 +331,9 @@ function createHarness() {
     },
     setTabCreateHandler(handler) {
       tabCreateHandler = handler;
+    },
+    setTabGetHandler(handler) {
+      tabGetHandler = handler;
     },
     setTabMissing(tabId, missing = true) {
       if (missing) missingTabIds.add(Number(tabId));
@@ -381,11 +431,54 @@ test("capture progress is persisted with heartbeat and runner metadata", () => {
   assert.equal(progress.heartbeatAt, progress.updatedAt);
 });
 
+test("a persistent list task rejects platform drift before relaying to content", async () => {
+  const harness = createHarness();
+  let sourceUrl = "https://www.xiaohongshu.com/search_result?keyword=test";
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    url: sourceUrl,
+    title: "capture source",
+  }));
+
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: "platform-drift-task",
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+
+  sourceUrl = "https://s.weibo.com/weibo?q=drifted";
+  const rejected = await harness.sendBackgroundMessage({
+    type: "onstarvoice:relay-to-content",
+    tabId: 41,
+    payload: {
+      action: "captureKeywordNotes",
+      taskId: "platform-drift-task",
+      listCaptureRunId: "list-run-platform-drift",
+    },
+  });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error.code, "capture_task_platform_unsupported");
+  assert.equal(harness.sentTabMessages.length, 0);
+
+  await harness.sendBackgroundMessage({
+    type: "onstarvoice:end-capture-task",
+    taskId: "platform-drift-task",
+    reason: "completed",
+    status: "completed",
+  });
+});
+
 test("concurrent progress and page-state messages preserve both runtime patches", async () => {
   const harness = createHarness();
   const sender = {
     tab: {
       id: 22,
+      active: true,
       url: "https://www.xiaohongshu.com/explore/test-note",
     },
   };

@@ -18,11 +18,37 @@ const API_BASE_URLS = [
   'http://127.0.0.1:3001',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
-].filter(Boolean);
+]
+  .map((value) => String(value || '').trim().replace(/\/$/, ''))
+  .filter((baseUrl, index, values) => baseUrl && values.indexOf(baseUrl) === index);
 
 let activeApiBaseUrl = API_BASE_URLS[0];
 
 // ==================== 通用请求函数 ====================
+
+function isRequestCancellationRequested(shouldStop, signal = null) {
+  if (signal?.aborted === true) return true;
+  if (typeof shouldStop !== 'function') return false;
+  try {
+    return shouldStop() === true;
+  } catch {
+    // A broken cancellation source must fail closed for write requests.
+    return true;
+  }
+}
+
+function buildCanceledRequestResult() {
+  return {
+    ok: false,
+    status: 'canceled',
+    reason: 'capture_task_canceled',
+    message: '任务已取消，未继续同步',
+    error: null,
+    data: null,
+    canceled: true,
+    __canceled: true,
+  };
+}
 
 /**
  * 统一请求函数
@@ -32,21 +58,33 @@ async function request(endpoint, options = {}) {
     method = 'POST',
     body = null,
     timeout = DEFAULT_CONFIG.REQUEST_TIMEOUT,
+    shouldStop = null,
+    signal = null,
   } = options;
 
   const baseUrls = [activeApiBaseUrl, ...API_BASE_URLS.filter(base => base !== activeApiBaseUrl)];
-  let lastNetworkError = null;
+  let lastUnavailableResult = null;
 
   for (const baseUrl of baseUrls) {
-    const result = await requestOnce(baseUrl, endpoint, { method, body, timeout });
-    if (!result?.__networkError) {
+    if (isRequestCancellationRequested(shouldStop, signal)) {
+      return buildCanceledRequestResult();
+    }
+    const result = await requestOnce(baseUrl, endpoint, {
+      method,
+      body,
+      timeout,
+      shouldStop,
+      signal,
+    });
+    if (result?.__canceled) return result;
+    if (!result?.__networkError && !result?.__endpointMissing) {
       activeApiBaseUrl = baseUrl;
       return result;
     }
-    lastNetworkError = result;
+    lastUnavailableResult = result;
   }
 
-  return lastNetworkError;
+  return lastUnavailableResult;
 }
 
 async function requestOnce(baseUrl, endpoint, options = {}) {
@@ -54,7 +92,13 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
     method = 'POST',
     body = null,
     timeout = DEFAULT_CONFIG.REQUEST_TIMEOUT,
+    shouldStop = null,
+    signal = null,
   } = options;
+
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
 
   const url = `${baseUrl}${endpoint}`;
   const requestBody =
@@ -64,8 +108,31 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
+  let canceled = signal?.aborted === true;
+  const abortFromCaller = () => {
+    canceled = true;
+    controller.abort();
+  };
+  signal?.addEventListener?.('abort', abortFromCaller, {once: true});
+  const cancellationPollId =
+    typeof shouldStop === 'function'
+      ? setInterval(() => {
+          if (!isRequestCancellationRequested(shouldStop, signal)) return;
+          canceled = true;
+          controller.abort();
+        }, 75)
+      : null;
+  const clearRequestTimers = () => {
+    clearTimeout(timeoutId);
+    if (cancellationPollId !== null) clearInterval(cancellationPollId);
+    signal?.removeEventListener?.('abort', abortFromCaller);
+  };
 
   try {
+    if (isRequestCancellationRequested(shouldStop, signal)) {
+      canceled = true;
+      return buildCanceledRequestResult();
+    }
     const response = await fetch(url, {
       method,
       headers: {
@@ -74,8 +141,6 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
       body: requestBody ? JSON.stringify(requestBody) : null,
       signal: controller.signal,
     });
-
-    clearTimeout(timeoutId);
 
     const text = await response.text();
     let data = null;
@@ -153,14 +218,16 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
         message: error.message,
         error,
         data,
+        __endpointMissing: response.status === 404,
       };
     }
 
     return data;
   } catch (error) {
-    clearTimeout(timeoutId);
-
     if (error.name === 'AbortError') {
+      if (canceled || isRequestCancellationRequested(shouldStop, signal)) {
+        return buildCanceledRequestResult();
+      }
       const timeoutError = {
         reason: ERROR_REASON.TIMEOUT,
         message: 'Request timeout',
@@ -206,6 +273,8 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
       data: null,
       __networkError: true,
     };
+  } finally {
+    clearRequestTimers();
   }
 }
 
@@ -287,9 +356,20 @@ export async function verify(code, options = {}) {
  * @param {Object} params.payload - 业务数据
  * @returns {Promise<Object>} 同步结果
  */
-export async function sync({ syncType, target, payload }) {
+export async function sync({ syncType, target, payload }, options = {}) {
+  const shouldStop = options?.shouldStop;
+  const signal = options?.signal || null;
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
   const runtime = await getRuntime();
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
   if (!authCodeResult.ok) {
     return authCodeResult;
   }
@@ -304,7 +384,7 @@ export async function sync({ syncType, target, payload }) {
     payload,
   };
 
-  return await request(API_ENDPOINT.SYNC, { body });
+  return await request(API_ENDPOINT.SYNC, {body, shouldStop, signal});
 }
 
 // ==================== 批量同步 ====================
@@ -315,9 +395,20 @@ export async function sync({ syncType, target, payload }) {
  * @param {Object} target - 同步目标配置
  * @returns {Promise<Object>} 批量同步结果
  */
-export async function syncBatch(records, target) {
+export async function syncBatch(records, target, options = {}) {
+  const shouldStop = options?.shouldStop;
+  const signal = options?.signal || null;
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
   const runtime = await getRuntime();
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
   if (!authCodeResult.ok) {
     return authCodeResult;
   }
@@ -348,11 +439,11 @@ export async function syncBatch(records, target) {
     })),
   };
 
-  return await request(API_ENDPOINT.SYNC_BATCH, { body });
+  return await request(API_ENDPOINT.SYNC_BATCH, {body, shouldStop, signal});
 }
 
 // 增量采集:问后端这批 external_id 哪些已采全(detailCaptureStatus=done)。
-// 返回 { ok, captured:[external_id...], items:[{ externalId, commentsCount, commentsBaselineCount }] }。
+// 返回 { ok, captured:[external_id...], items:[{ externalId, commentsCount, commentsBaselineCount, capturedAt }] }。
 // 失败时 captured/items 为空(不影响主流程,顶多多采几条)。
 export async function checkCapturedExternalIds({ platform = '', externalIds = [] } = {}) {
   const ids = Array.isArray(externalIds)

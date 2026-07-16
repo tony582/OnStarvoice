@@ -20,16 +20,69 @@ import {
 
 import {expandKeywordViaSuggestions} from "./utils/capture/keyword-expansion.js";
 
-import {detectPageType} from "./utils/helpers.js";
+import {detectPageType, detectPlatformFromUrl} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
 import {normalizeTaskContext} from "./utils/task-context.js";
 import {buildContentDiagnostics} from "./utils/diagnostics.js";
 import {startContentPageStateReporting} from "./utils/content-page-state.js";
+import {
+  createListCaptureOverlayRunScope,
+  getListCaptureDebugOverlay,
+} from "./utils/capture/list-capture-debug-overlay.js";
+import {
+  createListCaptureAcceptanceLedger,
+  decorateListCheckpointProgress,
+} from "./utils/capture/list-capture-trace.js";
 
 console.log("[StarVoice V1.0] Content script loaded");
 
 let activeCommentsCaptureRequestId = "";
 const activeCaptureRequestIds = new Set();
+let listCaptureInvocationSequence = 0;
+let activeListCaptureDebugOverlay = null;
+const pendingListCaptureCancellations = new Map();
+
+function normalizeListCaptureRunId(value) {
+  const runId = String(value || "").trim();
+  return runId && runId.length <= 320 ? runId : "";
+}
+
+function rememberListCaptureCancellation(runId) {
+  const normalizedRunId = normalizeListCaptureRunId(runId);
+  if (!normalizedRunId) return false;
+  const now = Date.now();
+  pendingListCaptureCancellations.set(normalizedRunId, now);
+  for (const [candidateRunId, canceledAt] of pendingListCaptureCancellations) {
+    if (
+      now - canceledAt > 10 * 60 * 1000 ||
+      pendingListCaptureCancellations.size > 64
+    ) {
+      pendingListCaptureCancellations.delete(candidateRunId);
+    }
+  }
+  return true;
+}
+
+function consumeListCaptureCancellation(runId) {
+  const normalizedRunId = normalizeListCaptureRunId(runId);
+  if (!normalizedRunId || !pendingListCaptureCancellations.has(normalizedRunId)) {
+    return false;
+  }
+  pendingListCaptureCancellations.delete(normalizedRunId);
+  return true;
+}
+
+function createCanceledListCaptureResult(type) {
+  return {
+    ok: false,
+    type,
+    data: null,
+    error: {
+      code: "CAPTURE_CANCELED",
+      message: "AI Debug Session 已由用户停止",
+    },
+  };
+}
 
 function safeRuntimeSendMessage(message) {
   try {
@@ -54,6 +107,209 @@ function safeRuntimeSendMessage(message) {
     console.warn("[Content] sendMessage failed:", error);
     return false;
   }
+}
+
+function createListCaptureRunId(request, captureKind) {
+  const requestedRunId = String(request?.listCaptureRunId || "").trim();
+  if (requestedRunId && requestedRunId.length <= 320) {
+    return requestedRunId;
+  }
+  listCaptureInvocationSequence += 1;
+  const taskId = normalizeTaskContext(request)?.taskId || "local";
+  const randomId = globalThis.crypto?.randomUUID?.() || "";
+  return [
+    taskId,
+    captureKind,
+    Date.now(),
+    listCaptureInvocationSequence,
+    randomId,
+  ]
+    .filter(Boolean)
+    .join(":");
+}
+
+function beginListCaptureFeedback(request, {captureKind, label}) {
+  let overlay = null;
+  let overlayRunScope = null;
+  let latestProgress = {};
+  const runId = createListCaptureRunId(request, captureKind);
+  const acceptanceLedger = createListCaptureAcceptanceLedger({runId});
+  const platform = detectPlatformFromUrl(window.location.href);
+  const feedbackEnabled =
+    platform === "xiaohongshu" || platform === "douyin";
+  try {
+    if (feedbackEnabled) {
+      overlay = getListCaptureDebugOverlay();
+      overlay.startSession({
+        sessionId: runId,
+        platform,
+        label,
+        message: "正在识别页面中的有效笔记卡片",
+      });
+      overlayRunScope = createListCaptureOverlayRunScope(overlay, runId);
+      activeListCaptureDebugOverlay = overlay;
+    }
+  } catch (error) {
+    console.warn("[Content] List capture feedback failed to start:", error);
+  }
+
+  const isSupersededRun = () =>
+    Boolean(overlayRunScope && !overlayRunScope.isCurrent());
+
+  const readFeedbackState = () => {
+    try {
+      const state = overlayRunScope?.getState() || {};
+      return {
+        markedCount: acceptanceLedger.getAcceptedCount(),
+        detectedCount: Number(state.detectedCount) || 0,
+      };
+    } catch {
+      return {
+        markedCount: acceptanceLedger.getAcceptedCount(),
+        detectedCount: 0,
+      };
+    }
+  };
+
+  const resolveProgressCount = (...values) => {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number) && number >= 0) {
+        return Math.floor(number);
+      }
+    }
+    return 0;
+  };
+
+  const sendTerminalProgress = ({
+    phase,
+    message,
+    result = null,
+    finalItems = [],
+  }) => {
+    if (isSupersededRun()) return false;
+    const feedbackState = readFeedbackState();
+    const detectedCount = resolveProgressCount(
+      result?.data?.rawTotalCount,
+      result?.data?.totalCount,
+      latestProgress?.detectedCount,
+      latestProgress?.currentContentCount,
+      feedbackState.detectedCount,
+    );
+    const filteredCount = resolveProgressCount(
+      result?.data?.filteredCount,
+      Array.isArray(result?.data?.items) ? finalItems.length : undefined,
+      feedbackState.markedCount,
+      latestProgress?.filteredCount,
+    );
+    reportCaptureProgress(request, {
+      phase,
+      message:
+        phase === "completed"
+          ? `${message}，页面已标记 ${feedbackState.markedCount} 条`
+          : message,
+      listCaptureRunId: runId,
+      detectedCount,
+      filteredCount,
+      markedCount: feedbackState.markedCount,
+      maxDetectedItems:
+        result?.data?.maxDetectedItems ?? latestProgress?.maxDetectedItems,
+      minLikes: result?.data?.minLikes ?? latestProgress?.minLikes,
+      sortDimension:
+        result?.data?.sortDimension ?? latestProgress?.sortDimension,
+    });
+    return true;
+  };
+
+  return Object.freeze({
+    runId,
+    report(progress = {}) {
+      if (!feedbackEnabled) {
+        reportCaptureProgress(request, progress);
+        return 0;
+      }
+      if (isSupersededRun()) return 0;
+      const tracedProgress = decorateListCheckpointProgress(
+        progress,
+        acceptanceLedger,
+      );
+      latestProgress = {...tracedProgress};
+      try {
+        overlayRunScope?.handleProgress(tracedProgress);
+      } catch (error) {
+        console.warn("[Content] List capture feedback update failed:", error);
+      }
+      const {markedCount} = readFeedbackState();
+      reportCaptureProgress(request, {
+        ...tracedProgress,
+        listCaptureRunId: runId,
+        markedCount,
+      });
+      return markedCount;
+    },
+    finish(result) {
+      if (!feedbackEnabled) {
+        return;
+      }
+      const finalItems = Array.isArray(result?.data?.items)
+        ? result.data.items
+        : [];
+      const tracedFinalItems = acceptanceLedger.acceptItems(finalItems, {
+        fallbackOutcome: "accepted",
+      });
+      if (result?.data && typeof result.data === "object") {
+        result.data.items = tracedFinalItems;
+      }
+      if (isSupersededRun()) return;
+      let terminalPhase = "completed";
+      let terminalMessage = "列表采集完成";
+      try {
+        if (tracedFinalItems.length > 0) {
+          overlayRunScope?.recordItems(tracedFinalItems, {
+            outcome: "accepted",
+            detectedCount:
+              result?.data?.rawTotalCount ?? result?.data?.totalCount ?? 0,
+          });
+        }
+        if (result?.ok === false) {
+          const errorCode = String(result?.error?.code || "").toUpperCase();
+          if (errorCode === "CAPTURE_CANCELED") {
+            terminalPhase = "canceled";
+            terminalMessage = result?.error?.message || "列表采集已停止";
+            overlayRunScope?.cancel(terminalMessage);
+          } else {
+            terminalPhase = "failed";
+            terminalMessage = result?.error?.message || "列表采集中断";
+            overlayRunScope?.fail(terminalMessage);
+          }
+        } else {
+          overlayRunScope?.complete();
+        }
+      } catch (error) {
+        console.warn("[Content] List capture feedback finish failed:", error);
+      }
+      sendTerminalProgress({
+        phase: terminalPhase,
+        message: terminalMessage,
+        result,
+        finalItems: tracedFinalItems,
+      });
+    },
+    fail(error) {
+      if (!feedbackEnabled || isSupersededRun()) {
+        return;
+      }
+      try {
+        overlayRunScope?.fail(error);
+      } catch (overlayError) {
+        console.warn("[Content] List capture feedback failure UI failed:", overlayError);
+      }
+      sendTerminalProgress({
+        phase: "failed",
+        message: String(error?.message || error || "列表采集中断"),
+      });
+    },
+  });
 }
 
 // ==================== 消息监听器 ====================
@@ -140,6 +396,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       runTrackedCaptureRequest(request, () =>
         handleCaptureKeywordNotes(request, sendResponseWithDiagnostics),
       );
+      return true;
+
+    case "updateListCaptureTraceBindings":
+      handleUpdateListCaptureTraceBindings(request, sendResponseWithDiagnostics);
       return true;
 
     case "prepareKeywordStrategyCapture":
@@ -245,6 +505,54 @@ function handleDetectPageType(sendResponse) {
   }
 }
 
+function handleUpdateListCaptureTraceBindings(request, sendResponse) {
+  try {
+    if (!activeListCaptureDebugOverlay) {
+      sendResponse({
+        ok: true,
+        data: {
+          runId: String(request?.runId || request?.payload?.runId || ""),
+          updatedCount: 0,
+          ignoredCount: Array.isArray(
+            request?.bindings || request?.payload?.bindings,
+          )
+            ? (request.bindings || request.payload.bindings).length
+            : 0,
+          reason: "no_active_list_capture_trace",
+        },
+      });
+      return;
+    }
+
+    const defaultRunId = String(
+      request?.runId || request?.payload?.runId || "",
+    ).trim();
+    const bindings = Array.isArray(request?.bindings)
+      ? request.bindings
+      : Array.isArray(request?.payload?.bindings)
+        ? request.payload.bindings
+        : [];
+    const normalizedBindings = bindings.map((binding) => ({
+      ...(binding && typeof binding === "object" ? binding : {}),
+      runId:
+        binding?.runId || binding?.captureTrace?.runId || defaultRunId,
+    }));
+    const result = activeListCaptureDebugOverlay.updateTraceBindings(
+      normalizedBindings,
+    );
+    sendResponse({ok: true, data: result});
+  } catch (error) {
+    console.warn("[Content] Update list capture trace bindings failed:", error);
+    sendResponse({
+      ok: false,
+      error: {
+        code: "TRACE_BINDING_UPDATE_FAILED",
+        message: error?.message || "更新列表采集标记失败",
+      },
+    });
+  }
+}
+
 /**
  * 处理智能采集
  */
@@ -328,12 +636,22 @@ async function handleCaptureBloggerProfile(request, sendResponse) {
  * 处理博主笔记列表采集
  */
 async function handleCaptureBloggerNotes(request, sendResponse) {
+  const captureFeedback = beginListCaptureFeedback(request, {
+    captureKind: "blogger-notes",
+    label: "博主作品列表",
+  });
+  if (consumeListCaptureCancellation(captureFeedback.runId)) {
+    const canceledResult = createCanceledListCaptureResult("blogger_notes");
+    captureFeedback.finish(canceledResult);
+    sendResponse(canceledResult);
+    return;
+  }
   try {
     resetCancelFlag();
 
     const result = await captureBloggerNotes({
       onProgress: (progress) => {
-        reportCaptureProgress(request, progress);
+        captureFeedback.report(progress);
       },
       profileMetrics: request.profileMetrics,
       minLikes: request.minLikes,
@@ -349,8 +667,10 @@ async function handleCaptureBloggerNotes(request, sendResponse) {
       maxScrollTimes: request.maxScrollTimes,
     });
 
+    captureFeedback.finish(result);
     sendResponse(result);
   } catch (error) {
+    captureFeedback.fail(error);
     console.error("[Content] Capture blogger notes failed:", error);
     sendResponse({
       ok: false,
@@ -358,6 +678,8 @@ async function handleCaptureBloggerNotes(request, sendResponse) {
       data: null,
       error: {code: "CAPTURE_FAILED", message: error.message},
     });
+  } finally {
+    pendingListCaptureCancellations.delete(captureFeedback.runId);
   }
 }
 
@@ -365,13 +687,23 @@ async function handleCaptureBloggerNotes(request, sendResponse) {
  * 处理关键词搜索结果采集
  */
 async function handleCaptureKeywordNotes(request, sendResponse) {
+  const captureFeedback = beginListCaptureFeedback(request, {
+    captureKind: "keyword-notes",
+    label: request.keyword ? `搜索：${request.keyword}` : "关键词搜索列表",
+  });
+  if (consumeListCaptureCancellation(captureFeedback.runId)) {
+    const canceledResult = createCanceledListCaptureResult("keyword_notes");
+    captureFeedback.finish(canceledResult);
+    sendResponse(canceledResult);
+    return;
+  }
   try {
     resetCancelFlag();
 
     const result = await captureKeywordNotes({
       keyword: request.keyword,
       onProgress: (progress) => {
-        reportCaptureProgress(request, progress);
+        captureFeedback.report(progress);
       },
       minLikes: request.minLikes,
       sortDimension: request.sortDimension,
@@ -383,8 +715,10 @@ async function handleCaptureKeywordNotes(request, sendResponse) {
       maxScrollTimes: request.maxScrollTimes || 50,
     });
 
+    captureFeedback.finish(result);
     sendResponse(result);
   } catch (error) {
+    captureFeedback.fail(error);
     console.error("[Content] Capture keyword notes failed:", error);
     sendResponse({
       ok: false,
@@ -392,6 +726,8 @@ async function handleCaptureKeywordNotes(request, sendResponse) {
       data: null,
       error: {code: "CAPTURE_FAILED", message: error.message},
     });
+  } finally {
+    pendingListCaptureCancellations.delete(captureFeedback.runId);
   }
 }
 
@@ -1366,16 +1702,35 @@ async function handleCaptureComments(request, sendResponse) {
 function handleCancelCapture(request, sendResponse) {
   try {
     const targetRequestId = String(request?.captureRequestId || "").trim();
+    const listCaptureRunId = normalizeListCaptureRunId(
+      request?.listCaptureRunId,
+    );
     const matched =
       !targetRequestId || activeCaptureRequestIds.has(targetRequestId);
-    if (matched) {
+    const listCaptureMatched = rememberListCaptureCancellation(listCaptureRunId);
+    if (matched || listCaptureMatched) {
       setCancelFlag(true);
     }
+    try {
+      const activeOverlayRunId = normalizeListCaptureRunId(
+        activeListCaptureDebugOverlay?.getState?.()?.sessionId,
+      );
+      if (
+        activeListCaptureDebugOverlay &&
+        (!listCaptureRunId || activeOverlayRunId === listCaptureRunId)
+      ) {
+        activeListCaptureDebugOverlay.cancel("用户已请求停止采集");
+      }
+    } catch (error) {
+      console.warn("[Content] List capture feedback cancel failed:", error);
+    }
+    const accepted = matched || listCaptureMatched;
     sendResponse({
       ok: true,
-      message: matched ? "取消信号已发送" : "目标采集已不在当前页面运行",
+      message: accepted ? "取消信号已发送" : "目标采集已不在当前页面运行",
       captureRequestId: targetRequestId,
-      matched,
+      listCaptureRunId,
+      matched: accepted,
     });
   } catch (error) {
     console.error("[Content] Cancel capture failed:", error);

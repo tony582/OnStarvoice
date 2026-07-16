@@ -1307,9 +1307,12 @@ function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
     const publishDateRaw = extractMonitorProfilePublishText(card);
     const publishTimestamp = parseMonitorProfilePublishTimestamp(publishDateRaw);
     const isPinned = /置顶|pinned/i.test(cardText);
+    const domCaptureKey = `douyin:${String(noteId).trim()}`;
+    card.setAttribute?.("data-osv-capture-key", domCaptureKey);
 
     notes.push({
       noteId,
+      domCaptureKey,
       publishLocation: bloggerIpLocation,
       url: noteUrl,
       noteUrl,

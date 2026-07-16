@@ -317,6 +317,142 @@
         class="tab-content"
         id="mainTabContent">
         <section
+          class="debug-session-panel"
+          id="debugSessionPanel"
+          aria-live="polite"
+          hidden>
+          <div class="debug-session-shell">
+            <div class="debug-session-target">
+              <span
+                class="debug-session-logo platform-logo platform-logo-xiaohongshu"
+                id="debugSessionLogo"
+                aria-hidden="true">
+                <span class="platform-logo-xiaohongshu-inner">小红书</span>
+              </span>
+              <span class="debug-session-target-copy">
+                <strong id="debugSessionPageTitle">当前采集页面</strong>
+                <span id="debugSessionPageUrl"></span>
+              </span>
+              <button
+                class="debug-session-focus-button"
+                id="btnDebugSessionFocusTab"
+                type="button">
+                定位页面
+              </button>
+            </div>
+
+            <div class="debug-session-progress-card">
+              <div class="debug-session-progress-heading">
+                <span
+                  class="debug-session-live"
+                  id="debugSessionStateLabel">任务进行中</span>
+                <strong
+                  id="debugSessionProgressPercent"
+                  hidden>—</strong>
+              </div>
+              <div
+                class="debug-session-progress-track"
+                id="debugSessionProgressTrack"
+                role="progressbar"
+                aria-label="采集任务进度"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuetext="任务进行中">
+                <span id="debugSessionProgressBar"></span>
+              </div>
+              <p
+                class="debug-session-current-message"
+                id="debugSessionCurrentMessage">
+                正在准备采集任务…
+              </p>
+              <p
+                class="debug-session-stats"
+                id="debugSessionStats"
+                hidden></p>
+            </div>
+
+            <section
+              class="debug-session-workers"
+              id="debugSessionWorkers"
+              hidden>
+              <div class="debug-session-workers-heading">
+                <strong>采集工作页</strong>
+                <span id="debugSessionWorkerMode">单工作页</span>
+              </div>
+              <div
+                class="debug-session-worker-list"
+                id="debugSessionWorkerList">
+                <div
+                  class="debug-session-worker"
+                  data-worker-index="0"
+                  data-state="idle">
+                  <span class="debug-session-worker-key">A</span>
+                  <span class="debug-session-worker-copy">
+                    <strong>工作页 A</strong>
+                    <small>等待任务</small>
+                  </span>
+                  <span
+                    class="debug-session-worker-signal"
+                    aria-hidden="true"></span>
+                </div>
+                <div
+                  class="debug-session-worker"
+                  data-worker-index="1"
+                  data-state="idle">
+                  <span class="debug-session-worker-key">B</span>
+                  <span class="debug-session-worker-copy">
+                    <strong>工作页 B</strong>
+                    <small>等待任务</small>
+                  </span>
+                  <span
+                    class="debug-session-worker-signal"
+                    aria-hidden="true"></span>
+                </div>
+              </div>
+            </section>
+
+            <div class="debug-session-progress">
+              <h2>任务进度</h2>
+              <ol
+                class="debug-session-steps"
+                id="debugSessionSteps">
+                <li data-debug-step="0"><span class="debug-step-icon"></span><span>正在分析当前页面</span></li>
+                <li data-debug-step="1"><span class="debug-step-icon"></span><span>正在读取并筛选列表</span></li>
+                <li data-debug-step="2"><span class="debug-step-icon"></span><span id="debugSessionNumberingLabel">正在标记采集结果</span></li>
+                <li data-debug-step="3"><span class="debug-step-icon"></span><span id="debugSessionDetailLabel">正在补采笔记详情</span></li>
+                <li data-debug-step="4"><span class="debug-step-icon"></span><span>正在同步采集结果</span></li>
+              </ol>
+            </div>
+          </div>
+
+          <div class="debug-session-footer">
+            <button
+              class="debug-session-footer-button is-stop"
+              id="btnDebugSessionStop"
+              type="button">
+              停止
+            </button>
+            <button
+              class="debug-session-footer-button is-hide"
+              id="btnDebugSessionMinimize"
+              type="button">
+              隐藏
+            </button>
+          </div>
+        </section>
+        <button
+          class="debug-session-dock"
+          id="debugSessionDock"
+          type="button"
+          aria-label="恢复正在运行的采集任务"
+          hidden>
+          <span class="debug-session-dock-count">1</span>
+          <span class="debug-session-dock-copy">
+            <strong>任务运行中</strong>
+            <small id="debugSessionDockStatus">点击查看进度</small>
+          </span>
+        </button>
+        <section
           class="unsupported-platform-cover"
           id="unsupportedPlatformCover"
           hidden>
@@ -535,6 +671,18 @@
                 <span class="switch-label">跳过已增强笔记</span>
               </label>
               <p class="form-hint">采集增强时，已完成增强的笔记不再重复打开详情页，减少重复导航、防风控、提速。</p>
+            </div>
+            <div class="form-group incremental-exception-group">
+              <label class="switch-wrap">
+                <input
+                  type="checkbox"
+                  class="switch-input"
+                  data-detail-setting="comment-count-recheck"
+                  checked />
+                <span class="switch-slider" aria-hidden="true"></span>
+                <span class="switch-label">例外：评论数增加时重采评论</span>
+              </label>
+              <p class="form-hint">仅在上方开启且“附加评论”开启时生效：本次列表评论数高于上次增强基线，才重新打开详情补采评论；相同或减少则只更新基础指标。</p>
             </div>
             <div class="form-group">
               <label class="form-label">笔记内容主题筛选</label>
@@ -896,6 +1044,18 @@
                   <span class="switch-label">跳过已增强笔记</span>
                 </label>
                 <p class="form-hint">采集增强时，已完成增强的笔记不再重复打开详情页，减少重复导航、防风控、提速。</p>
+              </div>
+              <div class="form-group incremental-exception-group">
+                <label class="switch-wrap">
+                  <input
+                    type="checkbox"
+                    class="switch-input"
+                    data-detail-setting="comment-count-recheck"
+                    checked />
+                  <span class="switch-slider" aria-hidden="true"></span>
+                  <span class="switch-label">例外：评论数增加时重采评论</span>
+                </label>
+                <p class="form-hint">仅在上方开启且“附加评论”开启时生效：本次列表评论数高于上次增强基线，才重新打开详情补采评论；相同或减少则只更新基础指标。</p>
               </div>
               <div class="form-group batch-settings">
                 <div class="batch-settings-block">

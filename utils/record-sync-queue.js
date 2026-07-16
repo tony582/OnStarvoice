@@ -9,6 +9,8 @@ export function createRecordSyncQueue({
   enabled = true,
   processRecord,
   onStateChange = null,
+  shouldStop = null,
+  signal = null,
 } = {}) {
   const queueEnabled = Boolean(enabled);
   if (queueEnabled && typeof processRecord !== "function") {
@@ -23,6 +25,8 @@ export function createRecordSyncQueue({
   let activeJob = null;
   let workerPromise = null;
   let blockedError = null;
+  let canceled = signal?.aborted === true;
+  let cancelReason = canceled ? "aborted" : "";
   const stats = {
     enqueuedCount: 0,
     processedCount: 0,
@@ -41,7 +45,48 @@ export function createRecordSyncQueue({
     activeRecordId: activeJob?.recordId || "",
     blocked: Boolean(blockedError),
     error: blockedError,
+    canceled,
+    cancelReason,
   });
+
+  const stopRequested = () => {
+    if (canceled || signal?.aborted === true) {
+      return true;
+    }
+    if (typeof shouldStop !== "function") {
+      return false;
+    }
+    try {
+      return shouldStop() === true;
+    } catch {
+      return true;
+    }
+  };
+
+  const cancel = (reason = "capture_task_canceled") => {
+    if (!queueEnabled) return false;
+    const firstCancellation = !canceled;
+    canceled = true;
+    if (firstCancellation || !cancelReason) {
+      cancelReason = String(reason || "capture_task_canceled");
+    }
+    pendingJobs.splice(0, pendingJobs.length);
+    pendingIds.clear();
+    dirtyIds.clear();
+    latestMetaById.clear();
+    if (firstCancellation) {
+      emitState("canceled", {reason: cancelReason});
+    }
+    return firstCancellation;
+  };
+
+  const syncCancellationState = () => {
+    if (!stopRequested()) return false;
+    cancel(signal?.aborted ? "aborted" : "capture_task_canceled");
+    return true;
+  };
+
+  signal?.addEventListener?.("abort", () => cancel("aborted"), {once: true});
 
   const emitState = (phase, extra = {}) => {
     if (typeof onStateChange !== "function") {
@@ -68,7 +113,7 @@ export function createRecordSyncQueue({
   };
 
   const enqueue = (recordId, meta = {}) => {
-    if (!queueEnabled) {
+    if (!queueEnabled || syncCancellationState()) {
       return false;
     }
     const normalizedId = normalizeRecordId(recordId);
@@ -102,6 +147,7 @@ export function createRecordSyncQueue({
   };
 
   const enqueueMissing = (recordIds, meta = {}) => {
+    if (syncCancellationState()) return 0;
     const ids = Array.isArray(recordIds) ? recordIds : [];
     let addedCount = 0;
     ids.forEach((recordId) => {
@@ -117,6 +163,7 @@ export function createRecordSyncQueue({
   };
 
   const processJob = async (job) => {
+    if (syncCancellationState()) return;
     activeJob = job;
     pendingIds.delete(job.recordId);
     const latestMeta = latestMetaById.get(job.recordId) || job.meta || {};
@@ -132,6 +179,7 @@ export function createRecordSyncQueue({
           (await processRecord({
             recordId: job.recordId,
             meta: latestMeta,
+            signal,
           })) || {ok: true};
       } catch (error) {
         result = {ok: false, error};
@@ -157,7 +205,11 @@ export function createRecordSyncQueue({
     });
     activeJob = null;
 
-    if (dirtyIds.delete(job.recordId) && !blockedError) {
+    if (
+      dirtyIds.delete(job.recordId) &&
+      !blockedError &&
+      !syncCancellationState()
+    ) {
       enqueue(job.recordId, latestMetaById.get(job.recordId) || latestMeta);
     } else {
       latestMetaById.delete(job.recordId);
@@ -166,18 +218,24 @@ export function createRecordSyncQueue({
 
   const runWorker = async () => {
     while (pendingJobs.length > 0) {
+      if (syncCancellationState()) break;
       const job = pendingJobs.shift();
       await processJob(job);
     }
   };
 
   function ensureWorker() {
-    if (!queueEnabled || workerPromise || pendingJobs.length === 0) {
+    if (
+      !queueEnabled ||
+      workerPromise ||
+      pendingJobs.length === 0 ||
+      syncCancellationState()
+    ) {
       return;
     }
     workerPromise = runWorker().finally(() => {
       workerPromise = null;
-      if (pendingJobs.length > 0) {
+      if (pendingJobs.length > 0 && !syncCancellationState()) {
         ensureWorker();
       }
     });
@@ -188,13 +246,14 @@ export function createRecordSyncQueue({
       return getStats();
     }
     do {
+      syncCancellationState();
       ensureWorker();
       const currentWorker = workerPromise;
       if (currentWorker) {
         await currentWorker;
       }
-    } while (workerPromise || pendingJobs.length > 0 || activeJob);
-    emitState("drained");
+    } while (workerPromise || (!canceled && pendingJobs.length > 0) || activeJob);
+    emitState(canceled ? "canceled" : "drained");
     return getStats();
   };
 
@@ -208,5 +267,6 @@ export function createRecordSyncQueue({
     },
     getStats,
     drain,
+    cancel,
   };
 }
