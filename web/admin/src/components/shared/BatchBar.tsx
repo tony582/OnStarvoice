@@ -79,13 +79,13 @@ export function BatchBar({ count, actions, onAction, onClear, busy }: {
 }) {
   if (count <= 0) return null
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
-      <div className="pointer-events-auto flex items-center gap-2 rounded-xl border border-border bg-card/95 p-1.5 pl-3 shadow-lg backdrop-blur animate-in fade-in slide-in-from-bottom-3 duration-200">
-        <span className="flex items-center gap-2 pr-1 text-[13px] font-semibold text-foreground">
+    <div className="pointer-events-none fixed inset-x-0 bottom-[max(1rem,env(safe-area-inset-bottom))] z-40 flex justify-center px-3 sm:px-4">
+      <div className="mobile-table-scroll pointer-events-auto flex max-w-full items-center gap-2 overflow-x-auto rounded-xl border border-border bg-card/95 p-1.5 pl-3 shadow-lg backdrop-blur animate-in fade-in slide-in-from-bottom-3 duration-200">
+        <span className="flex shrink-0 items-center gap-2 pr-1 text-[13px] font-semibold text-foreground">
           {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
           已选 <span className="tabular-nums text-primary">{count}</span> 项
         </span>
-        <div className="h-5 w-px bg-border" />
+        <div className="h-5 w-px shrink-0 bg-border" />
         {actions.map(action => {
           const Icon = action.icon
           return (
@@ -95,7 +95,7 @@ export function BatchBar({ count, actions, onAction, onClear, busy }: {
               disabled={busy}
               onClick={() => onAction(action.key)}
               className={cn(
-                'inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-[13px] font-medium transition-colors disabled:opacity-50',
+                'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg px-3 text-[13px] font-medium transition-colors disabled:opacity-50 lg:h-8',
                 action.tone === 'danger'
                   ? 'text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30'
                   : 'text-foreground hover:bg-muted',
@@ -106,11 +106,11 @@ export function BatchBar({ count, actions, onAction, onClear, busy }: {
             </button>
           )
         })}
-        <div className="h-5 w-px bg-border" />
+        <div className="h-5 w-px shrink-0 bg-border" />
         <button
           type="button"
           onClick={onClear}
-          className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8 lg:w-8"
           aria-label="取消选择"
         >
           <X className="h-4 w-4" />

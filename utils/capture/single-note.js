@@ -133,6 +133,7 @@ export async function captureSingleNote() {
       likes: interactions.likes,
       collects: interactions.collects,
       comments: interactions.comments,
+      commentsCountKnown: interactions.commentsCountKnown,
       publishTime: publishDateRaw,
       publishDateRaw,
       lastEditedAt,
@@ -397,7 +398,7 @@ function extractAuthorInfo(noteContext = document) {
 /**
  * 验证作者名称（增强版，更严格的时间文本过滤）
  */
-function validateAuthorName(name) {
+export function validateAuthorName(name) {
   if (!name || typeof name !== "string") return false;
 
   // 长度检查（从 2-20 扩展到 1-50）
@@ -439,8 +440,13 @@ function validateAuthorName(name) {
     }
   }
 
-  // 排除纯数字或纯符号
-  if (/^[\d\s]+$/.test(name) || /^[^\w\u4e00-\u9fa5]+$/.test(name)) {
+  // 排除纯数字；纯 Emoji 是小红书允许的合法昵称（例如“🌻”），不能按纯符号误杀。
+  if (/^[\d\s]+$/.test(name)) {
+    return false;
+  }
+  const hasWordOrCjk = /[\w\u3400-\u9fff]/.test(name);
+  const hasEmoji = /\p{Extended_Pictographic}/u.test(name);
+  if (!hasWordOrCjk && !hasEmoji) {
     return false;
   }
 
@@ -802,14 +808,140 @@ function extractInteractions(noteContext = document) {
       : byUse.comments > 0
         ? byUse.comments
         : extractInteractionByIcon("comment", noteContext);
+  const commentsCountKnown = resolveCommentsCountKnown(noteContext);
 
   console.log("[SingleNote] Interactions extracted:", {
     likes,
     collects,
     comments,
+    commentsCountKnown,
   });
 
-  return {likes, collects, comments};
+  return {likes, collects, comments, commentsCountKnown};
+}
+
+const XHS_COMMENT_COUNT_LOADING_PATTERN =
+  /(?:加载中|正在加载|加载评论|请稍候|请稍后)/;
+const XHS_EXPLICIT_EMPTY_COMMENTS_PATTERN =
+  /^(?:暂无评论|还没有评论(?:哦)?|暂时没有评论|还没有人评论(?:哦)?(?:[，,、\s]*(?:快来)?(?:抢沙发|说点什么)(?:吧)?)?|这是一片荒地(?:[，,、\s]*(?:点击评论|快来评论)(?:吧)?)?)[。！!\s]*$/;
+
+/**
+ * 判断当前详情页的评论数是否有明确页面证据。
+ *
+ * 数值字段仍会为兼容旧数据保留 0，但只有以下两种情况可以把 0 当作“确证零评论”：
+ * 1. 当前详情互动栏的评论计数节点实际包含数字；
+ * 2. 当前详情评论区出现小红书明确的无评论空态。
+ *
+ * 缺少节点、占位文本或加载中文案都返回 false，避免页面尚未完成渲染时误跳过评论采集。
+ */
+export function resolveCommentsCountKnown(noteContext = document) {
+  if (!noteContext || typeof noteContext.querySelectorAll !== "function") {
+    return false;
+  }
+
+  const countSelectors = [
+    ...(NOTE_DETAIL_SELECTORS.engageBar?.commentsCount || []),
+    ...(NOTE_DETAIL_SELECTORS.interactionsByIcon?.comments?.count || []),
+  ];
+  const countRoots = [
+    noteContext,
+    ...querySelectorAll(
+      NOTE_DETAIL_SELECTORS.engageBar?.container || [],
+      noteContext,
+    ),
+  ];
+
+  for (const root of countRoots) {
+    const countNodes = querySelectorAll(countSelectors, root);
+    if (countNodes.some(hasExplicitNumericCommentCount)) {
+      return true;
+    }
+
+    const useElements = Array.from(root.querySelectorAll("svg use"));
+    for (const use of useElements) {
+      const href = String(
+        use.getAttribute?.("xlink:href") || use.getAttribute?.("href") || "",
+      ).toLowerCase();
+      if (!/(?:chat|comment)/.test(href)) continue;
+
+      const iconRoot =
+        use.closest?.(".chat-wrapper, .comment-wrapper") ||
+        use.closest?.("span,button,div");
+      const countNode =
+        iconRoot?.querySelector?.(".count") ||
+        iconRoot?.parentElement?.querySelector?.(".count") ||
+        iconRoot?.nextElementSibling ||
+        null;
+      if (hasExplicitNumericCommentCount(countNode)) {
+        return true;
+      }
+    }
+  }
+
+  return hasExplicitEmptyCommentsState(noteContext);
+}
+
+function hasExplicitNumericCommentCount(node) {
+  if (!isUsableCommentEvidenceNode(node)) return false;
+  const text = cleanText(node.textContent || "");
+  if (!text || XHS_COMMENT_COUNT_LOADING_PATTERN.test(text)) return false;
+  return /(?:^|[^0-9])\d+(?:\.\d+)?(?:[wW万kK])?(?:$|[^0-9])/.test(text);
+}
+
+function hasExplicitEmptyCommentsState(noteContext) {
+  const commentRoots = querySelectorAll(
+    COMMENTS_SELECTORS.container,
+    noteContext,
+  );
+  const roots = commentRoots.length > 0 ? commentRoots : [noteContext];
+
+  for (const root of roots) {
+    const nodes = [root, ...Array.from(root.querySelectorAll("*"))];
+    for (const node of nodes) {
+      if (!isUsableCommentEvidenceNode(node)) continue;
+      if (isInsideNonDetailRecommendation(node, noteContext)) continue;
+
+      const text = cleanText(node.textContent || "");
+      if (!text || text.length > 48) continue;
+      if (XHS_COMMENT_COUNT_LOADING_PATTERN.test(text)) continue;
+      if (XHS_EXPLICIT_EMPTY_COMMENTS_PATTERN.test(text)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function isUsableCommentEvidenceNode(node) {
+  if (!node || typeof node !== "object") return false;
+  if (node.hidden === true) return false;
+  if (node.getAttribute?.("aria-hidden") === "true") return false;
+  if (node.closest?.('[hidden], [aria-hidden="true"]')) return false;
+
+  try {
+    if (typeof globalThis.window?.getComputedStyle === "function") {
+      const style = globalThis.window.getComputedStyle(node);
+      if (style?.display === "none" || style?.visibility === "hidden") {
+        return false;
+      }
+    }
+  } catch {
+    // 非浏览器测试环境没有完整 CSSOM；DOM 证据本身仍可使用。
+  }
+
+  return true;
+}
+
+function isInsideNonDetailRecommendation(node, noteContext) {
+  if (!node || typeof node.closest !== "function") return false;
+  const ignored = node.closest(
+    ".recommend, .related, .feed-item, .note-item, [class*='recommend'], [class*='related']",
+  );
+  if (!ignored || ignored === noteContext) return false;
+  return (
+    typeof noteContext.contains !== "function" || noteContext.contains(ignored)
+  );
 }
 
 function extractInteractionsBySvgUse(noteContext = document) {

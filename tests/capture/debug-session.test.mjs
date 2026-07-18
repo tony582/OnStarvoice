@@ -8,6 +8,7 @@ const {createManager, isListCaptureAction, resolveListRelayRunId} =
 
 function createDebuggerDouble({
   attachError = null,
+  attachErrors = null,
   focusError = null,
   detachError = null,
   detachDuringFocus = false,
@@ -15,6 +16,9 @@ function createDebuggerDouble({
 } = {}) {
   const detachListeners = new Set();
   const calls = [];
+  const queuedAttachErrors = Array.isArray(attachErrors)
+    ? [...attachErrors]
+    : null;
   const api = {
     calls,
     detachError,
@@ -25,7 +29,10 @@ function createDebuggerDouble({
     },
     async attach(debuggee, version) {
       calls.push(["attach", debuggee, version]);
-      if (attachError) throw attachError;
+      const nextAttachError = queuedAttachErrors?.length
+        ? queuedAttachErrors.shift()
+        : attachError;
+      if (nextAttachError) throw nextAttachError;
     },
     async sendCommand(debuggee, method, params) {
       calls.push(["sendCommand", debuggee, method, params]);
@@ -294,6 +301,208 @@ test("persistent native detach keeps a recovery snapshot until ordered cleanup f
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   assert.equal(manager.getSessionByTaskId("persistent-detach"), null);
+});
+
+test("target_closed waits for tabs.onReplaced and reattaches a persistent source", async () => {
+  const debuggerApi = createDebuggerDouble({emitDetachOnStop: false});
+  const unexpected = [];
+  let replacementTimeout = null;
+  const manager = createManager({
+    debuggerApi,
+    onUnexpectedDetach: (event) => unexpected.push(event),
+    setTimeoutFn(handler) {
+      replacementTimeout = handler;
+      return 1;
+    },
+    clearTimeoutFn() {
+      replacementTimeout = null;
+    },
+  });
+  await manager.start({
+    tabId: 81,
+    runId: "capture-task:source-replacement",
+    persistent: true,
+    taskId: "source-replacement",
+    workerTabIds: [82],
+    groupId: 700,
+  });
+
+  debuggerApi.emitDetach(81, "target_closed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(unexpected.length, 0);
+  assert.equal(typeof replacementTimeout, "function");
+  assert.equal(manager.getSession(81).state, "attached");
+
+  const replaced = await manager.replaceTab({
+    removedTabId: 81,
+    addedTabId: 83,
+    pageTitle: "抖音搜索",
+    pageUrl: "https://www.douyin.com/search/test",
+  });
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.role, "source");
+  assert.equal(replacementTimeout, null);
+  assert.equal(manager.getSession(81), null);
+  assert.equal(manager.getSession(83).state, "attached");
+  assert.equal(manager.getSession(83).taskId, "source-replacement");
+  assert.deepEqual(manager.getSession(83).workerTabIds, [82]);
+  assert.equal(manager.getSession(83).pageTitle, "抖音搜索");
+  assert.equal(unexpected.length, 0);
+  assert.deepEqual(debuggerApi.calls.slice(-2), [
+    ["attach", {tabId: 83}, "1.3"],
+    [
+      "sendCommand",
+      {tabId: 83},
+      "Emulation.setFocusEmulationEnabled",
+      {enabled: true},
+    ],
+  ]);
+});
+
+test("target_closed still cancels when no replacement arrives in the grace window", async () => {
+  const debuggerApi = createDebuggerDouble({
+    emitDetachOnStop: false,
+    attachErrors: [null, new Error("target no longer exists")],
+  });
+  const unexpected = [];
+  let replacementTimeout = null;
+  const manager = createManager({
+    debuggerApi,
+    onUnexpectedDetach: (event) => unexpected.push(event),
+    setTimeoutFn(handler) {
+      replacementTimeout = handler;
+      return 1;
+    },
+    clearTimeoutFn() {
+      replacementTimeout = null;
+    },
+  });
+  await manager.start({
+    tabId: 84,
+    runId: "capture-task:source-closed",
+    persistent: true,
+    taskId: "source-closed",
+  });
+
+  debuggerApi.emitDetach(84, "target_closed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(unexpected.length, 0);
+  replacementTimeout();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    debuggerApi.calls.filter(([type]) => type === "attach").length,
+    2,
+  );
+  assert.equal(unexpected.length, 1);
+  assert.equal(unexpected[0].reason, "target_closed");
+  assert.equal(unexpected[0].session.state, "detached");
+});
+
+test("target_closed reattaches the same persistent source when no replacement event arrives", async () => {
+  const debuggerApi = createDebuggerDouble({emitDetachOnStop: false});
+  const unexpected = [];
+  let replacementTimeout = null;
+  const manager = createManager({
+    debuggerApi,
+    onUnexpectedDetach: (event) => unexpected.push(event),
+    setTimeoutFn(handler) {
+      replacementTimeout = handler;
+      return 1;
+    },
+    clearTimeoutFn() {
+      replacementTimeout = null;
+    },
+  });
+  await manager.start({
+    tabId: 89,
+    runId: "capture-task:same-tab-reattach",
+    persistent: true,
+    taskId: "same-tab-reattach",
+  });
+
+  debuggerApi.emitDetach(89, "target_closed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  replacementTimeout();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(unexpected.length, 0);
+  assert.equal(manager.getSessionByTaskId("same-tab-reattach").state, "attached");
+  assert.equal(
+    debuggerApi.calls.filter(([type]) => type === "attach").length,
+    2,
+  );
+});
+
+test("target_closed cleanup can re-enter stopByTaskId without deadlocking the session queue", async () => {
+  const debuggerApi = createDebuggerDouble({
+    emitDetachOnStop: false,
+    attachErrors: [null, new Error("same-tab reattach failed")],
+  });
+  const stateChanges = [];
+  let replacementTimeout = null;
+  let cleanupStarted = false;
+  let cleanupFinished = false;
+  let manager;
+  manager = createManager({
+    debuggerApi,
+    onStateChange(session, metadata) {
+      stateChanges.push({session, metadata});
+    },
+    async onUnexpectedDetach(event) {
+      cleanupStarted = true;
+      await manager.stopByTaskId(event.session.taskId, "debugger_detached");
+      cleanupFinished = true;
+    },
+    setTimeoutFn(handler) {
+      replacementTimeout = handler;
+      return 1;
+    },
+    clearTimeoutFn() {
+      replacementTimeout = null;
+    },
+  });
+  await manager.start({
+    tabId: 88,
+    runId: "capture-task:target-closed-cleanup",
+    persistent: true,
+    taskId: "target-closed-cleanup",
+  });
+
+  debuggerApi.emitDetach(88, "target_closed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(typeof replacementTimeout, "function");
+  replacementTimeout();
+
+  // Give the queued callback several turns. A re-entrant queue deadlock leaves
+  // cleanupStarted=true forever while stopByTaskId waits behind its caller.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(cleanupStarted, true);
+  assert.equal(cleanupFinished, true);
+  assert.equal(manager.getSessionByTaskId("target-closed-cleanup"), null);
+  assert.equal(stateChanges.at(-1).session, null);
+});
+
+test("worker tab replacement preserves persistent task ownership", async () => {
+  const manager = createManager({debuggerApi: createDebuggerDouble()});
+  await manager.start({
+    tabId: 85,
+    runId: "capture-task:worker-replacement",
+    persistent: true,
+    taskId: "worker-replacement",
+    workerTabIds: [86],
+  });
+
+  const replaced = await manager.replaceTab({
+    removedTabId: 86,
+    addedTabId: 87,
+  });
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.role, "worker");
+  assert.deepEqual(
+    manager.getSessionByTaskId("worker-replacement").workerTabIds,
+    [87],
+  );
 });
 
 test("closing the owned tab forgets the session without touching another tab", async () => {

@@ -4,6 +4,7 @@
   const TASK_LEDGER_VERSION = 1;
   const DEFAULT_RETENTION_DAYS = 30;
   const DEFAULT_MAX_TERMINAL_RUNS = 300;
+  const DEFAULT_STALE_ACTIVE_AFTER_MS = 10 * 60 * 1000;
   const MAX_EVENTS_PER_RUN = 50;
   const MAX_TEXT_LENGTH = 500;
   const MAX_TITLE_LENGTH = 160;
@@ -615,9 +616,69 @@
     return {
       version: TASK_LEDGER_VERSION,
       runs,
+      clearedAt: normalizeTimestamp(source.clearedAt),
       updatedAt:
         normalizeTimestamp(source.updatedAt) || latestRunAt || new Date(now).toISOString(),
     };
+  }
+
+  function reconcileStaleTaskLedger(input = {}, options = {}) {
+    const now = normalizeNow(options.now);
+    const nowIso = new Date(now).toISOString();
+    const staleAfterMs = Math.max(
+      0,
+      Number.isFinite(Number(options.staleAfterMs))
+        ? Number(options.staleAfterMs)
+        : DEFAULT_STALE_ACTIVE_AFTER_MS,
+    );
+    const normalized = normalizeTaskLedger(input, {...options, now});
+    if (!staleAfterMs) return normalized;
+
+    let changed = false;
+    const runs = normalized.runs.map((run) => {
+      if (
+        !["pending", "running", "recovering"].includes(run.status) ||
+        options.isTaskActive?.(run) === true
+      ) {
+        return run;
+      }
+      const lastActivityAt = activityTimestamp(run);
+      if (!lastActivityAt || now - lastActivityAt < staleAfterMs) {
+        return run;
+      }
+
+      changed = true;
+      return normalizeTaskRun(
+        {
+          ...run,
+          status: "canceled",
+          finishedAt: nowIso,
+          updatedAt: nowIso,
+          message: "长时间无业务进展，已自动结束陈旧任务记录",
+          events: [
+            ...run.events,
+            {
+              id: `stale_reconciled_${now}`,
+              type: "stale_reconciled",
+              status: "canceled",
+              at: nowIso,
+              message: "长时间无业务进展，已自动结束陈旧任务记录",
+            },
+          ],
+        },
+        {now},
+      );
+    });
+
+    if (!changed) return normalized;
+    return normalizeTaskLedger(
+      {
+        ...normalized,
+        runs,
+        updatedAt: nowIso,
+      },
+      {...options, now},
+    );
   }
 
   function upsertTaskRun(ledger, patch = {}, options = {}) {
@@ -663,6 +724,7 @@
       {
         version: TASK_LEDGER_VERSION,
         runs: nextRuns,
+        clearedAt: normalizedLedger.clearedAt,
         updatedAt: new Date(now).toISOString(),
       },
       {...options, now},
@@ -724,10 +786,15 @@
     const success = normalizeNonNegativeInteger(input.successCount);
     const skipped = normalizeNonNegativeInteger(input.skippedCount);
     const finishedAt = pick(input, ["finishedAt", "createdAt"]);
-    let status = finishedAt ? "completed" : "running";
+    let status = finishedAt ? "completed" : "completed_with_warnings";
     if (failed > 0 && success > 0) status = "completed_with_warnings";
     else if (failed > 0) status = "failed";
-    else if (input.status) status = normalizeStatus(input.status, status);
+    else if (input.status) {
+      const normalizedInputStatus = normalizeStatus(input.status, status);
+      status = isTerminalTaskStatus(normalizedInputStatus)
+        ? normalizedInputStatus
+        : "completed_with_warnings";
+    }
     const trigger = sanitizeText(input.trigger, 100);
     const isMonitor = trigger === "monitor_run_now";
     const rawId = pick(input, ["id", "taskId", "batchId"]);
@@ -835,7 +902,10 @@
 
     const runs = [];
     for (const [groupKey, entries] of groups.entries()) {
-      const status = aggregateMonitorStatus(entries);
+      const aggregatedStatus = aggregateMonitorStatus(entries);
+      const status = isTerminalTaskStatus(aggregatedStatus)
+        ? aggregatedStatus
+        : "completed_with_warnings";
       const platforms = [...new Set(entries.map((entry) => entry.platform).filter(Boolean))];
       const startedAt = oldestTimestamp(
         ...entries.map((entry) => entry.startedAt || entry.createdAt),
@@ -1015,6 +1085,7 @@
     isTerminalTaskStatus,
     normalizeTaskRun,
     normalizeTaskLedger,
+    reconcileStaleTaskLedger,
     mergeTaskRun,
     upsertTaskRun,
     appendTaskEvent,

@@ -120,6 +120,8 @@ export const MESSAGE_TYPE = {
   GET_CLIENT_ENV: "onstarvoice:get-client-env",
   GET_EXTENSION_STATE: "onstarvoice:get-extension-state",
   UPDATE_RUNTIME: "onstarvoice:update-runtime",
+  GET_TASK_LEDGER: "onstarvoice:get-task-ledger",
+  CLEAR_TASK_CENTER: "onstarvoice:clear-task-center",
 
   // 内容脚本通信
   RELAY_TO_CONTENT: "onstarvoice:relay-to-content",
@@ -146,6 +148,7 @@ export const API_ENDPOINT = {
   TARGET: "/api/target",
   UPDATE_MANIFEST: "/api/update-manifest",
   KEYWORD_ANALYSIS: "/api/keyword-analysis",
+  RELEVANCE_PREFILTER: "/api/relevance/prefilter",
   KEYWORD_OPPORTUNITY: "/api/keyword-opportunity",
   BENCHMARK_DISCOVERY: "/api/benchmark-discovery",
   MONITOR_SUBSCRIPTIONS: "/api/monitor/subscriptions",

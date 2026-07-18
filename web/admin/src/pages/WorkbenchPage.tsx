@@ -3,10 +3,11 @@ import { TriageQueue } from '@/pages/workbench/TriageQueue'
 import { LeadsQueue } from '@/pages/workbench/LeadsQueue'
 import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
 import { TicketFeedbackQueue } from '@/pages/workbench/TicketFeedbackQueue'
+import { MisjudgmentQueue } from '@/pages/workbench/MisjudgmentQueue'
 import { ProcessingBanner } from '@/components/shared/ProcessingBanner'
 
-type QueueKey = 'triage' | 'leads' | 'feedback' | 'issues'
-const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'issues']
+type QueueKey = 'triage' | 'leads' | 'feedback' | 'misjudgments' | 'issues'
+const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'misjudgments', 'issues']
 
 /**
  * 舆情工作台:队列(内容分诊/评论线索/问题处置)已移到侧边栏二级导航,
@@ -24,6 +25,7 @@ export function WorkbenchPage() {
       {queue === 'triage' && <TriageQueue initial={initial} />}
       {queue === 'leads' && <LeadsQueue initial={initial} category="opinion" />}
       {queue === 'feedback' && <TicketFeedbackQueue />}
+      {queue === 'misjudgments' && <MisjudgmentQueue />}
       {queue === 'issues' && <IssuesQueue initial={initial} />}
     </div>
   )

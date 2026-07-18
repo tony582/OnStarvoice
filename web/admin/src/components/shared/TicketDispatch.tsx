@@ -69,8 +69,8 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
   }, [priority, assigneeUserId, note, assignees]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4 animate-in fade-in duration-150" onMouseDown={onCancel}>
-      <div className="w-full max-w-md rounded-xl border border-border bg-card p-5 shadow-2xl animate-in zoom-in-95 duration-150" onMouseDown={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4 animate-in fade-in duration-150" onMouseDown={onCancel}>
+      <div className="max-h-[calc(100dvh-1.5rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-border bg-card p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl sm:rounded-xl sm:p-5 animate-in zoom-in-95 duration-150" onMouseDown={e => e.stopPropagation()}>
         <h3 className="text-sm font-bold">{state.title || '转工单'}</h3>
         <p className="mt-1 text-[12px] text-muted-foreground">默认本人跟进,流转到「已转工单」后填写过程备注并结案;也可改派其他成员。</p>
         {state.summary && (
@@ -78,7 +78,7 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
         )}
 
         <label className="mt-4 block text-[12px] font-semibold text-foreground">优先级</label>
-        <div className="mt-1.5 inline-flex gap-1">
+        <div className="mt-1.5 flex flex-wrap gap-1">
           {PRIORITIES.map(p => (
             <button key={p.value} type="button" onClick={() => setPriority(p.value)}
               className={`rounded-lg px-3 py-1.5 text-[12.5px] font-semibold transition-colors ${priority === p.value ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted'}`}>
@@ -98,7 +98,7 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
           placeholder="例如:用户投诉续费乱扣费,请尽快私信安抚并核实订单"
           className="mt-1.5 w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-[13px] leading-6 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20" />
 
-        <div className="mt-4 flex items-center justify-end gap-2">
+        <div className="mt-4 grid grid-cols-2 gap-2 sm:flex sm:items-center sm:justify-end">
           <Button variant="outline" size="sm" onClick={onCancel}>取消</Button>
           <Button size="sm" onClick={submit}>转工单</Button>
         </div>

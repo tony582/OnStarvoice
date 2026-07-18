@@ -1,10 +1,18 @@
 const DOUYIN_SHELL_AUTHOR_NAME_PATTERN = /^我的$/u;
+const DOUYIN_AUTHOR_DECORATION_SUFFIX_PATTERN =
+  /(?:认证徽章|(?:商家|企业|官方|机构|个人|品牌)?认证账号|(?:商家|企业|官方|机构|个人|品牌)认证|蓝V认证|黄V认证|已关注|关注)+$/u;
 
 function cleanAuthorText(value) {
-  return String(value || "")
+  let text = String(value || "")
     .replace(/\s+/g, " ")
     .trim()
     .replace(/^@\s*/, "");
+  let previous = "";
+  while (text && text !== previous) {
+    previous = text;
+    text = text.replace(DOUYIN_AUTHOR_DECORATION_SUFFIX_PATTERN, "").trim();
+  }
+  return text;
 }
 
 export function isDouyinShellAuthorName(value) {

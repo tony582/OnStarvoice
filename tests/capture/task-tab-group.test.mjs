@@ -10,6 +10,7 @@ function createTabGroupDouble({sourceGroupId = -1, updateError = null} = {}) {
   const tabs = new Map([
     [41, {id: 41, windowId: 5, groupId: sourceGroupId}],
     [42, {id: 42, windowId: 5}],
+    [44, {id: 44, windowId: 5}],
     [43, {id: 43, windowId: 6}],
   ]);
   const calls = [];
@@ -168,6 +169,55 @@ test("removed worker tabs are forgotten without releasing the task source", asyn
   assert.deepEqual(manager.getTask("task-41").workerTabIds, []);
   assert.equal(await manager.handleTabRemoved(99), false);
   assert.equal(manager.getTask("task-41").sourceTabId, 41);
+});
+
+test("browser tab replacement migrates the source without ending the task", async () => {
+  const double = createTabGroupDouble();
+  const manager = createManager(double);
+  await manager.begin({taskId: "task-source-replaced", sourceTabId: 41});
+  await manager.register({taskId: "task-source-replaced", tabId: 42});
+
+  const replaced = await manager.replaceTab({
+    removedTabId: 41,
+    addedTabId: 44,
+  });
+
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.role, "source");
+  assert.equal(replaced.group.sourceTabId, 44);
+  assert.deepEqual(replaced.group.workerTabIds, [42]);
+  assert.deepEqual(double.calls.slice(-2), [
+    ["get", 44],
+    ["group", {groupId: 700, tabIds: [44]}],
+  ]);
+
+  const ended = await manager.end({taskId: "task-source-replaced"});
+  assert.equal(ended.released, true);
+  assert.deepEqual(double.calls.slice(-2), [
+    ["ungroup", [42]],
+    ["ungroup", [44]],
+  ]);
+});
+
+test("browser tab replacement migrates a worker inside the same task group", async () => {
+  const double = createTabGroupDouble();
+  const manager = createManager(double);
+  await manager.begin({taskId: "task-worker-replaced", sourceTabId: 41});
+  await manager.register({taskId: "task-worker-replaced", tabId: 42});
+
+  const replaced = await manager.replaceTab({
+    removedTabId: 42,
+    addedTabId: 44,
+  });
+
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.role, "worker");
+  assert.equal(replaced.group.sourceTabId, 41);
+  assert.deepEqual(replaced.group.workerTabIds, [44]);
+  assert.deepEqual(double.calls.slice(-2), [
+    ["get", 44],
+    ["group", {groupId: 700, tabIds: [44]}],
+  ]);
 });
 
 test("worker rollback leaves the source group active without an orphan tab", async () => {

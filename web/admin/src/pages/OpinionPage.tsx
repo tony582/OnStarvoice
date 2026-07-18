@@ -122,7 +122,42 @@ export function OpinionPage() {
       ) : items.length === 0 ? (
         <EmptyState icon={Inbox} title={`暂无${STATE_TABS.find(t => t.key === state)?.label || ''}的工单`} description="分诊团队在「工作台」点【转工单】后,工单会进入这里" />
       ) : (
-        <WorkbenchTableShell>
+        <>
+          <div className="space-y-2 lg:hidden">
+            {items.map(it => {
+              const actionable = canWrite() && (it.status === 'pending' || it.status === 'doing')
+              return (
+                <article key={it.id} className="relative overflow-hidden rounded-xl border border-border bg-card p-3.5 shadow-xs">
+                  <span className={`absolute inset-y-0 left-0 w-1 ${it.priority === 'urgent' ? 'bg-status-darkred' : it.priority === 'high' ? 'bg-status-red' : 'bg-status-blue'}`} />
+                  <button type="button" onClick={() => setDrawer(it)} className="w-full text-left">
+                    <div className="flex flex-wrap items-center gap-1.5 pr-5">
+                      <StatusBadge tone={it.priority}>{LABELS.priority[it.priority] || it.priority}</StatusBadge>
+                      <StatusBadge tone={STATE_TONE[it.status] || 'muted'}>{STATE_LABEL[it.status] || it.status}</StatusBadge>
+                      <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
+                      <StatusBadge tone="neutral">{platformName(it.platform)}</StatusBadge>
+                      <ChevronRight className="absolute right-3 top-4 h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <p className="mt-2.5 line-clamp-3 text-[13px] font-semibold leading-5">{it.item_text || it.title || '(无内容)'}</p>
+                    {it.dispatch_note && <div className="mt-2 rounded-lg bg-status-orange/[0.09] px-2.5 py-2 text-[11px] leading-5 text-amber-700 dark:text-amber-300"><span className="font-bold">为什么现在要处理：</span>{it.dispatch_note}</div>}
+                    {it.feedback_status === 'reopened' && it.review_note && <div className="mt-2 rounded-lg bg-status-red/[0.07] px-2.5 py-2 text-[11px] leading-5 text-status-red"><span className="font-bold">已被打回：</span>{it.review_note}</div>}
+                    {(it.handle_note || it.handled_at) && <div className="mt-2 rounded-lg bg-muted/60 px-2.5 py-2 text-[11px] leading-5 text-muted-foreground"><span className="font-bold text-foreground">最近进展：</span>{it.handle_note || '已处理'}{it.handled_by_name ? ` · ${it.handled_by_name}` : ''}</div>}
+                    <div className="mt-2.5 grid grid-cols-2 gap-x-3 gap-y-1 text-[10.5px] text-muted-foreground">
+                      <span>作者 {it.author || '-'}</span><span>处理人 {it.assignee_name || '公共池'}</span>
+                      <span>转单 {it.created_by_name || '-'}</span><span>{formatDate(it.created_at)}</span>
+                    </div>
+                  </button>
+                  <div className="mt-3 flex items-center gap-2 border-t border-border/70 pt-3">
+                    <Button variant="outline" size="sm" className="flex-1" onClick={() => setDrawer(it)}>查看详情</Button>
+                    {it.url && <Button variant="outline" size="sm" onClick={() => window.open(it.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="h-3.5 w-3.5" />原文</Button>}
+                    {actionable && <Button size="sm" className="flex-1" onClick={() => act(it, 'done', true)}>处理完成</Button>}
+                    {actionable && <Button variant="ghost" size="sm" onClick={() => act(it, 'dismiss', true)}>忽略</Button>}
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+          <div className="hidden lg:block">
+          <WorkbenchTableShell>
           <table className="w-full min-w-[940px] text-sm">
             <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">工单内容</th>
@@ -178,14 +213,16 @@ export function OpinionPage() {
               ))}
             </tbody>
           </table>
-        </WorkbenchTableShell>
+          </WorkbenchTableShell>
+          </div>
+        </>
       )}
 
       {pagination && pagination.totalPages > 1 && (
-        <div className="flex items-center justify-end gap-2">
-          <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}><ChevronLeft className="h-4 w-4" /></Button>
+        <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 lg:flex lg:justify-end">
+          <Button variant="outline" size="sm" className="h-10 lg:h-8 lg:w-8 lg:px-0" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}><ChevronLeft className="h-4 w-4" /><span className="lg:hidden">上一页</span></Button>
           <span className="text-xs text-muted-foreground">{pagination.page} / {pagination.totalPages}</span>
-          <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page >= pagination.totalPages} onClick={() => load(pagination.page + 1)}><ChevronRight className="h-4 w-4" /></Button>
+          <Button variant="outline" size="sm" className="h-10 lg:h-8 lg:w-8 lg:px-0" disabled={pagination.page >= pagination.totalPages} onClick={() => load(pagination.page + 1)}><span className="lg:hidden">下一页</span><ChevronRight className="h-4 w-4" /></Button>
         </div>
       )}
 

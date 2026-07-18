@@ -150,6 +150,56 @@ test("task center aggregation keeps ledger and legacy histories in one model", a
   assert.deepEqual(new Set(items.map((item) => item.type)), new Set(["keyword", "sync", "monitor"]));
 });
 
+test("task center clear cutoff hides old local and backend history", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?task-center-clear-test=${Date.now()}`
+  );
+  const clearedAt = new Date().toISOString();
+  const beforeClear = new Date(Date.now() - 60_000).toISOString();
+  const items = buildTaskCenterItems({
+    ledgerState: {runs: [], clearedAt},
+    historyConfig: {
+      entries: [
+        {id: "old-sync", status: "completed", finishedAt: beforeClear},
+      ],
+    },
+    monitorConfig: {
+      executions: [
+        {id: "old-monitor", status: "running", startedAt: beforeClear},
+      ],
+    },
+  });
+
+  assert.deepEqual(items, []);
+});
+
+test("task center clear cutoff also hides a stale legacy unattended request", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?task-center-unattended-clear-test=${Date.now()}`
+  );
+  const clearedAt = new Date().toISOString();
+  const beforeClear = new Date(Date.now() - 60_000).toISOString();
+  const items = buildTaskCenterItems({
+    ledgerState: {runs: [], clearedAt},
+    legacyState: {
+      plan: {
+        platform: "xiaohongshu",
+        keywords: ["旅行"],
+        lastRunStatus: "running",
+        lastRunAt: beforeClear,
+      },
+      request: {
+        id: "stale-request-before-clear",
+        status: "running",
+        createdAt: beforeClear,
+        updatedAt: beforeClear,
+      },
+    },
+  });
+
+  assert.deepEqual(items, []);
+});
+
 test("new ledger runs suppress their mirrored legacy records", async () => {
   const {buildTaskCenterItems} = await import(
     `../sidebar/task-center-ui.js?task-center-dedupe-test=${Date.now()}`

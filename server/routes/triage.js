@@ -2,6 +2,12 @@ import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { formatPublishDate } from '../services/publish-date.js';
+import {
+  appendCustomTagFilter,
+  customTagsSelectSql,
+  normalizeCustomTagFilter,
+} from '../services/record-custom-tags.js';
+import { insertRecordFeedback, normalizeFeedbackReason } from '../services/record-feedback.js';
 import { sendXlsx, fmtTs } from '../services/xlsx-export.js';
 
 const router = Router();
@@ -17,9 +23,24 @@ const NOTE_TYPE_CN = { image: '图文', video: '视频', normal: '图文' };
 const BRAND_MODEL_RE = /(安吉星|onstar|别克|凯迪拉克|凯迪|雪佛兰|buick|cadillac|chevrolet|上汽通用|君越|君威|昂科威|昂科拉|昂科旗|gl8|gl6|英朗|威朗|凯越|微蓝|velite|阅朗|ct4|ct5|ct6|xt4|xt5|xt6|锐歌|lyriq|凯雷德|科鲁兹|科沃兹|迈锐宝|创酷|创界|探界者|开拓者|沃兰多|星迈罗|赛欧|畅巡|景程)/i;
 const DEALER_NAME_RE = /(4s|旗舰店|体验中心|服务中心|销售服务|特约|经销|汽贸)/i;
 
-// 疑似身份:① 账号名带品牌/车型 → 像门店/经销(或 LLM 判经销)=4S店,否则 =KOE;
-//          ② 名字不带品牌 → 按 LLM source_type;pgc(KOL)按粉丝分级(KOC<5万/初级<50万/中级<300万/头部≥300万)。空值导出「未判定」。
-function identityLabel(sourceType, fans, name) {
+function kolIdentityLabel(fans) {
+  const f = Number(fans);
+  if (!Number.isFinite(f) || f <= 0) return 'KOL';
+  if (f < 50000) return 'KOC';
+  if (f < 500000) return '初级KOL';
+  if (f < 3000000) return '中级KOL';
+  return '头部KOL';
+}
+
+// 人工身份优先;未人工覆盖时才按作者名 + AI source_type 推导。
+export function identityLabel(sourceType, fans, name, identityOverride = '') {
+  const override = String(identityOverride || '');
+  if (override === 'dealer') return '4S店';
+  if (override === 'koe') return 'KOE';
+  if (override === 'user') return '用户';
+  if (override === 'other') return '其他';
+  if (override === 'kol') return kolIdentityLabel(fans);
+
   const nm = String(name || '');
   const st = String(sourceType || '');
   if (BRAND_MODEL_RE.test(nm)) {
@@ -29,14 +50,7 @@ function identityLabel(sourceType, fans, name) {
   if (st === 'employee') return 'KOE';
   if (st === 'ugc') return '用户';
   if (st === 'other') return '其他';
-  if (st === 'pgc') {
-    const f = Number(fans);
-    if (!Number.isFinite(f) || f <= 0) return 'KOL';
-    if (f < 50000) return 'KOC';
-    if (f < 500000) return '初级KOL';
-    if (f < 3000000) return '中级KOL';
-    return '头部KOL';
-  }
+  if (st === 'pgc') return kolIdentityLabel(fans);
   return '未判定';
 }
 
@@ -156,12 +170,13 @@ function identityWhereClause(reqIdentity) {
     .map((s) => String(s).trim()).filter(Boolean);
   const brand = `(COALESCE(r.author_name,'') ~* '${BRAND_MODEL_RE.source}')`;
   const dealerName = `(COALESCE(r.author_name,'') ~* '${DEALER_NAME_RE.source}')`;
+  const noOverride = `(COALESCE(r.identity_override, '') = '')`;
   const SQL = {
-    dealer: `((${brand} AND (${dealerName} OR r.source_type = 'dealer')) OR (NOT ${brand} AND r.source_type = 'dealer'))`,
-    koe: `((${brand} AND NOT (${dealerName} OR r.source_type = 'dealer')) OR (NOT ${brand} AND r.source_type = 'employee'))`,
-    user: `(NOT ${brand} AND r.source_type = 'ugc')`,
-    kol: `(NOT ${brand} AND r.source_type = 'pgc')`,
-    other: `(NOT ${brand} AND r.source_type = 'other')`,
+    dealer: `(r.identity_override = 'dealer' OR (${noOverride} AND ((${brand} AND (${dealerName} OR r.source_type = 'dealer')) OR (NOT ${brand} AND r.source_type = 'dealer'))))`,
+    koe: `(r.identity_override = 'koe' OR (${noOverride} AND ((${brand} AND NOT (${dealerName} OR r.source_type = 'dealer')) OR (NOT ${brand} AND r.source_type = 'employee'))))`,
+    user: `(r.identity_override = 'user' OR (${noOverride} AND NOT ${brand} AND r.source_type = 'ugc'))`,
+    kol: `(r.identity_override = 'kol' OR (${noOverride} AND NOT ${brand} AND r.source_type = 'pgc'))`,
+    other: `(r.identity_override = 'other' OR (${noOverride} AND NOT ${brand} AND r.source_type = 'other'))`,
   };
   const clauses = ids.map((id) => SQL[id]).filter(Boolean);
   return clauses.length ? ` AND (${clauses.join(' OR ')})` : '';
@@ -181,6 +196,14 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       page = 1,
       pageSize = 30,
     } = req.query;
+    const customTagFilter = normalizeCustomTagFilter(req.query.customTag, req.query.customTagMode);
+    if (!customTagFilter.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: customTagFilter.error,
+        message: customTagFilter.message,
+      });
+    }
     const params = [req.tenantId];
     let where = 'WHERE r.tenant_id = $1';
     if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
@@ -214,6 +237,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(captureKeywords);
       where += ` AND r.keyword = ANY($${params.length}::text[])`;
     }
+    where = appendCustomTagFilter(where, params, customTagFilter, 'r');
     where += identityWhereClause(req.query.identity);
     // 按采集时间(首次发现)区间导出/筛选,避免 Excel 越积越大;仅接受 YYYY-MM-DD
     const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || '')) ? req.query.dateFrom : '';
@@ -238,13 +262,14 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       SELECT
         r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
         r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.note_type,
-        r.publish_time, r.publish_location, r.blogger_profile_url,
+        r.publish_time, r.published_ts, r.publish_location, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,
         r.official_replied, r.official_response_status, r.negative_comment_count,
         r.latest_negative_comment_at, r.last_risk_reopened_at,
-        r.sentiment, r.category, r.source_type, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
-        r.ai_result, r.seen_count, r.created_at,
+        r.sentiment, r.category, r.source_type, r.identity_override, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
+        r.ai_result, r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
+        r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
         COALESCE(rt.owner_name, '') AS triage_owner_name,
@@ -293,6 +318,13 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
     const priority = req.body?.priority ? String(req.body.priority) : null;
     if (status !== null && !validateStatus(status)) {
       return res.status(400).json({ ok: false, error: 'invalid_status', message: '分诊状态无效' });
+    }
+    if (status === 'false_positive') {
+      return res.status(400).json({
+        ok: false,
+        error: 'false_positive_batch_not_allowed',
+        message: '误报必须逐条填写原因，不能批量操作',
+      });
     }
     if (priority !== null && !validatePriority(priority)) {
       return res.status(400).json({ ok: false, error: 'invalid_priority', message: '优先级无效' });
@@ -354,11 +386,71 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
       return res.status(400).json({ ok: false, error: 'invalid_priority', message: '优先级无效' });
     }
     const ownerName = Object.prototype.hasOwnProperty.call(body, 'ownerName') ? String(body.ownerName || '') : null;
-    const note = Object.prototype.hasOwnProperty.call(body, 'note') ? String(body.note || '') : null;
+    const requestedNote = Object.prototype.hasOwnProperty.call(body, 'note') ? String(body.note || '') : null;
+    let falsePositiveReason = '';
+    if (status === 'false_positive') {
+      if (req.actorType !== 'user' || !req.user) {
+        return res.status(403).json({
+          ok: false,
+          error: 'session_user_required',
+          message: '误报仅允许后台登录用户提交',
+        });
+      }
+      const reasonCandidate = String(body.reason ?? '').trim() || String(body.note ?? '').trim();
+      const checkedReason = normalizeFeedbackReason(reasonCandidate, { required: true });
+      if (!checkedReason.ok) {
+        return res.status(400).json({ ok: false, error: checkedReason.error, message: checkedReason.message });
+      }
+      falsePositiveReason = checkedReason.value;
+    }
+    const note = status === 'false_positive' ? falsePositiveReason : requestedNote;
 
     const result = await withTransaction(async tx => {
-      const record = await tx.queryOne('SELECT id FROM records WHERE id = $1 AND tenant_id = $2', [req.params.recordId, req.tenantId]);
+      const record = await tx.queryOne(
+        'SELECT * FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+        [req.params.recordId, req.tenantId],
+      );
       if (!record) return null;
+      const currentTriage = await tx.queryOne(
+        'SELECT * FROM record_triage WHERE tenant_id = $1 AND record_id = $2',
+        [req.tenantId, req.params.recordId],
+      );
+
+      let feedback = null;
+      if (status === 'false_positive') {
+        feedback = await tx.queryOne(`
+          SELECT *
+          FROM record_feedback
+          WHERE tenant_id = $1 AND record_id = $2
+            AND feedback_type = 'false_positive' AND review_status = 'pending'
+          ORDER BY submitted_at DESC
+          LIMIT 1
+        `, [req.tenantId, record.id]);
+        if (feedback) {
+          const err = new Error('该内容已有待复核误报');
+          err.code = 'pending_feedback_exists';
+          throw err;
+        }
+        feedback = await insertRecordFeedback(tx, {
+          tenantId: req.tenantId,
+          record,
+          triage: currentTriage,
+          feedbackType: 'false_positive',
+          reason: falsePositiveReason,
+          originalValues: {
+            triage_status: currentTriage?.status || 'unhandled',
+            triage_note: currentTriage?.note || '',
+          },
+          correctedValues: {
+            triage_status: 'false_positive',
+            triage_note: falsePositiveReason,
+          },
+          actorUserId: req.user.id,
+          actorName: req.actorName || req.user.name || req.user.email || '',
+        });
+      }
+      const triageNote = status === 'false_positive' ? feedback.reason : note;
+
       const triage = await tx.queryOne(`
         INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, note, updated_at)
         VALUES ($1, $2, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, COALESCE($6, ''), COALESCE($7, ''), now())
@@ -371,17 +463,32 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
           note = CASE WHEN $7::text IS NOT NULL THEN excluded.note ELSE record_triage.note END,
           updated_at = now()
         RETURNING *
-      `, [req.tenantId, req.params.recordId, status, priority, req.user?.id || null, ownerName, note]);
+      `, [req.tenantId, req.params.recordId, status, priority, req.user?.id || null, ownerName, triageNote]);
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1, $2, $3, $4, 'record.triage_updated', 'record', $5, $6::jsonb)
-      `, [req.tenantId, req.actorType || 'system', req.user?.id || req.authCode || '', req.user?.id || null, req.params.recordId, JSON.stringify({ status, priority })]);
-      return triage;
+      `, [
+        req.tenantId,
+        req.actorType || 'system',
+        req.user?.id || req.authCode || '',
+        req.user?.id || null,
+        req.params.recordId,
+        JSON.stringify({
+          status,
+          priority,
+          reason: status === 'false_positive' ? feedback.reason : '',
+          feedbackId: feedback?.id || null,
+        }),
+      ]);
+      return { triage, feedbackId: feedback?.id || null };
     });
 
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
-    return res.json({ ok: true, triage: result });
+    return res.json({ ok: true, ...result });
   } catch (err) {
+    if (err.code === 'pending_feedback_exists' || err.code === '23505') {
+      return res.status(409).json({ ok: false, error: 'pending_feedback_exists', message: '该内容已有待复核误报' });
+    }
     return next(err);
   }
 });
@@ -460,6 +567,14 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       keyword = '',
       queue = '',
     } = req.query;
+    const customTagFilter = normalizeCustomTagFilter(req.query.customTag, req.query.customTagMode);
+    if (!customTagFilter.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: customTagFilter.error,
+        message: customTagFilter.message,
+      });
+    }
     const params = [req.tenantId];
     let where = 'WHERE r.tenant_id = $1';
     if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
@@ -487,6 +602,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       params.push(captureKeywords);
       where += ` AND r.keyword = ANY($${params.length}::text[])`;
     }
+    where = appendCustomTagFilter(where, params, customTagFilter, 'r');
     where += identityWhereClause(req.query.identity);
     // 按采集时间(首次发现)区间导出/筛选,避免 Excel 越积越大;仅接受 YYYY-MM-DD
     const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || '')) ? req.query.dateFrom : '';
@@ -500,7 +616,8 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     const records = await queryAll(`
       SELECT
         r.keyword, r.platform, r.title, r.content, r.author_name, r.author_fans,
-        r.author_id, r.author_account_no, r.blogger_profile_url, r.note_type, r.source_type, r.url, r.external_id,
+        r.author_id, r.author_account_no, r.blogger_profile_url, r.note_type, r.source_type, r.identity_override,
+        r.url, r.external_id,
         COALESCE(
           NULLIF(r.payload->>'bloggerUserId',''), NULLIF(r.payload->>'redId',''),
           NULLIF(r.payload->>'douyinId',''), NULLIF(r.payload->>'bloggerId',''),
@@ -508,7 +625,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
           NULLIF(r.payload->'detailPayload'->>'douyinId',''), NULLIF(r.payload->'detailPayload'->>'bloggerId','')
         ) AS payload_account_no,
         r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
-        r.negative_comment_count, r.publish_time, r.publish_location, r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
+        r.negative_comment_count, r.publish_time, r.published_ts, r.publish_location,
+        r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
+        r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority
       FROM records r
@@ -527,7 +646,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       author_fans: r.author_fans,
       author_uid: platformUserId(r.author_id, r.blogger_profile_url, r.author_account_no, r.payload_account_no),
       blogger_url: r.blogger_profile_url || '',
-      identity: identityLabel(r.source_type, r.author_fans, r.author_name),
+      identity: identityLabel(r.source_type, r.author_fans, r.author_name, r.identity_override),
       note_type: NOTE_TYPE_CN[r.note_type] || '',
       url: postUrl(r),
       likes: r.likes,
@@ -536,6 +655,10 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       shares: r.shares,
       sentiment: SENTIMENT_CN[r.sentiment] || r.sentiment || '',
       category: CATEGORY_CN[r.category] || r.category || '',
+      custom_tags: (Array.isArray(r.custom_tags) ? r.custom_tags : [])
+        .map(tag => String(tag?.name || '').trim())
+        .filter(Boolean)
+        .join('、'),
       ai_summary: r.ai_summary,
       negative_comment_count: r.negative_comment_count,
       triage_status: TRIAGE_STATUS_CN[r.triage_status] || r.triage_status || '',
@@ -565,6 +688,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: '转发', key: 'shares', width: 8 },
       { header: '情感', key: 'sentiment', width: 8 },
       { header: '分类', key: 'category', width: 12 },
+      { header: '自定义标签', key: 'custom_tags', width: 28 },
       { header: 'AI摘要', key: 'ai_summary', width: 40 },
       { header: '负评数', key: 'negative_comment_count', width: 8 },
       { header: '处置状态', key: 'triage_status', width: 12 },

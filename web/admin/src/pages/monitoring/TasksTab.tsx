@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import { Loader2, Radar, Play, Target, Clock, AlertTriangle } from 'lucide-react'
+import { AlertTriangle, ArrowUpRight, Clock, Loader2, Play, Radar, Target } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatDate, platformName, formatNumber } from '@/lib/utils'
+import { formatDate, formatDateCompact, platformName, formatNumber } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge, StatusDot } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -19,6 +19,8 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
   const { canWrite } = useAuth()
   const [subs, setSubs] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [runningId, setRunningId] = useState('')
+  const [actionError, setActionError] = useState('')
 
   const load = async () => {
     setLoading(true)
@@ -30,17 +32,46 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
   useEffect(() => { load() }, [])
 
   const runNow = async (id: string) => {
-    await api.post('/monitor/run-now', { subscriptionId: id })
-    load()
+    setRunningId(id)
+    setActionError('')
+    try {
+      await api.post('/monitor/run-now', { subscriptionId: id })
+      await load()
+    } catch {
+      setActionError('执行失败，请稍后重试')
+    } finally {
+      setRunningId('')
+    }
   }
 
   const active = subs.filter(s => s.status === 'active').length
-  const errored = subs.filter(s => (s.last_error || '').trim()).length
+  const errored = subs.filter(s => String(s.last_error || s.lastError || '').trim()).length
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
-      {/* Stats 头部 */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      {/* 手机端是“值守概览”，桌面继续保留原统计条。 */}
+      <section className="relative overflow-hidden rounded-[22px] border border-border/70 bg-card px-5 py-4 shadow-sm lg:hidden">
+        <span className={`absolute inset-y-0 left-0 w-1 ${loading ? 'bg-primary' : errored > 0 ? 'bg-status-red' : 'bg-status-green'}`} />
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-[11px] font-semibold tracking-[0.16em] text-muted-foreground">监控值守</div>
+            <div className="mt-1.5 text-[22px] font-bold leading-tight text-foreground">
+              {loading ? '正在读取监控状态' : errored > 0 ? `${errored} 个关注对象需处理` : '所有关注对象运行正常'}
+            </div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">{loading ? '正在同步最新运行结果' : '先处理异常，再检查最新命中'}</div>
+          </div>
+          <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl ${loading ? 'bg-primary/10 text-primary' : errored > 0 ? 'bg-status-red/12 text-status-red' : 'bg-status-green/12 text-status-green'}`}>
+            {loading ? <Loader2 className="h-5 w-5 animate-spin" /> : errored > 0 ? <AlertTriangle className="h-5 w-5" /> : <Radar className="h-5 w-5" />}
+          </div>
+        </div>
+        <div className="mt-4 grid grid-cols-3 divide-x divide-border/70 border-t border-border/60 pt-3">
+          <MobileStat label="关注" value={loading ? '—' : formatNumber(subs.length)} />
+          <MobileStat label="运行中" value={loading ? '—' : formatNumber(active)} tone={loading ? undefined : 'text-status-green'} />
+          <MobileStat label="异常" value={loading ? '—' : formatNumber(errored)} tone={!loading && errored > 0 ? 'text-status-red' : undefined} />
+        </div>
+      </section>
+
+      <div className="hidden flex-wrap items-center justify-between gap-3 lg:flex">
         <div className="flex flex-wrap gap-3">
           <Stat label="关注博主" value={formatNumber(subs.length)} icon={Radar} />
           <Stat label="运行中" value={formatNumber(active)} icon={Clock} tone="green" />
@@ -49,13 +80,102 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
         <span className="text-[12px] text-muted-foreground">在扩展「对标监控」里把竞品博主纳入监控,这里查看并执行扫描</span>
       </div>
 
+      <p className="px-1 text-xs leading-5 text-muted-foreground lg:hidden">关注对象由扩展「对标监控」添加；这里负责值守、立即扫描和查看命中。</p>
+
+      {actionError && (
+        <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm font-medium text-status-red">
+          {actionError}
+        </div>
+      )}
+
       {loading ? (
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
       ) : subs.length === 0 ? (
         <EmptyState icon={Radar} title="暂无监控账号" description="在扩展「对标监控」标签把竞品博主纳入监控,即可在此查看与执行" />
       ) : (
-        <WorkbenchTableShell>
-          <table className="w-full text-sm">
+        <>
+          <div className="space-y-3 lg:hidden">
+            {subs.map(s => {
+              const err = String(s.last_error || s.lastError || '').trim()
+              const accountUrl = s.account_url || s.accountUrl
+              const isRunning = runningId === s.id
+              return (
+                <article key={s.id} className="relative overflow-hidden rounded-[20px] border border-border/70 bg-card shadow-sm">
+                  <span className={`absolute inset-y-0 left-0 w-1 ${err ? 'bg-status-red' : s.status === 'active' ? 'bg-status-green' : 'bg-muted-foreground/40'}`} />
+                  <div className="px-5 pb-4 pt-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <StatusBadge tone="neutral">{platformName(s.platform)}</StatusBadge>
+                          {err
+                            ? <StatusDot tone="negative">异常</StatusDot>
+                            : s.status === 'active'
+                              ? <StatusDot tone="active">运行中</StatusDot>
+                              : <StatusDot tone="muted">{s.status === 'paused' ? '已暂停' : s.status}</StatusDot>}
+                        </div>
+                        <h3 className="mt-2.5 truncate text-[17px] font-bold leading-6 text-foreground">{s.name || s.bloggerName || '博主'}</h3>
+                        <div className="mt-1 truncate text-xs text-muted-foreground">{s.platformBloggerId || s.keyword || '未记录账号 ID'}</div>
+                      </div>
+                      {accountUrl && (
+                        <a
+                          href={accountUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label={`打开${s.name || '博主'}主页`}
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-background text-primary transition-colors active:bg-muted"
+                        >
+                          <ArrowUpRight className="h-4 w-4" />
+                        </a>
+                      )}
+                    </div>
+
+                    {err && (
+                      <div className="mt-3 rounded-xl bg-status-red/8 px-3.5 py-3 text-xs leading-5 text-status-red">
+                        <div className="mb-0.5 font-semibold">最近一次扫描异常</div>
+                        <div className="line-clamp-2">{err}</div>
+                      </div>
+                    )}
+
+                    <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-y border-border/60 py-3">
+                      <div>
+                        <dt className="text-[10px] font-semibold tracking-wide text-muted-foreground">扫描频率</dt>
+                        <dd className="mt-1 text-[13px] font-semibold text-foreground">{formatCadence(s.cadence_minutes ?? s.cadenceMinutes)}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-[10px] font-semibold tracking-wide text-muted-foreground">最近运行</dt>
+                        <dd className="mt-1 text-[13px] font-semibold text-foreground">{formatDate(s.last_run_at || s.lastRunAt) || '—'}</dd>
+                      </div>
+                      <div className="col-span-2 flex items-center justify-between gap-3">
+                        <dt className="text-[10px] font-semibold tracking-wide text-muted-foreground">下次计划</dt>
+                        <dd className="text-[12px] font-medium text-foreground">{formatDateCompact(s.next_run_at || s.nextRunAt) || '—'}</dd>
+                      </div>
+                    </dl>
+
+                    <div className={`mt-4 grid gap-2.5 ${onViewHits ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                      {onViewHits ? (
+                        <Button variant="outline" size="sm" className="w-full" onClick={() => onViewHits(s.id)}>
+                          <Target className="h-4 w-4" /> 查看命中
+                        </Button>
+                      ) : null}
+                      <Button
+                        size="sm"
+                        className="w-full"
+                        onClick={() => runNow(s.id)}
+                        disabled={!canWrite() || isRunning}
+                      >
+                        {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                        {isRunning ? '正在执行' : '立即扫描'}
+                      </Button>
+                    </div>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+
+          <div className="hidden lg:block">
+            <WorkbenchTableShell>
+              <table className="w-full min-w-[760px] text-sm">
             <thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">博主</th>
               <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">平台</th>
@@ -66,7 +186,7 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
             </tr></thead>
             <tbody className="divide-y divide-border/40">
               {subs.map(s => {
-                const err = (s.last_error || '').trim()
+                const err = String(s.last_error || s.lastError || '').trim()
                 return (
                   <tr key={s.id} className="align-top transition-colors hover:bg-accent/45">
                     <td className="px-4 py-3">
@@ -96,8 +216,8 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                             <Target className="h-3.5 w-3.5" /> 命中
                           </Button>
                         )}
-                        <Button variant="outline" size="sm" onClick={() => runNow(s.id)} disabled={!canWrite()}>
-                          <Play className="h-3.5 w-3.5" /> 立即执行
+                        <Button variant="outline" size="sm" onClick={() => runNow(s.id)} disabled={!canWrite() || runningId === s.id}>
+                          {runningId === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} 立即执行
                         </Button>
                       </div>
                     </td>
@@ -105,9 +225,20 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                 )
               })}
             </tbody>
-          </table>
-        </WorkbenchTableShell>
+              </table>
+            </WorkbenchTableShell>
+          </div>
+        </>
       )}
+    </div>
+  )
+}
+
+function MobileStat({ label, value, tone = 'text-foreground' }: { label: string; value: string; tone?: string }) {
+  return (
+    <div className="px-3 first:pl-0 last:pr-0">
+      <div className={`text-lg font-bold leading-none tabular-nums ${tone}`}>{value}</div>
+      <div className="mt-1.5 text-[10px] font-medium text-muted-foreground">{label}</div>
     </div>
   )
 }

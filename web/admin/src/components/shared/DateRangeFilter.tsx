@@ -55,14 +55,14 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange }: {
   return (
     <div className="relative" ref={ref}>
       <button type="button" onClick={() => setOpen(o => !o)}
-        className={cn('inline-flex h-8 items-center gap-1 rounded-lg border border-transparent bg-muted px-2.5 text-[12px] font-medium transition-colors hover:bg-muted/70',
+        className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
           active ? 'text-primary' : 'text-muted-foreground')}>
         <CalendarRange className="h-3.5 w-3.5" />
         {label}
         <ChevronDown className="h-3 w-3" />
       </button>
       {open && (
-        <div className="absolute left-0 top-full z-30 mt-1.5 w-[264px] rounded-xl border border-border bg-card p-3.5 shadow-lg">
+        <div className="responsive-filter-popover absolute left-0 top-full z-50 mt-1.5 w-[264px] rounded-xl border border-border bg-card p-3.5 shadow-lg lg:z-30">
           <div className="mb-3 flex h-7 items-center rounded-lg bg-muted p-0.5">
             {BASIS_ORDER.map(([v, l]) => (
               <button key={v} type="button" onClick={() => onBasisChange(v)}
@@ -84,12 +84,12 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange }: {
             <label className="flex items-center gap-2.5">
               <span className="w-7 shrink-0 text-[11px] text-muted-foreground">开始</span>
               <input type="date" value={from} max={to || undefined} onChange={e => onChange(e.target.value, to)}
-                className="h-8 min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus:border-primary" />
+                className="h-10 min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus:border-primary lg:h-8" />
             </label>
             <label className="flex items-center gap-2.5">
               <span className="w-7 shrink-0 text-[11px] text-muted-foreground">结束</span>
               <input type="date" value={to} min={from || undefined} onChange={e => onChange(from, e.target.value)}
-                className="h-8 min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus:border-primary" />
+                className="h-10 min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none transition-colors focus:border-primary lg:h-8" />
             </label>
           </div>
           {active && (

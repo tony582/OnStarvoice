@@ -62,12 +62,13 @@ function KeywordDrawer({ row, onClose }: { row: any; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
       <div className="absolute inset-0 bg-black/35" />
-      <div className="relative z-10 flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200" onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-border px-6 py-4">
+      <div role="dialog" aria-modal="true" aria-label="扩词分析"
+        className="relative z-10 flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-border px-4 py-4 sm:px-6">
           <h2 className="text-base font-bold">扩词分析 · {row.seed_keyword}</h2>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          <button onClick={onClose} aria-label="关闭扩词分析" className="rounded-lg p-2 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
         </div>
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto overscroll-contain p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-6">
           {data.summary && <div className="mb-5 rounded-lg border border-border bg-muted/30 p-4 text-sm leading-relaxed text-muted-foreground">{data.summary}</div>}
           <div className="space-y-4">
             {cats.map((c: any, i: number) => (

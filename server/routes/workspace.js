@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import { queryAll, queryOne } from '../db/init.js';
 import { requireTenantAccess } from '../middleware/auth.js';
+import { customTagsSelectSql } from '../services/record-custom-tags.js';
 import { applyResolvedMetrics } from '../utils/metrics.js';
 import { ACTIVE_QUEUE_CONDITION } from './triage.js';
 
 const router = Router();
 
-// 侧边栏徽标计数:4 个轻量 COUNT,单次往返。triagePending 与收件箱「待处理队列」同条件。
+// 侧边栏徽标计数:单次往返。triagePending 与收件箱「待处理队列」同条件。
 router.get('/badges', requireTenantAccess, async (req, res, next) => {
   try {
     const row = await queryOne(`
@@ -20,7 +21,8 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
         (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention,
         (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')) AS tickets_pending,
-        (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review') AS tickets_feedback
+        (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review') AS tickets_feedback,
+        (SELECT COUNT(*) FROM record_feedback WHERE tenant_id = $1 AND review_status = 'pending') AS feedback_pending
     `, [req.tenantId]);
 
     return res.json({
@@ -32,6 +34,7 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         monitorAttention: Number(row?.monitor_attention || 0),
         ticketsPending: Number(row?.tickets_pending || 0),
         ticketsFeedback: Number(row?.tickets_feedback || 0),
+        feedbackPending: Number(row?.feedback_pending || 0),
       },
       generatedAt: new Date().toISOString(),
     });
@@ -168,6 +171,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     const pendingRecords = await queryAll(`
       SELECT r.id, r.platform, r.title, r.content, r.author_name, r.url, r.likes, r.comments_count,
         r.collects, r.shares, r.sentiment, r.category, r.last_seen_at,
+        ${customTagsSelectSql('r')} AS custom_tags,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
         (SELECT COUNT(*) FROM alerts a WHERE a.record_id = r.id AND a.tenant_id = r.tenant_id) AS alert_count

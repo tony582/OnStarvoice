@@ -290,6 +290,74 @@
         });
       }
 
+      async function replaceTab({removedTabId, addedTabId} = {}) {
+        return enqueue(async () => {
+          const oldTabId = normalizeTabId(removedTabId);
+          const newTabId = normalizeTabId(addedTabId);
+          if (!oldTabId || !newTabId || oldTabId === newTabId) {
+            return {replaced: false, reason: "invalid_tab"};
+          }
+
+          for (const group of groupsByTaskId.values()) {
+            const sourceReplacement = group.sourceTabId === oldTabId;
+            const workerReplacement = group.workerTabIds.includes(oldTabId);
+            if (!sourceReplacement && !workerReplacement) continue;
+
+            let replacementTab;
+            try {
+              replacementTab = await tabsApi.get(newTabId);
+            } catch (error) {
+              throw createError(
+                "capture_replacement_tab_missing",
+                "找不到浏览器替换后的采集页面",
+                error,
+              );
+            }
+            if (
+              group.windowId !== null &&
+              Number.isSafeInteger(replacementTab?.windowId) &&
+              replacementTab.windowId !== group.windowId
+            ) {
+              throw createError(
+                "capture_replacement_window_mismatch",
+                "浏览器替换后的采集页面不在原任务窗口",
+              );
+            }
+
+            try {
+              await tabsApi.group({
+                groupId: group.groupId,
+                tabIds: [newTabId],
+              });
+            } catch (error) {
+              throw createError(
+                "capture_replacement_group_failed",
+                "无法把浏览器替换后的页面保留在采集标签组",
+                error,
+              );
+            }
+
+            if (sourceReplacement) {
+              group.sourceTabId = newTabId;
+            } else {
+              group.workerTabIds = Array.from(
+                new Set(
+                  group.workerTabIds.map((workerTabId) =>
+                    workerTabId === oldTabId ? newTabId : workerTabId,
+                  ),
+                ),
+              ).filter((workerTabId) => workerTabId !== group.sourceTabId);
+            }
+            return {
+              replaced: true,
+              role: sourceReplacement ? "source" : "worker",
+              group: publicTaskGroup(group),
+            };
+          }
+          return {replaced: false, reason: "not_tracked"};
+        });
+      }
+
       async function end({taskId, reason = "capture_task_finished"} = {}) {
         return enqueue(async () => {
           const normalizedTaskId = cleanText(taskId, 320);
@@ -339,6 +407,7 @@
         begin,
         register,
         unregister,
+        replaceTab,
         end,
         handleTabRemoved,
         getTask(taskId) {

@@ -10,7 +10,6 @@
 import { PAGE_TYPE, SYNC_TYPE } from "../constants.js";
 import {
   parseInteractionCount,
-  normalizeDate,
   cleanText,
   extractBloggerId,
   extractNoteId,
@@ -416,6 +415,7 @@ function buildVideoSelectionContext({
 function buildPayloadFromApiDetail(detail, noteId) {
   const stats = (detail.statistics && typeof detail.statistics === "object")
     ? detail.statistics : {};
+  const commentsCountKnown = hasExplicitDouyinApiCommentCount(detail);
   const video = (detail.video && typeof detail.video === "object")
     ? detail.video : {};
   const author = (detail.author && typeof detail.author === "object")
@@ -485,7 +485,8 @@ function buildPayloadFromApiDetail(detail, noteId) {
     tags,
     likes: stats.digg_count ?? null,
     collects: stats.collect_count ?? null,
-    comments: stats.comment_count ?? null,
+    comments: commentsCountKnown ? stats.comment_count : null,
+    commentsCountKnown,
     shares: stats.share_count ?? null,
     publishTimestamp,
     publishTime: lastEditedAt || "",
@@ -760,10 +761,24 @@ export async function captureDouyinSingleNote({
     assertNoCaptchaPage();
     await ensureDetailPageReady(DOUYIN_DOM_PROFILE, { timeout: 10000 });
 
-    const detailRoot = resolveActiveDouyinDetailRoot();
-    const noteId = resolveDouyinNoteId(detailRoot);
+    const detailRoot = resolveActiveDouyinDetailRoot(urlNoteId);
+    if (!detailRoot) {
+      const error = new Error(
+        "抖音搜索页未真正打开目标作品详情，正在切换备用作品入口",
+      );
+      error.code = "DOUYIN_DETAIL_NOT_READY";
+      throw error;
+    }
+    const noteId = resolveDouyinNoteId(detailRoot, urlNoteId);
     if (!noteId) {
       throw new Error("无法识别当前抖音作品 ID");
+    }
+    if (urlNoteId && String(noteId) !== String(urlNoteId)) {
+      const error = new Error(
+        `抖音详情作品不匹配：目标 ${urlNoteId}，实际 ${noteId}`,
+      );
+      error.code = "DOUYIN_DETAIL_ID_MISMATCH";
+      throw error;
     }
     const noteUrl = resolveDouyinNoteUrl(detailRoot, noteId);
     await waitForDouyinMediaBootstrap(noteId, noteUrl);
@@ -771,7 +786,9 @@ export async function captureDouyinSingleNote({
     const authorInfo = extractDouyinAuthorInfo(detailRoot);
     const title = extractDouyinTitle(detailRoot);
     const tags = extractDouyinTags(detailRoot, title);
-    const interactions = extractDouyinInteractions(detailRoot);
+    const interactions = extractDouyinInteractions(detailRoot, {
+      apiDetail: readDouyinApiCache(noteId),
+    });
     let bloggerMetrics = normalizeDouyinBloggerMetrics({});
     if (includeBloggerMetrics) {
       bloggerMetrics = resolveDouyinNoteBloggerMetrics({
@@ -785,9 +802,11 @@ export async function captureDouyinSingleNote({
         preferWorksTabForBloggerMetrics,
       });
     }
-    const publishText = extractDouyinPublishText(detailRoot);
     // 优先用拦截到的 API create_time(最可靠的发布时间戳),DOM 文本兜底。本 fork 自加。
     const apiCreateTime = readDouyinApiCache(noteId)?.create_time;
+    const publishText = apiCreateTime
+      ? ""
+      : await waitForDouyinPublishText(detailRoot, 1800, noteId);
     const resolvedPublishText = apiCreateTime
       ? new Date(Number(apiCreateTime) * 1000).toISOString()
       : publishText;
@@ -811,7 +830,8 @@ export async function captureDouyinSingleNote({
         attempt += 1
       ) {
         await wait(400);
-        const refreshedRoot = resolveActiveDouyinDetailRoot();
+        const refreshedRoot = resolveActiveDouyinDetailRoot(noteId);
+        if (!refreshedRoot) break;
         media = extractDouyinMedia(refreshedRoot, noteId, {
           apiDetail: retryApiDetail,
         });
@@ -850,6 +870,7 @@ export async function captureDouyinSingleNote({
       likes: interactions.likes,
       collects: interactions.collects,
       comments: interactions.comments,
+      commentsCountKnown: interactions.commentsCountKnown,
       shares: interactions.shares,
       publishTime: resolvedPublishText,
       publishDateRaw: resolvedPublishText,
@@ -906,7 +927,7 @@ export async function captureDouyinSingleNote({
         captureFinishedAt: new Date().toISOString(),
       },
       error: {
-        code: "CAPTURE_FAILED",
+        code: String(error?.code || "CAPTURE_FAILED"),
         message: error.message,
       },
     };
@@ -921,24 +942,62 @@ function assertNoCaptchaPage() {
   }
 }
 
-function resolveDouyinNoteId(detailRoot) {
-  // 1. 最高优先级：从当前 URL 强行提取（包括 modal_id）
-  const fromUrl = extractNoteId(window.location.href);
-  if (fromUrl) return fromUrl;
+function normalizeDouyinNumericNoteId(value) {
+  const normalized = String(value || "").trim();
+  if (/^\d{8,}$/.test(normalized)) {
+    return normalized;
+  }
+  const match = normalized.match(/(?:^|[_-])(\d{8,})(?:$|[_-])/);
+  return match?.[1] || "";
+}
 
-  const modalId = new URL(window.location.href).searchParams.get("modal_id");
-  if (modalId) return modalId;
+export function resolveDouyinNoteId(detailRoot, expectedNoteId = "") {
+  const normalizedExpectedNoteId =
+    normalizeDouyinNumericNoteId(expectedNoteId);
+  if (normalizedExpectedNoteId && detailRoot?.querySelector) {
+    const exactSelector = [
+      `[data-e2e-aweme-id="${normalizedExpectedNoteId}"]`,
+      `[data-aweme-id="${normalizedExpectedNoteId}"]`,
+      `[data-awemeid="${normalizedExpectedNoteId}"]`,
+      `[data-item-id="${normalizedExpectedNoteId}"]`,
+    ].join(",");
+    if (detailRoot.matches?.(exactSelector) || detailRoot.querySelector(exactSelector)) {
+      return normalizedExpectedNoteId;
+    }
+  }
 
-  // 2. 其次：尝试从传递进来的 detailRoot 取（前提是 root 找得对）
-  const rootAwemeId = String(detailRoot?.getAttribute?.("data-e2e-aweme-id") || "").trim();
-  if (rootAwemeId) return rootAwemeId;
+  const rootAttributeCandidates = [
+    detailRoot?.getAttribute?.("data-e2e-aweme-id"),
+    detailRoot?.getAttribute?.("data-aweme-id"),
+    detailRoot?.getAttribute?.("data-awemeid"),
+    detailRoot?.getAttribute?.("data-item-id"),
+  ];
+  for (const candidate of rootAttributeCandidates) {
+    const normalized = normalizeDouyinNumericNoteId(candidate);
+    if (normalized) return normalized;
+  }
 
-  const awemeId = getAttribute(
-    DOUYIN_DOM_PROFILE.noteDetail.fields.noteId,
-    "data-e2e-aweme-id",
-    detailRoot,
-  );
-  if (awemeId) return awemeId;
+  const noteIdSelectors = [
+    ...DOUYIN_DOM_PROFILE.noteDetail.fields.noteId,
+    "[data-aweme-id]",
+    "[data-awemeid]",
+    "[data-item-id]",
+  ];
+  for (const selector of noteIdSelectors) {
+    const node = detailRoot?.querySelector?.(selector);
+    if (!node) continue;
+    for (const attribute of [
+      "data-e2e-aweme-id",
+      "data-aweme-id",
+      "data-awemeid",
+      "data-item-id",
+    ]) {
+      const normalized = normalizeDouyinNumericNoteId(
+        node.getAttribute?.(attribute),
+      );
+      if (normalized) return normalized;
+    }
+  }
 
   const detailHref = getAttribute(
     ['a[href*="/video/"]', 'a[href*="/note/"]'],
@@ -956,6 +1015,15 @@ function resolveDouyinNoteId(detailRoot) {
     "";
   const fromVideoUrl = extractNoteId(String(sourceUrl || ""));
   if (fromVideoUrl) return fromVideoUrl;
+
+  const currentUrl = String(window.location.href || "");
+  const directRouteId = currentUrl.match(
+    /\/(?:video|note)\/(\d{8,})/i,
+  )?.[1];
+  if (directRouteId) return directRouteId;
+
+  const modalId = new URL(currentUrl).searchParams.get("modal_id");
+  if (modalId) return normalizeDouyinNumericNoteId(modalId);
 
   return "";
 }
@@ -1071,48 +1139,144 @@ function hasReadyVideoElement(noteId = "") {
   return false;
 }
 
-function resolveActiveDouyinDetailRoot() {
-  const fallbackRoot = resolveDetailRoot(DOUYIN_DOM_PROFILE);
-  
-  // 1. 最高优先级：如果出现弹窗，且弹窗里有活跃视频，那绝对是当前观看的实体
-  const activeVideo = pickActiveDouyinVideoElement();
-  if (activeVideo) {
-     const modalRoot = activeVideo.closest('[role="dialog"]') || activeVideo.closest('[class*="Modal"]') || activeVideo.closest('[class*="modal"]');
-     if (modalRoot && isMeaningfulDouyinDetailRoot(modalRoot)) {
-       return modalRoot;
-     }
-     
-     const swiperRoot = activeVideo.closest('.swiper-slide-active');
-     if (swiperRoot && isMeaningfulDouyinDetailRoot(swiperRoot)) {
-       return swiperRoot;
-     }
+function expandDouyinDetailAnchor(anchorNode) {
+  if (!(anchorNode instanceof Element)) return null;
+  const modalRoot =
+    anchorNode.closest('[role="dialog"]') ||
+    anchorNode.closest('[class*="Modal"]') ||
+    anchorNode.closest('[class*="modal"]') ||
+    anchorNode.closest(".focusPanel") ||
+    anchorNode.closest('[class*="focusPanel"]');
+  const activeSlide = anchorNode.closest(".swiper-slide-active");
+  if (activeSlide && (!modalRoot || modalRoot.contains(activeSlide))) {
+    return activeSlide;
+  }
+  return (
+    modalRoot ||
+    activeSlide ||
+    anchorNode.closest(".swiper-slide") ||
+    anchorNode.parentElement?.parentElement ||
+    anchorNode
+  );
+}
+
+function findDouyinTargetBoundModalRoot(noteId) {
+  const normalizedNoteId = normalizeDouyinNumericNoteId(noteId);
+  if (!normalizedNoteId) return null;
+  const exactSelector = [
+    `[data-e2e-aweme-id="${normalizedNoteId}"]`,
+    `[data-aweme-id="${normalizedNoteId}"]`,
+    `[data-awemeid="${normalizedNoteId}"]`,
+    `[data-item-id="${normalizedNoteId}"]`,
+  ].join(",");
+  const modalBoundarySelector = [
+    '[role="dialog"]',
+    '[class*="Modal"]',
+    '[class*="modal"]',
+    ".focusPanel",
+    '[class*="focusPanel"]',
+  ].join(",");
+  const exactNodes = Array.from(document.querySelectorAll(exactSelector));
+  for (const node of exactNodes) {
+    const modalRoot = node.closest?.(modalBoundarySelector);
+    if (modalRoot && isElementVisible(modalRoot)) {
+      return expandDouyinDetailAnchor(node) || modalRoot;
+    }
   }
 
-  // 2. 其次锚点：从 URL 获取明确的视频 ID 并去匹配
-  const realNoteId = extractNoteId(window.location.href) || new URL(window.location.href).searchParams.get("modal_id");
+  for (const modalRoot of Array.from(
+    document.querySelectorAll(modalBoundarySelector),
+  )) {
+    if (!isElementVisible(modalRoot)) continue;
+    const linkedToTarget = Array.from(
+      modalRoot.querySelectorAll('a[href*="/video/"], a[href*="/note/"]'),
+    ).some(
+      (link) =>
+        extractNoteId(normalizeUrl(link.getAttribute?.("href") || "")) ===
+        normalizedNoteId,
+    );
+    if (linkedToTarget) return modalRoot;
+  }
+  return null;
+}
+
+function resolveActiveDouyinDetailRoot(expectedNoteId = "") {
+  const fallbackRoot = resolveDetailRoot(DOUYIN_DOM_PROFILE);
+  const currentUrl = String(window.location.href || "");
+  let modalId = "";
+  let currentPath = "";
+  try {
+    const parsed = new URL(currentUrl);
+    modalId = normalizeDouyinNumericNoteId(
+      parsed.searchParams.get("modal_id"),
+    );
+    currentPath = parsed.pathname;
+  } catch {}
+  const directRouteId = normalizeDouyinNumericNoteId(
+    currentPath.match(/\/(?:video|note)\/(\d{8,})/i)?.[1],
+  );
+  const realNoteId =
+    normalizeDouyinNumericNoteId(expectedNoteId) ||
+    directRouteId ||
+    modalId;
+  const isStrictSearchModalContext = Boolean(
+    realNoteId &&
+      modalId === realNoteId &&
+      /\/search\//i.test(currentPath),
+  );
+
+  if (isStrictSearchModalContext) {
+    return findDouyinTargetBoundModalRoot(realNoteId);
+  }
+
+  // 1. 先按当前 URL 的明确作品 ID 找根节点，避免推荐视频抢占当前详情。
   let anchorNode = null;
-  
   if (realNoteId) {
-    const perfectMatches = Array.from(document.querySelectorAll(`[data-e2e-aweme-id="${realNoteId}"]`));
+    const exactSelector = [
+      `[data-e2e-aweme-id="${realNoteId}"]`,
+      `[data-aweme-id="${realNoteId}"]`,
+      `[data-awemeid="${realNoteId}"]`,
+      `[data-item-id="${realNoteId}"]`,
+    ].join(",");
+    const perfectMatches = Array.from(
+      document.querySelectorAll(exactSelector),
+    );
     if (perfectMatches.length > 0) {
-      anchorNode = perfectMatches.find(n => n.closest('[role="dialog"]') || n.closest('[class*="Modal"]') || n.closest('[class*="modal"]')) 
-                || perfectMatches.find(n => n.closest('.swiper-slide-active')) 
-                || perfectMatches[0];
+      anchorNode =
+        perfectMatches.find(
+          (node) =>
+            node.closest('[role="dialog"]') ||
+            node.closest('[class*="Modal"]') ||
+            node.closest('[class*="modal"]') ||
+            node.closest(".focusPanel") ||
+            node.closest('[class*="focusPanel"]'),
+        ) ||
+        perfectMatches.find((node) => node.closest(".swiper-slide-active")) ||
+        perfectMatches[0];
     }
   }
 
   if (anchorNode) {
-     let expandedRoot = anchorNode.closest('.swiper-slide-active') || anchorNode.closest('.swiper-slide');
-     
-     if (!expandedRoot) {
-       expandedRoot = anchorNode.closest('[role="dialog"]') || anchorNode.closest('[class*="Modal"]') || anchorNode.closest('[class*="modal"]');
-     }
-     
-     if (!expandedRoot) {
-       expandedRoot = anchorNode.parentElement?.parentElement || anchorNode;
-     }
+    return expandDouyinDetailAnchor(anchorNode);
+  }
 
-     return expandedRoot;
+  // 2. 只有非搜索 modal 上下文才允许按活跃视频兜底。
+  const activeVideo = pickActiveDouyinVideoElement();
+  if (activeVideo) {
+    const modalRoot =
+      activeVideo.closest('[role="dialog"]') ||
+      activeVideo.closest('[class*="Modal"]') ||
+      activeVideo.closest('[class*="modal"]') ||
+      activeVideo.closest(".focusPanel") ||
+      activeVideo.closest('[class*="focusPanel"]');
+    if (modalRoot && isMeaningfulDouyinDetailRoot(modalRoot)) {
+      return modalRoot;
+    }
+
+    const swiperRoot = activeVideo.closest(".swiper-slide-active");
+    if (swiperRoot && isMeaningfulDouyinDetailRoot(swiperRoot)) {
+      return swiperRoot;
+    }
   }
 
   // 3. 回退方案
@@ -2411,13 +2575,101 @@ function extractDouyinTags(detailRoot, title = "") {
   return Array.from(new Set(tags));
 }
 
-function extractDouyinInteractions(detailRoot) {
+function parseExplicitDouyinCommentCount(value) {
+  if (value === undefined || value === null) return null;
+
+  const text = cleanText(String(value));
+  if (
+    !text ||
+    !/[0-9]/.test(text) ||
+    /加载中|正在加载|获取中|--|暂无数据/.test(text)
+  ) {
+    return null;
+  }
+
+  const parsed = parseDouyinCount(text);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function readExplicitDouyinApiCommentCount(detail) {
+  const stats = detail?.statistics;
+  if (
+    !stats ||
+    typeof stats !== "object" ||
+    !Object.prototype.hasOwnProperty.call(stats, "comment_count")
+  ) {
+    return null;
+  }
+  return parseExplicitDouyinCommentCount(stats.comment_count);
+}
+
+export function hasExplicitDouyinApiCommentCount(detail) {
+  return readExplicitDouyinApiCommentCount(detail) !== null;
+}
+
+function readDouyinCommentNodeText(node) {
+  if (!node) return "";
+  const parts = [node.textContent, node.innerText];
+  if (typeof node.getAttribute === "function") {
+    parts.push(node.getAttribute("aria-label"), node.getAttribute("title"));
+  }
+  return cleanText(parts.filter(Boolean).join(" "));
+}
+
+function hasExplicitDouyinEmptyCommentState(detailRoot) {
+  if (!detailRoot || typeof detailRoot.querySelectorAll !== "function") {
+    return false;
+  }
+
+  try {
+    const candidates = [
+      detailRoot,
+      ...detailRoot.querySelectorAll("div, span, p, button"),
+    ];
+    return candidates.some((node) => {
+      const text = cleanText(node?.textContent || node?.innerText || "");
+      return /^(暂无评论|还没有评论|暂时没有评论|抢首评|抢沙发)[。！!]*$/.test(
+        text,
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function resolveDouyinCommentCountEvidence({
+  commentNode = null,
+  apiDetail = null,
+  detailRoot = null,
+} = {}) {
+  const domCount = parseExplicitDouyinCommentCount(
+    readDouyinCommentNodeText(commentNode),
+  );
+  if (domCount !== null) {
+    return {count: domCount, known: true, source: "dom_count"};
+  }
+
+  const apiCount = readExplicitDouyinApiCommentCount(apiDetail);
+  if (apiCount !== null) {
+    return {count: apiCount, known: true, source: "api_statistics"};
+  }
+
+  if (hasExplicitDouyinEmptyCommentState(detailRoot)) {
+    return {count: 0, known: true, source: "dom_empty_state"};
+  }
+
+  return {count: null, known: false, source: "unknown"};
+}
+
+function extractDouyinInteractions(detailRoot, {apiDetail = null} = {}) {
+  let commentsNode = getFirstMatch(
+    DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.comments,
+    detailRoot,
+  );
   const likes = extractCountFromNode(
     getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.likes, detailRoot),
   );
-  const comments = extractCountFromNode(
-    getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.comments, detailRoot),
-  );
+  const comments = extractCountFromNode(commentsNode);
   const collects = extractCountFromNode(
     getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.collects, detailRoot),
   );
@@ -2425,36 +2677,50 @@ function extractDouyinInteractions(detailRoot) {
     getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.shares, detailRoot),
   );
 
-  if (likes || comments || collects || shares) {
-    return { likes, comments, collects, shares };
+  let interactions = {likes, comments, collects, shares};
+
+  if (!(likes || comments || collects || shares)) {
+    const fromBar = extractInteractionsFromHorizontalBar(detailRoot);
+    if (fromBar.likes || fromBar.comments || fromBar.collects || fromBar.shares) {
+      interactions = fromBar;
+    } else {
+      // Fallback: interaction buttons are often outside detailRoot on feed/profile pages
+      // 但不能是整个 document，否则有可能会取到背景里搜索列表的第一个结果
+      const docScope = detailRoot?.closest?.('.swiper-slide')
+                    || detailRoot?.closest?.('[role="dialog"]')
+                    || detailRoot?.closest?.('[class*="Modal"]')
+                    || detailRoot?.closest?.('[class*="modal"]')
+                    || detailRoot || document;
+      const fallbackCommentsNode = getFirstMatch(
+        DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.comments,
+        docScope,
+      );
+      commentsNode = fallbackCommentsNode || commentsNode;
+      interactions = {
+        likes: extractCountFromNode(
+          getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.likes, docScope),
+        ),
+        comments: extractCountFromNode(fallbackCommentsNode),
+        collects: extractCountFromNode(
+          getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.collects, docScope),
+        ),
+        shares: extractCountFromNode(
+          getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.shares, docScope),
+        ),
+      };
+    }
   }
 
-  const fromBar = extractInteractionsFromHorizontalBar(detailRoot);
-  if (fromBar.likes || fromBar.comments || fromBar.collects || fromBar.shares) {
-    return fromBar;
-  }
-
-  // Fallback: interaction buttons are often outside detailRoot on feed/profile pages
-  // 但不能是整个 document，否则有可能会取到背景里搜索列表的第一个结果
-  const docScope = detailRoot?.closest?.('.swiper-slide') 
-                || detailRoot?.closest?.('[role="dialog"]') 
-                || detailRoot?.closest?.('[class*="Modal"]') 
-                || detailRoot?.closest?.('[class*="modal"]') 
-                || detailRoot || document;
-                
-  const docLikes = extractCountFromNode(
-    getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.likes, docScope),
-  );
-  const docComments = extractCountFromNode(
-    getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.comments, docScope),
-  );
-  const docCollects = extractCountFromNode(
-    getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.collects, docScope),
-  );
-  const docShares = extractCountFromNode(
-    getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.interactions.shares, docScope),
-  );
-  return { likes: docLikes, comments: docComments, collects: docCollects, shares: docShares };
+  const evidence = resolveDouyinCommentCountEvidence({
+    commentNode: commentsNode,
+    apiDetail,
+    detailRoot,
+  });
+  return {
+    ...interactions,
+    comments: evidence.known ? evidence.count : interactions.comments,
+    commentsCountKnown: evidence.known,
+  };
 }
 
 function extractInteractionsFromHorizontalBar(detailRoot) {
@@ -2510,45 +2776,147 @@ function parseDouyinCount(text) {
 }
 
 function extractDouyinPublishText(detailRoot) {
-  const direct = cleanText(getText(DOUYIN_DOM_PROFILE.noteDetail.fields.publishTime, detailRoot));
+  const direct = extractDouyinPublishDateCandidate(
+    getText(DOUYIN_DOM_PROFILE.noteDetail.fields.publishTime, detailRoot),
+  );
   if (direct) return direct;
-  // 兜底(本 fork 自加;MediaClaw 合并上游时保留):抖音常改混淆类名 / 换 data-e2e,
-  // 这里按文本正则在详情根(退而 document)里找"发布时间:YYYY-MM-DD ...",不依赖易变的选择器。
-  const re = /发布时间[:：]\s*(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}[日]?(?:\s*\d{1,2}[:：]\d{2}(?::\d{2})?)?)/;
-  for (const scope of [detailRoot, document]) {
+  // 兜底：只在已经绑定到当前作品的详情根里找发布时间。搜索页 modal
+  // 未真正打开时，禁止退回整个 document，避免拾取其它卡片的日期。
+  const scopes = detailRoot ? [detailRoot] : [document];
+  for (const scope of scopes) {
     if (!scope) continue;
     const txt = String(scope.innerText || scope.textContent || "");
-    const m = txt.match(re);
-    if (m && m[1]) return cleanText(m[1]);
+    const labelMatch = txt.match(
+      /发布时间\s*[:：]?\s*(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}[日]?(?:\s*\d{1,2}[:：]\d{2}(?::\d{2})?)?)/,
+    );
+    const candidate = extractDouyinPublishDateCandidate(labelMatch?.[1] || "");
+    if (candidate) return candidate;
   }
   return "";
 }
 
-function normalizeDouyinPublishDate(text) {
-  const normalized = cleanText(text)
+async function waitForDouyinPublishText(
+  detailRoot,
+  timeoutMs = 1800,
+  noteId = "",
+) {
+  const startedAt = Date.now();
+  let resolvedRoot = detailRoot;
+  while (Date.now() - startedAt <= timeoutMs) {
+    const publishText = extractDouyinPublishText(resolvedRoot);
+    if (publishText) {
+      return publishText;
+    }
+    await wait(250);
+    resolvedRoot = resolveActiveDouyinDetailRoot(noteId) || resolvedRoot;
+  }
+  return "";
+}
+
+export function normalizeDouyinPublishDate(text, referenceDate = new Date()) {
+  const normalized = extractDouyinPublishDateCandidate(text)
     .replace(/^发布时间[:：]?/i, "")
     .replace(/^发布于[:：]?/i, "")
     .replace(/^·\s*/, "")
     .trim();
 
-  if (!normalized) {
-    return normalizeDate("");
+  if (!normalized) return "";
+
+  if (/^20\d{2}-\d{2}-\d{2}T/i.test(normalized)) {
+    const parsed = new Date(normalized);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : "";
   }
 
-  const fullDate = normalized.match(/(\d{4}-\d{1,2}-\d{1,2})/);
-  if (fullDate?.[1]) {
-    return normalizeDate(fullDate[1]);
+  const fullDate = normalized.match(
+    /(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?:\s+(\d{1,2})[:：](\d{2})(?::(\d{2}))?)?/,
+  );
+  if (fullDate) {
+    const year = Number(fullDate[1]);
+    const month = Number(fullDate[2]);
+    const day = Number(fullDate[3]);
+    if (!isValidDouyinPublishDate(year, month, day)) return "";
+    const date = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    if (!fullDate[4]) return date;
+    return `${date} ${String(fullDate[4]).padStart(2, "0")}:${fullDate[5]}:${fullDate[6] || "00"}`;
   }
 
-  const mdMatch = normalized.match(/(\d{1,2})月(\d{1,2})日/);
-  if (mdMatch?.[1] && mdMatch?.[2]) {
-    const now = new Date();
-    const month = String(mdMatch[1]).padStart(2, "0");
-    const day = String(mdMatch[2]).padStart(2, "0");
-    return `${now.getFullYear()}-${month}-${day}`;
+  const monthDay = normalized.match(/(\d{1,2})月(\d{1,2})日/);
+  if (monthDay) {
+    const reference =
+      referenceDate instanceof Date && Number.isFinite(referenceDate.getTime())
+        ? referenceDate
+        : new Date();
+    const month = Number(monthDay[1]);
+    const day = Number(monthDay[2]);
+    let year = reference.getFullYear();
+    const candidate = new Date(year, month - 1, day);
+    const tomorrow = new Date(reference.getTime());
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (candidate.getTime() > tomorrow.getTime()) {
+      year -= 1;
+    }
+    if (!isValidDouyinPublishDate(year, month, day)) return "";
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
   }
 
-  return normalizeDate(normalized);
+  return "";
+}
+
+export function extractDouyinPublishDateCandidate(raw) {
+  const normalized = cleanText(raw)
+    .replace(/^发布时间\s*[:：]?\s*/i, "")
+    .replace(/^发布于\s*[:：]?\s*/i, "")
+    .replace(/^·\s*/, "")
+    .trim();
+  if (!normalized) return "";
+
+  if (/^20\d{2}-\d{2}-\d{2}T/i.test(normalized)) {
+    const parsed = new Date(normalized);
+    return Number.isFinite(parsed.getTime()) ? normalized : "";
+  }
+
+  const fullDate = normalized.match(
+    /(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?:\s+\d{1,2}[:：]\d{2}(?::\d{2})?)?/,
+  );
+  if (
+    fullDate &&
+    isValidDouyinPublishDate(
+      Number(fullDate[1]),
+      Number(fullDate[2]),
+      Number(fullDate[3]),
+    )
+  ) {
+    return fullDate[0];
+  }
+
+  const monthDay = normalized.match(/(\d{1,2})月(\d{1,2})日/);
+  if (
+    monthDay &&
+    isValidDouyinPublishDate(
+      new Date().getFullYear(),
+      Number(monthDay[1]),
+      Number(monthDay[2]),
+    )
+  ) {
+    return monthDay[0];
+  }
+
+  return "";
+}
+
+function isValidDouyinPublishDate(year, month, day) {
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    year < 2000 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1
+  ) {
+    return false;
+  }
+  return day <= new Date(year, month, 0).getDate();
 }
 
 function extractDouyinMedia(detailRoot, noteId = "", options = {}) {
@@ -2720,7 +3088,7 @@ function supplementDouyinImageNotePayload(payload, noteId = "", apiDetail = null
 
   let detailRoot = null;
   try {
-    detailRoot = resolveActiveDouyinDetailRoot();
+    detailRoot = resolveActiveDouyinDetailRoot(noteId);
   } catch {}
 
   const authorInfo = detailRoot ? extractDouyinAuthorInfo(detailRoot) : {name: "", userId: "", url: ""};
@@ -2922,7 +3290,11 @@ async function observeStableDouyinMedia(noteId = "", noteUrl = "") {
   const apiDetail = noteId ? readDouyinApiCache(noteId) : null;
 
   while (Date.now() - startedAt <= timeoutMs) {
-    const refreshedRoot = resolveActiveDouyinDetailRoot();
+    const refreshedRoot = resolveActiveDouyinDetailRoot(noteId);
+    if (!refreshedRoot) {
+      await wait(intervalMs);
+      continue;
+    }
     const snapshot = extractDouyinMedia(refreshedRoot, noteId, {
       silent: true,
       apiDetail,
@@ -2961,7 +3333,12 @@ async function observeStableDouyinMedia(noteId = "", noteUrl = "") {
   }
 
   if (!bestSnapshot) {
-    const fallbackRoot = resolveActiveDouyinDetailRoot();
+    const fallbackRoot = resolveActiveDouyinDetailRoot(noteId);
+    if (!fallbackRoot) {
+      const error = new Error("抖音目标作品详情已离开当前页面");
+      error.code = "DOUYIN_DETAIL_NOT_READY";
+      throw error;
+    }
     return extractDouyinMedia(fallbackRoot, noteId, {
       silent: true,
       apiDetail,

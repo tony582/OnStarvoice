@@ -2738,11 +2738,12 @@ function buildRecordStatusRows(record) {
     .map((statusRow) => {
       const mainText = statusRow?.text || "";
       const mainTextClass = statusRow?.textClass || "";
+      const rowClass = statusRow?.rowClass || "";
       const detail = String(statusRow?.detail || "").trim();
       const actions = statusRow?.actions || "";
 
       return `
-        <div class="comment-status-row">
+        <div class="comment-status-row ${rowClass}">
           <div class="comment-status-copy">
             <div class="comment-status-title ${mainTextClass}">${escapeHtml(mainText)}</div>
             ${
@@ -2844,6 +2845,75 @@ function resolveCommentStatusRow(record) {
   return {text, textClass, detail, actions};
 }
 
+function formatAiRelevanceConfidence(value) {
+  const confidence = Number(value);
+  if (!Number.isFinite(confidence) || confidence < 0) {
+    return "";
+  }
+  const percent = confidence <= 1 ? confidence * 100 : confidence;
+  return `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+}
+
+function resolveAiRelevanceFilteredStatus(payload = {}) {
+  const audit =
+    payload.aiRelevancePrefilter &&
+    typeof payload.aiRelevancePrefilter === "object"
+      ? payload.aiRelevancePrefilter
+      : {};
+  const detailStatus = String(payload.detailCaptureStatus || "")
+    .trim()
+    .toLowerCase();
+  const executionDisposition = String(audit.executionDisposition || "")
+    .trim()
+    .toLowerCase();
+  const modelExecutionDisposition = String(
+    audit.modelExecutionDisposition || "",
+  )
+    .trim()
+    .toLowerCase();
+  const modelDecision = String(audit.modelDecision || audit.decision || "")
+    .trim()
+    .toLowerCase();
+  const traceState = String(payload?.captureTrace?.state || "")
+    .trim()
+    .toLowerCase();
+  const hasAiSkipAudit =
+    executionDisposition === "skip_expensive" ||
+    (modelExecutionDisposition === "skip_full_capture" &&
+      modelDecision === "skip");
+  const aiFiltered =
+    detailStatus === "filtered" ||
+    hasAiSkipAudit ||
+    (traceState === "filtered" && modelDecision === "skip");
+
+  if (!aiFiltered) {
+    return traceState === "filtered"
+      ? {
+          text: "已过滤 · 已跳过采集增强",
+          detail: "该条不进入详情、评论和博主增强采集",
+          isAi: false,
+        }
+      : null;
+  }
+
+  const keyword = String(audit.keyword || payload.keyword || "").trim();
+  const confidence = formatAiRelevanceConfidence(audit.confidence);
+  const reason = String(audit.reason || "").trim();
+  const detail = [
+    keyword ? `关键词「${keyword}」` : "",
+    confidence ? `置信度 ${confidence}` : "",
+    reason ? `判断原因：${reason}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return {
+    text: "AI 已判定无关 · 已跳过增强",
+    detail: detail || "已保留列表结果，不再打开详情、评论和博主页面",
+    isAi: true,
+  };
+}
+
 function resolveDetailCaptureStatusRow(record) {
   if (record.type !== "blogger_notes" && record.type !== "keyword_notes") {
     return null;
@@ -2861,6 +2931,17 @@ function resolveDetailCaptureStatusRow(record) {
     .trim()
     .toLowerCase();
   const errorText = resolveDetailCaptureErrorText(payload);
+  const filteredStatus = resolveAiRelevanceFilteredStatus(payload);
+
+  if (filteredStatus) {
+    return {
+      text: filteredStatus.text,
+      textClass: filteredStatus.isAi ? "is-ai-filtered" : "is-filtered",
+      rowClass: filteredStatus.isAi ? "is-ai-filtered" : "is-filtered",
+      detail: filteredStatus.detail,
+      actions: "",
+    };
+  }
 
   if (
     status === "done" &&

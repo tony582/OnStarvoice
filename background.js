@@ -25,6 +25,7 @@ const STORAGE_KEYS = {
   unattendedKeywordRunRequest: 'onstarvoice.unattendedKeywordRunRequest',
   captureExecutionLock: 'onstarvoice.captureExecutionLock',
   taskLedger: 'onstarvoice.taskLedger',
+  syncHistory: 'onstarvoice.sync_history',
 };
 
 const DEFAULT_RUNTIME = {
@@ -57,6 +58,8 @@ const MAX_SCHEDULE_LOOKAHEAD_DAYS = 400;
 // 不会再留下最长 12 小时且界面不可见的“幽灵任务”。
 const CAPTURE_EXECUTION_LOCK_LEASE_MS = 2 * 60 * 1000;
 const CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION = 1;
+const TASK_LEDGER_STALE_ACTIVE_MS = 10 * 60 * 1000;
+const TASK_CENTER_RECENT_ACTIVITY_MS = 2 * 60 * 1000;
 const UNATTENDED_LOCK_RETRY_DELAY_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_CLAIM_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_RUN_ACTIVE_GRACE_MS = 3 * 60 * 1000;
@@ -271,23 +274,118 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
   if (!progress || typeof progress !== 'object') {
     return null;
   }
+  const optionalNumber = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
   const current = Number(progress.current);
   const total = Number(progress.total);
-  const round = Number(progress.round);
+  const round = optionalNumber(progress.round);
+  const roundCurrent = optionalNumber(progress.roundCurrent ?? progress.round);
+  const roundTotal = optionalNumber(progress.roundTotal);
+  const keywordCurrent = optionalNumber(progress.keywordCurrent);
+  const keywordTotal = optionalNumber(progress.keywordTotal);
+  const itemCurrent = optionalNumber(progress.itemCurrent);
+  const itemTotal = optionalNumber(progress.itemTotal);
+  const attemptCurrent = optionalNumber(
+    progress.attemptCurrent ?? progress.attempt,
+  );
+  const attemptTotal = optionalNumber(
+    progress.attemptTotal ?? progress.maxAttempts,
+  );
   const runnerTabId = Number(progress.runnerTabId);
   const remainingMs = Number(progress.remainingMs);
+  const numericProgressFields = [
+    'detectedCount',
+    'markedCount',
+    'filteredCount',
+    'collectedCount',
+    'savedCount',
+    'commentsCount',
+    'followersCount',
+    'bloggerFollowersCount',
+  ];
+  const normalizedCounts = numericProgressFields.reduce((result, field) => {
+    if (
+      progress[field] === null ||
+      progress[field] === undefined ||
+      progress[field] === ''
+    ) {
+      return result;
+    }
+    const value = Number(progress[field]);
+    if (Number.isFinite(value)) {
+      result[field] = value;
+    }
+    return result;
+  }, {});
+  const taskMeta =
+    progress.taskMeta &&
+    typeof progress.taskMeta === 'object' &&
+    !Array.isArray(progress.taskMeta)
+      ? {
+          keywordList: Array.isArray(progress.taskMeta.keywordList)
+            ? progress.taskMeta.keywordList
+                .map((keyword) => String(keyword || '').trim().slice(0, 120))
+                .filter(Boolean)
+                .slice(0, 30)
+            : [],
+          searchFilters:
+            progress.taskMeta.searchFilters &&
+            typeof progress.taskMeta.searchFilters === 'object'
+              ? Object.fromEntries(
+                  Object.entries(progress.taskMeta.searchFilters)
+                    .slice(0, 12)
+                    .map(([field, value]) => [
+                      String(field || '').slice(0, 40),
+                      String(value || '').slice(0, 80),
+                    ]),
+                )
+              : {},
+          enhancementEnabled: Boolean(progress.taskMeta.enhancementEnabled),
+          commentsEnabled: Boolean(progress.taskMeta.commentsEnabled),
+          bloggerMetricsEnabled: Boolean(progress.taskMeta.bloggerMetricsEnabled),
+        }
+      : null;
   return {
     current: Number.isFinite(current) ? current : 0,
     total: Number.isFinite(total) ? total : 0,
     keyword: String(progress.keyword || ''),
+    keywordCurrent: Number.isFinite(keywordCurrent) ? keywordCurrent : null,
+    keywordTotal: Number.isFinite(keywordTotal) ? keywordTotal : null,
+    itemCurrent: Number.isFinite(itemCurrent) ? itemCurrent : null,
+    itemTotal: Number.isFinite(itemTotal) ? itemTotal : null,
+    nextKeyword: String(progress.nextKeyword || ''),
+    runStartedAt: String(progress.runStartedAt || ''),
+    progressScope: String(progress.progressScope || ''),
     phase: String(progress.phase || ''),
-    round: Number.isFinite(round) ? round : null,
+    round,
+    roundCurrent,
+    roundTotal,
+    attemptCurrent,
+    attemptTotal,
     runnerTabId: Number.isFinite(runnerTabId) && runnerTabId > 0 ? runnerTabId : null,
     recordId: String(progress.recordId || ''),
     remainingMs: Number.isFinite(remainingMs) ? remainingMs : null,
     waitUntil: String(progress.waitUntil || ''),
     message: String(progress.message || fallbackMessage || ''),
+    phaseStartedAt: String(progress.phaseStartedAt || ''),
     updatedAt: String(progress.updatedAt || new Date().toISOString()),
+    workerMode: String(progress.workerMode || ''),
+    workerStates: Array.isArray(progress.workerStates)
+      ? progress.workerStates
+          .filter((worker) => worker && typeof worker === 'object')
+          .slice(0, 2)
+          .map((worker) => ({
+            id: String(worker.id || worker.key || ''),
+            label: String(worker.label || ''),
+            state: String(worker.state || ''),
+            detail: String(worker.detail || worker.message || ''),
+          }))
+      : [],
+    taskMeta,
+    ...normalizedCounts,
   };
 }
 
@@ -813,11 +911,33 @@ async function persistUnattendedRunMutation(
 
 async function readTaskLedger() {
   return await runTaskLedgerMutation(async () => {
-    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.taskLedger,
+      STORAGE_KEYS.unattendedKeywordRunRequest,
+    ]);
     const rawLedger = stored[STORAGE_KEYS.taskLedger];
     const core = getUnattendedTaskCenterCore();
     if (core?.normalizeTaskLedger) {
-      return core.normalizeTaskLedger(rawLedger, {now: new Date().toISOString()});
+      const now = Date.now();
+      const normalized = core.normalizeTaskLedger(rawLedger, {now});
+      const reconciled = core.reconcileStaleTaskLedger
+        ? core.reconcileStaleTaskLedger(normalized, {
+            now,
+            staleAfterMs: TASK_LEDGER_STALE_ACTIVE_MS,
+            isTaskActive: (run) =>
+              isTaskRunActuallyActive(run, {
+                now,
+                unattendedRequest:
+                  stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+              }),
+          })
+        : normalized;
+      if (JSON.stringify(reconciled) !== JSON.stringify(normalized)) {
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.taskLedger]: reconciled,
+        });
+      }
+      return reconciled;
     }
     return rawLedger && typeof rawLedger === 'object'
       ? {
@@ -827,6 +947,142 @@ async function readTaskLedger() {
           updatedAt: String(rawLedger.updatedAt || ''),
         }
       : {version: 1, runs: [], updatedAt: ''};
+  });
+}
+
+function taskRunActivityAt(run) {
+  return Math.max(
+    Date.parse(String(run?.businessProgressAt || '')) || 0,
+    Date.parse(String(run?.heartbeatAt || '')) || 0,
+    Date.parse(String(run?.updatedAt || '')) || 0,
+    Date.parse(String(run?.startedAt || '')) || 0,
+    Date.parse(String(run?.createdAt || '')) || 0,
+  );
+}
+
+function isTaskRunActuallyActive(
+  run,
+  {now = Date.now(), unattendedRequest = null, includeRecent = false} = {},
+) {
+  const taskId = String(run?.id || run?.taskId || '').trim();
+  if (!taskId) return false;
+  if (captureDebugSessionManager?.getSessionByTaskId(taskId)) return true;
+  if (captureTaskOwnerCoordinator?.getOwner(taskId)?.connected === true) {
+    return true;
+  }
+  if (
+    includeRecent &&
+    now - taskRunActivityAt(run) < TASK_CENTER_RECENT_ACTIVITY_MS
+  ) {
+    return true;
+  }
+
+  const requestId = String(
+    unattendedRequest?.id || unattendedRequest?.requestId || '',
+  ).trim();
+  if (requestId !== taskId) return false;
+  const requestStatus = String(unattendedRequest?.status || '').toLowerCase();
+  if (UNATTENDED_RUN_TERMINAL_STATUSES.has(requestStatus)) return false;
+  const requestActivityAt = taskRunActivityAt(unattendedRequest);
+  return Boolean(
+    requestActivityAt &&
+      now - requestActivityAt < UNATTENDED_RUN_ACTIVE_GRACE_MS,
+  );
+}
+
+async function clearTaskCenterRecords() {
+  return await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.taskLedger,
+      STORAGE_KEYS.unattendedKeywordPlan,
+      STORAGE_KEYS.unattendedKeywordRunRequest,
+    ]);
+    const core = getUnattendedTaskCenterCore();
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const unattendedRequest =
+      stored[STORAGE_KEYS.unattendedKeywordRunRequest] &&
+      typeof stored[STORAGE_KEYS.unattendedKeywordRunRequest] === 'object'
+        ? stored[STORAGE_KEYS.unattendedKeywordRunRequest]
+        : null;
+    const unattendedRequestId = String(
+      unattendedRequest?.id || unattendedRequest?.requestId || '',
+    ).trim();
+    const unattendedRequestStatus = String(
+      unattendedRequest?.status || '',
+    ).toLowerCase();
+    const unattendedRequestActive = Boolean(
+      unattendedRequestId &&
+        !UNATTENDED_RUN_TERMINAL_STATUSES.has(unattendedRequestStatus) &&
+        isTaskRunActuallyActive(
+          {...unattendedRequest, id: unattendedRequestId},
+          {now, unattendedRequest},
+        ),
+    );
+    const normalized = core?.normalizeTaskLedger
+      ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
+      : stored[STORAGE_KEYS.taskLedger] || {version: 1, runs: []};
+    const runs = Array.isArray(normalized?.runs) ? normalized.runs : [];
+    const preservedRuns = runs.filter((run) => {
+      if (core?.isTerminalTaskStatus?.(run?.status)) return false;
+      return isTaskRunActuallyActive(run, {
+        now,
+        unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+        includeRecent: true,
+      });
+    });
+    const ledgerInput = {
+      ...normalized,
+      runs: preservedRuns,
+      clearedAt: nowIso,
+      updatedAt: nowIso,
+    };
+    const ledger = core?.normalizeTaskLedger
+      ? core.normalizeTaskLedger(ledgerInput, {now})
+      : ledgerInput;
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.taskLedger]: ledger,
+      [STORAGE_KEYS.syncHistory]: {
+        entries: [],
+        lastUpdatedAt: now,
+      },
+    });
+    let clearedUnattendedRequest = false;
+    if (!unattendedRequestActive) {
+      if (unattendedRequestId) {
+        await chrome.storage.local.remove(
+          STORAGE_KEYS.unattendedKeywordRunRequest,
+        );
+        clearedUnattendedRequest = true;
+      }
+      const unattendedPlan = stored[STORAGE_KEYS.unattendedKeywordPlan];
+      if (
+        unattendedPlan &&
+        typeof unattendedPlan === 'object' &&
+        (unattendedPlan.lastRunAt ||
+          unattendedPlan.lastRunStatus ||
+          unattendedPlan.lastRunMessage ||
+          unattendedPlan.lastRunProgress)
+      ) {
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.unattendedKeywordPlan]: {
+            ...unattendedPlan,
+            lastRunAt: '',
+            lastRunStatus: '',
+            lastRunMessage: '',
+            lastRunProgress: null,
+            updatedAt: nowIso,
+          },
+        });
+      }
+    }
+    return {
+      ledger,
+      clearedAt: nowIso,
+      clearedCount: Math.max(0, runs.length - preservedRuns.length),
+      preservedActiveCount: preservedRuns.length,
+      clearedUnattendedRequest,
+    };
   });
 }
 
@@ -886,6 +1142,86 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
       ledger: result.ledger,
     };
   });
+}
+
+async function terminalizeCaptureTaskLedgerRun(
+  taskId,
+  {
+    reason = 'capture_task_canceled',
+    message = '采集任务已停止',
+    status = 'canceled',
+  } = {},
+) {
+  const normalizedTaskId = String(taskId || '').trim();
+  if (!normalizedTaskId) {
+    return {accepted: false, reason: 'invalid_id'};
+  }
+  const rawTerminalStatus =
+    String(status || 'canceled').trim().toLowerCase() || 'canceled';
+  const terminalStatus =
+    {
+      partial: 'completed_with_failures',
+      success: 'completed',
+      succeeded: 'completed',
+      done: 'completed',
+      error: 'failed',
+      stopped: 'canceled',
+      cancelled: 'canceled',
+    }[rawTerminalStatus] || rawTerminalStatus;
+  const terminalReason =
+    String(reason || 'capture_task_canceled').trim() ||
+    'capture_task_canceled';
+  const terminalMessage = String(message || '采集任务已停止').trim();
+  const hasTerminalError = new Set([
+    'canceled',
+    'failed',
+    'completed_with_failures',
+  ]).has(terminalStatus);
+  const eventType =
+    terminalStatus === 'failed'
+      ? 'task_failed'
+      : terminalStatus === 'canceled'
+        ? 'task_canceled'
+        : 'task_finished';
+  const now = new Date().toISOString();
+  try {
+    return await upsertTaskLedgerRun({
+      patch: {
+        id: normalizedTaskId,
+        status: terminalStatus,
+        message: terminalMessage,
+        updatedAt: now,
+        finishedAt: now,
+        businessProgressAt: now,
+        error: hasTerminalError
+          ? {
+              code: terminalReason,
+              reason: terminalReason,
+              message: terminalMessage,
+            }
+          : null,
+      },
+      event: {
+        type: eventType,
+        status: terminalStatus,
+        message: terminalMessage,
+        at: now,
+        metadata: {
+          reason: terminalReason,
+        },
+      },
+    });
+  } catch (error) {
+    console.warn(
+      '[CaptureTask] failed to terminalize task-center record:',
+      error,
+    );
+    return {
+      accepted: false,
+      reason: 'task_ledger_update_failed',
+      error,
+    };
+  }
 }
 
 async function resolveSupersededNeedsActionTask(
@@ -1257,6 +1593,8 @@ function normalizeCaptureExecutionLock(value, { allowExpired = false } = {}) {
     id,
     owner: String(value.owner || 'unknown'),
     label: String(value.label || '正在运行的采集任务'),
+    captureTaskId: String(value.captureTaskId || '').trim(),
+    captureTaskAttemptId: String(value.captureTaskAttemptId || '').trim(),
     startedAt: String(value.startedAt || ''),
     updatedAt: String(value.updatedAt || ''),
     expiresAt,
@@ -1353,6 +1691,62 @@ async function readStoredCaptureExecutionLock() {
       stored[STORAGE_KEYS.captureExecutionLock],
       {allowExpired: true},
     );
+  });
+}
+
+async function bindCaptureExecutionLockToTask(
+  taskId,
+  sourceTabId,
+  {allowUnattendedRebind = false, attemptId = ''} = {},
+) {
+  const normalizedTaskId = String(taskId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  const normalizedSourceTabId = resolveCaptureTaskTabId(sourceTabId);
+  if (!normalizedTaskId || !normalizedSourceTabId) return null;
+
+  return await runCaptureExecutionLockOperation(async () => {
+    const activeLock = await readActiveCaptureExecutionLockUnsafe();
+    if (!activeLock) {
+      return activeLock;
+    }
+    const unattendedRebind = Boolean(
+      allowUnattendedRebind &&
+        String(activeLock.owner || '') === 'unattended_keyword_plan',
+    );
+    if (
+      !unattendedRebind &&
+      (Number(activeLock.holderTabId) !== normalizedSourceTabId ||
+        (activeLock.captureTaskId &&
+          activeLock.captureTaskId !== normalizedTaskId))
+    ) {
+      return activeLock;
+    }
+    if (activeLock.captureTaskId === normalizedTaskId) {
+      if (
+        !unattendedRebind ||
+        (Number(activeLock.holderTabId) === normalizedSourceTabId &&
+          String(activeLock.captureTaskAttemptId || '').trim() ===
+            normalizedAttemptId)
+      ) {
+        return activeLock;
+      }
+    }
+
+    const boundLock = {
+      ...activeLock,
+      captureTaskId: normalizedTaskId,
+      ...(unattendedRebind
+        ? {
+            holderTabId: normalizedSourceTabId,
+            captureTaskAttemptId: normalizedAttemptId,
+          }
+        : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureExecutionLock]: boundLock,
+    });
+    return boundLock;
   });
 }
 
@@ -1517,13 +1911,22 @@ async function releaseCaptureExecutionLock(
     if (activeLock.id !== lockId) {
       return false;
     }
-    if (
-      requireHolder &&
-      ((activeLock.holderId && activeLock.holderId !== holderId) ||
-        (activeLock.holderDocumentId &&
-          activeLock.holderDocumentId !== String(holderDocumentId || '')))
-    ) {
-      return false;
+    if (requireHolder) {
+      const normalizedHolderId = String(holderId || '');
+      const normalizedDocumentId = String(holderDocumentId || '');
+      // holderId 是侧栏文档启动时生成的随机凭证。Chrome 在扩展更新、
+      // service worker 重启等场景下可能改变 MessageSender.documentId；只要
+      // holderId 仍匹配，就允许原侧栏收口，避免后台留下无法释放的幽灵锁。
+      if (activeLock.holderId) {
+        if (activeLock.holderId !== normalizedHolderId) {
+          return false;
+        }
+      } else if (
+        activeLock.holderDocumentId &&
+        activeLock.holderDocumentId !== normalizedDocumentId
+      ) {
+        return false;
+      }
     }
     await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
     return true;
@@ -1567,6 +1970,7 @@ async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
     return await chrome.tabs.update(existingRunner.id, {
       url: runnerUrl,
       active: true,
+      autoDiscardable: false,
     });
   }
 
@@ -1577,7 +1981,13 @@ async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
   if (Number.isFinite(Number(windowId)) && Number(windowId) >= 0) {
     createOptions.windowId = Number(windowId);
   }
-  return await chrome.tabs.create(createOptions);
+  const createdRunner = await chrome.tabs.create(createOptions);
+  if (!createdRunner?.id) {
+    return createdRunner;
+  }
+  return await chrome.tabs.update(createdRunner.id, {
+    autoDiscardable: false,
+  });
 }
 
 async function createUnattendedKeywordRunRequest(plan, { reason = 'alarm' } = {}) {
@@ -1769,6 +2179,10 @@ async function claimUnattendedKeywordRun({
           lock: transferredLock,
         };
       }
+      await releaseUnattendedCaptureTaskResourcesForRecovery(transferredLock, {
+        reason: 'unattended_runner_resumed',
+        request,
+      });
     }
 
     const claimedAt = new Date().toISOString();
@@ -2055,6 +2469,9 @@ function formatUnattendedRecoveryReason(reason) {
     runner_tab_missing: '运行页已不存在',
     runner_heartbeat_stale: '运行页心跳中断',
     business_progress_stalled: '采集业务长时间没有新进展',
+    runner_owner_disconnected: '无人值守运行页连接已更换',
+    debug_target_closed: '浏览器替换了采集页面',
+    source_tab_replace_failed: '浏览器替换页面后接管需要重建',
   };
   return messages[String(reason || '')] || '无人值守任务运行异常';
 }
@@ -2157,6 +2574,10 @@ async function launchPendingUnattendedRecovery(request) {
         reason: 'previous_capture_stop_unconfirmed',
       };
     }
+    await releaseUnattendedCaptureTaskResourcesForRecovery(activeLock, {
+      reason: 'unattended_recovery_launch',
+      request,
+    });
     await releaseCaptureExecutionLock(activeLock.id);
   }
 
@@ -2377,6 +2798,15 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       reason: 'previous_capture_stop_unconfirmed',
       request: blockedRequest || transition.request,
     };
+  }
+  if (oldUnattendedLock) {
+    await releaseUnattendedCaptureTaskResourcesForRecovery(
+      oldUnattendedLock,
+      {
+        reason: `unattended_${String(health?.reason || 'runtime_recovery')}`,
+        request: transition.request,
+      },
+    );
   }
   if (oldUnattendedLock?.id) {
     await releaseCaptureExecutionLock(oldUnattendedLock.id).catch(() => false);
@@ -3005,6 +3435,15 @@ async function cleanupStaleCaptureRuntimeSession(session) {
     }
   }
 
+  await Promise.allSettled(
+    [...new Set([sourceTabId, ...workerTabIds].filter(Boolean))].map((tabId) =>
+      clearCaptureTaskTraceOverlayFailSoft({
+        taskId: session.taskId,
+        tabId,
+      }),
+    ),
+  );
+
   if (chrome.action?.setBadgeText) {
     await chrome.action.setBadgeText({text: ''}).catch(() => null);
   }
@@ -3083,6 +3522,12 @@ async function ensureRuntimeState() {
         },
       });
       await cleanupStaleCaptureRuntimeSession(current.captureDebugSession);
+      if (staleTaskId) {
+        await terminalizeCaptureTaskLedgerRun(staleTaskId, {
+          reason: 'extension_runtime_restarted',
+          message: '扩展已重新加载，上一采集任务已停止',
+        });
+      }
       nextPatch.captureDebugSession = null;
       if (staleTaskId) {
         captureTaskOwnerCoordinator?.clearTask(staleTaskId);
@@ -3097,8 +3542,9 @@ async function ensureRuntimeState() {
       nextPatch.clientLabel = getPlatformLabel();
     }
 
-    if (!current.appVersion) {
-      nextPatch.appVersion = getAppVersion();
+    const installedAppVersion = getAppVersion();
+    if (current.appVersion !== installedAppVersion) {
+      nextPatch.appVersion = installedAppVersion;
     }
 
     if (Object.keys(nextPatch).length === 0) {
@@ -4061,6 +4507,164 @@ async function requireConnectedCaptureTaskOwner(
   );
 }
 
+function isRecentActiveCaptureTaskLedgerRun(run, now = Date.now()) {
+  const status = String(run?.status || '').trim().toLowerCase();
+  if (!new Set(['pending', 'running', 'recovering']).has(status)) {
+    return false;
+  }
+  const activityAt = taskRunActivityAt(run);
+  return Boolean(
+    activityAt && now - activityAt < TASK_LEDGER_STALE_ACTIVE_MS,
+  );
+}
+
+async function inspectCaptureTaskGroupLiveness(group) {
+  const taskId = String(group?.taskId || '').trim();
+  if (!taskId) {
+    return {active: true, reason: 'invalid_task_group'};
+  }
+  if (captureTaskCleanupInProgress.has(taskId)) {
+    return {active: true, reason: 'cleanup_in_progress'};
+  }
+
+  const debugSession = captureDebugSessionManager.getSessionByTaskId(taskId);
+  const debugSessionState = String(debugSession?.state || '')
+    .trim()
+    .toLowerCase();
+  // A detached persistent snapshot exists only so ordered cleanup can still
+  // find its task/workers. It is not proof that capture is alive. Continue
+  // through the ledger/request/owner/lock checks so a terminal task can be
+  // reclaimed instead of blocking every later begin forever.
+  if (debugSession && debugSessionState !== 'detached') {
+    return {active: true, reason: 'debug_session', debugSession};
+  }
+
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.taskLedger,
+    STORAGE_KEYS.unattendedKeywordRunRequest,
+  ]);
+  const core = getUnattendedTaskCenterCore();
+  const now = Date.now();
+  const ledger = core?.normalizeTaskLedger
+    ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
+    : stored[STORAGE_KEYS.taskLedger];
+  const ledgerRun = Array.isArray(ledger?.runs)
+    ? ledger.runs.find((run) => String(run?.id || '').trim() === taskId)
+    : null;
+  const ledgerStatus = String(ledgerRun?.status || '').trim().toLowerCase();
+  const ledgerTerminal = Boolean(
+    ledgerRun &&
+      (core?.isTerminalTaskStatus?.(ledgerStatus) ||
+        new Set([
+          'completed',
+          'completed_with_warnings',
+          'completed_with_failures',
+          'failed',
+          'canceled',
+          'cancelled',
+          'skipped',
+          'needs_action',
+        ]).has(ledgerStatus)),
+  );
+  if (isRecentActiveCaptureTaskLedgerRun(ledgerRun, now)) {
+    return {active: true, reason: 'task_ledger', ledgerRun};
+  }
+
+  const unattendedRequest =
+    stored[STORAGE_KEYS.unattendedKeywordRunRequest] &&
+    typeof stored[STORAGE_KEYS.unattendedKeywordRunRequest] === 'object'
+      ? stored[STORAGE_KEYS.unattendedKeywordRunRequest]
+      : null;
+  if (
+    String(unattendedRequest?.id || '').trim() === taskId &&
+    (await isUnattendedRunRequestActive(unattendedRequest))
+  ) {
+    return {
+      active: true,
+      reason: 'unattended_run_request',
+      unattendedRequest,
+    };
+  }
+
+  // A connected sidebar can briefly survive after its task has already written
+  // a terminal tombstone. In that state the owner is cleanup residue, not proof
+  // that capture is still running. Without a terminal record, fail closed and
+  // keep the owner-owned group intact.
+  const owner = captureTaskOwnerCoordinator?.getOwner(taskId);
+  if (
+    !ledgerTerminal &&
+    (owner?.connected === true || owner?.abandoning === true)
+  ) {
+    return {active: true, reason: 'task_owner', owner};
+  }
+
+  const activeLock = await readActiveCaptureExecutionLock();
+  const groupTabIds = new Set(
+    [
+      group?.sourceTabId,
+      ...(Array.isArray(group?.workerTabIds) ? group.workerTabIds : []),
+    ]
+      .map((tabId) => resolveCaptureTaskTabId(tabId))
+      .filter(Boolean),
+  );
+  if (
+    activeLock &&
+    (activeLock.captureTaskId === taskId ||
+      (!activeLock.captureTaskId &&
+        groupTabIds.has(resolveCaptureTaskTabId(activeLock.holderTabId))))
+  ) {
+    return {active: true, reason: 'execution_lock', activeLock};
+  }
+
+  return {
+    active: false,
+    reason: 'confirmed_stale',
+    debugSession,
+    ledgerRun,
+  };
+}
+
+async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
+  const releasedTaskIds = [];
+  const protectedTasks = [];
+  const candidates = captureTaskTabGroupManager.getActiveTasks();
+  for (const group of candidates) {
+    const liveness = await inspectCaptureTaskGroupLiveness(group);
+    if (liveness.active) {
+      protectedTasks.push({
+        taskId: group.taskId,
+        reason: liveness.reason,
+      });
+      continue;
+    }
+
+    try {
+      await releaseCaptureTaskResourcesWithRetry(
+        {
+          taskId: group.taskId,
+          reason: 'stale_capture_task_recovered',
+          debugSnapshot: liveness.debugSession,
+        },
+        {attempts: 3},
+      );
+      releasedTaskIds.push(group.taskId);
+    } catch (error) {
+      console.warn(
+        '[CaptureTask] confirmed stale group cleanup remains pending:',
+        {
+          taskId: group.taskId,
+          error: String(error?.message || error || ''),
+        },
+      );
+      protectedTasks.push({
+        taskId: group.taskId,
+        reason: 'cleanup_failed',
+      });
+    }
+  }
+  return {releasedTaskIds, protectedTasks};
+}
+
 async function beginCaptureTask(message, sender) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
@@ -4096,9 +4700,36 @@ async function beginCaptureTask(message, sender) {
     );
   }
 
+  // Fence before consulting the execution lock. Recovery deliberately has a
+  // short window where the old lock is gone and the replacement runner has not
+  // acquired its lock yet; a late BEGIN from the old document must not use
+  // that window to resurrect the previous attempt as a manual task.
+  const beginAttemptFence = await inspectUnattendedCaptureTaskAttempt({
+    taskId,
+    attemptId: request.attemptId,
+  });
+  if (beginAttemptFence.unattended && !beginAttemptFence.current) {
+    throw createCaptureTaskError(
+      'stale_unattended_attempt',
+      '旧无人值守运行页已失效，已忽略其浏览器接管请求',
+    );
+  }
+
   if (ownerRequired) {
     await requireConnectedCaptureTaskOwner(taskId);
   }
+
+  const unattendedBegin = await reclaimSupersededUnattendedCaptureTaskForBegin({
+    taskId,
+    sourceTabId,
+    attemptId: request.attemptId,
+    sender,
+  });
+  await bindCaptureExecutionLockToTask(taskId, sourceTabId, {
+    allowUnattendedRebind: unattendedBegin?.unattended === true,
+    attemptId: request.attemptId,
+  });
+  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
 
   const existingSession =
     captureDebugSessionManager.getSessionByTaskId(taskId);
@@ -4240,6 +4871,17 @@ async function beginCaptureTask(message, sender) {
 async function updateCaptureTask(message) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
+  const attemptFence = await inspectUnattendedCaptureTaskAttempt({
+    taskId,
+    attemptId: request.attemptId,
+  });
+  if (attemptFence.unattended && !attemptFence.current) {
+    return {
+      taskId,
+      ignored: true,
+      reason: 'stale_unattended_attempt',
+    };
+  }
   const update = {taskId};
   for (const field of ['progress', 'label', 'minimized']) {
     if (Object.prototype.hasOwnProperty.call(request, field)) {
@@ -4247,12 +4889,43 @@ async function updateCaptureTask(message) {
     }
   }
   const session = await captureDebugSessionManager.updateTask(update);
+  const sourceTabId = resolveCaptureTaskTabId(
+    session?.sourceTabId,
+    session?.tabId,
+  );
+  if (sourceTabId && Object.prototype.hasOwnProperty.call(update, 'progress')) {
+    chrome.tabs
+      .sendMessage(sourceTabId, {
+        action: 'setCaptureTaskTakeover',
+        taskId,
+        active: true,
+        label: String(session?.label || 'AI 正在接管'),
+        progress: session?.progress || update.progress || {},
+      })
+      .catch((error) => {
+        console.debug(
+          '[CaptureTask] page progress overlay unavailable (ignored):',
+          error?.message || error,
+        );
+      });
+  }
   return {taskId, session};
 }
 
 async function registerCaptureTaskTab(message, sender) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
+  const attemptFence = await inspectUnattendedCaptureTaskAttempt({
+    taskId,
+    attemptId: request.attemptId,
+  });
+  if (attemptFence.unattended && !attemptFence.current) {
+    return {
+      taskId,
+      ignored: true,
+      reason: 'stale_unattended_attempt',
+    };
+  }
   const role = globalThis.OnStarvoiceCaptureTaskTabGroup.normalizeTaskTabRole(
     request.role,
   );
@@ -4334,6 +5007,26 @@ function getTrackedCaptureTaskWorkers(taskId, ...snapshots) {
   );
 }
 
+function replaceTrackedCaptureTaskWorkerTab(
+  taskId,
+  removedTabId,
+  addedTabId,
+) {
+  const pending = captureTaskPendingWorkerTabIds.get(taskId);
+  if (!pending?.length || !pending.includes(removedTabId)) return false;
+  captureTaskPendingWorkerTabIds.set(
+    taskId,
+    Array.from(
+      new Set(
+        pending.map((tabId) =>
+          Number(tabId) === Number(removedTabId) ? Number(addedTabId) : tabId,
+        ),
+      ),
+    ),
+  );
+  return true;
+}
+
 function buildCaptureTaskWorkerSnapshot(taskId, debugSnapshot, groupSnapshot) {
   return {
     ...(groupSnapshot || {}),
@@ -4362,6 +5055,30 @@ async function writeCaptureTaskCancellationFailSoft(cancellation, patch) {
     patch,
     onError: reportCaptureTaskCancellationPublishError,
   });
+}
+
+async function clearCaptureTaskTraceOverlayFailSoft({
+  taskId = '',
+  tabId = null,
+} = {}) {
+  const normalizedTabId = resolveCaptureTaskTabId(tabId);
+  if (!normalizedTabId) return false;
+  try {
+    const response = await chrome.tabs.sendMessage(normalizedTabId, {
+      action: 'setCaptureTaskTakeover',
+      taskId: String(taskId || '').trim(),
+      active: false,
+      clearTrace: true,
+      label: 'AI 正在接管',
+    });
+    return response?.ok !== false;
+  } catch (error) {
+    console.debug(
+      '[CaptureTask] page trace cleanup unavailable (ignored):',
+      error?.message || error,
+    );
+    return false;
+  }
 }
 
 function buildCaptureTaskCancellation(taskId, reason) {
@@ -4465,6 +5182,10 @@ async function releaseCaptureTaskResources({
       },
     );
   }
+  await clearCaptureTaskTraceOverlayFailSoft({
+    taskId,
+    tabId: cleanupSnapshot.sourceTabId,
+  });
 
   try {
     const result = await globalThis.OnStarvoiceCaptureTaskRuntime.endTaskResources({
@@ -4512,9 +5233,262 @@ async function releaseCaptureTaskResourcesWithRetry(
   throw lastError;
 }
 
+function buildUnattendedCaptureTaskId(requestId = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  return normalizedRequestId ? `unattended-capture:${normalizedRequestId}` : '';
+}
+
+function isExplicitCaptureTaskStopReason(reason = '') {
+  return new Set([
+    'canceled_by_user',
+    'user_cancel_requested',
+    'unattended_cancel_requested',
+    'manual_cancel_requested',
+  ]).has(String(reason || '').trim().toLowerCase());
+}
+
+async function readUnattendedParentForCaptureTask(taskId = '') {
+  const normalizedTaskId = String(taskId || '').trim();
+  if (!normalizedTaskId) return null;
+  const [lock, request] = await Promise.all([
+    readStoredCaptureExecutionLock(),
+    readUnattendedKeywordRunRequest(),
+  ]);
+  if (
+    String(lock?.owner || '') !== 'unattended_keyword_plan' ||
+    !request ||
+    isTerminalUnattendedRunStatus(request.status)
+  ) {
+    return null;
+  }
+  const stableTaskId = buildUnattendedCaptureTaskId(request.id);
+  if (
+    String(lock.captureTaskId || '').trim() !== normalizedTaskId &&
+    stableTaskId !== normalizedTaskId
+  ) {
+    return null;
+  }
+  return {lock, request, stableTaskId};
+}
+
+async function inspectUnattendedCaptureTaskAttempt({
+  taskId = '',
+  attemptId = '',
+} = {}) {
+  const normalizedTaskId = String(taskId || '').trim();
+  const incomingAttemptId = String(attemptId || '').trim();
+  if (!normalizedTaskId) {
+    return {unattended: false, current: true};
+  }
+  const [lock, request] = await Promise.all([
+    readStoredCaptureExecutionLock(),
+    readUnattendedKeywordRunRequest(),
+  ]);
+  if (!request) {
+    return {unattended: false, current: true};
+  }
+  const stableTaskId = buildUnattendedCaptureTaskId(request.id);
+  if (!stableTaskId || normalizedTaskId !== stableTaskId) {
+    // Legacy unattended child ids remain compatible. Recovery explicitly
+    // releases them before the stable task is rebound.
+    return {unattended: false, current: true};
+  }
+  const boundAttemptId =
+    String(lock?.owner || '') === 'unattended_keyword_plan' &&
+    String(lock?.captureTaskId || '').trim() === normalizedTaskId
+      ? String(lock?.captureTaskAttemptId || '').trim()
+      : '';
+  const currentAttemptId =
+    boundAttemptId || String(request.attemptId || '').trim();
+  return {
+    unattended: true,
+    current: Boolean(
+      incomingAttemptId &&
+        currentAttemptId &&
+        incomingAttemptId === currentAttemptId
+    ),
+    incomingAttemptId,
+    currentAttemptId,
+    request,
+  };
+}
+
+async function clearUnattendedCaptureTaskLockBinding(lockId, taskId) {
+  const normalizedLockId = String(lockId || '').trim();
+  const normalizedTaskId = String(taskId || '').trim();
+  if (!normalizedLockId || !normalizedTaskId) return false;
+  return await runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.captureExecutionLock,
+    );
+    const lock = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    if (
+      !lock ||
+      lock.id !== normalizedLockId ||
+      String(lock.owner || '') !== 'unattended_keyword_plan' ||
+      String(lock.captureTaskId || '').trim() !== normalizedTaskId
+    ) {
+      return false;
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureExecutionLock]: {
+        ...lock,
+        captureTaskId: '',
+        captureTaskAttemptId: '',
+        updatedAt: new Date().toISOString(),
+      },
+    });
+    return true;
+  });
+}
+
+async function releaseUnattendedCaptureTaskResourcesForRecovery(
+  lock,
+  {reason = 'unattended_runtime_recovery', request = null} = {},
+) {
+  const taskId = String(lock?.captureTaskId || '').trim();
+  if (!taskId) return {released: false, reason: 'no_capture_task'};
+  const debugSnapshot = captureDebugSessionManager.getSessionByTaskId(taskId);
+  const groupSnapshot = captureTaskTabGroupManager.getTask(taskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
+  if (debugSnapshot || groupSnapshot || pendingWorkerTabIds.length > 0) {
+    await releaseCaptureTaskResourcesWithRetry(
+      {taskId, reason, debugSnapshot},
+      {attempts: 3},
+    );
+  } else {
+    captureTaskOwnerCoordinator?.clearTask(taskId);
+  }
+  await clearUnattendedCaptureTaskLockBinding(lock.id, taskId);
+
+  // 0.3.43 及更早版本为每次 runner 生成随机 child task。只收口这类
+  // 旧记录；新版使用同一 request 的稳定 taskId，恢复后仍是同一项任务。
+  const stableTaskId = buildUnattendedCaptureTaskId(request?.id);
+  if (!stableTaskId || taskId !== stableTaskId) {
+    await terminalizeCaptureTaskLedgerRun(taskId, {
+      reason: 'unattended_attempt_replaced',
+      status: 'canceled',
+      message: '无人值守运行页已迁移，旧浏览器接管会话已释放',
+    });
+  }
+  return {released: true, taskId};
+}
+
+async function recoverUnattendedCaptureTaskInterruption({
+  taskId = '',
+  reason = 'runtime_interrupted',
+} = {}) {
+  const parent = await readUnattendedParentForCaptureTask(taskId);
+  if (!parent) return {handled: false, reason: 'not_unattended'};
+  const recovery = await recoverUnattendedKeywordRunRequest(parent.request, {
+    healthy: false,
+    reason,
+  });
+  return {handled: true, recovery};
+}
+
+function readUnattendedRequestIdFromSender(sender = null) {
+  const candidateUrls = [sender?.url, sender?.tab?.url];
+  for (const candidate of candidateUrls) {
+    try {
+      const url = new URL(String(candidate || ''));
+      const requestId = String(
+        url.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY) || '',
+      ).trim();
+      if (requestId) return requestId;
+    } catch {
+      // Ignore non-URL sender metadata.
+    }
+  }
+  return '';
+}
+
+async function reclaimSupersededUnattendedCaptureTaskForBegin({
+  taskId,
+  sourceTabId,
+  attemptId,
+  sender,
+} = {}) {
+  const normalizedTaskId = String(taskId || '').trim();
+  const normalizedSourceTabId = resolveCaptureTaskTabId(sourceTabId);
+  const [lock, request] = await Promise.all([
+    readStoredCaptureExecutionLock(),
+    readUnattendedKeywordRunRequest(),
+  ]);
+  if (
+    !normalizedTaskId ||
+    !normalizedSourceTabId ||
+    String(lock?.owner || '') !== 'unattended_keyword_plan' ||
+    !request ||
+    isTerminalUnattendedRunStatus(request.status)
+  ) {
+    return {unattended: false, reclaimed: false};
+  }
+
+  const senderRequestId = readUnattendedRequestIdFromSender(sender);
+  const senderDocumentId = String(sender?.documentId || '').trim();
+  const senderRunnerTabId = resolveCaptureTaskTabId(sender?.tab?.id);
+  const authorizedRunner = Boolean(
+    (senderRequestId && senderRequestId === String(request.id || '').trim()) &&
+      ((!lock.holderDocumentId ||
+        senderDocumentId === String(lock.holderDocumentId || '').trim()) ||
+        (!senderDocumentId &&
+          senderRunnerTabId === resolveCaptureTaskTabId(request.runnerTabId))),
+  );
+  const stableTaskId = buildUnattendedCaptureTaskId(request.id);
+  const attemptFence = await inspectUnattendedCaptureTaskAttempt({
+    taskId: normalizedTaskId,
+    attemptId,
+  });
+  if (attemptFence.unattended && !attemptFence.current) {
+    throw createCaptureTaskError(
+      'stale_unattended_attempt',
+      '旧无人值守运行页已失效，已忽略其浏览器接管请求',
+    );
+  }
+  if (!authorizedRunner && normalizedTaskId !== stableTaskId) {
+    return {unattended: false, reclaimed: false};
+  }
+
+  const previousTaskId = String(lock.captureTaskId || '').trim();
+  const previousSession = previousTaskId
+    ? captureDebugSessionManager.getSessionByTaskId(previousTaskId)
+    : null;
+  const sourceChanged = Boolean(
+    previousSession &&
+      resolveCaptureTaskTabId(previousSession.tabId) !== normalizedSourceTabId,
+  );
+  if (previousTaskId && (previousTaskId !== normalizedTaskId || sourceChanged)) {
+    await releaseUnattendedCaptureTaskResourcesForRecovery(lock, {
+      reason: 'unattended_runner_rebound',
+      request,
+    });
+  }
+  return {
+    unattended: true,
+    reclaimed: Boolean(previousTaskId),
+    request,
+  };
+}
+
 async function endCaptureTask(message) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
+  const attemptFence = await inspectUnattendedCaptureTaskAttempt({
+    taskId,
+    attemptId: request.attemptId,
+  });
+  if (attemptFence.unattended && !attemptFence.current) {
+    return {
+      taskId,
+      released: false,
+      ignored: true,
+      reason: 'stale_unattended_attempt',
+    };
+  }
   const reason =
     String(request.reason || '').trim() || 'capture_task_finished';
   const status = String(request.status || '').trim().toLowerCase();
@@ -4527,7 +5501,23 @@ async function endCaptureTask(message) {
     await publishCaptureTaskCancellation(taskId, reason);
     await relayCaptureTaskCancellation(session, reason);
   }
-  return await releaseCaptureTaskResourcesWithRetry({taskId, reason});
+  const result = await releaseCaptureTaskResourcesWithRetry({taskId, reason});
+  const terminalStatus = status || (canceled ? 'canceled' : 'completed');
+  await terminalizeCaptureTaskLedgerRun(taskId, {
+    reason,
+    status: terminalStatus,
+    message:
+      terminalStatus === 'completed'
+        ? '采集任务已完成'
+        : terminalStatus === 'skipped'
+          ? '采集任务已跳过'
+          : terminalStatus === 'completed_with_failures'
+            ? '采集任务已完成，部分内容处理失败'
+            : terminalStatus === 'failed'
+              ? '采集任务执行失败'
+              : '采集任务已停止',
+  });
+  return result;
 }
 
 async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
@@ -4537,7 +5527,22 @@ async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
     return;
   }
 
+  if (!isExplicitCaptureTaskStopReason(reason)) {
+    const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
+      taskId: session.taskId,
+      reason:
+        String(reason || '').trim() === 'target_closed'
+          ? 'debug_target_closed'
+          : 'runner_owner_disconnected',
+    });
+    if (unattendedRecovery.handled) return;
+  }
+
   await publishCaptureTaskCancellation(session.taskId, 'native_debug_canceled');
+  await terminalizeCaptureTaskLedgerRun(session.taskId, {
+    reason: 'native_debug_canceled',
+    message: '浏览器 Debug 接管已取消，采集任务已停止',
+  });
   await relayCaptureTaskCancellation(session, reason);
   try {
     await releaseCaptureTaskResourcesWithRetry(
@@ -4559,15 +5564,30 @@ async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
 async function handleAbandonedCaptureTask({taskId} = {}) {
   const normalizedTaskId = String(taskId || '').trim();
   if (!normalizedTaskId) return;
+  const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
+    taskId: normalizedTaskId,
+    reason: 'runner_owner_disconnected',
+  });
+  if (unattendedRecovery.handled) return;
   const session = captureDebugSessionManager.getSessionByTaskId(normalizedTaskId);
   const group = captureTaskTabGroupManager.getTask(normalizedTaskId);
   const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(normalizedTaskId);
-  if (!session && !group && pendingWorkerTabIds.length === 0) return;
+  if (!session && !group && pendingWorkerTabIds.length === 0) {
+    await terminalizeCaptureTaskLedgerRun(normalizedTaskId, {
+      reason: 'sidebar_owner_disconnected',
+      message: '控制面板已关闭，采集任务已停止',
+    });
+    return;
+  }
 
   await publishCaptureTaskCancellation(
     normalizedTaskId,
     'sidebar_owner_disconnected',
   );
+  await terminalizeCaptureTaskLedgerRun(normalizedTaskId, {
+    reason: 'sidebar_owner_disconnected',
+    message: '控制面板已关闭，采集任务已停止',
+  });
   await relayCaptureTaskCancellation(session, 'sidebar_owner_disconnected');
   try {
     await releaseCaptureTaskResourcesWithRetry(
@@ -4601,10 +5621,190 @@ captureTaskOwnerCoordinator =
     onAbandoned: handleAbandonedCaptureTask,
   });
 
+async function replaceCaptureExecutionLockTabId(removedTabId, addedTabId) {
+  return await runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.captureExecutionLock,
+    );
+    const lock = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    if (!lock || Number(lock.holderTabId) !== Number(removedTabId)) {
+      return false;
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureExecutionLock]: {
+        ...lock,
+        holderTabId: Number(addedTabId),
+        updatedAt: new Date().toISOString(),
+      },
+    });
+    return true;
+  });
+}
+
+async function replaceUnattendedRunnerTabId(removedTabId, addedTabId) {
+  return await runUnattendedRunMutation(async () => {
+    const request = await readUnattendedKeywordRunRequest();
+    if (
+      !request ||
+      isTerminalUnattendedRunStatus(request.status) ||
+      Number(request.runnerTabId) !== Number(removedTabId)
+    ) {
+      return false;
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...request,
+      runnerTabId: Number(addedTabId),
+      updatedAt: now,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: request,
+      event: {
+        type: 'runner_replaced',
+        message: '浏览器已替换运行页，任务继续执行',
+        at: now,
+      },
+    });
+    return true;
+  });
+}
+
+async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
+  const normalizedAddedTabId = resolveCaptureTaskTabId(addedTabId);
+  const normalizedRemovedTabId = resolveCaptureTaskTabId(removedTabId);
+  if (!normalizedAddedTabId || !normalizedRemovedTabId) return false;
+
+  const previousDebugSession =
+    captureDebugSessionManager.getSession(normalizedRemovedTabId);
+  const previousGroup = captureTaskTabGroupManager
+    .getActiveTasks()
+    .find(
+      (group) =>
+        Number(group?.sourceTabId) === normalizedRemovedTabId ||
+        group?.workerTabIds?.includes(normalizedRemovedTabId),
+    );
+  const taskId = String(
+    previousDebugSession?.taskId || previousGroup?.taskId || '',
+  ).trim();
+  const replacementRole =
+    Number(previousGroup?.sourceTabId) === normalizedRemovedTabId
+      ? 'source'
+      : previousGroup?.workerTabIds?.includes(normalizedRemovedTabId)
+        ? 'worker'
+        : previousDebugSession?.persistent
+          ? 'source'
+          : '';
+
+  if (!taskId) {
+    await Promise.all([
+      replaceCaptureExecutionLockTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+      replaceUnattendedRunnerTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+    ]);
+    return false;
+  }
+
+  let replacementTab = null;
+  try {
+    replacementTab = await chrome.tabs.get(normalizedAddedTabId);
+    const groupResult = await captureTaskTabGroupManager.replaceTab({
+      removedTabId: normalizedRemovedTabId,
+      addedTabId: normalizedAddedTabId,
+    });
+    const debugResult = await captureDebugSessionManager.replaceTab({
+      removedTabId: normalizedRemovedTabId,
+      addedTabId: normalizedAddedTabId,
+      pageTitle: replacementTab?.title || '',
+      pageUrl: replacementTab?.url || '',
+    });
+    if (
+      groupResult?.replaced !== true ||
+      (replacementRole && debugResult?.replaced !== true)
+    ) {
+      throw createCaptureTaskError(
+        'capture_task_replacement_not_rebound',
+        '浏览器替换了采集页面，但任务未能重新绑定',
+      );
+    }
+    if (groupResult?.role === 'worker' || debugResult?.role === 'worker') {
+      replaceTrackedCaptureTaskWorkerTab(
+        taskId,
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      );
+    }
+    await Promise.all([
+      replaceCaptureExecutionLockTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+      replaceUnattendedRunnerTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+    ]);
+    return true;
+  } catch (error) {
+    const message = `浏览器替换采集页面后接管迁移失败：${String(
+      error?.message || error || '未知错误',
+    )}`;
+    const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
+      taskId,
+      reason: 'source_tab_replace_failed',
+    });
+    if (unattendedRecovery.handled) {
+      return Boolean(unattendedRecovery.recovery?.recovered);
+    }
+    await publishCaptureTaskCancellation(
+      taskId,
+      'source_tab_replace_failed',
+    );
+    await terminalizeCaptureTaskLedgerRun(taskId, {
+      reason: 'source_tab_replace_failed',
+      message,
+    });
+    const latestSession =
+      captureDebugSessionManager.getSessionByTaskId(taskId) ||
+      previousDebugSession;
+    await relayCaptureTaskCancellation(
+      latestSession,
+      'source_tab_replace_failed',
+    );
+    try {
+      await releaseCaptureTaskResourcesWithRetry(
+        {
+          taskId,
+          reason: 'source_tab_replace_failed',
+          debugSnapshot: latestSession,
+        },
+        {attempts: 3},
+      );
+    } catch (cleanupError) {
+      console.warn(
+        '[CaptureTask] replaced-tab cleanup remains pending:',
+        cleanupError,
+      );
+    }
+    return false;
+  }
+}
+
 async function handleCaptureRuntimeTabRemoved(tabId) {
   const session = captureDebugSessionManager.getSession(tabId);
   if (session?.persistent && session.taskId) {
     await publishCaptureTaskCancellation(session.taskId, 'source_tab_removed');
+    await terminalizeCaptureTaskLedgerRun(session.taskId, {
+      reason: 'source_tab_removed',
+      message: '采集来源页面已关闭，任务已停止',
+    });
     await relayCaptureTaskCancellation(session, 'source_tab_removed');
     try {
       await releaseCaptureTaskResourcesWithRetry(
@@ -4709,9 +5909,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   });
 });
 
-chrome.tabs.onReplaced?.addListener((_addedTabId, removedTabId) => {
-  handleCaptureRuntimeTabRemoved(removedTabId).catch((error) => {
-    console.warn('[onstarvoice] capture task replaced-tab cleanup failed', error);
+chrome.tabs.onReplaced?.addListener((addedTabId, removedTabId) => {
+  handleCaptureRuntimeTabReplaced(addedTabId, removedTabId).catch((error) => {
+    console.warn('[onstarvoice] capture task tab migration failed', error);
   });
 });
 
@@ -4861,6 +6061,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (type === 'onstarvoice:get-task-ledger') {
         const ledger = await readTaskLedger();
         sendResponse({ok: true, data: ledger});
+        return;
+      }
+
+      if (type === 'onstarvoice:clear-task-center') {
+        const result = await clearTaskCenterRecords();
+        sendResponse({ok: true, data: result});
         return;
       }
 

@@ -60,9 +60,19 @@ async function request(endpoint, options = {}) {
     timeout = DEFAULT_CONFIG.REQUEST_TIMEOUT,
     shouldStop = null,
     signal = null,
+    maxBaseAttempts = null,
   } = options;
 
-  const baseUrls = [activeApiBaseUrl, ...API_BASE_URLS.filter(base => base !== activeApiBaseUrl)];
+  const configuredBaseUrls = [
+    activeApiBaseUrl,
+    ...API_BASE_URLS.filter(base => base !== activeApiBaseUrl),
+  ];
+  const normalizedMaxBaseAttempts = Number(maxBaseAttempts);
+  const baseUrls =
+    Number.isSafeInteger(normalizedMaxBaseAttempts) &&
+    normalizedMaxBaseAttempts > 0
+      ? configuredBaseUrls.slice(0, normalizedMaxBaseAttempts)
+      : configuredBaseUrls;
   let lastUnavailableResult = null;
 
   for (const baseUrl of baseUrls) {
@@ -561,6 +571,71 @@ export async function analyzeBenchmarkDiscovery({
     },
     timeout: DEFAULT_CONFIG.BENCHMARK_DISCOVERY_TIMEOUT,
   });
+}
+
+// AI 前置相关性筛选。该接口属于采集加速的可选能力：扩展只提交列表页
+// 的必要文字证据，模型调用和密钥始终留在后台。这里限制为单一后台地址和
+// 有上限的等待；调用方使用小批次，让健康的 DeepSeek 响应能在截止前返回，
+// 同时避免接口尚未部署、限流或模型不可用时无限拖慢原采集链路。
+export async function prefilterRelevance(
+  {
+    requestId = '',
+    idempotencyKey = '',
+    platform = '',
+    stage = 'list',
+    keyword = '',
+    promptVersion = 'prefilter-list-v1',
+    mode = 'conservative',
+    skipThreshold = 0.97,
+    items = [],
+  } = {},
+  options = {},
+) {
+  const normalizedItems = Array.isArray(items) ? items : [];
+  if (!String(keyword || '').trim() || normalizedItems.length === 0) {
+    return {
+      ok: false,
+      status: 'error',
+      reason: ERROR_REASON.INVALID_REQUEST,
+      message: 'AI 相关性筛选缺少关键词或候选内容',
+      data: null,
+    };
+  }
+
+  const shouldStop = options?.shouldStop;
+  const signal = options?.signal || null;
+  if (isRequestCancellationRequested(shouldStop, signal)) {
+    return buildCanceledRequestResult();
+  }
+
+  const runtime = await getRuntime();
+  const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
+  if (!authCodeResult.ok) return authCodeResult;
+
+  return await request(
+    API_ENDPOINT.RELEVANCE_PREFILTER || '/api/relevance/prefilter',
+    {
+      body: {
+        code: authCodeResult.code,
+        clientUuid: runtime.clientUuid,
+        clientLabel: runtime.clientLabel,
+        appVersion: runtime.appVersion,
+        requestId: String(requestId || '').trim(),
+        idempotencyKey: String(idempotencyKey || '').trim(),
+        platform: String(platform || '').trim().toLowerCase(),
+        stage: String(stage || 'list').trim().toLowerCase(),
+        keyword: String(keyword || '').trim(),
+        promptVersion: String(promptVersion || 'prefilter-list-v1').trim(),
+        mode: String(mode || 'conservative').trim().toLowerCase(),
+        skipThreshold: Math.max(0.97, Math.min(1, Number(skipThreshold) || 0.97)),
+        items: normalizedItems,
+      },
+      timeout: Math.max(500, Math.min(10000, Number(options?.timeout) || 10000)),
+      shouldStop,
+      signal,
+      maxBaseAttempts: 1,
+    },
+  );
 }
 
 export async function getUpdateManifest() {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readFileSync} from "node:fs";
 import test from "node:test";
 
 import {
@@ -9,8 +10,11 @@ import {
   createListHarvestState,
   describeListHarvestState,
   evaluateListCaptureElementIdentity,
+  formatTaskTakeoverCountdown,
   normalizeListHarvestItemOutcome,
+  normalizeTaskTakeoverProgress,
   reduceListHarvestState,
+  resolveTaskTakeoverWaitState,
 } from "../../utils/capture/list-capture-debug-overlay.js";
 import {createListCaptureAcceptanceLedger} from "../../utils/capture/list-capture-trace.js";
 
@@ -59,6 +63,325 @@ function identityElement(attributes = {}, descendants = []) {
     },
   };
 }
+
+function createOverlayDomHarness() {
+  class FakeStyle {
+    setProperty() {}
+  }
+
+  class FakeElement {
+    constructor(tagName = "div") {
+      this.tagName = tagName;
+      this.attributes = new Map();
+      this.children = [];
+      this.parentNode = null;
+      this.style = new FakeStyle();
+      this.dataset = {};
+      this.className = "";
+      this.textContent = "";
+      this.hidden = false;
+      this.isConnected = false;
+    }
+
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    }
+
+    getAttribute(name) {
+      return this.attributes.get(name) ?? null;
+    }
+
+    removeAttribute(name) {
+      this.attributes.delete(name);
+    }
+
+    appendChild(child) {
+      child.parentNode = this;
+      child.isConnected = this.isConnected;
+      this.children.push(child);
+      return child;
+    }
+
+    append(...children) {
+      children.forEach((child) => this.appendChild(child));
+    }
+
+    attachShadow() {
+      return new FakeElement("#shadow-root");
+    }
+
+    querySelectorAll() {
+      return [];
+    }
+
+    remove() {
+      if (this.parentNode) {
+        this.parentNode.children = this.parentNode.children.filter(
+          (child) => child !== this,
+        );
+      }
+      this.parentNode = null;
+      this.isConnected = false;
+    }
+  }
+
+  const documentElement = new FakeElement("html");
+  documentElement.isConnected = true;
+  const documentRef = {
+    documentElement,
+    createElement(tagName) {
+      return new FakeElement(tagName);
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  class FakeMutationObserver {
+    observe() {}
+    disconnect() {}
+  }
+  let intervalSequence = 0;
+  const intervals = new Map();
+  const windowRef = {
+    MutationObserver: FakeMutationObserver,
+    addEventListener() {},
+    removeEventListener() {},
+    requestAnimationFrame() {
+      return 1;
+    },
+    cancelAnimationFrame() {},
+    setInterval(callback) {
+      intervalSequence += 1;
+      intervals.set(intervalSequence, callback);
+      return intervalSequence;
+    },
+    clearInterval(timerId) {
+      intervals.delete(timerId);
+    },
+  };
+  return {
+    documentRef,
+    windowRef,
+    runIntervals() {
+      Array.from(intervals.values()).forEach((callback) => callback());
+    },
+    getActiveIntervalCount() {
+      return intervals.size;
+    },
+  };
+}
+
+test("task takeover wait state uses an absolute reported deadline without inventing ETA", () => {
+  const reportedAt = 1_700_000_000_000;
+  assert.deepEqual(normalizeTaskTakeoverProgress(null), null);
+  assert.deepEqual(
+    normalizeTaskTakeoverProgress({
+      phase: " INTER_KEYWORD_DELAY ",
+      remainingMs: 7500,
+      updatedAt: reportedAt,
+      nextKeyword: "别克壁纸",
+    }),
+    {
+      phase: "inter_keyword_delay",
+      message: "",
+      reason: "",
+      nextKeyword: "别克壁纸",
+      remainingMs: 7500,
+      updatedAt: reportedAt,
+      waitUntil: "",
+    },
+  );
+
+  const relative = resolveTaskTakeoverWaitState(
+    {
+      phase: "inter_keyword_delay",
+      remainingMs: 7500,
+      updatedAt: reportedAt,
+      nextKeyword: "别克壁纸",
+    },
+    reportedAt + 2000,
+  );
+  assert.equal(relative.waiting, true);
+  assert.equal(relative.deadlineAt, reportedAt + 7500);
+  assert.equal(relative.remainingMs, 5500);
+  assert.equal(relative.nextKeyword, "别克壁纸");
+
+  const explicit = resolveTaskTakeoverWaitState(
+    {
+      phase: "waiting_next_round",
+      remainingMs: 99_000,
+      updatedAt: reportedAt,
+      waitUntil: reportedAt + 15_000,
+    },
+    reportedAt + 10_000,
+  );
+  assert.equal(explicit.waiting, true);
+  assert.equal(explicit.deadlineAt, reportedAt + 15_000);
+  assert.equal(explicit.remainingMs, 5000);
+
+  const missingAnchor = resolveTaskTakeoverWaitState(
+    {
+      phase: "keyword_retry_wait",
+      remainingMs: 5000,
+    },
+    reportedAt,
+  );
+  assert.equal(missingAnchor.waiting, false);
+  assert.equal(missingAnchor.deadlineAt, 0);
+
+  const ordinary = resolveTaskTakeoverWaitState(
+    {
+      phase: "capturing",
+      remainingMs: 5000,
+      updatedAt: reportedAt,
+    },
+    reportedAt,
+  );
+  assert.equal(ordinary.waiting, false);
+  const resultRetry = resolveTaskTakeoverWaitState(
+    {
+      phase: "waiting_results",
+      remainingMs: 3000,
+      updatedAt: reportedAt,
+    },
+    reportedAt + 1000,
+  );
+  assert.equal(resultRetry.waiting, true);
+  assert.equal(resultRetry.remainingMs, 2000);
+  assert.equal(resultRetry.reason, "搜索结果正在加载，稍后自动重试");
+  assert.equal(formatTaskTakeoverCountdown(5500), "00:06");
+  assert.equal(formatTaskTakeoverCountdown(3_661_000), "01:01:01");
+});
+
+test("task takeover expands only explicit waits and updates its countdown in DOM only", () => {
+  let now = 1_700_000_100_000;
+  const harness = createOverlayDomHarness();
+  const overlay = createListCaptureDebugOverlay({
+    documentRef: harness.documentRef,
+    windowRef: harness.windowRef,
+    now: () => now,
+  });
+
+  const ordinary = overlay.setTaskTakeover({
+    active: true,
+    label: "AI 正在接管",
+    progress: {
+      phase: "capturing",
+      message: "正在读取并筛选列表",
+      remainingMs: 5000,
+      updatedAt: now,
+    },
+  });
+  const host = overlay.getHost();
+  assert.equal(ordinary.waiting, false);
+  assert.equal(host.getAttribute("data-takeover-waiting"), "false");
+  assert.equal(host.getAttribute("data-takeover-label"), "正在读取并筛选列表");
+  assert.equal(harness.getActiveIntervalCount(), 0);
+
+  const waiting = overlay.setTaskTakeover({
+    active: true,
+    label: "AI 正在接管",
+    progress: {
+      phase: "inter_keyword_delay",
+      message: "本词已完成，等待安全间隔",
+      reason: "降低连续访问频率",
+      remainingMs: 5000,
+      updatedAt: now,
+      nextKeyword: "别克壁纸",
+    },
+  });
+  assert.equal(waiting.waiting, true);
+  assert.equal(waiting.deadlineAt, 1_700_000_105_000);
+  assert.equal(host.getAttribute("data-takeover-waiting"), "true");
+  assert.equal(
+    host.getAttribute("data-takeover-next-keyword"),
+    "别克壁纸",
+  );
+  assert.equal(
+    host.getAttribute("data-takeover-reason"),
+    "降低连续访问频率",
+  );
+  assert.equal(host.getAttribute("data-takeover-remaining-ms"), "5000");
+  assert.equal(harness.getActiveIntervalCount(), 1);
+  const stateBeforeCountdownTicks = overlay.getState();
+
+  now = 1_700_000_103_250;
+  harness.runIntervals();
+  assert.equal(host.getAttribute("data-takeover-remaining-ms"), "1750");
+  assert.deepEqual(overlay.getState(), stateBeforeCountdownTicks);
+
+  now = 1_700_000_105_000;
+  harness.runIntervals();
+  assert.equal(host.getAttribute("data-takeover-remaining-ms"), "0");
+  assert.equal(host.getAttribute("data-takeover-waiting"), "false");
+  assert.equal(
+    host.getAttribute("data-takeover-label"),
+    "等待结束，正在继续",
+  );
+  assert.equal(host.getAttribute("data-takeover-deadline-at"), "");
+  assert.equal(host.getAttribute("data-takeover-next-keyword"), "");
+  assert.equal(host.getAttribute("data-takeover-reason"), "");
+  assert.deepEqual(overlay.getState(), stateBeforeCountdownTicks);
+  assert.equal(harness.getActiveIntervalCount(), 0);
+
+  overlay.setTaskTakeover({active: false});
+  assert.equal(host.getAttribute("data-takeover-visible"), "false");
+  assert.equal(host.getAttribute("data-takeover-waiting"), "false");
+  assert.equal(harness.getActiveIntervalCount(), 0);
+  overlay.destroy();
+});
+
+test("task takeover timer is cleared by trace cleanup and reduced motion disables breathing", () => {
+  let now = 1_700_000_200_000;
+  const harness = createOverlayDomHarness();
+  const overlay = createListCaptureDebugOverlay({
+    documentRef: harness.documentRef,
+    windowRef: harness.windowRef,
+    now: () => now,
+  });
+  overlay.setTaskTakeover({
+    active: true,
+    progress: {
+      phase: "scheduled-waiting",
+      waitUntil: now + 60_000,
+      updatedAt: now,
+    },
+  });
+  assert.equal(harness.getActiveIntervalCount(), 1);
+  overlay.clearTaskTrace();
+  assert.equal(harness.getActiveIntervalCount(), 0);
+
+  const overlaySource = readFileSync(
+    new URL(
+      "../../utils/capture/list-capture-debug-overlay.js",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(
+    overlaySource,
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.takeover-live-dot[\s\S]*?animation: none/,
+  );
+});
+
+test("content takeover protocol forwards progress to the page overlay", () => {
+  const contentSource = readFileSync(
+    new URL("../../content-v2.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    contentSource,
+    /overlay\.setTaskTakeover\(\{[\s\S]*?active: true,[\s\S]*?progress: normalizedProgress/,
+  );
+  assert.match(
+    contentSource,
+    /Object\.prototype\.hasOwnProperty\.call\(request \|\| \{\}, "progress"\)/,
+  );
+  assert.match(
+    contentSource,
+    /takeoverOptions\.progress =[\s\S]*?request\?\.progress/,
+  );
+});
 
 test("externally assigned captureTrace numbers 1 through 40 remain the source of truth", () => {
   const items = Array.from({length: 40}, (_, index) =>
@@ -433,6 +756,79 @@ test("a superseded run scope cannot report or terminate the current overlay run"
   assert.equal(runB.complete().applied, true);
   assert.equal(overlay.getState().status, "completed");
   overlay.destroy();
+});
+
+test("task takeover survives a completed child list until explicitly released on both platforms", () => {
+  for (const platform of ["xiaohongshu", "douyin"]) {
+    const {documentRef, windowRef} = createOverlayDomHarness();
+    const overlay = createListCaptureDebugOverlay({documentRef, windowRef});
+
+    overlay.setTaskTakeover({
+      active: true,
+      label: `${platform} AI 正在接管`,
+    });
+    overlay.startSession({
+      sessionId: `${platform}-child-list-run`,
+      platform,
+    });
+    overlay.complete("子列表采集完成");
+
+    const host = overlay.getHost();
+    assert.equal(overlay.getState().status, "completed");
+    assert.equal(host.getAttribute("data-task-takeover-active"), "true");
+    assert.equal(host.getAttribute("data-takeover-visible"), "true");
+    assert.equal(
+      host.getAttribute("data-takeover-label"),
+      `${platform} AI 正在接管`,
+    );
+
+    overlay.setTaskTakeover({active: false});
+    assert.equal(host.getAttribute("data-task-takeover-active"), "false");
+    assert.equal(host.getAttribute("data-takeover-visible"), "false");
+    overlay.destroy();
+  }
+});
+
+test("terminal task trace cleanup removes the completed overlay and can start cleanly again", () => {
+  for (const platform of ["xiaohongshu", "douyin"]) {
+    const {documentRef, windowRef} = createOverlayDomHarness();
+    const overlay = createListCaptureDebugOverlay({documentRef, windowRef});
+    const runId = `${platform}-terminal-trace`;
+
+    overlay.setTaskTakeover({active: true});
+    overlay.startSession({sessionId: runId, platform});
+    overlay.recordItems([
+      tracedItem(1, `${platform}-terminal-item`, {
+        captureTrace: {
+          runId,
+          identityKey: `id:${platform}-terminal-item`,
+        },
+      }),
+    ]);
+    overlay.complete("任务完成");
+    assert.ok(overlay.getHost());
+    assert.equal(overlay.getState().acceptedCount, 1);
+
+    const cleanup = overlay.clearTaskTrace();
+    assert.equal(cleanup.cleared, true);
+    assert.equal(cleanup.runId, runId);
+    assert.equal(overlay.getHost(), null);
+    assert.equal(overlay.getState().sessionId, "");
+    assert.equal(overlay.getState().acceptedCount, 0);
+    assert.deepEqual(overlay.getRenderSnapshot(), {
+      markers: [],
+      visibleMarkerCount: 0,
+      unresolvedCount: 0,
+    });
+
+    overlay.startSession({
+      sessionId: `${runId}-next`,
+      platform,
+    });
+    assert.ok(overlay.getHost());
+    assert.equal(overlay.getState().sessionId, `${runId}-next`);
+    overlay.destroy();
+  }
 });
 
 test("skipped failed and ai-skipped traced items never enter marker state", () => {

@@ -1,0 +1,345 @@
+import { useMemo, useState } from 'react'
+import { Check, Loader2, Plus, Search, Tag, X } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
+import {
+  MAX_CUSTOM_TAG_NAME, MAX_CUSTOM_TAGS,
+  type CustomTag, type CustomTagPatch,
+} from '@/lib/custom-tags'
+
+interface DraftTag extends CustomTag {
+  pending?: boolean
+}
+
+const TAG_TONES = [
+  {
+    chip: 'bg-sky-500/10 text-sky-700 ring-sky-500/15 dark:text-sky-300',
+    dot: 'bg-sky-500',
+  },
+  {
+    chip: 'bg-violet-500/10 text-violet-700 ring-violet-500/15 dark:text-violet-300',
+    dot: 'bg-violet-500',
+  },
+  {
+    chip: 'bg-teal-500/10 text-teal-700 ring-teal-500/15 dark:text-teal-300',
+    dot: 'bg-teal-500',
+  },
+  {
+    chip: 'bg-amber-500/12 text-amber-700 ring-amber-500/20 dark:text-amber-300',
+    dot: 'bg-amber-500',
+  },
+  {
+    chip: 'bg-rose-500/10 text-rose-700 ring-rose-500/15 dark:text-rose-300',
+    dot: 'bg-rose-500',
+  },
+  {
+    chip: 'bg-slate-500/10 text-slate-600 ring-slate-500/15 dark:text-slate-300',
+    dot: 'bg-slate-500',
+  },
+]
+
+export function RecordLabelChips({
+  tags,
+  limit,
+  compact = false,
+  removable = false,
+  disabled = false,
+  onRemove,
+  className,
+}: {
+  tags: CustomTag[]
+  limit?: number
+  compact?: boolean
+  removable?: boolean
+  disabled?: boolean
+  onRemove?: (tag: CustomTag) => void
+  className?: string
+}) {
+  const visible = limit === undefined ? tags : tags.slice(0, limit)
+  const hidden = Math.max(0, tags.length - visible.length)
+
+  if (tags.length === 0) return null
+
+  return (
+    <div className={cn('flex min-w-0 flex-wrap items-center gap-1', className)}>
+      {visible.map(tag => {
+        const tone = toneForTag(tag)
+        return (
+          <span
+            key={tag.id}
+            title={tag.name}
+            className={cn(
+              'inline-flex min-w-0 items-center gap-1 rounded-md font-semibold ring-1 ring-inset',
+              compact ? 'max-w-28 px-1.5 py-0.5 text-[10px]' : 'max-w-44 px-2 py-1 text-[11px]',
+              tone.chip,
+            )}
+          >
+            <span className={cn('shrink-0 rounded-full', compact ? 'h-1.5 w-1.5' : 'h-2 w-2', tone.dot)} />
+            <span className="truncate">{tag.name}</span>
+            {removable && onRemove && (
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => onRemove(tag)}
+                aria-label={`移除标签 ${tag.name}`}
+                className="-mr-0.5 shrink-0 rounded p-0.5 opacity-60 transition hover:bg-black/5 hover:opacity-100 disabled:pointer-events-none disabled:opacity-30 dark:hover:bg-white/10"
+              >
+                <X className={compact ? 'h-2.5 w-2.5' : 'h-3 w-3'} />
+              </button>
+            )}
+          </span>
+        )
+      })}
+      {hidden > 0 && (
+        <span
+          title={tags.slice(visible.length).map(tag => tag.name).join('、')}
+          className={cn(
+            'rounded-md bg-muted font-semibold text-muted-foreground',
+            compact ? 'px-1.5 py-0.5 text-[10px]' : 'px-2 py-1 text-[11px]',
+          )}
+        >
+          +{hidden}
+        </span>
+      )}
+    </div>
+  )
+}
+
+export function RecordLabelEditor({
+  initialTags,
+  catalog,
+  onSave,
+  onCancel,
+  onSavingChange,
+}: {
+  initialTags: CustomTag[]
+  catalog: CustomTag[]
+  onSave: (patch: CustomTagPatch) => Promise<CustomTag[]>
+  onCancel: () => void
+  onSavingChange?: (saving: boolean) => void
+}) {
+  const [draft, setDraft] = useState<DraftTag[]>(() => initialTags.map(tag => ({ ...tag })))
+  const [query, setQuery] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const mergedCatalog = useMemo(() => {
+    const byId = new Map<string, CustomTag>()
+    for (const tag of [...catalog, ...initialTags]) byId.set(tag.id, tag)
+    return [...byId.values()].sort((a, b) =>
+      Number(b.usageCount || 0) - Number(a.usageCount || 0) || a.name.localeCompare(b.name, 'zh-CN'))
+  }, [catalog, initialTags])
+
+  const normalizedQuery = normalizeName(query)
+  const filteredCatalog = mergedCatalog.filter(tag =>
+    !normalizedQuery || normalizeName(tag.name).includes(normalizedQuery))
+  const exactCatalogTag = mergedCatalog.find(tag => normalizeName(tag.name) === normalizedQuery)
+  const exactDraftTag = draft.find(tag => normalizeName(tag.name) === normalizedQuery)
+  const canCreate = Boolean(normalizedQuery && !exactCatalogTag && !exactDraftTag)
+  const initialIds = useMemo(() => new Set(initialTags.map(tag => tag.id)), [initialTags])
+  const draftExistingIds = draft.filter(tag => !tag.pending).map(tag => tag.id)
+  const draftPendingNames = draft.filter(tag => tag.pending).map(tag => tag.name)
+  const addTagIds = draftExistingIds.filter(id => !initialIds.has(id))
+  const removeTagIds = initialTags.filter(tag => !draftExistingIds.includes(tag.id)).map(tag => tag.id)
+  const changed = addTagIds.length > 0 || removeTagIds.length > 0 || draftPendingNames.length > 0
+  const atLimit = draft.length >= MAX_CUSTOM_TAGS
+
+  const toggleCatalogTag = (tag: CustomTag) => {
+    setError('')
+    setDraft(current => {
+      const selected = current.some(item => item.id === tag.id)
+      if (selected) return current.filter(item => item.id !== tag.id)
+      if (current.length >= MAX_CUSTOM_TAGS) return current
+      return [...current, { ...tag }]
+    })
+  }
+
+  const addFromInput = () => {
+    const name = query.trim()
+    if (!name) return
+    if (name.length > MAX_CUSTOM_TAG_NAME) {
+      setError(`单个标签不能超过 ${MAX_CUSTOM_TAG_NAME} 个字`)
+      return
+    }
+    if (atLimit) {
+      setError(`每条内容最多添加 ${MAX_CUSTOM_TAGS} 个标签`)
+      return
+    }
+    if (exactDraftTag) {
+      setQuery('')
+      return
+    }
+    if (exactCatalogTag) {
+      toggleCatalogTag(exactCatalogTag)
+      setQuery('')
+      return
+    }
+    const normalized = normalizeName(name)
+    setDraft(current => [
+      ...current,
+      { id: `new:${normalized}`, name, pending: true },
+    ])
+    setQuery('')
+    setError('')
+  }
+
+  const save = async () => {
+    if (!changed || saving) return
+    setSaving(true)
+    onSavingChange?.(true)
+    setError('')
+    try {
+      await onSave({
+        addTagIds,
+        addNames: draftPendingNames,
+        removeTagIds,
+      })
+      onCancel()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '标签保存失败，请稍后重试')
+    } finally {
+      setSaving(false)
+      onSavingChange?.(false)
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-xl border border-border bg-background/80 p-3 shadow-sm animate-in fade-in slide-in-from-top-1 duration-150">
+      <div className="flex items-start gap-2">
+        <div>
+          <div className="text-[12px] font-bold text-foreground">管理自定义标签</div>
+          <div className="mt-0.5 text-[11px] text-muted-foreground">选择已有标签，或输入名称创建新标签。</div>
+        </div>
+        <span className={cn('ml-auto text-[10.5px] font-semibold tabular-nums', atLimit ? 'text-amber-600 dark:text-amber-300' : 'text-muted-foreground')}>
+          {draft.length}/{MAX_CUSTOM_TAGS}
+        </span>
+      </div>
+
+      {draft.length > 0 ? (
+        <RecordLabelChips
+          tags={draft}
+          removable
+          disabled={saving}
+          onRemove={tag => {
+            setDraft(current => current.filter(item => item.id !== tag.id))
+            setError('')
+          }}
+          className="mt-3"
+        />
+      ) : (
+        <div className="mt-3 rounded-lg border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
+          暂无标签，从下方选择或创建。
+        </div>
+      )}
+
+      <div className="relative mt-3">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        <input
+          value={query}
+          maxLength={MAX_CUSTOM_TAG_NAME}
+          disabled={saving}
+          onChange={event => {
+            setQuery(event.target.value)
+            if (error) setError('')
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Enter') {
+              event.preventDefault()
+              addFromInput()
+            }
+          }}
+          placeholder="搜索或输入新标签…"
+          className="h-8 w-full rounded-lg border border-border bg-card pl-8 pr-12 text-[12px] outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15 disabled:opacity-60"
+        />
+        {query && (
+          <button
+            type="button"
+            onClick={() => setQuery('')}
+            className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label="清空搜索"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+
+      <div className="mt-2 max-h-44 overflow-y-auto rounded-lg border border-border/70 bg-card p-1">
+        {canCreate && (
+          <button
+            type="button"
+            disabled={atLimit || saving}
+            onClick={addFromInput}
+            className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-[12px] font-semibold text-primary transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            <span className="min-w-0 truncate">创建“{query.trim()}”</span>
+          </button>
+        )}
+        {filteredCatalog.length === 0 && !canCreate ? (
+          <div className="px-2 py-5 text-center text-[11px] text-muted-foreground">
+            {mergedCatalog.length ? '没有匹配的标签' : '暂无可复用标签'}
+          </div>
+        ) : filteredCatalog.map(tag => {
+          const selected = draft.some(item => item.id === tag.id)
+          const tone = toneForTag(tag)
+          return (
+            <button
+              key={tag.id}
+              type="button"
+              disabled={saving || (!selected && atLimit)}
+              onClick={() => toggleCatalogTag(tag)}
+              className={cn(
+                'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40',
+                selected && 'bg-accent/70',
+              )}
+            >
+              <span className={cn('h-2 w-2 shrink-0 rounded-full', tone.dot)} />
+              <span className="min-w-0 flex-1 truncate font-medium">{tag.name}</span>
+              {Number(tag.usageCount || 0) > 0 && (
+                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{Number(tag.usageCount).toLocaleString('zh-CN')}</span>
+              )}
+              <span className={cn(
+                'flex h-4 w-4 shrink-0 items-center justify-center rounded border',
+                selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border',
+              )}>
+                {selected && <Check className="h-3 w-3" strokeWidth={3} />}
+              </span>
+            </button>
+          )
+        })}
+      </div>
+
+      {error && <p className="mt-2 text-[11px] font-medium text-destructive">{error}</p>}
+      {!error && atLimit && <p className="mt-2 text-[11px] text-amber-600 dark:text-amber-300">已达到每条内容的标签上限。</p>}
+
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>取消</Button>
+        <Button size="sm" onClick={save} disabled={!changed || saving}>
+          {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+          保存标签
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+export function RecordLabelsHeading() {
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1 text-[11px] font-semibold text-muted-foreground">
+      <Tag className="h-3 w-3" />自定义标签
+    </span>
+  )
+}
+
+function toneForTag(tag: Pick<CustomTag, 'id' | 'name'>) {
+  const input = `${tag.id}:${tag.name}`
+  let hash = 0
+  for (let index = 0; index < input.length; index += 1) {
+    hash = ((hash << 5) - hash + input.charCodeAt(index)) | 0
+  }
+  return TAG_TONES[Math.abs(hash) % TAG_TONES.length]
+}
+
+function normalizeName(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLocaleLowerCase('zh-CN')
+}

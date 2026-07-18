@@ -31,6 +31,32 @@ export const LIST_HARVEST_STATES = Object.freeze([
 ]);
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+const TASK_TAKEOVER_WAIT_PHASES = new Set([
+  "waiting",
+  "backoff",
+  "inter_keyword_delay",
+  "waiting_next_round",
+  "keyword_retry_wait",
+  "scheduled-waiting",
+  "scheduled_waiting",
+  "enhance_retry_waiting",
+  "detail_item_delay",
+  "protected_waiting",
+  "waiting_results",
+]);
+const TASK_TAKEOVER_WAIT_REASONS = Object.freeze({
+  waiting: "正在等待安全继续条件",
+  backoff: "页面访问需要降频，稍后自动继续",
+  inter_keyword_delay: "为降低连续访问频率，正在等待下一个关键词",
+  waiting_next_round: "本轮已完成，正在按计划等待下一轮",
+  keyword_retry_wait: "当前关键词暂未完成，正在等待自动重试",
+  "scheduled-waiting": "正在等待计划设定的开始时间",
+  scheduled_waiting: "正在等待计划设定的开始时间",
+  enhance_retry_waiting: "作品详情暂未完成，正在等待自动重试",
+  detail_item_delay: "当前作品已处理，正在等待下一条",
+  protected_waiting: "正在安全等待，完成后自动继续",
+  waiting_results: "搜索结果正在加载，稍后自动重试",
+});
 const NON_NUMBERED_OUTCOMES = new Set([
   "ai_skipped",
   "cancelled",
@@ -67,6 +93,7 @@ const CARD_CONTAINER_SELECTOR = [
   "[data-e2e='search-result-card']",
   "[data-e2e='user-post-item']",
   "[id^='waterfall_item_']",
+  "[id^='search_card_']",
   "[data-aweme-id]",
   "[data-e2e-aweme-id]",
   "[data-item-id]",
@@ -78,8 +105,10 @@ const FALLBACK_CARD_SELECTOR = [
   "a[href*='/discovery/item/']",
   "a[href*='/video/']",
   "a[href*='/note/']",
+  "a[href*='modal_id=']",
   "a[data-href*='/video/']",
   "a[data-href*='/note/']",
+  "a[data-href*='modal_id=']",
 ].join(",");
 
 const OVERLAY_STYLES = `
@@ -165,6 +194,19 @@ const OVERLAY_STYLES = `
     animation: none !important;
     transition: none !important;
   }
+  .takeover.is-waiting {
+    left: 24px;
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr) auto;
+    width: min(430px, calc(100vw - 48px));
+    min-height: 112px;
+    padding: 16px 18px 16px 14px;
+    border: 1px solid #55515f;
+    border-left: 4px solid #8a6cff;
+    border-radius: 18px;
+    background: rgba(28, 28, 34, 0.97);
+    transform: none;
+  }
   .takeover[hidden] {
     display: none !important;
   }
@@ -175,9 +217,97 @@ const OVERLAY_STYLES = `
     place-items: center;
     border-radius: 50%;
     background: #17171d;
-    color: #c957ff;
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
-    font: 700 20px/1 sans-serif;
+  }
+  .takeover-live-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #8a6cff;
+    box-shadow: 0 0 0 0 rgba(138, 108, 255, 0.5);
+    animation: takeover-breathe 1.8s ease-in-out infinite;
+  }
+  @keyframes takeover-breathe {
+    0%, 100% {
+      opacity: 0.72;
+      box-shadow: 0 0 0 0 rgba(138, 108, 255, 0.42);
+    }
+    50% {
+      opacity: 1;
+      box-shadow: 0 0 0 7px rgba(138, 108, 255, 0);
+    }
+  }
+  .takeover-copy {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .takeover-label,
+  .takeover-detail,
+  .takeover-next {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .takeover-label {
+    color: #fff;
+    font: 700 15px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .takeover-detail {
+    color: #aaa8b4;
+    font: 500 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .takeover-countdown {
+    display: none;
+    min-width: 104px;
+    color: #f5f2ff;
+    font: 750 34px/1 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.04em;
+    text-align: right;
+  }
+  .takeover-next {
+    display: none;
+    grid-column: 2 / -1;
+    color: #cbc5ee;
+    font: 600 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .takeover.is-waiting .takeover-icon {
+    align-self: start;
+  }
+  .takeover.is-waiting .takeover-countdown,
+  .takeover.is-waiting .takeover-next:not([hidden]) {
+    display: block;
+  }
+  .takeover.is-waiting .takeover-label {
+    font-size: 13px;
+  }
+  .takeover.is-waiting .takeover-detail {
+    margin-top: 2px;
+    overflow: visible;
+    color: #d7d5dd;
+    text-overflow: clip;
+    white-space: normal;
+  }
+  @media (max-width: 420px) {
+    .takeover.is-waiting {
+      left: 12px;
+      grid-template-columns: 34px minmax(0, 1fr);
+      width: calc(100vw - 24px);
+    }
+    .takeover.is-waiting .takeover-countdown {
+      grid-column: 2;
+      margin-top: 8px;
+      text-align: left;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .takeover-live-dot {
+      animation: none;
+      box-shadow: none;
+      opacity: 1;
+    }
   }
 `;
 
@@ -238,6 +368,119 @@ function rectanglesOverlap(first, second) {
 
 function cleanText(value) {
   return String(value || "").replace(/\s+/gu, " ").trim();
+}
+
+function normalizeTimestampMs(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric < 1e11 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function isTaskTakeoverWaitPhase(phase) {
+  const normalizedPhase = cleanText(phase).toLowerCase();
+  return (
+    TASK_TAKEOVER_WAIT_PHASES.has(normalizedPhase) ||
+    normalizedPhase.includes("backoff")
+  );
+}
+
+function resolveTaskTakeoverWaitReason(progress = {}) {
+  const phase = cleanText(progress.phase).toLowerCase();
+  return (
+    cleanText(progress.waitReason || progress.reason) ||
+    TASK_TAKEOVER_WAIT_REASONS[phase] ||
+    (phase.includes("backoff")
+      ? TASK_TAKEOVER_WAIT_REASONS.backoff
+      : cleanText(progress.message)) ||
+    "正在等待，完成后自动继续"
+  );
+}
+
+export function normalizeTaskTakeoverProgress(progress = null) {
+  if (!progress || typeof progress !== "object" || Array.isArray(progress)) {
+    return null;
+  }
+  const remainingMs = Number(progress.remainingMs);
+  return {
+    phase: cleanText(progress.phase).toLowerCase(),
+    message: cleanText(progress.message).slice(0, 320),
+    reason: cleanText(progress.waitReason || progress.reason).slice(0, 320),
+    nextKeyword: cleanText(
+      progress.nextKeyword || progress.next_keyword,
+    ).slice(0, 160),
+    remainingMs:
+      Number.isFinite(remainingMs) && remainingMs >= 0
+        ? remainingMs
+        : null,
+    updatedAt: progress.updatedAt ?? "",
+    waitUntil: cleanText(progress.waitUntil || progress.wait_until),
+  };
+}
+
+export function resolveTaskTakeoverWaitState(
+  progress = null,
+  currentTime = Date.now(),
+) {
+  const normalized = normalizeTaskTakeoverProgress(progress);
+  const now = Number(currentTime);
+  if (
+    !normalized ||
+    !isTaskTakeoverWaitPhase(normalized.phase) ||
+    !Number.isFinite(now)
+  ) {
+    return {
+      waiting: false,
+      phase: normalized?.phase || "",
+      deadlineAt: 0,
+      remainingMs: null,
+      reason: "",
+      nextKeyword: normalized?.nextKeyword || "",
+    };
+  }
+
+  const explicitWaitUntil = normalizeTimestampMs(normalized.waitUntil);
+  const reportedAt = normalizeTimestampMs(normalized.updatedAt);
+  const relativeDeadline =
+    reportedAt > 0 && normalized.remainingMs !== null
+      ? reportedAt + normalized.remainingMs
+      : 0;
+  const deadlineAt = explicitWaitUntil || relativeDeadline;
+  if (!deadlineAt) {
+    return {
+      waiting: false,
+      phase: normalized.phase,
+      deadlineAt: 0,
+      remainingMs: null,
+      reason: resolveTaskTakeoverWaitReason(normalized),
+      nextKeyword: normalized.nextKeyword,
+    };
+  }
+
+  return {
+    waiting: true,
+    phase: normalized.phase,
+    deadlineAt,
+    remainingMs: Math.max(0, deadlineAt - now),
+    reason: resolveTaskTakeoverWaitReason(normalized),
+    nextKeyword: normalized.nextKeyword,
+  };
+}
+
+export function formatTaskTakeoverCountdown(remainingMs = 0) {
+  const totalSeconds = Math.max(
+    0,
+    Math.ceil((Number(remainingMs) || 0) / 1000),
+  );
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function normalizeStateName(value, fallback = "running") {
@@ -773,9 +1016,13 @@ function resolveCardContainer(node, windowRef) {
   const structural = node.closest?.(CARD_CONTAINER_SELECTOR);
   if (structural) return structural;
   const link = node.closest?.(
-    "a[href*='/explore/'],a[href*='/discovery/item/'],a[href*='/video/'],a[href*='/note/'],a[data-href*='/video/'],a[data-href*='/note/']",
+    "a[href*='/explore/'],a[href*='/discovery/item/'],a[href*='/video/'],a[href*='/note/'],a[href*='modal_id='],a[data-href*='/video/'],a[data-href*='/note/'],a[data-href*='modal_id=']",
   );
-  return link || node;
+  const boundedCard =
+    link?.closest?.(
+      "[id^='search_card_'],article,li,[role='listitem'],section",
+    ) || null;
+  return boundedCard || link || node;
 }
 
 function collectElementIdentityValues(element) {
@@ -789,6 +1036,12 @@ function collectElementIdentityValues(element) {
     ).slice(0, 80),
   ];
   nodes.forEach((node) => {
+    const semanticDomId = cleanText(node.id).match(
+      /^(?:waterfall_item_|search_card_)(\d{8,})$/iu,
+    )?.[1];
+    if (semanticDomId) {
+      values.push({type: "id", value: normalizeIdentityId(semanticDomId)});
+    }
     const domCaptureKey = cleanText(node.getAttribute?.("data-osv-capture-key"));
     if (domCaptureKey) {
       values.push({type: "dom", value: domCaptureKey.toLowerCase()});
@@ -1095,6 +1348,7 @@ export function createListCaptureOverlayRunScope(overlay, runId) {
 export function createListCaptureDebugOverlay({
   documentRef = globalThis.document,
   windowRef = globalThis.window,
+  now = () => Date.now(),
 } = {}) {
   let state = createListHarvestState();
   let host = null;
@@ -1103,6 +1357,9 @@ export function createListCaptureDebugOverlay({
   let markerLayer = null;
   let takeover = null;
   let takeoverLabel = null;
+  let takeoverDetail = null;
+  let takeoverCountdown = null;
+  let takeoverNext = null;
   let mutationObserver = null;
   let resizeObserver = null;
   let resizeObservedElements = new Set();
@@ -1111,6 +1368,11 @@ export function createListCaptureDebugOverlay({
   let stampedElements = new Set();
   let markerElements = new Map();
   let markerInstanceCounter = 0;
+  let taskTakeoverActive = false;
+  let taskTakeoverLabel = "AI 正在接管";
+  let taskTakeoverProgress = null;
+  let taskTakeoverDeadlineAt = 0;
+  let taskTakeoverCountdownTimer = 0;
   let lastRenderSnapshot = {
     markers: [],
     visibleMarkerCount: 0,
@@ -1157,6 +1419,140 @@ export function createListCaptureDebugOverlay({
   const clearMarkerElements = () => {
     markerElements.forEach(({marker}) => marker.remove());
     markerElements = new Map();
+  };
+
+  const clearTaskTakeoverCountdownTimer = () => {
+    if (!taskTakeoverCountdownTimer) return;
+    const clearIntervalFn =
+      windowRef?.clearInterval?.bind(windowRef) ||
+      globalThis.clearInterval?.bind(globalThis);
+    clearIntervalFn?.(taskTakeoverCountdownTimer);
+    taskTakeoverCountdownTimer = 0;
+  };
+
+  const renderTaskTakeoverCountdown = () => {
+    if (!taskTakeoverActive || !taskTakeoverDeadlineAt) return;
+    const remainingMs = Math.max(
+      0,
+      taskTakeoverDeadlineAt - Number(now()),
+    );
+    if (takeoverCountdown) {
+      takeoverCountdown.textContent = formatTaskTakeoverCountdown(remainingMs);
+    }
+    host?.setAttribute(
+      "data-takeover-remaining-ms",
+      String(Math.ceil(remainingMs)),
+    );
+    if (remainingMs <= 0) {
+      takeover.className = "takeover";
+      if (takeoverLabel) {
+        takeoverLabel.textContent = "等待结束，正在继续";
+      }
+      if (takeoverDetail) {
+        takeoverDetail.hidden = true;
+        takeoverDetail.textContent = "";
+      }
+      if (takeoverCountdown) {
+        takeoverCountdown.textContent = "";
+      }
+      if (takeoverNext) {
+        takeoverNext.hidden = true;
+        takeoverNext.textContent = "";
+      }
+      host?.setAttribute("data-takeover-waiting", "false");
+      host?.setAttribute("data-takeover-label", "等待结束，正在继续");
+      host?.setAttribute("data-takeover-deadline-at", "");
+      host?.setAttribute("data-takeover-next-keyword", "");
+      host?.setAttribute("data-takeover-reason", "");
+      taskTakeoverDeadlineAt = 0;
+      clearTaskTakeoverCountdownTimer();
+    }
+  };
+
+  const ensureTaskTakeoverCountdownTimer = () => {
+    if (
+      taskTakeoverCountdownTimer ||
+      !taskTakeoverActive ||
+      !taskTakeoverDeadlineAt ||
+      taskTakeoverDeadlineAt <= Number(now())
+    ) {
+      return;
+    }
+    const setIntervalFn =
+      windowRef?.setInterval?.bind(windowRef) ||
+      globalThis.setInterval?.bind(globalThis);
+    taskTakeoverCountdownTimer =
+      setIntervalFn?.(renderTaskTakeoverCountdown, 1000) || 0;
+  };
+
+  const syncTaskTakeoverPresentation = () => {
+    if (!host || !takeover) return;
+    const waitState = resolveTaskTakeoverWaitState(
+      taskTakeoverProgress,
+      Number(now()),
+    );
+    const waiting = taskTakeoverActive && waitState.waiting;
+    const progressMessage = cleanText(taskTakeoverProgress?.message);
+    const nextTakeoverLabel =
+      progressMessage || taskTakeoverLabel || "AI 正在接管";
+
+    takeover.className = waiting ? "takeover is-waiting" : "takeover";
+    takeover.hidden = !taskTakeoverActive &&
+      state.status !== "running" &&
+      state.status !== "backoff";
+    takeover.setAttribute(
+      "aria-label",
+      waiting
+        ? `StarVoice 正在安全等待：${waitState.reason}`
+        : nextTakeoverLabel,
+    );
+    if (takeoverLabel) {
+      takeoverLabel.textContent = waiting ? "安全等待" : nextTakeoverLabel;
+    }
+    if (takeoverDetail) {
+      takeoverDetail.hidden = !waiting;
+      takeoverDetail.textContent = waiting ? waitState.reason : "";
+    }
+    if (takeoverNext) {
+      takeoverNext.hidden = !waiting || !waitState.nextKeyword;
+      takeoverNext.textContent =
+        waiting && waitState.nextKeyword
+          ? `接下来：搜索「${waitState.nextKeyword}」`
+          : "";
+    }
+
+    host.setAttribute("data-task-takeover-active", String(taskTakeoverActive));
+    host.setAttribute("data-takeover-visible", String(!takeover.hidden));
+    host.setAttribute("data-takeover-label", nextTakeoverLabel);
+    host.setAttribute("data-takeover-waiting", String(waiting));
+    host.setAttribute("data-takeover-phase", waitState.phase || "");
+    host.setAttribute(
+      "data-takeover-deadline-at",
+      waiting ? String(waitState.deadlineAt) : "",
+    );
+    host.setAttribute(
+      "data-takeover-next-keyword",
+      waiting ? waitState.nextKeyword : "",
+    );
+    host.setAttribute(
+      "data-takeover-reason",
+      waiting ? waitState.reason : "",
+    );
+
+    if (!waiting) {
+      taskTakeoverDeadlineAt = 0;
+      host.setAttribute("data-takeover-remaining-ms", "");
+      if (takeoverCountdown) takeoverCountdown.textContent = "";
+      clearTaskTakeoverCountdownTimer();
+      return;
+    }
+
+    if (taskTakeoverDeadlineAt !== waitState.deadlineAt) {
+      clearTaskTakeoverCountdownTimer();
+      taskTakeoverDeadlineAt = waitState.deadlineAt;
+    }
+    renderTaskTakeoverCountdown();
+    ensureTaskTakeoverCountdownTimer();
   };
 
   const syncResizeObservation = (elements) => {
@@ -1253,12 +1649,7 @@ export function createListCaptureDebugOverlay({
       "aria-label",
       `StarVoice 列表采集：${copy.title}，已标记 ${state.acceptedCount} 条`,
     );
-    const takeoverVisible = state.status === "running" || state.status === "backoff";
-    const nextTakeoverLabel = "AI 正在接管";
-    host.setAttribute("data-takeover-visible", String(takeoverVisible));
-    host.setAttribute("data-takeover-label", nextTakeoverLabel);
-    if (takeover) takeover.hidden = !takeoverVisible;
-    if (takeoverLabel) takeoverLabel.textContent = nextTakeoverLabel;
+    syncTaskTakeoverPresentation();
   };
 
   const ensureMounted = () => {
@@ -1316,12 +1707,34 @@ export function createListCaptureDebugOverlay({
     takeover = documentRef.createElement("div");
     takeover.className = "takeover";
     takeover.setAttribute("role", "status");
+    takeover.setAttribute("aria-live", "polite");
+    takeover.setAttribute("aria-atomic", "true");
     const takeoverIcon = documentRef.createElement("span");
     takeoverIcon.className = "takeover-icon";
     takeoverIcon.setAttribute("aria-hidden", "true");
-    takeoverIcon.textContent = "ϟ";
+    const takeoverLiveDot = documentRef.createElement("span");
+    takeoverLiveDot.className = "takeover-live-dot";
+    takeoverIcon.appendChild(takeoverLiveDot);
+    const takeoverCopy = documentRef.createElement("span");
+    takeoverCopy.className = "takeover-copy";
     takeoverLabel = documentRef.createElement("span");
-    takeover.append(takeoverIcon, takeoverLabel);
+    takeoverLabel.className = "takeover-label";
+    takeoverDetail = documentRef.createElement("span");
+    takeoverDetail.className = "takeover-detail";
+    takeoverDetail.hidden = true;
+    takeoverCopy.append(takeoverLabel, takeoverDetail);
+    takeoverCountdown = documentRef.createElement("span");
+    takeoverCountdown.className = "takeover-countdown";
+    takeoverCountdown.setAttribute("aria-hidden", "true");
+    takeoverNext = documentRef.createElement("span");
+    takeoverNext.className = "takeover-next";
+    takeoverNext.hidden = true;
+    takeover.append(
+      takeoverIcon,
+      takeoverCopy,
+      takeoverCountdown,
+      takeoverNext,
+    );
     root.appendChild(takeover);
 
     documentRef.documentElement.appendChild(host);
@@ -1552,6 +1965,54 @@ export function createListCaptureDebugOverlay({
     if (!state.sessionId) startSession();
   };
 
+  const destroyOverlay = () => {
+    const clearedRunId = cleanText(state.sessionId);
+    let clearedAttributeCount = 0;
+    clearTaskTakeoverCountdownTimer();
+    if (rafId) {
+      if (windowRef?.cancelAnimationFrame) windowRef.cancelAnimationFrame(rafId);
+      else windowRef?.clearTimeout?.(rafId);
+    }
+    rafId = 0;
+    mutationObserver?.disconnect();
+    mutationObserver = null;
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    resizeObservedElements = new Set();
+    if (mounted) {
+      windowRef?.removeEventListener?.("scroll", scheduleRender, {capture: true});
+      windowRef?.removeEventListener?.("resize", scheduleRender);
+    }
+    mounted = false;
+    clearedAttributeCount = cleanupRunAttributes(clearedRunId);
+    clearMarkerElements();
+    host?.remove();
+    host = null;
+    shadowRoot = null;
+    root = null;
+    markerLayer = null;
+    takeover = null;
+    takeoverLabel = null;
+    takeoverDetail = null;
+    takeoverCountdown = null;
+    takeoverNext = null;
+    taskTakeoverActive = false;
+    taskTakeoverLabel = "AI 正在接管";
+    taskTakeoverProgress = null;
+    taskTakeoverDeadlineAt = 0;
+    lastRenderSnapshot = {
+      markers: [],
+      visibleMarkerCount: 0,
+      unresolvedCount: 0,
+    };
+    state = createListHarvestState();
+    return {
+      cleared: Boolean(clearedRunId || clearedAttributeCount),
+      runId: clearedRunId,
+      clearedAttributeCount,
+    };
+  };
+
   return Object.freeze({
     startSession,
     handleProgress(progress = {}) {
@@ -1584,6 +2045,48 @@ export function createListCaptureDebugOverlay({
         runId: state.sessionId,
         updatedCount: result.updatedCount,
         ignoredCount: result.ignoredCount,
+      };
+    },
+    setTaskTakeover(options = {}) {
+      const {active = false, label = "", progress} = options;
+      taskTakeoverActive = Boolean(active);
+      taskTakeoverLabel = cleanText(label) || "AI 正在接管";
+      if (Object.prototype.hasOwnProperty.call(options, "progress")) {
+        taskTakeoverProgress = normalizeTaskTakeoverProgress(progress);
+      }
+      if (!taskTakeoverActive) {
+        taskTakeoverProgress = null;
+        taskTakeoverDeadlineAt = 0;
+        clearTaskTakeoverCountdownTimer();
+      }
+      if (ensureMounted()) {
+        updateHostContract();
+        scheduleRender();
+      }
+      const waitState = resolveTaskTakeoverWaitState(
+        taskTakeoverProgress,
+        Number(now()),
+      );
+      return {
+        active: taskTakeoverActive,
+        label: taskTakeoverLabel,
+        progress: taskTakeoverProgress
+          ? {...taskTakeoverProgress}
+          : null,
+        waiting: taskTakeoverActive && waitState.waiting,
+        phase: waitState.phase,
+        deadlineAt:
+          taskTakeoverActive && waitState.waiting
+            ? waitState.deadlineAt
+            : 0,
+        remainingMs:
+          taskTakeoverActive && waitState.waiting
+            ? waitState.remainingMs
+            : null,
+        nextKeyword:
+          taskTakeoverActive && waitState.waiting
+            ? waitState.nextKeyword
+            : "",
       };
     },
     setRunning(message = "") {
@@ -1644,38 +2147,8 @@ export function createListCaptureDebugOverlay({
         unresolvedCount: lastRenderSnapshot.unresolvedCount,
       };
     },
-    destroy() {
-      if (rafId) {
-        if (windowRef?.cancelAnimationFrame) windowRef.cancelAnimationFrame(rafId);
-        else windowRef?.clearTimeout?.(rafId);
-      }
-      rafId = 0;
-      mutationObserver?.disconnect();
-      mutationObserver = null;
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-      resizeObservedElements = new Set();
-      if (mounted) {
-        windowRef?.removeEventListener?.("scroll", scheduleRender, {capture: true});
-        windowRef?.removeEventListener?.("resize", scheduleRender);
-      }
-      mounted = false;
-      cleanupRunAttributes(state.sessionId);
-      clearMarkerElements();
-      host?.remove();
-      host = null;
-      shadowRoot = null;
-      root = null;
-      markerLayer = null;
-      takeover = null;
-      takeoverLabel = null;
-      lastRenderSnapshot = {
-        markers: [],
-        visibleMarkerCount: 0,
-        unresolvedCount: 0,
-      };
-      state = createListHarvestState();
-    },
+    clearTaskTrace: destroyOverlay,
+    destroy: destroyOverlay,
   });
 }
 

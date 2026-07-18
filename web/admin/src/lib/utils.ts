@@ -125,9 +125,31 @@ export function platformName(key: string): string {
 const BRAND_MODEL_RE = /(安吉星|onstar|别克|凯迪拉克|凯迪|雪佛兰|buick|cadillac|chevrolet|上汽通用|君越|君威|昂科威|昂科拉|昂科旗|gl8|gl6|英朗|威朗|凯越|微蓝|velite|阅朗|ct4|ct5|ct6|xt4|xt5|xt6|锐歌|lyriq|凯雷德|科鲁兹|科沃兹|迈锐宝|创酷|创界|探界者|开拓者|沃兰多|星迈罗|赛欧|畅巡|景程)/i
 const DEALER_NAME_RE = /(4s|旗舰店|体验中心|服务中心|销售服务|特约|经销|汽贸)/i
 
+function kolIdentityLabel(fans?: number | null): string {
+  const f = Number(fans)
+  if (!Number.isFinite(f) || f <= 0) return 'KOL'
+  if (f < 50000) return 'KOC'
+  if (f < 500000) return '初级KOL'
+  if (f < 3000000) return '中级KOL'
+  return '头部KOL'
+}
+
 // 疑似身份:① 账号名带品牌/车型 → 像门店/经销(或 LLM 判经销)=4S店,否则 =KOE;
 //          ② 名字不带品牌 → 按 LLM source_type:用户(ugc)·KOL 按粉丝分级(KOC<5万/初级<50万/中级<300万/头部≥300万)·4S店·KOE(员工)·其他
-export function identityLabel(sourceType?: string | null, fans?: number | null, name?: string | null): string {
+export function identityLabel(sourceType?: string | null, fans?: number | null, name?: string | null, override?: string | null): string {
+  const manual = String(override || '').trim()
+  if (['kol', 'pgc'].includes(manual.toLowerCase())) return kolIdentityLabel(fans)
+  if (manual) {
+    return {
+      user: '用户',
+      ugc: '用户',
+      dealer: '4S店',
+      '4s': '4S店',
+      koe: 'KOE',
+      employee: 'KOE',
+      other: '其他',
+    }[manual.toLowerCase()] || manual
+  }
   const nm = String(name || '')
   const st = String(sourceType || '')
   if (BRAND_MODEL_RE.test(nm)) {
@@ -137,14 +159,7 @@ export function identityLabel(sourceType?: string | null, fans?: number | null, 
   if (st === 'employee') return 'KOE'
   if (st === 'ugc') return '用户'
   if (st === 'other') return '其他'
-  if (st === 'pgc') {
-    const f = Number(fans)
-    if (!Number.isFinite(f) || f <= 0) return 'KOL'
-    if (f < 50000) return 'KOC'
-    if (f < 500000) return '初级KOL'
-    if (f < 3000000) return '中级KOL'
-    return '头部KOL'
-  }
+  if (st === 'pgc') return kolIdentityLabel(fans)
   return ''
 }
 

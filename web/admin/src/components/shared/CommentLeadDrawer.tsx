@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, ExternalLink, MessageCircle, Footprints, CheckCheck, CircleSlash, Send } from 'lucide-react'
+import { X, ExternalLink, MessageCircle, Footprints, CheckCheck, CircleSlash, Send, ArrowLeft } from 'lucide-react'
 import { formatNumber, formatDate, formatFullDate, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
@@ -72,22 +72,23 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
   )
 
   return (
-    <div ref={panelRef} style={{ width }}
-      className="fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
+    <div ref={panelRef} style={{ width }} role="dialog" aria-modal="true" aria-label={`${noun}详情`}
+      className="detail-drawer fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
       <div onMouseDown={startResize} title="拖动调整宽度"
-        className="group absolute left-0 top-0 z-30 flex h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center">
+        className="group absolute left-0 top-0 z-30 hidden h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center lg:flex">
         <span className="h-full w-px bg-transparent transition-all group-hover:w-[3px] group-hover:bg-primary" />
       </div>
       <div className="relative z-10 flex h-full w-full flex-col">
         {/* Header */}
-        <div className="flex h-14 items-center gap-3 border-b border-border/50 px-6">
+        <div className="flex min-h-14 items-center gap-2 border-b border-border/50 px-2 pt-[env(safe-area-inset-top)] sm:px-6">
+          <button onClick={onClose} aria-label={`返回${noun}列表`} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground active:bg-accent lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
           <h2 className="text-base font-bold">{noun}详情</h2>
           <StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge>
-          <button onClick={onClose} className="ml-auto rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          <button onClick={onClose} aria-label={`关闭${noun}详情`} className="ml-auto hidden rounded-lg p-2 text-muted-foreground transition hover:bg-accent lg:block"><X className="h-5 w-5" /></button>
         </div>
 
         {/* Body */}
-        <div className="flex-1 space-y-5 overflow-y-auto p-6">
+        <div className="flex-1 space-y-5 overflow-y-auto overscroll-contain p-4 sm:p-6">
           {/* 评论(主角)*/}
           <section>
             <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-muted-foreground"><MessageCircle className="h-3.5 w-3.5" />评论内容</div>
@@ -153,13 +154,13 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
 
         {/* Footer 操作:销售=跟进/处理/忽略;舆情=转工单/归档/忽略(已归档只读)*/}
         {canWrite && (
-          <div className="flex items-center justify-end gap-2 border-t border-border/50 px-6 py-3.5">
+          <div className="grid grid-cols-3 items-center gap-2 border-t border-border/50 bg-card px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:flex lg:justify-end sm:px-6 sm:py-3.5">
             {isSales ? <>
               <Act icon={Footprints} label="跟进" status="following" />
               <Act icon={CheckCheck} label="处理" status="resolved" />
               <Act icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
             </> : bucket === 'archived' ? (
-              <span className="text-[12px] text-muted-foreground">已归档,无需操作</span>
+              <span className="col-span-3 text-center text-[12px] text-muted-foreground">已归档,无需操作</span>
             ) : <>
               <Button size="sm" onClick={onDispatch}><Send className="h-3.5 w-3.5" />转工单</Button>
               <Act icon={CheckCheck} label="归档" status="resolved" />

@@ -18,6 +18,14 @@ const sidebarSource = await readFile(
   resolve(repoRoot, "sidebar/sidebar-logic.js"),
   "utf8",
 );
+const contentSource = await readFile(
+  resolve(repoRoot, "content-v2.js"),
+  "utf8",
+);
+const douyinCommentsSource = await readFile(
+  resolve(repoRoot, "utils/capture/douyin-comments.js"),
+  "utf8",
+);
 
 let uuidCounter = 0;
 const context = vm.createContext({
@@ -115,7 +123,7 @@ test("detail comments and card stop reuse the bound request instead of the activ
     "phase: 'detail_comments_capturing'",
   );
   const detailBlockStart = captureSyncSource.lastIndexOf(
-    "if (includeComments && !stopAfterCurrent)",
+    "activeStage = 'comments_capture'",
     detailProgressAt,
   );
   const detailBlock = captureSyncSource.slice(
@@ -140,5 +148,80 @@ test("detail comments and card stop reuse the bound request instead of the activ
   assert.match(
     cancelBlock,
     /requestCaptureCancelSignal\(relayTabId, cancelRequestId\)/,
+  );
+});
+
+test("Douyin comment capture carries and checks the expected work identity before merging", () => {
+  const currentNoteBlock = sourceBlock(
+    captureSyncSource,
+    "async function captureCommentsForCurrentNote",
+    "async function captureCommentsForHydratedDetailRecord",
+  );
+  assert.match(currentNoteBlock, /expectedNoteId = ''/);
+  assert.match(currentNoteBlock, /expectedNoteId,\s*\n\s*},\s*\n\s*}\);/);
+  assert.match(
+    currentNoteBlock,
+    /buildDouyinCommentIdentityFailure\(\s*expectedNoteId,\s*capturedNoteId/,
+  );
+  assert.ok(
+    currentNoteBlock.indexOf("buildDouyinCommentIdentityFailure") <
+      currentNoteBlock.indexOf("const rawItems ="),
+  );
+
+  const batchMergeAt = captureSyncSource.indexOf(
+    "detailPayload = applyCommentResultToSingleNotePayload",
+  );
+  const batchIdentityAt = captureSyncSource.lastIndexOf(
+    "buildDouyinCommentIdentityFailure",
+    batchMergeAt,
+  );
+  assert.ok(batchIdentityAt >= 0 && batchIdentityAt < batchMergeAt);
+  assert.match(
+    captureSyncSource,
+    /expectedNoteId: String\(captureParams\.expectedNoteId \|\| ''\)/,
+  );
+  assert.match(
+    contentSource,
+    /expectedNoteId: String\(request\.expectedNoteId \|\| ""\)/,
+  );
+});
+
+test("Douyin comment identity mismatch fails closed at capture start and finish", async () => {
+  assert.match(
+    douyinCommentsSource,
+    /assertDouyinCommentTargetIdentity\(\s*normalizedExpectedNoteId,\s*noteId,\s*"开始采集评论前"/,
+  );
+  assert.match(
+    douyinCommentsSource,
+    /assertDouyinCommentTargetIdentity\(\s*normalizedExpectedNoteId,\s*finalNoteId,\s*"返回评论结果前"/,
+  );
+  assert.match(
+    douyinCommentsSource,
+    /error\?\.code \|\|\s*\(isCanceled\(\) \? "CAPTURE_CANCELED" : "CAPTURE_FAILED"\)/,
+  );
+
+  const {assertDouyinCommentTargetIdentity} = await import(
+    `../utils/capture/douyin-comments.js?comment-identity=${Date.now()}`
+  );
+  const expected = "766193585000000099";
+  assert.equal(
+    assertDouyinCommentTargetIdentity(expected, expected, "测试"),
+    expected,
+  );
+  assert.throws(
+    () =>
+      assertDouyinCommentTargetIdentity(
+        expected,
+        "766193585000000001",
+        "返回评论结果前",
+      ),
+    (error) =>
+      error?.code === "DOUYIN_COMMENT_ID_MISMATCH" &&
+      error?.expectedNoteId === expected &&
+      error?.actualNoteId === "766193585000000001",
+  );
+  assert.throws(
+    () => assertDouyinCommentTargetIdentity(expected, "", "开始采集评论前"),
+    (error) => error?.code === "DOUYIN_COMMENT_ID_MISMATCH",
   );
 });

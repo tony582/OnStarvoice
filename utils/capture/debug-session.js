@@ -111,6 +111,9 @@
       now = () => Date.now(),
       onStateChange = null,
       onUnexpectedDetach = null,
+      replacementGraceMs = 1200,
+      setTimeoutFn = (...args) => setTimeout(...args),
+      clearTimeoutFn = (timerId) => clearTimeout(timerId),
     } = {}) {
       if (
         !debuggerApi ||
@@ -126,6 +129,7 @@
 
       const sessionsByTab = new Map();
       const pendingAttachesByTab = new Map();
+      const pendingReplacementDetachesByTab = new Map();
       const expectedDetachTabs = new Set();
       let mutationQueue = Promise.resolve();
 
@@ -160,6 +164,21 @@
         );
       }
 
+      function dispatchUnexpectedDetach(event) {
+        if (typeof onUnexpectedDetach !== "function") return;
+        // Do not await the owner cleanup while holding mutationQueue. Persistent
+        // cleanup calls stopByTaskId(), which must be allowed to enqueue behind
+        // the current detach mutation instead of waiting on itself forever.
+        void Promise.resolve()
+          .then(() => onUnexpectedDetach(event))
+          .catch((error) => {
+            console.warn(
+              "[CaptureDebugSession] unexpected detach callback failed:",
+              error?.message || error,
+            );
+          });
+      }
+
       function findSessionByTaskId(taskId) {
         const normalizedTaskId = cleanText(taskId, 320);
         if (!normalizedTaskId) return null;
@@ -169,6 +188,137 @@
           }
         }
         return null;
+      }
+
+      function cancelPendingReplacementDetach(tabId) {
+        const normalizedTabId = normalizeTabId(tabId);
+        const pending = normalizedTabId
+          ? pendingReplacementDetachesByTab.get(normalizedTabId)
+          : null;
+        if (!pending) return false;
+        clearTimeoutFn(pending.timerId);
+        pendingReplacementDetachesByTab.delete(normalizedTabId);
+        return true;
+      }
+
+      async function finalizeUnexpectedDetach(
+        session,
+        normalizedReason,
+      ) {
+        if (!session) return false;
+        session.state = "detached";
+        const detachedSnapshot = publicSession(session, {state: "detached"});
+        await publish(session, {
+          reason: normalizedReason,
+          cleanupPending: Boolean(session.persistent),
+        });
+        if (
+          !session.persistent &&
+          sessionsByTab.get(session.tabId) === session
+        ) {
+          sessionsByTab.delete(session.tabId);
+          await publish(null, {
+            reason: normalizedReason,
+            previous: detachedSnapshot,
+          });
+        }
+        dispatchUnexpectedDetach({
+          reason: normalizedReason,
+          session: detachedSnapshot,
+        });
+        return true;
+      }
+
+      async function recoverPersistentSourceOnSameTab(
+        session,
+        normalizedReason,
+      ) {
+        const sessionTabId = normalizeTabId(session?.tabId);
+        if (
+          !session?.persistent ||
+          !sessionTabId ||
+          sessionsByTab.get(sessionTabId) !== session
+        ) {
+          return false;
+        }
+
+        const debuggee = {tabId: sessionTabId};
+        const pendingAttach = {detached: false, reason: ""};
+        let attached = false;
+        pendingAttachesByTab.set(sessionTabId, pendingAttach);
+        try {
+          await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
+          attached = true;
+          await applyFocusEmulation(sessionTabId, true);
+          if (pendingAttach.detached) {
+            throw createError(
+              "debug_session_detached_during_recovery",
+              "浏览器页面仍在切换，AI Debug 暂未恢复",
+            );
+          }
+          session.state = "attached";
+          await publish(session, {
+            reason: "capture_task_source_target_recovered",
+            detachReason: normalizedReason,
+          });
+          return true;
+        } catch (error) {
+          if (attached) {
+            expectedDetachTabs.add(sessionTabId);
+            try {
+              await debuggerApi.detach(debuggee).catch(() => null);
+            } finally {
+              expectedDetachTabs.delete(sessionTabId);
+            }
+          }
+          return false;
+        } finally {
+          if (pendingAttachesByTab.get(sessionTabId) === pendingAttach) {
+            pendingAttachesByTab.delete(sessionTabId);
+          }
+        }
+      }
+
+      function schedulePersistentReplacementDetach(
+        session,
+        normalizedReason,
+      ) {
+        const sessionTabId = normalizeTabId(session?.tabId);
+        if (!sessionTabId) return false;
+        cancelPendingReplacementDetach(sessionTabId);
+        const graceMs = Math.max(0, Number(replacementGraceMs) || 0);
+        const pending = {
+          session,
+          reason: normalizedReason,
+          timerId: null,
+        };
+        pending.timerId = setTimeoutFn(() => {
+          void enqueue(async () => {
+            if (
+              pendingReplacementDetachesByTab.get(sessionTabId) !== pending
+            ) {
+              return false;
+            }
+            pendingReplacementDetachesByTab.delete(sessionTabId);
+            if (sessionsByTab.get(sessionTabId) !== session) {
+              return false;
+            }
+            if (
+              await recoverPersistentSourceOnSameTab(
+                session,
+                normalizedReason,
+              )
+            ) {
+              return true;
+            }
+            return await finalizeUnexpectedDetach(
+              session,
+              normalizedReason,
+            );
+          });
+        }, graceMs);
+        pendingReplacementDetachesByTab.set(sessionTabId, pending);
+        return true;
       }
 
       async function start({
@@ -409,6 +559,7 @@
             return {released: false, reason: "not_attached"};
           }
           const sessionTabId = session.tabId;
+          cancelPendingReplacementDetach(sessionTabId);
           const normalizedRunId = cleanText(runId, 320);
           if (!force && normalizedRunId && normalizedRunId !== session.runId) {
             return {released: false, reason: "run_mismatch"};
@@ -462,6 +613,7 @@
         const expected = expectedDetachTabs.has(tabId);
         const normalizedReason = cleanText(reason, 120) || "canceled_by_user";
         if (expected) {
+          cancelPendingReplacementDetach(tabId);
           sessionsByTab.delete(tabId);
           await publish(null, {
             reason: "expected_detach",
@@ -470,42 +622,106 @@
           return true;
         }
 
-        // Keep the persistent snapshot durable until the ordered task cleanup
-        // has published its cancellation tombstone and released every worker.
-        // If the MV3 worker stops mid-cleanup, startup recovery can still see it.
-        session.state = "detached";
-        await publish(session, {
-          reason: normalizedReason,
-          cleanupPending: Boolean(session.persistent),
-        });
-        if (typeof onUnexpectedDetach === "function") {
-          try {
-            await Promise.resolve(
-              onUnexpectedDetach({
-                reason: normalizedReason,
-                session: publicSession(session, {state: "detached"}),
-              }),
-            );
-          } catch (error) {
-            console.warn(
-              "[CaptureDebugSession] unexpected detach callback failed:",
-              error?.message || error,
-            );
+        // Chrome may replace a prerendered/navigation target with a new Tab id.
+        // onDetach(target_closed) can arrive just before tabs.onReplaced. Give
+        // persistent tasks a short migration window instead of terminalizing
+        // the whole capture before the replacement event can rebind ownership.
+        if (session.persistent && normalizedReason === "target_closed") {
+          return schedulePersistentReplacementDetach(
+            session,
+            normalizedReason,
+          );
+        }
+        return await finalizeUnexpectedDetach(session, normalizedReason);
+      }
+
+      async function replaceTab({
+        removedTabId,
+        addedTabId,
+        pageTitle = "",
+        pageUrl = "",
+      } = {}) {
+        return enqueue(async () => {
+          const oldTabId = normalizeTabId(removedTabId);
+          const newTabId = normalizeTabId(addedTabId);
+          if (!oldTabId || !newTabId || oldTabId === newTabId) {
+            return {replaced: false, reason: "invalid_tab"};
           }
-        }
-        if (!session.persistent && sessionsByTab.get(tabId) === session) {
-          sessionsByTab.delete(tabId);
-          await publish(null, {
-            reason: normalizedReason,
-            previous: publicSession(session, {state: "detached"}),
-          });
-        }
-        return true;
+
+          const sourceSession = sessionsByTab.get(oldTabId);
+          if (sourceSession?.persistent) {
+            cancelPendingReplacementDetach(oldTabId);
+            const debuggee = {tabId: newTabId};
+            try {
+              await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
+              await applyFocusEmulation(newTabId, true);
+            } catch (error) {
+              expectedDetachTabs.add(newTabId);
+              await debuggerApi.detach(debuggee).catch(() => null);
+              expectedDetachTabs.delete(newTabId);
+              throw createError(
+                "debug_session_replace_failed",
+                "浏览器替换了采集页面，但 AI Debug 未能迁移到新页面",
+                error,
+              );
+            }
+
+            sessionsByTab.delete(oldTabId);
+            sourceSession.tabId = newTabId;
+            sourceSession.state = "attached";
+            const normalizedPageTitle = cleanText(pageTitle, 180);
+            const normalizedPageUrl = cleanText(pageUrl, 800);
+            if (normalizedPageTitle) sourceSession.pageTitle = normalizedPageTitle;
+            if (normalizedPageUrl) sourceSession.pageUrl = normalizedPageUrl;
+            sourceSession.workerTabIds = normalizeWorkerTabIds(
+              sourceSession.workerTabIds,
+              newTabId,
+            );
+            sessionsByTab.set(newTabId, sourceSession);
+            await publish(sourceSession, {
+              reason: "capture_task_source_tab_replaced",
+              removedTabId: oldTabId,
+              addedTabId: newTabId,
+            });
+            return {
+              replaced: true,
+              role: "source",
+              session: publicSession(sourceSession),
+            };
+          }
+
+          for (const session of sessionsByTab.values()) {
+            if (
+              !session.persistent ||
+              !session.workerTabIds.includes(oldTabId)
+            ) {
+              continue;
+            }
+            session.workerTabIds = normalizeWorkerTabIds(
+              session.workerTabIds.map((workerTabId) =>
+                workerTabId === oldTabId ? newTabId : workerTabId,
+              ),
+              session.tabId,
+            );
+            await publish(session, {
+              reason: "capture_worker_tab_replaced",
+              removedTabId: oldTabId,
+              addedTabId: newTabId,
+            });
+            return {
+              replaced: true,
+              role: "worker",
+              session: publicSession(session),
+            };
+          }
+          return {replaced: false, reason: "not_tracked"};
+        });
       }
 
       async function handleTabRemoved(tabId) {
         const normalizedTabId = normalizeTabId(tabId);
         if (!normalizedTabId) return false;
+        cancelPendingReplacementDetach(normalizedTabId);
         const session = sessionsByTab.get(normalizedTabId);
         if (session) {
           sessionsByTab.delete(normalizedTabId);
@@ -553,6 +769,7 @@
         },
         updateTask,
         registerWorkerTab,
+        replaceTab,
         setMinimized,
         handleDetach,
         handleTabRemoved,

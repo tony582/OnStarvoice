@@ -55,7 +55,7 @@ export function OverviewPage() {
       </div>
 
       {/* Numbers 行 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 lg:grid-cols-4">
         <NumberCard label="互动总量" hint="互动总量=点赞+评论+收藏+转发 之和(全部内容累计),不是内容条数。「声量」才指内容条数,见分析与报告。本系统不采阅读/播放量,不报触达人数。" value={formatNumber(k.total_interaction)} sub={`周期新增内容 ${formatNumber(k.period_new)}`} icon={Radio} onClick={() => navigate('data')} />
         <NumberCard label="待分诊" hint="待分诊=进入分诊队列、待人工研判的内容(尚未转工单也未归档)。" value={formatNumber(badges.triagePending)} sub="待人工研判" tone="orange" icon={Inbox} onClick={() => navigate('workbench', { queue: 'triage' })} />
         <NumberCard label="累计负面" hint="累计负面=情感被 AI 标注为负面的内容总数;负面占比=负面 ÷ 已标注内容。" value={formatNumber(sb.negative)} sub={`负面占比 ${negRatio}%`} tone="red" icon={ShieldAlert} onClick={() => navigate('workbench', { queue: 'triage', sentiment: 'negative' })} />
@@ -64,7 +64,7 @@ export function OverviewPage() {
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
         {/* 左:情感结构 + 分平台风险 */}
-        <section className="rounded-xl border border-border bg-card p-5 shadow-xs">
+        <section className="rounded-xl border border-border bg-card p-4 shadow-xs sm:p-5">
           <h2 className="text-[13px] font-semibold tracking-tight">情感结构</h2>
           <div className="mt-3 flex h-2.5 overflow-hidden rounded-full bg-muted">
             <div className="bg-status-red" style={{ width: pct(sb.negative, sb.total) }} />
@@ -94,7 +94,7 @@ export function OverviewPage() {
         </section>
 
         {/* 右:风险事件流 + 处置进度 */}
-        <section className="rounded-xl border border-border bg-card p-5 shadow-xs">
+        <section className="rounded-xl border border-border bg-card p-4 shadow-xs sm:p-5">
           <div className="flex items-center justify-between">
             <h2 className="text-[13px] font-semibold tracking-tight">风险事件流</h2>
             <button onClick={() => navigate('workbench', { queue: 'triage' })} className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-primary">全部处置 <ArrowRight className="h-3 w-3" /></button>
@@ -113,15 +113,15 @@ export function OverviewPage() {
                     <StatusBadge tone={tone}>{tone === 'negative' ? '负面' : tone === 'positive' ? '正面' : '中性'}</StatusBadge>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-[13px] font-medium">{r.title || compact(r.content || '', 40) || '(无标题)'}</div>
-                      <div className="mt-0.5 flex items-center gap-2.5 text-[10.5px] text-muted-foreground">
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[10.5px] text-muted-foreground">
                         <span>{platformName(r.platform)}</span>
                         <span className="inline-flex items-center gap-0.5"><Heart className="h-2.5 w-2.5" />{formatNumber(r.likes)}</span>
                         <span className="inline-flex items-center gap-0.5"><MessageCircle className="h-2.5 w-2.5" />{formatNumber(r.comments_count)}</span>
                         {Number(r.alert_count) > 0 && <span className="font-medium text-status-red">预警 {r.alert_count}</span>}
-                        <span className="ml-auto">{formatDate(r.last_seen_at)}</span>
+                        <span className="ml-auto hidden sm:inline">{formatDate(r.last_seen_at)}</span>
                       </div>
                     </div>
-                    <span className="shrink-0 text-[11px] font-medium text-primary">处置</span>
+                    <span className="inline-flex shrink-0 items-center gap-0.5 text-[11px] font-medium text-primary"><span className="hidden sm:inline">处置</span><ArrowRight className="h-3.5 w-3.5" /></span>
                   </button>
                 )
               })}
@@ -159,12 +159,12 @@ function NumberCard({ label, value, sub, icon: Icon, tone = 'default', onClick, 
 }) {
   return (
     <div onClick={onClick} role="button" tabIndex={0}
-      className="group cursor-pointer rounded-xl border border-border bg-card px-4 py-3.5 text-left shadow-xs transition-all duration-150 hover:border-primary/30 hover:shadow-sm">
+      className="group cursor-pointer rounded-xl border border-border bg-card px-3.5 py-3 text-left shadow-xs transition-all duration-150 hover:border-primary/30 hover:shadow-sm sm:px-4 sm:py-3.5">
       <div className="flex items-center justify-between gap-2">
         <span className="flex items-center gap-1 truncate text-[12px] font-medium text-muted-foreground">{label}{hint && <InfoHint text={hint} />}</span>
         <Icon className="h-4 w-4 shrink-0 text-muted-foreground transition-colors group-hover:text-primary" strokeWidth={1.8} />
       </div>
-      <div className={cn('mt-2 text-[26px] font-bold leading-none tabular-nums tracking-tight', NUM_TONE[tone])}>{value}</div>
+      <div className={cn('mt-2 text-[22px] font-bold leading-none tabular-nums tracking-tight sm:text-[26px]', NUM_TONE[tone])}>{value}</div>
       {sub && <div className="mt-1.5 text-[10.5px] text-muted-foreground">{sub}</div>}
     </div>
   )

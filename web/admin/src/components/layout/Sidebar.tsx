@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -22,6 +22,7 @@ const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof B
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
   { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsPending', dot: 'bg-violet-500' },
+  { queue: 'misjudgments', label: '误判反馈', badgeKey: 'feedbackPending', dot: 'bg-rose-500' },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
@@ -56,9 +57,11 @@ interface SidebarProps {
   onNavigate: (page: string, params?: Record<string, string>) => void
   collapsed: boolean
   onToggleCollapse: () => void
+  mobileOpen: boolean
+  onMobileClose: () => void
 }
 
-export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }: SidebarProps) {
+export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse, mobileOpen, onMobileClose }: SidebarProps) {
   const { isInternal, isPlatformAdmin } = useAuth()
   const { badges } = useBadges()
   const { workspace, switchWorkspace, params } = useNav()
@@ -67,19 +70,54 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
   const [adminOpen, setAdminOpen] = useState(false)
   const adminActive = ADMIN_NAV.some(i => i.id === activePage)
 
-  // 收起:整条侧栏彻底隐藏(展开按钮在顶栏 TopBar 左侧,主区直接贴边、不留空白)
-  if (collapsed) return null
+  useEffect(() => {
+    if (!mobileOpen) return
+    const previousOverflow = document.body.style.overflow
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onMobileClose()
+    }
+    document.body.style.overflow = 'hidden'
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [mobileOpen, onMobileClose])
 
   return (
-    <aside className="fixed inset-y-0 left-0 z-30 flex w-[240px] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
+    <>
+      {mobileOpen && (
+        <button
+          type="button"
+          aria-label="关闭导航"
+          onClick={onMobileClose}
+          className="fixed inset-0 z-40 bg-black/35 backdrop-blur-[1px] lg:hidden"
+        />
+      )}
+      <aside
+        id="mobile-navigation"
+        aria-label="主导航"
+        className={cn(
+          'fixed inset-y-0 left-0 z-50 flex w-[min(88vw,320px)] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar shadow-xl transition-transform duration-200 lg:z-30 lg:w-[240px] lg:shadow-none',
+          mobileOpen ? 'visible translate-x-0 pointer-events-auto' : 'invisible -translate-x-full pointer-events-none',
+          collapsed ? 'lg:invisible lg:-translate-x-full lg:pointer-events-none' : 'lg:visible lg:translate-x-0 lg:pointer-events-auto',
+        )}
+      >
       {/* 头部:Logo + 隐藏 */}
-      <div className="flex items-center gap-2.5 px-4 pb-1 pt-4">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary">
+      <div className="flex items-center gap-2.5 px-4 pb-1 pt-[max(1rem,env(safe-area-inset-top))]">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary lg:h-8 lg:w-8">
           <img src="/images/logo-starvoice.svg" alt="" className="h-[18px] w-[18px] object-contain brightness-0 invert" />
         </div>
-        <span className="truncate text-[13px] font-bold text-foreground">StarVoice 星语</span>
+        <div className="min-w-0">
+          <div className="truncate text-[13px] font-bold text-foreground">StarVoice 星语</div>
+          <div className="mt-0.5 text-[10px] font-medium tracking-wide text-muted-foreground lg:hidden">移动值守台</div>
+        </div>
+        <button onClick={onMobileClose} title="关闭导航"
+          className="ml-auto flex h-10 w-10 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground lg:hidden">
+          <X className="h-5 w-5" strokeWidth={1.9} />
+        </button>
         <button onClick={onToggleCollapse} title="隐藏导航"
-          className="ml-auto rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
+          className="ml-auto hidden h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground lg:flex">
           <PanelLeftClose className="h-[18px] w-[18px]" strokeWidth={1.9} />
         </button>
       </div>
@@ -90,9 +128,9 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
           const Icon = w.icon
           const on = w.key === workspace
           return (
-            <button key={w.key} onClick={() => switchWorkspace(w.key)} title={w.desc}
+            <button key={w.key} onClick={() => { switchWorkspace(w.key); onMobileClose() }} title={w.desc}
               className={cn(
-                'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[12.5px] font-semibold transition-colors',
+                'flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-[12.5px] font-semibold transition-colors lg:min-h-0 lg:py-1.5',
                 on ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
               )}>
               <Icon className={cn('h-4 w-4', on && w.accent)} strokeWidth={2} />
@@ -103,7 +141,7 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
       </div>
       <div className="px-4 pb-0.5 pt-1.5 text-[10px] text-muted-foreground">{activeWs.desc}</div>
 
-      <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto px-3 pb-4 pt-1">
+      <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-3 pb-4 pt-1">
         <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
       </nav>
 
@@ -139,8 +177,9 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse }:
         </div>
       )}
       <div className="mx-4 h-px bg-sidebar-border" />
-      <div className="px-4 py-2.5 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
-    </aside>
+      <div className="px-4 pb-[max(0.625rem,env(safe-area-inset-bottom))] pt-2.5 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
+      </aside>
+    </>
   )
 }
 
@@ -174,7 +213,7 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
                   return (
                     <button key={q.queue} onClick={() => onNavigate('workbench', { queue: q.queue })}
                       className={cn(
-                        'group flex w-full items-center gap-2.5 rounded-lg px-3 py-[6px] text-[12.5px] transition-colors',
+                        'group flex min-h-10 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[12.5px] transition-colors lg:min-h-0 lg:py-[6px]',
                         on ? 'bg-accent font-semibold text-primary' : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
                       )}>
                       <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full transition-colors', on ? q.dot : 'bg-muted-foreground/40 group-hover:bg-muted-foreground/70')} />
@@ -207,7 +246,7 @@ function NavButton({ item, active, sectionActive, badges, onClick }: {
   return (
     <button onClick={onClick}
       className={cn(
-        'group relative flex w-full items-center gap-3 rounded-lg px-3 py-[8px] text-[13px] transition-colors duration-150',
+        'group relative flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] transition-colors duration-150 lg:min-h-0 lg:py-[8px]',
         active ? 'bg-accent font-semibold text-primary'
           : sectionActive ? 'font-semibold text-foreground'
             : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground',

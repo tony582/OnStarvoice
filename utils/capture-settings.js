@@ -5,6 +5,8 @@
 export const CAPTURE_SETTINGS_KEYS = {
   AUTO_DETAIL_CAPTURE_AFTER_LIST_CAPTURE:
     "capture.autoDetailCaptureAfterListCapture",
+  ENABLE_AI_RELEVANCE_PREFILTER:
+    "capture.enableAiRelevancePrefilter",
   AUTO_SYNC_AFTER_DETAIL_CAPTURE: "capture.autoSyncAfterDetailCapture",
   COMMENTS_MAX_DETECTED_ITEMS: "capture.commentsMaxDetectedItems",
   DETAIL_COMMENTS_MAX_DETECTED_ITEMS: "capture.detailCommentsMaxDetectedItems",
@@ -22,8 +24,6 @@ export const CAPTURE_SETTINGS_KEYS = {
     "capture.includeBloggerMetricsOnDetailCapture",
   SKIP_ALREADY_CAPTURED_ON_DETAIL_CAPTURE:
     "capture.skipAlreadyCapturedOnDetailCapture",
-  RECAPTURE_COMMENTS_ON_COUNT_INCREASE:
-    "capture.recaptureCommentsOnCountIncrease",
   ENABLE_LOW_FOLLOWER_HIT_FILTER: "capture.enableLowFollowerHitFilter",
   ENABLE_LOW_FOLLOWER_HIT_FILTER_ON_DETAIL_CAPTURE:
     "capture.enableLowFollowerHitFilterOnDetailCapture",
@@ -57,6 +57,7 @@ const LEGACY_CAPTURE_SETTINGS_KEYS = {
 
 export const DEFAULT_CAPTURE_SETTINGS = {
   autoDetailCaptureAfterListCapture: false,
+  enableAiRelevancePrefilter: false,
   autoSyncAfterDetailCapture: false,
   commentsMaxDetectedItems: 50,
   detailCommentsMaxDetectedItems: 50,
@@ -70,7 +71,6 @@ export const DEFAULT_CAPTURE_SETTINGS = {
   includeBloggerMetricsOnNoteCapture: false,
   includeBloggerMetricsOnDetailCapture: false,
   skipAlreadyCapturedOnDetailCapture: true,
-  recaptureCommentsOnCountIncrease: true,
   enableLowFollowerHitFilter: false,
   enableLowFollowerHitFilterOnDetailCapture: false,
   lowFollowerHitThreshold: 10000,
@@ -166,6 +166,10 @@ export async function getCaptureSettings() {
       raw[CAPTURE_SETTINGS_KEYS.AUTO_DETAIL_CAPTURE_AFTER_LIST_CAPTURE],
       DEFAULT_CAPTURE_SETTINGS.autoDetailCaptureAfterListCapture,
     ),
+    enableAiRelevancePrefilter: normalizeBoolean(
+      raw[CAPTURE_SETTINGS_KEYS.ENABLE_AI_RELEVANCE_PREFILTER],
+      DEFAULT_CAPTURE_SETTINGS.enableAiRelevancePrefilter,
+    ),
     autoSyncAfterDetailCapture: normalizeBoolean(
       raw[CAPTURE_SETTINGS_KEYS.AUTO_SYNC_AFTER_DETAIL_CAPTURE],
       DEFAULT_CAPTURE_SETTINGS.autoSyncAfterDetailCapture,
@@ -224,10 +228,6 @@ export async function getCaptureSettings() {
     skipAlreadyCapturedOnDetailCapture: normalizeBoolean(
       raw[CAPTURE_SETTINGS_KEYS.SKIP_ALREADY_CAPTURED_ON_DETAIL_CAPTURE],
       DEFAULT_CAPTURE_SETTINGS.skipAlreadyCapturedOnDetailCapture,
-    ),
-    recaptureCommentsOnCountIncrease: normalizeBoolean(
-      raw[CAPTURE_SETTINGS_KEYS.RECAPTURE_COMMENTS_ON_COUNT_INCREASE],
-      DEFAULT_CAPTURE_SETTINGS.recaptureCommentsOnCountIncrease,
     ),
     includeBloggerMetricsOnDetailCapture: normalizeBoolean(
       raw[CAPTURE_SETTINGS_KEYS.INCLUDE_BLOGGER_METRICS_ON_DETAIL_CAPTURE],
@@ -358,6 +358,10 @@ export async function saveCaptureSettings(updates = {}) {
         next.autoDetailCaptureAfterListCapture,
         DEFAULT_CAPTURE_SETTINGS.autoDetailCaptureAfterListCapture,
       ),
+    [CAPTURE_SETTINGS_KEYS.ENABLE_AI_RELEVANCE_PREFILTER]: normalizeBoolean(
+      next.enableAiRelevancePrefilter,
+      DEFAULT_CAPTURE_SETTINGS.enableAiRelevancePrefilter,
+    ),
     [CAPTURE_SETTINGS_KEYS.AUTO_SYNC_AFTER_DETAIL_CAPTURE]: normalizeBoolean(
       next.autoSyncAfterDetailCapture,
       DEFAULT_CAPTURE_SETTINGS.autoSyncAfterDetailCapture,
@@ -416,11 +420,6 @@ export async function saveCaptureSettings(updates = {}) {
       normalizeBoolean(
         next.skipAlreadyCapturedOnDetailCapture,
         DEFAULT_CAPTURE_SETTINGS.skipAlreadyCapturedOnDetailCapture,
-      ),
-    [CAPTURE_SETTINGS_KEYS.RECAPTURE_COMMENTS_ON_COUNT_INCREASE]:
-      normalizeBoolean(
-        next.recaptureCommentsOnCountIncrease,
-        DEFAULT_CAPTURE_SETTINGS.recaptureCommentsOnCountIncrease,
       ),
     [CAPTURE_SETTINGS_KEYS.ENABLE_LOW_FOLLOWER_HIT_FILTER]: normalizeBoolean(
       next.enableLowFollowerHitFilter,

@@ -53,7 +53,7 @@ export function EventsPage() {
             const reachPct = Math.max(3, Math.round((Number(ev.reach || 0) / maxReach) * 100))
             return (
               <button key={ev.id} onClick={() => setOpenId(ev.id)}
-                className={cn('group flex w-full items-center gap-4 rounded-xl border border-l-[3px] border-border bg-card p-4 text-left shadow-xs transition-all hover:border-input hover:shadow-sm', sevAccent)}>
+                className={cn('group relative flex w-full flex-col items-stretch gap-3 rounded-xl border border-l-[3px] border-border bg-card p-3.5 text-left shadow-xs transition-all hover:border-input hover:shadow-sm lg:flex-row lg:items-center lg:gap-4 lg:p-4', sevAccent)}>
                 <div className="min-w-0 flex-1">
                   <div className="mb-1.5 flex flex-wrap items-center gap-2">
                     <StatusBadge tone={ev.severity}>{LABELS.severity?.[ev.severity] || ev.severity}</StatusBadge>
@@ -71,14 +71,14 @@ export function EventsPage() {
                 </div>
 
                 {/* 影响力 */}
-                <div className="w-32 shrink-0">
+                <div className="w-full shrink-0 border-t border-border/60 pt-2.5 lg:w-32 lg:border-0 lg:pt-0">
                   <div className="mb-1 flex items-center justify-between text-[10.5px] text-muted-foreground">
                     <span className="inline-flex items-center gap-0.5"><TrendingUp className="h-3 w-3" />影响力</span>
                     <span className="font-bold tabular-nums text-foreground">{formatNumber(ev.reach)}</span>
                   </div>
                   <div className="h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-red" style={{ width: `${reachPct}%` }} /></div>
                 </div>
-                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/50 transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+                <ChevronRight className="absolute right-3 top-3 h-4 w-4 shrink-0 text-muted-foreground/50 transition-transform group-hover:translate-x-0.5 group-hover:text-foreground lg:static" />
               </button>
             )
           })}

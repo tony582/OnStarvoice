@@ -22,7 +22,7 @@ function splitSetting(value, fallback = []) {
     .filter(Boolean);
 }
 
-async function getBrandContext(tenantId) {
+export async function getBrandContext(tenantId) {
   const brandName = (await getSetting('brand_name', tenantId)) || DEFAULT_BRAND_CONTEXT.brandName;
   const brandAliases = splitSetting(await getSetting('brand_aliases', tenantId), DEFAULT_BRAND_CONTEXT.brandAliases);
   const businessContext = (await getSetting('brand_business_context', tenantId)) || DEFAULT_BRAND_CONTEXT.businessContext;
@@ -124,7 +124,13 @@ async function callGemini(apiKey, model, systemPrompt, userMessage) {
   return JSON.parse(text);
 }
 
-async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userMessage) {
+async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userMessage, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+    ? Math.max(1000, Math.min(40000, Number(options.timeoutMs)))
+    : 40000;
+  const maxTokens = Number.isFinite(Number(options.maxTokens))
+    ? Math.max(256, Math.min(8192, Number(options.maxTokens)))
+    : undefined;
   const url = `${endpoint}/chat/completions`;
   const resp = await fetch(url, {
     method: 'POST',
@@ -134,8 +140,9 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
       messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
       temperature: 0.1,
       response_format: { type: 'json_object' },
+      max_tokens: maxTokens,
     }),
-    signal: AbortSignal.timeout(40000), // 防止 LLM 请求挂死冻住整个评论入库串行队列
+    signal: AbortSignal.timeout(timeoutMs), // 前置筛选使用更短预算；现有标注默认仍为 40 秒
   });
   if (!resp.ok) throw new Error(`LLM API error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
@@ -155,6 +162,46 @@ async function getLLMConfig(tenantId) {
   };
   const d = defaults[provider] || defaults.gemini;
   return { provider, apiKey, model: model || d.model, endpoint: endpoint || d.endpoint };
+}
+
+/**
+ * 前置相关性筛选只允许使用服务端保存的 DeepSeek 配置。
+ * 扩展只提交待判断的最小文字字段，永远不会取得或传入模型 Key。
+ */
+export async function getDeepSeekConfig(tenantId) {
+  const config = await getLLMConfig(tenantId);
+  if (config.provider !== 'deepseek') {
+    const err = new Error('AI 前置筛选要求租户后台将 LLM 提供商配置为 DeepSeek');
+    err.code = 'DEEPSEEK_PROVIDER_REQUIRED';
+    throw err;
+  }
+  if (!config.apiKey) {
+    const err = new Error('租户后台尚未配置 DeepSeek API Key');
+    err.code = 'DEEPSEEK_API_KEY_MISSING';
+    throw err;
+  }
+  return {
+    provider: 'deepseek',
+    apiKey: config.apiKey,
+    model: config.model || 'deepseek-chat',
+    endpoint: String(config.endpoint || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
+  };
+}
+
+export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
+  const config = await getDeepSeekConfig(tenantId);
+  const data = await callOpenAICompatible(
+    config.apiKey,
+    config.model,
+    config.endpoint,
+    systemPrompt,
+    userMessage,
+    { timeoutMs: options.timeoutMs, maxTokens: options.maxTokens }
+  );
+  if (options.returnMetadata) {
+    return { data, provider: config.provider, model: config.model };
+  }
+  return data;
 }
 
 async function callLLM(userMessage, tenantId) {
@@ -221,10 +268,23 @@ export async function labelRecord(recordId, options = {}) {
     const result = normalizeResult(rawResult);
     const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;
     await execute(`
-      UPDATE records SET sentiment = $1, intent = $2, category = $3, subcategory = $4,
+      UPDATE records SET
+        sentiment = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'sentiment' THEN sentiment
+          ELSE $1
+        END,
+        intent = $2,
+        category = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'category' THEN category
+          ELSE $3
+        END,
+        subcategory = $4,
         source_type = $5, ai_summary = $6, ai_confidence = $7,
         ai_result = $8::jsonb,
-        published_ts = COALESCE($9, published_ts),
+        published_ts = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'publish_time' THEN published_ts
+          ELSE COALESCE($9, published_ts)
+        END,
         ai_labeled_at = now(), updated_at = now()
       WHERE id = $10
     `, [

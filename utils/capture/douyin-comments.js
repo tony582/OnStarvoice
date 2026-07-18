@@ -346,6 +346,7 @@ function buildCommentCaptureDiagnostics(captureContext) {
 
 export async function captureDouyinComments({
   onProgress = null,
+  expectedNoteId = "",
   maxDetectedItems = null,
   maxItems = null,
   maxDurationMs = DEFAULT_CONFIG.MAX_CAPTURE_DURATION_MS,
@@ -391,7 +392,14 @@ export async function captureDouyinComments({
   try {
     await ensureDetailPageReady(DOUYIN_DOM_PROFILE, {timeout: 10000});
 
-    const noteId = resolveDouyinNoteId();
+    const normalizedExpectedNoteId =
+      normalizeDouyinCommentNoteId(expectedNoteId);
+    const noteId = resolveDouyinCommentNoteId(normalizedExpectedNoteId);
+    assertDouyinCommentTargetIdentity(
+      normalizedExpectedNoteId,
+      noteId,
+      "开始采集评论前",
+    );
     if (!noteId) {
       throw new Error("无法识别当前作品 ID");
     }
@@ -407,13 +415,21 @@ export async function captureDouyinComments({
       // 严格正向判定"确证零评论"(全页 0 评论项 且 抖音自身空态标记 抢首评/暂无评论)才干净返回 0 条;
       // 不满足(=可能有评论只是这次没找到)仍抛错走重试,绝不把真有评论的吞成空。
       if (detectDouyinConfirmedEmptyComments()) {
+        const finalNoteId = resolveDouyinCommentNoteId(
+          normalizedExpectedNoteId,
+        );
+        assertDouyinCommentTargetIdentity(
+          normalizedExpectedNoteId,
+          finalNoteId,
+          "返回空评论结果前",
+        );
         setCommentOpenStrategy(captureContext, "confirmed_empty_no_comments");
         const emptyDiagnostics = buildCommentCaptureDiagnostics(captureContext);
         return {
           ok: true,
           type: SYNC_TYPE.COMMENTS,
           data: {
-            noteId,
+            noteId: finalNoteId || noteId,
             noteUrl: window.location.href,
             noteTitle: resolveNoteTitle(),
             totalCount: 0,
@@ -582,6 +598,12 @@ export async function captureDouyinComments({
       0,
       normalizedMaxDetectedItems,
     );
+    const finalNoteId = resolveDouyinCommentNoteId(normalizedExpectedNoteId);
+    assertDouyinCommentTargetIdentity(
+      normalizedExpectedNoteId,
+      finalNoteId,
+      "返回评论结果前",
+    );
     const commentDiagnostics = buildCommentCaptureDiagnostics(captureContext);
     const stageTrace = [
       buildCommentLoadStage({
@@ -606,7 +628,7 @@ export async function captureDouyinComments({
       ok: true,
       type: SYNC_TYPE.COMMENTS,
       data: {
-        noteId,
+        noteId: finalNoteId || noteId,
         noteUrl: window.location.href,
         noteTitle: resolveNoteTitle(),
         totalCount: items.length,
@@ -656,7 +678,10 @@ export async function captureDouyinComments({
         diagnostics: buildCommentCaptureDiagnostics(captureContext),
       },
       error: {
-        code: isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED",
+        code: String(
+          error?.code ||
+            (isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED"),
+        ),
         message: error.message,
       },
     };
@@ -670,14 +695,114 @@ function normalizePositiveInteger(value, fallback) {
   return rounded > 0 ? rounded : fallback;
 }
 
-function resolveDouyinNoteId() {
-  return (
-    document
-      .querySelector("[data-e2e-aweme-id]")
-      ?.getAttribute("data-e2e-aweme-id") ||
-    extractNoteId(window.location.href) ||
-    ""
+function normalizeDouyinCommentNoteId(value) {
+  const normalized = String(value || "").trim();
+  if (/^\d{8,}$/.test(normalized)) {
+    return normalized;
+  }
+  const extracted = String(extractNoteId(normalized) || "").trim();
+  return /^\d{8,}$/.test(extracted) ? extracted : "";
+}
+
+function readDouyinCommentNoteIdFromNode(node) {
+  if (!node) return "";
+  const attributeNames = [
+    "data-e2e-aweme-id",
+    "data-aweme-id",
+    "data-awemeid",
+    "data-item-id",
+  ];
+  const scopedNode =
+    node.closest?.(
+      "[data-e2e-aweme-id],[data-aweme-id],[data-awemeid],[data-item-id]",
+    ) || node;
+  for (const name of attributeNames) {
+    const noteId = normalizeDouyinCommentNoteId(
+      scopedNode.getAttribute?.(name),
+    );
+    if (noteId) return noteId;
+  }
+  const descendant = scopedNode.querySelector?.(
+    "[data-e2e-aweme-id],[data-aweme-id],[data-awemeid],[data-item-id]",
   );
+  if (descendant && descendant !== scopedNode) {
+    return readDouyinCommentNoteIdFromNode(descendant);
+  }
+  return "";
+}
+
+export function resolveDouyinCommentNoteId(expectedNoteId = "") {
+  const expected = normalizeDouyinCommentNoteId(expectedNoteId);
+  const activeSelectors = [
+    ".swiper-slide-active[data-e2e-aweme-id]",
+    ".swiper-slide-active [data-e2e-aweme-id]",
+    ".swiper-slide-active[data-aweme-id]",
+    ".swiper-slide-active [data-aweme-id]",
+    '[role="dialog"] .swiper-slide-active',
+    ".focusPanel .swiper-slide-active",
+    '[class*="focusPanel"] .swiper-slide-active',
+  ];
+  for (const selector of activeSelectors) {
+    const nodes = Array.from(document.querySelectorAll(selector));
+    for (const node of nodes) {
+      if (!isElementVisible(node)) continue;
+      const noteId = readDouyinCommentNoteIdFromNode(node);
+      if (noteId) return noteId;
+    }
+  }
+
+  if (expected) {
+    const exactSelector = [
+      `[data-e2e-aweme-id="${expected}"]`,
+      `[data-aweme-id="${expected}"]`,
+      `[data-awemeid="${expected}"]`,
+      `[data-item-id="${expected}"]`,
+    ].join(",");
+    for (const node of Array.from(document.querySelectorAll(exactSelector))) {
+      const activeBoundary = node.closest?.(
+        '.swiper-slide-active,[role="dialog"],.focusPanel,[class*="focusPanel"]',
+      );
+      if (activeBoundary && isElementVisible(activeBoundary)) {
+        return expected;
+      }
+    }
+  }
+
+  const routeNoteId = normalizeDouyinCommentNoteId(window.location.href);
+  if (routeNoteId) return routeNoteId;
+
+  for (const node of Array.from(
+    document.querySelectorAll(
+      "[data-e2e-aweme-id],[data-aweme-id],[data-awemeid],[data-item-id]",
+    ),
+  )) {
+    if (!isElementVisible(node)) continue;
+    const noteId = readDouyinCommentNoteIdFromNode(node);
+    if (noteId) return noteId;
+  }
+  return "";
+}
+
+export function assertDouyinCommentTargetIdentity(
+  expectedNoteId,
+  actualNoteId,
+  stage = "",
+) {
+  const expected = normalizeDouyinCommentNoteId(expectedNoteId);
+  if (!expected) {
+    return normalizeDouyinCommentNoteId(actualNoteId);
+  }
+  const actual = normalizeDouyinCommentNoteId(actualNoteId);
+  if (actual === expected) {
+    return actual;
+  }
+  const error = new Error(
+    `${stage ? `${stage}：` : ""}抖音评论作品不匹配，目标 ${expected}，实际 ${actual || "无法识别"}`,
+  );
+  error.code = "DOUYIN_COMMENT_ID_MISMATCH";
+  error.expectedNoteId = expected;
+  error.actualNoteId = actual;
+  throw error;
 }
 
 function resolveNoteTitle() {

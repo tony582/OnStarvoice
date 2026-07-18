@@ -146,6 +146,14 @@ function beginListCaptureFeedback(request, {captureKind, label}) {
         label,
         message: "正在识别页面中的有效笔记卡片",
       });
+      if (
+        String(request?.taskId || request?.taskContext?.taskId || "").trim()
+      ) {
+        overlay.setTaskTakeover({
+          active: true,
+          label: "AI 正在接管",
+        });
+      }
       overlayRunScope = createListCaptureOverlayRunScope(overlay, runId);
       activeListCaptureDebugOverlay = overlay;
     }
@@ -402,6 +410,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       handleUpdateListCaptureTraceBindings(request, sendResponseWithDiagnostics);
       return true;
 
+    case "restoreListCaptureTraceOverlay":
+      handleRestoreListCaptureTraceOverlay(
+        request,
+        sendResponseWithDiagnostics,
+      );
+      return true;
+
+    case "setCaptureTaskTakeover":
+      handleSetCaptureTaskTakeover(request, sendResponseWithDiagnostics);
+      return true;
+
     case "prepareKeywordStrategyCapture":
       handlePrepareKeywordStrategyCapture(sendResponseWithDiagnostics);
       return true;
@@ -473,19 +492,40 @@ function runTrackedCaptureRequest(request, handler) {
 
 function reportCaptureProgress(request, progress = {}) {
   const source = progress && typeof progress === "object" ? progress : {};
+  const normalizedProgress = {
+    ...source,
+    captureRequestId: String(request?.captureRequestId || ""),
+    recordId: String(request?.recordId || source.recordId || ""),
+    current: Number(request?.current) || source.current,
+    total: Number(request?.total) || source.total,
+    runnerTabId: Number(request?.runnerTabId) || source.runnerTabId || null,
+    captureAction: String(request?.action || source.captureAction || ""),
+    recoveryMaxAttempts: 1,
+    updatedAt: source.updatedAt || Date.now(),
+  };
+  const taskId = String(
+    request?.taskId || request?.taskContext?.taskId || "",
+  ).trim();
+  if (taskId) {
+    try {
+      const overlay =
+        activeListCaptureDebugOverlay || getListCaptureDebugOverlay();
+      overlay.setTaskTakeover({
+        active: true,
+        label: "AI 正在接管",
+        progress: normalizedProgress,
+      });
+      activeListCaptureDebugOverlay = overlay;
+    } catch (error) {
+      console.debug(
+        "[Content] Capture task page progress unavailable (ignored):",
+        error?.message || error,
+      );
+    }
+  }
   safeRuntimeSendMessage({
     action: "captureProgress",
-    progress: {
-      ...source,
-      captureRequestId: String(request?.captureRequestId || ""),
-      recordId: String(request?.recordId || source.recordId || ""),
-      current: Number(request?.current) || source.current,
-      total: Number(request?.total) || source.total,
-      runnerTabId: Number(request?.runnerTabId) || source.runnerTabId || null,
-      captureAction: String(request?.action || source.captureAction || ""),
-      recoveryMaxAttempts: 1,
-      updatedAt: Date.now(),
-    },
+    progress: normalizedProgress,
   });
 }
 
@@ -548,6 +588,121 @@ function handleUpdateListCaptureTraceBindings(request, sendResponse) {
       error: {
         code: "TRACE_BINDING_UPDATE_FAILED",
         message: error?.message || "更新列表采集标记失败",
+      },
+    });
+  }
+}
+
+function handleRestoreListCaptureTraceOverlay(request, sendResponse) {
+  try {
+    const payload =
+      request?.payload && typeof request.payload === "object"
+        ? request.payload
+        : request;
+    const runId = normalizeListCaptureRunId(payload?.runId);
+    const items = Array.isArray(payload?.items)
+      ? payload.items.filter((item) => item && typeof item === "object")
+      : [];
+    if (!runId || items.length === 0) {
+      sendResponse({
+        ok: true,
+        data: {
+          runId,
+          restoredCount: 0,
+          reason: "missing_trace_snapshot",
+        },
+      });
+      return;
+    }
+
+    const overlay = getListCaptureDebugOverlay();
+    overlay.startSession({
+      sessionId: runId,
+      platform:
+        String(payload?.platform || detectPlatformFromUrl(window.location.href))
+          .trim()
+          .toLowerCase(),
+      label: String(payload?.label || "采集结果").trim(),
+      message: "已恢复本轮采集编号",
+    });
+    overlay.recordItems(items, {
+      outcome: "accepted",
+      detectedCount: items.length,
+      message: "已恢复本轮采集编号",
+    });
+    overlay.complete("已恢复本轮采集编号");
+    activeListCaptureDebugOverlay = overlay;
+    const snapshot = overlay.getRenderSnapshot?.() || {};
+    sendResponse({
+      ok: true,
+      data: {
+        runId,
+        restoredCount: items.length,
+        visibleMarkerCount: Number(snapshot.visibleMarkerCount) || 0,
+        unresolvedCount: Number(snapshot.unresolvedCount) || 0,
+      },
+    });
+  } catch (error) {
+    console.warn("[Content] Restore list capture trace overlay failed:", error);
+    sendResponse({
+      ok: false,
+      error: {
+        code: "TRACE_OVERLAY_RESTORE_FAILED",
+        message: error?.message || "恢复列表采集标记失败",
+      },
+    });
+  }
+}
+
+function handleSetCaptureTaskTakeover(request, sendResponse) {
+  try {
+    const active = Boolean(request?.active);
+    if (!active && request?.clearTrace === true) {
+      const result =
+        activeListCaptureDebugOverlay?.clearTaskTrace?.() || {
+          cleared: false,
+          runId: "",
+          clearedAttributeCount: 0,
+        };
+      activeListCaptureDebugOverlay = null;
+      sendResponse({
+        ok: true,
+        data: {
+          taskId: String(request?.taskId || "").trim(),
+          active: false,
+          label: String(request?.label || "AI 正在接管").trim(),
+          ...result,
+        },
+      });
+      return;
+    }
+    const overlay = getListCaptureDebugOverlay();
+    const takeoverOptions = {
+      active,
+      label: String(request?.label || "AI 正在接管").trim(),
+    };
+    if (Object.prototype.hasOwnProperty.call(request || {}, "progress")) {
+      takeoverOptions.progress =
+        request?.progress && typeof request.progress === "object"
+          ? request.progress
+          : null;
+    }
+    const result = overlay.setTaskTakeover(takeoverOptions);
+    activeListCaptureDebugOverlay = overlay;
+    sendResponse({
+      ok: true,
+      data: {
+        taskId: String(request?.taskId || "").trim(),
+        ...result,
+      },
+    });
+  } catch (error) {
+    console.warn("[Content] Set capture task takeover failed:", error);
+    sendResponse({
+      ok: false,
+      error: {
+        code: "TASK_TAKEOVER_UPDATE_FAILED",
+        message: error?.message || "更新页面接管状态失败",
       },
     });
   }
@@ -1669,6 +1824,7 @@ async function handleCaptureComments(request, sendResponse) {
       onProgress: (progress) => {
         reportCaptureProgress(request, progress);
       },
+      expectedNoteId: String(request.expectedNoteId || ""),
       onlyLevel1: Boolean(request.onlyLevel1),
       maxDetectedItems: request.maxDetectedItems ?? request.maxItems,
       maxDurationMs: request.maxDurationMs,

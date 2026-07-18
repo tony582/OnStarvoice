@@ -9,9 +9,18 @@ export interface Badges {
   monitorAttention: number
   ticketsPending: number
   ticketsFeedback: number
+  feedbackPending: number
 }
 
-const EMPTY: Badges = { triagePending: 0, leadsNew: 0, issuesOpen: 0, monitorAttention: 0, ticketsPending: 0, ticketsFeedback: 0 }
+const EMPTY: Badges = {
+  triagePending: 0,
+  leadsNew: 0,
+  issuesOpen: 0,
+  monitorAttention: 0,
+  ticketsPending: 0,
+  ticketsFeedback: 0,
+  feedbackPending: 0,
+}
 
 interface BadgesContextValue {
   badges: Badges
@@ -36,7 +45,7 @@ export function BadgesProvider({ children }: { children: ReactNode }) {
     const token = ++tokenRef.current
     api.get<{ ok: boolean; badges: Badges }>('/workspace/badges')
       .then(data => {
-        if (token === tokenRef.current && data?.ok) setBadges(data.badges || EMPTY)
+        if (token === tokenRef.current && data?.ok) setBadges({ ...EMPTY, ...(data.badges || {}) })
       })
       .catch(() => {})
   }, [user, tenantId])

@@ -502,8 +502,24 @@ function normalizeTaskLedgerState(value) {
   };
 }
 
+async function fetchTaskLedgerFromBackground() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.GET_TASK_LEDGER,
+    });
+    if (response?.ok && response?.data && typeof response.data === 'object') {
+      return response.data;
+    }
+  } catch (error) {
+    console.warn('[State] failed to reconcile task ledger:', error);
+  }
+  return await getTaskLedger();
+}
+
 export async function initTaskLedger() {
-  currentTaskLedger = normalizeTaskLedgerState(await getTaskLedger());
+  currentTaskLedger = normalizeTaskLedgerState(
+    await fetchTaskLedgerFromBackground(),
+  );
   notifyListeners('taskLedger', currentTaskLedger);
   return currentTaskLedger;
 }
@@ -513,7 +529,9 @@ export function getCurrentTaskLedger() {
 }
 
 export async function refreshTaskLedger() {
-  currentTaskLedger = normalizeTaskLedgerState(await getTaskLedger());
+  currentTaskLedger = normalizeTaskLedgerState(
+    await fetchTaskLedgerFromBackground(),
+  );
   notifyListeners('taskLedger', currentTaskLedger);
   return currentTaskLedger;
 }

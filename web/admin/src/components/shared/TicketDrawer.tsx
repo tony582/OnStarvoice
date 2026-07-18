@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, ExternalLink, FileText, Info, Sparkles, MessageCircle, UserCog, Workflow, Pin, CheckCircle2, Send } from 'lucide-react'
+import { X, ExternalLink, FileText, Info, Sparkles, MessageCircle, UserCog, Workflow, Pin, CheckCircle2, Send, ArrowLeft } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatFullDate, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -104,31 +104,32 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview,
   const postUrl = t.url || rec?.url || cmt?.record_url || ''
 
   return (
-    <div ref={panelRef} style={{ width }}
-      className="fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
+    <div ref={panelRef} style={{ width }} role="dialog" aria-modal="true" aria-label="工单详情"
+      className="detail-drawer fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
       <div onMouseDown={startResize} title="拖动调整宽度"
-        className="group absolute left-0 top-0 z-30 flex h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center">
+        className="group absolute left-0 top-0 z-30 hidden h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center lg:flex">
         <span className="h-full w-px bg-transparent transition-all group-hover:w-[3px] group-hover:bg-primary" />
       </div>
       <div className="relative z-10 flex h-full w-full flex-col">
         {/* Header:标题 + 状态 +(结案)+ 钉住 + 关闭 */}
-        <div className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border/60 px-6">
+        <div className="flex min-h-14 shrink-0 items-center gap-2 border-b border-border/60 px-2 pt-[env(safe-area-inset-top)] sm:px-6">
+          <button onClick={onClose} aria-label="返回工单列表" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground active:bg-accent lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
           <h2 className="text-base font-bold">工单详情</h2>
           <StatusBadge tone={STATE_TONE[t.status] || 'muted'}>{STATE_LABEL[t.status] || t.status}</StatusBadge>
           <div className="ml-auto flex items-center gap-2">
             {onCloseTicket && (closed
               ? <span className="inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-600 dark:text-emerald-400"><CheckCircle2 className="h-4 w-4" />已结案</span>
-              : canWrite && <Button size="sm" onClick={onCloseTicket}><CheckCircle2 className="h-3.5 w-3.5" />结案</Button>)}
-            <button onClick={togglePin} title={pinned ? '已钉住:切换工单时保留滚动' : '钉住面板'}
-              className={cn('rounded-lg p-1.5 transition-colors', pinned ? 'bg-primary/12 text-primary' : 'text-muted-foreground hover:bg-accent')}>
+              : canWrite && <Button className="hidden lg:inline-flex" size="sm" onClick={onCloseTicket}><CheckCircle2 className="h-3.5 w-3.5" />结案</Button>)}
+            <button onClick={togglePin} aria-label={pinned ? '取消钉住工单面板' : '钉住工单面板'} title={pinned ? '已钉住:切换工单时保留滚动' : '钉住面板'}
+              className={cn('hidden rounded-lg p-1.5 transition-colors lg:block', pinned ? 'bg-primary/12 text-primary' : 'text-muted-foreground hover:bg-accent')}>
               <Pin className={cn('h-[18px] w-[18px]', pinned && 'fill-current')} />
             </button>
-            <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+            <button onClick={onClose} aria-label="关闭工单详情" className="hidden rounded-lg p-2 text-muted-foreground transition hover:bg-accent lg:block"><X className="h-5 w-5" /></button>
           </div>
         </div>
 
         {/* 摘要条:类型 / 平台 / 优先级 / 处理人 / 原文 */}
-        <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border/60 bg-muted/30 px-6 py-2.5">
+        <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border/60 bg-muted/30 px-4 py-2.5 sm:px-6">
           <StatusBadge tone={isComment ? 'neutral' : 'active'}>{isComment ? '评论' : '内容'}</StatusBadge>
           <StatusBadge tone="neutral">{platformName(t.platform)}</StatusBadge>
           <StatusBadge tone={t.priority}>{LABELS.priority[t.priority] || t.priority}</StatusBadge>
@@ -137,7 +138,7 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview,
         </div>
 
         {/* Body:单面板,分区用分隔线拉开层次 */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto overscroll-contain">
           {/* 内容 */}
           <Section icon={FileText} title={isComment ? '评论内容' : '帖子正文'}>
             {isComment ? (
@@ -161,7 +162,7 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview,
           {rec && (
             <Section icon={Info} title={isComment ? '所在帖子 · 基本信息' : '基本信息'}>
               {isComment && rec.title && <div className="mb-2.5 line-clamp-2 text-[13px] font-medium leading-snug text-foreground">{rec.title}</div>}
-              <div className="grid grid-cols-4 gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 <Stat label="点赞" value={rec.likes} />
                 <Stat label="评论" value={rec.comments_count} />
                 <Stat label="收藏" value={rec.collects} />
@@ -245,9 +246,10 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview,
 
         {/* Footer:内联添加过程备注 + 旧动作(舆情处理/分诊回执)*/}
         {canWrite && (onCloseTicket || onAction || onReview) && (
-          <div className="shrink-0 border-t border-border/60 px-6 py-3">
+          <div className="shrink-0 border-t border-border/60 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-6">
+            {onCloseTicket && !closed && <Button className="mb-2 w-full lg:hidden" onClick={onCloseTicket}><CheckCircle2 className="h-4 w-4" />完成并结案</Button>}
             {!closed && (
-              <div className="flex items-end gap-2">
+              <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-end">
                 <textarea
                   value={noteText}
                   onChange={e => setNoteText(e.target.value)}
@@ -284,7 +286,7 @@ export function TicketDrawer({ ticket: t, onClose, canWrite, onAction, onReview,
 // 分区:顶部分隔线 + 图标 + 加粗标题,拉开层次
 function Section({ icon: Icon, title, children }: { icon: React.ElementType; title: string; children: React.ReactNode }) {
   return (
-    <section className="border-t border-border/50 px-6 py-4 first:border-t-0">
+    <section className="border-t border-border/50 px-4 py-4 first:border-t-0 sm:px-6">
       <div className="mb-2.5 flex items-center gap-2">
         <Icon className="h-4 w-4 text-primary" />
         <h3 className="text-[13px] font-bold text-foreground">{title}</h3>

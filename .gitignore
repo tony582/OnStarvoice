@@ -12,6 +12,13 @@ server/node_modules/
 extension-build/
 extension-build.crx
 extension-build.pem
+*.crx
+
+# 本地构建、浏览器验收与客户交付产物（不进入源码提交）
+release/
+output/
+.playwright-cli/
+.tmp-mediaclawnew/
 
 # 本地 Claude Code 恢复历史，不属于产品源码
 claude_history/

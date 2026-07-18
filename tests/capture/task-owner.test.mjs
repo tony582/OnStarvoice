@@ -8,6 +8,7 @@ const {
   BIND_MESSAGE_TYPE,
   UNBIND_MESSAGE_TYPE,
   CANCELED_MESSAGE_TYPE,
+  DEFAULT_GRACE_MS,
   createCoordinator,
 } = globalThis.OnStarvoiceCaptureTaskOwner;
 
@@ -123,6 +124,23 @@ test("disconnect waits for the grace period before abandoning the task", async (
   await timers.fire(timerId);
   assert.deepEqual(abandoned, [{taskId: "task-disconnect"}]);
   assert.equal(coordinator.getOwner("task-disconnect"), null);
+});
+
+test("default disconnect grace gives a replacement owner ten seconds to bind", () => {
+  const timers = createTimerDouble();
+  const coordinator = createCoordinator({
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+  });
+  const port = createPort();
+  coordinator.attachPort(port);
+  coordinator.bind(port, "task-default-grace");
+
+  port.disconnect();
+  const timer = timers.pending.values().next().value;
+
+  assert.equal(DEFAULT_GRACE_MS, 10_000);
+  assert.equal(timer.delay, DEFAULT_GRACE_MS);
 });
 
 test("reconnecting the same task cancels its pending abandonment", async () => {

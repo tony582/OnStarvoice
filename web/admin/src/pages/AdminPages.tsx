@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Loader2, Building2, Users, KeyRound, Settings as SettingsIcon, Save } from 'lucide-react'
+import { Loader2, Building2, Users, KeyRound, Save } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatExpiry, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -35,31 +35,47 @@ export function TenantsPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
-      <section className="rounded-xl border border-border bg-card p-5">
+      <section className="rounded-xl border border-border bg-card p-4 lg:p-5">
         <h2 className="mb-1 inline-flex items-center gap-1.5 text-sm font-bold"><Building2 className="h-4 w-4 text-primary" />新建客户(租户)</h2>
         <p className="mb-3 text-[12.5px] text-muted-foreground">每个客户(如「安吉星」)= 一个租户,数据完全隔离。建好后给它建账号、发激活码。</p>
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="min-w-[240px] flex-1">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+          <div className="min-w-0 w-full flex-1 sm:min-w-[240px]">
             <Field label="客户/租户名称">
               <Input value={name} onChange={e => setName(e.target.value)} placeholder="例:安吉星 / 上汽通用 / 凯迪拉克"
                 onKeyDown={e => { if (e.key === 'Enter') create() }} />
             </Field>
           </div>
-          <Button onClick={create} disabled={creating || !name.trim()}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Building2 className="h-4 w-4" />}新建客户</Button>
+          <Button className="h-11 w-full lg:h-9 lg:w-auto" onClick={create} disabled={creating || !name.trim()}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Building2 className="h-4 w-4" />}新建客户</Button>
         </div>
-        {msg && <p className="mt-3 text-[12.5px] font-medium text-status-green">{msg}</p>}
+        {msg && <p className={`mt-3 text-[12.5px] font-medium ${msg.startsWith('创建失败') ? 'text-status-red' : 'text-status-green'}`}>{msg}</p>}
       </section>
 
       {loading ? <Spin /> : !tenants.length ? <EmptyState icon={Building2} title="暂无租户" /> : (
-        <Table heads={['租户', '状态', '创建时间']}>
-          {tenants.map(t => (
-            <tr key={t.id} className="transition-colors hover:bg-muted/30">
-              <td className="px-4 py-3 font-medium">{t.name}</td>
-              <td className="px-4 py-3"><StatusBadge tone={t.status}>{t.status === 'active' ? '启用' : t.status}</StatusBadge></td>
-              <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(t.created_at)}</td>
-            </tr>
-          ))}
-        </Table>
+        <>
+          <MobileList label={`客户租户 · ${tenants.length}`}>
+            {tenants.map(t => (
+              <MobileEntityCard key={t.id} active={t.status === 'active'}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-bold tracking-[0.12em] text-muted-foreground">客户租户</p>
+                    <h3 className="mt-1 break-words text-[17px] font-bold leading-6 text-foreground">{t.name}</h3>
+                  </div>
+                  <StatusBadge tone={t.status}>{t.status === 'active' ? '启用' : t.status}</StatusBadge>
+                </div>
+                <div className="mt-4"><MobileMeta label="创建时间" value={formatDate(t.created_at)} /></div>
+              </MobileEntityCard>
+            ))}
+          </MobileList>
+          <Table heads={['租户', '状态', '创建时间']}>
+            {tenants.map(t => (
+              <tr key={t.id} className="transition-colors hover:bg-muted/30">
+                <td className="px-4 py-3 font-medium">{t.name}</td>
+                <td className="px-4 py-3"><StatusBadge tone={t.status}>{t.status === 'active' ? '启用' : t.status}</StatusBadge></td>
+                <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(t.created_at)}</td>
+              </tr>
+            ))}
+          </Table>
+        </>
       )}
     </div>
   )
@@ -72,6 +88,12 @@ export function UsersPage() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
+  const [mobileResetId, setMobileResetId] = useState('')
+  const [mobilePassword, setMobilePassword] = useState('')
+  const [mobileActionBusy, setMobileActionBusy] = useState(false)
+  const [mobileDisableId, setMobileDisableId] = useState('')
+  const [mobileActionError, setMobileActionError] = useState('')
+  const [mobileNotice, setMobileNotice] = useState({ id: '', text: '', error: false })
   const [form, setForm] = useState({ email: '', name: '', password: '', type: 'tenant', tenantId: '', role: 'tenant_viewer', globalRole: 'internal_operator' })
 
   const load = async () => {
@@ -114,70 +136,149 @@ export function UsersPage() {
     await api.post('/admin/users/' + id + '/reset-password', { password: pw }, { skipTenant: true })
   }
 
+  const resetPwdOnMobile = async (id: string) => {
+    if (mobilePassword.length < 8) { setMobileActionError('新密码至少 8 位'); return }
+    setMobileActionBusy(true); setMobileActionError('')
+    try {
+      await api.post('/admin/users/' + id + '/reset-password', { password: mobilePassword }, { skipTenant: true })
+      setMobileResetId(''); setMobilePassword(''); setMobileNotice({ id, text: '密码已重置', error: false })
+    } catch (err) {
+      setMobileActionError('重置失败:' + (err instanceof Error ? err.message : ''))
+    } finally { setMobileActionBusy(false) }
+  }
+
   const toggleStatus = async (id: string, current: string) => {
     await api.patch('/admin/users/' + id, { status: current === 'active' ? 'disabled' : 'active' }, { skipTenant: true })
     load()
   }
 
+  const toggleStatusOnMobile = async (id: string, current: string) => {
+    setMobileActionBusy(true); setMobileActionError('')
+    try {
+      await toggleStatus(id, current)
+      setMobileDisableId('')
+      setMobileNotice({ id, text: current === 'active' ? '账号已停用' : '账号已启用', error: false })
+    } catch (err) {
+      const text = '操作失败:' + (err instanceof Error ? err.message : '')
+      setMobileActionError(text)
+      if (current !== 'active') setMobileNotice({ id, text, error: true })
+    } finally { setMobileActionBusy(false) }
+  }
+
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
       {/* Create form */}
-      <section className="rounded-lg border border-border bg-card p-5">
+      <section className="rounded-xl border border-border bg-card p-4 lg:rounded-lg lg:p-5">
         <h2 className="mb-4 text-sm font-bold">创建账号</h2>
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          <Field label="邮箱"><Input value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} type="email" /></Field>
-          <Field label="姓名"><Input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
-          <Field label="初始密码"><Input value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} type="password" /></Field>
-          <Field label="账号类型">
-            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+        <p className="mb-4 text-xs leading-5 text-muted-foreground lg:hidden">先确定账号归属和权限，再填写人员信息与初始密码。</p>
+        <div className="grid gap-3 lg:grid-cols-3">
+          <Field label="邮箱" className="order-5 lg:order-none"><Input value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} type="email" /></Field>
+          <Field label="姓名" className="order-4 lg:order-none"><Input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
+          <Field label="初始密码" className="order-6 lg:order-none"><Input value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} type="password" /></Field>
+          <Field label="账号类型" className="order-1 lg:order-none">
+            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
               <option value="tenant">客户账号</option><option value="internal">内部账号</option>
             </select>
           </Field>
           {form.type === 'tenant' && (
             <>
-              <Field label="租户">
-                <select value={form.tenantId} onChange={e => setForm({ ...form, tenantId: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+              <Field label="租户" className="order-2 lg:order-none">
+                <select value={form.tenantId} onChange={e => setForm({ ...form, tenantId: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
                   {tenants.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
                 </select>
               </Field>
-              <Field label="角色">
-                <select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+              <Field label="角色" className="order-3 lg:order-none">
+                <select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
                   <option value="tenant_viewer">只读</option><option value="tenant_analyst">分析员</option><option value="tenant_admin">管理员</option>
                 </select>
               </Field>
             </>
           )}
           {form.type === 'internal' && (
-            <Field label="内部角色">
-              <select value={form.globalRole} onChange={e => setForm({ ...form, globalRole: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+            <Field label="内部角色" className="order-2 lg:order-none">
+              <select value={form.globalRole} onChange={e => setForm({ ...form, globalRole: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
                 <option value="internal_operator">内部运营</option><option value="platform_admin">平台管理员</option>
               </select>
             </Field>
           )}
         </div>
-        <div className="mt-4 flex flex-wrap items-center justify-end gap-3">
-          {msg && <span className={`text-[12.5px] font-medium ${/失败|必填|至少|请选择/.test(msg) ? 'text-status-red' : 'text-status-green'}`}>{msg}</span>}
-          <Button onClick={createUser} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}创建账号</Button>
+        <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-end">
+          {msg && <span className={`order-2 text-[12.5px] font-medium lg:order-none ${/失败|必填|至少|请选择/.test(msg) ? 'text-status-red' : 'text-status-green'}`}>{msg}</span>}
+          <Button className="h-11 w-full lg:h-9 lg:w-auto" onClick={createUser} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}创建账号</Button>
         </div>
       </section>
 
       {loading ? <Spin /> : !users.length ? <EmptyState icon={Users} title="暂无用户" /> : (
-        <Table heads={['用户', '角色', '状态', '最近登录', '操作']}>
-          {users.map(u => (
-            <tr key={u.id} className="transition-colors hover:bg-muted/30">
-              <td className="px-4 py-3"><div className="font-medium">{u.name || u.email}</div><div className="text-xs text-muted-foreground">{u.email}</div></td>
-              <td className="px-4 py-3"><StatusBadge tone={u.global_role || 'viewer'}>{u.is_internal ? (LABELS.role[u.global_role] || u.global_role) : '客户'}</StatusBadge></td>
-              <td className="px-4 py-3"><StatusBadge tone={u.status}>{u.status === 'active' ? '启用' : '禁用'}</StatusBadge></td>
-              <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(u.last_login_at)}</td>
-              <td className="px-4 py-3 text-right">
-                <div className="flex justify-end gap-1">
-                  <Button variant="outline" size="sm" onClick={() => resetPwd(u.id)}>重置密码</Button>
-                  <Button variant={u.status === 'active' ? 'destructive' : 'default'} size="sm" onClick={() => toggleStatus(u.id, u.status)}>{u.status === 'active' ? '禁用' : '启用'}</Button>
+        <>
+          <MobileList label={`账号 · ${users.length}`}>
+            {users.map(u => (
+              <MobileEntityCard key={u.id} active={u.status === 'active'}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h3 className="break-words text-[17px] font-bold leading-6">{u.name || u.email}</h3>
+                    <p className="mt-0.5 break-all text-xs text-muted-foreground">{u.email}</p>
+                  </div>
+                  <StatusBadge tone={u.status}>{u.status === 'active' ? '启用' : '禁用'}</StatusBadge>
                 </div>
-              </td>
-            </tr>
-          ))}
-        </Table>
+                <div className="mt-4 grid grid-cols-2 gap-2">
+                  <MobileMeta label="账号角色" value={u.is_internal ? (LABELS.role[u.global_role] || u.global_role) : '客户账号'} />
+                  <MobileMeta label="最近登录" value={formatDate(u.last_login_at)} />
+                </div>
+                {mobileNotice.id === u.id && <p className={`mt-3 rounded-lg px-3 py-2 text-xs font-semibold ${mobileNotice.error ? 'bg-destructive/10 text-destructive' : 'bg-status-green/10 text-status-green'}`}>{mobileNotice.text}</p>}
+                {mobileResetId === u.id ? (
+                  <div className="mt-4 space-y-3 rounded-xl border border-primary/25 bg-primary/5 p-3">
+                    <Field label="为此账号设置新密码">
+                      <Input autoFocus type="password" value={mobilePassword} onChange={e => setMobilePassword(e.target.value)} placeholder="至少 8 位" />
+                    </Field>
+                    {mobileActionError && <p className="text-xs font-semibold text-destructive">{mobileActionError}</p>}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button className="h-11" variant="outline" onClick={() => { setMobileResetId(''); setMobilePassword(''); setMobileActionError('') }}>取消</Button>
+                      <Button className="h-11" disabled={mobileActionBusy || mobilePassword.length < 8} onClick={() => resetPwdOnMobile(u.id)}>{mobileActionBusy && <Loader2 className="h-4 w-4 animate-spin" />}确认重置</Button>
+                    </div>
+                  </div>
+                ) : mobileDisableId === u.id ? (
+                  <div className="mt-4 space-y-3 rounded-xl border border-destructive/30 bg-destructive/5 p-3">
+                    <p className="text-sm font-bold text-destructive">确认停用这个账号？</p>
+                    <p className="text-xs leading-5 text-muted-foreground">停用后，该账号将立即无法登录；之后仍可重新启用。</p>
+                    {mobileActionError && <p className="text-xs font-semibold text-destructive">{mobileActionError}</p>}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button className="h-11" variant="outline" disabled={mobileActionBusy} onClick={() => { setMobileDisableId(''); setMobileActionError('') }}>返回</Button>
+                      <Button className="h-11" variant="destructive" disabled={mobileActionBusy} onClick={() => toggleStatusOnMobile(u.id, u.status)}>{mobileActionBusy && <Loader2 className="h-4 w-4 animate-spin" />}确认停用</Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="mt-4 grid grid-cols-2 gap-2 border-t border-border/70 pt-4">
+                      <Button className="h-11" variant="outline" onClick={() => { setMobileResetId(u.id); setMobilePassword(''); setMobileDisableId(''); setMobileActionError(''); setMobileNotice({ id: '', text: '', error: false }) }}>重置密码</Button>
+                      <Button className="h-11" disabled={mobileActionBusy} variant={u.status === 'active' ? 'destructive' : 'default'} onClick={() => {
+                        setMobileActionError(''); setMobileNotice({ id: '', text: '', error: false })
+                        if (u.status === 'active') { setMobileDisableId(u.id); setMobileResetId('') }
+                        else toggleStatusOnMobile(u.id, u.status)
+                      }}>{u.status === 'active' ? '停用账号' : '启用账号'}</Button>
+                    </div>
+                    {u.status === 'active' && <p className="mt-2 text-[11px] leading-4 text-muted-foreground">停用属于高风险操作，需要再次确认。</p>}
+                  </>
+                )}
+              </MobileEntityCard>
+            ))}
+          </MobileList>
+          <Table heads={['用户', '角色', '状态', '最近登录', '操作']}>
+            {users.map(u => (
+              <tr key={u.id} className="transition-colors hover:bg-muted/30">
+                <td className="px-4 py-3"><div className="font-medium">{u.name || u.email}</div><div className="text-xs text-muted-foreground">{u.email}</div></td>
+                <td className="px-4 py-3"><StatusBadge tone={u.global_role || 'viewer'}>{u.is_internal ? (LABELS.role[u.global_role] || u.global_role) : '客户'}</StatusBadge></td>
+                <td className="px-4 py-3"><StatusBadge tone={u.status}>{u.status === 'active' ? '启用' : '禁用'}</StatusBadge></td>
+                <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(u.last_login_at)}</td>
+                <td className="px-4 py-3 text-right">
+                  <div className="flex justify-end gap-1">
+                    <Button variant="outline" size="sm" onClick={() => resetPwd(u.id)}>重置密码</Button>
+                    <Button variant={u.status === 'active' ? 'destructive' : 'default'} size="sm" onClick={() => toggleStatus(u.id, u.status)}>{u.status === 'active' ? '禁用' : '启用'}</Button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </Table>
+        </>
       )}
     </div>
   )
@@ -226,43 +327,67 @@ export function AuthCodesPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
-      <section className="rounded-xl border border-border bg-card p-5">
+      <section className="rounded-xl border border-border bg-card p-4 lg:p-5">
         <h2 className="mb-1 inline-flex items-center gap-1.5 text-sm font-bold"><KeyRound className="h-4 w-4 text-primary" />生成激活码</h2>
         <p className="mb-3 text-[12.5px] text-muted-foreground">激活码绑定到某个客户(租户),该客户用此码采集的数据全部归属其租户。</p>
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid gap-3 lg:grid-cols-4">
           <Field label="归属客户(租户)">
-            <select value={form.tenantId} onChange={e => setForm({ ...form, tenantId: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+            <select value={form.tenantId} onChange={e => setForm({ ...form, tenantId: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
               {tenants.length === 0 && <option value="">(先到「租户管理」建客户)</option>}
               {tenants.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
             </select>
           </Field>
           <Field label="类型">
-            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="h-9 w-full rounded-lg border border-input bg-card px-3 text-sm">
+            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
               <option value="trial">试用(7天)</option><option value="annual">年付(1年)</option><option value="permanent">永久</option>
             </select>
           </Field>
           <Field label="备注/联系人(选填)"><Input value={form.ownerName} onChange={e => setForm({ ...form, ownerName: e.target.value })} placeholder="例:安吉星-张经理" /></Field>
-          <div className="flex items-end"><Button className="w-full" onClick={create} disabled={creating || !form.tenantId}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}生成激活码</Button></div>
+          <div className="flex items-end"><Button className="h-11 w-full lg:h-9" onClick={create} disabled={creating || !form.tenantId}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}生成激活码</Button></div>
         </div>
-        {created && <p className="mt-3 text-[12.5px] font-medium text-status-green">{created}</p>}
+        {created && <p className={`mt-3 break-all text-[12.5px] font-medium ${created.startsWith('创建失败') ? 'text-status-red' : 'text-status-green'}`}>{created}</p>}
       </section>
 
       {loading ? <Spin /> : !codes.length ? <EmptyState icon={KeyRound} title="暂无激活码" /> : (
-        <Table heads={['激活码', '类型', '状态', '客户', '绑定', '到期日']}>
-          {codes.map(c => {
-            const exp = formatExpiry(c.expires_at)
-            return (
-            <tr key={c.id} className="transition-colors hover:bg-muted/30">
-              <td className="px-4 py-3"><code className="rounded bg-muted px-2 py-0.5 text-xs font-mono">{c.code}</code><div className="mt-0.5 text-xs text-muted-foreground">{c.tenant_name}</div></td>
-              <td className="px-4 py-3"><StatusBadge tone="neutral">{c.type}</StatusBadge></td>
-              <td className="px-4 py-3"><StatusBadge tone={c.status}>{c.status}</StatusBadge></td>
-              <td className="px-4 py-3 text-sm">{c.owner_name || c.owner_email || '-'}</td>
-              <td className="px-4 py-3 tabular-nums text-sm">{c.binding_count} / {c.max_bindings}</td>
-              <td className={`px-4 py-3 text-sm ${exp.expired ? 'text-destructive' : 'text-muted-foreground'}`}>{exp.text}</td>
-            </tr>
-            )
-          })}
-        </Table>
+        <>
+          <MobileList label={`激活码 · ${codes.length}`}>
+            {codes.map(c => {
+              const exp = formatExpiry(c.expires_at)
+              return (
+                <MobileEntityCard key={c.id} active={c.status === 'active' && !exp.expired}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-[11px] font-bold tracking-[0.12em] text-muted-foreground">{c.tenant_name || '未命名租户'}</p>
+                      <code className="mt-1.5 block break-all font-mono text-[15px] font-bold leading-6 text-foreground">{c.code}</code>
+                    </div>
+                    <StatusBadge tone={c.status}>{c.status}</StatusBadge>
+                  </div>
+                  <div className="mt-4 grid grid-cols-2 gap-2">
+                    <MobileMeta label="有效类型" value={authCodeTypeLabel(c.type)} />
+                    <MobileMeta label="绑定设备" value={`${c.binding_count} / ${c.max_bindings}`} />
+                    <MobileMeta label="联系人" value={c.owner_name || c.owner_email || '-'} />
+                    <MobileMeta label="到期日" value={exp.text} danger={exp.expired} />
+                  </div>
+                </MobileEntityCard>
+              )
+            })}
+          </MobileList>
+          <Table heads={['激活码', '类型', '状态', '客户', '绑定', '到期日']}>
+            {codes.map(c => {
+              const exp = formatExpiry(c.expires_at)
+              return (
+              <tr key={c.id} className="transition-colors hover:bg-muted/30">
+                <td className="px-4 py-3"><code className="rounded bg-muted px-2 py-0.5 text-xs font-mono">{c.code}</code><div className="mt-0.5 text-xs text-muted-foreground">{c.tenant_name}</div></td>
+                <td className="px-4 py-3"><StatusBadge tone="neutral">{c.type}</StatusBadge></td>
+                <td className="px-4 py-3"><StatusBadge tone={c.status}>{c.status}</StatusBadge></td>
+                <td className="px-4 py-3 text-sm">{c.owner_name || c.owner_email || '-'}</td>
+                <td className="px-4 py-3 tabular-nums text-sm">{c.binding_count} / {c.max_bindings}</td>
+                <td className={`px-4 py-3 text-sm ${exp.expired ? 'text-destructive' : 'text-muted-foreground'}`}>{exp.text}</td>
+              </tr>
+              )
+            })}
+          </Table>
+        </>
       )}
     </div>
   )
@@ -304,16 +429,16 @@ export function SettingsPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
-      <SettingsCard title="AI 模型" onSave={() => save('llm')}>
-        <div className="grid gap-3 sm:grid-cols-2">
+      <SettingsCard title="AI 模型" description="配置舆情分析所使用的模型服务。" onSave={() => save('llm')}>
+        <div className="grid gap-3 lg:grid-cols-2">
           <Field label="提供商"><Input value={settings.llm_provider || ''} onChange={e => u('llm_provider', e.target.value)} /></Field>
           <Field label="模型"><Input value={settings.llm_model || ''} onChange={e => u('llm_model', e.target.value)} /></Field>
           <Field label="API Key" full><Input type="password" value={settings._llm_api_key || ''} onChange={e => u('_llm_api_key', e.target.value)} placeholder="留空不修改" /></Field>
         </div>
       </SettingsCard>
 
-      <SettingsCard title="品牌设置（AI 舆情判断按此租户的品牌语境）" onSave={() => save('brand')}>
-        <div className="grid gap-3 sm:grid-cols-2">
+      <SettingsCard title="品牌设置（AI 舆情判断按此租户的品牌语境）" description="定义当前租户的品牌边界和判断语境。" onSave={() => save('brand')}>
+        <div className="grid gap-3 lg:grid-cols-2">
           <Field label="品牌名称"><Input value={settings.brand_name || ''} onChange={e => u('brand_name', e.target.value)} placeholder="如：安吉星" /></Field>
           <Field label="品牌别名（逗号分隔）"><Input value={settings.brand_aliases || ''} onChange={e => u('brand_aliases', e.target.value)} placeholder="如：OnStar,安吉星" /></Field>
           <Field label="业务背景" full><Input value={settings.brand_business_context || ''} onChange={e => u('brand_business_context', e.target.value)} placeholder="一句话描述品牌业务，如：车联网服务，提供远程控制/车况检测/道路救援等" /></Field>
@@ -323,8 +448,8 @@ export function SettingsPage() {
         <p className="mt-3 text-xs text-muted-foreground">留空则回退到系统默认（安吉星）语境。给新公司开租户后，请在这里填该公司自己的品牌，AI 才会按它的语境判舆情。</p>
       </SettingsCard>
 
-      <SettingsCard title="报告时间" onSave={() => save('report')}>
-        <div className="grid gap-3 sm:grid-cols-2">
+      <SettingsCard title="报告时间" description="分别设置日报、周报和月报的生成时点。" onSave={() => save('report')}>
+        <div className="grid gap-3 lg:grid-cols-2">
           <Field label="日报时间"><Input value={settings.report_daily_time || '09:00'} onChange={e => u('report_daily_time', e.target.value)} /></Field>
           <Field label="周报时间"><Input value={settings.report_weekly_time || '09:00'} onChange={e => u('report_weekly_time', e.target.value)} /></Field>
           <Field label="月报日期"><Input value={settings.report_monthly_day || '1'} onChange={e => u('report_monthly_day', e.target.value)} /></Field>
@@ -332,8 +457,8 @@ export function SettingsPage() {
         </div>
       </SettingsCard>
 
-      <SettingsCard title="邮件发送" onSave={() => save('email')}>
-        <div className="grid gap-3 sm:grid-cols-2">
+      <SettingsCard title="邮件发送" description="设置报告邮件的发送服务和收件人。" onSave={() => save('email')}>
+        <div className="grid gap-3 lg:grid-cols-2">
           <Field label="SMTP 主机"><Input value={settings.smtp_host || ''} onChange={e => u('smtp_host', e.target.value)} /></Field>
           <Field label="SMTP 端口"><Input value={settings.smtp_port || '465'} onChange={e => u('smtp_port', e.target.value)} /></Field>
           <Field label="SMTP 账号"><Input value={settings.smtp_user || ''} onChange={e => u('smtp_user', e.target.value)} /></Field>
@@ -351,7 +476,7 @@ function Spin() { return <div className="flex justify-center py-20"><Loader2 cla
 
 function Table({ heads, children }: { heads: string[]; children: React.ReactNode }) {
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
+    <div className="hidden overflow-hidden rounded-lg border border-border bg-card lg:block">
       <table className="w-full text-sm">
         <thead><tr className="border-b border-border bg-muted/50">
           {heads.map(h => <th key={h} className="px-4 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">{h}</th>)}
@@ -362,16 +487,58 @@ function Table({ heads, children }: { heads: string[]; children: React.ReactNode
   )
 }
 
-function Field({ label, children, full }: { label: string; children: React.ReactNode; full?: boolean }) {
-  return <label className={`space-y-1.5 ${full ? 'sm:col-span-2' : ''}`}><span className="text-xs font-semibold text-muted-foreground">{label}</span>{children}</label>
+function MobileList({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <section className="space-y-3 lg:hidden">
+      <div className="flex items-center justify-between px-1">
+        <h2 className="text-[11px] font-bold tracking-[0.14em] text-muted-foreground">{label}</h2>
+        <span className="text-[11px] text-muted-foreground">纵向查看</span>
+      </div>
+      {children}
+    </section>
+  )
 }
 
-function SettingsCard({ title, onSave, children }: { title: string; onSave: () => void; children: React.ReactNode }) {
+function MobileEntityCard({ active, children }: { active: boolean; children: React.ReactNode }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-5">
-      <h2 className="mb-4 text-sm font-bold">{title}</h2>
+    <article className={`relative overflow-hidden rounded-2xl border bg-card p-4 shadow-sm ${active ? 'border-border' : 'border-destructive/25'}`}>
+      <span aria-hidden className={`absolute inset-y-0 left-0 w-1 ${active ? 'bg-status-green' : 'bg-destructive'}`} />
       {children}
-      <div className="mt-4 flex justify-end"><Button size="sm" onClick={onSave}><Save className="h-3.5 w-3.5" /> 保存</Button></div>
+    </article>
+  )
+}
+
+function MobileMeta({ label, value, danger = false }: { label: string; value: React.ReactNode; danger?: boolean }) {
+  return (
+    <div className="min-w-0 rounded-xl bg-muted/45 px-3 py-2.5">
+      <p className="text-[10px] font-bold tracking-wide text-muted-foreground">{label}</p>
+      <div className={`mt-1 break-words text-[13px] font-semibold leading-5 ${danger ? 'text-destructive' : 'text-foreground'}`}>{value}</div>
+    </div>
+  )
+}
+
+function authCodeTypeLabel(type: string) {
+  if (type === 'trial') return '试用 · 7 天'
+  if (type === 'annual') return '年付 · 1 年'
+  if (type === 'permanent') return '永久'
+  return type || '-'
+}
+
+function Field({ label, children, full, className = '' }: { label: string; children: React.ReactNode; full?: boolean; className?: string }) {
+  return <label className={`space-y-1.5 [&_input]:h-11 lg:[&_input]:h-9 ${full ? 'lg:col-span-2' : ''} ${className}`}><span className="text-xs font-semibold text-muted-foreground">{label}</span>{children}</label>
+}
+
+function SettingsCard({ title, description, onSave, children }: { title: string; description?: string; onSave: () => void; children: React.ReactNode }) {
+  return (
+    <section className="rounded-2xl border border-border bg-card p-4 lg:rounded-lg lg:p-5">
+      <div className="mb-4">
+        <h2 className="text-base font-bold leading-6 lg:text-sm">{title}</h2>
+        {description && <p className="mt-1 text-xs leading-5 text-muted-foreground lg:hidden">{description}</p>}
+      </div>
+      {children}
+      <div className="mt-4 border-t border-border/70 pt-4 lg:flex lg:justify-end lg:border-0 lg:pt-0">
+        <Button className="h-11 w-full lg:h-8 lg:w-auto" size="sm" onClick={onSave}><Save className="h-3.5 w-3.5" /> <span className="lg:hidden">保存本组设置</span><span className="hidden lg:inline">保存</span></Button>
+      </div>
     </section>
   )
 }

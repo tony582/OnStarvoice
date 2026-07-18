@@ -1,9 +1,9 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
-  CheckCircle, Archive, Ban, Loader2,
+  CheckCircle, Archive, Loader2,
   Package, User, FileText, Bell, ExternalLink,
-  ArrowUp, ArrowDown, ChevronsUpDown, Download, X,
+  ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
@@ -11,7 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { RecordDrawer, getCover } from '@/components/shared/RecordDrawer'
+import { RecordDrawer, getCover, type ManualRecordFields } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
@@ -20,6 +20,11 @@ import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useTicketDispatch } from '@/components/shared/TicketDispatch'
+import { RecordLabelChips } from '@/components/shared/RecordLabels'
+import {
+  normalizeCustomTags, tagsFromRecord,
+  type CustomTag, type CustomTagPatch,
+} from '@/lib/custom-tags'
 import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
@@ -31,6 +36,11 @@ const STATUS_TABS = [
 ]
 
 interface Pagination { page: number; totalPages: number; total: number }
+interface CustomTagsMutationResponse {
+  customTags?: unknown
+  custom_tags?: unknown
+  record?: unknown
+}
 type SortField = 'publish' | 'interactions' | 'first_seen' | 'last_seen'
 const RISK_OPTIONS = [{ value: 'alert', label: '有预警' }, { value: 'negative', label: '有负评' }]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
@@ -48,10 +58,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [risk, setRisk] = useState<string[]>([])
   const [identity, setIdentity] = useState<string[]>([])
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [customTagIds, setCustomTagIds] = useState<string[]>([])
+  const [customTagCatalog, setCustomTagCatalog] = useState<CustomTag[]>([])
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [exporting, setExporting] = useState(false)
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量/首次发现/最近采集、升降序
   const [sort, setSort] = useState<{ field: SortField; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
   const [records, setRecords] = useState<any[]>([])
@@ -60,10 +73,25 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [batchBusy, setBatchBusy] = useState(false)
+  const customTagRequestSeq = useRef(0)
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${status}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${status}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${pagination?.page ?? 1}`)
+
+  const loadCustomTagCatalog = useCallback(async (keyword = '') => {
+    const seq = ++customTagRequestSeq.current
+    try {
+      const params = new URLSearchParams({ limit: '100' })
+      if (keyword) params.set('keyword', keyword)
+      const data = await api.get<{ tags?: unknown }>('/custom-tags?' + params)
+      if (seq === customTagRequestSeq.current) {
+        setCustomTagCatalog(normalizeCustomTags(data.tags))
+      }
+    } catch {
+      // 标签目录不阻断内容列表；详情中仍可输入新标签，稍后刷新再复用。
+    }
+  }, [])
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
@@ -75,11 +103,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     params.set('sort', sort.field)
     params.set('dir', sort.dir)
     captureKeywords.forEach(k => params.append('captureKeyword', k))
+    customTagIds.forEach(id => params.append('customTag', id))
+    if (customTagIds.length) params.set('customTagMode', 'any')
     if (dateFrom) params.set('dateFrom', dateFrom)
     if (dateTo) params.set('dateTo', dateTo)
     if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, dateFrom, dateTo, dateBasis])
+  }, [status, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateFrom, dateTo, dateBasis])
 
   const load = useCallback(async (page = 1) => {
     setLoading(true)
@@ -106,13 +136,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || dateFrom || dateTo)
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || dateFrom || dateTo)
+  const activeFilterCount = [platform, sentiment, triageStatus, dateFrom || dateTo].filter(Boolean).length
+    + risk.length + identity.length + captureKeywords.length + customTagIds.length
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setDateFrom(''); setDateTo('')
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateFrom(''); setDateTo('')
     setSort({ field: 'publish', dir: 'desc' })
   }
 
   useEffect(() => { load() }, [load])
+  // Initial catalog fetch updates state asynchronously inside the callback.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { loadCustomTagCatalog() }, [loadCustomTagCatalog])
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -130,22 +165,76 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     refreshBadges()
   }, [load, pagination, records.length, refreshBadges])
 
-  const updateTriage = async (recordId: string, newStatus: string, opts?: { note?: string }) => {
+  const updateTriage = async (recordId: string, newStatus: string, opts?: { note?: string }): Promise<boolean> => {
     let note = opts?.note
     if (note === undefined) {
       const input = await ask({ title: '内容处理备注', placeholder: '例如：已官方回复 / 已上报 / 误报无需处理' })
-      if (input === null) { setOpenMenu(null); return } // 取消则不处理，避免误点即消失
+      if (input === null) { setOpenMenu(null); return false } // 取消则不处理，避免误点即消失
       note = input
     }
     await api.patch('/triage/records/' + recordId, { status: newStatus, note })
     setOpenMenu(null)
     await reloadAfterMutation()
+    return true
   }
 
-  const markResponded = async (recordId: string) => {
+  const markResponded = async (recordId: string): Promise<boolean> => {
     await api.patch('/records/' + recordId + '/official-response', { status: 'responded' })
     setOpenMenu(null)
     await reloadAfterMutation()
+    return true
+  }
+
+  const markFalsePositive = async (recordId: string): Promise<boolean> => {
+    const reason = await ask({
+      title: '标记为误报',
+      placeholder: '请说明为什么这条内容属于误报',
+      confirmLabel: '确认误报',
+      required: true,
+      helpText: '必填。原因会进入误报反馈，供后台人员复核和总结。',
+    })
+    if (reason === null) return false
+    await api.patch('/triage/records/' + recordId, {
+      status: 'false_positive',
+      reason,
+      note: reason,
+    })
+    setOpenMenu(null)
+    await reloadAfterMutation()
+    setDrawerRecord(null)
+    return true
+  }
+
+  const updateManualFields = async (recordId: string, fields: ManualRecordFields): Promise<boolean> => {
+    await api.patch('/records/' + recordId + '/manual-fields', fields)
+    await reloadAfterMutation()
+    setDrawerRecord(null)
+    return true
+  }
+
+  const updateCustomTags = async (recordId: string, patch: CustomTagPatch): Promise<CustomTag[]> => {
+    const data = await api.patch<CustomTagsMutationResponse>('/records/' + recordId + '/custom-tags', patch)
+    const tags = tagsFromMutationResponse(data)
+    setRecords(current => current.map(record =>
+      record.id === recordId ? withCustomTags(record, tags) : record))
+    setDrawerRecord((current: Record<string, unknown> | null) =>
+      current?.id === recordId ? withCustomTags(current, tags) : current)
+    await loadCustomTagCatalog()
+    if (customTagIds.length) {
+      const stillMatches = tags.some(tag => customTagIds.includes(tag.id))
+      if (!stillMatches) {
+        setRecords(current => current.filter(record => record.id !== recordId))
+        setPagination(current => {
+          if (!current) return current
+          const total = Math.max(0, current.total - 1)
+          return { ...current, total, totalPages: Math.ceil(total / 30) }
+        })
+      }
+      const page = pagination?.page || 1
+      const willEmpty = records.length <= 1 && page > 1
+      await load(willEmpty ? page - 1 : page)
+    }
+    return tags
   }
 
   const dispatchTicket = async (record: any) => {
@@ -180,8 +269,22 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     onClose: () => setDrawerRecord(null),
     canWrite: canWrite(),
     onLinkIssue: () => { dispatchTicket(drawerRecord); setDrawerRecord(null) },
-    onSetStatus: (s: string) => { updateTriage(drawerRecord.id, s); setDrawerRecord(null) },
-    onMarkResponded: () => { markResponded(drawerRecord.id); setDrawerRecord(null) },
+    onSetStatus: async (s: string) => {
+      const updated = await updateTriage(drawerRecord.id, s)
+      if (updated) setDrawerRecord(null)
+      return updated
+    },
+    onMarkResponded: async () => {
+      const updated = await markResponded(drawerRecord.id)
+      if (updated) setDrawerRecord(null)
+      return updated
+    },
+    onFalsePositive: drawerRecord.triage_status === 'false_positive'
+      ? undefined
+      : () => markFalsePositive(drawerRecord.id),
+    onUpdateFields: (fields: ManualRecordFields) => updateManualFields(drawerRecord.id, fields),
+    customTagCatalog,
+    onUpdateCustomTags: (patch: CustomTagPatch) => updateCustomTags(drawerRecord.id, patch),
   } : null
 
   return (
@@ -197,7 +300,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 return (
                   <button key={tab.value} onClick={() => { setStatus(tab.value); setTriageStatus('') }}
                     className={cn(
-                      'inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12.5px] font-semibold transition-colors',
+                      'inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] font-semibold transition-colors lg:min-h-0 lg:px-2.5 lg:py-1.5',
                       on ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                     )}>
                     <Icon className="h-3.5 w-3.5" strokeWidth={2} />
@@ -214,7 +317,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <div className="inline-flex items-center gap-0.5">
             {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([v, label, Icon]) => (
               <button key={v} onClick={() => setView(v)}
-                className={cn('inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors',
+                className={cn('inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-semibold transition-colors lg:min-h-0 lg:px-2.5 lg:py-1.5',
+                  v === 'board' && 'hidden lg:inline-flex',
                   view === v ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground')}>
                 <Icon className="h-3.5 w-3.5" />{label}
               </button>
@@ -223,46 +327,79 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-x-1.5 gap-y-2">
-          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}
-            className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
-            <option value="">全部平台</option>
-            <option value="xiaohongshu">小红书</option>
-            <option value="douyin">抖音</option>
-            <option value="weibo">微博</option>
-          </WorkbenchSelect>
-          {view === 'list' && (
-            <>
-              <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}
-                className={cn('bg-muted font-medium hover:bg-muted/70', triageStatus ? 'text-foreground' : 'text-muted-foreground')}>
-                {triageStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-              </WorkbenchSelect>
-              <span className="mx-0.5 h-4 w-px bg-border/60" />
-              <MultiSelect label="风险" options={RISK_OPTIONS} value={risk} onChange={setRisk} />
-              <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
-              <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
-              <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
-            </>
-          )}
-          <span className="mx-0.5 h-4 w-px bg-border/60" />
-          <div className="inline-flex h-8 items-center rounded-lg bg-muted p-0.5">
-            {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([v, label]) => (
-              <button key={v} onClick={() => setSentiment(v)}
-                className={cn('inline-flex h-7 items-center rounded-md px-2.5 text-[12px] font-medium transition-colors',
-                  sentiment === v ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
-                {label}
-              </button>
-            ))}
-          </div>
-          {hasActiveFilters && (
-            <button onClick={clearFilters} title="清空所有筛选"
-              className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
-              <X className="h-3.5 w-3.5" />清空
-            </button>
-          )}
-          <div className="relative ml-auto w-40 sm:w-52">
+          <div className="relative w-full lg:ml-auto lg:w-52">
             <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文…" className="h-8 border-transparent bg-muted pl-8 text-[12px] focus:bg-card" />
+              onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文…" className="h-10 border-transparent bg-muted pl-8 text-[12px] focus:bg-card lg:h-8" />
+          </div>
+          <button
+            type="button"
+            onClick={() => setMobileFiltersOpen(open => !open)}
+            aria-expanded={mobileFiltersOpen}
+            className={cn(
+              'inline-flex h-10 items-center gap-1.5 rounded-lg border px-3 text-[12px] font-semibold lg:hidden',
+              mobileFiltersOpen || activeFilterCount > 0 ? 'border-primary/25 bg-accent text-primary' : 'border-border bg-card text-muted-foreground',
+            )}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5" />筛选
+            {activeFilterCount > 0 && <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground">{activeFilterCount}</span>}
+          </button>
+          <div className={cn(
+            'w-full flex-wrap items-center gap-2 rounded-xl bg-muted/30 p-3',
+            mobileFiltersOpen ? 'flex' : 'hidden',
+            'lg:contents',
+          )}>
+            <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}
+              className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
+              <option value="">全部平台</option>
+              <option value="xiaohongshu">小红书</option>
+              <option value="douyin">抖音</option>
+              <option value="weibo">微博</option>
+            </WorkbenchSelect>
+            {view === 'list' && (
+              <>
+                <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}
+                  className={cn('bg-muted font-medium hover:bg-muted/70', triageStatus ? 'text-foreground' : 'text-muted-foreground')}>
+                  {triageStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+                </WorkbenchSelect>
+                <span className="mx-0.5 hidden h-4 w-px bg-border/60 lg:block" />
+                <MultiSelect label="风险" options={RISK_OPTIONS} value={risk} onChange={setRisk} />
+                <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
+                <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
+                <MultiSelect
+                  label="自定义标签"
+                  options={customTagCatalog.map(tag => ({
+                    value: tag.id,
+                    label: tag.name,
+                    count: tag.usageCount,
+                  }))}
+                  value={customTagIds}
+                  onChange={setCustomTagIds}
+                  width="w-64"
+                  searchable
+                  searchPlaceholder="搜索自定义标签…"
+                  emptyText="暂无自定义标签"
+                  onSearch={loadCustomTagCatalog}
+                />
+                <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
+              </>
+            )}
+            <span className="mx-0.5 hidden h-4 w-px bg-border/60 lg:block" />
+            <div className="mobile-table-scroll inline-flex h-10 max-w-full items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8">
+              {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([v, label]) => (
+                <button key={v} onClick={() => setSentiment(v)}
+                  className={cn('inline-flex h-9 shrink-0 items-center rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7',
+                    sentiment === v ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {hasActiveFilters && (
+              <button onClick={clearFilters} title="清空所有筛选"
+                className="inline-flex h-10 items-center gap-1 rounded-lg px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8 lg:px-2">
+                <X className="h-3.5 w-3.5" />清空
+              </button>
+            )}
           </div>
           {view === 'list' && (
             <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
@@ -292,7 +429,21 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         <EmptyState icon={Inbox} title="暂无记录" description="调整筛选条件试试" />
       ) : (
         <div className="overflow-hidden rounded-xl bg-card">
-          <div className="overflow-x-auto">
+          <div className="divide-y divide-border/50 lg:hidden">
+            {records.map(r => (
+              <MobileRecordCard
+                key={r.id}
+                record={r}
+                canWrite={canWrite()}
+                archived={status === 'archived'}
+                selected={sel.has(r.id)}
+                onToggle={() => sel.toggle(r.id)}
+                onOpenDetail={() => setDrawerRecord(r)}
+                interactions={interactions(r)}
+              />
+            ))}
+          </div>
+          <div className="hidden overflow-x-auto lg:block">
           <table className="w-full min-w-[1080px] text-sm">
             <thead>
               <tr className="border-b border-border/60 [&>th]:whitespace-nowrap [&>th]:py-3">
@@ -365,15 +516,102 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           onAction={key => runBatch(key)}
           actions={[
             { key: 'archived', label: '归档', icon: Archive },
-            { key: 'false_positive', label: '误报', icon: Ban, tone: 'danger' },
           ]}
         />
       )}
 
       {/* 详情:盖式滑出面板(无遮罩,盖在列表右侧,左侧仍可点)*/}
-      {drawerProps && <RecordDrawer {...drawerProps} />}
+      {/* The compiler cannot currently prove the ref-free shape of this memoized drawer payload. */}
+      {/* eslint-disable-next-line react-hooks/refs */}
+      {drawerProps && <RecordDrawer key={drawerProps.record.id} {...drawerProps} />}
       {dialog}
       {dispatchDialog}
+    </div>
+  )
+}
+
+/* 手机值守卡片：把桌面表格里最需要扫读的判断、风险和时间压到一屏内。 */
+// Mirrors the long-standing desktop row contract while keeping the mobile view local.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function MobileRecordCard({ record: r, canWrite, archived, selected, onToggle, onOpenDetail, interactions }: any) {
+  const cover = getCover(r)
+  const customTags = tagsFromRecord(r)
+  const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
+  const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
+  const mobileIdentity = identityLabel(r.source_type, r.author_fans, r.author_name, r.identity_override)
+  const hasRiskSignals = Number(r.alert_count || 0) > 0
+    || Number(r.negative_comment_count || 0) > 0
+    || (r.official_response_status && r.official_response_status !== 'none')
+
+  return (
+    <article
+      role="button"
+      tabIndex={0}
+      onClick={onOpenDetail}
+      onKeyDown={event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onOpenDetail()
+        }
+      }}
+      className={cn(
+        'relative cursor-pointer px-3 py-3.5 transition-colors active:bg-accent/70',
+        selected && 'bg-primary/[0.05]',
+      )}
+    >
+      <span className={cn('absolute inset-y-3.5 left-0 w-1 rounded-r-full', sentimentBar)} />
+      <div className="flex items-start gap-3">
+        {canWrite && (
+          <div className="-ml-1 flex h-11 w-8 shrink-0 items-center justify-center" onClick={event => event.stopPropagation()}>
+            <Checkbox checked={selected} onChange={onToggle} />
+          </div>
+        )}
+        {cover ? (
+          <div className="h-12 w-12 shrink-0 overflow-hidden rounded-xl border border-border/70 bg-muted">
+            <img src={cover} alt="" className="h-full w-full object-cover" loading="lazy" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+          </div>
+        ) : (
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-dashed border-border bg-muted/40">
+            <FileText className="h-4 w-4 text-muted-foreground/40" />
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="line-clamp-2 text-[14px] font-semibold leading-5">{r.title || r.content || '(无标题)'}</div>
+          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+            <span className="inline-flex min-w-0 items-center gap-1"><User className="h-3 w-3 shrink-0" /><span className="max-w-28 truncate">{r.author_name || '未知作者'}</span></span>
+            <span>{platformName(r.platform)}</span>
+            {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()} className="inline-flex items-center gap-0.5 font-semibold text-primary">原文<ExternalLink className="h-3 w-3" /></a>}
+          </div>
+        </div>
+        <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-muted-foreground/60" />
+      </div>
+
+      <div className={cn('mt-3 flex flex-wrap items-center gap-1.5', canWrite && 'pl-10')}>
+        <StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
+        <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
+        {hasRiskSignals && <RiskSignals record={r} />}
+        {mobileIdentity && <IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} />}
+      </div>
+
+      <div className={cn('mt-3 grid grid-cols-3 divide-x divide-border/60 rounded-lg bg-muted/35 px-1 py-2', canWrite && 'ml-10')}>
+        <MobileMetric label="互动" value={formatNumber(interactions)} />
+        <MobileMetric label="发布" value={r.publish_display || '—'} />
+        <MobileMetric label="最近采集" value={formatDateCompact(r.last_seen_at)} />
+      </div>
+
+      <div className={cn('mt-2.5 flex min-w-0 items-center justify-between gap-2', canWrite && 'pl-10')}>
+        <div className="min-w-0">{customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}</div>
+        <span className="shrink-0 text-[11px] font-semibold text-primary">{archived ? '查看归档' : '查看并处置'}</span>
+      </div>
+    </article>
+  )
+}
+
+function MobileMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 px-2 text-center">
+      <div className="truncate text-[11px] font-semibold tabular-nums text-foreground">{value}</div>
+      <div className="mt-0.5 text-[9.5px] text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -381,6 +619,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 /* ==================== Record Row(列表行)==================== */
 function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
+  const customTags = tagsFromRecord(r)
   const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
 
@@ -409,6 +648,7 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
               {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><ExternalLink className="h-2.5 w-2.5" />原文</a>}
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
             </div>
+            {customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact className="mt-1" />}
           </div>
         </div>
       </td>
@@ -416,7 +656,7 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
-      {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} /></td>}
+      {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>}
@@ -437,7 +677,6 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
                   <div className="absolute right-0 top-full z-30 mt-1 w-40 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-lg duration-150">
                     <MenuBtn icon={CheckCircle} label="标为已响应" onClick={onMarkResponded} />
                     <MenuBtn icon={Archive} label="归档" onClick={() => onUpdateTriage('archived')} />
-                    <MenuBtn icon={Ban} label="误报" onClick={() => onUpdateTriage('false_positive')} />
                   </div>
                 )}
               </div>
@@ -480,11 +719,11 @@ function SortableTh({ label, field, sort, onSort, align = 'left', className = ''
 }
 
 /* 疑似身份:作者来源(ai-labeler LLM 多信号判定);4S店/员工=疑似软文(原 KOE),KOL=自媒体,其余淡化 */
-function IdentityBadge({ sourceType, fans, name }: { sourceType?: string; fans?: number; name?: string }) {
-  const label = identityLabel(sourceType, fans, name)
+function IdentityBadge({ sourceType, fans, name, override }: { sourceType?: string; fans?: number; name?: string; override?: string }) {
+  const label = identityLabel(sourceType, fans, name, override)
   if (!label) return <span className="text-[11px] text-muted-foreground/40">—</span>
   const strong = label === 'KOE' || label === '4S店'
-  const kol = label === 'KOC' || label.endsWith('KOL')
+  const kol = label.includes('KOC') || label.includes('KOL')
   const cls = strong
     ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
     : kol
@@ -522,4 +761,18 @@ function RiskSignals({ record: r }: any) {
       )}
     </div>
   )
+}
+
+function tagsFromMutationResponse(data: CustomTagsMutationResponse): CustomTag[] {
+  if (data.customTags !== undefined) return normalizeCustomTags(data.customTags)
+  if (data.custom_tags !== undefined) return normalizeCustomTags(data.custom_tags)
+  if (data.record && typeof data.record === 'object') {
+    const record = data.record as Record<string, unknown>
+    if ('customTags' in record || 'custom_tags' in record) return tagsFromRecord(record)
+  }
+  throw new Error('标签已保存，但服务端未返回最新标签，请刷新后重试')
+}
+
+function withCustomTags<T extends Record<string, unknown>>(record: T, tags: CustomTag[]): T {
+  return { ...record, customTags: tags, custom_tags: tags }
 }

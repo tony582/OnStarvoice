@@ -333,3 +333,269 @@ test("both double-buffer workers register before any site navigation", async () 
     featureKey: "capture.search",
   });
 });
+
+test("Douyin detail batches create one active worker without standby prefetch", async () => {
+  const events = [];
+  const sourceTab = {
+    id: 61,
+    windowId: 7,
+    index: 2,
+    active: true,
+    status: "complete",
+    url: "https://www.douyin.com/jingxuan/search/test?type=general",
+  };
+  const worker = {
+    id: 292,
+    windowId: 7,
+    index: 3,
+    active: false,
+    status: "complete",
+    url: "about:blank",
+  };
+  let createCount = 0;
+  let navigationPatch = null;
+
+  globalThis.chrome = {
+    storage: {local: createMemoryStorageArea()},
+    runtime: {
+      async sendMessage(message) {
+        if (message?.type === "onstarvoice:begin-capture-task") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (message?.type === "onstarvoice:register-capture-task-tab") {
+          events.push(`register:${message.tabId}`);
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        return {ok: true, data: null};
+      },
+      getURL(path) {
+        return `chrome-extension://test/${path}`;
+      },
+    },
+    tabs: {
+      async query() {
+        return [sourceTab];
+      },
+      async create(properties) {
+        createCount += 1;
+        events.push(`create:${createCount}`);
+        return {...worker, ...properties, id: worker.id};
+      },
+      async update(tabId, patch) {
+        if (tabId === worker.id && patch?.url) {
+          navigationPatch = structuredClone(patch);
+          events.push("navigate");
+          throw new Error("stop after first Douyin navigation");
+        }
+        return {id: tabId, ...patch};
+      },
+      async get(tabId) {
+        if (tabId === sourceTab.id) return sourceTab;
+        if (tabId === worker.id) return worker;
+        throw new Error(`No tab with id: ${tabId}`);
+      },
+      async remove(tabId) {
+        events.push(`remove:${tabId}`);
+      },
+    },
+    scripting: {
+      async executeScript() {
+        return [{result: {isDouyin: true, detailReady: false}}];
+      },
+    },
+    windows: {async update() { return {}; }},
+  };
+
+  const [{addRecord}, captureSync, taskContext] = await Promise.all([
+    import("../../utils/storage.js"),
+    import("../../utils/capture-sync.js"),
+    import("../../utils/task-context.js"),
+  ]);
+  const recordIds = ["douyin-single-worker-r1", "douyin-single-worker-r2"];
+  for (const [index, recordId] of recordIds.entries()) {
+    const noteId = `76619358500000000${index + 1}`;
+    await addRecord({
+      id: recordId,
+      type: "keyword_notes",
+      platform: "douyin",
+      payload: {
+        items: [{
+          noteId: index === 0 ? "search_card_1" : noteId,
+          noteType: "video",
+          duration: "00:29",
+          url: `https://www.douyin.com/video/${noteId}`,
+        }],
+      },
+    });
+  }
+
+  const activeTask = taskContext.beginTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+  await captureSync.beginCaptureTaskSession({
+    taskId: activeTask.taskId,
+    tabId: sourceTab.id,
+    label: "Douyin single worker test",
+    platform: "douyin",
+  });
+
+  const result = await captureSync.batchCaptureDetailsForRecords(recordIds, {
+    skipAlreadyCaptured: false,
+    captureTaskId: activeTask.taskId,
+    shouldStop: () => navigationPatch !== null,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(createCount, 1, events.join(" -> "));
+  assert.equal(events.filter((event) => event.startsWith("register:")).length, 1);
+  assert.equal(navigationPatch?.active, true);
+  assert.equal(
+    navigationPatch?.url,
+    "https://www.douyin.com/jingxuan/search/test?type=general&modal_id=766193585000000001",
+  );
+  assert.equal(events.includes("remove:292"), true);
+
+  await captureSync.endCaptureTaskSession({
+    taskId: activeTask.taskId,
+    reason: "completed",
+    status: "completed",
+  });
+  taskContext.completeTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+});
+
+test("Douyin modal navigation timeout falls back to the direct video route", async () => {
+  const sourceTab = {
+    id: 71,
+    windowId: 8,
+    index: 2,
+    active: true,
+    status: "complete",
+    url: "https://www.douyin.com/jingxuan/search/fallback?type=general",
+  };
+  const worker = {
+    id: 392,
+    windowId: 8,
+    index: 3,
+    active: false,
+    status: "complete",
+    url: "about:blank",
+  };
+  const noteId = "766193585000000099";
+  const navigationUrls = [];
+
+  globalThis.chrome = {
+    storage: {local: createMemoryStorageArea()},
+    runtime: {
+      async sendMessage(message) {
+        if (message?.type === "onstarvoice:begin-capture-task") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (message?.type === "onstarvoice:register-capture-task-tab") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        return {ok: true, data: null};
+      },
+      getURL(path) {
+        return `chrome-extension://test/${path}`;
+      },
+    },
+    tabs: {
+      async query() {
+        return [sourceTab];
+      },
+      async create(properties) {
+        return {...worker, ...properties, id: worker.id};
+      },
+      async update(tabId, patch) {
+        if (tabId === worker.id && patch?.url) {
+          navigationUrls.push(String(patch.url));
+          worker.active = Boolean(patch.active);
+          if (navigationUrls.length === 1) {
+            worker.url = sourceTab.url;
+            worker.status = "loading";
+          } else {
+            worker.url = String(patch.url);
+            worker.status = "loading";
+          }
+        }
+        return tabId === sourceTab.id
+          ? {...sourceTab, ...patch}
+          : {...worker, ...patch};
+      },
+      async get(tabId) {
+        if (tabId === sourceTab.id) return sourceTab;
+        if (tabId === worker.id) return {...worker};
+        throw new Error(`No tab with id: ${tabId}`);
+      },
+      async remove() {
+        return undefined;
+      },
+    },
+    scripting: {
+      async executeScript() {
+        return [{result: 0}];
+      },
+    },
+    windows: {async update() { return {}; }},
+  };
+
+  const [{addRecord}, captureSync, taskContext] = await Promise.all([
+    import("../../utils/storage.js"),
+    import("../../utils/capture-sync.js"),
+    import("../../utils/task-context.js"),
+  ]);
+  const recordId = "douyin-modal-timeout-fallback-r1";
+  await addRecord({
+    id: recordId,
+    type: "keyword_notes",
+    platform: "douyin",
+    meta: {sourceUrl: sourceTab.url},
+    payload: {
+      searchUrl: sourceTab.url,
+      items: [{
+        noteId,
+        noteType: "video",
+        duration: "00:29",
+        url: `${sourceTab.url}&modal_id=${noteId}`,
+      }],
+    },
+  });
+
+  const activeTask = taskContext.beginTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+  await captureSync.beginCaptureTaskSession({
+    taskId: activeTask.taskId,
+    tabId: sourceTab.id,
+    label: "Douyin modal fallback test",
+    platform: "douyin",
+  });
+
+  const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
+    skipAlreadyCaptured: false,
+    captureTaskId: activeTask.taskId,
+    detailNavTimeoutMs: 5,
+    shouldStop: () => navigationUrls.length >= 2,
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(navigationUrls, [
+    `${sourceTab.url}&modal_id=${noteId}`,
+    `https://www.douyin.com/video/${noteId}`,
+  ]);
+
+  await captureSync.endCaptureTaskSession({
+    taskId: activeTask.taskId,
+    reason: "completed",
+    status: "completed",
+  });
+  taskContext.completeTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+});

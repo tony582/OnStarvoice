@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowRight, ChevronLeft, ChevronRight, Database, Download, ExternalLink, FileText, Image as ImageIcon,
-  Loader2, RefreshCw, Search,
+  ArrowLeft, ArrowRight, ChevronDown, ChevronLeft, ChevronRight, Database, Download, ExternalLink, FileText,
+  Filter, Image as ImageIcon, Layers3, Loader2, RefreshCw, Search, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatNumber, platformName, friendlyError } from '@/lib/utils'
@@ -67,6 +67,11 @@ export function DataPage() {
   const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
   const [expandedCells, setExpandedCells] = useState<Record<string, boolean>>({})
   const [expandResetVersion, setExpandResetVersion] = useState(0)
+  // The data explorer intentionally accepts heterogeneous rows from six tables.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [selectedRecord, setSelectedRecord] = useState<any | null>(null)
+  const [datasetPickerOpen, setDatasetPickerOpen] = useState(false)
+  const [filtersOpen, setFiltersOpen] = useState(false)
 
   const activeConfig = TABLES.find(table => table.key === activeTable) || TABLES[0]
   const columns = useMemo(() => {
@@ -81,6 +86,7 @@ export function DataPage() {
   const load = async (page = 1) => {
     setLoading(true)
     setError('')
+    setSelectedRecord(null)
     try {
       const params = new URLSearchParams({ page: String(page), pageSize: '50' })
       if (platform) params.set('platform', platform)
@@ -102,38 +108,167 @@ export function DataPage() {
 
   useEffect(() => { load(1) }, [activeTable, platform, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  const selectTable = (table: TableKey) => {
+    setActiveTable(table)
+    setSelectedRecord(null)
+    setDatasetPickerOpen(false)
+  }
+
+  const activeFilterCount = Number(Boolean(platform)) + Number(Boolean(dateFrom || dateTo))
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const renderColumn = (row: any, column: Column, rowIndex = 0) => {
+    const rowKey = recordKey(row, activeTable, pagination?.page || 1, rowIndex)
+    const cellKey = `${rowKey}:${column.key}`
+    return column.render(row, {
+      expanded: Boolean(expandedCells[cellKey]),
+      resetKey: `${expandResetVersion}:${cellKey}`,
+      toggle: () => setExpandedCells(current => ({ ...current, [cellKey]: !current[cellKey] })),
+    })
+  }
+
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-3 duration-300">
-      <WorkbenchTabs
-        tabs={TABLES.map(table => ({ key: table.key, label: table.label }))}
-        activeKey={activeTable}
-        onChange={key => setActiveTable(key as TableKey)}
-      />
+      <div className="hidden lg:block">
+        <WorkbenchTabs
+          tabs={TABLES.map(table => ({ key: table.key, label: table.label }))}
+          activeKey={activeTable}
+          onChange={key => selectTable(key as TableKey)}
+        />
+      </div>
 
-      <WorkbenchToolbar meta={activeConfig.description}>
-        <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
-          {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </WorkbenchSelect>
-        <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
-        <div className="relative min-w-[260px] flex-1 sm:flex-none">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={keyword}
-            onChange={e => setKeyword(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') load(1) }}
-            placeholder="搜索标题、正文、作者、关键词"
-            className="h-8 pl-8 text-xs"
-          />
+      <div className="hidden lg:block">
+        <WorkbenchToolbar meta={activeConfig.description}>
+          <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
+            {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </WorkbenchSelect>
+          <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
+          <div className="relative min-w-0 w-full flex-1 lg:min-w-[260px] lg:w-auto lg:flex-none">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={keyword}
+              onChange={e => setKeyword(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') load(1) }}
+              placeholder="搜索标题、正文、作者、关键词"
+              className="h-8 pl-8 text-xs"
+            />
           </div>
-        <Button variant="outline" size="sm" onClick={() => load(1)} disabled={loading}>
-          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-          刷新
-        </Button>
-      </WorkbenchToolbar>
+          <Button variant="outline" size="sm" onClick={() => load(1)} disabled={loading}>
+            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+            刷新
+          </Button>
+        </WorkbenchToolbar>
+      </div>
 
-      {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>}
+      <section className="space-y-3 lg:hidden" aria-label="移动数据仓">
+        <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+          <button
+            type="button"
+            onClick={() => setDatasetPickerOpen(true)}
+            className="flex w-full items-center gap-3 px-4 py-3.5 text-left active:bg-muted/60"
+          >
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+              <Layers3 className="h-5 w-5" />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] font-semibold tracking-wide text-muted-foreground">当前数据集</span>
+              <span className="mt-0.5 block truncate text-base font-bold text-foreground">{activeConfig.label}</span>
+              <span className="mt-0.5 block truncate text-xs text-muted-foreground">{activeConfig.description}</span>
+            </span>
+            <span className="inline-flex shrink-0 items-center gap-1 text-xs font-semibold text-primary">
+              切换 <ChevronDown className="h-4 w-4" />
+            </span>
+          </button>
 
-      <WorkbenchTableShell>
+          <div className="border-t border-border bg-muted/20 px-3 py-3">
+            <div className="flex items-center gap-2">
+              <div className="relative min-w-0 flex-1">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={keyword}
+                  onChange={e => setKeyword(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') load(1) }}
+                  placeholder="搜标题、正文或作者"
+                  className="h-10 rounded-xl bg-background pl-9 text-sm"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => setFiltersOpen(true)}
+                className="relative inline-flex h-10 shrink-0 items-center gap-1.5 rounded-xl border border-border bg-background px-3 text-sm font-semibold text-foreground active:bg-muted"
+              >
+                <Filter className="h-4 w-4" />
+                筛选
+                {activeFilterCount > 0 && (
+                  <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] text-primary-foreground">
+                    {activeFilterCount}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                aria-label="刷新数据"
+                onClick={() => load(1)}
+                disabled={loading}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-background text-foreground active:bg-muted disabled:opacity-50"
+              >
+                <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+              </button>
+            </div>
+            <div className="mt-2 flex items-center justify-between gap-3 px-1 text-xs text-muted-foreground">
+              <span>{platform ? platformName(platform) : '全部平台'} · {dateRangeSummary(dateFrom, dateTo)}</span>
+              <span className="shrink-0 font-semibold tabular-nums text-foreground">{formatNumber(pagination?.total ?? rows.length)} 条</span>
+            </div>
+          </div>
+        </div>
+
+        {activeTable === 'comment_leads' && (
+          <button
+            type="button"
+            onClick={() => navigate('workbench', { queue: 'leads' })}
+            className="flex w-full items-center justify-between rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-left"
+          >
+            <span>
+              <span className="block text-sm font-semibold text-foreground">这些客资需要跟进？</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">进入客资队列完成分配与处理</span>
+            </span>
+            <ArrowRight className="h-4 w-4 shrink-0 text-primary" />
+          </button>
+        )}
+
+        {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>}
+
+        {loading ? (
+          <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-2xl border border-border bg-card">
+            <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            <span className="text-sm text-muted-foreground">正在整理记录…</span>
+          </div>
+        ) : rows.length ? (
+          <div className="space-y-2.5">
+            {rows.map((row, index) => (
+              <MobileRecordCard
+                key={recordKey(row, activeTable, pagination?.page || 1, index)}
+                row={row}
+                table={activeTable}
+                onOpen={() => setSelectedRecord(row)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-border bg-card">
+            <EmptyState icon={Database} title="暂无数据" description="采集或同步后，这里会显示对应记录" />
+          </div>
+        )}
+
+        {pagination && pagination.totalPages > 1 && (
+          <MobilePagination pagination={pagination} onPage={load} />
+        )}
+      </section>
+
+      {error && <div className="hidden rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 lg:block">{error}</div>}
+
+      <div className="hidden lg:block">
+        <WorkbenchTableShell>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-muted/20 px-4 py-3">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold text-foreground">{activeConfig.label}</span>
@@ -158,7 +293,7 @@ export function DataPage() {
         {loading ? (
           <div className="flex justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
         ) : (
-          <div className="max-h-[calc(100vh-330px)] min-h-[420px] overflow-auto bg-background">
+          <div className="max-h-[calc(100dvh-280px)] min-h-[360px] overflow-auto bg-background lg:max-h-[calc(100vh-330px)] lg:min-h-[420px]">
             <table className="w-full border-separate border-spacing-0 text-sm" style={{ minWidth: `${Math.max(1280, tableMinWidth)}px` }}>
               <thead>
                 <tr>
@@ -178,15 +313,9 @@ export function DataPage() {
                   rows.map((row, index) => (
                     <tr key={row.id || row.observation_id || index} className="group align-top">
                       {columns.map((column, columnIndex) => {
-                        const rowKey = String(row.id || row.observation_id || `${activeTable}-${pagination?.page || 1}-${index}`)
-                        const cellKey = `${rowKey}:${column.key}`
                         return (
                           <td key={column.key} className={tableCellClass(columnIndex)} style={columnWidthStyle(column)}>
-                            {column.render(row, {
-                              expanded: Boolean(expandedCells[cellKey]),
-                              resetKey: `${expandResetVersion}:${cellKey}`,
-                              toggle: () => setExpandedCells(current => ({ ...current, [cellKey]: !current[cellKey] })),
-                            })}
+                            {renderColumn(row, column, index)}
                           </td>
                         )
                       })}
@@ -218,9 +347,489 @@ export function DataPage() {
             </div>
           </div>
         )}
-      </WorkbenchTableShell>
+        </WorkbenchTableShell>
+      </div>
+
+      {datasetPickerOpen && (
+        <MobileDatasetPicker activeTable={activeTable} onSelect={selectTable} onClose={() => setDatasetPickerOpen(false)} />
+      )}
+
+      {filtersOpen && (
+        <MobileDataFilters
+          platform={platform}
+          dateFrom={dateFrom}
+          dateTo={dateTo}
+          dateBasis={dateBasis}
+          onClose={() => setFiltersOpen(false)}
+          onApply={next => {
+            setPlatform(next.platform)
+            setDateFrom(next.dateFrom)
+            setDateTo(next.dateTo)
+            setDateBasis(next.dateBasis)
+            setFiltersOpen(false)
+          }}
+        />
+      )}
+
+      {selectedRecord && (
+        <MobileRecordDetail
+          row={selectedRecord}
+          table={activeTable}
+          columns={columns}
+          renderColumn={column => renderColumn(selectedRecord, column)}
+          onClose={() => setSelectedRecord(null)}
+          onOpenWorkbench={activeTable === 'comment_leads' ? () => navigate('workbench', { queue: 'leads' }) : undefined}
+        />
+      )}
     </div>
   )
+}
+
+/* Mobile renderers consume the same heterogeneous table rows as the desktop column registry. */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function recordKey(row: any, table: TableKey, page: number, index: number) {
+  return String(row?.id || row?.observation_id || `${table}-${page}-${index}`)
+}
+
+function dateRangeSummary(from: string, to: string) {
+  if (!from && !to) return '不限时间'
+  return `${from || '最早'} 至 ${to || '今天'}`
+}
+
+function MobileDatasetPicker({
+  activeTable,
+  onSelect,
+  onClose,
+}: {
+  activeTable: TableKey
+  onSelect: (table: TableKey) => void
+  onClose: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-[90] lg:hidden" role="dialog" aria-modal="true" aria-label="选择数据集">
+      <button type="button" aria-label="关闭数据集选择" onClick={onClose} className="absolute inset-0 bg-slate-950/45" />
+      <div className="absolute inset-x-0 bottom-0 max-h-[86dvh] overflow-y-auto rounded-t-[28px] border-t border-border bg-background px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 shadow-2xl">
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-muted-foreground/30" />
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div>
+            <p className="text-lg font-bold text-foreground">切换数据集</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">按采集任务进入对应记录，不需要横向找表格。</p>
+          </div>
+          <button type="button" aria-label="关闭" onClick={onClose} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-2">
+          {TABLES.map((table, index) => {
+            const active = table.key === activeTable
+            return (
+              <button
+                key={table.key}
+                type="button"
+                onClick={() => onSelect(table.key)}
+                className={`flex w-full items-center gap-3 rounded-2xl border px-3.5 py-3 text-left transition-colors ${active ? 'border-primary bg-primary/5' : 'border-border bg-card active:bg-muted'}`}
+              >
+                <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-sm font-bold tabular-nums ${active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}>
+                  {String(index + 1).padStart(2, '0')}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-bold text-foreground">{table.label}</span>
+                  <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">{table.description}</span>
+                </span>
+                {active ? <StatusBadge tone="normal">当前</StatusBadge> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function MobileDataFilters({
+  platform,
+  dateFrom,
+  dateTo,
+  dateBasis,
+  onClose,
+  onApply,
+}: {
+  platform: string
+  dateFrom: string
+  dateTo: string
+  dateBasis: DateBasis
+  onClose: () => void
+  onApply: (filters: { platform: string; dateFrom: string; dateTo: string; dateBasis: DateBasis }) => void
+}) {
+  const [draftPlatform, setDraftPlatform] = useState(platform)
+  const [draftFrom, setDraftFrom] = useState(dateFrom)
+  const [draftTo, setDraftTo] = useState(dateTo)
+  const [draftBasis, setDraftBasis] = useState<DateBasis>(dateBasis)
+  const basisOptions: Array<{ key: DateBasis; label: string }> = [
+    { key: 'publish', label: '发布时间' },
+    { key: 'recent', label: '最近采集' },
+    { key: 'first', label: '首次采集' },
+  ]
+
+  const applyDays = (days: number) => {
+    const end = new Date()
+    const start = new Date()
+    start.setDate(end.getDate() - (days - 1))
+    setDraftFrom(toYmd(start))
+    setDraftTo(toYmd(end))
+  }
+
+  const applyThisMonth = () => {
+    const end = new Date()
+    setDraftFrom(toYmd(new Date(end.getFullYear(), end.getMonth(), 1)))
+    setDraftTo(toYmd(end))
+  }
+
+  const reset = () => {
+    setDraftPlatform('')
+    setDraftFrom('')
+    setDraftTo('')
+    setDraftBasis('publish')
+  }
+
+  return (
+    <div className="fixed inset-0 z-[90] lg:hidden" role="dialog" aria-modal="true" aria-label="筛选数据">
+      <button type="button" aria-label="关闭筛选" onClick={onClose} className="absolute inset-0 bg-slate-950/45" />
+      <div className="absolute inset-x-0 bottom-0 max-h-[90dvh] overflow-y-auto rounded-t-[28px] border-t border-border bg-background px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 shadow-2xl">
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-muted-foreground/30" />
+        <div className="mb-5 flex items-center justify-between">
+          <div>
+            <p className="text-lg font-bold text-foreground">筛选记录</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">平台与时间可组合筛选</p>
+          </div>
+          <button type="button" onClick={reset} className="text-sm font-semibold text-primary">全部重置</button>
+        </div>
+
+        <div className="space-y-5">
+          <fieldset>
+            <legend className="mb-2 text-xs font-bold tracking-wide text-muted-foreground">采集平台</legend>
+            <div className="grid grid-cols-2 gap-2">
+              {PLATFORM_OPTIONS.map(option => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setDraftPlatform(option.value)}
+                  className={`h-11 rounded-xl border text-sm font-semibold ${draftPlatform === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-card text-foreground'}`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend className="mb-2 text-xs font-bold tracking-wide text-muted-foreground">时间口径</legend>
+            <div className="grid grid-cols-3 gap-1 rounded-xl bg-muted p-1">
+              {basisOptions.map(option => (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => setDraftBasis(option.key)}
+                  className={`h-9 rounded-lg text-xs font-semibold ${draftBasis === option.key ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground'}`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend className="mb-2 text-xs font-bold tracking-wide text-muted-foreground">快捷时间</legend>
+            <div className="grid grid-cols-3 gap-2">
+              <button type="button" onClick={() => applyDays(7)} className="h-10 rounded-xl border border-border bg-card text-sm font-semibold text-foreground">近 7 天</button>
+              <button type="button" onClick={() => applyDays(30)} className="h-10 rounded-xl border border-border bg-card text-sm font-semibold text-foreground">近 30 天</button>
+              <button type="button" onClick={applyThisMonth} className="h-10 rounded-xl border border-border bg-card text-sm font-semibold text-foreground">本月</button>
+            </div>
+          </fieldset>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="space-y-1.5">
+              <span className="text-xs font-semibold text-muted-foreground">开始日期</span>
+              <input
+                type="date"
+                value={draftFrom}
+                max={draftTo || undefined}
+                onChange={event => setDraftFrom(event.target.value)}
+                className="h-11 w-full rounded-xl border border-border bg-card px-3 text-sm text-foreground outline-none focus:border-primary"
+              />
+            </label>
+            <label className="space-y-1.5">
+              <span className="text-xs font-semibold text-muted-foreground">结束日期</span>
+              <input
+                type="date"
+                value={draftTo}
+                min={draftFrom || undefined}
+                onChange={event => setDraftTo(event.target.value)}
+                className="h-11 w-full rounded-xl border border-border bg-card px-3 text-sm text-foreground outline-none focus:border-primary"
+              />
+            </label>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => onApply({ platform: draftPlatform, dateFrom: draftFrom, dateTo: draftTo, dateBasis: draftBasis })}
+          className="mt-6 h-12 w-full rounded-xl bg-primary text-sm font-bold text-primary-foreground shadow-sm active:opacity-90"
+        >
+          查看筛选结果
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function MobileRecordCard({ row, table, onOpen }: { row: any; table: TableKey; onOpen: () => void }) {
+  const cover = table === 'blogger_profiles' ? avatarUrl(row) : primaryImage(row)
+  const title = mobileRecordTitle(row, table)
+  const subtitle = mobileRecordSubtitle(row, table)
+  const stats = mobileRecordStats(row, table)
+  const capturedAt = recordCaptureTime(row)
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="relative w-full overflow-hidden rounded-2xl border border-border bg-card p-4 text-left shadow-sm transition active:scale-[0.995] active:bg-muted/30"
+    >
+      <span className="absolute inset-y-3 left-0 w-1 rounded-r-full bg-primary/70" />
+      <span className="flex items-start gap-3">
+        {cover ? (
+          <img src={proxyImg(String(cover))} alt="" className="h-[74px] w-[62px] shrink-0 rounded-xl border border-border object-cover" loading="lazy" referrerPolicy="no-referrer" />
+        ) : (
+          <span className="flex h-[74px] w-[62px] shrink-0 items-center justify-center rounded-xl border border-border bg-muted text-muted-foreground">
+            {table === 'blogger_profiles' ? <Database className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
+          </span>
+        )}
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-2">
+            <StatusBadge tone="neutral">{platformName(row?.platform)}</StatusBadge>
+            <span className="truncate text-[11px] text-muted-foreground">{mobileRecordKind(table)}</span>
+          </span>
+          <span className="mt-2 block text-[15px] font-bold leading-5 text-foreground" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+            {title}
+          </span>
+          {subtitle && <span className="mt-1 block truncate text-xs text-muted-foreground">{subtitle}</span>}
+        </span>
+        <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-muted-foreground" />
+      </span>
+      <span className="mt-3 flex items-center justify-between gap-3 border-t border-border/70 pt-3">
+        <span className="flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+          {stats.map(stat => <span key={stat.label} className="whitespace-nowrap"><strong className="font-semibold tabular-nums text-foreground">{stat.value}</strong> {stat.label}</span>)}
+        </span>
+        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{mobileDate(capturedAt)}</span>
+      </span>
+    </button>
+  )
+}
+
+function MobilePagination({ pagination, onPage }: { pagination: any; onPage: (page: number) => void }) {
+  return (
+    <div className="flex items-center justify-between rounded-2xl border border-border bg-card px-3 py-3">
+      <button
+        type="button"
+        disabled={pagination.page <= 1}
+        onClick={() => onPage(pagination.page - 1)}
+        className="inline-flex h-10 items-center gap-1 rounded-xl border border-border px-3 text-sm font-semibold text-foreground disabled:opacity-35"
+      >
+        <ChevronLeft className="h-4 w-4" /> 上一页
+      </button>
+      <span className="text-center text-xs text-muted-foreground">
+        <strong className="block text-sm font-bold tabular-nums text-foreground">{pagination.page} / {pagination.totalPages}</strong>
+        共 {formatNumber(pagination.total)} 条
+      </span>
+      <button
+        type="button"
+        disabled={pagination.page >= pagination.totalPages}
+        onClick={() => onPage(pagination.page + 1)}
+        className="inline-flex h-10 items-center gap-1 rounded-xl border border-border px-3 text-sm font-semibold text-foreground disabled:opacity-35"
+      >
+        下一页 <ChevronRight className="h-4 w-4" />
+      </button>
+    </div>
+  )
+}
+
+function MobileRecordDetail({
+  row,
+  table,
+  columns,
+  renderColumn,
+  onClose,
+  onOpenWorkbench,
+}: {
+  row: any
+  table: TableKey
+  columns: Column[]
+  renderColumn: (column: Column) => React.ReactNode
+  onClose: () => void
+  onOpenWorkbench?: () => void
+}) {
+  const grouped = useMemo(() => groupMobileColumns(columns.filter(column => column.key !== 'attachments')), [columns])
+  const originalUrl = mobileOriginalUrl(row, table)
+  const hasAttachments = MEDIA_TABLES.has(table) && buildRecordMediaTasks(row).length > 0
+
+  return (
+    <div className="fixed inset-0 z-[100] flex min-h-0 flex-col bg-background lg:hidden" role="dialog" aria-modal="true" aria-label="记录详情">
+      <header className="shrink-0 border-b border-border bg-background/95 px-3 pb-3 pt-[max(.75rem,env(safe-area-inset-top))] backdrop-blur">
+        <div className="flex items-center gap-2">
+          <button type="button" aria-label="返回记录列表" onClick={onClose} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-foreground">
+            <ArrowLeft className="h-5 w-5" />
+          </button>
+          <div className="min-w-0 flex-1">
+            <p className="text-[11px] font-semibold text-muted-foreground">{mobileRecordKind(table)} · {platformName(row?.platform)}</p>
+            <h2 className="truncate text-base font-bold text-foreground">{mobileRecordTitle(row, table)}</h2>
+          </div>
+          <StatusBadge tone="neutral">{columns.length} 项</StatusBadge>
+        </div>
+      </header>
+
+      <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4">
+        <div className="mb-4 overflow-hidden rounded-2xl border border-border bg-card">
+          <div className="flex gap-3 p-4">
+            {primaryImage(row) && (
+              <img src={proxyImg(String(primaryImage(row)))} alt="" className="h-20 w-16 shrink-0 rounded-xl border border-border object-cover" referrerPolicy="no-referrer" />
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="text-[15px] font-bold leading-6 text-foreground">{mobileRecordTitle(row, table)}</p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{mobileRecordSubtitle(row, table) || '暂无补充说明'}</p>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {mobileRecordStats(row, table).map(stat => <StatusBadge key={stat.label} tone="muted">{stat.value} {stat.label}</StatusBadge>)}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          {grouped.map((group, groupIndex) => (
+            <details key={group.key} open={groupIndex === 0 || group.key === 'actions'} className="group overflow-hidden rounded-2xl border border-border bg-card">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3.5 [&::-webkit-details-marker]:hidden">
+                <span>
+                  <span className="block text-sm font-bold text-foreground">{group.label}</span>
+                  <span className="mt-0.5 block text-[11px] text-muted-foreground">{group.columns.length} 个字段</span>
+                </span>
+                <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+              </summary>
+              <div className="divide-y divide-border border-t border-border">
+                {group.columns.map(column => (
+                  <div key={column.key} className="px-4 py-3.5">
+                    <p className="mb-2 text-[11px] font-bold tracking-wide text-muted-foreground">{column.label}</p>
+                    <div className="min-w-0 text-sm [&_.truncate]:overflow-visible [&_.truncate]:whitespace-normal [&_img]:h-20 [&_img]:w-20">
+                      {renderColumn(column)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          ))}
+        </div>
+      </main>
+
+      <footer className="shrink-0 border-t border-border bg-background/95 px-3 pb-[max(.75rem,env(safe-area-inset-bottom))] pt-3 backdrop-blur">
+        <div className="flex items-stretch gap-2">
+          {hasAttachments && (
+            <div className="min-w-0 flex-1 [&_button]:h-11 [&_button]:w-full [&_button]:justify-center [&_button]:rounded-xl">
+              <AttachmentDownloadCell row={row} />
+            </div>
+          )}
+          {originalUrl && (
+            <a href={originalUrl} target="_blank" rel="noreferrer" className="inline-flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl bg-primary px-3 text-sm font-bold text-primary-foreground">
+              打开原文 <ExternalLink className="h-4 w-4" />
+            </a>
+          )}
+          {onOpenWorkbench && (
+            <button type="button" onClick={onOpenWorkbench} className="inline-flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl bg-primary px-3 text-sm font-bold text-primary-foreground">
+              去处理 <ArrowRight className="h-4 w-4" />
+            </button>
+          )}
+          {!hasAttachments && !originalUrl && !onOpenWorkbench && (
+            <button type="button" onClick={onClose} className="h-11 w-full rounded-xl bg-primary text-sm font-bold text-primary-foreground">返回记录列表</button>
+          )}
+        </div>
+      </footer>
+    </div>
+  )
+}
+
+function groupMobileColumns(columns: Column[]) {
+  const groups = [
+    { key: 'core', label: '核心信息', columns: [] as Column[] },
+    { key: 'metrics', label: '数据表现', columns: [] as Column[] },
+    { key: 'media', label: '图片与媒体', columns: [] as Column[] },
+    { key: 'ai', label: '逐字稿与 AI 分析', columns: [] as Column[] },
+    { key: 'actions', label: '链接与来源', columns: [] as Column[] },
+  ]
+  const metrics = new Set(['fans', 'liked', 'following', 'likes', 'collects', 'comments', 'shares', 'noteRating', 'collectRating'])
+  const media = new Set(['cover', 'coverLink', 'avatar', 'avatarLink', 'images', 'imageLinks', 'video', 'audio', 'duration'])
+  const ai = new Set(['transcript', 'script', 'scriptOut', 'commentText', 'commentAnalysis', 'commentAnalysisOut', 'rewrite', 'rewriteOut'])
+  const actions = new Set(['profile', 'url', 'recordUrl', 'userUrl', 'platform', 'captureTime', 'editedAt', 'time'])
+
+  columns.forEach(column => {
+    if (metrics.has(column.key)) groups[1].columns.push(column)
+    else if (media.has(column.key)) groups[2].columns.push(column)
+    else if (ai.has(column.key)) groups[3].columns.push(column)
+    else if (actions.has(column.key)) groups[4].columns.push(column)
+    else groups[0].columns.push(column)
+  })
+
+  return groups.filter(group => group.columns.length)
+}
+
+function mobileRecordTitle(row: any, table: TableKey) {
+  if (table === 'blogger_profiles') return String(firstValue(row.author_name, row.title, bloggerIdentifier(row), '未命名博主'))
+  if (table === 'comment_leads') return String(firstValue(row.comment_content, row.record_title, '未命名评论'))
+  return String(firstValue(row.title, row.record_title, row.content, row.author_name, '未命名记录'))
+}
+
+function mobileRecordSubtitle(row: any, table: TableKey) {
+  if (table === 'blogger_profiles') return String(firstValue(row.content, value(row, 'payload.description'), bloggerIdentifier(row)))
+  if (table === 'comment_leads') return String(firstValue(row.comment_author_name, row.record_title, row.matched_keywords))
+  return String(firstValue(row.author_name, row.keyword, value(row, 'payload.keyword'), row.content))
+}
+
+function mobileRecordKind(table: TableKey) {
+  return TABLES.find(item => item.key === table)?.label || '数据记录'
+}
+
+function mobileRecordStats(row: any, table: TableKey) {
+  if (table === 'blogger_profiles') {
+    return [
+      { label: '粉丝', value: formatNumber(firstValue(row.author_fans, value(row, 'payload.followersCount')) as any) },
+      { label: '获赞收藏', value: formatNumber(bloggerLiked(row) as any) },
+    ]
+  }
+  if (table === 'comment_leads') {
+    return [
+      { label: '赞', value: formatNumber(row.comment_like_count as any) },
+      { label: '命中词', value: String(asArray(row.matched_keywords).length || '-') },
+    ]
+  }
+  return [
+    { label: '赞', value: formatNumber(row.likes as any) },
+    { label: '藏', value: formatNumber(row.collects as any) },
+    { label: '评', value: formatNumber(row.comments_count as any) },
+  ]
+}
+
+function mobileOriginalUrl(row: any, table: TableKey) {
+  if (table === 'blogger_profiles') return String(firstValue(authorHomepage(row), row.url))
+  if (table === 'comment_leads') return String(firstValue(row.record_url, row.url))
+  return String(firstValue(row.url, row.record_url))
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function mobileDate(value: unknown) {
+  const formatted = formatTableDate(value)
+  return formatted ? formatted.replace(/^\d{4}\//, '').slice(0, 11) : '时间未知'
+}
+
+function toYmd(date: Date) {
+  const pad = (number: number) => String(number).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
 }
 
 function columnsForTable(table: TableKey, platform = ''): Column[] {
@@ -1224,7 +1833,7 @@ function TranscriptCell({ row }: { row: any }) {
 
   if (status === 'done' && text) {
     return (
-      <div className="max-w-[220px] whitespace-pre-wrap break-words text-xs leading-5" title={text}>
+      <div className="max-w-full whitespace-pre-wrap break-words text-xs leading-5 lg:max-w-[220px]" title={text}>
         {text.length > 200 ? text.slice(0, 200) + '…' : text}
       </div>
     )

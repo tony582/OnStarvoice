@@ -83,6 +83,10 @@ import {
   isDouyinOwnProfileUrl,
   pickDouyinAuthorName,
 } from './capture/douyin-author.js';
+import {
+  evaluateRelevancePrefilterRecords,
+  RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
+} from './capture/relevance-prefilter.js';
 // 福利中心(welfare-usage.js)未纳入本 fork —— 0.1.7 合并带来的 welfare 埋点已移除,见下方 no-op
 
 const COMMENT_CAPTURE_STATUS = {
@@ -97,6 +101,7 @@ const DETAIL_CAPTURE_STATUS = {
   NOT_STARTED: 'not_started',
   CAPTURING: 'capturing',
   DONE: 'done',
+  FILTERED: 'filtered',
   FAILED: 'failed',
 };
 
@@ -108,8 +113,48 @@ const CAPTURE_TASK_MESSAGE_TYPE = Object.freeze({
 });
 const activeCaptureTaskSessions = new Map();
 
+function buildCaptureTaskProgressActivityKey(progress = {}) {
+  return [
+    String(progress?.phase || ''),
+    String(progress?.progressScope || ''),
+    String(progress?.keyword || ''),
+    Number(progress?.roundCurrent ?? progress?.round) || 0,
+    Number(progress?.keywordCurrent) || 0,
+    Number(progress?.itemCurrent ?? progress?.current) || 0,
+    String(progress?.recordId || ''),
+    Number(progress?.attemptCurrent ?? progress?.attempt) || 0,
+  ].join('|');
+}
+
+function enrichCaptureTaskProgressTiming(session, progress = {}) {
+  const now = Date.now();
+  const updatedAt = new Date(now).toISOString();
+  const activityKey = buildCaptureTaskProgressActivityKey(progress);
+  if (
+    !session.progressActivityKey ||
+    session.progressActivityKey !== activityKey
+  ) {
+    session.progressActivityKey = activityKey;
+    session.phaseStartedAt = updatedAt;
+  }
+  const phaseStartedAt =
+    String(progress?.phaseStartedAt || session.phaseStartedAt || '').trim() ||
+    updatedAt;
+  session.phaseStartedAt = phaseStartedAt;
+  session.lastProgressAt = updatedAt;
+  return {
+    ...(progress && typeof progress === 'object' ? progress : {}),
+    phaseStartedAt,
+    updatedAt,
+  };
+}
+
 function normalizeCaptureTaskId(value) {
   return String(value || '').trim().slice(0, 120);
+}
+
+function normalizeCaptureTaskAttemptId(value) {
+  return String(value || '').trim().slice(0, 160);
 }
 
 function resolveActiveCaptureTaskSession(taskId = '') {
@@ -153,6 +198,47 @@ async function sendCaptureTaskLifecycleMessage(
   }
 }
 
+async function setCaptureTaskTakeoverStateInTab(
+  {
+    tabId = null,
+    taskId = '',
+    active = false,
+    label = 'AI 正在接管',
+    clearTrace = false,
+  } = {},
+  {chromeApi = globalThis.chrome} = {},
+) {
+  const normalizedTabId = Number(tabId);
+  if (
+    !Number.isSafeInteger(normalizedTabId) ||
+    normalizedTabId <= 0 ||
+    !chromeApi?.runtime ||
+    typeof chromeApi.runtime.sendMessage !== 'function'
+  ) {
+    return false;
+  }
+  try {
+    const response = await chromeApi.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: normalizedTabId,
+      payload: {
+        action: 'setCaptureTaskTakeover',
+        taskId: normalizeCaptureTaskId(taskId),
+        active: Boolean(active),
+        label: String(label || 'AI 正在接管').trim().slice(0, 80),
+        clearTrace: clearTrace === true,
+      },
+    });
+    return response?.ok !== false && response?.data?.ok !== false;
+  } catch (error) {
+    console.debug(
+      '[CaptureSync] capture task takeover update unavailable (ignored):',
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
 export async function beginCaptureTaskSession(
   {
     taskId = '',
@@ -160,10 +246,12 @@ export async function beginCaptureTaskSession(
     label = '',
     platform = '',
     ownerRequired = false,
+    attemptId = '',
   } = {},
   options = {},
 ) {
   const normalizedTaskId = normalizeCaptureTaskId(taskId);
+  const normalizedAttemptId = normalizeCaptureTaskAttemptId(attemptId);
   const normalizedTabId = Number(tabId);
   if (
     !normalizedTaskId ||
@@ -174,31 +262,83 @@ export async function beginCaptureTaskSession(
   }
 
   const existing = resolveActiveCaptureTaskSession(normalizedTaskId);
-  if (existing) {
+  if (
+    existing &&
+    existing.tabId === normalizedTabId &&
+    String(existing.attemptId || '') === normalizedAttemptId
+  ) {
+    await setCaptureTaskTakeoverStateInTab(
+      {
+        tabId: existing.tabId,
+        taskId: existing.taskId,
+        active: true,
+        label: existing.label || label,
+      },
+      options,
+    );
     return {ok: true, active: true, reused: true, taskId: normalizedTaskId};
   }
 
-  const result = await sendCaptureTaskLifecycleMessage(
-    CAPTURE_TASK_MESSAGE_TYPE.BEGIN,
-    {
-      taskId: normalizedTaskId,
-      tabId: normalizedTabId,
-      label: String(label || '').trim().slice(0, 120),
-      platform: String(platform || '').trim().toLowerCase().slice(0, 40),
-      ownerRequired: ownerRequired === true,
-    },
-    options,
-  );
+  const beginPayload = {
+    taskId: normalizedTaskId,
+    tabId: normalizedTabId,
+    label: String(label || '').trim().slice(0, 120),
+    platform: String(platform || '').trim().toLowerCase().slice(0, 40),
+    ownerRequired: ownerRequired === true,
+    ...(normalizedAttemptId ? {attemptId: normalizedAttemptId} : {}),
+  };
+  let result = null;
+  const retryDelays = existing ? [0, 120, 360, 720] : [0];
+  for (const delayMs of retryDelays) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    result = await sendCaptureTaskLifecycleMessage(
+      CAPTURE_TASK_MESSAGE_TYPE.BEGIN,
+      beginPayload,
+      options,
+    );
+    if (result.ok) break;
+    if (
+      !existing ||
+      !new Set([
+        'capture_task_source_mismatch',
+        'capture_task_not_found',
+        'capture_task_cleanup_pending',
+      ]).has(String(result.reason || ''))
+    ) {
+      break;
+    }
+  }
   if (!result.ok) {
     return {...result, active: false, taskId: normalizedTaskId};
   }
 
-  activeCaptureTaskSessions.set(normalizedTaskId, {
+  const session = existing || {
     taskId: normalizedTaskId,
-    tabId: normalizedTabId,
     state: 'active',
-  });
-  return {...result, active: true, taskId: normalizedTaskId};
+  };
+  session.tabId = normalizedTabId;
+  session.label = beginPayload.label;
+  session.platform = beginPayload.platform;
+  session.attemptId = normalizedAttemptId;
+  session.state = 'active';
+  activeCaptureTaskSessions.set(normalizedTaskId, session);
+  await setCaptureTaskTakeoverStateInTab(
+    {
+      tabId: normalizedTabId,
+      taskId: normalizedTaskId,
+      active: true,
+      label: 'AI 正在接管',
+    },
+    options,
+  );
+  return {
+    ...result,
+    active: true,
+    taskId: normalizedTaskId,
+    ...(existing ? {reused: true, rebound: true} : {}),
+  };
 }
 
 export async function updateCaptureTaskSession(
@@ -210,14 +350,13 @@ export async function updateCaptureTaskSession(
     return {ok: true, skipped: true, reason: 'no_active_task_session'};
   }
 
+  const timedProgress = enrichCaptureTaskProgressTiming(session, progress);
   return await sendCaptureTaskLifecycleMessage(
     CAPTURE_TASK_MESSAGE_TYPE.UPDATE,
     {
       taskId: session.taskId,
-      progress:
-        progress && typeof progress === 'object' && !Array.isArray(progress)
-          ? progress
-          : {},
+      progress: timedProgress,
+      ...(session.attemptId ? {attemptId: session.attemptId} : {}),
     },
     options,
   );
@@ -245,6 +384,7 @@ export async function registerCaptureTaskTab(
       taskId: session.taskId,
       tabId: normalizedTabId,
       role: String(role || 'worker').trim().toLowerCase().slice(0, 40),
+      ...(session.attemptId ? {attemptId: session.attemptId} : {}),
     },
     options,
   );
@@ -264,6 +404,7 @@ export async function endCaptureTaskSession(
     taskId: session.taskId,
     reason: String(reason || 'completed').trim().slice(0, 120),
     status: String(status || 'completed').trim().slice(0, 80),
+    ...(session.attemptId ? {attemptId: session.attemptId} : {}),
   };
   let result = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -281,7 +422,24 @@ export async function endCaptureTaskSession(
   const terminallyAbsent =
     result?.reason === 'capture_task_not_found' ||
     result?.response?.error?.code === 'capture_task_not_found';
+  const staleAttemptIgnored = result?.data?.ignored === true;
   if (result?.ok === true || terminallyAbsent) {
+    if (staleAttemptIgnored) {
+      if (activeCaptureTaskSessions.get(session.taskId) === session) {
+        activeCaptureTaskSessions.delete(session.taskId);
+      }
+      return result;
+    }
+    await setCaptureTaskTakeoverStateInTab(
+      {
+        tabId: session.tabId,
+        taskId: session.taskId,
+        active: false,
+        label: 'AI 正在接管',
+        clearTrace: true,
+      },
+      options,
+    );
     if (activeCaptureTaskSessions.get(session.taskId) === session) {
       activeCaptureTaskSessions.delete(session.taskId);
     }
@@ -308,6 +466,7 @@ const DETAIL_CAPTURE_FAILURE_CODE = {
   LINK_MISSING: 'LINK_MISSING',
   PAGE_OPEN_TIMEOUT: 'PAGE_OPEN_TIMEOUT',
   PAGE_OPEN_FAILED: 'PAGE_OPEN_FAILED',
+  CONTENT_UNAVAILABLE: 'CONTENT_UNAVAILABLE',
   NOTE_CAPTURE_FAILED: 'NOTE_CAPTURE_FAILED',
   COMMENTS_CAPTURE_FAILED: 'COMMENTS_CAPTURE_FAILED',
   BLOGGER_METRICS_FAILED: 'BLOGGER_METRICS_FAILED',
@@ -337,6 +496,12 @@ const COMMENT_CONTENT_MAX_LENGTH = 280;
 const DETAIL_CAPTURE_NAV_TIMEOUT_MS = 90000;
 const DETAIL_CAPTURE_NAV_POLL_MS = 280;
 const DETAIL_CAPTURE_AFTER_NAV_WAIT_MS = 2000;
+const DOUYIN_UNAVAILABLE_GRACE_MS = 4500;
+const DOUYIN_DETAIL_ROUTE_SETTLE_MS = 1200;
+const DOUYIN_SEARCH_MODAL_BIND_GRACE_MS = 2500;
+const DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS = 15000;
+const DOUYIN_COMMENT_READY_PROBE_TIMEOUT_MS = 1800;
+const DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS = 8000;
 // 补采详情「条与条之间」的随机间隔。注:小红书 300013 的真因是 xsec_source 为空(见
 // ensureXhsNoteUrlSource),不是请求频率;这里保留小幅随机间隔做基本礼貌,不必拉长。
 const DETAIL_ITEM_DELAY_MIN_MS = 2000;
@@ -869,6 +1034,86 @@ async function sendCaptureTraceBindingsToTab(tabId, bindings = []) {
   }
 }
 
+async function restoreCaptureTraceOverlayForRecords(tabId, recordIds = []) {
+  const normalizedTabId = Number(tabId);
+  if (
+    !Number.isFinite(normalizedTabId) ||
+    normalizedTabId <= 0 ||
+    !Array.isArray(recordIds) ||
+    recordIds.length === 0
+  ) {
+    return false;
+  }
+
+  const groups = new Map();
+  for (const recordId of recordIds) {
+    const record = await getRecord(recordId);
+    const trace = normalizeCompleteCaptureTrace(
+      resolveCaptureTraceFromRecord(record),
+    );
+    if (!record || !trace) continue;
+    const payload =
+      record.payload && typeof record.payload === 'object'
+        ? record.payload
+        : {};
+    const firstItem =
+      Array.isArray(payload.items) &&
+      payload.items[0] &&
+      typeof payload.items[0] === 'object'
+        ? payload.items[0]
+        : {};
+    const item = {
+      noteId: firstItem.noteId || payload.noteId || '',
+      url: firstItem.url || payload.url || '',
+      noteUrl: firstItem.noteUrl || payload.noteUrl || '',
+      detailPageUrl:
+        firstItem.detailPageUrl || payload.detailPageUrl || '',
+      title: firstItem.title || record.title || '',
+      author: firstItem.author || '',
+      coverImageUrl: firstItem.coverImageUrl || '',
+      domCaptureKey: firstItem.domCaptureKey || '',
+      domLocator: firstItem.domLocator || null,
+      domMatchHints: firstItem.domMatchHints || null,
+      captureTrace: trace,
+    };
+    const group = groups.get(trace.runId) || [];
+    group.push(item);
+    groups.set(trace.runId, group);
+  }
+
+  const selected = [...groups.entries()].sort(
+    (left, right) => right[1].length - left[1].length,
+  )[0];
+  if (!selected) return false;
+  const [runId, items] = selected;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: normalizedTabId,
+      payload: appendTaskContext(
+        {
+          action: 'restoreListCaptureTraceOverlay',
+          runId,
+          platform: detectPlatformFromUrl(
+            String((await chrome.tabs.get(normalizedTabId))?.url || ''),
+          ),
+          label: '采集结果',
+          items,
+        },
+        getActiveTaskContext(),
+      ),
+    });
+    return response?.ok !== false;
+  } catch (error) {
+    console.debug(
+      '[CaptureSync] restore capture trace overlay failed (ignored):',
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
 async function requestCaptureCancelInTabFailSoft(tabId, reason = '') {
   const normalizedTabId = Number(tabId);
   if (!Number.isSafeInteger(normalizedTabId) || normalizedTabId <= 0) {
@@ -1322,12 +1567,23 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     const savedRecords = []; // 全新记录:入本地池(unshift)+ 同步
     const refreshedRecords = []; // 已存但刷新了互动数:就地改 + 同步,但不 unshift(避免本地重复)
     const skippedRecordIds = [];
+    const traceBindings = [];
     let skippedCount = 0;
 
     for (const record of normalizedRecords) {
       const recordType = record?.type || record?.recordType;
       if (!isListCaptureRecordType(recordType)) {
-        savedRecords.push(record);
+        const boundTrace = bindCaptureTrace(
+          resolveCaptureTraceFromRecord(record),
+          record?.id,
+          'saved',
+        );
+        const recordToSave = boundTrace
+          ? applyCaptureTraceToRecord(record, boundTrace)
+          : record;
+        savedRecords.push(recordToSave);
+        const binding = buildCaptureTraceBinding(boundTrace);
+        if (binding) traceBindings.push(binding);
         continue;
       }
 
@@ -1344,13 +1600,19 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
         skippedCount += 1;
         const existingId = String(existingRecord.id || '').trim();
         keys.forEach((key) => session?.knownKeys?.add(key));
+        const traceMerge = mergeCaptureTraceIntoExistingRecord(
+          existingRecord,
+          record,
+        );
+        if (traceMerge.binding) traceBindings.push(traceMerge.binding);
         // 不再整条丢弃:把这次采到的互动数就地刷新进已存记录并纳入同步;
         // 没刷新到(0/空/没变)才按「已采过」计入 skipped。
         const keywordLabelsChanged =
           mergeKeywordMatchLabelsInPlace(existingRecord, record);
         if (
           refreshListCaptureMetricsInPlace(existingRecord, record) ||
-          keywordLabelsChanged
+          keywordLabelsChanged ||
+          traceMerge.changed
         ) {
           refreshedRecords.push(existingRecord);
         } else if (existingId) {
@@ -1359,10 +1621,20 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
         continue;
       }
 
-      savedRecords.push(record);
+      const boundTrace = bindCaptureTrace(
+        resolveCaptureTraceFromRecord(record),
+        record?.id,
+        'saved',
+      );
+      const recordToSave = boundTrace
+        ? applyCaptureTraceToRecord(record, boundTrace)
+        : record;
+      savedRecords.push(recordToSave);
+      const binding = buildCaptureTraceBinding(boundTrace);
+      if (binding) traceBindings.push(binding);
       keys.forEach((key) => {
         session?.knownKeys?.add(key);
-        keyToRecord.set(key, record);
+        keyToRecord.set(key, recordToSave);
       });
     }
 
@@ -1385,13 +1657,17 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
       session.savedRecords.push(...syncRecords);
       pushUnique(session.savedRecordIds, savedRecordIds);
       pushUnique(session.skippedRecordIds, skippedRecordIds);
+      upsertCaptureTraceBindings(session.traceBindings, traceBindings);
     }
 
+    const normalizedTraceBindings = sortCaptureTraceBindings(traceBindings);
     return {
       savedRecords: syncRecords,
       skippedCount,
       skippedRecordIds: [...new Set(skippedRecordIds)],
       recordIds: [...new Set([...savedRecordIds, ...skippedRecordIds])],
+      syncRecordIds: [...new Set(savedRecordIds)],
+      traceBindings: normalizedTraceBindings,
     };
   });
 }
@@ -1434,20 +1710,29 @@ async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
     await session.queue.catch(() => null);
   }
   const finalSave = await saveRecordsWithCacheDedupe(recordsToSave, {session});
+  const finalTraceBindings = Array.isArray(finalSave?.traceBindings)
+    ? finalSave.traceBindings
+    : [];
+  const finalRecordIds = Array.isArray(finalSave?.recordIds)
+    ? finalSave.recordIds
+    : [];
+  const finalSavedRecords = Array.isArray(finalSave?.savedRecords)
+    ? finalSave.savedRecords
+    : [];
   const traceBindings = sortCaptureTraceBindings([
     ...(session?.traceBindings || []),
-    ...finalSave.traceBindings,
+    ...finalTraceBindings,
   ]);
   const recordIds = orderRecordIdsByCaptureTrace(
     [
       ...collectListCaptureSessionRecordIds(session),
-      ...finalSave.recordIds,
+      ...finalRecordIds,
     ],
     traceBindings,
   );
   const savedRecords = uniqueRecordsById([
     ...(session?.savedRecords || []),
-    ...finalSave.savedRecords,
+    ...finalSavedRecords,
   ]);
   const syncRecordIds = orderRecordIdsByCaptureTrace(
     savedRecords.map((record) => record?.id),
@@ -1460,8 +1745,8 @@ async function saveCaptureResultRecords(captureResult, {session = null} = {}) {
     syncRecordIds,
     traceBindings,
     cacheStats: createListCaptureCacheStats(session, {
-      finalSkippedCount: finalSave.skippedCount,
-      finalSavedCount: finalSave.savedRecords.length,
+      finalSkippedCount: Number(finalSave?.skippedCount || 0),
+      finalSavedCount: finalSavedRecords.length,
     }),
   };
 }
@@ -2639,6 +2924,47 @@ function extractDouyinDetailGuardItemId(source) {
   return '';
 }
 
+function resolveExpectedDouyinCommentNoteId(record, fallbackUrl = '') {
+  const platform = String(
+    record?.platform || detectPlatformFromUrl(String(fallbackUrl || '')),
+  )
+    .trim()
+    .toLowerCase();
+  if (platform !== 'douyin') {
+    return '';
+  }
+  return (
+    extractDouyinDetailGuardItemId(resolveRecordDetailNoteId(record)) ||
+    extractDouyinDetailGuardItemId(fallbackUrl)
+  );
+}
+
+function resolveCapturedDouyinCommentNoteId(result) {
+  return (
+    extractDouyinDetailGuardItemId(result?.noteId) ||
+    extractDouyinDetailGuardItemId(result?.data?.noteId) ||
+    extractDouyinDetailGuardItemId(result?.data?.noteUrl) ||
+    extractDouyinDetailGuardItemId(result?.data?.url)
+  );
+}
+
+function buildDouyinCommentIdentityFailure(expectedNoteId, actualNoteId) {
+  const expected = extractDouyinDetailGuardItemId(expectedNoteId);
+  if (!expected) {
+    return null;
+  }
+  const actual = extractDouyinDetailGuardItemId(actualNoteId);
+  if (actual === expected) {
+    return null;
+  }
+  return {
+    code: 'DOUYIN_COMMENT_ID_MISMATCH',
+    message: `抖音评论作品不匹配：目标 ${expected}，实际 ${actual || '无法识别'}`,
+    expectedNoteId: expected,
+    actualNoteId: actual,
+  };
+}
+
 /**
  * 批量补采博主/关键词记录的笔记详情，回填到原记录 payload
  */
@@ -2658,9 +2984,10 @@ export async function batchCaptureDetailsForRecords(
     detailAfterNavWaitMs = null,
     profileAfterNavWaitMs = null,
     skipAlreadyCaptured = null,
-    recaptureCommentsOnCountIncrease = null,
     waitForegroundTabId = null,
     captureTaskId = '',
+    relevanceKeyword = '',
+    enableAiRelevancePrefilter = null,
   } = {},
 ) {
   const uniqueRecordIds = Array.isArray(recordIds)
@@ -2702,7 +3029,14 @@ export async function batchCaptureDetailsForRecords(
     };
   }
 
+  await restoreCaptureTraceOverlayForRecords(
+    activeTab.id,
+    uniqueRecordIds,
+  );
+
   const settings = await getCaptureSettings();
+  const resolvedEnableAiRelevancePrefilter =
+    enableAiRelevancePrefilter ?? settings.enableAiRelevancePrefilter ?? false;
   const commentLeadsConfig = buildCommentLeadsConfigFromSettings({
     ...settings,
     enableCommentLeadsFilter:
@@ -2731,15 +3065,7 @@ export async function batchCaptureDetailsForRecords(
   // 不再进详情/主页 → 大幅减少重复导航(防风控 + 提速)。查询失败则不跳过(顶多多采几条,不影响主流程)。
   const resolvedSkipCaptured =
     skipAlreadyCaptured ?? settings.skipAlreadyCapturedOnDetailCapture ?? true;
-  const resolvedRecaptureCommentsOnIncrease =
-    Boolean(includeComments) &&
-    Boolean(
-      recaptureCommentsOnCountIncrease ??
-        settings.recaptureCommentsOnCountIncrease ??
-        true,
-    );
   let skipRecordIdSet = new Set();
-  let recaptureCommentRecordIdSet = new Set();
   if (resolvedSkipCaptured) {
     try {
       const idPairs = [];
@@ -2754,7 +3080,6 @@ export async function batchCaptureDetailsForRecords(
             recordId: rid,
             externalId: String(ext),
             payload: rec.payload,
-            commentsCount: resolveRecordListCommentsCount(rec),
           });
         }
       }
@@ -2763,7 +3088,6 @@ export async function batchCaptureDetailsForRecords(
       // ① 本地已采全(detailCaptureStatus=done)的 external_id —— 覆盖「循环内 / 同会话」重复,
       //    不依赖同步到后台(无人值守循环不会每轮自动同步,所以第2轮跳第1轮要靠这个)。
       const localDone = new Set();
-      const localDoneStatusByExt = new Map();
       try {
         const pool = await getDataPool();
         for (const rec of pool?.records || []) {
@@ -2772,10 +3096,6 @@ export async function batchCaptureDetailsForRecords(
           if (ext && candidateExtIds.has(String(ext))) {
             const normalizedExt = String(ext);
             localDone.add(normalizedExt);
-            localDoneStatusByExt.set(
-              normalizedExt,
-              buildCapturedCommentStatus(rec),
-            );
           }
         }
       } catch (poolError) {
@@ -2783,51 +3103,21 @@ export async function batchCaptureDetailsForRecords(
       }
 
       // ② 后台已采全的 —— 覆盖「跨夜 / 跨会话」(需之前同步过)
-      const {captured, items: remoteCapturedItems = []} =
-        await checkCapturedExternalIds({
+      const {captured} = await checkCapturedExternalIds({
         platform: probePlatform,
         externalIds: idPairs.map((p) => p.externalId),
       });
       const capturedSet = new Set(captured);
-      const remoteDoneStatusByExt = new Map(
-        remoteCapturedItems
-          .map((item) => [
-            String(item?.externalId || '').trim(),
-            {
-              commentsCount: normalizeOptionalCount(item?.commentsCount),
-              commentsBaselineCount: normalizeOptionalCount(
-                item?.commentsBaselineCount,
-              ),
-              capturedAt: normalizeOptionalTimestamp(item?.capturedAt),
-              hasBaseline:
-                normalizeOptionalCount(item?.commentsBaselineCount) !== null,
-            },
-          ])
-          .filter(([externalId]) => externalId),
-      );
 
       const nextSkipRecordIds = [];
-      const nextRecaptureCommentRecordIds = [];
       idPairs.forEach((p) => {
         const isCaptured =
           capturedSet.has(p.externalId) || localDone.has(p.externalId);
         if (!isCaptured) return;
-        const shouldRecaptureComments =
-          resolvedRecaptureCommentsOnIncrease &&
-          hasCommentCountIncreasedSinceLastCapture({
-            currentCommentsCount: p.commentsCount,
-            localStatus: localDoneStatusByExt.get(p.externalId),
-            remoteStatus: remoteDoneStatusByExt.get(p.externalId),
-          });
-        if (shouldRecaptureComments) {
-          nextRecaptureCommentRecordIds.push(p.recordId);
-          return;
-        }
         nextSkipRecordIds.push(p.recordId);
       });
 
       skipRecordIdSet = new Set(nextSkipRecordIds);
-      recaptureCommentRecordIdSet = new Set(nextRecaptureCommentRecordIds);
 
       // 给跳过的记录打「已采过」标记,卡片据此显示"已采过"而非"未执行采集增强"
       for (const p of idPairs) {
@@ -2848,12 +3138,161 @@ export async function batchCaptureDetailsForRecords(
     } catch (error) {
       console.warn('[CaptureSync] 增量采集预检失败(忽略,照常补采):', error);
       skipRecordIdSet = new Set();
-      recaptureCommentRecordIdSet = new Set();
     }
   }
-  // 全部已采过 → 不必开补采标签页,直接返回
-  if (skipRecordIdSet.size > 0 && skipRecordIdSet.size === uniqueRecordIds.length) {
+
+  // 可选 AI 前置筛选只作用于 keyword_notes。它在任何详情工作页打开前，
+  // 批量提交标题/作者/类型/时间等列表文字给后台；DeepSeek、提示词和密钥
+  // 均留在后台。接口失败、超时、输出不完整或灰区一律安全放行。
+  let relevancePrefilterResult = {
+    enabled: Boolean(resolvedEnableAiRelevancePrefilter),
+    evaluatedCount: 0,
+    skippedCount: 0,
+    failedOpenCount: 0,
+    skippedRecordIds: [],
+    decisions: [],
+    canceled: false,
+  };
+  let relevancePrefilterSkipRecordIdSet = new Set();
+  const recordsForRelevancePrefilter = [];
+  if (resolvedEnableAiRelevancePrefilter) {
+    for (const recordId of uniqueRecordIds) {
+      if (skipRecordIdSet.has(recordId)) continue;
+      const record = await getRecord(recordId);
+      if (record) recordsForRelevancePrefilter.push(record);
+    }
+    if (recordsForRelevancePrefilter.length > 0) {
+      await reportProgressFailSoft(onProgress, {
+        phase: 'detail_ai_prefilter_start',
+        message: `AI 正在预判 ${recordsForRelevancePrefilter.length} 条搜索结果的相关性...`,
+        current: 0,
+        total: uniqueRecordIds.length,
+        candidateCount: recordsForRelevancePrefilter.length,
+      }, 'detail ai prefilter start');
+      relevancePrefilterResult = await evaluateRelevancePrefilterRecords(
+        recordsForRelevancePrefilter,
+        {
+          enabled: true,
+          keyword: relevanceKeyword,
+          threshold:
+            settings.aiRelevancePrefilterThreshold ??
+            RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
+          shouldStop,
+        },
+      );
+      relevancePrefilterSkipRecordIdSet = new Set(
+        relevancePrefilterResult.skippedRecordIds,
+      );
+
+      const evaluatedAt = Date.now();
+      for (const decision of relevancePrefilterResult.decisions) {
+        const latestRecord = await getRecord(decision.recordId);
+        if (!latestRecord) continue;
+        try {
+          const latestPayload =
+            latestRecord.payload && typeof latestRecord.payload === 'object'
+              ? latestRecord.payload
+              : {};
+          const hasCompletedDetail =
+            String(latestPayload.detailCaptureStatus || '')
+              .trim()
+              .toLowerCase() === DETAIL_CAPTURE_STATUS.DONE &&
+            latestPayload.detailPayload &&
+            typeof latestPayload.detailPayload === 'object';
+          const nextPayload =
+            decision.shouldSkip && !hasCompletedDetail
+              ? applyDetailCapturePatch(
+                  latestPayload,
+                  createDetailCapturePatch({
+                    status: DETAIL_CAPTURE_STATUS.FILTERED,
+                    finishedAt: evaluatedAt,
+                    error: '',
+                    failureCode: '',
+                    failureStage: '',
+                    failureCategory: '',
+                    diagnosticMessage: '',
+                  }),
+                )
+              : {...latestPayload};
+          await updateRecord(decision.recordId, {
+            payload: {
+              ...nextPayload,
+              aiRelevancePrefilter: {
+                status: decision.status,
+                modelDecision: decision.modelDecision,
+                confidence: decision.confidence,
+                reason: decision.reason,
+                keyword: decision.keyword,
+                stage: 'list',
+                promptVersion: 'prefilter-list-v1',
+                executionDisposition: decision.shouldSkip
+                  ? 'skip_expensive'
+                  : 'collect_full',
+                modelExecutionDisposition:
+                  decision.executionDisposition || null,
+                evaluatedAt,
+              },
+            },
+          });
+        } catch (error) {
+          console.warn(
+            '[CaptureSync] AI relevance audit update failed (ignored):',
+            error?.message || error,
+          );
+        }
+      }
+      await reportProgressFailSoft(onProgress, {
+        phase: 'detail_ai_prefilter_done',
+        message:
+          relevancePrefilterResult.skippedCount > 0
+            ? `AI 预判完成：高置信度跳过 ${relevancePrefilterResult.skippedCount} 条，其余继续采集`
+            : 'AI 预判完成：没有高置信度无关项，继续原采集流程',
+        current: 0,
+        total: uniqueRecordIds.length,
+        candidateCount: recordsForRelevancePrefilter.length,
+        evaluatedCount: relevancePrefilterResult.evaluatedCount,
+        aiFilteredCount: relevancePrefilterResult.skippedCount,
+        failedOpenCount: relevancePrefilterResult.failedOpenCount,
+      }, 'detail ai prefilter done');
+    }
+  }
+
+  if (relevancePrefilterResult.canceled) {
+    return {
+      ok: false,
+      canceled: true,
+      securityBlocked: false,
+      total: uniqueRecordIds.length,
+      processedCount: 0,
+      successCount: 0,
+      failedCount: 0,
+      filteredCount: 0,
+      skippedCount: 0,
+      results: [],
+      diagnostics: {stageTrace: []},
+      error: null,
+    };
+  }
+
+  const preDetailSkipRecordIdSet = new Set([
+    ...skipRecordIdSet,
+    ...relevancePrefilterSkipRecordIdSet,
+  ]);
+  const relevanceDecisionByRecordId = new Map(
+    relevancePrefilterResult.decisions.map((decision) => [
+      decision.recordId,
+      decision,
+    ]),
+  );
+
+  // 全部已采过或被 AI 高置信度过滤 → 不必开补采标签页。
+  if (
+    preDetailSkipRecordIdSet.size > 0 &&
+    preDetailSkipRecordIdSet.size === uniqueRecordIds.length
+  ) {
     const skippedResults = [];
+    let aiFilteredCount = 0;
+    let alreadyCapturedCount = 0;
     for (let index = 0; index < uniqueRecordIds.length; index += 1) {
       const recordId = uniqueRecordIds[index];
       const record = await getRecord(recordId);
@@ -2862,29 +3301,95 @@ export async function batchCaptureDetailsForRecords(
         captureTraceFields,
         index + 1,
       );
-      await persistAndPublishCaptureTraceState({
-        recordId,
-        state: 'skipped',
-        record,
-        tabId: activeTab?.id,
-      });
-      skippedResults.push({
-        recordId,
-        ok: true,
-        reason: 'already_captured',
-        message: `${markerLabel} 已采过，跳过`,
-        ...captureTraceFields,
-      });
+      const progressLabel = formatCaptureTraceProgressLabel(
+        captureTraceFields,
+        index + 1,
+        uniqueRecordIds.length,
+      );
+      if (relevancePrefilterSkipRecordIdSet.has(recordId)) {
+        const decision = relevanceDecisionByRecordId.get(recordId) || {};
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'filtered',
+          record,
+          tabId: activeTab?.id,
+        });
+        aiFilteredCount += 1;
+        skippedResults.push({
+          recordId,
+          ok: true,
+          filtered: true,
+          reason: 'ai_relevance_filtered',
+          message: `${markerLabel} AI 高置信度判定无关，已跳过采集增强`,
+          aiRelevanceConfidence: decision.confidence ?? null,
+          aiRelevanceReason: decision.reason || '',
+          ...captureTraceFields,
+        });
+        if (onProgress) {
+          await reportProgressFailSoft(onProgress, {
+            phase: 'detail_item_filtered',
+            message: `${progressLabel}：AI 高置信度判定与关键词「${decision.keyword || relevanceKeyword || ''}」无关，已跳过详情、评论和博主采集`,
+            recordId,
+            current: index + 1,
+            total: uniqueRecordIds.length,
+            successCount: 0,
+            failedCount: 0,
+            filteredCount: aiFilteredCount,
+            skippedCount: alreadyCapturedCount,
+            aiFilteredCount,
+            aiRelevanceConfidence: decision.confidence ?? null,
+            aiRelevanceReason: decision.reason || '',
+            runnerTabId: activeTab?.id || null,
+            ...captureTraceFields,
+          }, 'detail ai relevance filtered without runner');
+        }
+      } else {
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'skipped',
+          record,
+          tabId: activeTab?.id,
+        });
+        alreadyCapturedCount += 1;
+        skippedResults.push({
+          recordId,
+          ok: true,
+          reason: 'already_captured',
+          message: `${markerLabel} 已采过，跳过`,
+          ...captureTraceFields,
+        });
+        if (onProgress) {
+          await reportProgressFailSoft(onProgress, {
+            phase: 'detail_item_skipped',
+            message: `${progressLabel}：之前已采过，跳过（增量采集）`,
+            recordId,
+            current: index + 1,
+            total: uniqueRecordIds.length,
+            successCount: 0,
+            failedCount: 0,
+            filteredCount: aiFilteredCount,
+            skippedCount: alreadyCapturedCount,
+            aiFilteredCount,
+            runnerTabId: activeTab?.id || null,
+            ...captureTraceFields,
+          }, 'detail item skipped without runner');
+        }
+      }
     }
     if (onProgress) {
       await reportProgressFailSoft(onProgress, {
         phase: 'detail_batch_done',
-        message: `全部 ${uniqueRecordIds.length} 条均已采过,跳过补采`,
+        message:
+          aiFilteredCount > 0
+            ? `无需打开详情：AI 已过滤 ${aiFilteredCount} 条无关结果${alreadyCapturedCount > 0 ? `，另有 ${alreadyCapturedCount} 条之前已采过` : ''}`
+            : `全部 ${uniqueRecordIds.length} 条均已采过,跳过补采`,
         current: uniqueRecordIds.length,
         total: uniqueRecordIds.length,
         successCount: 0,
         failedCount: 0,
-        filteredCount: uniqueRecordIds.length,
+        filteredCount: aiFilteredCount,
+        skippedCount: alreadyCapturedCount,
+        aiFilteredCount,
       }, 'detail batch done');
     }
     return {
@@ -2895,7 +3400,9 @@ export async function batchCaptureDetailsForRecords(
       processedCount: uniqueRecordIds.length,
       successCount: 0,
       failedCount: 0,
-      filteredCount: uniqueRecordIds.length,
+      filteredCount: aiFilteredCount,
+      skippedCount: alreadyCapturedCount,
+      aiFilteredCount,
       results: skippedResults,
       diagnostics: { stageTrace: [] },
       error: null,
@@ -2981,10 +3488,49 @@ export async function batchCaptureDetailsForRecords(
 
   const remainingDetailCount = Math.max(
     0,
-    uniqueRecordIds.length - skipRecordIdSet.size,
+    uniqueRecordIds.length - preDetailSkipRecordIdSet.size,
   );
+  const detailBatchPlatforms = new Set([
+    detectPlatformFromUrl(String(activeTab?.url || '')),
+  ]);
+  const douyinDetailPathByRecordId = new Map();
+  for (const recordId of uniqueRecordIds) {
+    try {
+      const record = await getRecord(recordId);
+      const recordUrl = resolveRecordNoteUrl(record);
+      const recordPlatform = String(
+        record?.platform || detectPlatformFromUrl(recordUrl),
+      )
+        .trim()
+        .toLowerCase();
+      if (recordPlatform) detailBatchPlatforms.add(recordPlatform);
+      if (recordPlatform === 'douyin') {
+        douyinDetailPathByRecordId.set(
+          String(recordId),
+          resolveRecordDetailNotePath(record),
+        );
+      }
+    } catch (error) {
+      console.warn(
+        '[CaptureSync] detail batch platform lookup failed (ignored):',
+        recordId,
+        error?.message || error,
+      );
+    }
+  }
+  const detailBatchContainsDouyin = detailBatchPlatforms.has('douyin');
+  const allowDetailDoubleBuffer = !detailBatchContainsDouyin;
   if (
     normalizedCaptureTaskId &&
+    remainingDetailCount >= DETAIL_PREFETCH_WORKER_COUNT &&
+    !allowDetailDoubleBuffer
+  ) {
+    doubleBufferFallbackReason =
+      '抖音使用单工作页，避免自动连播导致作品错配';
+  }
+  if (
+    normalizedCaptureTaskId &&
+    allowDetailDoubleBuffer &&
     remainingDetailCount >= DETAIL_PREFETCH_WORKER_COUNT
   ) {
     let standbyContext = null;
@@ -3054,13 +3600,55 @@ export async function batchCaptureDetailsForRecords(
     stopTimeoutMs: DETAIL_PREFETCH_STOP_TIMEOUT_MS,
     shouldStop,
     isFatalError: isDetailSecurityBlockError,
-    navigate: async ({tabId, url, shouldStop: pipelineShouldStop}) => {
-      await openUrlInTab(tabId, url, {
-        timeoutMs: normalizedDetailNavTimeoutMs,
-        shouldStop: pipelineShouldStop,
-        active: false,
-      });
-      await probeDetailPreloadSafety(tabId);
+    navigate: async ({
+      tabId,
+      recordId,
+      url,
+      shouldStop: pipelineShouldStop,
+    }) => {
+      const isDouyinDetailNavigation =
+        detectPlatformFromUrl(url) === 'douyin';
+      const navigationCandidates = isDouyinDetailNavigation
+        ? buildDouyinDetailNavigationCandidates(
+            url,
+            activeTab?.url,
+            douyinDetailPathByRecordId.get(String(recordId)) || 'video',
+          )
+        : [url];
+      let lastRecoverableError = null;
+
+      for (const candidateUrl of navigationCandidates) {
+        try {
+          await openUrlInTab(tabId, candidateUrl, {
+            timeoutMs: isDouyinDetailNavigation
+              ? Math.min(
+                  normalizedDetailNavTimeoutMs,
+                  DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS,
+                )
+              : normalizedDetailNavTimeoutMs,
+            shouldStop: pipelineShouldStop,
+            active: isDouyinDetailNavigation,
+          });
+          await probeDetailPreloadSafety(tabId, {
+            targetUrl: candidateUrl,
+            waitForDouyinReady: isDouyinDetailNavigation,
+            shouldStop: pipelineShouldStop,
+          });
+          return;
+        } catch (error) {
+          const recoverable =
+            isDouyinDetailNavigation &&
+            (error?.code === 'DETAIL_NAVIGATION_TIMEOUT' ||
+              error?.code === 'DOUYIN_DETAIL_NOT_READY' ||
+              error?.code === 'DOUYIN_CONTENT_UNAVAILABLE');
+          if (!recoverable) {
+            throw error;
+          }
+          lastRecoverableError = error;
+        }
+      }
+
+      throw lastRecoverableError || new Error('抖音详情页未完成加载');
     },
     onTransition: ({type, slot, snapshot, error}) => {
       const fatalNavigationFailure =
@@ -3083,7 +3671,37 @@ export async function batchCaptureDetailsForRecords(
         }
       }
       if (!onProgress || !slot) return;
-      if (type === 'navigation_started' && slot.mode === 'prefetch') {
+      if (type === 'navigation_queued' && slot.mode === 'foreground') {
+        const context = activeDetailItemContext || {};
+        void reportProgressFailSoft(onProgress, {
+          phase: 'detail_item_opening',
+          message: `${context.progressLabel || slot.label}：已找到作品链接，等待工作页打开详情...`,
+          recordId: slot.recordId,
+          current: context.current || 0,
+          total: uniqueRecordIds.length,
+          runnerTabId: slot.tabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: snapshot?.activeTabId || null,
+          workerMode: snapshot?.mode || '',
+          workerRevision: snapshot?.revision || 0,
+          workerStates: snapshot?.slots || [],
+        }, 'detail foreground navigation queued');
+      } else if (type === 'navigation_started' && slot.mode === 'foreground') {
+        const context = activeDetailItemContext || {};
+        void reportProgressFailSoft(onProgress, {
+          phase: 'detail_item_opening',
+          message: `${context.progressLabel || slot.label}：已找到作品链接，正在工作页打开并确认详情...`,
+          recordId: slot.recordId,
+          current: context.current || 0,
+          total: uniqueRecordIds.length,
+          runnerTabId: slot.tabId,
+          runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+          activeRunnerTabId: snapshot?.activeTabId || null,
+          workerMode: snapshot?.mode || '',
+          workerRevision: snapshot?.revision || 0,
+          workerStates: snapshot?.slots || [],
+        }, 'detail foreground navigation started');
+      } else if (type === 'navigation_started' && slot.mode === 'prefetch') {
         void reportProgressFailSoft(onProgress, {
           phase: 'detail_item_prefetch_loading',
           message: `${slot.label} 正在预加载下一条详情...`,
@@ -3170,18 +3788,16 @@ export async function batchCaptureDetailsForRecords(
   }, 'detail batch start');
 
   // 增量采集:开跑前先告诉用户为什么只补一部分(否则客户看到跳过一脸懵)
-  if (onProgress && skipRecordIdSet.size > 0) {
-    const toCaptureCount = uniqueRecordIds.length - skipRecordIdSet.size;
-    const recaptureSuffix =
-      recaptureCommentRecordIdSet.size > 0
-        ? `，${recaptureCommentRecordIdSet.size} 条评论数增加将重采评论`
-        : '';
+  if (onProgress && preDetailSkipRecordIdSet.size > 0) {
+    const toCaptureCount =
+      uniqueRecordIds.length - preDetailSkipRecordIdSet.size;
     onProgress({
       phase: 'detail_skip_summary',
-      message: `增量采集:共 ${uniqueRecordIds.length} 条,其中 ${skipRecordIdSet.size} 条之前已采过(自动跳过)${recaptureSuffix},本次只补采 ${toCaptureCount} 条`,
+      message: `采集增强：共 ${uniqueRecordIds.length} 条，AI 过滤 ${relevancePrefilterSkipRecordIdSet.size} 条，之前已采过 ${skipRecordIdSet.size} 条，本次补采 ${toCaptureCount} 条`,
       current: 0,
       total: uniqueRecordIds.length,
       skippedCount: skipRecordIdSet.size,
+      aiFilteredCount: relevancePrefilterSkipRecordIdSet.size,
       toCaptureCount,
       runnerTabId: runnerContext.runnerTabId,
     }, 'detail skip summary');
@@ -3222,6 +3838,49 @@ export async function batchCaptureDetailsForRecords(
         markerLabel,
         progressLabel,
       };
+
+      // AI 只真正执行 high-confidence skip。灰区、need_detail、接口错误
+      // 和超时都不会进入这个分支，仍沿用下面的原详情采集流程。
+      if (relevancePrefilterSkipRecordIdSet.has(recordId)) {
+        const decision = relevanceDecisionByRecordId.get(recordId) || {};
+        discardPrefetchForRecord(recordId);
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'filtered',
+          record,
+          tabId: runnerContext.sourceTabId,
+        });
+        filteredCount += 1;
+        results.push({
+          recordId,
+          ok: true,
+          filtered: true,
+          reason: 'ai_relevance_filtered',
+          message: `${markerLabel} AI 高置信度判定无关，已跳过采集增强`,
+          aiRelevanceConfidence: decision.confidence ?? null,
+          aiRelevanceReason: decision.reason || '',
+          ...captureTraceFields,
+        });
+        if (onProgress) {
+          await reportProgressFailSoft(onProgress, {
+            phase: 'detail_item_filtered',
+            message: `${progressLabel}：AI 高置信度判定与关键词「${decision.keyword || relevanceKeyword || ''}」无关，已跳过详情、评论和博主采集`,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            successCount,
+            failedCount,
+            filteredCount,
+            aiFilteredCount: filteredCount,
+            aiRelevanceConfidence: decision.confidence ?? null,
+            aiRelevanceReason: decision.reason || '',
+            runnerTabId: runnerContext.runnerTabId,
+            ...captureTraceFields,
+          }, 'detail ai relevance filtered');
+        }
+        activeDetailItemContext = null;
+        continue;
+      }
 
       // 增量采集:已采全的直接跳过(不开详情/不进主页)
       if (skipRecordIdSet.has(recordId)) {
@@ -3415,7 +4074,7 @@ export async function batchCaptureDetailsForRecords(
       if (onProgress) {
         await reportProgressFailSoft(onProgress, {
           phase: 'detail_item_capturing',
-          message: `正在补采 ${progressLabel} 的详情...`,
+          message: `${progressLabel}：已找到作品链接，准备打开详情...`,
           recordId,
           current,
           total: uniqueRecordIds.length,
@@ -3457,7 +4116,7 @@ export async function batchCaptureDetailsForRecords(
           nextPrefetchCandidatePromise = findNextDetailPrefetchCandidate({
             recordIds: uniqueRecordIds,
             startIndex: index + 1,
-            skipRecordIdSet,
+            skipRecordIdSet: preDetailSkipRecordIdSet,
           }).catch((error) => {
             console.warn(
               '[CaptureSync] resolve next detail prefetch candidate failed (ignored):',
@@ -3746,6 +4405,12 @@ export async function batchCaptureDetailsForRecords(
                   await openUrlInTab(navigationTabId, navigationUrl, {
                     ...navigationOptions,
                     shouldStop: shouldStopDetailBatch,
+                    // 小红书 A/B 工作页始终留在后台。主页指标补采及回到笔记页
+                    // 不应把用户从搜索来源页切走；可靠加载仍由导航轮询和
+                    // 持久任务持有的工作页生命周期保证。
+                    ...(recordPlatform === 'xiaohongshu'
+                      ? {active: false}
+                      : {}),
                   });
                   await probeDetailPreloadSafety(navigationTabId);
                 }),
@@ -3861,8 +4526,60 @@ export async function batchCaptureDetailsForRecords(
           break captureCurrentDetail;
         }
 
-        if (includeComments && !stopAfterCurrent) {
+        const knownCommentsCount = includeComments
+          ? resolveKnownCommentsCountForDetailCapture(record, detailPayload)
+          : null;
+        const shouldSkipConfirmedEmptyComments =
+          includeComments && knownCommentsCount === 0;
+        if (shouldSkipConfirmedEmptyComments && !stopAfterCurrent) {
+          const confirmedAt = Date.now();
+          detailPayload = {
+            ...applyCommentStatusToPayload(
+              detailPayload,
+              createCommentStatusPatch({
+                status: COMMENT_CAPTURE_STATUS.DONE,
+                startedAt: confirmedAt,
+                finishedAt: confirmedAt,
+                stoppedByUser: false,
+                error: '',
+                cleanedItems: [],
+                mergedText: '',
+              }),
+            ),
+            commentsCaptureSkipReason: 'confirmed_zero',
+          };
+          detailPayload = applyCommentLeadsToPayload({
+            syncType: SYNC_TYPE.SINGLE_NOTE,
+            payload: detailPayload,
+            commentLeadsConfig,
+            computedAt: confirmedAt,
+          }).payload;
+          await reportProgressFailSoft(onProgress, {
+            phase: 'detail_comments_skipped_empty',
+            message: `${progressLabel}：已确认评论数为 0，跳过评论区并进入下一条`,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            successCount,
+            failedCount,
+            filteredCount,
+            includeComments: true,
+            commentsCount: 0,
+            runnerTabId: runnerContext.runnerTabId,
+            ...captureTraceFields,
+          }, 'detail comments confirmed empty');
+        }
+
+        if (
+          includeComments &&
+          !stopAfterCurrent &&
+          !shouldSkipConfirmedEmptyComments
+        ) {
           activeStage = 'comments_capture';
+          const expectedCommentNoteId =
+            recordPlatform === 'douyin'
+              ? resolveExpectedDouyinCommentNoteId(record, noteUrl)
+              : '';
           const commentCaptureIdentity = await ensureCommentCaptureIdentity({
             runnerTabId: runnerContext.runnerTabId,
           });
@@ -3884,19 +4601,38 @@ export async function batchCaptureDetailsForRecords(
             });
           }
 
+          const existingCommentItems = Array.isArray(
+            record.payload?.detailPayload?.commentsCleanedItems,
+          )
+            ? record.payload.detailPayload.commentsCleanedItems
+            : [];
           const commentsResult = await captureCommentsForCurrentNote({
             tabId: commentCaptureIdentity.runnerTabId,
             captureRequestId: commentCaptureIdentity.captureRequestId,
             recordId,
             current,
             total: uniqueRecordIds.length,
-            existingItems: record.payload?.detailPayload?.commentsCleanedItems,
+            existingItems: existingCommentItems,
             maxDetectedItems: normalizedCommentsMaxDetectedItems,
             maxDurationMs: settings.sharedMaxDurationMs,
             waitMinMs: settings.sharedWaitMinMs,
             waitMaxMs: settings.sharedWaitMaxMs,
             stallTimeoutMs: settings.sharedStallTimeoutMs,
+            expectedNoteId: expectedCommentNoteId,
           });
+          const commentIdentityFailure =
+            commentsResult.status !== COMMENT_CAPTURE_STATUS.FAILED ||
+            commentsResult.errorCode === 'DOUYIN_COMMENT_ID_MISMATCH'
+              ? buildDouyinCommentIdentityFailure(
+                  expectedCommentNoteId,
+                  resolveCapturedDouyinCommentNoteId(commentsResult),
+                )
+              : null;
+          if (commentIdentityFailure) {
+            const error = new Error(commentIdentityFailure.message);
+            error.code = commentIdentityFailure.code;
+            throw error;
+          }
           detailPayload = applyCommentResultToSingleNotePayload(
             detailPayload,
             commentsResult,
@@ -4731,9 +5467,24 @@ function protectDouyinDetailAuthorAgainstListItem(
     listItem?.nickname,
     listItem?.bloggerName,
   );
-  const author = detailAuthor || listAuthor;
+  const normalizeComparableAuthor = (value) =>
+    String(value || '')
+      .replace(/^@+/u, '')
+      .replace(/[\s\u200b-\u200d\ufeff·•._-]+/gu, '')
+      .toLowerCase();
+  const detailAuthorKey = normalizeComparableAuthor(detailAuthor);
+  const listAuthorKey = normalizeComparableAuthor(listAuthor);
+  const authorsConflict = Boolean(
+    detailAuthorKey &&
+      listAuthorKey &&
+      detailAuthorKey !== listAuthorKey,
+  );
+  // 搜索卡片与详情属于同一作品。两边作者冲突时，详情页通常误取了
+  // 推荐账号、品牌卡或登录账号；列表卡作者与作品绑定更直接，优先保留。
+  const preferListAuthor = Boolean(listAuthor && (!detailAuthor || authorsConflict));
+  const author = preferListAuthor ? listAuthor : detailAuthor || listAuthor;
   const authorUrl = pickTrustedDouyinAuthorUrl(
-    detailAuthor
+    !preferListAuthor && detailAuthor
       ? [
           base.authorProfileUrl,
           base.authorUrl,
@@ -4752,7 +5503,10 @@ function protectDouyinDetailAuthorAgainstListItem(
   const listAuthorId = String(
     listItem?.authorId || listItem?.bloggerId || '',
   ).trim();
-  const authorId = detailAuthor && !/^self$/i.test(detailAuthorId)
+  const authorId =
+    !preferListAuthor &&
+    detailAuthor &&
+    !/^self$/i.test(detailAuthorId)
     ? detailAuthorId
     : listAuthorId;
 
@@ -7522,6 +8276,10 @@ async function captureCommentsForSingleNoteRecord(
     commentsMaxDetectedItems ?? commentsMaxItems,
     settings.commentsMaxDetectedItems,
   );
+  const expectedNoteId = resolveExpectedDouyinCommentNoteId(
+    record,
+    resolveRecordNoteUrl(record),
+  );
   const startedAt = Date.now();
 
   await updateRecord(recordId, {
@@ -7563,6 +8321,7 @@ async function captureCommentsForSingleNoteRecord(
         waitMinMs: settings.sharedWaitMinMs,
         waitMaxMs: settings.sharedWaitMaxMs,
         stallTimeoutMs: settings.sharedStallTimeoutMs,
+        expectedNoteId,
       },
     });
   } catch (error) {
@@ -7573,6 +8332,19 @@ async function captureCommentsForSingleNoteRecord(
         message: error.message || '评论采集失败',
       },
     };
+  }
+
+  if (commentsResult?.ok) {
+    const commentIdentityFailure = buildDouyinCommentIdentityFailure(
+      expectedNoteId,
+      resolveCapturedDouyinCommentNoteId(commentsResult),
+    );
+    if (commentIdentityFailure) {
+      commentsResult = {
+        ok: false,
+        error: commentIdentityFailure,
+      };
+    }
   }
 
   if (!commentsResult.ok) {
@@ -9022,14 +9794,6 @@ function normalizeOptionalCount(value) {
   return Math.floor(parsed);
 }
 
-function normalizeOptionalTimestamp(value) {
-  if (value === undefined || value === null || value === '') return null;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && numeric > 0) return Math.floor(numeric);
-  const parsed = Date.parse(String(value));
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-}
-
 function pickFirstCountFromSources(sources = [], keys = []) {
   for (const source of sources) {
     if (!source || typeof source !== 'object') continue;
@@ -9060,59 +9824,56 @@ function resolveRecordListCommentsCount(record = {}) {
   ]);
 }
 
-function buildCapturedCommentStatus(record = {}) {
+export function resolveKnownCommentsCountForDetailCapture(
+  record = {},
+  detailPayload = {},
+) {
+  const countKeys = [
+    'comments',
+    'commentCount',
+    'comment_count',
+    'commentsCount',
+    'comments_count',
+  ];
+  const knownKeys = [
+    'commentsCountKnown',
+    'commentCountKnown',
+    'comment_count_known',
+    'comments_count_known',
+  ];
+  const pickProvenCount = (sources = []) => {
+    for (const source of sources) {
+      if (!source || typeof source !== 'object') continue;
+      const isKnown = knownKeys.some((key) => source[key] === true);
+      if (!isKnown) continue;
+      for (const key of countKeys) {
+        if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+        const rawCount = source[key];
+        if (
+          typeof rawCount !== 'number' &&
+          !/[0-9]/.test(String(rawCount ?? ''))
+        ) {
+          continue;
+        }
+        const count = normalizeOptionalCount(rawCount);
+        if (count !== null) return count;
+      }
+    }
+    return null;
+  };
+
+  const detailCount = pickProvenCount([detailPayload]);
+  if (detailCount !== null) return detailCount;
+
   const payload =
     record?.payload && typeof record.payload === 'object'
       ? record.payload
       : {};
-  const baseline = normalizeOptionalCount(payload.detailCommentCountBaseline);
-  return {
-    commentsCount: resolveRecordListCommentsCount(record),
-    commentsBaselineCount: baseline,
-    capturedAt:
-      normalizeOptionalTimestamp(payload.detailCaptureFinishedAt) ??
-      normalizeOptionalTimestamp(record?.updatedAt),
-    hasBaseline: baseline !== null,
-  };
-}
-
-function resolveCapturedCommentBaseline({localStatus = null, remoteStatus = null} = {}) {
-  const readBaseline = (status) => {
-    if (status?.hasBaseline && status.commentsBaselineCount !== null) {
-      return normalizeOptionalCount(status.commentsBaselineCount);
-    }
-    return normalizeOptionalCount(status?.commentsCount);
-  };
-  const localBaseline = readBaseline(localStatus);
-  const remoteBaseline = readBaseline(remoteStatus);
-  if (localBaseline === null) return remoteBaseline;
-  if (remoteBaseline === null) return localBaseline;
-
-  const localCapturedAt = normalizeOptionalTimestamp(localStatus?.capturedAt);
-  const remoteCapturedAt = normalizeOptionalTimestamp(remoteStatus?.capturedAt);
-  if (localCapturedAt !== null && remoteCapturedAt !== null) {
-    if (localCapturedAt > remoteCapturedAt) return localBaseline;
-    if (remoteCapturedAt > localCapturedAt) return remoteBaseline;
-  } else if (localCapturedAt !== null) {
-    return localBaseline;
-  } else if (remoteCapturedAt !== null) {
-    return remoteBaseline;
-  }
-
-  // Legacy snapshots have no comparable capture time. The larger baseline is
-  // the fail-safe choice: it avoids treating stale local data as new growth.
-  return Math.max(localBaseline, remoteBaseline);
-}
-
-function hasCommentCountIncreasedSinceLastCapture({
-  currentCommentsCount = null,
-  localStatus = null,
-  remoteStatus = null,
-} = {}) {
-  const current = normalizeOptionalCount(currentCommentsCount);
-  if (current === null) return false;
-  const baseline = resolveCapturedCommentBaseline({localStatus, remoteStatus});
-  return baseline !== null && current > baseline;
+  const firstItem =
+    Array.isArray(payload.items) && payload.items[0] && typeof payload.items[0] === 'object'
+      ? payload.items[0]
+      : {};
+  return pickProvenCount([firstItem, payload]);
 }
 
 function isValidBloggerMetricsStatus(status) {
@@ -9659,6 +10420,15 @@ function buildDetailCaptureFailure(code, stage, diagnosticMessage = '') {
         userMessage: '打开详情页失败，请稍后重试',
         diagnosticMessage: normalizedDiagnostic || '打开详情页失败',
       };
+    case DETAIL_CAPTURE_FAILURE_CODE.CONTENT_UNAVAILABLE:
+      return {
+        code: normalizedCode,
+        stage: normalizedStage,
+        category: DETAIL_CAPTURE_FAILURE_CATEGORY.PAGE_FAILED,
+        userMessage: '抖音作品不存在或不可访问，已跳过当前条',
+        diagnosticMessage:
+          normalizedDiagnostic || '抖音作品不存在、已删除或当前账号不可访问',
+      };
     case DETAIL_CAPTURE_FAILURE_CODE.NOTE_CAPTURE_FAILED:
       return {
         code: normalizedCode,
@@ -9739,8 +10509,17 @@ function isLikelyContextInterruptedMessage(message = '') {
 
 function classifyDetailCaptureFailure(error, { stage = 'unknown' } = {}) {
   const rawMessage = String(error?.message || '').trim();
+  const rawCode = String(error?.code || '').trim().toUpperCase();
   const normalizedStage =
     String(stage || 'unknown').trim().toLowerCase() || 'unknown';
+
+  if (rawCode === 'DOUYIN_CONTENT_UNAVAILABLE') {
+    return buildDetailCaptureFailure(
+      DETAIL_CAPTURE_FAILURE_CODE.CONTENT_UNAVAILABLE,
+      normalizedStage,
+      rawMessage,
+    );
+  }
 
   if (isLikelyContextInterruptedMessage(rawMessage)) {
     const interruptedCode =
@@ -9902,7 +10681,9 @@ function resolveRecordNoteUrl(record) {
 
   const payload = record.payload;
   const firstItem = Array.isArray(payload.items) ? payload.items[0] : null;
+  const expectedNoteId = resolveRecordDetailNoteId(record);
   const candidates = [
+    buildDouyinRecordSearchModalUrl(record, expectedNoteId),
     firstItem?.url,
     firstItem?.noteUrl,
     firstItem?.detailPageUrl,
@@ -9916,7 +10697,15 @@ function resolveRecordNoteUrl(record) {
   for (const candidate of candidates) {
     const normalized = normalizeOpenUrl(candidate);
     if (normalized) {
-      return normalized;
+      const candidateNoteId = extractNoteId(normalized);
+      if (
+        expectedNoteId &&
+        candidateNoteId &&
+        candidateNoteId !== expectedNoteId
+      ) {
+        continue;
+      }
+      return normalizeDouyinDetailUrlAgainstRecord(record, normalized);
     }
   }
 
@@ -9931,6 +10720,8 @@ function buildFallbackDetailNoteUrl(record) {
 
   const platform = String(record?.platform || '').trim().toLowerCase();
   if (platform === 'douyin') {
+    const contextualUrl = buildDouyinRecordSearchModalUrl(record, noteId);
+    if (contextualUrl) return contextualUrl;
     return `https://www.douyin.com/${resolveRecordDetailNotePath(record)}/${noteId}`;
   }
   if (platform === 'weibo') {
@@ -9939,6 +10730,45 @@ function buildFallbackDetailNoteUrl(record) {
   }
 
   return `https://www.xiaohongshu.com/explore/${noteId}`;
+}
+
+function buildDouyinRecordSearchModalUrl(record, noteId) {
+  if (!/^\d{8,}$/.test(String(noteId || ''))) {
+    return '';
+  }
+  const payload =
+    record?.payload && typeof record.payload === 'object'
+      ? record.payload
+      : {};
+  const firstItem =
+    Array.isArray(payload.items) &&
+    payload.items[0] &&
+    typeof payload.items[0] === 'object'
+      ? payload.items[0]
+      : {};
+  const candidates = [
+    firstItem.searchUrl,
+    payload.searchUrl,
+    record?.meta?.sourceUrl,
+    record?.sourceUrl,
+  ];
+  for (const candidate of candidates) {
+    try {
+      const parsed = new URL(String(candidate || ''));
+      const host = parsed.hostname.toLowerCase();
+      if (
+        (host !== 'douyin.com' && !host.endsWith('.douyin.com')) ||
+        !/\/search\//i.test(parsed.pathname)
+      ) {
+        continue;
+      }
+      parsed.searchParams.set('modal_id', String(noteId));
+      return parsed.toString();
+    } catch {
+      // Try the next captured search context.
+    }
+  }
+  return '';
 }
 
 function resolveRecordDetailNoteId(record) {
@@ -9950,23 +10780,34 @@ function resolveRecordDetailNoteId(record) {
     Array.isArray(payload.items) && payload.items[0] && typeof payload.items[0] === 'object'
       ? payload.items[0]
       : {};
+  const urlCandidates = [
+    firstItem.url,
+    firstItem.noteUrl,
+    firstItem.detailPageUrl,
+    payload.detailCaptureNoteUrl,
+    payload.url,
+    payload.noteUrl,
+    payload.detailPageUrl,
+  ];
+  const isDouyinRecord =
+    String(record?.platform || '').trim().toLowerCase() === 'douyin' ||
+    urlCandidates.some(
+      (value) => detectPlatformFromUrl(String(value || '')) === 'douyin',
+    );
   const candidates = [
     firstItem.noteId,
     payload.noteId,
     firstItem.id,
     payload.id,
-    extractNoteId(firstItem.url),
-    extractNoteId(firstItem.noteUrl),
-    extractNoteId(firstItem.detailPageUrl),
-    extractNoteId(payload.detailCaptureNoteUrl),
-    extractNoteId(payload.url),
-    extractNoteId(payload.noteUrl),
-    extractNoteId(payload.detailPageUrl),
+    ...urlCandidates.map(extractNoteId),
   ];
 
   for (const candidate of candidates) {
     const normalized = String(candidate || '').trim();
     if (!normalized || normalized.startsWith('synthetic_')) {
+      continue;
+    }
+    if (isDouyinRecord && !/^\d{8,}$/.test(normalized)) {
       continue;
     }
     if (/^[a-zA-Z0-9_-]{6,}$/.test(normalized)) {
@@ -9977,7 +10818,7 @@ function resolveRecordDetailNoteId(record) {
   return '';
 }
 
-function resolveRecordDetailNotePath(record) {
+export function resolveRecordDetailNotePath(record) {
   const payload =
     record?.payload && typeof record.payload === 'object'
       ? record.payload
@@ -9986,6 +10827,16 @@ function resolveRecordDetailNotePath(record) {
     Array.isArray(payload.items) && payload.items[0] && typeof payload.items[0] === 'object'
       ? payload.items[0]
       : {};
+  const duration = String(
+    firstItem.duration ||
+      firstItem.videoDuration ||
+      payload.duration ||
+      payload.videoDuration ||
+      '',
+  ).trim();
+  if (/^\d{1,3}:\d{2}(?::\d{2})?$/.test(duration)) {
+    return 'video';
+  }
   const rawType = String(
     firstItem.noteType ||
       firstItem.type ||
@@ -10004,6 +10855,119 @@ function resolveRecordDetailNotePath(record) {
   }
 
   return 'video';
+}
+
+function normalizeDouyinDetailUrlAgainstRecord(record, url) {
+  const normalized = String(url || '').trim();
+  const platform = String(
+    record?.platform || detectPlatformFromUrl(normalized),
+  )
+    .trim()
+    .toLowerCase();
+  if (
+    platform !== 'douyin' ||
+    resolveRecordDetailNotePath(record) !== 'video'
+  ) {
+    return normalized;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const match = parsed.pathname.match(/^\/note\/([^/?#]+)/i);
+    if (!match?.[1]) return normalized;
+    parsed.pathname = `/video/${match[1]}`;
+    return parsed.toString();
+  } catch {
+    return normalized.replace(
+      /^(https?:\/\/(?:www\.)?douyin\.com)\/note\//i,
+      '$1/video/',
+    );
+  }
+}
+
+export function buildDouyinDetailNavigationCandidates(
+  targetUrl,
+  sourcePageUrl = '',
+  preferredPath = 'video',
+) {
+  const normalizedTarget = normalizeOpenUrl(targetUrl);
+  if (!normalizedTarget || detectPlatformFromUrl(normalizedTarget) !== 'douyin') {
+    return normalizedTarget ? [normalizedTarget] : [];
+  }
+
+  const noteId = extractNoteId(normalizedTarget);
+  if (!/^\d{8,}$/.test(String(noteId || ''))) {
+    return [normalizedTarget];
+  }
+  const targetPathMatch = normalizedTarget.match(
+    /\/(video|note)\/\d{8,}/i,
+  );
+  const fallbackPath =
+    String(targetPathMatch?.[1] || preferredPath).toLowerCase() === 'note'
+      ? 'note'
+      : 'video';
+
+  const candidates = [];
+  const push = (value) => {
+    const normalized = normalizeOpenUrl(value);
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  };
+
+  try {
+    const source = new URL(String(sourcePageUrl || ''));
+    const sourceHost = source.hostname.toLowerCase();
+    const isDouyinSearchContext =
+      (sourceHost === 'douyin.com' || sourceHost.endsWith('.douyin.com')) &&
+      /\/search\//i.test(source.pathname);
+    if (isDouyinSearchContext) {
+      source.searchParams.set('modal_id', noteId);
+      push(source.toString());
+    }
+  } catch {
+    // Continue with the captured detail URL.
+  }
+
+  push(normalizedTarget);
+  if (/[?&]modal_id=/i.test(normalizedTarget)) {
+    push(`https://www.douyin.com/${fallbackPath}/${noteId}`);
+  }
+
+  return candidates;
+}
+
+export function buildDouyinCommentRecoveryCandidates(
+  record,
+  targetUrl,
+  sourcePageUrl = '',
+) {
+  const noteId = resolveRecordDetailNoteId(record) || extractNoteId(targetUrl);
+  if (!/^\d{8,}$/.test(String(noteId || ''))) {
+    return buildDouyinDetailNavigationCandidates(
+      targetUrl,
+      sourcePageUrl,
+      resolveRecordDetailNotePath(record),
+    );
+  }
+
+  const preferredPath = resolveRecordDetailNotePath(record);
+  const directUrl = `https://www.douyin.com/${preferredPath}/${noteId}`;
+  const candidates = [];
+  const push = (value) => {
+    const normalized = normalizeOpenUrl(value);
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  };
+
+  // 评论开始前若搜索弹层已经消失，继续留在搜索页只会得到“详情元素不存在”。
+  // 恢复阶段先走明确绑定作品 ID 的直达页，再回退到搜索弹层上下文。
+  push(directUrl);
+  buildDouyinDetailNavigationCandidates(
+    targetUrl,
+    sourcePageUrl,
+    preferredPath,
+  ).forEach(push);
+  return candidates;
 }
 
 function normalizeOpenUrl(url) {
@@ -10155,7 +11119,6 @@ async function openUrlInTab(
     active = true,
   } = {},
 ) {
-  const targetNoteId = extractNoteId(targetUrl);
   const navUrl = ensureXhsNoteUrlSource(targetUrl);
 
   await chrome.tabs.update(tabId, {
@@ -10163,7 +11126,26 @@ async function openUrlInTab(
     active: Boolean(active),
   });
 
+  await waitForOpenedUrlInTab(tabId, targetUrl, {
+    timeoutMs,
+    shouldStop,
+  });
+}
+
+async function waitForOpenedUrlInTab(
+  tabId,
+  targetUrl,
+  {
+    timeoutMs = DETAIL_CAPTURE_NAV_TIMEOUT_MS,
+    shouldStop = null,
+  } = {},
+) {
+  const targetNoteId = extractNoteId(targetUrl);
+  const requiresDouyinTargetIdentity =
+    Boolean(targetNoteId) && isDouyinContentFlowUrl(targetUrl);
   const startedAt = Date.now();
+  let douyinTargetMatchedAt = 0;
+  let lastObservedUrl = '';
   while (Date.now() - startedAt < timeoutMs) {
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('DETAIL_CAPTURE_CANCELED');
@@ -10177,75 +11159,463 @@ async function openUrlInTab(
     }
 
     const currentUrl = String(tab?.url || '');
+    lastObservedUrl = currentUrl;
     const status = String(tab?.status || '');
-    const noteMatched = isTargetNoteOpened(currentUrl, targetUrl, targetNoteId);
+    const currentNoteId = extractNoteId(currentUrl);
+    const targetIdentityMatched =
+      !requiresDouyinTargetIdentity || currentNoteId === targetNoteId;
+    const noteMatched =
+      targetIdentityMatched &&
+      isTargetNoteOpened(currentUrl, targetUrl, targetNoteId);
     if (status === 'complete' && noteMatched) {
       return;
+    }
+    if (requiresDouyinTargetIdentity && targetIdentityMatched) {
+      if (!douyinTargetMatchedAt) {
+        douyinTargetMatchedAt = Date.now();
+      }
+      if (Date.now() - douyinTargetMatchedAt >= DOUYIN_DETAIL_ROUTE_SETTLE_MS) {
+        return;
+      }
+    } else {
+      douyinTargetMatchedAt = 0;
     }
 
     await waitMs(DETAIL_CAPTURE_NAV_POLL_MS);
   }
 
-  throw new Error('打开页面超时，请稍后重试');
+  const error = new Error('打开页面超时，请稍后重试');
+  error.code = 'DETAIL_NAVIGATION_TIMEOUT';
+  error.currentUrl = lastObservedUrl;
+  throw error;
 }
 
-async function probeDetailPreloadSafety(tabId) {
+async function probeDetailPreloadSafety(
+  tabId,
+  {
+    targetUrl = '',
+    waitForDouyinReady = false,
+    requireVisibleDetailRoot = false,
+    shouldStop = null,
+    timeoutMs = 8000,
+  } = {},
+) {
   if (!globalThis.chrome?.scripting?.executeScript) {
-    return {ok: true, skipped: true};
-  }
-  try {
-    const [execution] = await chrome.scripting.executeScript({
-      target: {tabId: Number(tabId)},
-      func: () => {
-        const title = String(document.title || '').trim();
-        const bodyText = String(document.body?.innerText || '')
-          .replace(/\s+/gu, ' ')
-          .trim()
-          .slice(0, 12000);
-        const currentUrl = String(location.href || '');
-        const xhsBlocked =
-          (/安全限制/u.test(bodyText) &&
-            /(访问频繁|稍后再试|300013)/u.test(bodyText)) ||
-          (/300013/u.test(bodyText) &&
-            /(访问频繁|稍后再试|安全)/u.test(bodyText));
-        const challengeBlocked =
-          /(验证码中间页|请完成下列验证后继续|请完成验证|captcha|challenge)/iu.test(
-            `${title} ${bodyText}`,
-          );
-        return {
-          currentUrl,
-          title,
-          blocked: xhsBlocked || challengeBlocked,
-          code: xhsBlocked ? 'XHS_SECURITY_BLOCK' : 'PAGE_CHALLENGE_BLOCK',
-          message: xhsBlocked
-            ? '触发小红书安全限制(访问频繁/300013)'
-            : challengeBlocked
-              ? '详情预加载遇到验证码或风险验证页'
-              : '',
-        };
-      },
-    });
-    const result = execution?.result || {};
-    if (result.blocked) {
-      const error = new Error(result.message || '详情预加载遇到安全验证页');
-      error.code = result.code || 'PAGE_CHALLENGE_BLOCK';
-      error.currentUrl = result.currentUrl || '';
+    if (waitForDouyinReady) {
+      const error = new Error('当前浏览器无法确认抖音详情页是否加载完成');
+      error.code = 'DOUYIN_DETAIL_NOT_READY';
       throw error;
     }
-    return {ok: true, ...result};
+    return {ok: true, skipped: true};
+  }
+  const expectedNoteId = extractNoteId(targetUrl);
+  const startedAt = Date.now();
+  let unavailableSince = 0;
+  let unboundSearchModalSince = 0;
+  try {
+    while (true) {
+      if (typeof shouldStop === 'function' && shouldStop()) {
+        throw new Error('DETAIL_CAPTURE_CANCELED');
+      }
+      const [execution] = await chrome.scripting.executeScript({
+        target: {tabId: Number(tabId)},
+        args: [
+          String(expectedNoteId || ''),
+          Boolean(requireVisibleDetailRoot),
+        ],
+        func: (targetNoteId, requireVisibleRoot) => {
+          const title = String(document.title || '').trim();
+          const bodyText = String(document.body?.innerText || '')
+            .replace(/\s+/gu, ' ')
+            .trim()
+            .slice(0, 12000);
+          const currentUrl = String(location.href || '');
+          const douyinUnavailable =
+            /你要观看的(?:视频|作品|内容)不存在|(?:视频|作品)不存在|该作品已删除|内容已下架/u.test(
+              `${title} ${bodyText}`,
+            );
+          const xhsBlocked =
+            (/安全限制/u.test(bodyText) &&
+              /(访问频繁|稍后再试|300013)/u.test(bodyText)) ||
+            (/300013/u.test(bodyText) &&
+              /(访问频繁|稍后再试|安全)/u.test(bodyText));
+          const challengeBlocked =
+            /(验证码中间页|请完成下列验证后继续|请完成验证|captcha|challenge)/iu.test(
+              `${title} ${bodyText}`,
+            );
+          const isDouyin = /(^|\.)douyin\.com$/i.test(location.hostname);
+          const routeMatch = location.pathname.match(
+            /\/(?:video|note)\/(\d{8,})/i,
+          );
+          const modalId =
+            new URLSearchParams(location.search).get('modal_id') || '';
+          const currentNoteId =
+            routeMatch?.[1] ||
+            modalId ||
+            '';
+          const targetMatched =
+            !targetNoteId || currentNoteId === targetNoteId;
+          const isDirectDetailRoute = Boolean(routeMatch?.[1]);
+          const isSearchModalContext = Boolean(
+            targetNoteId &&
+              modalId === targetNoteId &&
+              /\/search\//i.test(location.pathname),
+          );
+          const isVisible = (element) => {
+            if (!(element instanceof Element)) return false;
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return Boolean(
+              rect.width > 0 &&
+                rect.height > 0 &&
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                Number(style.opacity || 1) > 0,
+            );
+          };
+          const hasVisible = (selectors, root = document) => {
+            if (!root?.querySelectorAll) return false;
+            return selectors.some((selector) =>
+              Array.from(root.querySelectorAll(selector)).some(isVisible),
+            );
+          };
+          let apiDetailReady = false;
+          if (isDouyin && targetNoteId) {
+            for (const storage of [sessionStorage, localStorage]) {
+              try {
+                const raw = storage.getItem(`__mc_dy_detail_${targetNoteId}`);
+                const parsed = raw ? JSON.parse(raw) : null;
+                if (parsed?.detail && typeof parsed.detail === 'object') {
+                  apiDetailReady = true;
+                  break;
+                }
+              } catch {
+                // Continue with visible DOM readiness.
+              }
+            }
+          }
+          const targetSelectors = targetNoteId
+            ? [
+                `[data-e2e-aweme-id="${targetNoteId}"]`,
+                `[data-aweme-id="${targetNoteId}"]`,
+                `[data-awemeid="${targetNoteId}"]`,
+                `[data-item-id="${targetNoteId}"]`,
+              ]
+            : [];
+          const targetRoots = Array.from(
+            new Set(
+              targetSelectors.flatMap((selector) =>
+                Array.from(document.querySelectorAll(selector)),
+              ),
+            ),
+          );
+          const modalBoundarySelector = [
+            '[role="dialog"]',
+            '[class*="Modal"]',
+            '[class*="modal"]',
+            '.focusPanel',
+            '[class*="focusPanel"]',
+          ].join(',');
+          const visibleModalRoots = Array.from(
+            document.querySelectorAll(modalBoundarySelector),
+          ).filter(isVisible);
+          const targetModalRoot =
+            targetRoots
+              .map((root) => root.closest?.(modalBoundarySelector))
+              .find((root) => isVisible(root)) || null;
+          const linkedModalRoot = targetNoteId
+            ? visibleModalRoots.find((root) => {
+                return Array.from(
+                  root.querySelectorAll(
+                    'a[href*="/video/"], a[href*="/note/"]',
+                  ),
+                ).some((link) => {
+                  try {
+                    return new URL(
+                      link.getAttribute('href') || '',
+                      location.origin,
+                    ).pathname.match(/\/(?:video|note)\/(\d{8,})/i)?.[1] ===
+                      targetNoteId;
+                  } catch {
+                    return false;
+                  }
+                });
+              }) || null
+            : null;
+          // 抖音搜索弹层经常只有 URL 的 modal_id 能证明作品身份，弹层 DOM
+          // 本身并不带 data-aweme-id，也不一定含作品直达链接。此时只在
+          // modal_id 已严格等于目标 ID，且可见弹层内确有详情/评论信号时
+          // 接受该弹层；绝不退回搜索页 document，避免把普通推荐卡当详情。
+          const modalIdentityFallbackRoot = isSearchModalContext
+            ? visibleModalRoots.find((root) =>
+                hasVisible(
+                  [
+                    '[data-e2e="video-desc"]',
+                    '[data-e2e="video-info"]',
+                    '[data-e2e="feed-video-nickname"]',
+                    '[data-e2e="feed-comment-icon"]',
+                    '[data-e2e="video-comment-icon"]',
+                    '[data-e2e="video-player-comment"]',
+                    '[data-e2e="comment-list"]',
+                    '.comment-mainContent',
+                    'video',
+                    '.xgplayer',
+                    '[class*="xgplayer"]',
+                    'img[src*="douyinpic.com"]',
+                    'img[src*="byteimg.com"]',
+                  ],
+                  root,
+                ),
+              ) || null
+            : null;
+          const boundDetailRoot = isSearchModalContext
+            ? targetModalRoot ||
+              linkedModalRoot ||
+              modalIdentityFallbackRoot
+            : targetRoots.find((root) => isVisible(root)) ||
+              (isDirectDetailRoute ? document : null);
+          const detailRoot = boundDetailRoot;
+          const hasTitleOrContent = hasVisible(
+            [
+              '[data-e2e="video-desc"]',
+              '[data-e2e="video-info"]',
+              '.video-info-detail',
+              '[class*="video-desc"]',
+              '[class*="VideoDesc"]',
+            ],
+            detailRoot,
+          );
+          const hasAuthor = hasVisible(
+            [
+              '[data-e2e="feed-video-nickname"]',
+              '[data-e2e="video-info"] a[href*="/user/"]',
+              '.video-info-detail a[href*="/user/"]',
+              '[data-e2e="video-avatar"]',
+            ],
+            detailRoot,
+          );
+          const hasMedia = hasVisible(
+            [
+              'video',
+              '.xgplayer',
+              '[class*="xgplayer"]',
+              '.swiper-slide img',
+              'main img[src*="douyinpic.com"]',
+              'main img[src*="byteimg.com"]',
+            ],
+            detailRoot,
+          );
+          const hasEngagement = hasVisible(
+            [
+              '[data-e2e="video-player-digg"]',
+              '[data-e2e="feed-like-icon"]',
+              '[data-e2e="feed-comment-icon"]',
+              '[data-e2e="video-player-collect"]',
+            ],
+            detailRoot,
+          );
+          const detailReady = Boolean(
+            !isDouyin ||
+              (targetMatched &&
+                (isSearchModalContext
+                  ? Boolean(boundDetailRoot) &&
+                    ((hasMedia &&
+                      (hasTitleOrContent || hasAuthor || hasEngagement)) ||
+                      (hasTitleOrContent &&
+                        (hasAuthor || hasEngagement)))
+                  : (!requireVisibleRoot && apiDetailReady) ||
+                    (Boolean(boundDetailRoot) &&
+                      ((hasMedia &&
+                        (hasTitleOrContent || hasAuthor || hasEngagement)) ||
+                        (hasTitleOrContent &&
+                          (hasAuthor || hasEngagement)))))),
+          );
+          return {
+            currentUrl,
+            title,
+            isDouyin,
+            currentNoteId,
+            targetMatched,
+            detailReady,
+            apiDetailReady,
+            requireVisibleDetailRoot: requireVisibleRoot,
+            hasBoundDetailRoot: Boolean(boundDetailRoot),
+            usedModalIdentityFallback: Boolean(
+              modalIdentityFallbackRoot &&
+                boundDetailRoot === modalIdentityFallbackRoot,
+            ),
+            isSearchModalContext,
+            blocked: xhsBlocked || challengeBlocked,
+            unavailable: douyinUnavailable,
+            code: xhsBlocked
+              ? 'XHS_SECURITY_BLOCK'
+              : challengeBlocked
+                ? 'PAGE_CHALLENGE_BLOCK'
+                : '',
+            message: xhsBlocked
+              ? '触发小红书安全限制(访问频繁/300013)'
+              : challengeBlocked
+                ? '详情预加载遇到验证码或风险验证页'
+                : '',
+          };
+        },
+      });
+      const result = execution?.result || {};
+      if (result.blocked) {
+        const error = new Error(result.message || '详情预加载遇到安全验证页');
+        error.code = result.code || 'PAGE_CHALLENGE_BLOCK';
+        error.currentUrl = result.currentUrl || '';
+        throw error;
+      }
+      if (!waitForDouyinReady || !result.isDouyin) {
+        return {ok: true, ...result};
+      }
+      // “作品不存在”页仍会渲染推荐作品、作者和互动控件；这些 DOM 信号
+      // 不能反过来证明目标作品已就绪。先处理不可用态，再允许 ready 返回。
+      if (result.unavailable) {
+        if (!unavailableSince) unavailableSince = Date.now();
+        if (Date.now() - unavailableSince >= DOUYIN_UNAVAILABLE_GRACE_MS) {
+          const error = new Error(
+            '抖音详情持续显示作品不存在，正在尝试备用入口',
+          );
+          error.code = 'DOUYIN_CONTENT_UNAVAILABLE';
+          error.currentUrl = result.currentUrl || '';
+          throw error;
+        }
+      } else {
+        unavailableSince = 0;
+        if (result.targetMatched && result.detailReady) {
+          return {ok: true, ...result};
+        }
+      }
+      if (result.isSearchModalContext && !result.hasBoundDetailRoot) {
+        if (!unboundSearchModalSince) {
+          unboundSearchModalSince = Date.now();
+        }
+        if (
+          Date.now() - unboundSearchModalSince >=
+          DOUYIN_SEARCH_MODAL_BIND_GRACE_MS
+        ) {
+          const error = new Error(
+            '抖音搜索页未打开目标作品详情，正在尝试直达作品入口',
+          );
+          error.code = 'DOUYIN_DETAIL_NOT_READY';
+          error.currentUrl = result.currentUrl || '';
+          throw error;
+        }
+      } else {
+        unboundSearchModalSince = 0;
+      }
+      if (Date.now() - startedAt >= Math.max(1000, Number(timeoutMs) || 8000)) {
+        const error = new Error('抖音详情页未完成加载');
+        error.code = 'DOUYIN_DETAIL_NOT_READY';
+        error.currentUrl = result.currentUrl || '';
+        throw error;
+      }
+      await waitMs(250);
+    }
   } catch (error) {
     if (
       error?.code === 'XHS_SECURITY_BLOCK' ||
-      error?.code === 'PAGE_CHALLENGE_BLOCK'
+      error?.code === 'PAGE_CHALLENGE_BLOCK' ||
+      error?.code === 'DOUYIN_CONTENT_UNAVAILABLE' ||
+      error?.code === 'DOUYIN_DETAIL_NOT_READY' ||
+      String(error?.message || '') === 'DETAIL_CAPTURE_CANCELED'
     ) {
       throw error;
     }
     console.warn(
-      '[CaptureSync] detail preload safety probe unavailable (ignored):',
+      '[CaptureSync] detail preload safety probe unavailable:',
       error?.message || error,
     );
+    if (waitForDouyinReady) {
+      const readinessError = new Error('抖音详情页就绪检查失败');
+      readinessError.code = 'DOUYIN_DETAIL_NOT_READY';
+      readinessError.cause = error;
+      throw readinessError;
+    }
     return {ok: true, skipped: true};
   }
+}
+
+async function ensureDouyinCommentTargetReadyInTab({
+  tabId,
+  record,
+  targetUrl,
+  sourcePageUrl = '',
+  shouldStop = null,
+  navigateCandidate = null,
+  onRecovery = null,
+} = {}) {
+  try {
+    const current = await probeDetailPreloadSafety(tabId, {
+      targetUrl,
+      waitForDouyinReady: true,
+      requireVisibleDetailRoot: true,
+      shouldStop,
+      timeoutMs: DOUYIN_COMMENT_READY_PROBE_TIMEOUT_MS,
+    });
+    return {ok: true, recovered: false, url: current?.currentUrl || targetUrl};
+  } catch (error) {
+    if (
+      isDetailSecurityBlockError(error) ||
+      String(error?.message || '') === 'DETAIL_CAPTURE_CANCELED'
+    ) {
+      throw error;
+    }
+    if (typeof onRecovery === 'function') {
+      await onRecovery(error);
+    }
+  }
+
+  const candidates = buildDouyinCommentRecoveryCandidates(
+    record,
+    targetUrl,
+    sourcePageUrl,
+  );
+  let lastError = null;
+  for (const candidateUrl of candidates) {
+    try {
+      const operation = async () => {
+        await openUrlInTab(tabId, candidateUrl, {
+          timeoutMs: DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS,
+          shouldStop,
+          active: true,
+        });
+        return await probeDetailPreloadSafety(tabId, {
+          targetUrl: candidateUrl,
+          waitForDouyinReady: true,
+          requireVisibleDetailRoot: true,
+          shouldStop,
+          timeoutMs: DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS,
+        });
+      };
+      const ready =
+        typeof navigateCandidate === 'function'
+          ? await navigateCandidate(operation, candidateUrl)
+          : await operation();
+      return {
+        ok: true,
+        recovered: true,
+        url: ready?.currentUrl || candidateUrl,
+      };
+    } catch (error) {
+      if (
+        isDetailSecurityBlockError(error) ||
+        String(error?.message || '') === 'DETAIL_CAPTURE_CANCELED'
+      ) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+
+  const error = new Error(
+    lastError?.message || '无人值守未能重新定位到目标抖音作品详情页',
+  );
+  error.code = String(lastError?.code || 'DOUYIN_COMMENT_TARGET_NOT_READY');
+  error.cause = lastError || null;
+  throw error;
 }
 
 function isDetailSecurityBlockError(error) {
@@ -10546,6 +11916,7 @@ async function captureCommentsForCurrentNote({
   waitMinMs,
   waitMaxMs,
   stallTimeoutMs,
+  expectedNoteId = '',
 }) {
   const savedItems = Array.isArray(existingItems) ? existingItems : [];
   const commentCaptureIdentity = await ensureCommentCaptureIdentity({
@@ -10567,6 +11938,7 @@ async function captureCommentsForCurrentNote({
         waitMinMs,
         waitMaxMs,
         stallTimeoutMs,
+        expectedNoteId,
       },
     });
   } catch (error) {
@@ -10578,8 +11950,10 @@ async function captureCommentsForCurrentNote({
       stopReason: '',
       captureRequestId: commentCaptureIdentity.captureRequestId,
       runnerTabId: commentCaptureIdentity.runnerTabId,
+      noteId: '',
       cleanedItems: savedItems,
       mergedText: buildCommentsMergedText(savedItems),
+      errorCode: String(error?.code || 'CAPTURE_FAILED'),
       error: error?.message || '评论采集失败',
     };
   }
@@ -10602,9 +11976,33 @@ async function captureCommentsForCurrentNote({
       stopReason: '',
       captureRequestId: commentCaptureIdentity.captureRequestId,
       runnerTabId: commentCaptureIdentity.runnerTabId,
+      noteId: resolveCapturedDouyinCommentNoteId(result),
       cleanedItems: savedItems,
       mergedText: buildCommentsMergedText(savedItems),
+      errorCode: String(result?.error?.code || 'CAPTURE_FAILED'),
       error: result?.error?.message || '评论采集失败',
+    };
+  }
+
+  const capturedNoteId = resolveCapturedDouyinCommentNoteId(result);
+  const commentIdentityFailure = buildDouyinCommentIdentityFailure(
+    expectedNoteId,
+    capturedNoteId,
+  );
+  if (commentIdentityFailure) {
+    return {
+      status: COMMENT_CAPTURE_STATUS.FAILED,
+      stoppedByUser: false,
+      stoppedByStall: false,
+      stoppedByNetwork: false,
+      stopReason: '',
+      captureRequestId: commentCaptureIdentity.captureRequestId,
+      runnerTabId: commentCaptureIdentity.runnerTabId,
+      noteId: capturedNoteId,
+      cleanedItems: savedItems,
+      mergedText: buildCommentsMergedText(savedItems),
+      errorCode: commentIdentityFailure.code,
+      error: commentIdentityFailure.message,
     };
   }
 
@@ -10642,8 +12040,10 @@ async function captureCommentsForCurrentNote({
     stopReason,
     captureRequestId: commentCaptureIdentity.captureRequestId,
     runnerTabId: commentCaptureIdentity.runnerTabId,
+    noteId: capturedNoteId,
     cleanedItems,
     mergedText: buildCommentsMergedText(cleanedItems),
+    errorCode: '',
     error: stoppedByStall
       ? stoppedByNetwork
         ? '网络中断超过 2 分钟，已保留当前结果；联网后可继续采集'
@@ -10689,6 +12089,10 @@ async function captureCommentsForHydratedDetailRecord(
   const maxDetectedItems = normalizeCommentsMaxDetectedItems(
     settings.detailCommentsMaxDetectedItems ?? commentsMaxDetectedItems,
     settings.commentsMaxDetectedItems,
+  );
+  const expectedNoteId = resolveExpectedDouyinCommentNoteId(
+    record,
+    resolveRecordNoteUrl(record),
   );
   const startedAt = Date.now();
   const latestBeforeStart = (await getRecord(recordId)) || record;
@@ -10738,10 +12142,30 @@ async function captureCommentsForHydratedDetailRecord(
     waitMinMs: settings.sharedWaitMinMs,
     waitMaxMs: settings.sharedWaitMaxMs,
     stallTimeoutMs: settings.sharedStallTimeoutMs,
+    expectedNoteId,
   });
+  const commentIdentityFailure =
+    result.status !== COMMENT_CAPTURE_STATUS.FAILED ||
+    result.errorCode === 'DOUYIN_COMMENT_ID_MISMATCH'
+      ? buildDouyinCommentIdentityFailure(
+          expectedNoteId,
+          resolveCapturedDouyinCommentNoteId(result),
+        )
+      : null;
+  const mergeResult = commentIdentityFailure
+    ? {
+        ...result,
+        status: COMMENT_CAPTURE_STATUS.FAILED,
+        errorCode: commentIdentityFailure.code,
+        error: commentIdentityFailure.message,
+        cleanedItems: Array.isArray(capturingDetailPayload.commentsCleanedItems)
+          ? capturingDetailPayload.commentsCleanedItems
+          : [],
+      }
+    : result;
   let nextDetailPayload = applyCommentResultToSingleNotePayload(
     capturingDetailPayload,
-    result,
+    mergeResult,
   );
   const commentLeadsConfig = buildCommentLeadsConfigFromSettings({
     ...settings,
@@ -10765,8 +12189,8 @@ async function captureCommentsForHydratedDetailRecord(
     },
   });
 
-  const failed = result.status === COMMENT_CAPTURE_STATUS.FAILED;
-  const partial = result.status === COMMENT_CAPTURE_STATUS.PARTIAL;
+  const failed = mergeResult.status === COMMENT_CAPTURE_STATUS.FAILED;
+  const partial = mergeResult.status === COMMENT_CAPTURE_STATUS.PARTIAL;
   const phase = failed
     ? 'comments_failed'
     : partial
@@ -10778,23 +12202,26 @@ async function captureCommentsForHydratedDetailRecord(
       message: failed
         ? '评论采集失败，可在记录卡片继续'
         : partial
-          ? result.stoppedByStall
-            ? result.stoppedByNetwork
-              ? `网络中断超过 2 分钟，已保留 ${result.cleanedItems.length} 条；联网后可继续采集`
-              : `评论页面卡顿，已保留 ${result.cleanedItems.length} 条；可继续采集`
-            : `评论已手动停止并合并（${result.cleanedItems.length}条）`
-          : `评论已合并（${result.cleanedItems.length}条）`,
+          ? mergeResult.stoppedByStall
+            ? mergeResult.stoppedByNetwork
+              ? `网络中断超过 2 分钟，已保留 ${mergeResult.cleanedItems.length} 条；联网后可继续采集`
+              : `评论页面卡顿，已保留 ${mergeResult.cleanedItems.length} 条；可继续采集`
+            : `评论已手动停止并合并（${mergeResult.cleanedItems.length}条）`
+          : `评论已合并（${mergeResult.cleanedItems.length}条）`,
       recordId,
-      collectedCount: result.cleanedItems.length,
+      collectedCount: mergeResult.cleanedItems.length,
       captureRequestId: commentCaptureIdentity.captureRequestId,
       runnerTabId: commentCaptureIdentity.runnerTabId,
       captureAction: 'captureComments',
-      stoppedByUser: Boolean(result.stoppedByUser),
-      stoppedByStall: Boolean(result.stoppedByStall),
-      stoppedByNetwork: Boolean(result.stoppedByNetwork),
-      stopReason: String(result.stopReason || ''),
+      stoppedByUser: Boolean(mergeResult.stoppedByUser),
+      stoppedByStall: Boolean(mergeResult.stoppedByStall),
+      stoppedByNetwork: Boolean(mergeResult.stoppedByNetwork),
+      stopReason: String(mergeResult.stopReason || ''),
       error: failed
-        ? {code: 'CAPTURE_FAILED', message: result.error || '评论采集失败'}
+        ? {
+            code: mergeResult.errorCode || 'CAPTURE_FAILED',
+            message: mergeResult.error || '评论采集失败',
+          }
         : null,
     });
   }
@@ -10805,14 +12232,17 @@ async function captureCommentsForHydratedDetailRecord(
     recordId,
     captureRequestId: commentCaptureIdentity.captureRequestId,
     runnerTabId: commentCaptureIdentity.runnerTabId,
-    commentsCount: result.cleanedItems.length,
+    commentsCount: mergeResult.cleanedItems.length,
     partial,
-    stoppedByUser: Boolean(result.stoppedByUser),
-    stoppedByStall: Boolean(result.stoppedByStall),
-    stoppedByNetwork: Boolean(result.stoppedByNetwork),
-    stopReason: String(result.stopReason || ''),
+    stoppedByUser: Boolean(mergeResult.stoppedByUser),
+    stoppedByStall: Boolean(mergeResult.stoppedByStall),
+    stoppedByNetwork: Boolean(mergeResult.stoppedByNetwork),
+    stopReason: String(mergeResult.stopReason || ''),
     error: failed
-      ? {code: 'CAPTURE_FAILED', message: result.error || '评论采集失败'}
+      ? {
+          code: mergeResult.errorCode || 'CAPTURE_FAILED',
+          message: mergeResult.error || '评论采集失败',
+        }
       : null,
   };
 }
@@ -11652,6 +13082,7 @@ export async function batchCaptureByUrls({
  * @param {string} options.platform - 平台标识 ('xiaohongshu' | 'douyin')
  * @param {string} options.baseSearchUrl - 当前搜索页 URL（用于构建同平台搜索 URL）
  * @param {Object} options.captureParams - 传给 captureKeywordNotes 的参数
+ * @param {string} [options.captureTaskId] - 持久 Debug/工作页所属任务
  * @param {Function} [options.afterKeywordCapture] - 单个关键词入池后触发，可用于立即采集增强
  * @param {Function} [options.onKeywordSettled] - 单个关键词收口后触发，用于持久化无人值守检查点
  * @param {Function} [options.onProgress] - 进度回调 ({ current, total, keyword, phase })
@@ -11721,7 +13152,9 @@ export async function batchCaptureByKeywords({
   keywords = [],
   platform = '',
   baseSearchUrl = '',
+  sourceTabId = null,
   captureParams = {},
+  captureTaskId = '',
   searchFilters = null,
   afterKeywordCapture = null,
   onKeywordSettled = null,
@@ -11733,9 +13166,89 @@ export async function batchCaptureByKeywords({
     return { ok: true, results: [], stats: { total: 0, success: 0, failed: 0 } };
   }
 
-  const sourceTab = await getCurrentActiveTab();
+  const preferredSourceTabId = Number(sourceTabId);
+  let sourceTab = null;
+  if (Number.isSafeInteger(preferredSourceTabId) && preferredSourceTabId > 0) {
+    try {
+      sourceTab = await chrome.tabs.get(preferredSourceTabId);
+    } catch {
+      throw new Error('指定的无人值守采集页已关闭，任务已停止以免误采其它标签页');
+    }
+    if (!sourceTab?.id) {
+      throw new Error('指定的无人值守采集页不可用，任务已停止以免误采其它标签页');
+    }
+  } else {
+    sourceTab = await getCurrentActiveTab();
+  }
   const runnerCtx = await prepareDetailBatchRunnerContext({ sourceTab });
-  const { runnerTabId } = runnerCtx;
+  let runnerTabId = Number(runnerCtx.runnerTabId);
+  const runnerReplacementEvents = chrome?.tabs?.onReplaced || null;
+  const handleRunnerTabReplacement = (addedTabId, removedTabId) => {
+    const normalizedAddedTabId = Number(addedTabId);
+    const normalizedRemovedTabId = Number(removedTabId);
+    if (
+      normalizedRemovedTabId !== runnerTabId ||
+      !Number.isSafeInteger(normalizedAddedTabId) ||
+      normalizedAddedTabId <= 0
+    ) {
+      return;
+    }
+    runnerTabId = normalizedAddedTabId;
+    runnerCtx.runnerTabId = normalizedAddedTabId;
+    if (Number(runnerCtx.sourceTabId) === normalizedRemovedTabId) {
+      runnerCtx.sourceTabId = normalizedAddedTabId;
+    }
+  };
+  if (typeof runnerReplacementEvents?.addListener === 'function') {
+    runnerReplacementEvents.addListener(handleRunnerTabReplacement);
+  }
+  const readStopRequested = () => {
+    if (typeof shouldStop !== 'function') return false;
+    try {
+      return shouldStop() === true;
+    } catch {
+      // A broken stop predicate must never make an unattended task continue
+      // indefinitely. Treat it as an explicit stop request.
+      return true;
+    }
+  };
+  const isRecoverableKeywordInterruption = (value) => {
+    const error = value?.error && typeof value.error === 'object'
+      ? value.error
+      : null;
+    const code = String(
+      error?.code || value?.code || value?.reason || '',
+    ).trim().toUpperCase();
+    const category = String(value?.category || error?.category || '')
+      .trim()
+      .toLowerCase();
+    return Boolean(
+      value?.recoverable === true ||
+        value?.runnerInterrupted === true ||
+        category === 'context_interrupted' ||
+        new Set([
+          'CONTEXT_INTERRUPTED',
+          'RUNNER_TAB_UNAVAILABLE',
+          'TASK_TAB_GROUP_UNAVAILABLE',
+          'CAPTURE_TASK_SIDEBAR_OWNER_DISCONNECTED',
+          'SIDEBAR_OWNER_DISCONNECTED',
+          'NATIVE_DEBUG_CANCELED',
+          'SOURCE_TAB_REMOVED',
+        ]).has(code)
+    );
+  };
+  const isExplicitFatalKeywordFailure = (value) => {
+    const error = value?.error && typeof value.error === 'object'
+      ? value.error
+      : null;
+    const code = String(error?.code || value?.code || '').trim().toUpperCase();
+    return Boolean(
+      value?.fatal === true ||
+        error?.fatal === true ||
+        value?.stopBatch === true ||
+        code.startsWith('FATAL_')
+    );
+  };
   const externalOnProgress =
     typeof onProgress === 'function' ? onProgress : null;
   onProgress = externalOnProgress
@@ -11758,10 +13271,12 @@ export async function batchCaptureByKeywords({
   let failedCount = 0;
   let canceled = false;
   let securityBlocked = false;
+  let fatal = false;
+  let recoveryRequired = false;
 
   try {
   for (let i = 0; i < keywords.length; i++) {
-    if (typeof shouldStop === 'function' && shouldStop()) {
+    if (readStopRequested()) {
       canceled = true;
       break;
     }
@@ -11795,6 +13310,14 @@ export async function batchCaptureByKeywords({
       } else {
         // 导航到搜索页
         await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
+      }
+      if (captureTaskId) {
+        await setCaptureTaskTakeoverStateInTab({
+          tabId: runnerTabId,
+          taskId: captureTaskId,
+          active: true,
+          label: 'AI 正在接管',
+        });
       }
 
       // 等待页面渲染
@@ -11985,16 +13508,36 @@ export async function batchCaptureByKeywords({
         captureResult = captureRunResult?.captureResult || null;
       }
 
-      if (isCaptureCanceledResult(captureResult)) {
+      const captureCanceled = isCaptureCanceledResult(captureResult);
+      const captureFatal =
+        isExplicitFatalKeywordFailure(captureRunResult) ||
+        isExplicitFatalKeywordFailure(captureResult);
+      if (captureCanceled && readStopRequested()) {
         canceled = true;
         break;
       }
-      if (typeof shouldStop === 'function' && shouldStop()) {
+      if (!captureCanceled && readStopRequested()) {
         canceled = true;
         break;
       }
 
-      if (captureRunResult?.ok) {
+      if (captureCanceled) {
+        const canceledError =
+          captureRunResult?.error?.message ||
+          captureResult?.error?.message ||
+          '当前关键词采集环境临时中断';
+        keywordResult = {
+          keyword,
+          ok: false,
+          partial: true,
+          fatal: captureFatal,
+          recoverableInterruption: !captureFatal,
+          error: canceledError,
+        };
+        results.push(keywordResult);
+        failedCount++;
+        if (captureFatal) fatal = true;
+      } else if (captureRunResult?.ok) {
         const savedRecords = Array.isArray(captureRunResult.savedRecords)
           ? captureRunResult.savedRecords
           : [];
@@ -12038,6 +13581,7 @@ export async function batchCaptureByKeywords({
             keyword,
             ok: true,
             partial: true,
+            fatal: captureFatal,
             recordIds: partialRecordIds,
             captureCacheStats: captureRunResult?.captureCacheStats || null,
             warning:
@@ -12051,6 +13595,7 @@ export async function batchCaptureByKeywords({
           keywordResult = {
             keyword,
             ok: false,
+            fatal: captureFatal,
             error:
               captureRunResult?.error?.message ||
               captureResult?.error?.message ||
@@ -12059,20 +13604,27 @@ export async function batchCaptureByKeywords({
           results.push(keywordResult);
           failedCount++;
         }
+        if (captureFatal) fatal = true;
       }
     } catch (error) {
-      if (isBatchCaptureCanceledError(error)) {
+      const canceledError = isBatchCaptureCanceledError(error);
+      if (canceledError && readStopRequested()) {
         canceled = true;
         break;
       }
+      const fatalError = isExplicitFatalKeywordFailure(error);
       keywordResult = {
         keyword,
         ok: false,
-        error: error.message,
+        partial: canceledError,
+        recoverableInterruption: canceledError,
+        fatal: fatalError,
+        error: error?.message || '当前关键词采集失败',
         securityBlocked: isUnattendedSafetyBlock(error),
       };
       results.push(keywordResult);
       failedCount++;
+      if (fatalError) fatal = true;
     } finally {
       // captureAndSaveInTab owns its own checkpoint session.
     }
@@ -12092,7 +13644,10 @@ export async function batchCaptureByKeywords({
         )
       : [];
     const canRunAfterKeywordCapture =
-      !canceled && keywordResult?.ok && typeof afterKeywordCapture === 'function';
+      !canceled &&
+      !keywordResult?.fatal &&
+      keywordResult?.ok &&
+      typeof afterKeywordCapture === 'function';
     if (
       canRunAfterKeywordCapture &&
       keywordRecordIds.length === 0 &&
@@ -12110,7 +13665,9 @@ export async function batchCaptureByKeywords({
         runnerTabId,
       });
     }
-    let stopAfterKeyword = Boolean(keywordResult?.securityBlocked);
+    let stopAfterKeyword = Boolean(
+      keywordResult?.securityBlocked || keywordResult?.fatal,
+    );
     if (canRunAfterKeywordCapture && keywordRecordIds.length > 0) {
       keywordResult.enhanceStatus = 'running';
       if (onProgress) {
@@ -12158,17 +13715,47 @@ export async function batchCaptureByKeywords({
           canceled = true;
           stopAfterKeyword = true;
         }
+        if (!stopAfterKeyword && isExplicitFatalKeywordFailure(enhanceResult)) {
+          keywordResult.enhanceStatus = 'failed';
+          keywordResult.partial = true;
+          keywordResult.fatal = true;
+          keywordResult.warning =
+            enhanceResult?.error?.message ||
+            keywordResult.warning ||
+            '采集增强遇到不可恢复错误';
+          fatal = true;
+          stopAfterKeyword = true;
+        }
         if (
           !stopAfterKeyword &&
-          (
-            enhanceResult?.canceled ||
-            (typeof shouldStop === 'function' && shouldStop())
-          )
+          enhanceResult?.canceled
         ) {
+          const stopRequested = readStopRequested();
+          const recoverableInterruption =
+            isRecoverableKeywordInterruption(enhanceResult) || !stopRequested;
           keywordResult.enhanceStatus = 'failed';
-          keywordResult.canceled = true;
-          canceled = true;
-          stopAfterKeyword = true;
+          keywordResult.partial = true;
+          keywordResult.warning =
+            enhanceResult?.error?.message ||
+            enhanceResult?.message ||
+            keywordResult.warning ||
+            '当前关键词采集增强临时中断';
+          if (recoverableInterruption) {
+            keywordResult.canceled = false;
+            keywordResult.recoverableInterruption = true;
+            if (stopRequested) {
+              // The external environment has already invalidated this run (for
+              // example a transient runner/owner loss). Persist the current
+              // keyword as partial and let the unattended supervisor resume
+              // from the checkpoint instead of misreporting a user cancel.
+              keywordResult.recoveryRequired = true;
+              recoveryRequired = true;
+            }
+          } else {
+            keywordResult.canceled = true;
+            canceled = true;
+            stopAfterKeyword = true;
+          }
         }
         if (!stopAfterKeyword && enhanceResult && enhanceResult.ok === false) {
           keywordResult.enhanceStatus = 'failed';
@@ -12179,7 +13766,8 @@ export async function batchCaptureByKeywords({
           keywordResult.enhanceStatus = 'done';
         }
       } catch (error) {
-        if (isBatchCaptureCanceledError(error)) {
+        const canceledError = isBatchCaptureCanceledError(error);
+        if (canceledError && readStopRequested()) {
           keywordResult.enhanceStatus = 'failed';
           keywordResult.canceled = true;
           canceled = true;
@@ -12189,10 +13777,18 @@ export async function batchCaptureByKeywords({
           keywordResult.partial = true;
           keywordResult.warning =
             error?.message || keywordResult.warning || '采集增强失败';
+          if (canceledError) {
+            keywordResult.canceled = false;
+            keywordResult.recoverableInterruption = true;
+          }
           if (isUnattendedSafetyBlock(error)) {
             keywordResult.securityBlocked = true;
             securityBlocked = true;
             canceled = true;
+            stopAfterKeyword = true;
+          } else if (isExplicitFatalKeywordFailure(error)) {
+            keywordResult.fatal = true;
+            fatal = true;
             stopAfterKeyword = true;
           }
           if (onProgress) {
@@ -12223,7 +13819,7 @@ export async function batchCaptureByKeywords({
       });
     }
 
-    if (stopAfterKeyword) {
+    if (stopAfterKeyword || recoveryRequired) {
       break;
     }
 
@@ -12286,6 +13882,8 @@ export async function batchCaptureByKeywords({
     ok: !canceled && failedCount === 0,
     canceled,
     securityBlocked,
+    fatal,
+    recoveryRequired,
     results,
     stats: {
       total: keywords.length,
@@ -12295,10 +13893,20 @@ export async function batchCaptureByKeywords({
     },
   };
   } finally {
+    if (typeof runnerReplacementEvents?.removeListener === 'function') {
+      runnerReplacementEvents.removeListener(handleRunnerTabReplacement);
+    }
     // 检查点持久化或外部回调失败时也必须恢复 runner 原页，避免页面永久停在半途关键词。
     if (runnerCtx.shouldRestoreSourcePage && runnerCtx.sourcePageUrl) {
       try {
-        await chrome.tabs.update(runnerTabId, { url: runnerCtx.sourcePageUrl });
+        const currentTab = await chrome.tabs.get(runnerTabId);
+        const currentUrl = normalizeUrlWithoutHash(currentTab?.url);
+        const sourceUrl = normalizeUrlWithoutHash(runnerCtx.sourcePageUrl);
+        if (currentUrl !== sourceUrl) {
+          await chrome.tabs.update(runnerTabId, {
+            url: runnerCtx.sourcePageUrl,
+          });
+        }
       } catch {
         // ignore restore failure
       }
@@ -13857,6 +15465,7 @@ function buildContentRequest(mode, captureParams = {}) {
     case 'comments':
       return {
         action: 'captureComments',
+        expectedNoteId: String(captureParams.expectedNoteId || ''),
         onlyLevel1: Boolean(captureParams.onlyLevel1),
         maxDetectedItems:
           captureParams.maxDetectedItems ?? captureParams.maxItems,

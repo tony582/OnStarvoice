@@ -35,6 +35,9 @@ import keywordOpportunityRouter, { keywordAnalysisRouter, benchmarkDiscoveryRout
 import contentRouter from './routes/content.js';
 import imageProxyRouter from './routes/image-proxy.js';
 import ticketsRouter from './routes/tickets.js';
+import feedbackRouter from './routes/feedback.js';
+import customTagsRouter from './routes/custom-tags.js';
+import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
 import { ensureMediaDirs, backfillRecentCovers, MEDIA_DIR } from './services/media-store.js';
 
@@ -131,6 +134,9 @@ app.use('/api/benchmark-discovery', benchmarkDiscoveryRouter);
 app.use('/api/content', contentRouter);
 app.use('/api/img', imageProxyRouter);
 app.use('/api/tickets', ticketsRouter);
+app.use('/api/feedback', feedbackRouter);
+app.use('/api/custom-tags', customTagsRouter);
+app.use('/api/relevance/prefilter', relevancePrefilterRouter);
 // 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
 app.use('/api/asr-media', asrMediaRouter);
 

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
   ExternalLink, User, FileText, Camera, Bell, Archive, Eye, Sparkles, ZoomIn,
+  Pencil, Ban, ArrowLeft,
 } from 'lucide-react'
 
 // 详情面板可拖宽,停靠右侧(Asana 式)
@@ -12,19 +13,48 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
+import {
+  RecordLabelChips, RecordLabelEditor, RecordLabelsHeading,
+} from '@/components/shared/RecordLabels'
+import { tagsFromRecord, type CustomTag, type CustomTagPatch } from '@/lib/custom-tags'
 
 /**
  * 舆情内容详情抽屉(帖子/评论/官方响应/采集快照 四 tab)。
  * 纯展示 + 回调:抽屉持有的是列表行快照,所有写操作由调用方持有,成功后由调用方
  * reload 列表并关闭抽屉(无单条 GET 端点可回灌)。从舆情收件箱提取以供多队列复用。
  */
-export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetStatus, onMarkResponded }: {
+export interface ManualRecordFields {
+  sentiment?: string
+  category?: string
+  identityOverride?: string
+  publishTime?: string
+  reason?: string
+}
+
+type AsyncDrawerAction = () => Promise<boolean | void> | boolean | void
+
+export function RecordDrawer({
+  record: r,
+  onClose,
+  canWrite,
+  onLinkIssue,
+  onSetStatus,
+  onMarkResponded,
+  onFalsePositive,
+  onUpdateFields,
+  customTagCatalog = [],
+  onUpdateCustomTags,
+}: {
   record: any
   onClose: () => void
   canWrite: boolean
   onLinkIssue: () => void
-  onSetStatus?: (status: string) => void
-  onMarkResponded?: () => void
+  onSetStatus?: (status: string) => Promise<boolean | void> | boolean | void
+  onMarkResponded?: AsyncDrawerAction
+  onFalsePositive?: AsyncDrawerAction
+  onUpdateFields?: (fields: ManualRecordFields) => Promise<boolean | void> | boolean | void
+  customTagCatalog?: CustomTag[]
+  onUpdateCustomTags?: (patch: CustomTagPatch) => Promise<CustomTag[]>
 }) {
   const [tab, setTab] = useState<'content' | 'comments' | 'official' | 'snapshot'>('content')
   const [comments, setComments] = useState<any[]>([])
@@ -32,6 +62,15 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   const [observations, setObservations] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [lightbox, setLightbox] = useState<string>('') // 点击放大的图片 URL(''=关闭)
+  const [editingJudgement, setEditingJudgement] = useState(false)
+  const [editingLabels, setEditingLabels] = useState(false)
+  const [editDraft, setEditDraft] = useState(() => manualDraft(r))
+  const [editError, setEditError] = useState('')
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [savingLabels, setSavingLabels] = useState(false)
+  const [statusBusy, setStatusBusy] = useState(false)
+  const [falsePositiveBusy, setFalsePositiveBusy] = useState(false)
+  const [actionError, setActionError] = useState('')
   const panelRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
@@ -51,10 +90,17 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   }, [r.id])
 
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') { if (lightbox) setLightbox(''); else onClose() } }
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels) return
+      if (editingLabels) setEditingLabels(false)
+      else if (editingJudgement) setEditingJudgement(false)
+      else if (lightbox) setLightbox('')
+      else onClose()
+    }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [onClose, lightbox])
+  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, statusBusy])
 
   // 把停靠宽度写入 CSS 变量,主内容据此让出右边
   useEffect(() => {
@@ -98,7 +144,79 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
     window.addEventListener('mouseup', onUp)
   }
 
+  const resolvedIdentity = identityLabel(r.source_type, r.author_fans, r.author_name, r.identity_override)
+
+  const openJudgementEditor = () => {
+    setEditDraft(manualDraft(r))
+    setEditError('')
+    setActionError('')
+    setEditingLabels(false)
+    setEditingJudgement(true)
+  }
+
+  const saveJudgement = async () => {
+    if (!onUpdateFields) return
+    const original = manualDraft(r)
+    const changes: ManualRecordFields = {}
+    let changed = false
+
+    if (editDraft.sentiment !== original.sentiment) { changes.sentiment = editDraft.sentiment; changed = true }
+    if (editDraft.category !== original.category) { changes.category = editDraft.category; changed = true }
+    if (editDraft.identityOverride !== original.identityOverride) { changes.identityOverride = editDraft.identityOverride; changed = true }
+    if (editDraft.publishTime !== original.publishTime) { changes.publishTime = editDraft.publishTime; changed = true }
+
+    if (!changed) {
+      setEditError('请至少修改一项判断后再保存')
+      return
+    }
+    const reason = editDraft.reason.trim()
+    if (reason) changes.reason = reason
+
+    setSavingEdit(true)
+    setEditError('')
+    try {
+      const result = await onUpdateFields(changes)
+      if (result !== false) setEditingJudgement(false)
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : '保存失败，请稍后重试')
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+
+  const runStatusAction = async (action?: AsyncDrawerAction) => {
+    if (!action) return
+    setStatusBusy(true)
+    setActionError('')
+    try {
+      await action()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '操作失败，请稍后重试')
+    } finally {
+      setStatusBusy(false)
+    }
+  }
+
+  const setStatus = async (status: string) => {
+    if (!onSetStatus) return
+    await runStatusAction(() => onSetStatus(status))
+  }
+
+  const markFalsePositive = async () => {
+    if (!onFalsePositive) return
+    setFalsePositiveBusy(true)
+    setActionError('')
+    try {
+      await onFalsePositive()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '标记误报失败，请稍后重试')
+    } finally {
+      setFalsePositiveBusy(false)
+    }
+  }
+
   const images = getImages(r)
+  const customTags = tagsFromRecord(r)
   // 封面优先用本地化副本(/media,静态可靠、不走代理);只有无本地副本才回落 CDN 代理。
   // 之前用 images[0]=proxiedImg(cover_url) 总是绕道 /api/img,白白放着 cover_local 不用。
   const cover = getCover(r) || images[0] || ''
@@ -116,26 +234,29 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
   ]
 
   return (
-    <div ref={panelRef} style={{ width }}
-      className="fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
+    <div ref={panelRef} style={{ width }} role="dialog" aria-modal="true" aria-label="舆情内容详情"
+      className="detail-drawer fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
       {/* 拖拽分隔条:贯穿到顶,与 banner 一体;hover 出蓝线(Asana) */}
       <div onMouseDown={startResize} title="拖动调整宽度"
-        className="group absolute left-0 top-0 z-30 flex h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center">
+        className="group absolute left-0 top-0 z-30 hidden h-full w-2.5 -translate-x-1/2 cursor-col-resize justify-center lg:flex">
         <span className="h-full w-px bg-transparent transition-all group-hover:w-[3px] group-hover:bg-primary" />
       </div>
       <div className="relative z-10 flex h-full w-full flex-col">
 
         {/* Header */}
-        <div className="flex h-14 items-center gap-3 border-b border-border/50 px-6">
-          <h2 className="text-base font-bold">舆情内容详情</h2>
+        <div className="flex min-h-14 items-center gap-2 border-b border-border/50 px-2 pt-[env(safe-area-inset-top)] sm:gap-3 sm:px-6">
+          <button onClick={onClose} aria-label="返回内容列表" disabled={savingEdit || savingLabels || statusBusy || falsePositiveBusy}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground transition active:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
+          <h2 className="min-w-0 truncate text-[15px] font-bold sm:text-base">舆情内容详情</h2>
           {r.triage_status && <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>}
-          <button onClick={onClose} className="ml-auto rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || statusBusy || falsePositiveBusy}
+            className="ml-auto hidden rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:block"><X className="h-5 w-5" /></button>
         </div>
 
         {/* Scrollable body */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto overscroll-contain">
           {/* Hero */}
-          <div className="border-b border-border/50 p-6">
+          <div className="border-b border-border/50 p-4 sm:p-6">
             <div className="flex gap-4">
               {cover ? (
                 <button type="button" onClick={() => setLightbox(cover)} title="点击放大"
@@ -149,8 +270,14 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
-                  {identityLabel(r.source_type, r.author_fans, r.author_name) && (
-                    <Tooltip text="疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除"><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(identityLabel(r.source_type, r.author_fans, r.author_name)) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{identityLabel(r.source_type, r.author_fans, r.author_name)}</span></Tooltip>
+                  {resolvedIdentity && (
+                    <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
+                  )}
+                  {canWrite && onUpdateFields && (
+                    <button type="button" onClick={openJudgementEditor}
+                      className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 text-[11px] font-semibold text-muted-foreground transition-colors hover:border-primary/40 hover:bg-accent hover:text-primary">
+                      <Pencil className="h-3 w-3" />编辑判断
+                    </button>
                   )}
                 </div>
                 <h3 className="text-[15px] font-bold leading-snug">{r.title || String(r.content || '').replace(/\s+/g, ' ').trim().slice(0, 40) || '(无标题)'}</h3>
@@ -169,6 +296,43 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
                   {r.publish_display && <span className="text-[12px] text-muted-foreground">发布于 {r.publish_display}</span>}
                 </div>
               </div>
+            </div>
+
+            <div className="mt-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <RecordLabelsHeading />
+                {customTags.length > 0 ? (
+                  <RecordLabelChips tags={customTags} />
+                ) : (
+                  <span className="text-[11px] text-muted-foreground/60">暂无</span>
+                )}
+                {canWrite && onUpdateCustomTags && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingJudgement(false)
+                      setEditingLabels(open => !open)
+                    }}
+                    className={cn(
+                      'inline-flex h-6 items-center rounded-md border px-2 text-[10.5px] font-semibold transition-colors',
+                      editingLabels
+                        ? 'border-primary/30 bg-accent text-primary'
+                        : 'border-border text-muted-foreground hover:border-primary/30 hover:bg-accent hover:text-primary',
+                    )}
+                  >
+                    {editingLabels ? '收起管理' : '管理标签'}
+                  </button>
+                )}
+              </div>
+              {editingLabels && onUpdateCustomTags && (
+                <RecordLabelEditor
+                  initialTags={customTags}
+                  catalog={customTagCatalog}
+                  onSave={onUpdateCustomTags}
+                  onCancel={() => setEditingLabels(false)}
+                  onSavingChange={setSavingLabels}
+                />
+              )}
             </div>
 
             {/* 风险信号条:与列表一致,深看再加最近负评时间 */}
@@ -194,7 +358,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
             )}
 
             {/* 互动指标:无框,标签—数值靠留白排开(Asana 式)*/}
-            <div className="mt-4 grid grid-cols-4">
+            <div className="mt-4 grid grid-cols-2 sm:grid-cols-4">
               <Metric icon={Heart} label="点赞" value={r.likes} />
               <Metric icon={MessageCircle} label="评论" value={r.comments_count} />
               <Metric icon={Star} label="收藏" value={r.collects} />
@@ -203,10 +367,10 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
           </div>
 
           {/* Tabs */}
-          <div className="flex border-b border-border/50 px-6">
+          <div className="mobile-table-scroll flex overflow-x-auto border-b border-border/50 px-1 sm:px-6">
             {TABS.map(t => (
               <button key={t.id} onClick={() => setTab(t.id)}
-                className={cn('flex items-center gap-1.5 border-b-2 px-4 py-3 text-sm font-semibold transition-colors',
+                className={cn('flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-3 text-sm font-semibold transition-colors sm:px-4',
                   tab === t.id ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground')}>
                 <t.icon className="h-3.5 w-3.5" />
                 {t.label}
@@ -215,7 +379,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
           </div>
 
           {/* Tab panels */}
-          <div className="p-6">
+          <div className="p-4 sm:p-6">
             {loading ? (
               <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
             ) : (
@@ -346,7 +510,7 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
 
         {/* 处理留痕:状态 / 处理人 / 时间 / 备注 */}
         {(r.triage_note || r.triage_owner_name) && (
-          <div className="border-t border-border/50 bg-muted/30 px-6 py-3 text-[12px]">
+          <div className="border-t border-border/50 bg-muted/30 px-4 py-3 text-[12px] sm:px-6">
             <div className="font-semibold text-muted-foreground">处理留痕</div>
             <div className="mt-1 space-y-0.5 text-muted-foreground">
               <div>
@@ -361,25 +525,160 @@ export function RecordDrawer({ record: r, onClose, canWrite, onLinkIssue, onSetS
 
         {/* Footer actions */}
         {canWrite && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-border/50 px-6 py-4">
-            {onMarkResponded && <Button variant="outline" size="sm" onClick={onMarkResponded}><CheckCircle className="h-3.5 w-3.5" />标为已响应</Button>}
-            {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('reviewing')}><Eye className="h-3.5 w-3.5" />待复核</Button>}
-            {onSetStatus && <Button variant="outline" size="sm" onClick={() => onSetStatus('archived')}><Archive className="h-3.5 w-3.5" />归档</Button>}
-            <Button className="ml-auto" onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转工单</Button>
+          <div className="grid grid-cols-2 items-center gap-2 border-t border-border/50 bg-card px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:flex lg:flex-wrap sm:px-6 sm:py-4">
+            {onMarkResponded && <Button variant="outline" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={() => runStatusAction(onMarkResponded)}>{statusBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle className="h-3.5 w-3.5" />}标为已响应</Button>}
+            {onSetStatus && <Button variant="outline" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={() => setStatus('reviewing')}><Eye className="h-3.5 w-3.5" />待复核</Button>}
+            {onSetStatus && <Button variant="outline" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={() => setStatus('archived')}><Archive className="h-3.5 w-3.5" />归档</Button>}
+            {onFalsePositive && (
+              <Button variant="outline" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={markFalsePositive}
+                className="border-rose-300 text-rose-600 hover:border-rose-400 hover:bg-rose-50 hover:text-rose-700 dark:border-rose-800 dark:text-rose-300 dark:hover:bg-rose-950/30">
+                {falsePositiveBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}误报
+              </Button>
+            )}
+            <Button className="order-first col-span-2 w-full lg:order-none lg:col-span-1 lg:ml-auto lg:w-auto" disabled={statusBusy || falsePositiveBusy} onClick={onLinkIssue}><LinkIcon className="h-4 w-4" />转工单</Button>
+            {actionError && <div className="col-span-2 text-[12px] font-medium text-destructive lg:basis-full">{actionError}</div>}
           </div>
         )}
       </div>
 
+      {editingJudgement && (
+        <JudgementEditor
+          draft={editDraft}
+          currentIdentity={identityLabel(r.source_type, r.author_fans, r.author_name)}
+          error={editError}
+          saving={savingEdit}
+          onChange={draft => {
+            setEditDraft(draft)
+            if (editError) setEditError('')
+          }}
+          onCancel={() => { if (!savingEdit) setEditingJudgement(false) }}
+          onSave={saveJudgement}
+        />
+      )}
+
       {/* 图片放大 lightbox:页内浮层,点背景 / × / Esc 关闭,不开新窗口 */}
       {lightbox && (
         <div onClick={() => setLightbox('')}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-8 animate-in fade-in duration-150">
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-8 animate-in fade-in duration-150">
           <button type="button" onClick={() => setLightbox('')} title="关闭(Esc)"
             className="absolute right-5 top-5 rounded-full bg-white/10 p-2 text-white transition hover:bg-white/20"><X className="h-5 w-5" /></button>
           <img src={lightbox} alt="" referrerPolicy="no-referrer" onClick={e => e.stopPropagation()}
             className="max-h-[90vh] max-w-[90vw] cursor-default rounded-lg object-contain shadow-2xl" />
         </div>
       )}
+    </div>
+  )
+}
+
+interface ManualEditDraft {
+  sentiment: string
+  category: string
+  identityOverride: string
+  publishTime: string
+  reason: string
+}
+
+function dateInputValue(record: any): string {
+  const values = [record?.publish_display, record?.publish_time]
+  for (const value of values) {
+    const match = String(value || '').match(/\d{4}-\d{2}-\d{2}/)
+    if (match) return match[0]
+  }
+  return ''
+}
+
+function manualDraft(record: any): ManualEditDraft {
+  return {
+    sentiment: String(record?.sentiment || ''),
+    category: String(record?.category || ''),
+    identityOverride: String(record?.identity_override || ''),
+    publishTime: dateInputValue(record),
+    reason: '',
+  }
+}
+
+function JudgementEditor({ draft, currentIdentity, error, saving, onChange, onCancel, onSave }: {
+  draft: ManualEditDraft
+  currentIdentity: string
+  error: string
+  saving: boolean
+  onChange: (draft: ManualEditDraft) => void
+  onCancel: () => void
+  onSave: () => void
+}) {
+  const controlClass = 'mt-1.5 h-11 w-full rounded-lg border border-border bg-background px-3 text-[13px] text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15 lg:h-9'
+  return (
+    <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4 animate-in fade-in duration-150" onMouseDown={onCancel}>
+      <div className="max-h-[calc(100dvh-1.5rem)] w-full max-w-xl overflow-y-auto rounded-2xl border border-border bg-card p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl sm:rounded-xl sm:p-5 animate-in zoom-in-95 duration-150" onMouseDown={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3">
+          <div>
+            <h3 className="text-sm font-bold">编辑判断</h3>
+            <p className="mt-1 text-[12px] leading-5 text-muted-foreground">人工修正将用于后台展示与后续统计；疑似身份选择“沿用 AI”可取消人工覆盖。</p>
+          </div>
+          <button type="button" onClick={onCancel} disabled={saving}
+            className="ml-auto rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground disabled:opacity-50">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <label className="text-[12px] font-semibold text-muted-foreground">
+            情感
+            <select value={draft.sentiment} onChange={e => onChange({ ...draft, sentiment: e.target.value })} className={controlClass}>
+              <option value="" disabled>待标注</option>
+              <option value="positive">正面</option>
+              <option value="neutral">中性</option>
+              <option value="negative">负面</option>
+            </select>
+          </label>
+          <label className="text-[12px] font-semibold text-muted-foreground">
+            分类
+            <select value={draft.category} onChange={e => onChange({ ...draft, category: e.target.value })} className={controlClass}>
+              <option value="" disabled>待分类</option>
+              <option value="safety_rescue">安全救援</option>
+              <option value="feature_usage">功能使用</option>
+              <option value="renewal_billing">续费收费</option>
+              <option value="privacy">隐私安全</option>
+              <option value="app_issue">App问题</option>
+              <option value="service_quality">服务质量</option>
+              <option value="brand_image">品牌形象</option>
+              <option value="other">其他</option>
+            </select>
+          </label>
+          <label className="text-[12px] font-semibold text-muted-foreground">
+            疑似身份
+            <select value={draft.identityOverride} onChange={e => onChange({ ...draft, identityOverride: e.target.value })} className={controlClass}>
+              <option value="">沿用 AI{currentIdentity ? `（当前：${currentIdentity}）` : ''}</option>
+              <option value="user">用户</option>
+              <option value="kol">KOL / KOC</option>
+              <option value="dealer">4S店</option>
+              <option value="koe">KOE</option>
+              <option value="other">其他</option>
+            </select>
+          </label>
+          <label className="text-[12px] font-semibold text-muted-foreground">
+            发布日期
+            <input type="date" value={draft.publishTime} onChange={e => onChange({ ...draft, publishTime: e.target.value })} className={controlClass} />
+          </label>
+        </div>
+
+        <label className="mt-4 block text-[12px] font-semibold text-muted-foreground">
+          修改说明 <span className="font-normal">（选填）</span>
+          <textarea value={draft.reason} onChange={e => onChange({ ...draft, reason: e.target.value })}
+            placeholder="例如：原文语气为中性；账号实际为经销商；平台日期识别错误"
+            rows={3}
+            className="mt-1.5 w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-[13px] leading-6 text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15" />
+        </label>
+
+        {error && <p className="mt-2 text-[12px] font-medium text-destructive">{error}</p>}
+        <div className="mt-5 grid grid-cols-2 gap-2 sm:flex sm:items-center sm:justify-end">
+          <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>取消</Button>
+          <Button size="sm" onClick={onSave} disabled={saving}>
+            {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            保存修改
+          </Button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -573,11 +872,20 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
   )
 }
 
-function TranscriptInsights({ data }: { data: any }) {
+type TranscriptAnalysis = {
+  stance?: unknown
+  summary?: unknown
+  keyPoints?: unknown
+  issues?: unknown
+  userNeeds?: unknown
+  risk?: unknown
+}
+
+function TranscriptInsights({ data }: { data: TranscriptAnalysis }) {
   const stance = String(data?.stance || '').toLowerCase()
   const stanceTone = stance === 'positive' ? 'positive' : stance === 'negative' ? 'negative' : 'neutral'
   const stanceLabel = stance === 'positive' ? '正面' : stance === 'negative' ? '负面' : '中性'
-  const toList = (v: any): string[] => Array.isArray(v) ? v.filter(Boolean).map(String) : (v ? [String(v)] : [])
+  const toList = (v: unknown): string[] => Array.isArray(v) ? v.filter(Boolean).map(String) : (v ? [String(v)] : [])
   const keyPoints = toList(data?.keyPoints)
   const issues = toList(data?.issues)
   const userNeeds = toList(data?.userNeeds)
@@ -585,11 +893,11 @@ function TranscriptInsights({ data }: { data: any }) {
     <div className="space-y-2.5 text-sm">
       <div className="flex flex-wrap items-center gap-2">
         <StatusBadge tone={stanceTone}>{stanceLabel}</StatusBadge>
-        {data?.summary && <span>{String(data.summary)}</span>}
+        {Boolean(data?.summary) && <span>{String(data.summary)}</span>}
       </div>
       {keyPoints.length > 0 && <InsightList label="核心观点" items={keyPoints} />}
       {issues.length > 0 && <InsightList label="涉及槽点" items={issues} warn />}
-      {data?.risk && (
+      {Boolean(data?.risk) && (
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">品牌风险</div>
           <p className="mt-0.5 leading-relaxed">{String(data.risk)}</p>

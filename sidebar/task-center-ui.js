@@ -434,7 +434,6 @@ function buildFallbackLegacyTaskItems({syncEntries, monitorExecutions, plan, req
   });
   for (const [key, group] of monitorGroups) {
     const first = group[0] || {};
-    const hasRunning = group.some((entry) => String(entry?.status || "") === "running");
     const failedCount = group.filter((entry) =>
       ["failed", "error"].includes(String(entry?.status || "")),
     ).length;
@@ -443,7 +442,7 @@ function buildFallbackLegacyTaskItems({syncEntries, monitorExecutions, plan, req
       id: `legacy-monitor-${key}`,
       type: "monitor",
       name: group.length > 1 ? `博主监控批次（${group.length} 个账号）` : String(first.bloggerName || "博主监控"),
-      status: hasRunning ? "running" : failedCount === group.length ? "failed" : failedCount > 0 ? "partial" : "completed",
+      status: failedCount === group.length ? "failed" : failedCount > 0 ? "partial" : "completed",
       platform: first.platform || "unknown",
       trigger: "monitor_backend",
       startedAt: first.startedAt,
@@ -556,12 +555,21 @@ export function buildTaskCenterItems({
   }
 
   const normalizedLedger = ledgerRuns.map(normalizeTaskCenterItem);
+  const clearedAt = normalizeTaskCenterTimestamp(ledgerState.clearedAt);
   const activeLegacyRequestId = String(
     legacyState.request?.id || legacyState.request?.requestId || "",
   ).trim();
   const normalizedLegacy = legacyItems
     .map(normalizeTaskCenterItem)
     .filter((legacyItem) => {
+      const legacyTime =
+        legacyItem.finishedAt || legacyItem.updatedAt || legacyItem.startedAt;
+      if (
+        clearedAt &&
+        (!legacyTime || legacyTime <= clearedAt)
+      ) {
+        return false;
+      }
       if (
         activeLegacyRequestId &&
         legacyItem.type === "keyword" &&
@@ -570,8 +578,6 @@ export function buildTaskCenterItems({
         return false;
       }
       if (legacyItem.type !== "sync") return true;
-      const legacyTime =
-        legacyItem.finishedAt || legacyItem.updatedAt || legacyItem.startedAt;
       return !normalizedLedger.some((run) => {
         if (run.type !== "sync" || !legacyTime) return false;
         const compatiblePlatform =

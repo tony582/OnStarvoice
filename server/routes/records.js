@@ -1,13 +1,97 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
-import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { requireSessionUser, requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
 import { collectRecordMediaUrls, isAllowedMediaHost, streamMediaToResponse } from '../services/media-proxy.js';
+import {
+  applyRecordCustomTagPatch,
+  validateCustomTagPatch,
+} from '../services/record-custom-tags.js';
+import { insertRecordFeedback, normalizeFeedbackReason } from '../services/record-feedback.js';
 import { startTranscription } from '../services/transcription.js';
 import { analyzeTranscript } from '../services/transcript-analysis.js';
 import { formatPublishDate } from '../services/publish-date.js';
 
 const router = Router();
+
+const MANUAL_SENTIMENTS = new Set(['positive', 'neutral', 'negative']);
+const MANUAL_CATEGORIES = new Set([
+  'safety_rescue', 'feature_usage', 'renewal_billing', 'privacy',
+  'app_issue', 'service_quality', 'brand_image', 'other',
+]);
+const MANUAL_IDENTITIES = new Set(['', 'user', 'kol', 'dealer', 'koe', 'other']);
+const MANUAL_INPUT_KEYS = new Set(['sentiment', 'category', 'identityOverride', 'publishTime', 'reason']);
+
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function validDateOnly(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+export function validateManualFields(body = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'invalid_request', message: '请求内容无效' };
+  }
+  const unknown = Object.keys(body).filter(key => !MANUAL_INPUT_KEYS.has(key));
+  if (unknown.length) {
+    return { ok: false, error: 'unsupported_fields', message: `不支持修改字段: ${unknown.join(', ')}` };
+  }
+
+  const values = {};
+  const providedFields = [];
+  if (hasOwn(body, 'sentiment')) {
+    const sentiment = String(body.sentiment || '').trim();
+    if (!MANUAL_SENTIMENTS.has(sentiment)) {
+      return { ok: false, error: 'invalid_sentiment', message: '情感值无效' };
+    }
+    values.sentiment = sentiment;
+    providedFields.push('sentiment');
+  }
+  if (hasOwn(body, 'category')) {
+    const category = String(body.category || '').trim();
+    if (!MANUAL_CATEGORIES.has(category)) {
+      return { ok: false, error: 'invalid_category', message: '内容分类无效' };
+    }
+    values.category = category;
+    providedFields.push('category');
+  }
+  if (hasOwn(body, 'identityOverride')) {
+    const identityOverride = String(body.identityOverride ?? '').trim();
+    if (!MANUAL_IDENTITIES.has(identityOverride)) {
+      return { ok: false, error: 'invalid_identity', message: '身份值无效' };
+    }
+    values.identityOverride = identityOverride;
+    providedFields.push('identityOverride');
+  }
+  if (hasOwn(body, 'publishTime')) {
+    const publishTime = String(body.publishTime ?? '').trim();
+    if (publishTime && !validDateOnly(publishTime)) {
+      return { ok: false, error: 'invalid_publish_time', message: '发布日期需为 YYYY-MM-DD 格式' };
+    }
+    values.publishTime = publishTime;
+    providedFields.push('publishTime');
+  }
+  if (providedFields.length === 0) {
+    return { ok: false, error: 'empty_update', message: '没有要更新的字段' };
+  }
+
+  const reasonResult = normalizeFeedbackReason(body.reason, { required: false });
+  if (!reasonResult.ok) return reasonResult;
+  return { ok: true, values, providedFields, reason: reasonResult.value };
+}
+
+export function publishTimestampFromDate(value) {
+  const date = String(value || '').trim();
+  return date ? new Date(`${date}T00:00:00+08:00`).toISOString() : null;
+}
 
 const RECORD_TABLE_TYPES = {
   single_notes: ['single_note', ''],
@@ -246,6 +330,240 @@ router.get('/:id/comments', requireTenantAccess, async (req, res, next) => {
     comments.forEach(c => { c.publish_display = formatPublishDate(c.published_at, c.created_at); });
     return res.json({ ok: true, comments, officialResponses });
   } catch (err) {
+    return next(err);
+  }
+});
+
+router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const validated = validateManualFields(req.body || {});
+    if (!validated.ok) {
+      return res.status(400).json({ ok: false, error: validated.error, message: validated.message });
+    }
+
+    const actorUserId = req.user?.id || null;
+    const actorName = req.actorName || req.user?.name || req.user?.email || '';
+    const updatedAt = new Date().toISOString();
+
+    const result = await withTransaction(async tx => {
+      const record = await tx.queryOne(
+        'SELECT * FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+        [req.params.id, req.tenantId],
+      );
+      if (!record) return null;
+
+      const changedFields = [];
+      const originalValues = {};
+      const correctedValues = {};
+      const overridePatch = {};
+      const values = validated.values;
+
+      const addChange = (field, before, after) => {
+        changedFields.push(field);
+        originalValues[field] = before ?? null;
+        correctedValues[field] = after ?? null;
+        overridePatch[field] = {
+          value: after ?? null,
+          updatedByUserId: actorUserId,
+          updatedByName: actorName,
+          updatedAt,
+          reason: validated.reason,
+        };
+      };
+
+      if (validated.providedFields.includes('sentiment') && String(record.sentiment || '') !== values.sentiment) {
+        addChange('sentiment', record.sentiment || '', values.sentiment);
+      }
+      if (validated.providedFields.includes('category') && String(record.category || '') !== values.category) {
+        addChange('category', record.category || '', values.category);
+      }
+      if (validated.providedFields.includes('identityOverride')
+        && String(record.identity_override || '') !== values.identityOverride) {
+        addChange('identity_override', record.identity_override || '', values.identityOverride);
+      }
+
+      let publishedTs = record.published_ts || null;
+      if (validated.providedFields.includes('publishTime')) {
+        publishedTs = publishTimestampFromDate(values.publishTime);
+        const currentPublishedTs = record.published_ts ? new Date(record.published_ts).toISOString() : null;
+        if (String(record.publish_time || '') !== values.publishTime || currentPublishedTs !== publishedTs) {
+          addChange('publish_time', record.publish_time || '', values.publishTime);
+          changedFields.push('published_ts');
+          originalValues.published_ts = record.published_ts || null;
+          correctedValues.published_ts = publishedTs;
+        }
+      }
+
+      if (changedFields.length === 0) {
+        return { record, feedbackId: null, changedFields: [], unchanged: true };
+      }
+
+      const updateSentiment = changedFields.includes('sentiment');
+      const updateCategory = changedFields.includes('category');
+      const updateIdentity = changedFields.includes('identity_override');
+      const updatePublish = changedFields.includes('publish_time');
+      const clearIdentityOverride = updateIdentity && values.identityOverride === '';
+      if (clearIdentityOverride) delete overridePatch.identity_override;
+      const updated = await tx.queryOne(`
+        UPDATE records
+        SET sentiment = CASE WHEN $3 THEN $4 ELSE sentiment END,
+          category = CASE WHEN $5 THEN $6 ELSE category END,
+          identity_override = CASE WHEN $7 THEN $8 ELSE identity_override END,
+          publish_time = CASE WHEN $9 THEN $10 ELSE publish_time END,
+          published_ts = CASE WHEN $9 THEN $11::timestamptz ELSE published_ts END,
+          manual_overrides = (
+            CASE
+              WHEN $15 THEN COALESCE(manual_overrides, '{}'::jsonb) - 'identity_override'
+              ELSE COALESCE(manual_overrides, '{}'::jsonb)
+            END
+          ) || $12::jsonb,
+          manual_updated_by = $13,
+          manual_updated_name = $14,
+          manual_updated_at = now(),
+          updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING *
+      `, [
+        req.params.id,
+        req.tenantId,
+        updateSentiment,
+        values.sentiment || '',
+        updateCategory,
+        values.category || '',
+        updateIdentity,
+        values.identityOverride ?? '',
+        updatePublish,
+        values.publishTime ?? '',
+        publishedTs,
+        JSON.stringify(overridePatch),
+        actorUserId,
+        actorName,
+        clearIdentityOverride,
+      ]);
+
+      await tx.execute(`
+        INSERT INTO record_versions (tenant_id, record_id, changed_fields, before_data, after_data)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+      `, [
+        req.tenantId,
+        record.id,
+        changedFields,
+        JSON.stringify(originalValues),
+        JSON.stringify(correctedValues),
+      ]);
+
+      const feedback = await insertRecordFeedback(tx, {
+        tenantId: req.tenantId,
+        record,
+        feedbackType: 'manual_correction',
+        reason: validated.reason,
+        originalValues,
+        correctedValues,
+        actorUserId,
+        actorName,
+      });
+
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES ($1, 'user', $2, $3, 'record.manual_fields_updated', 'record', $4, $5::jsonb)
+      `, [
+        req.tenantId,
+        actorUserId || '',
+        actorUserId,
+        record.id,
+        JSON.stringify({
+          changedFields,
+          originalValues,
+          correctedValues,
+          reason: validated.reason,
+          feedbackId: feedback.id,
+        }),
+      ]);
+
+      return { record: updated, feedbackId: feedback.id, changedFields, unchanged: false };
+    });
+
+    if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    result.record.publish_display = formatPublishDate(result.record.publish_time, result.record.created_at);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.patch('/:id/custom-tags', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const patch = validateCustomTagPatch(req.body || {});
+    if (!patch.ok) {
+      return res.status(400).json({ ok: false, error: patch.error, message: patch.message });
+    }
+
+    const actorUserId = req.user?.id || null;
+    const actorName = req.actorName || req.user?.name || req.user?.email || '';
+    const result = await withTransaction(async tx => {
+      const record = await tx.queryOne(
+        'SELECT id FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+        [req.params.id, req.tenantId],
+      );
+      if (!record) return null;
+
+      const changed = await applyRecordCustomTagPatch(tx, {
+        tenantId: req.tenantId,
+        recordId: record.id,
+        patch,
+        actorUserId,
+        actorName,
+      });
+
+      if (!changed.unchanged) {
+        await tx.execute(`
+          INSERT INTO record_versions (
+            tenant_id, record_id, changed_fields, before_data, after_data
+          ) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+        `, [
+          req.tenantId,
+          record.id,
+          ['custom_tags'],
+          JSON.stringify({ custom_tags: changed.before }),
+          JSON.stringify({ custom_tags: changed.after }),
+        ]);
+
+        await tx.execute(`
+          INSERT INTO audit_logs (
+            tenant_id, actor_type, actor_id, actor_user_id,
+            action, target_type, target_id, metadata
+          ) VALUES ($1, 'user', $2, $3, 'record.custom_tags_updated', 'record', $4, $5::jsonb)
+        `, [
+          req.tenantId,
+          actorUserId || '',
+          actorUserId,
+          record.id,
+          JSON.stringify({
+            added: changed.added,
+            removed: changed.removed,
+            before: changed.before,
+            after: changed.after,
+          }),
+        ]);
+      }
+
+      return changed;
+    });
+
+    if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    return res.json({
+      ok: true,
+      custom_tags: result.after,
+      added: result.added,
+      removed: result.removed,
+      unchanged: result.unchanged,
+    });
+  } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
+    }
     return next(err);
   }
 });

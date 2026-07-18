@@ -55,7 +55,7 @@ export function ContentHomePage() {
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
       {/* Numbers */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 gap-3 min-[360px]:grid-cols-3">
         <Num label="赛道" value={formatNumber(tracks.length)} icon={TrendingUp} onClick={() => navigate('tracks')} />
         <Num label="对标账号" value={formatNumber(accounts.length)} icon={Users2} onClick={() => navigate('benchmarks')} />
         <Num label="长尾词" value={formatNumber(keywordCount)} icon={Hash} onClick={() => navigate('keywords')} />
@@ -122,12 +122,12 @@ function rank(g: string): number { return g === 'high' ? 1 : g === 'medium' ? 2 
 
 function Num({ label, value, icon: Icon, onClick }: { label: string; value: string; icon: React.ElementType; onClick: () => void }) {
   return (
-    <button onClick={onClick} className="group rounded-xl border border-border bg-card px-4 py-3.5 text-left shadow-xs transition-all hover:border-primary/30 hover:shadow-sm">
+    <button onClick={onClick} className="group rounded-xl border border-border bg-card px-3 py-3.5 text-left shadow-xs transition-all hover:border-primary/30 hover:shadow-sm sm:px-4">
       <div className="flex items-center justify-between">
         <span className="text-[12px] font-medium text-muted-foreground">{label}</span>
         <Icon className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-primary" strokeWidth={1.8} />
       </div>
-      <div className="mt-2 text-[26px] font-bold leading-none tabular-nums">{value}</div>
+      <div className="mt-2 text-[22px] font-bold leading-none tabular-nums sm:text-[26px]">{value}</div>
     </button>
   )
 }

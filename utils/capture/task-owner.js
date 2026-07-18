@@ -11,7 +11,10 @@
     const BIND_MESSAGE_TYPE = "capture-owner:bind";
     const UNBIND_MESSAGE_TYPE = "capture-owner:unbind";
     const CANCELED_MESSAGE_TYPE = "capture-owner:canceled";
-    const DEFAULT_GRACE_MS = 1500;
+    // Sidebar reloads and unattended keyword hand-offs can briefly replace the
+    // owner document. Keep the task alive long enough for the replacement port
+    // to bind, while still bounding abandoned-task cleanup to ten seconds.
+    const DEFAULT_GRACE_MS = 10 * 1000;
 
     function cleanText(value, maxLength = 320) {
       return String(value || "").replace(/\s+/gu, " ").trim().slice(0, maxLength);

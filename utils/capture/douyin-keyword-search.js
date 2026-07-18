@@ -4,7 +4,7 @@
  */
 
 import { PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG } from "../constants.js";
-import { cleanText, extractNoteId, normalizeDate } from "../helpers.js";
+import { cleanText, extractNoteId } from "../helpers.js";
 import { autoScrollLoad, isCanceled, resetCancelFlag, wait } from "../scroll.js";
 import { getDomProfile } from "../platform/dom-profiles/index.js";
 import {
@@ -428,7 +428,12 @@ function extractDouyinSearchCards(searchRoot) {
 
   cards.forEach((card, index) => {
     const noteId = resolveSearchCardId(card, index);
-    const noteUrl = resolveSearchCardUrl(card, noteId, tabType);
+    const noteUrl = resolveSearchCardUrl(
+      card,
+      noteId,
+      tabType,
+      window.location.href,
+    );
     if (!noteUrl) return;
     if (!noteId) return;
 
@@ -527,7 +532,7 @@ function resolveSearchCardContainer(node) {
 
   if (
     node.matches?.(
-      '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+      '.search-result-card, [id^="waterfall_item_"], [id^="search_card_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
     )
   ) {
     return node;
@@ -535,8 +540,9 @@ function resolveSearchCardContainer(node) {
 
   return (
     node.closest?.(
-      '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
+      '.search-result-card, [id^="waterfall_item_"], [id^="search_card_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
     ) ||
+    node.closest?.('article, li, [role="listitem"], section') ||
     node.querySelector?.(".search-result-card") ||
     null
   );
@@ -576,7 +582,7 @@ function hasSearchResultContentSignal(card) {
   return /^\s*\d{1,2}:\d{2}\s*$/m.test(text);
 }
 
-function resolveSearchCardId(card, index = 0) {
+export function resolveSearchCardId(card, index = 0) {
   const idCandidates = [
     card?.id,
     card?.closest?.("[id^='waterfall_item_']")?.id,
@@ -592,13 +598,39 @@ function resolveSearchCardId(card, index = 0) {
     }
   }
 
+  const detailLinkNodes = [
+    card,
+    ...Array.from(
+      card?.querySelectorAll?.(
+        'a[href], a[data-href], a[data-url], [data-href], [data-url]',
+      ) || [],
+    ),
+  ];
+  for (const node of detailLinkNodes) {
+    const urlCandidates = [
+      node?.getAttribute?.("href"),
+      node?.href,
+      node?.getAttribute?.("data-href"),
+      node?.getAttribute?.("data-url"),
+    ];
+    for (const candidate of urlCandidates) {
+      const noteId = extractNoteId(normalizeUrl(candidate));
+      if (/^\d{8,}$/.test(String(noteId || ""))) {
+        return noteId;
+      }
+    }
+  }
+
   const text = cleanText(card?.innerText || "");
   const inlineId = text.match(/\b(\d{16,20})\b/);
   if (inlineId?.[1]) {
     return inlineId[1];
   }
 
-  return `search_card_${index + 1}`;
+  // 虚拟卡槽序号不是作品身份。没有真实作品 ID 时不进入采集和编号，
+  // 避免 search_card_1 与详情 URL 的数字 ID 冲突。
+  void index;
+  return "";
 }
 
 function resolveSearchCardNumericId(card) {
@@ -637,7 +669,12 @@ function hasSearchCardWorkContentSignal(card) {
   return Boolean(resolveSearchCardTitleFromLines(card));
 }
 
-function resolveSearchCardUrl(card, noteId, tabType) {
+export function resolveSearchCardUrl(
+  card,
+  noteId,
+  tabType,
+  sourceSearchUrl = globalThis.window?.location?.href || "",
+) {
   const anchors = Array.from(
     card?.querySelectorAll?.(
       "a[href], a[data-href], a[data-url], [data-href], [data-url]",
@@ -656,6 +693,7 @@ function resolveSearchCardUrl(card, noteId, tabType) {
     card?.getAttribute?.("data-href"),
     card?.getAttribute?.("data-url"),
   ];
+  let sawConflictingDetailId = false;
 
   for (const candidate of candidates) {
     const normalized = normalizeUrl(candidate);
@@ -669,18 +707,41 @@ function resolveSearchCardUrl(card, noteId, tabType) {
 
     const candidateNoteId = extractNoteId(normalized);
     if (!candidateNoteId) continue;
+    if (
+      /^\d{8,}$/.test(String(noteId || "")) &&
+      candidateNoteId !== String(noteId)
+    ) {
+      sawConflictingDetailId = true;
+      continue;
+    }
 
     if (/\/(?:video|note)\//i.test(normalized)) {
+      if (
+        /\/note\//i.test(normalized) &&
+        hasExplicitSearchCardVideoSignal(card)
+      ) {
+        return buildDouyinDetailUrl(candidateNoteId, "video");
+      }
       return normalized;
     }
 
-    return buildDouyinDetailUrl(
-      candidateNoteId,
-      inferSearchCardContentType(card, normalized, tabType),
-    );
+    // 搜索页的 modal_id 链接携带当前搜索上下文。抖音部分作品直接打开
+    // /video/{id} 或 /note/{id} 会显示“视频不存在”，因此保留原链接。
+    return normalized;
+  }
+
+  if (sawConflictingDetailId) {
+    return "";
   }
 
   if (/^\d{8,}$/.test(String(noteId || ""))) {
+    const contextualUrl = buildDouyinSearchModalUrl(
+      noteId,
+      sourceSearchUrl,
+    );
+    if (contextualUrl) {
+      return contextualUrl;
+    }
     return buildDouyinDetailUrl(
       noteId,
       inferSearchCardContentType(card, "", tabType),
@@ -688,6 +749,26 @@ function resolveSearchCardUrl(card, noteId, tabType) {
   }
 
   return "";
+}
+
+function buildDouyinSearchModalUrl(noteId, sourceSearchUrl = "") {
+  if (!/^\d{8,}$/.test(String(noteId || ""))) {
+    return "";
+  }
+  try {
+    const parsed = new URL(String(sourceSearchUrl || ""));
+    const host = parsed.hostname.toLowerCase();
+    if (
+      (host !== "douyin.com" && !host.endsWith(".douyin.com")) ||
+      !/\/search\//i.test(parsed.pathname)
+    ) {
+      return "";
+    }
+    parsed.searchParams.set("modal_id", String(noteId));
+    return parsed.toString();
+  } catch {
+    return "";
+  }
 }
 
 function resolveSearchCardTitle(card, noteId, index) {
@@ -1069,12 +1150,13 @@ function normalizeComparableAuthor(value) {
     .toLowerCase();
 }
 
-function resolveSearchCardPublishDate(card) {
+export function resolveSearchCardPublishDate(card) {
   const direct = cleanText(
     getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.publishDate, card),
   );
-  if (direct) {
-    return direct.replace(/^·\s*/, "");
+  const directCandidate = extractDouyinSearchPublishDateCandidate(direct);
+  if (directCandidate) {
+    return directCandidate;
   }
 
   return extractRelativeDateHint(card);
@@ -1107,11 +1189,23 @@ function inferSearchCardContentType(card, url = "", tabType = "") {
   if (/图文|图集|图片/.test(text)) {
     return "image";
   }
-  if (/^\d{1,2}:\d{2}/m.test(text)) {
+  if (hasExplicitSearchCardVideoSignal(card)) {
     return "video";
   }
 
   return "video";
+}
+
+function hasExplicitSearchCardVideoSignal(card) {
+  const duration = cleanText(
+    getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.duration, card),
+  );
+  if (/^\d{1,3}:\d{2}(?::\d{2})?$/.test(duration)) {
+    return true;
+  }
+  return /^\s*\d{1,3}:\d{2}(?::\d{2})?\s*$/m.test(
+    String(card?.innerText || ""),
+  );
 }
 
 function buildDouyinDetailUrl(noteId, contentType = "video") {
@@ -1346,11 +1440,30 @@ function resolveSearchCardLikes(card) {
 }
 
 function extractRelativeDateHint(card) {
-  const text = cleanText(card?.innerText || "");
-  const match = text.match(
-    /(\d+\s*(?:分钟前|小时前|天前)|昨天|前天|\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2})/,
-  );
-  return match?.[1] || "";
+  const rawText = String(card?.innerText || card?.textContent || "");
+  const lines = rawText
+    .split(/\n+/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  // 抖音搜索卡片的作者/发布日期通常靠近卡片底部；倒序找可避免正文里
+  // 的活动日期先于真正发布时间被误命中。
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (line.length > 120) continue;
+    const candidate = extractDouyinSearchPublishDateCandidate(line);
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  // 某些卡片把所有元信息压在同一行。仍只接受经过日历校验的日期；
+  // 视频时长 00:15 / 00-15 不会通过。
+  if (lines.length <= 1 && rawText.length <= 160) {
+    return extractDouyinSearchPublishDateCandidate(rawText);
+  }
+
+  return "";
 }
 
 function parseCount(text) {
@@ -1490,14 +1603,169 @@ function extractBackgroundImageUrl(node) {
   return computedMatch?.[2] || "";
 }
 
-function normalizeSearchDate(raw) {
+export function normalizeSearchDate(raw, referenceDate = new Date()) {
+  const text = extractDouyinSearchPublishDateCandidate(raw);
+  if (!text) return "";
+
+  const reference =
+    referenceDate instanceof Date && Number.isFinite(referenceDate.getTime())
+      ? new Date(referenceDate.getTime())
+      : new Date();
+  const formatDateParts = (year, month, day) =>
+    `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+
+  const fullDate = text.match(
+    /(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?/,
+  );
+  if (fullDate) {
+    return formatDateParts(
+      Number(fullDate[1]),
+      Number(fullDate[2]),
+      Number(fullDate[3]),
+    );
+  }
+
+  const monthDay =
+    text.match(/(\d{1,2})月(\d{1,2})日/) ||
+    text.match(/(?:^|[^\d:])(\d{1,2})[-/.](\d{1,2})(?:日)?(?:$|[^\d:])/);
+  if (monthDay) {
+    const month = Number(monthDay[1]);
+    const day = Number(monthDay[2]);
+    let year = reference.getFullYear();
+    let candidate = new Date(year, month - 1, day);
+    const tomorrow = new Date(reference.getTime());
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (candidate.getTime() > tomorrow.getTime()) {
+      year -= 1;
+      candidate = new Date(year, month - 1, day);
+    }
+    if (isValidDouyinCalendarDate(year, month, day)) {
+      return formatDateParts(year, month, day);
+    }
+    return "";
+  }
+
+  const relative = text.match(
+    /(\d+)\s*(分钟|分|小时|时|天|周|个月|月|年)前/,
+  );
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2];
+    const candidate = new Date(reference.getTime());
+    if (unit === "分钟" || unit === "分") {
+      candidate.setMinutes(candidate.getMinutes() - amount);
+    } else if (unit === "小时" || unit === "时") {
+      candidate.setHours(candidate.getHours() - amount);
+    } else if (unit === "天") {
+      candidate.setDate(candidate.getDate() - amount);
+    } else if (unit === "周") {
+      candidate.setDate(candidate.getDate() - amount * 7);
+    } else if (unit === "个月" || unit === "月") {
+      candidate.setMonth(candidate.getMonth() - amount);
+    } else if (unit === "年") {
+      candidate.setFullYear(candidate.getFullYear() - amount);
+    }
+    return formatDateParts(
+      candidate.getFullYear(),
+      candidate.getMonth() + 1,
+      candidate.getDate(),
+    );
+  }
+
+  if (/^(?:刚刚|今天)/.test(text)) {
+    return formatDateParts(
+      reference.getFullYear(),
+      reference.getMonth() + 1,
+      reference.getDate(),
+    );
+  }
+
+  if (/^(?:昨天|前天)/.test(text)) {
+    const candidate = new Date(reference.getTime());
+    candidate.setDate(candidate.getDate() - (text.startsWith("前天") ? 2 : 1));
+    return formatDateParts(
+      candidate.getFullYear(),
+      candidate.getMonth() + 1,
+      candidate.getDate(),
+    );
+  }
+
+  return "";
+}
+
+export function extractDouyinSearchPublishDateCandidate(raw) {
   const text = cleanText(String(raw || "").replace(/^·\s*/, ""));
   if (!text) return "";
 
-  const fullCn = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
-  if (fullCn) {
-    return `${fullCn[1]}-${String(fullCn[2]).padStart(2, "0")}-${String(fullCn[3]).padStart(2, "0")}`;
+  // 播放时长不是发布时间。抖音近期还会把 00:15 以 00-15 形式放进
+  // 旧的日期 class，必须在任何日期解析前拒绝。
+  if (/^\d{1,3}:\d{2}(?::\d{2})?$/.test(text)) {
+    return "";
   }
 
-  return normalizeDate(text);
+  const fullDate = text.match(
+    /(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/,
+  );
+  if (
+    fullDate &&
+    isValidDouyinCalendarDate(
+      Number(fullDate[1]),
+      Number(fullDate[2]),
+      Number(fullDate[3]),
+    )
+  ) {
+    return fullDate[0];
+  }
+
+  const relative = text.match(
+    /(?:刚刚|今天|昨天|前天|\d+\s*(?:分钟|分|小时|时|天|周|个月|月|年)前)/,
+  );
+  if (relative?.[0]) {
+    return relative[0];
+  }
+
+  const chineseMonthDay = text.match(
+    /(?:^|[^\d])(\d{1,2})月(\d{1,2})日(?:\s+\d{1,2}:\d{2})?/,
+  );
+  if (
+    chineseMonthDay &&
+    isValidDouyinCalendarDate(
+      new Date().getFullYear(),
+      Number(chineseMonthDay[1]),
+      Number(chineseMonthDay[2]),
+    )
+  ) {
+    return chineseMonthDay[0].trim();
+  }
+
+  const numericMonthDay = text.match(
+    /(?:^|[^\d:])(\d{1,2})[-/.](\d{1,2})(?:日)?(?:$|[^\d:])/,
+  );
+  if (
+    numericMonthDay &&
+    isValidDouyinCalendarDate(
+      new Date().getFullYear(),
+      Number(numericMonthDay[1]),
+      Number(numericMonthDay[2]),
+    )
+  ) {
+    return `${numericMonthDay[1]}-${numericMonthDay[2]}`;
+  }
+
+  return "";
+}
+
+function isValidDouyinCalendarDate(year, month, day) {
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    year < 2000 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1
+  ) {
+    return false;
+  }
+  return day <= new Date(year, month, 0).getDate();
 }

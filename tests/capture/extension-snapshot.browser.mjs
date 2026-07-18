@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
 import {existsSync} from "node:fs";
-import {mkdtemp, readFile, readdir, rm} from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {createServer} from "node:http";
 import {basename, dirname, join, resolve} from "node:path";
@@ -10,12 +17,30 @@ import {spawn} from "node:child_process";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const extensionDir = join(repoRoot, "extension-build");
+const artifactDir = resolve(
+  String(
+    process.env.STARVOICE_SNAPSHOT_ARTIFACT_DIR ||
+      join(tmpdir(), "starvoice-extension-snapshot-artifacts"),
+  ),
+);
+const sidebarScreenshotPath = join(
+  artifactDir,
+  "sidebar-dark-running.png",
+);
+const waitOverlayScreenshotPath = join(
+  artifactDir,
+  "platform-wait-countdown.png",
+);
 
 assert.equal(
   existsSync(join(extensionDir, "manifest.json")),
   true,
   "run scripts/sync-extension-build.zsh first",
 );
+const extensionManifest = JSON.parse(
+  await readFile(join(extensionDir, "manifest.json"), "utf8"),
+);
+await mkdir(artifactDir, {recursive: true});
 
 async function findBundledChromium() {
   const roots = [
@@ -179,6 +204,104 @@ async function evaluate(client, expression) {
   return response.result?.value;
 }
 
+async function captureViewportScreenshot(
+  client,
+  outputPath,
+  {width, height},
+) {
+  await client.send("Page.enable");
+  await client.send("Emulation.setDeviceMetricsOverride", {
+    width,
+    height,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await evaluate(
+    client,
+    "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))).then(() => true)",
+  );
+  const screenshot = await client.send("Page.captureScreenshot", {
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false,
+  });
+  assert.ok(
+    String(screenshot?.data || "").length > 100,
+    `empty Chromium screenshot: ${outputPath}`,
+  );
+  await writeFile(outputPath, Buffer.from(screenshot.data, "base64"));
+  return outputPath;
+}
+
+async function captureAttachedTabScreenshot(
+  controlClient,
+  tabId,
+  outputPath,
+  {width, height},
+) {
+  const data = await evaluate(
+    controlClient,
+    `(async () => {
+      const target = {tabId: ${tabId}};
+      await chrome.debugger.sendCommand(target, 'Page.enable');
+      await chrome.debugger.sendCommand(
+        target,
+        'Emulation.setDeviceMetricsOverride',
+        {
+          width: ${width},
+          height: ${height},
+          deviceScaleFactor: 1,
+          mobile: false,
+        },
+      );
+      await chrome.scripting.executeScript({
+        target: {tabId: ${tabId}},
+        func: () => new Promise(resolve =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      });
+      const screenshot = await chrome.debugger.sendCommand(
+        target,
+        'Page.captureScreenshot',
+        {
+          format: 'png',
+          fromSurface: true,
+          captureBeyondViewport: false,
+        },
+      );
+      return screenshot?.data || '';
+    })()`,
+  );
+  assert.ok(
+    String(data || "").length > 100,
+    `empty Chromium tab screenshot: ${outputPath}`,
+  );
+  await writeFile(outputPath, Buffer.from(data, "base64"));
+  return outputPath;
+}
+
+async function readTakeoverSnapshot(controlClient, tabId) {
+  return await evaluate(
+    controlClient,
+    `chrome.scripting.executeScript({
+      target: {tabId: ${tabId}},
+      func: () => {
+        const host = document.querySelector('[data-osv-list-harvest-host="true"]');
+        return {
+          exists: Boolean(host),
+          visible: host?.getAttribute('data-takeover-visible') || '',
+          waiting: host?.getAttribute('data-takeover-waiting') || '',
+          label: host?.getAttribute('data-takeover-label') || '',
+          phase: host?.getAttribute('data-takeover-phase') || '',
+          reason: host?.getAttribute('data-takeover-reason') || '',
+          nextKeyword: host?.getAttribute('data-takeover-next-keyword') || '',
+          remainingMs: Number(host?.getAttribute('data-takeover-remaining-ms') || 0),
+          deadlineAt: Number(host?.getAttribute('data-takeover-deadline-at') || 0),
+        };
+      },
+    }).then(results => results[0]?.result)`,
+  );
+}
+
 const executable = await resolveChromiumExecutable();
 const fixtureCards = Array.from(
   {length: 4},
@@ -190,10 +313,44 @@ const fixtureCards = Array.from(
       <div class="title">测试笔记 ${index + 1}</div>
       <span class="author">测试作者 ${index + 1}</span>
       <span class="like-count">${100 + index}</span>
-    </article>`,
+  </article>`,
 ).join("");
-const fixtureServer = createServer((_request, response) => {
+const douyinFixtureIds = [
+  "766193585000000001",
+  "766193585000000002",
+];
+const douyinFixtureCards = douyinFixtureIds
+  .map(
+    (noteId, index) => `
+      <article
+        id="${index === 0 ? `waterfall_item_${noteId}` : `search_card_${index + 1}`}"
+        class="search-result-card"
+        ${index === 1 ? `data-e2e-aweme-id="${noteId}"` : ""}
+      >
+        <a
+          class="cover"
+          ${index === 1 ? `href="/jingxuan/search/starvoice-fixture?type=general&modal_id=${noteId}"` : ""}
+        >
+          <img alt="抖音测试作品 ${index + 1}" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+        </a>
+        <p class="title">抖音测试作品 ${index + 1}</p>
+        <span class="author">抖音作者 ${index + 1}</span>
+        <span class="like-count">${200 + index}</span>
+        <span class="FnM1bbIQ">00:${String(20 + index).padStart(2, "0")}</span>
+      </article>`,
+  )
+  .join("");
+const fixtureServer = createServer((request, response) => {
   response.writeHead(200, {"content-type": "text/html; charset=utf-8"});
+  if (String(request.headers.host || "").startsWith("www.douyin.com")) {
+    response.end(
+      `<!doctype html><meta charset="utf-8"><title>Douyin fixture</title>
+       <style>body{min-height:1800px}#search-result-container{display:grid;grid-template-columns:repeat(2,240px);gap:24px}.search-result-card{min-height:260px}.FnM1bbIQ{display:block}</style>
+       <input data-e2e="searchbar-input" value="starvoice-fixture">
+       <main id="search-result-container">${douyinFixtureCards}</main>`,
+    );
+    return;
+  }
   response.end(
     `<!doctype html><meta charset="utf-8"><title>StarVoice fixture</title>
      <style>body{min-height:1800px}.feeds-container{display:grid;grid-template-columns:repeat(2,240px);gap:24px}.note-item{min-height:260px}</style>
@@ -206,6 +363,8 @@ await new Promise((resolvePromise, rejectPromise) => {
 });
 const fixturePort = fixtureServer.address().port;
 const sourceUrl = `http://www.xiaohongshu.com:${fixturePort}/search_result?keyword=starvoice-fixture`;
+const douyinSourceUrl =
+  `http://www.douyin.com:${fixturePort}/jingxuan/search/starvoice-fixture?type=general`;
 const weiboUrl = `http://s.weibo.com:${fixturePort}/weibo?q=starvoice-fixture`;
 const profileDir = await mkdtemp(join(tmpdir(), "starvoice-extension-smoke-"));
 const chrome = spawn(
@@ -217,7 +376,7 @@ const chrome = spawn(
     "--disable-background-networking",
     "--disable-component-update",
     "--no-proxy-server",
-    "--host-resolver-rules=MAP www.xiaohongshu.com 127.0.0.1, MAP s.weibo.com 127.0.0.1",
+    "--host-resolver-rules=MAP www.xiaohongshu.com 127.0.0.1, MAP www.douyin.com 127.0.0.1, MAP s.weibo.com 127.0.0.1",
     "--remote-debugging-port=0",
     "--remote-allow-origins=*",
     `--user-data-dir=${profileDir}`,
@@ -252,13 +411,24 @@ try {
   await waitUntil(async () =>
     await evaluate(client, "location.href.startsWith('chrome-extension://') && document.readyState === 'complete'"),
   );
+  await evaluate(
+    client,
+    "chrome.storage.local.set({'onstarvoice.riskNoticeAcknowledged': true}).then(() => true)",
+  );
+  await client.send("Page.reload", {ignoreCache: true});
+  await waitUntil(async () =>
+    await evaluate(
+      client,
+      "location.href.startsWith('chrome-extension://') && document.readyState === 'complete'",
+    ),
+  );
   assert.equal(
     await evaluate(client, "chrome.runtime.getManifest().name"),
     "StarVoice 星语",
   );
   assert.equal(
     await evaluate(client, "chrome.runtime.getManifest().version"),
-    "0.3.35",
+    extensionManifest.version,
   );
 
   const sourceTab = await evaluate(
@@ -278,6 +448,12 @@ try {
   const sourceTabId = sourceTab?.id;
   assert.equal(Number.isSafeInteger(sourceTabId), true, JSON.stringify(sourceTab));
   assert.match(String(sourceTab?.url || ""), /^http:\/\/www\.xiaohongshu\.com:/u);
+  await waitUntil(async () =>
+    await evaluate(
+      client,
+      `chrome.tabs.get(${sourceTabId}).then(tab => tab.status === 'complete')`,
+    ),
+  );
 
   const taskId = "extension-snapshot-task";
   const begin = await evaluate(
@@ -352,10 +528,31 @@ try {
         phase: 'detail_capturing',
         message: '正在采集详情',
         progressPercent: 42,
-        current: 1,
-        total: 2,
-        workerMode: 'single',
-        workerStates: [{label: '工作页 A', state: 'collecting'}],
+        keyword: '吉事桔香茶',
+        keywordCurrent: 1,
+        keywordTotal: 2,
+        itemCurrent: 44,
+        itemTotal: 50,
+        roundCurrent: 1,
+        roundTotal: 2,
+        runStartedAt: new Date(Date.now() - 73000).toISOString(),
+        phaseStartedAt: new Date(Date.now() - 12000).toISOString(),
+        updatedAt: new Date().toISOString(),
+        workerMode: 'double_buffer',
+        workerStates: [
+          {label: '工作页 A', state: 'collecting'},
+          {label: '工作页 B', state: 'ready'},
+        ],
+        taskMeta: {
+          keywordList: ['吉事桔香茶', '桔香茶'],
+          searchFilters: {
+            sort: 'latest',
+            publishTime: 'week',
+          },
+          enhancementEnabled: true,
+          commentsEnabled: true,
+          bloggerMetricsEnabled: true,
+        },
       },
     })`,
   );
@@ -384,6 +581,109 @@ try {
     ariaValueNow: "42",
     percentHidden: false,
     text: "42%",
+  });
+  await captureViewportScreenshot(client, sidebarScreenshotPath, {
+    width: 480,
+    height: 1000,
+  });
+  process.stdout.write(
+    `StarVoice dark task screenshot: ${sidebarScreenshotPath}\n`,
+  );
+
+  const waitProgressUpdatedAt = new Date().toISOString();
+  const waitTakeover = await evaluate(
+    client,
+    `chrome.runtime.sendMessage({
+      type: 'onstarvoice:relay-to-content',
+      tabId: ${sourceTabId},
+      payload: {
+        action: 'setCaptureTaskTakeover',
+        taskId: ${JSON.stringify(taskId)},
+        active: true,
+        label: 'AI 正在接管',
+        progress: {
+          phase: 'inter_keyword_delay',
+          message: '当前关键词已完成，正在安全等待',
+          waitReason: '降低连续访问频率，等待后自动继续',
+          remainingMs: 15000,
+          updatedAt: ${JSON.stringify(waitProgressUpdatedAt)},
+          nextKeyword: '别克壁纸',
+        },
+      },
+    })`,
+  );
+  assert.equal(waitTakeover?.ok, true, JSON.stringify(waitTakeover));
+  assert.notEqual(waitTakeover?.data?.ok, false, JSON.stringify(waitTakeover));
+
+  const initialWaitSnapshot = await waitUntil(async () => {
+    const snapshot = await readTakeoverSnapshot(client, sourceTabId);
+    return snapshot?.waiting === "true" && snapshot.remainingMs > 0
+      ? snapshot
+      : null;
+  });
+  assert.equal(initialWaitSnapshot.visible, "true");
+  assert.equal(initialWaitSnapshot.phase, "inter_keyword_delay");
+  assert.equal(
+    initialWaitSnapshot.reason,
+    "降低连续访问频率，等待后自动继续",
+  );
+  assert.equal(initialWaitSnapshot.nextKeyword, "别克壁纸");
+  assert.ok(initialWaitSnapshot.remainingMs <= 15_000);
+  assert.ok(initialWaitSnapshot.deadlineAt > Date.now());
+
+  const decrementedWaitSnapshot = await waitUntil(
+    async () => {
+      const snapshot = await readTakeoverSnapshot(client, sourceTabId);
+      return snapshot?.waiting === "true" &&
+        snapshot.remainingMs >= 0 &&
+        snapshot.remainingMs < initialWaitSnapshot.remainingMs
+        ? snapshot
+        : null;
+    },
+    {timeoutMs: 4_000, intervalMs: 100},
+  );
+  assert.equal(decrementedWaitSnapshot.nextKeyword, "别克壁纸");
+
+  await captureAttachedTabScreenshot(
+    client,
+    sourceTabId,
+    waitOverlayScreenshotPath,
+    {
+      width: 1440,
+      height: 900,
+    },
+  );
+  process.stdout.write(
+    `StarVoice wait countdown screenshot: ${waitOverlayScreenshotPath}\n`,
+  );
+
+  const clearedWaitTakeover = await evaluate(
+    client,
+    `chrome.runtime.sendMessage({
+      type: 'onstarvoice:relay-to-content',
+      tabId: ${sourceTabId},
+      payload: {
+        action: 'setCaptureTaskTakeover',
+        taskId: ${JSON.stringify(taskId)},
+        active: false,
+        clearTrace: true,
+        label: 'AI 正在接管',
+      },
+    })`,
+  );
+  assert.equal(
+    clearedWaitTakeover?.ok,
+    true,
+    JSON.stringify(clearedWaitTakeover),
+  );
+  assert.notEqual(
+    clearedWaitTakeover?.data?.ok,
+    false,
+    JSON.stringify(clearedWaitTakeover),
+  );
+  await waitUntil(async () => {
+    const snapshot = await readTakeoverSnapshot(client, sourceTabId);
+    return snapshot?.exists === false;
   });
 
   const listRunId = "list-run-extension-snapshot";
@@ -500,6 +800,171 @@ try {
     workerExists: false,
     cancellation: null,
   });
+
+  const douyinTab = await evaluate(
+    client,
+    `(async () => {
+      const tab = await chrome.tabs.create({url: ${JSON.stringify(douyinSourceUrl)}, active: false});
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const current = await chrome.tabs.get(tab.id);
+        if ((current.url || '').startsWith('http://www.douyin.com:')) {
+          return current;
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      return await chrome.tabs.get(tab.id);
+    })()`,
+  );
+  const douyinTabId = douyinTab?.id;
+  assert.equal(Number.isSafeInteger(douyinTabId), true, JSON.stringify(douyinTab));
+  const douyinTaskId = "extension-snapshot-douyin-task";
+  const douyinBegin = await evaluate(
+    client,
+    `chrome.runtime.sendMessage({
+      type: 'onstarvoice:begin-capture-task',
+      taskId: ${JSON.stringify(douyinTaskId)},
+      sourceTabId: ${douyinTabId},
+      platform: 'douyin',
+      label: '抖音序号验收任务',
+    })`,
+  );
+  assert.equal(douyinBegin?.ok, true, JSON.stringify(douyinBegin));
+
+  const douyinListRunId = "list-run-douyin-snapshot";
+  const douyinRelay = await evaluate(
+    client,
+    `chrome.runtime.sendMessage({
+      type: 'onstarvoice:relay-to-content',
+      tabId: ${douyinTabId},
+      payload: {
+        action: 'captureKeywordNotes',
+        taskId: ${JSON.stringify(douyinTaskId)},
+        listCaptureRunId: ${JSON.stringify(douyinListRunId)},
+        keyword: 'starvoice-fixture',
+        minLikes: 0,
+        maxDetectedItems: 2,
+        maxScrollTimes: 1,
+        waitMinMs: 100,
+        waitMaxMs: 100,
+        stallTimeoutMs: 1000,
+        maxDurationMs: 3000,
+      },
+    })`,
+  );
+  assert.equal(douyinRelay?.ok, true, JSON.stringify(douyinRelay));
+  assert.notEqual(douyinRelay?.data?.ok, false, JSON.stringify(douyinRelay));
+  assert.deepEqual(
+    douyinRelay.data.data.items.map((item) => item.noteId),
+    douyinFixtureIds,
+  );
+  assert.deepEqual(
+    douyinRelay.data.data.items.map((item) => item.captureTrace?.sequence),
+    [1, 2],
+  );
+  assert.deepEqual(
+    douyinRelay.data.data.items.map((item) =>
+      new URL(item.url).searchParams.get("modal_id"),
+    ),
+    douyinFixtureIds,
+  );
+  const douyinOverlay = await evaluate(
+    client,
+    `chrome.scripting.executeScript({
+      target: {tabId: ${douyinTabId}},
+      func: async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const host = document.querySelector('[data-osv-list-harvest-host="true"]');
+        return {
+          host: host?.getAttribute('data-state') || '',
+          marked: Number(host?.getAttribute('data-marked-count') || 0),
+          visible: Number(host?.getAttribute('data-visible-marker-count') || 0),
+          unresolved: Number(host?.getAttribute('data-unresolved-count') || 0),
+          sequences: Array.from(document.querySelectorAll('[data-osv-capture-sequence]'))
+            .map(card => Number(card.getAttribute('data-osv-capture-sequence')))
+            .filter(Number.isFinite)
+            .sort((left, right) => left - right),
+        };
+      },
+    }).then(results => results[0]?.result)`,
+  );
+  assert.equal(douyinOverlay.host, "completed", JSON.stringify(douyinOverlay));
+  assert.equal(douyinOverlay.marked, 2, JSON.stringify(douyinOverlay));
+  assert.equal(douyinOverlay.visible, 2, JSON.stringify(douyinOverlay));
+  assert.equal(douyinOverlay.unresolved, 0, JSON.stringify(douyinOverlay));
+  assert.deepEqual(douyinOverlay.sequences.slice(0, 2), [1, 2]);
+
+  await evaluate(
+    client,
+    `chrome.tabs.reload(${douyinTabId}).then(() => true)`,
+  );
+  await waitUntil(async () =>
+    await evaluate(
+      client,
+      `chrome.tabs.get(${douyinTabId}).then(tab => tab.status === 'complete')`,
+    ),
+  );
+  await waitUntil(async () =>
+    await evaluate(
+      client,
+      `(async () => {
+        const runtime = (await chrome.storage.local.get('onstarvoice.runtime'))['onstarvoice.runtime'];
+        const targets = await chrome.debugger.getTargets();
+        return runtime?.captureDebugSession?.taskId === ${JSON.stringify(douyinTaskId)} &&
+          runtime?.captureDebugSession?.state === 'attached' &&
+          targets.some(target => target.tabId === ${douyinTabId} && target.attached);
+      })()`,
+    ),
+  );
+  const douyinRestore = await evaluate(
+    client,
+    `chrome.runtime.sendMessage({
+      type: 'onstarvoice:relay-to-content',
+      tabId: ${douyinTabId},
+      payload: {
+        action: 'restoreListCaptureTraceOverlay',
+        runId: ${JSON.stringify(douyinListRunId)},
+        platform: 'douyin',
+        label: '抖音序号恢复验收',
+        items: ${JSON.stringify(douyinRelay.data.data.items)},
+      },
+    })`,
+  );
+  assert.equal(douyinRestore?.ok, true, JSON.stringify(douyinRestore));
+  assert.equal(
+    douyinRestore?.data?.data?.restoredCount,
+    2,
+    JSON.stringify(douyinRestore),
+  );
+  const restoredDouyinOverlay = await evaluate(
+    client,
+    `chrome.scripting.executeScript({
+      target: {tabId: ${douyinTabId}},
+      func: async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const host = document.querySelector('[data-osv-list-harvest-host="true"]');
+        return {
+          marked: Number(host?.getAttribute('data-marked-count') || 0),
+          visible: Number(host?.getAttribute('data-visible-marker-count') || 0),
+          unresolved: Number(host?.getAttribute('data-unresolved-count') || 0),
+        };
+      },
+    }).then(results => results[0]?.result)`,
+  );
+  assert.deepEqual(
+    restoredDouyinOverlay,
+    {marked: 2, visible: 2, unresolved: 0},
+  );
+
+  const douyinEnded = await evaluate(
+    client,
+    `chrome.runtime.sendMessage({
+      type: 'onstarvoice:end-capture-task',
+      taskId: ${JSON.stringify(douyinTaskId)},
+      reason: 'completed',
+      status: 'completed',
+    })`,
+  );
+  assert.equal(douyinEnded?.ok, true, JSON.stringify(douyinEnded));
 
   const weiboTabId = await evaluate(
     client,

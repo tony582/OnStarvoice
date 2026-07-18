@@ -3,10 +3,19 @@ import {readFile} from "node:fs/promises";
 import test from "node:test";
 
 const repoRoot = new URL("../../", import.meta.url);
-const [backgroundSource, manifestSource, captureSyncSource] = await Promise.all([
+const [
+  backgroundSource,
+  manifestSource,
+  captureSyncSource,
+  douyinKeywordSearchSource,
+] = await Promise.all([
   readFile(new URL("background.js", repoRoot), "utf8"),
   readFile(new URL("manifest.json", repoRoot), "utf8"),
   readFile(new URL("utils/capture-sync.js", repoRoot), "utf8"),
+  readFile(
+    new URL("utils/capture/douyin-keyword-search.js", repoRoot),
+    "utf8",
+  ),
 ]);
 const manifest = JSON.parse(manifestSource);
 
@@ -97,6 +106,47 @@ test("task begin checks debugger ownership before changing native groups", () =>
   assert.match(body, /capture_task_debug_busy/u);
 });
 
+test("task begin reconciles only confirmed stale native groups before reporting group busy", () => {
+  const start = backgroundSource.indexOf("async function beginCaptureTask");
+  const end = backgroundSource.indexOf("async function updateCaptureTask", start);
+  const body = backgroundSource.slice(start, end);
+  const reconcileAt = body.indexOf(
+    "releaseConfirmedStaleCaptureTaskGroupsForBegin",
+  );
+  const conflictAt = body.indexOf("capture_task_group_busy");
+
+  assert.ok(reconcileAt >= 0);
+  assert.ok(conflictAt > reconcileAt);
+  const livenessStart = backgroundSource.indexOf(
+    "async function inspectCaptureTaskGroupLiveness",
+  );
+  const livenessEnd = backgroundSource.indexOf(
+    "async function releaseConfirmedStaleCaptureTaskGroupsForBegin",
+    livenessStart,
+  );
+  const livenessBody = backgroundSource.slice(livenessStart, livenessEnd);
+  for (const signal of [
+    "debug_session",
+    "task_owner",
+    "execution_lock",
+    "task_ledger",
+  ]) {
+    assert.match(livenessBody, new RegExp(signal, "u"));
+  }
+  assert.match(
+    livenessBody,
+    /debugSession && debugSessionState !== 'detached'/u,
+  );
+  assert.match(
+    livenessBody,
+    /reason: 'confirmed_stale',[\s\S]*debugSession,/u,
+  );
+  assert.match(
+    backgroundSource,
+    /releaseCaptureTaskResourcesWithRetry\([\s\S]*reason: 'stale_capture_task_recovered'/u,
+  );
+});
+
 test("task-level Debug trusts the source URL and rejects unsupported or spoofed platforms", () => {
   const start = backgroundSource.indexOf("async function beginCaptureTask");
   const end = backgroundSource.indexOf("async function updateCaptureTask", start);
@@ -151,7 +201,71 @@ test("A/B detail preloading requires an explicit persistent task and two remaini
   assert.ok(standbyAt > doubleBufferAt);
   assert.match(
     body,
-    /if \(\s*normalizedCaptureTaskId &&\s*remainingDetailCount >= DETAIL_PREFETCH_WORKER_COUNT\s*\)/u,
+    /if \(\s*normalizedCaptureTaskId &&\s*allowDetailDoubleBuffer &&\s*remainingDetailCount >= DETAIL_PREFETCH_WORKER_COUNT\s*\)/u,
+  );
+});
+
+test("Douyin detail enhancement stays on one worker and delays unavailable failures", () => {
+  assert.match(
+    captureSyncSource,
+    /const allowDetailDoubleBuffer = !detailBatchContainsDouyin/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /抖音使用单工作页，避免自动连播导致作品错配/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /你要观看的\(\?:视频\|作品\|内容\)不存在/u,
+  );
+  assert.match(captureSyncSource, /DOUYIN_CONTENT_UNAVAILABLE/u);
+  assert.match(captureSyncSource, /DOUYIN_UNAVAILABLE_GRACE_MS = 4500/u);
+  assert.match(
+    captureSyncSource,
+    /buildDouyinDetailNavigationCandidates\(\s*url,\s*activeTab\?\.url,\s*douyinDetailPathByRecordId\.get\(String\(recordId\)\) \|\| 'video',\s*\)/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /source\.searchParams\.set\('modal_id', noteId\)/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS = 15000/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /error\?\.code === 'DETAIL_NAVIGATION_TIMEOUT'/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /error\.code = 'DETAIL_NAVIGATION_TIMEOUT'/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /DOUYIN_DETAIL_ROUTE_SETTLE_MS = 1200/u,
+  );
+});
+
+test("Douyin card identity and detail route are kept consistent", () => {
+  assert.match(
+    douyinKeywordSearchSource,
+    /candidateNoteId !== String\(noteId\)/u,
+  );
+  assert.match(
+    douyinKeywordSearchSource,
+    /hasExplicitSearchCardVideoSignal\(card\)[\s\S]*buildDouyinDetailUrl\(candidateNoteId, "video"\)/u,
+  );
+  assert.match(
+    douyinKeywordSearchSource,
+    /搜索页的 modal_id 链接携带当前搜索上下文/u,
+  );
+  assert.match(
+    douyinKeywordSearchSource,
+    /buildDouyinSearchModalUrl\(\s*noteId,\s*sourceSearchUrl/u,
+  );
+  assert.match(
+    douyinKeywordSearchSource,
+    /card\?\.querySelectorAll\?\.\([\s\S]*a\[href\][\s\S]*extractNoteId\(normalizeUrl\(candidate\)\)/u,
   );
 });
 
@@ -172,9 +286,13 @@ test("source removal uses unified task cleanup instead of deleting manager maps 
     backgroundSource,
     /async function handleCaptureRuntimeTabRemoved\(tabId\)[\s\S]*source_tab_removed/u,
   );
+  assert.match(
+    backgroundSource,
+    /handleCaptureRuntimeTabRemoved\(tabId\)[\s\S]*terminalizeCaptureTaskLedgerRun\(session\.taskId/u,
+  );
   const removedListener = backgroundSource.slice(
     backgroundSource.indexOf("chrome.tabs.onRemoved.addListener"),
-    backgroundSource.indexOf("chrome.tabs.onReplaced.addListener"),
+    backgroundSource.indexOf("chrome.tabs.onReplaced?.addListener"),
   );
   assert.match(removedListener, /handleCaptureRuntimeTabRemoved\(tabId\)/u);
   assert.doesNotMatch(removedListener, /captureDebugSessionManager\.handleTabRemoved/u);
@@ -212,6 +330,10 @@ test("detail, profile and restore navigations share the double-buffer pacer", ()
   const metricsCall = captureSyncSource.slice(metricsCallAt, metricsCallEnd);
   assert.match(metricsCall, /detailPrefetchPipeline\.runExternalNavigation/u);
   assert.match(metricsCall, /probeDetailPreloadSafety\(navigationTabId\)/u);
+  assert.match(
+    metricsCall,
+    /recordPlatform === 'xiaohongshu'\s*\?\s*\{active: false\}\s*:\s*\{\}/u,
+  );
 
   const metricsHelperAt = captureSyncSource.indexOf(
     "async function captureBloggerMetricsForDetailPayload",
@@ -381,6 +503,28 @@ test("native detach and source loss close owned detail workers", () => {
   );
 });
 
+test("tab replacement migrates persistent capture ownership instead of treating it as source removal", () => {
+  const replacedAt = backgroundSource.indexOf(
+    "async function handleCaptureRuntimeTabReplaced",
+  );
+  const replacedEnd = backgroundSource.indexOf(
+    "async function handleCaptureRuntimeTabRemoved",
+    replacedAt,
+  );
+  const body = backgroundSource.slice(replacedAt, replacedEnd);
+  assert.match(body, /captureTaskTabGroupManager\.replaceTab/u);
+  assert.match(body, /captureDebugSessionManager\.replaceTab/u);
+  assert.match(body, /replaceCaptureExecutionLockTabId/u);
+  assert.doesNotMatch(body, /source_tab_removed/u);
+
+  const listenerAt = backgroundSource.indexOf(
+    "chrome.tabs.onReplaced?.addListener",
+  );
+  const listenerBody = backgroundSource.slice(listenerAt, listenerAt + 360);
+  assert.match(listenerBody, /handleCaptureRuntimeTabReplaced\(addedTabId, removedTabId\)/u);
+  assert.doesNotMatch(listenerBody, /handleCaptureRuntimeTabRemoved/u);
+});
+
 test("normal task end also closes any surviving registered worker", () => {
   const start = backgroundSource.indexOf(
     "async function releaseCaptureTaskResources",
@@ -434,6 +578,7 @@ test("sidebar owner disconnect is a bounded whole-task cancellation", () => {
   );
   const body = backgroundSource.slice(start, end);
   assert.match(body, /sidebar_owner_disconnected/u);
+  assert.match(body, /terminalizeCaptureTaskLedgerRun\(normalizedTaskId/u);
   assert.match(body, /relayCaptureTaskCancellation/u);
   assert.match(body, /releaseCaptureTaskResources/u);
 });
@@ -448,10 +593,12 @@ test("native Debug cancellation publishes a task tombstone before cleanup", () =
   );
   const body = backgroundSource.slice(start, end);
   const publishAt = body.indexOf("publishCaptureTaskCancellation");
-  const relayAt = body.indexOf("relayCaptureTaskCancellation", publishAt);
+  const ledgerAt = body.indexOf("terminalizeCaptureTaskLedgerRun", publishAt);
+  const relayAt = body.indexOf("relayCaptureTaskCancellation", ledgerAt);
   const releaseAt = body.indexOf("releaseCaptureTaskResources", relayAt);
   assert.ok(publishAt >= 0);
-  assert.ok(relayAt > publishAt);
+  assert.ok(ledgerAt > publishAt);
+  assert.ok(relayAt > ledgerAt);
   assert.ok(releaseAt > relayAt);
   assert.match(backgroundSource, /captureTaskCancellation: cancellation/u);
 });

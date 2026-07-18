@@ -184,6 +184,52 @@ test("ledger normalization never lets an old terminal attempt overwrite a newer 
   assert.equal(ledger.runs[0].status, "running");
 });
 
+test("stale active tasks are terminally reconciled while live tasks stay running", () => {
+  const ledger = core.reconcileStaleTaskLedger(
+    {
+      runs: [
+        {
+          id: "stale-run",
+          status: "running",
+          createdAt: "2026-07-16T03:40:00Z",
+          updatedAt: "2026-07-16T03:40:00Z",
+          businessProgressAt: "2026-07-16T03:40:00Z",
+        },
+        {
+          id: "live-run",
+          status: "running",
+          createdAt: "2026-07-16T03:30:00Z",
+          updatedAt: "2026-07-16T03:30:00Z",
+          businessProgressAt: "2026-07-16T03:30:00Z",
+        },
+      ],
+    },
+    {
+      now: NOW,
+      staleAfterMs: 10 * 60 * 1000,
+      isTaskActive: (run) => run.id === "live-run",
+    },
+  );
+
+  assert.equal(ledger.runs.find((run) => run.id === "stale-run").status, "canceled");
+  assert.equal(ledger.runs.find((run) => run.id === "live-run").status, "running");
+  assert.match(
+    ledger.runs.find((run) => run.id === "stale-run").message,
+    /自动结束陈旧任务记录/,
+  );
+});
+
+test("task center clear cutoff survives later ledger upserts", () => {
+  const clearedAt = "2026-07-16T03:55:00Z";
+  const result = core.upsertTaskRun(
+    {version: 1, runs: [], clearedAt},
+    {id: "new-run", status: "running"},
+    {now: NOW},
+  );
+
+  assert.equal(result.ledger.clearedAt, "2026-07-16T03:55:00.000Z");
+});
+
 test("progress sequence never moves backwards", () => {
   const current = core.normalizeTaskRun(
     {
@@ -414,4 +460,24 @@ test("legacy adapter accepts monitor API response containers", () => {
   assert.equal(items.length, 1);
   assert.equal(items[0].status, "canceled");
   assert.equal(items[0].legacySource, "monitor_executions");
+});
+
+test("incomplete legacy running records are historical, not active tasks", () => {
+  const items = core.buildLegacyTaskCenterItems(
+    {
+      syncEntries: [{id: "old-sync", status: "running", startedAt: NOW - 60_000}],
+      monitorExecutions: [
+        {
+          id: "old-monitor",
+          status: "running",
+          startedAt: "2026-06-21T12:10:00Z",
+        },
+      ],
+    },
+    {now: NOW},
+  );
+
+  assert.equal(items.length, 2);
+  assert.equal(items.every((item) => item.status === "completed_with_warnings"), true);
+  assert.equal(items.every((item) => Boolean(item.finishedAt)), true);
 });

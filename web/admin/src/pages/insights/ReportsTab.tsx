@@ -204,7 +204,7 @@ export function ReportsTab() {
           <EmptyState icon={FileText} title="暂无报告" description="点击上方按钮生成第一份报告" />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full min-w-[760px] text-sm">
               <thead>
                 <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
                   <th className="px-5 py-3 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground">报告</th>

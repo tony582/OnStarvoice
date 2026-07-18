@@ -162,7 +162,10 @@ export async function upsertCapturedRecord(record, context) {
           comments_count = COALESCE($13::integer, comments_count),
           collects = COALESCE($14::integer, collects),
           shares = COALESCE($15::integer, shares),
-          publish_time = COALESCE(NULLIF($16, ''), publish_time),
+          publish_time = CASE
+            WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'publish_time' THEN publish_time
+            ELSE COALESCE(NULLIF($16, ''), publish_time)
+          END,
           tags = CASE WHEN $17::jsonb <> '[]'::jsonb THEN $17::jsonb ELSE tags END,
           blogger_profile_url = COALESCE(NULLIF($18, ''), blogger_profile_url),
           image_urls = CASE WHEN $19::jsonb <> '[]'::jsonb THEN $19::jsonb ELSE image_urls END,

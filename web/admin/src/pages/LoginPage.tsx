@@ -21,9 +21,9 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-6">
+    <div className="flex min-h-dvh items-center justify-center bg-background p-4 sm:p-6">
       <form onSubmit={handleSubmit}
-        className="animate-fade-up w-full max-w-[400px] space-y-7 rounded-lg border border-border bg-card p-8 shadow-sm">
+        className="animate-fade-up w-full max-w-[400px] space-y-7 rounded-lg border border-border bg-card p-6 shadow-sm sm:p-8">
 
         <div className="flex flex-col items-center">
           <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-lg border border-border bg-muted/40">

@@ -26,7 +26,21 @@ function createRuntimeDouble(responder = null) {
   };
 }
 
-test("capture task lifecycle emits the exact four-message contract", async () => {
+function getTaskLifecycleMessages(messages = []) {
+  return messages.filter(
+    (message) => message.type !== "onstarvoice:relay-to-content",
+  );
+}
+
+function getTakeoverMessages(messages = []) {
+  return messages.filter(
+    (message) =>
+      message.type === "onstarvoice:relay-to-content" &&
+      message.payload?.action === "setCaptureTaskTakeover",
+  );
+}
+
+test("capture task lifecycle emits four root messages plus page takeover updates", async () => {
   const runtime = createRuntimeDouble();
   const options = {chromeApi: runtime.chromeApi};
 
@@ -72,7 +86,25 @@ test("capture task lifecycle emits the exact four-message contract", async () =>
     options,
   );
 
-  assert.deepEqual(runtime.messages, [
+  const lifecycleMessages = getTaskLifecycleMessages(runtime.messages);
+  assert.match(
+    lifecycleMessages[1]?.progress?.phaseStartedAt || "",
+    /^\d{4}-\d{2}-\d{2}T/u,
+  );
+  assert.match(
+    lifecycleMessages[1]?.progress?.updatedAt || "",
+    /^\d{4}-\d{2}-\d{2}T/u,
+  );
+  const normalizedLifecycleMessages = lifecycleMessages.map((message) => {
+    if (message.type !== "onstarvoice:update-capture-task") {
+      return message;
+    }
+    const progress = {...message.progress};
+    delete progress.phaseStartedAt;
+    delete progress.updatedAt;
+    return {...message, progress};
+  });
+  assert.deepEqual(normalizedLifecycleMessages, [
     {
       type: "onstarvoice:begin-capture-task",
       taskId: "task-session-contract",
@@ -99,13 +131,20 @@ test("capture task lifecycle emits the exact four-message contract", async () =>
       status: "COMPLETED",
     },
   ]);
+  const takeoverMessages = getTakeoverMessages(runtime.messages);
+  assert.equal(takeoverMessages.length, 3);
+  assert.deepEqual(
+    takeoverMessages.map((message) => message.payload.active),
+    [true, true, false],
+  );
+  assert.equal(takeoverMessages.at(-1).payload.clearTrace, true);
 
   const afterEnd = await updateCaptureTaskSession(
     {taskId: "task-session-contract", progress: {phase: "late"}},
     options,
   );
   assert.equal(afterEnd.reason, "no_active_task_session");
-  assert.equal(runtime.messages.length, 4);
+  assert.equal(runtime.messages.length, 7);
 });
 
 test("no active session is a no-op and leaves the old capture path intact", async () => {
@@ -126,6 +165,61 @@ test("no active session is a no-op and leaves the old capture path intact", asyn
     "no_active_task_session",
   );
   assert.deepEqual(runtime.messages, []);
+});
+
+test("an unattended attempt token fences its lifecycle and a stale END does not clear the replacement overlay", async () => {
+  const runtime = createRuntimeDouble(async (message) => {
+    if (message.type === "onstarvoice:end-capture-task") {
+      return {
+        ok: true,
+        data: {ignored: true, reason: "stale_unattended_attempt"},
+      };
+    }
+    return {ok: true, data: {taskId: message.taskId}};
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "unattended-capture:attempt-fence-contract";
+
+  await beginCaptureTaskSession(
+    {taskId, tabId: 61, platform: "douyin", attemptId: "attempt-old"},
+    options,
+  );
+  await updateCaptureTaskSession(
+    {taskId, progress: {phase: "detail_capturing"}},
+    options,
+  );
+  await registerCaptureTaskTab(
+    {taskId, tabId: 62, role: "detail_worker"},
+    options,
+  );
+  const ended = await endCaptureTaskSession(
+    {taskId, reason: "failed", status: "failed"},
+    options,
+  );
+
+  assert.equal(ended.data.ignored, true);
+  const lifecycle = getTaskLifecycleMessages(runtime.messages);
+  assert.deepEqual(
+    lifecycle.map((message) => [message.type, message.attemptId]),
+    [
+      ["onstarvoice:begin-capture-task", "attempt-old"],
+      ["onstarvoice:update-capture-task", "attempt-old"],
+      ["onstarvoice:register-capture-task-tab", "attempt-old"],
+      ["onstarvoice:end-capture-task", "attempt-old"],
+    ],
+  );
+  assert.deepEqual(
+    getTakeoverMessages(runtime.messages).map((message) =>
+      message.payload.active,
+    ),
+    [true],
+    "a stale runner must not clear the takeover overlay owned by the replacement attempt",
+  );
+  assert.equal(
+    (await updateCaptureTaskSession({taskId, progress: {phase: "late"}}, options))
+      .reason,
+    "no_active_task_session",
+  );
 });
 
 test("an omitted task id never borrows the sole active persistent session", async () => {
@@ -149,14 +243,17 @@ test("an omitted task id never borrows the sole active persistent session", asyn
     (await endCaptureTaskSession({reason: "completed"}, options)).reason,
     "no_active_task_session",
   );
-  assert.equal(runtime.messages.length, 1);
+  assert.equal(getTaskLifecycleMessages(runtime.messages).length, 1);
+  assert.equal(getTakeoverMessages(runtime.messages).length, 1);
 
   const ended = await endCaptureTaskSession(
     {taskId: "task-explicit-identity", reason: "completed"},
     options,
   );
   assert.equal(ended.ok, true);
-  assert.equal(runtime.messages.length, 2);
+  assert.equal(getTaskLifecycleMessages(runtime.messages).length, 2);
+  assert.equal(getTakeoverMessages(runtime.messages).length, 2);
+  assert.equal(getTakeoverMessages(runtime.messages).at(-1).payload.clearTrace, true);
 });
 
 test("failed begin never activates a task session", async () => {
@@ -182,6 +279,53 @@ test("failed begin never activates a task session", async () => {
     "no_active_task_session",
   );
   assert.equal(runtime.messages.length, 1);
+});
+
+test("a replaced source tab is revalidated with background before local reuse", async () => {
+  let replacementBeginAttempts = 0;
+  const runtime = createRuntimeDouble(async (message) => {
+    if (
+      message.type === "onstarvoice:begin-capture-task" &&
+      Number(message.tabId) === 52
+    ) {
+      replacementBeginAttempts += 1;
+      if (replacementBeginAttempts === 1) {
+        return {
+          ok: false,
+          error: {code: "capture_task_source_mismatch"},
+        };
+      }
+    }
+    return {ok: true, data: {taskId: message.taskId}};
+  });
+  const options = {chromeApi: runtime.chromeApi};
+
+  await beginCaptureTaskSession(
+    {taskId: "task-source-rebound", tabId: 51, platform: "douyin"},
+    options,
+  );
+  const rebound = await beginCaptureTaskSession(
+    {taskId: "task-source-rebound", tabId: 52, platform: "douyin"},
+    options,
+  );
+
+  assert.equal(rebound.ok, true);
+  assert.equal(rebound.active, true);
+  assert.equal(rebound.rebound, true);
+  assert.equal(replacementBeginAttempts, 2);
+  const beginMessages = getTaskLifecycleMessages(runtime.messages).filter(
+    (message) => message.type === "onstarvoice:begin-capture-task",
+  );
+  assert.deepEqual(
+    beginMessages.map((message) => message.tabId),
+    [51, 52, 52],
+  );
+
+  await endCaptureTaskSession(
+    {taskId: "task-source-rebound", reason: "completed"},
+    options,
+  );
+  assert.equal(getTakeoverMessages(runtime.messages).at(-1).tabId, 52);
 });
 
 test("end retries one transient background release failure before clearing ownership", async () => {
@@ -213,7 +357,8 @@ test("end retries one transient background release failure before clearing owner
     options,
   );
   assert.equal(afterEnd.reason, "no_active_task_session");
-  assert.equal(runtime.messages.length, 3);
+  assert.equal(runtime.messages.length, 5);
+  assert.equal(getTakeoverMessages(runtime.messages).at(-1).payload.clearTrace, true);
 });
 
 test("two failed end attempts keep local ownership for a later user retry", async () => {

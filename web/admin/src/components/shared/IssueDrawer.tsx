@@ -1,4 +1,4 @@
-import { X, Clock, FileText, Activity } from 'lucide-react'
+import { X, Clock, FileText, Activity, ArrowLeft } from 'lucide-react'
 import { formatDate, formatFullDate, formatNumber, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
@@ -17,16 +17,18 @@ export function IssueDrawer({ issue, onClose, canWrite, onUpdateStatus }: {
 }) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/35" />
-      <div className="relative z-10 flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200"
+      <div className="absolute inset-0 hidden bg-black/35 lg:block" />
+      <div role="dialog" aria-modal="true" aria-label="问题详情"
+        className="relative z-10 flex h-full w-full max-w-xl flex-col bg-card lg:border-l lg:border-border lg:shadow-lg animate-in slide-in-from-right duration-200"
         onClick={e => e.stopPropagation()}>
 
-        <div className="flex items-center justify-between border-b border-border px-6 py-4">
+        <div className="flex min-h-14 items-center gap-2 border-b border-border px-2 pt-[env(safe-area-inset-top)] sm:px-6">
+          <button onClick={onClose} aria-label="返回问题列表" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground active:bg-accent lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
           <h2 className="text-base font-bold">问题详情</h2>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent"><X className="h-5 w-5" /></button>
+          <button onClick={onClose} aria-label="关闭问题详情" className="ml-auto hidden rounded-lg p-2 text-muted-foreground hover:bg-accent lg:block"><X className="h-5 w-5" /></button>
         </div>
 
-        <div className="flex-1 space-y-5 overflow-y-auto p-6">
+        <div className="flex-1 space-y-5 overflow-y-auto overscroll-contain p-4 sm:p-6">
           <h3 className="text-lg font-bold">{issue.title}</h3>
 
           <div className="grid grid-cols-2 gap-3">
@@ -80,7 +82,7 @@ export function IssueDrawer({ issue, onClose, canWrite, onUpdateStatus }: {
         </div>
 
         {canWrite && (
-          <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
+          <div className="grid grid-cols-2 gap-2 border-t border-border px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:flex sm:items-center sm:justify-end sm:px-6">
             <Button variant="outline" onClick={() => onUpdateStatus(issue.id, 'resolved')}>标为已解决</Button>
             <Button variant="ghost" onClick={() => onUpdateStatus(issue.id, 'closed')}>关闭问题</Button>
           </div>

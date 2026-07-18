@@ -319,7 +319,6 @@
         <section
           class="debug-session-panel"
           id="debugSessionPanel"
-          aria-live="polite"
           hidden>
           <div class="debug-session-shell">
             <div class="debug-session-target">
@@ -345,10 +344,30 @@
               <div class="debug-session-progress-heading">
                 <span
                   class="debug-session-live"
-                  id="debugSessionStateLabel">任务进行中</span>
-                <strong
-                  id="debugSessionProgressPercent"
-                  hidden>—</strong>
+                  id="debugSessionHealth"
+                  data-health="active">
+                  <span
+                    class="debug-session-live-dot"
+                    aria-hidden="true"></span>
+                  <span id="debugSessionStateLabel">运行正常</span>
+                </span>
+                <span class="debug-session-time-cluster">
+                  <time
+                    id="debugSessionElapsed"
+                    aria-live="off">已运行 00:00</time>
+                  <strong
+                    id="debugSessionProgressPercent"
+                    hidden>—</strong>
+                </span>
+              </div>
+              <div
+                class="debug-session-scope"
+                id="debugSessionScope">
+                <span class="debug-session-scope-label">当前关键词</span>
+                <strong id="debugSessionKeyword">正在准备任务</strong>
+                <div
+                  class="debug-session-scope-meta"
+                  id="debugSessionScopeMeta"></div>
               </div>
               <div
                 class="debug-session-progress-track"
@@ -362,13 +381,59 @@
               </div>
               <p
                 class="debug-session-current-message"
-                id="debugSessionCurrentMessage">
+                id="debugSessionCurrentMessage"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true">
                 正在准备采集任务…
               </p>
+              <div class="debug-session-action-meta">
+                <span
+                  id="debugSessionActionExplanation">正在确认平台页面和任务设置</span>
+                <time
+                  id="debugSessionStepElapsed"
+                  aria-live="off">本步骤 00:00</time>
+              </div>
+              <p
+                class="debug-session-next-action"
+                id="debugSessionNextAction">
+                完成后会自动继续，无需操作
+              </p>
+              <div
+                class="debug-session-wait-card"
+                id="debugSessionWaitCard"
+                hidden>
+                <span class="debug-session-wait-copy">
+                  <span id="debugSessionWaitReason">安全等待</span>
+                  <strong id="debugSessionWaitNext">系统会自动继续</strong>
+                </span>
+                <time
+                  class="debug-session-wait-countdown"
+                  id="debugSessionWaitCountdown"
+                  aria-live="off">00:00</time>
+              </div>
               <p
                 class="debug-session-stats"
                 id="debugSessionStats"
                 hidden></p>
+              <div class="debug-session-recent">
+                <span class="debug-session-recent-heading">
+                  <span>最近进展</span>
+                  <time
+                    id="debugSessionLastProgressAge"
+                    aria-live="off">刚刚</time>
+                </span>
+                <p id="debugSessionRecentMessage">任务已启动</p>
+              </div>
+              <div
+                class="debug-session-meta"
+                id="debugSessionMeta"
+                hidden>
+                <span class="debug-session-meta-label">本次任务</span>
+                <div
+                  class="debug-session-meta-chips"
+                  id="debugSessionMetaChips"></div>
+              </div>
             </div>
 
             <section
@@ -376,7 +441,7 @@
               id="debugSessionWorkers"
               hidden>
               <div class="debug-session-workers-heading">
-                <strong>采集工作页</strong>
+                <strong>采集页面</strong>
                 <span id="debugSessionWorkerMode">单工作页</span>
               </div>
               <div
@@ -411,16 +476,29 @@
               </div>
             </section>
 
+            <section
+              class="debug-session-activity"
+              id="debugSessionActivity"
+              hidden>
+              <div class="debug-session-activity-heading">
+                <strong>实时动态</strong>
+                <span>仅显示真实采集进展</span>
+              </div>
+              <ol
+                class="debug-session-activity-list"
+                id="debugSessionActivityList"></ol>
+            </section>
+
             <div class="debug-session-progress">
               <h2>任务进度</h2>
               <ol
                 class="debug-session-steps"
                 id="debugSessionSteps">
-                <li data-debug-step="0"><span class="debug-step-icon"></span><span>正在分析当前页面</span></li>
-                <li data-debug-step="1"><span class="debug-step-icon"></span><span>正在读取并筛选列表</span></li>
-                <li data-debug-step="2"><span class="debug-step-icon"></span><span id="debugSessionNumberingLabel">正在标记采集结果</span></li>
-                <li data-debug-step="3"><span class="debug-step-icon"></span><span id="debugSessionDetailLabel">正在补采笔记详情</span></li>
-                <li data-debug-step="4"><span class="debug-step-icon"></span><span>正在同步采集结果</span></li>
+                <li data-debug-step="0"><span class="debug-step-icon"></span><span>分析页面</span></li>
+                <li data-debug-step="1"><span class="debug-step-icon"></span><span>读取并筛选列表</span></li>
+                <li data-debug-step="2"><span class="debug-step-icon"></span><span id="debugSessionNumberingLabel">标记采集结果</span></li>
+                <li data-debug-step="3"><span class="debug-step-icon"></span><span id="debugSessionDetailLabel">完善作品详情</span></li>
+                <li data-debug-step="4"><span class="debug-step-icon"></span><span>同步采集结果</span></li>
               </ol>
             </div>
           </div>
@@ -671,18 +749,6 @@
                 <span class="switch-label">跳过已增强笔记</span>
               </label>
               <p class="form-hint">采集增强时，已完成增强的笔记不再重复打开详情页，减少重复导航、防风控、提速。</p>
-            </div>
-            <div class="form-group incremental-exception-group">
-              <label class="switch-wrap">
-                <input
-                  type="checkbox"
-                  class="switch-input"
-                  data-detail-setting="comment-count-recheck"
-                  checked />
-                <span class="switch-slider" aria-hidden="true"></span>
-                <span class="switch-label">例外：评论数增加时重采评论</span>
-              </label>
-              <p class="form-hint">仅在上方开启且“附加评论”开启时生效：本次列表评论数高于上次增强基线，才重新打开详情补采评论；相同或减少则只更新基础指标。</p>
             </div>
             <div class="form-group">
               <label class="form-label">笔记内容主题筛选</label>
@@ -1045,18 +1111,6 @@
                 </label>
                 <p class="form-hint">采集增强时，已完成增强的笔记不再重复打开详情页，减少重复导航、防风控、提速。</p>
               </div>
-              <div class="form-group incremental-exception-group">
-                <label class="switch-wrap">
-                  <input
-                    type="checkbox"
-                    class="switch-input"
-                    data-detail-setting="comment-count-recheck"
-                    checked />
-                  <span class="switch-slider" aria-hidden="true"></span>
-                  <span class="switch-label">例外：评论数增加时重采评论</span>
-                </label>
-                <p class="form-hint">仅在上方开启且“附加评论”开启时生效：本次列表评论数高于上次增强基线，才重新打开详情补采评论；相同或减少则只更新基础指标。</p>
-              </div>
               <div class="form-group batch-settings">
                 <div class="batch-settings-block">
                   <div class="batch-settings-head">
@@ -1128,6 +1182,27 @@
                       aria-hidden="true"></span>
                     <span class="switch-label">增强后自动同步后台</span>
                   </label>
+                  <div class="detail-enhance-ai-filter">
+                    <label class="switch-wrap">
+                      <input
+                        type="checkbox"
+                        class="switch-input"
+                        data-detail-setting="ai-relevance-prefilter"
+                        aria-describedby="aiRelevancePrefilterHint" />
+                      <span
+                        class="switch-slider"
+                        aria-hidden="true"></span>
+                      <span class="switch-label detail-enhance-ai-filter-label">
+                        AI 精准筛选
+                        <span class="detail-enhance-provider-badge">DeepSeek</span>
+                      </span>
+                    </label>
+                    <p
+                      class="detail-enhance-ai-filter-hint"
+                      id="aiRelevancePrefilterHint">
+                      将作品标题等必要信息交给后台 DeepSeek 判断与当前关键词是否匹配。仅在高置信度判定无关时跳过增强；判断不清、超时或服务异常都会继续采集。
+                    </p>
+                  </div>
                   <label class="switch-wrap">
                     <input
                       type="checkbox"
@@ -1481,8 +1556,8 @@
                   class="action-icon-btn sync-history-header-btn"
                   id="btnClearSyncHistory"
                   type="button"
-                  title="仅清空升级前的本地同步记录"
-                  aria-label="仅清空升级前的本地同步记录">
+                  title="清空任务中心记录"
+                  aria-label="清空任务中心记录">
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
                     width="16"
@@ -1578,7 +1653,7 @@
             </div>
             <div class="task-center-list-meta">
               <span id="syncHistoryStatsText" aria-live="polite">共 0 个任务</span>
-              <span class="task-center-legacy-note">清空仅影响旧同步记录</span>
+              <span class="task-center-legacy-note">清空会保留真实运行中的任务</span>
             </div>
             <div
               id="syncHistoryEmpty"

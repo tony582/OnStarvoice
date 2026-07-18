@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { X, Loader2, Heart, MessageCircle, Star, Share2, ExternalLink, Activity, TrendingUp, Globe, Clock } from 'lucide-react'
+import { X, Loader2, Heart, MessageCircle, Star, Share2, ExternalLink, Activity, TrendingUp, Globe, Clock, ArrowLeft } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDate, platformName, LABELS, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
@@ -30,19 +30,21 @@ export function EventDrawer({ eventId, onClose }: { eventId: string; onClose: ()
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/35" />
-      <div className="relative z-10 flex h-full w-full max-w-2xl flex-col border-l border-border bg-card shadow-lg animate-in slide-in-from-right duration-200" onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-border px-6 py-4">
+      <div className="absolute inset-0 hidden bg-black/35 lg:block" />
+      <div role="dialog" aria-modal="true" aria-label="事件详情"
+        className="relative z-10 flex h-full w-full max-w-2xl flex-col bg-card lg:border-l lg:border-border lg:shadow-lg animate-in slide-in-from-right duration-200" onClick={e => e.stopPropagation()}>
+        <div className="flex min-h-14 items-center gap-2 border-b border-border px-2 pt-[env(safe-area-inset-top)] sm:px-6">
+          <button onClick={onClose} aria-label="返回事件列表" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground active:bg-accent lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
           <h2 className="text-base font-bold">事件详情 · 时间脉络</h2>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent"><X className="h-5 w-5" /></button>
+          <button onClick={onClose} aria-label="关闭事件详情" className="ml-auto hidden rounded-lg p-2 text-muted-foreground transition hover:bg-accent lg:block"><X className="h-5 w-5" /></button>
         </div>
 
         {loading ? (
           <div className="flex flex-1 items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
         ) : (
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto overscroll-contain">
             {/* Hero */}
-            <div className="border-b border-border p-6">
+            <div className="border-b border-border p-4 sm:p-6">
               <div className="mb-2 flex flex-wrap items-center gap-2">
                 <StatusBadge tone={issue?.severity}>{LABELS.severity?.[issue?.severity] || issue?.severity}</StatusBadge>
                 <StatusBadge tone={issue?.status}>{LABELS.issueStatus?.[issue?.status] || issue?.status}</StatusBadge>
@@ -50,7 +52,7 @@ export function EventDrawer({ eventId, onClose }: { eventId: string; onClose: ()
               <h3 className="text-base font-bold leading-snug">{issue?.title}</h3>
               {issue?.summary && <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{issue.summary}</p>}
 
-              <div className="mt-4 grid grid-cols-4 gap-2">
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
                 <Metric icon={TrendingUp} label="影响力" value={formatNumber(reach)} tone="red" />
                 <Metric icon={Activity} label="关联内容" value={formatNumber(records.length)} />
                 <Metric icon={Globe} label="涉及平台" value={String(platforms.length)} />
@@ -59,7 +61,7 @@ export function EventDrawer({ eventId, onClose }: { eventId: string; onClose: ()
             </div>
 
             {/* 时间脉络 */}
-            <div className="p-6">
+            <div className="p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-6">
               <h4 className="mb-4 text-xs font-bold uppercase tracking-wider text-muted-foreground">时间脉络</h4>
               {timeline.length === 0 ? (
                 <EmptyState icon={Activity} title="暂无关联内容" />

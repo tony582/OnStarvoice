@@ -44,6 +44,12 @@ export function requireTenantWriter(req, res, next) {
   return res.status(403).json({ ok: false, error: 'forbidden', message: '当前账号没有写入权限' });
 }
 
+// 需放在 requireTenantAccess 之后使用。明确排除激活码调用方,仅允许后台登录会话。
+export function requireSessionUser(req, res, next) {
+  if (req.actorType === 'user' && req.user) return next();
+  return res.status(403).json({ ok: false, error: 'session_user_required', message: '该操作仅允许后台登录用户使用' });
+}
+
 export async function requireUser(req, res, next) {
   try {
     const resolved = await resolveSession(getSessionToken(req));
