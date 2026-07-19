@@ -7,9 +7,11 @@ import {
   RELEVANCE_PREFILTER_MAX_CONCURRENCY,
   RELEVANCE_PREFILTER_TIMEOUT_MS,
   buildRelevancePrefilterCandidate,
+  buildRelevancePrefilterIdempotencyKey,
   evaluateRelevancePrefilterRecords,
   normalizeRelevancePrefilterDecision,
 } from '../../utils/capture/relevance-prefilter.js';
+import {scopeRelevancePrefilterIdempotencyKey} from '../../utils/api.js';
 
 const captureSyncSource = await readFile(
   new URL('../../utils/capture-sync.js', import.meta.url),
@@ -169,6 +171,76 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
   assert.equal(calls.every(({options}) => options.timeout === 10000), true);
   assert.equal(result.skippedRecordIds.length, 5);
   assert.equal(result.failedOpenCount, 0);
+});
+
+test('identical list text in a later capture run receives a new idempotency key', async () => {
+  const requests = [];
+  const captureRequest = async (request) => {
+    requests.push(request);
+    return {
+      ok: true,
+      items: request.items.map((item) => ({
+        itemId: item.itemId,
+        status: 'ok',
+        modelDecision: 'keep',
+        confidence: 1,
+        executionDisposition: 'collect_full',
+      })),
+    };
+  };
+
+  await evaluateRelevancePrefilterRecords([keywordRecord(1)], {
+    enabled: true,
+    requestBatch: captureRequest,
+  });
+  await evaluateRelevancePrefilterRecords([keywordRecord(1)], {
+    enabled: true,
+    requestBatch: captureRequest,
+  });
+
+  assert.equal(requests.length, 2);
+  assert.notEqual(requests[0].requestId, requests[1].requestId);
+  assert.notEqual(requests[0].idempotencyKey, requests[1].idempotencyKey);
+  assert.match(
+    requests[0].idempotencyKey,
+    new RegExp(`:request:${requests[0].requestId}$`, 'u'),
+  );
+});
+
+test('prefilter idempotency scoping is stable for retries and bounded for the API', () => {
+  const input = [{itemId: 'douyin:1', title: '别克壁纸'}];
+  const first = buildRelevancePrefilterIdempotencyKey({
+    requestId: 'req-1',
+    platform: 'douyin',
+    keyword: '别克壁纸',
+    batchIndex: 0,
+    items: input,
+  });
+  const retry = buildRelevancePrefilterIdempotencyKey({
+    requestId: 'req-1',
+    platform: 'douyin',
+    keyword: '别克壁纸',
+    batchIndex: 0,
+    items: input,
+  });
+  const laterRun = buildRelevancePrefilterIdempotencyKey({
+    requestId: 'req-2',
+    platform: 'douyin',
+    keyword: '别克壁纸',
+    batchIndex: 0,
+    items: input,
+  });
+  assert.equal(first, retry);
+  assert.notEqual(first, laterRun);
+  assert.equal(scopeRelevancePrefilterIdempotencyKey(first, 'req-1'), first);
+
+  const legacyFirst = scopeRelevancePrefilterIdempotencyKey('legacy-content-key', 'req-1');
+  const legacyLater = scopeRelevancePrefilterIdempotencyKey('legacy-content-key', 'req-2');
+  assert.notEqual(legacyFirst, legacyLater);
+  assert.equal(legacyFirst, 'legacy-content-key:request:req-1');
+  assert.ok(
+    scopeRelevancePrefilterIdempotencyKey('x'.repeat(700), 'req-1').length <= 512,
+  );
 });
 
 test('parallel DeepSeek batches stay within the server tenant concurrency', async () => {

@@ -395,7 +395,7 @@ test("filtered and mismatched items still pass the shared post-item safety delay
 
 test("a fatal standby navigation actively cancels the collecting worker", () => {
   const pipelineAt = captureSyncSource.indexOf(
-    "detailPrefetchPipeline = createDetailPrefetchPipeline",
+    "const createCurrentDetailPrefetchPipeline = () => createDetailPrefetchPipeline",
   );
   const batchStartAt = captureSyncSource.indexOf(
     "phase: 'detail_batch_start'",

@@ -1004,7 +1004,9 @@ export function resolveDouyinNoteId(detailRoot, expectedNoteId = "") {
     "href",
     detailRoot,
   );
-  const fromHref = extractNoteId(normalizeUrl(detailHref));
+  const fromHref = normalizeDouyinNumericNoteId(
+    extractNoteId(normalizeUrl(detailHref)),
+  );
   if (fromHref) return fromHref;
 
   const video = getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.video, detailRoot);
@@ -1013,7 +1015,9 @@ export function resolveDouyinNoteId(detailRoot, expectedNoteId = "") {
     video?.currentSrc ||
     video?.querySelector("source[src]")?.getAttribute("src") ||
     "";
-  const fromVideoUrl = extractNoteId(String(sourceUrl || ""));
+  const fromVideoUrl = normalizeDouyinNumericNoteId(
+    extractNoteId(String(sourceUrl || "")),
+  );
   if (fromVideoUrl) return fromVideoUrl;
 
   const currentUrl = String(window.location.href || "");

@@ -24,6 +24,34 @@ const API_BASE_URLS = [
 
 let activeApiBaseUrl = API_BASE_URLS[0];
 
+const RELEVANCE_PREFILTER_IDEMPOTENCY_KEY_MAX_LENGTH = 512;
+
+/**
+ * Older callers built relevance-prefilter keys from list content only. The
+ * request layer later appends the active capture taskId, so a second capture
+ * run could send a different logical body under the same key. Scope the key to
+ * requestId as a final API-boundary safeguard. Repeating the same HTTP request
+ * remains idempotent; a new prefilter request cannot collide with an older run.
+ */
+export function scopeRelevancePrefilterIdempotencyKey(
+  idempotencyKey = '',
+  requestId = '',
+) {
+  const baseKey = String(idempotencyKey || '').trim();
+  const normalizedRequestId = String(requestId || '').trim().slice(0, 200);
+  if (!baseKey || !normalizedRequestId) return baseKey;
+
+  const suffix = `:request:${normalizedRequestId}`;
+  const unscopedBaseKey = baseKey.endsWith(suffix)
+    ? baseKey.slice(0, -suffix.length)
+    : baseKey;
+  const maxBaseLength = Math.max(
+    0,
+    RELEVANCE_PREFILTER_IDEMPOTENCY_KEY_MAX_LENGTH - suffix.length,
+  );
+  return `${unscopedBaseKey.slice(0, maxBaseLength)}${suffix}`;
+}
+
 // ==================== 通用请求函数 ====================
 
 function isRequestCancellationRequested(shouldStop, signal = null) {
@@ -612,6 +640,12 @@ export async function prefilterRelevance(
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
   if (!authCodeResult.ok) return authCodeResult;
 
+  const normalizedRequestId = String(requestId || '').trim();
+  const scopedIdempotencyKey = scopeRelevancePrefilterIdempotencyKey(
+    idempotencyKey,
+    normalizedRequestId,
+  );
+
   return await request(
     API_ENDPOINT.RELEVANCE_PREFILTER || '/api/relevance/prefilter',
     {
@@ -620,8 +654,8 @@ export async function prefilterRelevance(
         clientUuid: runtime.clientUuid,
         clientLabel: runtime.clientLabel,
         appVersion: runtime.appVersion,
-        requestId: String(requestId || '').trim(),
-        idempotencyKey: String(idempotencyKey || '').trim(),
+        requestId: normalizedRequestId,
+        idempotencyKey: scopedIdempotencyKey,
         platform: String(platform || '').trim().toLowerCase(),
         stage: String(stage || 'list').trim().toLowerCase(),
         keyword: String(keyword || '').trim(),

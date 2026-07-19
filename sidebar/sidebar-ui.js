@@ -2970,8 +2970,14 @@ function resolveDetailCaptureStatusRow(record) {
   }
 
   if (status === "failed") {
+    const autoRetryCount = Math.max(
+      0,
+      Number(payload.detailCaptureAutoRetryCount) || 0,
+    );
+    const retryText =
+      autoRetryCount > 0 ? `（已自动重试 ${autoRetryCount} 次）` : "";
     return {
-      text: `采集增强失败${errorText ? `：${errorText}` : ""}`,
+      text: `采集增强失败${retryText}${errorText ? `：${errorText}` : ""}`,
       textClass: "is-failed",
       actions: `
         <button

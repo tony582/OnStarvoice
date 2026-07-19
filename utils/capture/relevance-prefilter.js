@@ -223,6 +223,38 @@ function createRequestId() {
   return `prefilter-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * Keep one idempotency key inside one HTTP request/retry scope only.
+ *
+ * The generic API layer appends the active capture task context immediately
+ * before sending. Reusing a content-only key in a later capture run therefore
+ * produced the same key with a different taskId in the request body, which the
+ * server correctly rejected as IDEMPOTENCY_CONFLICT. Including requestId keeps
+ * transport retries idempotent while preventing different capture runs from
+ * sharing a key just because their list text happens to be identical.
+ */
+export function buildRelevancePrefilterIdempotencyKey({
+  requestId = '',
+  platform = '',
+  keyword = '',
+  threshold = RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
+  batchIndex = 0,
+  items = [],
+} = {}) {
+  const normalizedThreshold = normalizeThreshold(threshold);
+  const normalizedRequestId = normalizeText(requestId, 200);
+  const contentHash = hashText(JSON.stringify(Array.isArray(items) ? items : []));
+  const baseKey = `${normalizeText(platform, 40).toLocaleLowerCase()}:${hashText(
+    normalizeKeyword(keyword),
+  )}:list:conservative:${normalizedThreshold.toFixed(4)}:${Math.max(
+    0,
+    Number(batchIndex) || 0,
+  )}:${contentHash}`;
+  return normalizedRequestId
+    ? `${baseKey}:request:${normalizedRequestId}`
+    : baseKey;
+}
+
 function readResponseItems(response) {
   if (Array.isArray(response?.items)) return response.items;
   if (Array.isArray(response?.data?.items)) return response.data.items;
@@ -352,22 +384,27 @@ export async function evaluateRelevancePrefilterRecords(
         }
 
         const requestId = createRequestId();
-        const contentHash = hashText(
-          JSON.stringify(batch.map((candidate) => candidate.evidence)),
-        );
+        const requestItems = batch.map((candidate) => candidate.evidence);
         let response = null;
         try {
           response = await requestBatch(
             {
               requestId,
-              idempotencyKey: `${batch[0].platform}:${hashText(batch[0].keyword)}:list:conservative:${normalizedThreshold.toFixed(4)}:${batchIndex}:${contentHash}`,
+              idempotencyKey: buildRelevancePrefilterIdempotencyKey({
+                requestId,
+                platform: batch[0].platform,
+                keyword: batch[0].keyword,
+                threshold: normalizedThreshold,
+                batchIndex,
+                items: requestItems,
+              }),
               platform: batch[0].platform,
               stage: 'list',
               keyword: batch[0].keyword,
               promptVersion: 'prefilter-list-v1',
               mode: 'conservative',
               skipThreshold: normalizedThreshold,
-              items: batch.map((candidate) => candidate.evidence),
+              items: requestItems,
             },
             {
               timeout: timeoutMs,

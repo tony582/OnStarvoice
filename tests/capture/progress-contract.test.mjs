@@ -54,7 +54,7 @@ this.normalizeUnattendedRunProgress = normalizeUnattendedRunProgress;`,
   return context.normalizeUnattendedRunProgress;
 }
 
-function evaluateSyntheticSessionBuilder() {
+function evaluateSyntheticSessionBuilder({dismissedTerminalRunAt = ""} = {}) {
   const source = readSection(
     sidebarSource,
     "function buildUnattendedSyntheticDebugSession(",
@@ -62,7 +62,10 @@ function evaluateSyntheticSessionBuilder() {
   );
   const context = {
     keywordPlanState: null,
-    isKeywordPlanRunning: () => true,
+    isKeywordPlanRunning: (plan = {}) =>
+      ["started", "running", "recovering"].includes(
+        String(plan?.lastRunStatus || ""),
+      ),
     getPagePlatform: () => "xiaohongshu",
     supportsPersistentCaptureTaskPlatform: () => true,
     KEYWORD_PLAN_TERMINAL_STATUSES: new Set([
@@ -71,8 +74,7 @@ function evaluateSyntheticSessionBuilder() {
       "failed",
       "canceled",
     ]),
-    DEBUG_SESSION_TERMINAL_SUMMARY_MS: 20_000,
-    debugSessionDismissedTerminalRunAt: "",
+    debugSessionDismissedTerminalRunAt: dismissedTerminalRunAt,
   };
   vm.createContext(context);
   vm.runInContext(
@@ -82,6 +84,51 @@ this.buildUnattendedSyntheticDebugSession =
     context,
   );
   return context.buildUnattendedSyntheticDebugSession;
+}
+
+function evaluateKeywordPlanRunning() {
+  const source = readSection(
+    sidebarSource,
+    "function isKeywordPlanRunning(plan = {})",
+    "function clearKeywordPlanProgressCountdown()",
+  );
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(
+    `${source}\nthis.isKeywordPlanRunning = isKeywordPlanRunning;`,
+    context,
+  );
+  return context.isKeywordPlanRunning;
+}
+
+function evaluateKeywordPlanProgressText() {
+  const source = readSection(
+    sidebarSource,
+    "function buildKeywordPlanProgressText(plan = {})",
+    "function renderKeywordPlanProgressText(progressText, plan = {})",
+  );
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(
+    `${source}\nthis.buildKeywordPlanProgressText = buildKeywordPlanProgressText;`,
+    context,
+  );
+  return context.buildKeywordPlanProgressText;
+}
+
+function evaluateTerminalProgressPhase() {
+  const source = readSection(
+    sidebarSource,
+    "function isTerminalProgressPhase(phase)",
+    "/**\n * 隐藏进度",
+  );
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(
+    `${source}\nthis.isTerminalProgressPhase = isTerminalProgressPhase;`,
+    context,
+  );
+  return context.isTerminalProgressPhase;
 }
 
 function evaluateUnattendedTaskCountsBuilder() {
@@ -103,7 +150,7 @@ this.buildUnattendedTaskCounts = buildUnattendedTaskCounts;`,
 function evaluateCaptureTaskProgressLabels() {
   const statsSource = readSection(
     sidebarSource,
-    "function buildCaptureTaskStats(progress = {})",
+    "function isTerminalCaptureTaskView(progress = {}, session = {})",
     "function parseCaptureTaskTime(",
   );
   const scopeSource = readSection(
@@ -333,6 +380,38 @@ test("task labels distinguish the keyword plan from items inside the current key
   );
 });
 
+test("recovering remains an active unattended state and progress copy is hierarchical", () => {
+  const isKeywordPlanRunning = evaluateKeywordPlanRunning();
+  assert.equal(isKeywordPlanRunning({lastRunStatus: "recovering"}), true);
+  assert.equal(isKeywordPlanRunning({lastRunStatus: "completed"}), false);
+
+  const buildKeywordPlanProgressText = evaluateKeywordPlanProgressText();
+  const text = buildKeywordPlanProgressText({
+    enabled: true,
+    keywords: ["别克车机", "别克 OTA", "君威"],
+    lastRunProgress: {
+      keyword: "别克 OTA",
+      keywordCurrent: 2,
+      keywordTotal: 13,
+      itemCurrent: 4,
+      itemTotal: 50,
+      current: 1,
+      total: 2,
+      message: "正在完善作品详情",
+    },
+  });
+  assert.match(text, /关键词 2\/13/);
+  assert.match(text, /「别克 OTA」/);
+  assert.match(text, /当前词内作品 4\/50/);
+  assert.doesNotMatch(text, /(?:^| · )1\/2(?: · |：)/);
+});
+
+test("streaming sync completion is a terminal progress phase", () => {
+  const isTerminalProgressPhase = evaluateTerminalProgressPhase();
+  assert.equal(isTerminalProgressPhase("streaming_sync_done"), true);
+  assert.equal(isTerminalProgressPhase("streaming_sync_drain"), false);
+});
+
 test("temporary Debug interruptions do not become whole-batch user cancellation", () => {
   const classify = evaluateUnattendedEnhanceCancellationClassifier();
 
@@ -380,6 +459,11 @@ test("unattended reporters forward hierarchy, task metadata and timing fields", 
   assertProgressFieldContract(
     planReporter,
     "createUnattendedKeywordProgressReporter",
+  );
+  assert.match(
+    planReporter,
+    /next\.noEnhancement = Math\.max\(next\.noEnhancement, noEnhancement\)/,
+    "a retry that reports zero must not erase already-settled no-enhancement items",
   );
 
   const protectedWaitReporter = readSection(
@@ -449,6 +533,7 @@ test("background normalization preserves hierarchy, task metadata and timing fie
         sortDimension: "latest",
       },
       enhancementEnabled: true,
+      aiRelevancePrefilterEnabled: true,
       commentsEnabled: true,
       bloggerMetricsEnabled: true,
     },
@@ -508,6 +593,7 @@ test("synthetic and native dark task surfaces consume the same progress contract
       enabled: true,
       platform: "xiaohongshu",
       keywords: ["别克车机", "别克壁纸"],
+      lastRunStatus: "running",
       lastRunProgress: progress,
     },
   );
@@ -527,7 +613,15 @@ test("synthetic and native dark task surfaces consume the same progress contract
   );
   assert.match(
     renderSection,
-    /const session = nativeActive \? nativeSession : syntheticSession/,
+    /const session = usingSyntheticSession \? syntheticSession : nativeSession/,
+  );
+  assert.match(
+    renderSection,
+    /syntheticSession && \(!nativeVisible \|\| syntheticSession\.terminal\)/,
+  );
+  assert.match(
+    renderSection,
+    /dismissedUnattendedNative[\s\S]*startsWith\("unattended-capture:"\)/,
   );
   assert.match(
     renderSection,
@@ -564,10 +658,10 @@ test("detail step text uses item progress rather than ambiguous legacy current/t
   );
 });
 
-test("recent unattended terminal state remains visible as a completed summary", () => {
+test("unattended terminal state remains visible until explicitly dismissed", () => {
   const buildUnattendedSyntheticDebugSession =
     evaluateSyntheticSessionBuilder();
-  const lastRunAt = new Date().toISOString();
+  const lastRunAt = "2026-01-01T00:00:00.000Z";
   const session = buildUnattendedSyntheticDebugSession(
     {
       lastActiveTabId: 88,
@@ -591,4 +685,207 @@ test("recent unattended terminal state remains visible as a completed summary", 
   assert.equal(session.terminalRunAt, lastRunAt);
   assert.equal(session.progress.phase, "unattended_completed");
   assert.equal(session.progress.progressPercent, 100);
+
+  const buildDismissedSession = evaluateSyntheticSessionBuilder({
+    dismissedTerminalRunAt: lastRunAt,
+  });
+  assert.equal(
+    buildDismissedSession(
+      {lastActiveTabId: 88},
+      {
+        enabled: true,
+        platform: "douyin",
+        keywords: ["吉事桔香茶", "桔香茶"],
+        lastRunStatus: "completed",
+        lastRunAt,
+      },
+    ),
+    null,
+  );
+});
+
+test("terminal progress preserves final timing, sync and enhancement statistics", () => {
+  const normalizeUnattendedRunProgress =
+    evaluateBackgroundProgressNormalizer();
+  const input = {
+    current: 4,
+    total: 4,
+    phase: "unattended_completed_with_failures",
+    captureTaskId: "unattended-capture:req-1",
+    unattendedRequestId: "req-1",
+    unattendedAttemptId: "attempt-2",
+    finishedAt: "2026-07-19T04:40:00.000Z",
+    keywordCompletedCount: 3,
+    keywordPartialCount: 1,
+    keywordFailedCount: 0,
+    detailSuccessCount: 24,
+    detailFailedCount: 1,
+    aiFilteredCount: 5,
+    noEnhancementCount: 2,
+    syncSuccessCount: 30,
+    syncFailedCount: 0,
+    syncSkippedCount: 0,
+    syncRemainingCount: 0,
+    progressPercent: 100,
+    taskMeta: {aiRelevancePrefilterEnabled: true},
+  };
+  const normalized = normalizeUnattendedRunProgress(input);
+  for (const field of [
+    "captureTaskId",
+    "unattendedRequestId",
+    "unattendedAttemptId",
+    "finishedAt",
+    "keywordCompletedCount",
+    "keywordPartialCount",
+    "keywordFailedCount",
+    "detailSuccessCount",
+    "detailFailedCount",
+    "aiFilteredCount",
+    "noEnhancementCount",
+    "syncSuccessCount",
+    "syncFailedCount",
+    "syncSkippedCount",
+    "syncRemainingCount",
+    "progressPercent",
+  ]) {
+    assert.equal(normalized[field], input[field], `lost terminal field ${field}`);
+  }
+  assert.equal(normalized.taskMeta.aiRelevancePrefilterEnabled, true);
+
+  const {buildCaptureTaskStats} = evaluateCaptureTaskProgressLabels();
+  const stats = buildCaptureTaskStats(input);
+  assert.match(stats, /完整完成 3 个词/);
+  assert.match(stats, /部分完成 1 个词/);
+  assert.doesNotMatch(stats, /失败 1 个词/);
+  assert.match(stats, /作品失败 1 条/);
+  assert.match(stats, /AI 跳过 5 条/);
+  assert.match(stats, /无需增强 2 条/);
+  assert.match(stats, /最终同步 30\/30 条/);
+});
+
+test("terminal synthetic session has stable identity and freezes at finishedAt", () => {
+  const buildUnattendedSyntheticDebugSession =
+    evaluateSyntheticSessionBuilder();
+  const startedAt = "2026-07-19T04:00:00.000Z";
+  const finishedAt = "2026-07-19T04:12:30.000Z";
+  const session = buildUnattendedSyntheticDebugSession(
+    {lastActiveTabId: 88},
+    {
+      enabled: true,
+      platform: "xiaohongshu",
+      keywords: ["词一", "词二"],
+      lastRunStatus: "completed",
+      lastRunAt: finishedAt,
+      lastRunProgress: {
+        captureTaskId: "unattended-capture:req-1",
+        unattendedRequestId: "req-1",
+        runStartedAt: startedAt,
+        finishedAt,
+        keywordCurrent: 2,
+        keywordTotal: 2,
+      },
+    },
+  );
+  assert.equal(session.taskId, "unattended-capture:req-1");
+  assert.equal(session.runId, "unattended-capture:req-1");
+  assert.equal(session.startedAt, startedAt);
+  assert.equal(session.finishedAt, finishedAt);
+  assert.equal(session.progress.finishedAt, finishedAt);
+  assert.equal(session.progress.itemCurrent, null);
+  assert.equal(session.progress.nextKeyword, "");
+
+  const clockSection = readSection(
+    sidebarSource,
+    "function updateDebugSessionClock()",
+    "function stopDebugSessionClock()",
+  );
+  assert.match(clockSection, /const clockNow = terminal/);
+  assert.match(clockSection, /parseCaptureTaskTime\(progress\.finishedAt\)/);
+  assert.match(
+    clockSection,
+    /isTerminalCaptureTaskView\(progress, session\)[\s\S]*?clearInterval/,
+  );
+  const healthSection = readSection(
+    sidebarSource,
+    "function resolveCaptureTaskHealth(",
+    "function resolveCaptureTaskActionCopy(",
+  );
+  assert.match(healthSection, /label: "已完成"/);
+  assert.match(healthSection, /label: "已停止"/);
+});
+
+test("unattended terminal report owns the final structured progress snapshot", () => {
+  const runSection = readSection(
+    sidebarSource,
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction(",
+  );
+  assert.match(runSection, /progress: createTerminalProgress\(/);
+  assert.match(
+    runSection,
+    /updateCaptureTaskSession\(\{[\s\S]*?progress: unattendedCaptureTaskTerminalProgress/,
+  );
+  assert.match(runSection, /warnings: stats\.partial/);
+  assert.match(runSection, /processed:\s*stats\.success \+ stats\.partial/);
+
+  const drainSection = readSection(
+    sidebarSource,
+    "async function drainStreamingDetailSyncQueue(",
+    "async function handleBatchKeywordCapture(",
+  );
+  for (const field of [
+    "syncSuccessCount",
+    "syncFailedCount",
+    "syncSkippedCount",
+    "syncRemainingCount",
+  ]) {
+    assert.match(drainSection, new RegExp(`\\b${field}:`));
+  }
+});
+
+test("terminal progress fences late unattended UI updates without blocking a new manual start", () => {
+  const progressSection = readSection(
+    sidebarSource,
+    "function handleProgress(progress)",
+    "async function syncRuntimeCommentProgress(",
+  );
+  assert.match(
+    progressSection,
+    /unattendedProgressState === "terminal" && !isTerminalPhase/,
+  );
+  assert.match(progressSection, /!suppressLateUnattendedUi/);
+
+  const showSection = readSection(
+    sidebarSource,
+    "function showProgress(message, showUI = true)",
+    "function hideProgressPanelOnly(",
+  );
+  assert.match(
+    showSection,
+    /if \(activeUnattendedRunRequestId\)[\s\S]*unattendedProgressState = "running"[\s\S]*else \{[\s\S]*delete progressContainer\.dataset\.unattendedProgressState/,
+  );
+
+  const planCleanupSection = readSection(
+    sidebarSource,
+    "function hideKeywordPlanProgressPanelIfOwned(",
+    "function syncKeywordPlanProgressPanel(",
+  );
+  assert.match(
+    planCleanupSection,
+    /unattendedState === "running"[\s\S]*unattendedState === "terminal"/,
+  );
+  assert.match(planCleanupSection, /btnCancel\.hidden = true/);
+  assert.match(planCleanupSection, /btnCancel\.disabled = true/);
+
+  const genericCleanupSection = readSection(
+    sidebarSource,
+    "function hideProgressPanelOnly(",
+    "function isTerminalProgressPhase(",
+  );
+  assert.match(
+    genericCleanupSection,
+    /preserveUnattendedTerminalState[\s\S]*unattendedProgressState === "terminal"/,
+  );
+  assert.match(genericCleanupSection, /btnCancel\.hidden = true/);
+  assert.match(genericCleanupSection, /btnCancel\.disabled = true/);
 });

@@ -331,6 +331,8 @@ function createHarness() {
       `    return captureTaskOwnerCoordinator.bind(port, taskId);\n` +
       `  },\n` +
       `  handleAbandonedCaptureTask,\n` +
+      `  handleUnexpectedCaptureDebugDetach,\n` +
+      `  handleCaptureRuntimeTabRemoved,\n` +
       `  handleCaptureRuntimeTabReplaced,\n` +
       `  getCaptureTaskGroup: (taskId) => captureTaskTabGroupManager.getTask(taskId),\n` +
       `  releaseUnattendedKeywordPlanLock,\n` +
@@ -2775,6 +2777,130 @@ test("an unattended sidebar owner disconnect recovers the parent request instead
   );
 });
 
+test("a late Debug detach only cleans a terminal unattended wrapper and never creates a public ledger run", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness);
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "terminal-detach-holder",
+    holderDocumentId: "terminal-detach-document",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+  };
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{id: request.id, status: "completed"}],
+  };
+
+  await harness.api.handleUnexpectedCaptureDebugDetach({
+    session: harness.api.getCaptureDebugSessionByTaskId(stableTaskId),
+    reason: "target_closed",
+  });
+
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.deepEqual(
+    Array.from(harness.storage[TASK_LEDGER_KEY].runs, (run) => run.id),
+    [request.id],
+  );
+  assert.equal(harness.storage[TASK_LEDGER_KEY].runs[0].status, "completed");
+});
+
+test("a late owner disconnect only cleans a terminal unattended wrapper and preserves the root ledger", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness);
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "terminal-owner-holder",
+    holderDocumentId: "terminal-owner-document",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+  };
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{id: request.id, status: "completed"}],
+  };
+
+  await harness.api.handleAbandonedCaptureTask({taskId: stableTaskId});
+
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.deepEqual(
+    Array.from(harness.storage[TASK_LEDGER_KEY].runs, (run) => run.id),
+    [request.id],
+  );
+  assert.equal(harness.storage[TASK_LEDGER_KEY].runs[0].status, "completed");
+});
+
+test("closing an active unattended source tab recovers the root request without creating a wrapper ledger", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    planSnapshot: {
+      keywords: Array.from({length: 4}, (_, index) => `来源页恢复词${index + 1}`),
+    },
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "source-removed-holder",
+    holderDocumentId: "source-removed-document",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+
+  await harness.api.handleCaptureRuntimeTabRemoved(41);
+
+  const recoveredRequest = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(recoveredRequest.attemptNumber, 2);
+  assert.equal(recoveredRequest.status, "pending");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(
+    Boolean(
+      harness.storage[TASK_LEDGER_KEY]?.runs?.some(
+        (run) => run.id === stableTaskId,
+      ),
+    ),
+    false,
+  );
+});
+
 test("a replacement runner reclaims its own stale unattended child instead of reporting group busy", async () => {
   const harness = createHarness();
   seedUnattendedRequest(harness, {
@@ -2828,6 +2954,131 @@ test("a replacement runner reclaims its own stale unattended child instead of re
     "unattended-child-after-runner-replacement",
   );
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+});
+
+test("a replacement Douyin runner releases stable Debug resources even after the lock binding was cleared", async () => {
+  const harness = createHarness();
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    url: "https://www.douyin.com/search/unattended-rebind?type=general",
+    title: "douyin capture source",
+  }));
+  const request = seedUnattendedRequest(harness);
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "runner-holder-residual-debug",
+    holderDocumentId: "runner-document-residual-debug",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+
+  const firstBegin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "douyin",
+  });
+  assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
+
+  // This is the real recovery race from the Windows diagnostic: the persisted
+  // binding was already cleared while the stable Debug/group resources still
+  // belonged to the old source tab.
+  harness.storage[LOCK_KEY] = {
+    ...harness.storage[LOCK_KEY],
+    captureTaskId: "",
+    captureTaskAttemptId: "",
+  };
+
+  const replacement = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 44,
+      platform: "douyin",
+    },
+    {
+      documentId: "runner-document-residual-debug",
+      tab: {
+        id: 42,
+        url: `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}`,
+      },
+    },
+  );
+
+  assert.equal(replacement.ok, true, JSON.stringify(replacement));
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    44,
+  );
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 44);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, stableTaskId);
+});
+
+test("a replacement Douyin runner clears a residual group instead of reporting cleanup pending", async () => {
+  const harness = createHarness();
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    url: "https://www.douyin.com/search/unattended-cleanup?type=general",
+    title: "douyin capture source",
+  }));
+  const request = seedUnattendedRequest(harness);
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "runner-holder-residual-group",
+    holderDocumentId: "runner-document-residual-group",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+  const firstBegin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "douyin",
+  });
+  assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
+
+  await harness.api.stopCaptureDebugTask(stableTaskId, "simulate_cleanup_race");
+  harness.storage[LOCK_KEY] = {
+    ...harness.storage[LOCK_KEY],
+    captureTaskId: "",
+    captureTaskAttemptId: "",
+  };
+
+  const replacement = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 44,
+      platform: "douyin",
+    },
+    {
+      documentId: "runner-document-residual-group",
+      tab: {
+        id: 42,
+        url: `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}`,
+      },
+    },
+  );
+
+  assert.equal(replacement.ok, true, JSON.stringify(replacement));
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    44,
+  );
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 44);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, stableTaskId);
 });
 
 test("a late END from the recovered unattended attempt cannot stop the replacement Debug task", async () => {

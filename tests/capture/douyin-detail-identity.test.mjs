@@ -103,6 +103,127 @@ test("Douyin DOM identity wins over a misleading modal_id URL", async () => {
   }
 });
 
+test("Douyin CDN /video/tos/ href never overrides the numeric modal identity", async () => {
+  const previousWindow = globalThis.window;
+  const noteId = "7662443795690278611";
+  globalThis.window = {
+    location: {
+      href: `https://www.douyin.com/jingxuan/search/test?modal_id=${noteId}`,
+    },
+  };
+  try {
+    const {resolveDouyinNoteId} = await import(
+      `../../utils/capture/douyin-single-note.js?cdn-href-identity=${Date.now()}`
+    );
+    const cdnLink = {
+      getAttribute(name) {
+        return name === "href"
+          ? "https://v3-web.douyinvod.com/video/tos/cn/tos-cn-ve-15/o123"
+          : "";
+      },
+    };
+    const detailRoot = {
+      matches() {
+        return false;
+      },
+      querySelector(selector) {
+        return selector.includes('a[href*="/video/"]') ? cdnLink : null;
+      },
+      getAttribute() {
+        return "";
+      },
+    };
+
+    assert.equal(resolveDouyinNoteId(detailRoot), noteId);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("Douyin CDN /video/tos/ media src never overrides the numeric direct-route identity", async () => {
+  const previousWindow = globalThis.window;
+  const noteId = "7662443795690278622";
+  globalThis.window = {
+    location: {
+      href: `https://www.douyin.com/video/${noteId}`,
+    },
+  };
+  try {
+    const {resolveDouyinNoteId} = await import(
+      `../../utils/capture/douyin-single-note.js?cdn-video-identity=${Date.now()}`
+    );
+    const video = {
+      currentSrc: "",
+      getAttribute(name) {
+        return name === "src"
+          ? "https://v3-web.douyinvod.com/video/tos/cn/tos-cn-ve-15/o456"
+          : "";
+      },
+      querySelector() {
+        return null;
+      },
+    };
+    const emptyDetailLink = {
+      getAttribute() {
+        return "";
+      },
+    };
+    const detailRoot = {
+      matches() {
+        return false;
+      },
+      querySelector(selector) {
+        if (selector.includes('a[href*="/video/"]')) {
+          return emptyDetailLink;
+        }
+        return selector === "video" ? video : null;
+      },
+      getAttribute() {
+        return "";
+      },
+    };
+
+    assert.equal(resolveDouyinNoteId(detailRoot), noteId);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("Douyin href identity candidates must contain at least eight numeric digits", async () => {
+  const previousWindow = globalThis.window;
+  const noteId = "7662443795690278633";
+  globalThis.window = {
+    location: {
+      href: `https://www.douyin.com/jingxuan/search/test?modal_id=${noteId}`,
+    },
+  };
+  try {
+    const {resolveDouyinNoteId} = await import(
+      `../../utils/capture/douyin-single-note.js?short-href-identity=${Date.now()}`
+    );
+    const shortIdLink = {
+      getAttribute(name) {
+        return name === "href" ? "https://www.douyin.com/video/1234567" : "";
+      },
+    };
+    const detailRoot = {
+      matches() {
+        return false;
+      },
+      querySelector(selector) {
+        return selector.includes('a[href*="/video/"]') ? shortIdLink : null;
+      },
+      getAttribute() {
+        return "";
+      },
+    };
+
+    assert.equal(resolveDouyinNoteId(detailRoot), noteId);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
 test("Douyin image modal fallback uses the note route instead of video", async () => {
   const {
     buildDouyinDetailNavigationCandidates,

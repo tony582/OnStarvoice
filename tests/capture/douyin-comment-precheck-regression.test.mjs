@@ -97,12 +97,14 @@ test("Douyin batch capture reaches the real collector before any readiness recov
     "the real collector must retain the expected Douyin work ID guard",
   );
 
-  const resultStart = branch.indexOf("const commentsResult =");
+  const resultStart = branch.indexOf(
+    "commentsResult = await captureCommentsForCurrentNote({",
+  );
   const resultEnd = branch.indexOf(
     "const commentIdentityFailure =",
     resultStart,
   );
-  assert.ok(resultStart >= 0, "missing comment result assignment");
+  assert.ok(resultStart >= 0, "missing real comment collector assignment");
   assert.ok(resultEnd > resultStart, "missing comment identity validation");
   const resultBlock = branch.slice(resultStart, resultEnd);
 

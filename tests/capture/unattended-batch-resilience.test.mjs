@@ -141,6 +141,7 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
     captureCalls,
     navigationCalls,
     progress,
+    getReplacementListenerCount: () => replacementListeners.size,
     replaceRunnerTab,
     run,
     settled,
@@ -234,6 +235,44 @@ test("non-user detail cancellation marks the keyword partial and continues", asy
   assert.equal(result.results[0].partial, true);
   assert.equal(result.results[0].canceled, false);
   assert.equal(harness.settled[0].canceled, false);
+});
+
+test("runner interruption without canceled flag is checkpointed and continues to the next keyword", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    afterKeywordCapture: async ({current}) =>
+      current === 1
+        ? {
+            ok: false,
+            canceled: false,
+            runnerInterrupted: true,
+            results: [
+              {
+                recordId: "词1-record",
+                ok: false,
+                reason: "CONTEXT_INTERRUPTED",
+                category: "context_interrupted",
+                runnerInterrupted: true,
+              },
+            ],
+          }
+        : {ok: true},
+  });
+
+  const result = await harness.run({keywords: ["词1", "词2", "词3"]});
+
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词1", "词2", "词3"],
+  );
+  assert.equal(result.canceled, false);
+  assert.equal(result.recoveryRequired, false);
+  assert.equal(result.results[0].partial, true);
+  assert.equal(result.results[0].enhanceStatus, "failed");
+  assert.equal(result.results[0].enhanceResult.runnerInterrupted, true);
+  assert.equal(harness.settled.length, 3);
+  assert.equal(harness.settled[0].canceled, false);
+  assert.equal(harness.progress.at(-1)?.phase, "done");
 });
 
 test("an explicit user stop still terminates the keyword plan", async () => {
@@ -338,4 +377,168 @@ test("runner loss with an invalidated stop predicate requests checkpoint recover
   assert.deepEqual(harness.captureCalls.map((call) => call.keyword), ["词1"]);
   assert.equal(result.results[0].recoveryRequired, true);
   assert.equal(harness.settled[0].canceled, false);
+});
+
+test("a mixed 13-keyword unattended plan settles every keyword in order", async () => {
+  const attempts = new Map();
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => {
+      const keyword = captureParams.keyword;
+      attempts.set(keyword, (attempts.get(keyword) || 0) + 1);
+      if (keyword === "词1") {
+        return {
+          ok: true,
+          captureResult: {ok: true, data: {items: []}},
+          recordIds: [],
+          savedRecords: [],
+        };
+      }
+      return successCapture(keyword);
+    },
+    afterKeywordCapture: async ({current, keyword, recordIds}) => {
+      if (current === 5) {
+        return {
+          ok: false,
+          canceled: false,
+          successCount: 0,
+          failedCount: 1,
+          results: [
+            {
+              recordId: recordIds[0],
+              ok: false,
+              reason: "DETAIL_OPEN_TIMEOUT",
+            },
+          ],
+        };
+      }
+      if (current === 8) {
+        return {
+          ok: false,
+          canceled: false,
+          runnerInterrupted: true,
+          recoveryRequired: true,
+          successCount: 0,
+          failedCount: 1,
+          results: [
+            {
+              recordId: recordIds[0],
+              ok: false,
+              reason: "RUNNER_TAB_UNAVAILABLE",
+              category: "context_interrupted",
+              runnerInterrupted: true,
+            },
+          ],
+        };
+      }
+      return {
+        ok: true,
+        canceled: false,
+        successCount: 1,
+        failedCount: 0,
+        results: [{recordId: recordIds[0], ok: true, keyword}],
+      };
+    },
+  });
+  const keywords = Array.from({length: 13}, (_, index) => `词${index + 1}`);
+
+  const result = await harness.run({keywords});
+
+  assert.equal(attempts.get("词1"), 2, "an empty keyword retries exactly once");
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词1", ...keywords],
+    "the empty retry must not reorder or truncate the remaining keywords",
+  );
+  assert.deepEqual(
+    harness.settled.map((entry) => entry.keyword),
+    keywords,
+    "all 13 checkpoints must be persisted in plan order",
+  );
+  assert.deepEqual(
+    Array.from(result.results, (entry) => entry.keyword),
+    keywords,
+    "the terminal result must include one settlement for every keyword",
+  );
+  assert.equal(result.stats.total, 13);
+  assert.equal(result.stats.processed, 13);
+  assert.equal(result.canceled, false);
+  assert.equal(result.results[0].ok, false, "the no-result keyword is explicit");
+  assert.equal(result.results[4].enhanceStatus, "failed");
+  assert.equal(result.results[4].partial, true);
+  assert.equal(result.results[7].enhanceStatus, "failed");
+  assert.equal(result.results[7].partial, true);
+  assert.equal(result.results[7].enhanceResult.runnerInterrupted, true);
+  assert.equal(harness.progress.at(-1)?.phase, "done");
+  assert.equal(
+    harness.getReplacementListenerCount(),
+    0,
+    "the run must release its tab replacement listener",
+  );
+});
+
+test("two consecutive unattended rounds do not reuse results or listeners", async () => {
+  let activeRound = 1;
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => ({
+      ...successCapture(captureParams.keyword),
+      recordIds: [`round-${activeRound}-${captureParams.keyword}`],
+    }),
+    afterKeywordCapture: async ({recordIds}) => ({
+      ok: true,
+      canceled: false,
+      successCount: 1,
+      failedCount: 0,
+      results: [{recordId: recordIds[0], ok: true}],
+    }),
+  });
+  const keywords = Array.from({length: 13}, (_, index) => `词${index + 1}`);
+
+  const first = await harness.run({keywords});
+  assert.equal(harness.getReplacementListenerCount(), 0);
+  activeRound = 2;
+  const second = await harness.run({keywords});
+
+  assert.equal(first.stats.processed, 13);
+  assert.equal(second.stats.processed, 13);
+  assert.equal(first.results.length, 13);
+  assert.equal(second.results.length, 13);
+  assert.ok(
+    first.results.every((entry) => entry.recordIds[0].startsWith("round-1-")),
+  );
+  assert.ok(
+    second.results.every((entry) => entry.recordIds[0].startsWith("round-2-")),
+  );
+  assert.deepEqual(
+    harness.settled.map((entry) => entry.keyword),
+    [...keywords, ...keywords],
+    "both rounds must independently checkpoint all 13 keywords",
+  );
+  assert.equal(
+    harness.getReplacementListenerCount(),
+    0,
+    "a completed round must leave no listener that can receive stale tab events",
+  );
+  assert.equal(
+    harness.progress.filter((entry) => entry.phase === "done").length,
+    2,
+    "each round owns exactly one root terminal event",
+  );
+  const firstDoneAt = harness.progress.findIndex(
+    (entry) => entry.phase === "done",
+  );
+  assert.ok(
+    harness.progress
+      .slice(firstDoneAt + 1)
+      .some(
+        (entry) =>
+          entry.keyword === "词1" &&
+          ["navigating", "submitting_search"].includes(entry.phase),
+      ),
+    "round two must start from its own first-keyword progress after round one",
+  );
+  assert.doesNotMatch(
+    JSON.stringify({first, second}),
+    /(?:still cleaning|cleanup pending|group busy|仍在清理|已绑定.*Tab)/i,
+    "a clean second round must not inherit stale cleanup or task-group errors",
+  );
 });

@@ -500,6 +500,10 @@ const DOUYIN_UNAVAILABLE_GRACE_MS = 4500;
 const DOUYIN_DETAIL_ROUTE_SETTLE_MS = 1200;
 const DOUYIN_SEARCH_MODAL_BIND_GRACE_MS = 2500;
 const DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS = 15000;
+// 抖音同一作品可能依次尝试“搜索弹层 / 采集到的详情链接 / 直达链接”。
+// 这些候选必须共享总预算，不能每个候选都重新吃满超时，导致一条坏链接
+// 把无人值守任务拖成分钟级假死。
+const DOUYIN_DETAIL_NAV_TOTAL_TIMEOUT_MS = 32000;
 const DOUYIN_COMMENT_READY_PROBE_TIMEOUT_MS = 1800;
 const DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS = 8000;
 // 补采详情「条与条之间」的随机间隔。注:小红书 300013 的真因是 xsec_source 为空(见
@@ -2965,6 +2969,17 @@ function buildDouyinCommentIdentityFailure(expectedNoteId, actualNoteId) {
   };
 }
 
+function attachPartialDetailPayload(error, detailPayload) {
+  const effectiveError =
+    error && typeof error === 'object'
+      ? error
+      : new Error(String(error || '评论采集失败，请稍后重试'));
+  if (effectiveError.partialDetailPayload === undefined) {
+    effectiveError.partialDetailPayload = detailPayload;
+  }
+  return effectiveError;
+}
+
 /**
  * 批量补采博主/关键词记录的笔记详情，回填到原记录 payload
  */
@@ -3010,23 +3025,228 @@ export async function batchCaptureDetailsForRecords(
     };
   }
 
+  const buildSetupFailureResult = async ({
+    code,
+    message,
+    sourceTabId = null,
+    runnerTabId = null,
+    aiFilteredRecordIds = new Set(),
+    alreadyCapturedRecordIds = new Set(),
+    relevanceDecisionById = new Map(),
+  } = {}) => {
+    const normalizedCode =
+      String(code || 'RUNNER_TAB_UNAVAILABLE').trim().toUpperCase() ||
+      'RUNNER_TAB_UNAVAILABLE';
+    const normalizedMessage =
+      String(message || '详情采集工作页初始化失败，请稍后重试').trim() ||
+      '详情采集工作页初始化失败，请稍后重试';
+    const results = [];
+    let failedCount = 0;
+    let filteredCount = 0;
+    let skippedCount = 0;
+
+    for (let index = 0; index < uniqueRecordIds.length; index += 1) {
+      const recordId = uniqueRecordIds[index];
+      const record = await getRecord(recordId).catch(() => null);
+      const captureTraceFields = buildCaptureTraceEventFields(record);
+      const markerLabel = formatCaptureTraceMarker(
+        captureTraceFields,
+        index + 1,
+      );
+      const progressLabel = formatCaptureTraceProgressLabel(
+        captureTraceFields,
+        index + 1,
+        uniqueRecordIds.length,
+      );
+
+      if (aiFilteredRecordIds.has(recordId)) {
+        const decision = relevanceDecisionById.get(recordId) || {};
+        filteredCount += 1;
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'filtered',
+          record,
+          tabId: sourceTabId,
+        });
+        const item = {
+          recordId,
+          ok: true,
+          filtered: true,
+          reason: 'ai_relevance_filtered',
+          message: `${markerLabel} AI 高置信度判定无关，已跳过采集增强`,
+          aiRelevanceConfidence: decision.confidence ?? null,
+          aiRelevanceReason: decision.reason || '',
+          ...captureTraceFields,
+        };
+        results.push(item);
+        await reportProgressFailSoft(onProgress, {
+          ...item,
+          phase: 'detail_item_filtered',
+          message: `${progressLabel}：AI 高置信度判定无关，已跳过详情、评论和博主采集`,
+          current: index + 1,
+          total: uniqueRecordIds.length,
+          successCount: 0,
+          failedCount,
+          filteredCount,
+          skippedCount,
+          runnerTabId,
+        }, 'detail setup ai-filtered item');
+        continue;
+      }
+
+      if (alreadyCapturedRecordIds.has(recordId)) {
+        skippedCount += 1;
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'skipped',
+          record,
+          tabId: sourceTabId,
+        });
+        const item = {
+          recordId,
+          ok: true,
+          skipped: true,
+          reason: 'already_captured',
+          message: `${markerLabel} 之前已采过，自动跳过`,
+          ...captureTraceFields,
+        };
+        results.push(item);
+        await reportProgressFailSoft(onProgress, {
+          ...item,
+          phase: 'detail_item_skipped',
+          message: `${progressLabel}：之前已采过，跳过（增量采集）`,
+          current: index + 1,
+          total: uniqueRecordIds.length,
+          successCount: 0,
+          failedCount,
+          filteredCount,
+          skippedCount,
+          runnerTabId,
+        }, 'detail setup already-captured item');
+        continue;
+      }
+
+      failedCount += 1;
+      // 初始化阶段失败也必须落成一条完整的失败记录。否则调用方虽然能
+      // 收到 failedCount，卡片仍会停留在“未执行/采集中”，随后又可能被
+      // 同步队列当成待处理项重新入队。
+      if (record) {
+        try {
+          const finishedAt = Date.now();
+          const failedPayload = applyDetailCapturePatch(
+            record.payload,
+            createDetailCapturePatch({
+              status: DETAIL_CAPTURE_STATUS.FAILED,
+              startedAt:
+                Number(record?.payload?.detailCaptureStartedAt) || finishedAt,
+              finishedAt,
+              error: normalizedMessage,
+              failureCode: normalizedCode,
+              failureStage: 'runner_initialization',
+              failureCategory:
+                DETAIL_CAPTURE_FAILURE_CATEGORY.CONTEXT_INTERRUPTED,
+              diagnosticMessage: normalizedMessage,
+              noteUrl: resolveRecordNoteUrl(record),
+            }),
+          );
+          const failedTraceTransition = transitionRecordCaptureTrace(
+            record,
+            failedPayload,
+            'runner_interrupted',
+          );
+          await updateRecord(recordId, {
+            status: RECORD_STATUS.DRAFT,
+            payload: failedTraceTransition.payload,
+          });
+          if (failedTraceTransition.binding) {
+            await sendCaptureTraceBindingsToTab(sourceTabId, [
+              failedTraceTransition.binding,
+            ]);
+          }
+        } catch (error) {
+          // 结果契约优先：即使本地持久化异常，也不能吞掉逐条失败结果。
+          console.warn(
+            '[CaptureSync] persist detail setup failure failed (ignored):',
+            error?.message || error,
+          );
+        }
+      }
+      const item = {
+        recordId,
+        ok: false,
+        reason: normalizedCode,
+        code: normalizedCode,
+        category: DETAIL_CAPTURE_FAILURE_CATEGORY.CONTEXT_INTERRUPTED,
+        stage: 'runner_initialization',
+        message: `${markerLabel}：${normalizedMessage}`,
+        diagnosticMessage: normalizedMessage,
+        runnerInterrupted: true,
+        recoveryRequired: true,
+        ...captureTraceFields,
+      };
+      results.push(item);
+      await reportProgressFailSoft(onProgress, {
+        ...item,
+        phase: 'detail_item_failed',
+        message: `${progressLabel}：${normalizedMessage}`,
+        current: index + 1,
+        total: uniqueRecordIds.length,
+        successCount: 0,
+        failedCount,
+        filteredCount,
+        skippedCount,
+        runnerTabId,
+        sourceTabId,
+      }, 'detail setup failed item');
+    }
+
+    await reportProgressFailSoft(onProgress, {
+      phase: 'detail_batch_init_failed',
+      message: `${normalizedMessage}（失败 ${failedCount} 条）`,
+      current: results.length,
+      total: uniqueRecordIds.length,
+      successCount: 0,
+      failedCount,
+      filteredCount,
+      skippedCount,
+      runnerTabId,
+      sourceTabId,
+      runnerInterrupted: true,
+      recoveryRequired: true,
+      error: {code: normalizedCode, message: normalizedMessage},
+    }, 'detail batch setup failed');
+
+    return {
+      ok: false,
+      canceled: false,
+      runnerInterrupted: true,
+      recoveryRequired: true,
+      securityBlocked: false,
+      total: uniqueRecordIds.length,
+      processedCount: results.length,
+      successCount: 0,
+      failedCount,
+      filteredCount,
+      skippedCount,
+      results,
+      diagnostics: {stageTrace: []},
+      error: {
+        code: normalizedCode,
+        category: DETAIL_CAPTURE_FAILURE_CATEGORY.CONTEXT_INTERRUPTED,
+        stage: 'runner_initialization',
+        message: normalizedMessage,
+      },
+    };
+  };
+
   let activeTab = null;
   try {
     activeTab = await getCurrentActiveTab();
   } catch (error) {
-    return {
-      ok: false,
-      canceled: false,
-      total: uniqueRecordIds.length,
-      processedCount: 0,
-      successCount: 0,
-      failedCount: 0,
-      results: [],
-      error: {
-        code: 'TAB_NOT_FOUND',
-        message: error.message || '未找到当前活动标签页',
-      },
-    };
+    return await buildSetupFailureResult({
+      code: 'TAB_NOT_FOUND',
+      message: error.message || '未找到当前活动标签页',
+    });
   }
 
   await restoreCaptureTraceOverlayForRecords(
@@ -3416,7 +3636,7 @@ export async function batchCaptureDetailsForRecords(
   let filteredCount = 0;
   let skippedCount = 0; // 增量采集:之前已采过、本次跳过的条数(单列,不混入"过滤")
   let securityBlocked = false; // 撞上小红书安全限制(访问频繁/300013)→ 立即停整批,别再硬刷
-  let runnerInterrupted = false; // 任一 owned 工作页被关闭/中断后立即停批,绝不新建替代 worker
+  let runnerInterrupted = false; // owned 工作页中断即停批，交给外层用全新工作页最多重试一次
   let detailKeywordFilterEnabled = false;
   let detailKeywordFilteredCount = 0;
   let canceled = false;
@@ -3428,68 +3648,9 @@ export async function batchCaptureDetailsForRecords(
   let batchUnexpectedError = null;
   const fatalCancelRequestedTabIds = new Set();
 
-  try {
-    runnerContext = await prepareDetailBatchRunnerContext({
-      sourceTab: activeTab,
-      runnerMode: DETAIL_RUNNER_MODE.DEDICATED_TAB,
-      indexOffset: 1,
-    });
-    runnerContexts.push(runnerContext);
-  } catch (error) {
-    return {
-      ok: false,
-      canceled: false,
-      total: uniqueRecordIds.length,
-      processedCount: 0,
-      successCount: 0,
-      failedCount: 0,
-      results: [],
-      error: {
-        code: 'RUNNER_TAB_UNAVAILABLE',
-        message: error?.message || '初始化补采标签页失败',
-      },
-    };
-  }
-
-  const normalizedCaptureTaskId = normalizeCaptureTaskId(captureTaskId);
-  const taskTabRegistration = await registerCaptureTaskTab({
-    taskId: normalizedCaptureTaskId,
-    tabId: runnerContext.runnerTabId,
-    role: 'detail_worker',
-  });
-  const requiredTaskRegistrationMissing =
-    Boolean(normalizedCaptureTaskId) &&
-    (taskTabRegistration?.ok !== true || taskTabRegistration?.skipped === true);
-  if (taskTabRegistration?.ok === false || requiredTaskRegistrationMissing) {
-    await closeOwnedDetailRunnerTab({
-      runnerTabId: runnerContext.runnerTabId,
-      sourceTabId: runnerContext.sourceTabId,
-      ownsRunnerTab: runnerContext.ownsRunnerTab,
-    }).catch(() => false);
-    return {
-      ok: false,
-      canceled: false,
-      total: uniqueRecordIds.length,
-      processedCount: 0,
-      successCount: 0,
-      failedCount: 0,
-      results: [],
-      error: {
-        code: 'TASK_TAB_GROUP_UNAVAILABLE',
-        message:
-          taskTabRegistration?.response?.error?.message ||
-          (taskTabRegistration?.skipped
-            ? '当前详情采集任务已失去浏览器接管状态'
-            : '') ||
-          '详情采集工作页无法加入当前任务标签组',
-      },
-    };
-  }
-
-  const remainingDetailCount = Math.max(
-    0,
-    uniqueRecordIds.length - preDetailSkipRecordIdSet.size,
-  );
+  // 先确认本批平台，再决定是否启用双工作页。抖音恢复为已验证稳定的
+  // “来源搜索页 + 一个独立详情工作页”串行模式；来源页绝不兼任 worker。
+  // 小红书继续保留现有 A/B 双工作页。
   const detailBatchPlatforms = new Set([
     detectPlatformFromUrl(String(activeTab?.url || '')),
   ]);
@@ -3519,6 +3680,60 @@ export async function batchCaptureDetailsForRecords(
     }
   }
   const detailBatchContainsDouyin = detailBatchPlatforms.has('douyin');
+
+  try {
+    runnerContext = await prepareDetailBatchRunnerContext({
+      sourceTab: activeTab,
+      runnerMode: DETAIL_RUNNER_MODE.DEDICATED_TAB,
+      indexOffset: 1,
+    });
+    runnerContexts.push(runnerContext);
+  } catch (error) {
+    return await buildSetupFailureResult({
+      code: 'RUNNER_TAB_UNAVAILABLE',
+      message: error?.message || '初始化详情采集工作页失败，请稍后重试',
+      sourceTabId: activeTab?.id || null,
+      aiFilteredRecordIds: relevancePrefilterSkipRecordIdSet,
+      alreadyCapturedRecordIds: skipRecordIdSet,
+      relevanceDecisionById: relevanceDecisionByRecordId,
+    });
+  }
+
+  const normalizedCaptureTaskId = normalizeCaptureTaskId(captureTaskId);
+  const taskTabRegistration = await registerCaptureTaskTab({
+    taskId: normalizedCaptureTaskId,
+    tabId: runnerContext.runnerTabId,
+    role: 'detail_worker',
+  });
+  const requiredTaskRegistrationMissing =
+    Boolean(normalizedCaptureTaskId) &&
+    (taskTabRegistration?.ok !== true || taskTabRegistration?.skipped === true);
+  if (taskTabRegistration?.ok === false || requiredTaskRegistrationMissing) {
+    await closeOwnedDetailRunnerTab({
+      runnerTabId: runnerContext.runnerTabId,
+      sourceTabId: runnerContext.sourceTabId,
+      ownsRunnerTab: runnerContext.ownsRunnerTab,
+    }).catch(() => false);
+    return await buildSetupFailureResult({
+      code: 'TASK_TAB_GROUP_UNAVAILABLE',
+      message:
+        taskTabRegistration?.response?.error?.message ||
+        (taskTabRegistration?.skipped
+          ? '当前详情采集任务已失去浏览器接管状态'
+          : '') ||
+        '详情采集工作页无法加入当前任务标签组',
+      sourceTabId: runnerContext.sourceTabId,
+      runnerTabId: runnerContext.runnerTabId,
+      aiFilteredRecordIds: relevancePrefilterSkipRecordIdSet,
+      alreadyCapturedRecordIds: skipRecordIdSet,
+      relevanceDecisionById: relevanceDecisionByRecordId,
+    });
+  }
+
+  const remainingDetailCount = Math.max(
+    0,
+    uniqueRecordIds.length - preDetailSkipRecordIdSet.size,
+  );
   const allowDetailDoubleBuffer = !detailBatchContainsDouyin;
   if (
     normalizedCaptureTaskId &&
@@ -3591,7 +3806,7 @@ export async function batchCaptureDetailsForRecords(
     }
   };
 
-  detailPrefetchPipeline = createDetailPrefetchPipeline({
+  const createCurrentDetailPrefetchPipeline = () => createDetailPrefetchPipeline({
     workerTabs: runnerContexts.map((context, index) => ({
       tabId: context.runnerTabId,
       label: `工作页 ${String.fromCharCode(65 + index)}`,
@@ -3616,23 +3831,49 @@ export async function batchCaptureDetailsForRecords(
           )
         : [url];
       let lastRecoverableError = null;
+      const douyinNavigationDeadline = isDouyinDetailNavigation
+        ? Date.now() + Math.min(
+            normalizedDetailNavTimeoutMs,
+            DOUYIN_DETAIL_NAV_TOTAL_TIMEOUT_MS,
+          )
+        : 0;
 
       for (const candidateUrl of navigationCandidates) {
         try {
+          const remainingDouyinBudgetMs = isDouyinDetailNavigation
+            ? Math.max(0, douyinNavigationDeadline - Date.now())
+            : normalizedDetailNavTimeoutMs;
+          if (isDouyinDetailNavigation && remainingDouyinBudgetMs <= 0) {
+            const budgetError = new Error('抖音详情页在限定时间内未完成加载');
+            budgetError.code = 'DETAIL_NAVIGATION_TIMEOUT';
+            throw budgetError;
+          }
           await openUrlInTab(tabId, candidateUrl, {
             timeoutMs: isDouyinDetailNavigation
               ? Math.min(
                   normalizedDetailNavTimeoutMs,
                   DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS,
+                  remainingDouyinBudgetMs,
                 )
               : normalizedDetailNavTimeoutMs,
             shouldStop: pipelineShouldStop,
             active: isDouyinDetailNavigation,
           });
+          const remainingProbeBudgetMs = isDouyinDetailNavigation
+            ? Math.max(0, douyinNavigationDeadline - Date.now())
+            : undefined;
+          if (isDouyinDetailNavigation && remainingProbeBudgetMs <= 0) {
+            const budgetError = new Error('抖音详情页在限定时间内未完成加载');
+            budgetError.code = 'DETAIL_NAVIGATION_TIMEOUT';
+            throw budgetError;
+          }
           await probeDetailPreloadSafety(tabId, {
             targetUrl: candidateUrl,
             waitForDouyinReady: isDouyinDetailNavigation,
             shouldStop: pipelineShouldStop,
+            ...(isDouyinDetailNavigation
+              ? {timeoutMs: Math.min(8000, remainingProbeBudgetMs)}
+              : {}),
           });
           return;
         } catch (error) {
@@ -3738,6 +3979,7 @@ export async function batchCaptureDetailsForRecords(
       }
     },
   });
+  detailPrefetchPipeline = createCurrentDetailPrefetchPipeline();
 
   const discardPrefetchForRecord = (recordId) => {
     const normalizedRecordId = String(recordId || '').trim();
@@ -4028,6 +4270,12 @@ export async function batchCaptureDetailsForRecords(
         continue;
       }
 
+      const recordPlatform = String(
+        record?.platform || detectPlatformFromUrl(noteUrl),
+      )
+        .trim()
+        .toLowerCase();
+
       const startedAt = Date.now();
       activeDetailItemContext = {
         ...activeDetailItemContext,
@@ -4205,11 +4453,6 @@ export async function batchCaptureDetailsForRecords(
           throw new Error('DETAIL_CAPTURE_CANCELED');
         }
 
-        const recordPlatform = String(
-          record?.platform || detectPlatformFromUrl(noteUrl),
-        )
-          .trim()
-          .toLowerCase();
         const resolvedEnableLowFollowerHitFilter =
           enableLowFollowerHitFilter ??
           settings.enableLowFollowerHitFilterOnDetailCapture ??
@@ -4266,7 +4509,11 @@ export async function batchCaptureDetailsForRecords(
             securityBlocked = true; // 撞风控,下面 catch 会停整批
             throw new Error('XHS_SECURITY_BLOCK');
           }
-          throw new Error(noteResult?.error?.message || '详情采集失败');
+          const noteCaptureError = new Error(
+            noteResult?.error?.message || '详情采集失败',
+          );
+          noteCaptureError.code = String(noteResult?.error?.code || '').trim();
+          throw noteCaptureError;
         }
 
         let detailPayload = applyCommentStatusToPayload(
@@ -4295,7 +4542,7 @@ export async function batchCaptureDetailsForRecords(
           if (targetItemId && capturedItemId && targetItemId !== capturedItemId) {
             const latestRecord = (await getRecord(recordId)) || record;
             const failure = buildDetailCaptureFailure(
-              DETAIL_CAPTURE_FAILURE_CODE.NOTE_CAPTURE_FAILED,
+              DETAIL_CAPTURE_FAILURE_CODE.CONTENT_UNAVAILABLE,
               'note_capture',
               '原视频已失效(页面跳去播放其它作品),已跳过以防采错评论',
             );
@@ -4580,9 +4827,14 @@ export async function batchCaptureDetailsForRecords(
             recordPlatform === 'douyin'
               ? resolveExpectedDouyinCommentNoteId(record, noteUrl)
               : '';
-          const commentCaptureIdentity = await ensureCommentCaptureIdentity({
-            runnerTabId: runnerContext.runnerTabId,
-          });
+          let commentCaptureIdentity;
+          try {
+            commentCaptureIdentity = await ensureCommentCaptureIdentity({
+              runnerTabId: runnerContext.runnerTabId,
+            });
+          } catch (error) {
+            throw attachPartialDetailPayload(error, detailPayload);
+          }
           if (onProgress) {
             await reportProgressFailSoft(onProgress, {
               phase: 'detail_comments_capturing',
@@ -4606,20 +4858,25 @@ export async function batchCaptureDetailsForRecords(
           )
             ? record.payload.detailPayload.commentsCleanedItems
             : [];
-          const commentsResult = await captureCommentsForCurrentNote({
-            tabId: commentCaptureIdentity.runnerTabId,
-            captureRequestId: commentCaptureIdentity.captureRequestId,
-            recordId,
-            current,
-            total: uniqueRecordIds.length,
-            existingItems: existingCommentItems,
-            maxDetectedItems: normalizedCommentsMaxDetectedItems,
-            maxDurationMs: settings.sharedMaxDurationMs,
-            waitMinMs: settings.sharedWaitMinMs,
-            waitMaxMs: settings.sharedWaitMaxMs,
-            stallTimeoutMs: settings.sharedStallTimeoutMs,
-            expectedNoteId: expectedCommentNoteId,
-          });
+          let commentsResult;
+          try {
+            commentsResult = await captureCommentsForCurrentNote({
+              tabId: commentCaptureIdentity.runnerTabId,
+              captureRequestId: commentCaptureIdentity.captureRequestId,
+              recordId,
+              current,
+              total: uniqueRecordIds.length,
+              existingItems: existingCommentItems,
+              maxDetectedItems: normalizedCommentsMaxDetectedItems,
+              maxDurationMs: settings.sharedMaxDurationMs,
+              waitMinMs: settings.sharedWaitMinMs,
+              waitMaxMs: settings.sharedWaitMaxMs,
+              stallTimeoutMs: settings.sharedStallTimeoutMs,
+              expectedNoteId: expectedCommentNoteId,
+            });
+          } catch (error) {
+            throw attachPartialDetailPayload(error, detailPayload);
+          }
           const commentIdentityFailure =
             commentsResult.status !== COMMENT_CAPTURE_STATUS.FAILED ||
             commentsResult.errorCode === 'DOUYIN_COMMENT_ID_MISMATCH'
@@ -4631,7 +4888,7 @@ export async function batchCaptureDetailsForRecords(
           if (commentIdentityFailure) {
             const error = new Error(commentIdentityFailure.message);
             error.code = commentIdentityFailure.code;
-            throw error;
+            throw attachPartialDetailPayload(error, detailPayload);
           }
           detailPayload = applyCommentResultToSingleNotePayload(
             detailPayload,
@@ -4643,6 +4900,26 @@ export async function batchCaptureDetailsForRecords(
             commentLeadsConfig,
             computedAt: Date.now(),
           }).payload;
+
+          if (
+            commentsResult.status === COMMENT_CAPTURE_STATUS.FAILED &&
+            commentsResult.stoppedByUser !== true
+          ) {
+            const commentsError = new Error(
+              String(
+                commentsResult?.errorMessage ||
+                  commentsResult?.error?.message ||
+                  commentsResult?.error ||
+                  '评论采集失败，请稍后重试',
+              ).trim(),
+            );
+            commentsError.code =
+              DETAIL_CAPTURE_FAILURE_CODE.COMMENTS_CAPTURE_FAILED;
+            // 正文已经采到，评论失败时保留当前详情快照。第二次仍失败，
+            // 卡片应明确显示“正文已采到、评论失败”，不能退回“未增强”。
+            commentsError.partialDetailPayload = detailPayload;
+            throw commentsError;
+          }
 
           if (
             commentsResult.stoppedByUser &&
@@ -4777,6 +5054,15 @@ export async function batchCaptureDetailsForRecords(
             failureCategory: failure.category,
             diagnosticMessage: failure.diagnosticMessage,
             noteUrl,
+            detailPayload:
+              effectiveError?.partialDetailPayload !== undefined
+                ? sanitizeMediaFieldsForStorage(
+                    normalizeDetailPayloadAgainstRecord(
+                      latestRecord,
+                      effectiveError.partialDetailPayload,
+                    ),
+                  )
+                : undefined,
           }),
         );
         const failedTraceTransition = transitionRecordCaptureTrace(
@@ -4803,6 +5089,7 @@ export async function batchCaptureDetailsForRecords(
           canceled: canceledByUser,
           securityBlocked,
           runnerInterrupted: runnerContextInterrupted,
+          recoveryRequired: runnerContextInterrupted,
           ...captureTraceFields,
         };
         results.push(result);
@@ -5142,7 +5429,7 @@ export async function batchCaptureDetailsForRecords(
         runnerContext.runnerTabId,
         runnerContext.sourcePageUrl,
         runnerContext.sourcePageScrollY,
-        { timeoutMs: normalizedDetailNavTimeoutMs },
+        {timeoutMs: normalizedDetailNavTimeoutMs},
       ).catch((error) => {
         console.warn('[CaptureSync] restore source page failed:', error);
       });
@@ -5239,6 +5526,7 @@ export async function batchCaptureDetailsForRecords(
       failedCount === 0,
     canceled,
     runnerInterrupted,
+    recoveryRequired: runnerInterrupted,
     securityBlocked, // 撞小红书安全限制 → 主循环据此停整轮无人值守
     total: uniqueRecordIds.length,
     processedCount,
@@ -10513,7 +10801,12 @@ function classifyDetailCaptureFailure(error, { stage = 'unknown' } = {}) {
   const normalizedStage =
     String(stage || 'unknown').trim().toLowerCase() || 'unknown';
 
-  if (rawCode === 'DOUYIN_CONTENT_UNAVAILABLE') {
+  if (
+    rawCode === 'DOUYIN_CONTENT_UNAVAILABLE' ||
+    rawCode === 'DOUYIN_DETAIL_ID_MISMATCH' ||
+    rawCode === 'DOUYIN_COMMENT_ID_MISMATCH' ||
+    rawCode === DETAIL_CAPTURE_FAILURE_CODE.CONTENT_UNAVAILABLE
+  ) {
     return buildDetailCaptureFailure(
       DETAIL_CAPTURE_FAILURE_CODE.CONTENT_UNAVAILABLE,
       normalizedStage,

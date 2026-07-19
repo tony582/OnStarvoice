@@ -367,15 +367,17 @@ test("platform safety signals are circuit breakers", () => {
   assert.equal(isUnattendedSafetyBlock("导航超时"), false);
 });
 
-test("round-level enhancement retry propagates its circuit breaker to the batch result", async () => {
+test("round-level orchestration cannot start a second enhancement retry budget", async () => {
   const source = await readFile(
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  assert.match(
+  assert.doesNotMatch(
     source,
-    /if \(retryResult\?\.securityBlocked\) \{\s*result\.securityBlocked = true;\s*batchKeywordCancelRequested = true;/,
+    /retryFailedEnhancementsAfterRound|collectFailedEnhanceRecordIds/,
+    "all enhancement retries must stay inside runEnhancementWithSingleRetry",
   );
+  assert.match(source, /runEnhancementWithSingleRetry\(\{/);
 });
 
 test("a stale attempt never emits an unscoped content cancel that can hit its successor", async () => {

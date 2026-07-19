@@ -300,6 +300,22 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     'detectedCount',
     'markedCount',
     'filteredCount',
+    'aiFilteredCount',
+    'noEnhancementCount',
+    'successCount',
+    'failedCount',
+    'skippedCount',
+    'detailSuccessCount',
+    'detailFailedCount',
+    'syncSuccessCount',
+    'syncFailedCount',
+    'syncSkippedCount',
+    'syncRemainingCount',
+    'keywordCompletedCount',
+    'keywordPartialCount',
+    'keywordFailedCount',
+    'keywordSkippedCount',
+    'progressPercent',
     'collectedCount',
     'savedCount',
     'commentsCount',
@@ -344,6 +360,9 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
                 )
               : {},
           enhancementEnabled: Boolean(progress.taskMeta.enhancementEnabled),
+          aiRelevancePrefilterEnabled: Boolean(
+            progress.taskMeta.aiRelevancePrefilterEnabled,
+          ),
           commentsEnabled: Boolean(progress.taskMeta.commentsEnabled),
           bloggerMetricsEnabled: Boolean(progress.taskMeta.bloggerMetricsEnabled),
         }
@@ -351,6 +370,10 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
   return {
     current: Number.isFinite(current) ? current : 0,
     total: Number.isFinite(total) ? total : 0,
+    captureTaskId: String(progress.captureTaskId || ''),
+    unattendedRequestId: String(progress.unattendedRequestId || ''),
+    unattendedAttemptId: String(progress.unattendedAttemptId || ''),
+    finishedAt: String(progress.finishedAt || ''),
     keyword: String(progress.keyword || ''),
     keywordCurrent: Number.isFinite(keywordCurrent) ? keywordCurrent : null,
     keywordTotal: Number.isFinite(keywordTotal) ? keywordTotal : null,
@@ -5238,6 +5261,75 @@ function buildUnattendedCaptureTaskId(requestId = '') {
   return normalizedRequestId ? `unattended-capture:${normalizedRequestId}` : '';
 }
 
+function parseStableUnattendedCaptureTaskId(taskId = '') {
+  const normalizedTaskId = String(taskId || '').trim();
+  const prefix = 'unattended-capture:';
+  if (!normalizedTaskId.startsWith(prefix)) {
+    return {unattended: false, taskId: normalizedTaskId, requestId: ''};
+  }
+  const requestId = normalizedTaskId.slice(prefix.length).trim();
+  return {
+    unattended: Boolean(requestId),
+    taskId: normalizedTaskId,
+    requestId,
+  };
+}
+
+async function inspectStableUnattendedCaptureTask(taskId = '') {
+  const identity = parseStableUnattendedCaptureTaskId(taskId);
+  if (!identity.unattended) {
+    return {...identity, current: false, active: false, terminal: false, request: null};
+  }
+  const request = await readUnattendedKeywordRunRequest();
+  const current = Boolean(request && String(request.id || '').trim() === identity.requestId);
+  const terminal = Boolean(current && isTerminalUnattendedRunStatus(request.status));
+  return {
+    ...identity,
+    current,
+    active: Boolean(current && !terminal),
+    terminal,
+    request: current ? request : null,
+  };
+}
+
+async function releaseStableUnattendedCaptureTaskResourcesOnly(
+  inspection,
+  {reason = 'unattended_wrapper_cleanup', debugSnapshot = null} = {},
+) {
+  if (!inspection?.unattended || !inspection?.taskId) {
+    return {released: false, reason: 'not_unattended_stable_task'};
+  }
+  const taskId = inspection.taskId;
+  const storedLock = await readStoredCaptureExecutionLock();
+  const lockOwnsTask = Boolean(
+    storedLock &&
+      String(storedLock.owner || '') === 'unattended_keyword_plan' &&
+      String(storedLock.captureTaskId || '').trim() === taskId,
+  );
+  if (lockOwnsTask) {
+    return await releaseUnattendedCaptureTaskResourcesForRecovery(
+      storedLock,
+      {
+        reason,
+        request: inspection.request || {id: inspection.requestId},
+      },
+    );
+  }
+
+  const session =
+    debugSnapshot || captureDebugSessionManager.getSessionByTaskId(taskId);
+  const group = captureTaskTabGroupManager.getTask(taskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
+  if (session || group || pendingWorkerTabIds.length > 0) {
+    return await releaseCaptureTaskResourcesWithRetry(
+      {taskId, reason, debugSnapshot: session},
+      {attempts: 3},
+    );
+  }
+  captureTaskOwnerCoordinator?.clearTask(taskId);
+  return {released: true, taskId, reason: 'already_absent'};
+}
+
 function isExplicitCaptureTaskStopReason(reason = '') {
   return new Set([
     'canceled_by_user',
@@ -5349,7 +5441,12 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   lock,
   {reason = 'unattended_runtime_recovery', request = null} = {},
 ) {
-  const taskId = String(lock?.captureTaskId || '').trim();
+  // Recovery can clear the persisted lock binding before every asynchronous
+  // Debug/group/worker cleanup callback has finished.  The replacement runner
+  // still uses the stable request task id, so an empty captureTaskId must not
+  // make those residual resources invisible to the next recovery attempt.
+  const stableTaskId = buildUnattendedCaptureTaskId(request?.id);
+  const taskId = String(lock?.captureTaskId || stableTaskId || '').trim();
   if (!taskId) return {released: false, reason: 'no_capture_task'};
   const debugSnapshot = captureDebugSessionManager.getSessionByTaskId(taskId);
   const groupSnapshot = captureTaskTabGroupManager.getTask(taskId);
@@ -5366,7 +5463,6 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
 
   // 0.3.43 及更早版本为每次 runner 生成随机 child task。只收口这类
   // 旧记录；新版使用同一 request 的稳定 taskId，恢复后仍是同一项任务。
-  const stableTaskId = buildUnattendedCaptureTaskId(request?.id);
   if (!stableTaskId || taskId !== stableTaskId) {
     await terminalizeCaptureTaskLedgerRun(taskId, {
       reason: 'unattended_attempt_replaced',
@@ -5454,18 +5550,47 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
   }
 
   const previousTaskId = String(lock.captureTaskId || '').trim();
-  const previousSession = previousTaskId
-    ? captureDebugSessionManager.getSessionByTaskId(previousTaskId)
+  const recoveryTaskId = previousTaskId || stableTaskId;
+  const previousSession = recoveryTaskId
+    ? captureDebugSessionManager.getSessionByTaskId(recoveryTaskId)
     : null;
+  const previousGroup = recoveryTaskId
+    ? captureTaskTabGroupManager.getTask(recoveryTaskId)
+    : null;
+  const previousWorkerTabIds = recoveryTaskId
+    ? getTrackedCaptureTaskWorkers(recoveryTaskId)
+    : [];
   const sourceChanged = Boolean(
     previousSession &&
       resolveCaptureTaskTabId(previousSession.tabId) !== normalizedSourceTabId,
   );
-  if (previousTaskId && (previousTaskId !== normalizedTaskId || sourceChanged)) {
-    await releaseUnattendedCaptureTaskResourcesForRecovery(lock, {
-      reason: 'unattended_runner_rebound',
-      request,
-    });
+  const groupSourceChanged = Boolean(
+    previousGroup &&
+      resolveCaptureTaskTabId(previousGroup.sourceTabId) !==
+        normalizedSourceTabId,
+  );
+  const residualCleanupPending = Boolean(
+    recoveryTaskId === normalizedTaskId &&
+      // getTrackedCaptureTaskWorkers() without snapshots only exposes worker
+      // tabs whose earlier close failed; live session/group workers are not in
+      // this set and must not cause a healthy duplicate BEGIN to be released.
+      ((!previousSession && previousGroup) ||
+        previousWorkerTabIds.length > 0),
+  );
+  if (
+    recoveryTaskId &&
+    (recoveryTaskId !== normalizedTaskId ||
+      sourceChanged ||
+      groupSourceChanged ||
+      residualCleanupPending)
+  ) {
+    await releaseUnattendedCaptureTaskResourcesForRecovery(
+      {...lock, captureTaskId: recoveryTaskId},
+      {
+        reason: 'unattended_runner_rebound',
+        request,
+      },
+    );
   }
   return {
     unattended: true,
@@ -5503,20 +5628,53 @@ async function endCaptureTask(message) {
   }
   const result = await releaseCaptureTaskResourcesWithRetry({taskId, reason});
   const terminalStatus = status || (canceled ? 'canceled' : 'completed');
-  await terminalizeCaptureTaskLedgerRun(taskId, {
-    reason,
-    status: terminalStatus,
-    message:
-      terminalStatus === 'completed'
-        ? '采集任务已完成'
-        : terminalStatus === 'skipped'
-          ? '采集任务已跳过'
-          : terminalStatus === 'completed_with_failures'
-            ? '采集任务已完成，部分内容处理失败'
-            : terminalStatus === 'failed'
-              ? '采集任务执行失败'
-              : '采集任务已停止',
-  });
+  if (terminalStatus === 'recovering') {
+    // 无人值守 request root 是唯一公开任务台账；其 Debug wrapper 只管理
+    // 浏览器资源。不要再凭 unattended-capture:<id> 创建第二条 recovering
+    // 记录，否则作品级进度会和关键词级 counts 混在一起。
+    if (!attemptFence.unattended) {
+      const now = new Date().toISOString();
+      await upsertTaskLedgerRun({
+        patch: {
+          id: taskId,
+          status: 'recovering',
+          message: '正在重建浏览器采集上下文',
+          updatedAt: now,
+          businessProgressAt: now,
+          finishedAt: '',
+          error: null,
+          progress: {
+            phase: 'recovering',
+            message: '正在重建浏览器采集上下文 · 1/1',
+            captureTaskId: taskId,
+            updatedAt: now,
+          },
+        },
+        event: {
+          type: 'task_recovering',
+          status: 'recovering',
+          message: '旧采集上下文已释放，正在创建新工作页',
+        },
+      });
+    }
+    return result;
+  }
+  if (!attemptFence.unattended) {
+    await terminalizeCaptureTaskLedgerRun(taskId, {
+      reason,
+      status: terminalStatus,
+      message:
+        terminalStatus === 'completed'
+          ? '采集任务已完成'
+          : terminalStatus === 'skipped'
+            ? '采集任务已跳过'
+            : terminalStatus === 'completed_with_failures'
+              ? '采集任务已完成，部分内容处理失败'
+              : terminalStatus === 'failed'
+                ? '采集任务执行失败'
+                : '采集任务已停止',
+    });
+  }
   return result;
 }
 
@@ -5524,6 +5682,31 @@ async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
   if (!session) return;
   if (!session.persistent || !session.taskId) {
     await relayCaptureTaskCancellation(session, reason);
+    return;
+  }
+
+  const stableUnattended = await inspectStableUnattendedCaptureTask(
+    session.taskId,
+  );
+  if (stableUnattended.active) {
+    const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
+      taskId: session.taskId,
+      reason:
+        String(reason || '').trim() === 'target_closed'
+          ? 'debug_target_closed'
+          : 'runner_owner_disconnected',
+    });
+    if (unattendedRecovery.handled) return;
+  }
+  if (stableUnattended.unattended) {
+    // The request root is the only public unattended task. Once that root is
+    // terminal (or a later request has replaced it), a delayed Debug detach
+    // may only release browser resources; it must never create a second
+    // unattended-capture:<id> task-center record.
+    await releaseStableUnattendedCaptureTaskResourcesOnly(stableUnattended, {
+      reason: 'debugger_detached',
+      debugSnapshot: session,
+    });
     return;
   }
 
@@ -5564,6 +5747,22 @@ async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
 async function handleAbandonedCaptureTask({taskId} = {}) {
   const normalizedTaskId = String(taskId || '').trim();
   if (!normalizedTaskId) return;
+  const stableUnattended = await inspectStableUnattendedCaptureTask(
+    normalizedTaskId,
+  );
+  if (stableUnattended.active) {
+    const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
+      taskId: normalizedTaskId,
+      reason: 'runner_owner_disconnected',
+    });
+    if (unattendedRecovery.handled) return;
+  }
+  if (stableUnattended.unattended) {
+    await releaseStableUnattendedCaptureTaskResourcesOnly(stableUnattended, {
+      reason: 'sidebar_owner_disconnected',
+    });
+    return;
+  }
   const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
     taskId: normalizedTaskId,
     reason: 'runner_owner_disconnected',
@@ -5800,6 +5999,26 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
 async function handleCaptureRuntimeTabRemoved(tabId) {
   const session = captureDebugSessionManager.getSession(tabId);
   if (session?.persistent && session.taskId) {
+    const stableUnattended = await inspectStableUnattendedCaptureTask(
+      session.taskId,
+    );
+    if (stableUnattended.active) {
+      const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
+        taskId: session.taskId,
+        reason: 'source_tab_removed',
+      });
+      if (unattendedRecovery.handled) return;
+    }
+    if (stableUnattended.unattended) {
+      await releaseStableUnattendedCaptureTaskResourcesOnly(
+        stableUnattended,
+        {
+          reason: 'source_tab_removed',
+          debugSnapshot: session,
+        },
+      );
+      return;
+    }
     await publishCaptureTaskCancellation(session.taskId, 'source_tab_removed');
     await terminalizeCaptureTaskLedgerRun(session.taskId, {
       reason: 'source_tab_removed',

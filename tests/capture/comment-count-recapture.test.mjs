@@ -36,10 +36,11 @@ test("skip-captured precheck has no comment-growth exception", () => {
   const start = captureSync.indexOf(
     "export async function batchCaptureDetailsForRecords",
   );
-  const end = captureSync.indexOf("const results = [];", start);
-  const precheck = captureSync.slice(start, end);
+  const precheckStart = captureSync.indexOf("let skipRecordIdSet", start);
+  const end = captureSync.indexOf("const bloggerMetricsCache", precheckStart);
+  const precheck = captureSync.slice(precheckStart, end);
 
-  assert.ok(start >= 0 && end > start);
+  assert.ok(start >= 0 && precheckStart > start && end > precheckStart);
   assert.match(precheck, /nextSkipRecordIds\.push\(p\.recordId\)/);
   assert.doesNotMatch(precheck, /hasCommentCountIncreasedSinceLastCapture/);
   assert.doesNotMatch(precheck, /recaptureCommentRecordIdSet/);

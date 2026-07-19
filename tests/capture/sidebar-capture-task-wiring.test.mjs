@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
 
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
@@ -76,10 +77,7 @@ test("manual search begins only for the actual run and always ends in finally", 
     section,
     /batchCaptureByKeywords\(\{\s+keywords: \[\.\.\.searchKeywords\],[\s\S]*?captureTaskId: persistentCaptureTaskId/,
   );
-  assert.match(
-    section,
-    /retryFailedEnhancementsAfterRound\(\{[\s\S]*?captureTaskId: persistentCaptureTaskId/,
-  );
+  assert.doesNotMatch(section, /retryFailedEnhancementsAfterRound\(/);
 });
 
 test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the final replacement tab", () => {
@@ -115,7 +113,7 @@ test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the fi
     douyinStartIndex,
   );
   const batchIndex = section.indexOf(
-    "const batchRunResult = await handleBatchKeywordCapture({",
+    "batchRunResult = await handleBatchKeywordCapture({",
     rehydrateIndex,
   );
   const finallyIndex = section.lastIndexOf("} finally {");
@@ -300,10 +298,7 @@ test("batch keyword handler reuses caller-owned task lifecycle and threads its i
     section,
     /afterKeywordCapture:[\s\S]*?keywordCurrent:\s*current|keywordTotal:\s*total/,
   );
-  assert.match(
-    section,
-    /retryFailedEnhancementsAfterRound\(\{[\s\S]*?captureTaskId: persistentCaptureTaskId/,
-  );
+  assert.doesNotMatch(section, /retryFailedEnhancementsAfterRound\(/);
   assert.match(
     section.slice(finallyIndex),
     /captureTaskSessionStarted &&\s+!captureTaskLifecycleOwnedByCaller/,
@@ -322,7 +317,7 @@ test("unattended detail interruption only stops the whole plan for explicit term
 
   assert.match(
     section,
-    /if \(enhanceResult\?\.canceled\) \{[\s\S]*?resolveUnattendedEnhanceCancellation\(/,
+    /const resultInterruption = resolveUnattendedEnhanceCancellation\([\s\S]*?if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\)/,
   );
   assert.match(
     section,
@@ -334,19 +329,46 @@ test("unattended detail interruption only stops the whole plan for explicit term
   );
   assert.doesNotMatch(
     section,
-    /if \(enhanceResult\?\.canceled\) \{\s*batchKeywordCancelRequested = true/,
+    /if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\) \{\s*batchKeywordCancelRequested = true/,
   );
 });
 
-test("failed enhancement retries keep the persistent capture task id", () => {
-  const retrySection = readFunctionSection(
-    "async function retryFailedEnhancementsAfterRound({",
-    "async function handleBatchKeywordCapture(options = {})",
+test("one keyword cannot schedule a third detail enhancement attempt", () => {
+  const manualSection = readFunctionSection(
+    "async function handleCaptureSearchData()",
+    "function setKeywordStrategyTab(",
   );
-  assert.match(retrySection, /captureTaskId = ""/);
+  const unattendedSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const detailSection = readFunctionSection(
+    "async function runDetailCaptureForRecordIds(",
+    "/**\n * 处理导出",
+  );
+
+  // The single-retry helper owns the complete retry budget. Manual and
+  // unattended rounds must never launch another enhancement orchestration.
+  assert.doesNotMatch(sidebarSource, /retryFailedEnhancementsAfterRound\(/);
+  assert.doesNotMatch(
+    manualSection,
+    /collectFailedEnhanceRecordIds|enhance_retrying/,
+  );
+  assert.doesNotMatch(
+    unattendedSection,
+    /collectFailedEnhanceRecordIds|enhance_retrying/,
+  );
+  assert.equal(
+    (detailSection.match(/runEnhancementWithSingleRetry\(/g) || []).length,
+    1,
+  );
+  assert.equal(
+    (detailSection.match(/batchCaptureDetailsForRecords\(/g) || []).length,
+    1,
+  );
   assert.match(
-    retrySection,
-    /runDetailCaptureForRecordIds\([\s\S]*?waitForegroundTabId,\s+captureTaskId,/,
+    detailSection,
+    /runAttempt:\s*async \(attemptRecordIds,[\s\S]*?return await batchCaptureDetailsForRecords\(attemptRecordIds,/,
   );
 });
 
@@ -456,19 +478,30 @@ test("Weibo capture paths keep their non-Debug workflow", () => {
   );
 });
 
-test("capture progress is forwarded before any local UI branch", () => {
+test("capture progress rejects stale owners before forwarding into local UI", () => {
   const section = readFunctionSection(
     "function handleProgress(progress)",
     "async function syncRuntimeCommentProgress(",
   );
-  const updateIndex = section.indexOf(
-    "void updateCaptureTaskSession({taskId: captureTaskOwnerTaskId, progress});",
+  const ownerGuardIndex = section.indexOf("const incomingCaptureTaskId");
+  const rememberIndex = section.indexOf(
+    "progress = rememberCaptureTaskProgressContext(progress)",
   );
-  const phaseIndex = section.indexOf("const phase =");
+  const updateIndex = section.indexOf("void updateCaptureTaskSession({");
+  const localPhaseIndex = section.indexOf("const phase = incomingPhase");
   const domIndex = section.indexOf("document.getElementById(");
 
-  assert.ok(updateIndex > -1 && updateIndex < phaseIndex);
+  assert.ok(ownerGuardIndex > -1 && ownerGuardIndex < rememberIndex);
+  assert.match(
+    section.slice(ownerGuardIndex, rememberIndex),
+    /incomingCaptureTaskId !== currentCaptureTaskId[\s\S]*?return progress/,
+  );
+  assert.ok(updateIndex > rememberIndex && updateIndex < localPhaseIndex);
   assert.ok(updateIndex < domIndex);
+  assert.match(
+    section.slice(updateIndex, localPhaseIndex),
+    /taskId:\s*incomingCaptureTaskId\s*\|\|\s*captureTaskOwnerTaskId/,
+  );
 });
 
 test("task surface renders real A/B worker states from progress", () => {
@@ -488,22 +521,22 @@ test("task surface renders real A/B worker states from progress", () => {
   assert.match(section, /"正在读取作品详情"/);
 });
 
-test("unattended plan renders synthetic startup and recent terminal task surfaces", () => {
+test("unattended plan renders startup and durable terminal task surfaces", () => {
   const syntheticSection = readFunctionSection(
     "function buildUnattendedSyntheticDebugSession(",
     "function renderCaptureDebugSession(runtime = {})",
   );
   assert.match(
     syntheticSection,
-    /!plan\?\.enabled \|\| \(!running && !recentTerminal\)/,
+    /!plan\?\.enabled \|\| \(!running && !visibleTerminal\)/,
   );
   assert.match(syntheticSection, /synthetic: true/);
   assert.match(syntheticSection, /unattended: true/);
-  assert.match(syntheticSection, /terminal: recentTerminal/);
-  assert.match(syntheticSection, /state: recentTerminal \? status : "starting"/);
+  assert.match(syntheticSection, /terminal: visibleTerminal/);
+  assert.match(syntheticSection, /state: visibleTerminal \? status : "starting"/);
   assert.match(
     syntheticSection,
-    /phase: recentTerminal[\s\S]*?`unattended_\$\{status\}`[\s\S]*?String\(storedProgress\.phase \|\| "initializing_unattended"\)/,
+    /phase: visibleTerminal[\s\S]*?`unattended_\$\{status\}`[\s\S]*?String\(storedProgress\.phase \|\| "initializing_unattended"\)/,
   );
 
   const renderSection = readFunctionSection(
@@ -512,15 +545,19 @@ test("unattended plan renders synthetic startup and recent terminal task surface
   );
   assert.match(
     renderSection,
-    /const syntheticSession = nativeActive\s+\? null\s+: buildUnattendedSyntheticDebugSession\(runtime\)/,
+    /const syntheticSession = buildUnattendedSyntheticDebugSession\(runtime\)/,
   );
   assert.match(
     renderSection,
-    /const active = nativeActive \|\| Boolean\(syntheticSession\)/,
+    /const active = nativeVisible \|\| Boolean\(syntheticSession\)/,
   );
   assert.match(
     renderSection,
-    /syntheticSession \? "unattended-synthetic" : "native-debug"/,
+    /usingSyntheticSession \? "unattended-synthetic" : "native-debug"/,
+  );
+  assert.match(
+    renderSection,
+    /syntheticSession && \(!nativeVisible \|\| syntheticSession\.terminal\)/,
   );
 
   const statusSection = readFunctionSection(
@@ -655,7 +692,7 @@ test("detail progress forwards the merged A/B snapshot instead of overwriting it
   );
   assert.match(
     section,
-    /const mergedProgress = handleProgress\(progress\)/,
+    /const mergedProgress = handleProgress\(normalizedProgress\)/,
   );
   assert.match(section, /onProgress\(mergedProgress\)/);
   assert.match(section, /onItemSettled\(mergedProgress\)/);
@@ -695,6 +732,170 @@ test("task stop targets persisted source or worker and releases persistent Debug
   assert.match(section, /captureTaskSession\?\.sourceTabId/);
   assert.match(section, /type: "onstarvoice:end-capture-task"/);
   assert.match(section, /reason: "user_cancel_requested"/);
+});
+
+test("detail context rebuild fences cleanup with the current unattended attempt", () => {
+  const section = readFunctionSection(
+    "async function rebuildCaptureTaskSessionForEnhancementRetry({",
+    "const DEFAULT_MONITOR_SETTINGS",
+  );
+  const attemptIndex = section.indexOf("const retryAttemptId =");
+  const localEndIndex = section.indexOf("await endCaptureTaskSession({");
+  const directEndIndex = section.indexOf(
+    "const sendDirectCaptureTaskEnd = async",
+  );
+  const beginIndex = section.indexOf(
+    "return await startRequiredCaptureTaskSession({",
+  );
+  const failedCleanupIndex = section.lastIndexOf(
+    'reason: "context_rebuild_failed"',
+  );
+
+  assert.ok(attemptIndex > -1 && attemptIndex < localEndIndex);
+  assert.ok(directEndIndex > attemptIndex && directEndIndex < localEndIndex);
+  assert.ok(beginIndex > localEndIndex);
+  assert.ok(failedCleanupIndex > beginIndex);
+  assert.match(
+    section,
+    /type: "onstarvoice:end-capture-task",[\s\S]*?attemptId: retryAttemptId/,
+  );
+  assert.match(section, /data\?\.ignored === true/);
+  assert.match(section, /data\?\.released === false/);
+  assert.match(
+    section,
+    /reason: "context_rebuild_failed",\s+status: "failed"/,
+  );
+  assert.match(
+    section,
+    /attemptId: retryAttemptId,[\s\S]*?return await startRequiredCaptureTaskSession\(\{/,
+    "the cleanup and replacement BEGIN must share one attempt fence",
+  );
+  assert.match(section, /unattendedAttemptId = ""/);
+  assert.doesNotMatch(
+    section,
+    /activeUnattendedRunAttemptId/,
+    "a stale callback must never borrow the replacement attempt from globals",
+  );
+});
+
+function createContextRebuildHarness({
+  endResult = {ok: true, reason: "no_active_task_session"},
+  sendMessage = async () => ({ok: true, data: {released: true}}),
+  startSession = async () => ({ok: true, active: true}),
+  sourceTabId = 73,
+} = {}) {
+  const section = readFunctionSection(
+    "async function rebuildCaptureTaskSessionForEnhancementRetry({",
+    "const DEFAULT_MONITOR_SETTINGS",
+  );
+  const context = {
+    activeUnattendedRunAttemptId: "attempt-current",
+    captureTaskOwnerTaskId: "",
+    resolveCaptureTaskSourceTabId: async () => sourceTabId,
+    endCaptureTaskSession: async () => endResult,
+    startRequiredCaptureTaskSession: startSession,
+    wait: async () => undefined,
+    chrome: {runtime: {sendMessage}},
+    console,
+  };
+  vm.runInNewContext(
+    `${section}\nglobalThis.__rebuildCaptureTaskSession = rebuildCaptureTaskSessionForEnhancementRetry;`,
+    context,
+  );
+  return context.__rebuildCaptureTaskSession;
+}
+
+test("missing local unattended session retries ignored END with the current attempt before BEGIN", async () => {
+  const endMessages = [];
+  const beginCalls = [];
+  const rebuild = createContextRebuildHarness({
+    sendMessage: async (message) => {
+      endMessages.push(message);
+      return endMessages.length === 1
+        ? {
+            ok: true,
+            data: {
+              ignored: true,
+              released: false,
+              reason: "stale_unattended_attempt",
+            },
+          }
+        : {ok: true, data: {released: true}};
+    },
+    startSession: async (options) => {
+      beginCalls.push(options);
+      return {ok: true, active: true};
+    },
+  });
+
+  const result = await rebuild({
+    taskId: "unattended-capture:request-current",
+    platform: "douyin",
+    unattendedAttemptId: "attempt-current",
+  });
+
+  assert.equal(result.active, true);
+  assert.equal(endMessages.length, 2, "ignored or unreleased END must retry");
+  assert.ok(
+    endMessages.every((message) => message.attemptId === "attempt-current"),
+  );
+  assert.equal(beginCalls.length, 1);
+  assert.equal(beginCalls[0].attemptId, "attempt-current");
+});
+
+test("unattended context rebuild rejects a missing scoped attempt before END", async () => {
+  const endMessages = [];
+  const rebuild = createContextRebuildHarness({
+    sendMessage: async (message) => {
+      endMessages.push(message);
+      return {ok: true, data: {released: true}};
+    },
+  });
+
+  await assert.rejects(
+    rebuild({
+      taskId: "unattended-capture:request-current",
+      platform: "douyin",
+    }),
+    /缺少当前执行标识/,
+  );
+  assert.equal(endMessages.length, 0, "missing identity must not END any task");
+});
+
+test("exhausted context rebuild finalizes recovering ledger with the same attempt", async () => {
+  const endMessages = [];
+  const beginCalls = [];
+  const rebuild = createContextRebuildHarness({
+    endResult: {ok: true, data: {released: true}},
+    sendMessage: async (message) => {
+      endMessages.push(message);
+      return {ok: true, data: {released: true}};
+    },
+    startSession: async (options) => {
+      beginCalls.push(options);
+      const error = new Error("cleanup pending");
+      error.code = "capture_task_cleanup_pending";
+      throw error;
+    },
+  });
+
+  await assert.rejects(
+    rebuild({
+      taskId: "unattended-capture:request-current",
+      platform: "douyin",
+      unattendedAttemptId: "attempt-current",
+    }),
+    /cleanup pending/,
+  );
+
+  assert.equal(beginCalls.length, 4);
+  assert.ok(
+    beginCalls.every((call) => call.attemptId === "attempt-current"),
+  );
+  assert.equal(endMessages.length, 1);
+  assert.equal(endMessages[0].attemptId, "attempt-current");
+  assert.equal(endMessages[0].reason, "context_rebuild_failed");
+  assert.equal(endMessages[0].status, "failed");
 });
 
 test("native Debug cancellation stops list, detail and keyword-gap work", () => {
