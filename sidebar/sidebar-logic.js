@@ -1085,6 +1085,8 @@ const UNATTENDED_RUN_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const UNATTENDED_PROTECTED_WAIT_TICK_MS = 30 * 1000;
 const UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS = 1500;
 const UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
+const UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS = 30 * 1000;
+const UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS = 10 * 1000;
 const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 2;
 const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
@@ -13432,7 +13434,7 @@ async function reportUnattendedKeywordRun(
     return {ok: false, accepted: false, reason: "missing_request_id", data: null};
   }
   try {
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendUnattendedRuntimeMessage({
       type: "onstarvoice:update-unattended-keyword-run",
       requestId,
       attemptId: String(attemptId || ""),
@@ -13466,6 +13468,26 @@ async function reportUnattendedKeywordRun(
   }
 }
 
+async function sendUnattendedRuntimeMessage(message) {
+  let timeoutId = null;
+  try {
+    return await Promise.race([
+      chrome.runtime.sendMessage(message),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          const error = new Error("无人值守状态上报超时");
+          error.code = "UNATTENDED_RUNTIME_MESSAGE_TIMEOUT";
+          reject(error);
+        }, UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
 async function reportUnattendedTerminalRun(
   requestId,
   patch = {},
@@ -13473,19 +13495,36 @@ async function reportUnattendedTerminalRun(
 ) {
   const normalizedRequestId = String(requestId || "").trim();
   const normalizedAttemptId = String(attemptId || "").trim();
-  if (
-    normalizedRequestId &&
-    normalizedRequestId === String(activeUnattendedRunRequestId || "").trim() &&
-    (!normalizedAttemptId ||
-      normalizedAttemptId ===
-        String(activeUnattendedRunAttemptId || "").trim())
-  ) {
-    // 先立终态栅栏，再写后台终态。最终上报与清理之间迟到的详情/评论
-    // 事件不能覆盖最终同步快照，也不能重新显示运行态按钮。
-    activeUnattendedTerminalProgressKey = `${normalizedRequestId}:${normalizedAttemptId}`;
-  }
+  const terminalProgressKey = `${normalizedRequestId}:${normalizedAttemptId}`;
+  const commitTerminalFence = () => {
+    if (
+      normalizedRequestId &&
+      normalizedRequestId ===
+        String(activeUnattendedRunRequestId || "").trim() &&
+      (!normalizedAttemptId ||
+        normalizedAttemptId ===
+          String(activeUnattendedRunAttemptId || "").trim())
+    ) {
+      // 只有后台确认终态（或确认当前 attempt 已被替换）后才立终态栅栏。
+      // 若传输短暂失败，runner 仍需继续心跳并允许后台从检查点恢复。
+      activeUnattendedTerminalProgressKey = terminalProgressKey;
+    }
+  };
   let lastResult = null;
-  for (const delayMs of UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS) {
+  let attemptIndex = 0;
+  while (true) {
+    const delayMs =
+      attemptIndex < UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS.length
+        ? UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS[attemptIndex]
+        : Math.min(
+            UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS,
+            3000 *
+              2 **
+                Math.min(
+                  4,
+                  attemptIndex - UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS.length,
+                ),
+          );
     if (delayMs > 0) {
       await sleep(delayMs);
     }
@@ -13498,10 +13537,16 @@ async function reportUnattendedTerminalRun(
       lastResult.reason === "terminal" ||
       lastResult.reason === "attempt_mismatch"
     ) {
+      commitTerminalFence();
       return lastResult;
     }
+    // 只有传输层错误需要持续确认。后台明确拒绝时把结果交还调用方，
+    // 避免不存在的任务在旧 runner 中无限重试。
+    if (lastResult.reason !== "transport_error") {
+      return lastResult;
+    }
+    attemptIndex += 1;
   }
-  return lastResult;
 }
 
 function startUnattendedKeywordRunHeartbeat(
@@ -19034,11 +19079,73 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
     ? readDetailCaptureScopeFromInput(settings?.detailCaptureScope)
     : DETAIL_CAPTURE_SCOPE_ALL;
 
-  // 如果提供了明确的 recordIds，则优先使用这些 ID（主要针对刚采集完的场景，防止由于切表导致的 records 过滤失效）
+  const explicitRecordIds = Array.isArray(recordIds)
+    ? [
+        ...new Set(
+          recordIds
+            .filter((recordId) => typeof recordId === "string")
+            .map((recordId) => recordId.trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  const createTargetResolutionFailure = ({
+    code = "DETAIL_TARGETS_UNRESOLVED",
+    reason = "record_ids_unresolved",
+    message = "采集结果尚未写入本地数据池，无法启动采集增强",
+    failedRecordIds = explicitRecordIds,
+  } = {}) => {
+    const normalizedFailedRecordIds = Array.isArray(failedRecordIds)
+      ? [...new Set(failedRecordIds.filter(Boolean))]
+      : [];
+    const failureCount = Math.max(
+      1,
+      normalizedFailedRecordIds.length || explicitRecordIds.length,
+    );
+    return {
+      ok: false,
+      canceled: false,
+      partial: true,
+      recoverable: reason === "record_ids_unresolved",
+      recoveryRequired: reason === "record_ids_unresolved",
+      skipped: false,
+      reason,
+      total: Math.max(explicitRecordIds.length, failureCount),
+      processedCount: failureCount,
+      successCount: 0,
+      failedCount: failureCount,
+      filteredCount: 0,
+      skippedCount: 0,
+      unresolvedRecordIds: normalizedFailedRecordIds,
+      results: normalizedFailedRecordIds.map((recordId) => ({
+        recordId,
+        ok: false,
+        reason,
+        code,
+        message,
+        recoveryRequired: reason === "record_ids_unresolved",
+      })),
+      error: {code, message},
+    };
+  };
+
+  // 明确的 recordIds 是列表采集刚落盘的权威结果。这里必须直接读取
+  // 持久化数据池，不能依赖可能被并发 refresh 覆盖的侧栏 UI 快照。
+  // 否则最后一个关键词会被误判为 no_target_records，基础数据照常同步，
+  // 但详情增强静默跳过。
   let pageRecords = [];
-  if (Array.isArray(recordIds) && recordIds.length > 0) {
-    const pool = getCurrentDataPool()?.records || [];
-    pageRecords = pool.filter((r) => recordIds.includes(r.id));
+  let unresolvedRecordIds = [];
+  if (explicitRecordIds.length > 0) {
+    const persistedRecords = await getRecords(explicitRecordIds);
+    const persistedRecordById = new Map(
+      persistedRecords.map((record) => [record.id, record]),
+    );
+    pageRecords = explicitRecordIds
+      .map((recordId) => persistedRecordById.get(recordId))
+      .filter(Boolean);
+    unresolvedRecordIds = explicitRecordIds.filter(
+      (recordId) => !persistedRecordById.has(recordId),
+    );
   } else {
     pageRecords = getCurrentPageRecords();
   }
@@ -19048,6 +19155,45 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
   });
 
   if (targetRecords.length === 0) {
+    if (
+      explicitRecordIds.length > 0 &&
+      unresolvedRecordIds.length === 0 &&
+      pageRecords.length === explicitRecordIds.length &&
+      pageRecords.every((record) => isDetailCaptureDone(record))
+    ) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "all_targets_settled",
+        total: explicitRecordIds.length,
+        processedCount: explicitRecordIds.length,
+        successCount: 0,
+        failedCount: 0,
+        filteredCount: 0,
+        skippedCount: explicitRecordIds.length,
+        results: [],
+      };
+    }
+    if (explicitRecordIds.length > 0) {
+      return createTargetResolutionFailure({
+        code:
+          unresolvedRecordIds.length > 0
+            ? "DETAIL_RECORD_IDS_UNRESOLVED"
+            : "DETAIL_TARGETS_UNRESOLVED",
+        reason:
+          unresolvedRecordIds.length > 0
+            ? "record_ids_unresolved"
+            : "no_target_records",
+        message:
+          unresolvedRecordIds.length > 0
+            ? `有 ${unresolvedRecordIds.length} 条采集结果尚未写入本地数据池，已保留为部分完成并等待恢复`
+            : `已收到 ${explicitRecordIds.length} 条列表记录，但没有解析出可增强作品，任务不能按完整完成结算`,
+        failedRecordIds:
+          unresolvedRecordIds.length > 0
+            ? unresolvedRecordIds
+            : explicitRecordIds,
+      });
+    }
     return {
       skipped: true,
       reason: "no_target_records",
@@ -19058,24 +19204,106 @@ async function maybeRunAutoDetailCaptureAfterListCapture(
     .filter((record) => Boolean(getRecordPrimaryNoteUrl(record)))
     .map((record) => record.id);
 
-  if (targetRecordIds.length === 0) {
+  const targetRecordIdSet = new Set(targetRecordIds);
+  const missingNoteUrlRecordIds = targetRecords
+    .map((record) => record.id)
+    .filter((recordId) => !targetRecordIdSet.has(recordId));
+  if (missingNoteUrlRecordIds.length > 0) {
     showMessage("当前记录缺少可访问的笔记链接，无法执行采集增强", "warning");
-    return {
-      skipped: true,
-      reason: "missing_note_url",
-    };
   }
 
-  const result = await runDetailCaptureForRecordIds(targetRecordIds, settings, {
-    progressMessage: `正在执行采集增强（0/${targetRecordIds.length}）...`,
-    onProgress,
-    onItemSettled,
-    waitForegroundTabId,
-    captureTaskId,
-    relevanceKeyword,
-    unattendedRequestId,
-    unattendedAttemptId,
-  });
+  const preflightFailureRecordIds = [
+    ...new Set([...unresolvedRecordIds, ...missingNoteUrlRecordIds]),
+  ];
+  if (targetRecordIds.length === 0 && preflightFailureRecordIds.length > 0) {
+    const onlyMissingUrls = unresolvedRecordIds.length === 0;
+    return createTargetResolutionFailure({
+      code: onlyMissingUrls
+        ? "DETAIL_NOTE_URL_MISSING"
+        : "DETAIL_RECORD_IDS_UNRESOLVED",
+      reason: onlyMissingUrls ? "missing_note_url" : "record_ids_unresolved",
+      message: onlyMissingUrls
+        ? `有 ${missingNoteUrlRecordIds.length} 条记录缺少可访问的作品链接，未按完整增强结算`
+        : `有 ${unresolvedRecordIds.length} 条采集结果尚未写入本地数据池，已保留为部分完成并等待恢复`,
+      failedRecordIds: preflightFailureRecordIds,
+    });
+  }
+
+  const detailResult = await runDetailCaptureForRecordIds(
+    targetRecordIds,
+    settings,
+    {
+      progressMessage: `正在执行采集增强（0/${targetRecordIds.length}）...`,
+      onProgress,
+      onItemSettled,
+      waitForegroundTabId,
+      captureTaskId,
+      relevanceKeyword,
+      unattendedRequestId,
+      unattendedAttemptId,
+    },
+  );
+  const preflightFailures = [];
+  if (unresolvedRecordIds.length > 0) {
+    preflightFailures.push(
+      ...createTargetResolutionFailure({
+        code: "DETAIL_RECORD_IDS_UNRESOLVED",
+        reason: "record_ids_unresolved",
+        message: "采集结果尚未写入本地数据池，无法启动采集增强",
+        failedRecordIds: unresolvedRecordIds,
+      }).results,
+    );
+  }
+  if (missingNoteUrlRecordIds.length > 0) {
+    preflightFailures.push(
+      ...createTargetResolutionFailure({
+        code: "DETAIL_NOTE_URL_MISSING",
+        reason: "missing_note_url",
+        message: "记录缺少可访问的作品链接，无法启动采集增强",
+        failedRecordIds: missingNoteUrlRecordIds,
+      }).results,
+    );
+  }
+  const result =
+    preflightFailures.length === 0
+      ? detailResult
+      : {
+          ...detailResult,
+          ok: false,
+          partial: true,
+          recoveryRequired:
+            Boolean(detailResult?.recoveryRequired) ||
+            unresolvedRecordIds.length > 0,
+          total:
+            Math.max(
+              Number(detailResult?.total) || 0,
+              targetRecordIds.length,
+            ) + preflightFailures.length,
+          processedCount:
+            Math.max(
+              Number(detailResult?.processedCount) || 0,
+              targetRecordIds.length,
+            ) + preflightFailures.length,
+          failedCount:
+            Math.max(0, Number(detailResult?.failedCount) || 0) +
+            preflightFailures.length,
+          results: [
+            ...(Array.isArray(detailResult?.results)
+              ? detailResult.results
+              : []),
+            ...preflightFailures,
+          ],
+          unresolvedRecordIds,
+          error:
+            detailResult?.error ||
+            {
+              code:
+                unresolvedRecordIds.length > 0
+                  ? "DETAIL_RECORD_IDS_UNRESOLVED"
+                  : "DETAIL_NOTE_URL_MISSING",
+              message: `有 ${preflightFailures.length} 条记录未能进入采集增强`,
+            },
+        };
 
   if (result.canceled) {
     const filterMsg =

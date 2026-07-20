@@ -615,6 +615,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
       const metricFields = buildMetricFieldsByDimension(
         interaction.count,
         metricDimension,
+        interaction.known,
       );
 
       // 避免把作者卡/空壳节点误当作笔记数据入池
@@ -662,8 +663,10 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         likes: metricFields.likes,
         collects: metricFields.collects,
         comments: metricFields.comments,
+        metricKnown: metricFields.metricKnown,
         displayMetricCount: interaction.count,
         displayMetricDimension: metricDimension,
+        displayMetricKnown: interaction.known,
       });
     } catch (error) {
       console.warn("[Capture] Failed to extract note card:", error);
@@ -1190,6 +1193,7 @@ function extractPrimaryInteractionMetricFromCard(cardNode) {
     return {
       count: 0,
       dimensionHint: "",
+      known: false,
     };
   }
 
@@ -1197,20 +1201,22 @@ function extractPrimaryInteractionMetricFromCard(cardNode) {
 
   const likesSelectors = SEARCH_RESULTS_SELECTORS.noteCard.likes;
   const likesElement = querySelector(likesSelectors, cardNode);
-  const fromSelector = likesElement
-    ? parseKeywordInteractionCount(cleanText(likesElement.textContent))
-    : 0;
-  if (fromSelector > 0) {
-    return {count: fromSelector, dimensionHint};
+  const selectorText = likesElement
+    ? cleanText(likesElement.textContent)
+    : "";
+  const fromSelector = parseKeywordInteractionCount(selectorText);
+  if (fromSelector > 0 || isExplicitKeywordMetricText(selectorText)) {
+    return {count: fromSelector, dimensionHint, known: true};
   }
 
   const hintNodes = cardNode.querySelectorAll(
     '[class*="count"],[class*="interact"],[class*="engage"],[class*="like"],[class*="collect"],[class*="comment"],[aria-label],[title]',
   );
   for (const hint of hintNodes) {
-    const parsed = parseKeywordInteractionCount(cleanText(hint.textContent));
-    if (parsed > 0) {
-      return {count: parsed, dimensionHint};
+    const hintText = cleanText(hint.textContent);
+    const parsed = parseKeywordInteractionCount(hintText);
+    if (parsed > 0 || isExplicitKeywordMetricText(hintText)) {
+      return {count: parsed, dimensionHint, known: true};
     }
   }
 
@@ -1220,8 +1226,8 @@ function extractPrimaryInteractionMetricFromCard(cardNode) {
   );
   if (suffixMatch?.[1]) {
     const parsed = parseKeywordInteractionCount(suffixMatch[1]);
-    if (parsed > 0) {
-      return {count: parsed, dimensionHint};
+    if (parsed > 0 || isExplicitKeywordMetricText(suffixMatch[1])) {
+      return {count: parsed, dimensionHint, known: true};
     }
   }
 
@@ -1230,15 +1236,30 @@ function extractPrimaryInteractionMetricFromCard(cardNode) {
   );
   if (prefixMatch?.[1]) {
     const parsed = parseKeywordInteractionCount(prefixMatch[1]);
-    if (parsed > 0) {
-      return {count: parsed, dimensionHint};
+    if (parsed > 0 || isExplicitKeywordMetricText(prefixMatch[1])) {
+      return {count: parsed, dimensionHint, known: true};
     }
   }
 
   return {
     count: 0,
     dimensionHint,
+    known: false,
   };
+}
+
+function isExplicitKeywordMetricText(value) {
+  const text = cleanText(value || "");
+  if (!text) return false;
+  if (
+    /\d{1,2}[:：]\d{2}/.test(text) ||
+    /^\d{4}[./-]\d{1,2}[./-]\d{1,2}$/.test(text) ||
+    /^\d{1,2}[./-]\d{1,2}$/.test(text) ||
+    /(分钟前|小时前|天前|刚刚|昨天|今天|前天)/.test(text)
+  ) {
+    return false;
+  }
+  return /(?:^|[^0-9])0(?:\.0+)?\s*(?:[wWkK万])?(?:$|[^0-9])/.test(text);
 }
 
 function parseKeywordInteractionCount(value) {
@@ -1318,16 +1339,35 @@ function inferMetricDimensionFromHints(hints = []) {
   return normalizeSortDimension(best[0]);
 }
 
-function buildMetricFieldsByDimension(value, dimension) {
+function buildMetricFieldsByDimension(value, dimension, known = false) {
   const count = normalizeNonNegativeInteger(value, 0);
   const normalizedDimension = normalizeSortDimension(dimension);
+  const metricKnown = {
+    likes: false,
+    collects: false,
+    comments: false,
+    shares: false,
+  };
+  if (!known) return {metricKnown};
   if (normalizedDimension === KEYWORD_SORT_DIMENSION.COLLECTS) {
-    return {likes: 0, collects: count, comments: 0};
+    metricKnown.collects = true;
+    return {
+      collects: count,
+      metricKnown,
+    };
   }
   if (normalizedDimension === KEYWORD_SORT_DIMENSION.COMMENTS) {
-    return {likes: 0, collects: 0, comments: count};
+    metricKnown.comments = true;
+    return {
+      comments: count,
+      metricKnown,
+    };
   }
-  return {likes: count, collects: 0, comments: 0};
+  metricKnown.likes = true;
+  return {
+    likes: count,
+    metricKnown,
+  };
 }
 
 function getKeywordMetricCountByDimension(item, dimension) {

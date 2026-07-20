@@ -61,6 +61,121 @@ function pickPayloadValue(payload, keys = []) {
   return '';
 }
 
+const METRIC_KNOWN_FLAG_KEYS = Object.freeze({
+  likes: ['likesKnown', 'likeCountKnown'],
+  comments: [
+    'commentsKnown',
+    'commentsCountKnown',
+    'commentCountKnown',
+  ],
+  collects: ['collectsKnown', 'collectsCountKnown', 'collectCountKnown'],
+  shares: ['sharesKnown', 'sharesCountKnown', 'shareCountKnown'],
+});
+
+function normalizeMetricDimension(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'comment' || normalized === 'comment_count') return 'comments';
+  if (normalized === 'collect' || normalized === 'favorite') return 'collects';
+  if (normalized === 'like' || normalized === 'digg') return 'likes';
+  if (normalized === 'share' || normalized === 'repost') return 'shares';
+  return normalized;
+}
+
+function isExplicitMetricZero(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value === 0;
+  }
+  const normalized = String(value ?? '')
+    .replace(/[,，\s]/g, '')
+    .trim();
+  return /^0(?:\.0+)?(?:亿|万|[wWkK])?$/.test(normalized);
+}
+
+function isMetricKnownBySource(source, dimension) {
+  if (!source || typeof source !== 'object') return false;
+  if (source.metricKnown?.[dimension] === true) return true;
+  return (METRIC_KNOWN_FLAG_KEYS[dimension] || []).some(
+    (key) => source[key] === true,
+  );
+}
+
+/**
+ * Resolve a metric for an incremental write. `null` means the current capture
+ * did not observe that dimension and the stored value must be preserved;
+ * numeric 0 means the page explicitly proved a real zero and may overwrite.
+ */
+export function resolveMetricUpdateFromPayload(
+  payload,
+  dimension,
+  keys = [],
+  {syncType = ''} = {},
+) {
+  const safePayload = parseJsonObject(payload);
+  const listItem = firstPayloadItem(safePayload);
+  const normalizedDimension = normalizeMetricDimension(dimension);
+  const normalizedSyncType = String(syncType || safePayload.syncType || '')
+    .trim()
+    .toLowerCase();
+  const detailCaptureDone = [
+    safePayload.detailCaptureStatus,
+    listItem.detailCaptureStatus,
+  ].some((status) => String(status || '').trim().toLowerCase() === 'done');
+  const sources = [
+    {
+      value: parseJsonObject(safePayload.detailPayload),
+      detail: detailCaptureDone,
+    },
+    {
+      value: parseJsonObject(listItem.detailPayload),
+      detail: detailCaptureDone,
+    },
+    {value: listItem, detail: false},
+    {value: safePayload, detail: normalizedSyncType === 'single_note'},
+  ];
+
+  for (const sourceEntry of sources) {
+    const source = sourceEntry.value;
+    for (const key of keys) {
+      if (source?.[key] == null || source[key] === '') continue;
+      const rawValue = source[key];
+      const parsed = parseMetricNumber(rawValue, 0);
+      if (parsed > 0) return parsed;
+      if (!isExplicitMetricZero(rawValue)) continue;
+
+      const displayedDimension = normalizeMetricDimension(
+        source.displayMetricDimension ||
+          listItem.displayMetricDimension ||
+          safePayload.displayMetricDimension,
+      );
+      if (
+        sourceEntry.detail ||
+        isMetricKnownBySource(source, normalizedDimension) ||
+        ((source.displayMetricKnown === true ||
+          listItem.displayMetricKnown === true ||
+          safePayload.displayMetricKnown === true) &&
+          displayedDimension === normalizedDimension)
+      ) {
+        return 0;
+      }
+    }
+  }
+
+  const displayDimension = normalizeMetricDimension(
+    listItem.displayMetricDimension || safePayload.displayMetricDimension,
+  );
+  if (displayDimension !== normalizedDimension) return null;
+
+  const displayValue =
+    listItem.displayMetricCount ?? safePayload.displayMetricCount;
+  const parsedDisplayValue = parseMetricNumber(displayValue, 0);
+  if (parsedDisplayValue > 0) return parsedDisplayValue;
+  const displayMetricKnown = Boolean(
+    listItem.displayMetricKnown === true ||
+      safePayload.displayMetricKnown === true,
+  );
+  return displayMetricKnown && isExplicitMetricZero(displayValue) ? 0 : null;
+}
+
 export function resolveMetricFromPayload(payload, dimension, keys = []) {
   const direct = parseMetricNumber(pickPayloadValue(payload, keys), 0);
   if (direct > 0) return direct;
@@ -83,12 +198,24 @@ export function resolveRecordMetrics(row = {}) {
   const recordPayload = row.record_payload || row.payload || {};
   const observationPayload = row.observation_payload || {};
   const metric = (rowValue, dimension, keys) => {
+    const observedUpdate = resolveMetricUpdateFromPayload(
+      observationPayload,
+      dimension,
+      keys,
+    );
+    if (observedUpdate !== null) return observedUpdate;
+
     const stored = parseMetricNumber(rowValue, 0);
     if (stored > 0) return stored;
-    return (
-      resolveMetricFromPayload(observationPayload, dimension, keys) ||
-      resolveMetricFromPayload(recordPayload, dimension, keys)
+
+    const recordUpdate = resolveMetricUpdateFromPayload(
+      recordPayload,
+      dimension,
+      keys,
     );
+    if (recordUpdate !== null) return recordUpdate;
+
+    return resolveMetricFromPayload(recordPayload, dimension, keys);
   };
 
   return {

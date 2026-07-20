@@ -43,12 +43,20 @@ function buildDetailCaptureRecord(id, {done = false} = {}) {
   };
 }
 
-function buildAutoDetailHarness() {
+function buildAutoDetailHarness({
+  cachedRecords = null,
+  persistedRecords = null,
+} = {}) {
   const records = [
     buildDetailCaptureRecord("already-done", {done: true}),
     buildDetailCaptureRecord("pending"),
   ];
+  const liveRecords = Array.isArray(cachedRecords) ? cachedRecords : records;
+  const durableRecords = Array.isArray(persistedRecords)
+    ? persistedRecords
+    : records;
   const detailRuns = [];
+  const getRecordsCalls = [];
   const observedScopes = [];
 
   const run = compileFunction({
@@ -61,7 +69,7 @@ function buildAutoDetailHarness() {
       DETAIL_CAPTURE_SCOPE_ALL: "all",
       buildDetailCaptureFailureSummaryText: () => "",
       getCurrentAuth: () => ({verified: true}),
-      getCurrentDataPool: () => ({records}),
+      getCurrentDataPool: () => ({records: liveRecords}),
       getCurrentPageRecords: () => records,
       getCurrentRuntime: () => ({platform: "douyin"}),
       getDetailCaptureTargetRecords: (inputRecords, {scope}) => {
@@ -74,8 +82,15 @@ function buildAutoDetailHarness() {
       getPlatformCapabilities: () => ({batchDetailCapture: true}),
       getRecordPrimaryNoteUrl: (record) =>
         `https://www.douyin.com/note/${record.id}`,
+      getRecords: async (recordIds) => {
+        getRecordsCalls.push([...recordIds]);
+        const requestedIds = new Set(recordIds);
+        return durableRecords.filter((record) => requestedIds.has(record.id));
+      },
       getViewPlatform: () => "douyin",
       isAuthVerified: () => true,
+      isDetailCaptureDone: (record) =>
+        record?.payload?.detailCaptureStatus === "done",
       readDetailCaptureScopeFromInput: (scope) => scope || "pending",
       runDetailCaptureForRecordIds: async (recordIds) => {
         detailRuns.push([...recordIds]);
@@ -91,7 +106,7 @@ function buildAutoDetailHarness() {
     },
   });
 
-  return {detailRuns, observedScopes, records, run};
+  return {detailRuns, getRecordsCalls, observedScopes, records, run};
 }
 
 test("explicit record ids recapture already-done records when skip is disabled", async () => {
@@ -130,6 +145,122 @@ test("explicit record ids remain pending-only when skip is enabled", async () =>
   assert.equal(result.ok, true);
   assert.deepEqual(harness.detailRuns, [["pending"]]);
   assert.deepEqual(harness.observedScopes, ["pending"]);
+});
+
+test("explicit record ids resolve from durable storage when the sidebar cache is stale", async () => {
+  const pendingRecord = buildDetailCaptureRecord("pending");
+  const harness = buildAutoDetailHarness({
+    cachedRecords: [],
+    persistedRecords: [pendingRecord],
+  });
+
+  const result = await harness.run(
+    {
+      autoDetailCaptureAfterListCapture: true,
+      detailCaptureScope: "pending",
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+    {recordIds: ["pending"]},
+  );
+
+  assert.equal(result.ok, true);
+  assert.notEqual(result.skipped, true);
+  assert.deepEqual(harness.getRecordsCalls, [["pending"]]);
+  assert.deepEqual(harness.detailRuns, [["pending"]]);
+});
+
+test("durable storage is authoritative when cached detail state is stale", async () => {
+  const harness = buildAutoDetailHarness({
+    cachedRecords: [buildDetailCaptureRecord("same-record", {done: true})],
+    persistedRecords: [buildDetailCaptureRecord("same-record")],
+  });
+
+  const result = await harness.run(
+    {
+      autoDetailCaptureAfterListCapture: true,
+      detailCaptureScope: "pending",
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+    {recordIds: ["same-record"]},
+  );
+
+  assert.equal(result.ok, true);
+  assert.notEqual(result.skipped, true);
+  assert.deepEqual(harness.getRecordsCalls, [["same-record"]]);
+  assert.deepEqual(harness.detailRuns, [["same-record"]]);
+});
+
+test("missing explicit record ids return a partial failure instead of a successful skip", async () => {
+  const harness = buildAutoDetailHarness({
+    cachedRecords: [],
+    persistedRecords: [],
+  });
+
+  const result = await harness.run(
+    {
+      autoDetailCaptureAfterListCapture: true,
+      detailCaptureScope: "pending",
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+    {recordIds: ["missing-record"]},
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.partial, true);
+  assert.notEqual(result.skipped, true);
+  assert.equal(result.reason, "record_ids_unresolved");
+  assert.equal(result.error?.code, "DETAIL_RECORD_IDS_UNRESOLVED");
+  assert.equal(result.failedCount, 1);
+  assert.deepEqual([...result.unresolvedRecordIds], ["missing-record"]);
+  assert.deepEqual(harness.getRecordsCalls, [["missing-record"]]);
+  assert.deepEqual(harness.detailRuns, []);
+});
+
+test("resolved records are still enhanced when another explicit id is unresolved", async () => {
+  const harness = buildAutoDetailHarness({
+    cachedRecords: [],
+    persistedRecords: [buildDetailCaptureRecord("pending")],
+  });
+
+  const result = await harness.run(
+    {
+      autoDetailCaptureAfterListCapture: true,
+      detailCaptureScope: "pending",
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+    {recordIds: ["pending", "missing-record"]},
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.partial, true);
+  assert.equal(result.successCount, 1);
+  assert.equal(result.failedCount, 1);
+  assert.equal(result.total, 2);
+  assert.deepEqual(harness.detailRuns, [["pending"]]);
+  assert.deepEqual(
+    [...result.results].map((item) => item.recordId),
+    ["missing-record"],
+  );
+});
+
+test("fully settled explicit records remain a legal terminal skip", async () => {
+  const harness = buildAutoDetailHarness({
+    persistedRecords: [buildDetailCaptureRecord("already-done", {done: true})],
+  });
+
+  const result = await harness.run(
+    {
+      autoDetailCaptureAfterListCapture: true,
+      detailCaptureScope: "pending",
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+    {recordIds: ["already-done"]},
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, "all_targets_settled");
+  assert.deepEqual(harness.detailRuns, []);
 });
 
 test("each keyword invokes enhancement even when its record ids duplicate an already-done item", async () => {
@@ -202,7 +333,7 @@ test("each keyword invokes enhancement even when its record ids duplicate an alr
         keyword: payload.keyword,
         recordIds: [...payload.recordIds],
       });
-      return {skipped: true, reason: "no_target_records"};
+      return {skipped: true, reason: "all_targets_settled"};
     },
   });
 
@@ -216,4 +347,8 @@ test("each keyword invokes enhancement even when its record ids duplicate an alr
     "品牌词",
     "竞品词",
   ]);
+  assert.deepEqual(
+    [...result.results].map(({enhanceStatus}) => enhanceStatus),
+    ["skipped", "skipped"],
+  );
 });

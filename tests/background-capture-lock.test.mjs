@@ -1438,6 +1438,185 @@ test("runner heartbeats never masquerade as business progress", async () => {
   );
 });
 
+test("manual continuation starts with a fresh automatic recovery budget", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    status: "needs_action",
+    recoveryCount: 2,
+    recoveryLaunchFailures: 2,
+    finishedAt: new Date().toISOString(),
+  });
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.notEqual(harness.storage[UNATTENDED_REQUEST_KEY].id, request.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    0,
+  );
+});
+
+test("progress refreshes the business clock but only a durable milestone resets recovery budgets", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    recoveryCount: 2,
+    recoveryLaunchFailures: 1,
+    progressSeq: 8,
+  });
+  const duplicateProgress = {
+    ...request.progress,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const heartbeat = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {heartbeatAt: new Date().toISOString()},
+  });
+  const duplicate = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: request.progressSeq + 1,
+      progress: duplicateProgress,
+    },
+  });
+
+  assert.equal(heartbeat.accepted, true);
+  assert.equal(duplicate.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    1,
+  );
+
+  const advanced = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: harness.storage[UNATTENDED_REQUEST_KEY].progressSeq + 1,
+      progress: {
+        ...duplicateProgress,
+        current: Number(duplicateProgress.current || 0) + 1,
+        message: "已进入下一条作品",
+      },
+    },
+  });
+
+  assert.equal(advanced.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    1,
+  );
+
+  const milestone = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      checkpoint: {
+        ...request.checkpoint,
+        completedKeywords: ["关键词一"],
+      },
+    },
+  });
+
+  assert.equal(milestone.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    0,
+  );
+});
+
+test("a repeated checkpoint does not reset recovery but an advanced checkpoint does", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    recoveryCount: 2,
+    recoveryLaunchFailures: 1,
+  });
+  const duplicateCheckpoint = {
+    ...request.checkpoint,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const duplicate = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {checkpoint: duplicateCheckpoint},
+  });
+  assert.equal(duplicate.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    1,
+  );
+
+  const advanced = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      checkpoint: {
+        ...duplicateCheckpoint,
+        keywordIndex: Number(duplicateCheckpoint.keywordIndex || 0) + 1,
+        completedKeywords: ["关键词一"],
+      },
+    },
+  });
+  assert.equal(advanced.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    0,
+  );
+});
+
+test("repeated old progress cannot replenish more than two automatic recoveries", async () => {
+  const harness = createHarness();
+  let request = seedUnattendedRequest(harness);
+
+  const first = await harness.api.recoverUnattendedKeywordRunRequest(request, {
+    healthy: false,
+    reason: "runner_heartbeat_stale",
+  });
+  assert.equal(first.recovered, true, JSON.stringify(first));
+  request = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(request.recoveryCount, 1);
+
+  const duplicate = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: request.progressSeq + 1,
+      progress: {...request.progress, updatedAt: new Date().toISOString()},
+    },
+  });
+  assert.equal(duplicate.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
+
+  request = harness.storage[UNATTENDED_REQUEST_KEY];
+  const second = await harness.api.recoverUnattendedKeywordRunRequest(request, {
+    healthy: false,
+    reason: "runner_heartbeat_stale",
+  });
+  assert.equal(second.recovered, true, JSON.stringify(second));
+  request = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(request.recoveryCount, 2);
+
+  const exhausted = await harness.api.recoverUnattendedKeywordRunRequest(
+    request,
+    {healthy: false, reason: "runner_heartbeat_stale"},
+  );
+  assert.equal(exhausted.terminal, true, JSON.stringify(exhausted));
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+});
+
 test("completed-with-failures is terminal and cannot be resurrected", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness);
@@ -1868,6 +2047,76 @@ test("closing the active runner triggers recovery through tabs.onRemoved", async
     request.attemptId,
   );
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
+});
+
+test("a frozen runner is recovered even though its tab still exists", async () => {
+  const harness = createHarness();
+  seedUnattendedRequest(harness, {runnerTabId: 42});
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    status: "complete",
+    frozen: Number(tabId) === 42,
+    discarded: false,
+    url: "chrome-extension://test/sidebar/sidebar.html",
+  }));
+
+  const result = await harness.api.superviseUnattendedKeywordRun();
+
+  assert.equal(result.recovered, true, JSON.stringify(result));
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
+    "runner_tab_frozen",
+  );
+});
+
+test("the tab-state event immediately checks a frozen background runner", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {runnerTabId: 42});
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    active: false,
+    status: "complete",
+    frozen: Number(tabId) === 42,
+    discarded: false,
+    url: "chrome-extension://test/sidebar/sidebar.html",
+  }));
+
+  for (const listener of harness.chrome.tabs.onUpdated.listeners) {
+    listener(42, {frozen: true}, {id: 42, active: false, frozen: true});
+  }
+  await waitFor(
+    () =>
+      harness.storage[UNATTENDED_REQUEST_KEY]?.attemptId !== request.attemptId,
+    "frozen runner event should trigger unattended recovery",
+  );
+
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
+    "runner_tab_frozen",
+  );
+});
+
+test("a discarded runner is recovered without waiting for heartbeat expiry", async () => {
+  const harness = createHarness();
+  seedUnattendedRequest(harness, {runnerTabId: 42});
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    status: "unloaded",
+    frozen: false,
+    discarded: Number(tabId) === 42,
+    url: "chrome-extension://test/sidebar/sidebar.html",
+  }));
+
+  const result = await harness.api.superviseUnattendedKeywordRun();
+
+  assert.equal(result.recovered, true, JSON.stringify(result));
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
+    "runner_tab_discarded",
+  );
 });
 
 test("startup and sleep recovery apply a short grace before retrying", async () => {

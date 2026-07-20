@@ -4,7 +4,7 @@ import { labelRecord } from '../services/ai-labeler.js';
 import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
-import { parseMetricNumber, resolveMetricFromPayload } from '../utils/metrics.js';
+import { parseMetricNumber, resolveMetricUpdateFromPayload } from '../utils/metrics.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
 import { queryAll } from '../db/init.js';
 
@@ -121,7 +121,7 @@ async function drainCommentWorkflowQueue() {
   }
 }
 
-function normalizeRecord(body) {
+export function normalizeRecord(body) {
   let rawItems;
   if (Array.isArray(body.records)) {
     rawItems = body.records.map(r => ({
@@ -151,22 +151,10 @@ function normalizeRecord(body) {
       }
       return '';
     };
-    const getPayloadOnly = (...keys) => {
-      for (const k of keys) {
-        if (dp[k] != null && dp[k] !== '') return dp[k];
-        if (listItem[k] != null && listItem[k] !== '') return listItem[k];
-        if (item[k] != null && item[k] !== '') return item[k];
-      }
-      return '';
-    };
-    const metric = (dimension, ...keys) => {
-      const rawMetric = getPayloadOnly(...keys);
-      if (rawMetric !== '') {
-        return parseMetricNumber(rawMetric, 0);
-      }
-      const resolved = resolveMetricFromPayload(item, dimension, keys);
-      return resolved > 0 ? resolved : null;
-    };
+    const metric = (dimension, ...keys) =>
+      resolveMetricUpdateFromPayload(item, dimension, keys, {
+        syncType: item.syncType || body.syncType,
+      });
     const tags = mergedArrayValue(
       dp.tags, listItem.tags, item.tags,
       dp.hashtags, listItem.hashtags, item.hashtags,

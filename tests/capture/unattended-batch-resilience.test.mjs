@@ -237,6 +237,44 @@ test("non-user detail cancellation marks the keyword partial and continues", asy
   assert.equal(harness.settled[0].canceled, false);
 });
 
+test("nonempty keyword records cannot silently settle an anomalous no-target enhancement skip", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    afterKeywordCapture: async ({current, recordIds}) =>
+      current === 1
+        ? {
+            skipped: true,
+            reason: "no_target_records",
+          }
+        : {
+            ok: true,
+            canceled: false,
+            successCount: recordIds.length,
+            failedCount: 0,
+            results: recordIds.map((recordId) => ({recordId, ok: true})),
+          },
+  });
+
+  const result = await harness.run({keywords: ["词1", "词2"]});
+
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词1", "词2"],
+    "a defensive partial settlement must not truncate the remaining plan",
+  );
+  assert.equal(result.results[0].enhanceStatus, "failed");
+  assert.equal(result.results[0].partial, true);
+  assert.equal(harness.settled[0].result.partial, true);
+  assert.equal(result.results[1].enhanceStatus, "done");
+  assert.equal(
+    harness.progress.some(
+      (entry) => entry.keyword === "词1" && entry.phase === "enhance_skipped",
+    ),
+    false,
+    "a nonempty explicit batch must not be reported as an ordinary skip",
+  );
+});
+
 test("runner interruption without canceled flag is checkpointed and continues to the next keyword", async () => {
   const harness = createBatchHarness({
     captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
