@@ -1404,7 +1404,7 @@ function refreshListCaptureMetricsInPlace(existingRecord, freshRecord) {
   if (!freshItem || typeof freshItem !== 'object') return false;
   let changed = false;
   for (const field of ['likes', 'comments', 'collects', 'shares']) {
-    if (!hasMetricValue(freshItem, field)) continue;
+    if (!isListMetricExplicitlyKnown(freshItem, field)) continue;
     const next = parseInteractionCount(freshItem[field]);
     const previous = parseInteractionCount(existingItem[field]);
     if (previous === next) continue; // 没变化,不动
@@ -1419,6 +1419,44 @@ function refreshListCaptureMetricsInPlace(existingRecord, freshRecord) {
     changed = true;
   }
   return changed;
+}
+
+const LIST_METRIC_KNOWN_FLAG_KEYS = Object.freeze({
+  likes: ['likesKnown', 'likeCountKnown'],
+  comments: [
+    'commentsKnown',
+    'commentsCountKnown',
+    'commentCountKnown',
+  ],
+  collects: ['collectsKnown', 'collectsCountKnown', 'collectCountKnown'],
+  shares: ['sharesKnown', 'sharesCountKnown', 'shareCountKnown'],
+});
+
+function normalizeListMetricDimension(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'comment' || normalized === 'comment_count') return 'comments';
+  if (normalized === 'collect' || normalized === 'favorite') return 'collects';
+  if (normalized === 'like' || normalized === 'digg') return 'likes';
+  if (normalized === 'share' || normalized === 'repost') return 'shares';
+  return normalized;
+}
+
+export function isListMetricExplicitlyKnown(item = {}, field = '') {
+  const normalizedField = normalizeListMetricDimension(field);
+  if (!hasMetricValue(item, normalizedField)) return false;
+
+  const count = parseInteractionCount(item[normalizedField]);
+  if (count > 0) return true;
+
+  if (item?.metricKnown?.[normalizedField] === true) return true;
+  const knownFlagKeys = LIST_METRIC_KNOWN_FLAG_KEYS[normalizedField] || [];
+  if (knownFlagKeys.some((key) => item?.[key] === true)) return true;
+
+  return (
+    item?.displayMetricKnown === true &&
+    normalizeListMetricDimension(item?.displayMetricDimension) ===
+    normalizedField
+  );
 }
 
 function hasMetricValue(item = {}, field) {
@@ -13409,6 +13447,8 @@ function formatEnhanceSkipReason(reason = '') {
     auth_required: '未授权',
     unsupported_platform: '当前平台不支持',
     no_target_records: '没有待增强记录',
+    all_targets_settled: '本轮记录均已完成增强',
+    record_ids_unresolved: '采集结果尚未写入本地数据池',
     missing_note_url: '缺少可访问链接',
     no_record_ids: '本关键词没有可增强记录',
   };
@@ -13941,22 +13981,20 @@ export async function batchCaptureByKeywords({
       !keywordResult?.fatal &&
       keywordResult?.ok &&
       typeof afterKeywordCapture === 'function';
-    if (
-      canRunAfterKeywordCapture &&
-      keywordRecordIds.length === 0 &&
-      onProgress
-    ) {
+    if (canRunAfterKeywordCapture && keywordRecordIds.length === 0) {
       keywordResult.enhanceStatus = 'skipped';
       keywordResult.enhanceSkipReason = 'no_record_ids';
-      onProgress({
-        current: i + 1,
-        total: keywords.length,
-        keyword,
-        phase: 'enhance_skipped',
-        message: `关键词「${keyword}」没有采到可入池记录，跳过采集增强`,
-        recordIds: [],
-        runnerTabId,
-      });
+      if (onProgress) {
+        onProgress({
+          current: i + 1,
+          total: keywords.length,
+          keyword,
+          phase: 'enhance_skipped',
+          message: `关键词「${keyword}」没有采到可入池记录，跳过采集增强`,
+          recordIds: [],
+          runnerTabId,
+        });
+      }
     }
     let stopAfterKeyword = Boolean(
       keywordResult?.securityBlocked || keywordResult?.fatal,
@@ -13988,18 +14026,39 @@ export async function batchCaptureByKeywords({
         if (enhanceResult !== undefined) {
           keywordResult.enhanceResult = enhanceResult;
         }
-        if (enhanceResult?.skipped && onProgress) {
-          keywordResult.enhanceStatus = 'skipped';
-          keywordResult.enhanceSkipReason = enhanceResult.reason || '';
-          onProgress({
-            current: i + 1,
-            total: keywords.length,
-            keyword,
-            phase: 'enhance_skipped',
-            message: `关键词「${keyword}」采集增强已跳过：${formatEnhanceSkipReason(enhanceResult.reason)}`,
-            recordIds: keywordRecordIds,
-            runnerTabId,
-          });
+        const enhanceSkipReason = String(enhanceResult?.reason || '').trim();
+        const unexpectedExplicitSkip =
+          Boolean(enhanceResult?.skipped) &&
+          keywordRecordIds.length > 0 &&
+          ['no_target_records', 'record_ids_unresolved', 'missing_note_url'].includes(
+            enhanceSkipReason,
+          );
+        if (enhanceResult?.skipped) {
+          keywordResult.enhanceSkipReason = enhanceSkipReason;
+          if (unexpectedExplicitSkip) {
+            keywordResult.enhanceStatus = 'failed';
+            keywordResult.partial = true;
+            keywordResult.warning =
+              enhanceResult?.error?.message ||
+              `已采到 ${keywordRecordIds.length} 条记录，但采集增强目标未完整解析`;
+          } else {
+            keywordResult.enhanceStatus = 'skipped';
+          }
+          if (onProgress) {
+            onProgress({
+              current: i + 1,
+              total: keywords.length,
+              keyword,
+              phase: unexpectedExplicitSkip
+                ? 'enhance_failed'
+                : 'enhance_skipped',
+              message: unexpectedExplicitSkip
+                ? `关键词「${keyword}」采集增强未完整启动：${formatEnhanceSkipReason(enhanceSkipReason)}`
+                : `关键词「${keyword}」采集增强已跳过：${formatEnhanceSkipReason(enhanceSkipReason)}`,
+              recordIds: keywordRecordIds,
+              runnerTabId,
+            });
+          }
         }
         if (enhanceResult?.securityBlocked) {
           keywordResult.enhanceStatus = 'failed';

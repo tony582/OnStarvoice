@@ -207,6 +207,29 @@ test("partial comments remain retryable instead of becoming completed", () => {
   assert.equal(findUnattendedResumeKeyword(settled.checkpoint, keywords), "品牌");
 });
 
+test("legacy no-target enhancement skip with saved records stays retryable", () => {
+  const settled = settleUnattendedKeywordCheckpoint({
+    checkpoint: normalizeUnattendedKeywordCheckpoint({}, keywords),
+    keywords,
+    keyword: "品牌",
+    result: {
+      ok: true,
+      enhanceStatus: "skipped",
+      enhanceSkipReason: "no_target_records",
+    },
+    recordIds: ["record-1"],
+    attempt: 1,
+    maxAttempts: 2,
+  });
+
+  assert.equal(settled.entry.status, "partial");
+  assert.equal(
+    settled.entry.error,
+    "已采到列表记录，但采集增强目标未完整解析",
+  );
+  assert.equal(findUnattendedResumeKeyword(settled.checkpoint, keywords), "品牌");
+});
+
 test("partial work becomes bounded failure after the retry budget", () => {
   const first = settleUnattendedKeywordCheckpoint({
     checkpoint: normalizeUnattendedKeywordCheckpoint({}, keywords),

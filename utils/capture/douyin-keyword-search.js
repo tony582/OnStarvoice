@@ -458,7 +458,8 @@ function extractDouyinSearchCards(searchRoot) {
     const duration = cleanText(
       getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.duration, card),
     );
-    const likes = resolveSearchCardLikes(card);
+    const likesMetric = resolveSearchCardLikes(card);
+    const likes = likesMetric.count;
     const publishDateRaw = cleanText(resolveSearchCardPublishDate(card));
     const publishDate = publishDateRaw
       ? normalizeSearchDate(publishDateRaw)
@@ -484,10 +485,15 @@ function extractDouyinSearchCards(searchRoot) {
       publishDate,
       publishDateRaw,
       likes,
-      collects: 0,
-      comments: 0,
+      metricKnown: {
+        likes: likesMetric.known,
+        collects: false,
+        comments: false,
+        shares: false,
+      },
       displayMetricCount: likes,
       displayMetricDimension: DEFAULT_SORT_DIMENSION,
+      displayMetricKnown: likesMetric.known,
       domLocator: buildDomLocator(card),
       domMatchHints: reverseMatchHints,
       cardImageCandidates: cardMedia.images,
@@ -1426,17 +1432,20 @@ function resolveMetricText(card, selectors) {
 }
 
 function resolveSearchCardLikes(card) {
-  const directLikes = parseCount(
-    resolveMetricText(
-      card,
-      DOUYIN_DOM_PROFILE.searchResults.cards.fields.likes,
-    ),
+  const metricText = resolveMetricText(
+    card,
+    DOUYIN_DOM_PROFILE.searchResults.cards.fields.likes,
   );
-  if (directLikes > 0) {
-    return directLikes;
+  const directLikes = parseCount(metricText);
+  if (directLikes > 0 || /^0(?:\.0+)?(?:亿|万|[kK])?$/.test(metricText)) {
+    return {count: directLikes, known: true};
   }
 
-  return extractFallbackLikeCountFromCard(card);
+  const fallbackLikes = extractFallbackLikeCountFromCard(card);
+  return {
+    count: fallbackLikes,
+    known: fallbackLikes > 0,
+  };
 }
 
 function extractRelativeDateHint(card) {

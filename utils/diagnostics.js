@@ -462,6 +462,10 @@ function buildTaskCenterDiagnostics(taskLedger = {}) {
     trigger: normalizeText(run?.trigger, 80),
     attemptNumber: Number(run?.attemptNumber) || 0,
     progressSeq: Number(run?.progressSeq) || 0,
+    runnerTabId:
+      Number.isFinite(Number(run?.runnerTabId)) && Number(run?.runnerTabId) > 0
+        ? Math.floor(Number(run.runnerTabId))
+        : null,
     heartbeatAt: normalizeText(run?.heartbeatAt, 80),
     businessProgressAt: normalizeText(run?.businessProgressAt, 80),
     updatedAt: normalizeText(run?.updatedAt, 80),
@@ -473,6 +477,15 @@ function buildTaskCenterDiagnostics(taskLedger = {}) {
       message: normalizeText(run?.progress?.message, 180),
     },
     counts: sanitizeMetadata(run?.counts || run?.summary || {}),
+    recovery: {
+      count: Math.max(0, Number(run?.metadata?.recoveryCount) || 0),
+      maxAttempts: Math.max(
+        0,
+        Number(run?.metadata?.maxRecoveryAttempts) || 0,
+      ),
+      reason: normalizeText(run?.metadata?.recoveryReason, 120),
+      waitUntil: normalizeText(run?.metadata?.recoveryWaitUntil, 80),
+    },
     error: run?.error
       ? normalizeError(run.error, "task_run_error")
       : null,

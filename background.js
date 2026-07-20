@@ -600,6 +600,64 @@ function parseTimestampMs(value) {
   return Number.isFinite(timestamp) ? timestamp : NaN;
 }
 
+const UNATTENDED_PROGRESS_VOLATILE_FIELDS = new Set([
+  'businessProgressAt',
+  'elapsedMs',
+  'heartbeatAt',
+  'remainingMs',
+  'runStartedAt',
+  'stepStartedAt',
+  'updatedAt',
+  'waitUntil',
+]);
+
+function buildUnattendedBusinessProgressFingerprint(value) {
+  const normalize = (entry) => {
+    if (Array.isArray(entry)) {
+      return entry.map((item) => normalize(item));
+    }
+    if (!entry || typeof entry !== 'object') {
+      return entry;
+    }
+    return Object.fromEntries(
+      Object.keys(entry)
+        .filter((key) => !UNATTENDED_PROGRESS_VOLATILE_FIELDS.has(key))
+        .sort()
+        .map((key) => [key, normalize(entry[key])]),
+    );
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function buildUnattendedRecoveryMilestoneFingerprint(checkpoint) {
+  const source =
+    checkpoint && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
+      ? checkpoint
+      : {};
+  const keywordResults = Array.isArray(source.keywordResults)
+    ? source.keywordResults.map((entry) => ({
+        round: Math.max(1, Number(entry?.round) || 1),
+        index: Math.max(0, Number(entry?.index) || 0),
+        keyword: String(entry?.keyword || ''),
+        status: String(entry?.status || ''),
+        attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
+        savedCount: Math.max(0, Number(entry?.savedCount) || 0),
+        error: String(entry?.error || ''),
+      }))
+    : [];
+  const normalizeKeywords = (value) =>
+    Array.isArray(value)
+      ? value.map((keyword) => String(keyword || '').trim()).filter(Boolean)
+      : [];
+  return JSON.stringify({
+    round: Math.max(1, Number(source.round) || 1),
+    keywordResults,
+    completedKeywords: normalizeKeywords(source.completedKeywords),
+    failedKeywords: normalizeKeywords(source.failedKeywords),
+    skippedKeywords: normalizeKeywords(source.skippedKeywords),
+  });
+}
+
 function getUnattendedTaskCenterCore() {
   const core = globalThis.OnStarvoiceTaskCenterCore;
   return core && typeof core === 'object' ? core : null;
@@ -2291,7 +2349,22 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       safePatch.checkpoint &&
       typeof safePatch.checkpoint === 'object' &&
       !Array.isArray(safePatch.checkpoint);
-    const hasBusinessProgress = hasProgress || hasCheckpoint;
+    // 恢复后的 runner 会先重放已保存的 progress/checkpoint。语义变化可
+    // 刷新业务时钟，但只有关键词结算等持久检查点里程碑才能归还“连续恢复”
+    // 预算；仅阶段切换、时间戳变化、心跳或同一检查点重试均不能清零预算。
+    const progressAdvanced =
+      hasProgress &&
+      buildUnattendedBusinessProgressFingerprint(safePatch.progress) !==
+        buildUnattendedBusinessProgressFingerprint(request.progress || null);
+    const checkpointAdvanced =
+      hasCheckpoint &&
+      buildUnattendedBusinessProgressFingerprint(safePatch.checkpoint) !==
+        buildUnattendedBusinessProgressFingerprint(request.checkpoint || null);
+    const hasBusinessProgress = progressAdvanced || checkpointAdvanced;
+    const recoveryMilestoneAdvanced =
+      hasCheckpoint &&
+      buildUnattendedRecoveryMilestoneFingerprint(safePatch.checkpoint) !==
+        buildUnattendedRecoveryMilestoneFingerprint(request.checkpoint || null);
     let nextProgressSeq = request.progressSeq;
     if (hasProgress) {
       const suppliedProgressSeq = Number(safePatch.progressSeq);
@@ -2338,6 +2411,12 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       status: nextStatus,
       heartbeatAt: safePatch.heartbeatAt ? now : request.heartbeatAt,
       businessProgressAt: hasBusinessProgress ? now : request.businessProgressAt,
+      recoveryCount: recoveryMilestoneAdvanced
+        ? 0
+        : Math.max(0, Number(request.recoveryCount) || 0),
+      recoveryLaunchFailures: recoveryMilestoneAdvanced
+        ? 0
+        : Math.max(0, Number(request.recoveryLaunchFailures) || 0),
       recoveryWaitUntil: waitUntil,
       updatedAt: now,
     };
@@ -2457,7 +2536,13 @@ async function assessUnattendedRunHealth(
       return {healthy: false, reason: 'runner_tab_closed'};
     }
     try {
-      await chrome.tabs.get(runnerTabId);
+      const runnerTab = await chrome.tabs.get(runnerTabId);
+      if (runnerTab?.discarded === true) {
+        return {healthy: false, reason: 'runner_tab_discarded'};
+      }
+      if (runnerTab?.frozen === true) {
+        return {healthy: false, reason: 'runner_tab_frozen'};
+      }
     } catch {
       return {healthy: false, reason: 'runner_tab_missing'};
     }
@@ -2490,6 +2575,8 @@ function formatUnattendedRecoveryReason(reason) {
     claim_timeout: '运行页未在规定时间内领取任务',
     runner_tab_closed: '运行页已被关闭',
     runner_tab_missing: '运行页已不存在',
+    runner_tab_discarded: '浏览器已回收无人值守运行页',
+    runner_tab_frozen: '浏览器已暂停无人值守运行页',
     runner_heartbeat_stale: '运行页心跳中断',
     business_progress_stalled: '采集业务长时间没有新进展',
     runner_owner_disconnected: '无人值守运行页连接已更换',
@@ -3006,7 +3093,9 @@ async function manuallyRecoverUnattendedKeywordRun({requestId = '', mode = 'rema
       attemptId: createUuid(),
       attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
       progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
-      recoveryCount: Math.max(0, Number(current.recoveryCount) || 0),
+      // 人工继续是用户确认后创建的新根请求，不能继承上一根请求已经耗尽的
+      // 自动恢复预算；否则新任务第一次再遇到运行页暂停就会立即 needs_action。
+      recoveryCount: 0,
       manualRecoveryCount:
         Math.max(0, Number(current.manualRecoveryCount) || 0) + 1,
       recoveryMode: normalizedMode,
@@ -6108,6 +6197,16 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.frozen === true || changeInfo.discarded === true) {
+    // Chromium 132+ 会明确暴露 frozen；Edge 的睡眠标签页也可能进一步
+    // discarded。runner 虽仍在标签栏里，但这两种状态都已无法继续计时器
+    // 和编排，立即交给 supervisor 从检查点恢复，不再等心跳宽限耗尽。
+    superviseUnattendedKeywordRun({
+      reason: 'runner_tab_state_changed',
+    }).catch((error) => {
+      console.error('[onstarvoice] unattended runner state check failed', error);
+    });
+  }
   if (!tab?.active) return;
   if (!changeInfo.url && changeInfo.status !== 'complete') return;
 

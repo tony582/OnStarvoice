@@ -329,9 +329,23 @@ export function settleUnattendedKeywordCheckpoint({
     nonNegativeInt(previous?.attemptCount) + 1,
     positiveInt(attempt),
   );
+  const enhanceSkipReason = text(
+    result?.enhanceSkipReason || result?.enhanceResult?.reason,
+  );
+  const unexpectedExplicitEnhanceSkip = Boolean(
+    result?.enhanceStatus === "skipped" &&
+      Array.isArray(recordIds) &&
+      recordIds.length > 0 &&
+      [
+        "no_target_records",
+        "record_ids_unresolved",
+        "missing_note_url",
+      ].includes(enhanceSkipReason),
+  );
   const partial = Boolean(
     result?.partial ||
       result?.enhanceStatus === "failed" ||
+      unexpectedExplicitEnhanceSkip ||
       result?.commentsResult?.phase === "comments_partial",
   );
   const status = securityBlocked
@@ -366,6 +380,9 @@ export function settleUnattendedKeywordCheckpoint({
       result?.error?.message ||
         result?.error ||
         result?.warning ||
+        (unexpectedExplicitEnhanceSkip
+          ? "已采到列表记录，但采集增强目标未完整解析"
+          : "") ||
         (securityBlocked ? "触发平台安全限制" : ""),
     ),
     finishedAt,

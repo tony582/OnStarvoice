@@ -117,6 +117,15 @@ async function insertObservation(tx, { tenantId, recordId, authCode, monitorExec
   return result.id;
 }
 
+export function mergeObservationMetrics(record = {}, existing = {}) {
+  const merged = {...record};
+  for (const field of ['likes', 'comments_count', 'collects', 'shares']) {
+    const incoming = cleanOptionalNumber(record[field]);
+    merged[field] = incoming ?? cleanNumber(existing[field]);
+  }
+  return merged;
+}
+
 export async function upsertCapturedRecord(record, context) {
   const tenantId = context.tenantId;
   const authCode = context.authCode || '';
@@ -214,7 +223,13 @@ export async function upsertCapturedRecord(record, context) {
         record.publish_location || '',
       ]);
 
-      const observationId = await insertObservation(tx, { tenantId, recordId: existing.id, authCode, monitorExecutionId, record: { ...record, payload } });
+      const observationId = await insertObservation(tx, {
+        tenantId,
+        recordId: existing.id,
+        authCode,
+        monitorExecutionId,
+        record: mergeObservationMetrics({...record, payload}, existing),
+      });
 
       if (changedFields.length > 0) {
         await tx.execute(`

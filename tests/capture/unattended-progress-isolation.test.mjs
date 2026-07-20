@@ -25,6 +25,37 @@ function readFunctionSource(name) {
   assert.fail(`unterminated function: ${name}`);
 }
 
+function readAsyncFunctionSource(name) {
+  const marker = `async function ${name}(`;
+  const start = sidebarSource.indexOf(marker);
+  assert.notEqual(start, -1, `missing async function: ${name}`);
+  const paramsStart = sidebarSource.indexOf("(", start + marker.length - 1);
+  let paramsDepth = 0;
+  let paramsEnd = -1;
+  for (let index = paramsStart; index < sidebarSource.length; index += 1) {
+    const char = sidebarSource[index];
+    if (char === "(") paramsDepth += 1;
+    if (char !== ")") continue;
+    paramsDepth -= 1;
+    if (paramsDepth === 0) {
+      paramsEnd = index;
+      break;
+    }
+  }
+  assert.notEqual(paramsEnd, -1, `unterminated async params: ${name}`);
+  const bodyStart = sidebarSource.indexOf("{", paramsEnd);
+  assert.notEqual(bodyStart, -1, `missing async function body: ${name}`);
+  let depth = 0;
+  for (let index = bodyStart; index < sidebarSource.length; index += 1) {
+    const char = sidebarSource[index];
+    if (char === "{") depth += 1;
+    if (char !== "}") continue;
+    depth -= 1;
+    if (depth === 0) return sidebarSource.slice(start, index + 1);
+  }
+  assert.fail(`unterminated async function: ${name}`);
+}
+
 function evaluateUnattendedTerminalClassifier() {
   const source = readFunctionSource("isUnattendedTerminalProgressPhase");
   const context = {};
@@ -308,6 +339,58 @@ test("the root terminal fence rejects late events from the same unattended attem
     unattendedAttemptId: "attempt-B",
   });
   assert.equal(touched, 0, "terminal state must win over late worker progress");
+});
+
+test("terminal reporting keeps confirming after the initial transport retries", async () => {
+  const reportSource = readAsyncFunctionSource("reportUnattendedTerminalRun");
+  let calls = 0;
+  const context = {
+    activeUnattendedRunRequestId: "request-A",
+    activeUnattendedRunAttemptId: "attempt-A",
+    activeUnattendedTerminalProgressKey: "",
+    UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS: [0, 0, 0],
+    UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS: 0,
+    async sleep() {},
+    async reportUnattendedKeywordRun() {
+      calls += 1;
+      if (calls <= 3) {
+        assert.equal(
+          context.activeUnattendedTerminalProgressKey,
+          "",
+          "a transport failure must not commit the terminal fence",
+        );
+        return {ok: false, accepted: false, reason: "transport_error"};
+      }
+      return {ok: true, accepted: true, reason: "updated"};
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${reportSource}\nthis.reportUnattendedTerminalRun = reportUnattendedTerminalRun;`,
+    context,
+  );
+
+  const result = await context.reportUnattendedTerminalRun(
+    "request-A",
+    {status: "completed"},
+    {attemptId: "attempt-A"},
+  );
+
+  assert.equal(result.accepted, true);
+  assert.equal(calls, 4, "terminal confirmation must continue beyond three sends");
+  assert.equal(
+    context.activeUnattendedTerminalProgressKey,
+    "request-A:attempt-A",
+  );
+});
+
+test("unattended status messages have a finite transport timeout", () => {
+  const sendSource = readAsyncFunctionSource("sendUnattendedRuntimeMessage");
+  const reportSource = readAsyncFunctionSource("reportUnattendedKeywordRun");
+
+  assert.match(sendSource, /Promise\.race/);
+  assert.match(sendSource, /UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS/);
+  assert.match(reportSource, /sendUnattendedRuntimeMessage/);
 });
 
 test("terminal fence survives request cleanup without blocking a later manual task", () => {
