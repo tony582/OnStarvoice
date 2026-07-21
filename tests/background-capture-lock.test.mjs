@@ -73,6 +73,8 @@ function createHarness() {
   const badgeTextHistory = [];
   const createdTabs = [];
   const updatedTabs = [];
+  const cloudCommandCompletions = [];
+  const cloudHeartbeats = [];
   const alarmDefinitions = new Map();
   const missingTabIds = new Set();
   let uuidCounter = 0;
@@ -81,6 +83,7 @@ function createHarness() {
   let tabCreateHandler = null;
   let tabGetHandler = null;
   let tabQueryHandler = null;
+  let storageGetHandler = null;
   let reloadHook = null;
   let nextRuntimeSetError = null;
   const unrefSetTimeout = (handler, delay, ...args) => {
@@ -91,25 +94,28 @@ function createHarness() {
 
   const localStorage = {
     async get(keys) {
+      let result;
       if (typeof keys === "string") {
-        return Object.hasOwn(storage, keys) ? {[keys]: storage[keys]} : {};
-      }
-      if (Array.isArray(keys)) {
-        return Object.fromEntries(
+        result = Object.hasOwn(storage, keys) ? {[keys]: storage[keys]} : {};
+      } else if (Array.isArray(keys)) {
+        result = Object.fromEntries(
           keys
             .filter((key) => Object.hasOwn(storage, key))
             .map((key) => [key, storage[key]]),
         );
-      }
-      if (keys && typeof keys === "object") {
-        return Object.fromEntries(
+      } else if (keys && typeof keys === "object") {
+        result = Object.fromEntries(
           Object.entries(keys).map(([key, fallback]) => [
             key,
             Object.hasOwn(storage, key) ? storage[key] : fallback,
           ]),
         );
+      } else {
+        result = {...storage};
       }
-      return {...storage};
+      return typeof storageGetHandler === "function"
+        ? await storageGetHandler(keys, result)
+        : result;
     },
     async set(values) {
       if (
@@ -291,6 +297,27 @@ function createHarness() {
     setInterval,
     setTimeout: unrefSetTimeout,
     importScripts() {},
+    OnStarvoiceCloudTaskAgent: {
+      buildHeartbeatPayload(options = {}) {
+        return {
+          agent: {clientUuid: options.runtime?.clientUuid || ""},
+          tasks: Array.isArray(options.ledger?.runs)
+            ? options.ledger.runs.map((run) => ({...run}))
+            : [],
+          unattendedPlan: options.unattendedPlan || null,
+          reason: options.reason || "",
+          lastError: options.lastError || "",
+        };
+      },
+      async sendHeartbeat(options = {}) {
+        cloudHeartbeats.push(JSON.parse(JSON.stringify(options.body || {})));
+        return {ok: true, commands: []};
+      },
+      async completeCommand(options = {}) {
+        cloudCommandCompletions.push({...options});
+        return {ok: true, commandId: options.commandId};
+      },
+    },
   });
 
   vm.runInContext(taskCenterCoreSource, context, {filename: "utils/task-center.js"});
@@ -300,6 +327,7 @@ function createHarness() {
   vm.runInContext(
     `${backgroundSource}\n;globalThis.__captureLockTestApi = {\n` +
       `  acquireCaptureExecutionLock,\n` +
+      `  bindCaptureExecutionLockToTask,\n` +
       `  readActiveCaptureExecutionLock,\n` +
       `  releaseCaptureExecutionLock,\n` +
       `  renewCaptureExecutionLock,\n` +
@@ -310,6 +338,7 @@ function createHarness() {
       `  isCaptureRequestAborted,\n` +
       `  relayToContentWithRetry,\n` +
       `  handleUnattendedKeywordAlarm,\n` +
+      `  reconcileUnattendedKeywordPlanSchedule,\n` +
       `  createUnattendedKeywordRunRequest,\n` +
       `  openUnattendedRunnerTab,\n` +
       `  bindUnattendedRunnerTab,\n` +
@@ -319,6 +348,8 @@ function createHarness() {
       `  assessUnattendedRunHealth,\n` +
       `  recoverUnattendedKeywordRunRequest,\n` +
       `  manuallyRecoverUnattendedKeywordRun,\n` +
+      `  executeCloudTaskAgentCommand,\n` +
+      `  syncCloudTaskAgent,\n` +
       `  superviseUnattendedKeywordRun,\n` +
       `  syncUnattendedSupervisorAlarm,\n` +
       `  upsertTaskLedgerRun,\n` +
@@ -350,6 +381,8 @@ function createHarness() {
     chrome,
     alarmDefinitions,
     createdTabs,
+    cloudCommandCompletions,
+    cloudHeartbeats,
     updatedTabs,
     reloadedTabIds,
     removedTabIds,
@@ -395,6 +428,9 @@ function createHarness() {
     },
     setTabQueryHandler(handler) {
       tabQueryHandler = handler;
+    },
+    setStorageGetHandler(handler) {
+      storageGetHandler = handler;
     },
     setTabMissing(tabId, missing = true) {
       if (missing) missingTabIds.add(Number(tabId));
@@ -472,6 +508,16 @@ function seedUnattendedRequest(harness, overrides = {}) {
     planSnapshot: plan,
   };
   return harness.storage[UNATTENDED_REQUEST_KEY];
+}
+
+function buildUnattendedRunnerSender(request, holderDocumentId) {
+  return {
+    documentId: String(holderDocumentId || ""),
+    tab: {
+      id: Number(request?.runnerTabId),
+      url: `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}`,
+    },
+  };
 }
 
 test("capture progress is persisted with heartbeat and runner metadata", () => {
@@ -1275,6 +1321,544 @@ test("a reused unattended runner tab stays non-discardable", async () => {
   assert.equal(runner.autoDiscardable, false);
 });
 
+test("a cloud create command starts exactly one local task without replacing the saved plan", async () => {
+  const harness = createHarness();
+  harness.storage["onstarvoice.unattendedKeywordPlan"] = {
+    enabled: true,
+    platform: "xiaohongshu",
+    mode: "daily",
+    startTime: "09:00",
+    keywords: ["本地计划关键词"],
+    updatedAt: "2026-07-21T01:00:00.000Z",
+  };
+  const command = {
+    id: "cloud-command-create-1",
+    command_type: "create",
+    client_task_id: "cloud-task-local-1",
+    platform: "douyin",
+    payload: {
+      clientTaskId: "cloud-task-local-1",
+      planSnapshot: {
+        enabled: true,
+        platform: "douyin",
+        keywords: ["远程关键词", "远程关键词"],
+        keywordMaxDetectedItems: 275,
+        searchFilters: {sort: "latest", publishTime: "day"},
+        autoLoop: false,
+        maxRounds: 1,
+      },
+    },
+  };
+
+  const first = await harness.api.executeCloudTaskAgentCommand(
+    command,
+    "agent-token",
+  );
+  const request = harness.storage["onstarvoice.unattendedKeywordRunRequest"];
+  const savedPlan = harness.storage["onstarvoice.unattendedKeywordPlan"];
+
+  assert.equal(first.ok, true);
+  assert.equal(request.id, "cloud-task-local-1");
+  assert.equal(request.cloudAssigned, true);
+  assert.equal(request.executionMode, "one_time");
+  assert.equal(request.cloudCommandId, "cloud-command-create-1");
+  assert.deepEqual(Array.from(request.planSnapshot.keywords), ["远程关键词"]);
+  assert.equal(request.planSnapshot.keywordMaxDetectedItems, 275);
+  assert.deepEqual(Array.from(savedPlan.keywords), ["本地计划关键词"]);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(harness.createdTabs.length, 2);
+
+  await harness.api.executeCloudTaskAgentCommand(command, "agent-token");
+  assert.equal(harness.createdTabs.length, 2);
+  assert.equal(harness.cloudCommandCompletions.length, 2);
+  assert.equal(
+    harness.storage["onstarvoice.unattendedKeywordRunRequest"].id,
+    "cloud-task-local-1",
+  );
+});
+
+test("cloud tasks without a valid post limit do not create a device override", async () => {
+  for (const [suffix, planPatch] of [
+    ["legacy", {}],
+    ["zero", {keywordMaxDetectedItems: 0}],
+  ]) {
+    const harness = createHarness();
+    await harness.api.executeCloudTaskAgentCommand(
+      {
+        id: `cloud-command-limit-${suffix}`,
+        command_type: "create",
+        client_task_id: `cloud-task-limit-${suffix}`,
+        platform: "douyin",
+        payload: {
+          clientTaskId: `cloud-task-limit-${suffix}`,
+          planSnapshot: {
+            enabled: true,
+            platform: "douyin",
+            keywords: ["远程关键词"],
+            ...planPatch,
+          },
+        },
+      },
+      "agent-token",
+    );
+
+    const request = harness.storage[UNATTENDED_REQUEST_KEY];
+    assert.equal(
+      Object.hasOwn(request.planSnapshot, "keywordMaxDetectedItems"),
+      false,
+      `${suffix} task must continue with the device-local capture limit`,
+    );
+  }
+});
+
+test("a cloud unattended-plan command saves the schedule without opening a runner", async () => {
+  const harness = createHarness();
+  const command = {
+    id: "cloud-command-plan-1",
+    command_type: "create",
+    client_task_id: "cloud-plan-config-1",
+    platform: "douyin",
+    payload: {
+      executionMode: "unattended_plan",
+      clientTaskId: "cloud-plan-config-1",
+      planSnapshot: {
+        enabled: true,
+        platform: "douyin",
+        mode: "custom_dates",
+        startTime: "08:30",
+        randomOffsetMin: 12,
+        customDates: "2099/7/2\n2099-07-02\n2099/2/29",
+        keywords: ["远程无人值守计划"],
+        keywordMaxDetectedItems: 310,
+        searchFilters: {sort: "latest", publishTime: "week"},
+        maxRounds: 2,
+        roundGapMin: 15,
+      },
+    },
+  };
+
+  const result = await harness.api.executeCloudTaskAgentCommand(
+    command,
+    "agent-token",
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY], undefined);
+  assert.equal(harness.storage[UNATTENDED_PLAN_KEY].enabled, true);
+  assert.equal(harness.storage[UNATTENDED_PLAN_KEY].platform, "douyin");
+  assert.deepEqual(
+    Array.from(harness.storage[UNATTENDED_PLAN_KEY].keywords),
+    ["远程无人值守计划"],
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_PLAN_KEY].keywordMaxDetectedItems,
+    310,
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_PLAN_KEY].customDates,
+    "2099-07-02",
+  );
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.executionMode,
+    "unattended_plan",
+  );
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.requestId,
+    "cloud-plan-config-1",
+  );
+});
+
+test("a cloud stop command cancels only its exact active request", async () => {
+  const harness = createHarness();
+  const futureAlarm = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    nextRunAt: futureAlarm,
+    lastRunStatus: "completed",
+    lastRunMessage: "保留本地计划结果",
+  });
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    id: "cloud-stop-target",
+    attemptId: "cloud-stop-attempt",
+    attemptNumber: 1,
+    status: "running",
+    cloudAssigned: true,
+    executionMode: "one_time",
+    runnerTabId: 77,
+    progress: {runnerTabId: 77},
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+    planSnapshot: buildUnattendedPlan({keywords: ["云端停止目标"]}),
+  };
+  harness.storage[LOCK_KEY] = {
+    id: "cloud-stop-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "cloud-stop-holder",
+    holderTabId: 77,
+    createdAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+  };
+
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-stop-1",
+      command_type: "stop",
+      client_task_id: "cloud-stop-target",
+      payload: {controlTaskId: "cloud-stop-target"},
+    },
+    "agent-token",
+  );
+
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "canceled");
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.equal(harness.storage[UNATTENDED_PLAN_KEY].lastRunMessage, "保留本地计划结果");
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(harness.cloudCommandCompletions[0].result.requestId, "cloud-stop-target");
+  assert.ok(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) => tabId === 77 && payload.action === "cancelCapture",
+    ),
+  );
+
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    id: "newer-task",
+    attemptId: "newer-attempt",
+    status: "running",
+  };
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-stop-stale",
+      command_type: "stop",
+      client_task_id: "old-task",
+      payload: {controlTaskId: "old-task"},
+    },
+    "agent-token",
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, "newer-task");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+  assert.equal(harness.cloudCommandCompletions[1].success, false);
+});
+
+test("a cloud create command waits without overwriting an active unattended task", async () => {
+  const harness = createHarness();
+  harness.storage["onstarvoice.unattendedKeywordRunRequest"] = {
+    id: "active-local-task",
+    attemptId: "active-attempt",
+    status: "running",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    planSnapshot: {
+      enabled: true,
+      platform: "xiaohongshu",
+      keywords: ["正在执行"],
+    },
+  };
+
+  const result = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-create-busy",
+      command_type: "create",
+      client_task_id: "cloud-task-waiting",
+      payload: {
+        clientTaskId: "cloud-task-waiting",
+        planSnapshot: {
+          platform: "xiaohongshu",
+          keywords: ["等待执行"],
+        },
+      },
+    },
+    "agent-token",
+  );
+
+  assert.equal(result.deferred, true);
+  assert.equal(result.reason, "unattended_task_busy");
+  assert.equal(
+    harness.storage["onstarvoice.unattendedKeywordRunRequest"].id,
+    "active-local-task",
+  );
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+});
+
+test("a cloud create command preserves the current recoverable request", async () => {
+  for (const status of ["needs_action", "failed", "completed_with_failures"]) {
+    const harness = createHarness();
+    harness.storage[UNATTENDED_REQUEST_KEY] = {
+      id: `recoverable-${status}`,
+      attemptId: `attempt-${status}`,
+      status,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      planSnapshot: buildUnattendedPlan(),
+    };
+
+    const result = await harness.api.executeCloudTaskAgentCommand(
+      {
+        id: `cloud-command-after-${status}`,
+        command_type: "create",
+        client_task_id: `cloud-task-after-${status}`,
+        payload: {
+          clientTaskId: `cloud-task-after-${status}`,
+          planSnapshot: {
+            platform: "xiaohongshu",
+            keywords: ["等待旧任务处理"],
+          },
+        },
+      },
+      "agent-token",
+    );
+
+    assert.equal(result.deferred, true);
+    assert.equal(result.reason, "unattended_task_recoverable");
+    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, `recoverable-${status}`);
+    assert.equal(harness.createdTabs.length, 0);
+    assert.equal(harness.cloudCommandCompletions.length, 0);
+  }
+});
+
+test("a cloud one-off never consumes or rewrites the recurring local plan schedule", async () => {
+  const harness = createHarness();
+  const futureAlarm = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    nextRunAt: futureAlarm,
+    lastRunAt: "2026-07-20T01:00:00.000Z",
+    lastRunStatus: "completed",
+    lastRunMessage: "本地计划已完成",
+    updatedAt: "2026-07-20T01:00:00.000Z",
+  });
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    id: "cloud-running-plan-isolation",
+    attemptId: "cloud-attempt-plan-isolation",
+    status: "running",
+    cloudAssigned: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+    planSnapshot: buildUnattendedPlan({keywords: ["云端关键词"]}),
+  };
+
+  await harness.api.reconcileUnattendedKeywordPlanSchedule({launchDue: true});
+
+  const plan = harness.storage[UNATTENDED_PLAN_KEY];
+  assert.equal(plan.nextRunAt, futureAlarm);
+  assert.equal(plan.lastRunStatus, "completed");
+  assert.equal(plan.lastRunMessage, "本地计划已完成");
+  assert.equal(
+    harness.alarmDefinitions.get("onstarvoice:unattended-keyword-plan").when,
+    Date.parse(futureAlarm),
+  );
+});
+
+test("cloudAssigned survives claim, progress, and terminal mutations", async () => {
+  const harness = createHarness();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    keywords: ["本地计划关键词"],
+    lastRunStatus: "completed",
+    lastRunMessage: "本地计划结果",
+    updatedAt: "2026-07-20T01:00:00.000Z",
+  });
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-lifecycle",
+      command_type: "create",
+      client_task_id: "cloud-task-lifecycle",
+      payload: {
+        clientTaskId: "cloud-task-lifecycle",
+        planSnapshot: {
+          platform: "xiaohongshu",
+          keywords: ["云端生命周期"],
+        },
+      },
+    },
+    "agent-token",
+  );
+  let request = harness.storage[UNATTENDED_REQUEST_KEY];
+  const claim = await harness.api.claimUnattendedKeywordRun({
+    requestId: request.id,
+    senderTabId: request.runnerTabId,
+    senderDocumentId: "cloud-runner-document",
+    holderId: "cloud-runner-holder",
+  });
+  assert.equal(claim.accepted, true);
+  assert.equal(claim.data.cloudAssigned, true);
+
+  const running = await harness.api.updateUnattendedKeywordRun({
+    requestId: claim.data.id,
+    attemptId: claim.data.attemptId,
+    patch: {
+      status: "running",
+      progress: {current: 1, total: 1, keyword: "云端生命周期"},
+    },
+  });
+  assert.equal(running.accepted, true);
+  assert.equal(running.data.cloudAssigned, true);
+
+  const completed = await harness.api.updateUnattendedKeywordRun({
+    requestId: running.data.id,
+    attemptId: running.data.attemptId,
+    patch: {
+      status: "completed",
+      finishedAt: new Date().toISOString(),
+      progress: {current: 1, total: 1, keyword: "云端生命周期"},
+    },
+  });
+  assert.equal(completed.accepted, true);
+  assert.equal(completed.data.cloudAssigned, true);
+  assert.deepEqual(
+    Array.from(harness.storage[UNATTENDED_PLAN_KEY].keywords),
+    ["本地计划关键词"],
+  );
+  assert.equal(harness.storage[UNATTENDED_PLAN_KEY].lastRunMessage, "本地计划结果");
+});
+
+test("a missing local schedule is durably retried while a cloud one-off owns the slot", async () => {
+  const harness = createHarness();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    nextRunAt: "",
+    lastRunAt: "2026-07-20T01:00:00.000Z",
+    lastRunStatus: "completed",
+    lastRunMessage: "本地计划已完成",
+    updatedAt: "2026-07-20T01:00:00.000Z",
+  });
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    id: "cloud-running-missing-alarm",
+    attemptId: "cloud-attempt-missing-alarm",
+    status: "running",
+    cloudAssigned: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+    planSnapshot: buildUnattendedPlan({keywords: ["云端关键词"]}),
+  };
+  const before = Date.now();
+
+  await harness.api.reconcileUnattendedKeywordPlanSchedule({launchDue: true});
+
+  const plan = harness.storage[UNATTENDED_PLAN_KEY];
+  const scheduledAt = Date.parse(plan.nextRunAt);
+  assert.ok(scheduledAt >= before + 4.9 * 60 * 1000);
+  assert.ok(scheduledAt <= Date.now() + 5.1 * 60 * 1000);
+  assert.equal(plan.lastRunStatus, "completed");
+  assert.equal(plan.lastRunMessage, "本地计划已完成");
+  assert.equal(
+    harness.alarmDefinitions.get("onstarvoice:unattended-keyword-plan").when,
+    scheduledAt,
+  );
+});
+
+test("canceling a cloud one-off leaves the recurring local plan result untouched", async () => {
+  const harness = createHarness();
+  const futureAlarm = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    keywords: ["本地计划关键词"],
+    nextRunAt: futureAlarm,
+    lastRunAt: "2026-07-20T01:00:00.000Z",
+    lastRunStatus: "completed",
+    lastRunMessage: "本地结果保留",
+    updatedAt: "2026-07-20T01:00:00.000Z",
+  });
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    id: "cloud-cancel-plan-isolation",
+    attemptId: "cloud-cancel-attempt",
+    attemptNumber: 1,
+    progressSeq: 1,
+    status: "running",
+    cloudAssigned: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+    businessProgressAt: new Date().toISOString(),
+    planSnapshot: buildUnattendedPlan({keywords: ["云端关键词"]}),
+  };
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:cancel-unattended-keyword-run",
+    requestId: "cloud-cancel-plan-isolation",
+    message: "停止云端一次性任务",
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.request.status, "canceled");
+  assert.deepEqual(Array.from(response.data.plan.keywords), ["本地计划关键词"]);
+  assert.equal(response.data.plan.nextRunAt, futureAlarm);
+  assert.equal(response.data.plan.lastRunStatus, "completed");
+  assert.equal(response.data.plan.lastRunMessage, "本地结果保留");
+});
+
+test("switching capture-agent identity does not mirror the previous tenant's local plan or history", async () => {
+  const harness = createHarness();
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-a", token: "token-a"},
+  };
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    keywords: ["客户 A 计划"],
+    updatedAt: "2026-07-20T01:00:00.000Z",
+  });
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{
+      id: "customer-a-task",
+      status: "completed",
+      createdAt: "2026-07-20T01:00:00.000Z",
+      updatedAt: "2026-07-20T01:05:00.000Z",
+    }],
+  };
+
+  await harness.api.syncCloudTaskAgent({reason: "agent-a", force: true});
+  assert.equal(harness.cloudHeartbeats.at(-1).tasks.length, 1);
+  assert.equal(harness.cloudHeartbeats.at(-1).unattendedPlan.keywords[0], "客户 A 计划");
+
+  harness.storage["onstarvoice.cloudCommandResults"] = {
+    "old-command": {state: "completed"},
+  };
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-b", token: "token-b"},
+  };
+  await harness.api.syncCloudTaskAgent({reason: "agent-b", force: true});
+
+  assert.equal(harness.cloudHeartbeats.at(-1).tasks.length, 0);
+  assert.equal(harness.cloudHeartbeats.at(-1).unattendedPlan, null);
+  assert.equal(harness.storage["onstarvoice.cloudCommandResults"], undefined);
+
+  const scopeStartedAt = harness.storage["onstarvoice.cloudTaskAgentStatus"].scopeStartedAt;
+  const afterScope = new Date(Date.parse(scopeStartedAt) + 1000).toISOString();
+  await harness.api.saveUnattendedKeywordPlan(
+    buildUnattendedPlan({keywords: ["客户 A 自动改期后的旧计划"]}),
+    {recomputeNext: false},
+  );
+  await harness.api.syncCloudTaskAgent({reason: "agent-b-automatic-plan-update", force: true});
+  assert.equal(harness.cloudHeartbeats.at(-1).unattendedPlan, null);
+
+  await harness.api.saveUnattendedKeywordPlan(
+    buildUnattendedPlan({
+      keywords: ["客户 B 计划"],
+      updatedAt: afterScope,
+    }),
+    {recomputeNext: false, confirmCloudScope: true},
+  );
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{
+      id: "customer-b-task",
+      status: "running",
+      createdAt: afterScope,
+      updatedAt: afterScope,
+      metadata: {cloudAgentScopeId: "agent-b"},
+    }],
+  };
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-b", token: "token-b-rotated"},
+  };
+  await harness.api.syncCloudTaskAgent({reason: "agent-b-token-rotation", force: true});
+
+  assert.equal(harness.cloudHeartbeats.at(-1).tasks[0].id, "customer-b-task");
+  assert.equal(harness.cloudHeartbeats.at(-1).unattendedPlan.keywords[0], "客户 B 计划");
+});
+
 test("canceling unattended work never releases a manual batch lock", async () => {
   const harness = createHarness();
   const manualLock = await harness.api.acquireCaptureExecutionLock({
@@ -1366,6 +1950,8 @@ test("unattended terminal state absorbs concurrent and late heartbeats", async (
   const claim = await harness.api.claimUnattendedKeywordRun({
     requestId: request.id,
     senderTabId: 42,
+    senderDocumentId: "terminal-race-document",
+    holderId: "terminal-race-holder",
   });
   assert.equal(claim.accepted, true);
 
@@ -1714,6 +2300,8 @@ test("only the runner tab assigned by background can claim a pending request", a
   const assigned = await harness.api.claimUnattendedKeywordRun({
     requestId: request.id,
     senderTabId: 55,
+    senderDocumentId: "assigned-runner-document",
+    holderId: "assigned-runner-holder",
   });
 
   assert.equal(foreign.accepted, false);
@@ -3037,13 +3625,16 @@ test("a late Debug detach only cleans a terminal unattended wrapper and never cr
     holderTabId: 41,
   });
   assert.equal(lock.ok, true);
-  const begun = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: request.attemptId,
-    sourceTabId: 41,
-    platform: "xiaohongshu",
-  });
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, lock.lock.holderDocumentId),
+  );
   assert.equal(begun.ok, true, JSON.stringify(begun));
   harness.storage[UNATTENDED_REQUEST_KEY] = {
     ...harness.storage[UNATTENDED_REQUEST_KEY],
@@ -3080,13 +3671,16 @@ test("a late owner disconnect only cleans a terminal unattended wrapper and pres
     holderTabId: 41,
   });
   assert.equal(lock.ok, true);
-  const begun = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: request.attemptId,
-    sourceTabId: 41,
-    platform: "xiaohongshu",
-  });
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, lock.lock.holderDocumentId),
+  );
   assert.equal(begun.ok, true, JSON.stringify(begun));
   harness.storage[UNATTENDED_REQUEST_KEY] = {
     ...harness.storage[UNATTENDED_REQUEST_KEY],
@@ -3124,13 +3718,16 @@ test("closing an active unattended source tab recovers the root request without 
     holderTabId: 41,
   });
   assert.equal(lock.ok, true);
-  const begun = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: request.attemptId,
-    sourceTabId: 41,
-    platform: "xiaohongshu",
-  });
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, lock.lock.holderDocumentId),
+  );
   assert.equal(begun.ok, true, JSON.stringify(begun));
 
   await harness.api.handleCaptureRuntimeTabRemoved(41);
@@ -3225,13 +3822,16 @@ test("a replacement Douyin runner releases stable Debug resources even after the
   });
   assert.equal(lock.ok, true);
 
-  const firstBegin = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: request.attemptId,
-    sourceTabId: 41,
-    platform: "douyin",
-  });
+  const firstBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "douyin",
+    },
+    buildUnattendedRunnerSender(request, lock.lock.holderDocumentId),
+  );
   assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
 
   // This is the real recovery race from the Windows diagnostic: the persisted
@@ -3288,13 +3888,16 @@ test("a replacement Douyin runner clears a residual group instead of reporting c
     holderTabId: 41,
   });
   assert.equal(lock.ok, true);
-  const firstBegin = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: request.attemptId,
-    sourceTabId: 41,
-    platform: "douyin",
-  });
+  const firstBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "douyin",
+    },
+    buildUnattendedRunnerSender(request, lock.lock.holderDocumentId),
+  );
   assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
 
   await harness.api.stopCaptureDebugTask(stableTaskId, "simulate_cleanup_race");
@@ -3345,13 +3948,19 @@ test("a late END from the recovered unattended attempt cannot stop the replaceme
     holderTabId: 41,
   });
   assert.equal(firstLock.ok, true);
-  const firstBegin = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: request.attemptId,
-    sourceTabId: 41,
-    platform: "xiaohongshu",
-  });
+  const firstBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(
+      request,
+      firstLock.lock.holderDocumentId,
+    ),
+  );
   assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
 
   const recovery = await harness.api.recoverUnattendedKeywordRunRequest(
@@ -3369,13 +3978,19 @@ test("a late END from the recovered unattended attempt cannot stop the replaceme
     holderTabId: 44,
   });
   assert.equal(replacementLock.ok, true);
-  const replacementBegin = await harness.sendBackgroundMessage({
-    type: "onstarvoice:begin-capture-task",
-    taskId: stableTaskId,
-    attemptId: replacementRequest.attemptId,
-    sourceTabId: 44,
-    platform: "xiaohongshu",
-  });
+  const replacementBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: replacementRequest.attemptId,
+      sourceTabId: 44,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(
+      replacementRequest,
+      replacementLock.lock.holderDocumentId,
+    ),
+  );
   assert.equal(replacementBegin.ok, true, JSON.stringify(replacementBegin));
 
   // The replacement runner may report its terminal checkpoint just before its
@@ -3435,6 +4050,570 @@ test("a stale unattended BEGIN is fenced even between recovery locks", async () 
   assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
   assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
   assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("a current stable unattended BEGIN is rejected when its execution lock is missing", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-current-no-lock",
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+
+  const begin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+
+  assert.equal(begin.ok, false, JSON.stringify(begin));
+  assert.ok(String(begin.error?.code || ""));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("claim without holder evidence is rejected before changing request state", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    status: "pending",
+    attemptId: "attempt-missing-holder",
+    startedAt: "",
+    claimedAt: "",
+  });
+
+  const claim = await harness.api.claimUnattendedKeywordRun({
+    requestId: request.id,
+    senderTabId: request.runnerTabId,
+  });
+
+  assert.equal(claim.accepted, false, JSON.stringify(claim));
+  assert.equal(claim.reason, "missing_lock_holder");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "pending");
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("claim reserves the unattended lock before the stable capture task begins", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    status: "pending",
+    attemptId: "attempt-claim-lock",
+    startedAt: "",
+    claimedAt: "",
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+
+  const claim = await harness.api.claimUnattendedKeywordRun({
+    requestId: request.id,
+    senderTabId: request.runnerTabId,
+    senderDocumentId: "claim-runner-document",
+    holderId: "claim-runner-holder",
+  });
+
+  assert.equal(claim.accepted, true, JSON.stringify(claim));
+  assert.equal(claim.lock?.owner, "unattended_keyword_plan");
+  assert.equal(harness.storage[LOCK_KEY]?.id, claim.lock?.id);
+
+  const begin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    {
+      documentId: "claim-runner-document",
+      tab: {
+        id: request.runnerTabId,
+        url: `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}`,
+      },
+    },
+  );
+
+  assert.equal(begin.ok, true, JSON.stringify(begin));
+  assert.equal(harness.storage[LOCK_KEY]?.captureTaskId, stableTaskId);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
+  );
+});
+
+test("unattended bind CAS rejects a lock transferred after BEGIN preflight", async () => {
+  const harness = createHarness();
+  const stableTaskId = "unattended-capture:request-race";
+  const attemptId = "attempt-old";
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-old",
+    holderDocumentId: "document-old",
+    holderTabId: 42,
+  });
+  assert.equal(acquired.ok, true);
+  const initiallyBound = await harness.api.bindCaptureExecutionLockToTask(
+    stableTaskId,
+    41,
+    {
+      allowUnattendedRebind: true,
+      attemptId,
+      expectedLockId: acquired.lock.id,
+      expectedHolderId: acquired.lock.holderId,
+      expectedHolderDocumentId: acquired.lock.holderDocumentId,
+    },
+  );
+  assert.equal(initiallyBound.captureTaskId, stableTaskId);
+  assert.equal(initiallyBound.captureTaskAttemptId, attemptId);
+  const oldLock = {...initiallyBound};
+  harness.storage[LOCK_KEY] = {
+    ...oldLock,
+    holderId: "holder-new",
+    holderDocumentId: "document-new",
+    holderTabId: 52,
+  };
+
+  const result = await harness.api.bindCaptureExecutionLockToTask(
+    stableTaskId,
+    41,
+    {
+      allowUnattendedRebind: true,
+      attemptId,
+      expectedLockId: oldLock.id,
+      expectedHolderId: oldLock.holderId,
+      expectedHolderDocumentId: oldLock.holderDocumentId,
+    },
+  );
+
+  assert.equal(result, null);
+  assert.equal(harness.storage[LOCK_KEY].holderId, "holder-new");
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, stableTaskId);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskAttemptId, attemptId);
+});
+
+test("an old unattended BEGIN cannot replace or clean resources after holder transfer", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-holder-transfer",
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-old",
+    holderDocumentId: "document-old",
+    holderTabId: 41,
+  });
+  assert.equal(acquired.ok, true);
+  const initiallyBound = await harness.api.bindCaptureExecutionLockToTask(
+    stableTaskId,
+    41,
+    {
+      allowUnattendedRebind: true,
+      attemptId: request.attemptId,
+      expectedLockId: acquired.lock.id,
+      expectedHolderId: acquired.lock.holderId,
+      expectedHolderDocumentId: acquired.lock.holderDocumentId,
+    },
+  );
+  assert.equal(initiallyBound.captureTaskId, stableTaskId);
+  assert.equal(initiallyBound.captureTaskAttemptId, request.attemptId);
+
+  harness.storage[LOCK_KEY] = {
+    ...harness.storage[LOCK_KEY],
+    holderId: "holder-new",
+    holderDocumentId: "document-new",
+    holderTabId: 52,
+  };
+
+  const replacementBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 52,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, "document-new"),
+  );
+  assert.equal(replacementBegin.ok, true, JSON.stringify(replacementBegin));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 52);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId, 52);
+
+  const staleBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, "document-old"),
+  );
+
+  assert.equal(staleBegin.ok, false, JSON.stringify(staleBegin));
+  assert.equal(staleBegin.error.code, "unattended_runner_mismatch");
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 52);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId, 52);
+  assert.equal(harness.storage[LOCK_KEY].holderId, "holder-new");
+  assert.equal(harness.storage[LOCK_KEY].holderDocumentId, "document-new");
+  assert.equal(harness.storage[LOCK_KEY].holderTabId, 52);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, stableTaskId);
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    request.attemptId,
+  );
+});
+
+test("serialized stable BEGIN rechecks holder before cleanup and lets the new holder win", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-holder-cleanup-race",
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const oldHolderDocumentId = "holder-cleanup-old-document";
+  const newHolderDocumentId = "holder-cleanup-new-document";
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-cleanup-old",
+    holderDocumentId: oldHolderDocumentId,
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+
+  const initialBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, oldHolderDocumentId),
+  );
+  assert.equal(initialBegin.ok, true, JSON.stringify(initialBegin));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 41);
+
+  let releaseOldHolderRead;
+  let markOldHolderRead;
+  const oldHolderReadPaused = new Promise((resolve) => {
+    markOldHolderRead = resolve;
+  });
+  const oldHolderReadGate = new Promise((resolve) => {
+    releaseOldHolderRead = resolve;
+  });
+  let lockReadCount = 0;
+  harness.setStorageGetHandler(async (keys, result) => {
+    if (keys === LOCK_KEY) {
+      lockReadCount += 1;
+      // First read is beginCaptureTask's preflight; the second is reclaim's
+      // holder snapshot, immediately before its later cleanup decision.
+      if (lockReadCount === 2) {
+        markOldHolderRead();
+        await oldHolderReadGate;
+      }
+    }
+    return result;
+  });
+
+  let releaseNewBegin;
+  let markNewBegin;
+  const newBeginPaused = new Promise((resolve) => {
+    markNewBegin = resolve;
+  });
+  const newBeginGate = new Promise((resolve) => {
+    releaseNewBegin = resolve;
+  });
+  let newBeginWasPaused = false;
+  harness.setTabGetHandler(async (tabId) => {
+    if (Number(tabId) === 52 && !newBeginWasPaused) {
+      newBeginWasPaused = true;
+      markNewBegin();
+      await newBeginGate;
+    }
+    return {
+      id: Number(tabId),
+      windowId: 1,
+      groupId: -1,
+      status: "complete",
+      url: "https://www.xiaohongshu.com/search_result?keyword=holder-race",
+      title: "holder race source",
+    };
+  });
+
+  const oldBeginPromise = harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 43,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, oldHolderDocumentId),
+  );
+  await oldHolderReadPaused;
+
+  harness.storage[LOCK_KEY] = {
+    ...harness.storage[LOCK_KEY],
+    holderId: "holder-cleanup-new",
+    holderDocumentId: newHolderDocumentId,
+    updatedAt: new Date().toISOString(),
+  };
+  const newBeginPromise = harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 52,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, newHolderDocumentId),
+  );
+
+  await Promise.resolve();
+  assert.equal(
+    harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId,
+    41,
+    "the queued new BEGIN must not create resources while the old BEGIN is paused",
+  );
+
+  releaseOldHolderRead();
+  await newBeginPaused;
+  const oldBegin = await oldBeginPromise;
+  assert.equal(oldBegin.ok, false, JSON.stringify(oldBegin));
+  assert.equal(oldBegin.error.code, "unattended_runner_mismatch");
+  assert.equal(
+    harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId,
+    41,
+    "the rejected old BEGIN must not clean the current stable task resources",
+  );
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    41,
+  );
+
+  releaseNewBegin();
+  const newBegin = await newBeginPromise;
+  assert.equal(newBegin.ok, true, JSON.stringify(newBegin));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 52);
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    52,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderId, "holder-cleanup-new");
+  assert.equal(
+    harness.storage[LOCK_KEY]?.holderDocumentId,
+    newHolderDocumentId,
+  );
+});
+
+test("a post-bind holder transfer rolls back the old BEGIN before the queued holder starts", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-post-bind-holder-transfer",
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const oldHolderDocumentId = "post-bind-old-document";
+  const newHolderDocumentId = "post-bind-new-document";
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "post-bind-old-holder",
+    holderDocumentId: oldHolderDocumentId,
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+
+  let releaseOldPreflight;
+  let markOldPreflight;
+  const oldPreflightPaused = new Promise((resolve) => {
+    markOldPreflight = resolve;
+  });
+  const oldPreflightGate = new Promise((resolve) => {
+    releaseOldPreflight = resolve;
+  });
+  let releaseNewPreflight;
+  let markNewPreflight;
+  const newPreflightPaused = new Promise((resolve) => {
+    markNewPreflight = resolve;
+  });
+  const newPreflightGate = new Promise((resolve) => {
+    releaseNewPreflight = resolve;
+  });
+  let debuggerPreflightCount = 0;
+  harness.chrome.debugger.getTargets = async () => {
+    debuggerPreflightCount += 1;
+    if (debuggerPreflightCount === 1) {
+      markOldPreflight();
+      await oldPreflightGate;
+    } else if (debuggerPreflightCount === 2) {
+      markNewPreflight();
+      await newPreflightGate;
+    }
+    return [];
+  };
+
+  let oldBeginSettled = false;
+  const oldBeginPromise = harness
+    .sendBackgroundMessage(
+      {
+        type: "onstarvoice:begin-capture-task",
+        taskId: stableTaskId,
+        attemptId: request.attemptId,
+        sourceTabId: 41,
+        platform: "xiaohongshu",
+      },
+      buildUnattendedRunnerSender(request, oldHolderDocumentId),
+    )
+    .then((response) => {
+      oldBeginSettled = true;
+      return response;
+    });
+  await oldPreflightPaused;
+
+  assert.equal(harness.storage[LOCK_KEY]?.captureTaskId, stableTaskId);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderId, "post-bind-old-holder");
+  assert.equal(
+    harness.storage[LOCK_KEY]?.holderDocumentId,
+    oldHolderDocumentId,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderTabId, 41);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+
+  harness.storage[LOCK_KEY] = {
+    ...harness.storage[LOCK_KEY],
+    holderId: "post-bind-new-holder",
+    holderDocumentId: newHolderDocumentId,
+    holderTabId: 52,
+    updatedAt: new Date().toISOString(),
+  };
+
+  let newBeginSettled = false;
+  const newBeginPromise = harness
+    .sendBackgroundMessage(
+      {
+        type: "onstarvoice:begin-capture-task",
+        taskId: stableTaskId,
+        attemptId: request.attemptId,
+        sourceTabId: 52,
+        platform: "xiaohongshu",
+      },
+      buildUnattendedRunnerSender(request, newHolderDocumentId),
+    )
+    .then((response) => {
+      newBeginSettled = true;
+      return response;
+    });
+
+  await Promise.resolve();
+  assert.equal(oldBeginSettled, false);
+  assert.equal(newBeginSettled, false);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+
+  releaseOldPreflight();
+  await newPreflightPaused;
+  const oldBegin = await oldBeginPromise;
+  assert.equal(oldBegin.ok, false, JSON.stringify(oldBegin));
+  assert.equal(oldBegin.error.code, "unattended_begin_fence_changed");
+  assert.equal(newBeginSettled, false);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.storage[LOCK_KEY]?.holderId, "post-bind-new-holder");
+  assert.equal(
+    harness.storage[LOCK_KEY]?.holderDocumentId,
+    newHolderDocumentId,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderTabId, 52);
+  assert.equal(harness.storage[LOCK_KEY]?.captureTaskId, stableTaskId);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
+  );
+
+  releaseNewPreflight();
+  const newBegin = await newBeginPromise;
+  assert.equal(newBegin.ok, true, JSON.stringify(newBegin));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 52);
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    52,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderId, "post-bind-new-holder");
+  assert.equal(
+    harness.storage[LOCK_KEY]?.holderDocumentId,
+    newHolderDocumentId,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderTabId, 52);
+  assert.equal(harness.storage[LOCK_KEY]?.captureTaskId, stableTaskId);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
+  );
+});
+
+test("a terminal unattended request cannot BEGIN even while its old lock remains", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-already-terminal",
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "terminal-holder",
+    holderDocumentId: "terminal-document",
+    holderTabId: 41,
+  });
+  assert.equal(acquired.ok, true);
+
+  const begin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+
+  assert.equal(begin.ok, false, JSON.stringify(begin));
+  assert.ok(String(begin.error?.code || ""));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.notEqual(harness.storage[LOCK_KEY]?.captureTaskId, stableTaskId);
+});
+
+test("a stable unattended BEGIN cannot bind through a non-unattended lock", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-wrong-lock-owner",
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "manual_batch_keyword_capture",
+    holderId: "manual-holder",
+    holderDocumentId: "manual-document",
+    holderTabId: 41,
+  });
+  assert.equal(acquired.ok, true);
+
+  const begin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: stableTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+
+  assert.equal(begin.ok, false, JSON.stringify(begin));
+  assert.ok(String(begin.error?.code || ""));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.storage[LOCK_KEY].id, acquired.lock.id);
+  assert.equal(harness.storage[LOCK_KEY].owner, "manual_batch_keyword_capture");
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, undefined);
 });
 
 test("owner disconnect terminalizes a ledger-only task after resources already vanished", async () => {

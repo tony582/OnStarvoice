@@ -215,6 +215,157 @@ export function mergeKeywordAttemptResults({
   };
 }
 
+/**
+ * Run one unattended keyword round with a bounded retry queue.
+ *
+ * The batch runner remains responsible for continuing from one keyword to the
+ * next after a recoverable per-keyword failure. This helper owns the outer
+ * contract: merge the whole first pass, select only its failed keywords, and
+ * retry that subset without replaying keywords that already succeeded.
+ */
+export async function runUnattendedKeywordAttempts({
+  allKeywords = [],
+  initialPendingKeywords = allKeywords,
+  initialResult = null,
+  completedBeforeRun = new Set(),
+  maxAttempts = DEFAULT_MAX_ATTEMPTS,
+  runAttempt,
+  selectRetryKeywords = null,
+  onRetryScheduled = null,
+  shouldStop = null,
+} = {}) {
+  if (typeof runAttempt !== "function") {
+    throw new TypeError("runAttempt must be a function");
+  }
+
+  const normalizedAllKeywords = allKeywords.map(text).filter(Boolean);
+  const allowedKeywords = new Set(normalizedAllKeywords);
+  const normalizePendingKeywords = (values = []) => {
+    const seen = new Set();
+    const normalized = [];
+    for (const value of Array.isArray(values) ? values : []) {
+      const keyword = text(value);
+      if (
+        !keyword ||
+        (allowedKeywords.size > 0 && !allowedKeywords.has(keyword)) ||
+        seen.has(keyword)
+      ) {
+        continue;
+      }
+      seen.add(keyword);
+      normalized.push(keyword);
+    }
+    return normalized;
+  };
+  const stopRequested = () => {
+    if (typeof shouldStop !== "function") return false;
+    try {
+      return shouldStop() === true;
+    } catch {
+      return true;
+    }
+  };
+  const normalizedCompletedBeforeRun =
+    completedBeforeRun instanceof Set
+      ? completedBeforeRun
+      : new Set(
+          (Array.isArray(completedBeforeRun) ? completedBeforeRun : [])
+            .map(text)
+            .filter(Boolean),
+        );
+  const normalizedMaxAttempts = positiveInt(maxAttempts, DEFAULT_MAX_ATTEMPTS);
+  let pendingKeywords = normalizePendingKeywords(initialPendingKeywords);
+  let attempt = 1;
+  let mergedResult =
+    initialResult && typeof initialResult === "object"
+      ? initialResult
+      : {
+          ok: true,
+          canceled: false,
+          securityBlocked: false,
+          results: [],
+          stats: {
+            total: normalizedAllKeywords.length,
+            processed: normalizedCompletedBeforeRun.size,
+            success: normalizedCompletedBeforeRun.size,
+            failed: 0,
+          },
+        };
+  const attempts = [];
+
+  while (pendingKeywords.length > 0) {
+    const attemptKeywords = [...pendingKeywords];
+    const attemptResult = await runAttempt({
+      keywords: attemptKeywords,
+      attempt,
+      maxAttempts: normalizedMaxAttempts,
+    });
+    attempts.push({
+      attempt,
+      keywords: attemptKeywords,
+      result: attemptResult,
+    });
+    mergedResult = mergeKeywordAttemptResults({
+      previous: mergedResult,
+      next: attemptResult,
+      allKeywords: normalizedAllKeywords,
+      completedBeforeRun: normalizedCompletedBeforeRun,
+    });
+    if (
+      attemptResult?.canceled ||
+      attemptResult?.securityBlocked ||
+      stopRequested()
+    ) {
+      break;
+    }
+
+    let retryKeywords = normalizePendingKeywords(
+      (Array.isArray(attemptResult?.results) ? attemptResult.results : [])
+        .filter((item) => item?.ok !== true)
+        .map((item) => item?.keyword),
+    );
+    if (typeof selectRetryKeywords === "function") {
+      retryKeywords = normalizePendingKeywords(
+        await selectRetryKeywords({
+          keywords: [...retryKeywords],
+          attempt,
+          maxAttempts: normalizedMaxAttempts,
+          attemptResult,
+          mergedResult,
+        }),
+      );
+    }
+    pendingKeywords = retryKeywords;
+    if (
+      pendingKeywords.length === 0 ||
+      attempt >= normalizedMaxAttempts
+    ) {
+      break;
+    }
+
+    const nextAttempt = attempt + 1;
+    if (typeof onRetryScheduled === "function") {
+      await onRetryScheduled({
+        keywords: [...pendingKeywords],
+        attempt: nextAttempt,
+        previousAttempt: attempt,
+        maxAttempts: normalizedMaxAttempts,
+        attemptResult,
+        mergedResult,
+      });
+    }
+    attempt = nextAttempt;
+    if (stopRequested()) break;
+  }
+
+  return {
+    result: mergedResult,
+    attempts,
+    attempt,
+    pendingKeywords: [...pendingKeywords],
+  };
+}
+
 export function reconcileEnhancementRetryCheckpoint({
   checkpoint = {},
   keywords = [],

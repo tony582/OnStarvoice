@@ -79,7 +79,7 @@ test("cancel during runtime lookup prevents the first backend write", async () =
   assert.equal(fetchCount, 0);
 });
 
-test("cancel after a missing endpoint blocks every fallback URL", async () => {
+test("a missing endpoint stops at the single trusted API origin", async () => {
   storageGet = async (key) => ({[key]: store[key] ?? null});
   let canceled = false;
   let fetchCount = 0;
@@ -93,7 +93,8 @@ test("cancel after a missing endpoint blocks every fallback URL", async () => {
     shouldStop: () => canceled,
   });
 
-  assert.equal(result.canceled, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "not_found");
   assert.equal(fetchCount, 1);
 });
 

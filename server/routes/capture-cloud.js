@@ -1,0 +1,2588 @@
+import crypto from 'crypto';
+import { Router } from 'express';
+import { queryAll, queryOne, withTransaction } from '../db/init.js';
+import {
+  requireCaptureAgent,
+  requireSessionUser,
+  requireTenantAccess,
+  requireTenantWriter,
+} from '../middleware/auth.js';
+import {
+  captureAgentOnline,
+  isCloudTaskActive,
+  normalizeCaptureAgentPlatforms,
+  normalizeCloudTaskSnapshot,
+  normalizeRemoteTaskInput,
+  sanitizeCloudStructuredObject,
+  sanitizeCloudText,
+} from '../services/capture-cloud.js';
+
+const router = Router();
+const MAX_HEARTBEAT_TASKS = 50;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const RECOVERABLE_STATUSES = new Set([
+  'interrupted',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
+]);
+const REMOTELY_STOPPABLE_STATUSES = new Set([
+  'pending',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'resume_requested',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
+]);
+const STOP_FINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'canceled',
+  'skipped',
+  'superseded',
+]);
+const SUPERSEDED_CREATE_STOP_NO_TARGET_REASONS = new Set([
+  'not_found',
+  'request_mismatch',
+]);
+
+function text(value, limit = 1000) {
+  const normalized = String(value ?? '').trim();
+  return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+}
+
+function safeJson(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function remoteTaskRequestHash(agentId, title, executionMode, planSnapshot) {
+  const plan = safeJson(planSnapshot);
+  const executionPlan = {
+    executionMode,
+    enabled: plan.enabled,
+    platform: plan.platform,
+    keywords: plan.keywords,
+    searchFilters: plan.searchFilters,
+    keywordMaxDetectedItems: plan.keywordMaxDetectedItems,
+    captureSettings: plan.captureSettings,
+    mode: plan.mode,
+    startTime: plan.startTime,
+    randomOffsetMin: plan.randomOffsetMin,
+    customDates: plan.customDates,
+    maxRounds: plan.maxRounds,
+    roundGapMin: plan.roundGapMin,
+  };
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({agentId, title, executionPlan}))
+    .digest('hex');
+}
+
+export function captureTaskSnapshotFingerprint(snapshot = {}) {
+  const normalized = safeJson(snapshot);
+  // Fingerprint the complete normalized browser report. Exact heartbeat
+  // replays are idempotent, while a later source timestamp, progress sequence,
+  // status, checkpoint, or payload remains a distinct accepted snapshot.
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({
+      clientTaskId: normalized.clientTaskId,
+      controlTaskId: normalized.controlTaskId,
+      taskType: normalized.taskType,
+      featureKey: normalized.featureKey,
+      title: normalized.title,
+      platform: normalized.platform,
+      source: normalized.source,
+      triggerType: normalized.triggerType,
+      status: normalized.status,
+      progress: normalized.progress,
+      checkpoint: normalized.checkpoint,
+      counts: normalized.counts,
+      metadata: normalized.metadata,
+      error: normalized.error,
+      message: normalized.message,
+      attemptId: normalized.attemptId,
+      attemptNumber: normalized.attemptNumber,
+      progressSeq: normalized.progressSeq,
+      heartbeatAt: normalized.heartbeatAt,
+      businessProgressAt: normalized.businessProgressAt,
+      startedAt: normalized.startedAt,
+      finishedAt: normalized.finishedAt,
+      createdAt: normalized.createdAt,
+      updatedAt: normalized.updatedAt,
+    }))
+    .digest('hex');
+}
+
+function attemptStatus(taskStatus) {
+  if (taskStatus === 'claimed') return 'claimed';
+  if (taskStatus === 'recovering') return 'recovering';
+  if (taskStatus === 'running') return 'running';
+  if (taskStatus === 'interrupted' || taskStatus === 'needs_action') return 'interrupted';
+  if (taskStatus === 'completed') return 'completed';
+  if (taskStatus === 'completed_with_warnings') return 'completed_with_warnings';
+  if (taskStatus === 'completed_with_failures') return 'completed_with_failures';
+  if (taskStatus === 'canceled' || taskStatus === 'skipped') return 'canceled';
+  if (taskStatus === 'failed') return 'failed';
+  return '';
+}
+
+function stopFailureStatus(previousStatus) {
+  const normalized = text(previousStatus, 80);
+  if (normalized === 'resume_requested') return 'needs_action';
+  return REMOTELY_STOPPABLE_STATUSES.has(normalized)
+    ? normalized
+    : 'needs_action';
+}
+
+export function resolveStopCommandOutcome({
+  reportedSuccess = false,
+  expectedRequestId = '',
+  actualRequestId = '',
+  resultReason = '',
+  supersededCreateCommandId = '',
+  previousStatus = '',
+} = {}) {
+  const expected = text(expectedRequestId, 240);
+  const actual = text(actualRequestId, 240);
+  const validRequestId = Boolean(expected && actual === expected);
+  const normalizedReason = text(resultReason, 120);
+  const normalizedCreateCommandId = text(supersededCreateCommandId, 100);
+  const stoppedBeforeLocalCreation = Boolean(
+    validRequestId &&
+      reportedSuccess !== true &&
+      UUID_PATTERN.test(normalizedCreateCommandId) &&
+      SUPERSEDED_CREATE_STOP_NO_TARGET_REASONS.has(normalizedReason),
+  );
+  const success = Boolean(
+    validRequestId && (reportedSuccess === true || stoppedBeforeLocalCreation),
+  );
+  return {
+    validRequestId,
+    success,
+    stoppedBeforeLocalCreation,
+    commandStatus: success ? 'completed' : 'failed',
+    taskStatus: success ? 'canceled' : stopFailureStatus(previousStatus),
+  };
+}
+
+async function appendEvent(tx, {
+  tenantId,
+  taskId,
+  attemptId = null,
+  agentId = null,
+  eventType,
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+  status = '',
+  message = '',
+  payload = {},
+}) {
+  await tx.execute(`
+    INSERT INTO capture_task_events (
+      tenant_id, task_id, attempt_id, agent_id, event_type,
+      actor_type, actor_id, actor_name, status, message, payload
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+  `, [
+    tenantId,
+    taskId,
+    attemptId,
+    agentId,
+    eventType,
+    actorType,
+    text(actorId, 240),
+    text(actorName, 240),
+    text(status, 80),
+    text(message, 2000),
+    JSON.stringify(safeJson(payload)),
+  ]);
+}
+
+async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) {
+  const scopedTaskId = text(taskId, 100);
+  const scopedAgentId = text(agentId, 100);
+  // Every path that can mutate both records locks the task before its command.
+  // Lock candidate tasks in a deterministic order before the bulk command
+  // updates below, preventing heartbeat/receipt expiry races from deadlocking.
+  await tx.queryAll(`
+    SELECT t.id
+    FROM capture_tasks t
+    WHERE t.tenant_id = $1
+      AND ($2 = '' OR t.id::text = $2)
+      AND EXISTS (
+        SELECT 1 FROM capture_agent_commands c
+        WHERE c.task_id = t.id AND c.tenant_id = t.tenant_id
+          AND c.status IN ('pending', 'acknowledged')
+          AND ($3 = '' OR c.agent_id::text = $3)
+      )
+    ORDER BY t.id
+    FOR UPDATE
+  `, [tenantId, scopedTaskId, scopedAgentId]);
+  const expired = await tx.queryAll(`
+    UPDATE capture_agent_commands
+    SET status = 'expired',
+      result = jsonb_build_object('reason', 'expired'),
+      finished_at = now(), updated_at = now()
+    WHERE tenant_id = $1
+      AND ($2 = '' OR task_id::text = $2)
+      AND ($3 = '' OR agent_id::text = $3)
+      AND status IN ('pending', 'acknowledged')
+      AND expires_at <= now()
+    RETURNING id, task_id, agent_id, command_type, payload
+  `, [tenantId, scopedTaskId, scopedAgentId]);
+
+  for (const command of expired) {
+    if (command.command_type === 'create') {
+      const failedTask = await tx.queryOne(`
+        UPDATE capture_tasks
+        SET status = 'failed',
+          message = '设备创建指令已过期，任务未执行',
+          error = jsonb_build_object(
+            'code', 'create_command_expired',
+            'message', '设备未在指令有效期内领取并创建任务'
+          ),
+          finished_at = now(),
+          updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND status IN ('pending', 'claimed')
+          AND metadata->>'createCommandId' = $3
+        RETURNING id, status
+      `, [command.task_id, tenantId, command.id]);
+      await appendEvent(tx, {
+        tenantId,
+        taskId: command.task_id,
+        agentId: command.agent_id,
+        eventType: 'create_command_expired',
+        status: failedTask?.status || '',
+        message: failedTask
+          ? '设备创建指令已过期，任务未执行'
+          : '设备创建指令已过期，任务已有更新状态',
+        payload: {commandId: command.id, commandType: command.command_type},
+      });
+      continue;
+    }
+    if (command.command_type === 'stop') {
+      const restoredStatus = stopFailureStatus(command.payload?.previousStatus);
+      const restored = await tx.queryOne(`
+        UPDATE capture_tasks
+        SET status = $1,
+          message = '远程停止指令已过期，可重新下发',
+          metadata = metadata - 'stopCommandId' - 'stopPreviousStatus',
+          updated_at = now()
+        WHERE id = $2 AND tenant_id = $3
+          AND metadata->>'stopCommandId' = $4
+        RETURNING id
+      `, [restoredStatus, command.task_id, tenantId, command.id]);
+      if (restored) {
+        await appendEvent(tx, {
+          tenantId,
+          taskId: command.task_id,
+          agentId: command.agent_id,
+          eventType: 'stop_command_expired',
+          status: restoredStatus,
+          message: '远程停止指令已过期，可重新下发',
+          payload: {commandId: command.id, commandType: command.command_type},
+        });
+      }
+      continue;
+    }
+    if (command.command_type !== 'resume') {
+      await appendEvent(tx, {
+        tenantId,
+        taskId: command.task_id,
+        agentId: command.agent_id,
+        eventType: 'command_expired',
+        message: '远程指令已过期',
+        payload: {commandId: command.id, commandType: command.command_type},
+      });
+      continue;
+    }
+    const previousStatus = text(command.payload?.previousStatus, 80);
+    const restoredStatus = RECOVERABLE_STATUSES.has(previousStatus)
+      ? previousStatus
+      : 'needs_action';
+    const restored = await tx.queryOne(`
+      UPDATE capture_tasks
+      SET status = $1,
+        message = '远程继续指令已过期，可重新下发',
+        metadata = metadata - 'resumeCommandId' - 'resumePreviousStatus',
+        updated_at = now()
+      WHERE id = $2 AND tenant_id = $3 AND status = 'resume_requested'
+        AND metadata->>'resumeCommandId' = $4
+      RETURNING id
+    `, [restoredStatus, command.task_id, tenantId, command.id]);
+    if (!restored) continue;
+    await appendEvent(tx, {
+      tenantId,
+      taskId: command.task_id,
+      agentId: command.agent_id,
+      eventType: 'command_expired',
+      status: restoredStatus,
+      message: '远程继续指令已过期，任务已恢复为可重试状态',
+      payload: {commandId: command.id, commandType: command.command_type},
+    });
+  }
+
+  const unavailable = await tx.queryAll(`
+    UPDATE capture_agent_commands c
+    SET status = 'expired',
+      result = jsonb_build_object('reason', 'agent_inactive'),
+      finished_at = now(), updated_at = now()
+    WHERE c.tenant_id = $1
+      AND ($2 = '' OR c.task_id::text = $2)
+      AND ($3 = '' OR c.agent_id::text = $3)
+      AND c.command_type IN ('resume', 'stop', 'create')
+      AND c.status IN ('pending', 'acknowledged')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM capture_agents ca
+        JOIN tenants tenant
+          ON tenant.id = ca.tenant_id AND tenant.status = 'active'
+        JOIN auth_codes ac
+          ON ac.id = ca.auth_code_id
+          AND ac.tenant_id = ca.tenant_id
+          AND ac.status = 'active'
+          AND (ac.expires_at IS NULL OR ac.expires_at >= now())
+        JOIN auth_bindings ab
+          ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        JOIN capture_tasks t
+          ON t.id = c.task_id AND t.tenant_id = c.tenant_id
+        WHERE ca.id = c.agent_id AND ca.tenant_id = c.tenant_id
+          AND ca.status = 'active'
+          AND c.payload->>'authCodeId' = ca.auth_code_id::text
+          AND c.payload->>'authBindingId' = ca.auth_binding_id::text
+          AND c.payload->>'platform' = t.platform
+          AND (
+            c.command_type <> 'create'
+            OR ca.capabilities->>'remoteTaskCreate' = 'true'
+          )
+          AND (
+            c.command_type <> 'create'
+            OR CASE
+              WHEN jsonb_typeof(ca.capabilities->'supportedPlatforms') = 'array'
+                THEN ca.capabilities->'supportedPlatforms'
+              ELSE '[]'::jsonb
+            END = '[]'::jsonb
+            OR CASE
+              WHEN jsonb_typeof(ca.capabilities->'supportedPlatforms') = 'array'
+                THEN ca.capabilities->'supportedPlatforms'
+              ELSE '[]'::jsonb
+            END @> jsonb_build_array(t.platform)
+          )
+          AND (
+            cardinality(ca.allowed_platforms) = 0
+            OR t.platform = ANY(ca.allowed_platforms)
+          )
+      )
+    RETURNING id, task_id, agent_id, command_type, payload
+  `, [tenantId, scopedTaskId, scopedAgentId]);
+  for (const command of unavailable) {
+    if (command.command_type === 'create') {
+      const failedTask = await tx.queryOne(`
+        UPDATE capture_tasks
+        SET status = 'needs_action',
+          message = '目标节点授权或平台职责已变化，任务未执行',
+          error = jsonb_build_object(
+            'code', 'create_agent_unavailable',
+            'message', '目标节点授权或平台职责已变化'
+          ),
+          updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND status IN ('pending', 'claimed')
+          AND metadata->>'createCommandId' = $3
+        RETURNING id, status
+      `, [command.task_id, tenantId, command.id]);
+      await appendEvent(tx, {
+        tenantId,
+        taskId: command.task_id,
+        agentId: command.agent_id,
+        eventType: 'create_command_canceled_agent_unavailable',
+        status: failedTask?.status || '',
+        message: failedTask
+          ? '目标节点授权或平台职责已变化，创建指令已取消'
+          : '目标任务已有更新状态，旧创建指令已取消',
+        payload: {commandId: command.id, commandType: command.command_type},
+      });
+      continue;
+    }
+    if (command.command_type === 'stop') {
+      const restoredStatus = stopFailureStatus(command.payload?.previousStatus);
+      const restored = await tx.queryOne(`
+        UPDATE capture_tasks
+        SET status = $1,
+          message = '原执行节点授权或平台职责已变化，停止指令已取消',
+          metadata = metadata - 'stopCommandId' - 'stopPreviousStatus',
+          updated_at = now()
+        WHERE id = $2 AND tenant_id = $3
+          AND metadata->>'stopCommandId' = $4
+        RETURNING id
+      `, [restoredStatus, command.task_id, tenantId, command.id]);
+      if (restored) {
+        await appendEvent(tx, {
+          tenantId,
+          taskId: command.task_id,
+          agentId: command.agent_id,
+          eventType: 'stop_command_canceled_agent_unavailable',
+          status: restoredStatus,
+          message: '原执行节点授权或平台职责已变化，停止指令已取消',
+          payload: {commandId: command.id, commandType: command.command_type},
+        });
+      }
+      continue;
+    }
+    const previousStatus = text(command.payload?.previousStatus, 80);
+    const restoredStatus = RECOVERABLE_STATUSES.has(previousStatus)
+      ? previousStatus
+      : 'needs_action';
+    const restored = await tx.queryOne(`
+      UPDATE capture_tasks
+      SET status = $1,
+        message = '原执行节点授权或平台职责已变化，可重新下发',
+        metadata = metadata - 'resumeCommandId' - 'resumePreviousStatus',
+        updated_at = now()
+      WHERE id = $2 AND tenant_id = $3 AND status = 'resume_requested'
+        AND metadata->>'resumeCommandId' = $4
+      RETURNING id
+    `, [restoredStatus, command.task_id, tenantId, command.id]);
+    if (!restored) continue;
+    await appendEvent(tx, {
+      tenantId,
+      taskId: command.task_id,
+      agentId: command.agent_id,
+      eventType: 'command_canceled_agent_unavailable',
+      status: restoredStatus,
+      message: '原执行节点授权或平台职责已变化，远程继续指令已取消',
+      payload: {commandId: command.id, commandType: command.command_type},
+    });
+  }
+
+  // A device can recover or finish locally before it sees a cloud command. In
+  // that case the command must be invalidated, never delivered against a task
+  // that no longer points at this exact control command.
+  const obsolete = await tx.queryAll(`
+    UPDATE capture_agent_commands c
+    SET status = 'expired',
+      result = jsonb_build_object('reason', 'task_state_changed'),
+      finished_at = now(), updated_at = now()
+    WHERE c.tenant_id = $1
+      AND ($2 = '' OR c.task_id::text = $2)
+      AND ($3 = '' OR c.agent_id::text = $3)
+      AND c.status IN ('pending', 'acknowledged')
+      AND (
+        (
+          c.command_type = 'resume'
+          AND NOT EXISTS (
+            SELECT 1 FROM capture_tasks t
+            WHERE t.id = c.task_id AND t.tenant_id = c.tenant_id
+              AND t.status = 'resume_requested'
+              AND t.metadata->>'resumeCommandId' = c.id::text
+          )
+        )
+        OR (
+          c.command_type = 'create'
+          AND NOT EXISTS (
+            SELECT 1 FROM capture_tasks t
+            WHERE t.id = c.task_id AND t.tenant_id = c.tenant_id
+              AND t.status IN ('pending', 'claimed')
+              AND t.metadata->>'createCommandId' = c.id::text
+          )
+        )
+        OR (
+          c.command_type = 'stop'
+          AND NOT EXISTS (
+            SELECT 1 FROM capture_tasks t
+            WHERE t.id = c.task_id AND t.tenant_id = c.tenant_id
+              AND t.status NOT IN (
+                'completed', 'completed_with_warnings', 'canceled',
+                'skipped', 'superseded'
+              )
+              AND t.metadata->>'stopCommandId' = c.id::text
+          )
+        )
+      )
+    RETURNING id, task_id, agent_id, command_type
+  `, [tenantId, scopedTaskId, scopedAgentId]);
+  for (const command of obsolete) {
+    if (command.command_type === 'stop') {
+      await tx.execute(`
+        UPDATE capture_tasks
+        SET metadata = metadata - 'stopCommandId' - 'stopPreviousStatus',
+          updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND metadata->>'stopCommandId' = $3
+      `, [command.task_id, tenantId, command.id]);
+    }
+    await appendEvent(tx, {
+      tenantId,
+      taskId: command.task_id,
+      agentId: command.agent_id,
+      eventType: command.command_type === 'create'
+        ? 'create_command_canceled_task_changed'
+        : command.command_type === 'stop'
+          ? 'stop_command_canceled_task_changed'
+          : 'command_canceled_task_changed',
+      message: command.command_type === 'create'
+        ? '任务状态已变化，旧的创建指令未再下发'
+        : command.command_type === 'stop'
+          ? '任务已经结束或控制对象已变化，旧的停止指令未再下发'
+          : '任务已在设备侧变化，旧的远程继续指令未再下发',
+      payload: {commandId: command.id, commandType: command.command_type},
+    });
+  }
+  return [...expired, ...unavailable, ...obsolete];
+}
+
+async function resolveResumeCommandFromSuccessor(tx, agent, snapshot) {
+  const parentRequestId = text(snapshot.metadata?.parentRequestId, 240);
+  if (!parentRequestId) return null;
+  const parentTask = await tx.queryOne(`
+    SELECT id, metadata FROM capture_tasks
+    WHERE tenant_id = $1 AND origin_agent_id = $2
+      AND (client_task_id = $3 OR control_task_id = $3)
+      AND status = 'resume_requested'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `, [agent.tenant_id, agent.id, parentRequestId]);
+  if (!parentTask) return null;
+  const resumeCommandId = text(parentTask.metadata?.resumeCommandId, 100);
+  if (!resumeCommandId) return null;
+
+  const command = await tx.queryOne(`
+    UPDATE capture_agent_commands
+    SET status = 'completed',
+      result = $1::jsonb,
+      finished_at = now(),
+      updated_at = now()
+    WHERE id = (
+      SELECT id FROM capture_agent_commands
+      WHERE tenant_id = $2 AND agent_id = $3 AND task_id = $4
+        AND command_type = 'resume'
+        AND id::text = $5
+        AND status IN ('pending', 'acknowledged')
+        AND expires_at > now()
+      ORDER BY created_at DESC
+      LIMIT 1
+    )
+    RETURNING id
+  `, [
+    JSON.stringify({source: 'successor_observed', recoveryTaskId: snapshot.clientTaskId}),
+    agent.tenant_id,
+    agent.id,
+    parentTask.id,
+    resumeCommandId,
+  ]);
+  if (!command) return null;
+
+  const updatedParent = await tx.queryOne(`
+    UPDATE capture_tasks
+    SET status = 'superseded',
+      message = '设备已创建新的恢复任务',
+      metadata = (metadata - 'resumeCommandId' - 'resumePreviousStatus') || $1::jsonb,
+      updated_at = now()
+    WHERE id = $2 AND tenant_id = $3 AND status = 'resume_requested'
+    RETURNING id
+  `, [
+    JSON.stringify({recoveryTaskId: snapshot.clientTaskId, recoveryCommandId: command.id}),
+    parentTask.id,
+    agent.tenant_id,
+  ]);
+  if (updatedParent) {
+    await appendEvent(tx, {
+      tenantId: agent.tenant_id,
+      taskId: parentTask.id,
+      agentId: agent.id,
+      eventType: 'command_completed_from_successor',
+      actorType: 'capture_agent',
+      actorId: agent.id,
+      actorName: agent.display_name || agent.client_label,
+      status: 'superseded',
+      message: '检测到新的恢复任务，远程继续指令已对账完成',
+      payload: {commandId: command.id, recoveryTaskId: snapshot.clientTaskId},
+    });
+  }
+  return command;
+}
+
+async function resolveCreateCommandFromSnapshot(tx, agent, task, snapshot, evidence = null) {
+  const createCommandId = text(task?.metadata?.createCommandId, 100);
+  if (
+    !createCommandId ||
+    !task?.id ||
+    task?.metadata?.stopCommandId ||
+    (evidence && evidence.id !== createCommandId)
+  ) {
+    return null;
+  }
+  const command = await tx.queryOne(`
+    UPDATE capture_agent_commands
+    SET status = 'completed',
+      result = $1::jsonb,
+      finished_at = now(),
+      updated_at = now()
+    WHERE id = $2 AND tenant_id = $3 AND agent_id = $4 AND task_id = $5
+      AND command_type = 'create'
+      AND status IN ('pending', 'acknowledged', 'expired')
+      AND COALESCE(result->>'reason', '') NOT IN (
+        'superseded_by_stop', 'stopped_before_dispatch'
+      )
+      AND payload->>'clientTaskId' = $6
+    RETURNING id
+  `, [
+    JSON.stringify({source: 'task_snapshot_observed', requestId: snapshot.clientTaskId}),
+    createCommandId,
+    agent.tenant_id,
+    agent.id,
+    task.id,
+    snapshot.clientTaskId,
+  ]);
+  if (!command) return null;
+  await appendEvent(tx, {
+    tenantId: agent.tenant_id,
+    taskId: task.id,
+    agentId: agent.id,
+    eventType: 'create_command_completed_from_snapshot',
+    actorType: 'capture_agent',
+    actorId: agent.id,
+    actorName: agent.display_name || agent.client_label,
+    status: task.status,
+    message: '检测到设备已创建本地任务，创建指令已自动对账',
+    payload: {commandId: command.id, requestId: snapshot.clientTaskId},
+  });
+  return command;
+}
+
+async function mirrorTaskSnapshot(tx, agent, snapshot) {
+  const previous = await tx.queryOne(`
+    SELECT id, status, attempt_number
+    FROM capture_tasks
+    WHERE tenant_id = $1 AND origin_agent_id = $2 AND client_task_id = $3
+    LIMIT 1
+  `, [agent.tenant_id, agent.id, snapshot.clientTaskId]);
+
+  // Read exact create evidence without locking it; the task upsert below takes
+  // the first write lock, and command reconciliation follows that same
+  // task-then-command order everywhere.
+  const createCommandEvidence = await tx.queryOne(`
+    SELECT id::text AS id, status
+    FROM capture_agent_commands
+    WHERE tenant_id = $1 AND agent_id = $2
+      AND task_id::text = $3
+      AND command_type = 'create'
+      AND payload->>'clientTaskId' = $3
+      AND status IN ('pending', 'acknowledged', 'expired')
+    ORDER BY created_at DESC
+    LIMIT 1
+  `, [agent.tenant_id, agent.id, snapshot.clientTaskId]);
+
+  let task = await tx.queryOne(`
+    INSERT INTO capture_tasks (
+      tenant_id, origin_agent_id, assigned_agent_id,
+      client_task_id, control_task_id, task_type, feature_key, title,
+      platform, source, trigger_type, status,
+      progress, checkpoint, counts, metadata, error, message,
+      attempt_number, progress_seq, heartbeat_at, business_progress_at,
+      started_at, finished_at, source_updated_at, created_at, updated_at
+    ) VALUES (
+      $1, $2, $2,
+      $3, $4, $5, $6, $7,
+      $8, $9, $10, $11,
+      $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb, $17,
+      $18, $19, $20, $21,
+      $22, $23, COALESCE($25, $24, now()), COALESCE($24, now()), now()
+    )
+    ON CONFLICT (tenant_id, origin_agent_id, client_task_id)
+      WHERE client_task_id <> ''
+    DO UPDATE SET
+      assigned_agent_id = EXCLUDED.assigned_agent_id,
+      control_task_id = EXCLUDED.control_task_id,
+      task_type = EXCLUDED.task_type,
+      feature_key = EXCLUDED.feature_key,
+      title = EXCLUDED.title,
+      platform = EXCLUDED.platform,
+      source = EXCLUDED.source,
+      trigger_type = EXCLUDED.trigger_type,
+      status = CASE
+        WHEN capture_tasks.status = 'superseded'
+          THEN capture_tasks.status
+        WHEN capture_tasks.status = 'failed'
+          AND capture_tasks.error->>'code' = 'create_command_expired'
+          AND capture_tasks.metadata->>'createCommandId' = $26
+          AND capture_tasks.client_task_id = EXCLUDED.client_task_id
+          THEN CASE WHEN EXCLUDED.status = 'pending' THEN 'claimed' ELSE EXCLUDED.status END
+        WHEN capture_tasks.status = 'claimed'
+          AND capture_tasks.metadata ? 'createCommandId'
+          AND EXCLUDED.status = 'pending'
+          THEN capture_tasks.status
+        WHEN capture_tasks.status = 'resume_requested'
+          AND EXCLUDED.status IN ('needs_action', 'failed', 'interrupted', 'completed_with_failures')
+          THEN capture_tasks.status
+        WHEN capture_tasks.attempt_number = EXCLUDED.attempt_number
+          AND capture_tasks.status IN (
+            'completed', 'completed_with_warnings', 'completed_with_failures',
+            'failed', 'canceled', 'skipped'
+          )
+          AND EXCLUDED.status IN ('pending', 'claimed', 'running', 'recovering')
+          THEN capture_tasks.status
+        ELSE EXCLUDED.status
+      END,
+      progress = EXCLUDED.progress,
+      checkpoint = EXCLUDED.checkpoint,
+      counts = EXCLUDED.counts,
+      metadata = EXCLUDED.metadata
+        || CASE
+          WHEN capture_tasks.status = 'resume_requested'
+            AND EXCLUDED.status IN ('needs_action', 'failed', 'interrupted', 'completed_with_failures')
+          THEN jsonb_strip_nulls(jsonb_build_object(
+            'resumeCommandId', capture_tasks.metadata->'resumeCommandId',
+            'resumePreviousStatus', capture_tasks.metadata->'resumePreviousStatus'
+          ))
+          ELSE '{}'::jsonb
+        END
+        || CASE
+          WHEN capture_tasks.metadata ? 'createCommandId'
+          THEN jsonb_strip_nulls(jsonb_build_object(
+            'createCommandId', capture_tasks.metadata->'createCommandId',
+            'remoteCreated', capture_tasks.metadata->'remoteCreated',
+            'requestedByUserId', capture_tasks.metadata->'requestedByUserId',
+            'requestedByName', capture_tasks.metadata->'requestedByName',
+            'executionMode', capture_tasks.metadata->'executionMode',
+            'planSnapshot', capture_tasks.metadata->'planSnapshot',
+            'remoteRequestHash', capture_tasks.metadata->'remoteRequestHash',
+            'queueBlocker', capture_tasks.metadata->'queueBlocker',
+            'localRequestId', capture_tasks.metadata->'localRequestId',
+            'createCompletedAt', capture_tasks.metadata->'createCompletedAt',
+            'createFailedAt', capture_tasks.metadata->'createFailedAt'
+          ))
+          ELSE '{}'::jsonb
+        END
+        || CASE
+          WHEN capture_tasks.metadata ? 'stopCommandId'
+          THEN jsonb_strip_nulls(jsonb_build_object(
+            'stopCommandId', capture_tasks.metadata->'stopCommandId',
+            'stopPreviousStatus', capture_tasks.metadata->'stopPreviousStatus'
+          ))
+          ELSE '{}'::jsonb
+        END,
+      error = EXCLUDED.error,
+      message = EXCLUDED.message,
+      attempt_number = GREATEST(capture_tasks.attempt_number, EXCLUDED.attempt_number),
+      progress_seq = CASE
+        WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
+          THEN EXCLUDED.progress_seq
+        ELSE GREATEST(capture_tasks.progress_seq, EXCLUDED.progress_seq)
+      END,
+      heartbeat_at = CASE
+        WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
+          THEN EXCLUDED.heartbeat_at
+        ELSE GREATEST(capture_tasks.heartbeat_at, EXCLUDED.heartbeat_at)
+      END,
+      business_progress_at = CASE
+        WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
+          THEN EXCLUDED.business_progress_at
+        ELSE GREATEST(capture_tasks.business_progress_at, EXCLUDED.business_progress_at)
+      END,
+      started_at = LEAST(capture_tasks.started_at, EXCLUDED.started_at),
+      finished_at = CASE
+        WHEN capture_tasks.status = 'failed'
+          AND capture_tasks.error->>'code' = 'create_command_expired'
+          AND capture_tasks.metadata->>'createCommandId' = $26
+          AND capture_tasks.client_task_id = EXCLUDED.client_task_id
+          THEN EXCLUDED.finished_at
+        WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
+          THEN EXCLUDED.finished_at
+        ELSE GREATEST(capture_tasks.finished_at, EXCLUDED.finished_at)
+      END,
+      source_updated_at = CASE
+        WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
+          THEN EXCLUDED.source_updated_at
+        ELSE GREATEST(capture_tasks.source_updated_at, EXCLUDED.source_updated_at)
+      END,
+      updated_at = now()
+    WHERE capture_tasks.status <> 'superseded'
+      -- attempt_number is a monotonic slot, while client_attempt_id identifies
+      -- the concrete runner incarnation occupying it. Once a non-empty ID is
+      -- recorded, a different non-empty ID may not overwrite that slot's task
+      -- projection. Empty legacy IDs remain compatible in either direction.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM capture_task_attempts existing_attempt
+        WHERE existing_attempt.task_id = capture_tasks.id
+          AND existing_attempt.attempt_number = EXCLUDED.attempt_number
+          AND existing_attempt.client_attempt_id <> ''
+          AND $27 <> ''
+          AND existing_attempt.client_attempt_id <> $27
+      )
+      AND NOT (
+        EXCLUDED.attempt_number = capture_tasks.attempt_number
+        AND capture_tasks.status IN (
+          'completed', 'completed_with_warnings', 'completed_with_failures',
+          'failed', 'canceled', 'skipped'
+        )
+        AND EXCLUDED.status IN ('pending', 'claimed', 'running', 'recovering')
+        AND NOT (
+          capture_tasks.status = 'failed'
+          AND capture_tasks.error->>'code' = 'create_command_expired'
+          AND capture_tasks.metadata->>'createCommandId' = $26
+          AND capture_tasks.client_task_id = EXCLUDED.client_task_id
+        )
+      )
+      AND (
+        EXCLUDED.attempt_number > capture_tasks.attempt_number
+        OR (
+          EXCLUDED.attempt_number = capture_tasks.attempt_number
+          AND EXCLUDED.progress_seq > capture_tasks.progress_seq
+        )
+        OR (
+          EXCLUDED.attempt_number = capture_tasks.attempt_number
+          AND EXCLUDED.progress_seq = capture_tasks.progress_seq
+          AND EXCLUDED.source_updated_at > capture_tasks.source_updated_at
+        )
+      )
+    RETURNING *
+  `, [
+    agent.tenant_id,
+    agent.id,
+    snapshot.clientTaskId,
+    snapshot.controlTaskId,
+    snapshot.taskType,
+    snapshot.featureKey,
+    snapshot.title,
+    snapshot.platform,
+    snapshot.source,
+    snapshot.triggerType,
+    snapshot.status,
+    JSON.stringify(snapshot.progress),
+    JSON.stringify(snapshot.checkpoint),
+    JSON.stringify(snapshot.counts),
+    JSON.stringify(snapshot.metadata),
+    JSON.stringify(snapshot.error),
+    snapshot.message,
+    snapshot.attemptNumber,
+    snapshot.progressSeq,
+    snapshot.heartbeatAt,
+    snapshot.businessProgressAt,
+    snapshot.startedAt,
+    snapshot.finishedAt,
+    snapshot.createdAt,
+    snapshot.updatedAt,
+    createCommandEvidence?.id || '',
+    snapshot.attemptId,
+  ]);
+
+  const snapshotAccepted = Boolean(task);
+  if (!task) {
+    task = await tx.queryOne(`
+      SELECT * FROM capture_tasks
+      WHERE tenant_id = $1 AND origin_agent_id = $2 AND client_task_id = $3
+      LIMIT 1
+    `, [agent.tenant_id, agent.id, snapshot.clientTaskId]);
+  }
+
+  let attempt = null;
+  const normalizedAttemptStatus = attemptStatus(snapshot.status);
+  if (snapshotAccepted && snapshot.attemptNumber > 0 && normalizedAttemptStatus) {
+    attempt = await tx.queryOne(`
+      INSERT INTO capture_task_attempts (
+        tenant_id, task_id, agent_id, client_attempt_id, attempt_number,
+        status, progress_seq, heartbeat_at, business_progress_at,
+        started_at, finished_at, progress, checkpoint, error, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9,
+        COALESCE($10, now()), $11, $12::jsonb, $13::jsonb, $14::jsonb, now()
+      )
+      ON CONFLICT (task_id, attempt_number)
+      DO UPDATE SET
+        agent_id = EXCLUDED.agent_id,
+        client_attempt_id = CASE
+          WHEN capture_task_attempts.client_attempt_id <> ''
+            AND EXCLUDED.client_attempt_id = ''
+            THEN capture_task_attempts.client_attempt_id
+          ELSE EXCLUDED.client_attempt_id
+        END,
+        status = CASE
+          WHEN capture_task_attempts.status IN (
+            'completed', 'completed_with_warnings', 'completed_with_failures',
+            'failed', 'canceled'
+          ) AND EXCLUDED.status IN ('claimed', 'running', 'recovering')
+            THEN capture_task_attempts.status
+          ELSE EXCLUDED.status
+        END,
+        progress_seq = GREATEST(capture_task_attempts.progress_seq, EXCLUDED.progress_seq),
+        heartbeat_at = COALESCE(EXCLUDED.heartbeat_at, capture_task_attempts.heartbeat_at),
+        business_progress_at = COALESCE(EXCLUDED.business_progress_at, capture_task_attempts.business_progress_at),
+        finished_at = COALESCE(EXCLUDED.finished_at, capture_task_attempts.finished_at),
+        progress = EXCLUDED.progress,
+        checkpoint = EXCLUDED.checkpoint,
+        error = EXCLUDED.error,
+        updated_at = now()
+      WHERE capture_task_attempts.client_attempt_id = ''
+        OR EXCLUDED.client_attempt_id = ''
+        OR capture_task_attempts.client_attempt_id = EXCLUDED.client_attempt_id
+      RETURNING id
+    `, [
+      agent.tenant_id,
+      task.id,
+      agent.id,
+      snapshot.attemptId,
+      snapshot.attemptNumber,
+      normalizedAttemptStatus,
+      snapshot.progressSeq,
+      snapshot.heartbeatAt,
+      snapshot.businessProgressAt,
+      snapshot.startedAt,
+      snapshot.finishedAt,
+      JSON.stringify(snapshot.progress),
+      JSON.stringify(snapshot.checkpoint),
+      JSON.stringify(snapshot.error),
+    ]);
+  }
+
+  if (snapshotAccepted) {
+    await tx.execute(`
+      INSERT INTO capture_task_snapshots (
+        tenant_id, task_id, attempt_id, agent_id,
+        client_task_id, control_task_id, client_attempt_id,
+        attempt_number, progress_seq, task_type, feature_key, title,
+        platform, source, trigger_type, status,
+        progress, checkpoint, counts, metadata, error, message,
+        heartbeat_at, business_progress_at, started_at, finished_at,
+        source_created_at, source_updated_at, snapshot_fingerprint
+      ) VALUES (
+        $1, $2, $3, $4,
+        $5, $6, $7,
+        $8, $9, $10, $11, $12,
+        $13, $14, $15, $16,
+        $17::jsonb, $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb, $22,
+        $23, $24, $25, $26,
+        $27, $28, $29
+      )
+      ON CONFLICT (task_id, snapshot_fingerprint) DO NOTHING
+    `, [
+      agent.tenant_id,
+      task.id,
+      attempt?.id || null,
+      agent.id,
+      snapshot.clientTaskId,
+      snapshot.controlTaskId,
+      snapshot.attemptId,
+      snapshot.attemptNumber,
+      snapshot.progressSeq,
+      snapshot.taskType,
+      snapshot.featureKey,
+      snapshot.title,
+      snapshot.platform,
+      snapshot.source,
+      snapshot.triggerType,
+      snapshot.status,
+      JSON.stringify(snapshot.progress),
+      JSON.stringify(snapshot.checkpoint),
+      JSON.stringify(snapshot.counts),
+      JSON.stringify(snapshot.metadata),
+      JSON.stringify(snapshot.error),
+      snapshot.message,
+      snapshot.heartbeatAt,
+      snapshot.businessProgressAt,
+      snapshot.startedAt,
+      snapshot.finishedAt,
+      snapshot.createdAt,
+      task.source_updated_at,
+      captureTaskSnapshotFingerprint(snapshot),
+    ]);
+  }
+
+  if (!previous || previous.status !== task.status || previous.attempt_number !== task.attempt_number) {
+    await appendEvent(tx, {
+      tenantId: agent.tenant_id,
+      taskId: task.id,
+      attemptId: attempt?.id || null,
+      agentId: agent.id,
+      eventType: previous ? 'task_status_changed' : 'task_discovered',
+      actorType: 'capture_agent',
+      actorId: agent.id,
+      actorName: agent.display_name || agent.client_label,
+      status: task.status,
+      message: snapshot.message,
+      payload: {
+        clientTaskId: snapshot.clientTaskId,
+        previousStatus: previous?.status || '',
+        attemptNumber: snapshot.attemptNumber,
+      },
+    });
+  }
+
+  await resolveResumeCommandFromSuccessor(tx, agent, snapshot);
+  await resolveCreateCommandFromSnapshot(tx, agent, task, snapshot, createCommandEvidence);
+
+  return task;
+}
+
+router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
+  try {
+    const agent = req.captureAgent;
+    const clientUuid = text(req.body?.agent?.clientUuid, 240);
+    if (clientUuid && clientUuid !== agent.client_uuid) {
+      return res.status(409).json({ ok: false, error: 'agent_identity_mismatch', message: '采集节点身份不匹配，请重新验证扩展' });
+    }
+
+    const rawTasks = Array.isArray(req.body?.tasks)
+      ? req.body.tasks.slice(0, MAX_HEARTBEAT_TASKS)
+      : [];
+    const snapshots = rawTasks.map(normalizeCloudTaskSnapshot).filter(Boolean);
+    const hasUnattendedPlan = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      'unattendedPlan',
+    );
+    const rawUnattendedPlan = safeJson(req.body?.unattendedPlan);
+    const unattendedPlan = req.body?.unattendedPlan == null ||
+      Object.keys(rawUnattendedPlan).length === 0
+      ? {}
+      : normalizeRemoteTaskInput({planSnapshot: rawUnattendedPlan}).planSnapshot;
+    const heartbeatCapabilities = sanitizeCloudStructuredObject(
+      req.body?.agent?.capabilities,
+    );
+    if (Object.prototype.hasOwnProperty.call(heartbeatCapabilities, 'supportedPlatforms')) {
+      heartbeatCapabilities.supportedPlatforms = normalizeCaptureAgentPlatforms(
+        heartbeatCapabilities.supportedPlatforms,
+      );
+    }
+    const result = await withTransaction(async tx => {
+      await tx.execute(`
+        UPDATE capture_agents
+        SET client_label = COALESCE(NULLIF($1, ''), client_label),
+          app_version = COALESCE(NULLIF($2, ''), app_version),
+          capabilities = $3::jsonb,
+          last_heartbeat_at = now(),
+          last_error = $4,
+          unattended_plan = CASE
+            WHEN $5::boolean THEN $6::jsonb
+            ELSE unattended_plan
+          END,
+          unattended_plan_updated_at = CASE
+            WHEN $5::boolean THEN now()
+            ELSE unattended_plan_updated_at
+          END,
+          updated_at = now()
+        WHERE id = $7 AND tenant_id = $8
+      `, [
+        text(req.body?.agent?.clientLabel, 240),
+        text(req.body?.agent?.appVersion, 80),
+        JSON.stringify(heartbeatCapabilities),
+        sanitizeCloudText(req.body?.agent?.lastError, 1000),
+        hasUnattendedPlan,
+        JSON.stringify(unattendedPlan),
+        agent.id,
+        agent.tenant_id,
+      ]);
+
+      await expireStaleCommands(tx, agent.tenant_id, null, agent.id);
+
+      const mirroredTasks = [];
+      for (const snapshot of snapshots) {
+        mirroredTasks.push(await mirrorTaskSnapshot(tx, agent, snapshot));
+      }
+
+      const commands = await tx.queryAll(`
+        SELECT c.id, c.command_type, c.payload, c.status, c.created_at,
+          t.id AS task_id, t.client_task_id, t.control_task_id,
+          t.task_type, t.platform, t.title, t.status AS task_status
+        FROM capture_agent_commands c
+        JOIN capture_tasks t ON t.id = c.task_id AND t.tenant_id = c.tenant_id
+        WHERE c.agent_id = $1
+          AND c.tenant_id = $2
+          AND c.status IN ('pending', 'acknowledged')
+          AND c.expires_at > now()
+          AND c.payload->>'authCodeId' = $3
+          AND c.payload->>'authBindingId' = $4
+          AND c.payload->>'platform' = t.platform
+          AND (
+            cardinality($5::text[]) = 0
+            OR t.platform = ANY($5::text[])
+          )
+          AND (
+            c.command_type <> 'create'
+            OR cardinality($6::text[]) = 0
+            OR t.platform = ANY($6::text[])
+          )
+          AND (
+            c.command_type <> 'resume'
+            OR (
+              t.status = 'resume_requested'
+              AND t.metadata->>'resumeCommandId' = c.id::text
+            )
+          )
+          AND (
+            c.command_type <> 'create'
+            OR (
+              t.status IN ('pending', 'claimed')
+              AND t.metadata->>'createCommandId' = c.id::text
+            )
+          )
+          AND (
+            c.command_type <> 'stop'
+            OR (
+              t.status NOT IN (
+                'completed', 'completed_with_warnings', 'canceled',
+                'skipped', 'superseded'
+              )
+              AND t.metadata->>'stopCommandId' = c.id::text
+            )
+          )
+        -- Stop always wins: a queued create/resume must never make the browser
+        -- continue work after an operator has requested cancellation.
+        ORDER BY CASE
+          WHEN c.command_type = 'stop' THEN 0
+          WHEN c.command_type = 'resume' THEN 1
+          -- Saving a plan does not need the capture execution slot. Prioritize
+          -- it over ordinary creates so a busy queue cannot starve a newer
+          -- unattended-plan configuration behind ten deferred capture jobs.
+          WHEN c.command_type = 'create'
+            AND c.payload->>'executionMode' = 'unattended_plan' THEN 2
+          ELSE 3
+        END, c.created_at ASC, c.id ASC
+        LIMIT 10
+      `, [
+        agent.id,
+        agent.tenant_id,
+        agent.auth_code_id,
+        agent.auth_binding_id,
+        Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [],
+        normalizeCaptureAgentPlatforms(heartbeatCapabilities.supportedPlatforms),
+      ]);
+
+      if (commands.length > 0) {
+        await tx.execute(`
+          UPDATE capture_agent_commands
+          SET status = 'acknowledged', acknowledged_at = COALESCE(acknowledged_at, now()), updated_at = now()
+          WHERE id = ANY($1::uuid[]) AND status = 'pending'
+        `, [commands.map(command => command.id)]);
+
+        const newlyAcknowledgedCreates = commands.filter(command =>
+          command.command_type === 'create' && command.status === 'pending',
+        );
+        for (const command of newlyAcknowledgedCreates) {
+          await appendEvent(tx, {
+            tenantId: agent.tenant_id,
+            taskId: command.task_id,
+            agentId: agent.id,
+            eventType: 'create_command_acknowledged',
+            actorType: 'capture_agent',
+            actorId: agent.id,
+            actorName: agent.display_name || agent.client_label,
+            status: command.task_status,
+            message: '设备已收到创建指令，等待本地空闲后执行',
+            payload: {commandId: command.id, commandType: command.command_type},
+          });
+        }
+      }
+
+      return { mirroredTasks, commands };
+    });
+
+    return res.json({
+      ok: true,
+      agent: {
+        id: agent.id,
+        heartbeatAt: new Date().toISOString(),
+      },
+      tasksAccepted: result.mirroredTasks.length,
+      commands: result.commands,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res, next) => {
+  try {
+    const reportedSuccess = req.body?.success === true;
+    const resultPayload = sanitizeCloudStructuredObject(req.body?.result);
+    const commandResult = await withTransaction(async tx => {
+      const commandRef = await tx.queryOne(`
+        SELECT task_id
+        FROM capture_agent_commands
+        WHERE id = $1 AND tenant_id = $2 AND agent_id = $3
+      `, [req.params.id, req.tenantId, req.captureAgent.id]);
+      if (!commandRef) return {notFound: true};
+
+      // Match heartbeat and expiry ordering: task first, then its command.
+      const lockedTask = await tx.queryOne(`
+        SELECT id, status, error, metadata
+        FROM capture_tasks
+        WHERE id = $1 AND tenant_id = $2
+        FOR UPDATE
+      `, [commandRef.task_id, req.tenantId]);
+      const command = await tx.queryOne(`
+        SELECT * FROM capture_agent_commands
+        WHERE id = $1 AND tenant_id = $2 AND agent_id = $3
+        FOR UPDATE
+      `, [req.params.id, req.tenantId, req.captureAgent.id]);
+      if (!command) return {notFound: true};
+
+      let success = reportedSuccess;
+      let stopOutcome = null;
+      const createExecutionMode = command.payload?.executionMode === 'unattended_plan'
+        ? 'unattended_plan'
+        : 'one_time';
+      let expectedCreateRequestId = '';
+      let allowLateCreateSuccess = false;
+      if (command.command_type === 'create' && success) {
+        expectedCreateRequestId = text(command.payload?.clientTaskId, 240);
+        const actualRequestId = text(resultPayload.requestId, 240);
+        if (!expectedCreateRequestId || actualRequestId !== expectedCreateRequestId) {
+          return {
+            invalidCreateResult: true,
+            expectedRequestId: expectedCreateRequestId,
+            actualRequestId,
+          };
+        }
+        // A command can cross expires_at after the device has already received
+        // and created it. Exact request identity plus acknowledged_at is durable
+        // proof, so accept that late success instead of manufacturing a failure.
+        const createStopReason = text(command.result?.reason, 120);
+        const stoppedByOperator = [
+          'superseded_by_stop',
+          'stopped_before_dispatch',
+          'superseded_by_newer_plan',
+        ].includes(createStopReason) || Boolean(lockedTask?.metadata?.stopCommandId);
+        allowLateCreateSuccess = Boolean(command.acknowledged_at) && !stoppedByOperator;
+      }
+      if (command.command_type === 'stop') {
+        stopOutcome = resolveStopCommandOutcome({
+          reportedSuccess,
+          expectedRequestId: command.payload?.controlTaskId,
+          actualRequestId: resultPayload.requestId,
+          resultReason: resultPayload.reason,
+          supersededCreateCommandId:
+            command.payload?.supersededCreateCommandId,
+          previousStatus: command.payload?.previousStatus,
+        });
+        if (!stopOutcome.validRequestId) {
+          return {
+            invalidStopResult: true,
+            expectedRequestId: text(command.payload?.controlTaskId, 240),
+            actualRequestId: text(resultPayload.requestId, 240),
+          };
+        }
+        success = stopOutcome.success;
+      }
+      const desiredCommandStatus = success ? 'completed' : 'failed';
+      if (command.status === 'completed' || command.status === 'failed') {
+        return {
+          command,
+          idempotent: command.status === desiredCommandStatus,
+          conflict: command.status !== desiredCommandStatus,
+        };
+      }
+      if (command.status === 'expired' && !allowLateCreateSuccess) {
+        return {command, expired: true};
+      }
+      const expiredByTime = command.expires_at &&
+        new Date(command.expires_at).getTime() <= Date.now();
+      if (expiredByTime && !allowLateCreateSuccess) {
+        await expireStaleCommands(tx, req.tenantId, command.task_id);
+        return {command, expired: true};
+      }
+      await tx.execute(`
+        UPDATE capture_agent_commands
+        SET status = $1, result = $2::jsonb,
+          finished_at = now(), updated_at = now()
+        WHERE id = $3 AND status IN ('pending', 'acknowledged', 'expired')
+      `, [desiredCommandStatus, JSON.stringify(resultPayload), command.id]);
+
+      let nextStatus = 'needs_action';
+      let eventMessage = '';
+      let updatedTask = null;
+      if (command.command_type === 'create') {
+        const expectedRequestId = expectedCreateRequestId ||
+          text(command.payload?.clientTaskId, 240);
+        nextStatus = success
+          ? createExecutionMode === 'unattended_plan' ? 'completed' : 'claimed'
+          : 'needs_action';
+        eventMessage = success
+          ? createExecutionMode === 'unattended_plan'
+            ? '设备已保存并启用无人值守计划'
+            : '设备已创建本地任务，等待开始执行'
+          : text(resultPayload.message || '设备未能创建云端下发任务', 2000);
+        updatedTask = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET status = $1,
+            control_task_id = CASE
+              WHEN $2 AND $11 = 'one_time' THEN $3
+              ELSE control_task_id
+            END,
+            message = $4,
+            error = CASE WHEN $2 THEN '{}'::jsonb ELSE $5::jsonb END,
+            progress = CASE
+              WHEN $2 AND $11 = 'unattended_plan'
+                THEN jsonb_build_object('current', 1, 'total', 1, 'phase', 'saved')
+              ELSE progress
+            END,
+            counts = CASE
+              WHEN $2 AND $11 = 'unattended_plan'
+                THEN jsonb_build_object(
+                  'total', 1, 'processed', 1, 'success', 1,
+                  'failed', 0, 'skipped', 0
+                )
+              ELSE counts
+            END,
+            finished_at = CASE
+              WHEN NOT $2 OR $11 = 'unattended_plan' THEN now()
+              ELSE NULL
+            END,
+            metadata = metadata || $6::jsonb,
+            updated_at = now()
+          WHERE id = $7 AND tenant_id = $8 AND assigned_agent_id = $9
+            AND (
+              status IN ('pending', 'claimed')
+              OR (
+                $2::boolean
+                AND status = 'failed'
+                AND error->>'code' = 'create_command_expired'
+              )
+            )
+            AND metadata->>'createCommandId' = $10
+          RETURNING id, status
+        `, [
+          nextStatus,
+          success,
+          expectedRequestId,
+          eventMessage,
+          JSON.stringify(success ? {} : {
+            code: text(resultPayload.reason || 'create_command_failed', 120),
+            message: eventMessage,
+          }),
+          JSON.stringify(success ? {
+            createCompletedAt: new Date().toISOString(),
+            executionMode: createExecutionMode,
+            ...(createExecutionMode === 'unattended_plan'
+              ? {planAppliedAt: new Date().toISOString()}
+              : {localRequestId: expectedRequestId}),
+          } : {
+            createFailedAt: new Date().toISOString(),
+            executionMode: createExecutionMode,
+          }),
+          command.task_id,
+          req.tenantId,
+          req.captureAgent.id,
+          command.id,
+          createExecutionMode,
+        ]);
+      } else if (command.command_type === 'resume') {
+        // A manual continuation creates a new local root request. The interrupted
+        // cloud mirror is therefore superseded instead of pretending that the old
+        // execution attempt itself became running again.
+        nextStatus = success ? 'superseded' : 'needs_action';
+        eventMessage = success
+          ? '设备已创建新的恢复任务'
+          : text(
+            resultPayload.message || '设备未能执行远程继续',
+            2000,
+          );
+        updatedTask = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET status = $1,
+            message = $2,
+            metadata = (metadata - 'resumeCommandId' - 'resumePreviousStatus') || $3::jsonb,
+            updated_at = now()
+          WHERE id = $4 AND tenant_id = $5
+            AND status = 'resume_requested'
+            AND metadata->>'resumeCommandId' = $6
+          RETURNING id, status
+        `, [
+          nextStatus,
+          eventMessage,
+          JSON.stringify(success ? {
+            recoveryTaskId: text(resultPayload.requestId, 240),
+            recoveryCommandId: command.id,
+          } : {}),
+          command.task_id,
+          req.tenantId,
+          command.id,
+        ]);
+      } else if (command.command_type === 'stop') {
+        nextStatus = stopOutcome?.taskStatus || (
+          success ? 'canceled' : stopFailureStatus(command.payload?.previousStatus)
+        );
+        eventMessage = success
+          ? stopOutcome?.stoppedBeforeLocalCreation
+            ? '创建指令已被停止取代，设备没有需要继续停止的本地任务'
+            : '设备已停止任务'
+          : text(resultPayload.message || '设备未能停止任务', 2000);
+        updatedTask = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET status = $1,
+            message = $2,
+            metadata = metadata
+              - 'stopCommandId' - 'stopPreviousStatus'
+              - 'resumeCommandId' - 'resumePreviousStatus',
+            finished_at = CASE WHEN $3 THEN now() ELSE finished_at END,
+            updated_at = now()
+          WHERE id = $4 AND tenant_id = $5
+            AND metadata->>'stopCommandId' = $6
+          RETURNING id, status
+        `, [
+          nextStatus,
+          eventMessage,
+          success,
+          command.task_id,
+          req.tenantId,
+          command.id,
+        ]);
+      }
+      const currentTask = updatedTask || lockedTask;
+      await appendEvent(tx, {
+        tenantId: req.tenantId,
+        taskId: command.task_id,
+        agentId: req.captureAgent.id,
+        eventType: updatedTask
+          ? success ? 'command_completed' : 'command_failed'
+          : 'command_result_ignored',
+        actorType: 'capture_agent',
+        actorId: req.captureAgent.id,
+        actorName: req.captureAgent.display_name || req.captureAgent.client_label,
+        status: currentTask?.status || nextStatus,
+        message: updatedTask
+          ? eventMessage
+          : '任务状态已变化，迟到的指令回执未覆盖当前状态',
+        payload: {
+          commandId: command.id,
+          commandType: command.command_type,
+          recoveryTaskId: text(resultPayload.requestId, 240),
+          requestId: text(resultPayload.requestId, 240),
+        },
+      });
+      return {command: {...command, status: desiredCommandStatus}, taskUpdated: Boolean(updatedTask)};
+    });
+
+    if (commandResult.notFound) {
+      return res.status(404).json({ ok: false, error: 'command_not_found', message: '远程指令不存在或已完成' });
+    }
+    if (commandResult.expired) {
+      return res.status(409).json({ ok: false, error: 'command_expired', message: '远程指令已过期' });
+    }
+    if (commandResult.conflict) {
+      return res.status(409).json({ ok: false, error: 'command_result_conflict', message: '远程指令已提交相反结果' });
+    }
+    if (commandResult.invalidCreateResult) {
+      return res.status(409).json({
+        ok: false,
+        error: 'create_request_id_mismatch',
+        message: '设备创建的本地任务 ID 与云端指令不一致',
+        expectedRequestId: commandResult.expectedRequestId,
+      });
+    }
+    if (commandResult.invalidStopResult) {
+      return res.status(409).json({
+        ok: false,
+        error: 'stop_request_id_mismatch',
+        message: '设备停止的本地任务 ID 与云端指令不一致',
+        expectedRequestId: commandResult.expectedRequestId,
+      });
+    }
+    return res.json({
+      ok: true,
+      commandId: commandResult.command.id,
+      idempotent: commandResult.idempotent === true,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    const limit = Math.min(200, Math.max(10, Number(req.query.limit) || 100));
+    await withTransaction(async tx => expireStaleCommands(tx, req.tenantId));
+    const [agents, tasks, taskSummary] = await Promise.all([
+      queryAll(`
+        SELECT ca.id, ca.client_uuid, ca.client_label, ca.display_name,
+          ca.host_label, ca.browser_name, ca.operating_system, ca.app_version,
+          ca.allowed_platforms, ca.capabilities, ca.unattended_plan,
+          ca.unattended_plan_updated_at, ca.status,
+          ca.last_heartbeat_at, ca.last_error, ca.created_at, ca.updated_at,
+          (
+            ca.status = 'active'
+            AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+          ) AS online
+        FROM capture_agents ca
+        WHERE ca.tenant_id = $1 AND ca.status <> 'revoked'
+        ORDER BY ca.host_label, ca.display_name, ca.created_at
+      `, [req.tenantId]),
+      queryAll(`
+        SELECT t.*,
+          ca.display_name AS agent_display_name,
+          ca.host_label AS agent_host_label,
+          ca.browser_name AS agent_browser_name,
+          ca.operating_system AS agent_operating_system,
+          ca.allowed_platforms AS agent_allowed_platforms,
+          ca.capabilities AS agent_capabilities,
+          ca.last_heartbeat_at AS agent_last_heartbeat_at,
+          (
+            ca.status = 'active'
+            AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+          ) AS agent_online,
+          ca.status AS agent_status,
+          CASE
+            WHEN ca.id IS NULL THEN '原执行节点不存在'
+            WHEN tenant.status <> 'active' THEN '当前租户已暂停'
+            WHEN ca.status <> 'active' THEN '原执行节点已暂停或撤销'
+            WHEN ac.id IS NULL OR ac.status <> 'active'
+              OR (ac.expires_at IS NOT NULL AND ac.expires_at < now())
+              THEN '节点授权已失效，请重新验证激活码'
+            WHEN ab.id IS NULL THEN '节点环境绑定已失效，请重新验证激活码'
+            WHEN cardinality(ca.allowed_platforms) > 0
+              AND NOT (t.platform = ANY(ca.allowed_platforms))
+              THEN '原执行节点未配置负责该平台'
+            ELSE ''
+          END AS resume_block_reason,
+          command.id AS pending_command_id,
+          command.command_type AS pending_command_type,
+          command.status AS pending_command_status,
+          command.created_at AS pending_command_created_at,
+          command.expires_at AS pending_command_expires_at
+        FROM capture_tasks t
+        LEFT JOIN capture_agents ca
+          ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
+          AND ca.tenant_id = t.tenant_id
+        LEFT JOIN tenants tenant ON tenant.id = t.tenant_id
+        LEFT JOIN auth_codes ac
+          ON ac.id = ca.auth_code_id AND ac.tenant_id = t.tenant_id
+        LEFT JOIN auth_bindings ab
+          ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        LEFT JOIN LATERAL (
+          SELECT c.id, c.command_type, c.status, c.created_at, c.expires_at
+          FROM capture_agent_commands c
+          WHERE c.task_id = t.id
+            AND c.tenant_id = t.tenant_id
+            AND c.status IN ('pending', 'acknowledged')
+            AND c.expires_at > now()
+          ORDER BY CASE c.command_type
+            WHEN 'stop' THEN 0
+            WHEN 'resume' THEN 1
+            ELSE 2
+          END, c.created_at DESC
+          LIMIT 1
+        ) command ON true
+        WHERE t.tenant_id = $1
+        ORDER BY
+          CASE WHEN t.status IN ('running', 'recovering', 'resume_requested', 'needs_action', 'interrupted') THEN 0 ELSE 1 END,
+          t.updated_at DESC
+        LIMIT $2
+      `, [req.tenantId, limit]),
+      queryOne(`
+        SELECT
+          COUNT(*) FILTER (
+            WHERE t.status IN ('running', 'recovering')
+              AND ca.status = 'active'
+              AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+          ) AS running_tasks,
+          COUNT(*) FILTER (
+            WHERE t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
+          ) AS attention_tasks
+        FROM capture_tasks t
+        LEFT JOIN capture_agents ca
+          ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
+          AND ca.tenant_id = t.tenant_id
+        WHERE t.tenant_id = $1
+      `, [req.tenantId]),
+    ]);
+
+    return res.json({
+      ok: true,
+      agents,
+      tasks: tasks.map(task => ({
+        ...task,
+        effective_status:
+          isCloudTaskActive(task.status) && !task.agent_online && task.status !== 'needs_action'
+            ? 'waiting_device'
+            : task.status,
+      })),
+      summary: {
+        agents: agents.length,
+        onlineAgents: agents.filter(agent => agent.status === 'active' && captureAgentOnline(agent.last_heartbeat_at)).length,
+        runningTasks: Number(taskSummary?.running_tasks || 0),
+        attentionTasks: Number(taskSummary?.attention_tasks || 0),
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.patch('/agents/:id', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const displayName = text(req.body?.displayName, 120);
+    const hostLabel = text(req.body?.hostLabel, 120);
+    const allowedPlatforms = normalizeCaptureAgentPlatforms(req.body?.allowedPlatforms);
+    const status = ['active', 'paused', 'revoked'].includes(req.body?.status)
+      ? req.body.status
+      : null;
+    if (!displayName || !hostLabel) {
+      return res.status(400).json({ ok: false, error: 'invalid_agent_label', message: '设备名称和节点名称不能为空' });
+    }
+    const result = await withTransaction(async tx => {
+      const current = await tx.queryOne(`
+        SELECT id, status FROM capture_agents
+        WHERE id = $1 AND tenant_id = $2
+        FOR UPDATE
+      `, [req.params.id, req.tenantId]);
+      if (!current) return {notFound: true};
+      if (current.status === 'revoked' && status && status !== 'revoked') {
+        return {revokedLocked: true};
+      }
+      const agent = await tx.queryOne(`
+        UPDATE capture_agents
+        SET display_name = $1,
+          host_label = $2,
+          allowed_platforms = $3::text[],
+          status = COALESCE($4, status),
+          updated_at = now()
+        WHERE id = $5 AND tenant_id = $6
+        RETURNING id, display_name, host_label, allowed_platforms, status
+      `, [displayName, hostLabel, allowedPlatforms, status, req.params.id, req.tenantId]);
+      if (agent.status === 'revoked') {
+        await tx.execute(`
+          UPDATE capture_agent_tokens
+          SET revoked_at = COALESCE(revoked_at, now())
+          WHERE agent_id = $1
+        `, [agent.id]);
+      }
+      if (agent.status !== 'active') {
+        await expireStaleCommands(tx, req.tenantId, null, agent.id);
+      }
+      return {agent};
+    });
+    if (result.notFound) return res.status(404).json({ ok: false, error: 'agent_not_found', message: '采集节点不存在' });
+    if (result.revokedLocked) {
+      return res.status(409).json({ ok: false, error: 'agent_revoked', message: '已撤销节点不能重新激活，请重新注册浏览器节点' });
+    }
+    return res.json({ ok: true, agent: result.agent });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const result = await withTransaction(async tx => {
+      const agent = await tx.queryOne(`
+        SELECT ca.*, tenant.status AS tenant_status,
+          ac.status AS auth_code_status,
+          ac.expires_at AS auth_code_expires_at,
+          ab.id AS active_auth_binding_id
+        FROM capture_agents ca
+        JOIN tenants tenant ON tenant.id = ca.tenant_id
+        LEFT JOIN auth_codes ac
+          ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+        LEFT JOIN auth_bindings ab
+          ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        WHERE ca.id = $1 AND ca.tenant_id = $2
+        FOR UPDATE OF ca
+      `, [req.params.id, req.tenantId]);
+      if (!agent) return {error: 'agent_not_found'};
+
+      const authCodeExpired = agent.auth_code_expires_at &&
+        new Date(agent.auth_code_expires_at) < new Date();
+      if (
+        agent.tenant_status !== 'active' ||
+        agent.status !== 'active' ||
+        agent.auth_code_status !== 'active' ||
+        !agent.active_auth_binding_id ||
+        authCodeExpired
+      ) {
+        return {error: 'agent_unavailable'};
+      }
+      const capabilities = safeJson(agent.capabilities);
+      if (capabilities.remoteTaskCreate !== true) {
+        return {error: 'agent_capability_missing'};
+      }
+
+      const mirroredPlan = safeJson(agent.unattended_plan);
+      const body = safeJson(req.body);
+      const hasKeywordMaxDetectedItems = Object.prototype.hasOwnProperty.call(
+        body,
+        'keywordMaxDetectedItems',
+      );
+      const rawKeywordMaxDetectedItems = Number(body.keywordMaxDetectedItems);
+      if (
+        hasKeywordMaxDetectedItems &&
+        (
+          !Number.isSafeInteger(rawKeywordMaxDetectedItems) ||
+          rawKeywordMaxDetectedItems <= 0
+        )
+      ) {
+        return {error: 'invalid_keyword_max_detected_items'};
+      }
+      if (
+        hasKeywordMaxDetectedItems &&
+        capabilities.remoteTaskKeywordPostLimit !== true
+      ) {
+        return {error: 'agent_keyword_limit_capability_missing'};
+      }
+      if (
+        Object.keys(safeJson(body.captureSettings)).length > 0 &&
+        capabilities.remoteTaskEnhancementOptions !== true
+      ) {
+        return {error: 'agent_enhancement_capability_missing'};
+      }
+      const bodyFilters = safeJson(body.searchFilters);
+      const mirroredFilters = safeJson(mirroredPlan.searchFilters);
+      const explicitInput = normalizeRemoteTaskInput({
+        title: body.title,
+        clientTaskId: body.clientTaskId || body.requestKey,
+        executionMode: body.executionMode,
+        planSnapshot: {
+          ...body,
+          enabled: true,
+          searchFilters: {
+            ...bodyFilters,
+            ...(body.sort == null ? {} : {sort: body.sort}),
+            ...(body.publishTime == null ? {} : {publishTime: body.publishTime}),
+          },
+        },
+      });
+      const normalizedInput = normalizeRemoteTaskInput({
+        title: body.title,
+        clientTaskId: body.clientTaskId || body.requestKey,
+        executionMode: body.executionMode,
+        planSnapshot: {
+          ...mirroredPlan,
+          ...body,
+          enabled: true,
+          searchFilters: {
+            ...mirroredFilters,
+            ...bodyFilters,
+            ...(body.sort == null ? {} : {sort: body.sort}),
+            ...(body.publishTime == null ? {} : {publishTime: body.publishTime}),
+          },
+        },
+      });
+      const executionMode = normalizedInput.executionMode;
+      if (
+        executionMode === 'unattended_plan' &&
+        capabilities.remoteUnattendedPlanWrite !== true
+      ) {
+        return {error: 'agent_plan_capability_missing'};
+      }
+      const planSnapshot = normalizedInput.planSnapshot;
+      // This limit is an explicit per-task override. Legacy callers that omit
+      // it must continue using the device's current capture preference instead
+      // of inheriting a possibly stale mirrored unattended-plan value.
+      if (!hasKeywordMaxDetectedItems) {
+        delete planSnapshot.keywordMaxDetectedItems;
+      }
+      if (!['xiaohongshu', 'douyin'].includes(planSnapshot.platform)) {
+        return {error: 'unsupported_platform'};
+      }
+      if (planSnapshot.keywords.length === 0) {
+        return {error: 'keywords_required'};
+      }
+      if (
+        executionMode === 'unattended_plan' &&
+        planSnapshot.mode === 'custom_dates' &&
+        !planSnapshot.customDates
+      ) {
+        return {error: 'custom_dates_required'};
+      }
+
+      const allowedPlatforms = Array.isArray(agent.allowed_platforms)
+        ? agent.allowed_platforms
+        : [];
+      if (allowedPlatforms.length > 0 && !allowedPlatforms.includes(planSnapshot.platform)) {
+        return {error: 'agent_platform_mismatch'};
+      }
+      const supportedPlatforms = normalizeCaptureAgentPlatforms(
+        capabilities.supportedPlatforms,
+      );
+      if (
+        supportedPlatforms.length > 0 &&
+        !supportedPlatforms.includes(planSnapshot.platform)
+      ) {
+        return {error: 'agent_platform_unsupported'};
+      }
+
+      // One stable id identifies the cloud placeholder and the local request the
+      // browser must create. The first heartbeat therefore updates this row rather
+      // than inserting a visually duplicated task.
+      const title = normalizedInput.title || (
+        executionMode === 'unattended_plan'
+          ? '无人值守关键词采集计划'
+          : '一次性关键词采集'
+      );
+      if (!normalizedInput.clientTaskId) {
+        return {error: 'request_key_required'};
+      }
+      if (!UUID_PATTERN.test(normalizedInput.clientTaskId)) {
+        return {error: 'invalid_client_task_id'};
+      }
+      const clientTaskId = normalizedInput.clientTaskId.toLowerCase();
+      const taskId = clientTaskId;
+      const requestHash = remoteTaskRequestHash(
+        agent.id,
+        explicitInput.title || title,
+        explicitInput.executionMode,
+        explicitInput.planSnapshot,
+      );
+
+      // The agent row lock serializes creates for this node. A retry carrying the
+      // same clientTaskId reuses the committed task/command only when its normalized
+      // execution contract is identical; a conflicting payload is never ignored.
+      const existingTask = await tx.queryOne(`
+        SELECT t.*,
+          c.id AS create_command_id,
+          c.status AS create_command_status,
+          c.expires_at AS create_command_expires_at,
+          c.created_at AS create_command_created_at
+        FROM capture_tasks t
+        LEFT JOIN capture_agent_commands c
+          ON c.id::text = t.metadata->>'createCommandId'
+          AND c.task_id = t.id
+          AND c.tenant_id = t.tenant_id
+          AND c.agent_id = t.assigned_agent_id
+          AND c.command_type = 'create'
+        WHERE t.tenant_id = $1 AND t.origin_agent_id = $2
+          AND t.client_task_id = $3
+        FOR UPDATE OF t
+      `, [req.tenantId, agent.id, clientTaskId]);
+      if (existingTask) {
+        const existingMetadata = safeJson(existingTask.metadata);
+        if (
+          existingTask.id !== clientTaskId ||
+          existingMetadata.remoteCreated !== true ||
+          existingMetadata.remoteRequestHash !== requestHash ||
+          !existingTask.create_command_id
+        ) {
+          return {error: 'idempotency_key_conflict'};
+        }
+        return {
+          agent,
+          task: existingTask,
+          command: {
+            id: existingTask.create_command_id,
+            status: existingTask.create_command_status,
+            expires_at: existingTask.create_command_expires_at,
+            created_at: existingTask.create_command_created_at,
+          },
+          existing: true,
+          queueBlocker: safeJson(existingMetadata.queueBlocker),
+          executionMode: existingMetadata.executionMode === 'unattended_plan'
+            ? 'unattended_plan'
+            : 'one_time',
+        };
+      }
+      const idCollision = await tx.queryOne(`
+        SELECT id FROM capture_tasks WHERE id = $1::uuid
+      `, [taskId]);
+      if (idCollision) return {error: 'idempotency_key_conflict'};
+
+      const commandId = crypto.randomUUID();
+      const isPlanConfiguration = executionMode === 'unattended_plan';
+
+      // A plan configuration replaces the node's previous desired plan. Keep
+      // the audit rows, but fence every older uncompleted plan command before
+      // inserting the new one so an old acknowledged command cannot be
+      // redelivered later and overwrite the newer plan. The agent row is
+      // already locked above, serializing concurrent submissions for this node.
+      if (isPlanConfiguration) {
+        const olderPlanCommands = await tx.queryAll(`
+          SELECT t.id AS task_id, c.id AS command_id
+          FROM capture_tasks t
+          JOIN capture_agent_commands c
+            ON c.task_id = t.id AND c.tenant_id = t.tenant_id
+          WHERE t.tenant_id = $1
+            AND c.agent_id = $2
+            AND c.command_type = 'create'
+            AND c.status IN ('pending', 'acknowledged')
+            AND c.payload->>'executionMode' = 'unattended_plan'
+          ORDER BY t.id
+          FOR UPDATE OF t
+        `, [req.tenantId, agent.id]);
+        const olderCommandIds = olderPlanCommands.map(item => item.command_id);
+        if (olderCommandIds.length > 0) {
+          const supersededCommands = await tx.queryAll(`
+            UPDATE capture_agent_commands
+            SET status = 'expired',
+              result = jsonb_build_object(
+                'reason', 'superseded_by_newer_plan',
+                'supersededByTaskId', $2::text
+              ),
+              finished_at = now(), updated_at = now()
+            WHERE id = ANY($1::uuid[])
+              AND status IN ('pending', 'acknowledged')
+            RETURNING id, task_id
+          `, [olderCommandIds, taskId]);
+          const supersededCommandByTask = new Map(
+            supersededCommands.map(item => [String(item.task_id), item.id]),
+          );
+          const supersededTasks = await tx.queryAll(`
+            UPDATE capture_tasks
+            SET status = 'superseded',
+              message = '已被较新的无人值守计划修改替代',
+              error = '{}'::jsonb,
+              metadata = metadata || jsonb_build_object(
+                'supersededByTaskId', $2::text,
+                'supersededAt', now()
+              ),
+              finished_at = now(), updated_at = now()
+            WHERE id = ANY($1::uuid[])
+              AND task_type = 'unattended_plan_configuration'
+              AND status IN ('pending', 'claimed')
+            RETURNING id, status
+          `, [
+            [...supersededCommandByTask.keys()],
+            taskId,
+          ]);
+          for (const supersededTask of supersededTasks) {
+            await appendEvent(tx, {
+              tenantId: req.tenantId,
+              taskId: supersededTask.id,
+              agentId: agent.id,
+              eventType: 'plan_configuration_superseded',
+              actorType: 'user',
+              actorId: req.user?.id || '',
+              actorName: req.actorName,
+              status: 'superseded',
+              message: '较新的无人值守计划修改已替代此配置',
+              payload: {
+                commandId: supersededCommandByTask.get(
+                  String(supersededTask.id),
+                ) || '',
+                supersededByTaskId: taskId,
+              },
+            });
+          }
+        }
+      }
+
+      // A busy browser keeps create commands durably queued. Reporting the
+      // current recoverable task explains the wait without rejecting the new job.
+      // Plan configuration itself does not consume the capture slot, so it must
+      // neither inherit this blocker nor tell the operator to resolve old work.
+      const queueBlocker = isPlanConfiguration ? null : await tx.queryOne(`
+        SELECT id, title, platform, status
+        FROM capture_tasks
+        WHERE tenant_id = $1 AND assigned_agent_id = $2
+          AND control_task_id IS NOT NULL AND control_task_id <> ''
+          AND status IN (
+            'interrupted', 'needs_action', 'failed',
+            'completed_with_failures', 'resume_requested'
+          )
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `, [req.tenantId, agent.id]);
+
+      const total = isPlanConfiguration
+        ? 1
+        : planSnapshot.keywords.length * planSnapshot.maxRounds;
+      const taskType = isPlanConfiguration
+        ? 'unattended_plan_configuration'
+        : 'unattended_keyword_capture';
+      const triggerType = isPlanConfiguration
+        ? 'remote_plan_configuration'
+        : 'remote_manual';
+      const metadata = {
+        remoteCreated: true,
+        remoteRequestHash: requestHash,
+        createCommandId: commandId,
+        requestedByUserId: req.user?.id || '',
+        requestedByName: text(req.actorName, 240),
+        executionMode,
+        planSnapshot,
+        ...(queueBlocker ? {queueBlocker: {
+          id: queueBlocker.id,
+          title: queueBlocker.title,
+          platform: queueBlocker.platform,
+          status: queueBlocker.status,
+        }} : {}),
+      };
+      const queuedMessage = queueBlocker
+        ? '目标节点有待处理的旧任务，新任务已排队'
+        : isPlanConfiguration
+          ? '已创建无人值守计划，等待目标设备保存'
+          : '已创建一次性采集任务，等待目标设备领取';
+      const task = await tx.queryOne(`
+        INSERT INTO capture_tasks (
+          id, tenant_id, origin_agent_id, assigned_agent_id,
+          client_task_id, task_type, feature_key, title, platform,
+          source, trigger_type, status, progress, checkpoint, counts,
+          metadata, message, source_updated_at
+        ) VALUES (
+          $1::uuid, $2, $3, $3,
+          $1::text, $6, 'unattended_keyword_plan', $4, $5,
+          'cloud', $7, 'pending', $8::jsonb, $9::jsonb, $10::jsonb,
+          $11::jsonb, $12, now()
+        )
+        RETURNING id, client_task_id, task_type, feature_key, title, platform,
+          source, trigger_type, status, progress, counts, metadata,
+          created_at, updated_at
+      `, [
+        taskId,
+        req.tenantId,
+        agent.id,
+        title,
+        planSnapshot.platform,
+        taskType,
+        triggerType,
+        JSON.stringify({current: 0, total, phase: 'queued'}),
+        JSON.stringify({round: 1, keywordIndex: 0}),
+        JSON.stringify({total, processed: 0, success: 0, failed: 0, skipped: 0}),
+        JSON.stringify(metadata),
+        queuedMessage,
+      ]);
+      const command = await tx.queryOne(`
+        INSERT INTO capture_agent_commands (
+          id, tenant_id, agent_id, task_id, command_type, payload,
+          requested_by_user_id, requested_by_name
+        ) VALUES ($1, $2, $3, $4, 'create', $5::jsonb, $6, $7)
+        RETURNING id, status, expires_at, created_at
+      `, [
+        commandId,
+        req.tenantId,
+        agent.id,
+        task.id,
+        JSON.stringify({
+          taskId: task.id,
+          clientTaskId,
+          title,
+          executionMode,
+          platform: planSnapshot.platform,
+          planSnapshot,
+          requestHash,
+          authCodeId: agent.auth_code_id,
+          authBindingId: agent.auth_binding_id,
+        }),
+        req.user?.id || null,
+        text(req.actorName, 240),
+      ]);
+      await appendEvent(tx, {
+        tenantId: req.tenantId,
+        taskId: task.id,
+        agentId: agent.id,
+        eventType: 'remote_task_created',
+        actorType: 'user',
+        actorId: req.user?.id || '',
+        actorName: req.actorName,
+        status: task.status,
+        message: isPlanConfiguration
+          ? '后台已向指定节点下发无人值守计划'
+          : '后台已向指定节点创建一次性任务',
+        payload: {
+          commandId: command.id,
+          clientTaskId,
+          executionMode,
+          platform: planSnapshot.platform,
+          keywordCount: planSnapshot.keywords.length,
+          keywordMaxDetectedItems: planSnapshot.keywordMaxDetectedItems,
+          maxRounds: planSnapshot.maxRounds,
+          queuedBehindTaskId: queueBlocker?.id || '',
+        },
+      });
+      return {agent, task, command, existing: false, queueBlocker, executionMode};
+    });
+
+    const messages = {
+      agent_not_found: ['agent_not_found', '采集节点不存在'],
+      agent_unavailable: ['agent_unavailable', '目标节点授权已失效、已停用或不存在'],
+      agent_capability_missing: ['agent_capability_missing', '目标节点版本尚不支持云端创建任务，请先更新扩展'],
+      agent_plan_capability_missing: ['agent_plan_capability_missing', '目标节点版本尚不支持云端保存无人值守计划，请先更新扩展'],
+      agent_enhancement_capability_missing: ['agent_enhancement_capability_missing', '目标节点版本尚不支持远程任务增强选项，请先更新扩展'],
+      agent_keyword_limit_capability_missing: ['agent_keyword_limit_capability_missing', '目标节点版本尚不支持为远程任务指定帖子采集数量，请先更新扩展'],
+      invalid_keyword_max_detected_items: ['invalid_keyword_max_detected_items', '每个关键词采集帖子数必须是大于 0 的整数'],
+      custom_dates_required: ['custom_dates_required', '指定日期计划至少需要一个有效日期'],
+      request_key_required: ['request_key_required', '缺少任务请求标识，请刷新页面后重试'],
+      invalid_client_task_id: ['invalid_client_task_id', 'clientTaskId 必须是有效 UUID'],
+      idempotency_key_conflict: ['idempotency_key_conflict', '该 clientTaskId 已用于不同的任务请求，请重新生成'],
+      unsupported_platform: ['unsupported_platform', '云端创建任务当前只支持小红书和抖音'],
+      keywords_required: ['keywords_required', '请至少填写一个关键词'],
+      agent_platform_mismatch: ['agent_platform_mismatch', '目标节点未配置负责该任务平台'],
+      agent_platform_unsupported: ['agent_platform_unsupported', '目标节点当前版本不支持该任务平台'],
+    };
+    if (result.error) {
+      const [error, message] = messages[result.error];
+      const status = result.error === 'agent_not_found'
+        ? 404
+        : [
+            'unsupported_platform',
+            'keywords_required',
+            'request_key_required',
+            'invalid_client_task_id',
+            'invalid_keyword_max_detected_items',
+            'custom_dates_required',
+          ].includes(result.error) ? 400 : 409;
+      return res.status(status).json({ok: false, error, message});
+    }
+    const online = captureAgentOnline(result.agent.last_heartbeat_at);
+    const responseStatus = result.existing
+      ? result.task.status === 'pending' && !online ? 'waiting_device' : result.task.status
+      : online ? 'pending' : 'waiting_device';
+    return res.status(result.existing ? 200 : 201).json({
+      ok: true,
+      task: result.task,
+      commandId: result.command.id,
+      commandExpiresAt: result.command.expires_at,
+      existing: result.existing === true,
+      queuedBehindRecoverableTask: Boolean(
+        result.queueBlocker?.id && result.task.status === 'pending',
+      ),
+      agentOnline: online,
+      status: responseStatus,
+      message: result.existing
+        ? '相同请求已存在，已返回原任务状态'
+        : result.queueBlocker?.id
+          ? '任务已排队；请先继续或处理该节点的旧任务，设备空闲后会自动执行'
+          : result.executionMode === 'unattended_plan' && online
+            ? '无人值守计划已下发，在线设备将在下一次心跳保存并启用'
+            : result.executionMode === 'unattended_plan'
+              ? '无人值守计划已排队，设备上线后自动保存并启用'
+          : online
+            ? '一次性任务已创建，在线设备将在下一次心跳领取'
+            : '一次性任务已创建，设备当前离线，上线后自动领取',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const mode = ['remaining', 'failed', 'skip_current'].includes(req.body?.mode)
+      ? req.body.mode
+      : 'remaining';
+    const result = await withTransaction(async tx => {
+      await expireStaleCommands(tx, req.tenantId, req.params.id);
+      const task = await tx.queryOne(`
+        SELECT t.*, ca.status AS agent_status, ca.last_heartbeat_at,
+          ca.display_name AS agent_display_name, ca.client_label AS agent_client_label,
+          ca.allowed_platforms AS agent_allowed_platforms,
+          ca.auth_code_id AS agent_auth_code_id,
+          ca.auth_binding_id AS agent_auth_binding_id,
+          ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
+          ab.id AS active_auth_binding_id,
+          tenant.status AS tenant_status
+        FROM capture_tasks t
+        LEFT JOIN capture_agents ca
+          ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
+          AND ca.tenant_id = t.tenant_id
+        LEFT JOIN auth_codes ac ON ac.id = ca.auth_code_id AND ac.tenant_id = t.tenant_id
+        LEFT JOIN auth_bindings ab ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        LEFT JOIN tenants tenant ON tenant.id = t.tenant_id
+        WHERE t.id = $1 AND t.tenant_id = $2
+        FOR UPDATE OF t
+      `, [req.params.id, req.tenantId]);
+      if (!task) return { error: 'task_not_found' };
+      const agentId = task.assigned_agent_id || task.origin_agent_id;
+      if (!task.control_task_id || !String(task.task_type).includes('unattended')) {
+        return { error: 'task_not_remotely_resumable', task };
+      }
+      const authCodeExpired = task.auth_code_expires_at && new Date(task.auth_code_expires_at) < new Date();
+      if (
+        !agentId ||
+        task.tenant_status !== 'active' ||
+        task.agent_status !== 'active' ||
+        task.auth_code_status !== 'active' ||
+        !task.active_auth_binding_id ||
+        authCodeExpired
+      ) {
+        return { error: 'agent_unavailable', task };
+      }
+      const allowedPlatforms = Array.isArray(task.agent_allowed_platforms)
+        ? task.agent_allowed_platforms
+        : [];
+      if (allowedPlatforms.length > 0 && !allowedPlatforms.includes(task.platform)) {
+        return { error: 'agent_platform_mismatch', task };
+      }
+      const existing = agentId ? await tx.queryOne(`
+        SELECT id, status FROM capture_agent_commands
+        WHERE task_id = $1 AND agent_id = $2 AND command_type = 'resume'
+          AND status IN ('pending', 'acknowledged') AND expires_at > now()
+          AND payload->>'authCodeId' = $3
+          AND payload->>'authBindingId' = $4
+          AND payload->>'platform' = $5
+        ORDER BY created_at DESC LIMIT 1
+      `, [
+        task.id,
+        agentId,
+        task.agent_auth_code_id,
+        task.agent_auth_binding_id,
+        task.platform,
+      ]) : null;
+      if (existing) return { task, command: existing, existing: true };
+      if (!RECOVERABLE_STATUSES.has(task.status)) {
+        return { error: 'task_not_recoverable', task };
+      }
+
+      const command = await tx.queryOne(`
+        INSERT INTO capture_agent_commands (
+          tenant_id, agent_id, task_id, command_type, payload,
+          requested_by_user_id, requested_by_name
+        ) VALUES ($1, $2, $3, 'resume', $4::jsonb, $5, $6)
+        RETURNING id, status, created_at
+      `, [
+        req.tenantId,
+        agentId,
+        task.id,
+        JSON.stringify({
+          mode,
+          controlTaskId: task.control_task_id,
+          previousStatus: task.status,
+          authCodeId: task.agent_auth_code_id,
+          authBindingId: task.agent_auth_binding_id,
+          platform: task.platform,
+        }),
+        req.user?.id || null,
+        text(req.actorName, 240),
+      ]);
+      await tx.execute(`
+        UPDATE capture_tasks
+        SET status = 'resume_requested', assigned_agent_id = $1,
+          message = '后台已请求设备继续任务',
+          metadata = metadata || $2::jsonb,
+          updated_at = now()
+        WHERE id = $3 AND tenant_id = $4
+      `, [
+        agentId,
+        JSON.stringify({resumePreviousStatus: task.status, resumeCommandId: command.id}),
+        task.id,
+        req.tenantId,
+      ]);
+      await appendEvent(tx, {
+        tenantId: req.tenantId,
+        taskId: task.id,
+        agentId,
+        eventType: 'resume_requested',
+        actorType: 'user',
+        actorId: req.user?.id || '',
+        actorName: req.actorName,
+        status: 'resume_requested',
+        message: '后台请求继续剩余任务',
+        payload: { commandId: command.id, mode },
+      });
+      return { task, command, existing: false };
+    });
+
+    const messages = {
+      task_not_found: ['task_not_found', '任务不存在'],
+      task_not_recoverable: ['task_not_recoverable', '任务当前状态不能继续'],
+      task_not_remotely_resumable: ['task_not_remotely_resumable', '该任务还不支持远程继续'],
+      agent_unavailable: ['agent_unavailable', '原执行节点授权已失效、已停用或不存在'],
+      agent_platform_mismatch: ['agent_platform_mismatch', '原执行节点未配置负责该任务平台'],
+    };
+    if (result.error) {
+      const [error, message] = messages[result.error];
+      return res.status(result.error === 'task_not_found' ? 404 : 409).json({ ok: false, error, message });
+    }
+    const online = captureAgentOnline(result.task.last_heartbeat_at);
+    return res.json({
+      ok: true,
+      commandId: result.command.id,
+      existing: result.existing,
+      agentOnline: online,
+      status: online ? 'resume_requested' : 'waiting_device',
+      message: online ? '已向在线设备发送继续指令' : '设备当前离线，指令会等待设备上线',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const result = await withTransaction(async tx => {
+      await expireStaleCommands(tx, req.tenantId, req.params.id);
+      const task = await tx.queryOne(`
+        SELECT t.*, ca.status AS agent_status, ca.last_heartbeat_at,
+          ca.allowed_platforms AS agent_allowed_platforms,
+          ca.capabilities AS agent_capabilities,
+          ca.auth_code_id AS agent_auth_code_id,
+          ca.auth_binding_id AS agent_auth_binding_id,
+          ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
+          ab.id AS active_auth_binding_id,
+          tenant.status AS tenant_status
+        FROM capture_tasks t
+        LEFT JOIN capture_agents ca
+          ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
+          AND ca.tenant_id = t.tenant_id
+        LEFT JOIN auth_codes ac
+          ON ac.id = ca.auth_code_id AND ac.tenant_id = t.tenant_id
+        LEFT JOIN auth_bindings ab
+          ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        LEFT JOIN tenants tenant ON tenant.id = t.tenant_id
+        WHERE t.id = $1 AND t.tenant_id = $2
+        FOR UPDATE OF t
+      `, [req.params.id, req.tenantId]);
+      if (!task) return {error: 'task_not_found'};
+
+      const agentId = task.assigned_agent_id || task.origin_agent_id;
+      const existing = agentId ? await tx.queryOne(`
+        SELECT id, status, expires_at
+        FROM capture_agent_commands
+        WHERE task_id = $1 AND agent_id = $2 AND command_type = 'stop'
+          AND status IN ('pending', 'acknowledged') AND expires_at > now()
+          AND payload->>'authCodeId' = $3
+          AND payload->>'authBindingId' = $4
+          AND payload->>'platform' = $5
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+      `, [
+        task.id,
+        agentId,
+        task.agent_auth_code_id,
+        task.agent_auth_binding_id,
+        task.platform,
+      ]) : null;
+      if (existing) return {task, command: existing, existing: true};
+      if (task.status === 'canceled') {
+        return {task, alreadyStopped: true};
+      }
+
+      const activeCreate = agentId ? await tx.queryOne(`
+        SELECT id, status
+        FROM capture_agent_commands
+        WHERE task_id = $1 AND agent_id = $2 AND command_type = 'create'
+          AND status IN ('pending', 'acknowledged') AND expires_at > now()
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+      `, [task.id, agentId]) : null;
+
+      // A create that has never reached the browser can be canceled immediately.
+      // This is stronger than queuing a stop behind work the device never saw.
+      if (activeCreate?.status === 'pending') {
+        await tx.execute(`
+          UPDATE capture_agent_commands
+          SET status = 'expired',
+            result = jsonb_build_object('reason', 'stopped_before_dispatch'),
+            finished_at = now(), updated_at = now()
+          WHERE id = $1 AND status = 'pending'
+        `, [activeCreate.id]);
+        const canceledTask = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET status = 'canceled',
+            message = '任务已在设备领取前取消',
+            metadata = (metadata
+              - 'resumeCommandId' - 'resumePreviousStatus'
+              - 'stopCommandId' - 'stopPreviousStatus')
+              || jsonb_build_object('stoppedBeforeDispatch', true),
+            finished_at = now(), updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+          RETURNING id, status
+        `, [task.id, req.tenantId]);
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: task.id,
+          agentId,
+          eventType: 'task_stopped_before_dispatch',
+          actorType: 'user',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: 'canceled',
+          message: '后台已在设备领取前取消任务',
+          payload: {createCommandId: activeCreate.id},
+        });
+        return {task: canceledTask || task, immediate: true};
+      }
+
+      const metadata = safeJson(task.metadata);
+      const controlTaskId = text(task.control_task_id || task.client_task_id, 240);
+      const remotelyControlled = String(task.task_type || '').includes('unattended') ||
+        metadata.remoteCreated === true;
+      if (!controlTaskId || !remotelyControlled) {
+        return {error: 'task_not_remotely_stoppable', task};
+      }
+      if (STOP_FINAL_STATUSES.has(task.status) || !REMOTELY_STOPPABLE_STATUSES.has(task.status)) {
+        return {error: 'task_not_stoppable', task};
+      }
+      if (safeJson(task.agent_capabilities).remoteStop !== true) {
+        return {error: 'agent_stop_capability_missing', task};
+      }
+
+      const authCodeExpired = task.auth_code_expires_at &&
+        new Date(task.auth_code_expires_at) < new Date();
+      if (
+        !agentId ||
+        task.tenant_status !== 'active' ||
+        task.agent_status !== 'active' ||
+        task.auth_code_status !== 'active' ||
+        !task.active_auth_binding_id ||
+        authCodeExpired
+      ) {
+        return {error: 'agent_unavailable', task};
+      }
+      const allowedPlatforms = Array.isArray(task.agent_allowed_platforms)
+        ? task.agent_allowed_platforms
+        : [];
+      if (allowedPlatforms.length > 0 && !allowedPlatforms.includes(task.platform)) {
+        return {error: 'agent_platform_mismatch', task};
+      }
+
+      const previousStatus = task.status === 'resume_requested'
+        ? text(metadata.resumePreviousStatus, 80) || 'needs_action'
+        : task.status;
+      // Invalidate continuation and already-acknowledged create commands before
+      // inserting stop. Only the stop command remains eligible for heartbeat.
+      await tx.execute(`
+        UPDATE capture_agent_commands
+        SET status = 'expired',
+          result = jsonb_build_object('reason', 'superseded_by_stop'),
+          finished_at = now(), updated_at = now()
+        WHERE task_id = $1 AND agent_id = $2
+          AND command_type IN ('resume', 'create')
+          AND status IN ('pending', 'acknowledged')
+      `, [task.id, agentId]);
+
+      const command = await tx.queryOne(`
+        INSERT INTO capture_agent_commands (
+          tenant_id, agent_id, task_id, command_type, payload,
+          requested_by_user_id, requested_by_name
+        ) VALUES ($1, $2, $3, 'stop', $4::jsonb, $5, $6)
+        RETURNING id, status, expires_at, created_at
+      `, [
+        req.tenantId,
+        agentId,
+        task.id,
+        JSON.stringify({
+          controlTaskId,
+          previousStatus,
+          ...(activeCreate?.status === 'acknowledged'
+            ? {supersededCreateCommandId: activeCreate.id}
+            : {}),
+          authCodeId: task.agent_auth_code_id,
+          authBindingId: task.agent_auth_binding_id,
+          platform: task.platform,
+        }),
+        req.user?.id || null,
+        text(req.actorName, 240),
+      ]);
+      await tx.execute(`
+        UPDATE capture_tasks
+        SET assigned_agent_id = $1,
+          message = '后台已请求设备停止任务',
+          metadata = (metadata
+            - 'resumeCommandId' - 'resumePreviousStatus'
+            - 'stopCommandId' - 'stopPreviousStatus') || $2::jsonb,
+          updated_at = now()
+        WHERE id = $3 AND tenant_id = $4
+      `, [
+        agentId,
+        JSON.stringify({stopCommandId: command.id, stopPreviousStatus: previousStatus}),
+        task.id,
+        req.tenantId,
+      ]);
+      await appendEvent(tx, {
+        tenantId: req.tenantId,
+        taskId: task.id,
+        agentId,
+        eventType: 'stop_requested',
+        actorType: 'user',
+        actorId: req.user?.id || '',
+        actorName: req.actorName,
+        status: task.status,
+        message: '后台请求停止当前任务',
+        payload: {commandId: command.id, controlTaskId},
+      });
+      return {task, command, existing: false};
+    });
+
+    const messages = {
+      task_not_found: ['task_not_found', '任务不存在'],
+      task_not_stoppable: ['task_not_stoppable', '任务当前状态不能停止'],
+      task_not_remotely_stoppable: ['task_not_remotely_stoppable', '该任务还不支持远程停止'],
+      agent_stop_capability_missing: ['agent_stop_capability_missing', '原执行节点版本尚不支持远程停止，请先更新扩展'],
+      agent_unavailable: ['agent_unavailable', '原执行节点授权已失效、已停用或不存在'],
+      agent_platform_mismatch: ['agent_platform_mismatch', '原执行节点未配置负责该任务平台'],
+    };
+    if (result.error) {
+      const [error, message] = messages[result.error];
+      return res.status(result.error === 'task_not_found' ? 404 : 409).json({ok: false, error, message});
+    }
+    if (result.alreadyStopped) {
+      return res.json({
+        ok: true,
+        existing: true,
+        status: 'canceled',
+        message: '任务已经停止',
+      });
+    }
+    if (result.immediate) {
+      return res.json({
+        ok: true,
+        existing: false,
+        status: 'canceled',
+        message: '任务已在设备领取前取消',
+      });
+    }
+    const online = captureAgentOnline(result.task.last_heartbeat_at);
+    return res.json({
+      ok: true,
+      commandId: result.command.id,
+      commandExpiresAt: result.command.expires_at,
+      existing: result.existing === true,
+      agentOnline: online,
+      status: online ? 'stop_requested' : 'waiting_device',
+      message: online
+        ? '已向在线设备发送停止指令'
+        : '设备当前离线，停止指令会排队等待设备上线',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/tasks/:id/snapshots', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(500, Math.max(1, Math.floor(requestedLimit)))
+      : 100;
+    const task = await queryOne(
+      'SELECT id FROM capture_tasks WHERE id = $1 AND tenant_id = $2',
+      [req.params.id, req.tenantId],
+    );
+    if (!task) {
+      return res.status(404).json({
+        ok: false,
+        error: 'task_not_found',
+        message: '任务不存在',
+      });
+    }
+    const snapshots = await queryAll(`
+      SELECT id, attempt_id, agent_id,
+        client_task_id, control_task_id, client_attempt_id,
+        attempt_number, progress_seq, task_type, feature_key, title,
+        platform, source, trigger_type, status,
+        progress, checkpoint, counts, metadata, error, message,
+        heartbeat_at, business_progress_at, started_at, finished_at,
+        source_created_at, source_updated_at, received_at
+      FROM capture_task_snapshots
+      WHERE task_id = $1 AND tenant_id = $2
+      ORDER BY source_updated_at DESC, id DESC
+      LIMIT $3
+    `, [task.id, req.tenantId, limit]);
+    return res.json({ok: true, snapshots});
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/tasks/:id/events', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    const task = await queryOne('SELECT id FROM capture_tasks WHERE id = $1 AND tenant_id = $2', [req.params.id, req.tenantId]);
+    if (!task) return res.status(404).json({ ok: false, error: 'task_not_found', message: '任务不存在' });
+    const events = await queryAll(`
+      SELECT id, event_type, actor_type, actor_name, status, message, payload, created_at
+      FROM capture_task_events
+      WHERE task_id = $1 AND tenant_id = $2
+      ORDER BY created_at DESC
+      LIMIT 200
+    `, [task.id, req.tenantId]);
+    return res.json({ ok: true, events });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+export default router;

@@ -28,6 +28,142 @@ function readFunctionSection(startMarker, endMarker) {
   return readSourceSection(sidebarSource, startMarker, endMarker);
 }
 
+test("observer sidebar renders the active cloud run before Debug attaches", () => {
+  const displaySection = readFunctionSection(
+    "function buildKeywordRunDisplayPlan(",
+    "function clearKeywordPlanProgressCountdown(",
+  );
+  assert.match(displaySection, /request\.planSnapshot/u);
+  assert.match(displaySection, /lastRunRequestId:\s*requestId/u);
+  assert.match(displaySection, /unattendedRequestId:\s*requestId/u);
+  assert.match(displaySection, /cloudAssigned:\s*request\.cloudAssigned === true/u);
+
+  const loadSection = readFunctionSection(
+    "async function loadActiveKeywordRunState()",
+    "function shouldRefreshDataPoolForKeywordPlan(",
+  );
+  assert.match(
+    loadSection,
+    /onstarvoice:get-unattended-keyword-run-state/u,
+  );
+  assert.match(loadSection, /renderActiveKeywordRunState\(response\.data/u);
+
+  const storageSection = readFunctionSection(
+    "function setupKeywordPlanStorageListener()",
+    "function handleUnattendedRunRequestStorageChange(",
+  );
+  assert.match(storageSection, /renderActiveKeywordRunState\(request\)/u);
+  assert.ok(
+    storageSection.indexOf("renderActiveKeywordRunState(request)") <
+      storageSection.indexOf("handleUnattendedRunRequestStorageChange(request)"),
+    "the observer UI must update before runner-only cancellation handling",
+  );
+});
+
+test("cloud and unattended Debug sessions stop through the exact request id", () => {
+  const bindingSection = readFunctionSection(
+    "function resolveDisplayedUnattendedSessionBinding(",
+    "function renderCaptureDebugSession(",
+  );
+  const renderSection = readFunctionSection(
+    "function renderCaptureDebugSession(runtime = {})",
+    "function setupDebugSessionPanelControls()",
+  );
+  assert.match(bindingSection, /nativeTaskId\.startsWith\("unattended-capture:"\)/u);
+  assert.match(renderSection, /resolveDisplayedUnattendedSessionBinding/u);
+  assert.match(renderSection, /data-unattended-request-id/u);
+
+  const controlsSection = readFunctionSection(
+    "function setupDebugSessionPanelControls()",
+    "function setupAuthCodeInputListeners()",
+  );
+  assert.match(
+    controlsSection,
+    /cancelUnattendedKeywordPlanFromSidebar\([\s\S]*?panel\?\.dataset\?\.unattendedRequestId/u,
+  );
+
+  const cancelSection = readFunctionSection(
+    "async function cancelUnattendedKeywordPlanFromSidebar(",
+    "function populateKeywordPlanUI(",
+  );
+  assert.match(cancelSection, /requestId:\s*exactRequestId/u);
+  assert.match(cancelSection, /activeKeywordRunState\?\.id/u);
+});
+
+test("the stop binding follows the session shown in the panel across native and cloud races", () => {
+  const section = readFunctionSection(
+    "function resolveDisplayedUnattendedSessionBinding(",
+    "function renderCaptureDebugSession(",
+  );
+  const context = {};
+  vm.runInNewContext(
+    `${section}\nglobalThis.__resolveBinding = resolveDisplayedUnattendedSessionBinding;`,
+    context,
+  );
+  const resolveBinding = context.__resolveBinding;
+
+  assert.deepEqual(
+    {...resolveBinding({
+      usingSyntheticSession: false,
+      session: {taskId: "unattended-capture:request-A"},
+      nativeSession: {taskId: "unattended-capture:request-A"},
+      displayPlan: {lastRunRequestId: "request-B"},
+    })},
+    {unattended: true, requestId: "request-A"},
+    "an older native session must not borrow the newer cloud request id",
+  );
+  assert.deepEqual(
+    {...resolveBinding({
+      usingSyntheticSession: false,
+      session: {
+        taskId: "unattended-capture:request-A",
+        progress: {unattendedRequestId: "request-B"},
+      },
+      nativeSession: {
+        taskId: "unattended-capture:request-A",
+        progress: {unattendedRequestId: "request-B"},
+      },
+      displayPlan: {lastRunRequestId: "request-C"},
+    })},
+    {unattended: true, requestId: "request-A"},
+    "the native task id fences a stale progress identity",
+  );
+  assert.deepEqual(
+    {...resolveBinding({
+      usingSyntheticSession: false,
+      session: {taskId: "manual-capture:request-A"},
+      nativeSession: {taskId: "manual-capture:request-A"},
+      displayPlan: {lastRunRequestId: "request-B"},
+    })},
+    {unattended: false, requestId: ""},
+    "a visible manual Debug session must not stop a deferred cloud task",
+  );
+  assert.deepEqual(
+    {...resolveBinding({
+      usingSyntheticSession: true,
+      session: {taskId: "unattended-capture:request-B"},
+      nativeSession: {taskId: "unattended-capture:request-A"},
+      displayPlan: {lastRunRequestId: "request-C"},
+    })},
+    {unattended: true, requestId: "request-B"},
+    "a synthetic panel uses its own selected cloud task identity",
+  );
+});
+
+test("capture terminal status preserves partial completion when an issue is attached", () => {
+  const section = readFunctionSection(
+    "function resolveCaptureTaskTerminalStatus(",
+    "function resolveUnattendedEnhanceCancellation(",
+  );
+  const partialIndex = section.indexOf('taskStatus === "partial"');
+  const genericErrorIndex = section.indexOf(
+    'if (error) return {reason: "failed", status: "failed"};',
+  );
+
+  assert.ok(partialIndex > -1);
+  assert.ok(genericErrorIndex > partialIndex);
+});
+
 test("blogger capture owns one task session across list and detail work", () => {
   const section = readFunctionSection(
     "async function handleCaptureBloggerData()",
@@ -78,6 +214,43 @@ test("manual search begins only for the actual run and always ends in finally", 
     /batchCaptureByKeywords\(\{\s+keywords: \[\.\.\.searchKeywords\],[\s\S]*?captureTaskId: persistentCaptureTaskId/,
   );
   assert.doesNotMatch(section, /retryFailedEnhancementsAfterRound\(/);
+  assert.match(
+    section.slice(finallyIndex),
+    /buildStreamingSyncTaskIssue\(\s*streamingSyncResult,?\s*\)/,
+  );
+  assert.match(
+    section.slice(finallyIndex),
+    /taskStatus = "completed_with_failures";[\s\S]*?taskError = taskError \|\| streamingSyncTaskIssue/,
+  );
+  assert.match(
+    section.slice(finallyIndex),
+    /buildStreamingSyncTaskMetadata\(streamingSyncResult\)/,
+  );
+});
+
+test("batch keyword parent task absorbs hidden streaming sync failures", () => {
+  const section = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+
+  assert.match(
+    section,
+    /const streamingSyncTaskIssue = buildStreamingSyncTaskIssue\(\s*streamingSyncResult,?\s*\)/,
+  );
+  assert.match(
+    section,
+    /totalFailed > 0 \|\| streamingSyncTaskIssue\s*\? "completed_with_failures"/,
+  );
+  assert.match(section, /sidebarTaskError = streamingSyncTaskIssue/);
+  assert.match(
+    section,
+    /buildStreamingSyncTaskMetadata\(streamingSyncResult\)/,
+  );
+  assert.match(
+    section,
+    /totalFailed === 0 &&\s*!streamingSyncTaskIssue/,
+  );
 });
 
 test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the final replacement tab", () => {
@@ -174,6 +347,11 @@ test("unattended Douyin navigation readiness is bound to the expected URL and ke
   );
   assert.match(readinessSection, /expectedUrl\s*=\s*""/);
   assert.match(readinessSection, /expectedKeyword\s*=\s*""/);
+  assert.match(readinessSection, /shouldStop\s*=\s*null/);
+  assert.match(
+    readinessSection,
+    /UNATTENDED_SEARCH_BOOTSTRAP_CANCELED/,
+  );
   assert.match(readinessSection, /tab\?\.url/);
   assert.doesNotMatch(
     readinessSection,
@@ -187,12 +365,263 @@ test("unattended Douyin navigation readiness is bound to the expected URL and ke
   );
   assert.match(
     navigationSection,
-    /waitForActiveTabReady\(targetTab\.id, 15000, \{[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
+    /waitForActiveTabReady\(\s*preferredTabId,\s*15000,\s*\{[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
   );
   assert.match(
     navigationSection,
-    /waitForRuntimeSearchPage\(\{[\s\S]*?platform,[\s\S]*?tabId:\s*readyState\.tabId,[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
+    /readyState\.ready\s*\?\s*await waitForRuntimeSearchPage\(\{[\s\S]*?platform,[\s\S]*?tabId:\s*preferredTabId,[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
     "runtime readiness must describe the same final tab and search identity",
+  );
+  assert.match(
+    navigationSection,
+    /for \(let attempt = 1; attempt <= boundedMaxAttempts; attempt \+= 1\)/,
+  );
+  assert.match(
+    navigationSection,
+    /error\.code = "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"/,
+  );
+});
+
+function createUnattendedNavigationHarness({
+  tabReadiness = [],
+  runtimeReadiness = [],
+  stopAfterTabReadiness = false,
+  trackedTabMissing = false,
+  queriedTabs = [],
+} = {}) {
+  const navigationSection = readFunctionSection(
+    "async function navigateActiveTabToKeywordSearchForPlan({",
+    "function buildUnattendedTaskCounts(",
+  );
+  const updates = [];
+  const retries = [];
+  let runtimeChecks = 0;
+  let stopRequested = false;
+  const tab = {
+    id: 101,
+    windowId: 7,
+    status: "complete",
+    url: "https://www.douyin.com/jingxuan",
+  };
+  const sandbox = vm.createContext({
+    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 2,
+    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAY_MS: 0,
+    buildSidebarKeywordSearchUrl: (keyword) =>
+      `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`,
+    chrome: {
+      tabs: {
+        get: async () => {
+          if (trackedTabMissing) throw new Error("No tab with id: 101");
+          return {...tab};
+        },
+        query: async () => queriedTabs.map((entry) => ({...entry})),
+        update: async (tabId, patch) => {
+          updates.push({tabId, ...patch});
+          Object.assign(tab, patch);
+          return {...tab};
+        },
+      },
+      windows: {update: async () => ({})},
+    },
+    detectPlatformFromUrl: (url) =>
+      String(url || "").includes("douyin.com") ? "douyin" : "unknown",
+    sleep: async () => {},
+    waitForActiveTabReady: async () => {
+      const ready = Boolean(tabReadiness.shift());
+      if (stopAfterTabReadiness) stopRequested = true;
+      return {ready, tabId: tab.id, tab: ready ? {...tab} : null};
+    },
+    waitForRuntimeSearchPage: async () => {
+      runtimeChecks += 1;
+      return Boolean(runtimeReadiness.shift());
+    },
+  });
+  vm.runInContext(
+    `${navigationSection}\nglobalThis.__navigate = navigateActiveTabToKeywordSearchForPlan;`,
+    sandbox,
+  );
+  return {
+    navigate: (options = {}) =>
+      sandbox.__navigate({
+        keyword: "凯迪拉克",
+        platform: "douyin",
+        tabId: tab.id,
+        retryDelayMs: 0,
+        shouldStop: () => stopRequested,
+        onRetry: async (payload) => retries.push(payload),
+        ...options,
+      }),
+    retries,
+    runtimeChecks: () => runtimeChecks,
+    updates,
+  };
+}
+
+test("unattended bootstrap reopens the same keyword after a transient page drift", async () => {
+  const harness = createUnattendedNavigationHarness({
+    tabReadiness: [false, true],
+    runtimeReadiness: [true],
+  });
+
+  const result = await harness.navigate();
+
+  assert.equal(result.recovered, true);
+  assert.equal(result.attemptCount, 2);
+  assert.equal(harness.updates.length, 2);
+  assert.equal(harness.updates[0].url, harness.updates[1].url);
+  assert.match(harness.updates[0].url, /\/search\/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B/);
+  assert.equal(harness.retries.length, 1);
+  assert.equal(harness.retries[0].nextAttempt, 2);
+  assert.equal(
+    harness.runtimeChecks(),
+    1,
+    "a failed tab identity must retry immediately instead of waiting on stale runtime state",
+  );
+});
+
+test("unattended bootstrap retry is bounded and exposes a recoverable error code", async () => {
+  const harness = createUnattendedNavigationHarness({
+    tabReadiness: [false, false, true],
+  });
+
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
+    assert.equal(error.attempts, 2);
+    return true;
+  });
+  assert.equal(harness.updates.length, 2);
+  assert.equal(harness.retries.length, 1);
+  assert.equal(harness.runtimeChecks(), 0);
+});
+
+test("unattended bootstrap retries when the tab is ready but runtime is a video page", async () => {
+  const harness = createUnattendedNavigationHarness({
+    tabReadiness: [true, true],
+    runtimeReadiness: [false, true],
+  });
+
+  const result = await harness.navigate();
+
+  assert.equal(result.recovered, true);
+  assert.equal(result.attemptCount, 2);
+  assert.equal(harness.updates.length, 2);
+  assert.equal(harness.runtimeChecks(), 2);
+  assert.equal(harness.retries.length, 1);
+});
+
+test("unattended bootstrap cannot pass its final fence after cancellation", async () => {
+  const harness = createUnattendedNavigationHarness({
+    tabReadiness: [true],
+    runtimeReadiness: [true],
+    stopAfterTabReadiness: true,
+  });
+
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED");
+    return true;
+  });
+  assert.equal(harness.updates.length, 1);
+  assert.equal(harness.runtimeChecks(), 0);
+  assert.equal(harness.retries.length, 0);
+});
+
+test("a missing tracked tab never hijacks the user's unrelated active page", async () => {
+  const harness = createUnattendedNavigationHarness({
+    trackedTabMissing: true,
+    queriedTabs: [
+      {
+        id: 202,
+        windowId: 7,
+        active: true,
+        status: "complete",
+        url: "https://www.douyin.com/user/unrelated",
+      },
+    ],
+  });
+
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
+    return true;
+  });
+  assert.equal(harness.updates.length, 0);
+  assert.equal(harness.retries.length, 1);
+});
+
+test("tab readiness never promotes an unrelated same-platform tab to the task tab", async () => {
+  const readinessSection = readFunctionSection(
+    "async function waitForActiveTabReady(",
+    "async function waitForRuntimeSearchPage(",
+  );
+  let now = 0;
+  const sandbox = vm.createContext({
+    Date: class extends Date {
+      static now() {
+        return now;
+      }
+    },
+    chrome: {
+      tabs: {
+        get: async () => {
+          throw new Error("No tab with id: 101");
+        },
+        query: async () => [
+          {
+            id: 202,
+            windowId: 7,
+            active: true,
+            status: "complete",
+            url: "https://www.douyin.com/user/unrelated",
+          },
+        ],
+      },
+    },
+    detectPlatformFromUrl: (url) =>
+      String(url || "").includes("douyin.com") ? "douyin" : "unknown",
+    setTimeout: (resolve) => {
+      now += 301;
+      resolve();
+    },
+  });
+  vm.runInContext(
+    `${readinessSection}\nglobalThis.__waitForActiveTabReady = waitForActiveTabReady;`,
+    sandbox,
+  );
+
+  const result = await sandbox.__waitForActiveTabReady(101, 1, {
+    windowId: 7,
+    platform: "douyin",
+    expectedUrl:
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?type=general",
+    expectedKeyword: "凯迪拉克",
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.tabId, 101);
+});
+
+test("unattended bootstrap retry is reported before keyword batch delegation", () => {
+  const section = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  const navigationIndex = section.indexOf(
+    "const navigationResult = await navigateActiveTabToKeywordSearchForPlan({",
+  );
+  const retryIndex = section.indexOf("onRetry: async ({nextAttempt, maxAttempts})", navigationIndex);
+  const batchIndex = section.indexOf("batchRunResult = await handleBatchKeywordCapture({", retryIndex);
+
+  assert.ok(navigationIndex > -1);
+  assert.ok(retryIndex > navigationIndex);
+  assert.ok(batchIndex > retryIndex);
+  assert.match(section.slice(retryIndex, batchIndex), /phase: "recovering_search_page"/);
+  assert.match(section.slice(retryIndex, batchIndex), /retried: Math\.max\(0, Number\(nextAttempt\) - 1\)/);
+  assert.match(
+    section,
+    /const bootstrapFailed =\s+error\?\.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"/,
+  );
+  assert.match(
+    section,
+    /const terminalStatus = cancellation\?\.status \|\|\s*\(needsAction \? "needs_action" : "failed"\)/,
   );
 });
 
@@ -545,7 +974,7 @@ test("unattended plan renders startup and durable terminal task surfaces", () =>
   );
   assert.match(
     renderSection,
-    /const syntheticSession = buildUnattendedSyntheticDebugSession\(runtime\)/,
+    /const syntheticSession = buildUnattendedSyntheticDebugSession\(\s*runtime,\s*displayPlan,\s*\)/,
   );
   assert.match(
     renderSection,
@@ -579,11 +1008,11 @@ test("dark task surface stops an active unattended request through its real canc
   );
   assert.match(
     controlsSection,
-    /panel\?\.dataset\?\.unattended === "true" \|\|\s+isKeywordPlanRunning\(keywordPlanState\)/,
+    /panel\?\.dataset\?\.unattended === "true" \|\|\s+isKeywordPlanRunning\(buildKeywordRunDisplayPlan\(keywordPlanState\)\)/,
   );
   assert.match(
     controlsSection,
-    /if \(stoppingUnattended\) \{\s+await cancelUnattendedKeywordPlanFromSidebar\(\)/,
+    /if \(stoppingUnattended\) \{\s+await cancelUnattendedKeywordPlanFromSidebar\([\s\S]*?unattendedRequestId/,
   );
   assert.match(controlsSection, /else \{\s+await handleCancel\(\)/);
 });
@@ -633,11 +1062,11 @@ test("unattended Debug startup and unexpected cancellation retain system error i
     "async function handleBatchKeywordCapture(options = {})",
     "async function reportUnattendedKeywordRun(",
   );
-  const cancellationFenceAt = batchSection.indexOf(
-    'executionLockOwner === "unattended_keyword_plan" &&\n      activeCaptureTaskCancellationReason',
+  const cancellationFence = batchSection.match(
+    /executionLockOwner === "unattended_keyword_plan" &&[\s\S]{0,180}!isCurrentUnattendedInvocation\(\)[\s\S]{0,180}activeCaptureTaskCancellationReason/,
   );
   const resetAt = batchSection.indexOf("batchKeywordCancelRequested = false;");
-  assert.ok(cancellationFenceAt > -1 && cancellationFenceAt < resetAt);
+  assert.ok(cancellationFence?.index >= 0 && cancellationFence.index < resetAt);
 
   const storageSection = readFunctionSection(
     "function handleUnattendedRunRequestStorageChange(request)",
@@ -965,6 +1394,153 @@ test("native cancellation fences automatic backend sync at every task call site"
   );
   assert.match(
     batchSection,
-    /shouldStop: \(\) => batchKeywordCancelRequested/,
+    /const shouldStopBatchInvocation = \(\) =>\s+batchKeywordCancelRequested \|\| !isCurrentUnattendedInvocation\(\)/,
   );
+  assert.match(
+    batchSection,
+    /shouldStop: shouldStopBatchInvocation/,
+  );
+});
+
+test("cloud task capture settings override local UI settings and reach unattended batches", () => {
+  const batchSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  assert.match(batchSection, /runOptions\.captureSettings/u);
+  assert.match(
+    batchSection,
+    /resolveTaskCaptureSettingsOverrides\(\s*storedCaptureSettings,\s*runOptions\.captureSettings/u,
+  );
+  assert.match(
+    batchSection,
+    /const settings = taskCaptureSettings \|\|\s*resolveCurrentDetailCaptureSettings\(storedCaptureSettings\)/u,
+  );
+
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(",
+    "async function runCaptureAction(",
+  );
+  assert.match(
+    unattendedSection,
+    /handleBatchKeywordCapture\(\{[\s\S]*captureSettings:\s*plan\.captureSettings/u,
+  );
+});
+
+test("task keyword post limits override local settings and reach unattended capture params", () => {
+  const resolverSource = readFunctionSection(
+    "function resolveTaskKeywordMaxDetectedItems(",
+    "function resolveCurrentDetailCaptureSettings(",
+  );
+  const context = vm.createContext({});
+  vm.runInContext(
+    `const DEFAULT_CAPTURE_SETTINGS = {keywordMaxDetectedItems: 50};\n${resolverSource}\nglobalThis.__resolveTaskLimit = resolveTaskKeywordMaxDetectedItems;`,
+    context,
+  );
+  const resolveTaskLimit = context.__resolveTaskLimit;
+
+  assert.equal(resolveTaskLimit(50, 275), 275);
+  assert.equal(resolveTaskLimit(), 50);
+  assert.equal(resolveTaskLimit(73, null), 73);
+  assert.equal(resolveTaskLimit(73, undefined), 73);
+  for (const invalidValue of [0, -1, "invalid", 12.5]) {
+    assert.equal(
+      resolveTaskLimit(73, invalidValue),
+      73,
+      `invalid task value ${String(invalidValue)} must preserve the local setting`,
+    );
+  }
+
+  const batchSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  assert.match(batchSection, /runOptions\.keywordMaxDetectedItems/u);
+  assert.match(
+    batchSection,
+    /resolveTaskKeywordMaxDetectedItems\(\s*settings\.keywordMaxDetectedItems,\s*runOptions\.keywordMaxDetectedItems/u,
+  );
+  assert.match(
+    batchSection,
+    /maxDetectedItems:\s*keywordMaxDetectedItems/u,
+  );
+
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(",
+    "async function runCaptureAction(",
+  );
+  assert.match(
+    unattendedSection,
+    /handleBatchKeywordCapture\(\{[\s\S]*keywordMaxDetectedItems:[\s\S]*plan\.keywordMaxDetectedItems/u,
+  );
+});
+
+test("task capture-setting overrides preserve 1000 comments and normalize dependencies", () => {
+  const resolverSource = readFunctionSection(
+    "function resolveTaskCaptureSettingsOverrides(",
+    "function resolveCurrentDetailCaptureSettings(",
+  );
+  const context = vm.createContext({});
+  vm.runInContext(
+    `${resolverSource}\nglobalThis.resolveTaskCaptureSettingsOverridesForTest = resolveTaskCaptureSettingsOverrides;`,
+    context,
+  );
+  const resolveOverrides = context.resolveTaskCaptureSettingsOverridesForTest;
+
+  const enabled = resolveOverrides(
+    {detailCommentsMaxDetectedItems: 50},
+    {
+      autoDetailCaptureAfterListCapture: "true",
+      autoSyncAfterDetailCapture: true,
+      enableAiRelevancePrefilter: true,
+      includeBloggerMetricsOnDetailCapture: true,
+      enableLowFollowerHitFilterOnDetailCapture: true,
+      lowFollowerHitThresholdOnDetailCapture: 8000,
+      includeCommentsOnDetailCapture: true,
+      detailCommentsMaxDetectedItems: 1000,
+      enableCommentLeadsFilterOnDetailCapture: true,
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+  );
+  assert.equal(enabled.detailCommentsMaxDetectedItems, 1000);
+  assert.equal(enabled.enableLowFollowerHitFilterOnDetailCapture, true);
+  assert.equal(enabled.enableCommentLeadsFilterOnDetailCapture, true);
+
+  const disabledEnhancement = resolveOverrides(
+    {},
+    {
+      autoDetailCaptureAfterListCapture: false,
+      autoSyncAfterDetailCapture: true,
+      enableAiRelevancePrefilter: true,
+      includeBloggerMetricsOnDetailCapture: true,
+      enableLowFollowerHitFilterOnDetailCapture: true,
+      includeCommentsOnDetailCapture: true,
+      enableCommentLeadsFilterOnDetailCapture: true,
+      skipAlreadyCapturedOnDetailCapture: true,
+    },
+  );
+  for (const key of [
+    "autoSyncAfterDetailCapture",
+    "enableAiRelevancePrefilter",
+    "includeBloggerMetricsOnDetailCapture",
+    "enableLowFollowerHitFilterOnDetailCapture",
+    "includeCommentsOnDetailCapture",
+    "enableCommentLeadsFilterOnDetailCapture",
+    "skipAlreadyCapturedOnDetailCapture",
+  ]) {
+    assert.equal(disabledEnhancement[key], false, `${key} must be gated`);
+  }
+
+  const disabledParents = resolveOverrides(
+    {},
+    {
+      autoDetailCaptureAfterListCapture: true,
+      includeBloggerMetricsOnDetailCapture: false,
+      enableLowFollowerHitFilterOnDetailCapture: true,
+      includeCommentsOnDetailCapture: false,
+      enableCommentLeadsFilterOnDetailCapture: true,
+    },
+  );
+  assert.equal(disabledParents.enableLowFollowerHitFilterOnDetailCapture, false);
+  assert.equal(disabledParents.enableCommentLeadsFilterOnDetailCapture, false);
 });

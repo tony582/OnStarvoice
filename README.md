@@ -19,6 +19,7 @@
 ```
 
 - **扩展(采集端)**:`manifest.json` + `utils/` + `sidebar/`(源码在仓库根目录),实际加载的是手动快照 `extension-build/`(见 §6)。
+- **云端采集任务中心**:后台按浏览器节点展示设备心跳、采集进度和本地无人值守计划，并可向指定节点新建任务或发送恢复指令；架构、边界与验收见 `docs/cloud-task-center.md`。
 - **后端**:`server/`,Express + PostgreSQL,`server/index.js` 启动,`server/routes/*` 提供 API,`server/services/*` 是业务逻辑,`server/cron.js` 跑定时任务。
 - **后台**:`web/admin/`(React + TS + Tailwind + Vite),运营人员用;`web/dashboard/` 是另一套轻量看板。
 - **多租户**:一套部署服务多个品牌方(安吉星 / OnStar / …),数据按 `tenant_id` 隔离。
@@ -100,12 +101,13 @@ cd web/admin && npm install && npm run dev          # http://localhost:5173/admi
 ## 6. 扩展开发须知(重要)
 
 - 扩展是 **MediaClaw 的 fork**,加入了若干本地补丁(搜「`本 fork 自加`」);合并上游时务必保留。
-- **运行的是 `extension-build/` 这个手动快照,不是源码**。改完扩展源码(根目录 `utils/`、`sidebar/`、`manifest.json` 等)后必须:
-  1. `rsync -a --exclude='.DS_Store' utils/ extension-build/utils/`(及其它改动文件);
+- **运行的是 `extension-build/` 这个交付快照,不是源码**。改完扩展源码(根目录 `utils/`、`sidebar/`、`background.js`、`manifest.json` 等)后必须:
+  1. 在仓库根目录运行 `scripts/sync-extension-build.zsh`，一次性同步并校验完整快照；
   2. 用户在 `chrome://extensions` 点 **Reload**;
   3. **重新采集**才生效。`deploy.sh` 不部署扩展。
 - 采集方式(扩展侧栏):**作品详情页**(单篇,带评论)/ **账号主页**(博主监控)/ **搜索页**(关键词)。「**采集增强**」会逐条打开详情页补采正文/互动/**评论**/客资;「评论加载上限」控制每帖采多少条评论。
-- 给客户的扩展包:`zip` 打包 `extension-build/`(`*.zip` 已 gitignore),客户在开发者模式「加载已解压的扩展程序」。
+- 给客户的扩展包必须运行 `scripts/package-extension.zsh` 生成；该入口会强制重建并校验 production 快照，避免把 localhost 联调版误发给客户。生成的 `StarVoice-extension.zip` 已 gitignore，客户在开发者模式「加载已解压的扩展程序」。
+- 本机联调 `http://localhost:3001` 时，明确运行 `scripts/sync-extension-build.zsh local` 后再 Reload；该命令只修改 `extension-build/` 中的运行配置。正式交付请直接运行 `scripts/package-extension.zsh`，它会自动恢复并校验只连接 `https://voice.minilife.online` 的生产快照。
 
 ---
 

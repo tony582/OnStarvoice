@@ -245,6 +245,140 @@ test("batch and detail callbacks keep the immutable unattended request attempt",
   );
 });
 
+test("activating an unattended attempt clears cancellation inherited from the previous attempt", () => {
+  const activateStart = sidebarSource.indexOf(
+    "function activateUnattendedRunRequest(",
+  );
+  const activateEnd = sidebarSource.indexOf(
+    "function clearActiveUnattendedRunRequest(",
+    activateStart,
+  );
+  assert.ok(activateStart >= 0 && activateEnd > activateStart);
+  const activateSource = sidebarSource.slice(activateStart, activateEnd);
+  const context = {
+    activeUnattendedRunRequestId: "request-old",
+    activeUnattendedRunAttemptId: "attempt-old",
+    pendingUnattendedCancellationRequestId: "",
+    pendingUnattendedCancellationAttemptId: "",
+    activeUnattendedTerminalProgressKey: "request-old:attempt-old:failed",
+    activeUnattendedProgressSeq: 99,
+    activeUnattendedAttemptRejected: true,
+    lastUnattendedContentProgressAt: 123,
+    lastUnattendedContentProgressFingerprint: "old-progress",
+    activeCaptureTaskCancellationReason: "capture_page_closed",
+    batchKeywordCancelRequested: true,
+    detailBatchCancelRequested: true,
+    searchCaptureCancelRequested: true,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${activateSource}\nthis.activateUnattendedRunRequest = activateUnattendedRunRequest;`,
+    context,
+  );
+
+  const activationResult = context.activateUnattendedRunRequest({
+    id: "request-new",
+    attemptId: "attempt-new",
+    progressSeq: 7,
+  });
+
+  assert.equal(activationResult, undefined);
+  assert.equal(context.activeUnattendedRunRequestId, "request-new");
+  assert.equal(context.activeUnattendedRunAttemptId, "attempt-new");
+  assert.equal(context.activeCaptureTaskCancellationReason, "");
+  assert.equal(context.batchKeywordCancelRequested, false);
+  assert.equal(context.detailBatchCancelRequested, false);
+  assert.equal(context.searchCaptureCancelRequested, false);
+});
+
+test("cancellation received after claim but before activation is preserved", () => {
+  const activateStart = sidebarSource.indexOf(
+    "function activateUnattendedRunRequest(",
+  );
+  const activateEnd = sidebarSource.indexOf(
+    "function clearActiveUnattendedRunRequest(",
+    activateStart,
+  );
+  assert.ok(activateStart >= 0 && activateEnd > activateStart);
+  const activateSource = sidebarSource.slice(activateStart, activateEnd);
+  const storageChangeSource = readFunctionSource(
+    "handleUnattendedRunRequestStorageChange",
+  );
+  const context = {
+    activeUnattendedRunRequestId: "",
+    activeUnattendedRunAttemptId: "",
+    pendingUnattendedCancellationRequestId: "",
+    pendingUnattendedCancellationAttemptId: "",
+    activeUnattendedTerminalProgressKey: "",
+    activeUnattendedProgressSeq: 0,
+    activeUnattendedAttemptRejected: false,
+    lastUnattendedContentProgressAt: 0,
+    lastUnattendedContentProgressFingerprint: "",
+    activeCaptureTaskCancellationReason: "",
+    batchKeywordCancelRequested: false,
+    detailBatchCancelRequested: false,
+    searchCaptureCancelRequested: false,
+    getUnattendedRunRequestIdFromUrl: () => "request-current",
+    isExplicitUserUnattendedCancellationMessage: () => true,
+    setCancelFlag: () => {},
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${storageChangeSource}\n${activateSource}\nthis.handleStorageChange = handleUnattendedRunRequestStorageChange;\nthis.activate = activateUnattendedRunRequest;`,
+    context,
+  );
+
+  const canceledRequest = {
+    id: "request-current",
+    attemptId: "attempt-current",
+    status: "canceled",
+    message: "用户手动中止无人值守计划",
+  };
+  context.handleStorageChange(canceledRequest);
+  context.activate(canceledRequest);
+
+  assert.equal(
+    context.activeCaptureTaskCancellationReason,
+    "unattended_cancel_requested",
+  );
+  assert.equal(context.batchKeywordCancelRequested, true);
+  assert.equal(context.detailBatchCancelRequested, true);
+  assert.equal(context.searchCaptureCancelRequested, true);
+  assert.equal(context.activeUnattendedRunRequestId, "request-current");
+  assert.equal(context.activeUnattendedRunAttemptId, "attempt-current");
+});
+
+test("the awaited unattended start report cannot erase cancellation of the active attempt", () => {
+  const runSource = readAsyncFunctionSource(
+    "runUnattendedKeywordPlanRequest",
+  );
+  const startReportAt = runSource.indexOf(
+    "const startReport = await reportUnattendedKeywordRun(",
+  );
+  const keywordPlanCommitAt = runSource.indexOf(
+    "keywordPlanState =",
+    startReportAt,
+  );
+  assert.ok(startReportAt >= 0 && keywordPlanCommitAt > startReportAt);
+
+  const afterAwaitBeforeRunCommit = runSource.slice(
+    startReportAt,
+    keywordPlanCommitAt,
+  );
+  for (const [name, clearedValue] of [
+    ["activeCaptureTaskCancellationReason", '""'],
+    ["batchKeywordCancelRequested", "false"],
+    ["detailBatchCancelRequested", "false"],
+    ["searchCaptureCancelRequested", "false"],
+  ]) {
+    assert.doesNotMatch(
+      afterAwaitBeforeRunCommit,
+      new RegExp(`${name}\\s*=\\s*${clearedValue}`),
+      `${name} may have been raised while startReport was pending`,
+    );
+  }
+});
+
 test("late terminal events from task A are rejected after task B starts", () => {
   const handleProgressSource = readFunctionSource("handleProgress");
   let touched = 0;

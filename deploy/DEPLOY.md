@@ -74,7 +74,7 @@ curl https://voice.minilife.online/api/auth/me   # 期望 {"ok":false,...请先�
 浏览器打开 `https://voice.minilife.online` → 用 ADMIN_PASSWORD 登录。
 
 ### 7. 插件指向生产(已在代码层改好)
-- `utils/api.js` 与 `manifest.json` 已加入 `voice.minilife.online`(放在 localhost 之后,开发机仍走本地)。
+- `utils/api.js` 默认只连接 `voice.minilife.online`，不会携带凭证回退到其他来源。本机联调必须显式运行 `scripts/sync-extension-build.zsh local`；客户包必须通过 `scripts/package-extension.zsh` 生成并校验生产地址。
 - 生产用:把扩展(本目录)重新打包为 .crx 或在 Chrome「加载已解压的扩展」装这个文件夹,采集即同步到云端。
 
 ---

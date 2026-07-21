@@ -29,7 +29,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
-    { id: 'monitoring', label: '关注博主', icon: Radar, badgeKeys: ['monitorAttention'] },
+    { id: 'monitoring', label: '监测与采集', icon: Radar, badgeKeys: ['monitorAttention'], tag: 'BETA' },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },
@@ -253,16 +253,24 @@ function NavButton({ item, active, sectionActive, badges, onClick }: {
       )}>
       <Icon className={cn('h-[17px] w-[17px] shrink-0 transition-colors', hot ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground')} strokeWidth={hot ? 2 : 1.6} />
       <span className="truncate">{item.label}</span>
-      {badgeCount > 0 ? (
-        <span className={cn(
-          'ml-auto inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
-          isAttention ? 'bg-status-orange/20 text-amber-600 dark:text-amber-400' : 'bg-primary/12 text-primary',
-        )}>{badgeCount > 99 ? '99+' : badgeCount}</span>
-      ) : item.tag ? (
-        <span className="ml-auto rounded bg-status-green/15 px-1.5 text-[8.5px] font-bold tracking-wide text-emerald-600 dark:text-emerald-400">{item.tag}</span>
-      ) : active && !sectionActive ? (
-        <ChevronRight className="ml-auto h-3.5 w-3.5 text-muted-foreground" />
-      ) : null}
+      <span className="ml-auto flex shrink-0 items-center gap-1">
+        {item.tag && (
+          <span className={cn(
+            'rounded px-1.5 text-[8.5px] font-bold tracking-wide',
+            item.tag === 'BETA'
+              ? 'border border-primary/20 bg-primary/10 text-primary'
+              : 'bg-status-green/15 text-emerald-600 dark:text-emerald-400',
+          )}>{item.tag}</span>
+        )}
+        {badgeCount > 0 ? (
+          <span className={cn(
+            'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
+            isAttention ? 'bg-status-orange/20 text-amber-600 dark:text-amber-400' : 'bg-primary/12 text-primary',
+          )}>{badgeCount > 99 ? '99+' : badgeCount}</span>
+        ) : active && !sectionActive ? (
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+        ) : null}
+      </span>
     </button>
   )
 }

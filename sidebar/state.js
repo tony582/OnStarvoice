@@ -78,6 +78,12 @@ function bindStorageListeners() {
       notifyListeners('runtime', currentRuntime);
     }
 
+    const authChange = changes[STORAGE_KEY.AUTH];
+    if (authChange) {
+      currentAuth = authChange.newValue || null;
+      notifyListeners('auth', currentAuth);
+    }
+
     const taskLedgerChange = changes[STORAGE_KEY.TASK_LEDGER];
     if (taskLedgerChange) {
       currentTaskLedger = normalizeTaskLedgerState(taskLedgerChange.newValue);
@@ -266,10 +272,13 @@ export async function refreshAuth() {
 /**
  * 更新鉴权状态
  */
-export async function setCurrentAuth(updates) {
-  currentAuth = { ...currentAuth, ...updates };
-  await updateAuth(updates);
+export async function setCurrentAuth(updates, options = {}) {
+  const result = await updateAuth(updates, {
+    expectedMutationId: options.expectedMutationId,
+  });
+  currentAuth = result?.auth || await getAuth();
   notifyListeners('auth', currentAuth);
+  return result || {accepted: true, auth: currentAuth};
 }
 
 // ==================== 目标配置 ====================

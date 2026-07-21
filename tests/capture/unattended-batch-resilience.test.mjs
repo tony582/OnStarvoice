@@ -18,7 +18,31 @@ function readBatchFunctionSource() {
   return captureSyncSource.slice(start, end).replace(/^export\s+/u, "");
 }
 
-function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
+function readKeywordSearchPageUrlInspectorSource() {
+  const startMarker = "function inspectKeywordSearchPageUrl(";
+  const endMarker = "async function waitForKeywordSearchResultsInTab(";
+  const start = captureSyncSource.indexOf(startMarker);
+  const end = captureSyncSource.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, "keyword search URL inspector start marker missing");
+  assert.notEqual(end, -1, "keyword search URL inspector end marker missing");
+  return captureSyncSource.slice(start, end);
+}
+
+function inspectKeywordSearchPageUrl(pageUrl, platform, keyword) {
+  const sandbox = vm.createContext({URL});
+  vm.runInContext(
+    `${readKeywordSearchPageUrlInspectorSource()}\nglobalThis.__inspect = inspectKeywordSearchPageUrl;`,
+    sandbox,
+  );
+  return sandbox.__inspect(pageUrl, platform, keyword);
+}
+
+function createBatchHarness({
+  captureKeyword,
+  afterKeywordCapture = null,
+  switchDouyinKeyword = null,
+  waitForResults = null,
+} = {}) {
   const captureCalls = [];
   const navigationCalls = [];
   const settled = [];
@@ -72,8 +96,10 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
     Math,
     activateTabForReliableTimer: async () => {},
     buildInterKeywordDelayMessage: ({keyword}) => `next:${keyword}`,
-    buildKeywordSearchUrl: (keyword) =>
-      `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}`,
+    buildKeywordSearchUrl: (keyword, platform) =>
+      platform === "douyin"
+        ? `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`
+        : `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}`,
     captureAndSaveInTab: async (options) => {
       captureCalls.push({
         keyword: options.captureParams.keyword,
@@ -98,7 +124,7 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
             String(result?.error?.code || ""),
           ),
       ),
-    isDouyinPlatform: () => false,
+    isDouyinPlatform: (platform) => platform === "douyin",
     isEmptyKeywordCaptureResult: (result) =>
       Boolean(result?.ok && Array.isArray(result?.data?.items) && result.data.items.length === 0),
     isUnattendedSafetyBlock: (value) => Boolean(value?.securityBlocked),
@@ -114,8 +140,16 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
     }),
     setCaptureTaskTakeoverStateInTab: async () => {},
     submitKeywordSearchInTab: async () => {},
-    switchDouyinKeywordSearchInTab: async () => {},
-    waitForKeywordSearchResultsInTab: async () => true,
+    switchDouyinKeywordSearchInTab: async (tabId, keyword, url) => {
+      navigationCalls.push({tabId, keyword, url, platform: "douyin"});
+      if (typeof switchDouyinKeyword === "function") {
+        await switchDouyinKeyword({tabId, keyword, url});
+      }
+    },
+    waitForKeywordSearchResultsInTab: async (tabId, platform, shouldStop, options) =>
+      typeof waitForResults === "function"
+        ? await waitForResults({tabId, platform, shouldStop, ...(options || {})})
+        : true,
     waitMsWithStop: async () => {},
     waitMsWithStopAndTick: async () => {},
   };
@@ -190,6 +224,101 @@ test("one empty keyword retry does not truncate the remaining 12 keyword plan", 
   );
   assert.equal(harness.settled.length, 13, "every keyword must reach the checkpoint reporter");
   assert.equal(result.canceled, false);
+});
+
+test("a drifted Douyin search page fails only the current keyword and continues", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    waitForResults: async ({keyword}) => keyword !== "词1",
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+  });
+
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词2"],
+    "a stale /jingxuan page must never be captured as the failed keyword",
+  );
+  assert.equal(result.canceled, false);
+  assert.equal(result.stats.processed, 2);
+  assert.equal(result.stats.success, 1);
+  assert.equal(result.stats.failed, 1);
+  assert.equal(harness.settled.length, 2);
+  assert.equal(harness.settled[0].keyword, "词1");
+  assert.equal(harness.settled[0].result.ok, false);
+  assert.equal(harness.settled[1].keyword, "词2");
+  assert.equal(harness.settled[1].result.ok, true);
+});
+
+test("Douyin readiness rejects recommendation, detail, modal, and another keyword URLs", () => {
+  assert.deepEqual(
+    {...inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?type=general",
+      "douyin",
+      "凯迪拉克",
+    )},
+    {searchPathReady: true, keywordConflict: false},
+  );
+  assert.deepEqual(
+    {...inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/jingxuan",
+      "douyin",
+      "凯迪拉克",
+    )},
+    {searchPathReady: false, keywordConflict: false},
+  );
+  assert.equal(
+    inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?modal_id=123",
+      "douyin",
+      "凯迪拉克",
+    ).searchPathReady,
+    false,
+  );
+  assert.equal(
+    inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/video/123",
+      "douyin",
+      "凯迪拉克",
+    ).searchPathReady,
+    false,
+  );
+  assert.deepEqual(
+    {...inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/search/%E5%88%AB%E5%85%8B?type=general",
+      "douyin",
+      "凯迪拉克",
+    )},
+    {searchPathReady: true, keywordConflict: true},
+  );
+});
+
+test("the Douyin fail-closed guard does not make XHS slow readiness fail early", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    waitForResults: async () => false,
+  });
+
+  const result = await harness.run({
+    platform: "xiaohongshu",
+    keywords: ["词1"],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词1"],
+  );
+});
+
+test("Douyin filter reapply must prove results are ready before recapture", () => {
+  assert.match(
+    readBatchFunctionSource(),
+    /const refilteredResultsReady =[\s\S]*?if \(!refilteredResultsReady\) \{[\s\S]*?重挂筛选后搜索结果页仍未就绪/,
+  );
 });
 
 test("keyword three uses the replacement runner tab id after keyword two", async () => {

@@ -195,9 +195,26 @@ export async function setAuth(auth) {
 /**
  * 更新 auth 部分字段
  */
-export async function updateAuth(updates) {
-  const current = await getAuth();
-  return await setAuth({...current, ...updates});
+export async function updateAuth(updates, options = {}) {
+  const mutate = async () => {
+    const current = await getAuth();
+    const expectedMutationId = options.expectedMutationId;
+    if (
+      expectedMutationId !== undefined &&
+      String(current.authMutationId || '') !== String(expectedMutationId || '')
+    ) {
+      return {accepted: false, auth: current};
+    }
+    const auth = {...current, ...updates};
+    const saved = await setAuth(auth);
+    if (!saved) return {accepted: false, auth: current, error: 'write_failed'};
+    return {accepted: true, auth};
+  };
+  const locks = globalThis.navigator?.locks;
+  if (typeof locks?.request === 'function') {
+    return await locks.request('onstarvoice:auth-state', {mode: 'exclusive'}, mutate);
+  }
+  return await mutate();
 }
 
 /**
@@ -223,6 +240,8 @@ function getDefaultAuth() {
     credentialCredit: null,
     credential: null,
     binding: null,
+    captureAgent: null,
+    authMutationId: '',
     tenant: null,
   };
 }

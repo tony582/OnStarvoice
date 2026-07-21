@@ -11,13 +11,11 @@ import { recordDiagnosticError } from './diagnostics.js';
 
 // ==================== 配置 ====================
 
+// Credentials and captured business data must never be replayed across trust
+// origins. Development can opt into one local backend explicitly; production
+// uses only the production origin and does not silently fall back to localhost.
 const API_BASE_URLS = [
-  globalThis.__ONSTARVOICE_API_BASE_URL__,
-  'https://voice.minilife.online',
-  'http://localhost:3001',
-  'http://127.0.0.1:3001',
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
+  globalThis.__ONSTARVOICE_API_BASE_URL__ || 'https://voice.minilife.online',
 ]
   .map((value) => String(value || '').trim().replace(/\/$/, ''))
   .filter((baseUrl, index, values) => baseUrl && values.indexOf(baseUrl) === index);

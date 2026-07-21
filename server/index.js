@@ -38,6 +38,7 @@ import ticketsRouter from './routes/tickets.js';
 import feedbackRouter from './routes/feedback.js';
 import customTagsRouter from './routes/custom-tags.js';
 import relevancePrefilterRouter from './routes/relevance-prefilter.js';
+import captureCloudRouter from './routes/capture-cloud.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
 import { ensureMediaDirs, backfillRecentCovers, MEDIA_DIR } from './services/media-store.js';
 
@@ -63,7 +64,7 @@ app.use(cors({
     return callback(new Error(`CORS origin not allowed: ${origin}`));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-auth-code', 'x-admin-token', 'x-tenant-id', 'x-session-token', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'x-auth-code', 'x-admin-token', 'x-tenant-id', 'x-session-token', 'x-capture-agent-token', 'Authorization'],
 }));
 
 app.use(express.json({ limit: '10mb' }));
@@ -137,6 +138,7 @@ app.use('/api/tickets', ticketsRouter);
 app.use('/api/feedback', feedbackRouter);
 app.use('/api/custom-tags', customTagsRouter);
 app.use('/api/relevance/prefilter', relevancePrefilterRouter);
+app.use('/api/capture-cloud', captureCloudRouter);
 // 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
 app.use('/api/asr-media', asrMediaRouter);
 

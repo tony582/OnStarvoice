@@ -7,12 +7,13 @@ import { LABELS } from '@/lib/utils'
 interface TopBarProps {
   eyebrow: string
   title: string
+  badge?: string
   collapsed?: boolean
   onToggleCollapse?: () => void
   onOpenMobileNavigation?: () => void
 }
 
-export function TopBar({ eyebrow, title, collapsed, onToggleCollapse, onOpenMobileNavigation }: TopBarProps) {
+export function TopBar({ eyebrow, title, badge, collapsed, onToggleCollapse, onOpenMobileNavigation }: TopBarProps) {
   const { user, tenants, tenantId, switchTenant, logout } = useAuth()
 
   return (
@@ -39,7 +40,10 @@ export function TopBar({ eyebrow, title, collapsed, onToggleCollapse, onOpenMobi
           )}
           <div className="min-w-0">
             <div className="hidden text-[9px] font-medium uppercase tracking-[0.16em] text-muted-foreground sm:block">{eyebrow}</div>
-            <h1 className="truncate text-[15px] font-semibold leading-tight tracking-tight sm:text-[16px]">{title}</h1>
+            <div className="flex min-w-0 items-center gap-2">
+              <h1 className="truncate text-[15px] font-semibold leading-tight tracking-tight sm:text-[16px]">{title}</h1>
+              {badge && <span className="shrink-0 rounded border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[8px] font-extrabold uppercase tracking-[0.12em] text-primary">{badge}</span>}
+            </div>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1 sm:gap-2.5">

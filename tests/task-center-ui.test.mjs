@@ -150,6 +150,109 @@ test("task center aggregation keeps ledger and legacy histories in one model", a
   assert.deepEqual(new Set(items.map((item) => item.type)), new Set(["keyword", "sync", "monitor"]));
 });
 
+test("task center orders all business tasks by start time descending", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?task-center-time-order-test=${Date.now()}`
+  );
+  const items = buildTaskCenterItems({
+    ledgerState: {
+      runs: [
+        {
+          id: "older-running-task",
+          taskType: "capture",
+          status: "running",
+          createdAt: "2026-07-21T02:00:00.000Z",
+          updatedAt: "2026-07-21T02:30:00.000Z",
+        },
+        {
+          id: "newer-completed-task",
+          taskType: "capture",
+          status: "completed",
+          createdAt: "2026-07-21T02:20:00.000Z",
+          updatedAt: "2026-07-21T02:21:00.000Z",
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(items.map((item) => item.id), [
+    "newer-completed-task",
+    "older-running-task",
+  ]);
+});
+
+test("task center hides capture child syncs but keeps user initiated sync tasks", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?task-center-sync-visibility-test=${Date.now()}`
+  );
+  const items = buildTaskCenterItems({
+    ledgerState: {
+      runs: [
+        {
+          id: "capture-task",
+          taskType: "capture",
+          status: "completed",
+          createdAt: "2026-07-21T02:00:00.000Z",
+        },
+        {
+          id: "technical-sync-ledger",
+          taskType: "sync",
+          status: "completed",
+          createdAt: "2026-07-21T02:03:00.000Z",
+          metadata: {taskCenterVisibility: "internal"},
+        },
+      ],
+    },
+    historyConfig: {
+      entries: [
+        {
+          id: "detail-auto-sync",
+          trigger: "detail_auto",
+          status: "completed",
+          startedAt: "2026-07-21T02:02:00.000Z",
+          finishedAt: "2026-07-21T02:02:01.000Z",
+        },
+        {
+          id: "capture-auto-sync",
+          trigger: "capture_auto",
+          status: "completed",
+          startedAt: "2026-07-21T02:01:00.000Z",
+          finishedAt: "2026-07-21T02:01:01.000Z",
+        },
+        {
+          id: "manual-page-sync",
+          trigger: "current_page",
+          status: "completed",
+          startedAt: "2026-07-21T02:04:00.000Z",
+          finishedAt: "2026-07-21T02:04:01.000Z",
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ["legacy:sync:manual-page-sync", "capture-task"],
+  );
+});
+
+test("single-record capture auto sync keeps its internal trigger in history", async () => {
+  const captureSync = await read("utils/capture-sync.js");
+
+  assert.match(
+    captureSync,
+    /syncRecord\(syncRecordIds\[0\], onProgress, \{\s*trigger: 'capture_auto'/,
+  );
+  assert.match(
+    captureSync,
+    /const historyTrigger = String\(options\?\.trigger \|\| 'single'\)/,
+  );
+  assert.equal(
+    captureSync.match(/trigger: historyTrigger/g)?.length,
+    4,
+  );
+});
+
 test("task center clear cutoff hides old local and backend history", async () => {
   const {buildTaskCenterItems} = await import(
     `../sidebar/task-center-ui.js?task-center-clear-test=${Date.now()}`

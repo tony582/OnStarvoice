@@ -2342,6 +2342,7 @@ export async function captureAndSync({
     const syncResult =
       syncRecordIds.length === 1
         ? await syncRecord(syncRecordIds[0], onProgress, {
+            trigger: 'capture_auto',
             commentLeadsConfig,
             shouldStop,
             signal,
@@ -6142,6 +6143,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
   const startedAt = Date.now();
   const shouldStop = options?.shouldStop;
   const signal = options?.signal || null;
+  const historyTrigger = String(options?.trigger || 'single').trim() || 'single';
   try {
     if (isSyncCancellationRequested(shouldStop, signal)) {
       await resetCanceledSyncState();
@@ -6367,6 +6369,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
               recordId,
               result,
               startedAt,
+              trigger: historyTrigger,
             });
             return result;
           }
@@ -6428,6 +6431,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
         recordId,
         result,
         startedAt,
+        trigger: historyTrigger,
       });
       return result;
     } else {
@@ -6473,6 +6477,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
         recordId,
         result,
         startedAt,
+        trigger: historyTrigger,
       });
       return result;
     }
@@ -6520,6 +6525,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
       recordId,
       result,
       startedAt,
+      trigger: historyTrigger,
     });
     return result;
   }
@@ -13668,9 +13674,19 @@ export async function batchCaptureByKeywords({
           message: `正在等待「${keyword}」搜索结果加载(${i + 1}/${keywords.length})...`,
         });
       }
-      await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-        keyword,
-      });
+      const initialResultsReady = await waitForKeywordSearchResultsInTab(
+        runnerTabId,
+        platform,
+        shouldStop,
+        {
+          keyword,
+        },
+      );
+      if (!initialResultsReady && isDouyinPlatform(platform)) {
+        throw new Error(
+          `「${keyword}」搜索结果页未就绪，已结束本次尝试并保留后续关键词`,
+        );
+      }
 
       // 按需切换搜索「排序 / 范围」(默认值则跳过)。
       // 关键:筛选后结果没加载(如抖音「服务出现异常」)绝不能继续采——后面的重试会
@@ -13821,20 +13837,39 @@ export async function batchCaptureByKeywords({
             onTick: reportRetryWaitProgress,
           },
         );
-        await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-          keyword,
-        });
+        const retryResultsReady = await waitForKeywordSearchResultsInTab(
+          runnerTabId,
+          platform,
+          shouldStop,
+          {keyword},
+        );
+        if (!retryResultsReady && isDouyinPlatform(platform)) {
+          throw new Error(
+            `「${keyword}」重试后搜索结果页仍未就绪，已保留后续关键词`,
+          );
+        }
         // 抖音上面刚重新点了搜索,已挂的筛选会被清空:配置了筛选就必须重挂再采,
         // 否则采到的是未筛选(可能好几年前)的内容。
         if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
           await applySearchFiltersInTab(runnerTabId, searchFilters);
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
           await waitMsWithStop(1200, shouldStop, 'BATCH_CAPTURE_CANCELED');
-          await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-            keyword,
-            timeoutMs: 12000,
-            stablePolls: 1,
-          });
+          const refilteredResultsReady =
+            await waitForKeywordSearchResultsInTab(
+              runnerTabId,
+              platform,
+              shouldStop,
+              {
+                keyword,
+                timeoutMs: 12000,
+                stablePolls: 1,
+              },
+            );
+          if (!refilteredResultsReady) {
+            throw new Error(
+              `「${keyword}」重挂筛选后搜索结果页仍未就绪，已保留后续关键词`,
+            );
+          }
         }
         await closeKeywordSearchFilterPanelInTab(runnerTabId);
         captureRunResult = await runKeywordCapture();
@@ -15182,6 +15217,55 @@ function isEmptyKeywordCaptureResult(captureResult) {
   return items.length === 0 && rawTotalCount === 0 && filteredCount === 0;
 }
 
+function inspectKeywordSearchPageUrl(
+  pageUrl = '',
+  platform = '',
+  expectedKeyword = '',
+) {
+  if (String(platform || '').trim().toLowerCase() !== 'douyin') {
+    return {searchPathReady: true, keywordConflict: false};
+  }
+  try {
+    const url = new URL(String(pageUrl || ''));
+    const pathname = String(url.pathname || '').toLowerCase();
+    const searchPathReady =
+      !url.searchParams.has('modal_id') &&
+      (pathname.startsWith('/search/') ||
+        pathname.startsWith('/jingxuan/search'));
+    const decodeRepeatedly = (value) => {
+      let decoded = String(value || '');
+      for (let index = 0; index < 2; index += 1) {
+        try {
+          const next = decodeURIComponent(decoded);
+          if (next === decoded) break;
+          decoded = next;
+        } catch {
+          break;
+        }
+      }
+      return decoded;
+    };
+    const normalize = (value) =>
+      String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+    const rawUrlKeyword =
+      url.searchParams.get('keyword') ||
+      url.searchParams.get('query') ||
+      url.searchParams.get('q') ||
+      pathname.split('/search/')[1]?.split('/')[0] ||
+      '';
+    const urlKeyword = normalize(decodeRepeatedly(rawUrlKeyword));
+    const expected = normalize(expectedKeyword);
+    return {
+      searchPathReady,
+      keywordConflict: Boolean(
+        searchPathReady && expected && urlKeyword && urlKeyword !== expected,
+      ),
+    };
+  } catch {
+    return {searchPathReady: false, keywordConflict: false};
+  }
+}
+
 async function waitForKeywordSearchResultsInTab(
   tabId,
   platform = '',
@@ -15411,6 +15495,7 @@ async function waitForKeywordSearchResultsInTab(
           return {
             cardCount: cardNodes.length,
             keywordMatched,
+            pageUrl: window.location.href,
             signature,
           };
         },
@@ -15422,12 +15507,20 @@ async function waitForKeywordSearchResultsInTab(
     const cardCount = Number(snapshot?.cardCount || 0);
     const signature = String(snapshot?.signature || '');
     const keywordMatched = Boolean(snapshot?.keywordMatched);
+    const {searchPathReady, keywordConflict} = inspectKeywordSearchPageUrl(
+      snapshot?.pageUrl || '',
+      platform,
+      keyword,
+    );
     // 宽限期内仍要求关键词字面对上(防抢跑、防读到上一个词的旧结果);
     // 超过宽限期后,只要结果卡片稳定出现就放行,不再因抖音 URL 编码对不上而空等到超时。
     const keywordMatchGraceElapsed =
       Date.now() - startedAt >= BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS;
     const resultsAccepted =
-      cardCount > 0 && (keywordMatched || keywordMatchGraceElapsed);
+      searchPathReady &&
+      !keywordConflict &&
+      cardCount > 0 &&
+      (keywordMatched || keywordMatchGraceElapsed);
     if (
       resultsAccepted &&
       signature &&
