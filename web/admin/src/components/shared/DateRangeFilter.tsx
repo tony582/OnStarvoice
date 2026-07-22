@@ -20,12 +20,13 @@ const BASIS_ORDER: [DateBasis, string][] = [['publish', '发布时间'], ['recen
  * 把原生 date 控件收进弹层,并提供近 7/30 天等快捷。值为 YYYY-MM-DD。
  * basis 切换筛选维度:发布时间(published_ts)/ 最近采集(last_seen_at)/ 首次采集(first_seen_at)。
  */
-export function DateRangeFilter({ from, to, onChange, basis, onBasisChange }: {
+export function DateRangeFilter({ from, to, onChange, basis, onBasisChange, triggerClassName }: {
   from: string
   to: string
   onChange: (from: string, to: string) => void
   basis: DateBasis
   onBasisChange: (b: DateBasis) => void
+  triggerClassName?: string
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -56,7 +57,7 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange }: {
     <div className="relative" ref={ref}>
       <button type="button" onClick={() => setOpen(o => !o)}
         className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          active ? 'text-primary' : 'text-muted-foreground')}>
+          active ? 'text-primary' : 'text-muted-foreground', triggerClassName)}>
         <CalendarRange className="h-3.5 w-3.5" />
         {label}
         <ChevronDown className="h-3 w-3" />

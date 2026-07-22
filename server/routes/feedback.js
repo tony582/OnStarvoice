@@ -1,16 +1,123 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
-import { requireSessionUser, requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
-import { FEEDBACK_REVIEW_STATUSES, FEEDBACK_TYPES, normalizeReviewStatus } from '../services/record-feedback.js';
+import {
+  requirePlatformAdmin,
+  requireSessionUser,
+  requireTenantAccess,
+  requireTenantWriter,
+} from '../middleware/auth.js';
+import {
+  FEEDBACK_REVIEW_STATUSES,
+  FEEDBACK_TYPES,
+  insertRecordFeedback,
+  normalizeFeedbackReason,
+  normalizeReviewStatus,
+} from '../services/record-feedback.js';
 import { fmtTs, sendXlsx } from '../services/xlsx-export.js';
 import { identityLabel } from './triage.js';
+import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifecycle.js';
 
 const router = Router();
 
 router.use(requireTenantAccess, requireSessionUser);
 
 const TYPE_LABELS = { false_positive: '误报', manual_correction: '人工修正' };
-const STATUS_LABELS = { pending: '待复核', reviewed: '已复核', summarized: '已总结', dismissed: '已忽略' };
+const STATUS_LABELS = { pending: '待复核', reviewed: '已复核', summarized: '已记录', dismissed: '已忽略' };
+
+// 客户提交误报只复制一份快照到反馈台账，不改变帖子的处理模式、备注或归档状态。
+router.post('/false-positive', requireTenantWriter, async (req, res, next) => {
+  try {
+    const recordId = String(req.body?.recordId || '').trim();
+    if (!recordId) {
+      return res.status(400).json({ ok: false, error: 'record_id_required', message: '缺少内容ID' });
+    }
+    const checkedReason = normalizeFeedbackReason(req.body?.reason, { required: true });
+    if (!checkedReason.ok) {
+      return res.status(400).json({ ok: false, error: checkedReason.error, message: checkedReason.message });
+    }
+
+    const result = await withTransaction(async tx => {
+      const lifecycle = await getRecordLifecycle({
+        tenantId: req.tenantId,
+        recordId,
+        tx,
+        lock: true,
+      });
+      if (!lifecycle) return null;
+      if (lifecycle.archived_at) return { archived: true };
+      const record = await tx.queryOne(
+        'SELECT * FROM records WHERE id = $1 AND tenant_id = $2',
+        [recordId, req.tenantId],
+      );
+      const triage = await tx.queryOne(
+        'SELECT * FROM record_triage WHERE tenant_id = $1 AND record_id = $2',
+        [req.tenantId, record.id],
+      );
+      const pending = await tx.queryOne(`
+        SELECT id
+        FROM record_feedback
+        WHERE tenant_id = $1 AND record_id = $2
+          AND feedback_type = 'false_positive' AND review_status = 'pending'
+        LIMIT 1
+      `, [req.tenantId, record.id]);
+      if (pending) {
+        const err = new Error('该内容已有待复核误报');
+        err.code = 'pending_feedback_exists';
+        throw err;
+      }
+
+      const originalValues = {
+        triage_status: triage?.status || 'unhandled',
+        triage_note: triage?.note || '',
+        archived: Boolean(triage?.archived_at),
+      };
+      const feedback = await insertRecordFeedback(tx, {
+        tenantId: req.tenantId,
+        record,
+        triage,
+        feedbackType: 'false_positive',
+        reason: checkedReason.value,
+        originalValues,
+        correctedValues: originalValues,
+        actorUserId: req.user.id,
+        actorName: req.actorName || req.user.name || req.user.email || '',
+      });
+
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES ($1, 'user', $2, $3, 'record.false_positive_reported', 'record', $4, $5::jsonb)
+      `, [
+        req.tenantId,
+        req.user.id,
+        req.user.id,
+        record.id,
+        JSON.stringify({
+          feedbackId: feedback.id,
+          reason: checkedReason.value,
+          triageStatus: originalValues.triage_status,
+          archived: originalValues.archived,
+          flowUnchanged: true,
+        }),
+      ]);
+
+      return { feedback, triageStatus: originalValues.triage_status, archived: originalValues.archived };
+    });
+
+    if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (result.archived) return sendRecordArchived(res, [recordId]);
+    return res.status(201).json({ ok: true, ...result, flowUnchanged: true });
+  } catch (err) {
+    if (err.code === 'pending_feedback_exists' || err.code === '23505') {
+      return res.status(409).json({ ok: false, error: 'pending_feedback_exists', message: '该内容已有待复核误报' });
+    }
+    return next(err);
+  }
+});
+
+// 误报台账、导出与复核仅供平台管理员使用；客户账号只有提交权限。
+router.use(requirePlatformAdmin);
 
 export function normalizeFeedbackFilters(query = {}) {
   const status = String(query.status || query.reviewStatus || '').trim();
@@ -204,11 +311,12 @@ router.patch('/:id', requireTenantWriter, async (req, res, next) => {
       return res.status(400).json({ ok: false, error: 'invalid_status', message: '反馈复核状态无效' });
     }
     const reviewNote = String(req.body?.reviewNote ?? req.body?.note ?? '').trim().slice(0, 4000);
+    // summarized 是兼容存量数据的内部状态码，只表示“已保存复核记录”，不会调用或投喂任何 AI。
     if (reviewStatus === 'summarized' && !reviewNote) {
       return res.status(400).json({
         ok: false,
         error: 'summary_note_required',
-        message: '纳入总结前请填写总结结论',
+        message: '保存记录前请填写复核结论',
       });
     }
     const actorUserId = req.user?.id || null;
@@ -219,7 +327,7 @@ router.patch('/:id', requireTenantWriter, async (req, res, next) => {
         UPDATE record_feedback
         SET review_status = $3,
           review_note = $4,
-          reviewed_by_user_id = CASE WHEN $3 = 'pending' THEN NULL ELSE $5 END,
+          reviewed_by_user_id = CASE WHEN $3 = 'pending' THEN NULL ELSE $5::uuid END,
           reviewed_by_name = CASE WHEN $3 = 'pending' THEN '' ELSE $6 END,
           reviewed_at = CASE WHEN $3 = 'pending' THEN NULL ELSE now() END,
           updated_at = now()

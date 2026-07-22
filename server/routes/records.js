@@ -11,6 +11,7 @@ import { insertRecordFeedback, normalizeFeedbackReason } from '../services/recor
 import { startTranscription } from '../services/transcription.js';
 import { analyzeTranscript } from '../services/transcript-analysis.js';
 import { formatPublishDate } from '../services/publish-date.js';
+import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifecycle.js';
 
 const router = Router();
 
@@ -322,6 +323,158 @@ router.get('/:id/versions', requireTenantAccess, async (req, res, next) => {
   }
 });
 
+router.get('/:id/manual-history', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    if (!await ensureRecord(req, res)) return;
+    const history = await queryAll(`
+      SELECT
+        rf.id,
+        rf.original_values,
+        rf.corrected_values,
+        COALESCE(NULLIF(rf.submitted_by_name, ''), NULLIF(u.name, ''), u.email, '未知用户') AS submitted_by_name,
+        rf.submitted_at
+      FROM record_feedback rf
+      LEFT JOIN users u ON u.id = rf.submitted_by_user_id
+      WHERE rf.record_id = $1
+        AND rf.tenant_id = $2
+        AND rf.feedback_type = 'manual_correction'
+      ORDER BY rf.submitted_at DESC, rf.id DESC
+      LIMIT 100
+    `, [req.params.id, req.tenantId]);
+    return res.json({ ok: true, history });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 内容处理时间线：汇总人工判断、模式、归档、标签、工单等审计记录与追加备注。
+// 采集快照单独留在 observations，避免互动数字变化淹没真正的客户处理动作。
+router.get('/:id/activity', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    if (!await ensureRecord(req, res)) return;
+    const [audits, notes, legacyTriage] = await Promise.all([
+      queryAll(`
+        SELECT
+          al.id,
+          al.action,
+          al.metadata,
+          COALESCE(NULLIF(u.name, ''), u.email, NULLIF(al.actor_id, ''), '系统') AS actor_name,
+          al.created_at
+        FROM audit_logs al
+        LEFT JOIN users u ON u.id = al.actor_user_id
+        WHERE al.tenant_id = $2
+          AND al.target_type = 'record'
+          AND al.action <> 'record.note_added'
+          AND (
+            al.target_id = $1
+            OR COALESCE(al.metadata->'recordIds', '[]'::jsonb) ? $1
+          )
+        ORDER BY al.created_at DESC, al.id DESC
+        LIMIT 200
+      `, [req.params.id, req.tenantId]),
+      queryAll(`
+        SELECT
+          rn.id,
+          rn.body,
+          COALESCE(NULLIF(rn.author_name, ''), NULLIF(u.name, ''), u.email, '未知用户') AS actor_name,
+          rn.created_at
+        FROM record_notes rn
+        LEFT JOIN users u ON u.id = rn.author_user_id
+        WHERE rn.record_id = $1 AND rn.tenant_id = $2
+        ORDER BY rn.created_at DESC, rn.id DESC
+        LIMIT 200
+      `, [req.params.id, req.tenantId]),
+      queryOne(`
+        SELECT id, note, owner_name, updated_at
+        FROM record_triage
+        WHERE record_id = $1 AND tenant_id = $2 AND btrim(note) <> ''
+      `, [req.params.id, req.tenantId]),
+    ]);
+
+    const legacyNoteCovered = legacyTriage && audits.some(item => {
+      const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
+      return [metadata.note, metadata.reason].some(value => String(value || '').trim() === String(legacyTriage.note || '').trim());
+    });
+    const activity = [
+      ...audits.map(item => ({ ...item, metadata: item.metadata || {} })),
+      ...notes.map(item => ({
+        id: item.id,
+        action: 'record.note_added',
+        metadata: { body: item.body },
+        actor_name: item.actor_name,
+        created_at: item.created_at,
+      })),
+      ...(legacyTriage && !legacyNoteCovered ? [{
+        id: `legacy-${legacyTriage.id}`,
+        action: 'record.legacy_triage_note',
+        metadata: { body: legacyTriage.note },
+        actor_name: legacyTriage.owner_name || '历史处理人',
+        created_at: legacyTriage.updated_at,
+      }] : []),
+    ]
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, 200);
+
+    return res.json({ ok: true, activity });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/:id/notes', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const body = String(req.body?.body || '').trim();
+    if (!body) {
+      return res.status(400).json({ ok: false, error: 'empty_body', message: '备注内容不能为空' });
+    }
+    if (body.length > 2000) {
+      return res.status(400).json({ ok: false, error: 'body_too_long', message: '备注最多 2000 个字符' });
+    }
+
+    const note = await withTransaction(async tx => {
+      const lifecycle = await getRecordLifecycle({
+        tenantId: req.tenantId,
+        recordId: req.params.id,
+        tx,
+        lock: true,
+      });
+      if (!lifecycle) return null;
+      if (lifecycle.archived_at) return { archived: true };
+      const inserted = await tx.queryOne(`
+        INSERT INTO record_notes (
+          tenant_id, record_id, body, author_user_id, author_name
+        ) VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, body, author_user_id, author_name, created_at
+      `, [
+        req.tenantId,
+        lifecycle.id,
+        body,
+        req.user?.id || null,
+        req.actorName || req.user?.name || req.user?.email || '',
+      ]);
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES ($1, 'user', $2, $3, 'record.note_added', 'record', $4, $5::jsonb)
+      `, [
+        req.tenantId,
+        req.user?.id || '',
+        req.user?.id || null,
+        lifecycle.id,
+        JSON.stringify({ noteId: inserted.id }),
+      ]);
+      return inserted;
+    });
+
+    if (!note) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (note.archived) return sendRecordArchived(res, [req.params.id]);
+    return res.json({ ok: true, note });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.get('/:id/comments', requireTenantAccess, async (req, res, next) => {
   try {
     if (!await ensureRecord(req, res)) return;
@@ -346,11 +499,18 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
     const updatedAt = new Date().toISOString();
 
     const result = await withTransaction(async tx => {
+      const lifecycle = await getRecordLifecycle({
+        tenantId: req.tenantId,
+        recordId: req.params.id,
+        tx,
+        lock: true,
+      });
+      if (!lifecycle) return null;
+      if (lifecycle.archived_at) return { archived: true };
       const record = await tx.queryOne(
-        'SELECT * FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
+        'SELECT * FROM records WHERE id = $1 AND tenant_id = $2',
         [req.params.id, req.tenantId],
       );
-      if (!record) return null;
 
       const changedFields = [];
       const originalValues = {};
@@ -486,6 +646,7 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
     });
 
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (result.archived) return sendRecordArchived(res, [req.params.id]);
     result.record.publish_display = formatPublishDate(result.record.publish_time, result.record.created_at);
     return res.json({ ok: true, ...result });
   } catch (err) {
@@ -503,15 +664,18 @@ router.patch('/:id/custom-tags', requireTenantAccess, requireSessionUser, requir
     const actorUserId = req.user?.id || null;
     const actorName = req.actorName || req.user?.name || req.user?.email || '';
     const result = await withTransaction(async tx => {
-      const record = await tx.queryOne(
-        'SELECT id FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE',
-        [req.params.id, req.tenantId],
-      );
-      if (!record) return null;
+      const lifecycle = await getRecordLifecycle({
+        tenantId: req.tenantId,
+        recordId: req.params.id,
+        tx,
+        lock: true,
+      });
+      if (!lifecycle) return null;
+      if (lifecycle.archived_at) return { archived: true };
 
       const changed = await applyRecordCustomTagPatch(tx, {
         tenantId: req.tenantId,
-        recordId: record.id,
+        recordId: lifecycle.id,
         patch,
         actorUserId,
         actorName,
@@ -524,7 +688,7 @@ router.patch('/:id/custom-tags', requireTenantAccess, requireSessionUser, requir
           ) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
         `, [
           req.tenantId,
-          record.id,
+          lifecycle.id,
           ['custom_tags'],
           JSON.stringify({ custom_tags: changed.before }),
           JSON.stringify({ custom_tags: changed.after }),
@@ -539,7 +703,7 @@ router.patch('/:id/custom-tags', requireTenantAccess, requireSessionUser, requir
           req.tenantId,
           actorUserId || '',
           actorUserId,
-          record.id,
+          lifecycle.id,
           JSON.stringify({
             added: changed.added,
             removed: changed.removed,
@@ -553,6 +717,7 @@ router.patch('/:id/custom-tags', requireTenantAccess, requireSessionUser, requir
     });
 
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (result.archived) return sendRecordArchived(res, [req.params.id]);
     return res.json({
       ok: true,
       custom_tags: result.after,
@@ -570,11 +735,25 @@ router.patch('/:id/custom-tags', requireTenantAccess, requireSessionUser, requir
 
 router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    if (!await ensureRecord(req, res)) return;
     const status = String(req.body?.status || 'responded');
     const note = String(req.body?.note || '');
     const nextStatus = status === 'needs_followup' ? 'needs_followup' : 'responded';
-    await withTransaction(async tx => {
+    const result = await withTransaction(async tx => {
+      const lifecycle = await getRecordLifecycle({
+        tenantId: req.tenantId,
+        recordId: req.params.id,
+        tx,
+        lock: true,
+      });
+      if (!lifecycle) return { notFound: true };
+      if (lifecycle.archived_at) return { archived: true };
+      const previous = await tx.queryOne(`
+        SELECT r.official_response_status,
+          COALESCE(rt.status, 'unhandled') AS triage_status
+        FROM records r
+        LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
+        WHERE r.id = $1 AND r.tenant_id = $2
+      `, [req.params.id, req.tenantId]);
       await tx.execute(`
         UPDATE records
         SET official_replied = true,
@@ -595,8 +774,17 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1, 'user', $2, $3, 'record.official_response_marked', 'record', $4, $5::jsonb)
-      `, [req.tenantId, req.user?.id || '', req.user?.id || null, req.params.id, JSON.stringify({ status: nextStatus, note })]);
+      `, [req.tenantId, req.user?.id || '', req.user?.id || null, req.params.id, JSON.stringify({
+        previousStatus: previous?.triage_status || 'unhandled',
+        nextStatus: 'official_responded',
+        previousOfficialStatus: previous?.official_response_status || 'none',
+        nextOfficialStatus: nextStatus,
+        note,
+      })]);
+      return { updated: true };
     });
+    if (result.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (result.archived) return sendRecordArchived(res, [req.params.id]);
     return res.json({ ok: true });
   } catch (err) {
     return next(err);
@@ -663,6 +851,9 @@ router.get('/:id/transcript', requireTenantAccess, async (req, res, next) => {
  */
 router.post('/:id/transcribe', requireTenantAccess, async (req, res, next) => {
   try {
+    const lifecycle = await getRecordLifecycle({ tenantId: req.tenantId, recordId: req.params.id });
+    if (!lifecycle) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (lifecycle.archived_at) return sendRecordArchived(res, [req.params.id]);
     const result = await startTranscription({ tenantId: req.tenantId, recordId: req.params.id });
     if (!result.ok && result.error === 'not_found') {
       return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
@@ -679,6 +870,9 @@ router.post('/:id/transcribe', requireTenantAccess, async (req, res, next) => {
  */
 router.post('/:id/analyze-transcript', requireTenantAccess, async (req, res, next) => {
   try {
+    const lifecycle = await getRecordLifecycle({ tenantId: req.tenantId, recordId: req.params.id });
+    if (!lifecycle) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    if (lifecycle.archived_at) return sendRecordArchived(res, [req.params.id]);
     const result = await analyzeTranscript({ tenantId: req.tenantId, recordId: req.params.id });
     if (!result.ok && result.error === 'not_found') return res.status(404).json(result);
     if (!result.ok && result.error === 'no_transcript') return res.status(400).json(result);

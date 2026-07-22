@@ -134,8 +134,10 @@ function rootFromPath(path: string, search = ''): RootTab | null {
 
 function BottomNav({ active }: { active: RootTab | null }) {
   const { badges } = useBadges()
+  const { isPlatformAdmin } = useAuth()
   const routerNavigate = useRouterNavigate()
-  const taskCount = badges.triagePending + badges.leadsNew + badges.ticketsPending + badges.feedbackPending + badges.issuesOpen
+  const taskCount = badges.triagePending + badges.leadsNew + badges.ticketsPending
+    + (isPlatformAdmin() ? badges.feedbackPending : 0) + badges.issuesOpen
 
   return (
     <nav aria-label="手机端主导航" className="mobile-bottom-nav relative z-30 grid shrink-0 grid-cols-5 border-t border-border/80 bg-card/95 px-1 pt-1 backdrop-blur-xl">
@@ -340,7 +342,7 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
           <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green" style={{ width: `${handledPct}%` }} /></div>
           <div className="mt-3 grid grid-cols-3 divide-x divide-border text-center">
             <MiniMetric label="待判断" value={k.unhandled} />
-            <MiniMetric label="复核中" value={k.reviewing} />
+            <MiniMetric label="负面流程" value={k.reviewing} />
             <MiniMetric label="已关联" value={k.issue_linked} />
           </div>
         </section>
@@ -358,13 +360,15 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
 
 function TasksHub({ openPage }: { openPage: OpenPage }) {
   const { badges } = useBadges()
-  const total = badges.triagePending + badges.leadsNew + badges.ticketsPending + badges.feedbackPending + badges.issuesOpen
+  const { isPlatformAdmin } = useAuth()
+  const adminFeedback = isPlatformAdmin() ? badges.feedbackPending : 0
+  const total = badges.triagePending + badges.leadsNew + badges.ticketsPending + adminFeedback + badges.issuesOpen
   const queues = [
-    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、人工修正、转工单或归档', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
+    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、人工修正、转工单或标记处理模式', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
     { title: '评论分诊', count: badges.leadsNew, copy: '跟进风险评论，转工单或忽略', icon: MessageSquare, tone: 'orange', page: 'workbench', params: { queue: 'leads' } },
     { title: '已转工单', count: badges.ticketsPending, copy: '补充进展、追踪处理并完成结案', icon: Headphones, tone: 'blue', page: 'workbench', params: { queue: 'feedback' } },
     { title: '问题处置', count: badges.issuesOpen, copy: '确认负责人、解决问题或关闭事件', icon: CircleAlert, tone: 'purple', page: 'workbench', params: { queue: 'issues' } },
-    { title: '误判反馈', count: badges.feedbackPending, copy: '核对 AI 与人工判断差异并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } },
+    ...(isPlatformAdmin() ? [{ title: '误判反馈', count: badges.feedbackPending, copy: '核对客户提交的误报并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } }] : []),
   ]
 
   return (
@@ -560,7 +564,7 @@ function MobilePageSurface() {
   const routerNavigate = useRouterNavigate()
   const location = useLocation()
   const { page, params, seq, navigate } = useNav()
-  const { tenantId } = useAuth()
+  const { tenantId, isPlatformAdmin } = useAuth()
   const querySignature = searchParams.toString()
   const query = useMemo(() => Object.fromEntries(searchParams.entries()), [querySignature]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -570,7 +574,9 @@ function MobilePageSurface() {
   }, [page, pageId, params, query, navigate])
 
   const PageComponent = PAGE_COMPONENTS[pageId]
-  const title = pageId === 'workbench' ? (QUEUE_TITLES[query.queue || 'triage'] || PAGE_TITLES[pageId]) : (PAGE_TITLES[pageId] || '功能')
+  const requestedQueue = query.queue || 'triage'
+  const visibleQueue = requestedQueue === 'misjudgments' && !isPlatformAdmin() ? 'triage' : requestedQueue
+  const title = pageId === 'workbench' ? (QUEUE_TITLES[visibleQueue] || PAGE_TITLES[pageId]) : (PAGE_TITLES[pageId] || '功能')
   const backRoot = rootForPage(pageId, query)
 
   return (

@@ -18,11 +18,11 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 ]
 
 // 舆情工作台下的二级队列(在侧边栏纵向展开,替代主区横向卡片带)
-const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
+const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string; platformAdmin?: boolean }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
   { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsPending', dot: 'bg-violet-500' },
-  { queue: 'misjudgments', label: '误判反馈', badgeKey: 'feedbackPending', dot: 'bg-rose-500' },
+  { queue: 'misjudgments', label: '误判反馈', badgeKey: 'feedbackPending', dot: 'bg-rose-500', platformAdmin: true },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
@@ -208,6 +208,7 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
               <div className="relative mb-1 mt-0.5 space-y-0.5 pl-[26px]">
                 <span className="absolute bottom-1.5 left-[18px] top-1.5 w-px bg-sidebar-border" />
                 {WORKBENCH_QUEUES.map(q => {
+                  if (q.platformAdmin && !isPlatformAdmin()) return null
                   const on = onWorkbench && activeQueue === q.queue
                   const count = q.badgeKey ? badges[q.badgeKey] : 0
                   return (

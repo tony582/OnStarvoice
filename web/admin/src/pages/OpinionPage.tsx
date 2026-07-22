@@ -77,11 +77,12 @@ export function OpinionPage() {
         title: action === 'dismiss' ? '忽略原因' : '处理结果',
         placeholder: action === 'dismiss' ? '例如:与本品牌无关 / 重复工单' : '例如:已官方回复并私信用户 / 已转售后跟进',
       })
-      if (v === null) return
+      if (v === null) return false
       note = v
     }
-    await api.patch(`/tickets/${item.id}`, { action, ...(note !== undefined ? { note } : {}) })
-    setDrawer(null)
+    const data = await api.patch<any>(`/tickets/${item.id}`, { action, ...(note !== undefined ? { note } : {}) })
+    const updated = data.ticket || item
+    setDrawer((current: any) => current?.id === item.id ? { ...current, ...updated } : current)
     await load(pagination?.page ?? 1)
     refreshBadges()
     if (action === 'done' || action === 'dismiss') {
@@ -127,7 +128,7 @@ export function OpinionPage() {
             {items.map(it => {
               const actionable = canWrite() && (it.status === 'pending' || it.status === 'doing')
               return (
-                <article key={it.id} className="relative overflow-hidden rounded-xl border border-border bg-card p-3.5 shadow-xs">
+                <article key={it.id} data-ticket-detail-trigger className="relative overflow-hidden rounded-xl border border-border bg-card p-3.5 shadow-xs">
                   <span className={`absolute inset-y-0 left-0 w-1 ${it.priority === 'urgent' ? 'bg-status-darkred' : it.priority === 'high' ? 'bg-status-red' : 'bg-status-blue'}`} />
                   <button type="button" onClick={() => setDrawer(it)} className="w-full text-left">
                     <div className="flex flex-wrap items-center gap-1.5 pr-5">
@@ -168,7 +169,7 @@ export function OpinionPage() {
             </tr></thead>
             <tbody className="divide-y divide-border/40">
               {items.map(it => (
-                <tr key={it.id} onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-accent/45 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
+                <tr key={it.id} data-ticket-detail-trigger onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-accent/45 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
                   <td className="max-w-[440px] px-4 py-3">
                     <div className="mb-1 flex items-center gap-1.5">
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
@@ -232,6 +233,10 @@ export function OpinionPage() {
           canWrite={canWrite()}
           onClose={() => setDrawer(null)}
           onAction={(action) => act(drawer, action, action === 'done' || action === 'dismiss')}
+          onNoteAdded={note => {
+            setDrawer((current: any) => current ? { ...current, status: current.status === 'pending' ? 'doing' : current.status, updated_at: note.created_at } : current)
+            void load(pagination?.page ?? 1)
+          }}
         />
       )}
       {dialog}

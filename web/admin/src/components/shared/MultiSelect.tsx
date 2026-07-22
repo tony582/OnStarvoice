@@ -20,6 +20,7 @@ export function MultiSelect({
   onChange,
   width = 'w-44',
   className,
+  triggerClassName,
   searchable = false,
   searchPlaceholder = '搜索选项…',
   emptyText = '暂无选项',
@@ -31,6 +32,7 @@ export function MultiSelect({
   onChange: (v: string[]) => void
   width?: string
   className?: string
+  triggerClassName?: string
   searchable?: boolean
   searchPlaceholder?: string
   emptyText?: string
@@ -91,7 +93,7 @@ export function MultiSelect({
     <div className={cn('relative', className)} ref={ref}>
       <button type="button" onClick={toggleOpen} aria-expanded={open}
         className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          value.length ? 'text-primary' : 'text-muted-foreground')}>
+          value.length ? 'text-primary' : 'text-muted-foreground', triggerClassName)}>
         {label}
         {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
         <ChevronDown className="h-3 w-3" />

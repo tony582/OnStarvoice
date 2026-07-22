@@ -34,7 +34,7 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         monitorAttention: Number(row?.monitor_attention || 0),
         ticketsPending: Number(row?.tickets_pending || 0),
         ticketsFeedback: Number(row?.tickets_feedback || 0),
-        feedbackPending: Number(row?.feedback_pending || 0),
+        feedbackPending: req.user?.global_role === 'platform_admin' ? Number(row?.feedback_pending || 0) : 0,
       },
       generatedAt: new Date().toISOString(),
     });
@@ -143,8 +143,8 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
 
     const triageStats = await queryOne(`
       SELECT
-        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') AS unhandled,
-        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') AS reviewing,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled' AND rt.archived_at IS NULL) AS unhandled,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing' AND rt.archived_at IS NULL) AS reviewing,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) AS issue_linked
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
@@ -179,6 +179,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
         AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
+        AND rt.archived_at IS NULL
       ORDER BY
         CASE WHEN r.sentiment = 'negative' THEN 1 ELSE 2 END,
         (r.likes + r.comments_count + r.collects + r.shares) DESC,

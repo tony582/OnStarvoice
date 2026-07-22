@@ -70,11 +70,11 @@ const LABELS = {
     '': '待分类',
   },
   triage: {
-    unhandled: '新线索',
-    reviewing: '待复核',
-    issue_linked: '已转问题',
-    official_responded: '官方已响应',
-    archived: '已归档',
+    unhandled: '待处理',
+    reviewing: '负面流程',
+    issue_linked: '已转工单',
+    official_responded: '官方已评',
+    no_action: '无需操作',
     false_positive: '误报',
   },
   priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' },
@@ -279,12 +279,11 @@ async function renderOverview() {
 async function renderTriage() {
   const el = content();
   const statusTabs = [
-    { value: '', label: '待处理' },
-    { value: 'unhandled', label: '新线索' },
-    { value: 'reviewing', label: '待复核' },
-    { value: 'issue_linked', label: '已转问题' },
-    { value: 'official_responded', label: '已响应' },
-    { value: 'archived', label: '已归档' },
+    { value: '', label: '全部模式' },
+    { value: 'unhandled', label: '待处理' },
+    { value: 'reviewing', label: '负面流程' },
+    { value: 'official_responded', label: '官方已评' },
+    { value: 'no_action', label: '无需操作' },
   ];
   el.innerHTML = `
     <div class="page-intro">
@@ -327,7 +326,7 @@ async function loadTriageTable(page = 1) {
     page,
     pageSize: 30,
     status: valueOf('triageStatus'),
-    queue: valueOf('triageStatus') ? '' : 'active',
+    queue: 'triage',
     sentiment: valueOf('triageSentiment'),
     keyword: valueOf('triageKeyword'),
   });
@@ -629,9 +628,9 @@ function triageActions(r) {
       <button class="secondary action-more" onclick="this.parentElement.classList.toggle('open')">更多</button>
       <div class="action-menu">
         <button onclick="markOfficialResponded('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">标为已响应</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','reviewing'); this.closest('.action-dropdown').classList.remove('open')">移入待复核</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','archived'); this.closest('.action-dropdown').classList.remove('open')">归档</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','false_positive'); this.closest('.action-dropdown').classList.remove('open')">标为误报</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','reviewing'); this.closest('.action-dropdown').classList.remove('open')">负面流程</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','no_action'); this.closest('.action-dropdown').classList.remove('open')">无需操作</button>
+        <button onclick="archiveRecord('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">归档</button>
       </div>
     </div>
   </div>`;
@@ -647,6 +646,12 @@ function issueActions(i) {
 async function updateTriage(recordId, status) {
   await api('/triage/records/' + recordId, { method: 'PATCH', body: { status } });
   toast('分诊已更新', 'success');
+  if (state.page === 'overview') renderOverview(); else loadTriageTable();
+}
+
+async function archiveRecord(recordId) {
+  await api('/triage/records/archive', { method: 'PATCH', body: { ids: [recordId], archived: true } });
+  toast('内容已归档', 'success');
   if (state.page === 'overview') renderOverview(); else loadTriageTable();
 }
 

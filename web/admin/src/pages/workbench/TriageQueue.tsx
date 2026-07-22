@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
-  Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal, LinkIcon,
-  CheckCircle, Archive, Loader2,
-  Package, User, FileText, Bell, ExternalLink,
+  Inbox, Search, ChevronLeft, ChevronRight, MoreHorizontal,
+  Check, CheckCircle, Archive, ArchiveRestore, CircleOff, Loader2, ChevronDown,
+  User, FileText, Bell, ExternalLink,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -30,27 +31,44 @@ import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { Rows3, Kanban } from 'lucide-react'
 
-const STATUS_TABS = [
-  { value: '', label: '待处理', icon: Inbox },
-  { value: 'archived', label: '已归档', icon: Package },
-]
-
 interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
   customTags?: unknown
   custom_tags?: unknown
   record?: unknown
 }
-type SortField = 'publish' | 'interactions' | 'first_seen' | 'last_seen'
+type SortField = 'publish' | 'interactions' | 'comments' | 'likes' | 'first_seen' | 'last_seen'
 const RISK_OPTIONS = [{ value: 'alert', label: '有预警' }, { value: 'negative', label: '有负评' }]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
+type TriageMode = 'unhandled' | 'reviewing' | 'official_responded' | 'no_action'
+type ArchiveView = 'active' | 'archived'
+const TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: React.ElementType }> = [
+  { value: 'unhandled', label: '待处理', icon: Inbox },
+  { value: 'reviewing', label: '负面流程', icon: Bell },
+  { value: 'official_responded', label: '官方已评', icon: CheckCircle },
+  { value: 'no_action', label: '无需操作', icon: CircleOff },
+]
+const ARCHIVE_VIEWS: Array<{ value: ArchiveView; label: string; icon: React.ElementType }> = [
+  { value: 'active', label: '工作中', icon: Inbox },
+  { value: 'archived', label: '已归档', icon: Archive },
+]
+const PAGE_SIZE_OPTIONS = [20, 30, 50, 100] as const
+
+function getPaginationItems(currentPage: number, totalPages: number): Array<number | 'ellipsis'> {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1)
+  if (currentPage <= 4) return [1, 2, 3, 4, 5, 'ellipsis', totalPages]
+  if (currentPage >= totalPages - 3) {
+    return [1, 'ellipsis', totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1, totalPages]
+  }
+  return [1, 'ellipsis', currentPage - 1, currentPage, currentPage + 1, 'ellipsis', totalPages]
+}
 
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
   const [view, setView] = useState<'list' | 'board'>('list')
   const [boardNonce, setBoardNonce] = useState(0)
-  const [status, setStatus] = useState(initial?.status ?? '')
+  const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
@@ -69,15 +87,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [sort, setSort] = useState<{ field: SortField; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
   const [records, setRecords] = useState<any[]>([])
   const [pagination, setPagination] = useState<Pagination | null>(null)
+  const [pageSize, setPageSize] = useState(30)
+  const [jumpPage, setJumpPage] = useState('')
   const [loading, setLoading] = useState(true)
-  const [openMenu, setOpenMenu] = useState<string | null>(null)
+  const [modeBusyId, setModeBusyId] = useState<string | null>(null)
+  const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null)
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [batchBusy, setBatchBusy] = useState(false)
   const customTagRequestSeq = useRef(0)
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${status}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${pageSize}|${pagination?.page ?? 1}`)
 
   const loadCustomTagCatalog = useCallback(async (keyword = '') => {
     const seq = ++customTagRequestSeq.current
@@ -95,8 +116,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
-    if (status === 'archived') params.set('bucket', 'archived')
-    else params.set('queue', 'active')
+    if (archiveView === 'archived') params.set('bucket', 'archived')
+    else params.set('queue', 'triage')
     if (triageStatus) params.set('status', triageStatus)
     risk.forEach(rk => params.append('risk', rk))
     identity.forEach(id => params.append('identity', id))
@@ -109,20 +130,20 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateTo) params.set('dateTo', dateTo)
     if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateFrom, dateTo, dateBasis])
+  }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateFrom, dateTo, dateBasis])
 
-  const load = useCallback(async (page = 1) => {
-    setLoading(true)
+  const load = useCallback(async (page = 1, options?: { silent?: boolean }) => {
+    if (!options?.silent) setLoading(true)
     try {
       const params = filterParams()
       params.set('page', String(page))
-      params.set('pageSize', '30')
+      params.set('pageSize', String(pageSize))
       const data = await api.get<any>('/triage/records?' + params)
       setRecords(data.records || [])
       setPagination(data.pagination || null)
     } catch (err) { console.error(err) }
-    finally { setLoading(false) }
-  }, [filterParams])
+    finally { if (!options?.silent) setLoading(false) }
+  }, [filterParams, pageSize])
 
   const exportXlsx = async () => {
     setExporting(true)
@@ -149,63 +170,35 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { loadCustomTagCatalog() }, [loadCustomTagCatalog])
 
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest('.action-dropdown')) setOpenMenu(null)
-    }
-    document.addEventListener('click', handler)
-    return () => document.removeEventListener('click', handler)
-  }, [])
-
   // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
     const willEmpty = records.length <= 1 && page > 1
-    await load(willEmpty ? page - 1 : page)
+    await load(willEmpty ? page - 1 : page, { silent: true })
     refreshBadges()
   }, [load, pagination, records.length, refreshBadges])
 
-  const updateTriage = async (recordId: string, newStatus: string, opts?: { note?: string }): Promise<boolean> => {
-    let note = opts?.note
-    if (note === undefined) {
-      const input = await ask({ title: '内容处理备注', placeholder: '例如：已官方回复 / 已上报 / 误报无需处理' })
-      if (input === null) { setOpenMenu(null); return false } // 取消则不处理，避免误点即消失
-      note = input
-    }
-    await api.patch('/triage/records/' + recordId, { status: newStatus, note })
-    setOpenMenu(null)
-    await reloadAfterMutation()
-    return true
-  }
-
-  const markResponded = async (recordId: string): Promise<boolean> => {
-    await api.patch('/records/' + recordId + '/official-response', { status: 'responded' })
-    setOpenMenu(null)
-    await reloadAfterMutation()
-    return true
-  }
-
   const markFalsePositive = async (recordId: string): Promise<boolean> => {
+    if (archiveView === 'archived') return false
     const reason = await ask({
-      title: '标记为误报',
+      title: '提交误报',
       placeholder: '请说明为什么这条内容属于误报',
-      confirmLabel: '确认误报',
+      confirmLabel: '提交误报',
       required: true,
-      helpText: '必填。原因会进入误报反馈，供后台人员复核和总结。',
+      helpText: '提交后仅进入平台管理员复核，不会改变当前处理模式或归档状态。',
     })
     if (reason === null) return false
-    await api.patch('/triage/records/' + recordId, {
-      status: 'false_positive',
-      reason,
-      note: reason,
-    })
-    setOpenMenu(null)
-    await reloadAfterMutation()
-    setDrawerRecord(null)
+    await api.post('/feedback/false-positive', { recordId, reason })
+    setRecords(current => current.map(record =>
+      record.id === recordId ? { ...record, false_positive_pending: true } : record))
+    setDrawerRecord((current: Record<string, unknown> | null) =>
+      current?.id === recordId ? { ...current, false_positive_pending: true } : current)
+    refreshBadges()
     return true
   }
 
   const updateManualFields = async (recordId: string, fields: ManualRecordFields): Promise<boolean> => {
+    if (archiveView === 'archived') return false
     await api.patch('/records/' + recordId + '/manual-fields', fields)
     await reloadAfterMutation()
     setDrawerRecord(null)
@@ -213,6 +206,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }
 
   const updateCustomTags = async (recordId: string, patch: CustomTagPatch): Promise<CustomTag[]> => {
+    if (archiveView === 'archived') return []
     const data = await api.patch<CustomTagsMutationResponse>('/records/' + recordId + '/custom-tags', patch)
     const tags = tagsFromMutationResponse(data)
     setRecords(current => current.map(record =>
@@ -227,7 +221,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         setPagination(current => {
           if (!current) return current
           const total = Math.max(0, current.total - 1)
-          return { ...current, total, totalPages: Math.ceil(total / 30) }
+          return { ...current, total, totalPages: Math.ceil(total / pageSize) }
         })
       }
       const page = pagination?.page || 1
@@ -238,19 +232,117 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }
 
   const dispatchTicket = async (record: any) => {
+    if (archiveView === 'archived' || record.archived_at) return
     const r = await dispatch({ summary: record.title || record.content, defaultPriority: record.triage_priority })
     if (!r) return
     await api.post('/tickets', { sourceType: 'content', sourceId: record.id, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
     await reloadAfterMutation()
   }
 
-  const runBatch = async (newStatus: string) => {
+  const modeVisibleInCurrentList = useCallback((newStatus: string) => {
+    return !triageStatus || triageStatus === newStatus
+  }, [triageStatus])
+
+  const syncModeLocally = useCallback((ids: Iterable<string>, newStatus: TriageMode) => {
+    const changed = new Set(ids)
+    const keepInList = modeVisibleInCurrentList(newStatus)
+    setRecords(current => current.flatMap(record => {
+      if (!changed.has(record.id)) return [record]
+      if (!keepInList) return []
+      return [{
+        ...record,
+        triage_status: newStatus,
+        official_response_status: newStatus === 'official_responded' ? 'responded' : record.official_response_status,
+      }]
+    }))
+    setDrawerRecord((current: any) => {
+      if (!current || !changed.has(current.id)) return current
+      return {
+        ...current,
+        triage_status: newStatus,
+        official_response_status: newStatus === 'official_responded' ? 'responded' : current.official_response_status,
+      }
+    })
+  }, [modeVisibleInCurrentList])
+
+  const changeTriageMode = useCallback(async (recordId: string, newStatus: TriageMode): Promise<boolean> => {
+    if (archiveView === 'archived' || modeBusyId || archiveBusyId) return false
+    setModeBusyId(recordId)
+    try {
+      if (newStatus === 'official_responded') {
+        await api.patch('/records/' + recordId + '/official-response', { status: 'responded' })
+      } else {
+        await api.patch('/triage/records/' + recordId, { status: newStatus })
+      }
+      const page = pagination?.page || 1
+      const targetPage = !modeVisibleInCurrentList(newStatus) && records.length <= 1 && page > 1 ? page - 1 : page
+      syncModeLocally([recordId], newStatus)
+      refreshBadges()
+      await load(targetPage, { silent: true })
+      return true
+    } catch (err) {
+      console.error(err)
+      return false
+    } finally {
+      setModeBusyId(null)
+    }
+  }, [archiveBusyId, archiveView, load, modeBusyId, modeVisibleInCurrentList, pagination, records.length, refreshBadges, syncModeLocally])
+
+  const runBatch = async (newStatus: TriageMode) => {
+    if (archiveView === 'archived' || sel.count === 0) return
+    setBatchBusy(true)
+    try {
+      const ids = [...sel.selected]
+      await api.patch('/triage/records/batch', { ids, status: newStatus })
+      const page = pagination?.page || 1
+      const selectedOnPage = records.filter(record => sel.has(record.id)).length
+      const targetPage = !modeVisibleInCurrentList(newStatus) && selectedOnPage >= records.length && page > 1 ? page - 1 : page
+      syncModeLocally(ids, newStatus)
+      sel.clear()
+      refreshBadges()
+      await load(targetPage, { silent: true })
+    } catch (err) { console.error(err) }
+    finally { setBatchBusy(false) }
+  }
+
+  const syncArchiveLocally = useCallback((ids: Iterable<string>) => {
+    const changed = new Set(ids)
+    setRecords(current => current.filter(record => !changed.has(record.id)))
+    setDrawerRecord((current: any) => current && changed.has(current.id) ? null : current)
+  }, [])
+
+  const changeArchive = useCallback(async (recordId: string, archived: boolean): Promise<boolean> => {
+    if (modeBusyId || archiveBusyId) return false
+    setArchiveBusyId(recordId)
+    try {
+      await api.patch('/triage/records/archive', { ids: [recordId], archived })
+      const page = pagination?.page || 1
+      const targetPage = records.length <= 1 && page > 1 ? page - 1 : page
+      syncArchiveLocally([recordId])
+      refreshBadges()
+      await load(targetPage, { silent: true })
+      return true
+    } catch (err) {
+      console.error(err)
+      return false
+    } finally {
+      setArchiveBusyId(null)
+    }
+  }, [archiveBusyId, load, modeBusyId, pagination, records.length, refreshBadges, syncArchiveLocally])
+
+  const runArchiveBatch = async (archived: boolean) => {
     if (sel.count === 0) return
     setBatchBusy(true)
     try {
-      await api.patch('/triage/records/batch', { ids: [...sel.selected], status: newStatus })
+      const ids = [...sel.selected]
+      await api.patch('/triage/records/archive', { ids, archived })
+      const page = pagination?.page || 1
+      const selectedOnPage = records.filter(record => sel.has(record.id)).length
+      const targetPage = selectedOnPage >= records.length && page > 1 ? page - 1 : page
+      syncArchiveLocally(ids)
       sel.clear()
-      await reloadAfterMutation()
+      refreshBadges()
+      await load(targetPage, { silent: true })
     } catch (err) { console.error(err) }
     finally { setBatchBusy(false) }
   }
@@ -258,63 +350,91 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const interactions = (r: any) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
   const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
   const someChecked = records.some(r => sel.has(r.id))
-  // 处置状态筛选项随 tab 自适应:待处理队列只有未处理/待复核,已归档桶有归档/误报/已响应
-  const triageStatusOptions: Array<[string, string]> = status === 'archived'
-    ? [['', '全部状态'], ['archived', '已归档'], ['false_positive', '误报'], ['official_responded', '官方已响应']]
-    : [['', '全部状态'], ['unhandled', '未处理'], ['reviewing', '待复核']]
+  const triageStatusOptions: Array<[string, string]> = [
+    ['', '全部模式'],
+    ['unhandled', '待处理'],
+    ['reviewing', '负面流程'],
+    ['official_responded', '官方已评'],
+    ['no_action', '无需操作'],
+  ]
 
   const narrow = false
+  const drawerArchived = Boolean(drawerRecord?.archived_at)
   const drawerProps = drawerRecord ? {
     record: drawerRecord,
     onClose: () => setDrawerRecord(null),
     canWrite: canWrite(),
     onLinkIssue: () => { dispatchTicket(drawerRecord); setDrawerRecord(null) },
-    onSetStatus: async (s: string) => {
-      const updated = await updateTriage(drawerRecord.id, s)
-      if (updated) setDrawerRecord(null)
-      return updated
+    onSetStatus: drawerArchived ? undefined : async (s: string) => {
+      return changeTriageMode(drawerRecord.id, s as TriageMode)
     },
-    onMarkResponded: async () => {
-      const updated = await markResponded(drawerRecord.id)
-      if (updated) setDrawerRecord(null)
-      return updated
-    },
-    onFalsePositive: drawerRecord.triage_status === 'false_positive'
-      ? undefined
-      : () => markFalsePositive(drawerRecord.id),
-    onUpdateFields: (fields: ManualRecordFields) => updateManualFields(drawerRecord.id, fields),
+    onMarkResponded: drawerArchived ? undefined : async () => changeTriageMode(drawerRecord.id, 'official_responded'),
+    onSetArchived: async (archived: boolean) => changeArchive(drawerRecord.id, archived),
+    onFalsePositive: drawerArchived ? undefined : () => markFalsePositive(drawerRecord.id),
+    falsePositivePending: Boolean(drawerRecord.false_positive_pending),
+    onUpdateFields: drawerArchived ? undefined : (fields: ManualRecordFields) => updateManualFields(drawerRecord.id, fields),
     customTagCatalog,
-    onUpdateCustomTags: (patch: CustomTagPatch) => updateCustomTags(drawerRecord.id, patch),
+    onUpdateCustomTags: drawerArchived ? undefined : (patch: CustomTagPatch) => updateCustomTags(drawerRecord.id, patch),
   } : null
+
+  const goToPage = (requestedPage: number) => {
+    if (!pagination) return
+    const totalPages = Math.max(1, pagination.totalPages)
+    const targetPage = Math.min(totalPages, Math.max(1, Math.trunc(requestedPage)))
+    setJumpPage('')
+    if (targetPage !== pagination.page) void load(targetPage)
+  }
+
+  const submitJumpPage = () => {
+    const requestedPage = Number(jumpPage)
+    if (!Number.isFinite(requestedPage) || jumpPage.trim() === '') return
+    goToPage(requestedPage)
+  }
+
+  const pageStart = pagination && pagination.total > 0
+    ? (pagination.page - 1) * pageSize + 1
+    : 0
+  const pageEnd = pagination ? Math.min(pagination.page * pageSize, pagination.total) : 0
+  const paginationItems = pagination
+    ? getPaginationItems(pagination.page, Math.max(1, pagination.totalPages))
+    : []
 
   return (
     <div className="space-y-3">
-      {/* 工具条:无边框,靠留白与柔色高亮分隔(Asana 式)*/}
-      <div className="space-y-2 border-b border-border/50 pb-2">
+      <div className="space-y-3 border-b border-border/60 pb-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          {view === 'list' ? (
-            <div className="inline-flex flex-wrap items-center gap-0.5">
-              {STATUS_TABS.map(tab => {
-                const Icon = tab.icon
-                const on = status === tab.value
-                return (
-                  <button key={tab.value} onClick={() => { setStatus(tab.value); setTriageStatus('') }}
-                    className={cn(
-                      'inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 py-2 text-[12.5px] font-semibold transition-colors lg:min-h-0 lg:px-2.5 lg:py-1.5',
-                      on ? 'bg-accent text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                    )}>
-                    <Icon className="h-3.5 w-3.5" strokeWidth={2} />
-                    {tab.label}
-                  </button>
-                )
-              })}
-            </div>
-          ) : (
+          <div className="inline-flex items-center rounded-lg border border-border/70 bg-muted/35 p-0.5" role="tablist" aria-label="内容归档范围">
+            {ARCHIVE_VIEWS.map(item => {
+              const Icon = item.icon
+              return (
+                <button
+                  key={item.value}
+                  type="button"
+                  onClick={() => {
+                    setArchiveView(item.value)
+                    setTriageStatus('')
+                    if (item.value === 'archived') setView('list')
+                  }}
+                  role="tab"
+                  aria-selected={archiveView === item.value}
+                  className={cn(
+                    'inline-flex min-h-10 items-center gap-1.5 rounded-md px-3 py-2 text-[12px] font-semibold transition-colors lg:min-h-0 lg:py-1.5',
+                    archiveView === item.value
+                      ? 'bg-card text-foreground shadow-sm ring-1 ring-border/50'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  <Icon className="h-3.5 w-3.5" />{item.label}
+                </button>
+              )
+            })}
+          </div>
+          {view === 'board' && (
             <span className="inline-flex items-center gap-1.5 text-[12px] text-muted-foreground">
-              <Kanban className="h-3.5 w-3.5" />拖动卡片即可改变处置状态
+              <Kanban className="h-3.5 w-3.5" />拖动卡片即可改变处理模式
             </span>
           )}
-          <div className="inline-flex items-center gap-0.5">
+          {archiveView === 'active' && <div className="ml-auto inline-flex items-center gap-0.5">
             {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([v, label, Icon]) => (
               <button key={v} onClick={() => setView(v)}
                 className={cn('inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-semibold transition-colors lg:min-h-0 lg:px-2.5 lg:py-1.5',
@@ -323,11 +443,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <Icon className="h-3.5 w-3.5" />{label}
               </button>
             ))}
-          </div>
+          </div>}
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-2">
-          <div className="relative w-full lg:ml-auto lg:w-52">
+        <div role="group" aria-label="内容筛选" className="flex flex-wrap items-center gap-x-1.5 gap-y-2">
+          <div className="relative w-full lg:w-52">
             <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input value={keyword} onChange={e => setKeyword(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文…" className="h-10 border-transparent bg-muted pl-8 text-[12px] focus:bg-card lg:h-8" />
@@ -350,6 +470,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             'lg:contents',
           )}>
             <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}
+              aria-label="平台筛选"
               className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
               <option value="">全部平台</option>
               <option value="xiaohongshu">小红书</option>
@@ -359,6 +480,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             {view === 'list' && (
               <>
                 <WorkbenchSelect value={triageStatus} onChange={e => setTriageStatus(e.target.value)}
+                  aria-label="处理模式筛选"
                   className={cn('bg-muted font-medium hover:bg-muted/70', triageStatus ? 'text-foreground' : 'text-muted-foreground')}>
                   {triageStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
                 </WorkbenchSelect>
@@ -385,17 +507,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               </>
             )}
             <span className="mx-0.5 hidden h-4 w-px bg-border/60 lg:block" />
-            <div className="mobile-table-scroll inline-flex h-10 max-w-full items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8">
-              {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([v, label]) => (
-                <button key={v} onClick={() => setSentiment(v)}
+            <div role="group" aria-label="情感筛选" className="mobile-table-scroll inline-flex h-10 max-w-full items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8">
+              {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([value, label]) => (
+                <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
                   className={cn('inline-flex h-9 shrink-0 items-center rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7',
-                    sentiment === v ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                    sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
                   {label}
                 </button>
               ))}
             </div>
             {hasActiveFilters && (
-              <button onClick={clearFilters} title="清空所有筛选"
+              <button onClick={clearFilters} title="清空所有筛选" aria-label={`清空全部 ${activeFilterCount} 项筛选`}
                 className="inline-flex h-10 items-center gap-1 rounded-lg px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8 lg:px-2">
                 <X className="h-3.5 w-3.5" />清空
               </button>
@@ -426,7 +548,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
       ) : records.length === 0 ? (
-        <EmptyState icon={Inbox} title="暂无记录" description="调整筛选条件试试" />
+        <EmptyState
+          icon={archiveView === 'archived' ? Archive : Inbox}
+          title={archiveView === 'archived' ? '暂无已归档内容' : '暂无记录'}
+          description={archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '调整筛选条件试试'}
+        />
       ) : (
         <div className="overflow-hidden rounded-xl bg-card">
           <div className="divide-y divide-border/50 lg:hidden">
@@ -435,16 +561,21 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 key={r.id}
                 record={r}
                 canWrite={canWrite()}
-                archived={status === 'archived'}
                 selected={sel.has(r.id)}
                 onToggle={() => sel.toggle(r.id)}
+                onChangeMode={(nextStatus: TriageMode) => changeTriageMode(r.id, nextStatus)}
+                modeBusy={modeBusyId === r.id}
+                modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
+                onArchive={() => changeArchive(r.id, archiveView === 'active')}
+                archiveBusy={archiveBusyId === r.id}
+                archived={archiveView === 'archived'}
                 onOpenDetail={() => setDrawerRecord(r)}
                 interactions={interactions(r)}
               />
             ))}
           </div>
           <div className="hidden overflow-x-auto lg:block">
-          <table className="w-full min-w-[1080px] text-sm">
+          <table className="w-full min-w-[1200px] text-sm">
             <thead>
               <tr className="border-b border-border/60 [&>th]:whitespace-nowrap [&>th]:py-3">
                 {canWrite() && (
@@ -455,15 +586,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">平台</th>}
                 <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
-                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处置状态</th>
+                <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处理模式</th>
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
                 {!narrow && <th className="px-3 py-3.5 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
+                {!narrow && <SortableTh label="评论" field="comments" sort={sort} onSort={toggleSort} align="right" />}
+                {!narrow && <SortableTh label="点赞" field="likes" sort={sort} onSort={toggleSort} align="right" />}
                 {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
                 {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <th className="hidden whitespace-nowrap px-3 py-3.5 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
-                {canWrite() && !narrow && <th className="px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground">操作</th>}
+                {canWrite() && !narrow && <th className="sticky right-0 z-20 w-[132px] min-w-[132px] border-l border-border/50 bg-card px-3 py-3.5 pr-4 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground shadow-[-8px_0_16px_-14px_rgba(15,23,42,0.45)]">操作</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
@@ -472,16 +605,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   key={r.id}
                   record={r}
                   canWrite={canWrite()}
-                  archived={status === 'archived'}
                   narrow={narrow}
                   open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
                   onToggle={() => sel.toggle(r.id)}
-                  openMenu={openMenu}
-                  setOpenMenu={setOpenMenu}
                   onLinkIssue={() => dispatchTicket(r)}
-                  onUpdateTriage={(s: string) => updateTriage(r.id, s)}
-                  onMarkResponded={() => markResponded(r.id)}
+                  onChangeMode={(nextStatus: TriageMode) => changeTriageMode(r.id, nextStatus)}
+                  modeBusy={modeBusyId === r.id}
+                  modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
+                  onArchive={() => changeArchive(r.id, archiveView === 'active')}
+                  archiveBusy={archiveBusyId === r.id}
+                  archived={archiveView === 'archived'}
                   onOpenDetail={() => setDrawerRecord(r)}
                   interactions={interactions(r)}
                 />
@@ -490,17 +624,94 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </table>
           </div>
 
-          {pagination && pagination.totalPages > 1 && (
-            <div className="flex items-center justify-between border-t border-border/50 px-4 py-3">
-              <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条</span>
-              <div className="flex items-center gap-1">
-                <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}>
-                  <ChevronLeft className="h-4 w-4" />
-                </Button>
-                <span className="px-3 text-sm tabular-nums text-muted-foreground">{pagination.page} / {pagination.totalPages}</span>
-                <Button variant="outline" size="icon" className="h-8 w-8" disabled={pagination.page >= pagination.totalPages} onClick={() => load(pagination.page + 1)}>
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
+          {pagination && (
+            <div className="flex flex-col gap-3 border-t border-border/50 px-4 py-3 xl:flex-row xl:items-center xl:justify-between">
+              <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
+              </span>
+              <div className="flex flex-wrap items-center gap-2 xl:justify-end">
+                <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                  每页
+                  <select
+                    aria-label="每页条数"
+                    value={pageSize}
+                    onChange={event => setPageSize(Number(event.target.value))}
+                    className="h-8 rounded-lg border border-border bg-card px-2 text-xs font-medium tabular-nums text-foreground outline-none transition-colors focus:border-primary focus:ring-2 focus:ring-ring/30"
+                  >
+                    {PAGE_SIZE_OPTIONS.map(size => <option key={size} value={size}>{size}</option>)}
+                  </select>
+                  条
+                </label>
+
+                <nav aria-label="内容列表分页" className="flex shrink-0 items-center gap-1">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    disabled={pagination.page <= 1}
+                    aria-label="上一页"
+                    title="上一页"
+                    onClick={() => goToPage(pagination.page - 1)}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <div className="hidden items-center gap-1 sm:flex">
+                    {paginationItems.map((item, index) => item === 'ellipsis' ? (
+                      <span key={`ellipsis-${index}`} className="flex h-8 w-6 items-center justify-center text-xs text-muted-foreground">…</span>
+                    ) : (
+                      <Button
+                        key={item}
+                        variant={item === pagination.page ? 'default' : 'outline'}
+                        size="icon"
+                        className="h-8 w-8 text-xs tabular-nums"
+                        aria-label={`第 ${item} 页`}
+                        aria-current={item === pagination.page ? 'page' : undefined}
+                        onClick={() => goToPage(item)}
+                      >
+                        {item}
+                      </Button>
+                    ))}
+                  </div>
+                  <span className="min-w-16 px-1 text-center text-xs tabular-nums text-muted-foreground sm:hidden">
+                    {pagination.page} / {Math.max(1, pagination.totalPages)} 页
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    disabled={pagination.page >= pagination.totalPages}
+                    aria-label="下一页"
+                    title="下一页"
+                    onClick={() => goToPage(pagination.page + 1)}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </nav>
+
+                <div className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                  <span>跳至</span>
+                  <Input
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    max={Math.max(1, pagination.totalPages)}
+                    value={jumpPage}
+                    onChange={event => setJumpPage(event.target.value)}
+                    onKeyDown={event => { if (event.key === 'Enter') submitJumpPage() }}
+                    aria-label="跳转页码"
+                    className="h-8 w-14 px-2 text-center text-xs tabular-nums"
+                  />
+                  <span>页</span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 px-3"
+                    disabled={jumpPage.trim() === ''}
+                    onClick={submitJumpPage}
+                  >
+                    跳转
+                  </Button>
+                </div>
               </div>
             </div>
           )}
@@ -513,17 +724,27 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           count={sel.count}
           busy={batchBusy}
           onClear={sel.clear}
-          onAction={key => runBatch(key)}
-          actions={[
-            { key: 'archived', label: '归档', icon: Archive },
-          ]}
+          onAction={key => {
+            if (key === 'archive') void runArchiveBatch(true)
+            else if (key === 'unarchive') void runArchiveBatch(false)
+            else void runBatch(key as TriageMode)
+          }}
+          actions={archiveView === 'archived'
+            ? [{ key: 'unarchive', label: '取消归档', icon: ArchiveRestore }]
+            : [
+                { key: 'unhandled', label: '待处理', icon: Inbox },
+                { key: 'reviewing', label: '负面流程', icon: Bell },
+                { key: 'official_responded', label: '官方已评', icon: CheckCircle },
+                { key: 'no_action', label: '无需操作', icon: CircleOff },
+                { key: 'archive', label: '归档', icon: Archive, separatorBefore: true },
+              ]}
         />
       )}
 
       {/* 详情:盖式滑出面板(无遮罩,盖在列表右侧,左侧仍可点)*/}
       {/* The compiler cannot currently prove the ref-free shape of this memoized drawer payload. */}
       {/* eslint-disable-next-line react-hooks/refs */}
-      {drawerProps && <RecordDrawer key={drawerProps.record.id} {...drawerProps} />}
+      {drawerProps && <RecordDrawer {...drawerProps} />}
       {dialog}
       {dispatchDialog}
     </div>
@@ -533,7 +754,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 /* 手机值守卡片：把桌面表格里最需要扫读的判断、风险和时间压到一屏内。 */
 // Mirrors the long-standing desktop row contract while keeping the mobile view local.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function MobileRecordCard({ record: r, canWrite, archived, selected, onToggle, onOpenDetail, interactions }: any) {
+function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMode, modeBusy, modeDisabled, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
@@ -545,6 +766,7 @@ function MobileRecordCard({ record: r, canWrite, archived, selected, onToggle, o
 
   return (
     <article
+      data-record-detail-trigger
       role="button"
       tabIndex={0}
       onClick={onOpenDetail}
@@ -588,7 +810,11 @@ function MobileRecordCard({ record: r, canWrite, archived, selected, onToggle, o
 
       <div className={cn('mt-3 flex flex-wrap items-center gap-1.5', canWrite && 'pl-10')}>
         <StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
-        <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
+        {canWrite && !archived ? (
+          <TriageStatusMenu status={r.triage_status || 'unhandled'} busy={modeBusy} disabled={modeDisabled} onChange={onChangeMode} />
+        ) : (
+          <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
+        )}
         {hasRiskSignals && <RiskSignals record={r} />}
         {mobileIdentity && <IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} />}
       </div>
@@ -601,7 +827,24 @@ function MobileRecordCard({ record: r, canWrite, archived, selected, onToggle, o
 
       <div className={cn('mt-2.5 flex min-w-0 items-center justify-between gap-2', canWrite && 'pl-10')}>
         <div className="min-w-0">{customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}</div>
-        <span className="shrink-0 text-[11px] font-semibold text-primary">{archived ? '查看归档' : '查看并处置'}</span>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {canWrite && (
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-8 w-8"
+              disabled={archiveBusy || (!archived && modeDisabled)}
+              aria-label={archived ? '取消归档' : '归档'}
+              title={archived ? '取消归档' : '归档'}
+              onClick={event => { event.stopPropagation(); void onArchive() }}
+            >
+              {archiveBusy
+                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                : archived ? <ArchiveRestore className="h-3.5 w-3.5" /> : <Archive className="h-3.5 w-3.5" />}
+            </Button>
+          )}
+          <span className="text-[11px] font-semibold text-primary">{archived ? '查看详情' : '查看并处理'}</span>
+        </div>
       </div>
     </article>
   )
@@ -617,14 +860,15 @@ function MobileMetric({ label, value }: { label: string; value: string }) {
 }
 
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onToggle, openMenu, setOpenMenu, onLinkIssue, onUpdateTriage, onMarkResponded, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onLinkIssue, onChangeMode, modeBusy, modeDisabled, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
+  const triageStatus = r.triage_status || 'unhandled'
 
   return (
-    <tr className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
+    <tr data-record-detail-trigger className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
       {canWrite && (
         <td className="py-3.5 pl-4 pr-1 align-middle" onClick={e => e.stopPropagation()}>
           <Checkbox checked={selected} onChange={onToggle} />
@@ -654,45 +898,147 @@ function RecordRow({ record: r, canWrite, archived, narrow, open, selected, onTo
       </td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>}
       <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
-      <td className="px-3 py-3.5 align-middle"><StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge></td>
+      <td className="px-3 py-3.5 align-middle">
+        {canWrite && !archived ? (
+          <TriageStatusMenu status={triageStatus} busy={modeBusy} disabled={modeDisabled} onChange={onChangeMode} />
+        ) : (
+          <StatusBadge tone={triageStatus}>{LABELS.triage[triageStatus] || triageStatus}</StatusBadge>
+        )}
+      </td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
+      {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(r.comments_count)}</td>}
+      {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(r.likes)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>}
       {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
       {canWrite && !narrow && (
-        <td className="px-3 py-3.5 pr-4 align-middle" onClick={e => e.stopPropagation()}>
-          {archived ? (
-            <div className="text-right text-[11px] text-muted-foreground/60">已归档</div>
-          ) : (
-            <div className="flex items-center justify-end gap-1">
-              <Button size="sm" onClick={onLinkIssue}><LinkIcon className="h-3.5 w-3.5" />转工单</Button>
-              <div className="action-dropdown relative">
-                <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setOpenMenu(openMenu === r.id ? null : r.id)}>
-                  <MoreHorizontal className="h-4 w-4" />
-                </Button>
-                {openMenu === r.id && (
-                  <div className="absolute right-0 top-full z-30 mt-1 w-40 animate-in fade-in slide-in-from-top-1 rounded-lg border border-border bg-card p-1 shadow-lg duration-150">
-                    <MenuBtn icon={CheckCircle} label="标为已响应" onClick={onMarkResponded} />
-                    <MenuBtn icon={Archive} label="归档" onClick={() => onUpdateTriage('archived')} />
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
+        <td className={cn(
+          'sticky right-0 w-[132px] min-w-[132px] border-l border-border/50 px-3 py-3.5 pr-4 align-middle shadow-[-8px_0_16px_-14px_rgba(15,23,42,0.45)] transition-colors',
+          'z-10',
+          open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
+        )} onClick={e => e.stopPropagation()}>
+          <div className="flex items-center justify-end gap-1">
+            {archived ? (
+              <Button variant="outline" size="sm" disabled={archiveBusy} onClick={onArchive}>
+                {archiveBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArchiveRestore className="h-3.5 w-3.5" />}
+                取消归档
+              </Button>
+            ) : (
+              <>
+                <Button size="sm" onClick={onLinkIssue}>转工单</Button>
+                <TriageStatusMenu
+                  status={triageStatus}
+                  busy={modeBusy}
+                  archiveBusy={archiveBusy}
+                  disabled={modeDisabled}
+                  onChange={onChangeMode}
+                  onArchiveChange={onArchive}
+                  archived={archived}
+                  trigger="icon"
+                  align="end"
+                />
+              </>
+            )}
+          </div>
         </td>
       )}
     </tr>
   )
 }
 
-function MenuBtn({ icon: Icon, label, onClick }: { icon: React.ElementType; label: string; onClick: () => void }) {
+function TriageStatusMenu({ status, busy, archiveBusy, disabled, onChange, onArchiveChange, archived, trigger = 'badge', align = 'start' }: {
+  status: string
+  busy?: boolean
+  archiveBusy?: boolean
+  disabled?: boolean
+  onChange: (status: TriageMode) => void | Promise<unknown>
+  onArchiveChange?: () => void | Promise<unknown>
+  archived?: boolean
+  trigger?: 'badge' | 'icon'
+  align?: 'start' | 'end'
+}) {
+  const label = LABELS.triage[status] || status || '待处理'
   return (
-    <button onClick={onClick} className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
-      <Icon className="h-4 w-4" />{label}
-    </button>
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        {trigger === 'icon' ? (
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            disabled={busy || archiveBusy || disabled}
+            aria-label="更多操作"
+            title="更多操作"
+            onClick={event => event.stopPropagation()}
+          >
+            {busy || archiveBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
+          </Button>
+        ) : (
+          <button
+            type="button"
+            disabled={busy || disabled}
+            aria-label={`当前处理模式：${label}，点击修改`}
+            onClick={event => event.stopPropagation()}
+            className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+          >
+            <StatusBadge tone={status} className="gap-1 transition-[filter,box-shadow] hover:brightness-95 hover:shadow-sm">
+              {label}
+              {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <ChevronDown className="h-3 w-3" />}
+            </StatusBadge>
+          </button>
+        )}
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align={align}
+          sideOffset={6}
+          collisionPadding={10}
+          onClick={event => event.stopPropagation()}
+          className="z-[100] min-w-48 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-xl"
+        >
+          <DropdownMenu.Label className="px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground">处理模式</DropdownMenu.Label>
+          <DropdownMenu.Separator className="mb-1 h-px bg-border/70" />
+          <DropdownMenu.RadioGroup value={status}>
+            {TRIAGE_MODES.map(option => {
+              const Icon = option.icon
+              const active = option.value === status
+              return (
+                <DropdownMenu.RadioItem
+                  key={option.value}
+                  value={option.value}
+                  disabled={busy || disabled}
+                  onSelect={() => { if (!active) void onChange(option.value) }}
+                  className={cn(
+                    'flex cursor-default select-none items-center gap-2 rounded-md px-2.5 py-2 text-[13px] outline-none transition-colors data-[highlighted]:bg-accent data-[highlighted]:text-foreground',
+                    active ? 'font-semibold text-foreground' : 'text-muted-foreground',
+                  )}
+                >
+                  <Icon className="h-4 w-4" />
+                  <span>{option.label}</span>
+                  {active && <Check className="ml-auto h-3.5 w-3.5 text-primary" />}
+                </DropdownMenu.RadioItem>
+              )
+            })}
+          </DropdownMenu.RadioGroup>
+          {trigger === 'icon' && onArchiveChange && (
+            <>
+              <DropdownMenu.Separator className="my-1 h-px bg-border/70" />
+              <DropdownMenu.Item
+                disabled={busy || archiveBusy || disabled}
+                onSelect={() => { void onArchiveChange() }}
+                className="flex cursor-default select-none items-center gap-2 rounded-md px-2.5 py-2 text-[13px] text-muted-foreground outline-none transition-colors data-[highlighted]:bg-accent data-[highlighted]:text-foreground"
+              >
+                {archived ? <ArchiveRestore className="h-4 w-4" /> : <Archive className="h-4 w-4" />}
+                <span>{archived ? '取消归档' : '归档'}</span>
+              </DropdownMenu.Item>
+            </>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   )
 }
 
@@ -737,8 +1083,7 @@ function IdentityBadge({ sourceType, fans, name, override }: { sourceType?: stri
 function RiskSignals({ record: r }: any) {
   const alerts = Number(r.alert_count || 0)
   const neg = Number(r.negative_comment_count || 0)
-  const official = r.official_response_status
-  if (!(alerts > 0 || neg > 0 || (official && official !== 'none'))) {
+  if (!(alerts > 0 || neg > 0)) {
     return <span className="text-[11px] text-muted-foreground/40">—</span>
   }
   return (
@@ -752,12 +1097,6 @@ function RiskSignals({ record: r }: any) {
         <Tooltip text="该内容下被判为负面/风险的评论条数;点开详情可查看具体评论">
           <span className="cursor-help rounded bg-status-orange/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">负评{neg}</span>
         </Tooltip>
-      )}
-      {official === 'responded' && (
-        <span className="rounded bg-status-green/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">已回复</span>
-      )}
-      {official === 'needs_followup' && (
-        <span className="rounded bg-status-amber/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">需跟进</span>
       )}
     </div>
   )

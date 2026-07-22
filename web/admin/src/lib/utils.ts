@@ -86,8 +86,8 @@ export const LABELS = {
     brand_image: '品牌形象', other: '其他', '': '待分类',
   } as Record<string, string>,
   triage: {
-    unhandled: '未处理', reviewing: '待复核', issue_linked: '已转工单', ticketed: '已转工单',
-    official_responded: '官方已响应', archived: '已归档', false_positive: '误报',
+    unhandled: '待处理', reviewing: '负面流程', issue_linked: '已转工单', ticketed: '已转工单',
+    official_responded: '官方已评', no_action: '无需操作', archived: '已归档', false_positive: '误报',
   } as Record<string, string>,
   priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' } as Record<string, string>,
   issueStatus: {

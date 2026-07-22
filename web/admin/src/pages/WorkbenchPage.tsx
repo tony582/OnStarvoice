@@ -5,6 +5,7 @@ import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
 import { TicketFeedbackQueue } from '@/pages/workbench/TicketFeedbackQueue'
 import { MisjudgmentQueue } from '@/pages/workbench/MisjudgmentQueue'
 import { ProcessingBanner } from '@/components/shared/ProcessingBanner'
+import { useAuth } from '@/lib/auth'
 
 type QueueKey = 'triage' | 'leads' | 'feedback' | 'misjudgments' | 'issues'
 const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'misjudgments', 'issues']
@@ -16,7 +17,9 @@ const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'misjudgments', '
  */
 export function WorkbenchPage() {
   const { params } = useNav()
-  const queue: QueueKey = QUEUE_KEYS.includes(params?.queue as QueueKey) ? (params!.queue as QueueKey) : 'triage'
+  const { isPlatformAdmin } = useAuth()
+  const requestedQueue: QueueKey = QUEUE_KEYS.includes(params?.queue as QueueKey) ? (params!.queue as QueueKey) : 'triage'
+  const queue: QueueKey = requestedQueue === 'misjudgments' && !isPlatformAdmin() ? 'triage' : requestedQueue
   const initial = params ?? undefined
 
   return (
