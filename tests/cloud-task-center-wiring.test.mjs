@@ -217,6 +217,38 @@ test("admin UI shows each node's local plan and capability-gates remote task cre
   assert.match(page, /无人值守/u);
 });
 
+test("admin UI creates one task draft and explicitly assigns it to a browser agent", async () => {
+  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+
+  assert.match(page, /function TaskAssignmentDrawer/u);
+  assert.match(page, /新建任务并分配/u);
+  assert.match(page, /选择任务类型/u);
+  assert.match(page, /分配执行设备/u);
+  assert.match(page, /配置并确认/u);
+  assert.match(page, /role="radiogroup" aria-label="执行节点"/u);
+  assert.match(page, /setSelectedAgentId\(agent\.id\)/u);
+  assert.match(page, /key=\{`\$\{selectedAgent\.id\}:\$\{mode\}/u);
+  assert.match(page, /agent=\{selectedAgent\}/u);
+  assert.match(page, /设备离线；分配后会排队，上线即执行/u);
+  assert.match(page, /节点已暂停，不能接收新任务/u);
+  assert.match(page, /Extension 版本过低，需升级后才能远程接单/u);
+  assert.equal((page.match(/<AgentTaskCreator\b/gu) || []).length, 1,
+    "the long task form must render only once inside the assignment drawer");
+});
+
+test("admin UI keeps the business task list newest-first and hides technical child jobs", async () => {
+  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+
+  assert.match(page, /function isBusinessVisibleTask/u);
+  assert.match(page, /type === 'unattended_plan_configuration'/u);
+  assert.match(page, /type === 'sync'/u);
+  assert.match(page, /task\.status === 'superseded'/u);
+  assert.match(page, /\(overview\?\.tasks \|\| \[\]\)\.filter\(isBusinessVisibleTask\)/u);
+  assert.match(page, /left\.created_at \|\| left\.updated_at/u);
+  assert.match(page, /right\.created_at \|\| right\.updated_at/u);
+  assert.match(page, /按创建时间倒序，新任务在最前/u);
+});
+
 test("admin UI can load and explicitly replace an existing unattended plan without polluting new one-time tasks", async () => {
   const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
   const resetStart = page.indexOf("  const resetNewTaskForm = () => {");

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Activity, AlertTriangle, CheckCircle2, ChevronDown, ChevronUp,
-  CircleOff, CloudCog, Laptop, Loader2, Pencil, Play, Plus, RefreshCw, Save,
-  ServerCog, Square, Wifi, WifiOff,
+  Activity, AlertTriangle, ArrowLeft, Bot, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
+  CircleOff, ClipboardList, CloudCog, History, Laptop, ListChecks, Loader2, Pencil, Play, Plus,
+  RefreshCw, Save, ServerCog, Settings2, Square, Wifi, WifiOff, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
@@ -67,9 +67,12 @@ type CloudAgent = {
 
 type CloudTask = {
   id: string
+  assigned_agent_id?: string | null
+  origin_agent_id?: string | null
   client_task_id: string
   control_task_id: string
   task_type: string
+  feature_key?: string
   source?: string
   title: string
   platform: string
@@ -82,6 +85,7 @@ type CloudTask = {
   attempt_number?: number
   heartbeat_at?: string | null
   business_progress_at?: string | null
+  created_at?: string | null
   updated_at?: string | null
   finished_at?: string | null
   agent_display_name?: string
@@ -97,6 +101,14 @@ type CloudTask = {
   agent_capabilities?: Record<string, unknown> | null
   agent_allowed_platforms?: string[] | null
   resume_block_reason?: string
+}
+
+type TaskView = 'active' | 'attention' | 'history'
+type ComposerStep = 'mode' | 'agent' | 'configure'
+type ComposerIntent = {
+  agentId?: string
+  mode?: 'one_time' | 'unattended_plan'
+  editExisting?: boolean
 }
 
 type Overview = {
@@ -362,18 +374,29 @@ function AgentTaskCreator({
   agent,
   writable,
   onCreated,
+  initialExecutionMode = 'one_time',
+  forceOpen = false,
+  editExistingInitially = false,
+  hideLauncher = false,
+  lockExecutionMode = false,
 }: {
   agent: CloudAgent
   writable: boolean
   onCreated: () => Promise<void>
+  initialExecutionMode?: 'one_time' | 'unattended_plan'
+  forceOpen?: boolean
+  editExistingInitially?: boolean
+  hideLauncher?: boolean
+  lockExecutionMode?: boolean
 }) {
   const remoteTaskCreate = agent.capabilities?.remoteTaskCreate === true
   const remoteUnattendedPlanWrite = agent.capabilities?.remoteUnattendedPlanWrite === true
   const remoteTaskEnhancementOptions = agent.capabilities?.remoteTaskEnhancementOptions === true
   const remoteTaskKeywordPostLimit = agent.capabilities?.remoteTaskKeywordPostLimit === true
   const availablePlatforms = useMemo(() => agentCreatePlatforms(agent), [agent])
-  const [open, setOpen] = useState(false)
-  const [executionMode, setExecutionMode] = useState<'one_time' | 'unattended_plan'>('one_time')
+  const [open, setOpen] = useState(forceOpen)
+  const [executionMode, setExecutionMode] = useState<'one_time' | 'unattended_plan'>(initialExecutionMode)
+  const [taskTitle, setTaskTitle] = useState('')
   const [platform, setPlatform] = useState(availablePlatforms[0] || '')
   const [keywordText, setKeywordText] = useState('')
   const [sort, setSort] = useState('comprehensive')
@@ -414,6 +437,7 @@ function AgentTaskCreator({
 
   const resetNewTaskForm = () => {
     setExecutionMode('one_time')
+    setTaskTitle('')
     setPlatform(availablePlatforms[0] || '')
     setKeywordText('')
     setSort('comprehensive')
@@ -511,6 +535,21 @@ function AgentTaskCreator({
     pendingSubmission.current = null
     setOpen(true)
   }
+
+  /* eslint-disable react-hooks/set-state-in-effect -- 抽屉按 agent/mode key 重新挂载时，需要用设备镜像一次性回填受控表单。 */
+  useEffect(() => {
+    if (!forceOpen) return
+    if (editExistingInitially) {
+      editUnattendedPlan()
+      return
+    }
+    resetNewTaskForm()
+    setExecutionMode(initialExecutionMode)
+    setOpen(true)
+    // 该表单由抽屉通过 key 控制生命周期；这里只在目标节点或入口模式变化时初始化一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent.id, editExistingInitially, forceOpen, initialExecutionMode])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   if (!remoteTaskCreate) {
     return (
@@ -619,6 +658,7 @@ function AgentTaskCreator({
       : undefined
 
     const taskInput = {
+      ...(taskTitle.trim() ? { title: taskTitle.trim() } : {}),
       executionMode,
       platform: selectedPlatform,
       keywords,
@@ -682,8 +722,8 @@ function AgentTaskCreator({
       : '节点离线，任务会在云端排队，设备上线后自动领取。'
 
   return (
-    <div className="mt-3 border-t border-border/60 pt-3">
-      <div className="space-y-1.5">
+    <div className={hideLauncher ? '' : 'mt-3 border-t border-border/60 pt-3'}>
+      {!hideLauncher && <div className="space-y-1.5">
         <button type="button" onClick={toggleNewTaskForm}
           className="flex min-h-8 w-full items-center justify-between gap-3 rounded-lg px-1 text-left text-xs font-semibold text-foreground hover:bg-muted/60">
           <span className="flex items-center gap-1.5"><Plus className="h-3.5 w-3.5 text-primary" />新建关键词采集任务</span>
@@ -698,9 +738,9 @@ function AgentTaskCreator({
             {open && editingExistingPlan ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
           </button>
         )}
-      </div>
+      </div>}
       {open && (
-        <form className="mt-3 space-y-3" onSubmit={submit}>
+        <form className={`${hideLauncher ? '' : 'mt-3'} space-y-4`} onSubmit={submit}>
           {editingExistingPlan && (
             <div className="rounded-lg border border-status-orange/30 bg-status-orange/8 px-3 py-2.5 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
               <div className="font-semibold">正在修改该设备的现有无人值守计划</div>
@@ -710,16 +750,23 @@ function AgentTaskCreator({
           )}
           <p className={`rounded-lg px-2.5 py-2 text-[11px] leading-4 ${agent.online && agent.status === 'active' ? 'bg-status-green/8 text-status-green' : 'bg-status-orange/8 text-amber-700 dark:text-amber-300'}`}>{nodeMessage}</p>
           {!writable && <p className="text-[11px] leading-4 text-muted-foreground">当前账号为只读权限，不能创建任务。</p>}
+          <label className="block text-xs font-medium text-muted-foreground">
+            任务名称（可选）
+            <input value={taskTitle} onChange={event => setTaskTitle(event.target.value)} disabled={disabled}
+              maxLength={120} placeholder={executionMode === 'unattended_plan' ? '例如：新能源竞品每日监测' : '例如：7 月新品口碑采集'}
+              className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary disabled:opacity-60" />
+            <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">用于在任务队列中快速识别；不填写时会自动生成名称。</span>
+          </label>
           <div>
             <div className="text-xs font-medium text-muted-foreground">执行方式</div>
             <div className="mt-1.5 grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="tablist" aria-label="执行方式">
               <button type="button" role="tab" aria-selected={executionMode === 'one_time'}
-                onClick={() => editingExistingPlan ? resetNewTaskForm() : setExecutionMode('one_time')} disabled={disabled}
+                onClick={() => editingExistingPlan ? resetNewTaskForm() : setExecutionMode('one_time')} disabled={disabled || lockExecutionMode}
                 className={`min-h-9 rounded-md px-3 text-xs font-semibold transition-colors ${executionMode === 'one_time' ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
                 一次性
               </button>
               <button type="button" role="tab" aria-selected={executionMode === 'unattended_plan'}
-                onClick={() => setExecutionMode('unattended_plan')} disabled={disabled || !remoteUnattendedPlanWrite}
+                onClick={() => setExecutionMode('unattended_plan')} disabled={disabled || lockExecutionMode || !remoteUnattendedPlanWrite}
                 title={remoteUnattendedPlanWrite ? '' : '需要更新扩展后才能云端保存无人值守计划'}
                 className={`min-h-9 rounded-md px-3 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${executionMode === 'unattended_plan' ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
                 无人值守
@@ -1048,6 +1095,416 @@ function AgentEditor({ agent, onSaved }: { agent: CloudAgent; onSaved: () => Pro
   )
 }
 
+const ACTIVE_TASK_STATUSES = new Set(['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'resume_requested'])
+const ATTENTION_TASK_STATUSES = new Set(['interrupted', 'needs_action', 'failed', 'completed_with_failures'])
+
+function isBusinessVisibleTask(task: CloudTask) {
+  const type = String(task.task_type || '').toLowerCase()
+  // 计划保存/覆盖和采集链内同步是系统动作，不应占据业务任务队列。
+  if (type === 'unattended_plan_configuration' || type === 'sync' || type.endsWith('_sync')) return false
+  // 被恢复任务接替的旧记录保留在服务端审计中，不再作为一条独立业务任务重复展示。
+  if (task.status === 'superseded') return false
+  return true
+}
+
+function taskBelongsToAgent(task: CloudTask, agent: CloudAgent) {
+  const agentId = task.assigned_agent_id || task.origin_agent_id
+  if (agentId) return agentId === agent.id
+  return task.agent_display_name === agent.display_name && task.agent_host_label === agent.host_label
+}
+
+function agentAssignmentBlockReason(agent: CloudAgent, mode: 'one_time' | 'unattended_plan') {
+  if (agent.status !== 'active') return '节点已暂停，不能接收新任务'
+  if (agent.capabilities?.remoteTaskCreate !== true) return 'Extension 版本过低，需升级后才能远程接单'
+  if (mode === 'unattended_plan' && agent.capabilities?.remoteUnattendedPlanWrite !== true) {
+    return '当前版本不支持云端无人值守计划'
+  }
+  if (agentCreatePlatforms(agent).length === 0) return '没有可执行的小红书或抖音平台'
+  return ''
+}
+
+function AssignmentSteps({ step }: { step: ComposerStep }) {
+  const current = { mode: 1, agent: 2, configure: 3 }[step]
+  const items = [
+    { number: 1, label: '选择任务类型' },
+    { number: 2, label: '分配执行设备' },
+    { number: 3, label: '配置并确认' },
+  ]
+  return (
+    <ol className="grid grid-cols-3 gap-2" aria-label="创建任务步骤">
+      {items.map(item => (
+        <li key={item.number} aria-current={current === item.number ? 'step' : undefined}
+          className={`min-w-0 rounded-xl border px-2.5 py-2.5 sm:px-3 ${current === item.number ? 'border-primary/35 bg-primary/8' : current > item.number ? 'border-status-green/25 bg-status-green/5' : 'border-border/70 bg-muted/35'}`}>
+          <div className={`text-[10px] font-bold uppercase tracking-wider ${current === item.number ? 'text-primary' : current > item.number ? 'text-status-green' : 'text-muted-foreground'}`}>
+            {current > item.number ? '已完成' : `第 ${item.number} 步`}
+          </div>
+          <div className="mt-0.5 truncate text-xs font-semibold text-foreground">{item.label}</div>
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+function TaskAssignmentDrawer({
+  agents,
+  tasks,
+  writable,
+  intent,
+  onClose,
+  onCreated,
+}: {
+  agents: CloudAgent[]
+  tasks: CloudTask[]
+  writable: boolean
+  intent: ComposerIntent
+  onClose: () => void
+  onCreated: () => Promise<void>
+}) {
+  const editingExisting = intent.editExisting === true
+  const [step, setStep] = useState<ComposerStep>(editingExisting ? 'configure' : 'mode')
+  const [mode, setMode] = useState<'one_time' | 'unattended_plan'>(intent.mode || (editingExisting ? 'unattended_plan' : 'one_time'))
+  const [selectedAgentId, setSelectedAgentId] = useState(intent.agentId || '')
+  const selectedAgent = agents.find(agent => agent.id === selectedAgentId)
+  const sortedAgents = useMemo(() => [...agents].sort((left, right) => {
+    const leftBlocked = Boolean(agentAssignmentBlockReason(left, mode))
+    const rightBlocked = Boolean(agentAssignmentBlockReason(right, mode))
+    if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1
+    if (left.online !== right.online) return left.online ? -1 : 1
+    return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
+  }), [agents, mode])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [onClose])
+
+  const goBack = () => {
+    if (editingExisting || step === 'mode') return onClose()
+    setStep(step === 'configure' ? 'agent' : 'mode')
+  }
+
+  const selectMode = (value: 'one_time' | 'unattended_plan') => {
+    setMode(value)
+    if (selectedAgentId) {
+      const candidate = agents.find(agent => agent.id === selectedAgentId)
+      if (!candidate || agentAssignmentBlockReason(candidate, value)) setSelectedAgentId('')
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end" onMouseDown={event => {
+      if (event.target === event.currentTarget) onClose()
+    }}>
+      <div className="absolute inset-0 bg-black/35" />
+      <div role="dialog" aria-modal="true" aria-labelledby="task-composer-title"
+        className="relative z-10 flex h-full w-full max-w-3xl flex-col bg-card shadow-2xl motion-safe:animate-in motion-safe:slide-in-from-right motion-safe:duration-200 lg:border-l lg:border-border">
+        <header className="shrink-0 border-b border-border/70 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] sm:px-6">
+          <div className="flex items-start gap-3">
+            <button type="button" onClick={goBack} aria-label={step === 'mode' || editingExisting ? '关闭任务创建' : '返回上一步'}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border text-muted-foreground hover:bg-muted hover:text-foreground">
+              {step === 'mode' || editingExisting ? <X className="h-5 w-5" /> : <ArrowLeft className="h-5 w-5" />}
+            </button>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 id="task-composer-title" className="text-lg font-bold text-foreground">{editingExisting ? '修改无人值守计划' : '新建任务并分配'}</h2>
+                <span className="rounded-full border border-primary/25 bg-primary/8 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">Beta</span>
+              </div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">像分配 Agent 一样：先定义工作，再明确选择由哪个浏览器节点执行。</p>
+            </div>
+          </div>
+          {!editingExisting && <div className="mt-4"><AssignmentSteps step={step} /></div>}
+        </header>
+
+        <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6">
+          {step === 'mode' && (
+            <div className="mx-auto max-w-2xl">
+              <div className="mb-4">
+                <h3 className="text-base font-bold">这次要交给设备什么任务？</h3>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">先选择交付方式；采集内容和高级参数会在最后一步填写。</p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="任务类型">
+                {([
+                  { value: 'one_time' as const, title: '一次性任务', icon: Play, description: '创建后执行一次，完成后进入历史，不修改设备的自动计划。', note: '适合临时采集、补采和专项调研' },
+                  { value: 'unattended_plan' as const, title: '无人值守计划', icon: History, description: '保存到指定设备，由 Extension 按日期和时间自动产生采集任务。', note: '适合每天或指定日期持续监测' },
+                ]).map(item => {
+                  const selected = mode === item.value
+                  const Icon = item.icon
+                  return (
+                    <button key={item.value} type="button" role="radio" aria-checked={selected} onClick={() => selectMode(item.value)}
+                      className={`min-h-44 rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${selected ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}><Icon className="h-5 w-5" /></span>
+                        <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>
+                      </div>
+                      <div className="mt-4 text-sm font-bold text-foreground">{item.title}</div>
+                      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{item.description}</p>
+                      <div className="mt-3 text-[11px] font-medium text-primary">{item.note}</div>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {step === 'agent' && (
+            <div className="mx-auto max-w-2xl">
+              <div className="mb-4">
+                <h3 className="text-base font-bold">选择一个执行节点</h3>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">任务会绑定到具体浏览器 Extension。离线节点仍可接单，上线后自动领取。</p>
+              </div>
+              {sortedAgents.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-border p-8 text-center">
+                  <CircleOff className="mx-auto h-7 w-7 text-muted-foreground" />
+                  <div className="mt-3 text-sm font-semibold">还没有可分配的执行节点</div>
+                  <p className="mt-1 text-xs text-muted-foreground">让客户 Extension 重新验证激活码后，再回来分配任务。</p>
+                </div>
+              ) : (
+                <div className="space-y-2" role="radiogroup" aria-label="执行节点">
+                  {sortedAgents.map(agent => {
+                    const blockReason = agentAssignmentBlockReason(agent, mode)
+                    const selected = selectedAgentId === agent.id
+                    const agentTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))
+                    return (
+                      <button key={agent.id} type="button" role="radio" aria-checked={selected} disabled={Boolean(blockReason)}
+                        onClick={() => setSelectedAgentId(agent.id)}
+                        className={`flex min-h-24 w-full items-start gap-3 rounded-2xl border p-3.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-60 ${selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
+                        <span className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}><Bot className="h-5 w-5" /></span>
+                        <span className="min-w-0 flex-1">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="truncate text-sm font-bold text-foreground">{agent.display_name}</span>
+                            <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}>{agent.online ? '在线' : '离线'}</span>
+                          </span>
+                          <span className="mt-1 block text-xs text-muted-foreground">{agent.host_label} › {agent.browser_name} · {agent.operating_system} · v{agent.app_version || '未知'}</span>
+                          <span className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                            <span>{agentCreatePlatforms(agent).map(value => PLATFORM_LABELS[value] || value).join('、') || '无可用平台'}</span>
+                            <span>{agentTasks.length > 0 ? `${agentTasks.length} 个任务正在执行或排队` : '当前空闲'}</span>
+                          </span>
+                          {blockReason && <span className="mt-1.5 block text-[11px] font-medium text-status-red">{blockReason}</span>}
+                          {!blockReason && !agent.online && <span className="mt-1.5 block text-[11px] font-medium text-amber-700 dark:text-amber-300">设备离线；分配后会排队，上线即执行</span>}
+                        </span>
+                        <span className={`mt-2 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === 'configure' && selectedAgent && (
+            <div className="mx-auto max-w-2xl">
+              <div className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.045] p-3.5">
+                <div className="flex items-center gap-3">
+                  <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${selectedAgent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}><Bot className="h-5 w-5" /></span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-primary">已分配执行节点</div>
+                    <div className="mt-0.5 truncate text-sm font-bold">{selectedAgent.host_label} › {selectedAgent.display_name}</div>
+                    <div className="mt-0.5 text-[11px] text-muted-foreground">{selectedAgent.online ? '在线，提交后设备将在下一次心跳领取' : '离线，提交后在云端排队，上线自动领取'}</div>
+                  </div>
+                  {!editingExisting && <button type="button" onClick={() => setStep('agent')} className="min-h-10 rounded-lg px-3 text-xs font-semibold text-primary hover:bg-primary/10">更换</button>}
+                </div>
+              </div>
+              <AgentTaskCreator
+                key={`${selectedAgent.id}:${mode}:${editingExisting ? 'edit' : 'new'}`}
+                agent={selectedAgent}
+                writable={writable}
+                initialExecutionMode={mode}
+                forceOpen
+                editExistingInitially={editingExisting}
+                hideLauncher
+                lockExecutionMode
+                onCreated={async () => {
+                  await onCreated()
+                  onClose()
+                }}
+              />
+            </div>
+          )}
+        </div>
+
+        {step !== 'configure' && (
+          <footer className="shrink-0 border-t border-border bg-card px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">
+            <div className="mx-auto flex max-w-2xl items-center justify-between gap-3">
+              <Button type="button" variant="ghost" onClick={goBack}>{step === 'mode' ? '取消' : '上一步'}</Button>
+              <Button type="button" onClick={() => setStep(step === 'mode' ? 'agent' : 'configure')}
+                disabled={!writable || (step === 'agent' && !selectedAgentId)} className="min-h-11 min-w-36">
+                {step === 'mode' ? '下一步：选择设备' : '下一步：配置任务'} <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          </footer>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function DeviceAgentCard({
+  agent,
+  tasks,
+  writable,
+  onAssign,
+  onEditPlan,
+  onSaved,
+}: {
+  agent: CloudAgent
+  tasks: CloudTask[]
+  writable: boolean
+  onAssign: (agent: CloudAgent) => void
+  onEditPlan: (agent: CloudAgent) => void
+  onSaved: () => Promise<void>
+}) {
+  const [open, setOpen] = useState(false)
+  const relatedActiveTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))
+  const blockReason = agentAssignmentBlockReason(agent, 'one_time')
+  const hasPlan = hasConfiguredUnattendedPlan(agent.unattended_plan)
+
+  return (
+    <article className="rounded-2xl border border-border/70 bg-card p-3.5 shadow-xs">
+      <div className="flex items-start gap-3">
+        <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}><Bot className="h-5 w-5" /></span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h4 className="truncate text-sm font-bold">{agent.display_name}</h4>
+            <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${agent.status === 'paused' ? 'bg-status-orange/10 text-amber-700 dark:text-amber-300' : agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}>
+              {agent.status === 'paused' ? <CircleOff className="h-3 w-3" /> : agent.online ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+              {agent.status === 'paused' ? '已暂停' : agent.online ? '在线' : '离线'}
+            </span>
+          </div>
+          <div className="mt-1 truncate text-[11px] text-muted-foreground">{agent.browser_name} · {agent.operating_system} · v{agent.app_version || '未知'}</div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {agentCreatePlatforms(agent).length > 0
+              ? agentCreatePlatforms(agent).map(platform => <span key={platform} className="rounded-md bg-primary/8 px-2 py-1 text-[10px] font-medium text-primary">{PLATFORM_LABELS[platform] || platform}</span>)
+              : <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">无可用平台</span>}
+            <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{relatedActiveTasks.length ? `${relatedActiveTasks.length} 个任务` : '空闲'}</span>
+          </div>
+        </div>
+      </div>
+      {agent.last_error && <div role="alert" className="mt-3 rounded-lg bg-status-red/8 px-2.5 py-2 text-[11px] leading-4 text-status-red">节点异常：{agent.last_error}</div>}
+      {blockReason && <p className="mt-2 text-[11px] leading-4 text-status-red">{blockReason}</p>}
+      <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
+        <Button size="sm" onClick={() => onAssign(agent)} disabled={!writable || Boolean(blockReason)} className="min-h-10">
+          <Plus className="h-4 w-4" /> 分配任务
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => setOpen(value => !value)} aria-expanded={open} aria-label={`管理 ${agent.display_name}`} className="min-h-10 px-3">
+          <Settings2 className="h-4 w-4" />
+        </Button>
+      </div>
+      {open && (
+        <div className="mt-3 border-t border-border/60 pt-3">
+          <div className="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
+            <span>最后心跳：{formatTime(agent.last_heartbeat_at)}</span>
+            <span>{agent.client_uuid.slice(0, 8)}</span>
+          </div>
+          <UnattendedPlanSummary plan={agent.unattended_plan} mirroredAt={agent.unattended_plan_updated_at} />
+          {hasPlan && (
+            <Button variant="outline" size="sm" onClick={() => onEditPlan(agent)} disabled={!writable || agent.capabilities?.remoteUnattendedPlanWrite !== true} className="mt-2 min-h-10 w-full">
+              <Pencil className="h-3.5 w-3.5" /> 编辑无人值守计划
+            </Button>
+          )}
+          {writable && <div className="mt-3"><AgentEditor key={`${agent.id}:${agent.display_name}:${agent.host_label}:${agent.status}:${(agent.allowed_platforms || []).join(',')}`} agent={agent} onSaved={onSaved} /></div>}
+        </div>
+      )}
+    </article>
+  )
+}
+
+function TaskCard({
+  task,
+  writable,
+  actionTaskId,
+  onResume,
+  onStop,
+}: {
+  task: CloudTask
+  writable: boolean
+  actionTaskId: string
+  onResume: (task: CloudTask) => Promise<void>
+  onStop: (task: CloudTask) => Promise<void>
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const effectiveStatus = task.effective_status || task.status
+  const progress = taskProgress(task)
+  const resumable = canResume(task)
+  const stoppable = canStop(task)
+  const commandPending = Boolean(task.pending_command_id)
+  const stopPending = task.pending_command_type === 'stop'
+  const resumeBlocked = resumable ? resumeBlockReason(task) : ''
+  const taskError = taskErrorText(task)
+  const taskMode = task.source === 'cloud' && task.task_type.includes('plan') ? '自动计划' : task.source === 'cloud' ? '一次性任务' : '设备任务'
+
+  return (
+    <article className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${statusTone(effectiveStatus)}`}>{STATUS_LABELS[effectiveStatus] || effectiveStatus}</span>
+            <span className="rounded-full bg-muted px-2.5 py-1 text-[11px] text-muted-foreground">{PLATFORM_LABELS[task.platform] || task.platform}</span>
+            <span className="text-[11px] text-muted-foreground">{taskMode}</span>
+          </div>
+          <h4 className="mt-2.5 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
+          <div className="mt-2 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+            <ClipboardList className="h-3.5 w-3.5 shrink-0 text-primary" />
+            <span className="shrink-0">任务</span><ChevronRight className="h-3.5 w-3.5 shrink-0" />
+            <Bot className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate text-foreground">{task.agent_host_label || '未分配设备'} › {task.agent_display_name || '未分配节点'}</span>
+            <span className={`shrink-0 ${task.agent_online ? 'text-status-green' : ''}`}>{task.agent_online ? '在线' : '离线'}</span>
+          </div>
+          {task.message && <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{task.message}</p>}
+          {taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-2 text-xs leading-5 text-status-red">{taskError}</p>}
+        </div>
+        {(resumable || stoppable || commandPending) && (
+          <div className="flex shrink-0 flex-wrap gap-2 sm:justify-end">
+            {resumable && !commandPending && (
+              <Button size="sm" onClick={() => void onResume(task)} disabled={!writable || Boolean(resumeBlocked) || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                {resumeBlocked ? '暂时不能继续' : task.agent_online ? '继续剩余任务' : '上线后继续'}
+              </Button>
+            )}
+            {stoppable && !stopPending && (
+              <Button variant="destructive" size="sm" onClick={() => void onStop(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
+                {task.agent_online ? '停止任务' : '上线后停止'}
+              </Button>
+            )}
+            {stopPending && <Button variant="destructive" size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />{task.agent_online ? '等待设备停止' : '已排队，上线后停止'}</Button>}
+            {commandPending && !stoppable && !stopPending && <Button size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />等待设备响应</Button>}
+          </div>
+        )}
+      </div>
+      {progress.total > 0 && (
+        <div className="mt-3">
+          <div className="mb-1.5 flex justify-between text-[11px] text-muted-foreground"><span>总体进度</span><span>{progress.current}/{progress.total} · {progress.percent}%</span></div>
+          <div className="h-2 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="任务总体进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><span className="block h-full rounded-full bg-primary transition-[width]" style={{ width: `${progress.percent}%` }} /></div>
+        </div>
+      )}
+      <button type="button" onClick={() => setDetailsOpen(value => !value)} aria-expanded={detailsOpen}
+        className="mt-3 flex min-h-9 w-full items-center justify-between border-t border-border/60 pt-3 text-left text-[11px] font-medium text-muted-foreground hover:text-foreground">
+        <span>创建于 {formatTime(task.created_at || task.updated_at)}</span>
+        <span className="flex items-center gap-1">运行详情 {detailsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}</span>
+      </button>
+      {detailsOpen && (
+        <div className="mt-2 grid gap-2 rounded-xl bg-muted/45 p-3 text-[11px] text-muted-foreground sm:grid-cols-2">
+          <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>
+          <div>任务心跳：<span className="text-foreground">{formatTime(task.heartbeat_at)}</span></div>
+          <div>业务进展：<span className="text-foreground">{formatTime(task.business_progress_at)}</span></div>
+          <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
+          {task.attempt_number ? <div>执行次数：<span className="text-foreground">第 {task.attempt_number} 次</span></div> : null}
+          {commandPending && task.pending_command_expires_at ? <div>指令保留至：<span className="text-foreground">{formatTime(task.pending_command_expires_at)}</span></div> : null}
+          {resumeBlocked && !commandPending ? <div className="text-status-red sm:col-span-2">继续阻断：{resumeBlocked}</div> : null}
+        </div>
+      )}
+    </article>
+  )
+}
+
 export function CloudTasksTab() {
   const { canWrite } = useAuth()
   const [overview, setOverview] = useState<Overview | null>(null)
@@ -1057,7 +1514,8 @@ export function CloudTasksTab() {
   const [feedback, setFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [actionTaskId, setActionTaskId] = useState('')
-  const [showHistory, setShowHistory] = useState(false)
+  const [taskView, setTaskView] = useState<TaskView>('active')
+  const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(null)
   const loadGeneration = useRef(0)
 
   const load = useCallback(async (quiet = false) => {
@@ -1098,10 +1556,35 @@ export function CloudTasksTab() {
     return Array.from(groups.entries())
   }, [overview?.agents])
 
+  const businessTasks = useMemo(
+    () => (overview?.tasks || []).filter(isBusinessVisibleTask),
+    [overview?.tasks],
+  )
+
   const visibleTasks = useMemo(() => {
-    const active = new Set(['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'interrupted', 'resume_requested', 'needs_action', 'failed', 'completed_with_failures'])
-    return (overview?.tasks || []).filter(task => showHistory || active.has(task.effective_status || task.status))
-  }, [overview?.tasks, showHistory])
+    const tasks = [...businessTasks]
+    return tasks.filter(task => {
+      const status = task.effective_status || task.status
+      if (taskView === 'active') return ACTIVE_TASK_STATUSES.has(status)
+      if (taskView === 'attention') return ATTENTION_TASK_STATUSES.has(status)
+      return !ACTIVE_TASK_STATUSES.has(status) && !ATTENTION_TASK_STATUSES.has(status)
+    }).sort((left, right) => {
+      const leftTime = new Date(left.created_at || left.updated_at || left.finished_at || 0).getTime()
+      const rightTime = new Date(right.created_at || right.updated_at || right.finished_at || 0).getTime()
+      return rightTime - leftTime
+    })
+  }, [businessTasks, taskView])
+
+  const taskCounts = useMemo(() => {
+    const counts = { active: 0, attention: 0, history: 0 }
+    for (const task of businessTasks) {
+      const status = task.effective_status || task.status
+      if (ACTIVE_TASK_STATUSES.has(status)) counts.active += 1
+      else if (ATTENTION_TASK_STATUSES.has(status)) counts.attention += 1
+      else counts.history += 1
+    }
+    return counts
+  }, [businessTasks])
 
   const resume = async (task: CloudTask) => {
     setActionTaskId(task.id)
@@ -1144,162 +1627,129 @@ export function CloudTasksTab() {
     <div className="space-y-5">
       <section className="overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm">
         <div className="flex flex-col gap-4 px-5 py-5 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-primary"><CloudCog className="h-4 w-4" /> Cloud Task Center</div>
-            <h2 className="mt-2 text-xl font-bold text-foreground">云端采集任务中心</h2>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">查看不同浏览器节点的实时进度，也可为指定节点新建任务或继续中断任务。离线、忙碌设备会排队等待，不会假装正在执行。</p>
+          <div className="max-w-2xl">
+            <div className="flex flex-wrap items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-primary">
+              <CloudCog className="h-4 w-4" /> Task Dispatch
+              <span className="rounded-full border border-primary/25 bg-primary/8 px-2 py-0.5 text-[10px] tracking-wider">Beta</span>
+            </div>
+            <h2 className="mt-2 text-xl font-bold text-foreground">任务调度台</h2>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">创建采集任务，明确分配给一个浏览器节点，再持续跟踪排队、执行、中断与恢复。设备像 Agent，任务就是交给它的工作。</p>
           </div>
-          <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing}>
-            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
+            </Button>
+            <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建关键词采集任务">
+              <Plus className="h-4 w-4" /> 新建任务
+            </Button>
+          </div>
         </div>
         <div className="grid grid-cols-2 border-t border-border/60 lg:grid-cols-4">
-          <SummaryStat label="采集节点" value={summary.agents} icon={ServerCog} />
+          <SummaryStat label="执行节点" value={summary.agents} icon={ServerCog} />
           <SummaryStat label="在线节点" value={summary.onlineAgents} icon={Wifi} tone="green" />
-          <SummaryStat label="运行任务" value={summary.runningTasks} icon={Activity} tone="blue" />
-          <SummaryStat label="需要处理" value={summary.attentionTasks} icon={AlertTriangle} tone={summary.attentionTasks ? 'red' : 'default'} />
+          <SummaryStat label="正在执行" value={taskCounts.active} icon={Activity} tone="blue" selected={taskView === 'active'} onClick={() => setTaskView('active')} />
+          <SummaryStat label="需要处理" value={taskCounts.attention} icon={AlertTriangle} tone={taskCounts.attention ? 'red' : 'default'} selected={taskView === 'attention'} onClick={() => setTaskView('attention')} />
         </div>
       </section>
 
       {error && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{error}</div>}
       {actionError && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{actionError}</div>}
-      {feedback && <div role="status" className="rounded-xl border border-primary/20 bg-primary/8 px-4 py-3 text-sm text-primary">{feedback}</div>}
+      {feedback && <div role="status" aria-live="polite" className="rounded-xl border border-primary/20 bg-primary/8 px-4 py-3 text-sm text-primary">{feedback}</div>}
 
-      <section>
-        <div className="mb-3 flex items-end justify-between gap-3">
-          <div><h3 className="text-base font-bold">执行设备</h3><p className="mt-0.5 text-xs text-muted-foreground">同一台电脑的多个浏览器，需要把“所属设备”改成完全相同的名称后归组</p></div>
-          <span className="text-xs text-muted-foreground">2分钟无心跳视为离线</span>
-        </div>
-        {groupedAgents.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-10 text-center">
-            <CircleOff className="mx-auto h-7 w-7 text-muted-foreground" />
-            <div className="mt-3 text-sm font-semibold">还没有采集节点</div>
-            <p className="mt-1 text-xs text-muted-foreground">客户扩展重新验证激活码后，会自动注册到这里。</p>
+      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.5fr)_minmax(320px,0.72fr)]">
+        <section className="min-w-0">
+          <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2"><ListChecks className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">任务队列</h3></div>
+              <p className="mt-1 text-xs text-muted-foreground">按创建时间倒序，新任务在最前；当前展示最近 {businessTasks.length} 条业务任务</p>
+            </div>
+            <div className="flex rounded-xl border border-border bg-card p-1" role="tablist" aria-label="任务分组">
+              {([
+                { value: 'active' as const, label: '执行中', count: taskCounts.active },
+                { value: 'attention' as const, label: '需处理', count: taskCounts.attention },
+                { value: 'history' as const, label: '历史', count: taskCounts.history },
+              ]).map(item => (
+                <button key={item.value} type="button" role="tab" aria-selected={taskView === item.value} onClick={() => setTaskView(item.value)}
+                  className={`min-h-9 rounded-lg px-3 text-xs font-semibold transition-colors ${taskView === item.value ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
+                  {item.label} <span className="ml-1 tabular-nums opacity-80">{item.count}</span>
+                </button>
+              ))}
+            </div>
           </div>
-        ) : (
-          <div className="space-y-3">
-            {groupedAgents.map(([hostLabel, agents]) => (
-              <article key={hostLabel} className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
-                <div className="mb-3 flex items-center gap-2"><Laptop className="h-4 w-4 text-primary" /><h4 className="text-sm font-bold">{hostLabel}</h4><span className="text-xs text-muted-foreground">{agents.length} 个浏览器节点</span></div>
-                <div className="grid gap-3 lg:grid-cols-2">
-                  {agents.map(agent => (
-                    <div key={agent.id} className="rounded-xl border border-border/70 bg-background/70 p-3.5">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0"><div className="truncate text-sm font-bold">{agent.display_name}</div><div className="mt-1 text-[11px] text-muted-foreground">{agent.browser_name} · {agent.operating_system} · v{agent.app_version || '未知'} · {agent.client_uuid.slice(0, 8)}</div><div className="mt-0.5 truncate text-[11px] text-muted-foreground">{agent.client_label}</div></div>
-                        <span className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-1 text-[11px] font-semibold ${agent.status === 'paused' ? 'bg-status-orange/10 text-amber-700 dark:text-amber-300' : agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}>
-                          {agent.status === 'paused' ? <CircleOff className="h-3 w-3" /> : agent.online ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{agent.status === 'paused' ? '已暂停' : agent.online ? '在线' : '离线'}
-                        </span>
-                      </div>
-                      <div className="mt-3 flex flex-wrap gap-1.5">
-                        {(agent.allowed_platforms || []).length > 0
-                          ? agent.allowed_platforms.map(platform => <span key={platform} className="rounded-md bg-primary/8 px-2 py-1 text-[11px] font-medium text-primary">{PLATFORM_LABELS[platform] || platform}</span>)
-                          : <span className="rounded-md bg-muted px-2 py-1 text-[11px] text-muted-foreground">平台未限制</span>}
-                      </div>
-                      <div className="mt-3 text-[11px] text-muted-foreground">最后心跳：{formatTime(agent.last_heartbeat_at)}</div>
-                      {agent.last_error && <div role="alert" className="mt-2 rounded-lg bg-status-red/8 px-2.5 py-2 text-[11px] text-status-red">节点异常：{agent.last_error}</div>}
-                      <UnattendedPlanSummary plan={agent.unattended_plan} mirroredAt={agent.unattended_plan_updated_at} />
-                      <AgentTaskCreator agent={agent} writable={canWrite()} onCreated={() => load(true)} />
-                      {canWrite() && <AgentEditor key={`${agent.id}:${agent.display_name}:${agent.host_label}:${agent.status}:${(agent.allowed_platforms || []).join(',')}`} agent={agent} onSaved={() => load(true)} />}
-                    </div>
-                  ))}
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
 
-      <section>
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <div><h3 className="text-base font-bold">采集任务</h3><p className="mt-0.5 text-xs text-muted-foreground">设备心跳、任务心跳和业务进展分别记录；离线恢复指令保留 30 天</p></div>
-          <Button variant="ghost" size="sm" onClick={() => setShowHistory(value => !value)}>{showHistory ? '只看进行中' : '查看历史'}</Button>
-        </div>
-        {visibleTasks.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-10 text-center">
-            <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /><div className="mt-3 text-sm font-semibold">当前没有需要处理的云端任务</div>
+          {visibleTasks.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-12 text-center">
+              {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
+              <div className="mt-3 text-sm font-semibold">{taskView === 'active' ? '当前没有执行中或排队中的任务' : taskView === 'attention' ? '当前没有需要人工处理的任务' : '最近任务中还没有历史记录'}</div>
+              <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">{taskView === 'active' ? '新建任务后，先分配一个执行节点；节点离线时会保留在云端队列。' : taskView === 'attention' ? '中断、失败和部分失败会集中出现在这里。' : '已完成、已停止和已跳过的任务会进入历史。'}</p>
+              {taskView === 'active' && canWrite() && <Button size="sm" onClick={() => setComposerIntent({})} className="mt-4"><Plus className="h-4 w-4" /> 新建任务</Button>}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {visibleTasks.map(task => (
+                <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop} />
+              ))}
+            </div>
+          )}
+        </section>
+
+        <aside className="min-w-0 xl:sticky xl:top-4">
+          <div className="mb-3 flex items-end justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">执行设备</h3></div>
+              <p className="mt-1 text-xs text-muted-foreground">同一台电脑的多个浏览器会作为独立执行 Agent</p>
+            </div>
+            <span className="shrink-0 text-[11px] text-muted-foreground">2 分钟无心跳视为离线</span>
           </div>
-        ) : (
-          <div className="space-y-3">
-            {visibleTasks.map(task => {
-              const effectiveStatus = task.effective_status || task.status
-              const progress = taskProgress(task)
-              const resumable = canResume(task)
-              const stoppable = canStop(task)
-              const commandPending = Boolean(task.pending_command_id)
-              const stopPending = task.pending_command_type === 'stop'
-              const resumeBlocked = resumable ? resumeBlockReason(task) : ''
-              const taskError = taskErrorText(task)
-              return (
-                <article key={task.id} className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
-                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${statusTone(effectiveStatus)}`}>{STATUS_LABELS[effectiveStatus] || effectiveStatus}</span>
-                        <span className="rounded-full bg-muted px-2.5 py-1 text-[11px] text-muted-foreground">{PLATFORM_LABELS[task.platform] || task.platform}</span>
-                        {task.attempt_number ? <span className="text-[11px] text-muted-foreground">第 {task.attempt_number} 次执行</span> : null}
-                      </div>
-                      <h4 className="mt-2.5 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
-                      <div className="mt-1 text-xs text-muted-foreground">{task.agent_host_label || '未分配设备'} · {task.agent_display_name || '未分配节点'} · {task.agent_online ? '在线' : '离线'}</div>
-                      {task.message && <p className="mt-2 text-xs leading-5 text-muted-foreground">{task.message}</p>}
-                      {taskError && taskError !== task.message && <p role="alert" className="mt-2 text-xs leading-5 text-status-red">{taskError}</p>}
-                    </div>
-                    {(resumable || stoppable || commandPending) && (
-                      <div className="shrink-0 text-right">
-                        <div className="flex flex-wrap justify-end gap-2">
-                          {resumable && !commandPending && (
-                            <Button size="sm" onClick={() => resume(task)} disabled={!canWrite() || Boolean(resumeBlocked) || actionTaskId === task.id}>
-                              {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                              {resumeBlocked ? '暂时不能继续' : task.agent_online ? '继续剩余任务' : '上线后继续'}
-                            </Button>
-                          )}
-                          {stoppable && !stopPending && (
-                            <Button variant="destructive" size="sm" onClick={() => stop(task)} disabled={!canWrite() || actionTaskId === task.id}>
-                              {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
-                              {task.agent_online ? '停止任务' : '上线后停止'}
-                            </Button>
-                          )}
-                          {stopPending && (
-                            <Button variant="destructive" size="sm" disabled>
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                              {task.agent_online ? '等待设备停止' : '已排队，上线后停止'}
-                            </Button>
-                          )}
-                          {commandPending && !stoppable && !stopPending && (
-                            <Button size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />等待设备响应</Button>
-                          )}
-                        </div>
-                        {resumeBlocked && !commandPending && <p className="mt-1.5 max-w-44 text-[11px] text-status-red">{resumeBlocked}</p>}
-                        {commandPending && task.pending_command_expires_at && <p className="mt-1.5 text-[11px] text-muted-foreground">排队保留至 {formatTime(task.pending_command_expires_at)}</p>}
-                      </div>
-                    )}
+          {groupedAgents.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-10 text-center">
+              <CircleOff className="mx-auto h-7 w-7 text-muted-foreground" />
+              <div className="mt-3 text-sm font-semibold">还没有执行节点</div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">客户 Extension 重新验证激活码后，会自动注册到这里。</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {groupedAgents.map(([hostLabel, agents]) => (
+                <section key={hostLabel} aria-label={hostLabel}>
+                  <div className="mb-2 flex items-center gap-2 px-1">
+                    <Laptop className="h-4 w-4 text-primary" />
+                    <h4 className="min-w-0 truncate text-sm font-bold">{hostLabel}</h4>
+                    <span className="text-[11px] text-muted-foreground">{agents.length} 个节点</span>
                   </div>
-                  {progress.total > 0 && (
-                    <div className="mt-4">
-                      <div className="mb-1.5 flex justify-between text-[11px] text-muted-foreground"><span>总体进度</span><span>{progress.current}/{progress.total} · {progress.percent}%</span></div>
-                      <div className="h-2 overflow-hidden rounded-full bg-muted"><span className="block h-full rounded-full bg-primary transition-[width]" style={{ width: `${progress.percent}%` }} /></div>
-                    </div>
-                  )}
-                  <div className="mt-4 grid gap-2 border-t border-border/60 pt-3 text-[11px] text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
-                    <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>
-                    <div>任务心跳：<span className="text-foreground">{formatTime(task.heartbeat_at)}</span></div>
-                    <div>业务进展：<span className="text-foreground">{formatTime(task.business_progress_at)}</span></div>
-                    <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
+                  <div className="space-y-2.5">
+                    {agents.map(agent => (
+                      <DeviceAgentCard key={agent.id} agent={agent} tasks={businessTasks} writable={canWrite()}
+                        onAssign={selected => setComposerIntent({ agentId: selected.id })}
+                        onEditPlan={selected => setComposerIntent({ agentId: selected.id, mode: 'unattended_plan', editExisting: true })}
+                        onSaved={() => load(true)} />
+                    ))}
                   </div>
-                </article>
-              )
-            })}
-          </div>
-        )}
-      </section>
+                </section>
+              ))}
+            </div>
+          )}
+        </aside>
+      </div>
+
+      {composerIntent && (
+        <TaskAssignmentDrawer agents={overview?.agents || []} tasks={businessTasks} writable={canWrite()} intent={composerIntent}
+          onClose={() => setComposerIntent(null)}
+          onCreated={async () => {
+            setFeedback('任务已创建并分配给指定执行节点。')
+            await load(true)
+          }} />
+      )}
     </div>
   )
 }
 
-function SummaryStat({ label, value, icon: Icon, tone = 'default' }: { label: string; value: number; icon: React.ElementType; tone?: 'default' | 'green' | 'blue' | 'red' }) {
+function SummaryStat({ label, value, icon: Icon, tone = 'default', selected = false, onClick }: { label: string; value: number; icon: React.ElementType; tone?: 'default' | 'green' | 'blue' | 'red'; selected?: boolean; onClick?: () => void }) {
   const colors = { default: 'text-foreground', green: 'text-status-green', blue: 'text-primary', red: 'text-status-red' }
-  return (
-    <div className="flex items-center gap-3 border-b border-r border-border/60 px-4 py-3.5 last:border-r-0 lg:border-b-0">
+  const content = (
+    <>
       <Icon className={`h-5 w-5 ${colors[tone]}`} /><div><div className={`text-lg font-bold tabular-nums ${colors[tone]}`}>{value}</div><div className="text-[11px] text-muted-foreground">{label}</div></div>
-    </div>
+    </>
   )
+  if (onClick) return <button type="button" onClick={onClick} aria-pressed={selected} className={`flex min-h-16 items-center gap-3 border-b border-r border-border/60 px-4 py-3.5 text-left transition-colors last:border-r-0 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary lg:border-b-0 ${selected ? 'bg-primary/[0.045]' : ''}`}>{content}</button>
+  return <div className="flex min-h-16 items-center gap-3 border-b border-r border-border/60 px-4 py-3.5 last:border-r-0 lg:border-b-0">{content}</div>
 }
