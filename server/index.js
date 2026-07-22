@@ -40,7 +40,7 @@ import customTagsRouter from './routes/custom-tags.js';
 import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import captureCloudRouter from './routes/capture-cloud.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
-import { ensureMediaDirs, backfillRecentCovers, MEDIA_DIR } from './services/media-store.js';
+import { ensureMediaDirs, backfillRecentCovers, backfillRecentImages, MEDIA_DIR } from './services/media-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -207,8 +207,11 @@ async function start() {
 
   // 封面落地:启动 25s 后回填近 24h 采集、还没落地的封面(链接多半还有效,过期的自动跳过)
   setTimeout(() => {
-    backfillRecentCovers()
-      .then(n => { if (n) console.log(`[CoverStore] 启动回填:尝试 ${n} 条封面落地`); })
+    Promise.all([backfillRecentCovers(), backfillRecentImages()])
+      .then(([covers, images]) => {
+        if (covers) console.log(`[CoverStore] 启动回填:尝试 ${covers} 条封面落地`);
+        if (images) console.log(`[ImageStore] 启动回填:尝试 ${images} 条正文图片落地`);
+      })
       .catch(() => {});
   }, 25000);
 

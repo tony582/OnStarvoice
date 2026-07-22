@@ -384,7 +384,7 @@ router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
     if (recordId) {
       record = await queryOne(
         `SELECT id, platform, record_type, title, content, author_name, author_fans, blogger_profile_url,
-                url, cover_url, cover_local, image_urls, note_type, video_url,
+                url, cover_url, cover_local, image_urls, image_local_urls, note_type, video_url,
                 sentiment, category, source_type, identity_override, ai_summary, ai_result,
                 negative_comment_count, latest_negative_comment_at, official_response_status,
                 likes, comments_count, collects, shares, publish_time, publish_location, keyword,

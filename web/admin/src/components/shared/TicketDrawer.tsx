@@ -12,6 +12,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { RecordImageGallery, recordDisplayImages } from '@/components/shared/RecordImageGallery'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
 
@@ -220,7 +221,7 @@ export function TicketDrawer({
   const closed = t.status === 'closed'
   const postUrl = t.url || rec?.url || cmt?.record_url || ''
   const cover = recordCover(rec, t)
-  const images = recordImages(rec)
+  const images = recordDisplayImages(rec)
   const resolvedIdentity = rec ? identityLabel(rec.source_type, rec.author_fans, rec.author_name, rec.identity_override) : ''
   const timeline = buildTimeline(t, notes)
   const tabs = [
@@ -366,20 +367,7 @@ export function TicketDrawer({
                         <p className="text-sm leading-relaxed text-muted-foreground">{rec.ai_summary}</p>
                       </div>
                     )}
-                    {images.length > 1 && (
-                      <div>
-                        <h4 className="mb-2 text-[13px] font-semibold text-foreground">图片</h4>
-                        <div className="grid grid-cols-3 gap-2">
-                          {images.map((url, index) => (
-                            <button type="button" key={`${url}-${index}`} onClick={() => setLightbox(url)} title="点击放大"
-                              className="group relative aspect-square cursor-zoom-in overflow-hidden rounded-lg border border-border bg-muted">
-                              <img src={url} alt="" className="h-full w-full object-cover transition group-hover:scale-105" referrerPolicy="no-referrer" />
-                              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/25 group-hover:opacity-100"><ZoomIn className="h-4 w-4 text-white" /></span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
+                    <RecordImageGallery key={`${rec?.id || t.id}-${images.join('|')}`} images={images} onOpen={setLightbox} />
                   </div>
                 )}
 
@@ -678,22 +666,6 @@ function TicketTimeline({ items }: { items: TimelineItem[] }) {
 
 function recordCover(record: any, ticket: any): string {
   return proxiedImg(record?.cover_local || record?.cover_url || ticket?.cover_url || '')
-}
-
-function recordImages(record: any): string[] {
-  const urls: string[] = []
-  if (record?.cover_url) urls.push(record.cover_url)
-  const raw = record?.image_urls
-  let images: any[] = []
-  if (Array.isArray(raw)) images = raw
-  else if (raw) {
-    try { images = JSON.parse(raw) } catch { images = [] }
-  }
-  for (const item of images) {
-    const url = typeof item === 'string' ? item : item?.url
-    if (url && !urls.includes(url)) urls.push(url)
-  }
-  return urls.filter(url => /^https?:\/\//i.test(url)).map(proxiedImg)
 }
 
 function timeValue(value?: string): number {

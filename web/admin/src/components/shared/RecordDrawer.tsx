@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
+import { RecordImageGallery, recordDisplayImages } from '@/components/shared/RecordImageGallery'
 import {
   RecordLabelChips, RecordLabelEditor, RecordLabelsHeading,
 } from '@/components/shared/RecordLabels'
@@ -500,20 +501,7 @@ export function RecordDrawer({
                       </div>
                     )}
                     {hasVideo(r) && <TranscriptSection record={r} canWrite={canProcess} />}
-                    {images.length > 1 && (
-                      <div>
-                        <h4 className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">图片</h4>
-                        <div className="grid grid-cols-3 gap-2">
-                          {images.map((url: string, i: number) => (
-                            <button type="button" key={i} onClick={() => setLightbox(url)} title="点击放大"
-                              className="group relative aspect-square cursor-zoom-in overflow-hidden rounded-lg border border-border bg-muted">
-                              <img src={url} alt="" className="h-full w-full object-cover transition group-hover:scale-105" referrerPolicy="no-referrer" />
-                              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/25 group-hover:opacity-100"><ZoomIn className="h-4 w-4 text-white" /></span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
+                    <RecordImageGallery key={`${r.id}-${images.join('|')}`} images={images} onOpen={setLightbox} />
                   </div>
                 )}
 
@@ -1153,16 +1141,7 @@ export function getCover(r: any): string {
 }
 
 export function getImages(r: any): string[] {
-  const urls: string[] = []
-  if (r.cover_url) urls.push(r.cover_url)
-  try {
-    const imgs = JSON.parse(r.image_urls || '[]')
-    for (const img of imgs) {
-      const url = typeof img === 'string' ? img : (img?.url || '')
-      if (url && !urls.includes(url)) urls.push(url)
-    }
-  } catch {}
-  return urls.filter(u => /^https?:\/\//i.test(u)).map(proxiedImg)
+  return recordDisplayImages(r)
 }
 
 function commentClassifier(comment: any): string {

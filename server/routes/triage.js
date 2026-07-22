@@ -286,7 +286,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     const records = await queryAll(`
       SELECT
         r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
-        r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.note_type,
+        r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
         r.publish_time, r.published_ts, r.publish_location, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,
