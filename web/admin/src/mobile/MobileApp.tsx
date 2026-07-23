@@ -3,7 +3,7 @@ import {
   Activity, AlertTriangle, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
   CircleAlert, ClipboardList, Database, Eye, FileText, Headphones,
   Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageSquare, Monitor,
-  MoreHorizontal, Radio, RefreshCw, Search, Send, ServerCog, Settings, ShieldCheck,
+  MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
   Sparkles, User, Users,
 } from 'lucide-react'
 import {
@@ -25,6 +25,7 @@ import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
 import { InsightsPage } from '@/pages/InsightsPage'
+import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
 import { DataPage } from '@/pages/DataPage'
 import { EventsPage } from '@/pages/EventsPage'
 import { TracksPage } from '@/pages/TracksPage'
@@ -45,6 +46,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
   insights: InsightsPage,
+  'opinion-analysis': OpinionAnalysisPage,
   data: DataPage,
   events: EventsPage,
   tracks: TracksPage,
@@ -61,7 +63,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
 
 const PAGE_TITLES: Record<string, string> = {
   overview: '今日值守', opinion: '客服工单', salesleads: '销售客资', workbench: '待办队列',
-  monitoring: '监测中心', insights: '舆情洞察', data: '数据与导出', events: '事件中心',
+  monitoring: '监测中心', insights: '舆情洞察', 'opinion-analysis': '舆情剖析', data: '数据与导出', events: '事件中心',
   tracks: '赛道机会', benchmarks: '对标账号', keywords: '选题与扩词',
   'content-home': '内容总览', hits: '爆款拆解', review: '内容复盘',
   'official-accounts': '官方账号', tenants: '租户管理', users: '用户账号',
@@ -448,6 +450,14 @@ function InsightsHub({ openPage }: { openPage: OpenPage }) {
               <ChevronRight className="mt-1 h-4 w-4 text-muted-foreground" />
             </div>
           </button>
+          <button type="button" onClick={() => openPage('opinion-analysis')}
+            className="mt-2 w-full rounded-2xl border border-border bg-card p-4 text-left active:bg-muted">
+            <div className="flex items-start gap-3">
+              <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-status-purple/10 text-status-purple"><ScanSearch className="h-5 w-5" /></span>
+              <span className="min-w-0 flex-1"><span className="flex items-center gap-1.5 text-[15px] font-bold">舆情剖析<span className="rounded bg-status-green/15 px-1 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-emerald-600 dark:text-emerald-400">NEW</span></span><span className="mt-1 block text-[11px] leading-5 text-muted-foreground">圈定话题深度拆解：风险研判、观点情绪、传播与应对口径</span></span>
+              <ChevronRight className="mt-1 h-4 w-4 text-muted-foreground" />
+            </div>
+          </button>
         </section>
         <section>
           <SectionHeading label="内容机会" />
@@ -597,7 +607,7 @@ function MobilePageSurface() {
 function rootForPage(page: string, params: Record<string, string>): RootTab {
   if (page === 'workbench' || page === 'opinion' || page === 'salesleads') return 'tasks'
   if (page === 'monitoring' || page === 'events') return 'monitor'
-  if (['insights', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
+  if (['insights', 'opinion-analysis', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
   if (page === 'overview') return 'today'
   if (params.queue) return 'tasks'
   return 'more'

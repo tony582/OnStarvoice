@@ -8,6 +8,7 @@ import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
 import { InsightsPage } from '@/pages/InsightsPage'
+import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
 import { DataPage } from '@/pages/DataPage'
 import { EventsPage } from '@/pages/EventsPage'
 import { TracksPage } from '@/pages/TracksPage'
@@ -31,6 +32,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   salesleads: { eyebrow: 'Sales Leads', title: '销售客资' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
+  'opinion-analysis': { eyebrow: 'Opinion Analysis', title: '舆情剖析' },
   data: { eyebrow: 'Data Assets', title: '数据底座' },
   'content-home': { eyebrow: 'Content Studio', title: '内容总览' },
   tracks: { eyebrow: 'Content Studio', title: '赛道大盘' },
@@ -53,6 +55,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   salesleads: SalesLeadsPage,
   events: EventsPage,
   insights: InsightsPage,
+  'opinion-analysis': OpinionAnalysisPage,
   data: DataPage,
   tracks: TracksPage,
   benchmarks: BenchmarksPage,

@@ -23,6 +23,7 @@ export const WORKSPACE_HOME: Record<Workspace, string> = {
 export const PAGE_WORKSPACE: Record<string, Workspace> = {
   overview: 'opinion', workbench: 'opinion', monitoring: 'opinion',
   insights: 'opinion', data: 'opinion', events: 'opinion',
+  'opinion-analysis': 'opinion',
   'content-home': 'content', tracks: 'content', hits: 'content',
   benchmarks: 'content', keywords: 'content', review: 'content',
 }

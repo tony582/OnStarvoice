@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Columns3, Radar, BarChart3, Database,
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
-  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X,
+  ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X, ScanSearch,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -32,6 +32,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'monitoring', label: '监测与采集', icon: Radar, badgeKeys: ['monitorAttention'], tag: 'BETA' },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
+    { id: 'opinion-analysis', label: '舆情剖析', icon: ScanSearch, tag: 'NEW' },
     { id: 'data', label: '数据底座', icon: Database },
   ],
   content: [
