@@ -7,6 +7,7 @@ import {
   countScopedRecords,
   normalizeKeywords,
   hasBrandContextConfigured,
+  computeRecordInputHash,
 } from '../services/opinion-analysis.js';
 
 const router = Router();
@@ -189,7 +190,8 @@ router.post('/records/:recordId', async (req, res, next) => {
   }
 });
 
-// 只读缓存:未剖析回 analysis:null,由前端决定是否发起 POST
+// 只读缓存:未剖析回 analysis:null,由前端决定是否发起 POST。
+// stale = 缓存后正文/评论/逐字稿/OCR 有变化(input_hash 不一致),前端提示可重剖,GET 本身不触发。
 router.get('/records/:recordId', async (req, res, next) => {
   try {
     const cached = await queryOne(
@@ -198,7 +200,19 @@ router.get('/records/:recordId', async (req, res, next) => {
       [req.tenantId, req.params.recordId]
     );
     if (!cached) return res.json({ ok: true, analysis: null });
-    return res.json({ ok: true, analysis: cached.payload, source: cached.analysis_source, updatedAt: cached.updated_at });
+
+    let stale = false;
+    const record = await queryOne(
+      `SELECT id, content, comments_count, transcript FROM records WHERE id = $1 AND tenant_id = $2`,
+      [req.params.recordId, req.tenantId]
+    );
+    if (record) {
+      const currentHash = await computeRecordInputHash(req.tenantId, record);
+      stale = Boolean(cached.input_hash) && currentHash !== cached.input_hash;
+    }
+    return res.json({
+      ok: true, analysis: cached.payload, source: cached.analysis_source, updatedAt: cached.updated_at, stale,
+    });
   } catch (err) {
     return next(err);
   }

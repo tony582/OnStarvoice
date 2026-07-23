@@ -605,15 +605,73 @@ export async function failStaleAnalyses() {
   return total;
 }
 
+const RECORD_STANCES = ['positive', 'neutral', 'negative'];
+
 /**
- * 单条深剖(只读消费已有沉淀,不触发 ASR/OCR)。当前为规则兜底桩:stance 取 sentiment、
- * riskLevel 按该记录已命中的预警映射,LLM 深剖与 stale 检测后续接入。
- * 兜底结果同样落缓存 —— 抽屉重开有内容,POST 读到 rule_fallback 缓存会自动再试一次。
+ * 单条深剖 LLM(一次调用):喂正文+互动+逐字稿(截4000)+逐字稿分析 JSONB+OCR 图文(截1500)+
+ * 负面优先评论样本(≤50)+命中预警,覆盖 overview 文字层/contentInsights/commentInsights/回应话术。
+ * 回应话术是客户可见交付物,口径依据只来自系统提示词注入的品牌业务语境。失败/未配 key 返回 null 回落规则。
+ */
+async function enhanceRecordAnalysis(tenantId, { record, comments, ocrText, transcript, transcriptAnalysis, alerts }) {
+  try {
+    const brand = await getBrandContext(tenantId);
+    const systemPrompt = `你是「${brand.brandName}」的资深舆情分析师。业务语境:${brand.businessContext}
+下面给你一条社媒内容的正文/口播逐字稿/图文文字/评论摘录及其已命中的预警。请做单条深度剖析,只输出 JSON:
+{
+  "overview": {
+    "stance": "positive|neutral|negative",
+    "summary": "一句话:这条内容在讲什么、对品牌是什么态度、风险几何"
+  },
+  "contentInsights": {
+    "corePoints": ["博主/正文的核心观点或主张"],
+    "issues": ["提到的具体槽点/问题点(如年费贵、功能鸡肋、信号差)"]
+  },
+  "commentInsights": {
+    "summary": "评论区整体氛围与主要分歧(1-2句)",
+    "points": [{"viewpoint":"评论区的一类观点","stance":"negative|mixed|neutral|positive","summary":"这类评论在说什么"}]
+  },
+  "suggestedResponse": {
+    "action": "建议的处置动作(一句)",
+    "replyDraft": "面向该内容评论区/私信的建议回应话术(克制、基于事实、不承诺无法兑现的事;无需回应则空串)",
+    "escalation": "需要升级或跨部门协同的事项(无则空串)"
+  }
+}
+要求:stance 只能取三值枚举;评论观点要跨评论归纳而非逐条复述;话术必须贴合上述业务语境,不编造数据;简洁中文;空字段用空数组/空串。`;
+    const parts = [
+      `【标题】${record.title || ''}`,
+      `【正文】${compact(record.content, 2000) || '(无正文)'}`,
+      `【互动】赞${num(record.likes)} 评${num(record.comments_count)} 藏${num(record.collects)} 转${num(record.shares)};负面评论 ${num(record.negative_comment_count)} 条`,
+    ];
+    if (transcript) parts.push(`【视频口播逐字稿】\n${transcript}`);
+    if (transcriptAnalysis && typeof transcriptAnalysis === 'object') {
+      const ta = transcriptAnalysis;
+      parts.push(`【逐字稿既有AI分析】立场 ${cleanText(ta.stance, 20) || '未标'};${cleanText(ta.summary, 200)};槽点:${cleanList(ta.issues, 5, 80).join('、') || '无'}`);
+    }
+    if (ocrText) parts.push(`【图文提取文字】${ocrText}`);
+    if (alerts.length) parts.push(`【已命中预警】${alerts.map(a => cleanText(a.reason, 120)).filter(Boolean).join(';') || '无'}`);
+    if (comments.length) {
+      parts.push(`【评论摘录】(${comments.length} 条,负面优先)\n` + comments
+        .map(c => `- ${c.is_negative ? `负面/${c.risk_level || 'low'}` : (c.sentiment || '中性')} | 赞${num(c.like_count)} | ${compact(c.content, 100)}`)
+        .join('\n'));
+    } else {
+      parts.push('【评论摘录】无评论数据');
+    }
+    const result = await callLLMWithPrompt(tenantId, systemPrompt, parts.join('\n'));
+    if (!result || typeof result !== 'object') return null;
+    return (result.overview || result.contentInsights || result.commentInsights || result.suggestedResponse) ? result : null;
+  } catch (err) {
+    console.warn('[OpinionAnalysis] 单条深剖 LLM 失败,回落规则:', err?.message || err);
+    return null;
+  }
+}
+/**
+ * 单条深剖(只读消费已有沉淀,不触发 ASR/OCR):规则先算兜底骨架,再一次 LLM 覆盖文字层,失败无缝回落。
+ * 兜底/降级结果同样落缓存 —— 抽屉重开有内容;POST 读到 rule_fallback 缓存会隐式再试一次(防一次超时永久钉死)。
  */
 export async function analyzeOpinionRecord({ tenantId, recordId }) {
   const record = await queryOne(
     `SELECT id, title, content, sentiment, ai_summary, likes, comments_count, collects, shares,
-            negative_comment_count, transcript
+            negative_comment_count, transcript, transcript_analysis
      FROM records WHERE id = $1 AND tenant_id = $2`,
     [recordId, tenantId]
   );
@@ -623,24 +681,67 @@ export async function analyzeOpinionRecord({ tenantId, recordId }) {
     `SELECT level, reason FROM alerts WHERE tenant_id = $1 AND record_id = $2 ORDER BY created_at DESC`,
     [tenantId, recordId]
   );
+  // 评论样本:负面优先 + 高风险 + 高赞 + 最新,排除官方回复,≤50 条(与报告线负评排序同口径)
+  const comments = await queryAll(
+    `SELECT content, like_count, is_negative, risk_level, sentiment
+     FROM record_comments
+     WHERE tenant_id = $1 AND record_id = $2 AND is_official = false AND content <> ''
+     ORDER BY is_negative DESC,
+       CASE risk_level WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 ELSE 1 END DESC,
+       like_count DESC, last_seen_at DESC
+     LIMIT 50`,
+    [tenantId, recordId]
+  );
+  // OCR 只消费 done 行的可见文字,拼到 1500 字上限(不触发新的图片识别)
+  const ocrRows = await queryAll(
+    `SELECT text FROM record_image_ocr
+     WHERE tenant_id = $1 AND record_id = $2 AND status = 'done' AND text <> ''
+     ORDER BY updated_at DESC`,
+    [tenantId, recordId]
+  );
+  const ocrText = ocrRows.map(row => String(row.text || '').trim()).filter(Boolean).join('\n').slice(0, 1500);
+  const transcript = String(record.transcript || '').trim().slice(0, 4000);
+
   let riskLevel = 'watch';
   for (const alert of alerts) {
     const mapped = RECORD_RISK_BY_ALERT_LEVEL[alert.level] || 'watch';
     if (RISK_LEVELS.indexOf(mapped) < RISK_LEVELS.indexOf(riskLevel)) riskLevel = mapped;
   }
   riskLevel = normalizeRiskLevel(riskLevel);
-
   const interactionTotal = num(record.likes) + num(record.comments_count) + num(record.collects) + num(record.shares);
+
+  // evidenceSources 由规则确定性给出(用了哪些沉淀),不交给 LLM 编造
+  const evidenceSources = [];
+  if (record.content) evidenceSources.push('正文');
+  if (transcript) evidenceSources.push('视频逐字稿');
+  if (record.transcript_analysis && typeof record.transcript_analysis === 'object') evidenceSources.push('逐字稿AI分析');
+  if (ocrText) evidenceSources.push('图文提取文字');
+  if (comments.length) evidenceSources.push(`评论 ${comments.length} 条`);
+  if (alerts.length) evidenceSources.push(`预警 ${alerts.length} 条`);
+
+  // 规则兜底骨架:corePoints/issues 借逐字稿既有分析(若有),commentInsights 用真实负评摘录顶上
+  const ta = record.transcript_analysis && typeof record.transcript_analysis === 'object' ? record.transcript_analysis : null;
+  const fallbackPoints = comments.slice(0, 5).map(c => ({
+    viewpoint: compact(c.content, 60),
+    stance: c.is_negative ? 'negative' : (RECORD_STANCES.includes(c.sentiment) ? c.sentiment : 'neutral'),
+    summary: '',
+  }));
   const payload = {
-    meta: { promptVersion: RECORD_PROMPT_VERSION, generatedAt: new Date().toISOString() },
+    meta: { promptVersion: RECORD_PROMPT_VERSION, generatedAt: new Date().toISOString(), evidenceSources },
     overview: {
-      stance: record.sentiment || 'neutral',
+      stance: RECORD_STANCES.includes(record.sentiment) ? record.sentiment : 'neutral',
       riskLevel,
       riskLevelLabel: RISK_LEVEL_LABEL[riskLevel],
-      summary: compact(record.ai_summary || record.content || record.title, 160),
+      summary: compact(ta?.summary || record.ai_summary || record.content || record.title, 160),
     },
-    contentInsights: { corePoints: [], issues: [], evidenceSources: [] },
-    commentInsights: { summary: '', points: [] },
+    contentInsights: {
+      corePoints: ta ? cleanList(ta.keyPoints, 6, 120) : [],
+      issues: ta ? cleanList(ta.issues, 6, 120) : [],
+    },
+    commentInsights: {
+      summary: comments.length ? `共采样 ${comments.length} 条评论,其中负面 ${comments.filter(c => c.is_negative).length} 条。` : '',
+      points: fallbackPoints,
+    },
     spreadRisk: {
       interactionTotal,
       negativeCommentCount: num(record.negative_comment_count),
@@ -657,6 +758,52 @@ export async function analyzeOpinionRecord({ tenantId, recordId }) {
       escalation: '',
     },
   };
+  // LLM 覆盖文字层(事务外),失败则整体保留规则兜底
+  const llm = await enhanceRecordAnalysis(tenantId, {
+    record, comments, ocrText, transcript, transcriptAnalysis: ta, alerts,
+  });
+  let analysisSource = 'rule_fallback';
+  if (llm) {
+    analysisSource = 'llm';
+    const ov = llm.overview;
+    if (ov && typeof ov === 'object') {
+      if (RECORD_STANCES.includes(String(ov.stance || '').trim().toLowerCase())) {
+        payload.overview.stance = String(ov.stance).trim().toLowerCase();
+      }
+      const summary = cleanText(ov.summary, 300);
+      if (summary) payload.overview.summary = summary;
+    }
+    const ci = llm.contentInsights;
+    if (ci && typeof ci === 'object') {
+      const corePoints = cleanList(ci.corePoints, 8, 160);
+      if (corePoints.length) payload.contentInsights.corePoints = corePoints;
+      const issues = cleanList(ci.issues, 8, 160);
+      if (issues.length) payload.contentInsights.issues = issues;
+    }
+    const cm = llm.commentInsights;
+    if (cm && typeof cm === 'object') {
+      const summary = cleanText(cm.summary, 400);
+      if (summary) payload.commentInsights.summary = summary;
+      const points = (Array.isArray(cm.points) ? cm.points : [])
+        .map(p => ({
+          viewpoint: cleanText(p?.viewpoint, 120),
+          stance: VIEWPOINT_STANCES.includes(String(p?.stance || '').trim().toLowerCase())
+            ? String(p.stance).trim().toLowerCase() : 'neutral',
+          summary: cleanText(p?.summary, 300),
+        }))
+        .filter(p => p.viewpoint)
+        .slice(0, 6);
+      if (points.length) payload.commentInsights.points = points;
+    }
+    const sr = llm.suggestedResponse;
+    if (sr && typeof sr === 'object') {
+      const action = cleanText(sr.action, 300);
+      if (action) payload.suggestedResponse.action = action;
+      payload.suggestedResponse.replyDraft = cleanText(sr.replyDraft, 1200);
+      payload.suggestedResponse.escalation = cleanText(sr.escalation, 600);
+    }
+  }
+  payload.meta.analysisSource = analysisSource;
 
   const inputHash = await computeRecordInputHash(tenantId, record);
   await execute(
@@ -665,9 +812,9 @@ export async function analyzeOpinionRecord({ tenantId, recordId }) {
      ON CONFLICT (tenant_id, record_id)
      DO UPDATE SET payload = excluded.payload, analysis_source = excluded.analysis_source,
        prompt_version = excluded.prompt_version, input_hash = excluded.input_hash, updated_at = now()`,
-    [tenantId, recordId, JSON.stringify(payload), 'rule_fallback', RECORD_PROMPT_VERSION, inputHash]
+    [tenantId, recordId, JSON.stringify(payload), analysisSource, RECORD_PROMPT_VERSION, inputHash]
   );
-  return { payload, source: 'rule_fallback', inputHash };
+  return { payload, source: analysisSource, inputHash };
 }
 
 /** input_hash = sha1(正文摘要+评论数+逐字稿长度+OCR 条数):读缓存时不一致 → 提示 stale 可重剖。 */
