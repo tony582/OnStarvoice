@@ -487,7 +487,7 @@ router.post(
             progress, checkpoint, counts, metadata, message,
             orchestration_revision, source_updated_at
           ) VALUES (
-            $1::uuid, $2, $1::text, 'capture_orchestration',
+            $1::uuid, $2, $1::uuid::text, 'capture_orchestration',
             'keyword_orchestration', $3, $4, 'cloud',
             'remote_orchestration', 'pending',
             $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,

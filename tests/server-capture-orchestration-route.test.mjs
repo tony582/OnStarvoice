@@ -55,7 +55,15 @@ test('create is idempotent and creates only the parent plus keyword items', () =
     "router.post(\n  '/orchestrations'",
     "router.post(\n  '/orchestrations/:id/allocation-preview'",
   );
-  assert.match(create, /\$1::text, 'capture_orchestration'/u);
+  assert.match(
+    create,
+    /\$1::uuid, \$2, \$1::uuid::text, 'capture_orchestration'/u,
+  );
+  assert.doesNotMatch(
+    create,
+    /\$1::text/u,
+    'parent task id must have one PostgreSQL parameter type',
+  );
   assert.match(create, /metadata\.orchestrationRequestHash !== requestHash/u);
   assert.match(create, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
   assert.match(create, /draft\.created_at < now\(\) - interval '24 hours'/u);
