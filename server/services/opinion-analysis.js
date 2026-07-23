@@ -6,8 +6,9 @@
 
 import crypto from 'crypto';
 import { queryOne, queryAll, execute, getSetting } from '../db/init.js';
-import { getReportStats, RELEVANT_RECORD_SQL, RISK_LEVEL_LABEL } from './report-generator.js';
+import { getReportStats, RELEVANT_RECORD_SQL, RISK_LEVEL_LABEL, buildInsightSamplePool } from './report-generator.js';
 import { ALERT_REASON_PREFIXES } from './alert-engine.js';
+import { getBrandContext, callLLMWithPrompt } from './ai-labeler.js';
 
 const RISK_LEVELS = ['critical', 'warning', 'attention', 'watch']; // 越靠前越严重
 const PLATFORM_TEXT = { xiaohongshu: '小红书', weibo: '微博', douyin: '抖音', unknown: '未知平台' };
@@ -116,32 +117,9 @@ export async function collectTopicStats(tenantId, periodStart, periodEnd, keywor
     params
   );
 
-  // 分层抽样池:与报告线 buildAiOpinionInsight 同规则(头10/中5/尾5 ∪ 重点负面 ∪ 增长样本,≤30 条去重)
-  const ss = stats.sentimentSamples || [];
-  const mid = Math.floor(ss.length / 2);
-  const pool = [
-    ...(stats.topNegative || []),
-    ...(stats.risingRecords || []),
-    ...ss.slice(0, 10), ...ss.slice(mid, mid + 5), ...ss.slice(-5),
-  ];
-  const seen = new Set();
-  const samples = [];
-  const sampleMap = {};
-  for (const row of pool) {
-    const id = row.id || row.record_id;
-    if (!id) continue;
-    if (!sampleMap[id]) sampleMap[id] = { title: String(row.title || '').slice(0, 80), url: row.url || row.record_url || '' };
-    if (seen.has(id)) continue;
-    seen.add(id);
-    samples.push(row);
-    if (samples.length >= 30) break;
-  }
-
-  // 头部断层比:Top1 占 Top5 互动比例(越高=被少数爆款主导/易引导易反转)
-  const interOf = row => num(row.likes) + num(row.comments_count) + num(row.collects) + num(row.shares);
-  const tops = (stats.topInteraction || []).map(interOf).sort((a, b) => b - a).slice(0, 5);
-  const topSum = tops.reduce((a, b) => a + b, 0);
-  const cliffPct = topSum > 0 ? Math.round((tops[0] || 0) / topSum * 100) : 0;
+  // 分层抽样池+头部断层比:与报告线共用 buildInsightSamplePool(头10/中5/尾5 ∪ 重点负面 ∪ 增长样本,
+  // ≤30 条去重),保证两处样本口径与 cliffPct 永远一致;samples 为压缩样本(id/情感/互动/摘要),直接可喂 LLM
+  const { samples, sampleMap, cliffPct } = buildInsightSamplePool(stats);
 
   const sentimentCounts = { positive: 0, neutral: 0, negative: 0 };
   for (const row of stats.sentiment || []) {
@@ -319,23 +297,212 @@ export function buildTopicFallback({ stats, metrics, samples, sampleMap, keyword
   };
 }
 
-// LLM①(风险研判+观点拆解)。增强层尚未接入:恒返回 null → runTopicAnalysis 落纯规则兜底。
-async function enhanceRiskAndOpinion() {
-  return null;
+const VIEWPOINT_STANCES = ['negative', 'mixed', 'neutral', 'positive'];
+const RISK_LEVEL_ENUM_TEXT = RISK_LEVELS.map(level => `${level}(${RISK_LEVEL_LABEL[level]})`).join('|');
+
+function cleanText(value, max = 300) {
+  if (value === null || value === undefined || typeof value === 'object') return '';
+  return String(value).trim().slice(0, max);
 }
 
-// LLM②(传播叙事+应对建议,吃①的结论写话术)。增强层尚未接入:恒返回 null。
-async function enhanceSpreadAndResponse() {
-  return null;
+function cleanList(value, max, itemMax = 200) {
+  return (Array.isArray(value) ? value : [])
+    .map(item => cleanText(item, itemMax))
+    .filter(Boolean)
+    .slice(0, max);
 }
 
-// merge:增强层接入后做字段级覆盖 + sampleIds 幻觉过滤 + LLM/规则来源标记。
-// 当前直接返回规则兜底,只保证落库前 riskLevel 枚举归一。
-function mergeTopicResult({ fallback }) {
-  const riskLevel = normalizeRiskLevel(fallback.riskAssessment?.riskLevel);
-  fallback.riskAssessment.riskLevel = riskLevel;
-  fallback.riskAssessment.riskLevelLabel = RISK_LEVEL_LABEL[riskLevel];
-  return { payload: fallback, analysisSource: 'rule_fallback' };
+/** sampleIds 幻觉过滤:LLM 引用的样本 id 必须真实存在于喂入的 sampleMap,其余丢弃。 */
+function filterSampleIds(value, sampleMap) {
+  return (Array.isArray(value) ? value : [])
+    .map(id => cleanText(id, 64))
+    .filter(id => id && sampleMap[id]);
+}
+
+function pctClamp(value) {
+  return Math.max(0, Math.min(100, Math.round(num(value))));
+}
+
+function sampleLines(samples) {
+  return samples
+    .map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}负评${x.negComments} | ${x.title} | ${x.summary}`)
+    .join('\n');
+}
+
+/**
+ * LLM①(风险研判+观点拆解):喂圈定口径统计 + 分层抽样样本(≤30 条,与报告线同池),
+ * 覆盖 riskAssessment 文字层与 viewpointClusters。失败/未配 key 返回 null,该部分回落规则。
+ */
+async function enhanceRiskAndOpinion(tenantId, { metrics, samples, fallback }) {
+  try {
+    const brand = await getBrandContext(tenantId);
+    const systemPrompt = `你是「${brand.brandName}」的资深舆情分析师。业务语境:${brand.businessContext}
+下面给你一个圈定话题的统计概览 + 一批代表样本(每条含 id/情感/互动/摘要)。请做跨样本的风险研判与观点拆解,只输出 JSON:
+{
+  "riskAssessment": {
+    "riskLevel": "critical|warning|attention|watch",
+    "riskSummary": "结论先行的风险摘要(2-3句,点明主要矛盾、是否需介入)",
+    "trendJudgment": "走势研判(1-2句)",
+    "keyDrivers": [{"driver":"风险驱动因素","evidence":"依据","sampleIds":["命中样本id"]}],
+    "watchPoints": ["后续需要盯防的风险点"]
+  },
+  "opinionBreakdown": {
+    "viewpointClusters": [{"viewpoint":"观点","stance":"negative|mixed|neutral|positive","share":0到100的数字,"summary":"该观点在讲什么/集中在哪","sampleIds":["..."]}]
+  }
+}
+要求:riskLevel 只能取四级枚举 ${RISK_LEVEL_ENUM_TEXT} 之一;sampleIds 只能引用我给的样本 id,不得编造;聚类要跨样本归纳而非逐条复述;基于事实不臆造;空字段用空数组/空串;简洁中文。`;
+    const userMessage = `【话题概览】圈定 ${metrics.total} 条内容,负面 ${metrics.negativeCount} 条(负面率 ${metrics.negativeRate}%),负面评论 ${metrics.negativeComments} 条;周期内预警 critical ${num(metrics.alertCounts?.critical)} 条/warning ${num(metrics.alertCounts?.warning)} 条,低粉高扩散 ${metrics.lowFansHighSpreadCount} 条。
+【热度结构】Top1 内容占 Top5 互动的 ${metrics.cliffPct}%(越高=越被少数爆款主导/易引导易反转,越低=普遍发酵/更接近真实民意)。
+【规则走势】${fallback.riskAssessment.trendJudgment}
+【代表样本】(${samples.length} 条)
+${sampleLines(samples)}`;
+    const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+    if (!result || typeof result !== 'object') return null;
+    // 空壳/跑题 JSON 视同失败,让对应块干净地回落规则
+    return (result.riskAssessment || result.opinionBreakdown) ? result : null;
+  } catch (err) {
+    console.warn('[OpinionAnalysis] LLM①(风险/观点)失败,该部分回落规则:', err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * LLM②(传播叙事+应对建议):吃①的风险结论与主要观点写话术;①失败则用规则骨架的结论顶上。
+ * 回应话术是客户可见交付物,口径依据只来自系统提示词注入的品牌业务语境。
+ */
+async function enhanceSpreadAndResponse(tenantId, { metrics, fallback, riskOpinion }) {
+  try {
+    const brand = await getBrandContext(tenantId);
+    const riskLevel = normalizeRiskLevel(riskOpinion?.riskAssessment?.riskLevel, fallback.riskAssessment.ruleRiskLevel);
+    const riskSummary = cleanText(riskOpinion?.riskAssessment?.riskSummary, 500) || fallback.riskAssessment.riskSummary;
+    const clusterLines = (riskOpinion?.opinionBreakdown?.viewpointClusters || fallback.opinionBreakdown.viewpointClusters || [])
+      .slice(0, 3)
+      .map(c => `- ${cleanText(c?.viewpoint, 120)}(${cleanText(c?.stance, 20) || 'neutral'}):${cleanText(c?.summary, 200)}`);
+    const spread = fallback.spreadNarrative;
+    const platformLine = (spread.platforms || [])
+      .map(p => `${p.label} ${p.count} 条(负面 ${p.negativeCount})`)
+      .join('、') || '无平台分布数据';
+    const nodeLines = (spread.keyNodes || [])
+      .map(node => `- ${node.title}(${node.sentiment || '未标'},互动增长 ${node.interactionGrowth})`)
+      .join('\n') || '无';
+    const systemPrompt = `你是「${brand.brandName}」的舆情应对策略顾问。业务语境:${brand.businessContext}
+基于给出的风险结论、主要观点与传播统计,产出传播叙事与应对建议,只输出 JSON:
+{
+  "spreadSummary": "传播面叙事(2-3句:平台结构/扩散节奏/是爆款主导还是普遍发酵)",
+  "responseStrategy": {
+    "actions": ["按优先级排列的具体处置动作"],
+    "responseDraft": {
+      "statement": "对外统一回应口径",
+      "qa": [{"q":"高频追问","a":"建议答复"}],
+      "channelNotes": ["分渠道注意事项(评论区/私信/官方账号等)"]
+    },
+    "contentIdeas": [{"title":"承接性内容选题","angle":"切入角度"}]
+  }
+}
+要求:话术必须贴合上述业务语境,克制、基于事实,不承诺无法兑现的事,不编造数据;简洁中文;空字段用空数组/空串。`;
+    const userMessage = `【风险结论】等级 ${riskLevel}(${RISK_LEVEL_LABEL[riskLevel]});${riskSummary}
+【主要观点】
+${clusterLines.join('\n') || '无'}
+【传播统计】共 ${metrics.total} 条;平台分布:${platformLine};Top1 占 Top5 互动 ${metrics.cliffPct}%;低粉高扩散预警 ${metrics.lowFansHighSpreadCount} 条。
+【关键节点】
+${nodeLines}`;
+    const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+    if (!result || typeof result !== 'object') return null;
+    return (result.spreadSummary || result.responseStrategy) ? result : null;
+  } catch (err) {
+    console.warn('[OpinionAnalysis] LLM②(传播/应对)失败,该部分回落规则:', err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * 字段级 merge:规则骨架打底,LLM 成功的部分覆盖对应块并标记 source='llm'(前端按块显示来源角标)。
+ * emotionTones/representativeVoices 与 spreadNarrative 的数据字段(platforms/trend/keyNodes)永远保留
+ * 规则统计——情绪构成是真实计数、代表言论是真实评论,而 LLM① 只见过帖子样本没见过评论原文,
+ * 放开覆盖等于邀请编造引语;sampleIds 一律过 sampleMap 存在性过滤。
+ */
+export function mergeTopicResult({ fallback, riskOpinion = null, spreadResponse = null }) {
+  const payload = fallback;
+  const sampleMap = payload.sampleMap || {};
+  for (const key of ['riskAssessment', 'opinionBreakdown', 'spreadNarrative', 'responseStrategy']) {
+    payload[key].source = 'rule';
+  }
+
+  const risk = riskOpinion?.riskAssessment;
+  if (risk && typeof risk === 'object') {
+    const target = payload.riskAssessment;
+    // 枚举校验:非法值回落规则定级;合法但与规则不同以 LLM 为准,ruleRiskLevel 保留对照
+    target.riskLevel = normalizeRiskLevel(risk.riskLevel, target.ruleRiskLevel);
+    target.riskSummary = cleanText(risk.riskSummary, 600) || target.riskSummary;
+    target.trendJudgment = cleanText(risk.trendJudgment, 300) || target.trendJudgment;
+    const keyDrivers = (Array.isArray(risk.keyDrivers) ? risk.keyDrivers : [])
+      .map(d => ({
+        driver: cleanText(d?.driver, 120),
+        evidence: cleanText(d?.evidence, 300),
+        sampleIds: filterSampleIds(d?.sampleIds, sampleMap),
+      }))
+      .filter(d => d.driver)
+      .slice(0, 5);
+    if (keyDrivers.length) target.keyDrivers = keyDrivers;
+    const watchPoints = cleanList(risk.watchPoints, 6, 200);
+    if (watchPoints.length) target.watchPoints = watchPoints;
+    target.source = 'llm';
+  }
+
+  const clusters = (Array.isArray(riskOpinion?.opinionBreakdown?.viewpointClusters)
+    ? riskOpinion.opinionBreakdown.viewpointClusters : [])
+    .map(c => ({
+      viewpoint: cleanText(c?.viewpoint, 120),
+      stance: VIEWPOINT_STANCES.includes(String(c?.stance || '').trim().toLowerCase())
+        ? String(c.stance).trim().toLowerCase() : 'neutral',
+      share: pctClamp(c?.share),
+      summary: cleanText(c?.summary, 300),
+      sampleIds: filterSampleIds(c?.sampleIds, sampleMap),
+    }))
+    .filter(c => c.viewpoint)
+    .slice(0, 6);
+  if (clusters.length) {
+    payload.opinionBreakdown.viewpointClusters = clusters;
+    payload.opinionBreakdown.source = 'llm';
+  }
+
+  const spreadSummary = cleanText(spreadResponse?.spreadSummary, 600);
+  if (spreadSummary) {
+    // platforms/trend/keyNodes 数据永远来自规则统计,LLM 只覆盖叙事
+    payload.spreadNarrative.summary = spreadSummary;
+    payload.spreadNarrative.source = 'llm';
+  }
+
+  const strategy = spreadResponse?.responseStrategy;
+  if (strategy && typeof strategy === 'object') {
+    const target = payload.responseStrategy;
+    const actions = cleanList(strategy.actions, 8, 200);
+    if (actions.length) target.actions = actions;
+    const draft = strategy.responseDraft;
+    if (draft && typeof draft === 'object') {
+      target.responseDraft = {
+        statement: cleanText(draft.statement, 1200),
+        qa: (Array.isArray(draft.qa) ? draft.qa : [])
+          .map(item => ({ q: cleanText(item?.q, 200), a: cleanText(item?.a, 600) }))
+          .filter(item => item.q && item.a)
+          .slice(0, 8),
+        channelNotes: cleanList(draft.channelNotes, 6, 200),
+      };
+    }
+    target.contentIdeas = (Array.isArray(strategy.contentIdeas) ? strategy.contentIdeas : [])
+      .map(item => ({ title: cleanText(item?.title, 80), angle: cleanText(item?.angle, 200) }))
+      .filter(item => item.title)
+      .slice(0, 6);
+    target.source = 'llm';
+  }
+
+  const llmHits = (riskOpinion ? 1 : 0) + (spreadResponse ? 1 : 0);
+  const analysisSource = llmHits === 2 ? 'llm_with_rule_metrics' : llmHits === 1 ? 'partial_llm' : 'rule_fallback';
+
+  const riskLevel = normalizeRiskLevel(payload.riskAssessment.riskLevel, payload.riskAssessment.ruleRiskLevel);
+  payload.riskAssessment.riskLevel = riskLevel;
+  payload.riskAssessment.riskLevelLabel = RISK_LEVEL_LABEL[riskLevel];
+  return { payload, analysisSource };
 }
 
 const JSONB_FIELDS = new Set(['progress', 'payload']);
@@ -380,20 +547,23 @@ export async function runTopicAnalysis({ tenantId, analysisId }) {
     });
     const { stats, metrics, samples, sampleMap } = await collectTopicStats(tenantId, periodStart, periodEnd, keywords);
 
-    await updateAnalysis(analysisId, tenantId, {
-      progress: stageJson('analyze', '正在生成风险研判与观点拆解…'),
-    });
     const fallback = buildTopicFallback({ stats, metrics, samples, sampleMap, keywords, periodStart, periodEnd });
 
-    // 样本不足不算失败:预检通过后数据仍可能被过滤到 <3 条 → 降级纯规则,meta.insufficientSamples 已标记
-    let payload = fallback;
-    let analysisSource = 'rule_fallback';
+    // 样本不足不算失败:预检通过后数据仍可能被过滤到 <3 条 → 跳过 LLM 落纯规则,meta.insufficientSamples 已标记
+    let riskOpinion = null;
+    let spreadResponse = null;
     if (samples.length >= 3) {
       // 两次 LLM 各自独立降级,②吃①的结论写话术;事务里绝不放 LLM 调用
-      const riskOpinion = await enhanceRiskAndOpinion(tenantId, { stats, metrics, samples, fallback });
-      const spreadResponse = await enhanceSpreadAndResponse(tenantId, { stats, metrics, samples, fallback, riskOpinion });
-      ({ payload, analysisSource } = mergeTopicResult({ fallback, riskOpinion, spreadResponse }));
+      await updateAnalysis(analysisId, tenantId, {
+        progress: stageJson('analyze', '正在生成风险研判与观点拆解…(1/2)'),
+      });
+      riskOpinion = await enhanceRiskAndOpinion(tenantId, { metrics, samples, fallback });
+      await updateAnalysis(analysisId, tenantId, {
+        progress: stageJson('analyze', '正在生成传播叙事与应对建议…(2/2)'),
+      });
+      spreadResponse = await enhanceSpreadAndResponse(tenantId, { metrics, fallback, riskOpinion });
     }
+    const { payload, analysisSource } = mergeTopicResult({ fallback, riskOpinion, spreadResponse });
 
     await updateAnalysis(analysisId, tenantId, {
       progress: stageJson('finalize', '正在汇总剖析结果…'),
