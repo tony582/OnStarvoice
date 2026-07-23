@@ -97,7 +97,7 @@ test('Qwen OCR sends exactly one selected image and requests plain visible text'
   const result = await requestQwenOcr({
     config: {
       apiKey: 'test-key',
-      model: 'qwen-vl-ocr',
+      model: 'qwen3.5-ocr',
       endpoint: 'https://dashscope.example/compatible-mode/v1',
     },
     dataUrl: 'data:image/png;base64,aGVsbG8=',
@@ -116,15 +116,21 @@ test('Qwen OCR sends exactly one selected image and requests plain visible text'
   assert.equal(result.text, '标题\n正文内容');
   assert.deepEqual(result.usage, { promptTokens: 120, completionTokens: 8 });
   assert.equal(result.truncated, false);
-  assert.equal(requestBody.model, 'qwen-vl-ocr');
+  assert.equal(requestBody.model, 'qwen3.5-ocr');
   assert.equal(requestBody.messages.length, 1);
   assert.equal(requestBody.messages[0].role, 'user');
-  assert.equal(requestBody.messages[0].content[0].type, 'image_url');
+  assert.equal(requestBody.messages[0].content[0].type, 'text');
+  assert.match(requestBody.messages[0].content[0].text, /output only the text content/i);
   assert.equal(
     requestBody.messages[0].content.filter(item => item.type === 'image_url').length,
     1,
   );
-  assert.match(requestBody.messages[0].content[1].text, /只返回图片里的原文/);
+  assert.deepEqual(requestBody.messages[0].content[1], {
+    type: 'image_url',
+    image_url: { url: 'data:image/png;base64,aGVsbG8=' },
+    min_pixels: 3072,
+    max_pixels: 8388608,
+  });
   assert.equal(Object.hasOwn(requestBody, 'response_format'), false);
   assert.equal(requestBody.messages.some(message => message.role === 'system'), false);
 });
@@ -133,7 +139,7 @@ test('Qwen OCR marks output that stopped at the model token limit', async () => 
   const result = await requestQwenOcr({
     config: {
       apiKey: 'test-key',
-      model: 'qwen-vl-ocr',
+      model: 'qwen3.5-ocr',
       endpoint: 'https://dashscope.example/compatible-mode/v1',
     },
     dataUrl: 'data:image/png;base64,aGVsbG8=',
@@ -152,12 +158,46 @@ test('Qwen OCR marks output that stopped at the model token limit', async () => 
   assert.equal(result.truncated, true);
 });
 
+test('Qwen OCR rejects coordinate-only detector output instead of exposing it as copyable text', async () => {
+  await assert.rejects(
+    requestQwenOcr({
+      config: {
+        apiKey: 'test-key',
+        model: 'qwen3.5-ocr',
+        endpoint: 'https://dashscope.example/compatible-mode/v1',
+      },
+      dataUrl: 'data:image/png;base64,aGVsbG8=',
+      fetchImpl: async () => new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: [
+              '96,30,255,147,90',
+              '80,165,400,210,0',
+              '74,228,412,276,0',
+              '78,293,390,341,0',
+            ].join('\n'),
+          },
+        }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    }),
+    error => {
+      assert.ok(error instanceof ImageTextExtractionError);
+      assert.equal(error.code, 'ocr_invalid_response');
+      assert.equal(error.status, 502);
+      return true;
+    },
+  );
+});
+
 test('Qwen OCR maps rate limits to a stable customer-facing error', async () => {
   await assert.rejects(
     requestQwenOcr({
       config: {
         apiKey: 'test-key',
-        model: 'qwen-vl-ocr',
+        model: 'qwen3.5-ocr',
         endpoint: 'https://dashscope.example/compatible-mode/v1',
       },
       dataUrl: 'data:image/png;base64,aGVsbG8=',

@@ -22,13 +22,15 @@ const MAX_IMAGE_BYTES = 7 * 1024 * 1024;
 const MAX_TEXT_CHARS = 50_000;
 const IMAGE_FETCH_TIMEOUT_MS = 20_000;
 const OCR_TIMEOUT_MS = 45_000;
-const PROMPT_VERSION = 'visible-text-v1';
-const DEFAULT_MODEL = 'qwen-vl-ocr';
+const PROMPT_VERSION = 'visible-text-v2';
+const DEFAULT_MODEL = 'qwen3.5-ocr';
 const DEFAULT_ENDPOINT = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+const OCR_MIN_PIXELS = 3_072;
+const OCR_MAX_PIXELS = 8_388_608;
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const OCR_PROMPT =
-  '请逐行准确提取图片中所有可见文字。只返回图片里的原文，保留原有顺序、段落和换行；不要概括、改写、翻译或描述图片，不要添加 Markdown 标记。无法辨认的单个字符用“?”代替；图片没有文字时返回空内容。';
+  'Please output only the text content from the image without any additional descriptions or formatting.';
 
 const MIME_BY_EXTENSION = {
   '.bmp': 'image/bmp',
@@ -428,6 +430,18 @@ export function normalizeOcrContent(content) {
   return text.slice(0, MAX_TEXT_CHARS);
 }
 
+function isCoordinateOnlyOcr(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (lines.length < 3) return false;
+
+  const coordinateLine = /^\[?\s*-?\d+(?:\.\d+)?(?:\s*,\s*-?\d+(?:\.\d+)?){4,7}\s*\]?$/;
+  const coordinateLines = lines.filter(line => coordinateLine.test(line)).length;
+  return coordinateLines / lines.length >= 0.8;
+}
+
 export async function requestQwenOcr({ config, dataUrl, fetchImpl = fetch }) {
   let response;
   try {
@@ -442,8 +456,13 @@ export async function requestQwenOcr({ config, dataUrl, fetchImpl = fetch }) {
         messages: [{
           role: 'user',
           content: [
-            { type: 'image_url', image_url: { url: dataUrl } },
             { type: 'text', text: OCR_PROMPT },
+            {
+              type: 'image_url',
+              image_url: { url: dataUrl },
+              min_pixels: OCR_MIN_PIXELS,
+              max_pixels: OCR_MAX_PIXELS,
+            },
           ],
         }],
         temperature: 0,
@@ -483,8 +502,12 @@ export async function requestQwenOcr({ config, dataUrl, fetchImpl = fetch }) {
   if (!message || !Object.prototype.hasOwnProperty.call(message, 'content')) {
     throw new ImageTextExtractionError('ocr_invalid_response', '图片文字识别返回异常，请稍后重试', 502);
   }
+  const text = normalizeOcrContent(message.content);
+  if (isCoordinateOnlyOcr(text)) {
+    throw new ImageTextExtractionError('ocr_invalid_response', '图片文字识别返回异常，请稍后重试', 502);
+  }
   return {
-    text: normalizeOcrContent(message.content),
+    text,
     usage: {
       promptTokens: Number(data?.usage?.prompt_tokens) || null,
       completionTokens: Number(data?.usage?.completion_tokens) || null,
