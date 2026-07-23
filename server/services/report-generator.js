@@ -27,7 +27,7 @@ const PLATFORM_LABEL = {
   douyin: '抖音',
   unknown: '未知平台',
 };
-const RISK_LEVEL_LABEL = {
+export const RISK_LEVEL_LABEL = {
   watch: '平稳观察',
   attention: '需要关注',
   warning: '风险预警',
@@ -58,7 +58,8 @@ const TRIAGE_LABEL = {
   no_action: '无需操作',
   false_positive: '误报',
 };
-const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
+// 舆情剖析(opinion-analysis.js)自建的 records/alerts SQL 与预检 COUNT 同拼此口径,保持与报告一致
+export const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
 
 function escHtml(value) {
   return String(value ?? '')
@@ -163,7 +164,7 @@ function normalizeRows(rows = [], numberKeys = []) {
   });
 }
 
-async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
+export async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
   const baseParams = [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
   // 可选「采集关键词」过滤:仅数据看板按主题/关键词收敛时传入;报告路径不传 → kw 空 → recordFilter 退化、零影响。
   // 口径与内容分诊一致(精确 r.keyword)。⚠ PG 不允许"绑了却没引用"的参数(会报 could not determine type):
