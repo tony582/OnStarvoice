@@ -27,7 +27,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   overview: { eyebrow: 'Command Center', title: '指挥中心 · 态势驾驶舱' },
   opinion: { eyebrow: 'Opinion Handling', title: '舆情处理 · 工单' },
   workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
-  monitoring: { eyebrow: 'Monitoring', title: '关注博主' },
+  monitoring: { eyebrow: 'Monitoring & Capture', title: '监测与采集' },
   salesleads: { eyebrow: 'Sales Leads', title: '销售客资' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
@@ -114,6 +114,7 @@ export default function DesktopApp() {
         <TopBar
           eyebrow={config.eyebrow}
           title={pageTitle(page, params)}
+          badge={page === 'monitoring' ? 'BETA' : undefined}
           collapsed={collapsed}
           onToggleCollapse={toggleCollapse}
           onOpenMobileNavigation={() => setMobileNavigationOpen(true)}

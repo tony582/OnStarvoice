@@ -11,6 +11,13 @@ let taskCenterDetailReturnFocus = null;
 let lastTaskCenterStatusAnnouncementKey = "";
 let lastTaskCenterStatusById = new Map();
 
+const INTERNAL_SYNC_TRIGGERS = new Set(["capture_auto", "detail_auto"]);
+const INTERNAL_TASK_VISIBILITY_VALUES = new Set([
+  "hidden",
+  "internal",
+  "technical",
+]);
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -67,6 +74,76 @@ function readTaskField(source, ...names) {
     }
   }
   return undefined;
+}
+
+function isTaskCenterBusinessVisible(item) {
+  const raw = item?.raw && typeof item.raw === "object" ? item.raw : {};
+  const metadata =
+    raw.metadata && typeof raw.metadata === "object" ? raw.metadata : {};
+  const visibility = String(
+    readTaskField(
+      raw,
+      "taskCenterVisibility",
+      "task_center_visibility",
+    ) ||
+      readTaskField(
+        metadata,
+        "taskCenterVisibility",
+        "task_center_visibility",
+      ) ||
+      "",
+  )
+    .trim()
+    .toLowerCase();
+
+  if (INTERNAL_TASK_VISIBILITY_VALUES.has(visibility)) {
+    return false;
+  }
+  if (item?.type !== "sync") {
+    return true;
+  }
+
+  const trigger = String(
+    item.trigger ||
+      readTaskField(raw, "trigger", "triggerType", "trigger_type") ||
+      "",
+  )
+    .trim()
+    .toLowerCase();
+  if (INTERNAL_SYNC_TRIGGERS.has(trigger)) {
+    return false;
+  }
+
+  const parentTaskId = String(
+    readTaskField(
+      raw,
+      "parentTaskId",
+      "parent_task_id",
+      "captureTaskId",
+      "capture_task_id",
+    ) ||
+      readTaskField(
+        metadata,
+        "parentTaskId",
+        "parent_task_id",
+        "captureTaskId",
+        "capture_task_id",
+      ) ||
+      "",
+  ).trim();
+  return !parentTaskId;
+}
+
+function getTaskCenterChronologicalTime(item) {
+  return Number(
+    item?.startedAt || item?.finishedAt || item?.updatedAt || item?.lastProgressAt || 0,
+  );
+}
+
+function getTaskCenterTieBreakTime(item) {
+  return Number(
+    item?.finishedAt || item?.updatedAt || item?.lastProgressAt || item?.startedAt || 0,
+  );
 }
 
 function normalizeTaskCenterTimestamp(value) {
@@ -559,6 +636,25 @@ export function buildTaskCenterItems({
   const activeLegacyRequestId = String(
     legacyState.request?.id || legacyState.request?.requestId || "",
   ).trim();
+  const activeLegacyRequestStatus = normalizeTaskCenterStatus(
+    legacyState.request?.status,
+  );
+  const activeLegacyRequestBlocksRecovery =
+    activeLegacyRequestStatus === "running" ||
+    activeLegacyRequestStatus === "recovering" ||
+    ["claimed", "resume_requested"].includes(activeLegacyRequestStatus);
+  const activeLegacyRecoveryDismissed = Boolean(
+    String(legacyState.request?.recoveryDismissedAt || "").trim() ||
+    legacyState.requestRecoveryAllowed === false,
+  );
+  const recoverableRequestIds = new Set(
+    (Array.isArray(legacyState.recoverableRequestIds)
+      ? legacyState.recoverableRequestIds
+      : []
+    )
+      .map((requestId) => String(requestId || "").trim())
+      .filter(Boolean),
+  );
   const normalizedLegacy = legacyItems
     .map(normalizeTaskCenterItem)
     .filter((legacyItem) => {
@@ -600,22 +696,40 @@ export function buildTaskCenterItems({
       byId.set(item.id, item);
     }
   }
-  return Array.from(byId.values()).map((item) => ({
-    ...item,
-    canControlKeywordRun: Boolean(
-      activeLegacyRequestId &&
-        item.type === "keyword" &&
-        (item.id === activeLegacyRequestId ||
-          item.actionTaskId === activeLegacyRequestId),
-    ),
-  })).sort((left, right) => {
-    const groupPriority = {running: 0, attention: 1, history: 2};
-    const groupDiff = groupPriority[left.statusGroup] - groupPriority[right.statusGroup];
-    if (groupDiff !== 0) return groupDiff;
-    const leftTime = left.updatedAt || left.finishedAt || left.startedAt;
-    const rightTime = right.updatedAt || right.finishedAt || right.startedAt;
-    return rightTime - leftTime;
-  });
+  return Array.from(byId.values())
+    .filter(isTaskCenterBusinessVisible)
+    .map((item) => {
+      const actionRequestId = String(item.actionTaskId || item.id || "").trim();
+      const isCurrentRequest = Boolean(
+        activeLegacyRequestId &&
+          (item.id === activeLegacyRequestId ||
+            actionRequestId === activeLegacyRequestId),
+      );
+      const hasRecoverySnapshot = Boolean(
+        actionRequestId && recoverableRequestIds.has(actionRequestId),
+      );
+      return {
+        ...item,
+        canControlKeywordRun: Boolean(
+          item.type === "keyword" &&
+            (
+              (isCurrentRequest && !activeLegacyRecoveryDismissed) ||
+              (hasRecoverySnapshot && !activeLegacyRequestBlocksRecovery)
+            ),
+        ),
+      };
+    })
+    .sort((left, right) => {
+      const chronologicalDiff =
+        getTaskCenterChronologicalTime(right) -
+        getTaskCenterChronologicalTime(left);
+      if (chronologicalDiff !== 0) return chronologicalDiff;
+
+      const tieBreakDiff =
+        getTaskCenterTieBreakTime(right) - getTaskCenterTieBreakTime(left);
+      if (tieBreakDiff !== 0) return tieBreakDiff;
+      return String(left.id).localeCompare(String(right.id));
+    });
 }
 
 function getTaskCenterFilters() {
@@ -706,7 +820,8 @@ function getTaskCenterActions(item) {
     (isUnattendedKeyword || ["attention", "failed", "partial"].includes(item.status)) &&
     !item.canControlKeywordRun
   ) {
-    // 后台只允许控制当前 request；旧任务保留为只读，避免按钮必然 not_found。
+    // 只有当前 request 或仍有本地恢复快照的历史任务可控制；其余历史
+    // 记录保持只读，避免按钮必然返回 not_found。
     return [];
   }
   if (
@@ -747,6 +862,9 @@ function isTaskCenterCircuitBreaker(item) {
   if (
     item?.raw?.requiresManualIntervention === true ||
     item?.raw?.requires_manual_intervention === true ||
+    item?.raw?.requiresManualAction === true ||
+    item?.raw?.requires_manual_action === true ||
+    item?.raw?.error?.requiresManualAction === true ||
     item?.raw?.circuitBreaker === true ||
     item?.raw?.circuit_breaker === true
   ) {
@@ -763,7 +881,7 @@ function isTaskCenterCircuitBreaker(item) {
     .map((value) => String(value || ""))
     .join(" ")
     .toLowerCase();
-  return /验证码|人机验证|登录失效|请(?:先|重新)?登录|需要登录|账号异常|账号限制|安全限制|安全验证|访问受限|风控|captcha|login[_\s-]?required|auth[_\s-]?required|account[_\s-]?(?:forbidden|restricted)|security[_\s-]?(?:block|check)|risk[_\s-]?control/.test(text);
+  return /验证码|人机验证|登录失效|请(?:先|重新)?登录|需要登录|账号异常|账号限制|安全限制|安全验证|访问受限|风控|captcha|login[_\s-]?required|auth[_\s-]?required|account[_\s-]?(?:forbidden|restricted)|security[_\s-]?(?:block|check)|risk[_\s-]?control|douyin_search_service_abnormal/.test(text);
 }
 
 function renderTaskCenterActions(item, limit = Infinity) {

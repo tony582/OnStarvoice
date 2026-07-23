@@ -2,6 +2,8 @@
 ~$*
 *.docx
 node_modules/
+.pnpm-store/
+.tmp/
 
 server/data/
 media/

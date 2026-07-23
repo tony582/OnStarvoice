@@ -3,12 +3,13 @@ import { useNav } from '@/lib/navigation'
 import { WorkbenchTabs } from '@/components/shared/Workbench'
 import { MonitorTasksTab } from '@/pages/monitoring/TasksTab'
 import { MonitorHitsTab } from '@/pages/monitoring/HitsTab'
+import { CloudTasksTab } from '@/pages/monitoring/CloudTasksTab'
 
-type Tab = 'tasks' | 'hits'
+type Tab = 'cloud' | 'tasks' | 'hits'
 
 export function MonitoringPage() {
   const { params } = useNav()
-  const initialTab: Tab = params?.tab === 'hits' ? 'hits' : 'tasks'
+  const initialTab: Tab = params?.tab === 'hits' ? 'hits' : params?.tab === 'tasks' ? 'tasks' : 'cloud'
   const [tab, setTab] = useState<Tab>(initialTab)
   // hits 的一次性预置:导航带来的(tab=hits)或从任务行"查看命中"带来的 subscriptionId
   const [hitsInitial, setHitsInitial] = useState<Record<string, string> | undefined>(
@@ -23,10 +24,15 @@ export function MonitoringPage() {
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
       <WorkbenchTabs
-        tabs={[{ key: 'tasks', label: '关注的博主' }, { key: 'hits', label: '博主新动态' }]}
+        tabs={[
+          { key: 'cloud', label: '采集任务' },
+          { key: 'tasks', label: '关注的博主' },
+          { key: 'hits', label: '博主新动态' },
+        ]}
         activeKey={tab}
         onChange={key => setTab(key as Tab)}
       />
+      {tab === 'cloud' && <CloudTasksTab />}
       {tab === 'tasks' && <MonitorTasksTab onViewHits={viewHits} />}
       {tab === 'hits' && <MonitorHitsTab key={hitsInitial?.subscriptionId || 'all'} initial={hitsInitial} />}
     </div>

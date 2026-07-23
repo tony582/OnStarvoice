@@ -51,6 +51,10 @@ test("manual record fields use a strict whitelist and validated values", () => {
     "publishTime",
   ]);
 
+  const withoutReason = validateManualFields({sentiment: "positive"});
+  assert.equal(withoutReason.ok, true);
+  assert.equal(withoutReason.reason, "");
+
   assert.equal(
     validateManualFields({publishTime: "2026-02-30"}).error,
     "invalid_publish_time",
@@ -109,6 +113,9 @@ test("backend contracts persist feedback and protect manual overrides", async ()
     recordStore,
     workspace,
     serverIndex,
+    recordsRoute,
+    drawer,
+    feedbackOnlyMigration,
   ] = await Promise.all([
     source("server/db/migrations/029_record_feedback_manual_overrides.sql"),
     source("server/routes/triage.js"),
@@ -117,6 +124,9 @@ test("backend contracts persist feedback and protect manual overrides", async ()
     source("server/services/record-store.js"),
     source("server/routes/workspace.js"),
     source("server/index.js"),
+    source("server/routes/records.js"),
+    source("web/admin/src/components/shared/RecordDrawer.tsx"),
+    source("server/db/migrations/038_false_positive_feedback_only.sql"),
   ]);
 
   assert.match(migration, /CREATE TABLE IF NOT EXISTS record_feedback/);
@@ -125,28 +135,58 @@ test("backend contracts persist feedback and protect manual overrides", async ()
     /feedback_type <> 'false_positive' OR char_length\(btrim\(reason\)\) > 0/,
   );
   assert.match(migration, /uniq_record_feedback_pending_false_positive/);
-  assert.match(triage, /false_positive_batch_not_allowed/);
-  assert.match(triage, /误报仅允许后台登录用户提交/);
-  assert.match(triage, /pending_feedback_exists/);
+  assert.match(triage, /false_positive_is_feedback_only/);
+  assert.doesNotMatch(triage, /insertRecordFeedback/);
   assert.match(feedbackRoute, /router\.use\(requireTenantAccess, requireSessionUser\)/);
+  assert.match(feedbackRoute, /router\.post\('\/false-positive', requireTenantWriter/);
+  assert.match(feedbackRoute, /correctedValues: originalValues/);
+  assert.match(feedbackRoute, /record\.false_positive_reported/);
+  assert.match(feedbackRoute, /flowUnchanged: true/);
+  assert.match(feedbackRoute, /router\.use\(requirePlatformAdmin\)/);
+  assert.match(feedbackRoute, /pending_feedback_exists/);
+  assert.match(feedbackRoute, /ELSE \$5::uuid END/);
+  assert.match(feedbackRoute, /只表示“已保存复核记录”，不会调用或投喂任何 AI/);
+  const reviewRoute = feedbackRoute.slice(
+    feedbackRoute.indexOf("router.patch('/:id'"),
+    feedbackRoute.indexOf('export default router'),
+  );
+  assert.match(reviewRoute, /UPDATE record_feedback/);
+  assert.match(reviewRoute, /INSERT INTO audit_logs/);
+  assert.doesNotMatch(reviewRoute, /fetch\s*\(|labelRecord\s*\(|labelPendingRecords\s*\(|openai|deepseek/i);
   assert.match(feedbackRoute, /summary_note_required/);
   assert.match(feedbackRoute, /identityLabel\(/);
   assert.match(aiLabeler, /manual_overrides, '\{\}'::jsonb\) \? 'sentiment'/);
   assert.match(aiLabeler, /manual_overrides, '\{\}'::jsonb\) \? 'category'/);
   assert.match(aiLabeler, /manual_overrides, '\{\}'::jsonb\) \? 'publish_time'/);
   assert.match(recordStore, /manual_overrides, '\{\}'::jsonb\) \? 'publish_time'/);
+  assert.doesNotMatch(recordStore, /sentiment\s*=/);
+  assert.doesNotMatch(recordStore, /category\s*=/);
+  assert.doesNotMatch(recordStore, /identity_override\s*=/);
+  assert.match(recordsRoute, /router\.get\('\/:id\/manual-history'/);
+  assert.match(recordsRoute, /feedback_type = 'manual_correction'/);
+  assert.match(recordsRoute, /router\.get\('\/:id\/activity'/);
+  assert.match(drawer, /\/activity/);
   assert.match(workspace, /feedbackPending/);
+  assert.match(workspace, /global_role === 'platform_admin'/);
   assert.match(serverIndex, /app\.use\('\/api\/feedback', feedbackRouter\)/);
+  assert.match(feedbackOnlyMigration, /WHERE status = 'false_positive'/);
+  assert.match(feedbackOnlyMigration, /original_values->>'triage_status'/);
+  assert.doesNotMatch(
+    feedbackOnlyMigration.match(/ADD CONSTRAINT record_triage_status_check[\s\S]*$/)?.[0] || '',
+    /false_positive/,
+  );
 });
 
 test("React admin exposes drawer-only reporting and a review queue", async () => {
-  const [triage, drawer, notePrompt, feedbackQueue, sidebar] =
+  const [triage, drawer, notePrompt, feedbackQueue, sidebar, workbench, mobile] =
     await Promise.all([
       source("web/admin/src/pages/workbench/TriageQueue.tsx"),
       source("web/admin/src/components/shared/RecordDrawer.tsx"),
       source("web/admin/src/components/shared/NotePrompt.tsx"),
       source("web/admin/src/pages/workbench/MisjudgmentQueue.tsx"),
       source("web/admin/src/components/layout/Sidebar.tsx"),
+      source("web/admin/src/pages/WorkbenchPage.tsx"),
+      source("web/admin/src/mobile/MobileApp.tsx"),
     ]);
 
   assert.doesNotMatch(triage, /MenuBtn icon=\{Ban\}/);
@@ -155,13 +195,37 @@ test("React admin exposes drawer-only reporting and a review queue", async () =>
     /\{ key: 'false_positive', label: '误报'/,
   );
   assert.match(triage, /required: true/);
+  assert.match(triage, /api\.post\('\/feedback\/false-positive', \{ recordId, reason \}\)/);
+  assert.doesNotMatch(triage, /status: 'false_positive'/);
+  const submitAction = triage.slice(
+    triage.indexOf('const markFalsePositive'),
+    triage.indexOf('const updateManualFields'),
+  );
+  assert.match(submitAction, /false_positive_pending: true/);
+  assert.match(submitAction, /refreshBadges\(\)/);
+  assert.doesNotMatch(submitAction, /reloadAfterMutation|setDrawerRecord\(null\)/);
   assert.match(drawer, /onFalsePositive/);
-  assert.match(drawer, /误报\s*<\/Button>/);
+  assert.match(drawer, /falsePositivePending/);
+  assert.match(drawer, /误报已提交，等待平台管理员复核/);
+  assert.match(drawer, /aria-label=\{falsePositivePending \? '误报已提交' : '提交误报'\}/);
+  assert.match(drawer, /record\.false_positive_reported/);
   assert.match(drawer, /编辑判断/);
+  assert.match(drawer, /处理记录/);
+  assert.doesNotMatch(drawer, /修改说明/);
+  assert.match(drawer, /document\.addEventListener\('mousedown'/);
+  assert.match(drawer, /panelRef\.current\?\.contains\(target\)/);
+  assert.match(drawer, /data-record-detail-trigger/);
+  assert.match(drawer, /loadedRecordId !== r\.id/);
+  assert.match(triage, /data-record-detail-trigger/);
+  assert.doesNotMatch(triage, /<RecordDrawer key=/);
   assert.match(notePrompt, /请填写原因后再确认/);
-  assert.match(feedbackQueue, /反馈不会直接触发模型自动学习/);
-  assert.match(feedbackQueue, /已纳入总结/);
+  assert.match(feedbackQueue, /仅作为内部记录，不会发送给 AI/);
+  assert.match(feedbackQueue, /已记录/);
+  assert.match(feedbackQueue, /保存记录/);
+  assert.doesNotMatch(feedbackQueue, /纳入总结|提供给 AI|直接触发模型自动学习/);
   assert.match(feedbackQueue, /required: nextStatus === 'summarized'/);
-  assert.match(triage, /drawerRecord\.triage_status === 'false_positive'/);
-  assert.match(sidebar, /misjudgments.*误判反馈/);
+  assert.doesNotMatch(triage, /drawerRecord\.triage_status === 'false_positive'/);
+  assert.match(sidebar, /misjudgments.*误判反馈.*platformAdmin: true/);
+  assert.match(workbench, /requestedQueue === 'misjudgments' && !isPlatformAdmin\(\)/);
+  assert.match(mobile, /isPlatformAdmin\(\) \? badges\.feedbackPending : 0/);
 });

@@ -7,6 +7,10 @@ const captureSyncSource = await readFile(
   new URL("../../utils/capture-sync.js", import.meta.url),
   "utf8",
 );
+const contentSource = await readFile(
+  new URL("../../content-v2.js", import.meta.url),
+  "utf8",
+);
 
 function readBatchFunctionSource() {
   const startMarker = "export async function batchCaptureByKeywords({";
@@ -18,9 +22,36 @@ function readBatchFunctionSource() {
   return captureSyncSource.slice(start, end).replace(/^export\s+/u, "");
 }
 
-function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
+function readKeywordSearchPageUrlInspectorSource() {
+  const startMarker = "function inspectKeywordSearchPageUrl(";
+  const endMarker = "async function waitForKeywordSearchResultsInTab(";
+  const start = captureSyncSource.indexOf(startMarker);
+  const end = captureSyncSource.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, "keyword search URL inspector start marker missing");
+  assert.notEqual(end, -1, "keyword search URL inspector end marker missing");
+  return captureSyncSource.slice(start, end);
+}
+
+function inspectKeywordSearchPageUrl(pageUrl, platform, keyword) {
+  const sandbox = vm.createContext({URL});
+  vm.runInContext(
+    `${readKeywordSearchPageUrlInspectorSource()}\nglobalThis.__inspect = inspectKeywordSearchPageUrl;`,
+    sandbox,
+  );
+  return sandbox.__inspect(pageUrl, platform, keyword);
+}
+
+function createBatchHarness({
+  captureKeyword,
+  afterKeywordCapture = null,
+  switchDouyinKeyword = null,
+  waitForResults = null,
+  hasActiveFilters = false,
+} = {}) {
   const captureCalls = [];
+  const filterCalls = [];
   const navigationCalls = [];
+  const submitCalls = [];
   const settled = [];
   const progress = [];
   const liveTabs = new Map([
@@ -72,8 +103,10 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
     Math,
     activateTabForReliableTimer: async () => {},
     buildInterKeywordDelayMessage: ({keyword}) => `next:${keyword}`,
-    buildKeywordSearchUrl: (keyword) =>
-      `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}`,
+    buildKeywordSearchUrl: (keyword, platform) =>
+      platform === "douyin"
+        ? `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`
+        : `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(keyword)}`,
     captureAndSaveInTab: async (options) => {
       captureCalls.push({
         keyword: options.captureParams.keyword,
@@ -86,7 +119,7 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
     createCaptureRequestId: () => "list-run-test",
     formatEnhanceSkipReason: (reason) => reason || "",
     getCurrentActiveTab: async () => liveTabs.get(101),
-    hasActiveBatchSearchFilters: () => false,
+    hasActiveBatchSearchFilters: () => hasActiveFilters,
     isBatchCaptureCanceledError: (error) =>
       ["BATCH_CAPTURE_CANCELED", "DETAIL_CAPTURE_CANCELED"].includes(
         String(error?.message || ""),
@@ -98,10 +131,20 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
             String(result?.error?.code || ""),
           ),
       ),
-    isDouyinPlatform: () => false,
+    isDouyinPlatform: (platform) => platform === "douyin",
     isEmptyKeywordCaptureResult: (result) =>
       Boolean(result?.ok && Array.isArray(result?.data?.items) && result.data.items.length === 0),
-    isUnattendedSafetyBlock: (value) => Boolean(value?.securityBlocked),
+    isUnattendedSafetyBlock: (value) =>
+      Boolean(
+        value?.securityBlocked ||
+          value?.platformSafetyBlocked ||
+          String(value?.code || "").toUpperCase() ===
+            "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+      ),
+    applySearchFiltersInTab: async (tabId, filters) => {
+      filterCalls.push({tabId, filters});
+      return {applied: true};
+    },
     navigateToSearchUrl: async (tabId, url) => {
       navigationCalls.push({tabId, url});
     },
@@ -113,9 +156,19 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
       sourcePageUrl: "",
     }),
     setCaptureTaskTakeoverStateInTab: async () => {},
-    submitKeywordSearchInTab: async () => {},
-    switchDouyinKeywordSearchInTab: async () => {},
-    waitForKeywordSearchResultsInTab: async () => true,
+    submitKeywordSearchInTab: async (tabId, platform, keyword) => {
+      submitCalls.push({tabId, platform, keyword});
+    },
+    switchDouyinKeywordSearchInTab: async (tabId, keyword, url) => {
+      navigationCalls.push({tabId, keyword, url, platform: "douyin"});
+      if (typeof switchDouyinKeyword === "function") {
+        await switchDouyinKeyword({tabId, keyword, url});
+      }
+    },
+    waitForKeywordSearchResultsInTab: async (tabId, platform, shouldStop, options) =>
+      typeof waitForResults === "function"
+        ? await waitForResults({tabId, platform, shouldStop, ...(options || {})})
+        : true,
     waitMsWithStop: async () => {},
     waitMsWithStopAndTick: async () => {},
   };
@@ -134,17 +187,20 @@ function createBatchHarness({captureKeyword, afterKeywordCapture = null} = {}) {
       afterKeywordCapture: options.afterKeywordCapture ?? afterKeywordCapture,
       onKeywordSettled: async (payload) => settled.push(payload),
       onProgress: (payload) => progress.push(payload),
+      searchFilters: options.searchFilters || null,
       shouldStop: options.shouldStop || (() => false),
     });
 
   return {
     captureCalls,
+    filterCalls,
     navigationCalls,
     progress,
     getReplacementListenerCount: () => replacementListeners.size,
     replaceRunnerTab,
     run,
     settled,
+    submitCalls,
   };
 }
 
@@ -190,6 +246,189 @@ test("one empty keyword retry does not truncate the remaining 12 keyword plan", 
   );
   assert.equal(harness.settled.length, 13, "every keyword must reach the checkpoint reporter");
   assert.equal(result.canceled, false);
+});
+
+test("a drifted Douyin search page fails only the current keyword and continues", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    waitForResults: async ({keyword}) => keyword !== "词1",
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+  });
+
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词2"],
+    "a stale /jingxuan page must never be captured as the failed keyword",
+  );
+  assert.equal(result.canceled, false);
+  assert.equal(result.stats.processed, 2);
+  assert.equal(result.stats.success, 1);
+  assert.equal(result.stats.failed, 1);
+  assert.equal(harness.settled.length, 2);
+  assert.equal(harness.settled[0].keyword, "词1");
+  assert.equal(harness.settled[0].result.ok, false);
+  assert.equal(harness.settled[1].keyword, "词2");
+  assert.equal(harness.settled[1].result.ok, true);
+});
+
+test("Douyin service-abnormal state stops immediately without retrying or opening the next keyword", async () => {
+  let readinessChecks = 0;
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    hasActiveFilters: true,
+    waitForResults: async () => {
+      readinessChecks += 1;
+      if (readinessChecks === 1) return true;
+      const error = new Error(
+        "检测到抖音“服务出现异常”，为避免触发安全审核，已立即停止整条任务",
+      );
+      error.code = "DOUYIN_SEARCH_SERVICE_ABNORMAL";
+      error.securityBlocked = true;
+      error.platformSafetyBlocked = true;
+      error.requiresManualAction = true;
+      error.stopBatch = true;
+      error.fatal = true;
+      throw error;
+    },
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+    searchFilters: {sort: "latest", publishTime: "day"},
+  });
+
+  assert.equal(result.canceled, true);
+  assert.equal(result.securityBlocked, true);
+  assert.equal(result.requiresManualAction, true);
+  assert.equal(result.blockingError.code, "DOUYIN_SEARCH_SERVICE_ABNORMAL");
+  assert.deepEqual(harness.captureCalls, []);
+  assert.equal(harness.filterCalls.length, 1);
+  assert.equal(
+    harness.submitCalls.length,
+    0,
+    "the filter retry path must not submit another search",
+  );
+  assert.deepEqual(
+    harness.navigationCalls.map((entry) => entry.keyword),
+    ["词1"],
+    "the second keyword must never start",
+  );
+  assert.equal(harness.settled.length, 1);
+  assert.equal(harness.settled[0].keyword, "词1");
+  assert.equal(harness.settled[0].securityBlocked, true);
+  assert.equal(harness.progress.at(-1)?.phase, "needs_action");
+});
+
+test("Douyin checks the service-abnormal guard before clicking search or filters", () => {
+  const submitStart = captureSyncSource.indexOf(
+    "async function submitKeywordSearchInTab(",
+  );
+  const submitEnd = captureSyncSource.indexOf(
+    "async function switchDouyinKeywordSearchInTab(",
+    submitStart,
+  );
+  const submitSource = captureSyncSource.slice(submitStart, submitEnd);
+  const guardIndex = submitSource.indexOf(
+    "action: 'assertNoDouyinSearchServiceAbnormal'",
+  );
+  const clickScriptIndex = submitSource.indexOf(
+    "const result = await chrome.scripting",
+  );
+  assert.ok(guardIndex > -1);
+  assert.ok(clickScriptIndex > guardIndex);
+
+  assert.match(
+    contentSource,
+    /case "assertNoDouyinSearchServiceAbnormal":[\s\S]*handleAssertNoDouyinSearchServiceAbnormal/u,
+  );
+  const filterStart = contentSource.indexOf(
+    "async function applyBatchSearchFilters({",
+  );
+  const filterEnd = contentSource.indexOf(
+    "async function prepareKeywordStrategyCapture()",
+    filterStart,
+  );
+  const filterSource = contentSource.slice(filterStart, filterEnd);
+  const filterGuardIndex = filterSource.indexOf(
+    "assertNoDouyinSearchServiceAbnormalPage();",
+  );
+  const filterRequestsIndex = filterSource.indexOf("const filterRequests =");
+  assert.ok(filterGuardIndex > -1);
+  assert.ok(filterRequestsIndex > filterGuardIndex);
+});
+
+test("Douyin readiness rejects recommendation, detail, modal, and another keyword URLs", () => {
+  assert.deepEqual(
+    {...inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?type=general",
+      "douyin",
+      "凯迪拉克",
+    )},
+    {searchPathReady: true, keywordConflict: false},
+  );
+  assert.deepEqual(
+    {...inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/jingxuan",
+      "douyin",
+      "凯迪拉克",
+    )},
+    {searchPathReady: false, keywordConflict: false},
+  );
+  assert.equal(
+    inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?modal_id=123",
+      "douyin",
+      "凯迪拉克",
+    ).searchPathReady,
+    false,
+  );
+  assert.equal(
+    inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/video/123",
+      "douyin",
+      "凯迪拉克",
+    ).searchPathReady,
+    false,
+  );
+  assert.deepEqual(
+    {...inspectKeywordSearchPageUrl(
+      "https://www.douyin.com/search/%E5%88%AB%E5%85%8B?type=general",
+      "douyin",
+      "凯迪拉克",
+    )},
+    {searchPathReady: true, keywordConflict: true},
+  );
+});
+
+test("the Douyin fail-closed guard does not make XHS slow readiness fail early", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    waitForResults: async () => false,
+  });
+
+  const result = await harness.run({
+    platform: "xiaohongshu",
+    keywords: ["词1"],
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词1"],
+  );
+});
+
+test("Douyin filter reapply must prove results are ready before recapture", () => {
+  assert.match(
+    readBatchFunctionSource(),
+    /const refilteredResultsReady =[\s\S]*?if \(!refilteredResultsReady\) \{[\s\S]*?重挂筛选后搜索结果页仍未就绪/,
+  );
 });
 
 test("keyword three uses the replacement runner tab id after keyword two", async () => {

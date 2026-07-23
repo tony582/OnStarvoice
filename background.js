@@ -1,9 +1,21 @@
 try {
+  importScripts('utils/runtime-config.js');
+} catch (error) {
+  console.warn('[onstarvoice] runtime config unavailable; using production API defaults', error);
+}
+
+try {
   importScripts('utils/task-center.js');
 } catch (error) {
   // 测试或旧交付快照中可能暂时没有任务中心脚本。后台可靠性逻辑仍可运行，
   // 等脚本可用后会自动把同一份请求镜像到任务账本。
   console.warn('[onstarvoice] task center core unavailable', error);
+}
+
+try {
+  importScripts('utils/cloud-task-agent.js');
+} catch (error) {
+  console.warn('[onstarvoice] cloud task agent unavailable', error);
 }
 
 importScripts(
@@ -16,6 +28,7 @@ importScripts(
 
 const runtimeTabPolicy = globalThis.OnStarvoiceRuntimeTabPolicy;
 const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
+const cloudTaskAgentApi = globalThis.OnStarvoiceCloudTaskAgent;
 const CAPTURE_TASK_GROUP_TITLE =
   captureTaskTabGroupApi.DEFAULT_GROUP_TITLE || 'StarVoice 采集任务';
 
@@ -23,9 +36,13 @@ const STORAGE_KEYS = {
   runtime: 'onstarvoice.runtime',
   unattendedKeywordPlan: 'onstarvoice.unattendedKeywordPlan',
   unattendedKeywordRunRequest: 'onstarvoice.unattendedKeywordRunRequest',
+  unattendedKeywordRunArchive: 'onstarvoice.unattendedKeywordRunArchive',
   captureExecutionLock: 'onstarvoice.captureExecutionLock',
   taskLedger: 'onstarvoice.taskLedger',
   syncHistory: 'onstarvoice.sync_history',
+  auth: 'onstarvoice.auth',
+  cloudCommandResults: 'onstarvoice.cloudCommandResults',
+  cloudAgentStatus: 'onstarvoice.cloudTaskAgentStatus',
 };
 
 const DEFAULT_RUNTIME = {
@@ -47,6 +64,7 @@ const DEFAULT_RUNTIME = {
 
 const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
 const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
+const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
 const SCHEDULE_MODES = new Set([
   'daily',
@@ -65,10 +83,16 @@ const UNATTENDED_RUN_CLAIM_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_RUN_ACTIVE_GRACE_MS = 3 * 60 * 1000;
 const UNATTENDED_RUN_BUSINESS_STALL_MS = 6 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_PERIOD_MINUTES = 1;
+const CLOUD_TASK_AGENT_PERIOD_MINUTES = 1;
+const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
+const CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS = 15 * 1000;
+const CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS = 2.5 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_WAKE_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_LOCK_WAIT_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_SCHEMA_VERSION = 2;
+const UNATTENDED_RUN_ARCHIVE_LIMIT = 50;
+const UNATTENDED_RUN_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const UNATTENDED_MAX_RECOVERY_ATTEMPTS = 2;
 const CONTENT_SCRIPT_READY_TIMEOUT_MS = 10 * 1000;
 const CONTENT_RELAY_DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
@@ -86,6 +110,15 @@ const UNATTENDED_RUN_TERMINAL_STATUSES = new Set([
   'canceled',
   'skipped',
   'needs_action',
+]);
+// These states may still be retried. Before a terminal request releases the
+// single execution slot, retain its full plan/checkpoint in the bounded archive
+// so a later "continue" or "retry failed" action can reconstruct it exactly.
+const UNATTENDED_RUN_RETRYABLE_STATUSES = new Set([
+  'interrupted',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
 ]);
 const UNATTENDED_RUN_REPORTABLE_STATUSES = new Set([
   'started',
@@ -259,13 +292,41 @@ function normalizeSearchFilters(filters = {}) {
   }, {});
 }
 
+function normalizeCalendarDate(value) {
+  const match = String(value || '').trim().match(
+    /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/,
+  );
+  if (!match) return '';
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return '';
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month - 1];
+  if (day > daysInMonth) return '';
+  return `${match[1]}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
 function normalizeDateListText(value) {
   return Array.from(
     new Set(
       String(value || '')
         .split(/[\s,，;；]+/g)
-        .map((item) => item.trim())
-        .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item)),
+        .map(normalizeCalendarDate)
+        .filter(Boolean),
     ),
   ).join('\n');
 }
@@ -438,7 +499,12 @@ function normalizeUnattendedKeywordPlan(input = {}) {
   );
   const customDatesSource =
     String(base.customDates || '').trim() || String(base.holidayDates || '');
-  return {
+  const rawKeywordMaxDetectedItems = Number(base.keywordMaxDetectedItems);
+  const hasKeywordMaxDetectedItems =
+    Object.prototype.hasOwnProperty.call(base, 'keywordMaxDetectedItems') &&
+    Number.isSafeInteger(rawKeywordMaxDetectedItems) &&
+    rawKeywordMaxDetectedItems > 0;
+  const normalizedPlan = {
     ...DEFAULT_UNATTENDED_KEYWORD_PLAN,
     ...base,
     enabled: Boolean(base.enabled),
@@ -465,6 +531,12 @@ function normalizeUnattendedKeywordPlan(input = {}) {
     lastRunProgress: normalizeUnattendedRunProgress(base.lastRunProgress),
     updatedAt: String(base.updatedAt || ''),
   };
+  if (hasKeywordMaxDetectedItems) {
+    normalizedPlan.keywordMaxDetectedItems = rawKeywordMaxDetectedItems;
+  } else {
+    delete normalizedPlan.keywordMaxDetectedItems;
+  }
+  return normalizedPlan;
 }
 
 function formatLocalDateKey(date) {
@@ -537,7 +609,9 @@ async function readUnattendedKeywordPlan() {
 }
 
 let unattendedRunMutationQueue = Promise.resolve();
+let unattendedRunArchiveMutationQueue = Promise.resolve();
 let taskLedgerMutationQueue = Promise.resolve();
+let captureTaskBeginQueue = Promise.resolve();
 
 function runUnattendedRunMutation(operation) {
   const pending = unattendedRunMutationQueue.then(operation, operation);
@@ -545,9 +619,21 @@ function runUnattendedRunMutation(operation) {
   return pending;
 }
 
+function runUnattendedRunArchiveMutation(operation) {
+  const pending = unattendedRunArchiveMutationQueue.then(operation, operation);
+  unattendedRunArchiveMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
 function runTaskLedgerMutation(operation) {
   const pending = taskLedgerMutationQueue.then(operation, operation);
   taskLedgerMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runCaptureTaskBeginOperation(operation) {
+  const pending = captureTaskBeginQueue.then(operation, operation);
+  captureTaskBeginQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -589,6 +675,173 @@ async function readUnattendedKeywordRunRequest() {
   return normalizeUnattendedRunRequest(
     stored[STORAGE_KEYS.unattendedKeywordRunRequest],
   );
+}
+
+function isRetryableUnattendedRunRequest(request) {
+  return Boolean(
+    request &&
+      UNATTENDED_RUN_RETRYABLE_STATUSES.has(String(request.status || '')) &&
+      !String(request.recoveryDismissedAt || '').trim(),
+  );
+}
+
+function normalizeUnattendedKeywordRunArchive(
+  value,
+  now = Date.now(),
+  expectedAgentScopeId = '',
+) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const archiveAgentScopeId = String(source.agentScopeId || '').trim();
+  const normalizedExpectedScopeId = String(expectedAgentScopeId || '').trim();
+  const archiveScopeMatches =
+    !archiveAgentScopeId ||
+    !normalizedExpectedScopeId ||
+    archiveAgentScopeId === normalizedExpectedScopeId;
+  const rawRequests =
+    archiveScopeMatches &&
+    source.requests &&
+    typeof source.requests === 'object' &&
+    !Array.isArray(source.requests)
+      ? source.requests
+      : {};
+  const requests = Object.fromEntries(
+    Object.values(rawRequests)
+      .map((request) => normalizeUnattendedRunRequest(request))
+      .filter((request) => {
+        if (!isRetryableUnattendedRunRequest(request)) return false;
+        const requestAgentScopeId = String(
+          request.cloudAgentScopeId || '',
+        ).trim();
+        if (
+          requestAgentScopeId &&
+          normalizedExpectedScopeId &&
+          requestAgentScopeId !== normalizedExpectedScopeId
+        ) {
+          return false;
+        }
+        const archivedAt = parseTimestampMs(
+          request.archivedAt ||
+            request.finishedAt ||
+            request.updatedAt ||
+            request.createdAt,
+        );
+        return (
+          !Number.isFinite(archivedAt) ||
+          now - archivedAt <= UNATTENDED_RUN_ARCHIVE_RETENTION_MS
+        );
+      })
+      .sort((left, right) => {
+        const rightAt = parseTimestampMs(
+          right.archivedAt || right.finishedAt || right.updatedAt,
+        );
+        const leftAt = parseTimestampMs(
+          left.archivedAt || left.finishedAt || left.updatedAt,
+        );
+        return (Number.isFinite(rightAt) ? rightAt : 0) -
+          (Number.isFinite(leftAt) ? leftAt : 0);
+      })
+      .slice(0, UNATTENDED_RUN_ARCHIVE_LIMIT)
+      .map((request) => [request.id, request]),
+  );
+  return {
+    version: 1,
+    agentScopeId: archiveScopeMatches
+      ? archiveAgentScopeId || normalizedExpectedScopeId
+      : normalizedExpectedScopeId,
+    requests,
+    updatedAt: String(source.updatedAt || ''),
+  };
+}
+
+async function readUnattendedKeywordRunArchive() {
+  const [stored, credential] = await Promise.all([
+    chrome.storage.local.get(STORAGE_KEYS.unattendedKeywordRunArchive),
+    readCloudTaskAgentCredential(),
+  ]);
+  return normalizeUnattendedKeywordRunArchive(
+    stored[STORAGE_KEYS.unattendedKeywordRunArchive],
+    Date.now(),
+    credential.id,
+  );
+}
+
+async function readArchivedUnattendedKeywordRunRequest(requestId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  if (!normalizedRequestId) return null;
+  const archive = await readUnattendedKeywordRunArchive();
+  return normalizeUnattendedRunRequest(archive.requests[normalizedRequestId]);
+}
+
+async function archiveUnattendedKeywordRunRequest(request) {
+  return await runUnattendedRunArchiveMutation(async () => {
+    const normalized = normalizeUnattendedRunRequest(request);
+    if (!isRetryableUnattendedRunRequest(normalized)) {
+      return null;
+    }
+    const credential = await readCloudTaskAgentCredential();
+    const currentAgentScopeId = String(credential.id || '').trim();
+    const requestAgentScopeId = String(
+      normalized.cloudAgentScopeId || '',
+    ).trim();
+    if (
+      currentAgentScopeId &&
+      requestAgentScopeId &&
+      currentAgentScopeId !== requestAgentScopeId
+    ) {
+      return null;
+    }
+    const scopedRequest = {
+      ...normalized,
+      cloudAgentScopeId: requestAgentScopeId || currentAgentScopeId,
+    };
+    const archive = await readUnattendedKeywordRunArchive();
+    const now = new Date().toISOString();
+    const next = normalizeUnattendedKeywordRunArchive({
+      ...archive,
+      agentScopeId: currentAgentScopeId || requestAgentScopeId,
+      requests: {
+        ...archive.requests,
+        [scopedRequest.id]: {
+          ...scopedRequest,
+          archivedAt: now,
+        },
+      },
+      updatedAt: now,
+    }, Date.now(), currentAgentScopeId);
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunArchive]: next,
+    });
+    return next.requests[scopedRequest.id] || null;
+  });
+}
+
+async function removeArchivedUnattendedKeywordRunRequest(requestId) {
+  return await runUnattendedRunArchiveMutation(async () => {
+    const normalizedRequestId = String(requestId || '').trim();
+    if (!normalizedRequestId) return false;
+    const archive = await readUnattendedKeywordRunArchive();
+    if (!archive.requests[normalizedRequestId]) return false;
+    const requests = {...archive.requests};
+    delete requests[normalizedRequestId];
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunArchive]: {
+        ...archive,
+        requests,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+    return true;
+  });
+}
+
+async function clearUnattendedKeywordRunArchive() {
+  return await runUnattendedRunArchiveMutation(async () => {
+    await chrome.storage.local.remove(
+      STORAGE_KEYS.unattendedKeywordRunArchive,
+    );
+    return true;
+  });
 }
 
 function isTerminalUnattendedRunStatus(status) {
@@ -643,6 +896,9 @@ function buildUnattendedRecoveryMilestoneFingerprint(checkpoint) {
         attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
         savedCount: Math.max(0, Number(entry?.savedCount) || 0),
         error: String(entry?.error || ''),
+        errorCode: String(entry?.errorCode || ''),
+        securityBlocked: entry?.securityBlocked === true,
+        requiresManualAction: entry?.requiresManualAction === true,
       }))
     : [];
   const normalizeKeywords = (value) =>
@@ -723,6 +979,10 @@ function buildTaskCenterCheckpointFromUnattendedRequest(request) {
       attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
       savedCount: Math.max(0, Number(entry?.savedCount) || 0),
       error: String(entry?.error || '').trim(),
+      errorCode: String(entry?.errorCode || '').trim(),
+      errorCategory: String(entry?.errorCategory || '').trim(),
+      securityBlocked: entry?.securityBlocked === true,
+      requiresManualAction: entry?.requiresManualAction === true,
       finishedAt: String(entry?.finishedAt || ''),
     })),
     attempts:
@@ -774,16 +1034,25 @@ function buildUnattendedTaskRun(request, previousRun = null) {
     return null;
   }
   const plan = normalizeUnattendedKeywordPlan(normalized.planSnapshot || {});
+  const executionMode =
+    String(normalized.executionMode || '').trim() === 'one_time'
+      ? 'one_time'
+      : 'unattended_plan';
   return {
     ...(previousRun && typeof previousRun === 'object' ? previousRun : {}),
     id: normalized.id,
     taskType: 'unattended_keyword_capture',
     featureKey: 'unattended_keyword_plan',
-    source: 'unattended_supervisor',
+    source: normalized.cloudAssigned === true
+      ? 'cloud_assignment'
+      : 'unattended_supervisor',
     status: String(normalized.status || 'pending'),
     platform: plan.platform,
     trigger: String(normalized.reason || 'schedule'),
-    title: '无人值守关键词采集',
+    title:
+      executionMode === 'one_time'
+        ? '一次性关键词采集'
+        : '无人值守关键词采集',
     attemptId: normalized.attemptId,
     attemptNumber: normalized.attemptNumber,
     progressSeq: normalized.progressSeq,
@@ -817,6 +1086,10 @@ function buildUnattendedTaskRun(request, previousRun = null) {
       keywordCount: plan.keywords.length,
       keywords: plan.keywords,
       parentRequestId: String(normalized.parentRequestId || ''),
+      cloudCommandId: String(normalized.cloudCommandId || ''),
+      cloudAssigned: normalized.cloudAssigned === true,
+      executionMode,
+      cloudAgentScopeId: String(normalized.cloudAgentScopeId || ''),
       recoveryMode: String(normalized.recoveryMode || ''),
     },
     createdAt: normalized.createdAt,
@@ -969,17 +1242,19 @@ async function persistUnattendedRunMutation(
       error.code = 'UNATTENDED_LEDGER_REJECTED';
       throw error;
     }
-    const nextPlan = mirrorPlan
+    const shouldMirrorPlan = mirrorPlan && normalized.cloudAssigned !== true;
+    const nextPlan = shouldMirrorPlan
       ? buildPlanMirrorForUnattendedRequest(plan, normalized, now)
       : plan;
     const values = {
       [STORAGE_KEYS.unattendedKeywordRunRequest]: normalized,
       [STORAGE_KEYS.taskLedger]: ledgerResult.ledger,
     };
-    if (mirrorPlan) {
+    if (shouldMirrorPlan) {
       values[STORAGE_KEYS.unattendedKeywordPlan] = nextPlan;
     }
     await chrome.storage.local.set(values);
+    scheduleCloudTaskAgentSync('unattended_state_changed');
     return {
       request: normalized,
       plan: nextPlan,
@@ -1028,6 +1303,671 @@ async function readTaskLedger() {
           updatedAt: String(rawLedger.updatedAt || ''),
         }
       : {version: 1, runs: [], updatedAt: ''};
+  });
+}
+
+let cloudTaskAgentSyncInFlight = false;
+let cloudTaskAgentSyncPending = false;
+let cloudTaskAgentLastSyncAt = 0;
+let cloudTaskAgentSyncTimer = null;
+let cloudTaskAgentLastError = '';
+let cloudTaskAgentFailureCount = 0;
+let cloudTaskAgentRetryNotBefore = 0;
+
+function normalizeCloudTaskAgentError(value) {
+  return String(value || '')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/\-]+/gi, 'Bearer [REDACTED]')
+    .replace(
+      /\b(authorization|cookie|password|secret|token|api[_-]?key|auth[_-]?code)\s*[:=]\s*[^\s,;&]+/gi,
+      '$1=[REDACTED]',
+    )
+    .slice(0, 1000);
+}
+
+function recordCloudTaskAgentFailure() {
+  cloudTaskAgentFailureCount += 1;
+  const exponent = Math.max(0, Math.min(8, cloudTaskAgentFailureCount - 1));
+  const delayMs = Math.min(
+    CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS,
+    CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS * (2 ** exponent),
+  );
+  cloudTaskAgentRetryNotBefore = Date.now() + delayMs;
+  return delayMs;
+}
+
+function clearCloudTaskAgentFailureBackoff() {
+  cloudTaskAgentFailureCount = 0;
+  cloudTaskAgentRetryNotBefore = 0;
+}
+
+async function readCloudTaskAgentStatus() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.cloudAgentStatus);
+  const status = stored[STORAGE_KEYS.cloudAgentStatus];
+  return status && typeof status === 'object' && !Array.isArray(status) ? status : {};
+}
+
+async function rememberCloudTaskAgentError(value) {
+  cloudTaskAgentLastError = normalizeCloudTaskAgentError(value);
+  const current = await readCloudTaskAgentStatus();
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.cloudAgentStatus]: {
+      ...current,
+      lastError: cloudTaskAgentLastError,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+async function clearReportedCloudTaskAgentError(reportedError) {
+  const expected = normalizeCloudTaskAgentError(reportedError);
+  const current = await readCloudTaskAgentStatus();
+  if (normalizeCloudTaskAgentError(current.lastError) !== expected) return;
+  cloudTaskAgentLastError = '';
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.cloudAgentStatus]: {
+      ...current,
+      lastError: '',
+      updatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+async function readCloudTaskAgentCredential() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.auth);
+  const auth =
+    stored[STORAGE_KEYS.auth] && typeof stored[STORAGE_KEYS.auth] === 'object'
+      ? stored[STORAGE_KEYS.auth]
+      : {};
+  const captureAgent =
+    auth.captureAgent && typeof auth.captureAgent === 'object'
+      ? auth.captureAgent
+      : {};
+  return {
+    id: String(captureAgent.id || '').trim(),
+    token: String(captureAgent.token || '').trim(),
+  };
+}
+
+async function ensureCloudTaskAgentScope(agentId) {
+  const normalizedAgentId = String(agentId || '').trim();
+  const current = await readCloudTaskAgentStatus();
+  if (!normalizedAgentId || current.agentId === normalizedAgentId) {
+    return current;
+  }
+
+  const switched = Boolean(String(current.agentId || '').trim());
+  const now = new Date().toISOString();
+  const next = {
+    ...current,
+    agentId: normalizedAgentId,
+    // The first scope recorded after upgrading belongs to the already-active
+    // node, so its existing local plan/history may be mirrored. A later node
+    // identity change starts a strict boundary: only data created or explicitly
+    // saved after this time can be sent to the new tenant/node.
+    scopeStartedAt: switched ? now : '',
+    planScopeAgentId: switched
+      ? ''
+      : String(current.planScopeAgentId || normalizedAgentId),
+    lastError: switched ? '' : String(current.lastError || ''),
+    updatedAt: now,
+  };
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.cloudAgentStatus]: next,
+  });
+  if (switched) {
+    cloudTaskAgentLastError = '';
+    await chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults);
+    await clearUnattendedKeywordRunArchive();
+  }
+  return next;
+}
+
+async function confirmCloudTaskAgentPlanScope(agentId) {
+  const normalizedAgentId = String(agentId || '').trim();
+  if (!normalizedAgentId) return;
+  const current = await ensureCloudTaskAgentScope(normalizedAgentId);
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.cloudAgentStatus]: {
+      ...current,
+      planScopeAgentId: normalizedAgentId,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+function cloudScopeTimestamp(value) {
+  const timestamp = Date.parse(String(value || ''));
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function buildCloudScopedTaskLedger(ledger, scopeStartedAt = '', agentId = '') {
+  const scopeTimestamp = cloudScopeTimestamp(scopeStartedAt);
+  if (!scopeTimestamp) return ledger;
+  const normalizedAgentId = String(agentId || '').trim();
+  const source = ledger && typeof ledger === 'object' ? ledger : {};
+  const runs = Array.isArray(source.runs) ? source.runs : [];
+  return {
+    ...source,
+    runs: runs.filter((run) => {
+      const runAgentId = String(
+        run?.metadata?.cloudAgentScopeId || run?.cloudAgentScopeId || '',
+      ).trim();
+      return Boolean(normalizedAgentId && runAgentId === normalizedAgentId);
+    }),
+  };
+}
+
+function buildCloudScopedUnattendedPlan(plan, agentStatus = {}, agentId = '') {
+  const scopeStartedAt = agentStatus?.scopeStartedAt;
+  const scopeTimestamp = cloudScopeTimestamp(scopeStartedAt);
+  if (!scopeTimestamp) return plan;
+  return String(agentStatus?.planScopeAgentId || '') === String(agentId || '')
+    ? plan
+    : null;
+}
+
+async function readCloudCommandResults() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.cloudCommandResults);
+  const raw = stored[STORAGE_KEYS.cloudCommandResults];
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+async function rememberCloudCommandResult(commandId, result) {
+  const current = await readCloudCommandResults();
+  const entries = Object.entries({
+    ...current,
+    [commandId]: {
+      ...(result && typeof result === 'object' ? result : {}),
+      storedAt: new Date().toISOString(),
+    },
+  })
+    .sort((left, right) =>
+      Date.parse(String(right[1]?.storedAt || '')) -
+      Date.parse(String(left[1]?.storedAt || '')),
+    )
+    .slice(0, 50);
+  const next = Object.fromEntries(entries);
+  await chrome.storage.local.set({[STORAGE_KEYS.cloudCommandResults]: next});
+  return next[commandId];
+}
+
+function summarizeCloudRecoveryResult(result) {
+  return {
+    state: 'completed',
+    accepted: result?.accepted === true,
+    reason: String(result?.reason || ''),
+    requestId: String(result?.request?.id || result?.request?.requestId || ''),
+    parentRequestId: String(result?.request?.parentRequestId || ''),
+    message: String(
+      result?.request?.message ||
+        (result?.accepted ? '设备已创建恢复任务' : '设备无法恢复当前任务'),
+    ).slice(0, 1000),
+  };
+}
+
+function summarizeCloudCreationResult(request, commandId) {
+  const requestId = String(request?.id || request?.requestId || '').trim();
+  return {
+    state: 'completed',
+    accepted: Boolean(requestId),
+    reason: requestId ? 'created' : 'create_failed',
+    requestId,
+    cloudCommandId: String(commandId || ''),
+    message: requestId
+      ? '设备已创建并启动云端下发任务'
+      : '设备未能创建云端下发任务',
+  };
+}
+
+function summarizeCloudPlanSaveResult(plan, commandId, requestId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  return {
+    state: 'completed',
+    accepted: Boolean(normalizedRequestId && plan?.enabled),
+    reason: normalizedRequestId && plan?.enabled ? 'plan_saved' : 'plan_save_failed',
+    requestId: normalizedRequestId,
+    cloudCommandId: String(commandId || ''),
+    executionMode: 'unattended_plan',
+    message: plan?.enabled
+      ? '设备已保存并启用无人值守计划'
+      : '设备未能启用无人值守计划',
+  };
+}
+
+async function executeCloudTaskAgentCommand(command, token) {
+  const commandId = String(command?.id || '').trim();
+  if (!commandId) return null;
+  const commandType = String(command?.command_type || '').trim();
+  const cachedResults = await readCloudCommandResults();
+  let commandResult = cachedResults[commandId] || null;
+  const payload =
+    command.payload && typeof command.payload === 'object'
+      ? command.payload
+      : {};
+  const requestId = String(
+    payload.controlTaskId || command.control_task_id || command.client_task_id || '',
+  ).trim();
+
+  if (commandType === 'create') {
+    const clientTaskId = String(
+      payload.clientTaskId || command.client_task_id || '',
+    ).trim();
+    const executionMode =
+      String(payload.executionMode || '').trim() === 'unattended_plan'
+        ? 'unattended_plan'
+        : 'one_time';
+    if (
+      executionMode === 'unattended_plan' &&
+      (!commandResult || commandResult.state === 'executing')
+    ) {
+      const planSource =
+        payload.planSnapshot && typeof payload.planSnapshot === 'object'
+          ? payload.planSnapshot
+          : {};
+      const platform = normalizePlatformId(
+        planSource.platform || payload.platform || command.platform,
+      );
+      const keywords = normalizeKeywordList(planSource.keywords);
+      if (
+        !clientTaskId ||
+        !['xiaohongshu', 'douyin'].includes(platform) ||
+        keywords.length === 0
+      ) {
+        commandResult = await rememberCloudCommandResult(commandId, {
+          state: 'completed',
+          accepted: false,
+          reason: 'invalid_task_payload',
+          requestId: clientTaskId,
+          executionMode,
+          message: '云端计划缺少有效的平台或关键词',
+        });
+      } else {
+        await rememberCloudCommandResult(commandId, {
+          state: 'executing',
+          accepted: false,
+          reason: 'executing',
+          requestId: clientTaskId,
+          executionMode,
+        });
+        try {
+          const plan = await saveUnattendedKeywordPlan(
+            {
+              ...planSource,
+              enabled: true,
+              platform,
+              keywords,
+            },
+            {confirmCloudScope: true},
+          );
+          commandResult = await rememberCloudCommandResult(
+            commandId,
+            summarizeCloudPlanSaveResult(plan, commandId, clientTaskId),
+          );
+        } catch (error) {
+          commandResult = await rememberCloudCommandResult(commandId, {
+            state: 'completed',
+            accepted: false,
+            reason: String(error?.code || 'plan_save_failed'),
+            requestId: clientTaskId,
+            executionMode,
+            message: String(error?.message || '设备保存无人值守计划失败').slice(
+              0,
+              1000,
+            ),
+          });
+        }
+      }
+    } else if (!commandResult || commandResult.state === 'executing') {
+      const [currentRequest, ledger] = await Promise.all([
+        readUnattendedKeywordRunRequest(),
+        readTaskLedger(),
+      ]);
+      const reconciledRun =
+        currentRequest?.id === clientTaskId ||
+        currentRequest?.cloudCommandId === commandId
+          ? currentRequest
+          : (Array.isArray(ledger?.runs) ? ledger.runs : []).find(
+              (run) =>
+                run?.id === clientTaskId ||
+                run?.metadata?.cloudCommandId === commandId,
+            ) || null;
+      if (reconciledRun) {
+        commandResult = await rememberCloudCommandResult(commandId, {
+          state: 'completed',
+          accepted: true,
+          reason: 'reconciled',
+          requestId: String(reconciledRun.id || clientTaskId),
+          cloudCommandId: commandId,
+          message: '已对账到设备创建的云端任务',
+        });
+      } else {
+        const planSource =
+          payload.planSnapshot && typeof payload.planSnapshot === 'object'
+            ? payload.planSnapshot
+            : {};
+        const platform = normalizePlatformId(
+          planSource.platform || payload.platform || command.platform,
+        );
+        const keywords = normalizeKeywordList(planSource.keywords);
+        if (
+          !clientTaskId ||
+          !['xiaohongshu', 'douyin'].includes(platform) ||
+          keywords.length === 0
+        ) {
+          commandResult = await rememberCloudCommandResult(commandId, {
+            state: 'completed',
+            accepted: false,
+            reason: 'invalid_task_payload',
+            requestId: clientTaskId,
+            message: '云端任务缺少有效的平台或关键词',
+          });
+        } else if (
+          currentRequest &&
+          !isTerminalUnattendedRunStatus(currentRequest.status)
+        ) {
+          return {
+            ok: true,
+            deferred: true,
+            reason: 'unattended_task_busy',
+            commandId,
+          };
+        } else {
+          const activeLock = await readActiveCaptureExecutionLock();
+          if (activeLock) {
+            return {
+              ok: true,
+              deferred: true,
+              reason: 'capture_lock_busy',
+              commandId,
+            };
+          }
+          await rememberCloudCommandResult(commandId, {
+            state: 'executing',
+            accepted: false,
+            reason: 'executing',
+            requestId: clientTaskId,
+          });
+          try {
+            const request = await launchUnattendedKeywordRun(
+              {
+                ...planSource,
+                enabled: true,
+                platform,
+                keywords,
+              },
+              {
+                reason: 'cloud_assignment',
+                requestId: clientTaskId,
+                cloudCommandId: commandId,
+                cloudAssigned: true,
+                executionMode,
+              },
+            );
+            if (!request) {
+              return {
+                ok: true,
+                deferred: true,
+                reason: 'unattended_task_race',
+                commandId,
+              };
+            }
+            commandResult = await rememberCloudCommandResult(
+              commandId,
+              summarizeCloudCreationResult(request, commandId),
+            );
+          } catch (error) {
+            commandResult = await rememberCloudCommandResult(commandId, {
+              state: 'completed',
+              accepted: false,
+              reason: String(error?.code || 'create_failed'),
+              requestId: clientTaskId,
+              message: String(error?.message || '设备创建云端任务失败').slice(
+                0,
+                1000,
+              ),
+            });
+          }
+        }
+      }
+    }
+  } else if (commandType === 'stop') {
+    if (!commandResult || commandResult.state === 'executing') {
+      await rememberCloudCommandResult(commandId, {
+        state: 'executing',
+        accepted: false,
+        reason: 'executing',
+        requestId,
+      });
+      const stopped = await cancelUnattendedKeywordRunFromControl({
+        requestId,
+        message: '后台远程中止当前采集任务',
+      });
+      commandResult = await rememberCloudCommandResult(commandId, {
+        state: 'completed',
+        accepted: stopped.accepted === true,
+        reason: stopped.reason,
+        requestId,
+        message:
+          stopped.accepted === true
+            ? stopped.reason === 'already_terminal'
+              ? '任务已经结束，无需重复停止'
+              : '设备已停止当前任务并保留已有结果'
+            : '设备未找到需要停止的当前任务',
+      });
+    }
+  } else if (commandType !== 'resume') {
+    if (!commandResult || commandResult.state === 'executing') {
+      commandResult = await rememberCloudCommandResult(commandId, {
+        state: 'completed',
+        accepted: false,
+        reason: 'unsupported_command',
+        message: '当前扩展版本不支持该远程指令',
+      });
+    }
+  } else if (!commandResult || commandResult.state === 'executing') {
+    const [currentRequest, ledger] = await Promise.all([
+      readUnattendedKeywordRunRequest(),
+      readTaskLedger(),
+    ]);
+    const reconciledRun =
+      currentRequest?.cloudCommandId === commandId
+        ? currentRequest
+        : (Array.isArray(ledger?.runs) ? ledger.runs : []).find(
+            (run) => run?.metadata?.cloudCommandId === commandId,
+          ) || null;
+    if (reconciledRun) {
+      commandResult = await rememberCloudCommandResult(commandId, {
+        state: 'completed',
+        accepted: true,
+        reason: 'reconciled',
+        requestId: String(reconciledRun.id || ''),
+        parentRequestId: String(
+          reconciledRun.parentRequestId || reconciledRun.metadata?.parentRequestId || requestId,
+        ),
+        message: '已对账到设备创建的恢复任务',
+      });
+    } else {
+      const recoverableRequest =
+        currentRequest?.id === requestId
+          ? currentRequest
+          : await readArchivedUnattendedKeywordRunRequest(requestId);
+      if (!recoverableRequest) {
+        commandResult = await rememberCloudCommandResult(commandId, {
+          state: 'completed',
+          accepted: false,
+          reason: 'not_found',
+          requestId,
+          message: '设备未保留该任务的恢复快照，无法重复创建恢复任务',
+        });
+      } else if (
+        currentRequest &&
+        currentRequest.id !== requestId &&
+        !isTerminalUnattendedRunStatus(currentRequest.status)
+      ) {
+        return {
+          ok: true,
+          deferred: true,
+          reason: 'unattended_task_busy',
+          commandId,
+        };
+      } else {
+        await rememberCloudCommandResult(commandId, {
+          state: 'executing',
+          accepted: false,
+          reason: 'executing',
+          requestId,
+        });
+        const recovery = await manuallyRecoverUnattendedKeywordRun({
+          requestId,
+          mode: String(payload.mode || 'remaining'),
+          cloudCommandId: commandId,
+        });
+        commandResult = await rememberCloudCommandResult(
+          commandId,
+          summarizeCloudRecoveryResult(recovery),
+        );
+      }
+    }
+  }
+
+  return await cloudTaskAgentApi.completeCommand({
+    token,
+    commandId,
+    success: commandResult.accepted === true,
+    result: commandResult,
+  });
+}
+
+async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
+  if (!cloudTaskAgentApi?.buildHeartbeatPayload || !cloudTaskAgentApi?.sendHeartbeat) {
+    return {ok: false, skipped: true, reason: 'cloud_agent_unavailable'};
+  }
+  if (cloudTaskAgentSyncInFlight) {
+    cloudTaskAgentSyncPending = true;
+    return {ok: false, skipped: true, reason: 'sync_in_flight'};
+  }
+  if (cloudTaskAgentRetryNotBefore > Date.now()) {
+    const remainingMs = cloudTaskAgentRetryNotBefore - Date.now();
+    scheduleCloudTaskAgentSync(`${reason}_after_backoff`, remainingMs);
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'failure_backoff',
+      retryAfterMs: remainingMs,
+    };
+  }
+  if (
+    !force &&
+    cloudTaskAgentLastSyncAt > 0 &&
+    Date.now() - cloudTaskAgentLastSyncAt < CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS
+  ) {
+    const remainingMs = Math.max(
+      25,
+      CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS - (Date.now() - cloudTaskAgentLastSyncAt) + 25,
+    );
+    scheduleCloudTaskAgentSync(`${reason}_after_throttle`, remainingMs);
+    return {ok: false, skipped: true, reason: 'throttled'};
+  }
+
+  const credential = await readCloudTaskAgentCredential();
+  if (!credential.id || !credential.token) {
+    return {ok: false, skipped: true, reason: 'missing_agent_credential'};
+  }
+
+  cloudTaskAgentSyncInFlight = true;
+  try {
+    const agentStatus = await ensureCloudTaskAgentScope(credential.id);
+    const [runtime, ledger, stored] = await Promise.all([
+      ensureRuntimeState(),
+      readTaskLedger(),
+      chrome.storage.local.get([
+        STORAGE_KEYS.unattendedKeywordRunRequest,
+        STORAGE_KEYS.unattendedKeywordPlan,
+      ]),
+    ]);
+    const scopedLedger = buildCloudScopedTaskLedger(
+      ledger,
+      agentStatus.scopeStartedAt,
+      credential.id,
+    );
+    const scopedPlan = buildCloudScopedUnattendedPlan(
+      stored[STORAGE_KEYS.unattendedKeywordPlan],
+      agentStatus,
+      credential.id,
+    );
+    const reportedLastError = normalizeCloudTaskAgentError(
+      agentStatus.lastError || cloudTaskAgentLastError,
+    );
+    const payload = cloudTaskAgentApi.buildHeartbeatPayload({
+      runtime,
+      ledger: scopedLedger,
+      unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+      unattendedPlan: scopedPlan,
+      reason,
+      lastError: reportedLastError,
+    });
+    const response = await cloudTaskAgentApi.sendHeartbeat({
+      token: credential.token,
+      body: payload,
+    });
+    if (!response?.ok) {
+      recordCloudTaskAgentFailure();
+      await rememberCloudTaskAgentError(
+        response?.message || response?.reason || '云端任务中心同步失败',
+      );
+      return response;
+    }
+
+    clearCloudTaskAgentFailureBackoff();
+    cloudTaskAgentLastSyncAt = Date.now();
+    if (reportedLastError) {
+      await clearReportedCloudTaskAgentError(reportedLastError);
+      cloudTaskAgentSyncPending = true;
+    } else {
+      cloudTaskAgentLastError = '';
+    }
+    const commands = Array.isArray(response.commands) ? response.commands : [];
+    for (const command of commands) {
+      try {
+        await executeCloudTaskAgentCommand(command, credential.token);
+      } catch (error) {
+        await rememberCloudTaskAgentError(
+          error?.message || '远程指令执行失败',
+        );
+        console.warn('[CloudTaskAgent] command execution failed:', error);
+      }
+    }
+    return response;
+  } finally {
+    cloudTaskAgentSyncInFlight = false;
+    if (cloudTaskAgentSyncPending) {
+      cloudTaskAgentSyncPending = false;
+      setTimeout(() => {
+        syncCloudTaskAgent({reason: 'pending_state_changes', force: true}).catch(
+          (error) => console.warn('[CloudTaskAgent] pending sync failed:', error),
+        );
+      }, 0);
+    }
+  }
+}
+
+function scheduleCloudTaskAgentSync(reason = 'state_changed', delayMs = 250) {
+  if (cloudTaskAgentSyncInFlight) {
+    cloudTaskAgentSyncPending = true;
+    return;
+  }
+  if (cloudTaskAgentSyncTimer !== null) return;
+  cloudTaskAgentSyncTimer = setTimeout(() => {
+    cloudTaskAgentSyncTimer = null;
+    syncCloudTaskAgent({reason}).catch((error) => {
+      console.warn('[CloudTaskAgent] state sync failed:', error);
+    });
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+async function syncCloudTaskAgentAlarm() {
+  await chrome.alarms.create(CLOUD_TASK_AGENT_ALARM_NAME, {
+    periodInMinutes: CLOUD_TASK_AGENT_PERIOD_MINUTES,
   });
 }
 
@@ -1128,6 +2068,7 @@ async function clearTaskCenterRecords() {
         lastUpdatedAt: now,
       },
     });
+    await clearUnattendedKeywordRunArchive();
     let clearedUnattendedRequest = false;
     if (!unattendedRequestActive) {
       if (unattendedRequestId) {
@@ -1187,6 +2128,15 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
       ? ledger.runs.find((item) => item?.id === taskId) || null
       : null;
     let nextRun = {...(existing || {}), ...sourceRun, ...sourcePatch, id: taskId};
+    const cloudAgentScopeId = existing
+      ? String(existing?.metadata?.cloudAgentScopeId || '')
+      : String((await readCloudTaskAgentCredential()).id || '');
+    nextRun.metadata = {
+      ...(nextRun.metadata && typeof nextRun.metadata === 'object'
+        ? nextRun.metadata
+        : {}),
+      cloudAgentScopeId,
+    };
     if (!nextRun.taskType && nextRun.kind) {
       nextRun.taskType = nextRun.kind;
     }
@@ -1215,6 +2165,7 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
         });
     if (result.accepted) {
       await chrome.storage.local.set({[STORAGE_KEYS.taskLedger]: result.ledger});
+      scheduleCloudTaskAgentSync('task_ledger_changed');
     }
     return {
       accepted: Boolean(result.accepted),
@@ -1546,11 +2497,151 @@ async function cancelAndReleaseUnattendedExecutionTargets(
   return relayedCount;
 }
 
+async function cancelUnattendedKeywordRunFromControl({
+  requestId = '',
+  message = '用户手动中止当前采集任务',
+  tabId = null,
+} = {}) {
+  const requestedId = String(requestId || '').trim();
+  const request = await readUnattendedKeywordRunRequest();
+  if (requestedId && request?.id !== requestedId) {
+    const archivedRequest =
+      await readArchivedUnattendedKeywordRunRequest(requestedId);
+    if (archivedRequest) {
+      await removeArchivedUnattendedKeywordRunRequest(requestedId);
+      return {
+        accepted: true,
+        reason: 'results_kept',
+        request: archivedRequest,
+        plan: await readUnattendedKeywordPlan(),
+        relayedCount: 0,
+      };
+    }
+    const ledger = await readTaskLedger();
+    const historicalRun = (Array.isArray(ledger?.runs) ? ledger.runs : []).find(
+      (run) => String(run?.id || '').trim() === requestedId,
+    );
+    const alreadyTerminal = isTerminalUnattendedRunStatus(
+      historicalRun?.status,
+    );
+    return {
+      accepted: alreadyTerminal,
+      reason: alreadyTerminal ? 'already_terminal' : 'request_mismatch',
+      request: historicalRun || request || null,
+      plan: await readUnattendedKeywordPlan(),
+      relayedCount: 0,
+    };
+  }
+  if (
+    request &&
+    isTerminalUnattendedRunStatus(request.status) &&
+    request.status !== 'needs_action'
+  ) {
+    if (isRetryableUnattendedRunRequest(request)) {
+      const now = new Date().toISOString();
+      const dismissedRequest = {
+        ...request,
+        recoveryDismissedAt: now,
+        recoveryDismissedMessage: message,
+        updatedAt: now,
+      };
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunRequest]: dismissedRequest,
+      });
+      await removeArchivedUnattendedKeywordRunRequest(request.id);
+      scheduleCloudTaskAgentSync('unattended_recovery_dismissed');
+      return {
+        accepted: true,
+        reason: 'results_kept',
+        request: dismissedRequest,
+        plan: await readUnattendedKeywordPlan(),
+        relayedCount: 0,
+      };
+    }
+    return {
+      accepted: true,
+      reason: 'already_terminal',
+      request,
+      plan: await readUnattendedKeywordPlan(),
+      relayedCount: 0,
+    };
+  }
+  if (!request) {
+    return {
+      accepted: false,
+      reason: 'not_found',
+      request: null,
+      plan: await readUnattendedKeywordPlan(),
+      relayedCount: 0,
+    };
+  }
+
+  const progress = normalizeUnattendedRunProgress(
+    request.progress,
+    request.message,
+  );
+  const explicitTabId = Number(tabId);
+  const progressRunnerTabId = Number(progress?.runnerTabId);
+  // 状态切换前保留旧锁和平台页身份，确保在 Debug 尚未建立的导航阶段
+  // 也可以精确停止，而不会误伤随后启动的新任务。
+  const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
+  const canceledRequest = await cancelUnattendedKeywordRunRequest(message, {
+    requestId: requestedId,
+  });
+  if (!canceledRequest) {
+    return {
+      accepted: false,
+      reason: 'request_mismatch',
+      request,
+      plan: await readUnattendedKeywordPlan(),
+      relayedCount: 0,
+    };
+  }
+  const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
+    lockSnapshot,
+    [explicitTabId, progressRunnerTabId],
+  );
+
+  const now = new Date();
+  let nextPlan;
+  if (canceledRequest.cloudAssigned === true) {
+    // 云端一次性任务与本地定时计划互不覆盖。停止云任务后只恢复本地
+    // 计划调度，不把这次取消写成本地计划的运行结果。
+    nextPlan = await reconcileUnattendedKeywordPlanSchedule({launchDue: true});
+  } else {
+    const plan = await readUnattendedKeywordPlan();
+    nextPlan = await saveUnattendedKeywordPlan(
+      {
+        ...plan,
+        lastRunAt: now.toISOString(),
+        lastRunStatus: 'canceled',
+        lastRunMessage: message,
+        lastRunProgress: progress,
+        nextRunAt: '',
+      },
+      {recomputeNext: true, from: buildScheduleReferenceAfterDate(now)},
+    );
+  }
+
+  return {
+    accepted: true,
+    reason: 'canceled',
+    request: canceledRequest,
+    plan: nextPlan,
+    relayedCount,
+  };
+}
+
 async function cleanupDisabledUnattendedKeywordPlanRuntime() {
   const message = '无人值守计划已关闭，已取消未完成任务';
   // 状态切换前捕获旧锁和平台页。列表采集阶段 progress 可能尚未带 runnerTabId，
   // 若先释放锁再取消，旧 content capture 会继续与下一任务并行。
   const request = await readUnattendedKeywordRunRequest();
+  // 云端一次性下发任务与本地定时计划相互独立。关闭本地计划不能顺带
+  // 取消后台已分配并正在执行的任务。
+  if (request?.cloudAssigned === true) {
+    return;
+  }
   const progress = normalizeUnattendedRunProgress(
     request?.progress,
     request?.message,
@@ -1598,6 +2689,7 @@ async function saveUnattendedKeywordPlan(
     recomputeNext = true,
     from = null,
     preserveRunState = true,
+    confirmCloudScope = false,
   } = {},
 ) {
   const normalized = normalizeUnattendedKeywordPlan({
@@ -1634,6 +2726,11 @@ async function saveUnattendedKeywordPlan(
     return next;
   });
   await syncUnattendedKeywordAlarm(nextPlan);
+  if (confirmCloudScope) {
+    const credential = await readCloudTaskAgentCredential();
+    await confirmCloudTaskAgentPlanScope(credential.id);
+  }
+  scheduleCloudTaskAgentSync('unattended_plan_saved');
   if (!nextPlan.enabled) {
     await cleanupDisabledUnattendedKeywordPlanRuntime();
   }
@@ -1778,7 +2875,13 @@ async function readStoredCaptureExecutionLock() {
 async function bindCaptureExecutionLockToTask(
   taskId,
   sourceTabId,
-  {allowUnattendedRebind = false, attemptId = ''} = {},
+  {
+    allowUnattendedRebind = false,
+    attemptId = '',
+    expectedLockId = '',
+    expectedHolderId = '',
+    expectedHolderDocumentId = '',
+  } = {},
 ) {
   const normalizedTaskId = String(taskId || '').trim();
   const normalizedAttemptId = String(attemptId || '').trim();
@@ -1794,6 +2897,21 @@ async function bindCaptureExecutionLockToTask(
       allowUnattendedRebind &&
         String(activeLock.owner || '') === 'unattended_keyword_plan',
     );
+    if (
+      unattendedRebind &&
+      ((expectedLockId && activeLock.id !== String(expectedLockId)) ||
+        (expectedHolderId &&
+          String(activeLock.holderId || '') !== String(expectedHolderId)) ||
+        (expectedHolderDocumentId &&
+          String(activeLock.holderDocumentId || '') !==
+            String(expectedHolderDocumentId)))
+    ) {
+      // The lock was transferred after BEGIN's preflight. Returning the new
+      // lock here is ambiguous when it already carries the same stable task
+      // and attempt binding: the old BEGIN could mistake that lock for its own
+      // successful bind. Fail the compare-and-set explicitly instead.
+      return null;
+    }
     if (
       !unattendedRebind &&
       (Number(activeLock.holderTabId) !== normalizedSourceTabId ||
@@ -2071,16 +3189,29 @@ async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
   });
 }
 
-async function createUnattendedKeywordRunRequest(plan, { reason = 'alarm' } = {}) {
+async function createUnattendedKeywordRunRequest(
+  plan,
+  {
+    reason = 'alarm',
+    requestId = '',
+    cloudCommandId = '',
+    cloudAssigned = false,
+    executionMode = '',
+  } = {},
+) {
   return await runUnattendedRunMutation(async () => {
     const existing = await readUnattendedKeywordRunRequest();
     if (existing && !isTerminalUnattendedRunStatus(existing.status)) {
       return existing;
     }
+    if (isRetryableUnattendedRunRequest(existing)) {
+      await archiveUnattendedKeywordRunRequest(existing);
+    }
+    const cloudCredential = await readCloudTaskAgentCredential();
     const now = new Date().toISOString();
     const request = {
       schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
-      id: createUuid(),
+      id: String(requestId || '').trim() || createUuid(),
       attemptId: createUuid(),
       attemptNumber: 1,
       progressSeq: 0,
@@ -2088,6 +3219,13 @@ async function createUnattendedKeywordRunRequest(plan, { reason = 'alarm' } = {}
       type: 'keyword_batch',
       status: 'pending',
       reason,
+      cloudCommandId: String(cloudCommandId || '').trim(),
+      cloudAssigned: cloudAssigned === true,
+      executionMode:
+        String(executionMode || '').trim() === 'one_time'
+          ? 'one_time'
+          : 'unattended_plan',
+      cloudAgentScopeId: String(cloudCredential.id || ''),
       createdAt: now,
       updatedAt: now,
       heartbeatAt: now,
@@ -2100,7 +3238,7 @@ async function createUnattendedKeywordRunRequest(plan, { reason = 'alarm' } = {}
     await persistUnattendedRunMutation(request, {
       event: {type: 'created', message: '已创建无人值守任务', at: now},
     });
-    if (existing?.status === 'needs_action') {
+    if (!cloudAssigned && existing?.status === 'needs_action') {
       await resolveSupersededNeedsActionTask(
         existing.id,
         request.id,
@@ -2186,44 +3324,61 @@ async function claimUnattendedKeywordRun({
       return {accepted: false, reason: 'not_claimable', data: null};
     }
 
-    let transferredLock = null;
-    if (isSameRunnerResume) {
-      transferredLock = await transferOrReserveUnattendedCaptureExecutionLock({
-        holderId,
-        holderDocumentId: senderDocumentId,
-        holderTabId: request?.progress?.runnerTabId,
+    const normalizedHolderId = String(holderId || '').trim();
+    const normalizedSenderDocumentId = String(senderDocumentId || '').trim();
+    if (!normalizedHolderId || !normalizedSenderDocumentId) {
+      return {
+        accepted: false,
+        reason: 'missing_lock_holder',
+        data: request,
+        lock: null,
+      };
+    }
+
+    // Reserve the unattended execution lock at claim time, before the runner
+    // can start a stable Debug task. This closes the window where a canceled
+    // or lockless runner could create browser resources and only acquire the
+    // real capture lock later inside the keyword batch.
+    const transferredLock =
+      await transferOrReserveUnattendedCaptureExecutionLock({
+        holderId: normalizedHolderId,
+        holderDocumentId: normalizedSenderDocumentId,
+        holderTabId: isSameRunnerResume
+          ? request?.progress?.runnerTabId
+          : normalizedSenderTabId,
       });
-      if (!transferredLock) {
-        const blockedAt = new Date().toISOString();
-        const blockedMessage =
-          '检测到其他采集任务已占用执行锁，已阻止无人值守任务并行恢复；请等待当前任务结束后在任务中心重试';
-        const blockedRequest = {
-          ...request,
-          status: 'needs_action',
-          recoveryPendingLaunch: false,
-          finishedAt: blockedAt,
-          updatedAt: blockedAt,
+    if (!transferredLock) {
+      const blockedAt = new Date().toISOString();
+      const blockedMessage =
+        '检测到其他采集任务已占用执行锁，已阻止无人值守任务并行恢复；请等待当前任务结束后在任务中心重试';
+      const blockedRequest = {
+        ...request,
+        status: 'needs_action',
+        recoveryPendingLaunch: false,
+        finishedAt: blockedAt,
+        updatedAt: blockedAt,
+        message: blockedMessage,
+        error: {
+          code: 'CAPTURE_LOCK_CONFLICT',
           message: blockedMessage,
-          error: {
-            code: 'CAPTURE_LOCK_CONFLICT',
-            message: blockedMessage,
-          },
-        };
-        await persistUnattendedRunMutation(blockedRequest, {
-          previousRequest: request,
-          event: {
-            type: 'needs_action',
-            message: blockedMessage,
-            at: blockedAt,
-          },
-        });
-        return {
-          accepted: false,
-          reason: 'capture_lock_conflict',
-          data: blockedRequest,
-          lock: null,
-        };
-      }
+        },
+      };
+      await persistUnattendedRunMutation(blockedRequest, {
+        previousRequest: request,
+        event: {
+          type: 'needs_action',
+          message: blockedMessage,
+          at: blockedAt,
+        },
+      });
+      return {
+        accepted: false,
+        reason: 'capture_lock_conflict',
+        data: blockedRequest,
+        lock: null,
+      };
+    }
+    if (isSameRunnerResume) {
       // runner 刷新时旧页面编排已经消失。只有旧 content 执行确认停止（或其
       // 页面已被硬刷新/关闭）后，才允许新页面从检查点继续。
       const stopResult = await stopPreviousUnattendedCaptureForResume(
@@ -2447,7 +3602,16 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
   });
 }
 
-async function launchUnattendedKeywordRun(plan, { reason = 'alarm' } = {}) {
+async function launchUnattendedKeywordRun(
+  plan,
+  {
+    reason = 'alarm',
+    requestId = '',
+    cloudCommandId = '',
+    cloudAssigned = false,
+    executionMode = '',
+  } = {},
+) {
   const normalizedPlan = normalizeUnattendedKeywordPlan(plan);
   if (!normalizedPlan.enabled || normalizedPlan.keywords.length === 0) {
     return null;
@@ -2455,7 +3619,14 @@ async function launchUnattendedKeywordRun(plan, { reason = 'alarm' } = {}) {
 
   const request = await createUnattendedKeywordRunRequest(normalizedPlan, {
     reason,
+    requestId,
+    cloudCommandId,
+    cloudAssigned,
+    executionMode,
   });
+  if (requestId && request.id !== requestId) {
+    return null;
+  }
   try {
     const platformTab = await activateOrCreatePlatformTab(normalizedPlan.platform);
     const runnerTab = await openUnattendedRunnerTab(request.id, {
@@ -2473,6 +3644,84 @@ async function launchUnattendedKeywordRun(plan, { reason = 'alarm' } = {}) {
 }
 
 function getUnattendedRecoveryBlockReason(request) {
+  const checkpointResults = Array.isArray(request?.checkpoint?.keywordResults)
+    ? request.checkpoint.keywordResults
+    : [];
+  const structuredBlock = [
+    request?.error,
+    request?.progress,
+    ...checkpointResults,
+  ].find((entry) => {
+    const entryCode = String(
+      entry?.errorCode ||
+        entry?.error_code ||
+        entry?.code ||
+        entry?.error?.code ||
+        '',
+    )
+      .trim()
+      .toUpperCase();
+    return Boolean(
+      entry?.securityBlocked === true ||
+        entry?.security_blocked === true ||
+        entry?.requiresManualAction === true ||
+        entry?.requires_manual_action === true ||
+        entry?.error?.securityBlocked === true ||
+        entry?.error?.requiresManualAction === true ||
+        [
+          'PLATFORM_SAFETY_BLOCK',
+          'SECURITY_VERIFICATION_REQUIRED',
+          'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+        ].includes(entryCode),
+    );
+  });
+  const structuredCode = String(
+    structuredBlock?.errorCode ||
+      structuredBlock?.error_code ||
+      structuredBlock?.code ||
+      structuredBlock?.error?.code ||
+      '',
+  )
+    .trim()
+    .toUpperCase();
+  const structuredError =
+    structuredBlock?.error && typeof structuredBlock.error === 'object'
+      ? structuredBlock.error
+      : null;
+  const structuredMessage = String(
+    structuredError?.message ||
+      (typeof structuredBlock?.error === 'string'
+        ? structuredBlock.error
+        : '') ||
+      structuredBlock?.message ||
+      '',
+  ).trim();
+  if (structuredBlock) {
+    const douyinServiceAbnormal =
+      structuredCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL';
+    return {
+      code: structuredCode || 'UNATTENDED_RECOVERY_BLOCKED',
+      category: String(
+        structuredBlock?.errorCategory ||
+          structuredBlock?.error_category ||
+          structuredBlock?.category ||
+          structuredBlock?.error?.category ||
+          (douyinServiceAbnormal ? 'platform_service_abnormal' : ''),
+      ).trim(),
+      message: douyinServiceAbnormal
+        ? '检测到抖音“服务出现异常”，为避免触发安全审核，已停止自动恢复'
+        : structuredMessage || '任务已进入人工处理状态，已停止自动恢复',
+      securityBlocked: Boolean(
+        structuredBlock?.securityBlocked === true ||
+          structuredBlock?.security_blocked === true ||
+          structuredBlock?.error?.securityBlocked === true ||
+          douyinServiceAbnormal,
+      ),
+      requiresManualAction: true,
+      retryable: false,
+    };
+  }
+
   const code = String(request?.error?.code || '').toLowerCase();
   const text = [
     request?.message,
@@ -2488,12 +3737,23 @@ function getUnattendedRecoveryBlockReason(request) {
       text,
     );
   if (!blockedCode && !blockedText) {
-    return '';
+    return null;
   }
   if (/login|auth/.test(code) || /登录/.test(text)) {
-    return '登录状态已失效，需要用户重新登录后继续';
+    return {
+      code: String(request?.error?.code || 'UNATTENDED_RECOVERY_BLOCKED'),
+      message: '登录状态已失效，需要用户重新登录后继续',
+      requiresManualAction: true,
+      retryable: false,
+    };
   }
-  return '平台触发安全验证或账号限制，已停止自动重试';
+  return {
+    code: String(request?.error?.code || 'UNATTENDED_RECOVERY_BLOCKED'),
+    message: '平台触发安全验证或账号限制，已停止自动重试',
+    securityBlocked: true,
+    requiresManualAction: true,
+    retryable: false,
+  };
 }
 
 function getUnattendedWaitUntilMs(request) {
@@ -2795,7 +4055,8 @@ async function launchPendingUnattendedRecovery(request) {
 }
 
 async function recoverUnattendedKeywordRunRequest(request, health) {
-  const blockReason = getUnattendedRecoveryBlockReason(request);
+  const recoveryBlock = getUnattendedRecoveryBlockReason(request);
+  const blockReason = String(recoveryBlock?.message || '').trim();
   // request.runnerTabId 指向扩展自己的 runner 页面，不是注入 content script 的平台页；
   // 平台页在列表阶段未必已经写入 progress.runnerTabId，因此在释放旧锁之前也要
   // 捕获锁的 holderTabId。恢复只取消这两个旧执行目标，避免误伤新 attempt。
@@ -2830,8 +4091,18 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
           ...(current.error && typeof current.error === 'object'
             ? current.error
             : {}),
-          code: 'UNATTENDED_RECOVERY_BLOCKED',
+          code: String(
+            recoveryBlock?.code || 'UNATTENDED_RECOVERY_BLOCKED',
+          ),
           message: blockReason,
+          ...(recoveryBlock?.category
+            ? {category: String(recoveryBlock.category)}
+            : {}),
+          ...(recoveryBlock?.securityBlocked === true
+            ? {securityBlocked: true}
+            : {}),
+          requiresManualAction: true,
+          retryable: false,
         },
       };
       await persistUnattendedRunMutation(nextRequest, {
@@ -3017,17 +4288,66 @@ function buildManualRecoveryCheckpoint(request, mode) {
   return checkpoint;
 }
 
-async function manuallyRecoverUnattendedKeywordRun({requestId = '', mode = 'remaining'} = {}) {
+async function manuallyRecoverUnattendedKeywordRun({
+  requestId = '',
+  mode = 'remaining',
+  cloudCommandId = '',
+} = {}) {
   const normalizedMode = new Set(['remaining', 'failed', 'skip_current']).has(mode)
     ? mode
     : 'remaining';
   const created = await runUnattendedRunMutation(async () => {
-    const current = await readUnattendedKeywordRunRequest();
-    if (!current || !requestId || current.id !== requestId) {
+    const currentRequest = await readUnattendedKeywordRunRequest();
+    const current =
+      currentRequest?.id === requestId
+        ? currentRequest
+        : await readArchivedUnattendedKeywordRunRequest(requestId);
+    if (!current || !requestId) {
       return {accepted: false, reason: 'not_found', request: null};
+    }
+    if (
+      currentRequest &&
+      currentRequest.id !== current.id &&
+      !isTerminalUnattendedRunStatus(currentRequest.status)
+    ) {
+      return {
+        accepted: false,
+        reason: 'unattended_task_busy',
+        request: currentRequest,
+      };
     }
     if (!isTerminalUnattendedRunStatus(current.status)) {
       return {accepted: false, reason: 'not_recoverable', request: current};
+    }
+    const credential = await readCloudTaskAgentCredential();
+    const currentAgentScopeId = String(credential.id || '').trim();
+    const requestAgentScopeId = String(
+      current.cloudAgentScopeId || '',
+    ).trim();
+    if (
+      currentAgentScopeId &&
+      requestAgentScopeId &&
+      currentAgentScopeId !== requestAgentScopeId
+    ) {
+      return {
+        accepted: false,
+        reason: 'agent_scope_mismatch',
+        request: current,
+      };
+    }
+    if (String(current.recoveryDismissedAt || '').trim()) {
+      return {
+        accepted: false,
+        reason: 'recovery_dismissed',
+        request: current,
+      };
+    }
+    if (
+      currentRequest &&
+      currentRequest.id !== current.id &&
+      isRetryableUnattendedRunRequest(currentRequest)
+    ) {
+      await archiveUnattendedKeywordRunRequest(currentRequest);
     }
 
     const now = new Date().toISOString();
@@ -3090,6 +4410,7 @@ async function manuallyRecoverUnattendedKeywordRun({requestId = '', mode = 'rema
       schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
       id: createUuid(),
       parentRequestId: current.id,
+      cloudCommandId: String(cloudCommandId || ''),
       attemptId: createUuid(),
       attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
       progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
@@ -3127,6 +4448,7 @@ async function manuallyRecoverUnattendedKeywordRun({requestId = '', mode = 'rema
         at: now,
       },
     });
+    await removeArchivedUnattendedKeywordRunRequest(current.id);
     return {
       accepted: true,
       reason: 'created',
@@ -3286,6 +4608,18 @@ async function handleUnattendedKeywordAlarm() {
       !isTerminalUnattendedRunStatus(existingRequest.status)
     ) {
       await superviseUnattendedKeywordRun({reason: 'schedule_alarm'});
+      if (existingRequest.cloudAssigned === true) {
+        const retryAt = new Date(
+          Date.now() + UNATTENDED_LOCK_RETRY_DELAY_MS,
+        ).toISOString();
+        await saveUnattendedKeywordPlan(
+          {
+            ...plan,
+            nextRunAt: retryAt,
+          },
+          {recomputeNext: false},
+        );
+      }
       return;
     }
 
@@ -3367,6 +4701,25 @@ async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}
   }
 
   const activeRequest = await readUnattendedKeywordRunRequest();
+  if (
+    activeRequest?.cloudAssigned === true &&
+    !isTerminalUnattendedRunStatus(activeRequest.status)
+  ) {
+    const nextRunAt = new Date(plan.nextRunAt).getTime();
+    if (!plan.nextRunAt || !Number.isFinite(nextRunAt) || nextRunAt <= Date.now()) {
+      return await saveUnattendedKeywordPlan(
+        {
+          ...plan,
+          nextRunAt: new Date(
+            Date.now() + UNATTENDED_LOCK_RETRY_DELAY_MS,
+          ).toISOString(),
+        },
+        {recomputeNext: false},
+      );
+    }
+    await syncUnattendedKeywordAlarm(plan);
+    return plan;
+  }
   if (await isUnattendedRunRequestActive(activeRequest)) {
     if (plan.nextRunAt) {
       return await saveUnattendedKeywordPlan(
@@ -4778,6 +6131,12 @@ async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
 }
 
 async function beginCaptureTask(message, sender) {
+  return await runCaptureTaskBeginOperation(() =>
+    beginCaptureTaskNow(message, sender),
+  );
+}
+
+async function beginCaptureTaskNow(message, sender) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
   const ownerRequired = request.ownerRequired === true;
@@ -4826,6 +6185,21 @@ async function beginCaptureTask(message, sender) {
       '旧无人值守运行页已失效，已忽略其浏览器接管请求',
     );
   }
+  if (beginAttemptFence.unattended && !beginAttemptFence.active) {
+    throw createCaptureTaskError(
+      'unattended_request_terminal',
+      '无人值守任务已结束，未启动浏览器接管',
+    );
+  }
+  if (
+    beginAttemptFence.unattended &&
+    !beginAttemptFence.hasUnattendedLock
+  ) {
+    throw createCaptureTaskError(
+      'unattended_capture_lock_missing',
+      '无人值守任务执行锁已失效，未启动浏览器接管',
+    );
+  }
 
   if (ownerRequired) {
     await requireConnectedCaptureTaskOwner(taskId);
@@ -4837,11 +6211,52 @@ async function beginCaptureTask(message, sender) {
     attemptId: request.attemptId,
     sender,
   });
-  await bindCaptureExecutionLockToTask(taskId, sourceTabId, {
-    allowUnattendedRebind: unattendedBegin?.unattended === true,
+  const boundExecutionLock = await bindCaptureExecutionLockToTask(
+    taskId,
+    sourceTabId,
+    {
+      allowUnattendedRebind: unattendedBegin?.unattended === true,
+      attemptId: request.attemptId,
+      expectedLockId: beginAttemptFence.lock?.id,
+      expectedHolderId: beginAttemptFence.lock?.holderId,
+      expectedHolderDocumentId:
+        beginAttemptFence.lock?.holderDocumentId,
+    },
+  );
+  if (
+    beginAttemptFence.unattended &&
+    (!boundExecutionLock ||
+      String(boundExecutionLock.owner || '') !== 'unattended_keyword_plan' ||
+      String(boundExecutionLock.captureTaskId || '').trim() !== taskId ||
+      String(boundExecutionLock.captureTaskAttemptId || '').trim() !==
+        String(request.attemptId || '').trim())
+  ) {
+    throw createCaptureTaskError(
+      'unattended_capture_lock_bind_failed',
+      '无人值守任务执行锁未能绑定，未启动浏览器接管',
+    );
+  }
+  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
+
+  const finalBeginAttemptFence = await inspectUnattendedCaptureTaskAttempt({
+    taskId,
     attemptId: request.attemptId,
   });
-  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
+  if (
+    finalBeginAttemptFence.unattended &&
+    (!finalBeginAttemptFence.current ||
+      !finalBeginAttemptFence.active ||
+      !finalBeginAttemptFence.lockMatchesTaskAttempt ||
+      !matchesUnattendedBeginLease(
+        finalBeginAttemptFence.lock,
+        boundExecutionLock,
+      ))
+  ) {
+    throw createCaptureTaskError(
+      'unattended_begin_fence_changed',
+      '无人值守任务状态已经变化，未启动浏览器接管',
+    );
+  }
 
   const existingSession =
     captureDebugSessionManager.getSessionByTaskId(taskId);
@@ -4957,6 +6372,26 @@ async function beginCaptureTask(message, sender) {
       await requireConnectedCaptureTaskOwner(taskId);
     }
     await writeRuntimeState({captureTaskCancellation: null});
+    const completedBeginAttemptFence =
+      await inspectUnattendedCaptureTaskAttempt({
+        taskId,
+        attemptId: request.attemptId,
+      });
+    if (
+      completedBeginAttemptFence.unattended &&
+      (!completedBeginAttemptFence.current ||
+        !completedBeginAttemptFence.active ||
+        !completedBeginAttemptFence.lockMatchesTaskAttempt ||
+        !matchesUnattendedBeginLease(
+          completedBeginAttemptFence.lock,
+          boundExecutionLock,
+        ))
+    ) {
+      throw createCaptureTaskError(
+        'unattended_begin_fence_changed',
+        '无人值守任务状态已经变化，已撤销浏览器接管',
+      );
+    }
     return {taskId, session, group};
   } catch (error) {
     if (session || group || existingSession || existingGroup) {
@@ -5458,43 +6893,85 @@ async function inspectUnattendedCaptureTaskAttempt({
 } = {}) {
   const normalizedTaskId = String(taskId || '').trim();
   const incomingAttemptId = String(attemptId || '').trim();
-  if (!normalizedTaskId) {
+  const stableIdentity = parseStableUnattendedCaptureTaskId(normalizedTaskId);
+  if (!stableIdentity.unattended) {
     return {unattended: false, current: true};
   }
   const [lock, request] = await Promise.all([
     readStoredCaptureExecutionLock(),
     readUnattendedKeywordRunRequest(),
   ]);
-  if (!request) {
-    return {unattended: false, current: true};
-  }
-  const stableTaskId = buildUnattendedCaptureTaskId(request.id);
-  if (!stableTaskId || normalizedTaskId !== stableTaskId) {
-    // Legacy unattended child ids remain compatible. Recovery explicitly
-    // releases them before the stable task is rebound.
-    return {unattended: false, current: true};
-  }
+  const requestMatches = Boolean(
+    request && String(request.id || '').trim() === stableIdentity.requestId,
+  );
+  const terminal = Boolean(
+    requestMatches && isTerminalUnattendedRunStatus(request.status),
+  );
+  const unattendedLock = Boolean(
+    lock && String(lock.owner || '') === 'unattended_keyword_plan',
+  );
   const boundAttemptId =
-    String(lock?.owner || '') === 'unattended_keyword_plan' &&
+    unattendedLock &&
     String(lock?.captureTaskId || '').trim() === normalizedTaskId
       ? String(lock?.captureTaskAttemptId || '').trim()
       : '';
   const currentAttemptId =
-    boundAttemptId || String(request.attemptId || '').trim();
+    boundAttemptId ||
+    (requestMatches ? String(request.attemptId || '').trim() : '');
+  const current = Boolean(
+    requestMatches &&
+      incomingAttemptId &&
+      currentAttemptId &&
+      incomingAttemptId === currentAttemptId
+  );
+  const lockMatchesTaskAttempt = Boolean(
+    unattendedLock &&
+      String(lock?.captureTaskId || '').trim() === normalizedTaskId &&
+      String(lock?.captureTaskAttemptId || '').trim() === incomingAttemptId
+  );
   return {
     unattended: true,
-    current: Boolean(
-      incomingAttemptId &&
-        currentAttemptId &&
-        incomingAttemptId === currentAttemptId
-    ),
+    current,
+    active: Boolean(current && !terminal),
+    terminal,
+    hasUnattendedLock: unattendedLock,
+    lockMatchesTaskAttempt,
+    lock,
     incomingAttemptId,
     currentAttemptId,
-    request,
+    request: requestMatches ? request : null,
+    requestId: stableIdentity.requestId,
   };
 }
 
-async function clearUnattendedCaptureTaskLockBinding(lockId, taskId) {
+function matchesUnattendedBeginLease(actualLock, expectedLock) {
+  return Boolean(
+    actualLock &&
+      expectedLock &&
+      String(actualLock.id || '') === String(expectedLock.id || '') &&
+      String(actualLock.owner || '') === String(expectedLock.owner || '') &&
+      String(actualLock.holderId || '') ===
+        String(expectedLock.holderId || '') &&
+      String(actualLock.holderDocumentId || '') ===
+        String(expectedLock.holderDocumentId || '') &&
+      resolveCaptureTaskTabId(actualLock.holderTabId) ===
+        resolveCaptureTaskTabId(expectedLock.holderTabId) &&
+      String(actualLock.captureTaskId || '').trim() ===
+        String(expectedLock.captureTaskId || '').trim() &&
+      String(actualLock.captureTaskAttemptId || '').trim() ===
+        String(expectedLock.captureTaskAttemptId || '').trim()
+  );
+}
+
+async function clearUnattendedCaptureTaskLockBinding(
+  lockId,
+  taskId,
+  {
+    expectedHolderId = '',
+    expectedHolderDocumentId = '',
+    expectedHolderTabId = null,
+  } = {},
+) {
   const normalizedLockId = String(lockId || '').trim();
   const normalizedTaskId = String(taskId || '').trim();
   if (!normalizedLockId || !normalizedTaskId) return false;
@@ -5510,7 +6987,15 @@ async function clearUnattendedCaptureTaskLockBinding(lockId, taskId) {
       !lock ||
       lock.id !== normalizedLockId ||
       String(lock.owner || '') !== 'unattended_keyword_plan' ||
-      String(lock.captureTaskId || '').trim() !== normalizedTaskId
+      String(lock.captureTaskId || '').trim() !== normalizedTaskId ||
+      (expectedHolderId &&
+        String(lock.holderId || '') !== String(expectedHolderId)) ||
+      (expectedHolderDocumentId &&
+        String(lock.holderDocumentId || '') !==
+          String(expectedHolderDocumentId)) ||
+      (resolveCaptureTaskTabId(expectedHolderTabId) &&
+        resolveCaptureTaskTabId(lock.holderTabId) !==
+          resolveCaptureTaskTabId(expectedHolderTabId))
     ) {
       return false;
     }
@@ -5548,7 +7033,11 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   } else {
     captureTaskOwnerCoordinator?.clearTask(taskId);
   }
-  await clearUnattendedCaptureTaskLockBinding(lock.id, taskId);
+  await clearUnattendedCaptureTaskLockBinding(lock.id, taskId, {
+    expectedHolderId: lock?.holderId,
+    expectedHolderDocumentId: lock?.holderDocumentId,
+    expectedHolderTabId: lock?.holderTabId,
+  });
 
   // 0.3.43 及更早版本为每次 runner 生成随机 child task。只收口这类
   // 旧记录；新版使用同一 request 的稳定 taskId，恢复后仍是同一项任务。
@@ -5589,6 +7078,60 @@ function readUnattendedRequestIdFromSender(sender = null) {
     }
   }
   return '';
+}
+
+async function assertUnattendedBeginCleanupFence({
+  expectedLock = null,
+  requestId = '',
+  attemptId = '',
+} = {}) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  return await runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.captureExecutionLock,
+      STORAGE_KEYS.unattendedKeywordRunRequest,
+    ]);
+    const lock = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    const request = normalizeUnattendedRunRequest(
+      stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+    );
+    const expectedHolderTabId = resolveCaptureTaskTabId(
+      expectedLock?.holderTabId,
+    );
+    const holderSnapshotMatches = Boolean(
+      lock &&
+        expectedLock &&
+        String(lock.owner || '') === 'unattended_keyword_plan' &&
+        lock.id === String(expectedLock.id || '') &&
+        String(lock.holderId || '') ===
+          String(expectedLock.holderId || '') &&
+        String(lock.holderDocumentId || '') ===
+          String(expectedLock.holderDocumentId || '') &&
+        resolveCaptureTaskTabId(lock.holderTabId) === expectedHolderTabId &&
+        String(lock.captureTaskId || '').trim() ===
+          String(expectedLock.captureTaskId || '').trim() &&
+        String(lock.captureTaskAttemptId || '').trim() ===
+          String(expectedLock.captureTaskAttemptId || '').trim()
+    );
+    const requestSnapshotMatches = Boolean(
+      request &&
+        String(request.id || '').trim() === normalizedRequestId &&
+        (!normalizedAttemptId ||
+          String(request.attemptId || '').trim() === normalizedAttemptId) &&
+        !isTerminalUnattendedRunStatus(request.status)
+    );
+    if (!holderSnapshotMatches || !requestSnapshotMatches) {
+      throw createCaptureTaskError(
+        'unattended_runner_mismatch',
+        '无人值守运行页凭证已更换，已忽略旧页面的浏览器接管请求',
+      );
+    }
+    return {lock, request};
+  });
 }
 
 async function reclaimSupersededUnattendedCaptureTaskForBegin({
@@ -5634,7 +7177,13 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
       '旧无人值守运行页已失效，已忽略其浏览器接管请求',
     );
   }
-  if (!authorizedRunner && normalizedTaskId !== stableTaskId) {
+  if (!authorizedRunner) {
+    if (normalizedTaskId === stableTaskId) {
+      throw createCaptureTaskError(
+        'unattended_runner_mismatch',
+        '无人值守运行页凭证已更换，已忽略旧页面的浏览器接管请求',
+      );
+    }
     return {unattended: false, reclaimed: false};
   }
 
@@ -5673,11 +7222,16 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
       groupSourceChanged ||
       residualCleanupPending)
   ) {
+    const cleanupFence = await assertUnattendedBeginCleanupFence({
+      expectedLock: lock,
+      requestId: request.id,
+      attemptId,
+    });
     await releaseUnattendedCaptureTaskResourcesForRecovery(
-      {...lock, captureTaskId: recoveryTaskId},
+      {...cleanupFence.lock, captureTaskId: recoveryTaskId},
       {
         reason: 'unattended_runner_rebound',
-        request,
+        request: cleanupFence.request,
       },
     );
   }
@@ -6146,6 +7700,11 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
   syncUnattendedSupervisorAlarm().catch((error) => {
     console.error('[onstarvoice] failed to sync unattended supervisor on install', error);
   });
+  syncCloudTaskAgentAlarm()
+    .then(() => syncCloudTaskAgent({reason: 'extension_installed', force: true}))
+    .catch((error) => {
+      console.error('[onstarvoice] failed to initialize cloud task agent on install', error);
+    });
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -6163,9 +7722,20 @@ chrome.runtime.onStartup.addListener(() => {
     .catch((error) => {
       console.error('[onstarvoice] failed to sync unattended alarm on startup', error);
     });
+  syncCloudTaskAgentAlarm()
+    .then(() => syncCloudTaskAgent({reason: 'browser_startup', force: true}))
+    .catch((error) => {
+      console.error('[onstarvoice] failed to initialize cloud task agent on startup', error);
+    });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm?.name === CLOUD_TASK_AGENT_ALARM_NAME) {
+    syncCloudTaskAgent({reason: 'cloud_agent_alarm', force: true}).catch((error) => {
+      console.error('[onstarvoice] cloud task agent heartbeat failed', error);
+    });
+    return;
+  }
   if (alarm?.name === UNATTENDED_SUPERVISOR_ALARM_NAME) {
     superviseUnattendedKeywordRun({
       reason: 'supervisor_alarm',
@@ -6180,6 +7750,33 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       console.error('[onstarvoice] unattended keyword alarm failed', error);
     });
   }
+});
+
+chrome.storage.onChanged?.addListener?.((changes, areaName) => {
+  if (areaName !== 'local' || !changes[STORAGE_KEYS.auth]) return;
+  const previousAgentId = String(
+    changes[STORAGE_KEYS.auth]?.oldValue?.captureAgent?.id || '',
+  );
+  const nextAgentId = String(
+    changes[STORAGE_KEYS.auth]?.newValue?.captureAgent?.id || '',
+  );
+  const previousToken = String(
+    changes[STORAGE_KEYS.auth]?.oldValue?.captureAgent?.token || '',
+  );
+  const nextToken = String(
+    changes[STORAGE_KEYS.auth]?.newValue?.captureAgent?.token || '',
+  );
+  if (
+    !nextAgentId ||
+    !nextToken ||
+    (nextAgentId === previousAgentId && nextToken === previousToken)
+  ) return;
+  clearCloudTaskAgentFailureBackoff();
+  syncCloudTaskAgent({reason: 'agent_credential_updated', force: true}).catch(
+    (error) => {
+      console.error('[onstarvoice] cloud task agent credential sync failed', error);
+    },
+  );
 });
 
 chrome.action.onClicked.addListener((tab) => {
@@ -6411,8 +8008,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      if (type === 'onstarvoice:get-unattended-keyword-run-state') {
+        const request = await readUnattendedKeywordRunRequest();
+        sendResponse({ok: true, data: request});
+        return;
+      }
+
       if (type === 'onstarvoice:save-unattended-keyword-plan') {
-        const plan = await saveUnattendedKeywordPlan(message?.plan || {});
+        const plan = await saveUnattendedKeywordPlan(message?.plan || {}, {
+          confirmCloudScope: true,
+        });
         sendResponse({ ok: true, data: plan });
         return;
       }
@@ -6467,85 +8072,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (type === 'onstarvoice:cancel-unattended-keyword-run') {
         const reason =
           String(message?.message || '').trim() ||
-          '用户手动中止无人值守计划';
-        const request = await readUnattendedKeywordRunRequest();
-        const requestedId = String(message?.requestId || '').trim();
-        if (requestedId && request?.id !== requestedId) {
-          sendResponse({
-            ok: false,
-            data: null,
-            accepted: false,
-            reason: 'request_mismatch',
-          });
-          return;
-        }
-        if (
-          request &&
-          isTerminalUnattendedRunStatus(request.status) &&
-          request.status !== 'needs_action'
-        ) {
-          sendResponse({
-            ok: true,
-            accepted: true,
-            reason: 'already_terminal',
-            data: {
-              request,
-              plan: await readUnattendedKeywordPlan(),
-              relayedCount: 0,
-            },
-          });
-          return;
-        }
-        const progress = normalizeUnattendedRunProgress(
-          request?.progress,
-          request?.message,
-        );
-        const explicitTabId = Number(message?.tabId);
-        const progressRunnerTabId = Number(progress?.runnerTabId);
-        // 必须在把请求改成 canceled 之前捕获旧锁；锁的 holderTabId 是列表
-        // 导航/初始采集阶段唯一可靠的平台页身份。
-        const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
-        const canceledRequest = await cancelUnattendedKeywordRunRequest(reason, {
-          requestId: requestedId,
+          '用户手动中止当前采集任务';
+        const result = await cancelUnattendedKeywordRunFromControl({
+          requestId: String(message?.requestId || '').trim(),
+          message: reason,
+          tabId: message?.tabId,
         });
-        if (!canceledRequest) {
-          sendResponse({
-            ok: false,
-            data: request || null,
-            accepted: false,
-            reason: isTerminalUnattendedRunStatus(request?.status)
-              ? 'terminal'
-              : 'request_mismatch',
-          });
-          return;
-        }
-        const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
-          lockSnapshot,
-          [explicitTabId, progressRunnerTabId],
-        );
-
-        const now = new Date();
-        const plan = await readUnattendedKeywordPlan();
-        const nextPlan = await saveUnattendedKeywordPlan(
-          {
-            ...plan,
-            lastRunAt: now.toISOString(),
-            lastRunStatus: 'canceled',
-            lastRunMessage: reason,
-            lastRunProgress: progress,
-            nextRunAt: '',
-          },
-          { recomputeNext: true, from: buildScheduleReferenceAfterDate(now) },
-        );
-
         sendResponse({
-          ok: true,
-          accepted: true,
-          reason: 'canceled',
+          ok: result.accepted,
+          accepted: result.accepted,
+          reason: result.reason,
           data: {
-            request: canceledRequest,
-            plan: nextPlan,
-            relayedCount,
+            request: result.request,
+            plan: result.plan,
+            relayedCount: result.relayedCount,
           },
         });
         return;

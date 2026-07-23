@@ -2,6 +2,9 @@ import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { sendXlsx, fmtTs } from '../services/xlsx-export.js';
+import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifecycle.js';
+import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
+import { formatPublishDate } from '../services/publish-date.js';
 
 const router = Router();
 
@@ -35,6 +38,11 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
     }
     const priority = PRIORITIES.has(String(req.body?.priority)) ? String(req.body.priority) : '';
     const dispatchNote = String(req.body?.note || '');
+    if (sourceType === 'content') {
+      const lifecycle = await getRecordLifecycle({ tenantId: req.tenantId, recordId: sourceId });
+      if (!lifecycle) return res.status(404).json({ ok: false, error: 'not_found', message: '来源不存在' });
+      if (lifecycle.archived_at) return sendRecordArchived(res, [sourceId]);
+    }
 
     // 指派:优先用 assigneeUserId(下拉选人),校验是本租户在职成员后反查姓名作快照
     let assigneeUserId = String(req.body?.assigneeUserId || '').trim() || null;
@@ -84,7 +92,17 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
     }
     if (!snap) return res.status(404).json({ ok: false, error: 'not_found', message: '来源不存在' });
 
-    const ticket = await withTransaction(async (tx) => {
+    const ticketResult = await withTransaction(async (tx) => {
+      if (sourceType === 'content') {
+        const lifecycle = await getRecordLifecycle({
+          tenantId: req.tenantId,
+          recordId: sourceId,
+          tx,
+          lock: true,
+        });
+        if (!lifecycle) return { notFound: true };
+        if (lifecycle.archived_at) return { archived: true };
+      }
       const row = await tx.queryOne(
         `INSERT INTO tickets (
            tenant_id, source_type, source_record_id, source_comment_id,
@@ -105,6 +123,11 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
       );
       // 把源移出分诊队列:内容与评论统一标记为 ticketed(已转工单)
       if (sourceType === 'content') {
+        const previousTriage = await tx.queryOne(
+          `SELECT COALESCE(status, 'unhandled') AS status
+           FROM record_triage WHERE tenant_id = $1 AND record_id = $2`,
+          [req.tenantId, sourceId],
+        );
         await tx.execute(
           `INSERT INTO record_triage (tenant_id, record_id, status, owner_user_id, owner_name, updated_at)
            VALUES ($1, $2, 'ticketed', $3, $4, now())
@@ -112,6 +135,25 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
            DO UPDATE SET status = 'ticketed', updated_at = now()`,
           [req.tenantId, sourceId, req.user?.id || null, req.user?.name || req.user?.email || ''],
         );
+        await tx.execute(`
+          INSERT INTO audit_logs (
+            tenant_id, actor_type, actor_id, actor_user_id,
+            action, target_type, target_id, metadata
+          ) VALUES ($1, 'user', $2, $3, 'record.ticket_created', 'record', $4, $5::jsonb)
+        `, [
+          req.tenantId,
+          req.user?.id || '',
+          req.user?.id || null,
+          sourceId,
+          JSON.stringify({
+            ticketId: row.id,
+            previousStatus: previousTriage?.status || 'unhandled',
+            nextStatus: 'ticketed',
+            priority: row.priority,
+            assigneeName: row.assignee_name,
+            note: dispatchNote,
+          }),
+        ]);
       } else {
         await tx.execute(
           `UPDATE comment_leads SET status = 'ticketed', updated_at = now()
@@ -119,10 +161,12 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           [sourceId, req.tenantId],
         );
       }
-      return row;
+      return { ticket: row };
     });
 
-    return res.json({ ok: true, ticket });
+    if (ticketResult.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '来源不存在' });
+    if (ticketResult.archived) return sendRecordArchived(res, [sourceId]);
+    return res.json({ ok: true, ticket: ticketResult.ticket });
   } catch (err) { return next(err); }
 });
 
@@ -194,8 +238,17 @@ router.get('/dispatched', requireTenantAccess, async (req, res, next) => {
     params.push(pageSize, (page - 1) * pageSize);
     const items = await queryAll(
       `SELECT ${TICKET_COLUMNS},
-         (SELECT COUNT(*)::int FROM ticket_notes tn WHERE tn.ticket_id = tickets.id) AS notes_count,
-         (SELECT tn.body FROM ticket_notes tn WHERE tn.ticket_id = tickets.id ORDER BY tn.created_at DESC LIMIT 1) AS latest_note
+         (SELECT COUNT(*)::int FROM ticket_notes tn
+          WHERE tn.ticket_id = tickets.id AND tn.tenant_id = tickets.tenant_id) AS notes_count,
+         (SELECT tn.body FROM ticket_notes tn
+          WHERE tn.ticket_id = tickets.id AND tn.tenant_id = tickets.tenant_id
+          ORDER BY tn.created_at DESC, tn.id DESC LIMIT 1) AS latest_note,
+         (SELECT tn.author_name FROM ticket_notes tn
+          WHERE tn.ticket_id = tickets.id AND tn.tenant_id = tickets.tenant_id
+          ORDER BY tn.created_at DESC, tn.id DESC LIMIT 1) AS latest_note_author,
+         (SELECT tn.created_at FROM ticket_notes tn
+          WHERE tn.ticket_id = tickets.id AND tn.tenant_id = tickets.tenant_id
+          ORDER BY tn.created_at DESC, tn.id DESC LIMIT 1) AS latest_note_at
        FROM tickets ${where}
        ORDER BY (feedback_status = 'pending_review') DESC,
          CASE status WHEN 'doing' THEN 1 WHEN 'pending' THEN 2 WHEN 'done' THEN 3 ELSE 4 END,
@@ -230,11 +283,16 @@ router.get('/export', requireTenantAccess, async (req, res, next) => {
     const notesByTicket = {};
     if (ids.length) {
       const allNotes = await queryAll(
-        `SELECT ticket_id, author_name, body, created_at FROM ticket_notes
-         WHERE ticket_id = ANY($1::uuid[]) ORDER BY created_at ASC`,
-        [ids],
+        `SELECT ticket_id, event_type, author_name, body, created_at FROM ticket_notes
+         WHERE ticket_id = ANY($1::uuid[]) AND tenant_id = $2 ORDER BY created_at ASC`,
+        [ids, req.tenantId],
       );
-      for (const n of allNotes) (notesByTicket[n.ticket_id] ||= []).push(`${fmtTs(n.created_at)} ${n.author_name || ''}：${n.body}`);
+      const eventLabel = { note: '过程备注', closed: '结案', reopened: '重开' };
+      for (const n of allNotes) {
+        const label = eventLabel[n.event_type] || '过程记录';
+        const body = n.body ? `：${n.body}` : '';
+        (notesByTicket[n.ticket_id] ||= []).push(`${fmtTs(n.created_at)} ${n.author_name || ''} ${label}${body}`);
+      }
     }
     const STATUS_CN = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已结案' };
     const PRIORITY_CN = { urgent: '紧急', high: '高', normal: '普通', low: '低' };
@@ -320,32 +378,45 @@ router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
     }
 
     let record = null;
-    let negativeComments = [];
+    let comments = [];
+    let officialResponses = [];
+    let observations = [];
     if (recordId) {
       record = await queryOne(
-        `SELECT id, platform, title, content, author_name, author_fans, blogger_profile_url, url, cover_url,
-                sentiment, category, ai_summary, ai_result, negative_comment_count,
-                likes, comments_count, collects, shares, publish_time, first_seen_at, last_seen_at, seen_count
+        `SELECT id, platform, record_type, title, content, author_name, author_fans, blogger_profile_url,
+                url, cover_url, cover_local, image_urls, image_local_urls, note_type, video_url,
+                sentiment, category, source_type, identity_override, ai_summary, ai_result,
+                negative_comment_count, latest_negative_comment_at, official_response_status,
+                likes, comments_count, collects, shares, publish_time, publish_location, keyword,
+                first_seen_at, last_seen_at, seen_count, created_at
          FROM records WHERE id = $1 AND tenant_id = $2`,
         [recordId, req.tenantId],
       );
-      if (ticket.source_type === 'content') {
-        negativeComments = await queryAll(
-          `SELECT content, author_name, ip_location, sentiment, ai_summary, like_count
-           FROM record_comments
-           WHERE record_id = $1 AND tenant_id = $2 AND is_negative = true AND is_official = false
-           ORDER BY last_seen_at DESC LIMIT 6`,
-          [recordId, req.tenantId],
-        );
+      if (record) {
+        record.publish_display = formatPublishDate(record.publish_time, record.created_at);
+        [comments, officialResponses, observations] = await Promise.all([
+          getRecordComments(req.tenantId, recordId),
+          getOfficialResponses(req.tenantId, recordId),
+          queryAll(
+            `SELECT id, likes, comments_count, collects, shares, captured_at
+             FROM record_observations
+             WHERE record_id = $1 AND tenant_id = $2
+             ORDER BY captured_at DESC LIMIT 20`,
+            [recordId, req.tenantId],
+          ),
+        ]);
+        comments.forEach(item => {
+          item.publish_display = formatPublishDate(item.published_at, item.created_at);
+        });
       }
     }
-    // 过程备注(就地处理留痕),按时间正序
+    // 过程记录(备注 / 结案 / 重开),按时间正序
     const notes = await queryAll(
-      `SELECT id, body, author_name, created_at FROM ticket_notes
+      `SELECT id, event_type, body, author_name, created_at FROM ticket_notes
        WHERE ticket_id = $1 AND tenant_id = $2 ORDER BY created_at ASC`,
       [req.params.id, req.tenantId],
     );
-    return res.json({ ok: true, record, comment, negativeComments, notes });
+    return res.json({ ok: true, record, comment, comments, officialResponses, observations, notes });
   } catch (err) { return next(err); }
 });
 
@@ -354,32 +425,41 @@ router.post('/:id/notes', requireTenantAccess, requireTenantWriter, async (req, 
   try {
     const body = String(req.body?.body || '').trim();
     if (!body) return res.status(400).json({ ok: false, error: 'empty_body', message: '备注内容不能为空' });
+    if (body.length > 2000) return res.status(400).json({ ok: false, error: 'body_too_long', message: '备注最多 2000 个字符' });
     const actor = req.user?.name || req.user?.email || '';
     const actorId = req.user?.id || null;
 
-    // 工单必须属于本租户
-    const ticket = await queryOne(
-      `SELECT id, status FROM tickets WHERE id = $1 AND tenant_id = $2`,
-      [req.params.id, req.tenantId],
-    );
-    if (!ticket) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
-
-    const note = await queryOne(
-      `INSERT INTO ticket_notes (tenant_id, ticket_id, body, author_user_id, author_name)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, body, author_name, created_at`,
-      [req.tenantId, req.params.id, body, actorId, actor],
-    );
-
-    // 首次留痕即视为开始处理:pending → doing
-    if (ticket.status === 'pending') {
-      await queryOne(
-        `UPDATE tickets SET status = 'doing', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
+    const result = await withTransaction(async tx => {
+      // 与结案动作串行化，避免状态检查后、写入前被另一请求结案。
+      const ticket = await tx.queryOne(
+        `SELECT id, status FROM tickets WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
         [req.params.id, req.tenantId],
       );
-    }
+      if (!ticket) return { notFound: true };
+      if (ticket.status === 'closed') return { closed: true };
 
-    return res.json({ ok: true, note });
+      const note = await tx.queryOne(
+        `INSERT INTO ticket_notes (tenant_id, ticket_id, event_type, body, author_user_id, author_name)
+         VALUES ($1, $2, 'note', $3, $4, $5)
+         RETURNING id, event_type, body, author_name, created_at`,
+        [req.tenantId, req.params.id, body, actorId, actor],
+      );
+
+      // 首次留痕即视为开始处理:pending → doing
+      if (ticket.status === 'pending') {
+        await tx.execute(
+          `UPDATE tickets SET status = 'doing', updated_at = now() WHERE id = $1 AND tenant_id = $2`,
+          [req.params.id, req.tenantId],
+        );
+      }
+      return { note };
+    });
+
+    if (result.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
+    if (result.closed) {
+      return res.status(409).json({ ok: false, error: 'ticket_closed', message: '工单已结案，请重开后再添加进展' });
+    }
+    return res.json({ ok: true, note: result.note });
   } catch (err) { return next(err); }
 });
 
@@ -420,20 +500,92 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
               updated_at = now()`,
         params: [note, result, actorId, actor, actorId, actor],
       };
+    } else if (action === 'reopen') {
+      // 重开后恢复为处理中。上一次结案会先固化到 ticket_notes,再清空当前结案快照。
+      sets = {
+        sql: `status = 'doing', feedback_status = 'reopened',
+              review_note = COALESCE($P, ''),
+              handle_result = '', handle_note = '',
+              handled_by_user_id = NULL, handled_by_name = '', handled_at = NULL,
+              reviewed_by_user_id = NULL, reviewed_by_name = '', reviewed_at = NULL,
+              updated_at = now()`,
+        params: [note],
+      };
     } else {
       return res.status(400).json({ ok: false, error: 'invalid_action', message: '动作无效' });
     }
 
-    // 把 $P 占位替换为 $1..$n
-    const vals = [...sets.params, req.params.id, req.tenantId];
-    let i = 0;
-    const setSql = sets.sql.replace(/\$P/g, () => `$${++i}`);
-    const row = await queryOne(
-      `UPDATE tickets SET ${setSql} WHERE id = $${i + 1} AND tenant_id = $${i + 2} RETURNING ${TICKET_COLUMNS}`,
-      vals,
-    );
-    if (!row) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
-    return res.json({ ok: true, ticket: row });
+    const outcome = await withTransaction(async tx => {
+      const current = await tx.queryOne(
+        `SELECT ${TICKET_COLUMNS}, handled_by_user_id, reviewed_by_user_id
+         FROM tickets WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+        [req.params.id, req.tenantId],
+      );
+      if (!current) return { notFound: true };
+      if (action === 'reopen' && current.status !== 'closed') return { invalidState: 'not_closed' };
+      if (action !== 'reopen' && current.status === 'closed') return { invalidState: 'closed' };
+
+      // 兼容迁移前已经结案的工单:首次重开时补一条历史结案事件,避免清空快照后丢记录。
+      if (action === 'reopen') {
+        const closeEvent = await tx.queryOne(
+          `SELECT id FROM ticket_notes
+           WHERE ticket_id = $1 AND tenant_id = $2 AND event_type = 'closed'
+           ORDER BY created_at DESC LIMIT 1`,
+          [req.params.id, req.tenantId],
+        );
+        if (!closeEvent) {
+          const closeBody = current.handle_note || (current.handle_result === '已结案' ? '' : current.handle_result) || '';
+          await tx.queryOne(
+            `INSERT INTO ticket_notes (
+               tenant_id, ticket_id, event_type, body, author_user_id, author_name, created_at
+             ) VALUES ($1, $2, 'closed', $3, $4, $5, COALESCE($6::timestamptz, now()))
+             RETURNING id`,
+            [
+              req.tenantId,
+              req.params.id,
+              closeBody,
+              current.reviewed_by_user_id || current.handled_by_user_id || null,
+              current.reviewed_by_name || current.handled_by_name || '',
+              current.reviewed_at || current.handled_at || current.updated_at || null,
+            ],
+          );
+        }
+      }
+
+      // 把 $P 占位替换为 $1..$n
+      const vals = [...sets.params, req.params.id, req.tenantId];
+      let i = 0;
+      const setSql = sets.sql.replace(/\$P/g, () => `$${++i}`);
+      const row = await tx.queryOne(
+        `UPDATE tickets SET ${setSql}
+         WHERE id = $${i + 1} AND tenant_id = $${i + 2}
+         RETURNING ${TICKET_COLUMNS}`,
+        vals,
+      );
+
+      if (action === 'close' || action === 'reopen') {
+        const eventType = action === 'close' ? 'closed' : 'reopened';
+        const eventBody = action === 'close'
+          ? (note || (result && result !== '已结案' ? result : '') || '')
+          : (note || '');
+        await tx.queryOne(
+          `INSERT INTO ticket_notes (tenant_id, ticket_id, event_type, body, author_user_id, author_name)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id`,
+          [req.tenantId, req.params.id, eventType, eventBody, actorId, actor],
+        );
+      }
+      return { row };
+    });
+
+    if (outcome.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
+    if (outcome.invalidState === 'not_closed') {
+      return res.status(409).json({ ok: false, error: 'ticket_not_closed', message: '只有已结案工单可以重开' });
+    }
+    if (outcome.invalidState === 'closed') {
+      return res.status(409).json({ ok: false, error: 'ticket_closed', message: '工单已结案，请先重开' });
+    }
+    return res.json({ ok: true, ticket: outcome.row });
   } catch (err) { return next(err); }
 });
 

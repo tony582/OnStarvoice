@@ -1,0 +1,1338 @@
+import crypto from 'crypto';
+import { Router } from 'express';
+import { queryAll, queryOne, withTransaction } from '../db/init.js';
+import {
+  requireSessionUser,
+  requireTenantAccess,
+  requireTenantWriter,
+} from '../middleware/auth.js';
+import {
+  captureAgentOnline,
+  normalizeCaptureAgentPlatforms,
+  normalizeRemoteTaskInput,
+} from '../services/capture-cloud.js';
+import {
+  allocateKeywordWorkItems,
+  hashOrchestrationRequest,
+  normalizeOrchestrationRequest,
+} from '../services/capture-orchestration.js';
+
+const router = Router();
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
+
+function text(value, limit = 1000) {
+  const normalized = String(value ?? '').trim();
+  return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+}
+
+function safeJson(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function normalizedUuid(value) {
+  const candidate = text(value, 100).toLowerCase();
+  return UUID_PATTERN.test(candidate) ? candidate : '';
+}
+
+function orchestrationRouteId(req, res) {
+  const orchestrationId = normalizedUuid(req.params.id);
+  if (orchestrationId) return orchestrationId;
+  sendRequestError(res, requestError(
+    'invalid_orchestration_id',
+    '编排任务 ID 必须是有效 UUID',
+  ));
+  return '';
+}
+
+function keywordItemKey(keyword, ordinal) {
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(String(keyword || ''))
+    .digest('hex')
+    .slice(0, 12);
+  return `keyword:${String(ordinal + 1).padStart(4, '0')}:${fingerprint}`;
+}
+
+function requestError(error, message, status = 400, details = {}) {
+  return {error, message, status, details};
+}
+
+function sendRequestError(res, failure) {
+  return res.status(failure.status || 400).json({
+    ok: false,
+    error: failure.error,
+    message: failure.message,
+    ...safeJson(failure.details),
+  });
+}
+
+function normalizedAgentIds(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return {failure: requestError(
+      'agent_ids_required',
+      '请至少选择一个执行节点',
+    )};
+  }
+  const agentIds = [];
+  const seen = new Set();
+  for (const rawAgentId of value) {
+    const agentId = normalizedUuid(rawAgentId);
+    if (!agentId) {
+      return {failure: requestError(
+        'invalid_agent_id',
+        '执行节点 ID 必须是有效 UUID',
+      )};
+    }
+    if (seen.has(agentId)) {
+      return {failure: requestError(
+        'duplicate_agent_id',
+        '同一个执行节点不能重复选择',
+      )};
+    }
+    seen.add(agentId);
+    agentIds.push(agentId);
+  }
+  if (agentIds.length > 50) {
+    return {failure: requestError(
+      'too_many_agents',
+      '一次最多选择 50 个执行节点',
+    )};
+  }
+  return {agentIds};
+}
+
+function normalizeCreateRequest(body) {
+  try {
+    const normalized = normalizeOrchestrationRequest({
+      ...safeJson(body),
+      requestKey: body?.requestKey || body?.clientTaskId,
+      executionMode: 'one_time',
+    });
+    const requestKey = normalizedUuid(normalized.requestKey);
+    if (!requestKey) {
+      return {failure: requestError(
+        'invalid_request_key',
+        'requestKey 必须是有效 UUID',
+      )};
+    }
+    const remoteTaskInput = normalizeRemoteTaskInput({
+      clientTaskId: requestKey,
+      title: normalized.title,
+      executionMode: 'one_time',
+      planSnapshot: {
+        ...safeJson(normalized.taskInput),
+        platform: normalized.platform,
+        // normalizeRemoteTaskInput is also the child-command contract and is
+        // intentionally capped at 30 keywords. Normalize the shared plan
+        // options here, then restore the complete parent list below.
+        keywords: normalized.keywords.slice(0, 30),
+      },
+    });
+    if (!SUPPORTED_PLATFORMS.has(remoteTaskInput.planSnapshot.platform)) {
+      return {failure: requestError(
+        'unsupported_platform',
+        '编排任务当前只支持小红书和抖音',
+      )};
+    }
+    if (remoteTaskInput.planSnapshot.keywords.length === 0) {
+      return {failure: requestError(
+        'keywords_required',
+        '请至少填写一个关键词',
+      )};
+    }
+    const request = {
+      ...normalized,
+      requestKey,
+      executionMode: 'one_time',
+      platform: normalized.platform,
+      keywords: normalized.keywords,
+      title: remoteTaskInput.title,
+      taskInput: {
+        ...remoteTaskInput,
+        planSnapshot: {
+          ...remoteTaskInput.planSnapshot,
+          keywords: normalized.keywords,
+        },
+      },
+    };
+    return {request, requestHash: hashOrchestrationRequest(request)};
+  } catch (error) {
+    return {failure: requestError(
+      text(error?.code, 120) || 'invalid_orchestration_request',
+      text(error?.message, 1000) || '任务参数不完整或格式无效',
+    )};
+  }
+}
+
+async function appendEvent(tx, {
+  tenantId,
+  taskId,
+  agentId = null,
+  eventType,
+  actorId = '',
+  actorName = '',
+  status = '',
+  message = '',
+  payload = {},
+}) {
+  await tx.execute(`
+    INSERT INTO capture_task_events (
+      tenant_id, task_id, agent_id, event_type,
+      actor_type, actor_id, actor_name, status, message, payload
+    ) VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9::jsonb)
+  `, [
+    tenantId,
+    taskId,
+    agentId,
+    eventType,
+    text(actorId, 240),
+    text(actorName, 240),
+    text(status, 80),
+    text(message, 2000),
+    JSON.stringify(safeJson(payload)),
+  ]);
+}
+
+function publicAgent(agent) {
+  return {
+    id: agent.id,
+    display_name: agent.display_name,
+    host_label: agent.host_label,
+    browser_name: agent.browser_name,
+    operating_system: agent.operating_system,
+    app_version: agent.app_version,
+    allowed_platforms: agent.allowed_platforms,
+    capabilities: agent.capabilities,
+    status: agent.status,
+    last_heartbeat_at: agent.last_heartbeat_at,
+    online: captureAgentOnline(agent.last_heartbeat_at),
+  };
+}
+
+function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
+  if (
+    agent.tenant_status !== 'active' ||
+    agent.status !== 'active' ||
+    agent.auth_code_status !== 'active' ||
+    !agent.active_auth_binding_id ||
+    (
+      agent.auth_code_expires_at &&
+      new Date(agent.auth_code_expires_at) < new Date()
+    )
+  ) {
+    return {
+      code: 'agent_unavailable',
+      message: '目标节点授权已失效、已停用或不存在',
+    };
+  }
+  const capabilities = safeJson(agent.capabilities);
+  if (capabilities.remoteTaskCreate !== true) {
+    return {
+      code: 'agent_capability_missing',
+      message: '目标节点版本尚不支持云端创建任务，请先更新扩展',
+    };
+  }
+  if (
+    Object.hasOwn(planSnapshot, 'keywordMaxDetectedItems') &&
+    capabilities.remoteTaskKeywordPostLimit !== true
+  ) {
+    return {
+      code: 'agent_keyword_limit_capability_missing',
+      message: '目标节点版本尚不支持指定帖子采集数量',
+    };
+  }
+  if (
+    Object.keys(safeJson(planSnapshot.captureSettings)).length > 0 &&
+    capabilities.remoteTaskEnhancementOptions !== true
+  ) {
+    return {
+      code: 'agent_enhancement_capability_missing',
+      message: '目标节点版本尚不支持远程任务增强选项',
+    };
+  }
+  const allowedPlatforms = Array.isArray(agent.allowed_platforms)
+    ? agent.allowed_platforms
+    : [];
+  if (allowedPlatforms.length > 0 && !allowedPlatforms.includes(platform)) {
+    return {
+      code: 'agent_platform_mismatch',
+      message: '目标节点未配置负责该任务平台',
+    };
+  }
+  const supportedPlatforms = normalizeCaptureAgentPlatforms(
+    capabilities.supportedPlatforms,
+  );
+  if (
+    supportedPlatforms.length > 0 &&
+    !supportedPlatforms.includes(platform)
+  ) {
+    return {
+      code: 'agent_platform_unsupported',
+      message: '目标节点当前版本不支持该任务平台',
+    };
+  }
+  return null;
+}
+
+async function loadCompatibleAgents(
+  executor,
+  tenantId,
+  agentIds,
+  platform,
+  planSnapshot,
+  {lock = false} = {},
+) {
+  const orderedForLock = lock
+    ? [...agentIds].sort((left, right) => left.localeCompare(right))
+    : agentIds;
+  const agents = await executor.queryAll(`
+    SELECT ca.*,
+      tenant.status AS tenant_status,
+      ac.status AS auth_code_status,
+      ac.expires_at AS auth_code_expires_at,
+      ab.id AS active_auth_binding_id
+    FROM capture_agents ca
+    JOIN tenants tenant ON tenant.id = ca.tenant_id
+    LEFT JOIN auth_codes ac
+      ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+    LEFT JOIN auth_bindings ab
+      ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+    WHERE ca.tenant_id = $1
+      AND ca.id = ANY($2::uuid[])
+    ORDER BY ca.id
+    ${lock ? 'FOR UPDATE OF ca' : ''}
+  `, [tenantId, orderedForLock]);
+  const byId = new Map(agents.map(agent => [String(agent.id), agent]));
+  if (byId.size !== agentIds.length) {
+    return {failure: requestError(
+      'agent_not_found',
+      '一个或多个执行节点不存在于当前租户',
+      404,
+    )};
+  }
+  for (const agentId of agentIds) {
+    const agent = byId.get(agentId);
+    const failure = agentCompatibilityFailure(agent, platform, planSnapshot);
+    if (failure) {
+      return {failure: requestError(
+        failure.code,
+        failure.message,
+        409,
+        {agentId},
+      )};
+    }
+  }
+  return {
+    agents: agentIds.map(agentId => byId.get(agentId)),
+    agentsById: byId,
+  };
+}
+
+function parentSelect({lock = false} = {}) {
+  return `
+    SELECT id, tenant_id, client_task_id, parent_task_id,
+      task_type, feature_key, title, platform, source, trigger_type,
+      status, progress, checkpoint, counts, metadata, error, message,
+      orchestration_revision, created_at, updated_at
+    FROM capture_tasks
+    WHERE id = $1 AND tenant_id = $2 AND task_type = 'capture_orchestration'
+    ${lock ? 'FOR UPDATE' : ''}
+  `;
+}
+
+async function listParentItems(executor, tenantId, taskId, {lock = false} = {}) {
+  return executor.queryAll(`
+    SELECT id, task_id, item_key, ordinal, keyword, platform, item_type,
+      status, attempt_count, assigned_agent_id, execution_task_id,
+      assignment_revision, request_hash, error, metadata,
+      assigned_at, dispatched_at, started_at, finished_at,
+      created_at, updated_at
+    FROM capture_task_items
+    WHERE tenant_id = $1 AND task_id = $2
+    ORDER BY id
+    ${lock ? 'FOR UPDATE' : ''}
+  `, [tenantId, taskId]);
+}
+
+function mapAllocationGroups(allocation, items, agentsById) {
+  const itemByOrdinal = new Map(
+    items.map(item => [Number(item.ordinal), item]),
+  );
+  const allocationItems = Array.isArray(allocation?.items)
+    ? allocation.items
+    : [];
+  const itemsByAgent = new Map();
+  for (const entry of allocationItems) {
+    const agentId = String(
+      entry.agentId || entry.agent_id || entry.assignedAgentId || '',
+    );
+    if (!itemsByAgent.has(agentId)) itemsByAgent.set(agentId, []);
+    const item = itemByOrdinal.get(Number(entry.ordinal));
+    if (item) itemsByAgent.get(agentId).push(item);
+  }
+  return (Array.isArray(allocation?.groups) ? allocation.groups : []).map(
+    group => {
+      const agentId = String(group.agentId || group.agent_id || '');
+      let groupItems = itemsByAgent.get(agentId) || [];
+      if (groupItems.length === 0 && Array.isArray(group.ordinals)) {
+        groupItems = group.ordinals
+          .map(ordinal => itemByOrdinal.get(Number(ordinal)))
+          .filter(Boolean);
+      }
+      groupItems.sort((left, right) => Number(left.ordinal) - Number(right.ordinal));
+      return {
+        agentId,
+        agent: publicAgent(agentsById.get(agentId)),
+        itemIds: groupItems.map(item => item.id),
+        keywords: groupItems.map(item => item.keyword),
+        itemCount: groupItems.length,
+      };
+    },
+  );
+}
+
+router.post(
+  '/orchestrations',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const normalized = normalizeCreateRequest(req.body);
+      if (normalized.failure) return sendRequestError(res, normalized.failure);
+      const {request, requestHash} = normalized;
+      const result = await withTransaction(async tx => {
+        // Preview creates a hidden draft so assignment can be reviewed against
+        // stable item IDs. Explicit close deletes it immediately; this bounded
+        // cleanup handles crashed tabs and abandoned offline sessions.
+        await tx.execute(`
+          DELETE FROM capture_tasks draft
+          WHERE draft.tenant_id = $1
+            AND draft.task_type = 'capture_orchestration'
+            AND draft.orchestration_revision = 0
+            AND draft.metadata->>'draft' = 'true'
+            AND draft.created_at < now() - interval '24 hours'
+            AND NOT EXISTS (
+              SELECT 1 FROM capture_tasks child
+              WHERE child.tenant_id = draft.tenant_id
+                AND child.parent_task_id = draft.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM capture_task_items item
+              WHERE item.tenant_id = draft.tenant_id
+                AND item.task_id = draft.id
+                AND (
+                  item.status <> 'pending'
+                  OR item.assigned_agent_id IS NOT NULL
+                  OR item.execution_task_id IS NOT NULL
+                )
+            )
+        `, [req.tenantId]);
+        // A SELECT ... FOR UPDATE cannot lock a row that does not exist. Lock
+        // the tenant/request-key namespace first so concurrent retries cannot
+        // both pass the empty-key check and turn an idempotent request into a
+        // PostgreSQL unique-violation 500.
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          [String(req.tenantId), request.requestKey],
+        );
+        const existing = await tx.queryOne(
+          parentSelect({lock: true}),
+          [request.requestKey, req.tenantId],
+        );
+        if (existing) {
+          const metadata = safeJson(existing.metadata);
+          if (metadata.orchestrationRequestHash !== requestHash) {
+            return {failure: requestError(
+              'idempotency_key_conflict',
+              '该 requestKey 已用于不同的编排任务请求',
+              409,
+            )};
+          }
+          const items = await listParentItems(
+            tx,
+            req.tenantId,
+            existing.id,
+          );
+          return {parent: existing, items, existing: true};
+        }
+        const idCollision = await tx.queryOne(
+          'SELECT id FROM capture_tasks WHERE id = $1::uuid',
+          [request.requestKey],
+        );
+        if (idCollision) {
+          return {failure: requestError(
+            'idempotency_key_conflict',
+            '该 requestKey 已被其他任务占用',
+            409,
+          )};
+        }
+        const planSnapshot = request.taskInput.planSnapshot;
+        const total = request.keywords.length;
+        const metadata = {
+          orchestrationRequestHash: requestHash,
+          draft: true,
+          allocationMode: request.allocationMode || 'balanced',
+          executionMode: 'one_time',
+          planSnapshot,
+          requestedByUserId: req.user?.id || '',
+          requestedByName: text(req.actorName, 240),
+        };
+        const parent = await tx.queryOne(`
+          INSERT INTO capture_tasks (
+            id, tenant_id, client_task_id, task_type, feature_key,
+            title, platform, source, trigger_type, status,
+            progress, checkpoint, counts, metadata, message,
+            orchestration_revision, source_updated_at
+          ) VALUES (
+            $1::uuid, $2, $1::uuid::text, 'capture_orchestration',
+            'keyword_orchestration', $3, $4, 'cloud',
+            'remote_orchestration', 'pending',
+            $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
+            '编排任务已创建，等待分配执行节点', 0, now()
+          )
+          RETURNING id, tenant_id, client_task_id, parent_task_id,
+            task_type, feature_key, title, platform, source, trigger_type,
+            status, progress, checkpoint, counts, metadata, error, message,
+            orchestration_revision, created_at, updated_at
+        `, [
+          request.requestKey,
+          req.tenantId,
+          request.title,
+          request.platform,
+          JSON.stringify({current: 0, total, phase: 'unassigned'}),
+          JSON.stringify({
+            total,
+            assigned: 0,
+            processed: 0,
+            success: 0,
+            failed: 0,
+            skipped: 0,
+          }),
+          JSON.stringify(metadata),
+        ]);
+        const items = [];
+        for (let index = 0; index < request.keywords.length; index += 1) {
+          const ordinal = index;
+          const keyword = request.keywords[index];
+          const item = await tx.queryOne(`
+            INSERT INTO capture_task_items (
+              id, tenant_id, task_id, item_key, ordinal, keyword,
+              platform, item_type, status, metadata
+            ) VALUES (
+              $1, $2, $3, $4, $5, $6,
+              $7, 'keyword', 'pending', $8::jsonb
+            )
+            RETURNING id, task_id, item_key, ordinal, keyword,
+              platform, item_type, status, attempt_count,
+              assigned_agent_id, execution_task_id, assignment_revision,
+              request_hash, error, metadata, assigned_at, dispatched_at,
+              started_at, finished_at, created_at, updated_at
+          `, [
+            crypto.randomUUID(),
+            req.tenantId,
+            parent.id,
+            keywordItemKey(keyword, ordinal),
+            ordinal,
+            keyword,
+            request.platform,
+            JSON.stringify({keyword, ordinal}),
+          ]);
+          items.push(item);
+        }
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_created',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: parent.status,
+          message: '后台已创建关键词编排任务',
+          payload: {
+            revision: 0,
+            platform: parent.platform,
+            keywordCount: items.length,
+            allocationMode: metadata.allocationMode,
+          },
+        });
+        return {parent, items, existing: false};
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.status(result.existing ? 200 : 201).json({
+        ok: true,
+        existing: result.existing,
+        orchestration: {
+          ...result.parent,
+          revision: Number(result.parent.orchestration_revision || 0),
+        },
+        items: result.items.sort(
+          (left, right) => Number(left.ordinal) - Number(right.ordinal),
+        ),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.delete(
+  '/orchestrations/:id/draft',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const result = await withTransaction(async tx => {
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parent) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        const items = await listParentItems(
+          tx,
+          req.tenantId,
+          parent.id,
+          {lock: true},
+        );
+        const children = await tx.queryAll(`
+          SELECT id
+          FROM capture_tasks
+          WHERE tenant_id = $1 AND parent_task_id = $2
+          ORDER BY id
+          FOR UPDATE
+        `, [req.tenantId, parent.id]);
+        const stillDraft =
+          parent.status === 'pending' &&
+          Number(parent.orchestration_revision || 0) === 0 &&
+          children.length === 0 &&
+          items.length > 0 &&
+          items.every(item =>
+            item.status === 'pending' &&
+            !item.assigned_agent_id &&
+            !item.execution_task_id
+          );
+        if (!stillDraft) {
+          return {failure: requestError(
+            'orchestration_not_draft',
+            '该编排任务已经下发或发生状态变化，不能作为草稿删除',
+            409,
+          )};
+        }
+        const deleted = await tx.queryOne(`
+          DELETE FROM capture_tasks
+          WHERE id = $1 AND tenant_id = $2
+            AND task_type = 'capture_orchestration'
+          RETURNING id
+        `, [parent.id, req.tenantId]);
+        return {deleted};
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.json({
+        ok: true,
+        orchestrationId: result.deleted.id,
+        deleted: true,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/orchestrations/:id/allocation-preview',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const normalizedAgents = normalizedAgentIds(req.body?.agentIds);
+      if (normalizedAgents.failure) {
+        return sendRequestError(res, normalizedAgents.failure);
+      }
+      const parent = await queryOne(
+        parentSelect(),
+        [orchestrationId, req.tenantId],
+      );
+      if (!parent) {
+        return sendRequestError(res, requestError(
+          'orchestration_not_found',
+          '编排任务不存在',
+          404,
+        ));
+      }
+      const items = await listParentItems(
+        {queryAll},
+        req.tenantId,
+        parent.id,
+      );
+      if (items.length === 0) {
+        return sendRequestError(res, requestError(
+          'orchestration_items_missing',
+          '编排任务没有可分配的关键词',
+          409,
+        ));
+      }
+      if (items.some(item => item.execution_task_id || item.assigned_agent_id)) {
+        return sendRequestError(res, requestError(
+          'orchestration_already_dispatched',
+          '编排任务已经下发，当前版本不支持重新分配',
+          409,
+        ));
+      }
+      const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+      const compatible = await loadCompatibleAgents(
+        {queryAll},
+        req.tenantId,
+        normalizedAgents.agentIds,
+        parent.platform,
+        planSnapshot,
+      );
+      if (compatible.failure) {
+        return sendRequestError(res, compatible.failure);
+      }
+      const allocation = allocateKeywordWorkItems({
+        keywords: items
+          .slice()
+          .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
+          .map(item => item.keyword),
+        agentIds: normalizedAgents.agentIds,
+        revision: Number(parent.orchestration_revision || 0),
+      });
+      if (allocation.groups.some(group => group.keywords.length > 30)) {
+        return sendRequestError(res, requestError(
+          'insufficient_agents',
+          '所选节点不足以承载全部关键词，请增加执行节点',
+          409,
+          {minimumAgentCount: Math.ceil(items.length / 30)},
+        ));
+      }
+      return res.json({
+        ok: true,
+        orchestrationId: parent.id,
+        revision: Number(parent.orchestration_revision || 0),
+        platform: parent.platform,
+        itemCount: items.length,
+        groups: mapAllocationGroups(
+          allocation,
+          items,
+          compatible.agentsById,
+        ),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+function normalizeDispatch(body) {
+  const expectedRevision = Number(body?.expectedRevision);
+  if (
+    !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 0
+  ) {
+    return {failure: requestError(
+      'invalid_expected_revision',
+      'expectedRevision 必须是非负整数',
+    )};
+  }
+  if (!Array.isArray(body?.assignments) || body.assignments.length === 0) {
+    return {failure: requestError(
+      'assignments_required',
+      '请提交每个关键词的执行节点分配',
+    )};
+  }
+  const assignments = [];
+  const seenItems = new Set();
+  for (const rawAssignment of body.assignments) {
+    const itemId = normalizedUuid(rawAssignment?.itemId);
+    const agentId = normalizedUuid(rawAssignment?.agentId);
+    if (!itemId || !agentId) {
+      return {failure: requestError(
+        'invalid_assignment',
+        'itemId 和 agentId 必须是有效 UUID',
+      )};
+    }
+    if (seenItems.has(itemId)) {
+      return {failure: requestError(
+        'duplicate_item_assignment',
+        '同一个关键词不能重复分配',
+      )};
+    }
+    seenItems.add(itemId);
+    assignments.push({itemId, agentId});
+  }
+  return {expectedRevision, assignments};
+}
+
+router.post(
+  '/orchestrations/:id/dispatch',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const normalized = normalizeDispatch(req.body);
+      if (normalized.failure) return sendRequestError(res, normalized.failure);
+      const result = await withTransaction(async tx => {
+        // Lock order is part of the dispatch contract: parent, then all items
+        // by id, then all selected agents by id.
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parent) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        const currentRevision = Number(parent.orchestration_revision || 0);
+        const items = await listParentItems(
+          tx,
+          req.tenantId,
+          parent.id,
+          {lock: true},
+        );
+        if (currentRevision !== normalized.expectedRevision) {
+          const requestedAgentByItem = new Map(
+            normalized.assignments.map(assignment => [
+              assignment.itemId,
+              assignment.agentId,
+            ]),
+          );
+          const exactCommittedReplay =
+            currentRevision === normalized.expectedRevision + 1 &&
+            items.length === normalized.assignments.length &&
+            items.every(item =>
+              requestedAgentByItem.get(String(item.id)) ===
+                String(item.assigned_agent_id || '') &&
+              Boolean(item.execution_task_id) &&
+              Number(item.assignment_revision || 0) === currentRevision
+            );
+          if (exactCommittedReplay) {
+            const children = await tx.queryAll(`
+              SELECT child.id, child.assigned_agent_id, child.status,
+                child.metadata, ca.last_heartbeat_at,
+                command.id AS command_id
+              FROM capture_tasks child
+              LEFT JOIN capture_agents ca
+                ON ca.id = child.assigned_agent_id
+                AND ca.tenant_id = child.tenant_id
+              LEFT JOIN LATERAL (
+                SELECT c.id
+                FROM capture_agent_commands c
+                WHERE c.tenant_id = child.tenant_id
+                  AND c.task_id = child.id
+                  AND c.command_type = 'create'
+                ORDER BY c.created_at DESC, c.id DESC
+                LIMIT 1
+              ) command ON true
+              WHERE child.tenant_id = $1 AND child.parent_task_id = $2
+              ORDER BY child.created_at, child.id
+            `, [req.tenantId, parent.id]);
+            return {
+              parent,
+              existing: true,
+              executions: children.map(child => {
+                const childItems = items.filter(
+                  item => String(item.execution_task_id) === String(child.id),
+                );
+                return {
+                  taskId: child.id,
+                  agentId: child.assigned_agent_id,
+                  commandId: child.command_id,
+                  itemIds: childItems.map(item => item.id),
+                  keywords: childItems
+                    .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
+                    .map(item => item.keyword),
+                  status: child.status,
+                  agentOnline: captureAgentOnline(child.last_heartbeat_at),
+                };
+              }),
+            };
+          }
+          return {failure: requestError(
+            'revision_conflict',
+            '编排任务已被更新，请刷新后重新分配',
+            409,
+            {currentRevision},
+          )};
+        }
+        if (items.length !== normalized.assignments.length) {
+          return {failure: requestError(
+            'assignment_coverage_mismatch',
+            '必须为编排任务的每个关键词恰好分配一个执行节点',
+            400,
+          )};
+        }
+        const itemById = new Map(
+          items.map(item => [String(item.id), item]),
+        );
+        for (const assignment of normalized.assignments) {
+          if (!itemById.has(assignment.itemId)) {
+            return {failure: requestError(
+              'assignment_item_mismatch',
+              '分配中包含不属于当前编排任务的关键词',
+              400,
+              {itemId: assignment.itemId},
+            )};
+          }
+        }
+        if (
+          items.some(item =>
+            item.status !== 'pending' ||
+            item.assigned_agent_id ||
+            item.execution_task_id
+          )
+        ) {
+          return {failure: requestError(
+            'orchestration_already_dispatched',
+            '编排任务已经下发，当前版本不支持重新分配',
+            409,
+          )};
+        }
+        const agentIds = [...new Set(
+          normalized.assignments.map(assignment => assignment.agentId),
+        )];
+        const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+        const compatible = await loadCompatibleAgents(
+          tx,
+          req.tenantId,
+          agentIds,
+          parent.platform,
+          planSnapshot,
+          {lock: true},
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+
+        const assignmentsByAgent = new Map();
+        for (const assignment of normalized.assignments) {
+          if (!assignmentsByAgent.has(assignment.agentId)) {
+            assignmentsByAgent.set(assignment.agentId, []);
+          }
+          assignmentsByAgent
+            .get(assignment.agentId)
+            .push(itemById.get(assignment.itemId));
+        }
+        for (const groupItems of assignmentsByAgent.values()) {
+          groupItems.sort(
+            (left, right) => Number(left.ordinal) - Number(right.ordinal),
+          );
+        }
+        const oversizedGroup = [...assignmentsByAgent.entries()].find(
+          ([, groupItems]) => groupItems.length > 30,
+        );
+        if (oversizedGroup) {
+          return {failure: requestError(
+            'agent_keyword_capacity_exceeded',
+            '单个执行节点一次最多接收 30 个关键词',
+            409,
+            {
+              agentId: oversizedGroup[0],
+              keywordCount: oversizedGroup[1].length,
+            },
+          )};
+        }
+
+        const nextRevision = currentRevision + 1;
+        const executions = [];
+        const sortedAgentIds = [...assignmentsByAgent.keys()].sort(
+          (left, right) => left.localeCompare(right),
+        );
+        for (
+          let groupIndex = 0;
+          groupIndex < sortedAgentIds.length;
+          groupIndex += 1
+        ) {
+          const agentId = sortedAgentIds[groupIndex];
+          const agent = compatible.agentsById.get(agentId);
+          const groupItems = assignmentsByAgent.get(agentId);
+          const childTaskId = crypto.randomUUID();
+          const commandId = crypto.randomUUID();
+          const childTitle = sortedAgentIds.length === 1
+            ? parent.title
+            : `${parent.title} · ${groupIndex + 1}/${sortedAgentIds.length}`;
+          const childTaskInput = normalizeRemoteTaskInput({
+            clientTaskId: childTaskId,
+            title: childTitle,
+            executionMode: 'one_time',
+            planSnapshot: {
+              ...planSnapshot,
+              enabled: true,
+              platform: parent.platform,
+              keywords: groupItems.map(item => item.keyword),
+            },
+          });
+          const childRequestHash = hashOrchestrationRequest({
+            parentTaskId: parent.id,
+            revision: nextRevision,
+            agentId,
+            taskInput: childTaskInput,
+          });
+          const childPlan = childTaskInput.planSnapshot;
+          const total =
+            childPlan.keywords.length * Math.max(1, Number(childPlan.maxRounds) || 1);
+          const childMetadata = {
+            remoteCreated: true,
+            remoteRequestHash: childRequestHash,
+            createCommandId: commandId,
+            requestedByUserId: req.user?.id || '',
+            requestedByName: text(req.actorName, 240),
+            executionMode: 'one_time',
+            planSnapshot: childPlan,
+            orchestrationChild: true,
+            parentTaskId: parent.id,
+            orchestrationRevision: nextRevision,
+            itemIds: groupItems.map(item => item.id),
+          };
+          const child = await tx.queryOne(`
+            INSERT INTO capture_tasks (
+              id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
+              client_task_id, task_type, feature_key, title, platform,
+              source, trigger_type, status, progress, checkpoint, counts,
+              metadata, message, source_updated_at
+            ) VALUES (
+              $1::uuid, $2, $3, $4, $4,
+              $1::uuid::text, 'unattended_keyword_capture',
+              'unattended_keyword_plan', $5, $6,
+              'cloud', 'orchestration_dispatch', 'pending',
+              $7::jsonb, $8::jsonb, $9::jsonb,
+              $10::jsonb, '编排子任务已创建，等待目标设备领取', now()
+            )
+            RETURNING id, parent_task_id, assigned_agent_id, client_task_id,
+              task_type, title, platform, status, progress, counts, metadata,
+              created_at, updated_at
+          `, [
+            childTaskId,
+            req.tenantId,
+            parent.id,
+            agentId,
+            childTaskInput.title,
+            parent.platform,
+            JSON.stringify({current: 0, total, phase: 'queued'}),
+            JSON.stringify({round: 1, keywordIndex: 0}),
+            JSON.stringify({
+              total,
+              processed: 0,
+              success: 0,
+              failed: 0,
+              skipped: 0,
+            }),
+            JSON.stringify(childMetadata),
+          ]);
+          const command = await tx.queryOne(`
+            INSERT INTO capture_agent_commands (
+              id, tenant_id, agent_id, task_id, command_type, payload,
+              requested_by_user_id, requested_by_name
+            ) VALUES (
+              $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
+            )
+            RETURNING id, status, expires_at, created_at
+          `, [
+            commandId,
+            req.tenantId,
+            agentId,
+            child.id,
+            JSON.stringify({
+              taskId: child.id,
+              clientTaskId: child.id,
+              title: child.title,
+              executionMode: 'one_time',
+              platform: childPlan.platform,
+              planSnapshot: childPlan,
+              requestHash: childRequestHash,
+              authCodeId: agent.auth_code_id,
+              authBindingId: agent.auth_binding_id,
+              orchestration: {
+                parentTaskId: parent.id,
+                revision: nextRevision,
+                itemIds: groupItems.map(item => item.id),
+              },
+            }),
+            req.user?.id || null,
+            text(req.actorName, 240),
+          ]);
+          for (const item of groupItems) {
+            const updatedItem = await tx.queryOne(`
+              UPDATE capture_task_items
+              SET status = 'dispatched',
+                attempt_count = attempt_count + 1,
+                assigned_agent_id = $1,
+                execution_task_id = $2,
+                assignment_revision = $3,
+                request_hash = $4,
+                assigned_at = now(),
+                dispatched_at = now(),
+                updated_at = now()
+              WHERE id = $5 AND tenant_id = $6 AND task_id = $7
+                AND status = 'pending'
+                AND assigned_agent_id IS NULL
+                AND execution_task_id IS NULL
+              RETURNING id
+            `, [
+              agentId,
+              child.id,
+              nextRevision,
+              childRequestHash,
+              item.id,
+              req.tenantId,
+              parent.id,
+            ]);
+            if (!updatedItem) {
+              const conflict = new Error('orchestration_item_assignment_conflict');
+              conflict.code = 'orchestration_item_assignment_conflict';
+              throw conflict;
+            }
+            await tx.execute(`
+              INSERT INTO capture_task_item_attempts (
+                id, tenant_id, item_id, parent_task_id, execution_task_id,
+                agent_id, attempt_number, assignment_revision, status,
+                request_hash, checkpoint, result, error, dispatched_at
+              ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, 1, $7, 'dispatched',
+                $8, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+              )
+            `, [
+              crypto.randomUUID(),
+              req.tenantId,
+              item.id,
+              parent.id,
+              child.id,
+              agentId,
+              nextRevision,
+              childRequestHash,
+            ]);
+          }
+          await appendEvent(tx, {
+            tenantId: req.tenantId,
+            taskId: child.id,
+            agentId,
+            eventType: 'orchestration_child_dispatched',
+            actorId: req.user?.id || '',
+            actorName: req.actorName,
+            status: child.status,
+            message: '编排子任务已向指定节点下发',
+            payload: {
+              parentTaskId: parent.id,
+              revision: nextRevision,
+              commandId: command.id,
+              itemIds: groupItems.map(item => item.id),
+              keywords: groupItems.map(item => item.keyword),
+            },
+          });
+          executions.push({
+            taskId: child.id,
+            agentId,
+            commandId: command.id,
+            itemIds: groupItems.map(item => item.id),
+            keywords: groupItems.map(item => item.keyword),
+            status: child.status,
+            agentOnline: captureAgentOnline(agent.last_heartbeat_at),
+          });
+        }
+        const parentUpdate = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET orchestration_revision = orchestration_revision + 1,
+            status = 'pending',
+            progress = $1::jsonb,
+            counts = counts || $2::jsonb,
+            metadata = (metadata - 'draft') || jsonb_build_object(
+              'publishedAt', now()
+            ),
+            message = '编排任务已分配并下发到执行节点',
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $3 AND tenant_id = $4
+            AND task_type = 'capture_orchestration'
+            AND orchestration_revision = $5
+          RETURNING id, orchestration_revision, status
+        `, [
+          JSON.stringify({
+            current: 0,
+            total: items.length,
+            phase: 'dispatched',
+          }),
+          JSON.stringify({
+            total: items.length,
+            assigned: items.length,
+          }),
+          parent.id,
+          req.tenantId,
+          currentRevision,
+        ]);
+        if (!parentUpdate) {
+          const conflict = new Error('orchestration_revision_conflict');
+          conflict.code = 'orchestration_revision_conflict';
+          throw conflict;
+        }
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_dispatched',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: parentUpdate.status,
+          message: '编排任务已按确认方案下发',
+          payload: {
+            revision: parentUpdate.orchestration_revision,
+            executionCount: executions.length,
+            itemCount: items.length,
+            executions,
+          },
+        });
+        return {
+          parent: parentUpdate,
+          executions,
+        };
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.status(result.existing ? 200 : 201).json({
+        ok: true,
+        idempotent: result.existing === true,
+        orchestrationId: result.parent.id,
+        revision: Number(result.parent.orchestration_revision),
+        status: result.parent.status,
+        executions: result.executions,
+      });
+    } catch (error) {
+      if (
+        error?.code === 'orchestration_revision_conflict' ||
+        error?.code === 'orchestration_item_assignment_conflict'
+      ) {
+        return sendRequestError(res, requestError(
+          'dispatch_conflict',
+          '编排任务在下发时发生并发更新，请刷新后重试',
+          409,
+        ));
+      }
+      return next(error);
+    }
+  },
+);
+
+router.get(
+  '/orchestrations/:id',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const result = await withTransaction(async tx => {
+        // Keep the parent revision, item allocation, child tasks and attempt
+        // audit in one database snapshot. Otherwise a concurrent dispatch can
+        // return revision 0 alongside revision 1 children.
+        await tx.execute(
+          'SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY',
+        );
+        const orchestration = await tx.queryOne(
+          parentSelect(),
+          [orchestrationId, req.tenantId],
+        );
+        if (!orchestration) return null;
+        const items = await listParentItems(
+          tx,
+          req.tenantId,
+          orchestration.id,
+        );
+        const executions = await tx.queryAll(`
+          SELECT child.*,
+            ca.display_name AS agent_display_name,
+            ca.host_label AS agent_host_label,
+            ca.browser_name AS agent_browser_name,
+            ca.operating_system AS agent_operating_system,
+            ca.app_version AS agent_app_version,
+            ca.status AS agent_status,
+            ca.last_heartbeat_at AS agent_last_heartbeat_at,
+            command.id AS command_id,
+            command.status AS command_status,
+            command.expires_at AS command_expires_at
+          FROM capture_tasks child
+          LEFT JOIN capture_agents ca
+            ON ca.id = child.assigned_agent_id
+            AND ca.tenant_id = child.tenant_id
+          LEFT JOIN LATERAL (
+            SELECT c.id, c.status, c.expires_at
+            FROM capture_agent_commands c
+            WHERE c.task_id = child.id
+              AND c.tenant_id = child.tenant_id
+              AND c.command_type = 'create'
+            ORDER BY c.created_at DESC, c.id DESC
+            LIMIT 1
+          ) command ON true
+          WHERE child.tenant_id = $1
+            AND child.parent_task_id = $2
+          ORDER BY child.created_at, child.id
+        `, [req.tenantId, orchestration.id]);
+        const agents = await tx.queryAll(`
+          SELECT DISTINCT ON (ca.id)
+            ca.id, ca.display_name, ca.host_label, ca.browser_name,
+            ca.operating_system, ca.app_version, ca.allowed_platforms,
+            ca.capabilities, ca.status, ca.last_heartbeat_at
+          FROM capture_agents ca
+          JOIN capture_task_items item
+            ON item.assigned_agent_id = ca.id
+            AND item.tenant_id = ca.tenant_id
+          WHERE item.tenant_id = $1 AND item.task_id = $2
+          ORDER BY ca.id
+        `, [req.tenantId, orchestration.id]);
+        const attempts = await tx.queryAll(`
+          SELECT attempt.*,
+            item.ordinal, item.keyword, item.item_key
+          FROM capture_task_item_attempts attempt
+          JOIN capture_task_items item
+            ON item.id = attempt.item_id
+            AND item.tenant_id = attempt.tenant_id
+          WHERE attempt.tenant_id = $1
+            AND attempt.parent_task_id = $2
+          ORDER BY item.ordinal, attempt.attempt_number, attempt.created_at
+        `, [req.tenantId, orchestration.id]);
+        return {orchestration, items, executions, agents, attempts};
+      });
+      if (!result) {
+        return sendRequestError(res, requestError(
+          'orchestration_not_found',
+          '编排任务不存在',
+          404,
+        ));
+      }
+      const {orchestration, items, executions, agents, attempts} = result;
+      return res.json({
+        ok: true,
+        orchestration: {
+          ...orchestration,
+          revision: Number(orchestration.orchestration_revision || 0),
+        },
+        items: items.sort(
+          (left, right) => Number(left.ordinal) - Number(right.ordinal),
+        ),
+        executions: executions.map(execution => ({
+          ...execution,
+          agent_online: captureAgentOnline(execution.agent_last_heartbeat_at),
+        })),
+        agents: agents.map(publicAgent),
+        attempts,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+export default router;

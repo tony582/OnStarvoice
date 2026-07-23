@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Loader2, ClipboardCheck, ExternalLink, RefreshCw, ChevronLeft, ChevronRight, CheckCircle2, Download, UserCog } from 'lucide-react'
+import { Loader2, ClipboardCheck, ExternalLink, RefreshCw, ChevronLeft, ChevronRight, CheckCircle2, Download, RotateCcw, UserCog } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatNumber, platformName, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -52,12 +52,46 @@ export function TicketFeedbackQueue() {
 
   const closeTicket = async (item: any) => {
     const v = await ask({ title: '结案', placeholder: '填写结案说明 / 处理结论(可留空)' })
-    if (v === null) return
-    await api.patch(`/tickets/${item.id}`, { action: 'close', note: v })
-    setDrawer(null)
+    if (v === null) return false
+    const data = await api.patch<any>(`/tickets/${item.id}`, { action: 'close', note: v })
+    const updated = data.ticket || { ...item, status: 'closed' }
+    setDrawer((current: any) => current?.id === item.id ? { ...current, ...updated } : current)
     await load(pagination?.page ?? 1)
     refreshBadges()
+    return updated
   }
+
+  const reopenTicket = async (item: any) => {
+    const v = await ask({
+      title: '重开工单',
+      helpText: '确认后工单将恢复为处理中，原结案记录会保留。',
+      placeholder: '可填写重开原因或后续安排',
+      confirmLabel: '确认重开',
+    })
+    if (v === null) return false
+    const data = await api.patch<any>(`/tickets/${item.id}`, { action: 'reopen', note: v })
+    const updated = data.ticket || { ...item, status: 'doing' }
+    setDrawer((current: any) => current?.id === item.id ? { ...current, ...updated } : current)
+    await load(pagination?.page ?? 1)
+    refreshBadges()
+    return updated
+  }
+
+  const syncAddedNote = useCallback((ticketId: string, note: any) => {
+    const applyNote = (item: any) => {
+      if (!item || item.id !== ticketId) return item
+      return {
+        ...item,
+        status: item.status === 'pending' ? 'doing' : item.status,
+        latest_note: note.body,
+        latest_note_author: note.author_name,
+        latest_note_at: note.created_at,
+        notes_count: Number(item.notes_count || 0) + 1,
+      }
+    }
+    setItems(current => current.map(applyNote))
+    setDrawer((current: any) => applyNote(current))
+  }, [])
 
   return (
     <div className="space-y-3">
@@ -95,6 +129,7 @@ export function TicketFeedbackQueue() {
               return (
                 <article
                   key={it.id}
+                  data-ticket-detail-trigger
                   role="button"
                   tabIndex={0}
                   aria-label={`打开工单：${it.item_text || it.title || '无标题工单'}`}
@@ -147,6 +182,12 @@ export function TicketFeedbackQueue() {
                       {!closed && it.notes_count > 1 && <span className="text-[10px] text-muted-foreground">共 {it.notes_count} 条备注</span>}
                     </div>
                     <p className={`mt-1.5 line-clamp-3 text-[13px] leading-5 ${it.latest_note || closed ? 'text-foreground' : 'text-muted-foreground'}`}>{progress}</p>
+                    {!closed && it.latest_note && (
+                      <div className="mt-1 text-[11px] text-muted-foreground">
+                        {it.latest_note_author || '-'}{it.latest_note_at ? ` · ${formatDate(it.latest_note_at)}` : ''}
+                        {it.notes_count > 1 ? ` · 共 ${it.notes_count} 条` : ''}
+                      </div>
+                    )}
                     {closed && (
                       <div className="mt-1 text-[11px] text-muted-foreground">
                         {it.handled_by_name || '-'}{(it.reviewed_at || it.handled_at) ? ` · ${formatDate(it.reviewed_at || it.handled_at)}` : ''}
@@ -173,6 +214,11 @@ export function TicketFeedbackQueue() {
                         <CheckCircle2 className="h-4 w-4" />结案
                       </Button>
                     )}
+                    {canWrite() && closed && (
+                      <Button className="h-11 rounded-xl px-4" onClick={() => reopenTicket(it)}>
+                        <RotateCcw className="h-4 w-4" />重开
+                      </Button>
+                    )}
                   </div>
                 </article>
               )
@@ -190,7 +236,7 @@ export function TicketFeedbackQueue() {
             </tr></thead>
             <tbody className="divide-y divide-border/40">
               {items.map(it => (
-                <tr key={it.id} onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-accent/45 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
+                <tr key={it.id} data-ticket-detail-trigger onClick={() => setDrawer(it)} className={`cursor-pointer align-top transition-colors hover:bg-accent/45 ${drawer?.id === it.id ? 'bg-accent' : ''}`}>
                   <td className="max-w-[360px] px-4 py-3">
                     <div className="mb-1 flex flex-wrap items-center gap-1.5">
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
@@ -214,15 +260,18 @@ export function TicketFeedbackQueue() {
                       <div className="line-clamp-2 leading-5 text-foreground">{it.handle_note || '(无结案说明)'}</div>
                       <div className="mt-0.5 text-muted-foreground">{it.handled_by_name || '-'}{(it.reviewed_at || it.handled_at) ? ` · ${formatDate(it.reviewed_at || it.handled_at)}` : ''}</div>
                     </> : it.latest_note ? <>
-                      <div className="line-clamp-2 leading-5 text-foreground">{it.latest_note}</div>
-                      {it.notes_count > 1 && <div className="mt-0.5 text-muted-foreground/70">共 {it.notes_count} 条备注</div>}
+                      <div className="line-clamp-2 leading-5 text-foreground" title={it.latest_note}>{it.latest_note}</div>
+                      <div className="mt-0.5 text-muted-foreground/70">
+                        {it.latest_note_author || '-'}{it.latest_note_at ? ` · ${formatDate(it.latest_note_at)}` : ''}
+                        {it.notes_count > 1 ? ` · 共 ${it.notes_count} 条` : ''}
+                      </div>
                     </> : <span className="text-muted-foreground/60">— 未开始</span>}
                   </td>
                   <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
                     <div className="flex justify-end gap-1">
-                      {canWrite() && it.status !== 'closed'
-                        ? <Button variant="outline" size="sm" onClick={() => closeTicket(it)}><CheckCircle2 className="h-3.5 w-3.5" />结案</Button>
-                        : <span className="text-[11px] text-muted-foreground/60">{it.status === 'closed' ? '已结案' : '跟踪中'}</span>}
+                      {canWrite() && it.status !== 'closed' && <Button variant="outline" size="sm" onClick={() => closeTicket(it)}><CheckCircle2 className="h-3.5 w-3.5" />结案</Button>}
+                      {canWrite() && it.status === 'closed' && <Button variant="outline" size="sm" onClick={() => reopenTicket(it)}><RotateCcw className="h-3.5 w-3.5" />重开</Button>}
+                      {!canWrite() && <span className="text-[11px] text-muted-foreground/60">{it.status === 'closed' ? '已结案' : '跟踪中'}</span>}
                     </div>
                   </td>
                 </tr>
@@ -251,6 +300,8 @@ export function TicketFeedbackQueue() {
           canWrite={canWrite()}
           onClose={() => setDrawer(null)}
           onCloseTicket={() => closeTicket(drawer)}
+          onReopenTicket={() => reopenTicket(drawer)}
+          onNoteAdded={note => syncAddedNote(drawer.id, note)}
         />
       )}
       {dialog}

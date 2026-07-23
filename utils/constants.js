@@ -107,6 +107,7 @@ export const STORAGE_KEY = {
   TASK_LEDGER: "onstarvoice.taskLedger",
   UNATTENDED_KEYWORD_PLAN: "onstarvoice.unattendedKeywordPlan",
   UNATTENDED_KEYWORD_RUN_REQUEST: "onstarvoice.unattendedKeywordRunRequest",
+  UNATTENDED_KEYWORD_RUN_ARCHIVE: "onstarvoice.unattendedKeywordRunArchive",
   DIAGNOSTICS: "onstarvoice.diagnostics",
 };
 

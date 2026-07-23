@@ -319,11 +319,17 @@ async function aggregateRecordComments(tx, tenantId, recordId) {
 }
 
 async function applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, previousNegativeCount, aggregate }) {
-  const current = await tx.queryOne(
-    "SELECT status FROM record_triage WHERE tenant_id = $1 AND record_id = $2",
-    [tenantId, recordId]
-  );
-  const currentStatus = current?.status || 'unhandled';
+  const current = await tx.queryOne(`
+    SELECT COALESCE(rt.status, 'unhandled') AS status, rt.archived_at
+    FROM records r
+    LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
+    WHERE r.tenant_id = $1 AND r.id = $2
+    FOR UPDATE OF r
+  `, [tenantId, recordId]);
+  // 归档只封存处理动作，不阻断原始采集、评论和互动数据入库。
+  if (!current || current.archived_at) return;
+
+  const currentStatus = current.status;
   let nextStatus = '';
   let auditAction = '';
 
@@ -340,7 +346,7 @@ async function applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, pre
   if (officialRecord) {
     nextStatus = 'official_responded';
     auditAction = 'record.official_content_hidden';
-  } else if (aggregate.negativeCount > previousNegativeCount && (['archived', 'official_responded', 'false_positive'].includes(currentStatus) || dispatchedReopenable)) {
+  } else if (aggregate.negativeCount > previousNegativeCount && (['no_action', 'official_responded'].includes(currentStatus) || dispatchedReopenable)) {
     nextStatus = 'reviewing';
     auditAction = 'record.reopened_by_comment_risk';
     await tx.execute(

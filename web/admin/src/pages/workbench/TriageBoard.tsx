@@ -5,15 +5,15 @@ import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { getCover } from '@/components/shared/RecordDrawer'
 
-type ColKey = 'unhandled' | 'reviewing' | 'official_responded' | 'archived'
+type ColKey = 'unhandled' | 'reviewing' | 'official_responded' | 'no_action'
 
 // Monday 风格彩色分组列。dot=列头圆点色;ring=拖拽悬停高亮色。
 // 已转工单(ticketed)是交给工单系统的交接态,不在分诊看板拖拽(避免误写废弃状态),故不设列。
 const COLUMNS: Array<{ key: ColKey; label: string; dot: string; ring: string }> = [
-  { key: 'unhandled', label: '待分诊', dot: 'bg-status-orange', ring: 'ring-status-orange/40 bg-status-orange/[0.04]' },
-  { key: 'reviewing', label: '待复核', dot: 'bg-status-purple', ring: 'ring-status-purple/40 bg-status-purple/[0.04]' },
-  { key: 'official_responded', label: '已响应', dot: 'bg-status-green', ring: 'ring-status-green/40 bg-status-green/[0.04]' },
-  { key: 'archived', label: '已归档', dot: 'bg-status-grey', ring: 'ring-slate-300/50 bg-slate-50 dark:bg-slate-800/40' },
+  { key: 'unhandled', label: '待处理', dot: 'bg-status-orange', ring: 'ring-status-orange/40 bg-status-orange/[0.04]' },
+  { key: 'reviewing', label: '负面流程', dot: 'bg-status-purple', ring: 'ring-status-purple/40 bg-status-purple/[0.04]' },
+  { key: 'official_responded', label: '官方已评', dot: 'bg-status-green', ring: 'ring-status-green/40 bg-status-green/[0.04]' },
+  { key: 'no_action', label: '无需操作', dot: 'bg-status-grey', ring: 'ring-slate-300/50 bg-slate-50 dark:bg-slate-800/40' },
 ]
 
 const PER_COL = 60
@@ -27,7 +27,7 @@ export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite,
   onOpen: (record: any) => void
   refreshBadges: () => void
 }) {
-  const [cols, setCols] = useState<Record<ColKey, any[]>>({ unhandled: [], reviewing: [], official_responded: [], archived: [] })
+  const [cols, setCols] = useState<Record<ColKey, any[]>>({ unhandled: [], reviewing: [], official_responded: [], no_action: [] })
   const [loading, setLoading] = useState(true)
   const [dragId, setDragId] = useState<string | null>(null)
   const [overCol, setOverCol] = useState<ColKey | null>(null)
@@ -37,10 +37,10 @@ export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite,
     setLoading(true)
     try {
       const results = await Promise.all(COLUMNS.map(c => {
-        const p = new URLSearchParams({ status: c.key, pageSize: String(PER_COL), sentiment, platform: platform || '', keyword })
+        const p = new URLSearchParams({ queue: 'triage', status: c.key, pageSize: String(PER_COL), sentiment, platform: platform || '', keyword })
         return api.get<any>('/triage/records?' + p).then(d => [c.key, d.records || []] as const).catch(() => [c.key, []] as const)
       }))
-      const next: any = { unhandled: [], reviewing: [], official_responded: [], archived: [] }
+      const next: any = { unhandled: [], reviewing: [], official_responded: [], no_action: [] }
       for (const [k, recs] of results) next[k] = recs
       setCols(next)
     } finally { setLoading(false) }
@@ -57,7 +57,11 @@ export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite,
       return { ...prev, [from]: prev[from].filter(r => r.id !== id), [to]: [{ ...card, triage_status: to }, ...prev[to]] }
     })
     try {
-      await api.patch('/triage/records/' + id, { status: to })
+      if (to === 'official_responded') {
+        await api.patch('/records/' + id + '/official-response', { status: 'responded' })
+      } else {
+        await api.patch('/triage/records/' + id, { status: to })
+      }
       refreshBadges()
     } catch {
       // 回滚
@@ -116,6 +120,7 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onDragStart, onDragE
   const accent = r.sentiment === 'negative' ? 'border-l-status-red' : r.sentiment === 'positive' ? 'border-l-status-green' : 'border-l-status-blue'
   return (
     <div
+      data-record-detail-trigger
       draggable={canWrite}
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}

@@ -57,7 +57,7 @@ export function OverviewPage() {
       {/* Numbers 行 */}
       <div className="grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 lg:grid-cols-4">
         <NumberCard label="互动总量" hint="互动总量=点赞+评论+收藏+转发 之和(全部内容累计),不是内容条数。「声量」才指内容条数,见分析与报告。本系统不采阅读/播放量,不报触达人数。" value={formatNumber(k.total_interaction)} sub={`周期新增内容 ${formatNumber(k.period_new)}`} icon={Radio} onClick={() => navigate('data')} />
-        <NumberCard label="待分诊" hint="待分诊=进入分诊队列、待人工研判的内容(尚未转工单也未归档)。" value={formatNumber(badges.triagePending)} sub="待人工研判" tone="orange" icon={Inbox} onClick={() => navigate('workbench', { queue: 'triage' })} />
+        <NumberCard label="待处理" hint="待处理=进入内容分诊、尚未完成处理的内容。" value={formatNumber(badges.triagePending)} sub="待人工研判" tone="orange" icon={Inbox} onClick={() => navigate('workbench', { queue: 'triage' })} />
         <NumberCard label="累计负面" hint="累计负面=情感被 AI 标注为负面的内容总数;负面占比=负面 ÷ 已标注内容。" value={formatNumber(sb.negative)} sub={`负面占比 ${negRatio}%`} tone="red" icon={ShieldAlert} onClick={() => navigate('workbench', { queue: 'triage', sentiment: 'negative' })} />
         <NumberCard label="开放问题" hint="开放问题=未解决/未关闭的问题单(issue);高优=高/紧急级别。" value={formatNumber(k.open_issues)} sub={`高优 ${formatNumber(k.high_open_issues)}`} tone={Number(k.high_open_issues || 0) > 0 ? 'red' : 'default'} icon={AlertOctagon} onClick={() => navigate('workbench', { queue: 'issues' })} />
       </div>
@@ -108,7 +108,7 @@ export function OverviewPage() {
                 const accent = r.sentiment === 'negative' ? 'border-l-status-red' : r.sentiment === 'positive' ? 'border-l-status-green' : 'border-l-status-blue'
                 const interactions = Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
                 return (
-                  <button key={r.id} onClick={() => setDrawer(r)}
+                  <button key={r.id} data-record-detail-trigger onClick={() => setDrawer(r)}
                     className={cn('flex w-full items-center gap-3 rounded-r-lg border border-l-[3px] border-border bg-card px-3 py-2.5 text-left transition-all hover:shadow-xs hover:border-input', accent)}>
                     <StatusBadge tone={tone}>{tone === 'negative' ? '负面' : tone === 'positive' ? '正面' : '中性'}</StatusBadge>
                     <div className="min-w-0 flex-1">

@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { withTransaction } from '../db/init.js';
-import { queueCoverLocalization } from './media-store.js';
+import { queueCoverLocalization, queueRecordImagesLocalization } from './media-store.js';
 import { parseMetricNumber } from '../utils/metrics.js';
 
 const VERSION_FIELDS = [
@@ -298,6 +298,7 @@ export async function upsertCapturedRecord(record, context) {
   });
   // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
   if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
+  if (imageUrls !== '[]') queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
   return __result;
 }
 
@@ -307,6 +308,7 @@ export function serializeRecord(row) {
     ...row,
     tags: typeof row.tags === 'string' ? row.tags : JSON.stringify(row.tags || []),
     image_urls: typeof row.image_urls === 'string' ? row.image_urls : JSON.stringify(row.image_urls || []),
+    image_local_urls: typeof row.image_local_urls === 'string' ? row.image_local_urls : JSON.stringify(row.image_local_urls || []),
     payload: typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload || {}),
     ai_result: typeof row.ai_result === 'string' ? row.ai_result : JSON.stringify(row.ai_result || {}),
   };

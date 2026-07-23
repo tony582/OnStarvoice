@@ -6,7 +6,12 @@ import { cn } from '@/lib/utils'
 interface KeywordItem { keyword: string; count: number }
 
 // 采集关键词多选:每个关键词=一次采集 session。选项来自 /workspace/keywords(该租户采过的关键词去重)。
-export function KeywordFilter({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+export function KeywordFilter({ label = '采集关键词', value, onChange, triggerClassName }: {
+  label?: string
+  value: string[]
+  onChange: (v: string[]) => void
+  triggerClassName?: string
+}) {
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<KeywordItem[]>([])
   const [q, setQ] = useState('')
@@ -29,8 +34,8 @@ export function KeywordFilter({ value, onChange }: { value: string[]; onChange: 
     <div className="relative" ref={ref}>
       <button type="button" onClick={() => setOpen(o => !o)}
         className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          value.length ? 'text-primary' : 'text-muted-foreground')}>
-        采集关键词
+          value.length ? 'text-primary' : 'text-muted-foreground', triggerClassName)}>
+        {label}
         {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
         <ChevronDown className="h-3 w-3" />
       </button>

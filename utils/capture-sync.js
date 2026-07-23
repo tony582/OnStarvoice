@@ -84,6 +84,11 @@ import {
   pickDouyinAuthorName,
 } from './capture/douyin-author.js';
 import {
+  createDouyinSearchServiceAbnormalError,
+  DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE,
+  isDouyinSearchServiceAbnormalError,
+} from './capture/douyin-search-guard.js';
+import {
   evaluateRelevancePrefilterRecords,
   RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
 } from './capture/relevance-prefilter.js';
@@ -2342,6 +2347,7 @@ export async function captureAndSync({
     const syncResult =
       syncRecordIds.length === 1
         ? await syncRecord(syncRecordIds[0], onProgress, {
+            trigger: 'capture_auto',
             commentLeadsConfig,
             shouldStop,
             signal,
@@ -6142,6 +6148,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
   const startedAt = Date.now();
   const shouldStop = options?.shouldStop;
   const signal = options?.signal || null;
+  const historyTrigger = String(options?.trigger || 'single').trim() || 'single';
   try {
     if (isSyncCancellationRequested(shouldStop, signal)) {
       await resetCanceledSyncState();
@@ -6367,6 +6374,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
               recordId,
               result,
               startedAt,
+              trigger: historyTrigger,
             });
             return result;
           }
@@ -6428,6 +6436,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
         recordId,
         result,
         startedAt,
+        trigger: historyTrigger,
       });
       return result;
     } else {
@@ -6473,6 +6482,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
         recordId,
         result,
         startedAt,
+        trigger: historyTrigger,
       });
       return result;
     }
@@ -6520,6 +6530,7 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
       recordId,
       result,
       startedAt,
+      trigger: historyTrigger,
     });
     return result;
   }
@@ -13426,7 +13437,9 @@ function hasActiveBatchSearchFilters(searchFilters = {}) {
   );
 }
 
-// 采集前切搜索「排序 / 范围」:转发到 content 的 applyBatchSearchFilters(复用「找对标账号」的筛选点击);失败不影响采集
+// 采集前切搜索「排序 / 范围」:转发到 content 的 applyBatchSearchFilters。
+// 普通筛选失败仍由后续结果就绪检查兜底；抖音明确显示“服务出现异常”时必须
+// 保留结构化错误并立即停批，不能吞掉后再重新搜索。
 async function applySearchFiltersInTab(tabId, searchFilters = {}) {
   try {
     const response = await chrome.runtime.sendMessage({
@@ -13434,8 +13447,26 @@ async function applySearchFiltersInTab(tabId, searchFilters = {}) {
       tabId: Number(tabId),
       payload: { action: 'applyBatchSearchFilters', ...searchFilters },
     });
-    return response?.data ?? null;
+    const contentResponse = response?.data;
+    const responseError =
+      response?.ok === false
+        ? response?.error
+        : contentResponse?.ok === false
+          ? contentResponse?.error
+          : null;
+    if (isDouyinSearchServiceAbnormalError(responseError)) {
+      throw createDouyinSearchServiceAbnormalError({
+        message: responseError?.message,
+      });
+    }
+    if (responseError) {
+      return null;
+    }
+    return contentResponse?.data ?? contentResponse ?? null;
   } catch (error) {
+    if (isDouyinSearchServiceAbnormalError(error)) {
+      throw error;
+    }
     return null;
   }
 }
@@ -13606,6 +13637,81 @@ export async function batchCaptureByKeywords({
   let securityBlocked = false;
   let fatal = false;
   let recoveryRequired = false;
+  let blockingError = null;
+  const resolveKeywordFailure = (...values) => {
+    const candidates = values.filter(Boolean);
+    const structured = candidates
+      .map((value) =>
+        value?.error && typeof value.error === 'object'
+          ? value.error
+          : value,
+      )
+      .find((value) => value && typeof value === 'object') || {};
+    const message =
+      candidates
+        .map((value) =>
+          String(
+            value?.error?.message ||
+              (typeof value?.error === 'string' ? value.error : '') ||
+              value?.message ||
+              '',
+          ).trim(),
+        )
+        .find(Boolean) || '';
+    const errorCode =
+      candidates
+        .map((value) =>
+          String(
+            value?.error?.code ||
+              value?.errorCode ||
+              value?.code ||
+              '',
+          ).trim(),
+        )
+        .find(Boolean) || '';
+    const safetyEvidence = {
+      ...structured,
+      ...(errorCode ? {code: errorCode} : {}),
+      ...(message ? {message} : {}),
+      securityBlocked: candidates.some(
+        (value) =>
+          value?.securityBlocked === true ||
+          value?.error?.securityBlocked === true,
+      ),
+      platformSafetyBlocked: candidates.some(
+        (value) =>
+          value?.platformSafetyBlocked === true ||
+          value?.error?.platformSafetyBlocked === true,
+      ),
+    };
+    return {
+      code: errorCode,
+      message,
+      category:
+        candidates
+          .map((value) =>
+            String(
+              value?.error?.category ||
+                value?.category ||
+                '',
+            ).trim(),
+          )
+          .find(Boolean) || '',
+      securityBlocked: isUnattendedSafetyBlock(safetyEvidence),
+      requiresManualAction: candidates.some(
+        (value) =>
+          value?.requiresManualAction === true ||
+          value?.error?.requiresManualAction === true,
+      ),
+      fatal: candidates.some(
+        (value) =>
+          value?.fatal === true ||
+          value?.stopBatch === true ||
+          value?.error?.fatal === true ||
+          value?.error?.stopBatch === true,
+      ),
+    };
+  };
 
   try {
   for (let i = 0; i < keywords.length; i++) {
@@ -13653,12 +13759,15 @@ export async function batchCaptureByKeywords({
         });
       }
 
-      // 等待页面渲染
-      await waitMsWithStop(
-        BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
-        shouldStop,
-        'BATCH_CAPTURE_CANCELED',
-      );
+      // 抖音结果探针会每 300ms 检查“服务出现异常”，不要先固定等 2 秒，
+      // 否则保护性停止会被无意义地延迟。其它平台保留原有渲染宽限。
+      if (!isDouyinPlatform(platform)) {
+        await waitMsWithStop(
+          BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
+          shouldStop,
+          'BATCH_CAPTURE_CANCELED',
+        );
+      }
       if (onProgress) {
         onProgress({
           current: i + 1,
@@ -13668,9 +13777,19 @@ export async function batchCaptureByKeywords({
           message: `正在等待「${keyword}」搜索结果加载(${i + 1}/${keywords.length})...`,
         });
       }
-      await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-        keyword,
-      });
+      const initialResultsReady = await waitForKeywordSearchResultsInTab(
+        runnerTabId,
+        platform,
+        shouldStop,
+        {
+          keyword,
+        },
+      );
+      if (!initialResultsReady && isDouyinPlatform(platform)) {
+        throw new Error(
+          `「${keyword}」搜索结果页未就绪，已结束本次尝试并保留后续关键词`,
+        );
+      }
 
       // 按需切换搜索「排序 / 范围」(默认值则跳过)。
       // 关键:筛选后结果没加载(如抖音「服务出现异常」)绝不能继续采——后面的重试会
@@ -13696,7 +13815,6 @@ export async function batchCaptureByKeywords({
               });
             }
             await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
-            await waitMsWithStop(2000, shouldStop, 'BATCH_CAPTURE_CANCELED');
             await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
               keyword,
             });
@@ -13712,11 +13830,13 @@ export async function batchCaptureByKeywords({
           }
           await applySearchFiltersInTab(runnerTabId, searchFilters);
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
-          await waitMsWithStop(
-            1200,
-            shouldStop,
-            'BATCH_CAPTURE_CANCELED',
-          );
+          if (!isDouyinPlatform(platform)) {
+            await waitMsWithStop(
+              1200,
+              shouldStop,
+              'BATCH_CAPTURE_CANCELED',
+            );
+          }
           if (onProgress) {
             onProgress({
               current: i + 1,
@@ -13821,20 +13941,38 @@ export async function batchCaptureByKeywords({
             onTick: reportRetryWaitProgress,
           },
         );
-        await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-          keyword,
-        });
+        const retryResultsReady = await waitForKeywordSearchResultsInTab(
+          runnerTabId,
+          platform,
+          shouldStop,
+          {keyword},
+        );
+        if (!retryResultsReady && isDouyinPlatform(platform)) {
+          throw new Error(
+            `「${keyword}」重试后搜索结果页仍未就绪，已保留后续关键词`,
+          );
+        }
         // 抖音上面刚重新点了搜索,已挂的筛选会被清空:配置了筛选就必须重挂再采,
         // 否则采到的是未筛选(可能好几年前)的内容。
         if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
           await applySearchFiltersInTab(runnerTabId, searchFilters);
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
-          await waitMsWithStop(1200, shouldStop, 'BATCH_CAPTURE_CANCELED');
-          await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-            keyword,
-            timeoutMs: 12000,
-            stablePolls: 1,
-          });
+          const refilteredResultsReady =
+            await waitForKeywordSearchResultsInTab(
+              runnerTabId,
+              platform,
+              shouldStop,
+              {
+                keyword,
+                timeoutMs: 12000,
+                stablePolls: 1,
+              },
+            );
+          if (!refilteredResultsReady) {
+            throw new Error(
+              `「${keyword}」重挂筛选后搜索结果页仍未就绪，已保留后续关键词`,
+            );
+          }
         }
         await closeKeywordSearchFilterPanelInTab(runnerTabId);
         captureRunResult = await runKeywordCapture();
@@ -13845,6 +13983,10 @@ export async function batchCaptureByKeywords({
       const captureFatal =
         isExplicitFatalKeywordFailure(captureRunResult) ||
         isExplicitFatalKeywordFailure(captureResult);
+      const captureFailure = resolveKeywordFailure(
+        captureRunResult,
+        captureResult,
+      );
       if (captureCanceled && readStopRequested()) {
         canceled = true;
         break;
@@ -13863,13 +14005,17 @@ export async function batchCaptureByKeywords({
           keyword,
           ok: false,
           partial: true,
-          fatal: captureFatal,
-          recoverableInterruption: !captureFatal,
+          fatal: captureFatal || captureFailure.fatal,
+          recoverableInterruption: !(captureFatal || captureFailure.fatal),
           error: canceledError,
+          errorCode: captureFailure.code,
+          errorCategory: captureFailure.category,
+          securityBlocked: captureFailure.securityBlocked,
+          requiresManualAction: captureFailure.requiresManualAction,
         };
         results.push(keywordResult);
         failedCount++;
-        if (captureFatal) fatal = true;
+        if (captureFatal || captureFailure.fatal) fatal = true;
       } else if (captureRunResult?.ok) {
         const savedRecords = Array.isArray(captureRunResult.savedRecords)
           ? captureRunResult.savedRecords
@@ -13914,13 +14060,17 @@ export async function batchCaptureByKeywords({
             keyword,
             ok: true,
             partial: true,
-            fatal: captureFatal,
+            fatal: captureFatal || captureFailure.fatal,
             recordIds: partialRecordIds,
             captureCacheStats: captureRunResult?.captureCacheStats || null,
             warning:
               captureRunResult?.error?.message ||
               captureResult?.error?.message ||
               '采集未完整完成',
+            errorCode: captureFailure.code,
+            errorCategory: captureFailure.category,
+            securityBlocked: captureFailure.securityBlocked,
+            requiresManualAction: captureFailure.requiresManualAction,
           };
           results.push(keywordResult);
           successCount++;
@@ -13928,16 +14078,20 @@ export async function batchCaptureByKeywords({
           keywordResult = {
             keyword,
             ok: false,
-            fatal: captureFatal,
+            fatal: captureFatal || captureFailure.fatal,
             error:
               captureRunResult?.error?.message ||
               captureResult?.error?.message ||
               '采集失败',
+            errorCode: captureFailure.code,
+            errorCategory: captureFailure.category,
+            securityBlocked: captureFailure.securityBlocked,
+            requiresManualAction: captureFailure.requiresManualAction,
           };
           results.push(keywordResult);
           failedCount++;
         }
-        if (captureFatal) fatal = true;
+        if (captureFatal || captureFailure.fatal) fatal = true;
       }
     } catch (error) {
       const canceledError = isBatchCaptureCanceledError(error);
@@ -13946,29 +14100,55 @@ export async function batchCaptureByKeywords({
         break;
       }
       const fatalError = isExplicitFatalKeywordFailure(error);
+      const captureFailure = resolveKeywordFailure(error);
       keywordResult = {
         keyword,
         ok: false,
         partial: canceledError,
         recoverableInterruption: canceledError,
-        fatal: fatalError,
+        fatal: fatalError || captureFailure.fatal,
         error: error?.message || '当前关键词采集失败',
-        securityBlocked: isUnattendedSafetyBlock(error),
+        errorCode: captureFailure.code,
+        errorCategory: captureFailure.category,
+        securityBlocked: captureFailure.securityBlocked,
+        requiresManualAction: captureFailure.requiresManualAction,
       };
       results.push(keywordResult);
       failedCount++;
-      if (fatalError) fatal = true;
+      if (fatalError || captureFailure.fatal) fatal = true;
     } finally {
       // captureAndSaveInTab owns its own checkpoint session.
     }
 
     if (
-      keywordResult?.ok === false &&
-      (keywordResult.securityBlocked || isUnattendedSafetyBlock(keywordResult.error))
+      keywordResult?.securityBlocked ||
+      isUnattendedSafetyBlock({
+        code: keywordResult?.errorCode,
+        message: keywordResult?.error || keywordResult?.warning,
+        securityBlocked: keywordResult?.securityBlocked,
+      })
     ) {
       keywordResult.securityBlocked = true;
       securityBlocked = true;
       canceled = true;
+      if (!blockingError) {
+        blockingError = {
+          code: String(
+            keywordResult.errorCode || 'PLATFORM_SAFETY_BLOCK',
+          ).trim(),
+          message: String(
+            keywordResult.error ||
+              keywordResult.warning ||
+              '检测到平台异常，已停止任务',
+          ).trim(),
+          category: String(keywordResult.errorCategory || '').trim(),
+          securityBlocked: true,
+          requiresManualAction: Boolean(
+            keywordResult.requiresManualAction,
+          ),
+          retryable: false,
+        };
+      }
     }
 
     const keywordRecordIds = Array.isArray(keywordResult?.recordIds)
@@ -14219,13 +14399,21 @@ export async function batchCaptureByKeywords({
   }
 
   if (onProgress) {
+    const terminalNeedsAction = Boolean(securityBlocked);
     onProgress({
       current: successCount + failedCount,
       total: keywords.length,
       keyword: '',
-      phase: canceled ? 'canceled' : 'done',
-      message: canceled
-        ? `批量采集已停止：已处理 ${successCount + failedCount}/${keywords.length}，成功 ${successCount}，失败 ${failedCount}`
+      phase: terminalNeedsAction
+        ? 'needs_action'
+        : canceled
+          ? 'canceled'
+          : 'done',
+      message: terminalNeedsAction
+        ? blockingError?.message ||
+          `检测到平台异常，已停止整批任务：已处理 ${successCount + failedCount}/${keywords.length}`
+        : canceled
+          ? `批量采集已停止：已处理 ${successCount + failedCount}/${keywords.length}，成功 ${successCount}，失败 ${failedCount}`
         : `批量采集完成：成功 ${successCount}，失败 ${failedCount}`,
     });
   }
@@ -14234,6 +14422,10 @@ export async function batchCaptureByKeywords({
     ok: !canceled && failedCount === 0,
     canceled,
     securityBlocked,
+    requiresManualAction: Boolean(
+      securityBlocked || blockingError?.requiresManualAction,
+    ),
+    blockingError,
     fatal,
     recoveryRequired,
     results,
@@ -14562,6 +14754,26 @@ async function submitKeywordSearchInTab(
   const normalizedTabId = Number(tabId);
   if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
     return false;
+  }
+
+  const guardResponse = await chrome.runtime
+    .sendMessage({
+      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
+      tabId: normalizedTabId,
+      payload: {action: 'assertNoDouyinSearchServiceAbnormal'},
+    })
+    .catch(() => null);
+  const guardContentResponse = guardResponse?.data;
+  const guardError =
+    guardResponse?.ok === false
+      ? guardResponse?.error
+      : guardContentResponse?.ok === false
+        ? guardContentResponse?.error
+        : null;
+  if (isDouyinSearchServiceAbnormalError(guardError)) {
+    throw createDouyinSearchServiceAbnormalError({
+      message: guardError?.message,
+    });
   }
 
   const result = await chrome.scripting
@@ -15182,6 +15394,55 @@ function isEmptyKeywordCaptureResult(captureResult) {
   return items.length === 0 && rawTotalCount === 0 && filteredCount === 0;
 }
 
+function inspectKeywordSearchPageUrl(
+  pageUrl = '',
+  platform = '',
+  expectedKeyword = '',
+) {
+  if (String(platform || '').trim().toLowerCase() !== 'douyin') {
+    return {searchPathReady: true, keywordConflict: false};
+  }
+  try {
+    const url = new URL(String(pageUrl || ''));
+    const pathname = String(url.pathname || '').toLowerCase();
+    const searchPathReady =
+      !url.searchParams.has('modal_id') &&
+      (pathname.startsWith('/search/') ||
+        pathname.startsWith('/jingxuan/search'));
+    const decodeRepeatedly = (value) => {
+      let decoded = String(value || '');
+      for (let index = 0; index < 2; index += 1) {
+        try {
+          const next = decodeURIComponent(decoded);
+          if (next === decoded) break;
+          decoded = next;
+        } catch {
+          break;
+        }
+      }
+      return decoded;
+    };
+    const normalize = (value) =>
+      String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+    const rawUrlKeyword =
+      url.searchParams.get('keyword') ||
+      url.searchParams.get('query') ||
+      url.searchParams.get('q') ||
+      pathname.split('/search/')[1]?.split('/')[0] ||
+      '';
+    const urlKeyword = normalize(decodeRepeatedly(rawUrlKeyword));
+    const expected = normalize(expectedKeyword);
+    return {
+      searchPathReady,
+      keywordConflict: Boolean(
+        searchPathReady && expected && urlKeyword && urlKeyword !== expected,
+      ),
+    };
+  } catch {
+    return {searchPathReady: false, keywordConflict: false};
+  }
+}
+
 async function waitForKeywordSearchResultsInTab(
   tabId,
   platform = '',
@@ -15266,15 +15527,108 @@ async function waitForKeywordSearchResultsInTab(
               return false;
             }
             const rect = node.getBoundingClientRect();
-            const style = window.getComputedStyle(node);
-            return (
-              rect.width > 8 &&
-              rect.height > 8 &&
-              style.display !== 'none' &&
-              style.visibility !== 'hidden' &&
-              Number(style.opacity || 1) > 0.01
+            if (rect.width <= 8 || rect.height <= 8) {
+              return false;
+            }
+            let current = node;
+            while (current && current.nodeType !== Node.DOCUMENT_NODE) {
+              if (
+                current.hidden === true ||
+                String(current.getAttribute?.('aria-hidden') || '')
+                  .toLowerCase() === 'true'
+              ) {
+                return false;
+              }
+              const style = window.getComputedStyle(current);
+              if (
+                style.display === 'none' ||
+                style.visibility === 'hidden' ||
+                Number(style.opacity || 1) <= 0.01
+              ) {
+                return false;
+              }
+              current = current.parentElement;
+            }
+            return true;
+          };
+          const douyinSearchPathReady = (() => {
+            if (platformKey !== 'douyin') return false;
+            try {
+              const url = new URL(window.location.href);
+              const hostname = String(url.hostname || '').toLowerCase();
+              const pathname = String(url.pathname || '').toLowerCase();
+              return (
+                (hostname === 'douyin.com' ||
+                  hostname.endsWith('.douyin.com')) &&
+                (pathname === '/search' ||
+                  pathname.startsWith('/search/') ||
+                  pathname.startsWith('/jingxuan/search'))
+              );
+            } catch {
+              return false;
+            }
+          })();
+          const douyinResultLinkSelector = [
+            'a[href*="/video/"]',
+            'a[href*="/note/"]',
+            'a[href*="modal_id="]',
+            'a[data-href*="/video/"]',
+            'a[data-href*="/note/"]',
+            'a[data-url*="/video/"]',
+            'a[data-url*="/note/"]',
+          ].join(',');
+          const douyinResultCardSelector = [
+            '.search-result-card',
+            '[id^="waterfall_item_"]',
+            '[data-e2e-aweme-id]',
+            '[data-aweme-id]',
+            '[data-awemeid]',
+            '[data-modal-id]',
+            douyinResultLinkSelector,
+          ].join(',');
+          const isInsideDouyinResultCard = (node) => {
+            if (!node?.closest) return false;
+            if (node.closest(douyinResultCardSelector)) return true;
+            const idContainer = node.closest('[data-id], [data-item-id]');
+            if (!idContainer) return false;
+            const itemId = String(
+              idContainer.getAttribute?.('data-id') ||
+                idContainer.getAttribute?.('data-item-id') ||
+                '',
+            ).trim();
+            return Boolean(
+              /^\d{8,}$/u.test(itemId) ||
+                idContainer.querySelector?.(douyinResultLinkSelector),
             );
           };
+          const serviceAbnormalNode = douyinSearchPathReady
+            ? Array.from(
+                document.querySelectorAll('h1, h2, h3, h4, p, span, div'),
+              ).find((node) => {
+                if (!isVisible(node)) return false;
+                if (isInsideDouyinResultCard(node)) return false;
+                const text = String(node.innerText || node.textContent || '')
+                  .trim()
+                  .replace(/\s+/gu, '');
+                return (
+                  text === '服务出现异常' ||
+                  /^(?:服务出现异常)(?:，|,)?(?:请稍后重试)[。！!]?$/u.test(
+                    text,
+                  )
+                );
+              })
+            : null;
+          if (serviceAbnormalNode) {
+            return {
+              cardCount: 0,
+              keywordMatched: false,
+              pageUrl: window.location.href,
+              signature: '',
+              blockingCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+              blockingMessage:
+                '检测到抖音“服务出现异常”，为避免触发安全审核，已立即停止整条任务',
+            };
+          }
           const hasVisibleMedia = (node) =>
             Boolean(
               node?.querySelector?.(
@@ -15411,6 +15765,7 @@ async function waitForKeywordSearchResultsInTab(
           return {
             cardCount: cardNodes.length,
             keywordMatched,
+            pageUrl: window.location.href,
             signature,
           };
         },
@@ -15419,15 +15774,33 @@ async function waitForKeywordSearchResultsInTab(
       .then(([result]) => result?.result || null)
       .catch(() => null);
 
+    if (
+      String(snapshot?.blockingCode || '').trim().toUpperCase() ===
+      DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE
+    ) {
+      throw createDouyinSearchServiceAbnormalError({
+        message: snapshot?.blockingMessage,
+        pageUrl: snapshot?.pageUrl,
+      });
+    }
+
     const cardCount = Number(snapshot?.cardCount || 0);
     const signature = String(snapshot?.signature || '');
     const keywordMatched = Boolean(snapshot?.keywordMatched);
+    const {searchPathReady, keywordConflict} = inspectKeywordSearchPageUrl(
+      snapshot?.pageUrl || '',
+      platform,
+      keyword,
+    );
     // 宽限期内仍要求关键词字面对上(防抢跑、防读到上一个词的旧结果);
     // 超过宽限期后,只要结果卡片稳定出现就放行,不再因抖音 URL 编码对不上而空等到超时。
     const keywordMatchGraceElapsed =
       Date.now() - startedAt >= BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS;
     const resultsAccepted =
-      cardCount > 0 && (keywordMatched || keywordMatchGraceElapsed);
+      searchPathReady &&
+      !keywordConflict &&
+      cardCount > 0 &&
+      (keywordMatched || keywordMatchGraceElapsed);
     if (
       resultsAccepted &&
       signature &&

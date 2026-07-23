@@ -3,7 +3,7 @@ import {
   Activity, AlertTriangle, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
   CircleAlert, ClipboardList, Database, Eye, FileText, Headphones,
   Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageSquare, Monitor,
-  MoreHorizontal, Radio, RefreshCw, Search, Send, Settings, ShieldCheck,
+  MoreHorizontal, Radio, RefreshCw, Search, Send, ServerCog, Settings, ShieldCheck,
   Sparkles, User, Users,
 } from 'lucide-react'
 import {
@@ -134,8 +134,10 @@ function rootFromPath(path: string, search = ''): RootTab | null {
 
 function BottomNav({ active }: { active: RootTab | null }) {
   const { badges } = useBadges()
+  const { isPlatformAdmin } = useAuth()
   const routerNavigate = useRouterNavigate()
-  const taskCount = badges.triagePending + badges.leadsNew + badges.ticketsPending + badges.feedbackPending + badges.issuesOpen
+  const taskCount = badges.triagePending + badges.leadsNew + badges.ticketsPending
+    + (isPlatformAdmin() ? badges.feedbackPending : 0) + badges.issuesOpen
 
   return (
     <nav aria-label="手机端主导航" className="mobile-bottom-nav relative z-30 grid shrink-0 grid-cols-5 border-t border-border/80 bg-card/95 px-1 pt-1 backdrop-blur-xl">
@@ -160,7 +162,7 @@ function BottomNav({ active }: { active: RootTab | null }) {
   )
 }
 
-function RootHeader({ eyebrow, title, action }: { eyebrow: string; title: string; action?: React.ReactNode }) {
+function RootHeader({ eyebrow, title, badge, action }: { eyebrow: string; title: string; badge?: string; action?: React.ReactNode }) {
   const { tenants, tenantId, switchTenant } = useAuth()
   const current = tenants.find(t => t.id === tenantId)
   return (
@@ -170,7 +172,10 @@ function RootHeader({ eyebrow, title, action }: { eyebrow: string; title: string
           <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.18em] text-primary">
             <span className="h-1.5 w-1.5 rounded-full bg-status-red" />StarVoice · {eyebrow}
           </div>
-          <h1 className="mt-1 truncate text-[25px] font-extrabold leading-tight tracking-[-0.035em]">{title}</h1>
+          <div className="mt-1 flex min-w-0 items-center gap-2">
+            <h1 className="truncate text-[25px] font-extrabold leading-tight tracking-[-0.035em]">{title}</h1>
+            {badge && <span className="shrink-0 rounded border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[8px] font-extrabold uppercase tracking-[0.12em] text-primary">{badge}</span>}
+          </div>
         </div>
         {action}
       </div>
@@ -337,7 +342,7 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
           <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green" style={{ width: `${handledPct}%` }} /></div>
           <div className="mt-3 grid grid-cols-3 divide-x divide-border text-center">
             <MiniMetric label="待判断" value={k.unhandled} />
-            <MiniMetric label="复核中" value={k.reviewing} />
+            <MiniMetric label="负面流程" value={k.reviewing} />
             <MiniMetric label="已关联" value={k.issue_linked} />
           </div>
         </section>
@@ -355,13 +360,15 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
 
 function TasksHub({ openPage }: { openPage: OpenPage }) {
   const { badges } = useBadges()
-  const total = badges.triagePending + badges.leadsNew + badges.ticketsPending + badges.feedbackPending + badges.issuesOpen
+  const { isPlatformAdmin } = useAuth()
+  const adminFeedback = isPlatformAdmin() ? badges.feedbackPending : 0
+  const total = badges.triagePending + badges.leadsNew + badges.ticketsPending + adminFeedback + badges.issuesOpen
   const queues = [
-    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、人工修正、转工单或归档', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
+    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、人工修正、转工单或标记处理模式', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
     { title: '评论分诊', count: badges.leadsNew, copy: '跟进风险评论，转工单或忽略', icon: MessageSquare, tone: 'orange', page: 'workbench', params: { queue: 'leads' } },
     { title: '已转工单', count: badges.ticketsPending, copy: '补充进展、追踪处理并完成结案', icon: Headphones, tone: 'blue', page: 'workbench', params: { queue: 'feedback' } },
     { title: '问题处置', count: badges.issuesOpen, copy: '确认负责人、解决问题或关闭事件', icon: CircleAlert, tone: 'purple', page: 'workbench', params: { queue: 'issues' } },
-    { title: '误判反馈', count: badges.feedbackPending, copy: '核对 AI 与人工判断差异并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } },
+    ...(isPlatformAdmin() ? [{ title: '误判反馈', count: badges.feedbackPending, copy: '核对客户提交的误报并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } }] : []),
   ]
 
   return (
@@ -402,7 +409,7 @@ function MonitorHub({ openPage }: { openPage: OpenPage }) {
   const { badges } = useBadges()
   return (
     <div className="min-h-full pb-5">
-      <RootHeader eyebrow="Watch" title="监测" />
+      <RootHeader eyebrow="Watch" title="监测" badge="BETA" />
       <div className="space-y-5 px-4">
         {badges.monitorAttention > 0 && (
           <button type="button" onClick={() => openPage('monitoring', { tab: 'tasks' })}
@@ -413,6 +420,7 @@ function MonitorHub({ openPage }: { openPage: OpenPage }) {
           </button>
         )}
         <section className="space-y-2">
+          <MonitorCard icon={ServerCog} kicker="设备" title="云端采集任务中心" badge="BETA" copy="查看各浏览器节点的实时进度，并远程继续中断任务" action="打开任务中心" onClick={() => openPage('monitoring', { tab: 'cloud' })} tone="blue" />
           <MonitorCard icon={Activity} kicker="动态" title="关注对象的新内容" copy="按时间线查看最新命中、互动与情感变化" action="看新动态" onClick={() => openPage('monitoring', { tab: 'hits' })} />
           <MonitorCard icon={Bell} kicker="事件" title="正在扩散的风险事件" copy="沿事件时间线查看关联内容和当前处置状态" action="进事件中心" onClick={() => openPage('events')} tone="red" />
           <MonitorCard icon={Radio} kicker="关注" title="监测对象与运行状态" copy="查看频率、最近运行、异常原因并立即扫描" action="管理关注" onClick={() => openPage('monitoring', { tab: 'tasks' })} tone="blue" />
@@ -556,7 +564,7 @@ function MobilePageSurface() {
   const routerNavigate = useRouterNavigate()
   const location = useLocation()
   const { page, params, seq, navigate } = useNav()
-  const { tenantId } = useAuth()
+  const { tenantId, isPlatformAdmin } = useAuth()
   const querySignature = searchParams.toString()
   const query = useMemo(() => Object.fromEntries(searchParams.entries()), [querySignature]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -566,7 +574,9 @@ function MobilePageSurface() {
   }, [page, pageId, params, query, navigate])
 
   const PageComponent = PAGE_COMPONENTS[pageId]
-  const title = pageId === 'workbench' ? (QUEUE_TITLES[query.queue || 'triage'] || PAGE_TITLES[pageId]) : (PAGE_TITLES[pageId] || '功能')
+  const requestedQueue = query.queue || 'triage'
+  const visibleQueue = requestedQueue === 'misjudgments' && !isPlatformAdmin() ? 'triage' : requestedQueue
+  const title = pageId === 'workbench' ? (QUEUE_TITLES[visibleQueue] || PAGE_TITLES[pageId]) : (PAGE_TITLES[pageId] || '功能')
   const backRoot = rootForPage(pageId, query)
 
   return (
@@ -574,7 +584,7 @@ function MobilePageSurface() {
       <header className="mobile-page-header sticky top-0 z-20 flex min-h-[56px] items-center gap-2 border-b border-border/80 bg-background/95 px-2 pt-[env(safe-area-inset-top)] backdrop-blur-xl">
         <button type="button" onClick={() => location.key === 'default' ? routerNavigate(`/m/${backRoot}`, { replace: true }) : routerNavigate(-1)} aria-label="返回"
           className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full active:bg-muted"><ArrowLeft className="h-5 w-5" /></button>
-        <div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">StarVoice mobile</div><h1 className="truncate text-[17px] font-extrabold tracking-[-0.02em]">{title}</h1></div>
+        <div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">StarVoice mobile</div><div className="flex min-w-0 items-center gap-2"><h1 className="truncate text-[17px] font-extrabold tracking-[-0.02em]">{title}</h1>{pageId === 'monitoring' && <span className="shrink-0 rounded border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[8px] font-extrabold uppercase tracking-[0.12em] text-primary">BETA</span>}</div></div>
         <button type="button" onClick={() => routerNavigate('/m/more')} aria-label="更多功能" className="flex h-11 w-11 items-center justify-center rounded-full active:bg-muted"><MoreHorizontal className="h-5 w-5" /></button>
       </header>
       <div className="mobile-feature-page animate-fade-up px-3 py-3" key={`${pageId}:${seq}:${tenantId}:${querySignature}`}>
@@ -627,11 +637,11 @@ function DirectoryRow({ icon: Icon, title, subtitle, onClick, divided = false }:
   )
 }
 
-function MonitorCard({ icon: Icon, kicker, title, copy, action, onClick, tone = 'green' }: { icon: React.ElementType; kicker: string; title: string; copy: string; action: string; onClick: () => void; tone?: string }) {
+function MonitorCard({ icon: Icon, kicker, title, badge, copy, action, onClick, tone = 'green' }: { icon: React.ElementType; kicker: string; title: string; badge?: string; copy: string; action: string; onClick: () => void; tone?: string }) {
   const color = tone === 'red' ? 'text-status-red bg-status-red/10' : tone === 'blue' ? 'text-status-indigo bg-status-blue/10' : 'text-emerald-600 bg-status-green/10 dark:text-emerald-400'
   return (
     <button type="button" onClick={onClick} className="w-full rounded-2xl border border-border bg-card p-4 text-left active:bg-muted">
-      <div className="flex items-start gap-3"><span className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-xl', color)}><Icon className="h-5 w-5" /></span><span className="min-w-0 flex-1"><span className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted-foreground">{kicker}</span><span className="mt-0.5 block text-[15px] font-extrabold">{title}</span></span></div>
+      <div className="flex items-start gap-3"><span className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-xl', color)}><Icon className="h-5 w-5" /></span><span className="min-w-0 flex-1"><span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-muted-foreground">{kicker}{badge && <span className="rounded border border-primary/20 bg-primary/10 px-1 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-primary">{badge}</span>}</span><span className="mt-0.5 block text-[15px] font-extrabold">{title}</span></span></div>
       <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{copy}</p>
       <span className="mt-3 inline-flex items-center gap-1 text-[11px] font-bold text-primary">{action}<ChevronRight className="h-3.5 w-3.5" /></span>
     </button>

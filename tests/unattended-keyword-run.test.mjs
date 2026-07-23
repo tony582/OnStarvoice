@@ -9,6 +9,7 @@ import {
   mergeKeywordAttemptResults,
   normalizeUnattendedKeywordCheckpoint,
   reconcileEnhancementRetryCheckpoint,
+  runUnattendedKeywordAttempts,
   settleUnattendedKeywordCheckpoint,
   summarizeUnattendedKeywordCheckpoint,
 } from "../utils/unattended-keyword-run.js";
@@ -303,6 +304,110 @@ test("retry merge keeps a successful result even if a stale failure follows", ()
   assert.equal(merged.results[0].ok, true);
 });
 
+test("page drift fails keyword one, continues keyword two, then retries only keyword one", async () => {
+  const planKeywords = ["词1", "词2"];
+  let checkpoint = normalizeUnattendedKeywordCheckpoint({}, planKeywords);
+  const captureOrder = [];
+  const retryEvents = [];
+
+  const run = await runUnattendedKeywordAttempts({
+    allKeywords: planKeywords,
+    initialPendingKeywords: planKeywords,
+    maxAttempts: 2,
+    runAttempt: async ({keywords: attemptKeywords, attempt}) => {
+      const results = [];
+      for (const keyword of attemptKeywords) {
+        captureOrder.push({attempt, keyword});
+        const pageDrifted = attempt === 1 && keyword === "词1";
+        const result = pageDrifted
+          ? {
+              keyword,
+              ok: false,
+              recoverableInterruption: true,
+              error: "搜索结果页被视频页替换",
+            }
+          : {keyword, ok: true, recordIds: [`record-${keyword}`]};
+        results.push(result);
+        const settled = settleUnattendedKeywordCheckpoint({
+          checkpoint,
+          keywords: planKeywords,
+          round: 1,
+          originalIndex: planKeywords.indexOf(keyword),
+          keyword,
+          result,
+          recordIds: result.recordIds || [],
+          attempt,
+          maxAttempts: 2,
+        });
+        checkpoint = settled.checkpoint;
+      }
+      const success = results.filter((item) => item.ok === true).length;
+      return {
+        ok: success === results.length,
+        canceled: false,
+        securityBlocked: false,
+        results,
+        stats: {
+          total: attemptKeywords.length,
+          processed: results.length,
+          success,
+          failed: results.length - success,
+        },
+      };
+    },
+    selectRetryKeywords: ({keywords: failedKeywords}) =>
+      failedKeywords.filter((keyword) => {
+        const entry = checkpoint.keywordResults.find(
+          (candidate) => candidate.keyword === keyword,
+        );
+        return Number(entry?.attemptCount || 0) < 2;
+      }),
+    onRetryScheduled: ({keywords: retryKeywords, attempt}) => {
+      retryEvents.push({attempt, keywords: retryKeywords});
+    },
+  });
+
+  assert.deepEqual(captureOrder, [
+    {attempt: 1, keyword: "词1"},
+    {attempt: 1, keyword: "词2"},
+    {attempt: 2, keyword: "词1"},
+  ]);
+  assert.deepEqual(retryEvents, [{attempt: 2, keywords: ["词1"]}]);
+  assert.equal(run.result.ok, true);
+  assert.deepEqual(
+    run.result.results.map((item) => [item.keyword, item.ok]),
+    [
+      ["词1", true],
+      ["词2", true],
+    ],
+  );
+  assert.deepEqual(run.result.stats, {
+    total: 2,
+    processed: 2,
+    success: 2,
+    failed: 0,
+  });
+  assert.deepEqual(
+    checkpoint.keywordResults.map((entry) => [
+      entry.keyword,
+      entry.status,
+      entry.attemptCount,
+    ]),
+    [
+      ["词1", "completed", 2],
+      ["词2", "completed", 1],
+    ],
+  );
+  assert.deepEqual(summarizeUnattendedKeywordCheckpoint(checkpoint), {
+    completed: 2,
+    partial: 0,
+    failed: 0,
+    skipped: 0,
+    saved: 2,
+    retries: 1,
+  });
+});
+
 test("successful enhancement retry reconciles partial keyword without consuming another keyword attempt", () => {
   const checkpoint = normalizeUnattendedKeywordCheckpoint(
     {
@@ -387,7 +492,71 @@ test("platform safety signals are circuit breakers", () => {
   assert.equal(isUnattendedSafetyBlock("请重新登录后继续"), true);
   assert.equal(isUnattendedSafetyBlock("账号触发安全验证"), true);
   assert.equal(isUnattendedSafetyBlock({code: "ACCOUNT_FORBIDDEN"}), true);
+  assert.equal(
+    isUnattendedSafetyBlock({
+      code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+    }),
+    true,
+  );
+  assert.equal(
+    isUnattendedSafetyBlock({
+      securityBlocked: true,
+      code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+    }),
+    true,
+  );
+  assert.equal(
+    isUnattendedSafetyBlock("服务出现异常"),
+    false,
+    "plain copy alone is not structured evidence and may be a work title",
+  );
   assert.equal(isUnattendedSafetyBlock("导航超时"), false);
+});
+
+test("service-abnormal checkpoint preserves structured stop evidence", () => {
+  const planKeywords = ["品牌词"];
+  const checkpoint = normalizeUnattendedKeywordCheckpoint({}, planKeywords);
+  const settled = settleUnattendedKeywordCheckpoint({
+    checkpoint,
+    keywords: planKeywords,
+    round: 1,
+    originalIndex: 0,
+    keyword: "品牌词",
+    result: {
+      ok: false,
+      error: "检测到抖音服务异常",
+      errorCode: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+      errorCategory: "platform_service_abnormal",
+      securityBlocked: true,
+      requiresManualAction: true,
+    },
+    securityBlocked: true,
+    attempt: 1,
+    maxAttempts: 2,
+  });
+
+  assert.equal(settled.entry.status, "failed");
+  assert.equal(
+    settled.entry.errorCode,
+    "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+  );
+  assert.equal(
+    settled.entry.errorCategory,
+    "platform_service_abnormal",
+  );
+  assert.equal(settled.entry.securityBlocked, true);
+  assert.equal(settled.entry.requiresManualAction, true);
+
+  const restored = normalizeUnattendedKeywordCheckpoint(
+    settled.checkpoint,
+    planKeywords,
+  );
+  assert.equal(
+    restored.keywordResults[0].errorCode,
+    "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+  );
+  assert.equal(restored.keywordResults[0].securityBlocked, true);
+  assert.equal(restored.keywordResults[0].requiresManualAction, true);
 });
 
 test("round-level orchestration cannot start a second enhancement retry budget", async () => {

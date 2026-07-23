@@ -27,14 +27,14 @@ const G = {
   risk: '舆情风险指数(0~100)=负面率/负面评论/高危未关闭问题/告警 加权,封顶 100。≥70 重点处置,≥45 风险抬升,≥20 持续观察。是促处置的相对警戒分,非概率。',
   heat: '舆情热度指数=内容数/互动/新评论/观测 加权综合,无固定上限;数值本身无绝对含义,只看相对高低与环比。',
   official: '官方响应率=有官方回复的内容数 ÷ 总声量。',
-  pending: '待处理=进入处置队列、尚未转工单也未归档的内容(已排除官方内容与"已响应且零负评")。',
+  pending: '待处理=进入处理队列、尚未转工单、官方已评或标记无需操作的内容。',
   sentiment: '情感由 AI 标注为 正面/中性/负面;"待标注"单列为灰色、不并入中性。',
   platform: '平台分布=各平台内容条数与负面率;注:平台字段缺失的内容会默认归到小红书,占比可能略有偏差。',
   category: '主题分类由 AI 归入 9 类(安全救援/续费收费/服务质量 等),其中安全/续费/服务为车企高优先级风险议题。',
   topInteraction: '按 点赞+评论+收藏+转发 之和排序的高互动内容(采集时刻快照)。',
   topNegative: '重点负面=按 负评/转发/互动 加权排序的负面内容,可逐条点开核实处置。',
   negativeComment: '负面评论为评论层风险线索,带风险等级(低~严重),与内容层"负面"是两套口径。',
-  workflow: '处置漏斗:待处理 → 已转工单 → 归档/误报;配合官方响应、未关闭问题看监测→处置闭环。',
+  workflow: '处置漏斗:待处理/负面流程 → 已转工单、官方已评或无需操作;配合未关闭问题看监测→处置闭环。',
   hotTerms: '热词来自标题/正文/摘要/标签的文本挖掘,与"监控关键词"(只统计监控订阅采集)口径不同。',
   media: '媒体/来源类型来自内容的类型字段(record_type / mediaType)。',
 }
@@ -952,11 +952,10 @@ function CommentRisks({ rows }: { rows: any[] }) {
 
 function WorkflowSummary({ snapshot }: { snapshot: any }) {
   const rows = [
-    ['待处理/复核', snapshot.workflowStats?.active_inbox || 0, 'unhandled'],
+    ['待处理/负面流程', snapshot.workflowStats?.active_inbox || 0, 'unhandled'],
     ['已转工单', snapshot.workflowStats?.issue_linked || 0, 'issue_linked'],
-    ['官方已响应', snapshot.workflowStats?.official_responded || 0, 'official_responded'],
-    ['已归档', snapshot.workflowStats?.archived || 0, 'archived'],
-    ['误报', snapshot.workflowStats?.false_positive || 0, 'false_positive'],
+    ['官方已评', snapshot.workflowStats?.official_responded || 0, 'official_responded'],
+    ['无需操作', snapshot.workflowStats?.no_action || 0, 'no_action'],
     ['未关闭问题', snapshot.issueStats?.open_issues || 0, 'medium'],
   ]
   return (

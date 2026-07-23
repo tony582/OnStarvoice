@@ -1,3 +1,21 @@
+type ApiRequestOptions = RequestInit & {
+  skipTenant?: boolean
+  timeoutMs?: number
+}
+
+type ApiCallOptions = {
+  skipTenant?: boolean
+  timeoutMs?: number
+}
+
+function responseMessage(data: unknown, fallback: string) {
+  if (!data || typeof data !== 'object') return fallback
+  const response = data as { message?: unknown; error?: unknown }
+  if (typeof response.message === 'string' && response.message) return response.message
+  if (typeof response.error === 'string' && response.error) return response.error
+  return fallback
+}
+
 class ApiClient {
   private tenantId = ''
 
@@ -9,7 +27,7 @@ class ApiClient {
     return this.tenantId
   }
 
-  async request<T = any>(path: string, options: RequestInit & { skipTenant?: boolean } = {}): Promise<T> {
+  async request<T = unknown>(path: string, options: ApiRequestOptions = {}): Promise<T> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...(options.headers as Record<string, string> || {}),
@@ -18,15 +36,40 @@ class ApiClient {
       headers['x-tenant-id'] = this.tenantId
     }
 
-    const { skipTenant, ...fetchOptions } = options
+    const { timeoutMs, ...fetchOptions } = options
+    delete fetchOptions.skipTenant
+    const timeoutController =
+      Number.isFinite(timeoutMs) &&
+      Number(timeoutMs) > 0 &&
+      !fetchOptions.signal
+        ? new AbortController()
+        : null
+    const timeoutId = timeoutController
+      ? window.setTimeout(() => timeoutController.abort(), Number(timeoutMs))
+      : null
 
-    const resp = await fetch(`/api${path}`, {
-      credentials: 'same-origin',
-      ...fetchOptions,
-      headers,
-    })
+    let resp: Response
+    try {
+      resp = await fetch(`/api${path}`, {
+        credentials: 'same-origin',
+        ...fetchOptions,
+        ...(timeoutController ? { signal: timeoutController.signal } : {}),
+        headers,
+      })
+    } catch (error) {
+      if (timeoutController?.signal.aborted) {
+        const timeoutError = new Error(
+          '请求超时，云端暂未完成分配。请检查网络后重试；系统会自动识别重复提交。',
+        ) as Error & { cause?: unknown }
+        timeoutError.cause = error
+        throw timeoutError
+      }
+      throw error
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId)
+    }
 
-    let data: any
+    let data: unknown
     try {
       data = await resp.json()
     } catch {
@@ -34,29 +77,29 @@ class ApiClient {
     }
 
     if (!resp.ok) {
-      throw new Error(data.message || data.error || '请求失败')
+      throw new Error(responseMessage(data, '请求失败'))
     }
 
     return data as T
   }
 
-  get<T = any>(path: string, opts?: { skipTenant?: boolean }) {
+  get<T = unknown>(path: string, opts?: ApiCallOptions) {
     return this.request<T>(path, opts)
   }
 
-  post<T = any>(path: string, body?: unknown, opts?: { skipTenant?: boolean }) {
+  post<T = unknown>(path: string, body?: unknown, opts?: ApiCallOptions) {
     return this.request<T>(path, { method: 'POST', body: JSON.stringify(body), ...opts })
   }
 
-  patch<T = any>(path: string, body?: unknown, opts?: { skipTenant?: boolean }) {
+  patch<T = unknown>(path: string, body?: unknown, opts?: ApiCallOptions) {
     return this.request<T>(path, { method: 'PATCH', body: JSON.stringify(body), ...opts })
   }
 
-  put<T = any>(path: string, body?: unknown, opts?: { skipTenant?: boolean }) {
+  put<T = unknown>(path: string, body?: unknown, opts?: ApiCallOptions) {
     return this.request<T>(path, { method: 'PUT', body: JSON.stringify(body), ...opts })
   }
 
-  delete<T = any>(path: string, opts?: { skipTenant?: boolean }) {
+  delete<T = unknown>(path: string, opts?: ApiCallOptions) {
     return this.request<T>(path, { method: 'DELETE', ...opts })
   }
 
@@ -67,7 +110,7 @@ class ApiClient {
     const resp = await fetch(`/api${path}`, { credentials: 'same-origin', headers })
     if (!resp.ok) {
       let msg = '导出失败'
-      try { const d = await resp.json(); msg = d.message || d.error || msg } catch { /* ignore */ }
+      try { msg = responseMessage(await resp.json(), msg) } catch { /* ignore */ }
       throw new Error(msg)
     }
     const blob = await resp.blob()

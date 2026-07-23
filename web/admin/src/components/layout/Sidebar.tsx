@@ -18,18 +18,18 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 ]
 
 // 舆情工作台下的二级队列(在侧边栏纵向展开,替代主区横向卡片带)
-const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string }> = [
+const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string; platformAdmin?: boolean }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
   { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsPending', dot: 'bg-violet-500' },
-  { queue: 'misjudgments', label: '误判反馈', badgeKey: 'feedbackPending', dot: 'bg-rose-500' },
+  { queue: 'misjudgments', label: '误判反馈', badgeKey: 'feedbackPending', dot: 'bg-rose-500', platformAdmin: true },
 ]
 
 const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
-    { id: 'monitoring', label: '关注博主', icon: Radar, badgeKeys: ['monitorAttention'] },
+    { id: 'monitoring', label: '监测与采集', icon: Radar, badgeKeys: ['monitorAttention'], tag: 'BETA' },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'data', label: '数据底座', icon: Database },
@@ -208,6 +208,7 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
               <div className="relative mb-1 mt-0.5 space-y-0.5 pl-[26px]">
                 <span className="absolute bottom-1.5 left-[18px] top-1.5 w-px bg-sidebar-border" />
                 {WORKBENCH_QUEUES.map(q => {
+                  if (q.platformAdmin && !isPlatformAdmin()) return null
                   const on = onWorkbench && activeQueue === q.queue
                   const count = q.badgeKey ? badges[q.badgeKey] : 0
                   return (
@@ -253,16 +254,24 @@ function NavButton({ item, active, sectionActive, badges, onClick }: {
       )}>
       <Icon className={cn('h-[17px] w-[17px] shrink-0 transition-colors', hot ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground')} strokeWidth={hot ? 2 : 1.6} />
       <span className="truncate">{item.label}</span>
-      {badgeCount > 0 ? (
-        <span className={cn(
-          'ml-auto inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
-          isAttention ? 'bg-status-orange/20 text-amber-600 dark:text-amber-400' : 'bg-primary/12 text-primary',
-        )}>{badgeCount > 99 ? '99+' : badgeCount}</span>
-      ) : item.tag ? (
-        <span className="ml-auto rounded bg-status-green/15 px-1.5 text-[8.5px] font-bold tracking-wide text-emerald-600 dark:text-emerald-400">{item.tag}</span>
-      ) : active && !sectionActive ? (
-        <ChevronRight className="ml-auto h-3.5 w-3.5 text-muted-foreground" />
-      ) : null}
+      <span className="ml-auto flex shrink-0 items-center gap-1">
+        {item.tag && (
+          <span className={cn(
+            'rounded px-1.5 text-[8.5px] font-bold tracking-wide',
+            item.tag === 'BETA'
+              ? 'border border-primary/20 bg-primary/10 text-primary'
+              : 'bg-status-green/15 text-emerald-600 dark:text-emerald-400',
+          )}>{item.tag}</span>
+        )}
+        {badgeCount > 0 ? (
+          <span className={cn(
+            'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
+            isAttention ? 'bg-status-orange/20 text-amber-600 dark:text-amber-400' : 'bg-primary/12 text-primary',
+          )}>{badgeCount > 99 ? '99+' : badgeCount}</span>
+        ) : active && !sectionActive ? (
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+        ) : null}
+      </span>
     </button>
   )
 }

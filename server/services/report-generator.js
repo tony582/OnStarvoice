@@ -55,7 +55,7 @@ const TRIAGE_LABEL = {
   issue_linked: '已转工单',
   ticketed: '已转工单',
   official_responded: '官方已响应',
-  archived: '已归档',
+  no_action: '无需操作',
   false_positive: '误报',
 };
 const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
@@ -594,14 +594,14 @@ async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
        COUNT(*) FILTER (WHERE r.official_response_status = 'responded') as official_responded,
        COUNT(*) FILTER (
          WHERE COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
-           AND r.record_type <> 'official_content'
+          AND rt.archived_at IS NULL
+          AND r.record_type <> 'official_content'
            AND NOT (r.official_response_status = 'responded' AND r.negative_comment_count = 0)
        ) as active_inbox,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') as unhandled,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') as reviewing,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) as issue_linked,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'archived') as archived,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'false_positive') as false_positive
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'no_action') as no_action
      FROM records r
      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
      WHERE r.tenant_id = $1
@@ -678,8 +678,7 @@ async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
       unhandled: rowNum(workflowStats, 'unhandled'),
       reviewing: rowNum(workflowStats, 'reviewing'),
       issue_linked: rowNum(workflowStats, 'issue_linked'),
-      archived: rowNum(workflowStats, 'archived'),
-      false_positive: rowNum(workflowStats, 'false_positive'),
+      no_action: rowNum(workflowStats, 'no_action'),
     },
     triagePeriod,
     collectionStats: {

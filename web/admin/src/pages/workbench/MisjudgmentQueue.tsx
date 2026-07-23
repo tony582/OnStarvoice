@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ArrowDown, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink,
-  FileWarning, Loader2, RefreshCw, Search, Sparkles, User,
+  FileText, FileWarning, Loader2, RefreshCw, Search, User,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
@@ -83,7 +83,7 @@ const EMPTY_COUNTS: FeedbackCounts = {
 const STATUS_TABS: Array<{ key: FeedbackStatus; label: string }> = [
   { key: 'pending', label: '待复核' },
   { key: 'reviewed', label: '已复核' },
-  { key: 'summarized', label: '已纳入总结' },
+  { key: 'summarized', label: '已记录' },
   { key: '', label: '全部' },
 ]
 
@@ -95,7 +95,7 @@ const TYPE_LABELS: Record<string, string> = {
 const REVIEW_LABELS: Record<string, string> = {
   pending: '待复核',
   reviewed: '已复核',
-  summarized: '已纳入总结',
+  summarized: '已记录',
   dismissed: '已忽略',
 }
 
@@ -198,17 +198,17 @@ export function MisjudgmentQueue() {
   }
 
   const updateStatus = async (item: FeedbackItem, nextStatus: ReviewAction) => {
-    const actionLabel = nextStatus === 'reviewed' ? '标为已复核' : '纳入总结'
+    const actionLabel = nextStatus === 'reviewed' ? '标为已复核' : '保存记录'
     const note = await ask({
       title: actionLabel,
       placeholder: nextStatus === 'reviewed'
         ? '可填写复核结论、补充说明'
-        : '请填写本次总结主题、结论或规则调整建议',
+        : '请填写本次复核结论或内部备注',
       confirmLabel: actionLabel,
       required: nextStatus === 'summarized',
-      requiredMessage: '请填写总结结论后再确认',
+      requiredMessage: '请填写记录内容后再确认',
       helpText: nextStatus === 'summarized'
-        ? '必填。该结论会作为后续整理并提供给 AI 的依据。'
+        ? '必填。仅保存为内部复核记录，不会发送给 AI，也不会触发模型学习。'
         : '选填。可记录复核结论或补充说明。',
     })
     if (note === null) return
@@ -238,7 +238,7 @@ export function MisjudgmentQueue() {
   return (
     <div className="space-y-3">
       <p className="text-[13px] text-muted-foreground">
-        集中查看误报和人工纠正，由后台定期复核并纳入总结；反馈不会直接触发模型自动学习。
+        平台管理员集中复核客户提交的误报和人工纠正；所有结论仅作为内部记录，不会发送给 AI，也不会触发模型学习。
       </p>
 
       <WorkbenchTabs tabs={tabs} activeKey={status} onChange={key => setStatus(key as FeedbackStatus)} />
@@ -521,8 +521,8 @@ function MobileFeedbackCard({
               disabled={Boolean(busyAction)}
               onClick={() => onUpdate(item, 'summarized')}
             >
-              {summarizedBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-              纳入总结
+              {summarizedBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileText className="h-3.5 w-3.5" />}
+              保存记录
             </Button>
           )}
           {canWrite && (reviewStatus === 'summarized' || reviewStatus === 'dismissed') && (
@@ -621,8 +621,8 @@ function FeedbackRow({
             )}
             {reviewStatus !== 'summarized' && reviewStatus !== 'dismissed' && (
               <Button variant={reviewStatus === 'reviewed' ? 'default' : 'outline'} size="sm" disabled={Boolean(busyAction)} onClick={() => onUpdate(item, 'summarized')}>
-                {summarizedBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                纳入总结
+                {summarizedBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileText className="h-3.5 w-3.5" />}
+                保存记录
               </Button>
             )}
             {(reviewStatus === 'summarized' || reviewStatus === 'dismissed') && (

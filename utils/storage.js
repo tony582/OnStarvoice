@@ -195,9 +195,26 @@ export async function setAuth(auth) {
 /**
  * 更新 auth 部分字段
  */
-export async function updateAuth(updates) {
-  const current = await getAuth();
-  return await setAuth({...current, ...updates});
+export async function updateAuth(updates, options = {}) {
+  const mutate = async () => {
+    const current = await getAuth();
+    const expectedMutationId = options.expectedMutationId;
+    if (
+      expectedMutationId !== undefined &&
+      String(current.authMutationId || '') !== String(expectedMutationId || '')
+    ) {
+      return {accepted: false, auth: current};
+    }
+    const auth = {...current, ...updates};
+    const saved = await setAuth(auth);
+    if (!saved) return {accepted: false, auth: current, error: 'write_failed'};
+    return {accepted: true, auth};
+  };
+  const locks = globalThis.navigator?.locks;
+  if (typeof locks?.request === 'function') {
+    return await locks.request('onstarvoice:auth-state', {mode: 'exclusive'}, mutate);
+  }
+  return await mutate();
 }
 
 /**
@@ -223,6 +240,8 @@ function getDefaultAuth() {
     credentialCredit: null,
     credential: null,
     binding: null,
+    captureAgent: null,
+    authMutationId: '',
     tenant: null,
   };
 }
@@ -634,13 +653,51 @@ export async function getTaskLedger() {
  * 这里不改写旧数据，也不会把缺失字段推断成完整历史。
  */
 export async function getLegacyTaskCenterState() {
-  const [plan, request] = await Promise.all([
+  const [plan, request, archive, auth] = await Promise.all([
     getItem(STORAGE_KEY.UNATTENDED_KEYWORD_PLAN),
     getItem(STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST),
+    getItem(STORAGE_KEY.UNATTENDED_KEYWORD_RUN_ARCHIVE),
+    getItem(STORAGE_KEY.AUTH),
   ]);
+  const currentAgentScopeId = String(
+    auth?.captureAgent?.id || "",
+  ).trim();
+  const archiveAgentScopeId = String(archive?.agentScopeId || "").trim();
+  const archiveScopeMatches =
+    !archiveAgentScopeId ||
+    !currentAgentScopeId ||
+    archiveAgentScopeId === currentAgentScopeId;
+  const requestScopeMatches = (candidate) => {
+    const requestAgentScopeId = String(
+      candidate?.cloudAgentScopeId || "",
+    ).trim();
+    return (
+      !requestAgentScopeId ||
+      !currentAgentScopeId ||
+      requestAgentScopeId === currentAgentScopeId
+    );
+  };
+  const archivedRequests =
+    archiveScopeMatches &&
+    archive?.requests &&
+    typeof archive.requests === "object" &&
+    !Array.isArray(archive.requests)
+      ? archive.requests
+      : {};
   return {
     plan,
     request,
+    requestRecoveryAllowed: requestScopeMatches(request),
+    recoverableRequestIds: Object.entries(archivedRequests)
+      .filter(
+        ([, archivedRequest]) =>
+          archivedRequest &&
+          typeof archivedRequest === "object" &&
+          requestScopeMatches(archivedRequest) &&
+          !String(archivedRequest.recoveryDismissedAt || "").trim(),
+      )
+      .map(([requestId]) => String(requestId || "").trim())
+      .filter(Boolean),
   };
 }
 
