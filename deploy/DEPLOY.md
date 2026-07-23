@@ -44,7 +44,7 @@ cp deploy/onstarvoice.env.production.example server/.env.production
 # 编辑 server/.env.production:
 #   - DATABASE_URL 的 PG 密码(与 minilife 的 .env 里一致)
 #   - ADMIN_PASSWORD 设强密码
-#   - LLM_* / SMTP_* / FEISHU_*  从本地 server/.env 抄过来
+#   - LLM_* / DASHSCOPE_* / QWEN_OCR_* / SMTP_* / FEISHU_* 从本地 server/.env 抄过来
 ```
 该文件已被 .gitignore,不会进仓库。
 

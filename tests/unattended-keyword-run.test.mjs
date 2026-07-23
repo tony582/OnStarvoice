@@ -492,7 +492,71 @@ test("platform safety signals are circuit breakers", () => {
   assert.equal(isUnattendedSafetyBlock("请重新登录后继续"), true);
   assert.equal(isUnattendedSafetyBlock("账号触发安全验证"), true);
   assert.equal(isUnattendedSafetyBlock({code: "ACCOUNT_FORBIDDEN"}), true);
+  assert.equal(
+    isUnattendedSafetyBlock({
+      code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+    }),
+    true,
+  );
+  assert.equal(
+    isUnattendedSafetyBlock({
+      securityBlocked: true,
+      code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+    }),
+    true,
+  );
+  assert.equal(
+    isUnattendedSafetyBlock("服务出现异常"),
+    false,
+    "plain copy alone is not structured evidence and may be a work title",
+  );
   assert.equal(isUnattendedSafetyBlock("导航超时"), false);
+});
+
+test("service-abnormal checkpoint preserves structured stop evidence", () => {
+  const planKeywords = ["品牌词"];
+  const checkpoint = normalizeUnattendedKeywordCheckpoint({}, planKeywords);
+  const settled = settleUnattendedKeywordCheckpoint({
+    checkpoint,
+    keywords: planKeywords,
+    round: 1,
+    originalIndex: 0,
+    keyword: "品牌词",
+    result: {
+      ok: false,
+      error: "检测到抖音服务异常",
+      errorCode: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+      errorCategory: "platform_service_abnormal",
+      securityBlocked: true,
+      requiresManualAction: true,
+    },
+    securityBlocked: true,
+    attempt: 1,
+    maxAttempts: 2,
+  });
+
+  assert.equal(settled.entry.status, "failed");
+  assert.equal(
+    settled.entry.errorCode,
+    "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+  );
+  assert.equal(
+    settled.entry.errorCategory,
+    "platform_service_abnormal",
+  );
+  assert.equal(settled.entry.securityBlocked, true);
+  assert.equal(settled.entry.requiresManualAction, true);
+
+  const restored = normalizeUnattendedKeywordCheckpoint(
+    settled.checkpoint,
+    planKeywords,
+  );
+  assert.equal(
+    restored.keywordResults[0].errorCode,
+    "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+  );
+  assert.equal(restored.keywordResults[0].securityBlocked, true);
+  assert.equal(restored.keywordResults[0].requiresManualAction, true);
 });
 
 test("round-level orchestration cannot start a second enhancement retry budget", async () => {

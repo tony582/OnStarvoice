@@ -2,11 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity, AlertTriangle, ArrowLeft, Bot, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
   CircleOff, ClipboardList, CloudCog, History, Laptop, ListChecks, Loader2, Pencil, Play, Plus,
-  RefreshCw, Save, ServerCog, Settings2, Square, Wifi, WifiOff, X,
+  Network, RefreshCw, Save, ServerCog, Settings2, Square, Wifi, WifiOff, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 import { Button } from '@/components/ui/button'
+import {
+  OrchestrationComposerDrawer,
+  OrchestrationDetailWorkspace,
+} from './cloud-tasks'
 
 type CaptureEnhancementSettings = {
   autoDetailCaptureAfterListCapture?: boolean
@@ -63,10 +67,13 @@ type CloudAgent = {
   last_heartbeat_at?: string | null
   last_error?: string
   online: boolean
+  active_task_count?: number
+  queued_task_count?: number
 }
 
 type CloudTask = {
   id: string
+  parent_task_id?: string | null
   assigned_agent_id?: string | null
   origin_agent_id?: string | null
   client_task_id: string
@@ -79,10 +86,13 @@ type CloudTask = {
   status: string
   effective_status?: string
   progress?: Record<string, unknown>
+  checkpoint?: Record<string, unknown>
   counts?: Record<string, unknown>
+  metadata?: Record<string, unknown>
   message?: string
   error?: Record<string, unknown>
   attempt_number?: number
+  orchestration_revision?: number
   heartbeat_at?: string | null
   business_progress_at?: string | null
   created_at?: string | null
@@ -1100,6 +1110,10 @@ const ATTENTION_TASK_STATUSES = new Set(['interrupted', 'needs_action', 'failed'
 
 function isBusinessVisibleTask(task: CloudTask) {
   const type = String(task.task_type || '').toLowerCase()
+  if (type === 'capture_orchestration') return true
+  // 多 Agent 父任务是业务对象；其每个 Agent 子任务只在编排详情中展示，
+  // 避免一个 20 关键词任务在主列表里膨胀成多条技术记录。
+  if (task.parent_task_id || task.metadata?.orchestrationChild === true) return false
   // 计划保存/覆盖和采集链内同步是系统动作，不应占据业务任务队列。
   if (type === 'unattended_plan_configuration' || type === 'sync' || type.endsWith('_sync')) return false
   // 被恢复任务接替的旧记录保留在服务端审计中，不再作为一条独立业务任务重复展示。
@@ -1272,6 +1286,9 @@ function TaskAssignmentDrawer({
                     const blockReason = agentAssignmentBlockReason(agent, mode)
                     const selected = selectedAgentId === agent.id
                     const agentTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))
+                    const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
+                    const activeTaskCount = workloadKnown ? safeNumber(agent.active_task_count) : agentTasks.length
+                    const queuedTaskCount = workloadKnown ? safeNumber(agent.queued_task_count) : 0
                     return (
                       <button key={agent.id} type="button" role="radio" aria-checked={selected} disabled={Boolean(blockReason)}
                         onClick={() => setSelectedAgentId(agent.id)}
@@ -1285,7 +1302,14 @@ function TaskAssignmentDrawer({
                           <span className="mt-1 block text-xs text-muted-foreground">{agent.host_label} › {agent.browser_name} · {agent.operating_system} · v{agent.app_version || '未知'}</span>
                           <span className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
                             <span>{agentCreatePlatforms(agent).map(value => PLATFORM_LABELS[value] || value).join('、') || '无可用平台'}</span>
-                            <span>{agentTasks.length > 0 ? `${agentTasks.length} 个任务正在执行或排队` : '当前空闲'}</span>
+                            <span>
+                              {activeTaskCount > 0
+                                ? `执行中 ${activeTaskCount}`
+                                : queuedTaskCount > 0
+                                  ? '当前无执行任务'
+                                  : '当前空闲'}
+                              {queuedTaskCount > 0 ? ` · 排队 ${queuedTaskCount}` : ''}
+                            </span>
                           </span>
                           {blockReason && <span className="mt-1.5 block text-[11px] font-medium text-status-red">{blockReason}</span>}
                           {!blockReason && !agent.online && <span className="mt-1.5 block text-[11px] font-medium text-amber-700 dark:text-amber-300">设备离线；分配后会排队，上线即执行</span>}
@@ -1363,6 +1387,9 @@ function DeviceAgentCard({
 }) {
   const [open, setOpen] = useState(false)
   const relatedActiveTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))
+  const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
+  const activeTaskCount = workloadKnown ? safeNumber(agent.active_task_count) : relatedActiveTasks.length
+  const queuedTaskCount = workloadKnown ? safeNumber(agent.queued_task_count) : 0
   const blockReason = agentAssignmentBlockReason(agent, 'one_time')
   const hasPlan = hasConfiguredUnattendedPlan(agent.unattended_plan)
 
@@ -1383,7 +1410,10 @@ function DeviceAgentCard({
             {agentCreatePlatforms(agent).length > 0
               ? agentCreatePlatforms(agent).map(platform => <span key={platform} className="rounded-md bg-primary/8 px-2 py-1 text-[10px] font-medium text-primary">{PLATFORM_LABELS[platform] || platform}</span>)
               : <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">无可用平台</span>}
-            <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{relatedActiveTasks.length ? `${relatedActiveTasks.length} 个任务` : '空闲'}</span>
+            <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">
+              {activeTaskCount > 0 ? `执行中 ${activeTaskCount}` : queuedTaskCount > 0 ? '无执行任务' : '空闲'}
+              {queuedTaskCount > 0 ? ` · 排队 ${queuedTaskCount}` : ''}
+            </span>
           </div>
         </div>
       </div>
@@ -1422,23 +1452,26 @@ function TaskCard({
   actionTaskId,
   onResume,
   onStop,
+  onOpenOrchestration,
 }: {
   task: CloudTask
   writable: boolean
   actionTaskId: string
   onResume: (task: CloudTask) => Promise<void>
   onStop: (task: CloudTask) => Promise<void>
+  onOpenOrchestration: (task: CloudTask) => void
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const effectiveStatus = task.effective_status || task.status
   const progress = taskProgress(task)
-  const resumable = canResume(task)
-  const stoppable = canStop(task)
+  const orchestration = task.task_type === 'capture_orchestration'
+  const resumable = !orchestration && canResume(task)
+  const stoppable = !orchestration && canStop(task)
   const commandPending = Boolean(task.pending_command_id)
   const stopPending = task.pending_command_type === 'stop'
   const resumeBlocked = resumable ? resumeBlockReason(task) : ''
   const taskError = taskErrorText(task)
-  const taskMode = task.source === 'cloud' && task.task_type.includes('plan') ? '自动计划' : task.source === 'cloud' ? '一次性任务' : '设备任务'
+  const taskMode = orchestration ? '多 Agent 编排' : task.source === 'cloud' && task.task_type.includes('plan') ? '自动计划' : task.source === 'cloud' ? '一次性任务' : '设备任务'
 
   return (
     <article className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
@@ -1450,18 +1483,33 @@ function TaskCard({
             <span className="text-[11px] text-muted-foreground">{taskMode}</span>
           </div>
           <h4 className="mt-2.5 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
-          <div className="mt-2 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-            <ClipboardList className="h-3.5 w-3.5 shrink-0 text-primary" />
-            <span className="shrink-0">任务</span><ChevronRight className="h-3.5 w-3.5 shrink-0" />
-            <Bot className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate text-foreground">{task.agent_host_label || '未分配设备'} › {task.agent_display_name || '未分配节点'}</span>
-            <span className={`shrink-0 ${task.agent_online ? 'text-status-green' : ''}`}>{task.agent_online ? '在线' : '离线'}</span>
-          </div>
+          {orchestration ? (
+            <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <ClipboardList className="h-3.5 w-3.5 shrink-0 text-primary" />
+              <span>父任务</span><ChevronRight className="h-3.5 w-3.5 shrink-0" />
+              <Network className="h-3.5 w-3.5 shrink-0 text-primary" />
+              <span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词工作项</span>
+              <span>· 分配版本 {task.orchestration_revision || 0}</span>
+            </div>
+          ) : (
+            <div className="mt-2 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+              <ClipboardList className="h-3.5 w-3.5 shrink-0 text-primary" />
+              <span className="shrink-0">任务</span><ChevronRight className="h-3.5 w-3.5 shrink-0" />
+              <Bot className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate text-foreground">{task.agent_host_label || '未分配设备'} › {task.agent_display_name || '未分配节点'}</span>
+              <span className={`shrink-0 ${task.agent_online ? 'text-status-green' : ''}`}>{task.agent_online ? '在线' : '离线'}</span>
+            </div>
+          )}
           {task.message && <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{task.message}</p>}
           {taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-2 text-xs leading-5 text-status-red">{taskError}</p>}
         </div>
-        {(resumable || stoppable || commandPending) && (
+        {(orchestration || resumable || stoppable || commandPending) && (
           <div className="flex shrink-0 flex-wrap gap-2 sm:justify-end">
+            {orchestration && (
+              <Button size="sm" onClick={() => onOpenOrchestration(task)}>
+                <Network className="h-4 w-4" /> 查看编排
+              </Button>
+            )}
             {resumable && !commandPending && (
               <Button size="sm" onClick={() => void onResume(task)} disabled={!writable || Boolean(resumeBlocked) || actionTaskId === task.id}>
                 {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -1492,13 +1540,24 @@ function TaskCard({
       </button>
       {detailsOpen && (
         <div className="mt-2 grid gap-2 rounded-xl bg-muted/45 p-3 text-[11px] text-muted-foreground sm:grid-cols-2">
-          <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>
-          <div>任务心跳：<span className="text-foreground">{formatTime(task.heartbeat_at)}</span></div>
-          <div>业务进展：<span className="text-foreground">{formatTime(task.business_progress_at)}</span></div>
-          <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
-          {task.attempt_number ? <div>执行次数：<span className="text-foreground">第 {task.attempt_number} 次</span></div> : null}
-          {commandPending && task.pending_command_expires_at ? <div>指令保留至：<span className="text-foreground">{formatTime(task.pending_command_expires_at)}</span></div> : null}
-          {resumeBlocked && !commandPending ? <div className="text-status-red sm:col-span-2">继续阻断：{resumeBlocked}</div> : null}
+          {orchestration ? (
+            <>
+              <div>关键词工作项：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 项</span></div>
+              <div>已结算：<span className="text-foreground">{safeNumber(task.progress?.current)} 项</span></div>
+              <div>分配版本：<span className="text-foreground">第 {task.orchestration_revision || 0} 版</span></div>
+              <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
+            </>
+          ) : (
+            <>
+              <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>
+              <div>任务心跳：<span className="text-foreground">{formatTime(task.heartbeat_at)}</span></div>
+              <div>业务进展：<span className="text-foreground">{formatTime(task.business_progress_at)}</span></div>
+              <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
+              {task.attempt_number ? <div>执行次数：<span className="text-foreground">第 {task.attempt_number} 次</span></div> : null}
+              {commandPending && task.pending_command_expires_at ? <div>指令保留至：<span className="text-foreground">{formatTime(task.pending_command_expires_at)}</span></div> : null}
+              {resumeBlocked && !commandPending ? <div className="text-status-red sm:col-span-2">继续阻断：{resumeBlocked}</div> : null}
+            </>
+          )}
         </div>
       )}
     </article>
@@ -1516,7 +1575,19 @@ export function CloudTasksTab() {
   const [actionTaskId, setActionTaskId] = useState('')
   const [taskView, setTaskView] = useState<TaskView>('active')
   const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(null)
+  const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)
+  const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(null)
+  const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
   const loadGeneration = useRef(0)
+  const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
+
+  const closeOrchestrationComposer = useCallback(() => {
+    setOrchestrationComposerOpen(false)
+  }, [])
+
+  const closeOrchestrationDetail = useCallback(() => {
+    setSelectedOrchestrationId(null)
+  }, [])
 
   const load = useCallback(async (quiet = false) => {
     const generation = ++loadGeneration.current
@@ -1546,6 +1617,53 @@ export function CloudTasksTab() {
       window.clearInterval(timer)
     }
   }, [load])
+
+  useEffect(() => {
+    if (!selectedOrchestrationId) return
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
+    const focusTimer = window.setTimeout(() => {
+      const initialFocus = orchestrationDetailDialogRef.current?.querySelector<HTMLElement>('[data-dialog-initial-focus]')
+      if (initialFocus) initialFocus.focus()
+      else orchestrationDetailDialogRef.current?.focus()
+    }, 0)
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeOrchestrationDetail()
+        return
+      }
+      if (event.key !== 'Tab' || !orchestrationDetailDialogRef.current) return
+      const focusable = Array.from(orchestrationDetailDialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      )).filter(element => !element.hasAttribute('hidden') && element.getAttribute('aria-hidden') !== 'true')
+      if (focusable.length === 0) {
+        event.preventDefault()
+        orchestrationDetailDialogRef.current.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.clearTimeout(focusTimer)
+      window.removeEventListener('keydown', onKeyDown)
+      document.body.style.overflow = previousOverflow
+      previouslyFocused?.focus()
+    }
+  }, [closeOrchestrationDetail, selectedOrchestrationId])
 
   const groupedAgents = useMemo(() => {
     const groups = new Map<string, CloudAgent[]>()
@@ -1639,8 +1757,11 @@ export function CloudTasksTab() {
             <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
             </Button>
-            <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建关键词采集任务">
-              <Plus className="h-4 w-4" /> 新建任务
+            <Button variant="outline" size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建单节点关键词采集任务">
+              <Plus className="h-4 w-4" /> 单节点任务
+            </Button>
+            <Button size="sm" onClick={() => setOrchestrationComposerOpen(true)} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建多 Agent 编排任务">
+              <Network className="h-4 w-4" /> 多 Agent 编排
             </Button>
           </div>
         </div>
@@ -1682,12 +1803,18 @@ export function CloudTasksTab() {
               {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
               <div className="mt-3 text-sm font-semibold">{taskView === 'active' ? '当前没有执行中或排队中的任务' : taskView === 'attention' ? '当前没有需要人工处理的任务' : '最近任务中还没有历史记录'}</div>
               <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">{taskView === 'active' ? '新建任务后，先分配一个执行节点；节点离线时会保留在云端队列。' : taskView === 'attention' ? '中断、失败和部分失败会集中出现在这里。' : '已完成、已停止和已跳过的任务会进入历史。'}</p>
-              {taskView === 'active' && canWrite() && <Button size="sm" onClick={() => setComposerIntent({})} className="mt-4"><Plus className="h-4 w-4" /> 新建任务</Button>}
+              {taskView === 'active' && canWrite() && (
+                <div className="mt-4 flex justify-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setComposerIntent({})}><Plus className="h-4 w-4" /> 单节点任务</Button>
+                  <Button size="sm" onClick={() => setOrchestrationComposerOpen(true)}><Network className="h-4 w-4" /> 多 Agent 编排</Button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="space-y-3">
               {visibleTasks.map(task => (
-                <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop} />
+                <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
+                  onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
               ))}
             </div>
           )}
@@ -1738,6 +1865,44 @@ export function CloudTasksTab() {
             setFeedback('任务已创建并分配给指定执行节点。')
             await load(true)
           }} />
+      )}
+
+      <OrchestrationComposerDrawer
+        open={orchestrationComposerOpen}
+        writable={canWrite()}
+        agents={overview?.agents || []}
+        onClose={closeOrchestrationComposer}
+        onChanged={async () => {
+          setOrchestrationRefreshKey(value => value + 1)
+          await load(true)
+        }}
+        onDispatched={async result => {
+          setFeedback(`多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
+          setOrchestrationRefreshKey(value => value + 1)
+          await load(true)
+        }}
+      />
+
+      {selectedOrchestrationId && (
+        <div ref={orchestrationDetailDialogRef}
+          className="fixed inset-0 z-[60] overflow-y-auto bg-black/35 p-0 outline-none sm:p-4 lg:p-8"
+          role="dialog" aria-modal="true" aria-labelledby="orchestration-detail-title" tabIndex={-1}
+          onMouseDown={event => {
+            if (event.target === event.currentTarget) closeOrchestrationDetail()
+          }}>
+          <div className="mx-auto max-w-6xl">
+            <OrchestrationDetailWorkspace
+              orchestrationId={selectedOrchestrationId}
+              refreshKey={orchestrationRefreshKey}
+              writable={canWrite()}
+              onClose={closeOrchestrationDetail}
+              onChanged={async () => {
+                setOrchestrationRefreshKey(value => value + 1)
+                await load(true)
+              }}
+            />
+          </div>
+        </div>
       )}
     </div>
   )

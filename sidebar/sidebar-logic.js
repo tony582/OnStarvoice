@@ -111,6 +111,10 @@ import {
   summarizeUnattendedKeywordCheckpoint,
 } from "../utils/unattended-keyword-run.js";
 import {
+  DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE,
+  DOUYIN_SEARCH_SERVICE_ABNORMAL_MESSAGE,
+} from "../utils/capture/douyin-search-guard.js";
+import {
   AUTH_CODE_VIEW_MODE,
   ensureEncryptedAuthCode,
   ensurePlainAuthCode,
@@ -272,6 +276,7 @@ function buildSidebarTaskRun(taskContext, patch = {}) {
       new Set([
         "completed",
         "completed_with_failures",
+        "needs_action",
         "failed",
         "canceled",
       ]).has(status)
@@ -339,6 +344,18 @@ function finishSidebarTask(
       ? {
           code: String(error?.code || ""),
           message: String(error?.message || error || ""),
+          ...(error?.category
+            ? {category: String(error.category)}
+            : {}),
+          ...(error?.securityBlocked === true
+            ? {securityBlocked: true}
+            : {}),
+          ...(error?.requiresManualAction === true
+            ? {requiresManualAction: true}
+            : {}),
+          ...(typeof error?.retryable === "boolean"
+            ? {retryable: error.retryable}
+            : {}),
         }
       : null,
   });
@@ -424,6 +441,9 @@ function resolveCaptureTaskTerminalStatus({
   }
   if (taskStatus === "skipped") {
     return {reason: "skipped", status: "skipped"};
+  }
+  if (taskStatus === "needs_action") {
+    return {reason: "needs_action", status: "needs_action"};
   }
   if (
     taskStatus === "partial" ||
@@ -13600,7 +13620,13 @@ async function handleBatchKeywordCapture(options = {}) {
     const streamingSyncTaskIssue = buildStreamingSyncTaskIssue(
       streamingSyncResult,
     );
-    if (autoLoop) {
+    if (result?.securityBlocked) {
+      showMessage(
+        result?.blockingError?.message ||
+          "检测到平台异常，已立即停止整批任务，请人工确认后再继续",
+        "warning",
+      );
+    } else if (autoLoop) {
       const stopped = result.canceled || batchKeywordCancelRequested;
       showMessage(
         `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
@@ -13617,12 +13643,20 @@ async function handleBatchKeywordCapture(options = {}) {
         stats.failed > 0 ? "warning" : "success",
       );
     }
-    sidebarTaskStatus =
-      result?.canceled || batchKeywordCancelRequested
+    sidebarTaskStatus = result?.securityBlocked
+      ? "needs_action"
+      : result?.canceled || batchKeywordCancelRequested
         ? "canceled"
         : totalFailed > 0 || streamingSyncTaskIssue
           ? "completed_with_failures"
           : "completed";
+    if (
+      result?.securityBlocked &&
+      result?.blockingError &&
+      typeof result.blockingError === "object"
+    ) {
+      sidebarTaskError = {...result.blockingError};
+    }
     if (streamingSyncTaskIssue && !sidebarTaskError) {
       sidebarTaskError = streamingSyncTaskIssue;
     }
@@ -13642,6 +13676,13 @@ async function handleBatchKeywordCapture(options = {}) {
         !streamingSyncTaskIssue,
       canceled: Boolean(result?.canceled || batchKeywordCancelRequested),
       securityBlocked: Boolean(result?.securityBlocked),
+      requiresManualAction: Boolean(result?.requiresManualAction),
+      fatal: Boolean(result?.fatal),
+      blockingError:
+        result?.blockingError &&
+        typeof result.blockingError === "object"
+          ? {...result.blockingError}
+          : null,
       result,
       rounds: round,
       totalSuccess,
@@ -15884,8 +15925,19 @@ async function runUnattendedKeywordPlanRequest(request) {
     }
     if (batchRunResult?.securityBlocked) {
       unattendedCaptureTaskStatus = "completed_with_failures";
-      const safetyMessage =
-        "检测到验证码、登录失效或平台安全限制，已暂停整批任务且不会自动连续重试";
+      const blockingError =
+        batchRunResult?.blockingError &&
+        typeof batchRunResult.blockingError === "object"
+          ? batchRunResult.blockingError
+          : {};
+      const blockingCode =
+        String(blockingError?.code || "").trim().toUpperCase() ||
+        "PLATFORM_SAFETY_BLOCK";
+      const isDouyinServiceAbnormal =
+        blockingCode === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE;
+      const safetyMessage = isDouyinServiceAbnormal
+        ? DOUYIN_SEARCH_SERVICE_ABNORMAL_MESSAGE
+        : "检测到验证码、登录失效或平台安全限制，已暂停整批任务且不会自动连续重试";
       const safetySummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
       const finishedAt = new Date().toISOString();
       await reportUnattendedTerminalRun(
@@ -15906,7 +15958,14 @@ async function runUnattendedKeywordPlanRequest(request) {
             summary: safetySummary,
             streamingSync: batchRunResult?.streamingSync,
           }),
-          error: {code: "PLATFORM_SAFETY_BLOCK", message: safetyMessage},
+          error: {
+            code: blockingCode,
+            message: safetyMessage,
+            category: String(blockingError?.category || ""),
+            securityBlocked: true,
+            requiresManualAction: true,
+            retryable: false,
+          },
         },
         {attemptId: requestAttemptId},
       );

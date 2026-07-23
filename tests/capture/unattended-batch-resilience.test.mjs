@@ -7,6 +7,10 @@ const captureSyncSource = await readFile(
   new URL("../../utils/capture-sync.js", import.meta.url),
   "utf8",
 );
+const contentSource = await readFile(
+  new URL("../../content-v2.js", import.meta.url),
+  "utf8",
+);
 
 function readBatchFunctionSource() {
   const startMarker = "export async function batchCaptureByKeywords({";
@@ -42,9 +46,12 @@ function createBatchHarness({
   afterKeywordCapture = null,
   switchDouyinKeyword = null,
   waitForResults = null,
+  hasActiveFilters = false,
 } = {}) {
   const captureCalls = [];
+  const filterCalls = [];
   const navigationCalls = [];
+  const submitCalls = [];
   const settled = [];
   const progress = [];
   const liveTabs = new Map([
@@ -112,7 +119,7 @@ function createBatchHarness({
     createCaptureRequestId: () => "list-run-test",
     formatEnhanceSkipReason: (reason) => reason || "",
     getCurrentActiveTab: async () => liveTabs.get(101),
-    hasActiveBatchSearchFilters: () => false,
+    hasActiveBatchSearchFilters: () => hasActiveFilters,
     isBatchCaptureCanceledError: (error) =>
       ["BATCH_CAPTURE_CANCELED", "DETAIL_CAPTURE_CANCELED"].includes(
         String(error?.message || ""),
@@ -127,7 +134,17 @@ function createBatchHarness({
     isDouyinPlatform: (platform) => platform === "douyin",
     isEmptyKeywordCaptureResult: (result) =>
       Boolean(result?.ok && Array.isArray(result?.data?.items) && result.data.items.length === 0),
-    isUnattendedSafetyBlock: (value) => Boolean(value?.securityBlocked),
+    isUnattendedSafetyBlock: (value) =>
+      Boolean(
+        value?.securityBlocked ||
+          value?.platformSafetyBlocked ||
+          String(value?.code || "").toUpperCase() ===
+            "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+      ),
+    applySearchFiltersInTab: async (tabId, filters) => {
+      filterCalls.push({tabId, filters});
+      return {applied: true};
+    },
     navigateToSearchUrl: async (tabId, url) => {
       navigationCalls.push({tabId, url});
     },
@@ -139,7 +156,9 @@ function createBatchHarness({
       sourcePageUrl: "",
     }),
     setCaptureTaskTakeoverStateInTab: async () => {},
-    submitKeywordSearchInTab: async () => {},
+    submitKeywordSearchInTab: async (tabId, platform, keyword) => {
+      submitCalls.push({tabId, platform, keyword});
+    },
     switchDouyinKeywordSearchInTab: async (tabId, keyword, url) => {
       navigationCalls.push({tabId, keyword, url, platform: "douyin"});
       if (typeof switchDouyinKeyword === "function") {
@@ -168,17 +187,20 @@ function createBatchHarness({
       afterKeywordCapture: options.afterKeywordCapture ?? afterKeywordCapture,
       onKeywordSettled: async (payload) => settled.push(payload),
       onProgress: (payload) => progress.push(payload),
+      searchFilters: options.searchFilters || null,
       shouldStop: options.shouldStop || (() => false),
     });
 
   return {
     captureCalls,
+    filterCalls,
     navigationCalls,
     progress,
     getReplacementListenerCount: () => replacementListeners.size,
     replaceRunnerTab,
     run,
     settled,
+    submitCalls,
   };
 }
 
@@ -251,6 +273,94 @@ test("a drifted Douyin search page fails only the current keyword and continues"
   assert.equal(harness.settled[0].result.ok, false);
   assert.equal(harness.settled[1].keyword, "词2");
   assert.equal(harness.settled[1].result.ok, true);
+});
+
+test("Douyin service-abnormal state stops immediately without retrying or opening the next keyword", async () => {
+  let readinessChecks = 0;
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    hasActiveFilters: true,
+    waitForResults: async () => {
+      readinessChecks += 1;
+      if (readinessChecks === 1) return true;
+      const error = new Error(
+        "检测到抖音“服务出现异常”，为避免触发安全审核，已立即停止整条任务",
+      );
+      error.code = "DOUYIN_SEARCH_SERVICE_ABNORMAL";
+      error.securityBlocked = true;
+      error.platformSafetyBlocked = true;
+      error.requiresManualAction = true;
+      error.stopBatch = true;
+      error.fatal = true;
+      throw error;
+    },
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+    searchFilters: {sort: "latest", publishTime: "day"},
+  });
+
+  assert.equal(result.canceled, true);
+  assert.equal(result.securityBlocked, true);
+  assert.equal(result.requiresManualAction, true);
+  assert.equal(result.blockingError.code, "DOUYIN_SEARCH_SERVICE_ABNORMAL");
+  assert.deepEqual(harness.captureCalls, []);
+  assert.equal(harness.filterCalls.length, 1);
+  assert.equal(
+    harness.submitCalls.length,
+    0,
+    "the filter retry path must not submit another search",
+  );
+  assert.deepEqual(
+    harness.navigationCalls.map((entry) => entry.keyword),
+    ["词1"],
+    "the second keyword must never start",
+  );
+  assert.equal(harness.settled.length, 1);
+  assert.equal(harness.settled[0].keyword, "词1");
+  assert.equal(harness.settled[0].securityBlocked, true);
+  assert.equal(harness.progress.at(-1)?.phase, "needs_action");
+});
+
+test("Douyin checks the service-abnormal guard before clicking search or filters", () => {
+  const submitStart = captureSyncSource.indexOf(
+    "async function submitKeywordSearchInTab(",
+  );
+  const submitEnd = captureSyncSource.indexOf(
+    "async function switchDouyinKeywordSearchInTab(",
+    submitStart,
+  );
+  const submitSource = captureSyncSource.slice(submitStart, submitEnd);
+  const guardIndex = submitSource.indexOf(
+    "action: 'assertNoDouyinSearchServiceAbnormal'",
+  );
+  const clickScriptIndex = submitSource.indexOf(
+    "const result = await chrome.scripting",
+  );
+  assert.ok(guardIndex > -1);
+  assert.ok(clickScriptIndex > guardIndex);
+
+  assert.match(
+    contentSource,
+    /case "assertNoDouyinSearchServiceAbnormal":[\s\S]*handleAssertNoDouyinSearchServiceAbnormal/u,
+  );
+  const filterStart = contentSource.indexOf(
+    "async function applyBatchSearchFilters({",
+  );
+  const filterEnd = contentSource.indexOf(
+    "async function prepareKeywordStrategyCapture()",
+    filterStart,
+  );
+  const filterSource = contentSource.slice(filterStart, filterEnd);
+  const filterGuardIndex = filterSource.indexOf(
+    "assertNoDouyinSearchServiceAbnormalPage();",
+  );
+  const filterRequestsIndex = filterSource.indexOf("const filterRequests =");
+  assert.ok(filterGuardIndex > -1);
+  assert.ok(filterRequestsIndex > filterGuardIndex);
 });
 
 test("Douyin readiness rejects recommendation, detail, modal, and another keyword URLs", () => {

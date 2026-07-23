@@ -1,3 +1,5 @@
+import {DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE} from "./capture/douyin-search-guard.js";
+
 const DEFAULT_MAX_ATTEMPTS = 2;
 
 function text(value) {
@@ -44,6 +46,33 @@ export function normalizeUnattendedKeywordCheckpoint(
     const key = buildCheckpointKeywordKey(round, keyword);
     if (!keyword || !keywordSet.has(keyword) || seen.has(key)) continue;
     seen.add(key);
+    const rawError =
+      rawEntry?.error && typeof rawEntry.error === "object"
+        ? rawEntry.error
+        : null;
+    const errorCode = text(
+      rawEntry?.errorCode ||
+        rawEntry?.error_code ||
+        rawError?.code,
+    );
+    const errorCategory = text(
+      rawEntry?.errorCategory ||
+        rawEntry?.error_category ||
+        rawError?.category,
+    );
+    const securityBlocked = Boolean(
+      rawEntry?.securityBlocked ||
+        rawEntry?.security_blocked ||
+        rawEntry?.platformSafetyBlocked ||
+        rawEntry?.platform_safety_blocked ||
+        rawError?.securityBlocked ||
+        rawError?.platformSafetyBlocked,
+    );
+    const requiresManualAction = Boolean(
+      rawEntry?.requiresManualAction ||
+        rawEntry?.requires_manual_action ||
+        rawError?.requiresManualAction,
+    );
     keywordResults.push({
       round,
       // 旧快照中的 DOM/index 可能已经失真；永远按当前计划关键词顺序重算。
@@ -52,7 +81,11 @@ export function normalizeUnattendedKeywordCheckpoint(
       status: text(rawEntry?.status) || "failed",
       attemptCount: nonNegativeInt(rawEntry?.attemptCount),
       savedCount: nonNegativeInt(rawEntry?.savedCount),
-      error: text(rawEntry?.error),
+      error: text(rawError?.message || rawEntry?.error),
+      ...(errorCode ? {errorCode} : {}),
+      ...(errorCategory ? {errorCategory} : {}),
+      ...(securityBlocked ? {securityBlocked: true} : {}),
+      ...(requiresManualAction ? {requiresManualAction: true} : {}),
       finishedAt: text(rawEntry?.finishedAt),
     });
   }
@@ -164,10 +197,22 @@ export function summarizeUnattendedKeywordCheckpoint(checkpoint = {}) {
 export function isUnattendedSafetyBlock(value) {
   const valueText = text(value?.message || value).toLowerCase();
   const codeText = text(value?.code || value?.reason).toLowerCase();
+  const explicitSafetyCodes = new Set([
+    "platform_safety_block",
+    "security_verification_required",
+    "page_challenge_block",
+    "xhs_security_block",
+    "http_429",
+    "rate_limited",
+    DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE.toLowerCase(),
+  ]);
   return (
-    /(captcha|login|auth|security|risk|forbidden|account|challenge)/i.test(
-      codeText,
-    ) ||
+    value?.securityBlocked === true ||
+    value?.security_blocked === true ||
+    value?.platformSafetyBlocked === true ||
+    value?.platform_safety_blocked === true ||
+    explicitSafetyCodes.has(codeText) ||
+    /(captcha|login|auth|security|risk|forbidden|account|challenge)/i.test(codeText) ||
     /(验证码|人机验证|安全限制|安全验证|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|重新登录|账号异常|账号限制|captcha|security.?block|security.?check|login.?required|risk.?control|challenge)/i.test(
       valueText,
     )
@@ -200,11 +245,45 @@ export function mergeKeywordAttemptResults({
   return {
     ok: !next?.canceled && !next?.securityBlocked && failed === 0,
     canceled: Boolean(previous?.canceled || next?.canceled),
+    fatal: Boolean(
+      previous?.fatal ||
+        next?.fatal ||
+        results.some((item) => item?.fatal),
+    ),
     securityBlocked: Boolean(
       previous?.securityBlocked ||
         next?.securityBlocked ||
         results.some((item) => item?.securityBlocked),
     ),
+    requiresManualAction: Boolean(
+      previous?.requiresManualAction ||
+        next?.requiresManualAction ||
+        results.some((item) => item?.requiresManualAction),
+    ),
+    blockingError:
+      next?.blockingError ||
+      previous?.blockingError ||
+      (() => {
+        const blockedItem = results.find(
+          (item) => item?.securityBlocked || item?.requiresManualAction,
+        );
+        return blockedItem
+          ? {
+              code: text(blockedItem?.errorCode),
+              message: text(
+                blockedItem?.error?.message ||
+                  blockedItem?.error ||
+                  blockedItem?.warning,
+              ),
+              category: text(blockedItem?.errorCategory),
+              securityBlocked: Boolean(blockedItem?.securityBlocked),
+              requiresManualAction: Boolean(
+                blockedItem?.requiresManualAction,
+              ),
+              retryable: false,
+            }
+          : null;
+      })(),
     results,
     stats: {
       total: allKeywords.length,
@@ -314,6 +393,8 @@ export async function runUnattendedKeywordAttempts({
     if (
       attemptResult?.canceled ||
       attemptResult?.securityBlocked ||
+      attemptResult?.fatal ||
+      attemptResult?.requiresManualAction ||
       stopRequested()
     ) {
       break;
@@ -499,7 +580,37 @@ export function settleUnattendedKeywordCheckpoint({
       unexpectedExplicitEnhanceSkip ||
       result?.commentsResult?.phase === "comments_partial",
   );
-  const status = securityBlocked
+  const resultError =
+    result?.error && typeof result.error === "object"
+      ? result.error
+      : null;
+  const resolvedErrorCode = text(
+    result?.errorCode ||
+      result?.error_code ||
+      resultError?.code,
+  );
+  const resolvedErrorCategory = text(
+    result?.errorCategory ||
+      result?.error_category ||
+      resultError?.category,
+  );
+  const resolvedSecurityBlocked = Boolean(
+    securityBlocked ||
+      result?.securityBlocked ||
+      result?.platformSafetyBlocked ||
+      resultError?.securityBlocked ||
+      resultError?.platformSafetyBlocked ||
+      isUnattendedSafetyBlock({
+        code: resolvedErrorCode,
+        message: resultError?.message,
+      }),
+  );
+  const requiresManualAction = Boolean(
+    resolvedSecurityBlocked ||
+      result?.requiresManualAction ||
+      resultError?.requiresManualAction,
+  );
+  const status = resolvedSecurityBlocked
     ? "failed"
     : canceled
       ? "partial"
@@ -528,14 +639,20 @@ export function settleUnattendedKeywordCheckpoint({
       Array.isArray(recordIds) ? recordIds.length : 0,
     ),
     error: text(
-      result?.error?.message ||
+      resultError?.message ||
         result?.error ||
         result?.warning ||
         (unexpectedExplicitEnhanceSkip
           ? "已采到列表记录，但采集增强目标未完整解析"
           : "") ||
-        (securityBlocked ? "触发平台安全限制" : ""),
+        (resolvedSecurityBlocked ? "触发平台保护性暂停" : ""),
     ),
+    ...(resolvedErrorCode ? {errorCode: resolvedErrorCode} : {}),
+    ...(resolvedErrorCategory
+      ? {errorCategory: resolvedErrorCategory}
+      : {}),
+    ...(resolvedSecurityBlocked ? {securityBlocked: true} : {}),
+    ...(requiresManualAction ? {requiresManualAction: true} : {}),
     finishedAt,
   };
 

@@ -12,7 +12,8 @@ import {
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { RecordImageGallery, recordDisplayImages } from '@/components/shared/RecordImageGallery'
+import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
+import { recordDisplayImageEntries } from '@/components/shared/record-images'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
 
@@ -221,7 +222,8 @@ export function TicketDrawer({
   const closed = t.status === 'closed'
   const postUrl = t.url || rec?.url || cmt?.record_url || ''
   const cover = recordCover(rec, t)
-  const images = recordDisplayImages(rec)
+  const imageEntries = recordDisplayImageEntries(rec)
+  const images = imageEntries.map(item => item.url)
   const resolvedIdentity = rec ? identityLabel(rec.source_type, rec.author_fans, rec.author_name, rec.identity_override) : ''
   const timeline = buildTimeline(t, notes)
   const tabs = [
@@ -367,7 +369,14 @@ export function TicketDrawer({
                         <p className="text-sm leading-relaxed text-muted-foreground">{rec.ai_summary}</p>
                       </div>
                     )}
-                    <RecordImageGallery key={`${rec?.id || t.id}-${images.join('|')}`} images={images} onOpen={setLightbox} />
+                    <RecordImageGallery
+                      key={`${rec?.id || t.id}-${imageEntries.map(item => `${item.url}::${item.ref}`).join('|')}`}
+                      recordId={rec?.id ? String(rec.id) : undefined}
+                      canRefresh={canWrite}
+                      images={images}
+                      imageRefs={imageEntries.map(item => item.ref)}
+                      onOpen={setLightbox}
+                    />
                   </div>
                 )}
 

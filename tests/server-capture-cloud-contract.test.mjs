@@ -17,6 +17,9 @@ import {
 } from "../server/services/capture-cloud.js";
 import {
   captureTaskSnapshotFingerprint,
+  orchestrationCheckpointEntries,
+  orchestrationCheckpointInteger,
+  orchestrationCheckpointTimestamp,
   resolveStopCommandOutcome,
 } from "../server/routes/capture-cloud.js";
 
@@ -124,6 +127,163 @@ test("snapshot fingerprints deduplicate exact replays without collapsing later p
       ...snapshot,
       updatedAt: "2026-07-21T14:01:00.000Z",
     }),
+  );
+});
+
+test("orchestration checkpoint projection never reopens a terminal activeKeyword", () => {
+  const terminalEntries = orchestrationCheckpointEntries({
+    status: "completed",
+    progress: {keyword: "雪佛兰", phase: "completed"},
+    checkpoint: {
+      activeKeyword: "雪佛兰",
+      activePhase: "completed",
+      keywordResults: [
+        {keyword: "雪佛兰", status: "completed", attemptCount: 1, savedCount: 20},
+      ],
+    },
+  });
+  assert.deepEqual(
+    terminalEntries.map(entry => [entry.keyword, entry.status]),
+    [["雪佛兰", "completed"]],
+  );
+
+  const resumedEntries = orchestrationCheckpointEntries({
+    status: "running",
+    progress: {keyword: "凯迪拉克", phase: "initializing_unattended"},
+    checkpoint: {
+      // The local checkpoint deliberately retains the previously settled word.
+      activeKeyword: "雪佛兰",
+      activePhase: "completed",
+      keywordResults: [
+        {keyword: "雪佛兰", status: "completed", attemptCount: 1, savedCount: 20},
+      ],
+    },
+  });
+  assert.deepEqual(
+    resumedEntries.map(entry => [entry.keyword, entry.status]),
+    [["雪佛兰", "completed"], ["凯迪拉克", "running"]],
+  );
+});
+
+test("operator cancellation is absorbing against late child heartbeats", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    mirror,
+    /WHERE capture_tasks\.status NOT IN \('superseded', 'canceled'\)/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /capture_task_items\.status <> 'canceled' OR \$1 = 'canceled'/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /capture_task_item_attempts\.status <> 'canceled' OR \$1 = 'canceled'/u,
+  );
+});
+
+test("orchestration checkpoint database values are bounded and timestamp-safe", () => {
+  assert.equal(orchestrationCheckpointInteger(-4), 0);
+  assert.equal(orchestrationCheckpointInteger("17.9"), 17);
+  assert.equal(orchestrationCheckpointInteger(Number.POSITIVE_INFINITY), 0);
+  assert.equal(orchestrationCheckpointInteger(2147483648), 2147483647);
+  assert.equal(
+    orchestrationCheckpointTimestamp("2026-07-23T08:30:00+08:00"),
+    "2026-07-23T00:30:00.000Z",
+  );
+  assert.equal(orchestrationCheckpointTimestamp("not-a-date"), null);
+  assert.equal(orchestrationCheckpointTimestamp(""), null);
+});
+
+test("orchestration control outcomes lock parent before updating items", () => {
+  const helper = readRouteSection(
+    "async function projectOrchestrationChildControlOutcome",
+    "async function projectOrchestrationSnapshot",
+  );
+  const parentLock = helper.indexOf("await lockOrchestrationParent");
+  const itemUpdate = helper.indexOf("UPDATE capture_task_items");
+  const attemptUpdate = helper.indexOf("UPDATE capture_task_item_attempts");
+  assert.ok(parentLock >= 0);
+  assert.ok(itemUpdate > parentLock);
+  assert.ok(attemptUpdate > itemUpdate);
+  assert.match(
+    helper,
+    /status NOT IN \([\s\S]*'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'/u,
+  );
+  assert.match(helper, /return refreshOrchestrationParentTask/u);
+});
+
+test("create command failures and successful stops settle orchestration work items", () => {
+  const expiry = readRouteSection(
+    "async function expireStaleCommands",
+    "async function resolveResumeCommandFromSuccessor",
+  );
+  assert.match(
+    expiry,
+    /status: 'needs_action',[\s\S]*code: 'create_command_expired'/u,
+  );
+  assert.match(
+    expiry,
+    /status: 'needs_action',[\s\S]*code: 'create_agent_unavailable'/u,
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  assert.match(
+    completion,
+    /command\.command_type === 'create'[\s\S]*status: success \? 'dispatched' : 'needs_action'/u,
+  );
+  assert.match(
+    completion,
+    /command\.command_type === 'stop'[\s\S]*success[\s\S]*status: 'canceled'/u,
+  );
+  assert.match(completion, /SELECT id, parent_task_id, status, error, metadata/u);
+});
+
+test("stop before device receipt immediately cancels orchestration items", () => {
+  const stopRoute = readRouteSection(
+    "router.post('/tasks/:id/stop'",
+    "router.get('/tasks/:id/snapshots'",
+  );
+  assert.match(
+    stopRoute,
+    /RETURNING id, parent_task_id, status[\s\S]*task_stopped_before_dispatch/u,
+  );
+  assert.match(
+    stopRoute,
+    /canceledTask\?\.parent_task_id[\s\S]*projectOrchestrationChildControlOutcome[\s\S]*status: 'canceled'/u,
+  );
+});
+
+test("overview reports child-inclusive agent load but root-only task summary", () => {
+  const overview = readRouteSection(
+    "router.get('/overview'",
+    "router.patch('/agents/:id'",
+  );
+  assert.match(overview, /AS active_task_count/u);
+  assert.match(overview, /AS queued_task_count/u);
+  assert.match(overview, /WITH task_load AS/u);
+  assert.doesNotMatch(overview, /LEFT JOIN LATERAL \(\s*SELECT\s+COUNT\(\*\) FILTER/u);
+  assert.match(
+    overview,
+    /GROUP BY COALESCE\([\s\S]*assigned\.assigned_agent_id,[\s\S]*assigned\.origin_agent_id[\s\S]*LEFT JOIN task_load ON task_load\.agent_id = ca\.id/u,
+  );
+  assert.match(
+    overview,
+    /assigned\.status IN \([\s\S]*'claimed', 'running', 'recovering', 'resume_requested'/u,
+  );
+  assert.ok(
+    [...overview.matchAll(/AND t\.parent_task_id IS NULL/gu)].length >= 2,
+  );
+  assert.equal(
+    [...overview.matchAll(
+      /t\.orchestration_revision = 0[\s\S]*?t\.metadata->>'draft' = 'true'/gu,
+    )].length,
+    2,
   );
 });
 
@@ -243,9 +403,23 @@ test("plan configuration bypasses capture queue blockers and late receipts stay 
     "router.post('/agents/:id/tasks'",
     "router.post('/tasks/:id/resume'",
   );
+  const queueBlockerStart = createRoute.indexOf("const queueBlocker");
+  const queueBlockerEnd = createRoute.indexOf("const total", queueBlockerStart);
+  const queueBlockerSection = createRoute.slice(
+    queueBlockerStart,
+    queueBlockerEnd,
+  );
   assert.match(
     createRoute,
     /const queueBlocker = isPlanConfiguration \? null : await tx\.queryOne/u,
+  );
+  assert.match(
+    queueBlockerSection,
+    /'pending', 'claimed', 'running', 'recovering',[\s\S]*'interrupted', 'resume_requested'/u,
+  );
+  assert.doesNotMatch(
+    queueBlockerSection,
+    /'needs_action'|'failed'|'completed_with_failures'/u,
   );
   assert.match(
     captureCloudRouteSource,

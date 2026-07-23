@@ -39,6 +39,7 @@ import feedbackRouter from './routes/feedback.js';
 import customTagsRouter from './routes/custom-tags.js';
 import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import captureCloudRouter from './routes/capture-cloud.js';
+import captureOrchestrationsRouter from './routes/capture-orchestrations.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
 import { ensureMediaDirs, backfillRecentCovers, backfillRecentImages, MEDIA_DIR } from './services/media-store.js';
 
@@ -139,6 +140,7 @@ app.use('/api/feedback', feedbackRouter);
 app.use('/api/custom-tags', customTagsRouter);
 app.use('/api/relevance/prefilter', relevancePrefilterRouter);
 app.use('/api/capture-cloud', captureCloudRouter);
+app.use('/api/capture-cloud', captureOrchestrationsRouter);
 // 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
 app.use('/api/asr-media', asrMediaRouter);
 

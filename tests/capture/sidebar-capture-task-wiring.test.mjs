@@ -164,6 +164,35 @@ test("capture terminal status preserves partial completion when an issue is atta
   assert.ok(genericErrorIndex > partialIndex);
 });
 
+test("protective platform stops remain needs-action instead of user-canceled", () => {
+  const terminalSection = readFunctionSection(
+    "function resolveCaptureTaskTerminalStatus(",
+    "function resolveUnattendedEnhanceCancellation(",
+  );
+  assert.match(
+    terminalSection,
+    /taskStatus === "needs_action"[\s\S]*reason: "needs_action", status: "needs_action"/u,
+  );
+
+  const batchSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "function activateUnattendedRunRequest(",
+  );
+  const needsActionIndex = batchSection.indexOf(
+    'result?.securityBlocked\n      ? "needs_action"',
+  );
+  const canceledIndex = batchSection.indexOf(
+    'result?.canceled || batchKeywordCancelRequested',
+    needsActionIndex,
+  );
+  assert.ok(needsActionIndex > -1);
+  assert.ok(canceledIndex > needsActionIndex);
+  assert.match(
+    batchSection,
+    /sidebarTaskError = \{\.\.\.result\.blockingError\}/u,
+  );
+});
+
 test("blogger capture owns one task session across list and detail work", () => {
   const section = readFunctionSection(
     "async function handleCaptureBloggerData()",

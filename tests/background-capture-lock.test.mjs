@@ -450,6 +450,7 @@ function createHarness() {
 const LOCK_KEY = "onstarvoice.captureExecutionLock";
 const UNATTENDED_PLAN_KEY = "onstarvoice.unattendedKeywordPlan";
 const UNATTENDED_REQUEST_KEY = "onstarvoice.unattendedKeywordRunRequest";
+const UNATTENDED_ARCHIVE_KEY = "onstarvoice.unattendedKeywordRunArchive";
 const TASK_LEDGER_KEY = "onstarvoice.taskLedger";
 const SYNC_HISTORY_KEY = "onstarvoice.sync_history";
 
@@ -1584,16 +1585,57 @@ test("a cloud create command waits without overwriting an active unattended task
   assert.equal(harness.cloudCommandCompletions.length, 0);
 });
 
-test("a cloud create command preserves the current recoverable request", async () => {
+test("terminal unattended results release the slot for the next cloud task", async () => {
   for (const status of ["needs_action", "failed", "completed_with_failures"]) {
     const harness = createHarness();
+    const now = new Date().toISOString();
+    const oldRequestId = `recoverable-${status}`;
+    const oldPlan = buildUnattendedPlan({
+      keywords: ["已完成关键词", "待重试关键词"],
+      enhance: true,
+      aiFilter: true,
+      includeComments: true,
+      commentLimit: 35,
+    });
     harness.storage[UNATTENDED_REQUEST_KEY] = {
-      id: `recoverable-${status}`,
+      schemaVersion: 2,
+      id: oldRequestId,
       attemptId: `attempt-${status}`,
       status,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      planSnapshot: buildUnattendedPlan(),
+      createdAt: now,
+      updatedAt: now,
+      finishedAt: now,
+      planSnapshot: oldPlan,
+      checkpoint: {
+        round: 1,
+        keywordResults: [
+          {
+            round: 1,
+            index: 0,
+            keyword: "已完成关键词",
+            status: "completed",
+          },
+          {
+            round: 1,
+            index: 1,
+            keyword: "待重试关键词",
+            status: "failed",
+          },
+        ],
+      },
+    };
+    harness.storage[TASK_LEDGER_KEY] = {
+      version: 1,
+      runs: [
+        {
+          id: oldRequestId,
+          taskType: "unattended_keyword_capture",
+          status,
+          createdAt: now,
+          updatedAt: now,
+          finishedAt: now,
+        },
+      ],
     };
 
     const result = await harness.api.executeCloudTaskAgentCommand(
@@ -1612,12 +1654,282 @@ test("a cloud create command preserves the current recoverable request", async (
       "agent-token",
     );
 
-    assert.equal(result.deferred, true);
-    assert.equal(result.reason, "unattended_task_recoverable");
-    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, `recoverable-${status}`);
-    assert.equal(harness.createdTabs.length, 0);
-    assert.equal(harness.cloudCommandCompletions.length, 0);
+    assert.equal(result.ok, true);
+    assert.equal(
+      harness.storage[UNATTENDED_REQUEST_KEY].id,
+      `cloud-task-after-${status}`,
+    );
+    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "pending");
+    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].cloudAssigned, true);
+    assert.equal(harness.createdTabs.length, 2);
+    assert.equal(harness.cloudCommandCompletions.length, 1);
+    assert.equal(harness.cloudCommandCompletions[0].success, true);
+    assert.equal(
+      harness.cloudCommandCompletions[0].result.reason,
+      "created",
+    );
+
+    const archived =
+      harness.storage[UNATTENDED_ARCHIVE_KEY]?.requests?.[oldRequestId];
+    assert.equal(archived?.id, oldRequestId);
+    assert.equal(archived?.status, status);
+    assert.deepEqual(
+      Array.from(archived?.planSnapshot?.keywords || []),
+      ["已完成关键词", "待重试关键词"],
+    );
+    assert.equal(archived?.planSnapshot?.enhance, true);
+    assert.equal(archived?.planSnapshot?.includeComments, true);
+    assert.equal(archived?.checkpoint?.keywordResults?.[1]?.status, "failed");
+    assert.deepEqual(
+      Array.from(
+        harness.storage[TASK_LEDGER_KEY]?.runs || [],
+        (run) => run.id,
+      ).sort(),
+      [oldRequestId, `cloud-task-after-${status}`].sort(),
+    );
   }
+});
+
+test("an archived failed task remains retryable after a newer task finishes", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  const oldRequestId = "archived-failed-task";
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    schemaVersion: 2,
+    id: oldRequestId,
+    attemptId: "archived-failed-attempt",
+    attemptNumber: 1,
+    progressSeq: 4,
+    status: "completed_with_failures",
+    createdAt: now,
+    updatedAt: now,
+    finishedAt: now,
+    planSnapshot: buildUnattendedPlan({
+      keywords: ["成功词", "失败词"],
+      enhance: true,
+      aiFilter: true,
+      includeComments: true,
+      commentLimit: 50,
+    }),
+    checkpoint: {
+      round: 1,
+      keywordResults: [
+        {round: 1, index: 0, keyword: "成功词", status: "completed"},
+        {round: 1, index: 1, keyword: "失败词", status: "failed"},
+      ],
+    },
+  };
+
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-newer-task",
+      command_type: "create",
+      client_task_id: "newer-cloud-task",
+      payload: {
+        clientTaskId: "newer-cloud-task",
+        planSnapshot: {
+          platform: "xiaohongshu",
+          keywords: ["新任务关键词"],
+        },
+      },
+    },
+    "agent-token",
+  );
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const recovered = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: oldRequestId,
+    mode: "failed",
+  });
+
+  assert.equal(recovered.accepted, true);
+  const recoveryRequest = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(recoveryRequest.parentRequestId, oldRequestId);
+  assert.equal(recoveryRequest.status, "pending");
+  assert.deepEqual(Array.from(recoveryRequest.planSnapshot.keywords), ["失败词"]);
+  assert.equal(recoveryRequest.planSnapshot.enhance, true);
+  assert.equal(recoveryRequest.planSnapshot.aiFilter, true);
+  assert.equal(recoveryRequest.planSnapshot.includeComments, true);
+  assert.equal(recoveryRequest.planSnapshot.commentLimit, 50);
+  assert.equal(
+    harness.storage[UNATTENDED_ARCHIVE_KEY]?.requests?.[oldRequestId],
+    undefined,
+  );
+  assert.equal(harness.createdTabs.length, 4);
+});
+
+test("an archived retry waits while another unattended task is active", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    updatedAt: now,
+    requests: {
+      "archived-busy-task": {
+        schemaVersion: 2,
+        id: "archived-busy-task",
+        attemptId: "archived-busy-attempt",
+        status: "failed",
+        createdAt: now,
+        updatedAt: now,
+        finishedAt: now,
+        planSnapshot: buildUnattendedPlan(),
+        checkpoint: {failedKeywords: ["关键词二"]},
+      },
+    },
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    schemaVersion: 2,
+    id: "active-new-task",
+    attemptId: "active-new-attempt",
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["正在执行"]}),
+  };
+
+  const recovered = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: "archived-busy-task",
+    mode: "failed",
+  });
+
+  assert.equal(recovered.accepted, false);
+  assert.equal(recovered.reason, "unattended_task_busy");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, "active-new-task");
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_ARCHIVE_KEY].requests["archived-busy-task"].id,
+    "archived-busy-task",
+  );
+});
+
+test("a cloud resume command can recover a task from the local archive", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    updatedAt: now,
+    requests: {
+      "archived-cloud-resume": {
+        schemaVersion: 2,
+        id: "archived-cloud-resume",
+        attemptId: "archived-cloud-resume-attempt",
+        attemptNumber: 1,
+        status: "completed_with_failures",
+        createdAt: now,
+        updatedAt: now,
+        finishedAt: now,
+        planSnapshot: buildUnattendedPlan({
+          keywords: ["成功词", "云端重试词"],
+          enhance: true,
+          includeComments: true,
+        }),
+        checkpoint: {
+          round: 1,
+          keywordResults: [
+            {round: 1, index: 0, keyword: "成功词", status: "completed"},
+            {round: 1, index: 1, keyword: "云端重试词", status: "failed"},
+          ],
+        },
+      },
+    },
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    schemaVersion: 2,
+    id: "newer-finished-task",
+    attemptId: "newer-finished-attempt",
+    status: "completed",
+    createdAt: now,
+    updatedAt: now,
+    finishedAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["新任务"]}),
+  };
+
+  const result = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-resume-archive",
+      command_type: "resume",
+      client_task_id: "archived-cloud-resume",
+      payload: {
+        controlTaskId: "archived-cloud-resume",
+        mode: "failed",
+      },
+    },
+    "agent-token",
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.parentRequestId,
+    "archived-cloud-resume",
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].parentRequestId,
+    "archived-cloud-resume",
+  );
+  assert.deepEqual(
+    Array.from(harness.storage[UNATTENDED_REQUEST_KEY].planSnapshot.keywords),
+    ["云端重试词"],
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].planSnapshot.enhance, true);
+  assert.equal(harness.createdTabs.length, 2);
+});
+
+test("a cloud archive resume stays pending while another task is active", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    updatedAt: now,
+    requests: {
+      "archived-cloud-busy": {
+        schemaVersion: 2,
+        id: "archived-cloud-busy",
+        attemptId: "archived-cloud-busy-attempt",
+        status: "failed",
+        createdAt: now,
+        updatedAt: now,
+        finishedAt: now,
+        planSnapshot: buildUnattendedPlan(),
+        checkpoint: {failedKeywords: ["关键词二"]},
+      },
+    },
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    schemaVersion: 2,
+    id: "active-cloud-blocker",
+    attemptId: "active-cloud-blocker-attempt",
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["正在执行"]}),
+  };
+
+  const result = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-resume-busy-archive",
+      command_type: "resume",
+      client_task_id: "archived-cloud-busy",
+      payload: {
+        controlTaskId: "archived-cloud-busy",
+        mode: "failed",
+      },
+    },
+    "agent-token",
+  );
+
+  assert.equal(result.deferred, true);
+  assert.equal(result.reason, "unattended_task_busy");
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, "active-cloud-blocker");
+  assert.equal(harness.createdTabs.length, 0);
 });
 
 test("a cloud one-off never consumes or rewrites the recurring local plan schedule", async () => {
@@ -1857,6 +2169,111 @@ test("switching capture-agent identity does not mirror the previous tenant's loc
 
   assert.equal(harness.cloudHeartbeats.at(-1).tasks[0].id, "customer-b-task");
   assert.equal(harness.cloudHeartbeats.at(-1).unattendedPlan.keywords[0], "客户 B 计划");
+});
+
+test("switching Agent scope cannot revive another tenant's recovery snapshot", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "tenant-agent-a", token: "token-a"},
+  };
+  harness.storage["onstarvoice.cloudTaskAgentStatus"] = {
+    agentId: "tenant-agent-a",
+    updatedAt: now,
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    schemaVersion: 2,
+    id: "tenant-a-current-failure",
+    attemptId: "tenant-a-current-attempt",
+    status: "failed",
+    cloudAgentScopeId: "tenant-agent-a",
+    createdAt: now,
+    updatedAt: now,
+    finishedAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["客户 A 私有关键词"]}),
+    checkpoint: {failedKeywords: ["客户 A 私有关键词"]},
+  };
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    agentScopeId: "tenant-agent-a",
+    updatedAt: now,
+    requests: {
+      "tenant-a-archived-failure": {
+        schemaVersion: 2,
+        id: "tenant-a-archived-failure",
+        attemptId: "tenant-a-archived-attempt",
+        status: "failed",
+        cloudAgentScopeId: "tenant-agent-a",
+        createdAt: now,
+        updatedAt: now,
+        finishedAt: now,
+        planSnapshot: buildUnattendedPlan({keywords: ["客户 A 归档关键词"]}),
+        checkpoint: {failedKeywords: ["客户 A 归档关键词"]},
+      },
+    },
+  };
+
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "tenant-agent-b", token: "token-b"},
+  };
+  await harness.api.syncCloudTaskAgent({reason: "tenant-switch", force: true});
+  assert.equal(harness.storage[UNATTENDED_ARCHIVE_KEY], undefined);
+
+  // Simulate an old in-flight archive write landing after the scope clear.
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    agentScopeId: "tenant-agent-a",
+    updatedAt: now,
+    requests: {
+      "tenant-a-late-archive": {
+        schemaVersion: 2,
+        id: "tenant-a-late-archive",
+        attemptId: "tenant-a-late-attempt",
+        status: "failed",
+        cloudAgentScopeId: "tenant-agent-a",
+        createdAt: now,
+        updatedAt: now,
+        finishedAt: now,
+        planSnapshot: buildUnattendedPlan({keywords: ["客户 A 延迟快照"]}),
+        checkpoint: {failedKeywords: ["客户 A 延迟快照"]},
+      },
+    },
+  };
+
+  const currentRecovery = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: "tenant-a-current-failure",
+    mode: "failed",
+  });
+  assert.equal(currentRecovery.accepted, false);
+  assert.equal(currentRecovery.reason, "agent_scope_mismatch");
+
+  const archivedRecovery = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: "tenant-a-late-archive",
+    mode: "failed",
+  });
+  assert.equal(archivedRecovery.accepted, false);
+  assert.equal(archivedRecovery.reason, "not_found");
+
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "tenant-b-create-command",
+      command_type: "create",
+      client_task_id: "tenant-b-new-task",
+      payload: {
+        clientTaskId: "tenant-b-new-task",
+        planSnapshot: {
+          platform: "xiaohongshu",
+          keywords: ["客户 B 关键词"],
+        },
+      },
+    },
+    "agent-token-b",
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, "tenant-b-new-task");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].cloudAgentScopeId,
+    "tenant-agent-b",
+  );
 });
 
 test("canceling unattended work never releases a manual batch lock", async () => {
@@ -2201,6 +2618,47 @@ test("repeated old progress cannot replenish more than two automatic recoveries"
   assert.equal(exhausted.terminal, true, JSON.stringify(exhausted));
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+});
+
+test("a service-abnormal checkpoint blocks recovery even before terminal reporting", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    checkpoint: {
+      keywordIndex: 0,
+      currentKeyword: "关键词一",
+      completedKeywords: [],
+      failedKeywords: ["关键词一"],
+      skippedKeywords: [],
+      keywordResults: [
+        {
+          keyword: "关键词一",
+          status: "failed",
+          error: "检测到抖音“服务出现异常”",
+          errorCode: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+          errorCategory: "platform_service_abnormal",
+          securityBlocked: true,
+          requiresManualAction: true,
+        },
+      ],
+    },
+  });
+
+  const recovery = await harness.api.recoverUnattendedKeywordRunRequest(
+    request,
+    {healthy: false, reason: "runner_heartbeat_stale"},
+  );
+  const stored = harness.storage[UNATTENDED_REQUEST_KEY];
+
+  assert.equal(recovery.recovered, false);
+  assert.equal(recovery.terminal, true);
+  assert.equal(stored.status, "needs_action");
+  assert.equal(stored.attemptId, request.attemptId);
+  assert.equal(stored.error.code, "DOUYIN_SEARCH_SERVICE_ABNORMAL");
+  assert.equal(stored.error.category, "platform_service_abnormal");
+  assert.equal(stored.error.securityBlocked, true);
+  assert.equal(stored.error.requiresManualAction, true);
+  assert.equal(stored.error.retryable, false);
+  assert.equal(harness.createdTabs.length, 0);
 });
 
 test("completed-with-failures is terminal and cannot be resurrected", async () => {
@@ -3043,7 +3501,7 @@ test("disabling the plan also stops the lock holder captured before cancellation
   );
 });
 
-test("keep-results resolves needs-action but is idempotent for finished work", async () => {
+test("keep-results resolves needs-action and dismisses finished recovery", async () => {
   const needsActionHarness = createHarness();
   const needsAction = seedUnattendedRequest(needsActionHarness, {
     status: "needs_action",
@@ -3071,8 +3529,14 @@ test("keep-results resolves needs-action but is idempotent for finished work", a
     message: "保留已有结果",
   });
   assert.equal(kept.ok, true);
-  assert.equal(kept.reason, "already_terminal");
+  assert.equal(kept.reason, "results_kept");
   assert.equal(finishedHarness.storage[UNATTENDED_REQUEST_KEY].status, "failed");
+  assert.equal(
+    Boolean(
+      finishedHarness.storage[UNATTENDED_REQUEST_KEY].recoveryDismissedAt,
+    ),
+    true,
+  );
 });
 
 test("generic task ledger messages share normalized upsert and history reads", async () => {
@@ -4687,6 +5151,18 @@ test("clearing task center removes history but preserves a recently active task"
     ],
   };
   harness.storage[SYNC_HISTORY_KEY] = {entries: [{id: "old-sync"}]};
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    requests: {
+      "old-retryable-task": {
+        id: "old-retryable-task",
+        attemptId: "old-retryable-attempt",
+        status: "failed",
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+    },
+  };
 
   const response = await harness.sendBackgroundMessage({
     type: "onstarvoice:clear-task-center",
@@ -4700,6 +5176,7 @@ test("clearing task center removes history but preserves a recently active task"
   );
   assert.equal(Boolean(harness.storage[TASK_LEDGER_KEY].clearedAt), true);
   assert.deepEqual(Array.from(harness.storage[SYNC_HISTORY_KEY].entries), []);
+  assert.equal(harness.storage[UNATTENDED_ARCHIVE_KEY], undefined);
 });
 
 test("clearing task center removes a stale unattended request and its legacy plan mirror", async () => {

@@ -16,6 +16,10 @@ import {
   sanitizeCloudStructuredObject,
   sanitizeCloudText,
 } from '../services/capture-cloud.js';
+import {
+  aggregateParentTaskItems,
+  checkpointEntryToItemStatus,
+} from '../services/capture-orchestration.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -44,6 +48,7 @@ const STOP_FINAL_STATUSES = new Set([
   'skipped',
   'superseded',
 ]);
+const POSTGRES_INTEGER_MAX = 2147483647;
 const SUPERSEDED_CREATE_STOP_NO_TARGET_REASONS = new Set([
   'not_found',
   'request_mismatch',
@@ -52,6 +57,19 @@ const SUPERSEDED_CREATE_STOP_NO_TARGET_REASONS = new Set([
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
   return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+}
+
+export function orchestrationCheckpointInteger(value) {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.min(POSTGRES_INTEGER_MAX, Math.max(0, parsed));
+}
+
+export function orchestrationCheckpointTimestamp(value) {
+  const normalized = text(value, 100);
+  if (!normalized) return null;
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
 function safeJson(value) {
@@ -248,7 +266,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         WHERE id = $1 AND tenant_id = $2
           AND status IN ('pending', 'claimed')
           AND metadata->>'createCommandId' = $3
-        RETURNING id, status
+        RETURNING id, status, parent_task_id
       `, [command.task_id, tenantId, command.id]);
       await appendEvent(tx, {
         tenantId,
@@ -261,6 +279,18 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           : '设备创建指令已过期，任务已有更新状态',
         payload: {commandId: command.id, commandType: command.command_type},
       });
+      if (failedTask) {
+        await projectOrchestrationChildControlOutcome(tx, {
+          tenantId,
+          childTask: failedTask,
+          agentId: command.agent_id,
+          status: 'needs_action',
+          error: {
+            code: 'create_command_expired',
+            message: '设备未在指令有效期内领取并创建任务',
+          },
+        });
+      }
       continue;
     }
     if (command.command_type === 'stop') {
@@ -392,7 +422,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         WHERE id = $1 AND tenant_id = $2
           AND status IN ('pending', 'claimed')
           AND metadata->>'createCommandId' = $3
-        RETURNING id, status
+        RETURNING id, status, parent_task_id
       `, [command.task_id, tenantId, command.id]);
       await appendEvent(tx, {
         tenantId,
@@ -405,6 +435,18 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           : '目标任务已有更新状态，旧创建指令已取消',
         payload: {commandId: command.id, commandType: command.command_type},
       });
+      if (failedTask) {
+        await projectOrchestrationChildControlOutcome(tx, {
+          tenantId,
+          childTask: failedTask,
+          agentId: command.agent_id,
+          status: 'needs_action',
+          error: {
+            code: 'create_agent_unavailable',
+            message: '目标节点授权或平台职责已变化',
+          },
+        });
+      }
       continue;
     }
     if (command.command_type === 'stop') {
@@ -653,6 +695,523 @@ async function resolveCreateCommandFromSnapshot(tx, agent, task, snapshot, evide
   return command;
 }
 
+const ORCHESTRATION_ITEM_TERMINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'failed',
+  'skipped',
+  'canceled',
+]);
+
+export function orchestrationCheckpointEntries(snapshot) {
+  const checkpoint = safeJson(snapshot?.checkpoint);
+  const progress = safeJson(snapshot?.progress);
+  const entries = Array.isArray(checkpoint.keywordResults)
+    ? checkpoint.keywordResults
+      .map(entry => safeJson(entry))
+      .filter(entry => text(entry.keyword, 120))
+    : [];
+  const byKeyword = new Map(entries.map(entry => [text(entry.keyword, 120), entry]));
+  const activeKeyword = text(
+    progress.keyword ||
+      progress.currentKeyword ||
+      checkpoint.currentKeyword ||
+      checkpoint.activeKeyword,
+    120,
+  );
+  const existingEntry = byKeyword.get(activeKeyword);
+  const existingStatus = existingEntry
+    ? checkpointEntryToItemStatus(existingEntry)
+    : '';
+  const taskIsActivelyExecuting = ['claimed', 'running', 'recovering'].includes(
+    text(snapshot?.status, 80),
+  );
+  // settleUnattendedKeywordCheckpoint intentionally retains activeKeyword and
+  // activePhase after a keyword finishes, including in the final completed
+  // snapshot. Only a genuinely active child task may project a running item,
+  // and it must never overwrite an already terminal keyword result.
+  if (
+    activeKeyword &&
+    taskIsActivelyExecuting &&
+    !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus)
+  ) {
+    byKeyword.set(activeKeyword, {
+      ...safeJson(existingEntry),
+      keyword: activeKeyword,
+      status: 'running',
+      round: Math.max(1, Number(checkpoint.round) || 1),
+      index: Math.max(
+        0,
+        Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex) || 0,
+      ),
+    });
+  }
+  return Array.from(byKeyword.values());
+}
+
+function orchestrationItemAttemptStatus(itemStatus) {
+  // Item attempts start at dispatch, so a checkpoint entry with no meaningful
+  // status must not move the append-only audit back to a pre-dispatch state.
+  return itemStatus === 'pending' || itemStatus === 'assigned'
+    ? 'dispatched'
+    : itemStatus;
+}
+
+async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
+  return tx.queryOne(`
+    SELECT id, status, progress
+    FROM capture_tasks
+    WHERE id = $1 AND tenant_id = $2 AND task_type = 'capture_orchestration'
+    FOR UPDATE
+  `, [parentTaskId, tenantId]);
+}
+
+async function refreshOrchestrationParentTask(tx, {
+  tenantId,
+  parentTaskId,
+  parent: lockedParent = null,
+  agent = null,
+  snapshot = {},
+  childTaskId = '',
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+  eventAgentId = null,
+}) {
+  const parent = lockedParent ||
+    await lockOrchestrationParent(tx, tenantId, parentTaskId);
+  if (!parent) return null;
+
+  const items = await tx.queryAll(`
+    SELECT status
+    FROM capture_task_items
+    WHERE task_id = $1 AND tenant_id = $2
+    ORDER BY ordinal, id
+  `, [parentTaskId, tenantId]);
+  const aggregate = aggregateParentTaskItems(items);
+  const previousProgress = safeJson(parent.progress);
+  const businessProgressChanged =
+    Number(previousProgress.current || 0) !== aggregate.progress.current ||
+    Number(previousProgress.total || 0) !== aggregate.progress.total;
+  const message = aggregate.status === 'running'
+    ? '多个执行节点正在处理关键词工作项'
+    : aggregate.status === 'needs_action'
+      ? '部分关键词工作项需要人工处理'
+      : aggregate.terminal
+        ? '多 Agent 关键词任务已结算'
+        : '关键词工作项已分配，等待执行节点处理';
+
+  const updated = await tx.queryOne(`
+    UPDATE capture_tasks
+    SET status = $1,
+      progress = $2::jsonb,
+      counts = $3::jsonb,
+      message = $4,
+      heartbeat_at = GREATEST(heartbeat_at, $5::timestamptz),
+      business_progress_at = CASE
+        WHEN $6::boolean THEN GREATEST(business_progress_at, $7::timestamptz)
+        ELSE business_progress_at
+      END,
+      finished_at = CASE
+        WHEN $8::boolean THEN COALESCE(finished_at, $7::timestamptz, now())
+        ELSE NULL
+      END,
+      source_updated_at = CASE
+        WHEN $9::timestamptz IS NULL THEN source_updated_at
+        ELSE GREATEST(source_updated_at, $9::timestamptz)
+      END,
+      updated_at = now()
+    WHERE id = $10 AND tenant_id = $11
+    RETURNING *
+  `, [
+    aggregate.status,
+    JSON.stringify(aggregate.progress),
+    JSON.stringify(aggregate.counts),
+    message,
+    orchestrationCheckpointTimestamp(snapshot.heartbeatAt),
+    businessProgressChanged,
+    orchestrationCheckpointTimestamp(
+      snapshot.businessProgressAt ||
+      snapshot.updatedAt ||
+      snapshot.heartbeatAt,
+    ),
+    aggregate.terminal,
+    orchestrationCheckpointTimestamp(snapshot.updatedAt || snapshot.heartbeatAt),
+    parentTaskId,
+    tenantId,
+  ]);
+
+  if (updated && parent.status !== updated.status) {
+    const resolvedEventAgentId =
+      agent?.id || eventAgentId || null;
+    await appendEvent(tx, {
+      tenantId,
+      taskId: parentTaskId,
+      agentId: resolvedEventAgentId,
+      eventType: 'orchestration_status_changed',
+      actorType: agent ? 'capture_agent' : actorType,
+      actorId: agent?.id || actorId,
+      actorName: agent
+        ? agent.display_name || agent.client_label
+        : actorName,
+      status: updated.status,
+      message,
+      payload: {
+        previousStatus: parent.status,
+        childTaskId: childTaskId || snapshot.clientTaskId || '',
+        progress: aggregate.progress,
+      },
+    });
+  }
+  return updated;
+}
+
+async function projectOrchestrationChildControlOutcome(tx, {
+  tenantId,
+  childTask,
+  agentId,
+  status,
+  error = {},
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+}) {
+  if (!childTask?.parent_task_id) return null;
+
+  // The caller has already locked and mutated the child task. Lock the parent
+  // before touching item rows so command completion, expiry, and heartbeat
+  // projection all use the same task -> parent -> item order.
+  const parent = await lockOrchestrationParent(
+    tx,
+    tenantId,
+    childTask.parent_task_id,
+  );
+  if (!parent) return null;
+
+  const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(status);
+  await tx.execute(`
+    UPDATE capture_task_items
+    SET status = $1,
+      error = $2::jsonb,
+      finished_at = CASE
+        WHEN $3::boolean THEN COALESCE(finished_at, now())
+        ELSE NULL
+      END,
+      updated_at = now()
+    WHERE tenant_id = $4
+      AND task_id = $5
+      AND execution_task_id = $6
+      AND assigned_agent_id = $7
+      AND status NOT IN (
+        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+      )
+  `, [
+    status,
+    JSON.stringify(safeJson(error)),
+    terminal,
+    tenantId,
+    childTask.parent_task_id,
+    childTask.id,
+    agentId,
+  ]);
+  await tx.execute(`
+    UPDATE capture_task_item_attempts attempt
+    SET status = $1,
+      error = $2::jsonb,
+      finished_at = CASE
+        WHEN $3::boolean THEN COALESCE(attempt.finished_at, now())
+        ELSE NULL
+      END,
+      updated_at = now()
+    FROM capture_task_items item
+    WHERE item.id = attempt.item_id
+      AND item.tenant_id = $4
+      AND item.task_id = $5
+      AND item.execution_task_id = $6
+      AND item.assigned_agent_id = $7
+      AND item.status = $1
+      AND attempt.execution_task_id = $6
+      AND attempt.agent_id = $7
+      AND attempt.status NOT IN (
+        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+      )
+  `, [
+    status,
+    JSON.stringify(safeJson(error)),
+    terminal,
+    tenantId,
+    childTask.parent_task_id,
+    childTask.id,
+    agentId,
+  ]);
+
+  const now = new Date().toISOString();
+  return refreshOrchestrationParentTask(tx, {
+    tenantId,
+    parentTaskId: childTask.parent_task_id,
+    parent,
+    snapshot: {
+      heartbeatAt: now,
+      businessProgressAt: now,
+      updatedAt: now,
+    },
+    childTaskId: childTask.id,
+    actorType,
+    actorId,
+    actorName,
+    eventAgentId: agentId,
+  });
+}
+
+async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
+  if (!task?.parent_task_id) return null;
+
+  const parent = await lockOrchestrationParent(
+    tx,
+    agent.tenant_id,
+    task.parent_task_id,
+  );
+  if (!parent) return null;
+
+  // Receiving an accepted child snapshot proves the create command reached a
+  // local task. It does not prove that any keyword has started yet.
+  await tx.execute(`
+    UPDATE capture_task_items
+    SET status = 'dispatched',
+      dispatched_at = COALESCE(dispatched_at, now()),
+      updated_at = now()
+    WHERE tenant_id = $1
+      AND task_id = $2
+      AND execution_task_id = $3
+      AND assigned_agent_id = $4
+      AND status IN ('assigned', 'dispatch_pending')
+  `, [agent.tenant_id, task.parent_task_id, task.id, agent.id]);
+
+  for (const entry of orchestrationCheckpointEntries(snapshot)) {
+    const keyword = text(entry.keyword, 120);
+    const checkpointStatus = checkpointEntryToItemStatus(entry);
+    const status = checkpointStatus === 'pending' || checkpointStatus === 'assigned'
+      ? 'dispatched'
+      : checkpointStatus;
+    const attemptCount = orchestrationCheckpointInteger(entry.attemptCount);
+    const savedCount = orchestrationCheckpointInteger(entry.savedCount);
+    const finishedAt = orchestrationCheckpointTimestamp(entry.finishedAt);
+    const rawEntryError = entry.error;
+    const baseError = rawEntryError && typeof rawEntryError === 'object'
+      ? sanitizeCloudStructuredObject(rawEntryError)
+      : text(rawEntryError, 1000)
+        ? {message: text(rawEntryError, 1000)}
+        : {};
+    const error = {
+      ...baseError,
+      ...(text(entry.errorCode || entry.error_code, 100)
+        ? {code: text(entry.errorCode || entry.error_code, 100)}
+        : {}),
+      ...(text(entry.errorCategory || entry.error_category, 100)
+        ? {
+            category: text(
+              entry.errorCategory || entry.error_category,
+              100,
+            ),
+          }
+        : {}),
+      ...(entry.securityBlocked === true
+        ? {securityBlocked: true}
+        : {}),
+      ...(entry.requiresManualAction === true
+        ? {requiresManualAction: true}
+        : {}),
+    };
+    const checkpoint = {
+      round: Math.max(1, Number(entry.round) || 1),
+      index: Math.max(0, Number(entry.index) || 0),
+      keyword,
+      status: text(entry.status, 80),
+      attemptCount,
+      savedCount,
+      ...(text(entry.errorCode || entry.error_code, 100)
+        ? {errorCode: text(entry.errorCode || entry.error_code, 100)}
+        : {}),
+      ...(entry.securityBlocked === true
+        ? {securityBlocked: true}
+        : {}),
+      ...(entry.requiresManualAction === true
+        ? {requiresManualAction: true}
+        : {}),
+      finishedAt,
+    };
+    const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(status);
+    const item = await tx.queryOne(`
+      UPDATE capture_task_items
+      SET status = $1,
+        attempt_count = GREATEST(attempt_count, $2),
+        error = $3::jsonb,
+        metadata = metadata || jsonb_build_object('checkpoint', $4::jsonb),
+        started_at = CASE
+          WHEN $1 IN (
+            'running', 'retryable', 'needs_action', 'completed',
+            'completed_with_warnings', 'failed', 'skipped', 'canceled'
+          ) THEN COALESCE(started_at, now())
+          ELSE started_at
+        END,
+        finished_at = CASE
+          WHEN $5::boolean THEN COALESCE($6::timestamptz, finished_at, now())
+          ELSE NULL
+        END,
+        updated_at = now()
+      WHERE tenant_id = $7
+        AND task_id = $8
+        AND execution_task_id = $9
+        AND assigned_agent_id = $10
+        AND keyword = $11
+        AND (capture_task_items.status <> 'canceled' OR $1 = 'canceled')
+      RETURNING id, assignment_revision
+    `, [
+      status,
+      attemptCount,
+      JSON.stringify(error),
+      JSON.stringify(checkpoint),
+      terminal,
+      finishedAt,
+      agent.tenant_id,
+      task.parent_task_id,
+      task.id,
+      agent.id,
+      keyword,
+    ]);
+    if (!item) continue;
+
+    await tx.execute(`
+      UPDATE capture_task_item_attempts
+      SET status = $1,
+        checkpoint = $2::jsonb,
+        result = jsonb_build_object('savedCount', $3::integer),
+        error = $4::jsonb,
+        started_at = CASE
+          WHEN $1 <> 'dispatched' THEN COALESCE(started_at, now())
+          ELSE started_at
+        END,
+        finished_at = CASE
+          WHEN $5::boolean THEN COALESCE($6::timestamptz, finished_at, now())
+          ELSE NULL
+        END,
+        updated_at = now()
+      WHERE id = (
+        SELECT id
+        FROM capture_task_item_attempts
+        WHERE tenant_id = $7
+          AND item_id = $8
+          AND execution_task_id = $9
+          AND agent_id = $10
+          AND assignment_revision = $11
+          AND (capture_task_item_attempts.status <> 'canceled' OR $1 = 'canceled')
+        ORDER BY attempt_number DESC
+        LIMIT 1
+      )
+    `, [
+      orchestrationItemAttemptStatus(status),
+      JSON.stringify(checkpoint),
+      checkpoint.savedCount,
+      JSON.stringify(error),
+      terminal,
+      finishedAt,
+      agent.tenant_id,
+      item.id,
+      task.id,
+      agent.id,
+      item.assignment_revision,
+    ]);
+  }
+
+  const childStatus = text(snapshot.status, 80);
+  const unresolvedStatus = childStatus === 'canceled'
+    ? 'canceled'
+    : childStatus === 'skipped'
+      ? 'skipped'
+      : [
+        'interrupted',
+        'needs_action',
+        'failed',
+        'completed',
+        'completed_with_warnings',
+        'completed_with_failures',
+      ].includes(childStatus)
+        ? 'needs_action'
+        : '';
+  if (unresolvedStatus) {
+    const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(unresolvedStatus);
+    await tx.execute(`
+      UPDATE capture_task_items
+      SET status = $1,
+        error = CASE
+          WHEN $1 = 'needs_action' THEN jsonb_build_object(
+            'code', 'missing_keyword_checkpoint',
+            'message', '子任务已停止，但未收到该关键词的完成检查点'
+          )
+          ELSE error
+        END,
+        started_at = COALESCE(started_at, now()),
+        finished_at = CASE WHEN $2::boolean THEN COALESCE(finished_at, now()) ELSE NULL END,
+        updated_at = now()
+      WHERE tenant_id = $3
+        AND task_id = $4
+        AND execution_task_id = $5
+        AND assigned_agent_id = $6
+        AND status NOT IN (
+          'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+        )
+    `, [
+      unresolvedStatus,
+      terminal,
+      agent.tenant_id,
+      task.parent_task_id,
+      task.id,
+      agent.id,
+    ]);
+    await tx.execute(`
+      UPDATE capture_task_item_attempts attempt
+      SET status = $1,
+        error = CASE
+          WHEN $1 = 'needs_action' THEN jsonb_build_object(
+            'code', 'missing_keyword_checkpoint',
+            'message', '子任务已停止，但未收到该关键词的完成检查点'
+          )
+          ELSE attempt.error
+        END,
+        started_at = COALESCE(attempt.started_at, now()),
+        finished_at = CASE WHEN $2::boolean THEN COALESCE(attempt.finished_at, now()) ELSE NULL END,
+        updated_at = now()
+      FROM capture_task_items item
+      WHERE item.id = attempt.item_id
+        AND item.tenant_id = $3
+        AND item.task_id = $4
+        AND item.execution_task_id = $5
+        AND item.assigned_agent_id = $6
+        AND item.status = $1
+        AND attempt.execution_task_id = $5
+        AND attempt.agent_id = $6
+        AND attempt.status NOT IN (
+          'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+        )
+    `, [
+      unresolvedStatus,
+      terminal,
+      agent.tenant_id,
+      task.parent_task_id,
+      task.id,
+      agent.id,
+    ]);
+  }
+
+  return refreshOrchestrationParentTask(tx, {
+    tenantId: agent.tenant_id,
+    parentTaskId: task.parent_task_id,
+    parent,
+    agent,
+    snapshot,
+  });
+}
+
 async function mirrorTaskSnapshot(tx, agent, snapshot) {
   const previous = await tx.queryOne(`
     SELECT id, status, attempt_number
@@ -750,6 +1309,10 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'executionMode', capture_tasks.metadata->'executionMode',
             'planSnapshot', capture_tasks.metadata->'planSnapshot',
             'remoteRequestHash', capture_tasks.metadata->'remoteRequestHash',
+            'orchestrationChild', capture_tasks.metadata->'orchestrationChild',
+            'parentTaskId', capture_tasks.metadata->'parentTaskId',
+            'orchestrationRevision', capture_tasks.metadata->'orchestrationRevision',
+            'itemIds', capture_tasks.metadata->'itemIds',
             'queueBlocker', capture_tasks.metadata->'queueBlocker',
             'localRequestId', capture_tasks.metadata->'localRequestId',
             'createCompletedAt', capture_tasks.metadata->'createCompletedAt',
@@ -800,7 +1363,7 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
         ELSE GREATEST(capture_tasks.source_updated_at, EXCLUDED.source_updated_at)
       END,
       updated_at = now()
-    WHERE capture_tasks.status <> 'superseded'
+    WHERE capture_tasks.status NOT IN ('superseded', 'canceled')
       -- attempt_number is a monotonic slot, while client_attempt_id identifies
       -- the concrete runner incarnation occupying it. Once a non-empty ID is
       -- recorded, a different non-empty ID may not overwrite that slot's task
@@ -991,6 +1554,8 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
       task.source_updated_at,
       captureTaskSnapshotFingerprint(snapshot),
     ]);
+
+    await projectOrchestrationSnapshot(tx, agent, task, snapshot);
   }
 
   if (!previous || previous.status !== task.status || previous.attempt_number !== task.attempt_number) {
@@ -1209,7 +1774,7 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
 
       // Match heartbeat and expiry ordering: task first, then its command.
       const lockedTask = await tx.queryOne(`
-        SELECT id, status, error, metadata
+        SELECT id, parent_task_id, status, error, metadata
         FROM capture_tasks
         WHERE id = $1 AND tenant_id = $2
         FOR UPDATE
@@ -1344,7 +1909,7 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
               )
             )
             AND metadata->>'createCommandId' = $10
-          RETURNING id, status
+          RETURNING id, parent_task_id, status
         `, [
           nextStatus,
           success,
@@ -1390,7 +1955,7 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           WHERE id = $4 AND tenant_id = $5
             AND status = 'resume_requested'
             AND metadata->>'resumeCommandId' = $6
-          RETURNING id, status
+          RETURNING id, parent_task_id, status
         `, [
           nextStatus,
           eventMessage,
@@ -1422,7 +1987,7 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
             updated_at = now()
           WHERE id = $4 AND tenant_id = $5
             AND metadata->>'stopCommandId' = $6
-          RETURNING id, status
+          RETURNING id, parent_task_id, status
         `, [
           nextStatus,
           eventMessage,
@@ -1454,6 +2019,40 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           requestId: text(resultPayload.requestId, 240),
         },
       });
+      if (updatedTask?.parent_task_id && command.command_type === 'create') {
+        const createError = success
+          ? {}
+          : {
+            code: text(resultPayload.reason || 'create_command_failed', 120),
+            message: eventMessage,
+          };
+        await projectOrchestrationChildControlOutcome(tx, {
+          tenantId: req.tenantId,
+          childTask: updatedTask,
+          agentId: req.captureAgent.id,
+          status: success ? 'dispatched' : 'needs_action',
+          error: createError,
+          actorType: 'capture_agent',
+          actorId: req.captureAgent.id,
+          actorName:
+            req.captureAgent.display_name || req.captureAgent.client_label,
+        });
+      } else if (
+        updatedTask?.parent_task_id &&
+        command.command_type === 'stop' &&
+        success
+      ) {
+        await projectOrchestrationChildControlOutcome(tx, {
+          tenantId: req.tenantId,
+          childTask: updatedTask,
+          agentId: req.captureAgent.id,
+          status: 'canceled',
+          actorType: 'capture_agent',
+          actorId: req.captureAgent.id,
+          actorName:
+            req.captureAgent.display_name || req.captureAgent.client_label,
+        });
+      }
       return {command: {...command, status: desiredCommandStatus}, taskUpdated: Boolean(updatedTask)};
     });
 
@@ -1498,16 +2097,47 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
     await withTransaction(async tx => expireStaleCommands(tx, req.tenantId));
     const [agents, tasks, taskSummary] = await Promise.all([
       queryAll(`
+        WITH task_load AS (
+          SELECT
+            COALESCE(assigned.assigned_agent_id, assigned.origin_agent_id)
+              AS agent_id,
+            COUNT(*) FILTER (
+              WHERE assigned.status IN (
+                'claimed', 'running', 'recovering', 'resume_requested'
+              )
+            ) AS active_task_count,
+            COUNT(*) FILTER (
+              WHERE assigned.status = 'pending'
+            ) AS queued_task_count
+          FROM capture_tasks assigned
+          WHERE assigned.tenant_id = $1
+            AND assigned.status IN (
+              'pending', 'claimed', 'running', 'recovering', 'resume_requested'
+            )
+            AND COALESCE(
+              assigned.assigned_agent_id,
+              assigned.origin_agent_id
+            ) IS NOT NULL
+          GROUP BY COALESCE(
+            assigned.assigned_agent_id,
+            assigned.origin_agent_id
+          )
+        )
         SELECT ca.id, ca.client_uuid, ca.client_label, ca.display_name,
           ca.host_label, ca.browser_name, ca.operating_system, ca.app_version,
           ca.allowed_platforms, ca.capabilities, ca.unattended_plan,
           ca.unattended_plan_updated_at, ca.status,
           ca.last_heartbeat_at, ca.last_error, ca.created_at, ca.updated_at,
+          COALESCE(task_load.active_task_count, 0)::integer
+            AS active_task_count,
+          COALESCE(task_load.queued_task_count, 0)::integer
+            AS queued_task_count,
           (
             ca.status = 'active'
             AND ca.last_heartbeat_at >= now() - interval '2 minutes'
           ) AS online
         FROM capture_agents ca
+        LEFT JOIN task_load ON task_load.agent_id = ca.id
         WHERE ca.tenant_id = $1 AND ca.status <> 'revoked'
         ORDER BY ca.host_label, ca.display_name, ca.created_at
       `, [req.tenantId]),
@@ -1567,6 +2197,12 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           LIMIT 1
         ) command ON true
         WHERE t.tenant_id = $1
+          AND t.parent_task_id IS NULL
+          AND NOT (
+            t.task_type = 'capture_orchestration'
+            AND t.orchestration_revision = 0
+            AND t.metadata->>'draft' = 'true'
+          )
         ORDER BY
           CASE WHEN t.status IN ('running', 'recovering', 'resume_requested', 'needs_action', 'interrupted') THEN 0 ELSE 1 END,
           t.updated_at DESC
@@ -1576,8 +2212,13 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         SELECT
           COUNT(*) FILTER (
             WHERE t.status IN ('running', 'recovering')
-              AND ca.status = 'active'
-              AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+              AND (
+                t.task_type = 'capture_orchestration'
+                OR (
+                  ca.status = 'active'
+                  AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+                )
+              )
           ) AS running_tasks,
           COUNT(*) FILTER (
             WHERE t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
@@ -1587,6 +2228,12 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
           AND ca.tenant_id = t.tenant_id
         WHERE t.tenant_id = $1
+          AND t.parent_task_id IS NULL
+          AND NOT (
+            t.task_type = 'capture_orchestration'
+            AND t.orchestration_revision = 0
+            AND t.metadata->>'draft' = 'true'
+          )
       `, [req.tenantId]),
     ]);
 
@@ -1596,6 +2243,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
       tasks: tasks.map(task => ({
         ...task,
         effective_status:
+          task.task_type !== 'capture_orchestration' &&
           isCloudTaskActive(task.status) && !task.agent_online && task.status !== 'needs_action'
             ? 'waiting_device'
             : task.status,
@@ -1957,8 +2605,10 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         }
       }
 
-      // A busy browser keeps create commands durably queued. Reporting the
-      // current recoverable task explains the wait without rejecting the new job.
+      // A busy browser keeps create commands durably queued. Only work that
+      // still owns or is waiting for the execution slot may explain that wait;
+      // terminal failed/partial results remain retryable but must not block the
+      // next assignment forever.
       // Plan configuration itself does not consume the capture slot, so it must
       // neither inherit this blocker nor tell the operator to resolve old work.
       const queueBlocker = isPlanConfiguration ? null : await tx.queryOne(`
@@ -1967,8 +2617,8 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         WHERE tenant_id = $1 AND assigned_agent_id = $2
           AND control_task_id IS NOT NULL AND control_task_id <> ''
           AND status IN (
-            'interrupted', 'needs_action', 'failed',
-            'completed_with_failures', 'resume_requested'
+            'pending', 'claimed', 'running', 'recovering',
+            'interrupted', 'resume_requested'
           )
         ORDER BY updated_at DESC, created_at DESC
         LIMIT 1
@@ -2369,7 +3019,7 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
               || jsonb_build_object('stoppedBeforeDispatch', true),
             finished_at = now(), updated_at = now()
           WHERE id = $1 AND tenant_id = $2
-          RETURNING id, status
+          RETURNING id, parent_task_id, status
         `, [task.id, req.tenantId]);
         await appendEvent(tx, {
           tenantId: req.tenantId,
@@ -2383,6 +3033,17 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
           message: '后台已在设备领取前取消任务',
           payload: {createCommandId: activeCreate.id},
         });
+        if (canceledTask?.parent_task_id) {
+          await projectOrchestrationChildControlOutcome(tx, {
+            tenantId: req.tenantId,
+            childTask: canceledTask,
+            agentId,
+            status: 'canceled',
+            actorType: 'user',
+            actorId: req.user?.id || '',
+            actorName: req.actorName,
+          });
+        }
         return {task: canceledTask || task, immediate: true};
       }
 

@@ -5,7 +5,13 @@
 
 import { PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG } from "../constants.js";
 import { cleanText, extractNoteId } from "../helpers.js";
-import { autoScrollLoad, isCanceled, resetCancelFlag, wait } from "../scroll.js";
+import {
+  autoScrollLoad,
+  isCanceled,
+  resetCancelFlag,
+  setCancelFlag,
+  wait,
+} from "../scroll.js";
 import { getDomProfile } from "../platform/dom-profiles/index.js";
 import {
   ensureSectionReady,
@@ -29,6 +35,12 @@ import {
   isDouyinOwnProfileUrl,
   normalizeDouyinAuthorName,
 } from "./douyin-author.js";
+import {
+  assertNoDouyinSearchServiceAbnormalPage,
+  createDouyinSearchServiceAbnormalError,
+  isDouyinSearchServiceAbnormalError,
+  observeDouyinSearchServiceAbnormalPage,
+} from "./douyin-search-guard.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const DEFAULT_SORT_DIMENSION = "likes";
@@ -59,11 +71,70 @@ export async function captureDouyinKeywordNotes({
 } = {}) {
   const captureStartedAt = new Date().toISOString();
   resetCancelFlag();
+  let serviceAbnormalError = null;
+  let resolveServiceAbnormalSignal = null;
+  const serviceAbnormalSignal = new Promise((resolve) => {
+    resolveServiceAbnormalSignal = resolve;
+  });
+  const stopForServiceAbnormal = (error = null) => {
+    if (serviceAbnormalError) return serviceAbnormalError;
+    serviceAbnormalError = isDouyinSearchServiceAbnormalError(error)
+      ? error
+      : createDouyinSearchServiceAbnormalError();
+    setCancelFlag(true);
+    resolveServiceAbnormalSignal?.(serviceAbnormalError);
+    if (onProgress) {
+      onProgress({
+        phase: "platform_service_abnormal",
+        message: serviceAbnormalError.message,
+        error: {
+          code: serviceAbnormalError.code,
+          message: serviceAbnormalError.message,
+        },
+        stopBatch: true,
+        requiresManualAction: true,
+      });
+    }
+    return serviceAbnormalError;
+  };
+  const assertNoServiceAbnormal = () => {
+    if (serviceAbnormalError) {
+      throw serviceAbnormalError;
+    }
+    try {
+      assertNoDouyinSearchServiceAbnormalPage();
+    } catch (error) {
+      throw stopForServiceAbnormal(error);
+    }
+  };
+  const waitWithServiceAbnormalGuard = async (promise) => {
+    const outcome = await Promise.race([
+      Promise.resolve(promise).then(
+        (value) => ({value}),
+        (error) => ({error}),
+      ),
+      serviceAbnormalSignal.then((error) => ({error})),
+    ]);
+    if (outcome?.error) {
+      throw outcome.error;
+    }
+    assertNoServiceAbnormal();
+    return outcome?.value;
+  };
+  const serviceAbnormalObserver =
+    observeDouyinSearchServiceAbnormalPage({
+      onDetected: (error) => {
+        stopForServiceAbnormal(error);
+      },
+    });
 
   try {
-    await wait(1200);
+    assertNoServiceAbnormal();
+    await waitWithServiceAbnormalGuard(wait(1200));
     assertNoCaptchaPage();
-    await ensureSectionReady(DOUYIN_DOM_PROFILE, "searchResults");
+    await waitWithServiceAbnormalGuard(
+      ensureSectionReady(DOUYIN_DOM_PROFILE, "searchResults"),
+    );
 
     const searchRoot = resolveSectionRoot(DOUYIN_DOM_PROFILE, "searchResults");
     const resolvedKeyword = normalizeKeyword(
@@ -184,6 +255,7 @@ export async function captureDouyinKeywordNotes({
     };
 
     const collectDetectedNotes = () => {
+      assertNoServiceAbnormal();
       mergeNotesIntoMap(
         noteMap,
         extractDouyinSearchCards(searchRoot),
@@ -218,7 +290,9 @@ export async function captureDouyinKeywordNotes({
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
       scrollStep: async ({ noNewContentCount = 0 } = {}) => {
+        assertNoServiceAbnormal();
         await scrollDouyinSearchResults(searchRoot, { noNewContentCount });
+        assertNoServiceAbnormal();
       },
       stopWhen: ({ currentContentCount, noNewContentCount }) => {
         if (progressStats.detectedCount >= normalizedMaxDetectedItems) {
@@ -248,13 +322,16 @@ export async function captureDouyinKeywordNotes({
 
         return { stop: false };
       },
+      resetCancelOnStart: false,
     });
 
+    assertNoServiceAbnormal();
     if (isCanceled()) {
       throw new Error("采集已取消");
     }
 
     collectDetectedNotes();
+    assertNoServiceAbnormal();
     const allItems = Array.from(noteMap.values());
     const filteredItems = allItems.filter(
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
@@ -354,8 +431,22 @@ export async function captureDouyinKeywordNotes({
       console.error("[Douyin][KeywordSearch] Capture failed:", error);
     }
 
+    const errorCode =
+      String(error?.code || "").trim() ||
+      (isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED");
+    const platformServiceAbnormal =
+      isDouyinSearchServiceAbnormalError(error);
+
     return {
       ok: false,
+      fatal: Boolean(error?.fatal || platformServiceAbnormal),
+      stopBatch: Boolean(error?.stopBatch || platformServiceAbnormal),
+      securityBlocked: Boolean(
+        error?.securityBlocked || platformServiceAbnormal,
+      ),
+      requiresManualAction: Boolean(
+        error?.requiresManualAction || platformServiceAbnormal,
+      ),
       platform: "douyin",
       type: SYNC_TYPE.KEYWORD_NOTES,
       data: null,
@@ -367,10 +458,25 @@ export async function captureDouyinKeywordNotes({
         captureFinishedAt: new Date().toISOString(),
       },
       error: {
-        code: isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED",
-        message: error.message,
+        code: errorCode,
+        message: errorMessage || "抖音搜索结果采集失败",
+        category: String(error?.category || ""),
+        fatal: Boolean(error?.fatal || platformServiceAbnormal),
+        stopBatch: Boolean(error?.stopBatch || platformServiceAbnormal),
+        securityBlocked: Boolean(
+          error?.securityBlocked || platformServiceAbnormal,
+        ),
+        requiresManualAction: Boolean(
+          error?.requiresManualAction || platformServiceAbnormal,
+        ),
+        retryable:
+          typeof error?.retryable === "boolean"
+            ? error.retryable
+            : !platformServiceAbnormal,
       },
     };
+  } finally {
+    serviceAbnormalObserver?.disconnect?.();
   }
 }
 

@@ -91,8 +91,10 @@ function bindStorageListeners() {
     }
 
     if (
+      authChange ||
       changes[STORAGE_KEY.UNATTENDED_KEYWORD_PLAN] ||
-      changes[STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST]
+      changes[STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST] ||
+      changes[STORAGE_KEY.UNATTENDED_KEYWORD_RUN_ARCHIVE]
     ) {
       void refreshTaskCenterLegacyState();
     }

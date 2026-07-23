@@ -31,11 +31,12 @@ test('triage and ticket details expose local body image paths', () => {
 
 test('both detail drawers share a graceful image fallback', () => {
   const gallery = source('web/admin/src/components/shared/RecordImageGallery.tsx');
+  const imageSources = source('web/admin/src/components/shared/record-images.ts');
   const recordDrawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const ticketDrawer = source('web/admin/src/components/shared/TicketDrawer.tsx');
 
-  assert.match(gallery, /record\.image_local_urls/);
-  assert.match(gallery, /record\.cover_local \|\| record\.cover_url/);
+  assert.match(imageSources, /record\.image_local_urls/);
+  assert.match(imageSources, /record\.cover_local \|\| record\.cover_url/);
   assert.match(gallery, /onError=\{\(\) => setFailed/);
   assert.match(gallery, /平台原图已失效/);
   assert.match(recordDrawer, /<RecordImageGallery/);

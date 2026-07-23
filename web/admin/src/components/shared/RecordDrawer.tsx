@@ -12,7 +12,11 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
-import { RecordImageGallery, recordDisplayImages } from '@/components/shared/RecordImageGallery'
+import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
+import {
+  recordDisplayImageEntries,
+  recordDisplayImages,
+} from '@/components/shared/record-images'
 import {
   RecordLabelChips, RecordLabelEditor, RecordLabelsHeading,
 } from '@/components/shared/RecordLabels'
@@ -310,7 +314,8 @@ export function RecordDrawer({
     return tags
   }
 
-  const images = getImages(r)
+  const imageEntries = recordDisplayImageEntries(r)
+  const images = imageEntries.map(item => item.url)
   const customTags = tagsFromRecord(r)
   // 封面优先用本地化副本(/media,静态可靠、不走代理);只有无本地副本才回落 CDN 代理。
   // 之前用 images[0]=proxiedImg(cover_url) 总是绕道 /api/img,白白放着 cover_local 不用。
@@ -501,7 +506,14 @@ export function RecordDrawer({
                       </div>
                     )}
                     {hasVideo(r) && <TranscriptSection record={r} canWrite={canProcess} />}
-                    <RecordImageGallery key={`${r.id}-${images.join('|')}`} images={images} onOpen={setLightbox} />
+                    <RecordImageGallery
+                      key={`${r.id}-${imageEntries.map(item => `${item.url}::${item.ref}`).join('|')}`}
+                      recordId={String(r.id)}
+                      canRefresh={canWrite}
+                      images={images}
+                      imageRefs={imageEntries.map(item => item.ref)}
+                      onOpen={setLightbox}
+                    />
                   </div>
                 )}
 

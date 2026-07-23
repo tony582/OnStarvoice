@@ -417,6 +417,143 @@ test("historical keyword tasks are read-only when another request is current", a
   assert.equal(items.find((item) => item.id === "current-request")?.canControlKeywordRun, true);
 });
 
+test("an archived failed keyword task becomes retryable after the current task finishes", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?archived-control-test=${Date.now()}`
+  );
+  const createdAt = new Date().toISOString();
+  const items = buildTaskCenterItems({
+    ledgerState: {
+      runs: [
+        {
+          id: "archived-request",
+          taskType: "unattended_keyword_capture",
+          status: "completed_with_failures",
+          createdAt,
+        },
+        {
+          id: "finished-current-request",
+          taskType: "unattended_keyword_capture",
+          status: "completed",
+          createdAt,
+        },
+      ],
+    },
+    legacyState: {
+      request: {
+        id: "finished-current-request",
+        status: "completed",
+        createdAt,
+      },
+      recoverableRequestIds: ["archived-request"],
+    },
+  });
+
+  assert.equal(
+    items.find((item) => item.id === "archived-request")
+      ?.canControlKeywordRun,
+    true,
+  );
+});
+
+test("an archived retry is read-only while the current request is pending", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?archived-busy-control-test=${Date.now()}`
+  );
+  const createdAt = new Date().toISOString();
+  const items = buildTaskCenterItems({
+    ledgerState: {
+      runs: [
+        {
+          id: "archived-request",
+          taskType: "unattended_keyword_capture",
+          status: "failed",
+          createdAt,
+        },
+        {
+          id: "pending-current-request",
+          taskType: "unattended_keyword_capture",
+          status: "pending",
+          createdAt,
+        },
+      ],
+    },
+    legacyState: {
+      request: {
+        id: "pending-current-request",
+        status: "pending",
+        createdAt,
+      },
+      recoverableRequestIds: ["archived-request"],
+    },
+  });
+
+  assert.equal(
+    items.find((item) => item.id === "archived-request")
+      ?.canControlKeywordRun,
+    false,
+  );
+});
+
+test("keep-results hides recovery controls for a dismissed terminal request", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?dismissed-control-test=${Date.now()}`
+  );
+  const createdAt = new Date().toISOString();
+  const [item] = buildTaskCenterItems({
+    ledgerState: {
+      runs: [
+        {
+          id: "dismissed-request",
+          taskType: "unattended_keyword_capture",
+          status: "failed",
+          createdAt,
+        },
+      ],
+    },
+    legacyState: {
+      request: {
+        id: "dismissed-request",
+        status: "failed",
+        recoveryDismissedAt: createdAt,
+        createdAt,
+      },
+    },
+  });
+
+  assert.equal(item?.canControlKeywordRun, false);
+});
+
+test("an old Agent scope cannot expose recovery controls in the current tenant", async () => {
+  const {buildTaskCenterItems} = await import(
+    `../sidebar/task-center-ui.js?scope-control-test=${Date.now()}`
+  );
+  const createdAt = new Date().toISOString();
+  const [item] = buildTaskCenterItems({
+    ledgerState: {
+      runs: [
+        {
+          id: "old-scope-request",
+          taskType: "unattended_keyword_capture",
+          status: "failed",
+          createdAt,
+        },
+      ],
+    },
+    legacyState: {
+      request: {
+        id: "old-scope-request",
+        status: "failed",
+        cloudAgentScopeId: "old-agent",
+        createdAt,
+      },
+      requestRecoveryAllowed: false,
+    },
+  });
+
+  assert.equal(item?.canControlKeywordRun, false);
+});
+
 test("task center reads the canonical business clock and keyword checkpoint rows", async () => {
   const {normalizeTaskCenterItem} = await import(
     `../sidebar/task-center-ui.js?checkpoint-ui-test=${Date.now()}`
@@ -453,6 +590,8 @@ test("task center refreshes an open detail and blocks code-only safety retries",
   assert.match(ui, /stillValidAction \|\| document\.getElementById\("btnTaskCenterDetailDone"\)/);
   assert.match(ui, /item\?\.raw\?\.error\?\.code/);
   assert.match(ui, /login\[_\\s-\]\?required/);
+  assert.match(ui, /requiresManualAction/);
+  assert.match(ui, /douyin_search_service_abnormal/);
   assert.match(
     ui,
     /\["attention", "failed", "partial"\]\.includes\(item\.status\)[\s\S]*isTaskCenterCircuitBreaker\(item\)/,
@@ -471,4 +610,8 @@ test("sidebar state subscribes to task ledger and legacy unattended records", as
   assert.match(state, /notifyListeners\('taskCenterLegacy', currentTaskCenterLegacy\)/);
   assert.match(state, /initTaskLedger\(\)/);
   assert.match(state, /initTaskCenterLegacyState\(\)/);
+  assert.match(
+    state,
+    /authChange \|\|[\s\S]*UNATTENDED_KEYWORD_RUN_ARCHIVE/u,
+  );
 });

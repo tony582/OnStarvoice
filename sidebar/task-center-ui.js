@@ -636,6 +636,25 @@ export function buildTaskCenterItems({
   const activeLegacyRequestId = String(
     legacyState.request?.id || legacyState.request?.requestId || "",
   ).trim();
+  const activeLegacyRequestStatus = normalizeTaskCenterStatus(
+    legacyState.request?.status,
+  );
+  const activeLegacyRequestBlocksRecovery =
+    activeLegacyRequestStatus === "running" ||
+    activeLegacyRequestStatus === "recovering" ||
+    ["claimed", "resume_requested"].includes(activeLegacyRequestStatus);
+  const activeLegacyRecoveryDismissed = Boolean(
+    String(legacyState.request?.recoveryDismissedAt || "").trim() ||
+    legacyState.requestRecoveryAllowed === false,
+  );
+  const recoverableRequestIds = new Set(
+    (Array.isArray(legacyState.recoverableRequestIds)
+      ? legacyState.recoverableRequestIds
+      : []
+    )
+      .map((requestId) => String(requestId || "").trim())
+      .filter(Boolean),
+  );
   const normalizedLegacy = legacyItems
     .map(normalizeTaskCenterItem)
     .filter((legacyItem) => {
@@ -679,15 +698,27 @@ export function buildTaskCenterItems({
   }
   return Array.from(byId.values())
     .filter(isTaskCenterBusinessVisible)
-    .map((item) => ({
-      ...item,
-      canControlKeywordRun: Boolean(
+    .map((item) => {
+      const actionRequestId = String(item.actionTaskId || item.id || "").trim();
+      const isCurrentRequest = Boolean(
         activeLegacyRequestId &&
-          item.type === "keyword" &&
           (item.id === activeLegacyRequestId ||
-            item.actionTaskId === activeLegacyRequestId),
-      ),
-    }))
+            actionRequestId === activeLegacyRequestId),
+      );
+      const hasRecoverySnapshot = Boolean(
+        actionRequestId && recoverableRequestIds.has(actionRequestId),
+      );
+      return {
+        ...item,
+        canControlKeywordRun: Boolean(
+          item.type === "keyword" &&
+            (
+              (isCurrentRequest && !activeLegacyRecoveryDismissed) ||
+              (hasRecoverySnapshot && !activeLegacyRequestBlocksRecovery)
+            ),
+        ),
+      };
+    })
     .sort((left, right) => {
       const chronologicalDiff =
         getTaskCenterChronologicalTime(right) -
@@ -789,7 +820,8 @@ function getTaskCenterActions(item) {
     (isUnattendedKeyword || ["attention", "failed", "partial"].includes(item.status)) &&
     !item.canControlKeywordRun
   ) {
-    // 后台只允许控制当前 request；旧任务保留为只读，避免按钮必然 not_found。
+    // 只有当前 request 或仍有本地恢复快照的历史任务可控制；其余历史
+    // 记录保持只读，避免按钮必然返回 not_found。
     return [];
   }
   if (
@@ -830,6 +862,9 @@ function isTaskCenterCircuitBreaker(item) {
   if (
     item?.raw?.requiresManualIntervention === true ||
     item?.raw?.requires_manual_intervention === true ||
+    item?.raw?.requiresManualAction === true ||
+    item?.raw?.requires_manual_action === true ||
+    item?.raw?.error?.requiresManualAction === true ||
     item?.raw?.circuitBreaker === true ||
     item?.raw?.circuit_breaker === true
   ) {
@@ -846,7 +881,7 @@ function isTaskCenterCircuitBreaker(item) {
     .map((value) => String(value || ""))
     .join(" ")
     .toLowerCase();
-  return /验证码|人机验证|登录失效|请(?:先|重新)?登录|需要登录|账号异常|账号限制|安全限制|安全验证|访问受限|风控|captcha|login[_\s-]?required|auth[_\s-]?required|account[_\s-]?(?:forbidden|restricted)|security[_\s-]?(?:block|check)|risk[_\s-]?control/.test(text);
+  return /验证码|人机验证|登录失效|请(?:先|重新)?登录|需要登录|账号异常|账号限制|安全限制|安全验证|访问受限|风控|captcha|login[_\s-]?required|auth[_\s-]?required|account[_\s-]?(?:forbidden|restricted)|security[_\s-]?(?:block|check)|risk[_\s-]?control|douyin_search_service_abnormal/.test(text);
 }
 
 function renderTaskCenterActions(item, limit = Infinity) {

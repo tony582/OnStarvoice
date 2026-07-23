@@ -33,6 +33,9 @@ import {
   createListCaptureAcceptanceLedger,
   decorateListCheckpointProgress,
 } from "./utils/capture/list-capture-trace.js";
+import {
+  assertNoDouyinSearchServiceAbnormalPage,
+} from "./utils/capture/douyin-search-guard.js";
 
 console.log("[StarVoice V1.0] Content script loaded");
 
@@ -427,6 +430,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     case "applyBatchSearchFilters":
       handleApplyBatchSearchFilters(request, sendResponseWithDiagnostics);
+      return true;
+
+    case "assertNoDouyinSearchServiceAbnormal":
+      handleAssertNoDouyinSearchServiceAbnormal(sendResponseWithDiagnostics);
       return true;
 
     case "expandKeywordSuggestions":
@@ -1009,7 +1016,42 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
     sendResponse({ ok: true, data: result });
   } catch (error) {
     console.error("[Content] Apply batch search filters failed:", error);
-    sendResponse({ ok: false, error: { code: "APPLY_FILTER_FAILED", message: error.message } });
+    sendResponse({
+      ok: false,
+      error: {
+        code: String(error?.code || "APPLY_FILTER_FAILED"),
+        message: String(error?.message || "应用搜索筛选失败"),
+        category: String(error?.category || ""),
+        fatal: Boolean(error?.fatal),
+        stopBatch: Boolean(error?.stopBatch),
+        securityBlocked: Boolean(error?.securityBlocked),
+        requiresManualAction: Boolean(error?.requiresManualAction),
+        retryable:
+          typeof error?.retryable === "boolean" ? error.retryable : true,
+      },
+    });
+  }
+}
+
+function handleAssertNoDouyinSearchServiceAbnormal(sendResponse) {
+  try {
+    assertNoDouyinSearchServiceAbnormalPage();
+    sendResponse({ok: true, data: {blocked: false}});
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      error: {
+        code: String(error?.code || "DOUYIN_SEARCH_GUARD_FAILED"),
+        message: String(error?.message || "抖音搜索页保护检查失败"),
+        category: String(error?.category || ""),
+        fatal: Boolean(error?.fatal),
+        stopBatch: Boolean(error?.stopBatch),
+        securityBlocked: Boolean(error?.securityBlocked),
+        requiresManualAction: Boolean(error?.requiresManualAction),
+        retryable:
+          typeof error?.retryable === "boolean" ? error.retryable : false,
+      },
+    });
   }
 }
 
@@ -1082,6 +1124,9 @@ async function applyBatchSearchFilters({
     : /xiaohongshu\.com/i.test(window.location.href)
       ? "xiaohongshu"
       : "unknown";
+  if (platform === "douyin") {
+    assertNoDouyinSearchServiceAbnormalPage();
+  }
   const filterRequests = [
     {
       field: "sort",
@@ -1787,7 +1832,17 @@ function clickStrategyElement(node) {
 }
 
 async function waitForKeywordStrategyUi(ms = 300) {
-  await new Promise((resolve) => window.setTimeout(resolve, ms));
+  const total = Math.max(0, Number(ms) || 0);
+  const deadline = Date.now() + total;
+  do {
+    assertNoDouyinSearchServiceAbnormalPage();
+    const remainingMs = Math.max(0, deadline - Date.now());
+    if (remainingMs <= 0) break;
+    await new Promise((resolve) =>
+      window.setTimeout(resolve, Math.min(100, remainingMs)),
+    );
+  } while (Date.now() < deadline);
+  assertNoDouyinSearchServiceAbnormalPage();
 }
 
 function randomStrategyDelay(minMs, maxMs) {

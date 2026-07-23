@@ -1,6 +1,11 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
-import { requireSessionUser, requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import {
+  isTenantWriter,
+  requireSessionUser,
+  requireTenantAccess,
+  requireTenantWriter,
+} from '../middleware/auth.js';
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
 import { collectRecordMediaUrls, isAllowedMediaHost, streamMediaToResponse } from '../services/media-proxy.js';
 import {
@@ -10,6 +15,11 @@ import {
 import { insertRecordFeedback, normalizeFeedbackReason } from '../services/record-feedback.js';
 import { startTranscription } from '../services/transcription.js';
 import { analyzeTranscript } from '../services/transcript-analysis.js';
+import {
+  extractRecordImageText,
+  ImageTextExtractionError,
+  validateImageTextRequest,
+} from '../services/image-text-extraction.js';
 import { formatPublishDate } from '../services/publish-date.js';
 import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifecycle.js';
 
@@ -824,6 +834,49 @@ router.get('/:id/media-proxy', requireTenantAccess, async (req, res, next) => {
     return streamMediaToResponse({ url, filename, platform: record.platform, res });
   } catch (err) {
     return next(err);
+  }
+});
+
+/**
+ * 按需提取某一张内容图片（封面或正文图）里的文字。
+ * 客户端只提交画廊提供的稳定图片标识，服务端按 tenant + record 重新校验归属，
+ * 禁止任意 URL / Key / 模型透传。
+ * 登录成员可使用；结果按图片内容哈希缓存，refresh=true 时才重新调用模型。
+ */
+router.post('/:id/image-text', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  const input = validateImageTextRequest(req.body);
+  if (!input.ok) {
+    return res.status(400).json({
+      ok: false,
+      error: input.error,
+      message: input.message,
+    });
+  }
+  if (input.refresh && !isTenantWriter(req)) {
+    return res.status(403).json({
+      ok: false,
+      error: 'refresh_forbidden',
+      message: '当前账号不能重新识别图片',
+    });
+  }
+  try {
+    const result = await extractRecordImageText({
+      tenantId: req.tenantId,
+      recordId: req.params.id,
+      imageRef: input.imageRef,
+      refresh: input.refresh,
+      actorUserId: req.user?.id || null,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof ImageTextExtractionError) {
+      return res.status(error.status).json({
+        ok: false,
+        error: error.code,
+        message: error.message,
+      });
+    }
+    return next(error);
   }
 });
 

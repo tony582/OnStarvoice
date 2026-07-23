@@ -653,13 +653,51 @@ export async function getTaskLedger() {
  * 这里不改写旧数据，也不会把缺失字段推断成完整历史。
  */
 export async function getLegacyTaskCenterState() {
-  const [plan, request] = await Promise.all([
+  const [plan, request, archive, auth] = await Promise.all([
     getItem(STORAGE_KEY.UNATTENDED_KEYWORD_PLAN),
     getItem(STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST),
+    getItem(STORAGE_KEY.UNATTENDED_KEYWORD_RUN_ARCHIVE),
+    getItem(STORAGE_KEY.AUTH),
   ]);
+  const currentAgentScopeId = String(
+    auth?.captureAgent?.id || "",
+  ).trim();
+  const archiveAgentScopeId = String(archive?.agentScopeId || "").trim();
+  const archiveScopeMatches =
+    !archiveAgentScopeId ||
+    !currentAgentScopeId ||
+    archiveAgentScopeId === currentAgentScopeId;
+  const requestScopeMatches = (candidate) => {
+    const requestAgentScopeId = String(
+      candidate?.cloudAgentScopeId || "",
+    ).trim();
+    return (
+      !requestAgentScopeId ||
+      !currentAgentScopeId ||
+      requestAgentScopeId === currentAgentScopeId
+    );
+  };
+  const archivedRequests =
+    archiveScopeMatches &&
+    archive?.requests &&
+    typeof archive.requests === "object" &&
+    !Array.isArray(archive.requests)
+      ? archive.requests
+      : {};
   return {
     plan,
     request,
+    requestRecoveryAllowed: requestScopeMatches(request),
+    recoverableRequestIds: Object.entries(archivedRequests)
+      .filter(
+        ([, archivedRequest]) =>
+          archivedRequest &&
+          typeof archivedRequest === "object" &&
+          requestScopeMatches(archivedRequest) &&
+          !String(archivedRequest.recoveryDismissedAt || "").trim(),
+      )
+      .map(([requestId]) => String(requestId || "").trim())
+      .filter(Boolean),
   };
 }
 
