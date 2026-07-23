@@ -13,6 +13,7 @@ import {
 } from '../services/capture-cloud.js';
 import {
   allocateKeywordWorkItems,
+  computeNextOrchestrationRunAt,
   hashOrchestrationRequest,
   normalizeOrchestrationRequest,
 } from '../services/capture-orchestration.js';
@@ -108,7 +109,6 @@ function normalizeCreateRequest(body) {
     const normalized = normalizeOrchestrationRequest({
       ...safeJson(body),
       requestKey: body?.requestKey || body?.clientTaskId,
-      executionMode: 'one_time',
     });
     const requestKey = normalizedUuid(normalized.requestKey);
     if (!requestKey) {
@@ -120,7 +120,7 @@ function normalizeCreateRequest(body) {
     const remoteTaskInput = normalizeRemoteTaskInput({
       clientTaskId: requestKey,
       title: normalized.title,
-      executionMode: 'one_time',
+      executionMode: normalized.executionMode,
       planSnapshot: {
         ...safeJson(normalized.taskInput),
         platform: normalized.platform,
@@ -145,7 +145,7 @@ function normalizeCreateRequest(body) {
     const request = {
       ...normalized,
       requestKey,
-      executionMode: 'one_time',
+      executionMode: normalized.executionMode,
       platform: normalized.platform,
       keywords: normalized.keywords,
       title: remoteTaskInput.title,
@@ -335,11 +335,32 @@ function parentSelect({lock = false} = {}) {
     SELECT id, tenant_id, client_task_id, parent_task_id,
       task_type, feature_key, title, platform, source, trigger_type,
       status, progress, checkpoint, counts, metadata, error, message,
-      orchestration_revision, created_at, updated_at
+      orchestration_revision, orchestration_schedule_id, scheduled_for,
+      schedule_revision, attention_dismissed_at, created_at, updated_at
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2 AND task_type = 'capture_orchestration'
     ${lock ? 'FOR UPDATE' : ''}
   `;
+}
+
+async function loadOrchestrationSchedule(executor, tenantId, scheduleId, {lock = false} = {}) {
+  if (!scheduleId) return null;
+  return executor.queryOne(`
+    SELECT id, tenant_id, template_task_id, title, platform, status,
+      schedule_mode, timezone, start_time, random_offset_min,
+      ARRAY(
+        SELECT scheduled_date::text
+        FROM unnest(schedule.custom_dates) AS scheduled_date
+        ORDER BY scheduled_date
+      ) AS custom_dates,
+      overlap_policy, late_start_grace_min, allocation_mode, revision,
+      plan_snapshot, next_run_at, last_scheduled_for, last_run_at,
+      last_run_task_id, last_run_status, last_error, run_count,
+      created_at, updated_at
+    FROM capture_orchestration_schedules schedule
+    WHERE schedule.id = $1 AND schedule.tenant_id = $2
+    ${lock ? 'FOR UPDATE' : ''}
+  `, [scheduleId, tenantId]);
 }
 
 async function listParentItems(executor, tenantId, taskId, {lock = false} = {}) {
@@ -475,7 +496,7 @@ router.post(
           orchestrationRequestHash: requestHash,
           draft: true,
           allocationMode: request.allocationMode || 'balanced',
-          executionMode: 'one_time',
+          executionMode: request.executionMode,
           planSnapshot,
           requestedByUserId: req.user?.id || '',
           requestedByName: text(req.actorName, 240),
@@ -491,7 +512,7 @@ router.post(
             'keyword_orchestration', $3, $4, 'cloud',
             'remote_orchestration', 'pending',
             $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
-            '编排任务已创建，等待分配执行节点', 0, now()
+            $8, 0, now()
           )
           RETURNING id, tenant_id, client_task_id, parent_task_id,
             task_type, feature_key, title, platform, source, trigger_type,
@@ -512,6 +533,9 @@ router.post(
             skipped: 0,
           }),
           JSON.stringify(metadata),
+          request.executionMode === 'unattended_plan'
+            ? '多 Agent 无人值守计划已创建，等待确认分配'
+            : '编排任务已创建，等待分配执行节点',
         ]);
         const items = [];
         for (let index = 0; index < request.keywords.length; index += 1) {
@@ -549,12 +573,15 @@ router.post(
           actorId: req.user?.id || '',
           actorName: req.actorName,
           status: parent.status,
-          message: '后台已创建关键词编排任务',
+          message: request.executionMode === 'unattended_plan'
+            ? '后台已创建多 Agent 无人值守计划草稿'
+            : '后台已创建关键词编排任务',
           payload: {
             revision: 0,
             platform: parent.platform,
             keywordCount: items.length,
             allocationMode: metadata.allocationMode,
+            executionMode: request.executionMode,
           },
         });
         return {parent, items, existing: false};
@@ -802,6 +829,10 @@ router.post(
           )};
         }
         const currentRevision = Number(parent.orchestration_revision || 0);
+        const parentExecutionMode =
+          parent.metadata?.executionMode === 'unattended_plan'
+            ? 'unattended_plan'
+            : 'one_time';
         const items = await listParentItems(
           tx,
           req.tenantId,
@@ -821,10 +852,23 @@ router.post(
             items.every(item =>
               requestedAgentByItem.get(String(item.id)) ===
                 String(item.assigned_agent_id || '') &&
-              Boolean(item.execution_task_id) &&
+              (
+                parentExecutionMode === 'unattended_plan'
+                  ? !item.execution_task_id && item.status === 'assigned'
+                  : Boolean(item.execution_task_id)
+              ) &&
               Number(item.assignment_revision || 0) === currentRevision
             );
           if (exactCommittedReplay) {
+            const schedule = parentExecutionMode === 'unattended_plan'
+              ? await tx.queryOne(`
+                  SELECT id, status, schedule_mode, timezone, start_time,
+                    random_offset_min, custom_dates, next_run_at,
+                    last_run_at, last_run_task_id, run_count, revision
+                  FROM capture_orchestration_schedules
+                  WHERE tenant_id = $1 AND template_task_id = $2
+                `, [req.tenantId, parent.id])
+              : null;
             const children = await tx.queryAll(`
               SELECT child.id, child.assigned_agent_id, child.status,
                 child.metadata, ca.last_heartbeat_at,
@@ -848,6 +892,7 @@ router.post(
             return {
               parent,
               existing: true,
+              schedule,
               executions: children.map(child => {
                 const childItems = items.filter(
                   item => String(item.execution_task_id) === String(child.id),
@@ -950,6 +995,170 @@ router.post(
         }
 
         const nextRevision = currentRevision + 1;
+        if (parentExecutionMode === 'unattended_plan') {
+          const scheduleId = crypto.randomUUID();
+          const nextRunAt = computeNextOrchestrationRunAt(planSnapshot, {
+            after: new Date(),
+            seed: scheduleId,
+          });
+          if (!nextRunAt) {
+            return {failure: requestError(
+              'schedule_has_no_future_run',
+              '无人值守计划没有未来可执行时间，请调整日期或开始时间',
+              400,
+            )};
+          }
+          const scheduleMode = planSnapshot.mode === 'custom_dates'
+            ? 'custom_dates'
+            : 'daily';
+          const customDates = scheduleMode === 'custom_dates'
+            ? String(planSnapshot.customDates || '')
+              .split(/\r?\n/gu)
+              .map(value => value.trim())
+              .filter(Boolean)
+            : [];
+          const schedule = await tx.queryOne(`
+            INSERT INTO capture_orchestration_schedules (
+              id, tenant_id, template_task_id, title, platform, status,
+              schedule_mode, timezone, start_time, random_offset_min,
+              custom_dates, overlap_policy, late_start_grace_min,
+              allocation_mode, revision, plan_snapshot, next_run_at,
+              created_by_user_id, created_by_name
+            ) VALUES (
+              $1, $2, $3, $4, $5, 'active',
+              $6, 'Asia/Shanghai', $7, $8,
+              $9::date[], 'skip', $10,
+              'balanced', 1, $11::jsonb, $12,
+              $13, $14
+            )
+            RETURNING id, status, schedule_mode, timezone, start_time,
+              random_offset_min, custom_dates, next_run_at,
+              last_run_at, last_run_task_id, run_count, revision
+          `, [
+            scheduleId,
+            req.tenantId,
+            parent.id,
+            parent.title,
+            parent.platform,
+            scheduleMode,
+            planSnapshot.startTime || '09:00',
+            Number(planSnapshot.randomOffsetMin || 0),
+            customDates,
+            Number(planSnapshot.lateStartGraceMin || 360),
+            JSON.stringify(planSnapshot),
+            nextRunAt,
+            req.user?.id || null,
+            text(req.actorName, 240),
+          ]);
+          const orderedAgentIds = [];
+          const seenAgentIds = new Set();
+          for (const assignment of normalized.assignments) {
+            if (seenAgentIds.has(assignment.agentId)) continue;
+            seenAgentIds.add(assignment.agentId);
+            orderedAgentIds.push(assignment.agentId);
+          }
+          for (let index = 0; index < orderedAgentIds.length; index += 1) {
+            await tx.execute(`
+              INSERT INTO capture_orchestration_schedule_agents (
+                schedule_id, tenant_id, agent_id, ordinal
+              ) VALUES ($1, $2, $3, $4)
+            `, [schedule.id, req.tenantId, orderedAgentIds[index], index]);
+          }
+          for (const assignment of normalized.assignments) {
+            const updatedItem = await tx.queryOne(`
+              UPDATE capture_task_items
+              SET status = 'assigned',
+                assigned_agent_id = $1,
+                assignment_revision = $2,
+                assigned_at = now(),
+                updated_at = now()
+              WHERE id = $3 AND tenant_id = $4 AND task_id = $5
+                AND status = 'pending'
+                AND assigned_agent_id IS NULL
+                AND execution_task_id IS NULL
+              RETURNING id
+            `, [
+              assignment.agentId,
+              nextRevision,
+              assignment.itemId,
+              req.tenantId,
+              parent.id,
+            ]);
+            if (!updatedItem) {
+              const conflict = new Error('orchestration_item_assignment_conflict');
+              conflict.code = 'orchestration_item_assignment_conflict';
+              throw conflict;
+            }
+          }
+          const parentUpdate = await tx.queryOne(`
+            UPDATE capture_tasks
+            SET orchestration_revision = orchestration_revision + 1,
+              orchestration_schedule_id = $1,
+              schedule_revision = 1,
+              status = 'pending',
+              progress = $2::jsonb,
+              counts = counts || $3::jsonb,
+              metadata = (metadata - 'draft') || jsonb_build_object(
+                'publishedAt', now(),
+                'orchestrationTemplate', true,
+                'scheduleId', $1::uuid::text,
+                'scheduleStatus', 'active',
+                'nextRunAt', $4::timestamptz::text
+              ),
+              message = '多 Agent 无人值守计划已启用，等待下一次云端运行',
+              updated_at = now(),
+              source_updated_at = now()
+            WHERE id = $5 AND tenant_id = $6
+              AND task_type = 'capture_orchestration'
+              AND orchestration_revision = $7
+            RETURNING id, orchestration_revision, status,
+              orchestration_schedule_id
+          `, [
+            schedule.id,
+            JSON.stringify({
+              current: 0,
+              total: items.length,
+              phase: 'scheduled',
+              nextRunAt,
+            }),
+            JSON.stringify({
+              total: items.length,
+              assigned: items.length,
+            }),
+            nextRunAt,
+            parent.id,
+            req.tenantId,
+            currentRevision,
+          ]);
+          if (!parentUpdate) {
+            const conflict = new Error('orchestration_revision_conflict');
+            conflict.code = 'orchestration_revision_conflict';
+            throw conflict;
+          }
+          await appendEvent(tx, {
+            tenantId: req.tenantId,
+            taskId: parent.id,
+            eventType: 'orchestration_schedule_created',
+            actorId: req.user?.id || '',
+            actorName: req.actorName,
+            status: parentUpdate.status,
+            message: '多 Agent 无人值守计划已按确认分配启用',
+            payload: {
+              scheduleId: schedule.id,
+              revision: parentUpdate.orchestration_revision,
+              itemCount: items.length,
+              agentIds: orderedAgentIds,
+              nextRunAt,
+              scheduleMode,
+            },
+          });
+          return {
+            parent: parentUpdate,
+            schedule,
+            executions: [],
+          };
+        }
+
         const executions = [];
         const sortedAgentIds = [...assignmentsByAgent.keys()].sort(
           (left, right) => left.localeCompare(right),
@@ -1208,6 +1417,7 @@ router.post(
         orchestrationId: result.parent.id,
         revision: Number(result.parent.orchestration_revision),
         status: result.parent.status,
+        schedule: result.schedule || null,
         executions: result.executions,
       });
     } catch (error) {
@@ -1221,6 +1431,278 @@ router.post(
           409,
         ));
       }
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/orchestrations/:id/schedule/pause',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const result = await withTransaction(async tx => {
+        const parentSnapshot = await tx.queryOne(
+          parentSelect(),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parentSnapshot) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        if (
+          !parentSnapshot.orchestration_schedule_id ||
+          parentSnapshot.metadata?.orchestrationTemplate !== true
+        ) {
+          return {failure: requestError(
+            'orchestration_schedule_not_found',
+            '当前编排任务不是无人值守计划',
+            409,
+          )};
+        }
+        const schedule = await loadOrchestrationSchedule(
+          tx,
+          req.tenantId,
+          parentSnapshot.orchestration_schedule_id,
+          {lock: true},
+        );
+        if (!schedule) {
+          return {failure: requestError(
+            'orchestration_schedule_not_found',
+            '无人值守计划不存在',
+            404,
+          )};
+        }
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (
+          !parent ||
+          String(parent.orchestration_schedule_id || '') !== String(schedule.id)
+        ) {
+          return {failure: requestError(
+            'orchestration_schedule_conflict',
+            '计划状态刚刚发生变化，请刷新后重试',
+            409,
+          )};
+        }
+        if (schedule.status === 'paused') {
+          return {schedule, existing: true};
+        }
+        if (!['active'].includes(schedule.status)) {
+          return {failure: requestError(
+            'orchestration_schedule_not_pauseable',
+            '当前无人值守计划不能暂停',
+            409,
+          )};
+        }
+        const updated = await tx.queryOne(`
+          UPDATE capture_orchestration_schedules
+          SET status = 'paused',
+            revision = revision + 1,
+            updated_at = now()
+          WHERE id = $1 AND tenant_id = $2 AND status = 'active'
+          RETURNING *
+        `, [schedule.id, req.tenantId]);
+        if (!updated) {
+          return {failure: requestError(
+            'orchestration_schedule_conflict',
+            '计划状态刚刚发生变化，请刷新后重试',
+            409,
+          )};
+        }
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET metadata = metadata || jsonb_build_object(
+              'scheduleStatus', 'paused',
+              'scheduleRevision', $1::integer
+            ),
+            schedule_revision = $1,
+            message = '多 Agent 无人值守计划已暂停，不会再生成新任务',
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $2 AND tenant_id = $3
+        `, [Number(updated.revision), parent.id, req.tenantId]);
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_schedule_paused',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: parent.status,
+          message: '多 Agent 无人值守计划已暂停',
+          payload: {
+            scheduleId: updated.id,
+            revision: updated.revision,
+            nextRunAt: updated.next_run_at,
+          },
+        });
+        return {schedule: updated, existing: false};
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.json({
+        ok: true,
+        existing: result.existing === true,
+        schedule: result.schedule,
+        message: result.existing
+          ? '计划已经暂停'
+          : '计划已暂停，不会再生成新任务',
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/orchestrations/:id/schedule/resume',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const result = await withTransaction(async tx => {
+        const parentSnapshot = await tx.queryOne(
+          parentSelect(),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parentSnapshot) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        if (
+          !parentSnapshot.orchestration_schedule_id ||
+          parentSnapshot.metadata?.orchestrationTemplate !== true
+        ) {
+          return {failure: requestError(
+            'orchestration_schedule_not_found',
+            '当前编排任务不是无人值守计划',
+            409,
+          )};
+        }
+        const schedule = await loadOrchestrationSchedule(
+          tx,
+          req.tenantId,
+          parentSnapshot.orchestration_schedule_id,
+          {lock: true},
+        );
+        if (!schedule) {
+          return {failure: requestError(
+            'orchestration_schedule_not_found',
+            '无人值守计划不存在',
+            404,
+          )};
+        }
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (
+          !parent ||
+          String(parent.orchestration_schedule_id || '') !== String(schedule.id)
+        ) {
+          return {failure: requestError(
+            'orchestration_schedule_conflict',
+            '计划状态刚刚发生变化，请刷新后重试',
+            409,
+          )};
+        }
+        if (schedule.status === 'active') {
+          return {schedule, existing: true};
+        }
+        if (!['paused'].includes(schedule.status)) {
+          return {failure: requestError(
+            'orchestration_schedule_not_resumable',
+            '当前无人值守计划不能重新启用',
+            409,
+          )};
+        }
+        const nextRunAt = computeNextOrchestrationRunAt(schedule.plan_snapshot, {
+          after: new Date(),
+          seed: schedule.id,
+        });
+        if (!nextRunAt) {
+          return {failure: requestError(
+            'schedule_has_no_future_run',
+            '计划中已没有未来运行日期，请新建计划或调整日期',
+            409,
+          )};
+        }
+        const updated = await tx.queryOne(`
+          UPDATE capture_orchestration_schedules
+          SET status = 'active',
+            next_run_at = $1,
+            revision = revision + 1,
+            last_error = '{}'::jsonb,
+            updated_at = now()
+          WHERE id = $2 AND tenant_id = $3 AND status = 'paused'
+          RETURNING *
+        `, [nextRunAt, schedule.id, req.tenantId]);
+        if (!updated) {
+          return {failure: requestError(
+            'orchestration_schedule_conflict',
+            '计划状态刚刚发生变化，请刷新后重试',
+            409,
+          )};
+        }
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET status = 'pending',
+            metadata = metadata || jsonb_build_object(
+              'scheduleStatus', 'active',
+              'scheduleRevision', $1::integer,
+              'nextRunAt', $2::timestamptz::text
+            ),
+            schedule_revision = $1,
+            progress = progress || jsonb_build_object(
+              'phase', 'scheduled',
+              'nextRunAt', $2::timestamptz::text
+            ),
+            message = '多 Agent 无人值守计划已重新启用，等待下一次云端运行',
+            finished_at = NULL,
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $3 AND tenant_id = $4
+        `, [Number(updated.revision), nextRunAt, parent.id, req.tenantId]);
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_schedule_resumed',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: 'pending',
+          message: '多 Agent 无人值守计划已重新启用',
+          payload: {
+            scheduleId: updated.id,
+            revision: updated.revision,
+            nextRunAt,
+          },
+        });
+        return {schedule: updated, existing: false};
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.json({
+        ok: true,
+        existing: result.existing === true,
+        schedule: result.schedule,
+        message: result.existing
+          ? '计划已经启用'
+          : '计划已重新启用，将按下一次时间运行',
+      });
+    } catch (error) {
       return next(error);
     }
   },
@@ -1303,7 +1785,12 @@ router.get(
             AND attempt.parent_task_id = $2
           ORDER BY item.ordinal, attempt.attempt_number, attempt.created_at
         `, [req.tenantId, orchestration.id]);
-        return {orchestration, items, executions, agents, attempts};
+        const schedule = await loadOrchestrationSchedule(
+          tx,
+          req.tenantId,
+          orchestration.orchestration_schedule_id,
+        );
+        return {orchestration, items, executions, agents, attempts, schedule};
       });
       if (!result) {
         return sendRequestError(res, requestError(
@@ -1312,7 +1799,7 @@ router.get(
           404,
         ));
       }
-      const {orchestration, items, executions, agents, attempts} = result;
+      const {orchestration, items, executions, agents, attempts, schedule} = result;
       return res.json({
         ok: true,
         orchestration: {
@@ -1328,6 +1815,7 @@ router.get(
         })),
         agents: agents.map(publicAgent),
         attempts,
+        schedule,
       });
     } catch (error) {
       return next(error);

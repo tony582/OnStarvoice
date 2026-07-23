@@ -36,6 +36,8 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     "'/orchestrations/:id/draft'",
     "'/orchestrations/:id/allocation-preview'",
     "'/orchestrations/:id/dispatch'",
+    "'/orchestrations/:id/schedule/pause'",
+    "'/orchestrations/:id/schedule/resume'",
   ]) {
     const start = route.indexOf(marker);
     assert.notEqual(start, -1);
@@ -119,7 +121,7 @@ test('allocation preview uses deterministic balanced groups and validates compat
 test('dispatch is revision-CAS protected and locks parent, items, then agents', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
-    "router.get(\n  '/orchestrations/:id'",
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
   );
   const parentLock = dispatch.indexOf('parentSelect({lock: true})');
   const itemLock = dispatch.indexOf('listParentItems(', parentLock);
@@ -141,10 +143,10 @@ test('dispatch is revision-CAS protected and locks parent, items, then agents', 
   assert.match(dispatch, /idempotent: result\.existing === true/u);
 });
 
-test('dispatch creates disjoint ordinary child tasks, create commands, item attempts, and audit events', () => {
+test('one-time dispatch creates disjoint ordinary child tasks, create commands, item attempts, and audit events', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
-    "router.get(\n  '/orchestrations/:id'",
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
   );
   assert.match(dispatch, /parent_task_id, origin_agent_id, assigned_agent_id/u);
   assert.match(dispatch, /\$1::uuid[\s\S]*\$1::uuid::text/u);
@@ -164,6 +166,51 @@ test('dispatch creates disjoint ordinary child tasks, create commands, item atte
   assert.match(dispatch, /eventType: 'orchestration_child_dispatched'/u);
   assert.match(dispatch, /eventType: 'orchestration_dispatched'/u);
   assert.doesNotMatch(dispatch, /\b(?:handoff|reassign|fencing_token|lease_expires_at)\b/u);
+});
+
+test('unattended dispatch stores a cloud schedule and fixed assignments without issuing immediate child commands', () => {
+  const dispatch = section(
+    "router.post(\n  '/orchestrations/:id/dispatch'",
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+  );
+  const unattendedStart = dispatch.indexOf(
+    "if (parentExecutionMode === 'unattended_plan')",
+  );
+  const oneTimeStart = dispatch.indexOf('const executions = [];', unattendedStart);
+  assert.ok(unattendedStart >= 0);
+  assert.ok(oneTimeStart > unattendedStart);
+  const unattended = dispatch.slice(unattendedStart, oneTimeStart);
+
+  assert.match(unattended, /INSERT INTO capture_orchestration_schedules/u);
+  assert.match(unattended, /INSERT INTO capture_orchestration_schedule_agents/u);
+  assert.match(unattended, /SET status = 'assigned'/u);
+  assert.match(unattended, /orchestration_schedule_id = \$1/u);
+  assert.match(unattended, /schedule_revision = 1/u);
+  assert.match(unattended, /orchestrationTemplate/u);
+  assert.match(unattended, /eventType: 'orchestration_schedule_created'/u);
+  assert.doesNotMatch(unattended, /INSERT INTO capture_agent_commands/u);
+  assert.doesNotMatch(unattended, /INSERT INTO capture_task_item_attempts/u);
+});
+
+test('schedule pause and resume are tenant scoped, idempotent, and never backfill missed runs', () => {
+  const pause = section(
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+    "router.post(\n  '/orchestrations/:id/schedule/resume'",
+  );
+  const resume = section(
+    "router.post(\n  '/orchestrations/:id/schedule/resume'",
+    "router.get(\n  '/orchestrations/:id'",
+  );
+
+  assert.match(pause, /loadOrchestrationSchedule\([\s\S]*\{lock: true\}/u);
+  assert.match(pause, /schedule\.status === 'paused'/u);
+  assert.match(pause, /SET status = 'paused'/u);
+  assert.match(pause, /不会再生成新任务/u);
+  assert.match(resume, /schedule\.status === 'active'/u);
+  assert.match(resume, /computeNextOrchestrationRunAt\(schedule\.plan_snapshot/u);
+  assert.match(resume, /SET status = 'active'/u);
+  assert.match(resume, /等待下一次云端运行/u);
+  assert.doesNotMatch(resume, /\bbackfill\b/u);
 });
 
 test('detail reader is tenant scoped and returns the complete orchestration projection', () => {
@@ -188,6 +235,7 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
     'executions',
     'agents',
     'attempts',
+    'schedule',
   ]) {
     assert.match(detail, new RegExp(`\\b${field}\\b`, 'u'));
   }
@@ -198,6 +246,8 @@ test('all id-addressed orchestration routes validate UUIDs before database casts
     "'/orchestrations/:id/draft'",
     "'/orchestrations/:id/allocation-preview'",
     "'/orchestrations/:id/dispatch'",
+    "'/orchestrations/:id/schedule/pause'",
+    "'/orchestrations/:id/schedule/resume'",
     "'/orchestrations/:id'",
   ]) {
     const start = route.indexOf(marker);

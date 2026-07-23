@@ -137,9 +137,7 @@ function createBatchHarness({
     isUnattendedSafetyBlock: (value) =>
       Boolean(
         value?.securityBlocked ||
-          value?.platformSafetyBlocked ||
-          String(value?.code || "").toUpperCase() ===
-            "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+          value?.platformSafetyBlocked,
       ),
     applySearchFiltersInTab: async (tabId, filters) => {
       filterCalls.push({tabId, filters});
@@ -275,7 +273,7 @@ test("a drifted Douyin search page fails only the current keyword and continues"
   assert.equal(harness.settled[1].result.ok, true);
 });
 
-test("Douyin service-abnormal state stops immediately without retrying or opening the next keyword", async () => {
+test("Douyin service-abnormal state fails the current keyword and continues the next", async () => {
   let readinessChecks = 0;
   const harness = createBatchHarness({
     captureKeyword: async ({captureParams}) =>
@@ -283,17 +281,16 @@ test("Douyin service-abnormal state stops immediately without retrying or openin
     hasActiveFilters: true,
     waitForResults: async () => {
       readinessChecks += 1;
-      if (readinessChecks === 1) return true;
-      const error = new Error(
-        "检测到抖音“服务出现异常”，为避免触发安全审核，已立即停止整条任务",
-      );
-      error.code = "DOUYIN_SEARCH_SERVICE_ABNORMAL";
-      error.securityBlocked = true;
-      error.platformSafetyBlocked = true;
-      error.requiresManualAction = true;
-      error.stopBatch = true;
-      error.fatal = true;
-      throw error;
+      if (readinessChecks === 2) {
+        const error = new Error(
+          "抖音当前关键词搜索暂时不可用，已结束本词并继续下一个关键词",
+        );
+        error.code = "DOUYIN_SEARCH_SERVICE_ABNORMAL";
+        error.category = "platform_service_abnormal";
+        error.retryable = true;
+        throw error;
+      }
+      return true;
     },
   });
 
@@ -303,26 +300,37 @@ test("Douyin service-abnormal state stops immediately without retrying or openin
     searchFilters: {sort: "latest", publishTime: "day"},
   });
 
-  assert.equal(result.canceled, true);
-  assert.equal(result.securityBlocked, true);
-  assert.equal(result.requiresManualAction, true);
-  assert.equal(result.blockingError.code, "DOUYIN_SEARCH_SERVICE_ABNORMAL");
-  assert.deepEqual(harness.captureCalls, []);
-  assert.equal(harness.filterCalls.length, 1);
+  assert.equal(result.canceled, false);
+  assert.equal(result.securityBlocked, false);
+  assert.equal(result.requiresManualAction, false);
+  assert.equal(result.blockingError, null);
+  assert.deepEqual(
+    harness.captureCalls.map((entry) => entry.keyword),
+    ["词2"],
+  );
+  assert.equal(harness.filterCalls.length, 2);
   assert.equal(
     harness.submitCalls.length,
     0,
-    "the filter retry path must not submit another search",
+    "the service-abnormal word must fail before the generic filter retry path",
   );
   assert.deepEqual(
     harness.navigationCalls.map((entry) => entry.keyword),
-    ["词1"],
-    "the second keyword must never start",
+    ["词1", "词2"],
+    "the second keyword must start after the first search request fails",
   );
-  assert.equal(harness.settled.length, 1);
+  assert.equal(harness.settled.length, 2);
   assert.equal(harness.settled[0].keyword, "词1");
-  assert.equal(harness.settled[0].securityBlocked, true);
-  assert.equal(harness.progress.at(-1)?.phase, "needs_action");
+  assert.equal(harness.settled[0].securityBlocked, false);
+  assert.equal(
+    harness.settled[0].result.errorCode,
+    "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+  );
+  assert.equal(harness.settled[1].keyword, "词2");
+  assert.equal(harness.settled[1].result.ok, true);
+  assert.equal(result.stats.success, 1);
+  assert.equal(result.stats.failed, 1);
+  assert.equal(harness.progress.at(-1)?.phase, "done");
 });
 
 test("Douyin checks the service-abnormal guard before clicking search or filters", () => {

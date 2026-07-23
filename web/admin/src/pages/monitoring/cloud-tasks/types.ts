@@ -45,6 +45,9 @@ export type OrchestrationRecord = {
   status: string
   revision?: number
   orchestration_revision?: number
+  orchestration_schedule_id?: string | null
+  schedule_revision?: number | null
+  scheduled_for?: string | null
   progress?: Record<string, unknown> | null
   checkpoint?: Record<string, unknown> | null
   counts?: Record<string, unknown> | null
@@ -128,6 +131,31 @@ export type OrchestrationAttemptRecord = {
   [key: string]: unknown
 }
 
+export type OrchestrationScheduleRecord = {
+  id: string
+  status: 'active' | 'paused' | 'completed' | 'canceled' | string
+  schedule_mode?: 'daily' | 'custom_dates' | string
+  scheduleMode?: 'daily' | 'custom_dates' | string
+  timezone?: string
+  start_time?: string
+  startTime?: string
+  random_offset_min?: number
+  randomOffsetMin?: number
+  custom_dates?: string[] | string
+  customDates?: string[] | string
+  plan_snapshot?: Record<string, unknown> | null
+  next_run_at?: string | null
+  nextRunAt?: string | null
+  last_scheduled_for?: string | null
+  last_run_at?: string | null
+  last_run_task_id?: string | null
+  last_run_status?: string | null
+  last_error?: Record<string, unknown> | null
+  run_count?: number
+  revision?: number
+  [key: string]: unknown
+}
+
 export type OrchestrationDetailResponse = {
   ok: true
   orchestration: OrchestrationRecord
@@ -135,6 +163,7 @@ export type OrchestrationDetailResponse = {
   executions: OrchestrationExecutionRecord[]
   agents: OrchestrationCloudAgent[]
   attempts: OrchestrationAttemptRecord[]
+  schedule?: OrchestrationScheduleRecord | null
 }
 
 export type OrchestrationDispatchResult = {
@@ -142,6 +171,7 @@ export type OrchestrationDispatchResult = {
   orchestrationId: string
   revision: number
   status: 'pending' | string
+  schedule?: OrchestrationScheduleRecord | null
   executions: Array<{
     taskId: string
     agentId: string

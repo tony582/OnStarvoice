@@ -390,6 +390,24 @@ test("admin task dates accept loose separators and normalize real calendar days"
   ]);
 });
 
+test("admin can move ended failures to history individually or in bulk", async () => {
+  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+
+  assert.match(
+    page,
+    /const DISMISSIBLE_ATTENTION_TASK_STATUSES = new Set\(\['failed', 'completed_with_failures'\]\)/u,
+  );
+  assert.match(page, /function canDismissAttention/u);
+  assert.match(page, /!task\.attention_dismissed_at/u);
+  assert.match(page, /\/capture-cloud\/tasks\/' \+ task\.id \+ '\/dismiss-attention'/u);
+  assert.match(page, /\/capture-cloud\/tasks\/dismiss-terminal-attention/u);
+  assert.match(page, /任务记录和采集结果都会保留/u);
+  assert.match(page, /当前账号下所有已结束的失败任务/u);
+  assert.match(page, /中断和仍需处理的任务不会被清理/u);
+  assert.match(page, /清理已结束失败项/u);
+  assert.match(page, /移到历史/u);
+});
+
 test("verify input and extension API origins are bounded before credentials are sent", async () => {
   const [verifyRoute, api, sidebar, storage, state, runtimeConfig, localRuntimeConfig, snapshotScript, packageScript] = await Promise.all([
     read("server/routes/verify.js"),

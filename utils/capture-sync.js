@@ -13438,8 +13438,8 @@ function hasActiveBatchSearchFilters(searchFilters = {}) {
 }
 
 // 采集前切搜索「排序 / 范围」:转发到 content 的 applyBatchSearchFilters。
-// 普通筛选失败仍由后续结果就绪检查兜底；抖音明确显示“服务出现异常”时必须
-// 保留结构化错误并立即停批，不能吞掉后再重新搜索。
+// 普通筛选失败仍由后续结果就绪检查兜底；抖音明确显示“服务出现异常”时
+// 保留结构化的单关键词错误，由批处理跳过本词并继续，而不是误判为账号风控。
 async function applySearchFiltersInTab(tabId, searchFilters = {}) {
   try {
     const response = await chrome.runtime.sendMessage({
@@ -13493,6 +13493,12 @@ function buildInterKeywordDelayMessage({
   keywordResult = null,
 } = {}) {
   const seconds = Math.round(Number(delay || 0) / 1000);
+  if (
+    String(keywordResult?.errorCode || '').trim().toUpperCase() ===
+    DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE
+  ) {
+    return `「${keyword}」搜索服务暂时异常，已跳过本词，${seconds} 秒后尝试下一个关键词…`;
+  }
   if (!hasEnhanceStep) {
     return `已采「${keyword}」，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
   }
@@ -13760,7 +13766,7 @@ export async function batchCaptureByKeywords({
       }
 
       // 抖音结果探针会每 300ms 检查“服务出现异常”，不要先固定等 2 秒，
-      // 否则保护性停止会被无意义地延迟。其它平台保留原有渲染宽限。
+      // 让当前关键词尽快失败并把执行权交给下一个词。其它平台保留原有渲染宽限。
       if (!isDouyinPlatform(platform)) {
         await waitMsWithStop(
           BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
@@ -13792,7 +13798,7 @@ export async function batchCaptureByKeywords({
       }
 
       // 按需切换搜索「排序 / 范围」(默认值则跳过)。
-      // 关键:筛选后结果没加载(如抖音「服务出现异常」)绝不能继续采——后面的重试会
+      // 关键:筛选后结果没加载(如抖音「服务出现异常」)绝不能继续采——有界重试会
       // 重新点搜索,把筛选清空,采回来的就是未筛选(可能好几年前)的内容(客户投诉根源)。
       // 抖音撞到异常页时,像手动一样重新点一次搜索并把筛选重挂;仍失败则本词判失败跳过,宁缺勿错。
       if (hasActiveBatchSearchFilters(searchFilters)) {
@@ -15626,7 +15632,7 @@ async function waitForKeywordSearchResultsInTab(
               signature: '',
               blockingCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
               blockingMessage:
-                '检测到抖音“服务出现异常”，为避免触发安全审核，已立即停止整条任务',
+                '抖音当前关键词搜索暂时不可用，已结束本词并继续下一个关键词',
             };
           }
           const hasVisibleMedia = (node) =>

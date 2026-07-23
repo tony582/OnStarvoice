@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity, AlertTriangle, ArrowLeft, Bot, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
-  CircleOff, ClipboardList, CloudCog, History, Laptop, ListChecks, Loader2, Pencil, Play, Plus,
+  Archive, CircleOff, ClipboardList, CloudCog, History, Laptop, ListChecks, Loader2, Pencil, Play, Plus,
   Network, RefreshCw, Save, ServerCog, Settings2, Square, Wifi, WifiOff, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -98,6 +98,9 @@ type CloudTask = {
   created_at?: string | null
   updated_at?: string | null
   finished_at?: string | null
+  attention_dismissed_at?: string | null
+  attention_dismissed_by_user_id?: string | null
+  attention_dismissed_by_name?: string
   agent_display_name?: string
   agent_host_label?: string
   agent_online?: boolean
@@ -1107,6 +1110,18 @@ function AgentEditor({ agent, onSaved }: { agent: CloudAgent; onSaved: () => Pro
 
 const ACTIVE_TASK_STATUSES = new Set(['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'resume_requested'])
 const ATTENTION_TASK_STATUSES = new Set(['interrupted', 'needs_action', 'failed', 'completed_with_failures'])
+const DISMISSIBLE_ATTENTION_TASK_STATUSES = new Set(['failed', 'completed_with_failures'])
+
+function isAttentionTask(task: CloudTask) {
+  const status = task.effective_status || task.status
+  return ATTENTION_TASK_STATUSES.has(status) && !task.attention_dismissed_at
+}
+
+function canDismissAttention(task: CloudTask) {
+  return !task.parent_task_id &&
+    DISMISSIBLE_ATTENTION_TASK_STATUSES.has(task.status) &&
+    !task.attention_dismissed_at
+}
 
 function isBusinessVisibleTask(task: CloudTask) {
   const type = String(task.task_type || '').toLowerCase()
@@ -1452,6 +1467,7 @@ function TaskCard({
   actionTaskId,
   onResume,
   onStop,
+  onDismissAttention,
   onOpenOrchestration,
 }: {
   task: CloudTask
@@ -1459,6 +1475,7 @@ function TaskCard({
   actionTaskId: string
   onResume: (task: CloudTask) => Promise<void>
   onStop: (task: CloudTask) => Promise<void>
+  onDismissAttention: (task: CloudTask) => Promise<void>
   onOpenOrchestration: (task: CloudTask) => void
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -1471,14 +1488,36 @@ function TaskCard({
   const stopPending = task.pending_command_type === 'stop'
   const resumeBlocked = resumable ? resumeBlockReason(task) : ''
   const taskError = taskErrorText(task)
-  const taskMode = orchestration ? '多 Agent 编排' : task.source === 'cloud' && task.task_type.includes('plan') ? '自动计划' : task.source === 'cloud' ? '一次性任务' : '设备任务'
+  const dismissible = canDismissAttention(task)
+  const scheduleTemplate = orchestration && task.metadata?.orchestrationTemplate === true
+  const scheduleRun = orchestration && task.metadata?.orchestrationScheduleRun === true
+  const scheduleStatus = String(task.metadata?.scheduleStatus || '')
+  const displayedStatus = scheduleTemplate && scheduleStatus === 'active'
+    ? '计划已启用'
+    : scheduleTemplate && scheduleStatus === 'paused'
+      ? '计划已暂停'
+      : STATUS_LABELS[effectiveStatus] || effectiveStatus
+  const displayedStatusTone = scheduleTemplate && scheduleStatus === 'active'
+    ? 'border-status-green/25 bg-status-green/8 text-status-green'
+    : statusTone(effectiveStatus)
+  const taskMode = scheduleTemplate
+    ? '多 Agent 无人值守'
+    : scheduleRun
+      ? '计划运行批次'
+      : orchestration
+        ? '多 Agent 编排'
+        : task.source === 'cloud' && task.task_type.includes('plan')
+          ? '自动计划'
+          : task.source === 'cloud'
+            ? '一次性任务'
+            : '设备任务'
 
   return (
     <article className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${statusTone(effectiveStatus)}`}>{STATUS_LABELS[effectiveStatus] || effectiveStatus}</span>
+            <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
             <span className="rounded-full bg-muted px-2.5 py-1 text-[11px] text-muted-foreground">{PLATFORM_LABELS[task.platform] || task.platform}</span>
             <span className="text-[11px] text-muted-foreground">{taskMode}</span>
           </div>
@@ -1503,7 +1542,7 @@ function TaskCard({
           {task.message && <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{task.message}</p>}
           {taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-2 text-xs leading-5 text-status-red">{taskError}</p>}
         </div>
-        {(orchestration || resumable || stoppable || commandPending) && (
+        {(orchestration || resumable || stoppable || commandPending || dismissible) && (
           <div className="flex shrink-0 flex-wrap gap-2 sm:justify-end">
             {orchestration && (
               <Button size="sm" onClick={() => onOpenOrchestration(task)}>
@@ -1524,6 +1563,12 @@ function TaskCard({
             )}
             {stopPending && <Button variant="destructive" size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />{task.agent_online ? '等待设备停止' : '已排队，上线后停止'}</Button>}
             {commandPending && !stoppable && !stopPending && <Button size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />等待设备响应</Button>}
+            {dismissible && (
+              <Button variant="outline" size="sm" onClick={() => void onDismissAttention(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
+                移到历史
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -1545,6 +1590,7 @@ function TaskCard({
               <div>关键词工作项：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 项</span></div>
               <div>已结算：<span className="text-foreground">{safeNumber(task.progress?.current)} 项</span></div>
               <div>分配版本：<span className="text-foreground">第 {task.orchestration_revision || 0} 版</span></div>
+              {scheduleTemplate && <div>下次运行：<span className="text-foreground">{formatTime(String(task.metadata?.nextRunAt || ''))}</span></div>}
               <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
             </>
           ) : (
@@ -1684,8 +1730,8 @@ export function CloudTasksTab() {
     return tasks.filter(task => {
       const status = task.effective_status || task.status
       if (taskView === 'active') return ACTIVE_TASK_STATUSES.has(status)
-      if (taskView === 'attention') return ATTENTION_TASK_STATUSES.has(status)
-      return !ACTIVE_TASK_STATUSES.has(status) && !ATTENTION_TASK_STATUSES.has(status)
+      if (taskView === 'attention') return isAttentionTask(task)
+      return !ACTIVE_TASK_STATUSES.has(status) && !isAttentionTask(task)
     }).sort((left, right) => {
       const leftTime = new Date(left.created_at || left.updated_at || left.finished_at || 0).getTime()
       const rightTime = new Date(right.created_at || right.updated_at || right.finished_at || 0).getTime()
@@ -1698,11 +1744,16 @@ export function CloudTasksTab() {
     for (const task of businessTasks) {
       const status = task.effective_status || task.status
       if (ACTIVE_TASK_STATUSES.has(status)) counts.active += 1
-      else if (ATTENTION_TASK_STATUSES.has(status)) counts.attention += 1
+      else if (isAttentionTask(task)) counts.attention += 1
       else counts.history += 1
     }
     return counts
   }, [businessTasks])
+
+  const dismissibleAttentionCount = useMemo(
+    () => businessTasks.filter(canDismissAttention).length,
+    [businessTasks],
+  )
 
   const resume = async (task: CloudTask) => {
     setActionTaskId(task.id)
@@ -1730,6 +1781,39 @@ export function CloudTasksTab() {
       await load(true)
     } catch (err) {
       setActionError(err instanceof Error ? err.message : '发送停止指令失败')
+    } finally {
+      setActionTaskId('')
+    }
+  }
+
+  const dismissAttention = async (task: CloudTask) => {
+    if (!window.confirm(`将“${task.title || '当前任务'}”移到历史吗？任务记录和采集结果都会保留。`)) return
+    setActionTaskId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>('/capture-cloud/tasks/' + task.id + '/dismiss-attention', {})
+      setFeedback(result.message || '已移到历史')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '移到历史失败')
+    } finally {
+      setActionTaskId('')
+    }
+  }
+
+  const dismissTerminalAttention = async () => {
+    if (dismissibleAttentionCount <= 0) return
+    if (!window.confirm('将当前账号下所有已结束的失败任务移到历史吗？中断和仍需处理的任务不会被清理。')) return
+    setActionTaskId('bulk-dismiss-attention')
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ dismissedCount?: number; message?: string }>('/capture-cloud/tasks/dismiss-terminal-attention', {})
+      setFeedback(result.message || `已将 ${result.dismissedCount || 0} 个任务移到历史`)
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '清理已结束失败项失败')
     } finally {
       setActionTaskId('')
     }
@@ -1798,6 +1882,16 @@ export function CloudTasksTab() {
             </div>
           </div>
 
+          {taskView === 'attention' && dismissibleAttentionCount > 0 && (
+            <div className="mb-3 flex flex-col gap-3 rounded-xl border border-border/70 bg-muted/35 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs leading-5 text-muted-foreground">失败和部分失败已经结束，可移到历史；中断和需要人工处理的任务会继续保留。</p>
+              <Button variant="outline" size="sm" onClick={() => void dismissTerminalAttention()} disabled={!canWrite() || actionTaskId === 'bulk-dismiss-attention'} className="shrink-0">
+                {actionTaskId === 'bulk-dismiss-attention' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
+                清理已结束失败项
+              </Button>
+            </div>
+          )}
+
           {visibleTasks.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-12 text-center">
               {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
@@ -1814,6 +1908,7 @@ export function CloudTasksTab() {
             <div className="space-y-3">
               {visibleTasks.map(task => (
                 <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
+                  onDismissAttention={dismissAttention}
                   onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
               ))}
             </div>
@@ -1877,7 +1972,9 @@ export function CloudTasksTab() {
           await load(true)
         }}
         onDispatched={async result => {
-          setFeedback(`多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
+          setFeedback(result.schedule
+            ? '多 Agent 无人值守计划已启用，将按云端时间生成每轮任务。'
+            : `多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
           setOrchestrationRefreshKey(value => value + 1)
           await load(true)
         }}

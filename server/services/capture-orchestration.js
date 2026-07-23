@@ -142,12 +142,215 @@ function normalizeCaptureSettings(value) {
   };
 }
 
+function scheduleError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function normalizeCalendarDate(value) {
+  const match = String(value ?? '').trim().match(
+    /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/u,
+  );
+  if (!match) return '';
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return '';
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month - 1];
+  if (day > daysInMonth) return '';
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function normalizeScheduleDateList(value) {
+  const source = Array.isArray(value)
+    ? value
+    : String(value ?? '').slice(0, 20000).split(/[\s,，;；]+/gu);
+  const dates = [];
+  const invalidDates = [];
+  const seen = new Set();
+  for (const rawDate of source) {
+    const candidate = String(rawDate ?? '').trim();
+    if (!candidate) continue;
+    const normalized = normalizeCalendarDate(candidate);
+    if (!normalized) {
+      invalidDates.push(candidate);
+      continue;
+    }
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    dates.push(normalized);
+    if (dates.length >= 400) break;
+  }
+  dates.sort((left, right) => left.localeCompare(right));
+  return {dates, invalidDates};
+}
+
+export function normalizeOrchestrationSchedule(input = {}) {
+  const source = object(input);
+  const rawMode = text(
+    source.mode || source.scheduleMode || source.schedule_mode || 'daily',
+    40,
+  ).toLowerCase();
+  const mode = rawMode === 'holidays'
+    ? 'custom_dates'
+    : rawMode;
+  if (!['daily', 'custom_dates'].includes(mode)) {
+    throw scheduleError(
+      'invalid_schedule_mode',
+      '无人值守运行规则必须是每天或指定日期',
+    );
+  }
+  const startTime = text(
+    source.startTime || source.start_time || '09:00',
+    5,
+  );
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(startTime)) {
+    throw scheduleError(
+      'invalid_schedule_start_time',
+      '无人值守开始时间格式必须是 HH:mm',
+    );
+  }
+  const randomOffsetMin = integer(
+    source.randomOffsetMin ?? source.random_offset_min,
+    0,
+    0,
+    240,
+  );
+  const requestedMaxRounds = integer(source.maxRounds, 1, 1, 100);
+  if (requestedMaxRounds !== 1) {
+    throw scheduleError(
+      'multi_agent_schedule_single_round_only',
+      '多 Agent 无人值守计划当前每个运行时间只支持执行 1 轮',
+    );
+  }
+  const {dates, invalidDates} = normalizeScheduleDateList(
+    source.customDates || source.custom_dates || source.holidayDates,
+  );
+  if (invalidDates.length > 0) {
+    throw scheduleError(
+      'invalid_schedule_dates',
+      `存在无效运行日期：${invalidDates.slice(0, 3).join('、')}`,
+    );
+  }
+  if (mode === 'custom_dates' && dates.length === 0) {
+    throw scheduleError(
+      'custom_dates_required',
+      '指定日期计划至少需要一个有效日期',
+    );
+  }
+  return {
+    mode,
+    timezone: 'Asia/Shanghai',
+    startTime,
+    randomOffsetMin,
+    customDates: mode === 'custom_dates' ? dates.join('\n') : '',
+    maxRounds: 1,
+    roundGapMin: 10,
+    overlapPolicy: 'skip',
+    lateStartGraceMin: 360,
+  };
+}
+
+function shanghaiDateParts(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    date: `${values.year}-${values.month}-${values.day}`,
+  };
+}
+
+function addUtcCalendarDays(dateText, days) {
+  const [year, month, day] = dateText.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function deterministicOffsetMinutes(seed, dateText, maximum) {
+  if (maximum <= 0) return 0;
+  const value = Number.parseInt(
+    crypto.createHash('sha256').update(`${seed}:${dateText}`).digest('hex').slice(0, 8),
+    16,
+  );
+  return value % (maximum + 1);
+}
+
+function shanghaiLocalTimestamp(dateText, startTime, offsetMinutes) {
+  const [year, month, day] = dateText.split('-').map(Number);
+  const [hour, minute] = startTime.split(':').map(Number);
+  return Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour - 8,
+    minute + offsetMinutes,
+  );
+}
+
+export function computeNextOrchestrationRunAt(
+  scheduleInput = {},
+  {
+    after = new Date(),
+    seed = 'capture-orchestration',
+  } = {},
+) {
+  const schedule = normalizeOrchestrationSchedule(scheduleInput);
+  const afterDate = after instanceof Date ? after : new Date(after);
+  const afterMs = afterDate.getTime();
+  if (!Number.isFinite(afterMs)) {
+    throw scheduleError('invalid_schedule_cursor', '无法计算无人值守下一次运行时间');
+  }
+  const today = shanghaiDateParts(afterDate).date;
+  const candidates = schedule.mode === 'custom_dates'
+    ? schedule.customDates.split('\n').filter(date => date >= today)
+    : Array.from({length: 370}, (_, index) => addUtcCalendarDays(today, index));
+  for (const dateText of candidates) {
+    const offsetMinutes = deterministicOffsetMinutes(
+      seed,
+      dateText,
+      schedule.randomOffsetMin,
+    );
+    const candidateMs = shanghaiLocalTimestamp(
+      dateText,
+      schedule.startTime,
+      offsetMinutes,
+    );
+    if (candidateMs > afterMs) return new Date(candidateMs).toISOString();
+  }
+  return '';
+}
+
 /**
- * Normalize the first orchestration release's deliberately small contract.
- *
- * The first slice accepts only immediate keyword capture and deterministic
- * balanced allocation. It does not normalize "AI assignment" or a live handoff
- * into something that the backend cannot yet execute.
+ * Normalize the shared multi-Agent definition. A one-time definition becomes a
+ * real run immediately. An unattended definition is a cloud schedule template;
+ * each occurrence later materializes an ordinary one-time run so browser-local
+ * plans are not overwritten.
  */
 export function normalizeOrchestrationRequest(
   input = {},
@@ -182,6 +385,21 @@ export function normalizeOrchestrationRequest(
     typeof source.captureSettings === 'object' &&
     !Array.isArray(source.captureSettings),
   );
+  const rawExecutionMode = text(
+    source.executionMode || source.execution_mode || 'one_time',
+    40,
+  ).toLowerCase();
+  const executionMode = [
+    'unattended',
+    'unattended_plan',
+    'scheduled',
+    'cloud_schedule',
+  ].includes(rawExecutionMode)
+    ? 'unattended_plan'
+    : 'one_time';
+  const schedule = executionMode === 'unattended_plan'
+    ? normalizeOrchestrationSchedule(source.schedule || source)
+    : null;
 
   return {
     requestKey: text(
@@ -193,9 +411,7 @@ export function normalizeOrchestrationRequest(
     ),
     title: text(source.title || '关键词采集任务', 240),
     platform: normalizePlatform(source.platform),
-    // Immediate, disjoint child create commands are the only implemented
-    // execution contract in this slice.
-    executionMode: 'one_time',
+    executionMode,
     allocationMode: 'balanced',
     keywords,
     agentIds,
@@ -214,11 +430,9 @@ export function normalizeOrchestrationRequest(
         1,
         Number.MAX_SAFE_INTEGER,
       ),
-      // The first orchestration slice settles one work item per keyword. Keep
-      // it to a single round so a parent cannot appear complete between local
-      // rounds before the server has a round-aware item identity.
-      maxRounds: 1,
-      roundGapMin: 10,
+      maxRounds: schedule?.maxRounds || 1,
+      roundGapMin: schedule?.roundGapMin || 10,
+      ...(schedule ? schedule : {}),
       ...(hasCaptureSettings
         ? {captureSettings: normalizeCaptureSettings(source.captureSettings)}
         : {}),
@@ -349,15 +563,21 @@ function explicitSafetyBlock(entry) {
     error.code,
     100,
   ).toUpperCase();
+  if (errorCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+    return false;
+  }
   return (
     source.securityBlocked === true ||
     source.security_blocked === true ||
     source.platformSafetyBlocked === true ||
     source.platform_safety_blocked === true ||
+    source.requiresManualAction === true ||
+    source.requires_manual_action === true ||
+    error.requiresManualAction === true ||
+    error.requires_manual_action === true ||
     [
       'PLATFORM_SAFETY_BLOCK',
       'SECURITY_VERIFICATION_REQUIRED',
-      'DOUYIN_SEARCH_SERVICE_ABNORMAL',
     ].includes(errorCode)
   );
 }
@@ -366,8 +586,8 @@ function explicitSafetyBlock(entry) {
  * Project one extension keyword checkpoint entry onto a server item status.
  * Protective-stop handling only trusts explicit structured evidence;
  * error-message text is never classified as a platform restriction. Douyin's
- * service-abnormal state is kept as its own reason instead of being relabeled
- * as a confirmed CAPTCHA or account restriction.
+ * service-abnormal state is a retryable per-keyword search failure. Its exact
+ * code also downgrades legacy Extension snapshots that carried old stop flags.
  */
 export function checkpointEntryToItemStatus(
   entry = {},

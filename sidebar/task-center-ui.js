@@ -859,6 +859,17 @@ function getTaskCenterActions(item) {
 }
 
 function isTaskCenterCircuitBreaker(item) {
+  const errorCode = String(
+    item?.raw?.errorCode ||
+      item?.raw?.error_code ||
+      item?.raw?.error?.code ||
+      "",
+  )
+    .trim()
+    .toLowerCase();
+  if (errorCode === "douyin_search_service_abnormal") {
+    return false;
+  }
   if (
     item?.raw?.requiresManualIntervention === true ||
     item?.raw?.requires_manual_intervention === true ||
@@ -881,7 +892,7 @@ function isTaskCenterCircuitBreaker(item) {
     .map((value) => String(value || ""))
     .join(" ")
     .toLowerCase();
-  return /验证码|人机验证|登录失效|请(?:先|重新)?登录|需要登录|账号异常|账号限制|安全限制|安全验证|访问受限|风控|captcha|login[_\s-]?required|auth[_\s-]?required|account[_\s-]?(?:forbidden|restricted)|security[_\s-]?(?:block|check)|risk[_\s-]?control|douyin_search_service_abnormal/.test(text);
+  return /验证码|人机验证|登录失效|请(?:先|重新)?登录|需要登录|账号异常|账号限制|安全限制|安全验证|访问受限|风控|captcha|login[_\s-]?required|auth[_\s-]?required|account[_\s-]?(?:forbidden|restricted)|security[_\s-]?(?:block|check)|risk[_\s-]?control/.test(text);
 }
 
 function renderTaskCenterActions(item, limit = Infinity) {

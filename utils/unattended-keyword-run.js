@@ -197,6 +197,9 @@ export function summarizeUnattendedKeywordCheckpoint(checkpoint = {}) {
 export function isUnattendedSafetyBlock(value) {
   const valueText = text(value?.message || value).toLowerCase();
   const codeText = text(value?.code || value?.reason).toLowerCase();
+  if (codeText === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE.toLowerCase()) {
+    return false;
+  }
   const explicitSafetyCodes = new Set([
     "platform_safety_block",
     "security_verification_required",
@@ -204,7 +207,6 @@ export function isUnattendedSafetyBlock(value) {
     "xhs_security_block",
     "http_429",
     "rate_limited",
-    DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE.toLowerCase(),
   ]);
   return (
     value?.securityBlocked === true ||

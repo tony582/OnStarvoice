@@ -2620,7 +2620,7 @@ test("repeated old progress cannot replenish more than two automatic recoveries"
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
 });
 
-test("a service-abnormal checkpoint blocks recovery even before terminal reporting", async () => {
+test("a legacy service-abnormal checkpoint no longer blocks recovery", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness, {
     checkpoint: {
@@ -2649,16 +2649,10 @@ test("a service-abnormal checkpoint blocks recovery even before terminal reporti
   );
   const stored = harness.storage[UNATTENDED_REQUEST_KEY];
 
-  assert.equal(recovery.recovered, false);
-  assert.equal(recovery.terminal, true);
-  assert.equal(stored.status, "needs_action");
-  assert.equal(stored.attemptId, request.attemptId);
-  assert.equal(stored.error.code, "DOUYIN_SEARCH_SERVICE_ABNORMAL");
-  assert.equal(stored.error.category, "platform_service_abnormal");
-  assert.equal(stored.error.securityBlocked, true);
-  assert.equal(stored.error.requiresManualAction, true);
-  assert.equal(stored.error.retryable, false);
-  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(recovery.recovered, true, JSON.stringify(recovery));
+  assert.notEqual(stored.attemptId, request.attemptId);
+  assert.equal(stored.recoveryCount, 1);
+  assert.equal(harness.createdTabs.length, 2);
 });
 
 test("completed-with-failures is terminal and cannot be resurrected", async () => {

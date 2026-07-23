@@ -762,3 +762,42 @@ test("remote capture settings normalize dependent options fail closed", () => {
   assert.equal(disabledParents.enableLowFollowerHitFilterOnDetailCapture, false);
   assert.equal(disabledParents.enableCommentLeadsFilterOnDetailCapture, false);
 });
+
+test("ended failures can be dismissed from attention without deleting task history", () => {
+  const single = readRouteSection(
+    "router.post('/tasks/:id/dismiss-attention'",
+    "router.post('/tasks/dismiss-terminal-attention'",
+  );
+  const bulk = readRouteSection(
+    "router.post('/tasks/dismiss-terminal-attention'",
+    "router.post('/tasks/:id/resume'",
+  );
+
+  assert.match(
+    captureCloudRouteSource,
+    /const DISMISSIBLE_ATTENTION_STATUSES = new Set\(\[[\s\S]*'failed'[\s\S]*'completed_with_failures'/u,
+  );
+  assert.match(single, /parent_task_id/u);
+  assert.match(single, /DISMISSIBLE_ATTENTION_STATUSES\.has\(task\.status\)/u);
+  assert.match(single, /attention_dismissed_at = now\(\)/u);
+  assert.match(single, /eventType: 'task_attention_dismissed'/u);
+  assert.match(single, /任务和采集结果仍会保留/u);
+  assert.doesNotMatch(single, /\bDELETE\b/u);
+
+  assert.match(
+    bulk,
+    /status IN \('failed', 'completed_with_failures'\)/u,
+  );
+  assert.match(bulk, /attention_dismissed_at IS NULL/u);
+  assert.match(bulk, /parent_task_id IS NULL/u);
+  assert.doesNotMatch(bulk, /\bDELETE\b/u);
+
+  const overview = readRouteSection(
+    "router.get('/overview'",
+    "router.patch('/agents/:id'",
+  );
+  assert.match(
+    overview,
+    /WHERE t\.status IN \('interrupted', 'needs_action', 'failed', 'completed_with_failures'\)[\s\S]*t\.attention_dismissed_at IS NULL/u,
+  );
+});

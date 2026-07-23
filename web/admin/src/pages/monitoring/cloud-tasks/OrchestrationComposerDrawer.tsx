@@ -3,8 +3,10 @@ import {
   AlertTriangle,
   ArrowLeft,
   Bot,
+  CalendarDays,
   CheckCircle2,
   ChevronRight,
+  Clock3,
   ClipboardList,
   Loader2,
   Play,
@@ -27,6 +29,8 @@ import type {
 } from './types'
 
 type ComposerStage = 'define' | 'allocate' | 'dispatched'
+type ExecutionMode = 'one_time' | 'unattended_plan'
+type PlanMode = 'daily' | 'custom_dates'
 
 type CreateResponse = {
   ok: true
@@ -98,6 +102,58 @@ function uniqueKeywords(value: string) {
       .map(keyword => keyword.trim())
       .filter(Boolean),
   ))
+}
+
+function normalizeScheduleDate(value: string) {
+  const match = value.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)
+  if (!match) return ''
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const date = new Date(Date.UTC(year, month - 1, day))
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) return ''
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+function parseCustomDates(value: string) {
+  const candidates = value
+    .split(/[\n,，;；]+/g)
+    .map(candidate => candidate.trim())
+    .filter(Boolean)
+  const invalidDates: string[] = []
+  const dates = Array.from(new Set(candidates.map(candidate => {
+    const normalized = normalizeScheduleDate(candidate)
+    if (!normalized) invalidDates.push(candidate)
+    return normalized
+  }).filter(Boolean))).sort()
+  return { dates, invalidDates }
+}
+
+function shanghaiToday() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date())
+}
+
+function formatScheduleTime(value?: string | null) {
+  if (!value) return '等待云端计算'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
 }
 
 function safeCount(value: unknown) {
@@ -197,6 +253,11 @@ export function OrchestrationComposerDrawer({
   const [stage, setStage] = useState<ComposerStage>('define')
   const [title, setTitle] = useState('')
   const [platform, setPlatform] = useState<OrchestrationPlatform>('xiaohongshu')
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('one_time')
+  const [planMode, setPlanMode] = useState<PlanMode>('daily')
+  const [startTime, setStartTime] = useState('09:00')
+  const [randomOffsetMin, setRandomOffsetMin] = useState(20)
+  const [customDates, setCustomDates] = useState('')
   const [keywordText, setKeywordText] = useState('')
   const [keywordMaxDetectedItems, setKeywordMaxDetectedItems] = useState(50)
   const [sort, setSort] = useState('comprehensive')
@@ -255,11 +316,18 @@ export function OrchestrationComposerDrawer({
     [assignmentCounts],
   )
   const busy = submitting || discardingDraft
+  const dispatchedSchedule = dispatchResult?.schedule
+  const nextScheduleRunAt = dispatchedSchedule?.next_run_at || dispatchedSchedule?.nextRunAt || null
 
   const reset = () => {
     setStage('define')
     setTitle('')
     setPlatform('xiaohongshu')
+    setExecutionMode('one_time')
+    setPlanMode('daily')
+    setStartTime('09:00')
+    setRandomOffsetMin(20)
+    setCustomDates('')
     setKeywordText('')
     setKeywordMaxDetectedItems(50)
     setSort('comprehensive')
@@ -459,6 +527,15 @@ export function OrchestrationComposerDrawer({
   const currentFingerprint = JSON.stringify({
     title: title.trim(),
     platform,
+    executionMode,
+    ...(executionMode === 'unattended_plan'
+      ? {
+          planMode,
+          startTime,
+          randomOffsetMin,
+          customDates: parseCustomDates(customDates).dates,
+        }
+      : {}),
     keywords,
     keywordMaxDetectedItems,
     sort,
@@ -488,6 +565,31 @@ export function OrchestrationComposerDrawer({
       setError('评论加载上限必须是大于等于 1 的整数。')
       return
     }
+    const customDateResult = parseCustomDates(customDates)
+    if (executionMode === 'unattended_plan') {
+      if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(startTime)) {
+        setError('请选择有效的无人值守开始时间。')
+        return
+      }
+      if (!Number.isSafeInteger(randomOffsetMin) || randomOffsetMin < 0 || randomOffsetMin > 240) {
+        setError('随机延迟需要填写 0–240 分钟的整数。')
+        return
+      }
+      if (planMode === 'custom_dates') {
+        if (customDateResult.invalidDates.length > 0) {
+          setError(`存在无效日期：${customDateResult.invalidDates.slice(0, 3).join('、')}。请使用 YYYY-MM-DD 格式。`)
+          return
+        }
+        if (customDateResult.dates.length < 1) {
+          setError('指定日期计划至少需要填写一个运行日期。')
+          return
+        }
+        if (!customDateResult.dates.some(date => date >= shanghaiToday())) {
+          setError('指定日期中至少需要有一个今天或未来的日期。')
+          return
+        }
+      }
+    }
     const validSelectedAgents = selectedAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
       return agent && !agentBlockReason(agent, platform, enhancementEnabled)
@@ -512,6 +614,20 @@ export function OrchestrationComposerDrawer({
           requestKey: candidateDraftId,
           title: title.trim(),
           platform,
+          executionMode,
+          ...(executionMode === 'unattended_plan'
+            ? {
+                schedule: {
+                  mode: planMode,
+                  planMode,
+                  startTime,
+                  randomOffsetMin,
+                  customDates: planMode === 'custom_dates' ? customDateResult.dates.join('\n') : '',
+                  maxRounds: 1,
+                  roundGapMin: 10,
+                },
+              }
+            : {}),
           keywords,
           keywordMaxDetectedItems,
           searchFilters: { sort, publishTime },
@@ -616,7 +732,11 @@ export function OrchestrationComposerDrawer({
                 <h2 id="orchestration-composer-title" className="text-lg font-bold text-foreground">新建多 Agent 任务</h2>
                 <span className="rounded-full border border-primary/25 bg-primary/8 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">Beta</span>
               </div>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">一次性任务 · 先拆成关键词工作项，再明确分配给浏览器节点。</p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                {executionMode === 'unattended_plan'
+                  ? '无人值守 · 先固定关键词与 Agent 分配，再由云端按计划创建每次任务。'
+                  : '执行一次 · 先拆成关键词工作项，再明确分配给浏览器节点。'}
+              </p>
             </div>
           </div>
           <div className="mt-4 flex gap-2" aria-label="新建任务步骤">
@@ -630,6 +750,129 @@ export function OrchestrationComposerDrawer({
           {stage === 'define' && (
             <div className="grid gap-5 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]">
               <div className="space-y-4">
+                <section className={`rounded-2xl border p-4 transition-colors ${executionMode === 'unattended_plan' ? 'border-primary/25 bg-primary/[0.035]' : 'border-border/70 bg-background'}`}>
+                  <div className="mb-3 flex items-center gap-2">
+                    <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><Clock3 className="h-4 w-4" /></span>
+                    <div>
+                      <h3 className="text-sm font-bold text-foreground">运行方式</h3>
+                      <p className="text-[11px] text-muted-foreground">选择只执行一次，或让云端按固定计划反复生成任务。</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 rounded-xl bg-muted/55 p-1">
+                    {([
+                      {
+                        value: 'one_time' as const,
+                        label: '执行一次',
+                        description: '确认后立即下发',
+                        icon: Play,
+                      },
+                      {
+                        value: 'unattended_plan' as const,
+                        label: '无人值守',
+                        description: '云端按时运行',
+                        icon: CalendarDays,
+                      },
+                    ]).map(option => {
+                      const Icon = option.icon
+                      const active = executionMode === option.value
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          aria-pressed={active}
+                          disabled={busy}
+                          onClick={() => {
+                            if (executionMode === option.value) return
+                            markDefinitionChanged()
+                            setExecutionMode(option.value)
+                          }}
+                          className={`flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${active ? 'border-primary/30 bg-card text-primary shadow-sm' : 'border-transparent text-muted-foreground hover:bg-card/70 hover:text-foreground'}`}
+                        >
+                          <Icon className="h-4 w-4 shrink-0" />
+                          <span className="min-w-0">
+                            <span className="block text-xs font-bold">{option.label}</span>
+                            <span className="mt-0.5 block truncate text-[10px] font-normal">{option.description}</span>
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  {executionMode === 'unattended_plan' && (
+                    <div className="mt-4 space-y-3 border-t border-primary/15 pt-4">
+                      <div className="rounded-xl border border-primary/15 bg-card/80 px-3 py-2.5">
+                        <div className="flex items-start gap-2">
+                          <Bot className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                          <p className="text-[11px] leading-4 text-muted-foreground">
+                            这是独立的云端计划。到点后才创建当次任务并发给下方 Agent，<span className="font-semibold text-foreground">不会覆盖设备 Extension 里已有的本地无人值守计划</span>。
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          运行日期
+                          <select
+                            value={planMode}
+                            onChange={event => { markDefinitionChanged(); setPlanMode(event.target.value as PlanMode) }}
+                            disabled={busy}
+                            className={inputClassName}
+                          >
+                            <option value="daily">每天</option>
+                            <option value="custom_dates">指定日期</option>
+                          </select>
+                        </label>
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          开始时间（上海时区）
+                          <input
+                            type="time"
+                            value={startTime}
+                            onChange={event => { markDefinitionChanged(); setStartTime(event.target.value) }}
+                            disabled={busy}
+                            className={inputClassName}
+                          />
+                        </label>
+                      </div>
+                      {planMode === 'custom_dates' && (
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          指定日期（每行一个）
+                          <textarea
+                            value={customDates}
+                            onChange={event => { markDefinitionChanged(); setCustomDates(event.target.value) }}
+                            disabled={busy}
+                            rows={3}
+                            placeholder={'2026-07-25\n2026-08-01'}
+                            className={textareaClassName}
+                          />
+                          <span className="mt-1.5 block text-[11px] text-muted-foreground">格式 YYYY-MM-DD；已经过去的日期不会再次运行。</span>
+                        </label>
+                      )}
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          随机延迟（分钟）
+                          <input
+                            type="number"
+                            min={0}
+                            max={240}
+                            step={1}
+                            value={randomOffsetMin}
+                            onChange={event => { markDefinitionChanged(); setRandomOffsetMin(Number(event.target.value)) }}
+                            disabled={busy}
+                            className={inputClassName}
+                          />
+                        </label>
+                        <div className="flex items-center rounded-xl border border-border/70 bg-card px-3 py-2.5">
+                          <p className="text-[11px] leading-4 text-muted-foreground">
+                            每个计划时间，<span className="font-semibold text-foreground">每个关键词执行 1 次</span>。
+                          </p>
+                        </div>
+                      </div>
+                      <p className="text-[11px] leading-4 text-muted-foreground">
+                        随机延迟会在设定时间后 0–{randomOffsetMin} 分钟内启动，避免多个任务同时拥挤；Agent 分配可在下一步逐项确认。
+                      </p>
+                    </div>
+                  )}
+                </section>
+
                 <section className="rounded-2xl border border-border/70 bg-background p-4">
                   <div className="mb-4 flex items-center gap-2">
                     <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><ClipboardList className="h-4 w-4" /></span>
@@ -834,9 +1077,20 @@ export function OrchestrationComposerDrawer({
               <section className="rounded-2xl border border-primary/20 bg-primary/[0.035] p-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">规则分配预览</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">规则分配预览</div>
+                      <span className="inline-flex items-center gap-1 rounded-full border border-primary/20 bg-card px-2 py-0.5 text-[10px] font-semibold text-primary">
+                        {executionMode === 'unattended_plan' ? <CalendarDays className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                        {executionMode === 'unattended_plan' ? '无人值守' : '执行一次'}
+                      </span>
+                    </div>
                     <h3 className="mt-1 text-base font-bold text-foreground">{title}</h3>
-                    <p className="mt-1 text-xs text-muted-foreground">{preview.itemCount} 个工作项 · {selectedAgents.length} 个 Agent · 连续均衡分配</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {preview.itemCount} 个工作项 · {selectedAgents.length} 个 Agent · 连续均衡分配
+                      {executionMode === 'unattended_plan'
+                        ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
+                        : ''}
+                    </p>
                   </div>
                   <Button variant="outline" size="sm" onClick={() => { setStage('define'); setError('') }} disabled={busy}>调整 Agent</Button>
                 </div>
@@ -912,11 +1166,32 @@ export function OrchestrationComposerDrawer({
             <div className="mx-auto flex min-h-[480px] max-w-xl items-center justify-center">
               <div className="w-full rounded-2xl border border-status-green/25 bg-status-green/5 p-6 text-center">
                 <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-status-green text-white"><CheckCircle2 className="h-6 w-6" /></span>
-                <h3 className="mt-4 text-lg font-bold text-foreground">任务已分配</h3>
-                <p className="mt-2 text-sm leading-6 text-muted-foreground">已创建 {dispatchResult.executions.length} 条 Agent 执行指令。在线节点将在下一次心跳领取，离线节点上线后领取。</p>
+                <h3 className="mt-4 text-lg font-bold text-foreground">
+                  {executionMode === 'unattended_plan' ? '无人值守计划已启用' : '任务已分配'}
+                </h3>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  {executionMode === 'unattended_plan'
+                    ? '云端会在每个运行时间创建当次任务，并按已确认的关键词分配发送给 Agent。设备本地计划保持不变。'
+                    : `已创建 ${dispatchResult.executions.length} 条 Agent 执行指令。在线节点将在下一次心跳领取，离线节点上线后领取。`}
+                </p>
                 <div className="mt-4 rounded-xl border border-border/70 bg-card px-4 py-3 text-left text-xs text-muted-foreground">
                   <div>编排任务：<span className="font-mono text-foreground">{dispatchResult.orchestrationId}</span></div>
                   <div className="mt-1">当前状态：<span className="font-semibold text-foreground">{dispatchResult.status}</span></div>
+                  {executionMode === 'unattended_plan' && (
+                    <>
+                      <div className="mt-1">
+                        运行规则：
+                        <span className="font-semibold text-foreground">
+                          {planMode === 'daily' ? '每天' : '指定日期'} {startTime}
+                          {randomOffsetMin > 0 ? ` 后随机延迟 0–${randomOffsetMin} 分钟` : ''}
+                          {' · 每个关键词执行 1 次'}
+                        </span>
+                      </div>
+                      <div className="mt-1">
+                        下次运行：<span className="font-semibold text-foreground">{formatScheduleTime(nextScheduleRunAt)}</span>
+                      </div>
+                    </>
+                  )}
                 </div>
                 <Button className="mt-5 min-w-32" onClick={() => void requestClose()}>完成</Button>
               </div>
@@ -955,7 +1230,9 @@ export function OrchestrationComposerDrawer({
                 <div role="status" className="mb-3 flex items-center gap-2 rounded-xl border border-primary/20 bg-primary/8 px-3 py-2.5 text-xs font-medium text-primary">
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                   {stage === 'allocate'
-                    ? `正在创建 ${new Set(assignments.map(assignment => assignment.agentId)).size} 条 Agent 执行指令并写入云端，请稍候…`
+                    ? executionMode === 'unattended_plan'
+                      ? '正在保存 Agent 分配并启用云端计划，请稍候…'
+                      : `正在创建 ${new Set(assignments.map(assignment => assignment.agentId)).size} 条 Agent 执行指令并写入云端，请稍候…`
                     : '正在创建任务草稿并生成规则分配预览，请稍候…'}
                 </div>
               )}
@@ -963,8 +1240,12 @@ export function OrchestrationComposerDrawer({
             <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-[11px] leading-4 text-muted-foreground">
                 {stage === 'define'
-                  ? '第一期只支持一次性多 Agent 任务；不会修改设备已有的无人值守计划。'
-                  : '确认后将按当前分配创建真实子任务；每个工作项只归属一个 Agent。'}
+                  ? executionMode === 'unattended_plan'
+                    ? '这是云端无人值守计划，不会修改设备已有的本地计划。'
+                    : '执行一次会在确认分配后立即创建任务，不会修改设备已有的无人值守计划。'
+                  : executionMode === 'unattended_plan'
+                    ? '确认后保存长期分配；云端将在每次到点时创建真实子任务。'
+                    : '确认后将按当前分配创建真实子任务；每个工作项只归属一个 Agent。'}
               </div>
               <div className="flex shrink-0 gap-2">
                 <Button variant="ghost" onClick={stage === 'allocate' ? () => setStage('define') : () => void requestClose()} disabled={busy}>
@@ -978,7 +1259,9 @@ export function OrchestrationComposerDrawer({
                 ) : (
                   <Button onClick={() => void dispatch()} disabled={busy || overloadedAgentIds.length > 0} className="min-w-36">
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                    {busy ? '正在分配…' : '确认并分配'}
+                    {busy
+                      ? executionMode === 'unattended_plan' ? '正在启用…' : '正在分配…'
+                      : executionMode === 'unattended_plan' ? '确认并启用计划' : '确认并分配'}
                   </Button>
                 )}
               </div>

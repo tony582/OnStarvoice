@@ -6,11 +6,13 @@ import {
   aggregateParentTaskItems,
   allocateKeywordWorkItems,
   checkpointEntryToItemStatus,
+  computeNextOrchestrationRunAt,
   hashOrchestrationRequest,
   normalizeOrchestrationRequest,
+  normalizeOrchestrationSchedule,
 } from '../server/services/capture-orchestration.js';
 
-test('orchestration input is bounded, deduplicated, and limited to the real first-slice contract', () => {
+test('orchestration input keeps a validated cloud schedule without changing allocation order', () => {
   const normalized = normalizeOrchestrationRequest({
     requestKey: ' request-1 ',
     title: ' 20 个关键词 ',
@@ -24,7 +26,10 @@ test('orchestration input is bounded, deduplicated, and limited to the real firs
       {id: 'agent-a'},
     ],
     sort: 'Latest',
-    maxRounds: 4,
+    mode: 'daily',
+    startTime: '22:45',
+    randomOffsetMin: 20,
+    maxRounds: 1,
     keywordMaxDetectedItems: 50,
     captureSettings: {
       autoDetailCaptureAfterListCapture: true,
@@ -35,15 +40,97 @@ test('orchestration input is bounded, deduplicated, and limited to the real firs
 
   assert.equal(normalized.requestKey, 'request-1');
   assert.equal(normalized.platform, 'xiaohongshu');
-  assert.equal(normalized.executionMode, 'one_time');
+  assert.equal(normalized.executionMode, 'unattended_plan');
   assert.equal(normalized.allocationMode, 'balanced');
   assert.deepEqual(normalized.keywords, ['别克', '雪佛兰', '凯迪拉克']);
   assert.deepEqual(normalized.agentIds, ['agent-a', 'agent-b']);
   assert.equal(normalized.taskInput.searchFilters.sort, 'latest');
+  assert.equal(normalized.taskInput.mode, 'daily');
+  assert.equal(normalized.taskInput.startTime, '22:45');
+  assert.equal(normalized.taskInput.randomOffsetMin, 20);
   assert.equal(normalized.taskInput.maxRounds, 1);
+  assert.equal(normalized.taskInput.roundGapMin, 10);
   assert.equal(
     normalized.taskInput.captureSettings.includeCommentsOnDetailCapture,
     true,
+  );
+});
+
+test('custom-date schedules reject malformed dates and normalize accepted dates', () => {
+  assert.throws(
+    () => normalizeOrchestrationSchedule({mode: 'daily', maxRounds: 2}),
+    error => error?.code === 'multi_agent_schedule_single_round_only',
+  );
+  assert.throws(
+    () => normalizeOrchestrationSchedule({
+      mode: 'custom_dates',
+      customDates: '2026-07-23\n2026-02-30',
+    }),
+    error => error?.code === 'invalid_schedule_dates',
+  );
+  assert.deepEqual(
+    normalizeOrchestrationSchedule({
+      mode: 'custom_dates',
+      startTime: '08:05',
+      customDates: '2026/7/24，2026-07-23\n2026-07-24',
+      randomOffsetMin: 0,
+    }),
+    {
+      mode: 'custom_dates',
+      timezone: 'Asia/Shanghai',
+      startTime: '08:05',
+      randomOffsetMin: 0,
+      customDates: '2026-07-23\n2026-07-24',
+      maxRounds: 1,
+      roundGapMin: 10,
+      overlapPolicy: 'skip',
+      lateStartGraceMin: 360,
+    },
+  );
+});
+
+test('next schedule occurrence is computed in Asia/Shanghai and is deterministic', () => {
+  const schedule = {
+    mode: 'custom_dates',
+    startTime: '09:30',
+    randomOffsetMin: 0,
+    customDates: '2026-07-23\n2026-07-24',
+  };
+  assert.equal(
+    computeNextOrchestrationRunAt(schedule, {
+      after: new Date('2026-07-23T00:00:00.000Z'),
+      seed: 'schedule-a',
+    }),
+    '2026-07-23T01:30:00.000Z',
+  );
+  assert.equal(
+    computeNextOrchestrationRunAt(schedule, {
+      after: new Date('2026-07-23T02:00:00.000Z'),
+      seed: 'schedule-a',
+    }),
+    '2026-07-24T01:30:00.000Z',
+  );
+  assert.equal(
+    computeNextOrchestrationRunAt(schedule, {
+      after: new Date('2026-07-24T02:00:00.000Z'),
+      seed: 'schedule-a',
+    }),
+    '',
+  );
+  const jittered = {
+    mode: 'daily',
+    startTime: '09:30',
+    randomOffsetMin: 20,
+  };
+  assert.equal(
+    computeNextOrchestrationRunAt(jittered, {
+      after: new Date('2026-07-23T00:00:00.000Z'),
+      seed: 'schedule-a',
+    }),
+    computeNextOrchestrationRunAt(jittered, {
+      after: new Date('2026-07-23T00:00:00.000Z'),
+      seed: 'schedule-a',
+    }),
   );
 });
 
@@ -135,6 +222,24 @@ test('checkpoint mapping is retry-aware and requires structured safety evidence'
       status: 'failed',
       attemptCount: 1,
       errorCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+    }),
+    'retryable',
+  );
+  assert.equal(
+    checkpointEntryToItemStatus({
+      status: 'failed',
+      attemptCount: 1,
+      errorCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+      requiresManualAction: true,
+    }),
+    'retryable',
+    'legacy service-abnormal flags must be downgraded after the behavior change',
+  );
+  assert.equal(
+    checkpointEntryToItemStatus({
+      status: 'failed',
+      attemptCount: 1,
+      errorCode: 'SECURITY_VERIFICATION_REQUIRED',
       requiresManualAction: true,
     }),
     'needs_action',
@@ -204,4 +309,26 @@ test('migration adds parent/item audit fields without pretending to implement a 
   assert.match(migration, /CREATE TABLE IF NOT EXISTS capture_task_item_attempts/);
   assert.match(migration, /UNIQUE \(item_id, attempt_number\)/);
   assert.doesNotMatch(migration, /\b(?:lease_expires_at|fencing_token|claim_token)\b/);
+});
+
+test('cloud orchestration schedule migration keeps each occurrence unique and cleanup auditable', async () => {
+  const migration = await readFile(
+    new URL(
+      '../server/db/migrations/043_capture_orchestration_schedules.sql',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS capture_orchestration_schedules/);
+  assert.match(migration, /template_task_id UUID NOT NULL UNIQUE/);
+  assert.match(migration, /next_run_at TIMESTAMPTZ/);
+  assert.match(migration, /uniq_capture_orchestration_schedule_occurrence/);
+  assert.match(migration, /attention_dismissed_at TIMESTAMPTZ/);
+  assert.match(migration, /attention_dismissed_by_user_id UUID/);
+  assert.doesNotMatch(
+    migration,
+    /ON DELETE SET NULL \([^)]+\)/u,
+    'production PostgreSQL 14 does not support a SET NULL target-column list',
+  );
+  assert.doesNotMatch(migration, /\bDELETE FROM capture_tasks\b/);
 });

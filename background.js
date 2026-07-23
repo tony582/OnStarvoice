@@ -3661,6 +3661,9 @@ function getUnattendedRecoveryBlockReason(request) {
     )
       .trim()
       .toUpperCase();
+    if (entryCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+      return false;
+    }
     return Boolean(
       entry?.securityBlocked === true ||
         entry?.security_blocked === true ||
@@ -3671,7 +3674,6 @@ function getUnattendedRecoveryBlockReason(request) {
         [
           'PLATFORM_SAFETY_BLOCK',
           'SECURITY_VERIFICATION_REQUIRED',
-          'DOUYIN_SEARCH_SERVICE_ABNORMAL',
         ].includes(entryCode),
     );
   });
@@ -3697,8 +3699,6 @@ function getUnattendedRecoveryBlockReason(request) {
       '',
   ).trim();
   if (structuredBlock) {
-    const douyinServiceAbnormal =
-      structuredCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL';
     return {
       code: structuredCode || 'UNATTENDED_RECOVERY_BLOCKED',
       category: String(
@@ -3706,16 +3706,14 @@ function getUnattendedRecoveryBlockReason(request) {
           structuredBlock?.error_category ||
           structuredBlock?.category ||
           structuredBlock?.error?.category ||
-          (douyinServiceAbnormal ? 'platform_service_abnormal' : ''),
+          '',
       ).trim(),
-      message: douyinServiceAbnormal
-        ? '检测到抖音“服务出现异常”，为避免触发安全审核，已停止自动恢复'
-        : structuredMessage || '任务已进入人工处理状态，已停止自动恢复',
+      message:
+        structuredMessage || '任务已进入人工处理状态，已停止自动恢复',
       securityBlocked: Boolean(
         structuredBlock?.securityBlocked === true ||
           structuredBlock?.security_blocked === true ||
-          structuredBlock?.error?.securityBlocked === true ||
-          douyinServiceAbnormal,
+          structuredBlock?.error?.securityBlocked === true,
       ),
       requiresManualAction: true,
       retryable: false,

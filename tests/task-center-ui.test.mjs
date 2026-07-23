@@ -580,7 +580,7 @@ test("task center reads the canonical business clock and keyword checkpoint rows
   ]);
 });
 
-test("task center refreshes an open detail and blocks code-only safety retries", async () => {
+test("task center refreshes detail and keeps service-abnormal failures retryable", async () => {
   const ui = await read("sidebar/task-center-ui.js");
 
   assert.match(ui, /activeTaskCenterDetailId && detailModal\?\.classList\.contains\("is-active"\)/);
@@ -591,7 +591,14 @@ test("task center refreshes an open detail and blocks code-only safety retries",
   assert.match(ui, /item\?\.raw\?\.error\?\.code/);
   assert.match(ui, /login\[_\\s-\]\?required/);
   assert.match(ui, /requiresManualAction/);
-  assert.match(ui, /douyin_search_service_abnormal/);
+  assert.match(
+    ui,
+    /if \(errorCode === "douyin_search_service_abnormal"\) \{\s+return false;/,
+  );
+  assert.doesNotMatch(
+    ui,
+    /risk\[_\\s-\]\?control\|douyin_search_service_abnormal/,
+  );
   assert.match(
     ui,
     /\["attention", "failed", "partial"\]\.includes\(item\.status\)[\s\S]*isTaskCenterCircuitBreaker\(item\)/,
