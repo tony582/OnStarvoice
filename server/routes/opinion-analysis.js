@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { queryAll, queryOne, execute } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { formatPublishDate } from '../services/publish-date.js';
 import {
   runTopicAnalysis,
   analyzeOpinionRecord,
@@ -213,6 +214,22 @@ router.get('/records/:recordId', async (req, res, next) => {
     return res.json({
       ok: true, analysis: cached.payload, source: cached.analysis_source, updatedAt: cached.updated_at, stale,
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 薄取记录:证据回链页内下钻 RecordDrawer 用。返回 records 整行(tenant 隔离)+ publish_display,
+// 派生徽章字段(alert_count/alert_reasons)不在此计算,抽屉按 Number(||0) 优雅隐藏,深度剖析 tab 自取预警。
+router.get('/records/:recordId/detail', async (req, res, next) => {
+  try {
+    const record = await queryOne(
+      `SELECT * FROM records WHERE id = $1 AND tenant_id = $2`,
+      [req.params.recordId, req.tenantId]
+    );
+    if (!record) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    record.publish_display = formatPublishDate(record.publish_time, record.created_at);
+    return res.json({ ok: true, record });
   } catch (err) {
     return next(err);
   }

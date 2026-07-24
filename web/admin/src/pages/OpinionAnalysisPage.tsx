@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  AlertTriangle, ArrowLeft, Check, ClipboardList, Copy, ExternalLink, Loader2,
+  AlertTriangle, ArrowLeft, ArrowRight, Check, ClipboardList, Copy, ExternalLink, Loader2,
   MessageSquare, Plus, Quote, Radar, RotateCcw, ScanSearch, ShieldAlert,
   Sparkles, TrendingUp, Trash2, X,
 } from 'lucide-react'
@@ -12,6 +12,7 @@ import { StatusBadge, StatusPill } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { RecordDrawer } from '@/components/shared/RecordDrawer'
 
 interface TopicAnalysis {
   id: string
@@ -61,6 +62,22 @@ export function OpinionAnalysisPage() {
   const [selectedId, setSelectedId] = useState('')
   const [detail, setDetail] = useState<TopicAnalysis | null>(null)
   const [detailError, setDetailError] = useState('')
+  const [drawerRecord, setDrawerRecord] = useState<any>(null)
+  const [drawerBusy, setDrawerBusy] = useState(false)
+
+  // 证据回链页内下钻:按 recordId 薄取整行 → 打开 RecordDrawer(自带「深度剖析」tab)。
+  const openRecord = async (recordId: string) => {
+    if (!recordId || drawerBusy) return
+    setDrawerBusy(true)
+    try {
+      const d = await api.get<any>(`/opinion-analysis/records/${recordId}/detail`)
+      if (d.record) setDrawerRecord(d.record)
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : '打开原帖详情失败')
+    } finally {
+      setDrawerBusy(false)
+    }
+  }
 
   const loadList = () => api.get<any>('/opinion-analysis/topics')
     .then(d => setItems(d.analyses || []))
@@ -122,8 +139,15 @@ export function OpinionAnalysisPage() {
 
   if (selectedId) {
     return (
-      <DetailView detail={detail} error={detailError} canWrite={canWrite()}
-        onBack={() => setSelectedId('')} onRerun={() => rerun(selectedId)} onDelete={() => remove(selectedId)} />
+      <>
+        <DetailView detail={detail} error={detailError} canWrite={canWrite()}
+          onBack={() => setSelectedId('')} onRerun={() => rerun(selectedId)} onDelete={() => remove(selectedId)}
+          onOpenRecord={openRecord} />
+        {drawerRecord && (
+          <RecordDrawer record={drawerRecord} onClose={() => setDrawerRecord(null)}
+            canWrite={canWrite()} onLinkIssue={() => {}} />
+        )}
+      </>
     )
   }
 
@@ -390,9 +414,10 @@ function ProgressSteps({ progress, status }: { progress: TopicAnalysis['progress
   )
 }
 
-function DetailView({ detail, error, canWrite, onBack, onRerun, onDelete }: {
+function DetailView({ detail, error, canWrite, onBack, onRerun, onDelete, onOpenRecord }: {
   detail: TopicAnalysis | null; error: string; canWrite: boolean
   onBack: () => void; onRerun: () => void; onDelete: () => void
+  onOpenRecord: (recordId: string) => void
 }) {
   if (!detail) {
     return (
@@ -450,7 +475,7 @@ function DetailView({ detail, error, canWrite, onBack, onRerun, onDelete }: {
 
       {detail.status === 'done' && (
         detail.payload
-          ? <ResultBlocks payload={detail.payload} analysisSource={detail.analysis_source} />
+          ? <ResultBlocks payload={detail.payload} analysisSource={detail.analysis_source} onOpenRecord={onOpenRecord} />
           : <div className="rounded-xl border border-border bg-card p-4 text-sm text-muted-foreground">剖析已完成但结果为空,请重跑一次。</div>
       )}
     </div>
@@ -508,17 +533,27 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-/** 证据回链:sampleIds → sampleMap(id→{title,url})。本版为外链打开原帖,页内抽屉下钻在 C5 接入。 */
-function SampleLinks({ ids, sampleMap, className }: { ids?: string[]; sampleMap: any; className?: string }) {
-  const links = (ids || []).map(id => ({ id, ...(sampleMap?.[id] || {}) })).filter((x: any) => x.url)
+/** 证据回链:sampleIds → sampleMap(id→{title,url})。主行为=页内打开 RecordDrawer 下钻单条;「原帖」降为次链接。 */
+function SampleLinks({ ids, sampleMap, className, onOpenRecord }: {
+  ids?: string[]; sampleMap: any; className?: string; onOpenRecord?: (recordId: string) => void
+}) {
+  const links = (ids || []).map(id => ({ id, ...(sampleMap?.[id] || {}) })).filter((x: any) => x.url || x.title)
   if (!links.length) return null
   return (
     <div className={cn('flex flex-wrap items-center gap-x-3 gap-y-1', className)}>
       {links.map((l: any) => (
-        <a key={l.id} href={l.url} target="_blank" rel="noreferrer" title={l.title || ''}
-          className="inline-flex max-w-[220px] items-center gap-1 text-[10.5px] font-medium text-primary hover:underline">
-          <ExternalLink className="h-3 w-3 shrink-0" /><span className="truncate">{l.title || '打开原帖'}</span>
-        </a>
+        <span key={l.id} className="inline-flex max-w-[280px] items-center gap-1">
+          <button type="button" onClick={() => onOpenRecord?.(l.id)} title={l.title || ''}
+            className="inline-flex min-w-0 items-center gap-1 text-[10.5px] font-medium text-primary hover:underline">
+            <ScanSearch className="h-3 w-3 shrink-0" /><span className="truncate">{l.title || '查看该条'}</span>
+          </button>
+          {l.url && (
+            <a href={l.url} target="_blank" rel="noreferrer" aria-label="打开原帖"
+              className="shrink-0 text-muted-foreground hover:text-primary">
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
+        </span>
       ))}
     </div>
   )
@@ -577,7 +612,10 @@ function TrendBars({ trend }: { trend: any[] }) {
   )
 }
 
-function ResultBlocks({ payload, analysisSource }: { payload: any; analysisSource: string | null }) {
+function ResultBlocks({ payload, analysisSource, onOpenRecord }: {
+  payload: any; analysisSource: string | null; onOpenRecord: (recordId: string) => void
+}) {
+  const { navigate } = useNav()
   const meta = payload.meta || {}
   const metrics = payload.ruleMetrics || {}
   const risk = payload.riskAssessment || {}
@@ -619,7 +657,7 @@ function ResultBlocks({ payload, analysisSource }: { payload: any; analysisSourc
                 <div key={i} className="rounded-lg border border-border p-3">
                   <div className="text-[13px] font-semibold leading-snug">{d.driver}</div>
                   {d.evidence && <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{d.evidence}</p>}
-                  <SampleLinks ids={d.sampleIds} sampleMap={sampleMap} className="mt-1.5" />
+                  <SampleLinks ids={d.sampleIds} sampleMap={sampleMap} className="mt-1.5" onOpenRecord={onOpenRecord} />
                 </div>
               ))}
             </div>
@@ -655,7 +693,7 @@ function ResultBlocks({ payload, analysisSource }: { payload: any; analysisSourc
                     <span className="text-[13px] font-semibold leading-snug">{c.viewpoint}</span>
                   </div>
                   {c.summary && <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">{c.summary}</p>}
-                  <SampleLinks ids={c.sampleIds} sampleMap={sampleMap} className="mt-1.5" />
+                  <SampleLinks ids={c.sampleIds} sampleMap={sampleMap} className="mt-1.5" onOpenRecord={onOpenRecord} />
                 </div>
               ))}
             </div>
@@ -675,10 +713,16 @@ function ResultBlocks({ payload, analysisSource }: { payload: any; analysisSourc
                   <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-[18px] text-[10.5px] text-muted-foreground">
                     {Number(v.likeCount) > 0 && <span>赞 {formatNumber(v.likeCount)}</span>}
                     {v.recordTitle && <span className="max-w-[240px] truncate">来自:{v.recordTitle}</span>}
-                    {sampleMap[v.recordId]?.url && (
-                      <a href={sampleMap[v.recordId].url} target="_blank" rel="noreferrer"
+                    {v.recordId && (sampleMap[v.recordId] || sampleMap[v.recordId]?.url) && (
+                      <button type="button" onClick={() => onOpenRecord(v.recordId)}
                         className="inline-flex items-center gap-0.5 font-medium text-primary hover:underline">
-                        <ExternalLink className="h-3 w-3" />打开原帖
+                        <ScanSearch className="h-3 w-3" />查看该条
+                      </button>
+                    )}
+                    {sampleMap[v.recordId]?.url && (
+                      <a href={sampleMap[v.recordId].url} target="_blank" rel="noreferrer" aria-label="打开原帖"
+                        className="inline-flex items-center gap-0.5 hover:text-primary">
+                        <ExternalLink className="h-3 w-3" />
                       </a>
                     )}
                   </div>
@@ -721,8 +765,13 @@ function ResultBlocks({ payload, analysisSource }: { payload: any; analysisSourc
                   <StatusBadge tone={n.sentiment || 'neutral'}>{LABELS.sentiment[n.sentiment || ''] || '待标注'}</StatusBadge>
                   <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">{n.title || '(无标题)'}</span>
                   <span className={cn('shrink-0 text-[11px] font-bold tabular-nums', n.sentiment === 'negative' ? 'text-status-red' : 'text-muted-foreground')}>+{formatNumber(n.interactionGrowth)}</span>
+                  {n.recordId && (
+                    <button type="button" onClick={() => onOpenRecord(n.recordId)} aria-label="查看该条" className="shrink-0 text-primary hover:opacity-75">
+                      <ScanSearch className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   {sampleMap[n.recordId]?.url && (
-                    <a href={sampleMap[n.recordId].url} target="_blank" rel="noreferrer" aria-label="打开原帖" className="shrink-0 text-primary hover:opacity-75">
+                    <a href={sampleMap[n.recordId].url} target="_blank" rel="noreferrer" aria-label="打开原帖" className="shrink-0 text-muted-foreground hover:text-primary">
                       <ExternalLink className="h-3.5 w-3.5" />
                     </a>
                   )}
@@ -801,7 +850,10 @@ function ResultBlocks({ payload, analysisSource }: { payload: any; analysisSourc
                 </div>
               ))}
             </div>
-            <p className="mt-1.5 text-[10.5px] text-muted-foreground">可到「内容创意 · 选题与扩词」继续扩写这些方向。</p>
+            <button type="button" onClick={() => navigate('keywords')}
+              className="mt-1.5 inline-flex items-center gap-1 text-[10.5px] font-medium text-primary hover:underline">
+              到「内容创意 · 选题与扩词」继续扩写这些方向<ArrowRight className="h-3 w-3" />
+            </button>
           </div>
         )}
       </Section>
