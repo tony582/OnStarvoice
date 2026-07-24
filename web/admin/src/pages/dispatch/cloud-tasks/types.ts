@@ -1,14 +1,7 @@
 export type OrchestrationPlatform = 'xiaohongshu' | 'douyin'
 
-export type CaptureEnhancementSettings = {
-  autoDetailCaptureAfterListCapture: boolean
-  autoSyncAfterDetailCapture: boolean
-  enableAiRelevancePrefilter: boolean
-  includeBloggerMetricsOnDetailCapture: boolean
-  includeCommentsOnDetailCapture: boolean
-  detailCommentsMaxDetectedItems: number
-  skipAlreadyCapturedOnDetailCapture: boolean
-}
+// CaptureEnhancementSettings 统一以 lib.ts 的定义为准（字段全可选），此处仅 re-export 保持既有 import 兼容。
+export type { CaptureEnhancementSettings } from './lib'
 
 /**
  * The orchestration UI deliberately accepts the same agent shape already returned
@@ -187,6 +180,8 @@ export type OrchestrationComposerDrawerProps = {
   open: boolean
   writable: boolean
   agents: OrchestrationCloudAgent[]
+  /** 从新建任务向导带过来的预选节点；不传时行为不变（空小队）。 */
+  initialAgentIds?: string[]
   onClose: () => void
   onDispatched?: (result: OrchestrationDispatchResult) => void | Promise<void>
   onChanged?: () => void | Promise<void>

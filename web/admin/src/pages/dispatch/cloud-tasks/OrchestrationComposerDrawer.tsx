@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { Drawer } from '@/components/shared/Drawer'
 import type {
   CaptureEnhancementSettings,
   OrchestrationCloudAgent,
@@ -246,6 +247,7 @@ export function OrchestrationComposerDrawer({
   open,
   writable,
   agents,
+  initialAgentIds,
   onClose,
   onDispatched,
   onChanged,
@@ -279,14 +281,11 @@ export function OrchestrationComposerDrawer({
   const [pendingDraftCount, setPendingDraftCount] = useState(0)
   const [error, setError] = useState('')
   const [dispatchResult, setDispatchResult] = useState<OrchestrationDispatchResult | null>(null)
-  const closeButtonRef = useRef<HTMLButtonElement | null>(null)
-  const dialogRef = useRef<HTMLElement | null>(null)
   const requestKeyRef = useRef(randomRequestKey())
   const previouslyOpenRef = useRef(false)
   const submittingRef = useRef(false)
   const onCloseRef = useRef(onClose)
   const onChangedRef = useRef(onChanged)
-  const requestCloseRef = useRef<() => void | Promise<void>>(() => {})
   const draftIdsRef = useRef(new Set<string>())
   const draftCleanupPromiseRef = useRef<Promise<boolean> | null>(null)
 
@@ -339,7 +338,8 @@ export function OrchestrationComposerDrawer({
     setIncludeComments(false)
     setCommentLimit(50)
     setSkipCaptured(true)
-    setSelectedAgentIds([])
+    // 预选小队来自新建任务向导；未带预选时为空（原默认行为）。
+    setSelectedAgentIds(initialAgentIds ?? [])
     setCreateResult(null)
     setCreateFingerprint('')
     setPreview(null)
@@ -368,38 +368,6 @@ export function OrchestrationComposerDrawer({
   useEffect(() => {
     onChangedRef.current = onChanged
   }, [onChanged])
-
-  useEffect(() => {
-    if (!open) return
-    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    const focusTimer = window.setTimeout(() => closeButtonRef.current?.focus(), 0)
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !submittingRef.current) void requestCloseRef.current()
-      if (event.key !== 'Tab' || !dialogRef.current) return
-      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-      )).filter(element => !element.hasAttribute('hidden'))
-      if (focusable.length === 0) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => {
-      window.clearTimeout(focusTimer)
-      document.body.style.overflow = previousOverflow
-      window.removeEventListener('keydown', onKeyDown)
-      previouslyFocused?.focus()
-    }
-  }, [open])
 
   const discardCreatedDrafts = async () => {
     if (draftCleanupPromiseRef.current) return draftCleanupPromiseRef.current
@@ -472,10 +440,6 @@ export function OrchestrationComposerDrawer({
     const discarded = await discardCreatedDrafts()
     if (discarded && draftIdsRef.current.size === 0) onCloseRef.current()
   }
-
-  useEffect(() => {
-    requestCloseRef.current = requestClose
-  })
 
   const changePlatform = (value: OrchestrationPlatform) => {
     markDefinitionChanged()
@@ -706,20 +670,16 @@ export function OrchestrationComposerDrawer({
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end">
-      <div className="absolute inset-0 bg-black/35" onMouseDown={() => { if (!busy) void requestClose() }} />
-      <section
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="orchestration-composer-title"
-        className="relative z-10 flex h-full w-full flex-col bg-card shadow-lg lg:max-w-[880px] lg:border-l lg:border-border"
-      >
+    <Drawer
+      onClose={() => void requestClose()}
+      labelledBy="orchestration-composer-title"
+      panelClassName="max-w-none lg:max-w-[880px]"
+    >
         <header className="shrink-0 border-b border-border/70 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] sm:px-6">
           <div className="flex items-start gap-3">
             <button
-              ref={closeButtonRef}
               type="button"
+              data-dialog-initial-focus
               onClick={stage === 'allocate' ? () => { setStage('define'); setError('') } : () => void requestClose()}
               aria-label={stage === 'allocate' ? '返回任务配置' : '关闭新建编排任务'}
               disabled={busy}
@@ -1268,7 +1228,6 @@ export function OrchestrationComposerDrawer({
             </div>
           </footer>
         )}
-      </section>
-    </div>
+    </Drawer>
   )
 }

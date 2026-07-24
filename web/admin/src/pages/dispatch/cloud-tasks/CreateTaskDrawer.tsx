@@ -1,0 +1,303 @@
+import { useState } from 'react'
+import type { LucideIcon } from 'lucide-react'
+import {
+  ArrowLeft, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
+  MessagesSquare, Network, Search, ShieldAlert, X,
+} from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Drawer } from '@/components/shared/Drawer'
+import { AgentPicker } from './AgentPicker'
+import { AgentTaskCreator } from './AgentTaskCreator'
+import type { CloudAgent, CloudTask, ComposerIntent } from './lib'
+import { agentAssignmentBlockReason } from './lib'
+
+// 统一「新建任务」向导：任务类型 → 执行方式 → 选择节点 → 任务配置。
+// 单节点配置复用 AgentTaskCreator；多节点在选完节点后交接给编排抽屉（预选小队）。
+type WizardStep = 'type' | 'method' | 'agents' | 'configure'
+type TaskType = 'keyword' | 'unattended_plan'
+type ExecutionMethod = 'single' | 'multi'
+
+const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string; note: string; icon: LucideIcon; planned: boolean }> = [
+  { value: 'keyword', title: '关键词采集', description: '按关键词在小红书、抖音搜索并采集匹配帖子。', note: '一次性补采', icon: Search, planned: false },
+  { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
+  { value: 'negative_patrol', title: '负面帖子巡查', description: '定期巡查负面口碑帖并升级预警。', note: '', icon: ShieldAlert, planned: true },
+  { value: 'comment_patrol', title: '官方账号评论巡查', description: '定期巡查官方账号评论区，发现风险评论。', note: '', icon: MessagesSquare, planned: true },
+]
+
+const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [
+  { value: 'single', title: '单个节点', description: '指定一个 Agent 执行；离线也可排队，上线自动领取。', icon: Bot },
+  { value: 'multi', title: '多节点编排', description: '把关键词拆分到多个 Agent 并行执行，适合大批量采集。', icon: Network },
+]
+
+const STEP_LABELS: Array<{ step: WizardStep; label: string }> = [
+  { step: 'type', label: '任务类型' },
+  { step: 'method', label: '执行方式' },
+  { step: 'agents', label: '选择节点' },
+  { step: 'configure', label: '任务配置' },
+]
+
+function StepIndicator({ step, canBack, onBack }: { step: WizardStep; canBack: (target: WizardStep) => boolean; onBack: (target: WizardStep) => void }) {
+  const currentIndex = STEP_LABELS.findIndex(item => item.step === step)
+  return (
+    <ol className="grid grid-cols-4 gap-2" aria-label="创建任务步骤">
+      {STEP_LABELS.map((item, index) => {
+        const done = index < currentIndex
+        const current = index === currentIndex
+        const content = (
+          <>
+            <div className={`flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider ${current ? 'text-primary' : done ? 'text-status-green' : 'text-muted-foreground'}`}>
+              {done ? <><Check className="h-3 w-3" /> 已完成</> : `第 ${index + 1} 步`}
+            </div>
+            <div className="mt-0.5 truncate text-xs font-semibold text-foreground">{item.label}</div>
+          </>
+        )
+        return (
+          <li key={item.step} aria-current={current ? 'step' : undefined}
+            className={`min-w-0 rounded-xl border px-2.5 py-2.5 ${current ? 'border-primary/35 bg-primary/8' : done ? 'border-status-green/25 bg-status-green/5' : 'border-border/70 bg-muted/35'}`}>
+            {done && canBack(item.step)
+              ? <button type="button" onClick={() => onBack(item.step)} className="-m-1 block w-full rounded-lg p-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{content}</button>
+              : content}
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
+
+export function CreateTaskDrawer({
+  agents,
+  tasks,
+  writable,
+  intent,
+  onClose,
+  onCreated,
+  onLaunchOrchestration,
+}: {
+  agents: CloudAgent[]
+  tasks: CloudTask[]
+  writable: boolean
+  intent: ComposerIntent
+  onClose: () => void
+  onCreated: () => Promise<void>
+  onLaunchOrchestration: (agentIds: string[]) => void
+}) {
+  const editingExisting = intent.editExisting === true
+  // 从 Agent 详情「分配任务/创建计划」进入时锁定该 Agent：跳过执行方式与选择节点两步。
+  const presetAgentId = intent.agentId || ''
+  // intent.mode 视为已定任务类型（如 Agent 抽屉「创建无人值守计划」），直接落到配置步。
+  const presetTaskType: TaskType | null = editingExisting || intent.mode === 'unattended_plan' ? 'unattended_plan' : null
+  const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
+
+  const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : 'type')
+  const [taskType, setTaskType] = useState<TaskType>(presetTaskType || 'keyword')
+  const [method, setMethod] = useState<ExecutionMethod>('single')
+  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>(presetAgentId ? [presetAgentId] : [])
+
+  const mode: 'one_time' | 'unattended_plan' = taskType === 'unattended_plan' ? 'unattended_plan' : 'one_time'
+  const selectedAgent = agents.find(agent => agent.id === selectedAgentIds[0])
+  // 已选节点里当前仍可接单的（任务类型回退修改后，原选择可能因能力/平台不符被阻断）。
+  const selectedAssignableIds = selectedAgentIds.filter(id => {
+    const agent = agents.find(candidate => candidate.id === id)
+    return agent ? !agentAssignmentBlockReason(agent, mode) : false
+  })
+  const showIndicator = !editingExisting
+  const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
+
+  const goBack = () => {
+    if (step === 'configure') {
+      if (startsAtConfigure) return onClose()
+      if (presetAgentId) return setStep('type')
+      return setStep('agents')
+    }
+    if (step === 'agents') return setStep('method')
+    if (step === 'method') return setStep('type')
+    return onClose()
+  }
+
+  const goNext = () => {
+    if (step === 'type') {
+      if (presetAgentId) return setStep('configure')
+      return setStep('method')
+    }
+    if (step === 'method') return setStep('agents')
+    if (step === 'agents') {
+      // 多节点编排：关闭本向导并把已选小队交给编排抽屉（内部 define→allocate→dispatch 不变）。
+      if (method === 'multi') return onLaunchOrchestration(selectedAgentIds)
+      return setStep('configure')
+    }
+  }
+
+  // 步骤条回退：锁定 Agent 的链路只能回到任务类型，避免绕过锁定。
+  const canBackTo = (target: WizardStep) => {
+    if (editingExisting) return false
+    if (presetAgentId) return target === 'type'
+    return true
+  }
+  const goBackTo = (target: WizardStep) => {
+    if (canBackTo(target)) setStep(target)
+  }
+
+  const nextDisabled = !writable
+    || (step === 'agents' && selectedAssignableIds.length === 0)
+
+  const nextLabel = step === 'type'
+    ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
+    : step === 'method'
+      ? '下一步：选择节点'
+      : method === 'multi' ? '前往多节点编排' : '下一步：任务配置'
+
+  return (
+    <Drawer onClose={onClose} width="xl" labelledBy="create-task-title" closeOnOverlay={false}>
+      <header className="shrink-0 border-b border-border/70 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] sm:px-6">
+        <div className="flex items-start gap-3">
+          <button type="button" onClick={goBack} aria-label={atFirstStep ? '关闭任务创建' : '返回上一步'} data-dialog-initial-focus
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border text-muted-foreground hover:bg-muted hover:text-foreground">
+            {atFirstStep ? <X className="h-5 w-5" /> : <ArrowLeft className="h-5 w-5" />}
+          </button>
+          <div className="min-w-0 flex-1">
+            <h2 id="create-task-title" className="text-lg font-bold text-foreground">{editingExisting ? '修改无人值守计划' : '新建任务'}</h2>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              {editingExisting
+                ? '更新该设备的无人值守计划，保存后覆盖原计划。'
+                : '先选择任务类型，再决定交给哪个 Agent（浏览器节点）执行。'}
+            </p>
+          </div>
+        </div>
+        {showIndicator && <div className="mt-4"><StepIndicator step={step} canBack={canBackTo} onBack={goBackTo} /></div>}
+      </header>
+
+      <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6">
+        {step === 'type' && (
+          <div className="mx-auto max-w-2xl">
+            <div className="mb-4">
+              <h3 className="text-base font-bold">这次要创建哪种任务？</h3>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">目前开放关键词采集与无人值守计划；巡查类任务即将上线。</p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="任务类型">
+              {TASK_TYPE_CARDS.map(item => {
+                const Icon = item.icon
+                const selected = !item.planned && taskType === item.value
+                return (
+                  <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={item.planned || undefined}
+                    onClick={() => { if (!item.planned) setTaskType(item.value as TaskType) }}
+                    className={`flex min-h-36 flex-col rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${item.planned ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${!item.planned && selected ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}><Icon className="h-5 w-5" /></span>
+                      {item.planned
+                        ? <span className="rounded-full bg-status-orange/10 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">即将上线</span>
+                        : <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>}
+                    </div>
+                    <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
+                    <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{item.description}</p>
+                    {item.note && <div className="mt-auto pt-3 text-[11px] font-medium text-primary">{item.note}</div>}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {step === 'method' && (
+          <div className="mx-auto max-w-2xl">
+            <div className="mb-4">
+              <h3 className="text-base font-bold">怎么执行这批采集？</h3>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">Agent 指浏览器执行节点。量小指定单个即可，量大可编排到多个节点并行。</p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="执行方式">
+              {EXECUTION_METHODS.map(item => {
+                const Icon = item.icon
+                const selected = method === item.value
+                return (
+                  <button key={item.value} type="button" role="radio" aria-checked={selected} onClick={() => setMethod(item.value)}
+                    className={`min-h-36 rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${selected ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}><Icon className="h-5 w-5" /></span>
+                      <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>
+                    </div>
+                    <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
+                    <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{item.description}</p>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {step === 'agents' && (
+          <div className="mx-auto max-w-2xl">
+            <div className="mb-4">
+              <h3 className="text-base font-bold">{method === 'multi' ? '选择参与编排的节点' : '选择一个执行节点'}</h3>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">
+                {method === 'multi'
+                  ? '可多选；关键词会在下一步按规则均分给这些节点。'
+                  : '任务会绑定到具体浏览器扩展。离线 Agent 仍可接单，上线后自动领取。'}
+              </p>
+            </div>
+            <AgentPicker
+              agents={agents}
+              tasks={tasks}
+              mode={mode}
+              multiple={method === 'multi'}
+              selectedIds={selectedAgentIds}
+              onChange={setSelectedAgentIds}
+            />
+          </div>
+        )}
+
+        {step === 'configure' && (
+          selectedAgent ? (
+            <div className="mx-auto max-w-2xl">
+              {/* 步骤上下文摘要条：任务类型 · 执行方式 · 已选节点；可点击回退修改 */}
+              <div className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-border/70 bg-muted/35 px-3 py-2 text-xs text-muted-foreground">
+                <span className={`h-2 w-2 shrink-0 rounded-full ${selectedAgent.status === 'paused' ? 'bg-status-orange' : selectedAgent.online ? 'bg-status-green' : 'bg-muted-foreground/40'}`} aria-hidden="true" />
+                <span className="font-semibold text-foreground">{taskType === 'unattended_plan' ? '无人值守计划' : '关键词采集'}</span>
+                <span aria-hidden="true">·</span>
+                <span>单个节点</span>
+                <span aria-hidden="true">·</span>
+                <span className="min-w-0 truncate">{selectedAgent.host_label} › {selectedAgent.display_name}</span>
+                {!editingExisting && (
+                  <button type="button" onClick={goBack}
+                    className="ml-auto min-h-7 shrink-0 rounded-md px-2 text-[11px] font-semibold text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+                    返回修改
+                  </button>
+                )}
+              </div>
+              <AgentTaskCreator
+                key={`${selectedAgent.id}:${mode}:${editingExisting ? 'edit' : 'new'}`}
+                agent={selectedAgent}
+                writable={writable}
+                initialExecutionMode={mode}
+                forceOpen
+                editExistingInitially={editingExisting}
+                hideLauncher
+                lockExecutionMode
+                onCreated={async () => {
+                  await onCreated()
+                  onClose()
+                }}
+              />
+            </div>
+          ) : (
+            <div className="mx-auto max-w-2xl rounded-2xl border border-dashed border-border p-8 text-center">
+              <CircleOff className="mx-auto h-7 w-7 text-muted-foreground" />
+              <div className="mt-3 text-sm font-semibold">未找到目标 Agent</div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">该 Agent 可能已下线或被移除，请返回重新选择。</p>
+              <Button variant="outline" size="sm" onClick={goBack} className="mt-4">返回</Button>
+            </div>
+          )
+        )}
+      </div>
+
+      {step !== 'configure' && (
+        <footer className="shrink-0 border-t border-border bg-card px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">
+          <div className="mx-auto flex max-w-2xl items-center justify-between gap-3">
+            <Button type="button" variant="ghost" onClick={goBack}>{step === 'type' ? '取消' : '上一步'}</Button>
+            <Button type="button" onClick={goNext} disabled={nextDisabled} className="min-h-11 min-w-36">
+              {nextLabel} <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        </footer>
+      )}
+    </Drawer>
+  )
+}

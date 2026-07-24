@@ -7,6 +7,7 @@ import { OpinionPage } from '@/pages/OpinionPage'
 import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
+import { DispatchPage } from '@/pages/dispatch/DispatchPage'
 import { InsightsPage } from '@/pages/InsightsPage'
 import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
 import { DataPage } from '@/pages/DataPage'
@@ -28,7 +29,8 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   overview: { eyebrow: 'Command Center', title: '指挥中心 · 态势驾驶舱' },
   opinion: { eyebrow: 'Opinion Handling', title: '舆情处理 · 工单' },
   workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
-  monitoring: { eyebrow: 'Monitoring & Capture', title: '监测与采集' },
+  monitoring: { eyebrow: 'Followed Creators', title: '关注博主' },
+  dispatch: { eyebrow: 'Dispatch Center', title: '调度中心' },
   salesleads: { eyebrow: 'Sales Leads', title: '销售客资' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
@@ -52,6 +54,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   opinion: OpinionPage,
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
+  dispatch: DispatchPage,
   salesleads: SalesLeadsPage,
   events: EventsPage,
   insights: InsightsPage,
@@ -113,16 +116,20 @@ export default function DesktopApp() {
       <main className={cn(
         'app-main min-w-0 flex-1 overflow-y-auto transition-[margin-left,margin-right] duration-200',
         collapsed ? 'lg:ml-0' : 'lg:ml-[240px]',
+        page === 'dispatch' && 'xl:overflow-hidden',
       )}>
         <TopBar
           eyebrow={config.eyebrow}
           title={pageTitle(page, params)}
-          badge={page === 'monitoring' ? 'BETA' : undefined}
+          badge={page === 'dispatch' ? 'BETA' : undefined}
           collapsed={collapsed}
           onToggleCollapse={toggleCollapse}
           onOpenMobileNavigation={() => setMobileNavigationOpen(true)}
         />
-        <div className="animate-fade-up px-3 pb-[max(2rem,env(safe-area-inset-bottom))] pt-4 sm:px-4 sm:pt-5 lg:px-6" key={`${page}:${seq}:${tenantId}`}>
+        <div className={cn(
+          'animate-fade-up px-3 pb-[max(2rem,env(safe-area-inset-bottom))] pt-4 sm:px-4 sm:pt-5 lg:px-6',
+          page === 'dispatch' && 'xl:h-[calc(100dvh-3.5rem)] xl:pb-0 xl:pr-0 xl:pt-0',
+        )} key={`${page}:${seq}:${tenantId}`}>
           {PageComponent ? <PageComponent /> : <ComingSoon pageId={page} />}
         </div>
       </main>

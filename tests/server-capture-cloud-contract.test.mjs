@@ -244,6 +244,40 @@ test("create command failures and successful stops settle orchestration work ite
   assert.match(completion, /SELECT id, parent_task_id, status, error, metadata/u);
 });
 
+test("unattended plan deletion is a durable device command and clears the mirror only after acknowledgement", () => {
+  const deletion = readRouteSection(
+    "router.delete('/agents/:id/unattended-plan'",
+    "router.post('/tasks/:id/dismiss-attention'",
+  );
+  assert.match(deletion, /remoteUnattendedPlanDelete/u);
+  assert.match(
+    deletion,
+    /INSERT INTO capture_agent_commands[\s\S]*'create'[\s\S]*planOperation:\s*'delete'/u,
+  );
+  assert.match(
+    deletion,
+    /c\.payload->>'planOperation' = 'delete'[\s\S]*删除计划指令已存在/u,
+  );
+  assert.doesNotMatch(
+    deletion,
+    /UPDATE capture_agents[\s\S]*SET unattended_plan = '\{\}'::jsonb/u,
+    "the admin request must not hide a still-active device plan before receipt",
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  assert.match(
+    completion,
+    /createPlanOperation === 'delete'[\s\S]*设备已停止并删除无人值守计划/u,
+  );
+  assert.match(
+    completion,
+    /success[\s\S]*createPlanOperation === 'delete'[\s\S]*UPDATE capture_agents[\s\S]*unattended_plan = '\{\}'::jsonb/u,
+  );
+});
+
 test("stop before device receipt immediately cancels orchestration items", () => {
   const stopRoute = readRouteSection(
     "router.post('/tasks/:id/stop'",

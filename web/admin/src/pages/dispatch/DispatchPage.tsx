@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Activity, AlertTriangle, Archive, Bot, CalendarClock, CheckCircle2, ClipboardList,
+  Archive, CheckCircle2, ClipboardList,
   History, ListChecks, Loader2, Plus, RefreshCw,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -15,6 +15,7 @@ import { CreateTaskDrawer } from './cloud-tasks/CreateTaskDrawer'
 import { PlansView } from './cloud-tasks/PlansView'
 import { TaskCard } from './cloud-tasks/TaskCard'
 import type {
+  CloudAgent,
   CloudTask,
   ComposerIntent,
   Overview,
@@ -24,6 +25,7 @@ import {
   ACTIVE_TASK_STATUSES,
   canDismissAttention,
   hasConfiguredUnattendedPlan,
+  isPendingUnattendedPlanDeleteTask,
   isAttentionTask,
   isBusinessVisibleTask,
 } from './cloud-tasks/lib'
@@ -34,7 +36,7 @@ function isScheduleTemplateTask(task: CloudTask) {
   return task.task_type === 'capture_orchestration' && task.metadata?.orchestrationTemplate === true
 }
 
-export function CloudTasksTab() {
+export function DispatchPage() {
   const { canWrite } = useAuth()
   const [overview, setOverview] = useState<Overview | null>(null)
   const [loading, setLoading] = useState(true)
@@ -43,9 +45,11 @@ export function CloudTasksTab() {
   const [feedback, setFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [actionTaskId, setActionTaskId] = useState('')
+  const [planActionAgentId, setPlanActionAgentId] = useState('')
   const [taskView, setTaskView] = useState<TaskView>('active')
   const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(null)
   const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)
+  const [orchestrationInitialAgentIds, setOrchestrationInitialAgentIds] = useState<string[]>([])
   const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(null)
   const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
   const loadGeneration = useRef(0)
@@ -180,6 +184,12 @@ export function CloudTasksTab() {
     [overview?.agents],
   )
   const plansCount = scheduleTemplates.length + configuredPlanAgentCount
+  const pendingPlanDeleteAgentIds = useMemo(() => new Set(
+    (overview?.tasks || [])
+      .filter(isPendingUnattendedPlanDeleteTask)
+      .map(task => task.assigned_agent_id || task.origin_agent_id || '')
+      .filter(Boolean),
+  ), [overview?.tasks])
 
   const dismissibleAttentionCount = useMemo(
     () => queueTasks.filter(canDismissAttention).length,
@@ -250,49 +260,56 @@ export function CloudTasksTab() {
     }
   }
 
+  const deleteUnattendedPlan = async (agent: CloudAgent) => {
+    const name = agent.display_name || '当前 Agent'
+    if (!window.confirm(
+      `确定删除“${name}”的无人值守计划吗？设备收到指令后会停止该计划及其正在执行的本地任务；历史任务和已采集结果会保留。`,
+    )) return
+
+    setPlanActionAgentId(agent.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.delete<{ message?: string }>(
+        `/capture-cloud/agents/${agent.id}/unattended-plan`,
+      )
+      setFeedback(result.message || '删除计划指令已下发')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '删除无人值守计划失败')
+    } finally {
+      setPlanActionAgentId('')
+    }
+  }
+
   if (loading && !overview) {
     return <div className="flex justify-center py-24"><Loader2 className="h-7 w-7 animate-spin text-primary" /></div>
   }
 
-  const summary = overview?.summary || { agents: 0, onlineAgents: 0, runningTasks: 0, attentionTasks: 0 }
-
   return (
-    <div className="space-y-5">
-      <section className="overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm">
-        <div className="flex flex-col gap-3 px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="min-w-0">
-            <h2 className="text-xl font-bold text-foreground">任务调度台</h2>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">把采集任务分配给 Agent（浏览器节点），持续跟踪执行、需处理与定期计划。</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
-              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
-            </Button>
-            <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建任务">
-              <Plus className="h-4 w-4" /> 新建任务
-            </Button>
-          </div>
-        </div>
-        <div className="grid grid-cols-2 border-t border-border/60 lg:grid-cols-4">
-          <SummaryStat label="Agent 在线/总数" value={`${summary.onlineAgents} / ${summary.agents}`} icon={Bot} tone="green" />
-          <SummaryStat label="执行中" value={taskCounts.active} icon={Activity} tone="blue" selected={taskView === 'active'} onClick={() => setTaskView('active')} />
-          <SummaryStat label="需处理" value={taskCounts.attention} icon={AlertTriangle} tone={taskCounts.attention ? 'red' : 'default'} selected={taskView === 'attention'} onClick={() => setTaskView('attention')} />
-          <SummaryStat label="计划" value={plansCount} icon={CalendarClock} tone="default" selected={taskView === 'plans'} onClick={() => setTaskView('plans')} />
-        </div>
-      </section>
-
+    <div className="space-y-5 xl:h-full">
       {error && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{error}</div>}
       {actionError && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{actionError}</div>}
       {feedback && <div role="status" aria-live="polite" className="rounded-xl border border-primary/20 bg-primary/8 px-4 py-3 text-sm text-primary">{feedback}</div>}
 
-      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.5fr)_minmax(320px,0.72fr)]">
-        <section className="min-w-0">
-          <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <div className="flex items-center gap-2"><ListChecks className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">任务队列</h3></div>
-              <p className="mt-1 text-xs text-muted-foreground">{taskView === 'plans' ? '集中管理多 Agent 编排模板与各设备的无人值守计划' : '按创建时间倒序，新任务在最前'}</p>
+      <div className="grid items-stretch gap-5 xl:h-full xl:min-h-[36rem] xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)] xl:gap-0 xl:overflow-hidden">
+        <section className="flex min-h-0 min-w-0 flex-col xl:py-5 xl:pr-5">
+          <div className="mb-3 shrink-0 space-y-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2"><ListChecks className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">任务队列</h3></div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">{taskView === 'plans' ? '集中管理多 Agent 编排模板与各设备的无人值守计划' : '按创建时间倒序，新任务在最前'}</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
+                  <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
+                </Button>
+              <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建任务">
+                <Plus className="h-4 w-4" /> 新建任务
+              </Button>
             </div>
-            <div className="flex rounded-xl border border-border bg-card p-1" role="tablist" aria-label="任务分组">
+            </div>
+            <div className="mobile-table-scroll inline-flex max-w-full overflow-x-auto rounded-xl border border-border bg-card p-1" role="tablist" aria-label="任务分组">
               {([
                 { value: 'active' as const, label: '执行中', count: taskCounts.active },
                 { value: 'attention' as const, label: '需处理', count: taskCounts.attention },
@@ -300,71 +317,72 @@ export function CloudTasksTab() {
                 { value: 'history' as const, label: '历史', count: taskCounts.history },
               ]).map(item => (
                 <button key={item.value} type="button" role="tab" aria-selected={taskView === item.value} onClick={() => setTaskView(item.value)}
-                  className={`min-h-9 rounded-lg px-3 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${taskView === item.value ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
+                  className={`min-h-9 shrink-0 rounded-lg px-3 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${taskView === item.value ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
                   {item.label} <span className="ml-1 tabular-nums opacity-80">{item.count}</span>
                 </button>
               ))}
             </div>
           </div>
 
-          {taskView === 'plans' ? (
-            <PlansView
-              templates={scheduleTemplates}
-              agents={overview?.agents || []}
-              writable={canWrite()}
-              onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
-              onEditPlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan', editExisting: true })}
-            />
-          ) : (
-            <>
-              {taskView === 'attention' && dismissibleAttentionCount > 0 && (
-                <div className="mb-3 flex flex-col gap-3 rounded-xl border border-border/70 bg-muted/35 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-xs leading-5 text-muted-foreground">失败和部分失败已经结束，可移到历史；中断和需要人工处理的任务会继续保留。</p>
-                  <Button variant="outline" size="sm" onClick={() => void dismissTerminalAttention()} disabled={!canWrite() || actionTaskId === 'bulk-dismiss-attention'} className="shrink-0">
-                    {actionTaskId === 'bulk-dismiss-attention' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
-                    清理已结束失败项
-                  </Button>
-                </div>
-              )}
+          <div className="workspace-scrollbar min-h-0 flex-1 xl:overflow-y-auto xl:overscroll-contain xl:pb-4 xl:pr-2">
+            {taskView === 'plans' ? (
+              <PlansView
+                templates={scheduleTemplates}
+                agents={overview?.agents || []}
+                writable={canWrite()}
+                onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
+                onEditPlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan', editExisting: true })}
+                onDeletePlan={agent => void deleteUnattendedPlan(agent)}
+                deletingAgentId={planActionAgentId}
+                pendingDeleteAgentIds={pendingPlanDeleteAgentIds}
+              />
+            ) : (
+              <>
+                {taskView === 'attention' && dismissibleAttentionCount > 0 && (
+                  <div className="mb-3 flex flex-col gap-3 rounded-xl border border-border/70 bg-muted/35 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-xs leading-5 text-muted-foreground">失败和部分失败已经结束，可移到历史；中断和需要人工处理的任务会继续保留。</p>
+                    <Button variant="outline" size="sm" onClick={() => void dismissTerminalAttention()} disabled={!canWrite() || actionTaskId === 'bulk-dismiss-attention'} className="shrink-0">
+                      {actionTaskId === 'bulk-dismiss-attention' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
+                      清理已结束失败项
+                    </Button>
+                  </div>
+                )}
 
-              {visibleTasks.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-12 text-center">
-                  {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
-                  <div className="mt-3 text-sm font-semibold">{taskView === 'active' ? '当前没有执行中或排队中的任务' : taskView === 'attention' ? '当前没有需要人工处理的任务' : '最近任务中还没有历史记录'}</div>
-                  <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">{taskView === 'active' ? '新建任务后分配给 Agent；Agent 离线时任务会保留在云端队列，上线后自动领取。' : taskView === 'attention' ? '中断、失败和部分失败会集中出现在这里。' : '已完成、已停止和已跳过的任务会进入历史。'}</p>
-                  {taskView === 'active' && canWrite() && (
-                    <div className="mt-4 flex justify-center">
-                      <Button size="sm" onClick={() => setComposerIntent({})}><Plus className="h-4 w-4" /> 新建任务</Button>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {visibleTasks.map(task => (
-                    <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
-                      onDismissAttention={dismissAttention}
-                      onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
-                  ))}
-                </div>
-              )}
-            </>
-          )}
+                {visibleTasks.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-12 text-center xl:flex xl:h-full xl:min-h-[22rem] xl:flex-col xl:justify-center">
+                    {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
+                    <div className="mt-3 text-sm font-semibold">{taskView === 'active' ? '当前没有执行中或排队中的任务' : taskView === 'attention' ? '当前没有需要人工处理的任务' : '最近任务中还没有历史记录'}</div>
+                    <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">{taskView === 'active' ? '新建任务后分配给 Agent；Agent 离线时任务会保留在云端队列，上线后自动领取。' : taskView === 'attention' ? '中断、失败和部分失败会集中出现在这里。' : '已完成、已停止和已跳过的任务会进入历史。'}</p>
+                    {taskView === 'active' && canWrite() && (
+                      <div className="mt-4 flex justify-center">
+                        <Button size="sm" onClick={() => setComposerIntent({})}><Plus className="h-4 w-4" /> 新建任务</Button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {visibleTasks.map(task => (
+                      <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
+                        onDismissAttention={dismissAttention}
+                        onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </section>
 
-        <aside className="min-w-0 xl:sticky xl:top-4">
-          <div className="mb-3 flex items-end justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">Agent 池</h3></div>
-              <p className="mt-1 text-xs text-muted-foreground">同一台电脑的多个浏览器会作为独立 Agent（浏览器节点）</p>
-            </div>
-            <span className="shrink-0 text-[11px] text-muted-foreground">2 分钟无心跳视为离线</span>
-          </div>
+        <aside className="flex min-h-0 min-w-0 flex-col xl:border-l xl:border-border/70 xl:py-5 xl:pl-5">
           <AgentRail
             agents={overview?.agents || []}
-            tasks={businessTasks}
+            tasks={overview?.tasks || []}
             writable={canWrite()}
             onAssign={agent => setComposerIntent({ agentId: agent.id })}
             onEditPlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan', editExisting: true })}
+            onCreatePlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan' })}
+            onDeletePlan={agent => void deleteUnattendedPlan(agent)}
+            deletingPlanAgentId={planActionAgentId}
             onSaved={() => load(true)}
           />
         </aside>
@@ -373,8 +391,9 @@ export function CloudTasksTab() {
       {composerIntent && (
         <CreateTaskDrawer agents={overview?.agents || []} tasks={businessTasks} writable={canWrite()} intent={composerIntent}
           onClose={() => setComposerIntent(null)}
-          onLaunchOrchestration={() => {
+          onLaunchOrchestration={agentIds => {
             setComposerIntent(null)
+            setOrchestrationInitialAgentIds(agentIds)
             setOrchestrationComposerOpen(true)
           }}
           onCreated={async () => {
@@ -387,6 +406,7 @@ export function CloudTasksTab() {
         open={orchestrationComposerOpen}
         writable={canWrite()}
         agents={overview?.agents || []}
+        initialAgentIds={orchestrationInitialAgentIds}
         onClose={closeOrchestrationComposer}
         onChanged={async () => {
           setOrchestrationRefreshKey(value => value + 1)
@@ -424,15 +444,4 @@ export function CloudTasksTab() {
       )}
     </div>
   )
-}
-
-function SummaryStat({ label, value, icon: Icon, tone = 'default', selected = false, onClick }: { label: string; value: React.ReactNode; icon: React.ElementType; tone?: 'default' | 'green' | 'blue' | 'red'; selected?: boolean; onClick?: () => void }) {
-  const colors = { default: 'text-foreground', green: 'text-status-green', blue: 'text-primary', red: 'text-status-red' }
-  const content = (
-    <>
-      <Icon className={`h-5 w-5 ${colors[tone]}`} /><div><div className={`text-lg font-bold tabular-nums ${colors[tone]}`}>{value}</div><div className="text-[11px] text-muted-foreground">{label}</div></div>
-    </>
-  )
-  if (onClick) return <button type="button" onClick={onClick} aria-pressed={selected} className={`flex min-h-16 items-center gap-3 border-b border-r border-border/60 px-4 py-3.5 text-left transition-colors last:border-r-0 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary lg:border-b-0 ${selected ? 'bg-primary/[0.045]' : ''}`}>{content}</button>
-  return <div className="flex min-h-16 items-center gap-3 border-b border-r border-border/60 px-4 py-3.5 last:border-r-0 lg:border-b-0">{content}</div>
 }

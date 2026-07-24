@@ -1472,6 +1472,56 @@ test("a cloud unattended-plan command saves the schedule without opening a runne
   );
 });
 
+test("a cloud unattended-plan delete command clears the local schedule without clearing task history", async () => {
+  const harness = createHarness();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    platform: "douyin",
+    keywords: ["待删除计划"],
+    nextRunAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+  });
+  harness.storage["onstarvoice.taskLedger"] = {
+    version: 1,
+    runs: [{id: "historical-run", status: "completed"}],
+  };
+
+  const result = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-plan-delete-1",
+      command_type: "create",
+      client_task_id: "cloud-plan-delete-1",
+      platform: "douyin",
+      payload: {
+        executionMode: "unattended_plan",
+        planOperation: "delete",
+        clientTaskId: "cloud-plan-delete-1",
+        platform: "douyin",
+        planSnapshot: {
+          configured: false,
+          enabled: false,
+          platform: "douyin",
+          keywords: [],
+        },
+      },
+    },
+    "agent-token",
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.storage[UNATTENDED_PLAN_KEY], undefined);
+  assert.equal(harness.storage["onstarvoice.taskLedger"].runs.length, 1);
+  assert.equal(harness.storage["onstarvoice.taskLedger"].runs[0].id, "historical-run");
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.reason,
+    "plan_deleted",
+  );
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.requestId,
+    "cloud-plan-delete-1",
+  );
+});
+
 test("a cloud stop command cancels only its exact active request", async () => {
   const harness = createHarness();
   const futureAlarm = new Date(Date.now() + 60 * 60 * 1000).toISOString();

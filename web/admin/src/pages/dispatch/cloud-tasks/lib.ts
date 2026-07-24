@@ -18,7 +18,7 @@ export type UnattendedPlan = {
   mode?: string
   startTime?: string
   randomOffsetMin?: number
-  customDates?: string
+  customDates?: string | string[]
   keywords?: string[]
   keywordCount?: number
   searchFilters?: {
@@ -144,6 +144,12 @@ export const STATUS_LABELS: Record<string, string> = {
   canceled: '已取消',
   skipped: '已跳过',
   superseded: '已转入恢复任务',
+  // 编排任务/工作项专属状态（编排详情使用，普通任务不会出现）
+  draft: '草稿',
+  assigned: '已分配',
+  dispatch_pending: '等待下发',
+  dispatched: '已下发',
+  retryable: '等待重试',
 }
 
 export const PLAN_MODE_LABELS: Record<string, string> = {
@@ -186,8 +192,9 @@ export function normalizeCloudTaskDate(value = '') {
   return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
 }
 
-export function normalizeCloudTaskDateList(value = '') {
-  const sourceDates = String(value).split(/[\s,，;；]+/g).map(item => item.trim()).filter(Boolean)
+export function normalizeCloudTaskDateList(value: unknown = '') {
+  const source = Array.isArray(value) ? value.join('\n') : String(value ?? '')
+  const sourceDates = source.split(/[\s,，;；]+/g).map(item => item.trim()).filter(Boolean)
   const normalizedDates = sourceDates.map(sourceDate => ({
     sourceDate,
     normalizedDate: normalizeCloudTaskDate(sourceDate),
@@ -197,6 +204,44 @@ export function normalizeCloudTaskDateList(value = '') {
     dates: Array.from(new Set(normalizedDates.map(item => item.normalizedDate).filter(Boolean))),
     invalidDates: normalizedDates.filter(item => !item.normalizedDate).map(item => item.sourceDate),
   }
+}
+
+function localDateKey(date: Date) {
+  return [
+    String(date.getFullYear()).padStart(4, '0'),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-')
+}
+
+export function unattendedPlanDates(plan?: UnattendedPlan | null) {
+  if (!plan || String(plan.mode || '') !== 'custom_dates') return []
+  return normalizeCloudTaskDateList(plan.customDates).dates.slice().sort()
+}
+
+export function isUnattendedPlanEnded(
+  plan?: UnattendedPlan | null,
+  reference = new Date(),
+) {
+  if (!hasConfiguredUnattendedPlan(plan) || String(plan?.mode || '') !== 'custom_dates') {
+    return false
+  }
+
+  const nextRunAt = Date.parse(String(plan?.nextRunAt || ''))
+  if (Number.isFinite(nextRunAt) && nextRunAt > reference.getTime()) return false
+
+  const dates = unattendedPlanDates(plan)
+  if (dates.length === 0) return false
+  const today = localDateKey(reference)
+  const latestDate = dates[dates.length - 1]
+  if (latestDate < today) return true
+  if (latestDate > today) return false
+
+  const timeMatch = String(plan?.startTime || '').match(/^(\d{1,2}):(\d{2})$/)
+  if (!timeMatch) return false
+  const scheduled = new Date(reference)
+  scheduled.setHours(Number(timeMatch[1]), Number(timeMatch[2]), 0, 0)
+  return reference.getTime() > scheduled.getTime()
 }
 
 export function formatTime(value?: string | null) {
@@ -311,6 +356,12 @@ export function isBusinessVisibleTask(task: CloudTask) {
   // 被恢复任务接替的旧记录保留在服务端审计中，不再作为一条独立业务任务重复展示。
   if (task.status === 'superseded') return false
   return true
+}
+
+export function isPendingUnattendedPlanDeleteTask(task: CloudTask) {
+  return task.task_type === 'unattended_plan_configuration' &&
+    task.metadata?.planOperation === 'delete' &&
+    ['pending', 'claimed'].includes(task.status)
 }
 
 export function taskBelongsToAgent(task: CloudTask, agent: CloudAgent) {

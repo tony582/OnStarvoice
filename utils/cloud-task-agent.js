@@ -223,6 +223,7 @@
           remoteTaskCreate: true,
           remoteStop: true,
           remoteUnattendedPlanWrite: true,
+          remoteUnattendedPlanDelete: true,
           remoteTaskEnhancementOptions: true,
           remoteTaskKeywordPostLimit: true,
           unattendedPlanMirror: true,

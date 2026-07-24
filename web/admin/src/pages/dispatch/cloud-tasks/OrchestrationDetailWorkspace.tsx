@@ -28,11 +28,8 @@ import type {
   OrchestrationExecutionRecord,
   OrchestrationItemRecord,
 } from './types'
-
-const PLATFORM_LABELS: Record<string, string> = {
-  xiaohongshu: '小红书',
-  douyin: '抖音',
-}
+// 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
+import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -45,27 +42,6 @@ const PUBLISH_TIME_LABELS: Record<string, string> = {
   day: '一天内',
   week: '一周内',
   halfyear: '半年内',
-}
-
-const STATUS_LABELS: Record<string, string> = {
-  draft: '草稿',
-  pending: '等待领取',
-  assigned: '已分配',
-  dispatch_pending: '等待下发',
-  dispatched: '已下发',
-  waiting_device: '等待设备',
-  claimed: '已领取',
-  running: '执行中',
-  recovering: '恢复中',
-  retryable: '等待重试',
-  needs_action: '需要处理',
-  completed: '已完成',
-  completed_with_warnings: '完成有警告',
-  completed_with_failures: '部分失败',
-  failed: '失败',
-  interrupted: '已中断',
-  canceled: '已停止',
-  skipped: '已跳过',
 }
 
 const SUCCESS_ITEM_STATUSES = new Set(['completed', 'completed_with_warnings'])
@@ -104,19 +80,6 @@ function statusTone(status?: string) {
   if (['completed', 'completed_with_warnings'].includes(value)) return 'border-status-green/25 bg-status-green/8 text-status-green'
   if (ACTIVE_STATUSES.has(value)) return 'border-primary/25 bg-primary/8 text-primary'
   return 'border-border bg-muted text-muted-foreground'
-}
-
-function formatTime(value?: string | null) {
-  if (!value) return '—'
-  const date = new Date(value)
-  if (!Number.isFinite(date.getTime())) return '—'
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
 }
 
 function keywordForItem(item: OrchestrationItemRecord) {

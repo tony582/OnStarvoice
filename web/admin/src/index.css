@@ -208,6 +208,24 @@ body::before {
 ::-webkit-scrollbar-thumb { background: var(--muted-fg); border-radius: 99px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--fg); }
 
+/* 调度工作区采用低存在感滚动条：保持可发现，但不与内容竞争。 */
+.workspace-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--muted-fg) 24%, transparent) transparent;
+}
+.workspace-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+.workspace-scrollbar::-webkit-scrollbar-track { background: transparent; }
+.workspace-scrollbar::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted-fg) 24%, transparent);
+  background-clip: padding-box;
+}
+.workspace-scrollbar:hover::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted-fg) 42%, transparent);
+  background-clip: padding-box;
+}
+
 /* ── Page transitions ─────────────────────── */
 @keyframes fadeUp {
   from { opacity: 0; transform: translateY(12px); }

@@ -49,11 +49,15 @@ test('overview returns parent business tasks without exposing orchestration chil
 });
 
 test('production task center exposes real multi-Agent compose and detail flows', async () => {
-  const [page, composer, detail] = await Promise.all([
-    read('web/admin/src/pages/monitoring/CloudTasksTab.tsx'),
-    read('web/admin/src/pages/monitoring/cloud-tasks/OrchestrationComposerDrawer.tsx'),
-    read('web/admin/src/pages/monitoring/cloud-tasks/OrchestrationDetailWorkspace.tsx'),
+  const [dispatchPage, taskCard, plansView, taskLib, composer, detail] = await Promise.all([
+    read('web/admin/src/pages/dispatch/DispatchPage.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/PlansView.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/lib.ts'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationDetailWorkspace.tsx'),
   ]);
+  const page = [dispatchPage, taskCard, plansView, taskLib].join('\n');
 
   assert.match(page, /OrchestrationComposerDrawer/u);
   assert.match(page, /OrchestrationDetailWorkspace/u);

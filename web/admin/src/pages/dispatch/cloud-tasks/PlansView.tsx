@@ -1,4 +1,4 @@
-import { Bot, CalendarClock, Network } from 'lucide-react'
+import { Bot, CalendarClock, Loader2, Network, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import type { CloudAgent, CloudTask } from './lib'
 import {
@@ -7,7 +7,9 @@ import {
   STATUS_LABELS,
   formatTime,
   hasConfiguredUnattendedPlan,
+  isUnattendedPlanEnded,
   safeNumber,
+  unattendedPlanDates,
 } from './lib'
 
 // 「计划」视图集中呈现所有定期任务：多 Agent 无人值守编排模板 + 各设备本地无人值守计划。
@@ -18,12 +20,18 @@ export function PlansView({
   writable,
   onOpenOrchestration,
   onEditPlan,
+  onDeletePlan,
+  deletingAgentId = '',
+  pendingDeleteAgentIds,
 }: {
   templates: CloudTask[]
   agents: CloudAgent[]
   writable: boolean
   onOpenOrchestration: (task: CloudTask) => void
   onEditPlan: (agent: CloudAgent) => void
+  onDeletePlan: (agent: CloudAgent) => void
+  deletingAgentId?: string
+  pendingDeleteAgentIds: Set<string>
 }) {
   const planAgents = agents.filter(agent => hasConfiguredUnattendedPlan(agent.unattended_plan))
 
@@ -65,6 +73,8 @@ export function PlansView({
                 agent={agent}
                 writable={writable}
                 onEditPlan={onEditPlan}
+                onDeletePlan={onDeletePlan}
+                deleting={deletingAgentId === agent.id || pendingDeleteAgentIds.has(agent.id)}
               />
             ))}
           </div>
@@ -130,7 +140,7 @@ function TemplateCard({
   const revision = safeNumber(task.orchestration_revision)
 
   return (
-    <div className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
+    <div className="rounded-2xl border border-l-2 border-border/70 border-l-primary/40 bg-card p-4 shadow-xs">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -160,10 +170,14 @@ function AgentPlanCard({
   agent,
   writable,
   onEditPlan,
+  onDeletePlan,
+  deleting,
 }: {
   agent: CloudAgent
   writable: boolean
   onEditPlan: (agent: CloudAgent) => void
+  onDeletePlan: (agent: CloudAgent) => void
+  deleting: boolean
 }) {
   const plan = agent.unattended_plan
   if (!plan) return null
@@ -175,21 +189,40 @@ function AgentPlanCard({
   const platformLabel = PLATFORM_LABELS[plan.platform || 'unknown'] || plan.platform || '未设置'
   const mode = PLAN_MODE_LABELS[String(plan.mode || '')] || String(plan.mode || '本地设置')
   const lastRunStatus = STATUS_LABELS[String(plan.lastRunStatus || '')] || String(plan.lastRunStatus || '')
-
-  const points = [
-    `平台 ${platformLabel}`,
-    `关键词 ${keywordCount} 个`,
-    plan.enabled ? `执行 ${mode}${plan.startTime ? ` ${plan.startTime}` : ''}` : '当前不自动执行',
-    `下次运行 ${formatTime(plan.nextRunAt)}`,
-    `上次运行 ${formatTime(plan.lastRunAt)}${lastRunStatus ? ` · ${lastRunStatus}` : ''}`,
-  ]
-
-  const canEditPlan = writable && agent.capabilities?.remoteUnattendedPlanWrite === true
+  const customDates = unattendedPlanDates(plan)
+  const ended = isUnattendedPlanEnded(plan)
+  const canEditPlan = writable &&
+    agent.capabilities?.remoteUnattendedPlanWrite === true &&
+    !deleting
+  const canDeletePlan = writable &&
+    agent.capabilities?.remoteUnattendedPlanDelete === true &&
+    !deleting
   const editBlockTitle = !writable
     ? '只读模式下无法编辑计划'
+    : deleting
+      ? '删除指令正在等待设备确认'
     : agent.capabilities?.remoteUnattendedPlanWrite === true
       ? undefined
       : '当前客户端扩展版本不支持云端无人值守计划，升级后可编辑'
+  const deleteBlockTitle = !writable
+    ? '只读模式下无法删除计划'
+    : deleting
+      ? '删除指令正在等待设备确认'
+      : agent.capabilities?.remoteUnattendedPlanDelete === true
+        ? undefined
+        : '需要更新 Extension 后才能安全删除设备本地计划'
+  const stateLabel = deleting
+    ? '删除中'
+    : ended
+      ? '已结束'
+      : plan.enabled
+        ? '已启用'
+        : '未启用'
+  const stateClassName = deleting
+    ? 'bg-primary/10 text-primary'
+    : plan.enabled && !ended
+      ? 'bg-status-green/10 text-status-green'
+      : 'bg-muted text-muted-foreground'
 
   return (
     <div className="rounded-2xl border border-border/70 bg-card p-4 shadow-xs">
@@ -199,26 +232,57 @@ function AgentPlanCard({
             <h4 className="truncate text-[14px] font-semibold text-foreground">
               {agent.display_name || 'Agent'}
             </h4>
-            <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${plan.enabled ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}>
-              {plan.enabled ? '已启用' : '未启用'}
+            <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${stateClassName}`}>
+              {stateLabel}
             </span>
           </div>
-          <div className="mt-0.5 text-[12px] text-muted-foreground">
-            设备 {agent.host_label || '未命名设备'}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span title={editBlockTitle}>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!canEditPlan}
+              onClick={() => onEditPlan(agent)}
+            >
+              编辑计划
+            </Button>
+          </span>
+          <span title={deleteBlockTitle}>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!canDeletePlan}
+              onClick={() => onDeletePlan(agent)}
+              className="text-status-red hover:bg-status-red/8 hover:text-status-red"
+            >
+              {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+              {deleting ? '删除中' : '删除计划'}
+            </Button>
+          </span>
+        </div>
+      </div>
+      <div className="mt-3 grid gap-x-5 gap-y-1 text-[12px] leading-5 text-muted-foreground sm:grid-cols-2">
+        <div>平台 <span className="text-foreground">{platformLabel}</span></div>
+        <div>执行 <span className="text-foreground">{ended ? `${mode} · 已结束` : plan.enabled ? `${mode}${plan.startTime ? ` · ${plan.startTime}` : ''}` : '当前不自动执行'}</span></div>
+        {customDates.length > 0 && (
+          <div className="sm:col-span-2">运行日期 <span className="text-foreground">{customDates.join('、')}</span></div>
+        )}
+        <div>下次运行 <span className="text-foreground">{ended ? '无后续排期' : formatTime(plan.nextRunAt)}</span></div>
+        <div>上次运行 <span className="text-foreground">{formatTime(plan.lastRunAt)}{lastRunStatus ? ` · ${lastRunStatus}` : ''}</span></div>
+      </div>
+      {keywords.length > 0 && (
+        <div className="mt-3 border-t border-border/60 pt-3">
+          <div className="mb-1.5 text-[11px] text-muted-foreground">关键词（{keywordCount}）</div>
+          <div className="flex flex-wrap gap-1.5">
+            {keywords.map(keyword => (
+              <span key={keyword} className="max-w-full truncate rounded-md bg-muted px-2 py-1 text-[11px] text-muted-foreground">
+                {keyword}
+              </span>
+            ))}
           </div>
         </div>
-        <span title={editBlockTitle}>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!canEditPlan}
-            onClick={() => onEditPlan(agent)}
-          >
-            编辑计划
-          </Button>
-        </span>
-      </div>
-      <p className="mt-2 text-[12px] leading-5 text-muted-foreground">{points.join(' · ')}</p>
+      )}
     </div>
   )
 }

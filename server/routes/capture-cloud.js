@@ -80,6 +80,17 @@ function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
+function hasConfiguredAgentPlan(value) {
+  const plan = safeJson(value);
+  const keywords = Array.isArray(plan.keywords)
+    ? plan.keywords.map(keyword => text(keyword, 120)).filter(Boolean)
+    : [];
+  return plan.configured === true ||
+    plan.enabled === true ||
+    keywords.length > 0 ||
+    Boolean(text(plan.updatedAt, 100));
+}
+
 function remoteTaskRequestHash(agentId, title, executionMode, planSnapshot) {
   const plan = safeJson(planSnapshot);
   const executionPlan = {
@@ -1900,6 +1911,11 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       const createExecutionMode = command.payload?.executionMode === 'unattended_plan'
         ? 'unattended_plan'
         : 'one_time';
+      const createPlanOperation =
+        createExecutionMode === 'unattended_plan' &&
+        command.payload?.planOperation === 'delete'
+          ? 'delete'
+          : 'save';
       let expectedCreateRequestId = '';
       let allowLateCreateSuccess = false;
       if (command.command_type === 'create' && success) {
@@ -1977,7 +1993,9 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           : 'needs_action';
         eventMessage = success
           ? createExecutionMode === 'unattended_plan'
-            ? '设备已保存并启用无人值守计划'
+            ? createPlanOperation === 'delete'
+              ? '设备已停止并删除无人值守计划'
+              : '设备已保存并启用无人值守计划'
             : '设备已创建本地任务，等待开始执行'
           : text(resultPayload.message || '设备未能创建云端下发任务', 2000);
         updatedTask = await tx.queryOne(`
@@ -2032,7 +2050,12 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
             createCompletedAt: new Date().toISOString(),
             executionMode: createExecutionMode,
             ...(createExecutionMode === 'unattended_plan'
-              ? {planAppliedAt: new Date().toISOString()}
+              ? createPlanOperation === 'delete'
+                ? {
+                    planOperation: 'delete',
+                    planDeletedAt: new Date().toISOString(),
+                  }
+                : {planAppliedAt: new Date().toISOString()}
               : {localRequestId: expectedRequestId}),
           } : {
             createFailedAt: new Date().toISOString(),
@@ -2044,6 +2067,19 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           command.id,
           createExecutionMode,
         ]);
+        if (
+          success &&
+          createExecutionMode === 'unattended_plan' &&
+          createPlanOperation === 'delete'
+        ) {
+          await tx.execute(`
+            UPDATE capture_agents
+            SET unattended_plan = '{}'::jsonb,
+              unattended_plan_updated_at = now(),
+              updated_at = now()
+            WHERE id = $1 AND tenant_id = $2
+          `, [req.captureAgent.id, req.tenantId]);
+        }
       } else if (command.command_type === 'resume') {
         // A manual continuation creates a new local root request. The interrupted
         // cloud mirror is therefore superseded instead of pretending that the old
@@ -2126,6 +2162,9 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           commandType: command.command_type,
           recoveryTaskId: text(resultPayload.requestId, 240),
           requestId: text(resultPayload.requestId, 240),
+          ...(command.command_type === 'create'
+            ? {planOperation: createPlanOperation}
+            : {}),
         },
       });
       if (updatedTask?.parent_task_id && command.command_type === 'create') {
@@ -2900,6 +2939,293 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
           : online
             ? '一次性任务已创建，在线设备将在下一次心跳领取'
             : '一次性任务已创建，设备当前离线，上线后自动领取',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.delete('/agents/:id/unattended-plan', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const result = await withTransaction(async tx => {
+      const agent = await tx.queryOne(`
+        SELECT ca.*, tenant.status AS tenant_status,
+          ac.status AS auth_code_status,
+          ac.expires_at AS auth_code_expires_at,
+          ab.id AS active_auth_binding_id
+        FROM capture_agents ca
+        JOIN tenants tenant ON tenant.id = ca.tenant_id
+        LEFT JOIN auth_codes ac
+          ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+        LEFT JOIN auth_bindings ab
+          ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        WHERE ca.id = $1 AND ca.tenant_id = $2
+        FOR UPDATE OF ca
+      `, [req.params.id, req.tenantId]);
+      if (!agent) return {error: 'agent_not_found'};
+
+      const authCodeExpired = agent.auth_code_expires_at &&
+        new Date(agent.auth_code_expires_at) < new Date();
+      if (
+        agent.tenant_status !== 'active' ||
+        agent.status !== 'active' ||
+        agent.auth_code_status !== 'active' ||
+        !agent.active_auth_binding_id ||
+        authCodeExpired
+      ) {
+        return {error: 'agent_unavailable'};
+      }
+
+      const capabilities = safeJson(agent.capabilities);
+      if (
+        capabilities.remoteTaskCreate !== true ||
+        capabilities.remoteUnattendedPlanWrite !== true ||
+        capabilities.remoteUnattendedPlanDelete !== true
+      ) {
+        return {error: 'agent_plan_delete_capability_missing'};
+      }
+
+      const existing = await tx.queryOne(`
+        SELECT t.id, t.status, t.created_at,
+          c.id AS command_id, c.status AS command_status,
+          c.expires_at AS command_expires_at
+        FROM capture_tasks t
+        JOIN capture_agent_commands c
+          ON c.task_id = t.id AND c.tenant_id = t.tenant_id
+        WHERE t.tenant_id = $1
+          AND c.agent_id = $2
+          AND c.command_type = 'create'
+          AND c.status IN ('pending', 'acknowledged')
+          AND c.payload->>'executionMode' = 'unattended_plan'
+          AND c.payload->>'planOperation' = 'delete'
+        ORDER BY c.created_at DESC
+        LIMIT 1
+        FOR UPDATE OF t
+      `, [req.tenantId, agent.id]);
+      if (existing) {
+        return {
+          agent,
+          task: existing,
+          command: {
+            id: existing.command_id,
+            status: existing.command_status,
+            expires_at: existing.command_expires_at,
+          },
+          existing: true,
+        };
+      }
+
+      const mirroredPlan = safeJson(agent.unattended_plan);
+      if (!hasConfiguredAgentPlan(mirroredPlan)) {
+        return {error: 'plan_not_found'};
+      }
+
+      const supportedPlatforms = normalizeCaptureAgentPlatforms(
+        capabilities.supportedPlatforms,
+      );
+      const allowedPlatforms = Array.isArray(agent.allowed_platforms)
+        ? agent.allowed_platforms
+        : [];
+      const platformCandidates = [
+        text(mirroredPlan.platform, 60),
+        ...allowedPlatforms,
+        ...supportedPlatforms,
+        'xiaohongshu',
+      ];
+      const platform = platformCandidates.find(candidate =>
+        ['xiaohongshu', 'douyin'].includes(candidate) &&
+        (allowedPlatforms.length === 0 || allowedPlatforms.includes(candidate)) &&
+        (supportedPlatforms.length === 0 || supportedPlatforms.includes(candidate)),
+      );
+      if (!platform) return {error: 'agent_platform_unsupported'};
+
+      const taskId = crypto.randomUUID();
+      const commandId = crypto.randomUUID();
+      const olderPlanCommands = await tx.queryAll(`
+        SELECT t.id AS task_id, c.id AS command_id
+        FROM capture_tasks t
+        JOIN capture_agent_commands c
+          ON c.task_id = t.id AND c.tenant_id = t.tenant_id
+        WHERE t.tenant_id = $1
+          AND c.agent_id = $2
+          AND c.command_type = 'create'
+          AND c.status IN ('pending', 'acknowledged')
+          AND c.payload->>'executionMode' = 'unattended_plan'
+        ORDER BY t.id
+        FOR UPDATE OF t
+      `, [req.tenantId, agent.id]);
+      const olderCommandIds = olderPlanCommands.map(item => item.command_id);
+      if (olderCommandIds.length > 0) {
+        const supersededCommands = await tx.queryAll(`
+          UPDATE capture_agent_commands
+          SET status = 'expired',
+            result = jsonb_build_object(
+              'reason', 'superseded_by_newer_plan',
+              'supersededByTaskId', $2::text
+            ),
+            finished_at = now(), updated_at = now()
+          WHERE id = ANY($1::uuid[])
+            AND status IN ('pending', 'acknowledged')
+          RETURNING id, task_id
+        `, [olderCommandIds, taskId]);
+        const supersededCommandByTask = new Map(
+          supersededCommands.map(item => [String(item.task_id), item.id]),
+        );
+        const supersededTaskIds = [...supersededCommandByTask.keys()];
+        if (supersededTaskIds.length > 0) {
+          const supersededTasks = await tx.queryAll(`
+            UPDATE capture_tasks
+            SET status = 'superseded',
+              message = '已被删除无人值守计划的指令替代',
+              error = '{}'::jsonb,
+              metadata = metadata || jsonb_build_object(
+                'supersededByTaskId', $2::text,
+                'supersededAt', now()
+              ),
+              finished_at = now(), updated_at = now()
+            WHERE id = ANY($1::uuid[])
+              AND task_type = 'unattended_plan_configuration'
+              AND status IN ('pending', 'claimed')
+            RETURNING id, status
+          `, [supersededTaskIds, taskId]);
+          for (const supersededTask of supersededTasks) {
+            await appendEvent(tx, {
+              tenantId: req.tenantId,
+              taskId: supersededTask.id,
+              agentId: agent.id,
+              eventType: 'plan_configuration_superseded',
+              actorType: 'user',
+              actorId: req.user?.id || '',
+              actorName: req.actorName,
+              status: 'superseded',
+              message: '删除计划指令已替代较早的计划修改',
+              payload: {
+                commandId: supersededCommandByTask.get(
+                  String(supersededTask.id),
+                ) || '',
+                supersededByTaskId: taskId,
+              },
+            });
+          }
+        }
+      }
+
+      const planSnapshot = {
+        configured: false,
+        enabled: false,
+        platform,
+        keywords: [],
+      };
+      const metadata = {
+        remoteCreated: true,
+        createCommandId: commandId,
+        requestedByUserId: req.user?.id || '',
+        requestedByName: text(req.actorName, 240),
+        executionMode: 'unattended_plan',
+        planOperation: 'delete',
+        planSnapshot,
+      };
+      const task = await tx.queryOne(`
+        INSERT INTO capture_tasks (
+          id, tenant_id, origin_agent_id, assigned_agent_id,
+          client_task_id, task_type, feature_key, title, platform,
+          source, trigger_type, status, progress, checkpoint, counts,
+          metadata, message, source_updated_at
+        ) VALUES (
+          $1::uuid, $2, $3, $3,
+          $1::text, 'unattended_plan_configuration',
+          'unattended_keyword_plan', '删除无人值守计划', $4,
+          'cloud', 'remote_plan_delete', 'pending',
+          '{"current":0,"total":1,"phase":"queued"}'::jsonb,
+          '{}'::jsonb,
+          '{"total":1,"processed":0,"success":0,"failed":0,"skipped":0}'::jsonb,
+          $5::jsonb, '删除指令已创建，等待目标设备确认', now()
+        )
+        RETURNING id, client_task_id, task_type, feature_key, title, platform,
+          source, trigger_type, status, progress, counts, metadata,
+          created_at, updated_at
+      `, [
+        taskId,
+        req.tenantId,
+        agent.id,
+        platform,
+        JSON.stringify(metadata),
+      ]);
+      const command = await tx.queryOne(`
+        INSERT INTO capture_agent_commands (
+          id, tenant_id, agent_id, task_id, command_type, payload,
+          requested_by_user_id, requested_by_name
+        ) VALUES ($1, $2, $3, $4, 'create', $5::jsonb, $6, $7)
+        RETURNING id, status, expires_at, created_at
+      `, [
+        commandId,
+        req.tenantId,
+        agent.id,
+        task.id,
+        JSON.stringify({
+          taskId: task.id,
+          clientTaskId: task.id,
+          executionMode: 'unattended_plan',
+          planOperation: 'delete',
+          platform,
+          planSnapshot,
+          authCodeId: agent.auth_code_id,
+          authBindingId: agent.auth_binding_id,
+        }),
+        req.user?.id || null,
+        text(req.actorName, 240),
+      ]);
+      await appendEvent(tx, {
+        tenantId: req.tenantId,
+        taskId: task.id,
+        agentId: agent.id,
+        eventType: 'unattended_plan_delete_requested',
+        actorType: 'user',
+        actorId: req.user?.id || '',
+        actorName: req.actorName,
+        status: task.status,
+        message: '后台已向指定节点下发删除无人值守计划指令',
+        payload: {
+          commandId: command.id,
+          planOperation: 'delete',
+          platform,
+        },
+      });
+      return {agent, task, command, existing: false};
+    });
+
+    const messages = {
+      agent_not_found: ['agent_not_found', '采集节点不存在'],
+      agent_unavailable: ['agent_unavailable', '目标节点授权已失效、已停用或不存在'],
+      agent_plan_delete_capability_missing: [
+        'agent_plan_delete_capability_missing',
+        '目标节点版本尚不支持安全删除无人值守计划，请先更新 Extension',
+      ],
+      plan_not_found: ['plan_not_found', '该节点当前没有可删除的无人值守计划'],
+      agent_platform_unsupported: ['agent_platform_unsupported', '目标节点当前版本不支持该计划平台'],
+    };
+    if (result.error) {
+      const [error, message] = messages[result.error];
+      const status = result.error === 'agent_not_found' || result.error === 'plan_not_found'
+        ? 404
+        : 409;
+      return res.status(status).json({ok: false, error, message});
+    }
+
+    const online = captureAgentOnline(result.agent.last_heartbeat_at);
+    return res.status(result.existing ? 200 : 202).json({
+      ok: true,
+      task: result.task,
+      commandId: result.command.id,
+      commandExpiresAt: result.command.expires_at,
+      existing: result.existing === true,
+      agentOnline: online,
+      status: online ? 'pending' : 'waiting_device',
+      message: result.existing
+        ? '删除计划指令已存在，正在等待设备确认'
+        : online
+          ? '删除指令已下发，设备将在下一次心跳停止并清除计划'
+          : '删除指令已排队，设备上线后自动停止并清除计划',
     });
   } catch (err) {
     return next(err);

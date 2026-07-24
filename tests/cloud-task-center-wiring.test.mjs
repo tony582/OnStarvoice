@@ -165,84 +165,97 @@ test("remote task creation persists the local plan mirror and a durable create c
   );
 });
 
-test("admin UI groups browser nodes by physical-device label and exposes remote continue", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
-  assert.match(page, /const key = agent\.host_label/u);
-  assert.match(page, /同一台电脑的多个浏览器/u);
-  assert.match(page, /继续剩余任务/u);
-  assert.match(page, /上线后继续/u);
-  assert.match(page, /设备心跳：/u);
-  assert.match(page, /任务心跳：/u);
-  assert.match(page, /业务进展：/u);
-  assert.match(page, /resumable \|\| stoppable \|\| commandPending/u);
-  assert.match(page, /pending_command_expires_at/u);
-  assert.match(page, /pending_command_type/u);
-  assert.match(page, /\/capture-cloud\/tasks\/.*\/stop/u);
-  assert.match(page, /上线后停止/u);
+test("admin UI treats each browser as an independent Agent and exposes remote continue", async () => {
+  const [page, rail, taskCard] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentRail.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx"),
+  ]);
+  assert.match(rail, /每个浏览器均为独立 Agent/u);
+  assert.match(rail, /2 分钟无心跳即视为离线/u);
+  assert.match(taskCard, /继续剩余任务/u);
+  assert.match(taskCard, /上线后继续/u);
+  assert.match(taskCard, /设备心跳：/u);
+  assert.match(taskCard, /任务心跳：/u);
+  assert.match(taskCard, /业务进展：/u);
+  assert.match(taskCard, /orchestration \|\| resumable \|\| stoppable \|\| commandPending/u);
+  assert.match(taskCard, /pending_command_expires_at/u);
+  assert.match(taskCard, /pending_command_type/u);
+  assert.match(page, /\/capture-cloud\/tasks\/' \+ task\.id \+ '\/stop/u);
+  assert.match(taskCard, /上线后停止/u);
 });
 
 test("admin UI shows each node's local plan and capability-gates remote task creation", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
-  assert.match(page, /function UnattendedPlanSummary/u);
-  assert.match(page, /本地无人值守计划/u);
-  assert.match(page, /unattended_plan/u);
-  assert.match(page, /function AgentTaskCreator/u);
-  assert.match(page, /新建关键词采集任务/u);
-  assert.match(page, /agent\.capabilities\?\.remoteTaskCreate === true/u);
-  assert.match(page, /\/capture-cloud\/agents\/\$\{agent\.id\}\/tasks/u);
-  assert.match(page, /pendingSubmission/u);
-  assert.match(page, /requestKey:\s*window\.crypto\.randomUUID\(\)/u);
-  assert.match(page, /当前扩展版本不支持云端新建任务，请升级扩展/u);
-  assert.match(page, /节点离线，任务会在云端排队/u);
-  assert.match(page, /executionMode/u);
-  assert.match(page, /'one_time' \| 'unattended_plan'/u);
-  assert.match(page, /remoteUnattendedPlanWrite/u);
-  assert.match(page, /agent\.capabilities\?\.remoteTaskEnhancementOptions === true/u);
-  assert.match(page, /agent\.capabilities\?\.remoteTaskKeywordPostLimit === true/u);
-  assert.match(page, /每个关键词最多采集帖子数/u);
+  const [creator, summary] = await Promise.all([
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentTaskCreator.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/UnattendedPlanSummary.tsx"),
+  ]);
+  assert.match(summary, /本地无人值守计划/u);
+  assert.match(creator, /unattended_plan/u);
+  assert.match(creator, /function AgentTaskCreator/u);
+  assert.match(creator, /新建关键词采集任务/u);
+  assert.match(creator, /agent\.capabilities\?\.remoteTaskCreate === true/u);
+  assert.match(creator, /\/capture-cloud\/agents\/\$\{agent\.id\}\/tasks/u);
+  assert.match(creator, /pendingSubmission/u);
+  assert.match(creator, /requestKey:\s*window\.crypto\.randomUUID\(\)/u);
+  assert.match(creator, /当前扩展版本不支持云端新建任务，请升级扩展/u);
+  assert.match(creator, /Agent 离线，任务会在云端排队，设备上线后自动领取/u);
+  assert.match(creator, /executionMode/u);
+  assert.match(creator, /'one_time' \| 'unattended_plan'/u);
+  assert.match(creator, /remoteUnattendedPlanWrite/u);
+  assert.match(creator, /agent\.capabilities\?\.remoteTaskEnhancementOptions === true/u);
+  assert.match(creator, /agent\.capabilities\?\.remoteTaskKeywordPostLimit === true/u);
+  assert.match(creator, /每个关键词最多采集帖子数/u);
   assert.match(
-    page,
+    creator,
     /remoteTaskKeywordPostLimit &&[\s\S]*!Number\.isSafeInteger\(keywordMaxDetectedItems\)[\s\S]*keywordMaxDetectedItems < 1/u,
   );
   assert.match(
-    page,
+    creator,
     /\.\.\.\(remoteTaskKeywordPostLimit && keywordLimitOverrideEnabled \? \{ keywordMaxDetectedItems \} : \{\}\)/u,
   );
-  assert.match(page, /任务会使用目标设备的本地设置/u);
-  assert.match(page, /const captureSettings:\s*CaptureEnhancementSettings \| undefined/u);
-  assert.match(page, /\.\.\.\(captureSettings \? \{ captureSettings \} : \{\}\)/u);
-  assert.match(page, /detailCommentsMaxDetectedItems/u);
-  assert.match(page, /当前扩展版本不支持为远程任务指定采集增强选项/u);
-  assert.match(page, /一次性/u);
-  assert.match(page, /无人值守/u);
+  assert.match(creator, /任务会使用目标设备的本地设置/u);
+  assert.match(creator, /const captureSettings:\s*CaptureEnhancementSettings \| undefined/u);
+  assert.match(creator, /\.\.\.\(captureSettings \? \{ captureSettings \} : \{\}\)/u);
+  assert.match(creator, /detailCommentsMaxDetectedItems/u);
+  assert.match(creator, /当前扩展版本不支持为远程任务指定采集增强选项/u);
+  assert.match(creator, /一次性/u);
+  assert.match(creator, /无人值守/u);
 });
 
 test("admin UI creates one task draft and explicitly assigns it to a browser agent", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+  const [page, lib] = await Promise.all([
+    read("web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts"),
+  ]);
 
-  assert.match(page, /function TaskAssignmentDrawer/u);
-  assert.match(page, /新建任务并分配/u);
-  assert.match(page, /选择任务类型/u);
-  assert.match(page, /分配执行设备/u);
-  assert.match(page, /配置并确认/u);
-  assert.match(page, /role="radiogroup" aria-label="执行节点"/u);
-  assert.match(page, /setSelectedAgentId\(agent\.id\)/u);
-  assert.match(page, /key=\{`\$\{selectedAgent\.id\}:\$\{mode\}/u);
+  assert.match(page, /export function CreateTaskDrawer/u);
+  assert.match(page, /新建任务/u);
+  assert.match(page, /任务类型/u);
+  assert.match(page, /执行方式/u);
+  assert.match(page, /选择节点/u);
+  assert.match(page, /任务配置/u);
+  assert.match(page, /<AgentPicker/u);
+  assert.match(page, /setSelectedAgentIds/u);
+  assert.match(page, /key=\{`\$\{selectedAgent\.id\}:\$\{mode\}:/u);
   assert.match(page, /agent=\{selectedAgent\}/u);
-  assert.match(page, /设备离线；分配后会排队，上线即执行/u);
-  assert.match(page, /节点已暂停，不能接收新任务/u);
-  assert.match(page, /Extension 版本过低，需升级后才能远程接单/u);
+  assert.match(page, /离线 Agent 仍可接单，上线后自动领取/u);
+  assert.match(lib, /Agent 已暂停，不能接收新任务/u);
+  assert.match(lib, /客户端扩展版本过低，需升级后才能远程接单/u);
   assert.equal((page.match(/<AgentTaskCreator\b/gu) || []).length, 1,
     "the long task form must render only once inside the assignment drawer");
 });
 
 test("admin UI keeps the business task list newest-first and hides technical child jobs", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+  const [page, lib] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts"),
+  ]);
 
-  assert.match(page, /function isBusinessVisibleTask/u);
-  assert.match(page, /type === 'unattended_plan_configuration'/u);
-  assert.match(page, /type === 'sync'/u);
-  assert.match(page, /task\.status === 'superseded'/u);
+  assert.match(lib, /function isBusinessVisibleTask/u);
+  assert.match(lib, /type === 'unattended_plan_configuration'/u);
+  assert.match(lib, /type === 'sync'/u);
+  assert.match(lib, /task\.status === 'superseded'/u);
   assert.match(page, /\(overview\?\.tasks \|\| \[\]\)\.filter\(isBusinessVisibleTask\)/u);
   assert.match(page, /left\.created_at \|\| left\.updated_at/u);
   assert.match(page, /right\.created_at \|\| right\.updated_at/u);
@@ -250,7 +263,7 @@ test("admin UI keeps the business task list newest-first and hides technical chi
 });
 
 test("admin UI can load and explicitly replace an existing unattended plan without polluting new one-time tasks", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+  const page = await read("web/admin/src/pages/dispatch/cloud-tasks/AgentTaskCreator.tsx");
   const resetStart = page.indexOf("  const resetNewTaskForm = () => {");
   const resetEnd = page.indexOf("  const toggleNewTaskForm = () => {", resetStart);
   const toggleEnd = page.indexOf("  const editUnattendedPlan = () => {", resetEnd);
@@ -365,14 +378,18 @@ test("admin UI can load and explicitly replace an existing unattended plan witho
 });
 
 test("admin task dates accept loose separators and normalize real calendar days", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+  const page = await read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts");
   const start = page.indexOf("function normalizeCloudTaskDate(");
-  const end = page.indexOf("function formatTime(", start);
+  const end = page.indexOf("function localDateKey(", start);
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
   const context = vm.createContext({Date});
+  const executableDateHelpers = page
+    .slice(start, end)
+    .replaceAll("export ", "")
+    .replace("value: unknown = ''", "value = ''");
   vm.runInContext(
-    `${page.slice(start, end)}\nglobalThis.__normalizeDateList = normalizeCloudTaskDateList;`,
+    `${executableDateHelpers}\nglobalThis.__normalizeDateList = normalizeCloudTaskDateList;`,
     context,
   );
 
@@ -391,14 +408,17 @@ test("admin task dates accept loose separators and normalize real calendar days"
 });
 
 test("admin can move ended failures to history individually or in bulk", async () => {
-  const page = await read("web/admin/src/pages/monitoring/CloudTasksTab.tsx");
+  const [page, lib] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts"),
+  ]);
 
   assert.match(
-    page,
+    lib,
     /const DISMISSIBLE_ATTENTION_TASK_STATUSES = new Set\(\['failed', 'completed_with_failures'\]\)/u,
   );
-  assert.match(page, /function canDismissAttention/u);
-  assert.match(page, /!task\.attention_dismissed_at/u);
+  assert.match(lib, /function canDismissAttention/u);
+  assert.match(lib, /!task\.attention_dismissed_at/u);
   assert.match(page, /\/capture-cloud\/tasks\/' \+ task\.id \+ '\/dismiss-attention'/u);
   assert.match(page, /\/capture-cloud\/tasks\/dismiss-terminal-attention/u);
   assert.match(page, /任务记录和采集结果都会保留/u);

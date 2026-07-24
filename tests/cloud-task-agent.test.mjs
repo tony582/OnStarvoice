@@ -152,6 +152,7 @@ test("heartbeat advertises remote task creation and mirrors a sanitized unattend
   assert.equal(payload.agent.capabilities.remoteTaskCreate, true);
   assert.equal(payload.agent.capabilities.remoteStop, true);
   assert.equal(payload.agent.capabilities.remoteUnattendedPlanWrite, true);
+  assert.equal(payload.agent.capabilities.remoteUnattendedPlanDelete, true);
   assert.equal(payload.agent.capabilities.remoteTaskEnhancementOptions, true);
   assert.equal(payload.agent.capabilities.remoteTaskKeywordPostLimit, true);
   assert.equal(payload.agent.capabilities.unattendedPlanMirror, true);
