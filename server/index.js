@@ -13,6 +13,7 @@ import { startCronJobs } from './cron.js';
 import { sendTestEmail } from './services/email-notifier.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
+import { failStaleAnalyses } from './services/opinion-analysis.js';
 import { requireAdmin } from './middleware/auth.js';
 
 import authRouter from './routes/auth.js';
@@ -40,6 +41,7 @@ import customTagsRouter from './routes/custom-tags.js';
 import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import captureCloudRouter from './routes/capture-cloud.js';
 import captureOrchestrationsRouter from './routes/capture-orchestrations.js';
+import opinionAnalysisRouter from './routes/opinion-analysis.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
 import { ensureMediaDirs, backfillRecentCovers, backfillRecentImages, MEDIA_DIR } from './services/media-store.js';
 
@@ -141,6 +143,7 @@ app.use('/api/custom-tags', customTagsRouter);
 app.use('/api/relevance/prefilter', relevancePrefilterRouter);
 app.use('/api/capture-cloud', captureCloudRouter);
 app.use('/api/capture-cloud', captureOrchestrationsRouter);
+app.use('/api/opinion-analysis', opinionAnalysisRouter);
 // 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
 app.use('/api/asr-media', asrMediaRouter);
 
@@ -189,6 +192,10 @@ async function start() {
   await initDb();
   ensureMediaDirs();
   startCronJobs();
+
+  // 舆情剖析收尸:剖析任务靠 setImmediate 在内存里跑,进程重启即丢,
+  // 把上一进程遗留的 pending/running 置为 failed,前端不再无限轮询
+  failStaleAnalyses().catch(err => console.error('[OpinionAnalysis] 启动收尸失败:', err.message));
 
   app.listen(PORT, () => {
     console.log(`\n  ╔══════════════════════════════════════════╗`);

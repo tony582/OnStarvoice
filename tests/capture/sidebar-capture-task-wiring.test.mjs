@@ -240,8 +240,9 @@ test("manual search begins only for the actual run and always ends in finally", 
   assert.match(section, /captureTaskId: persistentCaptureTaskId/);
   assert.match(
     section,
-    /batchCaptureByKeywords\(\{\s+keywords: \[\.\.\.searchKeywords\],[\s\S]*?captureTaskId: persistentCaptureTaskId/,
+    /batchCaptureByKeywords\(\{\s+keywords: \[\.\.\.attemptKeywords\],[\s\S]*?captureTaskId: persistentCaptureTaskId/,
   );
+  assert.match(section, /runUnattendedKeywordAttempts\(\{/);
   assert.doesNotMatch(section, /retryFailedEnhancementsAfterRound\(/);
   assert.match(
     section.slice(finallyIndex),
@@ -788,6 +789,26 @@ test("unattended detail interruption only stops the whole plan for explicit term
   assert.doesNotMatch(
     section,
     /if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\) \{\s*batchKeywordCancelRequested = true/,
+  );
+});
+
+test("manual Douyin multi-keyword capture retries only after the first pass", () => {
+  const section = readFunctionSection(
+    "async function handleCaptureSearchData()",
+    "function setKeywordStrategyTab(",
+  );
+
+  assert.match(
+    section,
+    /const runSearchBatchAttempt = \(attemptKeywords\) =>[\s\S]*?batchCaptureByKeywords\(\{[\s\S]*?keywords: \[\.\.\.attemptKeywords\]/u,
+  );
+  assert.match(
+    section,
+    /runUnattendedKeywordAttempts\(\{[\s\S]*?maxAttempts: pagePlatform === "douyin" \? 2 : 1/u,
+  );
+  assert.match(
+    section,
+    /onRetryScheduled:[\s\S]*?sleepWithStop\([\s\S]*?retryDelay/u,
   );
 });
 

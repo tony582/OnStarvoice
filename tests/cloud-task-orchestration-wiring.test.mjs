@@ -49,11 +49,15 @@ test('overview returns parent business tasks without exposing orchestration chil
 });
 
 test('production task center exposes real multi-Agent compose and detail flows', async () => {
-  const [page, composer, detail] = await Promise.all([
-    read('web/admin/src/pages/monitoring/CloudTasksTab.tsx'),
-    read('web/admin/src/pages/monitoring/cloud-tasks/OrchestrationComposerDrawer.tsx'),
-    read('web/admin/src/pages/monitoring/cloud-tasks/OrchestrationDetailWorkspace.tsx'),
+  const [dispatchPage, taskCard, plansView, taskLib, composer, detail] = await Promise.all([
+    read('web/admin/src/pages/dispatch/DispatchPage.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/PlansView.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/lib.ts'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationDetailWorkspace.tsx'),
   ]);
+  const page = [dispatchPage, taskCard, plansView, taskLib].join('\n');
 
   assert.match(page, /OrchestrationComposerDrawer/u);
   assert.match(page, /OrchestrationDetailWorkspace/u);
@@ -72,12 +76,24 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /当前分配预览已失效/u);
   assert.match(composer, /正在创建 \$\{new Set\(assignments/u);
   assert.match(composer, /<footer[\s\S]*aria-live="polite"[\s\S]*role="alert"[\s\S]*确认并分配/u);
-  assert.match(composer, /busy \? '正在分配…' : '确认并分配'/u);
+  assert.match(composer, /'执行一次'/u);
+  assert.match(composer, /'无人值守'/u);
+  assert.match(composer, /platform,\s*\n\s*executionMode,/u);
+  assert.match(composer, /maxRounds:\s*1/u);
+  assert.match(composer, /roundGapMin:\s*10/u);
+  assert.match(composer, /schedule:\s*\{/u);
+  assert.match(composer, /'确认并启用计划'/u);
+  assert.match(composer, /'确认并分配'/u);
+  assert.match(composer, /不会覆盖设备 Extension 里已有的本地无人值守计划/u);
   assert.match(composer, /这里不会调用 AI/u);
   assert.match(composer, /1–300 个关键词/u);
 
   assert.match(detail, /detail\?\.items/u);
-  assert.match(detail, /orchestration, executions, agents, attempts/u);
+  assert.match(detail, /orchestration, executions, agents, attempts, schedule/u);
+  assert.match(detail, /\/schedule\/\$\{action\}/u);
+  assert.match(detail, /暂停计划/u);
+  assert.match(detail, /重新启用/u);
+  assert.match(detail, /每个计划时间，每个关键词执行 1 次/u);
   assert.match(detail, /重新分配（尚未开放）/u);
   assert.match(detail, /当前不会伪装执行/u);
 });

@@ -2,7 +2,7 @@ export const DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE =
   "DOUYIN_SEARCH_SERVICE_ABNORMAL";
 
 export const DOUYIN_SEARCH_SERVICE_ABNORMAL_MESSAGE =
-  "检测到抖音“服务出现异常”，为避免触发安全审核，已立即停止整条任务";
+  "抖音当前关键词搜索暂时不可用，已结束本词并继续下一个关键词";
 
 const DOUYIN_SEARCH_RESULT_LINK_SELECTOR = [
   'a[href*="/video/"]',
@@ -187,12 +187,15 @@ export function createDouyinSearchServiceAbnormalError({
   error.code = DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE;
   error.category = "platform_service_abnormal";
   error.pageUrl = String(pageUrl || "");
-  error.securityBlocked = true;
-  error.platformSafetyBlocked = true;
-  error.requiresManualAction = true;
-  error.stopBatch = true;
-  error.fatal = true;
-  error.retryable = false;
+  // “服务出现异常”也会出现在正常的手动搜索中。它只说明当前搜索请求
+  // 没有得到可采结果，不足以证明验证码、登录失效或账号风控。
+  error.securityBlocked = false;
+  error.platformSafetyBlocked = false;
+  error.requiresManualAction = false;
+  error.stopBatch = false;
+  error.fatal = false;
+  error.retryable = true;
+  error.keywordScoped = true;
   return error;
 }
 

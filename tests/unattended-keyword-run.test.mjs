@@ -304,7 +304,7 @@ test("retry merge keeps a successful result even if a stale failure follows", ()
   assert.equal(merged.results[0].ok, true);
 });
 
-test("page drift fails keyword one, continues keyword two, then retries only keyword one", async () => {
+test("Douyin service abnormal continues keyword two, then retries only keyword one", async () => {
   const planKeywords = ["词1", "词2"];
   let checkpoint = normalizeUnattendedKeywordCheckpoint({}, planKeywords);
   const captureOrder = [];
@@ -318,13 +318,14 @@ test("page drift fails keyword one, continues keyword two, then retries only key
       const results = [];
       for (const keyword of attemptKeywords) {
         captureOrder.push({attempt, keyword});
-        const pageDrifted = attempt === 1 && keyword === "词1";
-        const result = pageDrifted
+        const serviceAbnormal = attempt === 1 && keyword === "词1";
+        const result = serviceAbnormal
           ? {
               keyword,
               ok: false,
-              recoverableInterruption: true,
-              error: "搜索结果页被视频页替换",
+              error: "抖音当前关键词搜索暂时不可用",
+              errorCode: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
+              errorCategory: "platform_service_abnormal",
             }
           : {keyword, ok: true, recordIds: [`record-${keyword}`]};
         results.push(result);
@@ -496,14 +497,15 @@ test("platform safety signals are circuit breakers", () => {
     isUnattendedSafetyBlock({
       code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
     }),
-    true,
+    false,
   );
   assert.equal(
     isUnattendedSafetyBlock({
       securityBlocked: true,
       code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
     }),
-    true,
+    false,
+    "legacy service-abnormal flags must not keep the upgraded task blocked",
   );
   assert.equal(
     isUnattendedSafetyBlock("服务出现异常"),
@@ -513,7 +515,7 @@ test("platform safety signals are circuit breakers", () => {
   assert.equal(isUnattendedSafetyBlock("导航超时"), false);
 });
 
-test("service-abnormal checkpoint preserves structured stop evidence", () => {
+test("service-abnormal checkpoint remains a bounded retryable keyword failure", () => {
   const planKeywords = ["品牌词"];
   const checkpoint = normalizeUnattendedKeywordCheckpoint({}, planKeywords);
   const settled = settleUnattendedKeywordCheckpoint({
@@ -527,15 +529,12 @@ test("service-abnormal checkpoint preserves structured stop evidence", () => {
       error: "检测到抖音服务异常",
       errorCode: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
       errorCategory: "platform_service_abnormal",
-      securityBlocked: true,
-      requiresManualAction: true,
     },
-    securityBlocked: true,
     attempt: 1,
     maxAttempts: 2,
   });
 
-  assert.equal(settled.entry.status, "failed");
+  assert.equal(settled.entry.status, "retrying");
   assert.equal(
     settled.entry.errorCode,
     "DOUYIN_SEARCH_SERVICE_ABNORMAL",
@@ -544,8 +543,8 @@ test("service-abnormal checkpoint preserves structured stop evidence", () => {
     settled.entry.errorCategory,
     "platform_service_abnormal",
   );
-  assert.equal(settled.entry.securityBlocked, true);
-  assert.equal(settled.entry.requiresManualAction, true);
+  assert.equal(settled.entry.securityBlocked, undefined);
+  assert.equal(settled.entry.requiresManualAction, undefined);
 
   const restored = normalizeUnattendedKeywordCheckpoint(
     settled.checkpoint,
@@ -555,8 +554,12 @@ test("service-abnormal checkpoint preserves structured stop evidence", () => {
     restored.keywordResults[0].errorCode,
     "DOUYIN_SEARCH_SERVICE_ABNORMAL",
   );
-  assert.equal(restored.keywordResults[0].securityBlocked, true);
-  assert.equal(restored.keywordResults[0].requiresManualAction, true);
+  assert.equal(restored.keywordResults[0].securityBlocked, undefined);
+  assert.equal(restored.keywordResults[0].requiresManualAction, undefined);
+  assert.equal(
+    findUnattendedResumeKeyword(restored, planKeywords),
+    "品牌词",
+  );
 });
 
 test("round-level orchestration cannot start a second enhancement retry budget", async () => {

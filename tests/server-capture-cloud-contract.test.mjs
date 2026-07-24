@@ -244,6 +244,40 @@ test("create command failures and successful stops settle orchestration work ite
   assert.match(completion, /SELECT id, parent_task_id, status, error, metadata/u);
 });
 
+test("unattended plan deletion is a durable device command and clears the mirror only after acknowledgement", () => {
+  const deletion = readRouteSection(
+    "router.delete('/agents/:id/unattended-plan'",
+    "router.post('/tasks/:id/dismiss-attention'",
+  );
+  assert.match(deletion, /remoteUnattendedPlanDelete/u);
+  assert.match(
+    deletion,
+    /INSERT INTO capture_agent_commands[\s\S]*'create'[\s\S]*planOperation:\s*'delete'/u,
+  );
+  assert.match(
+    deletion,
+    /c\.payload->>'planOperation' = 'delete'[\s\S]*删除计划指令已存在/u,
+  );
+  assert.doesNotMatch(
+    deletion,
+    /UPDATE capture_agents[\s\S]*SET unattended_plan = '\{\}'::jsonb/u,
+    "the admin request must not hide a still-active device plan before receipt",
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  assert.match(
+    completion,
+    /createPlanOperation === 'delete'[\s\S]*设备已停止并删除无人值守计划/u,
+  );
+  assert.match(
+    completion,
+    /success[\s\S]*createPlanOperation === 'delete'[\s\S]*UPDATE capture_agents[\s\S]*unattended_plan = '\{\}'::jsonb/u,
+  );
+});
+
 test("stop before device receipt immediately cancels orchestration items", () => {
   const stopRoute = readRouteSection(
     "router.post('/tasks/:id/stop'",
@@ -761,4 +795,43 @@ test("remote capture settings normalize dependent options fail closed", () => {
   }).planSnapshot.captureSettings;
   assert.equal(disabledParents.enableLowFollowerHitFilterOnDetailCapture, false);
   assert.equal(disabledParents.enableCommentLeadsFilterOnDetailCapture, false);
+});
+
+test("ended failures can be dismissed from attention without deleting task history", () => {
+  const single = readRouteSection(
+    "router.post('/tasks/:id/dismiss-attention'",
+    "router.post('/tasks/dismiss-terminal-attention'",
+  );
+  const bulk = readRouteSection(
+    "router.post('/tasks/dismiss-terminal-attention'",
+    "router.post('/tasks/:id/resume'",
+  );
+
+  assert.match(
+    captureCloudRouteSource,
+    /const DISMISSIBLE_ATTENTION_STATUSES = new Set\(\[[\s\S]*'failed'[\s\S]*'completed_with_failures'/u,
+  );
+  assert.match(single, /parent_task_id/u);
+  assert.match(single, /DISMISSIBLE_ATTENTION_STATUSES\.has\(task\.status\)/u);
+  assert.match(single, /attention_dismissed_at = now\(\)/u);
+  assert.match(single, /eventType: 'task_attention_dismissed'/u);
+  assert.match(single, /任务和采集结果仍会保留/u);
+  assert.doesNotMatch(single, /\bDELETE\b/u);
+
+  assert.match(
+    bulk,
+    /status IN \('failed', 'completed_with_failures'\)/u,
+  );
+  assert.match(bulk, /attention_dismissed_at IS NULL/u);
+  assert.match(bulk, /parent_task_id IS NULL/u);
+  assert.doesNotMatch(bulk, /\bDELETE\b/u);
+
+  const overview = readRouteSection(
+    "router.get('/overview'",
+    "router.patch('/agents/:id'",
+  );
+  assert.match(
+    overview,
+    /WHERE t\.status IN \('interrupted', 'needs_action', 'failed', 'completed_with_failures'\)[\s\S]*t\.attention_dismissed_at IS NULL/u,
+  );
 });

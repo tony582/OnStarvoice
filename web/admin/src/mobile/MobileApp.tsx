@@ -3,7 +3,7 @@ import {
   Activity, AlertTriangle, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
   CircleAlert, ClipboardList, Database, Eye, FileText, Headphones,
   Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageSquare, Monitor,
-  MoreHorizontal, Radio, RefreshCw, Search, Send, ServerCog, Settings, ShieldCheck,
+  MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
   Sparkles, User, Users,
 } from 'lucide-react'
 import {
@@ -24,7 +24,9 @@ import { OpinionPage } from '@/pages/OpinionPage'
 import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
+import { DispatchPage } from '@/pages/dispatch/DispatchPage'
 import { InsightsPage } from '@/pages/InsightsPage'
+import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
 import { DataPage } from '@/pages/DataPage'
 import { EventsPage } from '@/pages/EventsPage'
 import { TracksPage } from '@/pages/TracksPage'
@@ -44,7 +46,9 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   salesleads: SalesLeadsPage,
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
+  dispatch: DispatchPage,
   insights: InsightsPage,
+  'opinion-analysis': OpinionAnalysisPage,
   data: DataPage,
   events: EventsPage,
   tracks: TracksPage,
@@ -61,7 +65,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
 
 const PAGE_TITLES: Record<string, string> = {
   overview: '今日值守', opinion: '客服工单', salesleads: '销售客资', workbench: '待办队列',
-  monitoring: '监测中心', insights: '舆情洞察', data: '数据与导出', events: '事件中心',
+  monitoring: '关注博主', dispatch: '调度中心', insights: '舆情洞察', 'opinion-analysis': '舆情剖析', data: '数据与导出', events: '事件中心',
   tracks: '赛道机会', benchmarks: '对标账号', keywords: '选题与扩词',
   'content-home': '内容总览', hits: '爆款拆解', review: '内容复盘',
   'official-accounts': '官方账号', tenants: '租户管理', users: '用户账号',
@@ -420,7 +424,7 @@ function MonitorHub({ openPage }: { openPage: OpenPage }) {
           </button>
         )}
         <section className="space-y-2">
-          <MonitorCard icon={ServerCog} kicker="设备" title="云端采集任务中心" badge="BETA" copy="查看各浏览器节点的实时进度，并远程继续中断任务" action="打开任务中心" onClick={() => openPage('monitoring', { tab: 'cloud' })} tone="blue" />
+          <MonitorCard icon={ServerCog} kicker="设备" title="调度中心" badge="BETA" copy="查看各浏览器节点的实时进度，并远程继续中断任务" action="打开调度中心" onClick={() => openPage('dispatch')} tone="blue" />
           <MonitorCard icon={Activity} kicker="动态" title="关注对象的新内容" copy="按时间线查看最新命中、互动与情感变化" action="看新动态" onClick={() => openPage('monitoring', { tab: 'hits' })} />
           <MonitorCard icon={Bell} kicker="事件" title="正在扩散的风险事件" copy="沿事件时间线查看关联内容和当前处置状态" action="进事件中心" onClick={() => openPage('events')} tone="red" />
           <MonitorCard icon={Radio} kicker="关注" title="监测对象与运行状态" copy="查看频率、最近运行、异常原因并立即扫描" action="管理关注" onClick={() => openPage('monitoring', { tab: 'tasks' })} tone="blue" />
@@ -445,6 +449,14 @@ function InsightsHub({ openPage }: { openPage: OpenPage }) {
             <div className="flex items-start gap-3">
               <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-status-red/10 text-status-red"><BarChart3 className="h-5 w-5" /></span>
               <span className="min-w-0 flex-1"><span className="block text-[15px] font-bold">先看结论，再看指标</span><span className="mt-1 block text-[11px] leading-5 text-muted-foreground">执行摘要、关键变化、风险建议、趋势与 AI 研判</span></span>
+              <ChevronRight className="mt-1 h-4 w-4 text-muted-foreground" />
+            </div>
+          </button>
+          <button type="button" onClick={() => openPage('opinion-analysis')}
+            className="mt-2 w-full rounded-2xl border border-border bg-card p-4 text-left active:bg-muted">
+            <div className="flex items-start gap-3">
+              <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-status-purple/10 text-status-purple"><ScanSearch className="h-5 w-5" /></span>
+              <span className="min-w-0 flex-1"><span className="flex items-center gap-1.5 text-[15px] font-bold">舆情剖析<span className="rounded bg-status-green/15 px-1 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-emerald-600 dark:text-emerald-400">NEW</span></span><span className="mt-1 block text-[11px] leading-5 text-muted-foreground">圈定话题深度拆解：风险研判、观点情绪、传播与应对口径</span></span>
               <ChevronRight className="mt-1 h-4 w-4 text-muted-foreground" />
             </div>
           </button>
@@ -584,7 +596,7 @@ function MobilePageSurface() {
       <header className="mobile-page-header sticky top-0 z-20 flex min-h-[56px] items-center gap-2 border-b border-border/80 bg-background/95 px-2 pt-[env(safe-area-inset-top)] backdrop-blur-xl">
         <button type="button" onClick={() => location.key === 'default' ? routerNavigate(`/m/${backRoot}`, { replace: true }) : routerNavigate(-1)} aria-label="返回"
           className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full active:bg-muted"><ArrowLeft className="h-5 w-5" /></button>
-        <div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">StarVoice mobile</div><div className="flex min-w-0 items-center gap-2"><h1 className="truncate text-[17px] font-extrabold tracking-[-0.02em]">{title}</h1>{pageId === 'monitoring' && <span className="shrink-0 rounded border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[8px] font-extrabold uppercase tracking-[0.12em] text-primary">BETA</span>}</div></div>
+        <div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">StarVoice mobile</div><div className="flex min-w-0 items-center gap-2"><h1 className="truncate text-[17px] font-extrabold tracking-[-0.02em]">{title}</h1>{pageId === 'dispatch' && <span className="shrink-0 rounded border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[8px] font-extrabold uppercase tracking-[0.12em] text-primary">BETA</span>}</div></div>
         <button type="button" onClick={() => routerNavigate('/m/more')} aria-label="更多功能" className="flex h-11 w-11 items-center justify-center rounded-full active:bg-muted"><MoreHorizontal className="h-5 w-5" /></button>
       </header>
       <div className="mobile-feature-page animate-fade-up px-3 py-3" key={`${pageId}:${seq}:${tenantId}:${querySignature}`}>
@@ -596,8 +608,8 @@ function MobilePageSurface() {
 
 function rootForPage(page: string, params: Record<string, string>): RootTab {
   if (page === 'workbench' || page === 'opinion' || page === 'salesleads') return 'tasks'
-  if (page === 'monitoring' || page === 'events') return 'monitor'
-  if (['insights', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
+  if (page === 'monitoring' || page === 'dispatch' || page === 'events') return 'monitor'
+  if (['insights', 'opinion-analysis', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
   if (page === 'overview') return 'today'
   if (params.queue) return 'tasks'
   return 'more'

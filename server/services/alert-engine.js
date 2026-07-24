@@ -8,6 +8,14 @@ import { sendAlertEmail } from './email-notifier.js';
 
 const HIGH_DANGER_KEYWORDS_DEFAULT = '安全,隐私,泄露,事故,召回,起火,失控,刹车失灵,死亡,伤亡';
 
+// reason 前缀是跨模块契约:舆情剖析(opinion-analysis.js)按前缀 LIKE 归类预警,改文案两侧要一起动
+export const ALERT_REASON_PREFIXES = {
+  dangerKeyword: '高危关键词命中',
+  lowFansHighSpread: '低粉高扩散',
+  highInteractionNegative: '高互动负面',
+  negativeBurst: '集中负面',
+};
+
 function sha1(value) {
   return crypto.createHash('sha1').update(value).digest('hex');
 }
@@ -122,7 +130,7 @@ export async function checkAlerts(recordId) {
     alerts.push({
       record_id: recordId,
       level: 'critical',
-      reason: `高危关键词命中: ${matchedDangerKeywords.join(', ')}`,
+      reason: `${ALERT_REASON_PREFIXES.dangerKeyword}: ${matchedDangerKeywords.join(', ')}`,
       title: record.title,
       summary: record.ai_summary || record.content?.slice(0, 100) || '',
       url: record.url,
@@ -141,7 +149,7 @@ export async function checkAlerts(recordId) {
     alerts.push({
       record_id: recordId,
       level: 'warning',
-      reason: `低粉高扩散: ${authorFans} 粉博主负面内容互动 ${interactionTotal}(赞粉比异常,疑似水军/突发种子)`,
+      reason: `${ALERT_REASON_PREFIXES.lowFansHighSpread}: ${authorFans} 粉博主负面内容互动 ${interactionTotal}(赞粉比异常,疑似水军/突发种子)`,
       title: record.title,
       summary: record.ai_summary || record.content?.slice(0, 100) || '',
       url: record.url,
@@ -168,7 +176,7 @@ export async function checkAlerts(recordId) {
     alerts.push({
       record_id: recordId,
       level: 'critical',
-      reason: `高互动负面: ${why}`,
+      reason: `${ALERT_REASON_PREFIXES.highInteractionNegative}: ${why}`,
       title: record.title,
       summary: record.ai_summary || record.content?.slice(0, 100) || '',
       url: record.url,
@@ -190,7 +198,7 @@ export async function checkAlerts(recordId) {
 
     if (recentNeg && recentNeg.n >= burstCount) {
       const existingBurstAlert = await queryOne(
-        "SELECT id FROM alerts WHERE tenant_id = $1 AND level = 'warning' AND reason ILIKE '%集中负面%' AND created_at >= $2",
+        `SELECT id FROM alerts WHERE tenant_id = $1 AND level = 'warning' AND reason ILIKE '%${ALERT_REASON_PREFIXES.negativeBurst}%' AND created_at >= $2`,
         [record.tenant_id, windowStart.toISOString()]
       );
 
@@ -198,7 +206,7 @@ export async function checkAlerts(recordId) {
         alerts.push({
           record_id: recordId,
           level: 'warning',
-          reason: `集中负面: ${burstWindow}分钟内出现 ${recentNeg.n} 条负面内容 (阈值 ${burstCount})`,
+          reason: `${ALERT_REASON_PREFIXES.negativeBurst}: ${burstWindow}分钟内出现 ${recentNeg.n} 条负面内容 (阈值 ${burstCount})`,
           title: '集中负面舆情预警',
           summary: `最近${burstWindow}分钟内检测到${recentNeg.n}条负面舆情`,
           url: '',

@@ -3,10 +3,13 @@ import {
   Activity,
   AlertTriangle,
   Bot,
+  CalendarDays,
   ChevronRight,
   ClipboardList,
   Loader2,
   Lock,
+  Pause,
+  Play,
   RefreshCw,
   Square,
   Users,
@@ -25,11 +28,8 @@ import type {
   OrchestrationExecutionRecord,
   OrchestrationItemRecord,
 } from './types'
-
-const PLATFORM_LABELS: Record<string, string> = {
-  xiaohongshu: '小红书',
-  douyin: '抖音',
-}
+// 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
+import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -42,27 +42,6 @@ const PUBLISH_TIME_LABELS: Record<string, string> = {
   day: '一天内',
   week: '一周内',
   halfyear: '半年内',
-}
-
-const STATUS_LABELS: Record<string, string> = {
-  draft: '草稿',
-  pending: '等待领取',
-  assigned: '已分配',
-  dispatch_pending: '等待下发',
-  dispatched: '已下发',
-  waiting_device: '等待设备',
-  claimed: '已领取',
-  running: '执行中',
-  recovering: '恢复中',
-  retryable: '等待重试',
-  needs_action: '需要处理',
-  completed: '已完成',
-  completed_with_warnings: '完成有警告',
-  completed_with_failures: '部分失败',
-  failed: '失败',
-  interrupted: '已中断',
-  canceled: '已停止',
-  skipped: '已跳过',
 }
 
 const SUCCESS_ITEM_STATUSES = new Set(['completed', 'completed_with_warnings'])
@@ -84,6 +63,13 @@ const COMMAND_STATUS_LABELS: Record<string, string> = {
   superseded: '指令已替换',
 }
 
+const SCHEDULE_STATUS_LABELS: Record<string, string> = {
+  active: '计划已启用',
+  paused: '计划已暂停',
+  completed: '计划已结束',
+  canceled: '计划已取消',
+}
+
 function statusLabel(status?: string) {
   return STATUS_LABELS[String(status || '')] || String(status || '未记录')
 }
@@ -94,19 +80,6 @@ function statusTone(status?: string) {
   if (['completed', 'completed_with_warnings'].includes(value)) return 'border-status-green/25 bg-status-green/8 text-status-green'
   if (ACTIVE_STATUSES.has(value)) return 'border-primary/25 bg-primary/8 text-primary'
   return 'border-border bg-muted text-muted-foreground'
-}
-
-function formatTime(value?: string | null) {
-  if (!value) return '—'
-  const date = new Date(value)
-  if (!Number.isFinite(date.getTime())) return '—'
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
 }
 
 function keywordForItem(item: OrchestrationItemRecord) {
@@ -175,6 +148,7 @@ export function OrchestrationDetailWorkspace({
   const [loading, setLoading] = useState(Boolean(orchestrationId))
   const [refreshing, setRefreshing] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [scheduleUpdating, setScheduleUpdating] = useState(false)
   const [actionFeedback, setActionFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [error, setError] = useState('')
@@ -241,6 +215,8 @@ export function OrchestrationDetailWorkspace({
   const failedCount = sortedItems.filter(item => FAILURE_STATUSES.has(item.status)).length
   const activeCount = sortedItems.filter(item => ACTIVE_STATUSES.has(item.status)).length
   const progressPercent = sortedItems.length > 0 ? Math.round((settledCount / sortedItems.length) * 100) : 0
+  const isScheduleTemplate =
+    detail?.orchestration.metadata?.orchestrationTemplate === true
   const stoppableTaskIds = useMemo(
     () => Array.from(new Set((detail?.executions || [])
       .filter(execution => STOPPABLE_EXECUTION_STATUSES.has(String(execution.status || '')))
@@ -248,7 +224,7 @@ export function OrchestrationDetailWorkspace({
       .filter(Boolean))),
     [detail?.executions],
   )
-  const hasActiveWork = Boolean(detail && (
+  const hasActiveWork = Boolean(detail && !isScheduleTemplate && (
     ACTIVE_STATUSES.has(String(detail.orchestration.status || '')) ||
     activeCount > 0
   ))
@@ -292,6 +268,31 @@ export function OrchestrationDetailWorkspace({
     }
   }
 
+  const updateScheduleStatus = async () => {
+    if (!detail?.schedule || !isScheduleTemplate || !writable || scheduleUpdating) return
+    const action = detail.schedule.status === 'active' ? 'pause' : 'resume'
+    const prompt = action === 'pause'
+      ? '暂停这个无人值守计划吗？已经生成并正在运行的任务不会被停止，但不会再生成下一轮。'
+      : '重新启用这个无人值守计划吗？云端会从下一个有效时间开始运行，不会补跑暂停期间错过的时间。'
+    if (!window.confirm(prompt)) return
+    setScheduleUpdating(true)
+    setActionFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/orchestrations/${orchestrationId}/schedule/${action}`,
+        {},
+      )
+      setActionFeedback(result.message || (action === 'pause' ? '计划已暂停' : '计划已重新启用'))
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '更新无人值守计划失败')
+    } finally {
+      setScheduleUpdating(false)
+    }
+  }
+
   if (!orchestrationId) {
     return (
       <section className={cn('rounded-2xl border border-dashed border-border bg-muted/20 px-5 py-12 text-center', className)}>
@@ -325,8 +326,10 @@ export function OrchestrationDetailWorkspace({
     )
   }
 
-  const { orchestration, executions, agents, attempts } = detail
+  const { orchestration, executions, agents, attempts, schedule } = detail
   const metadata = orchestration.metadata || {}
+  const scheduleTemplate = metadata.orchestrationTemplate === true
+  const scheduleRun = metadata.orchestrationScheduleRun === true
   const planSnapshot = metadata.planSnapshot && typeof metadata.planSnapshot === 'object'
     ? metadata.planSnapshot as Record<string, unknown>
     : {}
@@ -344,19 +347,46 @@ export function OrchestrationDetailWorkspace({
         <div className="flex items-start gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${statusTone(orchestration.status)}`}>{statusLabel(orchestration.status)}</span>
+              <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${scheduleTemplate && schedule?.status === 'active' ? 'border-status-green/25 bg-status-green/8 text-status-green' : statusTone(orchestration.status)}`}>
+                {scheduleTemplate && schedule
+                  ? SCHEDULE_STATUS_LABELS[schedule.status] || schedule.status
+                  : statusLabel(orchestration.status)}
+              </span>
               <span className="rounded-full bg-muted px-2.5 py-1 text-[11px] text-muted-foreground">{PLATFORM_LABELS[orchestration.platform] || orchestration.platform}</span>
-              <span className="text-[11px] text-muted-foreground">一次性多 Agent 任务</span>
+              <span className="text-[11px] text-muted-foreground">
+                {scheduleTemplate
+                  ? '多 Agent 无人值守计划'
+                  : scheduleRun
+                    ? '无人值守计划运行批次'
+                    : '一次性多 Agent 任务'}
+              </span>
             </div>
             <h2 id="orchestration-detail-title" className="mt-2.5 truncate text-lg font-bold text-foreground">{orchestration.title || '未命名编排任务'}</h2>
             <p className="mt-1 text-xs text-muted-foreground">创建于 {formatTime(orchestration.created_at)} · 版本 {orchestration.revision ?? orchestration.orchestration_revision ?? '—'}</p>
           </div>
-          <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
-            disabled={!writable || stopping || stoppableTaskIds.length === 0}
-            title={!writable ? '当前账号为只读权限' : stoppableTaskIds.length === 0 ? '当前没有可停止的子任务' : '停止所有仍可控制的 Agent 子任务'}>
-            {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
-            停止全部
-          </Button>
+          {scheduleTemplate && schedule && ['active', 'paused'].includes(schedule.status) ? (
+            <Button
+              variant={schedule.status === 'active' ? 'outline' : 'default'}
+              size="sm"
+              onClick={() => void updateScheduleStatus()}
+              disabled={!writable || scheduleUpdating}
+              title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
+            >
+              {scheduleUpdating
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : schedule.status === 'active'
+                  ? <Pause className="h-4 w-4" />
+                  : <Play className="h-4 w-4" />}
+              {schedule.status === 'active' ? '暂停计划' : '重新启用'}
+            </Button>
+          ) : (
+            <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
+              disabled={!writable || stopping || stoppableTaskIds.length === 0}
+              title={!writable ? '当前账号为只读权限' : stoppableTaskIds.length === 0 ? '当前没有可停止的子任务' : '停止所有仍可控制的 Agent 子任务'}>
+              {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
+              停止全部
+            </Button>
+          )}
           <Button variant="outline" size="icon" onClick={() => void load(true)} disabled={refreshing} aria-label="刷新编排任务详情">
             <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
           </Button>
@@ -370,15 +400,42 @@ export function OrchestrationDetailWorkspace({
       </header>
 
       <div className="p-4 sm:p-5">
+        {scheduleTemplate && schedule && (
+          <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.035] p-4">
+            <div className="flex items-start gap-3">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                <CalendarDays className="h-4.5 w-4.5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <h3 className="text-sm font-bold text-foreground">云端运行计划</h3>
+                  <span className="text-[11px] text-muted-foreground">
+                    {schedule.schedule_mode === 'custom_dates' ? '指定日期' : '每天'} {String(schedule.start_time || '09:00').slice(0, 5)}
+                    {Number(schedule.random_offset_min || 0) > 0 ? ` · 随机延迟 0–${Number(schedule.random_offset_min)} 分钟` : ''}
+                  </span>
+                </div>
+                <div className="mt-2 grid gap-2 text-[11px] text-muted-foreground sm:grid-cols-3">
+                  <div>下次运行：<strong className="font-semibold text-foreground">{formatTime(schedule.next_run_at)}</strong></div>
+                  <div>已生成：<strong className="font-semibold text-foreground">{Number(schedule.run_count || 0)} 轮</strong></div>
+                  <div>上轮状态：<strong className="font-semibold text-foreground">{schedule.last_run_status ? statusLabel(schedule.last_run_status) : '尚未运行'}</strong></div>
+                </div>
+                <p className="mt-2 text-[11px] leading-4 text-muted-foreground">每个计划时间，每个关键词执行 1 次。计划只保存在云端，不会覆盖任一 Extension 的本地无人值守计划。</p>
+              </div>
+            </div>
+          </section>
+        )}
         <ol className="mb-4 flex items-center gap-2 overflow-x-auto pb-1" aria-label="编排任务结构">
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-primary/25 bg-primary/[0.045] px-3 py-2">
             <ClipboardList className="h-4 w-4 shrink-0 text-primary" />
-            <span><span className="block text-[10px] text-muted-foreground">父任务</span><span className="block text-xs font-bold">{sortedItems.length} 个工作项</span></span>
+            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} 个工作项</span></span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-border bg-muted/30 px-3 py-2">
             <Activity className="h-4 w-4 shrink-0 text-primary" />
-            <span><span className="block text-[10px] text-muted-foreground">工作项状态</span><span className="block text-xs font-bold">{settledCount} 已结算 · {activeCount} 进行/等待</span></span>
+            <span>
+              <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '固定分配' : '工作项状态'}</span>
+              <span className="block text-xs font-bold">{scheduleTemplate ? `${sortedItems.length} 个关键词已分配` : `${settledCount} 已结算 · ${activeCount} 进行/等待`}</span>
+            </span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-border bg-muted/30 px-3 py-2">
@@ -391,16 +448,20 @@ export function OrchestrationDetailWorkspace({
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">Task</div>
-              <h3 className="mt-1 text-sm font-bold text-foreground">父任务进度</h3>
-              <p className="mt-1 text-xs text-muted-foreground">只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。</p>
+              <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : '父任务进度'}</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {scheduleTemplate
+                  ? '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
+                  : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
+              </p>
             </div>
-            <div className="flex flex-wrap gap-2 text-[11px]">
+            {!scheduleTemplate && <div className="flex flex-wrap gap-2 text-[11px]">
               <span className="rounded-md bg-status-green/10 px-2 py-1 font-medium text-status-green">成功 {completedCount}</span>
               <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">进行/等待 {activeCount}</span>
               {failedCount > 0 && <span className="rounded-md bg-status-red/8 px-2 py-1 font-medium text-status-red">异常 {failedCount}</span>}
-            </div>
+            </div>}
           </div>
-          <div className="mt-4 flex items-center gap-3">
+          {!scheduleTemplate && <div className="mt-4 flex items-center gap-3">
             <div
               className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
               role="progressbar"
@@ -413,7 +474,7 @@ export function OrchestrationDetailWorkspace({
               <div className="h-full rounded-full bg-primary transition-[width]" style={{ width: `${progressPercent}%` }} />
             </div>
             <span className="shrink-0 text-xs font-bold tabular-nums text-foreground">{settledCount}/{sortedItems.length}</span>
-          </div>
+          </div>}
           {(Number.isFinite(keywordLimit) || searchFilters || captureSettings) && (
             <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-border/70 pt-3 text-[11px] text-muted-foreground">
               {Number.isFinite(keywordLimit) && keywordLimit > 0 && <span>每词上限 <strong className="font-semibold text-foreground">{keywordLimit} 条</strong></span>}

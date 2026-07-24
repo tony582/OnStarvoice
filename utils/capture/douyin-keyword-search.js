@@ -91,8 +91,8 @@ export async function captureDouyinKeywordNotes({
           code: serviceAbnormalError.code,
           message: serviceAbnormalError.message,
         },
-        stopBatch: true,
-        requiresManualAction: true,
+        stopKeyword: true,
+        continueNextKeyword: true,
       });
     }
     return serviceAbnormalError;
@@ -434,19 +434,12 @@ export async function captureDouyinKeywordNotes({
     const errorCode =
       String(error?.code || "").trim() ||
       (isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED");
-    const platformServiceAbnormal =
-      isDouyinSearchServiceAbnormalError(error);
-
     return {
       ok: false,
-      fatal: Boolean(error?.fatal || platformServiceAbnormal),
-      stopBatch: Boolean(error?.stopBatch || platformServiceAbnormal),
-      securityBlocked: Boolean(
-        error?.securityBlocked || platformServiceAbnormal,
-      ),
-      requiresManualAction: Boolean(
-        error?.requiresManualAction || platformServiceAbnormal,
-      ),
+      fatal: Boolean(error?.fatal),
+      stopBatch: Boolean(error?.stopBatch),
+      securityBlocked: Boolean(error?.securityBlocked),
+      requiresManualAction: Boolean(error?.requiresManualAction),
       platform: "douyin",
       type: SYNC_TYPE.KEYWORD_NOTES,
       data: null,
@@ -461,18 +454,14 @@ export async function captureDouyinKeywordNotes({
         code: errorCode,
         message: errorMessage || "抖音搜索结果采集失败",
         category: String(error?.category || ""),
-        fatal: Boolean(error?.fatal || platformServiceAbnormal),
-        stopBatch: Boolean(error?.stopBatch || platformServiceAbnormal),
-        securityBlocked: Boolean(
-          error?.securityBlocked || platformServiceAbnormal,
-        ),
-        requiresManualAction: Boolean(
-          error?.requiresManualAction || platformServiceAbnormal,
-        ),
+        fatal: Boolean(error?.fatal),
+        stopBatch: Boolean(error?.stopBatch),
+        securityBlocked: Boolean(error?.securityBlocked),
+        requiresManualAction: Boolean(error?.requiresManualAction),
         retryable:
           typeof error?.retryable === "boolean"
             ? error.retryable
-            : !platformServiceAbnormal,
+            : true,
       },
     };
   } finally {

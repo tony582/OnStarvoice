@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Loader2, Building2, Users, KeyRound, Save } from 'lucide-react'
+import { Fragment, useEffect, useState } from 'react'
+import { Loader2, Building2, Users, KeyRound, Save, Pencil } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatExpiry, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -285,13 +285,66 @@ export function UsersPage() {
 }
 
 /* ==================== AuthCodesPage ==================== */
+type AuthCodeForm = {
+  tenantId: string
+  type: string
+  ownerName: string
+  maxBindings: string
+  expiresOn: string
+}
+
+type AuthCodeEditForm = {
+  maxBindings: string
+  expiresOn: string
+}
+
+function toDateInputValue(value: string | null | undefined) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(item => item.type === type)?.value || ''
+  return `${part('year')}-${part('month')}-${part('day')}`
+}
+
+function defaultAuthCodeExpiry(type: string) {
+  if (type === 'permanent') return ''
+  const date = new Date()
+  if (type === 'trial') date.setDate(date.getDate() + 7)
+  else date.setFullYear(date.getFullYear() + 1)
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-')
+}
+
+function newAuthCodeForm(): AuthCodeForm {
+  return {
+    tenantId: '',
+    type: 'annual',
+    ownerName: '',
+    maxBindings: '3',
+    expiresOn: defaultAuthCodeExpiry('annual'),
+  }
+}
+
 export function AuthCodesPage() {
   const [codes, setCodes] = useState<any[]>([])
   const [tenants, setTenants] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
-  const [form, setForm] = useState({ tenantId: '', type: 'annual', ownerName: '' })
+  const [form, setForm] = useState<AuthCodeForm>(() => newAuthCodeForm())
   const [creating, setCreating] = useState(false)
   const [created, setCreated] = useState('')
+  const [editingCodeId, setEditingCodeId] = useState('')
+  const [editForm, setEditForm] = useState<AuthCodeEditForm>({ maxBindings: '', expiresOn: '' })
+  const [editMessage, setEditMessage] = useState('')
+  const [savingCodeId, setSavingCodeId] = useState('')
 
   const load = async () => {
     setLoading(true)
@@ -309,15 +362,26 @@ export function AuthCodesPage() {
 
   const create = async () => {
     if (!form.tenantId) return
+    const maxBindings = Number(form.maxBindings)
+    if (!Number.isInteger(maxBindings) || maxBindings < 1 || maxBindings > 10000) {
+      setCreated('创建失败:设备上限请输入 1-10000 的整数')
+      return
+    }
+    if (form.type !== 'permanent' && !form.expiresOn) {
+      setCreated('创建失败:请选择到期日')
+      return
+    }
     setCreating(true); setCreated('')
     try {
       const d = await api.post<any>('/admin/auth-codes', {
         type: form.type,
         ownerName: form.ownerName.trim(),
         tenantId: form.tenantId,
+        maxBindings,
+        expiresAt: form.type === 'permanent' ? null : form.expiresOn,
       }, { skipTenant: true })
       const tname = tenants.find(t => t.id === form.tenantId)?.name || ''
-      setCreated(`已为「${tname}」生成激活码:${d.code}`)
+      setCreated(`已为「${tname}」生成激活码: ${d.code}`)
       setForm(f => ({ ...f, ownerName: '' }))
       load()
     } catch (err) {
@@ -325,12 +389,60 @@ export function AuthCodesPage() {
     } finally { setCreating(false) }
   }
 
+  const beginEdit = (code: any) => {
+    if (editingCodeId === code.id) {
+      setEditingCodeId('')
+      setEditMessage('')
+      return
+    }
+    setEditingCodeId(code.id)
+    setEditForm({
+      maxBindings: String(code.max_bindings ?? 3),
+      expiresOn: code.type === 'permanent' ? '' : toDateInputValue(code.expires_at),
+    })
+    setEditMessage('')
+  }
+
+  const saveEdit = async (code: any) => {
+    const maxBindings = Number(editForm.maxBindings)
+    const bindingCount = Number(code.binding_count || 0)
+    if (!Number.isInteger(maxBindings) || maxBindings < 1 || maxBindings > 10000) {
+      setEditMessage('设备上限请输入 1-10000 的整数')
+      return
+    }
+    if (maxBindings < bindingCount) {
+      setEditMessage(`设备上限不能低于当前已绑定数量 ${bindingCount}`)
+      return
+    }
+    if (code.type !== 'permanent' && !editForm.expiresOn) {
+      setEditMessage('请选择到期日')
+      return
+    }
+
+    setSavingCodeId(code.id)
+    setEditMessage('')
+    try {
+      await api.patch(`/admin/auth-codes/${code.id}`, {
+        maxBindings,
+        expiresAt: code.type === 'permanent' ? null : editForm.expiresOn,
+      }, { skipTenant: true })
+      await load()
+      setEditMessage('授权配置已保存')
+    } catch (err) {
+      setEditMessage(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setSavingCodeId('')
+    }
+  }
+
+  const today = toDateInputValue(new Date().toISOString())
+
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
       <section className="rounded-xl border border-border bg-card p-4 lg:p-5">
         <h2 className="mb-1 inline-flex items-center gap-1.5 text-sm font-bold"><KeyRound className="h-4 w-4 text-primary" />生成激活码</h2>
-        <p className="mb-3 text-[12.5px] text-muted-foreground">激活码绑定到某个客户(租户),该客户用此码采集的数据全部归属其租户。</p>
-        <div className="grid gap-3 lg:grid-cols-4">
+        <p className="mb-3 text-[12.5px] text-muted-foreground">为客户设置可用的浏览器 Agent 数量和授权期限；生成后仍可随时调整。</p>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
           <Field label="归属客户(租户)">
             <select value={form.tenantId} onChange={e => setForm({ ...form, tenantId: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
               {tenants.length === 0 && <option value="">(先到「租户管理」建客户)</option>}
@@ -338,13 +450,37 @@ export function AuthCodesPage() {
             </select>
           </Field>
           <Field label="类型">
-            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
-              <option value="trial">试用(7天)</option><option value="annual">年付(1年)</option><option value="permanent">永久</option>
+            <select value={form.type} onChange={e => {
+              const type = e.target.value
+              setForm({ ...form, type, expiresOn: defaultAuthCodeExpiry(type) })
+            }} className="h-11 w-full rounded-lg border border-input bg-card px-3 text-sm lg:h-9">
+              <option value="trial">试用</option><option value="annual">年付</option><option value="permanent">永久</option>
             </select>
+          </Field>
+          <Field label="设备上限(浏览器 Agent)">
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={10000}
+              step={1}
+              value={form.maxBindings}
+              onChange={e => setForm({ ...form, maxBindings: e.target.value })}
+            />
+          </Field>
+          <Field label={form.type === 'permanent' ? '到期日(长期有效)' : '到期日'}>
+            <Input
+              type="date"
+              min={today}
+              disabled={form.type === 'permanent'}
+              value={form.expiresOn}
+              onChange={e => setForm({ ...form, expiresOn: e.target.value })}
+            />
           </Field>
           <Field label="备注/联系人(选填)"><Input value={form.ownerName} onChange={e => setForm({ ...form, ownerName: e.target.value })} placeholder="例:安吉星-张经理" /></Field>
           <div className="flex items-end"><Button className="h-11 w-full lg:h-9" onClick={create} disabled={creating || !form.tenantId}>{creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}生成激活码</Button></div>
         </div>
+        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">每个浏览器配置占用 1 个设备名额；同一台电脑安装多个浏览器，也会分别计数。</p>
         {created && <p className={`mt-3 break-all text-[12.5px] font-medium ${created.startsWith('创建失败') ? 'text-status-red' : 'text-status-green'}`}>{created}</p>}
       </section>
 
@@ -352,7 +488,9 @@ export function AuthCodesPage() {
         <>
           <MobileList label={`激活码 · ${codes.length}`}>
             {codes.map(c => {
-              const exp = formatExpiry(c.expires_at)
+              const exp = c.type === 'permanent'
+                ? { text: '长期有效', expired: false }
+                : formatExpiry(c.expires_at)
               return (
                 <MobileEntityCard key={c.id} active={c.status === 'active' && !exp.expired}>
                   <div className="flex items-start justify-between gap-3">
@@ -364,26 +502,63 @@ export function AuthCodesPage() {
                   </div>
                   <div className="mt-4 grid grid-cols-2 gap-2">
                     <MobileMeta label="有效类型" value={authCodeTypeLabel(c.type)} />
-                    <MobileMeta label="绑定设备" value={`${c.binding_count} / ${c.max_bindings}`} />
+                    <MobileMeta label="浏览器 Agent" value={`${c.binding_count} / ${c.max_bindings}`} />
                     <MobileMeta label="联系人" value={c.owner_name || c.owner_email || '-'} />
                     <MobileMeta label="到期日" value={exp.text} danger={exp.expired} />
                   </div>
+                  <Button className="mt-3 h-11 w-full" variant="outline" onClick={() => beginEdit(c)}>
+                    <Pencil className="h-4 w-4" />{editingCodeId === c.id ? '收起调整' : '调整授权'}
+                  </Button>
+                  {editingCodeId === c.id && (
+                    <AuthCodeEditor
+                      code={c}
+                      form={editForm}
+                      busy={savingCodeId === c.id}
+                      message={editMessage}
+                      today={today}
+                      onChange={setEditForm}
+                      onSave={() => saveEdit(c)}
+                      onCancel={() => { setEditingCodeId(''); setEditMessage('') }}
+                    />
+                  )}
                 </MobileEntityCard>
               )
             })}
           </MobileList>
-          <Table heads={['激活码', '类型', '状态', '客户', '绑定', '到期日']}>
+          <Table heads={['激活码', '类型', '状态', '客户', 'Agent 名额', '到期日', '操作']}>
             {codes.map(c => {
-              const exp = formatExpiry(c.expires_at)
+              const exp = c.type === 'permanent'
+                ? { text: '长期有效', expired: false }
+                : formatExpiry(c.expires_at)
               return (
-              <tr key={c.id} className="transition-colors hover:bg-muted/30">
-                <td className="px-4 py-3"><code className="rounded bg-muted px-2 py-0.5 text-xs font-mono">{c.code}</code><div className="mt-0.5 text-xs text-muted-foreground">{c.tenant_name}</div></td>
-                <td className="px-4 py-3"><StatusBadge tone="neutral">{c.type}</StatusBadge></td>
-                <td className="px-4 py-3"><StatusBadge tone={c.status}>{c.status}</StatusBadge></td>
-                <td className="px-4 py-3 text-sm">{c.owner_name || c.owner_email || '-'}</td>
-                <td className="px-4 py-3 tabular-nums text-sm">{c.binding_count} / {c.max_bindings}</td>
-                <td className={`px-4 py-3 text-sm ${exp.expired ? 'text-destructive' : 'text-muted-foreground'}`}>{exp.text}</td>
-              </tr>
+                <Fragment key={c.id}>
+                  <tr className="transition-colors hover:bg-muted/30">
+                    <td className="px-4 py-3"><code className="rounded bg-muted px-2 py-0.5 text-xs font-mono">{c.code}</code><div className="mt-0.5 text-xs text-muted-foreground">{c.tenant_name}</div></td>
+                    <td className="px-4 py-3"><StatusBadge tone="neutral">{authCodeTypeLabel(c.type)}</StatusBadge></td>
+                    <td className="px-4 py-3"><StatusBadge tone={c.status}>{c.status}</StatusBadge></td>
+                    <td className="px-4 py-3 text-sm">{c.owner_name || c.owner_email || '-'}</td>
+                    <td className="px-4 py-3 tabular-nums text-sm">{c.binding_count} / {c.max_bindings}</td>
+                    <td className={`px-4 py-3 text-sm ${exp.expired ? 'text-destructive' : 'text-muted-foreground'}`}>{exp.text}</td>
+                    <td className="px-4 py-3 text-right"><Button size="sm" variant="outline" onClick={() => beginEdit(c)}><Pencil className="h-3.5 w-3.5" />调整</Button></td>
+                  </tr>
+                  {editingCodeId === c.id && (
+                    <tr>
+                      <td colSpan={7} className="bg-muted/20 px-4 py-4">
+                        <AuthCodeEditor
+                          code={c}
+                          form={editForm}
+                          busy={savingCodeId === c.id}
+                          message={editMessage}
+                          today={today}
+                          onChange={setEditForm}
+                          onSave={() => saveEdit(c)}
+                          onCancel={() => { setEditingCodeId(''); setEditMessage('') }}
+                          desktop
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               )
             })}
           </Table>
@@ -518,10 +693,76 @@ function MobileMeta({ label, value, danger = false }: { label: string; value: Re
 }
 
 function authCodeTypeLabel(type: string) {
-  if (type === 'trial') return '试用 · 7 天'
-  if (type === 'annual') return '年付 · 1 年'
+  if (type === 'trial') return '试用'
+  if (type === 'annual') return '年付'
   if (type === 'permanent') return '永久'
   return type || '-'
+}
+
+function AuthCodeEditor({
+  code,
+  form,
+  busy,
+  message,
+  today,
+  onChange,
+  onSave,
+  onCancel,
+  desktop = false,
+}: {
+  code: any
+  form: AuthCodeEditForm
+  busy: boolean
+  message: string
+  today: string
+  onChange: (form: AuthCodeEditForm) => void
+  onSave: () => void
+  onCancel: () => void
+  desktop?: boolean
+}) {
+  const bindingCount = Number(code.binding_count || 0)
+  const permanent = code.type === 'permanent'
+  return (
+    <div className={`${desktop ? 'rounded-lg border border-border bg-card p-4' : 'mt-4 border-t border-border/70 pt-4'}`}>
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-bold">调整设备与有效期</p>
+          <p className="mt-1 text-xs text-muted-foreground">当前已绑定 {bindingCount} 个设备，设备上限不能低于该数量。</p>
+        </div>
+        <StatusBadge tone="neutral">{authCodeTypeLabel(code.type)}</StatusBadge>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(180px,1fr)_minmax(180px,1fr)_auto] lg:items-end">
+        <Field label="设备上限">
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={Math.max(1, bindingCount)}
+            max={10000}
+            step={1}
+            value={form.maxBindings}
+            onChange={e => onChange({ ...form, maxBindings: e.target.value })}
+          />
+        </Field>
+        <Field label={permanent ? '到期日(长期有效)' : '到期日'}>
+          <Input
+            type="date"
+            min={today}
+            disabled={permanent}
+            value={form.expiresOn}
+            onChange={e => onChange({ ...form, expiresOn: e.target.value })}
+          />
+        </Field>
+        <div className="grid grid-cols-2 gap-2 lg:flex">
+          <Button variant="outline" onClick={onCancel} disabled={busy}>取消</Button>
+          <Button onClick={onSave} disabled={busy}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            保存授权
+          </Button>
+        </div>
+      </div>
+      {message && <p className={`mt-3 text-xs font-medium ${message === '授权配置已保存' ? 'text-status-green' : 'text-destructive'}`}>{message}</p>}
+    </div>
+  )
 }
 
 function Field({ label, children, full, className = '' }: { label: string; children: React.ReactNode; full?: boolean; className?: string }) {

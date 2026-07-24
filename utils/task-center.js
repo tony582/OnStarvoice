@@ -336,6 +336,19 @@
             const source = objectValue(entry);
             const keyword = sanitizeText(source.keyword, 200);
             if (!keyword) return null;
+            const errorCode = sanitizeText(
+              source.errorCode || source.error_code || source?.error?.code,
+              100,
+            );
+            const errorCategory = sanitizeText(
+              source.errorCategory ||
+                source.error_category ||
+                source?.error?.category,
+              100,
+            );
+            const keywordServiceAbnormal =
+              errorCode.toUpperCase() ===
+              "DOUYIN_SEARCH_SERVICE_ABNORMAL";
             return {
               round: Math.max(1, normalizeNonNegativeInteger(source.round, 1)),
               index: normalizeNonNegativeInteger(source.index),
@@ -344,6 +357,16 @@
               attemptCount: normalizeNonNegativeInteger(source.attemptCount),
               savedCount: normalizeNonNegativeInteger(source.savedCount),
               error: sanitizeText(source.error),
+              ...(errorCode ? {errorCode} : {}),
+              ...(errorCategory ? {errorCategory} : {}),
+              ...(!keywordServiceAbnormal &&
+              source.securityBlocked === true
+                ? {securityBlocked: true}
+                : {}),
+              ...(!keywordServiceAbnormal &&
+              source.requiresManualAction === true
+                ? {requiresManualAction: true}
+                : {}),
               finishedAt: normalizeTimestamp(source.finishedAt),
             };
           })

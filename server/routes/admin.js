@@ -8,6 +8,73 @@ import { v4 as uuidv4 } from 'uuid';
 const router = Router();
 router.use(requireAdmin);
 
+const AUTH_CODE_TYPES = new Set(['trial', 'annual', 'permanent']);
+const AUTH_CODE_STATUSES = new Set(['active', 'expired', 'frozen']);
+const MAX_AUTH_CODE_BINDINGS = 10000;
+
+class AuthCodeValidationError extends Error {
+  constructor(message, error = 'invalid_request') {
+    super(message);
+    this.name = 'AuthCodeValidationError';
+    this.error = error;
+  }
+}
+
+class AuthCodeConflictError extends Error {
+  constructor(message, error = 'binding_limit_below_usage') {
+    super(message);
+    this.name = 'AuthCodeConflictError';
+    this.error = error;
+  }
+}
+
+function parseAuthCodeMaxBindings(value, fallback = 3) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_AUTH_CODE_BINDINGS) {
+    throw new AuthCodeValidationError(`设备上限必须是 1-${MAX_AUTH_CODE_BINDINGS} 的整数`, 'invalid_max_bindings');
+  }
+  return parsed;
+}
+
+function parseAuthCodeDurationDays(value, fallback = 7) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 36500) {
+    throw new AuthCodeValidationError('有效天数必须是 1-36500 的整数', 'invalid_duration_days');
+  }
+  return parsed;
+}
+
+function parseAuthCodeExpiry(value, { allowNull = false } = {}) {
+  if (value === null || String(value ?? '').trim() === '') {
+    if (allowNull) return null;
+    throw new AuthCodeValidationError('请选择有效的到期日', 'invalid_expires_at');
+  }
+
+  const raw = String(value).trim();
+  const expiresAt = /^\d{4}-\d{2}-\d{2}$/.test(raw)
+    // 手工选择的是自然日：按北京时间当天 23:59:59 到期，而不是当天 00:00。
+    ? new Date(`${raw}T23:59:59.999+08:00`)
+    : new Date(raw);
+  if (Number.isNaN(expiresAt.getTime())) {
+    throw new AuthCodeValidationError('到期日格式不正确', 'invalid_expires_at');
+  }
+  return expiresAt;
+}
+
+function defaultAuthCodeExpiry(type, durationDays) {
+  if (type === 'permanent') return null;
+  const expiresAt = new Date();
+  if (type === 'trial') {
+    const days = durationDays === undefined
+      ? 7
+      : parseAuthCodeDurationDays(durationDays);
+    expiresAt.setDate(expiresAt.getDate() + days);
+  } else {
+    expiresAt.setFullYear(expiresAt.getFullYear() + 1);
+  }
+  return expiresAt;
+}
+
 function validGlobalRole(role) {
   return ['', 'platform_admin', 'internal_operator'].includes(role || '');
 }
@@ -254,21 +321,58 @@ router.get('/auth-codes', async (req, res, next) => {
 
 router.post('/auth-codes', async (req, res, next) => {
   try {
-    const { type = 'trial', ownerEmail = '', ownerName = '', maxBindings = 3, durationDays, notes = '', tenantId } = req.body;
+    const body = req.body || {};
+    const {
+      type = 'trial',
+      ownerEmail = '',
+      ownerName = '',
+      maxBindings = 3,
+      durationDays,
+      notes = '',
+      tenantId,
+    } = body;
+    if (!AUTH_CODE_TYPES.has(type)) {
+      throw new AuthCodeValidationError('激活码类型不合法', 'invalid_auth_code_type');
+    }
+    const normalizedMaxBindings = parseAuthCodeMaxBindings(maxBindings);
+    const hasManualExpiry = Object.prototype.hasOwnProperty.call(body, 'expiresAt');
+    const expiresAt = type === 'permanent'
+      ? null
+      : hasManualExpiry
+        ? parseAuthCodeExpiry(body.expiresAt)
+        : defaultAuthCodeExpiry(type, durationDays);
+    if (expiresAt && expiresAt.getTime() <= Date.now()) {
+      throw new AuthCodeValidationError('到期日必须是今天或未来日期', 'invalid_expires_at');
+    }
+
     const resolvedTenantId = tenantId || await getDefaultTenantId();
     const code = `OSV-${type.toUpperCase().slice(0, 1)}-${uuidv4().slice(0, 8).toUpperCase()}`;
-    const expiresAt = new Date();
-    if (type === 'trial') expiresAt.setDate(expiresAt.getDate() + (durationDays || 7));
-    else if (type === 'annual') expiresAt.setFullYear(expiresAt.getFullYear() + 1);
-    else expiresAt.setFullYear(expiresAt.getFullYear() + 100);
 
     const result = await execute(`
       INSERT INTO auth_codes (tenant_id, code, type, owner_email, owner_name, max_bindings, expires_at, notes)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING id
-    `, [resolvedTenantId, code, type, ownerEmail, ownerName, maxBindings, expiresAt.toISOString(), notes]);
-    return res.json({ ok: true, id: result.lastInsertRowid, code, expiresAt: expiresAt.toISOString() });
+    `, [
+      resolvedTenantId,
+      code,
+      type,
+      String(ownerEmail || '').trim(),
+      String(ownerName || '').trim(),
+      normalizedMaxBindings,
+      expiresAt?.toISOString() || null,
+      String(notes || '').trim(),
+    ]);
+    return res.json({
+      ok: true,
+      id: result.lastInsertRowid,
+      code,
+      maxBindings: normalizedMaxBindings,
+      expiresAt: expiresAt?.toISOString() || null,
+    });
   } catch (err) {
+    if (err instanceof AuthCodeValidationError) {
+      return res.status(400).json({ ok: false, error: err.error, message: err.message });
+    }
     return next(err);
   }
 });
@@ -276,24 +380,81 @@ router.post('/auth-codes', async (req, res, next) => {
 router.patch('/auth-codes/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { status, ownerEmail, ownerName, maxBindings, expiresAt, notes } = req.body;
-    const updates = [];
-    const params = [];
-    const add = (field, value) => {
-      params.push(value);
-      updates.push(`${field} = $${params.length}`);
-    };
-    if (status !== undefined) add('status', status);
-    if (ownerEmail !== undefined) add('owner_email', ownerEmail);
-    if (ownerName !== undefined) add('owner_name', ownerName);
-    if (maxBindings !== undefined) add('max_bindings', maxBindings);
-    if (expiresAt !== undefined) add('expires_at', expiresAt);
-    if (notes !== undefined) add('notes', notes);
-    if (updates.length === 0) return res.json({ ok: false, message: '没有要更新的字段' });
-    params.push(id);
-    const result = await execute(`UPDATE auth_codes SET ${updates.join(', ')} WHERE id = $${params.length}`, params);
-    return res.json({ ok: result.rowCount > 0 });
+    const body = req.body || {};
+    const { status, ownerEmail, ownerName, maxBindings, notes } = body;
+    if (status !== undefined && !AUTH_CODE_STATUSES.has(status)) {
+      throw new AuthCodeValidationError('激活码状态不合法', 'invalid_auth_code_status');
+    }
+    const normalizedMaxBindings = maxBindings === undefined
+      ? undefined
+      : parseAuthCodeMaxBindings(maxBindings);
+    const hasExpiresAt = Object.prototype.hasOwnProperty.call(body, 'expiresAt');
+    const normalizedExpiresAt = hasExpiresAt
+      ? parseAuthCodeExpiry(body.expiresAt, { allowNull: true })
+      : undefined;
+    if (normalizedExpiresAt && normalizedExpiresAt.getTime() <= Date.now()) {
+      throw new AuthCodeValidationError('到期日必须是今天或未来日期', 'invalid_expires_at');
+    }
+
+    const updated = await withTransaction(async tx => {
+      const code = await tx.queryOne(
+        'SELECT id, type, status FROM auth_codes WHERE id = $1 FOR UPDATE',
+        [id]
+      );
+      if (!code) return null;
+      if (hasExpiresAt && normalizedExpiresAt === null && code.type !== 'permanent') {
+        throw new AuthCodeValidationError('试用或年付激活码必须设置到期日', 'invalid_expires_at');
+      }
+
+      if (normalizedMaxBindings !== undefined) {
+        const bindingCount = Number((await tx.queryOne(
+          'SELECT COUNT(*) AS count FROM auth_bindings WHERE code_id = $1',
+          [id]
+        ))?.count || 0);
+        if (normalizedMaxBindings < bindingCount) {
+          throw new AuthCodeConflictError(`设备上限不能低于当前已绑定数量 ${bindingCount}`);
+        }
+      }
+
+      const updates = [];
+      const params = [];
+      const add = (field, value) => {
+        params.push(value);
+        updates.push(`${field} = $${params.length}`);
+      };
+      if (status !== undefined) add('status', status);
+      if (ownerEmail !== undefined) add('owner_email', String(ownerEmail || '').trim());
+      if (ownerName !== undefined) add('owner_name', String(ownerName || '').trim());
+      if (normalizedMaxBindings !== undefined) add('max_bindings', normalizedMaxBindings);
+      if (hasExpiresAt) {
+        add('expires_at', normalizedExpiresAt?.toISOString() || null);
+        // 管理员把到期日延后或改为永久时，自动恢复可用状态。
+        if (status === undefined) add('status', 'active');
+      }
+      if (notes !== undefined) add('notes', String(notes || '').trim());
+      if (updates.length === 0) {
+        throw new AuthCodeValidationError('没有要更新的字段');
+      }
+      params.push(id);
+      return tx.queryOne(
+        `UPDATE auth_codes
+         SET ${updates.join(', ')}
+         WHERE id = $${params.length}
+         RETURNING id, status, max_bindings, expires_at`,
+        params
+      );
+    });
+    if (!updated) {
+      return res.status(404).json({ ok: false, error: 'not_found', message: '激活码不存在' });
+    }
+    return res.json({ ok: true, authCode: updated });
   } catch (err) {
+    if (err instanceof AuthCodeValidationError) {
+      return res.status(400).json({ ok: false, error: err.error, message: err.message });
+    }
+    if (err instanceof AuthCodeConflictError) {
+      return res.status(409).json({ ok: false, error: err.error, message: err.message });
+    }
     return next(err);
   }
 });
@@ -610,5 +771,11 @@ router.post('/official-accounts/reclassify', async (req, res, next) => {
 router.post('/login', (req, res) => {
   return res.json({ ok: true, message: '登录成功' });
 });
+
+export {
+  defaultAuthCodeExpiry,
+  parseAuthCodeExpiry,
+  parseAuthCodeMaxBindings,
+};
 
 export default router;

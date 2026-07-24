@@ -3,6 +3,7 @@ import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
   ExternalLink, User, FileText, Camera, Bell, Archive, ArchiveRestore, Eye, Sparkles, ZoomIn,
   Pencil, Ban, ArrowLeft, History, ArrowRight, StickyNote, Tags, AlertTriangle,
+  Copy, RefreshCw, Radar,
 } from 'lucide-react'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
@@ -69,7 +70,7 @@ export function RecordDrawer({
   customTagCatalog?: CustomTag[]
   onUpdateCustomTags?: (patch: CustomTagPatch) => Promise<CustomTag[]>
 }) {
-  const [tab, setTab] = useState<'content' | 'comments' | 'official' | 'snapshot' | 'history'>('content')
+  const [tab, setTab] = useState<'content' | 'analysis' | 'comments' | 'official' | 'snapshot' | 'history'>('content')
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
   const [observations, setObservations] = useState<any[]>([])
@@ -328,6 +329,7 @@ export function RecordDrawer({
 
   const TABS = [
     { id: 'content' as const, label: '内容', icon: FileText },
+    { id: 'analysis' as const, label: '深度剖析', icon: Sparkles },
     { id: 'comments' as const, label: `评论 (${comments.length})`, icon: MessageCircle },
     { id: 'official' as const, label: `官方回复 (${officialResponses.length})`, icon: CheckCircle },
     { id: 'snapshot' as const, label: '采集', icon: Camera },
@@ -515,6 +517,10 @@ export function RecordDrawer({
                       onOpen={setLightbox}
                     />
                   </div>
+                )}
+
+                {tab === 'analysis' && (
+                  <RecordAnalysisPanel record={r} canWrite={canProcess} />
                 )}
 
                 {tab === 'comments' && (
@@ -1346,6 +1352,210 @@ function InsightList({ label, items, warn }: { label: string; items: string[]; w
           <li key={i} className={warn ? 'text-amber-700 dark:text-amber-300' : ''}>{it}</li>
         ))}
       </ul>
+    </div>
+  )
+}
+
+// 单条深度剖析:自含数据获取(GET 读缓存 → 无则 POST 发起,60s 显式超时),四块结果展示。
+// 与话题级同范式:LLM 覆盖文字层,失败落 rule_fallback 兜底(仍有内容,可一键重试)。
+const RISK_TONE: Record<string, string> = { critical: 'critical', warning: 'negative', attention: 'medium', watch: 'muted' }
+const STANCE_LABEL: Record<string, string> = { positive: '正面', negative: '负面', neutral: '中性', mixed: '褒贬不一' }
+const RECORD_SOURCE_LABEL: Record<string, string> = { llm: 'AI 深剖', rule_fallback: '规则兜底' }
+
+function RecordAnalysisPanel({ record, canWrite }: { record: any; canWrite: boolean }) {
+  const [loading, setLoading] = useState(true)
+  const [analysis, setAnalysis] = useState<any>(null)
+  const [source, setSource] = useState('')
+  const [stale, setStale] = useState(false)
+  const [generating, setGenerating] = useState(false)
+  const [error, setError] = useState('')
+  const [brandMissing, setBrandMissing] = useState(false)
+  const [copied, setCopied] = useState('')
+
+  useEffect(() => {
+    let active = true
+    setLoading(true); setAnalysis(null); setSource(''); setStale(false); setError(''); setBrandMissing(false)
+    api.get<any>(`/opinion-analysis/records/${record.id}`)
+      .then(d => {
+        if (!active) return
+        setAnalysis(d.analysis || null)
+        setSource(d.source || '')
+        setStale(Boolean(d.stale))
+      })
+      .catch(() => { /* 拉取失败按未剖析处理,由用户手动发起 */ })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [record.id])
+
+  const run = async (refresh: boolean) => {
+    setGenerating(true); setError(''); setBrandMissing(false)
+    try {
+      const d = await api.post<any>(
+        `/opinion-analysis/records/${record.id}${refresh ? '?refresh=1' : ''}`, {}, { timeoutMs: 60000 },
+      )
+      setAnalysis(d.analysis || null)
+      setSource(d.source || '')
+      setStale(false)
+    } catch (e: any) {
+      const msg = e?.message || '剖析失败'
+      if (/品牌/.test(msg)) setBrandMissing(true)
+      setError(msg)
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const copy = async (key: string, text: string) => {
+    try { await navigator.clipboard.writeText(text); setCopied(key); setTimeout(() => setCopied(''), 1500) } catch { /* 忽略 */ }
+  }
+
+  if (loading) return <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+
+  if (brandMissing) {
+    return (
+      <EmptyState icon={AlertTriangle} title="尚未配置品牌语境"
+        description="回应话术是客户可见交付物,需先在「系统设置」填写品牌名称与业务语境后再发起深度剖析。" />
+    )
+  }
+
+  if (!analysis) {
+    return (
+      <div className="flex flex-col items-center gap-4 py-10 text-center">
+        <Radar className="h-8 w-8 text-muted-foreground/60" />
+        <div>
+          <p className="text-sm font-semibold text-foreground">尚未做深度剖析</p>
+          <p className="mt-1 text-sm text-muted-foreground">基于正文 / 逐字稿 / 图文文字 / 评论,一次性拆解观点、风险与回应口径。</p>
+        </div>
+        {canWrite ? (
+          <Button size="sm" disabled={generating} onClick={() => void run(false)}>
+            {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {generating ? '正在深度剖析…(约需数十秒)' : '开始深度剖析'}
+          </Button>
+        ) : <p className="text-xs text-muted-foreground">只读账号无法发起剖析。</p>}
+        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{friendlyError(error)}</p>}
+      </div>
+    )
+  }
+
+  const overview = analysis.overview || {}
+  const content = analysis.contentInsights || {}
+  const commentIns = analysis.commentInsights || {}
+  const spread = analysis.spreadRisk || {}
+  const response = analysis.suggestedResponse || {}
+  const evidence: string[] = Array.isArray(analysis.meta?.evidenceSources) ? analysis.meta.evidenceSources : []
+  const corePoints: string[] = Array.isArray(content.corePoints) ? content.corePoints : []
+  const issues: string[] = Array.isArray(content.issues) ? content.issues : []
+  const points: any[] = Array.isArray(commentIns.points) ? commentIns.points : []
+  const alertReasons: string[] = Array.isArray(spread.alertReasons) ? spread.alertReasons : []
+  const riskLevel = String(overview.riskLevel || 'watch')
+
+  return (
+    <div className="space-y-5">
+      {/* 头部:来源徽章 + 重新剖析 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusBadge tone={source === 'llm' ? 'reviewing' : 'muted'}>{RECORD_SOURCE_LABEL[source] || source || '规则兜底'}</StatusBadge>
+        {evidence.map((e, i) => <span key={i} className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{e}</span>)}
+        {canWrite && (
+          <button onClick={() => void run(true)} disabled={generating}
+            className="ml-auto inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
+            {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            重新剖析
+          </button>
+        )}
+      </div>
+      {stale && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-300/60 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>内容或评论在剖析后有更新,当前结果可能已过时,建议「重新剖析」。</span>
+        </div>
+      )}
+      {source === 'rule_fallback' && (
+        <p className="text-[12px] text-muted-foreground">当前为规则兜底结果(LLM 未生成,可能未配置 Key 或调用超时)。点「重新剖析」再试一次。</p>
+      )}
+      {error && <p className="text-sm text-rose-600 dark:text-rose-400">{friendlyError(error)}</p>}
+
+      {/* 1. 风险概览 */}
+      <section>
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusBadge tone={RISK_TONE[riskLevel] || 'muted'}>{overview.riskLevelLabel || riskLevel}</StatusBadge>
+          <StatusBadge tone={overview.stance === 'positive' ? 'positive' : overview.stance === 'negative' ? 'negative' : 'muted'}>
+            {STANCE_LABEL[String(overview.stance)] || '中性'}
+          </StatusBadge>
+        </div>
+        {overview.summary && <p className="mt-2 text-sm leading-relaxed">{overview.summary}</p>}
+      </section>
+
+      {/* 2. 内容拆解 */}
+      {(corePoints.length > 0 || issues.length > 0) && (
+        <section className="space-y-2.5 border-t border-border/50 pt-4 text-sm">
+          <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">内容拆解</h4>
+          {corePoints.length > 0 && <InsightList label="核心观点" items={corePoints} />}
+          {issues.length > 0 && <InsightList label="涉及槽点" items={issues} warn />}
+        </section>
+      )}
+
+      {/* 3. 评论观点 */}
+      {(commentIns.summary || points.length > 0) && (
+        <section className="space-y-2 border-t border-border/50 pt-4">
+          <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">评论观点</h4>
+          {commentIns.summary && <p className="text-sm leading-relaxed text-muted-foreground">{commentIns.summary}</p>}
+          <div className="space-y-2">
+            {points.map((p, i) => (
+              <div key={i} className="rounded-lg bg-muted/40 p-3">
+                <div className="mb-1 flex items-center gap-2">
+                  <StatusBadge tone={p.stance === 'negative' ? 'negative' : p.stance === 'positive' ? 'positive' : p.stance === 'mixed' ? 'medium' : 'muted'}>
+                    {STANCE_LABEL[String(p.stance)] || '中性'}
+                  </StatusBadge>
+                  <span className="text-sm font-semibold">{p.viewpoint}</span>
+                </div>
+                {p.summary && <p className="text-[13px] leading-5 text-muted-foreground">{p.summary}</p>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* 4. 传播风险 */}
+      <section className="border-t border-border/50 pt-4">
+        <h4 className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">传播与风险</h4>
+        <div className="grid grid-cols-2 gap-3">
+          <InfoTile label="总互动" value={formatNumber(spread.interactionTotal)} />
+          <InfoTile label="负面评论" value={`${formatNumber(spread.negativeCommentCount)} 条`} />
+        </div>
+        {alertReasons.length > 0 && (
+          <div className="mt-3">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">已命中预警</div>
+            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[13px] text-rose-700 dark:text-rose-300">
+              {alertReasons.map((reason, i) => <li key={i}>{reason}</li>)}
+            </ul>
+          </div>
+        )}
+      </section>
+
+      {/* 5. 应对建议与回应口径 */}
+      <section className="border-t border-border/50 pt-4">
+        <h4 className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">应对建议</h4>
+        {response.action && <p className="text-sm leading-relaxed">{response.action}</p>}
+        {response.replyDraft && (
+          <div className="mt-3 rounded-lg border border-border/60 bg-muted/30 p-3">
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">回应话术草稿</span>
+              <button onClick={() => void copy('reply', response.replyDraft)}
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-0.5 text-[11px] font-semibold text-primary transition hover:bg-accent">
+                {copied === 'reply' ? <CheckCircle className="h-3 w-3 text-status-green" /> : <Copy className="h-3 w-3" />}
+                {copied === 'reply' ? '已复制' : '复制'}
+              </button>
+            </div>
+            <p className="whitespace-pre-wrap text-[13px] leading-5">{response.replyDraft}</p>
+          </div>
+        )}
+        {response.escalation && (
+          <div className="mt-3">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">升级 / 协同</div>
+            <p className="mt-0.5 text-[13px] leading-5 text-muted-foreground">{response.escalation}</p>
+          </div>
+        )}
+      </section>
     </div>
   )
 }

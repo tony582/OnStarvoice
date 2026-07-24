@@ -27,7 +27,7 @@ const PLATFORM_LABEL = {
   douyin: '抖音',
   unknown: '未知平台',
 };
-const RISK_LEVEL_LABEL = {
+export const RISK_LEVEL_LABEL = {
   watch: '平稳观察',
   attention: '需要关注',
   warning: '风险预警',
@@ -58,7 +58,8 @@ const TRIAGE_LABEL = {
   no_action: '无需操作',
   false_positive: '误报',
 };
-const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
+// 舆情剖析(opinion-analysis.js)自建的 records/alerts SQL 与预检 COUNT 同拼此口径,保持与报告一致
+export const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
 
 function escHtml(value) {
   return String(value ?? '')
@@ -163,7 +164,7 @@ function normalizeRows(rows = [], numberKeys = []) {
   });
 }
 
-async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
+export async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
   const baseParams = [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
   // 可选「采集关键词」过滤:仅数据看板按主题/关键词收敛时传入;报告路径不传 → kw 空 → recordFilter 退化、零影响。
   // 口径与内容分诊一致(精确 r.keyword)。⚠ PG 不允许"绑了却没引用"的参数(会报 could not determine type):
@@ -989,31 +990,29 @@ function buildSentimentStructure(stats, sentimentCounts) {
   return rows.map(row => ({ ...row, share: pct(row.count, total) }));
 }
 
-// 借鉴 MediaClaw 关键词舆情扫描:用 LLM 对本周期代表样本做跨样本六维研判,
-// 把"统计+模板话术"升级为真 AI 研判;每条议题/建议挂可回链的样本 id(取信管理层/PR)。
-async function buildAiOpinionInsight(tenantId, current) {
-  if (!tenantId) return null;
-  // 分层抽样:除重点负面/增长样本外,从情感样本的头/中/尾各取一截,保证中低互动的早期/长尾负面也进研判
-  const ss = current.sentimentSamples || [];
+// 分层抽样池:除重点负面/增长样本外,从情感样本的头/中/尾各取一截,保证中低互动的早期/长尾负面也进研判;
+// 附带头部断层比 cliffPct(Top1 占 Top5 互动比例,判舆情是被少数爆款主导(易引导/易反转)还是普遍发酵(真实民意))。
+// 报告线 buildAiOpinionInsight 与舆情剖析(opinion-analysis.js)共用此池,保证两处样本口径永远一致。
+export function buildInsightSamplePool(stats) {
+  const ss = stats.sentimentSamples || [];
   const mid = Math.floor(ss.length / 2);
   const stratified = [...ss.slice(0, 10), ...ss.slice(mid, mid + 5), ...ss.slice(-5)];
   const pool = [
-    ...(current.topNegative || []),
-    ...(current.risingRecords || []),
+    ...(stats.topNegative || []),
+    ...(stats.risingRecords || []),
     ...stratified,
   ];
-  // 头部断层比:Top1 占 Top5 互动比例,判舆情是被少数爆款主导(易引导/易反转)还是普遍发酵(真实民意)
   const interOf = (r) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0);
-  const tops = (current.topInteraction || []).map(interOf).sort((a, b) => b - a).slice(0, 5);
+  const tops = (stats.topInteraction || []).map(interOf).sort((a, b) => b - a).slice(0, 5);
   const topSum = tops.reduce((a, b) => a + b, 0);
   const cliffPct = topSum > 0 ? Math.round((tops[0] || 0) / topSum * 100) : 0;
   const seen = new Set();
   const samples = [];
-  const idMap = {};
+  const sampleMap = {};
   for (const r of pool) {
     const id = r.id || r.record_id;
     if (!id) continue;
-    if (!idMap[id]) idMap[id] = { title: String(r.title || '').slice(0, 80), url: r.url || r.record_url || '' };
+    if (!sampleMap[id]) sampleMap[id] = { title: String(r.title || '').slice(0, 80), url: r.url || r.record_url || '' };
     if (seen.has(id)) continue;
     seen.add(id);
     samples.push({
@@ -1027,6 +1026,14 @@ async function buildAiOpinionInsight(tenantId, current) {
     });
     if (samples.length >= 30) break;
   }
+  return { samples, sampleMap, cliffPct };
+}
+
+// 借鉴 MediaClaw 关键词舆情扫描:用 LLM 对本周期代表样本做跨样本六维研判,
+// 把"统计+模板话术"升级为真 AI 研判;每条议题/建议挂可回链的样本 id(取信管理层/PR)。
+async function buildAiOpinionInsight(tenantId, current) {
+  if (!tenantId) return null;
+  const { samples, sampleMap, cliffPct } = buildInsightSamplePool(current);
   if (samples.length < 3) return null;
 
   const brandName = (await getSetting('brand_name', tenantId)) || '目标品牌';
@@ -1051,7 +1058,7 @@ ${samples.map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评
   try {
     const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
     if (!result || typeof result !== 'object') return null;
-    return { ...result, sampleMap: idMap };
+    return { ...result, sampleMap };
   } catch (err) {
     console.warn('[report] AI 研判失败:', err?.message || err);
     return null;

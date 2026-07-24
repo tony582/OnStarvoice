@@ -249,13 +249,14 @@ test("an ancestor visibility mutation detects a pre-mounted long blocking subtre
   }
 });
 
-test("the structured error is non-retryable and stops the whole batch", () => {
+test("the structured error stops only the current keyword and remains retryable", () => {
   const error = createDouyinSearchServiceAbnormalError({pageUrl: searchUrl});
 
   assert.equal(error.code, DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE);
-  assert.equal(error.securityBlocked, true);
-  assert.equal(error.requiresManualAction, true);
-  assert.equal(error.stopBatch, true);
-  assert.equal(error.fatal, true);
-  assert.equal(error.retryable, false);
+  assert.equal(error.securityBlocked, false);
+  assert.equal(error.requiresManualAction, false);
+  assert.equal(error.stopBatch, false);
+  assert.equal(error.fatal, false);
+  assert.equal(error.retryable, true);
+  assert.equal(error.keywordScoped, true);
 });

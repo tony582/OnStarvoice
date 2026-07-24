@@ -6,6 +6,7 @@ import cron from 'node-cron';
 import { queryAll, execute, getSetting } from './db/init.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
+import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 
 function shanghaiNowParts() {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -91,6 +92,21 @@ export function startCronJobs() {
       await enqueueDueMonitorExecutions();
     } catch (err) {
       console.error('[Cron] Monitor enqueue error:', err.message);
+    }
+  });
+
+  cron.schedule('* * * * *', async () => {
+    try {
+      const results = await enqueueDueCaptureOrchestrations(20);
+      const created = results.filter(result => result.kind === 'created').length;
+      const skipped = results.length - created;
+      if (results.length > 0) {
+        console.log(
+          `[Cron] Multi-Agent schedules: ${created} run(s) created, ${skipped} occurrence(s) advanced`,
+        );
+      }
+    } catch (err) {
+      console.error('[Cron] Multi-Agent schedule error:', err.message);
     }
   });
 

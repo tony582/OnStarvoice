@@ -1534,6 +1534,22 @@ function summarizeCloudPlanSaveResult(plan, commandId, requestId) {
   };
 }
 
+function summarizeCloudPlanDeleteResult(commandId, requestId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  return {
+    state: 'completed',
+    accepted: Boolean(normalizedRequestId),
+    reason: normalizedRequestId ? 'plan_deleted' : 'plan_delete_failed',
+    requestId: normalizedRequestId,
+    cloudCommandId: String(commandId || ''),
+    executionMode: 'unattended_plan',
+    planOperation: 'delete',
+    message: normalizedRequestId
+      ? '设备已停止并删除无人值守计划'
+      : '设备未能删除无人值守计划',
+  };
+}
+
 async function executeCloudTaskAgentCommand(command, token) {
   const commandId = String(command?.id || '').trim();
   if (!commandId) return null;
@@ -1556,65 +1572,114 @@ async function executeCloudTaskAgentCommand(command, token) {
       String(payload.executionMode || '').trim() === 'unattended_plan'
         ? 'unattended_plan'
         : 'one_time';
+    const planOperation =
+      executionMode === 'unattended_plan' &&
+      String(payload.planOperation || '').trim() === 'delete'
+        ? 'delete'
+        : 'save';
     if (
       executionMode === 'unattended_plan' &&
       (!commandResult || commandResult.state === 'executing')
     ) {
-      const planSource =
-        payload.planSnapshot && typeof payload.planSnapshot === 'object'
-          ? payload.planSnapshot
-          : {};
-      const platform = normalizePlatformId(
-        planSource.platform || payload.platform || command.platform,
-      );
-      const keywords = normalizeKeywordList(planSource.keywords);
-      if (
-        !clientTaskId ||
-        !['xiaohongshu', 'douyin'].includes(platform) ||
-        keywords.length === 0
-      ) {
-        commandResult = await rememberCloudCommandResult(commandId, {
-          state: 'completed',
-          accepted: false,
-          reason: 'invalid_task_payload',
-          requestId: clientTaskId,
-          executionMode,
-          message: '云端计划缺少有效的平台或关键词',
-        });
-      } else {
-        await rememberCloudCommandResult(commandId, {
-          state: 'executing',
-          accepted: false,
-          reason: 'executing',
-          requestId: clientTaskId,
-          executionMode,
-        });
-        try {
-          const plan = await saveUnattendedKeywordPlan(
-            {
-              ...planSource,
-              enabled: true,
-              platform,
-              keywords,
-            },
-            {confirmCloudScope: true},
-          );
-          commandResult = await rememberCloudCommandResult(
-            commandId,
-            summarizeCloudPlanSaveResult(plan, commandId, clientTaskId),
-          );
-        } catch (error) {
+      if (planOperation === 'delete') {
+        if (!clientTaskId) {
           commandResult = await rememberCloudCommandResult(commandId, {
             state: 'completed',
             accepted: false,
-            reason: String(error?.code || 'plan_save_failed'),
+            reason: 'invalid_task_payload',
             requestId: clientTaskId,
             executionMode,
-            message: String(error?.message || '设备保存无人值守计划失败').slice(
-              0,
-              1000,
-            ),
+            planOperation,
+            message: '云端删除计划指令缺少有效标识',
           });
+        } else {
+          await rememberCloudCommandResult(commandId, {
+            state: 'executing',
+            accepted: false,
+            reason: 'executing',
+            requestId: clientTaskId,
+            executionMode,
+            planOperation,
+          });
+          try {
+            await clearUnattendedKeywordPlan({confirmCloudScope: true});
+            commandResult = await rememberCloudCommandResult(
+              commandId,
+              summarizeCloudPlanDeleteResult(commandId, clientTaskId),
+            );
+          } catch (error) {
+            commandResult = await rememberCloudCommandResult(commandId, {
+              state: 'completed',
+              accepted: false,
+              reason: String(error?.code || 'plan_delete_failed'),
+              requestId: clientTaskId,
+              executionMode,
+              planOperation,
+              message: String(error?.message || '设备删除无人值守计划失败').slice(
+                0,
+                1000,
+              ),
+            });
+          }
+        }
+      } else {
+        const planSource =
+          payload.planSnapshot && typeof payload.planSnapshot === 'object'
+            ? payload.planSnapshot
+            : {};
+        const platform = normalizePlatformId(
+          planSource.platform || payload.platform || command.platform,
+        );
+        const keywords = normalizeKeywordList(planSource.keywords);
+        if (
+          !clientTaskId ||
+          !['xiaohongshu', 'douyin'].includes(platform) ||
+          keywords.length === 0
+        ) {
+          commandResult = await rememberCloudCommandResult(commandId, {
+            state: 'completed',
+            accepted: false,
+            reason: 'invalid_task_payload',
+            requestId: clientTaskId,
+            executionMode,
+            planOperation,
+            message: '云端计划缺少有效的平台或关键词',
+          });
+        } else {
+          await rememberCloudCommandResult(commandId, {
+            state: 'executing',
+            accepted: false,
+            reason: 'executing',
+            requestId: clientTaskId,
+            executionMode,
+          });
+          try {
+            const plan = await saveUnattendedKeywordPlan(
+              {
+                ...planSource,
+                enabled: true,
+                platform,
+                keywords,
+              },
+              {confirmCloudScope: true},
+            );
+            commandResult = await rememberCloudCommandResult(
+              commandId,
+              summarizeCloudPlanSaveResult(plan, commandId, clientTaskId),
+            );
+          } catch (error) {
+            commandResult = await rememberCloudCommandResult(commandId, {
+              state: 'completed',
+              accepted: false,
+              reason: String(error?.code || 'plan_save_failed'),
+              requestId: clientTaskId,
+              executionMode,
+              message: String(error?.message || '设备保存无人值守计划失败').slice(
+                0,
+                1000,
+              ),
+            });
+          }
         }
       }
     } else if (!commandResult || commandResult.state === 'executing') {
@@ -2737,6 +2802,32 @@ async function saveUnattendedKeywordPlan(
   return nextPlan;
 }
 
+async function clearUnattendedKeywordPlan({confirmCloudScope = false} = {}) {
+  const currentPlan = await readUnattendedKeywordPlan();
+  await saveUnattendedKeywordPlan(
+    {
+      ...currentPlan,
+      configured: false,
+      enabled: false,
+      keywords: [],
+      nextRunAt: '',
+    },
+    {
+      recomputeNext: false,
+      preserveRunState: false,
+      confirmCloudScope: false,
+    },
+  );
+  await chrome.storage.local.remove(STORAGE_KEYS.unattendedKeywordPlan);
+  await syncUnattendedKeywordAlarm({});
+  if (confirmCloudScope) {
+    const credential = await readCloudTaskAgentCredential();
+    await confirmCloudTaskAgentPlanScope(credential.id);
+  }
+  scheduleCloudTaskAgentSync('unattended_plan_deleted');
+  return {configured: false, enabled: false};
+}
+
 let captureExecutionLockOperationQueue = Promise.resolve();
 
 function runCaptureExecutionLockOperation(operation) {
@@ -3661,6 +3752,9 @@ function getUnattendedRecoveryBlockReason(request) {
     )
       .trim()
       .toUpperCase();
+    if (entryCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+      return false;
+    }
     return Boolean(
       entry?.securityBlocked === true ||
         entry?.security_blocked === true ||
@@ -3671,7 +3765,6 @@ function getUnattendedRecoveryBlockReason(request) {
         [
           'PLATFORM_SAFETY_BLOCK',
           'SECURITY_VERIFICATION_REQUIRED',
-          'DOUYIN_SEARCH_SERVICE_ABNORMAL',
         ].includes(entryCode),
     );
   });
@@ -3697,8 +3790,6 @@ function getUnattendedRecoveryBlockReason(request) {
       '',
   ).trim();
   if (structuredBlock) {
-    const douyinServiceAbnormal =
-      structuredCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL';
     return {
       code: structuredCode || 'UNATTENDED_RECOVERY_BLOCKED',
       category: String(
@@ -3706,16 +3797,14 @@ function getUnattendedRecoveryBlockReason(request) {
           structuredBlock?.error_category ||
           structuredBlock?.category ||
           structuredBlock?.error?.category ||
-          (douyinServiceAbnormal ? 'platform_service_abnormal' : ''),
+          '',
       ).trim(),
-      message: douyinServiceAbnormal
-        ? '检测到抖音“服务出现异常”，为避免触发安全审核，已停止自动恢复'
-        : structuredMessage || '任务已进入人工处理状态，已停止自动恢复',
+      message:
+        structuredMessage || '任务已进入人工处理状态，已停止自动恢复',
       securityBlocked: Boolean(
         structuredBlock?.securityBlocked === true ||
           structuredBlock?.security_blocked === true ||
-          structuredBlock?.error?.securityBlocked === true ||
-          douyinServiceAbnormal,
+          structuredBlock?.error?.securityBlocked === true,
       ),
       requiresManualAction: true,
       retryable: false,

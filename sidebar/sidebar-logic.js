@@ -111,10 +111,6 @@ import {
   summarizeUnattendedKeywordCheckpoint,
 } from "../utils/unattended-keyword-run.js";
 import {
-  DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE,
-  DOUYIN_SEARCH_SERVICE_ABNORMAL_MESSAGE,
-} from "../utils/capture/douyin-search-guard.js";
-import {
   AUTH_CODE_VIEW_MODE,
   ensureEncryptedAuthCode,
   ensurePlainAuthCode,
@@ -7580,8 +7576,9 @@ async function handleCaptureSearchData() {
       if (searchBatchMode) {
         // 批量多词:逐词在 runner tab(=当前 tab)采,排序/发布时间由 batchCaptureByKeywords 内部逐词应用
         activeBatchRunnerTabId = searchActiveTabId ? Number(searchActiveTabId) : null;
-        const batchResult = await batchCaptureByKeywords({
-          keywords: [...searchKeywords],
+        const runSearchBatchAttempt = (attemptKeywords) =>
+          batchCaptureByKeywords({
+          keywords: [...attemptKeywords],
           platform: pagePlatform,
           baseSearchUrl: activeTabUrl,
           captureTaskId: persistentCaptureTaskId,
@@ -7681,6 +7678,33 @@ async function handleCaptureSearchData() {
           },
           shouldStop: () => searchCaptureCancelRequested,
         });
+        const searchBatchAttemptRun = await runUnattendedKeywordAttempts({
+          allKeywords: [...searchKeywords],
+          initialPendingKeywords: [...searchKeywords],
+          maxAttempts: pagePlatform === "douyin" ? 2 : 1,
+          runAttempt: ({keywords: attemptKeywords}) =>
+            runSearchBatchAttempt(attemptKeywords),
+          onRetryScheduled:
+            pagePlatform === "douyin"
+              ? async ({keywords: retryKeywords, attempt}) => {
+                  const retryDelay =
+                    UNATTENDED_KEYWORD_RETRY_MIN_MS +
+                    Math.random() *
+                      (UNATTENDED_KEYWORD_RETRY_MAX_MS -
+                        UNATTENDED_KEYWORD_RETRY_MIN_MS);
+                  showProgress(
+                    `${Math.ceil(retryDelay / 1000)} 秒后重试 ${retryKeywords.length} 个搜索失败的关键词（第 ${attempt}/2 次）`,
+                    "info",
+                  );
+                  await sleepWithStop(
+                    retryDelay,
+                    () => searchCaptureCancelRequested,
+                  );
+                }
+              : null,
+          shouldStop: () => searchCaptureCancelRequested,
+        });
+        const batchResult = searchBatchAttemptRun.result;
         await refreshDataPool();
         if (batchResult?.canceled) {
           taskStatus = "partial";
@@ -15933,11 +15957,8 @@ async function runUnattendedKeywordPlanRequest(request) {
       const blockingCode =
         String(blockingError?.code || "").trim().toUpperCase() ||
         "PLATFORM_SAFETY_BLOCK";
-      const isDouyinServiceAbnormal =
-        blockingCode === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE;
-      const safetyMessage = isDouyinServiceAbnormal
-        ? DOUYIN_SEARCH_SERVICE_ABNORMAL_MESSAGE
-        : "检测到验证码、登录失效或平台安全限制，已暂停整批任务且不会自动连续重试";
+      const safetyMessage =
+        "检测到验证码、登录失效或平台安全限制，已暂停整批任务且不会自动连续重试";
       const safetySummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
       const finishedAt = new Date().toISOString();
       await reportUnattendedTerminalRun(
