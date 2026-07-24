@@ -552,7 +552,10 @@ export async function runTopicAnalysis({ tenantId, analysisId }) {
     // 样本不足不算失败:预检通过后数据仍可能被过滤到 <3 条 → 跳过 LLM 落纯规则,meta.insufficientSamples 已标记
     let riskOpinion = null;
     let spreadResponse = null;
-    if (samples.length >= 3) {
+    // 品牌语境二次校验(防御 setImmediate 边界的竞态:发起时已过路由预检,但配置可能在后台执行前被清空;
+    // getBrandContext 无配置会回落硬编码默认品牌,而话术是客户可见交付物,宁可落规则兜底也不泄漏错品牌口径)
+    const brandOk = await hasBrandContextConfigured(tenantId);
+    if (samples.length >= 3 && brandOk) {
       // 两次 LLM 各自独立降级,②吃①的结论写话术;事务里绝不放 LLM 调用
       await updateAnalysis(analysisId, tenantId, {
         progress: stageJson('analyze', '正在生成风险研判与观点拆解…(1/2)'),
@@ -758,10 +761,11 @@ export async function analyzeOpinionRecord({ tenantId, recordId }) {
       escalation: '',
     },
   };
-  // LLM 覆盖文字层(事务外),失败则整体保留规则兜底
-  const llm = await enhanceRecordAnalysis(tenantId, {
-    record, comments, ocrText, transcript, transcriptAnalysis: ta, alerts,
-  });
+  // LLM 覆盖文字层(事务外),失败则整体保留规则兜底。品牌语境二次校验同 runTopicAnalysis:
+  // 无配置(路由预检后被清空的竞态)直接跳过 LLM,避免 getBrandContext 回落硬编码默认品牌泄漏错口径。
+  const llm = (await hasBrandContextConfigured(tenantId))
+    ? await enhanceRecordAnalysis(tenantId, { record, comments, ocrText, transcript, transcriptAnalysis: ta, alerts })
+    : null;
   let analysisSource = 'rule_fallback';
   if (llm) {
     analysisSource = 'llm';
