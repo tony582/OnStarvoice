@@ -802,7 +802,7 @@ export async function captureDouyinSingleNote({
         preferWorksTabForBloggerMetrics,
       });
     }
-    // 优先用拦截到的 API create_time(最可靠的发布时间戳),DOM 文本兜底。本 fork 自加。
+    // 优先用拦截到的 API create_time（最可靠的发布时间戳），DOM 文本兜底。StarVoice 自有逻辑。
     const apiCreateTime = readDouyinApiCache(noteId)?.create_time;
     const publishText = apiCreateTime
       ? ""

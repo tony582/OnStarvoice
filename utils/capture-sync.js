@@ -92,7 +92,7 @@ import {
   evaluateRelevancePrefilterRecords,
   RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
 } from './capture/relevance-prefilter.js';
-// 福利中心(welfare-usage.js)未纳入本 fork —— 0.1.7 合并带来的 welfare 埋点已移除,见下方 no-op
+// StarVoice 未启用福利中心（welfare-usage.js）；相关 welfare 埋点已移除，见下方 no-op。
 
 const COMMENT_CAPTURE_STATUS = {
   NOT_STARTED: 'not_started',
@@ -455,13 +455,13 @@ export async function endCaptureTaskSession(
 }
 
 function trackCoreCaptureSuccess(recordCount, metadata = {}) {
-  // 福利中心未纳入本 fork:原 0.1.7 的 welfare 埋点在此 no-op(保留函数壳,调用点不受影响)
+  // StarVoice 未启用福利中心：相关 welfare 埋点在此 no-op（保留函数壳，调用点不受影响）。
   void recordCount;
   void metadata;
 }
 
 function trackSyncSuccess(recordCount, metadata = {}) {
-  // 福利中心未纳入本 fork:同上 no-op
+  // StarVoice 未启用福利中心：同上 no-op。
   void recordCount;
   void metadata;
 }
@@ -1397,7 +1397,7 @@ function createListCaptureCacheStats(session, extra = {}) {
   };
 }
 
-// 本 fork 自加(合并上游务必保留):列表去重命中「已存记录」时,把这次采到的【易变互动数】
+// StarVoice 自有逻辑（后续升级时务必保留）：列表去重命中「已存记录」时，把这次采到的【易变互动数】
 // (点赞/评论/收藏/转发)就地刷新进已存记录 —— 否则同一帖第二次起永远停在首采的旧/空值,
 // 监控命中的互动数永远不更新(codex/gemini review #6,实测确诊)。
 // 只动这 4 个数值字段,绝不动 title/cover/detailPayload/号/评论。只要本次列表明确带了指标,
@@ -7677,11 +7677,11 @@ function buildSyncRequestPayload(syncType, payload) {
   ) {
     return payload;
   }
-  // 恢复 HEAD 行为:内容同步【原样发送】,不剔结构化评论。
-  // 本 fork 没有独立的评论同步通道,服务端靠内容同步包里的 commentsCleanedItems 入库
-  // record_comments → 评论分诊/销售客资/评论时间。上游 0.1.7 的
-  // stripCommentCollectionsForContentSync 为瘦身把这些评论数组剔了,导致关键词笔记采集
-  // 的评论只剩合并文本、进不了表(列表能看到、但弹窗/分诊/客资全空)。故此处不再剔除。
+  // 内容同步必须【原样发送】，不剔除结构化评论。
+  // 当前没有独立的评论同步通道，服务端通过内容同步包里的 commentsCleanedItems 入库。
+  // record_comments → 评论分诊/销售客资/评论时间。若通过
+  // stripCommentCollectionsForContentSync 剔除评论数组，会导致关键词笔记采集
+  // 的评论只剩合并文本、进不了表（列表能看到，但弹窗/分诊/客资全空），故此处不剔除。
   return payload;
 }
 

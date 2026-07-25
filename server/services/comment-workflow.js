@@ -371,7 +371,7 @@ async function applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, pre
   `, [tenantId, auditAction, recordId, JSON.stringify({ previousStatus: currentStatus, nextStatus })]);
 }
 
-// ── 抖音过采兜底(服务端,不动扩展 → 不受 MediaClaw 上游更新影响)─────────────
+// ── 抖音过采兜底（服务端实现，不依赖扩展侧更新）──────────────────────────
 // 抖音"评论"会混入【非评论内容】:推荐视频(数十万~百万赞、带话题标签)、页面版权页脚、
 // 视频赞数文本碎片("380.5万 用户名")、UI 碎片。入库前剔掉。依据平台机制:抖音评论结构上
 // 不带话题标签 # ,点赞也到不了视频量级。仅对 douyin 生效,不动小红书/微博。

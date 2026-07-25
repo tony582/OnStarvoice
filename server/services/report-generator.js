@@ -1029,7 +1029,7 @@ export function buildInsightSamplePool(stats) {
   return { samples, sampleMap, cliffPct };
 }
 
-// 借鉴 MediaClaw 关键词舆情扫描:用 LLM 对本周期代表样本做跨样本六维研判,
+// 关键词舆情扫描：用 LLM 对本周期代表样本做跨样本六维研判，
 // 把"统计+模板话术"升级为真 AI 研判;每条议题/建议挂可回链的样本 id(取信管理层/PR)。
 async function buildAiOpinionInsight(tenantId, current) {
   if (!tenantId) return null;
