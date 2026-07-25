@@ -102,6 +102,57 @@ export type CloudTask = {
   resume_block_reason?: string
 }
 
+export type TaskKeywordResult = {
+  round: number
+  index: number
+  keyword: string
+  status: string
+  noResults: boolean
+  resultKind: string
+  attemptCount: number
+  savedCount: number
+  error: string
+  errorCode: string
+  errorCategory: string
+  securityBlocked: boolean
+  requiresManualAction: boolean
+  finishedAt: string
+}
+
+export type TaskKeywordFailureKind =
+  | 'safety'
+  | 'search_unavailable'
+  | 'enhancement'
+  | 'network'
+  | 'other'
+
+export type TaskDiagnostics = {
+  items: TaskKeywordResult[]
+  total: number
+  processed: number
+  completed: number
+  partial: number
+  failed: number
+  skipped: number
+  noResults: number
+  saved: number
+  retried: number
+  currentKeyword: string
+  currentOrdinal: number
+  currentPhase: string
+  lastFinishedAt: string
+  safetyBlocked: number
+  searchUnavailable: number
+  enhancementFailed: number
+  networkFailed: number
+  otherFailed: number
+  headline: string
+  explanation: string
+  tone: 'success' | 'warning' | 'danger' | 'active' | 'neutral'
+  retryLimit: number
+  retryExhausted: boolean
+}
+
 export type TaskView = 'active' | 'attention' | 'plans' | 'history'
 export type ComposerIntent = {
   agentId?: string
@@ -262,6 +313,265 @@ export function taskProgress(task: CloudTask) {
   return { current, total, percent }
 }
 
+function diagnosticText(...values: unknown[]) {
+  for (const value of values) {
+    const resolved = String(value ?? '').trim()
+    if (resolved) return resolved
+  }
+  return ''
+}
+
+function diagnosticBoolean(...values: unknown[]) {
+  return values.some(value => value === true || value === 'true')
+}
+
+export function taskKeywordResults(task: CloudTask): TaskKeywordResult[] {
+  const checkpoint = task.checkpoint || {}
+  const rawItems = Array.isArray(checkpoint.keywordResults)
+    ? checkpoint.keywordResults
+    : []
+
+  return rawItems
+    .map((value, fallbackIndex) => {
+      const item = value && typeof value === 'object'
+        ? value as Record<string, unknown>
+        : {}
+      const rawError = item.error && typeof item.error === 'object'
+        ? item.error as Record<string, unknown>
+        : {}
+      const parsedIndex = Number(item.index)
+      const parsedRound = safeNumber(item.round)
+      return {
+        round: parsedRound > 0 ? parsedRound : 1,
+        index: Number.isFinite(parsedIndex) ? Math.max(0, Math.floor(parsedIndex)) : fallbackIndex,
+        keyword: diagnosticText(item.keyword),
+        status: diagnosticText(item.status, 'failed').toLowerCase(),
+        noResults: diagnosticBoolean(
+          item.noResults,
+          item.no_results,
+          item.emptyResult,
+          item.empty_result,
+        ) || diagnosticText(item.resultKind, item.result_kind) === 'no_matching_results',
+        resultKind: diagnosticText(item.resultKind, item.result_kind),
+        attemptCount: safeNumber(item.attemptCount ?? item.attempt_count),
+        savedCount: safeNumber(item.savedCount ?? item.saved_count),
+        error: diagnosticText(rawError.message, item.error),
+        errorCode: diagnosticText(item.errorCode, item.error_code, rawError.code),
+        errorCategory: diagnosticText(item.errorCategory, item.error_category, rawError.category),
+        securityBlocked: diagnosticBoolean(
+          item.securityBlocked,
+          item.security_blocked,
+          item.platformSafetyBlocked,
+          item.platform_safety_blocked,
+          rawError.securityBlocked,
+          rawError.platformSafetyBlocked,
+        ),
+        requiresManualAction: diagnosticBoolean(
+          item.requiresManualAction,
+          item.requires_manual_action,
+          rawError.requiresManualAction,
+        ),
+        finishedAt: diagnosticText(item.finishedAt, item.finished_at),
+      }
+    })
+    .filter(item => item.keyword)
+    .sort((left, right) => left.round - right.round || left.index - right.index)
+}
+
+export function taskKeywordFailureKind(item: TaskKeywordResult): TaskKeywordFailureKind {
+  const evidence = [item.errorCode, item.errorCategory, item.error].join(' ')
+  if (
+    item.securityBlocked ||
+    item.requiresManualAction ||
+    /(platform_safety_block|security_verification|required|page_challenge|xhs_security_block|http_?429|rate_?limited|captcha|risk.?control|账号异常|账号限制|平台安全|安全限制|安全审核|安全验证|访问频繁|访问受限|验证码|风控)/iu.test(evidence)
+  ) {
+    return 'safety'
+  }
+  if (/(采集增强|增强采集|增强未完整|详情采集|评论采集|博主数据|enhance|detail.?capture|comment.?capture)/iu.test(evidence)) {
+    return 'enhancement'
+  }
+  if (/(搜索结果页未就绪|搜索页未就绪|服务出现异常|搜索服务异常|douyin_search_service_abnormal|search.*(?:not.?ready|unavailable)|结果页.*未加载)/iu.test(evidence)) {
+    return 'search_unavailable'
+  }
+  if (/(network|net::|timeout|timed.?out|网络|连接失败|请求超时|设备离线)/iu.test(evidence)) {
+    return 'network'
+  }
+  return 'other'
+}
+
+export function taskPhaseLabel(phase = '') {
+  const normalized = String(phase || '').trim().toLowerCase()
+  const labels: Record<string, string> = {
+    pending: '等待执行',
+    opening_search: '打开搜索页',
+    reading_search: '读取搜索结果',
+    list_capture: '列表采集',
+    filtering: '筛选搜索结果',
+    enhancement: '增强采集',
+    detail_capture: '增强采集',
+    comments: '评论采集',
+    syncing: '同步后台',
+    retrying: '等待重试',
+    no_matching_results: '筛选范围内无匹配内容',
+    failed: '执行失败',
+    partial: '部分完成',
+    completed: '执行完成',
+    unattended_completed_with_failures: '已完成全部尝试',
+  }
+  return labels[normalized] || normalized.replace(/_/g, ' ') || '—'
+}
+
+export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
+  const items = taskKeywordResults(task)
+  const progress = taskProgress(task)
+  const checkpoint = task.checkpoint || {}
+  const counts = task.counts || {}
+  const metadata = task.metadata || {}
+  const terminalStatuses = new Set(['completed', 'partial', 'failed', 'skipped', 'canceled'])
+  const hasKeywordCheckpoint = items.length > 0
+  const keywordTotal = hasKeywordCheckpoint
+    ? items.length
+    : Math.max(progress.total, safeNumber(counts.total))
+  const processedFromItems = items.filter(item => terminalStatuses.has(item.status)).length
+  const processed = hasKeywordCheckpoint
+    ? processedFromItems
+    : Math.max(progress.current, safeNumber(counts.processed))
+  const completedFromItems = items.filter(item => item.status === 'completed').length
+  const partialFromItems = items.filter(item => item.status === 'partial').length
+  const completed = hasKeywordCheckpoint ? completedFromItems : safeNumber(counts.success)
+  const partial = hasKeywordCheckpoint ? partialFromItems : safeNumber(counts.warnings)
+  const failedItems = items.filter(item => item.status === 'failed')
+  const partialItems = items.filter(item => item.status === 'partial')
+  const abnormalItems = [...failedItems, ...partialItems]
+  const failed = hasKeywordCheckpoint ? failedItems.length : safeNumber(counts.failed)
+  const skippedFromItems = items.filter(item => item.status === 'skipped').length
+  const skipped = hasKeywordCheckpoint ? skippedFromItems : safeNumber(counts.skipped)
+  const noResults = items.filter(item => item.status === 'completed' && item.noResults).length
+  const savedFromItems = items.reduce((sum, item) => sum + item.savedCount, 0)
+  const retriesFromItems = items.reduce((sum, item) => sum + Math.max(0, item.attemptCount - 1), 0)
+  const currentKeyword = diagnosticText(
+    task.progress?.keyword,
+    task.progress?.currentKeyword,
+    checkpoint.currentKeyword,
+    checkpoint.activeKeyword,
+    items[items.length - 1]?.keyword,
+  )
+  const currentItem = items.find(item => item.keyword === currentKeyword) || items[items.length - 1]
+  const currentOrdinal = currentItem
+    ? Math.min(currentItem.index + 1, Math.max(keywordTotal, 1))
+    : progress.current > 0
+      ? Math.min(progress.current, Math.max(keywordTotal, 1))
+      : 0
+  const failureKinds = abnormalItems.reduce<Record<TaskKeywordFailureKind, number>>((summary, item) => {
+    summary[taskKeywordFailureKind(item)] += 1
+    return summary
+  }, {
+    safety: 0,
+    search_unavailable: 0,
+    enhancement: 0,
+    network: 0,
+    other: 0,
+  })
+  const retryLimit = safeNumber(
+    metadata.maxRecoveryAttempts ??
+    metadata.maxAttempts ??
+    checkpoint.maxRecoveryAttempts ??
+    checkpoint.maxAttempts,
+  ) || 2
+  const terminalTask = [
+    'completed', 'completed_with_warnings', 'completed_with_failures',
+    'failed', 'canceled', 'skipped',
+  ].includes(task.status)
+  const retryExhausted = terminalTask &&
+    failedItems.length > 0 &&
+    failedItems.every(item => item.attemptCount >= retryLimit)
+
+  let headline: string
+  let explanation: string
+  let tone: TaskDiagnostics['tone'] = 'neutral'
+  const taskIsActive = ['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'resume_requested']
+    .includes(task.effective_status || task.status)
+
+  if (taskIsActive && currentKeyword) {
+    headline = `正在处理 ${currentOrdinal || 1}/${Math.max(keywordTotal, 1)} · ${currentKeyword}`
+    explanation = `当前阶段：${taskPhaseLabel(diagnosticText(task.progress?.phase, checkpoint.activePhase, checkpoint.phase))}`
+    tone = 'active'
+  } else if (failureKinds.safety > 0) {
+    headline = `检测到 ${failureKinds.safety} 个平台风控信号`
+    explanation = '设备已保护性停止自动操作，需要到对应浏览器确认验证码、登录或账号状态。'
+    tone = 'danger'
+  } else if (failed > 0) {
+    const causes = [
+      failureKinds.search_unavailable > 0 ? `搜索页未就绪 ${failureKinds.search_unavailable}` : '',
+      failureKinds.enhancement > 0 ? `增强未完整 ${failureKinds.enhancement}` : '',
+      failureKinds.network > 0 ? `网络异常 ${failureKinds.network}` : '',
+      failureKinds.other > 0 ? `其他异常 ${failureKinds.other}` : '',
+    ].filter(Boolean)
+    headline = `未检测到明确风控 · ${causes.join(' · ') || `失败 ${failed}`}`
+    explanation = retryExhausted
+      ? `失败关键词均已达到 ${retryLimit} 次尝试上限；继续原任务不会产生新的采集进展。`
+      : '可在关键词明细中查看失败位置、尝试次数和设备返回的原始原因。'
+    tone = 'warning'
+  } else if (partial > 0) {
+    const causes = [
+      failureKinds.search_unavailable > 0 ? `搜索页未就绪 ${failureKinds.search_unavailable}` : '',
+      failureKinds.enhancement > 0 ? `增强未完整 ${failureKinds.enhancement}` : '',
+      failureKinds.network > 0 ? `网络异常 ${failureKinds.network}` : '',
+      failureKinds.other > 0 ? `其他异常 ${failureKinds.other}` : '',
+    ].filter(Boolean)
+    headline = `${partial} 个关键词只完成了部分采集${causes.length > 0 ? ` · ${causes.join(' · ')}` : ''}`
+    explanation = '列表结果已保留，增强、评论或同步步骤可能尚未完整。'
+    tone = 'warning'
+  } else if (items.length > 0 && completed + skipped >= items.length) {
+    const capturedCount = Math.max(0, completed - noResults)
+    headline = noResults > 0
+      ? `${capturedCount} 个关键词采到结果 · ${noResults} 个筛选范围内无匹配内容`
+      : `${completed} 个关键词已完整完成`
+    explanation = skipped > 0
+      ? `另有 ${skipped} 个关键词已按规则跳过。`
+      : noResults > 0
+        ? '无匹配内容已按 0 条正常结算，不计入失败或未完成。'
+        : '列表与已启用的增强步骤均已结算。'
+    tone = 'success'
+  } else {
+    headline = diagnosticText(task.message, taskErrorText(task), '暂时没有关键词级运行记录')
+    explanation = items.length === 0 ? '当前 Extension 尚未上报关键词检查点。' : ''
+  }
+
+  return {
+    items,
+    total: keywordTotal,
+    processed,
+    completed,
+    partial,
+    failed,
+    skipped,
+    noResults,
+    saved: Math.max(savedFromItems, safeNumber(counts.saved)),
+    retried: Math.max(retriesFromItems, safeNumber(counts.retried)),
+    currentKeyword,
+    currentOrdinal,
+    currentPhase: diagnosticText(task.progress?.phase, checkpoint.activePhase, checkpoint.phase),
+    lastFinishedAt: (() => {
+      const finishedTimes = items
+        .map(item => item.finishedAt)
+        .filter(Boolean)
+        .sort()
+      return finishedTimes[finishedTimes.length - 1] || ''
+    })(),
+    safetyBlocked: failureKinds.safety,
+    searchUnavailable: failureKinds.search_unavailable,
+    enhancementFailed: failureKinds.enhancement,
+    networkFailed: failureKinds.network,
+    otherFailed: failureKinds.other,
+    headline,
+    explanation,
+    tone,
+    retryLimit,
+    retryExhausted,
+  }
+}
+
 export function statusTone(status: string) {
   if (['running', 'recovering', 'claimed'].includes(status)) return 'border-primary/25 bg-primary/8 text-primary'
   if (['interrupted', 'needs_action', 'failed', 'completed_with_failures'].includes(status)) return 'border-status-red/25 bg-status-red/8 text-status-red'
@@ -298,6 +608,8 @@ export function resumeBlockReason(task: CloudTask) {
   if (task.agent_status && task.agent_status !== 'active') return '原执行 Agent 已暂停或撤销'
   const platforms = task.agent_allowed_platforms || []
   if (platforms.length > 0 && !platforms.includes(task.platform)) return '原执行 Agent 未配置负责该平台'
+  const diagnostics = taskDiagnostics(task)
+  if (diagnostics.retryExhausted) return `失败关键词均已达到 ${diagnostics.retryLimit} 次尝试上限，请新建补采任务`
   return ''
 }
 

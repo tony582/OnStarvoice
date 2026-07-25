@@ -60,6 +60,30 @@ test("observer sidebar renders the active cloud run before Debug attaches", () =
   );
 });
 
+test("one-time cloud runs keep one-time copy and never enable a hidden extra round", () => {
+  const progressSection = readFunctionSection(
+    "function buildKeywordPlanProgressText(",
+    "function renderKeywordPlanProgressText(",
+  );
+  assert.match(progressSection, /getKeywordExecutionCopy\(plan\)/u);
+  assert.match(progressSection, /parts = \[executionCopy\.captureLabel\]/u);
+
+  const runnerSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  assert.match(runnerSection, /getKeywordExecutionCopy\(request\)/u);
+  assert.match(
+    runnerSection,
+    /autoLoopInput\.checked = plannedRounds > 1/u,
+  );
+  assert.match(
+    runnerSection,
+    /captureExecutionLabel:\s*executionCopy\.captureLabel/u,
+  );
+  assert.match(runnerSection, /executionLockLabel:\s*executionCopy\.taskLabel/u);
+});
+
 test("cloud and unattended Debug sessions stop through the exact request id", () => {
   const bindingSection = readFunctionSection(
     "function resolveDisplayedUnattendedSessionBinding(",

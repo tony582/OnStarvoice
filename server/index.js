@@ -101,6 +101,12 @@ app.use('/dashboard', express.static(join(__dirname, '..', 'web', 'dashboard', '
 app.use('/admin', express.static(join(__dirname, 'admin')));
 app.use('/dashboard', express.static(join(__dirname, 'dashboard')));
 app.use('/images', express.static(join(__dirname, '..', 'images')));
+// 手动安装/侧载 Extension 的正式更新包。发布时把版本包放在
+// /opt/onstarvoice/releases；目录在 server rsync 之外，后端更新不会误删历史包。
+app.use('/downloads', express.static(join(__dirname, '..', 'releases'), {
+  maxAge: '1h',
+  fallthrough: true,
+}));
 // 封面落地的本地副本(在 rsync 之外的 MEDIA_DIR,部署不清空)
 app.use('/media', express.static(MEDIA_DIR, { maxAge: '7d' }));
 

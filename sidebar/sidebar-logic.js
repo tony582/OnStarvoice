@@ -2339,6 +2339,19 @@ function isKeywordPlanRunning(plan = {}) {
   );
 }
 
+function getKeywordExecutionCopy(source = {}) {
+  const executionMode =
+    String(source?.executionMode || "").trim() === "one_time"
+      ? "one_time"
+      : "unattended_plan";
+  const oneTime = executionMode === "one_time";
+  return {
+    executionMode,
+    taskLabel: oneTime ? "一次性采集任务" : "无人值守计划",
+    captureLabel: oneTime ? "一次性采集" : "无人值守采集",
+  };
+}
+
 function buildKeywordRunDisplayPlan(
   plan = keywordPlanState,
   request = activeKeywordRunState,
@@ -2413,9 +2426,10 @@ function buildKeywordPlanProgressText(plan = {}) {
     plan?.lastRunProgress && typeof plan.lastRunProgress === "object"
       ? plan.lastRunProgress
       : {};
+  const executionCopy = getKeywordExecutionCopy(plan);
   const message =
     String(progress.message || plan?.lastRunMessage || "").trim() ||
-    "无人值守计划运行中";
+    `${executionCopy.taskLabel}运行中`;
   const round = Number(progress.round);
   const maxRounds = Number(plan?.maxRounds);
   const keyword = String(progress.keyword || "").trim();
@@ -2437,7 +2451,7 @@ function buildKeywordPlanProgressText(plan = {}) {
         : 0;
   const itemCurrent = Number(progress.itemCurrent);
   const itemTotal = Number(progress.itemTotal);
-  const parts = ["无人值守采集"];
+  const parts = [executionCopy.captureLabel];
   const shouldShowRound =
     Number.isFinite(round) &&
     round > 0 &&
@@ -3756,6 +3770,10 @@ function resolveCaptureTaskActionCopy(progress = {}) {
     progress?.taskMeta && typeof progress.taskMeta === "object"
       ? progress.taskMeta
       : {};
+  const executionCopy = getKeywordExecutionCopy({
+    executionMode:
+      progress?.executionMode || taskMeta.executionMode || "unattended_plan",
+  });
   const detailFields = ["正文、作者、发布时间和互动数据"];
   if (taskMeta.commentsEnabled) detailFields.push("评论");
   if (taskMeta.bloggerMetricsEnabled) detailFields.push("作者粉丝等账号信息");
@@ -3763,7 +3781,9 @@ function resolveCaptureTaskActionCopy(progress = {}) {
   if (phase.startsWith("unattended_completed")) {
     return {
       title: phase.includes("with_failures") ? "任务已完成，部分作品需处理" : "任务已完成",
-      explanation: readProgressText(progress?.message) || "本次无人值守采集已经收口",
+      explanation:
+        readProgressText(progress?.message) ||
+        `本次${executionCopy.captureLabel}已经收口`,
       nextAction: "结果已保留，可在列表和任务中心查看",
     };
   }
@@ -3777,7 +3797,9 @@ function resolveCaptureTaskActionCopy(progress = {}) {
   if (phase.startsWith("unattended_")) {
     return {
       title: "任务已结束",
-      explanation: readProgressText(progress?.message) || "本次无人值守采集已经结束",
+      explanation:
+        readProgressText(progress?.message) ||
+        `本次${executionCopy.captureLabel}已经结束`,
       nextAction: "可在任务中心查看结果与需要处理的原因",
     };
   }
@@ -12725,6 +12747,17 @@ async function handleBatchKeywordCapture(options = {}) {
   const executionLockLabel =
     String(runOptions.executionLockLabel || "").trim() ||
     "手动批量关键词采集";
+  const captureExecutionLabel =
+    String(runOptions.captureExecutionLabel || "").trim() ||
+    (executionLockOwner === "unattended_keyword_plan"
+      ? "无人值守采集"
+      : "批量搜索采集");
+  const executionMode =
+    String(runOptions.executionMode || "").trim() === "one_time"
+      ? "one_time"
+      : executionLockOwner === "unattended_keyword_plan"
+        ? "unattended_plan"
+        : "manual";
   // Unattended identity belongs to this invocation, not to the mutable global
   // claim slot.  A delayed callback from a previous runner must never be
   // relabeled with the request/attempt that happens to be active later.
@@ -12845,6 +12878,7 @@ async function handleBatchKeywordCapture(options = {}) {
   let captureTaskRoundTotal = 1;
   let captureTaskDisplayMeta = {
     keywordList: [...keywords],
+    executionMode,
     searchFilters:
       runOptions.searchFilters && typeof runOptions.searchFilters === "object"
         ? {...runOptions.searchFilters}
@@ -13000,7 +13034,7 @@ async function handleBatchKeywordCapture(options = {}) {
     } catch (error) {
       if (preferredSourceTabId) {
         throw new Error(
-          `指定的无人值守采集页不可用，已停止以免误采其它标签页：${String(
+          `指定的${captureExecutionLabel}页面不可用，已停止以免误采其它标签页：${String(
             error?.message || error || "页面不存在",
           )}`,
         );
@@ -13026,7 +13060,7 @@ async function handleBatchKeywordCapture(options = {}) {
         tabId: sourceTabId,
         label:
           executionLockOwner === "unattended_keyword_plan"
-            ? `无人值守采集 · ${keywords.length} 个关键词`
+            ? `${captureExecutionLabel} · ${keywords.length} 个关键词`
             : `批量搜索采集 · ${keywords.length} 个关键词`,
         platform: pagePlatform,
       });
@@ -14051,8 +14085,10 @@ function createUnattendedKeywordProgressReporter(
     checkpoint = null,
     taskTotal = 0,
     attemptId = activeUnattendedRunAttemptId,
+    executionMode = "unattended_plan",
   } = {},
 ) {
+  const executionCopy = getKeywordExecutionCopy({executionMode});
   let lastFingerprint = "";
   let lastReportedAt = 0;
   let lastSnapshot = null;
@@ -14078,7 +14114,7 @@ function createUnattendedKeywordProgressReporter(
     }
     const projectedProgress = projectCaptureTaskProgress(progress);
     const message = String(
-      projectedProgress?.message || "无人值守计划运行中",
+      projectedProgress?.message || `${executionCopy.taskLabel}运行中`,
     ).trim();
     const phase = String(projectedProgress?.phase || "").trim();
     const detailKeyword = String(projectedProgress?.keyword || "").trim();
@@ -14749,6 +14785,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
   let claimedRequestId = requestId;
   let claimedAttemptId = "";
   let claimedAdoptedLockId = "";
+  let claimedExecutionCopy = getKeywordExecutionCopy();
   try {
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:claim-unattended-keyword-run",
@@ -14772,18 +14809,20 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
       response?.accepted === false &&
       response?.reason === "capture_lock_conflict"
     ) {
+      claimedExecutionCopy = getKeywordExecutionCopy(response?.data || {});
       showMessage(
-        "其他采集任务已占用执行锁，无人值守恢复已暂停；请等待当前任务结束后从任务中心重试",
+        `其他采集任务已占用执行锁，${claimedExecutionCopy.taskLabel}恢复已暂停；请等待当前任务结束后从任务中心重试`,
         "warning",
       );
       return;
     }
     if (!response?.ok || response?.accepted === false || !response.data) {
       if (requestId) {
-        showMessage("未找到可执行的无人值守计划任务", "warning");
+        showMessage("未找到可执行的采集任务", "warning");
       }
       return;
     }
+    claimedExecutionCopy = getKeywordExecutionCopy(response.data);
     claimedRequestId = String(response.data.id || requestId || "").trim();
     claimedAttemptId = String(response.data?.attemptId || "").trim();
     activateUnattendedRunRequest(response.data);
@@ -14807,7 +14846,10 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
       !activeUnattendedAttemptRejected &&
       !error?.unattendedTerminalReported
     ) {
-      showMessage("启动无人值守计划失败: " + error.message, "error");
+      showMessage(
+        `启动${claimedExecutionCopy.taskLabel}失败: ${error.message}`,
+        "error",
+      );
       await reportUnattendedTerminalRun(
         claimedRequestId,
         {
@@ -15461,6 +15503,8 @@ function createUnattendedKeywordCheckpointReporter({
 async function runUnattendedKeywordPlanRequest(request) {
   const requestId = String(request?.id || "").trim();
   const requestAttemptId = String(request?.attemptId || "").trim();
+  const executionCopy = getKeywordExecutionCopy(request);
+  const executionMode = executionCopy.executionMode;
   const isCurrentRequestAttempt = () =>
     requestId === String(activeUnattendedRunRequestId || "").trim() &&
     (!requestAttemptId ||
@@ -15488,7 +15532,7 @@ async function runUnattendedKeywordPlanRequest(request) {
   let unattendedCaptureTaskTerminalProgress = null;
 
   if (keywords.length === 0) {
-    throw new Error("无人值守计划没有可执行关键词");
+    throw new Error(`${executionCopy.taskLabel}没有可执行关键词`);
   }
   if (!resumeKeyword && Math.max(1, Number(checkpoint.round) || 1) < plannedRounds) {
     // 兼容旧版本在「本轮完成、下一轮尚未落盘」窗口留下的检查点。
@@ -15563,13 +15607,15 @@ async function runUnattendedKeywordPlanRequest(request) {
     return;
   }
   if (batchKeywordCaptureInFlight || batchUrlCaptureInFlight) {
-    throw new Error("已有批量任务执行中，无法启动无人值守计划");
+    throw new Error(
+      `已有批量任务执行中，无法启动${executionCopy.taskLabel}`,
+    );
   }
 
   const startingMessage =
     checkpoint.keywordResults.length > 0
-      ? `无人值守计划正在从关键词「${resumeKeyword}」恢复`
-      : "无人值守计划已触发，正在启动浏览器接管";
+      ? `${executionCopy.taskLabel}正在从关键词「${resumeKeyword}」恢复`
+      : `${executionCopy.taskLabel}已触发，正在启动浏览器接管`;
   const startingKeywordIndex = Math.max(0, keywords.indexOf(resumeKeyword));
   const startingProgress = {
     unattendedRequestId: requestId,
@@ -15588,9 +15634,11 @@ async function runUnattendedKeywordPlanRequest(request) {
     roundTotal: plannedRounds,
     phase: "initializing_unattended",
     message: startingMessage,
+    executionMode,
     taskMeta: {
       keywordList: [...keywords],
       searchFilters: {...(plan.searchFilters || {})},
+      executionMode,
       ...(Object.prototype.hasOwnProperty.call(
         plan,
         "keywordMaxDetectedItems",
@@ -15650,13 +15698,14 @@ async function runUnattendedKeywordPlanRequest(request) {
     {attemptId: requestAttemptId},
   );
   if (!startReport?.accepted) {
-    throw new Error("无人值守任务已被其它恢复尝试接管");
+    throw new Error(`${executionCopy.taskLabel}已被其它恢复尝试接管`);
   }
   keywordPlanState = {
     ...(keywordPlanState && typeof keywordPlanState === "object"
       ? keywordPlanState
       : {}),
     ...plan,
+    executionMode,
     enabled: true,
     lastRunStatus: "running",
     lastRunMessage: startingMessage,
@@ -15695,6 +15744,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         requestId,
         platform,
         keywordCount: keywords.length,
+        executionMode,
       },
     });
     // 同一无人值守 request 跨 runner reload / recovery attempt 复用稳定的
@@ -15705,7 +15755,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         await startRequiredCaptureTaskSession({
           taskId: unattendedCaptureTaskContext.taskId,
           tabId: sourceTabId,
-          label: `无人值守采集 · ${keywords.length} 个关键词`,
+          label: `${executionCopy.captureLabel} · ${keywords.length} 个关键词`,
           platform,
           ownerRequired: false,
           attemptId: requestAttemptId,
@@ -15751,10 +15801,10 @@ async function runUnattendedKeywordPlanRequest(request) {
 
     const autoLoopInput = document.getElementById("chkAutoLoop");
     if (autoLoopInput) {
-      autoLoopInput.checked = true;
+      autoLoopInput.checked = plannedRounds > 1;
       document
         .getElementById("batchLoopFields")
-        ?.classList.remove("is-disabled");
+        ?.classList.toggle("is-disabled", plannedRounds <= 1);
     }
     const loopGapInput = document.getElementById("inputLoopGapMin");
     if (loopGapInput) {
@@ -15831,7 +15881,9 @@ async function runUnattendedKeywordPlanRequest(request) {
       detailBatchCancelRequested ||
       Boolean(activeCaptureTaskCancellationReason)
     ) {
-      const canceledError = new Error("无人值守任务已停止，未启动浏览器接管");
+      const canceledError = new Error(
+        `${executionCopy.taskLabel}已停止，未启动浏览器接管`,
+      );
       canceledError.code = "UNATTENDED_ATTEMPT_CANCELED";
       throw canceledError;
     }
@@ -15841,7 +15893,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       const rebound = await beginCaptureTaskSession({
         taskId: unattendedCaptureTaskContext.taskId,
         tabId: unattendedSourceTabId,
-        label: `无人值守采集 · ${keywords.length} 个关键词`,
+        label: `${executionCopy.captureLabel} · ${keywords.length} 个关键词`,
         platform,
         ownerRequired: false,
         attemptId: requestAttemptId,
@@ -15866,7 +15918,10 @@ async function runUnattendedKeywordPlanRequest(request) {
       requestId,
       {
         status: "running",
-        message: "已交给循环采集流程执行",
+        message:
+          plannedRounds > 1
+            ? "已交给多轮采集流程执行"
+            : "已交给采集流程执行",
         checkpoint,
         counts: buildUnattendedTaskCounts(
           checkpoint,
@@ -15903,6 +15958,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         checkpoint,
         taskTotal: plannedTaskTotal,
         attemptId: requestAttemptId,
+        executionMode,
       },
     );
     const reportKeywordCheckpoint =
@@ -15921,7 +15977,9 @@ async function runUnattendedKeywordPlanRequest(request) {
       waitForegroundTabId: null,
       sourceTabId: unattendedSourceTabId,
       executionLockOwner: "unattended_keyword_plan",
-      executionLockLabel: "无人值守计划",
+      executionLockLabel: executionCopy.taskLabel,
+      captureExecutionLabel: executionCopy.captureLabel,
+      executionMode,
       unattendedRequestId: requestId,
       unattendedAttemptId: requestAttemptId,
       searchFilters: plan.searchFilters || {},
@@ -15942,7 +16000,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         unattendedCaptureTaskSessionStarted,
     });
     if (!batchRunResult?.started) {
-      throw new Error(batchRunResult?.reason || "循环采集流程未启动");
+      throw new Error(batchRunResult?.reason || "采集流程未启动");
     }
     if (batchRunResult?.ok === false && batchRunResult?.error) {
       throw new Error(batchRunResult.error);
@@ -15995,7 +16053,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     if (batchRunResult?.canceled) {
       const cancellation = resolveUnattendedCancellationTerminal(
         activeCaptureTaskCancellationReason,
-        batchRunResult.reason || "无人值守计划已取消",
+        batchRunResult.reason || `${executionCopy.taskLabel}已取消`,
       );
       unattendedCaptureTaskStatus = cancellation.status;
       const canceledSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
@@ -16061,7 +16119,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         ? "completed_with_failures"
         : "completed";
     unattendedCaptureTaskStatus = status;
-    const message = `无人值守计划${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个关键词次，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
+    const message = `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个关键词次，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
     const finishedAt = new Date().toISOString();
     await reportUnattendedTerminalRun(
       requestId,
@@ -16102,7 +16160,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       const cancellation = bootstrapCanceled
         ? resolveUnattendedCancellationTerminal(
             activeCaptureTaskCancellationReason,
-            "无人值守计划已取消",
+            `${executionCopy.taskLabel}已取消`,
           )
         : null;
       const needsAction = safetyBlocked || bootstrapFailed;
@@ -16120,8 +16178,8 @@ async function runUnattendedKeywordPlanRequest(request) {
         : cancellation?.message || error.message;
       showMessage(
         terminalStatus === "canceled"
-          ? "无人值守计划已取消"
-          : `无人值守计划${needsAction ? "需要处理" : "失败"}: ${terminalMessage}`,
+          ? `${executionCopy.taskLabel}已取消`
+          : `${executionCopy.taskLabel}${needsAction ? "需要处理" : "失败"}: ${terminalMessage}`,
         terminalStatus === "canceled" || needsAction ? "warning" : "error",
       );
       const finishedAt = new Date().toISOString();

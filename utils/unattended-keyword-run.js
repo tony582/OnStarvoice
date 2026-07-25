@@ -73,6 +73,17 @@ export function normalizeUnattendedKeywordCheckpoint(
         rawEntry?.requires_manual_action ||
         rawError?.requiresManualAction,
     );
+    const noResults = Boolean(
+      rawEntry?.noResults ||
+        rawEntry?.no_results ||
+        rawEntry?.emptyResult ||
+        rawEntry?.empty_result ||
+        text(rawEntry?.resultKind || rawEntry?.result_kind) ===
+          "no_matching_results",
+    );
+    const resultKind = text(
+      rawEntry?.resultKind || rawEntry?.result_kind,
+    );
     keywordResults.push({
       round,
       // 旧快照中的 DOM/index 可能已经失真；永远按当前计划关键词顺序重算。
@@ -82,6 +93,8 @@ export function normalizeUnattendedKeywordCheckpoint(
       attemptCount: nonNegativeInt(rawEntry?.attemptCount),
       savedCount: nonNegativeInt(rawEntry?.savedCount),
       error: text(rawError?.message || rawEntry?.error),
+      ...(noResults ? {noResults: true} : {}),
+      ...(resultKind ? {resultKind} : {}),
       ...(errorCode ? {errorCode} : {}),
       ...(errorCategory ? {errorCategory} : {}),
       ...(securityBlocked ? {securityBlocked: true} : {}),
@@ -612,6 +625,17 @@ export function settleUnattendedKeywordCheckpoint({
       result?.requiresManualAction ||
       resultError?.requiresManualAction,
   );
+  const noResults = Boolean(
+    result?.noResults ||
+      result?.no_results ||
+      result?.emptyResult ||
+      result?.empty_result ||
+      text(result?.resultKind || result?.result_kind) ===
+        "no_matching_results",
+  );
+  const resultKind =
+    text(result?.resultKind || result?.result_kind) ||
+    (noResults ? "no_matching_results" : "");
   const status = resolvedSecurityBlocked
     ? "failed"
     : canceled
@@ -649,6 +673,8 @@ export function settleUnattendedKeywordCheckpoint({
           : "") ||
         (resolvedSecurityBlocked ? "触发平台保护性暂停" : ""),
     ),
+    ...(noResults ? {noResults: true} : {}),
+    ...(resultKind ? {resultKind} : {}),
     ...(resolvedErrorCode ? {errorCode: resolvedErrorCode} : {}),
     ...(resolvedErrorCategory
       ? {errorCategory: resolvedErrorCategory}

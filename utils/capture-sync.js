@@ -13718,6 +13718,38 @@ export async function batchCaptureByKeywords({
       ),
     };
   };
+  const normalizeKeywordSearchReadiness = (value) => {
+    if (value && typeof value === 'object') {
+      return {
+        ready: value.ready === true,
+        confirmedEmpty: value.confirmedEmpty === true,
+        emptyMessage: String(value.emptyMessage || '').trim(),
+        pageUrl: String(value.pageUrl || '').trim(),
+      };
+    }
+    return {
+      ready: value === true,
+      confirmedEmpty: false,
+      emptyMessage: '',
+      pageUrl: '',
+    };
+  };
+  const throwConfirmedEmptySearchResult = (keyword, readiness) => {
+    if (!readiness?.confirmedEmpty) return;
+    const error = new Error(
+      readiness.emptyMessage ||
+        `「${keyword}」在当前筛选范围内没有匹配内容`,
+    );
+    error.code = 'CONFIRMED_EMPTY_SEARCH_RESULTS';
+    error.category = 'no_matching_results';
+    error.confirmedEmpty = true;
+    error.noResults = true;
+    error.resultKind = 'no_matching_results';
+    error.retryable = false;
+    error.keywordScoped = true;
+    error.pageUrl = readiness.pageUrl || '';
+    throw error;
+  };
 
   try {
   for (let i = 0; i < keywords.length; i++) {
@@ -13783,14 +13815,19 @@ export async function batchCaptureByKeywords({
           message: `正在等待「${keyword}」搜索结果加载(${i + 1}/${keywords.length})...`,
         });
       }
-      const initialResultsReady = await waitForKeywordSearchResultsInTab(
-        runnerTabId,
-        platform,
-        shouldStop,
-        {
-          keyword,
-        },
+      const initialReadiness = normalizeKeywordSearchReadiness(
+        await waitForKeywordSearchResultsInTab(
+          runnerTabId,
+          platform,
+          shouldStop,
+          {
+            keyword,
+            returnState: true,
+          },
+        ),
       );
+      throwConfirmedEmptySearchResult(keyword, initialReadiness);
+      const initialResultsReady = initialReadiness.ready;
       if (!initialResultsReady && isDouyinPlatform(platform)) {
         throw new Error(
           `「${keyword}」搜索结果页未就绪，已结束本次尝试并保留后续关键词`,
@@ -13821,9 +13858,18 @@ export async function batchCaptureByKeywords({
               });
             }
             await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
-            await waitForKeywordSearchResultsInTab(runnerTabId, platform, shouldStop, {
-              keyword,
-            });
+            const retrySearchReadiness = normalizeKeywordSearchReadiness(
+              await waitForKeywordSearchResultsInTab(
+                runnerTabId,
+                platform,
+                shouldStop,
+                {
+                  keyword,
+                  returnState: true,
+                },
+              ),
+            );
+            throwConfirmedEmptySearchResult(keyword, retrySearchReadiness);
           }
           if (onProgress) {
             onProgress({
@@ -13852,16 +13898,21 @@ export async function batchCaptureByKeywords({
               message: `正在等待「${keyword}」筛选后的结果加载(${i + 1}/${keywords.length})...`,
             });
           }
-          filteredResultsReady = await waitForKeywordSearchResultsInTab(
-            runnerTabId,
-            platform,
-            shouldStop,
-            {
-              keyword,
-              timeoutMs: 12000,
-              stablePolls: 1,
-            },
+          const filteredReadiness = normalizeKeywordSearchReadiness(
+            await waitForKeywordSearchResultsInTab(
+              runnerTabId,
+              platform,
+              shouldStop,
+              {
+                keyword,
+                timeoutMs: 12000,
+                stablePolls: 1,
+                returnState: true,
+              },
+            ),
           );
+          throwConfirmedEmptySearchResult(keyword, filteredReadiness);
+          filteredResultsReady = filteredReadiness.ready;
         }
         if (!filteredResultsReady) {
           throw new Error(
@@ -13947,12 +13998,16 @@ export async function batchCaptureByKeywords({
             onTick: reportRetryWaitProgress,
           },
         );
-        const retryResultsReady = await waitForKeywordSearchResultsInTab(
-          runnerTabId,
-          platform,
-          shouldStop,
-          {keyword},
+        const retryReadiness = normalizeKeywordSearchReadiness(
+          await waitForKeywordSearchResultsInTab(
+            runnerTabId,
+            platform,
+            shouldStop,
+            {keyword, returnState: true},
+          ),
         );
+        throwConfirmedEmptySearchResult(keyword, retryReadiness);
+        const retryResultsReady = retryReadiness.ready;
         if (!retryResultsReady && isDouyinPlatform(platform)) {
           throw new Error(
             `「${keyword}」重试后搜索结果页仍未就绪，已保留后续关键词`,
@@ -13963,7 +14018,7 @@ export async function batchCaptureByKeywords({
         if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
           await applySearchFiltersInTab(runnerTabId, searchFilters);
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
-          const refilteredResultsReady =
+          const refilteredReadiness = normalizeKeywordSearchReadiness(
             await waitForKeywordSearchResultsInTab(
               runnerTabId,
               platform,
@@ -13972,8 +14027,12 @@ export async function batchCaptureByKeywords({
                 keyword,
                 timeoutMs: 12000,
                 stablePolls: 1,
+                returnState: true,
               },
-            );
+            ),
+          );
+          throwConfirmedEmptySearchResult(keyword, refilteredReadiness);
+          const refilteredResultsReady = refilteredReadiness.ready;
           if (!refilteredResultsReady) {
             throw new Error(
               `「${keyword}」重挂筛选后搜索结果页仍未就绪，已保留后续关键词`,
@@ -14105,6 +14164,35 @@ export async function batchCaptureByKeywords({
         canceled = true;
         break;
       }
+      if (
+        String(error?.code || '').trim().toUpperCase() ===
+        'CONFIRMED_EMPTY_SEARCH_RESULTS'
+      ) {
+        keywordResult = {
+          keyword,
+          ok: true,
+          noResults: true,
+          emptyResult: true,
+          resultKind: 'no_matching_results',
+          recordIds: [],
+          message:
+            error?.message ||
+            `「${keyword}」在当前筛选范围内没有匹配内容`,
+        };
+        results.push(keywordResult);
+        successCount++;
+        if (onProgress) {
+          onProgress({
+            current: i + 1,
+            total: keywords.length,
+            keyword,
+            phase: 'no_matching_results',
+            message: `「${keyword}」在当前筛选范围内没有匹配内容，已按 0 条正常完成`,
+            recordIds: [],
+            runnerTabId,
+          });
+        }
+      } else {
       const fatalError = isExplicitFatalKeywordFailure(error);
       const captureFailure = resolveKeywordFailure(error);
       keywordResult = {
@@ -14122,6 +14210,7 @@ export async function batchCaptureByKeywords({
       results.push(keywordResult);
       failedCount++;
       if (fatalError || captureFailure.fatal) fatal = true;
+      }
     } finally {
       // captureAndSaveInTab owns its own checkpoint session.
     }
@@ -14165,6 +14254,7 @@ export async function batchCaptureByKeywords({
     const canRunAfterKeywordCapture =
       !canceled &&
       !keywordResult?.fatal &&
+      !keywordResult?.noResults &&
       keywordResult?.ok &&
       typeof afterKeywordCapture === 'function';
     if (canRunAfterKeywordCapture && keywordRecordIds.length === 0) {
@@ -15457,11 +15547,19 @@ async function waitForKeywordSearchResultsInTab(
     timeoutMs = BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS,
     keyword = '',
     stablePolls = BATCH_KEYWORD_RESULTS_STABLE_POLLS,
+    returnState = false,
   } = {},
 ) {
   const normalizedTabId = Number(tabId);
   if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
-    return false;
+    return returnState
+      ? {
+          ready: false,
+          confirmedEmpty: false,
+          emptyMessage: '',
+          pageUrl: '',
+        }
+      : false;
   }
 
   const startedAt = Date.now();
@@ -15470,6 +15568,7 @@ async function waitForKeywordSearchResultsInTab(
   let lastSignature = '';
   let lastCardCount = -1;
   let stableCount = 0;
+  let lastPageUrl = '';
   while (Date.now() - startedAt < timeout) {
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('BATCH_CAPTURE_CANCELED');
@@ -15635,6 +15734,22 @@ async function waitForKeywordSearchResultsInTab(
                 '抖音当前关键词搜索暂时不可用，已结束本词并继续下一个关键词',
             };
           }
+          const confirmedEmptyNode = douyinSearchPathReady
+            ? Array.from(
+                document.querySelectorAll('h1, h2, h3, h4, p, span, div'),
+              ).find((node) => {
+                if (!isVisible(node)) return false;
+                if (isInsideDouyinResultCard(node)) return false;
+                const text = String(node.innerText || node.textContent || '')
+                  .trim()
+                  .replace(/\s+/gu, '');
+                return (
+                  /^(?:暂无)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
+                  /^(?:没有找到|没有搜索到|未找到|未搜索到)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
+                  /^(?:暂无|没有)(?:符合)?(?:当前)?筛选条件的?(?:结果|内容|作品)[。！!]?$/u.test(text)
+                );
+              })
+            : null;
           const hasVisibleMedia = (node) =>
             Boolean(
               node?.querySelector?.(
@@ -15773,6 +15888,14 @@ async function waitForKeywordSearchResultsInTab(
             keywordMatched,
             pageUrl: window.location.href,
             signature,
+            confirmedEmpty: Boolean(confirmedEmptyNode),
+            emptyMessage: confirmedEmptyNode
+              ? String(
+                  confirmedEmptyNode.innerText ||
+                    confirmedEmptyNode.textContent ||
+                    '',
+                ).trim()
+              : '',
           };
         },
         args: [platform, keyword],
@@ -15798,6 +15921,23 @@ async function waitForKeywordSearchResultsInTab(
       platform,
       keyword,
     );
+    lastPageUrl = String(snapshot?.pageUrl || '');
+    const confirmedEmpty =
+      searchPathReady &&
+      !keywordConflict &&
+      keywordMatched &&
+      snapshot?.confirmedEmpty === true;
+    if (confirmedEmpty) {
+      const emptyState = {
+        ready: false,
+        confirmedEmpty: true,
+        emptyMessage:
+          String(snapshot?.emptyMessage || '').trim() ||
+          `「${keyword}」在当前筛选范围内没有匹配内容`,
+        pageUrl: lastPageUrl,
+      };
+      return returnState ? emptyState : false;
+    }
     // 宽限期内仍要求关键词字面对上(防抢跑、防读到上一个词的旧结果);
     // 超过宽限期后,只要结果卡片稳定出现就放行,不再因抖音 URL 编码对不上而空等到超时。
     const keywordMatchGraceElapsed =
@@ -15821,7 +15961,14 @@ async function waitForKeywordSearchResultsInTab(
     }
 
     if (resultsAccepted && stableCount >= requiredStablePolls) {
-      return true;
+      return returnState
+        ? {
+            ready: true,
+            confirmedEmpty: false,
+            emptyMessage: '',
+            pageUrl: lastPageUrl,
+          }
+        : true;
     }
 
     await waitMsWithStop(
@@ -15831,7 +15978,14 @@ async function waitForKeywordSearchResultsInTab(
     );
   }
 
-  return false;
+  return returnState
+    ? {
+        ready: false,
+        confirmedEmpty: false,
+        emptyMessage: '',
+        pageUrl: lastPageUrl,
+      }
+    : false;
 }
 
 async function closeKeywordSearchFilterPanelInTab(tabId) {

@@ -169,6 +169,41 @@ test("settled checkpoint advances only after a keyword result is available", () 
   assert.equal(settled.summary.completed, 1);
 });
 
+test("a confirmed zero-result keyword is completed and remains distinguishable", () => {
+  const zeroResultKeywords = ["无结果词"];
+  const settled = settleUnattendedKeywordCheckpoint({
+    checkpoint: normalizeUnattendedKeywordCheckpoint(
+      {},
+      zeroResultKeywords,
+    ),
+    keywords: zeroResultKeywords,
+    keyword: "无结果词",
+    result: {
+      ok: true,
+      noResults: true,
+      resultKind: "no_matching_results",
+      recordIds: [],
+    },
+    recordIds: [],
+  });
+
+  assert.equal(settled.entry.status, "completed");
+  assert.equal(settled.entry.savedCount, 0);
+  assert.equal(settled.entry.noResults, true);
+  assert.equal(settled.entry.resultKind, "no_matching_results");
+
+  const restored = normalizeUnattendedKeywordCheckpoint(
+    settled.checkpoint,
+    zeroResultKeywords,
+  );
+  assert.equal(restored.keywordResults[0].status, "completed");
+  assert.equal(restored.keywordResults[0].noResults, true);
+  assert.equal(
+    restored.keywordResults[0].resultKind,
+    "no_matching_results",
+  );
+});
+
 test("a later failed attempt does not erase an earlier saved count", () => {
   const first = settleUnattendedKeywordCheckpoint({
     checkpoint: normalizeUnattendedKeywordCheckpoint({}, keywords),

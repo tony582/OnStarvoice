@@ -102,6 +102,11 @@ function evaluateKeywordPlanRunning() {
 }
 
 function evaluateKeywordPlanProgressText() {
+  const copySource = readSection(
+    sidebarSource,
+    "function getKeywordExecutionCopy(source = {})",
+    "function buildKeywordRunDisplayPlan(",
+  );
   const source = readSection(
     sidebarSource,
     "function buildKeywordPlanProgressText(plan = {})",
@@ -110,7 +115,7 @@ function evaluateKeywordPlanProgressText() {
   const context = {};
   vm.createContext(context);
   vm.runInContext(
-    `${source}\nthis.buildKeywordPlanProgressText = buildKeywordPlanProgressText;`,
+    `${copySource}\n${source}\nthis.buildKeywordPlanProgressText = buildKeywordPlanProgressText;`,
     context,
   );
   return context.buildKeywordPlanProgressText;
@@ -404,6 +409,19 @@ test("recovering remains an active unattended state and progress copy is hierarc
   assert.match(text, /「别克 OTA」/);
   assert.match(text, /当前词内作品 4\/50/);
   assert.doesNotMatch(text, /(?:^| · )1\/2(?: · |：)/);
+
+  const oneTimeText = buildKeywordPlanProgressText({
+    executionMode: "one_time",
+    keywords: ["新店开业"],
+    lastRunProgress: {
+      keyword: "新店开业",
+      keywordCurrent: 1,
+      keywordTotal: 1,
+      message: "正在采集列表",
+    },
+  });
+  assert.match(oneTimeText, /^一次性采集 · /u);
+  assert.doesNotMatch(oneTimeText, /无人值守/u);
 });
 
 test("streaming sync completion is a terminal progress phase", () => {

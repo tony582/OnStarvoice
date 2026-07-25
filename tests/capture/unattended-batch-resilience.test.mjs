@@ -273,6 +273,49 @@ test("a drifted Douyin search page fails only the current keyword and continues"
   assert.equal(harness.settled[1].result.ok, true);
 });
 
+test("a confirmed empty Douyin result settles as a successful zero-result keyword", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    waitForResults: async ({keyword}) =>
+      keyword === "词1"
+        ? {
+            ready: false,
+            confirmedEmpty: true,
+            emptyMessage: "暂无相关内容",
+            pageUrl: "https://www.douyin.com/search/%E8%AF%8D1?type=general",
+          }
+        : {ready: true, confirmedEmpty: false},
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.canceled, false);
+  assert.equal(result.stats.success, 2);
+  assert.equal(result.stats.failed, 0);
+  assert.deepEqual(
+    harness.captureCalls.map((call) => call.keyword),
+    ["词2"],
+    "an explicitly empty keyword must not enter list capture",
+  );
+  assert.equal(result.results[0].ok, true);
+  assert.equal(result.results[0].noResults, true);
+  assert.equal(result.results[0].resultKind, "no_matching_results");
+  assert.equal(harness.settled[0].result.noResults, true);
+  assert.equal(
+    harness.progress.some(
+      (entry) =>
+        entry.keyword === "词1" &&
+        entry.phase === "no_matching_results",
+    ),
+    true,
+  );
+});
+
 test("Douyin service-abnormal state fails the current keyword and continues the next", async () => {
   let readinessChecks = 0;
   const harness = createBatchHarness({

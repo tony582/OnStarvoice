@@ -848,6 +848,25 @@ function isTerminalUnattendedRunStatus(status) {
   return UNATTENDED_RUN_TERMINAL_STATUSES.has(String(status || ''));
 }
 
+function getUnattendedExecutionMode(source = {}) {
+  const value =
+    typeof source === 'string' ? source : source?.executionMode;
+  return String(value || '').trim() === 'one_time'
+    ? 'one_time'
+    : 'unattended_plan';
+}
+
+function getUnattendedExecutionCopy(source = {}) {
+  const executionMode = getUnattendedExecutionMode(source);
+  const oneTime = executionMode === 'one_time';
+  return {
+    executionMode,
+    taskLabel: oneTime ? '一次性采集任务' : '无人值守任务',
+    runLabel: oneTime ? '一次性采集' : '无人值守运行',
+    runnerLabel: oneTime ? '一次性任务运行页' : '无人值守运行页',
+  };
+}
+
 function parseTimestampMs(value) {
   const timestamp = Date.parse(String(value || ''));
   return Number.isFinite(timestamp) ? timestamp : NaN;
@@ -3300,6 +3319,7 @@ async function createUnattendedKeywordRunRequest(
     }
     const cloudCredential = await readCloudTaskAgentCredential();
     const now = new Date().toISOString();
+    const executionCopy = getUnattendedExecutionCopy(executionMode);
     const request = {
       schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
       id: String(requestId || '').trim() || createUuid(),
@@ -3312,10 +3332,7 @@ async function createUnattendedKeywordRunRequest(
       reason,
       cloudCommandId: String(cloudCommandId || '').trim(),
       cloudAssigned: cloudAssigned === true,
-      executionMode:
-        String(executionMode || '').trim() === 'one_time'
-          ? 'one_time'
-          : 'unattended_plan',
+      executionMode: executionCopy.executionMode,
       cloudAgentScopeId: String(cloudCredential.id || ''),
       createdAt: now,
       updatedAt: now,
@@ -3324,10 +3341,14 @@ async function createUnattendedKeywordRunRequest(
       planSnapshot: normalizeUnattendedKeywordPlan(plan),
       progress: null,
       error: null,
-      message: '已创建无人值守任务，等待运行页领取',
+      message: `已创建${executionCopy.taskLabel}，等待运行页领取`,
     };
     await persistUnattendedRunMutation(request, {
-      event: {type: 'created', message: '已创建无人值守任务', at: now},
+      event: {
+        type: 'created',
+        message: `已创建${executionCopy.taskLabel}`,
+        at: now,
+      },
     });
     if (!cloudAssigned && existing?.status === 'needs_action') {
       await resolveSupersededNeedsActionTask(
@@ -3356,6 +3377,7 @@ async function bindUnattendedRunnerTab(request, runnerTabId) {
       return current;
     }
     const now = new Date().toISOString();
+    const executionCopy = getUnattendedExecutionCopy(current);
     const nextRequest = {
       ...current,
       runnerTabId: normalizedTabId,
@@ -3368,7 +3390,7 @@ async function bindUnattendedRunnerTab(request, runnerTabId) {
           ? null
           : {
               type: 'runner_bound',
-              message: '无人值守运行页已连接',
+              message: `${executionCopy.runnerLabel}已连接`,
               at: now,
             },
     });
@@ -3440,8 +3462,8 @@ async function claimUnattendedKeywordRun({
       });
     if (!transferredLock) {
       const blockedAt = new Date().toISOString();
-      const blockedMessage =
-        '检测到其他采集任务已占用执行锁，已阻止无人值守任务并行恢复；请等待当前任务结束后在任务中心重试';
+      const executionCopy = getUnattendedExecutionCopy(request);
+      const blockedMessage = `检测到其他采集任务已占用执行锁，已阻止${executionCopy.taskLabel}并行恢复；请等待当前任务结束后在任务中心重试`;
       const blockedRequest = {
         ...request,
         status: 'needs_action',
@@ -3513,6 +3535,7 @@ async function claimUnattendedKeywordRun({
     }
 
     const claimedAt = new Date().toISOString();
+    const executionCopy = getUnattendedExecutionCopy(request);
     const nextRequest = {
       ...request,
       status: 'claimed',
@@ -3533,7 +3556,9 @@ async function claimUnattendedKeywordRun({
         : Math.max(0, Number(request.resumeCount) || 0),
       message: isSameRunnerResume
         ? '检测到运行页刷新，正在从已有采集数据恢复任务'
-        : String(request.message || '无人值守运行页已领取任务'),
+        : String(
+            request.message || `${executionCopy.runnerLabel}已领取任务`,
+          ),
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
@@ -3725,9 +3750,10 @@ async function launchUnattendedKeywordRun(
     });
     await bindUnattendedRunnerTab(request, runnerTab?.id);
   } catch (error) {
+    const executionCopy = getUnattendedExecutionCopy(request);
     await markUnattendedRunRequestStale(
       request,
-      `创建无人值守运行页失败：${error?.message || '未知错误'}`,
+      `创建${executionCopy.runnerLabel}失败：${error?.message || '未知错误'}`,
     );
     throw error;
   }
@@ -3887,10 +3913,10 @@ async function assessUnattendedRunHealth(
     try {
       const runnerTab = await chrome.tabs.get(runnerTabId);
       if (runnerTab?.discarded === true) {
-        return {healthy: false, reason: 'runner_tab_discarded'};
+        return {healthy: false, reason: 'runner_tab_discarded', runnerTab};
       }
       if (runnerTab?.frozen === true) {
-        return {healthy: false, reason: 'runner_tab_frozen'};
+        return {healthy: false, reason: 'runner_tab_frozen', runnerTab};
       }
     } catch {
       return {healthy: false, reason: 'runner_tab_missing'};
@@ -3919,20 +3945,92 @@ async function assessUnattendedRunHealth(
   return {healthy: true, reason: 'active'};
 }
 
-function formatUnattendedRecoveryReason(reason) {
+async function wakeFrozenUnattendedRunnerTab(request, runnerTab = null) {
+  const runnerTabId = Number(request?.runnerTabId);
+  if (!Number.isFinite(runnerTabId) || runnerTabId <= 0) {
+    return {woken: false, reason: 'runner_tab_missing', request};
+  }
+
+  let resolvedRunnerTab = runnerTab;
+  try {
+    if (!resolvedRunnerTab || Number(resolvedRunnerTab.id) !== runnerTabId) {
+      resolvedRunnerTab = await chrome.tabs.get(runnerTabId);
+    }
+    if (resolvedRunnerTab?.discarded === true) {
+      return {woken: false, reason: 'runner_tab_discarded', request};
+    }
+
+    const windowId = Number(resolvedRunnerTab?.windowId);
+    let restoreTabId = null;
+    if (Number.isFinite(windowId) && windowId >= 0) {
+      try {
+        const activeTabs = await chrome.tabs.query({
+          active: true,
+          windowId,
+        });
+        const previousActiveTab = activeTabs.find(
+          (tab) =>
+            Number.isFinite(Number(tab?.id)) &&
+            Number(tab.id) > 0 &&
+            Number(tab.id) !== runnerTabId,
+        );
+        restoreTabId = previousActiveTab ? Number(previousActiveTab.id) : null;
+      } catch {
+        restoreTabId = null;
+      }
+    }
+
+    // Chromium 会在 tab 被激活时解除 frozen。这里先唤醒原 runner，
+    // 再恢复用户原本正在看的页面；不创建新 attempt，也不重跑当前关键词。
+    await chrome.tabs.update(runnerTabId, {
+      active: true,
+      autoDiscardable: false,
+    });
+    if (restoreTabId) {
+      try {
+        await chrome.tabs.update(restoreTabId, {active: true});
+      } catch {
+        // runner 已经被唤醒。恢复用户原标签失败不应触发整段任务重跑。
+      }
+    }
+
+    const protectedRequest = await applyUnattendedWakeGrace(
+      request,
+      'runner_tab_frozen',
+    );
+    return {
+      woken: true,
+      reason: 'runner_tab_woken',
+      request: protectedRequest || request,
+    };
+  } catch (error) {
+    return {
+      woken: false,
+      reason: 'runner_tab_wake_failed',
+      request,
+      error,
+    };
+  }
+}
+
+function formatUnattendedRecoveryReason(reason, request = null) {
+  const executionCopy = getUnattendedExecutionCopy(request || {});
   const messages = {
     claim_timeout: '运行页未在规定时间内领取任务',
     runner_tab_closed: '运行页已被关闭',
     runner_tab_missing: '运行页已不存在',
-    runner_tab_discarded: '浏览器已回收无人值守运行页',
-    runner_tab_frozen: '浏览器已暂停无人值守运行页',
+    runner_tab_discarded: `浏览器已回收${executionCopy.runnerLabel}`,
+    runner_tab_frozen: `浏览器已暂停${executionCopy.runnerLabel}`,
+    runner_tab_wake_failed: `浏览器未能唤醒${executionCopy.runnerLabel}`,
     runner_heartbeat_stale: '运行页心跳中断',
     business_progress_stalled: '采集业务长时间没有新进展',
-    runner_owner_disconnected: '无人值守运行页连接已更换',
+    runner_owner_disconnected: `${executionCopy.runnerLabel}连接已更换`,
     debug_target_closed: '浏览器替换了采集页面',
     source_tab_replace_failed: '浏览器替换页面后接管需要重建',
   };
-  return messages[String(reason || '')] || '无人值守任务运行异常';
+  return (
+    messages[String(reason || '')] || `${executionCopy.taskLabel}运行异常`
+  );
 }
 
 async function deferPendingUnattendedRecoveryForLock(request, activeLock) {
@@ -4051,6 +4149,7 @@ async function launchPendingUnattendedRecovery(request) {
       return null;
     }
     const now = new Date().toISOString();
+    const executionCopy = getUnattendedExecutionCopy(current);
     const nextRequest = {
       ...current,
       status: 'pending',
@@ -4060,7 +4159,7 @@ async function launchPendingUnattendedRecovery(request) {
       heartbeatAt: now,
       businessProgressAt: now,
       updatedAt: now,
-      message: `正在启动第 ${current.attemptNumber} 次无人值守运行`,
+      message: `正在启动第 ${current.attemptNumber} 次${executionCopy.runLabel}`,
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
@@ -4203,7 +4302,10 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
 
     const recoveryCount = Math.max(0, Number(current.recoveryCount) || 0);
     if (recoveryCount >= UNATTENDED_MAX_RECOVERY_ATTEMPTS) {
-      const reasonText = formatUnattendedRecoveryReason(health.reason);
+      const reasonText = formatUnattendedRecoveryReason(
+        health.reason,
+        current,
+      );
       const message = `${reasonText}，自动恢复已达到 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次，请人工检查后继续`;
       const nextRequest = {
         ...current,
@@ -4221,7 +4323,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
     }
 
     const nextRecoveryCount = recoveryCount + 1;
-    const reasonText = formatUnattendedRecoveryReason(health.reason);
+    const reasonText = formatUnattendedRecoveryReason(health.reason, current);
     const message = `${reasonText}，正在自动恢复（${nextRecoveryCount}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS}）`;
     const nextRequest = {
       ...current,
@@ -4657,6 +4759,21 @@ async function superviseUnattendedKeywordRun({
     });
     if (health.healthy) {
       return health;
+    }
+    if (health.reason === 'runner_tab_frozen') {
+      const wakeResult = await wakeFrozenUnattendedRunnerTab(
+        request,
+        health.runnerTab,
+      );
+      if (wakeResult.woken) {
+        return {
+          healthy: true,
+          reason: wakeResult.reason,
+          request: wakeResult.request,
+        };
+      }
+      health.reason = wakeResult.reason || health.reason;
+      health.error = wakeResult.error || null;
     }
     return await recoverUnattendedKeywordRunRequest(request, health);
   } finally {
@@ -7885,8 +8002,8 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.frozen === true || changeInfo.discarded === true) {
     // Chromium 132+ 会明确暴露 frozen；Edge 的睡眠标签页也可能进一步
-    // discarded。runner 虽仍在标签栏里，但这两种状态都已无法继续计时器
-    // 和编排，立即交给 supervisor 从检查点恢复，不再等心跳宽限耗尽。
+    // discarded。frozen 优先激活原 runner 解冻，避免重新执行当前关键词；
+    // discarded 已卸载页面，才由 supervisor 从检查点重建。
     superviseUnattendedKeywordRun({
       reason: 'runner_tab_state_changed',
     }).catch((error) => {

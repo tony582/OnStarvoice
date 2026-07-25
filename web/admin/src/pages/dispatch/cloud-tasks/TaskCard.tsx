@@ -3,6 +3,7 @@ import {
   Archive, Bot, ChevronDown, ChevronUp, Loader2, Network, Play, Square,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { KeywordProgressSummary, TaskDiagnosticsPanel } from './TaskDiagnostics'
 import type { CloudTask } from './lib'
 import {
   PLATFORM_LABELS,
@@ -14,6 +15,7 @@ import {
   resumeBlockReason,
   safeNumber,
   statusTone,
+  taskDiagnostics,
   taskErrorText,
   taskProgress,
 } from './lib'
@@ -38,7 +40,9 @@ export function TaskCard({
   const [detailsOpen, setDetailsOpen] = useState(false)
   const effectiveStatus = task.effective_status || task.status
   const progress = taskProgress(task)
+  const diagnostics = taskDiagnostics(task)
   const orchestration = task.task_type === 'capture_orchestration'
+  const hasKeywordDiagnostics = !orchestration && diagnostics.items.length > 0
   const resumable = !orchestration && canResume(task)
   const stoppable = !orchestration && canStop(task)
   const commandPending = Boolean(task.pending_command_id)
@@ -96,9 +100,21 @@ export function TaskCard({
         )}
         <span className="shrink-0">· {formatTime(task.created_at || task.updated_at)}</span>
       </div>
-      {task.message && <p className="mt-2 line-clamp-1 text-xs leading-5 text-muted-foreground">{task.message}</p>}
-      {taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-1 text-xs leading-5 text-status-red">{taskError}</p>}
-      {progress.total > 0 && (
+      {(hasKeywordDiagnostics ? diagnostics.headline : task.message) && (
+        <p className={`mt-2 line-clamp-1 text-xs leading-5 ${
+          hasKeywordDiagnostics && diagnostics.tone === 'danger'
+            ? 'text-status-red'
+            : hasKeywordDiagnostics && diagnostics.tone === 'warning'
+              ? 'text-amber-700 dark:text-amber-300'
+              : 'text-muted-foreground'
+        }`}>
+          {hasKeywordDiagnostics ? diagnostics.headline : task.message}
+        </p>
+      )}
+      {!hasKeywordDiagnostics && taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-1 text-xs leading-5 text-status-red">{taskError}</p>}
+      {hasKeywordDiagnostics ? (
+        <KeywordProgressSummary task={task} diagnostics={diagnostics} />
+      ) : progress.total > 0 && (
         <div className="mt-3">
           <div className="mb-1.5 flex justify-between text-[11px] text-muted-foreground"><span>总体进度</span><span>{progress.current}/{progress.total} · {progress.percent}%</span></div>
           <div className="h-1.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="任务总体进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><span className="block h-full rounded-full bg-primary transition-[width]" style={{ width: `${progress.percent}%` }} /></div>
@@ -108,7 +124,7 @@ export function TaskCard({
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
         <button type="button" onClick={() => setDetailsOpen(value => !value)} aria-expanded={detailsOpen}
           className="flex min-h-9 items-center gap-1.5 rounded-lg text-left text-[11px] font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary">
-          <span>运行详情</span>
+          <span>{hasKeywordDiagnostics ? '运行报告' : '运行详情'}</span>
           {detailsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
         </button>
         {hasActions && (
@@ -121,7 +137,13 @@ export function TaskCard({
             {resumable && !commandPending && (
               <Button size="sm" onClick={() => void onResume(task)} disabled={!writable || Boolean(resumeBlocked) || actionTaskId === task.id}>
                 {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                {resumeBlocked ? '暂时不能继续' : task.agent_online ? '继续剩余任务' : '上线后继续'}
+                {resumeBlocked
+                  ? diagnostics.retryExhausted
+                    ? '失败词已达上限'
+                    : '暂时不能继续'
+                  : task.agent_online
+                    ? '继续剩余任务'
+                    : '上线后继续'}
               </Button>
             )}
             {stoppable && !stopPending && (
@@ -142,8 +164,11 @@ export function TaskCard({
         )}
       </div>
       {detailsOpen && (
-        <div className="mt-2 grid gap-2 rounded-xl bg-muted/45 p-3 text-[11px] text-muted-foreground sm:grid-cols-2">
-          {orchestration ? (
+        hasKeywordDiagnostics ? (
+          <TaskDiagnosticsPanel task={task} diagnostics={diagnostics} />
+        ) : (
+          <div className="mt-2 grid gap-2 rounded-xl bg-muted/45 p-3 text-[11px] text-muted-foreground sm:grid-cols-2">
+            {orchestration ? (
             <>
               <div>关键词工作项：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 项</span></div>
               <div>已结算：<span className="text-foreground">{safeNumber(task.progress?.current)} 项</span></div>
@@ -151,7 +176,7 @@ export function TaskCard({
               {scheduleTemplate && <div>下次运行：<span className="text-foreground">{formatTime(String(task.metadata?.nextRunAt || ''))}</span></div>}
               <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
             </>
-          ) : (
+            ) : (
             <>
               <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>
               <div>任务心跳：<span className="text-foreground">{formatTime(task.heartbeat_at)}</span></div>
@@ -161,8 +186,9 @@ export function TaskCard({
               {commandPending && task.pending_command_expires_at ? <div>指令保留至：<span className="text-foreground">{formatTime(task.pending_command_expires_at)}</span></div> : null}
               {resumeBlocked && !commandPending ? <div className="text-status-red sm:col-span-2">继续阻断：{resumeBlocked}</div> : null}
             </>
-          )}
-        </div>
+            )}
+          </div>
+        )
       )}
     </article>
   )

@@ -83,6 +83,7 @@ function createHarness() {
   let tabCreateHandler = null;
   let tabGetHandler = null;
   let tabQueryHandler = null;
+  let tabUpdateHandler = null;
   let storageGetHandler = null;
   let reloadHook = null;
   let nextRuntimeSetError = null;
@@ -212,6 +213,9 @@ function createHarness() {
       async update(tabId, patch) {
         const tab = {id: tabId, ...patch};
         updatedTabs.push(tab);
+        if (typeof tabUpdateHandler === "function") {
+          return await tabUpdateHandler(tabId, patch);
+        }
         return tab;
       },
       async reload(tabId) {
@@ -428,6 +432,9 @@ function createHarness() {
     },
     setTabQueryHandler(handler) {
       tabQueryHandler = handler;
+    },
+    setTabUpdateHandler(handler) {
+      tabUpdateHandler = handler;
     },
     setStorageGetHandler(handler) {
       storageGetHandler = handler;
@@ -1362,6 +1369,8 @@ test("a cloud create command starts exactly one local task without replacing the
   assert.equal(request.id, "cloud-task-local-1");
   assert.equal(request.cloudAssigned, true);
   assert.equal(request.executionMode, "one_time");
+  assert.match(request.message, /一次性采集任务/u);
+  assert.doesNotMatch(request.message, /无人值守/u);
   assert.equal(request.cloudCommandId, "cloud-command-create-1");
   assert.deepEqual(Array.from(request.planSnapshot.keywords), ["远程关键词"]);
   assert.equal(request.planSnapshot.keywordMaxDetectedItems, 275);
@@ -3139,28 +3148,44 @@ test("closing the active runner triggers recovery through tabs.onRemoved", async
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
 });
 
-test("a frozen runner is recovered even though its tab still exists", async () => {
+test("a frozen runner is woken without rebuilding the current keyword attempt", async () => {
   const harness = createHarness();
-  seedUnattendedRequest(harness, {runnerTabId: 42});
+  const request = seedUnattendedRequest(harness, {runnerTabId: 42});
   harness.setTabGetHandler(async (tabId) => ({
     id: Number(tabId),
     windowId: 1,
+    active: Number(tabId) === 88,
     status: "complete",
     frozen: Number(tabId) === 42,
     discarded: false,
     url: "chrome-extension://test/sidebar/sidebar.html",
   }));
+  harness.setTabQueryHandler(async (queryInfo) =>
+    queryInfo?.active && Number(queryInfo?.windowId) === 1
+      ? [{id: 88, windowId: 1, active: true}]
+      : [],
+  );
 
   const result = await harness.api.superviseUnattendedKeywordRun();
 
-  assert.equal(result.recovered, true, JSON.stringify(result));
+  assert.equal(result.healthy, true, JSON.stringify(result));
+  assert.equal(result.reason, "runner_tab_woken");
   assert.equal(
-    harness.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
+    harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
+    request.attemptId,
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].wakeReason,
     "runner_tab_frozen",
   );
+  assert.deepEqual(harness.updatedTabs, [
+    {id: 42, active: true, autoDiscardable: false},
+    {id: 88, active: true},
+  ]);
 });
 
-test("the tab-state event immediately checks a frozen background runner", async () => {
+test("the tab-state event wakes a frozen background runner without a new attempt", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness, {runnerTabId: 42});
   harness.setTabGetHandler(async (tabId) => ({
@@ -3178,13 +3203,52 @@ test("the tab-state event immediately checks a frozen background runner", async 
   }
   await waitFor(
     () =>
-      harness.storage[UNATTENDED_REQUEST_KEY]?.attemptId !== request.attemptId,
-    "frozen runner event should trigger unattended recovery",
+      harness.storage[UNATTENDED_REQUEST_KEY]?.wakeReason ===
+      "runner_tab_frozen",
+    "frozen runner event should wake the existing runner",
   );
 
   assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
+    request.attemptId,
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.ok(
+    harness.updatedTabs.some(
+      (tab) => tab.id === 42 && tab.active === true,
+    ),
+  );
+});
+
+test("a frozen runner falls back to bounded recovery when it cannot be woken", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {runnerTabId: 42});
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    active: false,
+    status: "complete",
+    frozen: Number(tabId) === 42,
+    discarded: false,
+    url: "chrome-extension://test/sidebar/sidebar.html",
+  }));
+  harness.setTabUpdateHandler(async (tabId, patch) => {
+    if (Number(tabId) === 42 && patch?.active === true) {
+      throw new Error("tab activation failed");
+    }
+    return {id: Number(tabId), ...patch};
+  });
+
+  const result = await harness.api.superviseUnattendedKeywordRun();
+
+  assert.equal(result.recovered, true, JSON.stringify(result));
+  assert.notEqual(
+    harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
+    request.attemptId,
+  );
+  assert.equal(
     harness.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
-    "runner_tab_frozen",
+    "runner_tab_wake_failed",
   );
 });
 
