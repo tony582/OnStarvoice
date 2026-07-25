@@ -36,6 +36,9 @@ import {
 import {
   assertNoDouyinSearchServiceAbnormalPage,
 } from "./utils/capture/douyin-search-guard.js";
+import {
+  detectLoggedSocialAccount,
+} from "./utils/social-account-identity.js";
 
 console.log("[StarVoice V1.0] Content script loaded");
 
@@ -379,6 +382,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       handleDetectPageType(sendResponseWithDiagnostics);
       return true;
 
+    case "detectLoggedSocialAccount":
+      handleDetectLoggedSocialAccount(sendResponseWithDiagnostics);
+      return true;
+
     case "smartCapture":
       runTrackedCaptureRequest(request, () =>
         handleSmartCapture(request, sendResponseWithDiagnostics),
@@ -548,6 +555,28 @@ function handleDetectPageType(sendResponse) {
     sendResponse({
       ok: false,
       error: {code: "DETECT_FAILED", message: error.message},
+    });
+  }
+}
+
+function handleDetectLoggedSocialAccount(sendResponse) {
+  try {
+    sendResponse({
+      ok: true,
+      data: detectLoggedSocialAccount({
+        documentRef: document,
+        locationHref: window.location.href,
+        platform: detectPlatformFromUrl(window.location.href),
+      }),
+    });
+  } catch (error) {
+    console.warn("[Content] Detect logged social account failed:", error);
+    sendResponse({
+      ok: false,
+      error: {
+        code: "SOCIAL_ACCOUNT_DETECT_FAILED",
+        message: error?.message || "未能识别当前登录账号",
+      },
     });
   }
 }

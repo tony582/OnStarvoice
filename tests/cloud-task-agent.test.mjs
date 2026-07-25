@@ -108,6 +108,50 @@ test("heartbeat body does not include the cloud credential", () => {
   assert.equal(payload.tasks[0].metadata.safe, "visible");
 });
 
+test("heartbeat reports social identity and idempotent usage without phone numbers", () => {
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-social"},
+    observedSocialAccounts: [{
+      platform: "douyin",
+      platformAccountId: "account-a",
+      accountHandle: "handle-a",
+      displayName: "账号 A",
+      registeredPhone: "13800000000",
+      loginState: "authenticated",
+      observedAt: "2026-07-25T03:00:00.000Z",
+    }],
+    socialUsageEvents: [{
+      eventId: "usage-a",
+      platform: "douyin",
+      searches: 1,
+      enhancements: 2,
+      captureRuns: 3,
+      capturedItems: 20,
+      succeeded: true,
+      occurredAt: "2026-07-25T03:01:00.000Z",
+      accountIdentity: {
+        platformAccountId: "account-a",
+        accountHandle: "handle-a",
+        displayName: "账号 A",
+      },
+      metadata: {
+        action: "captureKeywordNotes",
+        token: "must-not-leak",
+      },
+    }],
+  });
+
+  assert.equal(payload.agent.capabilities.socialAccountIdentity, true);
+  assert.equal(payload.agent.capabilities.socialAccountDailyUsage, true);
+  assert.equal(payload.observedSocialAccounts.length, 1);
+  assert.equal(payload.observedSocialAccounts[0].platformAccountId, "account-a");
+  assert.equal(Object.hasOwn(payload.observedSocialAccounts[0], "registeredPhone"), false);
+  assert.equal(payload.socialUsageEvents[0].eventId, "usage-a");
+  assert.equal(payload.socialUsageEvents[0].metadata.token, "[REDACTED]");
+  assert.equal(JSON.stringify(payload).includes("13800000000"), false);
+  assert.equal(JSON.stringify(payload).includes("must-not-leak"), false);
+});
+
 test("heartbeat advertises remote task creation and mirrors a sanitized unattended plan", () => {
   const keywords = Array.from({length: 35}, (_, index) => ` keyword-${index + 1} `);
   const payload = agent.buildHeartbeatPayload({

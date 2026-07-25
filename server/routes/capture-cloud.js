@@ -20,6 +20,9 @@ import {
   aggregateParentTaskItems,
   checkpointEntryToItemStatus,
 } from '../services/capture-orchestration.js';
+import {
+  processSocialAccountHeartbeat,
+} from '../services/social-account-usage.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -1728,6 +1731,20 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
     const heartbeatCapabilities = sanitizeCloudStructuredObject(
       req.body?.agent?.capabilities,
     );
+    const observedSocialAccounts = (
+      Array.isArray(req.body?.observedSocialAccounts)
+        ? req.body.observedSocialAccounts
+        : []
+    )
+      .slice(0, 10)
+      .map(item => sanitizeCloudStructuredObject(item));
+    const socialUsageEvents = (
+      Array.isArray(req.body?.socialUsageEvents)
+        ? req.body.socialUsageEvents
+        : []
+    )
+      .slice(0, 200)
+      .map(item => sanitizeCloudStructuredObject(item));
     if (Object.prototype.hasOwnProperty.call(heartbeatCapabilities, 'supportedPlatforms')) {
       heartbeatCapabilities.supportedPlatforms = normalizeCaptureAgentPlatforms(
         heartbeatCapabilities.supportedPlatforms,
@@ -1763,6 +1780,12 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
       ]);
 
       await expireStaleCommands(tx, agent.tenant_id, null, agent.id);
+
+      const socialAccountResult = await processSocialAccountHeartbeat(tx, {
+        agent,
+        observedAccounts: observedSocialAccounts,
+        usageEvents: socialUsageEvents,
+      });
 
       const mirroredTasks = [];
       for (const snapshot of snapshots) {
@@ -1863,7 +1886,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         }
       }
 
-      return { mirroredTasks, commands };
+      return { mirroredTasks, commands, socialAccountResult };
     });
 
     return res.json({
@@ -1873,6 +1896,10 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         heartbeatAt: new Date().toISOString(),
       },
       tasksAccepted: result.mirroredTasks.length,
+      observedAccountsAccepted:
+        result.socialAccountResult.observedAccountCount,
+      acceptedSocialUsageEventIds:
+        result.socialAccountResult.acceptedUsageEventIds,
       commands: result.commands,
     });
   } catch (err) {

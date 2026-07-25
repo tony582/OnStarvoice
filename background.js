@@ -19,6 +19,7 @@ try {
 }
 
 importScripts(
+  'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/debug-session.js',
   'utils/capture/task-tab-group.js',
@@ -29,6 +30,7 @@ importScripts(
 const runtimeTabPolicy = globalThis.OnStarvoiceRuntimeTabPolicy;
 const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
 const cloudTaskAgentApi = globalThis.OnStarvoiceCloudTaskAgent;
+const socialAccountUsageApi = globalThis.OnStarvoiceSocialAccountUsage;
 const CAPTURE_TASK_GROUP_TITLE =
   captureTaskTabGroupApi.DEFAULT_GROUP_TITLE || 'StarVoice 采集任务';
 
@@ -43,6 +45,8 @@ const STORAGE_KEYS = {
   auth: 'onstarvoice.auth',
   cloudCommandResults: 'onstarvoice.cloudCommandResults',
   cloudAgentStatus: 'onstarvoice.cloudTaskAgentStatus',
+  observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
+  socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
 };
 
 const DEFAULT_RUNTIME = {
@@ -87,6 +91,7 @@ const CLOUD_TASK_AGENT_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS = 5 * 60 * 1000;
+const SOCIAL_ACCOUNT_IDENTITY_REFRESH_MS = 5 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS = 2.5 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_WAKE_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_LOCK_WAIT_MS = 5 * 60 * 1000;
@@ -1332,6 +1337,8 @@ let cloudTaskAgentSyncTimer = null;
 let cloudTaskAgentLastError = '';
 let cloudTaskAgentFailureCount = 0;
 let cloudTaskAgentRetryNotBefore = 0;
+let socialAccountIdentityRefreshInFlight = null;
+let socialAccountUsageQueueMutation = Promise.resolve();
 
 function normalizeCloudTaskAgentError(value) {
   return String(value || '')
@@ -1357,6 +1364,227 @@ function recordCloudTaskAgentFailure() {
 function clearCloudTaskAgentFailureBackoff() {
   cloudTaskAgentFailureCount = 0;
   cloudTaskAgentRetryNotBefore = 0;
+}
+
+function normalizeCachedObservedSocialAccounts(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? value
+      : {};
+  return {
+    updatedAt: String(source.updatedAt || ''),
+    accounts: (Array.isArray(source.accounts) ? source.accounts : [])
+      .filter(account =>
+        ['xiaohongshu', 'douyin', 'weibo'].includes(
+          String(account?.platform || ''),
+        ),
+      )
+      .slice(0, 10),
+  };
+}
+
+async function readObservedSocialAccounts() {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.observedSocialAccounts,
+  );
+  return normalizeCachedObservedSocialAccounts(
+    stored[STORAGE_KEYS.observedSocialAccounts],
+  );
+}
+
+async function storeObservedSocialAccounts(accounts) {
+  const next = {
+    updatedAt: new Date().toISOString(),
+    accounts: (Array.isArray(accounts) ? accounts : []).slice(0, 10),
+  };
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.observedSocialAccounts]: next,
+  });
+  return next;
+}
+
+function observedSocialAccountPriority(account) {
+  const loginScore =
+    account?.loginState === 'authenticated'
+      ? 300
+      : account?.loginState === 'logged_out'
+        ? 200
+        : 100;
+  const confidenceScore =
+    account?.confidence === 'high'
+      ? 30
+      : account?.confidence === 'medium'
+        ? 20
+        : 10;
+  return (
+    loginScore +
+    confidenceScore +
+    (account?.platformAccountId ? 8 : 0) +
+    (account?.accountHandle ? 4 : 0) +
+    (account?.displayName ? 2 : 0)
+  );
+}
+
+async function detectObservedSocialAccountInTab(tab, platform) {
+  const tabId = Number(tab?.id);
+  if (!Number.isFinite(tabId) || tabId <= 0 || !platform) return null;
+  try {
+    const response = await sendContentMessageWithTimeout(
+      tabId,
+      {action: 'detectLoggedSocialAccount'},
+      5000,
+    );
+    const account =
+      response?.ok === true &&
+      response.data &&
+      typeof response.data === 'object' &&
+      !Array.isArray(response.data)
+        ? response.data
+        : null;
+    return account?.platform === platform ? account : null;
+  } catch {
+    return null;
+  }
+}
+
+async function mergeObservedSocialAccount(account) {
+  if (!account?.platform) return await readObservedSocialAccounts();
+  const cached = await readObservedSocialAccounts();
+  const next = cached.accounts.filter(
+    candidate => candidate?.platform !== account.platform,
+  );
+  next.push(account);
+  return await storeObservedSocialAccounts(next);
+}
+
+async function refreshObservedSocialAccounts({force = false} = {}) {
+  if (socialAccountIdentityRefreshInFlight) {
+    return await socialAccountIdentityRefreshInFlight;
+  }
+  const cached = await readObservedSocialAccounts();
+  const refreshedAt = Date.parse(cached.updatedAt);
+  if (
+    !force &&
+    Number.isFinite(refreshedAt) &&
+    Date.now() - refreshedAt < SOCIAL_ACCOUNT_IDENTITY_REFRESH_MS
+  ) {
+    return cached;
+  }
+
+  socialAccountIdentityRefreshInFlight = (async () => {
+    const tabs = await chrome.tabs.query({});
+    const relevantTabs = tabs
+      .map(tab => ({tab, platform: detectPlatformFromUrl(tab?.url || '')}))
+      .filter(item =>
+        ['xiaohongshu', 'douyin', 'weibo'].includes(item.platform),
+      );
+    const detected = await Promise.all(
+      relevantTabs.map(({tab, platform}) =>
+        detectObservedSocialAccountInTab(tab, platform),
+      ),
+    );
+    const bestDetectedByPlatform = new Map();
+    for (const account of detected.filter(Boolean)) {
+      const previous = bestDetectedByPlatform.get(account.platform);
+      if (
+        !previous ||
+        observedSocialAccountPriority(account) >=
+          observedSocialAccountPriority(previous)
+      ) {
+        bestDetectedByPlatform.set(account.platform, account);
+      }
+    }
+    const bestByPlatform = new Map(
+      cached.accounts.map(account => [account.platform, account]),
+    );
+    for (const [platform, account] of bestDetectedByPlatform) {
+      bestByPlatform.set(platform, account);
+    }
+    return await storeObservedSocialAccounts(
+      Array.from(bestByPlatform.values()),
+    );
+  })();
+  try {
+    return await socialAccountIdentityRefreshInFlight;
+  } finally {
+    socialAccountIdentityRefreshInFlight = null;
+  }
+}
+
+async function readSocialAccountUsageQueue() {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.socialAccountUsageQueue,
+  );
+  return socialAccountUsageApi?.normalizeUsageQueue
+    ? socialAccountUsageApi.normalizeUsageQueue(
+        stored[STORAGE_KEYS.socialAccountUsageQueue],
+      )
+    : [];
+}
+
+function mutateSocialAccountUsageQueue(mutator) {
+  const mutation = socialAccountUsageQueueMutation
+    .catch(() => null)
+    .then(async () => {
+      const current = await readSocialAccountUsageQueue();
+      const next = mutator(current);
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.socialAccountUsageQueue]: next,
+      });
+      return next;
+    });
+  socialAccountUsageQueueMutation = mutation.catch(() => null);
+  return mutation;
+}
+
+async function appendSocialAccountUsageEvent(event) {
+  if (!event || !socialAccountUsageApi?.appendUsageEvent) return [];
+  return await mutateSocialAccountUsageQueue(current =>
+    socialAccountUsageApi.appendUsageEvent(current, event),
+  );
+}
+
+async function acknowledgeSocialAccountUsageEvents(eventIds) {
+  if (!socialAccountUsageApi?.acknowledgeUsageEvents) return [];
+  return await mutateSocialAccountUsageQueue(current =>
+    socialAccountUsageApi.acknowledgeUsageEvents(current, eventIds),
+  );
+}
+
+async function recordSocialAccountUsageFromRelay({
+  tab,
+  action,
+  platform,
+  response,
+  error,
+  sourcePayload,
+}) {
+  if (!socialAccountUsageApi?.buildUsageEventFromRelay) return null;
+  let cached = await readObservedSocialAccounts();
+  const detected = await detectObservedSocialAccountInTab(tab, platform);
+  if (detected) {
+    cached = await mergeObservedSocialAccount(detected);
+  }
+  const observedAccount =
+    cached.accounts.find(account => account?.platform === platform) || null;
+  const event = socialAccountUsageApi.buildUsageEventFromRelay({
+    action,
+    platform,
+    response,
+    error,
+    taskId:
+      sourcePayload?.taskId ||
+      sourcePayload?.taskContext?.taskId ||
+      sourcePayload?.captureRequestId,
+    featureKey:
+      sourcePayload?.featureKey ||
+      sourcePayload?.taskContext?.featureKey,
+    observedAccount,
+  });
+  if (!event) return null;
+  await appendSocialAccountUsageEvent(event);
+  scheduleCloudTaskAgentSync('social_account_usage', 50);
+  return event;
 }
 
 async function readCloudTaskAgentStatus() {
@@ -1961,13 +2189,21 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
   cloudTaskAgentSyncInFlight = true;
   try {
     const agentStatus = await ensureCloudTaskAgentScope(credential.id);
-    const [runtime, ledger, stored] = await Promise.all([
+    const [
+      runtime,
+      ledger,
+      stored,
+      observedSocialAccounts,
+      socialUsageEvents,
+    ] = await Promise.all([
       ensureRuntimeState(),
       readTaskLedger(),
       chrome.storage.local.get([
         STORAGE_KEYS.unattendedKeywordRunRequest,
         STORAGE_KEYS.unattendedKeywordPlan,
       ]),
+      refreshObservedSocialAccounts(),
+      readSocialAccountUsageQueue(),
     ]);
     const scopedLedger = buildCloudScopedTaskLedger(
       ledger,
@@ -1987,6 +2223,8 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       ledger: scopedLedger,
       unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
       unattendedPlan: scopedPlan,
+      observedSocialAccounts: observedSocialAccounts.accounts,
+      socialUsageEvents,
       reason,
       lastError: reportedLastError,
     });
@@ -2009,6 +2247,11 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       cloudTaskAgentSyncPending = true;
     } else {
       cloudTaskAgentLastError = '';
+    }
+    if (Array.isArray(response.acceptedSocialUsageEventIds)) {
+      await acknowledgeSocialAccountUsageEvents(
+        response.acceptedSocialUsageEventIds,
+      );
     }
     const commands = Array.isArray(response.commands) ? response.commands : [];
     for (const command of commands) {
@@ -8578,8 +8821,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         let response;
+        let relayError = null;
         try {
           response = await relayToContentWithRetry(tabId, relayPayload);
+        } catch (error) {
+          relayError = error;
+          throw error;
         } finally {
           if (debugSession && debugSessionStartedByRelay) {
             await captureDebugSessionManager.stop({
@@ -8587,6 +8834,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               runId: debugSession.runId,
               reason: 'capture_relay_finished',
             });
+          }
+          try {
+            await recordSocialAccountUsageFromRelay({
+              tab: relayTab,
+              action: contentAction,
+              platform,
+              response,
+              error: relayError,
+              sourcePayload,
+            });
+          } catch (usageError) {
+            console.warn(
+              '[SocialAccountUsage] failed to record relay usage:',
+              usageError,
+            );
           }
         }
         const runtimePatch = runtimeTabPolicy.buildRelayRuntimePatch(relayTab);

@@ -31,6 +31,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
     { id: 'monitoring', label: '关注博主', icon: UserCheck, badgeKeys: ['monitorAttention'] },
     { id: 'dispatch', label: '调度中心', icon: Waypoints, tag: 'BETA' },
+    { id: 'social-accounts', label: '社交账号', icon: Users },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
     { id: 'insights', label: '分析与报告', icon: BarChart3 },
     { id: 'opinion-analysis', label: '舆情剖析', icon: ScanSearch, tag: 'NEW' },

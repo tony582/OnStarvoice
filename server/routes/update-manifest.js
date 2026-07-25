@@ -3,22 +3,22 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.55',
+  latestVersion: '0.3.56',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-07-25',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.55-20260725.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.56-20260725.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
     {
-      version: '0.3.55',
+      version: '0.3.56',
       releaseDate: '2026-07-25',
       releaseNotes: [
         {
           tag: '新增',
           notes: [
             {
-              title: '远程任务运行报告',
-              desc: '按关键词展示进度、保存数、尝试次数、失败原因与设备心跳。',
+              title: '社交账号与 Agent 绑定',
+              desc: '自动识别当前登录账号，并与浏览器 Agent 建立可追踪的使用关系。',
             },
           ],
         },
@@ -26,12 +26,12 @@ export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
           tag: '优化',
           notes: [
             {
-              title: '明确区分零结果与页面异常',
-              desc: '筛选范围内无匹配内容按 0 条正常完成，页面未就绪继续保留为异常。',
+              title: '账号每日用量统计',
+              desc: '按账号记录搜索、详情增强、采集任务与采集条数，便于安排账号轮换和休息。',
             },
             {
-              title: '一次性任务文案与执行逻辑',
-              desc: '一次性采集不再显示为无人值守，也不会意外开启隐藏的额外轮次。',
+              title: '离线用量可靠补传',
+              desc: '网络中断时暂存用量事件，恢复后去重补传，并保留事件发生时的账号归属。',
             },
           ],
         },
@@ -39,12 +39,8 @@ export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
           tag: '修复',
           notes: [
             {
-              title: '冻结标签页恢复',
-              desc: '优先唤醒原运行页，避免重新执行当前关键词。',
-            },
-            {
-              title: '风控原因识别',
-              desc: '平台安全限制会明确标记为风控信号，不再混入普通异常。',
+              title: '账号切换归属',
+              desc: '切换登录账号后，历史用量仍归属于事件发生时的账号，不会串账。',
             },
           ],
         },

@@ -8,6 +8,7 @@ import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
 import { DispatchPage } from '@/pages/dispatch/DispatchPage'
+import { SocialAccountsPage } from '@/pages/SocialAccountsPage'
 import { InsightsPage } from '@/pages/InsightsPage'
 import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
 import { DataPage } from '@/pages/DataPage'
@@ -31,6 +32,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   workbench: { eyebrow: 'Opinion Workbench', title: '舆情工作台' },
   monitoring: { eyebrow: 'Followed Creators', title: '关注博主' },
   dispatch: { eyebrow: 'Dispatch Center', title: '调度中心' },
+  'social-accounts': { eyebrow: 'Account Health', title: '社交账号' },
   salesleads: { eyebrow: 'Sales Leads', title: '销售客资' },
   events: { eyebrow: 'Events', title: '事件中心' },
   insights: { eyebrow: 'Insights', title: '分析与报告' },
@@ -55,6 +57,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
   dispatch: DispatchPage,
+  'social-accounts': SocialAccountsPage,
   salesleads: SalesLeadsPage,
   events: EventsPage,
   insights: InsightsPage,
