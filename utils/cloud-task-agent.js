@@ -187,11 +187,89 @@
     };
   }
 
+  function buildObservedSocialAccountSnapshot(value) {
+    const source = objectValue(value);
+    const platform = text(source.platform, 40).toLowerCase();
+    if (!["xiaohongshu", "douyin", "weibo"].includes(platform)) return null;
+    const loginState = text(source.loginState, 40);
+    return {
+      platform,
+      platformAccountId: text(source.platformAccountId, 240),
+      accountHandle: text(source.accountHandle, 160),
+      displayName: text(source.displayName, 160),
+      avatarUrl: text(source.avatarUrl, 1000),
+      loginState: ["authenticated", "logged_out", "unknown"].includes(loginState)
+        ? loginState
+        : "unknown",
+      confidence: text(source.confidence || "unknown", 40),
+      sourceUrl: text(source.sourceUrl, 1000),
+      observedAt: text(source.observedAt, 80),
+    };
+  }
+
+  function buildSocialUsageEventSnapshot(value) {
+    const source = objectValue(value);
+    const eventId = text(source.eventId || source.id, 240);
+    const platform = text(source.platform, 40).toLowerCase();
+    if (
+      !eventId ||
+      !["xiaohongshu", "douyin", "weibo"].includes(platform)
+    ) {
+      return null;
+    }
+    const count = (candidate, maximum = 100000) => {
+      const parsed = Math.floor(Number(candidate));
+      if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+      return Math.min(maximum, parsed);
+    };
+    const snapshot = {
+      eventId,
+      platform,
+      searches: count(source.searches, 10000),
+      enhancements: count(source.enhancements, 10000),
+      captureRuns: count(source.captureRuns, 10000),
+      capturedItems: count(source.capturedItems),
+      succeeded: source.succeeded !== false,
+      occurredAt: text(source.occurredAt, 80),
+      accountIdentity: {
+        platformAccountId: text(
+          objectValue(source.accountIdentity).platformAccountId,
+          240,
+        ),
+        accountHandle: text(
+          objectValue(source.accountIdentity).accountHandle,
+          160,
+        ),
+        displayName: text(
+          objectValue(source.accountIdentity).displayName,
+          160,
+        ),
+        observedAt: text(
+          objectValue(source.accountIdentity).observedAt,
+          80,
+        ),
+      },
+      metadata: sanitizeStructuredValue(objectValue(source.metadata)),
+    };
+    if (
+      snapshot.searches +
+        snapshot.enhancements +
+        snapshot.captureRuns +
+        snapshot.capturedItems ===
+      0
+    ) {
+      return null;
+    }
+    return snapshot;
+  }
+
   function buildHeartbeatPayload({
     runtime = {},
     ledger = {},
     unattendedRequest = null,
     unattendedPlan = null,
+    observedSocialAccounts = [],
+    socialUsageEvents = [],
     reason = "heartbeat",
     lastError = "",
   } = {}) {
@@ -228,12 +306,26 @@
           remoteTaskKeywordPostLimit: true,
           unattendedPlanMirror: true,
           localExecutionLock: true,
+          socialAccountIdentity: true,
+          socialAccountDailyUsage: true,
           taskLedgerVersion: Number(safeLedger.version || 1) || 1,
         },
         lastError: sanitizeText(lastError, 1000),
       },
       unattendedPlan: buildUnattendedPlanSnapshot(unattendedPlan),
       tasks,
+      observedSocialAccounts: (
+        Array.isArray(observedSocialAccounts) ? observedSocialAccounts : []
+      )
+        .slice(0, 10)
+        .map(buildObservedSocialAccountSnapshot)
+        .filter(Boolean),
+      socialUsageEvents: (
+        Array.isArray(socialUsageEvents) ? socialUsageEvents : []
+      )
+        .slice(0, 200)
+        .map(buildSocialUsageEventSnapshot)
+        .filter(Boolean),
       reason: text(reason, 120),
       sentAt: new Date().toISOString(),
     };
@@ -333,6 +425,8 @@
   root.OnStarvoiceCloudTaskAgent = Object.freeze({
     buildTaskSnapshot,
     buildUnattendedPlanSnapshot,
+    buildObservedSocialAccountSnapshot,
+    buildSocialUsageEventSnapshot,
     buildHeartbeatPayload,
     requestJson,
     sendHeartbeat,

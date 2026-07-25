@@ -25,6 +25,7 @@ import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
 import { WorkbenchPage } from '@/pages/WorkbenchPage'
 import { MonitoringPage } from '@/pages/MonitoringPage'
 import { DispatchPage } from '@/pages/dispatch/DispatchPage'
+import { SocialAccountsPage } from '@/pages/SocialAccountsPage'
 import { InsightsPage } from '@/pages/InsightsPage'
 import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
 import { DataPage } from '@/pages/DataPage'
@@ -47,6 +48,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   workbench: WorkbenchPage,
   monitoring: MonitoringPage,
   dispatch: DispatchPage,
+  'social-accounts': SocialAccountsPage,
   insights: InsightsPage,
   'opinion-analysis': OpinionAnalysisPage,
   data: DataPage,
@@ -65,7 +67,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
 
 const PAGE_TITLES: Record<string, string> = {
   overview: '今日值守', opinion: '客服工单', salesleads: '销售客资', workbench: '待办队列',
-  monitoring: '关注博主', dispatch: '调度中心', insights: '舆情洞察', 'opinion-analysis': '舆情剖析', data: '数据与导出', events: '事件中心',
+  monitoring: '关注博主', dispatch: '调度中心', 'social-accounts': '社交账号', insights: '舆情洞察', 'opinion-analysis': '舆情剖析', data: '数据与导出', events: '事件中心',
   tracks: '赛道机会', benchmarks: '对标账号', keywords: '选题与扩词',
   'content-home': '内容总览', hits: '爆款拆解', review: '内容复盘',
   'official-accounts': '官方账号', tenants: '租户管理', users: '用户账号',
@@ -425,6 +427,7 @@ function MonitorHub({ openPage }: { openPage: OpenPage }) {
         )}
         <section className="space-y-2">
           <MonitorCard icon={ServerCog} kicker="设备" title="调度中心" badge="BETA" copy="查看各浏览器节点的实时进度，并远程继续中断任务" action="打开调度中心" onClick={() => openPage('dispatch')} tone="blue" />
+          <MonitorCard icon={Users} kicker="账号" title="社交账号负载" copy="查看每个登录账号今天的搜索、增强和采集次数，及时安排休息" action="管理账号负载" onClick={() => openPage('social-accounts')} tone="blue" />
           <MonitorCard icon={Activity} kicker="动态" title="关注对象的新内容" copy="按时间线查看最新命中、互动与情感变化" action="看新动态" onClick={() => openPage('monitoring', { tab: 'hits' })} />
           <MonitorCard icon={Bell} kicker="事件" title="正在扩散的风险事件" copy="沿事件时间线查看关联内容和当前处置状态" action="进事件中心" onClick={() => openPage('events')} tone="red" />
           <MonitorCard icon={Radio} kicker="关注" title="监测对象与运行状态" copy="查看频率、最近运行、异常原因并立即扫描" action="管理关注" onClick={() => openPage('monitoring', { tab: 'tasks' })} tone="blue" />
@@ -501,6 +504,7 @@ const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
   { label: '业务能力', items: [
     { title: '客服工单', subtitle: '处理、打回、归档与回执', icon: Headphones, page: 'opinion' },
     { title: '销售客资', subtitle: '购买意向跟进与处理', icon: User, page: 'salesleads' },
+    { title: '社交账号', subtitle: '登录账号、Agent 绑定与每日负载', icon: Users, page: 'social-accounts' },
     { title: '官方账号', subtitle: '账号、别名、ID 与排除规则', icon: ShieldCheck, page: 'official-accounts' },
     { title: '事件中心', subtitle: '严重度、状态与关联内容时间线', icon: Bell, page: 'events' },
   ] },
@@ -608,7 +612,7 @@ function MobilePageSurface() {
 
 function rootForPage(page: string, params: Record<string, string>): RootTab {
   if (page === 'workbench' || page === 'opinion' || page === 'salesleads') return 'tasks'
-  if (page === 'monitoring' || page === 'dispatch' || page === 'events') return 'monitor'
+  if (page === 'monitoring' || page === 'dispatch' || page === 'social-accounts' || page === 'events') return 'monitor'
   if (['insights', 'opinion-analysis', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
   if (page === 'overview') return 'today'
   if (params.queue) return 'tasks'
