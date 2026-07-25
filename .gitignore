@@ -20,7 +20,7 @@ extension-build.pem
 release/
 output/
 .playwright-cli/
-.tmp-mediaclawnew/
+.tmp-*/
 
 # 本地 Claude Code 恢复历史，不属于产品源码
 claude_history/

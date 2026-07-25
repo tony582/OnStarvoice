@@ -957,7 +957,7 @@ async function prepareCommentContainer(
           captureContext,
         });
       }
-      // 本 fork 自加(图文/视频 DOM 差异,MediaClaw 合并上游务必保留):图文 note 详情右侧是
+      // StarVoice 自有逻辑（图文/视频 DOM 差异，后续升级时务必保留）：图文 note 详情右侧是
       // 「相关推荐 | 评论」双 tab,切到「评论」后 comment-list 常因面板折叠(高度 0)过不了
       // 可见性判定 → 代码退回去误抓「相关推荐」那一列、把推荐当评论滚 → 评论采成 0(且不稳定)。
       // 只要 DOM 里已有"含评论项"的 comment-list,就直接用它,绝不回落到推荐列。
@@ -2184,7 +2184,7 @@ function scoreCommentContainerCandidate(
   );
   const containerText = cleanText(node.textContent || "");
 
-  // 本 fork 自加(图文/视频 DOM 差异,MediaClaw 合并上游务必保留):
+  // StarVoice 自有逻辑（图文/视频 DOM 差异，后续升级时务必保留）：
   // 真正的评论容器一定"含评论项"。图文 note 的评论面板常折叠(高度 0、isElementVisible=false),
   // 旧判定因"不可见/太矮"把它判 0,转而把【可见、可滚、且带「评论」tab 文字的"相关推荐"列】当评论区
   // → 推荐当评论滚、评论采成 0(且时灵时不灵)。修法:
@@ -2203,7 +2203,7 @@ function scoreCommentContainerCandidate(
   if (isScrollableContainer(node)) score += 18;
   if (/全部评论|评论区|留下你的精彩评论吧/.test(containerText)) score += 8;
   if (node.querySelector?.('[placeholder*="评论"]')) score += 4;
-  // 本 fork 自加:精准锁定"干净的评论根容器"。图文 note 详情里,外层壳会同时包住
+  // StarVoice 自有逻辑：精准锁定“干净的评论根容器”。图文 note 详情里，外层壳会同时包住
   // 「相关推荐」+「评论」两个 tab、评论项也被它统计到 → 若按 itemCount 排序会选中外层壳、
   // 滚动时又滚到推荐。故:① 自身即 comment-list / comment-mainContent → 主导加分;
   // ② 容器文本里含「相关推荐」(说明它是包住两个 tab 的外层壳,非干净评论区)→ 重罚。
@@ -2573,7 +2573,7 @@ function collectVisibleComments(
     );
   }
 
-  // ── 抖音过采根治(本 fork 自加;MediaClaw 合并上游时务必保留)──────────────────
+  // ── 抖音过采根治（StarVoice 自有逻辑，后续升级时务必保留）─────────────────
   // 实测(对着真实 DOM 查证):右侧推荐视频(data-e2e="related-video")、页脚
   // (data-e2e="page-footer")都在评论区容器【之外】,且不带 comment-item 标记;而启发式
   // 收集器(按头像/用户名/结构找"像评论的")会把它们误收进来。这里把候选【正向圈定】在

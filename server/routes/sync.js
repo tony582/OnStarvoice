@@ -192,7 +192,7 @@ export function normalizeRecord(body) {
       collects: metric('collects', 'collects', 'collectCount', 'collect_count', 'collectsCount', 'collects_count'),
       shares: metric('shares', 'shares', 'shareCount', 'share_count', 'reposts', 'repostCount', 'repost_count', 'repostsCount', 'reposts_count'),
       // lastEditedAt 会被采集端污染成"采集当天"(并非真实发布时间),不再作为发布时间兜底 ——
-      // 否则没采到发布时间的帖子会被冒充成采集日(本 fork 修:发布时间不对的根因之一)。
+      // 否则没采到发布时间的帖子会被冒充成采集日（StarVoice 自有修复：发布时间不对的根因之一）。
       publish_time: publishTime,
       publish_location: publishLocation,
       tags: JSON.stringify(tags),
