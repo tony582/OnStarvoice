@@ -344,6 +344,7 @@ function createHarness() {
       `  handleUnattendedKeywordAlarm,\n` +
       `  reconcileUnattendedKeywordPlanSchedule,\n` +
       `  createUnattendedKeywordRunRequest,\n` +
+      `  openTargetedPostRunnerTab,\n` +
       `  openUnattendedRunnerTab,\n` +
       `  bindUnattendedRunnerTab,\n` +
       `  saveUnattendedKeywordPlan,\n` +
@@ -1304,6 +1305,104 @@ test("a newly created unattended runner tab is made non-discardable", async () =
     {id: harness.createdTabs[0].id, autoDiscardable: false},
   ]);
   assert.equal(runner.autoDiscardable, false);
+});
+
+test("a targeted post runner never coerces a missing window to id zero", async () => {
+  const harness = createHarness();
+
+  const runner = await harness.api.openTargetedPostRunnerTab("targeted-create");
+
+  assert.equal(harness.createdTabs.length, 1);
+  assert.equal(
+    Object.hasOwn(harness.createdTabs[0], "windowId"),
+    false,
+  );
+  assert.match(harness.createdTabs[0].url, /targetedPostRun=targeted-create/);
+  assert.deepEqual(harness.updatedTabs, [
+    {id: harness.createdTabs[0].id, autoDiscardable: false},
+  ]);
+  assert.equal(runner.autoDiscardable, false);
+});
+
+test("a targeted post runner keeps a concrete browser window", async () => {
+  const harness = createHarness();
+
+  await harness.api.openTargetedPostRunnerTab("targeted-window", {
+    windowId: 7,
+  });
+
+  assert.equal(harness.createdTabs.length, 1);
+  assert.equal(harness.createdTabs[0].windowId, 7);
+});
+
+test("a targeted post runner falls back once when its preferred window closed", async () => {
+  const harness = createHarness();
+  const attempts = [];
+  harness.setTabCreateHandler(async (options) => {
+    attempts.push({...options});
+    if (attempts.length === 1) {
+      throw new Error("No window with id: 7.");
+    }
+    return {id: 103, ...options};
+  });
+
+  const runner = await harness.api.openTargetedPostRunnerTab("targeted-stale-window", {
+    windowId: 7,
+  });
+
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].windowId, 7);
+  assert.equal(Object.hasOwn(attempts[1], "windowId"), false);
+  assert.equal(runner.id, 103);
+});
+
+test("an unattended runner never coerces a missing window to id zero", async () => {
+  const harness = createHarness();
+
+  await harness.api.openUnattendedRunnerTab("unattended-no-window");
+
+  assert.equal(harness.createdTabs.length, 1);
+  assert.equal(
+    Object.hasOwn(harness.createdTabs[0], "windowId"),
+    false,
+  );
+});
+
+test("an unattended runner falls back once when its preferred window closed", async () => {
+  const harness = createHarness();
+  const attempts = [];
+  harness.setTabCreateHandler(async (options) => {
+    attempts.push({...options});
+    if (attempts.length === 1) {
+      throw new Error("No window with id: 9.");
+    }
+    return {id: 104, ...options};
+  });
+
+  await harness.api.openUnattendedRunnerTab("unattended-stale-window", {
+    windowId: 9,
+  });
+
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].windowId, 9);
+  assert.equal(Object.hasOwn(attempts[1], "windowId"), false);
+});
+
+test("runner tab creation does not retry an unrelated browser error", async () => {
+  const harness = createHarness();
+  let attempts = 0;
+  harness.setTabCreateHandler(async () => {
+    attempts += 1;
+    throw new Error("Tabs cannot be edited right now.");
+  });
+
+  await assert.rejects(
+    harness.api.openTargetedPostRunnerTab("targeted-non-window-error", {
+      windowId: 7,
+    }),
+    /Tabs cannot be edited right now/,
+  );
+  assert.equal(attempts, 1);
 });
 
 test("a reused unattended runner tab stays non-discardable", async () => {

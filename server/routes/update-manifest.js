@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.58',
+  latestVersion: '0.3.59',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-07-26',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.58-20260726.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.59-20260726.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.59',
+      releaseDate: '2026-07-26',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '定向巡查运行页',
+              desc: '修复未指定浏览器窗口时错误使用无效窗口 ID，导致负面帖子与官方账号评论巡查无法启动的问题。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.58',
       releaseDate: '2026-07-26',
