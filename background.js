@@ -3798,6 +3798,35 @@ function buildTargetedPostRunnerUrl(requestId) {
   return url.toString();
 }
 
+function normalizeConcreteWindowId(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const windowId = Number(value);
+  return Number.isSafeInteger(windowId) && windowId > 0 ? windowId : null;
+}
+
+function isMissingBrowserWindowError(error) {
+  return /no window with id/i.test(String(error?.message || error || ''));
+}
+
+async function createRunnerTab(createOptions, concreteWindowId) {
+  if (concreteWindowId === null) {
+    return await chrome.tabs.create(createOptions);
+  }
+  try {
+    return await chrome.tabs.create({
+      ...createOptions,
+      windowId: concreteWindowId,
+    });
+  } catch (error) {
+    if (!isMissingBrowserWindowError(error)) {
+      throw error;
+    }
+    return await chrome.tabs.create(createOptions);
+  }
+}
+
 async function openTargetedPostRunnerTab(requestId, {windowId = null} = {}) {
   const runnerUrl = buildTargetedPostRunnerUrl(requestId);
   const sidebarUrl = chrome.runtime.getURL(SIDEBAR_PAGE_PATH);
@@ -3817,10 +3846,8 @@ async function openTargetedPostRunnerTab(requestId, {windowId = null} = {}) {
     });
   }
   const createOptions = {url: runnerUrl, active: true};
-  if (Number.isFinite(Number(windowId)) && Number(windowId) >= 0) {
-    createOptions.windowId = Number(windowId);
-  }
-  const createdRunner = await chrome.tabs.create(createOptions);
+  const concreteWindowId = normalizeConcreteWindowId(windowId);
+  const createdRunner = await createRunnerTab(createOptions, concreteWindowId);
   if (!createdRunner?.id) {
     return createdRunner;
   }
@@ -3853,10 +3880,8 @@ async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
     url: runnerUrl,
     active: true,
   };
-  if (Number.isFinite(Number(windowId)) && Number(windowId) >= 0) {
-    createOptions.windowId = Number(windowId);
-  }
-  const createdRunner = await chrome.tabs.create(createOptions);
+  const concreteWindowId = normalizeConcreteWindowId(windowId);
+  const createdRunner = await createRunnerTab(createOptions, concreteWindowId);
   if (!createdRunner?.id) {
     return createdRunner;
   }
