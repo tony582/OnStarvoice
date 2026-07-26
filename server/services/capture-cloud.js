@@ -431,6 +431,16 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   if (!clientTaskId) return null;
   const rawPlatform = String(task.platform || 'unknown').trim().toLowerCase();
   const platform = PLATFORM_ALIASES[rawPlatform] || 'unknown';
+  const sanitizedTargetResults = safeStructuredValue(
+    Array.isArray(task.targetResults) ? task.targetResults : [],
+  );
+  const targetResults = Array.isArray(sanitizedTargetResults)
+    ? sanitizedTargetResults
+    : [];
+  const checkpoint = sanitizeCloudStructuredObject(task.checkpoint);
+  if (targetResults.length > 0) {
+    checkpoint.targetResults = targetResults;
+  }
   return {
     clientTaskId,
     // Only the currently recoverable local request receives a control id from
@@ -445,7 +455,8 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     triggerType: text(task.trigger || task.triggerType, 80),
     status: normalizeCloudTaskStatus(task.status),
     progress: sanitizeCloudStructuredObject(task.progress),
-    checkpoint: sanitizeCloudStructuredObject(task.checkpoint),
+    checkpoint,
+    targetResults,
     counts: sanitizeCloudStructuredObject(task.counts),
     metadata: sanitizeCloudStructuredObject(task.metadata),
     error: sanitizeCloudStructuredObject(task.error),

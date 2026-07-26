@@ -51,7 +51,9 @@ export function DispatchPage() {
   const [taskView, setTaskView] = useState<TaskView>(
     () => params?.view === 'attention' ? 'attention' : 'active',
   )
-  const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(null)
+  const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(
+    () => params?.create === 'comment_patrol' ? { taskType: 'comment_patrol' } : null,
+  )
   const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)
   const [orchestrationInitialAgentIds, setOrchestrationInitialAgentIds] = useState<string[]>([])
   const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(

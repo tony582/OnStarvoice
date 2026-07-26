@@ -60,6 +60,25 @@
     return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
+  function targetedPostTaskDescriptor(request = {}) {
+    const source = objectValue(request);
+    const workflow = text(source.workflow, 80);
+    if (workflow === "official_account_comment_patrol") {
+      return {
+        workflow,
+        taskType: "official_account_comment_patrol",
+        featureKey: "official_account_comment_patrol",
+        title: text(source.title, 500) || "官方账号评论巡查",
+      };
+    }
+    return {
+      workflow: "negative_post_patrol",
+      taskType: "negative_post_patrol",
+      featureKey: "negative_post_patrol",
+      title: text(source.title, 500) || "负面帖子定向巡查",
+    };
+  }
+
   function buildCaptureSettingsSnapshot(value) {
     const source = objectValue(value);
     if (Object.keys(source).length === 0) return {};
@@ -171,6 +190,14 @@
       status: text(source.status || "pending", 80),
       progress: sanitizeStructuredValue(objectValue(source.progress)),
       checkpoint: sanitizeStructuredValue(objectValue(source.checkpoint)),
+      workflow: text(source.workflow, 80),
+      protocolVersion: Math.max(0, Number(source.protocolVersion) || 0),
+      targetResults: (Array.isArray(source.targetResults)
+        ? source.targetResults
+        : []
+      )
+        .slice(0, 100)
+        .map((result) => sanitizeStructuredValue(objectValue(result))),
       counts: sanitizeStructuredValue(objectValue(source.counts)),
       metadata: sanitizeStructuredValue(metadata),
       error: sanitizeStructuredValue(objectValue(source.error)),
@@ -267,6 +294,7 @@
     runtime = {},
     ledger = {},
     unattendedRequest = null,
+    targetedPostRequest = null,
     unattendedPlan = null,
     observedSocialAccounts = [],
     socialUsageEvents = [],
@@ -288,6 +316,31 @@
       .slice(0, 50)
       .map((run) => buildTaskSnapshot(run, controlRequestId))
       .filter(Boolean);
+    const targetedRequest = objectValue(targetedPostRequest);
+    const targetedDescriptor = targetedPostTaskDescriptor(targetedRequest);
+    const targetedSnapshot = buildTaskSnapshot(
+      {
+        ...targetedRequest,
+        workflow: targetedDescriptor.workflow,
+        taskType: targetedDescriptor.taskType,
+        featureKey: targetedDescriptor.featureKey,
+        title: targetedDescriptor.title,
+        source: "cloud_assignment",
+        trigger: "remote",
+        metadata: {
+          ...objectValue(targetedRequest.metadata),
+          taskId: text(targetedRequest.taskId, 240),
+          cloudCommandId: text(targetedRequest.cloudCommandId, 240),
+        },
+      },
+      text(targetedRequest.id, 240),
+    );
+    if (
+      targetedSnapshot &&
+      !tasks.some((task) => task.id === targetedSnapshot.id)
+    ) {
+      tasks.unshift(targetedSnapshot);
+    }
 
     return {
       agent: {
@@ -304,6 +357,9 @@
           remoteUnattendedPlanDelete: true,
           remoteTaskEnhancementOptions: true,
           remoteTaskKeywordPostLimit: true,
+          negativePostPatrol: true,
+          officialAccountCommentPatrol: true,
+          remoteTargetedPostCaptureV1: true,
           unattendedPlanMirror: true,
           localExecutionLock: true,
           socialAccountIdentity: true,

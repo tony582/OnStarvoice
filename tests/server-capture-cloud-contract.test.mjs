@@ -18,6 +18,7 @@ import {
 } from "../server/services/capture-cloud.js";
 import {
   captureTaskSnapshotFingerprint,
+  negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
@@ -96,6 +97,124 @@ test("cloud task snapshots normalize local ledger aliases and timestamps", () =>
     normalizeCloudTaskSnapshot({id: "historical-task", status: "failed"}).controlTaskId,
     "",
   );
+});
+
+test("negative patrol heartbeats retain bounded target results in the checkpoint", () => {
+  const snapshot = normalizeCloudTaskSnapshot({
+    id: "patrol-task-1",
+    taskType: "negative_post_patrol",
+    platform: "douyin",
+    status: "running",
+    targetResults: [
+      {
+        itemId: "11111111-1111-4111-8111-111111111111",
+        recordId: "22222222-2222-4222-8222-222222222222",
+        externalId: "7123456789012345678",
+        ordinal: 1,
+        status: "completed",
+        startedAt: "2026-07-26T02:00:00.000Z",
+        finishedAt: "2026-07-26T02:01:00.000Z",
+      },
+    ],
+  });
+
+  assert.equal(snapshot.targetResults.length, 1);
+  assert.deepEqual(snapshot.checkpoint.targetResults, snapshot.targetResults);
+  assert.equal(
+    negativePatrolTargetResults(snapshot)[0].recordId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+});
+
+test("negative patrol target projection rejects bad identities and sync-stage success", () => {
+  const entries = negativePatrolTargetResults({
+    targetResults: [
+      {
+        itemId: "11111111-1111-4111-8111-111111111111",
+        recordId: "22222222-2222-4222-8222-222222222222",
+        externalId: "7123456789012345678",
+        ordinal: 2,
+        status: "completed",
+        error: {stage: "sync", message: "同步失败"},
+      },
+      {
+        itemId: "not-a-uuid",
+        recordId: "22222222-2222-4222-8222-222222222222",
+        externalId: "7123456789012345678",
+        ordinal: 1,
+        status: "completed",
+      },
+    ],
+  });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].status, "failed");
+  assert.equal(entries[0].error.stage, "sync");
+});
+
+test("official comment patrol keeps bounded per-run comment observations", () => {
+  const entries = negativePatrolTargetResults({
+    targetResults: [
+      {
+        workflow: "official_account_comment_patrol",
+        itemId: "11111111-1111-4111-8111-111111111111",
+        recordId: "22222222-2222-4222-8222-222222222222",
+        externalId: "note-12345",
+        ordinal: 1,
+        status: "completed_with_warnings",
+        commentObservation: {
+          observedCount: 18,
+          partial: true,
+          scope: "visible_comments_bounded",
+        },
+      },
+    ],
+  });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].commentObservation.observedCount, 18);
+  assert.equal(entries[0].commentObservation.partial, true);
+  assert.equal(
+    entries[0].commentObservation.scope,
+    "visible_comments_bounded",
+  );
+});
+
+test("targeted detail result projection has a closed workflow allow-list", () => {
+  assert.match(
+    captureCloudRouteSource,
+    /const TARGETED_POST_TASK_TYPES = new Set\(\[\s*'negative_post_patrol',\s*'official_account_comment_patrol',/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /!isTargetedPostTaskType\(task\.task_type\)/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /isTargetedPostTaskType\(lockedTask\?\.task_type\)[\s\S]*isTargetedPostTaskType\(command\.payload\?\.workflow\)/u,
+  );
+});
+
+test("negative patrol result projection binds server records and fresh observations", () => {
+  const projection = readRouteSection(
+    "async function projectNegativePatrolSnapshot",
+    "async function projectOrchestrationChildControlOutcome",
+  );
+  assert.match(projection, /record_id = \$14::uuid/u);
+  assert.match(projection, /external_id = \$15/u);
+  assert.match(projection, /result_record_id = CASE/u);
+  assert.match(projection, /THEN record_id/u);
+  assert.match(projection, /FROM record_observations/u);
+  assert.match(projection, /record_id = \$2/u);
+  assert.match(projection, /captured_at >= \$3::timestamptz/u);
+  assert.match(projection, /result_observation_id/u);
+  assert.match(projection, /aggregateParentTaskItems\(items\)/u);
+  assert.match(projection, /commentsSampled/u);
+  assert.match(projection, /commentPartialPosts/u);
+  assert.match(projection, /visible_comments_bounded/u);
+  assert.match(projection, /AND ordinal = \$4[\s\S]*nextOrdinal,/u);
+  assert.doesNotMatch(projection, /nextOrdinal\s*-\s*1/u);
+  assert.doesNotMatch(projection, /entry\.recordIds/u);
 });
 
 test("snapshot fingerprints deduplicate exact replays without collapsing later progress", () => {
@@ -384,9 +503,20 @@ test("create command failures and successful stops settle orchestration work ite
   );
   assert.match(
     completion,
+    /command\.command_type === 'create'[\s\S]*\(success \|\| targetedPostCreate\)[\s\S]*actualRequestId !== expectedCreateRequestId/u,
+  );
+  assert.match(
+    completion,
+    /isTargetedPostTaskType\(lockedTask\?\.task_type\)[\s\S]*isTargetedPostTaskType\(command\.payload\?\.workflow\)/u,
+  );
+  assert.match(
+    completion,
     /command\.command_type === 'stop'[\s\S]*success[\s\S]*status: 'canceled'/u,
   );
-  assert.match(completion, /SELECT id, parent_task_id, status, error, metadata/u);
+  assert.match(
+    completion,
+    /SELECT id, parent_task_id,[\s\S]*?status, error, metadata/u,
+  );
 });
 
 test("unattended plan deletion is a durable device command and clears the mirror only after acknowledgement", () => {

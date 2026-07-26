@@ -44,7 +44,7 @@ export function PlansView({
         <div className="mt-3 text-[14px] font-semibold text-foreground">暂无定期任务</div>
         <p className="mt-1 max-w-[320px] text-[13px] leading-5 text-muted-foreground">
           这里集中管理所有定期任务。配置好多 Agent 无人值守计划或设备本地计划后会在此显示；
-          负面帖子巡查、官方账号评论巡查上线后也会出现在这里。
+          官方账号评论巡查等定时任务上线后也会出现在这里。
         </p>
       </div>
     )
