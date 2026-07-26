@@ -157,6 +157,7 @@ export type TaskView = 'active' | 'attention' | 'plans' | 'history'
 export type ComposerIntent = {
   agentId?: string
   mode?: 'one_time' | 'unattended_plan'
+  taskType?: 'comment_patrol'
   editExisting?: boolean
 }
 

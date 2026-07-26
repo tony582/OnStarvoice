@@ -9,6 +9,8 @@
  * 4. 调用采集和同步功能
  */
 
+import "../utils/cloud-targeted-post.js";
+
 import {
   initAllStates,
   subscribe,
@@ -897,6 +899,8 @@ let keywordExpandCancelRequested = false;
 let batchUrlCaptureInFlight = false;
 let batchUrlCancelRequested = false;
 let batchUrlCaptureMode = "";
+let targetedPostCancelRequested = false;
+let targetedPostRunInFlight = false;
 let batchKeywordCaptureInFlight = false;
 let batchKeywordCancelRequested = false;
 let activeBatchKeywordInvocationToken = null;
@@ -1100,6 +1104,10 @@ const BATCH_DRAFT_SESSION_KEY = "onstarvoice.batchDraftByPlatform";
 const BATCH_DRAFT_LEGACY_KEYS = ["expandedKeywords", "expandedSeedKeyword"];
 const BATCH_DRAFT_PLATFORMS = new Set(["xiaohongshu", "douyin", "unknown"]);
 const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
+const TARGETED_POST_RUN_QUERY_KEY = "targetedPostRun";
+const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
+  "onstarvoice.targetedPostRunRequest";
+const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
 const KEYWORD_PLAN_RECONCILE_INTERVAL_MS = 5 * 1000;
@@ -2800,7 +2808,11 @@ function shouldRefreshDataPoolForKeywordPlan(plan = {}) {
 }
 
 async function reconcileKeywordPlanFromSidebar() {
-  if (keywordPlanReconcileInFlight || getUnattendedRunRequestIdFromUrl()) {
+  if (
+    keywordPlanReconcileInFlight ||
+    getUnattendedRunRequestIdFromUrl() ||
+    getTargetedPostRunRequestIdFromUrl()
+  ) {
     return;
   }
   keywordPlanReconcileInFlight = true;
@@ -2820,7 +2832,10 @@ async function reconcileKeywordPlanFromSidebar() {
 
 function startKeywordPlanReconcileTimer() {
   stopKeywordPlanReconcileTimer();
-  if (getUnattendedRunRequestIdFromUrl()) {
+  if (
+    getUnattendedRunRequestIdFromUrl() ||
+    getTargetedPostRunRequestIdFromUrl()
+  ) {
     return;
   }
   keywordPlanReconcileTimer = setInterval(() => {
@@ -2863,6 +2878,29 @@ function setupKeywordPlanStorageListener() {
         changes[KEYWORD_RUN_REQUEST_STORAGE_KEY].newValue || null;
       renderActiveKeywordRunState(request);
       handleUnattendedRunRequestStorageChange(request);
+    }
+    if (changes?.[TARGETED_POST_RUN_REQUEST_STORAGE_KEY]) {
+      const request =
+        changes[TARGETED_POST_RUN_REQUEST_STORAGE_KEY].newValue || null;
+      const requestId = getTargetedPostRunRequestIdFromUrl();
+      if (
+        requestId &&
+        request?.id === requestId &&
+        request.cancelRequested === true
+      ) {
+        targetedPostCancelRequested = true;
+        batchUrlCancelRequested = true;
+        if (activeBatchRunnerTabId) {
+          void requestCaptureCancelSignal(activeBatchRunnerTabId).catch(
+            (error) => {
+              console.warn(
+                "[Sidebar] Targeted post cancellation relay failed:",
+                error,
+              );
+            },
+          );
+        }
+      }
     }
   });
 }
@@ -3144,6 +3182,9 @@ export async function initSidebar() {
 
   void maybeClaimAndRunUnattendedKeywordPlan({allowPending: true}).catch((error) => {
     console.error("[Sidebar] Initial unattended keyword plan failed:", error);
+  });
+  void maybeClaimAndRunTargetedPostWorkflow().catch((error) => {
+    console.error("[Sidebar] Initial targeted post workflow failed:", error);
   });
 
   console.log("[Sidebar] Initialized");
@@ -14781,7 +14822,353 @@ function getUnattendedRunRequestIdFromUrl() {
   }
 }
 
+function getTargetedPostRunRequestIdFromUrl() {
+  try {
+    return (
+      new URLSearchParams(window.location.search).get(
+        TARGETED_POST_RUN_QUERY_KEY,
+      ) || ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function updateTargetedPostRun(request, patch = {}) {
+  const response = await chrome.runtime.sendMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: String(request?.id || ""),
+    attemptId: String(request?.attemptId || ""),
+    patch,
+  });
+  if (!response?.ok || response?.accepted === false || !response.data) {
+    const error = new Error(
+      response?.reason === "stale_targeted_post_attempt"
+        ? "定向作品任务已由其他运行页接管"
+        : "定向作品任务状态更新失败",
+    );
+    error.code = String(
+      response?.reason || "TARGETED_POST_STATE_UPDATE_FAILED",
+    );
+    throw error;
+  }
+  return response.data;
+}
+
+async function waitForTargetedPostRunnerTab(tabId, shouldStop) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 20 * 1000) {
+    if (shouldStop()) {
+      const error = new Error("定向作品任务已停止");
+      error.code = "TARGET_CAPTURE_CANCELED";
+      throw error;
+    }
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (String(tab?.status || "") === "complete") {
+        return tab;
+      }
+    } catch (error) {
+      const wrapped = new Error(error?.message || "定向作品采集页已关闭");
+      wrapped.code = "TARGET_RUNNER_TAB_CLOSED";
+      throw wrapped;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  const error = new Error("定向作品采集页打开超时");
+  error.code = "TARGET_RUNNER_TAB_TIMEOUT";
+  throw error;
+}
+
+async function maybeClaimAndRunTargetedPostWorkflow() {
+  const requestId = getTargetedPostRunRequestIdFromUrl();
+  if (!requestId || targetedPostRunInFlight) {
+    return;
+  }
+  if (!cloudTargetedPostApi?.normalizeCommandPayload) {
+    throw new Error("当前扩展缺少定向作品采集协议");
+  }
+
+  const stateResponse = await chrome.runtime.sendMessage({
+    type: "onstarvoice:get-targeted-post-run-state",
+    requestId,
+  });
+  let request = stateResponse?.data;
+  if (
+    !stateResponse?.ok ||
+    !request ||
+    request.id !== requestId ||
+    cloudTargetedPostApi.isTerminalRunStatus(request.status)
+  ) {
+    return;
+  }
+
+  targetedPostRunInFlight = true;
+  targetedPostCancelRequested = request.cancelRequested === true;
+  batchUrlCancelRequested = targetedPostCancelRequested;
+  let executionLock = null;
+  let targetTabId = null;
+  const shouldStop = () =>
+    targetedPostCancelRequested || batchUrlCancelRequested;
+  try {
+    executionLock = await acquireCaptureExecutionLock({
+      owner: "cloud_targeted_post_capture",
+      label: "云端定向作品采集",
+    });
+    if (!executionLock) {
+      request = await updateTargetedPostRun(request, {
+        status: "needs_action",
+        finishedAt: new Date().toISOString(),
+        message: "其他采集任务正在占用当前浏览器，请稍后接力",
+        error: {
+          code: "CAPTURE_LOCK_CONFLICT",
+          message: "其他采集任务正在占用当前浏览器",
+          retryable: true,
+        },
+      });
+      return;
+    }
+    request = await updateTargetedPostRun(request, {
+      status: "running",
+      startedAt: request.startedAt || new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      message: "正在逐条采集指定作品",
+    });
+
+    const settledItemIds = new Set(
+      (Array.isArray(request.targetResults) ? request.targetResults : []).map(
+        (result) => String(result?.itemId || ""),
+      ),
+    );
+    const pendingTargets = (Array.isArray(request.targets)
+      ? request.targets
+      : []
+    ).filter((target) => !settledItemIds.has(String(target?.itemId || "")));
+    if (pendingTargets.length > 0 && !shouldStop()) {
+      const targetTab = await chrome.tabs.create({
+        url: pendingTargets[0].url,
+        active: true,
+      });
+      if (!targetTab?.id) {
+        const error = new Error("无法创建定向作品采集页");
+        error.code = "TARGET_RUNNER_TAB_CREATE_FAILED";
+        throw error;
+      }
+      targetTabId = Number(targetTab.id);
+      activeBatchRunnerTabId = targetTabId;
+      await waitForTargetedPostRunnerTab(targetTabId, shouldStop);
+    }
+
+    batchUrlCaptureInFlight = true;
+    batchUrlCaptureMode = "targeted_posts";
+    const captureSettings =
+      request.captureSettings && typeof request.captureSettings === "object"
+        ? request.captureSettings
+        : {};
+    const targetedWorkflow = String(
+      request.workflow || "negative_post_patrol",
+    ).trim();
+    let targetResults = Array.isArray(request.targetResults)
+      ? request.targetResults.slice()
+      : [];
+
+    for (const target of pendingTargets) {
+      if (shouldStop()) break;
+      const startedAt = new Date().toISOString();
+      request = await updateTargetedPostRun(request, {
+        status: "running",
+        heartbeatAt: startedAt,
+        progress: {
+          current: Number(target.ordinal) || targetResults.length + 1,
+          total: request.targets.length,
+          itemId: target.itemId,
+          recordId: target.recordId,
+          title: target.title,
+          phase: "capturing",
+        },
+        message: `正在采集第 ${target.ordinal}/${request.targets.length} 条指定作品`,
+      });
+      const batchResult = await batchCaptureByUrls({
+        urls: [target.url],
+        mode: "single",
+        captureParams: {
+          includeComments: captureSettings.includeComments === true,
+          includeBloggerMetrics:
+            captureSettings.includeBloggerMetrics === true,
+          enableCommentLeadsFilter:
+            captureSettings.enableCommentLeadsFilter === true,
+          commentsMaxDetectedItems:
+            captureSettings.commentsMaxDetectedItems || 50,
+        },
+        shouldStop,
+      });
+      const localRecords = await getRecords();
+      let targetResult = cloudTargetedPostApi.buildTargetResult({
+        target,
+        batchResult,
+        records: localRecords,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+      });
+      if (
+        ["completed", "completed_with_warnings"].includes(
+          String(targetResult?.status || ""),
+        )
+      ) {
+        if (captureSettings.autoSyncAfterDetailCapture === false) {
+          targetResult = cloudTargetedPostApi.applySyncResult(targetResult, {
+            ok: false,
+            successCount: 0,
+            failedCount: targetResult.recordIds?.length || 0,
+            pausedCount: 0,
+            error: {
+              code: "TARGET_SYNC_DISABLED",
+              message: "定向作品已在本地采集，但任务未启用后台同步",
+            },
+          });
+        } else {
+          let syncResult = null;
+          let syncError = null;
+          try {
+            syncResult = await syncRecordBatch(
+              Array.isArray(targetResult.recordIds)
+                ? targetResult.recordIds
+                : [],
+              null,
+              {
+                trigger: targetedWorkflow,
+                syncScope: "all",
+                captureSettings: {
+                  ...captureSettings,
+                  autoSyncAfterDetailCapture: true,
+                },
+                commentLeadsConfig:
+                  buildCommentLeadsConfigFromSettings(captureSettings),
+                shouldStop,
+              },
+            );
+          } catch (error) {
+            syncError = error;
+          }
+          targetResult = cloudTargetedPostApi.applySyncResult(
+            targetResult,
+            syncResult,
+            syncError,
+          );
+        }
+      }
+      targetResults.push(targetResult);
+      const canceled =
+        shouldStop() ||
+        batchResult?.canceled ||
+        targetResult.status === "canceled";
+      request = await updateTargetedPostRun(request, {
+        status: canceled ? "cancel_requested" : "running",
+        cancelRequested: canceled,
+        heartbeatAt: new Date().toISOString(),
+        targetResults,
+        progress: {
+          current: targetResults.length,
+          total: request.targets.length,
+          itemId: target.itemId,
+          recordId: target.recordId,
+          title: target.title,
+          phase: canceled ? "canceling" : "settled",
+        },
+        message: canceled
+          ? "定向作品任务正在停止并保留已有结果"
+          : `第 ${target.ordinal}/${request.targets.length} 条指定作品已收口`,
+      });
+      targetResults = Array.isArray(request.targetResults)
+        ? request.targetResults.slice()
+        : targetResults;
+      if (canceled) break;
+    }
+
+    const checkpoint = cloudTargetedPostApi.buildCheckpoint(
+      request.targets,
+      targetResults,
+    );
+    const canceled = shouldStop() || request.cancelRequested === true;
+    const finalStatus = canceled
+      ? "canceled"
+      : checkpoint.failedCount === 0 && checkpoint.warningCount === 0
+        ? "completed"
+        : checkpoint.successCount > 0 || checkpoint.warningCount > 0
+          ? "completed_with_warnings"
+          : "failed";
+    request = await updateTargetedPostRun(request, {
+      status: finalStatus,
+      finishedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      targetResults,
+      progress: {
+        current: checkpoint.processedCount,
+        total: checkpoint.total,
+        phase: finalStatus,
+      },
+      message:
+        finalStatus === "completed"
+          ? `定向作品采集完成，共 ${checkpoint.successCount} 条`
+          : finalStatus === "completed_with_warnings"
+            ? `定向作品采集部分完成：成功 ${checkpoint.successCount} 条，警告 ${checkpoint.warningCount} 条，失败 ${checkpoint.failedCount} 条`
+            : finalStatus === "canceled"
+              ? `定向作品任务已停止，已保留 ${checkpoint.processedCount} 条结果`
+              : `定向作品采集失败，共 ${checkpoint.failedCount} 条`,
+    });
+    await refreshDataPool();
+  } catch (error) {
+    console.error("[Sidebar] Targeted post workflow failed:", error);
+    if (request && !cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+      try {
+        await updateTargetedPostRun(request, {
+          status:
+            shouldStop() || error?.code === "TARGET_CAPTURE_CANCELED"
+              ? "canceled"
+              : "failed",
+          finishedAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+          message:
+            shouldStop() || error?.code === "TARGET_CAPTURE_CANCELED"
+              ? "定向作品任务已停止并保留已有结果"
+              : String(error?.message || "定向作品采集失败"),
+          error: {
+            code: String(error?.code || "TARGET_CAPTURE_FAILED"),
+            message: String(error?.message || "定向作品采集失败").slice(
+              0,
+              1000,
+            ),
+            retryable:
+              ![
+                "TARGET_IDENTITY_MISMATCH",
+                "TARGET_URL_NOT_ALLOWED",
+              ].includes(String(error?.code || "")),
+          },
+        });
+      } catch (reportError) {
+        console.error(
+          "[Sidebar] Targeted post terminal report failed:",
+          reportError,
+        );
+      }
+    }
+  } finally {
+    batchUrlCaptureInFlight = false;
+    batchUrlCaptureMode = "";
+    batchUrlCancelRequested = false;
+    targetedPostCancelRequested = false;
+    targetedPostRunInFlight = false;
+    activeBatchRunnerTabId = null;
+    if (executionLock) {
+      await releaseCaptureExecutionLock(executionLock.id);
+    }
+  }
+}
+
 async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}) {
+  if (getTargetedPostRunRequestIdFromUrl()) {
+    return;
+  }
   const requestId = getUnattendedRunRequestIdFromUrl();
   if (!requestId && !allowPending) {
     return;

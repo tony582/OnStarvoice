@@ -18,6 +18,12 @@ try {
   console.warn('[onstarvoice] cloud task agent unavailable', error);
 }
 
+try {
+  importScripts('utils/cloud-targeted-post.js');
+} catch (error) {
+  console.warn('[onstarvoice] cloud targeted post protocol unavailable', error);
+}
+
 importScripts(
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
@@ -30,6 +36,7 @@ importScripts(
 const runtimeTabPolicy = globalThis.OnStarvoiceRuntimeTabPolicy;
 const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
 const cloudTaskAgentApi = globalThis.OnStarvoiceCloudTaskAgent;
+const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const socialAccountUsageApi = globalThis.OnStarvoiceSocialAccountUsage;
 const CAPTURE_TASK_GROUP_TITLE =
   captureTaskTabGroupApi.DEFAULT_GROUP_TITLE || 'StarVoice 采集任务';
@@ -45,6 +52,7 @@ const STORAGE_KEYS = {
   auth: 'onstarvoice.auth',
   cloudCommandResults: 'onstarvoice.cloudCommandResults',
   cloudAgentStatus: 'onstarvoice.cloudTaskAgentStatus',
+  targetedPostRunRequest: 'onstarvoice.targetedPostRunRequest',
   observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
   socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
 };
@@ -70,6 +78,7 @@ const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
 const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
 const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
+const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
 const SCHEDULE_MODES = new Set([
   'daily',
   'custom_dates',
@@ -1797,6 +1806,253 @@ function summarizeCloudPlanDeleteResult(commandId, requestId) {
   };
 }
 
+function isSupportedCloudTargetedPostWorkflow(value) {
+  const workflow = String(value || '').trim();
+  if (typeof cloudTargetedPostApi?.isSupportedWorkflow === 'function') {
+    return cloudTargetedPostApi.isSupportedWorkflow(workflow);
+  }
+  return workflow === 'negative_post_patrol';
+}
+
+function resolveCloudTargetedPostWorkflow(payload = {}) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const plan =
+    source.planSnapshot && typeof source.planSnapshot === 'object'
+      ? source.planSnapshot
+      : {};
+  const workflow = String(source.workflow || plan.workflow || '').trim();
+  return isSupportedCloudTargetedPostWorkflow(workflow) ? workflow : '';
+}
+
+function isCloudTargetedPostPayload(payload = {}) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const plan =
+    source.planSnapshot && typeof source.planSnapshot === 'object'
+      ? source.planSnapshot
+      : {};
+  return isSupportedCloudTargetedPostWorkflow(
+    String(source.workflow || plan.workflow || '').trim(),
+  );
+}
+
+async function readTargetedPostRunRequest() {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostRunRequest,
+  );
+  const request = stored[STORAGE_KEYS.targetedPostRunRequest];
+  if (
+    !request ||
+    typeof request !== 'object' ||
+    !isSupportedCloudTargetedPostWorkflow(request.workflow)
+  ) {
+    return null;
+  }
+  return request;
+}
+
+async function persistTargetedPostRunRequest(request) {
+  if (!request || typeof request !== 'object') {
+    await chrome.storage.local.remove(STORAGE_KEYS.targetedPostRunRequest);
+    return null;
+  }
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.targetedPostRunRequest]: request,
+  });
+  return request;
+}
+
+async function createOrResumeTargetedPostRun(command, payload) {
+  if (!cloudTargetedPostApi?.normalizeCommandPayload) {
+    const error = new Error('当前扩展缺少定向作品采集协议');
+    error.code = 'TARGET_PROTOCOL_UNAVAILABLE';
+    throw error;
+  }
+  const commandId = String(command?.id || '').trim();
+  const normalized = cloudTargetedPostApi.normalizeCommandPayload(payload, {
+    taskId: command?.task_id || command?.client_task_id,
+    clientTaskId: command?.client_task_id,
+  });
+  const requestId = String(
+    normalized.clientTaskId || normalized.taskId,
+  ).trim();
+  const current = await readTargetedPostRunRequest();
+  if (
+    current &&
+    (current.id === requestId || current.cloudCommandId === commandId)
+  ) {
+    if (
+      !cloudTargetedPostApi.isTerminalRunStatus(current.status) &&
+      current.status === 'pending'
+    ) {
+      const runner = await openTargetedPostRunnerTab(current.id);
+      if (runner?.id && Number(current.runnerTabId) !== Number(runner.id)) {
+        const rebound = cloudTargetedPostApi.mergeRunPatch(current, {
+          runnerTabId: runner.id,
+          message: '定向作品任务运行页已连接',
+        });
+        return await persistTargetedPostRunRequest(rebound);
+      }
+    }
+    return current;
+  }
+  if (
+    current &&
+    !cloudTargetedPostApi.isTerminalRunStatus(current.status)
+  ) {
+    return {deferred: true, reason: 'targeted_post_task_busy'};
+  }
+  const activeLock = await readActiveCaptureExecutionLock();
+  if (activeLock) {
+    return {deferred: true, reason: 'capture_lock_busy'};
+  }
+
+  let request = cloudTargetedPostApi.createRunRequest(normalized, {
+    commandId,
+    requestId,
+    attemptId: normalized.attemptId || createUuid(),
+  });
+  await persistTargetedPostRunRequest(request);
+  try {
+    const runner = await openTargetedPostRunnerTab(request.id);
+    request = cloudTargetedPostApi.mergeRunPatch(request, {
+      runnerTabId: runner?.id,
+      message: '定向作品任务已下发，等待运行页执行',
+    });
+    return await persistTargetedPostRunRequest(request);
+  } catch (error) {
+    const failed = cloudTargetedPostApi.mergeRunPatch(request, {
+      status: 'needs_action',
+      finishedAt: new Date().toISOString(),
+      message: '无法打开定向作品采集运行页',
+      error: {
+        code: String(error?.code || 'TARGET_RUNNER_OPEN_FAILED'),
+        message: String(error?.message || '无法打开采集运行页').slice(0, 1000),
+      },
+    });
+    await persistTargetedPostRunRequest(failed);
+    return failed;
+  }
+}
+
+function summarizeTargetedPostRunForCloud(request, commandId) {
+  const status = String(request?.status || '').trim();
+  const accepted = ['completed', 'completed_with_warnings'].includes(status);
+  return {
+    state: 'completed',
+    accepted,
+    reason:
+      status === 'completed'
+        ? 'targeted_post_capture_completed'
+        : status === 'completed_with_warnings'
+          ? 'targeted_post_capture_partial'
+          : status === 'canceled'
+            ? 'targeted_post_capture_canceled'
+            : 'targeted_post_capture_failed',
+    requestId: String(request?.id || ''),
+    taskId: String(request?.taskId || ''),
+    attemptId: String(request?.attemptId || ''),
+    protocolVersion: 1,
+    workflow: String(request?.workflow || 'negative_post_patrol'),
+    status,
+    cloudCommandId: String(commandId || ''),
+    targetResults: Array.isArray(request?.targetResults)
+      ? request.targetResults
+      : [],
+    checkpoint:
+      request?.checkpoint && typeof request.checkpoint === 'object'
+        ? request.checkpoint
+        : {},
+    message: String(request?.message || '').slice(0, 1000),
+    error:
+      request?.error && typeof request.error === 'object'
+        ? request.error
+        : null,
+  };
+}
+
+async function executeCloudTargetedPostCreateCommand(
+  command,
+  payload,
+  commandResult,
+) {
+  const commandId = String(command?.id || '').trim();
+  if (commandResult?.state === 'completed') {
+    return {commandResult};
+  }
+  let request;
+  try {
+    request = await createOrResumeTargetedPostRun(command, payload);
+  } catch (error) {
+    return {
+      commandResult: await rememberCloudCommandResult(commandId, {
+        state: 'completed',
+        accepted: false,
+        reason: String(error?.code || 'invalid_targeted_post_payload'),
+        requestId: String(payload?.clientTaskId || command?.client_task_id || ''),
+        protocolVersion: 1,
+        workflow: resolveCloudTargetedPostWorkflow(payload) || 'negative_post_patrol',
+        message: String(error?.message || '定向作品任务参数无效').slice(0, 1000),
+      }),
+    };
+  }
+  if (request?.deferred) {
+    return {
+      deferred: true,
+      reason: request.reason || 'targeted_post_task_busy',
+    };
+  }
+  if (!cloudTargetedPostApi.isTerminalRunStatus(request?.status)) {
+    await rememberCloudCommandResult(commandId, {
+      state: 'executing',
+      accepted: false,
+      reason: 'executing',
+      requestId: String(request?.id || ''),
+      taskId: String(request?.taskId || ''),
+      attemptId: String(request?.attemptId || ''),
+      protocolVersion: 1,
+      workflow: String(request?.workflow || 'negative_post_patrol'),
+    });
+    return {deferred: true, reason: 'targeted_post_running'};
+  }
+  return {
+    commandResult: await rememberCloudCommandResult(
+      commandId,
+      summarizeTargetedPostRunForCloud(request, commandId),
+    ),
+  };
+}
+
+async function cancelTargetedPostRunFromControl(requestId) {
+  const request = await readTargetedPostRunRequest();
+  if (!request || (requestId && request.id !== requestId)) {
+    return {matched: false, accepted: false, reason: 'not_found', request: null};
+  }
+  if (cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+    return {
+      matched: true,
+      accepted: true,
+      reason: 'already_terminal',
+      request,
+    };
+  }
+  const pending = String(request.status || '') === 'pending';
+  const next = cloudTargetedPostApi.mergeRunPatch(request, {
+    status: pending ? 'canceled' : 'cancel_requested',
+    cancelRequested: true,
+    finishedAt: pending ? new Date().toISOString() : '',
+    message: pending
+      ? '定向作品任务已在执行前停止'
+      : '后台已请求停止定向作品任务，正在保留已有结果',
+  });
+  await persistTargetedPostRunRequest(next);
+  return {
+    matched: true,
+    accepted: true,
+    reason: pending ? 'stopped_before_dispatch' : 'cancel_requested',
+    request: next,
+  };
+}
+
 async function executeCloudTaskAgentCommand(command, token) {
   const commandId = String(command?.id || '').trim();
   if (!commandId) return null;
@@ -1810,6 +2066,29 @@ async function executeCloudTaskAgentCommand(command, token) {
   const requestId = String(
     payload.controlTaskId || command.control_task_id || command.client_task_id || '',
   ).trim();
+
+  if (commandType === 'create' && isCloudTargetedPostPayload(payload)) {
+    const targeted = await executeCloudTargetedPostCreateCommand(
+      command,
+      payload,
+      commandResult,
+    );
+    if (targeted.deferred) {
+      return {
+        ok: true,
+        deferred: true,
+        reason: targeted.reason,
+        commandId,
+      };
+    }
+    commandResult = targeted.commandResult;
+    return await cloudTaskAgentApi.completeCommand({
+      token,
+      commandId,
+      success: commandResult?.accepted === true,
+      result: commandResult,
+    });
+  }
 
   if (commandType === 'create') {
     const clientTaskId = String(
@@ -2050,10 +2329,15 @@ async function executeCloudTaskAgentCommand(command, token) {
         reason: 'executing',
         requestId,
       });
-      const stopped = await cancelUnattendedKeywordRunFromControl({
-        requestId,
-        message: '后台远程中止当前采集任务',
-      });
+      const targetedStop = cloudTargetedPostApi?.mergeRunPatch
+        ? await cancelTargetedPostRunFromControl(requestId)
+        : {matched: false};
+      const stopped = targetedStop.matched
+        ? targetedStop
+        : await cancelUnattendedKeywordRunFromControl({
+            requestId,
+            message: '后台远程中止当前采集任务',
+          });
       commandResult = await rememberCloudCommandResult(commandId, {
         state: 'completed',
         accepted: stopped.accepted === true,
@@ -2201,6 +2485,7 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       chrome.storage.local.get([
         STORAGE_KEYS.unattendedKeywordRunRequest,
         STORAGE_KEYS.unattendedKeywordPlan,
+        STORAGE_KEYS.targetedPostRunRequest,
       ]),
       refreshObservedSocialAccounts(),
       readSocialAccountUsageQueue(),
@@ -2222,6 +2507,7 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       runtime,
       ledger: scopedLedger,
       unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+      targetedPostRequest: stored[STORAGE_KEYS.targetedPostRunRequest],
       unattendedPlan: scopedPlan,
       observedSocialAccounts: observedSocialAccounts.accounts,
       socialUsageEvents,
@@ -3504,6 +3790,43 @@ function buildUnattendedRunnerUrl(requestId) {
   const url = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
   url.searchParams.set(UNATTENDED_RUNNER_QUERY_KEY, requestId);
   return url.toString();
+}
+
+function buildTargetedPostRunnerUrl(requestId) {
+  const url = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+  url.searchParams.set(TARGETED_POST_RUNNER_QUERY_KEY, requestId);
+  return url.toString();
+}
+
+async function openTargetedPostRunnerTab(requestId, {windowId = null} = {}) {
+  const runnerUrl = buildTargetedPostRunnerUrl(requestId);
+  const sidebarUrl = chrome.runtime.getURL(SIDEBAR_PAGE_PATH);
+  const allTabs = await chrome.tabs.query({});
+  const existingRunner = allTabs.find((tab) => {
+    const currentUrl = String(tab?.url || '');
+    return (
+      currentUrl.startsWith(`${sidebarUrl}?`) &&
+      currentUrl.includes(`${TARGETED_POST_RUNNER_QUERY_KEY}=`)
+    );
+  });
+  if (existingRunner?.id) {
+    return await chrome.tabs.update(existingRunner.id, {
+      url: runnerUrl,
+      active: true,
+      autoDiscardable: false,
+    });
+  }
+  const createOptions = {url: runnerUrl, active: true};
+  if (Number.isFinite(Number(windowId)) && Number(windowId) >= 0) {
+    createOptions.windowId = Number(windowId);
+  }
+  const createdRunner = await chrome.tabs.create(createOptions);
+  if (!createdRunner?.id) {
+    return createdRunner;
+  }
+  return await chrome.tabs.update(createdRunner.id, {
+    autoDiscardable: false,
+  });
 }
 
 async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
@@ -8534,6 +8857,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (type === 'onstarvoice:get-unattended-keyword-run-state') {
         const request = await readUnattendedKeywordRunRequest();
         sendResponse({ok: true, data: request});
+        return;
+      }
+
+      if (type === 'onstarvoice:get-targeted-post-run-state') {
+        const request = await readTargetedPostRunRequest();
+        const requestId = String(message?.requestId || '').trim();
+        sendResponse({
+          ok: true,
+          data: !requestId || request?.id === requestId ? request : null,
+        });
+        return;
+      }
+
+      if (type === 'onstarvoice:update-targeted-post-run') {
+        const request = await readTargetedPostRunRequest();
+        const requestId = String(message?.requestId || '').trim();
+        const attemptId = String(message?.attemptId || '').trim();
+        if (
+          !request ||
+          request.id !== requestId ||
+          !attemptId ||
+          String(request.attemptId || '') !== attemptId
+        ) {
+          sendResponse({
+            ok: false,
+            accepted: false,
+            reason: 'stale_targeted_post_attempt',
+            data: request,
+          });
+          return;
+        }
+        if (cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+          sendResponse({
+            ok: false,
+            accepted: false,
+            reason: 'targeted_post_run_terminal',
+            data: request,
+          });
+          return;
+        }
+        const next = cloudTargetedPostApi.mergeRunPatch(
+          request,
+          message?.patch,
+        );
+        await persistTargetedPostRunRequest(next);
+        if (cloudTargetedPostApi.isTerminalRunStatus(next.status)) {
+          scheduleCloudTaskAgentSync('targeted_post_terminal', 0);
+        }
+        sendResponse({
+          ok: true,
+          accepted: true,
+          reason: '',
+          data: next,
+        });
         return;
       }
 

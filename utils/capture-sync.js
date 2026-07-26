@@ -8752,6 +8752,10 @@ async function captureCommentsForSingleNoteRecord(
   }
 
   const rawItems = Array.isArray(commentsResult.data?.items) ? commentsResult.data.items : [];
+  // Keep this run's bounded observation separate from the cumulative record
+  // payload. Cloud patrols must never infer "new comments" from the merged
+  // historical total.
+  const currentObservedItems = cleanCommentsItems(rawItems);
   const existingItems = Array.isArray(record.payload?.commentsCleanedItems)
     ? record.payload.commentsCleanedItems
     : [];
@@ -8761,7 +8765,7 @@ async function captureCommentsForSingleNoteRecord(
   );
   const cleanedItems = cleanCommentsItems([
     ...existingItems,
-    ...rawItems,
+    ...currentObservedItems,
   ]).slice(0, effectiveMaxDetectedItems);
   const isPartial =
     commentsResult.data?.captureStatus === COMMENT_CAPTURE_STATUS.PARTIAL ||
@@ -8842,6 +8846,8 @@ async function captureCommentsForSingleNoteRecord(
     captureRequestId: commentCaptureIdentity.captureRequestId,
     runnerTabId: commentCaptureIdentity.runnerTabId,
     commentsCount: cleanedItems.length,
+    currentObservedCount: currentObservedItems.length,
+    currentObservedItems: currentObservedItems.slice(0, 20),
     partial: isPartial,
     stoppedByUser,
     stoppedByStall,

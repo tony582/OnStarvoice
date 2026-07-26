@@ -8,20 +8,22 @@ import { Button } from '@/components/ui/button'
 import { Drawer } from '@/components/shared/Drawer'
 import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
+import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
+import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
 import type { CloudAgent, CloudTask, ComposerIntent } from './lib'
 import { agentAssignmentBlockReason } from './lib'
 
 // 统一「新建任务」向导：任务类型 → 执行方式 → 选择节点 → 任务配置。
 // 单节点配置复用 AgentTaskCreator；多节点在选完节点后交接给编排抽屉（预选小队）。
 type WizardStep = 'type' | 'method' | 'agents' | 'configure'
-type TaskType = 'keyword' | 'unattended_plan'
+type TaskType = 'keyword' | 'unattended_plan' | 'negative_patrol' | 'comment_patrol'
 type ExecutionMethod = 'single' | 'multi'
 
 const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string; note: string; icon: LucideIcon; planned: boolean }> = [
   { value: 'keyword', title: '关键词采集', description: '按关键词在小红书、抖音搜索并采集匹配帖子。', note: '一次性补采', icon: Search, planned: false },
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
-  { value: 'negative_patrol', title: '负面帖子巡查', description: '定期巡查负面口碑帖并升级预警。', note: '', icon: ShieldAlert, planned: true },
-  { value: 'comment_patrol', title: '官方账号评论巡查', description: '定期巡查官方账号评论区，发现风险评论。', note: '', icon: MessagesSquare, planned: true },
+  { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
+  { value: 'comment_patrol', title: '官方账号评论巡查', description: '圈定官方账号近期作品，逐篇读取当前可见评论并发现风险。', note: '定向评论巡查', icon: MessagesSquare, planned: false },
 ]
 
 const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [
@@ -85,7 +87,11 @@ export function CreateTaskDrawer({
   // 从 Agent 详情「分配任务/创建计划」进入时锁定该 Agent：跳过执行方式与选择节点两步。
   const presetAgentId = intent.agentId || ''
   // intent.mode 视为已定任务类型（如 Agent 抽屉「创建无人值守计划」），直接落到配置步。
-  const presetTaskType: TaskType | null = editingExisting || intent.mode === 'unattended_plan' ? 'unattended_plan' : null
+  const presetTaskType: TaskType | null = editingExisting || intent.mode === 'unattended_plan'
+    ? 'unattended_plan'
+    : intent.taskType === 'comment_patrol'
+      ? 'comment_patrol'
+      : null
   const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
 
   const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : 'type')
@@ -171,7 +177,7 @@ export function CreateTaskDrawer({
           <div className="mx-auto max-w-2xl">
             <div className="mb-4">
               <h3 className="text-base font-bold">这次要创建哪种任务？</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">目前开放关键词采集与无人值守计划；巡查类任务即将上线。</p>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">关键词任务负责发现新内容；负面巡查负责回到已识别帖子补采最新详情。</p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="任务类型">
               {TASK_TYPE_CARDS.map(item => {
@@ -179,7 +185,12 @@ export function CreateTaskDrawer({
                 const selected = !item.planned && taskType === item.value
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={item.planned || undefined}
-                    onClick={() => { if (!item.planned) setTaskType(item.value as TaskType) }}
+                    onClick={() => {
+                      if (!item.planned) {
+                        setTaskType(item.value as TaskType)
+                        if (item.value === 'negative_patrol' || item.value === 'comment_patrol') setMethod('single')
+                      }
+                    }}
                     className={`flex min-h-36 flex-col rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${item.planned ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
                     <div className="flex items-center justify-between gap-3">
                       <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${!item.planned && selected ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}><Icon className="h-5 w-5" /></span>
@@ -207,15 +218,25 @@ export function CreateTaskDrawer({
               {EXECUTION_METHODS.map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
+                const unavailable = (taskType === 'negative_patrol' || taskType === 'comment_patrol') && item.value === 'multi'
                 return (
-                  <button key={item.value} type="button" role="radio" aria-checked={selected} onClick={() => setMethod(item.value)}
-                    className={`min-h-36 rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
+                  <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
+                    onClick={() => { if (!unavailable) setMethod(item.value) }}
+                    className={`min-h-36 rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${unavailable ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30 opacity-65' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
                     <div className="flex items-center justify-between gap-3">
                       <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${selected ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}><Icon className="h-5 w-5" /></span>
-                      <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>
+                      {unavailable
+                        ? <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">后续开放</span>
+                        : <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>}
                     </div>
                     <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
-                    <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{item.description}</p>
+                    <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                      {unavailable
+                        ? taskType === 'comment_patrol'
+                          ? '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
+                          : '负面巡查首版先由一个 Agent 串行执行，避免同一帖子被重复打开。'
+                        : item.description}
+                    </p>
                   </button>
                 )
               })}
@@ -250,7 +271,15 @@ export function CreateTaskDrawer({
               {/* 步骤上下文摘要条：任务类型 · 执行方式 · 已选节点；可点击回退修改 */}
               <div className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-border/70 bg-muted/35 px-3 py-2 text-xs text-muted-foreground">
                 <span className={`h-2 w-2 shrink-0 rounded-full ${selectedAgent.status === 'paused' ? 'bg-status-orange' : selectedAgent.online ? 'bg-status-green' : 'bg-muted-foreground/40'}`} aria-hidden="true" />
-                <span className="font-semibold text-foreground">{taskType === 'unattended_plan' ? '无人值守计划' : '关键词采集'}</span>
+                <span className="font-semibold text-foreground">
+                  {taskType === 'unattended_plan'
+                    ? '无人值守计划'
+                    : taskType === 'negative_patrol'
+                    ? '负面帖子巡查'
+                    : taskType === 'comment_patrol'
+                      ? '官方账号评论巡查'
+                      : '关键词采集'}
+                </span>
                 <span aria-hidden="true">·</span>
                 <span>单个节点</span>
                 <span aria-hidden="true">·</span>
@@ -262,20 +291,42 @@ export function CreateTaskDrawer({
                   </button>
                 )}
               </div>
-              <AgentTaskCreator
-                key={`${selectedAgent.id}:${mode}:${editingExisting ? 'edit' : 'new'}`}
-                agent={selectedAgent}
-                writable={writable}
-                initialExecutionMode={mode}
-                forceOpen
-                editExistingInitially={editingExisting}
-                hideLauncher
-                lockExecutionMode
-                onCreated={async () => {
-                  await onCreated()
-                  onClose()
-                }}
-              />
+              {taskType === 'negative_patrol' ? (
+                <NegativePatrolTaskCreator
+                  key={`${selectedAgent.id}:negative-patrol`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'comment_patrol' ? (
+                <OfficialCommentPatrolTaskCreator
+                  key={`${selectedAgent.id}:official-comment-patrol`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              ) : (
+                <AgentTaskCreator
+                  key={`${selectedAgent.id}:${mode}:${editingExisting ? 'edit' : 'new'}`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  initialExecutionMode={mode}
+                  forceOpen
+                  editExistingInitially={editingExisting}
+                  hideLauncher
+                  lockExecutionMode
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              )}
             </div>
           ) : (
             <div className="mx-auto max-w-2xl rounded-2xl border border-dashed border-border p-8 text-center">

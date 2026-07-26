@@ -108,6 +108,72 @@ test("heartbeat body does not include the cloud credential", () => {
   assert.equal(payload.tasks[0].metadata.safe, "visible");
 });
 
+test("heartbeat reports targeted post item results and resumable checkpoint", () => {
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-targeted"},
+    targetedPostRequest: {
+      id: "targeted-request-1",
+      taskId: "targeted-task-1",
+      attemptId: "attempt-1",
+      workflow: "negative_post_patrol",
+      protocolVersion: 1,
+      platform: "douyin",
+      status: "running",
+      progress: {current: 1, total: 2},
+      checkpoint: {
+        nextOrdinal: 2,
+        completedItemIds: ["item-1"],
+      },
+      targetResults: [
+        {
+          itemId: "item-1",
+          recordId: "record-1",
+          externalId: "123",
+          status: "completed",
+        },
+      ],
+    },
+  });
+  assert.equal(payload.tasks[0].id, "targeted-request-1");
+  assert.equal(payload.tasks[0].taskType, "negative_post_patrol");
+  assert.equal(payload.tasks[0].workflow, "negative_post_patrol");
+  assert.equal(payload.tasks[0].protocolVersion, 1);
+  assert.equal(payload.tasks[0].targetResults[0].itemId, "item-1");
+  assert.deepEqual(
+    plain(payload.tasks[0].checkpoint.completedItemIds),
+    ["item-1"],
+  );
+});
+
+test("heartbeat preserves the official-account comment patrol workflow and capability", () => {
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-official-comments"},
+    targetedPostRequest: {
+      id: "official-request-1",
+      taskId: "official-task-1",
+      workflow: "official_account_comment_patrol",
+      protocolVersion: 1,
+      platform: "xiaohongshu",
+      status: "running",
+      targetResults: [{
+        itemId: "item-1",
+        recordId: "post-1",
+        externalId: "note-1",
+        workflow: "official_account_comment_patrol",
+        status: "completed_with_warnings",
+        commentObservation: {observedCount: 8, scope: "visible_comments_bounded"},
+      }],
+    },
+  });
+
+  assert.equal(payload.agent.capabilities.negativePostPatrol, true);
+  assert.equal(payload.agent.capabilities.officialAccountCommentPatrol, true);
+  assert.equal(payload.tasks[0].taskType, "official_account_comment_patrol");
+  assert.equal(payload.tasks[0].workflow, "official_account_comment_patrol");
+  assert.equal(payload.tasks[0].targetResults[0].workflow, "official_account_comment_patrol");
+  assert.equal(payload.tasks[0].targetResults[0].commentObservation.observedCount, 8);
+});
+
 test("heartbeat reports social identity and idempotent usage without phone numbers", () => {
   const payload = agent.buildHeartbeatPayload({
     runtime: {clientUuid: "profile-social"},
@@ -199,6 +265,8 @@ test("heartbeat advertises remote task creation and mirrors a sanitized unattend
   assert.equal(payload.agent.capabilities.remoteUnattendedPlanDelete, true);
   assert.equal(payload.agent.capabilities.remoteTaskEnhancementOptions, true);
   assert.equal(payload.agent.capabilities.remoteTaskKeywordPostLimit, true);
+  assert.equal(payload.agent.capabilities.negativePostPatrol, true);
+  assert.equal(payload.agent.capabilities.remoteTargetedPostCaptureV1, true);
   assert.equal(payload.agent.capabilities.unattendedPlanMirror, true);
   assert.equal(payload.unattendedPlan.configured, true);
   assert.equal(payload.unattendedPlan.enabled, true);

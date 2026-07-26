@@ -3,22 +3,26 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.57',
+  latestVersion: '0.3.58',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-07-26',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.57-20260726.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.58-20260726.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
     {
-      version: '0.3.57',
+      version: '0.3.58',
       releaseDate: '2026-07-26',
       releaseNotes: [
         {
           tag: '新增',
           notes: [
             {
-              title: '安全验证人工介入',
-              desc: '识别平台安全验证后暂停继续搜索，并在调度中心提供人工处理入口。',
+              title: '负面帖子巡查',
+              desc: '按发布时间、平台与负面条件筛选帖子，并定向采集详情。',
+            },
+            {
+              title: '官方账号评论巡查',
+              desc: '按时间范围筛选官方账号作品，由指定 Agent 定向采集评论。',
             },
           ],
         },
@@ -26,21 +30,8 @@ export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
           tag: '优化',
           notes: [
             {
-              title: '空闲 Agent 接力',
-              desc: '任务受阻时可把尚未开始的关键词交给空闲 Agent 继续执行。',
-            },
-            {
-              title: '保留已采集结果',
-              desc: '出现安全验证时保留当前已发现和已保存的数据，避免重复采集。',
-            },
-          ],
-        },
-        {
-          tag: '修复',
-          notes: [
-            {
-              title: '异常搜索循环',
-              desc: '平台阻断后不再反复重搜同一关键词，等待人工处理或安全接力。',
+              title: '定向详情采集',
+              desc: 'Extension 可领取巡查任务并打开目标作品，按任务要求完成增强、评论和同步。',
             },
           ],
         },

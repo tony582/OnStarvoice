@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import {
-  Archive, Bot, ChevronDown, ChevronUp, Loader2, Network, Play, ShieldAlert, Square,
+  Archive, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, ShieldAlert, Square,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { KeywordProgressSummary, TaskDiagnosticsPanel } from './TaskDiagnostics'
@@ -44,6 +44,51 @@ export function TaskCard({
   const progress = taskProgress(task)
   const diagnostics = taskDiagnostics(task)
   const orchestration = task.task_type === 'capture_orchestration'
+  const negativePatrol = task.task_type === 'negative_post_patrol'
+    || task.feature_key === 'negative_post_patrol'
+    || task.feature_key === 'capture.negative_post_patrol'
+  const negativePatrolFilter = negativePatrol
+    && task.metadata?.filter
+    && typeof task.metadata.filter === 'object'
+    && !Array.isArray(task.metadata.filter)
+    ? task.metadata.filter as Record<string, unknown>
+    : {}
+  const officialCommentPatrol = task.task_type === 'official_account_comment_patrol'
+    || task.task_type === 'comment_patrol'
+    || task.feature_key === 'official_account_comment_patrol'
+    || task.feature_key === 'capture.official_account_comment_patrol'
+  const officialCommentFilter = officialCommentPatrol
+    && task.metadata?.filter
+    && typeof task.metadata.filter === 'object'
+    && !Array.isArray(task.metadata.filter)
+    ? task.metadata.filter as Record<string, unknown>
+    : task.metadata || {}
+  const officialAccount = officialCommentPatrol
+    && task.metadata?.officialAccount
+    && typeof task.metadata.officialAccount === 'object'
+    && !Array.isArray(task.metadata.officialAccount)
+    ? task.metadata.officialAccount as Record<string, unknown>
+    : {}
+  const officialAccountName = String(
+    officialAccount.accountName
+    ?? officialCommentFilter.accountName
+    ?? officialCommentFilter.officialAccountName
+    ?? officialCommentFilter.account_name
+    ?? task.metadata?.accountName
+    ?? '',
+  ).trim()
+  const commentSamples = safeNumber(
+    task.counts?.commentsSampled
+    ?? task.counts?.comments_sampled
+    ?? task.progress?.commentsSampled
+    ?? task.progress?.comments_sampled,
+  )
+  const riskComments = safeNumber(
+    task.counts?.riskComments
+    ?? task.counts?.risk_comments
+    ?? task.progress?.riskComments
+    ?? task.progress?.risk_comments,
+  )
   const hasKeywordDiagnostics = !orchestration && diagnostics.items.length > 0
   const resumable = !orchestration && canResume(task)
   const stoppable = !orchestration && canStop(task)
@@ -74,6 +119,10 @@ export function TaskCard({
       ? '计划运行批次'
       : orchestration
         ? '多 Agent 编排'
+        : officialCommentPatrol
+          ? '官方账号评论巡查'
+          : negativePatrol
+          ? '负面帖子巡查'
         : task.source === 'cloud' && task.task_type.includes('plan')
           ? '自动计划'
           : task.source === 'cloud'
@@ -88,6 +137,10 @@ export function TaskCard({
       <div className="flex min-w-0 items-center gap-2">
         {orchestration
           ? <Network className="h-4 w-4 shrink-0 text-primary" />
+          : officialCommentPatrol
+            ? <MessagesSquare className="h-4 w-4 shrink-0 text-primary" />
+          : negativePatrol
+            ? <ShieldAlert className="h-4 w-4 shrink-0 text-status-red" />
           : <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />}
         <h4 className="min-w-0 flex-1 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
         <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
@@ -225,6 +278,22 @@ export function TaskCard({
             </>
             ) : (
             <>
+              {negativePatrol && (
+                <>
+                  <div>巡查帖子：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 条</span></div>
+                  <div>已处理：<span className="text-foreground">{safeNumber(task.counts?.processed ?? task.progress?.current)} 条</span></div>
+                  <div>发布时间：<span className="text-foreground">{String(negativePatrolFilter.publishDateFrom || '—')} 至 {String(negativePatrolFilter.publishDateTo || '—')}</span></div>
+                  <div>筛选情绪：<span className="text-foreground">负面</span></div>
+                </>
+              )}
+              {officialCommentPatrol && (
+                <>
+                  <div>官方账号：<span className="text-foreground">{officialAccountName || '—'}</span></div>
+                  <div>巡查作品：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 篇</span></div>
+                  <div>发布时间：<span className="text-foreground">{String(officialCommentFilter.publishDateFrom || '—')} 至 {String(officialCommentFilter.publishDateTo || '—')}</span></div>
+                  <div>评论样本：<span className="text-foreground">本次读取 {commentSamples} 条{riskComments > 0 ? ` · 风险 ${riskComments} 条` : ''}</span></div>
+                </>
+              )}
               <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>
               <div>任务心跳：<span className="text-foreground">{formatTime(task.heartbeat_at)}</span></div>
               <div>业务进展：<span className="text-foreground">{formatTime(task.business_progress_at)}</span></div>

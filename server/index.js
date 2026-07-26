@@ -41,6 +41,8 @@ import customTagsRouter from './routes/custom-tags.js';
 import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import captureCloudRouter from './routes/capture-cloud.js';
 import captureOrchestrationsRouter from './routes/capture-orchestrations.js';
+import negativePatrolRouter from './routes/negative-patrol.js';
+import officialCommentPatrolRouter from './routes/official-comment-patrol.js';
 import opinionAnalysisRouter from './routes/opinion-analysis.js';
 import socialAccountsRouter from './routes/social-accounts.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
@@ -150,6 +152,8 @@ app.use('/api/custom-tags', customTagsRouter);
 app.use('/api/relevance/prefilter', relevancePrefilterRouter);
 app.use('/api/capture-cloud', captureCloudRouter);
 app.use('/api/capture-cloud', captureOrchestrationsRouter);
+app.use('/api/capture-cloud', negativePatrolRouter);
+app.use('/api/capture-cloud', officialCommentPatrolRouter);
 app.use('/api/opinion-analysis', opinionAnalysisRouter);
 app.use('/api/social-accounts', socialAccountsRouter);
 // 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
