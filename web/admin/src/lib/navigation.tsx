@@ -48,22 +48,37 @@ export function normalizePage(page: string, params?: PageParams): { page: string
 
 const NavContext = createContext<NavContextValue | null>(null)
 
-function readInitial(): { workspace: Workspace; page: string } {
+function readInitial(): { workspace: Workspace; page: string; params: PageParams | null } {
   const ws = (localStorage.getItem('osv_workspace') as Workspace) || 'opinion'
   const workspace: Workspace = ws === 'content' ? 'content' : 'opinion'
+  const publicLinkParams = new URLSearchParams(window.location.search)
+  const publicLinkPage = String(publicLinkParams.get('page') || '').trim()
+  if (publicLinkPage) {
+    publicLinkParams.delete('page')
+    const params = Object.fromEntries(
+      [...publicLinkParams.entries()]
+        .slice(0, 20)
+        .map(([key, value]) => [key.slice(0, 80), value.slice(0, 500)]),
+    )
+    const norm = normalizePage(publicLinkPage.slice(0, 80), params)
+    const realWs = PAGE_WORKSPACE[norm.page] || workspace
+    localStorage.setItem('osv_workspace', realWs)
+    localStorage.setItem(`osv_page_${realWs}`, norm.page)
+    return { workspace: realWs, page: norm.page, params: norm.params }
+  }
   // 兼容老 key osv_page → 归到舆情面
   const legacy = localStorage.getItem('osv_page')
   const stored = localStorage.getItem(`osv_page_${workspace}`) || (workspace === 'opinion' ? legacy : null)
   const norm = normalizePage(stored || WORKSPACE_HOME[workspace])
   // 归一化后页面若属于另一面,以页面归属为准
   const realWs = PAGE_WORKSPACE[norm.page] || workspace
-  return { workspace: realWs, page: norm.page }
+  return { workspace: realWs, page: norm.page, params: null }
 }
 
 export function NavProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState(() => {
     const init = readInitial()
-    return { workspace: init.workspace, page: init.page, params: null as PageParams | null, seq: 0 }
+    return { workspace: init.workspace, page: init.page, params: init.params, seq: 0 }
   })
 
   const navigate = useCallback((page: string, params?: PageParams) => {

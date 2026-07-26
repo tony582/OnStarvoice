@@ -106,7 +106,11 @@ export function DataPage() {
     }
   }
 
-  useEffect(() => { load(1) }, [activeTable, platform, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load(1) })
+    return () => { active = false }
+  }, [activeTable, platform, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const selectTable = (table: TableKey) => {
     setActiveTable(table)
@@ -1580,16 +1584,12 @@ function ExpandableText({
 }) {
   const contentRef = useRef<HTMLDivElement>(null)
   const [hasOverflow, setHasOverflow] = useState(false)
-  const [localExpanded, setLocalExpanded] = useState(false)
-  const isExpanded = localExpanded
-
-  useEffect(() => {
-    setLocalExpanded(false)
-  }, [resetKey])
-
-  useEffect(() => {
-    if (expanded) setLocalExpanded(true)
-  }, [expanded])
+  const [localExpansion, setLocalExpansion] = useState({
+    resetKey,
+    expanded: false,
+  })
+  const isExpanded = expanded ||
+    (localExpansion.resetKey === resetKey && localExpansion.expanded)
 
   useEffect(() => {
     const node = contentRef.current
@@ -1620,7 +1620,7 @@ function ExpandableText({
   const handleToggle = (event?: React.SyntheticEvent) => {
     event?.preventDefault()
     event?.stopPropagation()
-    setLocalExpanded(current => !current)
+    setLocalExpansion({resetKey, expanded: !isExpanded})
     onToggle?.()
   }
 

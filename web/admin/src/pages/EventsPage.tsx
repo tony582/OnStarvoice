@@ -33,7 +33,11 @@ export function EventsPage() {
     finally { setLoading(false) }
   }, [filter])
 
-  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load() })
+    return () => { active = false }
+  }, [load])
 
   const maxReach = Math.max(1, ...events.map(e => Number(e.reach || 0)))
 

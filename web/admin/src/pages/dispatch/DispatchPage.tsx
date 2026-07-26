@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
+import { useNav } from '@/lib/navigation'
 import { Button } from '@/components/ui/button'
 import {
   OrchestrationComposerDrawer,
@@ -38,6 +39,7 @@ function isScheduleTemplateTask(task: CloudTask) {
 
 export function DispatchPage() {
   const { canWrite } = useAuth()
+  const { params } = useNav()
   const [overview, setOverview] = useState<Overview | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -46,11 +48,19 @@ export function DispatchPage() {
   const [actionError, setActionError] = useState('')
   const [actionTaskId, setActionTaskId] = useState('')
   const [planActionAgentId, setPlanActionAgentId] = useState('')
-  const [taskView, setTaskView] = useState<TaskView>('active')
+  const [taskView, setTaskView] = useState<TaskView>(
+    () => params?.view === 'attention' ? 'attention' : 'active',
+  )
   const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(null)
   const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)
   const [orchestrationInitialAgentIds, setOrchestrationInitialAgentIds] = useState<string[]>([])
-  const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(null)
+  const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(
+    () => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
+      String(params?.orchestrationId || ''),
+    )
+      ? String(params?.orchestrationId)
+      : null,
+  )
   const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
   const loadGeneration = useRef(0)
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
@@ -202,7 +212,7 @@ export function DispatchPage() {
     setActionError('')
     try {
       const result = await api.post<{ message?: string }>('/capture-cloud/tasks/' + task.id + '/resume', { mode: 'remaining' })
-      setFeedback(result.message || '已发送继续指令')
+      setFeedback(result.message || '已向原 Agent 发送继续剩余任务指令')
       await load(true)
     } catch (err) {
       setActionError(err instanceof Error ? err.message : '发送继续指令失败')
@@ -212,7 +222,7 @@ export function DispatchPage() {
   }
 
   const stop = async (task: CloudTask) => {
-    if (!window.confirm(`确定停止“${task.title || '当前任务'}”吗？已采集的结果会保留。`)) return
+    if (!window.confirm(`确定结束“${task.title || '当前任务'}”吗？后续关键词将不再执行，已经采集和保存的结果会保留。`)) return
     setActionTaskId(task.id)
     setFeedback('')
     setActionError('')
@@ -433,6 +443,7 @@ export function DispatchPage() {
               orchestrationId={selectedOrchestrationId}
               refreshKey={orchestrationRefreshKey}
               writable={canWrite()}
+              availableAgents={overview?.agents || []}
               onClose={closeOrchestrationDetail}
               onChanged={async () => {
                 setOrchestrationRefreshKey(value => value + 1)

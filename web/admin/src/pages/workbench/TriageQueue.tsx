@@ -100,7 +100,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${pageSize}|${pagination?.page ?? 1}`)
 
-  const loadCustomTagCatalog = useCallback(async (keyword = '') => {
+  const loadCustomTagCatalog = useCallback((keyword = '') => Promise.resolve().then(async () => {
     const seq = ++customTagRequestSeq.current
     try {
       const params = new URLSearchParams({ limit: '100' })
@@ -112,7 +112,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } catch {
       // 标签目录不阻断内容列表；详情中仍可输入新标签，稍后刷新再复用。
     }
-  }, [])
+  }), [])
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
@@ -132,7 +132,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return params
   }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateFrom, dateTo, dateBasis])
 
-  const load = useCallback(async (page = 1, options?: { silent?: boolean }) => {
+  const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (!options?.silent) setLoading(true)
     try {
       const params = filterParams()
@@ -143,7 +143,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       setPagination(data.pagination || null)
     } catch (err) { console.error(err) }
     finally { if (!options?.silent) setLoading(false) }
-  }, [filterParams, pageSize])
+  }), [filterParams, pageSize])
 
   const exportXlsx = async () => {
     setExporting(true)
@@ -165,10 +165,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort({ field: 'publish', dir: 'desc' })
   }
 
-  useEffect(() => { load() }, [load])
-  // Initial catalog fetch updates state asynchronously inside the callback.
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { loadCustomTagCatalog() }, [loadCustomTagCatalog])
+  useEffect(() => { void load() }, [load])
+  useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
 
   // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
   const reloadAfterMutation = useCallback(async () => {

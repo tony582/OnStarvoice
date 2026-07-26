@@ -108,7 +108,11 @@ export function UsersPage() {
     setForm(f => ({ ...f, tenantId: f.tenantId || ts[0]?.id || '' }))
     setLoading(false)
   }
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load() })
+    return () => { active = false }
+  }, [])
 
   const createUser = async () => {
     if (!form.email.trim() || !form.password) { setMsg('邮箱和初始密码必填'); return }
@@ -358,7 +362,11 @@ export function AuthCodesPage() {
     setForm(f => ({ ...f, tenantId: f.tenantId || ts[0]?.id || '' }))
     setLoading(false)
   }
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load() })
+    return () => { active = false }
+  }, [])
 
   const create = async () => {
     if (!form.tenantId) return
@@ -590,7 +598,17 @@ export function SettingsPage() {
     } else if (group === 'brand') {
       for (const k of ['brand_name', 'brand_aliases', 'brand_business_context', 'brand_relevance_terms', 'brand_noise_terms']) body[k] = settings[k] || ''
     } else if (group === 'email') {
-      for (const k of ['smtp_host', 'smtp_port', 'smtp_secure', 'smtp_user', 'smtp_pass', 'email_from', 'email_to']) body[k] = settings[k]
+      for (const k of [
+        'smtp_host',
+        'smtp_port',
+        'smtp_secure',
+        'smtp_user',
+        'email_from',
+        'email_to',
+        'capture_attention_email_to',
+      ]) body[k] = settings[k]
+      const smtpPass = settings.smtp_pass
+      if (smtpPass && smtpPass !== '***') body.smtp_pass = smtpPass
     } else if (group === 'report') {
       for (const k of ['report_daily_time', 'report_weekly_time', 'report_monthly_day', 'report_monthly_time']) body[k] = settings[k]
     }
@@ -640,6 +658,13 @@ export function SettingsPage() {
           <Field label="SMTP 密码"><Input type="password" value={settings.smtp_pass || ''} onChange={e => u('smtp_pass', e.target.value)} placeholder="留空不修改" /></Field>
           <Field label="发件人"><Input value={settings.email_from || ''} onChange={e => u('email_from', e.target.value)} /></Field>
           <Field label="收件人"><Input value={settings.email_to || ''} onChange={e => u('email_to', e.target.value)} /></Field>
+          <Field label="任务需人工介入通知邮箱">
+            <Input
+              value={settings.capture_attention_email_to || ''}
+              onChange={e => u('capture_attention_email_to', e.target.value)}
+              placeholder="验证码或安全审核时通知"
+            />
+          </Field>
         </div>
       </SettingsCard>
     </div>

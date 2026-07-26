@@ -803,7 +803,7 @@ function renderTaskCenterCountChips(counts) {
     .join("");
 }
 
-function getTaskCenterActions(item) {
+export function getTaskCenterActions(item) {
   if (item.type === "monitor" || (item.legacy && item.type !== "keyword")) {
     return [];
   }
@@ -829,7 +829,14 @@ function getTaskCenterActions(item) {
     isTaskCenterCircuitBreaker(item)
   ) {
     return item.type === "keyword"
-      ? [{id: "keep_results", label: "结束并保留"}]
+      ? [
+          {
+            id: "resume_remaining",
+            label: "已完成验证，继续",
+            primary: true,
+          },
+          {id: "keep_results", label: "结束并保留"},
+        ]
       : [];
   }
   if (item.status === "running" || item.status === "recovering") {

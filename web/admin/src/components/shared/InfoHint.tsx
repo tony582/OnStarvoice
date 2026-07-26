@@ -26,7 +26,11 @@ export function InfoHint({ text, className = '' }: { text: string; className?: s
         onMouseLeave={hide}
         onFocus={show}
         onBlur={hide}
-        onClick={(e) => { e.stopPropagation(); pos ? hide() : show() }}
+        onClick={(e) => {
+          e.stopPropagation()
+          if (pos) hide()
+          else show()
+        }}
         className={`inline-grid h-3.5 w-3.5 shrink-0 place-items-center align-middle text-muted-foreground/50 transition-colors hover:text-primary ${className}`}
       >
         <HelpCircle className="h-3.5 w-3.5" />

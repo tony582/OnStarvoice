@@ -108,7 +108,11 @@ router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
       // 把默认租户(OnStar)的设置整套复制给新租户:LLM / SMTP / 阈值 / 报表计划等
       await tx.execute(
         `INSERT INTO tenant_settings (tenant_id, key, value)
-         SELECT $1, key, value FROM tenant_settings WHERE tenant_id = $2`,
+         SELECT $1, key, value
+         FROM tenant_settings
+         WHERE tenant_id = $2
+           -- 人工安全验证通知属于客户自己的收件地址，绝不能继承默认租户。
+           AND key <> 'capture_attention_email_to'`,
         [created.id, defaultTenantId]
       );
       await tx.execute(
@@ -635,6 +639,7 @@ router.put('/settings', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body.tenantId || await getDefaultTenantId();
     const { tenantId: _tenantId, ...settings } = req.body || {};
+    if (settings.smtp_pass === '***') delete settings.smtp_pass;
     await setSettings(settings, tenantId);
     return res.json({ ok: true });
   } catch (err) {

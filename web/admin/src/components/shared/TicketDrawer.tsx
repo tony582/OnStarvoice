@@ -40,20 +40,7 @@ interface TicketSource {
   notes: TicketNote[]
 }
 
-/**
- * 内容工单详情沿用「内容分诊详情」的信息骨架：内容摘要、互动数据、页签和底部动作保持一致，
- * 只把标签管理 / 处理模式替换为工单优先级、处理人、过程记录和结案动作。
- */
-export function TicketDrawer({
-  ticket: t,
-  onClose,
-  canWrite,
-  onAction,
-  onReview,
-  onCloseTicket,
-  onReopenTicket,
-  onNoteAdded,
-}: {
+interface TicketDrawerProps {
   ticket: any
   onClose: () => void
   canWrite: boolean
@@ -62,10 +49,31 @@ export function TicketDrawer({
   onCloseTicket?: TicketAction
   onReopenTicket?: TicketAction
   onNoteAdded?: (note: any) => void
-}) {
+}
+
+/**
+ * 内容工单详情沿用「内容分诊详情」的信息骨架：内容摘要、互动数据、页签和底部动作保持一致，
+ * 只把标签管理 / 处理模式替换为工单优先级、处理人、过程记录和结案动作。
+ */
+export function TicketDrawer(props: TicketDrawerProps) {
+  return <TicketDrawerContent key={String(props.ticket?.id ?? '')} {...props} />
+}
+
+function TicketDrawerContent({
+  ticket: t,
+  onClose,
+  canWrite,
+  onAction,
+  onReview,
+  onCloseTicket,
+  onReopenTicket,
+  onNoteAdded,
+}: TicketDrawerProps) {
   const [tab, setTab] = useState<TicketTab>('content')
   const [source, setSource] = useState<TicketSource | null>(null)
-  const [loading, setLoading] = useState(true)
+  const sourceVersion = `${String(t.id)}:${String(t.updated_at ?? '')}`
+  const [loadedSourceVersion, setLoadedSourceVersion] = useState('')
+  const loading = loadedSourceVersion !== sourceVersion
   const [noteText, setNoteText] = useState('')
   const [noteError, setNoteError] = useState('')
   const [savingNote, setSavingNote] = useState(false)
@@ -74,7 +82,6 @@ export function TicketDrawer({
   const [lightbox, setLightbox] = useState('')
   const panelRef = useRef<HTMLDivElement>(null)
   const noteRef = useRef<HTMLTextAreaElement>(null)
-  const loadedTicketId = useRef('')
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
     return saved >= PANEL_MIN && saved <= PANEL_MAX ? saved : PANEL_DEFAULT
@@ -82,17 +89,6 @@ export function TicketDrawer({
 
   useEffect(() => {
     let alive = true
-    const switchingTicket = loadedTicketId.current !== t.id
-    if (switchingTicket) {
-      loadedTicketId.current = t.id
-      setSource(null)
-      setTab('content')
-      setNoteText('')
-      setNoteError('')
-      setActionError('')
-      setLightbox('')
-    }
-    setLoading(true)
     api.get<any>(`/tickets/${t.id}/source`)
       .then(data => {
         if (!alive) return
@@ -104,14 +100,15 @@ export function TicketDrawer({
           observations: data.observations || [],
           notes: data.notes || [],
         })
+        setLoadedSourceVersion(sourceVersion)
       })
       .catch(() => {
         if (!alive) return
         setSource({ record: null, comment: null, comments: [], officialResponses: [], observations: [], notes: [] })
+        setLoadedSourceVersion(sourceVersion)
       })
-      .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [t.id, t.updated_at])
+  }, [sourceVersion, t.id])
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {

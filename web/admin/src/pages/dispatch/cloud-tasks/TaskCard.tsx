@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import {
-  Archive, Bot, ChevronDown, ChevronUp, Loader2, Network, Play, Square,
+  Archive, Bot, ChevronDown, ChevronUp, Loader2, Network, Play, ShieldAlert, Square,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { KeywordProgressSummary, TaskDiagnosticsPanel } from './TaskDiagnostics'
@@ -12,6 +12,8 @@ import {
   canResume,
   canStop,
   formatTime,
+  isPlatformSafetyAttention,
+  platformSafetyReason,
   resumeBlockReason,
   safeNumber,
   statusTone,
@@ -49,6 +51,10 @@ export function TaskCard({
   const stopPending = task.pending_command_type === 'stop'
   const resumeBlocked = resumable ? resumeBlockReason(task) : ''
   const taskError = taskErrorText(task)
+  const safetyAttention = !orchestration && isPlatformSafetyAttention(task)
+  const safetyPosition = diagnostics.currentKeyword && diagnostics.currentOrdinal > 0
+    ? `${diagnostics.currentOrdinal}/${Math.max(diagnostics.total, 1)}「${diagnostics.currentKeyword}」`
+    : ''
   const dismissible = canDismissAttention(task)
   // 计划模板将从本列表移出，但保留其状态/文案分支，方便复用同一张卡渲染计划视图。
   const scheduleTemplate = orchestration && task.metadata?.orchestrationTemplate === true
@@ -100,7 +106,7 @@ export function TaskCard({
         )}
         <span className="shrink-0">· {formatTime(task.created_at || task.updated_at)}</span>
       </div>
-      {(hasKeywordDiagnostics ? diagnostics.headline : task.message) && (
+      {!safetyAttention && (hasKeywordDiagnostics ? diagnostics.headline : task.message) && (
         <p className={`mt-2 line-clamp-1 text-xs leading-5 ${
           hasKeywordDiagnostics && diagnostics.tone === 'danger'
             ? 'text-status-red'
@@ -111,13 +117,33 @@ export function TaskCard({
           {hasKeywordDiagnostics ? diagnostics.headline : task.message}
         </p>
       )}
-      {!hasKeywordDiagnostics && taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-1 text-xs leading-5 text-status-red">{taskError}</p>}
+      {!safetyAttention && !hasKeywordDiagnostics && taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-1 text-xs leading-5 text-status-red">{taskError}</p>}
       {hasKeywordDiagnostics ? (
         <KeywordProgressSummary task={task} diagnostics={diagnostics} />
       ) : progress.total > 0 && (
         <div className="mt-3">
           <div className="mb-1.5 flex justify-between text-[11px] text-muted-foreground"><span>总体进度</span><span>{progress.current}/{progress.total} · {progress.percent}%</span></div>
           <div className="h-1.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="任务总体进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><span className="block h-full rounded-full bg-primary transition-[width]" style={{ width: `${progress.percent}%` }} /></div>
+        </div>
+      )}
+      {safetyAttention && (
+        <div role="alert" className="mt-3 rounded-xl border border-status-red/25 bg-status-red/[0.045] p-3">
+          <div className="flex items-start gap-2.5">
+            <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-status-red/10 text-status-red">
+              <ShieldAlert className="h-4 w-4" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-status-red">需要在原 Agent 人工处理</p>
+              <p className="mt-1 text-xs leading-5 text-foreground">
+                {platformSafetyReason(task)}
+                {safetyPosition ? `，任务停在 ${safetyPosition}` : ''}
+                。请先在 <strong>{task.agent_display_name || '原 Agent'}</strong> 完成验证；此前结果已保留。
+              </p>
+              <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+                验证完成后继续剩余关键词；若不再执行，可结束任务并保留现有结果。
+              </p>
+            </div>
+          </div>
         </div>
       )}
       {/* 底部：左侧运行详情开关；右侧操作按钮（主操作实心、次操作 outline/ghost，最多 3 个） */}
@@ -141,6 +167,10 @@ export function TaskCard({
                   ? diagnostics.retryExhausted
                     ? '失败词已达上限'
                     : '暂时不能继续'
+                  : safetyAttention && task.agent_online
+                    ? '验证完成，原设备继续'
+                    : safetyAttention
+                      ? '原设备上线后继续'
                   : task.agent_online
                     ? '继续剩余任务'
                     : '上线后继续'}
@@ -149,10 +179,27 @@ export function TaskCard({
             {stoppable && !stopPending && (
               <Button variant="outline" size="sm" onClick={() => void onStop(task)} disabled={!writable || actionTaskId === task.id}>
                 {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
-                {task.agent_online ? '停止任务' : '上线后停止'}
+                {safetyAttention
+                  ? task.agent_online
+                    ? '结束并保留结果'
+                    : '上线后结束并保留'
+                  : task.agent_online
+                    ? '停止任务'
+                    : '上线后停止'}
               </Button>
             )}
-            {stopPending && <Button variant="outline" size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />{task.agent_online ? '等待设备停止' : '已排队，上线后停止'}</Button>}
+            {stopPending && (
+              <Button variant="outline" size="sm" disabled>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {safetyAttention
+                  ? task.agent_online
+                    ? '等待设备结束并保留'
+                    : '已排队，上线后结束'
+                  : task.agent_online
+                    ? '等待设备停止'
+                    : '已排队，上线后停止'}
+              </Button>
+            )}
             {commandPending && !stoppable && !stopPending && <Button size="sm" disabled><Loader2 className="h-4 w-4 animate-spin" />等待设备响应</Button>}
             {dismissible && (
               <Button variant="ghost" size="sm" onClick={() => void onDismissAttention(task)} disabled={!writable || actionTaskId === task.id}>

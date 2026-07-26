@@ -412,6 +412,8 @@ export function taskPhaseLabel(phase = '') {
     comments: '评论采集',
     syncing: '同步后台',
     retrying: '等待重试',
+    needs_action: '等待人工处理',
+    platform_safety_block: '等待人工安全验证',
     no_matching_results: '筛选范围内无匹配内容',
     failed: '执行失败',
     partial: '部分完成',
@@ -419,6 +421,74 @@ export function taskPhaseLabel(phase = '') {
     unattended_completed_with_failures: '已完成全部尝试',
   }
   return labels[normalized] || normalized.replace(/_/g, ' ') || '—'
+}
+
+const PLATFORM_SAFETY_EVIDENCE_PATTERN =
+  /(platform_safety_block|security_verification|page_challenge|xhs_security_block|douyin_search_security_challenge|http_?429|rate_?limited|captcha|risk.?control|账号异常|账号限制|平台安全|安全限制|安全审核|安全验证|访问频繁|访问受限|验证码|风控)/iu
+
+export function isPlatformSafetyAttention(task: CloudTask) {
+  const status = String(task.effective_status || task.status || '').toLowerCase()
+  if (!['interrupted', 'needs_action', 'failed', 'completed_with_failures'].includes(status)) {
+    return false
+  }
+
+  const error = task.error || {}
+  const progress = task.progress || {}
+  const checkpoint = task.checkpoint || {}
+  const explicitSafetyFlag = diagnosticBoolean(
+    error.securityBlocked,
+    error.security_blocked,
+    error.platformSafetyBlocked,
+    error.platform_safety_blocked,
+    error.requiresManualAction,
+    error.requires_manual_action,
+    progress.securityBlocked,
+    progress.security_blocked,
+    progress.platformSafetyBlocked,
+    progress.platform_safety_blocked,
+    progress.requiresManualAction,
+    progress.requires_manual_action,
+    checkpoint.securityBlocked,
+    checkpoint.security_blocked,
+    checkpoint.platformSafetyBlocked,
+    checkpoint.platform_safety_blocked,
+    checkpoint.requiresManualAction,
+    checkpoint.requires_manual_action,
+  )
+  const evidence = [
+    error.code,
+    error.category,
+    error.message,
+    error.reason,
+    progress.errorCode,
+    progress.errorCategory,
+    checkpoint.errorCode,
+    checkpoint.errorCategory,
+    task.message,
+  ].map(value => String(value ?? '').trim()).filter(Boolean).join(' ')
+
+  return explicitSafetyFlag ||
+    PLATFORM_SAFETY_EVIDENCE_PATTERN.test(evidence) ||
+    taskKeywordResults(task).some(item => taskKeywordFailureKind(item) === 'safety')
+}
+
+export function platformSafetyReason(task: CloudTask) {
+  const error = task.error || {}
+  const codeAndCategory = [
+    error.code,
+    error.category,
+    task.progress?.errorCode,
+    task.progress?.errorCategory,
+  ].map(value => String(value ?? '').trim()).filter(Boolean).join(' ')
+  if (/(douyin_search_security_challenge|security_verification|page_challenge|captcha|验证码|安全验证)/iu.test(codeAndCategory)) {
+    return task.platform === 'douyin'
+      ? '抖音页面要求完成人工安全验证'
+      : '平台页面要求完成人工安全验证'
+  }
+  if (/(login|required|登录)/iu.test(codeAndCategory)) return '当前账号需要重新登录或确认账号状态'
+  if (/(http_?429|rate_?limited|访问频繁)/iu.test(codeAndCategory)) return '平台提示访问过于频繁'
+
+  return diagnosticText(error.message, error.reason, task.message, '平台要求人工确认账号或安全验证')
 }
 
 export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
@@ -429,9 +499,10 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
   const metadata = task.metadata || {}
   const terminalStatuses = new Set(['completed', 'partial', 'failed', 'skipped', 'canceled'])
   const hasKeywordCheckpoint = items.length > 0
-  const keywordTotal = hasKeywordCheckpoint
-    ? items.length
-    : Math.max(progress.total, safeNumber(counts.total))
+  // Extension may stop between keywords before the current keyword checkpoint
+  // has settled. Keep the original plan total instead of shrinking the task to
+  // only the entries that happened to reach keywordResults.
+  const keywordTotal = Math.max(items.length, progress.total, safeNumber(counts.total))
   const processedFromItems = items.filter(item => terminalStatuses.has(item.status)).length
   const processed = hasKeywordCheckpoint
     ? processedFromItems
@@ -456,12 +527,15 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
     checkpoint.activeKeyword,
     items[items.length - 1]?.keyword,
   )
-  const currentItem = items.find(item => item.keyword === currentKeyword) || items[items.length - 1]
+  const currentItem = items.find(item => item.keyword === currentKeyword)
+  const checkpointKeywordIndex = Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex)
   const currentOrdinal = currentItem
     ? Math.min(currentItem.index + 1, Math.max(keywordTotal, 1))
-    : progress.current > 0
-      ? Math.min(progress.current, Math.max(keywordTotal, 1))
-      : 0
+    : Number.isFinite(checkpointKeywordIndex)
+      ? Math.min(Math.max(0, Math.floor(checkpointKeywordIndex)) + 1, Math.max(keywordTotal, 1))
+      : progress.current > 0
+        ? Math.min(progress.current, Math.max(keywordTotal, 1))
+        : 0
   const failureKinds = abnormalItems.reduce<Record<TaskKeywordFailureKind, number>>((summary, item) => {
     summary[taskKeywordFailureKind(item)] += 1
     return summary
@@ -485,6 +559,12 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
   const retryExhausted = terminalTask &&
     failedItems.length > 0 &&
     failedItems.every(item => item.attemptCount >= retryLimit)
+  const platformSafetyAttention = isPlatformSafetyAttention(task)
+  const safetyBlocked = failureKinds.safety > 0
+    ? failureKinds.safety
+    : platformSafetyAttention
+      ? 1
+      : 0
 
   let headline: string
   let explanation: string
@@ -496,9 +576,12 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
     headline = `正在处理 ${currentOrdinal || 1}/${Math.max(keywordTotal, 1)} · ${currentKeyword}`
     explanation = `当前阶段：${taskPhaseLabel(diagnosticText(task.progress?.phase, checkpoint.activePhase, checkpoint.phase))}`
     tone = 'active'
-  } else if (failureKinds.safety > 0) {
-    headline = `检测到 ${failureKinds.safety} 个平台风控信号`
-    explanation = '设备已保护性停止自动操作，需要到对应浏览器确认验证码、登录或账号状态。'
+  } else if (safetyBlocked > 0) {
+    const position = currentKeyword && currentOrdinal > 0
+      ? ` · 停在 ${currentOrdinal}/${Math.max(keywordTotal, 1)}「${currentKeyword}」`
+      : ''
+    headline = `${platformSafetyReason(task)}${position}`
+    explanation = '自动操作已保护性停止；请先在原 Agent 完成人工验证，再继续剩余关键词。'
     tone = 'danger'
   } else if (failed > 0) {
     const causes = [
@@ -559,7 +642,7 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
         .sort()
       return finishedTimes[finishedTimes.length - 1] || ''
     })(),
-    safetyBlocked: failureKinds.safety,
+    safetyBlocked,
     searchUnavailable: failureKinds.search_unavailable,
     enhancementFailed: failureKinds.enhancement,
     networkFailed: failureKinds.network,

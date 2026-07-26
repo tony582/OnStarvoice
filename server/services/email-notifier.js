@@ -2,10 +2,38 @@
  * 邮件通知服务
  */
 
+import { createHash } from 'crypto';
 import nodemailer from 'nodemailer';
 import { getSetting } from '../db/init.js';
 
-let transporter = null;
+const transporterCache = new Map();
+const MAX_TRANSPORTER_CACHE_SIZE = 20;
+
+export class EmailConfigurationError extends Error {
+  constructor(message, code = 'SMTP_NOT_CONFIGURED') {
+    super(message);
+    this.name = 'EmailConfigurationError';
+    this.code = code;
+  }
+}
+
+export function captureEmailTransporterCacheKey({
+  host,
+  port,
+  secure,
+  user,
+  pass,
+} = {}) {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      String(host || ''),
+      Number(port || 0),
+      Boolean(secure),
+      String(user || ''),
+      String(pass || ''),
+    ]))
+    .digest('hex');
+}
 
 function escHtml(value) {
   return String(value ?? '')
@@ -32,16 +60,82 @@ async function getTransporter(tenantId) {
     return null;
   }
 
-  if (!transporter || transporter._host !== host || transporter._user !== user) {
-    transporter = nodemailer.createTransport({
-      host, port, secure,
-      auth: { user, pass },
-    });
-    transporter._host = host;
-    transporter._user = user;
+  const key = captureEmailTransporterCacheKey({host, port, secure, user, pass});
+  let transporter = transporterCache.get(key);
+  if (transporter) {
+    // Refresh insertion order so bounded eviction behaves as a small LRU.
+    transporterCache.delete(key);
+    transporterCache.set(key, transporter);
+    return transporter;
+  }
+
+  transporter = nodemailer.createTransport({
+    host, port, secure,
+    auth: { user, pass },
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 20_000,
+  });
+  transporter._starvoiceUser = user;
+  transporterCache.set(key, transporter);
+
+  if (transporterCache.size > MAX_TRANSPORTER_CACHE_SIZE) {
+    const oldestKey = transporterCache.keys().next().value;
+    const oldestTransporter = transporterCache.get(oldestKey);
+    transporterCache.delete(oldestKey);
+    if (typeof oldestTransporter?.close === 'function') {
+      try {
+        oldestTransporter.close();
+      } catch {
+        // Eviction must not prevent the newly resolved tenant transport
+        // from being used.
+      }
+    }
   }
 
   return transporter;
+}
+
+/**
+ * 发送一封已经完成业务组装的租户邮件。
+ *
+ * 收件人必须由调用方显式传入，避免后台通知误用默认租户的 email_to。
+ */
+export async function sendTenantEmail({
+  tenantId,
+  to,
+  subject,
+  html,
+  messageId = '',
+}) {
+  const transporter = await getTransporter(tenantId);
+  if (!transporter) {
+    throw new EmailConfigurationError('SMTP 未配置');
+  }
+
+  const recipient = String(to || '').trim();
+  if (!recipient) {
+    throw new EmailConfigurationError(
+      '通知收件人未配置',
+      'EMAIL_RECIPIENT_NOT_CONFIGURED',
+    );
+  }
+
+  const from =
+    await getSetting('email_from', tenantId) ||
+    process.env.EMAIL_FROM ||
+    transporter._starvoiceUser ||
+    '';
+
+  return transporter.sendMail({
+    from,
+    to: recipient,
+    subject: String(subject || ''),
+    html: String(html || ''),
+    ...(String(messageId || '').trim()
+      ? {messageId: String(messageId).trim()}
+      : {}),
+  });
 }
 
 const LEVEL_LABEL = {

@@ -43,20 +43,7 @@ interface RecordActivity {
 
 type AsyncDrawerAction = () => Promise<boolean | void> | boolean | void
 
-export function RecordDrawer({
-  record: r,
-  onClose,
-  canWrite,
-  onLinkIssue,
-  onSetStatus,
-  onMarkResponded,
-  onSetArchived,
-  onFalsePositive,
-  falsePositivePending = false,
-  onUpdateFields,
-  customTagCatalog = [],
-  onUpdateCustomTags,
-}: {
+interface RecordDrawerProps {
   record: any
   onClose: () => void
   canWrite: boolean
@@ -69,7 +56,26 @@ export function RecordDrawer({
   onUpdateFields?: (fields: ManualRecordFields) => Promise<boolean | void> | boolean | void
   customTagCatalog?: CustomTag[]
   onUpdateCustomTags?: (patch: CustomTagPatch) => Promise<CustomTag[]>
-}) {
+}
+
+export function RecordDrawer(props: RecordDrawerProps) {
+  return <RecordDrawerContent key={String(props.record?.id ?? '')} {...props} />
+}
+
+function RecordDrawerContent({
+  record: r,
+  onClose,
+  canWrite,
+  onLinkIssue,
+  onSetStatus,
+  onMarkResponded,
+  onSetArchived,
+  onFalsePositive,
+  falsePositivePending = false,
+  onUpdateFields,
+  customTagCatalog = [],
+  onUpdateCustomTags,
+}: RecordDrawerProps) {
   const [tab, setTab] = useState<'content' | 'analysis' | 'comments' | 'official' | 'snapshot' | 'history'>('content')
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
@@ -99,20 +105,6 @@ export function RecordDrawer({
 
   useEffect(() => {
     let active = true
-    setLoading(true)
-    setComments([])
-    setOfficialResponses([])
-    setObservations([])
-    setActivity([])
-    setEditingJudgement(false)
-    setEditingLabels(false)
-    setLightbox('')
-    setEditDraft(manualDraft(r))
-    setEditError('')
-    setNoteDraft('')
-    setNoteError('')
-    setActionError('')
-    setPendingMode(null)
     Promise.all([
       api.get('/records/' + r.id + '/comments').catch(() => ({ comments: [], officialResponses: [] })),
       api.get('/records/' + r.id + '/observations').catch(() => ({ observations: [] })),
@@ -1153,7 +1145,7 @@ export function getCover(r: any): string {
     try {
       const imgs = JSON.parse(r.image_urls || '[]')
       if (imgs.length) raw = typeof imgs[0] === 'string' ? imgs[0] : (imgs[0]?.url || '')
-    } catch {}
+    } catch { /* 忽略历史记录中无效的图片 JSON，继续使用空封面。 */ }
   }
   return proxiedImg(raw)                             // CDN 图走 /api/img 代理,防直连防盗链刷不出
 }
@@ -1362,7 +1354,13 @@ const RISK_TONE: Record<string, string> = { critical: 'critical', warning: 'nega
 const STANCE_LABEL: Record<string, string> = { positive: '正面', negative: '负面', neutral: '中性', mixed: '褒贬不一' }
 const RECORD_SOURCE_LABEL: Record<string, string> = { llm: 'AI 深剖', rule_fallback: '规则兜底' }
 
-function RecordAnalysisPanel({ record, canWrite }: { record: any; canWrite: boolean }) {
+type RecordAnalysisPanelProps = { record: any; canWrite: boolean }
+
+function RecordAnalysisPanel(props: RecordAnalysisPanelProps) {
+  return <RecordAnalysisPanelContent key={String(props.record?.id ?? '')} {...props} />
+}
+
+function RecordAnalysisPanelContent({ record, canWrite }: RecordAnalysisPanelProps) {
   const [loading, setLoading] = useState(true)
   const [analysis, setAnalysis] = useState<any>(null)
   const [source, setSource] = useState('')
@@ -1374,7 +1372,6 @@ function RecordAnalysisPanel({ record, canWrite }: { record: any; canWrite: bool
 
   useEffect(() => {
     let active = true
-    setLoading(true); setAnalysis(null); setSource(''); setStale(false); setError(''); setBrandMissing(false)
     api.get<any>(`/opinion-analysis/records/${record.id}`)
       .then(d => {
         if (!active) return

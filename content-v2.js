@@ -35,6 +35,7 @@ import {
 } from "./utils/capture/list-capture-trace.js";
 import {
   assertNoDouyinSearchServiceAbnormalPage,
+  assertNoDouyinSearchSecurityChallengePage,
 } from "./utils/capture/douyin-search-guard.js";
 import {
   detectLoggedSocialAccount,
@@ -1054,6 +1055,7 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
         fatal: Boolean(error?.fatal),
         stopBatch: Boolean(error?.stopBatch),
         securityBlocked: Boolean(error?.securityBlocked),
+        platformSafetyBlocked: Boolean(error?.platformSafetyBlocked),
         requiresManualAction: Boolean(error?.requiresManualAction),
         retryable:
           typeof error?.retryable === "boolean" ? error.retryable : true,
@@ -1064,6 +1066,10 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
 
 function handleAssertNoDouyinSearchServiceAbnormal(sendResponse) {
   try {
+    // Keep the legacy action name for compatibility, but always give the
+    // higher-severity platform challenge precedence before allowing another
+    // search click.
+    assertNoDouyinSearchSecurityChallengePage();
     assertNoDouyinSearchServiceAbnormalPage();
     sendResponse({ok: true, data: {blocked: false}});
   } catch (error) {
@@ -1076,6 +1082,7 @@ function handleAssertNoDouyinSearchServiceAbnormal(sendResponse) {
         fatal: Boolean(error?.fatal),
         stopBatch: Boolean(error?.stopBatch),
         securityBlocked: Boolean(error?.securityBlocked),
+        platformSafetyBlocked: Boolean(error?.platformSafetyBlocked),
         requiresManualAction: Boolean(error?.requiresManualAction),
         retryable:
           typeof error?.retryable === "boolean" ? error.retryable : false,
@@ -1154,6 +1161,7 @@ async function applyBatchSearchFilters({
       ? "xiaohongshu"
       : "unknown";
   if (platform === "douyin") {
+    assertNoDouyinSearchSecurityChallengePage();
     assertNoDouyinSearchServiceAbnormalPage();
   }
   const filterRequests = [
@@ -1864,6 +1872,7 @@ async function waitForKeywordStrategyUi(ms = 300) {
   const total = Math.max(0, Number(ms) || 0);
   const deadline = Date.now() + total;
   do {
+    assertNoDouyinSearchSecurityChallengePage();
     assertNoDouyinSearchServiceAbnormalPage();
     const remainingMs = Math.max(0, deadline - Date.now());
     if (remainingMs <= 0) break;
@@ -1871,6 +1880,7 @@ async function waitForKeywordStrategyUi(ms = 300) {
       window.setTimeout(resolve, Math.min(100, remainingMs)),
     );
   } while (Date.now() < deadline);
+  assertNoDouyinSearchSecurityChallengePage();
   assertNoDouyinSearchServiceAbnormalPage();
 }
 

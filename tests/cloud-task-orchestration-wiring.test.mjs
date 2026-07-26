@@ -94,8 +94,8 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /暂停计划/u);
   assert.match(detail, /重新启用/u);
   assert.match(detail, /每个计划时间，每个关键词执行 1 次/u);
-  assert.match(detail, /重新分配（尚未开放）/u);
-  assert.match(detail, /当前不会伪装执行/u);
+  assert.match(detail, /任务遇到安全验证时/u);
+  assert.match(detail, /接力只处理尚未开始的完整关键词/u);
 });
 
 test('API supports opt-in timeouts without changing every request', async () => {

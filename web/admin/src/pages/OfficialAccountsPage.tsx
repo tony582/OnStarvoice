@@ -34,7 +34,11 @@ export function OfficialAccountsPage() {
       })))
     } catch (err) { console.error(err) } finally { setLoading(false) }
   }
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load() })
+    return () => { active = false }
+  }, [])
 
   const update = (i: number, patch: Partial<Row>) => setRows(rs => rs.map((r, j) => j === i ? { ...r, ...patch } : r))
   const addRow = () => setRows(rs => [...rs, { platform: 'xiaohongshu', account_name: '', aliasesText: '', account_id: '', skip_content: true }])

@@ -10,6 +10,7 @@ import {
 import {
   captureAgentOnline,
   isCloudTaskActive,
+  lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeCloudTaskSnapshot,
   normalizeRemoteTaskInput,
@@ -20,6 +21,9 @@ import {
   aggregateParentTaskItems,
   checkpointEntryToItemStatus,
 } from '../services/capture-orchestration.js';
+import {
+  enqueueCaptureSafetyAttentionNotification,
+} from '../services/capture-attention-notifier.js';
 import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
@@ -1088,6 +1092,16 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       AND status IN ('assigned', 'dispatch_pending')
   `, [agent.tenant_id, task.parent_task_id, task.id, agent.id]);
 
+  const projectedItemIds = [];
+  const snapshotProgress = safeJson(snapshot.progress);
+  const snapshotCheckpoint = safeJson(snapshot.checkpoint);
+  const activeKeyword = text(
+    snapshotProgress.keyword ||
+      snapshotProgress.currentKeyword ||
+      snapshotCheckpoint.currentKeyword ||
+      snapshotCheckpoint.activeKeyword,
+    120,
+  );
   for (const entry of orchestrationCheckpointEntries(snapshot)) {
     const keyword = text(entry.keyword, 120);
     const entryErrorCode = text(
@@ -1187,6 +1201,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       keyword,
     ]);
     if (!item) continue;
+    projectedItemIds.push(item.id);
 
     await tx.execute(`
       UPDATE capture_task_item_attempts
@@ -1263,23 +1278,99 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           : '';
   if (unresolvedStatus) {
     const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(unresolvedStatus);
+    const rawChildError = snapshot.error;
+    const childError = {
+      ...(rawChildError && typeof rawChildError === 'object'
+        ? sanitizeCloudStructuredObject(rawChildError)
+        : text(rawChildError, 1000)
+          ? {message: text(rawChildError, 1000)}
+          : {}),
+      ...(text(
+        snapshot?.error?.code || snapshot?.errorCode || snapshot?.error_code,
+        100,
+      )
+        ? {
+            code: text(
+              snapshot?.error?.code ||
+                snapshot?.errorCode ||
+                snapshot?.error_code,
+              100,
+            ),
+          }
+        : {}),
+    };
+    if (activeKeyword) {
+      const activeItem = await tx.queryOne(`
+        UPDATE capture_task_items
+        SET status = $1,
+          error = CASE
+            WHEN $2::jsonb = '{}'::jsonb THEN jsonb_build_object(
+              'code', 'missing_keyword_checkpoint',
+              'message', '当前关键词已开始，但子任务停止前未收到完成检查点'
+            )
+            ELSE $2::jsonb
+          END,
+          started_at = COALESCE(started_at, now()),
+          finished_at = CASE
+            WHEN $3::boolean THEN COALESCE(finished_at, now())
+            ELSE NULL
+          END,
+          updated_at = now()
+        WHERE tenant_id = $4
+          AND task_id = $5
+          AND execution_task_id = $6
+          AND assigned_agent_id = $7
+          AND keyword = $8
+          AND NOT (id = ANY($9::uuid[]))
+          AND status NOT IN (
+            'completed', 'completed_with_warnings',
+            'failed', 'skipped', 'canceled'
+          )
+        RETURNING id
+      `, [
+        unresolvedStatus,
+        JSON.stringify(childError),
+        terminal,
+        agent.tenant_id,
+        task.parent_task_id,
+        task.id,
+        agent.id,
+        activeKeyword,
+        projectedItemIds,
+      ]);
+      if (activeItem) projectedItemIds.push(activeItem.id);
+    }
     await tx.execute(`
       UPDATE capture_task_items
-      SET status = $1,
+      SET status = CASE
+          WHEN $1 = 'needs_action' AND started_at IS NULL THEN 'retryable'
+          ELSE $1
+        END,
         error = CASE
+          WHEN $1 = 'needs_action' AND started_at IS NULL
+            THEN jsonb_build_object(
+              'code', 'blocked_by_prior_item',
+              'message', '前序关键词需要人工处理，该关键词尚未开始，可安全接力'
+            )
           WHEN $1 = 'needs_action' THEN jsonb_build_object(
             'code', 'missing_keyword_checkpoint',
             'message', '子任务已停止，但未收到该关键词的完成检查点'
           )
           ELSE error
         END,
-        started_at = COALESCE(started_at, now()),
-        finished_at = CASE WHEN $2::boolean THEN COALESCE(finished_at, now()) ELSE NULL END,
+        finished_at = CASE
+          WHEN $2::boolean THEN COALESCE(finished_at, now())
+          ELSE NULL
+        END,
         updated_at = now()
       WHERE tenant_id = $3
         AND task_id = $4
         AND execution_task_id = $5
         AND assigned_agent_id = $6
+        AND (
+          $1 IN ('canceled', 'skipped')
+          OR NOT (id = ANY($7::uuid[]))
+        )
         AND status NOT IN (
           'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
         )
@@ -1290,35 +1381,33 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       task.parent_task_id,
       task.id,
       agent.id,
+      projectedItemIds,
     ]);
     await tx.execute(`
       UPDATE capture_task_item_attempts attempt
-      SET status = $1,
-        error = CASE
-          WHEN $1 = 'needs_action' THEN jsonb_build_object(
-            'code', 'missing_keyword_checkpoint',
-            'message', '子任务已停止，但未收到该关键词的完成检查点'
-          )
-          ELSE attempt.error
+      SET status = CASE
+          WHEN item.status = 'retryable' THEN 'retryable'
+          ELSE item.status
         END,
-        started_at = COALESCE(attempt.started_at, now()),
-        finished_at = CASE WHEN $2::boolean THEN COALESCE(attempt.finished_at, now()) ELSE NULL END,
+        error = item.error,
+        started_at = CASE
+          WHEN item.started_at IS NULL THEN attempt.started_at
+          ELSE COALESCE(attempt.started_at, item.started_at)
+        END,
+        finished_at = item.finished_at,
         updated_at = now()
       FROM capture_task_items item
       WHERE item.id = attempt.item_id
-        AND item.tenant_id = $3
-        AND item.task_id = $4
-        AND item.execution_task_id = $5
-        AND item.assigned_agent_id = $6
-        AND item.status = $1
-        AND attempt.execution_task_id = $5
-        AND attempt.agent_id = $6
+        AND item.tenant_id = $1
+        AND item.task_id = $2
+        AND item.execution_task_id = $3
+        AND item.assigned_agent_id = $4
+        AND attempt.execution_task_id = $3
+        AND attempt.agent_id = $4
         AND attempt.status NOT IN (
           'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
         )
     `, [
-      unresolvedStatus,
-      terminal,
       agent.tenant_id,
       task.parent_task_id,
       task.id,
@@ -1436,6 +1525,15 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'parentTaskId', capture_tasks.metadata->'parentTaskId',
             'orchestrationRevision', capture_tasks.metadata->'orchestrationRevision',
             'itemIds', capture_tasks.metadata->'itemIds',
+            'handoffRequestHash', capture_tasks.metadata->'handoffRequestHash',
+            'handoffRequestKey', capture_tasks.metadata->'handoffRequestKey',
+            'handoffSourceExecutionTaskId', capture_tasks.metadata->'handoffSourceExecutionTaskId',
+            'handoffConfirmedByUser', capture_tasks.metadata->'handoffConfirmedByUser',
+            'handoffSuccessorTaskId', capture_tasks.metadata->'handoffSuccessorTaskId',
+            'handoffSourcePreviousStatus', capture_tasks.metadata->'handoffSourcePreviousStatus',
+            'handedOffAt', capture_tasks.metadata->'handedOffAt',
+            'recoveryTaskId', capture_tasks.metadata->'recoveryTaskId',
+            'recoveryCommandId', capture_tasks.metadata->'recoveryCommandId',
             'queueBlocker', capture_tasks.metadata->'queueBlocker',
             'localRequestId', capture_tasks.metadata->'localRequestId',
             'createCompletedAt', capture_tasks.metadata->'createCompletedAt',
@@ -1681,6 +1779,14 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
     await projectOrchestrationSnapshot(tx, agent, task, snapshot);
   }
 
+  await enqueueCaptureSafetyAttentionNotification(tx, {
+    agent,
+    task,
+    snapshot,
+    previous,
+    snapshotAccepted,
+  });
+
   if (!previous || previous.status !== task.status || previous.attempt_number !== task.attempt_number) {
     await appendEvent(tx, {
       tenantId: agent.tenant_id,
@@ -1751,6 +1857,11 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
       );
     }
     const result = await withTransaction(async tx => {
+      await lockCaptureAgentExecutionSlot(
+        tx,
+        agent.tenant_id,
+        agent.id,
+      );
       await tx.execute(`
         UPDATE capture_agents
         SET client_label = COALESCE(NULLIF($1, ''), client_label),
@@ -2278,7 +2389,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
               AS agent_id,
             COUNT(*) FILTER (
               WHERE assigned.status IN (
-                'claimed', 'running', 'recovering', 'resume_requested'
+                'claimed', 'running', 'recovering', 'interrupted',
+                'needs_action', 'resume_requested'
               )
             ) AS active_task_count,
             COUNT(*) FILTER (
@@ -2287,7 +2399,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           FROM capture_tasks assigned
           WHERE assigned.tenant_id = $1
             AND assigned.status IN (
-              'pending', 'claimed', 'running', 'recovering', 'resume_requested'
+              'pending', 'claimed', 'running', 'recovering', 'interrupted',
+              'needs_action', 'resume_requested'
             )
             AND COALESCE(
               assigned.assigned_agent_id,
@@ -3402,6 +3515,18 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       ? req.body.mode
       : 'remaining';
     const result = await withTransaction(async tx => {
+      const taskIdentity = await tx.queryOne(`
+        SELECT COALESCE(assigned_agent_id, origin_agent_id) AS agent_id
+        FROM capture_tasks
+        WHERE id = $1 AND tenant_id = $2
+      `, [req.params.id, req.tenantId]);
+      if (!taskIdentity) return { error: 'task_not_found' };
+      if (!taskIdentity.agent_id) return { error: 'agent_unavailable' };
+      await lockCaptureAgentExecutionSlot(
+        tx,
+        req.tenantId,
+        taskIdentity.agent_id,
+      );
       await expireStaleCommands(tx, req.tenantId, req.params.id);
       const task = await tx.queryOne(`
         SELECT t.*, ca.status AS agent_status, ca.last_heartbeat_at,
@@ -3423,7 +3548,13 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
         FOR UPDATE OF t
       `, [req.params.id, req.tenantId]);
       if (!task) return { error: 'task_not_found' };
+      if (task.metadata?.handoffSuccessorTaskId) {
+        return { error: 'task_handed_off', task };
+      }
       const agentId = task.assigned_agent_id || task.origin_agent_id;
+      if (String(agentId || '') !== String(taskIdentity.agent_id)) {
+        return { error: 'task_agent_changed', task };
+      }
       if (!task.control_task_id || !String(task.task_type).includes('unattended')) {
         return { error: 'task_not_remotely_resumable', task };
       }
@@ -3516,6 +3647,8 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
     const messages = {
       task_not_found: ['task_not_found', '任务不存在'],
       task_not_recoverable: ['task_not_recoverable', '任务当前状态不能继续'],
+      task_handed_off: ['task_handed_off', '该任务的后续关键词已经转交其他 Agent，不能再由原设备继续'],
+      task_agent_changed: ['task_agent_changed', '任务执行节点刚刚发生变化，请刷新后重试'],
       task_not_remotely_resumable: ['task_not_remotely_resumable', '该任务还不支持远程继续'],
       agent_unavailable: ['agent_unavailable', '原执行节点授权已失效、已停用或不存在'],
       agent_platform_mismatch: ['agent_platform_mismatch', '原执行节点未配置负责该任务平台'],

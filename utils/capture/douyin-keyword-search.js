@@ -37,9 +37,13 @@ import {
 } from "./douyin-author.js";
 import {
   assertNoDouyinSearchServiceAbnormalPage,
+  assertNoDouyinSearchSecurityChallengePage,
   createDouyinSearchServiceAbnormalError,
+  createDouyinSearchSecurityChallengeError,
   isDouyinSearchServiceAbnormalError,
+  isDouyinSearchSecurityChallengeError,
   observeDouyinSearchServiceAbnormalPage,
+  observeDouyinSearchSecurityChallengePage,
 } from "./douyin-search-guard.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
@@ -71,10 +75,17 @@ export async function captureDouyinKeywordNotes({
 } = {}) {
   const captureStartedAt = new Date().toISOString();
   resetCancelFlag();
+  const noteMap = new Map();
+  let partialCapturePayload = null;
   let serviceAbnormalError = null;
   let resolveServiceAbnormalSignal = null;
   const serviceAbnormalSignal = new Promise((resolve) => {
     resolveServiceAbnormalSignal = resolve;
+  });
+  let securityChallengeError = null;
+  let resolveSecurityChallengeSignal = null;
+  const securityChallengeSignal = new Promise((resolve) => {
+    resolveSecurityChallengeSignal = resolve;
   });
   const stopForServiceAbnormal = (error = null) => {
     if (serviceAbnormalError) return serviceAbnormalError;
@@ -97,6 +108,32 @@ export async function captureDouyinKeywordNotes({
     }
     return serviceAbnormalError;
   };
+  const stopForSecurityChallenge = (error = null) => {
+    if (securityChallengeError) return securityChallengeError;
+    securityChallengeError = isDouyinSearchSecurityChallengeError(error)
+      ? error
+      : createDouyinSearchSecurityChallengeError();
+    setCancelFlag(true);
+    resolveSecurityChallengeSignal?.(securityChallengeError);
+    if (onProgress) {
+      onProgress({
+        phase: "platform_safety_block",
+        message: securityChallengeError.message,
+        error: {
+          code: securityChallengeError.code,
+          message: securityChallengeError.message,
+          category: securityChallengeError.category,
+          securityBlocked: true,
+          platformSafetyBlocked: true,
+          requiresManualAction: true,
+        },
+        stopKeyword: true,
+        stopBatch: true,
+        requiresManualAction: true,
+      });
+    }
+    return securityChallengeError;
+  };
   const assertNoServiceAbnormal = () => {
     if (serviceAbnormalError) {
       throw serviceAbnormalError;
@@ -107,18 +144,105 @@ export async function captureDouyinKeywordNotes({
       throw stopForServiceAbnormal(error);
     }
   };
-  const waitWithServiceAbnormalGuard = async (promise) => {
+  const assertNoSecurityChallenge = () => {
+    if (securityChallengeError) {
+      throw securityChallengeError;
+    }
+    try {
+      assertNoDouyinSearchSecurityChallengePage();
+    } catch (error) {
+      throw stopForSecurityChallenge(error);
+    }
+  };
+  const assertNoBlockingPage = () => {
+    assertNoSecurityChallenge();
+    assertNoServiceAbnormal();
+  };
+  const preserveMountedResultsAfterSecurityChallenge = () => {
+    const expectedKeyword = normalizeKeyword(keyword);
+    let mountedKeyword = "";
+    try {
+      mountedKeyword = normalizeKeyword(
+        extractKeywordFromUrl(window.location.href) ||
+          getText(
+            DOUYIN_DOM_PROFILE.searchResults.fields.searchInput,
+            document,
+          ),
+      );
+    } catch {
+      mountedKeyword = "";
+    }
+
+    // A challenge may leave the previous keyword's virtualized cards mounted.
+    // Never persist those cards under the new keyword unless the live page still
+    // identifies the same search. Existing checkpoints in noteMap remain safe.
+    if (
+      !mountedKeyword ||
+      (expectedKeyword && mountedKeyword !== expectedKeyword)
+    ) {
+      return partialCapturePayload;
+    }
+
+    const normalizedMinLikes = normalizeNonNegativeInteger(minLikes, 0);
+    const normalizedMaxDetectedItems = normalizePositiveInteger(
+      maxDetectedItems ?? maxItems,
+      100,
+    );
+    const searchRoot = resolveSectionRoot(
+      DOUYIN_DOM_PROFILE,
+      "searchResults",
+    );
+    mergeNotesIntoMap(
+      noteMap,
+      extractDouyinSearchCards(searchRoot),
+      normalizedMaxDetectedItems,
+    );
+    const allItems = Array.from(noteMap.values());
+    const filteredItems = allItems.filter(
+      (item) => Number(item.likes || 0) >= normalizedMinLikes,
+    );
+    const items = filteredItems.slice(0, normalizedMaxDetectedItems);
+    if (items.length === 0) {
+      return partialCapturePayload;
+    }
+
+    partialCapturePayload = {
+      platform: "douyin",
+      keyword: expectedKeyword || mountedKeyword,
+      searchUrl: window.location.href,
+      totalCount: items.length,
+      rawTotalCount: allItems.length,
+      minLikes: normalizedMinLikes,
+      minInteraction: normalizedMinLikes,
+      sortDimension: DEFAULT_SORT_DIMENSION,
+      sortDimensionLabel: "点赞",
+      sortDimensionSource: "douyin_default",
+      maxDetectedItems: normalizedMaxDetectedItems,
+      filteredCount: items.length,
+      filteredBeforeLimitCount: filteredItems.length,
+      items,
+      captureTimestamp: Date.now(),
+      recoveredFromMountedResults: true,
+    };
+    return partialCapturePayload;
+  };
+  const waitWithPageGuard = async (promise) => {
     const outcome = await Promise.race([
       Promise.resolve(promise).then(
         (value) => ({value}),
         (error) => ({error}),
       ),
       serviceAbnormalSignal.then((error) => ({error})),
+      securityChallengeSignal.then((error) => ({error})),
     ]);
     if (outcome?.error) {
+      // A service-abnormal state and the verification overlay can be mounted in
+      // the same render turn. Safety must win the race so the batch cannot
+      // treat the page as a retryable single-keyword failure and search again.
+      assertNoSecurityChallenge();
       throw outcome.error;
     }
-    assertNoServiceAbnormal();
+    assertNoBlockingPage();
     return outcome?.value;
   };
   const serviceAbnormalObserver =
@@ -127,12 +251,17 @@ export async function captureDouyinKeywordNotes({
         stopForServiceAbnormal(error);
       },
     });
+  const securityChallengeObserver =
+    observeDouyinSearchSecurityChallengePage({
+      onDetected: (error) => {
+        stopForSecurityChallenge(error);
+      },
+    });
 
   try {
-    assertNoServiceAbnormal();
-    await waitWithServiceAbnormalGuard(wait(1200));
-    assertNoCaptchaPage();
-    await waitWithServiceAbnormalGuard(
+    assertNoBlockingPage();
+    await waitWithPageGuard(wait(1200));
+    await waitWithPageGuard(
       ensureSectionReady(DOUYIN_DOM_PROFILE, "searchResults"),
     );
 
@@ -177,7 +306,6 @@ export async function captureDouyinKeywordNotes({
       DEFAULT_CONFIG.MAX_SCROLL_TIMES,
     );
 
-    const noteMap = new Map();
     let progressStats = {
       detectedCount: 0,
       qualifiedCount: 0,
@@ -210,6 +338,29 @@ export async function captureDouyinKeywordNotes({
         (item) => Number(item.likes || 0) >= normalizedMinLikes,
       );
       return filteredItems.slice(0, normalizedMaxDetectedItems);
+    };
+
+    const updatePartialCapturePayload = () => {
+      const allItems = Array.from(noteMap.values());
+      const items = buildFilteredItems();
+      partialCapturePayload = {
+        platform: "douyin",
+        keyword: resolvedKeyword,
+        searchUrl: window.location.href,
+        totalCount: items.length,
+        rawTotalCount: allItems.length,
+        minLikes: normalizedMinLikes,
+        minInteraction: normalizedMinLikes,
+        sortDimension: DEFAULT_SORT_DIMENSION,
+        sortDimensionLabel: "点赞",
+        sortDimensionSource: "douyin_default",
+        maxDetectedItems: normalizedMaxDetectedItems,
+        filteredCount: items.length,
+        filteredBeforeLimitCount: progressStats.qualifiedCount,
+        items,
+        captureTimestamp: Date.now(),
+      };
+      return partialCapturePayload;
     };
 
     const emitListCheckpoint = () => {
@@ -255,7 +406,7 @@ export async function captureDouyinKeywordNotes({
     };
 
     const collectDetectedNotes = () => {
-      assertNoServiceAbnormal();
+      assertNoBlockingPage();
       mergeNotesIntoMap(
         noteMap,
         extractDouyinSearchCards(searchRoot),
@@ -270,6 +421,7 @@ export async function captureDouyinKeywordNotes({
         qualifiedCount,
         filteredCount: Math.min(qualifiedCount, normalizedMaxDetectedItems),
       };
+      updatePartialCapturePayload();
       emitListCheckpoint();
       return progressStats.detectedCount;
     };
@@ -290,9 +442,9 @@ export async function captureDouyinKeywordNotes({
       waitMinMs: waitRange.min,
       waitMaxMs: waitRange.max,
       scrollStep: async ({ noNewContentCount = 0 } = {}) => {
-        assertNoServiceAbnormal();
+        assertNoBlockingPage();
         await scrollDouyinSearchResults(searchRoot, { noNewContentCount });
-        assertNoServiceAbnormal();
+        assertNoBlockingPage();
       },
       stopWhen: ({ currentContentCount, noNewContentCount }) => {
         if (progressStats.detectedCount >= normalizedMaxDetectedItems) {
@@ -325,13 +477,13 @@ export async function captureDouyinKeywordNotes({
       resetCancelOnStart: false,
     });
 
-    assertNoServiceAbnormal();
+    assertNoBlockingPage();
     if (isCanceled()) {
       throw new Error("采集已取消");
     }
 
     collectDetectedNotes();
-    assertNoServiceAbnormal();
+    assertNoBlockingPage();
     const allItems = Array.from(noteMap.values());
     const filteredItems = allItems.filter(
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
@@ -434,15 +586,37 @@ export async function captureDouyinKeywordNotes({
     const errorCode =
       String(error?.code || "").trim() ||
       (isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED");
+    const securityChallenge = isDouyinSearchSecurityChallengeError(error);
+    if (securityChallenge) {
+      try {
+        preserveMountedResultsAfterSecurityChallenge();
+      } catch (preserveError) {
+        // Preservation is best-effort and must never hide the original safety
+        // signal; otherwise the batch could downgrade to a generic retryable
+        // capture failure and continue searching behind the challenge.
+        console.warn(
+          "[Douyin][KeywordSearch] Preserve mounted results failed:",
+          preserveError,
+        );
+      }
+    }
+    const partialPayload =
+      securityChallenge &&
+      Array.isArray(partialCapturePayload?.items) &&
+      partialCapturePayload.items.length > 0
+        ? partialCapturePayload
+        : null;
     return {
       ok: false,
+      partial: Boolean(partialPayload),
       fatal: Boolean(error?.fatal),
       stopBatch: Boolean(error?.stopBatch),
       securityBlocked: Boolean(error?.securityBlocked),
+      platformSafetyBlocked: Boolean(error?.platformSafetyBlocked),
       requiresManualAction: Boolean(error?.requiresManualAction),
       platform: "douyin",
       type: SYNC_TYPE.KEYWORD_NOTES,
-      data: null,
+      data: partialPayload,
       meta: {
         platform: "douyin",
         sourceUrl: window.location.href,
@@ -457,6 +631,7 @@ export async function captureDouyinKeywordNotes({
         fatal: Boolean(error?.fatal),
         stopBatch: Boolean(error?.stopBatch),
         securityBlocked: Boolean(error?.securityBlocked),
+        platformSafetyBlocked: Boolean(error?.platformSafetyBlocked),
         requiresManualAction: Boolean(error?.requiresManualAction),
         retryable:
           typeof error?.retryable === "boolean"
@@ -466,14 +641,7 @@ export async function captureDouyinKeywordNotes({
     };
   } finally {
     serviceAbnormalObserver?.disconnect?.();
-  }
-}
-
-function assertNoCaptchaPage() {
-  const title = cleanText(document.title || "");
-  const bodyText = cleanText(document.body?.innerText || "");
-  if (/验证码中间页/i.test(title) || /请完成下列验证后继续:/i.test(bodyText)) {
-    throw new Error("当前页面触发抖音验证码或风险中间页");
+    securityChallengeObserver?.disconnect?.();
   }
 }
 

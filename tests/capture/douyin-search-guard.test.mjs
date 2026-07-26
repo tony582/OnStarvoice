@@ -3,11 +3,17 @@ import test from "node:test";
 
 import {
   createDouyinSearchServiceAbnormalError,
+  createDouyinSearchSecurityChallengeError,
   DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE,
+  DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE,
   findDouyinSearchServiceAbnormalNode,
+  findDouyinSearchSecurityChallengeNode,
   isDouyinSearchServiceAbnormalCandidate,
   isDouyinSearchServiceAbnormalText,
+  isDouyinSearchSecurityChallengeCandidate,
+  isDouyinSearchSecurityChallengeText,
   observeDouyinSearchServiceAbnormalPage,
+  observeDouyinSearchSecurityChallengePage,
 } from "../../utils/capture/douyin-search-guard.js";
 
 const searchUrl =
@@ -20,6 +26,7 @@ class FakeNode {
     insideResultCard = false,
     resultCardMarker = "",
     resultCardId = "",
+    attributes = {},
     style = null,
     hidden = false,
     ariaHidden = "",
@@ -32,6 +39,9 @@ class FakeNode {
     this.insideResultCard = insideResultCard;
     this.resultCardMarker = resultCardMarker;
     this.resultCardId = resultCardId;
+    this.attributes = {...attributes};
+    this.id = attributes.id || "";
+    this.className = attributes.class || "";
     this.hidden = hidden;
     this.ariaHidden = ariaHidden;
     this.parentElement = parentElement;
@@ -72,7 +82,7 @@ class FakeNode {
     if (name === "data-id" || name === "data-item-id") {
       return this.resultCardId;
     }
-    return "";
+    return this.attributes[name] || "";
   }
 
   closest(selector) {
@@ -259,4 +269,218 @@ test("the structured error stops only the current keyword and remains retryable"
   assert.equal(error.fatal, false);
   assert.equal(error.retryable, true);
   assert.equal(error.keywordScoped, true);
+});
+
+test("Douyin semantic image verification copy is a high-confidence security challenge", () => {
+  const challengeText =
+    "能满足人的口渴的东西 请选择所有符合上述描述的图片，并拖拽到下方 拖拽到这里 提交";
+  assert.equal(
+    isDouyinSearchSecurityChallengeText({text: challengeText}),
+    true,
+  );
+  assert.equal(
+    isDouyinSearchSecurityChallengeText({
+      text: "请选择一张喜欢的图片并提交",
+    }),
+    false,
+    "generic image copy must not stop a task",
+  );
+  assert.equal(
+    isDouyinSearchSecurityChallengeText({title: "验证码中间页"}),
+    true,
+  );
+});
+
+test("the security challenge must be visible, on Douyin, and outside result cards", () => {
+  const text =
+    "请选择所有符合上文描述的图片，并拖拽到下方 拖拽到这里";
+  assert.equal(
+    isDouyinSearchSecurityChallengeCandidate({
+      pageUrl: searchUrl,
+      text,
+      visible: true,
+      insideResultCard: false,
+    }),
+    true,
+  );
+  assert.equal(
+    isDouyinSearchSecurityChallengeCandidate({
+      pageUrl: searchUrl,
+      text,
+      visible: false,
+      insideResultCard: false,
+    }),
+    false,
+  );
+  assert.equal(
+    isDouyinSearchSecurityChallengeCandidate({
+      pageUrl: searchUrl,
+      text,
+      visible: true,
+      insideResultCard: true,
+    }),
+    false,
+  );
+  assert.equal(
+    isDouyinSearchSecurityChallengeCandidate({
+      pageUrl: "https://www.douyin.com/verify?from=search",
+      text,
+      visible: true,
+      insideResultCard: false,
+    }),
+    true,
+    "a Douyin verification redirect must not downgrade to a retryable page failure",
+  );
+  assert.equal(
+    isDouyinSearchSecurityChallengeCandidate({
+      pageUrl: "https://example.com/verify",
+      text,
+      visible: true,
+      insideResultCard: false,
+    }),
+    false,
+  );
+});
+
+test("the security guard detects the modal even when stale result cards remain mounted", () => {
+  const staleCard = new FakeNode({
+    text: "请选择所有符合上述描述的图片，并拖拽到下方 拖拽到这里",
+    insideResultCard: true,
+  });
+  const challenge = new FakeNode({
+    text: "请选择所有符合上述描述的图片，并拖拽到下方 拖拽到这里",
+  });
+  const root = new FakeNode({
+    text: "搜索页",
+    children: [staleCard, challenge],
+  });
+  assert.equal(
+    findDouyinSearchSecurityChallengeNode({root, pageUrl: searchUrl}),
+    challenge,
+  );
+});
+
+test("a visible verification iframe is treated as a security challenge", () => {
+  const challengeFrame = new FakeNode({
+    attributes: {
+      src: "https://verify.douyin.com/captcha/index",
+      title: "verification challenge",
+    },
+  });
+  const root = new FakeNode({
+    text: "搜索页",
+    children: [challengeFrame],
+  });
+  assert.equal(
+    findDouyinSearchSecurityChallengeNode({root, pageUrl: searchUrl}),
+    challengeFrame,
+  );
+});
+
+test("the structured security challenge requires human action and stops the batch", () => {
+  const error = createDouyinSearchSecurityChallengeError({
+    pageUrl: searchUrl,
+  });
+  assert.equal(error.code, DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE);
+  assert.equal(error.securityBlocked, true);
+  assert.equal(error.platformSafetyBlocked, true);
+  assert.equal(error.requiresManualAction, true);
+  assert.equal(error.stopBatch, true);
+  assert.equal(error.fatal, true);
+  assert.equal(error.retryable, false);
+  assert.equal(error.keywordScoped, false);
+});
+
+test("a newly visible semantic image challenge is observed immediately", () => {
+  const OriginalMutationObserver = globalThis.MutationObserver;
+  let observerCallback = null;
+  class FakeMutationObserver {
+    constructor(callback) {
+      observerCallback = callback;
+    }
+
+    observe() {}
+
+    disconnect() {}
+  }
+  globalThis.MutationObserver = FakeMutationObserver;
+  try {
+    const modal = new FakeNode({
+      text: "请选择所有符合上述描述的图片，并拖拽到下方 拖拽到这里",
+      visible: false,
+    });
+    const root = new FakeNode({text: "搜索页", children: [modal]});
+    let detected = null;
+    const observer = observeDouyinSearchSecurityChallengePage({
+      root,
+      pageUrl: searchUrl,
+      onDetected: (error) => {
+        detected = error;
+      },
+    });
+    assert.equal(detected, null);
+    modal.rect = {width: 320, height: 460};
+    observerCallback([{type: "attributes", target: modal}]);
+    assert.equal(
+      detected?.code,
+      DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE,
+    );
+    observer.disconnect();
+  } finally {
+    globalThis.MutationObserver = OriginalMutationObserver;
+  }
+});
+
+test("separately rendered instruction and drop-target siblings are detected from their shared container", () => {
+  const OriginalMutationObserver = globalThis.MutationObserver;
+  let observerCallback = null;
+  class FakeMutationObserver {
+    constructor(callback) {
+      observerCallback = callback;
+    }
+
+    observe() {}
+
+    disconnect() {}
+  }
+  globalThis.MutationObserver = FakeMutationObserver;
+  try {
+    const instruction = new FakeNode({
+      text: "请选择所有符合上述描述的图片",
+    });
+    const dropTarget = new FakeNode({text: "拖拽到这里"});
+    const modal = new FakeNode({
+      text: "请选择所有符合上述描述的图片，并拖拽到下方",
+      visible: false,
+      children: [instruction, dropTarget],
+    });
+    instruction.parentElement = modal;
+    dropTarget.parentElement = modal;
+    const root = new FakeNode({text: "搜索页", children: [modal]});
+    let detected = null;
+    const observer = observeDouyinSearchSecurityChallengePage({
+      root,
+      pageUrl: searchUrl,
+      onDetected: (error) => {
+        detected = error;
+      },
+    });
+
+    assert.equal(detected, null);
+    modal.rect = {width: 320, height: 460};
+    observerCallback([
+      {
+        type: "childList",
+        target: modal,
+        addedNodes: [dropTarget],
+      },
+    ]);
+    assert.equal(
+      detected?.code,
+      DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE,
+    );
+    observer.disconnect();
+  } finally {
+    globalThis.MutationObserver = OriginalMutationObserver;
+  }
 });

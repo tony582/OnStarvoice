@@ -108,7 +108,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     return params
   }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords, dateFrom, dateTo, dateBasis])
 
-  const load = useCallback(async (page = 1) => {
+  const load = useCallback((page = 1) => Promise.resolve().then(async () => {
     setLoading(true)
     setError('')
     try {
@@ -123,7 +123,7 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     } finally {
       setLoading(false)
     }
-  }, [filterParams, noun])
+  }), [filterParams, noun])
 
   const exportXlsx = async () => {
     setExporting(true)
@@ -132,7 +132,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
     finally { setExporting(false) }
   }
 
-  useEffect(() => { load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords, dateFrom, dateTo, dateBasis]) // eslint-disable-line react-hooks/exhaustive-deps
+  // 文本搜索保留“回车/按钮提交”，其余筛选项仍即时刷新。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { void load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords, dateFrom, dateTo, dateBasis])
 
   // 点表头排序:点未激活列 → 降序;再点 → 升/降切换
   const toggleSort = (field: LeadSortField) =>

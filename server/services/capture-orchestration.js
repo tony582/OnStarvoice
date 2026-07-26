@@ -400,6 +400,17 @@ export function normalizeOrchestrationRequest(
   const schedule = executionMode === 'unattended_plan'
     ? normalizeOrchestrationSchedule(source.schedule || source)
     : null;
+  const rawRecoveryPolicy = object(
+    source.recoveryPolicy || source.recovery_policy,
+  );
+  const recoveryPolicy = {
+    allowIdleAgentHandoff: boolean(
+      rawRecoveryPolicy.allowIdleAgentHandoff ??
+      rawRecoveryPolicy.allow_idle_agent_handoff,
+      true,
+    ),
+    platformSafetyMode: 'manual_confirmed',
+  };
 
   return {
     requestKey: text(
@@ -432,6 +443,7 @@ export function normalizeOrchestrationRequest(
       ),
       maxRounds: schedule?.maxRounds || 1,
       roundGapMin: schedule?.roundGapMin || 10,
+      recoveryPolicy,
       ...(schedule ? schedule : {}),
       ...(hasCaptureSettings
         ? {captureSettings: normalizeCaptureSettings(source.captureSettings)}

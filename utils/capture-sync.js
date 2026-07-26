@@ -85,8 +85,11 @@ import {
 } from './capture/douyin-author.js';
 import {
   createDouyinSearchServiceAbnormalError,
+  createDouyinSearchSecurityChallengeError,
   DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE,
+  DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE,
   isDouyinSearchServiceAbnormalError,
+  isDouyinSearchSecurityChallengeError,
 } from './capture/douyin-search-guard.js';
 import {
   evaluateRelevancePrefilterRecords,
@@ -2453,15 +2456,37 @@ async function captureAndSaveInTab({
     });
 
     if (!captureResult?.ok) {
+      const partialItems = Array.isArray(captureResult?.data?.items)
+        ? captureResult.data.items
+        : [];
+      if (captureResult?.partial === true && partialItems.length > 0) {
+        const partialSaveResult = await saveCaptureResultRecords(
+          {
+            ...captureResult,
+            ok: true,
+            error: null,
+          },
+          {session: checkpointSession},
+        );
+        savedRecords = Array.isArray(partialSaveResult?.savedRecords)
+          ? partialSaveResult.savedRecords
+          : [];
+        traceBindings = Array.isArray(partialSaveResult?.traceBindings)
+          ? partialSaveResult.traceBindings
+          : [];
+        captureCacheStats = partialSaveResult?.cacheStats || null;
+      }
       if (checkpointSession?.queue) {
         await checkpointSession.queue.catch(() => null);
       }
-      captureCacheStats = createListCaptureCacheStats(checkpointSession);
+      captureCacheStats =
+        captureCacheStats || createListCaptureCacheStats(checkpointSession);
       const partialRecordIds =
         collectListCaptureSessionRecordIds(checkpointSession);
-      traceBindings = sortCaptureTraceBindings(
-        checkpointSession?.traceBindings || [],
-      );
+      traceBindings = sortCaptureTraceBindings([
+        ...traceBindings,
+        ...(checkpointSession?.traceBindings || []),
+      ]);
       await sendCaptureTraceBindingsToTab(tabId, traceBindings);
       finishListCaptureCheckpointSession(checkpointSession);
       await updateCapture({
@@ -2476,7 +2501,7 @@ async function captureAndSaveInTab({
         ok: false,
         phase: 'capture',
         captureResult,
-        savedRecords: [],
+        savedRecords,
         recordIds: partialRecordIds,
         traceBindings,
         captureCacheStats,
@@ -12223,7 +12248,7 @@ async function waitMsWithStopAndTick(
       remainingSeconds !== lastRemainingSeconds
     ) {
       lastRemainingSeconds = remainingSeconds;
-      onTick(remainingMs);
+      await Promise.resolve(onTick(remainingMs));
     }
     await waitMs(Math.min(Math.max(100, Number(tickMs) || 1000), remainingMs));
   }
@@ -13442,6 +13467,7 @@ function hasActiveBatchSearchFilters(searchFilters = {}) {
 // 保留结构化的单关键词错误，由批处理跳过本词并继续，而不是误判为账号风控。
 async function applySearchFiltersInTab(tabId, searchFilters = {}) {
   try {
+    await assertNoDouyinSearchSecurityChallengeInTab(tabId);
     const response = await chrome.runtime.sendMessage({
       type: MESSAGE_TYPE.RELAY_TO_CONTENT,
       tabId: Number(tabId),
@@ -13459,12 +13485,20 @@ async function applySearchFiltersInTab(tabId, searchFilters = {}) {
         message: responseError?.message,
       });
     }
+    if (isDouyinSearchSecurityChallengeError(responseError)) {
+      throw createDouyinSearchSecurityChallengeError({
+        message: responseError?.message,
+      });
+    }
     if (responseError) {
       return null;
     }
     return contentResponse?.data ?? contentResponse ?? null;
   } catch (error) {
-    if (isDouyinSearchServiceAbnormalError(error)) {
+    if (
+      isDouyinSearchServiceAbnormalError(error) ||
+      isDouyinSearchSecurityChallengeError(error)
+    ) {
       throw error;
     }
     return null;
@@ -13704,6 +13738,11 @@ export async function batchCaptureByKeywords({
           )
           .find(Boolean) || '',
       securityBlocked: isUnattendedSafetyBlock(safetyEvidence),
+      platformSafetyBlocked: candidates.some(
+        (value) =>
+          value?.platformSafetyBlocked === true ||
+          value?.error?.platformSafetyBlocked === true,
+      ),
       requiresManualAction: candidates.some(
         (value) =>
           value?.requiresManualAction === true ||
@@ -13774,6 +13813,9 @@ export async function batchCaptureByKeywords({
     }
 
     try {
+      if (isDouyinPlatform(platform)) {
+        await assertNoDouyinSearchSecurityChallengeInTab(runnerTabId);
+      }
       // 构建搜索 URL
       const searchUrl = buildKeywordSearchUrl(keyword, platform, baseSearchUrl);
 
@@ -14076,6 +14118,7 @@ export async function batchCaptureByKeywords({
           errorCode: captureFailure.code,
           errorCategory: captureFailure.category,
           securityBlocked: captureFailure.securityBlocked,
+          platformSafetyBlocked: captureFailure.platformSafetyBlocked,
           requiresManualAction: captureFailure.requiresManualAction,
         };
         results.push(keywordResult);
@@ -14135,6 +14178,7 @@ export async function batchCaptureByKeywords({
             errorCode: captureFailure.code,
             errorCategory: captureFailure.category,
             securityBlocked: captureFailure.securityBlocked,
+            platformSafetyBlocked: captureFailure.platformSafetyBlocked,
             requiresManualAction: captureFailure.requiresManualAction,
           };
           results.push(keywordResult);
@@ -14151,6 +14195,7 @@ export async function batchCaptureByKeywords({
             errorCode: captureFailure.code,
             errorCategory: captureFailure.category,
             securityBlocked: captureFailure.securityBlocked,
+            platformSafetyBlocked: captureFailure.platformSafetyBlocked,
             requiresManualAction: captureFailure.requiresManualAction,
           };
           results.push(keywordResult);
@@ -14205,6 +14250,7 @@ export async function batchCaptureByKeywords({
         errorCode: captureFailure.code,
         errorCategory: captureFailure.category,
         securityBlocked: captureFailure.securityBlocked,
+        platformSafetyBlocked: captureFailure.platformSafetyBlocked,
         requiresManualAction: captureFailure.requiresManualAction,
       };
       results.push(keywordResult);
@@ -14224,6 +14270,9 @@ export async function batchCaptureByKeywords({
       })
     ) {
       keywordResult.securityBlocked = true;
+      keywordResult.platformSafetyBlocked = Boolean(
+        keywordResult.platformSafetyBlocked,
+      );
       securityBlocked = true;
       canceled = true;
       if (!blockingError) {
@@ -14238,6 +14287,9 @@ export async function batchCaptureByKeywords({
           ).trim(),
           category: String(keywordResult.errorCategory || '').trim(),
           securityBlocked: true,
+          platformSafetyBlocked: Boolean(
+            keywordResult.platformSafetyBlocked,
+          ),
           requiresManualAction: Boolean(
             keywordResult.requiresManualAction,
           ),
@@ -14458,7 +14510,10 @@ export async function batchCaptureByKeywords({
         Math.random() *
           (BATCH_INTER_KEYWORD_DELAY_MAX_MS - BATCH_INTER_KEYWORD_DELAY_MIN_MS);
       await activateTabForReliableTimer(waitForegroundTabId);
-      const reportDelayProgress = (remainingMs = delay) => {
+      const reportDelayProgress = async (remainingMs = delay) => {
+        if (isDouyinPlatform(platform)) {
+          await assertNoDouyinSearchSecurityChallengeInTab(runnerTabId);
+        }
         if (!onProgress) {
           return;
         }
@@ -14477,14 +14532,49 @@ export async function batchCaptureByKeywords({
           }),
         });
       };
-      reportDelayProgress(delay);
       try {
+        await reportDelayProgress(delay);
         await waitMsWithStopAndTick(delay, shouldStop, {
           errorMessage: 'BATCH_CAPTURE_CANCELED',
           tickMs: 1000,
           onTick: reportDelayProgress,
         });
       } catch (error) {
+        if (isDouyinSearchSecurityChallengeError(error)) {
+          securityBlocked = true;
+          canceled = true;
+          blockingError = {
+            code: String(
+              error?.code || DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE,
+            ).trim(),
+            message: String(
+              error?.message ||
+                '检测到抖音图片安全验证，已停止后续搜索',
+            ).trim(),
+            category: String(
+              error?.category || 'platform_safety_block',
+            ).trim(),
+            securityBlocked: true,
+            platformSafetyBlocked: true,
+            requiresManualAction: true,
+            retryable: false,
+          };
+          if (onProgress) {
+            onProgress({
+              current: i + 1,
+              total: keywords.length,
+              keyword,
+              phase: 'needs_action',
+              runnerTabId,
+              securityBlocked: true,
+              platformSafetyBlocked: true,
+              requiresManualAction: true,
+              error: blockingError,
+              message: blockingError.message,
+            });
+          }
+          break;
+        }
         if (isBatchCaptureCanceledError(error)) {
           canceled = true;
           break;
@@ -14505,6 +14595,14 @@ export async function batchCaptureByKeywords({
         : canceled
           ? 'canceled'
           : 'done',
+      securityBlocked: terminalNeedsAction,
+      platformSafetyBlocked: Boolean(
+        blockingError?.platformSafetyBlocked,
+      ),
+      requiresManualAction: Boolean(
+        terminalNeedsAction || blockingError?.requiresManualAction,
+      ),
+      error: terminalNeedsAction ? blockingError : null,
       message: terminalNeedsAction
         ? blockingError?.message ||
           `检测到平台异常，已停止整批任务：已处理 ${successCount + failedCount}/${keywords.length}`
@@ -14518,6 +14616,7 @@ export async function batchCaptureByKeywords({
     ok: !canceled && failedCount === 0,
     canceled,
     securityBlocked,
+    platformSafetyBlocked: Boolean(blockingError?.platformSafetyBlocked),
     requiresManualAction: Boolean(
       securityBlocked || blockingError?.requiresManualAction,
     ),
@@ -14851,6 +14950,7 @@ async function submitKeywordSearchInTab(
   if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
     return false;
   }
+  await assertNoDouyinSearchSecurityChallengeInTab(normalizedTabId);
 
   const guardResponse = await chrome.runtime
     .sendMessage({
@@ -14868,6 +14968,11 @@ async function submitKeywordSearchInTab(
         : null;
   if (isDouyinSearchServiceAbnormalError(guardError)) {
     throw createDouyinSearchServiceAbnormalError({
+      message: guardError?.message,
+    });
+  }
+  if (isDouyinSearchSecurityChallengeError(guardError)) {
+    throw createDouyinSearchSecurityChallengeError({
       message: guardError?.message,
     });
   }
@@ -15251,6 +15356,9 @@ async function waitForKeywordSearchTargetReadyInTab(
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('BATCH_CAPTURE_CANCELED');
     }
+    if (isDouyinPlatform(navigationContext?.platform)) {
+      await assertNoDouyinSearchSecurityChallengeInTab(tabId);
+    }
     if (await isKeywordSearchTargetReadyInTab(tabId, navigationContext)) {
       return true;
     }
@@ -15539,6 +15647,149 @@ function inspectKeywordSearchPageUrl(
   }
 }
 
+async function readDouyinSearchSecurityChallengeStateInTab(tabId) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return {detected: false, pageUrl: ''};
+  }
+  return chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: () => {
+        const pageUrl = String(window.location.href || '');
+        let douyinPage = false;
+        try {
+          const url = new URL(pageUrl);
+          const hostname = String(url.hostname || '').toLowerCase();
+          douyinPage =
+            hostname === 'douyin.com' || hostname.endsWith('.douyin.com');
+        } catch {
+          douyinPage = false;
+        }
+        if (!douyinPage) {
+          return {detected: false, pageUrl};
+        }
+
+        const normalize = (value) =>
+          String(value || '').trim().replace(/\s+/gu, '');
+        const isChallengeText = (title, text) => {
+          const normalizedTitle = normalize(title);
+          const normalizedText = normalize(text);
+          if (/验证码中间页/iu.test(normalizedTitle)) return true;
+          if (/请完成下列验证后继续[:：]?/iu.test(normalizedText)) {
+            return true;
+          }
+          return (
+            /请选择所有符合(?:上文|上述|下列)?描述的图片/iu.test(
+              normalizedText,
+            ) &&
+            /(?:并)?拖拽到(?:下方|这里)/iu.test(normalizedText)
+          );
+        };
+        if (isChallengeText(document.title, '')) {
+          return {
+            detected: true,
+            pageUrl,
+            evidence: 'challenge_title',
+          };
+        }
+
+        const isVisible = (node) => {
+          if (!(node instanceof Element)) return false;
+          const rect = node.getBoundingClientRect();
+          if (rect.width <= 4 || rect.height <= 4) return false;
+          let current = node;
+          while (current && current.nodeType !== Node.DOCUMENT_NODE) {
+            if (
+              current.hidden === true ||
+              String(current.getAttribute?.('aria-hidden') || '')
+                .toLowerCase() === 'true'
+            ) {
+              return false;
+            }
+            const style = window.getComputedStyle(current);
+            if (
+              style.display === 'none' ||
+              style.visibility === 'hidden' ||
+              Number(style.opacity || 1) <= 0.01
+            ) {
+              return false;
+            }
+            current = current.parentElement;
+          }
+          return true;
+        };
+        const resultCardSelector = [
+          '.search-result-card',
+          '[id^="waterfall_item_"]',
+          '[data-e2e-aweme-id]',
+          '[data-aweme-id]',
+          '[data-awemeid]',
+          '[data-modal-id]',
+          'a[href*="/video/"]',
+          'a[href*="/note/"]',
+          'a[href*="modal_id="]',
+        ].join(',');
+        const challengeNode = [document.body]
+          .concat(
+            Array.from(
+              document.querySelectorAll(
+                '[role="dialog"], dialog, section, aside, h1, h2, h3, h4, p, span, div',
+              ),
+            ),
+          )
+          .find((node) => {
+            if (!isVisible(node)) return false;
+            if (node?.closest?.(resultCardSelector)) return false;
+            return isChallengeText(
+              document.title,
+              node?.innerText || node?.textContent || '',
+            );
+          });
+        if (challengeNode) {
+          return {
+            detected: true,
+            pageUrl,
+            evidence: 'semantic_image_challenge',
+          };
+        }
+
+        const challengeFrame = Array.from(
+          document.querySelectorAll('iframe'),
+        ).find((node) => {
+          if (!isVisible(node)) return false;
+          const evidence = normalize(
+            [
+              node.getAttribute?.('src'),
+              node.getAttribute?.('title'),
+              node.getAttribute?.('name'),
+              node.id,
+              node.className,
+            ].join(' '),
+          ).toLowerCase();
+          return /captcha|verify|verification|challenge/iu.test(evidence);
+        });
+        return {
+          detected: Boolean(challengeFrame),
+          pageUrl,
+          evidence: challengeFrame ? 'challenge_frame' : '',
+        };
+      },
+    })
+    .then(([result]) => result?.result || {detected: false, pageUrl: ''})
+    .catch(() => ({detected: false, pageUrl: ''}));
+}
+
+async function assertNoDouyinSearchSecurityChallengeInTab(tabId) {
+  const state = await readDouyinSearchSecurityChallengeStateInTab(tabId);
+  if (!state?.detected) return state;
+  const error = createDouyinSearchSecurityChallengeError({
+    pageUrl: state.pageUrl,
+  });
+  error.evidence = String(state.evidence || '');
+  throw error;
+}
+
 async function waitForKeywordSearchResultsInTab(
   tabId,
   platform = '',
@@ -15572,6 +15823,9 @@ async function waitForKeywordSearchResultsInTab(
   while (Date.now() - startedAt < timeout) {
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('BATCH_CAPTURE_CANCELED');
+    }
+    if (String(platform || '').trim().toLowerCase() === 'douyin') {
+      await assertNoDouyinSearchSecurityChallengeInTab(normalizedTabId);
     }
 
     const snapshot = await chrome.scripting

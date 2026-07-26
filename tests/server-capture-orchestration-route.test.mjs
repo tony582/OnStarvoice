@@ -38,6 +38,7 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     "'/orchestrations/:id/dispatch'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
+    "'/orchestrations/:id/resolve-attention'",
   ]) {
     const start = route.indexOf(marker);
     assert.notEqual(start, -1);
@@ -213,6 +214,95 @@ test('schedule pause and resume are tenant scoped, idempotent, and never backfil
   assert.doesNotMatch(resume, /\bbackfill\b/u);
 });
 
+test('manual handoff transfers only unstarted whole keywords after the source is settled', () => {
+  const handoff = section(
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+    "router.get(\n  '/orchestrations/:id'",
+  );
+  assert.match(handoff, /normalizeAttentionHandoff/u);
+  assert.match(route, /text\(body\?\.action, 40\) !== 'handoff'/u);
+  assert.match(handoff, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
+  assert.match(handoff, /\['capture_task_global_id', normalized\.requestKey\]/u);
+  assert.match(handoff, /await lockCaptureAgentExecutionSlot\([\s\S]*normalized\.targetAgentId/u);
+  assert.match(handoff, /handoffRequestHash/u);
+  assert.match(handoff, /exactReplay/u);
+  assert.match(
+    handoff,
+    /WHERE id = \$1::uuid AND tenant_id = \$2/u,
+  );
+  assert.doesNotMatch(
+    handoff,
+    /SELECT id FROM capture_tasks WHERE id = \$1::uuid/u,
+    'a foreign-tenant task id must not be exposed through a global probe',
+  );
+  assert.match(handoff, /'idempotency_key_conflict'/u);
+  assert.doesNotMatch(
+    route.slice(
+      route.indexOf('const HANDOFF_SOURCE_FINAL_STATUSES'),
+      route.indexOf('const HANDOFF_TARGET_BUSY_STATUSES'),
+    ),
+    /'superseded'/u,
+  );
+  assert.match(
+    handoff,
+    /sourceTask\.status === 'superseded'[\s\S]*sourceMetadata\.recoveryTaskId[\s\S]*handoff_source_recovery_active/u,
+  );
+  assert.match(
+    handoff,
+    /原设备已经创建恢复任务并继续执行，不能再把相同剩余关键词接力给其他节点/u,
+  );
+  assert.match(handoff, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(sourceTask\.status\)/u);
+  assert.match(
+    handoff,
+    /capture_task_snapshots[\s\S]*snapshot\.status = 'needs_action'[\s\S]*capture_task_events[\s\S]*event\.status = 'needs_action'[\s\S]*parent_event\.payload->>'childTaskId'/u,
+  );
+  assert.match(handoff, /handoff_requires_attention_state/u);
+  assert.match(
+    handoff,
+    /status IN \('pending', 'acknowledged'\)[\s\S]*handoff_source_command_pending/u,
+  );
+  assert.match(handoff, /!item\.started_at/u);
+  assert.match(handoff, /started_at IS NULL/u);
+  assert.match(handoff, /handoff_has_no_unstarted_items/u);
+  assert.match(handoff, /itemRequiresManualSafetyAction\(item\)/u);
+  assert.match(handoff, /handoff_source_has_unresolved_started_items/u);
+  assert.match(handoff, /recoveryPolicy\.allowIdleAgentHandoff === false/u);
+  assert.match(handoff, /handoff_disabled_by_task_policy/u);
+  assert.match(
+    handoff,
+    /SET status = 'failed'[\s\S]*'code', 'handoff_source_security_item_failed'/u,
+  );
+  assert.match(
+    handoff,
+    /capture_task_item_attempts[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(handoff, /settledSourceItemIds/u);
+  assert.match(handoff, /handoff_target_same_as_source/u);
+  assert.match(handoff, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
+  assert.match(handoff, /handoff_target_busy/u);
+  assert.match(
+    route,
+    /HANDOFF_TARGET_BUSY_STATUSES = \[[\s\S]*'interrupted'[\s\S]*'needs_action'/u,
+  );
+  assert.match(handoff, /orchestration_revision = orchestration_revision \+ 1/u);
+  assert.match(handoff, /AND orchestration_revision = \$9/u);
+  assert.match(handoff, /attempt_count = attempt_count \+ 1/u);
+  assert.match(handoff, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(handoff, /handoffConfirmedByUser: true/u);
+  assert.match(
+    handoff,
+    /SET status = 'superseded'[\s\S]*'handoffSourcePreviousStatus'/u,
+  );
+  assert.match(handoff, /error\?\.code === '23505'/u);
+  assert.match(handoff, /'orchestration_handoff'/u);
+  assert.match(handoff, /eventType: 'orchestration_handoff_dispatched'/u);
+  assert.doesNotMatch(
+    handoff,
+    /(?:captcha|securityBlocked)[\s\S]*(?:auto|automatic)/iu,
+    'platform safety challenges must never trigger an automatic handoff',
+  );
+});
+
 test('detail reader is tenant scoped and returns the complete orchestration projection', () => {
   const detail = route.slice(route.indexOf("router.get(\n  '/orchestrations/:id'"));
   assert.match(detail, /parentSelect\(\)/u);
@@ -248,6 +338,7 @@ test('all id-addressed orchestration routes validate UUIDs before database casts
     "'/orchestrations/:id/dispatch'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
+    "'/orchestrations/:id/resolve-attention'",
     "'/orchestrations/:id'",
   ]) {
     const start = route.indexOf(marker);
