@@ -35,7 +35,7 @@ export function IssuesQueue({ initial }: { initial?: Record<string, string> }) {
   const [loading, setLoading] = useState(true)
   const [drawerIssue, setDrawerIssue] = useState<any>(null)
 
-  const load = useCallback(async (page = 1) => {
+  const load = useCallback((page = 1) => Promise.resolve().then(async () => {
     setLoading(true)
     try {
       const params = new URLSearchParams({ limit: '30', page: String(page) })
@@ -45,9 +45,9 @@ export function IssuesQueue({ initial }: { initial?: Record<string, string> }) {
       setPagination(data.pagination || null)
     } catch (err) { console.error(err) }
     finally { setLoading(false) }
-  }, [status])
+  }), [status])
 
-  useEffect(() => { load(1) }, [load])
+  useEffect(() => { void load(1) }, [load])
 
   const updateStatus = async (id: string, next: string) => {
     await api.patch('/issues/' + id, { status: next })

@@ -2523,6 +2523,72 @@ test("manual continuation starts with a fresh automatic recovery budget", async 
   );
 });
 
+test("human-confirmed continuation reopens only the blocked keyword without replaying completed work", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    status: "needs_action",
+    finishedAt: new Date().toISOString(),
+    checkpoint: {
+      schemaVersion: 1,
+      round: 1,
+      activeKeywordIndex: 1,
+      activeKeyword: "关键词二",
+      activePhase: "failed",
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "关键词一",
+          status: "completed",
+          attemptCount: 1,
+          savedCount: 8,
+        },
+        {
+          round: 1,
+          index: 1,
+          keyword: "关键词二",
+          status: "failed",
+          attemptCount: 3,
+          savedCount: 4,
+          errorCode: "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+          errorCategory: "platform_safety_block",
+          securityBlocked: true,
+          requiresManualAction: true,
+          error: "请人工完成验证",
+        },
+      ],
+    },
+    progress: {
+      current: 2,
+      total: 3,
+      keyword: "关键词二",
+    },
+  });
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  const nextCheckpoint =
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint;
+  assert.equal(nextCheckpoint.keywordResults[0].status, "completed");
+  assert.equal(nextCheckpoint.keywordResults[0].savedCount, 8);
+  assert.equal(nextCheckpoint.keywordResults[1].status, "retrying");
+  assert.equal(nextCheckpoint.keywordResults[1].attemptCount, 0);
+  assert.equal(nextCheckpoint.keywordResults[1].savedCount, 4);
+  assert.equal(
+    Object.hasOwn(nextCheckpoint.keywordResults[1], "securityBlocked"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(nextCheckpoint.keywordResults[1], "requiresManualAction"),
+    false,
+  );
+  assert.equal(nextCheckpoint.activePhase, "pending");
+});
+
 test("progress refreshes the business clock but only a durable milestone resets recovery budgets", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness, {

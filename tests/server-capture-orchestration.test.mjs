@@ -36,6 +36,9 @@ test('orchestration input keeps a validated cloud schedule without changing allo
       includeCommentsOnDetailCapture: true,
       detailCommentsMaxDetectedItems: 20,
     },
+    recoveryPolicy: {
+      allowIdleAgentHandoff: false,
+    },
   });
 
   assert.equal(normalized.requestKey, 'request-1');
@@ -54,6 +57,10 @@ test('orchestration input keeps a validated cloud schedule without changing allo
     normalized.taskInput.captureSettings.includeCommentsOnDetailCapture,
     true,
   );
+  assert.deepEqual(normalized.taskInput.recoveryPolicy, {
+    allowIdleAgentHandoff: false,
+    platformSafetyMode: 'manual_confirmed',
+  });
 });
 
 test('custom-date schedules reject malformed dates and normalize accepted dates', () => {

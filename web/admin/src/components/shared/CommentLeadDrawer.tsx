@@ -6,6 +6,35 @@ import { StatusBadge } from '@/components/ui/badge'
 
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 
+function LeadActionButton({
+  icon: Icon,
+  label,
+  status,
+  tone,
+  canWrite,
+  currentStatus,
+  onSetStatus,
+}: {
+  icon: React.ElementType
+  label: string
+  status: string
+  tone?: 'ghost'
+  canWrite: boolean
+  currentStatus?: string
+  onSetStatus: (status: string) => void
+}) {
+  return (
+    <Button
+      variant={tone === 'ghost' ? 'ghost' : 'outline'}
+      size="sm"
+      disabled={!canWrite || currentStatus === status}
+      onClick={() => onSetStatus(status)}
+    >
+      <Icon className="h-3.5 w-3.5" />{label}
+    </Button>
+  )
+}
+
 /**
  * 评论线索详情抽屉(舆情评论 / 销售客资 共用)。
  * 右侧停靠、可拖宽(与内容分诊一致),展示原帖 + 评论全文 + 线索判断 + 处理留痕,底部直接处理。
@@ -63,13 +92,11 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
     ? lead.matched_keywords
     : (() => { try { return JSON.parse(lead.matched_keywords || '[]') } catch { return [] } })()
 
-  const Act = ({ icon: Icon, label, status, tone }: any) => (
-    <Button variant={tone === 'ghost' ? 'ghost' : 'outline'} size="sm"
-      disabled={!canWrite || lead.status === status}
-      onClick={() => onSetStatus(status)}>
-      <Icon className="h-3.5 w-3.5" />{label}
-    </Button>
-  )
+  const actionProps = {
+    canWrite,
+    currentStatus: lead.status,
+    onSetStatus,
+  }
 
   return (
     <div ref={panelRef} style={{ width }} role="dialog" aria-modal="true" aria-label={`${noun}详情`}
@@ -156,15 +183,15 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
         {canWrite && (
           <div className="grid grid-cols-3 items-center gap-2 border-t border-border/50 bg-card px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:flex lg:justify-end sm:px-6 sm:py-3.5">
             {isSales ? <>
-              <Act icon={Footprints} label="跟进" status="following" />
-              <Act icon={CheckCheck} label="处理" status="resolved" />
-              <Act icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
+              <LeadActionButton {...actionProps} icon={Footprints} label="跟进" status="following" />
+              <LeadActionButton {...actionProps} icon={CheckCheck} label="处理" status="resolved" />
+              <LeadActionButton {...actionProps} icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
             </> : bucket === 'archived' ? (
               <span className="col-span-3 text-center text-[12px] text-muted-foreground">已归档,无需操作</span>
             ) : <>
               <Button size="sm" onClick={onDispatch}><Send className="h-3.5 w-3.5" />转工单</Button>
-              <Act icon={CheckCheck} label="归档" status="resolved" />
-              <Act icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
+              <LeadActionButton {...actionProps} icon={CheckCheck} label="归档" status="resolved" />
+              <LeadActionButton {...actionProps} icon={CircleSlash} label="忽略" status="ignored" tone="ghost" />
             </>}
           </div>
         )}

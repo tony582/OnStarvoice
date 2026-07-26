@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useCallback } from 'react'
+import { Fragment, useCallback, useState } from 'react'
 import { Check, Minus, X, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -6,23 +6,32 @@ import { cn } from '@/lib/utils'
  * 列表多选状态。resetKey 在筛选/翻页变化时改变 → 自动清空已选,避免跨页幽灵选中。
  */
 export function useSelection(resetKey: string) {
-  const [selected, setSelected] = useState<Set<string>>(new Set())
-
-  useEffect(() => { setSelected(new Set()) }, [resetKey])
+  const [selection, setSelection] = useState(() => ({
+    resetKey,
+    ids: new Set<string>(),
+  }))
+  const resetSelection = new Set<string>()
+  if (selection.resetKey !== resetKey) {
+    setSelection({ resetKey, ids: resetSelection })
+  }
+  const selected = selection.resetKey === resetKey ? selection.ids : resetSelection
 
   const toggle = useCallback((id: string) => {
-    setSelected(prev => {
-      const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
-      return next
+    setSelection(previous => {
+      const next = new Set(previous.resetKey === resetKey ? previous.ids : [])
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return { resetKey, ids: next }
     })
-  }, [])
+  }, [resetKey])
 
   const setAll = useCallback((ids: string[], checked: boolean) => {
-    setSelected(checked ? new Set(ids) : new Set())
-  }, [])
+    setSelection({ resetKey, ids: checked ? new Set(ids) : new Set() })
+  }, [resetKey])
 
-  const clear = useCallback(() => setSelected(new Set()), [])
+  const clear = useCallback(() => {
+    setSelection({ resetKey, ids: new Set() })
+  }, [resetKey])
 
   return {
     selected,

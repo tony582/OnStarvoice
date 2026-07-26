@@ -13,8 +13,8 @@ const POLL_MS = 6000
 export function ProcessingBanner() {
   const [pendingPosts, setPendingPosts] = useState(0)
   const [pendingComments, setPendingComments] = useState(0)
+  const [peakComments, setPeakComments] = useState(0)
   const [justDone, setJustDone] = useState(false)
-  const peakRef = useRef(0)
   const wasPendingRef = useRef(false)
 
   useEffect(() => {
@@ -26,12 +26,12 @@ export function ProcessingBanner() {
         if (!alive) return
         const posts = Number(d.pendingPosts || 0)
         const comments = Number(d.pendingComments || 0)
-        if (comments > peakRef.current) peakRef.current = comments
+        setPeakComments(previous => Math.max(previous, comments))
         setPendingPosts(posts)
         setPendingComments(comments)
         if (posts === 0 && wasPendingRef.current) {
           setJustDone(true)
-          peakRef.current = 0
+          setPeakComments(0)
           setTimeout(() => { if (alive) setJustDone(false) }, 6000)
         }
         wasPendingRef.current = posts > 0
@@ -43,7 +43,7 @@ export function ProcessingBanner() {
   }, [])
 
   if (pendingPosts > 0) {
-    const peak = Math.max(peakRef.current, pendingComments, 1)
+    const peak = Math.max(peakComments, pendingComments, 1)
     const done = Math.max(0, peak - pendingComments)
     const pct = Math.min(100, Math.round((done / peak) * 100))
     return (

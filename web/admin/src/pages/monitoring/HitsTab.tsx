@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Bookmark, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Heart,
   Loader2, MessageCircle, Radar, RefreshCw, Share2, Target, UserRound,
@@ -39,16 +39,16 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
   const [subscriptionId, setSubscriptionId] = useState(initial?.subscriptionId ?? '')
   const [expandedHitId, setExpandedHitId] = useState('')
 
-  const loadSubscriptions = async () => {
+  const loadSubscriptions = useCallback(() => Promise.resolve().then(async () => {
     try {
       const data = await api.get<any>('/monitor/subscriptions')
       setSubscriptions(data.subscriptions || data.data?.items || [])
     } catch {
       setSubscriptions([])
     }
-  }
+  }), [])
 
-  const load = async (page = 1) => {
+  const load = useCallback((page = 1) => Promise.resolve().then(async () => {
     setLoading(true)
     setError('')
     try {
@@ -63,10 +63,10 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
     } finally {
       setLoading(false)
     }
-  }
+  }), [range, platform, subscriptionId])
 
-  useEffect(() => { loadSubscriptions() }, [])
-  useEffect(() => { load(1) }, [range, platform, subscriptionId])
+  useEffect(() => { void loadSubscriptions() }, [loadSubscriptions])
+  useEffect(() => { void load(1) }, [load])
   useEffect(() => {
     if (!expandedHitId) return
     const previousOverflow = document.body.style.overflow

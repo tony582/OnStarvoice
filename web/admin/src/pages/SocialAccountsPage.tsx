@@ -255,6 +255,10 @@ function supportsPlatform(agent: SocialAgent, platform: SocialPlatform) {
     agent.allowed_platforms.includes(platform)
 }
 
+function restUntilTomorrow() {
+  return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+}
+
 export function SocialAccountsPage() {
   const { tenantId, canWrite } = useAuth()
   const [overview, setOverview] = useState<SocialAccountsOverview | null>(null)
@@ -288,7 +292,9 @@ export function SocialAccountsPage() {
   }, [])
 
   useEffect(() => {
-    void load()
+    let active = true
+    queueMicrotask(() => { if (active) void load() })
+    return () => { active = false }
   }, [tenantId, load])
 
   useEffect(() => {
@@ -414,7 +420,7 @@ export function SocialAccountsPage() {
     if (!canWrite()) return
     try {
       const restUntil = resting
-        ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+        ? restUntilTomorrow()
         : null
       await api.patch(`/social-accounts/${account.id}`, {
         ...accountPayload(formFromAccount(account)),

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -271,6 +271,7 @@ export function OrchestrationComposerDrawer({
   const [includeComments, setIncludeComments] = useState(false)
   const [commentLimit, setCommentLimit] = useState(50)
   const [skipCaptured, setSkipCaptured] = useState(true)
+  const [allowIdleAgentHandoff, setAllowIdleAgentHandoff] = useState(true)
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null)
   const [createFingerprint, setCreateFingerprint] = useState('')
@@ -318,7 +319,7 @@ export function OrchestrationComposerDrawer({
   const dispatchedSchedule = dispatchResult?.schedule
   const nextScheduleRunAt = dispatchedSchedule?.next_run_at || dispatchedSchedule?.nextRunAt || null
 
-  const reset = () => {
+  const reset = useCallback(() => {
     setStage('define')
     setTitle('')
     setPlatform('xiaohongshu')
@@ -338,6 +339,7 @@ export function OrchestrationComposerDrawer({
     setIncludeComments(false)
     setCommentLimit(50)
     setSkipCaptured(true)
+    setAllowIdleAgentHandoff(true)
     // 预选小队来自新建任务向导；未带预选时为空（原默认行为）。
     setSelectedAgentIds(initialAgentIds ?? [])
     setCreateResult(null)
@@ -350,12 +352,12 @@ export function OrchestrationComposerDrawer({
     setError('')
     setDispatchResult(null)
     requestKeyRef.current = randomRequestKey()
-  }
+  }, [initialAgentIds])
 
   useEffect(() => {
     if (open && !previouslyOpenRef.current) reset()
     previouslyOpenRef.current = open
-  }, [open])
+  }, [open, reset])
 
   useEffect(() => {
     submittingRef.current = busy
@@ -505,6 +507,7 @@ export function OrchestrationComposerDrawer({
     sort,
     publishTime,
     captureSettings,
+    allowIdleAgentHandoff,
   })
 
   const generatePreview = async () => {
@@ -595,6 +598,10 @@ export function OrchestrationComposerDrawer({
           keywords,
           keywordMaxDetectedItems,
           searchFilters: { sort, publishTime },
+          recoveryPolicy: {
+            allowIdleAgentHandoff,
+            platformSafetyMode: 'manual_confirmed',
+          },
           ...(captureSettings ? { captureSettings } : {}),
         })
         draftIdsRef.current.add(nextCreateResult.orchestration.id)
@@ -971,6 +978,24 @@ export function OrchestrationComposerDrawer({
                   <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 规则均衡</div>
                   <p className="mt-1 text-[11px] leading-4 text-muted-foreground">按关键词顺序连续均分给已选 Agent；结果可在下一步逐项调整。这里不会调用 AI。</p>
                 </div>
+                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-card px-3 py-3">
+                  <input
+                    type="checkbox"
+                    checked={allowIdleAgentHandoff}
+                    onChange={event => {
+                      markDefinitionChanged()
+                      setAllowIdleAgentHandoff(event.target.checked)
+                    }}
+                    disabled={busy}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                  />
+                  <span>
+                    <span className="block text-xs font-semibold text-foreground">允许空闲 Agent 接力</span>
+                    <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
+                      任务中断时可由人工把尚未开始的整词转给在线空闲节点；验证码和安全审核不会自动换设备。
+                    </span>
+                  </span>
+                </label>
                 {sortedAgents.length === 0 ? (
                   <div className="mt-3 rounded-xl border border-dashed border-border px-4 py-8 text-center">
                     <Bot className="mx-auto h-6 w-6 text-muted-foreground" />

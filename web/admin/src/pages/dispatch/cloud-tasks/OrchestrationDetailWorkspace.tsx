@@ -7,9 +7,10 @@ import {
   ChevronRight,
   ClipboardList,
   Loader2,
-  Lock,
   Pause,
   Play,
+  Send,
+  ShieldAlert,
   RefreshCw,
   Square,
   Users,
@@ -52,6 +53,14 @@ const STOPPABLE_EXECUTION_STATUSES = new Set([
   'pending', 'claimed', 'running', 'recovering', 'interrupted',
   'resume_requested', 'needs_action', 'failed', 'completed_with_failures',
 ])
+const FINAL_EXECUTION_STATUSES = new Set([
+  'completed', 'completed_with_warnings', 'completed_with_failures',
+  'failed', 'canceled', 'skipped', 'superseded',
+])
+const HANDOFF_UNSTARTED_EXCLUDED_STATUSES = new Set([
+  'completed', 'completed_with_warnings', 'failed', 'skipped',
+])
+const ENDED_EXECUTION_STATUSES = new Set(['canceled', 'skipped'])
 
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
@@ -136,9 +145,26 @@ function dataMessage(value: unknown) {
   return String(record.message || record.reason || record.code || '').trim()
 }
 
+function safetyDiagnostic(value: unknown): boolean {
+  if (!value) return false
+  if (typeof value === 'string') {
+    return /platform[_ -]?safety|security[_ -]?(?:challenge|blocked)|captcha|验证码|安全验证|请选择所有符合/u.test(value)
+  }
+  if (Array.isArray(value)) return value.some(safetyDiagnostic)
+  if (typeof value !== 'object') return false
+  return Object.entries(value as Record<string, unknown>).some(([key, nested]) =>
+    /platformSafetyBlocked|securityChallenge|captcha/u.test(key) || safetyDiagnostic(nested),
+  )
+}
+
+function executionStatus(execution?: OrchestrationExecutionRecord) {
+  return String(execution?.status || '')
+}
+
 export function OrchestrationDetailWorkspace({
   orchestrationId,
   writable = false,
+  availableAgents = [],
   onClose,
   onChanged,
   className,
@@ -149,6 +175,8 @@ export function OrchestrationDetailWorkspace({
   const [refreshing, setRefreshing] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [scheduleUpdating, setScheduleUpdating] = useState(false)
+  const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | 'handoff' | ''>('')
+  const [handoffTargetAgentId, setHandoffTargetAgentId] = useState('')
   const [actionFeedback, setActionFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [error, setError] = useState('')
@@ -228,6 +256,94 @@ export function OrchestrationDetailWorkspace({
     ACTIVE_STATUSES.has(String(detail.orchestration.status || '')) ||
     activeCount > 0
   ))
+  const attentionContext = useMemo(() => {
+    if (!detail) return null
+    const item = sortedItems.find(candidate =>
+      Boolean(candidate.execution_task_id) &&
+      candidate.status === 'needs_action' &&
+      (
+        safetyDiagnostic(candidate.error) ||
+        safetyDiagnostic(candidate.metadata)
+      ),
+    )
+    const execution = item
+      ? detail.executions.find(candidate => executionTaskId(candidate) === item.execution_task_id)
+      : detail.executions.find(candidate => {
+          const metadata = candidate.metadata && typeof candidate.metadata === 'object'
+            ? candidate.metadata as Record<string, unknown>
+            : {}
+          if (metadata.handoffSuccessorTaskId || metadata.recoveryTaskId) return false
+          const status = executionStatus(candidate)
+          const safetyEvidence =
+            safetyDiagnostic(candidate.error) ||
+            safetyDiagnostic(candidate.metadata) ||
+            safetyDiagnostic(candidate.checkpoint) ||
+            safetyDiagnostic(candidate.message)
+          if (!safetyEvidence) return false
+          if (status === 'needs_action') return true
+          if (!FINAL_EXECUTION_STATUSES.has(status)) return false
+          const taskId = executionTaskId(candidate)
+          return sortedItems.some(candidateItem =>
+            candidateItem.execution_task_id === taskId &&
+            !candidateItem.started_at &&
+            !HANDOFF_UNSTARTED_EXCLUDED_STATUSES.has(candidateItem.status),
+          )
+        })
+    if (!execution) return null
+    const executionMetadata = execution.metadata && typeof execution.metadata === 'object'
+      ? execution.metadata as Record<string, unknown>
+      : {}
+    if (
+      executionStatus(execution) === 'superseded' ||
+      executionMetadata.handoffSuccessorTaskId ||
+      executionMetadata.recoveryTaskId
+    ) {
+      return null
+    }
+    const sourceTaskId = executionTaskId(execution)
+    const sourceAgentId = executionAgentId(execution)
+    if (!sourceTaskId || !sourceAgentId) return null
+    const sourceItems = sortedItems.filter(candidate => candidate.execution_task_id === sourceTaskId)
+    const currentItem = item ||
+      sourceItems.find(candidate => candidate.status === 'needs_action') ||
+      [...sourceItems].reverse().find(candidate =>
+        Boolean(candidate.started_at) &&
+        (
+          safetyDiagnostic(candidate.error) ||
+          safetyDiagnostic(candidate.metadata)
+        ),
+      )
+    const sourceStatus = executionStatus(execution)
+    return {
+      sourceTaskId,
+      sourceAgentId,
+      sourceStatus,
+      sourceFinal: FINAL_EXECUTION_STATUSES.has(sourceStatus),
+      sourceEnded: ENDED_EXECUTION_STATUSES.has(sourceStatus),
+      sourceAgent: detail.agents.find(agent => agent.id === sourceAgentId),
+      currentItem,
+      currentOrdinal: Number(currentItem?.ordinal ?? -1) + 1,
+      unstartedCount: sourceItems.filter(candidate =>
+        !candidate.started_at &&
+        !HANDOFF_UNSTARTED_EXCLUDED_STATUSES.has(candidate.status),
+      ).length,
+    }
+  }, [detail, sortedItems])
+  const handoffCandidates = useMemo(() => {
+    if (!attentionContext || !detail) return []
+    return availableAgents
+      .filter(agent =>
+        agent.id !== attentionContext.sourceAgentId &&
+        agent.status === 'active' &&
+        agent.online &&
+        (agent.allowed_platforms.length === 0 || agent.allowed_platforms.includes(detail.orchestration.platform)) &&
+        Number(agent.active_task_count || 0) === 0 &&
+        Number(agent.queued_task_count || 0) === 0,
+      )
+      .sort((left, right) =>
+        `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN'),
+      )
+  }, [attentionContext, availableAgents, detail])
 
   useEffect(() => {
     if (!orchestrationId || !hasActiveWork) return
@@ -293,6 +409,111 @@ export function OrchestrationDetailWorkspace({
     }
   }
 
+  const resumeAttentionSource = async () => {
+    if (!attentionContext || !writable || attentionAction) return
+    if (!window.confirm('请确认已经在原 Agent 的抖音页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。')) return
+    setAttentionAction('resume')
+    setActionFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/tasks/${attentionContext.sourceTaskId}/resume`,
+        { mode: 'remaining' },
+      )
+      setActionFeedback(result.message || '已向原 Agent 发送继续剩余关键词指令')
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '发送继续指令失败')
+    } finally {
+      setAttentionAction('')
+    }
+  }
+
+  const stopAttentionSource = async () => {
+    if (!attentionContext || !writable || attentionAction) return
+    if (!window.confirm('确定结束原 Agent 的任务吗？后续关键词不再执行，已经采集和保存的结果会保留。')) return
+    setAttentionAction('stop')
+    setActionFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/tasks/${attentionContext.sourceTaskId}/stop`,
+        {},
+      )
+      setActionFeedback(result.message || '已向原 Agent 发送结束并保留结果指令')
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '发送结束指令失败')
+    } finally {
+      setAttentionAction('')
+    }
+  }
+
+  const handoffAttentionSource = async () => {
+    if (!attentionContext || !detail || !writable || attentionAction) return
+    const targetAgentId = handoffTargetAgentId || handoffCandidates[0]?.id || ''
+    const target = handoffCandidates.find(agent => agent.id === targetAgentId)
+    if (!target) {
+      setActionError('当前没有在线且空闲的兼容 Agent，请先释放一个节点后再接力。')
+      return
+    }
+    const sourceName = agentName(attentionContext.sourceAgent)
+    const targetName = agentName(target)
+    if (!window.confirm(
+      `确定由“${targetName}”接力吗？系统会先结束“${sourceName}”，触发验证的当前关键词不会跨设备迁移，后面的 ${attentionContext.unstartedCount} 个未开始关键词将转交；已保存结果会保留。`,
+    )) return
+    setAttentionAction('handoff')
+    setActionFeedback('')
+    setActionError('')
+    try {
+      let currentDetail = detail
+      let sourceExecution = currentDetail.executions.find(
+        execution => executionTaskId(execution) === attentionContext.sourceTaskId,
+      )
+      if (!FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution))) {
+        await api.post(`/capture-cloud/tasks/${attentionContext.sourceTaskId}/stop`, {})
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          await new Promise(resolve => window.setTimeout(resolve, 1_250))
+          currentDetail = await api.get<OrchestrationDetailResponse>(
+            `/capture-cloud/orchestrations/${orchestrationId}`,
+          )
+          sourceExecution = currentDetail.executions.find(
+            execution => executionTaskId(execution) === attentionContext.sourceTaskId,
+          )
+          if (FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution))) break
+        }
+      }
+      if (!FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution))) {
+        throw new Error('原 Agent 还未确认结束。停止指令已保留，请稍后刷新并再次接力。')
+      }
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/orchestrations/${orchestrationId}/resolve-attention`,
+        {
+          action: 'handoff',
+          expectedRevision: Number(
+            currentDetail.orchestration.revision ??
+            currentDetail.orchestration.orchestration_revision ??
+            0,
+          ),
+          requestKey: crypto.randomUUID(),
+          sourceExecutionTaskId: attentionContext.sourceTaskId,
+          targetAgentId,
+        },
+        { timeoutMs: 30_000 },
+      )
+      setActionFeedback(result.message || `剩余未开始关键词已转交给 ${targetName}`)
+      setHandoffTargetAgentId('')
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '转交空闲 Agent 失败')
+    } finally {
+      setAttentionAction('')
+    }
+  }
+
   if (!orchestrationId) {
     return (
       <section className={cn('rounded-2xl border border-dashed border-border bg-muted/20 px-5 py-12 text-center', className)}>
@@ -340,6 +561,10 @@ export function OrchestrationDetailWorkspace({
   const captureSettings = planSnapshot.captureSettings && typeof planSnapshot.captureSettings === 'object'
     ? planSnapshot.captureSettings as Record<string, unknown>
     : null
+  const recoveryPolicy = planSnapshot.recoveryPolicy && typeof planSnapshot.recoveryPolicy === 'object'
+    ? planSnapshot.recoveryPolicy as Record<string, unknown>
+    : {}
+  const idleHandoffAllowed = recoveryPolicy.allowIdleAgentHandoff !== false
 
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
@@ -400,6 +625,102 @@ export function OrchestrationDetailWorkspace({
       </header>
 
       <div className="p-4 sm:p-5">
+        {attentionContext && (
+          <section className="mb-4 rounded-2xl border border-status-red/25 bg-status-red/[0.035] p-4" role="alert">
+            <div className="flex items-start gap-3">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-status-red/10 text-status-red">
+                <ShieldAlert className="h-4.5 w-4.5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <h3 className="text-sm font-bold text-foreground">
+                    {attentionContext.sourceEnded
+                      ? '原 Agent 已结束，可接力后续关键词'
+                      : '抖音需要人工验证，自动操作已停止'}
+                  </h3>
+                  <span className="rounded-full bg-status-red/10 px-2 py-0.5 text-[10px] font-semibold text-status-red">
+                    {attentionContext.currentOrdinal > 0
+                      ? `${attentionContext.currentOrdinal}/${sortedItems.length}`
+                      : '需处理'}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  原 Agent：<strong className="font-semibold text-foreground">{agentName(attentionContext.sourceAgent)}</strong>
+                  {attentionContext.currentItem
+                    ? <> · 当前关键词：<strong className="font-semibold text-foreground">{keywordForItem(attentionContext.currentItem)}</strong></>
+                    : null}
+                  。此前采集结果已保留。
+                </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {!attentionContext.sourceEnded && (
+                    <Button
+                      size="sm"
+                      onClick={() => void resumeAttentionSource()}
+                      disabled={!writable || Boolean(attentionAction)}
+                    >
+                      {attentionAction === 'resume'
+                        ? <Loader2 className="h-4 w-4 animate-spin" />
+                        : <Play className="h-4 w-4" />}
+                      验证完成，原 Agent 继续
+                    </Button>
+                  )}
+                  {!attentionContext.sourceFinal && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void stopAttentionSource()}
+                      disabled={!writable || Boolean(attentionAction)}
+                    >
+                      {attentionAction === 'stop'
+                        ? <Loader2 className="h-4 w-4 animate-spin" />
+                        : <Square className="h-3.5 w-3.5 fill-current" />}
+                      结束并保留
+                    </Button>
+                  )}
+                  {idleHandoffAllowed && attentionContext.unstartedCount > 0 && (
+                    <>
+                      <select
+                        aria-label="选择接力 Agent"
+                        value={handoffTargetAgentId || handoffCandidates[0]?.id || ''}
+                        onChange={event => setHandoffTargetAgentId(event.target.value)}
+                        disabled={!writable || Boolean(attentionAction) || handoffCandidates.length === 0}
+                        className="h-9 min-w-48 max-w-full rounded-lg border border-border bg-background px-3 text-xs text-foreground outline-none focus:ring-2 focus:ring-primary"
+                      >
+                        {handoffCandidates.length === 0
+                          ? <option value="">没有在线空闲 Agent</option>
+                          : handoffCandidates.map(agent => (
+                              <option key={agent.id} value={agent.id}>
+                                {agentName(agent)}
+                              </option>
+                            ))}
+                      </select>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void handoffAttentionSource()}
+                        disabled={!writable || Boolean(attentionAction) || handoffCandidates.length === 0}
+                      >
+                        {attentionAction === 'handoff'
+                          ? <Loader2 className="h-4 w-4 animate-spin" />
+                          : <Send className="h-4 w-4" />}
+                        转交后续 {attentionContext.unstartedCount} 个词
+                      </Button>
+                    </>
+                  )}
+                </div>
+                <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
+                  {attentionContext.sourceEnded
+                    ? idleHandoffAllowed
+                      ? '原任务已结束，现有结果已保留。不需要接力时可直接关闭；需要继续时，只会转交尚未开始的整词。'
+                      : '原任务已结束，现有结果已保留；该任务创建时未启用空闲 Agent 接力。'
+                    : idleHandoffAllowed
+                    ? '验证码和安全审核不会自动换设备；只有你确认后，系统才会把尚未开始的整词交给空闲 Agent。'
+                    : '该任务创建时未启用空闲 Agent 接力；你可以在原 Agent 验证后继续，或结束并保留结果。'}
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
         {scheduleTemplate && schedule && (
           <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.035] p-4">
             <div className="flex items-start gap-3">
@@ -593,10 +914,9 @@ export function OrchestrationDetailWorkspace({
               </div>
             )}
             <div className="border-t border-border/70 bg-muted/25 p-3">
-              <Button variant="outline" size="sm" className="w-full" disabled title="当前版本尚未开放跨节点接力或重新分配接口">
-                <Lock className="h-3.5 w-3.5" /> 重新分配（尚未开放）
-              </Button>
-              <p className="mt-2 text-[10px] leading-4 text-muted-foreground">第一期只展示创建时的真实分配和子任务状态；跨 Agent 接力需要新的租约与重分配协议，当前不会伪装执行。</p>
+              <p className="text-[10px] leading-4 text-muted-foreground">
+                任务遇到安全验证时，上方会提供人工继续、结束保留和转交空闲 Agent；接力只处理尚未开始的完整关键词。
+              </p>
             </div>
           </section>
         </div>

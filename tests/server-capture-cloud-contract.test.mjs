@@ -8,6 +8,7 @@ import {
   captureAgentOnline,
   isCloudTaskActive,
   isCloudTaskTerminal,
+  lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeCloudTaskSnapshot,
   normalizeCloudTaskStatus,
@@ -184,6 +185,150 @@ test("operator cancellation is absorbing against late child heartbeats", () => {
   );
 });
 
+test("a stopped orchestration child keeps later unstarted keywords eligible for safe handoff", () => {
+  const projection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "async function mirrorTaskSnapshot",
+  );
+  assert.match(
+    projection,
+    /const activeKeyword = text\([\s\S]*snapshotProgress\.keyword[\s\S]*snapshotCheckpoint\.activeKeyword/u,
+  );
+  assert.match(
+    projection,
+    /started_at = COALESCE\(started_at, now\(\)\)[\s\S]*keyword = \$8/u,
+  );
+  assert.match(
+    projection,
+    /WHEN \$1 = 'needs_action' AND started_at IS NULL THEN 'retryable'/u,
+  );
+  assert.match(projection, /'code', 'blocked_by_prior_item'/u);
+  assert.match(
+    projection,
+    /前序关键词需要人工处理，该关键词尚未开始，可安全接力/u,
+  );
+  assert.match(
+    projection,
+    /SET status = CASE[\s\S]*finished_at = CASE/u,
+  );
+  assert.doesNotMatch(
+    projection.slice(
+      projection.indexOf("UPDATE capture_task_items\n      SET status = CASE"),
+      projection.indexOf("UPDATE capture_task_item_attempts attempt"),
+    ),
+    /started_at = COALESCE\(started_at, now\(\)\)/u,
+    "unreported later keywords must not be marked as started",
+  );
+  const attemptProjection = projection.slice(
+    projection.indexOf("UPDATE capture_task_item_attempts attempt"),
+  );
+  assert.match(attemptProjection, /item\.tenant_id = \$1/u);
+  assert.match(attemptProjection, /item\.task_id = \$2/u);
+  assert.match(attemptProjection, /item\.execution_task_id = \$3/u);
+  assert.match(attemptProjection, /item\.assigned_agent_id = \$4/u);
+  assert.doesNotMatch(attemptProjection, /\$(?:5|6)/u);
+});
+
+test("operator stop terminal snapshots settle every unresolved child item", () => {
+  const projection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "async function mirrorTaskSnapshot",
+  );
+  assert.match(
+    projection,
+    /\$1 IN \('canceled', 'skipped'\)[\s\S]*OR NOT \(id = ANY\(\$7::uuid\[\]\)\)/u,
+  );
+  assert.match(
+    projection,
+    /WHEN \$1 = 'needs_action'[\s\S]*ELSE error/u,
+    "canceled and skipped settlement must preserve an existing item error",
+  );
+  assert.match(
+    projection,
+    /metadata = metadata \|\| jsonb_build_object\('checkpoint', \$4::jsonb\)/u,
+    "checkpoint evidence must remain stored before terminal settlement",
+  );
+});
+
+test("handoff metadata survives agent snapshots and fences resume on the source task", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "router.post('/agent/heartbeat'",
+  );
+  for (const field of [
+    "handoffRequestHash",
+    "handoffRequestKey",
+    "handoffSourceExecutionTaskId",
+    "handoffConfirmedByUser",
+    "handoffSuccessorTaskId",
+    "handoffSourcePreviousStatus",
+    "handedOffAt",
+    "recoveryTaskId",
+    "recoveryCommandId",
+  ]) {
+    assert.match(mirror, new RegExp(`'${field}', capture_tasks\\.metadata->'${field}'`, "u"));
+  }
+  const resume = readRouteSection(
+    "router.post('/tasks/:id/resume'",
+    "router.post('/tasks/:id/stop'",
+  );
+  assert.match(resume, /task\.metadata\?\.handoffSuccessorTaskId/u);
+  assert.match(resume, /task_handed_off/u);
+  assert.match(resume, /后续关键词已经转交其他 Agent/u);
+});
+
+test("agent execution-slot locks serialize heartbeat, resume, and handoff assignment", async () => {
+  const calls = [];
+  await lockCaptureAgentExecutionSlot(
+    {execute: async (sql, params) => calls.push({sql, params})},
+    "tenant-a",
+    "agent-a",
+  );
+  assert.deepEqual(calls, [{
+    sql: "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+    params: ["capture_agent_execution_slot", "tenant-a:agent-a"],
+  }]);
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  const heartbeatTransaction = heartbeat.indexOf(
+    "const result = await withTransaction(async tx =>",
+  );
+  const heartbeatLock = heartbeat.indexOf(
+    "await lockCaptureAgentExecutionSlot(",
+    heartbeatTransaction,
+  );
+  const agentWrite = heartbeat.indexOf("UPDATE capture_agents", heartbeatTransaction);
+  assert.ok(heartbeatLock > heartbeatTransaction && heartbeatLock < agentWrite);
+
+  const resume = readRouteSection(
+    "router.post('/tasks/:id/resume'",
+    "router.post('/tasks/:id/stop'",
+  );
+  const identityRead = resume.indexOf(
+    "SELECT COALESCE(assigned_agent_id, origin_agent_id) AS agent_id",
+  );
+  const resumeLock = resume.indexOf("await lockCaptureAgentExecutionSlot(");
+  const staleCommands = resume.indexOf("await expireStaleCommands(");
+  const taskRowLock = resume.indexOf("FOR UPDATE OF t");
+  assert.ok(identityRead >= 0 && identityRead < resumeLock);
+  assert.ok(resumeLock < staleCommands && staleCommands < taskRowLock);
+  assert.match(resume, /task_agent_changed/u);
+});
+
+test("overview never presents interrupted or needs-action Agents as idle", () => {
+  const overview = readRouteSection(
+    "router.get('/overview'",
+    "router.patch('/agents/:id'",
+  );
+  assert.match(
+    overview,
+    /AS active_task_count[\s\S]*assigned\.status IN \([\s\S]*'interrupted'[\s\S]*'needs_action'/u,
+  );
+});
+
 test("orchestration checkpoint database values are bounded and timestamp-safe", () => {
   assert.equal(orchestrationCheckpointInteger(-4), 0);
   assert.equal(orchestrationCheckpointInteger("17.9"), 17);
@@ -308,7 +453,7 @@ test("overview reports child-inclusive agent load but root-only task summary", (
   );
   assert.match(
     overview,
-    /assigned\.status IN \([\s\S]*'claimed', 'running', 'recovering', 'resume_requested'/u,
+    /assigned\.status IN \([\s\S]*'claimed', 'running', 'recovering', 'interrupted',[\s\S]*'needs_action', 'resume_requested'/u,
   );
   assert.ok(
     [...overview.matchAll(/AND t\.parent_task_id IS NULL/gu)].length >= 2,
@@ -570,6 +715,7 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
     publishTime: "week",
     maxRounds: 999,
     roundGapMin: -9,
+    recoveryPolicy: {allowIdleAgentHandoff: false},
     nextRunAt,
   });
 
@@ -587,6 +733,10 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
   assert.equal(normalized.planSnapshot.searchFilters.publishTime, "week");
   assert.equal(normalized.planSnapshot.maxRounds, 100);
   assert.equal(normalized.planSnapshot.roundGapMin, 0);
+  assert.deepEqual(normalized.planSnapshot.recoveryPolicy, {
+    allowIdleAgentHandoff: false,
+    platformSafetyMode: "manual_confirmed",
+  });
   assert.equal(normalized.planSnapshot.nextRunAt, nextRunAt);
 
   const lowerAndUpperBounds = normalizeRemoteTaskInput({

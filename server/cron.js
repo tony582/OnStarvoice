@@ -6,6 +6,7 @@ import cron from 'node-cron';
 import { queryAll, execute, getSetting } from './db/init.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
+import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 
 function shanghaiNowParts() {
@@ -107,6 +108,21 @@ export function startCronJobs() {
       }
     } catch (err) {
       console.error('[Cron] Multi-Agent schedule error:', err.message);
+    }
+  });
+
+  cron.schedule('* * * * *', async () => {
+    try {
+      const result = await processCaptureAttentionNotifications(20);
+      if (result.claimed > 0) {
+        console.log(
+          `[Cron] Capture attention notifications: ${result.sent} sent, ` +
+          `${result.retry_wait} retrying, ${result.blocked_config} blocked, ` +
+          `${result.failed} failed, ${result.worker_error} worker error(s)`,
+        );
+      }
+    } catch (err) {
+      console.error('[Cron] Capture attention notification error:', err.message);
     }
   });
 

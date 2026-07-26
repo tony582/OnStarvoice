@@ -6307,6 +6307,15 @@ async function handleTaskCenterAction(event) {
   };
   const mode = recoveryModeByAction[action];
   if (!mode || !taskId) return;
+  if (
+    action === "continue_remaining" &&
+    isUnattendedSafetyBlock(detail.task || {}) &&
+    !window.confirm(
+      "请先在抖音页面人工完成安全验证。确认页面已经恢复正常后，再继续剩余关键词。",
+    )
+  ) {
+    return;
+  }
 
   try {
     const response = await chrome.runtime.sendMessage({
@@ -16016,6 +16025,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         String(blockingError?.code || "").trim().toUpperCase() ||
         "PLATFORM_SAFETY_BLOCK";
       const safetyMessage =
+        String(blockingError?.message || "").trim() ||
         "检测到验证码、登录失效或平台安全限制，已暂停整批任务且不会自动连续重试";
       const safetySummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
       const finishedAt = new Date().toISOString();
@@ -16042,6 +16052,9 @@ async function runUnattendedKeywordPlanRequest(request) {
             message: safetyMessage,
             category: String(blockingError?.category || ""),
             securityBlocked: true,
+            platformSafetyBlocked: Boolean(
+              blockingError?.platformSafetyBlocked,
+            ),
             requiresManualAction: true,
             retryable: false,
           },

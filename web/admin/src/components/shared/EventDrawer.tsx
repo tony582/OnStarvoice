@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { X, Loader2, Heart, MessageCircle, Star, Share2, ExternalLink, Activity, TrendingUp, Globe, Clock, ArrowLeft } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, formatFullDate, platformName, LABELS, cn } from '@/lib/utils'
+import { formatNumber, formatFullDate, platformName, LABELS, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 
@@ -13,14 +13,25 @@ export function EventDrawer({ eventId, onClose }: { eventId: string; onClose: ()
   const [issue, setIssue] = useState<any>(null)
   const [records, setRecords] = useState<any[]>([])
   const [events, setEvents] = useState<any[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loadedEventId, setLoadedEventId] = useState<string | null>(null)
+  const loading = loadedEventId !== eventId
 
   useEffect(() => {
-    setLoading(true)
+    let active = true
     api.get<any>('/issues/' + eventId)
-      .then(d => { setIssue(d.issue); setRecords(d.records || []); setEvents(d.events || []) })
-      .catch(console.error)
-      .finally(() => setLoading(false))
+      .then(d => {
+        if (!active) return
+        setIssue(d.issue)
+        setRecords(d.records || [])
+        setEvents(d.events || [])
+        setLoadedEventId(eventId)
+      })
+      .catch(error => {
+        if (!active) return
+        console.error(error)
+        setLoadedEventId(eventId)
+      })
+    return () => { active = false }
   }, [eventId])
 
   const reach = records.reduce((s, r) => s + Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0), 0)

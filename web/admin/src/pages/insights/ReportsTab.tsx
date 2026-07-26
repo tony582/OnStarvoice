@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AlertCircle, BarChart3, CheckCircle2, Eye, FileText, Loader2, Mail, RefreshCw, Send, Sparkles, X } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -73,7 +73,7 @@ export function ReportsTab() {
   const generatedCount = useMemo(() => reports.filter(r => ['generated', 'sent'].includes(r.status)).length, [reports])
   const failedCount = useMemo(() => reports.filter(r => r.status === 'failed').length, [reports])
 
-  const load = async () => {
+  const load = useCallback(() => Promise.resolve().then(async () => {
     setLoading(true)
     try {
       const data = await api.get<{ reports: ReportRun[] }>('/reports?limit=100')
@@ -81,9 +81,9 @@ export function ReportsTab() {
     } finally {
       setLoading(false)
     }
-  }
+  }), [])
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { void load() }, [load])
 
   const generate = async (type: string) => {
     setNotice(null)

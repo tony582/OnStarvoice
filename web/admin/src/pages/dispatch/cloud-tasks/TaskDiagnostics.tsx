@@ -128,6 +128,17 @@ export function KeywordProgressSummary({
   const currentLabel = diagnostics.currentKeyword
     ? `${diagnostics.currentOrdinal || diagnostics.processed}/${diagnostics.total} · ${diagnostics.currentKeyword}`
     : `${diagnostics.processed}/${diagnostics.total}`
+  const latestResultByIndex = new Map<number, TaskKeywordResult>()
+  diagnostics.items.forEach(item => latestResultByIndex.set(item.index, item))
+  const resultSegments = Array.from(
+    { length: diagnostics.total },
+    (_, index) => latestResultByIndex.get(index) || null,
+  )
+  const positionLabel = diagnostics.safetyBlocked > 0
+    ? '中断位置'
+    : ['running', 'recovering', 'claimed'].includes(task.effective_status || task.status)
+      ? '当前执行'
+      : '最后执行'
 
   return (
     <div className="mt-3">
@@ -145,17 +156,23 @@ export function KeywordProgressSummary({
         role="img"
         aria-label={`关键词执行结果：完成 ${diagnostics.completed}，失败 ${diagnostics.failed}，部分完成 ${diagnostics.partial}`}
       >
-        {diagnostics.items.map(item => (
+        {resultSegments.map((item, index) => item ? (
           <span
             key={`${item.round}:${item.index}:${item.keyword}`}
             className={`${keywordStatusDot(item.status)} min-w-0 rounded-full`}
             title={`${item.index + 1}. ${item.keyword}：${keywordStatusLabel(item.status)}`}
           />
+        ) : (
+          <span
+            key={`pending:${index}`}
+            className="min-w-0 rounded-full bg-muted"
+            title={`${index + 1}. 尚未上报`}
+          />
         ))}
       </div>
       <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
         <span>
-          {['running', 'recovering', 'claimed'].includes(task.effective_status || task.status) ? '当前执行' : '最后执行'}
+          {positionLabel}
           {'：'}<strong className="font-medium text-foreground">{currentLabel}</strong>
         </span>
         {diagnostics.retried > 0 && <span>累计重试 {diagnostics.retried} 次</span>}

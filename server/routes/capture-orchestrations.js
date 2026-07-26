@@ -8,10 +8,12 @@ import {
 } from '../middleware/auth.js';
 import {
   captureAgentOnline,
+  lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeRemoteTaskInput,
 } from '../services/capture-cloud.js';
 import {
+  aggregateParentTaskItems,
   allocateKeywordWorkItems,
   computeNextOrchestrationRunAt,
   hashOrchestrationRequest,
@@ -22,6 +24,29 @@ const router = Router();
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
+const HANDOFF_SOURCE_FINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+]);
+const HANDOFF_TARGET_BUSY_STATUSES = [
+  'pending',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'needs_action',
+  'resume_requested',
+];
+const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
+  'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+  'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
+  'DOUYIN_CAPTCHA_REQUIRED',
+  'CAPTCHA_PAGE_DETECTED',
+]);
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -30,6 +55,23 @@ function text(value, limit = 1000) {
 
 function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function itemRequiresManualSafetyAction(item) {
+  const error = safeJson(item?.error);
+  const checkpoint = safeJson(safeJson(item?.metadata).checkpoint);
+  const code = text(
+    error.code || checkpoint.errorCode || checkpoint.error_code,
+    100,
+  ).toUpperCase();
+  return HANDOFF_PLATFORM_SAFETY_CODES.has(code) ||
+    error.category === 'platform_safety_block' ||
+    error.securityBlocked === true ||
+    error.platformSafetyBlocked === true ||
+    error.requiresManualAction === true ||
+    checkpoint.securityBlocked === true ||
+    checkpoint.platformSafetyBlocked === true ||
+    checkpoint.requiresManualAction === true;
 }
 
 function normalizedUuid(value) {
@@ -801,6 +843,38 @@ function normalizeDispatch(body) {
     assignments.push({itemId, agentId});
   }
   return {expectedRevision, assignments};
+}
+
+function normalizeAttentionHandoff(body) {
+  if (text(body?.action, 40) !== 'handoff') {
+    return {failure: requestError(
+      'invalid_attention_action',
+      '当前接口只接受人工确认的 handoff 操作',
+    )};
+  }
+  const expectedRevision = Number(body?.expectedRevision);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+    return {failure: requestError(
+      'invalid_expected_revision',
+      'expectedRevision 必须是正整数',
+    )};
+  }
+  const requestKey = normalizedUuid(body?.requestKey);
+  const sourceExecutionTaskId = normalizedUuid(body?.sourceExecutionTaskId);
+  const targetAgentId = normalizedUuid(body?.targetAgentId);
+  if (!requestKey || !sourceExecutionTaskId || !targetAgentId) {
+    return {failure: requestError(
+      'invalid_handoff_request',
+      'requestKey、sourceExecutionTaskId 和 targetAgentId 必须是有效 UUID',
+    )};
+  }
+  return {
+    action: 'handoff',
+    expectedRevision,
+    requestKey,
+    sourceExecutionTaskId,
+    targetAgentId,
+  };
 }
 
 router.post(
@@ -1703,6 +1777,750 @@ router.post(
           : '计划已重新启用，将按下一次时间运行',
       });
     } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/orchestrations/:id/resolve-attention',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const normalized = normalizeAttentionHandoff(req.body);
+      if (normalized.failure) return sendRequestError(res, normalized.failure);
+      const handoffRequestHash = hashOrchestrationRequest({
+        action: normalized.action,
+        orchestrationId,
+        expectedRevision: normalized.expectedRevision,
+        requestKey: normalized.requestKey,
+        sourceExecutionTaskId: normalized.sourceExecutionTaskId,
+        targetAgentId: normalized.targetAgentId,
+      });
+      const result = await withTransaction(async tx => {
+        // requestKey is also a globally unique task ID. Serialize that global
+        // namespace first, then reserve the target Agent execution slot before
+        // taking task, parent, command or Agent row locks.
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['capture_task_global_id', normalized.requestKey],
+        );
+        await lockCaptureAgentExecutionSlot(
+          tx,
+          req.tenantId,
+          normalized.targetAgentId,
+        );
+        const existingTask = await tx.queryOne(`
+          SELECT id, tenant_id, parent_task_id, assigned_agent_id,
+            status, metadata
+          FROM capture_tasks
+          WHERE id = $1::uuid AND tenant_id = $2
+          FOR UPDATE
+        `, [normalized.requestKey, req.tenantId]);
+        if (existingTask) {
+          const existingMetadata = safeJson(existingTask.metadata);
+          const exactReplay =
+            String(existingTask.parent_task_id || '') === orchestrationId &&
+            String(existingTask.assigned_agent_id || '') ===
+              normalized.targetAgentId &&
+            existingMetadata.handoffRequestHash === handoffRequestHash &&
+            existingMetadata.handoffSourceExecutionTaskId ===
+              normalized.sourceExecutionTaskId;
+          if (!exactReplay) {
+            return {failure: requestError(
+              'idempotency_key_conflict',
+              '该 requestKey 已用于不同的任务',
+              409,
+            )};
+          }
+          const command = await tx.queryOne(`
+            SELECT id, status, expires_at, created_at
+            FROM capture_agent_commands
+            WHERE tenant_id = $1 AND task_id = $2
+              AND agent_id = $3 AND command_type = 'create'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+          `, [
+            req.tenantId,
+            existingTask.id,
+            normalized.targetAgentId,
+          ]);
+          const items = await tx.queryAll(`
+            SELECT id, keyword, ordinal
+            FROM capture_task_items
+            WHERE tenant_id = $1 AND task_id = $2
+              AND execution_task_id = $3
+            ORDER BY ordinal, id
+          `, [req.tenantId, orchestrationId, existingTask.id]);
+          return {
+            existing: true,
+            revision: Number(existingMetadata.orchestrationRevision || 0),
+            sourceExecutionTaskId: normalized.sourceExecutionTaskId,
+            execution: {
+              taskId: existingTask.id,
+              agentId: existingTask.assigned_agent_id,
+              commandId: command?.id || null,
+              commandStatus: command?.status || '',
+              status: existingTask.status,
+              itemIds: items.map(item => item.id),
+              keywords: items.map(item => item.keyword),
+            },
+          };
+        }
+        // Snapshot projection and command completion lock the child before its
+        // parent. Follow the same order so a handoff cannot deadlock a final
+        // source heartbeat.
+        const sourceTask = await tx.queryOne(`
+          SELECT id, tenant_id, parent_task_id, assigned_agent_id,
+            task_type, title, platform, status, metadata
+          FROM capture_tasks
+          WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
+          FOR UPDATE
+        `, [
+          normalized.sourceExecutionTaskId,
+          req.tenantId,
+          orchestrationId,
+        ]);
+        if (!sourceTask) {
+          return {failure: requestError(
+            'handoff_source_not_found',
+            '原执行任务不存在或不属于当前编排任务',
+            404,
+          )};
+        }
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parent) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        const currentRevision = Number(parent.orchestration_revision || 0);
+        if (currentRevision !== normalized.expectedRevision) {
+          return {failure: requestError(
+            'revision_conflict',
+            '编排任务已被更新，请刷新后重新确认接力',
+            409,
+            {currentRevision},
+          )};
+        }
+        if (
+          parent.metadata?.orchestrationTemplate === true ||
+          parent.metadata?.executionMode === 'unattended_plan'
+        ) {
+          return {failure: requestError(
+            'handoff_template_not_supported',
+            '计划模板本身不能接力，请对具体运行批次执行接力',
+            409,
+          )};
+        }
+        if (sourceTask.status === 'superseded') {
+          const sourceMetadata = safeJson(sourceTask.metadata);
+          const hasRecoverySuccessor = Boolean(
+            text(sourceMetadata.recoveryTaskId, 240) ||
+            text(sourceMetadata.recoveryCommandId, 240),
+          );
+          return {failure: requestError(
+            hasRecoverySuccessor
+              ? 'handoff_source_recovery_active'
+              : 'handoff_source_superseded',
+            hasRecoverySuccessor
+              ? '原设备已经创建恢复任务并继续执行，不能再把相同剩余关键词接力给其他节点'
+              : '原执行任务已被其他任务替代，不能再次接力',
+            409,
+            {
+              recoveryTaskId: text(sourceMetadata.recoveryTaskId, 240) || null,
+            },
+          )};
+        }
+        if (!HANDOFF_SOURCE_FINAL_STATUSES.has(sourceTask.status)) {
+          return {failure: requestError(
+            'handoff_source_not_settled',
+            '请先停止原任务并等待设备确认停止，再发起接力',
+            409,
+            {sourceStatus: sourceTask.status},
+          )};
+        }
+        const attentionEvidence = await tx.queryOne(`
+          SELECT true AS found
+          FROM (
+            SELECT snapshot.id
+            FROM capture_task_snapshots snapshot
+            WHERE snapshot.tenant_id = $1
+              AND snapshot.task_id = $2
+              AND snapshot.status = 'needs_action'
+            UNION ALL
+            SELECT event.id
+            FROM capture_task_events event
+            WHERE event.tenant_id = $1
+              AND event.task_id = $2
+              AND event.status = 'needs_action'
+            UNION ALL
+            SELECT parent_event.id
+            FROM capture_task_events parent_event
+            WHERE parent_event.tenant_id = $1
+              AND parent_event.task_id = $3
+              AND parent_event.status = 'needs_action'
+              AND parent_event.payload->>'childTaskId' = $2::uuid::text
+          ) attention
+          LIMIT 1
+        `, [req.tenantId, sourceTask.id, parent.id]);
+        if (!attentionEvidence) {
+          return {failure: requestError(
+            'handoff_requires_attention_state',
+            '只有曾进入需人工处理状态的任务才能人工接力',
+            409,
+          )};
+        }
+        const activeSourceCommand = await tx.queryOne(`
+          SELECT id, command_type, status
+          FROM capture_agent_commands
+          WHERE tenant_id = $1 AND task_id = $2
+            AND status IN ('pending', 'acknowledged')
+          ORDER BY created_at, id
+          LIMIT 1
+          FOR UPDATE
+        `, [req.tenantId, sourceTask.id]);
+        if (activeSourceCommand) {
+          return {failure: requestError(
+            'handoff_source_command_pending',
+            '原任务仍有待完成指令，请等待停止结果后重试',
+            409,
+            {
+              commandId: activeSourceCommand.id,
+              commandType: activeSourceCommand.command_type,
+            },
+          )};
+        }
+
+        const items = await listParentItems(
+          tx,
+          req.tenantId,
+          parent.id,
+          {lock: true},
+        );
+        const sourceItems = items.filter(item =>
+          String(item.execution_task_id || '') === String(sourceTask.id)
+        );
+        const safetyNeedsActionItems = sourceItems.filter(item =>
+          Boolean(item.started_at) &&
+          item.status === 'needs_action' &&
+          itemRequiresManualSafetyAction(item)
+        );
+        const safetyNeedsActionIds = new Set(
+          safetyNeedsActionItems.map(item => String(item.id)),
+        );
+        const unresolvedStartedItems = sourceItems.filter(item =>
+          Boolean(item.started_at) &&
+          ![
+            'completed',
+            'completed_with_warnings',
+            'failed',
+            'skipped',
+            'canceled',
+          ].includes(item.status) &&
+          !safetyNeedsActionIds.has(String(item.id))
+        );
+        if (unresolvedStartedItems.length > 0) {
+          return {failure: requestError(
+            'handoff_source_has_unresolved_started_items',
+            '原任务仍有已开始但未结算的关键词，请先保留结果或人工处理',
+            409,
+            {itemIds: unresolvedStartedItems.map(item => item.id)},
+          )};
+        }
+        const eligibleItems = items.filter(item =>
+          String(item.execution_task_id || '') === String(sourceTask.id) &&
+          !item.started_at &&
+          ![
+            'completed',
+            'completed_with_warnings',
+            'failed',
+            'skipped',
+          ].includes(item.status)
+        );
+        if (eligibleItems.length === 0) {
+          return {failure: requestError(
+            'handoff_has_no_unstarted_items',
+            '原任务没有可接力的未开始关键词；已开始的关键词不会跨设备迁移',
+            409,
+          )};
+        }
+        if (eligibleItems.length > 30) {
+          return {failure: requestError(
+            'handoff_keyword_capacity_exceeded',
+            '一次接力最多下发 30 个未开始关键词',
+            409,
+            {keywordCount: eligibleItems.length},
+          )};
+        }
+
+        const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+        const recoveryPolicy = safeJson(planSnapshot.recoveryPolicy);
+        if (recoveryPolicy.allowIdleAgentHandoff === false) {
+          return {failure: requestError(
+            'handoff_disabled_by_task_policy',
+            '该任务创建时未启用空闲 Agent 接力',
+            409,
+          )};
+        }
+        const compatible = await loadCompatibleAgents(
+          tx,
+          req.tenantId,
+          [normalized.targetAgentId],
+          parent.platform,
+          planSnapshot,
+          {lock: true},
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+        const targetAgent = compatible.agentsById.get(normalized.targetAgentId);
+        if (
+          normalized.targetAgentId ===
+          String(sourceTask.assigned_agent_id || '')
+        ) {
+          return {failure: requestError(
+            'handoff_target_same_as_source',
+            '接力节点必须不同于原执行节点',
+            409,
+          )};
+        }
+        if (!captureAgentOnline(targetAgent.last_heartbeat_at)) {
+          return {failure: requestError(
+            'handoff_target_offline',
+            '接力节点当前离线，请选择在线空闲节点',
+            409,
+          )};
+        }
+        const targetBusyTask = await tx.queryOne(`
+          SELECT id, status
+          FROM capture_tasks
+          WHERE tenant_id = $1
+            AND COALESCE(assigned_agent_id, origin_agent_id) = $2
+            AND task_type <> 'capture_orchestration'
+            AND status = ANY($3::text[])
+          ORDER BY created_at, id
+          LIMIT 1
+        `, [
+          req.tenantId,
+          normalized.targetAgentId,
+          HANDOFF_TARGET_BUSY_STATUSES,
+        ]);
+        if (targetBusyTask) {
+          return {failure: requestError(
+            'handoff_target_busy',
+            '接力节点当前有执行中或排队任务，请选择空闲节点',
+            409,
+            {
+              blockingTaskId: targetBusyTask.id,
+              blockingTaskStatus: targetBusyTask.status,
+            },
+          )};
+        }
+
+        for (const item of safetyNeedsActionItems) {
+          const settledItem = await tx.queryOne(`
+            UPDATE capture_task_items
+            SET status = 'failed',
+              error = jsonb_build_object(
+                'code', 'handoff_source_security_item_failed',
+                'message', '当前关键词触发平台安全验证，人工选择接力后按失败结算',
+                'cause', error
+              ),
+              finished_at = COALESCE(finished_at, now()),
+              updated_at = now()
+            WHERE id = $1 AND tenant_id = $2 AND task_id = $3
+              AND execution_task_id = $4
+              AND started_at IS NOT NULL
+              AND status = 'needs_action'
+            RETURNING id, error, finished_at
+          `, [
+            item.id,
+            req.tenantId,
+            parent.id,
+            sourceTask.id,
+          ]);
+          if (!settledItem) {
+            const conflict = new Error('orchestration_handoff_item_conflict');
+            conflict.code = 'orchestration_handoff_item_conflict';
+            throw conflict;
+          }
+          await tx.execute(`
+            UPDATE capture_task_item_attempts
+            SET status = 'failed',
+              error = $1::jsonb,
+              finished_at = COALESCE(finished_at, $2::timestamptz, now()),
+              updated_at = now()
+            WHERE tenant_id = $3
+              AND item_id = $4
+              AND execution_task_id = $5
+              AND status NOT IN (
+                'completed', 'completed_with_warnings',
+                'failed', 'skipped', 'canceled'
+              )
+          `, [
+            JSON.stringify(safeJson(settledItem.error)),
+            settledItem.finished_at,
+            req.tenantId,
+            item.id,
+            sourceTask.id,
+          ]);
+        }
+
+        eligibleItems.sort(
+          (left, right) => Number(left.ordinal) - Number(right.ordinal),
+        );
+        const nextRevision = currentRevision + 1;
+        const childTaskId = normalized.requestKey;
+        const commandId = crypto.randomUUID();
+        const childTaskInput = normalizeRemoteTaskInput({
+          clientTaskId: childTaskId,
+          title: `${parent.title} · 接力`,
+          executionMode: 'one_time',
+          planSnapshot: {
+            ...planSnapshot,
+            enabled: true,
+            platform: parent.platform,
+            keywords: eligibleItems.map(item => item.keyword),
+          },
+        });
+        const childPlan = childTaskInput.planSnapshot;
+        const total =
+          childPlan.keywords.length *
+          Math.max(1, Number(childPlan.maxRounds) || 1);
+        const childMetadata = {
+          remoteCreated: true,
+          remoteRequestHash: handoffRequestHash,
+          createCommandId: commandId,
+          requestedByUserId: req.user?.id || '',
+          requestedByName: text(req.actorName, 240),
+          executionMode: 'one_time',
+          planSnapshot: childPlan,
+          orchestrationChild: true,
+          parentTaskId: parent.id,
+          orchestrationRevision: nextRevision,
+          itemIds: eligibleItems.map(item => item.id),
+          handoffRequestHash,
+          handoffRequestKey: normalized.requestKey,
+          handoffSourceExecutionTaskId: sourceTask.id,
+          handoffConfirmedByUser: true,
+        };
+        const child = await tx.queryOne(`
+          INSERT INTO capture_tasks (
+            id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
+            client_task_id, task_type, feature_key, title, platform,
+            source, trigger_type, status, progress, checkpoint, counts,
+            metadata, message, source_updated_at
+          ) VALUES (
+            $1::uuid, $2, $3, $4, $4,
+            $1::uuid::text, 'unattended_keyword_capture',
+            'unattended_keyword_plan', $5, $6,
+            'cloud', 'orchestration_handoff', 'pending',
+            $7::jsonb, $8::jsonb, $9::jsonb,
+            $10::jsonb, '人工确认接力任务已创建，等待目标设备领取', now()
+          )
+          RETURNING id, parent_task_id, assigned_agent_id, title, platform,
+            status, progress, counts, metadata, created_at, updated_at
+        `, [
+          childTaskId,
+          req.tenantId,
+          parent.id,
+          normalized.targetAgentId,
+          childTaskInput.title,
+          parent.platform,
+          JSON.stringify({current: 0, total, phase: 'queued'}),
+          JSON.stringify({round: 1, keywordIndex: 0}),
+          JSON.stringify({
+            total,
+            processed: 0,
+            success: 0,
+            failed: 0,
+            skipped: 0,
+          }),
+          JSON.stringify(childMetadata),
+        ]);
+        const command = await tx.queryOne(`
+          INSERT INTO capture_agent_commands (
+            id, tenant_id, agent_id, task_id, command_type, payload,
+            requested_by_user_id, requested_by_name
+          ) VALUES (
+            $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
+          )
+          RETURNING id, status, expires_at, created_at
+        `, [
+          commandId,
+          req.tenantId,
+          normalized.targetAgentId,
+          child.id,
+          JSON.stringify({
+            taskId: child.id,
+            clientTaskId: child.id,
+            title: child.title,
+            executionMode: 'one_time',
+            platform: childPlan.platform,
+            planSnapshot: childPlan,
+            requestHash: handoffRequestHash,
+            authCodeId: targetAgent.auth_code_id,
+            authBindingId: targetAgent.auth_binding_id,
+            orchestration: {
+              parentTaskId: parent.id,
+              revision: nextRevision,
+              itemIds: eligibleItems.map(item => item.id),
+              handoffSourceExecutionTaskId: sourceTask.id,
+            },
+          }),
+          req.user?.id || null,
+          text(req.actorName, 240),
+        ]);
+
+        for (const item of eligibleItems) {
+          await tx.execute(`
+            UPDATE capture_task_item_attempts
+            SET status = 'canceled',
+              error = jsonb_build_object(
+                'code', 'handed_off_after_source_settled',
+                'message', '原执行任务已结束，该未开始关键词由人工确认转交'
+              ),
+              finished_at = COALESCE(finished_at, now()),
+              updated_at = now()
+            WHERE tenant_id = $1
+              AND item_id = $2
+              AND execution_task_id = $3
+              AND status NOT IN (
+                'completed', 'completed_with_warnings',
+                'failed', 'skipped', 'canceled'
+              )
+          `, [req.tenantId, item.id, sourceTask.id]);
+          const updatedItem = await tx.queryOne(`
+            UPDATE capture_task_items
+            SET status = 'dispatched',
+              attempt_count = attempt_count + 1,
+              assigned_agent_id = $1,
+              execution_task_id = $2,
+              assignment_revision = $3,
+              request_hash = $4,
+              error = '{}'::jsonb,
+              metadata = metadata || jsonb_build_object(
+                'handoffSourceExecutionTaskId', $5::uuid::text,
+                'handoffRequestKey', $6::uuid::text
+              ),
+              assigned_at = now(),
+              dispatched_at = now(),
+              started_at = NULL,
+              finished_at = NULL,
+              updated_at = now()
+            WHERE id = $7 AND tenant_id = $8 AND task_id = $9
+              AND execution_task_id = $5
+              AND assignment_revision = $10
+              AND started_at IS NULL
+              AND status NOT IN (
+                'completed', 'completed_with_warnings',
+                'failed', 'skipped'
+              )
+            RETURNING id, attempt_count
+          `, [
+            normalized.targetAgentId,
+            child.id,
+            nextRevision,
+            handoffRequestHash,
+            sourceTask.id,
+            normalized.requestKey,
+            item.id,
+            req.tenantId,
+            parent.id,
+            Number(item.assignment_revision || 0),
+          ]);
+          if (!updatedItem) {
+            const conflict = new Error('orchestration_handoff_item_conflict');
+            conflict.code = 'orchestration_handoff_item_conflict';
+            throw conflict;
+          }
+          await tx.execute(`
+            INSERT INTO capture_task_item_attempts (
+              id, tenant_id, item_id, parent_task_id, execution_task_id,
+              agent_id, attempt_number, assignment_revision, status,
+              request_hash, checkpoint, result, error, dispatched_at
+            ) VALUES (
+              $1, $2, $3, $4, $5,
+              $6, $7, $8, 'dispatched',
+              $9, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+            )
+          `, [
+            crypto.randomUUID(),
+            req.tenantId,
+            item.id,
+            parent.id,
+            child.id,
+            normalized.targetAgentId,
+            Number(updatedItem.attempt_count),
+            nextRevision,
+            handoffRequestHash,
+          ]);
+        }
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET status = 'superseded',
+            metadata = metadata || jsonb_build_object(
+              'handoffSuccessorTaskId', $1::uuid::text,
+              'handoffRequestKey', $2::uuid::text,
+              'handoffSourcePreviousStatus', $3::text,
+              'handedOffAt', now()
+            ),
+            message = '未开始关键词已转交新的执行节点，原任务已封存',
+            finished_at = COALESCE(finished_at, now()),
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $4 AND tenant_id = $5
+        `, [
+          child.id,
+          normalized.requestKey,
+          sourceTask.status,
+          sourceTask.id,
+          req.tenantId,
+        ]);
+
+        const refreshedItems = await listParentItems(
+          tx,
+          req.tenantId,
+          parent.id,
+        );
+        const aggregate = aggregateParentTaskItems(refreshedItems);
+        const parentUpdate = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET orchestration_revision = orchestration_revision + 1,
+            status = $1,
+            progress = $2::jsonb,
+            counts = $3::jsonb,
+            metadata = metadata || jsonb_build_object(
+              'lastHandoffAt', now(),
+              'lastHandoffSourceExecutionTaskId', $4::uuid::text,
+              'lastHandoffSuccessorTaskId', $5::uuid::text,
+              'lastHandoffRequestKey', $6::uuid::text
+            ),
+            message = '未开始关键词已由人工确认转交空闲节点',
+            finished_at = NULL,
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $7 AND tenant_id = $8
+            AND task_type = 'capture_orchestration'
+            AND orchestration_revision = $9
+          RETURNING id, orchestration_revision, status
+        `, [
+          aggregate.status,
+          JSON.stringify(aggregate.progress),
+          JSON.stringify(aggregate.counts),
+          sourceTask.id,
+          child.id,
+          normalized.requestKey,
+          parent.id,
+          req.tenantId,
+          currentRevision,
+        ]);
+        if (!parentUpdate) {
+          const conflict = new Error('orchestration_revision_conflict');
+          conflict.code = 'orchestration_revision_conflict';
+          throw conflict;
+        }
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: sourceTask.id,
+          agentId: sourceTask.assigned_agent_id,
+          eventType: 'orchestration_handoff_source_closed',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: 'superseded',
+          message: '原任务已终止，未开始关键词获准转交',
+          payload: {
+            parentTaskId: parent.id,
+            successorTaskId: child.id,
+            previousStatus: sourceTask.status,
+            itemIds: eligibleItems.map(item => item.id),
+            settledSourceItemIds: safetyNeedsActionItems.map(item => item.id),
+          },
+        });
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: child.id,
+          agentId: normalized.targetAgentId,
+          eventType: 'orchestration_handoff_child_dispatched',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: child.status,
+          message: '人工确认的接力任务已向空闲节点下发',
+          payload: {
+            parentTaskId: parent.id,
+            sourceExecutionTaskId: sourceTask.id,
+            revision: nextRevision,
+            commandId: command.id,
+            itemIds: eligibleItems.map(item => item.id),
+            keywords: eligibleItems.map(item => item.keyword),
+            settledSourceItemIds: safetyNeedsActionItems.map(item => item.id),
+          },
+        });
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_handoff_dispatched',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: parentUpdate.status,
+          message: '未开始关键词已转交新的执行节点',
+          payload: {
+            revision: parentUpdate.orchestration_revision,
+            sourceExecutionTaskId: sourceTask.id,
+            successorTaskId: child.id,
+            targetAgentId: normalized.targetAgentId,
+            itemIds: eligibleItems.map(item => item.id),
+            settledSourceItemIds: safetyNeedsActionItems.map(item => item.id),
+          },
+        });
+        return {
+          existing: false,
+          revision: Number(parentUpdate.orchestration_revision),
+          sourceExecutionTaskId: sourceTask.id,
+          execution: {
+            taskId: child.id,
+            agentId: normalized.targetAgentId,
+            commandId: command.id,
+            commandStatus: command.status,
+            status: child.status,
+            itemIds: eligibleItems.map(item => item.id),
+            keywords: eligibleItems.map(item => item.keyword),
+          },
+        };
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.status(result.existing ? 200 : 201).json({
+        ok: true,
+        idempotent: result.existing === true,
+        action: 'handoff',
+        orchestrationId,
+        revision: result.revision,
+        sourceExecutionTaskId: result.sourceExecutionTaskId,
+        execution: result.execution,
+        message: result.existing
+          ? '该接力请求已经下发'
+          : '未开始关键词已转交空闲节点',
+      });
+    } catch (error) {
+      if (
+        error?.code === 'orchestration_revision_conflict' ||
+        error?.code === 'orchestration_handoff_item_conflict' ||
+        error?.code === '23505'
+      ) {
+        return sendRequestError(res, requestError(
+          'handoff_conflict',
+          '接力过程中任务发生并发更新，请刷新后重试',
+          409,
+        ));
+      }
       return next(error);
     }
   },

@@ -68,7 +68,11 @@ export function OpinionPage() {
     } finally { setLoading(false) }
   }, [state, type, platform, keyword])
 
-  useEffect(() => { load(1) }, [state, type, platform]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load(1) })
+    return () => { active = false }
+  }, [state, type, platform]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const act = async (item: any, action: string, needNote = false) => {
     let note: string | undefined

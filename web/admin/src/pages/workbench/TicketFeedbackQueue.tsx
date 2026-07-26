@@ -36,7 +36,7 @@ export function TicketFeedbackQueue() {
   const [error, setError] = useState('')
   const [drawer, setDrawer] = useState<any>(null)
 
-  const load = useCallback(async (page = 1) => {
+  const load = useCallback((page = 1) => Promise.resolve().then(async () => {
     setLoading(true); setError('')
     try {
       const data = await api.get<any>(`/tickets/dispatched?view=${view}&page=${page}&pageSize=30`)
@@ -46,9 +46,9 @@ export function TicketFeedbackQueue() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败')
     } finally { setLoading(false) }
-  }, [view])
+  }), [view])
 
-  useEffect(() => { load(1) }, [view]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load(1) }, [load])
 
   const closeTicket = async (item: any) => {
     const v = await ask({ title: '结案', placeholder: '填写结案说明 / 处理结论(可留空)' })

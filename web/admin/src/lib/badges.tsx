@@ -33,36 +33,45 @@ const POLL_MS = 60_000
 
 export function BadgesProvider({ children }: { children: ReactNode }) {
   const { tenantId, user } = useAuth()
-  const [badges, setBadges] = useState<Badges>(EMPTY)
+  const badgeScope = user && tenantId ? `${user.id}:${tenantId}` : ''
+  const [badgeState, setBadgeState] = useState<{ scope: string; badges: Badges }>({
+    scope: '',
+    badges: EMPTY,
+  })
+  const badges = badgeState.scope === badgeScope ? badgeState.badges : EMPTY
   // 标识当前生效的拉取批次:租户切换/卸载时递增,丢弃在途的旧响应,避免计数串租户
   const tokenRef = useRef(0)
+  const invalidatePending = useCallback(() => {
+    tokenRef.current += 1
+  }, [])
 
   const refresh = useCallback(() => {
-    if (!user || !tenantId) {
-      setBadges(EMPTY)
-      return
-    }
+    if (!user || !tenantId) return
     const token = ++tokenRef.current
     api.get<{ ok: boolean; badges: Badges }>('/workspace/badges')
       .then(data => {
-        if (token === tokenRef.current && data?.ok) setBadges({ ...EMPTY, ...(data.badges || {}) })
+        if (token === tokenRef.current && data?.ok) {
+          setBadgeState({
+            scope: badgeScope,
+            badges: { ...EMPTY, ...(data.badges || {}) },
+          })
+        }
       })
       .catch(() => {})
-  }, [user, tenantId])
+  }, [badgeScope, user, tenantId])
 
   useEffect(() => {
-    tokenRef.current++ // 租户变更立即作废在途请求
-    setBadges(EMPTY)
+    invalidatePending() // 租户变更立即作废在途请求
     refresh()
     const timer = window.setInterval(refresh, POLL_MS)
     const onVisible = () => { if (document.visibilityState === 'visible') refresh() }
     document.addEventListener('visibilitychange', onVisible)
     return () => {
-      tokenRef.current++
+      invalidatePending()
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [refresh])
+  }, [invalidatePending, refresh])
 
   return (
     <BadgesContext.Provider value={{ badges, refresh }}>

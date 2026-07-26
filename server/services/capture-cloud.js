@@ -347,6 +347,17 @@ export function normalizeRemoteTaskInput(input = {}) {
       true,
     ),
   };
+  const rawRecoveryPolicy = jsonObject(read('recoveryPolicy'));
+  const recoveryPolicy = {
+    allowIdleAgentHandoff: boolean(
+      rawRecoveryPolicy.allowIdleAgentHandoff ??
+      rawRecoveryPolicy.allow_idle_agent_handoff,
+      true,
+    ),
+    // Platform safety challenges are never allowed to trigger an automatic
+    // device switch. This value is intentionally fixed by the server contract.
+    platformSafetyMode: 'manual_confirmed',
+  };
 
   const planSnapshot = {
     enabled,
@@ -360,6 +371,7 @@ export function normalizeRemoteTaskInput(input = {}) {
     autoLoop: maxRounds > 1,
     roundGapMin,
     maxRounds,
+    recoveryPolicy,
     holidayDates: '',
     customDates,
     ...(hasCaptureSettings ? {captureSettings} : {}),
@@ -461,6 +473,22 @@ export function isCloudTaskTerminal(status) {
 export function captureAgentOnline(lastHeartbeatAt, now = Date.now(), staleMs = 2 * 60 * 1000) {
   const timestamp = Date.parse(String(lastHeartbeatAt || ''));
   return Number.isFinite(timestamp) && now - timestamp <= staleMs;
+}
+
+export async function lockCaptureAgentExecutionSlot(
+  executor,
+  tenantId,
+  agentId,
+) {
+  const scopedTenantId = text(tenantId, 100);
+  const scopedAgentId = text(agentId, 100);
+  if (!scopedTenantId || !scopedAgentId) {
+    throw new Error('capture_agent_execution_slot_identity_required');
+  }
+  await executor.execute(
+    'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+    ['capture_agent_execution_slot', `${scopedTenantId}:${scopedAgentId}`],
+  );
 }
 
 export async function issueCaptureAgentCredential({

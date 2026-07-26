@@ -33,7 +33,7 @@ export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite,
   const [overCol, setOverCol] = useState<ColKey | null>(null)
   const dragFrom = useRef<ColKey | null>(null)
 
-  const load = useCallback(async () => {
+  const load = useCallback(() => Promise.resolve().then(async () => {
     setLoading(true)
     try {
       const results = await Promise.all(COLUMNS.map(c => {
@@ -44,9 +44,9 @@ export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite,
       for (const [k, recs] of results) next[k] = recs
       setCols(next)
     } finally { setLoading(false) }
-  }, [sentiment, platform, keyword])
+  }), [sentiment, platform, keyword])
 
-  useEffect(() => { load() }, [reloadKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load() }, [load, reloadKey])
 
   const move = useCallback(async (id: string, from: ColKey, to: ColKey) => {
     if (from === to) return

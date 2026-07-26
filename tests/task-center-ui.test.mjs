@@ -606,6 +606,37 @@ test("task center refreshes detail and keeps service-abnormal failures retryable
   assert.match(ui, /button\.setAttribute\("aria-label", `筛选\$\{label\}任务，\$\{count\} 个`\)/);
 });
 
+test("a safety interruption offers human-confirmed continuation or a clean stop", async () => {
+  const {getTaskCenterActions} = await import(
+    `../sidebar/task-center-ui.js?safety-actions-test=${Date.now()}`
+  );
+  const actions = getTaskCenterActions({
+    type: "keyword",
+    status: "attention",
+    canControlKeywordRun: true,
+    raw: {
+      taskType: "unattended_keyword_capture",
+      requiresManualAction: true,
+      error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    },
+  });
+
+  assert.deepEqual(actions, [
+    {
+      id: "resume_remaining",
+      label: "已完成验证，继续",
+      primary: true,
+    },
+    {id: "keep_results", label: "结束并保留"},
+  ]);
+
+  const logic = await read("sidebar/sidebar-logic.js");
+  assert.match(
+    logic,
+    /isUnattendedSafetyBlock\(detail\.task \|\| \{\}\)[\s\S]*请先在抖音页面人工完成安全验证/,
+  );
+});
+
 test("sidebar state subscribes to task ledger and legacy unattended records", async () => {
   const [constants, state] = await Promise.all([
     read("utils/constants.js"),

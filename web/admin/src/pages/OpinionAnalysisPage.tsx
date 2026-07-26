@@ -83,19 +83,22 @@ export function OpinionAnalysisPage() {
     .then(d => setItems(d.analyses || []))
     .catch(console.error)
 
-  useEffect(() => { loadList().finally(() => setLoading(false)) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { loadList().finally(() => setLoading(false)) }, [])
 
   // 列表停留时对排队/运行中的行保持轮询,让状态徽章自己走到 done/failed
   useEffect(() => {
     if (selectedId || !items.some(x => x.status === 'pending' || x.status === 'running')) return
     const timer = window.setTimeout(loadList, 2500)
     return () => window.clearTimeout(timer)
-  }, [items, selectedId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [items, selectedId])
 
   // 详情轮询:pending/running 每 2.5s 刷一次,done/failed 停
   useEffect(() => {
-    if (!selectedId) { setDetail(null); return }
     let alive = true
+    if (!selectedId) {
+      queueMicrotask(() => { if (alive) setDetail(null) })
+      return () => { alive = false }
+    }
     let timer: number | undefined
     const tick = async () => {
       try {
@@ -112,7 +115,7 @@ export function OpinionAnalysisPage() {
     }
     tick()
     return () => { alive = false; if (timer) window.clearTimeout(timer) }
-  }, [selectedId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedId])
 
   const rerun = async (id: string) => {
     try {

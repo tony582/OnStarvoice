@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Loader2, Flame, Heart, MessageCircle, Star, Share2, X, FileText,
   Anchor, Type, ListTree, Hash, Sparkles, Copy, ExternalLink, Wand2,
@@ -13,6 +13,11 @@ export function HitsPage() {
   const [hits, setHits] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [open, setOpen] = useState<any>(null)
+  const markAnalyzed = useCallback((hitId: string) => {
+    setHits(current => current.map(hit =>
+      hit.id === hitId ? { ...hit, analyzed: true } : hit,
+    ))
+  }, [])
 
   useEffect(() => {
     api.get<any>('/content/hits').then(d => setHits(d.hits || [])).catch(console.error).finally(() => setLoading(false))
@@ -63,12 +68,19 @@ export function HitsPage() {
         </div>
       )}
 
-      {open && <HitDrawer hit={open} onClose={() => setOpen(null)} onAnalyzed={() => setHits(hs => hs.map(x => x.id === open.id ? { ...x, analyzed: true } : x))} />}
+      {open && (
+        <HitDrawer
+          key={open.id}
+          hit={open}
+          onClose={() => setOpen(null)}
+          onAnalyzed={markAnalyzed}
+        />
+      )}
     </div>
   )
 }
 
-function HitDrawer({ hit, onClose, onAnalyzed }: { hit: any; onClose: () => void; onAnalyzed: () => void }) {
+function HitDrawer({ hit, onClose, onAnalyzed }: { hit: any; onClose: () => void; onAnalyzed: (hitId: string) => void }) {
   const [analysis, setAnalysis] = useState<any>(null)
   const [source, setSource] = useState('')
   const [loading, setLoading] = useState(true)
@@ -76,13 +88,12 @@ function HitDrawer({ hit, onClose, onAnalyzed }: { hit: any; onClose: () => void
 
   useEffect(() => {
     let alive = true
-    setLoading(true)
     api.post<any>(`/content/hits/${hit.id}/analyze`)
-      .then(d => { if (alive) { setAnalysis(d.analysis); setSource(d.source); if (!d.cached) onAnalyzed() } })
+      .then(d => { if (alive) { setAnalysis(d.analysis); setSource(d.source); if (!d.cached) onAnalyzed(hit.id) } })
       .catch(console.error)
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [hit.id])
+  }, [hit.id, onAnalyzed])
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>

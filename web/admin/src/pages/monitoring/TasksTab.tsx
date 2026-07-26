@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { AlertTriangle, ArrowUpRight, Clock, Loader2, Play, Radar, Target } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatDateCompact, platformName, formatNumber } from '@/lib/utils'
@@ -22,14 +22,14 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
   const [runningId, setRunningId] = useState('')
   const [actionError, setActionError] = useState('')
 
-  const load = async () => {
+  const load = useCallback(() => Promise.resolve().then(async () => {
     setLoading(true)
     const data = await api.get<any>('/monitor/subscriptions')
     setSubs(data.subscriptions || [])
     setLoading(false)
-  }
+  }), [])
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { void load() }, [load])
 
   const runNow = async (id: string) => {
     setRunningId(id)

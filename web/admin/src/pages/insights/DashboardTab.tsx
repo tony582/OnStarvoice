@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import cloud from 'd3-cloud'
 import {
   AlertTriangle, BarChart3, CalendarDays, ChevronDown, Loader2, MessageSquareWarning, RefreshCw, Sparkles, Star, X,
@@ -202,7 +202,7 @@ export function DashboardTab() {
   const [error, setError] = useState('')
   const [keywords, setKeywords] = useState<string[]>([]) // 关注主题/临时关键词:空=全量
 
-  const load = async () => {
+  const load = useCallback(() => Promise.resolve().then(async () => {
     setLoading(true)
     setError('')
     try {
@@ -219,9 +219,9 @@ export function DashboardTab() {
     } finally {
       setLoading(false)
     }
-  }
+  }), [range, start, end, keywords])
 
-  useEffect(() => { load() }, [range, start, end, keywords])
+  useEffect(() => { void load() }, [load])
 
   const s = data?.snapshot
 
@@ -719,12 +719,13 @@ function PlatformMatrix({ rows }: { rows: any[] }) {
 
 function SentimentRing({ rows }: { rows: any[] }) {
   if (!rows.length) return <EmptyState icon={BarChart3} title="暂无情绪数据" />
-  let cursor = 0
-  const stops = rows.map(row => {
-    const start = cursor
-    cursor += Number(row.share) || 0
-    return `${row.color} ${start}% ${Math.min(100, cursor)}%`
-  }).join(', ')
+  const stops = rows.reduce<{ cursor: number; values: string[] }>((result, row) => {
+    const nextCursor = result.cursor + (Number(row.share) || 0)
+    return {
+      cursor: nextCursor,
+      values: [...result.values, `${row.color} ${result.cursor}% ${Math.min(100, nextCursor)}%`],
+    }
+  }, { cursor: 0, values: [] }).values.join(', ')
   const negative = rows.find(row => row.key === 'negative') || { share: 0 }
   return (
     <div className="grid gap-5 sm:grid-cols-[150px_minmax(0,1fr)]">
@@ -817,7 +818,7 @@ const CLOUD_COLORS = ['#2563EB', '#E11D48', '#059669', '#D97706', '#7C3AED', '#0
 function WordCloud({ terms }: { terms: any[] }) {
   const ref = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(560)
-  const [placed, setPlaced] = useState<any[]>([])
+  const [placement, setPlacement] = useState<{ source: any[]; width: number; words: any[] } | null>(null)
   const H = 340
 
   useEffect(() => {
@@ -831,7 +832,7 @@ function WordCloud({ terms }: { terms: any[] }) {
   }, [])
 
   useEffect(() => {
-    if (!terms.length || !width) { setPlaced([]); return }
+    if (!terms.length || !width) return
     const top = terms.slice(0, 60)
     const ws = top.map(t => Number(t.weight) || Number(t.count) || 1)
     const max = Math.max(...ws, 1), min = Math.min(...ws)
@@ -855,12 +856,15 @@ function WordCloud({ terms }: { terms: any[] }) {
       .rotate(() => (Math.random() < 0.12 ? 90 : 0))
       .font('sans-serif')
       .fontSize((d: any) => d.size)
-      .on('end', (out: any[]) => { if (!cancelled) setPlaced(out) })
+      .on('end', (out: any[]) => {
+        if (!cancelled) setPlacement({ source: terms, width, words: out })
+      })
     layout.start()
     return () => { cancelled = true; layout.stop() }
   }, [terms, width])
 
   if (!terms.length) return <EmptyState icon={BarChart3} title="暂无热点词" />
+  const placed = placement?.source === terms && placement.width === width ? placement.words : []
   return (
     <div ref={ref} className="w-full">
       <svg width={width} height={H} className="w-full" style={{ display: 'block' }}>

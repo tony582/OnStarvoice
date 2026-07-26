@@ -4674,6 +4674,80 @@ function buildManualRecoveryCheckpoint(request, mode) {
       attempts: {},
     };
   }
+  if (mode === 'remaining') {
+    const currentKeyword = String(
+      checkpoint.activeKeyword ||
+        checkpoint.currentKeyword ||
+        request?.progress?.keyword ||
+        '',
+    ).trim();
+    const round = Math.max(1, Number(checkpoint.round) || 1);
+    const resultIndex = checkpoint.keywordResults.findIndex(
+      (entry) =>
+        String(entry?.keyword || '').trim() === currentKeyword &&
+        Math.max(1, Number(entry?.round) || 1) === round,
+    );
+    const currentEntry =
+      resultIndex >= 0 ? checkpoint.keywordResults[resultIndex] : null;
+    const currentCode = String(
+      currentEntry?.errorCode ||
+        currentEntry?.error_code ||
+        currentEntry?.error?.code ||
+        '',
+    )
+      .trim()
+      .toUpperCase();
+    const manuallyResolved = Boolean(
+      currentEntry &&
+        (currentEntry.securityBlocked === true ||
+          currentEntry.security_blocked === true ||
+          currentEntry.requiresManualAction === true ||
+          currentEntry.requires_manual_action === true ||
+          [
+            'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+            'PLATFORM_SAFETY_BLOCK',
+            'SECURITY_VERIFICATION_REQUIRED',
+            'LOGIN_REQUIRED',
+          ].includes(currentCode)),
+    );
+    if (manuallyResolved) {
+      const reopenedEntry = {
+        ...currentEntry,
+        status: 'retrying',
+        attemptCount: 0,
+        error: '',
+        finishedAt: '',
+      };
+      for (const field of [
+        'securityBlocked',
+        'security_blocked',
+        'requiresManualAction',
+        'requires_manual_action',
+        'errorCode',
+        'error_code',
+        'errorCategory',
+        'error_category',
+      ]) {
+        delete reopenedEntry[field];
+      }
+      checkpoint.keywordResults[resultIndex] = reopenedEntry;
+      checkpoint.failedKeywords = checkpoint.failedKeywords.filter(
+        (keyword) => keyword !== currentKeyword,
+      );
+      if (
+        checkpoint.attempts &&
+        Object.prototype.hasOwnProperty.call(
+          checkpoint.attempts,
+          currentKeyword,
+        )
+      ) {
+        delete checkpoint.attempts[currentKeyword];
+      }
+      checkpoint.activePhase = 'pending';
+      checkpoint.phase = '';
+      checkpoint.updatedAt = new Date().toISOString();
+    }
+  }
   if (mode === 'skip_current') {
     const currentKeyword = String(
       checkpoint.activeKeyword ||

@@ -190,6 +190,7 @@ export type OrchestrationComposerDrawerProps = {
 export type OrchestrationDetailWorkspaceProps = {
   orchestrationId: string | null
   writable?: boolean
+  availableAgents?: OrchestrationCloudAgent[]
   onClose?: () => void
   onChanged?: () => void | Promise<void>
   className?: string

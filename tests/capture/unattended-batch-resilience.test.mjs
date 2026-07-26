@@ -11,6 +11,13 @@ const contentSource = await readFile(
   new URL("../../content-v2.js", import.meta.url),
   "utf8",
 );
+const douyinKeywordSearchSource = await readFile(
+  new URL(
+    "../../utils/capture/douyin-keyword-search.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function readBatchFunctionSource() {
   const startMarker = "export async function batchCaptureByKeywords({";
@@ -47,6 +54,7 @@ function createBatchHarness({
   switchDouyinKeyword = null,
   waitForResults = null,
   hasActiveFilters = false,
+  assertNoSecurityChallenge = null,
 } = {}) {
   const captureCalls = [];
   const filterCalls = [];
@@ -100,6 +108,8 @@ function createBatchHarness({
     BATCH_INTER_KEYWORD_DELAY_MIN_MS: 0,
     BATCH_KEYWORD_AFTER_NAV_WAIT_MS: 0,
     BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS: 0,
+    DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE:
+      "DOUYIN_SEARCH_SECURITY_CHALLENGE",
     Math,
     activateTabForReliableTimer: async () => {},
     buildInterKeywordDelayMessage: ({keyword}) => `next:${keyword}`,
@@ -120,6 +130,11 @@ function createBatchHarness({
     formatEnhanceSkipReason: (reason) => reason || "",
     getCurrentActiveTab: async () => liveTabs.get(101),
     hasActiveBatchSearchFilters: () => hasActiveFilters,
+    assertNoDouyinSearchSecurityChallengeInTab: async (tabId) => {
+      if (typeof assertNoSecurityChallenge === "function") {
+        await assertNoSecurityChallenge({tabId});
+      }
+    },
     isBatchCaptureCanceledError: (error) =>
       ["BATCH_CAPTURE_CANCELED", "DETAIL_CAPTURE_CANCELED"].includes(
         String(error?.message || ""),
@@ -132,6 +147,9 @@ function createBatchHarness({
           ),
       ),
     isDouyinPlatform: (platform) => platform === "douyin",
+    isDouyinSearchSecurityChallengeError: (error) =>
+      String(error?.code || "").toUpperCase() ===
+      "DOUYIN_SEARCH_SECURITY_CHALLENGE",
     isEmptyKeywordCaptureResult: (result) =>
       Boolean(result?.ok && Array.isArray(result?.data?.items) && result.data.items.length === 0),
     isUnattendedSafetyBlock: (value) =>
@@ -376,6 +394,128 @@ test("Douyin service-abnormal state fails the current keyword and continues the 
   assert.equal(harness.progress.at(-1)?.phase, "done");
 });
 
+test("Douyin security challenge stops the whole keyword batch for human action", async () => {
+  let readinessChecks = 0;
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    waitForResults: async () => {
+      readinessChecks += 1;
+      if (readinessChecks === 1) {
+        const error = new Error(
+          "检测到抖音图片安全验证，已停止后续搜索并保留已发现结果",
+        );
+        error.code = "DOUYIN_SEARCH_SECURITY_CHALLENGE";
+        error.category = "platform_safety_block";
+        error.securityBlocked = true;
+        error.platformSafetyBlocked = true;
+        error.requiresManualAction = true;
+        error.stopBatch = true;
+        error.fatal = true;
+        error.retryable = false;
+        throw error;
+      }
+      return true;
+    },
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+  });
+
+  assert.equal(result.canceled, true);
+  assert.equal(result.securityBlocked, true);
+  assert.equal(result.platformSafetyBlocked, true);
+  assert.equal(result.requiresManualAction, true);
+  assert.equal(
+    result.blockingError?.code,
+    "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+  );
+  assert.deepEqual(harness.captureCalls, []);
+  assert.deepEqual(
+    harness.navigationCalls.map((entry) => entry.keyword),
+    ["词1"],
+  );
+  assert.equal(harness.settled.length, 1);
+  assert.equal(harness.progress.at(-1)?.phase, "needs_action");
+});
+
+test("a challenge appearing during the safety delay preserves the settled keyword and never searches the next", async () => {
+  let safetyChecks = 0;
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    assertNoSecurityChallenge: async () => {
+      safetyChecks += 1;
+      if (safetyChecks === 2) {
+        const error = new Error(
+          "检测到抖音图片安全验证，已停止后续搜索并保留已发现结果",
+        );
+        error.code = "DOUYIN_SEARCH_SECURITY_CHALLENGE";
+        error.category = "platform_safety_block";
+        error.securityBlocked = true;
+        error.platformSafetyBlocked = true;
+        error.requiresManualAction = true;
+        error.stopBatch = true;
+        error.fatal = true;
+        error.retryable = false;
+        throw error;
+      }
+    },
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+  });
+
+  assert.equal(result.canceled, true);
+  assert.equal(result.securityBlocked, true);
+  assert.equal(result.stats.success, 1);
+  assert.equal(result.stats.failed, 0);
+  assert.deepEqual(
+    harness.captureCalls.map((entry) => entry.keyword),
+    ["词1"],
+  );
+  assert.deepEqual(
+    harness.navigationCalls.map((entry) => entry.keyword),
+    ["词1"],
+  );
+  assert.equal(harness.settled.length, 1);
+  assert.equal(harness.settled[0].result.ok, true);
+});
+
+test("a blocked list capture persists its partial payload before returning the safety error", () => {
+  const start = captureSyncSource.indexOf(
+    "async function captureAndSaveInTab({",
+  );
+  const end = captureSyncSource.indexOf(
+    "async function captureBatchByUrls(",
+    start,
+  );
+  const source = captureSyncSource.slice(start, end);
+  assert.match(
+    source,
+    /captureResult\?\.partial === true[\s\S]*saveCaptureResultRecords[\s\S]*recordIds: partialRecordIds/u,
+  );
+});
+
+test("a challenge race harvests only same-keyword mounted links before returning the partial result", () => {
+  assert.match(
+    douyinKeywordSearchSource,
+    /const preserveMountedResultsAfterSecurityChallenge = \(\) => \{[\s\S]*!mountedKeyword[\s\S]*mountedKeyword !== expectedKeyword[\s\S]*extractDouyinSearchCards\(searchRoot\)[\s\S]*recoveredFromMountedResults: true/u,
+  );
+  assert.match(
+    douyinKeywordSearchSource,
+    /if \(securityChallenge\) \{\s*try \{\s*preserveMountedResultsAfterSecurityChallenge\(\);[\s\S]*Preservation is best-effort[\s\S]*\}[\s]*\}[\s\S]*const partialPayload/u,
+  );
+  assert.match(
+    douyinKeywordSearchSource,
+    /if \(outcome\?\.error\) \{[\s\S]*Safety must win the race[\s\S]*assertNoSecurityChallenge\(\);[\s\S]*throw outcome\.error;/u,
+  );
+});
+
 test("Douyin checks the service-abnormal guard before clicking search or filters", () => {
   const submitStart = captureSyncSource.indexOf(
     "async function submitKeywordSearchInTab(",
@@ -398,6 +538,14 @@ test("Douyin checks the service-abnormal guard before clicking search or filters
     contentSource,
     /case "assertNoDouyinSearchServiceAbnormal":[\s\S]*handleAssertNoDouyinSearchServiceAbnormal/u,
   );
+  assert.match(
+    contentSource,
+    /function handleAssertNoDouyinSearchServiceAbnormal[\s\S]*assertNoDouyinSearchSecurityChallengePage\(\);[\s\S]*assertNoDouyinSearchServiceAbnormalPage\(\);/u,
+  );
+  assert.match(
+    submitSource,
+    /isDouyinSearchSecurityChallengeError\(guardError\)[\s\S]*createDouyinSearchSecurityChallengeError/u,
+  );
   const filterStart = contentSource.indexOf(
     "async function applyBatchSearchFilters({",
   );
@@ -412,6 +560,11 @@ test("Douyin checks the service-abnormal guard before clicking search or filters
   const filterRequestsIndex = filterSource.indexOf("const filterRequests =");
   assert.ok(filterGuardIndex > -1);
   assert.ok(filterRequestsIndex > filterGuardIndex);
+
+  assert.match(
+    captureSyncSource,
+    /async function waitForKeywordSearchTargetReadyInTab[\s\S]*isDouyinPlatform\(navigationContext\?\.platform\)[\s\S]*assertNoDouyinSearchSecurityChallengeInTab\(tabId\)[\s\S]*isKeywordSearchTargetReadyInTab/u,
+  );
 });
 
 test("Douyin readiness rejects recommendation, detail, modal, and another keyword URLs", () => {
