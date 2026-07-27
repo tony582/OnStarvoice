@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.59',
+  latestVersion: '0.3.60',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-07-26',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.59-20260726.zip',
+  releaseDate: '2026-07-27',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.60-20260727.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.60',
+      releaseDate: '2026-07-27',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '社交账号与 Agent 绑定',
+              desc: '人工指定 Agent 后不再被心跳覆盖，并过滤无效账号身份与过期识别缓存。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.59',
       releaseDate: '2026-07-26',

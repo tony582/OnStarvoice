@@ -1,5 +1,16 @@
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin', 'weibo']);
 const LOGIN_STATES = new Set(['authenticated', 'logged_out', 'unknown']);
+const IDENTITY_CONFIDENCES = new Set(['high', 'medium', 'low', 'unknown']);
+const RESERVED_PLATFORM_ACCOUNT_IDS = new Set([
+  'self',
+  'me',
+  'my',
+  'profile',
+  'home',
+  'login',
+  'undefined',
+  'null',
+]);
 const MAX_USAGE_EVENTS_PER_HEARTBEAT = 200;
 const MAX_EVENT_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 const MAX_FUTURE_SKEW_MS = 10 * 60 * 1000;
@@ -24,6 +35,60 @@ export function normalizeSocialPlatform(value) {
   return SUPPORTED_PLATFORMS.has(platform) ? platform : '';
 }
 
+export function isReservedPlatformAccountId(value) {
+  return RESERVED_PLATFORM_ACCOUNT_IDS.has(
+    text(value, 240).toLowerCase().replace(/^@/u, ''),
+  );
+}
+
+export function hasDurableSocialAccountIdentity(value = {}) {
+  const source = safeJson(value);
+  return Boolean(
+    (
+      text(source.platformAccountId, 240) &&
+      !isReservedPlatformAccountId(source.platformAccountId)
+    ) ||
+    (
+      text(source.accountHandle, 160) &&
+      !isReservedPlatformAccountId(source.accountHandle)
+    ),
+  );
+}
+
+export function isTrustedSocialAccountObservation(value = {}) {
+  const source = safeJson(value);
+  return (
+    hasDurableSocialAccountIdentity(source) &&
+    ['high', 'medium'].includes(
+      text(source.confidence, 40).toLowerCase(),
+    )
+  );
+}
+
+export function socialAccountIdentityMatchesAccount(
+  observedValue = {},
+  accountValue = {},
+) {
+  const observed = safeJson(observedValue);
+  const account = safeJson(accountValue);
+  const observedId = text(observed.platformAccountId, 240);
+  const accountId = text(
+    account.platform_account_id || account.platformAccountId,
+    240,
+  );
+  if (observedId && accountId) return observedId === accountId;
+  const observedHandle = text(observed.accountHandle, 160).toLowerCase();
+  const accountHandle = text(
+    account.account_handle || account.accountHandle,
+    160,
+  ).toLowerCase();
+  return Boolean(
+    observedHandle &&
+    accountHandle &&
+    observedHandle === accountHandle,
+  );
+}
+
 export function normalizeObservedSocialAccount(value = {}) {
   const source = safeJson(value);
   const platform = normalizeSocialPlatform(source.platform);
@@ -31,14 +96,22 @@ export function normalizeObservedSocialAccount(value = {}) {
   const loginState = LOGIN_STATES.has(source.loginState)
     ? source.loginState
     : 'unknown';
-  const platformAccountId = text(
+  const rawPlatformAccountId = text(
     source.platformAccountId || source.accountId,
     240,
   );
-  const accountHandle = text(
+  const platformAccountId = isReservedPlatformAccountId(
+    rawPlatformAccountId,
+  )
+    ? ''
+    : rawPlatformAccountId;
+  const rawAccountHandle = text(
     source.accountHandle || source.handle,
     160,
   );
+  const accountHandle = isReservedPlatformAccountId(rawAccountHandle)
+    ? ''
+    : rawAccountHandle;
   const displayName = text(
     source.displayName || source.accountName,
     160,
@@ -51,7 +124,11 @@ export function normalizeObservedSocialAccount(value = {}) {
     displayName,
     avatarUrl: text(source.avatarUrl, 1000),
     loginState,
-    confidence: text(source.confidence || 'unknown', 40),
+    confidence: IDENTITY_CONFIDENCES.has(
+      text(source.confidence, 40).toLowerCase(),
+    )
+      ? text(source.confidence, 40).toLowerCase()
+      : 'unknown',
     sourceUrl: text(source.sourceUrl, 1000),
     observedAt: Number.isFinite(observedAt.getTime())
       ? observedAt.toISOString()
@@ -135,7 +212,7 @@ async function currentBinding(tx, agent, platform) {
     SELECT
       b.id AS binding_id, b.social_account_id, b.source AS binding_source,
       a.platform_account_id, a.account_handle, a.display_name,
-      a.identity_source
+      a.identity_source, a.agent_binding_mode
     FROM social_account_bindings b
     JOIN social_accounts a
       ON a.id = b.social_account_id AND a.tenant_id = b.tenant_id
@@ -152,7 +229,8 @@ async function currentBinding(tx, agent, platform) {
 async function findObservedAccount(tx, agent, observed) {
   if (observed.platformAccountId) {
     const byId = await tx.queryOne(`
-      SELECT id, identity_source
+      SELECT id, identity_source, agent_binding_mode,
+        platform_account_id, account_handle
       FROM social_accounts
       WHERE tenant_id = $1 AND platform = $2 AND platform_account_id = $3
       LIMIT 1
@@ -165,16 +243,23 @@ async function findObservedAccount(tx, agent, observed) {
   }
   if (observed.accountHandle) {
     return await tx.queryOne(`
-      SELECT id, identity_source
+      SELECT id, identity_source, agent_binding_mode,
+        platform_account_id, account_handle
       FROM social_accounts
       WHERE tenant_id = $1
         AND platform = $2
         AND lower(account_handle) = lower($3)
+        AND (
+          $4 = ''
+          OR platform_account_id = ''
+          OR platform_account_id = $4
+        )
       LIMIT 1
     `, [
       agent.tenant_id,
       observed.platform,
       observed.accountHandle,
+      observed.platformAccountId,
     ]);
   }
   return null;
@@ -184,17 +269,20 @@ async function updateAccountObservation(tx, agent, accountId, observed) {
   return await tx.queryOne(`
     UPDATE social_accounts
     SET platform_account_id = CASE
-        WHEN platform_account_id = '' THEN $1
+        WHEN identity_source <> 'manual' AND platform_account_id = '' THEN $1
         ELSE platform_account_id
       END,
       account_handle = CASE
-        WHEN account_handle = '' THEN $2
+        WHEN identity_source <> 'manual' AND account_handle = '' THEN $2
         ELSE account_handle
       END,
-      display_name = COALESCE(NULLIF($3, ''), display_name),
+      display_name = CASE
+        WHEN identity_source = 'manual' THEN display_name
+        ELSE COALESCE(NULLIF($3, ''), display_name)
+      END,
       identity_source = CASE
         WHEN identity_source = 'placeholder'
-          AND ($1 <> '' OR $2 <> '' OR $3 <> '')
+          AND ($1 <> '' OR $2 <> '')
           THEN 'extension'
         ELSE identity_source
       END,
@@ -280,7 +368,8 @@ async function createObservedAccount(tx, agent, observed, source) {
       $9
     )
     ON CONFLICT DO NOTHING
-    RETURNING id, identity_source
+    RETURNING id, identity_source, agent_binding_mode,
+      platform_account_id, account_handle
   `, [
     agent.tenant_id,
     observed.platform,
@@ -311,6 +400,7 @@ export async function ensureCurrentSocialAccount(
   );
   if (!observed) return null;
   const current = await currentBinding(tx, agent, observed.platform);
+  const hasDurableIdentity = hasDurableSocialAccountIdentity(observed);
 
   if (
     current &&
@@ -338,16 +428,7 @@ export async function ensureCurrentSocialAccount(
   const sameCurrentIdentity = Boolean(
     current &&
     (
-      (
-        observed.platformAccountId &&
-        observed.platformAccountId === current.platform_account_id
-      ) ||
-      (
-        !observed.platformAccountId &&
-        observed.accountHandle &&
-        observed.accountHandle.toLowerCase() ===
-          String(current.account_handle || '').toLowerCase()
-      ) ||
+      socialAccountIdentityMatchesAccount(observed, current) ||
       (
         !observed.platformAccountId &&
         !observed.accountHandle &&
@@ -361,6 +442,33 @@ export async function ensureCurrentSocialAccount(
       )
     )
   );
+
+  if (!hasDurableIdentity) {
+    if (!current) return null;
+    const manualCurrent =
+      current.binding_source === 'manual' ||
+      current.agent_binding_mode === 'manual';
+    if (!manualCurrent) return null;
+    await updateAccountObservation(
+      tx,
+      agent,
+      current.social_account_id,
+      {...observed, displayName: ''},
+    );
+    await tx.execute(`
+      UPDATE social_account_bindings
+      SET last_login_state = $1,
+        last_seen_at = $2::timestamptz,
+        updated_at = now()
+      WHERE id = $3 AND tenant_id = $4
+    `, [
+      observed.loginState,
+      observed.observedAt,
+      current.binding_id,
+      agent.tenant_id,
+    ]);
+    return {id: current.social_account_id, observed};
+  }
 
   if (sameCurrentIdentity) {
     await updateAccountObservation(
@@ -377,6 +485,30 @@ export async function ensureCurrentSocialAccount(
       current.binding_source || 'extension',
     );
     return {id: current.social_account_id, observed};
+  }
+
+  if (
+    current?.binding_source === 'manual' ||
+    current?.agent_binding_mode === 'manual'
+  ) {
+    await tx.execute(`
+      UPDATE social_account_bindings
+      SET metadata = metadata || $1::jsonb,
+        updated_at = now()
+      WHERE id = $2 AND tenant_id = $3
+    `, [
+      JSON.stringify({
+        identityConflict: true,
+        conflictObservedAt: observed.observedAt,
+      }),
+      current.binding_id,
+      agent.tenant_id,
+    ]);
+    return null;
+  }
+
+  if (!isTrustedSocialAccountObservation(observed)) {
+    return null;
   }
 
   let account = await findObservedAccount(tx, agent, observed);
@@ -403,6 +535,9 @@ export async function ensureCurrentSocialAccount(
         ? 'extension'
         : 'placeholder',
     );
+  }
+  if (account?.agent_binding_mode === 'manual') {
+    return null;
   }
   await updateAccountObservation(tx, agent, account.id, observed);
   await bindAccount(
@@ -434,6 +569,30 @@ async function resolveSocialAccountForUsageEvent(tx, agent, event) {
     );
   }
 
+  const current = await currentBinding(tx, agent, event.platform);
+  const currentMatches = Boolean(
+    current &&
+    socialAccountIdentityMatchesAccount(observed, current)
+  );
+  if (currentMatches) {
+    await updateAccountObservation(
+      tx,
+      agent,
+      current.social_account_id,
+      observed,
+    );
+    return {id: current.social_account_id, observed};
+  }
+  if (
+    current?.binding_source === 'manual' ||
+    current?.agent_binding_mode === 'manual'
+  ) {
+    return {id: current.social_account_id, observed};
+  }
+  if (!isTrustedSocialAccountObservation(observed)) {
+    return null;
+  }
+
   let account = await findObservedAccount(tx, agent, observed);
   if (!account) {
     account = await createObservedAccount(
@@ -442,6 +601,9 @@ async function resolveSocialAccountForUsageEvent(tx, agent, event) {
       observed,
       'extension',
     );
+  }
+  if (account?.agent_binding_mode === 'manual') {
+    return null;
   }
   await updateAccountObservation(tx, agent, account.id, observed);
   return {id: account.id, observed};
@@ -481,7 +643,9 @@ export async function processSocialAccountHeartbeat(
           event.platform,
           observedByPlatform.get(event.platform),
         );
-    if (!account) continue;
+    if (!account) {
+      continue;
+    }
     const inserted = await tx.queryOne(`
       INSERT INTO social_account_usage_events (
         tenant_id, event_id, social_account_id, agent_id, platform,

@@ -249,6 +249,39 @@
       if (!Number.isFinite(parsed) || parsed <= 0) return 0;
       return Math.min(maximum, parsed);
     };
+    const identity = objectValue(source.accountIdentity);
+    const reservedIdentityTokens = new Set([
+      "self",
+      "me",
+      "my",
+      "profile",
+      "home",
+      "login",
+      "undefined",
+      "null",
+    ]);
+    const identityToken = (candidate, limit) => {
+      const normalized = text(candidate, limit);
+      return reservedIdentityTokens.has(
+        normalized.toLowerCase().replace(/^@/u, ""),
+      )
+        ? ""
+        : normalized;
+    };
+    const platformAccountId = identityToken(
+      identity.platformAccountId,
+      240,
+    );
+    const accountHandle = identityToken(identity.accountHandle, 160);
+    const accountIdentity = platformAccountId || accountHandle
+      ? {
+          platformAccountId,
+          accountHandle,
+          displayName: text(identity.displayName, 160),
+          confidence: text(identity.confidence, 40) || "unknown",
+          observedAt: text(identity.observedAt, 80),
+        }
+      : null;
     const snapshot = {
       eventId,
       platform,
@@ -258,24 +291,7 @@
       capturedItems: count(source.capturedItems),
       succeeded: source.succeeded !== false,
       occurredAt: text(source.occurredAt, 80),
-      accountIdentity: {
-        platformAccountId: text(
-          objectValue(source.accountIdentity).platformAccountId,
-          240,
-        ),
-        accountHandle: text(
-          objectValue(source.accountIdentity).accountHandle,
-          160,
-        ),
-        displayName: text(
-          objectValue(source.accountIdentity).displayName,
-          160,
-        ),
-        observedAt: text(
-          objectValue(source.accountIdentity).observedAt,
-          80,
-        ),
-      },
+      accountIdentity,
       metadata: sanitizeStructuredValue(objectValue(source.metadata)),
     };
     if (

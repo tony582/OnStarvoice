@@ -6,12 +6,19 @@ import vm from "node:vm";
 import {fileURLToPath} from "node:url";
 
 import {
+  ensureCurrentSocialAccount,
+  hasDurableSocialAccountIdentity,
+  isReservedPlatformAccountId as isReservedServerAccountId,
+  isTrustedSocialAccountObservation,
   normalizeObservedSocialAccount,
   normalizeSocialUsageEvent,
   normalizeSocialUsageEvents,
+  processSocialAccountHeartbeat,
+  socialAccountIdentityMatchesAccount,
 } from "../server/services/social-account-usage.js";
 import {
   extractPlatformAccountId,
+  isReservedPlatformAccountId,
   normalizeSocialPlatform,
 } from "../utils/social-account-identity.js";
 
@@ -63,6 +70,12 @@ test("platform account ids are extracted only from supported profile urls", () =
     ),
     "",
   );
+  assert.equal(
+    extractPlatformAccountId("douyin", "https://www.douyin.com/user/self"),
+    "",
+  );
+  assert.equal(isReservedPlatformAccountId("@self"), true);
+  assert.equal(isReservedServerAccountId("SELF"), true);
 });
 
 test("extension usage events distinguish search, enhancement, runs, and captured items", async () => {
@@ -79,6 +92,7 @@ test("extension usage events distinguish search, enhancement, runs, and captured
       platformAccountId: "account-a",
       accountHandle: "starvoice-a",
       displayName: "账号 A",
+      confidence: "high",
       observedAt: "2026-07-25T04:00:00.000Z",
     },
   });
@@ -96,6 +110,7 @@ test("extension usage events distinguish search, enhancement, runs, and captured
       platformAccountId: "account-a",
       accountHandle: "starvoice-a",
       displayName: "账号 A",
+      confidence: "high",
       observedAt: "2026-07-25T04:00:00.000Z",
     },
     metadata: {
@@ -161,6 +176,47 @@ test("server normalizes identity snapshots and uses the Shanghai usage day", () 
   });
   assert.equal(observed.platform, "douyin");
   assert.equal(observed.platformAccountId, "account-a");
+  assert.equal(hasDurableSocialAccountIdentity(observed), true);
+  assert.equal(isTrustedSocialAccountObservation(observed), false);
+
+  const reserved = normalizeObservedSocialAccount({
+    platform: "douyin",
+    platformAccountId: "self",
+    accountHandle: "@self",
+    loginState: "authenticated",
+    confidence: "high",
+  });
+  assert.equal(reserved.platformAccountId, "");
+  assert.equal(reserved.accountHandle, "");
+  assert.equal(hasDurableSocialAccountIdentity(reserved), false);
+  assert.equal(isTrustedSocialAccountObservation(reserved), false);
+
+  const trusted = normalizeObservedSocialAccount({
+    platform: "douyin",
+    platformAccountId: "account-b",
+    confidence: "high",
+  });
+  assert.equal(isTrustedSocialAccountObservation(trusted), true);
+  assert.equal(
+    isTrustedSocialAccountObservation({
+      ...trusted,
+      confidence: "medium",
+    }),
+    true,
+  );
+  assert.equal(
+    socialAccountIdentityMatchesAccount(
+      {
+        platformAccountId: "new-stable-id",
+        accountHandle: "same-handle",
+      },
+      {
+        platform_account_id: "",
+        account_handle: "same-handle",
+      },
+    ),
+    true,
+  );
 
   const event = normalizeSocialUsageEvent(
     {
@@ -184,9 +240,78 @@ test("server normalizes identity snapshots and uses the Shanghai usage day", () 
   );
 });
 
+test("manual Agent binding cannot be overwritten by a conflicting heartbeat", async () => {
+  const executed = [];
+  const tx = {
+    async queryOne(sql) {
+      if (sql.includes("FROM social_account_bindings b")) {
+        return {
+          binding_id: "binding-manual",
+          social_account_id: "account-manual",
+          binding_source: "extension",
+          platform_account_id: "earth-account",
+          account_handle: "earth",
+          display_name: "地球",
+          identity_source: "extension",
+          agent_binding_mode: "manual",
+        };
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+    async execute(sql, params) {
+      executed.push({sql, params});
+      return null;
+    },
+  };
+  const result = await ensureCurrentSocialAccount(
+    tx,
+    {id: "agent-earth", tenant_id: "tenant-a"},
+    "douyin",
+    {
+      platform: "douyin",
+      platformAccountId: "mars-account",
+      accountHandle: "mars",
+      loginState: "authenticated",
+      confidence: "high",
+      observedAt: "2026-07-27T03:00:00.000Z",
+    },
+  );
+  assert.equal(result, null);
+  assert.equal(executed.length, 1);
+  assert.match(executed[0].sql, /metadata = metadata/u);
+  assert.equal(
+    JSON.parse(executed[0].params[0]).identityConflict,
+    true,
+  );
+});
+
+test("unassigned usage remains queued instead of being acknowledged and lost", async () => {
+  const tx = {
+    async queryOne(sql) {
+      if (sql.includes("FROM social_account_bindings b")) return null;
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  };
+  const result = await processSocialAccountHeartbeat(tx, {
+    agent: {id: "agent-unassigned", tenant_id: "tenant-a"},
+    usageEvents: [{
+      eventId: "usage-unassigned",
+      platform: "douyin",
+      searches: 1,
+      occurredAt: "2026-07-27T03:01:00.000Z",
+      accountIdentity: {
+        platformAccountId: "account-unconfirmed",
+        confidence: "low",
+      },
+    }],
+  });
+  assert.deepEqual(result.acceptedUsageEventIds, []);
+});
+
 test("schema, heartbeat, tenant api, and admin page are wired as one account-health flow", async () => {
   const [
     migration,
+    bindingModeMigration,
     captureRoute,
     accountRoute,
     serverIndex,
@@ -198,6 +323,7 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
     navigation,
   ] = await Promise.all([
     source("server/db/migrations/045_social_account_usage.sql"),
+    source("server/db/migrations/047_social_account_binding_mode.sql"),
     source("server/routes/capture-cloud.js"),
     source("server/routes/social-accounts.js"),
     source("server/index.js"),
@@ -218,17 +344,33 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
     assert.match(migration, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
   }
   assert.match(migration, /UNIQUE \(tenant_id, event_id\)/u);
+  assert.match(bindingModeMigration, /agent_binding_mode/u);
+  assert.match(bindingModeMigration, /'auto', 'manual'/u);
+  assert.match(bindingModeMigration, /invalidIdentityArchived/u);
+  assert.match(bindingModeMigration, /binding\.source = 'manual'/u);
   assert.match(captureRoute, /processSocialAccountHeartbeat/u);
   assert.match(captureRoute, /acceptedSocialUsageEventIds/u);
   assert.match(accountRoute, /router\.get\(\s*'\/overview'/u);
   assert.match(accountRoute, /registered_phone/u);
+  assert.match(accountRoute, /router\.put\(\s*'\/:id\/bindings'/u);
+  assert.match(accountRoute, /agent_binding_mode = \$1/u);
+  assert.match(accountRoute, /bindingModeAtUnbind', \$5::text/u);
+  assert.match(accountRoute, /lockCaptureAgentExecutionSlot/u);
   assert.match(serverIndex, /app\.use\('\/api\/social-accounts', socialAccountsRouter\)/u);
   assert.match(background, /onstarvoice\.socialAccountUsageQueue/u);
   assert.match(background, /recordSocialAccountUsageFromRelay/u);
   assert.match(background, /acknowledgeSocialAccountUsageEvents/u);
+  assert.match(background, /SOCIAL_ACCOUNT_IDENTITY_CACHE_MAX_AGE_MS/u);
+  assert.match(background, /schemaVersion:\s*2/u);
+  assert.match(background, /remove\(STORAGE_KEYS\.observedSocialAccounts\)/u);
   assert.match(cloudAgent, /socialAccountDailyUsage:\s*true/u);
   assert.match(page, /今天哪些账号该继续，哪些该休息/u);
   assert.match(page, /建议休息/u);
+  assert.match(page, /bindingMode: form\.agentBindingMode/u);
+  assert.match(page, /api\.put\(`\/social-accounts\/\$\{accountId\}\/bindings`/u);
+  assert.match(page, /手动指定/u);
+  assert.match(page, /未勾选的 Agent 不会被心跳自动加回/u);
+  assert.match(page, /已撤销，请取消/u);
   assert.match(desktop, /'social-accounts': SocialAccountsPage/u);
   assert.match(mobile, /'social-accounts': SocialAccountsPage/u);
   assert.match(navigation, /'social-accounts': 'opinion'/u);

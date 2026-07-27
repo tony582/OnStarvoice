@@ -99,6 +99,7 @@
               platformAccountId: text(account.platformAccountId, 240),
               accountHandle: text(account.accountHandle, 160),
               displayName: text(account.displayName, 160),
+              confidence: text(account.confidence, 40) || "unknown",
               observedAt: text(account.observedAt, 80),
             }
           : null,

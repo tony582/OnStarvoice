@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 
 type SocialPlatform = 'xiaohongshu' | 'douyin' | 'weibo'
 type HealthStatus = 'active' | 'resting' | 'risk' | 'login_required' | 'disabled' | 'unknown'
+type AgentBindingMode = 'auto' | 'manual'
 
 interface SocialBinding {
   id: string
@@ -28,6 +29,7 @@ interface SocialBinding {
   agent_browser_name?: string
   agent_operating_system?: string
   agent_last_heartbeat_at?: string
+  agent_status?: string
   agent_online?: boolean
 }
 
@@ -52,6 +54,7 @@ interface SocialAccount {
   display_name: string
   registered_phone: string
   identity_source: 'manual' | 'extension' | 'placeholder'
+  agent_binding_mode: AgentBindingMode
   health_status: HealthStatus
   effective_health_status: HealthStatus
   rest_until?: string | null
@@ -113,6 +116,7 @@ interface AccountForm {
   dailyEnhancementLimit: string
   dailyCaptureLimit: string
   notes: string
+  agentBindingMode: AgentBindingMode
 }
 
 const PLATFORM_META: Record<SocialPlatform, { label: string; short: string; className: string }> = {
@@ -145,6 +149,7 @@ const emptyForm = (): AccountForm => ({
   dailyEnhancementLimit: '',
   dailyCaptureLimit: '',
   notes: '',
+  agentBindingMode: 'manual',
 })
 
 function localDateTimeInput(value?: string | null) {
@@ -168,6 +173,7 @@ function formFromAccount(account: SocialAccount): AccountForm {
     dailyEnhancementLimit: account.daily_enhancement_limit ? String(account.daily_enhancement_limit) : '',
     dailyCaptureLimit: account.daily_capture_limit ? String(account.daily_capture_limit) : '',
     notes: account.notes || '',
+    agentBindingMode: account.agent_binding_mode || 'auto',
   }
 }
 
@@ -383,29 +389,17 @@ export function SocialAccountsPage() {
     try {
       const payload = accountPayload(form)
       let accountId = editingAccountId
-      let existingBindings = editingAccount?.bindings.filter(binding => binding.status === 'current') || []
       if (editingAccountId) {
         await api.patch(`/social-accounts/${editingAccountId}`, payload)
       } else {
         const created = await api.post<{ account: SocialAccount }>('/social-accounts', payload)
         accountId = created.account.id
-        existingBindings = []
       }
-
-      const desired = new Set(selectedAgentIds)
-      await Promise.all(
-        existingBindings
-          .filter(binding => !desired.has(binding.agent_id))
-          .map(binding => api.delete(`/social-accounts/bindings/${binding.id}`)),
-      )
-      const existingAgentIds = new Set(existingBindings.map(binding => binding.agent_id))
-      await Promise.all(
-        selectedAgentIds
-          .filter(agentId => !existingAgentIds.has(agentId))
-          .map(agentId =>
-            api.post(`/social-accounts/${accountId}/bindings`, { agentId }),
-          ),
-      )
+      if (!accountId) throw new Error('账号保存成功，但绑定目标缺失，请刷新后重试')
+      await api.put(`/social-accounts/${accountId}/bindings`, {
+        agentIds: selectedAgentIds,
+        bindingMode: form.agentBindingMode,
+      })
       setFeedback(editingAccountId ? '账号资料与 Agent 绑定已更新' : '社交账号已建立')
       setEditorOpen(false)
       await load(true)
@@ -745,11 +739,43 @@ function AccountEditor({
   onClose: () => void
   onSave: () => void
 }) {
-  const agents = (overview?.agents || []).filter(agent => supportsPlatform(agent, form.platform))
+  const knownAgents = overview?.agents || []
+  const knownAgentIds = new Set(knownAgents.map(agent => agent.id))
+  const unavailableSelectedAgents: SocialAgent[] = selectedAgentIds
+    .filter(agentId => !knownAgentIds.has(agentId))
+    .map(agentId => {
+      const binding = account?.bindings.find(item =>
+        item.status === 'current' && item.agent_id === agentId,
+      )
+      return {
+        id: agentId,
+        display_name: binding?.agent_display_name || '已撤销 Agent',
+        host_label: binding?.agent_host_label,
+        browser_name: binding?.agent_browser_name,
+        operating_system: binding?.agent_operating_system,
+        allowed_platforms: [form.platform],
+        status: binding?.agent_status || 'revoked',
+        last_heartbeat_at: binding?.agent_last_heartbeat_at,
+        online: false,
+      }
+    })
+  const agents = [...knownAgents, ...unavailableSelectedAgents]
+    .filter(agent =>
+      supportsPlatform(agent, form.platform) ||
+      selectedAgentIds.includes(agent.id),
+    )
+    .sort((left, right) => {
+      const selectedDelta =
+        Number(selectedAgentIds.includes(right.id)) -
+        Number(selectedAgentIds.includes(left.id))
+      if (selectedDelta !== 0) return selectedDelta
+      return Number(Boolean(right.online)) - Number(Boolean(left.online))
+    })
   const setField = <K extends keyof AccountForm>(key: K, value: AccountForm[K]) => {
     setForm(current => ({ ...current, [key]: value }))
   }
   const toggleAgent = (agentId: string) => {
+    setField('agentBindingMode', 'manual')
     setSelectedAgentIds(current =>
       current.includes(agentId)
         ? current.filter(id => id !== agentId)
@@ -850,24 +876,98 @@ function AccountEditor({
                 </div>
               </EditorSection>
 
-              <EditorSection title="绑定 Agent" copy="同一个账号可以登记在多个浏览器节点上；给 Agent 换绑后，后续用量会记到新账号。">
+              <EditorSection title="绑定 Agent" copy="选择人工固定，或让 Extension 根据实际登录账号自动识别。">
+                <div className="mb-3 grid gap-2 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    disabled={!writable}
+                    onClick={() => setField('agentBindingMode', 'manual')}
+                    className={cn(
+                      'rounded-xl border px-3.5 py-3 text-left transition-colors disabled:cursor-default',
+                      form.agentBindingMode === 'manual'
+                        ? 'border-primary bg-primary/5 ring-2 ring-primary/10'
+                        : 'border-border hover:bg-muted/40',
+                    )}
+                  >
+                    <span className="flex items-center gap-2 text-[12px] font-extrabold">
+                      <span className={cn(
+                        'flex h-4 w-4 items-center justify-center rounded-full border',
+                        form.agentBindingMode === 'manual'
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-input',
+                      )}>
+                        {form.agentBindingMode === 'manual' && <Check className="h-3 w-3" />}
+                      </span>
+                      手动指定
+                    </span>
+                    <span className="mt-1.5 block pl-6 text-[10px] leading-4 text-muted-foreground">
+                      仅绑定下方勾选的 Agent，Extension 心跳不会擅自增减。
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!writable}
+                    onClick={() => setField('agentBindingMode', 'auto')}
+                    className={cn(
+                      'rounded-xl border px-3.5 py-3 text-left transition-colors disabled:cursor-default',
+                      form.agentBindingMode === 'auto'
+                        ? 'border-primary bg-primary/5 ring-2 ring-primary/10'
+                        : 'border-border hover:bg-muted/40',
+                    )}
+                  >
+                    <span className="flex items-center gap-2 text-[12px] font-extrabold">
+                      <span className={cn(
+                        'flex h-4 w-4 items-center justify-center rounded-full border',
+                        form.agentBindingMode === 'auto'
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-input',
+                      )}>
+                        {form.agentBindingMode === 'auto' && <Check className="h-3 w-3" />}
+                      </span>
+                      自动识别
+                    </span>
+                    <span className="mt-1.5 block pl-6 text-[10px] leading-4 text-muted-foreground">
+                      Extension 检测到同一账号后，可自动更新 Agent 绑定。
+                    </span>
+                  </button>
+                </div>
                 <div className="overflow-hidden rounded-xl border border-border">
                   {agents.map((agent, index) => {
                     const selected = selectedAgentIds.includes(agent.id)
+                    const unavailable = agent.status === 'revoked'
+                    const unsupported = !supportsPlatform(agent, form.platform)
                     return (
                       <button key={agent.id} type="button" disabled={!writable} onClick={() => toggleAgent(agent.id)}
-                        className={cn('flex w-full items-center gap-3 px-3.5 py-3 text-left hover:bg-muted/50 disabled:cursor-default', index > 0 && 'border-t border-border')}>
+                        className={cn(
+                          'flex w-full items-center gap-3 px-3.5 py-3 text-left hover:bg-muted/50 disabled:cursor-default',
+                          index > 0 && 'border-t border-border',
+                          (unavailable || unsupported) && 'bg-amber-50/55 dark:bg-amber-500/5',
+                        )}>
                         <span className={cn('flex h-5 w-5 shrink-0 items-center justify-center rounded-md border', selected ? 'border-primary bg-primary text-primary-foreground' : 'border-input')}>
                           {selected && <Check className="h-3.5 w-3.5" />}
                         </span>
-                        <span className={cn('h-2 w-2 shrink-0 rounded-full', agent.online ? 'bg-status-green' : 'bg-status-grey')} />
+                        <span className={cn(
+                          'h-2 w-2 shrink-0 rounded-full',
+                          agent.online ? 'bg-status-green' : 'bg-status-grey',
+                        )} />
                         <span className="min-w-0 flex-1">
                           <span className="block truncate text-[12px] font-bold">{agentName(agent)}</span>
                           <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">
                             {[agent.host_label, agent.browser_name, agent.operating_system].filter(Boolean).join(' · ') || '浏览器 Agent'}
                           </span>
                         </span>
-                        <span className="text-[10px] text-muted-foreground">{agent.online ? '在线' : '离线'}</span>
+                        <span className={cn(
+                          'text-[10px] text-muted-foreground',
+                          (unavailable || unsupported) && 'font-bold text-amber-700 dark:text-amber-300',
+                        )}>
+                          {unavailable
+                            ? '已撤销，请取消'
+                            : unsupported
+                              ? '不支持当前平台，请取消'
+                              : agent.online
+                                ? '在线'
+                                : '离线'}
+                        </span>
                       </button>
                     )
                   })}
@@ -919,7 +1019,11 @@ function AccountEditor({
 
         {tab === 'profile' && writable && (
           <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-border bg-background px-4 py-3 sm:px-5">
-            <span className="hidden text-[10.5px] text-muted-foreground sm:block">保存后，绑定关系会在下一次心跳生效。</span>
+            <span className="hidden text-[10.5px] text-muted-foreground sm:block">
+              {form.agentBindingMode === 'manual'
+                ? '保存后，未勾选的 Agent 不会被心跳自动加回。'
+                : '保存后，Extension 可按实际登录账号更新绑定。'}
+            </span>
             <div className="ml-auto flex gap-2">
               <Button variant="outline" onClick={onClose}>取消</Button>
               <Button onClick={onSave} disabled={saving}>
