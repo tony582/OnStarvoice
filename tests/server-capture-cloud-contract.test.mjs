@@ -17,6 +17,7 @@ import {
   sanitizeCloudStructuredObject,
 } from "../server/services/capture-cloud.js";
 import {
+  captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
@@ -446,6 +447,64 @@ test("overview never presents interrupted or needs-action Agents as idle", () =>
     overview,
     /AS active_task_count[\s\S]*assigned\.status IN \([\s\S]*'interrupted'[\s\S]*'needs_action'/u,
   );
+});
+
+test("agent removal blockers explain every unsafe dependency", () => {
+  assert.equal(captureAgentRemovalBlockerMessage({}), "");
+  const message = captureAgentRemovalBlockerMessage({
+    online: true,
+    activeTasks: 2,
+    activeWorkItems: 3,
+    pendingCommands: 1,
+    localPlan: true,
+    cloudSchedules: 4,
+  });
+  assert.match(message, /节点仍在线/u);
+  assert.match(message, /2 个未结束任务/u);
+  assert.match(message, /3 个多 Agent 工作项/u);
+  assert.match(message, /1 条远程指令/u);
+  assert.match(message, /本地无人值守计划/u);
+  assert.match(message, /4 个云端编排计划/u);
+});
+
+test("agent deletion is a guarded soft revoke that preserves history", () => {
+  const removal = readRouteSection(
+    "router.delete('/agents/:id'",
+    "router.post('/agents/:id/tasks'",
+  );
+  assert.match(
+    removal,
+    /requireTenantAccess, requireSessionUser, requireTenantWriter/u,
+  );
+  const executionLock = removal.indexOf("await lockCaptureAgentExecutionSlot(");
+  const agentRowLock = removal.indexOf("FOR UPDATE");
+  assert.ok(executionLock >= 0 && executionLock < agentRowLock);
+  assert.match(removal, /captureAgentOnline\(agent\.last_heartbeat_at\)/u);
+  assert.match(
+    removal,
+    /COALESCE\(assigned_agent_id, origin_agent_id\)[\s\S]*AGENT_REMOVAL_TASK_STATUSES/u,
+  );
+  assert.match(removal, /FROM capture_task_items[\s\S]*assigned_agent_id = \$2/u);
+  assert.match(removal, /status IN \('pending', 'acknowledged'\)/u);
+  assert.match(
+    removal,
+    /capture_orchestration_schedule_agents[\s\S]*schedule\.status IN \('active', 'paused'\)/u,
+  );
+  assert.match(removal, /hasConfiguredAgentPlan\(agent\.unattended_plan\)/u);
+  assert.match(removal, /UPDATE capture_agent_tokens[\s\S]*revoked_at/u);
+  assert.match(
+    removal,
+    /UPDATE social_account_bindings[\s\S]*status = 'historical'/u,
+  );
+  assert.match(removal, /UPDATE social_accounts[\s\S]*last_agent_id = NULL/u);
+  assert.match(
+    removal,
+    /UPDATE capture_agents[\s\S]*SET status = 'revoked'/u,
+  );
+  assert.match(removal, /INSERT INTO audit_logs[\s\S]*capture_agent\.revoked/u);
+  assert.match(removal, /authBindingPreserved: true/u);
+  assert.doesNotMatch(removal, /DELETE FROM capture_agents/u);
+  assert.doesNotMatch(removal, /DELETE FROM auth_bindings/u);
 });
 
 test("orchestration checkpoint database values are bounded and timestamp-safe", () => {

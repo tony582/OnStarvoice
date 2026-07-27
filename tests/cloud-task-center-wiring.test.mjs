@@ -185,6 +185,24 @@ test("admin UI treats each browser as an independent Agent and exposes remote co
   assert.match(taskCard, /上线后停止/u);
 });
 
+test("admin UI exposes guarded Agent deletion without a nested row button", async () => {
+  const [page, rail] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentRail.tsx"),
+  ]);
+  assert.match(rail, /DropdownMenu\.Root/u);
+  assert.match(rail, /管理节点 \$\{agent\.display_name\}/u);
+  assert.match(rail, /删除节点/u);
+  assert.match(rail, /<Dialog\.Root/u);
+  assert.match(rail, /此操作不可直接恢复/u);
+  assert.match(rail, /历史任务、采集结果和账号用量会保留/u);
+  assert.match(rail, /激活码的环境名额不会自动释放/u);
+  assert.match(rail, /节点仍在线，请先关闭该浏览器的 Extension/u);
+  assert.doesNotMatch(rail, /window\.confirm/u);
+  assert.match(page, /api\.delete<\{ message\?: string \}>\([\s\S]*`\/capture-cloud\/agents\/\$\{agent\.id\}`/u);
+  assert.match(page, /onDeleteAgent=\{deleteAgent\}/u);
+});
+
 test("admin UI shows each node's local plan and capability-gates remote task creation", async () => {
   const [creator, summary] = await Promise.all([
     read("web/admin/src/pages/dispatch/cloud-tasks/AgentTaskCreator.tsx"),

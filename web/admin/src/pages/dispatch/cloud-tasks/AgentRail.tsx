@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
+import * as Dialog from '@radix-ui/react-dialog'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   AlertTriangle, ArrowLeft, Bot, CalendarClock, CheckCircle2, ChevronRight, CircleOff,
-  ChevronDown, ClipboardList, Loader2, Pencil, Plus, Save, Wifi, WifiOff,
+  ChevronDown, ClipboardList, Loader2, MoreHorizontal, Pencil, Plus, Save, Trash2,
+  Wifi, WifiOff,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate } from '@/lib/utils'
@@ -72,12 +75,16 @@ function AgentRow({
   agent,
   tasks,
   withBorder,
+  writable,
   onOpen,
+  onDelete,
 }: {
   agent: CloudAgent
   tasks: CloudTask[]
   withBorder: boolean
+  writable: boolean
   onOpen: () => void
+  onDelete: () => void
 }) {
   const { activeTaskCount, queuedTaskCount } = agentWorkload(agent, tasks)
   const platforms = agentCreatePlatforms(agent)
@@ -86,29 +93,127 @@ function AgentRow({
   const statusLabel = agent.status === 'paused' ? '已暂停' : agent.online ? '在线' : '离线'
 
   return (
-    <button type="button" onClick={onOpen}
-      className={`flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-sidebar-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${withBorder ? 'border-t border-border/60' : ''} ${agent.online ? '' : 'opacity-60'}`}>
-      <span className={`h-2 w-2 shrink-0 rounded-full ${dotClass}`} aria-hidden="true" />
-      <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-1.5">
-          <span className="truncate text-[13px] font-semibold text-foreground">{agent.display_name}</span>
-          {hasPlan && <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-label="已配置无人值守计划" />}
-          {agent.last_error && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-status-red" aria-label="Agent 异常" />}
+    <div className={`flex min-w-0 items-stretch transition-colors hover:bg-sidebar-accent/60 ${withBorder ? 'border-t border-border/60' : ''} ${agent.online ? '' : 'opacity-60'}`}>
+      <button type="button" onClick={onOpen}
+        className="flex min-w-0 flex-1 items-center gap-2.5 px-3 py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary">
+        <span className={`h-2 w-2 shrink-0 rounded-full ${dotClass}`} aria-hidden="true" />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5">
+            <span className="truncate text-[13px] font-semibold text-foreground">{agent.display_name}</span>
+            {hasPlan && <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-label="已配置无人值守计划" />}
+            {agent.last_error && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-status-red" aria-label="Agent 异常" />}
+          </span>
+          <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{statusLabel} · 最近心跳 {formatDate(agent.last_heartbeat_at)}</span>
+          <span className="mt-1 flex flex-wrap items-center gap-1">
+            {platforms.length > 0
+              ? platforms.map(platform => (
+                  <span key={platform} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">{PLATFORM_LABELS[platform] || platform}</span>
+                ))
+              : <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">无平台</span>}
+          </span>
         </span>
-        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{statusLabel} · 最近心跳 {formatDate(agent.last_heartbeat_at)}</span>
-        <span className="mt-1 flex flex-wrap items-center gap-1">
-          {platforms.length > 0
-            ? platforms.map(platform => (
-                <span key={platform} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">{PLATFORM_LABELS[platform] || platform}</span>
-              ))
-            : <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">无平台</span>}
+        <span className="flex shrink-0 items-center gap-1.5 text-[11px] tabular-nums text-muted-foreground">
+          <span>执行中 {activeTaskCount} · 排队 {queuedTaskCount}</span>
+          <ChevronRight className="h-4 w-4" />
         </span>
-      </span>
-      <span className="flex shrink-0 items-center gap-1.5 text-[11px] tabular-nums text-muted-foreground">
-        <span>执行中 {activeTaskCount} · 排队 {queuedTaskCount}</span>
-        <ChevronRight className="h-4 w-4" />
-      </span>
-    </button>
+      </button>
+      {writable && (
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button type="button" aria-label={`管理节点 ${agent.display_name}`}
+              className="my-auto mr-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              <MoreHorizontal className="h-4 w-4" />
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content align="end" sideOffset={6}
+              className="z-[80] min-w-36 rounded-xl border border-border bg-popover p-1.5 text-popover-foreground shadow-lg outline-none">
+              <DropdownMenu.Item onSelect={onDelete}
+                className="flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-lg px-2.5 text-xs font-medium text-destructive outline-none transition-colors focus:bg-destructive/10 data-[highlighted]:bg-destructive/10">
+                <Trash2 className="h-3.5 w-3.5" /> 删除节点
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+      )}
+    </div>
+  )
+}
+
+function DeleteAgentDialog({
+  agent,
+  tasks,
+  deleting,
+  error,
+  onOpenChange,
+  onConfirm,
+}: {
+  agent: CloudAgent | null
+  tasks: CloudTask[]
+  deleting: boolean
+  error: string
+  onOpenChange: (open: boolean) => void
+  onConfirm: () => void
+}) {
+  const workload = agent ? agentWorkload(agent, tasks) : {activeTaskCount: 0, queuedTaskCount: 0}
+  const hasPlan = Boolean(agent && hasConfiguredUnattendedPlan(agent.unattended_plan))
+  const knownBlocker = Boolean(
+    agent?.online ||
+    workload.activeTaskCount > 0 ||
+    workload.queuedTaskCount > 0 ||
+    hasPlan,
+  )
+
+  return (
+    <Dialog.Root open={Boolean(agent)} onOpenChange={open => {
+      if (!deleting) onOpenChange(open)
+    }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[90] bg-black/35 backdrop-blur-[1px] data-[state=closed]:animate-out data-[state=open]:animate-in" />
+        <Dialog.Content aria-describedby="delete-agent-description"
+          className="fixed left-1/2 top-1/2 z-[91] w-[calc(100vw-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border bg-card p-5 shadow-2xl outline-none">
+          <div className="flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-destructive/10 text-destructive">
+              <Trash2 className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <Dialog.Title className="text-base font-bold text-foreground">删除节点？</Dialog.Title>
+              <Dialog.Description id="delete-agent-description" className="mt-1 text-xs leading-5 text-muted-foreground">
+                删除后，该节点会失去云端访问权限并从调度中心移除。此操作不可直接恢复。
+              </Dialog.Description>
+            </div>
+          </div>
+
+          <div className="mt-4 rounded-xl border border-border/70 bg-muted/30 px-3.5 py-3">
+            <p className="truncate text-sm font-semibold text-foreground">{agent?.display_name || '未命名节点'}</p>
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+              历史任务、采集结果和账号用量会保留；激活码的环境名额不会自动释放。
+            </p>
+          </div>
+
+          {knownBlocker && (
+            <div role="alert" className="mt-3 rounded-xl border border-status-orange/25 bg-status-orange/8 px-3.5 py-3 text-[11px] leading-5 text-amber-700 dark:text-amber-300">
+              {agent?.online && <p>节点仍在线，请先关闭该浏览器的 Extension，等待约 2 分钟。</p>}
+              {(workload.activeTaskCount > 0 || workload.queuedTaskCount > 0) && (
+                <p>请先处理现有任务：执行中 {workload.activeTaskCount}，排队 {workload.queuedTaskCount}。</p>
+              )}
+              {hasPlan && <p>请先删除无人值守计划，并等待设备确认。</p>}
+            </div>
+          )}
+          {error && <p role="alert" className="mt-3 rounded-xl bg-destructive/8 px-3.5 py-2.5 text-[11px] leading-5 text-destructive">{error}</p>}
+
+          <div className="mt-5 flex justify-end gap-2">
+            <Dialog.Close asChild>
+              <Button variant="outline" size="sm" disabled={deleting}>取消</Button>
+            </Dialog.Close>
+            <Button variant="destructive" size="sm" onClick={onConfirm} disabled={deleting || knownBlocker}>
+              {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              确认删除
+            </Button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   )
 }
 
@@ -385,7 +490,9 @@ export function AgentRail({
   onEditPlan,
   onCreatePlan,
   onDeletePlan,
+  onDeleteAgent,
   deletingPlanAgentId = '',
+  deletingAgentId = '',
   onSaved,
 }: {
   agents: CloudAgent[]
@@ -395,14 +502,30 @@ export function AgentRail({
   onEditPlan: (agent: CloudAgent) => void
   onCreatePlan: (agent: CloudAgent) => void
   onDeletePlan: (agent: CloudAgent) => void
+  onDeleteAgent: (agent: CloudAgent) => Promise<void>
   deletingPlanAgentId?: string
+  deletingAgentId?: string
   onSaved: () => Promise<void>
 }) {
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null)
+  const [deleteCandidate, setDeleteCandidate] = useState<CloudAgent | null>(null)
+  const [deleteError, setDeleteError] = useState('')
 
   // 轮询刷新会替换 agents 数组；用 id 定位保证详情页在刷新后仍指向最新的同一 Agent，Agent 消失时自动返回列表。
   const activeAgent = activeAgentId ? agents.find(agent => agent.id === activeAgentId) ?? null : null
   const onlineAgentCount = agents.filter(agent => agent.online).length
+
+  const confirmDelete = async () => {
+    if (!deleteCandidate) return
+    setDeleteError('')
+    try {
+      await onDeleteAgent(deleteCandidate)
+      if (activeAgentId === deleteCandidate.id) setActiveAgentId(null)
+      setDeleteCandidate(null)
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : '删除节点失败')
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -435,13 +558,32 @@ export function AgentRail({
             ) : (
               <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-xs">
                 {agents.map((agent, index) => (
-                  <AgentRow key={agent.id} agent={agent} tasks={tasks} withBorder={index > 0} onOpen={() => setActiveAgentId(agent.id)} />
+                  <AgentRow key={agent.id} agent={agent} tasks={tasks} withBorder={index > 0}
+                    writable={writable}
+                    onOpen={() => setActiveAgentId(agent.id)}
+                    onDelete={() => {
+                      setDeleteError('')
+                      setDeleteCandidate(agent)
+                    }} />
                 ))}
               </div>
             )}
           </div>
         </>
       )}
+      <DeleteAgentDialog
+        agent={deleteCandidate}
+        tasks={tasks}
+        deleting={Boolean(deleteCandidate && deletingAgentId === deleteCandidate.id)}
+        error={deleteError}
+        onOpenChange={open => {
+          if (!open) {
+            setDeleteCandidate(null)
+            setDeleteError('')
+          }
+        }}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   )
 }
