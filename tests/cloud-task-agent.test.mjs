@@ -199,6 +199,7 @@ test("heartbeat reports social identity and idempotent usage without phone numbe
         platformAccountId: "account-a",
         accountHandle: "handle-a",
         displayName: "账号 A",
+        confidence: "high",
       },
       metadata: {
         action: "captureKeywordNotes",
@@ -213,9 +214,32 @@ test("heartbeat reports social identity and idempotent usage without phone numbe
   assert.equal(payload.observedSocialAccounts[0].platformAccountId, "account-a");
   assert.equal(Object.hasOwn(payload.observedSocialAccounts[0], "registeredPhone"), false);
   assert.equal(payload.socialUsageEvents[0].eventId, "usage-a");
+  assert.equal(
+    payload.socialUsageEvents[0].accountIdentity.confidence,
+    "high",
+  );
   assert.equal(payload.socialUsageEvents[0].metadata.token, "[REDACTED]");
   assert.equal(JSON.stringify(payload).includes("13800000000"), false);
   assert.equal(JSON.stringify(payload).includes("must-not-leak"), false);
+});
+
+test("heartbeat removes reserved placeholder identities without dropping usage", () => {
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-social-reserved"},
+    socialUsageEvents: [{
+      eventId: "usage-reserved",
+      platform: "douyin",
+      searches: 1,
+      occurredAt: "2026-07-27T03:01:00.000Z",
+      accountIdentity: {
+        platformAccountId: "self",
+        accountHandle: "@self",
+        confidence: "high",
+      },
+    }],
+  });
+  assert.equal(payload.socialUsageEvents.length, 1);
+  assert.equal(payload.socialUsageEvents[0].accountIdentity, null);
 });
 
 test("heartbeat advertises remote task creation and mirrors a sanitized unattended plan", () => {

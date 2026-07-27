@@ -17,6 +17,16 @@ const GENERIC_LABELS = new Set([
   "抖音",
   "微博",
 ]);
+const RESERVED_ACCOUNT_IDS = new Set([
+  "self",
+  "me",
+  "my",
+  "profile",
+  "home",
+  "login",
+  "undefined",
+  "null",
+]);
 
 function cleanText(value, limit = 160) {
   const normalized = String(value ?? "")
@@ -27,6 +37,12 @@ function cleanText(value, limit = 160) {
 export function normalizeSocialPlatform(value) {
   const platform = cleanText(value, 40).toLowerCase();
   return SUPPORTED_SOCIAL_PLATFORMS.has(platform) ? platform : "";
+}
+
+export function isReservedPlatformAccountId(value) {
+  return RESERVED_ACCOUNT_IDS.has(
+    cleanText(value, 240).toLowerCase().replace(/^@/u, ""),
+  );
 }
 
 export function extractPlatformAccountId(platformValue, hrefValue) {
@@ -46,11 +62,13 @@ export function extractPlatformAccountId(platformValue, hrefValue) {
   };
   const match = pathname.match(patterns[platform]);
   if (!match?.[1]) return "";
+  let accountId = "";
   try {
-    return cleanText(decodeURIComponent(match[1]), 240);
+    accountId = cleanText(decodeURIComponent(match[1]), 240);
   } catch {
-    return cleanText(match[1], 240);
+    accountId = cleanText(match[1], 240);
   }
+  return isReservedPlatformAccountId(accountId) ? "" : accountId;
 }
 
 function accountHandleFromText(value) {

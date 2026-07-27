@@ -101,6 +101,7 @@ const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const SOCIAL_ACCOUNT_IDENTITY_REFRESH_MS = 5 * 60 * 1000;
+const SOCIAL_ACCOUNT_IDENTITY_CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS = 2.5 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_WAKE_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_LOCK_WAIT_MS = 5 * 60 * 1000;
@@ -1380,14 +1381,29 @@ function normalizeCachedObservedSocialAccounts(value) {
     value && typeof value === 'object' && !Array.isArray(value)
       ? value
       : {};
+  const compatible = Number(source.schemaVersion) === 2;
+  const now = Date.now();
   return {
-    updatedAt: String(source.updatedAt || ''),
-    accounts: (Array.isArray(source.accounts) ? source.accounts : [])
+    schemaVersion: 2,
+    updatedAt: compatible ? String(source.updatedAt || '') : '',
+    accounts: (
+      compatible && Array.isArray(source.accounts)
+        ? source.accounts
+        : []
+    )
       .filter(account =>
         ['xiaohongshu', 'douyin', 'weibo'].includes(
           String(account?.platform || ''),
         ),
       )
+      .filter(account => {
+        const observedAt = Date.parse(String(account?.observedAt || ''));
+        return (
+          Number.isFinite(observedAt) &&
+          now - observedAt >= 0 &&
+          now - observedAt <= SOCIAL_ACCOUNT_IDENTITY_CACHE_MAX_AGE_MS
+        );
+      })
       .slice(0, 10),
   };
 }
@@ -1403,6 +1419,7 @@ async function readObservedSocialAccounts() {
 
 async function storeObservedSocialAccounts(accounts) {
   const next = {
+    schemaVersion: 2,
     updatedAt: new Date().toISOString(),
     accounts: (Array.isArray(accounts) ? accounts : []).slice(0, 10),
   };
@@ -1474,6 +1491,7 @@ async function refreshObservedSocialAccounts({force = false} = {}) {
   const refreshedAt = Date.parse(cached.updatedAt);
   if (
     !force &&
+    cached.accounts.length > 0 &&
     Number.isFinite(refreshedAt) &&
     Date.now() - refreshedAt < SOCIAL_ACCOUNT_IDENTITY_REFRESH_MS
   ) {
@@ -1503,8 +1521,13 @@ async function refreshObservedSocialAccounts({force = false} = {}) {
         bestDetectedByPlatform.set(account.platform, account);
       }
     }
+    const activePlatforms = new Set(
+      relevantTabs.map(item => item.platform),
+    );
     const bestByPlatform = new Map(
-      cached.accounts.map(account => [account.platform, account]),
+      cached.accounts
+        .filter(account => activePlatforms.has(account.platform))
+        .map(account => [account.platform, account]),
     );
     for (const [platform, account] of bestDetectedByPlatform) {
       bestByPlatform.set(platform, account);
@@ -1569,13 +1592,10 @@ async function recordSocialAccountUsageFromRelay({
   sourcePayload,
 }) {
   if (!socialAccountUsageApi?.buildUsageEventFromRelay) return null;
-  let cached = await readObservedSocialAccounts();
   const detected = await detectObservedSocialAccountInTab(tab, platform);
   if (detected) {
-    cached = await mergeObservedSocialAccount(detected);
+    await mergeObservedSocialAccount(detected);
   }
-  const observedAccount =
-    cached.accounts.find(account => account?.platform === platform) || null;
   const event = socialAccountUsageApi.buildUsageEventFromRelay({
     action,
     platform,
@@ -1588,7 +1608,7 @@ async function recordSocialAccountUsageFromRelay({
     featureKey:
       sourcePayload?.featureKey ||
       sourcePayload?.taskContext?.featureKey,
-    observedAccount,
+    observedAccount: detected,
   });
   if (!event) return null;
   await appendSocialAccountUsageEvent(event);
@@ -8558,12 +8578,20 @@ async function handleCaptureRuntimeTabRemoved(tabId) {
 }
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
+  const resetObservedAccounts =
+    reason === 'install' || reason === 'update'
+      ? chrome.storage.local
+          .remove(STORAGE_KEYS.observedSocialAccounts)
+          .catch(() => {})
+      : Promise.resolve();
   if (reason === 'install') {
     chrome.storage.local.remove('onstarvoice.riskNoticeAcknowledged').catch(() => {});
   }
-  ensureRuntimeState().catch((error) => {
-    console.error('[onstarvoice] failed to initialize runtime on install', error);
-  });
+  resetObservedAccounts
+    .then(() => ensureRuntimeState())
+    .catch((error) => {
+      console.error('[onstarvoice] failed to initialize runtime on install', error);
+    });
   reconcileUnattendedKeywordPlanSchedule({ launchDue: false })
     .catch((error) => {
       console.error('[onstarvoice] failed to sync unattended alarm on install', error);
@@ -8572,6 +8600,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
     console.error('[onstarvoice] failed to sync unattended supervisor on install', error);
   });
   syncCloudTaskAgentAlarm()
+    .then(() => resetObservedAccounts)
     .then(() => syncCloudTaskAgent({reason: 'extension_installed', force: true}))
     .catch((error) => {
       console.error('[onstarvoice] failed to initialize cloud task agent on install', error);
