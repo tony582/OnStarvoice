@@ -59,11 +59,46 @@ const DISMISSIBLE_ATTENTION_STATUSES = new Set([
   'failed',
   'completed_with_failures',
 ]);
+const AGENT_REMOVAL_TASK_STATUSES = [
+  'pending',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'resume_requested',
+  'needs_action',
+];
 const POSTGRES_INTEGER_MAX = 2147483647;
 const SUPERSEDED_CREATE_STOP_NO_TARGET_REASONS = new Set([
   'not_found',
   'request_mismatch',
 ]);
+
+export function captureAgentRemovalBlockerMessage(blockers = {}) {
+  const reasons = [];
+  if (blockers.online) {
+    reasons.push('节点仍在线，请先关闭该浏览器的 Extension，等待约 2 分钟后再删除');
+  }
+  if (Number(blockers.activeTasks) > 0) {
+    reasons.push(`还有 ${Number(blockers.activeTasks)} 个未结束任务`);
+  }
+  if (Number(blockers.activeWorkItems) > 0) {
+    reasons.push(`还有 ${Number(blockers.activeWorkItems)} 个多 Agent 工作项未结束`);
+  }
+  if (Number(blockers.pendingCommands) > 0) {
+    reasons.push(`还有 ${Number(blockers.pendingCommands)} 条远程指令等待设备确认`);
+  }
+  if (blockers.localPlan) {
+    reasons.push('仍有本地无人值守计划，请先删除计划并等待设备确认');
+  }
+  if (Number(blockers.cloudSchedules) > 0) {
+    reasons.push(`仍参与 ${Number(blockers.cloudSchedules)} 个云端编排计划`);
+  }
+  return reasons.length > 0
+    ? `暂不能删除：${reasons.join('；')}。`
+    : '';
+}
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -3058,10 +3093,17 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
 
 router.patch('/agents/:id', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
   try {
+    if (req.body?.status === 'revoked') {
+      return res.status(400).json({
+        ok: false,
+        error: 'agent_delete_endpoint_required',
+        message: '请使用“删除节点”操作撤销该节点',
+      });
+    }
     const displayName = text(req.body?.displayName, 120);
     const hostLabel = text(req.body?.hostLabel, 120);
     const allowedPlatforms = normalizeCaptureAgentPlatforms(req.body?.allowedPlatforms);
-    const status = ['active', 'paused', 'revoked'].includes(req.body?.status)
+    const status = ['active', 'paused'].includes(req.body?.status)
       ? req.body.status
       : null;
     if (!displayName || !hostLabel) {
@@ -3104,6 +3146,169 @@ router.patch('/agents/:id', requireTenantAccess, requireSessionUser, requireTena
       return res.status(409).json({ ok: false, error: 'agent_revoked', message: '已撤销节点不能重新激活，请重新注册浏览器节点' });
     }
     return res.json({ ok: true, agent: result.agent });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const agentId = text(req.params.id, 100).toLowerCase();
+    if (!UUID_PATTERN.test(agentId)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_agent_id',
+        message: '采集节点标识无效',
+      });
+    }
+
+    const result = await withTransaction(async tx => {
+      // Heartbeat and node removal share one execution-slot lock. Once this
+      // transaction commits, every previously issued token is invalid and a
+      // later heartbeat cannot silently revive the revoked client UUID.
+      await lockCaptureAgentExecutionSlot(tx, req.tenantId, agentId);
+
+      const agent = await tx.queryOne(`
+        SELECT id, display_name, status, last_heartbeat_at, unattended_plan
+        FROM capture_agents
+        WHERE id = $1 AND tenant_id = $2
+        FOR UPDATE
+      `, [agentId, req.tenantId]);
+      if (!agent) return {notFound: true};
+      if (agent.status === 'revoked') {
+        return {agent, alreadyRevoked: true};
+      }
+
+      // Read-only blockers are deliberately checked after the Agent row lock.
+      // Do not lock task rows here: orchestration dispatch locks parent/items
+      // before Agents, and reversing that order would create a deadlock risk.
+      const taskLoad = await tx.queryOne(`
+        SELECT COUNT(*)::integer AS count
+        FROM capture_tasks
+        WHERE tenant_id = $1
+          AND COALESCE(assigned_agent_id, origin_agent_id) = $2
+          AND status = ANY($3::text[])
+      `, [req.tenantId, agentId, AGENT_REMOVAL_TASK_STATUSES]);
+      const workItemLoad = await tx.queryOne(`
+        SELECT COUNT(*)::integer AS count
+        FROM capture_task_items
+        WHERE tenant_id = $1 AND assigned_agent_id = $2
+          AND status IN (
+            'pending', 'assigned', 'dispatch_pending', 'dispatched',
+            'waiting_device', 'running', 'retryable', 'needs_action'
+          )
+      `, [req.tenantId, agentId]);
+      const pendingCommands = await tx.queryOne(`
+        SELECT COUNT(*)::integer AS count
+        FROM capture_agent_commands
+        WHERE tenant_id = $1 AND agent_id = $2
+          AND status IN ('pending', 'acknowledged')
+          AND expires_at > now()
+      `, [req.tenantId, agentId]);
+      const cloudSchedules = await tx.queryOne(`
+        SELECT COUNT(DISTINCT schedule.id)::integer AS count
+        FROM capture_orchestration_schedule_agents assignment
+        JOIN capture_orchestration_schedules schedule
+          ON schedule.id = assignment.schedule_id
+          AND schedule.tenant_id = assignment.tenant_id
+        WHERE assignment.tenant_id = $1
+          AND assignment.agent_id = $2
+          AND schedule.status IN ('active', 'paused')
+      `, [req.tenantId, agentId]);
+
+      const blockers = {
+        online: captureAgentOnline(agent.last_heartbeat_at),
+        activeTasks: Number(taskLoad?.count || 0),
+        activeWorkItems: Number(workItemLoad?.count || 0),
+        pendingCommands: Number(pendingCommands?.count || 0),
+        localPlan: hasConfiguredAgentPlan(agent.unattended_plan),
+        cloudSchedules: Number(cloudSchedules?.count || 0),
+      };
+      const blockerMessage = captureAgentRemovalBlockerMessage(blockers);
+      if (blockerMessage) return {agent, blockers, blockerMessage};
+
+      await tx.execute(`
+        UPDATE capture_agent_tokens
+        SET revoked_at = COALESCE(revoked_at, now())
+        WHERE agent_id = $1
+      `, [agentId]);
+      await tx.execute(`
+        UPDATE capture_agent_commands
+        SET status = 'expired',
+          result = jsonb_build_object('reason', 'agent_revoked'),
+          finished_at = now(), updated_at = now()
+        WHERE tenant_id = $1 AND agent_id = $2
+          AND status IN ('pending', 'acknowledged')
+      `, [req.tenantId, agentId]);
+      await tx.execute(`
+        UPDATE social_account_bindings
+        SET status = 'historical',
+          ended_at = COALESCE(ended_at, now()),
+          metadata = metadata || jsonb_build_object(
+            'nodeRevoked', true,
+            'nodeRevokedAt', now(),
+            'nodeRevokedByUserId', $3::text
+          ),
+          updated_at = now()
+        WHERE tenant_id = $1 AND agent_id = $2 AND status = 'current'
+      `, [req.tenantId, agentId, req.user?.id || '']);
+      await tx.execute(`
+        UPDATE social_accounts
+        SET last_agent_id = NULL, updated_at = now()
+        WHERE tenant_id = $1 AND last_agent_id = $2
+      `, [req.tenantId, agentId]);
+      const revoked = await tx.queryOne(`
+        UPDATE capture_agents
+        SET status = 'revoked', updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING id, display_name, status, updated_at
+      `, [agentId, req.tenantId]);
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES (
+          $1, 'user', $2, $3, 'capture_agent.revoked',
+          'capture_agent', $4, $5::jsonb
+        )
+      `, [
+        req.tenantId,
+        String(req.user?.id || ''),
+        req.user?.id || null,
+        agentId,
+        JSON.stringify({
+          displayName: agent.display_name || '',
+          actorName: text(req.actorName, 240),
+          historyPreserved: true,
+          authBindingPreserved: true,
+        }),
+      ]);
+      return {agent: revoked};
+    });
+
+    if (result.notFound) {
+      return res.status(404).json({
+        ok: false,
+        error: 'agent_not_found',
+        message: '采集节点不存在',
+      });
+    }
+    if (result.blockerMessage) {
+      return res.status(409).json({
+        ok: false,
+        error: 'agent_delete_blocked',
+        message: result.blockerMessage,
+        blockers: result.blockers,
+      });
+    }
+    return res.json({
+      ok: true,
+      alreadyRevoked: result.alreadyRevoked === true,
+      agent: result.agent,
+      message: result.alreadyRevoked
+        ? '该节点已删除'
+        : `节点“${result.agent?.display_name || '未命名节点'}”已删除；历史任务和采集结果已保留。`,
+    });
   } catch (err) {
     return next(err);
   }
