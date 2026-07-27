@@ -884,7 +884,8 @@ let memberGroupModalListenersBound = false;
 let riskModalListenersBound = false;
 let debugSessionPanelMinimized = false;
 let debugSessionPanelListenersBound = false;
-let debugSessionDismissedTerminalRunAt = "";
+let debugSessionDismissedUnattendedTerminalRunAt = "";
+let debugSessionDismissedTargetedTerminalRunAt = "";
 let activeCaptureTaskProgressContext = null;
 let debugSessionClockTimer = null;
 let debugSessionClockSnapshot = null;
@@ -4622,7 +4623,8 @@ function buildUnattendedSyntheticDebugSession(
   const visibleTerminal = Boolean(
     terminal &&
       terminalSummaryId &&
-      terminalSummaryId !== debugSessionDismissedTerminalRunAt,
+      terminalSummaryId !==
+        debugSessionDismissedUnattendedTerminalRunAt,
   );
   if (!plan?.enabled || (!running && !visibleTerminal)) {
     return null;
@@ -4750,7 +4752,7 @@ function buildTargetedPostSyntheticDebugSession(
     `${requestId}:${status}:${String(request.message || "").trim()}`;
   if (
     terminal &&
-    terminalSummaryId === debugSessionDismissedTerminalRunAt
+    terminalSummaryId === debugSessionDismissedTargetedTerminalRunAt
   ) {
     return null;
   }
@@ -4984,7 +4986,8 @@ function renderCaptureDebugSession(runtime = {}) {
     nativeActive &&
       KEYWORD_PLAN_TERMINAL_STATUSES.has(planStatus) &&
       planTerminalSummaryId &&
-      planTerminalSummaryId === debugSessionDismissedTerminalRunAt &&
+      planTerminalSummaryId ===
+        debugSessionDismissedUnattendedTerminalRunAt &&
       String(nativeSession?.taskId || "").startsWith("unattended-capture:"),
   );
   const targetedStatus = String(
@@ -5002,7 +5005,8 @@ function renderCaptureDebugSession(runtime = {}) {
       getTargetedPostRunRequestIdFromUrl() &&
       cloudTargetedPostApi?.isTerminalRunStatus?.(targetedStatus) &&
       targetedTerminalSummaryId &&
-      targetedTerminalSummaryId === debugSessionDismissedTerminalRunAt,
+      targetedTerminalSummaryId ===
+        debugSessionDismissedTargetedTerminalRunAt,
   );
   const nativeVisible =
     nativeActive &&
@@ -5326,6 +5330,34 @@ function renderCaptureDebugSession(runtime = {}) {
   });
 }
 
+function dismissAllTerminalCaptureSummaries() {
+  const displayPlan = buildKeywordRunDisplayPlan(keywordPlanState);
+  const planStatus = String(
+    displayPlan?.lastRunStatus || "",
+  ).trim().toLowerCase();
+  if (KEYWORD_PLAN_TERMINAL_STATUSES.has(planStatus)) {
+    debugSessionDismissedUnattendedTerminalRunAt =
+      String(displayPlan?.lastRunAt || "").trim() ||
+      String(displayPlan?.lastRunProgress?.updatedAt || "").trim() ||
+      `${planStatus}:${String(displayPlan?.lastRunMessage || "").trim()}`;
+  }
+
+  const targetedStatus = String(
+    targetedPostRunState?.status || "",
+  ).trim().toLowerCase();
+  if (
+    cloudTargetedPostApi?.isTerminalRunStatus?.(targetedStatus)
+  ) {
+    debugSessionDismissedTargetedTerminalRunAt =
+      String(
+        targetedPostRunState?.finishedAt ||
+          targetedPostRunState?.updatedAt ||
+          "",
+      ).trim() ||
+      `${String(targetedPostRunState?.id || "")}:${targetedStatus}:${String(targetedPostRunState?.message || "").trim()}`;
+  }
+}
+
 function setupDebugSessionPanelControls() {
   if (debugSessionPanelListenersBound) return;
   const minimize = document.getElementById("btnDebugSessionMinimize");
@@ -5337,11 +5369,9 @@ function setupDebugSessionPanelControls() {
   minimize.addEventListener("click", async () => {
     const panel = document.getElementById("debugSessionPanel");
     if (panel?.dataset?.terminal === "true") {
-      debugSessionDismissedTerminalRunAt = String(
-        panel?.dataset?.terminalRunAt ||
-          buildKeywordRunDisplayPlan(keywordPlanState)?.lastRunAt ||
-          "",
-      ).trim();
+      // 一个页面可能同时保留“一次性/无人值守”和“定向巡查”的终态。
+      // 关闭应退出任务状态视图，而不是只隐藏当前一张卡后露出另一张。
+      dismissAllTerminalCaptureSummaries();
       debugSessionPanelMinimized = false;
       renderCaptureDebugSession(getCurrentRuntime() || {});
       return;

@@ -74,7 +74,7 @@ function evaluateSyntheticSessionBuilder({dismissedTerminalRunAt = ""} = {}) {
       "failed",
       "canceled",
     ]),
-    debugSessionDismissedTerminalRunAt: dismissedTerminalRunAt,
+    debugSessionDismissedUnattendedTerminalRunAt: dismissedTerminalRunAt,
   };
   vm.createContext(context);
   vm.runInContext(

@@ -84,9 +84,14 @@
     }
 
     if (evidence.length === 0) return null;
-    const availabilityStatus = evidence.includes("xhs_deleted_copy")
-      ? "deleted"
-      : "page_unavailable";
+    // 小红书详情页出现固定的“扫码查看 + 问题反馈 + 返回首页”不可用
+    // 布局时，目标作品已经不能再从 Web 端访问。业务上按删帖结算，
+    // 避免负面巡查把它留成模糊的“暂不可用”或继续重试。
+    const availabilityStatus =
+      evidence.includes("xhs_deleted_copy") ||
+      evidence.includes("xhs_unavailable_qr_layout")
+        ? "deleted"
+        : "page_unavailable";
     return {
       detected: true,
       unavailable: true,
@@ -95,7 +100,10 @@
       status: "unavailable",
       availabilityStatus,
       reason: UNAVAILABLE_REASON,
-      message: "平台提示该帖子已删除或当前不可用",
+      message:
+        availabilityStatus === "deleted"
+          ? "平台提示该帖子已删除"
+          : "平台提示该帖子当前不可用",
       retryable: false,
       platform,
       url: text(snapshot.url, 3000),

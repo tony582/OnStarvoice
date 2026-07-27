@@ -3,12 +3,31 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.60',
+  latestVersion: '0.3.61',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-07-27',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.60-20260727.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.61-20260727.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.61',
+      releaseDate: '2026-07-27',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '负面巡查删帖结算',
+              desc: '识别小红书作品已删除页面，并可靠回传任务终态，避免巡查长期停留在等待执行。',
+            },
+            {
+              title: '任务完成页关闭',
+              desc: '一次关闭即可退出全部已完成任务状态页，不再在两个完成界面之间反复切换。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.60',
       releaseDate: '2026-07-27',

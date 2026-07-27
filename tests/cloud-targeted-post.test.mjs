@@ -203,6 +203,32 @@ test("settles a deleted or unavailable post without retrying it", () => {
   });
 });
 
+test("upgrades an older QR unavailable result to deleted", () => {
+  const targets = [{
+    workflow: "negative_post_patrol",
+    itemId: "item-legacy-qr",
+    recordId: "record-legacy-qr",
+    externalId: "note-legacy-qr",
+    ordinal: 1,
+  }];
+  const [result] = targeted.normalizeTargetResults([{
+    ...targets[0],
+    status: "skipped",
+    businessOutcome: "post_unavailable",
+    availabilityStatus: "page_unavailable",
+    availability: {
+      status: "unavailable",
+      availabilityStatus: "page_unavailable",
+      message: "平台提示该帖子已删除或当前不可用",
+      evidence: ["xhs_unavailable_qr_layout"],
+    },
+  }], targets);
+
+  assert.equal(result.availabilityStatus, "deleted");
+  assert.equal(result.availability.availabilityStatus, "deleted");
+  assert.equal(result.availability.message, "平台提示该帖子已删除");
+});
+
 test("accepts official-account comment patrol only with a published direct-detail target and comments sync", () => {
   const command = targeted.normalizeCommandPayload({
     protocolVersion: 1,

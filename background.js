@@ -1867,7 +1867,40 @@ async function readTargetedPostRunRequest() {
   ) {
     return null;
   }
-  return request;
+  const targets = Array.isArray(request.targets) ? request.targets : [];
+  if (
+    targets.length === 0 ||
+    typeof cloudTargetedPostApi?.normalizeTargetResults !== 'function'
+  ) {
+    return request;
+  }
+  const targetResults = cloudTargetedPostApi.normalizeTargetResults(
+    request.targetResults,
+    targets,
+  );
+  const checkpoint =
+    typeof cloudTargetedPostApi?.buildCheckpoint === 'function'
+      ? {
+          ...(request.checkpoint && typeof request.checkpoint === 'object'
+            ? request.checkpoint
+            : {}),
+          ...cloudTargetedPostApi.buildCheckpoint(targets, targetResults),
+        }
+      : request.checkpoint;
+  const normalized = {
+    ...request,
+    targetResults,
+    checkpoint,
+  };
+  if (
+    JSON.stringify(targetResults) !== JSON.stringify(request.targetResults) ||
+    JSON.stringify(checkpoint) !== JSON.stringify(request.checkpoint)
+  ) {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.targetedPostRunRequest]: normalized,
+    });
+  }
+  return normalized;
 }
 
 async function persistTargetedPostRunRequest(request) {
@@ -1988,6 +2021,73 @@ function summarizeTargetedPostRunForCloud(request, commandId) {
         ? request.error
         : null,
   };
+}
+
+async function reportTargetedPostTerminalToCloud(request) {
+  if (
+    !request ||
+    !cloudTargetedPostApi?.isTerminalRunStatus?.(request.status)
+  ) {
+    return {ok: false, skipped: true, reason: 'targeted_post_not_terminal'};
+  }
+  const commandId = String(request.cloudCommandId || '').trim();
+  if (!commandId || !cloudTaskAgentApi?.completeCommand) {
+    scheduleCloudTaskAgentSync('targeted_post_terminal_fallback', 0);
+    return {
+      ok: false,
+      skipped: true,
+      reason: commandId ? 'cloud_agent_unavailable' : 'missing_command_id',
+    };
+  }
+  const credential = await readCloudTaskAgentCredential();
+  if (!credential.token) {
+    scheduleCloudTaskAgentSync('targeted_post_terminal_missing_credential', 0);
+    return {ok: false, skipped: true, reason: 'missing_agent_credential'};
+  }
+
+  const result = await rememberCloudCommandResult(
+    commandId,
+    summarizeTargetedPostRunForCloud(request, commandId),
+  );
+  try {
+    const response = await cloudTaskAgentApi.completeCommand({
+      token: credential.token,
+      commandId,
+      success: result.accepted === true,
+      result,
+    });
+    if (response?.ok) {
+      clearCloudTaskAgentFailureBackoff();
+      scheduleCloudTaskAgentSync('targeted_post_terminal_confirmed', 0);
+      return response;
+    }
+    const retryDelay = recordCloudTaskAgentFailure();
+    await rememberCloudTaskAgentError(
+      response?.message || response?.reason || '定向作品任务终态回传失败',
+    );
+    scheduleCloudTaskAgentSync(
+      'targeted_post_terminal_retry',
+      retryDelay,
+    );
+    return response || {
+      ok: false,
+      reason: 'targeted_post_terminal_report_failed',
+    };
+  } catch (error) {
+    const retryDelay = recordCloudTaskAgentFailure();
+    await rememberCloudTaskAgentError(
+      error?.message || '定向作品任务终态回传失败',
+    );
+    scheduleCloudTaskAgentSync(
+      'targeted_post_terminal_retry',
+      retryDelay,
+    );
+    return {
+      ok: false,
+      reason: 'targeted_post_terminal_report_failed',
+      message: normalizeCloudTaskAgentError(error?.message || error),
+    };
+  }
 }
 
 async function executeCloudTargetedPostCreateCommand(
@@ -8956,14 +9056,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message?.patch,
         );
         await persistTargetedPostRunRequest(next);
+        let cloudReport = null;
         if (cloudTargetedPostApi.isTerminalRunStatus(next.status)) {
-          scheduleCloudTaskAgentSync('targeted_post_terminal', 0);
+          // 终态不能只依赖一个随后触发的计时器：MV3 Service Worker
+          // 可能在计时器执行前休眠。直接等待指令回执，确保云端工作项、
+          // 父任务和帖子可用性在同一次消息生命周期内完成结算。
+          cloudReport = await reportTargetedPostTerminalToCloud(next);
         }
         sendResponse({
           ok: true,
           accepted: true,
           reason: '',
           data: next,
+          cloudReported: cloudReport?.ok === true,
         });
         return;
       }
