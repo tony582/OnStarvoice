@@ -31,10 +31,30 @@ test("detects the Xiaohongshu unavailable QR page shown to users", () => {
 
   assert.equal(result.unavailable, true);
   assert.equal(result.businessOutcome, "post_unavailable");
-  assert.equal(result.availabilityStatus, "page_unavailable");
+  assert.equal(result.availabilityStatus, "deleted");
   assert.equal(result.retryable, false);
   assert.equal(result.code, "TARGET_POST_UNAVAILABLE");
   assert.ok(result.evidence.includes("xhs_page_not_available"));
+  assert.ok(result.evidence.includes("xhs_unavailable_qr_layout"));
+});
+
+test("classifies the Chinese Xiaohongshu QR unavailable page as deleted", () => {
+  const result = availability.classifySnapshot({
+    platform: "xiaohongshu",
+    url: "https://www.xiaohongshu.com/explore/note-2",
+    title: "小红书",
+    bodyText: [
+      "当前笔记暂时无法浏览",
+      "请打开小红书App扫码查看",
+      "小红书如何扫码",
+      "问题反馈",
+      "返回首页",
+    ].join("\n"),
+  });
+
+  assert.equal(result.unavailable, true);
+  assert.equal(result.availabilityStatus, "deleted");
+  assert.equal(result.message, "平台提示该帖子已删除");
   assert.ok(result.evidence.includes("xhs_unavailable_qr_layout"));
 });
 

@@ -14,6 +14,10 @@ const taskCenterCoreSource = await readFile(
   resolve(repoRoot, "utils/task-center.js"),
   "utf8",
 );
+const cloudTargetedPostSource = await readFile(
+  resolve(repoRoot, "utils/cloud-targeted-post.js"),
+  "utf8",
+);
 const phase5RuntimeSources = await Promise.all(
   [
     "utils/runtime-tab-policy.js",
@@ -325,6 +329,9 @@ function createHarness() {
   });
 
   vm.runInContext(taskCenterCoreSource, context, {filename: "utils/task-center.js"});
+  vm.runInContext(cloudTargetedPostSource, context, {
+    filename: "utils/cloud-targeted-post.js",
+  });
   for (const {path, source} of phase5RuntimeSources) {
     vm.runInContext(source, context, {filename: path});
   }
@@ -353,6 +360,7 @@ function createHarness() {
       `  assessUnattendedRunHealth,\n` +
       `  recoverUnattendedKeywordRunRequest,\n` +
       `  manuallyRecoverUnattendedKeywordRun,\n` +
+      `  reportTargetedPostTerminalToCloud,\n` +
       `  executeCloudTaskAgentCommand,\n` +
       `  syncCloudTaskAgent,\n` +
       `  superviseUnattendedKeywordRun,\n` +
@@ -458,6 +466,7 @@ function createHarness() {
 const LOCK_KEY = "onstarvoice.captureExecutionLock";
 const UNATTENDED_PLAN_KEY = "onstarvoice.unattendedKeywordPlan";
 const UNATTENDED_REQUEST_KEY = "onstarvoice.unattendedKeywordRunRequest";
+const TARGETED_POST_REQUEST_KEY = "onstarvoice.targetedPostRunRequest";
 const UNATTENDED_ARCHIVE_KEY = "onstarvoice.unattendedKeywordRunArchive";
 const TASK_LEDGER_KEY = "onstarvoice.taskLedger";
 const SYNC_HISTORY_KEY = "onstarvoice.sync_history";
@@ -1426,6 +1435,82 @@ test("a reused unattended runner tab stays non-discardable", async () => {
     },
   ]);
   assert.equal(runner.autoDiscardable, false);
+});
+
+test("a terminal targeted-post update reports its cloud command before the message lifecycle ends", async () => {
+  const harness = createHarness();
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "agent-targeted-terminal",
+      token: "targeted-terminal-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    workflow: "negative_post_patrol",
+    id: "targeted-terminal-request",
+    taskId: "targeted-terminal-task",
+    attemptId: "targeted-terminal-attempt",
+    cloudCommandId: "targeted-terminal-command",
+    platform: "xiaohongshu",
+    status: "running",
+    createdAt: "2026-07-27T11:00:00.000Z",
+    updatedAt: "2026-07-27T11:00:01.000Z",
+    targets: [{
+      workflow: "negative_post_patrol",
+      itemId: "targeted-terminal-item",
+      recordId: "targeted-terminal-record",
+      externalId: "note-targeted-terminal",
+      ordinal: 1,
+      url: "https://www.xiaohongshu.com/explore/note-targeted-terminal",
+    }],
+    targetResults: [],
+    checkpoint: {processedCount: 0, total: 1},
+  };
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: "targeted-terminal-request",
+    attemptId: "targeted-terminal-attempt",
+    patch: {
+      status: "completed",
+      finishedAt: "2026-07-27T11:00:04.000Z",
+      message: "负面帖子巡查已完成",
+      targetResults: [{
+        workflow: "negative_post_patrol",
+        itemId: "targeted-terminal-item",
+        recordId: "targeted-terminal-record",
+        externalId: "note-targeted-terminal",
+        ordinal: 1,
+        status: "skipped",
+        businessOutcome: "post_unavailable",
+        availabilityStatus: "page_unavailable",
+        availability: {
+          status: "unavailable",
+          availabilityStatus: "page_unavailable",
+          reason: "post_deleted_or_unavailable",
+          evidence: ["xhs_unavailable_qr_layout"],
+          observedAt: "2026-07-27T11:00:04.000Z",
+        },
+      }],
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.cloudReported, true);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].commandId, "targeted-terminal-command");
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.targetResults[0].availabilityStatus,
+    "deleted",
+  );
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].targetResults[0].availability
+      .availabilityStatus,
+    "deleted",
+  );
 });
 
 test("a cloud create command starts exactly one local task without replacing the saved plan", async () => {

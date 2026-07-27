@@ -784,6 +784,17 @@
       ) {
         continue;
       }
+      const availability = objectValue(result.availability);
+      const availabilityEvidence = Array.isArray(availability.evidence)
+        ? availability.evidence
+            .map((value) => text(value, 160))
+            .filter(Boolean)
+            .slice(0, 4)
+        : [];
+      const qrUnavailableDeleted =
+        status === "skipped" &&
+        text(result.businessOutcome, 120) === "post_unavailable" &&
+        availabilityEvidence.includes("xhs_unavailable_qr_layout");
       seen.add(itemId);
       results.push({
         ...result,
@@ -791,6 +802,18 @@
         recordId: text(result.recordId, 240),
         externalId: text(result.externalId, 160),
         status,
+        ...(qrUnavailableDeleted
+          ? {
+              availabilityStatus: "deleted",
+              availability: {
+                ...availability,
+                status: "unavailable",
+                availabilityStatus: "deleted",
+                message: "平台提示该帖子已删除",
+                evidence: availabilityEvidence,
+              },
+            }
+          : {}),
       });
     }
     return results.sort(

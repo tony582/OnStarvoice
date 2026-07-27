@@ -191,7 +191,7 @@ test("a normal side panel without a runner query renders shared targeted state a
     targetedPostRunState: sharedRequest,
     getTargetedPostRunRequestIdFromUrl: () => "",
     cloudTargetedPostApi: {isTerminalRunStatus: () => false},
-    debugSessionDismissedTerminalRunAt: "",
+    debugSessionDismissedTargetedTerminalRunAt: "",
     activeBatchRunnerTabId: null,
     getPagePlatform: () => "xiaohongshu",
   };
@@ -241,6 +241,59 @@ test("a normal side panel without a runner query renders shared targeted state a
     "// ==================== 状态订阅",
   );
   assert.match(initSection, /loadTargetedPostRunStateForDisplay\(\)/u);
+});
+
+test("closing a terminal status page dismisses both current terminal task families", () => {
+  const dismissSection = readFunctionSection(
+    "function dismissAllTerminalCaptureSummaries()",
+    "function setupDebugSessionPanelControls()",
+  );
+  const context = {
+    keywordPlanState: {},
+    buildKeywordRunDisplayPlan: () => ({
+      lastRunStatus: "completed",
+      lastRunAt: "2026-07-27T12:00:00.000Z",
+      lastRunProgress: {},
+      lastRunMessage: "一次性采集已完成",
+    }),
+    KEYWORD_PLAN_TERMINAL_STATUSES: new Set(["completed"]),
+    targetedPostRunState: {
+      id: "targeted-close-test",
+      status: "completed",
+      finishedAt: "2026-07-27T12:01:00.000Z",
+      message: "负面帖子巡查已完成",
+    },
+    cloudTargetedPostApi: {
+      isTerminalRunStatus: (status) => status === "completed",
+    },
+    debugSessionDismissedUnattendedTerminalRunAt: "",
+    debugSessionDismissedTargetedTerminalRunAt: "",
+  };
+  vm.runInNewContext(
+    `${dismissSection}
+globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
+    context,
+  );
+
+  context.__dismissAll();
+
+  assert.equal(
+    context.debugSessionDismissedUnattendedTerminalRunAt,
+    "2026-07-27T12:00:00.000Z",
+  );
+  assert.equal(
+    context.debugSessionDismissedTargetedTerminalRunAt,
+    "2026-07-27T12:01:00.000Z",
+  );
+
+  const controlsSection = readFunctionSection(
+    "function setupDebugSessionPanelControls()",
+    "function setupAuthCodeInputListeners()",
+  );
+  assert.match(
+    controlsSection,
+    /dataset\?\.terminal === "true"[\s\S]*?dismissAllTerminalCaptureSummaries\(\)/u,
+  );
 });
 
 test("the stop binding follows the session shown in the panel across native and cloud races", () => {
