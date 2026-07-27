@@ -271,6 +271,90 @@ test("rejects unsupported workflows and unsafe official-comment patrol inputs", 
   );
 });
 
+test("normalizes creator and official profile discovery as resumable account targets", () => {
+  const creator = targeted.normalizeCommandPayload({
+    protocolVersion: 1,
+    workflow: "followed_creator_post_patrol",
+    taskId: "creator-task-1",
+    title: "关注博主作品扫描",
+    platform: "multi",
+    monitorSettings: {publishWindow: "7d"},
+    targets: [{
+      itemId: "11111111-1111-4111-8111-111111111111",
+      recordId: "22222222-2222-4222-8222-222222222222",
+      externalId: "22222222-2222-4222-8222-222222222222",
+      subscriptionId: "22222222-2222-4222-8222-222222222222",
+      executionId: "33333333-3333-4333-8333-333333333333",
+      platform: "xiaohongshu",
+      accountUrl:
+        "https://www.xiaohongshu.com/user/profile/creator-a?xsec_source=pc_feed&utm_source=drop#bad",
+      title: "博主 A",
+    }],
+  });
+
+  assert.equal(creator.workflow, "followed_creator_post_patrol");
+  assert.equal(creator.platform, "multi");
+  assert.equal(creator.subjectType, "creator");
+  assert.equal(creator.targets[0].routeKind, "profile");
+  assert.equal(
+    creator.targets[0].url,
+    "https://www.xiaohongshu.com/user/profile/creator-a?xsec_source=pc_feed",
+  );
+  assert.equal(creator.targets[0].executionId, "33333333-3333-4333-8333-333333333333");
+  assert.equal(plain(creator.monitorSettings).publishWindow, "7d");
+
+  const official = targeted.normalizeCommandPayload({
+    protocolVersion: 1,
+    workflow: "official_account_post_discovery",
+    taskId: "official-discovery-1",
+    platform: "douyin",
+    targets: [{
+      itemId: "44444444-4444-4444-8444-444444444444",
+      recordId: "55555555-5555-4555-8555-555555555555",
+      subscriptionId: "55555555-5555-4555-8555-555555555555",
+      executionId: "66666666-6666-4666-8666-666666666666",
+      platform: "douyin",
+      url: "https://www.douyin.com/user/MS4wLjABAAAA-demo?aid=drop",
+    }],
+  });
+  assert.equal(official.subjectType, "official");
+  assert.equal(official.targets[0].platform, "douyin");
+  assert.equal(official.targets[0].url, "https://www.douyin.com/user/MS4wLjABAAAA-demo");
+});
+
+test("profile discovery rejects post URLs and missing monitor execution identity", () => {
+  const base = {
+    protocolVersion: 1,
+    workflow: "followed_creator_post_patrol",
+    taskId: "creator-task-1",
+    platform: "xiaohongshu",
+  };
+  assert.throws(
+    () => targeted.normalizeCommandPayload({
+      ...base,
+      targets: [{
+        itemId: "item-1",
+        recordId: "subscription-1",
+        subscriptionId: "subscription-1",
+        executionId: "execution-1",
+        url: "https://www.xiaohongshu.com/explore/note-1",
+      }],
+    }),
+    /账号主页/,
+  );
+  assert.throws(
+    () => targeted.normalizeCommandPayload({
+      ...base,
+      targets: [{
+        itemId: "item-1",
+        recordId: "subscription-1",
+        url: "https://www.xiaohongshu.com/user/profile/creator-a",
+      }],
+    }),
+    /监控执行标识/,
+  );
+});
+
 test("reports a bounded current-run comment observation without claiming a full history", () => {
   const result = targeted.buildTargetResult({
     target: {

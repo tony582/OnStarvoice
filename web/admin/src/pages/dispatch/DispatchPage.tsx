@@ -53,7 +53,16 @@ export function DispatchPage() {
     () => params?.view === 'attention' ? 'attention' : 'active',
   )
   const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(
-    () => params?.create === 'comment_patrol' ? { taskType: 'comment_patrol' } : null,
+    () => params?.create === 'comment_patrol'
+      ? {
+          taskType: 'comment_patrol',
+          officialAccountId: String(params?.officialAccountId || '') || undefined,
+        }
+      : params?.create === 'creator_patrol'
+        ? { taskType: 'creator_patrol', subscriptionId: String(params?.subscriptionId || '') || undefined }
+        : params?.create === 'official_discovery'
+          ? { taskType: 'official_discovery', subscriptionId: String(params?.subscriptionId || '') || undefined }
+        : null,
   )
   const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)
   const [orchestrationInitialAgentIds, setOrchestrationInitialAgentIds] = useState<string[]>([])

@@ -660,39 +660,293 @@ router.get('/official-accounts', async (req, res, next) => {
   }
 });
 
+function officialAccountText(value) {
+  return String(value ?? '').trim();
+}
+
+function officialAccountAliases(value) {
+  const aliases = Array.isArray(value)
+    ? value
+    : officialAccountText(value).split(',');
+  return [...new Set(aliases.map(officialAccountText).filter(Boolean))];
+}
+
+function normalizeOfficialAccountInput(item = {}) {
+  const hasAliases = Object.prototype.hasOwnProperty.call(item, 'aliases');
+  return {
+    id: officialAccountText(item.id),
+    platform: officialAccountText(item.platform),
+    accountName: officialAccountText(item.accountName || item.account_name),
+    platformUserId: officialAccountText(item.platformUserId || item.platform_user_id),
+    accountNo: officialAccountText(item.accountNo || item.account_no),
+    legacyAccountId: officialAccountText(item.accountId || item.account_id),
+    profileUrl: officialAccountText(item.profileUrl || item.profile_url),
+    aliases: officialAccountAliases(item.aliases),
+    hasAliases,
+    skipContent: (item.skipContent ?? item.skip_content) !== false,
+    status: ['active', 'disabled'].includes(officialAccountText(item.status))
+      ? officialAccountText(item.status)
+      : 'active',
+  };
+}
+
+async function findOfficialAccountForAdminUpdate(tx, tenantId, input) {
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
+      .test(input.id)
+  ) {
+    const byId = await tx.queryOne(`
+      SELECT *
+      FROM official_accounts
+      WHERE id = $1::uuid AND tenant_id = $2
+      LIMIT 1
+      FOR UPDATE
+    `, [input.id, tenantId]);
+    if (byId) return byId;
+  }
+  return tx.queryOne(`
+    SELECT *
+    FROM official_accounts
+    WHERE tenant_id = $1
+      AND platform = $2
+      AND (
+        ($3 <> '' AND platform_user_id = $3)
+        OR ($4 <> '' AND account_no = $4)
+        OR ($5 <> '' AND account_id = $5)
+        OR ($6 <> '' AND profile_url = $6)
+        OR (
+          $3 = '' AND $4 = '' AND $5 = '' AND $6 = ''
+          AND $7 <> '' AND account_name = $7
+        )
+      )
+    ORDER BY
+      CASE
+        WHEN $3 <> '' AND platform_user_id = $3 THEN 1
+        WHEN $4 <> '' AND account_no = $4 THEN 2
+        WHEN $5 <> '' AND account_id = $5 THEN 3
+        WHEN $6 <> '' AND profile_url = $6 THEN 4
+        ELSE 5
+      END,
+      status = 'deleted',
+      created_at
+    LIMIT 1
+    FOR UPDATE
+  `, [
+    tenantId,
+    input.platform,
+    input.platformUserId,
+    input.accountNo,
+    input.legacyAccountId,
+    input.profileUrl,
+    input.accountName,
+  ]);
+}
+
+function officialAccountMonitorKeyword(account = {}) {
+  return officialAccountText(
+    account.platform_user_id ||
+    account.account_no ||
+    account.account_id ||
+    account.account_name
+  );
+}
+
+async function syncOfficialAccountMonitorSubscription(tx, tenantId, account) {
+  if (!account?.id) return null;
+
+  const profileUrl = officialAccountText(account.profile_url);
+  const accountStatus = officialAccountText(account.status);
+  const targetStatus = accountStatus === 'deleted'
+    ? 'deleted'
+    : accountStatus === 'active'
+      ? 'active'
+      : 'paused';
+  let subscription = await tx.queryOne(`
+    SELECT *
+    FROM monitor_subscriptions
+    WHERE tenant_id = $1
+      AND subject_type = 'official'
+      AND official_account_id = $2
+    ORDER BY status = 'deleted', created_at DESC
+    LIMIT 1
+    FOR UPDATE
+  `, [tenantId, account.id]);
+
+  // Legacy official-account records may already have an unlinked monitor row.
+  // A profile URL is a strong identity; account names are deliberately excluded.
+  if (!subscription && profileUrl) {
+    subscription = await tx.queryOne(`
+      SELECT *
+      FROM monitor_subscriptions
+      WHERE tenant_id = $1
+        AND platform = $2
+        AND subject_type = 'official'
+        AND account_url = $3
+        AND (official_account_id IS NULL OR official_account_id = $4)
+      ORDER BY status = 'deleted', created_at DESC
+      LIMIT 1
+      FOR UPDATE
+    `, [tenantId, account.platform, profileUrl, account.id]);
+  }
+
+  const keyword = officialAccountMonitorKeyword(account);
+  if (subscription) {
+    return tx.queryOne(`
+      UPDATE monitor_subscriptions
+      SET name = $1,
+        keyword = $2,
+        platform = $3,
+        account_url = CASE WHEN $4 <> '' THEN $4 ELSE account_url END,
+        status = $5,
+        subject_type = 'official',
+        official_account_id = $6,
+        next_run_at = CASE
+          WHEN $5 = 'active' AND status <> 'active' THEN now()
+          ELSE next_run_at
+        END,
+        updated_at = now()
+      WHERE id = $7 AND tenant_id = $8
+      RETURNING *
+    `, [
+      account.account_name,
+      keyword,
+      account.platform,
+      profileUrl,
+      targetStatus,
+      account.id,
+      subscription.id,
+      tenantId,
+    ]);
+  }
+
+  if (targetStatus !== 'active' || !profileUrl || !keyword) return null;
+  return tx.queryOne(`
+    INSERT INTO monitor_subscriptions (
+      tenant_id, name, keyword, platform, account_url, cadence_minutes,
+      status, notify_on_negative, auth_code, next_run_at, subject_type,
+      official_account_id
+    ) VALUES (
+      $1, $2, $3, $4, $5, 1440,
+      'active', true, '', now(), 'official', $6
+    )
+    RETURNING *
+  `, [
+    tenantId,
+    account.account_name,
+    keyword,
+    account.platform,
+    profileUrl,
+    account.id,
+  ]);
+}
+
 router.put('/official-accounts', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
     const accounts = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
-    await withTransaction(async tx => {
-      await tx.execute('DELETE FROM official_accounts WHERE tenant_id = $1', [tenantId]);
+    const savedAccounts = await withTransaction(async tx => {
+      const keptIds = [];
       for (const item of accounts) {
-        const platform = String(item?.platform || '').trim();
-        const accountName = String(item?.accountName || item?.account_name || '').trim();
-        if (!platform || !accountName) continue;
-        const aliases = Array.isArray(item?.aliases)
-          ? item.aliases.map(alias => String(alias || '').trim()).filter(Boolean)
-          : String(item?.aliases || '').split(',').map(alias => alias.trim()).filter(Boolean);
-        await tx.execute(`
-          INSERT INTO official_accounts (
-            tenant_id, platform, account_name, account_id, profile_url, aliases, skip_content, status
-          ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active')
-        `, [
-          tenantId,
-          platform,
-          accountName,
-          String(item?.accountId || item?.account_id || '').trim(),
-          String(item?.profileUrl || item?.profile_url || '').trim(),
-          JSON.stringify(aliases),
-          item?.skipContent !== false,
-        ]);
+        const input = normalizeOfficialAccountInput(item);
+        if (!input.platform || !input.accountName) continue;
+        const existing = await findOfficialAccountForAdminUpdate(tx, tenantId, input);
+        let saved = null;
+        if (existing) {
+          saved = await tx.queryOne(`
+            UPDATE official_accounts
+            SET platform = $1,
+              account_name = $2,
+              platform_user_id = CASE WHEN $3 <> '' THEN $3 ELSE platform_user_id END,
+              account_no = CASE WHEN $4 <> '' THEN $4 ELSE account_no END,
+              account_id = CASE WHEN $5 <> '' THEN $5 ELSE account_id END,
+              profile_url = CASE WHEN $6 <> '' THEN $6 ELSE profile_url END,
+              aliases = CASE WHEN $7 THEN $8::jsonb ELSE aliases END,
+              skip_content = $9,
+              status = $10,
+              updated_at = now()
+            WHERE id = $11 AND tenant_id = $12
+            RETURNING *
+          `, [
+            input.platform,
+            input.accountName,
+            input.platformUserId,
+            input.accountNo,
+            input.legacyAccountId,
+            input.profileUrl,
+            input.hasAliases,
+            JSON.stringify(input.aliases),
+            input.skipContent,
+            input.status,
+            existing.id,
+            tenantId,
+          ]);
+        } else {
+          saved = await tx.queryOne(`
+            INSERT INTO official_accounts (
+              tenant_id, platform, account_name, platform_user_id, account_no,
+              account_id, profile_url, aliases, skip_content, status
+            ) VALUES (
+              $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10
+            )
+            RETURNING *
+          `, [
+            tenantId,
+            input.platform,
+            input.accountName,
+            input.platformUserId,
+            input.accountNo,
+            input.legacyAccountId,
+            input.profileUrl,
+            JSON.stringify(input.aliases),
+            input.skipContent,
+            input.status,
+          ]);
+        }
+        if (saved?.id) {
+          keptIds.push(saved.id);
+          await syncOfficialAccountMonitorSubscription(tx, tenantId, saved);
+        }
       }
+      if (keptIds.length > 0) {
+        await tx.execute(`
+          UPDATE official_accounts
+          SET status = 'deleted', updated_at = now()
+          WHERE tenant_id = $1
+            AND NOT (id = ANY($2::uuid[]))
+            AND status <> 'deleted'
+        `, [tenantId, keptIds]);
+      } else {
+        await tx.execute(`
+          UPDATE official_accounts
+          SET status = 'deleted', updated_at = now()
+          WHERE tenant_id = $1 AND status <> 'deleted'
+        `, [tenantId]);
+      }
+      await tx.execute(`
+        UPDATE monitor_subscriptions AS subscription
+        SET status = 'deleted',
+          updated_at = now()
+        FROM official_accounts AS account
+        WHERE account.id = subscription.official_account_id
+          AND account.tenant_id = $1
+          AND subscription.tenant_id = $1
+          AND subscription.subject_type = 'official'
+          AND account.status = 'deleted'
+          AND subscription.status <> 'deleted'
+      `, [tenantId]);
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1, 'user', $2, $3, 'official_accounts.updated', 'tenant', $4, $5::jsonb)
-      `, [tenantId, req.user?.id || '', req.user?.id || null, String(tenantId), JSON.stringify({ count: accounts.length })]);
+      `, [
+        tenantId,
+        req.user?.id || '',
+        req.user?.id || null,
+        String(tenantId),
+        JSON.stringify({ count: keptIds.length }),
+      ]);
+      return keptIds;
     });
-    return res.json({ ok: true });
+    return res.json({ ok: true, count: savedAccounts.length });
   } catch (err) {
     return next(err);
   }
@@ -709,7 +963,8 @@ router.post('/official-accounts/reclassify', async (req, res, next) => {
       WHERE oa.tenant_id = ${rowAlias}.tenant_id AND oa.status = 'active'
         AND (COALESCE(oa.platform, '') = '' OR oa.platform = ${rowAlias}.platform)
         AND (
-          (COALESCE(oa.account_id, '') <> '' AND oa.account_id = ${rowAlias}.author_id)
+          (COALESCE(oa.platform_user_id, '') <> '' AND oa.platform_user_id = ${rowAlias}.author_id)
+          OR (COALESCE(oa.account_id, '') <> '' AND oa.account_id = ${rowAlias}.author_id)
           OR oa.account_name = ${rowAlias}.author_name
           OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) alias WHERE alias = ${rowAlias}.author_name)
         )
@@ -723,7 +978,11 @@ router.post('/official-accounts/reclassify', async (req, res, next) => {
           SELECT 1 FROM official_accounts oa
           WHERE oa.tenant_id = r.tenant_id AND oa.status = 'active' AND oa.skip_content = true
             AND (COALESCE(oa.platform,'')='' OR oa.platform = r.platform)
-            AND ((COALESCE(oa.account_id,'')<>'' AND oa.account_id=r.author_id)
+            AND ((COALESCE(oa.platform_user_id,'')<>'' AND oa.platform_user_id=r.author_id)
+              OR (COALESCE(oa.account_no,'')<>'' AND oa.account_no=r.author_account_no)
+              OR (COALESCE(oa.account_id,'')<>'' AND (
+                oa.account_id=r.author_id OR oa.account_id=r.author_account_no
+              ))
               OR oa.account_name=r.author_name
               OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) a WHERE a=r.author_name))
         )
@@ -744,7 +1003,8 @@ router.post('/official-accounts/reclassify', async (req, res, next) => {
       FROM record_comments c
       JOIN official_accounts oa ON oa.tenant_id = c.tenant_id AND oa.status = 'active'
         AND (COALESCE(oa.platform,'')='' OR oa.platform = c.platform)
-        AND ((COALESCE(oa.account_id,'')<>'' AND oa.account_id=c.author_id)
+        AND ((COALESCE(oa.platform_user_id,'')<>'' AND oa.platform_user_id=c.author_id)
+          OR (COALESCE(oa.account_id,'')<>'' AND oa.account_id=c.author_id)
           OR oa.account_name=c.author_name
           OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) a WHERE a=c.author_name))
       WHERE c.tenant_id = $1 AND c.is_official = true

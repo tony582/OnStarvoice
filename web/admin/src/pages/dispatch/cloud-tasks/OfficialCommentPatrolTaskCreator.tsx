@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle, CalendarDays, Check, Loader2, MessageCircle,
   RefreshCw, Search, Send, ShieldCheck,
@@ -79,10 +79,12 @@ export function OfficialCommentPatrolTaskCreator({
   agent,
   writable,
   onCreated,
+  initialOfficialAccountId = '',
 }: {
   agent: CloudAgent
   writable: boolean
   onCreated: () => Promise<void>
+  initialOfficialAccountId?: string
 }) {
   const initialRange = useMemo(() => initialDateRange(), [])
   const [accounts, setAccounts] = useState<OfficialAccount[]>([])
@@ -111,7 +113,7 @@ export function OfficialCommentPatrolTaskCreator({
   const compatible = platformCompatible && commentPatrolSupported
   const allSelected = candidates.length > 0 && selectedIds.size === candidates.length
 
-  const loadAccounts = async () => {
+  const loadAccounts = useCallback(async () => {
     setAccountsLoading(true)
     setAccountError('')
     try {
@@ -121,14 +123,20 @@ export function OfficialCommentPatrolTaskCreator({
         .filter(item => item && typeof item.id === 'string' && String(item.platform || '').trim())
         .map(item => ({ ...item, platform: String(item.platform).trim() }))
       setAccounts(normalized)
-      setAccountId(current => normalized.some(item => item.id === current) ? current : normalized[0]?.id || '')
+      setAccountId(current => {
+        if (normalized.some(item => item.id === current)) return current
+        if (initialOfficialAccountId && normalized.some(item => item.id === initialOfficialAccountId)) {
+          return initialOfficialAccountId
+        }
+        return normalized[0]?.id || ''
+      })
     } catch (requestError) {
       setAccounts([])
       setAccountError(requestError instanceof Error ? requestError.message : '读取官方账号失败')
     } finally {
       setAccountsLoading(false)
     }
-  }
+  }, [initialOfficialAccountId])
 
   useEffect(() => {
     let active = true
@@ -136,7 +144,7 @@ export function OfficialCommentPatrolTaskCreator({
       if (active) void loadAccounts()
     })
     return () => { active = false }
-  }, [])
+  }, [loadAccounts])
 
   const clearPreview = () => {
     setCandidates([])
@@ -322,7 +330,7 @@ export function OfficialCommentPatrolTaskCreator({
             {candidates.length > 0 && <button type="button" onClick={() => setSelectedIds(allSelected ? new Set() : new Set(candidates.map(item => item.id)))} className="min-h-8 rounded-lg px-2 text-xs font-semibold text-primary hover:bg-primary/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{allSelected ? '取消全选' : '全选'}</button>}
           </div>
           {candidates.length === 0 ? (
-            <div className="px-5 py-10 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-muted-foreground/50" /><div className="mt-3 text-sm font-semibold">没有可巡查作品</div><p className="mt-1 text-xs leading-5 text-muted-foreground">请先在关注博主中完成账号作品发现，或调整发布时间范围。</p></div>
+            <div className="px-5 py-10 text-center"><ShieldCheck className="mx-auto h-7 w-7 text-muted-foreground/50" /><div className="mt-3 text-sm font-semibold">没有可巡查作品</div><p className="mt-1 text-xs leading-5 text-muted-foreground">请先在调度中心创建“官方账号作品发现”任务，或调整发布时间范围。</p></div>
           ) : (
             <div className="max-h-[420px] divide-y divide-border/70 overflow-y-auto overscroll-contain">
               {candidates.map(candidate => {

@@ -38,7 +38,7 @@ export function MonitoringPage() {
         tabs={[
           { key: 'tasks', label: '关注的博主' },
           { key: 'hits', label: '博主新动态' },
-          { key: 'official-comments', label: '官方账号巡查' },
+          { key: 'official-comments', label: '官方账号评论巡查' },
         ]}
         activeKey={tab}
         onChange={key => setTab(key as Tab)}

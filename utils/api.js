@@ -702,16 +702,84 @@ export async function listMonitorSubscriptions({ status = 'all', platform = '' }
   );
 }
 
+function normalizeMonitorSubscriptionText(value) {
+  return String(value || '').trim();
+}
+
+export function normalizeMonitorSubscriptionPayload(input = {}) {
+  const subjectType =
+    normalizeMonitorSubscriptionText(input.subjectType || input.subject_type)
+      .toLowerCase() === 'official'
+      ? 'official'
+      : 'creator';
+  const profileInternalId = normalizeMonitorSubscriptionText(
+    input.profileInternalId ||
+      input.profile_internal_id ||
+      input.platformBloggerId ||
+      input.bloggerId
+  );
+  const accountNo = normalizeMonitorSubscriptionText(
+    input.accountNo ||
+      input.account_no ||
+      input.douyinId ||
+      input.redId ||
+      input.bloggerUserId
+  );
+  const displayName = normalizeMonitorSubscriptionText(
+    input.displayName ||
+      input.display_name ||
+      input.bloggerNameSnapshot ||
+      input.bloggerName ||
+      input.name
+  );
+  const profileUrl = normalizeMonitorSubscriptionText(
+    input.profileUrl ||
+      input.profile_url ||
+      input.bloggerUrl ||
+      input.bloggerProfileUrl ||
+      input.accountUrl
+  );
+  const avatarUrl = normalizeMonitorSubscriptionText(
+    input.avatarUrl ||
+      input.avatar_url ||
+      input.bloggerAvatarSnapshot
+  );
+  const platformBloggerId = normalizeMonitorSubscriptionText(
+    input.platformBloggerId || profileInternalId || accountNo
+  );
+  const assignedAgentId = normalizeMonitorSubscriptionText(
+    input.assignedAgentId || input.assigned_agent_id
+  );
+
+  return {
+    ...input,
+    subjectType,
+    profileInternalId,
+    accountNo,
+    displayName,
+    profileUrl,
+    avatarUrl,
+    assignedAgentId,
+    // Keep the legacy monitor fields while clients and servers migrate to the
+    // explicit subject identity contract.
+    platformBloggerId,
+    bloggerNameSnapshot: displayName,
+    bloggerUrl: profileUrl,
+    bloggerAvatarSnapshot: avatarUrl,
+  };
+}
+
 export async function createMonitorSubscription(input = {}) {
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
   if (!authCodeResult.ok) {
     return authCodeResult;
   }
 
+  const payload = normalizeMonitorSubscriptionPayload(input);
   return await request(API_ENDPOINT.MONITOR_SUBSCRIPTIONS, {
     body: {
+      ...payload,
       code: authCodeResult.code,
-      ...input,
     },
   });
 }
@@ -844,7 +912,11 @@ export async function listMonitorHits({ subscriptionId = '', limit = 50 } = {}) 
   });
 }
 
-export async function runMonitorNow({ platform = '', limit } = {}) {
+export async function runMonitorNow({
+  platform = '',
+  subjectType = 'creator',
+  limit,
+} = {}) {
   const authCodeResult = await resolvePlainAuthCodeFromCurrentAuth();
   if (!authCodeResult.ok) {
     return authCodeResult;
@@ -857,6 +929,10 @@ export async function runMonitorNow({ platform = '', limit } = {}) {
   if (platform) {
     body.platform = platform;
   }
+  body.subjectType =
+    normalizeMonitorSubscriptionText(subjectType).toLowerCase() === 'official'
+      ? 'official'
+      : 'creator';
   if (Number.isInteger(limit) && limit > 0) {
     body.limit = limit;
   }

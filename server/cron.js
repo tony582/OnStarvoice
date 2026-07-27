@@ -3,11 +3,12 @@
  */
 
 import cron from 'node-cron';
-import { queryAll, execute, getSetting } from './db/init.js';
+import { queryAll, getSetting } from './db/init.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
+import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
 
 function shanghaiNowParts() {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -29,26 +30,6 @@ function shanghaiNowParts() {
     hhmm: `${map.hour}:${map.minute}`,
     weekday: new Date(Date.UTC(Number(map.year), Number(map.month) - 1, Number(map.day))).getUTCDay(),
   };
-}
-
-async function enqueueDueMonitorExecutions() {
-  const result = await execute(`
-    INSERT INTO monitor_executions (tenant_id, subscription_id, status)
-    SELECT ms.tenant_id, ms.id, 'pending'
-    FROM monitor_subscriptions ms
-    WHERE ms.status = 'active'
-      AND COALESCE(ms.account_url, '') <> ''
-      AND ms.next_run_at <= now()
-      AND NOT EXISTS (
-        SELECT 1 FROM monitor_executions me
-        WHERE me.subscription_id = ms.id
-          AND me.status IN ('pending', 'running')
-      )
-    RETURNING id
-  `);
-  if (result.rowCount > 0) {
-    console.log(`[Cron] Enqueued ${result.rowCount} monitor executions`);
-  }
 }
 
 async function runConfiguredReports() {
@@ -90,9 +71,17 @@ export function startCronJobs() {
 
   cron.schedule('*/5 * * * *', async () => {
     try {
-      await enqueueDueMonitorExecutions();
+      const results = await enqueueDueProfilePatrolTasks(20);
+      const created = results.filter(result => result.kind === 'created').length;
+      const attention = results.length - created;
+      if (results.length > 0) {
+        console.log(
+          `[Cron] Profile patrol: ${created} task(s) created, ` +
+          `${attention} subscription(s) need attention`,
+        );
+      }
     } catch (err) {
-      console.error('[Cron] Monitor enqueue error:', err.message);
+      console.error('[Cron] Profile patrol enqueue error:', err.message);
     }
   });
 

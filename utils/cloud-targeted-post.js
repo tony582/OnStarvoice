@@ -8,9 +8,14 @@
   // executable browser work.
   const WORKFLOW = "negative_post_patrol";
   const OFFICIAL_ACCOUNT_COMMENT_WORKFLOW = "official_account_comment_patrol";
+  const FOLLOWED_CREATOR_POST_WORKFLOW = "followed_creator_post_patrol";
+  const OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW =
+    "official_account_post_discovery";
   const SUPPORTED_WORKFLOWS = new Set([
     WORKFLOW,
     OFFICIAL_ACCOUNT_COMMENT_WORKFLOW,
+    FOLLOWED_CREATOR_POST_WORKFLOW,
+    OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW,
   ]);
   const MAX_TARGETS = 100;
   const TERMINAL_STATUSES = new Set([
@@ -53,6 +58,9 @@
     if (["douyin", "dy", "抖音"].includes(normalized)) {
       return "douyin";
     }
+    if (["weibo", "wb", "微博"].includes(normalized)) {
+      return "weibo";
+    }
     return "";
   }
 
@@ -63,7 +71,9 @@
         ? "xiaohongshu.com"
         : platform === "douyin"
           ? "douyin.com"
-          : "";
+          : platform === "weibo"
+            ? "weibo.com"
+            : "";
     return Boolean(base && (host === base || host.endsWith(`.${base}`)));
   }
 
@@ -180,6 +190,60 @@
     };
   }
 
+  function canonicalizeCreatorProfileUrl(rawUrl, platform) {
+    const normalizedPlatform = normalizePlatform(platform);
+    if (!normalizedPlatform) {
+      throw Object.assign(new Error("不支持的账号平台"), {
+        code: "TARGET_PLATFORM_UNSUPPORTED",
+      });
+    }
+    let parsed;
+    try {
+      parsed = new URL(text(rawUrl, 3000));
+    } catch {
+      throw Object.assign(new Error("账号主页链接格式错误"), {
+        code: "TARGET_URL_INVALID",
+      });
+    }
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      (parsed.port && parsed.port !== "443") ||
+      !isAllowedHostname(parsed.hostname, normalizedPlatform)
+    ) {
+      throw Object.assign(new Error("账号主页链接不在允许的平台范围内"), {
+        code: "TARGET_URL_NOT_ALLOWED",
+      });
+    }
+    const pathname = String(parsed.pathname || "");
+    const valid =
+      normalizedPlatform === "xiaohongshu"
+        ? /^\/user\/profile\/[A-Za-z0-9_-]+\/?$/i.test(pathname)
+        : normalizedPlatform === "douyin"
+          ? /^\/user\/[A-Za-z0-9._-]+\/?$/i.test(pathname)
+          : /^\/(?:u\/)?[A-Za-z0-9._-]+\/?$/i.test(pathname);
+    if (!valid) {
+      throw Object.assign(new Error("只允许平台账号主页链接"), {
+        code: "TARGET_PROFILE_URL_REQUIRED",
+      });
+    }
+    const allowedQueryKeys =
+      normalizedPlatform === "xiaohongshu"
+        ? new Set(["xsec_token", "xsec_source"])
+        : new Set();
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (!allowedQueryKeys.has(key)) parsed.searchParams.delete(key);
+    }
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.toLowerCase();
+    return {
+      url: parsed.toString(),
+      platform: normalizedPlatform,
+      routeKind: "profile",
+    };
+  }
+
   function normalizeCaptureSettings(value) {
     const source = objectValue(value);
     const commentLimit = Math.floor(
@@ -241,9 +305,17 @@
       });
     }
 
-    const platform = normalizePlatform(
+    const isProfileDiscovery =
+      workflow === FOLLOWED_CREATOR_POST_WORKFLOW ||
+      workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW;
+    const rawPlatform = text(
       source.platform || plan.platform || fallback.platform,
-    );
+      40,
+    ).toLowerCase();
+    const platform =
+      isProfileDiscovery && rawPlatform === "multi"
+        ? "multi"
+        : normalizePlatform(rawPlatform);
     if (!platform) {
       throw Object.assign(new Error("定向采集缺少有效平台"), {
         code: "TARGET_PLATFORM_UNSUPPORTED",
@@ -297,12 +369,20 @@
           code: "TARGET_DUPLICATED",
         });
       }
-      const canonical = canonicalizeTargetUrl(
-        target.url,
-        platform,
-        target.externalId,
-        {allowDouyinSearchModal: !isOfficialCommentPatrol},
-      );
+      const targetPlatform = isProfileDiscovery
+        ? normalizePlatform(target.platform || platform)
+        : platform;
+      const canonical = isProfileDiscovery
+        ? canonicalizeCreatorProfileUrl(
+            target.accountUrl || target.url,
+            targetPlatform,
+          )
+        : canonicalizeTargetUrl(
+            target.url,
+            platform,
+            target.externalId,
+            {allowDouyinSearchModal: !isOfficialCommentPatrol},
+          );
       const publishedAt = text(target.publishedAt, 80);
       if (isOfficialCommentPatrol && !publishedAt) {
         throw Object.assign(new Error(`第 ${index + 1} 个目标缺少发布时间`), {
@@ -311,6 +391,37 @@
       }
       seenItems.add(itemId);
       seenRecords.add(recordId);
+      if (isProfileDiscovery) {
+        const subscriptionId = text(
+          target.subscriptionId || target.recordId,
+          240,
+        );
+        const executionId = text(target.executionId, 240);
+        if (!subscriptionId || !executionId) {
+          throw Object.assign(
+            new Error(`第 ${index + 1} 个账号缺少监控执行标识`),
+            {code: "TARGET_MONITOR_EXECUTION_REQUIRED"},
+          );
+        }
+        return {
+          workflow,
+          itemId,
+          recordId,
+          externalId: text(target.externalId || subscriptionId, 160),
+          subscriptionId,
+          executionId,
+          subjectType:
+            workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW
+              ? "official"
+              : "creator",
+          platform: canonical.platform,
+          accountUrl: canonical.url,
+          url: canonical.url,
+          routeKind: canonical.routeKind,
+          title: text(target.title || target.name, 500),
+          ordinal: index + 1,
+        };
+      }
       return {
         workflow,
         itemId,
@@ -335,8 +446,17 @@
       attemptId: text(source.attemptId || fallback.attemptId, 240),
       fenceToken: text(source.fenceToken || fallback.fenceToken, 500),
       platform,
+      title: text(source.title || plan.title, 500),
+      subjectType: isProfileDiscovery
+        ? workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW
+          ? "official"
+          : "creator"
+        : "",
       targets,
       captureSettings,
+      monitorSettings: isProfileDiscovery
+        ? objectValue(plan.monitorSettings || source.monitorSettings)
+        : {},
     };
   }
 
@@ -742,13 +862,19 @@
       attemptId: text(source.attemptId || attemptId, 240),
       fenceToken: text(source.fenceToken, 500),
       cloudCommandId: text(commandId, 240),
-      platform: normalizePlatform(source.platform),
+      platform:
+        text(source.platform, 40).toLowerCase() === "multi"
+          ? "multi"
+          : normalizePlatform(source.platform),
+      title: text(source.title, 500),
+      subjectType: text(source.subjectType, 40),
       status: "pending",
       cancelRequested: false,
       createdAt,
       updatedAt: createdAt,
       heartbeatAt: createdAt,
       captureSettings: normalizeCaptureSettings(source.captureSettings),
+      monitorSettings: objectValue(source.monitorSettings),
       targets: Array.isArray(source.targets) ? source.targets : [],
       targetResults: [],
       checkpoint: buildCheckpoint(source.targets, []),
@@ -810,10 +936,13 @@
     PROTOCOL_VERSION,
     WORKFLOW,
     OFFICIAL_ACCOUNT_COMMENT_WORKFLOW,
+    FOLLOWED_CREATOR_POST_WORKFLOW,
+    OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW,
     MAX_TARGETS,
     isSupportedWorkflow,
     normalizePlatform,
     canonicalizeTargetUrl,
+    canonicalizeCreatorProfileUrl,
     normalizeCommandPayload,
     normalizeCaptureSettings,
     collectRecordExternalIds,

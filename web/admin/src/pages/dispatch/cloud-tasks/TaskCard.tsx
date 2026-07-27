@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
-  Archive, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, ShieldAlert, Square,
+  Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, ShieldAlert, Square,
+  Radar,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { KeywordProgressSummary, TaskDiagnosticsPanel } from './TaskDiagnostics'
@@ -57,6 +58,12 @@ export function TaskCard({
     || task.task_type === 'comment_patrol'
     || task.feature_key === 'official_account_comment_patrol'
     || task.feature_key === 'capture.official_account_comment_patrol'
+  const followedCreatorPatrol = task.task_type === 'followed_creator_post_patrol'
+    || task.feature_key === 'followed_creator_post_patrol'
+    || task.feature_key === 'capture.followed_creator_post_patrol'
+  const officialAccountDiscovery = task.task_type === 'official_account_post_discovery'
+    || task.feature_key === 'official_account_post_discovery'
+    || task.feature_key === 'capture.official_account_post_discovery'
   const officialCommentFilter = officialCommentPatrol
     && task.metadata?.filter
     && typeof task.metadata.filter === 'object'
@@ -123,6 +130,10 @@ export function TaskCard({
         ? '多 Agent 编排'
         : officialCommentPatrol
           ? '官方账号评论巡查'
+          : followedCreatorPatrol
+            ? '关注博主扫描'
+          : officialAccountDiscovery
+            ? '官方账号作品发现'
           : negativePatrol
           ? '负面帖子巡查'
         : task.source === 'cloud' && task.task_type.includes('plan')
@@ -143,6 +154,10 @@ export function TaskCard({
             ? <Network className="h-4 w-4 shrink-0 text-primary" />
           : officialCommentPatrol
             ? <MessagesSquare className="h-4 w-4 shrink-0 text-primary" />
+          : followedCreatorPatrol
+            ? <Radar className="h-4 w-4 shrink-0 text-primary" />
+          : officialAccountDiscovery
+            ? <BadgeCheck className="h-4 w-4 shrink-0 text-primary" />
           : <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />}
         <h4 className="min-w-0 flex-1 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
         <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
@@ -303,6 +318,18 @@ export function TaskCard({
                   <div>巡查作品：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 篇</span></div>
                   <div>发布时间：<span className="text-foreground">{String(officialCommentFilter.publishDateFrom || '—')} 至 {String(officialCommentFilter.publishDateTo || '—')}</span></div>
                   <div>评论样本：<span className="text-foreground">本次读取 {commentSamples} 条{riskComments > 0 ? ` · 风险 ${riskComments} 条` : ''}</span></div>
+                </>
+              )}
+              {followedCreatorPatrol && (
+                <>
+                  <div>扫描博主：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 个</span></div>
+                  <div>已完成：<span className="text-foreground">{safeNumber(task.counts?.completed ?? task.progress?.current)} 个</span></div>
+                </>
+              )}
+              {officialAccountDiscovery && (
+                <>
+                  <div>官方账号：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 个</span></div>
+                  <div>已发现：<span className="text-foreground">{safeNumber(task.counts?.saved ?? task.progress?.saved)} 篇作品</span></div>
                 </>
               )}
               <div>设备心跳：<span className="text-foreground">{formatTime(task.agent_last_heartbeat_at)}</span></div>

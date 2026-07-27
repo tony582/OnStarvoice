@@ -11,9 +11,28 @@ const MONITOR_SETTING_KEYS = new Set([
   'observeWindowHours',
   'timezone',
 ]);
+const MONITOR_SUBJECT_TYPES = new Set(['creator', 'official']);
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 function normalizeText(value) {
   return String(value || '').trim();
+}
+
+function normalizeSubjectType(value, fallback = 'creator') {
+  const normalized = normalizeText(value || fallback).toLowerCase();
+  return MONITOR_SUBJECT_TYPES.has(normalized) ? normalized : '';
+}
+
+function normalizeAliases(value) {
+  const aliases = Array.isArray(value)
+    ? value
+    : normalizeText(value).split(',');
+  return [...new Set(aliases.map(normalizeText).filter(Boolean))];
+}
+
+function isUuid(value) {
+  return UUID_PATTERN.test(normalizeText(value));
 }
 
 function resolveHitsSince(range) {
@@ -34,6 +53,10 @@ function normalizeMonitorSubscriptionRow(row = {}) {
     bloggerNameSnapshot: row.name || '',
     bloggerName: row.name || '',
     platformBloggerId: row.keyword || '',
+    subjectType: row.subject_type || 'creator',
+    officialAccountId: row.official_account_id || null,
+    assignedAgentId: row.assigned_agent_id || null,
+    hasOfficialRole: Boolean(row.has_official_role),
     notifyOnNegative: Boolean(row.notify_on_negative),
     cadenceMinutes: Number(row.cadence_minutes || 0),
     lastCursor: row.last_cursor || '',
@@ -51,13 +74,22 @@ function resolveSubscriptionInput(body = {}) {
     body.accountUrl || body.bloggerUrl || body.profileUrl || body.authorUrl
   );
   const platformBloggerId = normalizeText(
-    body.platformBloggerId || body.bloggerId || body.authorId
+    body.profileInternalId ||
+    body.profile_internal_id ||
+    body.platformBloggerId ||
+    body.bloggerId ||
+    body.authorId
   );
   const keyword = normalizeText(
     body.keyword || platformBloggerId || body.bloggerNameSnapshot || body.name || accountUrl
   );
   const name = normalizeText(
-    body.name || body.bloggerNameSnapshot || body.bloggerName || keyword
+    body.displayName ||
+    body.display_name ||
+    body.name ||
+    body.bloggerNameSnapshot ||
+    body.bloggerName ||
+    keyword
   );
 
   return {
@@ -67,20 +99,428 @@ function resolveSubscriptionInput(body = {}) {
     accountUrl,
     notifyOnNegative: body.notifyOnNegative ?? 1,
     cadenceMinutes: Number(body.cadenceMinutes) || 1440,
+    subjectType: normalizeSubjectType(body.subjectType || body.subject_type),
+    assignedAgentId: isUuid(
+      body.assignedAgentId || body.assigned_agent_id,
+    )
+      ? normalizeText(body.assignedAgentId || body.assigned_agent_id)
+      : '',
+  };
+}
+
+async function validateSubscriptionAgentBinding(tx, {
+  tenantId,
+  assignedAgentId,
+  actorType,
+  authCodeId = '',
+}) {
+  if (!assignedAgentId) return {agentId: null};
+  const agent = await tx.queryOne(`
+    SELECT agent.id
+    FROM capture_agents agent
+    JOIN tenants tenant
+      ON tenant.id = agent.tenant_id
+      AND tenant.status = 'active'
+    JOIN auth_codes code
+      ON code.id = agent.auth_code_id
+      AND code.tenant_id = agent.tenant_id
+      AND code.status = 'active'
+      AND (code.expires_at IS NULL OR code.expires_at >= now())
+    JOIN auth_bindings binding
+      ON binding.id = agent.auth_binding_id
+      AND binding.code_id = code.id
+    WHERE agent.id = $1::uuid
+      AND agent.tenant_id = $2
+      AND agent.status = 'active'
+      AND ($3 <> 'auth_code' OR code.id = $4::uuid)
+    LIMIT 1
+    FOR UPDATE OF agent
+  `, [
+    assignedAgentId,
+    tenantId,
+    actorType,
+    authCodeId || null,
+  ]);
+  if (!agent) {
+    return {
+      failure: {
+        status: 409,
+        error: 'assigned_agent_binding_invalid',
+        message: '当前扩展节点与账号登记不属于同一有效授权，请重新验证扩展',
+      },
+    };
+  }
+  return {agentId: agent.id};
+}
+
+function resolveOfficialIdentity(body = {}, subscription = {}) {
+  return {
+    platform: normalizeText(body.platform || subscription.platform),
+    accountName: normalizeText(
+      body.accountName ||
+      body.account_name ||
+      body.displayName ||
+      body.display_name ||
+      body.bloggerNameSnapshot ||
+      body.bloggerName ||
+      body.name ||
+      subscription.name
+    ),
+    platformUserId: normalizeText(
+      body.platformUserId ||
+      body.platform_user_id ||
+      body.profileInternalId ||
+      body.profile_internal_id ||
+      body.platformBloggerId ||
+      body.bloggerId ||
+      body.authorId
+    ),
+    accountNo: normalizeText(
+      body.accountNo ||
+      body.account_no ||
+      body.authorAccountNo ||
+      body.author_account_no
+    ),
+    legacyAccountId: normalizeText(body.accountId || body.account_id),
+    profileUrl: normalizeText(
+      body.profileUrl ||
+      body.profile_url ||
+      body.accountUrl ||
+      body.bloggerUrl ||
+      subscription.account_url
+    ),
+    aliases: normalizeAliases(body.aliases),
+    avatarUrl: normalizeText(body.avatarUrl || body.avatar_url),
+    skipContent: body.skipContent !== false && body.skip_content !== false,
+  };
+}
+
+function mergeAliases(current, incoming) {
+  let existing = current;
+  if (typeof existing === 'string') {
+    try {
+      existing = JSON.parse(existing);
+    } catch {
+      existing = existing.split(',');
+    }
+  }
+  return [...new Set([
+    ...normalizeAliases(existing),
+    ...normalizeAliases(incoming),
+  ])];
+}
+
+async function findOfficialAccountForUpdate(tx, tenantId, identity) {
+  return tx.queryOne(`
+    SELECT *
+    FROM official_accounts
+    WHERE tenant_id = $1
+      AND platform = $2
+      AND (
+        ($3 <> '' AND platform_user_id = $3)
+        OR ($4 <> '' AND account_no = $4)
+        OR ($5 <> '' AND account_id = $5)
+        OR ($6 <> '' AND profile_url = $6)
+        OR (
+          $3 = '' AND $4 = '' AND $5 = '' AND $6 = ''
+          AND $7 <> '' AND account_name = $7
+        )
+      )
+    ORDER BY
+      CASE
+        WHEN $3 <> '' AND platform_user_id = $3 THEN 1
+        WHEN $4 <> '' AND account_no = $4 THEN 2
+        WHEN $5 <> '' AND account_id = $5 THEN 3
+        WHEN $6 <> '' AND profile_url = $6 THEN 4
+        ELSE 5
+      END,
+      status = 'deleted',
+      created_at
+    LIMIT 1
+    FOR UPDATE
+  `, [
+    tenantId,
+    identity.platform,
+    identity.platformUserId,
+    identity.accountNo,
+    identity.legacyAccountId,
+    identity.profileUrl,
+    identity.accountName,
+  ]);
+}
+
+async function markSubscriptionOfficial(tx, {
+  tenantId,
+  subscriptionId,
+  body = {},
+  actorType = 'system',
+  actorId = '',
+}) {
+  const subscription = await tx.queryOne(`
+    SELECT *
+    FROM monitor_subscriptions
+    WHERE id = $1 AND tenant_id = $2
+    LIMIT 1
+    FOR UPDATE
+  `, [subscriptionId, tenantId]);
+  if (!subscription) {
+    return {failure: {status: 404, error: 'subscription_not_found', message: '关注账号不存在'}};
+  }
+  let sourceSubscription = subscription;
+
+  const identity = resolveOfficialIdentity(body, subscription);
+  if (!identity.platform || !identity.accountName) {
+    return {
+      failure: {
+        status: 400,
+        error: 'official_account_identity_required',
+        message: '标记官方账号需要平台和账号名称',
+      },
+    };
+  }
+
+  let officialAccount = await findOfficialAccountForUpdate(tx, tenantId, identity);
+  if (!officialAccount && subscription.official_account_id) {
+    officialAccount = await tx.queryOne(`
+      SELECT *
+      FROM official_accounts
+      WHERE id = $1 AND tenant_id = $2
+      LIMIT 1
+      FOR UPDATE
+    `, [subscription.official_account_id, tenantId]);
+  }
+
+  const aliases = mergeAliases(officialAccount?.aliases, identity.aliases);
+  if (officialAccount) {
+    officialAccount = await tx.queryOne(`
+      UPDATE official_accounts
+      SET platform = $1,
+        account_name = $2,
+        platform_user_id = CASE WHEN $3 <> '' THEN $3 ELSE platform_user_id END,
+        account_no = CASE WHEN $4 <> '' THEN $4 ELSE account_no END,
+        account_id = CASE WHEN $5 <> '' THEN $5 ELSE account_id END,
+        profile_url = CASE WHEN $6 <> '' THEN $6 ELSE profile_url END,
+        aliases = $7::jsonb,
+        skip_content = $8,
+        status = 'active',
+        updated_at = now()
+      WHERE id = $9 AND tenant_id = $10
+      RETURNING *
+    `, [
+      identity.platform,
+      identity.accountName,
+      identity.platformUserId,
+      identity.accountNo,
+      identity.legacyAccountId,
+      identity.profileUrl,
+      JSON.stringify(aliases),
+      identity.skipContent,
+      officialAccount.id,
+      tenantId,
+    ]);
+  } else {
+    officialAccount = await tx.queryOne(`
+      INSERT INTO official_accounts (
+        tenant_id, platform, account_name, platform_user_id, account_no,
+        account_id, profile_url, aliases, skip_content, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, 'active')
+      RETURNING *
+    `, [
+      tenantId,
+      identity.platform,
+      identity.accountName,
+      identity.platformUserId,
+      identity.accountNo,
+      identity.legacyAccountId,
+      identity.profileUrl,
+      JSON.stringify(aliases),
+      identity.skipContent,
+    ]);
+  }
+
+  let linkedSubscription = subscription;
+  let linkedSubscriptionCreated = false;
+  if ((subscription.subject_type || 'creator') === 'official') {
+    linkedSubscription = await tx.queryOne(`
+      UPDATE monitor_subscriptions
+      SET subject_type = 'official',
+        official_account_id = $1,
+        updated_at = now()
+      WHERE id = $2 AND tenant_id = $3
+      RETURNING *
+    `, [officialAccount.id, subscription.id, tenantId]);
+  } else {
+    linkedSubscription = await tx.queryOne(`
+      SELECT *
+      FROM monitor_subscriptions
+      WHERE tenant_id = $1
+        AND platform = $2
+        AND subject_type = 'official'
+        AND (
+          official_account_id = $3
+          OR ($4 <> '' AND keyword = $4)
+          OR ($5 <> '' AND account_url <> '' AND account_url = $5)
+          OR (
+            $5 = ''
+            AND COALESCE(account_url, '') = ''
+            AND keyword = $6
+          )
+        )
+      ORDER BY status = 'deleted', created_at DESC
+      LIMIT 1
+      FOR UPDATE
+    `, [
+      tenantId,
+      subscription.platform,
+      officialAccount.id,
+      identity.platformUserId,
+      identity.profileUrl || subscription.account_url,
+      subscription.keyword,
+    ]);
+
+    if (linkedSubscription) {
+      linkedSubscription = await tx.queryOne(`
+        UPDATE monitor_subscriptions
+        SET name = $1,
+          keyword = $2,
+          account_url = $3,
+          notify_on_negative = $4,
+          cadence_minutes = $5,
+          status = CASE WHEN status = 'deleted' THEN 'active' ELSE status END,
+          subject_type = 'official',
+          official_account_id = $6,
+          assigned_agent_id = COALESCE($7::uuid, assigned_agent_id),
+          next_run_at = CASE WHEN status = 'deleted' THEN now() ELSE next_run_at END,
+          updated_at = now()
+        WHERE id = $8 AND tenant_id = $9
+        RETURNING *
+      `, [
+        identity.accountName,
+        subscription.keyword,
+        identity.profileUrl || subscription.account_url,
+        subscription.notify_on_negative,
+        subscription.cadence_minutes,
+        officialAccount.id,
+        subscription.assigned_agent_id || null,
+        linkedSubscription.id,
+        tenantId,
+      ]);
+    } else {
+      linkedSubscriptionCreated = true;
+      linkedSubscription = await tx.queryOne(`
+        INSERT INTO monitor_subscriptions (
+          tenant_id, name, keyword, platform, account_url, cadence_minutes,
+          status, notify_on_negative, auth_code, next_run_at, subject_type,
+          official_account_id, assigned_agent_id
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6,
+          'active', $7, $8, now(), 'official', $9, $10
+        )
+        RETURNING *
+      `, [
+        tenantId,
+        identity.accountName,
+        subscription.keyword,
+        subscription.platform,
+        identity.profileUrl || subscription.account_url,
+        subscription.cadence_minutes,
+        subscription.notify_on_negative,
+        subscription.auth_code,
+        officialAccount.id,
+        subscription.assigned_agent_id || null,
+      ]);
+    }
+  }
+
+  if (sourceSubscription.id !== linkedSubscription.id) {
+    sourceSubscription = await tx.queryOne(`
+      UPDATE monitor_subscriptions
+      SET status = 'paused',
+        last_error = '',
+        updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+      RETURNING *
+    `, [sourceSubscription.id, tenantId]);
+  }
+
+  await tx.execute(`
+    INSERT INTO audit_logs (
+      tenant_id, actor_type, actor_id, action, target_type, target_id, metadata
+    ) VALUES (
+      $1, $2, $3, 'monitor_subscription.marked_official',
+      'monitor_subscription', $4, $5::jsonb
+    )
+  `, [
+    tenantId,
+    actorType,
+    actorId,
+    String(linkedSubscription.id),
+    JSON.stringify({
+      officialAccountId: officialAccount.id,
+      platform: officialAccount.platform,
+      sourceSubscriptionId: subscription.id,
+      creatorHistoryPreserved: subscription.id !== linkedSubscription.id,
+      creatorSubscriptionPaused: sourceSubscription.status === 'paused',
+    }),
+  ]);
+
+  return {
+    subscription: linkedSubscription,
+    sourceSubscription,
+    officialAccount,
+    linkedSubscriptionCreated,
   };
 }
 
 router.get('/subscriptions', requireTenantAccess, async (req, res, next) => {
   try {
-    const { status = 'all', platform = '' } = req.query;
+    const { status = 'all', platform = '', subjectType = '' } = req.query;
+    const normalizedSubjectType = subjectType
+      ? normalizeSubjectType(subjectType, '')
+      : '';
+    if (subjectType && !normalizedSubjectType) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_subject_type',
+        message: 'subjectType 仅支持 creator 或 official',
+      });
+    }
     const params = [req.tenantId];
-    let sql = 'SELECT * FROM monitor_subscriptions WHERE tenant_id = $1';
+    let sql = `
+      SELECT ms.*,
+        EXISTS (
+          SELECT 1
+          FROM monitor_subscriptions official
+          WHERE official.tenant_id = ms.tenant_id
+            AND official.platform = ms.platform
+            AND official.subject_type = 'official'
+            AND official.status = 'active'
+            AND (
+              (
+                official.account_url <> ''
+                AND ms.account_url <> ''
+                AND official.account_url = ms.account_url
+              )
+              OR (
+                COALESCE(official.account_url, '') = ''
+                AND COALESCE(ms.account_url, '') = ''
+                AND official.keyword = ms.keyword
+              )
+            )
+        ) AS has_official_role
+      FROM monitor_subscriptions ms
+      WHERE ms.tenant_id = $1
+    `;
     // 监控中心只做对标监控:仅显示账号(博主)订阅(account_url 非空),过滤旧的关键词订阅
-    sql += ` AND COALESCE(account_url, '') <> ''`;
-    if (status !== 'all') { params.push(status); sql += ` AND status = $${params.length}`; }
-    else { sql += ` AND status <> 'deleted'`; } // 默认不显示已删除
-    if (platform) { params.push(platform); sql += ` AND platform = $${params.length}`; }
-    sql += ' ORDER BY created_at DESC';
+    sql += ` AND COALESCE(ms.account_url, '') <> ''`;
+    if (status !== 'all') { params.push(status); sql += ` AND ms.status = $${params.length}`; }
+    else { sql += ` AND ms.status <> 'deleted'`; } // 默认不显示已删除
+    if (platform) { params.push(platform); sql += ` AND ms.platform = $${params.length}`; }
+    if (normalizedSubjectType) {
+      params.push(normalizedSubjectType);
+      sql += ` AND ms.subject_type = $${params.length}`;
+    }
+    sql += ' ORDER BY ms.created_at DESC';
     const subscriptions = (await queryAll(sql, params)).map(normalizeMonitorSubscriptionRow);
     return res.json({
       ok: true,
@@ -95,25 +535,109 @@ router.get('/subscriptions', requireTenantAccess, async (req, res, next) => {
 router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const input = resolveSubscriptionInput(req.body);
+    if (!input.subjectType) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_subject_type',
+        message: 'subjectType 仅支持 creator 或 official',
+      });
+    }
     if (!input.keyword) {
       return res.json({ ok: false, error: 'invalid_request', message: '账号 ID 或关键词不能为空' });
     }
+    const rawAssignedAgentId = normalizeText(
+      req.body?.assignedAgentId || req.body?.assigned_agent_id,
+    );
+    if (rawAssignedAgentId && !isUuid(rawAssignedAgentId)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_assigned_agent_id',
+        message: '执行节点 ID 无效',
+      });
+    }
 
-    const existing = await queryOne(`
-      SELECT * FROM monitor_subscriptions
-      WHERE tenant_id = $1
-        AND platform = $2
-        AND (
-          keyword = $3
-          OR (account_url <> '' AND account_url = $4)
-        )
-      ORDER BY status = 'deleted', created_at DESC
-      LIMIT 1
-    `, [req.tenantId, input.platform, input.keyword, input.accountUrl]);
+    const result = await withTransaction(async tx => {
+      const binding = await validateSubscriptionAgentBinding(tx, {
+        tenantId: req.tenantId,
+        assignedAgentId: input.assignedAgentId,
+        actorType: req.actorType,
+        authCodeId: req.authCodeRow?.id || '',
+      });
+      if (binding.failure) return {failure: binding.failure};
 
-    if (existing) {
-      if (existing.status === 'deleted') {
-        const restored = await queryOne(`
+      const officialIdentity = input.subjectType === 'official'
+        ? resolveOfficialIdentity(req.body, {
+          platform: input.platform,
+          name: input.name,
+          account_url: input.accountUrl,
+        })
+        : null;
+      const matchedOfficialAccount = officialIdentity
+        ? await findOfficialAccountForUpdate(tx, req.tenantId, officialIdentity)
+        : null;
+
+      let subscription = await tx.queryOne(`
+        SELECT *
+        FROM monitor_subscriptions
+        WHERE tenant_id = $1
+          AND platform = $2
+          AND subject_type = $5
+          AND (
+            ($6::uuid IS NOT NULL AND official_account_id = $6::uuid)
+            OR ($7 <> '' AND keyword = $7)
+            OR ($4 <> '' AND account_url <> '' AND account_url = $4)
+            OR (
+              $4 = ''
+              AND COALESCE(account_url, '') = ''
+              AND keyword = $3
+            )
+          )
+        ORDER BY status = 'deleted', created_at DESC
+        LIMIT 1
+        FOR UPDATE
+      `, [
+        req.tenantId,
+        input.platform,
+        input.keyword,
+        input.accountUrl,
+        input.subjectType,
+        matchedOfficialAccount?.id || null,
+        officialIdentity?.platformUserId || '',
+      ]);
+      if (!subscription && input.subjectType === 'official') {
+        subscription = await tx.queryOne(`
+          SELECT *
+          FROM monitor_subscriptions
+          WHERE tenant_id = $1
+            AND platform = $2
+            AND subject_type = 'creator'
+            AND status <> 'deleted'
+            AND (
+              ($5 <> '' AND keyword = $5)
+              OR ($4 <> '' AND account_url <> '' AND account_url = $4)
+              OR (
+                $4 = ''
+                AND COALESCE(account_url, '') = ''
+                AND keyword = $3
+              )
+            )
+          ORDER BY status = 'active' DESC, created_at DESC
+          LIMIT 1
+          FOR UPDATE
+        `, [
+          req.tenantId,
+          input.platform,
+          input.keyword,
+          input.accountUrl,
+          officialIdentity?.platformUserId || '',
+        ]);
+      }
+
+      let created = false;
+      let restored = false;
+      if (subscription?.status === 'deleted') {
+        restored = true;
+        subscription = await tx.queryOne(`
           UPDATE monitor_subscriptions
           SET status = 'active',
             name = $1,
@@ -121,9 +645,11 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
             account_url = $3,
             notify_on_negative = $4,
             cadence_minutes = $5,
+            subject_type = $6,
+            assigned_agent_id = COALESCE($7::uuid, assigned_agent_id),
             next_run_at = now(),
             updated_at = now()
-          WHERE id = $6 AND tenant_id = $7
+          WHERE id = $8 AND tenant_id = $9
           RETURNING *
         `, [
           input.name || input.keyword,
@@ -131,42 +657,136 @@ router.post('/subscriptions', requireTenantAccess, requireTenantWriter, async (r
           input.accountUrl,
           Boolean(input.notifyOnNegative),
           input.cadenceMinutes,
-          existing.id,
+          input.subjectType,
+          binding.agentId,
+          subscription.id,
           req.tenantId,
         ]);
-        return res.json({
-          ok: true,
-          id: restored.id,
-          data: { restored: true, item: normalizeMonitorSubscriptionRow(restored) },
-        });
+      } else if (!subscription) {
+        created = true;
+        subscription = await tx.queryOne(`
+          INSERT INTO monitor_subscriptions (
+            tenant_id, name, keyword, platform, account_url, notify_on_negative,
+            cadence_minutes, auth_code, next_run_at, subject_type,
+            assigned_agent_id
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10
+          )
+          RETURNING *
+        `, [
+          req.tenantId,
+          input.name || input.keyword,
+          input.keyword,
+          input.platform,
+          input.accountUrl,
+          Boolean(input.notifyOnNegative),
+          input.cadenceMinutes,
+          req.authCode || '',
+          input.subjectType,
+          binding.agentId,
+        ]);
+      } else if (binding.agentId) {
+        subscription = await tx.queryOne(`
+          UPDATE monitor_subscriptions
+          SET assigned_agent_id = $1,
+            last_error = '',
+            updated_at = now()
+          WHERE id = $2 AND tenant_id = $3
+          RETURNING *
+        `, [binding.agentId, subscription.id, req.tenantId]);
       }
 
-      return res.json({
-        ok: true,
-        id: existing.id,
-        data: { created: false, item: normalizeMonitorSubscriptionRow(existing) },
+      let officialAccount = null;
+      if (input.subjectType === 'official') {
+        const marked = await markSubscriptionOfficial(tx, {
+          tenantId: req.tenantId,
+          subscriptionId: subscription.id,
+          body: req.body,
+          actorType: req.actorType || 'user',
+          actorId: req.user?.id || '',
+        });
+        if (marked.failure) {
+          const error = new Error(marked.failure.message);
+          Object.assign(error, marked.failure);
+          throw error;
+        }
+        subscription = marked.subscription;
+        officialAccount = marked.officialAccount;
+        created = created || marked.linkedSubscriptionCreated;
+      }
+
+      return {subscription, officialAccount, created, restored};
+    });
+    if (result.failure) {
+      return res.status(result.failure.status).json({
+        ok: false,
+        error: result.failure.error,
+        message: result.failure.message,
       });
     }
 
-    const result = await queryOne(`
-      INSERT INTO monitor_subscriptions (
-        tenant_id, name, keyword, platform, account_url, notify_on_negative,
-        cadence_minutes, auth_code, next_run_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-      RETURNING *
-    `, [
-      req.tenantId, input.name || input.keyword, input.keyword, input.platform, input.accountUrl,
-      Boolean(input.notifyOnNegative), input.cadenceMinutes, req.authCode || '',
-    ]);
     return res.json({
       ok: true,
-      id: result.id,
-      data: { created: true, item: normalizeMonitorSubscriptionRow(result) },
+      id: result.subscription.id,
+      data: {
+        created: result.created,
+        restored: result.restored,
+        item: normalizeMonitorSubscriptionRow(result.subscription),
+        officialAccount: result.officialAccount,
+      },
     });
   } catch (err) {
+    if (err.status && err.error) {
+      return res.status(err.status).json({
+        ok: false,
+        error: err.error,
+        message: err.message,
+      });
+    }
     return next(err);
   }
 });
+
+router.post(
+  '/subscriptions/:id/mark-official',
+  requireTenantAccess,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.id)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'invalid_subscription_id',
+          message: '关注账号 ID 无效',
+        });
+      }
+      const result = await withTransaction(tx => markSubscriptionOfficial(tx, {
+        tenantId: req.tenantId,
+        subscriptionId: req.params.id,
+        body: req.body,
+        actorType: req.actorType || 'user',
+        actorId: req.user?.id || '',
+      }));
+      if (result.failure) {
+        return res.status(result.failure.status).json({
+          ok: false,
+          error: result.failure.error,
+          message: result.failure.message,
+        });
+      }
+      return res.json({
+        ok: true,
+        data: {
+          item: normalizeMonitorSubscriptionRow(result.subscription),
+          sourceItem: normalizeMonitorSubscriptionRow(result.sourceSubscription),
+          officialAccount: result.officialAccount,
+        },
+      });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
 
 router.patch('/subscriptions/:id', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
@@ -351,6 +971,13 @@ router.get('/due', requireTenantAccess, async (req, res, next) => {
       WHERE me.tenant_id = $1
         AND me.status = 'pending'
         AND ms.status = 'active'
+        AND COALESCE(ms.subject_type, 'creator') = 'creator'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM capture_task_items item
+          WHERE item.tenant_id = me.tenant_id
+            AND item.metadata->>'monitorExecutionId' = me.id::text
+        )
       ORDER BY me.created_at ASC
       LIMIT $2
     `, [req.tenantId, limit]);
@@ -367,6 +994,13 @@ router.post('/executions/:id/start', requireTenantAccess, requireTenantWriter, a
       UPDATE monitor_executions
       SET status = 'running', started_at = now(), updated_at = now()
       WHERE id = $1 AND tenant_id = $2 AND status = 'pending'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM capture_task_items item
+          WHERE item.tenant_id = monitor_executions.tenant_id
+            AND item.metadata->>'monitorExecutionId' =
+              monitor_executions.id::text
+        )
       RETURNING id
     `, [req.params.id, req.tenantId]);
     return res.json({ ok: result.rowCount > 0, executionId: result.rows[0]?.id || null });
@@ -487,12 +1121,31 @@ router.put('/settings', requireTenantAccess, requireTenantWriter, async (req, re
 router.post('/run-now', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const { subscriptionId, platform = '', limit } = req.body;
-    const params = [req.tenantId];
+    const subjectType = normalizeSubjectType(
+      req.body?.subjectType || req.body?.subject_type,
+      'creator',
+    );
+    if (!subjectType) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_subject_type',
+        message: 'subjectType 仅支持 creator 或 official',
+      });
+    }
+    if (subjectType !== 'creator') {
+      return res.status(409).json({
+        ok: false,
+        error: 'official_subscription_requires_dispatch',
+        message: '官方账号请在调度中心创建评论巡查任务',
+      });
+    }
+    const params = [req.tenantId, subjectType];
     let sql = `
       SELECT *
       FROM monitor_subscriptions
       WHERE tenant_id = $1
         AND status = 'active'
+        AND subject_type = $2
     `;
 
     if (subscriptionId) {

@@ -703,6 +703,32 @@ test("create command failures and successful stops settle orchestration work ite
     expiry,
     /status: 'needs_action',[\s\S]*code: 'create_agent_unavailable'/u,
   );
+  assert.match(
+    expiry,
+    /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_command_expired'/u,
+  );
+  assert.match(
+    expiry,
+    /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_agent_unavailable'/u,
+  );
+
+  const profileFailure = readRouteSection(
+    "async function failProfileDiscoveryWork",
+    "async function cancelProfileDiscoveryWork",
+  );
+  assert.match(
+    profileFailure,
+    /UPDATE capture_task_items[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(
+    profileFailure,
+    /UPDATE capture_task_item_attempts[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(
+    profileFailure,
+    /UPDATE monitor_executions execution[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(profileFailure, /syncProfileDiscoverySubscriptions/u);
 
   const completion = readRouteSection(
     "router.post('/agent/commands/:id/complete'",

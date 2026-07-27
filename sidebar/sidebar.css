@@ -4526,6 +4526,62 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
   margin-bottom: 0;
 }
 
+.monitor-subject-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.monitor-subject-option {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.monitor-subject-option:hover {
+  border-color: rgba(79, 70, 229, 0.32);
+  background: rgba(79, 70, 229, 0.03);
+}
+
+.monitor-subject-option:focus-visible {
+  outline: 2px solid rgba(79, 70, 229, 0.35);
+  outline-offset: 2px;
+}
+
+.monitor-subject-option.is-selected,
+.monitor-subject-option[aria-pressed="true"] {
+  border-color: var(--theme-primary);
+  background: rgba(79, 70, 229, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(79, 70, 229, 0.08);
+}
+
+.monitor-subject-option-title,
+.monitor-subject-option-copy {
+  display: block;
+}
+
+.monitor-subject-option-title {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.4;
+}
+
+.monitor-subject-option-copy {
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .monitor-action-row {
   display: flex;
   gap: var(--spacing-sm);
@@ -4628,7 +4684,6 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
 .monitor-item-platform-label {
   display: inline-flex;
   align-items: center;
-  margin-top: 6px;
   font-size: 11px;
   font-weight: var(--font-weight-medium);
   color: var(--text-secondary);
@@ -4636,6 +4691,33 @@ body[data-selected-platform="xiaohongshu"] .monitor-credit-tip {
   padding: 2px 8px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-light);
+}
+
+.monitor-item-labels {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.monitor-subject-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid rgba(79, 70, 229, 0.18);
+  border-radius: var(--radius-sm);
+  background: rgba(79, 70, 229, 0.07);
+  color: var(--theme-primary);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+}
+
+.monitor-subject-badge.is-official {
+  border-color: rgba(0, 153, 102, 0.2);
+  background: rgba(0, 185, 107, 0.08);
+  color: var(--status-success);
 }
 
 .monitor-item-subtitle {

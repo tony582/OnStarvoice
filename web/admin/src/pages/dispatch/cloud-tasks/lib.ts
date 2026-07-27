@@ -157,9 +157,19 @@ export type TaskView = 'active' | 'attention' | 'plans' | 'history'
 export type ComposerIntent = {
   agentId?: string
   mode?: 'one_time' | 'unattended_plan'
-  taskType?: 'comment_patrol'
+  taskType?: 'comment_patrol' | 'creator_patrol' | 'official_discovery'
+  subscriptionId?: string
+  officialAccountId?: string
   editExisting?: boolean
 }
+
+export type CloudCreateTaskType =
+  | 'keyword'
+  | 'unattended_plan'
+  | 'creator_patrol'
+  | 'official_discovery'
+  | 'negative_patrol'
+  | 'comment_patrol'
 
 export type Overview = {
   agents: CloudAgent[]
@@ -716,6 +726,32 @@ export function agentCreatePlatforms(agent: CloudAgent) {
     (supportedPlatforms.length === 0 || supportedPlatforms.includes(platform)) &&
     (allowedPlatforms.length === 0 || allowedPlatforms.includes(platform)),
   )
+}
+
+export function agentTaskTypeBlockReason(
+  agent: CloudAgent,
+  taskType: CloudCreateTaskType,
+  mode: 'one_time' | 'unattended_plan',
+) {
+  const genericReason = agentAssignmentBlockReason(agent, mode)
+  if (genericReason) return genericReason
+  if (['creator_patrol', 'official_discovery', 'negative_patrol'].includes(taskType)
+    && agent.capabilities?.remoteTargetedPostCaptureV1 !== true) {
+    return '客户端扩展版本过低，尚不支持定向页面任务'
+  }
+  if (taskType === 'creator_patrol' && agent.capabilities?.followedCreatorPostPatrol !== true) {
+    return '客户端扩展版本过低，尚不支持关注博主扫描'
+  }
+  if (taskType === 'official_discovery' && agent.capabilities?.officialAccountPostDiscovery !== true) {
+    return '客户端扩展版本过低，尚不支持官方账号作品发现'
+  }
+  if (taskType === 'negative_patrol' && agent.capabilities?.negativePostPatrol !== true) {
+    return '客户端扩展版本过低，尚不支持负面帖子巡查'
+  }
+  if (taskType === 'comment_patrol' && agent.capabilities?.officialAccountCommentPatrol !== true) {
+    return '客户端扩展版本过低，尚不支持官方账号评论巡查'
+  }
+  return ''
 }
 
 export function hasConfiguredUnattendedPlan(plan?: UnattendedPlan | null) {

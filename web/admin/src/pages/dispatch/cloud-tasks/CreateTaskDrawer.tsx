@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import {
-  ArrowLeft, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
-  MessagesSquare, Network, Search, ShieldAlert, X,
+  ArrowLeft, BadgeCheck, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
+  MessagesSquare, Network, Radar, Search, ShieldAlert, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drawer } from '@/components/shared/Drawer'
@@ -10,18 +10,21 @@ import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
 import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
-import type { CloudAgent, CloudTask, ComposerIntent } from './lib'
-import { agentAssignmentBlockReason } from './lib'
+import { AccountDiscoveryTaskCreator } from './AccountDiscoveryTaskCreator'
+import type { CloudAgent, CloudCreateTaskType, CloudTask, ComposerIntent } from './lib'
+import { agentTaskTypeBlockReason } from './lib'
 
 // 统一「新建任务」向导：任务类型 → 执行方式 → 选择节点 → 任务配置。
 // 单节点配置复用 AgentTaskCreator；多节点在选完节点后交接给编排抽屉（预选小队）。
 type WizardStep = 'type' | 'method' | 'agents' | 'configure'
-type TaskType = 'keyword' | 'unattended_plan' | 'negative_patrol' | 'comment_patrol'
+type TaskType = CloudCreateTaskType
 type ExecutionMethod = 'single' | 'multi'
 
 const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string; note: string; icon: LucideIcon; planned: boolean }> = [
   { value: 'keyword', title: '关键词采集', description: '按关键词在小红书、抖音搜索并采集匹配帖子。', note: '一次性补采', icon: Search, planned: false },
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
+  { value: 'creator_patrol', title: '关注博主扫描', description: '打开已关注博主主页，发现近期作品并更新博主新动态。', note: '主页作品发现', icon: Radar, planned: false },
+  { value: 'official_discovery', title: '官方账号作品发现', description: '打开已登记官方账号主页，发现带发布时间的近期作品。', note: '评论巡查前置任务', icon: BadgeCheck, planned: false },
   { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
   { value: 'comment_patrol', title: '官方账号评论巡查', description: '圈定官方账号近期作品，逐篇读取当前可见评论并发现风险。', note: '定向评论巡查', icon: MessagesSquare, planned: false },
 ]
@@ -91,6 +94,10 @@ export function CreateTaskDrawer({
     ? 'unattended_plan'
     : intent.taskType === 'comment_patrol'
       ? 'comment_patrol'
+      : intent.taskType === 'creator_patrol'
+        ? 'creator_patrol'
+        : intent.taskType === 'official_discovery'
+          ? 'official_discovery'
       : null
   const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
 
@@ -107,7 +114,7 @@ export function CreateTaskDrawer({
   // 已选节点里当前仍可接单的（任务类型回退修改后，原选择可能因能力/平台不符被阻断）。
   const selectedAssignableIds = selectedAgentIds.filter(id => {
     const agent = agents.find(candidate => candidate.id === id)
-    return agent ? !agentAssignmentBlockReason(agent, mode) : false
+    return agent ? !agentTaskTypeBlockReason(agent, taskType, mode) : false
   })
   const showIndicator = !editingExisting
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
@@ -160,7 +167,7 @@ export function CreateTaskDrawer({
     ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
     : step === 'method'
       ? '下一步：选择节点'
-      : method === 'multi' && taskType !== 'negative_patrol'
+        : method === 'multi' && taskType !== 'negative_patrol'
         ? '前往多节点编排'
         : '下一步：任务配置'
 
@@ -200,7 +207,7 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
-                        if (item.value === 'comment_patrol') setMethod('single')
+                        if (['comment_patrol', 'creator_patrol', 'official_discovery'].includes(item.value)) setMethod('single')
                       }
                     }}
                     className={`flex min-h-36 flex-col rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${item.planned ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
@@ -230,7 +237,7 @@ export function CreateTaskDrawer({
               {EXECUTION_METHODS.map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
-                const unavailable = taskType === 'comment_patrol' && item.value === 'multi'
+                const unavailable = ['comment_patrol', 'creator_patrol', 'official_discovery'].includes(taskType) && item.value === 'multi'
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
                     onClick={() => { if (!unavailable) setMethod(item.value) }}
@@ -244,7 +251,9 @@ export function CreateTaskDrawer({
                     <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
                     <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
                       {unavailable
-                        ? '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
+                        ? ['creator_patrol', 'official_discovery'].includes(taskType)
+                          ? '账号作品发现首版由一个 Agent 串行执行；每个账号只打开一次，避免重复发现。'
+                          : '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
                         : taskType === 'negative_patrol' && item.value === 'multi'
                           ? '把负面帖子均衡拆给多个在线 Agent 并行巡查，降低单账号连续打开大量帖子的压力。'
                         : item.description}
@@ -272,6 +281,7 @@ export function CreateTaskDrawer({
               agents={agents}
               tasks={tasks}
               mode={mode}
+              taskType={taskType}
               multiple={method === 'multi'}
               selectedIds={selectedAgentIds}
               onChange={setSelectedAgentIds}
@@ -293,6 +303,10 @@ export function CreateTaskDrawer({
                 <span className="font-semibold text-foreground">
                   {taskType === 'unattended_plan'
                     ? '无人值守计划'
+                    : taskType === 'creator_patrol'
+                      ? '关注博主扫描'
+                    : taskType === 'official_discovery'
+                      ? '官方账号作品发现'
                     : taskType === 'negative_patrol'
                     ? '负面帖子巡查'
                     : taskType === 'comment_patrol'
@@ -329,6 +343,31 @@ export function CreateTaskDrawer({
                   key={`${selectedAgent.id}:official-comment-patrol`}
                   agent={selectedAgent}
                   writable={writable}
+                  initialOfficialAccountId={intent.officialAccountId}
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'creator_patrol' ? (
+                <AccountDiscoveryTaskCreator
+                  key={`${selectedAgent.id}:followed-creator-patrol`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  initialSubscriptionId={intent.subscriptionId}
+                  subjectType="creator"
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'official_discovery' ? (
+                <AccountDiscoveryTaskCreator
+                  key={`${selectedAgent.id}:official-account-discovery`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  initialSubscriptionId={intent.subscriptionId}
+                  subjectType="official"
                   onCreated={async () => {
                     await onCreated()
                     onClose()
