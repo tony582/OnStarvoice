@@ -6,6 +6,10 @@ const migration = await readFile(
   new URL('../server/db/migrations/049_official_account_monitor_link.sql', import.meta.url),
   'utf8',
 );
+const initialMigration = await readFile(
+  new URL('../server/db/migrations/001_initial_postgres.sql', import.meta.url),
+  'utf8',
+);
 const monitorRoute = await readFile(
   new URL('../server/routes/monitor.js', import.meta.url),
   'utf8',
@@ -87,6 +91,14 @@ test('migration preserves disabled state and pauses the exact legacy creator sch
     /CASE WHEN account\.status = 'active' THEN 'active' ELSE 'paused' END/u,
   );
   assert.match(
+    initialMigration,
+    /next_run_at TIMESTAMPTZ NOT NULL DEFAULT now\(\)/u,
+  );
+  assert.match(
+    migration,
+    /CASE WHEN account\.status = 'active' THEN 'active' ELSE 'paused' END,[\s\S]*true,[\s\S]*'',[\s\S]*now\(\),[\s\S]*'official'/u,
+  );
+  assert.doesNotMatch(
     migration,
     /CASE WHEN account\.status = 'active' THEN now\(\) ELSE NULL END/u,
   );

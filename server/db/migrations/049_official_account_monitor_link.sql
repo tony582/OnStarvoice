@@ -90,7 +90,10 @@ SELECT
   CASE WHEN account.status = 'active' THEN 'active' ELSE 'paused' END,
   true,
   '',
-  CASE WHEN account.status = 'active' THEN now() ELSE NULL END,
+  -- next_run_at is NOT NULL in the original monitor_subscriptions schema.
+  -- Paused rows are excluded by status, so retaining a concrete timestamp is
+  -- both schema-compatible and keeps disabled accounts from being scheduled.
+  now(),
   'official',
   account.id
 FROM official_accounts account
