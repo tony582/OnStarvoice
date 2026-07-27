@@ -180,9 +180,35 @@ function officialAliases(account) {
 function matchesOfficialAccount(subject, account) {
   if (!account || account.status !== 'active') return false;
   if (account.platform && subject.platform && account.platform !== subject.platform) return false;
-  const subjectId = normalizeComparable(subject.author_id || subject.account_id || '');
-  const accountId = normalizeComparable(account.account_id || '');
-  if (subjectId && accountId && subjectId === accountId) return true;
+  const subjectPlatformUserId = normalizeComparable(
+    subject.author_id || subject.platform_user_id || '',
+  );
+  const subjectAccountNo = normalizeComparable(
+    subject.author_account_no || subject.account_no || '',
+  );
+  const platformUserId = normalizeComparable(account.platform_user_id || '');
+  const accountNo = normalizeComparable(account.account_no || '');
+  const legacyAccountId = normalizeComparable(account.account_id || '');
+  if (
+    subjectPlatformUserId &&
+    platformUserId &&
+    subjectPlatformUserId === platformUserId
+  ) return true;
+  if (subjectAccountNo && accountNo && subjectAccountNo === accountNo) return true;
+  if (
+    legacyAccountId &&
+    (
+      (subjectPlatformUserId && subjectPlatformUserId === legacyAccountId) ||
+      (subjectAccountNo && subjectAccountNo === legacyAccountId)
+    )
+  ) return true;
+  const accountHasStrongIdentity = Boolean(
+    platformUserId || accountNo || legacyAccountId,
+  );
+  const subjectHasStrongIdentity = Boolean(
+    subjectPlatformUserId || subjectAccountNo,
+  );
+  if (accountHasStrongIdentity && subjectHasStrongIdentity) return false;
   const subjectName = normalizeComparable(subject.author_name || subject.account_name || '');
   if (!subjectName) return false;
   return officialAliases(account).some(alias => alias && subjectName === alias);
@@ -452,7 +478,7 @@ export async function upsertRecordComments(recordId, record, context) {
   // PHASE 0:只读加载放在事务之外(官方账号表、当前记录),不占用事务连接。
   const accounts = await loadOfficialAccounts({ queryAll }, tenantId);
   const currentRecord = await queryOne(
-    'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
+    'SELECT id, title, content, url, keyword, author_name, author_id, author_account_no, platform, record_type, sentiment, category, negative_comment_count FROM records WHERE id = $1 AND tenant_id = $2',
     [recordId, tenantId]
   );
   if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
@@ -462,6 +488,7 @@ export async function upsertRecordComments(recordId, record, context) {
     platform,
     author_name: record.author_name || currentRecord.author_name,
     author_id: record.author_id || currentRecord.author_id,
+    author_account_no: record.author_account_no || currentRecord.author_account_no,
   }, accounts);
   const shouldSkipOfficialAccounts = record.skip_official_accounts !== false;
   const officialRecord = Boolean(
@@ -629,6 +656,7 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
 export async function reprocessPendingComments({ limit = 2000 } = {}) {
   const rows = await queryAll(`
     SELECT r.id, r.tenant_id, r.platform, r.title, r.content, r.author_name, r.author_id,
+           r.author_account_no,
            r.url, r.keyword,
            COALESCE(
              CASE WHEN jsonb_typeof(r.payload->'items'->0->'commentsCleanedItems') = 'array'
@@ -660,7 +688,8 @@ export async function reprocessPendingComments({ limit = 2000 } = {}) {
     try {
       await upsertRecordComments(r.id, {
         platform: r.platform, title: r.title, content: r.content,
-        author_name: r.author_name, author_id: r.author_id, url: r.url, keyword: r.keyword,
+        author_name: r.author_name, author_id: r.author_id,
+        author_account_no: r.author_account_no, url: r.url, keyword: r.keyword,
         comments_cleaned_items: JSON.stringify(r.cleaned || []),
         official_reply_items: JSON.stringify(r.official_reply || []),
       }, { tenantId: r.tenant_id, authCode: '' });

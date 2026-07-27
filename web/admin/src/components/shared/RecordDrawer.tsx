@@ -379,6 +379,12 @@ function RecordDrawerContent({
                 <div className="mb-2 flex flex-wrap items-center gap-1.5">
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
+                  {r.content_availability_status === 'deleted' && (
+                    <StatusBadge tone="muted"><Ban className="h-3 w-3" />原帖已删除</StatusBadge>
+                  )}
+                  {r.content_availability_status === 'page_unavailable' && (
+                    <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
+                  )}
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
                   {resolvedIdentity && (
                     <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>

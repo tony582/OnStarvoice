@@ -71,6 +71,22 @@
         title: text(source.title, 500) || "官方账号评论巡查",
       };
     }
+    if (workflow === "followed_creator_post_patrol") {
+      return {
+        workflow,
+        taskType: "followed_creator_post_patrol",
+        featureKey: "followed_creator_post_patrol",
+        title: text(source.title, 500) || "关注博主作品扫描",
+      };
+    }
+    if (workflow === "official_account_post_discovery") {
+      return {
+        workflow,
+        taskType: "official_account_post_discovery",
+        featureKey: "official_account_post_discovery",
+        title: text(source.title, 500) || "官方账号作品发现",
+      };
+    }
     return {
       workflow: "negative_post_patrol",
       taskType: "negative_post_patrol",
@@ -375,6 +391,8 @@
           remoteTaskKeywordPostLimit: true,
           negativePostPatrol: true,
           officialAccountCommentPatrol: true,
+          followedCreatorPostPatrol: true,
+          officialAccountPostDiscovery: true,
           remoteTargetedPostCaptureV1: true,
           unattendedPlanMirror: true,
           localExecutionLock: true,

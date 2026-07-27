@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { CalendarDays, ChevronRight, Loader2, MessageCircle, RefreshCw, ShieldCheck } from 'lucide-react'
+import { CalendarDays, ChevronRight, Loader2, MessageCircle, RefreshCw, ShieldCheck, UserRoundPlus } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useNav } from '@/lib/navigation'
 import { formatDate, formatNumber, platformName } from '@/lib/utils'
@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge, StatusDot } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchTableShell } from '@/components/shared/Workbench'
+import { OfficialAccountRegistrationDrawer } from './OfficialAccountRegistrationDrawer'
 
 type PatrolPost = {
   id: string
@@ -29,6 +30,7 @@ type PatrolPost = {
 
 type PatrolAccount = {
   id: string
+  monitorSubscriptionId?: string
   accountName?: string
   name?: string
   platform: string
@@ -107,6 +109,7 @@ export function OfficialCommentPatrolTab() {
   const [accounts, setAccounts] = useState<PatrolAccount[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [registrationOpen, setRegistrationOpen] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -137,7 +140,14 @@ export function OfficialCommentPatrolTab() {
     risk: accounts.reduce((total, account) => total + riskCount(account), 0),
   }), [accounts])
 
-  const createTask = () => navigate('dispatch', { create: 'comment_patrol' })
+  const createTask = (officialAccountId = '') => navigate('dispatch', {
+    create: 'comment_patrol',
+    ...(officialAccountId ? { officialAccountId } : {}),
+  })
+  const createDiscoveryTask = (subscriptionId = '') => navigate('dispatch', {
+    create: 'official_discovery',
+    ...(subscriptionId ? { subscriptionId } : {}),
+  })
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
@@ -147,7 +157,15 @@ export function OfficialCommentPatrolTab() {
             <div className="flex items-center gap-2"><MessageCircle className="h-4 w-4 text-primary" /><h2 className="text-base font-bold">官方账号评论巡查</h2></div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">查看已发现的近期作品和最近一次巡查结果；任务创建、分配与重试统一在调度中心完成。</p>
           </div>
-          <Button size="sm" className="min-h-10 shrink-0" onClick={createTask}><MessageCircle className="h-4 w-4" />创建评论巡查</Button>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            <Button variant="outline" size="sm" className="min-h-10" onClick={() => setRegistrationOpen(true)}>
+              <UserRoundPlus className="h-4 w-4" />登记官方账号
+            </Button>
+            <Button variant="outline" size="sm" className="min-h-10" onClick={() => createDiscoveryTask()}>
+              <RefreshCw className="h-4 w-4" />发现近期作品
+            </Button>
+            <Button size="sm" className="min-h-10" onClick={() => createTask()}><MessageCircle className="h-4 w-4" />创建评论巡查</Button>
+          </div>
         </div>
         <div className="mt-4 grid grid-cols-3 divide-x divide-border/70 border-t border-border/60 pt-3">
           <MiniStat label="官方账号" value={loading ? '—' : formatNumber(totals.accounts)} />
@@ -162,8 +180,11 @@ export function OfficialCommentPatrolTab() {
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
       ) : accounts.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-border bg-card">
-          <EmptyState icon={ShieldCheck} title="暂无可巡查官方账号" description="先在官方账号管理登记账号，并完成账号作品发现；带发布时间和原帖链接的近期作品才会进入巡查范围。" />
-          <div className="flex justify-center border-t border-border/70 px-4 py-4"><Button size="sm" onClick={createTask}>前往调度中心创建任务</Button></div>
+          <EmptyState icon={ShieldCheck} title="暂无可巡查官方账号" description="打开官方账号主页，在 Extension 里选择“登记为官方账号”；也可以把已有关注账号直接转换。登记后先发现近期作品，再按发布时间创建评论巡查。" />
+          <div className="flex flex-wrap justify-center gap-2 border-t border-border/70 px-4 py-4">
+            <Button variant="outline" size="sm" onClick={() => setRegistrationOpen(true)}>从关注列表登记</Button>
+            <Button size="sm" onClick={() => createDiscoveryTask()}>创建作品发现任务</Button>
+          </div>
         </div>
       ) : (
         <div className="space-y-3">
@@ -179,7 +200,18 @@ export function OfficialCommentPatrolTab() {
                     <h3 className="mt-2 text-[15px] font-bold text-foreground">{accountName(account)}</h3>
                     <p className="mt-1 text-xs text-muted-foreground">最近巡查 {formatDate(lastPatrol(account)) || '—'} · 近 7 天可巡查作品 {formatNumber(Math.max(posts.length, safeNumber(account.recentPostCount)))}</p>
                   </div>
-                  <Button variant="outline" size="sm" onClick={createTask} className="shrink-0">创建任务 <ChevronRight className="h-3.5 w-3.5" /></Button>
+                  <div className="flex shrink-0 flex-wrap gap-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!account.monitorSubscriptionId}
+                      title={account.monitorSubscriptionId ? '为这个官方账号发现近期作品' : '请先补全官方账号主页并保存'}
+                      onClick={() => createDiscoveryTask(account.monitorSubscriptionId)}
+                    >
+                      更新作品
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => createTask(account.id)}>巡查评论 <ChevronRight className="h-3.5 w-3.5" /></Button>
+                  </div>
                 </div>
 
                 {posts.length === 0 ? (
@@ -199,6 +231,12 @@ export function OfficialCommentPatrolTab() {
         </div>
       )}
       {!loading && accounts.length > 0 && <div className="flex justify-end"><Button variant="outline" size="sm" onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />刷新资产状态</Button></div>}
+      {registrationOpen && (
+        <OfficialAccountRegistrationDrawer
+          onClose={() => setRegistrationOpen(false)}
+          onRegistered={load}
+        />
+      )}
     </div>
   )
 }

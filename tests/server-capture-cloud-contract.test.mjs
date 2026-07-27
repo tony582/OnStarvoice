@@ -19,6 +19,7 @@ import {
 import {
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  lockActiveCaptureAgentSession,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
@@ -201,8 +202,9 @@ test("negative patrol result projection binds server records and fresh observati
     "async function projectNegativePatrolSnapshot",
     "async function projectOrchestrationChildControlOutcome",
   );
-  assert.match(projection, /record_id = \$14::uuid/u);
-  assert.match(projection, /external_id = \$15/u);
+  assert.match(projection, /id = \$14::uuid/u);
+  assert.match(projection, /record_id = \$15::uuid/u);
+  assert.match(projection, /external_id = \$16/u);
   assert.match(projection, /result_record_id = CASE/u);
   assert.match(projection, /THEN record_id/u);
   assert.match(projection, /FROM record_observations/u);
@@ -213,8 +215,10 @@ test("negative patrol result projection binds server records and fresh observati
   assert.match(projection, /commentsSampled/u);
   assert.match(projection, /commentPartialPosts/u);
   assert.match(projection, /visible_comments_bounded/u);
-  assert.match(projection, /AND ordinal = \$4[\s\S]*nextOrdinal,/u);
-  assert.doesNotMatch(projection, /nextOrdinal\s*-\s*1/u);
+  assert.match(
+    projection,
+    /ORDER BY ordinal, id[\s\S]*OFFSET \$5[\s\S]*nextOrdinal\s*-\s*1/u,
+  );
   assert.doesNotMatch(projection, /entry\.recordIds/u);
 });
 
@@ -417,7 +421,7 @@ test("agent execution-slot locks serialize heartbeat, resume, and handoff assign
     "const result = await withTransaction(async tx =>",
   );
   const heartbeatLock = heartbeat.indexOf(
-    "await lockCaptureAgentExecutionSlot(",
+    "await lockActiveCaptureAgentSession(",
     heartbeatTransaction,
   );
   const agentWrite = heartbeat.indexOf("UPDATE capture_agents", heartbeatTransaction);
@@ -436,6 +440,71 @@ test("agent execution-slot locks serialize heartbeat, resume, and handoff assign
   assert.ok(identityRead >= 0 && identityRead < resumeLock);
   assert.ok(resumeLock < staleCommands && staleCommands < taskRowLock);
   assert.match(resume, /task_agent_changed/u);
+});
+
+test("a request authenticated before retirement is rejected when retirement commits first", async () => {
+  const authenticatedAgent = {
+    id: "528f8cbd-42f1-493e-8f77-bd585d53ac31",
+    tenant_id: "tenant-a",
+    auth_code_id: "code-a",
+    auth_binding_id: "binding-a",
+    status: "active",
+  };
+  const calls = [];
+  const executor = {
+    execute: async (sql, params) => {
+      calls.push({method: "execute", sql, params});
+    },
+    queryOne: async (sql, params) => {
+      calls.push({method: "queryOne", sql, params});
+      return {
+        ...authenticatedAgent,
+        status: "revoked",
+      };
+    },
+  };
+
+  assert.equal(
+    await lockActiveCaptureAgentSession(executor, authenticatedAgent),
+    null,
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].method, "execute");
+  assert.match(calls[0].sql, /pg_advisory_xact_lock/u);
+  assert.equal(calls[1].method, "queryOne");
+  assert.match(calls[1].sql, /FROM capture_agents[\s\S]*FOR UPDATE/u);
+});
+
+test("late Agent heartbeat and command receipts are absorbed after retirement wins", () => {
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  const heartbeatGuard = heartbeat.indexOf(
+    "await lockActiveCaptureAgentSession(",
+  );
+  const heartbeatWrite = heartbeat.indexOf("UPDATE capture_agents");
+  assert.ok(heartbeatGuard >= 0 && heartbeatGuard < heartbeatWrite);
+  assert.match(heartbeat, /if \(!currentAgent\) return \{agentInactive: true\}/u);
+  assert.match(
+    heartbeat,
+    /result\.agentInactive[\s\S]*error: 'agent_inactive'/u,
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  const completionGuard = completion.indexOf(
+    "await lockActiveCaptureAgentSession(",
+  );
+  const commandRead = completion.indexOf("SELECT task_id");
+  assert.ok(completionGuard >= 0 && completionGuard < commandRead);
+  assert.match(
+    completion,
+    /commandResult\.agentInactive[\s\S]*error: 'agent_inactive'/u,
+  );
+  assert.match(completion, /'agent_retired'/u);
 });
 
 test("overview never presents interrupted or needs-action Agents as idle", () => {
@@ -507,6 +576,89 @@ test("agent deletion is a guarded soft revoke that preserves history", () => {
   assert.doesNotMatch(removal, /DELETE FROM auth_bindings/u);
 });
 
+test("permanently offline Agent retirement is explicit, tenant-scoped, audited, and settles control state", async () => {
+  const retirement = readRouteSection(
+    "router.post('/agents/:id/retire'",
+    "router.post('/agents/:id/tasks'",
+  );
+  const credentialIssuer = await readFile(
+    new URL("../server/services/capture-cloud.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    retirement,
+    /requireTenantAccess, requireSessionUser, requireTenantWriter/u,
+  );
+  assert.match(retirement, /req\.body\?\.confirmation[\s\S]*永久归档/u);
+  assert.match(
+    retirement,
+    /\['tenant_migrated', 'permanently_offline'\]/u,
+  );
+  assert.match(
+    retirement,
+    /WHERE id = \$1 AND tenant_id = \$2[\s\S]*FOR UPDATE/u,
+  );
+  assert.doesNotMatch(retirement, /WHERE client_uuid/u);
+  assert.match(
+    retirement,
+    /captureAgentOnline\(agent\.last_heartbeat_at\)[\s\S]*agent_retirement_online/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_agent_tokens[\s\S]*revoked_at = COALESCE\(revoked_at, now\(\)\)/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_agent_commands[\s\S]*status = 'expired'[\s\S]*agent_retired/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_task_attempts[\s\S]*status = 'canceled'/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_task_item_attempts[\s\S]*status = 'canceled'/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_task_items[\s\S]*status = 'canceled'/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_tasks[\s\S]*status = 'canceled'[\s\S]*历史采集结果已保留/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_orchestration_schedules[\s\S]*status = 'canceled'[\s\S]*next_run_at = NULL/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE social_account_bindings[\s\S]*status = 'historical'/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE social_accounts[\s\S]*last_agent_id = NULL/u,
+  );
+  assert.match(
+    retirement,
+    /UPDATE capture_agents[\s\S]*status = 'revoked'[\s\S]*unattended_plan = '\{\}'::jsonb/u,
+  );
+  assert.match(
+    retirement,
+    /INSERT INTO audit_logs[\s\S]*capture_agent\.retired/u,
+  );
+  assert.match(retirement, /unattendedPlanSnapshot: planSnapshot/u);
+  assert.match(retirement, /historyPreserved: true/u);
+  assert.match(retirement, /authBindingPreserved: true/u);
+  assert.match(
+    credentialIssuer,
+    /ON CONFLICT \(tenant_id, client_uuid\)[\s\S]*status = capture_agents\.status[\s\S]*agent\.status !== 'active'[\s\S]*token: ''/u,
+  );
+  assert.doesNotMatch(retirement, /DELETE FROM capture_tasks/u);
+  assert.doesNotMatch(retirement, /DELETE FROM records/u);
+  assert.doesNotMatch(retirement, /DELETE FROM auth_bindings/u);
+});
+
 test("orchestration checkpoint database values are bounded and timestamp-safe", () => {
   assert.equal(orchestrationCheckpointInteger(-4), 0);
   assert.equal(orchestrationCheckpointInteger("17.9"), 17);
@@ -551,6 +703,32 @@ test("create command failures and successful stops settle orchestration work ite
     expiry,
     /status: 'needs_action',[\s\S]*code: 'create_agent_unavailable'/u,
   );
+  assert.match(
+    expiry,
+    /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_command_expired'/u,
+  );
+  assert.match(
+    expiry,
+    /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_agent_unavailable'/u,
+  );
+
+  const profileFailure = readRouteSection(
+    "async function failProfileDiscoveryWork",
+    "async function cancelProfileDiscoveryWork",
+  );
+  assert.match(
+    profileFailure,
+    /UPDATE capture_task_items[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(
+    profileFailure,
+    /UPDATE capture_task_item_attempts[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(
+    profileFailure,
+    /UPDATE monitor_executions execution[\s\S]*SET status = 'failed'/u,
+  );
+  assert.match(profileFailure, /syncProfileDiscoverySubscriptions/u);
 
   const completion = readRouteSection(
     "router.post('/agent/commands/:id/complete'",

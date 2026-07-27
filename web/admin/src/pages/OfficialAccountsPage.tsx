@@ -6,7 +6,42 @@ import { Input } from '@/components/ui/input'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { cn } from '@/lib/utils'
 
-type Row = { platform: string; account_name: string; aliasesText: string; account_id: string; skip_content: boolean }
+type Row = {
+  id?: string
+  platform: string
+  account_name: string
+  aliasesText: string
+  account_id: string
+  account_no: string
+  platform_user_id: string
+  profile_url: string
+  skip_content: boolean
+}
+
+type OfficialAccountApiRow = {
+  id?: string
+  platform?: string
+  account_name?: string
+  aliases?: unknown
+  account_id?: string
+  account_no?: string
+  accountNo?: string
+  platform_user_id?: string
+  platformUserId?: string
+  profile_url?: string
+  profileUrl?: string
+  skip_content?: boolean
+}
+
+type OfficialAccountsResponse = {
+  accounts?: OfficialAccountApiRow[]
+}
+
+type ReclassifyResponse = {
+  excluded?: number
+  officialReplies?: number
+  repliedRecords?: number
+}
 
 const PLATFORMS = [
   { value: 'xiaohongshu', label: '小红书' },
@@ -24,12 +59,16 @@ export function OfficialAccountsPage() {
   const load = async () => {
     setLoading(true)
     try {
-      const d = await api.get<any>('/admin/official-accounts')
-      setRows((d.accounts || []).map((a: any) => ({
+      const d = await api.get<OfficialAccountsResponse>('/admin/official-accounts')
+      setRows((d.accounts || []).map(a => ({
+        id: a.id || undefined,
         platform: a.platform || 'xiaohongshu',
         account_name: a.account_name || '',
         aliasesText: (Array.isArray(a.aliases) ? a.aliases : []).join(', '),
         account_id: a.account_id || '',
+        account_no: a.account_no || a.accountNo || a.account_id || '',
+        platform_user_id: a.platform_user_id || a.platformUserId || '',
+        profile_url: a.profile_url || a.profileUrl || '',
         skip_content: a.skip_content !== false,
       })))
     } catch (err) { console.error(err) } finally { setLoading(false) }
@@ -41,17 +80,30 @@ export function OfficialAccountsPage() {
   }, [])
 
   const update = (i: number, patch: Partial<Row>) => setRows(rs => rs.map((r, j) => j === i ? { ...r, ...patch } : r))
-  const addRow = () => setRows(rs => [...rs, { platform: 'xiaohongshu', account_name: '', aliasesText: '', account_id: '', skip_content: true }])
+  const addRow = () => setRows(rs => [...rs, {
+    platform: 'xiaohongshu',
+    account_name: '',
+    aliasesText: '',
+    account_id: '',
+    account_no: '',
+    platform_user_id: '',
+    profile_url: '',
+    skip_content: true,
+  }])
   const removeRow = (i: number) => setRows(rs => rs.filter((_, j) => j !== i))
 
   const save = async () => {
     setSaving(true); setMsg('')
     try {
       const accounts = rows.filter(r => r.account_name.trim()).map(r => ({
+        id: r.id,
         platform: r.platform,
         accountName: r.account_name.trim(),
         aliases: r.aliasesText.split(',').map(s => s.trim()).filter(Boolean),
-        accountId: r.account_id.trim(),
+        accountId: (r.account_no || r.account_id).trim(),
+        accountNo: (r.account_no || r.account_id).trim(),
+        platformUserId: r.platform_user_id.trim(),
+        profileUrl: r.profile_url.trim(),
         skipContent: r.skip_content,
       }))
       await api.put('/admin/official-accounts', { accounts })
@@ -63,7 +115,7 @@ export function OfficialAccountsPage() {
   const reclassify = async () => {
     setReclassifying(true); setMsg('')
     try {
-      const d = await api.post<any>('/admin/official-accounts/reclassify')
+      const d = await api.post<ReclassifyResponse>('/admin/official-accounts/reclassify')
       setMsg(`回溯完成:移出监测 ${d.excluded ?? 0} 条官方发文;识别官方回复 ${d.officialReplies ?? 0} 条,标记「已官方回复」内容 ${d.repliedRecords ?? 0} 条。`)
     } catch (err) { setMsg('回溯失败:' + (err instanceof Error ? err.message : '')) } finally { setReclassifying(false) }
   }
@@ -98,7 +150,7 @@ export function OfficialAccountsPage() {
               </WorkbenchSelect></label>
               <label><span className="mb-1 block text-[11px] font-semibold text-muted-foreground lg:hidden">账号名（精确）</span><Input value={r.account_name} onChange={e => update(i, { account_name: e.target.value })} placeholder="上海安吉星信息服务有限公司" className="h-10 text-[12px] lg:h-8" /></label>
               <label><span className="mb-1 block text-[11px] font-semibold text-muted-foreground lg:hidden">别名（逗号分隔）</span><Input value={r.aliasesText} onChange={e => update(i, { aliasesText: e.target.value })} placeholder="安吉星OnStar, 安吉星客服" className="h-10 text-[12px] lg:h-8" /></label>
-              <label><span className="mb-1 block text-[11px] font-semibold text-muted-foreground lg:hidden">账号 ID（选填）</span><Input value={r.account_id} onChange={e => update(i, { account_id: e.target.value })} placeholder="平台ID" className="h-10 text-[12px] lg:h-8" /></label>
+              <label><span className="mb-1 block text-[11px] font-semibold text-muted-foreground lg:hidden">账号 ID（选填）</span><Input value={r.account_no || r.account_id} onChange={e => update(i, { account_no: e.target.value, account_id: e.target.value })} placeholder="客户可见账号号" className="h-10 text-[12px] lg:h-8" /></label>
               <button onClick={() => update(i, { skip_content: !r.skip_content })} className="flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-left lg:min-h-0 lg:justify-center lg:border-0 lg:px-0">
                 <span className={cn('flex h-[18px] w-[18px] items-center justify-center rounded border transition-colors', r.skip_content ? 'border-status-green bg-status-green text-white' : 'border-input bg-card')}>
                   {r.skip_content && <Check className="h-3 w-3" strokeWidth={3} />}

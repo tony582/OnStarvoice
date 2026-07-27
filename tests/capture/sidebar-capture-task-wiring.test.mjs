@@ -114,6 +114,135 @@ test("cloud and unattended Debug sessions stop through the exact request id", ()
   assert.match(cancelSection, /activeKeywordRunState\?\.id/u);
 });
 
+test("targeted patrol owns the dark task surface and exact stop binding", () => {
+  const renderSection = readFunctionSection(
+    "function renderCaptureDebugSession(runtime = {})",
+    "function setupDebugSessionPanelControls()",
+  );
+  assert.match(renderSection, /buildTargetedPostSyntheticDebugSession/u);
+  assert.match(
+    renderSection,
+    /usingTargetedSyntheticSession[\s\S]*?targetedSyntheticSession/u,
+  );
+  assert.match(renderSection, /targeted-post-synthetic/u);
+  assert.match(renderSection, /data-targeted-post-request-id/u);
+
+  const controlsSection = readFunctionSection(
+    "function setupDebugSessionPanelControls()",
+    "function setupAuthCodeInputListeners()",
+  );
+  assert.match(
+    controlsSection,
+    /cancelTargetedPostRunFromSidebar\([\s\S]*?targetedPostRequestId/u,
+  );
+
+  const runnerSection = readFunctionSection(
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+    "async function maybeClaimAndRunUnattendedKeywordPlan(",
+  );
+  assert.match(
+    runnerSection,
+    /detectUnavailableTargetPage:[\s\S]*?negative_post_patrol/u,
+  );
+  assert.match(runnerSection, /runnerTabId:\s*targetTabId/u);
+  assert.match(
+    runnerSection,
+    /rawPhase\.startsWith\("target_"\)[\s\S]*?: `target_\$\{rawPhase\}`/u,
+  );
+  assert.doesNotMatch(runnerSection, /phase:\s*`target_\$\{String\(progress\.phase/u);
+
+  const batchSection = readSourceSection(
+    captureSyncSource,
+    "export async function batchCaptureByUrls({",
+    "/**\n * 批量关键词采集",
+  );
+  assert.match(
+    batchSection,
+    /runnerTabId:\s*explicitRunnerTabId\s*=\s*null/u,
+  );
+  assert.match(
+    batchSection,
+    /chrome\.tabs\.get\(normalizedExplicitRunnerTabId\)[\s\S]*?: await getCurrentActiveTab\(\)/u,
+  );
+});
+
+test("a normal side panel without a runner query renders shared targeted state and stops that exact request", async () => {
+  const syntheticSection = readFunctionSection(
+    "function buildTargetedPostSyntheticDebugSession(",
+    "function resolveDisplayedUnattendedSessionBinding(",
+  );
+  const sharedRequest = {
+    id: "shared-targeted-request",
+    workflow: "negative_post_patrol",
+    status: "running",
+    platform: "xiaohongshu",
+    createdAt: "2026-07-27T01:00:00.000Z",
+    targets: [{
+      itemId: "item-1",
+      title: "待巡查帖子",
+      url: "https://www.xiaohongshu.com/explore/note-1",
+      ordinal: 1,
+    }],
+    targetResults: [],
+    progress: {current: 1, total: 1, itemId: "item-1"},
+    checkpoint: {processedCount: 0},
+  };
+  const syntheticContext = {
+    targetedPostRunState: sharedRequest,
+    getTargetedPostRunRequestIdFromUrl: () => "",
+    cloudTargetedPostApi: {isTerminalRunStatus: () => false},
+    debugSessionDismissedTerminalRunAt: "",
+    activeBatchRunnerTabId: null,
+    getPagePlatform: () => "xiaohongshu",
+  };
+  vm.runInNewContext(
+    `${syntheticSection}\nglobalThis.__buildTargeted = buildTargetedPostSyntheticDebugSession;`,
+    syntheticContext,
+  );
+  const session = syntheticContext.__buildTargeted({});
+  assert.equal(session.targetedPost, true);
+  assert.equal(session.taskId, "targeted-post:shared-targeted-request");
+  assert.equal(session.progress.currentTargetTitle, "待巡查帖子");
+
+  const cancelSection = readFunctionSection(
+    "async function cancelTargetedPostRunFromSidebar(",
+    "async function waitForTargetedPostRunnerTab(",
+  );
+  const updateCalls = [];
+  const cancelContext = {
+    targetedPostRunState: sharedRequest,
+    cloudTargetedPostApi: {isTerminalRunStatus: () => false},
+    targetedPostCancelRequested: false,
+    batchUrlCancelRequested: false,
+    activeBatchRunnerTabId: null,
+    updateTargetedPostRun: async (request, patch) => {
+      updateCalls.push({request, patch});
+      return {...request, ...patch};
+    },
+    requestCaptureCancelSignal: async () => true,
+    console,
+  };
+  vm.runInNewContext(
+    `${cancelSection}\nglobalThis.__cancelTargeted = cancelTargetedPostRunFromSidebar;`,
+    cancelContext,
+  );
+  assert.equal(await cancelContext.__cancelTargeted("another-request"), false);
+  assert.equal(updateCalls.length, 0);
+  assert.equal(
+    await cancelContext.__cancelTargeted("shared-targeted-request"),
+    true,
+  );
+  assert.equal(updateCalls.length, 1);
+  assert.equal(updateCalls[0].request.id, "shared-targeted-request");
+  assert.equal(updateCalls[0].patch.cancelRequested, true);
+
+  const initSection = readFunctionSection(
+    "export async function initSidebar()",
+    "// ==================== 状态订阅",
+  );
+  assert.match(initSection, /loadTargetedPostRunStateForDisplay\(\)/u);
+});
+
 test("the stop binding follows the session shown in the panel across native and cloud races", () => {
   const section = readFunctionSection(
     "function resolveDisplayedUnattendedSessionBinding(",
@@ -1048,19 +1177,19 @@ test("unattended plan renders startup and durable terminal task surfaces", () =>
   );
   assert.match(
     renderSection,
-    /const syntheticSession = buildUnattendedSyntheticDebugSession\(\s*runtime,\s*displayPlan,\s*\)/,
+    /const unattendedSyntheticSession = buildUnattendedSyntheticDebugSession\(\s*runtime,\s*displayPlan,\s*\)/,
   );
   assert.match(
     renderSection,
-    /const active = nativeVisible \|\| Boolean\(syntheticSession\)/,
+    /nativeVisible \|\|[\s\S]*?Boolean\(targetedSyntheticSession\) \|\|[\s\S]*?Boolean\(unattendedSyntheticSession\)/,
   );
   assert.match(
     renderSection,
-    /usingSyntheticSession \? "unattended-synthetic" : "native-debug"/,
+    /usingUnattendedSyntheticSession[\s\S]*?"unattended-synthetic"[\s\S]*?"native-debug"/,
   );
   assert.match(
     renderSection,
-    /syntheticSession && \(!nativeVisible \|\| syntheticSession\.terminal\)/,
+    /unattendedSyntheticSession &&[\s\S]*?\(!nativeVisible \|\| unattendedSyntheticSession\.terminal\)/,
   );
 
   const statusSection = readFunctionSection(

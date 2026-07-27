@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import {
-  ArrowLeft, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
-  MessagesSquare, Network, Search, ShieldAlert, X,
+  ArrowLeft, BadgeCheck, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
+  MessagesSquare, Network, Radar, Search, ShieldAlert, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drawer } from '@/components/shared/Drawer'
@@ -10,18 +10,21 @@ import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
 import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
-import type { CloudAgent, CloudTask, ComposerIntent } from './lib'
-import { agentAssignmentBlockReason } from './lib'
+import { AccountDiscoveryTaskCreator } from './AccountDiscoveryTaskCreator'
+import type { CloudAgent, CloudCreateTaskType, CloudTask, ComposerIntent } from './lib'
+import { agentTaskTypeBlockReason } from './lib'
 
 // 统一「新建任务」向导：任务类型 → 执行方式 → 选择节点 → 任务配置。
 // 单节点配置复用 AgentTaskCreator；多节点在选完节点后交接给编排抽屉（预选小队）。
 type WizardStep = 'type' | 'method' | 'agents' | 'configure'
-type TaskType = 'keyword' | 'unattended_plan' | 'negative_patrol' | 'comment_patrol'
+type TaskType = CloudCreateTaskType
 type ExecutionMethod = 'single' | 'multi'
 
 const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string; note: string; icon: LucideIcon; planned: boolean }> = [
   { value: 'keyword', title: '关键词采集', description: '按关键词在小红书、抖音搜索并采集匹配帖子。', note: '一次性补采', icon: Search, planned: false },
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
+  { value: 'creator_patrol', title: '关注博主扫描', description: '打开已关注博主主页，发现近期作品并更新博主新动态。', note: '主页作品发现', icon: Radar, planned: false },
+  { value: 'official_discovery', title: '官方账号作品发现', description: '打开已登记官方账号主页，发现带发布时间的近期作品。', note: '评论巡查前置任务', icon: BadgeCheck, planned: false },
   { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
   { value: 'comment_patrol', title: '官方账号评论巡查', description: '圈定官方账号近期作品，逐篇读取当前可见评论并发现风险。', note: '定向评论巡查', icon: MessagesSquare, planned: false },
 ]
@@ -91,6 +94,10 @@ export function CreateTaskDrawer({
     ? 'unattended_plan'
     : intent.taskType === 'comment_patrol'
       ? 'comment_patrol'
+      : intent.taskType === 'creator_patrol'
+        ? 'creator_patrol'
+        : intent.taskType === 'official_discovery'
+          ? 'official_discovery'
       : null
   const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
 
@@ -101,10 +108,13 @@ export function CreateTaskDrawer({
 
   const mode: 'one_time' | 'unattended_plan' = taskType === 'unattended_plan' ? 'unattended_plan' : 'one_time'
   const selectedAgent = agents.find(agent => agent.id === selectedAgentIds[0])
+  const selectedAgents = selectedAgentIds
+    .map(id => agents.find(agent => agent.id === id))
+    .filter((agent): agent is CloudAgent => Boolean(agent))
   // 已选节点里当前仍可接单的（任务类型回退修改后，原选择可能因能力/平台不符被阻断）。
   const selectedAssignableIds = selectedAgentIds.filter(id => {
     const agent = agents.find(candidate => candidate.id === id)
-    return agent ? !agentAssignmentBlockReason(agent, mode) : false
+    return agent ? !agentTaskTypeBlockReason(agent, taskType, mode) : false
   })
   const showIndicator = !editingExisting
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
@@ -128,7 +138,9 @@ export function CreateTaskDrawer({
     if (step === 'method') return setStep('agents')
     if (step === 'agents') {
       // 多节点编排：关闭本向导并把已选小队交给编排抽屉（内部 define→allocate→dispatch 不变）。
-      if (method === 'multi') return onLaunchOrchestration(selectedAgentIds)
+      if (method === 'multi' && taskType !== 'negative_patrol') {
+        return onLaunchOrchestration(selectedAgentIds)
+      }
       return setStep('configure')
     }
   }
@@ -145,12 +157,19 @@ export function CreateTaskDrawer({
 
   const nextDisabled = !writable
     || (step === 'agents' && selectedAssignableIds.length === 0)
+    || (
+      step === 'agents'
+      && method === 'multi'
+      && selectedAssignableIds.length < 2
+    )
 
   const nextLabel = step === 'type'
     ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
     : step === 'method'
       ? '下一步：选择节点'
-      : method === 'multi' ? '前往多节点编排' : '下一步：任务配置'
+        : method === 'multi' && taskType !== 'negative_patrol'
+        ? '前往多节点编排'
+        : '下一步：任务配置'
 
   return (
     <Drawer onClose={onClose} width="xl" labelledBy="create-task-title" closeOnOverlay={false}>
@@ -188,7 +207,7 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
-                        if (item.value === 'negative_patrol' || item.value === 'comment_patrol') setMethod('single')
+                        if (['comment_patrol', 'creator_patrol', 'official_discovery'].includes(item.value)) setMethod('single')
                       }
                     }}
                     className={`flex min-h-36 flex-col rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${item.planned ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
@@ -218,7 +237,7 @@ export function CreateTaskDrawer({
               {EXECUTION_METHODS.map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
-                const unavailable = (taskType === 'negative_patrol' || taskType === 'comment_patrol') && item.value === 'multi'
+                const unavailable = ['comment_patrol', 'creator_patrol', 'official_discovery'].includes(taskType) && item.value === 'multi'
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
                     onClick={() => { if (!unavailable) setMethod(item.value) }}
@@ -232,9 +251,11 @@ export function CreateTaskDrawer({
                     <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
                     <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
                       {unavailable
-                        ? taskType === 'comment_patrol'
-                          ? '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
-                          : '负面巡查首版先由一个 Agent 串行执行，避免同一帖子被重复打开。'
+                        ? ['creator_patrol', 'official_discovery'].includes(taskType)
+                          ? '账号作品发现首版由一个 Agent 串行执行；每个账号只打开一次，避免重复发现。'
+                          : '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
+                        : taskType === 'negative_patrol' && item.value === 'multi'
+                          ? '把负面帖子均衡拆给多个在线 Agent 并行巡查，降低单账号连续打开大量帖子的压力。'
                         : item.description}
                     </p>
                   </button>
@@ -250,7 +271,9 @@ export function CreateTaskDrawer({
               <h3 className="text-base font-bold">{method === 'multi' ? '选择参与编排的节点' : '选择一个执行节点'}</h3>
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
                 {method === 'multi'
-                  ? '可多选；关键词会在下一步按规则均分给这些节点。'
+                  ? taskType === 'negative_patrol'
+                    ? '可多选；确认帖子清单后，系统会把帖子均衡分给这些在线节点，每条帖子只交给一个 Agent。'
+                    : '可多选；关键词会在下一步按规则均分给这些节点。'
                   : '任务会绑定到具体浏览器扩展。离线 Agent 仍可接单，上线后自动领取。'}
               </p>
             </div>
@@ -258,10 +281,16 @@ export function CreateTaskDrawer({
               agents={agents}
               tasks={tasks}
               mode={mode}
+              taskType={taskType}
               multiple={method === 'multi'}
               selectedIds={selectedAgentIds}
               onChange={setSelectedAgentIds}
             />
+            {method === 'multi' && selectedAssignableIds.length < 2 && (
+              <p role="status" className="mt-3 text-xs leading-5 text-status-orange">
+                多 Agent 模式至少选择 2 个可用节点。
+              </p>
+            )}
           </div>
         )}
 
@@ -274,6 +303,10 @@ export function CreateTaskDrawer({
                 <span className="font-semibold text-foreground">
                   {taskType === 'unattended_plan'
                     ? '无人值守计划'
+                    : taskType === 'creator_patrol'
+                      ? '关注博主扫描'
+                    : taskType === 'official_discovery'
+                      ? '官方账号作品发现'
                     : taskType === 'negative_patrol'
                     ? '负面帖子巡查'
                     : taskType === 'comment_patrol'
@@ -281,9 +314,13 @@ export function CreateTaskDrawer({
                       : '关键词采集'}
                 </span>
                 <span aria-hidden="true">·</span>
-                <span>单个节点</span>
+                <span>{method === 'multi' ? `多节点 · ${selectedAgents.length} 个 Agent` : '单个节点'}</span>
                 <span aria-hidden="true">·</span>
-                <span className="min-w-0 truncate">{selectedAgent.host_label} › {selectedAgent.display_name}</span>
+                <span className="min-w-0 truncate">
+                  {method === 'multi'
+                    ? selectedAgents.map(agent => agent.display_name).join('、')
+                    : `${selectedAgent.host_label} › ${selectedAgent.display_name}`}
+                </span>
                 {!editingExisting && (
                   <button type="button" onClick={goBack}
                     className="ml-auto min-h-7 shrink-0 rounded-md px-2 text-[11px] font-semibold text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
@@ -293,8 +330,8 @@ export function CreateTaskDrawer({
               </div>
               {taskType === 'negative_patrol' ? (
                 <NegativePatrolTaskCreator
-                  key={`${selectedAgent.id}:negative-patrol`}
-                  agent={selectedAgent}
+                  key={`${selectedAgentIds.join(':')}:negative-patrol`}
+                  agents={method === 'multi' ? selectedAgents : [selectedAgent]}
                   writable={writable}
                   onCreated={async () => {
                     await onCreated()
@@ -306,6 +343,31 @@ export function CreateTaskDrawer({
                   key={`${selectedAgent.id}:official-comment-patrol`}
                   agent={selectedAgent}
                   writable={writable}
+                  initialOfficialAccountId={intent.officialAccountId}
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'creator_patrol' ? (
+                <AccountDiscoveryTaskCreator
+                  key={`${selectedAgent.id}:followed-creator-patrol`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  initialSubscriptionId={intent.subscriptionId}
+                  subjectType="creator"
+                  onCreated={async () => {
+                    await onCreated()
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'official_discovery' ? (
+                <AccountDiscoveryTaskCreator
+                  key={`${selectedAgent.id}:official-account-discovery`}
+                  agent={selectedAgent}
+                  writable={writable}
+                  initialSubscriptionId={intent.subscriptionId}
+                  subjectType="official"
                   onCreated={async () => {
                     await onCreated()
                     onClose()

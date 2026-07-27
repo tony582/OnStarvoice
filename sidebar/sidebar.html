@@ -1330,13 +1330,41 @@
                 </div>
               </div>
 
+              <div
+                class="monitor-subject-picker"
+                role="group"
+                aria-label="选择账号用途">
+                <button
+                  class="monitor-subject-option is-selected"
+                  id="btnMonitorSubjectCreator"
+                  type="button"
+                  data-subject-type="creator"
+                  aria-pressed="true">
+                  <span class="monitor-subject-option-title">关注博主</span>
+                  <span class="monitor-subject-option-copy"
+                    >持续发现该账号的新动态</span
+                  >
+                </button>
+                <button
+                  class="monitor-subject-option"
+                  id="btnMonitorSubjectOfficial"
+                  type="button"
+                  data-subject-type="official"
+                  aria-pressed="false">
+                  <span class="monitor-subject-option-title">官方账号</span>
+                  <span class="monitor-subject-option-copy"
+                    >登记自有账号，用于作品与评论巡查</span
+                  >
+                </button>
+              </div>
+
               <div class="monitor-action-row">
                 <button
                   class="btn btn-primary btn-full is-disabled"
                   id="btnMonitorAddCurrent"
                   type="button"
                   disabled>
-                  纳入监控
+                  关注博主
                 </button>
                 <button
                   class="btn btn-secondary btn-full is-disabled"

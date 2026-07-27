@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle, CalendarDays, Check, Loader2, MessageSquareText,
-  RefreshCw, Search, Send, Sparkles,
+  RefreshCw, Search, Send, Sparkles, Users,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -87,16 +87,22 @@ function platformTone(platform: string) {
 }
 
 export function NegativePatrolTaskCreator({
-  agent,
+  agents,
   writable,
   onCreated,
 }: {
-  agent: CloudAgent
+  agents: CloudAgent[]
   writable: boolean
   onCreated: () => Promise<void>
 }) {
   const initialRange = useMemo(() => initialDateRange(), [])
-  const availablePlatforms = useMemo(() => agentCreatePlatforms(agent), [agent])
+  const availablePlatforms = useMemo(() => {
+    const [firstAgent, ...remainingAgents] = agents
+    if (!firstAgent) return []
+    return agentCreatePlatforms(firstAgent).filter(candidate =>
+      remainingAgents.every(agent => agentCreatePlatforms(agent).includes(candidate)),
+    )
+  }, [agents])
   const [title, setTitle] = useState('负面帖子巡查')
   const [platform, setPlatform] = useState(availablePlatforms[0] || '')
   const [publishDateFrom, setPublishDateFrom] = useState(initialRange.from)
@@ -117,11 +123,25 @@ export function NegativePatrolTaskCreator({
   const [feedback, setFeedback] = useState('')
   const pendingSubmission = useRef<{ fingerprint: string; requestKey: string } | null>(null)
 
-  const supportsPatrol = agent.capabilities?.negativePostPatrol === true
+  const supportsPatrol = agents.length > 0
+    && agents.every(agent => agent.capabilities?.negativePostPatrol === true)
+  const allOnline = agents.every(agent => agent.online)
+  const multiAgent = agents.length > 1
   const selectedPlatform = availablePlatforms.includes(platform)
     ? platform
     : availablePlatforms[0] || ''
   const allSelected = candidates.length > 0 && selectedIds.size === candidates.length
+  const allocationInvalid = multiAgent && selectedIds.size < agents.length
+  const allocationPreview = useMemo(() => {
+    const total = selectedIds.size
+    if (total === 0 || agents.length === 0) return []
+    const base = Math.floor(total / agents.length)
+    const remainder = total % agents.length
+    return agents.map((agent, index) => ({
+      agent,
+      count: base + (index < remainder ? 1 : 0),
+    }))
+  }, [agents, selectedIds])
 
   const filters = {
     publishDateFrom,
@@ -143,7 +163,11 @@ export function NegativePatrolTaskCreator({
   }
 
   const validateFilters = () => {
-    if (!selectedPlatform) return '该 Agent 没有可执行的平台，请先编辑节点配置。'
+    if (agents.length === 0) return '请至少选择一个执行节点。'
+    if (!supportsPatrol) return '部分节点版本尚不支持负面帖子巡查，请先升级 Extension。'
+    if (agents.some(agent => agent.status !== 'active')) return '已选节点中包含暂停或停用节点，请返回重新选择。'
+    if (multiAgent && !allOnline) return '多节点巡查只分配给在线 Agent，请移除离线节点后再创建。'
+    if (!selectedPlatform) return '已选 Agent 没有共同可执行的平台，请调整节点负责平台。'
     if (!publishDateFrom || !publishDateTo) return '发布时间范围不能为空。'
     if (publishDateFrom > publishDateTo) return '发布时间的开始日期不能晚于结束日期。'
     if (!Number.isSafeInteger(minInteractions) || minInteractions < 0) {
@@ -217,9 +241,14 @@ export function NegativePatrolTaskCreator({
       setError('请至少选择一条需要定向采集的帖子。')
       return
     }
+    if (multiAgent && selectedIds.size < agents.length) {
+      setError(`当前选择 ${selectedIds.size} 条帖子，少于 ${agents.length} 个节点；请减少节点或增加帖子。`)
+      return
+    }
     const taskInput = {
       ...filters,
-      agentId: agent.id,
+      agentIds: agents.map(agent => agent.id),
+      ...(agents.length === 1 ? { agentId: agents[0].id } : {}),
       title: title.trim() || '负面帖子巡查',
       recordIds: Array.from(selectedIds),
       captureSettings: {
@@ -244,9 +273,11 @@ export function NegativePatrolTaskCreator({
       )
       pendingSubmission.current = null
       setFeedback(result.message || (
-        agent.online
-          ? `已向 ${agent.display_name} 下发 ${selectedIds.size} 条定向采集任务。`
-          : `已创建 ${selectedIds.size} 条定向采集任务，Agent 上线后自动领取。`
+        multiAgent
+          ? `已把 ${selectedIds.size} 条帖子均衡分配给 ${agents.length} 个在线 Agent。`
+          : agents[0]?.online
+            ? `已向 ${agents[0].display_name} 下发 ${selectedIds.size} 条定向采集任务。`
+            : `已创建 ${selectedIds.size} 条定向采集任务，Agent 上线后自动领取。`
       ))
       await onCreated()
     } catch (err) {
@@ -257,7 +288,9 @@ export function NegativePatrolTaskCreator({
   }
 
   const disabled = !writable
-    || agent.status !== 'active'
+    || agents.length === 0
+    || agents.some(agent => agent.status !== 'active')
+    || (multiAgent && !allOnline)
     || availablePlatforms.length === 0
     || submitting
 
@@ -267,8 +300,8 @@ export function NegativePatrolTaskCreator({
         <div className="flex items-start gap-3">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
           <div>
-            <div className="font-semibold">当前 Extension 还不能执行负面帖子巡查</div>
-            <p className="mt-1 text-xs leading-5">升级并重新加载 Extension 后，该 Agent 会自动上报定向逐帖采集能力。</p>
+            <div className="font-semibold">部分 Extension 还不能执行负面帖子巡查</div>
+            <p className="mt-1 text-xs leading-5">升级并重新加载 Extension 后，Agent 会自动上报定向逐帖采集能力。</p>
           </div>
         </div>
       </div>
@@ -428,16 +461,47 @@ export function NegativePatrolTaskCreator({
         </section>
       )}
 
+      {previewed && multiAgent && selectedIds.size > 0 && (
+        <section className="rounded-2xl border border-primary/20 bg-primary/[0.035] p-4 sm:p-5">
+          <div className="flex items-start gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+              <Users className="h-4 w-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <h3 className="text-sm font-bold text-foreground">帖子分配预览</h3>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                按当前清单连续均衡分配，每条帖子只由一个 Agent 巡查。
+              </p>
+              {allocationInvalid && (
+                <p role="alert" className="mt-2 text-xs leading-5 text-status-red">
+                  帖子数少于节点数，无法保证每个节点至少分到 1 条；请增加帖子或返回减少节点。
+                </p>
+              )}
+              <div className="mt-3 flex flex-wrap gap-2">
+                {allocationPreview.map(({ agent, count }) => (
+                  <span key={agent.id} className={`rounded-lg border bg-background px-2.5 py-1.5 text-[11px] ${count > 0 ? 'border-border/70 text-muted-foreground' : 'border-status-red/30 text-status-red'}`}>
+                    <strong className="font-semibold text-foreground">{agent.display_name}</strong>
+                    {' · '}{count} 条
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {error && <p role="alert" className="text-xs leading-5 text-status-red">{error}</p>}
       {feedback && <p role="status" className="text-xs leading-5 text-status-green">{feedback}</p>}
 
       <Button type="button" onClick={submit}
-        disabled={disabled || !previewed || selectedIds.size === 0}
+        disabled={disabled || !previewed || selectedIds.size === 0 || allocationInvalid}
         className="min-h-11 w-full">
         {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-        {agent.online
-          ? `下发 ${selectedIds.size || ''} 条定向采集`
-          : `创建 ${selectedIds.size || ''} 条任务并排队`}
+        {multiAgent
+          ? `分配 ${selectedIds.size || ''} 条帖子给 ${agents.length} 个节点`
+          : agents[0]?.online
+            ? `下发 ${selectedIds.size || ''} 条定向采集`
+            : `创建 ${selectedIds.size || ''} 条任务并排队`}
       </Button>
     </div>
   )

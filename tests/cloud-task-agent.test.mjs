@@ -174,6 +174,41 @@ test("heartbeat preserves the official-account comment patrol workflow and capab
   assert.equal(payload.tasks[0].targetResults[0].commentObservation.observedCount, 8);
 });
 
+test("heartbeat distinguishes creator scan and official post discovery capabilities", () => {
+  const creator = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-creator-scan"},
+    targetedPostRequest: {
+      id: "creator-scan-1",
+      taskId: "creator-task-1",
+      workflow: "followed_creator_post_patrol",
+      protocolVersion: 1,
+      platform: "xiaohongshu",
+      title: "关注博主作品扫描",
+      status: "running",
+      targetResults: [],
+    },
+  });
+  assert.equal(creator.agent.capabilities.followedCreatorPostPatrol, true);
+  assert.equal(creator.agent.capabilities.officialAccountPostDiscovery, true);
+  assert.equal(creator.tasks[0].taskType, "followed_creator_post_patrol");
+  assert.equal(creator.tasks[0].title, "关注博主作品扫描");
+
+  const official = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-official-discovery"},
+    targetedPostRequest: {
+      id: "official-discovery-1",
+      taskId: "official-discovery-task-1",
+      workflow: "official_account_post_discovery",
+      protocolVersion: 1,
+      platform: "douyin",
+      status: "running",
+      targetResults: [],
+    },
+  });
+  assert.equal(official.tasks[0].taskType, "official_account_post_discovery");
+  assert.equal(official.tasks[0].title, "官方账号作品发现");
+});
+
 test("heartbeat reports social identity and idempotent usage without phone numbers", () => {
   const payload = agent.buildHeartbeatPayload({
     runtime: {clientUuid: "profile-social"},

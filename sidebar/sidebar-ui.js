@@ -1014,8 +1014,12 @@ document.addEventListener("DOMContentLoaded", () => {
       pagePlatform,
       pagePlatform,
       PAGE_TYPE.BLOGGER_PROFILE,
-      `已就绪：当前是${pagePlatformCopy.label || "该平台"}账号主页，可一键纳入监控`,
-      "请前往抖音、小红书或微博账号主页后，再将当前账号纳入监控",
+      `已就绪：当前是${pagePlatformCopy.label || "该平台"}账号主页，请选择“关注博主”或“官方账号”`,
+      "请前往抖音、小红书或微博账号主页后，再选择账号用途",
+    );
+    updateMonitorAddCurrentButton(
+      window.getSidebarMonitorState?.() || null,
+      window.getSidebarAuthState?.() || null,
     );
 
     const keywordFromUrl = extractKeywordFromUrl(
@@ -1315,39 +1319,20 @@ document.addEventListener("DOMContentLoaded", () => {
     const monitorSubscriptionList = document.getElementById(
       "monitorSubscriptionList",
     );
-    const btnMonitorAddCurrent = document.getElementById(
-      "btnMonitorAddCurrent",
-    );
     const btnMonitorRunNow = document.getElementById("btnMonitorRunNow");
 
-    if (btnMonitorAddCurrent) {
-      const runtime = window.getSidebarRuntimeState?.() || null;
-      const pageUrl = String(runtime?.lastPageUrl || "").trim();
-      const currentMonitorId = extractBloggerIdFromMonitorUrl(pageUrl);
-      const currentPlatform = detectPlatformFromUrl(pageUrl);
-      const exists = Array.isArray(monitorConfig.items)
-        ? monitorConfig.items.some(
-            (item) =>
-              String(item?.platform || "").trim() === currentPlatform &&
-              String(item?.platformBloggerId || "").trim() ===
-                currentMonitorId &&
-              String(item?.status || "").trim() !== "deleted",
-          )
-        : false;
-      const isReady =
-        authConfig?.status === AUTH_STATUS.VERIFIED &&
-        runtime?.pageType === PAGE_TYPE.BLOGGER_PROFILE &&
-        (currentPlatform === "douyin" ||
-          currentPlatform === "xiaohongshu" ||
-          currentPlatform === "weibo");
-      btnMonitorAddCurrent.disabled = !isReady || exists;
-      btnMonitorAddCurrent.classList.toggle("is-disabled", !isReady || exists);
-      btnMonitorAddCurrent.textContent = exists ? "已在监控中" : "纳入监控";
-    }
+    updateMonitorAddCurrentButton(monitorConfig, authConfig);
+    window.refreshMonitorSubjectAction = () =>
+      updateMonitorAddCurrentButton(
+        window.getSidebarMonitorState?.() || monitorConfig,
+        window.getSidebarAuthState?.() || authConfig,
+      );
 
     const activeMonitorCount = Array.isArray(monitorConfig.items)
       ? monitorConfig.items.filter(
-          (item) => String(item?.status || "").trim() === "active",
+          (item) =>
+            String(item?.status || "").trim() === "active" &&
+            resolveMonitorSubscriptionSubjectType(item) === "creator",
         ).length
       : 0;
     if (btnMonitorRunNow) {
@@ -1908,10 +1893,71 @@ function resolveMonitorSubscriptionDisplayName(item) {
   }
 
   return (
-    String(item.bloggerNameSnapshot || "").trim() ||
-    String(item.platformBloggerId || "").trim() ||
+    String(
+      item.displayName ||
+        item.display_name ||
+        item.bloggerNameSnapshot ||
+        item.bloggerName ||
+        "",
+    ).trim() ||
+    String(
+      item.accountNo ||
+        item.account_no ||
+        item.profileInternalId ||
+        item.profile_internal_id ||
+        item.platformBloggerId ||
+        "",
+    ).trim() ||
     "未命名博主"
   );
+}
+
+function normalizeMonitorSubjectType(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase() === "official"
+    ? "official"
+    : "creator";
+}
+
+function resolveMonitorSubscriptionSubjectType(item) {
+  return normalizeMonitorSubjectType(item?.subjectType || item?.subject_type);
+}
+
+function resolveSelectedMonitorSubjectType() {
+  const fromLogic = window.getMonitorSubjectType?.();
+  if (fromLogic) {
+    return normalizeMonitorSubjectType(fromLogic);
+  }
+  const selectedButton = document.querySelector(
+    '.monitor-subject-option[aria-pressed="true"]',
+  );
+  return normalizeMonitorSubjectType(selectedButton?.dataset?.subjectType);
+}
+
+function resolveMonitorSubjectUi(subjectType) {
+  return normalizeMonitorSubjectType(subjectType) === "official"
+    ? {
+        label: "官方账号",
+        actionLabel: "登记官方账号",
+        existsLabel: "已登记",
+      }
+    : {
+        label: "关注博主",
+        actionLabel: "关注博主",
+        existsLabel: "已关注",
+      };
+}
+
+function resolveMonitorSubscriptionIdentity(item) {
+  return String(
+    item?.profileInternalId ||
+      item?.profile_internal_id ||
+      item?.platformBloggerId ||
+      item?.accountNo ||
+      item?.account_no ||
+      "",
+  ).trim();
 }
 
 function extractBloggerIdFromMonitorUrl(url) {
@@ -1928,6 +1974,38 @@ function extractBloggerIdFromMonitorUrl(url) {
   }
   const douyinMatch = normalized.match(/\/user\/([a-zA-Z0-9._-]+)/i);
   return douyinMatch?.[1] || "";
+}
+
+function updateMonitorAddCurrentButton(monitorConfig, authConfig) {
+  const button = document.getElementById("btnMonitorAddCurrent");
+  if (!button) return;
+
+  const runtime = window.getSidebarRuntimeState?.() || null;
+  const pageUrl = String(runtime?.lastPageUrl || "").trim();
+  const currentMonitorId = extractBloggerIdFromMonitorUrl(pageUrl);
+  const currentPlatform = detectPlatformFromUrl(pageUrl);
+  const selectedSubjectType = resolveSelectedMonitorSubjectType();
+  const subjectUi = resolveMonitorSubjectUi(selectedSubjectType);
+  const exists = Array.isArray(monitorConfig?.items)
+    ? monitorConfig.items.some(
+        (item) =>
+          String(item?.platform || "").trim() === currentPlatform &&
+          resolveMonitorSubscriptionIdentity(item) === currentMonitorId &&
+          resolveMonitorSubscriptionSubjectType(item) === selectedSubjectType &&
+          String(item?.status || "").trim() !== "deleted",
+      )
+    : false;
+  const isReady =
+    authConfig?.status === AUTH_STATUS.VERIFIED &&
+    runtime?.pageType === PAGE_TYPE.BLOGGER_PROFILE &&
+    Boolean(currentMonitorId) &&
+    (currentPlatform === "douyin" ||
+      currentPlatform === "xiaohongshu" ||
+      currentPlatform === "weibo");
+
+  button.disabled = !isReady || exists;
+  button.classList.toggle("is-disabled", !isReady || exists);
+  button.textContent = exists ? subjectUi.existsLabel : subjectUi.actionLabel;
 }
 
 function getMonitorRecordButtonState(record, recordPlatform) {
@@ -1961,7 +2039,8 @@ function getMonitorRecordButtonState(record, recordPlatform) {
     ? monitorConfig.items.some(
         (item) =>
           String(item?.platform || "").trim() === recordPlatform &&
-          String(item?.platformBloggerId || "").trim() === platformBloggerId &&
+          resolveMonitorSubscriptionIdentity(item) === platformBloggerId &&
+          resolveMonitorSubscriptionSubjectType(item) === "creator" &&
           String(item?.status || "").trim() !== "deleted",
       )
     : false;
@@ -2015,6 +2094,15 @@ function renderMonitorSubscriptionCard(item, monitorConfig) {
   const statusLabel = getMonitorStatusLabel(status);
   const displayName = resolveMonitorSubscriptionDisplayName(item);
   const platformLabel = formatHistoryPlatform(item?.platform);
+  const subjectType = resolveMonitorSubscriptionSubjectType(item);
+  const subjectUi = resolveMonitorSubjectUi(subjectType);
+  const profileUrl = String(
+    item?.profileUrl ||
+      item?.profile_url ||
+      item?.bloggerUrl ||
+      item?.accountUrl ||
+      "",
+  ).trim();
   const actionLabel = status === "active" ? "暂停" : "恢复";
   const nextStatus = status === "active" ? "paused" : "active";
   const insufficientHint =
@@ -2029,16 +2117,19 @@ function renderMonitorSubscriptionCard(item, monitorConfig) {
           <div class="monitor-item-title">
             <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(displayName)}</span>
             ${
-              item?.bloggerUrl
-                ? `<a class="monitor-item-title-link" href="${escapeHtml(item.bloggerUrl)}" target="_blank" rel="noreferrer noopener" title="访问主页">
+              profileUrl
+                ? `<a class="monitor-item-title-link" href="${escapeHtml(profileUrl)}" target="_blank" rel="noreferrer noopener" title="访问主页">
                     <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
                   </a>`
                 : ""
             }
           </div>
-          <div class="monitor-item-platform-label">
-            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><path d="M22 4s-.7 2.1-2 3.4c1.6 10-9.4 17.3-18 11.6 2.2.1 4.4-.6 6-2C3 15.5 5.9 6.5 22 4z"></path></svg>
-            ${escapeHtml(platformLabel)}
+          <div class="monitor-item-labels">
+            <div class="monitor-item-platform-label">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><path d="M22 4s-.7 2.1-2 3.4c1.6 10-9.4 17.3-18 11.6 2.2.1 4.4-.6 6-2C3 15.5 5.9 6.5 22 4z"></path></svg>
+              ${escapeHtml(platformLabel)}
+            </div>
+            <span class="monitor-subject-badge is-${escapeHtml(subjectType)}">${escapeHtml(subjectUi.label)}</span>
           </div>
         </div>
         <span class="monitor-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>

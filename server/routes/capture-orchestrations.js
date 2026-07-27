@@ -407,15 +407,21 @@ async function loadOrchestrationSchedule(executor, tenantId, scheduleId, {lock =
 
 async function listParentItems(executor, tenantId, taskId, {lock = false} = {}) {
   return executor.queryAll(`
-    SELECT id, task_id, item_key, ordinal, keyword, platform, item_type,
-      status, attempt_count, assigned_agent_id, execution_task_id,
-      assignment_revision, request_hash, error, metadata,
-      assigned_at, dispatched_at, started_at, finished_at,
-      created_at, updated_at
-    FROM capture_task_items
-    WHERE tenant_id = $1 AND task_id = $2
-    ORDER BY id
-    ${lock ? 'FOR UPDATE' : ''}
+    SELECT item.id, item.task_id, item.item_key, item.ordinal, item.keyword,
+      item.platform, item.item_type, item.status, item.attempt_count,
+      item.assigned_agent_id, item.execution_task_id,
+      item.assignment_revision, item.request_hash, item.error, item.metadata,
+      item.assigned_at, item.dispatched_at, item.started_at, item.finished_at,
+      item.created_at, item.updated_at,
+      record.content_availability_status,
+      record.content_availability_checked_at
+    FROM capture_task_items item
+    LEFT JOIN records record
+      ON record.id = item.record_id
+      AND record.tenant_id = item.tenant_id
+    WHERE item.tenant_id = $1 AND item.task_id = $2
+    ORDER BY item.id
+    ${lock ? 'FOR UPDATE OF item' : ''}
   `, [tenantId, taskId]);
 }
 

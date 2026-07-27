@@ -1,11 +1,11 @@
 import { useMemo } from 'react'
 import { CheckCircle2, CircleOff } from 'lucide-react'
-import type { CloudAgent, CloudTask } from './lib'
+import type { CloudAgent, CloudCreateTaskType, CloudTask } from './lib'
 import {
   ACTIVE_TASK_STATUSES,
   PLATFORM_LABELS,
-  agentAssignmentBlockReason,
   agentCreatePlatforms,
+  agentTaskTypeBlockReason,
   safeNumber,
   taskBelongsToAgent,
 } from './lib'
@@ -16,6 +16,7 @@ export function AgentPicker({
   agents,
   tasks,
   mode,
+  taskType = 'keyword',
   multiple = false,
   selectedIds,
   onChange,
@@ -23,17 +24,18 @@ export function AgentPicker({
   agents: CloudAgent[]
   tasks: CloudTask[]
   mode: 'one_time' | 'unattended_plan'
+  taskType?: CloudCreateTaskType
   multiple?: boolean
   selectedIds: string[]
   onChange: (ids: string[]) => void
 }) {
   const sortedAgents = useMemo(() => [...agents].sort((left, right) => {
-    const leftBlocked = Boolean(agentAssignmentBlockReason(left, mode))
-    const rightBlocked = Boolean(agentAssignmentBlockReason(right, mode))
+    const leftBlocked = Boolean(agentTaskTypeBlockReason(left, taskType, mode))
+    const rightBlocked = Boolean(agentTaskTypeBlockReason(right, taskType, mode))
     if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1
     if (left.online !== right.online) return left.online ? -1 : 1
     return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
-  }), [agents, mode])
+  }), [agents, mode, taskType])
 
   const toggle = (agentId: string) => {
     if (multiple) {
@@ -58,7 +60,7 @@ export function AgentPicker({
   return (
     <div className="space-y-2" role={multiple ? 'group' : 'radiogroup'} aria-label="选择执行节点">
       {sortedAgents.map(agent => {
-        const blockReason = agentAssignmentBlockReason(agent, mode)
+        const blockReason = agentTaskTypeBlockReason(agent, taskType, mode)
         const selected = selectedIds.includes(agent.id)
         const platforms = agentCreatePlatforms(agent)
         const agentTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))

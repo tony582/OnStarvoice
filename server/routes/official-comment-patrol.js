@@ -220,8 +220,8 @@ export function normalizeOfficialCommentPatrolFilter(body = {}, {now} = {}) {
 
 async function loadOfficialAccount(executor, tenantId, accountId) {
   return executor.queryOne(`
-    SELECT id, tenant_id, platform, account_name, account_id, profile_url,
-      aliases, status
+    SELECT id, tenant_id, platform, account_name, platform_user_id, account_no,
+      account_id, profile_url, aliases, status
     FROM official_accounts
     WHERE id = $1::uuid AND tenant_id = $2
     LIMIT 1
@@ -245,11 +245,32 @@ function officialAccountWhere(filter, recordIds = []) {
       AND r.external_id ~ '^[[:alnum:]_-]{5,200}$'
       AND (
         (
-          NULLIF(BTRIM(oa.account_id), '') IS NOT NULL
-          AND r.author_account_no = oa.account_id
+          NULLIF(BTRIM(oa.platform_user_id), '') IS NOT NULL
+          AND r.author_id = oa.platform_user_id
         )
         OR (
-          NULLIF(BTRIM(oa.account_id), '') IS NULL
+          NULLIF(BTRIM(oa.account_no), '') IS NOT NULL
+          AND r.author_account_no = oa.account_no
+        )
+        OR (
+          NULLIF(BTRIM(oa.account_id), '') IS NOT NULL
+          AND (
+            r.author_id = oa.account_id
+            OR r.author_account_no = oa.account_id
+          )
+        )
+        OR (
+          NOT (
+            (
+              NULLIF(BTRIM(oa.platform_user_id), '') IS NOT NULL
+              OR NULLIF(BTRIM(oa.account_no), '') IS NOT NULL
+              OR NULLIF(BTRIM(oa.account_id), '') IS NOT NULL
+            )
+            AND (
+              NULLIF(BTRIM(r.author_id), '') IS NOT NULL
+              OR NULLIF(BTRIM(r.author_account_no), '') IS NOT NULL
+            )
+          )
           AND (
             (
               NULLIF(BTRIM(oa.account_name), '') IS NOT NULL
@@ -458,11 +479,27 @@ router.get(
   async (req, res, next) => {
     try {
       const accounts = await queryAll(`
-        SELECT id, platform, account_name, account_id, profile_url, aliases, status
-        FROM official_accounts
-        WHERE tenant_id = $1 AND status = 'active'
-          AND platform IN ('xiaohongshu', 'douyin')
-        ORDER BY platform, account_name, id
+        SELECT account.id, account.platform, account.account_name,
+          account.platform_user_id, account.account_no, account.account_id,
+          account.profile_url, account.aliases, account.status,
+          subscription.id AS monitor_subscription_id
+        FROM official_accounts account
+        LEFT JOIN LATERAL (
+          SELECT id
+          FROM monitor_subscriptions
+          WHERE tenant_id = account.tenant_id
+            AND official_account_id = account.id
+            AND subject_type = 'official'
+            AND status <> 'deleted'
+          ORDER BY
+            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+            updated_at DESC,
+            id
+          LIMIT 1
+        ) subscription ON TRUE
+        WHERE account.tenant_id = $1 AND account.status = 'active'
+          AND account.platform IN ('xiaohongshu', 'douyin')
+        ORDER BY account.platform, account.account_name, account.id
       `, [req.tenantId]);
       const today = shanghaiCalendarDate();
       const filterBase = {publishDateFrom: addDays(today, -6), publishDateTo: today, postsLimit: 5, commentsLimit: DEFAULT_COMMENTS_LIMIT, timezone: 'Asia/Shanghai'};
@@ -492,8 +529,11 @@ router.get(
         }, null);
         result.push({
           id: account.id,
+          monitorSubscriptionId: account.monitor_subscription_id || null,
           accountName: account.account_name,
           platform: account.platform,
+          platformUserId: account.platform_user_id,
+          accountNo: account.account_no,
           profileUrl: account.profile_url,
           recentPosts,
           recentPostCount: loaded.total,

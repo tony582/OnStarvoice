@@ -63,6 +63,33 @@ test('official comment patrol admin calls the mounted capture-cloud namespace', 
   );
 });
 
+test('official account row actions preserve their exact discovery and patrol targets', () => {
+  assert.match(
+    route,
+    /subscription\.id AS monitor_subscription_id/u,
+  );
+  assert.match(
+    route,
+    /monitorSubscriptionId: account\.monitor_subscription_id \|\| null/u,
+  );
+  assert.match(
+    monitoringTab,
+    /officialAccountId \? \{ officialAccountId \} : \{\}/u,
+  );
+  assert.match(
+    monitoringTab,
+    /subscriptionId \? \{ subscriptionId \} : \{\}/u,
+  );
+  assert.match(
+    taskCreator,
+    /initialOfficialAccountId = ''/u,
+  );
+  assert.match(
+    taskCreator,
+    /normalized\.some\(item => item\.id === initialOfficialAccountId\)/u,
+  );
+});
+
 test('official comment patrol defaults to latest seven Shanghai calendar days', () => {
   const normalized = normalizeOfficialCommentPatrolFilter({
     officialAccountId: '11111111-1111-4111-8111-111111111111',
@@ -135,11 +162,15 @@ test('candidate selection is tenant-scoped, exact-account matched, dated, and UR
   assert.match(route, /r\.platform = oa\.platform/u);
   assert.match(
     route,
-    /NULLIF\(BTRIM\(oa\.account_id\), ''\) IS NOT NULL[\s\S]*r\.author_account_no = oa\.account_id/u,
+    /NULLIF\(BTRIM\(oa\.platform_user_id\), ''\) IS NOT NULL[\s\S]*r\.author_id = oa\.platform_user_id/u,
   );
   assert.match(
     route,
-    /NULLIF\(BTRIM\(oa\.account_id\), ''\) IS NULL[\s\S]*r\.author_name = oa\.account_name/u,
+    /NULLIF\(BTRIM\(oa\.account_no\), ''\) IS NOT NULL[\s\S]*r\.author_account_no = oa\.account_no/u,
+  );
+  assert.match(
+    route,
+    /NULLIF\(BTRIM\(oa\.account_id\), ''\) IS NOT NULL[\s\S]*r\.author_id = oa\.account_id[\s\S]*r\.author_account_no = oa\.account_id/u,
   );
   assert.match(route, /r\.author_name = oa\.account_name/u);
   assert.match(route, /jsonb_array_elements_text/u);
