@@ -63,6 +63,13 @@ function getPaginationItems(currentPage: number, totalPages: number): Array<numb
   return [1, 'ellipsis', currentPage - 1, currentPage, currentPage + 1, 'ellipsis', totalPages]
 }
 
+function contentAvailabilityLabel(record: Record<string, unknown>) {
+  const status = String(record.content_availability_status || '')
+  if (status === 'deleted') return '原帖已删除'
+  if (status === 'page_unavailable') return '已删除或不可访问'
+  return ''
+}
+
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
@@ -761,6 +768,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
   const hasRiskSignals = Number(r.alert_count || 0) > 0
     || Number(r.negative_comment_count || 0) > 0
     || (r.official_response_status && r.official_response_status !== 'none')
+  const availabilityLabel = contentAvailabilityLabel(r)
 
   return (
     <article
@@ -808,6 +816,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
 
       <div className={cn('mt-3 flex flex-wrap items-center gap-1.5', canWrite && 'pl-10')}>
         <StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
+        {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
         {canWrite && !archived ? (
           <TriageStatusMenu status={r.triage_status || 'unhandled'} busy={modeBusy} disabled={modeDisabled} onChange={onChangeMode} />
         ) : (
@@ -864,6 +873,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onLi
   const sentimentBar = r.sentiment === 'negative' ? 'bg-status-red' : r.sentiment === 'positive' ? 'bg-status-green' : 'bg-status-blue'
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
   const triageStatus = r.triage_status || 'unhandled'
+  const availabilityLabel = contentAvailabilityLabel(r)
 
   return (
     <tr data-record-detail-trigger className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
@@ -895,7 +905,12 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onLi
         </div>
       </td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge></td>}
-      <td className="px-3 py-3.5 align-middle"><StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></td>
+      <td className="px-3 py-3.5 align-middle">
+        <div className="flex flex-wrap gap-1">
+          <StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
+          {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
+        </div>
+      </td>
       <td className="px-3 py-3.5 align-middle">
         {canWrite && !archived ? (
           <TriageStatusMenu status={triageStatus} busy={modeBusy} disabled={modeDisabled} onChange={onChangeMode} />

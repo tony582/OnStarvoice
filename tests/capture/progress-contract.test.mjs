@@ -631,11 +631,11 @@ test("synthetic and native dark task surfaces consume the same progress contract
   );
   assert.match(
     renderSection,
-    /const session = usingSyntheticSession \? syntheticSession : nativeSession/,
+    /const session = usingTargetedSyntheticSession[\s\S]*?\? targetedSyntheticSession[\s\S]*?: usingUnattendedSyntheticSession[\s\S]*?\? unattendedSyntheticSession[\s\S]*?: nativeSession/,
   );
   assert.match(
     renderSection,
-    /syntheticSession && \(!nativeVisible \|\| syntheticSession\.terminal\)/,
+    /unattendedSyntheticSession &&[\s\S]*?\(!nativeVisible \|\| unattendedSyntheticSession\.terminal\)/,
   );
   assert.match(
     renderSection,

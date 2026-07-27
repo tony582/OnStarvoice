@@ -203,6 +203,27 @@ test("admin UI exposes guarded Agent deletion without a nested row button", asyn
   assert.match(page, /onDeleteAgent=\{deleteAgent\}/u);
 });
 
+test("admin UI exposes a strongly confirmed retirement flow only for offline legacy Agents", async () => {
+  const [page, rail] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentRail.tsx"),
+  ]);
+  assert.match(rail, /永久归档旧节点/u);
+  assert.match(rail, /disabled=\{agent\.online\}/u);
+  assert.match(rail, /普通离线和临时关机不要使用/u);
+  assert.match(rail, /已换租户或激活码/u);
+  assert.match(rail, /设备永久停用/u);
+  assert.match(rail, /输入“永久归档”确认/u);
+  assert.match(rail, /confirmation !== '永久归档'/u);
+  assert.match(rail, /后续心跳不能自动恢复/u);
+  assert.match(rail, /历史任务、采集结果、用量和审计记录全部保留/u);
+  assert.match(
+    page,
+    /api\.post<\{ message\?: string \}>\([\s\S]*`\/capture-cloud\/agents\/\$\{agent\.id\}\/retire`[\s\S]*confirmation: '永久归档'[\s\S]*reason/u,
+  );
+  assert.match(page, /onRetireAgent=\{retireAgent\}/u);
+});
+
 test("admin UI shows each node's local plan and capability-gates remote task creation", async () => {
   const [creator, summary] = await Promise.all([
     read("web/admin/src/pages/dispatch/cloud-tasks/AgentTaskCreator.tsx"),

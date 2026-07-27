@@ -140,9 +140,66 @@ test("builds resumable item results and checkpoint in target order", () => {
     successCount: 1,
     warningCount: 0,
     failedCount: 0,
+    unavailableCount: 0,
+    capturedCount: 1,
+    skippedCount: 0,
     canceledCount: 0,
     completedItemIds: ["item-1"],
     total: 2,
+  });
+});
+
+test("settles a deleted or unavailable post without retrying it", () => {
+  const targets = [{
+    workflow: "negative_post_patrol",
+    itemId: "item-deleted",
+    recordId: "record-deleted",
+    externalId: "note-deleted",
+    ordinal: 1,
+  }];
+  const result = targeted.buildTargetResult({
+    target: targets[0],
+    batchResult: {
+      results: [{
+        ok: true,
+        captured: false,
+        unavailable: true,
+        businessOutcome: "post_unavailable",
+        availabilityStatus: "deleted",
+        retryable: false,
+        availability: {
+          status: "unavailable",
+          availabilityStatus: "deleted",
+          reason: "post_deleted_or_unavailable",
+          code: "TARGET_POST_UNAVAILABLE",
+          message: "平台提示该帖子已删除",
+          evidence: ["xhs_deleted_copy"],
+          observedAt: "2026-07-27T01:00:00.000Z",
+        },
+      }],
+    },
+    finishedAt: "2026-07-27T01:00:00.000Z",
+  });
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.captured, false);
+  assert.equal(result.businessOutcome, "post_unavailable");
+  assert.equal(result.availabilityStatus, "deleted");
+  assert.equal(result.retryable, false);
+  assert.deepEqual(plain(result.recordIds), []);
+  assert.deepEqual(plain(targeted.buildCheckpoint(targets, [result])), {
+    workflow: "negative_post_patrol",
+    nextOrdinal: 2,
+    processedCount: 1,
+    successCount: 0,
+    warningCount: 0,
+    failedCount: 0,
+    unavailableCount: 1,
+    capturedCount: 0,
+    skippedCount: 1,
+    canceledCount: 0,
+    completedItemIds: ["item-deleted"],
+    total: 1,
   });
 });
 

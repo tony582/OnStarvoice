@@ -95,7 +95,11 @@ import {
   evaluateRelevancePrefilterRecords,
   RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
 } from './capture/relevance-prefilter.js';
+import './capture/target-page-availability.js';
 // StarVoice 未启用福利中心（welfare-usage.js）；相关 welfare 埋点已移除，见下方 no-op。
+
+const targetPageAvailabilityApi =
+  globalThis.OnStarvoiceTargetPageAvailability;
 
 const COMMENT_CAPTURE_STATUS = {
   NOT_STARTED: 'not_started',
@@ -13088,6 +13092,7 @@ async function runBatchSingleNoteEnhancements(
  * @param {string} options.mode - 'single' | 'blogger_notes'
  * @param {Object} options.captureParams - 传给 capture 脚本的参数
  * @param {boolean} [options.captureParams.includeBloggerProfileRecord] - 当 mode=blogger_notes 时是否先采集博主信息并入池
+ * @param {number|null} [options.runnerTabId] - 显式指定执行标签页，避免用户切换活动标签页后误导航其他页面
  * @param {Function} [options.onProgress] - 进度回调 ({ current, total, url, phase })
  * @param {Function} [options.shouldStop] - 取消检测函数
  * @returns {Promise<{ ok: boolean, results: Array, stats: Object }>}
@@ -13096,6 +13101,7 @@ export async function batchCaptureByUrls({
   urls = [],
   mode = "single",
   captureParams = {},
+  runnerTabId: explicitRunnerTabId = null,
   onProgress = null,
   shouldStop = null,
 } = {}) {
@@ -13103,7 +13109,12 @@ export async function batchCaptureByUrls({
     return { ok: true, results: [], stats: { total: 0, success: 0, failed: 0 } };
   }
 
-  const sourceTab = await getCurrentActiveTab();
+  const normalizedExplicitRunnerTabId = Number(explicitRunnerTabId);
+  const sourceTab =
+    Number.isSafeInteger(normalizedExplicitRunnerTabId) &&
+    normalizedExplicitRunnerTabId > 0
+      ? await chrome.tabs.get(normalizedExplicitRunnerTabId)
+      : await getCurrentActiveTab();
   const runnerCtx = await prepareDetailBatchRunnerContext({
     sourceTab,
   });
@@ -13167,6 +13178,69 @@ export async function batchCaptureByUrls({
         shouldStop,
         "BATCH_CAPTURE_CANCELED",
       );
+
+      if (
+        mode === "single" &&
+        captureParams.detectUnavailableTargetPage === true &&
+        targetPageAvailabilityApi?.classifySnapshot
+      ) {
+        let unavailablePage = null;
+        try {
+          const [snapshotExecution] = await chrome.scripting.executeScript({
+            target: {tabId: runnerTabId},
+            func: () => ({
+              url: String(window.location.href || ""),
+              title: String(document.title || ""),
+              bodyText: String(document.body?.innerText || "").slice(0, 20000),
+            }),
+          });
+          unavailablePage =
+            targetPageAvailabilityApi.classifySnapshot({
+              ...(snapshotExecution?.result || {}),
+              platform: detectPlatformFromUrl(url),
+              url,
+            }) || null;
+        } catch (error) {
+          console.warn(
+            "[CaptureSync] target page availability probe failed:",
+            error,
+          );
+        }
+        if (unavailablePage?.unavailable === true) {
+          const observedAt = new Date().toISOString();
+          results.push({
+            url,
+            ok: true,
+            captured: false,
+            recordIds: [],
+            unavailable: true,
+            businessOutcome: unavailablePage.businessOutcome,
+            availabilityStatus: unavailablePage.availabilityStatus,
+            retryable: false,
+            availability: {
+              status: unavailablePage.status,
+              availabilityStatus: unavailablePage.availabilityStatus,
+              reason: unavailablePage.reason,
+              code: unavailablePage.code,
+              message: unavailablePage.message,
+              evidence: unavailablePage.evidence,
+              observedAt,
+            },
+          });
+          successCount++;
+          if (onProgress) {
+            onProgress({
+              current: i + 1,
+              total: urls.length,
+              url,
+              phase: "target_unavailable",
+              businessOutcome: unavailablePage.businessOutcome,
+              message: "平台提示该帖子已删除或不可用，已记录状态",
+            });
+          }
+          continue;
+        }
+      }
 
       if (onProgress) {
         onProgress({

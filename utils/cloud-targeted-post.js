@@ -423,6 +423,52 @@
         },
       };
     }
+    if (
+      itemResult?.unavailable === true ||
+      itemResult?.availability?.status === "unavailable"
+    ) {
+      const availability = objectValue(itemResult.availability);
+      return {
+        ...base,
+        status: "skipped",
+        recordIds: [],
+        captured: false,
+        businessOutcome: text(
+          itemResult.businessOutcome,
+          120,
+        ) || "post_unavailable",
+        availabilityStatus:
+          text(
+            itemResult.availabilityStatus ||
+              availability.availabilityStatus,
+            80,
+          ) || "page_unavailable",
+        retryable: false,
+        availability: {
+          status: "unavailable",
+          availabilityStatus:
+            text(
+              itemResult.availabilityStatus ||
+                availability.availabilityStatus,
+              80,
+            ) || "page_unavailable",
+          reason:
+            text(availability.reason, 160) ||
+            "post_deleted_or_unavailable",
+          code: text(availability.code, 160) || "TARGET_POST_UNAVAILABLE",
+          message:
+            text(availability.message, 1000) ||
+            "平台提示该帖子已删除或当前不可用",
+          evidence: Array.isArray(availability.evidence)
+            ? availability.evidence
+                .map((value) => text(value, 160))
+                .filter(Boolean)
+                .slice(0, 4)
+            : [],
+          observedAt: text(availability.observedAt, 80) || base.finishedAt,
+        },
+      };
+    }
     if (!itemResult?.ok) {
       return {
         ...base,
@@ -650,6 +696,14 @@
     const failedCount = normalizedResults.filter(
       (result) => result.status === "failed",
     ).length;
+    const skippedCount = normalizedResults.filter(
+      (result) => result.status === "skipped",
+    ).length;
+    const unavailableCount = normalizedResults.filter(
+      (result) =>
+        result.businessOutcome === "post_unavailable" ||
+        result.availability?.status === "unavailable",
+    ).length;
     return {
       workflow:
         text(targets[0]?.workflow, 80) ||
@@ -661,6 +715,9 @@
       successCount,
       warningCount,
       failedCount,
+      unavailableCount,
+      capturedCount: successCount,
+      skippedCount,
       canceledCount: normalizedResults.filter(
         (result) => result.status === "canceled",
       ).length,

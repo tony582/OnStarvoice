@@ -61,6 +61,27 @@ const HANDOFF_UNSTARTED_EXCLUDED_STATUSES = new Set([
   'completed', 'completed_with_warnings', 'failed', 'skipped',
 ])
 const ENDED_EXECUTION_STATUSES = new Set(['canceled', 'skipped'])
+const NEGATIVE_REASSIGN_EXPLICIT_STATUSES = new Set([
+  'needs_action',
+  'failed',
+  'retryable',
+])
+const NEGATIVE_REASSIGN_UNSTARTED_STATUSES = new Set([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+])
+const NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES = new Set([
+  'pending',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'waiting_device',
+  'resume_requested',
+])
 
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
@@ -92,11 +113,39 @@ function statusTone(status?: string) {
 }
 
 function keywordForItem(item: OrchestrationItemRecord) {
+  const sourceRecord = item.metadata?.sourceRecord
+  if (sourceRecord && typeof sourceRecord === 'object' && !Array.isArray(sourceRecord)) {
+    const record = sourceRecord as Record<string, unknown>
+    const title = String(record.title || record.content || '').trim()
+    if (title) return title
+  }
   if (item.keyword?.trim()) return item.keyword.trim()
   const metadataKeyword = item.metadata?.keyword
   return typeof metadataKeyword === 'string' && metadataKeyword.trim()
     ? metadataKeyword.trim()
     : item.item_key
+}
+
+function itemAvailabilityLabel(item: OrchestrationItemRecord) {
+  const persistedStatus = String(item.content_availability_status || '')
+  if (persistedStatus === 'deleted') return '原帖已删除'
+  if (persistedStatus === 'page_unavailable') return '已删除或不可访问'
+  const targetResult = item.metadata?.targetResult
+  if (!targetResult || typeof targetResult !== 'object' || Array.isArray(targetResult)) return ''
+  const result = targetResult as Record<string, unknown>
+  const availability = result.availability && typeof result.availability === 'object' && !Array.isArray(result.availability)
+    ? result.availability as Record<string, unknown>
+    : {}
+  const status = String(
+    result.availabilityStatus
+      || result.availability_status
+      || availability.availabilityStatus
+      || availability.availability_status
+      || '',
+  )
+  if (status === 'deleted') return '原帖已删除'
+  if (status === 'page_unavailable') return '已删除或不可访问'
+  return ''
 }
 
 function executionAgentId(execution: OrchestrationExecutionRecord) {
@@ -161,6 +210,28 @@ function executionStatus(execution?: OrchestrationExecutionRecord) {
   return String(execution?.status || '')
 }
 
+function agentSupportsNegativePatrol(
+  agent: OrchestrationCloudAgent,
+  platform: string,
+) {
+  if (agent.status !== 'active' || !agent.online) return false
+  if (agent.capabilities?.remoteTaskCreate !== true) return false
+  if (agent.capabilities?.negativePostPatrol !== true) return false
+  const allowedPlatforms = Array.isArray(agent.allowed_platforms)
+    ? agent.allowed_platforms
+    : []
+  if (
+    allowedPlatforms.length > 0 &&
+    !allowedPlatforms.includes(platform)
+  ) {
+    return false
+  }
+  const supportedPlatforms = agent.capabilities?.supportedPlatforms
+  return !Array.isArray(supportedPlatforms) ||
+    supportedPlatforms.length === 0 ||
+    supportedPlatforms.includes(platform)
+}
+
 export function OrchestrationDetailWorkspace({
   orchestrationId,
   writable = false,
@@ -177,10 +248,17 @@ export function OrchestrationDetailWorkspace({
   const [scheduleUpdating, setScheduleUpdating] = useState(false)
   const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | 'handoff' | ''>('')
   const [handoffTargetAgentId, setHandoffTargetAgentId] = useState('')
+  const [negativeReassignOpen, setNegativeReassignOpen] = useState(false)
+  const [negativeReassigning, setNegativeReassigning] = useState(false)
+  const [negativeReassignAgentIds, setNegativeReassignAgentIds] = useState<Set<string>>(new Set())
   const [actionFeedback, setActionFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [error, setError] = useState('')
   const loadGeneration = useRef(0)
+  const pendingNegativeReassign = useRef<{
+    fingerprint: string
+    requestKey: string
+  } | null>(null)
 
   const load = useCallback(async (quiet = false, showRefreshIndicator = true) => {
     if (!orchestrationId) return
@@ -209,6 +287,9 @@ export function OrchestrationDetailWorkspace({
     setError('')
     setActionFeedback('')
     setActionError('')
+    setNegativeReassignOpen(false)
+    setNegativeReassignAgentIds(new Set())
+    pendingNegativeReassign.current = null
     if (!orchestrationId) {
       setLoading(false)
       return
@@ -245,6 +326,87 @@ export function OrchestrationDetailWorkspace({
   const progressPercent = sortedItems.length > 0 ? Math.round((settledCount / sortedItems.length) * 100) : 0
   const isScheduleTemplate =
     detail?.orchestration.metadata?.orchestrationTemplate === true
+  const negativePatrol = detail?.orchestration.feature_key === 'negative_post_patrol'
+    || detail?.orchestration.metadata?.workflow === 'negative_post_patrol'
+  const executionsById = useMemo(
+    () => new Map((detail?.executions || []).map(execution => [
+      executionTaskId(execution),
+      execution,
+    ])),
+    [detail?.executions],
+  )
+  const negativeReassignItems = useMemo(() => {
+    if (!negativePatrol) return []
+    return sortedItems.filter(item => {
+      if (itemAvailabilityLabel(item)) return false
+      if (NEGATIVE_REASSIGN_EXPLICIT_STATUSES.has(item.status)) return true
+      if (
+        !item.started_at &&
+        NEGATIVE_REASSIGN_UNSTARTED_STATUSES.has(item.status)
+      ) {
+        const sourceExecution = executionsById.get(
+          String(item.execution_task_id || ''),
+        )
+        return Boolean(
+          sourceExecution &&
+          FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution)),
+        )
+      }
+      return false
+    })
+  }, [executionsById, negativePatrol, sortedItems])
+  const negativeReassignSourceAgentIds = useMemo(() => new Set(
+    negativeReassignItems
+      .map(item => itemAssignedAgentId(
+        item,
+        detail?.executions || [],
+        detail?.attempts || [],
+      ))
+      .filter(Boolean),
+  ), [detail?.attempts, detail?.executions, negativeReassignItems])
+  const negativeReassignCandidates = useMemo(() => {
+    if (!detail || !negativePatrol) return []
+    return availableAgents
+      .filter(agent => agentSupportsNegativePatrol(
+        agent,
+        detail.orchestration.platform,
+      ))
+      .sort((left, right) =>
+        `${left.host_label}${left.display_name}`.localeCompare(
+          `${right.host_label}${right.display_name}`,
+          'zh-CN',
+        ),
+      )
+  }, [availableAgents, detail, negativePatrol])
+  const negativeReassignBlockedByActiveExecution = Boolean(
+    negativePatrol &&
+    (detail?.executions || []).some(execution =>
+      NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES.has(
+        executionStatus(execution),
+      ),
+    ),
+  )
+  const selectedNegativeReassignAgents = useMemo(
+    () => negativeReassignCandidates.filter(agent =>
+      negativeReassignAgentIds.has(agent.id),
+    ),
+    [negativeReassignAgentIds, negativeReassignCandidates],
+  )
+  const negativeReassignAllocation = useMemo(() => {
+    if (
+      negativeReassignItems.length === 0 ||
+      selectedNegativeReassignAgents.length === 0
+    ) return []
+    const base = Math.floor(
+      negativeReassignItems.length / selectedNegativeReassignAgents.length,
+    )
+    const remainder =
+      negativeReassignItems.length % selectedNegativeReassignAgents.length
+    return selectedNegativeReassignAgents.map((agent, index) => ({
+      agent,
+      count: base + (index < remainder ? 1 : 0),
+    }))
+  }, [negativeReassignItems.length, selectedNegativeReassignAgents])
   const stoppableTaskIds = useMemo(
     () => Array.from(new Set((detail?.executions || [])
       .filter(execution => STOPPABLE_EXECUTION_STATUSES.has(String(execution.status || '')))
@@ -257,7 +419,7 @@ export function OrchestrationDetailWorkspace({
     activeCount > 0
   ))
   const attentionContext = useMemo(() => {
-    if (!detail) return null
+    if (!detail || negativePatrol) return null
     const item = sortedItems.find(candidate =>
       Boolean(candidate.execution_task_id) &&
       candidate.status === 'needs_action' &&
@@ -328,7 +490,7 @@ export function OrchestrationDetailWorkspace({
         !HANDOFF_UNSTARTED_EXCLUDED_STATUSES.has(candidate.status),
       ).length,
     }
-  }, [detail, sortedItems])
+  }, [detail, negativePatrol, sortedItems])
   const handoffCandidates = useMemo(() => {
     if (!attentionContext || !detail) return []
     return availableAgents
@@ -514,6 +676,107 @@ export function OrchestrationDetailWorkspace({
     }
   }
 
+  const openNegativeReassign = () => {
+    const preferred = negativeReassignCandidates.filter(
+      agent => !negativeReassignSourceAgentIds.has(agent.id),
+    )
+    const initial = preferred.length > 0
+      ? preferred
+      : negativeReassignCandidates
+    setNegativeReassignAgentIds(new Set(
+      initial
+        .slice(0, negativeReassignItems.length)
+        .map(agent => agent.id),
+    ))
+    setNegativeReassignOpen(true)
+    setActionError('')
+    setActionFeedback('')
+  }
+
+  const toggleNegativeReassignAgent = (agentId: string) => {
+    setNegativeReassignAgentIds(current => {
+      const next = new Set(current)
+      if (next.has(agentId)) {
+        next.delete(agentId)
+      } else if (next.size < negativeReassignItems.length) {
+        next.add(agentId)
+      }
+      return next
+    })
+  }
+
+  const submitNegativeReassign = async () => {
+    if (
+      !detail ||
+      !orchestrationId ||
+      !writable ||
+      negativeReassigning ||
+      negativeReassignItems.length === 0 ||
+      selectedNegativeReassignAgents.length === 0
+    ) return
+    const agentIds = selectedNegativeReassignAgents.map(agent => agent.id)
+    const retryingOriginalAgents = agentIds.filter(agentId =>
+      negativeReassignSourceAgentIds.has(agentId),
+    ).length
+    if (!window.confirm(
+      `确定把 ${negativeReassignItems.length} 条未完成帖子重新均衡分配给 ${agentIds.length} 个在线 Agent 吗？` +
+      `${retryingOriginalAgents > 0 ? ` 其中 ${retryingOriginalAgents} 个是原失败节点。` : ''}` +
+      ' 已完成以及已删除或不可访问的帖子不会重复执行。',
+    )) return
+
+    const expectedRevision = Number(
+      detail.orchestration.revision ??
+      detail.orchestration.orchestration_revision ??
+      0,
+    )
+    const fingerprint = JSON.stringify({
+      orchestrationId,
+      expectedRevision,
+      agentIds,
+      itemIds: negativeReassignItems.map(item => item.id),
+    })
+    if (
+      !pendingNegativeReassign.current ||
+      pendingNegativeReassign.current.fingerprint !== fingerprint
+    ) {
+      pendingNegativeReassign.current = {
+        fingerprint,
+        requestKey: crypto.randomUUID(),
+      }
+    }
+    setNegativeReassigning(true)
+    setActionError('')
+    setActionFeedback('')
+    try {
+      const result = await api.post<{
+        existing?: boolean
+        eligibleCount?: number
+        message?: string
+      }>(
+        `/capture-cloud/negative-patrol/orchestrations/${orchestrationId}/reassign`,
+        {
+          requestKey: pendingNegativeReassign.current.requestKey,
+          expectedRevision,
+          agentIds,
+        },
+        { timeoutMs: 30_000 },
+      )
+      pendingNegativeReassign.current = null
+      setNegativeReassignOpen(false)
+      setNegativeReassignAgentIds(new Set())
+      setActionFeedback(
+        result.message ||
+        `已重新分配 ${result.eligibleCount ?? negativeReassignItems.length} 条未完成帖子`,
+      )
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '重新分配未完成帖子失败')
+    } finally {
+      setNegativeReassigning(false)
+    }
+  }
+
   if (!orchestrationId) {
     return (
       <section className={cn('rounded-2xl border border-dashed border-border bg-muted/20 px-5 py-12 text-center', className)}>
@@ -583,6 +846,8 @@ export function OrchestrationDetailWorkspace({
                   ? '多 Agent 无人值守计划'
                   : scheduleRun
                     ? '无人值守计划运行批次'
+                    : negativePatrol
+                      ? '多 Agent 负面帖子巡查'
                     : '一次性多 Agent 任务'}
               </span>
             </div>
@@ -721,6 +986,154 @@ export function OrchestrationDetailWorkspace({
             </div>
           </section>
         )}
+        {negativePatrol && negativeReassignItems.length > 0 && (
+          <section className="mb-4 overflow-hidden rounded-2xl border border-primary/20 bg-primary/[0.025]">
+            <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-start sm:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                  <RefreshCw className="h-4.5 w-4.5" />
+                </span>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-sm font-bold text-foreground">
+                      {negativeReassignItems.length} 条帖子尚未完成
+                    </h3>
+                    <span className="rounded-full bg-status-red/8 px-2 py-0.5 text-[10px] font-semibold text-status-red">
+                      可重新分配
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    只会重建失败或未结算的逐帖任务；已完成、已删除或不可访问的帖子继续保留原结果。
+                  </p>
+                </div>
+              </div>
+              {!negativeReassignOpen && (
+                <Button
+                  size="sm"
+                  onClick={openNegativeReassign}
+                  disabled={!writable || negativeReassignBlockedByActiveExecution}
+                  title={
+                    !writable
+                      ? '当前账号为只读权限'
+                      : negativeReassignBlockedByActiveExecution
+                        ? '当前批次仍有 Agent 在运行，请先等待结束或停止任务'
+                        : '选择在线 Agent 重新分配未完成帖子'
+                  }
+                >
+                  <Send className="h-4 w-4" />
+                  重新分配未完成帖子
+                </Button>
+              )}
+            </div>
+            {negativeReassignBlockedByActiveExecution && !negativeReassignOpen && (
+              <p className="border-t border-border/70 bg-background/55 px-4 py-2.5 text-[11px] leading-4 text-muted-foreground">
+                当前批次仍有 Agent 在执行或等待设备。为避免同一帖子并发执行，请先等待批次结束，或停止任务后再重新分配。
+              </p>
+            )}
+            {negativeReassignOpen && (
+              <div className="border-t border-border/70 bg-background/70 p-4">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <h4 className="text-xs font-bold text-foreground">选择接力 Agent</h4>
+                    <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                      默认排除原失败节点；确有需要时可以手动勾回。每条帖子只会交给一个新执行节点。
+                    </p>
+                  </div>
+                  <span className="text-[11px] font-medium tabular-nums text-muted-foreground">
+                    已选 {selectedNegativeReassignAgents.length} / 最多 {negativeReassignItems.length}
+                  </span>
+                </div>
+                {negativeReassignCandidates.length === 0 ? (
+                  <div className="mt-3 rounded-xl border border-dashed border-border bg-muted/25 px-3 py-5 text-center text-xs text-muted-foreground">
+                    当前没有在线且兼容负面巡查的 Agent。请先让可用 Extension 上线或升级。
+                  </div>
+                ) : (
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {negativeReassignCandidates.map(agent => {
+                      const checked = negativeReassignAgentIds.has(agent.id)
+                      const originalFailed = negativeReassignSourceAgentIds.has(agent.id)
+                      const selectionFull =
+                        !checked &&
+                        negativeReassignAgentIds.size >= negativeReassignItems.length
+                      return (
+                        <label
+                          key={agent.id}
+                          className={cn(
+                            'flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-2.5 transition-colors',
+                            checked
+                              ? 'border-primary/35 bg-primary/[0.045]'
+                              : 'border-border/70 bg-card hover:border-primary/25',
+                            selectionFull && 'cursor-not-allowed opacity-55',
+                          )}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleNegativeReassignAgent(agent.id)}
+                            disabled={negativeReassigning || selectionFull}
+                            className="mt-0.5 h-4 w-4 rounded border-border text-primary focus:ring-primary"
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="flex flex-wrap items-center gap-1.5">
+                              <strong className="truncate text-xs font-semibold text-foreground">
+                                {agentName(agent)}
+                              </strong>
+                              {originalFailed && (
+                                <span className="rounded-full bg-status-red/8 px-1.5 py-0.5 text-[9px] font-semibold text-status-red">
+                                  原失败节点
+                                </span>
+                              )}
+                            </span>
+                            <span className="mt-1 block text-[10px] text-muted-foreground">
+                              在线 · 执行中 {Number(agent.active_task_count || 0)} · 排队 {Number(agent.queued_task_count || 0)}
+                            </span>
+                          </span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
+                {negativeReassignAllocation.length > 0 && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-muted/30 px-3 py-2.5">
+                    <span className="text-[10px] font-semibold text-muted-foreground">预计分配</span>
+                    {negativeReassignAllocation.map(({ agent, count }) => (
+                      <span key={agent.id} className="rounded-md border border-border/70 bg-card px-2 py-1 text-[10px] text-foreground">
+                        {agentName(agent)} · {count} 条
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-4 flex flex-wrap justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setNegativeReassignOpen(false)
+                      setNegativeReassignAgentIds(new Set())
+                    }}
+                    disabled={negativeReassigning}
+                  >
+                    取消
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => void submitNegativeReassign()}
+                    disabled={
+                      !writable ||
+                      negativeReassigning ||
+                      selectedNegativeReassignAgents.length === 0
+                    }
+                  >
+                    {negativeReassigning
+                      ? <Loader2 className="h-4 w-4 animate-spin" />
+                      : <Send className="h-4 w-4" />}
+                    确认重新分配 {negativeReassignItems.length} 条
+                  </Button>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
         {scheduleTemplate && schedule && (
           <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.035] p-4">
             <div className="flex items-start gap-3">
@@ -748,7 +1161,7 @@ export function OrchestrationDetailWorkspace({
         <ol className="mb-4 flex items-center gap-2 overflow-x-auto pb-1" aria-label="编排任务结构">
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-primary/25 bg-primary/[0.045] px-3 py-2">
             <ClipboardList className="h-4 w-4 shrink-0 text-primary" />
-            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} 个工作项</span></span>
+            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} {negativePatrol ? '条帖子' : '个工作项'}</span></span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-border bg-muted/30 px-3 py-2">
@@ -773,7 +1186,9 @@ export function OrchestrationDetailWorkspace({
               <p className="mt-1 text-xs text-muted-foreground">
                 {scheduleTemplate
                   ? '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
-                  : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
+                  : negativePatrol
+                    ? '按每条帖子的真实巡查结果汇总，并展示它由哪个 Agent 执行。'
+                    : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
               </p>
             </div>
             {!scheduleTemplate && <div className="flex flex-wrap gap-2 text-[11px]">
@@ -810,7 +1225,7 @@ export function OrchestrationDetailWorkspace({
             <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
               <div>
                 <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">Work items</div>
-                <h3 className="mt-0.5 text-sm font-bold text-foreground">关键词工作项</h3>
+                <h3 className="mt-0.5 text-sm font-bold text-foreground">{negativePatrol ? '负面帖子工作项' : '关键词工作项'}</h3>
               </div>
               <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{sortedItems.length} 项</span>
             </div>
@@ -823,6 +1238,7 @@ export function OrchestrationDetailWorkspace({
                   const assignedAgent = agentsById.get(assignedAgentId)
                   const itemAttempts = attemptsByItem.get(item.id) || []
                   const errorMessage = dataMessage(item.error)
+                  const availabilityLabel = itemAvailabilityLabel(item)
                   return (
                     <article key={item.id} className="grid gap-3 px-4 py-3 sm:grid-cols-[40px_minmax(0,1fr)_auto] sm:items-start">
                       <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted text-xs font-bold tabular-nums text-muted-foreground">
@@ -831,7 +1247,9 @@ export function OrchestrationDetailWorkspace({
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
                           <h4 className="truncate text-sm font-semibold text-foreground">{keywordForItem(item)}</h4>
-                          <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusTone(item.status)}`}>{statusLabel(item.status)}</span>
+                          <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusTone(item.status)}`}>
+                            {availabilityLabel || statusLabel(item.status)}
+                          </span>
                         </div>
                         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
                           <span>Agent：<strong className="font-medium text-foreground">{agentName(assignedAgent)}</strong></span>
@@ -876,7 +1294,7 @@ export function OrchestrationDetailWorkspace({
                             </span>
                           </div>
                           <p className="mt-1 truncate text-[11px] text-muted-foreground">{agent.host_label} › {agent.browser_name} · {agent.operating_system}</p>
-                          <p className="mt-1 text-[11px] text-muted-foreground">分配 {assignedItems.length} 个工作项 · {agentExecutions.length} 条子任务记录</p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">分配 {assignedItems.length} {negativePatrol ? '条帖子' : '个工作项'} · {agentExecutions.length} 条子任务记录</p>
                         </div>
                       </div>
                       {agentExecutions.length > 0 && (
@@ -889,7 +1307,7 @@ export function OrchestrationDetailWorkspace({
                                 return <>
                               <div className="flex items-center justify-between gap-2">
                                 <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(String(execution.status || ''))}`}>{statusLabel(String(execution.status || ''))}</span>
-                                <span className="text-[10px] text-muted-foreground">{itemCount} 个工作项</span>
+                                <span className="text-[10px] text-muted-foreground">{itemCount} {negativePatrol ? '条帖子' : '个工作项'}</span>
                               </div>
                               <div className="mt-1.5 truncate font-mono text-[10px] text-muted-foreground">{executionTaskId(execution) || '未返回子任务 ID'}</div>
                               {(execution.command_status || execution.command_expires_at) && (
@@ -913,11 +1331,11 @@ export function OrchestrationDetailWorkspace({
                 })}
               </div>
             )}
-            <div className="border-t border-border/70 bg-muted/25 p-3">
+            {!negativePatrol && <div className="border-t border-border/70 bg-muted/25 p-3">
               <p className="text-[10px] leading-4 text-muted-foreground">
                 任务遇到安全验证时，上方会提供人工继续、结束保留和转交空闲 Agent；接力只处理尚未开始的完整关键词。
               </p>
-            </div>
+            </div>}
           </section>
         </div>
       </div>

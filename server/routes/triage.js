@@ -292,6 +292,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         r.comments_capture_status, r.comments_total_captured,
         r.official_replied, r.official_response_status, r.negative_comment_count,
         r.latest_negative_comment_at, r.last_risk_reopened_at,
+        r.content_availability_status, r.content_availability_checked_at,
+        r.content_availability_reason, r.content_availability_evidence,
         r.sentiment, r.category, r.source_type, r.identity_override, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
         r.ai_result, r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
         r.seen_count, r.created_at,

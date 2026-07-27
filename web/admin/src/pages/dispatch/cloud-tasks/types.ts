@@ -33,6 +33,7 @@ export type OrchestrationRecord = {
   client_task_id?: string
   parent_task_id?: string | null
   task_type?: string
+  feature_key?: string
   title: string
   platform: OrchestrationPlatform | string
   status: string
@@ -67,6 +68,8 @@ export type OrchestrationItemRecord = {
   execution_task_id?: string | null
   assignment_revision?: number
   request_hash?: string | null
+  content_availability_status?: string | null
+  content_availability_checked_at?: string | null
   metadata?: Record<string, unknown> | null
   result?: Record<string, unknown> | null
   error?: Record<string, unknown> | null

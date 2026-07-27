@@ -117,6 +117,8 @@ export function TaskCard({
     ? '多 Agent 无人值守'
     : scheduleRun
       ? '计划运行批次'
+      : orchestration && negativePatrol
+        ? '多 Agent 负面巡查'
       : orchestration
         ? '多 Agent 编排'
         : officialCommentPatrol
@@ -135,12 +137,12 @@ export function TaskCard({
     <article className={`rounded-2xl border border-border/70 bg-card p-4 shadow-xs ${orchestration ? 'border-l-2 border-l-primary/40' : ''}`}>
       {/* 第一行：类型图标 + 标题 + 状态 chip（右对齐） */}
       <div className="flex min-w-0 items-center gap-2">
-        {orchestration
-          ? <Network className="h-4 w-4 shrink-0 text-primary" />
+        {negativePatrol
+          ? <ShieldAlert className="h-4 w-4 shrink-0 text-status-red" />
+          : orchestration
+            ? <Network className="h-4 w-4 shrink-0 text-primary" />
           : officialCommentPatrol
             ? <MessagesSquare className="h-4 w-4 shrink-0 text-primary" />
-          : negativePatrol
-            ? <ShieldAlert className="h-4 w-4 shrink-0 text-status-red" />
           : <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />}
         <h4 className="min-w-0 flex-1 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
         <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
@@ -151,7 +153,9 @@ export function TaskCard({
           {PLATFORM_LABELS[task.platform] || task.platform}
           {' · '}{taskMode}{' · '}
           {orchestration
-            ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词`
+            ? negativePatrol
+              ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子`
+              : `${safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词`
             : `${task.agent_host_label || '未分配设备'} › ${task.agent_display_name || '未分配 Agent'}`}
         </span>
         {!orchestration && (
@@ -268,7 +272,22 @@ export function TaskCard({
           <TaskDiagnosticsPanel task={task} diagnostics={diagnostics} />
         ) : (
           <div className="mt-2 grid gap-2 rounded-xl bg-muted/45 p-3 text-[11px] text-muted-foreground sm:grid-cols-2">
-            {orchestration ? (
+            {negativePatrol ? (
+            <>
+              <div>巡查帖子：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 条</span></div>
+              <div>已处理：<span className="text-foreground">{safeNumber(task.counts?.processed ?? task.progress?.current)} 条</span></div>
+              {orchestration && (
+                <div>执行节点：<span className="text-foreground">
+                  {Array.isArray(task.metadata?.selectedAgentIds)
+                    ? task.metadata.selectedAgentIds.length
+                    : safeNumber(task.counts?.agents)} 个 Agent
+                </span></div>
+              )}
+              <div>发布时间：<span className="text-foreground">{String(negativePatrolFilter.publishDateFrom || '—')} 至 {String(negativePatrolFilter.publishDateTo || '—')}</span></div>
+              <div>筛选情绪：<span className="text-foreground">负面</span></div>
+              <div>最后更新：<span className="text-foreground">{formatTime(task.updated_at)}</span></div>
+            </>
+            ) : orchestration ? (
             <>
               <div>关键词工作项：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 项</span></div>
               <div>已结算：<span className="text-foreground">{safeNumber(task.progress?.current)} 项</span></div>
@@ -278,14 +297,6 @@ export function TaskCard({
             </>
             ) : (
             <>
-              {negativePatrol && (
-                <>
-                  <div>巡查帖子：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 条</span></div>
-                  <div>已处理：<span className="text-foreground">{safeNumber(task.counts?.processed ?? task.progress?.current)} 条</span></div>
-                  <div>发布时间：<span className="text-foreground">{String(negativePatrolFilter.publishDateFrom || '—')} 至 {String(negativePatrolFilter.publishDateTo || '—')}</span></div>
-                  <div>筛选情绪：<span className="text-foreground">负面</span></div>
-                </>
-              )}
               {officialCommentPatrol && (
                 <>
                   <div>官方账号：<span className="text-foreground">{officialAccountName || '—'}</span></div>

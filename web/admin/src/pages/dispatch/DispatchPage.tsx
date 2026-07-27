@@ -314,6 +314,29 @@ export function DispatchPage() {
     }
   }
 
+  const retireAgent = async (
+    agent: CloudAgent,
+    reason: 'tenant_migrated' | 'permanently_offline',
+  ) => {
+    setAgentActionId(agent.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/agents/${agent.id}/retire`,
+        { confirmation: '永久归档', reason },
+      )
+      setFeedback(result.message || `节点“${agent.display_name}”已永久归档；历史记录已保留。`)
+      await load(true)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '永久归档节点失败'
+      setActionError(message)
+      throw err
+    } finally {
+      setAgentActionId('')
+    }
+  }
+
   if (loading && !overview) {
     return <div className="flex justify-center py-24"><Loader2 className="h-7 w-7 animate-spin text-primary" /></div>
   }
@@ -415,8 +438,10 @@ export function DispatchPage() {
             onCreatePlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan' })}
             onDeletePlan={agent => void deleteUnattendedPlan(agent)}
             onDeleteAgent={deleteAgent}
+            onRetireAgent={retireAgent}
             deletingPlanAgentId={planActionAgentId}
             deletingAgentId={agentActionId}
+            retiringAgentId={agentActionId}
             onSaved={() => load(true)}
           />
         </aside>
