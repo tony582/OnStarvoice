@@ -158,7 +158,11 @@ test("Douyin comment capture carries and checks the expected work identity befor
     "async function captureCommentsForHydratedDetailRecord",
   );
   assert.match(currentNoteBlock, /expectedNoteId = ''/);
-  assert.match(currentNoteBlock, /expectedNoteId,\s*\n\s*},\s*\n\s*}\);/);
+  assert.match(currentNoteBlock, /verifiedNoteId = ''/);
+  assert.match(
+    currentNoteBlock,
+    /expectedNoteId,\s*\n\s*verifiedNoteId,\s*\n\s*},\s*\n\s*}\);/,
+  );
   assert.match(
     currentNoteBlock,
     /buildDouyinCommentIdentityFailure\(\s*expectedNoteId,\s*capturedNoteId/,
@@ -181,8 +185,61 @@ test("Douyin comment capture carries and checks the expected work identity befor
     /expectedNoteId: String\(captureParams\.expectedNoteId \|\| ''\)/,
   );
   assert.match(
+    captureSyncSource,
+    /verifiedNoteId: String\(captureParams\.verifiedNoteId \|\| ''\)/,
+  );
+  assert.match(
     contentSource,
     /expectedNoteId: String\(request\.expectedNoteId \|\| ""\)/,
+  );
+  assert.match(
+    contentSource,
+    /verifiedNoteId: String\(request\.verifiedNoteId \|\| ""\)/,
+  );
+  assert.match(
+    captureSyncSource,
+    /resolveVerifiedDouyinDetailNoteId\(\s*detailPayload,\s*expectedCommentNoteId/,
+  );
+
+  const singleRecordBlock = sourceBlock(
+    captureSyncSource,
+    "async function captureCommentsForSingleNoteRecord",
+    "async function captureBloggerMetricsForSingleNoteRecord",
+  );
+  assert.match(
+    singleRecordBlock,
+    /verifiedNoteId:\s*providedVerifiedNoteId = ''/,
+  );
+  assert.doesNotMatch(
+    singleRecordBlock,
+    /resolveVerifiedDouyinDetailNoteId\(/,
+  );
+  assert.doesNotMatch(
+    singleRecordBlock,
+    /record\.payload\?\.detailPayload\s*\|\|\s*record\.payload/,
+  );
+
+  const hydratedRecordBlock = sourceBlock(
+    captureSyncSource,
+    "async function captureCommentsForHydratedDetailRecord",
+    "export function applyCommentResultToSingleNotePayload",
+  );
+  assert.match(
+    hydratedRecordBlock,
+    /verifiedNoteId:\s*providedVerifiedNoteId = ''/,
+  );
+  assert.doesNotMatch(
+    hydratedRecordBlock,
+    /resolveVerifiedDouyinDetailNoteId\(/,
+  );
+  assert.doesNotMatch(
+    hydratedRecordBlock,
+    /resolveVerifiedDouyinDetailNoteId\(\s*latestDetailPayload/,
+  );
+
+  assert.match(
+    captureSyncSource,
+    /capturedIds\.size === 1 \? \[\.\.\.capturedIds\]\[0\] : ''/,
   );
 });
 
@@ -200,7 +257,10 @@ test("Douyin comment identity mismatch fails closed at capture start and finish"
     /error\?\.code \|\|\s*\(isCanceled\(\) \? "CAPTURE_CANCELED" : "CAPTURE_FAILED"\)/,
   );
 
-  const {assertDouyinCommentTargetIdentity} = await import(
+  const {
+    assertDouyinCommentTargetIdentity,
+    resolveVerifiedDouyinCommentNoteId,
+  } = await import(
     `../utils/capture/douyin-comments.js?comment-identity=${Date.now()}`
   );
   const expected = "766193585000000099";
@@ -223,5 +283,122 @@ test("Douyin comment identity mismatch fails closed at capture start and finish"
   assert.throws(
     () => assertDouyinCommentTargetIdentity(expected, "", "开始采集评论前"),
     (error) => error?.code === "DOUYIN_COMMENT_ID_MISMATCH",
+  );
+  assert.equal(
+    resolveVerifiedDouyinCommentNoteId(expected, expected),
+    expected,
+  );
+  assert.equal(
+    resolveVerifiedDouyinCommentNoteId(
+      expected,
+      "766193585000000001",
+    ),
+    "",
+  );
+  assert.equal(resolveVerifiedDouyinCommentNoteId(expected, ""), "");
+});
+
+test("Douyin comment identity prefers the current route over a stale visible work", async () => {
+  const {resolveDouyinCommentNoteId} = await import(
+    `../utils/capture/douyin-comments.js?comment-route-identity=${Date.now()}`
+  );
+  const expected = "766193585000000099";
+  const routeNoteId = "766193585000000101";
+  const staleNode = {
+    closest() {
+      return this;
+    },
+    getAttribute(name) {
+      return name === "data-e2e-aweme-id" ? expected : "";
+    },
+    querySelector() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return {top: 0, bottom: 100, width: 100, height: 100};
+    },
+  };
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  try {
+    globalThis.window = {
+      location: {
+        href: `https://www.douyin.com/video/${routeNoteId}`,
+      },
+      getComputedStyle() {
+        return {
+          display: "block",
+          visibility: "visible",
+          opacity: "1",
+        };
+      },
+    };
+    globalThis.document = {
+      querySelectorAll(selector) {
+        return selector.includes("swiper-slide-active") ? [staleNode] : [];
+      },
+    };
+
+    assert.equal(resolveDouyinCommentNoteId(expected), routeNoteId);
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  }
+});
+
+test("conflicting Douyin work IDs fail closed instead of selecting the first ID", () => {
+  const guardSource = sourceBlock(
+    captureSyncSource,
+    "function extractDouyinDetailGuardItemId",
+    "function buildDouyinCommentIdentityFailure",
+  );
+  const guardContext = vm.createContext({Set, String, Object, Array});
+  vm.runInContext(
+    `${guardSource}
+globalThis.__douyinGuardApi = {
+  resolveCapturedDouyinCommentNoteId,
+  resolveVerifiedDouyinDetailNoteId,
+};`,
+    guardContext,
+    {filename: "utils/capture-sync-douyin-identity.js"},
+  );
+  const {
+    resolveCapturedDouyinCommentNoteId,
+    resolveVerifiedDouyinDetailNoteId,
+  } = guardContext.__douyinGuardApi;
+  const expected = "766193585000000099";
+  const other = "766193585000000101";
+
+  assert.equal(
+    resolveCapturedDouyinCommentNoteId({
+      noteId: expected,
+      data: {noteId: expected, url: `https://www.douyin.com/video/${expected}`},
+    }),
+    expected,
+  );
+  assert.equal(
+    resolveCapturedDouyinCommentNoteId({
+      noteId: expected,
+      data: {url: `https://www.douyin.com/video/${other}`},
+    }),
+    "",
+  );
+  assert.equal(
+    resolveVerifiedDouyinDetailNoteId(
+      {
+        noteId: expected,
+        url: `https://www.douyin.com/video/${other}`,
+      },
+      expected,
+    ),
+    "",
   );
 });

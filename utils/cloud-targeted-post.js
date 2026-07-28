@@ -268,6 +268,10 @@
       enableCommentLeadsFilter:
         source.enableCommentLeadsFilter === true ||
         source.enableCommentLeadsFilterOnDetailCapture === true,
+      verifyPublishDateFromDetail:
+        source.verifyPublishDateFromDetail === true,
+      skipAlreadyCapturedOnDetailCapture:
+        source.skipAlreadyCapturedOnDetailCapture !== false,
       commentsMaxDetectedItems:
         Number.isFinite(commentLimit) && commentLimit > 0
           ? Math.min(commentLimit, 500)

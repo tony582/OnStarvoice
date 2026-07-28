@@ -210,5 +210,6 @@ test('create route creates one account-page Agent task and forces comment sampli
   assert.match(route, /autoSyncAfterDetailCapture: true/u);
   assert.match(route, /commentsMaxDetectedItems: normalized\.filter\.commentsLimit/u);
   assert.match(route, /skipAlreadyCapturedOnDetailCapture: false/u);
+  assert.match(route, /verifyPublishDateFromDetail: true/u);
   assert.doesNotMatch(route, /recordIds: normalized\.recordIds/u);
 });

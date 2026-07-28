@@ -4,7 +4,11 @@ import { labelRecord } from '../services/ai-labeler.js';
 import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
-import { parseMetricNumber, resolveMetricUpdateFromPayload } from '../utils/metrics.js';
+import {
+  parseMetricNumber,
+  resolveCommentCountEvidenceFromPayload,
+  resolveMetricUpdateFromPayload,
+} from '../utils/metrics.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
 import { queryAll } from '../db/init.js';
 
@@ -155,6 +159,8 @@ export function normalizeRecord(body) {
       resolveMetricUpdateFromPayload(item, dimension, keys, {
         syncType: item.syncType || body.syncType,
       });
+    const commentCountEvidence =
+      resolveCommentCountEvidenceFromPayload(item);
     const tags = mergedArrayValue(
       dp.tags, listItem.tags, item.tags,
       dp.hashtags, listItem.hashtags, item.hashtags,
@@ -189,6 +195,8 @@ export function normalizeRecord(body) {
       source_type: String(get('sourceType', 'source_type')),
       likes: metric('likes', 'likes', 'likeCount', 'like_count', 'diggCount', 'digg_count', 'attitudes_count', 'attitudesCount'),
       comments_count: metric('comments', 'comments', 'commentCount', 'comment_count', 'commentsCount', 'comments_count'),
+      comments_count_known: commentCountEvidence.known,
+      comments_count_source: commentCountEvidence.source,
       collects: metric('collects', 'collects', 'collectCount', 'collect_count', 'collectsCount', 'collects_count'),
       shares: metric('shares', 'shares', 'shareCount', 'share_count', 'reposts', 'repostCount', 'repost_count', 'repostsCount', 'reposts_count'),
       // lastEditedAt 会被采集端污染成"采集当天"(并非真实发布时间),不再作为发布时间兜底 ——

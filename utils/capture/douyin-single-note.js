@@ -487,6 +487,7 @@ function buildPayloadFromApiDetail(detail, noteId) {
     collects: stats.collect_count ?? null,
     comments: commentsCountKnown ? stats.comment_count : null,
     commentsCountKnown,
+    commentsCountSource: commentsCountKnown ? "api_statistics" : "unknown",
     shares: stats.share_count ?? null,
     publishTimestamp,
     publishTime: lastEditedAt || "",
@@ -888,6 +889,7 @@ export async function captureDouyinSingleNote({
       collects: interactions.collects,
       comments: interactions.comments,
       commentsCountKnown: interactions.commentsCountKnown,
+      commentsCountSource: interactions.commentsCountSource,
       shares: interactions.shares,
       publishTime: resolvedPublishText,
       publishDateRaw: resolvedPublishText,
@@ -2633,8 +2635,22 @@ function parseExplicitDouyinCommentCount(value) {
     return null;
   }
 
-  const parsed = parseDouyinCount(text);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  // 一个 DOM 节点可能同时把可见文本和无障碍文本展开成
+  // “评论 22 22”。直接删除空格会把它错误拼成 2222。
+  // 只接受唯一的数值证据；重复的相同数值去重，冲突数值则视为未知。
+  const normalized = text.replace(/，/g, ",");
+  const tokens =
+    normalized.match(
+      /\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:亿|万|[kK])?|\d+(?:\.\d+)?(?:亿|万|[kK])?/g,
+    ) || [];
+  const counts = Array.from(
+    new Set(
+      tokens
+        .map((token) => parseDouyinCount(token))
+        .filter((count) => Number.isFinite(count) && count >= 0),
+    ),
+  );
+  return counts.length === 1 ? counts[0] : null;
 }
 
 function readExplicitDouyinApiCommentCount(detail) {
@@ -2653,13 +2669,15 @@ export function hasExplicitDouyinApiCommentCount(detail) {
   return readExplicitDouyinApiCommentCount(detail) !== null;
 }
 
-function readDouyinCommentNodeText(node) {
-  if (!node) return "";
-  const parts = [node.textContent, node.innerText];
+function readDouyinCommentNodeValues(node) {
+  if (!node) return [];
+  const values = [node.textContent, node.innerText];
   if (typeof node.getAttribute === "function") {
-    parts.push(node.getAttribute("aria-label"), node.getAttribute("title"));
+    values.push(node.getAttribute("aria-label"), node.getAttribute("title"));
   }
-  return cleanText(parts.filter(Boolean).join(" "));
+  return Array.from(
+    new Set(values.map((value) => cleanText(value)).filter(Boolean)),
+  );
 }
 
 function hasExplicitDouyinEmptyCommentState(detailRoot) {
@@ -2688,16 +2706,23 @@ export function resolveDouyinCommentCountEvidence({
   apiDetail = null,
   detailRoot = null,
 } = {}) {
-  const domCount = parseExplicitDouyinCommentCount(
-    readDouyinCommentNodeText(commentNode),
-  );
-  if (domCount !== null) {
-    return {count: domCount, known: true, source: "dom_count"};
-  }
-
   const apiCount = readExplicitDouyinApiCommentCount(apiDetail);
   if (apiCount !== null) {
     return {count: apiCount, known: true, source: "api_statistics"};
+  }
+
+  const domCounts = Array.from(
+    new Set(
+      readDouyinCommentNodeValues(commentNode)
+        .map((value) => parseExplicitDouyinCommentCount(value))
+        .filter((count) => count !== null),
+    ),
+  );
+  if (domCounts.length === 1) {
+    return {count: domCounts[0], known: true, source: "dom_count"};
+  }
+  if (domCounts.length > 1) {
+    return {count: null, known: false, source: "dom_conflict"};
   }
 
   if (hasExplicitDouyinEmptyCommentState(detailRoot)) {
@@ -2766,6 +2791,7 @@ function extractDouyinInteractions(detailRoot, {apiDetail = null} = {}) {
     ...interactions,
     comments: evidence.known ? evidence.count : interactions.comments,
     commentsCountKnown: evidence.known,
+    commentsCountSource: evidence.source,
   };
 }
 

@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {normalizeRecord} from '../server/routes/sync.js';
-import {mergeObservationMetrics} from '../server/services/record-store.js';
+import {
+  guardRecordCommentCount,
+  mergeObservationMetrics,
+  resolveGuardedCommentsCount,
+} from '../server/services/record-store.js';
 import {
   resolveMetricUpdateFromPayload,
   resolveRecordMetrics,
@@ -68,6 +72,23 @@ test('sync normalization preserves unknown list metrics as null', () => {
   assert.equal(record.likes, 8);
   assert.equal(record.comments_count, null);
   assert.equal(record.collects, null);
+});
+
+test('sync normalization preserves comment count certainty and source', () => {
+  const [record] = normalizeRecord({
+    syncType: 'single_note',
+    platform: 'douyin',
+    payload: {
+      noteId: 'douyin-1',
+      comments: 22,
+      commentsCountKnown: true,
+      commentsCountSource: 'api_statistics',
+    },
+  });
+
+  assert.equal(record.comments_count, 22);
+  assert.equal(record.comments_count_known, true);
+  assert.equal(record.comments_count_source, 'api_statistics');
 });
 
 test('confirmed zero updates while an unproven displayed zero stays unknown', () => {
@@ -181,4 +202,94 @@ test('unknown latest metrics fall back to the older enhanced values', () => {
 
   assert.equal(metrics.comments_count, 7);
   assert.equal(metrics.collects, 1);
+});
+
+test('legacy comment count cannot overwrite a trusted stored count', () => {
+  const existing = {
+    comments_count: 22,
+    payload: {
+      comments: 22,
+      commentsCountKnown: true,
+      commentsCountSource: 'api_statistics',
+    },
+  };
+  const decision = resolveGuardedCommentsCount(
+    {comments_count: 23, payload: {comments: 23}},
+    existing,
+  );
+
+  assert.equal(decision.value, 22);
+  assert.equal(decision.preserved, true);
+  assert.equal(decision.reason, 'untrusted_regression');
+});
+
+test('repeated DOM concatenation is blocked for records and observations', () => {
+  const existing = {
+    comments_count: 35,
+    payload: {
+      comments: 35,
+      commentsCountKnown: true,
+      commentsCountSource: 'api_statistics',
+    },
+  };
+  const guarded = guardRecordCommentCount({
+    comments_count: 3535,
+    comments_count_known: true,
+    comments_count_source: 'dom_count',
+    payload: JSON.stringify({
+      comments: 3535,
+      commentsCountKnown: true,
+      commentsCountSource: 'dom_count',
+    }),
+  }, existing);
+
+  assert.equal(guarded.comments_count, 35);
+  assert.equal(JSON.parse(guarded.payload).comments, 35);
+  assert.equal(
+    mergeObservationMetrics(guarded, existing).comments_count,
+    35,
+  );
+});
+
+test('trusted API evidence may repair a bad old count and record real growth', () => {
+  const oldBad = {
+    comments_count: 2222,
+    payload: {
+      comments: 2222,
+      commentsCountKnown: true,
+      commentsCountSource: 'legacy_known',
+    },
+  };
+  const repaired = resolveGuardedCommentsCount({
+    comments_count: 22,
+    comments_count_known: true,
+    comments_count_source: 'api_statistics',
+    payload: {
+      comments: 22,
+      commentsCountKnown: true,
+      commentsCountSource: 'api_statistics',
+    },
+  }, oldBad);
+  const grown = resolveGuardedCommentsCount({
+    comments_count: 36,
+    comments_count_known: true,
+    comments_count_source: 'api_statistics',
+    payload: {
+      comments: 36,
+      commentsCountKnown: true,
+      commentsCountSource: 'api_statistics',
+    },
+  }, {
+    comments_count: 35,
+    payload: {
+      comments: 35,
+      commentsCountKnown: true,
+      commentsCountSource: 'api_statistics',
+    },
+  });
+
+  assert.equal(repaired.value, 22);
+  assert.equal(repaired.preserved, false);
+  assert.equal(grown.value, 36);
+  assert.equal(grown.preserved, false);
 });

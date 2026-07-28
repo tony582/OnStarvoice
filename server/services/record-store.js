@@ -1,7 +1,12 @@
 import crypto from 'crypto';
 import { withTransaction } from '../db/init.js';
 import { queueCoverLocalization, queueRecordImagesLocalization } from './media-store.js';
-import { parseMetricNumber } from '../utils/metrics.js';
+import {
+  commentCountEvidenceRank,
+  normalizeCommentCountSource,
+  parseMetricNumber,
+  resolveCommentCountEvidenceFromPayload,
+} from '../utils/metrics.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
@@ -46,6 +51,165 @@ function cleanNumber(value) {
 function cleanOptionalNumber(value) {
   if (value == null || value === '') return null;
   return parseMetricNumber(value, 0);
+}
+
+function explicitBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  return null;
+}
+
+function recordCommentCountEvidence(record = {}) {
+  const payloadEvidence = resolveCommentCountEvidenceFromPayload(record.payload);
+  const explicitKnown = explicitBoolean(record.comments_count_known);
+  const explicitSource = String(record.comments_count_source || '').trim();
+  return {
+    known: explicitKnown ?? payloadEvidence.known,
+    source: explicitSource
+      ? normalizeCommentCountSource(explicitSource)
+      : payloadEvidence.source,
+  };
+}
+
+function isRepeatedCommentCountConcatenation(previous, incoming) {
+  if (!Number.isInteger(previous) || !Number.isInteger(incoming)) return false;
+  const previousText = String(previous);
+  const incomingText = String(incoming);
+  if (previousText.length < 2 || incomingText.length <= previousText.length) {
+    return false;
+  }
+  if (incomingText.length % previousText.length !== 0) return false;
+  return incomingText === previousText.repeat(
+    incomingText.length / previousText.length,
+  );
+}
+
+export function resolveGuardedCommentsCount(record = {}, existing = {}) {
+  const incoming = cleanOptionalNumber(record.comments_count);
+  const previous = cleanOptionalNumber(existing.comments_count);
+  const incomingEvidence = recordCommentCountEvidence(record);
+  const existingEvidence = recordCommentCountEvidence(existing);
+  const trustedApiIncoming =
+    incomingEvidence.known &&
+    normalizeCommentCountSource(incomingEvidence.source) === 'api_statistics';
+
+  if (incoming == null) {
+    return {
+      value: previous,
+      preserved: previous != null,
+      reason: 'not_observed',
+      incomingEvidence,
+      existingEvidence,
+    };
+  }
+
+  if (
+    previous != null &&
+    !trustedApiIncoming &&
+    isRepeatedCommentCountConcatenation(previous, incoming)
+  ) {
+    return {
+      value: previous,
+      preserved: true,
+      reason: 'repeated_concatenation',
+      incomingEvidence,
+      existingEvidence,
+    };
+  }
+
+  if (
+    previous != null &&
+    commentCountEvidenceRank(existingEvidence) > 0 &&
+    commentCountEvidenceRank(incomingEvidence) === 0
+  ) {
+    return {
+      value: previous,
+      preserved: true,
+      reason: 'untrusted_regression',
+      incomingEvidence,
+      existingEvidence,
+    };
+  }
+
+  return {
+    value: incoming,
+    preserved: false,
+    reason: 'accepted',
+    incomingEvidence,
+    existingEvidence,
+  };
+}
+
+function patchPayloadCommentCount(payload, count, evidence) {
+  let parsed;
+  try {
+    parsed = typeof payload === 'string' ? JSON.parse(payload) : structuredClone(payload);
+  } catch {
+    return payload;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return payload;
+
+  const listItem = Array.isArray(parsed.items)
+    ? parsed.items.find(item => item && typeof item === 'object' && !Array.isArray(item))
+    : null;
+  const candidates = [
+    parsed.detailPayload,
+    listItem?.detailPayload,
+    listItem,
+    parsed,
+  ].filter(candidate => candidate && typeof candidate === 'object' && !Array.isArray(candidate));
+  const keys = ['comments', 'commentCount', 'comment_count', 'commentsCount', 'comments_count'];
+  let patched = false;
+
+  for (const candidate of candidates) {
+    let touched = false;
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(candidate, key)) continue;
+      candidate[key] = count;
+      touched = true;
+    }
+    if (
+      String(candidate.displayMetricDimension || '').trim().toLowerCase() ===
+      'comments'
+    ) {
+      candidate.displayMetricCount = count;
+      candidate.displayMetricKnown = evidence.known;
+      touched = true;
+    }
+    if (!touched) continue;
+    candidate.commentsCountKnown = evidence.known;
+    candidate.commentsCountSource = evidence.source;
+    patched = true;
+  }
+
+  if (!patched) {
+    parsed.comments = count;
+    parsed.commentsCountKnown = evidence.known;
+    parsed.commentsCountSource = evidence.source;
+  }
+  return JSON.stringify(parsed);
+}
+
+export function guardRecordCommentCount(record = {}, existing = {}) {
+  const decision = resolveGuardedCommentsCount(record, existing);
+  if (!decision.preserved || decision.reason === 'not_observed') {
+    return {...record, comments_count: decision.value};
+  }
+  const evidence = decision.existingEvidence;
+  return {
+    ...record,
+    comments_count: decision.value,
+    comments_count_known: evidence.known,
+    comments_count_source: evidence.source,
+    payload: patchPayloadCommentCount(
+      record.payload,
+      decision.value,
+      evidence,
+    ),
+  };
 }
 
 function meaningful(value) {
@@ -134,7 +298,7 @@ export async function upsertCapturedRecord(record, context) {
   const contentHash = buildContentHash(record, canonicalUrl);
   const tags = jsonText(record.tags, '[]');
   const imageUrls = jsonText(record.image_urls, '[]');
-  const payload = jsonText(record.payload, '{}');
+  let payload = jsonText(record.payload, '{}');
 
   const __result = await withTransaction(async tx => {
     let existing = null;
@@ -150,6 +314,9 @@ export async function upsertCapturedRecord(record, context) {
         [tenantId, record.platform, contentHash]
       );
     }
+
+    record = guardRecordCommentCount(record, existing || {});
+    payload = jsonText(record.payload, '{}');
 
     if (existing) {
       const changedFields = detectChangedFields(existing, { ...record, tags, image_urls: imageUrls, payload });

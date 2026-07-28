@@ -1923,6 +1923,7 @@ async function handleCaptureComments(request, sendResponse) {
         reportCaptureProgress(request, progress);
       },
       expectedNoteId: String(request.expectedNoteId || ""),
+      verifiedNoteId: String(request.verifiedNoteId || ""),
       onlyLevel1: Boolean(request.onlyLevel1),
       maxDetectedItems: request.maxDetectedItems ?? request.maxItems,
       maxDurationMs: request.maxDurationMs,

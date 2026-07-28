@@ -27,7 +27,7 @@ test("keeps ordinary author names intact", () => {
   assert.equal(pickDouyinAuthorName("我的", "可心"), "可心");
 });
 
-test("a conflicting detail-page brand account cannot overwrite the list author", () => {
+test("a verified detail-page author cannot be overwritten by a stale list author", () => {
   const syncInput = resolveSyncInputForRecord({
     id: "record-douyin-author-conflict",
     platform: "douyin",
@@ -39,7 +39,7 @@ test("a conflicting detail-page brand account cannot overwrite the list author",
         {
           noteId: "7591873004130191546",
           url: "https://www.douyin.com/video/7591873004130191546",
-          author: "白瀚白瀚",
+          author: "阿亮偏爱大凯迪",
           authorId: "list-author-id",
           authorUrl: "https://www.douyin.com/user/list-author",
         },
@@ -47,14 +47,47 @@ test("a conflicting detail-page brand account cannot overwrite the list author",
       detailPayload: {
         noteId: "7591873004130191546",
         url: "https://www.douyin.com/video/7591873004130191546",
-        author: "吉事桔香茶认证徽章商家认证账号",
-        authorId: "detail-brand-id",
-        authorUrl: "https://www.douyin.com/user/detail-brand",
+        author: "C",
+        authorId: "detail-author-id",
+        authorUrl: "https://www.douyin.com/user/detail-author",
       },
     },
   });
 
-  assert.equal(syncInput.payload.items[0].author, "白瀚白瀚");
+  assert.equal(syncInput.payload.items[0].author, "C");
+  assert.equal(syncInput.payload.items[0].authorId, "detail-author-id");
+  assert.equal(
+    syncInput.payload.items[0].authorUrl,
+    "https://www.douyin.com/user/detail-author",
+  );
+});
+
+test("an unbound detail author falls back to the list author as one identity tuple", () => {
+  const syncInput = resolveSyncInputForRecord({
+    id: "record-douyin-author-unbound",
+    platform: "douyin",
+    type: "keyword_notes",
+    payload: {
+      keyword: "安吉星",
+      detailCaptureStatus: "done",
+      items: [
+        {
+          noteId: "7591873004130191546",
+          url: "https://www.douyin.com/video/7591873004130191546",
+          author: "列表作者",
+          authorId: "list-author-id",
+          authorUrl: "https://www.douyin.com/user/list-author",
+        },
+      ],
+      detailPayload: {
+        author: "其他作品作者",
+        authorId: "other-author-id",
+        authorUrl: "https://www.douyin.com/user/other-author",
+      },
+    },
+  });
+
+  assert.equal(syncInput.payload.items[0].author, "列表作者");
   assert.equal(syncInput.payload.items[0].authorId, "list-author-id");
   assert.equal(
     syncInput.payload.items[0].authorUrl,

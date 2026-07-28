@@ -348,6 +348,7 @@ function buildCommentCaptureDiagnostics(captureContext) {
 export async function captureDouyinComments({
   onProgress = null,
   expectedNoteId = "",
+  verifiedNoteId = "",
   maxDetectedItems = null,
   maxItems = null,
   maxDurationMs = DEFAULT_CONFIG.MAX_CAPTURE_DURATION_MS,
@@ -395,7 +396,12 @@ export async function captureDouyinComments({
 
     const normalizedExpectedNoteId =
       normalizeDouyinCommentNoteId(expectedNoteId);
-    const noteId = resolveDouyinCommentNoteId(normalizedExpectedNoteId);
+    const normalizedVerifiedNoteId =
+      normalizeDouyinCommentNoteId(verifiedNoteId);
+    const noteId = await waitForDouyinCommentNoteId(
+      normalizedExpectedNoteId,
+      normalizedVerifiedNoteId,
+    );
     assertDouyinCommentTargetIdentity(
       normalizedExpectedNoteId,
       noteId,
@@ -416,9 +422,12 @@ export async function captureDouyinComments({
       // 严格正向判定"确证零评论"(全页 0 评论项 且 抖音自身空态标记 抢首评/暂无评论)才干净返回 0 条;
       // 不满足(=可能有评论只是这次没找到)仍抛错走重试,绝不把真有评论的吞成空。
       if (detectDouyinConfirmedEmptyComments()) {
-        const finalNoteId = resolveDouyinCommentNoteId(
-          normalizedExpectedNoteId,
-        );
+        const finalNoteId =
+          resolveDouyinCommentNoteId(normalizedExpectedNoteId) ||
+          resolveVerifiedDouyinCommentNoteId(
+            normalizedExpectedNoteId,
+            normalizedVerifiedNoteId,
+          );
         assertDouyinCommentTargetIdentity(
           normalizedExpectedNoteId,
           finalNoteId,
@@ -599,7 +608,12 @@ export async function captureDouyinComments({
       0,
       normalizedMaxDetectedItems,
     );
-    const finalNoteId = resolveDouyinCommentNoteId(normalizedExpectedNoteId);
+    const finalNoteId =
+      resolveDouyinCommentNoteId(normalizedExpectedNoteId) ||
+      resolveVerifiedDouyinCommentNoteId(
+        normalizedExpectedNoteId,
+        normalizedVerifiedNoteId,
+      );
     assertDouyinCommentTargetIdentity(
       normalizedExpectedNoteId,
       finalNoteId,
@@ -734,6 +748,12 @@ function readDouyinCommentNoteIdFromNode(node) {
 
 export function resolveDouyinCommentNoteId(expectedNoteId = "") {
   const expected = normalizeDouyinCommentNoteId(expectedNoteId);
+  // URL/modal_id is the strongest current-page signal. Douyin can leave the
+  // previous swiper slide mounted and visible while navigating to another
+  // work; trusting that stale DOM first can merge comments into the wrong work.
+  const routeNoteId = normalizeDouyinCommentNoteId(window.location.href);
+  if (routeNoteId) return routeNoteId;
+
   const activeSelectors = [
     ".swiper-slide-active[data-e2e-aweme-id]",
     ".swiper-slide-active [data-e2e-aweme-id]",
@@ -743,13 +763,20 @@ export function resolveDouyinCommentNoteId(expectedNoteId = "") {
     ".focusPanel .swiper-slide-active",
     '[class*="focusPanel"] .swiper-slide-active',
   ];
+  const activeNoteIds = new Set();
   for (const selector of activeSelectors) {
     const nodes = Array.from(document.querySelectorAll(selector));
     for (const node of nodes) {
       if (!isElementVisible(node)) continue;
       const noteId = readDouyinCommentNoteIdFromNode(node);
-      if (noteId) return noteId;
+      if (noteId) activeNoteIds.add(noteId);
     }
+  }
+  if (activeNoteIds.size === 1) {
+    return [...activeNoteIds][0];
+  }
+  if (activeNoteIds.size > 1) {
+    return "";
   }
 
   if (expected) {
@@ -769,9 +796,7 @@ export function resolveDouyinCommentNoteId(expectedNoteId = "") {
     }
   }
 
-  const routeNoteId = normalizeDouyinCommentNoteId(window.location.href);
-  if (routeNoteId) return routeNoteId;
-
+  const visibleNoteIds = new Set();
   for (const node of Array.from(
     document.querySelectorAll(
       "[data-e2e-aweme-id],[data-aweme-id],[data-awemeid],[data-item-id]",
@@ -779,9 +804,49 @@ export function resolveDouyinCommentNoteId(expectedNoteId = "") {
   )) {
     if (!isElementVisible(node)) continue;
     const noteId = readDouyinCommentNoteIdFromNode(node);
-    if (noteId) return noteId;
+    if (noteId) visibleNoteIds.add(noteId);
   }
-  return "";
+  return visibleNoteIds.size === 1 ? [...visibleNoteIds][0] : "";
+}
+
+export function resolveVerifiedDouyinCommentNoteId(
+  expectedNoteId = "",
+  verifiedNoteId = "",
+) {
+  const expected = normalizeDouyinCommentNoteId(expectedNoteId);
+  const verified = normalizeDouyinCommentNoteId(verifiedNoteId);
+  return expected && verified === expected ? expected : "";
+}
+
+async function waitForDouyinCommentNoteId(
+  expectedNoteId = "",
+  verifiedNoteId = "",
+  {timeoutMs = 1800} = {},
+) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  let actualNoteId = "";
+  let lastMismatchedNoteId = "";
+  const expected = normalizeDouyinCommentNoteId(expectedNoteId);
+  do {
+    actualNoteId = resolveDouyinCommentNoteId(expectedNoteId);
+    if (actualNoteId && (!expected || actualNoteId === expected)) {
+      return actualNoteId;
+    }
+    if (actualNoteId) {
+      lastMismatchedNoteId = actualNoteId;
+    }
+    if (Date.now() >= deadline) {
+      break;
+    }
+    await wait(120);
+  } while (true);
+
+  // 详情采集刚刚确认过目标作品时，抖音评论栏切换造成的瞬时 DOM/URL
+  // 空白不应误判失败；但只接受与目标完全一致的已验证 ID。
+  return (
+    lastMismatchedNoteId ||
+    resolveVerifiedDouyinCommentNoteId(expectedNoteId, verifiedNoteId)
+  );
 }
 
 export function assertDouyinCommentTargetIdentity(

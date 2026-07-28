@@ -509,6 +509,8 @@ router.post(
         autoSyncAfterDetailCapture: true,
         commentsMaxDetectedItems: normalized.filter.commentsLimit,
         skipAlreadyCapturedOnDetailCapture: false,
+        // 账号主页列表只用于发现候选作品，发布时间必须进入作品详情后核实。
+        verifyPublishDateFromDetail: true,
       };
       const monitorSettings = sanitizeCloudStructuredObject({
         publishWindow: 'custom',
