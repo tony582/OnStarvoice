@@ -321,3 +321,46 @@ test("Douyin comment readiness cannot pass from API cache without visible detail
       probeBlock.indexOf("if (result.targetMatched && result.detailReady)"),
   );
 });
+
+test("targeted Douyin preflight defers only detail loading to the existing capture wait chain", () => {
+  const helperStart = captureSyncSource.indexOf(
+    "async function probeDouyinDetailPreloadBeforeCapture",
+  );
+  const helperEnd = captureSyncSource.indexOf(
+    "/**\n * 批量链接采集",
+    helperStart,
+  );
+  const helperBlock = captureSyncSource.slice(helperStart, helperEnd);
+  assert.ok(helperStart >= 0);
+  assert.ok(helperEnd > helperStart);
+  assert.match(
+    helperBlock,
+    /String\(error\?\.code \|\| ""\)\.trim\(\)\.toUpperCase\(\) !==\s+"DOUYIN_DETAIL_NOT_READY"/u,
+  );
+  assert.match(helperBlock, /throw error;/u);
+  assert.match(helperBlock, /deferredToCapture: true/u);
+  assert.doesNotMatch(
+    helperBlock,
+    /DOUYIN_CONTENT_UNAVAILABLE|DOUYIN_DETAIL_ID_MISMATCH|PAGE_CHALLENGE_BLOCK|XHS_SECURITY_BLOCK/u,
+  );
+
+  const batchStart = captureSyncSource.indexOf(
+    "export async function batchCaptureByUrls({",
+  );
+  const batchEnd = captureSyncSource.indexOf(
+    "async function applySearchFiltersInTab",
+    batchStart,
+  );
+  const batchBlock = captureSyncSource.slice(batchStart, batchEnd);
+  const preflightIndex = batchBlock.indexOf(
+    "await probeDouyinDetailPreloadBeforeCapture(runnerTabId",
+  );
+  const captureIndex = batchBlock.indexOf(
+    "let captureResult = await captureInTab(runnerTabId",
+  );
+  assert.ok(preflightIndex >= 0);
+  assert.ok(
+    captureIndex > preflightIndex,
+    "a slow-but-correct detail must continue into single-note capture",
+  );
+});

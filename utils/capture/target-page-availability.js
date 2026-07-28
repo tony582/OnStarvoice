@@ -25,11 +25,57 @@
 
   function classifySnapshot(snapshot = {}) {
     const platform = normalizePlatform(snapshot.platform);
-    if (platform !== "xiaohongshu") return null;
-
     const bodyText = text(snapshot.bodyText);
     const title = text(snapshot.title, 500);
     const combined = `${title} ${bodyText}`;
+
+    if (platform === "douyin") {
+      const directUnavailableCopy =
+        /你要观看的(?:图文|视频|作品|内容)不存在/u.test(combined);
+      const directDeletedCopy =
+        /(?:图文|视频|作品|内容)(?:已被作者)?(?:删除|下架)|该作品不可用/u.test(
+          combined,
+        );
+      const autoPlayOrExitAction =
+        /接下来播放|去精选页查看更多(?:视频|内容)|返回精选/u.test(combined);
+      const exactUnavailableCopy =
+        /^你要观看的(?:图文|视频|作品|内容)不存在[。！？]?$/u.test(
+          bodyText,
+        );
+      const highConfidenceUnavailable =
+        directUnavailableCopy &&
+        (exactUnavailableCopy || autoPlayOrExitAction);
+      const highConfidenceDeleted =
+        directDeletedCopy &&
+        autoPlayOrExitAction;
+
+      if (!highConfidenceUnavailable && !highConfidenceDeleted) {
+        return null;
+      }
+
+      return {
+        detected: true,
+        unavailable: true,
+        code: UNAVAILABLE_CODE,
+        businessOutcome: UNAVAILABLE_OUTCOME,
+        status: "unavailable",
+        availabilityStatus: "deleted",
+        reason: UNAVAILABLE_REASON,
+        message: "平台提示该帖子已删除",
+        retryable: false,
+        platform,
+        url: text(snapshot.url, 3000),
+        evidence: [
+          directUnavailableCopy
+            ? "douyin_target_not_found"
+            : "douyin_deleted_copy",
+          ...(autoPlayOrExitAction ? ["douyin_autoplay_countdown"] : []),
+        ],
+      };
+    }
+
+    if (platform !== "xiaohongshu") return null;
+
     const evidence = [];
     const bodyLength = bodyText.length;
     const shortErrorPage = bodyLength > 0 && bodyLength <= 1200;

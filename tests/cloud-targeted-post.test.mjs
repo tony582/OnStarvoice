@@ -113,6 +113,76 @@ test("blocks cloud success when captured record identity differs", () => {
   assert.equal(result.error.code, "TARGET_IDENTITY_MISMATCH");
 });
 
+test("accepts a v2 local record with the requested platform identity", () => {
+  const result = targeted.buildTargetResult({
+    target: {
+      itemId: "copied-tenant-item",
+      recordId: "server-record-from-tenant-copy",
+      externalId: "7663121602599925435",
+      ordinal: 1,
+    },
+    batchResult: {
+      results: [{
+        ok: true,
+        recordIds: ["rec_single_note_device_local"],
+        commentsResult: {
+          phase: "comments_completed",
+          currentObservedCount: 16,
+          currentObservedItems: [],
+        },
+      }],
+    },
+    records: [{
+      id: "rec_single_note_device_local",
+      recordType: "single_note",
+      platform: "douyin",
+      payload: {
+        noteId: "7663121602599925435",
+        url: "https://www.douyin.com/video/7663121602599925435",
+        comments: 60,
+        commentsCountKnown: true,
+      },
+      normalizedPayload: {
+        noteId: "7663121602599925435",
+        url: "https://www.douyin.com/video/7663121602599925435",
+      },
+    }],
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.recordId, "server-record-from-tenant-copy");
+  assert.equal(result.capturedExternalId, "7663121602599925435");
+  assert.deepEqual(plain(result.recordIds), ["rec_single_note_device_local"]);
+});
+
+test("still blocks a different platform work inside a v2 record", () => {
+  const result = targeted.buildTargetResult({
+    target: {
+      itemId: "item-v2-mismatch",
+      recordId: "server-record-2",
+      externalId: "7663121602599925435",
+      ordinal: 1,
+    },
+    batchResult: {
+      results: [{ok: true, recordIds: ["rec_single_note_wrong"]}],
+    },
+    records: [{
+      id: "rec_single_note_wrong",
+      platform: "douyin",
+      payload: {
+        noteId: "7661920299776470898",
+        url: "https://www.douyin.com/video/7661920299776470898",
+      },
+    }],
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.error.code, "TARGET_IDENTITY_MISMATCH");
+  assert.deepEqual(plain(result.capturedExternalIds), [
+    "7661920299776470898",
+  ]);
+});
+
 test("builds resumable item results and checkpoint in target order", () => {
   const targets = [
     {itemId: "item-1", recordId: "record-1", externalId: "note-1", ordinal: 1},
@@ -346,6 +416,49 @@ test("normalizes creator and official profile discovery as resumable account tar
   assert.equal(official.subjectType, "official");
   assert.equal(official.targets[0].platform, "douyin");
   assert.equal(official.targets[0].url, "https://www.douyin.com/user/MS4wLjABAAAA-demo");
+
+  const officialComments = targeted.normalizeCommandPayload({
+    protocolVersion: 1,
+    workflow: "official_account_comment_patrol",
+    targetMode: "profile",
+    taskId: "official-comments-profile-1",
+    platform: "douyin",
+    monitorSettings: {
+      publishWindow: "custom",
+      publishDateFrom: "2026-07-21",
+      publishDateTo: "2026-07-28",
+      postsLimit: 5,
+    },
+    captureSettings: {
+      includeComments: true,
+      includeCommentsOnDetailCapture: true,
+      autoSyncAfterDetailCapture: true,
+      commentsMaxDetectedItems: 30,
+    },
+    targets: [{
+      itemId: "77777777-7777-4777-8777-777777777777",
+      recordId: "88888888-8888-4888-8888-888888888888",
+      subscriptionId: "88888888-8888-4888-8888-888888888888",
+      executionId: "99999999-9999-4999-8999-999999999999",
+      platform: "douyin",
+      url: "https://www.douyin.com/user/MS4wLjABAAAA-comments?aid=drop",
+    }],
+  });
+  assert.equal(officialComments.workflow, "official_account_comment_patrol");
+  assert.equal(officialComments.targetMode, "profile");
+  assert.equal(officialComments.subjectType, "official");
+  assert.equal(officialComments.targets[0].routeKind, "profile");
+  assert.equal(
+    officialComments.targets[0].url,
+    "https://www.douyin.com/user/MS4wLjABAAAA-comments",
+  );
+  assert.deepEqual(plain(officialComments.monitorSettings), {
+    publishWindow: "custom",
+    publishDateFrom: "2026-07-21",
+    publishDateTo: "2026-07-28",
+    postsLimit: 5,
+  });
+  assert.equal(officialComments.captureSettings.includeComments, true);
 });
 
 test("profile discovery rejects post URLs and missing monitor execution identity", () => {

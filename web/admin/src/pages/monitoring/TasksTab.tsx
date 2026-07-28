@@ -72,7 +72,7 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
 
   const markOfficial = async (subscription: CreatorSubscription) => {
     const name = String(subscription?.name || subscription?.bloggerName || '当前账号').trim()
-    if (!window.confirm(`将“${name}”转为官方账号？确认后将进入独立的官方账号作品发现与评论巡查流程；原关注博主计划会暂停，历史扫描记录继续保留。`)) return
+    if (!window.confirm(`将“${name}”转为官方账号？确认后将进入独立的官方账号主页增强与评论巡查流程；原关注博主计划会暂停，历史扫描记录继续保留。`)) return
     setPromotingId(subscription.id)
     setActionError('')
     setFeedback('')

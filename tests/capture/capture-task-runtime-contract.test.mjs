@@ -216,7 +216,7 @@ test("Douyin detail enhancement stays on one worker and delays unavailable failu
   );
   assert.match(
     captureSyncSource,
-    /你要观看的\(\?:视频\|作品\|内容\)不存在/u,
+    /你要观看的\(\?:图文\|视频\|作品\|内容\)不存在/u,
   );
   assert.match(captureSyncSource, /DOUYIN_CONTENT_UNAVAILABLE/u);
   assert.match(captureSyncSource, /DOUYIN_UNAVAILABLE_GRACE_MS = 4500/u);

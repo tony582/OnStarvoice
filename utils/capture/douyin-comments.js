@@ -81,6 +81,7 @@ const DETAIL_TAB_LABELS = Object.freeze([
   "TA的作品",
   "评论",
   "问AI",
+  "AI抖音",
   "相关推荐",
 ]);
 
@@ -1332,7 +1333,8 @@ function findVisibleCommentContainer({
 function findCommentButton() {
   const nodes = queryVisibleElements(COMMENT_BUTTON_SELECTORS)
     .map(resolveActionableCommentNode)
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter(isVerifiedCommentTriggerCandidate);
   const deduped = Array.from(new Set(nodes));
   const ranked = deduped
     .filter((node) => {
@@ -1467,6 +1469,7 @@ function findStrictCommentIconTrigger() {
         if (
           node instanceof Element &&
           isElementVisible(node) &&
+          isVerifiedCommentTriggerCandidate(node) &&
           isLikelyRightRailActionTarget(node, {maxWidth: 180, maxHeight: 180})
         ) {
           return node;
@@ -1541,7 +1544,8 @@ function findCommentIconByActionBarPosition() {
     });
     if (commentAttrMatch) return commentAttrMatch.node;
 
-    if (cluster.length >= 2) return cluster[1].node;
+    // 抖音右侧操作栏会动态插入“AI抖音”等入口，不能再按“第几个按钮”
+    // 猜测评论入口；没有评论语义或已知图标签名时宁可不点，避免误入 AI 面板。
   }
 
   return null;
@@ -1618,6 +1622,9 @@ function findInteractionBarCommentTrigger() {
           if (!isLikelyRightRailActionTarget(actionable, {maxWidth: 240, maxHeight: 320})) {
             return;
           }
+          if (!isVerifiedCommentTriggerCandidate(actionable)) {
+            return;
+          }
           candidates.push(actionable);
         });
       } catch {}
@@ -1633,6 +1640,33 @@ function findInteractionBarCommentTrigger() {
     .sort((left, right) => right.score - left.score);
 
   return ranked[0]?.node || null;
+}
+
+function isVerifiedCommentTriggerCandidate(node) {
+  if (!(node instanceof Element) || !isElementVisible(node)) {
+    return false;
+  }
+
+  const text = cleanText(node.textContent || "");
+  if (/^(?:AI|AI抖音|问AI)$/iu.test(text)) {
+    return false;
+  }
+
+  const attrs = [
+    node.getAttribute?.("data-e2e") || "",
+    node.getAttribute?.("aria-label") || "",
+    node.getAttribute?.("title") || "",
+    typeof node.className === "string" ? node.className : "",
+  ].join(" ");
+  const hasCommentPath = Boolean(
+    node.matches?.(`svg path[d*="${COMMENT_ICON_PATH_SIGNATURE}"]`) ||
+      node.querySelector?.(`svg path[d*="${COMMENT_ICON_PATH_SIGNATURE}"]`),
+  );
+  return (
+    /feed-comment-icon|comment-icon|player-comment/i.test(attrs) ||
+    hasCommentPath ||
+    looksLikeCommentHotzone(node)
+  );
 }
 
 function findCurrentDouyinWorkRoot() {
@@ -1984,7 +2018,7 @@ function findCommentsTabTrigger() {
     .filter(isElementVisible)
     .filter((node) => {
       const text = cleanText(node.textContent || "");
-      return hasDouyinCommentsTabLabel([text], "评论");
+      return isExactDouyinCommentsTabLabel(text, "评论");
     });
 
   const actionable = Array.from(
@@ -2033,53 +2067,58 @@ function hasTabbedContentFlowForComments() {
   return false;
 }
 
-function normalizeDouyinCommentsTabText(text) {
+export function normalizeDouyinCommentsTabText(text) {
   return cleanText(text || "")
     .replace(/[（(][^()（）]*[)）]/g, "")
+    .replace(/(?:[:：]?\s*\d+(?:\.\d+)?[万wWkK]?)$/u, "")
     .replace(/\s+/g, "");
 }
 
-function hasDouyinCommentsTabLabel(texts = [], label = "") {
+export function isExactDouyinCommentsTabLabel(text = "", label = "") {
   const target = normalizeDouyinCommentsTabText(label);
   if (!target) return false;
+  return normalizeDouyinCommentsTabText(text) === target;
+}
+
+export function hasDouyinCommentsTabLabel(texts = [], label = "") {
   return texts.some((text) => {
-    const normalized = normalizeDouyinCommentsTabText(text);
-    if (!normalized) return false;
-    return normalized === target || normalized.includes(target);
+    return isExactDouyinCommentsTabLabel(text, label);
   });
 }
 
 function resolveActionableTabNode(node) {
-  if (!node) return null;
+  if (!(node instanceof Element) || !isElementVisible(node)) return null;
 
-  const semanticClickable =
-    node.closest?.('[role="tab"], [role="button"], button, a') || null;
-  if (semanticClickable && isElementVisible(semanticClickable)) {
-    return semanticClickable;
-  }
-
-  let current = node instanceof Element ? node : null;
-  for (let depth = 0; current && depth < 4; depth += 1) {
+  let exactFallback = null;
+  let current = node;
+  for (let depth = 0; current && depth < 5; depth += 1) {
     if (!isElementVisible(current)) {
       current = current.parentElement;
       continue;
     }
 
-    const siblingTabCount = countKnownTabLabelsAround(current);
-    const normalizedText = normalizeDouyinCommentsTabText(
-      cleanText(current.textContent || ""),
-    );
+    const nodeText = cleanText(current.textContent || "");
+    if (!isExactDouyinCommentsTabLabel(nodeText, "评论")) {
+      current = current.parentElement;
+      continue;
+    }
+
+    exactFallback ||= current;
     if (
-      siblingTabCount >= 2 &&
-      (normalizedText === "评论" || normalizedText === "TA的作品")
+      current.matches?.('[role="tab"], [role="button"], button, a')
     ) {
+      return current;
+    }
+
+    const siblingTabCount = countKnownTabLabelsAround(current);
+    if (siblingTabCount >= 2) {
       return current;
     }
 
     current = current.parentElement;
   }
 
-  return node instanceof Element && isElementVisible(node) ? node : null;
+  return exactFallback;
 }
 
 function resolveActionableCommentNode(node) {
@@ -2318,6 +2357,11 @@ function scoreCommentsTabCandidate(node) {
   const normalizedText = normalizeDouyinCommentsTabText(
     cleanText(node.textContent || ""),
   );
+  // 只允许“评论”自身成为点击目标。禁止把同时包含“评论 / AI抖音 /
+  // 相关推荐”等文本的整组标签栏当成候选，避免点击落到相邻 AI 标签。
+  if (normalizedText !== "评论") {
+    return 0;
+  }
   let score = 1;
   const knownSiblingCount = countKnownTabLabelsAround(node);
   const attributes = [
@@ -2349,11 +2393,7 @@ function scoreCommentsTabCandidate(node) {
   if (node.closest?.('[role="tablist"]')) {
     score += 10;
   }
-  if (normalizedText === "评论") {
-    score += 12;
-  } else if (normalizedText.includes("评论")) {
-    score += 6;
-  }
+  score += 12;
   if (looksLikeCommentCountTab) {
     score += 12;
   }

@@ -361,6 +361,7 @@ function createHarness() {
       `  recoverUnattendedKeywordRunRequest,\n` +
       `  manuallyRecoverUnattendedKeywordRun,\n` +
       `  reportTargetedPostTerminalToCloud,\n` +
+      `  persistTargetedPostRunRequest,\n` +
       `  executeCloudTaskAgentCommand,\n` +
       `  syncCloudTaskAgent,\n` +
       `  superviseUnattendedKeywordRun,\n` +
@@ -1511,6 +1512,20 @@ test("a terminal targeted-post update reports its cloud command before the messa
       .availabilityStatus,
     "deleted",
   );
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === "targeted-terminal-request",
+  );
+  assert.equal(ledgerRun.status, "completed");
+  assert.equal(ledgerRun.taskType, "negative_post_patrol");
+  assert.equal(ledgerRun.counts.total, 1);
+  assert.equal(ledgerRun.counts.processed, 1);
+  assert.equal(ledgerRun.counts.skipped, 1);
+  assert.equal(ledgerRun.metadata.workflow, "negative_post_patrol");
+  assert.equal(
+    ledgerRun.metadata.cloudCommandId,
+    "targeted-terminal-command",
+  );
+  assert.equal(Object.hasOwn(ledgerRun.metadata, "targetResults"), false);
 });
 
 test("a cloud create command starts exactly one local task without replacing the saved plan", async () => {
@@ -5535,6 +5550,89 @@ test("clearing task center removes history but preserves a recently active task"
   assert.equal(Boolean(harness.storage[TASK_LEDGER_KEY].clearedAt), true);
   assert.deepEqual(Array.from(harness.storage[SYNC_HISTORY_KEY].entries), []);
   assert.equal(harness.storage[UNATTENDED_ARCHIVE_KEY], undefined);
+});
+
+test("a fresh targeted request keeps its same-id task-center record active", async () => {
+  const harness = createHarness();
+  const oldAt = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  const nowIso = new Date().toISOString();
+  harness.storage[TARGETED_POST_REQUEST_KEY] = {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    workflow: "negative_post_patrol",
+    id: "active-targeted-request",
+    taskId: "active-targeted-task",
+    attemptId: "active-targeted-attempt",
+    status: "running",
+    createdAt: oldAt,
+    updatedAt: nowIso,
+    heartbeatAt: nowIso,
+  };
+
+  const readResponse = await harness.sendBackgroundMessage({
+    type: "onstarvoice:get-task-ledger",
+  });
+  assert.equal(readResponse.ok, true);
+  assert.equal(readResponse.data.runs[0].status, "running");
+  assert.equal(readResponse.data.runs[0].id, "active-targeted-request");
+  assert.equal(
+    readResponse.data.runs[0].metadata.workflow,
+    "negative_post_patrol",
+  );
+
+  const clearResponse = await harness.sendBackgroundMessage({
+    type: "onstarvoice:clear-task-center",
+  });
+  assert.equal(clearResponse.ok, true);
+  assert.equal(clearResponse.data.preservedActiveCount, 1);
+  assert.equal(clearResponse.data.clearedTargetedRequest, false);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].id,
+    "active-targeted-request",
+  );
+  assert.deepEqual(
+    Array.from(harness.storage[TASK_LEDGER_KEY].runs, (run) => run.id),
+    ["active-targeted-request"],
+  );
+});
+
+test("clearing task center removes a stale targeted request and its ledger row", async () => {
+  const harness = createHarness();
+  const oldAt = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  harness.storage[TARGETED_POST_REQUEST_KEY] = {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    workflow: "negative_post_patrol",
+    id: "stale-targeted-request",
+    taskId: "stale-targeted-task",
+    attemptId: "stale-targeted-attempt",
+    status: "running",
+    createdAt: oldAt,
+    updatedAt: oldAt,
+    heartbeatAt: oldAt,
+  };
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [
+      {
+        id: "stale-targeted-request",
+        taskType: "negative_post_patrol",
+        status: "running",
+        createdAt: oldAt,
+        updatedAt: oldAt,
+        businessProgressAt: oldAt,
+      },
+    ],
+  };
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:clear-task-center",
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.clearedTargetedRequest, true);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY], undefined);
+  assert.deepEqual(Array.from(harness.storage[TASK_LEDGER_KEY].runs), []);
 });
 
 test("clearing task center removes a stale unattended request and its legacy plan mirror", async () => {

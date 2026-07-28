@@ -787,6 +787,7 @@ async function handleCaptureSingleNote(request, sendResponse) {
     resetCancelFlag();
 
     const result = await captureSingleNote({
+      expectedNoteId: String(request.expectedNoteId || ""),
       includeBloggerMetrics: Boolean(request.includeBloggerMetrics),
       preferWorksTabForBloggerMetrics: Boolean(
         request.preferWorksTabForBloggerMetrics,
@@ -799,7 +800,10 @@ async function handleCaptureSingleNote(request, sendResponse) {
       ok: false,
       type: "single_note",
       data: null,
-      error: {code: "CAPTURE_FAILED", message: error.message},
+      error: {
+        code: String(error?.code || "CAPTURE_FAILED"),
+        message: error.message,
+      },
     });
   }
 }

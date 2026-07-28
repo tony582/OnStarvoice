@@ -145,6 +145,53 @@ test("heartbeat reports targeted post item results and resumable checkpoint", ()
   );
 });
 
+test("the live targeted request replaces a same-id compact ledger snapshot", () => {
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-targeted-reconcile"},
+    ledger: {
+      runs: [{
+        id: "targeted-request-same-id",
+        taskType: "negative_post_patrol",
+        status: "running",
+        checkpoint: {processedCount: 0, total: 2},
+        metadata: {workflow: "negative_post_patrol"},
+      }],
+    },
+    targetedPostRequest: {
+      id: "targeted-request-same-id",
+      taskId: "targeted-task-same-id",
+      attemptId: "targeted-attempt-same-id",
+      workflow: "negative_post_patrol",
+      protocolVersion: 1,
+      platform: "douyin",
+      status: "running",
+      checkpoint: {
+        nextOrdinal: 2,
+        processedCount: 1,
+        completedItemIds: ["item-live-1"],
+        total: 2,
+      },
+      targetResults: [{
+        itemId: "item-live-1",
+        recordId: "record-live-1",
+        externalId: "live-1",
+        status: "completed",
+      }],
+    },
+  });
+
+  const matchingTasks = payload.tasks.filter(
+    (task) => task.id === "targeted-request-same-id",
+  );
+  assert.equal(matchingTasks.length, 1);
+  assert.equal(matchingTasks[0].targetResults[0].itemId, "item-live-1");
+  assert.equal(matchingTasks[0].checkpoint.processedCount, 1);
+  assert.deepEqual(
+    plain(matchingTasks[0].checkpoint.completedItemIds),
+    ["item-live-1"],
+  );
+});
+
 test("heartbeat preserves the official-account comment patrol workflow and capability", () => {
   const payload = agent.buildHeartbeatPayload({
     runtime: {clientUuid: "profile-official-comments"},
@@ -168,6 +215,10 @@ test("heartbeat preserves the official-account comment patrol workflow and capab
 
   assert.equal(payload.agent.capabilities.negativePostPatrol, true);
   assert.equal(payload.agent.capabilities.officialAccountCommentPatrol, true);
+  assert.equal(
+    payload.agent.capabilities.officialAccountCommentPatrolProfileV1,
+    true,
+  );
   assert.equal(payload.tasks[0].taskType, "official_account_comment_patrol");
   assert.equal(payload.tasks[0].workflow, "official_account_comment_patrol");
   assert.equal(payload.tasks[0].targetResults[0].workflow, "official_account_comment_patrol");

@@ -60,8 +60,6 @@ export function DispatchPage() {
         }
       : params?.create === 'creator_patrol'
         ? { taskType: 'creator_patrol', subscriptionId: String(params?.subscriptionId || '') || undefined }
-        : params?.create === 'official_discovery'
-          ? { taskType: 'official_discovery', subscriptionId: String(params?.subscriptionId || '') || undefined }
         : null,
   )
   const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)

@@ -30,7 +30,6 @@ type PatrolPost = {
 
 type PatrolAccount = {
   id: string
-  monitorSubscriptionId?: string
   accountName?: string
   name?: string
   platform: string
@@ -144,10 +143,6 @@ export function OfficialCommentPatrolTab() {
     create: 'comment_patrol',
     ...(officialAccountId ? { officialAccountId } : {}),
   })
-  const createDiscoveryTask = (subscriptionId = '') => navigate('dispatch', {
-    create: 'official_discovery',
-    ...(subscriptionId ? { subscriptionId } : {}),
-  })
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
@@ -155,14 +150,11 @@ export function OfficialCommentPatrolTab() {
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2"><MessageCircle className="h-4 w-4 text-primary" /><h2 className="text-base font-bold">官方账号评论巡查</h2></div>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">查看已发现的近期作品和最近一次巡查结果；任务创建、分配与重试统一在调度中心完成。</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">从官方账号主页读取指定时间内的作品与评论；任务创建、分配与重试统一在调度中心完成。</p>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
             <Button variant="outline" size="sm" className="min-h-10" onClick={() => setRegistrationOpen(true)}>
               <UserRoundPlus className="h-4 w-4" />登记官方账号
-            </Button>
-            <Button variant="outline" size="sm" className="min-h-10" onClick={() => createDiscoveryTask()}>
-              <RefreshCw className="h-4 w-4" />发现近期作品
             </Button>
             <Button size="sm" className="min-h-10" onClick={() => createTask()}><MessageCircle className="h-4 w-4" />创建评论巡查</Button>
           </div>
@@ -180,10 +172,10 @@ export function OfficialCommentPatrolTab() {
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
       ) : accounts.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-border bg-card">
-          <EmptyState icon={ShieldCheck} title="暂无可巡查官方账号" description="打开官方账号主页，在 Extension 里选择“登记为官方账号”；也可以把已有关注账号直接转换。登记后先发现近期作品，再按发布时间创建评论巡查。" />
+          <EmptyState icon={ShieldCheck} title="暂无可巡查官方账号" description="打开官方账号主页，在 Extension 里选择“登记为官方账号”；也可以把已有关注账号直接转换。登记后即可按发布时间创建账号主页评论巡查。" />
           <div className="flex flex-wrap justify-center gap-2 border-t border-border/70 px-4 py-4">
             <Button variant="outline" size="sm" onClick={() => setRegistrationOpen(true)}>从关注列表登记</Button>
-            <Button size="sm" onClick={() => createDiscoveryTask()}>创建作品发现任务</Button>
+            <Button size="sm" onClick={() => createTask()}>创建评论巡查</Button>
           </div>
         </div>
       ) : (
@@ -201,28 +193,19 @@ export function OfficialCommentPatrolTab() {
                     <p className="mt-1 text-xs text-muted-foreground">最近巡查 {formatDate(lastPatrol(account)) || '—'} · 近 7 天可巡查作品 {formatNumber(Math.max(posts.length, safeNumber(account.recentPostCount)))}</p>
                   </div>
                   <div className="flex shrink-0 flex-wrap gap-2">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={!account.monitorSubscriptionId}
-                      title={account.monitorSubscriptionId ? '为这个官方账号发现近期作品' : '请先补全官方账号主页并保存'}
-                      onClick={() => createDiscoveryTask(account.monitorSubscriptionId)}
-                    >
-                      更新作品
-                    </Button>
                     <Button variant="outline" size="sm" onClick={() => createTask(account.id)}>巡查评论 <ChevronRight className="h-3.5 w-3.5" /></Button>
                   </div>
                 </div>
 
                 {posts.length === 0 ? (
-                  <div className="flex items-start gap-3 px-4 py-5 text-xs leading-5 text-muted-foreground sm:px-5"><CalendarDays className="mt-0.5 h-4 w-4 shrink-0" /><span>近 7 天没有已发现且带发布时间的作品。账号发现完成后，会自动在这里显示为可巡查对象。</span></div>
+                  <div className="flex items-start gap-3 px-4 py-5 text-xs leading-5 text-muted-foreground sm:px-5"><CalendarDays className="mt-0.5 h-4 w-4 shrink-0" /><span>尚无近期巡查结果。创建任务后，Agent 会从官方账号主页读取指定日期范围内的作品与评论。</span></div>
                 ) : (
                   <>
                     <div className="space-y-0 lg:hidden">
                       {posts.slice(0, 6).map(post => <PostMobileRow key={post.id} post={post} />)}
                     </div>
                     <div className="hidden lg:block"><WorkbenchTableShell><table className="w-full min-w-[760px] text-sm"><thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-left [&>th]:text-[11px] [&>th]:font-medium [&>th]:text-muted-foreground"><th>作品</th><th>发布时间</th><th>评论摘要</th><th>最近巡查</th><th>状态</th></tr></thead><tbody className="divide-y divide-border/40">{posts.slice(0, 20).map(post => <PostTableRow key={post.id} post={post} />)}</tbody></table></WorkbenchTableShell></div>
-                    {posts.length > 6 && <div className="border-t border-border/70 px-4 py-3 text-xs text-muted-foreground sm:px-5">当前展示前 {posts.length > 20 ? 20 : posts.length} 篇；创建任务时可预览并选择完整候选范围。</div>}
+                    {posts.length > 6 && <div className="border-t border-border/70 px-4 py-3 text-xs text-muted-foreground sm:px-5">当前展示最近 {posts.length > 20 ? 20 : posts.length} 篇巡查结果。</div>}
                   </>
                 )}
               </section>

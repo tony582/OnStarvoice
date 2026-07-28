@@ -11607,8 +11607,24 @@ async function probeDetailPreloadSafety(
             .trim()
             .slice(0, 12000);
           const currentUrl = String(location.href || '');
+          const douyinUnavailableCopy =
+            /你要观看的(?:图文|视频|作品|内容)不存在/u.test(
+              `${title} ${bodyText}`,
+            );
+          const douyinUnavailableAction =
+            /接下来播放|去精选页查看更多(?:视频|内容)|返回精选/u.test(
+              bodyText,
+            );
+          const douyinExactUnavailableCopy =
+            /^你要观看的(?:图文|视频|作品|内容)不存在[。！？]?$/u.test(
+              bodyText,
+            );
+          const douyinImmediateUnavailable =
+            douyinUnavailableCopy &&
+            (douyinUnavailableAction || douyinExactUnavailableCopy);
           const douyinUnavailable =
-            /你要观看的(?:视频|作品|内容)不存在|(?:视频|作品)不存在|该作品已删除|内容已下架/u.test(
+            douyinImmediateUnavailable ||
+            /(?:图文|视频|作品|内容)不存在|该作品已删除|内容已下架/u.test(
               `${title} ${bodyText}`,
             );
           const xhsBlocked =
@@ -11824,6 +11840,7 @@ async function probeDetailPreloadSafety(
             isSearchModalContext,
             blocked: xhsBlocked || challengeBlocked,
             unavailable: douyinUnavailable,
+            immediateUnavailable: douyinImmediateUnavailable,
             code: xhsBlocked
               ? 'XHS_SECURITY_BLOCK'
               : challengeBlocked
@@ -11850,6 +11867,14 @@ async function probeDetailPreloadSafety(
       // “作品不存在”页仍会渲染推荐作品、作者和互动控件；这些 DOM 信号
       // 不能反过来证明目标作品已就绪。先处理不可用态，再允许 ready 返回。
       if (result.unavailable) {
+        if (result.immediateUnavailable) {
+          const error = new Error(
+            '抖音提示目标帖子已删除或不存在',
+          );
+          error.code = 'DOUYIN_CONTENT_UNAVAILABLE';
+          error.currentUrl = result.currentUrl || '';
+          throw error;
+        }
         if (!unavailableSince) unavailableSince = Date.now();
         if (Date.now() - unavailableSince >= DOUYIN_UNAVAILABLE_GRACE_MS) {
           const error = new Error(
@@ -13111,6 +13136,88 @@ async function runBatchSingleNoteEnhancements(
   };
 }
 
+async function classifyTargetPageAvailabilityInTab(tabId, targetUrl) {
+  if (!targetPageAvailabilityApi?.classifySnapshot) {
+    return null;
+  }
+  try {
+    const [snapshotExecution] = await chrome.scripting.executeScript({
+      target: {tabId: Number(tabId)},
+      func: () => ({
+        url: String(window.location.href || ""),
+        title: String(document.title || ""),
+        bodyText: String(document.body?.innerText || "").slice(0, 20000),
+      }),
+    });
+    return (
+      targetPageAvailabilityApi.classifySnapshot({
+        ...(snapshotExecution?.result || {}),
+        platform: detectPlatformFromUrl(targetUrl),
+        url: targetUrl,
+      }) || null
+    );
+  } catch (error) {
+    console.warn(
+      "[CaptureSync] target page availability probe failed:",
+      error,
+    );
+    return null;
+  }
+}
+
+function buildUnavailableBatchCaptureResult(url, unavailablePage = null) {
+  const observedAt = new Date().toISOString();
+  return {
+    url,
+    ok: true,
+    captured: false,
+    recordIds: [],
+    unavailable: true,
+    businessOutcome:
+      unavailablePage?.businessOutcome || "post_unavailable",
+    availabilityStatus:
+      unavailablePage?.availabilityStatus || "deleted",
+    retryable: false,
+    availability: {
+      status: unavailablePage?.status || "unavailable",
+      availabilityStatus:
+        unavailablePage?.availabilityStatus || "deleted",
+      reason:
+        unavailablePage?.reason || "post_deleted_or_unavailable",
+      code:
+        unavailablePage?.code || "TARGET_POST_UNAVAILABLE",
+      message:
+        unavailablePage?.message || "平台提示该帖子已删除",
+      evidence: Array.isArray(unavailablePage?.evidence)
+        ? unavailablePage.evidence
+        : [],
+      observedAt,
+    },
+  };
+}
+
+async function probeDouyinDetailPreloadBeforeCapture(tabId, options = {}) {
+  try {
+    return await probeDetailPreloadSafety(tabId, options);
+  } catch (error) {
+    if (
+      String(error?.code || "").trim().toUpperCase() !==
+      "DOUYIN_DETAIL_NOT_READY"
+    ) {
+      throw error;
+    }
+    // 这里只放行“目标详情仍在加载”。真正的单帖采集内部还有更完整的
+    // API/DOM 等待与身份校验链；删帖、安全验证、身份不匹配及未知错误
+    // 都不能在这里降级，否则会把错误作品写回云端。
+    return {
+      ok: false,
+      deferredToCapture: true,
+      code: "DOUYIN_DETAIL_NOT_READY",
+      currentUrl: String(error?.currentUrl || ""),
+    };
+  }
+}
+
 /**
  * 批量链接采集 — 在 runner tab 中逐个导航到 URL 并采集
  *
@@ -13180,24 +13287,14 @@ export async function batchCaptureByUrls({
         throw new Error("链接格式错误");
       }
 
-      // 导航
-      await chrome.tabs.update(runnerTabId, { url });
-
-      // 等待导航完成
-      let navStartedAt = Date.now();
-      let loaded = false;
-      while (Date.now() - navStartedAt < BATCH_KEYWORD_NAV_TIMEOUT_MS) {
-        if (typeof shouldStop === "function" && shouldStop()) {
-          throw new Error("BATCH_CAPTURE_CANCELED");
-        }
-        let tab = await chrome.tabs.get(runnerTabId);
-        if (String(tab?.status || "") === "complete") {
-          loaded = true;
-          break;
-        }
-        await waitMs(BATCH_KEYWORD_NAV_POLL_MS);
-      }
-      if (!loaded) throw new Error("导航超时");
+      // 定向作品连续采集不能只看 tab.status。抖音是单页应用，切换 modal_id
+      // 时标签页可能仍显示 complete，但详情 DOM 还是上一条作品。必须等地址中的
+      // 作品 ID 已切到当前目标后，才允许进入采集，避免整批结果串到前一条。
+      await openUrlInTab(runnerTabId, url, {
+        timeoutMs: DETAIL_CAPTURE_NAV_TIMEOUT_MS,
+        shouldStop,
+        active: true,
+      });
 
       // 等待页面渲染
       await waitMsWithStop(
@@ -13211,49 +13308,12 @@ export async function batchCaptureByUrls({
         captureParams.detectUnavailableTargetPage === true &&
         targetPageAvailabilityApi?.classifySnapshot
       ) {
-        let unavailablePage = null;
-        try {
-          const [snapshotExecution] = await chrome.scripting.executeScript({
-            target: {tabId: runnerTabId},
-            func: () => ({
-              url: String(window.location.href || ""),
-              title: String(document.title || ""),
-              bodyText: String(document.body?.innerText || "").slice(0, 20000),
-            }),
-          });
-          unavailablePage =
-            targetPageAvailabilityApi.classifySnapshot({
-              ...(snapshotExecution?.result || {}),
-              platform: detectPlatformFromUrl(url),
-              url,
-            }) || null;
-        } catch (error) {
-          console.warn(
-            "[CaptureSync] target page availability probe failed:",
-            error,
-          );
-        }
+        const unavailablePage =
+          await classifyTargetPageAvailabilityInTab(runnerTabId, url);
         if (unavailablePage?.unavailable === true) {
-          const observedAt = new Date().toISOString();
-          results.push({
-            url,
-            ok: true,
-            captured: false,
-            recordIds: [],
-            unavailable: true,
-            businessOutcome: unavailablePage.businessOutcome,
-            availabilityStatus: unavailablePage.availabilityStatus,
-            retryable: false,
-            availability: {
-              status: unavailablePage.status,
-              availabilityStatus: unavailablePage.availabilityStatus,
-              reason: unavailablePage.reason,
-              code: unavailablePage.code,
-              message: unavailablePage.message,
-              evidence: unavailablePage.evidence,
-              observedAt,
-            },
-          });
+          results.push(
+            buildUnavailableBatchCaptureResult(url, unavailablePage),
+          );
           successCount++;
           if (onProgress) {
             onProgress({
@@ -13267,6 +13327,20 @@ export async function batchCaptureByUrls({
           }
           continue;
         }
+      }
+
+      if (
+        mode === "single" &&
+        detectPlatformFromUrl(url) === "douyin" &&
+        extractNoteId(url)
+      ) {
+        await probeDouyinDetailPreloadBeforeCapture(runnerTabId, {
+          targetUrl: url,
+          waitForDouyinReady: true,
+          requireVisibleDetailRoot: true,
+          shouldStop,
+          timeoutMs: DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS,
+        });
       }
 
       if (onProgress) {
@@ -13324,6 +13398,10 @@ export async function batchCaptureByUrls({
       const singleNoteEnhancementOptions =
         mode === "single"
           ? {
+              expectedNoteId:
+                detectPlatformFromUrl(url) === "douyin"
+                  ? extractNoteId(url)
+                  : "",
               includeComments: Boolean(captureParams.includeComments),
               includeBloggerMetrics: Boolean(captureParams.includeBloggerMetrics),
               enableCommentLeadsFilter: captureParams.enableCommentLeadsFilter,
@@ -13343,6 +13421,8 @@ export async function batchCaptureByUrls({
         mode === "single" && singleNoteEnhancementOptions
           ? {
               ...captureParams,
+              expectedNoteId:
+                singleNoteEnhancementOptions.expectedNoteId,
               preferWorksTabForBloggerMetrics:
                 singleNoteEnhancementOptions.preferWorksTabForBloggerMetrics,
             }
@@ -13358,10 +13438,64 @@ export async function batchCaptureByUrls({
         mode,
         source: 'batch_link_capture',
       });
-      const captureResult = await captureInTab(runnerTabId, {
+      let captureResult = await captureInTab(runnerTabId, {
         mode,
         captureParams: effectiveCaptureParams,
       });
+
+      let unavailableAfterCapture = null;
+      const captureErrorCode = String(
+        captureResult?.error?.code || "",
+      ).toUpperCase();
+      const shouldRecheckUnavailableDouyinTarget =
+        mode === "single" &&
+        captureParams.detectUnavailableTargetPage === true &&
+        detectPlatformFromUrl(url) === "douyin" &&
+        [
+          "DOUYIN_CONTENT_UNAVAILABLE",
+          "DOUYIN_DETAIL_ID_MISMATCH",
+          "DOUYIN_DETAIL_NOT_READY",
+        ].includes(captureErrorCode);
+      if (shouldRecheckUnavailableDouyinTarget) {
+        if (captureErrorCode === "DOUYIN_CONTENT_UNAVAILABLE") {
+          unavailableAfterCapture =
+            (await classifyTargetPageAvailabilityInTab(runnerTabId, url)) ||
+            {
+              unavailable: true,
+              availabilityStatus: "deleted",
+              message: "平台提示该帖子已删除",
+              evidence: ["douyin_content_unavailable"],
+            };
+        } else {
+          // 删除页 5 秒后会自动播放推荐作品。若捕获到串号或未就绪，
+          // 重新打开一次原目标并立即检查删除文案，避免把推荐作品写回。
+          await openUrlInTab(runnerTabId, url, {
+            timeoutMs: DETAIL_CAPTURE_NAV_TIMEOUT_MS,
+            shouldStop,
+            active: true,
+          });
+          await waitMsWithStop(
+            500,
+            shouldStop,
+            "BATCH_CAPTURE_CANCELED",
+          );
+          unavailableAfterCapture =
+            await classifyTargetPageAvailabilityInTab(runnerTabId, url);
+          if (!unavailableAfterCapture?.unavailable) {
+            await probeDouyinDetailPreloadBeforeCapture(runnerTabId, {
+              targetUrl: url,
+              waitForDouyinReady: true,
+              requireVisibleDetailRoot: true,
+              shouldStop,
+              timeoutMs: DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS,
+            });
+            captureResult = await captureInTab(runnerTabId, {
+              mode,
+              captureParams: effectiveCaptureParams,
+            });
+          }
+        }
+      }
 
       if (isCaptureCanceledResult(captureResult)) {
         canceled = true;
@@ -13373,7 +13507,15 @@ export async function batchCaptureByUrls({
       }
 
       // 入池
-      if (captureResult?.ok) {
+      if (unavailableAfterCapture?.unavailable === true) {
+        results.push(
+          buildUnavailableBatchCaptureResult(
+            url,
+            unavailableAfterCapture,
+          ),
+        );
+        successCount++;
+      } else if (captureResult?.ok) {
         const saveResult = await saveCaptureResultRecords(captureResult, {
           session: checkpointSession,
         });
@@ -13465,29 +13607,53 @@ export async function batchCaptureByUrls({
         canceled = true;
         break;
       }
-      if (checkpointSession?.queue) {
-        await checkpointSession.queue.catch(() => null);
-      }
-      const partialRecordIds = collectListCaptureSessionRecordIds(
-        checkpointSession,
-      );
-      if (partialRecordIds.length > 0 || profileRecordIds.length > 0) {
-        results.push({
-          url,
-          ok: true,
-          partial: true,
-          recordIds: [...profileRecordIds, ...partialRecordIds],
-          captureCacheStats: createListCaptureCacheStats(checkpointSession),
-          warning: error.message || "采集未完整完成",
-        });
+      if (
+        mode === "single" &&
+        captureParams.detectUnavailableTargetPage === true &&
+        detectPlatformFromUrl(url) === "douyin" &&
+        String(error?.code || "").toUpperCase() ===
+          "DOUYIN_CONTENT_UNAVAILABLE"
+      ) {
+        const unavailableClassification =
+          (await classifyTargetPageAvailabilityInTab(runnerTabId, url)) ||
+          {
+            unavailable: true,
+            availabilityStatus: "deleted",
+            message: "平台提示该帖子已删除",
+            evidence: ["douyin_content_unavailable"],
+          };
+        results.push(
+          buildUnavailableBatchCaptureResult(
+            url,
+            unavailableClassification,
+          ),
+        );
         successCount++;
       } else {
-        results.push({
-          url,
-          ok: false,
-          error: error.message,
-        });
-        failedCount++;
+        if (checkpointSession?.queue) {
+          await checkpointSession.queue.catch(() => null);
+        }
+        const partialRecordIds = collectListCaptureSessionRecordIds(
+          checkpointSession,
+        );
+        if (partialRecordIds.length > 0 || profileRecordIds.length > 0) {
+          results.push({
+            url,
+            ok: true,
+            partial: true,
+            recordIds: [...profileRecordIds, ...partialRecordIds],
+            captureCacheStats: createListCaptureCacheStats(checkpointSession),
+            warning: error.message || "采集未完整完成",
+          });
+          successCount++;
+        } else {
+          results.push({
+            url,
+            ok: false,
+            error: error.message,
+          });
+          failedCount++;
+        }
       }
     } finally {
       if (checkpointSession?.queue) {
@@ -16688,6 +16854,7 @@ function buildContentRequest(mode, captureParams = {}) {
     case 'single':
       return {
         action: 'captureSingleNote',
+        expectedNoteId: String(captureParams.expectedNoteId || ''),
         includeBloggerMetrics: Boolean(captureParams.includeBloggerMetrics),
         preferWorksTabForBloggerMetrics: Boolean(
           captureParams.preferWorksTabForBloggerMetrics,
