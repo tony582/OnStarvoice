@@ -99,6 +99,104 @@ function isMetricKnownBySource(source, dimension) {
   );
 }
 
+const COMMENT_COUNT_SOURCE_KEYS = Object.freeze([
+  'commentsCountSource',
+  'commentCountSource',
+  'comments_count_source',
+  'comment_count_source',
+]);
+
+function hasOwn(source, key) {
+  return Boolean(
+    source &&
+      typeof source === 'object' &&
+      Object.prototype.hasOwnProperty.call(source, key),
+  );
+}
+
+function parseExplicitBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  return null;
+}
+
+export function normalizeCommentCountSource(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  return normalized || 'unknown';
+}
+
+/**
+ * Keep the capture-side certainty metadata attached to the metric all the way
+ * through sync normalization and persistence. Older clients did not send a
+ * source, so their positive values remain usable but are explicitly marked as
+ * legacy evidence instead of being mistaken for API evidence.
+ */
+export function resolveCommentCountEvidenceFromPayload(payload) {
+  const safePayload = parseJsonObject(payload);
+  const listItem = firstPayloadItem(safePayload);
+  const sources = [
+    parseJsonObject(safePayload.detailPayload),
+    parseJsonObject(listItem.detailPayload),
+    listItem,
+    safePayload,
+  ];
+
+  let source = '';
+  let known = null;
+
+  for (const candidate of sources) {
+    if (!source) {
+      for (const key of COMMENT_COUNT_SOURCE_KEYS) {
+        if (candidate?.[key] == null || candidate[key] === '') continue;
+        source = normalizeCommentCountSource(candidate[key]);
+        break;
+      }
+    }
+
+    if (known == null) {
+      if (candidate?.metricKnown?.comments != null) {
+        known = parseExplicitBoolean(candidate.metricKnown.comments);
+      }
+      if (known == null) {
+        for (const key of METRIC_KNOWN_FLAG_KEYS.comments) {
+          if (!hasOwn(candidate, key)) continue;
+          known = parseExplicitBoolean(candidate[key]);
+          if (known != null) break;
+        }
+      }
+    }
+
+    if (source && known != null) break;
+  }
+
+  const resolvedKnown = known === true;
+  return {
+    known: resolvedKnown,
+    source:
+      source ||
+      (resolvedKnown ? 'legacy_known' : 'legacy_unverified'),
+  };
+}
+
+export function commentCountEvidenceRank({known = false, source = ''} = {}) {
+  if (!known) return 0;
+  const normalizedSource = normalizeCommentCountSource(source);
+  if (normalizedSource === 'api_statistics') return 3;
+  if (
+    normalizedSource === 'dom_count' ||
+    normalizedSource === 'dom_empty_state'
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
 /**
  * Resolve a metric for an incremental write. `null` means the current capture
  * did not observe that dimension and the stored value must be preserved;

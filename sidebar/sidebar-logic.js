@@ -806,7 +806,9 @@ const MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW = Object.freeze({
   48: 30,
   72: 40,
 });
-const MONITOR_UNKNOWN_PUBLISH_DETAIL_LIMIT = 8;
+const MONITOR_DETAIL_DATE_DISCOVERY_MIN = 20;
+const MONITOR_DETAIL_DATE_DISCOVERY_MAX = 60;
+const MONITOR_DETAIL_DATE_DISCOVERY_MULTIPLIER = 3;
 const MONITOR_OBSERVE_WINDOW_OPTIONS = Object.freeze([24, 48, 72]);
 const MONITOR_RUN_TIME_OPTIONS = Object.freeze(
   Array.from({length: 24}, (_, hour) => `${String(hour).padStart(2, "0")}:00`),
@@ -18926,19 +18928,33 @@ function resolveMonitorRunnerCaptureParams(
       DEFAULT_MONITOR_SETTINGS.observeWindowHours
     ];
   const requestedPostsLimit = Number(monitorSettings.postsLimit);
-  const maxDetectedItems =
+  const normalizedPostsLimit =
     Number.isSafeInteger(requestedPostsLimit) && requestedPostsLimit > 0
-      ? Math.min(defaultMaxDetectedItems, requestedPostsLimit)
+      ? requestedPostsLimit
       : defaultMaxDetectedItems;
+  const verifyPublishDateFromDetail =
+    captureSettings.verifyPublishDateFromDetail === true;
+  const maxDetectedItems =
+    verifyPublishDateFromDetail
+      ? Math.min(
+          MONITOR_DETAIL_DATE_DISCOVERY_MAX,
+          Math.max(
+            MONITOR_DETAIL_DATE_DISCOVERY_MIN,
+            normalizedPostsLimit * MONITOR_DETAIL_DATE_DISCOVERY_MULTIPLIER,
+          ),
+        )
+      : Math.min(defaultMaxDetectedItems, normalizedPostsLimit);
   const publishBounds = resolveMonitorPublishWindowBounds(monitorSettings);
   const publishWindow = publishBounds.key;
   const isStrictPublishWindow = publishBounds.strict === true;
-  const monitorScanLimit = isStrictPublishWindow
-    ? Math.min(
-        maxDetectedItems,
-        publishWindow === MONITOR_PUBLISH_WINDOW.PREVIOUS_DAY ? 20 : 12,
-      )
-    : maxDetectedItems;
+  const monitorScanLimit = verifyPublishDateFromDetail
+    ? maxDetectedItems
+    : isStrictPublishWindow
+      ? Math.min(
+          maxDetectedItems,
+          publishWindow === MONITOR_PUBLISH_WINDOW.PREVIOUS_DAY ? 20 : 12,
+        )
+      : maxDetectedItems;
   const likeThreshold = Math.max(
     0,
     Number(monitorSettings.likeThreshold) ||
@@ -18951,7 +18967,9 @@ function resolveMonitorRunnerCaptureParams(
     minLikes: 0,
     maxDetectedItems: Math.floor(monitorScanLimit),
     monitorLikeThreshold: Math.floor(likeThreshold),
-    monitorPublishWindow: publishWindow,
+    // 账号作品列表不一定提供可信发布时间。官方账号评论巡查先把列表当作
+    // 候选来源，进入详情页核实日期后再筛选，避免在列表阶段误判。
+    monitorPublishWindow: verifyPublishDateFromDetail ? "" : publishWindow,
     monitorObserveWindowHours: observeWindowHours,
     waitMinMs:
       Number(captureSettings.sharedWaitMinMs) ||
@@ -18965,7 +18983,8 @@ function resolveMonitorRunnerCaptureParams(
     maxDurationMs:
       Number(captureSettings.sharedMaxDurationMs) ||
       DEFAULT_CAPTURE_SETTINGS.sharedMaxDurationMs,
-    maxScrollTimes: isStrictPublishWindow ? 6 : 20,
+    maxScrollTimes:
+      verifyPublishDateFromDetail || !isStrictPublishWindow ? 20 : 6,
   };
 }
 
@@ -19349,7 +19368,10 @@ function parseMonitorPublishMoment(value, nowMs = Date.now()) {
   return null;
 }
 
-function collectMonitorPublishCandidates(record = {}) {
+function collectMonitorPublishCandidates(
+  record = {},
+  {detailOnly = false} = {},
+) {
   const payload =
     record?.payload && typeof record.payload === "object" ? record.payload : {};
   const item =
@@ -19363,12 +19385,19 @@ function collectMonitorPublishCandidates(record = {}) {
       ? payload.detailPayload
       : {};
 
-  return [
+  const detailCandidates = [
     {value: detail.publishTimestamp, source: "detail.publishTimestamp"},
     {value: detail.publishTime, source: "detail.publishTime"},
     {value: detail.publishDateRaw, source: "detail.publishDateRaw"},
     {value: detail.lastEditedAt, source: "detail.lastEditedAt"},
     {value: detail.publishDate, source: "detail.publishDate"},
+  ];
+  if (detailOnly) {
+    return detailCandidates;
+  }
+
+  return [
+    ...detailCandidates,
     {value: item.publishTimestamp, source: "item.publishTimestamp"},
     {value: item.publishTime, source: "item.publishTime"},
     {value: item.publishDateRaw, source: "item.publishDateRaw"},
@@ -19382,13 +19411,20 @@ function collectMonitorPublishCandidates(record = {}) {
   ];
 }
 
-function isLikelyFallbackCaptureTime(record, candidate, moment) {
+function isLikelyFallbackCaptureTime(
+  record,
+  candidate,
+  moment,
+  {detailOnly = false} = {},
+) {
   const source = String(candidate?.source || "");
   if (!/lastEditedAt/i.test(source) || !moment?.timestampMs) {
     return false;
   }
 
-  const rawDateSignals = collectMonitorPublishCandidates(record).some((item) => {
+  const rawDateSignals = collectMonitorPublishCandidates(record, {
+    detailOnly,
+  }).some((item) => {
     const candidateSource = String(item.source || "");
     return (
       !/lastEditedAt/i.test(candidateSource) &&
@@ -19419,14 +19455,20 @@ function isLikelyFallbackCaptureTime(record, candidate, moment) {
   );
 }
 
-function resolveMonitorRecordPublishMoment(record, nowMs = Date.now()) {
-  const candidates = collectMonitorPublishCandidates(record);
+function resolveMonitorRecordPublishMoment(
+  record,
+  nowMs = Date.now(),
+  {detailOnly = false} = {},
+) {
+  const candidates = collectMonitorPublishCandidates(record, {detailOnly});
   for (const candidate of candidates) {
     const moment = parseMonitorPublishMoment(candidate.value, nowMs);
     if (!moment) {
       continue;
     }
-    if (isLikelyFallbackCaptureTime(record, candidate, moment)) {
+    if (
+      isLikelyFallbackCaptureTime(record, candidate, moment, {detailOnly})
+    ) {
       continue;
     }
     return {
@@ -19461,6 +19503,8 @@ async function resolveMonitorRecordIdsForPublishWindow({
 } = {}) {
   const uniqueRecordIds = [...new Set(recordIds.filter(Boolean))];
   const bounds = resolveMonitorPublishWindowBounds(monitorSettings);
+  const verifyPublishDateFromDetail =
+    captureSettings.verifyPublishDateFromDetail === true;
 
   if (!bounds.strict || uniqueRecordIds.length === 0) {
     return {
@@ -19473,21 +19517,23 @@ async function resolveMonitorRecordIdsForPublishWindow({
     };
   }
 
-  const preRecords = await getRecords(uniqueRecordIds);
-  const preRecordById = new Map(preRecords.map((record) => [record.id, record]));
-  const prefilterNowMs = Date.now();
-  let unknownCandidateCount = 0;
-  const detailCandidateIds = uniqueRecordIds.filter((recordId) => {
-    const moment = resolveMonitorRecordPublishMoment(
-      preRecordById.get(recordId),
-      prefilterNowMs,
+  let detailCandidateIds = uniqueRecordIds;
+  if (!verifyPublishDateFromDetail) {
+    const preRecords = await getRecords(uniqueRecordIds);
+    const preRecordById = new Map(
+      preRecords.map((record) => [record.id, record]),
     );
-    if (!moment) {
-      unknownCandidateCount += 1;
-      return unknownCandidateCount <= MONITOR_UNKNOWN_PUBLISH_DETAIL_LIMIT;
-    }
-    return isMonitorPublishMomentInWindow(moment, bounds);
-  });
+    const prefilterNowMs = Date.now();
+    detailCandidateIds = uniqueRecordIds.filter((recordId) => {
+      const moment = resolveMonitorRecordPublishMoment(
+        preRecordById.get(recordId),
+        prefilterNowMs,
+      );
+      return (
+        !moment || isMonitorPublishMomentInWindow(moment, bounds)
+      );
+    });
+  }
 
   if (detailCandidateIds.length === 0) {
     return {
@@ -19526,16 +19572,34 @@ async function resolveMonitorRecordIdsForPublishWindow({
     },
     includeComments: false,
     includeBloggerMetrics: false,
+    // 发布时间必须来自本轮真实进入详情页后的结果。即使此前采过详情，
+    // 也不能复用旧快照，否则会把旧日期误当作本轮巡查证据。
+    skipAlreadyCaptured: false,
     detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
     detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
     profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
   });
 
-  const records = await getRecords(detailCandidateIds);
-  if (
-    detailResult?.canceled ||
-    (typeof shouldStop === "function" && shouldStop())
-  ) {
+  const stoppedByCaller =
+    typeof shouldStop === "function" && shouldStop();
+  const terminalError = detailResult?.canceled || stoppedByCaller
+    ? {
+        errorCode: "capture_canceled",
+        errorMessage: "发布时间读取已取消",
+        canceled: true,
+      }
+    : detailResult?.securityBlocked
+      ? {
+          errorCode: "capture_security_blocked",
+          errorMessage: "发布时间读取遇到安全验证，已停止巡查",
+        }
+      : detailResult?.runnerInterrupted
+        ? {
+            errorCode: "capture_runner_interrupted",
+            errorMessage: "发布时间读取工作页已关闭或中断",
+          }
+        : null;
+  if (terminalError) {
     return {
       recordIds: [],
       scannedCount: uniqueRecordIds.length,
@@ -19543,18 +19607,63 @@ async function resolveMonitorRecordIdsForPublishWindow({
       unknownCount: 0,
       windowLabel: bounds.label,
       detailResult,
-      canceled: true,
+      failed: true,
+      ...terminalError,
     };
   }
 
+  const detailItems = Array.isArray(detailResult?.results)
+    ? detailResult.results
+    : [];
+  const successfulDetailRecordIds = detailItems
+    .filter(
+      (item) =>
+        item?.ok === true &&
+        item?.filtered !== true &&
+        item?.reason !== "already_captured",
+    )
+    .map((item) => item?.recordId)
+    .filter((recordId) => detailCandidateIds.includes(recordId));
+  const successfulDetailRecordIdSet = new Set(successfulDetailRecordIds);
+  const failedDetailCount = detailCandidateIds.filter(
+    (recordId) => !successfulDetailRecordIdSet.has(recordId),
+  ).length;
+  if (detailResult?.ok === false || failedDetailCount > 0) {
+    const firstFailure = detailItems.find((item) => item?.ok === false);
+    const failureMessage =
+      String(
+        firstFailure?.diagnosticMessage ||
+          firstFailure?.message ||
+          detailResult?.error?.message ||
+          "",
+      ).trim() || "部分作品未能完成发布时间读取";
+    return {
+      recordIds: [],
+      scannedCount: uniqueRecordIds.length,
+      filteredCount: uniqueRecordIds.length,
+      unknownCount: 0,
+      windowLabel: bounds.label,
+      detailResult,
+      failed: true,
+      errorCode: "publish_date_capture_failed",
+      errorMessage: failureMessage,
+      successfulDetailCount: successfulDetailRecordIds.length,
+      failedDetailCount,
+    };
+  }
+
+  // 只读取本轮明确成功的详情记录；不得让失败项沿用数据库里的旧详情日期。
+  const records = await getRecords(successfulDetailRecordIds);
   const recordById = new Map(records.map((record) => [record.id, record]));
   const selectedIds = [];
   let unknownCount = 0;
   const nowMs = Date.now();
 
-  detailCandidateIds.forEach((recordId) => {
+  successfulDetailRecordIds.forEach((recordId) => {
     const record = recordById.get(recordId);
-    const moment = resolveMonitorRecordPublishMoment(record, nowMs);
+    const moment = resolveMonitorRecordPublishMoment(record, nowMs, {
+      detailOnly: verifyPublishDateFromDetail,
+    });
     if (!moment) {
       unknownCount += 1;
       return;
@@ -19564,10 +19673,35 @@ async function resolveMonitorRecordIdsForPublishWindow({
     }
   });
 
+  if (unknownCount > 0) {
+    return {
+      recordIds: [],
+      scannedCount: uniqueRecordIds.length,
+      filteredCount: uniqueRecordIds.length,
+      unknownCount,
+      windowLabel: bounds.label,
+      detailResult,
+      failed: true,
+      errorCode: "publish_date_unknown",
+      errorMessage: `${unknownCount} 篇作品未能读取到可信的发布时间`,
+      successfulDetailCount: successfulDetailRecordIds.length,
+      failedDetailCount: 0,
+    };
+  }
+
+  const requestedPostsLimit = Number(monitorSettings.postsLimit);
+  const limitedSelectedIds =
+    Number.isSafeInteger(requestedPostsLimit) && requestedPostsLimit > 0
+      ? selectedIds.slice(0, requestedPostsLimit)
+      : selectedIds;
+
   return {
-    recordIds: selectedIds,
+    recordIds: limitedSelectedIds,
     scannedCount: uniqueRecordIds.length,
-    filteredCount: Math.max(0, uniqueRecordIds.length - selectedIds.length),
+    filteredCount: Math.max(
+      0,
+      uniqueRecordIds.length - limitedSelectedIds.length,
+    ),
     unknownCount,
     windowLabel: bounds.label,
     detailResult,
@@ -19774,6 +19908,32 @@ async function executeMonitorRunItem({
         hitCount: 0,
         errorCode: "capture_canceled",
         errorMessage: "采集已取消",
+        captureResult,
+        detailResult: publishFilterResult.detailResult,
+      };
+    }
+    if (publishFilterResult.failed) {
+      const errorCode =
+        String(publishFilterResult.errorCode || "").trim() ||
+        "publish_date_capture_failed";
+      const errorMessage =
+        String(publishFilterResult.errorMessage || "").trim() ||
+        "作品发布时间核验失败";
+      await finishMonitorExecutionSafely(executionId, {
+        status: "failed",
+        recordsFound: 0,
+        errorMessage,
+      });
+      return {
+        ...baseResult,
+        status: "failed",
+        scannedCount: publishFilterResult.scannedCount,
+        hitCount: 0,
+        filteredCount: publishFilterResult.filteredCount,
+        unknownPublishTimeCount: publishFilterResult.unknownCount,
+        publishWindowLabel: publishFilterResult.windowLabel,
+        errorCode,
+        errorMessage,
         captureResult,
         detailResult: publishFilterResult.detailResult,
       };

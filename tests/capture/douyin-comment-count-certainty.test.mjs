@@ -52,6 +52,10 @@ test("Douyin API comment_count is proven when explicitly present, including zero
 
 test("Douyin DOM comment count is known only when its count node contains a number", () => {
   assert.deepEqual(
+    resolveDouyinCommentCountEvidence({commentNode: textNode("22")}),
+    {count: 22, known: true, source: "dom_count"},
+  );
+  assert.deepEqual(
     resolveDouyinCommentCountEvidence({commentNode: textNode("评论 0")}),
     {count: 0, known: true, source: "dom_count"},
   );
@@ -62,6 +66,70 @@ test("Douyin DOM comment count is known only when its count node contains a numb
   assert.deepEqual(
     resolveDouyinCommentCountEvidence({commentNode: textNode("评论加载中")}),
     {count: null, known: false, source: "unknown"},
+  );
+});
+
+test("Douyin comment count does not concatenate duplicate DOM representations", () => {
+  assert.deepEqual(
+    resolveDouyinCommentCountEvidence({
+      commentNode: {
+        textContent: "35",
+        innerText: "35",
+        getAttribute(name) {
+          return name === "aria-label" ? "评论 35" : "";
+        },
+      },
+    }),
+    {count: 35, known: true, source: "dom_count"},
+  );
+  assert.deepEqual(
+    resolveDouyinCommentCountEvidence({
+      commentNode: textNode("评论 22 22"),
+    }),
+    {count: 22, known: true, source: "dom_count"},
+  );
+  assert.deepEqual(
+    resolveDouyinCommentCountEvidence({
+      commentNode: textNode("评论 22 回复 3"),
+    }),
+    {count: null, known: false, source: "unknown"},
+  );
+});
+
+test("Douyin DOM count is unknown when rendered representations disagree", () => {
+  assert.deepEqual(
+    resolveDouyinCommentCountEvidence({
+      commentNode: {
+        textContent: "2222",
+        innerText: "22",
+        getAttribute(name) {
+          return name === "aria-label" ? "评论 22" : "";
+        },
+      },
+    }),
+    {count: null, known: false, source: "dom_conflict"},
+  );
+  assert.deepEqual(
+    resolveDouyinCommentCountEvidence({
+      commentNode: {
+        textContent: "3535",
+        innerText: "35",
+        getAttribute(name) {
+          return name === "title" ? "评论 35" : "";
+        },
+      },
+    }),
+    {count: null, known: false, source: "dom_conflict"},
+  );
+});
+
+test("Douyin API comment count wins over a stale or malformed DOM count", () => {
+  assert.deepEqual(
+    resolveDouyinCommentCountEvidence({
+      commentNode: textNode("2222"),
+      apiDetail: {statistics: {comment_count: 22}},
+    }),
+    {count: 22, known: true, source: "api_statistics"},
   );
 });
 
@@ -86,13 +154,13 @@ test("Douyin DOM fallback accepts explicit API evidence or a scoped empty state"
   );
 });
 
-test("both API and DOM payload paths publish commentsCountKnown provenance", () => {
+test("both API and DOM payload paths publish comment-count provenance", () => {
   assert.match(
     singleNoteSource,
-    /comments:\s*commentsCountKnown \? stats\.comment_count : null,\s*commentsCountKnown,/u,
+    /comments:\s*commentsCountKnown \? stats\.comment_count : null,\s*commentsCountKnown,\s*commentsCountSource:/u,
   );
   assert.match(
     singleNoteSource,
-    /comments:\s*interactions\.comments,\s*commentsCountKnown:\s*interactions\.commentsCountKnown,/u,
+    /comments:\s*interactions\.comments,\s*commentsCountKnown:\s*interactions\.commentsCountKnown,\s*commentsCountSource:\s*interactions\.commentsCountSource,/u,
   );
 });

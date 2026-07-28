@@ -404,6 +404,7 @@
           negativePostPatrol: true,
           officialAccountCommentPatrol: true,
           officialAccountCommentPatrolProfileV1: true,
+          officialAccountDetailPublishDateV1: true,
           followedCreatorPostPatrol: true,
           officialAccountPostDiscovery: true,
           remoteTargetedPostCaptureV1: true,

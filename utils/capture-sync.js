@@ -3017,12 +3017,39 @@ function resolveExpectedDouyinCommentNoteId(record, fallbackUrl = '') {
 }
 
 function resolveCapturedDouyinCommentNoteId(result) {
-  return (
-    extractDouyinDetailGuardItemId(result?.noteId) ||
-    extractDouyinDetailGuardItemId(result?.data?.noteId) ||
-    extractDouyinDetailGuardItemId(result?.data?.noteUrl) ||
-    extractDouyinDetailGuardItemId(result?.data?.url)
+  const capturedIds = new Set(
+    [
+      result?.noteId,
+      result?.data?.noteId,
+      result?.data?.noteUrl,
+      result?.data?.url,
+    ]
+      .map(extractDouyinDetailGuardItemId)
+      .filter(Boolean),
   );
+  // A response carrying multiple work IDs is internally inconsistent. Never
+  // pick the first one and allow a potentially wrong cloud merge.
+  return capturedIds.size === 1 ? [...capturedIds][0] : '';
+}
+
+function resolveVerifiedDouyinDetailNoteId(
+  detailPayload = {},
+  expectedNoteId = '',
+) {
+  const expected = extractDouyinDetailGuardItemId(expectedNoteId);
+  if (!expected || !detailPayload || typeof detailPayload !== 'object') {
+    return '';
+  }
+  const capturedIds = new Set(
+    [
+      detailPayload.noteId,
+      detailPayload.url,
+      detailPayload.noteUrl,
+    ]
+      .map(extractDouyinDetailGuardItemId)
+      .filter(Boolean),
+  );
+  return capturedIds.size === 1 && capturedIds.has(expected) ? expected : '';
 }
 
 function buildDouyinCommentIdentityFailure(expectedNoteId, actualNoteId) {
@@ -4900,6 +4927,13 @@ export async function batchCaptureDetailsForRecords(
             recordPlatform === 'douyin'
               ? resolveExpectedDouyinCommentNoteId(record, noteUrl)
               : '';
+          const verifiedCommentNoteId =
+            recordPlatform === 'douyin'
+              ? resolveVerifiedDouyinDetailNoteId(
+                  detailPayload,
+                  expectedCommentNoteId,
+                )
+              : '';
           let commentCaptureIdentity;
           try {
             commentCaptureIdentity = await ensureCommentCaptureIdentity({
@@ -4946,6 +4980,7 @@ export async function batchCaptureDetailsForRecords(
               waitMaxMs: settings.sharedWaitMaxMs,
               stallTimeoutMs: settings.sharedStallTimeoutMs,
               expectedNoteId: expectedCommentNoteId,
+              verifiedNoteId: verifiedCommentNoteId,
             });
           } catch (error) {
             throw attachPartialDetailPayload(error, detailPayload);
@@ -5828,48 +5863,60 @@ function protectDouyinDetailAuthorAgainstListItem(
     listItem?.nickname,
     listItem?.bloggerName,
   );
-  const normalizeComparableAuthor = (value) =>
-    String(value || '')
-      .replace(/^@+/u, '')
-      .replace(/[\s\u200b-\u200d\ufeff·•._-]+/gu, '')
-      .toLowerCase();
-  const detailAuthorKey = normalizeComparableAuthor(detailAuthor);
-  const listAuthorKey = normalizeComparableAuthor(listAuthor);
-  const authorsConflict = Boolean(
-    detailAuthorKey &&
-      listAuthorKey &&
-      detailAuthorKey !== listAuthorKey,
+  const expectedNoteId =
+    resolveExpectedDouyinCommentNoteId(record, base.url || base.noteUrl) ||
+    extractDouyinDetailGuardItemId(listItem?.noteId) ||
+    extractDouyinDetailGuardItemId(listItem?.url);
+  const detailNoteIds = [
+    base.noteId,
+    base.url,
+    base.noteUrl,
+  ]
+    .map(extractDouyinDetailGuardItemId)
+    .filter(Boolean);
+  const detailIdentityVerified = Boolean(
+    expectedNoteId &&
+      detailNoteIds.length > 0 &&
+      detailNoteIds.every((noteId) => noteId === expectedNoteId),
   );
-  // 搜索卡片与详情属于同一作品。两边作者冲突时，详情页通常误取了
-  // 推荐账号、品牌卡或登录账号；列表卡作者与作品绑定更直接，优先保留。
-  const preferListAuthor = Boolean(listAuthor && (!detailAuthor || authorsConflict));
-  const author = preferListAuthor ? listAuthor : detailAuthor || listAuthor;
-  const authorUrl = pickTrustedDouyinAuthorUrl(
-    !preferListAuthor && detailAuthor
-      ? [
-          base.authorProfileUrl,
-          base.authorUrl,
-          base.bloggerProfileUrl,
-          base.profileUrl,
-        ]
-      : [],
-    [
-      listItem?.authorProfileUrl,
-      listItem?.authorUrl,
-      listItem?.bloggerProfileUrl,
-      listItem?.profileUrl,
-    ],
-  );
+  // 详情采集已经用作品 ID 绑定到目标作品时，详情作者才是该作品的
+  // 第一手证据。搜索列表可能复用旧卡片，不能反向覆盖详情作者。
+  // 详情未绑定或作者缺失时，列表作者只作为完整的一组兜底信息。
+  const preferDetailAuthor = Boolean(detailAuthor && detailIdentityVerified);
+  const preferListAuthor = Boolean(listAuthor && !preferDetailAuthor);
+  const author = preferDetailAuthor
+    ? detailAuthor
+    : preferListAuthor
+      ? listAuthor
+      : detailAuthor;
+  const authorUrl = preferDetailAuthor
+    ? pickTrustedDouyinAuthorUrl([
+        base.authorProfileUrl,
+        base.authorUrl,
+        base.bloggerProfileUrl,
+        base.profileUrl,
+      ])
+    : preferListAuthor
+      ? pickTrustedDouyinAuthorUrl([
+          listItem?.authorProfileUrl,
+          listItem?.authorUrl,
+          listItem?.bloggerProfileUrl,
+          listItem?.profileUrl,
+        ])
+      : '';
   const detailAuthorId = String(base.authorId || base.bloggerId || '').trim();
   const listAuthorId = String(
     listItem?.authorId || listItem?.bloggerId || '',
   ).trim();
-  const authorId =
-    !preferListAuthor &&
-    detailAuthor &&
-    !/^self$/i.test(detailAuthorId)
-    ? detailAuthorId
-    : listAuthorId;
+  const authorId = preferDetailAuthor
+    ? !/^self$/i.test(detailAuthorId)
+      ? detailAuthorId
+      : ''
+    : preferListAuthor
+      ? !/^self$/i.test(listAuthorId)
+        ? listAuthorId
+        : ''
+      : '';
 
   base.author = author;
   base.authorName = author;
@@ -6056,14 +6103,22 @@ function isLikelyDownloadableDouyinMediaUrlForStorage(url, kind = 'video') {
 
 function mergeHydratedDetailIntoRecordPayload(record) {
   const payload = record?.payload && typeof record.payload === 'object' ? record.payload : {};
-  const detail = normalizeSingleNotePayloadForSync(payload.detailPayload);
-  if (!detail || typeof detail !== 'object') {
+  const normalizedDetail = normalizeSingleNotePayloadForSync(payload.detailPayload);
+  if (!normalizedDetail || typeof normalizedDetail !== 'object') {
     return payload;
   }
 
   const items = Array.isArray(payload.items) ? payload.items : [];
   const firstItem =
     items[0] && typeof items[0] === 'object' ? items[0] : {};
+  // 必须在合并列表字段之前判断详情作者是否真的与目标作品绑定。
+  // 否则详情缺少 noteId/url 时，会继承列表作品 ID，并被误判为“详情已验证”，
+  // 进而让另一条作品的作者覆盖当前列表作者。
+  const detail = protectDouyinDetailAuthorAgainstListItem(
+    record,
+    {...normalizedDetail},
+    firstItem,
+  );
   const mergedItem = {
     ...firstItem,
     ...detail,
@@ -8611,6 +8666,7 @@ async function captureCommentsForSingleNoteRecord(
     commentsMaxItems = null,
     captureRequestId = '',
     runnerTabId = null,
+    verifiedNoteId: providedVerifiedNoteId = '',
     onProgress = null,
   } = {},
 ) {
@@ -8646,6 +8702,13 @@ async function captureCommentsForSingleNoteRecord(
     record,
     resolveRecordNoteUrl(record),
   );
+  // Stored payloads are historical evidence and cannot prove which work is
+  // currently open. Only an explicit verifier produced by the same live
+  // navigation/capture call may bridge a transient blank DOM.
+  const verifiedNoteId =
+    extractDouyinDetailGuardItemId(providedVerifiedNoteId) === expectedNoteId
+      ? expectedNoteId
+      : '';
   const startedAt = Date.now();
 
   await updateRecord(recordId, {
@@ -8688,6 +8751,7 @@ async function captureCommentsForSingleNoteRecord(
         waitMaxMs: settings.sharedWaitMaxMs,
         stallTimeoutMs: settings.sharedStallTimeoutMs,
         expectedNoteId,
+        verifiedNoteId,
       },
     });
   } catch (error) {
@@ -12319,6 +12383,7 @@ async function captureCommentsForCurrentNote({
   waitMaxMs,
   stallTimeoutMs,
   expectedNoteId = '',
+  verifiedNoteId = '',
 }) {
   const savedItems = Array.isArray(existingItems) ? existingItems : [];
   const commentCaptureIdentity = await ensureCommentCaptureIdentity({
@@ -12341,6 +12406,7 @@ async function captureCommentsForCurrentNote({
         waitMaxMs,
         stallTimeoutMs,
         expectedNoteId,
+        verifiedNoteId,
       },
     });
   } catch (error) {
@@ -12459,6 +12525,7 @@ async function captureCommentsForHydratedDetailRecord(
   {
     tabId,
     captureRequestId = '',
+    verifiedNoteId: providedVerifiedNoteId = '',
     settings = {},
     commentsMaxDetectedItems = null,
     onProgress = null,
@@ -12503,6 +12570,12 @@ async function captureCommentsForHydratedDetailRecord(
     typeof latestBeforeStart.payload.detailPayload === 'object'
       ? latestBeforeStart.payload.detailPayload
       : detailPayload;
+  // Do not use latestDetailPayload as current-page proof. It may have been
+  // captured hours earlier or imported from another run.
+  const verifiedNoteId =
+    extractDouyinDetailGuardItemId(providedVerifiedNoteId) === expectedNoteId
+      ? expectedNoteId
+      : '';
   const capturingDetailPayload = applyCommentStatusToPayload(
     clearInterruptedCommentObservation(latestDetailPayload),
     createCommentStatusPatch({
@@ -12545,6 +12618,7 @@ async function captureCommentsForHydratedDetailRecord(
     waitMaxMs: settings.sharedWaitMaxMs,
     stallTimeoutMs: settings.sharedStallTimeoutMs,
     expectedNoteId,
+    verifiedNoteId,
   });
   const commentIdentityFailure =
     result.status !== COMMENT_CAPTURE_STATUS.FAILED ||
@@ -16900,6 +16974,7 @@ function buildContentRequest(mode, captureParams = {}) {
       return {
         action: 'captureComments',
         expectedNoteId: String(captureParams.expectedNoteId || ''),
+        verifiedNoteId: String(captureParams.verifiedNoteId || ''),
         onlyLevel1: Boolean(captureParams.onlyLevel1),
         maxDetectedItems:
           captureParams.maxDetectedItems ?? captureParams.maxItems,

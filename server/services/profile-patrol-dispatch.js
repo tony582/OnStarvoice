@@ -98,7 +98,9 @@ export async function loadCompatibleProfilePatrolAgent(
     !workflow ||
     capabilities.remoteTaskCreate !== true ||
     capabilities.remoteTargetedPostCaptureV1 !== true ||
-    capabilities[capability] !== true
+    capabilities[capability] !== true ||
+    (subjectType === 'official' &&
+      capabilities.officialAccountDetailPublishDateV1 !== true)
   ) {
     return {failure: requestError(
       'agent_profile_scan_capability_missing',
@@ -505,6 +507,7 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
               autoSyncAfterDetailCapture: true,
               commentsMaxDetectedItems: 50,
               skipAlreadyCapturedOnDetailCapture: false,
+              verifyPublishDateFromDetail: true,
             }
           : {autoSyncAfterDetailCapture: true},
       );

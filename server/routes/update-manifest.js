@@ -3,12 +3,35 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.64',
+  latestVersion: '0.3.65',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-07-28',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.64-20260728.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.65-20260728.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.65',
+      releaseDate: '2026-07-28',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '抖音作品与评论采集',
+              desc: '加强作品身份校验和评论数量读取，避免自动播放、推荐内容或旧页面数据写入目标作品。',
+            },
+            {
+              title: '官方账号评论巡查',
+              desc: '进入作品详情后按真实发布时间筛选，并只读取评论区域，避免误入 AI 页面。',
+            },
+            {
+              title: '采集数据写回保护',
+              desc: '阻止不确定或过期数据覆盖可信指标，并允许可靠的新采集结果修复历史异常值。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.64',
       releaseDate: '2026-07-28',
