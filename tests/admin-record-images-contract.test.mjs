@@ -37,6 +37,9 @@ test('both detail drawers share a graceful image fallback', () => {
 
   assert.match(imageSources, /record\.image_local_urls/);
   assert.match(imageSources, /record\.cover_local \|\| record\.cover_url/);
+  assert.match(imageSources, /function imageSourceIdentity/);
+  assert.match(imageSources, /const seenSourceIdentities = new Set<string>\(\)/);
+  assert.match(imageSources, /imageSourceIdentity\(item\.ref \|\| item\.url\)/);
   assert.match(gallery, /onError=\{\(\) => setFailed/);
   assert.match(gallery, /平台原图已失效/);
   assert.match(recordDrawer, /<RecordImageGallery/);

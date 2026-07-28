@@ -2,8 +2,12 @@ import { createHash } from 'node:crypto';
 
 import { execute, getSetting, queryAll, queryOne, withTransaction } from '../db/init.js';
 import { callDeepSeekWithPrompt, getBrandContext, getDeepSeekConfig } from './ai-labeler.js';
+import {
+  formatMonitoringIntentForPrompt,
+  resolveMonitoringIntent,
+} from './monitoring-intent.js';
 
-export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v1';
+export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v2';
 export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
@@ -82,6 +86,7 @@ function normalizeIntent(raw, keywordHash) {
     intentVersion: Number.isInteger(Number(source.intentVersion)) && Number(source.intentVersion) > 0
       ? Number(source.intentVersion)
       : 1,
+    objective: boundedText(source.objective, 80),
     targetEntity: boundedStringArray(source.targetEntity, { maxItems: 20, maxLength: 80 }),
     targetContent: boundedStringArray(source.targetContent, { maxItems: 20, maxLength: 80 }),
     exclusions: boundedStringArray(source.exclusions, { maxItems: 30, maxLength: 100 }),
@@ -115,7 +120,7 @@ export function validatePrefilterRequest(body = {}) {
   const platform = normalizePlatform(body.platform);
   const stage = boundedText(body.stage || 'list', 20).toLowerCase();
   const keyword = normalizePrefilterKeyword(body.keyword);
-  const promptVersion = boundedText(body.promptVersion || PREFILTER_PROMPT_VERSION, 100);
+  const requestedPromptVersion = boundedText(body.promptVersion || PREFILTER_PROMPT_VERSION, 100);
   const requestedModeRaw = boundedText(body.mode || 'shadow', 30).toLowerCase();
 
   if (!requestId) return { ok: false, status: 400, error: 'REQUEST_ID_REQUIRED', message: '缺少 requestId' };
@@ -123,9 +128,10 @@ export function validatePrefilterRequest(body = {}) {
   if (!VALID_PLATFORMS.has(platform)) return { ok: false, status: 422, error: 'INVALID_PLATFORM', message: '仅支持小红书和抖音' };
   if (stage !== 'list') return { ok: false, status: 422, error: 'UNSUPPORTED_STAGE', message: '第一期仅支持 list 文字判断' };
   if (!keyword) return { ok: false, status: 422, error: 'KEYWORD_REQUIRED', message: '缺少搜索关键词' };
-  if (promptVersion !== PREFILTER_PROMPT_VERSION) {
+  if (!['prefilter-list-v1', PREFILTER_PROMPT_VERSION].includes(requestedPromptVersion)) {
     return { ok: false, status: 409, error: 'PROMPT_VERSION_CONFLICT', message: '前置筛选提示词版本不匹配' };
   }
+  const promptVersion = PREFILTER_PROMPT_VERSION;
   if (!VALID_MODES.has(requestedModeRaw)) {
     return { ok: false, status: 422, error: 'INVALID_MODE', message: '筛选模式无效' };
   }
@@ -261,7 +267,7 @@ export function determineExecutionDisposition({ status, modelDecision, confidenc
   return 'collect_full';
 }
 
-export function buildPrefilterSystemPrompt(brand = {}) {
+export function buildPrefilterSystemPrompt(brand = {}, intent = {}) {
   return `你是采集前的查询意图相关性筛选器。你不是在做宽泛的品牌舆情判断，而是在判断每条搜索结果是否符合用户本次搜索词的具体意图。
 
 租户品牌：${brand.brandName || '未配置'}
@@ -270,13 +276,15 @@ export function buildPrefilterSystemPrompt(brand = {}) {
 品牌相关词：${(brand.positiveContextTerms || []).join('、') || '无'}
 常见噪声：${(brand.noiseTerms || []).join('、') || '无'}
 
+${formatMonitoringIntentForPrompt(intent)}
+
 对每一项只允许三种决定：
 - keep：现有列表文字已经足以确认符合本次查询意图；
 - skip：现有列表文字已经足以确认不符合本次查询意图；
 - need_detail：可能相关但证据不足，需要正文、标签、画面或口播才能判断。
 
 规则：
-1. 不要因为内容提到了品牌就自动 keep，必须同时考虑搜索词表达的内容用途或主题。
+1. 不要因为内容提到了品牌、车型、搜索词、话题标签或作者名就自动 keep，必须同时符合任务的目标对象和目标主题。
 2. 人名、地名、谐音、其它品牌、泛词巧合命中应 skip。
 3. 标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail。
 4. 证据不足时必须 need_detail，禁止为了提高跳过率猜测。
@@ -284,6 +292,7 @@ export function buildPrefilterSystemPrompt(brand = {}) {
 6. 只输出 JSON 对象，不要 Markdown 或解释性前后缀。
 7. confidence 表示你对当前决定的确定程度，不是相关度分数。若标题已经明确指向其它汽车品牌/产品，且目标品牌或目标实体完全缺失，这是可由列表文字直接证实的无关项，decision=skip，confidence 应为 0.98-1.00。
 8. 只有部分词相似、可能需要画面/口播/正文才能排除，或仍存在合理相关解释时，不得用高置信 skip，必须输出 need_detail，confidence 不高于 0.96。
+9. 关联品牌的其它车辆话题不属于当前功能任务。例如“别克OTA”不包含别克机械故障，“至境哨兵”不包含至境胎噪，“凯迪拉克壁纸”不包含凯迪拉克碰撞测试。
 
 输出格式：
 {"items":[{"itemId":"原值","decision":"keep|skip|need_detail","queryMatch":0.0,"brandMatch":0.0,"confidence":0.0,"reason":"简短中文原因","evidence":["证据"],"missingSignals":["缺失证据"]}]}`;
@@ -631,7 +640,14 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
   if (!validation.ok) {
     throw new PrefilterRequestError(validation.status, validation.error, validation.message);
   }
-  const request = validation.value;
+  const brand = await getBrandContext(tenantId);
+  const request = {
+    ...validation.value,
+    intent: resolveMonitoringIntent(validation.value.keyword, {
+      brand,
+      fallbackIntent: validation.value.intent,
+    }),
+  };
   const bodyHash = prefilterRequestBodyHash(request);
   const existing = await findIdempotentRequest(tenantId, request, bodyHash);
   if (existing?.kind === 'replay') return existing.response;
@@ -661,10 +677,9 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
         if (pendingItems.length > 0) {
           const pendingRequest = { ...request, items: pendingItems };
           try {
-            const brand = await getBrandContext(tenantId);
             const result = await callDeepSeekWithPrompt(
               tenantId,
-              buildPrefilterSystemPrompt(brand),
+              buildPrefilterSystemPrompt(brand, request.intent),
               buildPrefilterUserMessage(pendingRequest),
               {
                 timeoutMs: modelTimeoutMs(),
@@ -716,6 +731,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       requestId: request.requestId,
       intentId: request.intent.intentId,
       intentVersion: request.intent.intentVersion,
+      intent: request.intent,
       promptVersion: request.promptVersion,
       provider: PREFILTER_PROVIDER,
       model,

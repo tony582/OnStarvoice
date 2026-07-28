@@ -4,6 +4,12 @@
 
 import { queryOne, queryAll, execute, getSetting } from '../db/init.js';
 import { parsePublishTimestamp } from './publish-date.js';
+import {
+  formatMonitoringIntentForPrompt,
+  resolveMonitoringIntent,
+} from './monitoring-intent.js';
+
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v2';
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -37,17 +43,33 @@ export async function getBrandContext(tenantId) {
   return { brandName, brandAliases, businessContext, positiveContextTerms, noiseTerms };
 }
 
-function buildSystemPrompt(brand) {
+export function buildSystemPrompt(brand, intent = {}) {
   return `你是一个可配置品牌的舆情分析专家。当前品牌：${brand.brandName}。
 品牌别名：${brand.brandAliases.join('、') || brand.brandName}。
 业务语境：${brand.businessContext}
 强相关语境词：${brand.positiveContextTerms.join('、') || '无'}。
 常见误命中/噪声：${brand.noiseTerms.join('、') || '无'}。
 
-第一步判断内容是否在【监控范围】内。监控范围 = 品牌「${brand.brandName}」及上述"业务语境"所描述的范围：涵盖该品牌(及其别名/子品牌)的产品、服务、门店/渠道、官方与经销商/合作方动态、用户口碑与体验、相关话题/周边等。只要内容真实涉及该品牌或其产品/服务/周边，一律判 relevant —— 不要因为"没出现品牌全名"或"只是周边/话题/壁纸"就判无关。
-仅当内容与该品牌毫无关系才判 irrelevant：纯地名、人名、小区、楼盘、店铺、谐音、泛词，或属其它品牌/无关行业、无任何该品牌语境(例如品牌词只是地名/人名/谐音的巧合命中)。
-如果证据不足但可能相关，判为 uncertain，不要强行判负面或正面。
-只有 relevant 或 uncertain 的内容才继续判断情绪、意图和主题。
+${formatMonitoringIntentForPrompt(intent)}
+
+第一步判断内容是否符合【本次采集任务标准】，不是判断它是否宽泛涉及租户品牌家族：
+- relevant：内容有证据同时指向本次任务的目标对象和目标主题。
+- irrelevant：内容只涉及关联车型/品牌，却没有本次功能主题；或只是相似功能、泛行业话题、搜索词/标签/作者名巧合命中。
+- uncertain：已经出现目标对象或目标功能的直接线索，但列表或正文信息残缺，暂时无法确认两者关系。不能因为“功能相似”就判 uncertain。
+
+第二步先识别“内容实际评价的对象”，再判断情绪：
+- sentiment 必须表示内容对本次监控对象/主题的态度，而不是整段文字里最强烈的情绪。
+- 负面表达若指向其它品牌、其它产品或泛行业现象，不得判为对本次监控对象的 negative。
+- 客观询问、故障确认、经验交流，且没有明显抱怨、指责或维权诉求时，判 neutral + inquiry。
+- 内容相关与内容负面是两个独立结论；壁纸、教程、咨询可以 relevant 但 sentiment=neutral。
+- “安全”“安全感”“隐私”等普通词本身不代表负面或风险；必须有明确的故障、隐患、泄露、威胁、抱怨等上下文证据。
+
+校准样例：
+- “别克威朗车轮抱死”在“别克哨兵”任务中 irrelevant：它是机械故障，不是哨兵/驻车监控。
+- “至境E7胎噪”在“至境哨兵”任务中 irrelevant：它是车辆体验，不是哨兵功能。
+- “凯迪拉克碰撞测试”在“凯迪拉克OTA”任务中 irrelevant：它没有软件升级主题。
+- “安吉星反复提示更换空调滤芯，怎么关闭”可 relevant；若只是客观询问，则 sentiment=neutral、intent=inquiry。
+- “安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论。
 
 对每条内容，你需要输出以下JSON格式：
 
@@ -56,6 +78,9 @@ function buildSystemPrompt(brand) {
   "relevanceConfidence": 0.0-1.0,
   "relevanceReason": "判断相关或无关的简短原因",
   "noiseType": "none|place_name|person_name|real_estate|store|homophone|generic_word|other",
+  "targetEntity": "内容实际讨论或评价的对象",
+  "sentimentTarget": "情绪实际指向的对象",
+  "evidence": ["支持判断的原文短语"],
   "sentiment": "positive|neutral|negative",
   "intent": "inquiry|complaint|share|suggestion|other",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
@@ -84,12 +109,14 @@ function buildSystemPrompt(brand) {
 规则：
 - irrelevant 内容的 sentiment 固定为 neutral，category 固定为 other，summary 说明为何无关。
 - uncertain 内容的 sentiment 尽量保守，能判断再给 positive/negative，不能判断则 neutral。
-- 真实涉及本品牌(${brand.brandName}及其别名/子品牌)的内容一律 relevant，哪怕只是周边、话题、壁纸；只有当"品牌词/搜索词"是谐音、地名、无关行业的巧合命中(无任何本品牌语境)时，才判 irrelevant。
+- 租户品牌背景只能帮助理解实体，不能覆盖本次采集任务的目标主题和排除项。
+- 搜索关键词、话题标签和作者名称是召回线索，不是相关性结论。
 - 只输出JSON，不要其他文字。`;
 }
 
-function buildUserMessage(record) {
+export function buildUserMessage(record) {
   let text = '';
+  if (record.keyword) text += `采集关键词（仅表示召回入口，不代表一定相关）：${record.keyword}\n`;
   if (record.title) text += `标题：${record.title}\n`;
   if (record.content) text += `正文：${record.content.slice(0, 2000)}\n`;
   if (record.author_name) text += `作者：${record.author_name}\n`;
@@ -204,13 +231,16 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
   return data;
 }
 
-async function callLLM(userMessage, tenantId) {
+async function callLLM(userMessage, tenantId, keyword = '') {
   const config = await getLLMConfig(tenantId);
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
   const brand = await getBrandContext(tenantId);
-  const systemPrompt = buildSystemPrompt(brand);
-  if (config.provider === 'gemini') return await callGemini(config.apiKey, config.model, systemPrompt, userMessage);
-  return await callOpenAICompatible(config.apiKey, config.model, config.endpoint, systemPrompt, userMessage);
+  const intent = resolveMonitoringIntent(keyword, { brand });
+  const systemPrompt = buildSystemPrompt(brand, intent);
+  const result = config.provider === 'gemini'
+    ? await callGemini(config.apiKey, config.model, systemPrompt, userMessage)
+    : await callOpenAICompatible(config.apiKey, config.model, config.endpoint, systemPrompt, userMessage);
+  return { result, intent, provider: config.provider, model: config.model };
 }
 
 export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage) {
@@ -263,9 +293,19 @@ export async function labelRecord(recordId, options = {}) {
 
   const userMessage = buildUserMessage(record);
   try {
-    const rawResult = await callLLM(userMessage, record.tenant_id);
-    if (!rawResult) return null;
-    const result = normalizeResult(rawResult);
+    const labeled = await callLLM(userMessage, record.tenant_id, record.keyword);
+    if (!labeled?.result) return null;
+    const result = {
+      ...normalizeResult(labeled.result),
+      classifierMetadata: {
+        promptVersion: RECORD_CLASSIFICATION_PROMPT_VERSION,
+        provider: labeled.provider,
+        model: labeled.model,
+        monitoringIntentId: labeled.intent.intentId,
+        monitoringIntentVersion: labeled.intent.intentVersion,
+        monitoringObjective: labeled.intent.objective,
+      },
+    };
     const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;
     await execute(`
       UPDATE records SET

@@ -3517,7 +3517,7 @@ export async function batchCaptureDetailsForRecords(
                 reason: decision.reason,
                 keyword: decision.keyword,
                 stage: 'list',
-                promptVersion: 'prefilter-list-v1',
+                promptVersion: 'prefilter-list-v2',
                 executionDisposition: decision.shouldSkip
                   ? 'skip_expensive'
                   : 'collect_full',
@@ -12949,10 +12949,37 @@ const BATCH_KEYWORD_AFTER_NAV_WAIT_MS = 2000;
 const BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS = 12000;
 const BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS = 5000;
 const BATCH_KEYWORD_RESULTS_STABLE_POLLS = 2;
+// 0.3.32 在搜索后固定等待 2 秒、筛选后等待 1.2 秒。后来为尽快识别异常页移除了
+// 抖音等待，导致搜索→筛选→读取动作过密。恢复基础停顿并加入轻微随机化，同时轮询
+// 安全验证；这只降低触发概率，不会自动点击或绕过真实验证码。
+const DOUYIN_SEARCH_PACING_MIN_MS = 2000;
+const DOUYIN_SEARCH_PACING_MAX_MS = 3000;
+const DOUYIN_FILTER_PACING_MIN_MS = 1200;
+const DOUYIN_FILTER_PACING_MAX_MS = 1900;
 // 抖音搜索 URL 常被改写/二次编码,"网址里的关键词"经常和目标词字面对不上。
 // 切词那步(switchDouyinKeywordSearchInTab)已先确认过页面切到了新词,这里再强判 keywordMatched 是冗余的,
 // 只会在"卡片其实已经出现"时白白空等到超时。给一个宽限期:超过它仍未字面匹配但卡片稳定,就放行。
 const BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS = 6000;
+
+async function waitForDouyinSearchPacingWindow(
+  tabId,
+  shouldStop = null,
+  {phase = 'search'} = {},
+) {
+  const isFilterPhase = String(phase || '').trim() === 'filter';
+  const minMs = isFilterPhase
+    ? DOUYIN_FILTER_PACING_MIN_MS
+    : DOUYIN_SEARCH_PACING_MIN_MS;
+  const maxMs = isFilterPhase
+    ? DOUYIN_FILTER_PACING_MAX_MS
+    : DOUYIN_SEARCH_PACING_MAX_MS;
+  const delay = minMs + Math.random() * Math.max(0, maxMs - minMs);
+  await waitMsWithStopAndTick(delay, shouldStop, {
+    errorMessage: 'BATCH_CAPTURE_CANCELED',
+    tickMs: 350,
+    onTick: () => assertNoDouyinSearchSecurityChallengeInTab(tabId),
+  });
+}
 
 async function runBatchSingleNoteEnhancements(
   recordId,
@@ -13906,6 +13933,11 @@ export async function batchCaptureByKeywords({
           searchUrl,
           shouldStop,
         );
+        await waitForDouyinSearchPacingWindow(
+          runnerTabId,
+          shouldStop,
+          {phase: 'search'},
+        );
       } else {
         // 导航到搜索页
         await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
@@ -13980,6 +14012,11 @@ export async function batchCaptureByKeywords({
               });
             }
             await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
+            await waitForDouyinSearchPacingWindow(
+              runnerTabId,
+              shouldStop,
+              {phase: 'search'},
+            );
             const retrySearchReadiness = normalizeKeywordSearchReadiness(
               await waitForKeywordSearchResultsInTab(
                 runnerTabId,
@@ -14004,7 +14041,13 @@ export async function batchCaptureByKeywords({
           }
           await applySearchFiltersInTab(runnerTabId, searchFilters);
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
-          if (!isDouyinPlatform(platform)) {
+          if (isDouyinPlatform(platform)) {
+            await waitForDouyinSearchPacingWindow(
+              runnerTabId,
+              shouldStop,
+              {phase: 'filter'},
+            );
+          } else {
             await waitMsWithStop(
               1200,
               shouldStop,
@@ -14140,6 +14183,11 @@ export async function batchCaptureByKeywords({
         if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
           await applySearchFiltersInTab(runnerTabId, searchFilters);
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
+          await waitForDouyinSearchPacingWindow(
+            runnerTabId,
+            shouldStop,
+            {phase: 'filter'},
+          );
           const refilteredReadiness = normalizeKeywordSearchReadiness(
             await waitForKeywordSearchResultsInTab(
               runnerTabId,

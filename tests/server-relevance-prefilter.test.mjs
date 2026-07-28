@@ -9,6 +9,7 @@ import {
   PREFILTER_DEFAULT_TENANT_CONCURRENCY,
   PREFILTER_MAX_LIST_BATCH,
   PREFILTER_MIN_SKIP_THRESHOLD,
+  PREFILTER_PROMPT_VERSION,
   buildPrefilterSystemPrompt,
   buildPrefilterUserMessage,
   determineExecutionDisposition,
@@ -18,6 +19,7 @@ import {
   resolvePrefilterPolicyValues,
   validatePrefilterRequest,
 } from '../server/services/relevance-prefilter.js';
+import { resolveMonitoringIntent } from '../server/services/monitoring-intent.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -62,6 +64,7 @@ test('list request validation is bounded, normalized and conservative-only for r
   assert.equal(result.ok, true);
   assert.equal(result.value.platform, 'xiaohongshu');
   assert.equal(result.value.keyword, '别克 壁纸');
+  assert.equal(result.value.promptVersion, PREFILTER_PROMPT_VERSION);
   assert.equal(result.value.requestedThreshold, PREFILTER_MIN_SKIP_THRESHOLD);
   assert.equal(result.value.mode, 'conservative');
   assert.equal(result.value.items[0].inputValid, true);
@@ -88,6 +91,7 @@ test('invalid batch shapes are rejected before any model call', () => {
     'DUPLICATE_ITEM_ID',
   );
   assert.equal(validatePrefilterRequest(validBody({ stage: 'detail' })).error, 'UNSUPPORTED_STAGE');
+  assert.equal(validatePrefilterRequest(validBody({ promptVersion: 'prefilter-list-v0' })).error, 'PROMPT_VERSION_CONFLICT');
 });
 
 test('first release sends DeepSeek only minimal list text', () => {
@@ -106,9 +110,15 @@ test('first release sends DeepSeek only minimal list text', () => {
   assert.match(message, /别克壁纸/);
   assert.doesNotMatch(message, /must-not-enter-prompt|详情正文不应发送|private\.example|评论不应发送/);
 
-  const prompt = buildPrefilterSystemPrompt({ brandName: '别克' });
+  const prompt = buildPrefilterSystemPrompt(
+    { brandName: '别克' },
+    resolveMonitoringIntent('别克壁纸'),
+  );
   assert.match(prompt, /keep\|skip\|need_detail/);
   assert.match(prompt, /不是在做宽泛的品牌舆情判断/);
+  assert.match(prompt, /目标对象：别克、Buick/);
+  assert.match(prompt, /目标主题：车机壁纸、手机壁纸/);
+  assert.match(prompt, /必须同时符合任务的目标对象和目标主题/);
   assert.match(prompt, /其它汽车品牌[\s\S]*0\.98-1\.00/);
   assert.match(prompt, /合理相关解释[\s\S]*need_detail[\s\S]*0\.96/);
 });
