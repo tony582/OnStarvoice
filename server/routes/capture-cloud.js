@@ -1712,7 +1712,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
         error = CASE
           WHEN $1 = 'needs_action' THEN jsonb_build_object(
             'code', 'missing_target_result',
-            'message', $7
+            'message', $7::text
           )
           ELSE error
         END,

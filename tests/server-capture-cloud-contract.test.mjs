@@ -217,6 +217,10 @@ test("negative patrol result projection binds server records and fresh observati
   assert.match(projection, /visible_comments_bounded/u);
   assert.match(
     projection,
+    /'message', \$7::text/u,
+  );
+  assert.match(
+    projection,
     /ORDER BY ordinal, id[\s\S]*OFFSET \$5[\s\S]*nextOrdinal\s*-\s*1/u,
   );
   assert.doesNotMatch(projection, /entry\.recordIds/u);
