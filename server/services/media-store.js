@@ -101,6 +101,32 @@ export function queueCoverLocalization(recordId, coverUrl, platform) {
   ensureCoverLocal(recordId, coverUrl, platform).catch(() => {});
 }
 
+export function imageSourceIdentity(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    const hostname = String(parsed.hostname || '').toLowerCase();
+    const isDouyinImageHost = [
+      'douyinpic.com',
+      'byteimg.com',
+      'pstatp.com',
+      'bytecdn.cn',
+    ].some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
+    if (isDouyinImageHost) {
+      const pathSegments = String(parsed.pathname || '').split('/').filter(Boolean);
+      const lastSegment = decodeURIComponent(pathSegments.at(-1) || '');
+      // 同一抖音素材会因搜索页/详情页生成不同签名、格式和尺寸后缀。
+      // `~` 前的素材 token 才是稳定身份，不能按整条限时 URL 重复下载。
+      const assetToken = lastSegment.split('~')[0].trim();
+      if (assetToken) return `douyin:${assetToken}`;
+    }
+  } catch {
+    // 非标准 URL 继续使用原值，保持旧行为。
+  }
+  return raw;
+}
+
 function parseImageUrls(value) {
   let parsed = value;
   if (typeof parsed === 'string') {
@@ -111,8 +137,9 @@ function parseImageUrls(value) {
   const seen = new Set();
   for (const item of parsed) {
     const url = typeof item === 'string' ? item.trim() : String(item?.url || '').trim();
-    if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
-    seen.add(url);
+    const identity = imageSourceIdentity(url);
+    if (!/^https?:\/\//i.test(url) || !identity || seen.has(identity)) continue;
+    seen.add(identity);
     urls.push(url);
     if (urls.length >= 20) break;
   }
@@ -128,7 +155,10 @@ function parseLocalImageEntries(value) {
 }
 
 function imageSourceHash(url) {
-  return createHash('sha256').update(url).digest('hex').slice(0, 20);
+  return createHash('sha256')
+    .update(imageSourceIdentity(url))
+    .digest('hex')
+    .slice(0, 20);
 }
 
 function localImageExists(url) {
@@ -146,8 +176,13 @@ export async function ensureRecordImagesLocal(recordId, imageUrls, platform) {
     const current = new Map();
     for (const entry of parseLocalImageEntries(row.image_local_urls)) {
       const hash = String(entry?.source_hash || '');
+      const sourceUrl = String(entry?.source_url || '');
       const url = String(entry?.url || '');
-      if (hash && url && localImageExists(url)) current.set(hash, url);
+      if (!url || !localImageExists(url)) continue;
+      if (hash) current.set(hash, url);
+      // 兼容旧版本按完整签名 URL 生成的 source_hash：只要素材 token 相同，
+      // 新采集的 URL 变了也直接复用已经落地的文件。
+      if (sourceUrl) current.set(imageSourceHash(sourceUrl), url);
     }
 
     await acquire();

@@ -240,6 +240,18 @@ test("server normalizes identity snapshots and uses the Shanghai usage day", () 
   );
 });
 
+test("account overview returns usage dates without UTC day rollover", async () => {
+  const route = await source("server/routes/social-accounts.js");
+  assert.match(
+    route,
+    /du\.usage_date::text AS usage_date/u,
+  );
+  assert.match(
+    route,
+    /String\(row\.usage_date\) === today/u,
+  );
+});
+
 test("manual Agent binding cannot be overwritten by a conflicting heartbeat", async () => {
   const executed = [];
   const tx = {

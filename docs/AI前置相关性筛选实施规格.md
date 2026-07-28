@@ -289,7 +289,7 @@ discovered
   "platform": "xiaohongshu",
   "stage": "list|detail",
   "keyword": "别克壁纸",
-  "promptVersion": "prefilter-list-v1",
+  "promptVersion": "prefilter-list-v2",
   "intent": {
     "intentId": "intent_uuid",
     "intentVersion": 1,
@@ -317,7 +317,7 @@ discovered
   "ok": true,
   "requestId": "req_uuid",
   "intentId": "intent_uuid",
-  "promptVersion": "prefilter-list-v1",
+  "promptVersion": "prefilter-list-v2",
   "intentVersion": 1,
   "model": "qwen-or-deepseek-model-name",
   "latencyMs": 826,

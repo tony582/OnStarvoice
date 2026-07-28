@@ -401,7 +401,7 @@ export async function evaluateRelevancePrefilterRecords(
               platform: batch[0].platform,
               stage: 'list',
               keyword: batch[0].keyword,
-              promptVersion: 'prefilter-list-v1',
+              promptVersion: 'prefilter-list-v2',
               mode: 'conservative',
               skipThreshold: normalizedThreshold,
               items: requestItems,

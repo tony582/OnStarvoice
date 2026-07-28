@@ -5,6 +5,7 @@
 import crypto from 'crypto';
 import { queryOne, execute, getSetting, withTransaction } from '../db/init.js';
 import { sendAlertEmail } from './email-notifier.js';
+import { matchDangerKeywords } from './alert-risk-matcher.js';
 
 const HIGH_DANGER_KEYWORDS_DEFAULT = '安全,隐私,泄露,事故,召回,起火,失控,刹车失灵,死亡,伤亡';
 
@@ -122,8 +123,8 @@ export async function checkAlerts(recordId) {
 
   const dangerKeywords = ((await getSetting('alert_high_danger_keywords', record.tenant_id)) || HIGH_DANGER_KEYWORDS_DEFAULT)
     .split(',').map(k => k.trim()).filter(Boolean);
-  const textToCheck = `${record.title} ${record.content}`.toLowerCase();
-  const matchedDangerKeywords = dangerKeywords.filter(kw => textToCheck.includes(kw.toLowerCase()));
+  const textToCheck = `${record.title || ''} ${record.content || ''}`;
+  const matchedDangerKeywords = matchDangerKeywords(textToCheck, dangerKeywords);
   const interactionTotal = (record.likes || 0) + (record.comments_count || 0) + (record.collects || 0) + (record.shares || 0);
 
   if (matchedDangerKeywords.length > 0) {

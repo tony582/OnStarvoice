@@ -116,7 +116,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // 收件箱「待处理队列」条件(别名约定: records r / record_triage rt)。
 // workspace.js 的 /badges 计数 import 此常量,保证侧边栏徽标与收件箱列表数字一致。
 export const ACTIVE_QUEUE_CONDITION = `
-  r.record_type <> 'official_content'
+  r.record_type NOT IN ('official_content', 'blogger_profile')
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
   AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
   AND rt.archived_at IS NULL
@@ -125,7 +125,7 @@ export const ACTIVE_QUEUE_CONDITION = `
 
 // 处理模式和归档生命周期相互独立。两个列表共享模式范围，只按 archived_at 分组。
 const TRIAGE_CONTENT_CONDITION = `
-  r.record_type <> 'official_content'
+  r.record_type NOT IN ('official_content', 'blogger_profile')
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
   AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing', 'official_responded', 'no_action')
 `;

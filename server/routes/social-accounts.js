@@ -252,7 +252,8 @@ router.get(
         queryAll(`
           SELECT
             du.social_account_id, du.agent_id, du.platform,
-            du.usage_date, du.searches, du.enhancements,
+            du.usage_date::text AS usage_date,
+            du.searches, du.enhancements,
             du.capture_runs, du.captured_items, du.failed_events,
             du.last_event_at
           FROM social_account_daily_usage du

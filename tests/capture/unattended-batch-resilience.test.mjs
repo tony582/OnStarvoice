@@ -62,6 +62,7 @@ function createBatchHarness({
   const submitCalls = [];
   const settled = [];
   const progress = [];
+  const pacingCalls = [];
   const liveTabs = new Map([
     [101, {id: 101, windowId: 7, groupId: 9, url: "https://www.xiaohongshu.com/search_result"}],
   ]);
@@ -185,6 +186,9 @@ function createBatchHarness({
       typeof waitForResults === "function"
         ? await waitForResults({tabId, platform, shouldStop, ...(options || {})})
         : true,
+    waitForDouyinSearchPacingWindow: async (tabId, shouldStop, options = {}) => {
+      pacingCalls.push({tabId, phase: options.phase || "search"});
+    },
     waitMsWithStop: async () => {},
     waitMsWithStopAndTick: async () => {},
   };
@@ -211,6 +215,7 @@ function createBatchHarness({
     captureCalls,
     filterCalls,
     navigationCalls,
+    pacingCalls,
     progress,
     getReplacementListenerCount: () => replacementListeners.size,
     replaceRunnerTab,
@@ -228,6 +233,26 @@ function successCapture(keyword) {
     savedRecords: [],
   };
 }
+
+test("Douyin restores a paced settle window after search and filtering", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    hasActiveFilters: true,
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1"],
+    searchFilters: {sort: "latest", publishTime: "day"},
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    harness.pacingCalls.map((entry) => entry.phase),
+    ["search", "filter"],
+  );
+});
 
 test("one empty keyword retry does not truncate the remaining 12 keyword plan", async () => {
   const attempts = new Map();
