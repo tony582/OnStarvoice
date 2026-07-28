@@ -19,6 +19,7 @@ import {
 import {
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  isProfilePatrolTask,
   lockActiveCaptureAgentSession,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
@@ -182,6 +183,51 @@ test("official comment patrol keeps bounded per-run comment observations", () =>
   );
 });
 
+test("official comment patrol distinguishes profile scans from legacy direct-detail tasks", () => {
+  assert.equal(
+    isProfilePatrolTask({
+      task_type: "official_account_comment_patrol",
+      metadata: {targetMode: "profile", profileMode: true},
+    }),
+    true,
+  );
+  assert.equal(
+    isProfilePatrolTask(
+      {task_type: "official_account_comment_patrol", metadata: {}},
+      {targetMode: "profile"},
+    ),
+    true,
+  );
+  assert.equal(
+    isProfilePatrolTask({
+      task_type: "official_account_comment_patrol",
+      metadata: {targetMode: "detail", subjectType: "official"},
+    }, {
+      targetMode: "profile",
+    }),
+    false,
+  );
+  assert.equal(
+    isProfilePatrolTask({
+      task_type: "official_account_comment_patrol",
+      metadata: {subjectType: "official"},
+    }),
+    false,
+  );
+  assert.equal(
+    isProfilePatrolTask("followed_creator_post_patrol"),
+    true,
+  );
+  assert.equal(
+    isProfilePatrolTask("official_account_post_discovery"),
+    true,
+  );
+  assert.equal(
+    isProfilePatrolTask("negative_post_patrol"),
+    false,
+  );
+});
+
 test("targeted detail result projection has a closed workflow allow-list", () => {
   assert.match(
     captureCloudRouteSource,
@@ -212,6 +258,7 @@ test("negative patrol result projection binds server records and fresh observati
   assert.match(projection, /captured_at >= \$3::timestamptz/u);
   assert.match(projection, /result_observation_id/u);
   assert.match(projection, /aggregateParentTaskItems\(items\)/u);
+  assert.match(projection, /isProfilePatrolTask\(task\)/u);
   assert.match(projection, /commentsSampled/u);
   assert.match(projection, /commentPartialPosts/u);
   assert.match(projection, /visible_comments_bounded/u);

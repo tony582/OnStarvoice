@@ -150,6 +150,11 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
     /rawPhase\.startsWith\("target_"\)[\s\S]*?: `target_\$\{rawPhase\}`/u,
   );
   assert.doesNotMatch(runnerSection, /phase:\s*`target_\$\{String\(progress\.phase/u);
+  assert.match(
+    runnerSection,
+    /const localRecordIds = collectTargetedPostRecordIds\(batchResult\);[\s\S]*?getRecords\(localRecordIds\)/u,
+  );
+  assert.doesNotMatch(runnerSection, /getRecords\(\)/u);
 
   const batchSection = readSourceSection(
     captureSyncSource,
@@ -164,6 +169,201 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
     batchSection,
     /chrome\.tabs\.get\(normalizedExplicitRunnerTabId\)[\s\S]*?: await getCurrentActiveTab\(\)/u,
   );
+});
+
+test("targeted patrol reads only the records returned by the current batch", () => {
+  const collectSection = readFunctionSection(
+    "function collectTargetedPostRecordIds(",
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+  );
+  const context = {};
+  vm.runInNewContext(
+    `${collectSection}
+globalThis.__collectTargetedPostRecordIds = collectTargetedPostRecordIds;`,
+    context,
+  );
+
+  assert.deepEqual(
+    [...context.__collectTargetedPostRecordIds({
+      results: [
+        {recordIds: ["record-a", "record-b", "record-a", ""]},
+        {recordIds: [" record-c "]},
+        {recordIds: null},
+      ],
+    })],
+    ["record-a", "record-b", "record-c"],
+  );
+  assert.deepEqual(
+    [...context.__collectTargetedPostRecordIds({results: []})],
+    [],
+  );
+});
+
+test("a completed Douyin targeted patrol pauses its owned media and returns its runner home", async () => {
+  const cleanupSection = readFunctionSection(
+    "async function settleTargetedPostRunnerTab(",
+    "async function waitForTargetedPostRunnerTab(",
+  );
+  const scriptCalls = [];
+  const tabUpdates = [];
+  const context = {
+    chrome: {
+      tabs: {
+        get: async () => ({
+          id: 77,
+          url: "https://www.douyin.com/video/766193585000000001",
+        }),
+        update: async (tabId, patch) => {
+          tabUpdates.push({tabId, patch});
+          return {id: tabId, ...patch};
+        },
+      },
+      scripting: {
+        executeScript: async (payload) => {
+          scriptCalls.push(payload);
+          return [{result: 1}];
+        },
+      },
+    },
+    detectPlatformFromUrl: (url) =>
+      String(url || "").includes("douyin.com") ? "douyin" : "unknown",
+    TARGETED_POST_RUNNER_HOME_URLS: {
+      douyin: "https://www.douyin.com/jingxuan",
+    },
+    console,
+  };
+  vm.runInNewContext(
+    `${cleanupSection}
+globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
+    context,
+  );
+
+  assert.equal(
+    await context.__settleTargetedPostRunnerTab(77, "douyin"),
+    true,
+  );
+  assert.equal(scriptCalls.length, 1);
+  assert.equal(scriptCalls[0].target.tabId, 77);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(tabUpdates)),
+    [{
+      tabId: 77,
+      patch: {
+        url: "https://www.douyin.com/jingxuan",
+        active: true,
+      },
+    }],
+  );
+
+  const runnerSection = readFunctionSection(
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+    "async function maybeClaimAndRunUnattendedKeywordPlan(",
+  );
+  const settleIndex = runnerSection.lastIndexOf(
+    "await settleTargetedPostRunnerTab(targetTabId, request?.platform, {",
+  );
+  const clearIndex = runnerSection.lastIndexOf(
+    "activeBatchRunnerTabId = null",
+  );
+  assert.ok(settleIndex > -1);
+  assert.ok(clearIndex > settleIndex);
+});
+
+test("targeted patrol cleanup never redirects a non-Douyin runner", async () => {
+  const cleanupSection = readFunctionSection(
+    "async function settleTargetedPostRunnerTab(",
+    "async function waitForTargetedPostRunnerTab(",
+  );
+  const scriptCalls = [];
+  const tabUpdates = [];
+  const context = {
+    chrome: {
+      tabs: {
+        get: async () => ({
+          id: 88,
+          url: "https://www.xiaohongshu.com/explore/note-1",
+        }),
+        update: async (tabId, patch) => {
+          tabUpdates.push({tabId, patch});
+          return {id: tabId, ...patch};
+        },
+      },
+      scripting: {
+        executeScript: async (payload) => {
+          scriptCalls.push(payload);
+          return [];
+        },
+      },
+    },
+    detectPlatformFromUrl: (url) =>
+      String(url || "").includes("xiaohongshu.com")
+        ? "xiaohongshu"
+        : "unknown",
+    TARGETED_POST_RUNNER_HOME_URLS: {
+      douyin: "https://www.douyin.com/jingxuan",
+    },
+    console,
+  };
+  vm.runInNewContext(
+    `${cleanupSection}
+globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
+    context,
+  );
+
+  assert.equal(
+    await context.__settleTargetedPostRunnerTab(88, "douyin"),
+    false,
+  );
+  assert.equal(scriptCalls.length, 0);
+  assert.equal(tabUpdates.length, 0);
+});
+
+test("targeted patrol safety intervention pauses media without leaving the page", async () => {
+  const cleanupSection = readFunctionSection(
+    "async function settleTargetedPostRunnerTab(",
+    "async function waitForTargetedPostRunnerTab(",
+  );
+  const scriptCalls = [];
+  const tabUpdates = [];
+  const context = {
+    chrome: {
+      tabs: {
+        get: async () => ({
+          id: 99,
+          url: "https://www.douyin.com/video/766193585000000002",
+        }),
+        update: async (tabId, patch) => {
+          tabUpdates.push({tabId, patch});
+          return {id: tabId, ...patch};
+        },
+      },
+      scripting: {
+        executeScript: async (payload) => {
+          scriptCalls.push(payload);
+          return [{result: 1}];
+        },
+      },
+    },
+    detectPlatformFromUrl: () => "douyin",
+    TARGETED_POST_RUNNER_HOME_URLS: {
+      douyin: "https://www.douyin.com/jingxuan",
+    },
+    console,
+  };
+  vm.runInNewContext(
+    `${cleanupSection}
+globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
+    context,
+  );
+
+  assert.equal(
+    await context.__settleTargetedPostRunnerTab(99, "douyin", {
+      returnHome: false,
+    }),
+    true,
+  );
+  assert.equal(scriptCalls.length, 1);
+  assert.equal(tabUpdates.length, 0);
 });
 
 test("a normal side panel without a runner query renders shared targeted state and stops that exact request", async () => {

@@ -1304,12 +1304,40 @@ async function readTaskLedger() {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.taskLedger,
       STORAGE_KEYS.unattendedKeywordRunRequest,
+      STORAGE_KEYS.targetedPostRunRequest,
     ]);
     const rawLedger = stored[STORAGE_KEYS.taskLedger];
     const core = getUnattendedTaskCenterCore();
     if (core?.normalizeTaskLedger) {
       const now = Date.now();
-      const normalized = core.normalizeTaskLedger(rawLedger, {now});
+      let normalized = core.normalizeTaskLedger(rawLedger, {now});
+      let repairedTargetedLedger = false;
+      const targetedRequest = stored[STORAGE_KEYS.targetedPostRunRequest];
+      const targetedRequestId = String(
+        targetedRequest?.id || targetedRequest?.requestId || '',
+      ).trim();
+      if (
+        targetedRequestId &&
+        isSupportedCloudTargetedPostWorkflow(targetedRequest?.workflow) &&
+        !normalized.runs.some((run) => run?.id === targetedRequestId)
+      ) {
+        const taskRun = buildTargetedPostTaskCenterRun(targetedRequest);
+        if (taskRun) {
+          if (!taskRun.metadata.cloudAgentScopeId) {
+            taskRun.metadata.cloudAgentScopeId = String(
+              (await readCloudTaskAgentCredential()).id || '',
+            );
+          }
+          const result = core.upsertTaskRun(normalized, taskRun, {
+            now,
+            attemptId: String(taskRun.attemptId || ''),
+          });
+          if (result.accepted) {
+            normalized = result.ledger;
+            repairedTargetedLedger = true;
+          }
+        }
+      }
       const reconciled = core.reconcileStaleTaskLedger
         ? core.reconcileStaleTaskLedger(normalized, {
             now,
@@ -1319,10 +1347,15 @@ async function readTaskLedger() {
                 now,
                 unattendedRequest:
                   stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+                targetedRequest:
+                  stored[STORAGE_KEYS.targetedPostRunRequest],
               }),
           })
         : normalized;
-      if (JSON.stringify(reconciled) !== JSON.stringify(normalized)) {
+      if (
+        repairedTargetedLedger ||
+        JSON.stringify(reconciled) !== JSON.stringify(normalized)
+      ) {
         await chrome.storage.local.set({
           [STORAGE_KEYS.taskLedger]: reconciled,
         });
@@ -1896,11 +1929,184 @@ async function readTargetedPostRunRequest() {
     JSON.stringify(targetResults) !== JSON.stringify(request.targetResults) ||
     JSON.stringify(checkpoint) !== JSON.stringify(request.checkpoint)
   ) {
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.targetedPostRunRequest]: normalized,
-    });
+    await persistTargetedPostRunRequest(normalized);
   }
   return normalized;
+}
+
+function targetedPostTaskCenterDescriptor(request = {}) {
+  const workflow = String(request?.workflow || '').trim();
+  if (workflow === 'official_account_comment_patrol') {
+    return {
+      workflow,
+      taskType: 'official_account_comment_patrol',
+      title: String(request?.title || '').trim() || '官方账号评论巡查',
+    };
+  }
+  if (workflow === 'followed_creator_post_patrol') {
+    return {
+      workflow,
+      taskType: 'followed_creator_post_patrol',
+      title: String(request?.title || '').trim() || '关注博主作品扫描',
+    };
+  }
+  if (workflow === 'official_account_post_discovery') {
+    return {
+      workflow,
+      taskType: 'official_account_post_discovery',
+      title: String(request?.title || '').trim() || '官方账号作品发现',
+    };
+  }
+  return {
+    workflow: 'negative_post_patrol',
+    taskType: 'negative_post_patrol',
+    title: String(request?.title || '').trim() || '负面帖子定向巡查',
+  };
+}
+
+function targetedPostTaskCenterStatus(value) {
+  const status = String(value || '').trim().toLowerCase();
+  if (status === 'pending') return 'pending';
+  if (status === 'running' || status === 'cancel_requested') return 'running';
+  if (status === 'needs_action') return 'needs_action';
+  if (
+    [
+      'completed',
+      'completed_with_warnings',
+      'completed_with_failures',
+      'failed',
+      'canceled',
+      'skipped',
+    ].includes(status)
+  ) {
+    return status;
+  }
+  return 'pending';
+}
+
+function targetedPostTaskCenterInteger(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? Math.max(0, Math.floor(numeric))
+    : Math.max(0, Math.floor(Number(fallback) || 0));
+}
+
+function buildTargetedPostTaskCenterRun(request, existingRun = null) {
+  if (!request || typeof request !== 'object') return null;
+  const id = String(request.id || request.requestId || '').trim();
+  if (!id) return null;
+  const descriptor = targetedPostTaskCenterDescriptor(request);
+  const checkpoint =
+    request.checkpoint &&
+    typeof request.checkpoint === 'object' &&
+    !Array.isArray(request.checkpoint)
+      ? request.checkpoint
+      : {};
+  const progress =
+    request.progress &&
+    typeof request.progress === 'object' &&
+    !Array.isArray(request.progress)
+      ? request.progress
+      : {};
+  const targets = Array.isArray(request.targets) ? request.targets : [];
+  const targetResults = Array.isArray(request.targetResults)
+    ? request.targetResults
+    : [];
+  const total = targetedPostTaskCenterInteger(
+    checkpoint.total,
+    targetedPostTaskCenterInteger(progress.total, targets.length),
+  );
+  const processed = targetedPostTaskCenterInteger(
+    checkpoint.processedCount,
+    targetedPostTaskCenterInteger(progress.current, targetResults.length),
+  );
+  const updatedAt = String(
+    request.updatedAt ||
+      progress.updatedAt ||
+      request.heartbeatAt ||
+      request.startedAt ||
+      request.createdAt ||
+      new Date().toISOString(),
+  );
+  const status = targetedPostTaskCenterStatus(request.status);
+  const terminal = Boolean(
+    getUnattendedTaskCenterCore()?.isTerminalTaskStatus?.(status),
+  );
+  const priorMetadata =
+    existingRun?.metadata &&
+    typeof existingRun.metadata === 'object' &&
+    !Array.isArray(existingRun.metadata)
+      ? existingRun.metadata
+      : {};
+  const requestMetadata =
+    request.metadata &&
+    typeof request.metadata === 'object' &&
+    !Array.isArray(request.metadata)
+      ? request.metadata
+      : {};
+  return {
+    id,
+    taskType: descriptor.taskType,
+    featureKey: descriptor.taskType,
+    title: descriptor.title,
+    source: 'cloud_assignment',
+    trigger: 'remote',
+    platform: String(request.platform || 'unknown').trim().toLowerCase(),
+    status,
+    attemptId: String(request.attemptId || ''),
+    attemptNumber: targetedPostTaskCenterInteger(request.attemptNumber, 1),
+    progressSeq: targetedPostTaskCenterInteger(request.progressSeq),
+    createdAt: String(request.createdAt || updatedAt),
+    startedAt: String(request.startedAt || ''),
+    updatedAt,
+    finishedAt: terminal ? String(request.finishedAt || updatedAt) : '',
+    heartbeatAt: String(request.heartbeatAt || updatedAt),
+    businessProgressAt: String(progress.updatedAt || updatedAt),
+    message:
+      String(progress.message || request.message || '').trim() ||
+      (request.cancelRequested === true ? '正在停止定向巡查任务' : ''),
+    error: request.error || null,
+    runnerTabId: request.runnerTabId,
+    counts: {
+      total,
+      processed,
+      saved: targetedPostTaskCenterInteger(checkpoint.capturedCount),
+      success: targetedPostTaskCenterInteger(checkpoint.successCount),
+      failed: targetedPostTaskCenterInteger(checkpoint.failedCount),
+      skipped: targetedPostTaskCenterInteger(checkpoint.skippedCount),
+      retried: targetedPostTaskCenterInteger(
+        request.counts?.retried,
+        request.retryCount,
+      ),
+      warnings: targetedPostTaskCenterInteger(checkpoint.warningCount),
+    },
+    progress: {
+      current: targetedPostTaskCenterInteger(progress.current, processed),
+      total: targetedPostTaskCenterInteger(progress.total, total),
+      index: targetedPostTaskCenterInteger(progress.index, processed),
+      phase: String(progress.phase || descriptor.workflow),
+      message: String(progress.message || request.message || ''),
+      retryCount: targetedPostTaskCenterInteger(progress.retryCount),
+      maxRetries: targetedPostTaskCenterInteger(progress.maxRetries),
+      updatedAt: String(progress.updatedAt || updatedAt),
+    },
+    metadata: {
+      workflow: descriptor.workflow,
+      protocolVersion: targetedPostTaskCenterInteger(request.protocolVersion),
+      taskId: String(request.taskId || ''),
+      cloudCommandId: String(request.cloudCommandId || ''),
+      subjectType: String(request.subjectType || ''),
+      targetCount: total,
+      cancelRequested:
+        request.cancelRequested === true ||
+        String(request.status || '') === 'cancel_requested',
+      cloudAgentScopeId: String(
+        priorMetadata.cloudAgentScopeId ||
+          requestMetadata.cloudAgentScopeId ||
+          '',
+      ),
+    },
+  };
 }
 
 async function persistTargetedPostRunRequest(request) {
@@ -1908,10 +2114,50 @@ async function persistTargetedPostRunRequest(request) {
     await chrome.storage.local.remove(STORAGE_KEYS.targetedPostRunRequest);
     return null;
   }
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.targetedPostRunRequest]: request,
+  return await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const core = getUnattendedTaskCenterCore();
+    const now = new Date().toISOString();
+    let ledger = core?.normalizeTaskLedger
+      ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
+      : stored[STORAGE_KEYS.taskLedger] || {
+          version: 1,
+          runs: [],
+          updatedAt: '',
+        };
+    const existingRun = Array.isArray(ledger?.runs)
+      ? ledger.runs.find((item) => item?.id === request.id) || null
+      : null;
+    const taskRun = buildTargetedPostTaskCenterRun(request, existingRun);
+    if (!taskRun) {
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.targetedPostRunRequest]: request,
+      });
+      return request;
+    }
+    if (!taskRun.metadata.cloudAgentScopeId) {
+      taskRun.metadata.cloudAgentScopeId = String(
+        (await readCloudTaskAgentCredential()).id || '',
+      );
+    }
+    const result = core?.upsertTaskRun
+      ? core.upsertTaskRun(ledger, taskRun, {
+          now,
+          attemptId: String(taskRun.attemptId || ''),
+        })
+      : fallbackUpsertUnattendedTaskRun(ledger, taskRun, {
+          previousAttemptId: String(taskRun.attemptId || ''),
+        });
+    if (result.accepted) {
+      ledger = result.ledger;
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.targetedPostRunRequest]: request,
+      [STORAGE_KEYS.taskLedger]: ledger,
+    });
+    scheduleCloudTaskAgentSync('targeted_post_state_changed');
+    return request;
   });
-  return request;
 }
 
 async function createOrResumeTargetedPostRun(command, payload) {
@@ -2716,7 +2962,12 @@ function taskRunActivityAt(run) {
 
 function isTaskRunActuallyActive(
   run,
-  {now = Date.now(), unattendedRequest = null, includeRecent = false} = {},
+  {
+    now = Date.now(),
+    unattendedRequest = null,
+    targetedRequest = null,
+    includeRecent = false,
+  } = {},
 ) {
   const taskId = String(run?.id || run?.taskId || '').trim();
   if (!taskId) return false;
@@ -2734,13 +2985,31 @@ function isTaskRunActuallyActive(
   const requestId = String(
     unattendedRequest?.id || unattendedRequest?.requestId || '',
   ).trim();
-  if (requestId !== taskId) return false;
-  const requestStatus = String(unattendedRequest?.status || '').toLowerCase();
-  if (UNATTENDED_RUN_TERMINAL_STATUSES.has(requestStatus)) return false;
-  const requestActivityAt = taskRunActivityAt(unattendedRequest);
+  if (requestId === taskId) {
+    const requestStatus = String(unattendedRequest?.status || '').toLowerCase();
+    if (UNATTENDED_RUN_TERMINAL_STATUSES.has(requestStatus)) return false;
+    const requestActivityAt = taskRunActivityAt(unattendedRequest);
+    return Boolean(
+      requestActivityAt &&
+        now - requestActivityAt < UNATTENDED_RUN_ACTIVE_GRACE_MS,
+    );
+  }
+
+  const targetedRequestId = String(
+    targetedRequest?.id || targetedRequest?.requestId || '',
+  ).trim();
+  if (targetedRequestId !== taskId) return false;
+  if (
+    cloudTargetedPostApi?.isTerminalRunStatus?.(
+      String(targetedRequest?.status || ''),
+    )
+  ) {
+    return false;
+  }
+  const targetedActivityAt = taskRunActivityAt(targetedRequest);
   return Boolean(
-    requestActivityAt &&
-      now - requestActivityAt < UNATTENDED_RUN_ACTIVE_GRACE_MS,
+    targetedActivityAt &&
+      now - targetedActivityAt < UNATTENDED_RUN_ACTIVE_GRACE_MS,
   );
 }
 
@@ -2750,6 +3019,7 @@ async function clearTaskCenterRecords() {
       STORAGE_KEYS.taskLedger,
       STORAGE_KEYS.unattendedKeywordPlan,
       STORAGE_KEYS.unattendedKeywordRunRequest,
+      STORAGE_KEYS.targetedPostRunRequest,
     ]);
     const core = getUnattendedTaskCenterCore();
     const now = Date.now();
@@ -2773,6 +3043,24 @@ async function clearTaskCenterRecords() {
           {now, unattendedRequest},
         ),
     );
+    const targetedRequest =
+      stored[STORAGE_KEYS.targetedPostRunRequest] &&
+      typeof stored[STORAGE_KEYS.targetedPostRunRequest] === 'object'
+        ? stored[STORAGE_KEYS.targetedPostRunRequest]
+        : null;
+    const targetedRequestId = String(
+      targetedRequest?.id || targetedRequest?.requestId || '',
+    ).trim();
+    const targetedRequestActive = Boolean(
+      targetedRequestId &&
+        !cloudTargetedPostApi?.isTerminalRunStatus?.(
+          String(targetedRequest?.status || ''),
+        ) &&
+        isTaskRunActuallyActive(
+          {...targetedRequest, id: targetedRequestId},
+          {now, targetedRequest},
+        ),
+    );
     const normalized = core?.normalizeTaskLedger
       ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
       : stored[STORAGE_KEYS.taskLedger] || {version: 1, runs: []};
@@ -2782,6 +3070,7 @@ async function clearTaskCenterRecords() {
       return isTaskRunActuallyActive(run, {
         now,
         unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+        targetedRequest: stored[STORAGE_KEYS.targetedPostRunRequest],
         includeRecent: true,
       });
     });
@@ -2831,12 +3120,18 @@ async function clearTaskCenterRecords() {
         });
       }
     }
+    let clearedTargetedRequest = false;
+    if (!targetedRequestActive && targetedRequestId) {
+      await chrome.storage.local.remove(STORAGE_KEYS.targetedPostRunRequest);
+      clearedTargetedRequest = true;
+    }
     return {
       ledger,
       clearedAt: nowIso,
       clearedCount: Math.max(0, runs.length - preservedRuns.length),
       preservedActiveCount: preservedRuns.length,
       clearedUnattendedRequest,
+      clearedTargetedRequest,
     };
   });
 }

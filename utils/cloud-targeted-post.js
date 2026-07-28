@@ -305,15 +305,23 @@
       });
     }
 
-    const isProfileDiscovery =
+    const targetMode = text(
+      source.targetMode || plan.targetMode || fallback.targetMode,
+      40,
+    ).toLowerCase();
+    const isOfficialCommentProfile =
+      workflow === OFFICIAL_ACCOUNT_COMMENT_WORKFLOW &&
+      targetMode === "profile";
+    const isProfilePatrol =
       workflow === FOLLOWED_CREATOR_POST_WORKFLOW ||
-      workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW;
+      workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW ||
+      isOfficialCommentProfile;
     const rawPlatform = text(
       source.platform || plan.platform || fallback.platform,
       40,
     ).toLowerCase();
     const platform =
-      isProfileDiscovery && rawPlatform === "multi"
+      isProfilePatrol && rawPlatform === "multi"
         ? "multi"
         : normalizePlatform(rawPlatform);
     if (!platform) {
@@ -369,10 +377,10 @@
           code: "TARGET_DUPLICATED",
         });
       }
-      const targetPlatform = isProfileDiscovery
+      const targetPlatform = isProfilePatrol
         ? normalizePlatform(target.platform || platform)
         : platform;
-      const canonical = isProfileDiscovery
+      const canonical = isProfilePatrol
         ? canonicalizeCreatorProfileUrl(
             target.accountUrl || target.url,
             targetPlatform,
@@ -384,14 +392,14 @@
             {allowDouyinSearchModal: !isOfficialCommentPatrol},
           );
       const publishedAt = text(target.publishedAt, 80);
-      if (isOfficialCommentPatrol && !publishedAt) {
+      if (isOfficialCommentPatrol && !isProfilePatrol && !publishedAt) {
         throw Object.assign(new Error(`第 ${index + 1} 个目标缺少发布时间`), {
           code: "TARGET_PUBLISHED_AT_REQUIRED",
         });
       }
       seenItems.add(itemId);
       seenRecords.add(recordId);
-      if (isProfileDiscovery) {
+      if (isProfilePatrol) {
         const subscriptionId = text(
           target.subscriptionId || target.recordId,
           240,
@@ -411,7 +419,8 @@
           subscriptionId,
           executionId,
           subjectType:
-            workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW
+            workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW ||
+            isOfficialCommentProfile
               ? "official"
               : "creator",
           platform: canonical.platform,
@@ -447,14 +456,16 @@
       fenceToken: text(source.fenceToken || fallback.fenceToken, 500),
       platform,
       title: text(source.title || plan.title, 500),
-      subjectType: isProfileDiscovery
-        ? workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW
+      targetMode: isProfilePatrol ? "profile" : "detail",
+      subjectType: isProfilePatrol
+        ? workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW ||
+          isOfficialCommentProfile
           ? "official"
           : "creator"
         : "",
       targets,
       captureSettings,
-      monitorSettings: isProfileDiscovery
+      monitorSettings: isProfilePatrol
         ? objectValue(plan.monitorSettings || source.monitorSettings)
         : {},
     };
@@ -462,37 +473,66 @@
 
   function collectRecordExternalIds(record) {
     const source = objectValue(record);
-    const data = objectValue(source.data);
+    // v1 records exposed the capture payload as `data`; the current v2
+    // envelope stores the same platform fields under `payload`,
+    // `normalizedPayload` and `rawPayload`. Local record IDs are device-local
+    // and can legitimately differ from the server record ID (especially after
+    // a tenant copy), so identity must be proven from the platform work ID
+    // carried by one of these payloads instead.
+    const payloadCandidates = [
+      objectValue(source.data),
+      objectValue(source.payload),
+      objectValue(source.normalizedPayload),
+      objectValue(source.rawPayload),
+    ];
+    const nestedItemCandidates = payloadCandidates.flatMap((payload) =>
+      Array.isArray(payload.items)
+        ? payload.items
+            .filter((item) => item && typeof item === "object")
+            .slice(0, 4)
+        : [],
+    );
+    // Never treat the local envelope `source.id` as a platform work ID.
+    const identityCandidates = [
+      {...source, id: ""},
+      ...payloadCandidates,
+      ...nestedItemCandidates,
+    ];
     const ids = new Set();
-    for (const candidate of [
-      source.externalId,
-      source.external_id,
-      source.noteId,
-      source.note_id,
-      source.awemeId,
-      source.aweme_id,
-      data.externalId,
-      data.external_id,
-      data.noteId,
-      data.note_id,
-      data.awemeId,
-      data.aweme_id,
-      data.id,
-    ]) {
-      const normalized = normalizeExternalId(candidate);
-      if (normalized) ids.add(normalized);
+    for (const candidate of identityCandidates) {
+      for (const value of [
+        candidate.externalId,
+        candidate.external_id,
+        candidate.noteId,
+        candidate.note_id,
+        candidate.awemeId,
+        candidate.aweme_id,
+        candidate.id,
+      ]) {
+        const normalized = normalizeExternalId(value);
+        if (normalized) ids.add(normalized);
+      }
     }
-    for (const candidate of [
-      source.url,
-      source.noteUrl,
-      data.url,
-      data.noteUrl,
-      data.shareUrl,
-    ]) {
+    const urlCandidates = [
+      source.sourceUrl,
+      objectValue(source.meta).sourceUrl,
+      ...identityCandidates.flatMap((candidate) => [
+        candidate.url,
+        candidate.noteUrl,
+        candidate.detailPageUrl,
+        candidate.shareUrl,
+      ]),
+    ];
+    for (const candidate of urlCandidates) {
       try {
         const parsed = new URL(text(candidate, 3000));
         const platform =
-          normalizePlatform(source.platform || data.platform) ||
+          normalizePlatform(
+            source.platform ||
+              identityCandidates.find((payload) =>
+                normalizePlatform(payload.platform),
+              )?.platform,
+          ) ||
           (isAllowedHostname(parsed.hostname, "xiaohongshu")
             ? "xiaohongshu"
             : isAllowedHostname(parsed.hostname, "douyin")

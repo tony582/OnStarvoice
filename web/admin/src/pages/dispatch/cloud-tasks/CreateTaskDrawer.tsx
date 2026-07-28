@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import {
-  ArrowLeft, BadgeCheck, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
+  ArrowLeft, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
   MessagesSquare, Network, Radar, Search, ShieldAlert, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -24,9 +24,8 @@ const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string
   { value: 'keyword', title: '关键词采集', description: '按关键词在小红书、抖音搜索并采集匹配帖子。', note: '一次性补采', icon: Search, planned: false },
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
   { value: 'creator_patrol', title: '关注博主扫描', description: '打开已关注博主主页，发现近期作品并更新博主新动态。', note: '主页作品发现', icon: Radar, planned: false },
-  { value: 'official_discovery', title: '官方账号作品发现', description: '打开已登记官方账号主页，发现带发布时间的近期作品。', note: '评论巡查前置任务', icon: BadgeCheck, planned: false },
   { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
-  { value: 'comment_patrol', title: '官方账号评论巡查', description: '圈定官方账号近期作品，逐篇读取当前可见评论并发现风险。', note: '定向评论巡查', icon: MessagesSquare, planned: false },
+  { value: 'comment_patrol', title: '官方账号评论巡查', description: '打开官方账号主页，按发布时间读取近期作品及当前可见评论。', note: '账号主页增强', icon: MessagesSquare, planned: false },
 ]
 
 const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [
@@ -96,9 +95,7 @@ export function CreateTaskDrawer({
       ? 'comment_patrol'
       : intent.taskType === 'creator_patrol'
         ? 'creator_patrol'
-        : intent.taskType === 'official_discovery'
-          ? 'official_discovery'
-      : null
+        : null
   const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
 
   const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : 'type')
@@ -207,7 +204,7 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
-                        if (['comment_patrol', 'creator_patrol', 'official_discovery'].includes(item.value)) setMethod('single')
+                        if (['comment_patrol', 'creator_patrol'].includes(item.value)) setMethod('single')
                       }
                     }}
                     className={`flex min-h-36 flex-col rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${item.planned ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
@@ -237,7 +234,7 @@ export function CreateTaskDrawer({
               {EXECUTION_METHODS.map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
-                const unavailable = ['comment_patrol', 'creator_patrol', 'official_discovery'].includes(taskType) && item.value === 'multi'
+                const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
                     onClick={() => { if (!unavailable) setMethod(item.value) }}
@@ -251,7 +248,7 @@ export function CreateTaskDrawer({
                     <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
                     <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
                       {unavailable
-                        ? ['creator_patrol', 'official_discovery'].includes(taskType)
+                        ? taskType === 'creator_patrol'
                           ? '账号作品发现首版由一个 Agent 串行执行；每个账号只打开一次，避免重复发现。'
                           : '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
                         : taskType === 'negative_patrol' && item.value === 'multi'
@@ -305,13 +302,11 @@ export function CreateTaskDrawer({
                     ? '无人值守计划'
                     : taskType === 'creator_patrol'
                       ? '关注博主扫描'
-                    : taskType === 'official_discovery'
-                      ? '官方账号作品发现'
                     : taskType === 'negative_patrol'
-                    ? '负面帖子巡查'
-                    : taskType === 'comment_patrol'
-                      ? '官方账号评论巡查'
-                      : '关键词采集'}
+                      ? '负面帖子巡查'
+                      : taskType === 'comment_patrol'
+                        ? '官方账号评论巡查'
+                        : '关键词采集'}
                 </span>
                 <span aria-hidden="true">·</span>
                 <span>{method === 'multi' ? `多节点 · ${selectedAgents.length} 个 Agent` : '单个节点'}</span>
@@ -356,18 +351,6 @@ export function CreateTaskDrawer({
                   writable={writable}
                   initialSubscriptionId={intent.subscriptionId}
                   subjectType="creator"
-                  onCreated={async () => {
-                    await onCreated()
-                    onClose()
-                  }}
-                />
-              ) : taskType === 'official_discovery' ? (
-                <AccountDiscoveryTaskCreator
-                  key={`${selectedAgent.id}:official-account-discovery`}
-                  agent={selectedAgent}
-                  writable={writable}
-                  initialSubscriptionId={intent.subscriptionId}
-                  subjectType="official"
                   onCreated={async () => {
                     await onCreated()
                     onClose()

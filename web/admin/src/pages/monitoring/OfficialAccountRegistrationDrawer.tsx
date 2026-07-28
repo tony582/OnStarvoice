@@ -72,7 +72,7 @@ export function OfficialAccountRegistrationDrawer({
 
   const register = async (subscription: CreatorSubscription) => {
     if (!window.confirm(
-      `将“${subscription.name || '当前账号'}”转为官方账号？确认后将进入独立的官方账号作品发现与评论巡查流程；原关注博主计划会暂停，历史扫描记录继续保留。`,
+      `将“${subscription.name || '当前账号'}”转为官方账号？确认后将进入独立的官方账号主页增强与评论巡查流程；原关注博主计划会暂停，历史扫描记录继续保留。`,
     )) return
     setRegisteringId(subscription.id)
     setError('')
@@ -102,7 +102,7 @@ export function OfficialAccountRegistrationDrawer({
             </div>
             <h2 id="official-account-registration-title" className="mt-1 text-lg font-bold text-foreground">从已关注账号登记官方账号</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              账号主页和历史作品会保留；登记后将进入独立的作品发现与评论巡查链路。
+              账号主页和历史作品会保留；登记后将通过账号主页增强执行评论巡查。
             </p>
           </div>
           <button

@@ -49,7 +49,7 @@ test('subscription API separates creator and official roles', () => {
   );
   assert.match(
     dispatchService,
-    /official: 'official_account_post_discovery'/u,
+    /official: 'official_account_comment_patrol'/u,
   );
   assert.match(route, /row\.subject_type \|\| 'creator'/u);
 });
@@ -65,8 +65,9 @@ test('task creation binds one monitor execution and work item to each subscripti
   assert.match(dispatchService, /INSERT INTO capture_task_item_attempts/u);
   assert.match(dispatchService, /INSERT INTO capture_agent_commands/u);
   assert.match(dispatchService, /followedCreatorPostPatrol/u);
-  assert.match(dispatchService, /officialAccountPostDiscovery/u);
+  assert.match(dispatchService, /officialAccountCommentPatrolProfileV1/u);
   assert.match(dispatchService, /remoteTargetedPostCaptureV1/u);
+  assert.match(dispatchService, /targetMode: 'profile'/u);
 });
 
 test('task materialization binds the selected Agent to the work item', async () => {
@@ -172,7 +173,7 @@ test('mixed-platform profile patrol is rejected before any task is created', asy
           platform: 'xiaohongshu',
         },
       ],
-      title: '官方账号作品发现',
+      title: '官方账号评论巡查',
     }),
     error => {
       assert.equal(error.status, 409);
@@ -234,10 +235,10 @@ test('scheduled occurrence participates in the dispatch idempotency hash', async
     `../server/services/profile-patrol-dispatch.js?test=${Date.now()}`,
   );
   const input = {
-    workflow: 'official_account_post_discovery',
+    workflow: 'official_account_comment_patrol',
     agentId: 'agent-1',
     subscriptionIds: ['subscription-1'],
-    title: '官方账号作品发现',
+    title: '官方账号评论巡查',
     monitorSettings: {publishWindow: '7d'},
     captureSettings: {autoSyncAfterDetailCapture: true},
   };
@@ -291,4 +292,15 @@ test('extension profile scan reuses monitor execution and renders distinct dark 
   assert.match(sidebar, /扫描当前账号作品/u);
   assert.match(sidebar, /monitor_execution_not_claimable/u);
   assert.match(sidebar, /该账号扫描已被其他执行端领取或已结束/u);
+});
+
+test('official comment patrol enhances the account page within the selected date window', () => {
+  assert.match(sidebar, /parseMonitorCalendarDateStartMs/u);
+  assert.match(sidebar, /publishDateFrom/u);
+  assert.match(sidebar, /publishDateTo/u);
+  assert.match(sidebar, /postsLimit/u);
+  assert.match(sidebar, /正在巡查账号评论/u);
+  assert.match(sidebar, /includeComments:\s*true/u);
+  assert.match(sidebar, /skipAlreadyCaptured:\s*false/u);
+  assert.match(sidebar, /comment_capture_failed/u);
 });

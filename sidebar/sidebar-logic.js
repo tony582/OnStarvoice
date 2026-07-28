@@ -1113,6 +1113,9 @@ const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
 const TARGETED_POST_RUN_QUERY_KEY = "targetedPostRun";
 const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.targetedPostRunRequest";
+const TARGETED_POST_RUNNER_HOME_URLS = Object.freeze({
+  douyin: "https://www.douyin.com/jingxuan",
+});
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
@@ -3860,7 +3863,10 @@ function resolveCaptureTaskActionCopy(progress = {}) {
   const phase = String(progress?.phase || "").trim().toLowerCase();
   const profileDiscovery =
     progress?.targetedPost === true &&
-    isTargetedProfileDiscoveryWorkflow(progress?.workflow);
+    isTargetedProfileDiscoveryWorkflow(
+      progress?.workflow,
+      progress?.targetMode || progress?.taskMeta?.targetMode,
+    );
   const itemCurrent = Math.max(
     0,
     Number(progress?.itemCurrent ?? progress?.current) || 0,
@@ -4169,7 +4175,10 @@ function buildCaptureTaskMetaChips(progress = {}, platform = "") {
       Number(progress?.itemTotal ?? progress?.total) || 0,
     );
     const profileDiscovery =
-      isTargetedProfileDiscoveryWorkflow(progress?.workflow);
+      isTargetedProfileDiscoveryWorkflow(
+        progress?.workflow,
+        progress?.targetMode || progress?.taskMeta?.targetMode,
+      );
     if (total > 0) {
       chips.push(`${total} ${profileDiscovery ? "个账号" : "条帖子"}`);
     }
@@ -4235,7 +4244,10 @@ function buildCaptureTaskScopeMeta(progress = {}) {
     );
     if (current > 0 && total > 0) {
       parts.push(
-        `${isTargetedProfileDiscoveryWorkflow(progress?.workflow) ? "账号" : "帖子"} ${Math.min(current, total)}/${total}`,
+        `${isTargetedProfileDiscoveryWorkflow(
+          progress?.workflow,
+          progress?.targetMode || progress?.taskMeta?.targetMode,
+        ) ? "账号" : "帖子"} ${Math.min(current, total)}/${total}`,
       );
     }
     return parts;
@@ -4772,6 +4784,7 @@ function buildTargetedPostSyntheticDebugSession(
   const workflow = String(
     request.workflow || "negative_post_patrol",
   ).trim();
+  const targetMode = String(request.targetMode || "").trim().toLowerCase();
   const workflowLabel = getTargetedWorkflowLabel(workflow);
   const unavailableResults = targetResults.filter(
     (result) =>
@@ -4866,6 +4879,7 @@ function buildTargetedPostSyntheticDebugSession(
       message,
       targetedPost: true,
       workflow,
+      targetMode,
       currentTargetTitle: String(
         storedProgress.title || currentTarget.title || "",
       ),
@@ -4883,6 +4897,7 @@ function buildTargetedPostSyntheticDebugSession(
       taskMeta: {
         targetedPost: true,
         workflow,
+        targetMode,
         commentsEnabled: captureSettings.includeComments === true,
         bloggerMetricsEnabled:
           captureSettings.includeBloggerMetrics === true,
@@ -4891,11 +4906,16 @@ function buildTargetedPostSyntheticDebugSession(
   };
 }
 
-function isTargetedProfileDiscoveryWorkflow(workflow = "") {
-  return [
-    "followed_creator_post_patrol",
-    "official_account_post_discovery",
-  ].includes(String(workflow || "").trim());
+function isTargetedProfileDiscoveryWorkflow(workflow = "", targetMode = "") {
+  const normalizedWorkflow = String(workflow || "").trim();
+  return (
+    [
+      "followed_creator_post_patrol",
+      "official_account_post_discovery",
+    ].includes(normalizedWorkflow) ||
+    (normalizedWorkflow === "official_account_comment_patrol" &&
+      String(targetMode || "").trim().toLowerCase() === "profile")
+  );
 }
 
 function getTargetedWorkflowLabel(workflow = "") {
@@ -5215,7 +5235,10 @@ function renderCaptureDebugSession(runtime = {}) {
   if (scopeLabel) {
     const profileDiscovery =
       progress?.targetedPost === true &&
-      isTargetedProfileDiscoveryWorkflow(progress?.workflow);
+      isTargetedProfileDiscoveryWorkflow(
+        progress?.workflow,
+        progress?.targetMode || progress?.taskMeta?.targetMode,
+      );
     scopeLabel.textContent =
       progress?.targetedPost === true
         ? profileDiscovery
@@ -5286,7 +5309,10 @@ function renderCaptureDebugSession(runtime = {}) {
   if (numberingLabel) {
     const profileDiscovery =
       progress?.targetedPost === true &&
-      isTargetedProfileDiscoveryWorkflow(progress?.workflow);
+      isTargetedProfileDiscoveryWorkflow(
+        progress?.workflow,
+        progress?.targetMode || progress?.taskMeta?.targetMode,
+      );
     numberingLabel.textContent =
       progress?.targetedPost === true
         ? profileDiscovery
@@ -5308,7 +5334,10 @@ function renderCaptureDebugSession(runtime = {}) {
       : "";
     const profileDiscovery =
       progress?.targetedPost === true &&
-      isTargetedProfileDiscoveryWorkflow(progress?.workflow);
+      isTargetedProfileDiscoveryWorkflow(
+        progress?.workflow,
+        progress?.targetMode || progress?.taskMeta?.targetMode,
+      );
     const detailStepText =
       progress?.targetedPost === true
         ? profileDiscovery
@@ -15424,6 +15453,75 @@ async function cancelTargetedPostRunFromSidebar(requestId = "") {
   return true;
 }
 
+async function settleTargetedPostRunnerTab(
+  tabId,
+  platform = "",
+  {returnHome = true} = {},
+) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isSafeInteger(normalizedTabId) || normalizedTabId <= 0) {
+    return false;
+  }
+
+  let runnerTab = null;
+  try {
+    runnerTab = await chrome.tabs.get(normalizedTabId);
+  } catch {
+    return false;
+  }
+
+  const detectedPlatform = detectPlatformFromUrl(runnerTab?.url || "");
+  const normalizedPlatform =
+    detectedPlatform && detectedPlatform !== "unknown"
+      ? detectedPlatform
+      : String(platform || "").trim().toLowerCase();
+  const homeUrl = TARGETED_POST_RUNNER_HOME_URLS[normalizedPlatform] || "";
+  if (!homeUrl) {
+    return false;
+  }
+
+  // 这个标签页由定向任务自己创建，可以安全收尾。先停止当前作品的音视频，
+  // 再回到平台首页，避免任务结束后仍在后台循环播放。
+  try {
+    await chrome.scripting.executeScript({
+      target: {tabId: normalizedTabId},
+      func: () => {
+        let pausedCount = 0;
+        document.querySelectorAll("video, audio").forEach((media) => {
+          try {
+            media.pause?.();
+            media.autoplay = false;
+            media.loop = false;
+            media.removeAttribute?.("autoplay");
+            media.removeAttribute?.("loop");
+            pausedCount += 1;
+          } catch {
+            // 单个媒体节点不可控时继续处理其他节点。
+          }
+        });
+        return pausedCount;
+      },
+    });
+  } catch (error) {
+    console.warn("[Sidebar] Pause targeted runner media failed:", error);
+  }
+
+  if (!returnHome) {
+    return true;
+  }
+
+  try {
+    await chrome.tabs.update(normalizedTabId, {
+      url: homeUrl,
+      active: true,
+    });
+    return true;
+  } catch (error) {
+    console.warn("[Sidebar] Restore targeted runner home failed:", error);
+    return false;
+  }
+}
+
 async function waitForTargetedPostRunnerTab(tabId, shouldStop) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < 20 * 1000) {
@@ -15447,6 +15545,23 @@ async function waitForTargetedPostRunnerTab(tabId, shouldStop) {
   const error = new Error("定向作品采集页打开超时");
   error.code = "TARGET_RUNNER_TAB_TIMEOUT";
   throw error;
+}
+
+function collectTargetedPostRecordIds(batchResult = {}) {
+  const results = Array.isArray(batchResult?.results)
+    ? batchResult.results
+    : [];
+  return [
+    ...new Set(
+      results.flatMap((result) =>
+        Array.isArray(result?.recordIds)
+          ? result.recordIds
+              .map((recordId) => String(recordId || "").trim())
+              .filter(Boolean)
+          : [],
+      ),
+    ),
+  ];
 }
 
 async function maybeClaimAndRunTargetedPostWorkflow() {
@@ -15486,7 +15601,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     request.workflow || "negative_post_patrol",
   ).trim();
   const isProfileDiscovery =
-    isTargetedProfileDiscoveryWorkflow(targetedWorkflow);
+    isTargetedProfileDiscoveryWorkflow(
+      targetedWorkflow,
+      request.targetMode,
+    );
   const workflowLabel = getTargetedWorkflowLabel(targetedWorkflow);
   try {
     executionLock = await acquireCaptureExecutionLock({
@@ -15707,7 +15825,8 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           },
           shouldStop,
         });
-        const localRecords = await getRecords();
+        const localRecordIds = collectTargetedPostRecordIds(batchResult);
+        const localRecords = await getRecords(localRecordIds);
         targetResult = cloudTargetedPostApi.buildTargetResult({
           target,
           batchResult,
@@ -15888,6 +16007,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     batchUrlCancelRequested = false;
     targetedPostCancelRequested = false;
     targetedPostRunInFlight = false;
+    await settleTargetedPostRunnerTab(targetTabId, request?.platform, {
+      returnHome: String(request?.status || "") !== "needs_action",
+    });
     activeBatchRunnerTabId = null;
     if (executionLock) {
       await releaseCaptureExecutionLock(executionLock.id);
@@ -18798,16 +18920,19 @@ function resolveMonitorRunnerCaptureParams(
     )
       ? Number(monitorSettings.observeWindowHours)
       : DEFAULT_MONITOR_SETTINGS.observeWindowHours;
-  const maxDetectedItems =
+  const defaultMaxDetectedItems =
     MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW[observeWindowHours] ||
     MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW[
       DEFAULT_MONITOR_SETTINGS.observeWindowHours
     ];
-  const publishWindow =
-    monitorSettings.publishWindow || DEFAULT_MONITOR_SETTINGS.publishWindow;
-  const isStrictPublishWindow =
-    publishWindow === MONITOR_PUBLISH_WINDOW.LAST_24H ||
-    publishWindow === MONITOR_PUBLISH_WINDOW.PREVIOUS_DAY;
+  const requestedPostsLimit = Number(monitorSettings.postsLimit);
+  const maxDetectedItems =
+    Number.isSafeInteger(requestedPostsLimit) && requestedPostsLimit > 0
+      ? Math.min(defaultMaxDetectedItems, requestedPostsLimit)
+      : defaultMaxDetectedItems;
+  const publishBounds = resolveMonitorPublishWindowBounds(monitorSettings);
+  const publishWindow = publishBounds.key;
+  const isStrictPublishWindow = publishBounds.strict === true;
   const monitorScanLimit = isStrictPublishWindow
     ? Math.min(
         maxDetectedItems,
@@ -18918,9 +19043,59 @@ function buildShanghaiTimestamp({
   return Number.isFinite(timestamp) ? timestamp : NaN;
 }
 
-function resolveMonitorPublishWindowBounds(publishWindow, nowMs = Date.now()) {
-  const normalized = MONITOR_PUBLISH_WINDOW_OPTIONS.has(publishWindow)
-    ? publishWindow
+function parseMonitorCalendarDateStartMs(value) {
+  const match = String(value || "")
+    .trim()
+    .match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return NaN;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const timestamp = buildShanghaiTimestamp({year, month, day});
+  if (!Number.isFinite(timestamp)) {
+    return NaN;
+  }
+  const parts = getShanghaiDateParts(timestamp);
+  return parts.year === year && parts.month === month && parts.day === day
+    ? timestamp
+    : NaN;
+}
+
+function resolveMonitorPublishWindowBounds(
+  publishWindowOrSettings,
+  nowMs = Date.now(),
+) {
+  const settings =
+    publishWindowOrSettings &&
+    typeof publishWindowOrSettings === "object" &&
+    !Array.isArray(publishWindowOrSettings)
+      ? publishWindowOrSettings
+      : {publishWindow: publishWindowOrSettings};
+  const publishDateFrom = String(settings.publishDateFrom || "").trim();
+  const publishDateTo = String(settings.publishDateTo || "").trim();
+  const customStartMs = parseMonitorCalendarDateStartMs(publishDateFrom);
+  const customEndStartMs = parseMonitorCalendarDateStartMs(publishDateTo);
+  if (
+    Number.isFinite(customStartMs) &&
+    Number.isFinite(customEndStartMs) &&
+    customStartMs <= customEndStartMs
+  ) {
+    return {
+      key: "custom",
+      label:
+        publishDateFrom === publishDateTo
+          ? `${publishDateFrom} 发布`
+          : `${publishDateFrom} 至 ${publishDateTo} 发布`,
+      strict: true,
+      startMs: customStartMs,
+      endMs: customEndStartMs + MONITOR_DAY_MS,
+    };
+  }
+
+  const normalized = MONITOR_PUBLISH_WINDOW_OPTIONS.has(settings.publishWindow)
+    ? settings.publishWindow
     : DEFAULT_MONITOR_SETTINGS.publishWindow;
 
   if (normalized === MONITOR_PUBLISH_WINDOW.PREVIOUS_DAY) {
@@ -18944,7 +19119,10 @@ function resolveMonitorPublishWindowBounds(publishWindow, nowMs = Date.now()) {
     };
   }
 
-  return resolveMonitorPublishWindowBounds(DEFAULT_MONITOR_SETTINGS.publishWindow, nowMs);
+  return resolveMonitorPublishWindowBounds(
+    DEFAULT_MONITOR_SETTINGS.publishWindow,
+    nowMs,
+  );
 }
 
 function cleanMonitorPublishText(value) {
@@ -19282,9 +19460,7 @@ async function resolveMonitorRecordIdsForPublishWindow({
   shouldStop = null,
 } = {}) {
   const uniqueRecordIds = [...new Set(recordIds.filter(Boolean))];
-  const bounds = resolveMonitorPublishWindowBounds(
-    monitorSettings.publishWindow || DEFAULT_MONITOR_SETTINGS.publishWindow,
-  );
+  const bounds = resolveMonitorPublishWindowBounds(monitorSettings);
 
   if (!bounds.strict || uniqueRecordIds.length === 0) {
     return {
@@ -19625,6 +19801,70 @@ async function executeMonitorRunItem({
       };
     }
 
+    const shouldCaptureComments =
+      captureSettings.includeComments === true ||
+      captureSettings.includeCommentsOnDetailCapture === true;
+    let commentDetailResult = null;
+    if (shouldCaptureComments) {
+      showProgress(
+        `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${hitRecordIds.length} 条作品`,
+      );
+      commentDetailResult = await batchCaptureDetailsForRecords(hitRecordIds, {
+        shouldStop,
+        onProgress: (progress = {}) => {
+          const message =
+            String(progress.message || "").trim() || "正在采集作品评论...";
+          showProgress(
+            `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${message}`,
+          );
+        },
+        includeComments: true,
+        includeBloggerMetrics: false,
+        // 发布时间筛选会先读取详情；官方账号评论巡查仍需再次进入命中作品
+        // 采评论，不能被“已采过详情”的增量规则跳过。
+        skipAlreadyCaptured: false,
+        enableAiRelevancePrefilter: false,
+        commentsMaxDetectedItems:
+          captureSettings.detailCommentsMaxDetectedItems ??
+          captureSettings.commentsMaxDetectedItems ??
+          50,
+        detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
+        detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
+        profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
+        waitForegroundTabId:
+          Number.isSafeInteger(Number(runnerTabId)) &&
+          Number(runnerTabId) > 0
+            ? Number(runnerTabId)
+            : null,
+        captureTaskId: executionId,
+      });
+
+      if (
+        commentDetailResult?.canceled ||
+        (typeof shouldStop === "function" && shouldStop())
+      ) {
+        await finishMonitorExecutionSafely(executionId, {
+          status: "failed",
+          recordsFound: hitRecordIds.length,
+          errorMessage: "评论巡查已取消",
+        });
+        return {
+          ...baseResult,
+          status: "failed",
+          scannedCount: publishFilterResult.scannedCount,
+          hitCount: 0,
+          filteredCount: publishFilterResult.filteredCount,
+          unknownPublishTimeCount: publishFilterResult.unknownCount,
+          publishWindowLabel: publishFilterResult.windowLabel,
+          errorCode: "capture_canceled",
+          errorMessage: "评论巡查已取消",
+          captureResult,
+          publishDetailResult: publishFilterResult.detailResult,
+          detailResult: commentDetailResult,
+        };
+      }
+    }
+
     showProgress(
       `正在同步监控命中 (${index + 1}/${total})：${displayName} · ${hitRecordIds.length}/${publishFilterResult.scannedCount} 条符合${publishFilterResult.windowLabel}`,
     );
@@ -19649,14 +19889,27 @@ async function executeMonitorRunItem({
     const syncStats = summarizeMonitorSyncResult(syncResult);
     const hasSyncFailure =
       !syncResult?.ok || syncStats.failedCount > 0 || syncStats.successCount === 0;
-    const errorMessage = hasSyncFailure
-      ? syncResult?.message ||
+    const hasCommentCaptureFailure =
+      shouldCaptureComments &&
+      (commentDetailResult?.ok === false ||
+        Number(commentDetailResult?.failedCount || 0) > 0);
+    const hasTaskFailure = hasSyncFailure || hasCommentCaptureFailure;
+    const errorMessage = hasCommentCaptureFailure
+      ? `评论巡查部分失败：成功 ${Math.max(
+          0,
+          Number(commentDetailResult?.successCount) || 0,
+        )}，失败 ${Math.max(
+          0,
+          Number(commentDetailResult?.failedCount) || 0,
+        )}`
+      : hasSyncFailure
+        ? syncResult?.message ||
         syncResult?.error?.message ||
         `监控命中同步失败 ${syncStats.failedCount} 条`
-      : "";
+        : "";
 
     await finishMonitorExecutionSafely(executionId, {
-      status: hasSyncFailure ? "failed" : "succeeded",
+      status: hasTaskFailure ? "failed" : "succeeded",
       recordsFound: hitRecordIds.length,
       newRecords: syncStats.insertedCount,
       updatedRecords: syncStats.updatedCount,
@@ -19666,17 +19919,22 @@ async function executeMonitorRunItem({
 
     return {
       ...baseResult,
-      status: hasSyncFailure ? "failed" : "success",
+      status: hasTaskFailure ? "failed" : "success",
       scannedCount: publishFilterResult.scannedCount,
       hitCount: syncStats.successCount,
       filteredCount: publishFilterResult.filteredCount,
       unknownPublishTimeCount: publishFilterResult.unknownCount,
       publishWindowLabel: publishFilterResult.windowLabel,
-      errorCode: hasSyncFailure ? "sync_failed" : "",
+      errorCode: hasCommentCaptureFailure
+        ? "comment_capture_failed"
+        : hasSyncFailure
+          ? "sync_failed"
+          : "",
       errorMessage,
       syncResult,
       captureResult,
-      detailResult: publishFilterResult.detailResult,
+      publishDetailResult: publishFilterResult.detailResult,
+      detailResult: commentDetailResult || publishFilterResult.detailResult,
     };
   } catch (error) {
     const errorMessage = error?.message || "监控执行失败";

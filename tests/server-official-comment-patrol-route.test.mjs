@@ -47,11 +47,11 @@ test('official comment patrol admin calls the mounted capture-cloud namespace', 
   );
   assert.match(
     taskCreator,
-    /\/capture-cloud\/official-comment-patrol\/candidates\/preview/u,
-  );
-  assert.match(
-    taskCreator,
     /\/capture-cloud\/official-comment-patrol\/tasks/u,
+  );
+  assert.doesNotMatch(
+    taskCreator,
+    /\/capture-cloud\/official-comment-patrol\/candidates\/preview/u,
   );
   assert.match(
     monitoringTab,
@@ -63,22 +63,14 @@ test('official comment patrol admin calls the mounted capture-cloud namespace', 
   );
 });
 
-test('official account row actions preserve their exact discovery and patrol targets', () => {
-  assert.match(
-    route,
-    /subscription\.id AS monitor_subscription_id/u,
-  );
-  assert.match(
-    route,
-    /monitorSubscriptionId: account\.monitor_subscription_id \|\| null/u,
-  );
+test('official account row opens one account-page patrol flow without a discovery task', () => {
   assert.match(
     monitoringTab,
     /officialAccountId \? \{ officialAccountId \} : \{\}/u,
   );
-  assert.match(
+  assert.doesNotMatch(
     monitoringTab,
-    /subscriptionId \? \{ subscriptionId \} : \{\}/u,
+    /official_discovery|createDiscoveryTask|创建作品发现任务/u,
   );
   assert.match(
     taskCreator,
@@ -88,6 +80,23 @@ test('official account row actions preserve their exact discovery and patrol tar
     taskCreator,
     /normalized\.some\(item => item\.id === initialOfficialAccountId\)/u,
   );
+  assert.match(
+    taskCreator,
+    /Agent 会打开账号主页，在指定日期范围内读取近期作品并采集当前可见评论/u,
+  );
+  assert.doesNotMatch(taskCreator, /recordIds|预览作品|selectedIds/u);
+});
+
+test('task composer hides official discovery while legacy task cards stay readable', async () => {
+  const [drawer, dispatchPage, taskCard] = await Promise.all([
+    readFile(new URL('../web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../web/admin/src/pages/dispatch/DispatchPage.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx', import.meta.url), 'utf8'),
+  ]);
+  assert.doesNotMatch(drawer, /official_discovery|官方账号作品发现/u);
+  assert.doesNotMatch(dispatchPage, /official_discovery/u);
+  assert.match(taskCard, /official_account_post_discovery/u);
+  assert.match(taskCard, /官方账号作品发现/u);
 });
 
 test('official comment patrol defaults to latest seven Shanghai calendar days', () => {
@@ -187,18 +196,19 @@ test('candidate selection is tenant-scoped, exact-account matched, dated, and UR
   );
 });
 
-test('create route creates one agent task with post items and forces comment sampling sync', () => {
+test('create route creates one account-page Agent task and forces comment sampling sync', () => {
   assert.match(route, /'\/official-comment-patrol\/tasks'/u);
   assert.match(route, /agent_required/u);
-  assert.match(route, /capabilities\.officialAccountCommentPatrol !== true/u);
-  assert.match(route, /task_type, feature_key/u);
+  assert.match(route, /loadCompatibleProfilePatrolAgent/u);
+  assert.match(route, /materializeProfilePatrolTask/u);
+  assert.match(route, /subjectType: 'official'/u);
   assert.match(route, /official_account_comment_patrol/u);
-  assert.match(route, /'official_account_post'/u);
-  assert.match(route, /INSERT INTO capture_task_item_attempts/u);
-  assert.match(route, /INSERT INTO capture_agent_commands/u);
+  assert.match(route, /publishWindow: 'custom'/u);
+  assert.match(route, /postsLimit: normalized\.filter\.postsLimit/u);
   assert.match(route, /includeComments: true/u);
+  assert.match(route, /includeCommentsOnDetailCapture: true/u);
   assert.match(route, /autoSyncAfterDetailCapture: true/u);
   assert.match(route, /commentsMaxDetectedItems: normalized\.filter\.commentsLimit/u);
-  assert.match(route, /resultDisclosure/u);
-  assert.match(route, /不代表平台全部评论/u);
+  assert.match(route, /skipAlreadyCapturedOnDetailCapture: false/u);
+  assert.doesNotMatch(route, /recordIds: normalized\.recordIds/u);
 });

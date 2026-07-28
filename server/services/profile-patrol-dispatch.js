@@ -8,12 +8,12 @@ import {
 
 export const PROFILE_PATROL_WORKFLOWS = Object.freeze({
   creator: 'followed_creator_post_patrol',
-  official: 'official_account_post_discovery',
+  official: 'official_account_comment_patrol',
 });
 
 const PROFILE_PATROL_CAPABILITIES = Object.freeze({
   creator: 'followedCreatorPostPatrol',
-  official: 'officialAccountPostDiscovery',
+  official: 'officialAccountCommentPatrolProfileV1',
 });
 
 function text(value, limit = 1000) {
@@ -169,6 +169,8 @@ export async function materializeProfilePatrolTask(tx, {
   const metadata = {
     workflow,
     subjectType,
+    targetMode: 'profile',
+    profileMode: true,
     protocolVersion: 1,
     remoteCreated: true,
     remoteRequestHash: hash,
@@ -326,6 +328,7 @@ export async function materializeProfilePatrolTask(tx, {
     title: task.title,
     executionMode: 'one_time',
     subjectType,
+    targetMode: 'profile',
     platform: taskPlatform,
     workflow,
     taskKind: workflow,
@@ -491,12 +494,20 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       }
       const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
       const title = subjectType === 'official'
-        ? `官方账号作品发现 · ${subscription.name}`
+        ? `官方账号评论巡查 · ${subscription.name}`
         : `关注博主作品扫描 · ${subscription.name}`;
       const scheduledFor = new Date(subscription.next_run_at).toISOString();
-      const captureSettings = sanitizeCloudStructuredObject({
-        autoSyncAfterDetailCapture: true,
-      });
+      const captureSettings = sanitizeCloudStructuredObject(
+        subjectType === 'official'
+          ? {
+              includeComments: true,
+              includeCommentsOnDetailCapture: true,
+              autoSyncAfterDetailCapture: true,
+              commentsMaxDetectedItems: 50,
+              skipAlreadyCapturedOnDetailCapture: false,
+            }
+          : {autoSyncAfterDetailCapture: true},
+      );
       const monitorSettings = settingsByTenant.get(subscription.tenant_id);
       const requestKey = crypto.randomUUID();
       const requestHash = profilePatrolRequestHash({

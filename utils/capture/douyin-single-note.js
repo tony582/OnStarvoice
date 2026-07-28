@@ -556,6 +556,7 @@ function hasRequiredDouyinBloggerMetrics(payload) {
 // ── 主采集函数 ────────────────────────────────────────────────────────────
 
 export async function captureDouyinSingleNote({
+  expectedNoteId = "",
   includeBloggerMetrics = false,
   preferWorksTabForBloggerMetrics = false,
 } = {}) {
@@ -563,9 +564,24 @@ export async function captureDouyinSingleNote({
 
   try {
     // 1. 从 URL 提取 aweme_id
-    const urlNoteId =
+    const currentUrlNoteId =
       extractNoteId(window.location.href) ||
       new URL(window.location.href).searchParams.get("modal_id");
+    const normalizedExpectedNoteId =
+      normalizeDouyinNumericNoteId(expectedNoteId);
+    assertNoDouyinUnavailablePage(normalizedExpectedNoteId);
+    if (
+      normalizedExpectedNoteId &&
+      currentUrlNoteId &&
+      String(currentUrlNoteId) !== normalizedExpectedNoteId
+    ) {
+      const error = new Error(
+        `抖音详情作品不匹配：目标 ${normalizedExpectedNoteId}，实际 ${currentUrlNoteId}`,
+      );
+      error.code = "DOUYIN_DETAIL_ID_MISMATCH";
+      throw error;
+    }
+    const urlNoteId = normalizedExpectedNoteId || currentUrlNoteId;
     const videoContext = isLikelyVideoContext(window.location.href);
 
     // 2. 优先尝试命中当前作品的详情缓存，短等待一次接口结果
@@ -758,6 +774,7 @@ export async function captureDouyinSingleNote({
 
     // 3. 纯 DOM 解析
     await wait(1200);
+    assertNoDouyinUnavailablePage(normalizedExpectedNoteId);
     assertNoCaptchaPage();
     await ensureDetailPageReady(DOUYIN_DOM_PROFILE, { timeout: 10000 });
 
@@ -939,6 +956,31 @@ function assertNoCaptchaPage() {
   const bodyText = cleanText(document.body?.innerText || "");
   if (/验证码中间页/i.test(title) || /请完成下列验证后继续:/i.test(bodyText)) {
     throw new Error("当前页面触发抖音验证码或风险中间页");
+  }
+}
+
+function assertNoDouyinUnavailablePage(expectedNoteId = "") {
+  const title = cleanText(document.title || "");
+  const bodyText = cleanText(document.body?.innerText || "");
+  const directUnavailableCopy =
+    /你要观看的(?:图文|视频|作品|内容)不存在/u.test(
+      `${title} ${bodyText}`,
+    );
+  const explicitDeletedCopy =
+    /^(?:图文|视频|作品|内容)(?:已被作者)?(?:删除|下架)[。！？]?$/u.test(
+      bodyText,
+    );
+  const autoPlayOrExitAction =
+    /接下来播放|去精选页查看更多(?:视频|内容)|返回精选/u.test(bodyText);
+  if (
+    (directUnavailableCopy && autoPlayOrExitAction) ||
+    /^你要观看的(?:图文|视频|作品|内容)不存在[。！？]?$/u.test(bodyText) ||
+    explicitDeletedCopy
+  ) {
+    const error = new Error("抖音提示目标帖子已删除或不存在");
+    error.code = "DOUYIN_CONTENT_UNAVAILABLE";
+    error.expectedNoteId = normalizeDouyinNumericNoteId(expectedNoteId);
+    throw error;
   }
 }
 

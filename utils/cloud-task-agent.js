@@ -230,6 +230,28 @@
     };
   }
 
+  function buildTargetedPostTaskSnapshot(request = {}) {
+    const source = objectValue(request);
+    const descriptor = targetedPostTaskDescriptor(source);
+    return buildTaskSnapshot(
+      {
+        ...source,
+        workflow: descriptor.workflow,
+        taskType: descriptor.taskType,
+        featureKey: descriptor.featureKey,
+        title: descriptor.title,
+        source: "cloud_assignment",
+        trigger: "remote",
+        metadata: {
+          ...objectValue(source.metadata),
+          taskId: text(source.taskId, 240),
+          cloudCommandId: text(source.cloudCommandId, 240),
+        },
+      },
+      text(source.id, 240),
+    );
+  }
+
   function buildObservedSocialAccountSnapshot(value) {
     const source = objectValue(value);
     const platform = text(source.platform, 40).toLowerCase();
@@ -348,29 +370,19 @@
       .slice(0, 50)
       .map((run) => buildTaskSnapshot(run, controlRequestId))
       .filter(Boolean);
-    const targetedRequest = objectValue(targetedPostRequest);
-    const targetedDescriptor = targetedPostTaskDescriptor(targetedRequest);
-    const targetedSnapshot = buildTaskSnapshot(
-      {
-        ...targetedRequest,
-        workflow: targetedDescriptor.workflow,
-        taskType: targetedDescriptor.taskType,
-        featureKey: targetedDescriptor.featureKey,
-        title: targetedDescriptor.title,
-        source: "cloud_assignment",
-        trigger: "remote",
-        metadata: {
-          ...objectValue(targetedRequest.metadata),
-          taskId: text(targetedRequest.taskId, 240),
-          cloudCommandId: text(targetedRequest.cloudCommandId, 240),
-        },
-      },
-      text(targetedRequest.id, 240),
+    const targetedSnapshot = buildTargetedPostTaskSnapshot(
+      targetedPostRequest,
     );
-    if (
-      targetedSnapshot &&
-      !tasks.some((task) => task.id === targetedSnapshot.id)
-    ) {
+    if (targetedSnapshot) {
+      const existingIndex = tasks.findIndex(
+        (task) => task.id === targetedSnapshot.id,
+      );
+      if (existingIndex >= 0) {
+        // The local ledger intentionally stores a compact task-center record.
+        // For cloud reconciliation, the live targeted request is authoritative
+        // and must replace that compact row so item results/checkpoints survive.
+        tasks.splice(existingIndex, 1);
+      }
       tasks.unshift(targetedSnapshot);
     }
 
@@ -391,6 +403,7 @@
           remoteTaskKeywordPostLimit: true,
           negativePostPatrol: true,
           officialAccountCommentPatrol: true,
+          officialAccountCommentPatrolProfileV1: true,
           followedCreatorPostPatrol: true,
           officialAccountPostDiscovery: true,
           remoteTargetedPostCaptureV1: true,
@@ -514,6 +527,7 @@
 
   root.OnStarvoiceCloudTaskAgent = Object.freeze({
     buildTaskSnapshot,
+    buildTargetedPostTaskSnapshot,
     buildUnattendedPlanSnapshot,
     buildObservedSocialAccountSnapshot,
     buildSocialUsageEventSnapshot,

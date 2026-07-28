@@ -69,7 +69,44 @@ test("classifies explicit platform deletion copy as deleted", () => {
   assert.equal(result.reason, "post_deleted_or_unavailable");
 });
 
-test("does not treat a normal detail page or another platform as deleted", () => {
+test("classifies the Douyin deleted image-post countdown before autoplay", () => {
+  const result = availability.classifySnapshot({
+    platform: "douyin",
+    url: "https://www.douyin.com/note/7665258839256621760",
+    title: "抖音",
+    bodyText: [
+      "你要观看的图文不存在",
+      "5",
+      "接下来播放",
+      "去精选页查看更多视频",
+    ].join("\n"),
+  });
+
+  assert.equal(result.unavailable, true);
+  assert.equal(result.availabilityStatus, "deleted");
+  assert.equal(result.businessOutcome, "post_unavailable");
+  assert.equal(result.retryable, false);
+  assert.ok(result.evidence.includes("douyin_target_not_found"));
+  assert.ok(result.evidence.includes("douyin_autoplay_countdown"));
+});
+
+test("does not infer Douyin deletion from quoted copy in a normal long post", () => {
+  assert.equal(
+    availability.classifySnapshot({
+      platform: "douyin",
+      title: "平台错误提示讨论",
+      bodyText: [
+        "这是一条正常发布的视频，正文在分析平台提示语。",
+        "有人问为什么会出现“你要观看的图文不存在”，这里仅是引用。",
+        "当前视频、作者、评论、点赞、收藏和相关推荐都能正常显示。",
+        "以下是更长的说明。".repeat(180),
+      ].join(" "),
+    }),
+    null,
+  );
+});
+
+test("does not treat a normal detail page or unrelated error copy as deleted", () => {
   assert.equal(
     availability.classifySnapshot({
       platform: "xiaohongshu",

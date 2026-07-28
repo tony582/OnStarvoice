@@ -357,7 +357,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         WHERE id = $1 AND tenant_id = $2
           AND status IN ('pending', 'claimed')
           AND metadata->>'createCommandId' = $3
-        RETURNING id, status, parent_task_id, task_type
+        RETURNING id, status, parent_task_id, task_type, metadata
       `, [command.task_id, tenantId, command.id]);
       await appendEvent(tx, {
         tenantId,
@@ -374,7 +374,9 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         await failProfileDiscoveryWork(tx, {
           tenantId,
           taskId: failedTask.id,
+          task: failedTask,
           taskType: failedTask.task_type,
+          payload: command.payload,
           code: 'create_command_expired',
           message: '设备未在指令有效期内领取并创建任务',
         });
@@ -520,7 +522,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         WHERE id = $1 AND tenant_id = $2
           AND status IN ('pending', 'claimed')
           AND metadata->>'createCommandId' = $3
-        RETURNING id, status, parent_task_id, task_type
+        RETURNING id, status, parent_task_id, task_type, metadata
       `, [command.task_id, tenantId, command.id]);
       await appendEvent(tx, {
         tenantId,
@@ -537,7 +539,9 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         await failProfileDiscoveryWork(tx, {
           tenantId,
           taskId: failedTask.id,
+          task: failedTask,
           taskType: failedTask.task_type,
+          payload: command.payload,
           code: 'create_agent_unavailable',
           message: '目标节点授权或平台职责已变化',
         });
@@ -858,11 +862,73 @@ function targetedPostTaskLabel(taskType) {
   return '负面帖子巡查';
 }
 
-function isProfileDiscoveryTaskType(taskType) {
-  return [
+function profilePatrolIntent(source = {}) {
+  const value = safeJson(source);
+  const targetMode = text(
+    value.targetMode || value.target_mode,
+    80,
+  ).toLowerCase();
+  if (targetMode) {
+    if ([
+      'profile',
+      'account',
+      'account_profile',
+      'profile_patrol',
+      'profile_scan',
+    ].includes(targetMode)) {
+      return true;
+    }
+    if ([
+      'post',
+      'detail',
+      'record',
+      'direct',
+      'single_post',
+      'post_detail',
+    ].includes(targetMode)) {
+      return false;
+    }
+  }
+  const profileMode = value.profileMode ?? value.profile_mode;
+  if (profileMode === true || profileMode === 'true' || profileMode === 1) {
+    return true;
+  }
+  if (profileMode === false || profileMode === 'false' || profileMode === 0) {
+    return false;
+  }
+  return null;
+}
+
+export function isProfilePatrolTask(taskOrType = {}, payload = {}) {
+  const task = typeof taskOrType === 'string'
+    ? {task_type: taskOrType}
+    : safeJson(taskOrType);
+  const metadata = safeJson(task.metadata);
+  const commandPayload = safeJson(payload);
+  const taskType = text(
+    task.task_type ||
+      task.taskType ||
+      task.workflow ||
+      metadata.workflow ||
+      commandPayload.workflow ||
+      commandPayload.taskType,
+    80,
+  );
+  if ([
     'followed_creator_post_patrol',
     'official_account_post_discovery',
-  ].includes(text(taskType, 80));
+  ].includes(taskType)) {
+    return true;
+  }
+  if (taskType !== 'official_account_comment_patrol') {
+    return false;
+  }
+  const taskIntent = profilePatrolIntent(task);
+  if (taskIntent !== null) return taskIntent;
+  const metadataIntent = profilePatrolIntent(metadata);
+  if (metadataIntent !== null) return metadataIntent;
+  const payloadIntent = profilePatrolIntent(commandPayload);
+  return payloadIntent === true;
 }
 
 async function syncProfileDiscoverySubscriptions(
@@ -902,11 +968,18 @@ async function syncProfileDiscoverySubscriptions(
 async function failProfileDiscoveryWork(tx, {
   tenantId,
   taskId,
+  task = {},
   taskType,
+  payload = {},
   code,
   message,
 }) {
-  if (!isProfileDiscoveryTaskType(taskType)) {
+  if (!isProfilePatrolTask(
+    Object.keys(safeJson(task)).length > 0
+      ? task
+      : {task_type: taskType},
+    payload,
+  )) {
     return {itemCount: 0, executionCount: 0};
   }
   const safeCode = text(code, 120) || 'profile_scan_dispatch_failed';
@@ -967,12 +1040,16 @@ async function failProfileDiscoveryWork(tx, {
   };
 }
 
-async function cancelProfileDiscoveryWork(
-  tx,
+async function cancelProfileDiscoveryWork(tx, {
   tenantId,
   taskId,
+  task = {},
+  payload = {},
   message = '账号扫描任务已停止',
-) {
+}) {
+  if (!isProfilePatrolTask(task, payload)) {
+    return {itemCount: 0, executionCount: 0};
+  }
   const canceledItems = await tx.queryAll(`
     UPDATE capture_task_items
     SET status = 'canceled',
@@ -1026,6 +1103,10 @@ async function cancelProfileDiscoveryWork(
     tenantId,
     canceledExecutions.map(execution => execution.id),
   );
+  return {
+    itemCount: canceledItems.length,
+    executionCount: canceledExecutions.length,
+  };
 }
 
 export function negativePatrolTargetResults(snapshot = {}) {
@@ -1417,15 +1498,12 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
         0,
     ) || 0,
   );
-  const isProfileDiscovery = [
-    'followed_creator_post_patrol',
-    'official_account_post_discovery',
-  ].includes(task.task_type);
+  const isProfilePatrol = isProfilePatrolTask(task);
   const projectedItemIds = [];
   for (const entry of negativePatrolTargetResults(snapshot)) {
     let resultObservationId = null;
     if (
-      !isProfileDiscovery &&
+      !isProfilePatrol &&
       NEGATIVE_PATROL_SUCCESS_STATUSES.has(entry.status) &&
       entry.startedAt
     ) {
@@ -1514,7 +1592,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       entry.recordId,
       entry.externalId,
       executionRevision,
-      isProfileDiscovery,
+      isProfilePatrol,
     ]);
     if (!item) continue;
     projectedItemIds.push(item.id);
@@ -1568,7 +1646,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       item.assignment_revision,
     ]);
 
-    if (isProfileDiscovery && UUID_PATTERN.test(text(entry.executionId, 100))) {
+    if (isProfilePatrol && UUID_PATTERN.test(text(entry.executionId, 100))) {
       const monitorStatus =
         entry.status === 'canceled'
           ? 'cancelled'
@@ -1736,7 +1814,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       task.id,
       agent.id,
       projectedItemIds,
-      isProfileDiscovery
+      isProfilePatrol
         ? '设备任务已结束，但该账号没有返回可验证的扫描结果'
         : '设备任务已结束，但该帖子没有返回可验证的逐帖结果',
     ]);
@@ -1758,7 +1836,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
           'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
         )
     `, [agent.tenant_id, itemOwnerTaskId, task.id, agent.id]);
-    if (isProfileDiscovery) {
+    if (isProfilePatrol) {
       const fallbackExecutions = await tx.queryAll(`
         UPDATE monitor_executions execution
         SET status = CASE
@@ -1835,7 +1913,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
     aggregate.counts.commentSampleScope = 'visible_comments_bounded';
   }
   const taskLabel = targetedPostTaskLabel(task.task_type);
-  const targetNoun = isProfileDiscovery ? '账号' : '帖子';
+  const targetNoun = isProfilePatrol ? '账号' : '帖子';
   const statusMessage = aggregate.status === 'running'
     ? `正在逐${targetNoun}执行${taskLabel}`
     : aggregate.status === 'needs_action'
@@ -3115,8 +3193,11 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
               resultPayload.message || (
                 success
                   ? `设备已完成${targetedPostTaskLabel(lockedTask?.task_type || command.payload?.workflow)}并返回${
-                      isProfileDiscoveryTaskType(
-                        lockedTask?.task_type || command.payload?.workflow,
+                      isProfilePatrolTask(
+                        lockedTask || {
+                          task_type: command.payload?.workflow,
+                        },
+                        command.payload,
                       )
                         ? '账号扫描结果'
                         : '逐帖结果'
@@ -3275,16 +3356,14 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           req.tenantId,
           command.id,
         ]);
-        if (
-          success &&
-          isProfileDiscoveryTaskType(lockedTask?.task_type)
-        ) {
-          await cancelProfileDiscoveryWork(
-            tx,
-            req.tenantId,
-            command.task_id,
-            eventMessage,
-          );
+        if (success) {
+          await cancelProfileDiscoveryWork(tx, {
+            tenantId: req.tenantId,
+            taskId: command.task_id,
+            task: lockedTask,
+            payload: command.payload,
+            message: eventMessage,
+          });
         }
       }
       if (updatedTask && targetedPostCreate) {
@@ -5369,14 +5448,12 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
           WHERE id = $1 AND tenant_id = $2
           RETURNING id, parent_task_id, status
         `, [task.id, req.tenantId]);
-        if (isProfileDiscoveryTaskType(task.task_type)) {
-          await cancelProfileDiscoveryWork(
-            tx,
-            req.tenantId,
-            task.id,
-            '任务已在设备领取前取消',
-          );
-        }
+        await cancelProfileDiscoveryWork(tx, {
+          tenantId: req.tenantId,
+          taskId: task.id,
+          task,
+          message: '任务已在设备领取前取消',
+        });
         await appendEvent(tx, {
           tenantId: req.tenantId,
           taskId: task.id,

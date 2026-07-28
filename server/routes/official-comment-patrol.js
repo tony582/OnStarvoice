@@ -8,9 +8,13 @@ import {
 } from '../middleware/auth.js';
 import {
   captureAgentOnline,
-  normalizeCaptureAgentPlatforms,
   sanitizeCloudStructuredObject,
 } from '../services/capture-cloud.js';
+import {
+  loadCompatibleProfilePatrolAgent,
+  materializeProfilePatrolTask,
+  profilePatrolRequestHash,
+} from '../services/profile-patrol-dispatch.js';
 import {negativePatrolTargetUrl} from './negative-patrol.js';
 
 const router = Router();
@@ -100,30 +104,6 @@ function inclusiveDays(from, to) {
     (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) /
       86_400_000,
   ) + 1;
-}
-
-function normalizeRecordIds(value) {
-  if (value == null) return {recordIds: []};
-  if (!Array.isArray(value)) {
-    return {failure: requestError('invalid_record_ids', 'recordIds 必须是帖子 ID 数组')};
-  }
-  const recordIds = [];
-  const seen = new Set();
-  for (const rawId of value) {
-    const id = normalizedUuid(rawId);
-    if (!id) {
-      return {failure: requestError('invalid_record_id', 'recordIds 中包含无效的帖子 ID')};
-    }
-    if (!seen.has(id)) recordIds.push(id);
-    seen.add(id);
-    if (recordIds.length > MAX_POSTS) {
-      return {failure: requestError(
-        'too_many_record_ids',
-        `一次最多选择 ${MAX_POSTS} 篇作品`,
-      )};
-    }
-  }
-  return {recordIds};
 }
 
 /**
@@ -395,83 +375,6 @@ async function loadCandidates(executor, tenantId, filter, {recordIds = [], lock 
   };
 }
 
-function patrolRequestHash({agentId, title, filter, recordIds, captureSettings}) {
-  return crypto.createHash('sha256').update(JSON.stringify({
-    workflow: WORKFLOW,
-    protocolVersion: 1,
-    agentId,
-    title,
-    filter,
-    recordIds: [...recordIds].sort(),
-    captureSettings,
-  })).digest('hex');
-}
-
-async function loadCompatibleAgent(tx, tenantId, agentId, platform) {
-  const agent = await tx.queryOne(`
-    SELECT ca.*, tenant.status AS tenant_status,
-      ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
-      ab.id AS active_auth_binding_id
-    FROM capture_agents ca
-    JOIN tenants tenant ON tenant.id = ca.tenant_id
-    LEFT JOIN auth_codes ac ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
-    LEFT JOIN auth_bindings ab ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
-    WHERE ca.id = $1::uuid AND ca.tenant_id = $2
-    FOR UPDATE OF ca
-  `, [agentId, tenantId]);
-  if (!agent) return {failure: requestError('agent_not_found', '目标执行节点不存在于当前租户', 404)};
-  if (
-    agent.tenant_status !== 'active' || agent.status !== 'active' ||
-    agent.auth_code_status !== 'active' || !agent.active_auth_binding_id ||
-    (agent.auth_code_expires_at && new Date(agent.auth_code_expires_at) < new Date())
-  ) {
-    return {failure: requestError('agent_unavailable', '目标执行节点授权已失效、已停用或不存在', 409)};
-  }
-  const capabilities = safeJson(agent.capabilities);
-  if (
-    capabilities.remoteTaskCreate !== true ||
-    capabilities.officialAccountCommentPatrol !== true
-  ) {
-    return {failure: requestError(
-      'agent_official_comment_patrol_capability_missing',
-      '目标执行节点版本尚不支持官方账号评论巡查，请先升级扩展',
-      409,
-    )};
-  }
-  const allowedPlatforms = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
-  if (allowedPlatforms.length > 0 && !allowedPlatforms.includes(platform)) {
-    return {failure: requestError('agent_platform_mismatch', '目标执行节点未配置负责该平台', 409)};
-  }
-  const supported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
-  if (supported.length > 0 && !supported.includes(platform)) {
-    return {failure: requestError('agent_platform_unsupported', '目标执行节点当前版本不支持该平台', 409)};
-  }
-  return {agent};
-}
-
-function candidateTarget(candidate, itemId) {
-  return {
-    itemId,
-    recordId: candidate.id,
-    externalId: candidate.externalId,
-    url: candidate.url,
-    title: candidate.title,
-    publishedAt: candidate.publishedAt,
-  };
-}
-
-async function appendTaskEvent(tx, {tenantId, taskId, agentId, actorId, actorName, status, message, payload}) {
-  await tx.execute(`
-    INSERT INTO capture_task_events (
-      tenant_id, task_id, agent_id, event_type, actor_type,
-      actor_id, actor_name, status, message, payload
-    ) VALUES ($1, $2, $3, 'official_comment_patrol_created', 'user', $4, $5, $6, $7, $8::jsonb)
-  `, [
-    tenantId, taskId, agentId, text(actorId, 240), text(actorName, 240),
-    status, message, JSON.stringify(safeJson(payload)),
-  ]);
-}
-
 router.get(
   '/official-comment-patrol/accounts',
   requireTenantAccess,
@@ -589,8 +492,6 @@ router.post(
     try {
       const normalized = normalizeOfficialCommentPatrolFilter(req.body);
       if (normalized.failure) return sendRequestError(res, normalized.failure);
-      const normalizedIds = normalizeRecordIds(req.body?.recordIds);
-      if (normalizedIds.failure) return sendRequestError(res, normalizedIds.failure);
       const agentId = normalizedUuid(req.body?.agentId);
       if (!agentId) return sendRequestError(res, requestError('agent_required', '请选择一个有效的执行节点'));
       const rawRequestKey = text(req.body?.requestKey, 100);
@@ -607,10 +508,83 @@ router.post(
         includeCommentsOnDetailCapture: true,
         autoSyncAfterDetailCapture: true,
         commentsMaxDetectedItems: normalized.filter.commentsLimit,
+        skipAlreadyCapturedOnDetailCapture: false,
       };
+      const monitorSettings = sanitizeCloudStructuredObject({
+        publishWindow: 'custom',
+        publishDateFrom: normalized.filter.publishDateFrom,
+        publishDateTo: normalized.filter.publishDateTo,
+        postsLimit: normalized.filter.postsLimit,
+        timezone: normalized.filter.timezone,
+      });
 
       const result = await withTransaction(async tx => {
         await tx.execute('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [WORKFLOW, requestKey]);
+        const subscription = await tx.queryOne(`
+          SELECT subscription.*, account.account_name,
+            account.platform AS account_platform,
+            account.profile_url AS official_profile_url,
+            account.status AS official_account_status
+          FROM official_accounts account
+          JOIN monitor_subscriptions subscription
+            ON subscription.tenant_id = account.tenant_id
+            AND subscription.official_account_id = account.id
+            AND subscription.subject_type = 'official'
+            AND subscription.status = 'active'
+          WHERE account.id = $1::uuid
+            AND account.tenant_id = $2
+            AND account.status = 'active'
+            AND account.platform IN ('xiaohongshu', 'douyin')
+            AND COALESCE(subscription.account_url, account.profile_url, '') <> ''
+          ORDER BY subscription.updated_at DESC, subscription.id
+          LIMIT 1
+          FOR UPDATE OF subscription, account
+        `, [normalized.filter.officialAccountId, req.tenantId]);
+        if (!subscription) {
+          return {failure: requestError(
+            'official_account_profile_subscription_missing',
+            '该官方账号尚未配置可执行的账号主页巡查计划，请先补充主页链接并启用账号',
+            409,
+          )};
+        }
+        const platform = text(
+          subscription.account_platform || subscription.platform,
+          40,
+        ).toLowerCase();
+        if (
+          normalized.filter.requestedPlatform &&
+          normalized.filter.requestedPlatform !== platform
+        ) {
+          return {failure: requestError(
+            'official_account_platform_mismatch',
+            '所选平台与官方账号的平台不一致',
+          )};
+        }
+        subscription.name = text(
+          subscription.account_name || subscription.name,
+          240,
+        );
+        subscription.platform = platform;
+        subscription.account_url = text(
+          subscription.account_url || subscription.official_profile_url,
+          3000,
+        );
+        const compatible = await loadCompatibleProfilePatrolAgent(
+          tx,
+          req.tenantId,
+          agentId,
+          [platform],
+          'official',
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+        const requestHash = profilePatrolRequestHash({
+          workflow: WORKFLOW,
+          agentId,
+          subscriptionIds: [subscription.id],
+          title,
+          monitorSettings,
+          captureSettings,
+        });
         const existing = await tx.queryOne(`
           SELECT task.*, command.id AS create_command_id,
             command.expires_at AS create_command_expires_at,
@@ -625,132 +599,57 @@ router.post(
         `, [requestKey, req.tenantId]);
         if (existing) {
           const metadata = safeJson(existing.metadata);
-          const recordIds = normalizedIds.recordIds.length > 0
-            ? normalizedIds.recordIds : Array.isArray(metadata.selectedRecordIds) ? metadata.selectedRecordIds : [];
-          const hash = patrolRequestHash({agentId, title, filter: normalized.filter, recordIds, captureSettings});
-          if (existing.task_type !== WORKFLOW || metadata.remoteRequestHash !== hash) {
+          if (
+            existing.task_type !== WORKFLOW ||
+            metadata.remoteRequestHash !== requestHash
+          ) {
             return {failure: requestError('idempotency_key_conflict', '该 requestKey 已用于不同的任务请求', 409)};
           }
-          return {task: existing, commandId: existing.create_command_id || null, commandExpiresAt: existing.create_command_expires_at || null, agentOnline: captureAgentOnline(existing.agent_last_heartbeat_at), existing: true};
+          return {
+            task: existing,
+            commandId: existing.create_command_id || null,
+            commandExpiresAt: existing.create_command_expires_at || null,
+            agentOnline: captureAgentOnline(existing.agent_last_heartbeat_at),
+            existing: true,
+          };
         }
         const collision = await tx.queryOne('SELECT id FROM capture_tasks WHERE id = $1::uuid', [requestKey]);
         if (collision) return {failure: requestError('idempotency_key_conflict', '该 requestKey 已用于其他任务', 409)};
-        const selection = await loadCandidates(tx, req.tenantId, normalized.filter, {recordIds: normalizedIds.recordIds, lock: true});
-        if (selection.failure) return {failure: selection.failure};
-        if (selection.candidates.length === 0) {
-          return {failure: requestError('official_comment_candidates_empty', '当前时间范围内没有可巡查的官方账号作品', 409)};
-        }
-        if (normalizedIds.recordIds.length > 0 && selection.candidates.length !== normalizedIds.recordIds.length) {
-          const actual = new Set(selection.candidates.map(candidate => candidate.id));
-          return {failure: requestError(
-            'candidate_selection_changed',
-            '部分已选作品不再符合官方账号、发布时间或详情链接条件，请刷新候选列表',
-            409,
-            {invalidRecordIds: normalizedIds.recordIds.filter(id => !actual.has(id))},
-          )};
-        }
-        const compatible = await loadCompatibleAgent(tx, req.tenantId, agentId, selection.account.platform);
-        if (compatible.failure) return {failure: compatible.failure};
-        const agent = compatible.agent;
-        const selectedRecordIds = selection.candidates.map(candidate => candidate.id);
-        const requestHash = patrolRequestHash({agentId, title, filter: normalized.filter, recordIds: selectedRecordIds, captureSettings});
-        const commandId = crypto.randomUUID();
-        const metadata = {
-          workflow: WORKFLOW,
-          protocolVersion: 1,
-          remoteCreated: true,
-          remoteRequestHash: requestHash,
-          createCommandId: commandId,
-          officialAccount: {
-            id: selection.account.id,
-            accountName: selection.account.account_name,
-            accountId: selection.account.account_id,
-            platform: selection.account.platform,
-          },
-          filter: {...normalized.filter, platform: selection.account.platform},
-          selectedRecordIds,
-          captureSettings,
-          resultDisclosure: '评论为本次可访问样本与入库结果，不代表平台全部评论。',
-        };
-        const task = await tx.queryOne(`
-          INSERT INTO capture_tasks (
-            id, tenant_id, origin_agent_id, assigned_agent_id, client_task_id,
-            task_type, feature_key, title, platform, source, trigger_type, status,
-            progress, checkpoint, counts, metadata, message, orchestration_revision, source_updated_at
-          ) VALUES (
-            $1::uuid, $2, $3, $3, $1::uuid::text,
-            $4, $4, $5, $6, 'cloud', 'official_comment_patrol_manual', 'pending',
-            $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, 1, now()
-          ) RETURNING *
-        `, [
-          requestKey, req.tenantId, agent.id, WORKFLOW, title, selection.account.platform,
-          JSON.stringify({current: 0, total: selection.candidates.length, percent: 0, phase: 'queued'}),
-          JSON.stringify({targetIndex: 0}),
-          JSON.stringify({total: selection.candidates.length, assigned: selection.candidates.length, processed: 0, success: 0, failed: 0, skipped: 0}),
-          JSON.stringify(metadata),
-          '官方账号评论巡查任务已创建，等待目标设备领取',
-        ]);
-        const targets = [];
-        for (let ordinal = 0; ordinal < selection.candidates.length; ordinal += 1) {
-          const candidate = selection.candidates[ordinal];
-          const itemId = crypto.randomUUID();
-          await tx.execute(`
-            INSERT INTO capture_task_items (
-              id, tenant_id, task_id, item_key, ordinal, platform, item_type,
-              record_id, external_id, url_snapshot, status, assigned_agent_id,
-              execution_task_id, assignment_revision, request_hash, assigned_at, dispatched_at, metadata
-            ) VALUES (
-              $1, $2, $3, $4, $5, $6, 'official_account_post',
-              $7, $8, $9, 'dispatched', $10, $3, 1, $11, now(), now(), $12::jsonb
-            )
-          `, [
-            itemId, req.tenantId, task.id, `record:${candidate.id}`, ordinal,
-            candidate.platform, candidate.id, candidate.externalId, candidate.url,
-            agent.id, requestHash,
-            JSON.stringify({sourceRecord: {title: candidate.title, authorName: candidate.authorName, publishedAt: candidate.publishedAt}, commentsLimit: normalized.filter.commentsLimit, resultDisclosure: metadata.resultDisclosure}),
-          ]);
-          await tx.execute(`
-            INSERT INTO capture_task_item_attempts (
-              id, tenant_id, item_id, parent_task_id, execution_task_id, agent_id,
-              attempt_number, assignment_revision, status, request_hash, checkpoint, result, error, dispatched_at
-            ) VALUES ($1, $2, $3, $4, $4, $5, 1, 1, 'dispatched', $6, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now())
-          `, [crypto.randomUUID(), req.tenantId, itemId, task.id, agent.id, requestHash]);
-          targets.push(candidateTarget(candidate, itemId));
-        }
-        const payload = {
-          taskId: task.id,
-          clientTaskId: task.id,
-          title: task.title,
-          executionMode: 'one_time',
-          platform: task.platform,
-          workflow: WORKFLOW,
-          taskKind: WORKFLOW,
-          protocolVersion: 1,
-          targets,
-          items: targets,
+        const dispatched = await materializeProfilePatrolTask(tx, {
+          tenantId: req.tenantId,
+          subjectType: 'official',
+          agent: compatible.agent,
+          subscriptions: [subscription],
+          requestKey,
+          title,
+          monitorSettings,
           captureSettings,
           requestHash,
-          authCodeId: agent.auth_code_id,
-          authBindingId: agent.auth_binding_id,
-        };
-        const command = await tx.queryOne(`
-          INSERT INTO capture_agent_commands (
-            id, tenant_id, agent_id, task_id, command_type, payload, requested_by_user_id, requested_by_name
-          ) VALUES ($1, $2, $3, $4, 'create', $5::jsonb, $6, $7)
-          RETURNING id, status, expires_at, created_at
-        `, [commandId, req.tenantId, agent.id, task.id, JSON.stringify(payload), req.user?.id || null, text(req.actorName, 240)]);
-        await appendTaskEvent(tx, {
-          tenantId: req.tenantId, taskId: task.id, agentId: agent.id,
-          actorId: req.user?.id || '', actorName: req.actorName, status: task.status,
-          message: '后台已向指定节点创建官方账号评论巡查任务',
-          payload: {commandId: command.id, officialAccountId: selection.account.id, candidateCount: targets.length, commentsLimit: normalized.filter.commentsLimit, publishDateFrom: normalized.filter.publishDateFrom, publishDateTo: normalized.filter.publishDateTo, requestHash},
+          triggerType: 'official_comment_patrol_manual',
+          requestedByUserId: req.user?.id || null,
+          requestedByName: req.actorName,
         });
         await tx.execute(`
           INSERT INTO audit_logs (
             tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata
           ) VALUES ($1, 'user', $2, $3, 'official_comment_patrol.create', 'capture_task', $4, $5::jsonb)
-        `, [req.tenantId, text(req.user?.id || '', 240), req.user?.id || null, task.id, JSON.stringify({agentId: agent.id, officialAccountId: selection.account.id, candidateCount: targets.length, requestHash})]);
-        return {task, commandId: command.id, commandExpiresAt: command.expires_at, agentOnline: captureAgentOnline(agent.last_heartbeat_at), existing: false};
+        `, [
+          req.tenantId,
+          text(req.user?.id || '', 240),
+          req.user?.id || null,
+          dispatched.task.id,
+          JSON.stringify({
+            agentId: compatible.agent.id,
+            officialAccountId: normalized.filter.officialAccountId,
+            monitorSubscriptionId: subscription.id,
+            publishDateFrom: normalized.filter.publishDateFrom,
+            publishDateTo: normalized.filter.publishDateTo,
+            postsLimit: normalized.filter.postsLimit,
+            commentsLimit: normalized.filter.commentsLimit,
+            requestHash,
+          }),
+        ]);
+        return {...dispatched, existing: false};
       });
       if (result.failure) return sendRequestError(res, result.failure);
       return res.status(result.existing ? 200 : 201).json({
