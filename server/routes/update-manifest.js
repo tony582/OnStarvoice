@@ -3,12 +3,35 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.65',
+  latestVersion: '0.3.66',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-07-28',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.65-20260728.zip',
+  releaseDate: '2026-07-29',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.66-20260729.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.66',
+      releaseDate: '2026-07-29',
+      releaseNotes: [
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: 'AI 前置筛选稳定性',
+              desc: '缩小单批判断数量并延长等待时间；整批超时时自动拆分重试，减少高峰期未介入。',
+            },
+            {
+              title: '采集不中断保护',
+              desc: 'AI 超时或服务异常时安全放行并继续采集详情，不因筛选服务波动丢失内容。',
+            },
+            {
+              title: '运行状态更清楚',
+              desc: '任务进度会显示 AI 拆批重试、超时及安全放行数量，便于确认 AI 是否实际介入。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.65',
       releaseDate: '2026-07-28',
