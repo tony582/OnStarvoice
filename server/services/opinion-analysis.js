@@ -13,9 +13,10 @@ import { getBrandContext, callLLMWithPrompt } from './ai-labeler.js';
 const RISK_LEVELS = ['critical', 'warning', 'attention', 'watch']; // 越靠前越严重
 const PLATFORM_TEXT = { xiaohongshu: '小红书', weibo: '微博', douyin: '抖音', unknown: '未知平台' };
 const TOPIC_PROMPT_VERSION = 'topic-v1';
-const RECORD_PROMPT_VERSION = 'record-v1';
+export const RECORD_ANALYSIS_PROMPT_VERSION = 'record-v1';
 const RECORD_RISK_BY_ALERT_LEVEL = { critical: 'critical', warning: 'warning', info: 'attention' };
 const INFLIGHT = new Set(); // analysisId,防并发重复执行(同 transcription.js 的转写防重)
+const RECORD_ANALYSIS_INFLIGHT = new Map(); // tenant:record:inputHash → Promise
 
 export function normalizeRiskLevel(value, fallback = 'watch') {
   const normalized = String(value || '').trim().toLowerCase();
@@ -40,6 +41,107 @@ function pctOf(part, total) {
 function compact(value, max = 120) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+function normalizedTimestamp(value) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toISOString();
+}
+
+/**
+ * 单条剖析缓存只有在「输入完全一致 + 提示词版本一致」时才可复用。
+ * rule_fallback 是否可复用由调用方决定：GET 可以展示，自动/手动生成应继续尝试 LLM。
+ */
+export function isRecordAnalysisCacheCurrent(cached, inputHash) {
+  return Boolean(
+    cached
+    && String(cached.input_hash || '') === String(inputHash || '')
+    && String(cached.prompt_version || '') === RECORD_ANALYSIS_PROMPT_VERSION
+  );
+}
+
+export function isValidRecordAnalysisCache(cached, inputHash, { allowRuleFallback = true } = {}) {
+  return Boolean(
+    isRecordAnalysisCacheCurrent(cached, inputHash)
+    && cached.payload
+    && (allowRuleFallback || cached.analysis_source !== 'rule_fallback')
+  );
+}
+
+/** 同一租户、同一帖子、同一输入版本的剖析只允许一个模型调用。 */
+export function withRecordAnalysisSingleFlight(key, runner) {
+  const inflightKey = String(key || '');
+  const existing = RECORD_ANALYSIS_INFLIGHT.get(inflightKey);
+  if (existing) return existing;
+
+  let pending;
+  pending = Promise.resolve()
+    .then(runner)
+    .finally(() => {
+      if (RECORD_ANALYSIS_INFLIGHT.get(inflightKey) === pending) {
+        RECORD_ANALYSIS_INFLIGHT.delete(inflightKey);
+      }
+    });
+  RECORD_ANALYSIS_INFLIGHT.set(inflightKey, pending);
+  return pending;
+}
+
+/**
+ * 纯函数版本的 input hash，供服务与测试共用。
+ * 不把“抓取时间”本身放进 hash，避免相同指标的重复快照导致无意义重算。
+ */
+export function computeRecordAnalysisInputHashFromState(state = {}) {
+  const record = state.record || {};
+  const observation = state.latestObservation || {};
+  const negativeComments = state.negativeComments || {};
+  const ocr = state.ocr || {};
+  const alertFingerprints = [...new Set((Array.isArray(state.alerts) ? state.alerts : [])
+    .map(alert => [
+      String(alert?.level || ''),
+      String(alert?.reason || ''),
+      String(num(alert?.interaction_total)),
+    ].join('|')))]
+    .sort();
+
+  const basis = {
+    record: {
+      title: String(record.title || ''),
+      content: String(record.content || ''),
+      sentiment: String(record.sentiment || ''),
+      aiSummary: String(record.ai_summary || ''),
+      likes: num(record.likes),
+      comments: num(record.comments_count),
+      collects: num(record.collects),
+      shares: num(record.shares),
+      negativeComments: num(record.negative_comment_count),
+      latestNegativeCommentAt: normalizedTimestamp(record.latest_negative_comment_at),
+      transcript: String(record.transcript || ''),
+      transcriptAnalysis: record.transcript_analysis || null,
+    },
+    latestObservation: {
+      likes: num(observation.likes),
+      comments: num(observation.comments_count),
+      collects: num(observation.collects),
+      shares: num(observation.shares),
+      interactionTotal: num(observation.interaction_total),
+    },
+    alerts: alertFingerprints,
+    negativeComments: {
+      count: num(negativeComments.negative_count),
+      likes: num(negativeComments.negative_likes),
+      critical: num(negativeComments.critical_count),
+      high: num(negativeComments.high_count),
+      medium: num(negativeComments.medium_count),
+      low: num(negativeComments.low_count),
+      latestUpdatedAt: normalizedTimestamp(negativeComments.latest_negative_updated_at),
+    },
+    ocr: {
+      count: num(ocr.count),
+      latestUpdatedAt: normalizedTimestamp(ocr.latest_updated_at),
+    },
+  };
+  return crypto.createHash('sha1').update(JSON.stringify(basis)).digest('hex');
 }
 
 function parseKeywordsColumn(value) {
@@ -671,14 +773,17 @@ async function enhanceRecordAnalysis(tenantId, { record, comments, ocrText, tran
  * 单条深剖(只读消费已有沉淀,不触发 ASR/OCR):规则先算兜底骨架,再一次 LLM 覆盖文字层,失败无缝回落。
  * 兜底/降级结果同样落缓存 —— 抽屉重开有内容;POST 读到 rule_fallback 缓存会隐式再试一次(防一次超时永久钉死)。
  */
-export async function analyzeOpinionRecord({ tenantId, recordId }) {
+export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = null }) {
   const record = await queryOne(
     `SELECT id, title, content, sentiment, ai_summary, likes, comments_count, collects, shares,
-            negative_comment_count, transcript, transcript_analysis
+            negative_comment_count, latest_negative_comment_at, transcript, transcript_analysis
      FROM records WHERE id = $1 AND tenant_id = $2`,
     [recordId, tenantId]
   );
   if (!record) return null;
+  // 在读取剖析证据和调用模型前固定输入版本。之后若证据继续变化，缓存会自然变为 stale，
+  // 避免把“旧内容分析”错误写成“最新输入”的有效缓存。
+  const analysisInputHash = inputHash || await computeRecordInputHash(tenantId, recordId);
 
   const alerts = await queryAll(
     `SELECT level, reason FROM alerts WHERE tenant_id = $1 AND record_id = $2 ORDER BY created_at DESC`,
@@ -730,7 +835,7 @@ export async function analyzeOpinionRecord({ tenantId, recordId }) {
     summary: '',
   }));
   const payload = {
-    meta: { promptVersion: RECORD_PROMPT_VERSION, generatedAt: new Date().toISOString(), evidenceSources },
+    meta: { promptVersion: RECORD_ANALYSIS_PROMPT_VERSION, generatedAt: new Date().toISOString(), evidenceSources },
     overview: {
       stance: RECORD_STANCES.includes(record.sentiment) ? record.sentiment : 'neutral',
       riskLevel,
@@ -809,30 +914,140 @@ export async function analyzeOpinionRecord({ tenantId, recordId }) {
   }
   payload.meta.analysisSource = analysisSource;
 
-  const inputHash = await computeRecordInputHash(tenantId, record);
   await execute(
     `INSERT INTO opinion_record_analyses (tenant_id, record_id, payload, analysis_source, prompt_version, input_hash)
      VALUES ($1, $2, $3::jsonb, $4, $5, $6)
      ON CONFLICT (tenant_id, record_id)
      DO UPDATE SET payload = excluded.payload, analysis_source = excluded.analysis_source,
        prompt_version = excluded.prompt_version, input_hash = excluded.input_hash, updated_at = now()`,
-    [tenantId, recordId, JSON.stringify(payload), analysisSource, RECORD_PROMPT_VERSION, inputHash]
+    [
+      tenantId,
+      recordId,
+      JSON.stringify(payload),
+      analysisSource,
+      RECORD_ANALYSIS_PROMPT_VERSION,
+      analysisInputHash,
+    ]
   );
-  return { payload, source: analysisSource, inputHash };
+  return { payload, source: analysisSource, inputHash: analysisInputHash };
 }
 
-/** input_hash = sha1(正文摘要+评论数+逐字稿长度+OCR 条数):读缓存时不一致 → 提示 stale 可重剖。 */
-export async function computeRecordInputHash(tenantId, record) {
-  const ocr = await queryOne(
-    `SELECT COUNT(*) AS n FROM record_image_ocr
-     WHERE tenant_id = $1 AND record_id = $2 AND status = 'done'`,
-    [tenantId, record.id]
+/**
+ * 单条剖析输入版本：正文/分类 + 最新互动快照 + 风险预警 + 负面评论变化 + ASR/OCR。
+ * recordOrId 仅用于取 id；其余字段始终从数据库读最新值，避免路由传入部分字段造成假命中。
+ */
+export async function computeRecordInputHash(tenantId, recordOrId) {
+  const recordId = typeof recordOrId === 'object' ? recordOrId?.id : recordOrId;
+  if (!recordId) return '';
+
+  const [record, latestObservation, alerts, negativeComments, ocr] = await Promise.all([
+    queryOne(
+      `SELECT id, title, content, sentiment, ai_summary, likes, comments_count, collects, shares,
+              negative_comment_count, latest_negative_comment_at, transcript, transcript_analysis
+       FROM records WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, recordId]
+    ),
+    queryOne(
+      `SELECT likes, comments_count, collects, shares, interaction_total
+       FROM record_observations
+       WHERE tenant_id = $1 AND record_id = $2
+       ORDER BY captured_at DESC, id DESC
+       LIMIT 1`,
+      [tenantId, recordId]
+    ),
+    queryAll(
+      `SELECT level, reason, interaction_total
+       FROM alerts
+       WHERE tenant_id = $1 AND record_id = $2
+       ORDER BY level, reason, interaction_total`,
+      [tenantId, recordId]
+    ),
+    queryOne(
+      `SELECT
+         COUNT(*) FILTER (WHERE is_negative = true) AS negative_count,
+         COALESCE(SUM(like_count) FILTER (WHERE is_negative = true), 0) AS negative_likes,
+         COUNT(*) FILTER (WHERE is_negative = true AND risk_level = 'critical') AS critical_count,
+         COUNT(*) FILTER (WHERE is_negative = true AND risk_level = 'high') AS high_count,
+         COUNT(*) FILTER (WHERE is_negative = true AND risk_level = 'medium') AS medium_count,
+         COUNT(*) FILTER (WHERE is_negative = true AND risk_level = 'low') AS low_count,
+         MAX(updated_at) FILTER (WHERE is_negative = true) AS latest_negative_updated_at
+       FROM record_comments
+       WHERE tenant_id = $1 AND record_id = $2 AND is_official = false`,
+      [tenantId, recordId]
+    ),
+    queryOne(
+      `SELECT COUNT(*) AS count, MAX(updated_at) AS latest_updated_at
+       FROM record_image_ocr
+       WHERE tenant_id = $1 AND record_id = $2 AND status = 'done'`,
+      [tenantId, recordId]
+    ),
+  ]);
+  if (!record) return '';
+
+  return computeRecordAnalysisInputHashFromState({
+    record,
+    latestObservation,
+    alerts,
+    negativeComments,
+    ocr,
+  });
+}
+
+export async function analyzeOpinionRecordOnce({ tenantId, recordId, inputHash = null }) {
+  const currentHash = inputHash || await computeRecordInputHash(tenantId, recordId);
+  if (!currentHash) return null;
+  const key = `${tenantId}:${recordId}:${currentHash}`;
+  return await withRecordAnalysisSingleFlight(
+    key,
+    () => analyzeOpinionRecord({ tenantId, recordId, inputHash: currentHash })
   );
-  const basis = [
-    String(record.content || '').slice(0, 2000),
-    String(num(record.comments_count)),
-    String(String(record.transcript || '').length),
-    String(num(ocr?.n)),
-  ].join('|');
-  return crypto.createHash('sha1').update(basis).digest('hex');
+}
+
+export function shouldAutoAnalyzeRecord(record) {
+  return String(record?.sentiment || '').trim().toLowerCase() === 'negative';
+}
+
+/**
+ * AI 分类后的自动剖析入口：
+ * - 仅负面内容；
+ * - 有当前有效 LLM 缓存时跳过；
+ * - 同一输入并发由 analyzeOpinionRecordOnce 合并。
+ */
+export async function ensureNegativeRecordAnalysis({ tenantId, recordId }) {
+  const record = await queryOne(
+    `SELECT id, sentiment FROM records WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, recordId]
+  );
+  if (!record) return { triggered: false, reason: 'not_found' };
+  if (!shouldAutoAnalyzeRecord(record)) return { triggered: false, reason: 'not_negative' };
+  if (!await hasBrandContextConfigured(tenantId)) {
+    return { triggered: false, reason: 'brand_context_missing' };
+  }
+
+  const inputHash = await computeRecordInputHash(tenantId, recordId);
+  if (!inputHash) return { triggered: false, reason: 'not_found' };
+  const cached = await queryOne(
+    `SELECT payload, analysis_source, prompt_version, input_hash
+     FROM opinion_record_analyses
+     WHERE tenant_id = $1 AND record_id = $2`,
+    [tenantId, recordId]
+  );
+  if (isValidRecordAnalysisCache(cached, inputHash, { allowRuleFallback: false })) {
+    return { triggered: false, reason: 'cached', inputHash };
+  }
+
+  const result = await analyzeOpinionRecordOnce({ tenantId, recordId, inputHash });
+  return { triggered: Boolean(result), reason: result ? 'analyzed' : 'not_found', inputHash, result };
+}
+
+/** 后台触发且吞掉错误，绝不阻塞 AI 分类和同步接口。 */
+export function queueNegativeRecordAnalysis(options) {
+  const pending = ensureNegativeRecordAnalysis(options);
+  pending.catch(err => {
+    console.error(
+      `[OpinionAnalysis] 负面内容自动剖析失败 ${options?.recordId || ''}:`,
+      err?.message || err
+    );
+  });
+  return pending;
 }

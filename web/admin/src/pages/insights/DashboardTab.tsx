@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { InfoHint } from '@/components/shared/InfoHint'
+import { NegativePatrolOverview } from '@/pages/insights/NegativePatrolTab'
 
 const ChinaMap = lazy(() => import('@/components/shared/ChinaMap'))
 
@@ -193,7 +194,7 @@ function FocusTopicBar({ keywords, setKeywords }: { keywords: string[]; setKeywo
   )
 }
 
-export function DashboardTab() {
+export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
   const [range, setRange] = useState<RangePreset>('7d')
   const [start, setStart] = useState(inputDate(-6))
   const [end, setEnd] = useState(inputDate())
@@ -293,6 +294,9 @@ export function DashboardTab() {
 
           {/* 1.5 AI 舆情研判 —— 按需触发,LLM 跨样本六维(议题/情绪/诉求/信号/建议,挂样本回链) */}
           <AiInsightPanel range={range} start={start} end={end} />
+
+          {/* 数据看板只保留巡查摘要，完整趋势与升温内容在独立页面查看 */}
+          <NegativePatrolOverview data={s.negativePatrol} onOpen={onOpenPatrol} />
 
           {/* 2. 声量总览与趋势 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.8fr)]">

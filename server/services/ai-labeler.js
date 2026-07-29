@@ -2,7 +2,7 @@
  * AI 标签引擎 — 多 LLM 提供商支持
  */
 
-import { queryOne, queryAll, execute, getSetting } from '../db/init.js';
+import { queryOne, queryAll, getSetting } from '../db/init.js';
 import { parsePublishTimestamp } from './publish-date.js';
 import {
   formatMonitoringIntentForPrompt,
@@ -287,6 +287,32 @@ function hasRelevanceResult(record) {
   }
 }
 
+/**
+ * 分类落库后的派生任务统一从这里异步触发。
+ * 动态导入避免 ai-labeler ↔ opinion-analysis 的静态循环依赖；任何失败只记日志，
+ * 不影响分类主链路，也不会让同步接口因深度剖析失败而失败。
+ */
+function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment }) {
+  setImmediate(async () => {
+    try {
+      if (relevance !== 'irrelevant' || sentiment === 'negative') {
+        const { checkAlerts } = await import('./alert-engine.js');
+        await checkAlerts(recordId);
+      }
+    } catch (err) {
+      console.error(`[AI] Alert check failed for record ${recordId}:`, err?.message || err);
+    }
+
+    if (sentiment !== 'negative') return;
+    try {
+      const { queueNegativeRecordAnalysis } = await import('./opinion-analysis.js');
+      void queueNegativeRecordAnalysis({ tenantId, recordId });
+    } catch (err) {
+      console.error(`[AI] Negative analysis dispatch failed for record ${recordId}:`, err?.message || err);
+    }
+  });
+}
+
 export async function labelRecord(recordId, options = {}) {
   const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
@@ -307,7 +333,7 @@ export async function labelRecord(recordId, options = {}) {
       },
     };
     const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;
-    await execute(`
+    const persisted = await queryOne(`
       UPDATE records SET
         sentiment = CASE
           WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'sentiment' THEN sentiment
@@ -327,6 +353,7 @@ export async function labelRecord(recordId, options = {}) {
         END,
         ai_labeled_at = now(), updated_at = now()
       WHERE id = $10
+      RETURNING tenant_id, sentiment
     `, [
       result.sentiment || '', result.intent || '', result.category || '', result.subcategory || '',
       result.sourceType || result.source_type || '', result.summary || '', result.confidence || 0,
@@ -335,6 +362,14 @@ export async function labelRecord(recordId, options = {}) {
       recordId,
     ]);
     console.log(`[AI] Record ${recordId} labeled: ${result.relevance}/${result.sentiment}/${result.category}`);
+    if (persisted) {
+      queuePostClassificationTasks({
+        recordId,
+        tenantId: persisted.tenant_id,
+        relevance: result.relevance,
+        sentiment: persisted.sentiment,
+      });
+    }
     return result;
   } catch (err) {
     console.error(`[AI] Label error for record ${recordId}:`, err.message);

@@ -7,6 +7,7 @@
 import { queryOne, queryAll, execute, withTransaction, getSetting } from '../db/init.js';
 import { sendReportEmail } from './email-notifier.js';
 import { callLLMWithPrompt } from './ai-labeler.js';
+import { getNegativePatrolAnalytics } from './negative-patrol-analytics.js';
 
 const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
 const SENTIMENT_COLOR = { positive: '#059669', neutral: '#6B7280', negative: '#DC2626' };
@@ -631,6 +632,13 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     params
   );
 
+  const negativePatrol = await getNegativePatrolAnalytics({
+    tenantId,
+    periodStart,
+    periodEnd,
+    keywords: kw,
+  });
+
   return {
     total,
     newRecords,
@@ -688,6 +696,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
       records_with_cover: rowNum(collectionStats, 'records_with_cover'),
       records_with_negative_comments: rowNum(collectionStats, 'records_with_negative_comments'),
     },
+    negativePatrol,
   };
 }
 
@@ -1530,6 +1539,86 @@ function renderReportCard(title, body, subtitle = '') {
   </section>`;
 }
 
+function signedMetric(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—';
+  const normalized = Number(value);
+  return `${normalized > 0 ? '+' : ''}${n0(normalized)}`;
+}
+
+function renderNegativePatrolOverview(negativePatrol = {}) {
+  const summary = negativePatrol.summary || {};
+  const delta = summary.interactionDelta || null;
+  const measuredPosts = num(summary.measuredPosts);
+  const unmeasuredPosts = num(summary.unmeasuredPosts);
+  const trend = (negativePatrol.trend || []).map(row => ({
+    label: row.date || '未知日期',
+    count: row.negativePostVolume,
+  }));
+  const measurementText = delta
+    ? `已对比 ${n0(measuredPosts)} 条；另有 ${n0(unmeasuredPosts)} 条缺少前后快照，未计入增量`
+    : `暂无可比快照；${n0(unmeasuredPosts)} 条显示为未测量，不按 0 增量处理`;
+  const metrics = [
+    ['负面帖子声量', n0(summary.negativePostVolume), '本周期被负面巡查任务实际处理的去重帖子'],
+    ['互动净增量', signedMetric(delta?.interactionTotal), measurementText],
+    ['评论增加', signedMetric(delta?.comments), '仅汇总具备前后两次真实快照的帖子'],
+    ['收藏增加', signedMetric(delta?.collects), '仅汇总具备前后两次真实快照的帖子'],
+    ['点赞增加', signedMetric(delta?.likes), '仅汇总具备前后两次真实快照的帖子'],
+    ['转发增加', signedMetric(delta?.shares), '仅汇总具备前后两次真实快照的帖子'],
+  ];
+  return `<div class="osv-grid-3">${metrics.map(([label, value, help]) => `
+    <article class="osv-topic-box">
+      <h4><span>${escHtml(label)}</span><strong>${escHtml(value)}</strong></h4>
+      <p>${escHtml(help)}</p>
+    </article>
+  `).join('')}</div>
+  <div style="margin-top:14px;">
+    <h4 style="margin:0 0 10px;">巡查声量趋势</h4>
+    ${renderDistribution(trend, {
+      labelKey: 'label',
+      valueKey: 'count',
+      total: 0,
+      color: '#DC2626',
+      maxRows: 14,
+    })}
+  </div>`;
+}
+
+function renderNegativePatrolRisingRecords(rows = []) {
+  if (!rows.length) {
+    return '<div class="osv-empty">本周期暂无负面巡查帖子</div>';
+  }
+  return `<div class="osv-rank-list">${rows.slice(0, 8).map((row, index) => `
+    <div class="osv-rank-row" style="grid-template-columns:28px minmax(0,1fr) auto;">
+      <span class="osv-rank-no">${index + 1}</span>
+      <span class="osv-rank-title">
+        ${safeUrl(row.url)
+          ? `<a href="${escHtml(safeUrl(row.url))}">${escHtml(compactText(row.title || '无标题', 58))}</a>`
+          : escHtml(compactText(row.title || '无标题', 58))}
+        <small style="display:block;color:#6B7280;margin-top:3px;">
+          ${row.measured
+            ? `评论 ${escHtml(signedMetric(row.delta?.comments))}
+              · 收藏 ${escHtml(signedMetric(row.delta?.collects))}
+              · 点赞 ${escHtml(signedMetric(row.delta?.likes))}
+              · 转发 ${escHtml(signedMetric(row.delta?.shares))}`
+            : '待形成基线，暂不计算互动增量'}
+        </small>
+      </span>
+      <strong class="osv-rank-metric">${row.measured
+        ? escHtml(signedMetric(row.delta?.interactionTotal))
+        : '未测量'}</strong>
+    </div>
+  `).join('')}</div>`;
+}
+
+function renderNegativePatrolEmail(negativePatrol = {}, paragraphStyle = '') {
+  const summary = negativePatrol.summary || {};
+  const delta = summary.interactionDelta || null;
+  const comparison = delta
+    ? `互动净增量 ${signedMetric(delta.interactionTotal)}，其中评论 ${signedMetric(delta.comments)}、收藏 ${signedMetric(delta.collects)}、点赞 ${signedMetric(delta.likes)}、转发 ${signedMetric(delta.shares)}`
+    : '当前缺少可比的前后快照，互动增量未测量';
+  return `<p style="${paragraphStyle}">负面帖子声量 ${n0(summary.negativePostVolume)} 条；${escHtml(comparison)}。已测量 ${n0(summary.measuredPosts)} 条，未测量 ${n0(summary.unmeasuredPosts)} 条。</p>`;
+}
+
 function renderOpinionIndex(stats) {
   const idx = stats.opinionIndex || { heat: 0, risk: 0, response: 0, status: '平稳', heatDelta: null, riskDelta: null };
   const riskColor = idx.risk >= 70 ? '#DC2626' : idx.risk >= 45 ? '#D97706' : '#2563EB';
@@ -1768,6 +1857,10 @@ function buildManagementReportHTML(title, periodLabel, stats) {
           ${renderReportCard('平台声量矩阵', renderPlatformMatrix(stats.platformMatrix), '声量、互动与负面率综合排序')}
         </section>
         <section class="osv-grid">
+          ${renderReportCard('负面巡查态势', renderNegativePatrolOverview(stats.negativePatrol), '仅统计负面巡查任务')}
+          ${renderReportCard('负面帖子互动增长', renderNegativePatrolRisingRecords(stats.negativePatrol?.risingRecords || []), '任务下发基线与本次结果快照对比')}
+        </section>
+        <section class="osv-grid">
           ${renderReportCard('管理摘要', renderList(stats.executiveSummary), '结论先行')}
           ${renderReportCard('行动建议', renderList(stats.actionItems, true), '按处置优先级执行')}
         </section>
@@ -1821,6 +1914,10 @@ function buildDataDashboardHTML(title, periodLabel, stats) {
         <section class="osv-grid">
           ${renderReportCard('舆情态势指数', renderOpinionIndex(stats), '综合热度 / 风险 / 响应')}
           ${renderReportCard('平台声量矩阵', renderPlatformMatrix(stats.platformMatrix), '声量、互动与负面率综合排序')}
+        </section>
+        <section class="osv-grid">
+          ${renderReportCard('负面巡查态势', renderNegativePatrolOverview(stats.negativePatrol), '仅统计负面巡查任务')}
+          ${renderReportCard('负面帖子互动增长', renderNegativePatrolRisingRecords(stats.negativePatrol?.risingRecords || []), '任务下发基线与本次结果快照对比')}
         </section>
         <section class="osv-screen-grid">
           <div style="display:grid;gap:14px;">
@@ -1912,6 +2009,11 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
       ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}
       ${renderSection('官方响应概况', `<p style="${P}">本周期官方响应 ${n0(stats.officialPeriod.response_count)} 条,覆盖 ${n0(stats.officialPeriod.record_count)} 条内容;当前待处理/待复核 ${n0(inbox)} 条。</p>`, '')}`;
   }
+  body += renderSection(
+    '负面巡查',
+    renderNegativePatrolEmail(stats.negativePatrol, P),
+    '仅统计负面巡查任务；缺少任务基线或本次结果快照时显示未测量',
+  );
 
   return `${styleBlock()}
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif; max-width:760px; margin:0 auto; background:#F6F8FB; padding:18px; color:#111827;">
@@ -1998,7 +2100,10 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
   const html = buildManagementReportHTML(title, periodLabel, stats);
   const dashboardHtml = buildDataDashboardHTML(title, periodLabel, stats);
   const emailHtml = buildEmailSummaryHTML(title, periodLabel, stats);
-  const hasContent = stats.total > 0 || stats.issueStats.open_issues > 0 || stats.workflowStats.active_inbox > 0;
+  const hasContent = stats.total > 0
+    || stats.issueStats.open_issues > 0
+    || stats.workflowStats.active_inbox > 0
+    || num(stats.negativePatrol?.summary?.negativePostVolume) > 0;
   const status = hasContent ? (send ? 'generating' : 'generated') : 'skipped';
 
   let run = await upsertReportRun({ tenantId, type, periodStart: start, periodEnd: end, subject, html, dashboardHtml, emailHtml, stats, status, template });
@@ -2054,3 +2159,12 @@ export async function resendReport(reportId, tenantId = null) {
   `, [report.tenant_id, report.id, JSON.stringify({ reportType: report.report_type })]);
   return { ...report, status: 'sent' };
 }
+
+export const __reportGeneratorInternals = {
+  buildManagementReportHTML,
+  buildDataDashboardHTML,
+  buildEmailSummaryHTML,
+  renderNegativePatrolOverview,
+  renderNegativePatrolRisingRecords,
+  renderNegativePatrolEmail,
+};

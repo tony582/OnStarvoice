@@ -12,12 +12,28 @@ import {
   sanitizeCloudStructuredObject,
 } from '../services/capture-cloud.js';
 import {aggregateParentTaskItems} from '../services/capture-orchestration.js';
+import {
+  getNegativePatrolAnalytics,
+  getNegativePatrolPostTimeline,
+} from '../services/negative-patrol-analytics.js';
 
 const router = Router();
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const EXTERNAL_ID_PATTERN = /^[a-z0-9_-]{5,200}$/iu;
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
+const ANALYTICS_PLATFORMS = new Set([
+  '',
+  'xiaohongshu',
+  'douyin',
+  'weibo',
+]);
+const ANALYTICS_STATUSES = new Set([
+  '',
+  'available',
+  'unavailable',
+  'baseline_pending',
+]);
 const MAX_CANDIDATES = 100;
 const NEGATIVE_PATROL_REASSIGNABLE_ITEM_STATUSES = new Set([
   'pending',
@@ -84,6 +100,58 @@ function normalizeCalendarDate(value) {
     return '';
   }
   return candidate;
+}
+
+function normalizeAnalyticsPeriod(query = {}) {
+  const endValue = text(query.periodEnd || query.end, 40);
+  const startValue = text(query.periodStart || query.start, 40);
+  const periodEnd = endValue ? new Date(endValue) : new Date();
+  const periodStart = startValue
+    ? new Date(startValue)
+    : new Date(periodEnd.getTime() - 7 * 24 * 60 * 60 * 1000);
+  if (
+    Number.isNaN(periodStart.getTime()) ||
+    Number.isNaN(periodEnd.getTime()) ||
+    periodStart >= periodEnd
+  ) {
+    return {failure: requestError(
+      'invalid_period',
+      'periodStart 必须早于 periodEnd，且两者均为有效日期',
+    )};
+  }
+  if (periodEnd.getTime() - periodStart.getTime() > 366 * 24 * 60 * 60 * 1000) {
+    return {failure: requestError(
+      'period_too_large',
+      '单次舆情巡查分析最多查询 366 天',
+    )};
+  }
+  const rawKeywords = Array.isArray(query.keywords)
+    ? query.keywords
+    : String(query.keywords || '').split(',');
+  const keywords = [...new Set(rawKeywords
+    .map(keyword => text(keyword, 200))
+    .filter(Boolean))].slice(0, 100);
+  const platform = text(query.platform, 40).toLowerCase();
+  if (!ANALYTICS_PLATFORMS.has(platform)) {
+    return {failure: requestError(
+      'invalid_analytics_platform',
+      'platform 仅支持 xiaohongshu、douyin 或 weibo',
+    )};
+  }
+  const status = text(query.status, 40).toLowerCase();
+  if (status === 'high_risk') {
+    return {failure: requestError(
+      'unsupported_analytics_status',
+      '当前缺少可靠的统一风险等级字段，暂不支持高风险筛选',
+    )};
+  }
+  if (!ANALYTICS_STATUSES.has(status)) {
+    return {failure: requestError(
+      'invalid_analytics_status',
+      'status 仅支持 available、unavailable 或 baseline_pending',
+    )};
+  }
+  return {periodStart, periodEnd, keywords, platform, status};
 }
 
 function boundedInteger(value, fallback, minimum, maximum) {
@@ -1119,6 +1187,64 @@ router.post(
         limited: result.limited,
         filter: normalized.filter,
       });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.get(
+  '/negative-patrol/analytics',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const normalized = normalizeAnalyticsPeriod(req.query);
+      if (normalized.failure) {
+        return sendRequestError(res, normalized.failure);
+      }
+      const negativePatrol = await getNegativePatrolAnalytics({
+        tenantId: req.tenantId,
+        periodStart: normalized.periodStart,
+        periodEnd: normalized.periodEnd,
+        keywords: normalized.keywords,
+        platform: normalized.platform,
+        status: normalized.status,
+      });
+      return res.json({ok: true, negativePatrol});
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.get(
+  '/negative-patrol/posts/:recordId/timeline',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const recordId = normalizedUuid(req.params.recordId);
+      if (!recordId) {
+        return sendRequestError(res, requestError(
+          'invalid_record_id',
+          'recordId 必须是有效 UUID',
+        ));
+      }
+      const timeline = await getNegativePatrolPostTimeline({
+        tenantId: req.tenantId,
+        recordId,
+      });
+      if (!timeline) {
+        return res.status(404).json({
+          ok: false,
+          error: 'record_not_found',
+          message: '未找到该舆情内容',
+        });
+      }
+      // RecordDrawer consumes the timeline fields directly. Keep the nested
+      // property as a compatibility alias for other API consumers.
+      return res.json({ok: true, ...timeline, timeline});
     } catch (error) {
       return next(error);
     }
@@ -2398,5 +2524,9 @@ router.post(
     }
   },
 );
+
+export const __negativePatrolRouteInternals = {
+  normalizeAnalyticsPeriod,
+};
 
 export default router;

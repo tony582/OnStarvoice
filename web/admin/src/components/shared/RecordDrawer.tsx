@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
   ExternalLink, User, FileText, Camera, Bell, Archive, ArchiveRestore, Eye, Sparkles, ZoomIn,
@@ -76,7 +76,7 @@ function RecordDrawerContent({
   customTagCatalog = [],
   onUpdateCustomTags,
 }: RecordDrawerProps) {
-  const [tab, setTab] = useState<'content' | 'analysis' | 'comments' | 'official' | 'snapshot' | 'history'>('content')
+  const [tab, setTab] = useState<'content' | 'comments' | 'official' | 'snapshot' | 'patrol' | 'history'>('content')
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
   const [observations, setObservations] = useState<any[]>([])
@@ -321,10 +321,12 @@ function RecordDrawerContent({
 
   const TABS = [
     { id: 'content' as const, label: '内容', icon: FileText },
-    { id: 'analysis' as const, label: '深度剖析', icon: Sparkles },
     { id: 'comments' as const, label: `评论 (${comments.length})`, icon: MessageCircle },
     { id: 'official' as const, label: `官方回复 (${officialResponses.length})`, icon: CheckCircle },
     { id: 'snapshot' as const, label: '采集', icon: Camera },
+    ...(r.sentiment === 'negative'
+      ? [{ id: 'patrol' as const, label: '舆情巡查', icon: Radar }]
+      : []),
     { id: 'history' as const, label: `处理记录 (${activity.length})`, icon: History },
   ]
   const modeActions = [
@@ -505,6 +507,28 @@ function RecordDrawerContent({
                         <p className="text-sm leading-relaxed text-muted-foreground">{r.ai_summary}</p>
                       </div>
                     )}
+                    <section className="border-t border-border/50 pt-5">
+                      <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                          <h4 className="flex items-center gap-1.5 text-[13px] font-semibold text-foreground">
+                            <Sparkles className="h-4 w-4 text-primary" />
+                            深度剖析
+                          </h4>
+                          <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                            {r.sentiment === 'negative'
+                              ? '负面内容会自动拆解观点、传播风险与应对建议。'
+                              : '需要时可手动生成观点、风险与应对建议。'}
+                          </p>
+                        </div>
+                        {r.sentiment === 'negative' && <StatusBadge tone="negative">负面自动剖析</StatusBadge>}
+                      </div>
+                      <RecordAnalysisPanel
+                        record={r}
+                        canWrite={canProcess}
+                        autoRun={r.sentiment === 'negative'}
+                        embedded
+                      />
+                    </section>
                     {hasVideo(r) && <TranscriptSection record={r} canWrite={canProcess} />}
                     <RecordImageGallery
                       key={`${r.id}-${imageEntries.map(item => `${item.url}::${item.ref}`).join('|')}`}
@@ -515,10 +539,6 @@ function RecordDrawerContent({
                       onOpen={setLightbox}
                     />
                   </div>
-                )}
-
-                {tab === 'analysis' && (
-                  <RecordAnalysisPanel record={r} canWrite={canProcess} />
                 )}
 
                 {tab === 'comments' && (
@@ -609,6 +629,10 @@ function RecordDrawerContent({
                       </div>
                     )}
                   </div>
+                )}
+
+                {tab === 'patrol' && (
+                  <RecordPatrolPanel key={String(r.id)} record={r} />
                 )}
 
                 {tab === 'history' && (
@@ -1354,19 +1378,368 @@ function InsightList({ label, items, warn }: { label: string; items: string[]; w
   )
 }
 
+type PatrolDelta = {
+  likes: number | null
+  comments: number | null
+  collects: number | null
+  shares: number | null
+  interactionTotal: number | null
+}
+
+type PatrolSnapshot = {
+  id?: string
+  observationId?: string
+  capturedAt?: string
+  captured_at?: string
+  likes?: number | null
+  comments?: number | null
+  comments_count?: number | null
+  collects?: number | null
+  shares?: number | null
+  interactionTotal?: number | null
+  interaction_total?: number | null
+  availability_status?: string | null
+  runId?: string
+  kind?: 'baseline' | 'result' | string
+}
+
+type PatrolRun = {
+  id?: string
+  itemId?: string
+  status?: string
+  createdAt?: string
+  created_at?: string
+  updatedAt?: string
+  updated_at?: string
+  startedAt?: string
+  started_at?: string
+  finishedAt?: string
+  finished_at?: string
+  agentName?: string | null
+  agent_name?: string | null
+  errorMessage?: string | null
+  error_message?: string | null
+  availabilityStatus?: string | null
+  availability_status?: string | null
+  measured?: boolean
+  delta?: Partial<PatrolDelta> | null
+}
+
+type PatrolTimeline = {
+  record?: Record<string, unknown> | null
+  summary?: {
+    runCount?: number
+    patrolCount?: number
+    snapshotCount?: number
+    measuredRuns?: number
+    unmeasuredRuns?: number
+    firstPatrolledAt?: string | null
+    lastPatrolledAt?: string | null
+    latestStatus?: string | null
+    availabilityStatus?: string | null
+    delta?: Partial<PatrolDelta> | null
+  }
+  snapshots?: PatrolSnapshot[]
+  runs?: PatrolRun[]
+}
+
+type PatrolRecord = {
+  id?: string | number
+  sentiment?: string | null
+  content_availability_status?: string | null
+}
+
+const PATROL_STATUS_LABEL: Record<string, string> = {
+  completed: '巡查完成',
+  partial: '部分完成',
+  partially_completed: '部分完成',
+  failed: '巡查失败',
+  running: '巡查中',
+  pending: '等待巡查',
+  queued: '等待巡查',
+  deleted: '原帖已删除',
+  page_unavailable: '已删除或不可访问',
+}
+
+function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
+  const [timeline, setTimeline] = useState<PatrolTimeline | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    api.get<PatrolTimeline & { timeline?: PatrolTimeline }>(`/capture-cloud/negative-patrol/posts/${record.id}/timeline`)
+      .then(data => { if (active) setTimeline(data.timeline || data) })
+      .catch(err => { if (active) setError(err instanceof Error ? err.message : '舆情巡查数据读取失败') })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [record.id])
+
+  if (record.sentiment !== 'negative') {
+    return (
+      <EmptyState
+        icon={Radar}
+        title="该内容未纳入负面舆情巡查"
+        description="仅负面内容自动形成巡查轨迹；其他内容仍可在「采集」中查看普通快照。"
+      />
+    )
+  }
+
+  if (loading) return <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+
+  if (error) {
+    return (
+      <EmptyState
+        icon={AlertTriangle}
+        title="暂时无法读取舆情巡查"
+        description={friendlyError(error)}
+      />
+    )
+  }
+
+  const summary = timeline?.summary || {}
+  const runs = Array.isArray(timeline?.runs) ? timeline.runs : []
+  const snapshots = (Array.isArray(timeline?.snapshots) ? timeline.snapshots : [])
+    .filter(item => patrolSnapshotCapturedAt(item))
+    .sort((a, b) => new Date(patrolSnapshotCapturedAt(a)).getTime() - new Date(patrolSnapshotCapturedAt(b)).getTime())
+  const delta = summary.delta || runs.find(run => run.measured)?.delta || null
+  const hasMeasuredDelta = Boolean(
+    delta
+    && [delta.likes, delta.comments, delta.collects, delta.shares, delta.interactionTotal]
+      .some(value => typeof value === 'number'),
+  )
+  const availability = String(summary.availabilityStatus || record.content_availability_status || 'available')
+  const unavailable = ['deleted', 'page_unavailable', 'unavailable'].includes(availability)
+  const latestStatus = unavailable ? availability : String(summary.latestStatus || runs[0]?.status || '')
+  const measuredRuns = Number(summary.measuredRuns || runs.filter(run => run.measured).length || 0)
+  const patrolCount = Number(summary.patrolCount ?? summary.runCount ?? runs.length)
+  const interactionDelta = typeof delta?.interactionTotal === 'number'
+    ? delta.interactionTotal
+    : sumKnown([delta?.likes, delta?.comments, delta?.collects, delta?.shares])
+
+  if (runs.length === 0) {
+    return (
+      <EmptyState
+        icon={Radar}
+        title="尚未形成负面巡查记录"
+        description="该内容已判为负面，但还没有经过「负面帖子巡查」任务。普通采集快照不会被计入巡查声量。"
+      />
+    )
+  }
+
+  return (
+    <div className="space-y-5">
+      <section className={cn(
+        'rounded-xl border p-4',
+        unavailable
+          ? 'border-border bg-muted/35'
+          : 'border-primary/15 bg-primary/[0.035]',
+      )}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Radar className="h-4 w-4 text-primary" />
+              <h4 className="text-[13px] font-semibold text-foreground">负面内容巡查状态</h4>
+            </div>
+            <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
+              仅统计真实负面巡查任务；普通重复采集不会混入这里。
+            </p>
+          </div>
+          <StatusBadge tone={unavailable ? 'muted' : latestStatus === 'failed' ? 'negative' : latestStatus === 'running' ? 'reviewing' : 'positive'}>
+            {PATROL_STATUS_LABEL[latestStatus] || '已纳入巡查'}
+          </StatusBadge>
+        </div>
+        {unavailable && (
+          <div className="mt-3 flex items-start gap-2 rounded-lg bg-background/70 px-3 py-2 text-[12px] text-muted-foreground">
+            <Ban className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>当前页面已删除或不可访问；历史巡查快照仍保留，不再把不可访问误算成互动下降。</span>
+          </div>
+        )}
+      </section>
+
+      <section>
+        <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
+          <div>
+            <h4 className="text-[13px] font-semibold text-foreground">最近一次可比巡查增量</h4>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">同一条内容两次巡查快照之间的互动变化，不等同于新增负面评论。</p>
+          </div>
+          <span className="text-[11px] text-muted-foreground">
+            {hasMeasuredDelta ? `${measuredRuns} 次可比巡查` : '待形成第二次巡查快照'}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <PatrolDeltaCard icon={Heart} label="点赞增加" value={delta?.likes} />
+          <PatrolDeltaCard icon={MessageCircle} label="评论增加" value={delta?.comments} />
+          <PatrolDeltaCard icon={Star} label="收藏增加" value={delta?.collects} />
+          <PatrolDeltaCard icon={Share2} label="转发增加" value={delta?.shares} />
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-border/60 bg-card p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h4 className="text-[13px] font-semibold text-foreground">互动趋势</h4>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">点赞、评论、收藏、转发的快照合计</p>
+          </div>
+          <div className="text-right">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">本轮总互动变化</div>
+            <div className="text-lg font-bold tabular-nums">{formatPatrolDelta(interactionDelta)}</div>
+          </div>
+        </div>
+        <PatrolTrendChart snapshots={snapshots} />
+      </section>
+
+      <section>
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <h4 className="text-[13px] font-semibold text-foreground">巡查记录</h4>
+          <span className="text-[11px] text-muted-foreground">
+            共 {patrolCount} 次 · 最近 {formatFullDateSec(
+              summary.lastPatrolledAt
+              || runs[0]?.finishedAt
+              || runs[0]?.finished_at
+              || runs[0]?.updatedAt
+              || runs[0]?.updated_at,
+            )}
+          </span>
+        </div>
+        <div className="divide-y divide-border/50 rounded-xl border border-border/60 bg-card">
+          {runs.slice(0, 8).map((run, index) => {
+            const status = String(run.availabilityStatus || run.availability_status || run.status || '')
+            return (
+              <div key={run.itemId || run.id || index} className="p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[12px] font-semibold">第 {patrolCount - index} 次巡查</span>
+                  <StatusBadge tone={status === 'failed' ? 'negative' : status === 'running' ? 'reviewing' : status.includes('unavailable') || status === 'deleted' ? 'muted' : 'positive'}>
+                    {PATROL_STATUS_LABEL[status] || status || '已完成'}
+                  </StatusBadge>
+                  <span className="ml-auto text-[11px] text-muted-foreground">
+                    {formatFullDateSec(run.finishedAt || run.finished_at || run.updatedAt || run.updated_at || run.startedAt || run.started_at || run.createdAt || run.created_at)}
+                  </span>
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                  <span>Agent：{run.agentName || run.agent_name || '未记录'}</span>
+                  <span>{run.measured ? `互动变化 ${formatPatrolDelta(run.delta?.interactionTotal ?? sumKnown([run.delta?.likes, run.delta?.comments, run.delta?.collects, run.delta?.shares]))}` : '缺少成对快照，未计算增量'}</span>
+                </div>
+                {(run.errorMessage || run.error_message) && (
+                  <p className="mt-1.5 text-[11px] leading-5 text-destructive">{run.errorMessage || run.error_message}</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function PatrolDeltaCard({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: number | null | undefined }) {
+  return (
+    <div className="rounded-lg border border-border/50 bg-muted/30 p-3">
+      <div className="flex items-center gap-1.5 text-[10.5px] font-medium text-muted-foreground">
+        <Icon className="h-3.5 w-3.5" />{label}
+      </div>
+      <div className="mt-1 text-[17px] font-bold tabular-nums">{formatPatrolDelta(value)}</div>
+    </div>
+  )
+}
+
+function PatrolTrendChart({ snapshots }: { snapshots: PatrolSnapshot[] }) {
+  const points = snapshots
+    .map(snapshot => ({
+      capturedAt: patrolSnapshotCapturedAt(snapshot),
+      total: snapshot.interactionTotal ?? snapshot.interaction_total ?? sumKnown([
+        snapshot.likes,
+        snapshot.comments ?? snapshot.comments_count,
+        snapshot.collects,
+        snapshot.shares,
+      ]),
+    }))
+    .filter((point): point is { capturedAt: string; total: number } => typeof point.total === 'number')
+
+  if (points.length < 2) {
+    return (
+      <div className="mt-4 flex h-28 items-center justify-center rounded-lg bg-muted/25 px-4 text-center text-[12px] text-muted-foreground">
+        首次巡查只保存基线；完成下一次巡查后才会显示真实趋势。
+      </div>
+    )
+  }
+
+  const width = 520
+  const height = 136
+  const insetX = 12
+  const insetY = 14
+  const values = points.map(point => point.total)
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const range = Math.max(1, max - min)
+  const coords = points.map((point, index) => ({
+    x: insetX + (index / Math.max(1, points.length - 1)) * (width - insetX * 2),
+    y: insetY + ((max - point.total) / range) * (height - insetY * 2),
+    ...point,
+  }))
+  const polyline = coords.map(point => `${point.x},${point.y}`).join(' ')
+
+  return (
+    <div className="mt-3">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-32 w-full overflow-visible" role="img" aria-label="负面内容互动变化趋势">
+        {[0.2, 0.5, 0.8].map(ratio => (
+          <line key={ratio} x1={insetX} x2={width - insetX} y1={height * ratio} y2={height * ratio}
+            className="stroke-border/70" strokeDasharray="4 5" strokeWidth="1" />
+        ))}
+        <polyline points={polyline} fill="none" className="stroke-primary" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        {coords.map((point, index) => (
+          <g key={`${point.capturedAt}-${index}`}>
+            <circle cx={point.x} cy={point.y} r="4" className="fill-card stroke-primary" strokeWidth="2.5" />
+            {(index === 0 || index === coords.length - 1) && (
+              <text x={point.x} y={Math.max(10, point.y - 9)} textAnchor={index === 0 ? 'start' : 'end'}
+                className="fill-muted-foreground text-[10px] font-semibold">
+                {formatNumber(point.total)}
+              </text>
+            )}
+          </g>
+        ))}
+      </svg>
+      <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
+        <span>{formatFullDateSec(points[0]?.capturedAt)}</span>
+        <span>{formatFullDateSec(points[points.length - 1]?.capturedAt)}</span>
+      </div>
+    </div>
+  )
+}
+
+function patrolSnapshotCapturedAt(snapshot: PatrolSnapshot): string {
+  return String(snapshot.capturedAt || snapshot.captured_at || '')
+}
+
+function sumKnown(values: Array<number | null | undefined>): number | null {
+  const known = values.filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+  return known.length ? known.reduce((sum, value) => sum + value, 0) : null
+}
+
+function formatPatrolDelta(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '待对比'
+  return `${value > 0 ? '+' : ''}${formatNumber(value)}`
+}
+
 // 单条深度剖析:自含数据获取(GET 读缓存 → 无则 POST 发起,60s 显式超时),四块结果展示。
 // 与话题级同范式:LLM 覆盖文字层,失败落 rule_fallback 兜底(仍有内容,可一键重试)。
 const RISK_TONE: Record<string, string> = { critical: 'critical', warning: 'negative', attention: 'medium', watch: 'muted' }
 const STANCE_LABEL: Record<string, string> = { positive: '正面', negative: '负面', neutral: '中性', mixed: '褒贬不一' }
 const RECORD_SOURCE_LABEL: Record<string, string> = { llm: 'AI 深剖', rule_fallback: '规则兜底' }
+const AUTO_ANALYSIS_REQUESTED = new Set<string>()
 
-type RecordAnalysisPanelProps = { record: any; canWrite: boolean }
+type RecordAnalysisPanelProps = {
+  record: any
+  canWrite: boolean
+  autoRun?: boolean
+  embedded?: boolean
+}
 
 function RecordAnalysisPanel(props: RecordAnalysisPanelProps) {
   return <RecordAnalysisPanelContent key={String(props.record?.id ?? '')} {...props} />
 }
 
-function RecordAnalysisPanelContent({ record, canWrite }: RecordAnalysisPanelProps) {
+function RecordAnalysisPanelContent({ record, canWrite, autoRun = false, embedded = false }: RecordAnalysisPanelProps) {
   const [loading, setLoading] = useState(true)
   const [analysis, setAnalysis] = useState<any>(null)
   const [source, setSource] = useState('')
@@ -1376,21 +1749,7 @@ function RecordAnalysisPanelContent({ record, canWrite }: RecordAnalysisPanelPro
   const [brandMissing, setBrandMissing] = useState(false)
   const [copied, setCopied] = useState('')
 
-  useEffect(() => {
-    let active = true
-    api.get<any>(`/opinion-analysis/records/${record.id}`)
-      .then(d => {
-        if (!active) return
-        setAnalysis(d.analysis || null)
-        setSource(d.source || '')
-        setStale(Boolean(d.stale))
-      })
-      .catch(() => { /* 拉取失败按未剖析处理,由用户手动发起 */ })
-      .finally(() => { if (active) setLoading(false) })
-    return () => { active = false }
-  }, [record.id])
-
-  const run = async (refresh: boolean) => {
+  const run = useCallback(async (refresh: boolean) => {
     setGenerating(true); setError(''); setBrandMissing(false)
     try {
       const d = await api.post<any>(
@@ -1406,7 +1765,31 @@ function RecordAnalysisPanelContent({ record, canWrite }: RecordAnalysisPanelPro
     } finally {
       setGenerating(false)
     }
-  }
+  }, [record.id])
+
+  useEffect(() => {
+    let active = true
+    api.get<any>(`/opinion-analysis/records/${record.id}`)
+      .then(async d => {
+        if (!active) return
+        setAnalysis(d.analysis || null)
+        setSource(d.source || '')
+        setStale(Boolean(d.stale))
+        if (
+          !d.analysis
+          && autoRun
+          && canWrite
+          && !AUTO_ANALYSIS_REQUESTED.has(String(record.id))
+        ) {
+          AUTO_ANALYSIS_REQUESTED.add(String(record.id))
+          setLoading(false)
+          await run(false)
+        }
+      })
+      .catch(() => { /* 拉取失败按未剖析处理,由用户手动发起 */ })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [autoRun, canWrite, record.id, run])
 
   const copy = async (key: string, text: string) => {
     try { await navigator.clipboard.writeText(text); setCopied(key); setTimeout(() => setCopied(''), 1500) } catch { /* 忽略 */ }
@@ -1423,16 +1806,22 @@ function RecordAnalysisPanelContent({ record, canWrite }: RecordAnalysisPanelPro
 
   if (!analysis) {
     return (
-      <div className="flex flex-col items-center gap-4 py-10 text-center">
+      <div className={cn('flex flex-col items-center gap-4 text-center', embedded ? 'py-6' : 'py-10')}>
         <Radar className="h-8 w-8 text-muted-foreground/60" />
         <div>
-          <p className="text-sm font-semibold text-foreground">尚未做深度剖析</p>
-          <p className="mt-1 text-sm text-muted-foreground">基于正文 / 逐字稿 / 图文文字 / 评论,一次性拆解观点、风险与回应口径。</p>
+          <p className="text-sm font-semibold text-foreground">
+            {generating && autoRun ? '正在自动深度剖析' : '尚未做深度剖析'}
+          </p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {generating && autoRun
+              ? '负面内容已进入 AI 剖析，完成后会在这里展示观点、传播风险与建议。'
+              : '基于正文 / 逐字稿 / 图文文字 / 评论，一次性拆解观点、风险与回应口径。'}
+          </p>
         </div>
         {canWrite ? (
-          <Button size="sm" disabled={generating} onClick={() => void run(false)}>
+          <Button size="sm" disabled={generating} onClick={() => void run(Boolean(error))}>
             {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-            {generating ? '正在深度剖析…(约需数十秒)' : '开始深度剖析'}
+            {generating ? '正在深度剖析…（约需数十秒）' : error ? '重新尝试' : '开始深度剖析'}
           </Button>
         ) : <p className="text-xs text-muted-foreground">只读账号无法发起剖析。</p>}
         {error && <p className="text-sm text-rose-600 dark:text-rose-400">{friendlyError(error)}</p>}
