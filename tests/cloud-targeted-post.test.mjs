@@ -588,6 +588,56 @@ test("reports a target complete only after every captured record syncs", () => {
   assert.equal(result.sync.status, "completed");
 });
 
+test("createRunRequest fences a fresh local attempt from stale payload metadata", () => {
+  const normalized = targeted.normalizeCommandPayload({
+    protocolVersion: 1,
+    workflow: "official_account_comment_patrol",
+    taskId: "official-comments-profile-1",
+    clientTaskId: "official-comments-profile-1",
+    attemptId: "stale-payload-attempt",
+    platform: "douyin",
+    targetMode: "profile",
+    profileMode: true,
+    monitorSettings: {
+      publishWindow: "custom",
+      publishDateFrom: "2026-07-21",
+      publishDateTo: "2026-07-28",
+      postsLimit: 5,
+    },
+    captureSettings: {
+      includeComments: true,
+      includeCommentsOnDetailCapture: true,
+      autoSyncAfterDetailCapture: true,
+      commentsMaxDetectedItems: 30,
+    },
+    targets: [
+      {
+        itemId: "profile-item-1",
+        recordId: "profile-record-1",
+        subscriptionId: "profile-record-1",
+        executionId: "profile-execution-1",
+        url: "https://www.douyin.com/user/MS4wLjABAAAA-comments",
+      },
+    ],
+  });
+
+  const request = targeted.createRunRequest(normalized, {
+    commandId: "command-2",
+    attemptId: "fresh-local-attempt",
+    attemptNumber: 2,
+    previousAttemptId: "attempt-1",
+    now: "2026-07-29T06:00:00.000Z",
+  });
+
+  assert.equal(request.id, "official-comments-profile-1");
+  assert.equal(request.attemptId, "fresh-local-attempt");
+  assert.equal(request.attemptNumber, 2);
+  assert.equal(request.previousAttemptId, "attempt-1");
+  assert.equal(request.cloudCommandId, "command-2");
+  assert.equal(request.targetMode, "profile");
+  assert.equal(request.profileMode, true);
+});
+
 test("mergeRunPatch ignores unknown target results and preserves formal checkpoint", () => {
   const request = targeted.createRunRequest(
     targeted.normalizeCommandPayload({

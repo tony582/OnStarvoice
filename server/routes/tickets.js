@@ -85,7 +85,7 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
       snap = await queryOne(
         `SELECT platform, COALESCE(NULLIF(record_title, ''), '评论') AS title, comment_content AS item_text,
                 comment_author_name AS author, record_url AS url, '' AS cover_url,
-                lead_type AS category, priority AS src_priority
+                lead_type AS category, priority AS src_priority, record_id AS source_record_id
          FROM comment_leads WHERE id = $1 AND tenant_id = $2`,
         [sourceId, req.tenantId],
       );
@@ -113,7 +113,7 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
          RETURNING ${TICKET_COLUMNS}`,
         [
           req.tenantId, sourceType,
-          sourceType === 'content' ? sourceId : null,
+          sourceType === 'content' ? sourceId : (snap.source_record_id || null),
           sourceType === 'comment' ? sourceId : null,
           snap.platform || '', snap.title || '', snap.item_text || '', snap.author || '',
           snap.url || '', snap.cover_url || '',
@@ -374,7 +374,7 @@ router.get('/:id/source', requireTenantAccess, async (req, res, next) => {
          FROM comment_leads WHERE id = $1 AND tenant_id = $2`,
         [ticket.source_comment_id, req.tenantId],
       );
-      recordId = comment?.record_id || null;
+      recordId = comment?.record_id || recordId || null;
     }
 
     let record = null;

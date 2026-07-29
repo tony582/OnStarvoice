@@ -1461,7 +1461,7 @@ const PATROL_STATUS_LABEL: Record<string, string> = {
   page_unavailable: '已删除或不可访问',
 }
 
-function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
+export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
   const [timeline, setTimeline] = useState<PatrolTimeline | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -1474,16 +1474,6 @@ function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [record.id])
-
-  if (record.sentiment !== 'negative') {
-    return (
-      <EmptyState
-        icon={Radar}
-        title="该内容未纳入负面舆情巡查"
-        description="仅负面内容自动形成巡查轨迹；其他内容仍可在「采集」中查看普通快照。"
-      />
-    )
-  }
 
   if (loading) return <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
 
@@ -1518,6 +1508,15 @@ function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
     : sumKnown([delta?.likes, delta?.comments, delta?.collects, delta?.shares])
 
   if (runs.length === 0) {
+    if (record.sentiment !== 'negative') {
+      return (
+        <EmptyState
+          icon={Radar}
+          title="该内容未纳入负面舆情巡查"
+          description="尚无负面巡查任务记录；普通采集快照请在「采集」中查看。"
+        />
+      )
+    }
     return (
       <EmptyState
         icon={Radar}

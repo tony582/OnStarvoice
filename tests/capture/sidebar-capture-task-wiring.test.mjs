@@ -171,6 +171,269 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
   );
 });
 
+test("targeted runner is fenced by its URL attempt before adopting cloud state", () => {
+  assert.match(
+    sidebarSource,
+    /TARGETED_POST_RUN_ATTEMPT_QUERY_KEY = "targetedPostAttempt"/u,
+  );
+
+  const urlSection = readFunctionSection(
+    "function getTargetedPostRunRequestIdFromUrl()",
+    "async function loadTargetedPostRunStateForDisplay()",
+  );
+  assert.match(
+    urlSection,
+    /function getTargetedPostRunAttemptIdFromUrl\(\)[\s\S]*?TARGETED_POST_RUN_ATTEMPT_QUERY_KEY/u,
+  );
+
+  const displaySection = readFunctionSection(
+    "async function loadTargetedPostRunStateForDisplay()",
+    "async function updateTargetedPostRun(",
+  );
+  assert.match(
+    displaySection,
+    /\.\.\.\(requestId \? \{requestId, attemptId\} : \{\}\)/u,
+  );
+  assert.match(
+    displaySection,
+    /if \(requestId && !attemptId\)[\s\S]*?targeted_post_attempt_required/u,
+  );
+  assert.match(
+    displaySection,
+    /resolveTargetedPostRunBinding\([\s\S]*?if \(!binding\.accepted\)[\s\S]*?return null/u,
+  );
+
+  const runnerSection = readFunctionSection(
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+    "async function maybeClaimAndRunUnattendedKeywordPlan(",
+  );
+  assert.match(
+    runnerSection,
+    /onstarvoice:get-targeted-post-run-state[\s\S]*?requestId,\s*attemptId/u,
+  );
+  const requiredAttemptIndex = runnerSection.indexOf(
+    "if (!invocationToken)",
+  );
+  const firstStateReadIndex = runnerSection.indexOf(
+    'type: "onstarvoice:get-targeted-post-run-state"',
+  );
+  const bindingIndex = runnerSection.indexOf(
+    "const binding = resolveTargetedPostRunBinding(",
+  );
+  const rejectedBindingIndex = runnerSection.indexOf(
+    "if (!binding.accepted)",
+    bindingIndex,
+  );
+  const stateAdoptionIndex = runnerSection.indexOf(
+    "targetedPostRunState = request",
+    rejectedBindingIndex,
+  );
+  assert.ok(
+    requiredAttemptIndex > -1 && requiredAttemptIndex < firstStateReadIndex,
+  );
+  assert.ok(bindingIndex > firstStateReadIndex);
+  assert.ok(rejectedBindingIndex > bindingIndex);
+  assert.ok(stateAdoptionIndex > rejectedBindingIndex);
+
+  const bindingSection = readFunctionSection(
+    "function resolveTargetedPostRunBinding(",
+    "function stopTargetedPostRunnerForInvalidBinding(",
+  );
+  const context = {};
+  vm.runInNewContext(
+    `${bindingSection}
+globalThis.__resolveTargetedPostRunBinding = resolveTargetedPostRunBinding;`,
+    context,
+  );
+  const resolveBinding = context.__resolveTargetedPostRunBinding;
+
+  const missingAttempt = resolveBinding(
+    {ok: true, data: {id: "request-1", attemptId: "attempt-new"}},
+    "request-1",
+    "",
+  );
+  assert.equal(missingAttempt.accepted, false);
+  assert.equal(missingAttempt.reason, "targeted_post_attempt_required");
+  assert.equal(missingAttempt.request, null);
+
+  const staleAttempt = resolveBinding(
+    {ok: true, data: {id: "request-1", attemptId: "attempt-new"}},
+    "request-1",
+    "attempt-old",
+  );
+  assert.equal(staleAttempt.accepted, false);
+  assert.equal(staleAttempt.reason, "stale_targeted_post_attempt");
+  assert.equal(staleAttempt.request, null);
+
+  const rejectedAttempt = resolveBinding(
+    {
+      ok: false,
+      accepted: false,
+      reason: "stale_targeted_post_attempt",
+      data: {id: "request-1", attemptId: "attempt-new"},
+    },
+    "request-1",
+    "attempt-old",
+  );
+  assert.equal(rejectedAttempt.accepted, false);
+  assert.equal(rejectedAttempt.reason, "stale_targeted_post_attempt");
+  assert.equal(rejectedAttempt.request, null);
+
+  const matchingAttempt = resolveBinding(
+    {
+      ok: true,
+      accepted: true,
+      data: {
+        id: "request-1",
+        attemptId: "attempt-current",
+      },
+    },
+    "request-1",
+    "attempt-current",
+  );
+  assert.equal(matchingAttempt.accepted, true);
+  assert.equal(matchingAttempt.reason, "");
+  assert.equal(matchingAttempt.request.id, "request-1");
+  assert.equal(matchingAttempt.request.attemptId, "attempt-current");
+});
+
+test("storage handoff from attempt A to B fences late A progress and cleanup", () => {
+  const helperSection = readFunctionSection(
+    "function createTargetedPostInvocationToken(",
+    "function resolveTargetedPostRunBinding(",
+  );
+  const stopReasons = [];
+  const context = {
+    activeTargetedPostInvocationToken: null,
+    targetedPostRunInFlightOwnerToken: null,
+    targetedPostBatchStateOwnerToken: null,
+    targetedPostRunnerTabOwnerToken: null,
+    targetedPostRunState: null,
+    targetedPostCancelRequested: false,
+    batchUrlCancelRequested: false,
+    activeBatchRunnerTabId: 77,
+    getTargetedPostRunRequestIdFromUrl: () => "request-1",
+    getTargetedPostRunAttemptIdFromUrl: () => "attempt-a",
+    stopTargetedPostRunnerForInvalidBinding: (reason) => {
+      stopReasons.push(reason);
+    },
+    renderCaptureDebugSession: () => {},
+    getCurrentRuntime: () => ({}),
+    requestCaptureCancelSignal: async () => true,
+    console,
+  };
+  vm.runInNewContext(
+    `${helperSection}
+globalThis.__targetedAttemptHelpers = {
+  createTargetedPostInvocationToken,
+  activateTargetedPostInvocation,
+  getTargetedPostInvocationOwnership,
+  handleTargetedPostRunRequestStorageChange,
+};`,
+    context,
+  );
+  const helpers = context.__targetedAttemptHelpers;
+  const attemptA = helpers.createTargetedPostInvocationToken(
+    "request-1",
+    "attempt-a",
+  );
+  helpers.activateTargetedPostInvocation(attemptA);
+  context.targetedPostRunInFlightOwnerToken = attemptA;
+  context.targetedPostBatchStateOwnerToken = attemptA;
+  context.targetedPostRunnerTabOwnerToken = attemptA;
+  context.targetedPostRunState = {
+    id: "request-1",
+    attemptId: "attempt-a",
+    status: "running",
+  };
+
+  helpers.handleTargetedPostRunRequestStorageChange({
+    id: "request-1",
+    attemptId: "attempt-b",
+    status: "running",
+  });
+
+  assert.equal(Object.isFrozen(attemptA), true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.activeTargetedPostInvocationToken)),
+    {requestId: "request-1", attemptId: "attempt-b"},
+  );
+  assert.equal(context.targetedPostRunState, null);
+  assert.deepEqual(stopReasons, ["stale_targeted_post_attempt"]);
+  assert.deepEqual(
+    JSON.parse(
+      JSON.stringify(
+        helpers.getTargetedPostInvocationOwnership(attemptA),
+      ),
+    ),
+    {active: false, run: true, batch: true, runnerTab: true},
+  );
+
+  const attemptB = helpers.createTargetedPostInvocationToken(
+    "request-1",
+    "attempt-b",
+  );
+  context.targetedPostRunInFlightOwnerToken = attemptB;
+  context.targetedPostBatchStateOwnerToken = attemptB;
+  context.targetedPostRunnerTabOwnerToken = attemptB;
+  assert.deepEqual(
+    JSON.parse(
+      JSON.stringify(
+        helpers.getTargetedPostInvocationOwnership(attemptA),
+      ),
+    ),
+    {active: false, run: false, batch: false, runnerTab: false},
+  );
+
+  const runnerSection = readFunctionSection(
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+    "async function maybeClaimAndRunUnattendedKeywordPlan(",
+  );
+  const progressIndex = runnerSection.indexOf(
+    "onProgress: (progress = {}) =>",
+  );
+  const progressFenceIndex = runnerSection.indexOf(
+    "if (!isActiveTargetedPostInvocation(invocationToken))",
+    progressIndex,
+  );
+  const progressWriteIndex = runnerSection.indexOf(
+    "targetedPostRunState = cloudTargetedPostApi.mergeRunPatch(",
+    progressFenceIndex,
+  );
+  assert.ok(progressIndex > -1);
+  assert.ok(progressFenceIndex > progressIndex);
+  assert.ok(progressWriteIndex > progressFenceIndex);
+
+  const finallyIndex = runnerSection.lastIndexOf("} finally {");
+  const confirmBindingIndex = runnerSection.indexOf(
+    "await confirmTargetedPostInvocationBinding(invocationToken)",
+    finallyIndex,
+  );
+  const settleRunnerIndex = runnerSection.indexOf(
+    "await settleTargetedPostRunnerTab(",
+    confirmBindingIndex,
+  );
+  assert.ok(finallyIndex > -1);
+  assert.ok(confirmBindingIndex > finallyIndex);
+  assert.ok(settleRunnerIndex > confirmBindingIndex);
+  assert.match(
+    runnerSection.slice(finallyIndex),
+    /if \(latestOwnership\.batch\)[\s\S]*?targetedPostBatchStateOwnerToken = null;/u,
+  );
+  assert.match(
+    runnerSection.slice(finallyIndex),
+    /if \(latestOwnership\.runnerTab\)[\s\S]*?targetedPostRunnerTabOwnerToken = null;/u,
+  );
+  assert.match(
+    runnerSection.slice(finallyIndex),
+    /if \(latestOwnership\.run\)[\s\S]*?targetedPostRunInFlightOwnerToken = null;/u,
+  );
+  assert.match(
+    runnerSection.slice(finallyIndex),
+    /if \(latestOwnership\.active\)[\s\S]*?activeTargetedPostInvocationToken = null;/u,
+  );
+});
+
 test("targeted patrol reads only the records returned by the current batch", () => {
   const collectSection = readFunctionSection(
     "function collectTargetedPostRecordIds(",
@@ -373,6 +636,7 @@ test("a normal side panel without a runner query renders shared targeted state a
   );
   const sharedRequest = {
     id: "shared-targeted-request",
+    attemptId: "shared-targeted-attempt",
     workflow: "negative_post_patrol",
     status: "running",
     platform: "xiaohongshu",
@@ -415,6 +679,25 @@ test("a normal side panel without a runner query renders shared targeted state a
     targetedPostCancelRequested: false,
     batchUrlCancelRequested: false,
     activeBatchRunnerTabId: null,
+    targetedPostRunnerTabOwnerToken: null,
+    getTargetedPostInvocationTokenFromRequest: (request) =>
+      request?.id && request?.attemptId
+        ? {
+            requestId: request.id,
+            attemptId: request.attemptId,
+          }
+        : null,
+    getTargetedPostRunRequestIdFromUrl: () => "",
+    getTargetedPostRunAttemptIdFromUrl: () => "",
+    createTargetedPostInvocationToken: () => null,
+    isSameTargetedPostInvocationToken: (left, right) =>
+      Boolean(
+        left &&
+          right &&
+          left.requestId === right.requestId &&
+          left.attemptId === right.attemptId,
+      ),
+    isActiveTargetedPostInvocation: () => false,
     updateTargetedPostRun: async (request, patch) => {
       updateCalls.push({request, patch});
       return {...request, ...patch};

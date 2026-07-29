@@ -177,38 +177,70 @@ function officialAliases(account) {
   ].map(normalizeComparable).filter(Boolean);
 }
 
-function matchesOfficialAccount(subject, account) {
-  if (!account || account.status !== 'active') return false;
-  if (account.platform && subject.platform && account.platform !== subject.platform) return false;
-  const subjectPlatformUserId = normalizeComparable(
-    subject.author_id || subject.platform_user_id || '',
-  );
-  const subjectAccountNo = normalizeComparable(
-    subject.author_account_no || subject.account_no || '',
-  );
-  const platformUserId = normalizeComparable(account.platform_user_id || '');
-  const accountNo = normalizeComparable(account.account_no || '');
-  const legacyAccountId = normalizeComparable(account.account_id || '');
+function platformCompatible(subject, account) {
+  return !(account.platform && subject.platform && account.platform !== subject.platform);
+}
+
+function officialStrongIdentity(account) {
+  return {
+    platformUserId: normalizeComparable(account.platform_user_id || ''),
+    accountNo: normalizeComparable(account.account_no || ''),
+    legacyAccountId: normalizeComparable(account.account_id || ''),
+  };
+}
+
+function subjectStrongIdentity(subject) {
+  return {
+    platformUserId: normalizeComparable(
+      subject.author_id || subject.platform_user_id || '',
+    ),
+    accountNo: normalizeComparable(
+      subject.author_account_no || subject.account_no || '',
+    ),
+  };
+}
+
+function matchesStrongOfficialIdentity(subject, account) {
+  const subjectIdentity = subjectStrongIdentity(subject);
+  const officialIdentity = officialStrongIdentity(account);
   if (
-    subjectPlatformUserId &&
-    platformUserId &&
-    subjectPlatformUserId === platformUserId
+    subjectIdentity.platformUserId &&
+    officialIdentity.platformUserId &&
+    subjectIdentity.platformUserId === officialIdentity.platformUserId
   ) return true;
-  if (subjectAccountNo && accountNo && subjectAccountNo === accountNo) return true;
   if (
-    legacyAccountId &&
+    subjectIdentity.accountNo &&
+    officialIdentity.accountNo &&
+    subjectIdentity.accountNo === officialIdentity.accountNo
+  ) return true;
+  return Boolean(
+    officialIdentity.legacyAccountId &&
     (
-      (subjectPlatformUserId && subjectPlatformUserId === legacyAccountId) ||
-      (subjectAccountNo && subjectAccountNo === legacyAccountId)
-    )
-  ) return true;
-  const accountHasStrongIdentity = Boolean(
-    platformUserId || accountNo || legacyAccountId,
+      subjectIdentity.platformUserId === officialIdentity.legacyAccountId ||
+      subjectIdentity.accountNo === officialIdentity.legacyAccountId
+    ),
   );
-  const subjectHasStrongIdentity = Boolean(
-    subjectPlatformUserId || subjectAccountNo,
-  );
-  if (accountHasStrongIdentity && subjectHasStrongIdentity) return false;
+}
+
+export function matchesOfficialRecordOwner(subject, account) {
+  if (!account || account.status !== 'active') return false;
+  if (!platformCompatible(subject, account)) return false;
+  return matchesStrongOfficialIdentity(subject, account);
+}
+
+export function matchesOfficialCommentAuthor(subject, account) {
+  if (!account || account.status !== 'active') return false;
+  if (!platformCompatible(subject, account)) return false;
+  if (matchesStrongOfficialIdentity(subject, account)) return true;
+  const officialIdentity = officialStrongIdentity(account);
+  const subjectIdentity = subjectStrongIdentity(subject);
+  if (
+    officialIdentity.platformUserId ||
+    officialIdentity.accountNo ||
+    officialIdentity.legacyAccountId ||
+    subjectIdentity.platformUserId ||
+    subjectIdentity.accountNo
+  ) return false;
   const subjectName = normalizeComparable(subject.author_name || subject.account_name || '');
   if (!subjectName) return false;
   return officialAliases(account).some(alias => alias && subjectName === alias);
@@ -221,8 +253,12 @@ async function loadOfficialAccounts(tx, tenantId) {
   );
 }
 
-function isOfficialSubject(subject, accounts) {
-  return accounts.find(account => matchesOfficialAccount(subject, account)) || null;
+function findOfficialRecordOwner(subject, accounts) {
+  return accounts.find(account => matchesOfficialRecordOwner(subject, account)) || null;
+}
+
+function findOfficialCommentAuthor(subject, accounts) {
+  return accounts.find(account => matchesOfficialCommentAuthor(subject, account)) || null;
 }
 
 function buildCommentHash(recordId, comment) {
@@ -484,7 +520,7 @@ export async function upsertRecordComments(recordId, record, context) {
   if (!currentRecord) return { inserted: 0, updated: 0, negative: 0, officialResponses: 0, officialContent: false };
   const koeTerms = splitKoeTerms(await getSetting('koe_account_terms', tenantId));
 
-  const officialRecordAccount = isOfficialSubject({
+  const officialRecordAccount = findOfficialRecordOwner({
     platform,
     author_name: record.author_name || currentRecord.author_name,
     author_id: record.author_id || currentRecord.author_id,
@@ -501,7 +537,7 @@ export async function upsertRecordComments(recordId, record, context) {
   // 非官方评论标 aiClassified=false,留给后台 refineCommentsWithAI 批量 AI 精炼。
   const prepared = comments.map((raw, index) => {
     const comment = normalizeComment(raw, index);
-    const officialAccount = isOfficialSubject({
+    const officialAccount = findOfficialCommentAuthor({
       platform,
       author_name: comment.author_name,
       author_id: comment.author_id,

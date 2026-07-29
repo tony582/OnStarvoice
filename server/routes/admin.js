@@ -952,25 +952,51 @@ router.put('/official-accounts', async (req, res, next) => {
   }
 });
 
-// 回溯重标:把历史上作者命中官方账号(精确名/别名/ID,且 skip_content)的内容
-// 标为 official_content,使其退出舆情监测队列。匹配规则与 comment-workflow 的 matchesOfficialAccount 对齐。
+// 回溯重标:官方发文只接受强身份匹配；官方评论仅兼容双方均无强身份的旧名称数据。
 router.post('/official-accounts/reclassify', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
-    // 命中官方账号的 SQL 谓词(精确名/别名/ID,对齐 comment-workflow.matchesOfficialAccount)
-    const matchSql = (rowAlias) => `EXISTS (
+    const commentAuthorMatchSql = (rowAlias, officialAlias = 'oa') => `(
+      (
+        COALESCE(${officialAlias}.platform_user_id, '') <> ''
+        AND ${officialAlias}.platform_user_id = ${rowAlias}.author_id
+      )
+      OR (
+        COALESCE(${officialAlias}.account_id, '') <> ''
+        AND ${officialAlias}.account_id = ${rowAlias}.author_id
+      )
+      OR (
+        COALESCE(${officialAlias}.platform_user_id, '') = ''
+        AND COALESCE(${officialAlias}.account_no, '') = ''
+        AND COALESCE(${officialAlias}.account_id, '') = ''
+        AND COALESCE(${rowAlias}.author_id, '') = ''
+        AND (
+          (
+            COALESCE(${officialAlias}.account_name, '') <> ''
+            AND ${officialAlias}.account_name = ${rowAlias}.author_name
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(
+              CASE
+                WHEN jsonb_typeof(${officialAlias}.aliases) = 'array'
+                  THEN ${officialAlias}.aliases
+                ELSE '[]'::jsonb
+              END
+            ) alias
+            WHERE alias = ${rowAlias}.author_name
+          )
+        )
+      )
+    )`;
+    const commentMatchSql = (rowAlias) => `EXISTS (
       SELECT 1 FROM official_accounts oa
       WHERE oa.tenant_id = ${rowAlias}.tenant_id AND oa.status = 'active'
         AND (COALESCE(oa.platform, '') = '' OR oa.platform = ${rowAlias}.platform)
-        AND (
-          (COALESCE(oa.platform_user_id, '') <> '' AND oa.platform_user_id = ${rowAlias}.author_id)
-          OR (COALESCE(oa.account_id, '') <> '' AND oa.account_id = ${rowAlias}.author_id)
-          OR oa.account_name = ${rowAlias}.author_name
-          OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) alias WHERE alias = ${rowAlias}.author_name)
-        )
+        AND ${commentAuthorMatchSql(rowAlias)}
     )`;
 
-    // ① 官方"发文" → official_content,退出舆情监测
+    // ① 官方"发文"只按强身份重标 → official_content,退出舆情监测
     const excluded = (await execute(`
       UPDATE records r SET record_type = 'official_content', updated_at = now()
       WHERE r.tenant_id = $1 AND COALESCE(r.record_type, '') <> 'official_content'
@@ -982,17 +1008,15 @@ router.post('/official-accounts/reclassify', async (req, res, next) => {
               OR (COALESCE(oa.account_no,'')<>'' AND oa.account_no=r.author_account_no)
               OR (COALESCE(oa.account_id,'')<>'' AND (
                 oa.account_id=r.author_id OR oa.account_id=r.author_account_no
-              ))
-              OR oa.account_name=r.author_name
-              OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) a WHERE a=r.author_name))
+              )))
         )
     `, [tenantId]))?.rowCount ?? 0;
 
-    // ② 官方"回复评论" → 标记 is_official(中性,不计负面/客资)
+    // ② 官方"回复评论" → 强身份优先；双方均无强身份时才兼容旧名称数据
     const officialReplies = (await execute(`
       UPDATE record_comments c
       SET is_official = true, is_negative = false, sentiment = 'neutral', risk_level = 'none', updated_at = now()
-      WHERE c.tenant_id = $1 AND c.is_official IS DISTINCT FROM true AND ${matchSql('c')}
+      WHERE c.tenant_id = $1 AND c.is_official IS DISTINCT FROM true AND ${commentMatchSql('c')}
     `, [tenantId]))?.rowCount ?? 0;
 
     // ③ 为官方回复补 official_responses(供详情页"官方响应"展示;每条评论一条,去重)
@@ -1003,10 +1027,7 @@ router.post('/official-accounts/reclassify', async (req, res, next) => {
       FROM record_comments c
       JOIN official_accounts oa ON oa.tenant_id = c.tenant_id AND oa.status = 'active'
         AND (COALESCE(oa.platform,'')='' OR oa.platform = c.platform)
-        AND ((COALESCE(oa.platform_user_id,'')<>'' AND oa.platform_user_id=c.author_id)
-          OR (COALESCE(oa.account_id,'')<>'' AND oa.account_id=c.author_id)
-          OR oa.account_name=c.author_name
-          OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(oa.aliases) a WHERE a=c.author_name))
+        AND ${commentAuthorMatchSql('c')}
       WHERE c.tenant_id = $1 AND c.is_official = true
         AND NOT EXISTS (SELECT 1 FROM official_responses orr WHERE orr.tenant_id = c.tenant_id AND orr.comment_id = c.id)
       ORDER BY c.id, oa.id

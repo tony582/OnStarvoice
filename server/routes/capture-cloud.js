@@ -249,6 +249,8 @@ export function resolveStopCommandOutcome({
   reportedSuccess = false,
   expectedRequestId = '',
   actualRequestId = '',
+  expectedAttemptId = '',
+  actualAttemptId = '',
   resultReason = '',
   supersededCreateCommandId = '',
   previousStatus = '',
@@ -256,19 +258,29 @@ export function resolveStopCommandOutcome({
   const expected = text(expectedRequestId, 240);
   const actual = text(actualRequestId, 240);
   const validRequestId = Boolean(expected && actual === expected);
+  const expectedAttempt = text(expectedAttemptId, 240);
+  const actualAttempt = text(actualAttemptId, 240);
+  // Existing non-targeted stop commands predate attempt fencing. Once a
+  // command carries an attempt, however, its receipt must identify that exact
+  // execution round so a stale browser run cannot settle the current task.
+  const validAttemptId = expectedAttempt
+    ? actualAttempt === expectedAttempt
+    : true;
+  const validIdentity = validRequestId && validAttemptId;
   const normalizedReason = text(resultReason, 120);
   const normalizedCreateCommandId = text(supersededCreateCommandId, 100);
   const stoppedBeforeLocalCreation = Boolean(
-    validRequestId &&
+    validIdentity &&
       reportedSuccess !== true &&
       UUID_PATTERN.test(normalizedCreateCommandId) &&
       SUPERSEDED_CREATE_STOP_NO_TARGET_REASONS.has(normalizedReason),
   );
   const success = Boolean(
-    validRequestId && (reportedSuccess === true || stoppedBeforeLocalCreation),
+    validIdentity && (reportedSuccess === true || stoppedBeforeLocalCreation),
   );
   return {
     validRequestId,
+    validAttemptId,
     success,
     stoppedBeforeLocalCreation,
     commandStatus: success ? 'completed' : 'failed',
@@ -758,11 +770,22 @@ async function resolveResumeCommandFromSuccessor(tx, agent, snapshot) {
 
 async function resolveCreateCommandFromSnapshot(tx, agent, task, snapshot, evidence = null) {
   const createCommandId = text(task?.metadata?.createCommandId, 100);
+  const taskWorkflow = text(
+    task?.metadata?.workflow || task?.task_type,
+    80,
+  );
   if (
     !createCommandId ||
     !task?.id ||
     task?.metadata?.stopCommandId ||
-    (evidence && evidence.id !== createCommandId)
+    (evidence && evidence.id !== createCommandId) ||
+    (
+      taskWorkflow === 'official_account_comment_patrol' &&
+      (
+        !evidence ||
+        !createCommandSnapshotMatches(evidence.payload, snapshot)
+      )
+    )
   ) {
     return null;
   }
@@ -897,6 +920,225 @@ function profilePatrolIntent(source = {}) {
     return false;
   }
   return null;
+}
+
+function ownContractValue(source = {}, keys = []) {
+  const value = safeJson(source);
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      return value[key];
+    }
+  }
+  return undefined;
+}
+
+function observedContractValue(observed, metadata, keys) {
+  const direct = ownContractValue(observed, keys);
+  return direct === undefined
+    ? ownContractValue(metadata, keys)
+    : direct;
+}
+
+function contractBoolean(value) {
+  if (value === true || value === 1 || value === '1' || value === 'true') {
+    return true;
+  }
+  if (value === false || value === 0 || value === '0' || value === 'false') {
+    return false;
+  }
+  return null;
+}
+
+function contractInteger(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.floor(parsed) : null;
+}
+
+function contractUrl(value) {
+  const normalized = text(value, 3000);
+  if (!normalized) return '';
+  try {
+    const parsed = new URL(normalized);
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/u, '');
+  } catch {
+    return normalized.replace(/\/$/u, '');
+  }
+}
+
+function patrolTargets(source = {}) {
+  const value = Array.isArray(source) ? source : [];
+  return value.map(target => {
+    const normalized = safeJson(target);
+    return {
+      accountId: text(
+        normalized.subscriptionId ||
+          normalized.subscription_id ||
+          normalized.recordId ||
+          normalized.record_id ||
+          normalized.externalId ||
+          normalized.external_id,
+        240,
+      ).toLowerCase(),
+      accountUrl: contractUrl(
+        normalized.accountUrl ||
+          normalized.account_url ||
+          normalized.url,
+      ),
+    };
+  });
+}
+
+function patrolTargetsMatch(expected = [], observed = []) {
+  const expectedTargets = patrolTargets(expected);
+  const observedTargets = patrolTargets(observed);
+  if (
+    expectedTargets.length === 0 ||
+    expectedTargets.length !== observedTargets.length
+  ) {
+    return false;
+  }
+  return expectedTargets.every((target, index) => {
+    const actual = observedTargets[index];
+    return Boolean(
+      actual &&
+      (!target.accountId || actual.accountId === target.accountId) &&
+      (!target.accountUrl || actual.accountUrl === target.accountUrl),
+    );
+  });
+}
+
+function expectedContractFieldMatches(
+  expected,
+  observed,
+  key,
+  normalizer = value => text(value, 240).toLowerCase(),
+) {
+  const expectedValue = ownContractValue(expected, [key]);
+  if (expectedValue === undefined) return true;
+  return normalizer(observed?.[key]) === normalizer(expectedValue);
+}
+
+export function createCommandSnapshotMatches(commandPayload = {}, snapshot = {}) {
+  const payload = safeJson(commandPayload);
+  const observed = safeJson(snapshot);
+  const observedMetadata = safeJson(observed.metadata);
+  const expectedWorkflow = text(
+    payload.workflow || payload.taskKind || payload.taskType,
+    80,
+  );
+  // Official-comment patrol may be either a direct post capture or an account
+  // profile scan. A matching task id alone is therefore not execution proof.
+  if (expectedWorkflow !== 'official_account_comment_patrol') return true;
+  const observedWorkflow = text(
+    observed.workflow ||
+      observedMetadata.workflow ||
+      observed.taskType ||
+      observed.featureKey,
+    80,
+  );
+  if (observedWorkflow !== expectedWorkflow) return false;
+  const expectedProfileMode = profilePatrolIntent(payload);
+  if (expectedProfileMode === null) return false;
+  const observedProfileMode = profilePatrolIntent({
+    ...observedMetadata,
+    ...observed,
+  });
+  if (observedProfileMode !== expectedProfileMode) return false;
+
+  const expectedProtocolVersion = ownContractValue(
+    payload,
+    ['protocolVersion', 'protocol_version'],
+  );
+  const observedProtocolVersion = observedContractValue(
+    observed,
+    observedMetadata,
+    ['protocolVersion', 'protocol_version'],
+  );
+  if (
+    expectedProtocolVersion !== undefined &&
+    contractInteger(observedProtocolVersion) !==
+      contractInteger(expectedProtocolVersion)
+  ) {
+    return false;
+  }
+
+  const expectedSubjectType = ownContractValue(
+    payload,
+    ['subjectType', 'subject_type'],
+  );
+  const observedSubjectType = observedContractValue(
+    observed,
+    observedMetadata,
+    ['subjectType', 'subject_type'],
+  );
+  if (
+    expectedSubjectType !== undefined &&
+    text(observedSubjectType, 80).toLowerCase() !==
+      text(expectedSubjectType, 80).toLowerCase()
+  ) {
+    return false;
+  }
+
+  const expectedTargets = ownContractValue(payload, ['targets', 'items']);
+  const observedTargets = observedContractValue(
+    observed,
+    observedMetadata,
+    ['targets', 'items'],
+  );
+  if (!patrolTargetsMatch(expectedTargets, observedTargets)) return false;
+
+  const expectedMonitorSettings = safeJson(
+    ownContractValue(payload, ['monitorSettings', 'monitor_settings']),
+  );
+  const observedMonitorSettings = safeJson(observedContractValue(
+    observed,
+    observedMetadata,
+    ['monitorSettings', 'monitor_settings'],
+  ));
+  for (const key of [
+    'publishWindow',
+    'publishDateFrom',
+    'publishDateTo',
+  ]) {
+    if (!expectedContractFieldMatches(
+      expectedMonitorSettings,
+      observedMonitorSettings,
+      key,
+      value => text(value, 100),
+    )) {
+      return false;
+    }
+  }
+
+  const expectedCaptureSettings = safeJson(
+    ownContractValue(payload, ['captureSettings', 'capture_settings']),
+  );
+  const observedCaptureSettings = safeJson(observedContractValue(
+    observed,
+    observedMetadata,
+    ['captureSettings', 'capture_settings'],
+  ));
+  for (const key of [
+    'includeComments',
+    'includeCommentsOnDetailCapture',
+  ]) {
+    if (!expectedContractFieldMatches(
+      expectedCaptureSettings,
+      observedCaptureSettings,
+      key,
+      contractBoolean,
+    )) {
+      return false;
+    }
+  }
+  return expectedContractFieldMatches(
+    expectedCaptureSettings,
+    observedCaptureSettings,
+    'commentsMaxDetectedItems',
+    contractInteger,
+  );
 }
 
 export function isProfilePatrolTask(taskOrType = {}, payload = {}) {
@@ -2452,7 +2694,7 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
   // the first write lock, and command reconciliation follows that same
   // task-then-command order everywhere.
   const createCommandEvidence = await tx.queryOne(`
-    SELECT id::text AS id, status
+    SELECT id::text AS id, status, payload
     FROM capture_agent_commands
     WHERE tenant_id = $1 AND agent_id = $2
       AND task_id::text = $3
@@ -2551,11 +2793,8 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'recoveryTaskId', capture_tasks.metadata->'recoveryTaskId',
             'recoveryCommandId', capture_tasks.metadata->'recoveryCommandId',
             'queueBlocker', capture_tasks.metadata->'queueBlocker',
-            'workflow', capture_tasks.metadata->'workflow',
-            'protocolVersion', capture_tasks.metadata->'protocolVersion',
             'filter', capture_tasks.metadata->'filter',
             'selectedRecordIds', capture_tasks.metadata->'selectedRecordIds',
-            'captureSettings', capture_tasks.metadata->'captureSettings',
             'reassignment', capture_tasks.metadata->'reassignment',
             'reassignmentRequestKey', capture_tasks.metadata->'reassignmentRequestKey',
             'reassignmentRequestHash', capture_tasks.metadata->'reassignmentRequestHash',
@@ -3141,16 +3380,22 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           reportedSuccess,
           expectedRequestId: command.payload?.controlTaskId,
           actualRequestId: resultPayload.requestId,
+          expectedAttemptId: command.payload?.attemptId,
+          actualAttemptId: resultPayload.attemptId,
           resultReason: resultPayload.reason,
           supersededCreateCommandId:
             command.payload?.supersededCreateCommandId,
           previousStatus: command.payload?.previousStatus,
         });
-        if (!stopOutcome.validRequestId) {
+        if (!stopOutcome.validRequestId || !stopOutcome.validAttemptId) {
           return {
             invalidStopResult: true,
             expectedRequestId: text(command.payload?.controlTaskId, 240),
             actualRequestId: text(resultPayload.requestId, 240),
+            expectedAttemptId: text(command.payload?.attemptId, 240),
+            actualAttemptId: text(resultPayload.attemptId, 240),
+            attemptMismatch:
+              stopOutcome.validRequestId && !stopOutcome.validAttemptId,
           };
         }
         success = stopOutcome.success;
@@ -3480,11 +3725,17 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       });
     }
     if (commandResult.invalidStopResult) {
+      const attemptMismatch = commandResult.attemptMismatch === true;
       return res.status(409).json({
         ok: false,
-        error: 'stop_request_id_mismatch',
-        message: '设备停止的本地任务 ID 与云端指令不一致',
+        error: attemptMismatch
+          ? 'stop_attempt_id_mismatch'
+          : 'stop_request_id_mismatch',
+        message: attemptMismatch
+          ? '设备停止回执的执行轮次与云端指令不一致'
+          : '设备停止的本地任务 ID 与云端指令不一致',
         expectedRequestId: commandResult.expectedRequestId,
+        expectedAttemptId: commandResult.expectedAttemptId,
       });
     }
     return res.json({
@@ -5393,6 +5644,17 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
       if (!task) return {error: 'task_not_found'};
 
       const agentId = task.assigned_agent_id || task.origin_agent_id;
+      const targetedStop = isTargetedPostTaskType(task.task_type);
+      const currentAttempt =
+        targetedStop && Number(task.attempt_number) > 0
+          ? await tx.queryOne(`
+            SELECT client_attempt_id
+            FROM capture_task_attempts
+            WHERE tenant_id = $1 AND task_id = $2 AND attempt_number = $3
+            LIMIT 1
+          `, [req.tenantId, task.id, task.attempt_number])
+          : null;
+      const clientAttemptId = text(currentAttempt?.client_attempt_id, 240);
       const existing = agentId ? await tx.queryOne(`
         SELECT id, status, expires_at
         FROM capture_agent_commands
@@ -5401,6 +5663,10 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
           AND payload->>'authCodeId' = $3
           AND payload->>'authBindingId' = $4
           AND payload->>'platform' = $5
+          AND (
+            $6::boolean = false
+            OR ($7 <> '' AND payload->>'attemptId' = $7)
+          )
         ORDER BY created_at DESC
         LIMIT 1
         FOR UPDATE
@@ -5410,6 +5676,8 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
         task.agent_auth_code_id,
         task.agent_auth_binding_id,
         task.platform,
+        targetedStop,
+        clientAttemptId,
       ]) : null;
       if (existing) return {task, command: existing, existing: true};
       if (task.status === 'canceled') {
@@ -5516,6 +5784,9 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
       ) {
         return {error: 'agent_platform_mismatch', task};
       }
+      if (targetedStop && !clientAttemptId) {
+        return {error: 'task_attempt_unavailable', task};
+      }
 
       const previousStatus = task.status === 'resume_requested'
         ? text(metadata.resumePreviousStatus, 80) || 'needs_action'
@@ -5548,6 +5819,7 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
           ...(activeCreate?.status === 'acknowledged'
             ? {supersededCreateCommandId: activeCreate.id}
             : {}),
+          ...(clientAttemptId ? {attemptId: clientAttemptId} : {}),
           authCodeId: task.agent_auth_code_id,
           authBindingId: task.agent_auth_binding_id,
           platform: task.platform,
@@ -5589,6 +5861,7 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
       task_not_found: ['task_not_found', '任务不存在'],
       task_not_stoppable: ['task_not_stoppable', '任务当前状态不能停止'],
       task_not_remotely_stoppable: ['task_not_remotely_stoppable', '该任务还不支持远程停止'],
+      task_attempt_unavailable: ['task_attempt_unavailable', '设备尚未上报当前执行轮次，请稍后重试停止'],
       agent_stop_capability_missing: ['agent_stop_capability_missing', '原执行节点版本尚不支持远程停止，请先更新扩展'],
       agent_unavailable: ['agent_unavailable', '原执行节点授权已失效、已停用或不存在'],
       agent_platform_mismatch: ['agent_platform_mismatch', '原执行节点未配置负责该任务平台'],

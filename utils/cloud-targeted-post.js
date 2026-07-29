@@ -461,6 +461,7 @@
       platform,
       title: text(source.title || plan.title, 500),
       targetMode: isProfilePatrol ? "profile" : "detail",
+      profileMode: isProfilePatrol,
       subjectType: isProfilePatrol
         ? workflow === OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW ||
           isOfficialCommentProfile
@@ -915,7 +916,14 @@
 
   function createRunRequest(
     normalizedPayload,
-    {commandId = "", requestId = "", attemptId = "", now = ""} = {},
+    {
+      commandId = "",
+      requestId = "",
+      attemptId = "",
+      attemptNumber = 1,
+      previousAttemptId = "",
+      now = "",
+    } = {},
   ) {
     const source = objectValue(normalizedPayload);
     const createdAt = text(now, 80) || new Date().toISOString();
@@ -926,7 +934,12 @@
       workflow: text(source.workflow, 80) || WORKFLOW,
       id,
       taskId: text(source.taskId, 240),
-      attemptId: text(source.attemptId || attemptId, 240),
+      attemptId: text(attemptId || source.attemptId, 240),
+      attemptNumber: Math.max(
+        1,
+        Math.floor(Number(attemptNumber) || 1),
+      ),
+      previousAttemptId: text(previousAttemptId, 240),
       fenceToken: text(source.fenceToken, 500),
       cloudCommandId: text(commandId, 240),
       platform:
@@ -934,6 +947,13 @@
           ? "multi"
           : normalizePlatform(source.platform),
       title: text(source.title, 500),
+      targetMode:
+        text(source.targetMode, 40).toLowerCase() === "profile"
+          ? "profile"
+          : "detail",
+      profileMode:
+        source.profileMode === true ||
+        text(source.targetMode, 40).toLowerCase() === "profile",
       subjectType: text(source.subjectType, 40),
       status: "pending",
       cancelRequested: false,

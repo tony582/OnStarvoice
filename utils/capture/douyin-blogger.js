@@ -35,6 +35,15 @@ import {
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const MIN_DOUYIN_BLOGGER_STALL_TIMEOUT_MS = 12000;
 const REQUIRED_DOUYIN_BLOGGER_STALL_ROUNDS = 5;
+const DOUYIN_BLOGGER_NOTES_ROOT_ERROR_CODE =
+  "DOUYIN_BLOGGER_NOTES_ROOT_NOT_READY";
+const UNSAFE_DOUYIN_BLOGGER_NOTES_ROOT_SELECTORS = new Set([
+  "html",
+  "body",
+  "main",
+  "#root",
+  "#app",
+]);
 
 export async function captureDouyinBloggerProfile() {
   const captureStartedAt = new Date().toISOString();
@@ -148,6 +157,11 @@ export async function captureDouyinBloggerNotes({
     const profileContext = resolveBloggerProfileContext(profileRoot);
     const infoRoot = profileContext.infoRoot || profileRoot;
     const notesRoot = resolveBloggerNotesRoot(profileRoot);
+    if (!notesRoot) {
+      throw createRetryableBloggerNotesError(
+        "抖音博主作品列表尚未加载，请稍后重试",
+      );
+    }
     const bloggerId = resolveBloggerId(infoRoot);
     const douyinId = extractDouyinId();
     if (!bloggerId) {
@@ -525,8 +539,11 @@ export async function captureDouyinBloggerNotes({
         captureFinishedAt: new Date().toISOString(),
       },
       error: {
-        code: isCanceled() ? "CAPTURE_CANCELED" : "CAPTURE_FAILED",
+        code: isCanceled()
+          ? "CAPTURE_CANCELED"
+          : error?.code || "CAPTURE_FAILED",
         message: error.message,
+        retryable: !isCanceled() && error?.retryable === true,
       },
     };
   }
@@ -1256,18 +1273,87 @@ function extractBloggerAccountType(profileRoot) {
 }
 
 function resolveBloggerNotesRoot(profileRoot) {
-  const selectors = DOUYIN_DOM_PROFILE.bloggerProfile.notesList.rootSelectors;
+  if (!(profileRoot instanceof Element)) {
+    return null;
+  }
+
+  const selectors =
+    DOUYIN_DOM_PROFILE.bloggerProfile.notesList.rootSelectors.filter(
+      isSafeDouyinBloggerNotesRootSelector,
+    );
+  const scopes = [];
+  const addScope = (scope) => {
+    if (
+      isSafeDouyinBloggerProfileScope(scope) &&
+      !scopes.includes(scope)
+    ) {
+      scopes.push(scope);
+    }
+  };
+
+  addScope(profileRoot);
+  addScope(profileRoot.closest('[data-e2e="user-detail"]'));
+
+  for (const scope of scopes) {
+    const notesRoot = findBloggerNotesRootInScope(scope, selectors);
+    if (notesRoot) {
+      return notesRoot;
+    }
+  }
+
+  return null;
+}
+
+function isSafeDouyinBloggerProfileScope(scope) {
+  if (!(scope instanceof Element)) {
+    return false;
+  }
+  const tagName = String(scope.tagName || "").toLowerCase();
+  const id = String(scope.id || "").toLowerCase();
   return (
-    getFirstMatch(selectors, document) ||
-    getFirstMatch(selectors, profileRoot) ||
-    document.querySelector("main") ||
-    document.body
+    tagName !== "html" &&
+    tagName !== "body" &&
+    tagName !== "main" &&
+    id !== "root" &&
+    id !== "app"
   );
 }
 
+function isSafeDouyinBloggerNotesRootSelector(selector = "") {
+  const normalized = String(selector || "").trim().toLowerCase();
+  return (
+    Boolean(normalized) &&
+    !UNSAFE_DOUYIN_BLOGGER_NOTES_ROOT_SELECTORS.has(normalized)
+  );
+}
+
+function findBloggerNotesRootInScope(scope, selectors = []) {
+  for (const selector of selectors) {
+    if (scope.matches?.(selector)) {
+      return scope;
+    }
+    const match = scope.querySelector?.(selector);
+    if (match instanceof Element) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function createRetryableBloggerNotesError(message) {
+  const error = new Error(message);
+  error.code = DOUYIN_BLOGGER_NOTES_ROOT_ERROR_CODE;
+  error.retryable = true;
+  return error;
+}
+
 function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {
+  if (!(notesRoot instanceof Element)) {
+    return [];
+  }
+
   const candidateNodes = Array.from(
-    (notesRoot || document).querySelectorAll(
+    notesRoot.querySelectorAll(
       DOUYIN_DOM_PROFILE.bloggerProfile.notesList.cardSelectors.join(", "),
     ),
   );
@@ -1480,28 +1566,11 @@ async function scrollDouyinBloggerNotesResults(
 }
 
 function findDouyinBloggerNotesScrollTarget(notesRoot = null) {
-  const roots = [
-    notesRoot,
-    getFirstMatch(DOUYIN_DOM_PROFILE.bloggerProfile.notesList.rootSelectors),
-    document.querySelector('[data-e2e="user-post-list"]'),
-    document.querySelector('[data-e2e="scroll-list"]'),
-    document.querySelector("#douyin-right-container"),
-    document.querySelector("#root"),
-    document.querySelector("#app"),
-    document.querySelector("main"),
-    document.scrollingElement,
-    document.documentElement,
-    document.body,
-  ].filter(Boolean);
-
-  for (const root of roots) {
-    const target = findScrollableAncestor(root);
-    if (target) {
-      return target;
-    }
+  if (!(notesRoot instanceof Element)) {
+    return null;
   }
 
-  return window;
+  return findScrollableAncestor(notesRoot) || window;
 }
 
 function findScrollableAncestor(startNode) {
@@ -1553,7 +1622,7 @@ function dispatchWheelHint(target, distance) {
 
 function resolveProfileNoteCardContainer(link) {
   if (!(link instanceof Element)) {
-    return link || document.body;
+    return null;
   }
 
   let node = link;

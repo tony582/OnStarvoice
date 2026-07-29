@@ -331,6 +331,7 @@ export async function materializeProfilePatrolTask(tx, {
     executionMode: 'one_time',
     subjectType,
     targetMode: 'profile',
+    profileMode: true,
     platform: taskPlatform,
     workflow,
     taskKind: workflow,

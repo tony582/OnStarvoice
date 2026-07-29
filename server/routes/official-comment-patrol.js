@@ -208,6 +208,14 @@ async function loadOfficialAccount(executor, tenantId, accountId) {
   `, [accountId, tenantId]);
 }
 
+function hasStrongOfficialIdentity(account) {
+  return Boolean(
+    text(account?.platform_user_id, 500) ||
+    text(account?.account_no, 500) ||
+    text(account?.account_id, 500)
+  );
+}
+
 function officialAccountWhere(filter, recordIds = []) {
   const params = [
     filter.officialAccountId,
@@ -237,34 +245,6 @@ function officialAccountWhere(filter, recordIds = []) {
           AND (
             r.author_id = oa.account_id
             OR r.author_account_no = oa.account_id
-          )
-        )
-        OR (
-          NOT (
-            (
-              NULLIF(BTRIM(oa.platform_user_id), '') IS NOT NULL
-              OR NULLIF(BTRIM(oa.account_no), '') IS NOT NULL
-              OR NULLIF(BTRIM(oa.account_id), '') IS NOT NULL
-            )
-            AND (
-              NULLIF(BTRIM(r.author_id), '') IS NOT NULL
-              OR NULLIF(BTRIM(r.author_account_no), '') IS NOT NULL
-            )
-          )
-          AND (
-            (
-              NULLIF(BTRIM(oa.account_name), '') IS NOT NULL
-              AND r.author_name = oa.account_name
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM jsonb_array_elements_text(
-                CASE WHEN jsonb_typeof(oa.aliases) = 'array'
-                  THEN oa.aliases ELSE '[]'::jsonb END
-              ) AS alias(value)
-              WHERE NULLIF(BTRIM(alias.value), '') IS NOT NULL
-                AND alias.value = r.author_name
-            )
           )
         )
       )
@@ -298,7 +278,6 @@ function publicCandidate(row) {
 }
 
 async function loadCandidates(executor, tenantId, filter, {recordIds = [], lock = false} = {}) {
-  const {where, params} = officialAccountWhere(filter, recordIds);
   const account = await loadOfficialAccount(executor, tenantId, filter.officialAccountId);
   if (!account || account.status !== 'active') {
     return {failure: requestError('official_account_not_found', '官方账号不存在或已停用', 404)};
@@ -316,6 +295,14 @@ async function loadCandidates(executor, tenantId, filter, {recordIds = [], lock 
       '所选平台与官方账号的平台不一致',
     )};
   }
+  if (!hasStrongOfficialIdentity(account)) {
+    return {failure: requestError(
+      'official_account_identity_required',
+      '请先补全官方账号ID或账号号后再巡查',
+      409,
+    )};
+  }
+  const {where, params} = officialAccountWhere(filter, recordIds);
   const totalRow = await executor.queryOne(`
     SELECT COUNT(*) AS total
     FROM records r

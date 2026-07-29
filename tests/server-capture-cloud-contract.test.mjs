@@ -856,6 +856,36 @@ test("stop before device receipt immediately cancels orchestration items", () =>
   );
 });
 
+test("targeted stop commands and receipts are fenced to the current attempt", () => {
+  const stopRoute = readRouteSection(
+    "router.post('/tasks/:id/stop'",
+    "router.get('/tasks/:id/snapshots'",
+  );
+  assert.match(
+    stopRoute,
+    /SELECT client_attempt_id[\s\S]*FROM capture_task_attempts[\s\S]*attempt_number = \$3/u,
+  );
+  assert.match(
+    stopRoute,
+    /task_attempt_unavailable[\s\S]*attemptId: clientAttemptId/u,
+  );
+  assert.match(
+    stopRoute,
+    /payload->>'attemptId' = \$7/u,
+    "a pending stop from an older attempt must not be reused",
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  assert.match(
+    completion,
+    /expectedAttemptId: command\.payload\?\.attemptId[\s\S]*actualAttemptId: resultPayload\.attemptId/u,
+  );
+  assert.match(completion, /stop_attempt_id_mismatch/u);
+});
+
 test("overview reports child-inclusive agent load but root-only task summary", () => {
   const overview = readRouteSection(
     "router.get('/overview'",
@@ -1039,6 +1069,7 @@ test("a stop-fenced acknowledged create settles exact no-target receipts as canc
       }),
       {
         validRequestId: true,
+        validAttemptId: true,
         success: true,
         stoppedBeforeLocalCreation: true,
         commandStatus: "completed",
@@ -1101,6 +1132,48 @@ test("stop-fenced no-target handling preserves request identity and real failure
   assert.equal(normalSuccess.stoppedBeforeLocalCreation, false);
   assert.equal(normalSuccess.commandStatus, "completed");
   assert.equal(normalSuccess.taskStatus, "canceled");
+});
+
+test("targeted stop receipts require both request and attempt identity", () => {
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const attemptId = "targeted-attempt-current";
+  const exact = resolveStopCommandOutcome({
+    reportedSuccess: true,
+    expectedRequestId: requestId,
+    actualRequestId: requestId,
+    expectedAttemptId: attemptId,
+    actualAttemptId: attemptId,
+    previousStatus: "running",
+  });
+  assert.equal(exact.validRequestId, true);
+  assert.equal(exact.validAttemptId, true);
+  assert.equal(exact.success, true);
+  assert.equal(exact.taskStatus, "canceled");
+
+  for (const actualAttemptId of ["", "targeted-attempt-stale"]) {
+    const stale = resolveStopCommandOutcome({
+      reportedSuccess: true,
+      expectedRequestId: requestId,
+      actualRequestId: requestId,
+      expectedAttemptId: attemptId,
+      actualAttemptId,
+      previousStatus: "running",
+    });
+    assert.equal(stale.validRequestId, true);
+    assert.equal(stale.validAttemptId, false);
+    assert.equal(stale.success, false);
+    assert.equal(stale.commandStatus, "failed");
+    assert.equal(stale.taskStatus, "running");
+  }
+
+  const legacy = resolveStopCommandOutcome({
+    reportedSuccess: true,
+    expectedRequestId: requestId,
+    actualRequestId: requestId,
+    previousStatus: "running",
+  });
+  assert.equal(legacy.validAttemptId, true);
+  assert.equal(legacy.success, true);
 });
 
 test("agent capabilities and command results share the server-side redaction boundary", () => {
