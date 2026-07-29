@@ -544,6 +544,12 @@ test("background normalization preserves hierarchy, task metadata and timing fie
     updatedAt: "2026-07-16T09:04:00.000Z",
     remainingMs: 2_000,
     waitUntil: "2026-07-16T09:04:02.000Z",
+    candidateCount: 5,
+    evaluatedCount: 3,
+    failedOpenCount: 2,
+    retryCount: 2,
+    retriedItemCount: 5,
+    timeoutCount: 2,
     taskMeta: {
       keywordList: ["别克车机", "别克壁纸"],
       searchFilters: {
@@ -570,6 +576,12 @@ test("background normalization preserves hierarchy, task metadata and timing fie
     "updatedAt",
     "remainingMs",
     "waitUntil",
+    "candidateCount",
+    "evaluatedCount",
+    "failedOpenCount",
+    "retryCount",
+    "retriedItemCount",
+    "timeoutCount",
   ]) {
     assert.equal(normalized[field], input[field], `lost ${field}`);
   }

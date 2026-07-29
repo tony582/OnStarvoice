@@ -129,11 +129,11 @@ test('fallback titles cannot be skipped even when model is overconfident', async
 });
 
 test('records use small DeepSeek batches and the bounded response deadline', async () => {
-  assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 10);
-  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 10000);
+  assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 5);
+  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 20000);
   assert.match(
     apiSource,
-    /Math\.min\(10000, Number\(options\?\.timeout\) \|\| 10000\)/u,
+    /Math\.min\(20000, Number\(options\?\.timeout\) \|\| 20000\)/u,
     'API layer must not clamp the prefilter back below its response deadline',
   );
   const records = Array.from({length: 41}, (_, index) => keywordRecord(index + 1));
@@ -157,10 +157,10 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
       };
     },
   });
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 9);
   assert.deepEqual(
     calls.map(({request}) => request.items.length).sort((a, b) => b - a),
-    [10, 10, 10, 10, 1],
+    [5, 5, 5, 5, 5, 5, 5, 5, 1],
   );
   assert.equal(calls.every(({request}) => request.mode === 'conservative'), true);
   assert.equal(calls.every(({request}) => request.skipThreshold === 0.97), true);
@@ -168,9 +168,80 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
     calls.every(({request}) => request.idempotencyKey.includes(':conservative:0.9700:')),
     true,
   );
-  assert.equal(calls.every(({options}) => options.timeout === 10000), true);
-  assert.equal(result.skippedRecordIds.length, 5);
+  assert.equal(calls.every(({options}) => options.timeout === 20000), true);
+  assert.equal(result.skippedRecordIds.length, 9);
   assert.equal(result.failedOpenCount, 0);
+});
+
+test('a whole timed-out batch is split and retried once before failing open', async () => {
+  const records = Array.from({length: 5}, (_, index) => keywordRecord(index + 1));
+  const calls = [];
+  const result = await evaluateRelevancePrefilterRecords(records, {
+    enabled: true,
+    requestBatch: async ({items}) => {
+      calls.push(items.map((item) => item.itemId));
+      if (calls.length === 1) {
+        return {
+          ok: true,
+          items: items.map((item) => ({
+            itemId: item.itemId,
+            status: 'timeout',
+            modelDecision: null,
+            confidence: null,
+            executionDisposition: 'collect_full',
+            reason: 'MODEL_TIMEOUT',
+          })),
+        };
+      }
+      return {
+        ok: true,
+        items: items.map((item) => ({
+          itemId: item.itemId,
+          status: 'ok',
+          modelDecision: 'keep',
+          confidence: 1,
+          executionDisposition: 'collect_full',
+        })),
+      };
+    },
+  });
+
+  assert.deepEqual(calls.map((items) => items.length), [5, 3, 2]);
+  assert.equal(result.retryCount, 2);
+  assert.equal(result.retriedItemCount, 5);
+  assert.equal(result.timeoutCount, 0);
+  assert.equal(result.evaluatedCount, 5);
+  assert.equal(result.failedOpenCount, 0);
+});
+
+test('split retries stop after one layer and expose the remaining timeout count', async () => {
+  const records = Array.from({length: 5}, (_, index) => keywordRecord(index + 1));
+  const calls = [];
+  const result = await evaluateRelevancePrefilterRecords(records, {
+    enabled: true,
+    requestBatch: async ({items}) => {
+      calls.push(items.length);
+      return {
+        ok: true,
+        items: items.map((item) => ({
+          itemId: item.itemId,
+          status: 'timeout',
+          modelDecision: null,
+          confidence: null,
+          executionDisposition: 'collect_full',
+          reason: 'MODEL_TIMEOUT',
+        })),
+      };
+    },
+  });
+
+  assert.deepEqual(calls, [5, 3, 2]);
+  assert.equal(result.retryCount, 2);
+  assert.equal(result.retriedItemCount, 5);
+  assert.equal(result.timeoutCount, 5);
+  assert.equal(result.evaluatedCount, 0);
+  assert.equal(result.failedOpenCount, 5);
+  assert.deepEqual(result.skippedRecordIds, []);
 });
 
 test('identical list text in a later capture run receives a new idempotency key', async () => {

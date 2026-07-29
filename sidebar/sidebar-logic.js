@@ -4045,14 +4045,26 @@ function resolveCaptureTaskActionCopy(progress = {}) {
       0,
       Number(progress?.aiFilteredCount ?? progress?.filteredCount) || 0,
     );
+    const failedOpenCount = Math.max(
+      0,
+      Number(progress?.failedOpenCount) || 0,
+    );
+    const retryCount = Math.max(0, Number(progress?.retryCount) || 0);
     return {
       title:
-        filteredCount > 0
+        failedOpenCount > 0
+          ? `AI 筛选完成 · ${failedOpenCount} 条超时或异常后继续采集`
+          : filteredCount > 0
           ? `AI 筛选完成 · 已跳过 ${filteredCount} 条无关结果`
+          : retryCount > 0
+            ? `AI 筛选完成 · 拆批重试 ${retryCount} 次`
           : "AI 筛选完成 · 本批全部继续采集",
       explanation:
         readProgressText(progress?.message) || "相关性判断已经完成",
-      nextAction: "接下来只为需要保留的结果采集详情、评论和博主信息",
+      nextAction:
+        failedOpenCount > 0
+          ? "超时或异常条目不会被 AI 跳过，仍会继续采集详情"
+          : "接下来只为需要保留的结果采集详情、评论和博主信息",
     };
   }
   if (phase === "detail_item_filtered") {

@@ -662,7 +662,7 @@ export async function prefilterRelevance(
         skipThreshold: Math.max(0.97, Math.min(1, Number(skipThreshold) || 0.97)),
         items: normalizedItems,
       },
-      timeout: Math.max(500, Math.min(10000, Number(options?.timeout) || 10000)),
+      timeout: Math.max(500, Math.min(20000, Number(options?.timeout) || 20000)),
       shouldStop,
       signal,
       maxBaseAttempts: 1,
