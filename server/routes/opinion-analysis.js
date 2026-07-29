@@ -4,11 +4,13 @@ import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js'
 import { formatPublishDate } from '../services/publish-date.js';
 import {
   runTopicAnalysis,
-  analyzeOpinionRecord,
+  analyzeOpinionRecordOnce,
   countScopedRecords,
   normalizeKeywords,
   hasBrandContextConfigured,
   computeRecordInputHash,
+  isRecordAnalysisCacheCurrent,
+  isValidRecordAnalysisCache,
 } from '../services/opinion-analysis.js';
 
 const router = Router();
@@ -175,15 +177,24 @@ router.post('/records/:recordId', async (req, res, next) => {
     );
     if (!record) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
 
+    const currentHash = await computeRecordInputHash(req.tenantId, req.params.recordId);
     const cached = await queryOne(
-      `SELECT payload, analysis_source FROM opinion_record_analyses WHERE tenant_id = $1 AND record_id = $2`,
+      `SELECT payload, analysis_source, prompt_version, input_hash
+       FROM opinion_record_analyses WHERE tenant_id = $1 AND record_id = $2`,
       [req.tenantId, req.params.recordId]
     );
-    if (cached && cached.analysis_source !== 'rule_fallback' && !req.query.refresh) {
+    if (
+      !req.query.refresh
+      && isValidRecordAnalysisCache(cached, currentHash, { allowRuleFallback: false })
+    ) {
       return res.json({ ok: true, analysis: cached.payload, source: cached.analysis_source, cached: true });
     }
 
-    const result = await analyzeOpinionRecord({ tenantId: req.tenantId, recordId: req.params.recordId });
+    const result = await analyzeOpinionRecordOnce({
+      tenantId: req.tenantId,
+      recordId: req.params.recordId,
+      inputHash: currentHash,
+    });
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     return res.json({ ok: true, analysis: result.payload, source: result.source, cached: false, retried: Boolean(cached) });
   } catch (err) {
@@ -202,15 +213,8 @@ router.get('/records/:recordId', async (req, res, next) => {
     );
     if (!cached) return res.json({ ok: true, analysis: null });
 
-    let stale = false;
-    const record = await queryOne(
-      `SELECT id, content, comments_count, transcript FROM records WHERE id = $1 AND tenant_id = $2`,
-      [req.params.recordId, req.tenantId]
-    );
-    if (record) {
-      const currentHash = await computeRecordInputHash(req.tenantId, record);
-      stale = Boolean(cached.input_hash) && currentHash !== cached.input_hash;
-    }
+    const currentHash = await computeRecordInputHash(req.tenantId, req.params.recordId);
+    const stale = !isRecordAnalysisCacheCurrent(cached, currentHash);
     return res.json({
       ok: true, analysis: cached.payload, source: cached.analysis_source, updatedAt: cached.updated_at, stale,
     });

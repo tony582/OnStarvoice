@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { labelRecord } from '../services/ai-labeler.js';
-import { checkAlerts } from '../services/alert-engine.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
 import {
@@ -245,11 +244,9 @@ function queueAiJobs(recordIds) {
   setImmediate(async () => {
     for (const id of recordIds) {
       try {
-        const result = await labelRecord(id);
-        if (result?.relevance === 'irrelevant') continue;
-        await checkAlerts(id);
+        await labelRecord(id);
       } catch (err) {
-        console.error(`[Sync] AI/alert error for record ${id}:`, err.message);
+        console.error(`[Sync] AI label error for record ${id}:`, err.message);
       }
     }
   });
