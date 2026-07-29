@@ -3,12 +3,35 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.66',
+  latestVersion: '0.3.67',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-07-29',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.66-20260729.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.67-20260729.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.67',
+      releaseDate: '2026-07-29',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '官方账号评论巡查',
+              desc: '修复账号主页识别、作品发布时间筛选和评论巡查结果回写，避免旧页面或非目标作品数据混入。',
+            },
+            {
+              title: '任务尝试隔离',
+              desc: '停止、重试与重分配按本次执行尝试严格隔离，避免旧指令误停新任务或覆盖新结果。',
+            },
+            {
+              title: '巡查记录与工单',
+              desc: '工单保留来源内容的舆情巡查与快照历史，便于持续查看声量和互动变化。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.66',
       releaseDate: '2026-07-29',

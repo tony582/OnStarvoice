@@ -79,6 +79,7 @@ const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
 const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
+const TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY = 'targetedPostAttempt';
 const SCHEDULE_MODES = new Set([
   'daily',
   'custom_dates',
@@ -633,6 +634,7 @@ let unattendedRunMutationQueue = Promise.resolve();
 let unattendedRunArchiveMutationQueue = Promise.resolve();
 let taskLedgerMutationQueue = Promise.resolve();
 let captureTaskBeginQueue = Promise.resolve();
+let targetedPostRunMutationQueue = Promise.resolve();
 
 function runUnattendedRunMutation(operation) {
   const pending = unattendedRunMutationQueue.then(operation, operation);
@@ -655,6 +657,12 @@ function runTaskLedgerMutation(operation) {
 function runCaptureTaskBeginOperation(operation) {
   const pending = captureTaskBeginQueue.then(operation, operation);
   captureTaskBeginQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runTargetedPostRunMutation(operation) {
+  const pending = targetedPostRunMutationQueue.then(operation, operation);
+  targetedPostRunMutationQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -1319,9 +1327,7 @@ async function readTaskLedger() {
       let normalized = core.normalizeTaskLedger(rawLedger, {now});
       let repairedTargetedLedger = false;
       const targetedRequest = stored[STORAGE_KEYS.targetedPostRunRequest];
-      const targetedRequestId = String(
-        targetedRequest?.id || targetedRequest?.requestId || '',
-      ).trim();
+      const targetedRequestId = targetedPostPhysicalRunId(targetedRequest);
       if (
         targetedRequestId &&
         isSupportedCloudTargetedPostWorkflow(targetedRequest?.workflow) &&
@@ -1894,24 +1900,20 @@ function isCloudTargetedPostPayload(payload = {}) {
   );
 }
 
-async function readTargetedPostRunRequest() {
-  const stored = await chrome.storage.local.get(
-    STORAGE_KEYS.targetedPostRunRequest,
-  );
-  const request = stored[STORAGE_KEYS.targetedPostRunRequest];
+function normalizeStoredTargetedPostRunRequest(request) {
   if (
     !request ||
     typeof request !== 'object' ||
     !isSupportedCloudTargetedPostWorkflow(request.workflow)
   ) {
-    return null;
+    return {request: null, changed: false};
   }
   const targets = Array.isArray(request.targets) ? request.targets : [];
   if (
     targets.length === 0 ||
     typeof cloudTargetedPostApi?.normalizeTargetResults !== 'function'
   ) {
-    return request;
+    return {request, changed: false};
   }
   const targetResults = cloudTargetedPostApi.normalizeTargetResults(
     request.targetResults,
@@ -1931,13 +1933,45 @@ async function readTargetedPostRunRequest() {
     targetResults,
     checkpoint,
   };
+  return {
+    request: normalized,
+    changed:
+      JSON.stringify(targetResults) !== JSON.stringify(request.targetResults) ||
+      JSON.stringify(checkpoint) !== JSON.stringify(request.checkpoint),
+  };
+}
+
+async function readTargetedPostRunRequest({persistNormalized = true} = {}) {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostRunRequest,
+  );
+  const normalized = normalizeStoredTargetedPostRunRequest(
+    stored[STORAGE_KEYS.targetedPostRunRequest],
+  );
   if (
-    JSON.stringify(targetResults) !== JSON.stringify(request.targetResults) ||
-    JSON.stringify(checkpoint) !== JSON.stringify(request.checkpoint)
+    !normalized.request ||
+    !normalized.changed ||
+    !persistNormalized
   ) {
-    await persistTargetedPostRunRequest(normalized);
+    return normalized.request;
   }
-  return normalized;
+  const expectedAttempt = normalized.request;
+  return await runTargetedPostRunMutation(async () => {
+    const latestStored = await chrome.storage.local.get(
+      STORAGE_KEYS.targetedPostRunRequest,
+    );
+    const latest = normalizeStoredTargetedPostRunRequest(
+      latestStored[STORAGE_KEYS.targetedPostRunRequest],
+    );
+    if (!latest.request) return null;
+    if (!isOwnedTargetedPostAttempt(latest.request, expectedAttempt)) {
+      return latest.request;
+    }
+    if (latest.changed) {
+      await persistTargetedPostRunRequest(latest.request);
+    }
+    return latest.request;
+  });
 }
 
 function targetedPostTaskCenterDescriptor(request = {}) {
@@ -1997,9 +2031,197 @@ function targetedPostTaskCenterInteger(value, fallback = 0) {
     : Math.max(0, Math.floor(Number(fallback) || 0));
 }
 
+function stableTargetedPostValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => stableTargetedPostValue(item));
+  }
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((result, key) => {
+        if (value[key] !== undefined) {
+          result[key] = stableTargetedPostValue(value[key]);
+        }
+        return result;
+      }, {});
+  }
+  return value;
+}
+
+function targetedPostExecutionContract(source) {
+  const request =
+    source && typeof source === 'object' && !Array.isArray(source)
+      ? source
+      : {};
+  return {
+    protocolVersion: targetedPostTaskCenterInteger(request.protocolVersion),
+    workflow: String(request.workflow || ''),
+    taskId: String(request.taskId || ''),
+    fenceToken: String(request.fenceToken || ''),
+    platform: String(request.platform || ''),
+    title: String(request.title || ''),
+    targetMode: String(request.targetMode || ''),
+    profileMode: request.profileMode === true,
+    subjectType: String(request.subjectType || ''),
+    targets: Array.isArray(request.targets) ? request.targets : [],
+    monitorSettings:
+      request.monitorSettings &&
+      typeof request.monitorSettings === 'object' &&
+      !Array.isArray(request.monitorSettings)
+        ? request.monitorSettings
+        : {},
+    captureSettings:
+      request.captureSettings &&
+      typeof request.captureSettings === 'object' &&
+      !Array.isArray(request.captureSettings)
+        ? request.captureSettings
+        : {},
+  };
+}
+
+function targetedPostExecutionFingerprint(source) {
+  return JSON.stringify(
+    stableTargetedPostValue(targetedPostExecutionContract(source)),
+  );
+}
+
+function targetedPostLogicalRequestId(request = {}) {
+  return String(request?.id || request?.requestId || '').trim();
+}
+
+function targetedPostPhysicalRunId(request = {}) {
+  const requestId = targetedPostLogicalRequestId(request);
+  const attemptId = String(request?.attemptId || '').trim();
+  return requestId && attemptId ? `${requestId}::${attemptId}` : requestId;
+}
+
+function isSameTargetedPostAttempt(
+  left,
+  right,
+  {requireCommand = false} = {},
+) {
+  const same =
+    targetedPostLogicalRequestId(left) &&
+    targetedPostLogicalRequestId(left) === targetedPostLogicalRequestId(right) &&
+    String(left?.attemptId || '').trim() &&
+    String(left?.attemptId || '').trim() ===
+      String(right?.attemptId || '').trim();
+  if (!same || !requireCommand) return Boolean(same);
+  const commandId = String(left?.cloudCommandId || '').trim();
+  return Boolean(
+    commandId && commandId === String(right?.cloudCommandId || '').trim(),
+  );
+}
+
+function isOwnedTargetedPostAttempt(current, expected) {
+  const expectedCommandId = String(expected?.cloudCommandId || '').trim();
+  return isSameTargetedPostAttempt(current, expected, {
+    requireCommand: Boolean(expectedCommandId),
+  });
+}
+
+async function readOwnedTargetedPostAttempt(expected) {
+  const current = await readTargetedPostRunRequest({
+    persistNormalized: false,
+  });
+  return isOwnedTargetedPostAttempt(current, expected) ? current : null;
+}
+
+function isTargetedPostOwnerSnapshot(current, expected) {
+  if (!expected) return !current;
+  return isOwnedTargetedPostAttempt(current, expected);
+}
+
+function isTargetedPostRunnerTabForAttempt(tab, request) {
+  const requestId = targetedPostLogicalRequestId(request);
+  const attemptId = String(request?.attemptId || '').trim();
+  if (!requestId || !attemptId) return false;
+  try {
+    const candidate = new URL(String(tab?.url || ''));
+    const sidebar = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    return (
+      candidate.origin === sidebar.origin &&
+      candidate.pathname === sidebar.pathname &&
+      candidate.searchParams.get(TARGETED_POST_RUNNER_QUERY_KEY) ===
+        requestId &&
+      candidate.searchParams.get(TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY) ===
+        attemptId
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function closeSupersededTargetedPostRunnerTabs(
+  superseded,
+  expectedCurrent = null,
+) {
+  let current = await readTargetedPostRunRequest({
+    persistNormalized: false,
+  });
+  const initialResult = {
+    ok: true,
+    current,
+    removedTabIds: [],
+    removedCount: 0,
+  };
+  if (
+    !targetedPostLogicalRequestId(superseded) ||
+    !String(superseded?.attemptId || '').trim() ||
+    isSameTargetedPostAttempt(superseded, expectedCurrent)
+  ) {
+    return initialResult;
+  }
+  if (!isTargetedPostOwnerSnapshot(current, expectedCurrent)) {
+    return {...initialResult, ok: false};
+  }
+
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (error) {
+    return {
+      ...initialResult,
+      warning: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+  const candidates = tabs.filter((tab) =>
+    isTargetedPostRunnerTabForAttempt(tab, superseded),
+  );
+  const removedTabIds = [];
+  for (const tab of candidates) {
+    current = await readTargetedPostRunRequest({
+      persistNormalized: false,
+    });
+    if (!isTargetedPostOwnerSnapshot(current, expectedCurrent)) {
+      return {
+        ok: false,
+        current,
+        removedTabIds,
+        removedCount: removedTabIds.length,
+      };
+    }
+    const tabId = Number(tab?.id);
+    if (!Number.isSafeInteger(tabId)) continue;
+    try {
+      await chrome.tabs.remove(tabId);
+      removedTabIds.push(tabId);
+    } catch (_error) {
+      // 页面可能已由用户关闭；不影响新的执行轮次继续领取。
+    }
+  }
+  return {
+    ok: true,
+    current,
+    removedTabIds,
+    removedCount: removedTabIds.length,
+  };
+}
+
 function buildTargetedPostTaskCenterRun(request, existingRun = null) {
   if (!request || typeof request !== 'object') return null;
-  const id = String(request.id || request.requestId || '').trim();
+  const logicalRequestId = targetedPostLogicalRequestId(request);
+  const id = targetedPostPhysicalRunId(request);
   if (!id) return null;
   const descriptor = targetedPostTaskCenterDescriptor(request);
   const checkpoint =
@@ -2098,10 +2320,16 @@ function buildTargetedPostTaskCenterRun(request, existingRun = null) {
     },
     metadata: {
       workflow: descriptor.workflow,
+      logicalRequestId,
       protocolVersion: targetedPostTaskCenterInteger(request.protocolVersion),
       taskId: String(request.taskId || ''),
       cloudCommandId: String(request.cloudCommandId || ''),
+      attemptId: String(request.attemptId || ''),
+      previousAttemptId: String(request.previousAttemptId || ''),
       subjectType: String(request.subjectType || ''),
+      targetMode: String(request.targetMode || ''),
+      profileMode: request.profileMode === true,
+      executionFingerprint: String(request.executionFingerprint || ''),
       targetCount: total,
       cancelRequested:
         request.cancelRequested === true ||
@@ -2132,7 +2360,9 @@ async function persistTargetedPostRunRequest(request) {
           updatedAt: '',
         };
     const existingRun = Array.isArray(ledger?.runs)
-      ? ledger.runs.find((item) => item?.id === request.id) || null
+      ? ledger.runs.find(
+          (item) => item?.id === targetedPostPhysicalRunId(request),
+        ) || null
       : null;
     const taskRun = buildTargetedPostTaskCenterRun(request, existingRun);
     if (!taskRun) {
@@ -2180,63 +2410,195 @@ async function createOrResumeTargetedPostRun(command, payload) {
   const requestId = String(
     normalized.clientTaskId || normalized.taskId,
   ).trim();
-  const current = await readTargetedPostRunRequest();
-  if (
-    current &&
-    (current.id === requestId || current.cloudCommandId === commandId)
-  ) {
+  const executionFingerprint = targetedPostExecutionFingerprint(normalized);
+  return await runTargetedPostRunMutation(async () => {
+    const current = await readTargetedPostRunRequest({
+      persistNormalized: false,
+    });
+    const sameRequest = Boolean(current && current.id === requestId);
+    const sameCommand = Boolean(
+      sameRequest &&
+        commandId &&
+        String(current.cloudCommandId || '') === commandId,
+    );
+    const currentFingerprint = current
+      ? String(
+          current.executionFingerprint ||
+            targetedPostExecutionFingerprint(current),
+        )
+      : '';
+    const exactDuplicate = Boolean(
+      sameCommand &&
+        current?.attemptId &&
+        currentFingerprint === executionFingerprint,
+    );
+
+    if (exactDuplicate) {
+      if (
+        !cloudTargetedPostApi.isTerminalRunStatus(current.status) &&
+        current.status === 'pending'
+      ) {
+        try {
+          const ownedBeforeOpen = await readOwnedTargetedPostAttempt(current);
+          if (!ownedBeforeOpen) {
+            return await readTargetedPostRunRequest({
+              persistNormalized: false,
+            });
+          }
+          const runner = await openTargetedPostRunnerTab(current.id, {
+            attemptId: current.attemptId,
+          });
+          const ownedAfterOpen = await readOwnedTargetedPostAttempt(current);
+          if (!ownedAfterOpen) {
+            await closeSupersededTargetedPostRunnerTabs(
+              current,
+              await readTargetedPostRunRequest({persistNormalized: false}),
+            );
+            return await readTargetedPostRunRequest({
+              persistNormalized: false,
+            });
+          }
+          if (runner?.id && Number(current.runnerTabId) !== Number(runner.id)) {
+            const rebound = cloudTargetedPostApi.mergeRunPatch(current, {
+              runnerTabId: runner.id,
+              message: '定向作品任务运行页已连接',
+            });
+            return await persistTargetedPostRunRequest(rebound);
+          }
+        } catch (error) {
+          const owned = await readOwnedTargetedPostAttempt(current);
+          if (!owned) {
+            return await readTargetedPostRunRequest({
+              persistNormalized: false,
+            });
+          }
+          const failed = cloudTargetedPostApi.mergeRunPatch(current, {
+            status: 'needs_action',
+            finishedAt: new Date().toISOString(),
+            message: '无法打开定向作品采集运行页',
+            error: {
+              code: String(error?.code || 'TARGET_RUNNER_OPEN_FAILED'),
+              message: String(error?.message || '无法打开采集运行页').slice(
+                0,
+                1000,
+              ),
+            },
+          });
+          return await persistTargetedPostRunRequest(failed);
+        }
+      }
+      return current;
+    }
+
     if (
-      !cloudTargetedPostApi.isTerminalRunStatus(current.status) &&
-      current.status === 'pending'
+      current &&
+      !sameRequest &&
+      !cloudTargetedPostApi.isTerminalRunStatus(current.status)
     ) {
-      const runner = await openTargetedPostRunnerTab(current.id);
-      if (runner?.id && Number(current.runnerTabId) !== Number(runner.id)) {
-        const rebound = cloudTargetedPostApi.mergeRunPatch(current, {
-          runnerTabId: runner.id,
-          message: '定向作品任务运行页已连接',
-        });
-        return await persistTargetedPostRunRequest(rebound);
+      return {deferred: true, reason: 'targeted_post_task_busy'};
+    }
+    if (!sameRequest) {
+      const activeLock = await readActiveCaptureExecutionLock();
+      if (activeLock) {
+        return {deferred: true, reason: 'capture_lock_busy'};
       }
     }
-    return current;
-  }
-  if (
-    current &&
-    !cloudTargetedPostApi.isTerminalRunStatus(current.status)
-  ) {
-    return {deferred: true, reason: 'targeted_post_task_busy'};
-  }
-  const activeLock = await readActiveCaptureExecutionLock();
-  if (activeLock) {
-    return {deferred: true, reason: 'capture_lock_busy'};
-  }
 
-  let request = cloudTargetedPostApi.createRunRequest(normalized, {
-    commandId,
-    requestId,
-    attemptId: normalized.attemptId || createUuid(),
+    const previousAttemptId = sameRequest
+      ? String(current?.attemptId || '')
+      : '';
+    const attemptNumber = sameRequest
+      ? Math.max(1, Number(current?.attemptNumber) || 1) + 1
+      : 1;
+    const nextAttemptId = createUuid();
+    let supersededRequest = null;
+    if (
+      sameRequest &&
+      current &&
+      !cloudTargetedPostApi.isTerminalRunStatus(current.status)
+    ) {
+      const superseded = cloudTargetedPostApi.mergeRunPatch(current, {
+        status: 'canceled',
+        cancelRequested: true,
+        finishedAt: new Date().toISOString(),
+        message: '任务已由新的执行轮次接管',
+        supersededByAttemptId: nextAttemptId,
+      });
+      await persistTargetedPostRunRequest(superseded);
+      supersededRequest = superseded;
+    }
+    let request = cloudTargetedPostApi.createRunRequest(normalized, {
+      commandId,
+      requestId,
+      attemptId: nextAttemptId,
+      attemptNumber,
+      previousAttemptId,
+    });
+    request = {
+      ...request,
+      executionFingerprint,
+    };
+    await persistTargetedPostRunRequest(request);
+    if (supersededRequest) {
+      const closed = await closeSupersededTargetedPostRunnerTabs(
+        supersededRequest,
+        request,
+      );
+      if (!closed.ok) {
+        return (
+          closed.current ||
+          (await readTargetedPostRunRequest({persistNormalized: false}))
+        );
+      }
+    }
+    try {
+      const ownedBeforeOpen = await readOwnedTargetedPostAttempt(request);
+      if (!ownedBeforeOpen) {
+        return await readTargetedPostRunRequest({
+          persistNormalized: false,
+        });
+      }
+      const runner = await openTargetedPostRunnerTab(request.id, {
+        attemptId: request.attemptId,
+      });
+      const ownedAfterOpen = await readOwnedTargetedPostAttempt(request);
+      if (!ownedAfterOpen) {
+        await closeSupersededTargetedPostRunnerTabs(
+          request,
+          await readTargetedPostRunRequest({persistNormalized: false}),
+        );
+        return await readTargetedPostRunRequest({
+          persistNormalized: false,
+        });
+      }
+      request = cloudTargetedPostApi.mergeRunPatch(request, {
+        runnerTabId: runner?.id,
+        message: '定向作品任务已下发，等待运行页执行',
+      });
+      return await persistTargetedPostRunRequest(request);
+    } catch (error) {
+      const owned = await readOwnedTargetedPostAttempt(request);
+      if (!owned) {
+        return await readTargetedPostRunRequest({
+          persistNormalized: false,
+        });
+      }
+      const failed = cloudTargetedPostApi.mergeRunPatch(request, {
+        status: 'needs_action',
+        finishedAt: new Date().toISOString(),
+        message: '无法打开定向作品采集运行页',
+        error: {
+          code: String(error?.code || 'TARGET_RUNNER_OPEN_FAILED'),
+          message: String(error?.message || '无法打开采集运行页').slice(
+            0,
+            1000,
+          ),
+        },
+      });
+      await persistTargetedPostRunRequest(failed);
+      return failed;
+    }
   });
-  await persistTargetedPostRunRequest(request);
-  try {
-    const runner = await openTargetedPostRunnerTab(request.id);
-    request = cloudTargetedPostApi.mergeRunPatch(request, {
-      runnerTabId: runner?.id,
-      message: '定向作品任务已下发，等待运行页执行',
-    });
-    return await persistTargetedPostRunRequest(request);
-  } catch (error) {
-    const failed = cloudTargetedPostApi.mergeRunPatch(request, {
-      status: 'needs_action',
-      finishedAt: new Date().toISOString(),
-      message: '无法打开定向作品采集运行页',
-      error: {
-        code: String(error?.code || 'TARGET_RUNNER_OPEN_FAILED'),
-        message: String(error?.message || '无法打开采集运行页').slice(0, 1000),
-      },
-    });
-    await persistTargetedPostRunRequest(failed);
-    return failed;
-  }
 }
 
 function summarizeTargetedPostRunForCloud(request, commandId) {
@@ -2282,64 +2644,70 @@ async function reportTargetedPostTerminalToCloud(request) {
   ) {
     return {ok: false, skipped: true, reason: 'targeted_post_not_terminal'};
   }
-  const commandId = String(request.cloudCommandId || '').trim();
-  if (!commandId || !cloudTaskAgentApi?.completeCommand) {
-    scheduleCloudTaskAgentSync('targeted_post_terminal_fallback', 0);
-    return {
-      ok: false,
-      skipped: true,
-      reason: commandId ? 'cloud_agent_unavailable' : 'missing_command_id',
-    };
-  }
-  const credential = await readCloudTaskAgentCredential();
-  if (!credential.token) {
-    scheduleCloudTaskAgentSync('targeted_post_terminal_missing_credential', 0);
-    return {ok: false, skipped: true, reason: 'missing_agent_credential'};
-  }
-
-  const result = await rememberCloudCommandResult(
-    commandId,
-    summarizeTargetedPostRunForCloud(request, commandId),
-  );
-  try {
-    const response = await cloudTaskAgentApi.completeCommand({
-      token: credential.token,
-      commandId,
-      success: result.accepted === true,
-      result,
+  return await runTargetedPostRunMutation(async () => {
+    const current = await readTargetedPostRunRequest({
+      persistNormalized: false,
     });
-    if (response?.ok) {
-      clearCloudTaskAgentFailureBackoff();
-      scheduleCloudTaskAgentSync('targeted_post_terminal_confirmed', 0);
-      return response;
+    if (!isSameTargetedPostAttempt(current, request, {requireCommand: true})) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: 'stale_targeted_post_attempt',
+      };
     }
-    const retryDelay = recordCloudTaskAgentFailure();
-    await rememberCloudTaskAgentError(
-      response?.message || response?.reason || '定向作品任务终态回传失败',
+    const commandId = String(current.cloudCommandId || '').trim();
+    if (!commandId || !cloudTaskAgentApi?.completeCommand) {
+      scheduleCloudTaskAgentSync('targeted_post_terminal_fallback', 0);
+      return {
+        ok: false,
+        skipped: true,
+        reason: commandId ? 'cloud_agent_unavailable' : 'missing_command_id',
+      };
+    }
+    const credential = await readCloudTaskAgentCredential();
+    if (!credential.token) {
+      scheduleCloudTaskAgentSync('targeted_post_terminal_missing_credential', 0);
+      return {ok: false, skipped: true, reason: 'missing_agent_credential'};
+    }
+
+    const result = await rememberCloudCommandResult(
+      commandId,
+      summarizeTargetedPostRunForCloud(current, commandId),
     );
-    scheduleCloudTaskAgentSync(
-      'targeted_post_terminal_retry',
-      retryDelay,
-    );
-    return response || {
-      ok: false,
-      reason: 'targeted_post_terminal_report_failed',
-    };
-  } catch (error) {
-    const retryDelay = recordCloudTaskAgentFailure();
-    await rememberCloudTaskAgentError(
-      error?.message || '定向作品任务终态回传失败',
-    );
-    scheduleCloudTaskAgentSync(
-      'targeted_post_terminal_retry',
-      retryDelay,
-    );
-    return {
-      ok: false,
-      reason: 'targeted_post_terminal_report_failed',
-      message: normalizeCloudTaskAgentError(error?.message || error),
-    };
-  }
+    try {
+      const response = await cloudTaskAgentApi.completeCommand({
+        token: credential.token,
+        commandId,
+        success: result.accepted === true,
+        result,
+      });
+      if (response?.ok) {
+        clearCloudTaskAgentFailureBackoff();
+        scheduleCloudTaskAgentSync('targeted_post_terminal_confirmed', 0);
+        return response;
+      }
+      const retryDelay = recordCloudTaskAgentFailure();
+      await rememberCloudTaskAgentError(
+        response?.message || response?.reason || '定向作品任务终态回传失败',
+      );
+      scheduleCloudTaskAgentSync('targeted_post_terminal_retry', retryDelay);
+      return response || {
+        ok: false,
+        reason: 'targeted_post_terminal_report_failed',
+      };
+    } catch (error) {
+      const retryDelay = recordCloudTaskAgentFailure();
+      await rememberCloudTaskAgentError(
+        error?.message || '定向作品任务终态回传失败',
+      );
+      scheduleCloudTaskAgentSync('targeted_post_terminal_retry', retryDelay);
+      return {
+        ok: false,
+        reason: 'targeted_post_terminal_report_failed',
+        message: normalizeCloudTaskAgentError(error?.message || error),
+      };
+    }
+  });
 }
 
 async function executeCloudTargetedPostCreateCommand(
@@ -2394,35 +2762,60 @@ async function executeCloudTargetedPostCreateCommand(
   };
 }
 
-async function cancelTargetedPostRunFromControl(requestId) {
-  const request = await readTargetedPostRunRequest();
-  if (!request || (requestId && request.id !== requestId)) {
-    return {matched: false, accepted: false, reason: 'not_found', request: null};
-  }
-  if (cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+async function cancelTargetedPostRunFromControl(requestId, attemptId = '') {
+  return await runTargetedPostRunMutation(async () => {
+    const request = await readTargetedPostRunRequest({
+      persistNormalized: false,
+    });
+    if (!request || (requestId && request.id !== requestId)) {
+      return {
+        matched: false,
+        accepted: false,
+        reason: 'not_found',
+        request: null,
+      };
+    }
+    if (!attemptId) {
+      return {
+        matched: true,
+        accepted: false,
+        reason: 'targeted_post_attempt_required',
+        request,
+      };
+    }
+    if (String(request.attemptId || '') !== String(attemptId).trim()) {
+      return {
+        matched: true,
+        accepted: false,
+        reason: 'stale_targeted_post_attempt',
+        request,
+      };
+    }
+    if (cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+      return {
+        matched: true,
+        accepted: true,
+        reason: 'already_terminal',
+        request,
+      };
+    }
+    const pending = String(request.status || '') === 'pending';
+    const next = cloudTargetedPostApi.mergeRunPatch(request, {
+      status: pending ? 'canceled' : 'cancel_requested',
+      cancelRequested: true,
+      finishedAt: pending ? new Date().toISOString() : '',
+      message: pending
+        ? '定向作品任务已在执行前停止'
+        : '后台已请求停止定向作品任务，正在保留已有结果',
+    });
+    await persistTargetedPostRunRequest(next);
     return {
       matched: true,
       accepted: true,
-      reason: 'already_terminal',
-      request,
+      reason: pending ? 'stopped_before_dispatch' : 'cancel_requested',
+      request: next,
     };
-  }
-  const pending = String(request.status || '') === 'pending';
-  const next = cloudTargetedPostApi.mergeRunPatch(request, {
-    status: pending ? 'canceled' : 'cancel_requested',
-    cancelRequested: true,
-    finishedAt: pending ? new Date().toISOString() : '',
-    message: pending
-      ? '定向作品任务已在执行前停止'
-      : '后台已请求停止定向作品任务，正在保留已有结果',
   });
-  await persistTargetedPostRunRequest(next);
-  return {
-    matched: true,
-    accepted: true,
-    reason: pending ? 'stopped_before_dispatch' : 'cancel_requested',
-    request: next,
-  };
 }
 
 async function executeCloudTaskAgentCommand(command, token) {
@@ -2437,6 +2830,17 @@ async function executeCloudTaskAgentCommand(command, token) {
       : {};
   const requestId = String(
     payload.controlTaskId || command.control_task_id || command.client_task_id || '',
+  ).trim();
+  const targetedAttemptId = String(
+    payload.targetedAttemptId ||
+      payload.targeted_attempt_id ||
+      payload.attemptId ||
+      payload.attempt_id ||
+      payload.clientAttemptId ||
+      payload.client_attempt_id ||
+      command.attempt_id ||
+      command.client_attempt_id ||
+      '',
   ).trim();
 
   if (commandType === 'create' && isCloudTargetedPostPayload(payload)) {
@@ -2700,9 +3104,10 @@ async function executeCloudTaskAgentCommand(command, token) {
         accepted: false,
         reason: 'executing',
         requestId,
+        attemptId: targetedAttemptId,
       });
       const targetedStop = cloudTargetedPostApi?.mergeRunPatch
-        ? await cancelTargetedPostRunFromControl(requestId)
+        ? await cancelTargetedPostRunFromControl(requestId, targetedAttemptId)
         : {matched: false};
       const stopped = targetedStop.matched
         ? targetedStop
@@ -2715,6 +3120,7 @@ async function executeCloudTaskAgentCommand(command, token) {
         accepted: stopped.accepted === true,
         reason: stopped.reason,
         requestId,
+        attemptId: targetedAttemptId,
         message:
           stopped.accepted === true
             ? stopped.reason === 'already_terminal'
@@ -3001,9 +3407,7 @@ function isTaskRunActuallyActive(
     );
   }
 
-  const targetedRequestId = String(
-    targetedRequest?.id || targetedRequest?.requestId || '',
-  ).trim();
+  const targetedRequestId = targetedPostPhysicalRunId(targetedRequest);
   if (targetedRequestId !== taskId) return false;
   if (
     cloudTargetedPostApi?.isTerminalRunStatus?.(
@@ -3054,16 +3458,16 @@ async function clearTaskCenterRecords() {
       typeof stored[STORAGE_KEYS.targetedPostRunRequest] === 'object'
         ? stored[STORAGE_KEYS.targetedPostRunRequest]
         : null;
-    const targetedRequestId = String(
-      targetedRequest?.id || targetedRequest?.requestId || '',
-    ).trim();
+    const targetedRequestId = targetedPostLogicalRequestId(targetedRequest);
+    const targetedPhysicalRunId = targetedPostPhysicalRunId(targetedRequest);
     const targetedRequestActive = Boolean(
       targetedRequestId &&
+        targetedPhysicalRunId &&
         !cloudTargetedPostApi?.isTerminalRunStatus?.(
           String(targetedRequest?.status || ''),
         ) &&
         isTaskRunActuallyActive(
-          {...targetedRequest, id: targetedRequestId},
+          {...targetedRequest, id: targetedPhysicalRunId},
           {now, targetedRequest},
         ),
     );
@@ -4213,9 +4617,15 @@ function buildUnattendedRunnerUrl(requestId) {
   return url.toString();
 }
 
-function buildTargetedPostRunnerUrl(requestId) {
+function buildTargetedPostRunnerUrl(requestId, attemptId = '') {
   const url = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
   url.searchParams.set(TARGETED_POST_RUNNER_QUERY_KEY, requestId);
+  if (attemptId) {
+    url.searchParams.set(
+      TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY,
+      attemptId,
+    );
+  }
   return url.toString();
 }
 
@@ -4248,20 +4658,40 @@ async function createRunnerTab(createOptions, concreteWindowId) {
   }
 }
 
-async function openTargetedPostRunnerTab(requestId, {windowId = null} = {}) {
-  const runnerUrl = buildTargetedPostRunnerUrl(requestId);
+async function openTargetedPostRunnerTab(
+  requestId,
+  {windowId = null, attemptId = ''} = {},
+) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  if (!normalizedRequestId || !normalizedAttemptId) {
+    const error = new Error('定向作品运行页缺少任务执行轮次');
+    error.code = 'TARGETED_POST_ATTEMPT_REQUIRED';
+    throw error;
+  }
+  const runnerUrl = buildTargetedPostRunnerUrl(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
   const sidebarUrl = chrome.runtime.getURL(SIDEBAR_PAGE_PATH);
   const allTabs = await chrome.tabs.query({});
   const existingRunner = allTabs.find((tab) => {
     const currentUrl = String(tab?.url || '');
-    return (
-      currentUrl.startsWith(`${sidebarUrl}?`) &&
-      currentUrl.includes(`${TARGETED_POST_RUNNER_QUERY_KEY}=`)
-    );
+    if (!currentUrl.startsWith(`${sidebarUrl}?`)) return false;
+    try {
+      const parsed = new URL(currentUrl);
+      return (
+        parsed.searchParams.get(TARGETED_POST_RUNNER_QUERY_KEY) ===
+          normalizedRequestId &&
+        parsed.searchParams.get(TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY) ===
+          normalizedAttemptId
+      );
+    } catch (_error) {
+      return false;
+    }
   });
   if (existingRunner?.id) {
     return await chrome.tabs.update(existingRunner.id, {
-      url: runnerUrl,
       active: true,
       autoDiscardable: false,
     });
@@ -9318,21 +9748,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (type === 'onstarvoice:get-targeted-post-run-state') {
         const request = await readTargetedPostRunRequest();
         const requestId = String(message?.requestId || '').trim();
-        sendResponse({
-          ok: true,
-          data: !requestId || request?.id === requestId ? request : null,
-        });
-        return;
-      }
-
-      if (type === 'onstarvoice:update-targeted-post-run') {
-        const request = await readTargetedPostRunRequest();
-        const requestId = String(message?.requestId || '').trim();
         const attemptId = String(message?.attemptId || '').trim();
+        if (!requestId) {
+          // 任务中心只读展示保持兼容；真正的运行页必须同时绑定
+          // requestId 与 attemptId，避免旧页面读取到新一轮任务。
+          sendResponse({ok: true, accepted: true, data: request});
+          return;
+        }
+        if (!attemptId) {
+          sendResponse({
+            ok: false,
+            accepted: false,
+            reason: 'targeted_post_attempt_required',
+            data: request,
+          });
+          return;
+        }
         if (
           !request ||
           request.id !== requestId ||
-          !attemptId ||
           String(request.attemptId || '') !== attemptId
         ) {
           sendResponse({
@@ -9343,32 +9777,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        if (cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
-          sendResponse({
-            ok: false,
-            accepted: false,
-            reason: 'targeted_post_run_terminal',
-            data: request,
-          });
-          return;
-        }
-        const next = cloudTargetedPostApi.mergeRunPatch(
-          request,
-          message?.patch,
-        );
-        await persistTargetedPostRunRequest(next);
-        let cloudReport = null;
-        if (cloudTargetedPostApi.isTerminalRunStatus(next.status)) {
-          // 终态不能只依赖一个随后触发的计时器：MV3 Service Worker
-          // 可能在计时器执行前休眠。直接等待指令回执，确保云端工作项、
-          // 父任务和帖子可用性在同一次消息生命周期内完成结算。
-          cloudReport = await reportTargetedPostTerminalToCloud(next);
-        }
         sendResponse({
           ok: true,
           accepted: true,
           reason: '',
-          data: next,
+          data: request,
+        });
+        return;
+      }
+
+      if (type === 'onstarvoice:update-targeted-post-run') {
+        const requestId = String(message?.requestId || '').trim();
+        const attemptId = String(message?.attemptId || '').trim();
+        const result = await runTargetedPostRunMutation(async () => {
+          const request = await readTargetedPostRunRequest({
+            persistNormalized: false,
+          });
+          if (!attemptId) {
+            return {
+              ok: false,
+              accepted: false,
+              reason: 'targeted_post_attempt_required',
+              data: request,
+            };
+          }
+          if (
+            !request ||
+            request.id !== requestId ||
+            String(request.attemptId || '') !== attemptId
+          ) {
+            return {
+              ok: false,
+              accepted: false,
+              reason: 'stale_targeted_post_attempt',
+              data: request,
+            };
+          }
+          if (cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+            return {
+              ok: false,
+              accepted: false,
+              reason: 'targeted_post_run_terminal',
+              data: request,
+            };
+          }
+          const next = cloudTargetedPostApi.mergeRunPatch(
+            request,
+            message?.patch,
+          );
+          await persistTargetedPostRunRequest(next);
+          return {
+            ok: true,
+            accepted: true,
+            reason: '',
+            data: next,
+          };
+        });
+        let cloudReport = null;
+        if (
+          result.ok &&
+          cloudTargetedPostApi.isTerminalRunStatus(result.data?.status)
+        ) {
+          // 终态不能只依赖一个随后触发的计时器：MV3 Service Worker
+          // 可能在计时器执行前休眠。直接等待指令回执，确保云端工作项、
+          // 父任务和帖子可用性在同一次消息生命周期内完成结算。
+          cloudReport = await reportTargetedPostTerminalToCloud(result.data);
+        }
+        sendResponse({
+          ...result,
           cloudReported: cloudReport?.ok === true,
         });
         return;

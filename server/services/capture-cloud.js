@@ -431,6 +431,40 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   if (!clientTaskId) return null;
   const rawPlatform = String(task.platform || 'unknown').trim().toLowerCase();
   const platform = PLATFORM_ALIASES[rawPlatform] || 'unknown';
+  const metadata = sanitizeCloudStructuredObject(task.metadata);
+  const promoteMetadataField = (key, value) => {
+    if (
+      value === undefined ||
+      value === null ||
+      value === ''
+    ) {
+      return;
+    }
+    const sanitized = safeStructuredValue(value, key);
+    if (sanitized !== undefined && sanitized !== null && sanitized !== '') {
+      metadata[key] = sanitized;
+    }
+  };
+  // Targeted-profile runs expose their execution contract at the top level.
+  // Promote it into metadata so the server can compare the observed local run
+  // with the exact create command without trusting a task id alone.
+  promoteMetadataField('workflow', task.workflow);
+  promoteMetadataField(
+    'protocolVersion',
+    task.protocolVersion ?? task.protocol_version,
+  );
+  promoteMetadataField('targetMode', task.targetMode ?? task.target_mode);
+  promoteMetadataField('profileMode', task.profileMode ?? task.profile_mode);
+  promoteMetadataField('subjectType', task.subjectType ?? task.subject_type);
+  promoteMetadataField('targets', task.targets);
+  promoteMetadataField(
+    'monitorSettings',
+    task.monitorSettings ?? task.monitor_settings,
+  );
+  promoteMetadataField(
+    'captureSettings',
+    task.captureSettings ?? task.capture_settings,
+  );
   const sanitizedTargetResults = safeStructuredValue(
     Array.isArray(task.targetResults) ? task.targetResults : [],
   );
@@ -458,7 +492,7 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     checkpoint,
     targetResults,
     counts: sanitizeCloudStructuredObject(task.counts),
-    metadata: sanitizeCloudStructuredObject(task.metadata),
+    metadata,
     error: sanitizeCloudStructuredObject(task.error),
     message: text(safeStructuredValue(task.message), 2000),
     attemptId: text(task.attemptId, 240),

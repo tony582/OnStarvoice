@@ -351,6 +351,10 @@ function createHarness() {
       `  handleUnattendedKeywordAlarm,\n` +
       `  reconcileUnattendedKeywordPlanSchedule,\n` +
       `  createUnattendedKeywordRunRequest,\n` +
+      `  readTargetedPostRunRequest,\n` +
+      `  createOrResumeTargetedPostRun,\n` +
+      `  closeSupersededTargetedPostRunnerTabs,\n` +
+      `  cancelTargetedPostRunFromControl,\n` +
       `  openTargetedPostRunnerTab,\n` +
       `  openUnattendedRunnerTab,\n` +
       `  bindUnattendedRunnerTab,\n` +
@@ -481,6 +485,48 @@ function buildUnattendedPlan(overrides = {}) {
     randomOffsetMin: 0,
     keywords: ["关键词一", "关键词二"],
     nextRunAt: "",
+    ...overrides,
+  };
+}
+
+function buildTargetedPostRequest(overrides = {}) {
+  const now = "2026-07-29T00:00:00.000Z";
+  return {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    workflow: "negative_post_patrol",
+    id: "targeted-request",
+    clientTaskId: "targeted-request",
+    taskId: "targeted-task",
+    attemptId: "targeted-attempt",
+    attemptNumber: 1,
+    cloudCommandId: "targeted-command",
+    platform: "douyin",
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    heartbeatAt: now,
+    targets: [{
+      workflow: "negative_post_patrol",
+      itemId: "targeted-item-1",
+      recordId: "targeted-record-1",
+      externalId: "123",
+      ordinal: 1,
+      url: "https://www.douyin.com/video/123",
+    }],
+    targetResults: [],
+    checkpoint: {
+      processedCount: 0,
+      successCount: 0,
+      warningCount: 0,
+      failedCount: 0,
+      unavailableCount: 0,
+      capturedCount: 0,
+      skippedCount: 0,
+      canceledCount: 0,
+      completedItemIds: [],
+      total: 1,
+    },
     ...overrides,
   };
 }
@@ -1320,7 +1366,9 @@ test("a newly created unattended runner tab is made non-discardable", async () =
 test("a targeted post runner never coerces a missing window to id zero", async () => {
   const harness = createHarness();
 
-  const runner = await harness.api.openTargetedPostRunnerTab("targeted-create");
+  const runner = await harness.api.openTargetedPostRunnerTab("targeted-create", {
+    attemptId: "targeted-create-attempt",
+  });
 
   assert.equal(harness.createdTabs.length, 1);
   assert.equal(
@@ -1328,6 +1376,10 @@ test("a targeted post runner never coerces a missing window to id zero", async (
     false,
   );
   assert.match(harness.createdTabs[0].url, /targetedPostRun=targeted-create/);
+  assert.match(
+    harness.createdTabs[0].url,
+    /targetedPostAttempt=targeted-create-attempt/,
+  );
   assert.deepEqual(harness.updatedTabs, [
     {id: harness.createdTabs[0].id, autoDiscardable: false},
   ]);
@@ -1339,6 +1391,7 @@ test("a targeted post runner keeps a concrete browser window", async () => {
 
   await harness.api.openTargetedPostRunnerTab("targeted-window", {
     windowId: 7,
+    attemptId: "targeted-window-attempt",
   });
 
   assert.equal(harness.createdTabs.length, 1);
@@ -1358,6 +1411,7 @@ test("a targeted post runner falls back once when its preferred window closed", 
 
   const runner = await harness.api.openTargetedPostRunnerTab("targeted-stale-window", {
     windowId: 7,
+    attemptId: "targeted-stale-window-attempt",
   });
 
   assert.equal(attempts.length, 2);
@@ -1409,10 +1463,123 @@ test("runner tab creation does not retry an unrelated browser error", async () =
   await assert.rejects(
     harness.api.openTargetedPostRunnerTab("targeted-non-window-error", {
       windowId: 7,
+      attemptId: "targeted-non-window-error-attempt",
     }),
     /Tabs cannot be edited right now/,
   );
   assert.equal(attempts, 1);
+});
+
+test("targeted cleanup closes only the superseded attempt runner", async () => {
+  const harness = createHarness();
+  const superseded = buildTargetedPostRequest({
+    id: "targeted-shared-request",
+    clientTaskId: "targeted-shared-request",
+    taskId: "targeted-shared-task",
+    attemptId: "targeted-old-attempt",
+    cloudCommandId: "targeted-old-command",
+  });
+  const current = buildTargetedPostRequest({
+    id: "targeted-shared-request",
+    clientTaskId: "targeted-shared-request",
+    taskId: "targeted-shared-task",
+    attemptId: "targeted-new-attempt",
+    cloudCommandId: "targeted-new-command",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = current;
+  harness.setTabQueryHandler(async () => [
+    {
+      id: 41,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-shared-request" +
+        "&targetedPostAttempt=targeted-old-attempt",
+    },
+    {
+      id: 42,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-shared-request" +
+        "&targetedPostAttempt=targeted-new-attempt",
+    },
+  ]);
+
+  const result =
+    await harness.api.closeSupersededTargetedPostRunnerTabs(
+      superseded,
+      current,
+    );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(harness.removedTabIds, [41]);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].attemptId, "targeted-new-attempt");
+});
+
+test("targeted stop accepts the current attempt", async () => {
+  const harness = createHarness();
+  harness.storage[TARGETED_POST_REQUEST_KEY] = buildTargetedPostRequest({
+    id: "targeted-stop-request",
+    clientTaskId: "targeted-stop-request",
+    attemptId: "targeted-stop-current",
+    cloudCommandId: "targeted-stop-command",
+  });
+
+  const result = await harness.api.cancelTargetedPostRunFromControl(
+    "targeted-stop-request",
+    "targeted-stop-current",
+  );
+
+  assert.equal(result.matched, true);
+  assert.equal(result.accepted, true);
+  assert.equal(result.reason, "cancel_requested");
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "cancel_requested",
+  );
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
+    "targeted-stop-current",
+  );
+});
+
+test("targeted stop rejects a stale attempt", async () => {
+  const harness = createHarness();
+  harness.storage[TARGETED_POST_REQUEST_KEY] = buildTargetedPostRequest({
+    id: "targeted-stop-request",
+    clientTaskId: "targeted-stop-request",
+    attemptId: "targeted-stop-current",
+    cloudCommandId: "targeted-stop-command",
+  });
+
+  const result = await harness.api.cancelTargetedPostRunFromControl(
+    "targeted-stop-request",
+    "targeted-stop-stale",
+  );
+
+  assert.equal(result.matched, true);
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, "stale_targeted_post_attempt");
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "running");
+});
+
+test("targeted stop rejects a missing attempt", async () => {
+  const harness = createHarness();
+  harness.storage[TARGETED_POST_REQUEST_KEY] = buildTargetedPostRequest({
+    id: "targeted-stop-request",
+    clientTaskId: "targeted-stop-request",
+    attemptId: "targeted-stop-current",
+    cloudCommandId: "targeted-stop-command",
+  });
+
+  const result = await harness.api.cancelTargetedPostRunFromControl(
+    "targeted-stop-request",
+    "",
+  );
+
+  assert.equal(result.matched, true);
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, "targeted_post_attempt_required");
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "running");
 });
 
 test("a reused unattended runner tab stays non-discardable", async () => {
@@ -1513,7 +1680,9 @@ test("a terminal targeted-post update reports its cloud command before the messa
     "deleted",
   );
   const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
-    (run) => run.id === "targeted-terminal-request",
+    (run) =>
+      run.id ===
+      "targeted-terminal-request::targeted-terminal-attempt",
   );
   assert.equal(ledgerRun.status, "completed");
   assert.equal(ledgerRun.taskType, "negative_post_patrol");
@@ -5574,7 +5743,10 @@ test("a fresh targeted request keeps its same-id task-center record active", asy
   });
   assert.equal(readResponse.ok, true);
   assert.equal(readResponse.data.runs[0].status, "running");
-  assert.equal(readResponse.data.runs[0].id, "active-targeted-request");
+  assert.equal(
+    readResponse.data.runs[0].id,
+    "active-targeted-request::active-targeted-attempt",
+  );
   assert.equal(
     readResponse.data.runs[0].metadata.workflow,
     "negative_post_patrol",
@@ -5592,7 +5764,7 @@ test("a fresh targeted request keeps its same-id task-center record active", asy
   );
   assert.deepEqual(
     Array.from(harness.storage[TASK_LEDGER_KEY].runs, (run) => run.id),
-    ["active-targeted-request"],
+    ["active-targeted-request::active-targeted-attempt"],
   );
 });
 

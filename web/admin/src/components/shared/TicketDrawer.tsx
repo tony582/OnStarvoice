@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import {
   ArrowLeft, Ban, Camera, CheckCircle, CheckCircle2, ClipboardCheck, ExternalLink,
   FileText, Heart, History, LinkIcon, Loader2, MessageCircle, RotateCcw, Share2,
-  Star, StickyNote, User, UserCog, X, ZoomIn,
+  Radar, Star, StickyNote, User, UserCog, X, ZoomIn,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import {
@@ -14,13 +14,14 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import { recordDisplayImageEntries } from '@/components/shared/record-images'
+import { RecordPatrolPanel } from '@/components/shared/RecordDrawer'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
 
 const STATE_TONE: Record<string, string> = { pending: 'orange', doing: 'blue', done: 'positive', dismissed: 'muted', closed: 'positive' }
 const STATE_LABEL: Record<string, string> = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已结案' }
 
-type TicketTab = 'content' | 'comments' | 'official' | 'snapshot' | 'history'
+type TicketTab = 'content' | 'comments' | 'official' | 'snapshot' | 'patrol' | 'history'
 type TicketAction = () => Promise<unknown> | unknown
 
 interface TicketNote {
@@ -228,6 +229,9 @@ function TicketDrawerContent({
     { id: 'comments' as const, label: `评论 (${comments.length})`, icon: MessageCircle },
     { id: 'official' as const, label: `官方回复 (${officialResponses.length})`, icon: CheckCircle },
     { id: 'snapshot' as const, label: '采集', icon: Camera },
+    ...(rec
+      ? [{ id: 'patrol' as const, label: '舆情巡查', icon: Radar }]
+      : []),
     { id: 'history' as const, label: `处理记录 (${timeline.length})`, icon: History },
   ]
 
@@ -457,6 +461,10 @@ function TicketDrawerContent({
                       </div>
                     )}
                   </div>
+                )}
+
+                {tab === 'patrol' && rec && (
+                  <RecordPatrolPanel key={String(rec.id)} record={rec} />
                 )}
 
                 {tab === 'history' && (

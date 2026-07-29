@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
+import {
+  matchesOfficialCommentAuthor,
+  matchesOfficialRecordOwner,
+} from '../server/services/comment-workflow.js';
+
 const migration = await readFile(
   new URL('../server/db/migrations/049_official_account_monitor_link.sql', import.meta.url),
   'utf8',
@@ -269,32 +274,91 @@ test('extension identity fields keep internal UID and visible account number sep
 });
 
 test('official identity matching distinguishes platform UID and human account number', () => {
+  const officialAccountWhere = sourceSection(
+    officialPatrolRoute,
+    'function officialAccountWhere',
+    'function publicCandidate',
+  );
   assert.match(
     monitorRoute,
     /\$3 = '' AND \$4 = '' AND \$5 = '' AND \$6 = ''[\s\S]*account_name = \$7/u,
   );
   assert.match(
-    officialPatrolRoute,
+    officialAccountWhere,
     /r\.author_id = oa\.platform_user_id/u,
   );
   assert.match(
-    officialPatrolRoute,
+    officialAccountWhere,
     /r\.author_account_no = oa\.account_no/u,
   );
   assert.match(
-    officialPatrolRoute,
+    officialAccountWhere,
     /r\.author_id = oa\.account_id[\s\S]*r\.author_account_no = oa\.account_id/u,
+  );
+  assert.doesNotMatch(
+    officialAccountWhere,
+    /author_name|jsonb_array_elements_text/u,
   );
   assert.match(commentWorkflow, /account\.platform_user_id/u);
   assert.match(commentWorkflow, /account\.account_no/u);
   assert.match(commentWorkflow, /legacyAccountId/u);
-  assert.match(
-    officialPatrolRoute,
-    /NOT \([\s\S]*oa\.platform_user_id[\s\S]*r\.author_id[\s\S]*\)[\s\S]*r\.author_name = oa\.account_name/u,
+
+  const official = {
+    status: 'active',
+    platform: 'douyin',
+    account_name: '安吉星',
+    aliases: ['上海安吉星信息服务有限公司'],
+    platform_user_id: 'official-uid',
+    account_no: 'official-no',
+    account_id: 'legacy-id',
+  };
+  assert.equal(
+    matchesOfficialRecordOwner(
+      {platform: 'douyin', author_name: '安吉星'},
+      official,
+    ),
+    false,
   );
-  assert.match(
-    commentWorkflow,
-    /if \(accountHasStrongIdentity && subjectHasStrongIdentity\) return false/u,
+  assert.equal(
+    matchesOfficialRecordOwner(
+      {platform: 'douyin', author_id: 'official-uid'},
+      official,
+    ),
+    true,
+  );
+  assert.equal(
+    matchesOfficialCommentAuthor(
+      {platform: 'douyin', author_name: '安吉星'},
+      official,
+    ),
+    false,
+  );
+  assert.equal(
+    matchesOfficialCommentAuthor(
+      {platform: 'douyin', author_id: 'official-uid'},
+      official,
+    ),
+    true,
+  );
+  const legacyOfficial = {
+    ...official,
+    platform_user_id: '',
+    account_no: '',
+    account_id: '',
+  };
+  assert.equal(
+    matchesOfficialCommentAuthor(
+      {platform: 'douyin', author_name: '安吉星'},
+      legacyOfficial,
+    ),
+    true,
+  );
+  assert.equal(
+    matchesOfficialRecordOwner(
+      {platform: 'douyin', author_name: '安吉星'},
+      legacyOfficial,
+    ),
+    false,
   );
 });
 
@@ -349,6 +413,25 @@ test('legacy official-account admin matching never falls back to a name when str
     adminRoute,
     /OR \(\$7 <> '' AND account_name = \$7\)/u,
   );
+});
+
+test('historical reclassification uses strong record identity and guarded legacy comment fallback', () => {
+  const route = sourceSection(
+    adminRoute,
+    "router.post('/official-accounts/reclassify'",
+    "router.post('/login'",
+  );
+  const recordUpdate = sourceSection(route, '// ①', '// ②');
+  assert.doesNotMatch(
+    recordUpdate,
+    /account_name\s*=\s*r\.author_name|jsonb_array_elements_text/u,
+  );
+  assert.ok(route.includes("COALESCE(${officialAlias}.platform_user_id, '') = ''"));
+  assert.ok(route.includes("COALESCE(${officialAlias}.account_no, '') = ''"));
+  assert.ok(route.includes("COALESCE(${officialAlias}.account_id, '') = ''"));
+  assert.ok(route.includes("COALESCE(${rowAlias}.author_id, '') = ''"));
+  assert.ok(route.includes("CASE\n                WHEN jsonb_typeof(${officialAlias}.aliases) = 'array'"));
+  assert.ok(route.includes("${commentAuthorMatchSql('c')}"));
 });
 
 test('legacy official-account saves create or reuse a tenant-safe linked official subscription', () => {

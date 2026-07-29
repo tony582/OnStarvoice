@@ -909,6 +909,11 @@ let batchUrlCaptureMode = "";
 let targetedPostCancelRequested = false;
 let targetedPostRunInFlight = false;
 let targetedPostRunState = null;
+let targetedPostRunBindingStopReason = "";
+let activeTargetedPostInvocationToken = null;
+let targetedPostRunInFlightOwnerToken = null;
+let targetedPostBatchStateOwnerToken = null;
+let targetedPostRunnerTabOwnerToken = null;
 let batchKeywordCaptureInFlight = false;
 let batchKeywordCancelRequested = false;
 let activeBatchKeywordInvocationToken = null;
@@ -1113,6 +1118,7 @@ const BATCH_DRAFT_LEGACY_KEYS = ["expandedKeywords", "expandedSeedKeyword"];
 const BATCH_DRAFT_PLATFORMS = new Set(["xiaohongshu", "douyin", "unknown"]);
 const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
 const TARGETED_POST_RUN_QUERY_KEY = "targetedPostRun";
+const TARGETED_POST_RUN_ATTEMPT_QUERY_KEY = "targetedPostAttempt";
 const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.targetedPostRunRequest";
 const TARGETED_POST_RUNNER_HOME_URLS = Object.freeze({
@@ -2893,27 +2899,7 @@ function setupKeywordPlanStorageListener() {
     if (changes?.[TARGETED_POST_RUN_REQUEST_STORAGE_KEY]) {
       const request =
         changes[TARGETED_POST_RUN_REQUEST_STORAGE_KEY].newValue || null;
-      targetedPostRunState = request;
-      renderCaptureDebugSession(getCurrentRuntime() || {});
-      const requestId = getTargetedPostRunRequestIdFromUrl();
-      if (
-        requestId &&
-        request?.id === requestId &&
-        request.cancelRequested === true
-      ) {
-        targetedPostCancelRequested = true;
-        batchUrlCancelRequested = true;
-        if (activeBatchRunnerTabId) {
-          void requestCaptureCancelSignal(activeBatchRunnerTabId).catch(
-            (error) => {
-              console.warn(
-                "[Sidebar] Targeted post cancellation relay failed:",
-                error,
-              );
-            },
-          );
-        }
-      }
+      handleTargetedPostRunRequestStorageChange(request);
     }
   });
 }
@@ -15372,15 +15358,290 @@ function getTargetedPostRunRequestIdFromUrl() {
   }
 }
 
+function getTargetedPostRunAttemptIdFromUrl() {
+  try {
+    return (
+      new URLSearchParams(window.location.search).get(
+        TARGETED_POST_RUN_ATTEMPT_QUERY_KEY,
+      ) || ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+function createTargetedPostInvocationToken(requestId = "", attemptId = "") {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  if (!normalizedRequestId || !normalizedAttemptId) {
+    return null;
+  }
+  return Object.freeze({
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+  });
+}
+
+function getTargetedPostInvocationTokenFromRequest(request) {
+  return createTargetedPostInvocationToken(
+    request?.id,
+    request?.attemptId,
+  );
+}
+
+function isSameTargetedPostInvocationToken(left, right) {
+  return Boolean(
+    left &&
+      right &&
+      left.requestId === right.requestId &&
+      left.attemptId === right.attemptId,
+  );
+}
+
+function isActiveTargetedPostInvocation(token) {
+  return isSameTargetedPostInvocationToken(
+    activeTargetedPostInvocationToken,
+    token,
+  );
+}
+
+function activateTargetedPostInvocation(token) {
+  const normalizedToken = createTargetedPostInvocationToken(
+    token?.requestId,
+    token?.attemptId,
+  );
+  activeTargetedPostInvocationToken = normalizedToken;
+  return normalizedToken;
+}
+
+function getTargetedPostInvocationOwnership(token) {
+  return Object.freeze({
+    active: isActiveTargetedPostInvocation(token),
+    run: isSameTargetedPostInvocationToken(
+      targetedPostRunInFlightOwnerToken,
+      token,
+    ),
+    batch: isSameTargetedPostInvocationToken(
+      targetedPostBatchStateOwnerToken,
+      token,
+    ),
+    runnerTab: isSameTargetedPostInvocationToken(
+      targetedPostRunnerTabOwnerToken,
+      token,
+    ),
+  });
+}
+
+function createTargetedPostInvocationError(
+  reason = "stale_targeted_post_attempt",
+) {
+  const normalizedReason = String(reason || "").trim();
+  const error = new Error(
+    normalizedReason === "targeted_post_attempt_required"
+      ? "定向作品任务缺少运行批次"
+      : "定向作品任务已由新的运行批次接管",
+  );
+  error.code = normalizedReason || "stale_targeted_post_attempt";
+  return error;
+}
+
+function handleTargetedPostRunRequestStorageChange(request) {
+  const runnerRequestId = getTargetedPostRunRequestIdFromUrl();
+  if (!runnerRequestId) {
+    targetedPostRunState = request;
+    renderCaptureDebugSession(getCurrentRuntime() || {});
+    return;
+  }
+
+  const runnerToken = createTargetedPostInvocationToken(
+    runnerRequestId,
+    getTargetedPostRunAttemptIdFromUrl(),
+  );
+  if (!runnerToken) {
+    activeTargetedPostInvocationToken = null;
+    targetedPostRunState = null;
+    stopTargetedPostRunnerForInvalidBinding(
+      "targeted_post_attempt_required",
+    );
+    renderCaptureDebugSession(getCurrentRuntime() || {});
+    return;
+  }
+
+  const requestToken = getTargetedPostInvocationTokenFromRequest(request);
+  if (
+    activeTargetedPostInvocationToken &&
+    activeTargetedPostInvocationToken.requestId === runnerRequestId &&
+    !isSameTargetedPostInvocationToken(
+      activeTargetedPostInvocationToken,
+      requestToken,
+    )
+  ) {
+    activateTargetedPostInvocation(requestToken);
+    targetedPostRunState = null;
+    stopTargetedPostRunnerForInvalidBinding(
+      requestToken
+        ? "stale_targeted_post_attempt"
+        : "targeted_post_attempt_required",
+    );
+    renderCaptureDebugSession(getCurrentRuntime() || {});
+    return;
+  }
+
+  if (!isSameTargetedPostInvocationToken(requestToken, runnerToken)) {
+    return;
+  }
+  if (
+    activeTargetedPostInvocationToken &&
+    !isSameTargetedPostInvocationToken(
+      activeTargetedPostInvocationToken,
+      runnerToken,
+    )
+  ) {
+    return;
+  }
+  if (!activeTargetedPostInvocationToken) {
+    activateTargetedPostInvocation(runnerToken);
+  }
+  targetedPostRunState = request;
+  renderCaptureDebugSession(getCurrentRuntime() || {});
+  if (request?.cancelRequested === true) {
+    targetedPostCancelRequested = true;
+    batchUrlCancelRequested = true;
+    if (
+      activeBatchRunnerTabId &&
+      isSameTargetedPostInvocationToken(
+        targetedPostRunnerTabOwnerToken,
+        runnerToken,
+      )
+    ) {
+      void requestCaptureCancelSignal(activeBatchRunnerTabId).catch(
+        (error) => {
+          console.warn(
+            "[Sidebar] Targeted post cancellation signal failed:",
+            error,
+          );
+        },
+      );
+    }
+  }
+}
+
+function resolveTargetedPostRunBinding(
+  response,
+  requestId = "",
+  attemptId = "",
+) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  if (!normalizedAttemptId) {
+    return {
+      accepted: false,
+      reason: "targeted_post_attempt_required",
+      request: null,
+    };
+  }
+
+  if (!response?.ok || response?.accepted === false) {
+    return {
+      accepted: false,
+      reason: String(
+        response?.reason || "targeted_post_run_binding_rejected",
+      ),
+      request: null,
+    };
+  }
+
+  const request =
+    response?.data && typeof response.data === "object"
+      ? response.data
+      : null;
+  if (
+    !request ||
+    String(request.id || "").trim() !== normalizedRequestId ||
+    String(request.attemptId || "").trim() !== normalizedAttemptId
+  ) {
+    return {
+      accepted: false,
+      reason: "stale_targeted_post_attempt",
+      request: null,
+    };
+  }
+
+  return {accepted: true, reason: "", request};
+}
+
+function stopTargetedPostRunnerForInvalidBinding(reason = "") {
+  const normalizedReason = String(reason || "").trim();
+  if (targetedPostRunBindingStopReason === normalizedReason) {
+    return;
+  }
+  targetedPostRunBindingStopReason = normalizedReason;
+  const message =
+    normalizedReason === "targeted_post_attempt_required"
+      ? "定向作品任务链接缺少运行批次，已停止执行"
+      : "当前定向作品任务运行批次已失效，旧页面已停止执行";
+  console.warn("[Sidebar] Targeted post runner stopped:", normalizedReason);
+  showMessage(message, "warning");
+}
+
 async function loadTargetedPostRunStateForDisplay() {
   try {
+    const requestId = getTargetedPostRunRequestIdFromUrl();
+    const attemptId = getTargetedPostRunAttemptIdFromUrl();
+    const invocationToken = createTargetedPostInvocationToken(
+      requestId,
+      attemptId,
+    );
+    if (requestId && !attemptId) {
+      targetedPostRunState = null;
+      stopTargetedPostRunnerForInvalidBinding(
+        "targeted_post_attempt_required",
+      );
+      renderCaptureDebugSession(getCurrentRuntime() || {});
+      return null;
+    }
+
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:get-targeted-post-run-state",
+      ...(requestId ? {requestId, attemptId} : {}),
     });
-    targetedPostRunState =
-      response?.ok && response.data && typeof response.data === "object"
-        ? response.data
-        : null;
+    if (requestId) {
+      const binding = resolveTargetedPostRunBinding(
+        response,
+        requestId,
+        attemptId,
+      );
+      if (!binding.accepted) {
+        targetedPostRunState = null;
+        stopTargetedPostRunnerForInvalidBinding(binding.reason);
+        renderCaptureDebugSession(getCurrentRuntime() || {});
+        return null;
+      }
+      if (
+        activeTargetedPostInvocationToken &&
+        !isSameTargetedPostInvocationToken(
+          activeTargetedPostInvocationToken,
+          invocationToken,
+        )
+      ) {
+        stopTargetedPostRunnerForInvalidBinding(
+          "stale_targeted_post_attempt",
+        );
+        return null;
+      }
+      if (!activeTargetedPostInvocationToken) {
+        activateTargetedPostInvocation(invocationToken);
+      }
+      if (!isActiveTargetedPostInvocation(invocationToken)) {
+        return null;
+      }
+      targetedPostRunState = binding.request;
+    } else {
+      targetedPostRunState =
+        response?.ok && response.data && typeof response.data === "object"
+          ? response.data
+          : null;
+    }
     renderCaptureDebugSession(getCurrentRuntime() || {});
     return targetedPostRunState;
   } catch (error) {
@@ -15392,27 +15653,54 @@ async function loadTargetedPostRunStateForDisplay() {
   }
 }
 
-async function updateTargetedPostRun(request, patch = {}) {
+async function updateTargetedPostRun(
+  request,
+  patch = {},
+  invocationToken = null,
+) {
+  const requestToken = getTargetedPostInvocationTokenFromRequest(request);
+  if (!requestToken) {
+    throw createTargetedPostInvocationError(
+      "targeted_post_attempt_required",
+    );
+  }
+  if (
+    invocationToken &&
+    (!isSameTargetedPostInvocationToken(requestToken, invocationToken) ||
+      !isActiveTargetedPostInvocation(invocationToken))
+  ) {
+    throw createTargetedPostInvocationError();
+  }
   const response = await chrome.runtime.sendMessage({
     type: "onstarvoice:update-targeted-post-run",
-    requestId: String(request?.id || ""),
-    attemptId: String(request?.attemptId || ""),
+    requestId: requestToken.requestId,
+    attemptId: requestToken.attemptId,
     patch,
   });
-  if (!response?.ok || response?.accepted === false || !response.data) {
-    const error = new Error(
-      response?.reason === "stale_targeted_post_attempt"
-        ? "定向作品任务已由其他运行页接管"
-        : "定向作品任务状态更新失败",
-    );
+  if (invocationToken && !isActiveTargetedPostInvocation(invocationToken)) {
+    throw createTargetedPostInvocationError();
+  }
+  const binding = resolveTargetedPostRunBinding(
+    response,
+    requestToken.requestId,
+    requestToken.attemptId,
+  );
+  if (!binding.accepted) {
+    const error =
+      binding.reason === "stale_targeted_post_attempt"
+        ? createTargetedPostInvocationError(binding.reason)
+        : new Error("定向作品任务状态更新失败");
     error.code = String(
-      response?.reason || "TARGETED_POST_STATE_UPDATE_FAILED",
+      binding.reason || "TARGETED_POST_STATE_UPDATE_FAILED",
     );
     throw error;
   }
-  targetedPostRunState = response.data;
+  if (invocationToken && !isActiveTargetedPostInvocation(invocationToken)) {
+    throw createTargetedPostInvocationError();
+  }
+  targetedPostRunState = binding.request;
   renderCaptureDebugSession(getCurrentRuntime() || {});
-  return response.data;
+  return binding.request;
 }
 
 async function cancelTargetedPostRunFromSidebar(requestId = "") {
@@ -15428,6 +15716,22 @@ async function cancelTargetedPostRunFromSidebar(requestId = "") {
   }
   if (cloudTargetedPostApi?.isTerminalRunStatus(current.status)) {
     return true;
+  }
+  const currentToken = getTargetedPostInvocationTokenFromRequest(current);
+  if (!currentToken) {
+    return false;
+  }
+  const runnerRequestId = getTargetedPostRunRequestIdFromUrl();
+  const runnerToken = createTargetedPostInvocationToken(
+    runnerRequestId,
+    getTargetedPostRunAttemptIdFromUrl(),
+  );
+  if (
+    runnerRequestId &&
+    (!isSameTargetedPostInvocationToken(currentToken, runnerToken) ||
+      !isActiveTargetedPostInvocation(runnerToken))
+  ) {
+    return false;
   }
   targetedPostCancelRequested = true;
   batchUrlCancelRequested = true;
@@ -15453,8 +15757,15 @@ async function cancelTargetedPostRunFromSidebar(requestId = "") {
       String(current.status || "") === "pending"
         ? `${workflowLabel}已在执行前停止`
         : `正在停止${workflowLabel}并保留已有结果`,
-  });
-  if (activeBatchRunnerTabId) {
+  }, runnerRequestId ? runnerToken : null);
+  if (
+    activeBatchRunnerTabId &&
+    (!runnerRequestId ||
+      isSameTargetedPostInvocationToken(
+        targetedPostRunnerTabOwnerToken,
+        runnerToken,
+      ))
+  ) {
     await requestCaptureCancelSignal(activeBatchRunnerTabId).catch(
       (error) => {
         console.warn(
@@ -15465,6 +15776,23 @@ async function cancelTargetedPostRunFromSidebar(requestId = "") {
     );
   }
   return true;
+}
+
+async function confirmTargetedPostInvocationBinding(invocationToken) {
+  if (!isActiveTargetedPostInvocation(invocationToken)) {
+    return false;
+  }
+  const response = await chrome.runtime.sendMessage({
+    type: "onstarvoice:get-targeted-post-run-state",
+    requestId: invocationToken.requestId,
+    attemptId: invocationToken.attemptId,
+  });
+  const binding = resolveTargetedPostRunBinding(
+    response,
+    invocationToken.requestId,
+    invocationToken.attemptId,
+  );
+  return binding.accepted && isActiveTargetedPostInvocation(invocationToken);
 }
 
 async function settleTargetedPostRunnerTab(
@@ -15580,7 +15908,23 @@ function collectTargetedPostRecordIds(batchResult = {}) {
 
 async function maybeClaimAndRunTargetedPostWorkflow() {
   const requestId = getTargetedPostRunRequestIdFromUrl();
-  if (!requestId || targetedPostRunInFlight) {
+  if (!requestId) {
+    return;
+  }
+  const attemptId = getTargetedPostRunAttemptIdFromUrl();
+  const invocationToken = createTargetedPostInvocationToken(
+    requestId,
+    attemptId,
+  );
+  if (!invocationToken) {
+    targetedPostRunState = null;
+    stopTargetedPostRunnerForInvalidBinding(
+      "targeted_post_attempt_required",
+    );
+    renderCaptureDebugSession(getCurrentRuntime() || {});
+    return;
+  }
+  if (targetedPostRunInFlight) {
     return;
   }
   if (!cloudTargetedPostApi?.normalizeCommandPayload) {
@@ -15590,27 +15934,60 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
   const stateResponse = await chrome.runtime.sendMessage({
     type: "onstarvoice:get-targeted-post-run-state",
     requestId,
+    attemptId,
   });
-  let request = stateResponse?.data;
-  targetedPostRunState =
-    request && typeof request === "object" ? request : null;
+  const binding = resolveTargetedPostRunBinding(
+    stateResponse,
+    requestId,
+    attemptId,
+  );
+  if (!binding.accepted) {
+    targetedPostRunState = null;
+    stopTargetedPostRunnerForInvalidBinding(binding.reason);
+    renderCaptureDebugSession(getCurrentRuntime() || {});
+    return;
+  }
+  if (
+    activeTargetedPostInvocationToken &&
+    !isSameTargetedPostInvocationToken(
+      activeTargetedPostInvocationToken,
+      invocationToken,
+    )
+  ) {
+    stopTargetedPostRunnerForInvalidBinding(
+      "stale_targeted_post_attempt",
+    );
+    return;
+  }
+  if (!activeTargetedPostInvocationToken) {
+    activateTargetedPostInvocation(invocationToken);
+  }
+  if (!isActiveTargetedPostInvocation(invocationToken)) {
+    return;
+  }
+  let request = binding.request;
+  targetedPostRunBindingStopReason = "";
+  targetedPostRunState = request;
   renderCaptureDebugSession(getCurrentRuntime() || {});
   if (
-    !stateResponse?.ok ||
-    !request ||
-    request.id !== requestId ||
     cloudTargetedPostApi.isTerminalRunStatus(request.status)
   ) {
     return;
   }
 
   targetedPostRunInFlight = true;
+  targetedPostRunInFlightOwnerToken = invocationToken;
   targetedPostCancelRequested = request.cancelRequested === true;
   batchUrlCancelRequested = targetedPostCancelRequested;
   let executionLock = null;
   let targetTabId = null;
   const shouldStop = () =>
-    targetedPostCancelRequested || batchUrlCancelRequested;
+    !isActiveTargetedPostInvocation(invocationToken) ||
+    (isSameTargetedPostInvocationToken(
+      targetedPostRunInFlightOwnerToken,
+      invocationToken,
+    ) &&
+      (targetedPostCancelRequested || batchUrlCancelRequested));
   const targetedWorkflow = String(
     request.workflow || "negative_post_patrol",
   ).trim();
@@ -15635,7 +16012,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           message: "其他采集任务正在占用当前浏览器",
           retryable: true,
         },
-      });
+      }, invocationToken);
       return;
     }
     request = await updateTargetedPostRun(request, {
@@ -15645,7 +16022,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       message: isProfileDiscovery
         ? `正在逐个扫描${request.subjectType === "official" ? "官方账号" : "关注博主"}`
         : "正在逐条采集指定作品",
-    });
+    }, invocationToken);
 
     const settledItemIds = new Set(
       (Array.isArray(request.targetResults) ? request.targetResults : []).map(
@@ -15667,11 +16044,19 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
         throw error;
       }
       targetTabId = Number(targetTab.id);
+      if (!isActiveTargetedPostInvocation(invocationToken)) {
+        throw createTargetedPostInvocationError();
+      }
       activeBatchRunnerTabId = targetTabId;
+      targetedPostRunnerTabOwnerToken = invocationToken;
       await waitForTargetedPostRunnerTab(targetTabId, shouldStop);
     }
 
+    if (!isActiveTargetedPostInvocation(invocationToken)) {
+      throw createTargetedPostInvocationError();
+    }
     batchUrlCaptureInFlight = true;
+    targetedPostBatchStateOwnerToken = invocationToken;
     batchUrlCaptureMode = isProfileDiscovery
       ? "profile_discovery"
       : "targeted_posts";
@@ -15713,7 +16098,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
         message: isProfileDiscovery
           ? `正在打开第 ${target.ordinal}/${request.targets.length} 个账号主页`
           : `正在打开第 ${target.ordinal}/${request.targets.length} 条指定作品`,
-      });
+      }, invocationToken);
       let batchResult = null;
       let targetResult = null;
       if (isProfileDiscovery) {
@@ -15806,6 +16191,22 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
               captureSettings.commentsMaxDetectedItems || 50,
           },
           onProgress: (progress = {}) => {
+            if (!isActiveTargetedPostInvocation(invocationToken)) {
+              return;
+            }
+            const displayedToken =
+              getTargetedPostInvocationTokenFromRequest(
+                targetedPostRunState,
+              );
+            if (
+              displayedToken &&
+              !isSameTargetedPostInvocationToken(
+                displayedToken,
+                invocationToken,
+              )
+            ) {
+              return;
+            }
             const rawPhase = String(progress.phase || "capturing");
             const nextProgress = {
               ...(request?.progress && typeof request.progress === "object"
@@ -15839,6 +16240,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           },
           shouldStop,
         });
+        if (!isActiveTargetedPostInvocation(invocationToken)) {
+          throw createTargetedPostInvocationError();
+        }
         const localRecordIds = collectTargetedPostRecordIds(batchResult);
         const localRecords = await getRecords(localRecordIds);
         targetResult = cloudTargetedPostApi.buildTargetResult({
@@ -15897,6 +16301,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           }
         }
       }
+      if (!isActiveTargetedPostInvocation(invocationToken)) {
+        throw createTargetedPostInvocationError();
+      }
       targetResults.push(targetResult);
       const canceled =
         shouldStop() ||
@@ -15932,13 +16339,16 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
             : isProfileDiscovery
               ? `第 ${target.ordinal}/${request.targets.length} 个账号扫描已收口`
               : `第 ${target.ordinal}/${request.targets.length} 条指定作品已收口`,
-      });
+      }, invocationToken);
       targetResults = Array.isArray(request.targetResults)
         ? request.targetResults.slice()
         : targetResults;
       if (canceled) break;
     }
 
+    if (!isActiveTargetedPostInvocation(invocationToken)) {
+      throw createTargetedPostInvocationError();
+    }
     const checkpoint = cloudTargetedPostApi.buildCheckpoint(
       request.targets,
       targetResults,
@@ -15978,11 +16388,18 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
             : finalStatus === "canceled"
               ? `${workflowLabel}已停止，已保留 ${checkpoint.processedCount} 条结果`
               : `${workflowLabel}失败，共 ${checkpoint.failedCount} 条`,
-    });
+    }, invocationToken);
     await refreshDataPool();
   } catch (error) {
     console.error("[Sidebar] Targeted post workflow failed:", error);
-    if (request && !cloudTargetedPostApi.isTerminalRunStatus(request.status)) {
+    const staleInvocation =
+      String(error?.code || "") === "stale_targeted_post_attempt" ||
+      !isActiveTargetedPostInvocation(invocationToken);
+    if (
+      !staleInvocation &&
+      request &&
+      !cloudTargetedPostApi.isTerminalRunStatus(request.status)
+    ) {
       try {
         await updateTargetedPostRun(request, {
           status:
@@ -16007,7 +16424,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 "TARGET_URL_NOT_ALLOWED",
               ].includes(String(error?.code || "")),
           },
-        });
+        }, invocationToken);
       } catch (reportError) {
         console.error(
           "[Sidebar] Targeted post terminal report failed:",
@@ -16016,15 +16433,39 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       }
     }
   } finally {
-    batchUrlCaptureInFlight = false;
-    batchUrlCaptureMode = "";
-    batchUrlCancelRequested = false;
-    targetedPostCancelRequested = false;
-    targetedPostRunInFlight = false;
-    await settleTargetedPostRunnerTab(targetTabId, request?.platform, {
-      returnHome: String(request?.status || "") !== "needs_action",
-    });
-    activeBatchRunnerTabId = null;
+    const cleanupOwnership =
+      getTargetedPostInvocationOwnership(invocationToken);
+    if (
+      cleanupOwnership.active &&
+      cleanupOwnership.runnerTab &&
+      (await confirmTargetedPostInvocationBinding(invocationToken).catch(
+        () => false,
+      ))
+    ) {
+      await settleTargetedPostRunnerTab(targetTabId, request?.platform, {
+        returnHome: String(request?.status || "") !== "needs_action",
+      });
+    }
+    const latestOwnership =
+      getTargetedPostInvocationOwnership(invocationToken);
+    if (latestOwnership.batch) {
+      batchUrlCaptureInFlight = false;
+      batchUrlCaptureMode = "";
+      batchUrlCancelRequested = false;
+      targetedPostBatchStateOwnerToken = null;
+    }
+    if (latestOwnership.runnerTab) {
+      activeBatchRunnerTabId = null;
+      targetedPostRunnerTabOwnerToken = null;
+    }
+    if (latestOwnership.run) {
+      targetedPostCancelRequested = false;
+      targetedPostRunInFlight = false;
+      targetedPostRunInFlightOwnerToken = null;
+    }
+    if (latestOwnership.active) {
+      activeTargetedPostInvocationToken = null;
+    }
     if (executionLock) {
       await releaseCaptureExecutionLock(executionLock.id);
     }

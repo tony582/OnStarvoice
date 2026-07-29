@@ -29,6 +29,14 @@ const monitoringTab = await readFile(
   'utf8',
 );
 
+function sourceSection(source, start, end) {
+  const startIndex = source.indexOf(start);
+  assert.notEqual(startIndex, -1, `missing source section: ${start}`);
+  const endIndex = source.indexOf(end, startIndex + start.length);
+  assert.notEqual(endIndex, -1, `missing source section end: ${end}`);
+  return source.slice(startIndex, endIndex);
+}
+
 test('official comment patrol is mounted under capture-cloud', () => {
   assert.match(
     serverIndex,
@@ -167,25 +175,31 @@ test('official comment patrol rejects missing accounts, bad windows, and over-li
 });
 
 test('candidate selection is tenant-scoped, exact-account matched, dated, and URL-safe', () => {
-  assert.match(route, /oa\.tenant_id = r\.tenant_id/u);
-  assert.match(route, /r\.platform = oa\.platform/u);
-  assert.match(
+  const accountWhere = sourceSection(
     route,
+    'function officialAccountWhere',
+    'function publicCandidate',
+  );
+  assert.match(accountWhere, /r\.platform = oa\.platform/u);
+  assert.match(
+    accountWhere,
     /NULLIF\(BTRIM\(oa\.platform_user_id\), ''\) IS NOT NULL[\s\S]*r\.author_id = oa\.platform_user_id/u,
   );
   assert.match(
-    route,
+    accountWhere,
     /NULLIF\(BTRIM\(oa\.account_no\), ''\) IS NOT NULL[\s\S]*r\.author_account_no = oa\.account_no/u,
   );
   assert.match(
-    route,
+    accountWhere,
     /NULLIF\(BTRIM\(oa\.account_id\), ''\) IS NOT NULL[\s\S]*r\.author_id = oa\.account_id[\s\S]*r\.author_account_no = oa\.account_id/u,
   );
-  assert.match(route, /r\.author_name = oa\.account_name/u);
-  assert.match(route, /jsonb_array_elements_text/u);
-  assert.match(route, /r\.published_ts IS NOT NULL/u);
-  assert.doesNotMatch(route, /NULLIF\(BTRIM\(r\.publish_time\), ''\) IS NOT NULL/u);
-  assert.match(route, /AT TIME ZONE 'Asia\/Shanghai'/u);
+  assert.doesNotMatch(accountWhere, /author_name|jsonb_array_elements_text/u);
+  assert.match(accountWhere, /r\.published_ts IS NOT NULL/u);
+  assert.doesNotMatch(accountWhere, /NULLIF\(BTRIM\(r\.publish_time\), ''\) IS NOT NULL/u);
+  assert.match(accountWhere, /AT TIME ZONE 'Asia\/Shanghai'/u);
+  assert.match(route, /oa\.tenant_id = r\.tenant_id/u);
+  assert.match(route, /official_account_identity_required/u);
+  assert.match(route, /hasStrongOfficialIdentity\(account\)/u);
   assert.match(route, /negativePatrolTargetUrl\(row\)/u);
   assert.match(route, /filter\(Boolean\)/u);
   assert.match(route, /task\.task_type = '\$\{WORKFLOW\}'/u);
