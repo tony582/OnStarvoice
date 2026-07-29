@@ -249,6 +249,9 @@ test('timeline uses task baseline and result snapshot with UI-compatible fields'
   const timelineSql = calls[1];
   assert.match(timelineSql, /item\.error->>'message'/u);
   assert.doesNotMatch(timelineSql, /item\.error_message/u);
+  assert.match(timelineSql, /agent\.display_name/u);
+  assert.match(timelineSql, /agent\.client_label/u);
+  assert.doesNotMatch(timelineSql, /agent\.name/u);
   assert.equal(result.summary.patrolCount, 1);
   assert.equal(result.runs[0].agent_name, 'Chrome · macOS');
   assert.equal(result.runs[0].started_at, '2026-07-04T11:30:00.000Z');

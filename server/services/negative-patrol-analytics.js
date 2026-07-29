@@ -523,7 +523,12 @@ export async function getNegativePatrolPostTimeline({
       item.task_id,
       item.execution_task_id,
       item.assigned_agent_id AS agent_id,
-      agent.name AS agent_name,
+      COALESCE(
+        NULLIF(agent.display_name, ''),
+        NULLIF(agent.client_label, ''),
+        agent.id::text,
+        ''
+      ) AS agent_name,
       item.status,
       item.created_at,
       item.updated_at,
