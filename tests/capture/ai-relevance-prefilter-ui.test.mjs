@@ -255,6 +255,8 @@ test("task progress explains AI prefilter start, completion and per-item skips",
   assert.match(actionCopySection, /AI 正在判断搜索结果相关性/);
   assert.match(actionCopySection, /phase === "detail_ai_prefilter_done"/);
   assert.match(actionCopySection, /AI 筛选完成/);
+  assert.match(actionCopySection, /failedOpenCount/);
+  assert.match(actionCopySection, /超时或异常后继续采集/);
   assert.match(actionCopySection, /phase === "detail_item_filtered"/);
   assert.match(actionCopySection, /AI 已跳过/);
 });

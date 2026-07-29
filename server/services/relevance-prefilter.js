@@ -11,7 +11,7 @@ export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v2';
 export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
-export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 8000;
+export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 15000;
 export const PREFILTER_DEFAULT_TENANT_CONCURRENCY = 6;
 
 const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);

@@ -3469,6 +3469,9 @@ export async function batchCaptureDetailsForRecords(
     evaluatedCount: 0,
     skippedCount: 0,
     failedOpenCount: 0,
+    retryCount: 0,
+    retriedItemCount: 0,
+    timeoutCount: 0,
     skippedRecordIds: [],
     decisions: [],
     canceled: false,
@@ -3564,8 +3567,12 @@ export async function batchCaptureDetailsForRecords(
       await reportProgressFailSoft(onProgress, {
         phase: 'detail_ai_prefilter_done',
         message:
-          relevancePrefilterResult.skippedCount > 0
+          relevancePrefilterResult.failedOpenCount > 0
+            ? `AI 预判完成：${relevancePrefilterResult.failedOpenCount} 条超时或异常，已安全继续采集`
+            : relevancePrefilterResult.skippedCount > 0
             ? `AI 预判完成：高置信度跳过 ${relevancePrefilterResult.skippedCount} 条，其余继续采集`
+            : relevancePrefilterResult.retryCount > 0
+              ? `AI 预判完成：拆批重试 ${relevancePrefilterResult.retryCount} 次后完成，继续采集`
             : 'AI 预判完成：没有高置信度无关项，继续原采集流程',
         current: 0,
         total: uniqueRecordIds.length,
@@ -3573,6 +3580,9 @@ export async function batchCaptureDetailsForRecords(
         evaluatedCount: relevancePrefilterResult.evaluatedCount,
         aiFilteredCount: relevancePrefilterResult.skippedCount,
         failedOpenCount: relevancePrefilterResult.failedOpenCount,
+        retryCount: relevancePrefilterResult.retryCount,
+        retriedItemCount: relevancePrefilterResult.retriedItemCount,
+        timeoutCount: relevancePrefilterResult.timeoutCount,
       }, 'detail ai prefilter done');
     }
   }

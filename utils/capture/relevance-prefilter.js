@@ -12,8 +12,8 @@ export const RELEVANCE_PREFILTER_DEFAULT_THRESHOLD = 0.97;
 // DeepSeek handles smaller groups much more predictably. Keep each request
 // small enough to finish inside the extension's bounded wait while still
 // running the requests for one keyword in parallel.
-export const RELEVANCE_PREFILTER_BATCH_SIZE = 10;
-export const RELEVANCE_PREFILTER_TIMEOUT_MS = 10000;
+export const RELEVANCE_PREFILTER_BATCH_SIZE = 5;
+export const RELEVANCE_PREFILTER_TIMEOUT_MS = 20000;
 export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 6;
 
 const KEYWORD_RECORD_TYPE = 'keyword_notes';
@@ -262,6 +262,12 @@ function readResponseItems(response) {
   return [];
 }
 
+function isTimeoutLikeError(error) {
+  const text = `${error?.name || ''} ${error?.code || ''} ${error?.message || ''}`
+    .toLocaleLowerCase();
+  return text.includes('timeout') || text.includes('abort');
+}
+
 export function normalizeRelevancePrefilterDecision(
   raw = {},
   {threshold = RELEVANCE_PREFILTER_DEFAULT_THRESHOLD, canSkip = true} = {},
@@ -341,6 +347,9 @@ export async function evaluateRelevancePrefilterRecords(
     evaluatedCount: 0,
     skippedCount: 0,
     failedOpenCount: 0,
+    retryCount: 0,
+    retriedItemCount: 0,
+    timeoutCount: 0,
     ineligibleCount: Math.max(0, inputRecords.length - candidates.length),
     skippedRecordIds: [],
     decisions: [],
@@ -361,97 +370,134 @@ export async function evaluateRelevancePrefilterRecords(
 
   const normalizedThreshold = normalizeThreshold(threshold);
   const decisions = [];
+  let retryCount = 0;
+  let retriedItemCount = 0;
   const batchJobs = [...groups.values()].flatMap((groupCandidates) =>
     chunkItems(groupCandidates).map((batch, batchIndex) => ({batch, batchIndex})),
   );
+
+  const requestBatchOnce = async (
+    batch,
+    {batchIndex = 0, retryPart = 0} = {},
+  ) => {
+    if (isStopRequested(shouldStop)) {
+      return batch.map((candidate) => ({
+        ...candidate,
+        valid: false,
+        shouldSkip: false,
+        status: 'canceled',
+        modelDecision: null,
+        confidence: null,
+        executionDisposition: null,
+        reason: '任务已停止，AI 筛选安全放行',
+        evidence: [],
+      }));
+    }
+
+    const requestId = createRequestId();
+    const requestItems = batch.map((candidate) => candidate.evidence);
+    let response = null;
+    try {
+      response = await requestBatch(
+        {
+          requestId,
+          idempotencyKey: buildRelevancePrefilterIdempotencyKey({
+            requestId,
+            platform: batch[0].platform,
+            keyword: batch[0].keyword,
+            threshold: normalizedThreshold,
+            batchIndex: batchIndex * 10 + retryPart,
+            items: requestItems,
+          }),
+          platform: batch[0].platform,
+          stage: 'list',
+          keyword: batch[0].keyword,
+          promptVersion: 'prefilter-list-v2',
+          mode: 'conservative',
+          skipThreshold: normalizedThreshold,
+          items: requestItems,
+        },
+        {
+          timeout: timeoutMs,
+          shouldStop,
+        },
+      );
+    } catch (error) {
+      response = isTimeoutLikeError(error)
+        ? {
+            ok: false,
+            reason: 'timeout',
+            message: 'AI 判断等待超时，安全放行',
+          }
+        : null;
+    }
+
+    const responseItems = response?.ok ? readResponseItems(response) : [];
+    const responseByItemId = new Map();
+    responseItems.forEach((item) => {
+      const itemId = normalizeText(item?.itemId, 180);
+      if (!itemId || responseByItemId.has(itemId)) {
+        if (itemId) responseByItemId.set(itemId, null);
+        return;
+      }
+      responseByItemId.set(itemId, item);
+    });
+
+    return batch.map((candidate) => {
+      const raw = responseByItemId.get(candidate.itemId);
+      const decision = raw
+        ? normalizeRelevancePrefilterDecision(raw, {
+            threshold: normalizedThreshold,
+            canSkip: candidate.canSkip,
+          })
+        : {
+            valid: false,
+            shouldSkip: false,
+            status: response?.canceled
+              ? 'canceled'
+              : response?.reason === 'timeout'
+                ? 'timeout'
+                : 'model_error',
+            modelDecision: null,
+            confidence: null,
+            executionDisposition: null,
+            reason: normalizeText(
+              response?.message || 'AI 未返回有效判断，安全放行',
+              320,
+            ),
+            evidence: [],
+          };
+      return {...candidate, ...decision};
+    });
+  };
+
   await runWithConcurrency(
     batchJobs,
     async ({batch, batchIndex}) => {
-        if (isStopRequested(shouldStop)) {
-          batch.forEach((candidate) => {
-            decisions.push({
-              ...candidate,
-              valid: false,
-              shouldSkip: false,
-              status: 'canceled',
-              modelDecision: null,
-              confidence: null,
-              reason: '任务已停止，AI 筛选安全放行',
-              evidence: [],
-            });
-          });
-          return;
-        }
+      const initialDecisions = await requestBatchOnce(batch, {batchIndex});
+      const wholeBatchTimedOut =
+        batch.length > 1 &&
+        initialDecisions.length === batch.length &&
+        initialDecisions.every((decision) => decision.status === 'timeout');
+      if (!wholeBatchTimedOut || isStopRequested(shouldStop)) {
+        decisions.push(...initialDecisions);
+        return;
+      }
 
-        const requestId = createRequestId();
-        const requestItems = batch.map((candidate) => candidate.evidence);
-        let response = null;
-        try {
-          response = await requestBatch(
-            {
-              requestId,
-              idempotencyKey: buildRelevancePrefilterIdempotencyKey({
-                requestId,
-                platform: batch[0].platform,
-                keyword: batch[0].keyword,
-                threshold: normalizedThreshold,
-                batchIndex,
-                items: requestItems,
-              }),
-              platform: batch[0].platform,
-              stage: 'list',
-              keyword: batch[0].keyword,
-              promptVersion: 'prefilter-list-v2',
-              mode: 'conservative',
-              skipThreshold: normalizedThreshold,
-              items: requestItems,
-            },
-            {
-              timeout: timeoutMs,
-              shouldStop,
-            },
-          );
-        } catch {
-          response = null;
-        }
-
-        const responseItems = response?.ok ? readResponseItems(response) : [];
-        const responseByItemId = new Map();
-        responseItems.forEach((item) => {
-          const itemId = normalizeText(item?.itemId, 180);
-          if (!itemId || responseByItemId.has(itemId)) {
-            if (itemId) responseByItemId.set(itemId, null);
-            return;
-          }
-          responseByItemId.set(itemId, item);
-        });
-
-        batch.forEach((candidate) => {
-          const raw = responseByItemId.get(candidate.itemId);
-          const decision = raw
-            ? normalizeRelevancePrefilterDecision(raw, {
-                threshold: normalizedThreshold,
-                canSkip: candidate.canSkip,
-              })
-            : {
-                valid: false,
-                shouldSkip: false,
-                status: response?.canceled
-                  ? 'canceled'
-                  : response?.reason === 'timeout'
-                    ? 'timeout'
-                    : 'model_error',
-                modelDecision: null,
-                confidence: null,
-                executionDisposition: null,
-                reason: normalizeText(
-                  response?.message || 'AI 未返回有效判断，安全放行',
-                  320,
-                ),
-                evidence: [],
-              };
-          decisions.push({...candidate, ...decision});
-        });
+      const splitAt = Math.ceil(batch.length / 2);
+      const retryBatches = [batch.slice(0, splitAt), batch.slice(splitAt)].filter(
+        (retryBatch) => retryBatch.length > 0,
+      );
+      retriedItemCount += batch.length;
+      for (let retryPart = 0; retryPart < retryBatches.length; retryPart += 1) {
+        retryCount += 1;
+        decisions.push(
+          ...(await requestBatchOnce(retryBatches[retryPart], {
+            batchIndex,
+            retryPart: retryPart + 1,
+          })),
+        );
+      }
     },
   );
 
@@ -463,6 +509,10 @@ export async function evaluateRelevancePrefilterRecords(
     evaluatedCount: decisions.filter((decision) => decision.valid).length,
     skippedCount: skippedRecordIds.length,
     failedOpenCount: decisions.filter((decision) => !decision.valid).length,
+    retryCount,
+    retriedItemCount,
+    timeoutCount: decisions.filter((decision) => decision.status === 'timeout')
+      .length,
     skippedRecordIds: [...new Set(skippedRecordIds)],
     decisions,
     canceled: isStopRequested(shouldStop),

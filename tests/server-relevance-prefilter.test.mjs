@@ -75,7 +75,7 @@ test('list request validation is bounded, normalized and conservative-only for r
 
 test('invalid batch shapes are rejected before any model call', () => {
   assert.equal(PREFILTER_MAX_LIST_BATCH, 40);
-  assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 8000);
+  assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 15000);
   assert.equal(PREFILTER_DEFAULT_TENANT_CONCURRENCY, 6);
   assert.equal(validatePrefilterRequest(validBody({ items: [] })).error, 'ITEMS_REQUIRED');
   assert.equal(
