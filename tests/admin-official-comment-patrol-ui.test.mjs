@@ -16,6 +16,10 @@ const [
   monitoringTasksTab,
   taskCard,
   taskLib,
+  sidebar,
+  monitoringPage,
+  desktopApp,
+  mobileApp,
 ] = await Promise.all([
   load('web/admin/src/pages/dispatch/cloud-tasks/OfficialCommentPatrolTaskCreator.tsx'),
   load('web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx'),
@@ -25,16 +29,30 @@ const [
   load('web/admin/src/pages/monitoring/TasksTab.tsx'),
   load('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
   load('web/admin/src/pages/dispatch/cloud-tasks/lib.ts'),
+  load('web/admin/src/components/layout/Sidebar.tsx'),
+  load('web/admin/src/pages/MonitoringPage.tsx'),
+  load('web/admin/src/desktop/DesktopApp.tsx'),
+  load('web/admin/src/mobile/MobileApp.tsx'),
 ])
 
 test('official comment patrol is created directly from an account homepage', () => {
   assert.match(creator, /\/capture-cloud\/official-comment-patrol\/tasks/u)
-  assert.match(creator, /Agent 会打开账号主页，在指定日期范围内读取近期作品并采集当前可见评论/u)
-  assert.match(creator, /publishDateFrom/u)
-  assert.match(creator, /publishDateTo/u)
+  assert.match(creator, /Agent 会从账号主页按最新顺序读取你指定数量的作品/u)
+  assert.match(creator, /作品加载数量/u)
+  assert.match(creator, /每篇评论加载上限/u)
+  assert.match(creator, /const \[postsLimit, setPostsLimit\] = useState<number \| ''>\(''\)/u)
+  assert.match(creator, /const \[commentsLimit, setCommentsLimit\] = useState<number \| ''>\(''\)/u)
+  assert.match(creator, /max=\{100\}/u)
   assert.match(creator, /postsLimit/u)
   assert.match(creator, /commentsLimit/u)
+  assert.match(creator, /新作品会入库，已存在作品也会重新读取评论并补充更新/u)
+  assert.doesNotMatch(creator, /publishDateFrom|publishDateTo|发布时间范围/u)
   assert.doesNotMatch(creator, /candidates\/preview|recordIds|selectedIds|预览作品/u)
+})
+
+test('official comment patrol compatibility requires count-based account scanning', () => {
+  assert.match(creator, /officialAccountLatestPostsByCountV1/u)
+  assert.match(taskLib, /officialAccountLatestPostsByCountV1/u)
 })
 
 test('admin navigation no longer exposes an official discovery task', () => {
@@ -49,4 +67,84 @@ test('admin navigation no longer exposes an official discovery task', () => {
 test('legacy official discovery tasks remain readable', () => {
   assert.match(taskCard, /official_account_post_discovery/u)
   assert.match(taskCard, /官方账号作品发现/u)
+})
+
+test('official social navigation owns account management and comment patrol', () => {
+  assert.match(sidebar, /label: '官方社媒'/u)
+  assert.match(sidebar, /id: 'official-accounts', label: '官方账号管理'/u)
+  assert.match(sidebar, /id: 'official-comments', label: '评论巡查'/u)
+  assert.match(
+    sidebar,
+    /children: \[[\s\S]*id: 'official-comments'[\s\S]*id: 'official-accounts'[\s\S]*\]/u,
+  )
+  assert.match(
+    mobileApp,
+    /label: '官方社媒'[\s\S]*title: '评论巡查'[\s\S]*title: '官方账号管理'/u,
+  )
+  assert.match(desktopApp, /'official-comments': OfficialCommentPatrolTab/u)
+  assert.match(
+    desktopApp,
+    /page === 'official-comments'[\s\S]*\? 'pb-0 pt-0 xl:h-\[calc\(100dvh-3\.5rem\)\] xl:overflow-hidden'/u,
+  )
+  assert.doesNotMatch(monitoringPage, /官方账号评论巡查/u)
+})
+
+test('official comment workbench focuses on posts, engagement, and advice', () => {
+  assert.match(monitoringTab, /帖子信息/u)
+  assert.match(monitoringTab, /情感分布/u)
+  assert.match(monitoringTab, /互动数据/u)
+  assert.match(monitoringTab, /最近采集/u)
+  assert.match(monitoringTab, /label: '点赞'/u)
+  assert.match(monitoringTab, /label: '评论'/u)
+  assert.match(monitoringTab, /label: '转发'/u)
+  assert.match(monitoringTab, /EngagementTrend/u)
+  assert.match(monitoringTab, /较上次采集/u)
+  assert.match(monitoringTab, /负面评论/u)
+  assert.match(monitoringTab, /正面评论/u)
+  assert.match(monitoringTab, /建议：/u)
+  assert.doesNotMatch(monitoringTab, /本次巡查|上次巡查|相比上次巡查|较上次巡查|风险趋势|评论覆盖|本次新增/u)
+  assert.doesNotMatch(monitoringTab, /CommentActionButton|标记完成|delete_review|encourage_reply|manual_complete/u)
+  assert.doesNotMatch(monitoringTab, />帖子列表</u)
+  assert.doesNotMatch(monitoringTab, /CircleUserRound|authorAvatar/u)
+  assert.doesNotMatch(monitoringTab, /查看原帖/u)
+  assert.doesNotMatch(monitoringTab, /Sparkles/u)
+  assert.doesNotMatch(monitoringTab, /巡查新鲜度|近 7 天|巡查设置|立即巡查/u)
+  assert.match(monitoringTab, /aria-label="排序"/u)
+  assert.match(monitoringTab, /发帖时间：新到旧/u)
+  assert.match(monitoringTab, /最近采集时间：新到旧/u)
+  assert.match(monitoringTab, /发起巡查/u)
+  assert.match(
+    monitoringTab,
+    /<form onSubmit=\{submitSearch\}[\s\S]*aria-label="平台"[\s\S]*aria-label="官方账号"[\s\S]*aria-label="排序"/u,
+  )
+  assert.match(monitoringTab, /space-y-0 duration-300/u)
+  assert.match(monitoringTab, /border-b border-border\/70 py-4/u)
+  assert.match(monitoringTab, /flex shrink-0 gap-1 border-b border-border\/60 px-3/u)
+  assert.doesNotMatch(monitoringTab, /border-b border-border\/60 px-3 pt-2/u)
+})
+
+test('official comment workbench uses a dispatch-style split and complete list pagination', () => {
+  assert.match(
+    monitoringTab,
+    /xl:grid-cols-\[minmax\(0,3fr\)_minmax\(380px,2fr\)\]/u,
+  )
+  assert.match(monitoringTab, /xl:min-h-0 xl:flex-1/u)
+  assert.doesNotMatch(monitoringTab, /xl:h-\[calc\(100dvh-9\.5rem\)\]/u)
+  assert.match(monitoringTab, /xl:border-l xl:border-border\/70 xl:pl-4/u)
+  assert.match(monitoringTab, /workspace-scrollbar min-h-0 flex-1 overflow-y-auto/u)
+  assert.match(monitoringTab, /<thead className="sticky top-0 z-20 bg-card">/u)
+  assert.match(monitoringTab, /PAGE_SIZE_OPTIONS/u)
+  assert.match(monitoringTab, /getPaginationItems/u)
+  assert.match(monitoringTab, /aria-label="每页条数"/u)
+  assert.match(monitoringTab, /aria-label="跳转页码"/u)
+  assert.match(monitoringTab, /第 \{formatNumber\(pageStart\)\}–\{formatNumber\(pageEnd\)\} 条/u)
+  assert.match(monitoringTab, /lg:flex-row lg:items-center lg:justify-between/u)
+  assert.match(monitoringTab, /lg:flex-nowrap lg:justify-end/u)
+})
+
+test('every post surface provides a safe original-post link', () => {
+  assert.match(monitoringTab, /查看原文/u)
+  assert.match(monitoringTab, /target="_blank"/u)
+  assert.match(monitoringTab, /rel="noreferrer"/u)
+  assert.match(monitoringTab, /原文链接待补充/u)
 })

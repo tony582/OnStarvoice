@@ -744,8 +744,10 @@ export function agentTaskTypeBlockReason(
   if (taskType === 'negative_patrol' && agent.capabilities?.negativePostPatrol !== true) {
     return '客户端扩展版本过低，尚不支持负面帖子巡查'
   }
-  if (taskType === 'comment_patrol' && agent.capabilities?.officialAccountCommentPatrol !== true) {
-    return '客户端扩展版本过低，尚不支持官方账号评论巡查'
+  if (taskType === 'comment_patrol'
+    && (agent.capabilities?.officialAccountCommentPatrol !== true
+      || agent.capabilities?.officialAccountLatestPostsByCountV1 !== true)) {
+    return '客户端扩展版本过低，尚不支持按作品数量巡查官方账号'
   }
   return ''
 }

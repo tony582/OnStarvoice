@@ -171,6 +171,85 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
   );
 });
 
+test("targeted patrol heartbeat keeps long profile scans alive as business progress", async () => {
+  const heartbeatSection = readFunctionSection(
+    "function startTargetedPostRunHeartbeat(",
+    "async function cancelTargetedPostRunFromSidebar(",
+  );
+  const calls = [];
+  let intervalHandler = null;
+  let clearedTimer = null;
+  const token = {requestId: "task-1", attemptId: "attempt-1"};
+  const request = {
+    id: token.requestId,
+    attemptId: token.attemptId,
+    status: "running",
+    progress: {
+      phase: "target_profile_publish_date_verification",
+      current: 1,
+      total: 1,
+    },
+  };
+  const context = {
+    TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS: 20_000,
+    setInterval: (handler, intervalMs) => {
+      intervalHandler = handler;
+      assert.equal(intervalMs, 20_000);
+      return 91;
+    },
+    clearInterval: (timer) => {
+      clearedTimer = timer;
+    },
+    isActiveTargetedPostInvocation: () => true,
+    getTargetedPostInvocationTokenFromRequest: (value) => ({
+      requestId: value.id,
+      attemptId: value.attemptId,
+    }),
+    isSameTargetedPostInvocationToken: (left, right) =>
+      left?.requestId === right?.requestId &&
+      left?.attemptId === right?.attemptId,
+    cloudTargetedPostApi: {
+      isTerminalRunStatus: (status) =>
+        ["completed", "failed", "canceled"].includes(status),
+    },
+    updateTargetedPostRun: async (...args) => {
+      calls.push(args);
+    },
+    console,
+  };
+  vm.runInNewContext(
+    `${heartbeatSection}
+globalThis.__startTargetedPostRunHeartbeat = startTargetedPostRunHeartbeat;`,
+    context,
+  );
+
+  const stop = context.__startTargetedPostRunHeartbeat(
+    token,
+    () => request,
+  );
+  intervalHandler();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], request);
+  assert.equal(calls[0][2], token);
+  assert.equal(
+    calls[0][1].heartbeatAt,
+    calls[0][1].businessProgressAt,
+  );
+  assert.equal(
+    calls[0][1].progress.updatedAt,
+    calls[0][1].heartbeatAt,
+  );
+  assert.equal(
+    calls[0][1].progress.phase,
+    "target_profile_publish_date_verification",
+  );
+
+  stop();
+  assert.equal(clearedTimer, 91);
+});
+
 test("targeted runner is fenced by its URL attempt before adopting cloud state", () => {
   assert.match(
     sidebarSource,

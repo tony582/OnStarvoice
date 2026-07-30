@@ -3,17 +3,14 @@ import { useNav } from '@/lib/navigation'
 import { WorkbenchTabs } from '@/components/shared/Workbench'
 import { MonitorTasksTab } from '@/pages/monitoring/TasksTab'
 import { MonitorHitsTab } from '@/pages/monitoring/HitsTab'
-import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
 
-type Tab = 'tasks' | 'hits' | 'official-comments'
+type Tab = 'tasks' | 'hits'
 
 export function MonitoringPage() {
   const { params, navigate } = useNav()
   const initialTab: Tab = params?.tab === 'hits'
     ? 'hits'
-    : params?.tab === 'official-comments'
-      ? 'official-comments'
-      : 'tasks'
+    : 'tasks'
   const [tab, setTab] = useState<Tab>(initialTab)
   // hits 的一次性预置:导航带来的(tab=hits)或从任务行"查看命中"带来的 subscriptionId
   const [hitsInitial, setHitsInitial] = useState<Record<string, string> | undefined>(
@@ -23,6 +20,7 @@ export function MonitoringPage() {
   // 老入口(monitoring?tab=cloud)兼容:采集任务已独立为一级模块「调度中心」
   useEffect(() => {
     if (params?.tab === 'cloud') navigate('dispatch')
+    if (params?.tab === 'official-comments') navigate('official-comments')
   }, [params?.tab, navigate])
 
   const viewHits = (subscriptionId: string) => {
@@ -30,7 +28,7 @@ export function MonitoringPage() {
     setTab('hits')
   }
 
-  if (params?.tab === 'cloud') return null
+  if (params?.tab === 'cloud' || params?.tab === 'official-comments') return null
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
@@ -38,14 +36,12 @@ export function MonitoringPage() {
         tabs={[
           { key: 'tasks', label: '关注的博主' },
           { key: 'hits', label: '博主新动态' },
-          { key: 'official-comments', label: '官方账号评论巡查' },
         ]}
         activeKey={tab}
         onChange={key => setTab(key as Tab)}
       />
       {tab === 'tasks' && <MonitorTasksTab onViewHits={viewHits} />}
       {tab === 'hits' && <MonitorHitsTab key={hitsInitial?.subscriptionId || 'all'} initial={hitsInitial} />}
-      {tab === 'official-comments' && <OfficialCommentPatrolTab />}
     </div>
   )
 }
