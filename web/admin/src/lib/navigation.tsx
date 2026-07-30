@@ -22,7 +22,7 @@ export const WORKSPACE_HOME: Record<Workspace, string> = {
 /** 页面 → 所属工作区(导航到他面页面会自动切面;未列出的=管理页,留在当前面) */
 export const PAGE_WORKSPACE: Record<string, Workspace> = {
   overview: 'opinion', workbench: 'opinion', monitoring: 'opinion', dispatch: 'opinion',
-  'social-accounts': 'opinion',
+  'social-accounts': 'opinion', 'official-accounts': 'opinion', 'official-comments': 'opinion',
   insights: 'opinion', data: 'opinion', events: 'opinion',
   'opinion-analysis': 'opinion',
   'content-home': 'content', tracks: 'content', hits: 'content',
@@ -36,6 +36,7 @@ export const LEGACY_PAGE_MAP: Record<string, { page: string; params?: PageParams
   issues: { page: 'workbench', params: { queue: 'issues' } },
   monitor: { page: 'monitoring', params: { tab: 'tasks' } },
   'monitor-hits': { page: 'monitoring', params: { tab: 'hits' } },
+  'official-comment-patrol': { page: 'official-comments' },
   analytics: { page: 'insights', params: { tab: 'dashboard' } },
   reports: { page: 'insights', params: { tab: 'reports' } },
 }

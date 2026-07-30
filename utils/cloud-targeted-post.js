@@ -270,6 +270,8 @@
         source.enableCommentLeadsFilterOnDetailCapture === true,
       verifyPublishDateFromDetail:
         source.verifyPublishDateFromDetail === true,
+      scanLatestPostsByCount:
+        source.scanLatestPostsByCount === true,
       skipAlreadyCapturedOnDetailCapture:
         source.skipAlreadyCapturedOnDetailCapture !== false,
       commentsMaxDetectedItems:

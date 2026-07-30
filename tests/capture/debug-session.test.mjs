@@ -262,6 +262,78 @@ test("Chrome Cancel or DevTools detach clears ownership and cancels capture", as
   assert.equal(unexpected[0].session.runId, "external-detach");
 });
 
+test("target_closed reattaches a nonpersistent list capture on the same live tab", async () => {
+  const debuggerApi = createDebuggerDouble({emitDetachOnStop: false});
+  const unexpected = [];
+  let replacementTimeout = null;
+  const manager = createManager({
+    debuggerApi,
+    onUnexpectedDetach: (event) => unexpected.push(event),
+    setTimeoutFn(handler) {
+      replacementTimeout = handler;
+      return 1;
+    },
+    clearTimeoutFn() {
+      replacementTimeout = null;
+    },
+  });
+  await manager.start({
+    tabId: 30,
+    runId: "list-capture:transient-target-closed",
+  });
+
+  debuggerApi.emitDetach(30, "target_closed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(unexpected.length, 0);
+  assert.equal(typeof replacementTimeout, "function");
+  assert.equal(manager.getSession(30).state, "attached");
+
+  replacementTimeout();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(unexpected.length, 0);
+  assert.equal(manager.getSession(30).state, "attached");
+  assert.equal(
+    debuggerApi.calls.filter(([type]) => type === "attach").length,
+    2,
+  );
+});
+
+test("target_closed releases only debug ownership when a nonpersistent list reattach fails", async () => {
+  const debuggerApi = createDebuggerDouble({
+    emitDetachOnStop: false,
+    attachErrors: [null, new Error("target no longer exists")],
+  });
+  const unexpected = [];
+  let replacementTimeout = null;
+  const manager = createManager({
+    debuggerApi,
+    onUnexpectedDetach: (event) => unexpected.push(event),
+    setTimeoutFn(handler) {
+      replacementTimeout = handler;
+      return 1;
+    },
+    clearTimeoutFn() {
+      replacementTimeout = null;
+    },
+  });
+  await manager.start({
+    tabId: 35,
+    runId: "list-capture:closed-target",
+  });
+
+  debuggerApi.emitDetach(35, "target_closed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(unexpected.length, 0);
+
+  replacementTimeout();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(unexpected.length, 0);
+  assert.equal(manager.getSession(35), null);
+});
+
 test("persistent native detach keeps a recovery snapshot until ordered cleanup finishes", async () => {
   const debuggerApi = createDebuggerDouble({emitDetachOnStop: false});
   let manager;

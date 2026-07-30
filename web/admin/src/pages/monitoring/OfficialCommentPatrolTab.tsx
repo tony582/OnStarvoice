@@ -1,54 +1,235 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { CalendarDays, ChevronRight, Loader2, MessageCircle, RefreshCw, ShieldCheck, UserRoundPlus } from 'lucide-react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type KeyboardEvent,
+} from 'react'
+import {
+  ArrowDownRight,
+  ArrowUpRight,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ExternalLink,
+  Heart,
+  Loader2,
+  MessageCircle,
+  Minus,
+  Search,
+  Share2,
+  ShieldAlert,
+  ThumbsUp,
+  X,
+} from 'lucide-react'
 import { api } from '@/lib/api'
+import { useAuth } from '@/lib/auth'
 import { useNav } from '@/lib/navigation'
-import { formatDate, formatNumber, platformName } from '@/lib/utils'
+import { cn, formatNumber, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { StatusBadge, StatusDot } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
+import { StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { WorkbenchTableShell } from '@/components/shared/Workbench'
 import { OfficialAccountRegistrationDrawer } from './OfficialAccountRegistrationDrawer'
+
+type Sentiment = {
+  total: number
+  positive: number
+  neutral: number
+  negative: number
+  unknown: number
+  negativeRate: number
+}
 
 type PatrolPost = {
   id: string
-  title?: string
-  content?: string
-  url?: string
-  publishTime?: string
-  publishedAt?: string
-  commentsCount?: number
-  comments_count?: number
-  commentsSampled?: number
-  commentsCaptured?: number
-  riskCommentCount?: number
-  negativeComments?: number
-  lastPatrolAt?: string
-  lastPatrolledAt?: string
-  patrolStatus?: string
-  status?: string
-}
-
-type PatrolAccount = {
-  id: string
-  accountName?: string
-  name?: string
+  title: string
+  url: string
   platform: string
-  profileUrl?: string
-  recentPosts?: PatrolPost[]
-  posts?: PatrolPost[]
-  recentPostCount?: number
-  lastPatrolAt?: string
-  lastPatrolledAt?: string
-  lastPatrolStatus?: string
-  patrolStatus?: string
-  riskCommentCount?: number
-  negativeComments?: number
+  externalId: string
+  publishedAt?: string | null
+  publishTime?: string
+  officialAccount: {
+    id: string
+    name: string
+    platform?: string
+  }
+  coverage: {
+    platformComments: number
+    sampledComments: number
+    percent: number | null
+    note?: string
+  }
+  engagement: {
+    likes: number
+    comments: number
+    shares: number
+    trend?: {
+      likes: number
+      comments: number
+      shares: number
+      capturedAt?: string | null
+    } | null
+  }
+  sentiment: Sentiment
+  previousSentiment?: Sentiment | null
+  delta?: {
+    comments: number
+    negative: number
+    positive: number
+    negativeRate: number
+  } | null
+  riskTrend: 'rising' | 'stable' | 'falling' | 'baseline'
+  todos: {
+    negative: number
+    positive: number
+  }
+  lastPatrolledAt?: string | null
+  previousPatrolledAt?: string | null
+  patrolStatus: string
 }
 
-type AccountResponse = {
-  accounts?: PatrolAccount[]
-  items?: PatrolAccount[]
-  data?: { accounts?: PatrolAccount[]; items?: PatrolAccount[] }
+type WorkbenchResponse = {
+  ok: boolean
+  sort: PostSort
+  accounts: Array<{ id: string; name: string; platform: string }>
+  comparison: {
+    scope: string
+    baselineOnly: boolean
+    comparedPosts: number
+    latestPatrolledAt?: string | null
+    previousPatrolledAt?: string | null
+    newComments: number
+    newNegative: number
+    negativeComments: number
+    positiveComments: number
+    negativePending: number
+    positivePending: number
+    riskRisingPosts: number
+  }
+  posts: PatrolPost[]
+  pagination: {
+    page: number
+    pageSize: number
+    total: number
+    totalPages: number
+  }
+  message?: string
+}
+
+type CommentAction = {
+  id: string
+  action_type: string
+  status: string
+  note?: string
+  actor_name?: string
+  completed_at?: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+type PatrolComment = {
+  id: string
+  authorName: string
+  content: string
+  likeCount: number
+  publishedAt?: string | null
+  ipLocation?: string
+  sentiment: string
+  isNegative: boolean
+  riskLevel: string
+  category?: string
+  summary?: string
+  firstSeenAt?: string | null
+  lastSeenAt?: string | null
+  isNewSincePrevious: boolean
+  leadId?: string | null
+  actions: CommentAction[]
+}
+
+type CommentBucket = 'negative' | 'positive' | 'all'
+
+type PostCommentsResponse = {
+  ok: boolean
+  post: {
+    id: string
+    title: string
+    url: string
+    platform: string
+    publishedAt?: string | null
+    officialAccount: { id: string; name: string }
+  }
+  bucket: CommentBucket
+  counts: {
+    all: number
+    negative: number
+    positive: number
+    negativePending: number
+    positivePending: number
+  }
+  comparison: {
+    latestPatrolledAt?: string | null
+    previousPatrolledAt?: string | null
+    baselineOnly: boolean
+  }
+  comments: PatrolComment[]
+  pagination: {
+    page: number
+    pageSize: number
+    total: number
+    totalPages: number
+  }
+}
+
+type PostSort = 'published_desc' | 'collected_desc'
+
+type Filters = {
+  platform: string
+  officialAccountId: string
+  sort: PostSort
+}
+
+const INITIAL_FILTERS: Filters = {
+  platform: '',
+  officialAccountId: '',
+  sort: 'published_desc',
+}
+
+const PAGE_SIZE_OPTIONS = [20, 30, 50] as const
+
+function getPaginationItems(
+  currentPage: number,
+  totalPages: number,
+): Array<number | 'ellipsis'> {
+  if (totalPages <= 7) {
+    return Array.from({length: totalPages}, (_, index) => index + 1)
+  }
+  if (currentPage <= 4) return [1, 2, 3, 4, 5, 'ellipsis', totalPages]
+  if (currentPage >= totalPages - 3) {
+    return [
+      1,
+      'ellipsis',
+      totalPages - 4,
+      totalPages - 3,
+      totalPages - 2,
+      totalPages - 1,
+      totalPages,
+    ]
+  }
+  return [
+    1,
+    'ellipsis',
+    currentPage - 1,
+    currentPage,
+    currentPage + 1,
+    'ellipsis',
+    totalPages,
+  ]
+}
+
+function isPreviewMode() {
+  if (!import.meta.env.DEV) return false
+  return new URLSearchParams(window.location.search).get('preview') === 'official-comment-ops'
 }
 
 function safeNumber(value: unknown) {
@@ -56,164 +237,364 @@ function safeNumber(value: unknown) {
   return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0
 }
 
-function accountName(account: PatrolAccount) {
-  return account.accountName || account.name || '未命名官方账号'
+function formatDateTime(value?: string | null) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
 }
 
-function postsOf(account: PatrolAccount) {
-  return account.recentPosts || account.posts || []
+function formatPublish(value?: string | null, fallback = '') {
+  if (value) return formatDateTime(value)
+  return fallback || '—'
 }
 
-function postPublishTime(post: PatrolPost) {
-  return post.publishedAt || post.publishTime || ''
+function comparableDate(value?: string | null) {
+  const timestamp = value ? Date.parse(value) : Number.NaN
+  return Number.isFinite(timestamp) ? timestamp : null
 }
 
-function lastPatrol(account: PatrolAccount) {
-  return account.lastPatrolAt || account.lastPatrolledAt || ''
+function compareDateDesc(
+  leftValue?: string | null,
+  rightValue?: string | null,
+) {
+  const left = comparableDate(leftValue)
+  const right = comparableDate(rightValue)
+  if (left === null && right === null) return 0
+  if (left === null) return 1
+  if (right === null) return -1
+  return right - left
 }
 
-function riskCount(account: PatrolAccount) {
-  return safeNumber(account.riskCommentCount ?? account.negativeComments)
+function comparePosts(left: PatrolPost, right: PatrolPost, sort: PostSort) {
+  const primary = sort === 'collected_desc'
+    ? compareDateDesc(left.lastPatrolledAt, right.lastPatrolledAt)
+    : compareDateDesc(left.publishedAt, right.publishedAt)
+  if (primary !== 0) return primary
+  const published = compareDateDesc(left.publishedAt, right.publishedAt)
+  if (published !== 0) return published
+  return left.id.localeCompare(right.id)
 }
 
-function postRiskCount(post: PatrolPost) {
-  return safeNumber(post.riskCommentCount ?? post.negativeComments)
+function platformBadgeClass(platform: string) {
+  return platform === 'xiaohongshu'
+    ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-300'
+    : 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
 }
 
-function sampledCount(post: PatrolPost) {
-  return safeNumber(post.commentsSampled ?? post.commentsCaptured)
-}
-
-function patrolStatusLabel(status?: string) {
-  const normalized = String(status || '').toLowerCase()
-  if (['completed', 'succeeded', 'success'].includes(normalized)) return { label: '已巡查', tone: 'active' as const }
-  if (normalized === 'completed_with_warnings') return { label: '部分完成', tone: 'negative' as const }
-  if (normalized === 'sampled') return { label: '已有样本', tone: 'active' as const }
-  if (['failed', 'needs_action', 'attention', 'retryable'].includes(normalized)) return { label: '需处理', tone: 'negative' as const }
-  if (['claimed', 'running', 'recovering', 'resume_requested'].includes(normalized)) return { label: '巡查中', tone: 'neutral' as const }
-  if (['pending', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device', 'queued'].includes(normalized)) return { label: '待执行', tone: 'neutral' as const }
-  if (normalized === 'canceled') return { label: '已取消', tone: 'muted' as const }
-  if (normalized === 'skipped') return { label: '已跳过', tone: 'muted' as const }
-  return { label: '未巡查', tone: 'muted' as const }
-}
-
-function postPatrolStatus(post: PatrolPost) {
-  const explicitStatus = String(post.patrolStatus || post.status || '').trim()
-  if (!explicitStatus && sampledCount(post) > 0) return { label: '已有样本', tone: 'active' as const }
-  return patrolStatusLabel(explicitStatus)
+function clonePreview<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
 }
 
 export function OfficialCommentPatrolTab() {
   const { navigate } = useNav()
-  const [accounts, setAccounts] = useState<PatrolAccount[]>([])
+  const { canWrite } = useAuth()
+  const previewMode = isPreviewMode()
+  const [filters, setFilters] = useState<Filters>(INITIAL_FILTERS)
+  const [searchDraft, setSearchDraft] = useState('')
+  const [search, setSearch] = useState('')
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
+  const [data, setData] = useState<WorkbenchResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [selectedPostId, setSelectedPostId] = useState('')
+  const [bucket, setBucket] = useState<CommentBucket>('negative')
+  const [detail, setDetail] = useState<PostCommentsResponse | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState('')
   const [registrationOpen, setRegistrationOpen] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      const result = await api.get<AccountResponse>('/capture-cloud/official-comment-patrol/accounts?range=7d')
-      const rows = result.accounts || result.items || result.data?.accounts || result.data?.items || []
-      setAccounts(rows.filter(row => row && typeof row.id === 'string'))
+      let response: WorkbenchResponse
+      if (previewMode) {
+        const module = await import('./officialCommentPatrolPreview')
+        response = clonePreview(module.previewWorkbench) as WorkbenchResponse
+        const filteredPosts = response.posts.filter(post => {
+          if (filters.platform && post.platform !== filters.platform) return false
+          if (
+            filters.officialAccountId &&
+            post.officialAccount.id !== filters.officialAccountId
+          ) return false
+          if (
+            search &&
+            !`${post.title} ${post.officialAccount.name}`
+              .toLowerCase()
+              .includes(search.toLowerCase())
+          ) return false
+          return true
+        })
+        const sortedPosts = [...filteredPosts].sort(
+          (left, right) => comparePosts(left, right, filters.sort),
+        )
+        const total = sortedPosts.length
+        const totalPages = Math.max(1, Math.ceil(total / pageSize))
+        const effectivePage = Math.min(page, totalPages)
+        const offset = (effectivePage - 1) * pageSize
+        response.sort = filters.sort
+        response.posts = sortedPosts.slice(offset, offset + pageSize)
+        response.pagination = {
+          page: effectivePage,
+          pageSize,
+          total,
+          totalPages,
+        }
+      } else {
+        const params = new URLSearchParams({
+          sort: filters.sort,
+          page: String(page),
+          pageSize: String(pageSize),
+        })
+        if (filters.platform) params.set('platform', filters.platform)
+        if (filters.officialAccountId) {
+          params.set('officialAccountId', filters.officialAccountId)
+        }
+        if (search) params.set('search', search)
+        response = await api.get<WorkbenchResponse>(
+          `/capture-cloud/official-comment-patrol/workbench?${params.toString()}`,
+        )
+      }
+      setData(response)
+      setSelectedPostId(current => {
+        if (response.posts.some(post => post.id === current)) return current
+        return response.posts[0]?.id || ''
+      })
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : '读取官方账号巡查数据失败')
-      setAccounts([])
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : '读取评论巡查数据失败',
+      )
+      setData(null)
+      setSelectedPostId('')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [filters, page, pageSize, previewMode, search])
 
   useEffect(() => {
-    let active = true
-    queueMicrotask(() => {
-      if (active) void load()
-    })
-    return () => { active = false }
+    const timer = window.setTimeout(() => void load(), 0)
+    return () => window.clearTimeout(timer)
   }, [load])
 
-  const totals = useMemo(() => ({
-    accounts: accounts.length,
-    posts: accounts.reduce((total, account) => total + Math.max(postsOf(account).length, safeNumber(account.recentPostCount)), 0),
-    risk: accounts.reduce((total, account) => total + riskCount(account), 0),
-  }), [accounts])
+  const loadDetail = useCallback(async () => {
+    if (!selectedPostId) {
+      setDetail(null)
+      return
+    }
+    setDetail(null)
+    setDetailLoading(true)
+    setDetailError('')
+    try {
+      if (previewMode) {
+        const module = await import('./officialCommentPatrolPreview')
+        setDetail(
+          clonePreview(
+            module.previewPostComments(bucket, selectedPostId),
+          ) as PostCommentsResponse,
+        )
+      } else {
+        const response = await api.get<PostCommentsResponse>(
+          `/capture-cloud/official-comment-patrol/posts/${selectedPostId}/comments?bucket=${bucket}&pageSize=20`,
+        )
+        setDetail(response)
+      }
+    } catch (requestError) {
+      setDetailError(
+        requestError instanceof Error
+          ? requestError.message
+          : '读取帖子评论失败',
+      )
+      setDetail(null)
+    } finally {
+      setDetailLoading(false)
+    }
+  }, [bucket, previewMode, selectedPostId])
 
-  const createTask = (officialAccountId = '') => navigate('dispatch', {
-    create: 'comment_patrol',
-    ...(officialAccountId ? { officialAccountId } : {}),
-  })
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadDetail(), 0)
+    return () => window.clearTimeout(timer)
+  }, [loadDetail])
+
+  const selectedPost = useMemo(
+    () => data?.posts.find(post => post.id === selectedPostId) || null,
+    [data?.posts, selectedPostId],
+  )
+
+  const updateFilter = <K extends keyof Filters>(key: K, value: Filters[K]) => {
+    setFilters(current => ({...current, [key]: value}))
+    setPage(1)
+  }
+
+  const submitSearch = (event: React.FormEvent) => {
+    event.preventDefault()
+    setSearch(searchDraft.trim())
+    setPage(1)
+  }
+
+  const createTask = (officialAccountId = '') => {
+    navigate('dispatch', {
+      create: 'comment_patrol',
+      ...(officialAccountId ? {officialAccountId} : {}),
+    })
+  }
 
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
-      <section className="rounded-2xl border border-border/70 bg-card px-4 py-4 shadow-xs sm:px-5">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2"><MessageCircle className="h-4 w-4 text-primary" /><h2 className="text-base font-bold">官方账号评论巡查</h2></div>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">从官方账号主页读取指定时间内的作品与评论；任务创建、分配与重试统一在调度中心完成。</p>
+    <div className="animate-in fade-in slide-in-from-bottom-2 space-y-0 duration-300 xl:flex xl:h-full xl:flex-col">
+      <section className="shrink-0 border-b border-border/70 py-4">
+        <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center">
+          <form onSubmit={submitSearch} className="relative min-w-[260px] flex-1">
+            <input
+              aria-label="搜索帖子"
+              value={searchDraft}
+              onChange={event => setSearchDraft(event.target.value)}
+              placeholder="搜索帖子标题或账号"
+              className="h-9 w-full rounded-lg border border-input bg-card pl-3 pr-16 text-[12px] outline-none placeholder:text-muted-foreground focus:ring-2 focus:ring-primary/15"
+            />
+            {searchDraft && (
+              <button
+                type="button"
+                aria-label="清空搜索"
+                onClick={() => {
+                  setSearchDraft('')
+                  setSearch('')
+                }}
+                className="absolute right-8 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+            <button
+              type="submit"
+              aria-label="搜索"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+            >
+              <Search className="h-3.5 w-3.5" />
+            </button>
+          </form>
+          <div className="relative shrink-0">
+            <select
+              aria-label="平台"
+              value={filters.platform}
+              onChange={event => updateFilter('platform', event.target.value)}
+              className="h-9 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
+            >
+              <option value="">全部平台</option>
+              <option value="xiaohongshu">小红书</option>
+              <option value="douyin">抖音</option>
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           </div>
-          <div className="flex shrink-0 flex-wrap gap-2">
-            <Button variant="outline" size="sm" className="min-h-10" onClick={() => setRegistrationOpen(true)}>
-              <UserRoundPlus className="h-4 w-4" />登记官方账号
-            </Button>
-            <Button size="sm" className="min-h-10" onClick={() => createTask()}><MessageCircle className="h-4 w-4" />创建评论巡查</Button>
+          <div className="relative shrink-0">
+            <select
+              aria-label="官方账号"
+              value={filters.officialAccountId}
+              onChange={event => updateFilter('officialAccountId', event.target.value)}
+              className="h-9 min-w-40 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
+            >
+              <option value="">全部官方账号</option>
+              {(data?.accounts || []).map(account => (
+                <option key={account.id} value={account.id}>
+                  {platformName(account.platform)} · {account.name}
+                </option>
+              ))}
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           </div>
-        </div>
-        <div className="mt-4 grid grid-cols-3 divide-x divide-border/70 border-t border-border/60 pt-3">
-          <MiniStat label="官方账号" value={loading ? '—' : formatNumber(totals.accounts)} />
-          <MiniStat label="近 7 天作品" value={loading ? '—' : formatNumber(totals.posts)} />
-          <MiniStat label="风险评论" value={loading ? '—' : formatNumber(totals.risk)} tone={totals.risk > 0 ? 'text-status-red' : undefined} />
+          <div className="relative shrink-0">
+            <select
+              aria-label="排序"
+              value={filters.sort}
+              onChange={event => updateFilter('sort', event.target.value as PostSort)}
+              className="h-9 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
+            >
+              <option value="published_desc">发帖时间：新到旧</option>
+              <option value="collected_desc">最近采集时间：新到旧</option>
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          </div>
+          <Button
+            size="sm"
+            className="h-9 shrink-0"
+            onClick={() => createTask(filters.officialAccountId)}
+            disabled={!canWrite() && !previewMode}
+          >
+            发起巡查
+          </Button>
         </div>
       </section>
 
-      {error && <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-xs text-status-red"><span>{error}</span><Button variant="ghost" size="sm" onClick={() => void load()}>重试</Button></div>}
-
-      {loading ? (
-        <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
-      ) : accounts.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-border bg-card">
-          <EmptyState icon={ShieldCheck} title="暂无可巡查官方账号" description="打开官方账号主页，在 Extension 里选择“登记为官方账号”；也可以把已有关注账号直接转换。登记后即可按发布时间创建账号主页评论巡查。" />
-          <div className="flex flex-wrap justify-center gap-2 border-t border-border/70 px-4 py-4">
-            <Button variant="outline" size="sm" onClick={() => setRegistrationOpen(true)}>从关注列表登记</Button>
-            <Button size="sm" onClick={() => createTask()}>创建评论巡查</Button>
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {accounts.map(account => {
-            const posts = postsOf(account)
-            const accountStatus = patrolStatusLabel(account.lastPatrolStatus || account.patrolStatus)
-            const accountRisk = riskCount(account)
-            return (
-              <section key={account.id} className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-xs">
-                <div className="flex flex-col gap-3 border-b border-border/70 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-5">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2"><StatusBadge tone="neutral">{platformName(account.platform)}</StatusBadge><StatusBadge tone={accountStatus.tone}>{accountStatus.label}</StatusBadge>{accountRisk > 0 && <StatusBadge tone="negative">风险评论 {formatNumber(accountRisk)}</StatusBadge>}</div>
-                    <h3 className="mt-2 text-[15px] font-bold text-foreground">{accountName(account)}</h3>
-                    <p className="mt-1 text-xs text-muted-foreground">最近巡查 {formatDate(lastPatrol(account)) || '—'} · 近 7 天可巡查作品 {formatNumber(Math.max(posts.length, safeNumber(account.recentPostCount)))}</p>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap gap-2">
-                    <Button variant="outline" size="sm" onClick={() => createTask(account.id)}>巡查评论 <ChevronRight className="h-3.5 w-3.5" /></Button>
-                  </div>
-                </div>
-
-                {posts.length === 0 ? (
-                  <div className="flex items-start gap-3 px-4 py-5 text-xs leading-5 text-muted-foreground sm:px-5"><CalendarDays className="mt-0.5 h-4 w-4 shrink-0" /><span>尚无近期巡查结果。创建任务后，Agent 会从官方账号主页读取指定日期范围内的作品与评论。</span></div>
-                ) : (
-                  <>
-                    <div className="space-y-0 lg:hidden">
-                      {posts.slice(0, 6).map(post => <PostMobileRow key={post.id} post={post} />)}
-                    </div>
-                    <div className="hidden lg:block"><WorkbenchTableShell><table className="w-full min-w-[760px] text-sm"><thead><tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-2.5 [&>th]:text-left [&>th]:text-[11px] [&>th]:font-medium [&>th]:text-muted-foreground"><th>作品</th><th>发布时间</th><th>评论摘要</th><th>最近巡查</th><th>状态</th></tr></thead><tbody className="divide-y divide-border/40">{posts.slice(0, 20).map(post => <PostTableRow key={post.id} post={post} />)}</tbody></table></WorkbenchTableShell></div>
-                    {posts.length > 6 && <div className="border-t border-border/70 px-4 py-3 text-xs text-muted-foreground sm:px-5">当前展示最近 {posts.length > 20 ? 20 : posts.length} 篇巡查结果。</div>}
-                  </>
-                )}
-              </section>
-            )
-          })}
+      {error && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-xs text-status-red">
+          <span>{error}</span>
+          <Button variant="ghost" size="sm" onClick={() => void load()}>重试</Button>
         </div>
       )}
-      {!loading && accounts.length > 0 && <div className="flex justify-end"><Button variant="outline" size="sm" onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />刷新资产状态</Button></div>}
+
+      {loading ? (
+        <div className="flex justify-center py-24">
+          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        </div>
+      ) : data ? (
+        <>
+          {data.posts.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-border bg-card">
+              <EmptyState
+                icon={MessageCircle}
+                title="当前筛选下暂无官方帖子"
+                description="调整筛选，或先登记官方账号并发起评论巡查。"
+              />
+              <div className="flex justify-center gap-2 border-t border-border/60 p-4">
+                <Button variant="outline" size="sm" onClick={() => setRegistrationOpen(true)}>
+                  登记官方账号
+                </Button>
+                <Button size="sm" onClick={() => createTask()}>
+                  发起巡查
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="grid min-w-0 items-stretch gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(0,3fr)_minmax(380px,2fr)] xl:gap-0 xl:overflow-hidden">
+              <div className="flex min-h-0 min-w-0 flex-col xl:pr-4">
+                <PostList
+                  posts={data.posts}
+                  selectedPostId={selectedPostId}
+                  onSelect={postId => {
+                    setSelectedPostId(postId)
+                    setBucket('negative')
+                  }}
+                  pagination={data.pagination}
+                  onPage={setPage}
+                  pageSize={pageSize}
+                  onPageSize={nextPageSize => {
+                    setPageSize(nextPageSize)
+                    setPage(1)
+                  }}
+                />
+              </div>
+              <PostDetailPanel
+                post={selectedPost}
+                detail={detail}
+                loading={detailLoading}
+                error={detailError}
+                bucket={bucket}
+                onBucket={setBucket}
+                onRetry={() => void loadDetail()}
+              />
+            </div>
+          )}
+        </>
+      ) : null}
+
       {registrationOpen && (
         <OfficialAccountRegistrationDrawer
           onClose={() => setRegistrationOpen(false)}
@@ -224,16 +605,625 @@ export function OfficialCommentPatrolTab() {
   )
 }
 
-function MiniStat({ label, value, tone = '' }: { label: string; value: string; tone?: string }) {
-  return <div className="px-3 first:pl-0 last:pr-0"><div className={`text-lg font-bold leading-none tabular-nums ${tone}`}>{value}</div><div className="mt-1.5 text-[10px] font-medium text-muted-foreground">{label}</div></div>
+function PostList({
+  posts,
+  selectedPostId,
+  onSelect,
+  pagination,
+  onPage,
+  pageSize,
+  onPageSize,
+}: {
+  posts: PatrolPost[]
+  selectedPostId: string
+  onSelect: (postId: string) => void
+  pagination: WorkbenchResponse['pagination']
+  onPage: (page: number) => void
+  pageSize: number
+  onPageSize: (pageSize: number) => void
+}) {
+  return (
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-card">
+      <div className="workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain lg:hidden">
+        <div className="divide-y divide-border/60">
+          {posts.map(post => (
+            <PostMobileCard
+              key={post.id}
+              post={post}
+              selected={post.id === selectedPostId}
+              onSelect={() => onSelect(post.id)}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="workspace-scrollbar hidden min-h-0 flex-1 overflow-auto overscroll-contain lg:block">
+        <table aria-label="官方帖子列表" className="w-full table-fixed text-left">
+          <thead className="sticky top-0 z-20 bg-card">
+            <tr className="border-b border-border/60 bg-muted/20 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              <th className="w-[36%] px-3 py-2.5">帖子信息</th>
+              <th className="w-[24%] px-3 py-2.5">情感分布</th>
+              <th className="w-[25%] px-3 py-2.5">互动数据</th>
+              <th className="w-[15%] px-3 py-2.5">最近采集</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border/50">
+            {posts.map(post => (
+              <PostTableRow
+                key={post.id}
+                post={post}
+                selected={post.id === selectedPostId}
+                onSelect={() => onSelect(post.id)}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <Pagination
+        pagination={pagination}
+        onPage={onPage}
+        pageSize={pageSize}
+        onPageSize={onPageSize}
+      />
+    </section>
+  )
 }
 
-function PostMobileRow({ post }: { post: PatrolPost }) {
-  const status = postPatrolStatus(post)
-  return <article className="border-b border-border/60 px-4 py-3.5 last:border-b-0"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><h4 className="line-clamp-2 text-sm font-semibold leading-5 text-foreground">{post.title || post.content || '未命名作品'}</h4><p className="mt-1 text-[11px] text-muted-foreground">发布 {formatDate(postPublishTime(post)) || '—'}</p></div><StatusBadge tone={status.tone}>{status.label}</StatusBadge></div><p className="mt-2 text-xs text-muted-foreground">平台评论 {formatNumber(safeNumber(post.commentsCount ?? post.comments_count))} · 已入库样本 {formatNumber(sampledCount(post))}{postRiskCount(post) > 0 ? ` · 风险 ${formatNumber(postRiskCount(post))}` : ''}</p><p className="mt-1 text-[11px] text-muted-foreground">最近巡查 {formatDate(post.lastPatrolAt || post.lastPatrolledAt) || '—'}</p></article>
+function PostTableRow({
+  post,
+  selected,
+  onSelect,
+}: {
+  post: PatrolPost
+  selected: boolean
+  onSelect: () => void
+}) {
+  const selectFromKeyboard = (event: KeyboardEvent<HTMLTableRowElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    onSelect()
+  }
+  return (
+    <tr
+      tabIndex={0}
+      aria-selected={selected}
+      onClick={onSelect}
+      onKeyDown={selectFromKeyboard}
+      className={cn(
+        'cursor-pointer align-middle outline-none transition-colors hover:bg-accent/35 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30',
+        selected && 'bg-accent/55 shadow-[inset_3px_0_0_var(--primary)]',
+      )}
+    >
+      <td className="px-3 py-3">
+        <div className="flex items-start gap-2.5">
+          <span className={cn(
+            'mt-0.5 inline-flex h-5 shrink-0 items-center rounded px-1.5 text-[9px] font-bold',
+            platformBadgeClass(post.platform),
+          )}>
+            {post.platform === 'xiaohongshu' ? '小红书' : '抖音'}
+          </span>
+          <div className="min-w-0">
+            <div className="line-clamp-2 text-[12px] font-semibold leading-4.5 text-foreground">
+              {post.title}
+            </div>
+            <div className="mt-1 truncate text-[10px] text-muted-foreground">
+              {post.officialAccount.name} · {formatPublish(post.publishedAt, post.publishTime)}
+            </div>
+            {post.url ? (
+              <a
+                href={post.url}
+                target="_blank"
+                rel="noreferrer"
+                onClick={event => event.stopPropagation()}
+                className="mt-1 inline-flex items-center gap-1 text-[10px] font-medium text-primary hover:underline"
+              >
+                查看原文 <ExternalLink className="h-2.5 w-2.5" />
+              </a>
+            ) : (
+              <span className="mt-1 inline-flex text-[10px] text-muted-foreground">
+                原文链接待补充
+              </span>
+            )}
+          </div>
+        </div>
+      </td>
+      <td className="px-3 py-3">
+        <SentimentDistribution sentiment={post.sentiment} />
+      </td>
+      <td className="px-3 py-3">
+        <EngagementMetrics engagement={post.engagement} />
+      </td>
+      <td className="px-3 py-3 text-[10px] text-muted-foreground">
+        {formatDateTime(post.lastPatrolledAt)}
+      </td>
+    </tr>
+  )
 }
 
-function PostTableRow({ post }: { post: PatrolPost }) {
-  const status = postPatrolStatus(post)
-  return <tr className="align-top transition-colors hover:bg-accent/45"><td className="max-w-[360px] px-4 py-3"><div className="line-clamp-2 font-medium leading-5">{post.title || post.content || '未命名作品'}</div>{post.url && <a href={post.url} target="_blank" rel="noreferrer" className="mt-1 inline-block text-xs text-primary hover:underline">打开原文 ↗</a>}</td><td className="px-4 py-3 text-xs text-muted-foreground">{formatDate(postPublishTime(post)) || '—'}</td><td className="px-4 py-3 text-xs text-muted-foreground">平台 {formatNumber(safeNumber(post.commentsCount ?? post.comments_count))} · 已入库样本 {formatNumber(sampledCount(post))}{postRiskCount(post) > 0 ? <div className="mt-1 text-status-red">风险 {formatNumber(postRiskCount(post))}</div> : null}</td><td className="px-4 py-3 text-xs text-muted-foreground">{formatDate(post.lastPatrolAt || post.lastPatrolledAt) || '—'}</td><td className="px-4 py-3"><StatusDot tone={status.tone}>{status.label}</StatusDot></td></tr>
+function PostMobileCard({
+  post,
+  selected,
+  onSelect,
+}: {
+  post: PatrolPost
+  selected: boolean
+  onSelect: () => void
+}) {
+  return (
+    <article className={cn('px-4 py-4', selected && 'bg-accent/45')}>
+      <button type="button" className="w-full text-left" onClick={onSelect}>
+        <div className="min-w-0">
+          <span className={cn(
+            'inline-flex h-5 items-center rounded px-1.5 text-[9px] font-bold',
+            platformBadgeClass(post.platform),
+          )}>
+            {platformName(post.platform)}
+          </span>
+          <h4 className="mt-2 line-clamp-2 text-sm font-semibold leading-5">{post.title}</h4>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {post.officialAccount.name} · {formatPublish(post.publishedAt, post.publishTime)}
+          </p>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            最近采集 {formatDateTime(post.lastPatrolledAt)}
+          </p>
+        </div>
+      </button>
+      {post.url ? (
+        <a
+          href={post.url}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+        >
+          查看原文 <ExternalLink className="h-3 w-3" />
+        </a>
+      ) : (
+        <span className="mt-2 inline-flex text-[11px] text-muted-foreground">
+          原文链接待补充
+        </span>
+      )}
+      <div className="mt-3">
+        <SentimentDistribution sentiment={post.sentiment} />
+      </div>
+      <div className="mt-3 rounded-lg bg-muted/25 px-2 py-2.5">
+        <EngagementMetrics engagement={post.engagement} />
+      </div>
+    </article>
+  )
+}
+
+function EngagementMetrics({
+  engagement,
+}: {
+  engagement: PatrolPost['engagement']
+}) {
+  const items = [
+    {
+      label: '点赞',
+      value: engagement.likes,
+      delta: engagement.trend?.likes,
+      icon: ThumbsUp,
+    },
+    {
+      label: '评论',
+      value: engagement.comments,
+      delta: engagement.trend?.comments,
+      icon: MessageCircle,
+    },
+    {
+      label: '转发',
+      value: engagement.shares,
+      delta: engagement.trend?.shares,
+      icon: Share2,
+    },
+  ]
+  return (
+    <div className="grid grid-cols-3 gap-2 text-center">
+      {items.map(item => {
+        const Icon = item.icon
+        return (
+          <div
+            key={item.label}
+            aria-label={`${item.label} ${formatNumber(item.value)}，${
+              item.delta === undefined
+                ? '暂无历史趋势'
+                : item.delta === 0
+                  ? '较上次采集持平'
+                  : `较上次采集${item.delta > 0 ? '增加' : '减少'} ${formatNumber(Math.abs(item.delta))}`
+            }`}
+          >
+            <div className="flex items-center justify-center gap-1 text-[11px] font-semibold tabular-nums">
+              <Icon className="h-3.5 w-3.5 text-muted-foreground" />
+              {formatNumber(item.value)}
+            </div>
+            <div className="mt-0.5 flex items-center justify-center gap-1 whitespace-nowrap text-[9px] text-muted-foreground">
+              <span>{item.label}</span>
+              <EngagementTrend delta={item.delta} />
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function EngagementTrend({delta}: {delta?: number}) {
+  if (delta === undefined) {
+    return <span title="暂无历史采集数据">—</span>
+  }
+  if (delta === 0) {
+    return (
+      <span
+        title="较上次采集持平"
+        className="inline-flex items-center gap-0.5 tabular-nums"
+      >
+        <Minus className="h-2.5 w-2.5" />0
+      </span>
+    )
+  }
+  const rising = delta > 0
+  const Icon = rising ? ArrowUpRight : ArrowDownRight
+  return (
+    <span
+      title={`较上次采集${rising ? '增加' : '减少'} ${formatNumber(Math.abs(delta))}`}
+      className={cn(
+        'inline-flex items-center gap-0.5 font-semibold tabular-nums',
+        rising ? 'text-primary' : 'text-muted-foreground',
+      )}
+    >
+      <Icon className="h-2.5 w-2.5" />
+      {formatNumber(Math.abs(delta))}
+    </span>
+  )
+}
+
+function SentimentDistribution({sentiment}: {sentiment: Sentiment}) {
+  const denominator = Math.max(1, safeNumber(sentiment.total))
+  const positiveWidth = (safeNumber(sentiment.positive) / denominator) * 100
+  const neutralWidth = (safeNumber(sentiment.neutral) / denominator) * 100
+  const negativeWidth = (safeNumber(sentiment.negative) / denominator) * 100
+  return (
+    <div>
+      <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[9px] tabular-nums">
+        <span className="text-emerald-700 dark:text-emerald-300">{formatNumber(sentiment.positive)} 正面</span>
+        <span className="text-muted-foreground">{formatNumber(sentiment.neutral)} 中性</span>
+        <span className="text-status-red">{formatNumber(sentiment.negative)} 负面</span>
+      </div>
+      <div
+        className="mt-1.5 flex h-1.5 overflow-hidden rounded-full bg-muted"
+        aria-label={`正面 ${sentiment.positive}，中性 ${sentiment.neutral}，负面 ${sentiment.negative}`}
+      >
+        <span className="bg-status-green" style={{width: `${positiveWidth}%`}} />
+        <span className="bg-status-grey" style={{width: `${neutralWidth}%`}} />
+        <span className="bg-status-red" style={{width: `${negativeWidth}%`}} />
+      </div>
+    </div>
+  )
+}
+
+function Pagination({
+  pagination,
+  onPage,
+  pageSize,
+  onPageSize,
+}: {
+  pagination: WorkbenchResponse['pagination']
+  onPage: (page: number) => void
+  pageSize: number
+  onPageSize: (pageSize: number) => void
+}) {
+  const [jumpPage, setJumpPage] = useState('')
+  const totalPages = Math.max(1, pagination.totalPages)
+  const pageStart = pagination.total > 0
+    ? (pagination.page - 1) * pagination.pageSize + 1
+    : 0
+  const pageEnd = Math.min(
+    pagination.page * pagination.pageSize,
+    pagination.total,
+  )
+  const paginationItems = getPaginationItems(pagination.page, totalPages)
+  const goToPage = (requestedPage: number) => {
+    const targetPage = Math.min(
+      totalPages,
+      Math.max(1, Math.trunc(requestedPage)),
+    )
+    setJumpPage('')
+    if (targetPage !== pagination.page) onPage(targetPage)
+  }
+  const submitJumpPage = () => {
+    const requestedPage = Number(jumpPage)
+    if (!Number.isFinite(requestedPage) || jumpPage.trim() === '') return
+    goToPage(requestedPage)
+  }
+
+  return (
+    <div className="flex shrink-0 flex-col gap-2 border-t border-border/60 px-3 py-2 lg:flex-row lg:items-center lg:justify-between">
+      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+        第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
+      </span>
+      <div className="flex flex-wrap items-center gap-2 lg:flex-nowrap lg:justify-end">
+        <label className="flex shrink-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+          每页
+          <select
+            aria-label="每页条数"
+            value={pageSize}
+            onChange={event => onPageSize(Number(event.target.value))}
+            className="h-8 rounded-lg border border-border bg-card px-2 text-[10px] font-medium tabular-nums text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/30"
+          >
+            {PAGE_SIZE_OPTIONS.map(size => (
+              <option key={size} value={size}>{size}</option>
+            ))}
+          </select>
+          条
+        </label>
+
+        <nav aria-label="官方帖子分页" className="flex shrink-0 items-center gap-1">
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            aria-label="上一页"
+            title="上一页"
+            disabled={pagination.page <= 1}
+            onClick={() => goToPage(pagination.page - 1)}
+          >
+            <ChevronLeft className="h-3.5 w-3.5" />
+          </Button>
+          <div className="hidden items-center gap-1 sm:flex">
+            {paginationItems.map((item, index) => item === 'ellipsis' ? (
+              <span
+                key={`ellipsis-${index}`}
+                className="flex h-8 w-5 items-center justify-center text-[10px] text-muted-foreground"
+              >
+                …
+              </span>
+            ) : (
+              <Button
+                key={item}
+                variant={item === pagination.page ? 'default' : 'outline'}
+                size="icon"
+                className="h-8 w-8 text-[10px] tabular-nums"
+                aria-label={`第 ${item} 页`}
+                aria-current={item === pagination.page ? 'page' : undefined}
+                onClick={() => goToPage(item)}
+              >
+                {item}
+              </Button>
+            ))}
+          </div>
+          <span className="min-w-14 px-1 text-center text-[10px] tabular-nums text-muted-foreground sm:hidden">
+            {pagination.page} / {totalPages} 页
+          </span>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            aria-label="下一页"
+            title="下一页"
+            disabled={pagination.page >= totalPages}
+            onClick={() => goToPage(pagination.page + 1)}
+          >
+            <ChevronRight className="h-3.5 w-3.5" />
+          </Button>
+        </nav>
+
+        <div className="flex shrink-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+          <span>跳至</span>
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={totalPages}
+            value={jumpPage}
+            onChange={event => setJumpPage(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter') submitJumpPage()
+            }}
+            aria-label="跳转页码"
+            className="h-8 w-14 px-2 text-center text-[10px] tabular-nums"
+          />
+          <span>页</span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 px-3 text-[10px]"
+            disabled={jumpPage.trim() === ''}
+            onClick={submitJumpPage}
+          >
+            跳转
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PostDetailPanel({
+  post,
+  detail,
+  loading,
+  error,
+  bucket,
+  onBucket,
+  onRetry,
+}: {
+  post: PatrolPost | null
+  detail: PostCommentsResponse | null
+  loading: boolean
+  error: string
+  bucket: CommentBucket
+  onBucket: (bucket: CommentBucket) => void
+  onRetry: () => void
+}) {
+  if (!post) {
+    return (
+      <aside className="flex min-h-0 min-w-0 flex-col xl:border-l xl:border-border/70 xl:pl-4">
+        <div className="flex flex-1 items-center bg-card p-5">
+          <EmptyState icon={MessageCircle} title="选择一篇帖子查看评论" />
+        </div>
+      </aside>
+    )
+  }
+  const counts = detail?.counts || {
+    all: post.sentiment.total,
+    negative: post.sentiment.negative,
+    positive: post.sentiment.positive,
+    negativePending: post.todos.negative,
+    positivePending: post.todos.positive,
+  }
+  return (
+    <aside className="flex min-h-0 min-w-0 flex-col xl:border-l xl:border-border/70 xl:pl-4">
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-card">
+      <div className="flex shrink-0 gap-1 border-b border-border/60 px-3">
+        <DetailTab
+          active={bucket === 'negative'}
+          tone="negative"
+          onClick={() => onBucket('negative')}
+        >
+          负面评论 {formatNumber(counts.negative)}
+        </DetailTab>
+        <DetailTab
+          active={bucket === 'positive'}
+          tone="positive"
+          onClick={() => onBucket('positive')}
+        >
+          正面评论 {formatNumber(counts.positive)}
+        </DetailTab>
+        <DetailTab
+          active={bucket === 'all'}
+          tone="neutral"
+          onClick={() => onBucket('all')}
+        >
+          全部评论 {formatNumber(counts.all)}
+        </DetailTab>
+      </div>
+
+      <div className="workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        {loading ? (
+          <div className="flex justify-center py-20">
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : error ? (
+          <div role="alert" className="p-5 text-center text-xs text-status-red">
+            <p>{error}</p>
+            <Button variant="outline" size="sm" className="mt-3" onClick={onRetry}>
+              重试
+            </Button>
+          </div>
+        ) : detail?.comments.length ? (
+          <div className="divide-y divide-border/60">
+            {detail.comments.map(comment => (
+              <CommentCard
+                key={comment.id}
+                comment={comment}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="px-5 py-16 text-center">
+            <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
+              {bucket === 'positive'
+                ? <Heart className="h-4.5 w-4.5" />
+                : <ShieldAlert className="h-4.5 w-4.5" />}
+            </div>
+            <p className="mt-3 text-[12px] font-semibold">
+              {bucket === 'negative' ? '暂无负面评论' : bucket === 'positive' ? '暂无正面评论' : '暂无评论样本'}
+            </p>
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              评论结果来自最近一次有效巡查样本
+            </p>
+          </div>
+        )}
+      </div>
+      </div>
+    </aside>
+  )
+}
+
+function DetailTab({
+  active,
+  tone,
+  onClick,
+  children,
+}: {
+  active: boolean
+  tone: 'negative' | 'positive' | 'neutral'
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        'relative min-h-9 flex-1 whitespace-nowrap px-2 text-[10px] font-semibold text-muted-foreground transition-colors hover:text-foreground',
+        active && tone === 'negative' && 'text-status-red',
+        active && tone === 'positive' && 'text-emerald-700 dark:text-emerald-300',
+        active && tone === 'neutral' && 'text-primary',
+      )}
+    >
+      {children}
+      {active && (
+        <span className={cn(
+          'absolute inset-x-2 bottom-0 h-0.5 rounded-full',
+          tone === 'negative' && 'bg-status-red',
+          tone === 'positive' && 'bg-status-green',
+          tone === 'neutral' && 'bg-primary',
+        )} />
+      )}
+    </button>
+  )
+}
+
+function commentRecommendation(comment: PatrolComment) {
+  if (comment.sentiment === 'positive') {
+    return '点赞鼓励；如果提到具体使用体验，可简短回复致谢。'
+  }
+  if (['critical', 'high'].includes(comment.riskLevel)) {
+    return '优先核实事实并准备公开回复；仅在确认违规、辱骂或虚假信息时考虑删除。'
+  }
+  if (comment.isNegative || comment.sentiment === 'negative') {
+    return '先回应评论里的具体问题并跟进；如属重复攻击或违规内容，再考虑删除。'
+  }
+  return '观察后续讨论；出现明确问题或求助时再回复。'
+}
+
+function CommentCard({ comment }: { comment: PatrolComment }) {
+  const positive = comment.sentiment === 'positive'
+  return (
+    <article className="px-3 py-3.5 sm:px-4">
+      <div className="min-w-0">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="max-w-full break-words text-[11px] font-semibold">{comment.authorName}</span>
+          <span className="text-[9px] text-muted-foreground">
+            {comment.publishedAt || formatDateTime(comment.firstSeenAt)}
+            {comment.ipLocation ? ` · ${comment.ipLocation}` : ''}
+          </span>
+        </div>
+        <p className="mt-2 break-words text-[12px] leading-5 text-foreground">{comment.content}</p>
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-[9px]">
+          <StatusPill tone={positive ? 'positive' : comment.isNegative ? 'negative' : 'neutral'}>
+            {positive ? '正面' : comment.isNegative ? '负面' : '中性'}
+          </StatusPill>
+          {comment.riskLevel && !['none', 'low'].includes(comment.riskLevel) && (
+            <StatusPill tone={comment.riskLevel}>
+              {comment.riskLevel === 'critical' ? '危急风险' : comment.riskLevel === 'high' ? '高风险' : '中风险'}
+            </StatusPill>
+          )}
+          <span className="inline-flex items-center gap-1 text-muted-foreground">
+            <ThumbsUp className="h-3 w-3" />
+            {formatNumber(comment.likeCount)}
+          </span>
+        </div>
+        <div className="mt-2.5 rounded-lg bg-muted/35 px-2.5 py-2">
+          <p className="text-[10px] leading-4 text-foreground/80">
+            <span className="font-semibold">建议：</span>
+            {commentRecommendation(comment)}
+          </p>
+        </div>
+      </div>
+    </article>
+  )
 }

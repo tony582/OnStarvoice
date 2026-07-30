@@ -19,6 +19,7 @@ import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentHomePage } from '@/pages/ContentHomePage'
 import { HitsPage } from '@/pages/HitsPage'
 import { OfficialAccountsPage } from '@/pages/OfficialAccountsPage'
+import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
@@ -44,7 +45,8 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   benchmarks: { eyebrow: 'Content Studio', title: '对标账号库' },
   keywords: { eyebrow: 'Content Studio', title: '选题与扩词' },
   review: { eyebrow: 'Content Studio', title: '内容复盘' },
-  'official-accounts': { eyebrow: 'Administration', title: '官方账号管理' },
+  'official-accounts': { eyebrow: 'Official Social', title: '官方账号管理' },
+  'official-comments': { eyebrow: 'Official Social', title: '评论巡查' },
   tenants: { eyebrow: 'Administration', title: '租户管理' },
   users: { eyebrow: 'Administration', title: '用户账号' },
   'auth-codes': { eyebrow: 'Administration', title: '激活码' },
@@ -69,6 +71,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   'content-home': ContentHomePage,
   hits: HitsPage,
   'official-accounts': OfficialAccountsPage,
+  'official-comments': OfficialCommentPatrolTab,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,
@@ -105,6 +108,8 @@ export default function DesktopApp() {
 
   const config = PAGE_CONFIG[page] || PAGE_CONFIG.overview
   const PageComponent = PAGE_COMPONENTS[page]
+  const officialCommentPreview = import.meta.env.DEV
+    && new URLSearchParams(window.location.search).get('preview') === 'official-comment-ops'
 
   return (
     <div className="flex h-dvh min-h-[480px] overflow-hidden">
@@ -115,6 +120,7 @@ export default function DesktopApp() {
         onToggleCollapse={toggleCollapse}
         mobileOpen={mobileNavigationOpen}
         onMobileClose={() => setMobileNavigationOpen(false)}
+        showInternalItems={officialCommentPreview}
       />
       <main className={cn(
         'app-main min-w-0 flex-1 overflow-y-auto transition-[margin-left,margin-right] duration-200',
@@ -130,7 +136,10 @@ export default function DesktopApp() {
           onOpenMobileNavigation={() => setMobileNavigationOpen(true)}
         />
         <div className={cn(
-          'animate-fade-up px-3 pb-[max(2rem,env(safe-area-inset-bottom))] pt-4 sm:px-4 sm:pt-5 lg:px-6',
+          'animate-fade-up px-3 sm:px-4 lg:px-6',
+          page === 'official-comments'
+            ? 'pb-0 pt-0 xl:h-[calc(100dvh-3.5rem)] xl:overflow-hidden'
+            : 'pb-[max(2rem,env(safe-area-inset-bottom))] pt-4 sm:pt-5',
           page === 'dispatch' && 'xl:h-[calc(100dvh-3.5rem)] xl:pb-0 xl:pr-0 xl:pt-0',
         )} key={`${page}:${seq}:${tenantId}`}>
           {PageComponent ? <PageComponent /> : <ComingSoon pageId={page} />}

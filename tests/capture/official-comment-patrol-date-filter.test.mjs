@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import {runEnhancementWithSingleRetry} from "../../utils/capture/enhancement-retry.js";
 
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
@@ -71,6 +72,7 @@ function buildPublishWindowHarness({
   const detailCalls = [];
   const getRecordCalls = [];
   let detailCaptureStarted = false;
+  let detailCallCount = 0;
 
   const run = compileFunction({
     source: sidebarSource,
@@ -82,9 +84,20 @@ function buildPublishWindowHarness({
       Map,
       Math,
       Number,
+      Promise,
       Set,
       MONITOR_UNKNOWN_PUBLISH_DETAIL_LIMIT: 8,
+      runEnhancementWithSingleRetry,
+      reportMonitorRunProgress: (onProgress, progress, fallbackMessage) => {
+        if (typeof onProgress === "function") {
+          onProgress({
+            ...progress,
+            message: progress?.message || fallbackMessage || "",
+          });
+        }
+      },
       batchCaptureDetailsForRecords: async (recordIds, options) => {
+        detailCallCount += 1;
         detailCalls.push({
           recordIds: [...recordIds],
           includeComments: options.includeComments,
@@ -92,7 +105,7 @@ function buildPublishWindowHarness({
         });
         detailCaptureStarted = true;
         if (typeof detailResultFactory === "function") {
-          return detailResultFactory([...recordIds]);
+          return detailResultFactory([...recordIds], detailCallCount);
         }
         return {
           ok: true,
@@ -163,6 +176,78 @@ test("official comment patrol detail-checks every discovered candidate, includin
   assert.equal(result.scannedCount, 10);
   assert.equal(result.filteredCount, 0);
   assert.equal(result.unknownCount, 0);
+});
+
+test("official comment patrol resumes unfinished detail candidates once after its worker tab disappears", async () => {
+  const recordIds = Array.from(
+    {length: 6},
+    (_, index) => `candidate-${index + 1}`,
+  );
+  const afterRecords = recordIds.map((id, index) =>
+    buildRecord(id, {
+      detailPublishTime: `2026-07-${String(22 + index).padStart(2, "0")}T10:00:00+08:00`,
+    }),
+  );
+  const harness = buildPublishWindowHarness({
+    beforeRecords: recordIds.map((id) => buildRecord(id)),
+    afterRecords,
+    detailResultFactory: (attemptRecordIds, callCount) => {
+      if (callCount === 1) {
+        return {
+          ok: false,
+          canceled: false,
+          runnerInterrupted: true,
+          recoveryRequired: true,
+          successCount: 3,
+          failedCount: 1,
+          results: [
+            ...recordIds.slice(0, 3).map((recordId) => ({
+              recordId,
+              ok: true,
+            })),
+            {
+              recordId: recordIds[3],
+              ok: false,
+              reason: "CONTEXT_INTERRUPTED",
+              category: "context_interrupted",
+            },
+          ],
+        };
+      }
+      return {
+        ok: true,
+        canceled: false,
+        runnerInterrupted: false,
+        recoveryRequired: false,
+        successCount: attemptRecordIds.length,
+        failedCount: 0,
+        results: attemptRecordIds.map((recordId) => ({
+          recordId,
+          ok: true,
+        })),
+      };
+    },
+  });
+
+  const result = await harness.run({
+    recordIds,
+    monitorSettings: {
+      publishWindow: "custom",
+      publishDateFrom: "2026-07-22",
+      publishDateTo: "2026-07-28",
+      postsLimit: 20,
+    },
+    captureSettings: {verifyPublishDateFromDetail: true},
+    displayName: "上海安吉星信息服务有限公司",
+  });
+
+  assert.deepEqual(
+    harness.detailCalls.map((call) => call.recordIds),
+    [recordIds, recordIds.slice(3)],
+  );
+  assert.equal(result.failed, undefined);
+  assert.equal(result.detailResult.autoRetryAttempted, true);
+  assert.deepEqual([...result.recordIds], recordIds);
 });
 
 test("official comment patrol trusts detail dates over list dates and applies postsLimit after date filtering", async () => {
@@ -426,4 +511,70 @@ test("official comment patrol disables list-page date filtering and discovers be
     "the strict date window must not shrink the detail-verification discovery pool",
   );
   assert.equal(captureParams.maxScrollTimes, 20);
+});
+
+test("official account patrol scans the explicitly requested latest post count without a date window", async () => {
+  const resolveCaptureParams = compileFunction({
+    source: sidebarSource,
+    startMarker: "function resolveMonitorRunnerCaptureParams(",
+    endMarker: "function summarizeMonitorSyncResult(",
+    functionName: "resolveMonitorRunnerCaptureParams",
+    context: {
+      Math,
+      Number,
+      DEFAULT_CAPTURE_SETTINGS: {
+        sharedWaitMinMs: 800,
+        sharedWaitMaxMs: 1600,
+        sharedStallTimeoutMs: 8000,
+        sharedMaxDurationMs: 120000,
+      },
+      DEFAULT_MONITOR_SETTINGS: {
+        observeWindowHours: 48,
+        likeThreshold: 0,
+      },
+      MONITOR_OBSERVE_WINDOW_OPTIONS: [24, 48, 72],
+      MONITOR_DETAIL_DATE_DISCOVERY_MIN: 20,
+      MONITOR_DETAIL_DATE_DISCOVERY_MAX: 60,
+      MONITOR_DETAIL_DATE_DISCOVERY_MULTIPLIER: 3,
+      MONITOR_LATEST_POSTS_LIMIT_MAX: 100,
+      MONITOR_PUBLISH_WINDOW: {PREVIOUS_DAY: "previous_day"},
+      MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW: {
+        24: 20,
+        48: 30,
+        72: 40,
+      },
+      resolveMonitorPublishWindowBounds: () => ({
+        strict: true,
+        key: "last_24h",
+      }),
+    },
+  });
+
+  const captureParams = resolveCaptureParams(
+    {postsLimit: 30},
+    {scanLatestPostsByCount: true},
+  );
+  assert.equal(captureParams.maxDetectedItems, 30);
+  assert.equal(captureParams.monitorPublishWindow, "");
+  assert.equal(captureParams.maxScrollTimes, 20);
+
+  const resolveRecordIds = compileFunction({
+    source: sidebarSource,
+    startMarker: "async function resolveMonitorRecordIdsForPublishWindow(",
+    endMarker: "async function finishMonitorExecutionSafely(",
+    functionName: "resolveMonitorRecordIdsForPublishWindow",
+    context: {Number, Set},
+  });
+  const recordIds = Array.from({length: 35}, (_, index) => `post-${index + 1}`);
+  const selected = await resolveRecordIds({
+    recordIds,
+    monitorSettings: {postsLimit: 30},
+    captureSettings: {scanLatestPostsByCount: true},
+  });
+  assert.deepEqual([...selected.recordIds], recordIds.slice(0, 30));
+  assert.equal(selected.scannedCount, 35);
+  assert.equal(selected.filteredCount, 5);
+  assert.equal(selected.unknownCount, 0);
+  assert.equal(selected.windowLabel, "最近 30 篇");
+  assert.equal(selected.detailResult, null);
 });

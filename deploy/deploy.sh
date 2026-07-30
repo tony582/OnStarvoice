@@ -28,6 +28,9 @@ rsync -avz --delete --exclude node_modules --exclude '.env' "$ROOT/server/"     
 rsync -avz --delete                                          "$ROOT/web/admin/dist/" "root@$SERVER:$APP_DIR/web/admin/dist/"
 rsync -avz --delete                                          "$ROOT/images/"         "root@$SERVER:$APP_DIR/images/"
 scp "$ROOT/server/.env.production" "root@$SERVER:$APP_DIR/server/.env"
+echo "▶ 收紧并校验生产环境文件权限…"
+ssh "root@$SERVER" \
+  "chown root:root '$APP_DIR/server/.env' && chmod 600 '$APP_DIR/server/.env' && test \"\$(stat -c '%a' '$APP_DIR/server/.env')\" = 600"
 
 echo "▶ 远程安装依赖 + 迁移建表 + PM2 重启…"
 ssh "root@$SERVER" bash -s <<EOF

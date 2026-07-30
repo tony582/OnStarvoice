@@ -200,8 +200,21 @@ test("heartbeat preserves the official-account comment patrol workflow and capab
       taskId: "official-task-1",
       workflow: "official_account_comment_patrol",
       protocolVersion: 1,
+      targetMode: "profile",
+      profileMode: true,
+      subjectType: "official",
       platform: "xiaohongshu",
       status: "running",
+      targets: [{
+        itemId: "item-1",
+        subscriptionId: "subscription-1",
+        accountUrl: "https://www.xiaohongshu.com/user/profile/official-1",
+      }],
+      monitorSettings: {postsLimit: 30},
+      captureSettings: {
+        includeComments: true,
+        scanLatestPostsByCount: true,
+      },
       targetResults: [{
         itemId: "item-1",
         recordId: "post-1",
@@ -219,8 +232,21 @@ test("heartbeat preserves the official-account comment patrol workflow and capab
     payload.agent.capabilities.officialAccountCommentPatrolProfileV1,
     true,
   );
+  assert.equal(
+    payload.agent.capabilities.officialAccountLatestPostsByCountV1,
+    true,
+  );
   assert.equal(payload.tasks[0].taskType, "official_account_comment_patrol");
   assert.equal(payload.tasks[0].workflow, "official_account_comment_patrol");
+  assert.equal(payload.tasks[0].targetMode, "profile");
+  assert.equal(payload.tasks[0].profileMode, true);
+  assert.equal(payload.tasks[0].subjectType, "official");
+  assert.equal(payload.tasks[0].monitorSettings.postsLimit, 30);
+  assert.equal(
+    payload.tasks[0].captureSettings.scanLatestPostsByCount,
+    true,
+  );
+  assert.equal(payload.tasks[0].targets[0].subscriptionId, "subscription-1");
   assert.equal(payload.tasks[0].targetResults[0].workflow, "official_account_comment_patrol");
   assert.equal(payload.tasks[0].targetResults[0].commentObservation.observedCount, 8);
 });

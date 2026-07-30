@@ -424,16 +424,14 @@ test("normalizes creator and official profile discovery as resumable account tar
     taskId: "official-comments-profile-1",
     platform: "douyin",
     monitorSettings: {
-      publishWindow: "custom",
-      publishDateFrom: "2026-07-21",
-      publishDateTo: "2026-07-28",
-      postsLimit: 5,
+      postsLimit: 30,
     },
     captureSettings: {
       includeComments: true,
       includeCommentsOnDetailCapture: true,
       autoSyncAfterDetailCapture: true,
       commentsMaxDetectedItems: 30,
+      scanLatestPostsByCount: true,
     },
     targets: [{
       itemId: "77777777-7777-4777-8777-777777777777",
@@ -453,12 +451,13 @@ test("normalizes creator and official profile discovery as resumable account tar
     "https://www.douyin.com/user/MS4wLjABAAAA-comments",
   );
   assert.deepEqual(plain(officialComments.monitorSettings), {
-    publishWindow: "custom",
-    publishDateFrom: "2026-07-21",
-    publishDateTo: "2026-07-28",
-    postsLimit: 5,
+    postsLimit: 30,
   });
   assert.equal(officialComments.captureSettings.includeComments, true);
+  assert.equal(
+    officialComments.captureSettings.scanLatestPostsByCount,
+    true,
+  );
 });
 
 test("profile discovery rejects post URLs and missing monitor execution identity", () => {
@@ -599,9 +598,6 @@ test("createRunRequest fences a fresh local attempt from stale payload metadata"
     targetMode: "profile",
     profileMode: true,
     monitorSettings: {
-      publishWindow: "custom",
-      publishDateFrom: "2026-07-21",
-      publishDateTo: "2026-07-28",
       postsLimit: 5,
     },
     captureSettings: {
@@ -609,6 +605,7 @@ test("createRunRequest fences a fresh local attempt from stale payload metadata"
       includeCommentsOnDetailCapture: true,
       autoSyncAfterDetailCapture: true,
       commentsMaxDetectedItems: 30,
+      scanLatestPostsByCount: true,
     },
     targets: [
       {
