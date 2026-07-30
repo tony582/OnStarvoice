@@ -100,7 +100,7 @@ export async function loadCompatibleProfilePatrolAgent(
     capabilities.remoteTargetedPostCaptureV1 !== true ||
     capabilities[capability] !== true ||
     (subjectType === 'official' &&
-      capabilities.officialAccountDetailPublishDateV1 !== true)
+      capabilities.officialAccountLatestPostsByCountV1 !== true)
   ) {
     return {failure: requestError(
       'agent_profile_scan_capability_missing',
@@ -414,7 +414,10 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       SELECT ms.*
       FROM monitor_subscriptions ms
       WHERE ms.status = 'active'
-        AND ms.subject_type IN ('creator', 'official')
+        -- Official-account comment patrol is explicitly launched by the user
+        -- because each run chooses its own post and comment limits. This
+        -- legacy profile cron only schedules followed creators.
+        AND ms.subject_type = 'creator'
         AND COALESCE(ms.account_url, '') <> ''
         AND ms.next_run_at <= now()
         AND NOT EXISTS (

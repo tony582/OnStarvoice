@@ -204,6 +204,7 @@
       async function finalizeUnexpectedDetach(
         session,
         normalizedReason,
+        {notifyUnexpected = true} = {},
       ) {
         if (!session) return false;
         session.state = "detached";
@@ -222,20 +223,22 @@
             previous: detachedSnapshot,
           });
         }
-        dispatchUnexpectedDetach({
-          reason: normalizedReason,
-          session: detachedSnapshot,
-        });
+        if (notifyUnexpected) {
+          dispatchUnexpectedDetach({
+            reason: normalizedReason,
+            session: detachedSnapshot,
+          });
+        }
         return true;
       }
 
-      async function recoverPersistentSourceOnSameTab(
+      async function recoverSourceOnSameTab(
         session,
         normalizedReason,
       ) {
         const sessionTabId = normalizeTabId(session?.tabId);
         if (
-          !session?.persistent ||
+          !session ||
           !sessionTabId ||
           sessionsByTab.get(sessionTabId) !== session
         ) {
@@ -279,7 +282,7 @@
         }
       }
 
-      function schedulePersistentReplacementDetach(
+      function scheduleSourceDetachRecovery(
         session,
         normalizedReason,
       ) {
@@ -304,12 +307,24 @@
               return false;
             }
             if (
-              await recoverPersistentSourceOnSameTab(
+              await recoverSourceOnSameTab(
                 session,
                 normalizedReason,
               )
             ) {
               return true;
+            }
+            if (!session.persistent) {
+              // A renderer target can disappear while the visible profile Tab
+              // and its content script keep running. Losing focus emulation is
+              // recoverable for a one-off list relay; relaying cancelCapture
+              // here would turn Edge's internal target rebuild into a fake
+              // user stop and discard the account scan.
+              return await finalizeUnexpectedDetach(
+                session,
+                "target_closed_debug_degraded",
+                {notifyUnexpected: false},
+              );
             }
             return await finalizeUnexpectedDetach(
               session,
@@ -622,12 +637,13 @@
           return true;
         }
 
-        // Chrome may replace a prerendered/navigation target with a new Tab id.
-        // onDetach(target_closed) can arrive just before tabs.onReplaced. Give
-        // persistent tasks a short migration window instead of terminalizing
-        // the whole capture before the replacement event can rebind ownership.
-        if (session.persistent && normalizedReason === "target_closed") {
-          return schedulePersistentReplacementDetach(
+        // Chromium/Edge can briefly rebuild the renderer target while keeping
+        // the same visible Tab alive. This happens during ordinary Douyin
+        // profile scrolling too, not only during persistent detail tasks.
+        // Give every list session a short same-tab reattach window. Persistent
+        // sessions may additionally be migrated by tabs.onReplaced.
+        if (normalizedReason === "target_closed") {
+          return scheduleSourceDetachRecovery(
             session,
             normalizedReason,
           );

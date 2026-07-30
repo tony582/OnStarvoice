@@ -63,7 +63,15 @@ test('official comment patrol admin calls the mounted capture-cloud namespace', 
   );
   assert.match(
     monitoringTab,
-    /\/capture-cloud\/official-comment-patrol\/accounts/u,
+    /\/capture-cloud\/official-comment-patrol\/workbench/u,
+  );
+  assert.match(
+    monitoringTab,
+    /\/capture-cloud\/official-comment-patrol\/posts\/\$\{selectedPostId\}\/comments/u,
+  );
+  assert.doesNotMatch(
+    monitoringTab,
+    /\/capture-cloud\/official-comment-patrol\/comments\/\$\{comment\.id\}\/actions/u,
   );
   assert.doesNotMatch(
     `${taskCreator}\n${monitoringTab}`,
@@ -71,10 +79,10 @@ test('official comment patrol admin calls the mounted capture-cloud namespace', 
   );
 });
 
-test('official account row opens one account-page patrol flow without a discovery task', () => {
+test('official post workbench opens one account-page patrol flow without a discovery task', () => {
   assert.match(
     monitoringTab,
-    /officialAccountId \? \{ officialAccountId \} : \{\}/u,
+    /\.\.\.\(officialAccountId \? \{officialAccountId\} : \{\}\)/u,
   );
   assert.doesNotMatch(
     monitoringTab,
@@ -90,9 +98,68 @@ test('official account row opens one account-page patrol flow without a discover
   );
   assert.match(
     taskCreator,
-    /Agent 会打开账号主页，在指定日期范围内读取近期作品并采集当前可见评论/u,
+    /Agent 会从账号主页按最新顺序读取你指定数量的作品/u,
   );
+  assert.doesNotMatch(taskCreator, /publishDateFrom|publishDateTo|发布时间范围/u);
   assert.doesNotMatch(taskCreator, /recordIds|预览作品|selectedIds/u);
+});
+
+test('official post workbench exposes current engagement, sentiment, advice, and source links', () => {
+  assert.match(monitoringTab, /帖子信息/u);
+  assert.match(monitoringTab, /情感分布/u);
+  assert.match(monitoringTab, /互动数据/u);
+  assert.match(monitoringTab, /label: '点赞'/u);
+  assert.match(monitoringTab, /label: '评论'/u);
+  assert.match(monitoringTab, /label: '转发'/u);
+  assert.match(monitoringTab, /负面评论/u);
+  assert.match(monitoringTab, /正面评论/u);
+  assert.match(monitoringTab, /建议：/u);
+  assert.doesNotMatch(
+    monitoringTab,
+    /本次巡查|上次巡查|相比上次巡查|较上次巡查|风险趋势|评论覆盖|本次新增/u,
+  );
+  assert.doesNotMatch(monitoringTab, /label="点赞"|label="回复鼓励"|标记完成/u);
+  assert.match(monitoringTab, /查看原文/u);
+  assert.doesNotMatch(monitoringTab, /查看原帖/u);
+  assert.doesNotMatch(monitoringTab, />帖子列表</u);
+  assert.match(monitoringTab, /href=\{post\.url\}/u);
+  assert.match(route, /record\.likes, record\.shares/u);
+  assert.match(
+    route,
+    /const engagement = \{[\s\S]*likes: safeCount\(row\.likes\)[\s\S]*comments: safeCount\(row\.platform_comments\)[\s\S]*shares: safeCount\(row\.shares\)/u,
+  );
+  assert.match(
+    route,
+    /trend: row\.previous_engagement_at[\s\S]*engagement\.likes - safeCount\(row\.previous_likes\)[\s\S]*engagement\.comments - safeCount\(row\.previous_platform_comments\)[\s\S]*engagement\.shares - safeCount\(row\.previous_shares\)/u,
+  );
+  assert.match(
+    route,
+    /FROM record_observations observation[\s\S]*observation\.record_id = post\.id[\s\S]*observation\.id <> post\.latest_observation_id/u,
+  );
+});
+
+test('official post workbench defaults to publish time and can sort by latest collection', () => {
+  const cte = sourceSection(
+    route,
+    'function buildWorkbenchCte',
+    'async function loadOfficialWorkbenchPost',
+  );
+  const workbenchRoute = sourceSection(
+    route,
+    "router.get(\n  '/official-comment-patrol/workbench'",
+    "router.get(\n  '/official-comment-patrol/posts/:id/comments'",
+  );
+  assert.doesNotMatch(cte, /query\.range|query\.freshness|make_interval/u);
+  assert.doesNotMatch(workbenchRoute, /req\.query\.range|req\.query\.freshness/u);
+  assert.match(workbenchRoute, /sort: req\.query\.sort/u);
+  assert.match(
+    workbenchRoute,
+    /COALESCE\(latest_snapshot_at, latest_comment_at\) DESC NULLS LAST,[\s\S]*published_ts DESC NULLS LAST, id/u,
+  );
+  assert.match(workbenchRoute, /: 'published_ts DESC NULLS LAST, id'/u);
+  assert.match(monitoringTab, /sort: 'published_desc'/u);
+  assert.match(monitoringTab, /comparePosts\(left, right, filters\.sort\)/u);
+  assert.match(monitoringTab, /formatDateTime\(post\.lastPatrolledAt\)/u);
 });
 
 test('task composer hides official discovery while legacy task cards stay readable', async () => {
@@ -107,22 +174,28 @@ test('task composer hides official discovery while legacy task cards stay readab
   assert.match(taskCard, /官方账号作品发现/u);
 });
 
-test('official comment patrol defaults to latest seven Shanghai calendar days', () => {
+test('official comment patrol requires an explicit post count and does not infer dates', () => {
+  assert.equal(
+    normalizeOfficialCommentPatrolFilter({
+      officialAccountId: '11111111-1111-4111-8111-111111111111',
+    }).failure.error,
+    'posts_limit_required',
+  );
   const normalized = normalizeOfficialCommentPatrolFilter({
     officialAccountId: '11111111-1111-4111-8111-111111111111',
-  }, {now: new Date('2026-07-26T16:30:00.000Z')});
+    postsLimit: 30,
+    commentsLimit: 50,
+  });
   assert.deepEqual(normalized.filter, {
     officialAccountId: '11111111-1111-4111-8111-111111111111',
-    publishDateFrom: '2026-07-21',
-    publishDateTo: '2026-07-27',
-    postsLimit: 20,
+    postsLimit: 30,
     commentsLimit: 50,
     requestedPlatform: '',
     timezone: 'Asia/Shanghai',
   });
 });
 
-test('official comment patrol rejects missing accounts, bad windows, and over-limit requests', () => {
+test('official comment patrol rejects missing accounts and over-limit requests', () => {
   assert.equal(
     normalizeOfficialCommentPatrolFilter({}).failure.error,
     'official_account_required',
@@ -130,51 +203,29 @@ test('official comment patrol rejects missing accounts, bad windows, and over-li
   assert.equal(
     normalizeOfficialCommentPatrolFilter({
       officialAccountId: '11111111-1111-4111-8111-111111111111',
-      publishDateFrom: '2026-02-30',
-      publishDateTo: '2026/03/01',
-    }).failure.error,
-    'invalid_publish_date',
-  );
-  assert.equal(
-    normalizeOfficialCommentPatrolFilter({
-      officialAccountId: '11111111-1111-4111-8111-111111111111',
-      publishDateFrom: '2026-07-26oops',
-    }).failure.error,
-    'invalid_publish_date',
-  );
-  assert.equal(
-    normalizeOfficialCommentPatrolFilter({
-      officialAccountId: '11111111-1111-4111-8111-111111111111',
-      publishDateFrom: '2026-07-26',
-      publishDateTo: '2026-07-01',
-    }).failure.error,
-    'invalid_publish_date_range',
-  );
-  assert.equal(
-    normalizeOfficialCommentPatrolFilter({
-      officialAccountId: '11111111-1111-4111-8111-111111111111',
-      publishDateFrom: '2026-06-01',
-      publishDateTo: '2026-07-01',
-    }).failure.error,
-    'publish_date_range_too_large',
-  );
-  assert.equal(
-    normalizeOfficialCommentPatrolFilter({
-      officialAccountId: '11111111-1111-4111-8111-111111111111',
-      postsLimit: 21,
+      postsLimit: 101,
+      commentsLimit: 50,
     }).failure.error,
     'invalid_posts_limit',
   );
   assert.equal(
     normalizeOfficialCommentPatrolFilter({
       officialAccountId: '11111111-1111-4111-8111-111111111111',
+      postsLimit: 20,
+    }).failure.error,
+    'comments_limit_required',
+  );
+  assert.equal(
+    normalizeOfficialCommentPatrolFilter({
+      officialAccountId: '11111111-1111-4111-8111-111111111111',
+      postsLimit: 20,
       commentsLimit: 101,
     }).failure.error,
     'invalid_comments_limit',
   );
 });
 
-test('candidate selection is tenant-scoped, exact-account matched, dated, and URL-safe', () => {
+test('candidate selection is tenant-scoped, exact-account matched, and URL-safe', () => {
   const accountWhere = sourceSection(
     route,
     'function officialAccountWhere',
@@ -211,19 +262,24 @@ test('candidate selection is tenant-scoped, exact-account matched, dated, and UR
 });
 
 test('create route creates one account-page Agent task and forces comment sampling sync', () => {
+  const createRoute = sourceSection(
+    route,
+    "router.post(\n  '/official-comment-patrol/tasks'",
+    'export default router',
+  );
   assert.match(route, /'\/official-comment-patrol\/tasks'/u);
   assert.match(route, /agent_required/u);
   assert.match(route, /loadCompatibleProfilePatrolAgent/u);
   assert.match(route, /materializeProfilePatrolTask/u);
   assert.match(route, /subjectType: 'official'/u);
   assert.match(route, /official_account_comment_patrol/u);
-  assert.match(route, /publishWindow: 'custom'/u);
   assert.match(route, /postsLimit: normalized\.filter\.postsLimit/u);
   assert.match(route, /includeComments: true/u);
   assert.match(route, /includeCommentsOnDetailCapture: true/u);
   assert.match(route, /autoSyncAfterDetailCapture: true/u);
   assert.match(route, /commentsMaxDetectedItems: normalized\.filter\.commentsLimit/u);
   assert.match(route, /skipAlreadyCapturedOnDetailCapture: false/u);
-  assert.match(route, /verifyPublishDateFromDetail: true/u);
+  assert.match(route, /scanLatestPostsByCount: true/u);
+  assert.doesNotMatch(createRoute, /publishDateFrom|publishDateTo|verifyPublishDateFromDetail/u);
   assert.doesNotMatch(route, /recordIds: normalized\.recordIds/u);
 });

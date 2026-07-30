@@ -3,12 +3,36 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.67',
+  latestVersion: '0.3.70',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-07-29',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.67-20260729.zip',
+  releaseDate: '2026-07-30',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.70-20260730.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.70',
+      releaseDate: '2026-07-30',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: 'Edge 账号巡查不再被误停止',
+              desc: 'Edge 临时重建账号页目标时会继续当前巡查，不再把浏览器内部切换误判为用户取消；长任务持续上报进度，详情工作页中断后可续跑未完成作品。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '官方账号按作品数量巡查',
+              desc: '复用账号页采集增强，用户分别填写作品加载数量与每篇评论加载上限；新作品入库，已有作品也会重新读取并补充评论，不再按不可靠的列表日期过滤。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.67',
       releaseDate: '2026-07-29',

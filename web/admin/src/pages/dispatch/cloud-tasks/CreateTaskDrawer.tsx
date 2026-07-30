@@ -25,7 +25,7 @@ const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
   { value: 'creator_patrol', title: '关注博主扫描', description: '打开已关注博主主页，发现近期作品并更新博主新动态。', note: '主页作品发现', icon: Radar, planned: false },
   { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
-  { value: 'comment_patrol', title: '官方账号评论巡查', description: '打开官方账号主页，按发布时间读取近期作品及当前可见评论。', note: '账号主页增强', icon: MessagesSquare, planned: false },
+  { value: 'comment_patrol', title: '官方账号评论巡查', description: '打开官方账号主页，按最新顺序读取指定数量的作品及当前可见评论。', note: '账号主页增强', icon: MessagesSquare, planned: false },
 ]
 
 const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [

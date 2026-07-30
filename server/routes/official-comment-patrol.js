@@ -21,12 +21,26 @@ const router = Router();
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
-const MAX_POSTS = 20;
+const MAX_POSTS = 100;
 const MAX_COMMENTS_PER_POST = 100;
-const DEFAULT_POSTS_LIMIT = 20;
 const DEFAULT_COMMENTS_LIMIT = 50;
-const MAX_WINDOW_DAYS = 30;
+const MAX_WORKBENCH_PAGE_SIZE = 50;
 const WORKFLOW = 'official_account_comment_patrol';
+const COMMENT_ACTION_TYPES = new Set([
+  'delete_review',
+  'reply',
+  'like',
+  'encourage_reply',
+  'ignore',
+  'ticket',
+  'manual_complete',
+]);
+const COMMENT_ACTION_STATUSES = new Set([
+  'pending',
+  'completed',
+  'canceled',
+  'failed',
+]);
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -53,22 +67,6 @@ function sendRequestError(res, failure) {
 function normalizedUuid(value) {
   const candidate = text(value, 100).toLowerCase();
   return UUID_PATTERN.test(candidate) ? candidate : '';
-}
-
-function normalizeCalendarDate(value) {
-  const candidate = String(value ?? '').trim();
-  const match = candidate.match(/^(\d{4})-(\d{2})-(\d{2})$/u);
-  if (!match) return '';
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const date = new Date(Date.UTC(year, month - 1, day));
-  if (
-    date.getUTCFullYear() !== year ||
-    date.getUTCMonth() !== month - 1 ||
-    date.getUTCDate() !== day
-  ) return '';
-  return candidate;
 }
 
 function shanghaiCalendarDate(now = new Date()) {
@@ -99,19 +97,391 @@ function boundedInteger(value, fallback, minimum, maximum) {
   return parsed;
 }
 
-function inclusiveDays(from, to) {
-  return Math.floor(
-    (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) /
-      86_400_000,
-  ) + 1;
+function safeCount(value) {
+  const normalized = Number(value);
+  return Number.isFinite(normalized)
+    ? Math.max(0, Math.floor(normalized))
+    : 0;
+}
+
+function ratio(part, total) {
+  const denominator = safeCount(total);
+  return denominator > 0
+    ? Math.round((safeCount(part) / denominator) * 1000) / 10
+    : 0;
+}
+
+function isoOrNull(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function workbenchRiskTrend(row) {
+  if (!row.previous_snapshot_at) return 'baseline';
+  const currentRate = ratio(row.current_negative, row.current_sampled);
+  const previousRate = ratio(row.previous_negative, row.previous_sampled);
+  const negativeDelta =
+    safeCount(row.current_negative) - safeCount(row.previous_negative);
+  const rateDelta = Math.round((currentRate - previousRate) * 10) / 10;
+  if (negativeDelta > 0 || rateDelta >= 0.5) return 'rising';
+  if (negativeDelta < 0 || rateDelta <= -0.5) return 'falling';
+  return 'stable';
+}
+
+function publicWorkbenchPost(row) {
+  const current = {
+    total: safeCount(row.current_sampled),
+    positive: safeCount(row.current_positive),
+    neutral: safeCount(row.current_neutral),
+    negative: safeCount(row.current_negative),
+    unknown: safeCount(row.current_unknown),
+  };
+  const previous = row.previous_snapshot_at
+    ? {
+        total: safeCount(row.previous_sampled),
+        positive: safeCount(row.previous_positive),
+        neutral: safeCount(row.previous_neutral),
+        negative: safeCount(row.previous_negative),
+        unknown: safeCount(row.previous_unknown),
+      }
+    : null;
+  const negativeRate = ratio(current.negative, current.total);
+  const previousNegativeRate = previous
+    ? ratio(previous.negative, previous.total)
+    : null;
+  const engagement = {
+    likes: safeCount(row.likes),
+    comments: safeCount(row.platform_comments),
+    shares: safeCount(row.shares),
+  };
+  return {
+    id: row.id,
+    title: row.title || row.content || '未命名作品',
+    url: negativePatrolTargetUrl(row) || '',
+    platform: row.platform,
+    externalId: row.external_id,
+    publishedAt: row.published_ts || null,
+    publishTime: row.publish_time || '',
+    officialAccount: {
+      id: row.official_account_id,
+      name: row.official_account_name,
+      platform: row.platform,
+    },
+    coverage: {
+      platformComments: safeCount(row.platform_comments),
+      sampledComments: current.total,
+      percent: safeCount(row.platform_comments) > 0
+        ? Math.min(
+            100,
+            Math.round(
+              (current.total / safeCount(row.platform_comments)) * 100,
+            ),
+          )
+        : null,
+      note: '平台显示数与本次可访问样本使用不同口径。',
+    },
+    engagement: {
+      ...engagement,
+      trend: row.previous_engagement_at
+        ? {
+            likes: engagement.likes - safeCount(row.previous_likes),
+            comments:
+              engagement.comments - safeCount(row.previous_platform_comments),
+            shares: engagement.shares - safeCount(row.previous_shares),
+            capturedAt: isoOrNull(row.previous_engagement_at),
+          }
+        : null,
+    },
+    sentiment: {
+      ...current,
+      negativeRate,
+    },
+    previousSentiment: previous
+      ? {
+          ...previous,
+          negativeRate: previousNegativeRate,
+        }
+      : null,
+    delta: previous
+      ? {
+          comments: current.total - previous.total,
+          negative: current.negative - previous.negative,
+          positive: current.positive - previous.positive,
+          negativeRate:
+            Math.round((negativeRate - previousNegativeRate) * 10) / 10,
+        }
+      : null,
+    riskTrend: workbenchRiskTrend(row),
+    todos: {
+      negative: safeCount(row.negative_pending),
+      positive: safeCount(row.positive_pending),
+    },
+    lastPatrolledAt:
+      isoOrNull(row.latest_snapshot_at) ||
+      isoOrNull(row.latest_comment_at),
+    previousPatrolledAt: isoOrNull(row.previous_snapshot_at),
+    patrolStatus: row.latest_snapshot_at
+      ? 'completed'
+      : safeCount(row.current_sampled) > 0
+        ? 'sampled'
+        : 'not_patrolled',
+  };
+}
+
+function buildWorkbenchCte(tenantId, query = {}) {
+  const params = [tenantId];
+  const where = [
+    'record.tenant_id = $1',
+    "record.platform IN ('xiaohongshu', 'douyin')",
+  ];
+  const sort = query.sort === 'collected_desc'
+    ? 'collected_desc'
+    : 'published_desc';
+  const platform = text(query.platform, 40).toLowerCase();
+  if (SUPPORTED_PLATFORMS.has(platform)) {
+    params.push(platform);
+    where.push(`record.platform = $${params.length}`);
+  }
+  const officialAccountId = normalizedUuid(query.officialAccountId);
+  if (officialAccountId) {
+    params.push(officialAccountId);
+    where.push(`account.id = $${params.length}::uuid`);
+  }
+  const search = text(query.search, 200);
+  if (search) {
+    params.push(`%${search}%`);
+    where.push(`(
+      COALESCE(record.title, '') ILIKE $${params.length}
+      OR COALESCE(record.content, '') ILIKE $${params.length}
+      OR COALESCE(account.account_name, '') ILIKE $${params.length}
+    )`);
+  }
+
+  return {
+    params,
+    sort,
+    sql: `
+      WITH matched_posts AS (
+        SELECT record.id, record.platform, record.external_id,
+          record.note_type, record.title, record.content, record.url,
+          record.canonical_url, record.publish_time, record.published_ts,
+          record.likes, record.shares, record.latest_observation_id,
+          record.comments_count AS platform_comments,
+          account.id AS official_account_id,
+          account.account_name AS official_account_name
+        FROM records record
+        JOIN LATERAL (
+          SELECT candidate.id, candidate.account_name
+          FROM official_accounts candidate
+          WHERE candidate.tenant_id = record.tenant_id
+            AND candidate.status = 'active'
+            AND candidate.platform = record.platform
+            AND (
+              (
+                NULLIF(BTRIM(candidate.platform_user_id), '') IS NOT NULL
+                AND record.author_id = candidate.platform_user_id
+              )
+              OR (
+                NULLIF(BTRIM(candidate.account_no), '') IS NOT NULL
+                AND record.author_account_no = candidate.account_no
+              )
+              OR (
+                NULLIF(BTRIM(candidate.account_id), '') IS NOT NULL
+                AND (
+                  record.author_id = candidate.account_id
+                  OR record.author_account_no = candidate.account_id
+                )
+              )
+            )
+          ORDER BY candidate.updated_at DESC, candidate.id
+          LIMIT 1
+        ) account ON true
+        WHERE ${where.join('\n          AND ')}
+      ),
+      comment_state AS (
+        SELECT post.id,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+          )::integer AS sampled_comments,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+              AND comment.sentiment = 'positive'
+          )::integer AS positive_comments,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+              AND comment.sentiment = 'neutral'
+          )::integer AS neutral_comments,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+              AND (
+                comment.sentiment = 'negative'
+                OR comment.is_negative = true
+                OR comment.risk_level IN ('high', 'critical')
+              )
+          )::integer AS negative_comments,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+              AND COALESCE(comment.sentiment, '') NOT IN (
+                'positive', 'neutral', 'negative'
+              )
+              AND comment.is_negative = false
+              AND comment.risk_level NOT IN ('high', 'critical')
+          )::integer AS unknown_comments,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+              AND (
+                comment.sentiment = 'negative'
+                OR comment.is_negative = true
+                OR comment.risk_level IN ('high', 'critical')
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM official_comment_actions action
+                WHERE action.tenant_id = comment.tenant_id
+                  AND action.comment_id = comment.id
+                  AND action.status = 'completed'
+                  AND action.action_type IN (
+                    'reply', 'ignore', 'ticket', 'manual_complete'
+                  )
+              )
+          )::integer AS negative_pending,
+          COUNT(comment.id) FILTER (
+            WHERE comment.is_official = false
+              AND comment.sentiment = 'positive'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM official_comment_actions action
+                WHERE action.tenant_id = comment.tenant_id
+                  AND action.comment_id = comment.id
+                  AND action.status = 'completed'
+                  AND action.action_type IN (
+                    'like', 'encourage_reply', 'ignore', 'manual_complete'
+                  )
+              )
+          )::integer AS positive_pending,
+          MAX(comment.last_seen_at) FILTER (
+            WHERE comment.is_official = false
+          ) AS latest_comment_at
+        FROM matched_posts post
+        LEFT JOIN record_comments comment
+          ON comment.tenant_id = $1
+          AND comment.record_id = post.id
+        GROUP BY post.id
+      ),
+      post_state AS (
+        SELECT post.*,
+          COALESCE(latest.sampled_comment_count, state.sampled_comments, 0)
+            AS current_sampled,
+          COALESCE(latest.positive_comment_count, state.positive_comments, 0)
+            AS current_positive,
+          COALESCE(latest.neutral_comment_count, state.neutral_comments, 0)
+            AS current_neutral,
+          COALESCE(latest.negative_comment_count, state.negative_comments, 0)
+            AS current_negative,
+          COALESCE(latest.unknown_comment_count, state.unknown_comments, 0)
+            AS current_unknown,
+          COALESCE(state.negative_pending, 0) AS negative_pending,
+          COALESCE(state.positive_pending, 0) AS positive_pending,
+          state.latest_comment_at,
+          latest.captured_at AS latest_snapshot_at,
+          previous.captured_at AS previous_snapshot_at,
+          COALESCE(previous.sampled_comment_count, 0) AS previous_sampled,
+          COALESCE(previous.positive_comment_count, 0) AS previous_positive,
+          COALESCE(previous.neutral_comment_count, 0) AS previous_neutral,
+          COALESCE(previous.negative_comment_count, 0) AS previous_negative,
+          COALESCE(previous.unknown_comment_count, 0) AS previous_unknown,
+          previous_engagement.captured_at AS previous_engagement_at,
+          previous_engagement.likes AS previous_likes,
+          previous_engagement.comments_count AS previous_platform_comments,
+          previous_engagement.shares AS previous_shares
+        FROM matched_posts post
+        LEFT JOIN comment_state state ON state.id = post.id
+        LEFT JOIN LATERAL (
+          SELECT snapshot.*
+          FROM official_comment_patrol_snapshots snapshot
+          WHERE snapshot.tenant_id = $1
+            AND snapshot.record_id = post.id
+          ORDER BY snapshot.captured_at DESC, snapshot.id DESC
+          LIMIT 1
+        ) latest ON true
+        LEFT JOIN LATERAL (
+          SELECT snapshot.*
+          FROM official_comment_patrol_snapshots snapshot
+          WHERE snapshot.tenant_id = $1
+            AND snapshot.record_id = post.id
+            AND latest.id IS NOT NULL
+            AND snapshot.id <> latest.id
+          ORDER BY snapshot.captured_at DESC, snapshot.id DESC
+          LIMIT 1
+        ) previous ON true
+        LEFT JOIN LATERAL (
+          SELECT observation.likes, observation.comments_count,
+            observation.shares, observation.captured_at
+          FROM record_observations observation
+          WHERE observation.tenant_id = $1
+            AND observation.record_id = post.id
+            AND post.latest_observation_id IS NOT NULL
+            AND observation.id <> post.latest_observation_id
+          ORDER BY observation.captured_at DESC, observation.id DESC
+          LIMIT 1
+        ) previous_engagement ON true
+      ),
+      filtered_posts AS (
+        SELECT *
+        FROM post_state
+      )
+    `,
+  };
+}
+
+async function loadOfficialWorkbenchPost(tenantId, recordId) {
+  if (!normalizedUuid(recordId)) return null;
+  return queryOne(`
+    SELECT record.id, record.platform, record.external_id, record.note_type,
+      record.title, record.content, record.url, record.canonical_url,
+      record.publish_time, record.published_ts,
+      account.id AS official_account_id,
+      account.account_name AS official_account_name
+    FROM records record
+    JOIN LATERAL (
+      SELECT candidate.id, candidate.account_name
+      FROM official_accounts candidate
+      WHERE candidate.tenant_id = record.tenant_id
+        AND candidate.status = 'active'
+        AND candidate.platform = record.platform
+        AND (
+          (
+            NULLIF(BTRIM(candidate.platform_user_id), '') IS NOT NULL
+            AND record.author_id = candidate.platform_user_id
+          )
+          OR (
+            NULLIF(BTRIM(candidate.account_no), '') IS NOT NULL
+            AND record.author_account_no = candidate.account_no
+          )
+          OR (
+            NULLIF(BTRIM(candidate.account_id), '') IS NOT NULL
+            AND (
+              record.author_id = candidate.account_id
+              OR record.author_account_no = candidate.account_id
+            )
+          )
+        )
+      ORDER BY candidate.updated_at DESC, candidate.id
+      LIMIT 1
+    ) account ON true
+    WHERE record.id = $1::uuid
+      AND record.tenant_id = $2
+    LIMIT 1
+  `, [recordId, tenantId]);
 }
 
 /**
- * The date window is intentionally mandatory at task execution time. When the
- * caller does not provide one, the explicit default is the latest seven
- * calendar days in Asia/Shanghai; no all-history patrol is available in V1.
+ * Official-account patrol is count based. Profile list publication dates are
+ * not reliable enough to be used as a dispatch filter, so the caller chooses
+ * how many of the account's latest posts to inspect.
  */
-export function normalizeOfficialCommentPatrolFilter(body = {}, {now} = {}) {
+export function normalizeOfficialCommentPatrolFilter(body = {}) {
   const source = safeJson(body);
   const officialAccountId = normalizedUuid(source.officialAccountId);
   if (!officialAccountId) {
@@ -120,43 +490,19 @@ export function normalizeOfficialCommentPatrolFilter(body = {}, {now} = {}) {
       '请选择一个有效的官方账号',
     )};
   }
-  const today = shanghaiCalendarDate(now instanceof Date ? now : new Date());
-  const hasPublishDateFrom = Object.prototype.hasOwnProperty.call(
-    source,
-    'publishDateFrom',
-  );
-  const hasPublishDateTo = Object.prototype.hasOwnProperty.call(
-    source,
-    'publishDateTo',
-  );
-  const normalizedPublishDateFrom = normalizeCalendarDate(source.publishDateFrom);
-  const normalizedPublishDateTo = normalizeCalendarDate(source.publishDateTo);
-  if (
-    (hasPublishDateFrom && !normalizedPublishDateFrom) ||
-    (hasPublishDateTo && !normalizedPublishDateTo)
-  ) {
+  const hasPostsLimit =
+    Object.prototype.hasOwnProperty.call(source, 'postsLimit') ||
+    Object.prototype.hasOwnProperty.call(source, 'limit');
+  const rawPostsLimit = source.postsLimit ?? source.limit;
+  if (!hasPostsLimit || rawPostsLimit === '') {
     return {failure: requestError(
-      'invalid_publish_date',
-      '发布时间必须是有效日期，格式为 YYYY-MM-DD',
-    )};
-  }
-  const publishDateFrom = normalizedPublishDateFrom || addDays(today, -6);
-  const publishDateTo = normalizedPublishDateTo || today;
-  if (publishDateFrom > publishDateTo) {
-    return {failure: requestError(
-      'invalid_publish_date_range',
-      '发布时间开始日期不能晚于结束日期',
-    )};
-  }
-  if (inclusiveDays(publishDateFrom, publishDateTo) > MAX_WINDOW_DAYS) {
-    return {failure: requestError(
-      'publish_date_range_too_large',
-      `发布时间范围最多 ${MAX_WINDOW_DAYS} 天`,
+      'posts_limit_required',
+      '请填写本次要巡查的最近作品数量',
     )};
   }
   const postsLimit = boundedInteger(
-    source.postsLimit ?? source.limit,
-    DEFAULT_POSTS_LIMIT,
+    rawPostsLimit,
+    null,
     1,
     MAX_POSTS,
   );
@@ -166,9 +512,20 @@ export function normalizeOfficialCommentPatrolFilter(body = {}, {now} = {}) {
       `postsLimit 必须是 1-${MAX_POSTS} 的整数`,
     )};
   }
+  const hasCommentsLimit =
+    Object.prototype.hasOwnProperty.call(source, 'commentsLimit') ||
+    Object.prototype.hasOwnProperty.call(source, 'commentsMaxDetectedItems');
+  const rawCommentsLimit =
+    source.commentsLimit ?? source.commentsMaxDetectedItems;
+  if (!hasCommentsLimit || rawCommentsLimit === '') {
+    return {failure: requestError(
+      'comments_limit_required',
+      '请填写每篇作品的评论加载上限',
+    )};
+  }
   const commentsLimit = boundedInteger(
-    source.commentsLimit ?? source.commentsMaxDetectedItems,
-    DEFAULT_COMMENTS_LIMIT,
+    rawCommentsLimit,
+    null,
     1,
     MAX_COMMENTS_PER_POST,
   );
@@ -188,8 +545,6 @@ export function normalizeOfficialCommentPatrolFilter(body = {}, {now} = {}) {
   return {
     filter: {
       officialAccountId,
-      publishDateFrom,
-      publishDateTo,
       postsLimit,
       commentsLimit,
       requestedPlatform,
@@ -217,19 +572,12 @@ function hasStrongOfficialIdentity(account) {
 }
 
 function officialAccountWhere(filter, recordIds = []) {
-  const params = [
-    filter.officialAccountId,
-    filter.publishDateFrom,
-    filter.publishDateTo,
-  ];
+  const params = [filter.officialAccountId];
   let where = `
     WHERE oa.id = $1::uuid
       AND oa.status = 'active'
       AND oa.platform IN ('xiaohongshu', 'douyin')
       AND r.platform = oa.platform
-      AND r.published_ts IS NOT NULL
-      AND r.published_ts >= ($2::date::timestamp AT TIME ZONE 'Asia/Shanghai')
-      AND r.published_ts < (($3::date::timestamp + INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')
       AND r.external_id ~ '^[[:alnum:]_-]{5,200}$'
       AND (
         (
@@ -249,6 +597,16 @@ function officialAccountWhere(filter, recordIds = []) {
         )
       )
   `;
+  if (filter.publishDateFrom && filter.publishDateTo) {
+    params.push(filter.publishDateFrom, filter.publishDateTo);
+    const fromIndex = params.length - 1;
+    const toIndex = params.length;
+    where += `
+      AND r.published_ts IS NOT NULL
+      AND r.published_ts >= ($${fromIndex}::date::timestamp AT TIME ZONE 'Asia/Shanghai')
+      AND r.published_ts < (($${toIndex}::date::timestamp + INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')
+    `;
+  }
   if (recordIds.length > 0) {
     params.push(recordIds);
     where += ` AND r.id = ANY($${params.length}::uuid[])`;
@@ -309,10 +667,12 @@ async function loadCandidates(executor, tenantId, filter, {recordIds = [], lock 
     JOIN official_accounts oa ON oa.id = $1::uuid AND oa.tenant_id = r.tenant_id
     ${where}
   `, params);
-  // Preview only needs at most 20 valid direct links. Fetch a bounded surplus
+  // Preview only needs a bounded number of valid direct links. Fetch a surplus
   // because historic rows may contain an expired/share URL that is not safe to
   // dispatch to an extension.
-  const queryLimit = recordIds.length > 0 ? recordIds.length : MAX_POSTS * 10;
+  const queryLimit = recordIds.length > 0
+    ? recordIds.length
+    : Math.min(MAX_POSTS * 10, Math.max(50, filter.postsLimit * 10));
   const rows = await executor.queryAll(`
     SELECT r.id, r.platform, r.external_id, r.title, r.url, r.canonical_url,
       r.note_type, r.publish_time, r.published_ts, r.author_name,
@@ -361,6 +721,570 @@ async function loadCandidates(executor, tenantId, filter, {recordIds = [], lock 
     limited: Number(totalRow?.total || 0) > candidates.length,
   };
 }
+
+router.get(
+  '/official-comment-patrol/workbench',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const page = Math.max(1, safeCount(req.query.page) || 1);
+      const pageSize = Math.min(
+        MAX_WORKBENCH_PAGE_SIZE,
+        Math.max(1, safeCount(req.query.pageSize) || 20),
+      );
+      const query = {
+        platform: req.query.platform,
+        officialAccountId: req.query.officialAccountId,
+        sort: req.query.sort,
+        search: req.query.search,
+      };
+      const workbench = buildWorkbenchCte(req.tenantId, query);
+      const orderBy = workbench.sort === 'collected_desc'
+        ? `COALESCE(latest_snapshot_at, latest_comment_at) DESC NULLS LAST,
+          published_ts DESC NULLS LAST, id`
+        : 'published_ts DESC NULLS LAST, id';
+      const summary = await queryOne(`
+        ${workbench.sql}
+        SELECT
+          COUNT(*)::integer AS total_posts,
+          COUNT(DISTINCT official_account_id)::integer AS account_count,
+          COUNT(*) FILTER (
+            WHERE previous_snapshot_at IS NOT NULL
+          )::integer AS compared_posts,
+          COALESCE(SUM(
+            CASE
+              WHEN previous_snapshot_at IS NOT NULL
+              THEN GREATEST(current_sampled - previous_sampled, 0)
+              ELSE 0
+            END
+          ), 0)::integer AS new_comments,
+          COALESCE(SUM(
+            CASE
+              WHEN previous_snapshot_at IS NOT NULL
+              THEN GREATEST(current_negative - previous_negative, 0)
+              ELSE 0
+            END
+          ), 0)::integer AS new_negative,
+          COALESCE(SUM(current_negative), 0)::integer AS negative_comments,
+          COALESCE(SUM(current_positive), 0)::integer AS positive_comments,
+          COALESCE(SUM(negative_pending), 0)::integer AS negative_pending,
+          COALESCE(SUM(positive_pending), 0)::integer AS positive_pending,
+          COUNT(*) FILTER (
+            WHERE previous_snapshot_at IS NOT NULL
+              AND (
+                current_negative > previous_negative
+                OR (
+                  CASE
+                    WHEN current_sampled > 0
+                    THEN current_negative::numeric / current_sampled
+                    ELSE 0
+                  END
+                  -
+                  CASE
+                    WHEN previous_sampled > 0
+                    THEN previous_negative::numeric / previous_sampled
+                    ELSE 0
+                  END
+                ) >= 0.005
+              )
+          )::integer AS risk_rising_posts,
+          MAX(latest_snapshot_at) AS latest_snapshot_at,
+          MAX(previous_snapshot_at) AS previous_snapshot_at
+        FROM filtered_posts
+      `, workbench.params);
+      const rowParams = [
+        ...workbench.params,
+        pageSize,
+        (page - 1) * pageSize,
+      ];
+      const posts = await queryAll(`
+        ${workbench.sql}
+        SELECT *
+        FROM filtered_posts
+        ORDER BY ${orderBy}
+        LIMIT $${rowParams.length - 1}
+        OFFSET $${rowParams.length}
+      `, rowParams);
+      const accounts = await queryAll(`
+        SELECT id, account_name, platform
+        FROM official_accounts
+        WHERE tenant_id = $1
+          AND status = 'active'
+          AND platform IN ('xiaohongshu', 'douyin')
+        ORDER BY platform, account_name, id
+      `, [req.tenantId]);
+      const total = safeCount(summary?.total_posts);
+      return res.json({
+        ok: true,
+        sort: workbench.sort,
+        accounts: accounts.map(account => ({
+          id: account.id,
+          name: account.account_name,
+          platform: account.platform,
+        })),
+        comparison: {
+          scope: 'per_post_latest_two_valid_patrols',
+          baselineOnly: safeCount(summary?.compared_posts) === 0,
+          comparedPosts: safeCount(summary?.compared_posts),
+          latestPatrolledAt: isoOrNull(summary?.latest_snapshot_at),
+          previousPatrolledAt: isoOrNull(summary?.previous_snapshot_at),
+          newComments: safeCount(summary?.new_comments),
+          newNegative: safeCount(summary?.new_negative),
+          negativeComments: safeCount(summary?.negative_comments),
+          positiveComments: safeCount(summary?.positive_comments),
+          negativePending: safeCount(summary?.negative_pending),
+          positivePending: safeCount(summary?.positive_pending),
+          riskRisingPosts: safeCount(summary?.risk_rising_posts),
+        },
+        posts: posts.map(publicWorkbenchPost),
+        pagination: {
+          page,
+          pageSize,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / pageSize)),
+        },
+        message: '趋势按每篇帖子最近两次有效巡查快照计算；首次巡查只建立基线。',
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.get(
+  '/official-comment-patrol/posts/:id/comments',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const post = await loadOfficialWorkbenchPost(
+        req.tenantId,
+        req.params.id,
+      );
+      if (!post) {
+        return res.status(404).json({
+          ok: false,
+          error: 'official_post_not_found',
+          message: '未找到当前租户的官方账号帖子',
+        });
+      }
+      const bucket = ['negative', 'positive', 'all'].includes(
+        String(req.query.bucket || ''),
+      )
+        ? String(req.query.bucket)
+        : 'negative';
+      const page = Math.max(1, safeCount(req.query.page) || 1);
+      const pageSize = Math.min(
+        MAX_WORKBENCH_PAGE_SIZE,
+        Math.max(1, safeCount(req.query.pageSize) || 20),
+      );
+      const snapshots = await queryAll(`
+        SELECT *
+        FROM official_comment_patrol_snapshots
+        WHERE tenant_id = $1
+          AND record_id = $2::uuid
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 2
+      `, [req.tenantId, post.id]);
+      const previousPatrolledAt = snapshots[1]?.captured_at || null;
+      const counts = await queryOne(`
+        SELECT
+          COUNT(*) FILTER (WHERE comment.is_official = false)::integer
+            AS total,
+          COUNT(*) FILTER (
+            WHERE comment.is_official = false
+              AND (
+                comment.sentiment = 'negative'
+                OR comment.is_negative = true
+                OR comment.risk_level IN ('high', 'critical')
+              )
+          )::integer AS negative,
+          COUNT(*) FILTER (
+            WHERE comment.is_official = false
+              AND comment.sentiment = 'positive'
+          )::integer AS positive,
+          COUNT(*) FILTER (
+            WHERE comment.is_official = false
+              AND (
+                comment.sentiment = 'negative'
+                OR comment.is_negative = true
+                OR comment.risk_level IN ('high', 'critical')
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM official_comment_actions action
+                WHERE action.tenant_id = comment.tenant_id
+                  AND action.comment_id = comment.id
+                  AND action.status = 'completed'
+                  AND action.action_type IN (
+                    'reply', 'ignore', 'ticket', 'manual_complete'
+                  )
+              )
+          )::integer AS negative_pending,
+          COUNT(*) FILTER (
+            WHERE comment.is_official = false
+              AND comment.sentiment = 'positive'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM official_comment_actions action
+                WHERE action.tenant_id = comment.tenant_id
+                  AND action.comment_id = comment.id
+                  AND action.status = 'completed'
+                  AND action.action_type IN (
+                    'like', 'encourage_reply', 'ignore', 'manual_complete'
+                  )
+              )
+          )::integer AS positive_pending
+        FROM record_comments comment
+        WHERE comment.tenant_id = $1
+          AND comment.record_id = $2::uuid
+      `, [req.tenantId, post.id]);
+      const bucketCondition = bucket === 'negative'
+        ? `AND (
+            comment.sentiment = 'negative'
+            OR comment.is_negative = true
+            OR comment.risk_level IN ('high', 'critical')
+          )`
+        : bucket === 'positive'
+          ? `AND comment.sentiment = 'positive'`
+          : '';
+      const total = await queryOne(`
+        SELECT COUNT(*)::integer AS total
+        FROM record_comments comment
+        WHERE comment.tenant_id = $1
+          AND comment.record_id = $2::uuid
+          AND comment.is_official = false
+          ${bucketCondition}
+      `, [req.tenantId, post.id]);
+      const comments = await queryAll(`
+        SELECT comment.*,
+          lead.id AS lead_id,
+          COALESCE((
+            SELECT jsonb_agg(action_row ORDER BY action_row.updated_at DESC)
+            FROM (
+              SELECT action.id, action.action_type, action.status,
+                action.note, action.actor_name, action.completed_at,
+                action.created_at, action.updated_at
+              FROM official_comment_actions action
+              WHERE action.tenant_id = comment.tenant_id
+                AND action.comment_id = comment.id
+              ORDER BY action.updated_at DESC
+              LIMIT 8
+            ) action_row
+          ), '[]'::jsonb) AS actions
+        FROM record_comments comment
+        LEFT JOIN comment_leads lead
+          ON lead.tenant_id = comment.tenant_id
+          AND lead.comment_id = comment.id
+        WHERE comment.tenant_id = $1
+          AND comment.record_id = $2::uuid
+          AND comment.is_official = false
+          ${bucketCondition}
+        ORDER BY
+          CASE comment.risk_level
+            WHEN 'critical' THEN 0
+            WHEN 'high' THEN 1
+            WHEN 'medium' THEN 2
+            WHEN 'low' THEN 3
+            ELSE 4
+          END,
+          comment.like_count DESC,
+          comment.last_seen_at DESC,
+          comment.id
+        LIMIT $3 OFFSET $4
+      `, [
+        req.tenantId,
+        post.id,
+        pageSize,
+        (page - 1) * pageSize,
+      ]);
+      return res.json({
+        ok: true,
+        post: {
+          id: post.id,
+          title: post.title || post.content || '未命名作品',
+          url: negativePatrolTargetUrl(post) || '',
+          platform: post.platform,
+          publishedAt: post.published_ts || null,
+          officialAccount: {
+            id: post.official_account_id,
+            name: post.official_account_name,
+          },
+        },
+        bucket,
+        counts: {
+          all: safeCount(counts?.total),
+          negative: safeCount(counts?.negative),
+          positive: safeCount(counts?.positive),
+          negativePending: safeCount(counts?.negative_pending),
+          positivePending: safeCount(counts?.positive_pending),
+        },
+        comparison: {
+          latestPatrolledAt: isoOrNull(snapshots[0]?.captured_at),
+          previousPatrolledAt: isoOrNull(previousPatrolledAt),
+          baselineOnly: snapshots.length < 2,
+        },
+        comments: comments.map(comment => ({
+          id: comment.id,
+          authorName: comment.author_name || '未知用户',
+          authorAvatar: comment.author_avatar || '',
+          content: comment.content || '',
+          likeCount: safeCount(comment.like_count),
+          publishedAt: comment.published_at || null,
+          ipLocation: comment.ip_location || '',
+          sentiment: comment.sentiment || 'unknown',
+          isNegative: Boolean(comment.is_negative),
+          riskLevel: comment.risk_level || 'none',
+          category: comment.category || '',
+          summary: comment.ai_summary || '',
+          firstSeenAt: isoOrNull(comment.first_seen_at),
+          lastSeenAt: isoOrNull(comment.last_seen_at),
+          isNewSincePrevious: previousPatrolledAt
+            ? new Date(comment.first_seen_at) > new Date(previousPatrolledAt)
+            : false,
+          leadId: comment.lead_id || null,
+          actions: Array.isArray(comment.actions) ? comment.actions : [],
+        })),
+        pagination: {
+          page,
+          pageSize,
+          total: safeCount(total?.total),
+          totalPages: Math.max(
+            1,
+            Math.ceil(safeCount(total?.total) / pageSize),
+          ),
+        },
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/official-comment-patrol/comments/:id/actions',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const commentId = normalizedUuid(req.params.id);
+      const actionType = text(req.body?.actionType, 40);
+      if (!commentId || !COMMENT_ACTION_TYPES.has(actionType)) {
+        return sendRequestError(res, requestError(
+          'invalid_comment_action',
+          '评论操作类型无效',
+        ));
+      }
+      const requestedStatus = text(req.body?.status, 40);
+      const status = COMMENT_ACTION_STATUSES.has(requestedStatus)
+        ? requestedStatus
+        : ['ignore', 'manual_complete'].includes(actionType)
+          ? 'completed'
+          : 'pending';
+      const result = await withTransaction(async tx => {
+        const comment = await tx.queryOne(`
+          SELECT comment.id, comment.record_id, record.platform,
+            record.external_id, record.note_type, record.url,
+            record.canonical_url
+          FROM record_comments comment
+          JOIN records record
+            ON record.id = comment.record_id
+            AND record.tenant_id = comment.tenant_id
+          WHERE comment.id = $1::uuid
+            AND comment.tenant_id = $2
+            AND comment.is_official = false
+            AND EXISTS (
+              SELECT 1
+              FROM official_accounts account
+              WHERE account.tenant_id = record.tenant_id
+                AND account.status = 'active'
+                AND account.platform = record.platform
+                AND (
+                  (
+                    NULLIF(BTRIM(account.platform_user_id), '') IS NOT NULL
+                    AND record.author_id = account.platform_user_id
+                  )
+                  OR (
+                    NULLIF(BTRIM(account.account_no), '') IS NOT NULL
+                    AND record.author_account_no = account.account_no
+                  )
+                  OR (
+                    NULLIF(BTRIM(account.account_id), '') IS NOT NULL
+                    AND (
+                      record.author_id = account.account_id
+                      OR record.author_account_no = account.account_id
+                    )
+                  )
+                )
+            )
+          LIMIT 1
+          FOR UPDATE OF comment
+        `, [commentId, req.tenantId]);
+        if (!comment) return null;
+        const action = status === 'pending'
+          ? await tx.queryOne(`
+              INSERT INTO official_comment_actions (
+                tenant_id, record_id, comment_id, action_type, status,
+                note, actor_user_id, actor_name, metadata
+              ) VALUES (
+                $1, $2, $3, $4, 'pending',
+                $5, $6, $7, $8::jsonb
+              )
+              ON CONFLICT (tenant_id, comment_id, action_type)
+                WHERE status = 'pending'
+              DO UPDATE SET
+                note = excluded.note,
+                actor_user_id = excluded.actor_user_id,
+                actor_name = excluded.actor_name,
+                metadata = official_comment_actions.metadata ||
+                  excluded.metadata,
+                updated_at = now()
+              RETURNING *
+            `, [
+              req.tenantId,
+              comment.record_id,
+              comment.id,
+              actionType,
+              text(req.body?.note, 2000),
+              req.user?.id || null,
+              text(req.actorName || req.user?.name || req.user?.email, 240),
+              JSON.stringify(
+                sanitizeCloudStructuredObject(req.body?.metadata),
+              ),
+            ])
+          : await tx.queryOne(`
+              INSERT INTO official_comment_actions (
+                tenant_id, record_id, comment_id, action_type, status,
+                note, actor_user_id, actor_name, metadata, completed_at
+              ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9::jsonb,
+                CASE WHEN $5 = 'completed' THEN now() ELSE NULL END
+              )
+              RETURNING *
+            `, [
+              req.tenantId,
+              comment.record_id,
+              comment.id,
+              actionType,
+              status,
+              text(req.body?.note, 2000),
+              req.user?.id || null,
+              text(req.actorName || req.user?.name || req.user?.email, 240),
+              JSON.stringify(
+                sanitizeCloudStructuredObject(req.body?.metadata),
+              ),
+            ]);
+        await tx.execute(`
+          INSERT INTO audit_logs (
+            tenant_id, actor_type, actor_id, actor_user_id, action,
+            target_type, target_id, metadata
+          ) VALUES (
+            $1, 'user', $2, $3, 'official_comment_action.create',
+            'record_comment', $4, $5::jsonb
+          )
+        `, [
+          req.tenantId,
+          text(req.user?.id || '', 240),
+          req.user?.id || null,
+          comment.id,
+          JSON.stringify({
+            actionId: action.id,
+            actionType,
+            status,
+            recordId: comment.record_id,
+          }),
+        ]);
+        return {
+          action,
+          postUrl: negativePatrolTargetUrl(comment) || '',
+        };
+      });
+      if (!result) {
+        return res.status(404).json({
+          ok: false,
+          error: 'official_comment_not_found',
+          message: '未找到当前官方帖子下的评论',
+        });
+      }
+      return res.status(201).json({ok: true, ...result});
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.patch(
+  '/official-comment-patrol/actions/:id',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const actionId = normalizedUuid(req.params.id);
+      const status = text(req.body?.status, 40);
+      if (!actionId || !COMMENT_ACTION_STATUSES.has(status)) {
+        return sendRequestError(res, requestError(
+          'invalid_comment_action_status',
+          '评论操作状态无效',
+        ));
+      }
+      const action = await withTransaction(async tx => {
+        const updated = await tx.queryOne(`
+          UPDATE official_comment_actions
+          SET status = $1,
+            note = CASE
+              WHEN $2::boolean THEN $3
+              ELSE note
+            END,
+            completed_at = CASE
+              WHEN $1 = 'completed' THEN COALESCE(completed_at, now())
+              ELSE NULL
+            END,
+            updated_at = now()
+          WHERE id = $4::uuid
+            AND tenant_id = $5
+          RETURNING *
+        `, [
+          status,
+          Object.prototype.hasOwnProperty.call(req.body || {}, 'note'),
+          text(req.body?.note, 2000),
+          actionId,
+          req.tenantId,
+        ]);
+        if (!updated) return null;
+        await tx.execute(`
+          INSERT INTO audit_logs (
+            tenant_id, actor_type, actor_id, actor_user_id, action,
+            target_type, target_id, metadata
+          ) VALUES (
+            $1, 'user', $2, $3, 'official_comment_action.update',
+            'official_comment_action', $4, $5::jsonb
+          )
+        `, [
+          req.tenantId,
+          text(req.user?.id || '', 240),
+          req.user?.id || null,
+          updated.id,
+          JSON.stringify({status, commentId: updated.comment_id}),
+        ]);
+        return updated;
+      });
+      if (!action) {
+        return res.status(404).json({
+          ok: false,
+          error: 'comment_action_not_found',
+          message: '评论操作记录不存在',
+        });
+      }
+      return res.json({ok: true, action});
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
 
 router.get(
   '/official-comment-patrol/accounts',
@@ -462,7 +1386,7 @@ router.post(
         total: result.total,
         limited: result.limited,
         filter: {...normalized.filter, platform: result.account.platform},
-        message: '候选作品仅来自已采集、发布时间明确且可验证详情链接的官方账号内容；评论为可访问样本。',
+        message: '候选作品按账号最近内容排序；评论为可访问样本。',
       });
     } catch (error) {
       return next(error);
@@ -485,7 +1409,7 @@ router.post(
       const requestKey = rawRequestKey ? normalizedUuid(rawRequestKey) : crypto.randomUUID();
       if (!requestKey) return sendRequestError(res, requestError('invalid_request_key', 'requestKey 必须是有效 UUID'));
       const title = text(
-        req.body?.title || `官方账号评论巡查 · ${normalized.filter.publishDateFrom} 至 ${normalized.filter.publishDateTo}`,
+        req.body?.title || `官方账号评论巡查 · 最近 ${normalized.filter.postsLimit} 篇`,
         240,
       );
       const requestedSettings = sanitizeCloudStructuredObject(req.body?.captureSettings);
@@ -496,13 +1420,10 @@ router.post(
         autoSyncAfterDetailCapture: true,
         commentsMaxDetectedItems: normalized.filter.commentsLimit,
         skipAlreadyCapturedOnDetailCapture: false,
-        // 账号主页列表只用于发现候选作品，发布时间必须进入作品详情后核实。
-        verifyPublishDateFromDetail: true,
+        // 官方账号巡查按主页最新顺序取 N 篇，不依赖列表中的发布日期。
+        scanLatestPostsByCount: true,
       };
       const monitorSettings = sanitizeCloudStructuredObject({
-        publishWindow: 'custom',
-        publishDateFrom: normalized.filter.publishDateFrom,
-        publishDateTo: normalized.filter.publishDateTo,
         postsLimit: normalized.filter.postsLimit,
         timezone: normalized.filter.timezone,
       });
@@ -631,8 +1552,6 @@ router.post(
             agentId: compatible.agent.id,
             officialAccountId: normalized.filter.officialAccountId,
             monitorSubscriptionId: subscription.id,
-            publishDateFrom: normalized.filter.publishDateFrom,
-            publishDateTo: normalized.filter.publishDateTo,
             postsLimit: normalized.filter.postsLimit,
             commentsLimit: normalized.filter.commentsLimit,
             requestHash,

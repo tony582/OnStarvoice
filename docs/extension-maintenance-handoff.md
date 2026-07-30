@@ -1,772 +1,1264 @@
-# 扩展代码维护交接手册
+# StarVoice Extension 维护、发布与故障交接手册
 
-本文面向未来的维护者和接手本仓库的 AI。目标不是推动马上重构，而是在不触碰业务代码的前提下，把 Chrome 扩展侧的大文件结构、风险边界、入口关系和回归清单写清楚。
+> 适用基线：StarVoice Extension `0.3.67`
+> 核验日期：2026-07-30
+> 适用对象：Extension 维护者、后端维护者、测试与发布人员、后续接手的 AI Agent
+> 文档性质：运行事实、边界、回归门禁和故障处理手册，不是产品宣传材料
 
-如果很久以后再回来，先读本文。除非正在定位具体 bug，不建议一开始就完整阅读 `sidebar/sidebar-logic.js` 和 `utils/capture-sync.js`。
+## 1. 文档目的
 
-最后更新: 2026-07-08
+本文回答五个必须能交接的问题：
 
-## 1. 一句话结论
+1. 哪些文件是真实源码，哪些文件才是客户实际加载和收到的交付物。
+2. 激活、租户、浏览器节点、云任务、本地任务如何建立并保持隔离。
+3. 任务如何防止重复执行、旧进度覆盖新进度、停止后又被旧回调“复活”。
+4. 小红书、抖音异常页、删帖页、验证码、服务异常分别应该如何处理。
+5. 如何本地联调、打包、升级、验收和回滚，同时避免把本地地址或敏感数据交付给客户。
 
-当前扩展侧最大的维护风险不是性能，而是两个大文件承载了太多职责:
+“当前稳定”只表示本手册所列测试和行为在上述日期通过，并不代表以下情况可跳过验证：
 
-| 文件 | 当前规模 | 角色 | 建议态度 |
-|---|---:|---|---|
-| `sidebar/sidebar-logic.js` | 约 18k 行 | 侧边栏业务入口, UI 事件, 采集按钮, 批量任务, 监控, 导出 | 只在明确需求下小步修改 |
-| `utils/capture-sync.js` | 约 11k 行 | 采集编排, 入池去重, 同步, 详情补采, 评论客资, 批量关键词/链接 | 更高风险, 不要主动大拆 |
+- 平台 DOM、路由、验证码或风控策略变化；
+- Chrome / Edge 或 Manifest V3 生命周期变化；
+- 后端任务协议、租户鉴权、任务状态字段变化；
+- `manifest.json` 权限、可访问资源或内容脚本匹配范围变化；
+- 打包脚本、运行环境配置或 Extension 版本变化。
 
-推荐策略:
+## 2. 先记住的十二条硬规则
 
-1. 不为了“文件太大”单独大重构。
-2. 先补文档和回归清单。
-3. 以后改某个功能时, 只围绕该功能做小范围整理。
-4. 如果要拆文件, 先保持原入口和导出兼容, 只搬代码, 不改行为。
+1. **根目录是开发源码，`extension-build/` 是加载与交付快照。** 不要直接在 `extension-build/` 修问题。
+2. **客户包只能由生产目标重新生成。** 本地联调快照不能直接压缩发给客户。
+3. **一个浏览器 Profile 是一个 Agent。** 不是一台物理电脑一个 Agent，也不是一个窗口一个 Agent。
+4. **Agent 作用域变化必须视为新节点。** 不能把旧节点的计划、历史或命令结果自动带给新节点。
+5. **在线只表示心跳在线。** 不代表页面可采集、账号正常、任务有业务进展或 AI 正在工作。
+6. **任务状态以账本和 attempt 为准。** 页面文本、侧边栏当前显示和浏览器 URL 都不能替代任务账本。
+7. **终态吸收迟到回调。** 已完成、失败、取消、跳过的任务不能被旧异步回调改回运行中。
+8. **同一 Agent 默认只并行一个任务。** 不要绕过本地所有权锁强行多开。
+9. **清理顺序固定：先解除调试器，再关工作页，最后释放分组和所有权。**
+10. **验证码是人工介入；服务异常不是验证码。** 两者不能共用同一停止策略。
+11. **列表页日期不可信。** 官方账号评论巡查必须进入详情页读发布时间，再判断日期范围。
+12. **AI 前置筛选必须 fail-open。** AI 不清楚、超时或服务异常时继续采集，不能误删业务结果。
 
-## 2. 未来 AI 快速接手提示
+## 3. 源码、加载面与交付面
 
-可以把下面这段直接给接手的 AI:
+### 3.1 真实开发源码
 
-```text
-你正在维护 StarVoice Chrome 扩展。先读 docs/extension-maintenance-handoff.md, 不要一开始吞完整 sidebar/sidebar-logic.js 或 utils/capture-sync.js。
-
-原则:
-1. 不做大重构。
-2. 不改 storage key, MESSAGE_TYPE, sync payload 结构, Chrome tab 导航/等待顺序。
-3. 如果必须改扩展源码, 记得运行的是 extension-build/ 手动快照, 源码改完还要同步到 extension-build/ 才能给浏览器加载。
-4. sidebar/sidebar-logic.js 是 sidebar.html 的业务入口。
-5. utils/capture-sync.js 是采集和同步编排入口, 对外导出很多函数, 不要随意改函数签名。
-6. 改动前先说明影响链路, 改动后按本文回归清单验证。
-```
-
-## 3. 仓库里扩展相关的运行关系
-
-扩展源码主要在仓库根目录:
+Extension 的作者源码位于仓库根目录：
 
 ```text
 manifest.json
 background.js
 content-loader.js
 content-v2.js
+images/
 sidebar/
 utils/
-extension-build/
 ```
 
-重要提醒:
+常用职责：
 
-1. `manifest.json` 是源码清单。
-2. README 已说明: 浏览器实际加载通常是 `extension-build/` 这个手动快照。
-3. 修改根目录的 `utils/`, `sidebar/`, `background.js`, `content-v2.js`, `manifest.json` 后, 若要让浏览器使用, 需要同步到 `extension-build/` 并在 `chrome://extensions` Reload。
-4. `deploy/deploy.sh` 部署后端和后台, 不部署扩展。
+| 路径 | 职责 |
+|---|---|
+| `manifest.json` | MV3 入口、权限、站点范围、内容脚本、侧边栏和后台服务 |
+| `background.js` | Service Worker、消息分发、心跳、云任务、计划任务、调试器和标签页编排 |
+| `content-loader.js` | 页面侧最小加载器，只负责注入主内容逻辑 |
+| `content-v2.js` | 页面状态识别、页面数据桥接、详情页/搜索页协作 |
+| `sidebar/sidebar.html` | Side Panel 页面入口和脚本加载顺序 |
+| `sidebar/sidebar-logic.js` | 侧边栏主要业务交互、采集入口、任务中心交互 |
+| `sidebar/sidebar-ui.js` | 侧边栏通用 UI 辅助 |
+| `sidebar/task-center-ui.js` | 本地任务中心展示与状态操作 |
+| `utils/api.js` | 后端请求、超时、取消、请求上下文 |
+| `utils/auth-code.js` | 激活码本地状态、加密封装、绑定与迁移 |
+| `utils/cloud-task-agent.js` | Agent 心跳、能力声明、云命令领取与回执 |
+| `utils/task-center.js` | 本地任务账本、状态机、事件与进度栅栏 |
+| `utils/task-context.js` | 任务上下文和运行期关联 |
+| `utils/unattended-keyword-run.js` | 无人值守关键词任务运行逻辑 |
+| `utils/cloud-targeted-post.js` | 云端定向帖子任务 |
+| `utils/capture/task-owner.js` | 当前任务所有权、端口重连与冲突隔离 |
+| `utils/capture/task-runtime.js` | 调试器、工作页和运行时清理 |
+| `utils/capture/task-tab-group.js` | 原始页、工作页和标签组生命周期 |
+| `utils/runtime-tab-policy.js` | 只允许有效发送页更新全局页面状态 |
+| `utils/capture/target-page-availability.js` | 帖子可用、删除、不可访问等高置信识别 |
+| `utils/capture/douyin-search-guard.js` | 抖音搜索异常、验证码和安全状态识别 |
+| `utils/capture/relevance-prefilter.js` | 详情增强前的确定性与 AI 相关性预筛 |
 
-典型加载链路:
+### 3.2 实际加载与客户交付快照
+
+`extension-build/` 是：
+
+- 开发者在 `chrome://extensions` 或 `edge://extensions` 加载的目录；
+- 客户安装包生成前的唯一快照；
+- 由同步脚本重建的产物；
+- `.gitignore` 管理的构建目录，而不是编辑入口。
+
+禁止：
+
+- 直接改 `extension-build/` 后宣称修复完成；
+- 从旧 `extension-build/` 手工拷贝几个文件覆盖客户包；
+- 在执行过 `local` 同步后直接压缩目录；
+- 把 `.pem`、`.crx`、旧 `.zip`、`.env*` 或 `.DS_Store` 混入交付。
+
+正确关系：
+
+```text
+根目录源码
+   │
+   ├─ scripts/sync-extension-build.zsh local
+   │      └─ extension-build/（仅本地联调）
+   │
+   └─ scripts/package-extension.zsh
+          ├─ 强制 production 同步
+          ├─ 校验运行地址和禁止文件
+          └─ StarVoice-extension.zip（客户包）
+```
+
+### 3.3 同步后必须满足的事实
+
+生产同步完成后，除被主动排除的系统文件外：
+
+```bash
+diff -u manifest.json extension-build/manifest.json
+```
+
+上面的单文件命令只用于快速查看。完整一致性由同步脚本在 staging 目录中执行并验证；不要自己拼一个不完整的目录比较替代脚本门禁。
+
+## 4. MV3 加载链与生命周期
+
+### 4.1 启动链
 
 ```text
 manifest.json
-  background.service_worker -> background.js
-  side_panel.default_path   -> sidebar/sidebar.html
-  content_scripts           -> content-loader.js
-
-content-loader.js
-  import(chrome.runtime.getURL("content-v2.js"))
-
-sidebar/sidebar.html
-  <script type="module" src="sidebar-logic.js">
-  <script type="module" src="sidebar-ui.js">
+├─ background.service_worker → background.js
+├─ side_panel.default_path → sidebar/sidebar.html
+├─ content_scripts
+│  ├─ 抖音网络拦截脚本（MAIN / document_start）
+│  ├─ 微博网络桥接脚本（MAIN / document_start）
+│  └─ content-loader.js（受支持平台）
+└─ web_accessible_resources
+   ├─ content-v2.js
+   ├─ utils/*.js
+   └─ utils/capture/*.js
 ```
 
-`sidebar-logic.js` 和 `sidebar-ui.js` 是两个并列 module。它们通过 DOM、状态模块和少量 `window.*` 方法互相配合。
+`content-loader.js` 只应加载 `content-v2.js` 一次。重复注入会造成：
 
-## 4. 先读顺序
+- MutationObserver 重复；
+- 消息监听重复；
+- 采集回调重复；
+- 任务进度重复写入；
+- 页面关闭后仍有旧回调。
 
-为了省 token 和减少误判, 不同任务先读不同文件:
+排查重复任务时，先确认不是重复注入，再看任务账本。
 
-### 4.1 只改后端或后台
+### 4.2 Side Panel 加载链
 
-不用读两个万行文件。读:
+`sidebar/sidebar.html` 必须先加载运行配置，再加载业务逻辑。原因是：
 
-1. `README.md`
-2. 对应的 `server/routes/*` 或 `web/admin/src/*`
-3. 必要时读 `docs/API接口文档.md`
+- API 基址需要在业务请求前确定；
+- 本地与生产不能在业务逻辑里散落硬编码；
+- 打包脚本会针对运行配置做生产目标校验。
 
-### 4.2 改扩展 sidebar UI
+### 4.3 Service Worker 的三个周期任务
 
-先读:
+后台通过 alarms 管理三个关键周期：
 
-1. `sidebar/sidebar.html`
-2. `sidebar/sidebar.css`
-3. `sidebar/sidebar-ui.js`
-4. `sidebar/sidebar-logic.js` 中 `setupUIEventListeners`, `updateUI`, `updateDataPoolUI` 附近
+| Alarm | 目的 |
+|---|---|
+| `onstarvoice:unattended-keyword-plan` | 检查和触发本地无人值守关键词计划 |
+| `onstarvoice:unattended-supervisor` | 监督运行中的无人值守任务、锁、页面和业务进度 |
+| `onstarvoice:cloud-task-agent` | Agent 心跳、云命令拉取与状态回传 |
 
-不要先全量读 `sidebar/sidebar-logic.js`。
+MV3 Service Worker 随时可能被浏览器挂起。不要依赖：
 
-### 4.3 改采集按钮或批量任务
+- 永久在内存里的变量；
+- 一个不会丢失的计时器；
+- “后台一直活着”的假设。
 
-先读:
+恢复所需状态必须落到 `chrome.storage`、任务账本或后端。
 
-1. `sidebar/sidebar-logic.js`
-2. `utils/capture-sync.js`
-3. `utils/capture/index.js`
-4. 对应平台采集文件:
-   - 小红书: `utils/capture/single-note.js`, `utils/capture/blogger.js`, `utils/capture/keyword-search.js`, `utils/capture/comments.js`
-   - 抖音: `utils/capture/douyin-single-note.js`, `utils/capture/douyin-blogger.js`, `utils/capture/douyin-keyword-search.js`, `utils/capture/douyin-comments.js`
-   - 微博: `utils/capture/weibo-single-note.js`, `utils/capture/weibo-blogger.js`, `utils/capture/weibo-keyword-search.js`
+### 4.4 任务页面查询参数
 
-### 4.4 改同步或入库 payload
+当前运行链会使用：
 
-先读:
+| 参数 | 作用 |
+|---|---|
+| `unattendedRun` | 关联无人值守运行 |
+| `targetedPostRun` | 关联定向帖子运行 |
+| `targetedPostAttempt` | 关联定向任务当前 attempt |
 
-1. `utils/capture-sync.js`
-2. `utils/platform/sync-router.js`
-3. `utils/platform/record-envelope.js`
-4. `utils/storage.js`
-5. `utils/api.js`
-6. `server/routes/sync.js`
-7. `server/services/record-store.js`
+这些参数是关联辅助，不是授权凭据，也不能单独证明页面仍属于当前任务。写回前仍必须核对任务 ID、attempt 和目标 ID。
 
-### 4.5 改平台识别或页面类型
+## 5. Manifest 权限与数据边界
 
-先读:
+### 5.1 当前权限说明
 
-1. `utils/constants.js`
-2. `utils/platform/page-routing.js`
-3. `utils/helpers.js`
-4. `background.js` 的 runtime sync 逻辑
-5. `content-v2.js` 的 page state 上报逻辑
+| 权限 | 必要用途 | 不能被误解为 |
+|---|---|---|
+| `activeTab` | 读取用户当前授权页面上下文 | 自动读取任意未授权页面 |
+| `scripting` | 注入页面识别、采集或就绪检测脚本 | 任意执行远程代码 |
+| `debugger` | 受控导航、网络/页面协作和可靠解除调试 | 永久接管浏览器 |
+| `tabs` | 创建、定位、切换和关闭任务工作页 | 上传全部浏览历史 |
+| `tabGroups` | 一个任务一个原生分组、恢复来源分组 | 跨 Profile 共享任务 |
+| `storage` | 激活、Agent scope、任务账本、计划、配置和本地采集数据 | OS 级密钥保险箱 |
+| `alarms` | 心跳、无人值守计划和监督器 | 保证后台永不休眠 |
+| `sidePanel` | 展示 Extension 业务 UI 和任务状态 | 独立桌面程序 |
+| `downloads` | 用户主动导出结果 | 后台任意下载 |
 
-### 4.6 改导出或下载
+### 5.2 Host 权限范围
 
-先读:
+当前范围覆盖：
 
-1. `sidebar/sidebar-logic.js` 中 `handleExport`, `handleDownloadRecordMedia`, `build*CsvRows`, `download*` 系列函数
-2. `sidebar/sidebar-ui.js` 中记录列表点击相关逻辑
-3. `utils/storage.js` 的 record/dataPool 结构
+- 小红书站点及必要资源域；
+- 抖音和短链域；
+- 微博及必要桥接域；
+- 页面图片资源域；
+- 生产 API；
+- 本地开发 API。
 
-这类功能相对独立, 如果以后真的要拆文件, 这里是低风险试点。
+Host 权限表示 Extension **可以在业务需要时访问这些来源**，不表示会把全部页面内容上传。真正上传的数据必须由：
 
-## 5. 核心边界和不可轻易改动项
+- 明确采集动作；
+- 明确云任务；
+- 明确后台同步；
+- 已激活且租户范围正确；
+- 后端允许的接口和字段；
 
-### 5.1 `utils/constants.js`
+共同约束。
 
-这里定义了跨模块协议:
+### 5.3 MAIN world 与可访问资源
 
-1. `STORAGE_KEY`: Chrome storage key。改名会造成老数据读不到。
-2. `MESSAGE_TYPE`: sidebar, background, content script 之间通信协议。改动会导致消息收发断链。
-3. `SYNC_TYPE`: 前端记录类型和后端同步类型。改动会影响 payload 路由、记录归类、后台数据。
-4. `PAGE_TYPE`: 页面识别结果。改动会影响按钮状态和采集模式判断。
-5. `API_ENDPOINT`: 扩展调用后端的接口路径。
+抖音、微博部分网络数据只能在页面主世界观察，因此使用 `world: MAIN` 和 `document_start`。这是审核与安全敏感面：
 
-除非要做兼容迁移, 不要直接重命名这些常量值。
+- 只拦截已知业务请求；
+- 不记录 Cookie、Authorization 或完整请求头；
+- 不持久化无关响应；
+- 页面桥接消息必须校验来源和结构；
+- 不接受远程脚本内容；
+- 不把可访问资源范围随意扩大到全部文件。
 
-### 5.2 `utils/storage.js`
+修改 MAIN 脚本、匹配域或 `web_accessible_resources` 后，必须重新做：
 
-这是扩展侧本地状态的主要封装, 包括:
+1. 三个平台基础采集；
+2. 生产包解压审查；
+3. Chrome / Edge MV3 加载；
+4. 商店权限说明复核。
 
-1. runtime
-2. auth
-3. target
-4. capture
-5. sync
-6. monitor
-7. dataPool
-8. syncHistory
+### 5.4 明确禁止记录的数据
 
-风险点:
+日志、心跳和诊断中不得写入：
 
-1. `dataPool.records` 是很多 UI 和同步流程的共同来源。
-2. `record.payload` 和 `record.detailPayload` 的结构被导出、同步、补采、后端解析共同依赖。
-3. `markRecordSynced`, `updateRecord`, `addRecords` 这类函数如果行为改变, 影响范围很大。
+- 激活码原文；
+- 后端认证令牌；
+- Authorization / Cookie；
+- 密码、验证码答案；
+- API Key；
+- 完整会话凭据；
+- 非任务所需的页面私密数据。
 
-### 5.3 `background.js`
+诊断字段应只保留：任务 ID、attempt、步骤、平台、错误分类、时间、有限页面状态和已脱敏 URL。
 
-负责:
+## 6. 激活、租户与 Agent 作用域
 
-1. 侧边栏打开。
-2. active tab runtime 同步。
-3. 接收 content script 的页面变化和进度消息。
-4. 转发 sidebar 到 content script 的请求。
-5. 某些平台 tab 切换或创建。
+### 6.1 激活状态
 
-风险点:
+`utils/auth-code.js` 对本地激活状态使用 AES-GCM 封装，格式带 `enc:v1:` 前缀，并支持旧明文状态迁移。
 
-1. `chrome.runtime.onMessage.addListener` 必须在异步响应时 `return true`。
-2. 任何消息返回结构变更, 都要同步改 sidebar 和 content 调用方。
-3. 页面类型和当前 tab id 错误, 会让 sidebar 判断错当前平台或采集按钮状态。
+必须如实理解其边界：
 
-### 5.4 `content-loader.js` 与 `content-v2.js`
+- 可以避免本地存储里直接出现可读激活码；
+- 可以降低普通复制和误暴露；
+- 不能替代 macOS Keychain、Windows Credential Manager 或硬件密钥；
+- 加密种子随 Extension 代码交付，无法抵御拥有本机与源码的强攻击者。
 
-`content-loader.js` 很小, 作用是把 `content-v2.js` 作为 module 动态加载。`content-v2.js` 负责:
+所以服务端仍必须负责：
 
-1. 接收采集命令。
-2. 调用 `utils/capture/*` 里的具体采集模块。
-3. 向 background 上报页面状态和采集进度。
+- 激活码有效、到期、冻结判断；
+- 绑定数量和设备替换；
+- 租户隔离；
+- 权限和功能范围；
+- 服务端令牌轮换。
 
-风险点:
+### 6.2 激活请求的设备字段
 
-1. content script 运行在目标网站页面环境中, DOM 和滚动非常脆弱。
-2. 小红书、抖音、微博 DOM 经常变, 选择器修复要尽量局部。
-3. 页面上报如果过于频繁或字段变更, 会影响 sidebar 状态。
+激活或校验会提交有限的设备上下文：
 
-## 6. `sidebar/sidebar-logic.js` 代码地图
+- `clientUuid`
+- `clientLabel`
+- `appVersion`
+- `platform`
+- 可选的待替换绑定 ID
 
-这个文件是侧边栏的业务中枢, 当前混合了多个职责。不要试图靠阅读顺序理解全部, 应按功能块定位。
+浏览器无法可靠取得物理电脑的永久硬件 ID。因此：
 
-### 6.1 外部依赖
+> `clientUuid` 表示浏览器 Profile 节点，不等同于物理电脑序列号。
 
-主要 import:
+同一电脑的 Chrome、Edge、不同 Chrome Profile 都可能是独立 Agent。后台如需按电脑归组，应使用客户可理解的设备名或显式分组，不应推断硬件身份。
 
-1. `./state.js`: sidebar 内存状态和 storage refresh。
-2. `../utils/capture-sync.js`: 采集和同步主流程。
-3. `../utils/capture-settings.js`: 采集配置。
-4. `../utils/storage.js`: dataPool 和 syncHistory 等本地数据。
-5. `../utils/api.js`: 后端接口, 包括授权、目标配置、关键词分析、监控。
-6. `../utils/constants.js`: 页面类型、同步类型、消息类型、错误码。
-7. `../utils/scroll.js`: 取消标记和等待。
-8. `../utils/diagnostics.js`: 诊断日志。
-9. `../utils/task-context.js`: 任务上下文。
-10. `./platform-registry.js`: 平台能力和文案。
+### 6.3 校验响应竞态
 
-### 6.2 公开入口
+并发激活校验可能出现旧响应晚于新响应。当前逻辑必须保留“响应栅栏”：
 
-`sidebar/sidebar.html` 直接加载 `sidebar-logic.js`。文件公开导出:
+- 只接受最新一次校验上下文；
+- 旧响应不得覆盖新租户、新节点或新激活状态；
+- 过期、冻结、失效和替换必须进入明确分支；
+- 不能因为旧的成功响应让已失效激活重新可用。
 
-```js
-export async function initSidebar()
+### 6.4 Agent scope 切换
+
+`ensureCloudTaskAgentScope(agentId)` 的核心规则：
+
+1. 首次升级到有 scope 的版本时，可迁移本节点合理的本地计划和历史；
+2. 后续 `agentId` 变化必须视为新节点；
+3. 新节点不得继承旧节点计划、任务归档、命令结果或错误；
+4. 本地计划只有在 `planScopeAgentId` 与当前 Agent 一致时才允许镜像到云端；
+5. Agent scope 不一致时先隔离，再等待后端重新下发。
+
+切换租户、替换激活或重装 Profile 后，如果看到旧计划：
+
+1. 先确认 `cloudAgentScopeId`；
+2. 再确认 `planScopeAgentId`；
+3. 检查是否有旧版本迁移路径绕过 scope；
+4. 不要手工把旧 `chrome.storage` 全量复制到新 Profile。
+
+## 7. Agent 心跳与“在线”的正确含义
+
+### 7.1 心跳内容
+
+`utils/cloud-task-agent.js` 向后端声明：
+
+- Agent 基本信息和版本；
+- 页面类型、详情页就绪状态、当前活动标签；
+- 当前采集、取消和最近 URL 的脱敏状态；
+- 支持平台；
+- 支持的云任务工作流；
+- 创建、继续、停止和计划写入/删除能力；
+- 单 Agent 并行槽位；
+- 本地锁和无人值守计划镜像状态；
+- 社交账号身份与当日用量的有限汇总。
+
+心跳会主动清理或屏蔽敏感字段。新增心跳字段时必须延续白名单式结构，不要直接上传完整运行对象。
+
+### 7.2 周期、超时和退避
+
+- 正常 alarm 约每分钟触发；
+- 活跃期最短节流约 15 秒；
+- 单次请求有明确超时；
+- 连续失败会指数退避，最长约 5 分钟；
+- 只向可信生产或本地开发来源发送；
+- 不向未知跨域地址携带认证信息；
+- 同源兼容路由的 404 才允许受控 fallback。
+
+### 7.3 在线不是可执行保证
+
+后台显示“在线”只能证明近期收到心跳。以下任一问题仍可能导致任务失败：
+
+- Extension Side Panel 没打开，但后台可心跳；
+- 目标平台未登录；
+- 当前页面不支持该任务；
+- 验证码或访问限制；
+- 页面 DOM 更新；
+- Agent 正被另一个任务占用；
+- 本地任务所有权端口断开；
+- 业务步骤长时间没有进度；
+- AI 服务未配置或超时。
+
+UI 和运维文档中必须区分：
+
+```text
+在线：设备控制面可达
+空闲：没有任务所有权
+可执行：平台、页面、账号、权限和任务能力均满足
+有进展：业务 progressSeq 正在推进
 ```
 
-底部还有自动初始化:
+## 8. 并发、任务所有权与页面范围
 
-```js
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", initSidebar);
-} else {
-  initSidebar();
-}
+### 8.1 默认并发模型
+
+当前 Agent 心跳声明 `parallelSlots = 1`。含义：
+
+- 一个浏览器 Profile 同一时间只运行一个受控采集任务；
+- 同一 Profile 的两个窗口共享任务锁；
+- 不同浏览器或不同 Profile 可作为独立 Agent 并行；
+- 多 Agent 编排由后端拆分工作项，不由一个 Agent 内部强行多开。
+
+### 8.2 所有权端口
+
+`utils/capture/task-owner.js` 使用专用 Port 维护任务所有权：
+
+- 当前任务与持有者绑定；
+- Port 短暂断开提供约 10 秒重连宽限；
+- 新 Port 已重绑后，旧 Port 的迟到 disconnect 不能终止新任务；
+- 真正超时或页面消失才进入恢复/终止判断。
+
+禁止用一个普通布尔值替代所有权模型。否则会出现：
+
+- Side Panel 重绘就误停任务；
+- 页面重载后两个 runner 并行；
+- 旧页面关闭导致新页面任务被取消；
+- 远程任务和本地任务互相抢占。
+
+### 8.3 活动页面状态
+
+`utils/runtime-tab-policy.js` 限制只有有效 sender tab 能更新全局页面状态。原因：
+
+- 后台可能同时存在原始页、详情工作页、已关闭页的迟到消息；
+- 非活动页更新会让 UI 显示错误 URL、平台或“已就绪”；
+- 任务结束后旧页面消息可能覆盖首页状态。
+
+任何新增页面消息都必须携带并校验发送 tab 上下文。
+
+## 9. 任务账本与状态机
+
+### 9.1 账本不是 UI 缓存
+
+`utils/task-center.js` 是任务事实来源，当前账本版本为 1。它保存：
+
+- 任务 ID、类型、平台和来源；
+- 当前 attempt；
+- 状态和业务阶段；
+- `progressSeq`；
+- 关键进度、关键词/帖子级结果；
+- 事件时间线；
+- 失败分类和是否需要人工；
+- 恢复请求和父子任务关联。
+
+Side Panel 只能从账本渲染，不能根据当前页面猜测任务完成度。
+
+### 9.2 状态分类
+
+终态：
+
+| 状态 | 含义 |
+|---|---|
+| `completed` | 全部完成 |
+| `completed_with_warnings` | 完成，但存在不影响主结果的警告 |
+| `completed_with_failures` | 已结束，部分工作项失败 |
+| `failed` | 主任务失败 |
+| `canceled` | 用户或云端明确取消 |
+| `skipped` | 根据业务规则跳过 |
+
+非终态：
+
+| 状态 | 含义 |
+|---|---|
+| 运行/等待类状态 | 当前 attempt 仍可推进 |
+| `needs_action` | 需要人工处理，不能自动当成失败清理 |
+
+终态任务可以归档；`needs_action` 必须留在待处理，直到人工操作或明确迁移。
+
+### 9.3 attempt 栅栏
+
+每次重新分配、继续或恢复都必须明确 attempt：
+
+```text
+任务 ID 相同
+├─ attempt 1：旧执行
+├─ attempt 2：当前恢复
+└─ attempt 1 迟到结果：拒绝
 ```
 
-风险点:
+写入规则：
 
-1. 不要重复调用 `initSidebar`, 否则可能重复绑定事件。
-2. 如果以后拆初始化, 要保证事件绑定只执行一次。
-3. `beforeunload` 里有取消/清理逻辑, 不要漏掉。
+1. 写回必须携带任务 ID 和 attempt；
+2. 低于当前 attempt 的写入拒绝；
+3. 只有明确恢复流程可以建立更高 attempt；
+4. 新 attempt 建立后，旧 runner 不再拥有任务；
+5. 目标帖子任务还需核对目标 ID。
 
-### 6.3 主要功能块
+### 9.4 progressSeq 栅栏
 
-按当前文件中的大致顺序:
+同一 attempt 内使用单调递增的 `progressSeq`：
 
-| 区域 | 代表函数 | 职责 | 风险 |
+- 小于当前序号：拒绝；
+- 等于当前序号：只允许幂等结果；
+- 大于当前序号：按有效状态转换写入；
+- 终态：拒绝把任务改回非终态。
+
+这个规则解决：
+
+- 网络重试乱序；
+- 多页面并发回调；
+- 详情采集完成后列表页旧状态迟到；
+- 云端停止后本地又上报“运行中”。
+
+### 9.5 账本容量和保留
+
+当前约束：
+
+- 终态默认保留 30 天；
+- 终态记录上限约 300；
+- 每次运行事件上限约 50；
+- 关键词结果上限约 500；
+- 活跃任务长时间无有效更新会进入陈旧判断，基准约 10 分钟。
+
+不要无限保存 DOM、完整响应或图片到任务账本。业务数据应进入正式数据表或后端，账本只保存恢复和诊断所需信息。
+
+### 9.6 旧记录迁移
+
+旧版任务无法可靠推断关键词边界、attempt 或恢复点时：
+
+- 标记为 legacy / incomplete；
+- 可以展示已有结果；
+- 不要从通用数据池反推“已完成哪些关键词”；
+- 不要伪造断点继续；
+- 必要时新建明确 attempt，并保留父任务关联。
+
+## 10. 创建、停止、继续和恢复
+
+### 10.1 云端定向帖子任务
+
+创建规则：
+
+- 相同任务/attempt/目标的重复指令必须幂等；
+- Agent 锁忙时应进入等待或延期，不应制造第二 runner；
+- 更高 attempt 到达时，旧 attempt 失去所有权；
+- 打开目标页失败可进入 `needs_action` 或明确失败分类；
+- 任务执行前后都要检查 attempt 和目标 ID；
+- 本地结果同步完成后再回执命令完成。
+
+目标确认不能只比较页面标题。应优先比较平台稳定作品标识；确实无法取得时，才使用规范化 URL 等辅助证据。
+
+### 10.2 停止
+
+停止必须幂等：
+
+- 待执行任务直接取消；
+- 运行任务先标记 `cancel_requested`；
+- runner 在安全检查点停止；
+- 已采集结果保留；
+- 清理完成后进入 `canceled`；
+- 对已终态任务再次停止不改变结果。
+
+“停止”不是清空数据，也不是删除任务。
+
+### 10.3 继续模式
+
+支持的业务恢复语义：
+
+| 模式 | 语义 |
+|---|---|
+| `remaining` | 继续未完成工作项 |
+| `failed` | 只重试失败工作项，轮次必须有上限 |
+| `skip_current` | 跳过当前阻塞项，继续后续工作 |
+
+禁止把“继续”实现成从第一个关键词完整重跑。恢复请求应：
+
+- 新建明确 attempt；
+- 关联父任务；
+- 使用已有 checkpoint；
+- 继承已完成结果；
+- 只打开下一必要页面；
+- 保持 Agent scope 一致。
+
+若任务因验证码等待人工处理，人机完成验证后可用 `remaining` 恢复；若页面已被平台删除，应记为业务不可用并继续后续项，不应反复重试。
+
+### 10.4 无人值守监督
+
+无人值守任务运行时，监督器检查：
+
+- runner、holder 和文档 ID 是否一致；
+- 锁是否仍被当前任务持有；
+- 页面是否仍存在；
+- 设备心跳是否过期；
+- 业务 `progressSeq` 是否停滞；
+- 是否正在合理等待、冷却或重试窗口；
+- 是否进入验证码/人工介入；
+- 是否只有浏览器心跳而无业务进展。
+
+需要唤醒冻结 runner 时：
+
+1. 短暂激活工作页；
+2. 确认当前任务所有权；
+3. 只恢复未完成步骤；
+4. 恢复用户原活动页；
+5. 不能从头重跑。
+
+## 11. 工作页、调试器和标签组清理
+
+### 11.1 一个任务一个原生标签组
+
+`utils/capture/task-tab-group.js` 维护：
+
+- 来源页；
+- 同窗口工作页；
+- 任务专属原生标签组；
+- 工作页替换时的迁移；
+- 来源页原分组恢复；
+- 来源页被关闭后的工作页释放。
+
+不要跨窗口强行把工作页塞入同一组；浏览器原生分组受窗口约束。
+
+### 11.2 固定清理顺序
+
+任务结束、失败、停止或页面替换时：
+
+1. 标记 runner 不再接受新业务步骤；
+2. 请求解除 debugger；
+3. 确认 debugger 已解除；
+4. 关闭任务工作页，允许已不存在的页视为幂等成功；
+5. 恢复或释放来源页分组；
+6. 释放任务所有权；
+7. 最后更新 UI 终态。
+
+如果 debugger 解除失败或工作页无法确认关闭：
+
+- 不要提前释放所有权；
+- 记录清理失败；
+- 允许监督器再次回收；
+- 避免新任务复用仍被控制的页面。
+
+取消链应 fail-soft：单个清理步骤失败不能阻止后续安全清理，但必须保留诊断。
+
+### 11.3 完成后的页面行为
+
+任务完成后应：
+
+- 停止视频或自动播放；
+- 关闭任务创建的详情工作页；
+- 恢复到来源搜索页或用户原活动页；
+- 关闭任务暗色状态页时不在两个已结束页面之间循环；
+- 不主动关闭用户任务开始前已经打开的业务页面。
+
+## 12. 平台异常处理矩阵
+
+### 12.1 总原则
+
+异常识别优先级：
+
+```text
+验证码 / 人工验证
+    > 明确删除或不可用
+    > 服务临时异常
+    > 页面未完成加载
+    > 普通无结果
+```
+
+只有高置信、顶层可见、与当前任务页面关联的信号才能改变任务状态。推荐卡片、评论文字或页面正文中的相同词语不能误判为平台异常。
+
+### 12.2 抖音
+
+| 场景 | 高置信信号 | 分类 | 当前工作项 | 批量任务 |
+|---|---|---|---|---|
+| 搜索服务异常 | 顶层可见、精确“服务出现异常”，且不在内容卡片中 | `DOUYIN_SEARCH_SERVICE_ABNORMAL` | 当前关键词可重试或记无结果 | 不全停，继续下一个词 |
+| 图片/滑块验证 | 验证 iframe、明确图形验证文案/控件 | `DOUYIN_SEARCH_SECURITY_CHALLENGE` | 暂停 | 整体进入人工介入 |
+| 作品已删除/不存在 | 精确“你要观看的图文/视频/作品/内容不存在”，并结合紧凑卡片、倒计时或自动播放下一条 | `TARGET_POST_UNAVAILABLE` | 记业务不可用 | 继续后续帖子 |
+| 详情未加载 | 目标标识存在，但详情稳定字段在超时前未就绪 | 页面未就绪 | 有限重试 | 超限后记录失败 |
+| 当前进入 AI 抖音页 | 顶部 Tab/页面结构显示 AI 抖音而非评论 | 页面偏航 | 回到详情并重新定位评论 | 不把 AI 页数据写回 |
+
+抖音“服务出现异常”不是安全验证码，不应让 13 个关键词全部停止。真正验证码需要停止自动操作，通知人工，防止风险升级。
+
+删帖倒计时会自动播放下一条。检测顺序必须早于下一条作品稳定完成，且写回时核对原目标作品 ID，避免把推荐作品当成目标结果。
+
+### 12.3 小红书
+
+| 场景 | 高置信信号 | 分类 | 处理 |
 |---|---|---|---|
-| 批量操作弹窗 | `openBatchModal`, `handleRunBatchLinks`, `handleRunBatchBloggers` | 批量链接/博主/关键词入口和草稿 | 中 |
-| 关键词计划/洞察 | `handleSaveKeywordPlan`, `handleExpandKeywords`, `handleRunKeywordOpportunity`, `handleRunBenchmarkDiscovery` | 关键词裂变、机会分析、对标发现、卡片导出 | 中 |
-| 初始化 | `initSidebar`, `setupStateSubscriptions`, `setupUIEventListeners` | 初始化状态、绑定事件、启动 timers | 高 |
-| 更新提示/版本 | `checkExtensionUpdate`, `renderUpdateNoticeModal` | 版本检查和更新弹窗 | 低到中 |
-| 主采集动作 | `handleCaptureNoteData`, `handleCaptureBloggerData`, `handleCaptureSearchData`, `runCaptureAction` | 单笔记、博主、搜索页采集按钮 | 高 |
-| 监控 | `handleAddCurrentMonitor`, `handleRunMonitorNow`, `executeMonitorRunItem` | 监控订阅、立即运行、执行记录 | 高 |
-| 授权/目标配置 | `handleVerify`, `handleSaveTarget`, `syncTargetConfigAfterVerify` | 激活码、飞书/同步目标配置 | 中到高 |
-| 采集设置 | `initCaptureSettingsUI`, `handleSaveCaptureSettings`, `sync*Controls` | 采集偏好、评论、详情补采、客资规则 | 高 |
-| 同步 | `handleSyncAll`, `repairInterruptedDetailCaptureRecordsBeforeSync`, `maybeRunAutoSyncAfterDetailCapture` | 同步全部/选中, 自动同步, 中断补偿 | 高 |
-| 数据池动作 | `handleRecordListClick`, `handleRetryCommentsCapture`, `handleRetryDetailCapture`, `handleDeleteRecord` | 记录列表交互、重试、删除、下载 | 高 |
-| 导出/下载 | `handleExport`, `handleDownloadRecordMedia`, `build*CsvRows` | CSV 导出和媒体下载 | 中 |
-| UI 更新 | `updateUI`, `updateAuthUI`, `updateDataPoolUI`, `showMessage`, `showProgress` | 渲染状态和提示 | 中到高 |
+| 笔记不可浏览 | “当前笔记暂时无法浏览”或同义精确页 | deleted / page_unavailable | 记录不可用，不重试 |
+| 扫码查看页 | “请打开小红书 App 扫码查看”并有问题反馈/返回首页结构 | deleted / page_unavailable | 记录不可用，不重试 |
+| 英文不可用页 | `Sorry, This Page Isn't Available Right Now.` | deleted / page_unavailable | 记录不可用，不重试 |
+| 安全限制 | 明确安全限制/访问受限结构 | `XHS_SECURITY_BLOCK` | 暂停并通知人工 |
+| 普通空结果 | 搜索完成且列表为空 | 业务无结果 | 完成当前词，继续后续 |
 
-### 6.4 与 `sidebar-ui.js` 的关系
+动态弹层和异步路由必须用 MutationObserver 识别。观察器在任务结束后必须解除，避免已结束任务再次改变状态。
 
-`sidebar-ui.js` 更偏展示和交互小组件, 但两者并不是完全隔离。常见桥接:
+### 12.4 目标所有权校验
 
-1. `window.showMessage`
-2. `window.showStatusFeedback`
-3. `window.clearStatusFeedback`
-4. `window.renderPlatformCaptureTabs`
-5. `window.activateSidebarTab`
-6. `window.getSidebarAuthState`
-7. `window.getSidebarRuntimeState`
-8. `window.getSidebarMonitorState`
-9. `window.requestMonitorRefresh`
-10. `window.requestExecutionDetailRefresh`
-11. `window.requestAuthRefresh`
+任何平台详情采集写回前必须同时校验：
 
-风险点:
+- 当前任务 ID；
+- 当前 attempt；
+- 当前目标 ID；
+- 当前 tab / runner 所有权；
+- 页面解析得到的作品 ID；
+- 任务尚未进入吸收型终态。
 
-1. 如果重命名这些 `window.*` 方法, 要同时改两个文件。
-2. 如果把 UI 函数拆模块, 要确认全局方法仍在 sidebar 生命周期内注册。
-3. `sidebar-ui.js` 中也有事件绑定, 不要以为所有事件都在 `sidebar-logic.js`。
+其中任一不一致，拒绝云端写回并保留本地诊断。不能为了“提高成功率”放宽为只比标题。
 
-## 7. `utils/capture-sync.js` 代码地图
+## 13. 官方账号评论巡查与日期过滤
 
-这是扩展侧最敏感的文件。它连接:
+### 13.1 前置条件
 
-```text
-sidebar action
-  -> capture-sync 编排
-  -> chrome tab/content script
-  -> utils/capture/* 平台采集
-  -> utils/storage.js 入池
-  -> utils/api.js 同步后端
-```
+任务必须绑定：
 
-### 7.1 公开导出
+- 已登记的官方账号；
+- 平台；
+- 可打开的主页 URL；
+- 起止日期；
+- 本次最大作品数；
+- 每篇最大评论读取数；
+- 指定 Agent。
 
-当前常用导出包括:
+主页链接缺失时，任务应在创建前阻止，而不是给 Agent 一个无法执行的空任务。
 
-1. `captureAndSync`
-2. `captureNoteWithOptionalComments`
-3. `retryCommentsForRecord`
-4. `retryDetailCaptureForRecord`
-5. `batchCaptureDetailsForRecords`
-6. `resolveSyncInputForRecord`
-7. `syncRecord`
-8. `syncRecordBatch`
-9. `checkBeforeSync`
-10. `captureAndSyncSingleNote`
-11. `captureAndSyncBloggerProfile`
-12. `captureAndSyncBloggerNotes`
-13. `captureAndSyncKeywordNotes`
-14. `captureAndSyncComments`
-15. `captureOnly`
-16. `resetCaptureAndSyncState`
-17. `buildCommentLeadsConfigFromSettings`
-18. `buildCommentLeadsPayloadForRecord`
-19. `evaluateDetailKeywordFilter`
-20. `repairInterruptedDetailCaptureRecords`
-21. `batchCaptureByUrls`
-22. `batchCaptureByKeywords`
-23. `lightSampleByKeywords`
-24. `captureTabContent`
+### 13.2 为什么列表页不能直接判断日期
 
-不要随意改这些函数的:
+抖音、小红书账号主页列表经常只展示：
 
-1. 函数名。
-2. 参数结构。
-3. 返回值结构。
-4. `onProgress` 回调字段。
-5. 错误对象字段。
+- 相对时间；
+- 不完整日期；
+- 置顶作品；
+- 无发布时间；
+- 虚拟滚动或延迟加载卡片。
 
-### 7.2 主要功能块
+因此列表卡片只能用于发现候选作品，不能作为最终日期过滤证据。
 
-| 区域 | 代表函数 | 职责 | 风险 |
-|---|---|---|---|
-| 入池和去重 | `saveRecordsWithCacheDedupe`, `saveCaptureResultRecords`, `buildDataPoolIdentityIndex` | 采集结果写入 dataPool, 去重, 刷新互动数 | 高 |
-| 前端同步失败记录 | `appendFrontendSyncFailureHistory`, `buildFrontendFailureItems` | 同步失败历史和错误展示 | 中 |
-| 采集并同步 | `captureAndSync`, `captureAndSaveInTab` | 主采集流程, 可自动同步 | 高 |
-| 单笔记和评论 | `captureNoteWithOptionalComments`, `retryCommentsForRecord` | 单笔记正文和评论合并 | 高 |
-| 详情补采 | `batchCaptureDetailsForRecords`, `retryDetailCaptureForRecord` | 逐条打开详情页补正文/评论/博主指标 | 最高 |
-| payload 归一化 | `normalizeDetailPayloadAgainstRecord`, `mergeHydratedDetailIntoRecordPayload`, `sanitizeMediaFieldsForStorage` | 存储前清洗和合并 | 高 |
-| 同步 | `syncRecord`, `syncRecordBatch`, `runSyncRecordBatch`, `syncGroupRecordsWithRetry` | 单条/批量同步, 分包, 限流, 暂停 | 最高 |
-| 评论客资 | `buildCommentLeadsConfigFromSettings`, `buildCommentLeadsPayloadForRecord` | 评论客资筛选和 payload 生成 | 中到高 |
-| 详情状态字段 | `ensureDetailCaptureFields`, `createDetailCapturePatch`, `classifyDetailCaptureFailure` | 详情补采状态和失败原因 | 高 |
-| Chrome tab 导航 | `openUrlInTab`, `prepareDetailBatchRunnerContext`, `restoreSourcePageIfNeeded` | runner tab 导航和恢复 | 最高 |
-| 可靠计时器 | `getReliableTimerWorker`, `waitMs`, `waitMsWithStop` | 避免后台 tab timer 被 Chrome 节流 | 高 |
-| 批量链接 | `batchCaptureByUrls` | URL 队列逐个导航采集 | 高 |
-| 批量关键词 | `batchCaptureByKeywords`, `switchDouyinKeywordSearchInTab`, `navigateToSearchUrl` | 搜索页切词、等待结果、采集 | 最高 |
-| content 调用 | `captureTabContent`, `captureInActiveTab`, `captureInTab` | 对 content script 发采集消息 | 高 |
-
-### 7.3 不要顺手改的逻辑
-
-这些地方看起来可能“可以优化”, 但很容易造成隐性回归:
-
-1. `await` 顺序。
-2. `waitMs`, `waitMsWithStop`, `DETAIL_*_WAIT_MS` 等等待时间。
-3. Chrome tab 激活、导航、恢复原页的顺序。
-4. 详情补采时的 `shouldStop` 检查。
-5. 评论采集和单笔记 payload 合并顺序。
-6. 同步分包大小和限流重试。
-7. `detailPayload` 和 `payload.items[0]` 的互相补字段。
-8. 小红书 `xsec_source` 补齐逻辑。
-9. 抖音作品 ID 防串号逻辑。
-10. 可靠 timer worker 的 fallback。
-
-## 8. 数据和状态流
-
-### 8.1 页面识别流
+### 13.3 正确顺序
 
 ```text
-Chrome tab changed
-  -> background.js syncRuntimeForTabId
-  -> utils/platform/page-routing.js 或 helpers.js 判断 platform/pageType
-  -> storage runtime
-  -> sidebar/state.js initRuntime/refresh
-  -> sidebar/sidebar-logic.js updatePlatformUI/updatePageTypeUI
+打开官方账号主页
+  → 发现候选作品
+  → 逐篇进入详情
+  → 读取详情页可信发布时间
+  → 按闭区间判断 startDate ≤ publishDate ≤ endDate
+  → 再应用作品数量上限
+  → 读取当前可见评论样本
+  → 写回作品与评论结果
 ```
 
-同时, content script 也会主动上报:
+注意：
+
+- 日期范围为必填；
+- 服务端最多允许连续 30 天；
+- 边界日期包含在内；
+- 详情发布时间未知时标记 `publish_date_unknown`，不自动纳入；
+- 不能沿用上一篇作品的日期；
+- 取消、验证码、页面读取失败应结束或暂停当前运行，不能以旧数据补齐；
+- “每篇读取评论数”是读取上限，不是平台显示评论总数；
+- 实际得到的是当前网页可访问样本，不能宣称为全部历史评论。
+
+### 13.4 作品发现与账号页增强的边界
+
+官方账号评论巡查应优先复用现有账号主页增强能力，而不是通过不稳定的外链反查作品。新增“作品发现”通道前，必须证明现有账号页无法覆盖，并单独设计所有权、日期和去重。
+
+## 14. AI 前置相关性筛选
+
+### 14.1 作用位置
+
+AI 前置筛选位于：
 
 ```text
-content-v2.js
-  -> chrome.runtime.sendMessage({ action: "pageChanged" 或 "pageStateChanged" })
-  -> background.js
-  -> writeRuntimeState
+搜索结果列表
+  → 确定性规则预判
+  → 保存列表级记录
+  → DeepSeek 批量文本判断
+  → 仅高置信无关项跳过详情增强
+  → 其余继续进入详情
 ```
 
-### 8.2 单笔记采集流
-
-```text
-用户点击 sidebar 按钮
-  -> sidebar/sidebar-logic.js handleCaptureNoteData
-  -> runCaptureAction
-  -> utils/capture-sync.js captureNoteWithOptionalComments 或 captureAndSync
-  -> captureTabContent/captureInTab
-  -> background.js RELAY_TO_CONTENT
-  -> content-v2.js
-  -> utils/capture/index.js
-  -> 平台具体 capture 文件
-  -> capture-sync saveCaptureResultRecords
-  -> utils/storage.js addRecord/addRecords/updateRecord
-  -> sidebar/state.js refreshDataPool
-  -> sidebar UI 刷新
-```
-
-### 8.3 列表采集加详情补采流
-
-```text
-搜索页/博主页采集列表
-  -> 先入池为列表态记录
-  -> 可选自动采集增强
-  -> batchCaptureDetailsForRecords
-  -> runner tab 逐条打开详情页
-  -> captureTabContent 采正文/评论/博主指标
-  -> detailPayload 回填到原 record
-  -> 可选自动同步
-```
-
-风险点:
-
-1. 列表态记录不一定有完整正文、评论、真实账号号。
-2. 详情补采结果写回原记录, 不应创建重复记录。
-3. 中断或取消时要把正在采集的记录标记为可重试或失败, 不能永久卡在 capturing。
-
-### 8.4 同步流
-
-```text
-recordIds
-  -> sidebar handleSyncAll 或 record action
-  -> capture-sync syncRecordBatch
-  -> resolveSyncInputForRecord
-  -> buildPlatformSyncInput / sync-router
-  -> chunkSyncRecordsForRequest
-  -> utils/api.js syncBatch
-  -> POST /api/sync/batch
-  -> markRecordSynced 或写失败历史
-```
-
-风险点:
-
-1. 批量同步有 payload 大小和评论富记录分包限制。
-2. rate limit 和 indeterminate failure 有暂停/重试逻辑。
-3. 不要把失败误标成成功。
-4. 不要在同步前丢掉 `detailPayload`, 否则补采到的正文/评论/账号号可能无法入后端。
-
-## 9. 功能风险分级
-
-### 9.1 低风险
-
-适合以后作为第一批小拆分试点:
-
-1. 纯格式化函数。
-2. CSV 单元格格式化。
-3. 文件名清洗。
-4. 只读展示文案。
-5. 更新提示弹窗渲染。
-
-注意: 低风险不等于不用测试, 只是影响链路比较短。
-
-### 9.2 中风险
-
-1. 导出 CSV。
-2. 下载媒体。
-3. 授权 UI 展示。
-4. 设置面板控件同步。
-5. 监控列表 UI 渲染。
-6. 关键词分析卡片渲染。
-
-这些通常不会破坏采集主链路, 但可能影响客户操作。
-
-### 9.3 高风险
-
-1. `initSidebar`。
-2. `setupUIEventListeners`。
-3. `runCaptureAction`。
-4. `handleCaptureNoteData`, `handleCaptureBloggerData`, `handleCaptureSearchData`。
-5. `handleSyncAll`。
-6. `syncRecordBatch`。
-7. `captureAndSync`。
-8. `captureNoteWithOptionalComments`。
-9. `batchCaptureDetailsForRecords`。
-10. `batchCaptureByKeywords`。
-11. `batchCaptureByUrls`。
-12. `captureTabContent`。
-
-这些地方要小步改, 每次改完立刻回归。
-
-## 10. 如果未来真的要拆文件
-
-### 10.1 基本原则
+目标是减少无关详情页打开次数，而不是替代完整采集或舆情判断。
 
-1. 原入口文件先保留。
-2. 原公开函数继续从原路径导出。
-3. 第一步只移动代码, 不改逻辑。
-4. 一个 PR 或一次提交只拆一个功能块。
-5. 每次拆完跑手工回归。
-
-### 10.2 推荐先拆 `sidebar/sidebar-logic.js`
-
-优先顺序:
-
-1. 导出/下载相关函数。
-2. 更新提示弹窗。
-3. 关键词分析卡片渲染。
-4. 采集设置面板。
-5. 监控 UI。
-6. 批量任务。
-7. 主采集动作。
-8. 初始化和状态订阅最后拆。
-
-不建议第一刀碰:
-
-1. `initSidebar`
-2. `setupUIEventListeners`
-3. `runCaptureAction`
-4. `handleSyncAll`
-5. 自动详情补采和自动同步
-
-### 10.3 推荐后拆 `utils/capture-sync.js`
-
-优先顺序:
-
-1. 纯工具函数, 如文本截断、数字规范化、CSV 无关则可迁移到 util。
-2. 评论客资配置构建。
-3. payload 清洗函数。
-4. 同步分包 helper。
-5. 批量链接采集。
-6. 批量关键词采集。
-7. 详情补采和 tab 导航最后拆。
-
-### 10.4 拆分后的兼容形态示例
-
-如果把 `utils/capture-sync.js` 拆到目录, 也应保留旧路径:
-
-```js
-export {
-  captureAndSync,
-  captureNoteWithOptionalComments,
-  syncRecordBatch,
-  batchCaptureDetailsForRecords,
-  batchCaptureByKeywords,
-  batchCaptureByUrls,
-} from "./capture-sync/index.js";
-```
-
-这样现有 import 不需要同时修改。
-
-## 11. 改动前检查清单
-
-任何扩展侧改动前, 先回答:
-
-1. 这次改的是 UI、采集、同步、存储、后端接口, 还是平台 DOM 适配?
-2. 是否会影响 `MESSAGE_TYPE`?
-3. 是否会影响 `STORAGE_KEY` 或 record 结构?
-4. 是否会改变 `payload`, `detailPayload`, `items`, `commentsCleanedItems`?
-5. 是否会改变 Chrome tab 打开、激活、导航、关闭、恢复顺序?
-6. 是否会改变 `onProgress` 字段?
-7. 是否会改变取消逻辑?
-8. 是否需要同步更新 `extension-build/`?
-
-如果以上任一答案是“是”, 就按高风险处理。
-
-## 12. 改动后手工回归清单
-
-### 12.1 基础启动
-
-1. 在 `chrome://extensions` Reload 扩展。
-2. 打开 side panel。
-3. 控制台无 import/export 报错。
-4. sidebar 能识别当前平台和页面类型。
-5. tab 切换后 sidebar 平台状态能更新。
-
-### 12.2 授权和设置
-
-1. 激活码显示/隐藏正常。
-2. 授权状态显示正常。
-3. 目标配置保存正常。
-4. 采集设置勾选、输入、保存后刷新仍保留。
-5. 评论加载上限、客资过滤、详情补采设置正常。
-
-### 12.3 单笔记
-
-1. 小红书单笔记采集。
-2. 抖音视频单条采集。
-3. 抖音图文单条采集。
-4. 微博单条采集。
-5. 可选评论采集能合并到同一 record。
-6. 采集中点击取消, UI 和状态能恢复。
-
-### 12.4 列表采集
-
-1. 小红书搜索页关键词采集。
-2. 抖音搜索页关键词采集。
-3. 微博搜索页关键词采集。
-4. 小红书博主页采集。
-5. 抖音博主页采集。
-6. 微博博主页采集。
-7. 重复采集不会产生明显重复记录。
-8. 已有记录的互动数能按预期刷新。
+### 14.2 默认和 fail-open
 
-### 12.5 详情补采
-
-1. 从列表记录触发单条详情补采。
-2. 批量详情补采。
-3. 详情补采包含正文。
-4. 详情补采包含评论。
-5. 详情补采包含博主指标或账号号时, 字段能回填。
-6. 取消后记录不会永久停在 capturing。
-7. 浏览器 tab 能回到合理页面。
-8. 中断后重新打开 sidebar, `repairInterruptedDetailCaptureRecords` 能修复卡住状态。
+- DeepSeek 预筛默认关闭；
+- 用户打开前端开关不等于 AI 已实际返回；
+- AI 判断不清、超时、配置缺失、限流或服务异常时继续采集；
+- 只有高置信“无关”可以跳过详情；
+- 已保存的列表级记录不能因 AI 失败丢失；
+- 内容同步后的 AI 情感/标签流水线是另一条异步流程。
 
-### 12.6 同步
-
-1. 单条同步。
-2. 选中同步。
-3. 同步全部。
-4. 大 payload 或评论多的记录能分包。
-5. 失败时 syncHistory 有可读错误。
-6. 成功时 record 标记为已同步。
-7. 失败记录重试正常。
-8. 前端失败历史不会吞掉真实错误原因。
+### 14.3 当前实现边界
 
-### 12.7 批量任务
+当前关键路径：
 
-1. 批量链接采集。
-2. 批量博主采集。
-3. 批量关键词采集。
-4. 批量过程中进度显示正常。
-5. 批量取消正常。
-6. 批量草稿保留正常。
-7. 抖音切关键词后不会采到旧词结果。
+- `utils/capture/relevance-prefilter.js`
+- `utils/api.js`
+- 后端相关性预筛路由与服务
+- AI labeler
+- 对应数据库迁移
 
-### 12.8 导出和下载
+当前运行参数以代码为准；2026-07-30 基线约为：
 
-1. 当前列表导出 CSV。
-2. 评论客资导出。
-3. 单笔记 CSV 字段完整。
-4. 博主/搜索页 CSV 字段完整。
-5. 图片下载。
-6. 视频下载。
-7. 抖音音频下载按设置/逻辑正常。
+- 每批 10 条；
+- 最大并发 6 批；
+- 客户端约 10 秒超时；
+- 服务/模型约 8 秒超时；
+- 默认模型标识为 `deepseek-chat`。
 
-### 12.9 监控
+AI 生效还要求租户配置：
 
-1. 添加当前账号/关键词监控。
-2. 保存监控设置。
-3. 立即运行监控。
-4. 监控执行记录刷新。
-5. 监控结果同步汇总正常。
+- provider 指向受支持服务；
+- 服务端配置有效 API Key；
+- 路由可用；
+- 未触发服务端限流。
 
-## 13. 常见故障定位入口
+验证 AI 是否介入，不能只看开关，应查：
 
-### 13.1 sidebar 打不开或白屏
+- 任务账本是否记录预筛阶段；
+- 返回元数据是否标记 AI 命中/跳过；
+- 服务端请求和耗时；
+- 详情页实际打开数量是否减少；
+- 超时时是否按 fail-open 继续。
 
-先看:
+### 14.4 尚未实现的能力
 
-1. 浏览器扩展页面是否 Reload。
-2. `sidebar/sidebar.html` script 路径。
-3. 控制台 import/export 报错。
-4. `sidebar/sidebar-logic.js` 顶部 import 路径。
-5. `sidebar/sidebar-ui.js` 顶部 import 路径。
+“进入详情后再做第二次 AI 相关性复核”不是当前稳定能力。若要增加：
 
-### 13.2 平台识别不对
+- 必须单独设计成本、超时和 fail-open；
+- 不得与舆情情感分析混用；
+- 不得导致同一作品重复写入；
+- 必须增加单元测试和浏览器快照。
 
-先看:
+## 15. 本地联调、生产同步与打包
 
-1. `background.js` 的 runtime 更新。
-2. `utils/platform/page-routing.js`。
-3. `utils/helpers.js`。
-4. `content-v2.js` 的 page state 上报。
-5. `sidebar/sidebar-logic.js` 的 `updatePlatformUI` 和 `updatePageTypeUI`。
-
-### 13.3 点击采集无反应
-
-先看:
-
-1. `setupUIEventListeners` 是否绑定了按钮。
-2. 按钮是否被 `setCaptureButtonsDisabled` 禁用。
-3. `runCaptureAction` 是否提前因为授权/页面类型拦截。
-4. `chrome.runtime.sendMessage` 是否返回错误。
-5. content script 是否加载成功。
-
-### 13.4 采集有数据但列表不显示
-
-先看:
-
-1. `saveCaptureResultRecords`。
-2. `saveRecordsWithCacheDedupe`。
-3. `utils/storage.js` 的 `addRecord/addRecords`。
-4. `sidebar/state.js` 的 `refreshDataPool`。
-5. `sidebar/sidebar-ui.js` 的记录列表渲染。
-
-### 13.5 同步失败
-
-先看:
-
-1. `resolveSyncInputForRecord`。
-2. `buildPlatformSyncInput`。
-3. `syncRecordBatch`。
-4. `utils/api.js` 的 `sync` 或 `syncBatch`。
-5. 后端 `server/routes/sync.js`。
-6. 后端 `server/services/record-store.js`。
-7. syncHistory 里的 `debugUrl`, `reason`, `message`。
-
-### 13.6 详情补采卡住
-
-先看:
-
-1. `batchCaptureDetailsForRecords`。
-2. `prepareDetailBatchRunnerContext`。
-3. `openUrlInTab`。
-4. `waitMsWithStop`。
-5. `captureCommentsForCurrentNote`。
-6. `classifyDetailCaptureFailure`。
-7. `repairInterruptedDetailCaptureRecords`。
-
-## 14. 建议保留的本地命令
-
-统计大文件:
+### 15.1 本地联调
 
 ```bash
-rg --files -0 -g '!node_modules' -g '!dist' -g '!build' -g '!coverage' -g '!vendor' | xargs -0 wc -l | sort -nr | head -40
+scripts/sync-extension-build.zsh local
 ```
 
-查看扩展公开导出:
+效果：
+
+- 从根目录源码重建 `extension-build/`；
+- 使用 `scripts/extension-runtime-config.local.js` 替换运行配置；
+- 连接本地 API；
+- 校验 manifest、禁止文件和快照一致性。
+
+随后：
+
+1. 打开扩展管理页；
+2. 对已加载的 `extension-build/` 点击“重新加载”；
+3. 打开目标平台页面；
+4. 确认 Side Panel 版本、激活和本地 API；
+5. 跑最小采集任务。
+
+### 15.2 生产同步
 
 ```bash
-rg -n '^export (async )?function|^export const|^export \\{' sidebar utils
+scripts/sync-extension-build.zsh production
 ```
 
-查看 message 通信:
+效果：
+
+- 只复制白名单入口和目录；
+- 用临时 staging 目录构建；
+- 排除系统垃圾文件；
+- 校验 `manifest.json`；
+- 拒绝密钥、安装包和环境文件；
+- 以 `rsync --delete` 清除过期文件；
+- 验证最终快照与 staging 完全一致。
+
+### 15.3 客户包
 
 ```bash
-rg -n 'chrome\\.runtime\\.(onMessage|sendMessage)|MESSAGE_TYPE|RELAY_TO_CONTENT' background.js content-v2.js sidebar utils
+scripts/package-extension.zsh
 ```
 
-查看 sidebar 事件绑定:
+或指定输出：
 
 ```bash
-rg -n 'addEventListener|window\\.' sidebar/sidebar-logic.js sidebar/sidebar-ui.js
+scripts/package-extension.zsh /absolute/output/StarVoice-extension-0.3.67.zip
 ```
 
-查看采集同步入口:
+打包脚本会：
+
+1. 强制重新做 production 同步；
+2. 检查运行目标为 production；
+3. 检查生产 API 地址存在；
+4. 拒绝 `localhost` 和 `127.0.0.1`；
+5. 从 `extension-build/` 生成 zip；
+6. 再次解压流检查本地地址；
+7. 输出最终客户包。
+
+`deploy/deploy.sh` 不负责 Extension 发布。后端部署成功不表示 Extension 客户包已更新。
+
+### 15.4 包体人工审查
 
 ```bash
-rg -n '^export async function|^export function|^async function|^function' utils/capture-sync.js
+tmp_dir=$(mktemp -d)
+unzip -q StarVoice-extension.zip -d "$tmp_dir"
+find "$tmp_dir" -type f | sort
+grep -RInE 'localhost|127\\.0\\.0\\.1' "$tmp_dir"
+shasum -a 256 StarVoice-extension.zip
 ```
 
-## 15. 文档维护规则
+人工确认：
 
-以后如果改了扩展侧核心流程, 请同步更新本文:
+- 根目录有 `manifest.json`；
+- 版本符合发布单；
+- 没有源码仓库文档、测试、数据库或部署脚本；
+- 没有 `.env*`、`.pem`、旧包、临时日志；
+- 没有本地 API 地址；
+- SHA-256 已记录到发布记录；
+- 上一个可用版本包仍可取得。
 
-1. 新增公开导出。
-2. 新增 message type。
-3. 新增 storage key。
-4. 改变 record/payload/detailPayload 结构。
-5. 改变扩展加载方式。
-6. 改变手工回归清单。
+## 16. 升级、发布、验收与回滚
 
-这份文档的价值在于少读代码、少猜上下文、少误动敏感链路。宁可写细一点, 也不要让接手者重新从两个万行文件里推理业务边界。
+### 16.1 发布前
+
+1. 确认工作树中 Extension 相关改动范围；
+2. 更新 `manifest.json` 版本；
+3. 更新受影响的协议和维护文档；
+4. 运行 production 同步；
+5. 运行定向测试和浏览器快照；
+6. 生成客户包；
+7. 解压审查并记录哈希；
+8. 保留上一版包和服务端兼容窗口。
+
+### 16.2 客户升级
+
+开发者模式加载解压包：
+
+1. 客户先结束正在运行的采集任务；
+2. 备份当前可用包，不导出认证明文；
+3. 解压新包到新的固定目录；
+4. 在扩展管理页加载/更新该目录；
+5. 确认版本号；
+6. 确认激活和 Agent 名称；
+7. 等待后台出现当前 Agent 心跳；
+8. 跑一个最小任务；
+9. 再恢复无人值守或批量任务。
+
+不要在运行中覆盖 Extension 文件。浏览器对更新中的 Service Worker、内容脚本和页面旧实例可能并存。
+
+### 16.3 最小验收
+
+每次正式包至少验证：
+
+| 类别 | 验收点 |
+|---|---|
+| 加载 | Chrome 和 Edge 无 manifest 错误 |
+| 版本 | Side Panel 与 manifest 一致 |
+| 激活 | 校验成功，租户和 Agent scope 正确 |
+| 心跳 | 后台显示当前 Agent，能力与平台正确 |
+| 任务 | 新建、停止、继续各一次 |
+| 所有权 | 同 Profile 第二任务不并行 |
+| 小红书 | 正常详情、删除页、安全限制 |
+| 抖音 | 正常详情、服务异常、验证码、删帖倒计时 |
+| 评论巡查 | 详情日期过滤、边界日期、未知日期 |
+| AI | 开/关、实际命中、超时 fail-open |
+| 清理 | 调试器解除、工作页关闭、来源页恢复 |
+| 打包 | 无本地地址和禁止文件 |
+
+### 16.4 回滚
+
+触发条件：
+
+- 大面积任务无法领取；
+- 目标 ID 校验持续误杀；
+- 任务停止后继续写回；
+- 验证码未停止自动操作；
+- 调试器或工作页无法释放；
+- 租户/Agent scope 串数据；
+- 生产包包含本地地址；
+- 平台采集成功率显著下降。
+
+回滚步骤：
+
+1. 暂停云端新增任务；
+2. 停止或安全结算正在运行任务；
+3. 保存诊断和任务 ID，不保存敏感凭据；
+4. 恢复上一版固定目录或重新加载上一版包；
+5. 确认版本和心跳；
+6. 跑最小采集；
+7. 恢复下发；
+8. 将失败 attempt 保留，不篡改为成功。
+
+若后端协议已经改变，必须先确认上一版 Extension 仍兼容；否则应回滚后端兼容层或暂时停止该工作流。
+
+## 17. 2026-07-30 测试证据
+
+以下命令在 `0.3.67` 基线上执行：
+
+```bash
+node --test \
+  tests/cloud-task-agent.test.mjs \
+  tests/cloud-targeted-post.test.mjs \
+  tests/target-page-availability.test.mjs \
+  tests/capture/douyin-search-guard.test.mjs \
+  tests/capture/official-comment-patrol-date-filter.test.mjs \
+  tests/negative-patrol-multi-agent.test.mjs \
+  tests/capture/task-owner.test.mjs \
+  tests/capture/task-runtime.test.mjs \
+  tests/capture/task-tab-group.test.mjs \
+  tests/task-center.test.mjs \
+  tests/auth-state-cas.test.mjs
+```
+
+结果：
+
+```text
+118 passed
+0 failed
+```
+
+浏览器快照：
+
+```bash
+node tests/capture/extension-snapshot.browser.mjs
+```
+
+结果：
+
+- Chromium 快照通过；
+- 暗色运行页通过；
+- 等待倒计时状态通过。
+
+测试期间唯一已知警告：
+
+```text
+MODULE_TYPELESS_PACKAGE_JSON
+```
+
+该警告来自仓库未在 `package.json` 明确声明模块类型，当前不影响上述用例通过，但属于工程债，见后文。
+
+### 17.1 测试证据的边界
+
+上述结果不能替代：
+
+- 真实账号平台冒烟；
+- Chrome / Edge 双浏览器测试；
+- 真实验证码人工介入；
+- 生产 API 和租户 scope 验证；
+- 客户包解压审查；
+- 长时间无人值守测试。
+
+任何平台页面改版后，单元测试仍可能通过而真实 DOM 已失效。
+
+## 18. 故障排查顺序
+
+### 18.1 后台显示在线，但任务没有执行
+
+依次检查：
+
+1. Agent ID 是否为当前浏览器 Profile；
+2. 租户和激活 scope 是否一致；
+3. 心跳是否只有设备时间，没有业务进度；
+4. 平台是否登录；
+5. 当前 Agent 是否已有任务所有权；
+6. 云命令是否仍 pending；
+7. command attempt 是否已经被更高 attempt 替代；
+8. 页面是否进入验证码、安全限制或不支持页；
+9. Service Worker 控制台是否有命令领取错误；
+10. 任务账本是否已经进入终态而 UI 未刷新。
+
+### 18.2 点击继续却从第一个关键词开始
+
+检查：
+
+- 是否创建了新 attempt；
+- checkpoint 是否记录到关键词粒度；
+- `remaining` 是否错误映射为 full rerun；
+- 旧版 legacy 记录是否缺少边界；
+- 新 runner 是否读取了错误 Agent scope；
+- 完成关键词结果是否被清理脚本误删。
+
+### 18.3 Extension 显示成功，云端仍失败
+
+检查：
+
+- 写回使用的任务 ID、attempt、目标 ID；
+- 目标页面实际作品 ID；
+- 是否先完成本地任务、后遇到云端栅栏拒绝；
+- 后端是否仍显示旧 attempt；
+- UI 是否读取旧缓存；
+- 是否发生租户镜像数据迁移后引用旧 ID。
+
+不得删除 ID 校验来“修复”。应修正 ID 规范化、任务映射或 attempt。
+
+### 18.4 任务一直重复、页面循环打开
+
+检查：
+
+- `content-v2.js` 是否重复注入；
+- MutationObserver 是否在终态解除；
+- 旧 Port disconnect 是否误杀/重启新 runner；
+- 终态是否吸收迟到 progress；
+- 工作页关闭后是否又被 supervisor 误判为需恢复；
+- 来源页恢复和暗色状态页关闭是否形成互相导航；
+- 清理时是否过早释放所有权。
+
+### 18.5 抖音服务异常导致全任务停止
+
+检查异常分类是否错误进入：
+
+- security challenge；
+- manual action；
+- fatal batch。
+
+正确行为是当前关键词有限重试或结束，继续下一个词。只有验证码/人工验证才暂停整批。
+
+### 18.6 官方账号日期范围不生效
+
+检查：
+
+- 是否在列表页就过滤；
+- 是否逐篇进入详情；
+- 是否读取可信发布时间；
+- 是否把未知日期当成当前日期；
+- 是否先截断 postsLimit 再过滤日期；
+- 服务端是否拒绝超过 30 天；
+- 时区和边界日期是否按业务约定处理。
+
+### 18.7 AI 开关打开但没有介入
+
+检查：
+
+- 租户 provider 配置；
+- 服务端 API Key 是否存在且有效；
+- 前置筛选请求是否发出；
+- 是否只有确定性规则完成；
+- AI 是否超时后 fail-open；
+- 返回是否高置信无关；
+- 任务日志是否显示批次、耗时和结果；
+- 内容同步后的 AI 分析是否被误认为前置筛选。
+
+## 19. 高风险改动区域
+
+以下改动必须小步、带测试、可回滚：
+
+| 区域 | 主要风险 |
+|---|---|
+| `background.js` | 消息协议、Service Worker 生命周期、云任务和调试器交叉 |
+| `sidebar/sidebar-logic.js` | 多入口 UI、任务中心、采集按钮和历史兼容 |
+| `utils/task-center.js` | 状态机、attempt、终态和旧数据迁移 |
+| `utils/cloud-task-agent.js` | 租户、心跳、能力声明、命令回执 |
+| `utils/capture/task-owner.js` | 重连、误停、重复 runner |
+| `utils/capture/task-runtime.js` | debugger 与页面清理 |
+| `utils/capture/task-tab-group.js` | 原始页、工作页、窗口和原生分组 |
+| 平台 DOM 选择器 | 平台改版、误抓推荐内容、错误目标 ID |
+| MAIN world 拦截 | 审核、安全和页面兼容 |
+| 打包脚本 | 本地地址或禁止文件泄漏 |
+
+不要为了“文件太大”做无业务目标的大拆分。若必须拆分：
+
+1. 先锁定外部入口和消息协议；
+2. 只搬代码，不改行为；
+3. 原导出保持兼容；
+4. 每一步运行定向测试；
+5. 最后再做命名和结构整理。
+
+## 20. 已知工程债
+
+### P1：稳定后尽快处理
+
+1. **ES Module 类型未显式声明**
+   Node 测试出现 `MODULE_TYPELESS_PACKAGE_JSON`。应评估给合适的测试/工具包声明 `"type": "module"`，但不要未经全量脚本验证直接改仓库根模块语义。
+
+2. **关键业务文件仍然过大**
+   `background.js`、`sidebar/sidebar-logic.js`、`utils/task-center.js` 职责多。优先按协议、状态机、视图适配器渐进拆分，不做一次性重写。
+
+3. **平台 DOM 持续漂移**
+   需要为高风险信号维护真实、脱敏的 DOM fixture，并增加“正文包含异常词但不应误判”的反例。
+
+4. **AI 可观测性不够直观**
+   UI 开关与实际 AI 命中容易混淆。应展示“确定性规则 / AI 返回 / 超时 fail-open / 服务未配置”四种来源。
+
+### P2：计划治理
+
+5. **激活状态不是 OS 级安全存储**
+   当前本地 AES-GCM 只是降低明文暴露。长期可评估浏览器托管身份或操作系统安全存储桥接。
+
+6. **真实浏览器端到端覆盖有限**
+   需要增加 Chrome、Edge、Service Worker 挂起恢复、Profile 隔离和长时间无人值守测试。
+
+7. **官方评论是可见样本，不是全量语义**
+   报告和 UI 应持续标注采样边界，避免把“读取上限”显示成“平台总评论数”。
+
+8. **Legacy 任务恢复能力有限**
+   缺少关键词边界和 attempt 的旧任务只能展示，不能安全断点恢复。不要用推断补齐。
+
+9. **Manifest 审核面偏大**
+   权限和可访问资源都有真实业务理由，但每次新增平台或资源后需复核最小化空间。
+
+10. **交付仍依赖人工解压冒烟**
+    可增加 CI 生成哈希、列出包内容并运行静态敏感项检查，但仍保留人工平台冒烟。
+
+## 21. 修改协议时的联动清单
+
+### 21.1 增加新任务类型
+
+必须同时检查：
+
+- 后端任务 schema；
+- Agent 能力声明；
+- 云命令领取；
+- 本地任务账本展示；
+- attempt / progressSeq；
+- 所有权锁；
+- 停止和恢复；
+- 任务页面创建与清理；
+- 失败分类；
+- 测试；
+- 本文档。
+
+### 21.2 增加新平台
+
+必须同时检查：
+
+- manifest host 权限；
+- 内容脚本匹配；
+- 页面类型识别；
+- 账号身份；
+- 正常页和异常页；
+- 删除/不可用；
+- 验证码；
+- 作品 ID 规范化；
+- 评论读取边界；
+- 本地与生产包；
+- 商店权限说明。
+
+### 21.3 修改任务状态
+
+必须回答：
+
+1. 是终态还是非终态？
+2. 旧 attempt 能否写入？
+3. 终态能否被恢复？
+4. UI 放在哪个分组？
+5. 清理按钮是否可归档？
+6. 云端和本地名称是否一致？
+7. 旧版本 Extension 收到新状态会怎样？
+
+## 22. 发布记录模板
+
+每个正式 Extension 包至少记录：
+
+```text
+版本：
+构建日期：
+Git 提交：
+生产包文件名：
+SHA-256：
+生产同步：通过 / 不通过
+单元测试：通过数量 / 失败数量
+浏览器快照：通过 / 不通过
+Chrome 冒烟：通过 / 不通过
+Edge 冒烟：通过 / 不通过
+激活与 Agent scope：通过 / 不通过
+小红书：通过 / 不通过
+抖音：通过 / 不通过
+官方评论日期过滤：通过 / 不通过
+AI fail-open：通过 / 不通过
+上一版回滚包：
+已知限制：
+发布人：
+验收人：
+```
+
+发布记录中不要粘贴激活码、令牌、Cookie、真实客户账号或未脱敏业务数据。
+
+## 23. 接手者 30 分钟检查表
+
+第一次接手时按顺序完成：
+
+1. 阅读本文第 2、3、6、9、11、12、15、16 节；
+2. 确认 `manifest.json` 版本；
+3. 查看根源码与 `extension-build/` 的关系；
+4. 跑第 17 节定向测试；
+5. 跑浏览器快照；
+6. production 同步；
+7. 本地加载 `extension-build/`；
+8. 激活测试节点；
+9. 确认 Agent 心跳；
+10. 创建一个最小任务；
+11. 测试停止；
+12. 测试 `remaining` 继续；
+13. 检查 debugger、工作页和标签组已清理；
+14. 不改代码前先保存测试基线。
+
+如果任何一步失败，不要继续打包或部署；先按第 18 节定位，并保留任务 ID、attempt、错误分类和时间。
+
+---
+
+最后更新：2026-07-30
+当前文档基线：StarVoice Extension `0.3.67`

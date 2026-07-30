@@ -809,6 +809,7 @@ const MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW = Object.freeze({
 const MONITOR_DETAIL_DATE_DISCOVERY_MIN = 20;
 const MONITOR_DETAIL_DATE_DISCOVERY_MAX = 60;
 const MONITOR_DETAIL_DATE_DISCOVERY_MULTIPLIER = 3;
+const MONITOR_LATEST_POSTS_LIMIT_MAX = 100;
 const MONITOR_OBSERVE_WINDOW_OPTIONS = Object.freeze([24, 48, 72]);
 const MONITOR_RUN_TIME_OPTIONS = Object.freeze(
   Array.from({length: 24}, (_, hour) => `${String(hour).padStart(2, "0")}:00`),
@@ -960,6 +961,7 @@ let captureExecutionLockHeartbeatInFlight = false;
 let captureExecutionLockInitialHolderTabId = null;
 let captureExecutionLockReleasePendingId = "";
 const CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS = 20 * 1000;
 const CAPTURE_EXECUTION_LOCK_HOLDER_ID =
   typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -15703,6 +15705,72 @@ async function updateTargetedPostRun(
   return binding.request;
 }
 
+function startTargetedPostRunHeartbeat(invocationToken, getCurrentRequest) {
+  let stopped = false;
+  let inFlight = false;
+
+  const publish = async () => {
+    if (
+      stopped ||
+      inFlight ||
+      !isActiveTargetedPostInvocation(invocationToken)
+    ) {
+      return;
+    }
+    const current =
+      typeof getCurrentRequest === "function" ? getCurrentRequest() : null;
+    const currentToken = getTargetedPostInvocationTokenFromRequest(current);
+    if (
+      !current ||
+      !isSameTargetedPostInvocationToken(currentToken, invocationToken) ||
+      cloudTargetedPostApi?.isTerminalRunStatus?.(current.status)
+    ) {
+      return;
+    }
+
+    inFlight = true;
+    const now = new Date().toISOString();
+    const progress =
+      current.progress &&
+      typeof current.progress === "object" &&
+      !Array.isArray(current.progress)
+        ? current.progress
+        : {};
+    try {
+      await updateTargetedPostRun(
+        current,
+        {
+          heartbeatAt: now,
+          businessProgressAt: now,
+          progress: {
+            ...progress,
+            updatedAt: now,
+          },
+        },
+        invocationToken,
+      );
+    } catch (error) {
+      if (
+        isActiveTargetedPostInvocation(invocationToken) &&
+        String(error?.code || "") !== "targeted_post_run_terminal"
+      ) {
+        console.warn("[Sidebar] Targeted post heartbeat failed:", error);
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void publish();
+  }, TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS);
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 async function cancelTargetedPostRunFromSidebar(requestId = "") {
   const current =
     targetedPostRunState && typeof targetedPostRunState === "object"
@@ -15981,6 +16049,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
   batchUrlCancelRequested = targetedPostCancelRequested;
   let executionLock = null;
   let targetTabId = null;
+  let stopTargetedPostHeartbeat = () => {};
   const shouldStop = () =>
     !isActiveTargetedPostInvocation(invocationToken) ||
     (isSameTargetedPostInvocationToken(
@@ -16023,6 +16092,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
         ? `正在逐个扫描${request.subjectType === "official" ? "官方账号" : "关注博主"}`
         : "正在逐条采集指定作品",
     }, invocationToken);
+    stopTargetedPostHeartbeat = startTargetedPostRunHeartbeat(
+      invocationToken,
+      () => targetedPostRunState || request,
+    );
 
     const settledItemIds = new Set(
       (Array.isArray(request.targetResults) ? request.targetResults : []).map(
@@ -16115,6 +16188,59 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           // execution because it is linked to a cloud task item.
           executionPreclaimed: true,
           shouldStop,
+          onProgress: (progress = {}) => {
+            if (!isActiveTargetedPostInvocation(invocationToken)) {
+              return;
+            }
+            const displayedToken =
+              getTargetedPostInvocationTokenFromRequest(
+                targetedPostRunState,
+              );
+            if (
+              displayedToken &&
+              !isSameTargetedPostInvocationToken(
+                displayedToken,
+                invocationToken,
+              )
+            ) {
+              return;
+            }
+            const rawPhase = String(progress.phase || "profile_scan");
+            const nextProgress = {
+              ...(targetedPostRunState?.progress &&
+              typeof targetedPostRunState.progress === "object"
+                ? targetedPostRunState.progress
+                : request?.progress &&
+                    typeof request.progress === "object"
+                  ? request.progress
+                  : {}),
+              current: Number(target.ordinal) || targetResults.length + 1,
+              total: request.targets.length,
+              itemId: target.itemId,
+              recordId: target.recordId,
+              title: target.title,
+              url: target.url,
+              targetTabId,
+              phase: rawPhase.startsWith("target_")
+                ? rawPhase
+                : `target_${rawPhase}`,
+              message: String(
+                progress.message ||
+                  `正在扫描第 ${target.ordinal}/${request.targets.length} 个账号`,
+              ),
+              updatedAt:
+                String(progress.updatedAt || "").trim() ||
+                new Date().toISOString(),
+            };
+            targetedPostRunState = cloudTargetedPostApi.mergeRunPatch(
+              targetedPostRunState || request,
+              {
+                progress: nextProgress,
+                message: nextProgress.message,
+              },
+            );
+            renderCaptureDebugSession(getCurrentRuntime() || {});
+          },
         });
         const monitorStatus = String(monitorResult?.status || "");
         const canceled =
@@ -16361,6 +16487,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
         : checkpoint.successCount > 0 || checkpoint.warningCount > 0
           ? "completed_with_warnings"
           : "failed";
+    stopTargetedPostHeartbeat();
     request = await updateTargetedPostRun(request, {
       status: finalStatus,
       finishedAt: new Date().toISOString(),
@@ -16391,6 +16518,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     }, invocationToken);
     await refreshDataPool();
   } catch (error) {
+    stopTargetedPostHeartbeat();
     console.error("[Sidebar] Targeted post workflow failed:", error);
     const staleInvocation =
       String(error?.code || "") === "stale_targeted_post_attempt" ||
@@ -16433,6 +16561,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       }
     }
   } finally {
+    stopTargetedPostHeartbeat();
     const cleanupOwnership =
       getTargetedPostInvocationOwnership(invocationToken);
     if (
@@ -19387,8 +19516,12 @@ function resolveMonitorRunnerCaptureParams(
       : defaultMaxDetectedItems;
   const verifyPublishDateFromDetail =
     captureSettings.verifyPublishDateFromDetail === true;
+  const scanLatestPostsByCount =
+    captureSettings.scanLatestPostsByCount === true;
   const maxDetectedItems =
-    verifyPublishDateFromDetail
+    scanLatestPostsByCount
+      ? Math.min(MONITOR_LATEST_POSTS_LIMIT_MAX, normalizedPostsLimit)
+      : verifyPublishDateFromDetail
       ? Math.min(
           MONITOR_DETAIL_DATE_DISCOVERY_MAX,
           Math.max(
@@ -19400,7 +19533,9 @@ function resolveMonitorRunnerCaptureParams(
   const publishBounds = resolveMonitorPublishWindowBounds(monitorSettings);
   const publishWindow = publishBounds.key;
   const isStrictPublishWindow = publishBounds.strict === true;
-  const monitorScanLimit = verifyPublishDateFromDetail
+  const monitorScanLimit = scanLatestPostsByCount
+    ? maxDetectedItems
+    : verifyPublishDateFromDetail
     ? maxDetectedItems
     : isStrictPublishWindow
       ? Math.min(
@@ -19422,7 +19557,10 @@ function resolveMonitorRunnerCaptureParams(
     monitorLikeThreshold: Math.floor(likeThreshold),
     // 账号作品列表不一定提供可信发布时间。官方账号评论巡查先把列表当作
     // 候选来源，进入详情页核实日期后再筛选，避免在列表阶段误判。
-    monitorPublishWindow: verifyPublishDateFromDetail ? "" : publishWindow,
+    monitorPublishWindow:
+      verifyPublishDateFromDetail || scanLatestPostsByCount
+        ? ""
+        : publishWindow,
     monitorObserveWindowHours: observeWindowHours,
     waitMinMs:
       Number(captureSettings.sharedWaitMinMs) ||
@@ -19437,7 +19575,14 @@ function resolveMonitorRunnerCaptureParams(
       Number(captureSettings.sharedMaxDurationMs) ||
       DEFAULT_CAPTURE_SETTINGS.sharedMaxDurationMs,
     maxScrollTimes:
-      verifyPublishDateFromDetail || !isStrictPublishWindow ? 20 : 6,
+      scanLatestPostsByCount
+        ? Math.max(
+            20,
+            Math.min(60, Math.ceil(Math.floor(monitorScanLimit) / 2)),
+          )
+        : verifyPublishDateFromDetail || !isStrictPublishWindow
+          ? 20
+          : 6,
   };
 }
 
@@ -19945,6 +20090,29 @@ function isMonitorPublishMomentInWindow(moment, bounds) {
   return moment.timestampMs >= bounds.startMs && moment.timestampMs < bounds.endMs;
 }
 
+function reportMonitorRunProgress(
+  onProgress,
+  progress = {},
+  fallbackMessage = "",
+) {
+  const message =
+    String(progress?.message || fallbackMessage || "").trim() ||
+    "正在处理账号巡查...";
+  showProgress(message);
+  if (typeof onProgress === "function") {
+    Promise.resolve(
+      onProgress({
+        ...progress,
+        message,
+        updatedAt: new Date().toISOString(),
+      }),
+    ).catch((error) => {
+      console.warn("[Sidebar] Monitor progress callback failed:", error);
+    });
+  }
+  return message;
+}
+
 async function resolveMonitorRecordIdsForPublishWindow({
   recordIds = [],
   monitorSettings = {},
@@ -19953,11 +20121,29 @@ async function resolveMonitorRecordIdsForPublishWindow({
   index = 0,
   total = 1,
   shouldStop = null,
+  onProgress = null,
 } = {}) {
   const uniqueRecordIds = [...new Set(recordIds.filter(Boolean))];
-  const bounds = resolveMonitorPublishWindowBounds(monitorSettings);
   const verifyPublishDateFromDetail =
     captureSettings.verifyPublishDateFromDetail === true;
+  const scanLatestPostsByCount =
+    captureSettings.scanLatestPostsByCount === true;
+  if (scanLatestPostsByCount) {
+    const requestedPostsLimit = Number(monitorSettings.postsLimit);
+    const selectedIds =
+      Number.isSafeInteger(requestedPostsLimit) && requestedPostsLimit > 0
+        ? uniqueRecordIds.slice(0, requestedPostsLimit)
+        : uniqueRecordIds;
+    return {
+      recordIds: selectedIds,
+      scannedCount: uniqueRecordIds.length,
+      filteredCount: Math.max(0, uniqueRecordIds.length - selectedIds.length),
+      unknownCount: 0,
+      windowLabel: `最近 ${selectedIds.length} 篇`,
+      detailResult: null,
+    };
+  }
+  const bounds = resolveMonitorPublishWindowBounds(monitorSettings);
 
   if (!bounds.strict || uniqueRecordIds.length === 0) {
     return {
@@ -20011,26 +20197,64 @@ async function resolveMonitorRecordIdsForPublishWindow({
     };
   }
 
-  showProgress(
+  reportMonitorRunProgress(
+    onProgress,
+    {
+      phase: "profile_publish_date_verification",
+      current: 0,
+      total: detailCandidateIds.length,
+    },
     `正在读取发布时间 (${index + 1}/${total})：${displayName} · ${bounds.label}`,
   );
-  const detailResult = await batchCaptureDetailsForRecords(detailCandidateIds, {
+  const detailResult = await runEnhancementWithSingleRetry({
+    recordIds: detailCandidateIds,
     shouldStop,
-    onProgress: (progress = {}) => {
-      const message =
-        String(progress.message || "").trim() || "正在补采作品详情...";
-      showProgress(
-        `正在读取发布时间 (${index + 1}/${total})：${displayName} · ${message}`,
+    onRetryScheduled: ({recordIds: retryRecordIds}) => {
+      reportMonitorRunProgress(
+        onProgress,
+        {
+          phase: "profile_publish_date_retry_waiting",
+          current: 0,
+          total: retryRecordIds.length,
+          autoRetryCount: 1,
+        },
+        `发布时间读取工作页中断，正在续跑剩余 ${retryRecordIds.length} 条`,
       );
     },
-    includeComments: false,
-    includeBloggerMetrics: false,
-    // 发布时间必须来自本轮真实进入详情页后的结果。即使此前采过详情，
-    // 也不能复用旧快照，否则会把旧日期误当作本轮巡查证据。
-    skipAlreadyCaptured: false,
-    detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
-    detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
-    profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
+    runAttempt: async (attemptRecordIds, attemptContext = {}) => {
+      const isRetry = attemptContext.isRetry === true;
+      return await batchCaptureDetailsForRecords(attemptRecordIds, {
+        shouldStop,
+        onProgress: (progress = {}) => {
+          const detailMessage =
+            String(progress.message || "").trim() || "正在补采作品详情...";
+          reportMonitorRunProgress(
+            onProgress,
+            {
+              ...progress,
+              phase: isRetry
+                ? "profile_publish_date_retry"
+                : String(
+                    progress.phase ||
+                      "profile_publish_date_verification",
+                  ),
+              autoRetryCount: isRetry ? 1 : 0,
+            },
+            `正在读取发布时间 (${index + 1}/${total})：${displayName} · ${
+              isRetry ? "续跑 1/1 · " : ""
+            }${detailMessage}`,
+          );
+        },
+        includeComments: false,
+        includeBloggerMetrics: false,
+        // 发布时间必须来自本轮真实进入详情页后的结果。即使此前采过详情，
+        // 也不能复用旧快照，否则会把旧日期误当作本轮巡查证据。
+        skipAlreadyCaptured: false,
+        detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
+        detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
+        profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
+      });
+    },
   });
 
   const stoppedByCaller =
@@ -20187,6 +20411,7 @@ async function executeMonitorRunItem({
   runnerTabId = null,
   executionPreclaimed = false,
   shouldStop = null,
+  onProgress = null,
 } = {}) {
   const subscriptionId = String(
     runItem.subscriptionId || monitorItem.id || "",
@@ -20245,7 +20470,13 @@ async function executeMonitorRunItem({
   }
 
   try {
-    showProgress(
+    reportMonitorRunProgress(
+      onProgress,
+      {
+        phase: "profile_scan_start",
+        current: 0,
+        total,
+      },
       `正在扫描监控账号 (${index + 1}/${total})：${displayName}`,
     );
 
@@ -20280,10 +20511,15 @@ async function executeMonitorRunItem({
         captureSettings,
       ),
       onProgress: (progress = {}) => {
-        const message =
+        const captureMessage =
           String(progress.message || "").trim() || "正在采集账号作品...";
-        showProgress(
-          `正在扫描监控账号 (${index + 1}/${total})：${displayName} · ${message}`,
+        reportMonitorRunProgress(
+          onProgress,
+          {
+            ...progress,
+            phase: String(progress.phase || "profile_list_capture"),
+          },
+          `正在扫描监控账号 (${index + 1}/${total})：${displayName} · ${captureMessage}`,
         );
       },
       shouldStop,
@@ -20346,6 +20582,7 @@ async function executeMonitorRunItem({
       index,
       total,
       shouldStop,
+      onProgress,
     });
 
     if (publishFilterResult.canceled) {
@@ -20419,37 +20656,73 @@ async function executeMonitorRunItem({
       captureSettings.includeCommentsOnDetailCapture === true;
     let commentDetailResult = null;
     if (shouldCaptureComments) {
-      showProgress(
+      reportMonitorRunProgress(
+        onProgress,
+        {
+          phase: "profile_comment_patrol",
+          current: 0,
+          total: hitRecordIds.length,
+        },
         `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${hitRecordIds.length} 条作品`,
       );
-      commentDetailResult = await batchCaptureDetailsForRecords(hitRecordIds, {
+      commentDetailResult = await runEnhancementWithSingleRetry({
+        recordIds: hitRecordIds,
         shouldStop,
-        onProgress: (progress = {}) => {
-          const message =
-            String(progress.message || "").trim() || "正在采集作品评论...";
-          showProgress(
-            `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${message}`,
+        onRetryScheduled: ({recordIds: retryRecordIds}) => {
+          reportMonitorRunProgress(
+            onProgress,
+            {
+              phase: "profile_comment_retry_waiting",
+              current: 0,
+              total: retryRecordIds.length,
+              autoRetryCount: 1,
+            },
+            `评论巡查工作页中断，正在续跑剩余 ${retryRecordIds.length} 条`,
           );
         },
-        includeComments: true,
-        includeBloggerMetrics: false,
-        // 发布时间筛选会先读取详情；官方账号评论巡查仍需再次进入命中作品
-        // 采评论，不能被“已采过详情”的增量规则跳过。
-        skipAlreadyCaptured: false,
-        enableAiRelevancePrefilter: false,
-        commentsMaxDetectedItems:
-          captureSettings.detailCommentsMaxDetectedItems ??
-          captureSettings.commentsMaxDetectedItems ??
-          50,
-        detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
-        detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
-        profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
-        waitForegroundTabId:
-          Number.isSafeInteger(Number(runnerTabId)) &&
-          Number(runnerTabId) > 0
-            ? Number(runnerTabId)
-            : null,
-        captureTaskId: executionId,
+        runAttempt: async (attemptRecordIds, attemptContext = {}) => {
+          const isRetry = attemptContext.isRetry === true;
+          return await batchCaptureDetailsForRecords(attemptRecordIds, {
+            shouldStop,
+            onProgress: (progress = {}) => {
+              const commentMessage =
+                String(progress.message || "").trim() ||
+                "正在采集作品评论...";
+              reportMonitorRunProgress(
+                onProgress,
+                {
+                  ...progress,
+                  phase: isRetry
+                    ? "profile_comment_retry"
+                    : String(progress.phase || "profile_comment_patrol"),
+                  autoRetryCount: isRetry ? 1 : 0,
+                },
+                `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${
+                  isRetry ? "续跑 1/1 · " : ""
+                }${commentMessage}`,
+              );
+            },
+            includeComments: true,
+            includeBloggerMetrics: false,
+            // 官方账号评论巡查每次都要重新进入命中作品采评论，不能被
+            // “已采过详情”的增量规则跳过。
+            skipAlreadyCaptured: false,
+            enableAiRelevancePrefilter: false,
+            commentsMaxDetectedItems:
+              captureSettings.detailCommentsMaxDetectedItems ??
+              captureSettings.commentsMaxDetectedItems ??
+              50,
+            detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
+            detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
+            profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
+            waitForegroundTabId:
+              Number.isSafeInteger(Number(runnerTabId)) &&
+              Number(runnerTabId) > 0
+                ? Number(runnerTabId)
+                : null,
+            captureTaskId: executionId,
+          });
+        },
       });
 
       if (

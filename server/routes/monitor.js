@@ -2,6 +2,9 @@ import { Router } from 'express';
 import { queryOne, queryAll, execute, getAllSettings, setSettings, withTransaction } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { applyResolvedMetrics } from '../utils/metrics.js';
+import {
+  captureOfficialCommentPatrolSnapshots,
+} from '../services/official-comment-patrol-analytics.js';
 
 const router = Router();
 const MONITOR_SETTING_KEYS = new Set([
@@ -1060,6 +1063,14 @@ router.post('/executions/:id/finish', requireTenantAccess, requireTenantWriter, 
           updated_at = now()
         WHERE id = $4 AND tenant_id = $5
       `, [finalStatus, nextCursor || '', finalStatus === 'failed' ? errorMessage : '', execution.subscription_id, req.tenantId]);
+
+      if (finalStatus === 'succeeded') {
+        await captureOfficialCommentPatrolSnapshots(
+          tx,
+          req.tenantId,
+          execution.id,
+        );
+      }
 
       return execution;
     });

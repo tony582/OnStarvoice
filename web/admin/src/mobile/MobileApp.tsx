@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity, AlertTriangle, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
   CircleAlert, ClipboardList, Database, Eye, FileText, Headphones,
-  Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageSquare, Monitor,
+  Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageCircle, MessageSquare, Monitor,
   MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
   Sparkles, User, Users,
 } from 'lucide-react'
@@ -36,6 +36,7 @@ import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentHomePage } from '@/pages/ContentHomePage'
 import { HitsPage } from '@/pages/HitsPage'
 import { OfficialAccountsPage } from '@/pages/OfficialAccountsPage'
+import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 
 type OpenPage = (page: string, params?: Record<string, string>) => void
@@ -59,6 +60,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   'content-home': ContentHomePage,
   hits: HitsPage,
   'official-accounts': OfficialAccountsPage,
+  'official-comments': OfficialCommentPatrolTab,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,
@@ -70,7 +72,8 @@ const PAGE_TITLES: Record<string, string> = {
   monitoring: '关注博主', dispatch: '调度中心', 'social-accounts': '社交账号', insights: '舆情洞察', 'opinion-analysis': '舆情剖析', data: '数据与导出', events: '事件中心',
   tracks: '赛道机会', benchmarks: '对标账号', keywords: '选题与扩词',
   'content-home': '内容总览', hits: '爆款拆解', review: '内容复盘',
-  'official-accounts': '官方账号', tenants: '租户管理', users: '用户账号',
+  'official-accounts': '官方账号管理', 'official-comments': '评论巡查',
+  tenants: '租户管理', users: '用户账号',
   'auth-codes': '激活码', settings: '系统设置',
 }
 
@@ -494,9 +497,14 @@ interface DirectoryItem {
   page: string
   params?: Record<string, string>
   admin?: boolean
+  internal?: boolean
 }
 
 const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
+  { label: '官方社媒', items: [
+    { title: '评论巡查', subtitle: '帖子趋势、评论情绪与运营建议', icon: MessageCircle, page: 'official-comments' },
+    { title: '官方账号管理', subtitle: '账号、别名、ID 与排除规则', icon: ShieldCheck, page: 'official-accounts', internal: true },
+  ] },
   { label: '数据与导出', items: [
     { title: '数据底座', subtitle: '六类数据集、筛选、详情与下载', icon: Database, page: 'data' },
     { title: '报告中心', subtitle: '生成、预览、发送与历史记录', icon: FileText, page: 'insights', params: { tab: 'reports' } },
@@ -505,7 +513,6 @@ const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
     { title: '客服工单', subtitle: '处理、打回、归档与回执', icon: Headphones, page: 'opinion' },
     { title: '销售客资', subtitle: '购买意向跟进与处理', icon: User, page: 'salesleads' },
     { title: '社交账号', subtitle: '登录账号、Agent 绑定与每日负载', icon: Users, page: 'social-accounts' },
-    { title: '官方账号', subtitle: '账号、别名、ID 与排除规则', icon: ShieldCheck, page: 'official-accounts' },
     { title: '事件中心', subtitle: '严重度、状态与关联内容时间线', icon: Bell, page: 'events' },
   ] },
   { label: '平台管理', items: [
@@ -522,7 +529,10 @@ function MoreHub({ openPage }: { openPage: OpenPage }) {
   const normalized = query.trim().toLowerCase()
   const groups = MORE_GROUPS.map(group => ({
     ...group,
-    items: group.items.filter(item => (!item.admin || isPlatformAdmin()) && (!normalized || `${item.title}${item.subtitle}`.toLowerCase().includes(normalized))),
+    items: group.items.filter(item =>
+      (!item.admin || isPlatformAdmin())
+      && (!item.internal || isInternal())
+      && (!normalized || `${item.title}${item.subtitle}`.toLowerCase().includes(normalized))),
   })).filter(group => group.items.length)
 
   return (
@@ -615,6 +625,7 @@ function rootForPage(page: string, params: Record<string, string>): RootTab {
   if (page === 'monitoring' || page === 'dispatch' || page === 'social-accounts' || page === 'events') return 'monitor'
   if (['insights', 'opinion-analysis', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
   if (page === 'overview') return 'today'
+  if (page === 'official-accounts' || page === 'official-comments') return 'more'
   if (params.queue) return 'tasks'
   return 'more'
 }

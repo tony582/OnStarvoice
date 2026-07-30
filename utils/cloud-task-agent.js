@@ -208,6 +208,18 @@
       checkpoint: sanitizeStructuredValue(objectValue(source.checkpoint)),
       workflow: text(source.workflow, 80),
       protocolVersion: Math.max(0, Number(source.protocolVersion) || 0),
+      targetMode: text(source.targetMode, 40),
+      profileMode: source.profileMode === true,
+      subjectType: text(source.subjectType, 40),
+      targets: (Array.isArray(source.targets) ? source.targets : [])
+        .slice(0, 100)
+        .map((target) => sanitizeStructuredValue(objectValue(target))),
+      monitorSettings: sanitizeStructuredValue(
+        objectValue(source.monitorSettings),
+      ),
+      captureSettings: sanitizeStructuredValue(
+        objectValue(source.captureSettings),
+      ),
       targetResults: (Array.isArray(source.targetResults)
         ? source.targetResults
         : []
@@ -405,6 +417,7 @@
           officialAccountCommentPatrol: true,
           officialAccountCommentPatrolProfileV1: true,
           officialAccountDetailPublishDateV1: true,
+          officialAccountLatestPostsByCountV1: true,
           followedCreatorPostPatrol: true,
           officialAccountPostDiscovery: true,
           remoteTargetedPostCaptureV1: true,

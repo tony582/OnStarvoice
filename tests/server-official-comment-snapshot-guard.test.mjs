@@ -25,15 +25,14 @@ const TARGET = {
   url: 'https://www.douyin.com/user/official-profile',
 };
 const MONITOR_SETTINGS = {
-  publishWindow: 'custom',
-  publishDateFrom: '2026-07-20',
-  publishDateTo: '2026-07-29',
+  postsLimit: 30,
 };
 const CAPTURE_SETTINGS = {
   includeComments: true,
   includeCommentsOnDetailCapture: true,
   autoSyncAfterDetailCapture: true,
   commentsMaxDetectedItems: 50,
+  scanLatestPostsByCount: true,
 };
 
 function officialCommentCommand(overrides = {}) {
@@ -84,14 +83,13 @@ test('official comment snapshots promote their profile execution contract into m
         accountUrl: 'https://www.douyin.com/user/wrong-profile',
       }],
       monitorSettings: {
-        publishWindow: 'custom',
-        publishDateFrom: '2026-01-01',
-        publishDateTo: '2026-01-02',
+        postsLimit: 1,
       },
       captureSettings: {
         includeComments: false,
         includeCommentsOnDetailCapture: false,
         commentsMaxDetectedItems: 1,
+        scanLatestPostsByCount: false,
       },
     },
   });
@@ -142,7 +140,7 @@ test('official comment create completion requires matching workflow and profile 
   );
 });
 
-test('official comment create completion rejects the wrong account, date window, and comment contract', () => {
+test('official comment create completion rejects the wrong account, post count, and comment contract', () => {
   const command = officialCommentCommand();
   const wrongAccount = officialCommentSnapshot({
     targets: [{
@@ -152,10 +150,10 @@ test('official comment create completion rejects the wrong account, date window,
       url: 'https://www.douyin.com/user/wrong-profile',
     }],
   });
-  const wrongDateWindow = officialCommentSnapshot({
+  const wrongPostsLimit = officialCommentSnapshot({
     monitorSettings: {
       ...MONITOR_SETTINGS,
-      publishDateFrom: '2026-07-21',
+      postsLimit: 20,
     },
   });
   const commentsDisabled = officialCommentSnapshot({
@@ -171,11 +169,18 @@ test('official comment create completion rejects the wrong account, date window,
       commentsMaxDetectedItems: 10,
     },
   });
+  const wrongSelectionMode = officialCommentSnapshot({
+    captureSettings: {
+      ...CAPTURE_SETTINGS,
+      scanLatestPostsByCount: false,
+    },
+  });
 
   assert.equal(createCommandSnapshotMatches(command, wrongAccount), false);
-  assert.equal(createCommandSnapshotMatches(command, wrongDateWindow), false);
+  assert.equal(createCommandSnapshotMatches(command, wrongPostsLimit), false);
   assert.equal(createCommandSnapshotMatches(command, commentsDisabled), false);
   assert.equal(createCommandSnapshotMatches(command, wrongCommentLimit), false);
+  assert.equal(createCommandSnapshotMatches(command, wrongSelectionMode), false);
 });
 
 test('snapshot upserts do not restore stale execution fields from existing metadata', () => {
@@ -243,13 +248,12 @@ test('official profile task materialization stores the full contract in task met
     },
   };
   const monitorSettings = {
-    publishWindow: 'custom',
-    publishDateFrom: '2026-07-20',
-    publishDateTo: '2026-07-29',
+    postsLimit: 30,
   };
   const captureSettings = {
     includeCommentsOnDetailCapture: true,
     commentsMaxDetectedItems: 50,
+    scanLatestPostsByCount: true,
   };
 
   await materializeProfilePatrolTask(tx, {

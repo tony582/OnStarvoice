@@ -4,13 +4,28 @@ import {
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
   ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X, ScanSearch,
+  Megaphone, MessageCircle,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
 import { useBadges, type Badges } from '@/lib/badges'
 import { useNav, type Workspace } from '@/lib/navigation'
 
-type NavItem = { id: string; label: string; icon: React.ElementType; platformAdmin?: boolean; badgeKeys?: Array<keyof Badges>; tag?: string }
+type NavChild = {
+  id: string
+  label: string
+  internalOnly?: boolean
+}
+
+type NavItem = {
+  id: string
+  label: string
+  icon: React.ElementType
+  platformAdmin?: boolean
+  badgeKeys?: Array<keyof Badges>
+  tag?: string
+  children?: NavChild[]
+}
 
 const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: React.ElementType; accent: string }> = [
   { key: 'opinion', label: '舆情风控', desc: '监测 · 预警 · 处置', icon: ShieldHalf, accent: 'text-status-red' },
@@ -30,6 +45,15 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
     { id: 'monitoring', label: '关注博主', icon: UserCheck, badgeKeys: ['monitorAttention'] },
+    {
+      id: 'official-social',
+      label: '官方社媒',
+      icon: Megaphone,
+      children: [
+        { id: 'official-comments', label: '评论巡查' },
+        { id: 'official-accounts', label: '官方账号管理', internalOnly: true },
+      ],
+    },
     { id: 'dispatch', label: '调度中心', icon: Waypoints, tag: 'BETA' },
     { id: 'social-accounts', label: '社交账号', icon: Users },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
@@ -48,7 +72,6 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
 }
 
 const ADMIN_NAV: NavItem[] = [
-  { id: 'official-accounts', label: '官方账号', icon: ShieldCheck },
   { id: 'tenants', label: '租户管理', icon: Building2 },
   { id: 'users', label: '用户账号', icon: Users, platformAdmin: true },
   { id: 'auth-codes', label: '激活码', icon: KeyRound },
@@ -62,9 +85,18 @@ interface SidebarProps {
   onToggleCollapse: () => void
   mobileOpen: boolean
   onMobileClose: () => void
+  showInternalItems?: boolean
 }
 
-export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse, mobileOpen, onMobileClose }: SidebarProps) {
+export function Sidebar({
+  activePage,
+  onNavigate,
+  collapsed,
+  onToggleCollapse,
+  mobileOpen,
+  onMobileClose,
+  showInternalItems = false,
+}: SidebarProps) {
   const { isInternal, isPlatformAdmin } = useAuth()
   const { badges } = useBadges()
   const { workspace, switchWorkspace, params } = useNav()
@@ -145,7 +177,16 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse, m
       <div className="px-4 pb-0.5 pt-1.5 text-[10px] text-muted-foreground">{activeWs.desc}</div>
 
       <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-3 pb-4 pt-1">
-        <NavGroup label="WORKSPACE" items={NAV_BY_WORKSPACE[workspace]} activePage={activePage} activeQueue={activeQueue} onNavigate={onNavigate} badges={badges} isPlatformAdmin={isPlatformAdmin} />
+        <NavGroup
+          label="WORKSPACE"
+          items={NAV_BY_WORKSPACE[workspace]}
+          activePage={activePage}
+          activeQueue={activeQueue}
+          onNavigate={onNavigate}
+          badges={badges}
+          isInternal={() => showInternalItems || isInternal()}
+          isPlatformAdmin={isPlatformAdmin}
+        />
       </nav>
 
       {/* 底部:平台管理(向上弹出菜单)+ 版本 —— 管理类不进日常导航 */}
@@ -186,10 +227,10 @@ export function Sidebar({ activePage, onNavigate, collapsed, onToggleCollapse, m
   )
 }
 
-function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, isPlatformAdmin }: {
+function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, isInternal, isPlatformAdmin }: {
   label: string; items: NavItem[]; activePage: string; activeQueue: string | null
   onNavigate: (p: string, params?: Record<string, string>) => void
-  badges: Badges; isPlatformAdmin: () => boolean
+  badges: Badges; isInternal: () => boolean; isPlatformAdmin: () => boolean
 }) {
   return (
     <div className="mb-1">
@@ -198,14 +239,23 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
         if (item.platformAdmin && !isPlatformAdmin()) return null
         const isWorkbench = item.id === 'workbench'
         const onWorkbench = isWorkbench && activePage === 'workbench'
+        const visibleChildren = (item.children || []).filter(child => !child.internalOnly || isInternal())
+        const hasChildren = visibleChildren.length > 0
+        const onChild = hasChildren && visibleChildren.some(child => child.id === activePage)
         return (
           <div key={item.id}>
             <NavButton
               item={item}
-              active={activePage === item.id && !isWorkbench}
-              sectionActive={onWorkbench}
+              active={activePage === item.id && !isWorkbench && !hasChildren}
+              sectionActive={onWorkbench || onChild}
               badges={badges}
-              onClick={() => onNavigate(item.id, isWorkbench ? { queue: 'triage' } : undefined)}
+              onClick={() => {
+                if (hasChildren) {
+                  onNavigate(visibleChildren[0].id)
+                  return
+                }
+                onNavigate(item.id, isWorkbench ? { queue: 'triage' } : undefined)
+              }}
             />
             {isWorkbench && (
               <div className="relative mb-1 mt-0.5 space-y-0.5 pl-[26px]">
@@ -228,6 +278,31 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
                           on ? 'bg-primary/12 text-primary' : 'bg-muted text-muted-foreground',
                         )}>{count > 99 ? '99+' : count}</span>
                       )}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            {hasChildren && (
+              <div className="relative mb-1 mt-0.5 space-y-0.5 pl-[26px]">
+                <span className="absolute bottom-1.5 left-[18px] top-1.5 w-px bg-sidebar-border" />
+                {visibleChildren.map(child => {
+                  const on = activePage === child.id
+                  return (
+                    <button
+                      key={child.id}
+                      onClick={() => onNavigate(child.id)}
+                      className={cn(
+                        'group flex min-h-10 w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[12.5px] transition-colors lg:min-h-0 lg:py-[6px]',
+                        on
+                          ? 'bg-accent font-semibold text-primary'
+                          : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                      )}
+                    >
+                      {child.id === 'official-accounts'
+                        ? <ShieldCheck className={cn('h-3.5 w-3.5', on ? 'text-primary' : 'text-muted-foreground')} />
+                        : <MessageCircle className={cn('h-3.5 w-3.5', on ? 'text-primary' : 'text-muted-foreground')} />}
+                      <span className="truncate">{child.label}</span>
                     </button>
                   )
                 })}

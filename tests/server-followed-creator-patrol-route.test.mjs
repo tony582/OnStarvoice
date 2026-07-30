@@ -66,6 +66,7 @@ test('task creation binds one monitor execution and work item to each subscripti
   assert.match(dispatchService, /INSERT INTO capture_agent_commands/u);
   assert.match(dispatchService, /followedCreatorPostPatrol/u);
   assert.match(dispatchService, /officialAccountCommentPatrolProfileV1/u);
+  assert.match(dispatchService, /officialAccountLatestPostsByCountV1/u);
   assert.match(dispatchService, /remoteTargetedPostCaptureV1/u);
   assert.match(dispatchService, /targetMode: 'profile'/u);
 });
@@ -209,6 +210,10 @@ test('scheduled profile patrol materializes real dispatch-center tasks', () => {
   assert.doesNotMatch(cron, /enqueueDueMonitorExecutions/u);
   assert.match(
     dispatchService,
+    /WHERE ms\.status = 'active'[\s\S]*AND ms\.subject_type = 'creator'/u,
+  );
+  assert.doesNotMatch(
+    dispatchService,
     /ms\.subject_type IN \('creator', 'official'\)/u,
   );
   assert.match(dispatchService, /subscription\.assigned_agent_id/u);
@@ -294,10 +299,9 @@ test('extension profile scan reuses monitor execution and renders distinct dark 
   assert.match(sidebar, /该账号扫描已被其他执行端领取或已结束/u);
 });
 
-test('official comment patrol enhances the account page within the selected date window', () => {
-  assert.match(sidebar, /parseMonitorCalendarDateStartMs/u);
-  assert.match(sidebar, /publishDateFrom/u);
-  assert.match(sidebar, /publishDateTo/u);
+test('official comment patrol enhances the selected latest account posts without skipping old records', () => {
+  assert.match(sidebar, /scanLatestPostsByCount/u);
+  assert.match(sidebar, /MONITOR_LATEST_POSTS_LIMIT_MAX/u);
   assert.match(sidebar, /postsLimit/u);
   assert.match(sidebar, /正在巡查账号评论/u);
   assert.match(sidebar, /includeComments:\s*true/u);

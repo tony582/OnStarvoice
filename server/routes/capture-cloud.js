@@ -1123,6 +1123,7 @@ export function createCommandSnapshotMatches(commandPayload = {}, snapshot = {})
   for (const key of [
     'includeComments',
     'includeCommentsOnDetailCapture',
+    'scanLatestPostsByCount',
   ]) {
     if (!expectedContractFieldMatches(
       expectedCaptureSettings,
@@ -1133,10 +1134,18 @@ export function createCommandSnapshotMatches(commandPayload = {}, snapshot = {})
       return false;
     }
   }
-  return expectedContractFieldMatches(
+  if (!expectedContractFieldMatches(
     expectedCaptureSettings,
     observedCaptureSettings,
     'commentsMaxDetectedItems',
+    contractInteger,
+  )) {
+    return false;
+  }
+  return expectedContractFieldMatches(
+    expectedMonitorSettings,
+    observedMonitorSettings,
+    'postsLimit',
     contractInteger,
   );
 }
