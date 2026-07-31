@@ -252,8 +252,18 @@ function formatDateTime(value?: string | null) {
 }
 
 function formatPublish(value?: string | null, fallback = '') {
-  if (value) return formatDateTime(value)
-  return fallback || '—'
+  const candidate = value || fallback
+  if (!candidate) return '—'
+  const date = new Date(candidate)
+  if (Number.isNaN(date.getTime())) return fallback || String(value)
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
 }
 
 function comparableDate(value?: string | null) {

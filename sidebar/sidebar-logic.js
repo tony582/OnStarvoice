@@ -13192,8 +13192,19 @@ function routeDetailItemToStreamingSync(
   if (!recordId) {
     return;
   }
-  if (String(progress?.phase || "") === "detail_item_filtered") {
+  const phase = String(progress?.phase || "");
+  if (
+    phase === "detail_item_filtered" ||
+    phase === "detail_item_skipped"
+  ) {
     streamingSyncQueue.markSeen(recordId);
+    return;
+  }
+  // Failed detail items must wait until the whole enhancement result is known.
+  // Non-terminal failures are picked up by enqueueMissing below; an identity
+  // or safety stop returns before that point, so unverified data never starts
+  // syncing while the terminal decision is still in flight.
+  if (phase !== "detail_item_done") {
     return;
   }
   streamingSyncQueue.enqueue(recordId, {sourceLabel});
@@ -13881,9 +13892,8 @@ async function handleBatchKeywordCapture(options = {}) {
                 taskMeta: captureTaskDisplayMeta,
               });
               await refreshDataPool();
-              let enhanceResult = null;
-              try {
-                enhanceResult = await maybeRunAutoDetailCaptureAfterListCapture(
+              const enhanceResult =
+                await maybeRunAutoDetailCaptureAfterListCapture(
                   settings,
                   {
                     sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
@@ -13934,13 +13944,6 @@ async function handleBatchKeywordCapture(options = {}) {
                       : null,
                   },
                 );
-              } finally {
-                if (streamingSyncQueue?.enabled) {
-                  streamingSyncQueue.enqueueMissing(recordIds, {
-                    sourceLabel: `关键词「${capturedKeyword}」笔记`,
-                  });
-                }
-              }
               if (enhanceResult?.securityBlocked) {
                 batchKeywordCancelRequested = true;
                 showMessage(
@@ -13952,6 +13955,25 @@ async function handleBatchKeywordCapture(options = {}) {
               const resultInterruption = resolveUnattendedEnhanceCancellation(
                 enhanceResult,
               );
+              if (resultInterruption.stopBatch) {
+                batchKeywordCancelRequested = true;
+                if (enhanceResult?.integrityBlocked === true) {
+                  showMessage(
+                    "⚠️ 无法确认当前抖音作品身份，已停止无人值守，且未同步未验证数据。",
+                    "warning",
+                  );
+                }
+                return {
+                  ...enhanceResult,
+                  fatal: enhanceResult?.fatal === true,
+                  stopBatch: true,
+                  cancellationReason:
+                    resultInterruption.reason ||
+                    (enhanceResult?.integrityBlocked
+                      ? "fatal_douyin_identity_mismatch"
+                      : "fatal_detail_capture"),
+                };
+              }
               if (enhanceResult?.canceled || resultInterruption.recoverable) {
                 const interruptionReason = activeUnattendedAttemptRejected
                   ? "fatal_attempt_replaced"
@@ -13995,6 +14017,11 @@ async function handleBatchKeywordCapture(options = {}) {
                     cancellation.reason ||
                     "detail_capture_interrupted",
                 };
+              }
+              if (streamingSyncQueue?.enabled) {
+                streamingSyncQueue.enqueueMissing(recordIds, {
+                  sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                });
               }
               if (!streamingSyncQueue?.enabled) {
                 await maybeRunAutoSyncAfterDetailCapture(settings, {

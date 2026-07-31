@@ -84,19 +84,22 @@ test("only a confirmed zero may short-circuit the detail comment relay", () => {
   );
 });
 
-test("Douyin batch capture reaches the real collector before any readiness recovery", () => {
+test("Douyin batch capture re-establishes the target before the real collector", () => {
   const branch = readDetailCommentBranch();
-  assert.doesNotMatch(
+  assert.match(
     branch,
     /ensureDouyinCommentTargetReadyInTab\(\{/u,
-    "batch capture must not reject a usable Douyin comment surface with a narrower precheck",
+    "comment capture must confirm or recover the target work first",
   );
   assert.match(
     branch,
-    /const expectedCommentNoteId\s*=\s*recordPlatform === 'douyin'[\s\S]*?resolveExpectedDouyinCommentNoteId\(record, noteUrl\)/u,
+    /const expectedCommentNoteId\s*=\s*recordPlatform === 'douyin'[\s\S]*?expectedDouyinNoteId/u,
     "the real collector must retain the expected Douyin work ID guard",
   );
 
+  const readyIndex = branch.indexOf(
+    "await ensureDouyinCommentTargetReadyInTab({",
+  );
   const resultStart = branch.indexOf(
     "commentsResult = await captureCommentsForCurrentNote({",
   );
@@ -104,7 +107,12 @@ test("Douyin batch capture reaches the real collector before any readiness recov
     "const commentIdentityFailure =",
     resultStart,
   );
+  assert.ok(readyIndex >= 0);
   assert.ok(resultStart >= 0, "missing real comment collector assignment");
+  assert.ok(
+    resultStart > readyIndex,
+    "the real collector may start only after target readiness",
+  );
   assert.ok(resultEnd > resultStart, "missing comment identity validation");
   const resultBlock = branch.slice(resultStart, resultEnd);
 

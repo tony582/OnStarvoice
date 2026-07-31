@@ -139,6 +139,24 @@ test('official comment workbench focuses on posts, engagement, and advice', () =
   assert.doesNotMatch(monitoringTab, /border-b border-border\/60 px-3 pt-2/u)
 })
 
+test('official post publish times include the year for cross-year records', () => {
+  const start = monitoringTab.indexOf('function formatPublish')
+  const end = monitoringTab.indexOf('function comparableDate', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const formatter = monitoringTab.slice(start, end)
+
+  assert.match(formatter, /new Intl\.DateTimeFormat\('zh-CN'/u)
+  assert.match(formatter, /year: 'numeric'/u)
+  assert.match(formatter, /month: '2-digit'/u)
+  assert.match(formatter, /day: '2-digit'/u)
+  assert.doesNotMatch(formatter, /return formatDateTime\(value\)/u)
+  assert.equal(
+    monitoringTab.match(/formatPublish\(post\.publishedAt, post\.publishTime\)/gu)?.length,
+    2,
+  )
+})
+
 test('official comment workbench uses a dispatch-style split and complete list pagination', () => {
   assert.match(
     monitoringTab,

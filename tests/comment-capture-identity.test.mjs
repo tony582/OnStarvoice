@@ -250,7 +250,19 @@ test("Douyin comment identity mismatch fails closed at capture start and finish"
   );
   assert.match(
     douyinCommentsSource,
-    /assertDouyinCommentTargetIdentity\(\s*normalizedExpectedNoteId,\s*finalNoteId,\s*"返回评论结果前"/,
+    /verifyCurrentCommentIdentity\("返回评论结果前"/,
+  );
+  assert.match(
+    douyinCommentsSource,
+    /verifyCurrentCommentIdentity\("返回评论结果前",\s*\{\s*allowVerifiedFallback:\s*false,/u,
+  );
+  assert.match(
+    douyinCommentsSource,
+    /verifyCurrentCommentIdentity\("评论滚动采集期间",\s*\{\s*deferFailure:\s*true,/,
+  );
+  assert.match(
+    douyinCommentsSource,
+    /verifyCurrentCommentIdentity\("评论滚动操作前",[\s\S]*?allowVerifiedFallback:\s*false[\s\S]*?verifyCurrentCommentIdentity\("评论滚动操作后",[\s\S]*?allowVerifiedFallback:\s*false[\s\S]*?verifyCurrentCommentIdentity\("评论加载更多后",[\s\S]*?allowVerifiedFallback:\s*false/,
   );
   assert.match(
     douyinCommentsSource,
@@ -259,6 +271,8 @@ test("Douyin comment identity mismatch fails closed at capture start and finish"
 
   const {
     assertDouyinCommentTargetIdentity,
+    assertCurrentDouyinCommentTargetIdentity,
+    inspectDouyinCommentTargetIdentity,
     resolveVerifiedDouyinCommentNoteId,
   } = await import(
     `../utils/capture/douyin-comments.js?comment-identity=${Date.now()}`
@@ -296,20 +310,82 @@ test("Douyin comment identity mismatch fails closed at capture start and finish"
     "",
   );
   assert.equal(resolveVerifiedDouyinCommentNoteId(expected, ""), "");
+
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  try {
+    globalThis.window = {
+      location: {href: `https://www.douyin.com/video/${expected}`},
+      getComputedStyle() {
+        return {
+          display: "block",
+          visibility: "visible",
+          opacity: "1",
+        };
+      },
+    };
+    globalThis.document = {
+      querySelectorAll() {
+        return [];
+      },
+    };
+
+    assert.equal(
+      assertCurrentDouyinCommentTargetIdentity(expected, {
+        verifiedNoteId: expected,
+        stage: "评论滚动操作前",
+      }),
+      expected,
+    );
+
+    globalThis.window.location.href =
+      "https://www.douyin.com/video/766193585000000001";
+    const evidence = inspectDouyinCommentTargetIdentity(expected);
+    assert.equal(evidence.hasConflict, true);
+    assert.equal(evidence.source, "route");
+    assert.throws(
+      () =>
+        assertCurrentDouyinCommentTargetIdentity(expected, {
+          verifiedNoteId: expected,
+          stage: "评论滚动操作后",
+        }),
+      (error) =>
+        error?.code === "DOUYIN_COMMENT_ID_MISMATCH" &&
+        error?.expectedNoteId === expected &&
+        error?.actualNoteId === "766193585000000001" &&
+        error?.identitySource === "route",
+      "a previously verified ID must not hide a route that moved to another work",
+    );
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  }
 });
 
-test("Douyin comment identity prefers the current route over a stale visible work", async () => {
-  const {resolveDouyinCommentNoteId} = await import(
+test("Douyin comment identity rejects an expected route when another work is active", async () => {
+  const {
+    assertCurrentDouyinCommentTargetIdentity,
+    inspectDouyinCommentTargetIdentity,
+    resolveDouyinCommentNoteId,
+  } = await import(
     `../utils/capture/douyin-comments.js?comment-route-identity=${Date.now()}`
   );
   const expected = "766193585000000099";
-  const routeNoteId = "766193585000000101";
-  const staleNode = {
+  const other = "766193585000000101";
+  const activeOtherNode = {
     closest() {
       return this;
     },
     getAttribute(name) {
-      return name === "data-e2e-aweme-id" ? expected : "";
+      return name === "data-item-id" ? other : "";
     },
     querySelector() {
       return null;
@@ -323,7 +399,7 @@ test("Douyin comment identity prefers the current route over a stale visible wor
   try {
     globalThis.window = {
       location: {
-        href: `https://www.douyin.com/video/${routeNoteId}`,
+        href: `https://www.douyin.com/video/${expected}`,
       },
       getComputedStyle() {
         return {
@@ -335,11 +411,284 @@ test("Douyin comment identity prefers the current route over a stale visible wor
     };
     globalThis.document = {
       querySelectorAll(selector) {
-        return selector.includes("swiper-slide-active") ? [staleNode] : [];
+        return selector.includes("swiper-slide-active")
+          ? [activeOtherNode]
+          : [];
       },
     };
 
-    assert.equal(resolveDouyinCommentNoteId(expected), routeNoteId);
+    const evidence = inspectDouyinCommentTargetIdentity(expected);
+    assert.match(
+      douyinCommentsSource,
+      /\.swiper-slide-active\[data-item-id\][\s\S]*?\.swiper-slide-active \[data-item-id\]/u,
+    );
+    assert.equal(evidence.routeNoteId, expected);
+    assert.equal(evidence.hasConflict, true);
+    assert.equal(evidence.ambiguous, true);
+    assert.deepEqual(evidence.activeNoteIds, [other]);
+    assert.deepEqual(evidence.conflictingNoteIds, [other]);
+    assert.equal(
+      resolveDouyinCommentNoteId(expected),
+      "",
+      "a matching URL must not mask an active slide that already belongs to another work",
+    );
+
+    for (const stage of ["评论滚动操作前", "返回评论结果前"]) {
+      assert.throws(
+        () =>
+          assertCurrentDouyinCommentTargetIdentity(expected, {
+            verifiedNoteId: expected,
+            stage,
+          }),
+        (error) =>
+          error?.code === "DOUYIN_COMMENT_ID_MISMATCH" &&
+          error?.expectedNoteId === expected &&
+          error?.actualNoteId === other &&
+          error?.conflictingNoteIds?.includes(other),
+        `${stage} must fail immediately once the active slide moves to another work`,
+      );
+    }
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  }
+});
+
+test("Douyin comment startup can wait for an expected-route transition to settle", async () => {
+  const identityLogicSource = sourceBlock(
+    douyinCommentsSource,
+    "function normalizeDouyinCommentNoteId",
+    "function resolveNoteTitle",
+  ).replace(/\bexport\s+(?=function\b)/g, "");
+  const expected = "766193585000000099";
+  const other = "766193585000000101";
+  let activeNoteId = other;
+  let waitCount = 0;
+  const activeNode = {
+    closest() {
+      return this;
+    },
+    getAttribute(name) {
+      return name === "data-e2e-aweme-id" ? activeNoteId : "";
+    },
+    querySelector() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return {top: 0, bottom: 100, width: 100, height: 100};
+    },
+  };
+  const identityContext = vm.createContext({
+    Array,
+    Date,
+    Error,
+    Object,
+    Set,
+    String,
+    extractNoteId(value) {
+      const normalized = String(value || "");
+      return (
+        normalized.match(/[?&]modal_id=(\d{8,})/u)?.[1] ||
+        normalized.match(/\/(?:video|note)\/(\d{8,})/u)?.[1] ||
+        null
+      );
+    },
+    window: {
+      location: {href: `https://www.douyin.com/video/${expected}`},
+      getComputedStyle() {
+        return {
+          display: "block",
+          visibility: "visible",
+          opacity: "1",
+        };
+      },
+    },
+    document: {
+      querySelectorAll(selector) {
+        if (selector.includes("swiper-slide-active")) {
+          return [activeNode];
+        }
+        return [];
+      },
+    },
+    isElementVisible() {
+      return true;
+    },
+    async wait() {
+      waitCount += 1;
+      activeNoteId = expected;
+    },
+  });
+  vm.runInContext(
+    `${identityLogicSource}
+globalThis.__douyinCommentWaitApi = {waitForDouyinCommentNoteId};`,
+    identityContext,
+    {filename: "utils/capture/douyin-comments-identity-wait.js"},
+  );
+
+  const settledNoteId =
+    await identityContext.__douyinCommentWaitApi.waitForDouyinCommentNoteId(
+      expected,
+      "",
+      {timeoutMs: 500},
+    );
+
+  assert.equal(settledNoteId, expected);
+  assert.equal(
+    waitCount,
+    1,
+    "startup should wait for the stale active slide to converge instead of accepting or failing it immediately",
+  );
+});
+
+test("ambiguous current Douyin work IDs cannot be masked by an older verified ID", async () => {
+  const {
+    assertCurrentDouyinCommentTargetIdentity,
+    inspectDouyinCommentTargetIdentity,
+  } = await import(
+    `../utils/capture/douyin-comments.js?comment-ambiguous-identity=${Date.now()}`
+  );
+  const expected = "766193585000000099";
+  const other = "766193585000000101";
+  const makeVisibleWorkNode = (noteId) => ({
+    closest() {
+      return this;
+    },
+    getAttribute(name) {
+      return name === "data-e2e-aweme-id" ? noteId : "";
+    },
+    querySelector() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return {top: 0, bottom: 100, width: 100, height: 100};
+    },
+  });
+  const activeNodes = [
+    makeVisibleWorkNode(expected),
+    makeVisibleWorkNode(other),
+  ];
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  try {
+    globalThis.window = {
+      location: {href: "https://www.douyin.com/"},
+      getComputedStyle() {
+        return {
+          display: "block",
+          visibility: "visible",
+          opacity: "1",
+        };
+      },
+    };
+    globalThis.document = {
+      querySelectorAll(selector) {
+        if (selector.includes("swiper-slide-active")) {
+          return activeNodes;
+        }
+        return [];
+      },
+    };
+
+    const evidence = inspectDouyinCommentTargetIdentity(expected);
+    assert.equal(evidence.hasConflict, true);
+    assert.equal(evidence.ambiguous, true);
+    assert.equal(evidence.source, "active_dom_conflict");
+    assert.deepEqual(
+      evidence.conflictingNoteIds,
+      [other],
+    );
+    assert.throws(
+      () =>
+        assertCurrentDouyinCommentTargetIdentity(expected, {
+          verifiedNoteId: expected,
+          stage: "评论滚动采集期间",
+        }),
+      (error) =>
+        error?.code === "DOUYIN_COMMENT_ID_MISMATCH" &&
+        error?.expectedNoteId === expected &&
+        error?.actualNoteId === other &&
+        error?.identitySource === "active_dom_conflict",
+    );
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+  }
+});
+
+test("strict final identity rejects a page that becomes blank after verification", async () => {
+  const {
+    assertCurrentDouyinCommentTargetIdentity,
+    inspectDouyinCommentTargetIdentity,
+  } = await import(
+    `../utils/capture/douyin-comments.js?comment-blank-identity=${Date.now()}`
+  );
+  const expected = "766193585000000099";
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  try {
+    globalThis.window = {
+      location: {href: `https://www.douyin.com/video/${expected}`},
+      getComputedStyle() {
+        return {
+          display: "block",
+          visibility: "visible",
+          opacity: "1",
+        };
+      },
+    };
+    globalThis.document = {
+      querySelectorAll() {
+        return [];
+      },
+    };
+
+    assert.equal(
+      assertCurrentDouyinCommentTargetIdentity(expected, {
+        verifiedNoteId: expected,
+        stage: "评论开始前",
+      }),
+      expected,
+    );
+
+    globalThis.window.location.href = "https://www.douyin.com/";
+    const evidence = inspectDouyinCommentTargetIdentity(expected);
+    assert.equal(evidence.hasConflict, false);
+    assert.equal(evidence.source, "none");
+    assert.equal(
+      assertCurrentDouyinCommentTargetIdentity(expected, {
+        verifiedNoteId: expected,
+        stage: "评论区切换瞬间",
+      }),
+      expected,
+    );
+    assert.throws(
+      () =>
+        assertCurrentDouyinCommentTargetIdentity(expected, {
+          verifiedNoteId: expected,
+          stage: "禁止回退验证",
+          allowVerifiedFallback: false,
+        }),
+      (error) =>
+        error?.code === "DOUYIN_COMMENT_ID_MISMATCH" &&
+        error?.actualNoteId === "",
+    );
   } finally {
     if (previousWindow === undefined) {
       delete globalThis.window;

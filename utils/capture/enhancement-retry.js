@@ -26,6 +26,7 @@ const NON_RETRYABLE_FAILURE_CATEGORIES = new Set([
   "invalid_record",
   "link_missing",
   "security_blocked",
+  "integrity_blocked",
   "user_canceled",
 ]);
 
@@ -82,6 +83,10 @@ function isNonRetryableFailure(item = {}) {
       code === "CANCELED" ||
       code === "DETAIL_CAPTURE_CANCELED" ||
       code === "XHS_SECURITY_BLOCK" ||
+      code === "IDENTITY_MISMATCH" ||
+      code === "DOUYIN_DETAIL_ID_MISMATCH" ||
+      code === "DOUYIN_COMMENT_ID_MISMATCH" ||
+      code === "DOUYIN_COMMENT_ID_CONFLICT" ||
       code === "CONTENT_UNAVAILABLE" ||
       code === "LINK_MISSING" ||
       code === "INVALID_RECORD",
@@ -127,7 +132,18 @@ export function collectRetryableEnhancementRecordIds(
   if (
     !result ||
     result.canceled === true ||
-    result.securityBlocked === true
+    result.securityBlocked === true ||
+    result.integrityBlocked === true ||
+    result.fatal === true ||
+    result.stopBatch === true ||
+    result.fatalError ||
+    (Array.isArray(result.results) &&
+      result.results.some(
+        (item) =>
+          item?.integrityBlocked === true ||
+          item?.fatal === true ||
+          item?.stopBatch === true,
+      ))
   ) {
     return [];
   }
@@ -424,6 +440,21 @@ export function mergeEnhancementAttemptResults({
     retryResult?.recoveryRequired === true || runnerInterrupted,
   );
   const securityBlocked = retryResult?.securityBlocked === true;
+  const integrityBlocked = Boolean(
+    initialResult?.integrityBlocked === true ||
+      retryResult?.integrityBlocked === true ||
+      mergedResults.some((item) => item?.integrityBlocked === true),
+  );
+  const fatal = Boolean(
+    initialResult?.fatal === true ||
+      retryResult?.fatal === true ||
+      integrityBlocked,
+  );
+  const stopBatch = Boolean(
+    initialResult?.stopBatch === true ||
+      retryResult?.stopBatch === true ||
+      fatal,
+  );
   const error = retryResult?.error || null;
 
   return {
@@ -432,12 +463,18 @@ export function mergeEnhancementAttemptResults({
       !canceled &&
       !runnerInterrupted &&
       !securityBlocked &&
+      !integrityBlocked &&
+      !fatal &&
+      !stopBatch &&
       !error &&
       failedCount === 0,
     canceled,
     runnerInterrupted,
     recoveryRequired,
     securityBlocked,
+    integrityBlocked,
+    fatal,
+    stopBatch,
     total: Math.max(
       Number(initialResult?.total) || 0,
       mergedResults.length,
