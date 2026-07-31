@@ -4022,15 +4022,16 @@ export async function batchCaptureDetailsForRecords(
             budgetError.code = 'DETAIL_NAVIGATION_TIMEOUT';
             throw budgetError;
           }
-          const preloadResult = await probeDetailPreloadSafety(tabId, {
-            targetUrl: candidateUrl,
-            waitForDouyinReady: isDouyinDetailNavigation,
-            requireVisibleDetailRoot: isDouyinDetailNavigation,
-            shouldStop: pipelineShouldStop,
-            ...(isDouyinDetailNavigation
-              ? {timeoutMs: Math.min(8000, remainingProbeBudgetMs)}
-              : {}),
-          });
+          const preloadResult = isDouyinDetailNavigation
+            ? await probeDouyinNavigationEntry(tabId, {
+                targetUrl: candidateUrl,
+                shouldStop: pipelineShouldStop,
+                timeoutMs: Math.min(8000, remainingProbeBudgetMs),
+              })
+            : await probeDetailPreloadSafety(tabId, {
+                targetUrl: candidateUrl,
+                shouldStop: pipelineShouldStop,
+              });
           if (isDouyinDetailNavigation) {
             const expectedNoteId = extractNoteId(candidateUrl);
             const entryKind = /\/note\/\d{8,}/i.test(candidateUrl)
@@ -4050,6 +4051,10 @@ export async function batchCaptureDetailsForRecords(
                 targetMatched: preloadResult?.targetMatched === true,
                 visibleDetailBound:
                   preloadResult?.hasBoundDetailRoot === true,
+                directRouteAccepted:
+                  preloadResult?.directRouteAccepted === true,
+                hydrationDeferred:
+                  preloadResult?.hydrationDeferred === true,
               },
               taskContext: getActiveTaskContext(),
               featureKey: 'capture.enhancement',
@@ -4786,12 +4791,10 @@ export async function batchCaptureDetailsForRecords(
                     active: true,
                   },
                 );
-                return await probeDetailPreloadSafety(
+                return await probeDouyinNavigationEntry(
                   runnerContext.runnerTabId,
                   {
                     targetUrl: candidateUrl,
-                    waitForDouyinReady: true,
-                    requireVisibleDetailRoot: true,
                     shouldStop: shouldStopDetailBatch,
                     timeoutMs: Math.min(
                       8000,
@@ -9342,7 +9345,9 @@ async function captureBloggerMetricsForSingleNoteRecord(
   }
 
   const basePayload = ensureBloggerMetricsFields(record.payload);
-  const noteUrl = normalizeOpenUrl(basePayload.url || basePayload.noteUrl);
+  const noteUrl =
+    resolveRecordNoteUrl(record) ||
+    normalizeOpenUrl(basePayload.url || basePayload.noteUrl);
   const platform = detectPlatformFromUrl(
     noteUrl || basePayload.authorUrl || basePayload.bloggerProfileUrl || '',
   );
@@ -9430,7 +9435,12 @@ async function captureBloggerMetricsForSingleNoteRecord(
 
       // 抖音号在博主主页上(作品页指标那条路拿不到)→ 补一次"导航到主页 + mode blogger_profile"(=douyin-blogger.js)取抖音号。
       // 失败不影响主流程(粉丝数已采到)。
-      if (profileUrl && tab?.id && (typeof shouldStop !== 'function' || !shouldStop())) {
+      if (
+        profileUrl &&
+        tab?.id &&
+        (typeof shouldStop !== 'function' || !shouldStop())
+      ) {
+        let profileNavigationAttempted = false;
         try {
           if (onProgress) {
             onProgress({
@@ -9439,6 +9449,7 @@ async function captureBloggerMetricsForSingleNoteRecord(
               recordId,
             });
           }
+          profileNavigationAttempted = true;
           await openUrlInTab(tab.id, profileUrl, {
             timeoutMs: detailNavTimeoutMs,
             shouldStop,
@@ -9469,6 +9480,20 @@ async function captureBloggerMetricsForSingleNoteRecord(
           }
         } catch (idError) {
           console.warn('[Sidebar] 抖音号补采失败(不影响主流程):', idError);
+        } finally {
+          if (profileNavigationAttempted && noteUrl) {
+            try {
+              await openUrlInTab(tab.id, noteUrl, {
+                timeoutMs: detailNavTimeoutMs,
+                active: true,
+              });
+            } catch (restoreError) {
+              console.warn(
+                '[Sidebar] 返回抖音作品页失败(不影响已采指标):',
+                restoreError,
+              );
+            }
+          }
         }
       }
 
@@ -12680,6 +12705,76 @@ async function probeDetailPreloadSafety(
     }
     return {ok: true, skipped: true};
   }
+}
+
+function isDouyinDirectDetailEntryUrl(url = '') {
+  try {
+    const parsed = new URL(String(url || ''));
+    const host = parsed.hostname.toLowerCase();
+    return Boolean(
+      (host === 'douyin.com' || host.endsWith('.douyin.com')) &&
+        /^\/(?:video|note)\/\d{8,}(?:\/|$)/i.test(parsed.pathname),
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function probeDouyinNavigationEntry(
+  tabId,
+  {
+    targetUrl = '',
+    shouldStop = null,
+    timeoutMs = 8000,
+  } = {},
+) {
+  const isDirectEntry = isDouyinDirectDetailEntryUrl(targetUrl);
+  const result = await probeDetailPreloadSafety(tabId, {
+    targetUrl,
+    // Edge 后台工作页会把 document.visibilityState 报为 hidden，导致可见
+    // DOM 就绪信号恒为 false。直达页的作品 ID 已由导航轮询稳定确认，
+    // 此处只做一次风控、失效态和错帖检查，把页面水合等待交给正文采集器。
+    // 搜索弹层没有独立路径身份，仍必须等到绑定目标 ID 的可见详情根节点。
+    waitForDouyinReady: !isDirectEntry,
+    requireVisibleDetailRoot: !isDirectEntry,
+    shouldStop,
+    timeoutMs,
+  });
+
+  if (!isDirectEntry) {
+    return {
+      ...result,
+      directRouteAccepted: false,
+      hydrationDeferred: false,
+    };
+  }
+
+  if (
+    result?.targetMatched !== true ||
+    result?.activeWorkIdentityConflict === true
+  ) {
+    const error = new Error('抖音直达页作品身份尚未稳定');
+    error.code = 'DOUYIN_DETAIL_NOT_READY';
+    error.currentUrl = result?.currentUrl || '';
+    error.currentNoteId = result?.currentNoteId || '';
+    error.conflictingNoteIds = result?.conflictingActiveWorkIds || [];
+    error.activeWorkIdentityConflict =
+      result?.activeWorkIdentityConflict === true;
+    throw error;
+  }
+
+  if (result?.immediateUnavailable === true) {
+    const error = new Error('抖音提示目标帖子已删除或不存在');
+    error.code = 'DOUYIN_CONTENT_UNAVAILABLE';
+    error.currentUrl = result?.currentUrl || '';
+    throw error;
+  }
+
+  return {
+    ...result,
+    directRouteAccepted: true,
+    hydrationDeferred: result?.detailReady !== true,
+  };
 }
 
 async function ensureDouyinCommentTargetReadyInTab({

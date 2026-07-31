@@ -778,6 +778,7 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
       async executeScript({target, args}) {
         assert.equal(target?.tabId, workerTab.id);
         const expectedNoteId = String(args?.[0] || noteId);
+        const isModal = workerCurrentUrl === modalUrl;
         return [{
           result: {
             currentUrl: workerCurrentUrl,
@@ -788,12 +789,14 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
             activeWorkIds: [expectedNoteId],
             conflictingActiveWorkIds: [],
             activeWorkIdentityConflict: false,
-            detailReady: true,
+            // Edge 后台直达页的作品 ID 已匹配，但可见 DOM 探针仍会返回
+            // false；它必须先进入 extractor，而不是立刻跳去搜索弹层。
+            detailReady: isModal,
             apiDetailReady: false,
-            requireVisibleDetailRoot: true,
-            hasBoundDetailRoot: true,
-            usedModalIdentityFallback: workerCurrentUrl === modalUrl,
-            isSearchModalContext: workerCurrentUrl === modalUrl,
+            requireVisibleDetailRoot: Boolean(args?.[1]),
+            hasBoundDetailRoot: isModal,
+            usedModalIdentityFallback: isModal,
+            isSearchModalContext: isModal,
             blocked: false,
             unavailable: false,
             immediateUnavailable: false,

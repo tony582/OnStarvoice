@@ -1096,10 +1096,24 @@ export function resolveDouyinNoteId(detailRoot, expectedNoteId = "") {
   return "";
 }
 
-function resolveDouyinNoteUrl(detailRoot, noteId) {
+export function resolveDouyinNoteUrl(detailRoot, noteId) {
+  const normalizedNoteId = String(noteId || "").trim();
   const currentUrl = String(window.location.href || "").trim();
-  if (extractNoteId(currentUrl) === String(noteId || "")) {
-    return currentUrl;
+  try {
+    const parsedCurrentUrl = new URL(currentUrl);
+    const currentRouteMatch = parsedCurrentUrl.pathname.match(
+      /^\/(?:video|note)\/(\d{8,})(?:\/|$)/i,
+    );
+    const currentHost = parsedCurrentUrl.hostname.toLowerCase();
+    if (
+      (currentHost === "douyin.com" ||
+        currentHost.endsWith(".douyin.com")) &&
+      currentRouteMatch?.[1] === normalizedNoteId
+    ) {
+      return parsedCurrentUrl.toString();
+    }
+  } catch {
+    // Fall through to a detail-root link or a canonical direct URL.
   }
 
   const scopedHref = getAttribute(
@@ -1108,12 +1122,29 @@ function resolveDouyinNoteUrl(detailRoot, noteId) {
     detailRoot,
   );
   const normalizedScopedHref = normalizeUrl(scopedHref);
-  if (extractNoteId(normalizedScopedHref) === String(noteId || "")) {
-    return normalizedScopedHref;
+  try {
+    const parsedScopedHref = new URL(normalizedScopedHref);
+    const scopedRouteMatch = parsedScopedHref.pathname.match(
+      /^\/(?:video|note)\/(\d{8,})(?:\/|$)/i,
+    );
+    const scopedHost = parsedScopedHref.hostname.toLowerCase();
+    if (
+      (scopedHost === "douyin.com" || scopedHost.endsWith(".douyin.com")) &&
+      scopedRouteMatch?.[1] === normalizedNoteId
+    ) {
+      return parsedScopedHref.toString();
+    }
+  } catch {
+    // Ignore malformed or non-Douyin links and synthesize a direct URL below.
   }
 
-  const notePath = inferDouyinNotePath(noteId);
-  return `https://www.douyin.com/${notePath}/${noteId}`;
+  // 搜索弹层 URL 虽然带有匹配的 modal_id，但它只是入口上下文，不是可
+  // 恢复的作品地址。后续若进博主主页，必须回到 /video 或 /note 直达页。
+  return buildDouyinCanonicalNoteUrl(
+    normalizedNoteId,
+    "",
+    readDouyinApiCache(normalizedNoteId),
+  );
 }
 
 function buildDouyinCanonicalNoteUrl(noteId, noteType = "", detail = null) {

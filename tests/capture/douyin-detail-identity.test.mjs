@@ -103,6 +103,64 @@ test("Douyin DOM identity wins over a misleading modal_id URL", async () => {
   }
 });
 
+test("Douyin search modal capture stores a canonical direct work URL", async () => {
+  const previousWindow = globalThis.window;
+  const noteId = "766193585000000111";
+  globalThis.window = {
+    location: {
+      href:
+        `https://www.douyin.com/jingxuan/search/canonical?modal_id=${noteId}`,
+    },
+  };
+  try {
+    const {resolveDouyinNoteUrl} = await import(
+      `../../utils/capture/douyin-single-note.js?canonical-modal-url=${Date.now()}`
+    );
+    const externalWorkLink = {
+      getAttribute(name) {
+        return name === "href"
+          ? `https://example.com/video/${noteId}`
+          : "";
+      },
+    };
+    const detailRoot = {
+      querySelector(selector) {
+        return selector.includes('a[href*="/video/"]')
+          ? externalWorkLink
+          : null;
+      },
+    };
+
+    assert.equal(
+      resolveDouyinNoteUrl(detailRoot, noteId),
+      `https://www.douyin.com/video/${noteId}`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("Douyin direct note URL remains the return target after profile capture", async () => {
+  const previousWindow = globalThis.window;
+  const noteId = "766193585000000112";
+  globalThis.window = {
+    location: {
+      href: `https://www.douyin.com/note/${noteId}?from=search_result`,
+    },
+  };
+  try {
+    const {resolveDouyinNoteUrl} = await import(
+      `../../utils/capture/douyin-single-note.js?canonical-direct-url=${Date.now()}`
+    );
+    assert.equal(
+      resolveDouyinNoteUrl({querySelector() { return null; }}, noteId),
+      `https://www.douyin.com/note/${noteId}?from=search_result`,
+    );
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
 test("Douyin CDN /video/tos/ href never overrides the numeric modal identity", async () => {
   const previousWindow = globalThis.window;
   const noteId = "7662443795690278611";
@@ -470,12 +528,52 @@ test("Douyin extractor failure continues only from the next verified entry", () 
   );
   assert.match(
     batchBlock,
-    /detailPrefetchPipeline\.runExternalNavigation[\s\S]*?active: true[\s\S]*?requireVisibleDetailRoot: true[\s\S]*?noteResult = await captureCurrentNotePayload\(\)/u,
+    /detailPrefetchPipeline\.runExternalNavigation[\s\S]*?active: true[\s\S]*?probeDouyinNavigationEntry[\s\S]*?noteResult = await captureCurrentNotePayload\(\)/u,
   );
   assert.doesNotMatch(
     batchBlock,
     /readyEntryIndex < 0[\s\S]{0,160}fallbackCandidates/u,
     "an unknown cursor must not replay the first candidate",
+  );
+});
+
+test("Douyin direct entry defers hidden-page hydration but keeps search modal readiness strict", () => {
+  const helperStart = captureSyncSource.indexOf(
+    "async function probeDouyinNavigationEntry",
+  );
+  const helperEnd = captureSyncSource.indexOf(
+    "async function ensureDouyinCommentTargetReadyInTab",
+    helperStart,
+  );
+  const helperBlock = captureSyncSource.slice(helperStart, helperEnd);
+
+  assert.ok(helperStart >= 0);
+  assert.match(helperBlock, /waitForDouyinReady: !isDirectEntry/u);
+  assert.match(helperBlock, /requireVisibleDetailRoot: !isDirectEntry/u);
+  assert.match(helperBlock, /result\?\.targetMatched !== true/u);
+  assert.match(helperBlock, /result\?\.activeWorkIdentityConflict === true/u);
+  assert.match(helperBlock, /result\?\.immediateUnavailable === true/u);
+  assert.match(helperBlock, /hydrationDeferred: result\?\.detailReady !== true/u);
+});
+
+test("single-note Douyin profile lookup always restores a canonical work route", () => {
+  const helperStart = captureSyncSource.indexOf(
+    "async function captureBloggerMetricsForSingleNoteRecord",
+  );
+  const helperEnd = captureSyncSource.indexOf(
+    "async function captureDouyinBloggerMetricsFromNoteDetail",
+    helperStart,
+  );
+  const helperBlock = captureSyncSource.slice(helperStart, helperEnd);
+
+  assert.ok(helperStart >= 0);
+  assert.match(
+    helperBlock,
+    /const noteUrl =\s+resolveRecordNoteUrl\(record\) \|\|/u,
+  );
+  assert.match(
+    helperBlock,
+    /finally \{[\s\S]*?openUrlInTab\(tab\.id, noteUrl,[\s\S]*?active: true/u,
   );
 });
 
