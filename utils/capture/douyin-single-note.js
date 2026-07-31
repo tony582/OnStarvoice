@@ -184,22 +184,42 @@ const VIDEO_SOURCE_PRIORITY = {
  * @param {string} awemeId
  * @returns {object|null} aweme_detail 对象，或 null
  */
-function readDouyinApiCache(awemeId) {
+export function readDouyinApiCache(awemeId) {
   if (!awemeId) return null;
-  const cacheKey = _CACHE_KEY_PREFIX + awemeId;
+  const normalizedAwemeId = String(awemeId).trim();
+  if (!normalizedAwemeId) return null;
+  const cacheKey = _CACHE_KEY_PREFIX + normalizedAwemeId;
   try {
-    const raw =
-      sessionStorage.getItem(cacheKey) ||
-      localStorage.getItem(cacheKey);
-    if (!raw) return null;
-    const entry = JSON.parse(raw);
-    if (!entry || typeof entry !== "object") return null;
-    if (Date.now() - (entry.ts || 0) > _CACHE_TTL_MS) {
-      sessionStorage.removeItem(cacheKey);
-      localStorage.removeItem(cacheKey);
-      return null;
+    for (const storage of [sessionStorage, localStorage]) {
+      try {
+        const raw = storage.getItem(cacheKey);
+        if (!raw) continue;
+        const entry = JSON.parse(raw);
+        if (!entry || typeof entry !== "object") continue;
+        if (Date.now() - (entry.ts || 0) > _CACHE_TTL_MS) {
+          storage.removeItem(cacheKey);
+          continue;
+        }
+
+        const detail = entry.detail || null;
+        if (!detail || typeof detail !== "object") continue;
+        const embeddedIds = [safeGet(detail, "aweme_id"), safeGet(detail, "id")]
+          .filter((value) => value !== undefined && value !== null)
+          .map((value) => String(value).trim())
+          .filter(Boolean);
+        if (
+          embeddedIds.length === 0 ||
+          embeddedIds.some((embeddedId) => embeddedId !== normalizedAwemeId)
+        ) {
+          continue;
+        }
+
+        return detail;
+      } catch {
+        // A malformed cache copy must not hide a valid fallback storage.
+      }
     }
-    return entry.detail || null;
+    return null;
   } catch (_) {
     return null;
   }

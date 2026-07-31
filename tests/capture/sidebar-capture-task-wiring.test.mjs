@@ -1546,6 +1546,33 @@ test("unattended detail interruption only stops the whole plan for explicit term
     section,
     /const resultInterruption = resolveUnattendedEnhanceCancellation\([\s\S]*?if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\)/,
   );
+  const interruptionAt = section.indexOf(
+    "const resultInterruption = resolveUnattendedEnhanceCancellation",
+  );
+  const terminalStopAt = section.indexOf(
+    "if (resultInterruption.stopBatch)",
+    interruptionAt,
+  );
+  const recoverableAt = section.indexOf(
+    "if (enhanceResult?.canceled || resultInterruption.recoverable)",
+    interruptionAt,
+  );
+  const autoSyncAt = section.indexOf(
+    "await maybeRunAutoSyncAfterDetailCapture",
+    interruptionAt,
+  );
+  const enqueueMissingAt = section.indexOf(
+    "streamingSyncQueue.enqueueMissing(recordIds",
+    interruptionAt,
+  );
+  assert.ok(terminalStopAt > interruptionAt);
+  assert.ok(recoverableAt > terminalStopAt);
+  assert.ok(enqueueMissingAt > recoverableAt);
+  assert.ok(autoSyncAt > terminalStopAt);
+  assert.match(
+    section.slice(terminalStopAt, recoverableAt),
+    /batchKeywordCancelRequested = true[\s\S]*?stopBatch: true/u,
+  );
   assert.match(
     section,
     /if \(cancellation\.stopBatch\) \{\s*batchKeywordCancelRequested = true/,
@@ -1557,6 +1584,42 @@ test("unattended detail interruption only stops the whole plan for explicit term
   assert.doesNotMatch(
     section,
     /if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\) \{\s*batchKeywordCancelRequested = true/,
+  );
+});
+
+test("streaming sync waits for a safe terminal decision before queuing failed details", () => {
+  const router = readFunctionSection(
+    "function routeDetailItemToStreamingSync(",
+    "function formatStreamingSyncSummary(",
+  );
+  const batch = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const stopAt = batch.indexOf("if (resultInterruption.stopBatch)");
+  const recoverableAt = batch.indexOf(
+    "if (enhanceResult?.canceled || resultInterruption.recoverable)",
+    stopAt,
+  );
+  const enqueueMissingAt = batch.indexOf(
+    "streamingSyncQueue.enqueueMissing(recordIds",
+    recoverableAt,
+  );
+
+  assert.match(
+    router,
+    /phase !== "detail_item_done"[\s\S]*?return;[\s\S]*?streamingSyncQueue\.enqueue\(recordId/u,
+  );
+  assert.match(
+    router,
+    /phase === "detail_item_filtered"[\s\S]*?phase === "detail_item_skipped"[\s\S]*?markSeen/u,
+  );
+  assert.ok(stopAt >= 0);
+  assert.ok(recoverableAt > stopAt);
+  assert.ok(enqueueMissingAt > recoverableAt);
+  assert.doesNotMatch(
+    batch.slice(0, stopAt),
+    /streamingSyncQueue\.enqueueMissing\(recordIds/u,
   );
 });
 

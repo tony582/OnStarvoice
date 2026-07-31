@@ -224,7 +224,7 @@ test("Douyin href identity candidates must contain at least eight numeric digits
   }
 });
 
-test("Douyin image modal fallback uses the note route instead of video", async () => {
+test("Douyin image records use the matched note route before their search modal", async () => {
   const {
     buildDouyinDetailNavigationCandidates,
     resolveRecordDetailNotePath,
@@ -253,9 +253,107 @@ test("Douyin image modal fallback uses the note route instead of video", async (
   assert.deepEqual(
     buildDouyinDetailNavigationCandidates(modalUrl, sourceUrl, "note"),
     [
-      modalUrl,
       `https://www.douyin.com/note/${noteId}`,
+      modalUrl,
     ],
+  );
+});
+
+test("Douyin unknown records try both direct routes before their own search modal", async () => {
+  const {
+    buildDouyinDetailNavigationCandidates,
+    resolveRecordDetailNotePath,
+  } = await import(
+    `../../utils/capture-sync.js?unknown-direct-routes=${Date.now()}`
+  );
+  const noteId = "766193585000000078";
+  const recordSourceUrl =
+    "https://www.douyin.com/jingxuan/search/record-keyword?type=general";
+  const unrelatedActiveSourceUrl =
+    "https://www.douyin.com/jingxuan/search/another-keyword?type=general";
+  const recordModalUrl = `${recordSourceUrl}&modal_id=${noteId}`;
+  const record = {
+    platform: "douyin",
+    payload: {
+      searchUrl: recordSourceUrl,
+      items: [
+        {
+          noteId,
+          url: recordModalUrl,
+        },
+      ],
+    },
+  };
+
+  assert.equal(resolveRecordDetailNotePath(record), "unknown");
+  assert.deepEqual(
+    buildDouyinDetailNavigationCandidates(
+      recordModalUrl,
+      unrelatedActiveSourceUrl,
+      "unknown",
+    ),
+    [
+      `https://www.douyin.com/video/${noteId}`,
+      `https://www.douyin.com/note/${noteId}`,
+      recordModalUrl,
+    ],
+  );
+});
+
+test("Douyin records fail closed when stored IDs disagree", async () => {
+  const {
+    inspectDouyinRecordDetailIdentity,
+    resolveRecordDetailNoteId,
+  } = await import(
+    `../../utils/capture-sync.js?record-id-conflict=${Date.now()}`
+  );
+  const explicitId = "766193585000000078";
+  const urlId = "766193585000000079";
+  const record = {
+    platform: "douyin",
+    payload: {
+      items: [
+        {
+          noteId: explicitId,
+          url: `https://www.douyin.com/video/${urlId}`,
+        },
+      ],
+    },
+  };
+
+  assert.equal(resolveRecordDetailNoteId(record), "");
+  assert.deepEqual(inspectDouyinRecordDetailIdentity(record), {
+    isDouyin: true,
+    noteId: "",
+    noteIds: [explicitId, urlId],
+    conflicting: true,
+  });
+  assert.match(
+    captureSyncSource,
+    /recordIdentityConflict[\s\S]*?integrityBlocked = true[\s\S]*?fatal: recordIdentityConflict[\s\S]*?stopBatch: recordIdentityConflict/u,
+  );
+});
+
+test("an explicit Douyin note route wins over a misleading duration field", async () => {
+  const {resolveRecordDetailNotePath} = await import(
+    `../../utils/capture-sync.js?note-route-priority=${Date.now()}`
+  );
+  const noteId = "766193585000000080";
+
+  assert.equal(
+    resolveRecordDetailNotePath({
+      platform: "douyin",
+      payload: {
+        items: [
+          {
+            noteId,
+            duration: "00:15",
+            url: `https://www.douyin.com/note/${noteId}`,
+          },
+        ],
+      },
+    }),
+    "note",
   );
 });
 
@@ -319,6 +417,65 @@ test("Douyin comment readiness cannot pass from API cache without visible detail
   assert.ok(
     probeBlock.indexOf("if (result.unavailable)") <
       probeBlock.indexOf("if (result.targetMatched && result.detailReady)"),
+  );
+  assert.match(
+    probeBlock,
+    /document\.visibilityState === 'hidden'/u,
+    "a hidden work tab must not satisfy visible-DOM readiness",
+  );
+  assert.match(
+    probeBlock,
+    /douyinRateLimited[\s\S]*?'RATE_LIMITED'/u,
+    "Douyin rate-limit pages must stop the batch",
+  );
+  assert.match(
+    probeBlock,
+    /const visibleRateLimitSurface[\s\S]*?visibleRateLimitSurface \|\|\s*\(douyinRateLimitCopy && !hasVisibleDetailSignal\)/u,
+    "a visible rate-limit overlay must win even when detail remains rendered underneath",
+  );
+  assert.doesNotMatch(
+    probeBlock,
+    /(?:^|\|)\s*\\b429\\b/u,
+    "a bare 429 in normal post text must not be treated as a rate-limit page",
+  );
+  assert.match(
+    probeBlock,
+    /embeddedIds\.every\(\(value\) => value === targetNoteId\)/u,
+    "API readiness cache must be bound to the requested work ID",
+  );
+});
+
+test("Douyin extractor failure continues only from the next verified entry", () => {
+  const batchStart = captureSyncSource.indexOf(
+    "export async function batchCaptureDetailsForRecords",
+  );
+  const batchEnd = captureSyncSource.indexOf(
+    "export async function syncRecord",
+    batchStart,
+  );
+  const batchBlock = captureSyncSource.slice(batchStart, batchEnd);
+
+  assert.match(batchBlock, /const douyinReadyEntryUrlByRecordId = new Map\(\)/u);
+  assert.match(
+    batchBlock,
+    /douyinReadyEntryUrlByRecordId\.set\(\s*String\(recordId\),\s*candidateUrl/u,
+  );
+  assert.match(
+    batchBlock,
+    /code === 'DOUYIN_DETAIL_NOT_READY' \|\|\s*code === 'DOUYIN_CONTENT_UNAVAILABLE'/u,
+  );
+  assert.match(
+    batchBlock,
+    /const readyEntryIndex = fallbackCandidates\.indexOf\(readyEntryUrl\)[\s\S]*?fallbackCandidates\.slice\(readyEntryIndex \+ 1\)/u,
+  );
+  assert.match(
+    batchBlock,
+    /detailPrefetchPipeline\.runExternalNavigation[\s\S]*?active: true[\s\S]*?requireVisibleDetailRoot: true[\s\S]*?noteResult = await captureCurrentNotePayload\(\)/u,
+  );
+  assert.doesNotMatch(
+    batchBlock,
+    /readyEntryIndex < 0[\s\S]{0,160}fallbackCandidates/u,
+    "an unknown cursor must not replay the first candidate",
   );
 });
 

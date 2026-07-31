@@ -222,11 +222,15 @@ test("Douyin detail enhancement stays on one worker and delays unavailable failu
   assert.match(captureSyncSource, /DOUYIN_UNAVAILABLE_GRACE_MS = 4500/u);
   assert.match(
     captureSyncSource,
-    /buildDouyinDetailNavigationCandidates\(\s*url,\s*activeTab\?\.url,\s*douyinDetailPathByRecordId\.get\(String\(recordId\)\) \|\| 'video',\s*\)/u,
+    /buildDouyinDetailNavigationCandidates\(\s*url,\s*douyinSearchModalUrlByRecordId\.get\(String\(recordId\)\) \|\| '',\s*douyinDetailPathByRecordId\.get\(String\(recordId\)\) \|\| 'unknown',\s*\)/u,
   );
   assert.match(
     captureSyncSource,
-    /source\.searchParams\.set\('modal_id', noteId\)/u,
+    /douyinSearchModalUrlByRecordId\.set\(\s*String\(recordId\),\s*buildDouyinRecordSearchModalUrl\(record, noteId\),\s*\)/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /modalId === noteId/u,
   );
   assert.match(
     captureSyncSource,
@@ -356,7 +360,7 @@ test("standby prefetch is queued before current note extraction begins", () => {
     acquireAt,
   );
   const noteCaptureAt = captureSyncSource.indexOf(
-    "const noteResult = await captureInTab",
+    "let noteResult = await captureCurrentNotePayload()",
     acquireAt,
   );
   const persistenceAt = captureSyncSource.indexOf(
@@ -377,9 +381,16 @@ test("standby prefetch is queued before current note extraction begins", () => {
   );
 });
 
-test("filtered and mismatched items still pass the shared post-item safety delay", () => {
+test("filtered items still pass the shared post-item safety delay", () => {
   const labeledTryAt = captureSyncSource.indexOf("captureCurrentDetail: try {");
-  const itemCatchAt = captureSyncSource.indexOf("} catch (error) {", labeledTryAt);
+  const itemCatchBodyAt = captureSyncSource.indexOf(
+    "const pipelineFatalError = detailPrefetchPipeline.getFatalError()",
+    labeledTryAt,
+  );
+  const itemCatchAt = captureSyncSource.lastIndexOf(
+    "} catch (error) {",
+    itemCatchBodyAt,
+  );
   const itemFinallyAt = captureSyncSource.indexOf("} finally {", itemCatchAt);
   const itemDelayAt = captureSyncSource.indexOf(
     "const itemDelay =",
@@ -387,8 +398,12 @@ test("filtered and mismatched items still pass the shared post-item safety delay
   );
   const itemBody = captureSyncSource.slice(labeledTryAt, itemCatchAt);
 
-  assert.ok(labeledTryAt >= 0 && itemCatchAt > labeledTryAt);
-  assert.equal((itemBody.match(/break captureCurrentDetail;/gu) || []).length, 3);
+  assert.ok(
+    labeledTryAt >= 0 &&
+      itemCatchBodyAt > labeledTryAt &&
+      itemCatchAt > labeledTryAt,
+  );
+  assert.equal((itemBody.match(/break captureCurrentDetail;/gu) || []).length, 2);
   assert.doesNotMatch(itemBody, /\bcontinue;/u);
   assert.ok(itemFinallyAt > itemCatchAt && itemDelayAt > itemFinallyAt);
 });

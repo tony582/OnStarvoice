@@ -143,6 +143,10 @@ test('retry classifier accepts transient stages and rejects permanent or unsafe 
     'CANCELED',
     'DETAIL_CAPTURE_CANCELED',
     'XHS_SECURITY_BLOCK',
+    'IDENTITY_MISMATCH',
+    'DOUYIN_DETAIL_ID_MISMATCH',
+    'DOUYIN_COMMENT_ID_MISMATCH',
+    'DOUYIN_COMMENT_ID_CONFLICT',
   ];
   const input = [
     ...transientCodes.map((reason, index) =>
@@ -152,9 +156,11 @@ test('retry classifier accepts transient stages and rejects permanent or unsafe 
       recordId: `permanent-${index}`,
       ok: false,
       reason,
-      category:
-        reason.includes('CANCELED')
+        category:
+          reason.includes('CANCELED')
             ? 'user_canceled'
+            : reason.includes('IDENTITY') || reason.includes('ID_')
+              ? 'integrity_blocked'
             : 'page_failed',
       securityBlocked: reason === 'XHS_SECURITY_BLOCK',
     })),
@@ -184,6 +190,22 @@ test('permanent, security and user cancellation results never retry', async () =
     detailResult([transientFailure('canceled')], {
       canceled: true,
     }),
+    detailResult(
+      [
+        transientFailure('earlier-transient'),
+        {
+          ...transientFailure('identity-stop', 'IDENTITY_MISMATCH'),
+          integrityBlocked: true,
+          fatal: true,
+          stopBatch: true,
+        },
+      ],
+      {
+        integrityBlocked: true,
+        fatal: true,
+        stopBatch: true,
+      },
+    ),
   ];
 
   for (const [index, firstResult] of scenarios.entries()) {
@@ -396,6 +418,44 @@ test('merge replaces only retried records and preserves first-attempt order and 
   assert.equal(merged.processedCount, 3);
   assert.equal(merged.successCount, 2);
   assert.equal(merged.failedCount, 1);
+});
+
+test('merge preserves an identity-integrity stop raised by the retry attempt', () => {
+  const first = detailResult(
+    [transientFailure('record-a')],
+    {
+      ok: false,
+      runnerInterrupted: true,
+      recoveryRequired: true,
+    },
+  );
+  const retry = detailResult(
+    [
+      {
+        ...transientFailure('record-a', 'IDENTITY_MISMATCH'),
+        integrityBlocked: true,
+        fatal: true,
+        stopBatch: true,
+      },
+    ],
+    {
+      ok: false,
+      integrityBlocked: true,
+      fatal: true,
+      stopBatch: true,
+    },
+  );
+
+  const merged = mergeEnhancementAttemptResults({
+    initialResult: first,
+    retryResult: retry,
+    retryRecordIds: ['record-a'],
+  });
+
+  assert.equal(merged.ok, false);
+  assert.equal(merged.integrityBlocked, true);
+  assert.equal(merged.fatal, true);
+  assert.equal(merged.stopBatch, true);
 });
 
 test('runner setup failures retry every unresolved record with a fresh second attempt', async () => {

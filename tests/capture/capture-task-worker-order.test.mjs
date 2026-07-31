@@ -466,7 +466,7 @@ test("Douyin detail batches create one dedicated serial worker and never registe
   assert.equal(navigationPatch?.active, true);
   assert.equal(
     navigationPatch?.url,
-    "https://www.douyin.com/jingxuan/search/test?type=general&modal_id=766193585000000001",
+    "https://www.douyin.com/video/766193585000000001",
   );
   assert.equal(events.includes(`remove:${workerTab.id}`), true);
 
@@ -481,7 +481,7 @@ test("Douyin detail batches create one dedicated serial worker and never registe
   });
 });
 
-test("Douyin modal readiness failure falls back to the direct video route", async () => {
+test("Douyin direct-route readiness failure falls back to the record search modal", async () => {
   const sourceTab = {
     id: 71,
     windowId: 8,
@@ -613,7 +613,392 @@ test("Douyin modal readiness failure falls back to the direct video route", asyn
   assert.equal(createCount, 1);
   assert.equal(sourceNavigationCount, 0);
   assert.deepEqual(navigationUrls, [
+    `https://www.douyin.com/video/${noteId}`,
     `${sourceTab.url}&modal_id=${noteId}`,
+  ]);
+
+  await captureSync.endCaptureTaskSession({
+    taskId: activeTask.taskId,
+    reason: "completed",
+    status: "completed",
+  });
+  taskContext.completeTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+});
+
+test("Douyin extractor readiness failure reuses its worker and advances only to the record modal", async () => {
+  const sourceTab = {
+    id: 73,
+    windowId: 8,
+    index: 2,
+    active: true,
+    status: "complete",
+    url: "https://www.douyin.com/jingxuan/search/extractor-fallback?type=general",
+  };
+  const workerTab = {
+    id: 394,
+    windowId: 8,
+    index: 3,
+    active: false,
+    status: "complete",
+    url: "about:blank",
+  };
+  const noteId = "766193585000000101";
+  const directUrl = `https://www.douyin.com/video/${noteId}`;
+  const modalUrl = `${sourceTab.url}&modal_id=${noteId}`;
+  const navigationUrls = [];
+  const captureTabIds = [];
+  const removedTabIds = [];
+  const events = [];
+  let workerCurrentUrl = workerTab.url;
+  let createCount = 0;
+  let registrationCount = 0;
+  let sourceNavigationCount = 0;
+  let captureCount = 0;
+
+  globalThis.chrome = {
+    storage: {local: createMemoryStorageArea()},
+    runtime: {
+      async sendMessage(message) {
+        if (message?.type === "onstarvoice:begin-capture-task") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (message?.type === "onstarvoice:register-capture-task-tab") {
+          registrationCount += 1;
+          assert.equal(message.tabId, workerTab.id);
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (
+          message?.type === "onstarvoice:relay-to-content" &&
+          message?.payload?.action === "captureSingleNote"
+        ) {
+          captureCount += 1;
+          captureTabIds.push(message.tabId);
+          events.push(`capture:${captureCount}`);
+          if (captureCount === 1) {
+            return {
+              ok: true,
+              data: {
+                ok: false,
+                type: "single_note",
+                data: null,
+                error: {
+                  code: "DOUYIN_DETAIL_NOT_READY",
+                  message: "direct detail DOM was not readable",
+                },
+              },
+            };
+          }
+          return {
+            ok: true,
+            data: {
+              ok: true,
+              platform: "douyin",
+              type: "single_note",
+              data: {
+                noteId,
+                noteUrl: directUrl,
+                title: "Extractor fallback detail",
+                content: "Fallback capture succeeded from the record modal.",
+                author: "Fallback author",
+                likes: 12,
+                bloggerFollowersCount: 1200,
+                bloggerLikedAndCollectedCount: 3400,
+                bloggerProfileUrl: "https://www.douyin.com/user/fallback-author",
+              },
+              meta: {pageType: "note_detail"},
+              error: null,
+            },
+          };
+        }
+        return {ok: true, data: {ok: true}};
+      },
+      getURL(path) {
+        return `chrome-extension://test/${path}`;
+      },
+    },
+    tabs: {
+      async query() {
+        return [sourceTab];
+      },
+      async create(properties) {
+        createCount += 1;
+        workerCurrentUrl = String(properties?.url || workerTab.url);
+        return {
+          ...workerTab,
+          ...properties,
+          id: workerTab.id,
+          url: workerCurrentUrl,
+        };
+      },
+      async update(tabId, patch) {
+        const targetUrl = String(patch?.url || "");
+        if (
+          tabId === sourceTab.id &&
+          targetUrl &&
+          targetUrl !== sourceTab.url
+        ) {
+          sourceNavigationCount += 1;
+          throw new Error("Douyin source search tab must stay untouched");
+        }
+        if (tabId === workerTab.id && targetUrl) {
+          workerCurrentUrl = targetUrl;
+          navigationUrls.push(targetUrl);
+          events.push(`navigate:${targetUrl}`);
+          return {
+            ...workerTab,
+            ...patch,
+            url: workerCurrentUrl,
+            status: "complete",
+          };
+        }
+        return tabId === sourceTab.id
+          ? {...sourceTab, ...patch}
+          : {...workerTab, ...patch, url: workerCurrentUrl};
+      },
+      async get(tabId) {
+        if (tabId === sourceTab.id) return {...sourceTab};
+        if (tabId === workerTab.id) {
+          return {
+            ...workerTab,
+            url: workerCurrentUrl,
+            status: "complete",
+          };
+        }
+        throw new Error(`No tab with id: ${tabId}`);
+      },
+      async remove(tabId) {
+        removedTabIds.push(tabId);
+        events.push(`remove:${tabId}`);
+      },
+    },
+    scripting: {
+      async executeScript({target, args}) {
+        assert.equal(target?.tabId, workerTab.id);
+        const expectedNoteId = String(args?.[0] || noteId);
+        return [{
+          result: {
+            currentUrl: workerCurrentUrl,
+            title: "Douyin detail",
+            isDouyin: true,
+            currentNoteId: expectedNoteId,
+            targetMatched: true,
+            activeWorkIds: [expectedNoteId],
+            conflictingActiveWorkIds: [],
+            activeWorkIdentityConflict: false,
+            detailReady: true,
+            apiDetailReady: false,
+            requireVisibleDetailRoot: true,
+            hasBoundDetailRoot: true,
+            usedModalIdentityFallback: workerCurrentUrl === modalUrl,
+            isSearchModalContext: workerCurrentUrl === modalUrl,
+            blocked: false,
+            unavailable: false,
+            immediateUnavailable: false,
+            code: "",
+            message: "",
+          },
+        }];
+      },
+    },
+    windows: {async update() { return {}; }},
+  };
+
+  const [{addRecord}, captureSync, taskContext] = await Promise.all([
+    import("../../utils/storage.js"),
+    import("../../utils/capture-sync.js"),
+    import("../../utils/task-context.js"),
+  ]);
+  const recordId = "douyin-extractor-modal-fallback-r1";
+  await addRecord({
+    id: recordId,
+    type: "keyword_notes",
+    platform: "douyin",
+    meta: {sourceUrl: sourceTab.url},
+    payload: {
+      searchUrl: sourceTab.url,
+      items: [{
+        noteId,
+        noteType: "video",
+        duration: "00:29",
+        url: modalUrl,
+      }],
+    },
+  });
+
+  const activeTask = taskContext.beginTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+  await captureSync.beginCaptureTaskSession({
+    taskId: activeTask.taskId,
+    tabId: sourceTab.id,
+    label: "Douyin extractor modal fallback test",
+    platform: "douyin",
+  });
+
+  try {
+    const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
+      skipAlreadyCaptured: false,
+      captureTaskId: activeTask.taskId,
+      detailNavTimeoutMs: 5000,
+      detailAfterNavWaitMs: 1,
+    });
+
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.successCount, 1);
+    assert.equal(createCount, 1);
+    assert.equal(registrationCount, 1);
+    assert.equal(sourceNavigationCount, 0);
+    assert.equal(captureCount, 2);
+    assert.deepEqual(captureTabIds, [workerTab.id, workerTab.id]);
+    assert.deepEqual(
+      navigationUrls,
+      [directUrl, modalUrl],
+      "the extractor fallback must advance to the record modal without replaying direct",
+    );
+    assert.deepEqual(removedTabIds, [workerTab.id]);
+    assert.ok(
+      events.indexOf("capture:1") <
+        events.indexOf(`navigate:${modalUrl}`) &&
+        events.indexOf(`navigate:${modalUrl}`) <
+          events.indexOf("capture:2") &&
+        events.indexOf("capture:2") <
+          events.indexOf(`remove:${workerTab.id}`),
+      events.join(" -> "),
+    );
+  } finally {
+    await captureSync.endCaptureTaskSession({
+      taskId: activeTask.taskId,
+      reason: "completed",
+      status: "completed",
+    });
+    taskContext.completeTaskContext({
+      taskType: "capture",
+      featureKey: "capture.search",
+    });
+  }
+});
+
+test("Douyin security errors stop at the direct route without trying a fallback entry", async () => {
+  const sourceTab = {
+    id: 72,
+    windowId: 8,
+    index: 2,
+    active: true,
+    status: "complete",
+    url: "https://www.douyin.com/jingxuan/search/security?type=general",
+  };
+  const workerTab = {
+    id: 393,
+    windowId: 8,
+    index: 3,
+    active: false,
+    status: "complete",
+    url: "about:blank",
+  };
+  const noteId = "766193585000000100";
+  const navigationUrls = [];
+
+  globalThis.chrome = {
+    storage: {local: createMemoryStorageArea()},
+    runtime: {
+      async sendMessage(message) {
+        if (message?.type === "onstarvoice:begin-capture-task") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (message?.type === "onstarvoice:register-capture-task-tab") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        return {ok: true, data: null};
+      },
+      getURL(path) {
+        return `chrome-extension://test/${path}`;
+      },
+    },
+    tabs: {
+      async query() {
+        return [sourceTab];
+      },
+      async create(properties) {
+        return {...workerTab, ...properties, id: workerTab.id};
+      },
+      async update(tabId, patch) {
+        if (
+          tabId === workerTab.id &&
+          patch?.url &&
+          String(patch.url) !== workerTab.url
+        ) {
+          navigationUrls.push(String(patch.url));
+          const error = new Error("Douyin captcha challenge requires human action");
+          error.code = "PAGE_CHALLENGE_BLOCK";
+          throw error;
+        }
+        return tabId === sourceTab.id
+          ? {...sourceTab, ...patch}
+          : {...workerTab, ...patch};
+      },
+      async get(tabId) {
+        if (tabId === sourceTab.id) return sourceTab;
+        if (tabId === workerTab.id) return workerTab;
+        throw new Error(`No tab with id: ${tabId}`);
+      },
+      async remove() {
+        return undefined;
+      },
+    },
+    scripting: {
+      async executeScript() {
+        return [{result: 0}];
+      },
+    },
+    windows: {async update() { return {}; }},
+  };
+
+  const [{addRecord}, captureSync, taskContext] = await Promise.all([
+    import("../../utils/storage.js"),
+    import("../../utils/capture-sync.js"),
+    import("../../utils/task-context.js"),
+  ]);
+  const recordId = "douyin-direct-security-stop-r1";
+  await addRecord({
+    id: recordId,
+    type: "keyword_notes",
+    platform: "douyin",
+    meta: {sourceUrl: sourceTab.url},
+    payload: {
+      searchUrl: sourceTab.url,
+      items: [{
+        noteId,
+        noteType: "video",
+        duration: "00:29",
+        url: `${sourceTab.url}&modal_id=${noteId}`,
+      }],
+    },
+  });
+
+  const activeTask = taskContext.beginTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+  await captureSync.beginCaptureTaskSession({
+    taskId: activeTask.taskId,
+    tabId: sourceTab.id,
+    label: "Douyin security stop test",
+    platform: "douyin",
+  });
+
+  const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
+    skipAlreadyCaptured: false,
+    captureTaskId: activeTask.taskId,
+    detailNavTimeoutMs: 5000,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.securityBlocked, true);
+  assert.deepEqual(navigationUrls, [
     `https://www.douyin.com/video/${noteId}`,
   ]);
 

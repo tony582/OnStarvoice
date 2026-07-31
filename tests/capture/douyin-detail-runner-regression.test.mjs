@@ -70,7 +70,7 @@ test("AI prefilter completion continues into worker registration and detail capt
   );
   const batchStartAt = body.indexOf("phase: 'detail_batch_start'", registrationAt);
   const detailCaptureAt = body.indexOf(
-    "const noteResult = await captureInTab",
+    "let noteResult = await captureCurrentNotePayload()",
     batchStartAt,
   );
 
