@@ -234,6 +234,8 @@ function buildWorkbenchCte(tenantId, query = {}) {
   const where = [
     'record.tenant_id = $1',
     "record.platform IN ('xiaohongshu', 'douyin')",
+    "COALESCE(record.record_type, '') <> 'blogger_profile'",
+    "NULLIF(BTRIM(record.external_id), '') IS NOT NULL",
   ];
   const sort = query.sort === 'collected_desc'
     ? 'collected_desc'
@@ -472,6 +474,8 @@ async function loadOfficialWorkbenchPost(tenantId, recordId) {
     ) account ON true
     WHERE record.id = $1::uuid
       AND record.tenant_id = $2
+      AND COALESCE(record.record_type, '') <> 'blogger_profile'
+      AND NULLIF(BTRIM(record.external_id), '') IS NOT NULL
     LIMIT 1
   `, [recordId, tenantId]);
 }

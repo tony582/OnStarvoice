@@ -17,6 +17,16 @@ const MONITOR_SETTING_KEYS = new Set([
 const MONITOR_SUBJECT_TYPES = new Set(['creator', 'official']);
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const RESERVED_PLATFORM_ACCOUNT_IDS = new Set([
+  'self',
+  'me',
+  'my',
+  'profile',
+  'home',
+  'login',
+  'undefined',
+  'null',
+]);
 
 function normalizeText(value) {
   return String(value || '').trim();
@@ -36,6 +46,58 @@ function normalizeAliases(value) {
 
 function isUuid(value) {
   return UUID_PATTERN.test(normalizeText(value));
+}
+
+export function extractOfficialPlatformUserId(platformValue, profileUrlValue) {
+  const platform = normalizeText(platformValue).toLowerCase();
+  const profileUrl = normalizeText(profileUrlValue);
+  const platformContract = {
+    douyin: {
+      hostname: 'douyin.com',
+      pathname: /\/user\/([^/?#]+)/iu,
+    },
+    xiaohongshu: {
+      hostname: 'xiaohongshu.com',
+      pathname: /\/user\/profile\/([^/?#]+)/iu,
+    },
+    weibo: {
+      hostname: 'weibo.com',
+      pathname: /\/(?:u\/)?(\d{4,})\/?$/iu,
+    },
+  }[platform];
+  if (!profileUrl || !platformContract) return '';
+
+  let parsed;
+  try {
+    parsed = new URL(profileUrl);
+  } catch {
+    return '';
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    hostname !== platformContract.hostname &&
+    !hostname.endsWith(`.${platformContract.hostname}`)
+  ) {
+    return '';
+  }
+
+  const match = parsed.pathname.match(platformContract.pathname);
+  if (!match?.[1]) return '';
+  let accountId = '';
+  try {
+    accountId = normalizeText(decodeURIComponent(match[1]));
+  } catch {
+    accountId = normalizeText(match[1]);
+  }
+  if (
+    accountId.length < 5 ||
+    accountId.length > 240 ||
+    !/^[a-z0-9._-]+$/iu.test(accountId) ||
+    RESERVED_PLATFORM_ACCOUNT_IDS.has(accountId.toLowerCase())
+  ) {
+    return '';
+  }
+  return accountId;
 }
 
 function resolveHitsSince(range) {
@@ -157,8 +219,25 @@ async function validateSubscriptionAgentBinding(tx, {
 }
 
 function resolveOfficialIdentity(body = {}, subscription = {}) {
+  const platform = normalizeText(body.platform || subscription.platform);
+  const profileUrl = normalizeText(
+    body.profileUrl ||
+    body.profile_url ||
+    body.accountUrl ||
+    body.bloggerUrl ||
+    subscription.account_url
+  );
+  const explicitPlatformUserId = normalizeText(
+    body.platformUserId ||
+    body.platform_user_id ||
+    body.profileInternalId ||
+    body.profile_internal_id ||
+    body.platformBloggerId ||
+    body.bloggerId ||
+    body.authorId
+  );
   return {
-    platform: normalizeText(body.platform || subscription.platform),
+    platform,
     accountName: normalizeText(
       body.accountName ||
       body.account_name ||
@@ -169,15 +248,9 @@ function resolveOfficialIdentity(body = {}, subscription = {}) {
       body.name ||
       subscription.name
     ),
-    platformUserId: normalizeText(
-      body.platformUserId ||
-      body.platform_user_id ||
-      body.profileInternalId ||
-      body.profile_internal_id ||
-      body.platformBloggerId ||
-      body.bloggerId ||
-      body.authorId
-    ),
+    platformUserId:
+      explicitPlatformUserId ||
+      extractOfficialPlatformUserId(platform, profileUrl),
     accountNo: normalizeText(
       body.accountNo ||
       body.account_no ||
@@ -185,13 +258,7 @@ function resolveOfficialIdentity(body = {}, subscription = {}) {
       body.author_account_no
     ),
     legacyAccountId: normalizeText(body.accountId || body.account_id),
-    profileUrl: normalizeText(
-      body.profileUrl ||
-      body.profile_url ||
-      body.accountUrl ||
-      body.bloggerUrl ||
-      subscription.account_url
-    ),
+    profileUrl,
     aliases: normalizeAliases(body.aliases),
     avatarUrl: normalizeText(body.avatarUrl || body.avatar_url),
     skipContent: body.skipContent !== false && body.skip_content !== false,
@@ -281,7 +348,6 @@ async function markSubscriptionOfficial(tx, {
       },
     };
   }
-
   let officialAccount = await findOfficialAccountForUpdate(tx, tenantId, identity);
   if (!officialAccount && subscription.official_account_id) {
     officialAccount = await tx.queryOne(`
@@ -291,6 +357,22 @@ async function markSubscriptionOfficial(tx, {
       LIMIT 1
       FOR UPDATE
     `, [subscription.official_account_id, tenantId]);
+  }
+  if (
+    !identity.platformUserId &&
+    !identity.accountNo &&
+    !identity.legacyAccountId &&
+    !officialAccount?.platform_user_id &&
+    !officialAccount?.account_no &&
+    !officialAccount?.account_id
+  ) {
+    return {
+      failure: {
+        status: 400,
+        error: 'official_account_strong_identity_required',
+        message: '未从账号主页识别到稳定账号 ID，请重新打开账号主页后登记',
+      },
+    };
   }
 
   const aliases = mergeAliases(officialAccount?.aliases, identity.aliases);
