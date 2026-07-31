@@ -4,7 +4,7 @@ import {
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
   ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X, ScanSearch,
-  Megaphone, MessageCircle,
+  Megaphone,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -45,15 +45,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
     { id: 'monitoring', label: '关注博主', icon: UserCheck, badgeKeys: ['monitorAttention'] },
-    {
-      id: 'official-social',
-      label: '官方社媒',
-      icon: Megaphone,
-      children: [
-        { id: 'official-comments', label: '评论巡查' },
-        { id: 'official-accounts', label: '官方账号管理', internalOnly: true },
-      ],
-    },
+    { id: 'official-comments', label: '官方社媒', icon: Megaphone },
     { id: 'dispatch', label: '调度中心', icon: Waypoints, tag: 'BETA' },
     { id: 'social-accounts', label: '社交账号', icon: Users },
     { id: 'salesleads', label: '销售客资', icon: HandCoins },
@@ -72,6 +64,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
 }
 
 const ADMIN_NAV: NavItem[] = [
+  { id: 'owned-account-exclusions', label: '自营内容排除', icon: ShieldCheck },
   { id: 'tenants', label: '租户管理', icon: Building2 },
   { id: 'users', label: '用户账号', icon: Users, platformAdmin: true },
   { id: 'auth-codes', label: '激活码', icon: KeyRound },
@@ -299,9 +292,7 @@ function NavGroup({ label, items, activePage, activeQueue, onNavigate, badges, i
                           : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
                       )}
                     >
-                      {child.id === 'official-accounts'
-                        ? <ShieldCheck className={cn('h-3.5 w-3.5', on ? 'text-primary' : 'text-muted-foreground')} />
-                        : <MessageCircle className={cn('h-3.5 w-3.5', on ? 'text-primary' : 'text-muted-foreground')} />}
+                      <span className={cn('h-1.5 w-1.5 rounded-full', on ? 'bg-primary' : 'bg-muted-foreground/40')} />
                       <span className="truncate">{child.label}</span>
                     </button>
                   )

@@ -12,7 +12,6 @@ const [
   drawer,
   dispatchPage,
   monitoringTab,
-  registrationDrawer,
   monitoringTasksTab,
   taskCard,
   taskLib,
@@ -20,12 +19,13 @@ const [
   monitoringPage,
   desktopApp,
   mobileApp,
+  navigation,
+  exclusionPage,
 ] = await Promise.all([
   load('web/admin/src/pages/dispatch/cloud-tasks/OfficialCommentPatrolTaskCreator.tsx'),
   load('web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx'),
   load('web/admin/src/pages/dispatch/DispatchPage.tsx'),
   load('web/admin/src/pages/monitoring/OfficialCommentPatrolTab.tsx'),
-  load('web/admin/src/pages/monitoring/OfficialAccountRegistrationDrawer.tsx'),
   load('web/admin/src/pages/monitoring/TasksTab.tsx'),
   load('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
   load('web/admin/src/pages/dispatch/cloud-tasks/lib.ts'),
@@ -33,6 +33,8 @@ const [
   load('web/admin/src/pages/MonitoringPage.tsx'),
   load('web/admin/src/desktop/DesktopApp.tsx'),
   load('web/admin/src/mobile/MobileApp.tsx'),
+  load('web/admin/src/lib/navigation.tsx'),
+  load('web/admin/src/pages/OwnedAccountExclusionsPage.tsx'),
 ])
 
 test('official comment patrol is created directly from an account homepage', () => {
@@ -59,7 +61,6 @@ test('admin navigation no longer exposes an official discovery task', () => {
   assert.doesNotMatch(drawer, /official_discovery|官方账号作品发现/u)
   assert.doesNotMatch(dispatchPage, /official_discovery/u)
   assert.doesNotMatch(monitoringTab, /official_discovery|createDiscoveryTask|创建作品发现任务|发现近期作品/u)
-  assert.doesNotMatch(registrationDrawer, /作品发现/u)
   assert.doesNotMatch(monitoringTasksTab, /作品发现/u)
   assert.doesNotMatch(taskLib, /official_discovery/u)
 })
@@ -69,24 +70,27 @@ test('legacy official discovery tasks remain readable', () => {
   assert.match(taskCard, /官方账号作品发现/u)
 })
 
-test('official social navigation owns account management and comment patrol', () => {
-  assert.match(sidebar, /label: '官方社媒'/u)
-  assert.match(sidebar, /id: 'official-accounts', label: '官方账号管理'/u)
-  assert.match(sidebar, /id: 'official-comments', label: '评论巡查'/u)
-  assert.match(
-    sidebar,
-    /children: \[[\s\S]*id: 'official-comments'[\s\S]*id: 'official-accounts'[\s\S]*\]/u,
-  )
-  assert.match(
-    mobileApp,
-    /label: '官方社媒'[\s\S]*title: '评论巡查'[\s\S]*title: '官方账号管理'/u,
-  )
+test('official social is one top-level navigation entry', () => {
+  assert.match(sidebar, /\{ id: 'official-comments', label: '官方社媒', icon: Megaphone \}/u)
+  assert.doesNotMatch(sidebar, /official-social|official-accounts|官方账号管理/u)
+  assert.match(mobileApp, /title: '官方社媒', subtitle: '帖子趋势、评论情绪与运营建议'/u)
+  assert.doesNotMatch(mobileApp, /official-accounts|官方账号管理|OfficialAccountsPage/u)
+  assert.match(sidebar, /id: 'owned-account-exclusions', label: '自营内容排除'/u)
+  assert.match(mobileApp, /title: '自营内容排除', subtitle: '避免自营发文进入内容分诊'/u)
   assert.match(desktopApp, /'official-comments': OfficialCommentPatrolTab/u)
+  assert.doesNotMatch(desktopApp, /official-accounts|OfficialAccountsPage|官方账号管理/u)
+  assert.match(navigation, /'official-accounts': \{ page: 'official-comments' \}/u)
   assert.match(
     desktopApp,
     /page === 'official-comments'[\s\S]*\? 'pb-0 pt-0 xl:h-\[calc\(100dvh-3\.5rem\)\] xl:overflow-hidden'/u,
   )
   assert.doesNotMatch(monitoringPage, /官方账号评论巡查/u)
+})
+
+test('self-owned-content exclusion stays separate from official social', () => {
+  assert.match(exclusionPage, /skip_content/u)
+  assert.match(exclusionPage, /自营内容排除名单/u)
+  assert.match(exclusionPage, /回溯排除历史官方内容/u)
 })
 
 test('official comment workbench focuses on posts, engagement, and advice', () => {
@@ -98,6 +102,16 @@ test('official comment workbench focuses on posts, engagement, and advice', () =
   assert.match(monitoringTab, /label: '评论'/u)
   assert.match(monitoringTab, /label: '转发'/u)
   assert.match(monitoringTab, /EngagementTrend/u)
+  assert.match(monitoringTab, /bg-blue-50 text-blue-700/u)
+  assert.match(monitoringTab, /bg-amber-50 text-amber-700/u)
+  assert.match(monitoringTab, /text-\[12px\] font-bold text-foreground/u)
+  assert.match(monitoringTab, /flex h-2\.5 gap-px overflow-hidden/u)
+  assert.match(monitoringTab, /text-\[11px\] font-semibold tabular-nums/u)
+  assert.match(monitoringTab, /function PlatformIcon/u)
+  assert.match(monitoringTab, /xiaohongshu \? BookOpen : Music2/u)
+  assert.match(monitoringTab, /inline-flex h-5 w-5 shrink-0/u)
+  assert.match(monitoringTab, /aria-label=\{label\}/u)
+  assert.doesNotMatch(monitoringTab, /platformBadgeClass/u)
   assert.match(monitoringTab, /较上次采集/u)
   assert.match(monitoringTab, /负面评论/u)
   assert.match(monitoringTab, /正面评论/u)
@@ -113,6 +127,8 @@ test('official comment workbench focuses on posts, engagement, and advice', () =
   assert.match(monitoringTab, /发帖时间：新到旧/u)
   assert.match(monitoringTab, /最近采集时间：新到旧/u)
   assert.match(monitoringTab, /发起巡查/u)
+  assert.doesNotMatch(monitoringTab, /官方社媒设置|登记官方账号|OfficialAccountRegistrationDrawer|registrationOpen/u)
+  assert.doesNotMatch(monitoringTasksTab, /mark-official|设为官方账号|这是官方账号|登记官方账号/u)
   assert.match(
     monitoringTab,
     /<form onSubmit=\{submitSearch\}[\s\S]*aria-label="平台"[\s\S]*aria-label="官方账号"[\s\S]*aria-label="排序"/u,

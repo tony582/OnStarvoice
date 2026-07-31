@@ -49,7 +49,7 @@ const PLATFORMS = [
   { value: 'weibo', label: '微博' },
 ]
 
-export function OfficialAccountsPage() {
+export function OwnedAccountExclusionsPage() {
   const [rows, setRows] = useState<Row[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -59,7 +59,7 @@ export function OfficialAccountsPage() {
   const load = async () => {
     setLoading(true)
     try {
-      const d = await api.get<OfficialAccountsResponse>('/admin/official-accounts')
+      const d = await api.get<OfficialAccountsResponse>('/admin/owned-account-exclusions')
       setRows((d.accounts || []).map(a => ({
         id: a.id || undefined,
         platform: a.platform || 'xiaohongshu',
@@ -106,16 +106,16 @@ export function OfficialAccountsPage() {
         profileUrl: r.profile_url.trim(),
         skipContent: r.skip_content,
       }))
-      await api.put('/admin/official-accounts', { accounts })
-      setMsg('已保存。新采集的内容会按此名单自动识别。历史内容请点下方「回溯排除」。')
-      load()
+      await api.put('/admin/owned-account-exclusions', { accounts })
+      setMsg('已保存排除规则。')
+      void load()
     } catch (err) { setMsg('保存失败:' + (err instanceof Error ? err.message : '')) } finally { setSaving(false) }
   }
 
   const reclassify = async () => {
     setReclassifying(true); setMsg('')
     try {
-      const d = await api.post<ReclassifyResponse>('/admin/official-accounts/reclassify')
+      const d = await api.post<ReclassifyResponse>('/admin/owned-account-exclusions/reclassify')
       setMsg(`回溯完成:移出监测 ${d.excluded ?? 0} 条官方发文;识别官方回复 ${d.officialReplies ?? 0} 条,标记「已官方回复」内容 ${d.repliedRecords ?? 0} 条。`)
     } catch (err) { setMsg('回溯失败:' + (err instanceof Error ? err.message : '')) } finally { setReclassifying(false) }
   }
@@ -127,22 +127,21 @@ export function OfficialAccountsPage() {
       <div className="flex items-start gap-2.5 rounded-xl border border-status-blue/30 bg-status-blue/[0.05] p-4">
         <Info className="mt-0.5 h-4 w-4 shrink-0 text-status-blue" />
         <div className="text-[12.5px] leading-relaxed text-foreground/80">
-          在这里登记<strong>官方/自营账号</strong>(如「上海安吉星信息服务有限公司」「安吉星OnStar」及各客服账号)。它们<strong>发的内容</strong>会被标为官方内容、退出舆情监测;它们<strong>回复评论</strong>会被记为「官方已回复」。
-          匹配是<strong>精确</strong>的(完整账号名 / 别名 / 账号ID),不会误伤名字里带「安吉星」的路人。
+          这里只维护内容分诊排除规则，不会新增、删除或暂停 Extension 中的官方社媒账号。
         </div>
       </div>
 
       <section className="overflow-hidden rounded-xl border border-border bg-card shadow-xs">
         <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-3 sm:px-5">
-          <h2 className="inline-flex items-center gap-1.5 text-[13px] font-semibold"><ShieldCheck className="h-4 w-4 text-status-green" />官方账号名单 <span className="text-muted-foreground">({rows.length})</span></h2>
-          <Button variant="outline" size="sm" onClick={addRow}><Plus className="h-3.5 w-3.5" />添加账号</Button>
+          <h2 className="inline-flex items-center gap-1.5 text-[13px] font-semibold"><ShieldCheck className="h-4 w-4 text-status-green" />自营内容排除名单 <span className="text-muted-foreground">({rows.length})</span></h2>
+          <Button variant="outline" size="sm" onClick={addRow}><Plus className="h-3.5 w-3.5" />添加排除规则</Button>
         </div>
         <div className="divide-y divide-border">
           <div className="hidden grid-cols-[110px_1fr_1fr_120px_72px_36px] items-center gap-2 bg-muted px-4 py-2 text-[11px] font-medium text-muted-foreground lg:grid">
             <span>平台</span><span>账号名(精确)</span><span>别名(逗号分隔)</span><span>账号ID(选填)</span><span>退出监测</span><span></span>
           </div>
           {rows.length === 0 ? (
-            <div className="px-4 py-8 text-center text-[12px] text-muted-foreground">还没有官方账号,点「添加账号」登记第一个(例:上海安吉星信息服务有限公司)</div>
+            <div className="px-4 py-8 text-center text-[12px] text-muted-foreground">暂无自营内容排除规则</div>
           ) : rows.map((r, i) => (
             <div key={i} className="grid grid-cols-1 items-center gap-3 px-3 py-4 lg:grid-cols-[110px_1fr_1fr_120px_72px_36px] lg:gap-2 lg:px-4 lg:py-2.5">
               <label><span className="mb-1 block text-[11px] font-semibold text-muted-foreground lg:hidden">平台</span><WorkbenchSelect value={r.platform} onChange={e => update(i, { platform: e.target.value })} className="w-full">

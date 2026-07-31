@@ -18,7 +18,7 @@ import { BenchmarksPage } from '@/pages/BenchmarksPage'
 import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentHomePage } from '@/pages/ContentHomePage'
 import { HitsPage } from '@/pages/HitsPage'
-import { OfficialAccountsPage } from '@/pages/OfficialAccountsPage'
+import { OwnedAccountExclusionsPage } from '@/pages/OwnedAccountExclusionsPage'
 import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
@@ -45,8 +45,8 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   benchmarks: { eyebrow: 'Content Studio', title: '对标账号库' },
   keywords: { eyebrow: 'Content Studio', title: '选题与扩词' },
   review: { eyebrow: 'Content Studio', title: '内容复盘' },
-  'official-accounts': { eyebrow: 'Official Social', title: '官方账号管理' },
-  'official-comments': { eyebrow: 'Official Social', title: '评论巡查' },
+  'official-comments': { eyebrow: 'Official Social', title: '官方社媒' },
+  'owned-account-exclusions': { eyebrow: 'Administration', title: '自营内容排除' },
   tenants: { eyebrow: 'Administration', title: '租户管理' },
   users: { eyebrow: 'Administration', title: '用户账号' },
   'auth-codes': { eyebrow: 'Administration', title: '激活码' },
@@ -70,8 +70,8 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   keywords: KeywordsPage,
   'content-home': ContentHomePage,
   hits: HitsPage,
-  'official-accounts': OfficialAccountsPage,
   'official-comments': OfficialCommentPatrolTab,
+  'owned-account-exclusions': OwnedAccountExclusionsPage,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,

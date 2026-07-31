@@ -232,6 +232,28 @@ test('extension registration binds only its own active Agent', () => {
   );
 });
 
+test('Extension deletion retires the linked official account without touching other live links', () => {
+  const route = sourceSection(
+    monitorRoute,
+    "router.patch('/subscriptions/:id'",
+    "router.get('/executions'",
+  );
+  assert.match(route, /withTransaction\(async tx/u);
+  assert.match(route, /UPDATE monitor_subscriptions[\s\S]*RETURNING \*/u);
+  assert.match(
+    route,
+    /saved\.subject_type === 'official'[\s\S]*status === 'deleted'[\s\S]*UPDATE official_accounts account[\s\S]*SET status = 'deleted'/u,
+  );
+  assert.match(
+    route,
+    /NOT EXISTS \([\s\S]*other\.official_account_id = account\.id[\s\S]*other\.subject_type = 'official'[\s\S]*other\.status <> 'deleted'/u,
+  );
+  assert.match(
+    route,
+    /status === 'active'[\s\S]*UPDATE official_accounts[\s\S]*SET status = 'active'/u,
+  );
+});
+
 test('legacy run-now executes creator subscriptions only', () => {
   assert.match(
     monitorRoute,
@@ -418,7 +440,7 @@ test('legacy official-account admin matching never falls back to a name when str
 test('historical reclassification uses strong record identity and guarded legacy comment fallback', () => {
   const route = sourceSection(
     adminRoute,
-    "router.post('/official-accounts/reclassify'",
+    "router.post(['/owned-account-exclusions/reclassify'",
     "router.post('/login'",
   );
   const recordUpdate = sourceSection(route, '// ①', '// ②');
@@ -434,58 +456,50 @@ test('historical reclassification uses strong record identity and guarded legacy
   assert.ok(route.includes("${commentAuthorMatchSql('c')}"));
 });
 
-test('legacy official-account saves create or reuse a tenant-safe linked official subscription', () => {
+test('backend official-account writes are blocked because Extension owns the lifecycle', () => {
   assert.match(
     adminRoute,
-    /async function syncOfficialAccountMonitorSubscription\(tx, tenantId, account\)/u,
+    /router\.put\('\/official-accounts'[\s\S]*status\(409\)[\s\S]*official_accounts_extension_managed/u,
   );
-  assert.match(
-    adminRoute,
-    /WHERE tenant_id = \$1[\s\S]*subject_type = 'official'[\s\S]*official_account_id = \$2[\s\S]*FOR UPDATE/u,
-  );
-  assert.match(
-    adminRoute,
-    /account_url = \$3[\s\S]*official_account_id IS NULL OR official_account_id = \$4/u,
-  );
-  assert.match(
-    adminRoute,
-    /INSERT INTO monitor_subscriptions \([\s\S]*subject_type,[\s\S]*official_account_id[\s\S]*'active', true, '', now\(\), 'official', \$6/u,
-  );
-  assert.match(
-    adminRoute,
-    /await syncOfficialAccountMonitorSubscription\(tx, tenantId, saved\)/u,
-  );
+  assert.doesNotMatch(adminRoute, /syncOfficialAccountMonitorSubscription/u);
 });
 
-test('legacy official-account status changes preserve subscription history', () => {
-  assert.match(
+test('owned-content exclusion saves never mutate Extension patrol subscriptions', () => {
+  const route = sourceSection(
     adminRoute,
-    /accountStatus === 'deleted'[\s\S]*accountStatus === 'active'[\s\S]*'paused'/u,
+    "router.put('/owned-account-exclusions'",
+    '// 回溯重标',
   );
   assert.match(
-    adminRoute,
-    /UPDATE monitor_subscriptions[\s\S]*status = \$5[\s\S]*official_account_id = \$6[\s\S]*WHERE id = \$7 AND tenant_id = \$8/u,
+    route,
+    /existing\?\.extension_managed[\s\S]*SET skip_content = true/u,
   );
   assert.match(
-    adminRoute,
-    /UPDATE monitor_subscriptions AS subscription[\s\S]*SET status = 'deleted'[\s\S]*account\.tenant_id = \$1[\s\S]*subscription\.tenant_id = \$1/u,
+    route,
+    /SET skip_content = false[\s\S]*subscription\.subject_type = 'official'[\s\S]*subscription\.status <> 'deleted'/u,
   );
-  assert.doesNotMatch(
-    adminRoute,
-    /DELETE FROM monitor_subscriptions/u,
+  assert.match(
+    route,
+    /SET status = 'deleted'[\s\S]*NOT EXISTS \([\s\S]*subscription\.subject_type = 'official'/u,
   );
+  assert.doesNotMatch(route, /UPDATE monitor_subscriptions|INSERT INTO monitor_subscriptions|DELETE FROM monitor_subscriptions/u);
 });
 
-test('admin account saves preserve stable rows and links', () => {
-  assert.doesNotMatch(adminRoute, /DELETE FROM official_accounts WHERE tenant_id/u);
-  assert.match(
+test('owned-content exclusions preserve stable rows and strong identity', () => {
+  const route = sourceSection(
     adminRoute,
-    /UPDATE official_accounts[\s\S]*WHERE id = \$11 AND tenant_id = \$12[\s\S]*RETURNING \*/u,
+    "router.put('/owned-account-exclusions'",
+    '// 回溯重标',
+  );
+  assert.doesNotMatch(route, /DELETE FROM official_accounts WHERE tenant_id/u);
+  assert.match(
+    route,
+    /UPDATE official_accounts[\s\S]*WHERE id = \$9 AND tenant_id = \$10[\s\S]*RETURNING \*/u,
   );
   assert.match(
-    adminRoute,
-    /SET status = 'deleted', updated_at = now\(\)[\s\S]*tenant_id = \$1/u,
+    route,
+    /SET status = 'deleted',[\s\S]*updated_at = now\(\)[\s\S]*account\.tenant_id = \$1/u,
   );
-  assert.match(adminRoute, /platform_user_id = CASE WHEN \$3 <> ''/u);
-  assert.match(adminRoute, /account_no = CASE WHEN \$4 <> ''/u);
+  assert.match(route, /platform_user_id = CASE WHEN \$3 <> ''/u);
+  assert.match(route, /account_no = CASE WHEN \$4 <> ''/u);
 });

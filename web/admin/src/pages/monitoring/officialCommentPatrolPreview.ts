@@ -3,9 +3,44 @@
 
 const ACCOUNT = {
   id: '11111111-1111-4111-8111-111111111111',
-  name: '安吉星官方账号',
+  name: '安吉星小红书',
   platform: 'xiaohongshu',
 }
+
+const DOUYIN_ACCOUNT = {
+  id: '12222222-2222-4222-8222-222222222222',
+  name: '安吉星抖音',
+  platform: 'douyin',
+}
+
+export const previewOfficialAccounts = [
+  {
+    id: ACCOUNT.id,
+    accountName: ACCOUNT.name,
+    platform: ACCOUNT.platform,
+    accountNo: 'OnStarChina',
+    profileUrl: 'https://www.xiaohongshu.com/user/profile/preview-onstar',
+    monitorSubscriptionId: '51111111-1111-4111-8111-111111111111',
+    subscriptionStatus: 'active',
+    assignedAgentName: '上海运营节点',
+    recentPostCount: 12,
+    lastCollectedAt: '2026-07-30T01:20:00.000Z',
+    lastPatrolledAt: '2026-07-30T01:20:00.000Z',
+  },
+  {
+    id: DOUYIN_ACCOUNT.id,
+    accountName: DOUYIN_ACCOUNT.name,
+    platform: DOUYIN_ACCOUNT.platform,
+    accountNo: '安吉星官方',
+    profileUrl: 'https://www.douyin.com/user/preview-onstar',
+    monitorSubscriptionId: '52222222-2222-4222-8222-222222222222',
+    subscriptionStatus: 'paused',
+    assignedAgentName: '华东运营节点',
+    recentPostCount: 8,
+    lastCollectedAt: '2026-07-29T10:05:00.000Z',
+    lastPatrolledAt: '2026-07-29T10:05:00.000Z',
+  },
+]
 
 const PRIMARY_POSTS = [
   {
@@ -60,7 +95,7 @@ const PRIMARY_POSTS = [
     externalId: 'preview-onstar-2',
     publishedAt: '2026-07-28T10:05:00.000Z',
     publishTime: '2026-07-28 18:05',
-    officialAccount: {...ACCOUNT, platform: 'douyin'},
+    officialAccount: DOUYIN_ACCOUNT,
     coverage: {
       platformComments: 20,
       sampledComments: 18,
@@ -148,7 +183,7 @@ const PRIMARY_POSTS = [
     externalId: 'preview-onstar-4',
     publishedAt: '2026-07-26T12:11:00.000Z',
     publishTime: '2026-07-26 20:11',
-    officialAccount: {...ACCOUNT, platform: 'douyin'},
+    officialAccount: DOUYIN_ACCOUNT,
     coverage: {
       platformComments: 15,
       sampledComments: 12,
@@ -236,7 +271,7 @@ const PRIMARY_POSTS = [
     externalId: 'preview-onstar-6',
     publishedAt: '2026-07-24T01:30:00.000Z',
     publishTime: '2026-07-24 09:30',
-    officialAccount: {...ACCOUNT, platform: 'douyin'},
+    officialAccount: DOUYIN_ACCOUNT,
     coverage: {
       platformComments: 12,
       sampledComments: 10,
@@ -445,11 +480,7 @@ export const previewWorkbench = {
   sort: 'published_desc',
   accounts: [
     ACCOUNT,
-    {
-      id: '12222222-2222-4222-8222-222222222222',
-      name: '安吉星车主服务',
-      platform: 'douyin',
-    },
+    DOUYIN_ACCOUNT,
   ],
   comparison: {
     scope: 'per_post_latest_two_valid_patrols',

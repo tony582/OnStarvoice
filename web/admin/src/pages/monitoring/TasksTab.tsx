@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, ArrowUpRight, Clock, Loader2, Play, Radar, ShieldCheck, Target } from 'lucide-react'
+import { AlertTriangle, ArrowUpRight, Clock, Loader2, Play, Radar, Target } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatDateCompact, platformName, formatNumber } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -47,9 +47,7 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
   const { navigate } = useNav()
   const [subs, setSubs] = useState<CreatorSubscription[]>([])
   const [loading, setLoading] = useState(true)
-  const [promotingId, setPromotingId] = useState('')
   const [actionError, setActionError] = useState('')
-  const [feedback, setFeedback] = useState('')
 
   const load = useCallback(() => Promise.resolve().then(async () => {
     setLoading(true)
@@ -68,23 +66,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
 
   const createScanTask = (id: string) => {
     navigate('dispatch', { create: 'creator_patrol', subscriptionId: id })
-  }
-
-  const markOfficial = async (subscription: CreatorSubscription) => {
-    const name = String(subscription?.name || subscription?.bloggerName || '当前账号').trim()
-    if (!window.confirm(`将“${name}”转为官方账号？确认后将进入独立的官方账号主页增强与评论巡查流程；原关注博主计划会暂停，历史扫描记录继续保留。`)) return
-    setPromotingId(subscription.id)
-    setActionError('')
-    setFeedback('')
-    try {
-      await api.post(`/monitor/subscriptions/${subscription.id}/mark-official`, {})
-      setFeedback(`已将“${name}”转入官方账号巡查，原关注博主计划已暂停，历史记录已保留`)
-      await load()
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : '登记官方账号失败，请稍后重试')
-    } finally {
-      setPromotingId('')
-    }
   }
 
   const followedCreatorSubs = subs.filter(s => s.hasOfficialRole !== true && s.has_official_role !== true)
@@ -131,12 +112,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
           {actionError}
         </div>
       )}
-      {feedback && (
-        <div role="status" className="rounded-xl border border-status-green/25 bg-status-green/8 px-4 py-3 text-sm font-medium text-status-green">
-          {feedback}
-        </div>
-      )}
-
       {loading ? (
         <div className="flex justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
       ) : followedCreatorSubs.length === 0 ? (
@@ -147,8 +122,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
             {followedCreatorSubs.map(s => {
               const err = String(s.last_error || s.lastError || '').trim()
               const accountUrl = s.account_url || s.accountUrl
-              const promoting = promotingId === s.id
-              const officialRegistered = s.hasOfficialRole === true || s.has_official_role === true
               return (
                 <article key={s.id} className="relative overflow-hidden rounded-[20px] border border-border/70 bg-card shadow-sm">
                   <span className={`absolute inset-y-0 left-0 w-1 ${err ? 'bg-status-red' : s.status === 'active' ? 'bg-status-green' : 'bg-muted-foreground/40'}`} />
@@ -216,16 +189,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                         <Play className="h-4 w-4" />
                         分配扫描任务
                       </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="col-span-2 w-full text-muted-foreground"
-                        onClick={() => void markOfficial(s)}
-                        disabled={!canWrite() || promoting || officialRegistered}
-                      >
-                        {promoting ? <Loader2 className="h-4 w-4 animate-spin" /> : officialRegistered ? <ShieldCheck className="h-4 w-4 text-status-green" /> : <ShieldCheck className="h-4 w-4" />}
-                        {promoting ? '正在登记' : officialRegistered ? '已登记为官方账号' : '这是官方账号'}
-                      </Button>
                     </div>
                   </div>
                 </article>
@@ -276,15 +239,6 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                             <Target className="h-3.5 w-3.5" /> 命中
                           </Button>
                         )}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => void markOfficial(s)}
-                          disabled={!canWrite() || promotingId === s.id || s.hasOfficialRole === true || s.has_official_role === true}
-                        >
-                          {promotingId === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className={`h-3.5 w-3.5 ${s.hasOfficialRole === true || s.has_official_role === true ? 'text-status-green' : ''}`} />}
-                          {s.hasOfficialRole === true || s.has_official_role === true ? '已登记官方账号' : '设为官方账号'}
-                        </Button>
                         <Button variant="outline" size="sm" onClick={() => createScanTask(s.id)} disabled={!canWrite()}>
                           <Play className="h-3.5 w-3.5" /> 分配扫描
                         </Button>

@@ -813,11 +813,54 @@ router.patch('/subscriptions/:id', requireTenantAccess, requireTenantWriter, asy
     updates.push('updated_at = now()');
     params.push(id, req.tenantId);
 
-    const result = await execute(
-      `UPDATE monitor_subscriptions SET ${updates.join(', ')} WHERE id = $${params.length - 1} AND tenant_id = $${params.length}`,
-      params
-    );
-    return res.json({ ok: result.rowCount > 0 });
+    const subscription = await withTransaction(async tx => {
+      const saved = await tx.queryOne(`
+        UPDATE monitor_subscriptions
+        SET ${updates.join(', ')}
+        WHERE id = $${params.length - 1}
+          AND tenant_id = $${params.length}
+        RETURNING *
+      `, params);
+      if (!saved) return null;
+
+      if (
+        saved.subject_type === 'official' &&
+        saved.official_account_id &&
+        status === 'deleted'
+      ) {
+        // Extension deletion owns the official-account lifecycle. Retire the
+        // account only after its final live official subscription is gone.
+        await tx.execute(`
+          UPDATE official_accounts account
+          SET status = 'deleted',
+            updated_at = now()
+          WHERE account.id = $1
+            AND account.tenant_id = $2
+            AND NOT EXISTS (
+              SELECT 1
+              FROM monitor_subscriptions other
+              WHERE other.tenant_id = account.tenant_id
+                AND other.official_account_id = account.id
+                AND other.subject_type = 'official'
+                AND other.status <> 'deleted'
+            )
+        `, [saved.official_account_id, req.tenantId]);
+      } else if (
+        saved.subject_type === 'official' &&
+        saved.official_account_id &&
+        status === 'active'
+      ) {
+        await tx.execute(`
+          UPDATE official_accounts
+          SET status = 'active',
+            updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+        `, [saved.official_account_id, req.tenantId]);
+      }
+
+      return saved;
+    });
+    return res.json({ ok: Boolean(subscription) });
   } catch (err) {
     return next(err);
   }

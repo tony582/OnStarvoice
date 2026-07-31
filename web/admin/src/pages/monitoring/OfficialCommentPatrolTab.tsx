@@ -8,6 +8,7 @@ import {
 import {
   ArrowDownRight,
   ArrowUpRight,
+  BookOpen,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -16,6 +17,7 @@ import {
   Loader2,
   MessageCircle,
   Minus,
+  Music2,
   Search,
   Share2,
   ShieldAlert,
@@ -30,7 +32,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
-import { OfficialAccountRegistrationDrawer } from './OfficialAccountRegistrationDrawer'
 
 type Sentiment = {
   total: number
@@ -282,10 +283,25 @@ function comparePosts(left: PatrolPost, right: PatrolPost, sort: PostSort) {
   return left.id.localeCompare(right.id)
 }
 
-function platformBadgeClass(platform: string) {
-  return platform === 'xiaohongshu'
-    ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-300'
-    : 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
+function PlatformIcon({platform}: {platform: string}) {
+  const xiaohongshu = platform === 'xiaohongshu'
+  const Icon = xiaohongshu ? BookOpen : Music2
+  const label = platformName(platform)
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      title={label}
+      className={cn(
+        'mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded',
+        xiaohongshu
+          ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-300'
+          : 'bg-slate-100 text-slate-950 dark:bg-slate-800 dark:text-white',
+      )}
+    >
+      <Icon className="h-3.5 w-3.5" strokeWidth={2.25} />
+    </span>
+  )
 }
 
 function clonePreview<T>(value: T): T {
@@ -293,10 +309,14 @@ function clonePreview<T>(value: T): T {
 }
 
 export function OfficialCommentPatrolTab() {
-  const { navigate } = useNav()
+  const { navigate, params } = useNav()
   const { canWrite } = useAuth()
   const previewMode = isPreviewMode()
-  const [filters, setFilters] = useState<Filters>(INITIAL_FILTERS)
+  const [filters, setFilters] = useState<Filters>(() => ({
+    ...INITIAL_FILTERS,
+    platform: params?.platform || '',
+    officialAccountId: params?.officialAccountId || '',
+  }))
   const [searchDraft, setSearchDraft] = useState('')
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(1)
@@ -309,7 +329,6 @@ export function OfficialCommentPatrolTab() {
   const [detail, setDetail] = useState<PostCommentsResponse | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
-  const [registrationOpen, setRegistrationOpen] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -451,8 +470,8 @@ export function OfficialCommentPatrolTab() {
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-0 duration-300 xl:flex xl:h-full xl:flex-col">
       <section className="shrink-0 border-b border-border/70 py-4">
-        <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center">
-          <form onSubmit={submitSearch} className="relative min-w-[260px] flex-1">
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
+          <form onSubmit={submitSearch} className="relative min-w-0 flex-1">
             <input
               aria-label="搜索帖子"
               value={searchDraft}
@@ -481,55 +500,59 @@ export function OfficialCommentPatrolTab() {
               <Search className="h-3.5 w-3.5" />
             </button>
           </form>
-          <div className="relative shrink-0">
-            <select
-              aria-label="平台"
-              value={filters.platform}
-              onChange={event => updateFilter('platform', event.target.value)}
-              className="h-9 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
-            >
-              <option value="">全部平台</option>
-              <option value="xiaohongshu">小红书</option>
-              <option value="douyin">抖音</option>
-            </select>
-            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <div className="flex flex-wrap items-center gap-2 lg:flex-nowrap">
+            <div className="relative shrink-0">
+              <select
+                aria-label="平台"
+                value={filters.platform}
+                onChange={event => updateFilter('platform', event.target.value)}
+                className="h-9 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
+              >
+                <option value="">全部平台</option>
+                <option value="xiaohongshu">小红书</option>
+                <option value="douyin">抖音</option>
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            </div>
+            <div className="relative shrink-0">
+              <select
+                aria-label="官方账号"
+                value={filters.officialAccountId}
+                onChange={event => updateFilter('officialAccountId', event.target.value)}
+                className="h-9 min-w-40 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
+              >
+                <option value="">全部官方账号</option>
+                {(data?.accounts || []).map(account => (
+                  <option key={account.id} value={account.id}>
+                    {platformName(account.platform)} · {account.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            </div>
+            <div className="relative shrink-0">
+              <select
+                aria-label="排序"
+                value={filters.sort}
+                onChange={event => updateFilter('sort', event.target.value as PostSort)}
+                className="h-9 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
+              >
+                <option value="published_desc">发帖时间：新到旧</option>
+                <option value="collected_desc">最近采集时间：新到旧</option>
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            </div>
+            <div className="ml-auto flex shrink-0 items-center gap-2 lg:ml-0">
+              <Button
+                size="sm"
+                className="h-9 shrink-0"
+                onClick={() => createTask(filters.officialAccountId)}
+                disabled={!canWrite() && !previewMode}
+              >
+                发起巡查
+              </Button>
+            </div>
           </div>
-          <div className="relative shrink-0">
-            <select
-              aria-label="官方账号"
-              value={filters.officialAccountId}
-              onChange={event => updateFilter('officialAccountId', event.target.value)}
-              className="h-9 min-w-40 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
-            >
-              <option value="">全部官方账号</option>
-              {(data?.accounts || []).map(account => (
-                <option key={account.id} value={account.id}>
-                  {platformName(account.platform)} · {account.name}
-                </option>
-              ))}
-            </select>
-            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          </div>
-          <div className="relative shrink-0">
-            <select
-              aria-label="排序"
-              value={filters.sort}
-              onChange={event => updateFilter('sort', event.target.value as PostSort)}
-              className="h-9 appearance-none rounded-lg border border-input bg-card py-0 pl-3 pr-10 text-[12px] font-medium outline-none focus:ring-2 focus:ring-primary/15"
-            >
-              <option value="published_desc">发帖时间：新到旧</option>
-              <option value="collected_desc">最近采集时间：新到旧</option>
-            </select>
-            <ChevronDown className="pointer-events-none absolute right-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          </div>
-          <Button
-            size="sm"
-            className="h-9 shrink-0"
-            onClick={() => createTask(filters.officialAccountId)}
-            disabled={!canWrite() && !previewMode}
-          >
-            发起巡查
-          </Button>
         </div>
       </section>
 
@@ -551,12 +574,9 @@ export function OfficialCommentPatrolTab() {
               <EmptyState
                 icon={MessageCircle}
                 title="当前筛选下暂无官方帖子"
-                description="调整筛选，或先登记官方账号并发起评论巡查。"
+                description="调整筛选，或发起评论巡查。"
               />
-              <div className="flex justify-center gap-2 border-t border-border/60 p-4">
-                <Button variant="outline" size="sm" onClick={() => setRegistrationOpen(true)}>
-                  登记官方账号
-                </Button>
+              <div className="flex justify-center border-t border-border/60 p-4">
                 <Button size="sm" onClick={() => createTask()}>
                   发起巡查
                 </Button>
@@ -594,13 +614,6 @@ export function OfficialCommentPatrolTab() {
           )}
         </>
       ) : null}
-
-      {registrationOpen && (
-        <OfficialAccountRegistrationDrawer
-          onClose={() => setRegistrationOpen(false)}
-          onRegistered={load}
-        />
-      )}
     </div>
   )
 }
@@ -696,13 +709,8 @@ function PostTableRow({
       )}
     >
       <td className="px-3 py-3">
-        <div className="flex items-start gap-2.5">
-          <span className={cn(
-            'mt-0.5 inline-flex h-5 shrink-0 items-center rounded px-1.5 text-[9px] font-bold',
-            platformBadgeClass(post.platform),
-          )}>
-            {post.platform === 'xiaohongshu' ? '小红书' : '抖音'}
-          </span>
+        <div className="flex items-start gap-2">
+          <PlatformIcon platform={post.platform} />
           <div className="min-w-0">
             <div className="line-clamp-2 text-[12px] font-semibold leading-4.5 text-foreground">
               {post.title}
@@ -754,13 +762,10 @@ function PostMobileCard({
     <article className={cn('px-4 py-4', selected && 'bg-accent/45')}>
       <button type="button" className="w-full text-left" onClick={onSelect}>
         <div className="min-w-0">
-          <span className={cn(
-            'inline-flex h-5 items-center rounded px-1.5 text-[9px] font-bold',
-            platformBadgeClass(post.platform),
-          )}>
-            {platformName(post.platform)}
-          </span>
-          <h4 className="mt-2 line-clamp-2 text-sm font-semibold leading-5">{post.title}</h4>
+          <div className="flex items-start gap-2">
+            <PlatformIcon platform={post.platform} />
+            <h4 className="line-clamp-2 text-sm font-semibold leading-5">{post.title}</h4>
+          </div>
           <p className="mt-1 text-[11px] text-muted-foreground">
             {post.officialAccount.name} · {formatPublish(post.publishedAt, post.publishTime)}
           </p>
@@ -819,7 +824,7 @@ function EngagementMetrics({
     },
   ]
   return (
-    <div className="grid grid-cols-3 gap-2 text-center">
+    <div className="grid grid-cols-3 gap-1.5 text-center">
       {items.map(item => {
         const Icon = item.icon
         return (
@@ -833,13 +838,15 @@ function EngagementMetrics({
                   : `较上次采集${item.delta > 0 ? '增加' : '减少'} ${formatNumber(Math.abs(item.delta))}`
             }`}
           >
-            <div className="flex items-center justify-center gap-1 text-[11px] font-semibold tabular-nums">
+            <div className="flex items-center justify-center gap-1.5 tabular-nums">
               <Icon className="h-3.5 w-3.5 text-muted-foreground" />
-              {formatNumber(item.value)}
-            </div>
-            <div className="mt-0.5 flex items-center justify-center gap-1 whitespace-nowrap text-[9px] text-muted-foreground">
-              <span>{item.label}</span>
+              <span className="text-[12px] font-bold text-foreground">
+                {formatNumber(item.value)}
+              </span>
               <EngagementTrend delta={item.delta} />
+            </div>
+            <div className="mt-1 whitespace-nowrap text-[10px] font-medium text-muted-foreground">
+              {item.label}
             </div>
           </div>
         )
@@ -850,15 +857,22 @@ function EngagementMetrics({
 
 function EngagementTrend({delta}: {delta?: number}) {
   if (delta === undefined) {
-    return <span title="暂无历史采集数据">—</span>
+    return (
+      <span
+        title="暂无历史采集数据"
+        className="inline-flex h-5 items-center rounded bg-muted px-1.5 text-[10px] font-bold text-muted-foreground"
+      >
+        —
+      </span>
+    )
   }
   if (delta === 0) {
     return (
       <span
         title="较上次采集持平"
-        className="inline-flex items-center gap-0.5 tabular-nums"
+        className="inline-flex h-5 items-center gap-0.5 rounded bg-muted px-1.5 text-[10px] font-bold tabular-nums text-muted-foreground"
       >
-        <Minus className="h-2.5 w-2.5" />0
+        <Minus className="h-3 w-3" />0
       </span>
     )
   }
@@ -868,11 +882,13 @@ function EngagementTrend({delta}: {delta?: number}) {
     <span
       title={`较上次采集${rising ? '增加' : '减少'} ${formatNumber(Math.abs(delta))}`}
       className={cn(
-        'inline-flex items-center gap-0.5 font-semibold tabular-nums',
-        rising ? 'text-primary' : 'text-muted-foreground',
+        'inline-flex h-5 items-center gap-0.5 rounded px-1.5 text-[10px] font-bold tabular-nums',
+        rising
+          ? 'bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300'
+          : 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
       )}
     >
-      <Icon className="h-2.5 w-2.5" />
+      <Icon className="h-3 w-3" />
       {formatNumber(Math.abs(delta))}
     </span>
   )
@@ -885,17 +901,26 @@ function SentimentDistribution({sentiment}: {sentiment: Sentiment}) {
   const negativeWidth = (safeNumber(sentiment.negative) / denominator) * 100
   return (
     <div>
-      <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[9px] tabular-nums">
-        <span className="text-emerald-700 dark:text-emerald-300">{formatNumber(sentiment.positive)} 正面</span>
-        <span className="text-muted-foreground">{formatNumber(sentiment.neutral)} 中性</span>
-        <span className="text-status-red">{formatNumber(sentiment.negative)} 负面</span>
+      <div className="flex items-center gap-2.5 whitespace-nowrap text-[11px] font-semibold tabular-nums">
+        <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300">
+          <span className="h-1.5 w-1.5 rounded-full bg-status-green" />
+          {formatNumber(sentiment.positive)} 正面
+        </span>
+        <span className="inline-flex items-center gap-1 text-slate-600 dark:text-slate-300">
+          <span className="h-1.5 w-1.5 rounded-full bg-slate-400 dark:bg-slate-500" />
+          {formatNumber(sentiment.neutral)} 中性
+        </span>
+        <span className="inline-flex items-center gap-1 text-status-red">
+          <span className="h-1.5 w-1.5 rounded-full bg-status-red" />
+          {formatNumber(sentiment.negative)} 负面
+        </span>
       </div>
       <div
-        className="mt-1.5 flex h-1.5 overflow-hidden rounded-full bg-muted"
+        className="mt-2 flex h-2.5 gap-px overflow-hidden rounded-full bg-muted"
         aria-label={`正面 ${sentiment.positive}，中性 ${sentiment.neutral}，负面 ${sentiment.negative}`}
       >
         <span className="bg-status-green" style={{width: `${positiveWidth}%`}} />
-        <span className="bg-status-grey" style={{width: `${neutralWidth}%`}} />
+        <span className="bg-slate-300 dark:bg-slate-600" style={{width: `${neutralWidth}%`}} />
         <span className="bg-status-red" style={{width: `${negativeWidth}%`}} />
       </div>
     </div>

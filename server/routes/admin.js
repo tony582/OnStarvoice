@@ -660,6 +660,14 @@ router.get('/official-accounts', async (req, res, next) => {
   }
 });
 
+router.put('/official-accounts', (req, res) => {
+  return res.status(409).json({
+    ok: false,
+    error: 'official_accounts_extension_managed',
+    message: '官方社媒账号仅可通过 Extension 增删；后台只维护自营内容排除规则。',
+  });
+});
+
 function officialAccountText(value) {
   return String(value ?? '').trim();
 }
@@ -684,51 +692,64 @@ function normalizeOfficialAccountInput(item = {}) {
     aliases: officialAccountAliases(item.aliases),
     hasAliases,
     skipContent: (item.skipContent ?? item.skip_content) !== false,
-    status: ['active', 'disabled'].includes(officialAccountText(item.status))
-      ? officialAccountText(item.status)
-      : 'active',
   };
 }
 
-async function findOfficialAccountForAdminUpdate(tx, tenantId, input) {
+async function findOwnedAccountExclusionForUpdate(tx, tenantId, input) {
   if (
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
       .test(input.id)
   ) {
     const byId = await tx.queryOne(`
-      SELECT *
-      FROM official_accounts
-      WHERE id = $1::uuid AND tenant_id = $2
+      SELECT account.*,
+        EXISTS (
+          SELECT 1
+          FROM monitor_subscriptions subscription
+          WHERE subscription.tenant_id = account.tenant_id
+            AND subscription.official_account_id = account.id
+            AND subscription.subject_type = 'official'
+            AND subscription.status <> 'deleted'
+        ) AS extension_managed
+      FROM official_accounts account
+      WHERE account.id = $1::uuid AND account.tenant_id = $2
       LIMIT 1
       FOR UPDATE
     `, [input.id, tenantId]);
     if (byId) return byId;
   }
   return tx.queryOne(`
-    SELECT *
-    FROM official_accounts
-    WHERE tenant_id = $1
-      AND platform = $2
+    SELECT account.*,
+      EXISTS (
+        SELECT 1
+        FROM monitor_subscriptions subscription
+        WHERE subscription.tenant_id = account.tenant_id
+          AND subscription.official_account_id = account.id
+          AND subscription.subject_type = 'official'
+          AND subscription.status <> 'deleted'
+      ) AS extension_managed
+    FROM official_accounts account
+    WHERE account.tenant_id = $1
+      AND account.platform = $2
       AND (
-        ($3 <> '' AND platform_user_id = $3)
-        OR ($4 <> '' AND account_no = $4)
-        OR ($5 <> '' AND account_id = $5)
-        OR ($6 <> '' AND profile_url = $6)
+        ($3 <> '' AND account.platform_user_id = $3)
+        OR ($4 <> '' AND account.account_no = $4)
+        OR ($5 <> '' AND account.account_id = $5)
+        OR ($6 <> '' AND account.profile_url = $6)
         OR (
           $3 = '' AND $4 = '' AND $5 = '' AND $6 = ''
-          AND $7 <> '' AND account_name = $7
+          AND $7 <> '' AND account.account_name = $7
         )
       )
     ORDER BY
       CASE
-        WHEN $3 <> '' AND platform_user_id = $3 THEN 1
-        WHEN $4 <> '' AND account_no = $4 THEN 2
-        WHEN $5 <> '' AND account_id = $5 THEN 3
-        WHEN $6 <> '' AND profile_url = $6 THEN 4
+        WHEN $3 <> '' AND account.platform_user_id = $3 THEN 1
+        WHEN $4 <> '' AND account.account_no = $4 THEN 2
+        WHEN $5 <> '' AND account.account_id = $5 THEN 3
+        WHEN $6 <> '' AND account.profile_url = $6 THEN 4
         ELSE 5
       END,
-      status = 'deleted',
-      created_at
+      account.status = 'deleted',
+      account.created_at
     LIMIT 1
     FOR UPDATE
   `, [
@@ -742,116 +763,53 @@ async function findOfficialAccountForAdminUpdate(tx, tenantId, input) {
   ]);
 }
 
-function officialAccountMonitorKeyword(account = {}) {
-  return officialAccountText(
-    account.platform_user_id ||
-    account.account_no ||
-    account.account_id ||
-    account.account_name
-  );
-}
-
-async function syncOfficialAccountMonitorSubscription(tx, tenantId, account) {
-  if (!account?.id) return null;
-
-  const profileUrl = officialAccountText(account.profile_url);
-  const accountStatus = officialAccountText(account.status);
-  const targetStatus = accountStatus === 'deleted'
-    ? 'deleted'
-    : accountStatus === 'active'
-      ? 'active'
-      : 'paused';
-  let subscription = await tx.queryOne(`
-    SELECT *
-    FROM monitor_subscriptions
-    WHERE tenant_id = $1
-      AND subject_type = 'official'
-      AND official_account_id = $2
-    ORDER BY status = 'deleted', created_at DESC
-    LIMIT 1
-    FOR UPDATE
-  `, [tenantId, account.id]);
-
-  // Legacy official-account records may already have an unlinked monitor row.
-  // A profile URL is a strong identity; account names are deliberately excluded.
-  if (!subscription && profileUrl) {
-    subscription = await tx.queryOne(`
-      SELECT *
-      FROM monitor_subscriptions
-      WHERE tenant_id = $1
-        AND platform = $2
-        AND subject_type = 'official'
-        AND account_url = $3
-        AND (official_account_id IS NULL OR official_account_id = $4)
-      ORDER BY status = 'deleted', created_at DESC
-      LIMIT 1
-      FOR UPDATE
-    `, [tenantId, account.platform, profileUrl, account.id]);
+router.get('/owned-account-exclusions', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || await getDefaultTenantId();
+    const accounts = await queryAll(`
+      SELECT account.*,
+        EXISTS (
+          SELECT 1
+          FROM monitor_subscriptions subscription
+          WHERE subscription.tenant_id = account.tenant_id
+            AND subscription.official_account_id = account.id
+            AND subscription.subject_type = 'official'
+            AND subscription.status <> 'deleted'
+        ) AS extension_managed
+      FROM official_accounts account
+      WHERE account.tenant_id = $1
+        AND account.status <> 'deleted'
+        AND account.skip_content = true
+      ORDER BY account.platform, account.account_name
+    `, [tenantId]);
+    return res.json({ok: true, accounts, tenantId});
+  } catch (err) {
+    return next(err);
   }
+});
 
-  const keyword = officialAccountMonitorKeyword(account);
-  if (subscription) {
-    return tx.queryOne(`
-      UPDATE monitor_subscriptions
-      SET name = $1,
-        keyword = $2,
-        platform = $3,
-        account_url = CASE WHEN $4 <> '' THEN $4 ELSE account_url END,
-        status = $5,
-        subject_type = 'official',
-        official_account_id = $6,
-        next_run_at = CASE
-          WHEN $5 = 'active' AND status <> 'active' THEN now()
-          ELSE next_run_at
-        END,
-        updated_at = now()
-      WHERE id = $7 AND tenant_id = $8
-      RETURNING *
-    `, [
-      account.account_name,
-      keyword,
-      account.platform,
-      profileUrl,
-      targetStatus,
-      account.id,
-      subscription.id,
-      tenantId,
-    ]);
-  }
-
-  if (targetStatus !== 'active' || !profileUrl || !keyword) return null;
-  return tx.queryOne(`
-    INSERT INTO monitor_subscriptions (
-      tenant_id, name, keyword, platform, account_url, cadence_minutes,
-      status, notify_on_negative, auth_code, next_run_at, subject_type,
-      official_account_id
-    ) VALUES (
-      $1, $2, $3, $4, $5, 1440,
-      'active', true, '', now(), 'official', $6
-    )
-    RETURNING *
-  `, [
-    tenantId,
-    account.account_name,
-    keyword,
-    account.platform,
-    profileUrl,
-    account.id,
-  ]);
-}
-
-router.put('/official-accounts', async (req, res, next) => {
+router.put('/owned-account-exclusions', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
     const accounts = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
-    const savedAccounts = await withTransaction(async tx => {
+    const savedExclusions = await withTransaction(async tx => {
       const keptIds = [];
       for (const item of accounts) {
         const input = normalizeOfficialAccountInput(item);
-        if (!input.platform || !input.accountName) continue;
-        const existing = await findOfficialAccountForAdminUpdate(tx, tenantId, input);
+        if (!input.platform || !input.accountName || !input.skipContent) continue;
+        const existing = await findOwnedAccountExclusionForUpdate(tx, tenantId, input);
         let saved = null;
-        if (existing) {
+        if (existing?.extension_managed) {
+          // Extension owns the account identity and patrol lifecycle. This
+          // surface may only toggle whether its own posts leave content triage.
+          saved = await tx.queryOne(`
+            UPDATE official_accounts
+            SET skip_content = true,
+              updated_at = now()
+            WHERE id = $1 AND tenant_id = $2
+            RETURNING *
+          `, [existing.id, tenantId]);
+        } else if (existing) {
           saved = await tx.queryOne(`
             UPDATE official_accounts
             SET platform = $1,
@@ -861,10 +819,10 @@ router.put('/official-accounts', async (req, res, next) => {
               account_id = CASE WHEN $5 <> '' THEN $5 ELSE account_id END,
               profile_url = CASE WHEN $6 <> '' THEN $6 ELSE profile_url END,
               aliases = CASE WHEN $7 THEN $8::jsonb ELSE aliases END,
-              skip_content = $9,
-              status = $10,
+              skip_content = true,
+              status = 'active',
               updated_at = now()
-            WHERE id = $11 AND tenant_id = $12
+            WHERE id = $9 AND tenant_id = $10
             RETURNING *
           `, [
             input.platform,
@@ -875,8 +833,6 @@ router.put('/official-accounts', async (req, res, next) => {
             input.profileUrl,
             input.hasAliases,
             JSON.stringify(input.aliases),
-            input.skipContent,
-            input.status,
             existing.id,
             tenantId,
           ]);
@@ -886,7 +842,7 @@ router.put('/official-accounts', async (req, res, next) => {
               tenant_id, platform, account_name, platform_user_id, account_no,
               account_id, profile_url, aliases, skip_content, status
             ) VALUES (
-              $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10
+              $1, $2, $3, $4, $5, $6, $7, $8::jsonb, true, 'active'
             )
             RETURNING *
           `, [
@@ -898,45 +854,56 @@ router.put('/official-accounts', async (req, res, next) => {
             input.legacyAccountId,
             input.profileUrl,
             JSON.stringify(input.aliases),
-            input.skipContent,
-            input.status,
           ]);
         }
         if (saved?.id) {
           keptIds.push(saved.id);
-          await syncOfficialAccountMonitorSubscription(tx, tenantId, saved);
         }
       }
-      if (keptIds.length > 0) {
-        await tx.execute(`
-          UPDATE official_accounts
-          SET status = 'deleted', updated_at = now()
-          WHERE tenant_id = $1
-            AND NOT (id = ANY($2::uuid[]))
-            AND status <> 'deleted'
-        `, [tenantId, keptIds]);
-      } else {
-        await tx.execute(`
-          UPDATE official_accounts
-          SET status = 'deleted', updated_at = now()
-          WHERE tenant_id = $1 AND status <> 'deleted'
-        `, [tenantId]);
-      }
+
+      // Removing an Extension-managed account only disables its triage
+      // exclusion. It must never delete the account or pause its patrol.
       await tx.execute(`
-        UPDATE monitor_subscriptions AS subscription
+        UPDATE official_accounts account
+        SET skip_content = false,
+          updated_at = now()
+        WHERE account.tenant_id = $1
+          AND account.status <> 'deleted'
+          AND account.skip_content = true
+          AND NOT (account.id = ANY($2::uuid[]))
+          AND EXISTS (
+            SELECT 1
+            FROM monitor_subscriptions subscription
+            WHERE subscription.tenant_id = account.tenant_id
+              AND subscription.official_account_id = account.id
+              AND subscription.subject_type = 'official'
+              AND subscription.status <> 'deleted'
+          )
+      `, [tenantId, keptIds]);
+
+      // Name-only legacy rules have no patrol lifecycle to preserve, so
+      // removing them simply retires the rule row.
+      await tx.execute(`
+        UPDATE official_accounts account
         SET status = 'deleted',
           updated_at = now()
-        FROM official_accounts AS account
-        WHERE account.id = subscription.official_account_id
-          AND account.tenant_id = $1
-          AND subscription.tenant_id = $1
-          AND subscription.subject_type = 'official'
-          AND account.status = 'deleted'
-          AND subscription.status <> 'deleted'
-      `, [tenantId]);
+        WHERE account.tenant_id = $1
+          AND account.status <> 'deleted'
+          AND account.skip_content = true
+          AND NOT (account.id = ANY($2::uuid[]))
+          AND NOT EXISTS (
+            SELECT 1
+            FROM monitor_subscriptions subscription
+            WHERE subscription.tenant_id = account.tenant_id
+              AND subscription.official_account_id = account.id
+              AND subscription.subject_type = 'official'
+              AND subscription.status <> 'deleted'
+          )
+      `, [tenantId, keptIds]);
+
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
-        VALUES ($1, 'user', $2, $3, 'official_accounts.updated', 'tenant', $4, $5::jsonb)
+        VALUES ($1, 'user', $2, $3, 'owned_account_exclusions.updated', 'tenant', $4, $5::jsonb)
       `, [
         tenantId,
         req.user?.id || '',
@@ -946,14 +913,14 @@ router.put('/official-accounts', async (req, res, next) => {
       ]);
       return keptIds;
     });
-    return res.json({ ok: true, count: savedAccounts.length });
+    return res.json({ok: true, count: savedExclusions.length});
   } catch (err) {
     return next(err);
   }
 });
 
 // 回溯重标:官方发文只接受强身份匹配；官方评论仅兼容双方均无强身份的旧名称数据。
-router.post('/official-accounts/reclassify', async (req, res, next) => {
+router.post(['/owned-account-exclusions/reclassify', '/official-accounts/reclassify'], async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
     const commentAuthorMatchSql = (rowAlias, officialAlias = 'oa') => `(

@@ -35,7 +35,7 @@ import { BenchmarksPage } from '@/pages/BenchmarksPage'
 import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentHomePage } from '@/pages/ContentHomePage'
 import { HitsPage } from '@/pages/HitsPage'
-import { OfficialAccountsPage } from '@/pages/OfficialAccountsPage'
+import { OwnedAccountExclusionsPage } from '@/pages/OwnedAccountExclusionsPage'
 import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 
@@ -59,8 +59,8 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   keywords: KeywordsPage,
   'content-home': ContentHomePage,
   hits: HitsPage,
-  'official-accounts': OfficialAccountsPage,
   'official-comments': OfficialCommentPatrolTab,
+  'owned-account-exclusions': OwnedAccountExclusionsPage,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,
@@ -72,7 +72,8 @@ const PAGE_TITLES: Record<string, string> = {
   monitoring: '关注博主', dispatch: '调度中心', 'social-accounts': '社交账号', insights: '舆情洞察', 'opinion-analysis': '舆情剖析', data: '数据与导出', events: '事件中心',
   tracks: '赛道机会', benchmarks: '对标账号', keywords: '选题与扩词',
   'content-home': '内容总览', hits: '爆款拆解', review: '内容复盘',
-  'official-accounts': '官方账号管理', 'official-comments': '评论巡查',
+  'official-comments': '官方社媒',
+  'owned-account-exclusions': '自营内容排除',
   tenants: '租户管理', users: '用户账号',
   'auth-codes': '激活码', settings: '系统设置',
 }
@@ -501,21 +502,19 @@ interface DirectoryItem {
 }
 
 const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
-  { label: '官方社媒', items: [
-    { title: '评论巡查', subtitle: '帖子趋势、评论情绪与运营建议', icon: MessageCircle, page: 'official-comments' },
-    { title: '官方账号管理', subtitle: '账号、别名、ID 与排除规则', icon: ShieldCheck, page: 'official-accounts', internal: true },
-  ] },
   { label: '数据与导出', items: [
     { title: '数据底座', subtitle: '六类数据集、筛选、详情与下载', icon: Database, page: 'data' },
     { title: '报告中心', subtitle: '生成、预览、发送与历史记录', icon: FileText, page: 'insights', params: { tab: 'reports' } },
   ] },
   { label: '业务能力', items: [
+    { title: '官方社媒', subtitle: '帖子趋势、评论情绪与运营建议', icon: MessageCircle, page: 'official-comments' },
     { title: '客服工单', subtitle: '处理、打回、归档与回执', icon: Headphones, page: 'opinion' },
     { title: '销售客资', subtitle: '购买意向跟进与处理', icon: User, page: 'salesleads' },
     { title: '社交账号', subtitle: '登录账号、Agent 绑定与每日负载', icon: Users, page: 'social-accounts' },
     { title: '事件中心', subtitle: '严重度、状态与关联内容时间线', icon: Bell, page: 'events' },
   ] },
   { label: '平台管理', items: [
+    { title: '自营内容排除', subtitle: '避免自营发文进入内容分诊', icon: ShieldCheck, page: 'owned-account-exclusions', internal: true },
     { title: '租户管理', subtitle: '客户空间和状态', icon: Building2, page: 'tenants', admin: true },
     { title: '用户账号', subtitle: '角色、状态和密码', icon: Users, page: 'users', admin: true },
     { title: '激活码', subtitle: '生成和管理授权', icon: KeyRound, page: 'auth-codes', admin: true },
@@ -625,7 +624,7 @@ function rootForPage(page: string, params: Record<string, string>): RootTab {
   if (page === 'monitoring' || page === 'dispatch' || page === 'social-accounts' || page === 'events') return 'monitor'
   if (['insights', 'opinion-analysis', 'content-home', 'tracks', 'hits', 'benchmarks', 'keywords', 'review'].includes(page)) return 'insights'
   if (page === 'overview') return 'today'
-  if (page === 'official-accounts' || page === 'official-comments') return 'more'
+  if (page === 'official-comments' || page === 'owned-account-exclusions') return 'more'
   if (params.queue) return 'tasks'
   return 'more'
 }

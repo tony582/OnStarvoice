@@ -1296,19 +1296,29 @@ router.get(
         SELECT account.id, account.platform, account.account_name,
           account.platform_user_id, account.account_no, account.account_id,
           account.profile_url, account.aliases, account.status,
-          subscription.id AS monitor_subscription_id
+          subscription.id AS monitor_subscription_id,
+          subscription.status AS subscription_status,
+          subscription.last_run_at AS subscription_last_run_at,
+          subscription.next_run_at AS subscription_next_run_at,
+          subscription.assigned_agent_id,
+          subscription.assigned_agent_name
         FROM official_accounts account
-        LEFT JOIN LATERAL (
-          SELECT id
-          FROM monitor_subscriptions
-          WHERE tenant_id = account.tenant_id
-            AND official_account_id = account.id
-            AND subject_type = 'official'
-            AND status <> 'deleted'
+        JOIN LATERAL (
+          SELECT monitor.id, monitor.status, monitor.last_run_at,
+            monitor.next_run_at, monitor.assigned_agent_id,
+            COALESCE(agent.display_name, agent.client_label, '') AS assigned_agent_name
+          FROM monitor_subscriptions monitor
+          LEFT JOIN capture_agents agent
+            ON agent.id = monitor.assigned_agent_id
+            AND agent.tenant_id = monitor.tenant_id
+          WHERE monitor.tenant_id = account.tenant_id
+            AND monitor.official_account_id = account.id
+            AND monitor.subject_type = 'official'
+            AND monitor.status <> 'deleted'
           ORDER BY
-            CASE WHEN status = 'active' THEN 0 ELSE 1 END,
-            updated_at DESC,
-            id
+            CASE WHEN monitor.status = 'active' THEN 0 ELSE 1 END,
+            monitor.updated_at DESC,
+            monitor.id
           LIMIT 1
         ) subscription ON TRUE
         WHERE account.tenant_id = $1 AND account.status = 'active'
@@ -1349,6 +1359,11 @@ router.get(
           platformUserId: account.platform_user_id,
           accountNo: account.account_no,
           profileUrl: account.profile_url,
+          subscriptionStatus: account.subscription_status,
+          assignedAgentId: account.assigned_agent_id || null,
+          assignedAgentName: account.assigned_agent_name || '',
+          lastCollectedAt: isoOrNull(account.subscription_last_run_at),
+          nextScheduledAt: isoOrNull(account.subscription_next_run_at),
           recentPosts,
           recentPostCount: loaded.total,
           lastPatrolledAt: latestPatrolPost?.lastPatrolledAt || null,

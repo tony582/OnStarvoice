@@ -504,7 +504,7 @@ async function renderAuthCodes() {
 async function renderSettings() {
   const [data, officialData] = await Promise.all([
     api('/admin/settings'),
-    api('/admin/official-accounts'),
+    api('/admin/owned-account-exclusions'),
   ]);
   const s = data.settings || {};
   content().innerHTML = `
@@ -513,7 +513,7 @@ async function renderSettings() {
       ${panel('品牌相关性', renderBrandSettingsForm(s))}
       ${panel('报告时间', `<div class="form-grid"><label>日报时间<input id="report_daily_time" value="${escAttr(s.report_daily_time || '09:00')}"></label><label>周报时间<input id="report_weekly_time" value="${escAttr(s.report_weekly_time || '09:00')}"></label><label>月报日期<input id="report_monthly_day" value="${escAttr(s.report_monthly_day || '1')}"></label><label>月报时间<input id="report_monthly_time" value="${escAttr(s.report_monthly_time || '09:00')}"></label></div><div class="toolbar"><div></div><button class="primary" onclick="saveSettings('report')">保存</button></div>`)}
       ${panel('邮件发送', renderEmailSettingsForm(s))}
-      ${panel('官方账号识别', renderOfficialAccountsForm(officialData.accounts || []))}
+      ${panel('自营内容排除', renderOfficialAccountsForm(officialData.accounts || []))}
     </div>
   `;
 }
@@ -1021,7 +1021,7 @@ function renderOfficialAccountsForm(accounts) {
     </div>
     <div class="toolbar">
       <div class="subtext">官方账号发布的内容默认不进入待处理队列；普通用户内容下的官方回复会被记录为处置进展。</div>
-      <button class="primary" onclick="saveOfficialAccounts()">保存官方账号</button>
+      <button class="primary" onclick="saveOfficialAccounts()">保存排除规则</button>
     </div>
   `;
 }
@@ -1051,8 +1051,8 @@ async function saveOfficialAccounts() {
       skipContent: true,
     };
   }).filter(account => account.platform && account.accountName);
-  await api('/admin/official-accounts', { method: 'PUT', body: { accounts } });
-  toast('官方账号配置已保存', 'success');
+  await api('/admin/owned-account-exclusions', { method: 'PUT', body: { accounts } });
+  toast('自营内容排除规则已保存', 'success');
 }
 
 function renderPendingRecords(records) {
