@@ -94,7 +94,7 @@ test("Douyin detail capture and final persistence both require the expected work
   );
   assert.match(
     source,
-    /activeStage = 'commit_guard'[\s\S]*?resolveVerifiedDouyinDetailNoteId\([\s\S]*?expectedDouyinNoteId[\s\S]*?probeDetailPreloadSafety\(/u,
+    /activeStage = 'commit_guard'[\s\S]*?resolveVerifiedDouyinDetailNoteId\([\s\S]*?expectedDouyinNoteId[\s\S]*?probeDouyinTargetRouteSafety\([\s\S]*?verifiedNoteId: expectedDouyinNoteId,[\s\S]*?requireVerifiedNoteId: true/u,
   );
   const commitGuardIndex = source.indexOf("activeStage = 'commit_guard'");
   const finalWriteIndex = source.indexOf("await updateRecord(recordId", commitGuardIndex);
@@ -239,7 +239,7 @@ test("comment-only retry restores detail done only after a complete result", () 
   assert.match(persistenceBlock, /detailPayload:\s*nextDetailPayload/u);
 });
 
-test("Douyin commit guard treats either probe result or error URL mismatch as an identity failure", () => {
+test("Douyin commit guard rejects either an active-work conflict or a real route mismatch", () => {
   const batchBlock = sourceBlock(
     "export async function batchCaptureDetailsForRecords",
     "export async function syncRecord",
@@ -269,6 +269,7 @@ test("Douyin commit guard treats either probe result or error URL mismatch as an
   assert.match(
     commitBlock,
     /error\?\.activeWorkIdentityConflict === true \|\|\s*\(observedCurrentNoteId &&\s*observedCurrentNoteId !== expectedDouyinNoteId\)/u,
+    "an exact URL must not hide a real active-work conflict or route mismatch",
   );
   assert.match(
     compactCommitBlock,

@@ -447,7 +447,7 @@ test("Douyin comment recovery prefers an identity-bound direct route", async () 
   assert.ok(candidates.includes(modalUrl));
 });
 
-test("Douyin comment readiness cannot pass from API cache without visible detail DOM", () => {
+test("Douyin comment readiness trusts a verified direct route but keeps search modals visible-bound", () => {
   assert.match(
     captureSyncSource,
     /\(!requireVisibleRoot && apiDetailReady\) \|\|/u,
@@ -461,8 +461,50 @@ test("Douyin comment readiness cannot pass from API cache without visible detail
   );
   const helperBlock = captureSyncSource.slice(helperStart, helperEnd);
   assert.ok(helperStart >= 0);
-  assert.match(helperBlock, /requireVisibleDetailRoot: true/u);
+  assert.match(helperBlock, /probeDouyinTargetRouteSafety\(tabId/u);
+  assert.match(
+    helperBlock,
+    /verifiedNoteId,[\s\S]*?requireVerifiedNoteId: true/u,
+    "comment preflight and recovery must require the already verified detail payload ID",
+  );
   assert.match(helperBlock, /buildDouyinCommentRecoveryCandidates/u);
+
+  const routeProbeStart = captureSyncSource.indexOf(
+    "async function probeDouyinTargetRouteSafety",
+  );
+  const routeProbeEnd = captureSyncSource.indexOf(
+    "async function probeDouyinNavigationEntry",
+    routeProbeStart,
+  );
+  const routeProbeBlock = captureSyncSource.slice(
+    routeProbeStart,
+    routeProbeEnd,
+  );
+  assert.ok(routeProbeStart >= 0);
+  assert.match(
+    routeProbeBlock,
+    /const currentUrl = String\(snapshot\?\.currentUrl \|\| ''\)/u,
+    "route classification must use the actual tab URL",
+  );
+  assert.match(
+    routeProbeBlock,
+    /isDouyinDirectDetailEntryUrl\(currentUrl\)/u,
+  );
+  assert.match(
+    routeProbeBlock,
+    /if \(snapshot\?\.activeWorkIdentityConflict === true\) \{[\s\S]*?buildDouyinTargetRouteNotReadyError/u,
+    "a verified payload removes only the visible-DOM gate, not a real active-work conflict",
+  );
+  assert.match(
+    routeProbeBlock,
+    /snapshot\?\.immediateUnavailable === true \|\|\s*\(requireVerifiedNoteId && snapshot\?\.unavailable === true\)/u,
+    "a verified direct route must still fail closed on an unavailable work",
+  );
+  assert.match(
+    routeProbeBlock,
+    /snapshot\?\.isSearchModalContext === true[\s\S]*?probeDetailPreloadSafety\(tabId,[\s\S]*?waitForDouyinReady: true,[\s\S]*?requireVisibleDetailRoot: true/u,
+    "search modal readiness must remain bound to visible target detail DOM",
+  );
 
   const probeStart = captureSyncSource.indexOf(
     "async function probeDetailPreloadSafety",
@@ -537,23 +579,51 @@ test("Douyin extractor failure continues only from the next verified entry", () 
   );
 });
 
-test("Douyin direct entry defers hidden-page hydration but keeps search modal readiness strict", () => {
-  const helperStart = captureSyncSource.indexOf(
+test("Douyin initial direct entry remains conflict-strict until the payload ID is verified", () => {
+  const routeProbeStart = captureSyncSource.indexOf(
+    "async function probeDouyinTargetRouteSafety",
+  );
+  const navigationProbeStart = captureSyncSource.indexOf(
     "async function probeDouyinNavigationEntry",
+    routeProbeStart,
   );
-  const helperEnd = captureSyncSource.indexOf(
+  const navigationProbeEnd = captureSyncSource.indexOf(
     "async function ensureDouyinCommentTargetReadyInTab",
-    helperStart,
+    navigationProbeStart,
   );
-  const helperBlock = captureSyncSource.slice(helperStart, helperEnd);
+  const routeProbeBlock = captureSyncSource.slice(
+    routeProbeStart,
+    navigationProbeStart,
+  );
+  const navigationProbeBlock = captureSyncSource.slice(
+    navigationProbeStart,
+    navigationProbeEnd,
+  );
 
-  assert.ok(helperStart >= 0);
-  assert.match(helperBlock, /waitForDouyinReady: !isDirectEntry/u);
-  assert.match(helperBlock, /requireVisibleDetailRoot: !isDirectEntry/u);
-  assert.match(helperBlock, /result\?\.targetMatched !== true/u);
-  assert.match(helperBlock, /result\?\.activeWorkIdentityConflict === true/u);
-  assert.match(helperBlock, /result\?\.immediateUnavailable === true/u);
-  assert.match(helperBlock, /hydrationDeferred: result\?\.detailReady !== true/u);
+  assert.ok(routeProbeStart >= 0);
+  assert.ok(navigationProbeStart > routeProbeStart);
+  assert.match(
+    navigationProbeBlock,
+    /probeDouyinTargetRouteSafety\(tabId,[\s\S]*?targetUrl,[\s\S]*?shouldStop,[\s\S]*?timeoutMs/u,
+  );
+  assert.doesNotMatch(
+    navigationProbeBlock,
+    /verifiedNoteId/u,
+    "initial navigation must not claim a payload identity that has not been captured",
+  );
+  assert.match(
+    routeProbeBlock,
+    /if \(snapshot\?\.activeWorkIdentityConflict === true\)/u,
+  );
+  assert.match(
+    routeProbeBlock,
+    /directRouteNoteId !== expectedNoteId \|\|[\s\S]*?currentNoteId && currentNoteId !== expectedNoteId/u,
+    "a real direct-route mismatch must remain fail closed",
+  );
+  assert.match(
+    routeProbeBlock,
+    /hydrationDeferred: snapshot\?\.detailReady !== true/u,
+  );
 });
 
 test("single-note Douyin profile lookup always restores a canonical work route", () => {

@@ -5131,6 +5131,7 @@ export async function batchCaptureDetailsForRecords(
                   tabId: runnerContext.runnerTabId,
                   record,
                   targetUrl: noteUrl,
+                  verifiedNoteId: verifiedCommentNoteId,
                   sourcePageUrl:
                     douyinSearchModalUrlByRecordId.get(String(recordId)) ||
                     '',
@@ -5311,12 +5312,12 @@ export async function batchCaptureDetailsForRecords(
             );
           }
           try {
-            const finalReady = await probeDetailPreloadSafety(
+            const finalReady = await probeDouyinTargetRouteSafety(
               runnerContext.runnerTabId,
               {
                 targetUrl: noteUrl,
-                waitForDouyinReady: true,
-                requireVisibleDetailRoot: true,
+                verifiedNoteId: expectedDouyinNoteId,
+                requireVerifiedNoteId: true,
                 shouldStop: shouldStopDetailBatch,
                 timeoutMs: DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS,
               },
@@ -5341,6 +5342,7 @@ export async function batchCaptureDetailsForRecords(
                 recordId: String(recordId || ''),
                 expectedNoteId: String(expectedDouyinNoteId || ''),
                 currentNoteId: String(finalReady?.currentNoteId || ''),
+                routeKind: String(finalReady?.routeKind || ''),
                 visibleDetailBound:
                   finalReady?.hasBoundDetailRoot === true,
               },
@@ -12665,6 +12667,8 @@ async function probeDetailPreloadSafety(
           error.conflictingNoteIds = result.conflictingActiveWorkIds || [];
           error.activeWorkIdentityConflict =
             result.activeWorkIdentityConflict === true;
+          error.isSearchModalContext =
+            result.isSearchModalContext === true;
           throw error;
         }
       } else {
@@ -12678,6 +12682,8 @@ async function probeDetailPreloadSafety(
         error.conflictingNoteIds = result.conflictingActiveWorkIds || [];
         error.activeWorkIdentityConflict =
           result.activeWorkIdentityConflict === true;
+        error.isSearchModalContext =
+          result.isSearchModalContext === true;
         throw error;
       }
       await waitMs(250);
@@ -12720,6 +12726,146 @@ function isDouyinDirectDetailEntryUrl(url = '') {
   }
 }
 
+function buildDouyinTargetRouteNotReadyError(
+  result = {},
+  message = '抖音目标作品页面尚未稳定',
+) {
+  const error = new Error(message);
+  error.code = 'DOUYIN_DETAIL_NOT_READY';
+  error.currentUrl = String(result?.currentUrl || '');
+  error.currentNoteId = String(result?.currentNoteId || '');
+  error.conflictingNoteIds = Array.isArray(
+    result?.conflictingActiveWorkIds,
+  )
+    ? result.conflictingActiveWorkIds
+    : [];
+  error.activeWorkIdentityConflict =
+    result?.activeWorkIdentityConflict === true;
+  error.isSearchModalContext = result?.isSearchModalContext === true;
+  return error;
+}
+
+async function probeDouyinTargetRouteSafety(
+  tabId,
+  {
+    targetUrl = '',
+    verifiedNoteId = '',
+    requireVerifiedNoteId = false,
+    shouldStop = null,
+    timeoutMs = 8000,
+  } = {},
+) {
+  const expectedNoteId = extractNoteId(targetUrl);
+  const normalizedVerifiedNoteId = extractDouyinDetailGuardItemId(
+    verifiedNoteId,
+  );
+  if (!expectedNoteId) {
+    throw buildDouyinTargetRouteNotReadyError(
+      {},
+      '抖音目标作品 ID 缺失',
+    );
+  }
+  if (
+    requireVerifiedNoteId &&
+    normalizedVerifiedNoteId !== expectedNoteId
+  ) {
+    throw buildDouyinTargetRouteNotReadyError(
+      {},
+      '抖音正文作品 ID 尚未完成验证',
+    );
+  }
+
+  const snapshot = await probeDetailPreloadSafety(tabId, {
+    targetUrl,
+    // 直达作品页的路径本身已绑定作品 ID。这里只读取一次安全态、当前
+    // 路径和活动作品冲突，不再重复要求可见 DOM 组合信号。搜索弹层
+    // 没有独立路径身份，仍在下方走严格可见校验。
+    waitForDouyinReady: false,
+    requireVisibleDetailRoot: false,
+    shouldStop,
+    timeoutMs,
+  });
+  if (snapshot?.skipped === true) {
+    throw buildDouyinTargetRouteNotReadyError(
+      snapshot,
+      '当前浏览器无法确认抖音目标作品页面',
+    );
+  }
+  if (
+    snapshot?.immediateUnavailable === true ||
+    (requireVerifiedNoteId && snapshot?.unavailable === true)
+  ) {
+    const error = new Error('抖音提示目标帖子已删除或不存在');
+    error.code = 'DOUYIN_CONTENT_UNAVAILABLE';
+    error.currentUrl = String(snapshot?.currentUrl || '');
+    throw error;
+  }
+
+  const currentUrl = String(snapshot?.currentUrl || '');
+  const currentNoteId = extractDouyinDetailGuardItemId(
+    snapshot?.currentNoteId,
+  );
+  if (isDouyinDirectDetailEntryUrl(currentUrl)) {
+    const directRouteNoteId = extractNoteId(currentUrl);
+    if (
+      directRouteNoteId !== expectedNoteId ||
+      (currentNoteId && currentNoteId !== expectedNoteId) ||
+      snapshot?.targetMatched !== true
+    ) {
+      throw buildDouyinTargetRouteNotReadyError(
+        snapshot,
+        '抖音直达页作品 ID 与目标不一致',
+      );
+    }
+    // URL 与正文 ID 一致仍不能覆盖真实活动作品冲突。这里仅移除可见
+    // DOM 水合门槛；若页面明确显示另一个活动作品，所有阶段继续 fail closed。
+    if (snapshot?.activeWorkIdentityConflict === true) {
+      throw buildDouyinTargetRouteNotReadyError(
+        snapshot,
+        '抖音直达页作品身份尚未稳定',
+      );
+    }
+    return {
+      ...snapshot,
+      currentNoteId: expectedNoteId,
+      routeKind: 'direct',
+      directRouteAccepted: true,
+      hydrationDeferred: snapshot?.detailReady !== true,
+    };
+  }
+
+  if (
+    snapshot?.isSearchModalContext === true &&
+    currentNoteId === expectedNoteId
+  ) {
+    const ready = await probeDetailPreloadSafety(tabId, {
+      targetUrl,
+      waitForDouyinReady: true,
+      requireVisibleDetailRoot: true,
+      shouldStop,
+      timeoutMs,
+    });
+    const readyNoteId = extractDouyinDetailGuardItemId(
+      ready?.currentNoteId,
+    );
+    if (readyNoteId !== expectedNoteId) {
+      throw buildDouyinTargetRouteNotReadyError(
+        ready,
+        '抖音搜索弹层作品 ID 与目标不一致',
+      );
+    }
+    return {
+      ...ready,
+      currentNoteId: expectedNoteId,
+      routeKind: 'search_modal',
+      directRouteAccepted: false,
+      hydrationDeferred: false,
+    };
+  }
+
+  throw buildDouyinTargetRouteNotReadyError(snapshot);
+}
+
 async function probeDouyinNavigationEntry(
   tabId,
   {
@@ -12728,69 +12874,28 @@ async function probeDouyinNavigationEntry(
     timeoutMs = 8000,
   } = {},
 ) {
-  const isDirectEntry = isDouyinDirectDetailEntryUrl(targetUrl);
-  const result = await probeDetailPreloadSafety(tabId, {
+  return await probeDouyinTargetRouteSafety(tabId, {
     targetUrl,
-    // Edge 后台工作页会把 document.visibilityState 报为 hidden，导致可见
-    // DOM 就绪信号恒为 false。直达页的作品 ID 已由导航轮询稳定确认，
-    // 此处只做一次风控、失效态和错帖检查，把页面水合等待交给正文采集器。
-    // 搜索弹层没有独立路径身份，仍必须等到绑定目标 ID 的可见详情根节点。
-    waitForDouyinReady: !isDirectEntry,
-    requireVisibleDetailRoot: !isDirectEntry,
     shouldStop,
     timeoutMs,
   });
-
-  if (!isDirectEntry) {
-    return {
-      ...result,
-      directRouteAccepted: false,
-      hydrationDeferred: false,
-    };
-  }
-
-  if (
-    result?.targetMatched !== true ||
-    result?.activeWorkIdentityConflict === true
-  ) {
-    const error = new Error('抖音直达页作品身份尚未稳定');
-    error.code = 'DOUYIN_DETAIL_NOT_READY';
-    error.currentUrl = result?.currentUrl || '';
-    error.currentNoteId = result?.currentNoteId || '';
-    error.conflictingNoteIds = result?.conflictingActiveWorkIds || [];
-    error.activeWorkIdentityConflict =
-      result?.activeWorkIdentityConflict === true;
-    throw error;
-  }
-
-  if (result?.immediateUnavailable === true) {
-    const error = new Error('抖音提示目标帖子已删除或不存在');
-    error.code = 'DOUYIN_CONTENT_UNAVAILABLE';
-    error.currentUrl = result?.currentUrl || '';
-    throw error;
-  }
-
-  return {
-    ...result,
-    directRouteAccepted: true,
-    hydrationDeferred: result?.detailReady !== true,
-  };
 }
 
 async function ensureDouyinCommentTargetReadyInTab({
   tabId,
   record,
   targetUrl,
+  verifiedNoteId = '',
   sourcePageUrl = '',
   shouldStop = null,
   navigateCandidate = null,
   onRecovery = null,
 } = {}) {
   try {
-    const current = await probeDetailPreloadSafety(tabId, {
+    const current = await probeDouyinTargetRouteSafety(tabId, {
       targetUrl,
-      waitForDouyinReady: true,
-      requireVisibleDetailRoot: true,
+      verifiedNoteId,
+      requireVerifiedNoteId: true,
       shouldStop,
       timeoutMs: DOUYIN_COMMENT_READY_PROBE_TIMEOUT_MS,
     });
@@ -12821,10 +12926,10 @@ async function ensureDouyinCommentTargetReadyInTab({
           shouldStop,
           active: true,
         });
-        return await probeDetailPreloadSafety(tabId, {
+        return await probeDouyinTargetRouteSafety(tabId, {
           targetUrl: candidateUrl,
-          waitForDouyinReady: true,
-          requireVisibleDetailRoot: true,
+          verifiedNoteId,
+          requireVerifiedNoteId: true,
           shouldStop,
           timeoutMs: DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS,
         });
