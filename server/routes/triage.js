@@ -176,6 +176,59 @@ function orderBySql(sort, dir) {
   return riskOrderSql();
 }
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const COMBINED_DATE_FILTERS = [
+  { from: 'publishFrom', to: 'publishTo', column: 'r.published_ts' },
+  { from: 'recentFrom', to: 'recentTo', column: 'r.last_seen_at' },
+  { from: 'firstFrom', to: 'firstTo', column: 'r.first_seen_at' },
+];
+
+function validDateQueryValue(value) {
+  const normalized = String(value || '');
+  return DATE_ONLY_RE.test(normalized) ? normalized : '';
+}
+
+function appendDateBounds(where, params, query, { from, to, column }) {
+  const dateFrom = validDateQueryValue(query[from]);
+  const dateTo = validDateQueryValue(query[to]);
+  if (dateFrom) {
+    params.push(dateFrom);
+    where += ` AND ${column} >= $${params.length}::date`;
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    where += ` AND ${column} < ($${params.length}::date + INTERVAL '1 day')`;
+  }
+  return where;
+}
+
+// 发布时间、最近采集、首次采集可分别设置区间；多个已设置区间按 AND 组合。
+// dateFrom/dateTo/dateBasis 是旧客户端参数，只有未携带新组合参数时才使用。
+export function appendTriageDateFilters(where, params, query = {}) {
+  const hasCombinedParams = COMBINED_DATE_FILTERS.some(({ from, to }) => (
+    Object.prototype.hasOwnProperty.call(query, from)
+    || Object.prototype.hasOwnProperty.call(query, to)
+  ));
+  if (hasCombinedParams) {
+    return COMBINED_DATE_FILTERS.reduce(
+      (nextWhere, definition) => appendDateBounds(nextWhere, params, query, definition),
+      where,
+    );
+  }
+
+  const basis = String(query.dateBasis || 'publish');
+  const column = basis === 'first'
+    ? 'r.first_seen_at'
+    : basis === 'recent'
+      ? 'r.last_seen_at'
+      : 'r.published_ts';
+  return appendDateBounds(where, params, query, {
+    from: 'dateFrom',
+    to: 'dateTo',
+    column,
+  });
+}
+
 // 风险信号多选筛选(有预警 / 有负评),命中任一即入选(OR)。条件为字面 SQL,不绑定参数。
 // 注:作者身份(原"疑似KOE")已从风险信号拆出,改为独立的「疑似身份」维度(见 identityWhereClause)。
 function riskWhereClause(reqRisk) {
@@ -264,14 +317,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     }
     where = appendCustomTagFilter(where, params, customTagFilter, 'r');
     where += identityWhereClause(req.query.identity);
-    // 按采集时间(首次发现)区间导出/筛选,避免 Excel 越积越大;仅接受 YYYY-MM-DD
-    const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || '')) ? req.query.dateFrom : '';
-    const dTo = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateTo || '')) ? req.query.dateTo : '';
-    // 日期维度可切换:发布时间(published_ts,默认)/ 最近采集(last_seen_at)/ 首次采集(first_seen_at)。列名白名单,无注入
-    const dbasis = String(req.query.dateBasis || 'publish');
-    const dateCol = dbasis === 'first' ? 'r.first_seen_at' : dbasis === 'recent' ? 'r.last_seen_at' : 'r.published_ts';
-    if (dFrom) { params.push(dFrom); where += ` AND ${dateCol} >= $${params.length}::date`; }
-    if (dTo) { params.push(dTo); where += ` AND ${dateCol} < ($${params.length}::date + INTERVAL '1 day')`; }
+    where = appendTriageDateFilters(where, params, req.query);
 
     const total = (await queryOne(`
       SELECT COUNT(*) AS total
@@ -743,14 +789,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     }
     where = appendCustomTagFilter(where, params, customTagFilter, 'r');
     where += identityWhereClause(req.query.identity);
-    // 按采集时间(首次发现)区间导出/筛选,避免 Excel 越积越大;仅接受 YYYY-MM-DD
-    const dFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || '')) ? req.query.dateFrom : '';
-    const dTo = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateTo || '')) ? req.query.dateTo : '';
-    // 日期维度可切换:发布时间(published_ts,默认)/ 最近采集(last_seen_at)/ 首次采集(first_seen_at)。列名白名单,无注入
-    const dbasis = String(req.query.dateBasis || 'publish');
-    const dateCol = dbasis === 'first' ? 'r.first_seen_at' : dbasis === 'recent' ? 'r.last_seen_at' : 'r.published_ts';
-    if (dFrom) { params.push(dFrom); where += ` AND ${dateCol} >= $${params.length}::date`; }
-    if (dTo) { params.push(dTo); where += ` AND ${dateCol} < ($${params.length}::date + INTERVAL '1 day')`; }
+    where = appendTriageDateFilters(where, params, req.query);
 
     const records = await queryAll(`
       SELECT

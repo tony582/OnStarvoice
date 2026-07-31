@@ -15,7 +15,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer, getCover, type ManualRecordFields } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
-import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
+import { CombinedDateRangeFilter, type CombinedDateRanges } from '@/components/shared/DateRangeFilter'
 import { MultiSelect } from '@/components/shared/MultiSelect'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
@@ -53,6 +53,11 @@ const ARCHIVE_VIEWS: Array<{ value: ArchiveView; label: string; icon: React.Elem
   { value: 'archived', label: '已归档', icon: Archive },
 ]
 const PAGE_SIZE_OPTIONS = [20, 30, 50, 100] as const
+const emptyDateRanges = (): CombinedDateRanges => ({
+  publish: { from: '', to: '' },
+  recent: { from: '', to: '' },
+  first: { from: '', to: '' },
+})
 
 function getPaginationItems(currentPage: number, totalPages: number): Array<number | 'ellipsis'> {
   if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1)
@@ -85,9 +90,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
   const [customTagIds, setCustomTagIds] = useState<string[]>([])
   const [customTagCatalog, setCustomTagCatalog] = useState<CustomTag[]>([])
-  const [dateFrom, setDateFrom] = useState('')
-  const [dateTo, setDateTo] = useState('')
-  const [dateBasis, setDateBasis] = useState<DateBasis>('publish')
+  const [dateRanges, setDateRanges] = useState<CombinedDateRanges>(emptyDateRanges)
   const [exporting, setExporting] = useState(false)
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量/首次发现/最近采集、升降序
@@ -105,7 +108,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
 
   const loadCustomTagCatalog = useCallback((keyword = '') => Promise.resolve().then(async () => {
     const seq = ++customTagRequestSeq.current
@@ -133,11 +136,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     captureKeywords.forEach(k => params.append('captureKeyword', k))
     customTagIds.forEach(id => params.append('customTag', id))
     if (customTagIds.length) params.set('customTagMode', 'any')
-    if (dateFrom) params.set('dateFrom', dateFrom)
-    if (dateTo) params.set('dateTo', dateTo)
-    if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
+    if (dateRanges.publish.from) params.set('publishFrom', dateRanges.publish.from)
+    if (dateRanges.publish.to) params.set('publishTo', dateRanges.publish.to)
+    if (dateRanges.recent.from) params.set('recentFrom', dateRanges.recent.from)
+    if (dateRanges.recent.to) params.set('recentTo', dateRanges.recent.to)
+    if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
+    if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
     return params
-  }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateFrom, dateTo, dateBasis])
+  }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (!options?.silent) setLoading(true)
@@ -164,11 +170,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || dateFrom || dateTo)
-  const activeFilterCount = [platform, sentiment, triageStatus, dateFrom || dateTo].filter(Boolean).length
-    + risk.length + identity.length + captureKeywords.length + customTagIds.length
+  const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount)
+  const activeFilterCount = [platform, sentiment, triageStatus].filter(Boolean).length
+    + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateFrom(''); setDateTo('')
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setSort({ field: 'publish', dir: 'desc' })
   }
 
@@ -508,7 +515,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   emptyText="暂无自定义标签"
                   onSearch={loadCustomTagCatalog}
                 />
-                <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
+                <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} />
               </>
             )}
             <span className="mx-0.5 hidden h-4 w-px bg-border/60 lg:block" />
