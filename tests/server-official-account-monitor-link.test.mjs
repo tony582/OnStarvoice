@@ -6,9 +6,19 @@ import {
   matchesOfficialCommentAuthor,
   matchesOfficialRecordOwner,
 } from '../server/services/comment-workflow.js';
+import {
+  extractOfficialPlatformUserId,
+} from '../server/routes/monitor.js';
 
 const migration = await readFile(
   new URL('../server/db/migrations/049_official_account_monitor_link.sql', import.meta.url),
+  'utf8',
+);
+const identityBackfillMigration = await readFile(
+  new URL(
+    '../server/db/migrations/053_backfill_official_account_profile_identity.sql',
+    import.meta.url,
+  ),
   'utf8',
 );
 const initialMigration = await readFile(
@@ -118,6 +128,41 @@ test('migration preserves disabled state and pauses the exact legacy creator sch
   assert.doesNotMatch(
     migration,
     /UPDATE monitor_subscriptions creator[\s\S]*creator\.keyword\s*=\s*account\.account_name/u,
+  );
+});
+
+test('identity backfill trusts linked platform profile URLs, not names or keywords', () => {
+  assert.match(
+    identityBackfillMigration,
+    /subscription\.official_account_id = account\.id[\s\S]*subscription\.subject_type = 'official'/u,
+  );
+  assert.ok(identityBackfillMigration.includes("douyin\\.com/user/"));
+  assert.ok(
+    identityBackfillMigration.includes(
+      "FROM '/user/([[:alnum:]_.-]{5,240})'",
+    ),
+  );
+  assert.ok(
+    identityBackfillMigration.includes(
+      "xiaohongshu\\.com/user/profile/",
+    ),
+  );
+  assert.ok(
+    identityBackfillMigration.includes(
+      "FROM '/user/profile/([[:alnum:]_.-]{5,240})'",
+    ),
+  );
+  assert.match(
+    identityBackfillMigration,
+    /account\.platform_user_id = ''/u,
+  );
+  assert.match(
+    identityBackfillMigration,
+    /conflicting\.platform_user_id =[\s\S]*candidate\.inferred_platform_user_id/u,
+  );
+  assert.doesNotMatch(
+    identityBackfillMigration,
+    /subscription\.keyword|account\.account_name\s*=/u,
   );
 });
 
@@ -272,7 +317,7 @@ test('legacy run-now executes creator subscriptions only', () => {
 test('extension identity fields keep internal UID and visible account number separate', () => {
   assert.match(
     monitorRoute,
-    /platformUserId: normalizeText\([\s\S]*body\.profileInternalId[\s\S]*body\.platformBloggerId/u,
+    /explicitPlatformUserId = normalizeText\([\s\S]*body\.profileInternalId[\s\S]*body\.platformBloggerId/u,
   );
   assert.match(
     monitorRoute,
@@ -293,6 +338,42 @@ test('extension identity fields keep internal UID and visible account number sep
     'function mergeAliases',
   );
   assert.doesNotMatch(identityResolver, /subscription\.keyword/u);
+  assert.match(
+    identityResolver,
+    /extractOfficialPlatformUserId\(platform, profileUrl\)/u,
+  );
+  assert.match(
+    monitorRoute,
+    /official_account_strong_identity_required/u,
+  );
+
+  const douyinId =
+    'MS4wLjABAAAAfiSeUkdKAizCXA_PQB2SvpFKSE9urkLkV-JgydIwH6g';
+  assert.equal(
+    extractOfficialPlatformUserId(
+      'douyin',
+      `https://www.douyin.com/user/${douyinId}?from_tab_name=main`,
+    ),
+    douyinId,
+  );
+  assert.equal(
+    extractOfficialPlatformUserId(
+      'xiaohongshu',
+      'https://www.xiaohongshu.com/user/profile/605bda8400000000010098cf?xsec_source=pc_search',
+    ),
+    '605bda8400000000010098cf',
+  );
+  assert.equal(
+    extractOfficialPlatformUserId(
+      'douyin',
+      `https://example.com/user/${douyinId}`,
+    ),
+    '',
+  );
+  assert.equal(
+    extractOfficialPlatformUserId('douyin', 'https://www.douyin.com/user/home'),
+    '',
+  );
 });
 
 test('official identity matching distinguishes platform UID and human account number', () => {
@@ -320,6 +401,14 @@ test('official identity matching distinguishes platform UID and human account nu
   assert.doesNotMatch(
     officialAccountWhere,
     /author_name|jsonb_array_elements_text/u,
+  );
+  assert.match(
+    officialPatrolRoute,
+    /COALESCE\(record\.record_type, ''\) <> 'blogger_profile'/u,
+  );
+  assert.match(
+    officialPatrolRoute,
+    /NULLIF\(BTRIM\(record\.external_id\), ''\) IS NOT NULL/u,
   );
   assert.match(commentWorkflow, /account\.platform_user_id/u);
   assert.match(commentWorkflow, /account\.account_no/u);
