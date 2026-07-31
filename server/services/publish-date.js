@@ -21,6 +21,9 @@ function isFuturePublish(d, fbValid) {
   return d.getTime() > ref + 2 * 86400000;
 }
 
+const ISO_TIMESTAMP_PATTERN =
+  /^20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/iu;
+
 export function parsePublishTimestamp(raw, fallback = null) {
   const fb = fallback ? new Date(fallback) : null;
   const fbValid = fb && !Number.isNaN(fb.getTime()) ? fb : null;
@@ -47,6 +50,16 @@ export function parsePublishTimestamp(raw, fallback = null) {
   if (/^(刚刚|今天)/u.test(t)) return fbValid;
   if (/^昨天/u.test(t) && fbValid) { const d = new Date(fbValid); d.setDate(d.getDate() - 1); return d; }
   if (/^前天/u.test(t) && fbValid) { const d = new Date(fbValid); d.setDate(d.getDate() - 2); return d; }
+
+  // ISO 8601 必须先于宽松的 YYYY-MM-DD 规则解析。否则 `T` 后面的
+  // 时分秒和时区会被忽略，精确发布时间会被错误压成当天 00:00。
+  if (ISO_TIMESTAMP_PATTERN.test(t)) {
+    const parsed = Date.parse(t);
+    if (!Number.isNaN(parsed)) {
+      const d = new Date(parsed);
+      return isFuturePublish(d, fbValid) ? null : d;
+    }
+  }
 
   // 绝对:YYYY-MM-DD(及 / . 年月 分隔,可带时分)
   const ymd = t.match(/(20\d{2})[\-/.年](\d{1,2})[\-/.月](\d{1,2})(?:[日]?\s+(\d{1,2}):(\d{2}))?/u);
