@@ -38,6 +38,8 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     "'/orchestrations/:id/dispatch'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
+    "'/orchestrations/:id/schedule/run-now'",
+    "'/orchestrations/:id/retry-items'",
     "'/orchestrations/:id/resolve-attention'",
   ]) {
     const start = route.indexOf(marker);
@@ -301,6 +303,44 @@ test('manual handoff transfers only unstarted whole keywords after the source is
     /(?:captcha|securityBlocked)[\s\S]*(?:auto|automatic)/iu,
     'platform safety challenges must never trigger an automatic handoff',
   );
+});
+
+test('failed keyword retry stays inside the same parent and can target an idle Agent', () => {
+  const retry = section(
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+  );
+  assert.match(retry, /normalizeRetryItems/u);
+  assert.match(retry, /RETRY_ITEM_STATUSES/u);
+  assert.match(retry, /retry_requires_safety_confirmation/u);
+  assert.match(retry, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(task\.status\)/u);
+  assert.match(retry, /lockCaptureAgentExecutionSlot/u);
+  assert.match(retry, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
+  assert.match(retry, /retry_target_busy/u);
+  assert.match(retry, /'orchestration_retry'/u);
+  assert.match(retry, /parent_task_id/u);
+  assert.match(retry, /attempt_count = attempt_count \+ 1/u);
+  assert.match(retry, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(retry, /retrySourceExecutionTaskIds/u);
+  assert.match(retry, /orchestration_revision = orchestration_revision \+ 1/u);
+  assert.match(retry, /eventType: 'orchestration_retry_dispatched'/u);
+  assert.doesNotMatch(
+    retry,
+    /SET status = 'superseded'/u,
+    'retrying one failed item must not erase sibling results on its source execution',
+  );
+});
+
+test('an active unattended plan can be started immediately from the cloud', () => {
+  const runNow = section(
+    "router.post(\n  '/orchestrations/:id/schedule/run-now'",
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+  );
+  assert.match(runNow, /runCaptureOrchestrationScheduleNow/u);
+  assert.match(runNow, /requestKey/u);
+  assert.match(runNow, /orchestration_schedule_overlap/u);
+  assert.match(runNow, /已从云端立即启动一轮无人值守任务/u);
+  assert.match(runNow, /idempotency_conflict/u);
 });
 
 test('detail reader is tenant scoped and returns the complete orchestration projection', () => {

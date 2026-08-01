@@ -413,6 +413,7 @@
           remoteUnattendedPlanDelete: true,
           remoteTaskEnhancementOptions: true,
           remoteTaskKeywordPostLimit: true,
+          remoteOrchestrationRecoveryMergeV1: true,
           negativePostPatrol: true,
           officialAccountCommentPatrol: true,
           officialAccountCommentPatrolProfileV1: true,

@@ -1,6 +1,6 @@
 # StarVoice Extension 维护、发布与故障交接手册
 
-> 适用基线：StarVoice Extension `0.3.71`
+> 适用基线：StarVoice Extension `0.3.72`
 > 核验日期：2026-07-31
 > 适用对象：Extension 维护者、后端维护者、测试与发布人员、后续接手的 AI Agent
 > 文档性质：运行事实、边界、回归门禁和故障处理手册，不是产品宣传材料
@@ -1261,4 +1261,4 @@ AI fail-open：通过 / 不通过
 ---
 
 最后更新：2026-07-31
-当前文档基线：StarVoice Extension `0.3.71`
+当前文档基线：StarVoice Extension `0.3.72`

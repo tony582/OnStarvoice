@@ -82,6 +82,7 @@ const NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES = new Set([
   'waiting_device',
   'resume_requested',
 ])
+const KEYWORD_RETRY_STATUSES = new Set(['retryable', 'needs_action', 'failed'])
 
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
@@ -232,6 +233,26 @@ function agentSupportsNegativePatrol(
     supportedPlatforms.includes(platform)
 }
 
+function agentSupportsKeywordRetry(
+  agent: OrchestrationCloudAgent,
+  platform: string,
+) {
+  if (agent.status !== 'active' || !agent.online) return false
+  if (agent.capabilities?.remoteTaskCreate !== true) return false
+  if (Number(agent.active_task_count || 0) > 0) return false
+  if (Number(agent.queued_task_count || 0) > 0) return false
+  const allowedPlatforms = Array.isArray(agent.allowed_platforms)
+    ? agent.allowed_platforms
+    : []
+  if (allowedPlatforms.length > 0 && !allowedPlatforms.includes(platform)) {
+    return false
+  }
+  const supportedPlatforms = agent.capabilities?.supportedPlatforms
+  return !Array.isArray(supportedPlatforms) ||
+    supportedPlatforms.length === 0 ||
+    supportedPlatforms.includes(platform)
+}
+
 export function OrchestrationDetailWorkspace({
   orchestrationId,
   writable = false,
@@ -246,8 +267,11 @@ export function OrchestrationDetailWorkspace({
   const [refreshing, setRefreshing] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [scheduleUpdating, setScheduleUpdating] = useState(false)
+  const [scheduleRunningNow, setScheduleRunningNow] = useState(false)
   const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | 'handoff' | ''>('')
   const [handoffTargetAgentId, setHandoffTargetAgentId] = useState('')
+  const [keywordRetryTargetAgentId, setKeywordRetryTargetAgentId] = useState('')
+  const [keywordRetrying, setKeywordRetrying] = useState(false)
   const [negativeReassignOpen, setNegativeReassignOpen] = useState(false)
   const [negativeReassigning, setNegativeReassigning] = useState(false)
   const [negativeReassignAgentIds, setNegativeReassignAgentIds] = useState<Set<string>>(new Set())
@@ -259,6 +283,11 @@ export function OrchestrationDetailWorkspace({
     fingerprint: string
     requestKey: string
   } | null>(null)
+  const pendingKeywordRetry = useRef<{
+    fingerprint: string
+    requestKey: string
+  } | null>(null)
+  const pendingScheduleRunNow = useRef<string | null>(null)
 
   const load = useCallback(async (quiet = false, showRefreshIndicator = true) => {
     if (!orchestrationId) return
@@ -289,7 +318,10 @@ export function OrchestrationDetailWorkspace({
     setActionError('')
     setNegativeReassignOpen(false)
     setNegativeReassignAgentIds(new Set())
+    setKeywordRetryTargetAgentId('')
     pendingNegativeReassign.current = null
+    pendingKeywordRetry.current = null
+    pendingScheduleRunNow.current = null
     if (!orchestrationId) {
       setLoading(false)
       return
@@ -335,6 +367,45 @@ export function OrchestrationDetailWorkspace({
     ])),
     [detail?.executions],
   )
+  const keywordRetryItems = useMemo(() => {
+    if (!detail || negativePatrol || isScheduleTemplate) return []
+    return sortedItems.filter(item => {
+      if (!KEYWORD_RETRY_STATUSES.has(item.status)) return false
+      const sourceExecution = executionsById.get(
+        String(item.execution_task_id || ''),
+      )
+      return Boolean(
+        sourceExecution &&
+        FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution)),
+      )
+    })
+  }, [detail, executionsById, isScheduleTemplate, negativePatrol, sortedItems])
+  const keywordRetrySourceAgentIds = useMemo(() => new Set(
+    keywordRetryItems
+      .map(item => itemAssignedAgentId(
+        item,
+        detail?.executions || [],
+        detail?.attempts || [],
+      ))
+      .filter(Boolean),
+  ), [detail?.attempts, detail?.executions, keywordRetryItems])
+  const keywordRetryCandidates = useMemo(() => {
+    if (!detail || negativePatrol) return []
+    return availableAgents
+      .filter(agent => agentSupportsKeywordRetry(
+        agent,
+        detail.orchestration.platform,
+      ))
+      .sort((left, right) => {
+        const leftOriginal = keywordRetrySourceAgentIds.has(left.id) ? 1 : 0
+        const rightOriginal = keywordRetrySourceAgentIds.has(right.id) ? 1 : 0
+        if (leftOriginal !== rightOriginal) return leftOriginal - rightOriginal
+        return `${left.host_label}${left.display_name}`.localeCompare(
+          `${right.host_label}${right.display_name}`,
+          'zh-CN',
+        )
+      })
+  }, [availableAgents, detail, keywordRetrySourceAgentIds, negativePatrol])
   const negativeReassignItems = useMemo(() => {
     if (!negativePatrol) return []
     return sortedItems.filter(item => {
@@ -571,6 +642,40 @@ export function OrchestrationDetailWorkspace({
     }
   }
 
+  const runScheduleNow = async () => {
+    if (
+      !detail?.schedule ||
+      !isScheduleTemplate ||
+      !['active', 'completed'].includes(detail.schedule.status) ||
+      !writable ||
+      scheduleRunningNow
+    ) return
+    if (!window.confirm(
+      '现在立即启动一轮无人值守任务吗？如果上一轮仍未结束，云端会阻止重复启动；计划模板和原定时设置都会保留。',
+    )) return
+    if (!pendingScheduleRunNow.current) {
+      pendingScheduleRunNow.current = crypto.randomUUID()
+    }
+    setScheduleRunningNow(true)
+    setActionFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{message?: string; runTaskId?: string}>(
+        `/capture-cloud/orchestrations/${orchestrationId}/schedule/run-now`,
+        {requestKey: pendingScheduleRunNow.current},
+        {timeoutMs: 30_000},
+      )
+      pendingScheduleRunNow.current = null
+      setActionFeedback(result.message || '已立即启动一轮无人值守任务')
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '立即启动无人值守任务失败')
+    } finally {
+      setScheduleRunningNow(false)
+    }
+  }
+
   const resumeAttentionSource = async () => {
     if (!attentionContext || !writable || attentionAction) return
     if (!window.confirm('请确认已经在原 Agent 的抖音页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。')) return
@@ -673,6 +778,86 @@ export function OrchestrationDetailWorkspace({
       setActionError(err instanceof Error ? err.message : '转交空闲 Agent 失败')
     } finally {
       setAttentionAction('')
+    }
+  }
+
+  const retryFailedKeywords = async () => {
+    if (
+      !detail ||
+      !orchestrationId ||
+      !writable ||
+      keywordRetrying ||
+      keywordRetryItems.length === 0
+    ) return
+    const targetAgentId =
+      keywordRetryTargetAgentId || keywordRetryCandidates[0]?.id || ''
+    const target = keywordRetryCandidates.find(
+      agent => agent.id === targetAgentId,
+    )
+    if (!target) {
+      setActionError('当前没有支持该平台的在线空闲 Agent')
+      return
+    }
+    const confirmSafety = keywordRetryItems.some(item =>
+      safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata),
+    )
+    const originalCount = keywordRetrySourceAgentIds.has(targetAgentId) ? 1 : 0
+    if (!window.confirm(
+      `确定把 ${keywordRetryItems.length} 个失败关键词交给 ${agentName(target)} 重试吗？` +
+      `${originalCount ? ' 这是原执行 Agent。' : ' 这是新的空闲 Agent。'}` +
+      ' 新结果会写回当前无人值守任务，不会生成独立根任务。' +
+      `${confirmSafety ? ' 其中包含曾触发安全验证的关键词，请确认目标设备已可正常访问平台。' : ''}`,
+    )) return
+
+    const expectedRevision = Number(
+      detail.orchestration.revision ??
+      detail.orchestration.orchestration_revision ??
+      0,
+    )
+    const itemIds = keywordRetryItems.map(item => item.id)
+    const fingerprint = JSON.stringify({
+      orchestrationId,
+      expectedRevision,
+      targetAgentId,
+      itemIds,
+      confirmSafety,
+    })
+    if (
+      !pendingKeywordRetry.current ||
+      pendingKeywordRetry.current.fingerprint !== fingerprint
+    ) {
+      pendingKeywordRetry.current = {
+        fingerprint,
+        requestKey: crypto.randomUUID(),
+      }
+    }
+    setKeywordRetrying(true)
+    setActionError('')
+    setActionFeedback('')
+    try {
+      const result = await api.post<{message?: string}>(
+        `/capture-cloud/orchestrations/${orchestrationId}/retry-items`,
+        {
+          requestKey: pendingKeywordRetry.current.requestKey,
+          expectedRevision,
+          targetAgentId,
+          itemIds,
+          confirmSafety,
+        },
+        {timeoutMs: 30_000},
+      )
+      pendingKeywordRetry.current = null
+      setKeywordRetryTargetAgentId('')
+      setActionFeedback(
+        result.message ||
+        `${keywordRetryItems.length} 个失败关键词已在原任务中重新下发`,
+      )
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '云端重试失败关键词失败')
+    } finally {
+      setKeywordRetrying(false)
     }
   }
 
@@ -854,21 +1039,38 @@ export function OrchestrationDetailWorkspace({
             <h2 id="orchestration-detail-title" className="mt-2.5 truncate text-lg font-bold text-foreground">{orchestration.title || '未命名编排任务'}</h2>
             <p className="mt-1 text-xs text-muted-foreground">创建于 {formatTime(orchestration.created_at)} · 版本 {orchestration.revision ?? orchestration.orchestration_revision ?? '—'}</p>
           </div>
-          {scheduleTemplate && schedule && ['active', 'paused'].includes(schedule.status) ? (
-            <Button
-              variant={schedule.status === 'active' ? 'outline' : 'default'}
-              size="sm"
-              onClick={() => void updateScheduleStatus()}
-              disabled={!writable || scheduleUpdating}
-              title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
-            >
-              {scheduleUpdating
-                ? <Loader2 className="h-4 w-4 animate-spin" />
-                : schedule.status === 'active'
-                  ? <Pause className="h-4 w-4" />
-                  : <Play className="h-4 w-4" />}
-              {schedule.status === 'active' ? '暂停计划' : '重新启用'}
-            </Button>
+          {scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
+            <>
+              {['active', 'completed'].includes(schedule.status) && (
+                <Button
+                  size="sm"
+                  onClick={() => void runScheduleNow()}
+                  disabled={!writable || scheduleRunningNow || scheduleUpdating}
+                  title={!writable ? '当前账号为只读权限' : '立即生成并下发一轮无人值守任务'}
+                >
+                  {scheduleRunningNow
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Play className="h-4 w-4" />}
+                  立即运行
+                </Button>
+              )}
+              {schedule.status !== 'completed' && (
+                <Button
+                  variant={schedule.status === 'active' ? 'outline' : 'default'}
+                  size="sm"
+                  onClick={() => void updateScheduleStatus()}
+                  disabled={!writable || scheduleUpdating || scheduleRunningNow}
+                  title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
+                >
+                  {scheduleUpdating
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : schedule.status === 'active'
+                      ? <Pause className="h-4 w-4" />
+                      : <Play className="h-4 w-4" />}
+                  {schedule.status === 'active' ? '暂停计划' : '重新启用'}
+                </Button>
+              )}
+            </>
           ) : (
             <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
               disabled={!writable || stopping || stoppableTaskIds.length === 0}
@@ -982,6 +1184,58 @@ export function OrchestrationDetailWorkspace({
                     ? '验证码和安全审核不会自动换设备；只有你确认后，系统才会把尚未开始的整词交给空闲 Agent。'
                     : '该任务创建时未启用空闲 Agent 接力；你可以在原 Agent 验证后继续，或结束并保留结果。'}
                 </p>
+              </div>
+            </div>
+          </section>
+        )}
+        {keywordRetryItems.length > 0 && (
+          <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                  <RefreshCw className="h-4.5 w-4.5" />
+                </span>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-sm font-bold text-foreground">
+                      {keywordRetryItems.length} 个关键词可云端重试
+                    </h3>
+                    <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                      回写当前父任务
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    可选择原 Agent 或其他在线空闲 Agent；新的执行记录和结果都会保留在本轮无人值守任务下。
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <select
+                  aria-label="选择失败关键词重试 Agent"
+                  value={keywordRetryTargetAgentId || keywordRetryCandidates[0]?.id || ''}
+                  onChange={event => setKeywordRetryTargetAgentId(event.target.value)}
+                  disabled={!writable || keywordRetrying || keywordRetryCandidates.length === 0}
+                  className="h-9 min-w-52 max-w-full rounded-lg border border-border bg-background px-3 text-xs text-foreground outline-none focus:ring-2 focus:ring-primary"
+                >
+                  {keywordRetryCandidates.length === 0
+                    ? <option value="">没有在线空闲 Agent</option>
+                    : keywordRetryCandidates.map(agent => (
+                        <option key={agent.id} value={agent.id}>
+                          {agentName(agent)}
+                          {keywordRetrySourceAgentIds.has(agent.id) ? '（原 Agent）' : '（空闲 Agent）'}
+                        </option>
+                      ))}
+                </select>
+                <Button
+                  size="sm"
+                  onClick={() => void retryFailedKeywords()}
+                  disabled={!writable || keywordRetrying || keywordRetryCandidates.length === 0}
+                >
+                  {keywordRetrying
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Send className="h-4 w-4" />}
+                  重试失败关键词
+                </Button>
               </div>
             </div>
           </section>

@@ -339,3 +339,62 @@ test('cloud orchestration schedule migration keeps each occurrence unique and cl
   );
   assert.doesNotMatch(migration, /\bDELETE FROM capture_tasks\b/);
 });
+
+test('schedule overlap guard ignores its template but still detects active occurrences', async () => {
+  const scheduler = await readFile(
+    new URL(
+      '../server/services/capture-orchestration-scheduler.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  const overlapStart = scheduler.indexOf('const overlapping = await tx.queryOne');
+  const overlapEnd = scheduler.indexOf('if (overlapping)', overlapStart);
+  assert.ok(overlapStart >= 0);
+  assert.ok(overlapEnd > overlapStart);
+  const overlap = scheduler.slice(overlapStart, overlapEnd);
+
+  assert.match(overlap, /run\.orchestration_schedule_id = \$2/u);
+  assert.match(overlap, /run\.id <> \$3/u);
+  assert.match(
+    overlap,
+    /\[schedule\.tenant_id, schedule\.id, schedule\.template_task_id\]/u,
+  );
+  assert.match(
+    overlap,
+    /run\.status IN \([\s\S]*'pending'[\s\S]*'running'[\s\S]*'recovering'/u,
+  );
+  assert.match(overlap, /child\.parent_task_id = run\.id/u);
+  assert.match(overlap, /item\.task_id = run\.id/u);
+});
+
+test('manual cloud start is idempotent and never overlaps an active schedule run', async () => {
+  const scheduler = await readFile(
+    new URL(
+      '../server/services/capture-orchestration-scheduler.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(
+    scheduler,
+    /export async function runCaptureOrchestrationScheduleNow/u,
+  );
+  assert.match(
+    scheduler,
+    /orchestration_schedule_manual_run_requested/u,
+  );
+  assert.match(
+    scheduler,
+    /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u,
+  );
+  assert.match(
+    scheduler,
+    /if \(manual\) \{[\s\S]*kind: 'blocked_overlap'/u,
+  );
+  assert.match(scheduler, /manualRunNow: manual/u);
+  assert.match(
+    scheduler,
+    /\['active', 'completed'\]\.includes\(schedule\.status\)/u,
+  );
+});

@@ -13,8 +13,8 @@ export const RELEVANCE_PREFILTER_DEFAULT_THRESHOLD = 0.97;
 // small enough to finish inside the extension's bounded wait while still
 // running the requests for one keyword in parallel.
 export const RELEVANCE_PREFILTER_BATCH_SIZE = 5;
-export const RELEVANCE_PREFILTER_TIMEOUT_MS = 20000;
-export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 6;
+export const RELEVANCE_PREFILTER_TIMEOUT_MS = 90000;
+export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 2;
 
 const KEYWORD_RECORD_TYPE = 'keyword_notes';
 const INSUFFICIENT_TITLE_PATTERN =

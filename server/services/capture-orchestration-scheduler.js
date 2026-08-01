@@ -108,6 +108,9 @@ async function appendEvent(tx, {
   taskId,
   agentId = null,
   eventType,
+  actorType = 'system',
+  actorId = '',
+  actorName = '云端调度器',
   status = '',
   message = '',
   payload = {},
@@ -116,12 +119,15 @@ async function appendEvent(tx, {
     INSERT INTO capture_task_events (
       tenant_id, task_id, agent_id, event_type,
       actor_type, actor_id, actor_name, status, message, payload
-    ) VALUES ($1, $2, $3, $4, 'system', '', '云端调度器', $5, $6, $7::jsonb)
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
   `, [
     tenantId,
     taskId,
     agentId,
     eventType,
+    text(actorType, 80),
+    text(actorId, 240),
+    text(actorName, 240),
     text(status, 80),
     text(message, 2000),
     JSON.stringify(object(payload)),
@@ -189,12 +195,12 @@ async function advanceSchedule(tx, schedule, {
   return {nextRunAt: next, scheduleStatus: finalStatus};
 }
 
-async function materializeOccurrence(tx, schedule) {
+async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   const scheduledFor = new Date(schedule.next_run_at);
   const scheduledForMs = scheduledFor.getTime();
   const schedulerNow = new Date(schedule.scheduler_now || Date.now());
   const graceMs = Number(schedule.late_start_grace_min || 360) * 60 * 1000;
-  if (schedulerNow.getTime() > scheduledForMs + graceMs) {
+  if (!manual && schedulerNow.getTime() > scheduledForMs + graceMs) {
     const advanced = await advanceSchedule(tx, schedule, {
       after: schedulerNow,
       lastRunStatus: 'skipped_late',
@@ -220,6 +226,7 @@ async function materializeOccurrence(tx, schedule) {
     FROM capture_tasks run
     WHERE run.tenant_id = $1
       AND run.orchestration_schedule_id = $2
+      AND run.id <> $3
       AND run.task_type = 'capture_orchestration'
       AND (
         run.status IN (
@@ -249,8 +256,15 @@ async function materializeOccurrence(tx, schedule) {
       )
     ORDER BY run.scheduled_for DESC, run.id
     LIMIT 1
-  `, [schedule.tenant_id, schedule.id]);
+  `, [schedule.tenant_id, schedule.id, schedule.template_task_id]);
   if (overlapping) {
+    if (manual) {
+      return {
+        kind: 'blocked_overlap',
+        scheduleId: schedule.id,
+        activeRunTaskId: overlapping.id,
+      };
+    }
     const advanced = await advanceSchedule(tx, schedule, {
       after: scheduledFor,
       lastRunStatus: 'skipped_overlap',
@@ -350,6 +364,7 @@ async function materializeOccurrence(tx, schedule) {
     executionMode: 'one_time',
     planSnapshot,
     orchestrationScheduleRun: true,
+    manualRunNow: manual,
     scheduleId: schedule.id,
     scheduleTemplateTaskId: schedule.template_task_id,
     scheduleRevision: Number(schedule.revision),
@@ -713,6 +728,84 @@ async function materializeOccurrence(tx, schedule) {
     itemCount: finalItems.length,
     ...advanced,
   };
+}
+
+export async function runCaptureOrchestrationScheduleNow({
+  tenantId,
+  scheduleId,
+  requestKey,
+  actorId = '',
+  actorName = '',
+} = {}) {
+  return withTransaction(async tx => {
+    await tx.execute(
+      'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+      [String(tenantId || ''), String(requestKey || '')],
+    );
+    const replay = await tx.queryOne(`
+      SELECT payload->>'runTaskId' AS run_task_id,
+        payload->>'scheduleId' AS schedule_id
+      FROM capture_task_events
+      WHERE tenant_id = $1
+        AND event_type = 'orchestration_schedule_manual_run_requested'
+        AND payload->>'requestKey' = $2
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `, [tenantId, requestKey]);
+    if (replay?.run_task_id) {
+      if (String(replay.schedule_id || '') !== String(scheduleId || '')) {
+        return {kind: 'idempotency_conflict'};
+      }
+      return {
+        kind: 'existing',
+        scheduleId,
+        runTaskId: replay.run_task_id,
+        idempotent: true,
+      };
+    }
+    const schedule = await tx.queryOne(`
+      SELECT schedule.*,
+        now() AS scheduler_now,
+        ARRAY(
+          SELECT scheduled_date::text
+          FROM unnest(schedule.custom_dates) AS scheduled_date
+          ORDER BY scheduled_date
+        ) AS custom_date_texts
+      FROM capture_orchestration_schedules schedule
+      WHERE schedule.id = $1
+        AND schedule.tenant_id = $2
+      FOR UPDATE
+    `, [scheduleId, tenantId]);
+    if (!schedule) return {kind: 'not_found'};
+    if (!['active', 'completed'].includes(schedule.status)) {
+      return {kind: 'inactive', status: schedule.status};
+    }
+    const now = new Date(schedule.scheduler_now || Date.now());
+    const result = await materializeOccurrence(tx, {
+      ...schedule,
+      next_run_at: now.toISOString(),
+      scheduler_now: now.toISOString(),
+    }, {manual: true});
+    if (result.kind === 'created') {
+      await appendEvent(tx, {
+        tenantId: schedule.tenant_id,
+        taskId: schedule.template_task_id,
+        eventType: 'orchestration_schedule_manual_run_requested',
+        actorType: 'user',
+        actorId,
+        actorName,
+        status: result.scheduleStatus,
+        message: '用户从云端立即启动了一轮无人值守任务',
+        payload: {
+          requestKey,
+          scheduleId: schedule.id,
+          runTaskId: result.runTaskId,
+          scheduledFor: now.toISOString(),
+        },
+      });
+    }
+    return result;
+  });
 }
 
 export async function enqueueDueCaptureOrchestrations(limit = 10) {

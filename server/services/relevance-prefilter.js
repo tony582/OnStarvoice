@@ -11,14 +11,15 @@ export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v2';
 export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
-export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 15000;
+export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 25000;
 export const PREFILTER_DEFAULT_TENANT_CONCURRENCY = 6;
+export const PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS = 30000;
 
 const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const VALID_MODES = new Set(['disabled', 'shadow', 'conservative']);
 const VALID_DECISIONS = new Set(['keep', 'skip', 'need_detail']);
 const MODE_RANK = { disabled: 0, shadow: 1, conservative: 2 };
-const activeTenantCalls = new Map();
+const tenantSlotStates = new Map();
 
 export class PrefilterRequestError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -439,7 +440,7 @@ function isTimeoutError(error) {
 function modelTimeoutMs() {
   const configured = Number(process.env.PREFILTER_MODEL_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return PREFILTER_DEFAULT_MODEL_TIMEOUT_MS;
-  return Math.max(1000, Math.min(15000, configured));
+  return Math.max(1000, Math.min(40000, configured));
 }
 
 function maxTenantConcurrency() {
@@ -449,18 +450,57 @@ function maxTenantConcurrency() {
     : PREFILTER_DEFAULT_TENANT_CONCURRENCY;
 }
 
-function acquireTenantSlot(tenantId) {
-  const active = activeTenantCalls.get(tenantId) || 0;
-  if (active >= maxTenantConcurrency()) {
-    throw new PrefilterRequestError(429, 'PREFILTER_CONCURRENCY_LIMIT', 'AI 判断请求较多，本批请直接安全放行', { retryAfterMs: 1000 });
+function tenantQueueTimeoutMs() {
+  const configured = Number(process.env.PREFILTER_QUEUE_TIMEOUT_MS);
+  if (!Number.isFinite(configured)) return PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS;
+  return Math.max(1000, Math.min(60000, configured));
+}
+
+async function acquireTenantSlot(tenantId) {
+  const state = tenantSlotStates.get(tenantId) || {active: 0, queue: []};
+  tenantSlotStates.set(tenantId, state);
+  if (state.active < maxTenantConcurrency()) {
+    state.active += 1;
+    return;
   }
-  activeTenantCalls.set(tenantId, active + 1);
+  if (state.queue.length >= 200) {
+    throw new PrefilterRequestError(
+      503,
+      'PREFILTER_QUEUE_FULL',
+      'AI 判断队列暂时已满，本批按安全策略继续采集',
+      {retryAfterMs: 3000},
+    );
+  }
+  await new Promise((resolve, reject) => {
+    const waiter = {resolve, timer: null};
+    waiter.timer = setTimeout(() => {
+      const index = state.queue.indexOf(waiter);
+      if (index >= 0) state.queue.splice(index, 1);
+      if (state.active === 0 && state.queue.length === 0) {
+        tenantSlotStates.delete(tenantId);
+      }
+      reject(new PrefilterRequestError(
+        503,
+        'PREFILTER_QUEUE_TIMEOUT',
+        'AI 判断排队超时，本批按安全策略继续采集',
+        {retryAfterMs: 3000},
+      ));
+    }, tenantQueueTimeoutMs());
+    state.queue.push(waiter);
+  });
 }
 
 function releaseTenantSlot(tenantId) {
-  const active = activeTenantCalls.get(tenantId) || 0;
-  if (active <= 1) activeTenantCalls.delete(tenantId);
-  else activeTenantCalls.set(tenantId, active - 1);
+  const state = tenantSlotStates.get(tenantId);
+  if (!state) return;
+  const waiter = state.queue.shift();
+  if (waiter) {
+    clearTimeout(waiter.timer);
+    waiter.resolve();
+    return;
+  }
+  state.active = Math.max(0, state.active - 1);
+  if (state.active === 0) tenantSlotStates.delete(tenantId);
 }
 
 async function assertDailyQuota(tenantId, itemCount) {
@@ -652,7 +692,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
   const existing = await findIdempotentRequest(tenantId, request, bodyHash);
   if (existing?.kind === 'replay') return existing.response;
 
-  acquireTenantSlot(tenantId);
+  await acquireTenantSlot(tenantId);
   try {
     await assertDailyQuota(tenantId, request.items.length);
     const policy = await resolvePrefilterPolicy(tenantId, request);
@@ -663,6 +703,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
     let items;
     let degraded = false;
     let unknownOutputCount = 0;
+    let modelDiagnostics = {};
 
     if (policy.effectiveMode === 'disabled') {
       degraded = true;
@@ -677,21 +718,63 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
         if (pendingItems.length > 0) {
           const pendingRequest = { ...request, items: pendingItems };
           try {
-            const result = await callDeepSeekWithPrompt(
-              tenantId,
-              buildPrefilterSystemPrompt(brand, request.intent),
-              buildPrefilterUserMessage(pendingRequest),
-              {
-                timeoutMs: modelTimeoutMs(),
-                maxTokens: Math.min(8192, Math.max(1200, pendingItems.length * 180)),
-                returnMetadata: true,
-              }
+            const baseMaxTokens = Math.min(
+              8192,
+              Math.max(3000, pendingItems.length * 600),
             );
+            let result = null;
+            let retryCount = 0;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              try {
+                result = await callDeepSeekWithPrompt(
+                  tenantId,
+                  buildPrefilterSystemPrompt(brand, request.intent),
+                  buildPrefilterUserMessage(pendingRequest),
+                  {
+                    timeoutMs: modelTimeoutMs(),
+                    maxTokens: attempt === 0
+                      ? baseMaxTokens
+                      : Math.min(8192, Math.max(5000, baseMaxTokens * 2)),
+                    returnMetadata: true,
+                  },
+                );
+                if (result.finishReason === 'length' && attempt === 0) {
+                  retryCount += 1;
+                  continue;
+                }
+                break;
+              } catch (error) {
+                const truncated =
+                  error?.code === 'LLM_JSON_PARSE_FAILED' ||
+                  String(error?.finishReason || '') === 'length';
+                if (!truncated || attempt > 0) throw error;
+                retryCount += 1;
+              }
+            }
+            if (!result) {
+              const error = new Error('DeepSeek 未返回可用的结构化结果');
+              error.code = 'LLM_EMPTY_RESULT';
+              throw error;
+            }
             model = result.model;
+            modelDiagnostics = {
+              finishReason: result.finishReason || '',
+              responseLength: Math.max(0, Number(result.responseLength) || 0),
+              promptTokens: Math.max(0, Number(result.promptTokens) || 0),
+              completionTokens: Math.max(0, Number(result.completionTokens) || 0),
+              totalTokens: Math.max(0, Number(result.totalTokens) || 0),
+              retryCount,
+            };
             const normalized = normalizePrefilterModelResponse(pendingRequest, result.data, policy);
             for (const item of normalized.items) pendingResults.set(item.itemId, item);
             unknownOutputCount = normalized.unknownOutputCount;
           } catch (error) {
+            console.warn('[RelevancePrefilter] Model output unavailable', {
+              tenantId,
+              code: boundedText(error?.code, 100),
+              finishReason: boundedText(error?.finishReason, 40),
+              responseLength: Math.max(0, Number(error?.responseLength) || 0),
+            });
             const timedOut = isTimeoutError(error);
             const failed = allFailOpenItems(
               pendingRequest,
@@ -739,6 +822,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       effectiveMode: policy.effectiveMode,
       skipThreshold: policy.skipThreshold,
       unknownOutputCount,
+      modelDiagnostics,
       cacheHitCount: items.filter(item => item.cacheHit).length,
       idempotentReplay: false,
       items,

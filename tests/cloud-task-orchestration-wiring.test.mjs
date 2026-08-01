@@ -26,12 +26,57 @@ test('accepted child snapshots project keyword checkpoints to their exact parent
   assert.match(route, /'orchestrationChild', capture_tasks\.metadata->'orchestrationChild'/u);
   assert.match(route, /'parentTaskId', capture_tasks\.metadata->'parentTaskId'/u);
 
-  const acceptedStart = route.indexOf('if (snapshotAccepted) {', mirrorStart);
-  const acceptedEnd = route.indexOf('\n  }', acceptedStart);
-  assert.ok(acceptedStart >= 0);
+  const acceptedProjectionStart = route.indexOf(
+    'const projectedNegativePatrolTask',
+    mirrorStart,
+  );
+  assert.ok(acceptedProjectionStart >= 0);
   assert.match(
-    route.slice(acceptedStart, acceptedEnd + 4),
+    route.slice(acceptedProjectionStart, acceptedProjectionStart + 800),
     /projectOrchestrationSnapshot\(tx, agent, task, snapshot\)/u,
+  );
+});
+
+test('a device-side retry is adopted by the original orchestration parent', async () => {
+  const [route, agent] = await Promise.all([
+    read('server/routes/capture-cloud.js'),
+    read('utils/cloud-task-agent.js'),
+  ]);
+  const adoptionStart = route.indexOf('async function adoptLocalOrchestrationRecovery');
+  const adoptionEnd = route.indexOf('async function refreshOrchestrationParentTask', adoptionStart);
+  assert.ok(adoptionStart >= 0 && adoptionEnd > adoptionStart);
+  const adoption = route.slice(adoptionStart, adoptionEnd);
+  assert.match(adoption, /snapshotMetadata\.parentRequestId/u);
+  assert.match(adoption, /snapshotMetadata\.cloudAssigned !== true/u);
+  assert.match(adoption, /sourceTask\.parent_task_id/u);
+  assert.match(adoption, /status IN \('retryable', 'needs_action', 'failed'\)/u);
+  assert.match(adoption, /parent_task_id = \$1/u);
+  assert.match(adoption, /attempt_count = attempt_count \+ 1/u);
+  assert.match(adoption, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(adoption, /orchestration_local_recovery_adopted/u);
+  assert.match(
+    route,
+    /task = await adoptLocalOrchestrationRecovery\(tx, agent, task, snapshot\)/u,
+  );
+  assert.match(agent, /remoteOrchestrationRecoveryMergeV1: true/u);
+});
+
+test('schedule status follows its latest run before and after terminal settlement', async () => {
+  const route = await read('server/routes/capture-cloud.js');
+  const refreshStart = route.indexOf('async function refreshOrchestrationParentTask');
+  const refreshEnd = route.indexOf(
+    'async function projectNegativePatrolSnapshot',
+    refreshStart,
+  );
+  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
+  const refresh = route.slice(refreshStart, refreshEnd);
+  assert.match(refresh, /last_run_status = \$2/u);
+  assert.match(refresh, /scheduled_run_needs_action/u);
+  assert.match(refresh, /orchestration_schedule_run_status_updated/u);
+  assert.match(refresh, /WHEN \$7::boolean THEN COALESCE\(\$1::timestamptz, now\(\)\)/u);
+  assert.doesNotMatch(
+    refresh,
+    /updated &&\s*aggregate\.terminal &&\s*parent\.status !== updated\.status/u,
   );
 });
 
@@ -96,6 +141,15 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /每个计划时间，每个关键词执行 1 次/u);
   assert.match(detail, /任务遇到安全验证时/u);
   assert.match(detail, /接力只处理尚未开始的完整关键词/u);
+  assert.match(detail, /\/retry-items/u);
+  assert.match(detail, /回写当前父任务/u);
+  assert.match(detail, /重试失败关键词/u);
+  assert.match(detail, /\/schedule\/run-now/u);
+  assert.match(detail, /立即运行/u);
+  assert.match(
+    detail,
+    /\['active', 'completed'\]\.includes\(schedule\.status\)/u,
+  );
 });
 
 test('API supports opt-in timeouts without changing every request', async () => {

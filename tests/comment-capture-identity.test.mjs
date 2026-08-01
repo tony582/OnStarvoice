@@ -151,6 +151,26 @@ test("detail comments and card stop reuse the bound request instead of the activ
   );
 });
 
+test("long XHS detail and blogger operations emit relay-only heartbeats", () => {
+  assert.match(contentSource, /function beginCaptureOperationHeartbeat/u);
+  assert.match(contentSource, /heartbeatOnly: true/u);
+  assert.match(contentSource, /15_000/u);
+  const note = sourceBlock(
+    contentSource,
+    "async function handleCaptureSingleNote",
+    "/**\n * 处理博主信息采集",
+  );
+  const blogger = sourceBlock(
+    contentSource,
+    "async function handleCaptureBloggerProfile",
+    "/**\n * 处理博主笔记列表采集",
+  );
+  assert.match(note, /capture_single_note_alive/u);
+  assert.match(note, /stopHeartbeat\(\)/u);
+  assert.match(blogger, /capture_blogger_profile_alive/u);
+  assert.match(blogger, /stopHeartbeat\(\)/u);
+});
+
 test("Douyin comment capture carries and checks the expected work identity before merging", () => {
   const currentNoteBlock = sourceBlock(
     captureSyncSource,

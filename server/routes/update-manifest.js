@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.71',
+  latestVersion: '0.3.72',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-07-31',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.71-20260731.zip',
+  releaseDate: '2026-08-01',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.72-20260801.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.72',
+      releaseDate: '2026-08-01',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: '无人值守任务可在云端完整操作',
+              desc: '可从云端立即运行、暂停、继续和停止计划，并把失败关键词交给原设备或另一台在线空闲设备重试；所有尝试持续回写同一个父任务。',
+            },
+          ],
+        },
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '设备重试结果回归原无人值守任务',
+              desc: '设备端恢复会保留云端编排身份，不再生成孤立的一次性根任务；计划模板也不再被误判成运行中的上一轮。',
+            },
+            {
+              title: '小红书长任务与 AI 筛选稳定性',
+              desc: '长时间详情和博主采集持续发送连接心跳；AI 请求改为租户排队，并对输出截断自动增加预算重试，减少无效放行与小时级等待。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.71',
       releaseDate: '2026-07-31',

@@ -521,7 +521,7 @@ function reportCaptureProgress(request, progress = {}) {
   const taskId = String(
     request?.taskId || request?.taskContext?.taskId || "",
   ).trim();
-  if (taskId) {
+  if (taskId && source.heartbeatOnly !== true) {
     try {
       const overlay =
         activeListCaptureDebugOverlay || getListCaptureDebugOverlay();
@@ -542,6 +542,20 @@ function reportCaptureProgress(request, progress = {}) {
     action: "captureProgress",
     progress: normalizedProgress,
   });
+}
+
+function beginCaptureOperationHeartbeat(request, phase) {
+  const captureRequestId = String(request?.captureRequestId || '').trim();
+  if (!captureRequestId) return () => {};
+  const reportAlive = () => reportCaptureProgress(request, {
+    heartbeatOnly: true,
+    phase,
+    message: '',
+    updatedAt: Date.now(),
+  });
+  reportAlive();
+  const intervalId = setInterval(reportAlive, 15_000);
+  return () => clearInterval(intervalId);
 }
 
 /**
@@ -783,6 +797,10 @@ async function handleSmartCapture(request, sendResponse) {
  * 处理单篇笔记采集
  */
 async function handleCaptureSingleNote(request, sendResponse) {
+  const stopHeartbeat = beginCaptureOperationHeartbeat(
+    request,
+    'capture_single_note_alive',
+  );
   try {
     resetCancelFlag();
 
@@ -805,6 +823,8 @@ async function handleCaptureSingleNote(request, sendResponse) {
         message: error.message,
       },
     });
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -812,6 +832,10 @@ async function handleCaptureSingleNote(request, sendResponse) {
  * 处理博主信息采集
  */
 async function handleCaptureBloggerProfile(request, sendResponse) {
+  const stopHeartbeat = beginCaptureOperationHeartbeat(
+    request,
+    'capture_blogger_profile_alive',
+  );
   try {
     resetCancelFlag();
 
@@ -825,6 +849,8 @@ async function handleCaptureBloggerProfile(request, sendResponse) {
       data: null,
       error: {code: "CAPTURE_FAILED", message: error.message},
     });
+  } finally {
+    stopHeartbeat();
   }
 }
 

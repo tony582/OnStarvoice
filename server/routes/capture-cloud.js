@@ -1529,12 +1529,308 @@ function orchestrationItemAttemptStatus(itemStatus) {
 
 async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
   return tx.queryOne(`
-    SELECT id, status, progress, metadata, feature_key,
+    SELECT id, title, status, progress, metadata, feature_key,
+      orchestration_revision,
       orchestration_schedule_id, scheduled_for
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2 AND task_type = 'capture_orchestration'
     FOR UPDATE
   `, [parentTaskId, tenantId]);
+}
+
+async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
+  if (
+    !task ||
+    task.parent_task_id ||
+    task.task_type !== 'unattended_keyword_capture'
+  ) {
+    return task;
+  }
+  const snapshotMetadata = safeJson(snapshot.metadata);
+  const parentRequestId = text(snapshotMetadata.parentRequestId, 240);
+  if (!parentRequestId || snapshotMetadata.cloudAssigned !== true) {
+    return task;
+  }
+
+  const lineageTaskIds = [];
+  let lineageClientTaskId = parentRequestId;
+  let sourceCandidate = null;
+  for (let depth = 0; depth < 6 && lineageClientTaskId; depth += 1) {
+    const candidate = await tx.queryOne(`
+      SELECT id, client_task_id, parent_task_id, assigned_agent_id,
+        status, metadata
+      FROM capture_tasks
+      WHERE tenant_id = $1
+        AND origin_agent_id = $2
+        AND client_task_id = $3
+        AND id <> $4
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `, [agent.tenant_id, agent.id, lineageClientTaskId, task.id]);
+    if (!candidate || lineageTaskIds.includes(String(candidate.id))) break;
+    lineageTaskIds.push(String(candidate.id));
+    if (candidate.parent_task_id) {
+      sourceCandidate = candidate;
+      break;
+    }
+    lineageClientTaskId = text(
+      safeJson(candidate.metadata).parentRequestId,
+      240,
+    );
+  }
+  if (!sourceCandidate?.parent_task_id) return task;
+  const sourceTask = await tx.queryOne(`
+    SELECT id, parent_task_id, assigned_agent_id, status, metadata
+    FROM capture_tasks
+    WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
+    FOR UPDATE
+  `, [
+    sourceCandidate.id,
+    agent.tenant_id,
+    sourceCandidate.parent_task_id,
+  ]);
+  if (!sourceTask?.parent_task_id) return task;
+
+  const sourceMetadata = safeJson(sourceTask.metadata);
+  const recordedSuccessorId = text(
+    sourceMetadata.recoveryTaskId || sourceMetadata.handoffSuccessorTaskId,
+    240,
+  );
+  if (
+    recordedSuccessorId &&
+    recordedSuccessorId !== String(task.id) &&
+    !lineageTaskIds.includes(recordedSuccessorId)
+  ) {
+    return task;
+  }
+  const parent = await lockOrchestrationParent(
+    tx,
+    agent.tenant_id,
+    sourceTask.parent_task_id,
+  );
+  if (
+    !parent ||
+    safeJson(parent.metadata).orchestrationTemplate === true ||
+    safeJson(parent.metadata).executionMode === 'unattended_plan'
+  ) {
+    return task;
+  }
+
+  const authoritativeItemIds = new Set(
+    (Array.isArray(sourceMetadata.itemIds) ? sourceMetadata.itemIds : [])
+      .map(itemId => text(itemId, 100))
+      .filter(value => UUID_PATTERN.test(value)),
+  );
+  const desiredKeywords = new Set(
+    (Array.isArray(snapshotMetadata.keywords) ? snapshotMetadata.keywords : [])
+      .map(keyword => text(keyword, 120))
+      .filter(Boolean),
+  );
+  const sourceItems = await tx.queryAll(`
+    SELECT id, keyword, ordinal, status, attempt_count,
+      assignment_revision
+    FROM capture_task_items
+    WHERE tenant_id = $1
+      AND task_id = $2
+      AND execution_task_id = $3
+      AND assigned_agent_id = $4
+      AND status IN ('retryable', 'needs_action', 'failed')
+    ORDER BY id
+    FOR UPDATE
+  `, [
+    agent.tenant_id,
+    parent.id,
+    sourceTask.id,
+    agent.id,
+  ]);
+  const eligibleItems = sourceItems
+    .filter(item =>
+      (authoritativeItemIds.size === 0 || authoritativeItemIds.has(String(item.id))) &&
+      (desiredKeywords.size === 0 || desiredKeywords.has(text(item.keyword, 120)))
+    )
+    .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
+    .slice(0, 30);
+  if (eligibleItems.length === 0) return task;
+
+  const nextRevision = Number(parent.orchestration_revision || 0) + 1;
+  const requestHash = crypto
+    .createHash('sha256')
+    .update(JSON.stringify({
+      parentTaskId: parent.id,
+      sourceTaskId: sourceTask.id,
+      recoveryTaskId: task.id,
+      itemIds: eligibleItems.map(item => item.id),
+      attemptNumber: Math.max(1, Number(snapshot.attemptNumber) || 1),
+    }))
+    .digest('hex');
+  const adoptedTask = await tx.queryOne(`
+    UPDATE capture_tasks
+    SET parent_task_id = $1,
+      title = $2,
+      trigger_type = 'orchestration_local_recovery',
+      metadata = metadata || jsonb_build_object(
+        'orchestrationChild', true,
+        'parentTaskId', $1::uuid::text,
+        'orchestrationRevision', $3::integer,
+        'itemIds', $4::jsonb,
+        'localRecovery', true,
+        'localRecoverySourceExecutionTaskId', $5::uuid::text,
+        'localRecoveryAdoptedAt', now()
+      ),
+      updated_at = now(),
+      source_updated_at = now()
+    WHERE id = $6 AND tenant_id = $7 AND parent_task_id IS NULL
+    RETURNING *
+  `, [
+    parent.id,
+    `${text(parent.title || '无人值守计划运行批次', 180)} · 设备重试`,
+    nextRevision,
+    JSON.stringify(eligibleItems.map(item => item.id)),
+    sourceTask.id,
+    task.id,
+    agent.tenant_id,
+  ]);
+  if (!adoptedTask) return task;
+
+  const detachedLineageTaskIds = lineageTaskIds.filter(
+    lineageTaskId =>
+      lineageTaskId !== String(sourceTask.id) &&
+      lineageTaskId !== String(adoptedTask.id),
+  );
+  if (detachedLineageTaskIds.length > 0) {
+    await tx.execute(`
+      UPDATE capture_tasks
+      SET parent_task_id = $1,
+        metadata = metadata || jsonb_build_object(
+          'orchestrationChild', true,
+          'parentTaskId', $1::uuid::text,
+          'orchestrationRecoveryLineageOnly', true,
+          'orchestrationLineageAdoptedAt', now()
+        ),
+        updated_at = now()
+      WHERE tenant_id = $2
+        AND id = ANY($3::uuid[])
+        AND parent_task_id IS NULL
+    `, [parent.id, agent.tenant_id, detachedLineageTaskIds]);
+  }
+
+  for (const item of eligibleItems) {
+    const updatedItem = await tx.queryOne(`
+      UPDATE capture_task_items
+      SET status = 'dispatched',
+        attempt_count = attempt_count + 1,
+        assigned_agent_id = $1,
+        execution_task_id = $2,
+        assignment_revision = $3,
+        request_hash = $4,
+        error = '{}'::jsonb,
+        metadata = metadata || jsonb_build_object(
+          'localRecoverySourceExecutionTaskId', $5::uuid::text
+        ),
+        assigned_at = now(),
+        dispatched_at = now(),
+        started_at = NULL,
+        finished_at = NULL,
+        updated_at = now()
+      WHERE id = $6
+        AND tenant_id = $7
+        AND task_id = $8
+        AND execution_task_id = $5
+        AND assignment_revision = $9
+        AND status IN ('retryable', 'needs_action', 'failed')
+      RETURNING id, attempt_count
+    `, [
+      agent.id,
+      adoptedTask.id,
+      nextRevision,
+      requestHash,
+      sourceTask.id,
+      item.id,
+      agent.tenant_id,
+      parent.id,
+      Number(item.assignment_revision || 0),
+    ]);
+    if (!updatedItem) {
+      const error = new Error('orchestration_local_recovery_item_conflict');
+      error.code = 'orchestration_local_recovery_item_conflict';
+      throw error;
+    }
+    await tx.execute(`
+      INSERT INTO capture_task_item_attempts (
+        id, tenant_id, item_id, parent_task_id, execution_task_id,
+        agent_id, attempt_number, assignment_revision, status,
+        request_hash, checkpoint, result, error, dispatched_at
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, 'dispatched',
+        $9, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+      )
+    `, [
+      crypto.randomUUID(),
+      agent.tenant_id,
+      item.id,
+      parent.id,
+      adoptedTask.id,
+      agent.id,
+      Number(updatedItem.attempt_count),
+      nextRevision,
+      requestHash,
+    ]);
+  }
+  await tx.execute(`
+    UPDATE capture_tasks
+    SET status = 'superseded',
+      metadata = metadata || jsonb_build_object(
+        'recoveryTaskId', $1::uuid::text,
+        'localRecoveryAdoptedAt', now()
+      ),
+      message = '设备端重试已归入同一无人值守父任务',
+      finished_at = COALESCE(finished_at, now()),
+      updated_at = now(),
+      source_updated_at = now()
+    WHERE id = $2 AND tenant_id = $3
+  `, [adoptedTask.id, sourceTask.id, agent.tenant_id]);
+  await tx.execute(`
+    UPDATE capture_tasks
+    SET orchestration_revision = $1,
+      status = 'running',
+      metadata = metadata || jsonb_build_object(
+        'lastLocalRecoveryAt', now(),
+        'lastLocalRecoverySourceExecutionTaskId', $2::uuid::text,
+        'lastLocalRecoveryTaskId', $3::uuid::text
+      ),
+      message = '设备端重试已归入本轮无人值守任务',
+      finished_at = NULL,
+      updated_at = now(),
+      source_updated_at = now()
+    WHERE id = $4 AND tenant_id = $5
+      AND orchestration_revision = $6
+  `, [
+    nextRevision,
+    sourceTask.id,
+    adoptedTask.id,
+    parent.id,
+    agent.tenant_id,
+    Number(parent.orchestration_revision || 0),
+  ]);
+  await appendEvent(tx, {
+    tenantId: agent.tenant_id,
+    taskId: parent.id,
+    agentId: agent.id,
+    eventType: 'orchestration_local_recovery_adopted',
+    actorType: 'capture_agent',
+    actorId: agent.id,
+    actorName: agent.display_name || agent.client_label,
+    status: 'running',
+    message: '设备端重试已合并到原无人值守任务',
+    payload: {
+      sourceExecutionTaskId: sourceTask.id,
+      recoveryTaskId: adoptedTask.id,
+      revision: nextRevision,
+      itemIds: eligibleItems.map(item => item.id),
+    },
+  });
+  return adoptedTask;
 }
 
 async function refreshOrchestrationParentTask(tx, {
@@ -1625,18 +1921,28 @@ async function refreshOrchestrationParentTask(tx, {
 
   if (
     updated &&
-    aggregate.terminal &&
     parent.status !== updated.status &&
     parent.orchestration_schedule_id &&
     safeJson(parent.metadata).orchestrationScheduleRun === true
   ) {
     const schedule = await tx.queryOne(`
       UPDATE capture_orchestration_schedules
-      SET last_run_at = COALESCE($1::timestamptz, now()),
+      SET last_run_at = CASE
+          WHEN $7::boolean THEN COALESCE($1::timestamptz, now())
+          ELSE last_run_at
+        END,
         last_run_status = $2,
         last_error = CASE
-          WHEN $2 IN ('completed', 'completed_with_warnings', 'canceled')
+          WHEN $2 IN (
+            'pending', 'running', 'completed',
+            'completed_with_warnings', 'canceled'
+          )
             THEN '{}'::jsonb
+          WHEN $2 = 'needs_action'
+            THEN jsonb_build_object(
+              'code', 'scheduled_run_needs_action',
+              'message', $3::text
+            )
           ELSE jsonb_build_object(
             'code', 'scheduled_run_settled_with_failures',
             'message', $3::text
@@ -1646,7 +1952,7 @@ async function refreshOrchestrationParentTask(tx, {
       WHERE id = $4
         AND tenant_id = $5
         AND last_run_task_id = $6
-      RETURNING template_task_id, status, next_run_at
+      RETURNING template_task_id, status, next_run_at, last_run_at
     `, [
       updated.finished_at,
       updated.status,
@@ -1654,6 +1960,7 @@ async function refreshOrchestrationParentTask(tx, {
       parent.orchestration_schedule_id,
       tenantId,
       parent.id,
+      aggregate.terminal,
     ]);
     if (schedule) {
       await tx.execute(`
@@ -1670,6 +1977,12 @@ async function refreshOrchestrationParentTask(tx, {
               THEN '上一轮多 Agent 任务已结算，计划等待下一次运行'
             WHEN $4 = 'canceled'
               THEN '上一轮多 Agent 任务已停止，计划等待下一次运行'
+            WHEN $4 = 'needs_action'
+              THEN '上一轮有待处理项，可在云端重试失败关键词'
+            WHEN $4 = 'running'
+              THEN '上一轮多 Agent 任务正在执行'
+            WHEN $4 = 'pending'
+              THEN '上一轮多 Agent 任务已下发，等待执行节点'
             ELSE '上一轮多 Agent 任务有失败项，计划仍会按下一次时间运行'
           END,
           updated_at = now(),
@@ -1678,7 +1991,7 @@ async function refreshOrchestrationParentTask(tx, {
       `, [
         schedule.status,
         schedule.next_run_at,
-        updated.finished_at,
+        schedule.last_run_at,
         updated.status,
         parent.id,
         schedule.template_task_id,
@@ -1688,14 +2001,18 @@ async function refreshOrchestrationParentTask(tx, {
         tenantId,
         taskId: schedule.template_task_id,
         agentId: agent?.id || eventAgentId || null,
-        eventType: 'orchestration_schedule_run_settled',
+        eventType: aggregate.terminal
+          ? 'orchestration_schedule_run_settled'
+          : 'orchestration_schedule_run_status_updated',
         actorType: agent ? 'capture_agent' : actorType,
         actorId: agent?.id || actorId,
         actorName: agent
           ? agent.display_name || agent.client_label
           : actorName,
         status: schedule.status,
-        message: '无人值守计划的一轮多 Agent 任务已结算',
+        message: aggregate.terminal
+          ? '无人值守计划的一轮多 Agent 任务已结算'
+          : '无人值守计划的本轮状态已同步',
         payload: {
           runTaskId: parent.id,
           runStatus: updated.status,
@@ -2799,6 +3116,11 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'handoffSuccessorTaskId', capture_tasks.metadata->'handoffSuccessorTaskId',
             'handoffSourcePreviousStatus', capture_tasks.metadata->'handoffSourcePreviousStatus',
             'handedOffAt', capture_tasks.metadata->'handedOffAt',
+            'retryRequestHash', capture_tasks.metadata->'retryRequestHash',
+            'retryRequestKey', capture_tasks.metadata->'retryRequestKey',
+            'retrySourceExecutionTaskIds', capture_tasks.metadata->'retrySourceExecutionTaskIds',
+            'retryConfirmedByUser', capture_tasks.metadata->'retryConfirmedByUser',
+            'retrySafetyConfirmed', capture_tasks.metadata->'retrySafetyConfirmed',
             'recoveryTaskId', capture_tasks.metadata->'recoveryTaskId',
             'recoveryCommandId', capture_tasks.metadata->'recoveryCommandId',
             'queueBlocker', capture_tasks.metadata->'queueBlocker',
@@ -2812,6 +3134,19 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'localRequestId', capture_tasks.metadata->'localRequestId',
             'createCompletedAt', capture_tasks.metadata->'createCompletedAt',
             'createFailedAt', capture_tasks.metadata->'createFailedAt'
+          ))
+          ELSE '{}'::jsonb
+        END
+        || CASE
+          WHEN capture_tasks.metadata->>'localRecovery' = 'true'
+          THEN jsonb_strip_nulls(jsonb_build_object(
+            'orchestrationChild', capture_tasks.metadata->'orchestrationChild',
+            'parentTaskId', capture_tasks.metadata->'parentTaskId',
+            'orchestrationRevision', capture_tasks.metadata->'orchestrationRevision',
+            'itemIds', capture_tasks.metadata->'itemIds',
+            'localRecovery', capture_tasks.metadata->'localRecovery',
+            'localRecoverySourceExecutionTaskId', capture_tasks.metadata->'localRecoverySourceExecutionTaskId',
+            'localRecoveryAdoptedAt', capture_tasks.metadata->'localRecoveryAdoptedAt'
           ))
           ELSE '{}'::jsonb
         END
@@ -2936,6 +3271,10 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
       WHERE tenant_id = $1 AND origin_agent_id = $2 AND client_task_id = $3
       LIMIT 1
     `, [agent.tenant_id, agent.id, snapshot.clientTaskId]);
+  }
+
+  if (snapshotAccepted) {
+    task = await adoptLocalOrchestrationRecovery(tx, agent, task, snapshot);
   }
 
   let attempt = null;

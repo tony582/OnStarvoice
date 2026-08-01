@@ -697,6 +697,33 @@ function normalizeUnattendedRunRequest(request) {
   };
 }
 
+function normalizeOrchestrationExecutionContext(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const parentTaskId = String(source.parentTaskId || '').trim().slice(0, 100);
+  if (!parentTaskId) return null;
+  const itemIds = Array.from(
+    new Set(
+      (Array.isArray(source.itemIds) ? source.itemIds : [])
+        .map((itemId) => String(itemId || '').trim().slice(0, 100))
+        .filter(Boolean),
+    ),
+  ).slice(0, 30);
+  return {
+    parentTaskId,
+    revision: Math.max(0, Math.floor(Number(source.revision) || 0)),
+    itemIds,
+    scheduleId: String(source.scheduleId || '').trim().slice(0, 100),
+    scheduledFor: String(source.scheduledFor || '').trim().slice(0, 100),
+    sourceExecutionTaskId: String(
+      source.sourceExecutionTaskId ||
+        source.handoffSourceExecutionTaskId ||
+        source.retrySourceExecutionTaskId ||
+        '',
+    ).trim().slice(0, 100),
+  };
+}
+
 async function readUnattendedKeywordRunRequest() {
   const stored = await chrome.storage.local.get(
     STORAGE_KEYS.unattendedKeywordRunRequest,
@@ -888,11 +915,28 @@ function getUnattendedExecutionMode(source = {}) {
 function getUnattendedExecutionCopy(source = {}) {
   const executionMode = getUnattendedExecutionMode(source);
   const oneTime = executionMode === 'one_time';
+  const orchestrationRun = Boolean(
+    source &&
+      typeof source === 'object' &&
+      normalizeOrchestrationExecutionContext(source.orchestrationContext),
+  );
   return {
     executionMode,
-    taskLabel: oneTime ? '一次性采集任务' : '无人值守任务',
-    runLabel: oneTime ? '一次性采集' : '无人值守运行',
-    runnerLabel: oneTime ? '一次性任务运行页' : '无人值守运行页',
+    taskLabel: orchestrationRun
+      ? '无人值守计划执行批次'
+      : oneTime
+        ? '一次性采集任务'
+        : '无人值守任务',
+    runLabel: orchestrationRun
+      ? '无人值守计划运行批次'
+      : oneTime
+        ? '一次性采集'
+        : '无人值守运行',
+    runnerLabel: orchestrationRun
+      ? '无人值守计划运行页'
+      : oneTime
+        ? '一次性任务运行页'
+        : '无人值守运行页',
   };
 }
 
@@ -1086,6 +1130,9 @@ function buildUnattendedTaskRun(request, previousRun = null) {
     String(normalized.executionMode || '').trim() === 'one_time'
       ? 'one_time'
       : 'unattended_plan';
+  const orchestrationContext = normalizeOrchestrationExecutionContext(
+    normalized.orchestrationContext,
+  );
   return {
     ...(previousRun && typeof previousRun === 'object' ? previousRun : {}),
     id: normalized.id,
@@ -1098,7 +1145,9 @@ function buildUnattendedTaskRun(request, previousRun = null) {
     platform: plan.platform,
     trigger: String(normalized.reason || 'schedule'),
     title:
-      executionMode === 'one_time'
+      orchestrationContext
+        ? '无人值守计划执行批次'
+        : executionMode === 'one_time'
         ? '一次性关键词采集'
         : '无人值守关键词采集',
     attemptId: normalized.attemptId,
@@ -1139,6 +1188,7 @@ function buildUnattendedTaskRun(request, previousRun = null) {
       executionMode,
       cloudAgentScopeId: String(normalized.cloudAgentScopeId || ''),
       recoveryMode: String(normalized.recoveryMode || ''),
+      ...(orchestrationContext ? {orchestrationContext} : {}),
     },
     createdAt: normalized.createdAt,
     startedAt: String(normalized.startedAt || normalized.claimedAt || ''),
@@ -3068,6 +3118,9 @@ async function executeCloudTaskAgentCommand(command, token) {
                 cloudCommandId: commandId,
                 cloudAssigned: true,
                 executionMode,
+                orchestrationContext: normalizeOrchestrationExecutionContext(
+                  payload.orchestration,
+                ),
               },
             );
             if (!request) {
@@ -4749,6 +4802,7 @@ async function createUnattendedKeywordRunRequest(
     cloudCommandId = '',
     cloudAssigned = false,
     executionMode = '',
+    orchestrationContext = null,
   } = {},
 ) {
   return await runUnattendedRunMutation(async () => {
@@ -4761,7 +4815,12 @@ async function createUnattendedKeywordRunRequest(
     }
     const cloudCredential = await readCloudTaskAgentCredential();
     const now = new Date().toISOString();
-    const executionCopy = getUnattendedExecutionCopy(executionMode);
+    const normalizedOrchestrationContext =
+      normalizeOrchestrationExecutionContext(orchestrationContext);
+    const executionCopy = getUnattendedExecutionCopy({
+      executionMode,
+      orchestrationContext: normalizedOrchestrationContext,
+    });
     const request = {
       schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
       id: String(requestId || '').trim() || createUuid(),
@@ -4775,6 +4834,9 @@ async function createUnattendedKeywordRunRequest(
       cloudCommandId: String(cloudCommandId || '').trim(),
       cloudAssigned: cloudAssigned === true,
       executionMode: executionCopy.executionMode,
+      ...(normalizedOrchestrationContext
+        ? {orchestrationContext: normalizedOrchestrationContext}
+        : {}),
       cloudAgentScopeId: String(cloudCredential.id || ''),
       createdAt: now,
       updatedAt: now,
@@ -5168,6 +5230,7 @@ async function launchUnattendedKeywordRun(
     cloudCommandId = '',
     cloudAssigned = false,
     executionMode = '',
+    orchestrationContext = null,
   } = {},
 ) {
   const normalizedPlan = normalizeUnattendedKeywordPlan(plan);
@@ -5181,6 +5244,7 @@ async function launchUnattendedKeywordRun(
     cloudCommandId,
     cloudAssigned,
     executionMode,
+    orchestrationContext,
   });
   if (requestId && request.id !== requestId) {
     return null;
@@ -7239,9 +7303,13 @@ function markContentRelayHeartbeat(progress = {}) {
   });
 }
 
-function createContentRelayWatchdogError(code, message) {
+function createContentRelayWatchdogError(code, message, details = {}) {
   const error = new Error(message);
   error.code = code;
+  error.details =
+    details && typeof details === 'object' && !Array.isArray(details)
+      ? details
+      : {};
   return error;
 }
 
@@ -7397,7 +7465,14 @@ async function sendContentMessageWithTimeout(tabId, payload, timeoutMs) {
             reject(
               createContentRelayWatchdogError(
                 'CONTENT_RELAY_STALLED',
-                `页面超过 ${Math.ceil(inactivityTimeoutMs / 1000)} 秒没有采集进度，正在自动恢复当前步骤`,
+                `页面超过 ${Math.ceil(inactivityTimeoutMs / 1000)} 秒没有采集进度，正在自动恢复当前步骤（动作 ${String(payload?.action || 'unknown')}，阶段 ${String(latestHeartbeat?.phase || 'unknown')}）`,
+                {
+                  tabId,
+                  captureRequestId: requestId,
+                  captureAction: String(payload?.action || ''),
+                  lastHeartbeatPhase: String(latestHeartbeat?.phase || ''),
+                  heartbeatAgeMs,
+                },
               ),
             );
             return;
@@ -7407,7 +7482,14 @@ async function sendContentMessageWithTimeout(tabId, payload, timeoutMs) {
             reject(
               createContentRelayWatchdogError(
                 'CONTENT_RELAY_TIMEOUT',
-                `页面采集脚本超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应，已停止当前步骤`,
+                `页面采集脚本超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应，已停止当前步骤（动作 ${String(payload?.action || 'unknown')}，阶段 ${String(latestHeartbeat?.phase || 'unknown')}）`,
+                {
+                  tabId,
+                  captureRequestId: requestId,
+                  captureAction: String(payload?.action || ''),
+                  lastHeartbeatPhase: String(latestHeartbeat?.phase || ''),
+                  activeElapsedMs,
+                },
               ),
             );
             return;
@@ -9585,6 +9667,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           );
           if (action === 'captureProgress') {
             markContentRelayHeartbeat(normalizedProgress);
+            if (normalizedProgress.heartbeatOnly === true) {
+              sendResponse({
+                ok: true,
+                data: {heartbeatOnly: true},
+              });
+              return;
+            }
           }
           const progressPatch = runtimeTabPolicy.buildCaptureProgressPatch(
             sender?.tab,

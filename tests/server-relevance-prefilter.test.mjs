@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   PREFILTER_DEFAULT_MODEL_TIMEOUT_MS,
+  PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
   PREFILTER_DEFAULT_TENANT_CONCURRENCY,
   PREFILTER_MAX_LIST_BATCH,
   PREFILTER_MIN_SKIP_THRESHOLD,
@@ -75,7 +76,8 @@ test('list request validation is bounded, normalized and conservative-only for r
 
 test('invalid batch shapes are rejected before any model call', () => {
   assert.equal(PREFILTER_MAX_LIST_BATCH, 40);
-  assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 15000);
+  assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 25000);
+  assert.equal(PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS, 30000);
   assert.equal(PREFILTER_DEFAULT_TENANT_CONCURRENCY, 6);
   assert.equal(validatePrefilterRequest(validBody({ items: [] })).error, 'ITEMS_REQUIRED');
   assert.equal(
@@ -206,11 +208,18 @@ test('backend contract uses tenant auth, server DeepSeek config and an audit led
   assert.match(migration, /server_model_status IN \('ok', 'invalid_input', 'model_error', 'timeout'\)/);
   assert.match(migration, /execution_disposition IN \('collect_full', 'skip_full_capture', 'request_detail'\)/);
   assert.match(service, /callDeepSeekWithPrompt/);
+  assert.match(service, /await acquireTenantSlot\(tenantId\)/u);
+  assert.match(service, /PREFILTER_QUEUE_TIMEOUT/u);
+  assert.match(service, /Math\.max\(3000, pendingItems\.length \* 600\)/u);
+  assert.match(service, /finishReason/u);
+  assert.match(service, /retryCount/u);
   assert.match(service, /relevance_prefilter_daily_item_limit/);
   assert.match(service, /response_body = \$4::jsonb/);
   assert.match(route, /requireAuthCodeFirst, requireTenantWriter/);
   assert.match(route, /failOpen: true/);
   assert.match(aiLabeler, /config\.provider !== 'deepseek'/);
   assert.match(aiLabeler, /租户后台尚未配置 DeepSeek API Key/);
+  assert.match(aiLabeler, /LLM_JSON_PARSE_FAILED/u);
+  assert.match(aiLabeler, /finish_reason/u);
   assert.match(serverIndex, /app\.use\('\/api\/relevance\/prefilter', relevancePrefilterRouter\)/);
 });

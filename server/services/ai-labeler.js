@@ -173,7 +173,32 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
   });
   if (!resp.ok) throw new Error(`LLM API error ${resp.status}: ${await resp.text()}`);
   const data = await resp.json();
-  return JSON.parse(data.choices?.[0]?.message?.content || '');
+  const content = String(data.choices?.[0]?.message?.content || '');
+  const finishReason = String(data.choices?.[0]?.finish_reason || '');
+  const metadata = {
+    finishReason,
+    responseLength: content.length,
+    promptTokens: Math.max(0, Number(data.usage?.prompt_tokens) || 0),
+    completionTokens: Math.max(0, Number(data.usage?.completion_tokens) || 0),
+    totalTokens: Math.max(0, Number(data.usage?.total_tokens) || 0),
+  };
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (cause) {
+    const error = new Error(
+      `LLM JSON 解析失败（finish_reason=${finishReason || 'unknown'}，响应 ${content.length} 字符）`,
+    );
+    error.code = 'LLM_JSON_PARSE_FAILED';
+    error.finishReason = finishReason;
+    error.responseLength = content.length;
+    error.usage = data.usage || {};
+    error.cause = cause;
+    throw error;
+  }
+  return options.returnMetadata
+    ? {data: parsed, ...metadata}
+    : parsed;
 }
 
 async function getLLMConfig(tenantId) {
@@ -223,10 +248,23 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
     config.endpoint,
     systemPrompt,
     userMessage,
-    { timeoutMs: options.timeoutMs, maxTokens: options.maxTokens }
+    {
+      timeoutMs: options.timeoutMs,
+      maxTokens: options.maxTokens,
+      returnMetadata: options.returnMetadata === true,
+    }
   );
   if (options.returnMetadata) {
-    return { data, provider: config.provider, model: config.model };
+    return {
+      data: data.data,
+      provider: config.provider,
+      model: config.model,
+      finishReason: data.finishReason,
+      responseLength: data.responseLength,
+      promptTokens: data.promptTokens,
+      completionTokens: data.completionTokens,
+      totalTokens: data.totalTokens,
+    };
   }
   return data;
 }

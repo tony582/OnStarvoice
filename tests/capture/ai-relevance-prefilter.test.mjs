@@ -130,10 +130,10 @@ test('fallback titles cannot be skipped even when model is overconfident', async
 
 test('records use small DeepSeek batches and the bounded response deadline', async () => {
   assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 5);
-  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 20000);
+  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 90000);
   assert.match(
     apiSource,
-    /Math\.min\(20000, Number\(options\?\.timeout\) \|\| 20000\)/u,
+    /Math\.min\(120000, Number\(options\?\.timeout\) \|\| 90000\)/u,
     'API layer must not clamp the prefilter back below its response deadline',
   );
   const records = Array.from({length: 41}, (_, index) => keywordRecord(index + 1));
@@ -168,7 +168,7 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
     calls.every(({request}) => request.idempotencyKey.includes(':conservative:0.9700:')),
     true,
   );
-  assert.equal(calls.every(({options}) => options.timeout === 20000), true);
+  assert.equal(calls.every(({options}) => options.timeout === 90000), true);
   assert.equal(result.skippedRecordIds.length, 9);
   assert.equal(result.failedOpenCount, 0);
 });
@@ -315,7 +315,7 @@ test('prefilter idempotency scoping is stable for retries and bounded for the AP
 });
 
 test('parallel DeepSeek batches stay within the server tenant concurrency', async () => {
-  assert.equal(RELEVANCE_PREFILTER_MAX_CONCURRENCY, 6);
+  assert.equal(RELEVANCE_PREFILTER_MAX_CONCURRENCY, 2);
   const records = Array.from({length: 70}, (_, index) => keywordRecord(index + 1));
   let active = 0;
   let maxActive = 0;
@@ -338,7 +338,7 @@ test('parallel DeepSeek batches stay within the server tenant concurrency', asyn
       };
     },
   });
-  assert.equal(maxActive, 6);
+  assert.equal(maxActive, 2);
   assert.equal(result.evaluatedCount, 70);
   assert.equal(result.failedOpenCount, 0);
 });
