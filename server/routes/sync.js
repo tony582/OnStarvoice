@@ -268,7 +268,7 @@ function queueCommentWorkflow(record, result, context) {
   const total = countCommentWorkflowItems(record);
   enqueueCommentWorkflow(async () => {
     const commentStats = await applyCommentWorkflow(record, result, context);
-    if (result.action === 'inserted' && !commentStats.officialContent) {
+    if (result.action === 'inserted' && !result.officialContent && !commentStats.officialContent) {
       queueAiJobs([result.id]);
     }
   });
@@ -304,7 +304,7 @@ router.post('/', requireAuth, async (req, res) => {
       authCode: req.authCode,
     });
 
-    if (result.action === 'inserted' && !commentStats.queued && !commentStats.officialContent) queueAiJobs([result.id]);
+    if (result.action === 'inserted' && !result.officialContent && !commentStats.queued && !commentStats.officialContent) queueAiJobs([result.id]);
 
     return res.json({
       ok: true,
@@ -350,7 +350,7 @@ router.post('/batch', requireAuth, async (req, res) => {
         backendRecordId: result.id,
         commentStats,
       });
-      if (result.action === 'inserted' && !commentStats.queued && !commentStats.officialContent) insertedIds.push(result.id);
+      if (result.action === 'inserted' && !result.officialContent && !commentStats.queued && !commentStats.officialContent) insertedIds.push(result.id);
     } catch (err) {
       const message = err?.message || '同步失败';
       results.push({

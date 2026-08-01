@@ -8,6 +8,7 @@ import {
 } from '../middleware/auth.js';
 import {
   captureAgentOnline,
+  findCaptureAgentExecutionSlotBlocker,
   lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeRemoteTaskInput,
@@ -35,15 +36,6 @@ const HANDOFF_SOURCE_FINAL_STATUSES = new Set([
   'canceled',
   'skipped',
 ]);
-const HANDOFF_TARGET_BUSY_STATUSES = [
-  'pending',
-  'claimed',
-  'running',
-  'recovering',
-  'interrupted',
-  'needs_action',
-  'resume_requested',
-];
 const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
   'DOUYIN_SEARCH_SECURITY_CHALLENGE',
   'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
@@ -2124,28 +2116,20 @@ router.post(
             409,
           )};
         }
-        const targetBusyTask = await tx.queryOne(`
-          SELECT id, status
-          FROM capture_tasks
-          WHERE tenant_id = $1
-            AND COALESCE(assigned_agent_id, origin_agent_id) = $2
-            AND task_type <> 'capture_orchestration'
-            AND status = ANY($3::text[])
-          ORDER BY created_at, id
-          LIMIT 1
-        `, [
+        const targetBusyTask = await findCaptureAgentExecutionSlotBlocker(
+          tx,
           req.tenantId,
           normalized.targetAgentId,
-          HANDOFF_TARGET_BUSY_STATUSES,
-        ]);
+        );
         if (targetBusyTask) {
           return {failure: requestError(
             'retry_target_busy',
             '目标 Agent 当前有执行中或排队任务，请选择空闲节点',
             409,
             {
-              blockingTaskId: targetBusyTask.id,
+              blockingTaskId: targetBusyTask.task_id || targetBusyTask.id,
               blockingTaskStatus: targetBusyTask.status,
+              blockerKind: targetBusyTask.kind,
             },
           )};
         }
@@ -2758,28 +2742,20 @@ router.post(
             409,
           )};
         }
-        const targetBusyTask = await tx.queryOne(`
-          SELECT id, status
-          FROM capture_tasks
-          WHERE tenant_id = $1
-            AND COALESCE(assigned_agent_id, origin_agent_id) = $2
-            AND task_type <> 'capture_orchestration'
-            AND status = ANY($3::text[])
-          ORDER BY created_at, id
-          LIMIT 1
-        `, [
+        const targetBusyTask = await findCaptureAgentExecutionSlotBlocker(
+          tx,
           req.tenantId,
           normalized.targetAgentId,
-          HANDOFF_TARGET_BUSY_STATUSES,
-        ]);
+        );
         if (targetBusyTask) {
           return {failure: requestError(
             'handoff_target_busy',
             '接力节点当前有执行中或排队任务，请选择空闲节点',
             409,
             {
-              blockingTaskId: targetBusyTask.id,
+              blockingTaskId: targetBusyTask.task_id || targetBusyTask.id,
               blockingTaskStatus: targetBusyTask.status,
+              blockerKind: targetBusyTask.kind,
             },
           )};
         }

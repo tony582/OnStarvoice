@@ -222,10 +222,31 @@ async function start() {
   // 自愈:启动 15s 后(避开启动峰值)非阻塞补回积压的评论入库 ——
   // 异步队列曾因 LLM 请求挂死而卡死、或进程重启丢失内存队列,导致 record_comments 漏入。
   // 评论数据本就安全存在 records.payload,这里从 payload 重新入库。LLM 已加超时,不会再卡。
-  setTimeout(() => {
-    import('./services/comment-workflow.js')
-      .then(m => m.reprocessPendingComments())
-      .catch(err => console.error('[Reprocess] 启动自愈失败:', err.message));
+  setTimeout(async () => {
+    try {
+      const workflow = await import('./services/comment-workflow.js');
+      await workflow.reprocessPendingComments();
+
+      // 一次性把旧版因裸命中“安全”而落库的负面评论重新排入 AI 语义分类。
+      // “安全”只用于缩小历史候选范围，不作为最终正负结论；AI 回写前保留旧事实，
+      // 避免规则 fallback 暂时把真实安全投诉降成非负面。
+      const { queryOne, execute } = await import('./db/init.js');
+      const flag = 'comment_safety_semantic_reclassify_v1';
+      const done = await queryOne('SELECT 1 FROM schema_migrations WHERE version = $1', [flag]);
+      if (!done) {
+        const stats = await workflow.reclassifyComments(null, {
+          safetySemanticReviewCandidatesOnly: true,
+          queueForAI: true,
+        });
+        await execute(
+          'INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING',
+          [flag],
+        );
+        console.log(`[CommentSafety] 存量评论已重新排入 AI 语义分类:${stats.changed} 条`);
+      }
+    } catch (err) {
+      console.error('[Reprocess] 启动自愈或安全词重算失败:', err.message);
+    }
   }, 15000);
 
   // 封面落地:启动 25s 后回填近 24h 采集、还没落地的封面(链接多半还有效,过期的自动跳过)

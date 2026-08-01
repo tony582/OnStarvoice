@@ -339,6 +339,10 @@ test('negative patrol backend reassigns unfinished items with CAS and stale-chil
     /negative_patrol_reassignment_execution_active/u,
   );
   assert.match(reassign, /requireOnline:\s*true/u);
+  assert.match(reassign, /requireIdle:\s*true/u);
+  assert.match(route, /await lockCaptureAgentExecutionSlot\(tx, tenantId, agentId\)/u);
+  assert.match(route, /findCaptureAgentExecutionSlotBlocker/u);
+  assert.match(route, /CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES/u);
   const agentLockIndex = reassign.indexOf(
     'const compatible = await loadCompatibleAgents(',
   );

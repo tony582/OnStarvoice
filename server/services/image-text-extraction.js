@@ -13,6 +13,7 @@ import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { execute, getSetting, queryOne } from '../db/init.js';
+import {runWithTenantAiAdmission} from './ai-admission.js';
 import { isAllowedMediaHost, resolveReferer } from './media-proxy.js';
 import { MEDIA_DIR } from './media-store.js';
 
@@ -725,7 +726,11 @@ async function extractRecordImageTextWithinSlot({
       }
 
       const dataUrl = `data:${mime};base64,${bytes.toString('base64')}`;
-      const result = await requestQwenOcr({ config, dataUrl, fetchImpl });
+      const result = await runWithTenantAiAdmission(
+        tenantId,
+        () => requestQwenOcr({config, dataUrl, fetchImpl}),
+        {priority: 'interactive', kind: 'image_ocr'},
+      );
       await saveOcrSuccess({
         tenantId,
         recordId,

@@ -6,8 +6,6 @@ import { fileURLToPath } from 'node:url';
 
 import {
   PREFILTER_DEFAULT_MODEL_TIMEOUT_MS,
-  PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
-  PREFILTER_DEFAULT_TENANT_CONCURRENCY,
   PREFILTER_MAX_LIST_BATCH,
   PREFILTER_MIN_SKIP_THRESHOLD,
   PREFILTER_PROMPT_VERSION,
@@ -77,8 +75,6 @@ test('list request validation is bounded, normalized and conservative-only for r
 test('invalid batch shapes are rejected before any model call', () => {
   assert.equal(PREFILTER_MAX_LIST_BATCH, 40);
   assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 25000);
-  assert.equal(PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS, 30000);
-  assert.equal(PREFILTER_DEFAULT_TENANT_CONCURRENCY, 6);
   assert.equal(validatePrefilterRequest(validBody({ items: [] })).error, 'ITEMS_REQUIRED');
   assert.equal(
     validatePrefilterRequest(validBody({
@@ -191,12 +187,13 @@ test('idempotency body hash ignores request ids but detects logical content chan
   );
 });
 
-test('backend contract uses tenant auth, server DeepSeek config and an audit ledger', async () => {
-  const [migration, service, route, aiLabeler, serverIndex] = await Promise.all([
+test('backend contract uses tenant auth, shared AI admission and an audit ledger', async () => {
+  const [migration, service, route, aiLabeler, admission, serverIndex] = await Promise.all([
     source('server/db/migrations/031_relevance_prefilter.sql'),
     source('server/services/relevance-prefilter.js'),
     source('server/routes/relevance-prefilter.js'),
     source('server/services/ai-labeler.js'),
+    source('server/services/ai-admission.js'),
     source('server/index.js'),
   ]);
 
@@ -208,8 +205,7 @@ test('backend contract uses tenant auth, server DeepSeek config and an audit led
   assert.match(migration, /server_model_status IN \('ok', 'invalid_input', 'model_error', 'timeout'\)/);
   assert.match(migration, /execution_disposition IN \('collect_full', 'skip_full_capture', 'request_detail'\)/);
   assert.match(service, /callDeepSeekWithPrompt/);
-  assert.match(service, /await acquireTenantSlot\(tenantId\)/u);
-  assert.match(service, /PREFILTER_QUEUE_TIMEOUT/u);
+  assert.doesNotMatch(service, /acquireTenantSlot|tenantSlotStates/u);
   assert.match(service, /Math\.max\(3000, pendingItems\.length \* 600\)/u);
   assert.match(service, /finishReason/u);
   assert.match(service, /retryCount/u);
@@ -221,5 +217,9 @@ test('backend contract uses tenant auth, server DeepSeek config and an audit led
   assert.match(aiLabeler, /租户后台尚未配置 DeepSeek API Key/);
   assert.match(aiLabeler, /LLM_JSON_PARSE_FAILED/u);
   assert.match(aiLabeler, /finish_reason/u);
+  assert.match(aiLabeler, /runWithTenantAiAdmission/u);
+  assert.match(admission, /DEFAULT_AI_TENANT_CONCURRENCY = 6/u);
+  assert.match(admission, /priority/u);
+  assert.match(admission, /AI_ADMISSION_QUEUE_TIMEOUT/u);
   assert.match(serverIndex, /app\.use\('\/api\/relevance\/prefilter', relevancePrefilterRouter\)/);
 });

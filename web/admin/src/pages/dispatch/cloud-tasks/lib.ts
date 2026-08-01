@@ -178,6 +178,9 @@ export type Overview = {
     onlineAgents: number
     runningTasks: number
     attentionTasks: number
+    aiActive?: number
+    aiQueued?: number
+    aiConcurrencyLimit?: number
   }
 }
 
@@ -679,6 +682,23 @@ export function canResume(task: CloudTask) {
     task.task_type.includes('unattended') &&
     ['interrupted', 'needs_action', 'failed', 'completed_with_failures'].includes(task.status),
   )
+}
+
+const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
+  'unattended_keyword_capture',
+  'negative_post_patrol',
+  'official_account_comment_patrol',
+  'followed_creator_post_patrol',
+  'official_account_post_discovery',
+])
+
+export function canRetryOnIdleAgent(task: CloudTask) {
+  if (task.parent_task_id || task.pending_command_id) return false
+  if (!['failed', 'completed_with_failures'].includes(task.status)) return false
+  if (task.task_type === 'capture_orchestration') {
+    return task.metadata?.promotedRetryParent === true
+  }
+  return CROSS_DEVICE_RETRY_TASK_TYPES.has(task.task_type)
 }
 
 export function canStop(task: CloudTask) {

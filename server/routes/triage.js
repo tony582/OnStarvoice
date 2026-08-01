@@ -120,7 +120,6 @@ export const ACTIVE_QUEUE_CONDITION = `
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
   AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
   AND rt.archived_at IS NULL
-  AND NOT (r.official_response_status = 'responded' AND r.negative_comment_count = 0)
 `;
 
 // 处理模式和归档生命周期相互独立。两个列表共享模式范围，只按 archived_at 分组。

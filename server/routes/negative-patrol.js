@@ -7,7 +7,10 @@ import {
   requireTenantWriter,
 } from '../middleware/auth.js';
 import {
+  CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
   captureAgentOnline,
+  findCaptureAgentExecutionSlotBlocker,
+  lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   sanitizeCloudStructuredObject,
 } from '../services/capture-cloud.js';
@@ -45,15 +48,8 @@ const NEGATIVE_PATROL_REASSIGNABLE_ITEM_STATUSES = new Set([
   'needs_action',
   'failed',
 ]);
-const NEGATIVE_PATROL_ACTIVE_CHILD_STATUSES = [
-  'pending',
-  'claimed',
-  'running',
-  'recovering',
-  'interrupted',
-  'waiting_device',
-  'resume_requested',
-];
+const NEGATIVE_PATROL_ACTIVE_CHILD_STATUSES =
+  CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES;
 const NEGATIVE_PATROL_TERMINAL_ATTEMPT_STATUSES = [
   'completed',
   'completed_with_warnings',
@@ -647,12 +643,15 @@ async function loadCompatibleAgents(
   tenantId,
   agentIds,
   platform,
-  {requireOnline = false} = {},
+  {requireOnline = false, requireIdle = false} = {},
 ) {
   const byId = new Map();
   // Lock in a stable UUID order so concurrent task creation cannot deadlock
   // when the same Agent set is submitted in a different visual order.
   for (const agentId of [...agentIds].sort()) {
+    if (requireIdle) {
+      await lockCaptureAgentExecutionSlot(tx, tenantId, agentId);
+    }
     const compatible = await loadCompatibleAgent(
       tx,
       tenantId,
@@ -675,6 +674,31 @@ async function loadCompatibleAgents(
         409,
         {agentId},
       )};
+    }
+    if (requireIdle) {
+      const blocker = await findCaptureAgentExecutionSlotBlocker(
+        tx,
+        tenantId,
+        agentId,
+      );
+      if (blocker) {
+        return {failure: requestError(
+          'agent_busy',
+          `节点“${text(
+            compatible.agent?.display_name ||
+            compatible.agent?.client_label ||
+            agentId,
+            120,
+          )}”当前仍有任务或远程指令占用，请选择空闲节点`,
+          409,
+          {
+            agentId,
+            blockingTaskId: blocker.task_id || blocker.id,
+            blockingTaskStatus: blocker.status,
+            blockerKind: blocker.kind,
+          },
+        )};
+      }
     }
     byId.set(agentId, compatible.agent);
   }
@@ -1962,7 +1986,7 @@ router.post(
           req.tenantId,
           agentIds,
           parent.platform,
-          {requireOnline: true},
+          {requireOnline: true, requireIdle: true},
         );
         if (compatible.failure) return {failure: compatible.failure};
         const agents = compatible.agents;

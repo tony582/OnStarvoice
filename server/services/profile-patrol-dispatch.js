@@ -1,7 +1,10 @@
 import crypto from 'node:crypto';
 import {withTransaction} from '../db/init.js';
 import {
+  CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
   captureAgentOnline,
+  findCaptureAgentExecutionSlotBlocker,
+  lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   sanitizeCloudStructuredObject,
 } from './capture-cloud.js';
@@ -15,6 +18,18 @@ const PROFILE_PATROL_CAPABILITIES = Object.freeze({
   creator: 'followedCreatorPostPatrol',
   official: 'officialAccountCommentPatrolProfileV1',
 });
+
+const PROFILE_PATROL_ACTIVE_ITEM_STATUSES = Object.freeze([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+  'running',
+  'retryable',
+  'needs_action',
+  'failed',
+]);
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -57,7 +72,6 @@ export async function loadCompatibleProfilePatrolAgent(
   platforms,
   subjectType,
 ) {
-  const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
   const agent = await tx.queryOne(`
     SELECT ca.*, tenant.status AS tenant_status,
       ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
@@ -71,12 +85,26 @@ export async function loadCompatibleProfilePatrolAgent(
     WHERE ca.id = $1::uuid AND ca.tenant_id = $2
     FOR UPDATE OF ca
   `, [agentId, tenantId]);
+  const failure = profilePatrolAgentCompatibilityFailure(
+    agent,
+    platforms,
+    subjectType,
+  );
+  return failure ? {failure} : {agent};
+}
+
+export function profilePatrolAgentCompatibilityFailure(
+  agent,
+  platforms,
+  subjectType,
+) {
+  const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
   if (!agent) {
-    return {failure: requestError(
+    return requestError(
       'agent_not_found',
       '目标执行节点不存在于当前租户',
       404,
-    )};
+    );
   }
   if (
     agent.tenant_status !== 'active' ||
@@ -86,11 +114,11 @@ export async function loadCompatibleProfilePatrolAgent(
     (agent.auth_code_expires_at &&
       new Date(agent.auth_code_expires_at) < new Date())
   ) {
-    return {failure: requestError(
+    return requestError(
       'agent_unavailable',
       '目标执行节点授权已失效、已停用或不存在',
       409,
-    )};
+    );
   }
   const capabilities = safeJson(agent.capabilities);
   const capability = PROFILE_PATROL_CAPABILITIES[subjectType];
@@ -102,11 +130,11 @@ export async function loadCompatibleProfilePatrolAgent(
     (subjectType === 'official' &&
       capabilities.officialAccountLatestPostsByCountV1 !== true)
   ) {
-    return {failure: requestError(
+    return requestError(
       'agent_profile_scan_capability_missing',
       '目标执行节点版本尚不支持账号作品扫描，请先升级扩展',
       409,
-    )};
+    );
   }
   const allowed = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
@@ -118,13 +146,206 @@ export async function loadCompatibleProfilePatrolAgent(
     (allowed.length > 0 && !allowed.includes(platform)) ||
     (supported.length > 0 && !supported.includes(platform)));
   if (incompatible.length > 0) {
-    return {failure: requestError(
+    return requestError(
       'agent_platform_mismatch',
       `目标执行节点不支持：${incompatible.join('、')}`,
       409,
-    )};
+    );
   }
-  return {agent};
+  return null;
+}
+
+export function profilePatrolTaskBlocksAgentSlot(status) {
+  return CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes(
+    text(status, 80).toLowerCase(),
+  );
+}
+
+export async function loadAvailableScheduledProfilePatrolAgent(tx, {
+  tenantId,
+  preferredAgentId = '',
+  platform,
+  subjectType,
+}) {
+  const preferred = text(preferredAgentId, 100).toLowerCase();
+  const candidates = await tx.queryAll(`
+    SELECT ca.*, tenant.status AS tenant_status,
+      ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
+      ab.id AS active_auth_binding_id,
+      (
+        SELECT COUNT(*)::integer
+        FROM capture_tasks active_task
+        WHERE active_task.tenant_id = ca.tenant_id
+          AND COALESCE(
+            active_task.assigned_agent_id,
+            active_task.origin_agent_id
+          ) = ca.id
+          AND active_task.task_type <> 'capture_orchestration'
+          AND active_task.status = ANY($3::text[])
+      ) AS active_task_count,
+      (
+        SELECT COUNT(*)::integer
+        FROM capture_agent_commands active_command
+        WHERE active_command.tenant_id = ca.tenant_id
+          AND active_command.agent_id = ca.id
+          AND active_command.status IN ('pending', 'acknowledged')
+          AND (
+            active_command.expires_at IS NULL OR
+            active_command.expires_at > now()
+          )
+      ) AS active_command_count
+    FROM capture_agents ca
+    JOIN tenants tenant ON tenant.id = ca.tenant_id
+    LEFT JOIN auth_codes ac
+      ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+    LEFT JOIN auth_bindings ab
+      ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+    WHERE ca.tenant_id = $1 AND ca.status = 'active'
+    ORDER BY
+      CASE WHEN ca.id::text = $2 THEN 0 ELSE 1 END,
+      ca.last_heartbeat_at DESC NULLS LAST,
+      ca.id
+  `, [tenantId, preferred, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]);
+  const candidate = candidates.find(agent =>
+    !profilePatrolAgentCompatibilityFailure(
+      agent,
+      [platform],
+      subjectType,
+    ) &&
+    captureAgentOnline(agent.last_heartbeat_at) &&
+    Number(agent.active_task_count || 0) === 0 &&
+    Number(agent.active_command_count || 0) === 0);
+  if (candidate) {
+    await lockCaptureAgentExecutionSlot(tx, tenantId, candidate.id);
+    const compatible = await loadCompatibleProfilePatrolAgent(
+      tx,
+      tenantId,
+      candidate.id,
+      [platform],
+      subjectType,
+    );
+    const busy = compatible.failure ? true
+      : await findCaptureAgentExecutionSlotBlocker(
+        tx,
+        tenantId,
+        compatible.agent.id,
+      );
+    if (
+      !compatible.failure &&
+      !busy &&
+      captureAgentOnline(compatible.agent.last_heartbeat_at)
+    ) {
+      return {
+        agent: compatible.agent,
+        preferredAgentId: preferred || null,
+        selection: !preferred
+          ? 'auto'
+          : String(compatible.agent.id) === preferred
+            ? 'preferred'
+            : 'failover',
+      };
+    }
+  }
+  return {failure: requestError(
+    'profile_scan_idle_agent_unavailable',
+    '当前没有在线、空闲且支持该平台的执行节点，云端稍后会自动重试',
+    409,
+  )};
+}
+
+export async function reconcileStaleProfilePatrolExecutions(
+  tx,
+  {limit = 100, staleMinutes = 10} = {},
+) {
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+  const safeStaleMinutes = Math.max(
+    5,
+    Math.min(1440, Number(staleMinutes) || 10),
+  );
+  const reconciled = await tx.queryAll(`
+    WITH stale_execution AS (
+      SELECT execution.id
+      FROM monitor_executions execution
+      WHERE execution.status IN ('pending', 'running')
+        AND execution.updated_at <=
+          now() - make_interval(mins => $2::integer)
+        AND EXISTS (
+          SELECT 1
+          FROM capture_task_items linked_item
+          WHERE linked_item.tenant_id = execution.tenant_id
+            AND linked_item.metadata->>'monitorExecutionId' =
+              execution.id::text
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM capture_task_items active_item
+          JOIN capture_tasks active_task
+            ON active_task.id = active_item.execution_task_id
+            AND active_task.tenant_id = active_item.tenant_id
+          LEFT JOIN capture_agents active_agent
+            ON active_agent.id = COALESCE(
+              active_task.assigned_agent_id,
+              active_task.origin_agent_id
+            )
+            AND active_agent.tenant_id = active_task.tenant_id
+          WHERE active_item.tenant_id = execution.tenant_id
+            AND active_item.metadata->>'monitorExecutionId' =
+              execution.id::text
+            AND active_item.status = ANY($3::text[])
+            AND active_task.status = ANY($4::text[])
+            AND (
+              (
+                active_task.status IN ('pending', 'waiting_device')
+                AND EXISTS (
+                  SELECT 1
+                  FROM capture_agent_commands active_command
+                  WHERE active_command.tenant_id = active_task.tenant_id
+                    AND active_command.task_id = active_task.id
+                    AND active_command.command_type = 'create'
+                    AND active_command.status IN ('pending', 'acknowledged')
+                    AND active_command.expires_at > now()
+                )
+              )
+              OR (
+                active_task.status IN ('claimed', 'running', 'recovering')
+                AND active_agent.status = 'active'
+                AND active_agent.last_heartbeat_at >=
+                  now() - interval '2 minutes'
+              )
+              OR (
+                active_task.status = 'resume_requested'
+                AND EXISTS (
+                  SELECT 1
+                  FROM capture_agent_commands active_command
+                  WHERE active_command.tenant_id = active_task.tenant_id
+                    AND active_command.task_id = active_task.id
+                    AND active_command.command_type = 'resume'
+                    AND active_command.status IN ('pending', 'acknowledged')
+                    AND active_command.expires_at > now()
+                )
+              )
+            )
+        )
+      ORDER BY execution.updated_at, execution.id
+      LIMIT $1
+      FOR UPDATE OF execution SKIP LOCKED
+    )
+    UPDATE monitor_executions execution
+    SET status = 'failed',
+      error_message =
+        '历史账号巡查执行状态未闭环，云端已清理并重新调度',
+      finished_at = COALESCE(execution.finished_at, now()),
+      updated_at = now()
+    FROM stale_execution
+    WHERE execution.id = stale_execution.id
+    RETURNING execution.id, execution.tenant_id, execution.subscription_id
+  `, [
+    safeLimit,
+    safeStaleMinutes,
+    PROFILE_PATROL_ACTIVE_ITEM_STATUSES,
+    CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  ]);
+  return reconciled;
 }
 
 export async function materializeProfilePatrolTask(tx, {
@@ -143,6 +364,8 @@ export async function materializeProfilePatrolTask(tx, {
   requestedByName = '',
   actorType = 'user',
   scheduledFor = '',
+  preferredAgentId = null,
+  agentSelection = 'manual',
 }) {
   const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
   if (!workflow) throw new Error(`Unsupported profile patrol subject: ${subjectType}`);
@@ -182,6 +405,8 @@ export async function materializeProfilePatrolTask(tx, {
     captureSettings,
     scheduled: triggerType === 'profile_scan_schedule',
     scheduledFor: scheduledFor || null,
+    scheduledPreferredAgentId: preferredAgentId || null,
+    scheduledAgentSelection: agentSelection,
   };
   const resolvedExecutionsBySubscription = new Map();
   for (const subscription of subscriptions) {
@@ -254,7 +479,7 @@ export async function materializeProfilePatrolTask(tx, {
     }),
     JSON.stringify(metadata),
     triggerType === 'profile_scan_schedule'
-      ? `${title}定时任务已创建，等待绑定设备领取`
+      ? `${title}定时任务已创建，等待执行设备领取`
       : `${title}任务已创建，等待目标设备领取`,
   ]);
 
@@ -378,7 +603,11 @@ export async function materializeProfilePatrolTask(tx, {
     text(requestedByName, 240),
     task.status,
     triggerType === 'profile_scan_schedule'
-      ? `云端调度器已为绑定节点创建${title}任务`
+      ? agentSelection === 'failover'
+        ? `绑定节点不可用，云端已改由在线空闲节点创建${title}任务`
+        : agentSelection === 'auto'
+          ? `云端已自动选择在线空闲节点创建${title}任务`
+          : `云端调度器已为绑定节点创建${title}任务`
       : `后台已向指定节点创建${title}任务`,
     JSON.stringify({
       commandId: command.id,
@@ -386,6 +615,8 @@ export async function materializeProfilePatrolTask(tx, {
       subscriptionCount: subscriptions.length,
       requestHash: hash,
       scheduledFor: scheduledFor || null,
+      preferredAgentId: preferredAgentId || null,
+      agentSelection,
     }),
   ]);
 
@@ -410,6 +641,10 @@ function profileMonitorSettings(rows) {
 export async function enqueueDueProfilePatrolTasks(limit = 20) {
   const safeLimit = Math.max(1, Math.min(100, Number(limit) || 20));
   return await withTransaction(async tx => {
+    const reconciledExecutions = await reconcileStaleProfilePatrolExecutions(
+      tx,
+      {limit: safeLimit * 5},
+    );
     const subscriptions = await tx.queryAll(`
       SELECT ms.*
       FROM monitor_subscriptions ms
@@ -442,35 +677,25 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       LIMIT $1
       FOR UPDATE OF ms SKIP LOCKED
     `, [safeLimit]);
-    const results = [];
+    const results = reconciledExecutions.map(execution => ({
+      kind: 'stale_execution_reconciled',
+      subscriptionId: execution.subscription_id,
+      executionId: execution.id,
+      message: '历史账号巡查执行状态未闭环，已清理并重新进入调度',
+    }));
     const settingsByTenant = new Map();
 
     for (const subscription of subscriptions) {
       const assignedAgentId = text(subscription.assigned_agent_id, 100);
-      if (!assignedAgentId) {
-        const message = '该账号尚未绑定执行节点，定时扫描未创建';
-        await tx.execute(`
-          UPDATE monitor_subscriptions
-          SET last_error = $1, updated_at = now()
-          WHERE id = $2 AND tenant_id = $3
-        `, [message, subscription.id, subscription.tenant_id]);
-        results.push({
-          kind: 'needs_agent',
-          subscriptionId: subscription.id,
-          message,
-        });
-        continue;
-      }
       const subjectType = subscription.subject_type || 'creator';
-      const compatible = await loadCompatibleProfilePatrolAgent(
-        tx,
-        subscription.tenant_id,
-        assignedAgentId,
-        [subscription.platform],
+      const available = await loadAvailableScheduledProfilePatrolAgent(tx, {
+        tenantId: subscription.tenant_id,
+        preferredAgentId: assignedAgentId,
+        platform: subscription.platform,
         subjectType,
-      );
-      if (compatible.failure) {
-        const message = compatible.failure.message;
+      });
+      if (available.failure) {
+        const message = available.failure.message;
         await tx.execute(`
           UPDATE monitor_subscriptions
           SET last_error = $1, updated_at = now()
@@ -483,6 +708,7 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
         });
         continue;
       }
+      const compatible = available;
       if (!settingsByTenant.has(subscription.tenant_id)) {
         const rows = await tx.queryAll(`
           SELECT key, value
@@ -511,6 +737,7 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
               autoSyncAfterDetailCapture: true,
               commentsMaxDetectedItems: 50,
               skipAlreadyCapturedOnDetailCapture: false,
+              skipOfficialAccounts: true,
               verifyPublishDateFromDetail: true,
             }
           : {autoSyncAfterDetailCapture: true},
@@ -519,7 +746,7 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
       const requestKey = crypto.randomUUID();
       const requestHash = profilePatrolRequestHash({
         workflow,
-        agentId: assignedAgentId,
+        agentId: compatible.agent.id,
         subscriptionIds: [subscription.id],
         title,
         monitorSettings,
@@ -566,6 +793,8 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
           requestedByName: '云端调度器',
           actorType: 'system',
           scheduledFor,
+          preferredAgentId: compatible.preferredAgentId,
+          agentSelection: compatible.selection,
         });
       } catch (error) {
         if (error?.error === 'subscription_execution_busy') {
@@ -587,7 +816,9 @@ export async function enqueueDueProfilePatrolTasks(limit = 20) {
         kind: 'created',
         subscriptionId: subscription.id,
         taskId: dispatched.task.id,
+        agentId: compatible.agent.id,
         agentOnline: dispatched.agentOnline,
+        agentSelection: compatible.selection,
       });
     }
     return results;

@@ -3,6 +3,7 @@
  */
 
 import { queryOne, queryAll, getSetting } from '../db/init.js';
+import {runWithTenantAiAdmission} from './ai-admission.js';
 import { parsePublishTimestamp } from './publish-date.js';
 import {
   formatMonitoringIntentForPrompt,
@@ -10,6 +11,7 @@ import {
 } from './monitoring-intent.js';
 
 export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v2';
+const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -133,9 +135,54 @@ export function buildUserMessage(record) {
   return text || '(空内容)';
 }
 
+export function modelRetryDelayMs(attempt, retryAfter = '') {
+  const raw = String(retryAfter || '').trim();
+  if (/^\d+(?:\.\d+)?$/u.test(raw)) {
+    return Math.max(100, Math.min(10000, Math.round(Number(raw) * 1000)));
+  }
+  const retryAt = Date.parse(raw);
+  if (Number.isFinite(retryAt)) {
+    return Math.max(100, Math.min(10000, retryAt - Date.now()));
+  }
+  return Math.min(5000, 500 * (2 ** Math.max(0, Number(attempt) || 0)));
+}
+
+async function requestModelResponse(url, buildRequest, errorPrefix) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(url, buildRequest());
+    if (response.ok) return response;
+    const responseText = await response.text();
+    if (
+      RETRYABLE_MODEL_HTTP_STATUSES.has(response.status) &&
+      attempt < 2
+    ) {
+      const waitMs = modelRetryDelayMs(
+        attempt,
+        response.headers?.get?.('retry-after') || '',
+      );
+      console.warn('[AI] transient upstream response, retrying in slot', {
+        status: response.status,
+        attempt: attempt + 1,
+        waitMs,
+      });
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      continue;
+    }
+    const error = new Error(
+      `${errorPrefix} ${response.status}: ${responseText}`,
+    );
+    error.status = response.status;
+    error.code = response.status === 429
+      ? 'LLM_RATE_LIMITED'
+      : 'LLM_HTTP_ERROR';
+    throw error;
+  }
+  throw new Error(`${errorPrefix}: retry exhausted`);
+}
+
 async function callGemini(apiKey, model, systemPrompt, userMessage) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const resp = await fetch(url, {
+  const resp = await requestModelResponse(url, () => ({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -144,8 +191,7 @@ async function callGemini(apiKey, model, systemPrompt, userMessage) {
       generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
     }),
     signal: AbortSignal.timeout(40000), // 防止 LLM 请求挂死冻住整个评论入库串行队列
-  });
-  if (!resp.ok) throw new Error(`Gemini API error ${resp.status}: ${await resp.text()}`);
+  }), 'Gemini API error');
   const data = await resp.json();
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
   return JSON.parse(text);
@@ -159,7 +205,7 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
     ? Math.max(256, Math.min(8192, Number(options.maxTokens)))
     : undefined;
   const url = `${endpoint}/chat/completions`;
-  const resp = await fetch(url, {
+  const resp = await requestModelResponse(url, () => ({
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
     body: JSON.stringify({
@@ -170,8 +216,7 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
       max_tokens: maxTokens,
     }),
     signal: AbortSignal.timeout(timeoutMs), // 前置筛选使用更短预算；现有标注默认仍为 40 秒
-  });
-  if (!resp.ok) throw new Error(`LLM API error ${resp.status}: ${await resp.text()}`);
+  }), 'LLM API error');
   const data = await resp.json();
   const content = String(data.choices?.[0]?.message?.content || '');
   const finishReason = String(data.choices?.[0]?.finish_reason || '');
@@ -242,17 +287,25 @@ export async function getDeepSeekConfig(tenantId) {
 
 export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
   const config = await getDeepSeekConfig(tenantId);
-  const data = await callOpenAICompatible(
-    config.apiKey,
-    config.model,
-    config.endpoint,
-    systemPrompt,
-    userMessage,
+  const data = await runWithTenantAiAdmission(
+    tenantId,
+    () => callOpenAICompatible(
+      config.apiKey,
+      config.model,
+      config.endpoint,
+      systemPrompt,
+      userMessage,
+      {
+        timeoutMs: options.timeoutMs,
+        maxTokens: options.maxTokens,
+        returnMetadata: options.returnMetadata === true,
+      },
+    ),
     {
-      timeoutMs: options.timeoutMs,
-      maxTokens: options.maxTokens,
-      returnMetadata: options.returnMetadata === true,
-    }
+      priority: options.priority || 'capture',
+      kind: options.kind || 'relevance_prefilter',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
   );
   if (options.returnMetadata) {
     return {
@@ -269,23 +322,53 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
   return data;
 }
 
-async function callLLM(userMessage, tenantId, keyword = '') {
+async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
   const config = await getLLMConfig(tenantId);
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
   const brand = await getBrandContext(tenantId);
   const intent = resolveMonitoringIntent(keyword, { brand });
   const systemPrompt = buildSystemPrompt(brand, intent);
-  const result = config.provider === 'gemini'
-    ? await callGemini(config.apiKey, config.model, systemPrompt, userMessage)
-    : await callOpenAICompatible(config.apiKey, config.model, config.endpoint, systemPrompt, userMessage);
+  const result = await runWithTenantAiAdmission(
+    tenantId,
+    () => config.provider === 'gemini'
+      ? callGemini(config.apiKey, config.model, systemPrompt, userMessage)
+      : callOpenAICompatible(
+        config.apiKey,
+        config.model,
+        config.endpoint,
+        systemPrompt,
+        userMessage,
+      ),
+    {
+      priority: options.priority || 'normal',
+      kind: options.kind || 'record_classification',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
+  );
   return { result, intent, provider: config.provider, model: config.model };
 }
 
-export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage) {
+export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
   const config = await getLLMConfig(tenantId);
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
-  if (config.provider === 'gemini') return await callGemini(config.apiKey, config.model, systemPrompt, userMessage);
-  return await callOpenAICompatible(config.apiKey, config.model, config.endpoint, systemPrompt, userMessage);
+  return await runWithTenantAiAdmission(
+    tenantId,
+    () => config.provider === 'gemini'
+      ? callGemini(config.apiKey, config.model, systemPrompt, userMessage)
+      : callOpenAICompatible(
+        config.apiKey,
+        config.model,
+        config.endpoint,
+        systemPrompt,
+        userMessage,
+        options,
+      ),
+    {
+      priority: options.priority || 'normal',
+      kind: options.kind || 'llm_prompt',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
+  );
 }
 
 function normalizeRelevance(value) {
@@ -353,11 +436,17 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
 
 export async function labelRecord(recordId, options = {}) {
   const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
+  if (['official_content', 'blogger_profile'].includes(record?.record_type)) return null;
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
 
   const userMessage = buildUserMessage(record);
   try {
-    const labeled = await callLLM(userMessage, record.tenant_id, record.keyword);
+    const labeled = await callLLM(
+      userMessage,
+      record.tenant_id,
+      record.keyword,
+      {priority: 'normal', kind: 'record_classification'},
+    );
     if (!labeled?.result) return null;
     const result = {
       ...normalizeResult(labeled.result),
@@ -418,7 +507,8 @@ export async function labelRecord(recordId, options = {}) {
 export async function labelPendingRecords(limit = 50) {
   const records = await queryAll(
     `SELECT id FROM records
-     WHERE ai_labeled_at IS NULL OR ai_result->>'relevance' IS NULL
+     WHERE record_type NOT IN ('official_content', 'blogger_profile')
+       AND (ai_labeled_at IS NULL OR ai_result->>'relevance' IS NULL)
      ORDER BY created_at DESC
      LIMIT $1`,
     [limit]
@@ -433,13 +523,14 @@ export async function labelPendingRecords(limit = 50) {
   return { total: records.length, labeled };
 }
 
-function buildCommentSystemPrompt(brand) {
+export function buildCommentSystemPrompt(brand) {
   return `你是一个可配置品牌的社交媒体评论舆情分析专家。当前品牌：${brand.brandName}。
 品牌别名：${brand.brandAliases.join('、') || brand.brandName}。
 业务语境：${brand.businessContext}
 
 你要判断“评论本身”对当前品牌/产品/服务的态度和风险。注意：
 - 不要只按关键词判断。“不续费”“收费”“不能用”“贵”可能是事实说明、价格讨论、使用选择，也可能是投诉，必须结合语气和上下文。
+- 不能根据“安全”等单个词或固定短语直接定性，必须结合完整句意、原帖上下文和评价对象做语义判断。例如“安全感满满/安全感时刻在线”通常是正向，“安全座椅”本身是中性；“开着总提心吊胆，一点安全感都没有”才可能是负面。
 - 只有明确抱怨、投诉、故障、乱扣费、服务不满、安全/隐私风险、强烈负面情绪时，才标记 isNegative=true。
 - “不算贵”“免费”“可以”“有用”“不会不提供服务”“开的不多用不了几次”“不用续”这类通常是中性或正向澄清，不应标为负面。
 - 如果评论只是客观说明、个人选择、轻微吐槽但没有明确问题或诉求，标为 neutral。
@@ -518,13 +609,14 @@ function normalizeCommentAiResult(result, fallback) {
   };
 }
 
-function buildCommentBatchSystemPrompt(brand) {
+export function buildCommentBatchSystemPrompt(brand) {
   return `你是可配置品牌的社交媒体评论舆情分析专家。当前品牌：${brand.brandName}。
 品牌别名：${brand.brandAliases.join('、') || brand.brandName}。
 业务语境：${brand.businessContext}
 
 你会收到同一篇帖子下的一批评论(JSON 数组,每条带序号 i)。请逐条判断每条评论本身对该品牌/产品/服务的态度与风险。判断要点:
 - 不要只按关键词。“不续费/收费/不能用/贵”可能是事实说明、价格讨论或使用选择,也可能是投诉,要结合语气与上下文。
+- 不能根据“安全”等单个词或固定短语直接定性,必须结合完整句意、原帖上下文和评价对象做语义判断。例如“安全感满满/安全感时刻在线”通常是正向,“安全座椅”本身是中性;“开着总提心吊胆,一点安全感都没有”才可能是负面。
 - 只有明确抱怨、投诉、故障、乱扣费、服务不满、安全/隐私风险、强烈负面情绪时,isNegative=true。
 - “不算贵/免费/可以/有用/不会不提供服务/开的不多用不了几次/不用续”通常中性或正向,不应判负面。
 - 仅客观说明、个人选择、轻微吐槽且无明确诉求 → neutral;认可、解释、澄清、推荐 → positive 或 neutral。
@@ -560,7 +652,12 @@ export async function classifyCommentsBatch({ tenantId, record = {}, comments = 
   const brand = await getBrandContext(tenantId);
   const systemPrompt = buildCommentBatchSystemPrompt(brand);
   const userMessage = buildCommentBatchUserMessage({ record, comments });
-  const parsed = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+  const parsed = await callLLMWithPrompt(
+    tenantId,
+    systemPrompt,
+    userMessage,
+    {priority: 'background', kind: 'comment_batch_classification'},
+  );
   const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.results) ? parsed.results : []);
   const byIndex = new Map();
   for (const item of list) {
@@ -579,7 +676,12 @@ export async function classifyCommentWithAI({ tenantId, record = {}, comment = {
   const systemPrompt = buildCommentSystemPrompt(brand);
   const userMessage = buildCommentUserMessage({ record, comment });
   try {
-    const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
+    const result = await callLLMWithPrompt(
+      tenantId,
+      systemPrompt,
+      userMessage,
+      {priority: 'background', kind: 'comment_classification'},
+    );
     if (!result) return null;
     return normalizeCommentAiResult(result, fallback);
   } catch (err) {

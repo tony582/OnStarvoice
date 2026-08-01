@@ -46,6 +46,11 @@ test('content triage exposes the four customer handling modes consistently', () 
   assert.match(route, /const TRIAGE_QUEUE_CONDITION/);
   assert.match(route, /queue === 'triage'/);
   assert.match(route, /IN \('unhandled', 'reviewing', 'official_responded', 'no_action'\)/);
+  const activeQueue = route.slice(
+    route.indexOf('export const ACTIVE_QUEUE_CONDITION'),
+    route.indexOf('// 处理模式和归档生命周期相互独立'),
+  );
+  assert.doesNotMatch(activeQueue, /official_response_status/);
   assert.match(route, /header: '处理模式'/);
   assert.match(migration, /status = 'no_action'/);
   assert.match(migration, /archived_at = COALESCE\(archived_at, updated_at, now\(\)\)/);
@@ -123,10 +128,14 @@ test('archived content is sealed until an explicit unarchive', () => {
   assert.match(ticketsRoute, /if \(lifecycle\.archived_at\) return sendRecordArchived\(res, \[sourceId\]\)/);
   assert.match(feedbackRoute, /if \(result\.archived\) return sendRecordArchived\(res, \[recordId\]\)/);
 
-  const workflowStart = commentWorkflow.indexOf('async function applyTriageWorkflow');
+  const workflowStart = commentWorkflow.indexOf('async function appendCommentSignals');
   const workflowEnd = commentWorkflow.indexOf('// ── 抖音过采兜底', workflowStart);
   const archivedWorkflowGuard = commentWorkflow.slice(workflowStart, workflowEnd);
   assert.match(archivedWorkflowGuard, /rt\.archived_at/);
-  assert.match(archivedWorkflowGuard, /FOR UPDATE OF r/);
-  assert.match(archivedWorkflowGuard, /if \(!current \|\| current\.archived_at\) return/);
+  assert.match(archivedWorkflowGuard, /if \(!current \|\| current\.archived_at\) return \[\]/);
+  assert.doesNotMatch(commentWorkflow, /INSERT INTO record_triage/);
+  assert.doesNotMatch(commentWorkflow, /UPDATE record_triage/);
+  assert.match(commentWorkflow, /processingModeChanged:\s*false/);
+  assert.match(commentWorkflow, /record\.comment_risk_detected/);
+  assert.match(commentWorkflow, /record\.official_response_detected/);
 });

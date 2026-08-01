@@ -520,6 +520,63 @@ export function captureAgentOnline(lastHeartbeatAt, now = Date.now(), staleMs = 
   return Number.isFinite(timestamp) && now - timestamp <= staleMs;
 }
 
+// These are the states that can still own the browser's single capture lock.
+// Attention/terminal states such as interrupted, needs_action and failed keep
+// their audit history, but the extension has already released its execution
+// lock and another cloud task may safely use the Agent.
+export const CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES = Object.freeze([
+  'pending',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'resume_requested',
+]);
+
+export async function findCaptureAgentExecutionSlotBlocker(
+  executor,
+  tenantId,
+  agentId,
+  {excludeTaskIds = []} = {},
+) {
+  const excluded = [...new Set(
+    (Array.isArray(excludeTaskIds) ? excludeTaskIds : [])
+      .map(value => text(value, 100).toLowerCase())
+      .filter(value => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)),
+  )];
+  return await executor.queryOne(`
+    SELECT blocker.kind, blocker.id, blocker.task_id, blocker.status
+    FROM (
+      SELECT 'task'::text AS kind, task.id, task.id AS task_id, task.status,
+        task.created_at AS blocked_at
+      FROM capture_tasks task
+      WHERE task.tenant_id = $1
+        AND COALESCE(task.assigned_agent_id, task.origin_agent_id) = $2
+        AND task.task_type <> 'capture_orchestration'
+        AND task.status = ANY($3::text[])
+        AND NOT (task.id = ANY($4::uuid[]))
+
+      UNION ALL
+
+      SELECT 'command'::text AS kind, command.id, command.task_id,
+        command.status, command.created_at AS blocked_at
+      FROM capture_agent_commands command
+      WHERE command.tenant_id = $1
+        AND command.agent_id = $2
+        AND command.status IN ('pending', 'acknowledged')
+        AND (command.expires_at IS NULL OR command.expires_at > now())
+        AND NOT (command.task_id = ANY($4::uuid[]))
+    ) blocker
+    ORDER BY blocker.blocked_at, blocker.id
+    LIMIT 1
+  `, [
+    text(tenantId, 100),
+    text(agentId, 100),
+    CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+    excluded,
+  ]);
+}
+
 export async function lockCaptureAgentExecutionSlot(
   executor,
   tenantId,

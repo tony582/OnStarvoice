@@ -1439,6 +1439,7 @@ router.post(
         autoSyncAfterDetailCapture: true,
         commentsMaxDetectedItems: normalized.filter.commentsLimit,
         skipAlreadyCapturedOnDetailCapture: false,
+        skipOfficialAccounts: true,
         // 官方账号巡查按主页最新顺序取 N 篇，不依赖列表中的发布日期。
         scanLatestPostsByCount: true,
       };

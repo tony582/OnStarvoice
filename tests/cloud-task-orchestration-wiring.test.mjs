@@ -61,6 +61,36 @@ test('a device-side retry is adopted by the original orchestration parent', asyn
   assert.match(agent, /remoteOrchestrationRecoveryMergeV1: true/u);
 });
 
+test('device recovery accepts the local client task id recorded by resume completion', async () => {
+  const {orchestrationRecoverySuccessorMatches} = await import(
+    `../server/routes/capture-cloud.js?recovery-identity=${Date.now()}`
+  );
+  const recoveryTask = {
+    id: 'ffa0bef6-2930-459c-a357-2e00166cd314',
+    client_task_id: '20163c79-0a97-46e2-a1c3-68d480ea61d2',
+  };
+  const lineageTasks = [{
+    id: '2384ca54-bb53-4596-94b8-869e89962f4d',
+    client_task_id: '2384ca54-bb53-4596-94b8-869e89962f4d',
+  }];
+
+  assert.equal(orchestrationRecoverySuccessorMatches({
+    recordedSuccessorId: recoveryTask.client_task_id,
+    recoveryTask,
+    lineageTasks,
+  }), true);
+  assert.equal(orchestrationRecoverySuccessorMatches({
+    recordedSuccessorId: recoveryTask.id,
+    recoveryTask,
+    lineageTasks,
+  }), true);
+  assert.equal(orchestrationRecoverySuccessorMatches({
+    recordedSuccessorId: '99999999-9999-4999-8999-999999999999',
+    recoveryTask,
+    lineageTasks,
+  }), false);
+});
+
 test('schedule status follows its latest run before and after terminal settlement', async () => {
   const route = await read('server/routes/capture-cloud.js');
   const refreshStart = route.indexOf('async function refreshOrchestrationParentTask');

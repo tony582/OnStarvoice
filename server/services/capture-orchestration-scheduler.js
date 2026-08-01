@@ -10,6 +10,53 @@ import {
   normalizeRemoteTaskInput,
 } from './capture-cloud.js';
 
+export const SCHEDULE_OVERLAP_RUN_STATUSES = Object.freeze([
+  'pending',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'resume_requested',
+  'stop_requested',
+]);
+export const SCHEDULE_OVERLAP_ITEM_STATUSES = Object.freeze([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+]);
+export const SCHEDULE_TERMINAL_RUN_STATUSES = Object.freeze([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'superseded',
+]);
+
+export function scheduleRunBlocksNextOccurrence({
+  runStatus = '',
+  childStatuses = [],
+  itemStatuses = [],
+} = {}) {
+  if (SCHEDULE_TERMINAL_RUN_STATUSES.includes(String(runStatus))) return false;
+  const childActive = childStatuses.some(status =>
+    SCHEDULE_OVERLAP_RUN_STATUSES.includes(String(status))
+  );
+  const itemActive = itemStatuses.some(status =>
+    SCHEDULE_OVERLAP_ITEM_STATUSES.includes(String(status))
+  );
+  if (childStatuses.length > 0 || itemStatuses.length > 0) {
+    return childActive || itemActive;
+  }
+  return SCHEDULE_OVERLAP_RUN_STATUSES.includes(String(runStatus));
+}
+
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
   return normalized.length > limit ? normalized.slice(0, limit) : normalized;
@@ -228,35 +275,55 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       AND run.orchestration_schedule_id = $2
       AND run.id <> $3
       AND run.task_type = 'capture_orchestration'
+      -- A terminal parent is absorbing. Legacy child/item residue is audit
+      -- debt, not proof that the completed occurrence is still executing.
+      AND NOT (run.status = ANY($4::text[]))
       AND (
-        run.status IN (
-          'pending', 'waiting_device', 'claimed', 'running',
-          'recovering', 'resume_requested', 'stop_requested'
-        )
-        OR EXISTS (
+        EXISTS (
           SELECT 1
           FROM capture_tasks child
           WHERE child.parent_task_id = run.id
             AND child.tenant_id = run.tenant_id
-            AND child.status IN (
-              'pending', 'waiting_device', 'claimed', 'running',
-              'recovering', 'resume_requested', 'stop_requested'
-            )
+            AND child.status = ANY($5::text[])
         )
         OR EXISTS (
           SELECT 1
           FROM capture_task_items item
           WHERE item.task_id = run.id
             AND item.tenant_id = run.tenant_id
-            AND item.status IN (
-              'pending', 'assigned', 'dispatch_pending', 'dispatched',
-              'claimed', 'running', 'retryable', 'recovering'
-            )
+            -- A retryable/needs-action result remains available for an
+            -- operator retry but must not disable every future occurrence.
+            AND item.status = ANY($6::text[])
+        )
+        OR (
+          -- A legacy parent without a work graph can only expose its own
+          -- status. Once children/items exist, their real execution state is
+          -- authoritative and a stale parent projection cannot block forever.
+          run.status = ANY($5::text[])
+          AND NOT EXISTS (
+            SELECT 1
+            FROM capture_tasks any_child
+            WHERE any_child.parent_task_id = run.id
+              AND any_child.tenant_id = run.tenant_id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM capture_task_items any_item
+            WHERE any_item.task_id = run.id
+              AND any_item.tenant_id = run.tenant_id
+          )
         )
       )
     ORDER BY run.scheduled_for DESC, run.id
     LIMIT 1
-  `, [schedule.tenant_id, schedule.id, schedule.template_task_id]);
+  `, [
+    schedule.tenant_id,
+    schedule.id,
+    schedule.template_task_id,
+    SCHEDULE_TERMINAL_RUN_STATUSES,
+    SCHEDULE_OVERLAP_RUN_STATUSES,
+    SCHEDULE_OVERLAP_ITEM_STATUSES,
+  ]);
   if (overlapping) {
     if (manual) {
       return {

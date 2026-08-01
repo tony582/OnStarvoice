@@ -5,7 +5,9 @@ import test from "node:test";
 import vm from "node:vm";
 
 import {
+  CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
   captureAgentOnline,
+  findCaptureAgentExecutionSlotBlocker,
   isCloudTaskActive,
   isCloudTaskTerminal,
   lockCaptureAgentExecutionSlot,
@@ -19,6 +21,9 @@ import {
 import {
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  crossDeviceRetryAgentSupportsTask,
+  crossDeviceRetryItemNeedsManualSafety,
+  crossDeviceRetryTaskSupported,
   isProfilePatrolTask,
   lockActiveCaptureAgentSession,
   negativePatrolTargetResults,
@@ -30,6 +35,10 @@ import {
 
 const captureCloudRouteSource = await readFile(
   new URL("../server/routes/capture-cloud.js", import.meta.url),
+  "utf8",
+);
+const cronSource = await readFile(
+  new URL("../server/cron.js", import.meta.url),
   "utf8",
 );
 
@@ -67,6 +76,104 @@ test("agent platform assignment is bounded, normalized, and deduplicated", () =>
     ["xiaohongshu", "douyin", "weibo"],
   );
   assert.deepEqual(normalizeCaptureAgentPlatforms("xiaohongshu"), []);
+});
+
+test("physical Agent slots ignore attention history but block live commands", async () => {
+  assert.deepEqual(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES, [
+    "pending",
+    "waiting_device",
+    "claimed",
+    "running",
+    "recovering",
+    "resume_requested",
+  ]);
+  assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("interrupted"), false);
+  assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("needs_action"), false);
+
+  let statement = null;
+  const blocker = {kind: "command", id: "command-id", status: "pending"};
+  const executor = {
+    async queryOne(sql, params) {
+      statement = {sql, params};
+      return blocker;
+    },
+  };
+  assert.equal(
+    await findCaptureAgentExecutionSlotBlocker(
+      executor,
+      "tenant-id",
+      "agent-id",
+      {excludeTaskIds: ["11111111-1111-4111-8111-111111111111"]},
+    ),
+    blocker,
+  );
+  assert.match(statement.sql, /task\.status = ANY\(\$3::text\[\]\)/u);
+  assert.match(statement.sql, /capture_agent_commands/u);
+  assert.match(statement.sql, /command\.status IN \('pending', 'acknowledged'\)/u);
+  assert.match(statement.sql, /command\.expires_at IS NULL OR command\.expires_at > now\(\)/u);
+  assert.deepEqual(statement.params[2], CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES);
+  assert.deepEqual(statement.params[3], ["11111111-1111-4111-8111-111111111111"]);
+});
+
+test("cross-device retry is limited to settled root business tasks", () => {
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "unattended_keyword_capture",
+    parent_task_id: null,
+  }), true);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "followed_creator_post_patrol",
+    parent_task_id: null,
+  }), true);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "capture_orchestration",
+    parent_task_id: null,
+    metadata: {
+      promotedRetryParent: true,
+      promotedBusinessTaskType: "official_account_comment_patrol",
+    },
+  }), true);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "capture_orchestration",
+    parent_task_id: null,
+    metadata: {},
+  }), false);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "negative_post_patrol",
+    parent_task_id: "11111111-1111-4111-8111-111111111111",
+  }), false);
+});
+
+test("cross-device retry requires exact workflow capabilities and blocks safety items", () => {
+  const baseAgent = {
+    allowed_platforms: ["douyin"],
+    capabilities: {
+      remoteTaskCreate: true,
+      remoteTargetedPostCaptureV1: true,
+      supportedPlatforms: ["douyin"],
+      followedCreatorPostPatrol: true,
+    },
+  };
+  assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }), true);
+  assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
+    task_type: "negative_post_patrol",
+    platform: "douyin",
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
+    task_type: "followed_creator_post_patrol",
+    platform: "xiaohongshu",
+  }), false);
+  assert.equal(crossDeviceRetryItemNeedsManualSafety({
+    error: {code: "DOUYIN_SEARCH_CAPTCHA_REQUIRED"},
+  }), true);
+  assert.equal(crossDeviceRetryItemNeedsManualSafety({
+    metadata: {checkpoint: {requiresManualAction: true}},
+  }), true);
+  assert.equal(crossDeviceRetryItemNeedsManualSafety({
+    error: {code: "CONTENT_RELAY_STALLED"},
+  }), false);
 });
 
 test("cloud task snapshots normalize local ledger aliases and timestamps", () => {
@@ -1474,5 +1581,58 @@ test("ended failures can be dismissed from attention without deleting task histo
   assert.match(
     overview,
     /WHERE t\.status IN \('interrupted', 'needs_action', 'failed', 'completed_with_failures'\)[\s\S]*t\.attention_dismissed_at IS NULL/u,
+  );
+});
+
+test("stale cloud commands are reconciled by cron without waiting for UI or Agent heartbeat", () => {
+  assert.match(
+    captureCloudRouteSource,
+    /export async function reconcilePendingCaptureCommands/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /WHERE status IN \('pending', 'acknowledged'\)[\s\S]*expireStaleCommands\(tx, tenant\.tenant_id\)/u,
+  );
+  assert.match(
+    cronSource,
+    /reconcilePendingCaptureCommands\(\)[\s\S]*enqueueDueProfilePatrolTasks/u,
+  );
+  assert.match(
+    cronSource,
+    /reconcilePendingCaptureCommands\(\)[\s\S]*enqueueDueCaptureOrchestrations/u,
+  );
+});
+
+test("settled single-node tasks can retry on another idle Agent without forking the business task", () => {
+  const retry = readRouteSection(
+    "router.post('/tasks/:id/retry-on-idle-agent'",
+    "router.post('/tasks/:id/resume'",
+  );
+  assert.match(retry, /requireTenantAccess/u);
+  assert.match(retry, /requireSessionUser/u);
+  assert.match(retry, /requireTenantWriter/u);
+  assert.match(retry, /loadIdleCrossDeviceRetryAgent/u);
+  assert.match(captureCloudRouteSource, /AS active_command_count/u);
+  assert.match(
+    captureCloudRouteSource,
+    /Number\(agent\.active_command_count \|\| 0\) === 0/u,
+  );
+  assert.match(captureCloudRouteSource, /findCaptureAgentExecutionSlotBlocker/u);
+  assert.match(retry, /promoteSingleNodeTaskForRetry/u);
+  assert.match(retry, /task_type = 'capture_orchestration'/u);
+  assert.match(retry, /parent_task_id/u);
+  assert.match(retry, /crossDeviceRetryRequestKey/u);
+  assert.match(retry, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(retry, /renewProfileRetryExecutions/u);
+  assert.match(retry, /cross_device_retry_dispatched/u);
+  assert.match(retry, /abortCrossDeviceRetry\(promoted\.error\)/u);
+  assert.match(retry, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
+  assert.match(
+    captureCloudRouteSource,
+    /cross_device_retry_transaction_abort/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /promotedRetryParent' IS DISTINCT FROM 'true'/u,
   );
 });

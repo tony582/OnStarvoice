@@ -231,6 +231,35 @@ export function DispatchPage() {
     }
   }
 
+  const retryOnIdleAgent = async (task: CloudTask) => {
+    if (!window.confirm(
+      `确定把“${task.title || '当前任务'}”的未完成项转交给其它在线空闲设备吗？` +
+      ' 已完成结果会保留，重试结果仍汇总在这条原任务里。',
+    )) return
+    setActionTaskId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{
+        itemCount?: number
+        targetAgentName?: string
+        message?: string
+      }>(`/capture-cloud/tasks/${task.id}/retry-on-idle-agent`, {
+        requestKey: window.crypto.randomUUID(),
+        expectedRevision: Number(task.orchestration_revision || 0),
+      })
+      setFeedback(
+        result.message ||
+        `${result.itemCount || 0} 个未完成项已转交${result.targetAgentName || '空闲设备'}重试`,
+      )
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '换空闲设备重试失败')
+    } finally {
+      setActionTaskId('')
+    }
+  }
+
   const stop = async (task: CloudTask) => {
     if (!window.confirm(`确定结束“${task.title || '当前任务'}”吗？后续关键词将不再执行，已经采集和保存的结果会保留。`)) return
     setActionTaskId(task.id)
@@ -361,6 +390,12 @@ export function DispatchPage() {
               <div className="min-w-0">
                 <div className="flex items-center gap-2"><ListChecks className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">任务队列</h3></div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">{taskView === 'plans' ? '集中管理多 Agent 编排模板与各设备的无人值守计划' : '按创建时间倒序，新任务在最前'}</p>
+                {Number(overview?.summary.aiConcurrencyLimit || 0) > 0 && (
+                  <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
+                    AI 处理中 {Number(overview?.summary.aiActive || 0)}/{Number(overview?.summary.aiConcurrencyLimit || 0)}
+                    {' · '}排队 {Number(overview?.summary.aiQueued || 0)}
+                  </p>
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
@@ -425,6 +460,7 @@ export function DispatchPage() {
                   <div className="space-y-3">
                     {visibleTasks.map(task => (
                       <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
+                        onRetryOnIdleAgent={retryOnIdleAgent}
                         onDismissAttention={dismissAttention}
                         onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
                     ))}

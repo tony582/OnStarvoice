@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import {
-  Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, ShieldAlert, Square,
+  Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, RefreshCw, ShieldAlert, Square,
   Radar,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,7 @@ import {
   STATUS_LABELS,
   canDismissAttention,
   canResume,
+  canRetryOnIdleAgent,
   canStop,
   formatTime,
   isPlatformSafetyAttention,
@@ -28,6 +29,7 @@ export function TaskCard({
   writable,
   actionTaskId,
   onResume,
+  onRetryOnIdleAgent,
   onStop,
   onDismissAttention,
   onOpenOrchestration,
@@ -36,6 +38,7 @@ export function TaskCard({
   writable: boolean
   actionTaskId: string
   onResume: (task: CloudTask) => Promise<void>
+  onRetryOnIdleAgent: (task: CloudTask) => Promise<void>
   onStop: (task: CloudTask) => Promise<void>
   onDismissAttention: (task: CloudTask) => Promise<void>
   onOpenOrchestration: (task: CloudTask) => void
@@ -98,6 +101,7 @@ export function TaskCard({
   )
   const hasKeywordDiagnostics = !orchestration && diagnostics.items.length > 0
   const resumable = !orchestration && canResume(task)
+  const retryOnIdleAgent = canRetryOnIdleAgent(task)
   const stoppable = !orchestration && canStop(task)
   const commandPending = Boolean(task.pending_command_id)
   const stopPending = task.pending_command_type === 'stop'
@@ -142,7 +146,7 @@ export function TaskCard({
             ? '一次性任务'
             : '设备任务'
 
-  const hasActions = orchestration || resumable || stoppable || commandPending || dismissible
+  const hasActions = orchestration || resumable || retryOnIdleAgent || stoppable || commandPending || dismissible
 
   return (
     <article className={`rounded-2xl border border-border/70 bg-card p-4 shadow-xs ${orchestration ? 'border-l-2 border-l-primary/40' : ''}`}>
@@ -230,6 +234,12 @@ export function TaskCard({
             {orchestration && (
               <Button size="sm" onClick={() => onOpenOrchestration(task)}>
                 <Network className="h-4 w-4" /> 查看编排
+              </Button>
+            )}
+            {retryOnIdleAgent && !commandPending && (
+              <Button size="sm" onClick={() => void onRetryOnIdleAgent(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                换空闲设备重试
               </Button>
             )}
             {resumable && !commandPending && (

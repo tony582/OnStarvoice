@@ -358,14 +358,45 @@ test('schedule overlap guard ignores its template but still detects active occur
   assert.match(overlap, /run\.id <> \$3/u);
   assert.match(
     overlap,
-    /\[schedule\.tenant_id, schedule\.id, schedule\.template_task_id\]/u,
+    /SCHEDULE_TERMINAL_RUN_STATUSES/u,
   );
-  assert.match(
-    overlap,
-    /run\.status IN \([\s\S]*'pending'[\s\S]*'running'[\s\S]*'recovering'/u,
-  );
+  assert.match(overlap, /run\.status = ANY\(\$5::text\[\]\)/u);
   assert.match(overlap, /child\.parent_task_id = run\.id/u);
   assert.match(overlap, /item\.task_id = run\.id/u);
+  assert.match(overlap, /item\.status = ANY\(\$6::text\[\]\)/u);
+  assert.match(overlap, /NOT EXISTS \([\s\S]*any_child/u);
+  assert.match(overlap, /NOT EXISTS \([\s\S]*any_item/u);
+});
+
+test('terminal or attention-only schedule residue never blocks the next occurrence', async () => {
+  const {
+    scheduleRunBlocksNextOccurrence,
+    SCHEDULE_OVERLAP_ITEM_STATUSES,
+  } = await import(
+    `../server/services/capture-orchestration-scheduler.js?overlap=${Date.now()}`
+  );
+
+  assert.equal(scheduleRunBlocksNextOccurrence({
+    runStatus: 'completed',
+    itemStatuses: Array(13).fill('assigned'),
+  }), false);
+  assert.equal(scheduleRunBlocksNextOccurrence({
+    runStatus: 'needs_action',
+    itemStatuses: ['needs_action', 'retryable', 'retryable'],
+  }), false);
+  assert.equal(scheduleRunBlocksNextOccurrence({
+    runStatus: 'needs_action',
+    childStatuses: ['running'],
+  }), true);
+  assert.equal(scheduleRunBlocksNextOccurrence({
+    runStatus: 'running',
+  }), true);
+  assert.equal(scheduleRunBlocksNextOccurrence({
+    runStatus: 'running',
+    childStatuses: ['completed'],
+    itemStatuses: ['completed', 'failed'],
+  }), false);
+  assert.equal(SCHEDULE_OVERLAP_ITEM_STATUSES.includes('retryable'), false);
 });
 
 test('manual cloud start is idempotent and never overlaps an active schedule run', async () => {

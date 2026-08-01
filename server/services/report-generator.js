@@ -593,12 +593,14 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
 
   const workflowStats = await queryOne(
     `SELECT
-       COUNT(*) FILTER (WHERE r.official_response_status = 'responded') as official_responded,
+       COUNT(*) FILTER (
+         WHERE r.official_response_status = 'responded'
+           AND r.record_type <> 'official_content'
+       ) as official_responded,
        COUNT(*) FILTER (
          WHERE COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
           AND rt.archived_at IS NULL
           AND r.record_type <> 'official_content'
-           AND NOT (r.official_response_status = 'responded' AND r.negative_comment_count = 0)
        ) as active_inbox,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') as unhandled,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') as reviewing,

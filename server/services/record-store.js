@@ -7,6 +7,7 @@ import {
   parseMetricNumber,
   resolveCommentCountEvidenceFromPayload,
 } from '../utils/metrics.js';
+import {resolveCapturedRecordType} from './official-account-identity.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
@@ -281,6 +282,57 @@ async function insertObservation(tx, { tenantId, recordId, authCode, monitorExec
   return result.id;
 }
 
+async function loadOfficialAccountCandidates(tx, tenantId, monitorExecutionId) {
+  return await tx.queryAll(`
+    SELECT account.*,
+      EXISTS (
+        SELECT 1
+        FROM monitor_executions execution
+        JOIN monitor_subscriptions subscription
+          ON subscription.id = execution.subscription_id
+          AND subscription.tenant_id = execution.tenant_id
+          AND subscription.subject_type = 'official'
+        WHERE $2::uuid IS NOT NULL
+          AND execution.id = $2::uuid
+          AND execution.tenant_id = account.tenant_id
+          AND subscription.official_account_id = account.id
+      ) AS execution_bound
+    FROM official_accounts account
+    WHERE account.tenant_id = $1
+      AND account.status = 'active'
+  `, [tenantId, monitorExecutionId || null]);
+}
+
+async function appendOfficialContentAudit(tx, {
+  tenantId,
+  recordId,
+  previousRecordType,
+  nextRecordType,
+  source,
+  officialAccountId,
+}) {
+  if (previousRecordType === nextRecordType) return;
+  const action = nextRecordType === 'official_content'
+    ? 'record.official_content_identified'
+    : 'record.official_content_exclusion_removed';
+  await tx.execute(`
+    INSERT INTO audit_logs (
+      tenant_id, actor_type, actor_id, action, target_type, target_id, metadata
+    ) VALUES ($1, 'system', 'official-content-classifier', $2, 'record', $3, $4::jsonb)
+  `, [
+    tenantId,
+    action,
+    recordId,
+    JSON.stringify({
+      previousRecordType,
+      nextRecordType,
+      source,
+      officialAccountId: officialAccountId || null,
+      processingModeChanged: false,
+    }),
+  ]);
+}
+
 export function mergeObservationMetrics(record = {}, existing = {}) {
   const merged = {...record};
   for (const field of ['likes', 'comments_count', 'collects', 'shares']) {
@@ -314,6 +366,17 @@ export async function upsertCapturedRecord(record, context) {
         [tenantId, record.platform, contentHash]
       );
     }
+
+    const incomingRecordType = record.record_type || existing?.record_type || 'single_note';
+    const officialAccounts = incomingRecordType === 'blogger_profile'
+      ? []
+      : await loadOfficialAccountCandidates(tx, tenantId, monitorExecutionId);
+    const officialResolution = resolveCapturedRecordType({
+      record,
+      existing: existing || {},
+      officialAccounts,
+    });
+    record = {...record, record_type: officialResolution.recordType};
 
     record = guardRecordCommentCount(record, existing || {});
     payload = jsonText(record.payload, '{}');
@@ -390,6 +453,15 @@ export async function upsertCapturedRecord(record, context) {
         record.publish_location || '',
       ]);
 
+      await appendOfficialContentAudit(tx, {
+        tenantId,
+        recordId: existing.id,
+        previousRecordType: existing.record_type || '',
+        nextRecordType: officialResolution.recordType,
+        source: officialResolution.source,
+        officialAccountId: officialResolution.officialAccount?.id,
+      });
+
       const observationId = await insertObservation(tx, {
         tenantId,
         recordId: existing.id,
@@ -411,7 +483,13 @@ export async function upsertCapturedRecord(record, context) {
         ]);
       }
 
-      return { id: existing.id, action: 'updated', observationId };
+      return {
+        id: existing.id,
+        action: 'updated',
+        observationId,
+        officialContent: officialResolution.officialContent,
+        officialContentSource: officialResolution.source,
+      };
     }
 
     const inserted = await tx.queryOne(`
@@ -461,7 +539,21 @@ export async function upsertCapturedRecord(record, context) {
     ]);
 
     const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });
-    return { id: inserted.id, action: 'inserted', observationId };
+    await appendOfficialContentAudit(tx, {
+      tenantId,
+      recordId: inserted.id,
+      previousRecordType: officialResolution.incomingRecordType,
+      nextRecordType: officialResolution.recordType,
+      source: officialResolution.source,
+      officialAccountId: officialResolution.officialAccount?.id,
+    });
+    return {
+      id: inserted.id,
+      action: 'inserted',
+      observationId,
+      officialContent: officialResolution.officialContent,
+      officialContentSource: officialResolution.source,
+    };
   });
   // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
   if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);

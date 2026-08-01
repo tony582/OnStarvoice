@@ -2,11 +2,21 @@ import crypto from 'crypto';
 import { queryAll, queryOne, withTransaction, getSetting } from '../db/init.js';
 import { classifyCommentWithAI, classifyCommentsBatch } from './ai-labeler.js';
 import { upsertCommentLeadForComment } from './comment-leads.js';
+import {
+  findOfficialCommentAuthor,
+  findOfficialRecordOwner,
+} from './official-account-identity.js';
+
+export {
+  matchesOfficialCommentAuthor,
+  matchesOfficialRecordOwner,
+} from './official-account-identity.js';
 
 const NEGATIVE_KEYWORDS = [
   '投诉', '维权', '差评', '垃圾', '失望', '被骗', '坑', '故障', '坏了', '崩溃',
   '闪退', '打不开', '连不上', '不能用', '不续费', '收费', '乱扣', '贵', '恶心',
-  '安全', '事故', '召回', '失控', '泄露', '隐私', '客服', '没人管', '气死',
+  // “安全”刻意不做 fallback 关键词：相关措辞等待 Phase B 结合整句和原帖做 AI 语义判断。
+  '事故', '召回', '失控', '泄露', '隐私', '客服', '没人管', '气死',
 ];
 
 const CRITICAL_KEYWORDS = ['事故', '失控', '刹车', '起火', '死亡', '伤亡', '泄露', '隐私', '召回'];
@@ -170,95 +180,11 @@ async function classifyCommentForWorkflow({ tenantId, record = {}, comment, isOf
   return aiClassification || ruleClassificationWithMetadata(ruleClassification);
 }
 
-function officialAliases(account) {
-  return [
-    account.account_name,
-    ...parseJsonArray(account.aliases).map(value => typeof value === 'string' ? value : value?.name),
-  ].map(normalizeComparable).filter(Boolean);
-}
-
-function platformCompatible(subject, account) {
-  return !(account.platform && subject.platform && account.platform !== subject.platform);
-}
-
-function officialStrongIdentity(account) {
-  return {
-    platformUserId: normalizeComparable(account.platform_user_id || ''),
-    accountNo: normalizeComparable(account.account_no || ''),
-    legacyAccountId: normalizeComparable(account.account_id || ''),
-  };
-}
-
-function subjectStrongIdentity(subject) {
-  return {
-    platformUserId: normalizeComparable(
-      subject.author_id || subject.platform_user_id || '',
-    ),
-    accountNo: normalizeComparable(
-      subject.author_account_no || subject.account_no || '',
-    ),
-  };
-}
-
-function matchesStrongOfficialIdentity(subject, account) {
-  const subjectIdentity = subjectStrongIdentity(subject);
-  const officialIdentity = officialStrongIdentity(account);
-  if (
-    subjectIdentity.platformUserId &&
-    officialIdentity.platformUserId &&
-    subjectIdentity.platformUserId === officialIdentity.platformUserId
-  ) return true;
-  if (
-    subjectIdentity.accountNo &&
-    officialIdentity.accountNo &&
-    subjectIdentity.accountNo === officialIdentity.accountNo
-  ) return true;
-  return Boolean(
-    officialIdentity.legacyAccountId &&
-    (
-      subjectIdentity.platformUserId === officialIdentity.legacyAccountId ||
-      subjectIdentity.accountNo === officialIdentity.legacyAccountId
-    ),
-  );
-}
-
-export function matchesOfficialRecordOwner(subject, account) {
-  if (!account || account.status !== 'active') return false;
-  if (!platformCompatible(subject, account)) return false;
-  return matchesStrongOfficialIdentity(subject, account);
-}
-
-export function matchesOfficialCommentAuthor(subject, account) {
-  if (!account || account.status !== 'active') return false;
-  if (!platformCompatible(subject, account)) return false;
-  if (matchesStrongOfficialIdentity(subject, account)) return true;
-  const officialIdentity = officialStrongIdentity(account);
-  const subjectIdentity = subjectStrongIdentity(subject);
-  if (
-    officialIdentity.platformUserId ||
-    officialIdentity.accountNo ||
-    officialIdentity.legacyAccountId ||
-    subjectIdentity.platformUserId ||
-    subjectIdentity.accountNo
-  ) return false;
-  const subjectName = normalizeComparable(subject.author_name || subject.account_name || '');
-  if (!subjectName) return false;
-  return officialAliases(account).some(alias => alias && subjectName === alias);
-}
-
 async function loadOfficialAccounts(tx, tenantId) {
   return await tx.queryAll(
     "SELECT * FROM official_accounts WHERE tenant_id = $1 AND status = 'active'",
     [tenantId]
   );
-}
-
-function findOfficialRecordOwner(subject, accounts) {
-  return accounts.find(account => matchesOfficialRecordOwner(subject, account)) || null;
-}
-
-function findOfficialCommentAuthor(subject, accounts) {
-  return accounts.find(account => matchesOfficialCommentAuthor(subject, account)) || null;
 }
 
 function buildCommentHash(recordId, comment) {
@@ -380,57 +306,73 @@ async function aggregateRecordComments(tx, tenantId, recordId) {
   };
 }
 
-async function applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, previousNegativeCount, aggregate }) {
+export function resolveOfficialResponseFacts(aggregate = {}) {
+  const officialCount = Number(aggregate.officialCount || 0);
+  const negativeCount = Number(aggregate.negativeCount || 0);
+  return {
+    officialReplied: officialCount > 0,
+    responseStatus: officialCount > 0
+      ? (negativeCount > 0 ? 'needs_followup' : 'responded')
+      : 'none',
+  };
+}
+
+export function buildCommentSignalEvents({previousAggregate = {}, aggregate = {}, processingMode = 'unhandled'} = {}) {
+  const previousNegativeCount = Number(previousAggregate.negativeCount || 0);
+  const negativeCount = Number(aggregate.negativeCount || 0);
+  const previousOfficialCount = Number(previousAggregate.officialCount || 0);
+  const officialCount = Number(aggregate.officialCount || 0);
+  const common = {
+    processingMode,
+    processingModeChanged: false,
+  };
+  const events = [];
+  if (negativeCount > previousNegativeCount) {
+    events.push({
+      action: 'record.comment_risk_detected',
+      metadata: {
+        ...common,
+        previousNegativeCount,
+        negativeCount,
+        addedNegativeCount: negativeCount - previousNegativeCount,
+      },
+    });
+  }
+  if (officialCount > previousOfficialCount) {
+    events.push({
+      action: 'record.official_response_detected',
+      metadata: {
+        ...common,
+        previousOfficialCount,
+        officialCount,
+        addedOfficialResponseCount: officialCount - previousOfficialCount,
+      },
+    });
+  }
+  return events;
+}
+
+async function appendCommentSignals(tx, {tenantId, recordId, previousAggregate, aggregate}) {
   const current = await tx.queryOne(`
     SELECT COALESCE(rt.status, 'unhandled') AS status, rt.archived_at
     FROM records r
     LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
     WHERE r.tenant_id = $1 AND r.id = $2
-    FOR UPDATE OF r
   `, [tenantId, recordId]);
-  // 归档只封存处理动作，不阻断原始采集、评论和互动数据入库。
-  if (!current || current.archived_at) return;
-
-  const currentStatus = current.status;
-  let nextStatus = '';
-  let auditAction = '';
-
-  // 已转工单(ticketed/旧 issue_linked)只有在关联工单已关闭时才允许复发,避免在途工单被搅动
-  let dispatchedReopenable = false;
-  if (['ticketed', 'issue_linked'].includes(currentStatus)) {
-    const openTicket = await tx.queryOne(
-      "SELECT 1 FROM tickets WHERE tenant_id = $1 AND source_record_id = $2 AND status <> 'closed' LIMIT 1",
-      [tenantId, recordId]
-    );
-    dispatchedReopenable = !openTicket;
+  // 归档继续封存处理时间线；事实计数仍会更新，但不追加新的处置提醒。
+  if (!current || current.archived_at) return [];
+  const events = buildCommentSignalEvents({
+    previousAggregate,
+    aggregate,
+    processingMode: current.status,
+  });
+  for (const event of events) {
+    await tx.execute(`
+      INSERT INTO audit_logs (tenant_id, actor_type, actor_id, action, target_type, target_id, metadata)
+      VALUES ($1, 'system', 'comment-workflow', $2, 'record', $3, $4::jsonb)
+    `, [tenantId, event.action, recordId, JSON.stringify(event.metadata)]);
   }
-
-  if (officialRecord) {
-    nextStatus = 'official_responded';
-    auditAction = 'record.official_content_hidden';
-  } else if (aggregate.negativeCount > previousNegativeCount && (['no_action', 'official_responded'].includes(currentStatus) || dispatchedReopenable)) {
-    nextStatus = 'reviewing';
-    auditAction = 'record.reopened_by_comment_risk';
-    await tx.execute(
-      'UPDATE records SET last_risk_reopened_at = now() WHERE id = $1 AND tenant_id = $2',
-      [recordId, tenantId]
-    );
-  } else if (aggregate.officialCount > 0 && aggregate.negativeCount === 0 && ['unhandled', 'reviewing', 'official_responded'].includes(currentStatus)) {
-    nextStatus = 'official_responded';
-    auditAction = 'record.official_responded';
-  }
-
-  if (!nextStatus) return;
-  await tx.execute(`
-    INSERT INTO record_triage (tenant_id, record_id, status, priority, note, updated_at)
-    VALUES ($1, $2, $3, 'normal', '', now())
-    ON CONFLICT (tenant_id, record_id)
-    DO UPDATE SET status = excluded.status, updated_at = now()
-  `, [tenantId, recordId, nextStatus]);
-  await tx.execute(`
-    INSERT INTO audit_logs (tenant_id, actor_type, actor_id, action, target_type, target_id, metadata)
-    VALUES ($1, 'system', 'comment-workflow', $2, 'record', $3, $4::jsonb)
-  `, [tenantId, auditAction, recordId, JSON.stringify({ previousStatus: currentStatus, nextStatus })]);
+  return events;
 }
 
 // ── 抖音过采兜底（服务端实现，不依赖扩展侧更新）──────────────────────────
@@ -469,13 +411,11 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
-// 评论写库后:重算负面数/官方回复状态、更新记录、跑分诊流转。
-// Phase A(规则入库后)与 Phase B(AI 精炼后)共用 —— AI 精炼可能改变 is_negative,需重算并可能复发。
-async function finalizeRecordAggregate(tx, { tenantId, recordId, officialRecord, previousNegativeCount }) {
+// 评论写库后:重算事实计数与官方回复状态，只追加提醒，绝不改人工处理模式。
+// Phase A(规则入库后)与 Phase B(AI 精炼后)共用。
+async function finalizeRecordAggregate(tx, { tenantId, recordId, previousAggregate }) {
   const aggregate = await aggregateRecordComments(tx, tenantId, recordId);
-  const responseStatus = aggregate.officialCount > 0
-    ? (aggregate.negativeCount > 0 ? 'needs_followup' : 'responded')
-    : (officialRecord ? 'responded' : 'none');
+  const responseFacts = resolveOfficialResponseFacts(aggregate);
   await tx.execute(`
     UPDATE records
     SET official_replied = $1,
@@ -485,15 +425,20 @@ async function finalizeRecordAggregate(tx, { tenantId, recordId, officialRecord,
       updated_at = now()
     WHERE id = $5 AND tenant_id = $6
   `, [
-    aggregate.officialCount > 0 || officialRecord,
-    responseStatus,
+    responseFacts.officialReplied,
+    responseFacts.responseStatus,
     aggregate.negativeCount,
     aggregate.latestNegativeAt,
     recordId,
     tenantId,
   ]);
-  await applyTriageWorkflow(tx, { tenantId, recordId, officialRecord, previousNegativeCount, aggregate });
-  return { aggregate, responseStatus };
+  const signals = await appendCommentSignals(tx, {
+    tenantId,
+    recordId,
+    previousAggregate,
+    aggregate,
+  });
+  return {aggregate, responseStatus: responseFacts.responseStatus, signals};
 }
 
 export async function upsertRecordComments(recordId, record, context) {
@@ -527,7 +472,7 @@ export async function upsertRecordComments(recordId, record, context) {
     author_account_no: record.author_account_no || currentRecord.author_account_no,
   }, accounts);
   const shouldSkipOfficialAccounts = record.skip_official_accounts !== false;
-  const officialRecord = Boolean(
+  const officialRecord = currentRecord.record_type === 'official_content' || Boolean(
     shouldSkipOfficialAccounts &&
       officialRecordAccount &&
       officialRecordAccount.skip_content !== false,
@@ -551,16 +496,25 @@ export async function upsertRecordComments(recordId, record, context) {
     let inserted = 0;
     let updated = 0;
     let officialResponses = 0;
+    const previousAggregate = await aggregateRecordComments(tx, tenantId, recordId);
 
-    if (officialRecord) {
+    if (officialRecord && currentRecord.record_type !== 'official_content') {
       await tx.execute(`
         UPDATE records
         SET record_type = 'official_content',
-          official_replied = true,
-          official_response_status = 'responded',
           updated_at = now()
         WHERE id = $1 AND tenant_id = $2
       `, [recordId, tenantId]);
+      await tx.execute(`
+        INSERT INTO audit_logs (tenant_id, actor_type, actor_id, action, target_type, target_id, metadata)
+        VALUES ($1, 'system', 'official-content-classifier', 'record.official_content_identified', 'record', $2, $3::jsonb)
+      `, [tenantId, recordId, JSON.stringify({
+        previousRecordType: currentRecord.record_type || '',
+        nextRecordType: 'official_content',
+        source: 'strong_identity',
+        officialAccountId: officialRecordAccount?.id || null,
+        processingModeChanged: false,
+      })]);
     }
 
     for (const { comment, officialAccount, classification, aiClassified } of prepared) {
@@ -584,8 +538,7 @@ export async function upsertRecordComments(recordId, record, context) {
     const { aggregate, responseStatus } = await finalizeRecordAggregate(tx, {
       tenantId,
       recordId,
-      officialRecord,
-      previousNegativeCount: Number(currentRecord.negative_comment_count || 0),
+      previousAggregate,
     });
 
     return {
@@ -600,7 +553,7 @@ export async function upsertRecordComments(recordId, record, context) {
 }
 
 // Phase B(后台 AI 精炼):捞出待精炼(ai_classified_at IS NULL)的非官方评论,按帖分组、
-// 分批并发走批量 LLM,精炼结果回填评论,据此生成客资 + 重算该帖负面数/分诊。
+// 分批并发走批量 LLM,精炼结果回填评论,据此生成客资 + 重算该帖事实计数/提醒。
 // LLM 整批失败 → 这批保持 NULL,下轮重试;评论早已入库可见,绝不会因 AI 失败丢成 0 条。
 export async function refineCommentsWithAI({ limit = 300 } = {}) {
   const pending = await queryAll(`
@@ -650,6 +603,7 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
     // 写库在一个快事务里(无 LLM)
     let changed = 0;
     await withTransaction(async tx => {
+      const previousAggregate = await aggregateRecordComments(tx, tenantId, recordId);
       const recForLead = await tx.queryOne(
         'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type FROM records WHERE id = $1 AND tenant_id = $2',
         [recordId, tenantId]
@@ -675,8 +629,7 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
       if (changed > 0) {
         await finalizeRecordAggregate(tx, {
           tenantId, recordId,
-          officialRecord: rows[0].r_type === 'official_content',
-          previousNegativeCount: Number(rows[0].r_neg || 0),
+          previousAggregate,
         });
       }
     });
@@ -763,6 +716,7 @@ export async function reclassifyComments(tenantId = null, options = {}) {
   const config = typeof options === 'boolean' ? { useAI: options } : (options || {});
   const useAI = Boolean(config.useAI);
   const onlyWithoutAI = Boolean(config.onlyWithoutAI);
+  const queueForAI = Boolean(config.queueForAI);
   const limit = Math.max(0, Math.floor(Number(config.limit || 0)));
   const params = [];
   let where = 'WHERE 1=1';
@@ -776,6 +730,10 @@ export async function reclassifyComments(tenantId = null, options = {}) {
   }
   if (onlyWithoutAI) {
     where += " AND (rc.ai_result->>'classifier' IS DISTINCT FROM 'llm_comment')";
+  }
+  if (config.safetySemanticReviewCandidatesOnly) {
+    // 这里只缩小旧误判的重审范围，不根据“安全”得出分类结论。
+    where += " AND rc.is_official = false AND rc.is_negative = true AND rc.content LIKE '%安全%'";
   }
   let limitSql = '';
   if (limit > 0) {
@@ -817,7 +775,7 @@ export async function reclassifyComments(tenantId = null, options = {}) {
       : ruleClassificationWithMetadata(classifyComment(comment, comment.is_official));
     if (next.ai_result?.classifier === 'llm_comment') aiUsed += 1;
     else ruleFallback += 1;
-    if (!classificationChanged(comment, next, useAI)) continue;
+    if (!queueForAI && !classificationChanged(comment, next, useAI)) continue;
     updates.push({
       id: comment.id,
       tenantId: comment.tenant_id,
@@ -831,14 +789,15 @@ export async function reclassifyComments(tenantId = null, options = {}) {
       const next = update.next;
       await tx.execute(`
         UPDATE record_comments
-        SET is_negative = $1,
-          sentiment = $2,
-          category = $3,
-          risk_level = $4,
-          ai_summary = $5,
-          ai_result = $6::jsonb,
+        SET is_negative = CASE WHEN $7 THEN is_negative ELSE $1 END,
+          sentiment = CASE WHEN $7 THEN sentiment ELSE $2 END,
+          category = CASE WHEN $7 THEN category ELSE $3 END,
+          risk_level = CASE WHEN $7 THEN risk_level ELSE $4 END,
+          ai_summary = CASE WHEN $7 THEN ai_summary ELSE $5 END,
+          ai_result = CASE WHEN $7 THEN ai_result ELSE $6::jsonb END,
+          ai_classified_at = CASE WHEN $7 THEN NULL ELSE ai_classified_at END,
           updated_at = now()
-        WHERE id = $7 AND tenant_id = $8
+        WHERE id = $8 AND tenant_id = $9
       `, [
         next.is_negative,
         next.sentiment,
@@ -846,6 +805,7 @@ export async function reclassifyComments(tenantId = null, options = {}) {
         next.risk_level,
         classificationSummary(next),
         JSON.stringify(next.ai_result || {}),
+        queueForAI,
         update.id,
         update.tenantId,
       ]);
@@ -857,9 +817,7 @@ export async function reclassifyComments(tenantId = null, options = {}) {
     }
     for (const [recordId, recordTenantId] of recordPairs.entries()) {
       const aggregate = await aggregateRecordComments(tx, recordTenantId, recordId);
-      const responseStatus = aggregate.negativeCount > 0
-        ? 'needs_followup'
-        : (aggregate.officialCount > 0 ? 'responded' : 'none');
+      const responseFacts = resolveOfficialResponseFacts(aggregate);
       await tx.execute(`
         UPDATE records
         SET official_replied = $1,
@@ -869,8 +827,8 @@ export async function reclassifyComments(tenantId = null, options = {}) {
           updated_at = now()
         WHERE id = $5 AND tenant_id = $6
       `, [
-        aggregate.officialCount > 0,
-        responseStatus,
+        responseFacts.officialReplied,
+        responseFacts.responseStatus,
         aggregate.negativeCount,
         aggregate.latestNegativeAt,
         recordId,

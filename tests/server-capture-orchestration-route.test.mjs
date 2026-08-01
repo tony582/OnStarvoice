@@ -241,7 +241,7 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.doesNotMatch(
     route.slice(
       route.indexOf('const HANDOFF_SOURCE_FINAL_STATUSES'),
-      route.indexOf('const HANDOFF_TARGET_BUSY_STATUSES'),
+      route.indexOf('const HANDOFF_PLATFORM_SAFETY_CODES'),
     ),
     /'superseded'/u,
   );
@@ -282,10 +282,8 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.match(handoff, /handoff_target_same_as_source/u);
   assert.match(handoff, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
   assert.match(handoff, /handoff_target_busy/u);
-  assert.match(
-    route,
-    /HANDOFF_TARGET_BUSY_STATUSES = \[[\s\S]*'interrupted'[\s\S]*'needs_action'/u,
-  );
+  assert.match(handoff, /findCaptureAgentExecutionSlotBlocker/u);
+  assert.match(handoff, /blockerKind: targetBusyTask\.kind/u);
   assert.match(handoff, /orchestration_revision = orchestration_revision \+ 1/u);
   assert.match(handoff, /AND orchestration_revision = \$9/u);
   assert.match(handoff, /attempt_count = attempt_count \+ 1/u);

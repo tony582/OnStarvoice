@@ -1004,6 +1004,42 @@ function activityDetail(item: RecordActivity, recordId: string): {
   if (item.action === 'record.official_responded') return { ...result, title: '采集到官方回复', icon: CheckCircle }
   if (item.action === 'record.reopened_by_comment_risk') return { ...result, title: '因新增负评重新进入待处理', icon: Bell }
   if (item.action === 'record.official_content_hidden') return { ...result, title: '识别为官方内容并移出分诊', icon: Eye }
+  if (item.action === 'record.comment_risk_detected') {
+    const added = Math.max(1, Number(metadata.addedNegativeCount || 1))
+    const mode = String(metadata.processingMode || 'unhandled')
+    return {
+      ...result,
+      title: '新增负评提醒',
+      icon: Bell,
+      body: `检测到 ${added} 条新增负评；仅作提醒，处理模式仍为“${LABELS.triage[mode] || mode}”。`,
+    }
+  }
+  if (item.action === 'record.official_response_detected') {
+    const added = Math.max(1, Number(metadata.addedOfficialResponseCount || 1))
+    const mode = String(metadata.processingMode || 'unhandled')
+    return {
+      ...result,
+      title: '官方回复提醒',
+      icon: CheckCircle,
+      body: `采集到 ${added} 条新增官方回复；仅作提醒，处理模式仍为“${LABELS.triage[mode] || mode}”。`,
+    }
+  }
+  if (item.action === 'record.official_content_identified') {
+    return {
+      ...result,
+      title: '识别为官方内容并移出分诊',
+      icon: Eye,
+      body: '仅更新内容归属，未改变处理模式。',
+    }
+  }
+  if (item.action === 'record.official_content_exclusion_removed') {
+    return {
+      ...result,
+      title: '取消了官方内容排除',
+      icon: Eye,
+      body: '仅更新内容归属，未改变处理模式。',
+    }
+  }
   return result
 }
 

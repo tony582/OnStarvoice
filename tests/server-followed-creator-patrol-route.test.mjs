@@ -189,6 +189,126 @@ test('mixed-platform profile patrol is rejected before any task is created', asy
   assert.equal(queried, false);
 });
 
+test('scheduled profile patrol treats attention tasks as idle and fails over without rebinding', async () => {
+  const {
+    loadAvailableScheduledProfilePatrolAgent,
+    profilePatrolTaskBlocksAgentSlot,
+  } = await import(
+    `../server/services/profile-patrol-dispatch.js?failover=${Date.now()}`
+  );
+  assert.equal(profilePatrolTaskBlocksAgentSlot('running'), true);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('waiting_device'), true);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('resume_requested'), true);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('needs_action'), false);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('interrupted'), false);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('failed'), false);
+
+  const preferredAgentId = '10000000-0000-4000-8000-000000000001';
+  const fallbackAgentId = '20000000-0000-4000-8000-000000000002';
+  const tenantId = '30000000-0000-4000-8000-000000000003';
+  const agent = (id, heartbeat) => ({
+    id,
+    tenant_status: 'active',
+    status: 'active',
+    auth_code_status: 'active',
+    auth_code_expires_at: null,
+    active_auth_binding_id: '40000000-0000-4000-8000-000000000004',
+    auth_code_id: '50000000-0000-4000-8000-000000000005',
+    auth_binding_id: '40000000-0000-4000-8000-000000000004',
+    allowed_platforms: ['douyin'],
+    capabilities: {
+      remoteTaskCreate: true,
+      remoteTargetedPostCaptureV1: true,
+      followedCreatorPostPatrol: true,
+      supportedPlatforms: ['douyin'],
+    },
+    last_heartbeat_at: heartbeat,
+    active_task_count: 0,
+    active_command_count: 0,
+  });
+  const fallback = agent(fallbackAgentId, new Date().toISOString());
+  const statements = [];
+  const tx = {
+    async queryAll(sql, params) {
+      statements.push({kind: 'queryAll', sql, params});
+      return [
+        agent(preferredAgentId, '2020-01-01T00:00:00.000Z'),
+        fallback,
+      ];
+    },
+    async queryOne(sql, params) {
+      statements.push({kind: 'queryOne', sql, params});
+      if (sql.includes('FROM capture_agents ca')) return fallback;
+      if (sql.includes('FROM capture_tasks')) return null;
+      throw new Error(`Unexpected queryOne: ${sql}`);
+    },
+    async execute(sql, params) {
+      statements.push({kind: 'execute', sql, params});
+      return {rowCount: 1};
+    },
+  };
+
+  const selected = await loadAvailableScheduledProfilePatrolAgent(tx, {
+    tenantId,
+    preferredAgentId,
+    platform: 'douyin',
+    subjectType: 'creator',
+  });
+  assert.equal(selected.agent.id, fallbackAgentId);
+  assert.equal(selected.preferredAgentId, preferredAgentId);
+  assert.equal(selected.selection, 'failover');
+  assert.ok(statements.some(statement =>
+    statement.kind === 'execute' &&
+    statement.sql.includes('pg_advisory_xact_lock')));
+  assert.equal(statements.some(statement =>
+    statement.sql.includes('UPDATE monitor_subscriptions') &&
+    statement.sql.includes('assigned_agent_id')),
+  false);
+});
+
+test('stale profile execution cleanup preserves live commands and online runners', async () => {
+  const {reconcileStaleProfilePatrolExecutions} = await import(
+    `../server/services/profile-patrol-dispatch.js?reconcile=${Date.now()}`
+  );
+  const executionId = '60000000-0000-4000-8000-000000000006';
+  const statements = [];
+  const tx = {
+    async queryAll(sql, params) {
+      statements.push({kind: 'queryAll', sql, params});
+      return [{
+        id: executionId,
+        tenant_id: '30000000-0000-4000-8000-000000000003',
+        subscription_id: '70000000-0000-4000-8000-000000000007',
+      }];
+    },
+    async execute(sql, params) {
+      statements.push({kind: 'execute', sql, params});
+      return {rowCount: 1};
+    },
+  };
+
+  const reconciled = await reconcileStaleProfilePatrolExecutions(tx, {
+    limit: 25,
+    staleMinutes: 15,
+  });
+  assert.equal(reconciled.length, 1);
+  const cleanup = statements[0];
+  assert.match(cleanup.sql, /active_command\.expires_at > now\(\)/u);
+  assert.match(cleanup.sql, /active_agent\.last_heartbeat_at >=/u);
+  assert.match(cleanup.sql, /FOR UPDATE OF execution SKIP LOCKED/u);
+  assert.equal(cleanup.params[0], 25);
+  assert.equal(cleanup.params[1], 15);
+  assert.deepEqual(cleanup.params[3], [
+    'pending',
+    'waiting_device',
+    'claimed',
+    'running',
+    'recovering',
+    'resume_requested',
+  ]);
+  assert.equal(statements.length, 1);
+});
+
 test('manual dispatch safely adopts only unclaimed scheduled executions', () => {
   assert.match(route, /requestKeyCollision/u);
   assert.match(route, /idempotency_key_conflict/u);
@@ -217,6 +337,11 @@ test('scheduled profile patrol materializes real dispatch-center tasks', () => {
     /ms\.subject_type IN \('creator', 'official'\)/u,
   );
   assert.match(dispatchService, /subscription\.assigned_agent_id/u);
+  assert.match(dispatchService, /loadAvailableScheduledProfilePatrolAgent/u);
+  assert.match(dispatchService, /selection: !preferred/u);
+  assert.match(dispatchService, /scheduledAgentSelection/u);
+  assert.match(dispatchService, /reconcileStaleProfilePatrolExecutions/u);
+  assert.match(dispatchService, /历史账号巡查执行状态未闭环/u);
   assert.match(dispatchService, /triggerType: 'profile_scan_schedule'/u);
   assert.match(dispatchService, /requestedByName: '云端调度器'/u);
   assert.match(dispatchService, /const reusableExecution = await tx\.queryOne/u);
@@ -229,10 +354,7 @@ test('scheduled profile patrol materializes real dispatch-center tasks', () => {
     dispatchService,
     /error\?\.error === 'subscription_execution_busy'[\s\S]*kind: 'busy'/u,
   );
-  assert.match(
-    dispatchService,
-    /该账号尚未绑定执行节点，定时扫描未创建/u,
-  );
+  assert.match(dispatchService, /当前没有在线、空闲且支持该平台的执行节点/u);
 });
 
 test('scheduled occurrence participates in the dispatch idempotency hash', async () => {

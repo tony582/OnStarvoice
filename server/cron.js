@@ -9,6 +9,7 @@ import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
+import {reconcilePendingCaptureCommands} from './routes/capture-cloud.js';
 
 function shanghaiNowParts() {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -71,6 +72,7 @@ export function startCronJobs() {
 
   cron.schedule('*/5 * * * *', async () => {
     try {
+      await reconcilePendingCaptureCommands();
       const results = await enqueueDueProfilePatrolTasks(20);
       const created = results.filter(result => result.kind === 'created').length;
       const attention = results.length - created;
@@ -87,6 +89,12 @@ export function startCronJobs() {
 
   cron.schedule('* * * * *', async () => {
     try {
+      const reconciliation = await reconcilePendingCaptureCommands();
+      if (reconciliation.commandCount > 0) {
+        console.log(
+          `[Cron] Capture commands reconciled: ${reconciliation.commandCount}`,
+        );
+      }
       const results = await enqueueDueCaptureOrchestrations(20);
       const created = results.filter(result => result.kind === 'created').length;
       const skipped = results.length - created;

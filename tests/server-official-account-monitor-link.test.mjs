@@ -37,6 +37,10 @@ const commentWorkflow = await readFile(
   new URL('../server/services/comment-workflow.js', import.meta.url),
   'utf8',
 );
+const officialIdentity = await readFile(
+  new URL('../server/services/official-account-identity.js', import.meta.url),
+  'utf8',
+);
 const adminRoute = await readFile(
   new URL('../server/routes/admin.js', import.meta.url),
   'utf8',
@@ -410,9 +414,10 @@ test('official identity matching distinguishes platform UID and human account nu
     officialPatrolRoute,
     /NULLIF\(BTRIM\(record\.external_id\), ''\) IS NOT NULL/u,
   );
-  assert.match(commentWorkflow, /account\.platform_user_id/u);
-  assert.match(commentWorkflow, /account\.account_no/u);
-  assert.match(commentWorkflow, /legacyAccountId/u);
+  assert.match(commentWorkflow, /official-account-identity\.js/u);
+  assert.match(officialIdentity, /account\.platform_user_id/u);
+  assert.match(officialIdentity, /account\.account_no/u);
+  assert.match(officialIdentity, /legacyAccountId/u);
 
   const official = {
     status: 'active',

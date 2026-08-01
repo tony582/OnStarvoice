@@ -118,6 +118,7 @@ async function attachIssue(record, alert, alertId) {
 export async function checkAlerts(recordId) {
   const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
   if (!record) return [];
+  if (['official_content', 'blogger_profile'].includes(record.record_type)) return [];
 
   const alerts = [];
 
@@ -164,7 +165,10 @@ export async function checkAlerts(recordId) {
     const b = await queryOne(
       `SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY (likes + comments_count + collects + shares)) AS p90,
               COUNT(*) AS n
-       FROM records WHERE tenant_id = $1 AND created_at >= now() - interval '14 days'`,
+       FROM records
+       WHERE tenant_id = $1
+         AND record_type NOT IN ('official_content', 'blogger_profile')
+         AND created_at >= now() - interval '14 days'`,
       [record.tenant_id]
     );
     if (b && Number(b.n) >= 20) baselineP90 = Math.round(Number(b.p90) || 0);
@@ -193,7 +197,7 @@ export async function checkAlerts(recordId) {
     windowStart.setMinutes(windowStart.getMinutes() - burstWindow);
 
     const recentNeg = await queryOne(
-      "SELECT COUNT(*) as n FROM records WHERE tenant_id = $1 AND sentiment = 'negative' AND created_at >= $2",
+      "SELECT COUNT(*) as n FROM records WHERE tenant_id = $1 AND record_type NOT IN ('official_content', 'blogger_profile') AND sentiment = 'negative' AND created_at >= $2",
       [record.tenant_id, windowStart.toISOString()]
     );
 
