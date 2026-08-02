@@ -17,12 +17,17 @@
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
-    "node-cron": "^3.0.3",
-    "nodemailer": "^6.9.16",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.3",
     "pg": "^8.21.0",
     "uuid": "^11.1.0"
   },
   "optionalDependencies": {
     "sql.js": "^1.14.1"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
   }
 }
