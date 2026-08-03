@@ -13,9 +13,10 @@ import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCre
 import { AccountDiscoveryTaskCreator } from './AccountDiscoveryTaskCreator'
 import type { CloudAgent, CloudCreateTaskType, CloudTask, ComposerIntent } from './lib'
 import { agentTaskTypeBlockReason } from './lib'
+import type { OrchestrationLaunchIntent } from './types'
 
 // 统一「新建任务」向导：任务类型 → 执行方式 → 选择节点 → 任务配置。
-// 单节点配置复用 AgentTaskCreator；多节点在选完节点后交接给编排抽屉（预选小队）。
+// 单节点配置复用 AgentTaskCreator；多节点直接进入编排器，在平台和采集规则确定后只选一次节点。
 type WizardStep = 'type' | 'method' | 'agents' | 'configure'
 type TaskType = CloudCreateTaskType
 type ExecutionMethod = 'single' | 'multi'
@@ -40,11 +41,11 @@ const STEP_LABELS: Array<{ step: WizardStep; label: string }> = [
   { step: 'configure', label: '任务配置' },
 ]
 
-function StepIndicator({ step, canBack, onBack }: { step: WizardStep; canBack: (target: WizardStep) => boolean; onBack: (target: WizardStep) => void }) {
-  const currentIndex = STEP_LABELS.findIndex(item => item.step === step)
+function StepIndicator({ step, labels, canBack, onBack }: { step: WizardStep; labels: typeof STEP_LABELS; canBack: (target: WizardStep) => boolean; onBack: (target: WizardStep) => void }) {
+  const currentIndex = labels.findIndex(item => item.step === step)
   return (
     <ol className="grid grid-cols-4 gap-2" aria-label="创建任务步骤">
-      {STEP_LABELS.map((item, index) => {
+      {labels.map((item, index) => {
         const done = index < currentIndex
         const current = index === currentIndex
         const content = (
@@ -83,7 +84,7 @@ export function CreateTaskDrawer({
   intent: ComposerIntent
   onClose: () => void
   onCreated: () => Promise<void>
-  onLaunchOrchestration: (agentIds: string[]) => void
+  onLaunchOrchestration: (intent: OrchestrationLaunchIntent) => void
 }) {
   const editingExisting = intent.editExisting === true
   // 从 Agent 详情「分配任务/创建计划」进入时锁定该 Agent：跳过执行方式与选择节点两步。
@@ -115,6 +116,15 @@ export function CreateTaskDrawer({
   })
   const showIndicator = !editingExisting
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
+  const orchestrationPath = method === 'multi' && taskType !== 'negative_patrol'
+  const stepLabels = orchestrationPath
+    ? [
+        { step: 'type' as const, label: '任务类型' },
+        { step: 'method' as const, label: '执行范围' },
+        { step: 'agents' as const, label: '任务配置与节点' },
+        { step: 'configure' as const, label: '分配确认' },
+      ]
+    : STEP_LABELS
 
   const goBack = () => {
     if (step === 'configure') {
@@ -132,12 +142,18 @@ export function CreateTaskDrawer({
       if (presetAgentId) return setStep('configure')
       return setStep('method')
     }
-    if (step === 'method') return setStep('agents')
-    if (step === 'agents') {
-      // 多节点编排：关闭本向导并把已选小队交给编排抽屉（内部 define→allocate→dispatch 不变）。
+    if (step === 'method') {
       if (method === 'multi' && taskType !== 'negative_patrol') {
-        return onLaunchOrchestration(selectedAgentIds)
+        return onLaunchOrchestration({
+          executionMode: mode,
+          agentIds: [],
+          lockExecutionMode: true,
+          minimumAgentCount: 2,
+        })
       }
+      return setStep('agents')
+    }
+    if (step === 'agents') {
       return setStep('configure')
     }
   }
@@ -163,10 +179,10 @@ export function CreateTaskDrawer({
   const nextLabel = step === 'type'
     ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
     : step === 'method'
-      ? '下一步：选择节点'
-        : method === 'multi' && taskType !== 'negative_patrol'
-        ? '前往多节点编排'
-        : '下一步：任务配置'
+      ? method === 'multi' && taskType !== 'negative_patrol'
+        ? '配置多节点任务'
+        : '下一步：选择节点'
+      : '下一步：任务配置'
 
   return (
     <Drawer onClose={onClose} width="xl" labelledBy="create-task-title" closeOnOverlay={false}>
@@ -185,7 +201,7 @@ export function CreateTaskDrawer({
             </p>
           </div>
         </div>
-        {showIndicator && <div className="mt-4"><StepIndicator step={step} canBack={canBackTo} onBack={goBackTo} /></div>}
+        {showIndicator && <div className="mt-4"><StepIndicator step={step} labels={stepLabels} canBack={canBackTo} onBack={goBackTo} /></div>}
       </header>
 
       <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6">
@@ -204,7 +220,10 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
-                        if (['comment_patrol', 'creator_patrol'].includes(item.value)) setMethod('single')
+                        if (['comment_patrol', 'creator_patrol'].includes(item.value)) {
+                          setMethod('single')
+                          setSelectedAgentIds(current => current.slice(0, 1))
+                        }
                       }
                     }}
                     className={`flex min-h-36 flex-col rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${item.planned ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
@@ -237,7 +256,11 @@ export function CreateTaskDrawer({
                 const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
-                    onClick={() => { if (!unavailable) setMethod(item.value) }}
+                    onClick={() => {
+                      if (unavailable) return
+                      setMethod(item.value)
+                      if (item.value === 'single') setSelectedAgentIds(current => current.slice(0, 1))
+                    }}
                     className={`min-h-36 rounded-2xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${unavailable ? 'cursor-not-allowed border-dashed border-border/70 bg-muted/30 opacity-65' : selected ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/20' : 'border-border bg-background hover:border-primary/35'}`}>
                     <div className="flex items-center justify-between gap-3">
                       <span className={`flex h-10 w-10 items-center justify-center rounded-xl ${selected ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}><Icon className="h-5 w-5" /></span>
@@ -255,6 +278,11 @@ export function CreateTaskDrawer({
                           ? '把负面帖子均衡拆给多个在线 Agent 并行巡查，降低单账号连续打开大量帖子的压力。'
                         : item.description}
                     </p>
+                    {!unavailable && item.value === 'multi' && selected && taskType !== 'negative_patrol' && (
+                      <p className="mt-2 text-[11px] leading-4 text-primary">
+                        下一页先确定平台和采集规则，再选择兼容节点；Agent 只选一次。
+                      </p>
+                    )}
                   </button>
                 )
               })}

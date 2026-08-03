@@ -1,6 +1,6 @@
 # StarVoice 星语 API 接口文档
 
-> 稳定版基线：Extension `0.3.72`，以仓库 `main` 分支为准，数据库迁移截至 `054_restore_iso_publish_timestamps.sql`。
+> 稳定版基线：Extension `0.3.73`，以仓库 `main` 分支为准，数据库迁移截至 `054_restore_iso_publish_timestamps.sql`。
 > 本文用于开发、联调、排障和交接，不替代路由源码。接口发生变化时，应同时更新对应路由、测试和本文。
 
 ## 1. 基址与服务边界

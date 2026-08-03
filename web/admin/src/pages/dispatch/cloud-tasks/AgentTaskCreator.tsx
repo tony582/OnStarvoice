@@ -11,7 +11,9 @@ import {
   hasConfiguredUnattendedPlan,
   normalizeCloudTaskDateList,
   safeNumber,
+  shanghaiToday,
 } from './lib'
+import { ScheduledDatesPicker } from './ScheduledDatesPicker'
 
 export function AgentTaskCreator({
   agent,
@@ -250,11 +252,15 @@ export function AgentTaskCreator({
       (normalizedDates.length === 0 || invalidDates.length > 0)
     ) {
       setError(invalidDates.length > 0
-        ? `以下日期无效：${invalidDates.slice(0, 3).join('、')}。请输入真实存在的日期，例如 2026-07-21。`
-        : '指定日期计划至少需要一个有效日期，例如 2026-7-21 或 2026/7/21。')
+        ? `旧计划中有无法识别的日期：${invalidDates.slice(0, 3).join('、')}。请删除后重新选择。`
+        : '请至少选择一个运行日期。')
       return
     }
     if (executionMode === 'unattended_plan' && planMode === 'custom_dates') {
+      if (!normalizedDates.some(date => date >= shanghaiToday())) {
+        setError('指定日期中至少需要一个今天或未来的日期。')
+        return
+      }
       setCustomDates(normalizedDates.join('\n'))
     }
     if (
@@ -529,13 +535,7 @@ export function AgentTaskCreator({
             </>}
           </div>
           {executionMode === 'unattended_plan' && planMode === 'custom_dates' && (
-            <label className="block text-xs font-medium text-muted-foreground">
-              运行日期（每行一个）
-              <textarea value={customDates} onChange={event => setCustomDates(event.target.value)} rows={3} disabled={disabled}
-                placeholder={'2026-7-21\n2026/10/2'}
-                className="mt-1.5 w-full resize-y rounded-lg border border-border bg-background px-3 py-2.5 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary disabled:opacity-60" />
-              <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">支持 YYYY-M-D 或 YYYY/M/D，保存时会自动规范为 YYYY-MM-DD。</span>
-            </label>
+            <ScheduledDatesPicker value={customDates} onChange={setCustomDates} disabled={disabled} />
           )}
           {remoteTaskEnhancementOptions ? (
             <fieldset className="rounded-xl border border-primary/20 bg-primary/[0.035] p-3.5">

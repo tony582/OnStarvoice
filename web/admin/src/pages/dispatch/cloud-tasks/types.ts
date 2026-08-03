@@ -1,4 +1,12 @@
 export type OrchestrationPlatform = 'xiaohongshu' | 'douyin'
+export type OrchestrationExecutionMode = 'one_time' | 'unattended_plan'
+
+export type OrchestrationLaunchIntent = {
+  executionMode: OrchestrationExecutionMode
+  agentIds: string[]
+  lockExecutionMode?: boolean
+  minimumAgentCount?: number
+}
 
 // CaptureEnhancementSettings 统一以 lib.ts 的定义为准（字段全可选），此处仅 re-export 保持既有 import 兼容。
 export type { CaptureEnhancementSettings } from './lib'
@@ -183,7 +191,12 @@ export type OrchestrationComposerDrawerProps = {
   open: boolean
   writable: boolean
   agents: OrchestrationCloudAgent[]
-  /** 从新建任务向导带过来的预选节点；不传时行为不变（空小队）。 */
+  /** 新建任务向导可以锁定已选运行方式，避免跨抽屉后回落到默认值。 */
+  initialExecutionMode?: OrchestrationExecutionMode
+  lockExecutionMode?: boolean
+  /** 多节点入口要求平台兼容过滤后仍保留至少两个节点；直接入口仍可使用一个。 */
+  minimumAgentCount?: number
+  /** 兼容直接打开编排器时的预选节点；统一向导的多节点链路不再提前选节点。 */
   initialAgentIds?: string[]
   onClose: () => void
   onDispatched?: (result: OrchestrationDispatchResult) => void | Promise<void>

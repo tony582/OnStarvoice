@@ -18,19 +18,21 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { ScheduledDatesPicker } from './ScheduledDatesPicker'
 import { Drawer } from '@/components/shared/Drawer'
+import { shanghaiToday } from './lib'
 import type {
   CaptureEnhancementSettings,
   OrchestrationCloudAgent,
   OrchestrationComposerDrawerProps,
   OrchestrationDispatchResult,
+  OrchestrationExecutionMode,
   OrchestrationItemRecord,
   OrchestrationPlatform,
   OrchestrationRecord,
 } from './types'
 
 type ComposerStage = 'define' | 'allocate' | 'dispatched'
-type ExecutionMode = 'one_time' | 'unattended_plan'
 type PlanMode = 'daily' | 'custom_dates'
 
 type CreateResponse = {
@@ -132,15 +134,6 @@ function parseCustomDates(value: string) {
     return normalized
   }).filter(Boolean))).sort()
   return { dates, invalidDates }
-}
-
-function shanghaiToday() {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date())
 }
 
 function formatScheduleTime(value?: string | null) {
@@ -247,6 +240,9 @@ export function OrchestrationComposerDrawer({
   open,
   writable,
   agents,
+  initialExecutionMode = 'one_time',
+  lockExecutionMode = false,
+  minimumAgentCount = 1,
   initialAgentIds,
   onClose,
   onDispatched,
@@ -255,7 +251,7 @@ export function OrchestrationComposerDrawer({
   const [stage, setStage] = useState<ComposerStage>('define')
   const [title, setTitle] = useState('')
   const [platform, setPlatform] = useState<OrchestrationPlatform>('xiaohongshu')
-  const [executionMode, setExecutionMode] = useState<ExecutionMode>('one_time')
+  const [executionMode, setExecutionMode] = useState<OrchestrationExecutionMode>(initialExecutionMode)
   const [planMode, setPlanMode] = useState<PlanMode>('daily')
   const [startTime, setStartTime] = useState('09:00')
   const [randomOffsetMin, setRandomOffsetMin] = useState(20)
@@ -273,6 +269,7 @@ export function OrchestrationComposerDrawer({
   const [skipCaptured, setSkipCaptured] = useState(true)
   const [allowIdleAgentHandoff, setAllowIdleAgentHandoff] = useState(true)
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
+  const [selectionNotice, setSelectionNotice] = useState('')
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null)
   const [createFingerprint, setCreateFingerprint] = useState('')
   const [preview, setPreview] = useState<AllocationPreviewResponse | null>(null)
@@ -298,17 +295,28 @@ export function OrchestrationComposerDrawer({
     if (left.online !== right.online) return left.online ? -1 : 1
     return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
   }), [agents, enhancementEnabled, platform])
+  const validSelectedAgentIds = useMemo(
+    () => selectedAgentIds.filter(agentId => {
+      const agent = agents.find(candidate => candidate.id === agentId)
+      return agent ? !agentBlockReason(agent, platform, enhancementEnabled) : false
+    }),
+    [agents, enhancementEnabled, platform, selectedAgentIds],
+  )
   const selectedAgents = useMemo(
-    () => selectedAgentIds
+    () => validSelectedAgentIds
       .map(agentId => agents.find(agent => agent.id === agentId))
       .filter((agent): agent is OrchestrationCloudAgent => Boolean(agent)),
-    [agents, selectedAgentIds],
+    [agents, validSelectedAgentIds],
   )
   const assignmentCounts = useMemo(() => {
     const counts = new Map<string, number>()
     assignments.forEach(assignment => counts.set(assignment.agentId, (counts.get(assignment.agentId) || 0) + 1))
     return counts
   }, [assignments])
+  const assignedAgentCount = useMemo(
+    () => new Set(assignments.map(assignment => assignment.agentId).filter(Boolean)).size,
+    [assignments],
+  )
   const overloadedAgentIds = useMemo(
     () => Array.from(assignmentCounts.entries())
       .filter(([, count]) => count > 30)
@@ -316,6 +324,9 @@ export function OrchestrationComposerDrawer({
     [assignmentCounts],
   )
   const busy = submitting || discardingDraft
+  const requiredAgentCount = Number.isFinite(minimumAgentCount)
+    ? Math.max(1, Math.floor(minimumAgentCount))
+    : 1
   const dispatchedSchedule = dispatchResult?.schedule
   const nextScheduleRunAt = dispatchedSchedule?.next_run_at || dispatchedSchedule?.nextRunAt || null
 
@@ -323,7 +334,7 @@ export function OrchestrationComposerDrawer({
     setStage('define')
     setTitle('')
     setPlatform('xiaohongshu')
-    setExecutionMode('one_time')
+    setExecutionMode(initialExecutionMode)
     setPlanMode('daily')
     setStartTime('09:00')
     setRandomOffsetMin(20)
@@ -340,8 +351,16 @@ export function OrchestrationComposerDrawer({
     setCommentLimit(50)
     setSkipCaptured(true)
     setAllowIdleAgentHandoff(true)
-    // 预选小队来自新建任务向导；未带预选时为空（原默认行为）。
-    setSelectedAgentIds(initialAgentIds ?? [])
+    const compatibleInitialAgentIds = (initialAgentIds ?? []).filter(agentId => {
+      const agent = agents.find(candidate => candidate.id === agentId)
+      return agent && !agentBlockReason(agent, 'xiaohongshu', false)
+    })
+    setSelectedAgentIds(compatibleInitialAgentIds)
+    setSelectionNotice(
+      compatibleInitialAgentIds.length < (initialAgentIds?.length ?? 0)
+        ? '已移除与默认小红书平台不兼容的预选节点，请重新确认 Agent 小队。'
+        : '',
+    )
     setCreateResult(null)
     setCreateFingerprint('')
     setPreview(null)
@@ -352,7 +371,7 @@ export function OrchestrationComposerDrawer({
     setError('')
     setDispatchResult(null)
     requestKeyRef.current = randomRequestKey()
-  }, [initialAgentIds])
+  }, [agents, initialAgentIds, initialExecutionMode])
 
   useEffect(() => {
     if (open && !previouslyOpenRef.current) reset()
@@ -443,13 +462,30 @@ export function OrchestrationComposerDrawer({
     if (discarded && draftIdsRef.current.size === 0) onCloseRef.current()
   }
 
+  const keepCompatibleAgents = (
+    candidateIds: string[],
+    targetPlatform: OrchestrationPlatform,
+    targetEnhancementEnabled: boolean,
+  ) => {
+    const compatibleIds = candidateIds.filter(agentId => {
+      const agent = agents.find(candidate => candidate.id === agentId)
+      return agent && !agentBlockReason(agent, targetPlatform, targetEnhancementEnabled)
+    })
+    const removedNames = candidateIds
+      .filter(agentId => !compatibleIds.includes(agentId))
+      .map(agentId => agents.find(candidate => candidate.id === agentId)?.display_name || `Agent ${agentId.slice(0, 8)}`)
+    setSelectedAgentIds(compatibleIds)
+    setSelectionNotice(
+      removedNames.length > 0
+        ? `已移除不兼容节点：${removedNames.join('、')}。请按当前平台和采集设置补选。`
+        : '',
+    )
+  }
+
   const changePlatform = (value: OrchestrationPlatform) => {
     markDefinitionChanged()
     setPlatform(value)
-    setSelectedAgentIds(current => current.filter(agentId => {
-      const agent = agents.find(candidate => candidate.id === agentId)
-      return agent && !agentBlockReason(agent, value, enhancementEnabled)
-    }))
+    keepCompatibleAgents(selectedAgentIds, value, enhancementEnabled)
   }
 
   const changeEnhancementEnabled = (value: boolean) => {
@@ -461,14 +497,12 @@ export function OrchestrationComposerDrawer({
       setBloggerMetrics(false)
       setIncludeComments(false)
     }
-    setSelectedAgentIds(current => current.filter(agentId => {
-      const agent = agents.find(candidate => candidate.id === agentId)
-      return agent && !agentBlockReason(agent, platform, value)
-    }))
+    keepCompatibleAgents(selectedAgentIds, platform, value)
   }
 
   const toggleAgent = (agentId: string) => {
     setError('')
+    setSelectionNotice('')
     setPreview(null)
     setAssignments([])
     setSelectedAgentIds(current =>
@@ -524,6 +558,10 @@ export function OrchestrationComposerDrawer({
       setError('请输入 1–300 个关键词，每行一个。单个 Agent 最多承载 30 个。')
       return
     }
+    if (requiredAgentCount > 1 && keywords.length < requiredAgentCount) {
+      setError(`多节点任务至少需要 ${requiredAgentCount} 个关键词；一个关键词只能交给一个 Agent。`)
+      return
+    }
     if (!Number.isSafeInteger(keywordMaxDetectedItems) || keywordMaxDetectedItems < 1) {
       setError('每个关键词的帖子上限必须是大于等于 1 的整数。')
       return
@@ -557,12 +595,8 @@ export function OrchestrationComposerDrawer({
         }
       }
     }
-    const validSelectedAgents = selectedAgentIds.filter(agentId => {
-      const agent = agents.find(candidate => candidate.id === agentId)
-      return agent && !agentBlockReason(agent, platform, enhancementEnabled)
-    })
-    if (validSelectedAgents.length < 1) {
-      setError('至少选择 1 个与当前平台和采集设置兼容的 Agent。')
+    if (validSelectedAgentIds.length < requiredAgentCount) {
+      setError(`请至少选择 ${requiredAgentCount} 个与当前平台和采集设置兼容的 Agent。`)
       return
     }
     if ((!createResult || createFingerprint !== currentFingerprint) && draftIdsRef.current.size > 0) {
@@ -612,7 +646,7 @@ export function OrchestrationComposerDrawer({
 
       const nextPreview = await api.post<AllocationPreviewResponse>(
         `/capture-cloud/orchestrations/${nextCreateResult.orchestration.id}/allocation-preview`,
-        { agentIds: validSelectedAgents },
+        { agentIds: validSelectedAgentIds },
       )
       const nextAssignments = buildAssignments(nextCreateResult, nextPreview)
       if (nextAssignments.length !== nextPreview.itemCount || nextAssignments.some(assignment => !assignment.agentId)) {
@@ -636,6 +670,10 @@ export function OrchestrationComposerDrawer({
     }
     if (assignments.length !== createResult.items.length || assignments.some(assignment => !assignment.agentId)) {
       setError('每个工作项都必须分配给一个已选择的 Agent。')
+      return
+    }
+    if (assignedAgentCount < requiredAgentCount) {
+      setError(`多节点任务必须实际分配给至少 ${requiredAgentCount} 个 Agent。`)
       return
     }
     if (overloadedAgentIds.length > 0) {
@@ -722,48 +760,65 @@ export function OrchestrationComposerDrawer({
                     <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><Clock3 className="h-4 w-4" /></span>
                     <div>
                       <h3 className="text-sm font-bold text-foreground">运行方式</h3>
-                      <p className="text-[11px] text-muted-foreground">选择只执行一次，或让云端按固定计划反复生成任务。</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {lockExecutionMode ? '已从上一步带入；这里只配置具体运行规则。' : '选择只执行一次，或让云端按固定计划反复生成任务。'}
+                      </p>
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-2 rounded-xl bg-muted/55 p-1">
-                    {([
-                      {
-                        value: 'one_time' as const,
-                        label: '执行一次',
-                        description: '确认后立即下发',
-                        icon: Play,
-                      },
-                      {
-                        value: 'unattended_plan' as const,
-                        label: '无人值守',
-                        description: '云端按时运行',
-                        icon: CalendarDays,
-                      },
-                    ]).map(option => {
-                      const Icon = option.icon
-                      const active = executionMode === option.value
-                      return (
-                        <button
-                          key={option.value}
-                          type="button"
-                          aria-pressed={active}
-                          disabled={busy}
-                          onClick={() => {
-                            if (executionMode === option.value) return
-                            markDefinitionChanged()
-                            setExecutionMode(option.value)
-                          }}
-                          className={`flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${active ? 'border-primary/30 bg-card text-primary shadow-sm' : 'border-transparent text-muted-foreground hover:bg-card/70 hover:text-foreground'}`}
-                        >
-                          <Icon className="h-4 w-4 shrink-0" />
-                          <span className="min-w-0">
-                            <span className="block text-xs font-bold">{option.label}</span>
-                            <span className="mt-0.5 block truncate text-[10px] font-normal">{option.description}</span>
-                          </span>
-                        </button>
-                      )
-                    })}
-                  </div>
+                  {lockExecutionMode ? (
+                    <div role="status" className="flex items-center gap-3 rounded-xl border border-primary/20 bg-card px-3 py-2.5">
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                        {executionMode === 'unattended_plan' ? <CalendarDays className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-xs font-bold text-foreground">
+                          {executionMode === 'unattended_plan' ? '无人值守' : '执行一次'}
+                        </span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">已从上一步确定，无需重复选择。</span>
+                      </span>
+                      <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">已确定</span>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-2 rounded-xl bg-muted/55 p-1">
+                      {([
+                        {
+                          value: 'one_time' as const,
+                          label: '执行一次',
+                          description: '确认后立即下发',
+                          icon: Play,
+                        },
+                        {
+                          value: 'unattended_plan' as const,
+                          label: '无人值守',
+                          description: '云端按时运行',
+                          icon: CalendarDays,
+                        },
+                      ]).map(option => {
+                        const Icon = option.icon
+                        const active = executionMode === option.value
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            aria-pressed={active}
+                            disabled={busy}
+                            onClick={() => {
+                              if (executionMode === option.value) return
+                              markDefinitionChanged()
+                              setExecutionMode(option.value)
+                            }}
+                            className={`flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${active ? 'border-primary/30 bg-card text-primary shadow-sm' : 'border-transparent text-muted-foreground hover:bg-card/70 hover:text-foreground'}`}
+                          >
+                            <Icon className="h-4 w-4 shrink-0" />
+                            <span className="min-w-0">
+                              <span className="block text-xs font-bold">{option.label}</span>
+                              <span className="mt-0.5 block truncate text-[10px] font-normal">{option.description}</span>
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
 
                   {executionMode === 'unattended_plan' && (
                     <div className="mt-4 space-y-3 border-t border-primary/15 pt-4">
@@ -800,18 +855,14 @@ export function OrchestrationComposerDrawer({
                         </label>
                       </div>
                       {planMode === 'custom_dates' && (
-                        <label className="block text-xs font-medium text-muted-foreground">
-                          指定日期（每行一个）
-                          <textarea
-                            value={customDates}
-                            onChange={event => { markDefinitionChanged(); setCustomDates(event.target.value) }}
-                            disabled={busy}
-                            rows={3}
-                            placeholder={'2026-07-25\n2026-08-01'}
-                            className={textareaClassName}
-                          />
-                          <span className="mt-1.5 block text-[11px] text-muted-foreground">格式 YYYY-MM-DD；已经过去的日期不会再次运行。</span>
-                        </label>
+                        <ScheduledDatesPicker
+                          value={customDates}
+                          onChange={value => {
+                            markDefinitionChanged()
+                            setCustomDates(value)
+                          }}
+                          disabled={busy}
+                        />
                       )}
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="block text-xs font-medium text-muted-foreground">
@@ -860,26 +911,18 @@ export function OrchestrationComposerDrawer({
                         className={inputClassName}
                       />
                     </label>
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <label className="block text-xs font-medium text-muted-foreground">
-                        平台
-                        <select value={platform} onChange={event => changePlatform(event.target.value as OrchestrationPlatform)} disabled={busy} className={inputClassName}>
-                          {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                        </select>
-                      </label>
-                      <label className="block text-xs font-medium text-muted-foreground">
-                        每个关键词最多采集
-                        <input
-                          type="number"
-                          min={1}
-                          step={1}
-                          value={keywordMaxDetectedItems}
-                          onChange={event => { markDefinitionChanged(); setKeywordMaxDetectedItems(Number(event.target.value)) }}
-                          disabled={busy}
-                          className={inputClassName}
-                        />
-                      </label>
-                    </div>
+                    <label className="block text-xs font-medium text-muted-foreground">
+                      每个关键词最多采集
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        value={keywordMaxDetectedItems}
+                        onChange={event => { markDefinitionChanged(); setKeywordMaxDetectedItems(Number(event.target.value)) }}
+                        disabled={busy}
+                        className={inputClassName}
+                      />
+                    </label>
                     <label className="block text-xs font-medium text-muted-foreground">
                       关键词（每行一个）
                       <textarea
@@ -968,12 +1011,24 @@ export function OrchestrationComposerDrawer({
                   <div className="flex items-center gap-2">
                     <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><Users className="h-4 w-4" /></span>
                     <div>
-                      <h3 className="text-sm font-bold text-foreground">选择 Agent 小队</h3>
-                      <p className="text-[11px] text-muted-foreground">已选 {selectedAgentIds.length} 个节点</p>
+                      <h3 className="text-sm font-bold text-foreground">采集平台与 Agent 小队</h3>
+                      <p className="text-[11px] text-muted-foreground">已选 {selectedAgents.length} 个兼容节点</p>
                     </div>
                   </div>
-                  <span className="rounded-md bg-muted px-2 py-1 text-[10px] font-medium text-muted-foreground">至少 1 个</span>
+                  <span className="rounded-md bg-muted px-2 py-1 text-[10px] font-medium text-muted-foreground">至少 {requiredAgentCount} 个</span>
                 </div>
+                <label className="mt-3 block text-xs font-medium text-muted-foreground">
+                  先选采集平台
+                  <select value={platform} onChange={event => changePlatform(event.target.value as OrchestrationPlatform)} disabled={busy} className={inputClassName}>
+                    {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                  <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">下方仅允许选择支持当前平台和采集设置的 Agent。</span>
+                </label>
+                {selectionNotice && (
+                  <p role="status" aria-live="polite" className="mt-3 rounded-xl border border-status-orange/25 bg-status-orange/8 px-3 py-2 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+                    {selectionNotice}
+                  </p>
+                )}
                 <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[0.045] px-3 py-2.5">
                   <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 规则均衡</div>
                   <p className="mt-1 text-[11px] leading-4 text-muted-foreground">按关键词顺序连续均分给已选 Agent；结果可在下一步逐项调整。这里不会调用 AI。</p>
@@ -1006,7 +1061,7 @@ export function OrchestrationComposerDrawer({
                   <div className="mt-3 max-h-[520px] space-y-2 overflow-y-auto pr-1">
                     {sortedAgents.map(agent => {
                       const blockReason = agentBlockReason(agent, platform, enhancementEnabled)
-                      const checked = selectedAgentIds.includes(agent.id)
+                      const checked = validSelectedAgentIds.includes(agent.id)
                       const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
                       const activeTasks = safeCount(agent.active_task_count)
                       const queuedTasks = safeCount(agent.queued_task_count)
@@ -1052,6 +1107,11 @@ export function OrchestrationComposerDrawer({
                       )
                     })}
                   </div>
+                )}
+                {selectedAgents.length < requiredAgentCount && (
+                  <p role="status" className="mt-3 text-[11px] leading-4 text-status-orange">
+                    还需选择 {requiredAgentCount - selectedAgents.length} 个与当前平台和采集设置兼容的 Agent。
+                  </p>
                 )}
               </section>
             </div>
@@ -1142,6 +1202,12 @@ export function OrchestrationComposerDrawer({
                     }).join('、')}
                     {' '}超过单节点 30 个工作项上限。请把部分关键词改分配给其他 Agent。
                   </span>
+                </div>
+              )}
+              {assignedAgentCount < requiredAgentCount && (
+                <div role="alert" className="flex items-start gap-2 rounded-xl border border-status-orange/25 bg-status-orange/8 px-3 py-2.5 text-xs leading-5 text-amber-700 dark:text-amber-300">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>多节点任务必须实际分配给至少 {requiredAgentCount} 个 Agent；请把至少一个关键词分给另一节点。</span>
                 </div>
               )}
             </div>
@@ -1237,12 +1303,12 @@ export function OrchestrationComposerDrawer({
                   {stage === 'allocate' ? '上一步' : '取消'}
                 </Button>
                 {stage === 'define' ? (
-                  <Button onClick={() => void generatePreview()} disabled={busy || !writable} className="min-w-44">
+                  <Button onClick={() => void generatePreview()} disabled={busy || !writable || selectedAgents.length < requiredAgentCount} className="min-w-44">
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Settings2 className="h-4 w-4" />}
                     {busy ? '正在生成预览…' : '生成规则分配预览'}
                   </Button>
                 ) : (
-                  <Button onClick={() => void dispatch()} disabled={busy || overloadedAgentIds.length > 0} className="min-w-36">
+                  <Button onClick={() => void dispatch()} disabled={busy || overloadedAgentIds.length > 0 || assignedAgentCount < requiredAgentCount} className="min-w-36">
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                     {busy
                       ? executionMode === 'unattended_plan' ? '正在启用…' : '正在分配…'

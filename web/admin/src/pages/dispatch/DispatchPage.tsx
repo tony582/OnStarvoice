@@ -22,6 +22,7 @@ import type {
   Overview,
   TaskView,
 } from './cloud-tasks/lib'
+import type { OrchestrationLaunchIntent } from './cloud-tasks/types'
 import {
   ACTIVE_TASK_STATUSES,
   canDismissAttention,
@@ -62,8 +63,7 @@ export function DispatchPage() {
         ? { taskType: 'creator_patrol', subscriptionId: String(params?.subscriptionId || '') || undefined }
         : null,
   )
-  const [orchestrationComposerOpen, setOrchestrationComposerOpen] = useState(false)
-  const [orchestrationInitialAgentIds, setOrchestrationInitialAgentIds] = useState<string[]>([])
+  const [orchestrationLaunchIntent, setOrchestrationLaunchIntent] = useState<OrchestrationLaunchIntent | null>(null)
   const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(
     () => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
       String(params?.orchestrationId || ''),
@@ -76,7 +76,7 @@ export function DispatchPage() {
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
 
   const closeOrchestrationComposer = useCallback(() => {
-    setOrchestrationComposerOpen(false)
+    setOrchestrationLaunchIntent(null)
   }, [])
 
   const closeOrchestrationDetail = useCallback(() => {
@@ -493,10 +493,9 @@ export function DispatchPage() {
       {composerIntent && (
         <CreateTaskDrawer agents={overview?.agents || []} tasks={businessTasks} writable={canWrite()} intent={composerIntent}
           onClose={() => setComposerIntent(null)}
-          onLaunchOrchestration={agentIds => {
+          onLaunchOrchestration={launchIntent => {
             setComposerIntent(null)
-            setOrchestrationInitialAgentIds(agentIds)
-            setOrchestrationComposerOpen(true)
+            setOrchestrationLaunchIntent(launchIntent)
           }}
           onCreated={async () => {
             setFeedback('任务已创建并分配给指定 Agent。')
@@ -504,24 +503,29 @@ export function DispatchPage() {
           }} />
       )}
 
-      <OrchestrationComposerDrawer
-        open={orchestrationComposerOpen}
-        writable={canWrite()}
-        agents={overview?.agents || []}
-        initialAgentIds={orchestrationInitialAgentIds}
-        onClose={closeOrchestrationComposer}
-        onChanged={async () => {
-          setOrchestrationRefreshKey(value => value + 1)
-          await load(true)
-        }}
-        onDispatched={async result => {
-          setFeedback(result.schedule
-            ? '多 Agent 无人值守计划已启用，将按云端时间生成每轮任务。'
-            : `多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
-          setOrchestrationRefreshKey(value => value + 1)
-          await load(true)
-        }}
-      />
+      {orchestrationLaunchIntent && (
+        <OrchestrationComposerDrawer
+          open
+          writable={canWrite()}
+          agents={overview?.agents || []}
+          initialExecutionMode={orchestrationLaunchIntent.executionMode}
+          lockExecutionMode={orchestrationLaunchIntent.lockExecutionMode}
+          minimumAgentCount={orchestrationLaunchIntent.minimumAgentCount}
+          initialAgentIds={orchestrationLaunchIntent.agentIds}
+          onClose={closeOrchestrationComposer}
+          onChanged={async () => {
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+          onDispatched={async result => {
+            setFeedback(result.schedule
+              ? '多 Agent 无人值守计划已启用，将按云端时间生成每轮任务。'
+              : `多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+        />
+      )}
 
       {selectedOrchestrationId && (
         <div ref={orchestrationDetailDialogRef}

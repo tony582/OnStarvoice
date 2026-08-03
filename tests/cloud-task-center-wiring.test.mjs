@@ -285,6 +285,33 @@ test("admin UI creates one task draft and explicitly assigns it to a browser age
     "the long task form must render only once inside the assignment drawer");
 });
 
+test("multi-Agent handoff keeps unattended mode and selects platform-compatible agents only once", async () => {
+  const [drawer, dispatch, composer, types] = await Promise.all([
+    read("web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx"),
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/types.ts"),
+  ]);
+
+  assert.match(
+    drawer,
+    /onLaunchOrchestration\(\{[\s\S]*executionMode: mode,[\s\S]*agentIds: \[\],[\s\S]*lockExecutionMode: true,[\s\S]*minimumAgentCount: 2/u,
+  );
+  assert.doesNotMatch(drawer, /onLaunchOrchestration\(selectedAgentIds\)/u);
+  assert.match(drawer, /平台和采集规则确定后只选一次节点/u);
+  assert.match(dispatch, /setOrchestrationLaunchIntent\(launchIntent\)/u);
+  assert.match(dispatch, /\{orchestrationLaunchIntent && \([\s\S]*initialExecutionMode=\{orchestrationLaunchIntent\.executionMode\}/u);
+  assert.match(dispatch, /minimumAgentCount=\{orchestrationLaunchIntent\.minimumAgentCount\}/u);
+  assert.match(types, /executionMode: OrchestrationExecutionMode/u);
+  assert.match(composer, /setExecutionMode\(initialExecutionMode\)/u);
+  assert.match(composer, /已从上一步确定，无需重复选择/u);
+  assert.match(composer, /validSelectedAgentIds\.length < requiredAgentCount/u);
+  assert.match(composer, /keywords\.length < requiredAgentCount/u);
+  assert.match(composer, /assignedAgentCount < requiredAgentCount/u);
+  assert.match(composer, /至少 \{requiredAgentCount\} 个/u);
+  assert.match(composer, /已移除不兼容节点/u);
+});
+
 test("admin UI keeps the business task list newest-first and hides technical child jobs", async () => {
   const [page, lib] = await Promise.all([
     read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
@@ -428,7 +455,7 @@ test("admin task dates accept loose separators and normalize real calendar days"
     .replaceAll("export ", "")
     .replace("value: unknown = ''", "value = ''");
   vm.runInContext(
-    `${executableDateHelpers}\nglobalThis.__normalizeDateList = normalizeCloudTaskDateList;`,
+    `${executableDateHelpers}\nglobalThis.__normalizeDateList = normalizeCloudTaskDateList; globalThis.__shanghaiToday = shanghaiToday;`,
     context,
   );
 
@@ -444,6 +471,29 @@ test("admin task dates accept loose separators and normalize real calendar days"
     "2026-13-1",
     "invalid",
   ]);
+  assert.equal(
+    context.__shanghaiToday(new Date("2026-08-02T16:30:00.000Z")),
+    "2026-08-03",
+  );
+});
+
+test("single and multi-Agent plans share a calendar-based multi-date picker", async () => {
+  const [picker, single, multi] = await Promise.all([
+    read("web/admin/src/pages/dispatch/cloud-tasks/ScheduledDatesPicker.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentTaskCreator.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx"),
+  ]);
+
+  assert.match(single, /<ScheduledDatesPicker value=\{customDates\} onChange=\{setCustomDates\}/u);
+  assert.match(multi, /<ScheduledDatesPicker[\s\S]*value=\{customDates\}/u);
+  assert.doesNotMatch(single, /运行日期（每行一个）/u);
+  assert.doesNotMatch(multi, /指定日期（每行一个）/u);
+  assert.match(picker, /type="date"/u);
+  assert.match(picker, /min=\{today\}/u);
+  assert.match(picker, /nextDates\.join\('\\n'\)/u);
+  assert.match(picker, /dates\.filter\(item => item !== date\)\.join\('\\n'\)/u);
+  assert.match(picker, /dates\.length >= 400/u);
+  assert.match(picker, /aria-live="polite"/u);
 });
 
 test("admin can move ended failures to history individually or in bulk", async () => {

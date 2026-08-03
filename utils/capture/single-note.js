@@ -253,7 +253,7 @@ function extractNoteIdFromUrl() {
  * @throws {Error} 如果验证失败
  * @returns {boolean} 验证通过返回 true
  */
-function validateCapturedData(payload) {
+export function validateCapturedData(payload) {
   const fatalIssues = [];
   const warnings = [];
 
@@ -275,6 +275,19 @@ function validateCapturedData(payload) {
         break;
       }
     }
+  }
+
+  // 纯数字昵称只有在作者主页和作者 ID 相互印证时才允许进入结果。
+  // 这是最终防线，避免后续提取分支意外把互动数、时间等裸数字当成作者。
+  if (
+    isPureNumericAuthorName(payload.author) &&
+    !validateAuthorName(payload.author, {
+      fromAuthorContainer: true,
+      profileUrl: payload.authorUrl,
+      userId: payload.authorId,
+    })
+  ) {
+    fatalIssues.push("纯数字作者身份不完整");
   }
 
   // 媒体缺失降级为告警，不阻断整条记录
@@ -358,7 +371,12 @@ function extractAuthorInfo(noteContext = document) {
   }
 
   let name = nameElement ? cleanText(nameElement.textContent) : "";
-  let url = linkElement ? linkElement.href : "";
+  const authorIdentity = resolveAuthorProfileIdentity(
+    authorContainer,
+    nameElement,
+    linkElement,
+  );
+  let url = authorIdentity.profileUrl || (linkElement ? linkElement.href : "");
 
   if (!url && nameElement) {
     const wrappedLink = nameElement.closest('a[href*="/user/profile/"]');
@@ -367,10 +385,10 @@ function extractAuthorInfo(noteContext = document) {
     }
   }
 
-  const userId = url ? extractUserId(url) : "";
+  const userId = authorIdentity.userId || (url ? extractUserId(url) : "");
 
   // 验证作者名称有效性
-  if (!validateAuthorName(name)) {
+  if (!validateAuthorName(name, authorIdentity)) {
     console.warn(
       "[SingleNote] Author name validation failed:",
       name,
@@ -398,7 +416,7 @@ function extractAuthorInfo(noteContext = document) {
 /**
  * 验证作者名称（增强版，更严格的时间文本过滤）
  */
-export function validateAuthorName(name) {
+export function validateAuthorName(name, identityEvidence = {}) {
   if (!name || typeof name !== "string") return false;
 
   // 长度检查（从 2-20 扩展到 1-50）
@@ -440,7 +458,11 @@ export function validateAuthorName(name) {
     }
   }
 
-  // 排除纯数字；纯 Emoji 是小红书允许的合法昵称（例如“🌻”），不能按纯符号误杀。
+  // 裸数字仍默认拒绝。只有来自当前作者容器、且主页 URL 与作者 ID
+  // 相互印证时才放行合法的纯数字昵称（例如“123”）。
+  if (isPureNumericAuthorName(name)) {
+    return hasMatchingVerifiedXhsProfileIdentity(identityEvidence);
+  }
   if (/^[\d\s]+$/.test(name)) {
     return false;
   }
@@ -451,6 +473,125 @@ export function validateAuthorName(name) {
   }
 
   return true;
+}
+
+function isPureNumericAuthorName(name) {
+  if (typeof name !== "string") return false;
+  return /^[\d\s]+$/.test(name) && /\d/.test(name);
+}
+
+function hasMatchingVerifiedXhsProfileIdentity(identityEvidence = {}) {
+  if (identityEvidence?.fromAuthorContainer !== true) return false;
+
+  const expectedUserId = String(identityEvidence?.userId || "").trim();
+  if (!expectedUserId) return false;
+
+  const profileUserId = extractVerifiedXhsProfileUserId(
+    identityEvidence?.profileUrl,
+  );
+  return Boolean(profileUserId && profileUserId === expectedUserId);
+}
+
+function extractVerifiedXhsProfileUserId(profileUrl) {
+  const rawUrl = String(profileUrl || "").trim();
+  if (!rawUrl) return "";
+
+  try {
+    const parsed = new URL(rawUrl, "https://www.xiaohongshu.com");
+    const hostname = parsed.hostname.toLowerCase();
+    const isXhsHost =
+      hostname === "xiaohongshu.com" || hostname.endsWith(".xiaohongshu.com");
+    if (parsed.protocol !== "https:" || !isXhsHost) return "";
+
+    const pathMatch = parsed.pathname.match(
+      /^\/user\/profile\/([a-zA-Z0-9]+)(?:\/|$)/i,
+    );
+    if (!pathMatch?.[1]) return "";
+
+    const extractedUserId = String(extractUserId(parsed.href) || "").trim();
+    return extractedUserId === pathMatch[1] ? extractedUserId : "";
+  } catch {
+    return "";
+  }
+}
+
+export function resolveAuthorProfileIdentity(
+  authorContainer,
+  nameElement,
+  linkElement = null,
+) {
+  const emptyIdentity = {
+    fromAuthorContainer: false,
+    profileUrl: "",
+    userId: "",
+  };
+  if (
+    !authorContainer ||
+    !nameElement ||
+    !isNodeWithin(authorContainer, nameElement)
+  ) {
+    return emptyIdentity;
+  }
+
+  const wrappedProfileLink = nameElement.closest?.(
+    'a[href*="/user/profile/"]',
+  );
+  const wrappedIdentity = resolveProfileLinkIdentity(
+    authorContainer,
+    wrappedProfileLink,
+  );
+
+  const candidateLinks = [
+    wrappedProfileLink,
+    linkElement,
+    ...Array.from(
+      authorContainer.querySelectorAll?.('a[href*="/user/profile/"]') || [],
+    ),
+  ];
+  const identitiesByUserId = new Map();
+
+  for (const candidate of candidateLinks) {
+    const identity = resolveProfileLinkIdentity(authorContainer, candidate);
+    if (!identity || identitiesByUserId.has(identity.userId)) continue;
+    identitiesByUserId.set(identity.userId, identity);
+  }
+
+  // 作者容器内出现多个不同主页时无法确认绑定关系，保持失败关闭。
+  if (identitiesByUserId.size !== 1) {
+    return emptyIdentity;
+  }
+  const onlyIdentity = identitiesByUserId.values().next().value;
+  return wrappedIdentity?.userId === onlyIdentity.userId
+    ? wrappedIdentity
+    : onlyIdentity;
+}
+
+function resolveProfileLinkIdentity(authorContainer, linkElement) {
+  if (
+    !linkElement ||
+    !isNodeWithin(authorContainer, linkElement) ||
+    isIgnoredAuthorNode(linkElement)
+  ) {
+    return null;
+  }
+
+  const profileUrl = String(
+    linkElement.href || linkElement.getAttribute?.("href") || "",
+  ).trim();
+  const userId = extractVerifiedXhsProfileUserId(profileUrl);
+  if (!userId) return null;
+
+  return {
+    fromAuthorContainer: true,
+    profileUrl,
+    userId,
+  };
+}
+
+function isNodeWithin(container, node) {
+  if (!container || !node) return false;
+  if (container === node) return true;
+  return typeof container.contains === "function" && container.contains(node);
 }
 
 /**
@@ -649,13 +790,27 @@ function validateContainer(container, noteId) {
   const idMatches = containerMatchesNoteId(container, noteId);
 
   // 验证 3：作者元素有效
-  const authorName = querySelector(
-    NOTE_DETAIL_SELECTORS.author.name,
+  const authorContainer = querySelector(
+    NOTE_DETAIL_SELECTORS.author.container,
     container,
   );
+  const authorName = querySelector(
+    NOTE_DETAIL_SELECTORS.author.name,
+    authorContainer || container,
+  );
+  const authorLink = authorContainer
+    ? querySelector(NOTE_DETAIL_SELECTORS.author.link, authorContainer)
+    : null;
   const authorText = cleanText(authorName?.textContent || "");
+  const authorIdentity = resolveAuthorProfileIdentity(
+    authorContainer,
+    authorName,
+    authorLink,
+  );
   const authorValid =
-    authorText && authorText.length > 0 && validateAuthorName(authorText);
+    authorText &&
+    authorText.length > 0 &&
+    validateAuthorName(authorText, authorIdentity);
 
   // 验证 4：内容区存在
   const content = querySelector(NOTE_DETAIL_SELECTORS.content, container);

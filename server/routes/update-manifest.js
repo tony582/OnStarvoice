@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.72',
+  latestVersion: '0.3.73',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-01',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.72-20260801.zip',
+  releaseDate: '2026-08-03',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.73-20260803.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.73',
+      releaseDate: '2026-08-03',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书纯数字昵称不再漏采',
+              desc: '纯数字昵称在作者区域主页链接与作者 ID 一致时可正常采集；无法互证时继续拒绝，避免把时间或互动数误识别为作者。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.72',
       releaseDate: '2026-08-01',
