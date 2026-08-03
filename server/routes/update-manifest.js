@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.73',
+  latestVersion: '0.3.74',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-03',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.73-20260803.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.74-20260803.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.74',
+      releaseDate: '2026-08-03',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '官方账号评论巡查稳定执行',
+              desc: '抖音与小红书巡查会持续持有当前任务直到作品评论采集真正结束，避免任务提前结束、重复历史或续跑丢失。',
+            },
+            {
+              title: 'Agent 租户与平台边界',
+              desc: '已换租户节点可从当前租户安全移出并在重新验证后恢复；新建任务和官方账号只显示平台兼容的可用 Agent。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '评论采集数量取消 100 条硬上限',
+              desc: '每篇评论采集数量可按业务需要填写，实际在评论加载完成、长时间无新增或达到安全时限时结束。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.73',
       releaseDate: '2026-08-03',

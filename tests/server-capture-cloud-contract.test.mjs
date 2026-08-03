@@ -19,6 +19,7 @@ import {
   sanitizeCloudStructuredObject,
 } from "../server/services/capture-cloud.js";
 import {
+  captureTaskBusinessRootVisibilitySql,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
   crossDeviceRetryAgentSupportsTask,
@@ -207,6 +208,39 @@ test("cloud task snapshots normalize local ledger aliases and timestamps", () =>
   assert.equal(
     normalizeCloudTaskSnapshot({id: "historical-task", status: "failed"}).controlTaskId,
     "",
+  );
+});
+
+test("targeted physical run ids normalize to their canonical business task", () => {
+  const logicalRequestId = "54c0b3fd-a7f8-41a3-94f6-a3bd0e3cd018";
+  const attemptId = "16249468-e006-4c97-af3c-773691dbda65";
+  const snapshot = normalizeCloudTaskSnapshot({
+    id: `${logicalRequestId}::${attemptId}`,
+    taskType: "official_account_comment_patrol",
+    platform: "douyin",
+    status: "failed",
+    attemptId,
+    metadata: {
+      workflow: "official_account_comment_patrol",
+      logicalRequestId,
+      attemptId,
+    },
+  });
+
+  assert.equal(snapshot.clientTaskId, logicalRequestId);
+  assert.equal(snapshot.attemptId, attemptId);
+  assert.equal(snapshot.metadata.logicalRequestId, logicalRequestId);
+
+  const unrelated = normalizeCloudTaskSnapshot({
+    id: `${logicalRequestId}::${attemptId}`,
+    taskType: "unattended_keyword_plan",
+    attemptId,
+    metadata: {logicalRequestId, attemptId},
+  });
+  assert.equal(
+    unrelated.clientTaskId,
+    `${logicalRequestId}::${attemptId}`,
+    "non-targeted tasks must retain their native identity",
   );
 });
 
@@ -693,6 +727,39 @@ test("overview separates execution load from attention history and technical tas
     workload,
     /assigned\.task_type NOT IN \([\s\S]*'capture_orchestration', 'unattended_plan_configuration', 'sync'[\s\S]*RIGHT\(assigned\.task_type, 5\) <> '_sync'/u,
   );
+  assert.match(
+    overview,
+    /ca\.status IN \('active', 'paused'\)/u,
+    "migrated and revoked Agents must stay out of operational lists",
+  );
+  assert.match(
+    overview,
+    /ca\.status = 'migrated'[\s\S]*原执行节点已移出当前租户/u,
+    "historical tasks still explain why their original Agent is unavailable",
+  );
+});
+
+test("overview hides only exact legacy targeted mirror roots", () => {
+  const assigned = captureTaskBusinessRootVisibilitySql("assigned");
+  assert.match(assigned, /assigned\.client_task_id\s*=\s*[\s\S]*logicalRequestId[\s\S]*'::'[\s\S]*attemptId/u);
+  assert.match(assigned, /canonical\.id::text = assigned\.metadata->>'logicalRequestId'/u);
+  assert.match(assigned, /canonical\.client_task_id = assigned\.metadata->>'logicalRequestId'/u);
+  assert.match(assigned, /canonical\.origin_agent_id IS NOT DISTINCT FROM assigned\.origin_agent_id/u);
+  assert.match(assigned, /canonical\.task_type = assigned\.task_type/u);
+  assert.throws(
+    () => captureTaskBusinessRootVisibilitySql("unsafe alias"),
+    /Unsupported capture task SQL alias/u,
+  );
+
+  const overview = readRouteSection(
+    "router.get('/overview'",
+    "router.patch('/agents/:id'",
+  );
+  assert.equal(
+    [...overview.matchAll(/captureTaskBusinessRootVisibilitySql\('(?:assigned|t)'\)/gu)].length,
+    3,
+    "agent load, visible task rows, and summary counts must share the filter",
+  );
 });
 
 test("agent removal blockers explain every unsafe dependency", () => {
@@ -728,9 +795,22 @@ test("agent deletion is a guarded soft revoke that preserves history", () => {
   assert.match(removal, /captureAgentOnline\(agent\.last_heartbeat_at\)/u);
   assert.match(
     removal,
-    /COALESCE\(assigned_agent_id, origin_agent_id\)[\s\S]*AGENT_REMOVAL_TASK_STATUSES/u,
+    /COALESCE\(t\.assigned_agent_id, t\.origin_agent_id\)[\s\S]*AGENT_REMOVAL_TASK_STATUSES/u,
   );
-  assert.match(removal, /FROM capture_task_items[\s\S]*assigned_agent_id = \$2/u);
+  assert.match(
+    removal,
+    /captureTaskBusinessRootVisibilitySql\('t'\)/u,
+    "hidden legacy targeted mirrors must not block Agent deletion",
+  );
+  assert.match(
+    removal,
+    /FROM capture_task_items item[\s\S]*JOIN capture_tasks parent[\s\S]*parent\.status = ANY\(\$3::text\[\]\)/u,
+  );
+  assert.match(
+    removal,
+    /workItemLoad[\s\S]*AGENT_REMOVAL_TASK_STATUSES/u,
+    "terminal parents must not leave stale work items blocking Agent deletion",
+  );
   assert.match(removal, /status IN \('pending', 'acknowledged'\)/u);
   assert.match(
     removal,
@@ -753,24 +833,29 @@ test("agent deletion is a guarded soft revoke that preserves history", () => {
   assert.doesNotMatch(removal, /DELETE FROM auth_bindings/u);
 });
 
-test("permanently offline Agent retirement is explicit, tenant-scoped, audited, and settles control state", async () => {
+test("Agent tenant migration is reversible while permanent retirement stays irreversible", async () => {
   const retirement = readRouteSection(
     "router.post('/agents/:id/retire'",
     "router.post('/agents/:id/tasks'",
   );
-  const credentialIssuer = await readFile(
-    new URL("../server/services/capture-cloud.js", import.meta.url),
-    "utf8",
-  );
+  const [credentialIssuer, migration] = await Promise.all([
+    readFile(new URL("../server/services/capture-cloud.js", import.meta.url), "utf8"),
+    readFile(new URL(
+      "../server/db/migrations/055_capture_agent_tenant_migration.sql",
+      import.meta.url,
+    ), "utf8"),
+  ]);
   assert.match(
     retirement,
     /requireTenantAccess, requireSessionUser, requireTenantWriter/u,
   );
-  assert.match(retirement, /req\.body\?\.confirmation[\s\S]*永久归档/u);
   assert.match(
     retirement,
     /\['tenant_migrated', 'permanently_offline'\]/u,
   );
+  assert.match(retirement, /requiredConfirmation[\s\S]*移出当前租户[\s\S]*永久停用/u);
+  assert.match(retirement, /terminalAgentStatus[\s\S]*'migrated'[\s\S]*'revoked'/u);
+  assert.match(retirement, /capture_agent\.migrated[\s\S]*capture_agent\.retired/u);
   assert.match(
     retirement,
     /WHERE id = \$1 AND tenant_id = \$2[\s\S]*FOR UPDATE/u,
@@ -786,7 +871,7 @@ test("permanently offline Agent retirement is explicit, tenant-scoped, audited, 
   );
   assert.match(
     retirement,
-    /UPDATE capture_agent_commands[\s\S]*status = 'expired'[\s\S]*agent_retired/u,
+    /UPDATE capture_agent_commands[\s\S]*status = 'expired'[\s\S]*lifecycleCode/u,
   );
   assert.match(
     retirement,
@@ -818,18 +903,33 @@ test("permanently offline Agent retirement is explicit, tenant-scoped, audited, 
   );
   assert.match(
     retirement,
-    /UPDATE capture_agents[\s\S]*status = 'revoked'[\s\S]*unattended_plan = '\{\}'::jsonb/u,
+    /UPDATE capture_agents[\s\S]*SET status = \$3[\s\S]*unattended_plan = '\{\}'::jsonb[\s\S]*terminalAgentStatus/u,
   );
   assert.match(
     retirement,
-    /INSERT INTO audit_logs[\s\S]*capture_agent\.retired/u,
+    /INSERT INTO audit_logs[\s\S]*lifecycleAction/u,
   );
   assert.match(retirement, /unattendedPlanSnapshot: planSnapshot/u);
   assert.match(retirement, /historyPreserved: true/u);
   assert.match(retirement, /authBindingPreserved: true/u);
   assert.match(
     credentialIssuer,
-    /ON CONFLICT \(tenant_id, client_uuid\)[\s\S]*status = capture_agents\.status[\s\S]*agent\.status !== 'active'[\s\S]*token: ''/u,
+    /ON CONFLICT \(tenant_id, client_uuid\)[\s\S]*capture_agents\.status = 'migrated'[\s\S]*THEN 'active'[\s\S]*agent\.status !== 'active'[\s\S]*token: ''/u,
+  );
+  assert.match(
+    credentialIssuer,
+    /lockCaptureAgentExecutionSlot\(tx, tenantId, existingAgent\.id\)/u,
+  );
+  assert.match(
+    credentialIssuer,
+    /lockCaptureAgentExecutionSlot\(tx, tenantId, existingAgent\.id\)[\s\S]*WHERE tenant_id = \$1 AND id = \$2[\s\S]*FOR UPDATE[\s\S]*ON CONFLICT \(tenant_id, client_uuid\)/u,
+    "restore status must be re-read under the same lifecycle lock before upsert",
+  );
+  assert.match(credentialIssuer, /capture_agent\.returned_to_tenant/u);
+  assert.match(migration, /DROP CONSTRAINT IF EXISTS capture_agents_status_check/u);
+  assert.match(
+    migration,
+    /CHECK \(status IN \('active', 'paused', 'migrated', 'revoked'\)\)/u,
   );
   assert.doesNotMatch(retirement, /DELETE FROM capture_tasks/u);
   assert.doesNotMatch(retirement, /DELETE FROM records/u);

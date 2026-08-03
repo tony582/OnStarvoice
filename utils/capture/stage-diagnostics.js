@@ -10,6 +10,7 @@ const STAGE_KEYS = Object.freeze({
 });
 
 function finiteNumber(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
 }
@@ -61,6 +62,21 @@ function scrollTerminalReason(scrollResult = {}) {
   if (scrollResult?.canceled) return "canceled";
   if (scrollResult?.completed) return "no_new";
   return "";
+}
+
+export function resolveCommentCaptureStatus({
+  stoppedByUser = false,
+  scrollResult = {},
+} = {}) {
+  const stopReason = cleanText(scrollResult?.stopReason || "", 80);
+  const reachedSafetyLimit =
+    stopReason === "max_scroll" || stopReason === "max_duration";
+  return stoppedByUser ||
+    scrollResult?.canceled === true ||
+    scrollResult?.stalled === true ||
+    reachedSafetyLimit
+    ? "partial"
+    : "done";
 }
 
 function stage(stageKey, label, metrics = {}, status = "completed") {

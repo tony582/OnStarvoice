@@ -24,7 +24,10 @@ import {
   wait,
   scrollElementIntoView,
 } from "../scroll.js";
-import {buildCommentLoadStage} from "./stage-diagnostics.js";
+import {
+  buildCommentLoadStage,
+  resolveCommentCaptureStatus,
+} from "./stage-diagnostics.js";
 
 const DEFAULT_MAX_ITEMS = 100;
 const COMMENT_CONTENT_MAX_LENGTH = 280;
@@ -42,7 +45,7 @@ const FORCE_STOP_STALL_ROUNDS = 10;
  * @param {number} options.waitMinMs - 每轮随机等待最小毫秒
  * @param {number} options.waitMaxMs - 每轮随机等待最大毫秒
  * @param {number} options.stallTimeoutMs - 连续无新增超时毫秒
- * @param {number} options.maxScrollTimes - 最大滚动次数
+ * @param {number|null} options.maxScrollTimes - 最大滚动次数；默认不设固定次数上限
  */
 export async function captureComments({
   onProgress = null,
@@ -53,7 +56,7 @@ export async function captureComments({
   waitMinMs = DEFAULT_CONFIG.SCROLL_DELAY_MIN,
   waitMaxMs = DEFAULT_CONFIG.SCROLL_DELAY_MAX,
   stallTimeoutMs = 3000,
-  maxScrollTimes = DEFAULT_CONFIG.MAX_SCROLL_TIMES,
+  maxScrollTimes = null,
 } = {}) {
   const captureStartedAt = new Date().toISOString();
   resetCancelFlag();
@@ -84,9 +87,8 @@ export async function captureComments({
     normalizePositiveInteger(stallTimeoutMs, 3000),
     MIN_COMMENTS_STALL_TIMEOUT_MS,
   );
-  const normalizedMaxScrollTimes = normalizePositiveInteger(
+  const normalizedMaxScrollTimes = normalizeOptionalPositiveInteger(
     maxScrollTimes,
-    DEFAULT_CONFIG.MAX_SCROLL_TIMES,
   );
 
   try {
@@ -203,7 +205,10 @@ export async function captureComments({
 
     const stoppedByUser = isCanceled();
     const stoppedByStall = Boolean(scrollResult?.stalled);
-    const captureStatus = stoppedByUser || stoppedByStall ? "partial" : "done";
+    const captureStatus = resolveCommentCaptureStatus({
+      stoppedByUser,
+      scrollResult,
+    });
     const items = Array.from(commentsMap.values()).slice(
       0,
       normalizedMaxDetectedItems,
@@ -292,6 +297,14 @@ function normalizePositiveInteger(value, fallback) {
   if (!Number.isFinite(num)) return fallback;
   const rounded = Math.floor(num);
   return rounded > 0 ? rounded : fallback;
+}
+
+function normalizeOptionalPositiveInteger(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const rounded = Math.floor(num);
+  return rounded > 0 ? rounded : null;
 }
 
 function extractNoteIdFromUrl() {

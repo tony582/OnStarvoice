@@ -368,6 +368,12 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
   assert.match(accountRoute, /agent_binding_mode = \$1/u);
   assert.match(accountRoute, /bindingModeAtUnbind', \$5::text/u);
   assert.match(accountRoute, /lockCaptureAgentExecutionSlot/u);
+  assert.match(
+    accountRoute,
+    /status IN \('active', 'paused'\)/u,
+    "migrated and revoked Agents must not be offered for social-account binding",
+  );
+  assert.doesNotMatch(accountRoute, /status <> 'revoked'/u);
   assert.match(serverIndex, /app\.use\('\/api\/social-accounts', socialAccountsRouter\)/u);
   assert.match(background, /onstarvoice\.socialAccountUsageQueue/u);
   assert.match(background, /recordSocialAccountUsageFromRelay/u);
@@ -377,12 +383,16 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
   assert.match(background, /remove\(STORAGE_KEYS\.observedSocialAccounts\)/u);
   assert.match(cloudAgent, /socialAccountDailyUsage:\s*true/u);
   assert.match(page, /今天哪些账号该继续，哪些该休息/u);
+  assert.match(
+    page,
+    /knownAgents[\s\S]*agent\.status === 'active' \|\| agent\.status === 'paused'/u,
+  );
   assert.match(page, /建议休息/u);
   assert.match(page, /bindingMode: form\.agentBindingMode/u);
   assert.match(page, /api\.put\(`\/social-accounts\/\$\{accountId\}\/bindings`/u);
   assert.match(page, /手动指定/u);
   assert.match(page, /未勾选的 Agent 不会被心跳自动加回/u);
-  assert.match(page, /已撤销，请取消/u);
+  assert.match(page, /已移出或停用，请取消/u);
   assert.match(desktop, /'social-accounts': SocialAccountsPage/u);
   assert.match(mobile, /'social-accounts': SocialAccountsPage/u);
   assert.match(navigation, /'social-accounts': 'opinion'/u);

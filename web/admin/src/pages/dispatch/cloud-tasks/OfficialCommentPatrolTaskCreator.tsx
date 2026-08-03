@@ -5,7 +5,7 @@ import {
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import type { CloudAgent } from './lib'
-import { PLATFORM_LABELS, agentCreatePlatforms } from './lib'
+import { PLATFORM_LABELS, agentCreatePlatforms, agentTaskTypeBlockReason } from './lib'
 
 type OfficialAccount = {
   id: string
@@ -47,13 +47,19 @@ export function OfficialCommentPatrolTaskCreator({
   const [feedback, setFeedback] = useState('')
   const pendingSubmission = useRef<{ fingerprint: string; requestKey: string } | null>(null)
   const availablePlatforms = useMemo(() => agentCreatePlatforms(agent), [agent])
-  const selectedAccount = accounts.find(account => account.id === accountId)
+  const compatibleAccounts = useMemo(
+    () => accounts.filter(account => availablePlatforms.includes(account.platform)),
+    [accounts, availablePlatforms],
+  )
+  const selectedAccount =
+    compatibleAccounts.find(account => account.id === accountId) ||
+    compatibleAccounts.find(account => account.id === initialOfficialAccountId) ||
+    compatibleAccounts[0]
   const selectedPlatform = String(selectedAccount?.platform || '').trim()
   const platformCompatible = Boolean(selectedPlatform && availablePlatforms.includes(selectedPlatform))
   const profileReady = Boolean(String(selectedAccount?.profileUrl || '').trim())
-  const commentPatrolSupported =
-    agent.capabilities?.officialAccountCommentPatrol === true &&
-    agent.capabilities?.officialAccountLatestPostsByCountV1 === true
+  const commentPatrolBlockReason = agentTaskTypeBlockReason(agent, 'comment_patrol', 'one_time')
+  const commentPatrolSupported = !commentPatrolBlockReason
   const compatible = platformCompatible && profileReady && commentPatrolSupported
 
   const loadAccounts = useCallback(async () => {
@@ -64,22 +70,15 @@ export function OfficialCommentPatrolTaskCreator({
       const rows = response.accounts || response.items || response.data?.accounts || response.data?.items || []
       const normalized = rows
         .filter(item => item && typeof item.id === 'string' && String(item.platform || '').trim())
-        .map(item => ({ ...item, platform: String(item.platform).trim() }))
+        .map(item => ({ ...item, platform: String(item.platform).trim().toLowerCase() }))
       setAccounts(normalized)
-      setAccountId(current => {
-        if (normalized.some(item => item.id === current)) return current
-        if (initialOfficialAccountId && normalized.some(item => item.id === initialOfficialAccountId)) {
-          return initialOfficialAccountId
-        }
-        return normalized[0]?.id || ''
-      })
     } catch (requestError) {
       setAccounts([])
       setAccountError(requestError instanceof Error ? requestError.message : '读取官方账号失败')
     } finally {
       setAccountsLoading(false)
     }
-  }, [initialOfficialAccountId])
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -99,9 +98,9 @@ export function OfficialCommentPatrolTaskCreator({
     if (!selectedAccount) return '请先选择一个官方账号。'
     if (!platformCompatible) return `当前 Agent 不负责${PLATFORM_LABELS[selectedPlatform] || selectedPlatform}，请返回选择兼容节点。`
     if (!profileReady) return '该官方账号还没有可用的主页链接，请先补全官方账号资料。'
-    if (!commentPatrolSupported) return '当前 Agent 的扩展版本不支持官方账号评论巡查，请升级扩展后再创建任务。'
+    if (!commentPatrolSupported) return commentPatrolBlockReason
     if (typeof postsLimit !== 'number' || !Number.isSafeInteger(postsLimit) || postsLimit < 1 || postsLimit > 100) return '请填写 1–100 的最近作品数量。'
-    if (typeof commentsLimit !== 'number' || !Number.isSafeInteger(commentsLimit) || commentsLimit < 1 || commentsLimit > 100) return '请填写 1–100 的每篇评论加载上限。'
+    if (typeof commentsLimit !== 'number' || !Number.isSafeInteger(commentsLimit) || commentsLimit < 1) return '请填写大于 0 的每篇评论采集数量。'
     return ''
   }
 
@@ -162,9 +161,13 @@ export function OfficialCommentPatrolTaskCreator({
         <div className="grid gap-4 border-t border-border/70 p-4 sm:grid-cols-2 sm:p-5">
           <label className="block text-xs font-medium text-muted-foreground sm:col-span-2">
             官方账号 <span className="text-status-red">*</span>
-            <select value={accountId} onChange={event => { setAccountId(event.target.value); resetSubmission() }} disabled={disabled || accounts.length === 0}
+            <select value={selectedAccount?.id || ''} onChange={event => { setAccountId(event.target.value); resetSubmission() }} disabled={disabled || compatibleAccounts.length === 0}
               className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary disabled:opacity-60">
-              {accounts.length === 0 ? <option value="">暂无可巡查官方账号</option> : accounts.map(account => (
+              {compatibleAccounts.length === 0 ? <option value="">{availablePlatforms.length === 1
+                ? `当前 Agent 暂无可巡查的${PLATFORM_LABELS[availablePlatforms[0]] || availablePlatforms[0]}官方账号`
+                : availablePlatforms.length === 0
+                  ? '当前 Agent 未配置可执行平台'
+                  : '当前 Agent 暂无兼容的官方账号'}</option> : compatibleAccounts.map(account => (
                 <option key={account.id} value={account.id}>{PLATFORM_LABELS[account.platform] || account.platform} · {accountLabel(account)}</option>
               ))}
             </select>
@@ -177,10 +180,11 @@ export function OfficialCommentPatrolTaskCreator({
             <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">数量由本次任务明确指定，最多 100 篇；新作品会入库，已存在作品也会重新读取评论并补充更新。</p>
           </label>
           <label className="block text-xs font-medium text-muted-foreground">
-            每篇评论加载上限 <span className="text-status-red">*</span>
-            <input type="number" min={1} max={100} step={1} value={commentsLimit} placeholder="例如 20 或 50"
+            每篇评论采集数量 <span className="text-status-red">*</span>
+            <input type="number" min={1} step={1} value={commentsLimit} placeholder="例如 500 或 1000"
               onChange={event => { setCommentsLimit(event.target.value === '' ? '' : Number(event.target.value)); resetSubmission() }} disabled={disabled}
               className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary disabled:opacity-60" />
+            <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">不设 100 条固定上限；实际会在平台评论已加载完、长时间无新增或达到安全时限时结束。</p>
           </label>
         </div>
 
@@ -191,7 +195,7 @@ export function OfficialCommentPatrolTaskCreator({
               : !profileReady
                 ? '该官方账号尚未配置主页链接，请先补全账号资料。'
               : !commentPatrolSupported
-                ? '当前扩展版本不支持评论巡查，请升级扩展后再创建。'
+                ? commentPatrolBlockReason
                 : `${PLATFORM_LABELS[selectedPlatform] || selectedPlatform} · 将从账号主页读取作品并巡查评论`
             : '请选择账号后继续'}</p>
         </div>

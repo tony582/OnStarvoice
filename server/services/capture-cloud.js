@@ -40,6 +40,13 @@ const TERMINAL_TASK_STATUSES = new Set([
   'superseded',
 ]);
 
+const TARGETED_TASK_TYPES = new Set([
+  'negative_post_patrol',
+  'official_account_comment_patrol',
+  'followed_creator_post_patrol',
+  'official_account_post_discovery',
+]);
+
 const PLATFORM_ALIASES = Object.freeze({
   xhs: 'xiaohongshu',
   red: 'xiaohongshu',
@@ -427,8 +434,8 @@ export function normalizeCloudTaskStatus(value, fallback = 'pending') {
 
 export function normalizeCloudTaskSnapshot(input = {}) {
   const task = jsonObject(input);
-  const clientTaskId = text(task.id || task.clientTaskId, 240);
-  if (!clientTaskId) return null;
+  const rawClientTaskId = text(task.id || task.clientTaskId, 240);
+  if (!rawClientTaskId) return null;
   const rawPlatform = String(task.platform || 'unknown').trim().toLowerCase();
   const platform = PLATFORM_ALIASES[rawPlatform] || 'unknown';
   const metadata = sanitizeCloudStructuredObject(task.metadata);
@@ -465,6 +472,22 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     'captureSettings',
     task.captureSettings ?? task.capture_settings,
   );
+  const workflow = text(
+    task.workflow || metadata.workflow || task.taskType || task.type,
+    120,
+  );
+  const attemptId = text(task.attemptId || metadata.attemptId, 240);
+  const logicalRequestId = text(
+    task.logicalRequestId || metadata.logicalRequestId,
+    240,
+  );
+  const clientTaskId =
+    TARGETED_TASK_TYPES.has(workflow) &&
+    logicalRequestId &&
+    attemptId &&
+    rawClientTaskId === `${logicalRequestId}::${attemptId}`
+      ? logicalRequestId
+      : rawClientTaskId;
   const sanitizedTargetResults = safeStructuredValue(
     Array.isArray(task.targetResults) ? task.targetResults : [],
   );
@@ -495,7 +518,7 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     metadata,
     error: sanitizeCloudStructuredObject(task.error),
     message: text(safeStructuredValue(task.message), 2000),
-    attemptId: text(task.attemptId, 240),
+    attemptId,
     attemptNumber: integer(task.attemptNumber),
     progressSeq: integer(task.progressSeq),
     heartbeatAt: isoTimestamp(task.heartbeatAt),
@@ -614,6 +637,27 @@ export async function issueCaptureAgentCredential({
   // profiles to the same host label from the cloud task center.
   const defaultHostLabel = `${environment.operatingSystem} · ${stableClientUuid.slice(0, 8)}`;
   return await withTransaction(async tx => {
+    // Re-verification and an administrator moving this exact tenant-scoped
+    // Agent out share the same fence. Never search or mutate another tenant by
+    // client_uuid: it is a browser-provided identifier, not an authorization
+    // credential.
+    let existingAgent = await tx.queryOne(`
+      SELECT id, status
+      FROM capture_agents
+      WHERE tenant_id = $1 AND client_uuid = $2
+    `, [tenantId, stableClientUuid]);
+    if (existingAgent?.id) {
+      await lockCaptureAgentExecutionSlot(tx, tenantId, existingAgent.id);
+      // The pre-lock lookup only resolves the advisory-lock key. Re-read the
+      // row after acquiring the shared lifecycle fence so restore decisions and
+      // audit metadata use the same state that the upsert is about to change.
+      existingAgent = await tx.queryOne(`
+        SELECT id, status
+        FROM capture_agents
+        WHERE tenant_id = $1 AND id = $2
+        FOR UPDATE
+      `, [tenantId, existingAgent.id]);
+    }
     const agent = await tx.queryOne(`
       INSERT INTO capture_agents (
         tenant_id, auth_code_id, auth_binding_id, client_uuid, client_label,
@@ -632,7 +676,14 @@ export async function issueCaptureAgentCredential({
         browser_name = EXCLUDED.browser_name,
         operating_system = EXCLUDED.operating_system,
         app_version = EXCLUDED.app_version,
-        status = capture_agents.status,
+        status = CASE
+          WHEN capture_agents.status = 'migrated' THEN 'active'
+          ELSE capture_agents.status
+        END,
+        last_error = CASE
+          WHEN capture_agents.status = 'migrated' THEN ''
+          ELSE capture_agents.last_error
+        END,
         updated_at = now()
       RETURNING id, client_uuid, client_label, display_name, host_label,
         browser_name, operating_system, app_version, allowed_platforms, status
@@ -677,6 +728,32 @@ export async function issueCaptureAgentCredential({
         )
     `, [agent.id]);
 
-    return { ...agent, token };
+    if (existingAgent?.status === 'migrated') {
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, action,
+          target_type, target_id, metadata
+        ) VALUES (
+          $1, 'capture_agent', $2, 'capture_agent.returned_to_tenant',
+          'capture_agent', $2, $3::jsonb
+        )
+      `, [
+        tenantId,
+        agent.id,
+        JSON.stringify({
+          clientUuid: stableClientUuid,
+          authCodeId,
+          authBindingId,
+          previousStatus: 'migrated',
+          nextStatus: 'active',
+        }),
+      ]);
+    }
+
+    return {
+      ...agent,
+      token,
+      returnedToTenant: existingAgent?.status === 'migrated',
+    };
   });
 }

@@ -739,7 +739,8 @@ function AccountEditor({
   onClose: () => void
   onSave: () => void
 }) {
-  const knownAgents = overview?.agents || []
+  const knownAgents = (overview?.agents || []).filter(agent =>
+    agent.status === 'active' || agent.status === 'paused')
   const knownAgentIds = new Set(knownAgents.map(agent => agent.id))
   const unavailableSelectedAgents: SocialAgent[] = selectedAgentIds
     .filter(agentId => !knownAgentIds.has(agentId))
@@ -934,7 +935,7 @@ function AccountEditor({
                 <div className="overflow-hidden rounded-xl border border-border">
                   {agents.map((agent, index) => {
                     const selected = selectedAgentIds.includes(agent.id)
-                    const unavailable = agent.status === 'revoked'
+                    const unavailable = !['active', 'paused'].includes(agent.status)
                     const unsupported = !supportsPlatform(agent, form.platform)
                     return (
                       <button key={agent.id} type="button" disabled={!writable} onClick={() => toggleAgent(agent.id)}
@@ -961,7 +962,7 @@ function AccountEditor({
                           (unavailable || unsupported) && 'font-bold text-amber-700 dark:text-amber-300',
                         )}>
                           {unavailable
-                            ? '已撤销，请取消'
+                            ? '已移出或停用，请取消'
                             : unsupported
                               ? '不支持当前平台，请取消'
                               : agent.online

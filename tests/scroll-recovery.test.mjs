@@ -4,12 +4,25 @@ import test from "node:test";
 import vm from "node:vm";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
+import {
+  buildCommentLoadStage,
+  resolveCommentCaptureStatus,
+} from "../utils/capture/stage-diagnostics.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = (await readFile(resolve(repoRoot, "utils/scroll.js"), "utf8"))
   .replace("import { randomScrollDistance } from './helpers.js';", "")
   .replace("import { DEFAULT_CONFIG } from './constants.js';", "")
   .replace(/\bexport\s+(?=(?:async\s+)?function\b)/g, "");
+const xiaohongshuCommentsSource = await readFile(
+  resolve(repoRoot, "utils/capture/comments.js"),
+  "utf8",
+);
+const douyinCommentsSource = await readFile(
+  resolve(repoRoot, "utils/capture/douyin-comments.js"),
+  "utf8",
+);
+const contentSource = await readFile(resolve(repoRoot, "content-v2.js"), "utf8");
 
 function createHarness({
   hidden = false,
@@ -222,6 +235,109 @@ test("a cancel raised during comment initialization survives auto-scroll entry",
 
   assert.equal(result.canceled, true);
   assert.equal(result.scrollCount, 0);
+});
+
+test("an explicit null scroll ceiling can continue past the former 50-scroll comment limit", async () => {
+  const harness = createHarness();
+  let loadedCount = 0;
+
+  const result = await harness.api.autoScrollLoad({
+    maxScrollTimes: null,
+    noNewContentThreshold: 0,
+    maxDurationMs: 60_000,
+    waitMinMs: 0,
+    waitMaxMs: 0,
+    detectNewContent: () => loadedCount,
+    scrollStep: async () => {
+      loadedCount += 1;
+    },
+    stopWhen: ({currentContentCount}) =>
+      currentContentCount >= 55
+        ? {stop: true, reason: "max_items"}
+        : {stop: false},
+  });
+
+  assert.equal(result.stopReason, "max_items");
+  assert.equal(result.scrollCount, 55);
+  assert.equal(result.maxScrollTimes, null);
+});
+
+test("both platform comment collectors omit a fixed scroll ceiling by default", () => {
+  for (const platformSource of [
+    xiaohongshuCommentsSource,
+    douyinCommentsSource,
+  ]) {
+    assert.match(platformSource, /maxScrollTimes\s*=\s*null/u);
+    assert.match(
+      platformSource,
+      /maxScrollTimes:\s*normalizedMaxScrollTimes/u,
+    );
+    assert.match(platformSource, /resolveCommentCaptureStatus\(\{/u);
+  }
+
+  const handlerStart = contentSource.indexOf("async function handleCaptureComments");
+  const handlerEnd = contentSource.indexOf(
+    "/**\n * \u5904\u7406\u53d6\u6d88\u91c7\u96c6",
+    handlerStart,
+  );
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  const handlerSource = contentSource.slice(handlerStart, handlerEnd);
+  assert.match(handlerSource, /maxScrollTimes:\s*request\.maxScrollTimes/u);
+  assert.doesNotMatch(handlerSource, /maxScrollTimes:[^\n]*\|\|\s*50/u);
+
+  const stage = buildCommentLoadStage({
+    maxScrollTimes: null,
+    scrollResult: {maxScrollTimes: null},
+  });
+  assert.equal(stage.metrics.maxScrollTimes, null);
+});
+
+test("an explicit scroll ceiling remains diagnostic instead of looking complete", async () => {
+  const phases = [];
+  const harness = createHarness();
+
+  const result = await harness.api.autoScrollLoad({
+    maxScrollTimes: 2,
+    noNewContentThreshold: 0,
+    maxDurationMs: 60_000,
+    waitMinMs: 0,
+    waitMaxMs: 0,
+    detectNewContent: ({scrollCount} = {}) => Number(scrollCount || 0),
+    scrollStep: async () => {},
+    onProgress: (progress) => phases.push(progress.phase),
+  });
+
+  assert.equal(result.stopReason, "max_scroll");
+  assert.equal(result.completed, false);
+  assert.equal(result.scrollCount, 2);
+  assert.ok(phases.includes("max_reached"));
+  assert.equal(
+    resolveCommentCaptureStatus({scrollResult: result}),
+    "partial",
+  );
+});
+
+test("comment capture status treats only interruption and safety ceilings as partial", () => {
+  for (const stopReason of ["max_scroll", "max_duration"]) {
+    assert.equal(
+      resolveCommentCaptureStatus({scrollResult: {stopReason}}),
+      "partial",
+    );
+  }
+  assert.equal(
+    resolveCommentCaptureStatus({scrollResult: {stopReason: "max_items"}}),
+    "done",
+  );
+  assert.equal(
+    resolveCommentCaptureStatus({
+      scrollResult: {stopReason: "comment_area_exhausted"},
+    }),
+    "done",
+  );
+  assert.equal(
+    resolveCommentCaptureStatus({scrollResult: {stalled: true}}),
+    "partial",
+  );
 });
 
 test("a sleep-sized freeze is excluded from active capture duration", async () => {

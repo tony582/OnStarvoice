@@ -47,6 +47,31 @@ test("normalizes only protocol v1 negative-post detail targets", () => {
   );
 });
 
+test("preserves official comment counts above the former 100 and 500 caps", () => {
+  const command = targeted.normalizeCommandPayload({
+    protocolVersion: 1,
+    workflow: "official_account_comment_patrol",
+    targetMode: "profile",
+    taskId: "official-comments-unbounded",
+    platform: "douyin",
+    captureSettings: {
+      includeComments: true,
+      autoSyncAfterDetailCapture: true,
+      commentsMaxDetectedItems: 1_000,
+    },
+    targets: [{
+      itemId: "official-item-1",
+      recordId: "official-subscription-1",
+      subscriptionId: "official-subscription-1",
+      executionId: "official-execution-1",
+      platform: "douyin",
+      url: "https://www.douyin.com/user/MS4wLjABAAAA-unbounded",
+    }],
+  });
+
+  assert.equal(command.captureSettings.commentsMaxDetectedItems, 1_000);
+});
+
 test("rejects arbitrary origins, non-detail pages and mismatched identities", () => {
   const base = {
     protocolVersion: 1,

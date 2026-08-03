@@ -43,7 +43,11 @@ test('admin attention card names the original Agent and exposes explicit human r
   assert.match(diagnostics, /中断位置/u)
   assert.match(page, /后续关键词将不再执行，已经采集和保存的结果会保留/u)
   assert.match(page, /mode: 'remaining'/u)
-  assert.match(page, /availableAgents=\{overview\?\.agents \|\| \[\]\}/u)
+  assert.match(page, /availableAgents=\{operationalAgents\}/u)
+  assert.match(
+    page,
+    /operationalAgents[\s\S]*agent\.status === 'active' \|\| agent\.status === 'paused'/u,
+  )
   assert.match(page, /params\?\.view === 'attention'/u)
   assert.match(page, /params\?\.orchestrationId/u)
   assert.match(orchestration, /验证码和安全审核不会自动换设备/u)

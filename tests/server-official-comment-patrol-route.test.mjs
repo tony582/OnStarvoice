@@ -94,7 +94,7 @@ test('official post workbench opens one account-page patrol flow without a disco
   );
   assert.match(
     taskCreator,
-    /normalized\.some\(item => item\.id === initialOfficialAccountId\)/u,
+    /compatibleAccounts\.find\(account => account\.id === initialOfficialAccountId\)/u,
   );
   assert.match(
     taskCreator,
@@ -195,7 +195,7 @@ test('official comment patrol requires an explicit post count and does not infer
   });
 });
 
-test('official comment patrol rejects missing accounts and over-limit requests', () => {
+test('official comment patrol keeps the post cap but accepts comment counts above 100', () => {
   assert.equal(
     normalizeOfficialCommentPatrolFilter({}).failure.error,
     'official_account_required',
@@ -215,14 +215,21 @@ test('official comment patrol rejects missing accounts and over-limit requests',
     }).failure.error,
     'comments_limit_required',
   );
+  assert.equal(normalizeOfficialCommentPatrolFilter({
+    officialAccountId: '11111111-1111-4111-8111-111111111111',
+    postsLimit: 20,
+    commentsLimit: 1_000,
+  }).filter.commentsLimit, 1_000);
   assert.equal(
     normalizeOfficialCommentPatrolFilter({
       officialAccountId: '11111111-1111-4111-8111-111111111111',
       postsLimit: 20,
-      commentsLimit: 101,
+      commentsLimit: Number.MAX_SAFE_INTEGER + 1,
     }).failure.error,
     'invalid_comments_limit',
   );
+  assert.doesNotMatch(route, /MAX_COMMENTS_PER_POST/u);
+  assert.match(route, /rawCommentsLimit,[\s\S]*Number\.MAX_SAFE_INTEGER/u);
 });
 
 test('candidate selection is tenant-scoped, exact-account matched, and URL-safe', () => {

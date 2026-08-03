@@ -16001,6 +16001,39 @@ function collectTargetedPostRecordIds(batchResult = {}) {
   ];
 }
 
+function buildTargetedProfileCaptureTaskContext(
+  request = {},
+  invocationToken = null,
+) {
+  if (
+    String(request?.workflow || "").trim() !==
+    "official_account_comment_patrol"
+  ) {
+    return null;
+  }
+
+  const requestToken = getTargetedPostInvocationTokenFromRequest(request);
+  if (
+    !requestToken ||
+    !invocationToken ||
+    !isSameTargetedPostInvocationToken(requestToken, invocationToken)
+  ) {
+    throw createTargetedPostInvocationError(
+      "stale_targeted_post_attempt",
+    );
+  }
+
+  // Native Debug resources use the same physical run identity as the cloud
+  // task ledger. Keeping the attempt in the task id prevents a late cleanup
+  // from attempt A from releasing attempt B after a device retry/handoff.
+  return Object.freeze({
+    taskId: `${requestToken.requestId}::${requestToken.attemptId}`,
+    attemptId: requestToken.attemptId,
+    label: getTargetedWorkflowLabel(request.workflow),
+    ownerRequired: true,
+  });
+}
+
 async function maybeClaimAndRunTargetedPostWorkflow() {
   const requestId = getTargetedPostRunRequestIdFromUrl();
   if (!requestId) {
@@ -16092,6 +16125,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       targetedWorkflow,
       request.targetMode,
     );
+  const targetedProfileCaptureTaskContext = isProfileDiscovery
+    ? buildTargetedProfileCaptureTaskContext(request, invocationToken)
+    : null;
   const workflowLabel = getTargetedWorkflowLabel(targetedWorkflow);
   try {
     executionLock = await acquireCaptureExecutionLock({
@@ -16214,6 +16250,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           // the legacy monitor-start endpoint would correctly reject this
           // execution because it is linked to a cloud task item.
           executionPreclaimed: true,
+          captureTaskContext: targetedProfileCaptureTaskContext,
           shouldStop,
           onProgress: (progress = {}) => {
             if (!isActiveTargetedPostInvocation(invocationToken)) {
@@ -20428,6 +20465,115 @@ async function finishMonitorExecutionSafely(executionId, result = {}) {
   }
 }
 
+async function runMonitorCommentPatrolWithCaptureTaskSession({
+  platform = "",
+  runnerTabId = null,
+  captureTaskContext = null,
+  shouldStop = null,
+  run = null,
+} = {}) {
+  if (typeof run !== "function") {
+    const error = new Error("评论巡查缺少详情采集执行器");
+    error.code = "COMMENT_PATROL_RUNNER_REQUIRED";
+    throw error;
+  }
+
+  const taskId = String(captureTaskContext?.taskId || "").trim();
+  if (!taskId) {
+    return await run();
+  }
+
+  const normalizedPlatform = String(platform || "")
+    .trim()
+    .toLowerCase();
+  const normalizedRunnerTabId = Number(runnerTabId);
+  if (!supportsPersistentCaptureTaskPlatform(normalizedPlatform)) {
+    const error = new Error("官方账号评论巡查仅支持小红书和抖音");
+    error.code = "capture_task_platform_unsupported";
+    throw error;
+  }
+  if (
+    !Number.isSafeInteger(normalizedRunnerTabId) ||
+    normalizedRunnerTabId <= 0
+  ) {
+    const error = new Error("官方账号评论巡查缺少有效的账号页面");
+    error.code = "invalid_capture_task_source_tab";
+    throw error;
+  }
+
+  await startRequiredCaptureTaskSession({
+    taskId,
+    attemptId: String(captureTaskContext?.attemptId || "").trim(),
+    tabId: normalizedRunnerTabId,
+    label:
+      String(captureTaskContext?.label || "").trim() ||
+      "官方账号评论巡查",
+    platform: normalizedPlatform,
+    ownerRequired: captureTaskContext?.ownerRequired !== false,
+  });
+
+  let result = null;
+  let runError = null;
+  try {
+    result = await run();
+  } catch (error) {
+    runError = error;
+  }
+
+  let stopped = false;
+  try {
+    stopped = typeof shouldStop === "function" && shouldStop() === true;
+  } catch {
+    stopped = true;
+  }
+  const canceled = stopped || result?.canceled === true;
+  const taskStatus = runError
+    ? "failed"
+    : canceled
+      ? "canceled"
+      : result?.ok === false || Number(result?.failedCount || 0) > 0
+        ? "completed_with_failures"
+        : "completed";
+  const terminal = resolveCaptureTaskTerminalStatus({
+    taskStatus,
+    error: runError,
+    canceled,
+  });
+
+  let captureTaskEnd = null;
+  try {
+    captureTaskEnd = await endCaptureTaskSession({
+      taskId,
+      ...terminal,
+    });
+  } catch (error) {
+    captureTaskEnd = {ok: false, error};
+  }
+  const captureTaskEnded =
+    captureTaskEnd?.ok === true ||
+    captureTaskEnd?.reason === "capture_task_not_found" ||
+    captureTaskEnd?.response?.error?.code === "capture_task_not_found";
+  if (captureTaskEnded) {
+    releaseCaptureTaskOwner(taskId);
+  } else {
+    const cleanupError = new Error(
+      captureTaskEnd?.response?.error?.message ||
+        captureTaskEnd?.error?.message ||
+        "评论巡查结束后浏览器接管未能安全释放",
+    );
+    cleanupError.code = String(
+      captureTaskEnd?.response?.error?.code ||
+        captureTaskEnd?.reason ||
+        "CAPTURE_TASK_CLEANUP_FAILED",
+    ).trim();
+    if (runError) cleanupError.cause = runError;
+    throw cleanupError;
+  }
+
+  if (runError) throw runError;
+  return result;
+}
+
 async function executeMonitorRunItem({
   runItem = {},
   monitorItem = {},
@@ -20437,6 +20583,7 @@ async function executeMonitorRunItem({
   captureSettings = {},
   runnerTabId = null,
   executionPreclaimed = false,
+  captureTaskContext = null,
   shouldStop = null,
   onProgress = null,
 } = {}) {
@@ -20692,65 +20839,77 @@ async function executeMonitorRunItem({
         },
         `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${hitRecordIds.length} 条作品`,
       );
-      commentDetailResult = await runEnhancementWithSingleRetry({
-        recordIds: hitRecordIds,
-        shouldStop,
-        onRetryScheduled: ({recordIds: retryRecordIds}) => {
-          reportMonitorRunProgress(
-            onProgress,
-            {
-              phase: "profile_comment_retry_waiting",
-              current: 0,
-              total: retryRecordIds.length,
-              autoRetryCount: 1,
-            },
-            `评论巡查工作页中断，正在续跑剩余 ${retryRecordIds.length} 条`,
-          );
-        },
-        runAttempt: async (attemptRecordIds, attemptContext = {}) => {
-          const isRetry = attemptContext.isRetry === true;
-          return await batchCaptureDetailsForRecords(attemptRecordIds, {
-            shouldStop,
-            onProgress: (progress = {}) => {
-              const commentMessage =
-                String(progress.message || "").trim() ||
-                "正在采集作品评论...";
-              reportMonitorRunProgress(
-                onProgress,
-                {
-                  ...progress,
-                  phase: isRetry
-                    ? "profile_comment_retry"
-                    : String(progress.phase || "profile_comment_patrol"),
-                  autoRetryCount: isRetry ? 1 : 0,
-                },
-                `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${
-                  isRetry ? "续跑 1/1 · " : ""
-                }${commentMessage}`,
-              );
-            },
-            includeComments: true,
-            includeBloggerMetrics: false,
-            // 官方账号评论巡查每次都要重新进入命中作品采评论，不能被
-            // “已采过详情”的增量规则跳过。
-            skipAlreadyCaptured: false,
-            enableAiRelevancePrefilter: false,
-            commentsMaxDetectedItems:
-              captureSettings.detailCommentsMaxDetectedItems ??
-              captureSettings.commentsMaxDetectedItems ??
-              50,
-            detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
-            detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
-            profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
-            waitForegroundTabId:
-              Number.isSafeInteger(Number(runnerTabId)) &&
-              Number(runnerTabId) > 0
-                ? Number(runnerTabId)
-                : null,
-            captureTaskId: executionId,
-          });
-        },
-      });
+      commentDetailResult =
+        await runMonitorCommentPatrolWithCaptureTaskSession({
+          platform,
+          runnerTabId,
+          captureTaskContext,
+          shouldStop,
+          run: async () =>
+            await runEnhancementWithSingleRetry({
+              recordIds: hitRecordIds,
+              shouldStop,
+              onRetryScheduled: ({recordIds: retryRecordIds}) => {
+                reportMonitorRunProgress(
+                  onProgress,
+                  {
+                    phase: "profile_comment_retry_waiting",
+                    current: 0,
+                    total: retryRecordIds.length,
+                    autoRetryCount: 1,
+                  },
+                  `评论巡查工作页中断，正在续跑剩余 ${retryRecordIds.length} 条`,
+                );
+              },
+              runAttempt: async (attemptRecordIds, attemptContext = {}) => {
+                const isRetry = attemptContext.isRetry === true;
+                return await batchCaptureDetailsForRecords(attemptRecordIds, {
+                  shouldStop,
+                  onProgress: (progress = {}) => {
+                    const commentMessage =
+                      String(progress.message || "").trim() ||
+                      "正在采集作品评论...";
+                    reportMonitorRunProgress(
+                      onProgress,
+                      {
+                        ...progress,
+                        phase: isRetry
+                          ? "profile_comment_retry"
+                          : String(
+                              progress.phase || "profile_comment_patrol",
+                            ),
+                        autoRetryCount: isRetry ? 1 : 0,
+                      },
+                      `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${
+                        isRetry ? "续跑 1/1 · " : ""
+                      }${commentMessage}`,
+                    );
+                  },
+                  includeComments: true,
+                  includeBloggerMetrics: false,
+                  // 官方账号评论巡查每次都要重新进入命中作品采评论，不能被
+                  // “已采过详情”的增量规则跳过。
+                  skipAlreadyCaptured: false,
+                  enableAiRelevancePrefilter: false,
+                  commentsMaxDetectedItems:
+                    captureSettings.detailCommentsMaxDetectedItems ??
+                    captureSettings.commentsMaxDetectedItems ??
+                    50,
+                  detailNavTimeoutMs: captureSettings.detailNavTimeoutMs,
+                  detailAfterNavWaitMs: captureSettings.detailAfterNavWaitMs,
+                  profileAfterNavWaitMs: captureSettings.profileAfterNavWaitMs,
+                  waitForegroundTabId:
+                    Number.isSafeInteger(Number(runnerTabId)) &&
+                    Number(runnerTabId) > 0
+                      ? Number(runnerTabId)
+                      : null,
+                  captureTaskId: String(
+                    captureTaskContext?.taskId || "",
+                  ).trim(),
+                });
+              },
+            }),
+        });
 
       if (
         commentDetailResult?.canceled ||

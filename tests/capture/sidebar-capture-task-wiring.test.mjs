@@ -3,6 +3,12 @@ import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+import {
+  beginCaptureTaskSession,
+  endCaptureTaskSession,
+  registerCaptureTaskTab,
+} from "../../utils/capture-sync.js";
+
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
   "utf8",
@@ -538,6 +544,336 @@ globalThis.__collectTargetedPostRecordIds = collectTargetedPostRecordIds;`,
   assert.deepEqual(
     [...context.__collectTargetedPostRecordIds({results: []})],
     [],
+  );
+});
+
+test("official comment patrol starts one attempt-fenced task session before detail workers on both platforms", async (t) => {
+  const contextBuilderSection = readFunctionSection(
+    "function buildTargetedProfileCaptureTaskContext(",
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+  );
+  const commentSessionSection = readFunctionSection(
+    "async function runMonitorCommentPatrolWithCaptureTaskSession(",
+    "async function executeMonitorRunItem(",
+  );
+  const monitorRunSection = readFunctionSection(
+    "async function executeMonitorRunItem(",
+    "async function handleRunMonitorNow()",
+  );
+
+  for (const [platform, sourceTabId, workerTabId] of [
+    ["douyin", 731, 732],
+    ["xiaohongshu", 741, 742],
+  ]) {
+    await t.test(platform, async () => {
+      const requestId = `official-${platform}-task`;
+      const attemptId = `official-${platform}-attempt`;
+      const physicalTaskId = `${requestId}::${attemptId}`;
+      const events = [];
+      const lifecycleMessages = [];
+      const releasedOwners = [];
+      const finishedExecutions = [];
+      const chromeApi = {
+        runtime: {
+          async sendMessage(message) {
+            lifecycleMessages.push(JSON.parse(JSON.stringify(message)));
+            return {ok: true, data: {taskId: message.taskId}};
+          },
+        },
+      };
+      const lifecycleOptions = {chromeApi};
+      const context = {
+        console,
+        getTargetedPostInvocationTokenFromRequest: (request) => ({
+          requestId: String(request?.id || ""),
+          attemptId: String(request?.attemptId || ""),
+        }),
+        isSameTargetedPostInvocationToken: (left, right) =>
+          left?.requestId === right?.requestId &&
+          left?.attemptId === right?.attemptId,
+        createTargetedPostInvocationError: () => {
+          const error = new Error("stale targeted attempt");
+          error.code = "stale_targeted_post_attempt";
+          return error;
+        },
+        getTargetedWorkflowLabel: () => "官方账号评论巡查",
+        supportsPersistentCaptureTaskPlatform: (value) =>
+          value === "douyin" || value === "xiaohongshu",
+        startRequiredCaptureTaskSession: async (options) => {
+          events.push("session_begin");
+          const begun = await beginCaptureTaskSession(
+            options,
+            lifecycleOptions,
+          );
+          assert.equal(begun.ok, true);
+          assert.equal(begun.active, true);
+          return begun;
+        },
+        endCaptureTaskSession: async (options) => {
+          events.push("session_end");
+          return await endCaptureTaskSession(options, lifecycleOptions);
+        },
+        releaseCaptureTaskOwner: (taskId) => {
+          events.push("owner_release");
+          releasedOwners.push(taskId);
+        },
+        resolveCaptureTaskTerminalStatus: ({taskStatus, canceled}) =>
+          canceled
+            ? {reason: "canceled", status: "canceled"}
+            : {
+                reason:
+                  taskStatus === "completed" ? "completed" : taskStatus,
+                status: taskStatus,
+              },
+        normalizeMonitorRunnerPlatform: (value) => String(value || ""),
+        resolveMonitorRunnerAccountUrl: (runItem) => runItem.accountUrl,
+        resolveMonitorRunnerName: (runItem) => runItem.title,
+        reportMonitorRunProgress: (onProgress, progress, message) => {
+          onProgress?.({...progress, message});
+          return message;
+        },
+        startMonitorExecution: async () => ({ok: true}),
+        batchCaptureByUrls: async () => {
+          events.push("profile_list");
+          return {
+            ok: true,
+            results: [{recordIds: [`${platform}-record`]}],
+          };
+        },
+        resolveMonitorRunnerCaptureParams: () => ({}),
+        collectBatchRecordIds: (result) =>
+          result.results.flatMap((item) => item.recordIds || []),
+        resolveMonitorRecordIdsForPublishWindow: async ({recordIds}) => ({
+          recordIds,
+          scannedCount: recordIds.length,
+          filteredCount: 0,
+          unknownCount: 0,
+          windowLabel: `最近 ${recordIds.length} 篇`,
+          detailResult: null,
+        }),
+        runEnhancementWithSingleRetry: async ({recordIds, runAttempt}) =>
+          await runAttempt(recordIds, {isRetry: false}),
+        batchCaptureDetailsForRecords: async (recordIds, options) => {
+          events.push("comment_detail");
+          assert.deepEqual(recordIds, [`${platform}-record`]);
+          assert.equal(options.captureTaskId, physicalTaskId);
+          const registration = await registerCaptureTaskTab(
+            {
+              taskId: options.captureTaskId,
+              tabId: workerTabId,
+              role: "detail_worker",
+            },
+            lifecycleOptions,
+          );
+          assert.equal(registration.ok, true);
+          assert.notEqual(registration.skipped, true);
+          return {
+            ok: true,
+            canceled: false,
+            successCount: recordIds.length,
+            failedCount: 0,
+            results: recordIds.map((recordId) => ({recordId, ok: true})),
+          };
+        },
+        syncRecordBatch: async (recordIds) => {
+          events.push("sync");
+          return {
+            ok: true,
+            results: recordIds.map(() => ({
+              success: true,
+              rawResponse: {action: "updated"},
+            })),
+          };
+        },
+        summarizeMonitorSyncResult: (syncResult) => ({
+          successCount: syncResult.results.filter((item) => item.success)
+            .length,
+          failedCount: 0,
+          insertedCount: 0,
+          updatedCount: syncResult.results.length,
+          negativeCount: 0,
+        }),
+        buildCommentLeadsConfigFromSettings: () => ({}),
+        finishMonitorExecutionSafely: async (executionId, result) => {
+          finishedExecutions.push({executionId, result});
+          return {ok: true};
+        },
+        showProgress: () => {},
+      };
+
+      vm.runInNewContext(
+        `${contextBuilderSection}\n${commentSessionSection}\n${monitorRunSection}\n` +
+          `globalThis.__officialPatrolHarness = {\n` +
+          `  buildContext: buildTargetedProfileCaptureTaskContext,\n` +
+          `  execute: executeMonitorRunItem,\n` +
+          `};`,
+        context,
+      );
+      const invocationToken = {requestId, attemptId};
+      const captureTaskContext =
+        context.__officialPatrolHarness.buildContext(
+          {
+            id: requestId,
+            attemptId,
+            workflow: "official_account_comment_patrol",
+          },
+          invocationToken,
+        );
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(captureTaskContext)),
+        {
+          taskId: physicalTaskId,
+          attemptId,
+          label: "官方账号评论巡查",
+          ownerRequired: true,
+        },
+      );
+
+      const result = await context.__officialPatrolHarness.execute({
+        runItem: {
+          subscriptionId: `${platform}-subscription`,
+          executionId: `${platform}-execution`,
+          platform,
+          accountUrl:
+            platform === "douyin"
+              ? "https://www.douyin.com/user/test"
+              : "https://www.xiaohongshu.com/user/profile/test",
+          title: `${platform} 官方账号`,
+        },
+        monitorSettings: {postsLimit: 1},
+        captureSettings: {
+          includeComments: true,
+          commentsMaxDetectedItems: 100,
+        },
+        runnerTabId: sourceTabId,
+        executionPreclaimed: true,
+        captureTaskContext,
+        shouldStop: () => false,
+      });
+
+      assert.equal(result.status, "success");
+      assert.deepEqual(events, [
+        "profile_list",
+        "session_begin",
+        "comment_detail",
+        "session_end",
+        "owner_release",
+        "sync",
+      ]);
+      assert.deepEqual(releasedOwners, [physicalTaskId]);
+      assert.equal(finishedExecutions.length, 1);
+      assert.equal(finishedExecutions[0].result.status, "succeeded");
+
+      const taskMessages = lifecycleMessages.filter(
+        (message) =>
+          message.type !== "onstarvoice:relay-to-content",
+      );
+      assert.deepEqual(
+        taskMessages.map((message) => ({
+          type: message.type,
+          taskId: message.taskId,
+          attemptId: message.attemptId,
+          tabId: message.tabId,
+          role: message.role,
+        })),
+        [
+          {
+            type: "onstarvoice:begin-capture-task",
+            taskId: physicalTaskId,
+            attemptId,
+            tabId: sourceTabId,
+            role: undefined,
+          },
+          {
+            type: "onstarvoice:register-capture-task-tab",
+            taskId: physicalTaskId,
+            attemptId,
+            tabId: workerTabId,
+            role: "detail_worker",
+          },
+          {
+            type: "onstarvoice:end-capture-task",
+            taskId: physicalTaskId,
+            attemptId,
+            tabId: undefined,
+            role: undefined,
+          },
+        ],
+      );
+    });
+  }
+});
+
+test("official comment patrol cancellation ends and releases its exact native task session", async () => {
+  const commentSessionSection = readFunctionSection(
+    "async function runMonitorCommentPatrolWithCaptureTaskSession(",
+    "async function executeMonitorRunItem(",
+  );
+  const calls = [];
+  const context = {
+    supportsPersistentCaptureTaskPlatform: () => true,
+    startRequiredCaptureTaskSession: async (options) => {
+      calls.push({type: "begin", options});
+      return {ok: true, active: true};
+    },
+    endCaptureTaskSession: async (options) => {
+      calls.push({type: "end", options});
+      return {ok: true};
+    },
+    releaseCaptureTaskOwner: (taskId) => {
+      calls.push({type: "release", taskId});
+    },
+    resolveCaptureTaskTerminalStatus: ({canceled}) =>
+      canceled
+        ? {reason: "canceled", status: "canceled"}
+        : {reason: "completed", status: "completed"},
+  };
+  vm.runInNewContext(
+    `${commentSessionSection}\n` +
+      `globalThis.__runCommentPatrol = runMonitorCommentPatrolWithCaptureTaskSession;`,
+    context,
+  );
+
+  const result = await context.__runCommentPatrol({
+    platform: "douyin",
+    runnerTabId: 751,
+    captureTaskContext: {
+      taskId: "official-task::attempt-current",
+      attemptId: "attempt-current",
+      label: "官方账号评论巡查",
+    },
+    shouldStop: () => true,
+    run: async () => ({ok: false, canceled: true, failedCount: 0}),
+  });
+
+  assert.equal(result.canceled, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls)),
+    [
+      {
+        type: "begin",
+        options: {
+          taskId: "official-task::attempt-current",
+          attemptId: "attempt-current",
+          tabId: 751,
+          label: "官方账号评论巡查",
+          platform: "douyin",
+          ownerRequired: true,
+        },
+      },
+      {
+        type: "end",
+        options: {
+          taskId: "official-task::attempt-current",
+          reason: "canceled",
+          status: "canceled",
+        },
+      },
+      {
+        type: "release",
+        taskId: "official-task::attempt-current",
+      },
+    ],
   );
 });
 

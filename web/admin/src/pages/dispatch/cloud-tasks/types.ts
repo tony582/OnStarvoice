@@ -27,7 +27,7 @@ export type OrchestrationCloudAgent = {
   app_version: string
   allowed_platforms: string[]
   capabilities?: Record<string, unknown>
-  status: 'active' | 'paused' | 'revoked'
+  status: 'active' | 'paused' | 'migrated' | 'revoked'
   last_heartbeat_at?: string | null
   last_error?: string
   online: boolean

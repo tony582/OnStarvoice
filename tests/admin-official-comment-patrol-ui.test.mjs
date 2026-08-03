@@ -41,10 +41,13 @@ test('official comment patrol is created directly from an account homepage', () 
   assert.match(creator, /\/capture-cloud\/official-comment-patrol\/tasks/u)
   assert.match(creator, /Agent 会从账号主页按最新顺序读取你指定数量的作品/u)
   assert.match(creator, /作品加载数量/u)
-  assert.match(creator, /每篇评论加载上限/u)
+  assert.match(creator, /每篇评论采集数量/u)
   assert.match(creator, /const \[postsLimit, setPostsLimit\] = useState<number \| ''>\(''\)/u)
   assert.match(creator, /const \[commentsLimit, setCommentsLimit\] = useState<number \| ''>\(''\)/u)
-  assert.match(creator, /max=\{100\}/u)
+  assert.equal(creator.match(/max=\{100\}/gu)?.length, 1)
+  assert.match(creator, /不设 100 条固定上限/u)
+  assert.match(creator, /Number\.isSafeInteger\(commentsLimit\)[\s\S]*commentsLimit < 1/u)
+  assert.doesNotMatch(creator, /commentsLimit > 100/u)
   assert.match(creator, /postsLimit/u)
   assert.match(creator, /commentsLimit/u)
   assert.match(creator, /新作品会入库，已存在作品也会重新读取评论并补充更新/u)
@@ -52,9 +55,36 @@ test('official comment patrol is created directly from an account homepage', () 
   assert.doesNotMatch(creator, /candidates\/preview|recordIds|selectedIds|预览作品/u)
 })
 
-test('official comment patrol compatibility requires count-based account scanning', () => {
-  assert.match(creator, /officialAccountLatestPostsByCountV1/u)
-  assert.match(taskLib, /officialAccountLatestPostsByCountV1/u)
+test('official comment patrol only offers accounts supported by the selected Agent', () => {
+  assert.match(
+    creator,
+    /const compatibleAccounts = useMemo\([\s\S]*accounts\.filter\(account => availablePlatforms\.includes\(account\.platform\)\)/u,
+  )
+  assert.match(
+    creator,
+    /compatibleAccounts\.find\(account => account\.id === accountId\)[\s\S]*compatibleAccounts\.find\(account => account\.id === initialOfficialAccountId\)[\s\S]*compatibleAccounts\[0\]/u,
+  )
+  assert.match(creator, /compatibleAccounts\.map\(account =>/u)
+  assert.match(creator, /value=\{selectedAccount\?\.id \|\| ''\}/u)
+  assert.match(creator, /disabled=\{disabled \|\| compatibleAccounts\.length === 0\}/u)
+  assert.match(creator, /当前 Agent 暂无可巡查的/u)
+})
+
+test('official comment patrol uses the same remote profile capability bundle as the server', () => {
+  assert.match(creator, /agentTaskTypeBlockReason\(agent, 'comment_patrol', 'one_time'\)/u)
+  const start = taskLib.indexOf('export function agentTaskTypeBlockReason')
+  const end = taskLib.indexOf('export function hasConfiguredUnattendedPlan', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const compatibility = taskLib.slice(start, end)
+  assert.match(
+    compatibility,
+    /\['creator_patrol', 'negative_patrol', 'comment_patrol'\]\.includes\(taskType\)[\s\S]*remoteTargetedPostCaptureV1/u,
+  )
+  assert.match(compatibility, /officialAccountCommentPatrolProfileV1/u)
+  assert.match(compatibility, /officialAccountLatestPostsByCountV1/u)
+  assert.doesNotMatch(compatibility, /officialAccountCommentPatrol !== true/u)
+  assert.match(taskLib, /agentAssignmentBlockReason[\s\S]*remoteTaskCreate !== true/u)
 })
 
 test('admin navigation no longer exposes an official discovery task', () => {

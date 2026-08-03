@@ -15,7 +15,10 @@ import {
 } from "../scroll.js";
 import {getDomProfile} from "../platform/dom-profiles/index.js";
 import {ensureDetailPageReady} from "./shared/detail-dom.js";
-import {buildCommentLoadStage} from "./stage-diagnostics.js";
+import {
+  buildCommentLoadStage,
+  resolveCommentCaptureStatus,
+} from "./stage-diagnostics.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 
@@ -356,7 +359,7 @@ export async function captureDouyinComments({
   waitMinMs = DEFAULT_CONFIG.SCROLL_DELAY_MIN,
   waitMaxMs = DEFAULT_CONFIG.SCROLL_DELAY_MAX,
   stallTimeoutMs = 3000,
-  maxScrollTimes = DEFAULT_CONFIG.MAX_SCROLL_TIMES,
+  maxScrollTimes = null,
 } = {}) {
   const captureStartedAt = new Date().toISOString();
   resetCancelFlag();
@@ -385,9 +388,8 @@ export async function captureDouyinComments({
     normalizePositiveInteger(stallTimeoutMs, 3000),
     MIN_COMMENTS_STALL_TIMEOUT_MS,
   );
-  const normalizedMaxScrollTimes = normalizePositiveInteger(
+  const normalizedMaxScrollTimes = normalizeOptionalPositiveInteger(
     maxScrollTimes,
-    DEFAULT_CONFIG.MAX_SCROLL_TIMES,
   );
   let captureContext = null;
 
@@ -670,7 +672,10 @@ export async function captureDouyinComments({
 
     const stoppedByUser = isCanceled();
     const stoppedByStall = Boolean(scrollResult?.stalled);
-    const captureStatus = stoppedByUser || stoppedByStall ? "partial" : "done";
+    const captureStatus = resolveCommentCaptureStatus({
+      stoppedByUser,
+      scrollResult,
+    });
     const items = Array.from(commentsMap.values()).slice(
       0,
       normalizedMaxDetectedItems,
@@ -764,6 +769,14 @@ function normalizePositiveInteger(value, fallback) {
   if (!Number.isFinite(num)) return fallback;
   const rounded = Math.floor(num);
   return rounded > 0 ? rounded : fallback;
+}
+
+function normalizeOptionalPositiveInteger(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const rounded = Math.floor(num);
+  return rounded > 0 ? rounded : null;
 }
 
 function normalizeDouyinCommentNoteId(value) {

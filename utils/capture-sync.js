@@ -9249,6 +9249,15 @@ async function captureCommentsForSingleNoteRecord(
       '',
   );
   const stoppedByNetwork = stopReason === 'network_timeout';
+  const partialMessage = isPartial
+    ? commentCapturePartialMessage({
+        stopReason,
+        stoppedByUser,
+        stoppedByStall,
+        stoppedByNetwork,
+        collectedCount: cleanedItems.length,
+      })
+    : '';
   const finalStatus = isPartial ? COMMENT_CAPTURE_STATUS.PARTIAL : COMMENT_CAPTURE_STATUS.DONE;
   const finishedAt = Date.now();
   const mergedText = buildCommentsMergedText(cleanedItems);
@@ -9263,11 +9272,7 @@ async function captureCommentsForSingleNoteRecord(
       startedAt,
       finishedAt,
       stoppedByUser,
-      error: stoppedByStall
-        ? stoppedByNetwork
-          ? '网络中断超过 2 分钟，已保留当前结果；联网后可继续采集'
-          : '检测到页面卡顿，已保留当前结果；可继续采集'
-        : '',
+      error: partialMessage,
       cleanedItems,
       mergedText,
     }),
@@ -9287,12 +9292,8 @@ async function captureCommentsForSingleNoteRecord(
   if (onProgress) {
     onProgress({
       phase: isPartial ? 'comments_partial' : 'comments_done',
-      message: stoppedByStall
-        ? stoppedByNetwork
-          ? `网络中断超过 2 分钟，已保留 ${cleanedItems.length} 条；联网后可继续采集`
-          : `评论页面卡顿，已保留 ${cleanedItems.length} 条；可继续采集`
-        : isPartial
-          ? `评论已手动停止并合并（${cleanedItems.length}条）`
+      message: isPartial
+        ? partialMessage
         : `评论已合并（${cleanedItems.length}条）`,
       recordId,
       collectedCount: cleanedItems.length,
@@ -10035,6 +10036,38 @@ function normalizeCommentsMaxDetectedItems(maxDetectedItems, fallback) {
     return fallback;
   }
   return Math.floor(num);
+}
+
+function commentCapturePartialMessage({
+  stopReason = '',
+  stoppedByUser = false,
+  stoppedByStall = false,
+  stoppedByNetwork = false,
+  collectedCount = null,
+} = {}) {
+  const normalizedReason = String(stopReason || '').trim().toLowerCase();
+  const count = Number(collectedCount);
+  const saved = Number.isFinite(count) && count >= 0
+    ? `${Math.floor(count)} 条`
+    : '当前结果';
+  if (stoppedByNetwork || normalizedReason === 'network_timeout') {
+    return `网络中断超过 2 分钟，已保留 ${saved}；联网后可继续采集`;
+  }
+  if (stoppedByStall) {
+    return `评论页面卡顿，已保留 ${saved}；可继续采集`;
+  }
+  if (normalizedReason === 'max_duration') {
+    return `达到评论采集安全时限，已保留 ${saved}；可继续采集`;
+  }
+  if (normalizedReason === 'max_scroll') {
+    return `达到配置的评论滚动上限，已保留 ${saved}；可继续采集`;
+  }
+  if (stoppedByUser || normalizedReason === 'canceled') {
+    return Number.isFinite(count) && count >= 0
+      ? `评论已手动停止并合并（${Math.floor(count)}条）`
+      : '评论已手动停止并保留当前结果';
+  }
+  return `评论采集尚未完成，已保留 ${saved}；可继续采集`;
 }
 
 function normalizePositiveInteger(value, fallback) {
@@ -13391,6 +13424,15 @@ async function captureCommentsForCurrentNote({
     result.data?.stopReason || result.meta?.scrollInfo?.stopReason || '',
   );
   const stoppedByNetwork = stopReason === 'network_timeout';
+  const partialMessage = partial
+    ? commentCapturePartialMessage({
+        stopReason,
+        stoppedByUser,
+        stoppedByStall,
+        stoppedByNetwork,
+        collectedCount: cleanedItems.length,
+      })
+    : '';
 
   return {
     status: partial ? COMMENT_CAPTURE_STATUS.PARTIAL : COMMENT_CAPTURE_STATUS.DONE,
@@ -13404,11 +13446,7 @@ async function captureCommentsForCurrentNote({
     cleanedItems,
     mergedText: buildCommentsMergedText(cleanedItems),
     errorCode: '',
-    error: stoppedByStall
-      ? stoppedByNetwork
-        ? '网络中断超过 2 分钟，已保留当前结果；联网后可继续采集'
-        : '检测到页面卡顿，已保留当前结果；可继续采集'
-      : '',
+    error: partialMessage,
   };
 }
 
@@ -13651,11 +13689,13 @@ async function captureCommentsForHydratedDetailRecord(
       message: failed
         ? '评论采集失败，可在记录卡片继续'
         : partial
-          ? mergeResult.stoppedByStall
-            ? mergeResult.stoppedByNetwork
-              ? `网络中断超过 2 分钟，已保留 ${mergeResult.cleanedItems.length} 条；联网后可继续采集`
-              : `评论页面卡顿，已保留 ${mergeResult.cleanedItems.length} 条；可继续采集`
-            : `评论已手动停止并合并（${mergeResult.cleanedItems.length}条）`
+          ? commentCapturePartialMessage({
+              stopReason: mergeResult.stopReason,
+              stoppedByUser: mergeResult.stoppedByUser,
+              stoppedByStall: mergeResult.stoppedByStall,
+              stoppedByNetwork: mergeResult.stoppedByNetwork,
+              collectedCount: mergeResult.cleanedItems.length,
+            })
           : `评论已合并（${mergeResult.cleanedItems.length}条）`,
       recordId,
       collectedCount: mergeResult.cleanedItems.length,
@@ -17956,6 +17996,7 @@ function buildContentRequest(mode, captureParams = {}) {
         waitMinMs: captureParams.waitMinMs,
         waitMaxMs: captureParams.waitMaxMs,
         stallTimeoutMs: captureParams.stallTimeoutMs,
+        maxScrollTimes: captureParams.maxScrollTimes,
       };
     default:
       throw new Error(`未知的采集模式: ${mode}`);

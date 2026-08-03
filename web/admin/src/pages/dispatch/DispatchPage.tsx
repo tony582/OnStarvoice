@@ -163,6 +163,14 @@ export function DispatchPage() {
     () => (overview?.tasks || []).filter(isBusinessVisibleTask),
     [overview?.tasks],
   )
+  // The server already omits migrated/revoked Agents. Keep the same boundary
+  // in the client so a stale response can never surface them in a picker or
+  // preset task flow while a lifecycle action is refreshing the page.
+  const operationalAgents = useMemo(
+    () => (overview?.agents || []).filter(agent =>
+      agent.status === 'active' || agent.status === 'paused'),
+    [overview?.agents],
+  )
 
   // 模板任务进入「计划」视图；其余任务进入执行中/需处理/历史三桶。
   const scheduleTemplates = useMemo(
@@ -200,8 +208,8 @@ export function DispatchPage() {
   }, [queueTasks])
 
   const configuredPlanAgentCount = useMemo(
-    () => (overview?.agents || []).filter(agent => hasConfiguredUnattendedPlan(agent.unattended_plan)).length,
-    [overview?.agents],
+    () => operationalAgents.filter(agent => hasConfiguredUnattendedPlan(agent.unattended_plan)).length,
+    [operationalAgents],
   )
   const plansCount = scheduleTemplates.length + configuredPlanAgentCount
   const pendingPlanDeleteAgentIds = useMemo(() => new Set(
@@ -350,22 +358,39 @@ export function DispatchPage() {
     }
   }
 
-  const retireAgent = async (
-    agent: CloudAgent,
-    reason: 'tenant_migrated' | 'permanently_offline',
-  ) => {
+  const detachAgent = async (agent: CloudAgent) => {
     setAgentActionId(agent.id)
     setFeedback('')
     setActionError('')
     try {
       const result = await api.post<{ message?: string }>(
         `/capture-cloud/agents/${agent.id}/retire`,
-        { confirmation: '永久归档', reason },
+        { confirmation: '移出当前租户', reason: 'tenant_migrated' },
       )
-      setFeedback(result.message || `节点“${agent.display_name}”已永久归档；历史记录已保留。`)
+      setFeedback(result.message || `节点“${agent.display_name}”已移出当前租户；历史记录已保留，切回本租户重新验证后可恢复。`)
       await load(true)
     } catch (err) {
-      const message = err instanceof Error ? err.message : '永久归档节点失败'
+      const message = err instanceof Error ? err.message : '移出当前租户失败'
+      setActionError(message)
+      throw err
+    } finally {
+      setAgentActionId('')
+    }
+  }
+
+  const retireAgent = async (agent: CloudAgent) => {
+    setAgentActionId(agent.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/agents/${agent.id}/retire`,
+        { confirmation: '永久停用', reason: 'permanently_offline' },
+      )
+      setFeedback(result.message || `节点“${agent.display_name}”已永久停用；历史记录已保留。`)
+      await load(true)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '永久停用节点失败'
       setActionError(message)
       throw err
     } finally {
@@ -425,7 +450,7 @@ export function DispatchPage() {
             {taskView === 'plans' ? (
               <PlansView
                 templates={scheduleTemplates}
-                agents={overview?.agents || []}
+                agents={operationalAgents}
                 writable={canWrite()}
                 onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
                 onEditPlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan', editExisting: true })}
@@ -473,7 +498,7 @@ export function DispatchPage() {
 
         <aside className="flex min-h-0 min-w-0 flex-col xl:border-l xl:border-border/70 xl:py-5 xl:pl-5">
           <AgentRail
-            agents={overview?.agents || []}
+            agents={operationalAgents}
             tasks={overview?.tasks || []}
             writable={canWrite()}
             onAssign={agent => setComposerIntent({ agentId: agent.id })}
@@ -481,9 +506,11 @@ export function DispatchPage() {
             onCreatePlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan' })}
             onDeletePlan={agent => void deleteUnattendedPlan(agent)}
             onDeleteAgent={deleteAgent}
+            onDetachAgent={detachAgent}
             onRetireAgent={retireAgent}
             deletingPlanAgentId={planActionAgentId}
             deletingAgentId={agentActionId}
+            detachingAgentId={agentActionId}
             retiringAgentId={agentActionId}
             onSaved={() => load(true)}
           />
@@ -491,7 +518,7 @@ export function DispatchPage() {
       </div>
 
       {composerIntent && (
-        <CreateTaskDrawer agents={overview?.agents || []} tasks={businessTasks} writable={canWrite()} intent={composerIntent}
+        <CreateTaskDrawer agents={operationalAgents} tasks={businessTasks} writable={canWrite()} intent={composerIntent}
           onClose={() => setComposerIntent(null)}
           onLaunchOrchestration={launchIntent => {
             setComposerIntent(null)
@@ -507,7 +534,7 @@ export function DispatchPage() {
         <OrchestrationComposerDrawer
           open
           writable={canWrite()}
-          agents={overview?.agents || []}
+          agents={operationalAgents}
           initialExecutionMode={orchestrationLaunchIntent.executionMode}
           lockExecutionMode={orchestrationLaunchIntent.lockExecutionMode}
           minimumAgentCount={orchestrationLaunchIntent.minimumAgentCount}
@@ -539,7 +566,7 @@ export function DispatchPage() {
               orchestrationId={selectedOrchestrationId}
               refreshKey={orchestrationRefreshKey}
               writable={canWrite()}
-              availableAgents={overview?.agents || []}
+              availableAgents={operationalAgents}
               onClose={closeOrchestrationDetail}
               onChanged={async () => {
                 setOrchestrationRefreshKey(value => value + 1)

@@ -130,7 +130,8 @@ async function bindAccountToAgent(
   const agent = await tx.queryOne(`
     SELECT id
     FROM capture_agents
-    WHERE id = $1 AND tenant_id = $2 AND status <> 'revoked'
+    WHERE id = $1 AND tenant_id = $2
+      AND status IN ('active', 'paused')
     FOR UPDATE
   `, [normalizedAgentId, tenantId]);
   if (!agent) return {notFound: true};
@@ -246,7 +247,8 @@ router.get(
               AND ca.last_heartbeat_at >= now() - interval '2 minutes'
             ) AS online
           FROM capture_agents ca
-          WHERE ca.tenant_id = $1 AND ca.status <> 'revoked'
+          WHERE ca.tenant_id = $1
+            AND ca.status IN ('active', 'paused')
           ORDER BY ca.host_label, ca.display_name, ca.created_at
         `, [req.tenantId]),
         queryAll(`
@@ -366,7 +368,8 @@ router.post(
           const agent = await tx.queryOne(`
             SELECT id
             FROM capture_agents
-            WHERE id = $1 AND tenant_id = $2 AND status <> 'revoked'
+            WHERE id = $1 AND tenant_id = $2
+              AND status IN ('active', 'paused')
             FOR UPDATE
           `, [agentId, req.tenantId]);
           if (!agent) return {agentNotFound: true};
@@ -637,7 +640,7 @@ router.put(
               FROM capture_agents
               WHERE tenant_id = $1
                 AND id = ANY($2::uuid[])
-                AND status <> 'revoked'
+                AND status IN ('active', 'paused')
               ORDER BY id
               FOR UPDATE
             `, [req.tenantId, normalizedAgents.agentIds])

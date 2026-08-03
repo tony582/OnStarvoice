@@ -60,6 +60,74 @@
     return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
+  const TARGETED_TASK_TYPES = new Set([
+    "negative_post_patrol",
+    "official_account_comment_patrol",
+    "followed_creator_post_patrol",
+    "official_account_post_discovery",
+  ]);
+
+  // Targeted runs keep attempt-scoped physical IDs in the local task ledger.
+  // Cloud reconciliation must use the original business request ID, otherwise
+  // the ledger row is mirrored as a second task beside the cloud-created row.
+  function taskSnapshotIdentity(run = {}) {
+    const source = objectValue(run);
+    const metadata = objectValue(source.metadata);
+    const physicalId = text(source.id, 240);
+    const taskType = text(
+      source.workflow || metadata.workflow || source.taskType || source.type,
+      120,
+    );
+    let attemptId = text(source.attemptId || metadata.attemptId, 240);
+    let logicalRequestId = text(
+      source.logicalRequestId || metadata.logicalRequestId,
+      240,
+    );
+
+    if (TARGETED_TASK_TYPES.has(taskType)) {
+      if (!attemptId && logicalRequestId) {
+        const prefix = `${logicalRequestId}::`;
+        if (physicalId.startsWith(prefix)) {
+          attemptId = text(physicalId.slice(prefix.length), 240);
+        }
+      }
+      if (!logicalRequestId && attemptId) {
+        const suffix = `::${attemptId}`;
+        if (physicalId.endsWith(suffix)) {
+          logicalRequestId = text(
+            physicalId.slice(0, physicalId.length - suffix.length),
+            240,
+          );
+        }
+      }
+    }
+
+    const canonicalId =
+      TARGETED_TASK_TYPES.has(taskType) &&
+      logicalRequestId &&
+      attemptId &&
+      physicalId === `${logicalRequestId}::${attemptId}`
+        ? logicalRequestId
+        : physicalId;
+    return {id: canonicalId, attemptId};
+  }
+
+  function isSameTaskAttempt(left, right) {
+    const leftId = text(left?.id, 240);
+    const rightId = text(right?.id, 240);
+    if (!leftId || leftId !== rightId) return false;
+    const leftAttemptId = text(left?.attemptId, 240);
+    const rightAttemptId = text(right?.attemptId, 240);
+    // Legacy compact rows did not always retain an attempt ID. When one side is
+    // the authoritative live request, the shared business ID is the only safe
+    // reconciliation key; two explicit, different attempts remain distinct.
+    return (
+      !leftAttemptId ||
+      !rightAttemptId ||
+      leftAttemptId === rightAttemptId
+    );
+  }
+
   function targetedPostTaskDescriptor(request = {}) {
     const source = objectValue(request);
     const workflow = text(source.workflow, 80);
@@ -186,7 +254,8 @@
 
   function buildTaskSnapshot(run, controlRequestId = "") {
     const source = objectValue(run);
-    const id = text(source.id, 240);
+    const identity = taskSnapshotIdentity(source);
+    const id = identity.id;
     if (!id) return null;
     const metadata = objectValue(source.metadata);
     const isCurrentControlRequest =
@@ -230,7 +299,7 @@
       metadata: sanitizeStructuredValue(metadata),
       error: sanitizeStructuredValue(objectValue(source.error)),
       message: sanitizeText(source.message, 2000),
-      attemptId: text(source.attemptId, 240),
+      attemptId: identity.attemptId,
       attemptNumber: Math.max(0, Number(source.attemptNumber) || 0),
       progressSeq: Math.max(0, Number(source.progressSeq) || 0),
       heartbeatAt: text(source.heartbeatAt, 80),
@@ -381,13 +450,19 @@
       })
       .slice(0, 50)
       .map((run) => buildTaskSnapshot(run, controlRequestId))
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter(
+        (task, index, snapshots) =>
+          snapshots.findIndex((candidate) =>
+            isSameTaskAttempt(candidate, task),
+          ) === index,
+      );
     const targetedSnapshot = buildTargetedPostTaskSnapshot(
       targetedPostRequest,
     );
     if (targetedSnapshot) {
-      const existingIndex = tasks.findIndex(
-        (task) => task.id === targetedSnapshot.id,
+      const existingIndex = tasks.findIndex((task) =>
+        isSameTaskAttempt(task, targetedSnapshot),
       );
       if (existingIndex >= 0) {
         // The local ledger intentionally stores a compact task-center record.

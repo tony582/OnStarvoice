@@ -22,7 +22,6 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const MAX_POSTS = 100;
-const MAX_COMMENTS_PER_POST = 100;
 const DEFAULT_COMMENTS_LIMIT = 50;
 const MAX_WORKBENCH_PAGE_SIZE = 50;
 const WORKFLOW = 'official_account_comment_patrol';
@@ -524,19 +523,19 @@ export function normalizeOfficialCommentPatrolFilter(body = {}) {
   if (!hasCommentsLimit || rawCommentsLimit === '') {
     return {failure: requestError(
       'comments_limit_required',
-      '请填写每篇作品的评论加载上限',
+      '请填写每篇作品的评论采集数量',
     )};
   }
   const commentsLimit = boundedInteger(
     rawCommentsLimit,
     null,
     1,
-    MAX_COMMENTS_PER_POST,
+    Number.MAX_SAFE_INTEGER,
   );
   if (commentsLimit == null) {
     return {failure: requestError(
       'invalid_comments_limit',
-      `commentsLimit 必须是 1-${MAX_COMMENTS_PER_POST} 的整数`,
+      'commentsLimit 必须是大于 0 的安全整数',
     )};
   }
   const requestedPlatform = text(source.platform, 40).toLowerCase();

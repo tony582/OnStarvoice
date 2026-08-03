@@ -49,7 +49,7 @@ export type CloudAgent = {
   capabilities?: Record<string, unknown>
   unattended_plan?: UnattendedPlan | null
   unattended_plan_updated_at?: string | null
-  status: 'active' | 'paused' | 'revoked'
+  status: 'active' | 'paused' | 'migrated' | 'revoked'
   last_heartbeat_at?: string | null
   last_error?: string
   online: boolean
@@ -765,7 +765,7 @@ export function agentTaskTypeBlockReason(
 ) {
   const genericReason = agentAssignmentBlockReason(agent, mode)
   if (genericReason) return genericReason
-  if (['creator_patrol', 'negative_patrol'].includes(taskType)
+  if (['creator_patrol', 'negative_patrol', 'comment_patrol'].includes(taskType)
     && agent.capabilities?.remoteTargetedPostCaptureV1 !== true) {
     return '客户端扩展版本过低，尚不支持定向页面任务'
   }
@@ -776,7 +776,7 @@ export function agentTaskTypeBlockReason(
     return '客户端扩展版本过低，尚不支持负面帖子巡查'
   }
   if (taskType === 'comment_patrol'
-    && (agent.capabilities?.officialAccountCommentPatrol !== true
+    && (agent.capabilities?.officialAccountCommentPatrolProfileV1 !== true
       || agent.capabilities?.officialAccountLatestPostsByCountV1 !== true)) {
     return '客户端扩展版本过低，尚不支持按作品数量巡查官方账号'
   }
@@ -832,6 +832,8 @@ export function taskBelongsToAgent(task: CloudTask, agent: CloudAgent) {
 }
 
 export function agentAssignmentBlockReason(agent: CloudAgent, mode: 'one_time' | 'unattended_plan') {
+  if (agent.status === 'migrated') return 'Agent 已移出当前租户，不能接收新任务'
+  if (agent.status === 'revoked') return 'Agent 已永久停用，不能接收新任务'
   if (agent.status !== 'active') return 'Agent 已暂停，不能接收新任务'
   if (agent.capabilities?.remoteTaskCreate !== true) return '客户端扩展版本过低，需升级后才能远程接单'
   if (mode === 'unattended_plan' && agent.capabilities?.remoteUnattendedPlanWrite !== true) {

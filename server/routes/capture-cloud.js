@@ -208,6 +208,38 @@ function text(value, limit = 1000) {
   return normalized.length > limit ? normalized.slice(0, limit) : normalized;
 }
 
+const CAPTURE_TASK_VISIBILITY_ALIASES = new Set(['assigned', 't']);
+
+export function captureTaskBusinessRootVisibilitySql(alias = 't') {
+  if (!CAPTURE_TASK_VISIBILITY_ALIASES.has(alias)) {
+    throw new Error('Unsupported capture task SQL alias');
+  }
+  return `NOT (
+    ${alias}.task_type IN (
+      'negative_post_patrol',
+      'official_account_comment_patrol',
+      'followed_creator_post_patrol',
+      'official_account_post_discovery'
+    )
+    AND NULLIF(${alias}.metadata->>'logicalRequestId', '') IS NOT NULL
+    AND NULLIF(${alias}.metadata->>'attemptId', '') IS NOT NULL
+    AND ${alias}.client_task_id =
+      (${alias}.metadata->>'logicalRequestId') || '::' ||
+      (${alias}.metadata->>'attemptId')
+    AND EXISTS (
+      SELECT 1
+      FROM capture_tasks canonical
+      WHERE canonical.tenant_id = ${alias}.tenant_id
+        AND canonical.id::text = ${alias}.metadata->>'logicalRequestId'
+        AND canonical.client_task_id = ${alias}.metadata->>'logicalRequestId'
+        AND canonical.task_type = ${alias}.task_type
+        AND canonical.origin_agent_id IS NOT DISTINCT FROM ${alias}.origin_agent_id
+        AND canonical.parent_task_id IS NULL
+        AND canonical.id <> ${alias}.id
+    )
+  )`;
+}
+
 export async function lockActiveCaptureAgentSession(
   executor,
   authenticatedAgent = {},
@@ -4483,6 +4515,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             ) AS queued_task_count
           FROM capture_tasks assigned
           WHERE assigned.tenant_id = $1
+            AND ${captureTaskBusinessRootVisibilitySql('assigned')}
             AND assigned.status = ANY($2::text[])
             AND assigned.task_type NOT IN (
               'capture_orchestration', 'unattended_plan_configuration', 'sync'
@@ -4512,7 +4545,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           ) AS online
         FROM capture_agents ca
         LEFT JOIN task_load ON task_load.agent_id = ca.id
-        WHERE ca.tenant_id = $1 AND ca.status <> 'revoked'
+        WHERE ca.tenant_id = $1
+          AND ca.status IN ('active', 'paused')
         ORDER BY ca.host_label, ca.display_name, ca.created_at
       `, [req.tenantId, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]),
       queryAll(`
@@ -4532,6 +4566,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           CASE
             WHEN ca.id IS NULL THEN '原执行节点不存在'
             WHEN tenant.status <> 'active' THEN '当前租户已暂停'
+            WHEN ca.status = 'migrated' THEN '原执行节点已移出当前租户'
             WHEN ca.status <> 'active' THEN '原执行节点已暂停或撤销'
             WHEN ac.id IS NULL OR ac.status <> 'active'
               OR (ac.expires_at IS NOT NULL AND ac.expires_at < now())
@@ -4572,6 +4607,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         ) command ON true
         WHERE t.tenant_id = $1
           AND t.parent_task_id IS NULL
+          AND ${captureTaskBusinessRootVisibilitySql('t')}
           AND NOT (
             t.task_type = 'capture_orchestration'
             AND t.orchestration_revision = 0
@@ -4604,6 +4640,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           AND ca.tenant_id = t.tenant_id
         WHERE t.tenant_id = $1
           AND t.parent_task_id IS NULL
+          AND ${captureTaskBusinessRootVisibilitySql('t')}
           AND NOT (
             t.task_type = 'capture_orchestration'
             AND t.orchestration_revision = 0
@@ -4667,6 +4704,9 @@ router.patch('/agents/:id', requireTenantAccess, requireSessionUser, requireTena
       if (current.status === 'revoked' && status && status !== 'revoked') {
         return {revokedLocked: true};
       }
+      if (current.status === 'migrated' && status && status !== 'migrated') {
+        return {migratedLocked: true};
+      }
       const agent = await tx.queryOne(`
         UPDATE capture_agents
         SET display_name = $1,
@@ -4692,6 +4732,13 @@ router.patch('/agents/:id', requireTenantAccess, requireSessionUser, requireTena
     if (result.notFound) return res.status(404).json({ ok: false, error: 'agent_not_found', message: '采集节点不存在' });
     if (result.revokedLocked) {
       return res.status(409).json({ ok: false, error: 'agent_revoked', message: '已撤销节点不能重新激活，请重新注册浏览器节点' });
+    }
+    if (result.migratedLocked) {
+      return res.status(409).json({
+        ok: false,
+        error: 'agent_migrated',
+        message: '已移出节点不能在管理端直接恢复；请在该浏览器重新验证本租户激活码',
+      });
     }
     return res.json({ ok: true, agent: result.agent });
   } catch (err) {
@@ -4732,20 +4779,25 @@ router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTen
       // before Agents, and reversing that order would create a deadlock risk.
       const taskLoad = await tx.queryOne(`
         SELECT COUNT(*)::integer AS count
-        FROM capture_tasks
-        WHERE tenant_id = $1
-          AND COALESCE(assigned_agent_id, origin_agent_id) = $2
-          AND status = ANY($3::text[])
+        FROM capture_tasks t
+        WHERE t.tenant_id = $1
+          AND COALESCE(t.assigned_agent_id, t.origin_agent_id) = $2
+          AND t.status = ANY($3::text[])
+          AND ${captureTaskBusinessRootVisibilitySql('t')}
       `, [req.tenantId, agentId, AGENT_REMOVAL_TASK_STATUSES]);
       const workItemLoad = await tx.queryOne(`
         SELECT COUNT(*)::integer AS count
-        FROM capture_task_items
-        WHERE tenant_id = $1 AND assigned_agent_id = $2
-          AND status IN (
+        FROM capture_task_items item
+        JOIN capture_tasks parent
+          ON parent.id = item.task_id
+          AND parent.tenant_id = item.tenant_id
+        WHERE item.tenant_id = $1 AND item.assigned_agent_id = $2
+          AND item.status IN (
             'pending', 'assigned', 'dispatch_pending', 'dispatched',
             'waiting_device', 'running', 'retryable', 'needs_action'
           )
-      `, [req.tenantId, agentId]);
+          AND parent.status = ANY($3::text[])
+      `, [req.tenantId, agentId, AGENT_REMOVAL_TASK_STATUSES]);
       const pendingCommands = await tx.queryOne(`
         SELECT COUNT(*)::integer AS count
         FROM capture_agent_commands
@@ -4872,13 +4924,6 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         message: '采集节点标识无效',
       });
     }
-    if (text(req.body?.confirmation, 30) !== '永久归档') {
-      return res.status(400).json({
-        ok: false,
-        error: 'agent_retirement_confirmation_required',
-        message: '请输入“永久归档”确认该高风险操作',
-      });
-    }
     const retirementReason = text(req.body?.reason, 80);
     if (!['tenant_migrated', 'permanently_offline'].includes(retirementReason)) {
       return res.status(400).json({
@@ -4887,6 +4932,35 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         message: '请选择节点已换租户或设备永久停用',
       });
     }
+    const movedToAnotherTenant = retirementReason === 'tenant_migrated';
+    const requiredConfirmation = movedToAnotherTenant ? '移出当前租户' : '永久停用';
+    if (text(req.body?.confirmation, 30) !== requiredConfirmation) {
+      return res.status(400).json({
+        ok: false,
+        error: movedToAnotherTenant
+          ? 'agent_migration_confirmation_required'
+          : 'agent_retirement_confirmation_required',
+        message: `请输入“${requiredConfirmation}”确认该操作`,
+      });
+    }
+    const terminalAgentStatus = movedToAnotherTenant ? 'migrated' : 'revoked';
+    const lifecycleCode = movedToAnotherTenant ? 'agent_migrated' : 'agent_retired';
+    const lifecycleAction = movedToAnotherTenant
+      ? 'capture_agent.migrated'
+      : 'capture_agent.retired';
+    const lifecycleEventType = movedToAnotherTenant
+      ? 'capture_agent_migrated'
+      : 'capture_agent_retired';
+    const lifecycleProjectionEventType = movedToAnotherTenant
+      ? 'capture_agent_migration_projected'
+      : 'capture_agent_retirement_projected';
+    const lifecycleMetadataKey = movedToAnotherTenant
+      ? 'agentMigration'
+      : 'agentRetirement';
+    const lastLifecycleMetadataKey = movedToAnotherTenant
+      ? 'lastAgentMigration'
+      : 'lastAgentRetirement';
+    const lifecycleLabel = movedToAnotherTenant ? '已移出当前租户' : '已永久停用';
 
     const result = await withTransaction(async tx => {
       // The same advisory lock fences late heartbeats, credential refreshes and
@@ -4904,6 +4978,9 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
       if (agent.status === 'revoked') {
         return {agent, alreadyRetired: true};
       }
+      if (agent.status === 'migrated' && movedToAnotherTenant) {
+        return {agent, alreadyMigrated: true};
+      }
       if (captureAgentOnline(agent.last_heartbeat_at)) {
         return {agent, online: true};
       }
@@ -4911,10 +4988,21 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
       const actorId = String(req.user?.id || '');
       const actorName = text(req.actorName, 240);
       const retirementMetadata = {
-        code: 'agent_retired',
+        code: lifecycleCode,
         reason: retirementReason,
-        retiredAt: new Date().toISOString(),
-        retiredByUserId: actorId,
+        changedAt: new Date().toISOString(),
+        changedByUserId: actorId,
+        previousStatus: agent.status,
+        nextStatus: terminalAgentStatus,
+        ...(movedToAnotherTenant
+          ? {
+              migratedAt: new Date().toISOString(),
+              migratedByUserId: actorId,
+            }
+          : {
+              retiredAt: new Date().toISOString(),
+              retiredByUserId: actorId,
+            }),
       };
       const planSnapshot = safeJson(agent.unattended_plan);
 
@@ -4925,10 +5013,10 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         UPDATE capture_orchestration_schedules schedule
         SET status = 'canceled',
           next_run_at = NULL,
-          last_run_status = 'agent_retired',
+          last_run_status = $4,
           last_error = jsonb_build_object(
-            'code', 'agent_retired',
-            'message', '计划中的执行节点已永久归档',
+            'code', $4::text,
+            'message', $5::text,
             'agentId', $2::text,
             'reason', $3::text
           ),
@@ -4940,7 +5028,15 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
           AND assignment.agent_id = $2
           AND schedule.status IN ('active', 'paused')
         RETURNING schedule.id, schedule.template_task_id
-      `, [req.tenantId, agentId, retirementReason]);
+      `, [
+        req.tenantId,
+        agentId,
+        retirementReason,
+        lifecycleCode,
+        movedToAnotherTenant
+          ? '计划中的执行节点已移出当前租户'
+          : '计划中的执行节点已永久停用',
+      ]);
       const retiredTemplateTaskIds = retiredSchedules
         .map(schedule => String(schedule.template_task_id || ''))
         .filter(Boolean);
@@ -4981,7 +5077,7 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         SET status = 'canceled',
           error = error || $3::jsonb,
           metadata = metadata || jsonb_build_object(
-            'agentRetirement', $3::jsonb
+            $4::text, $3::jsonb
           ),
           finished_at = COALESCE(finished_at, now()),
           updated_at = now()
@@ -4990,15 +5086,20 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
             'pending', 'assigned', 'dispatch_pending', 'dispatched',
             'waiting_device', 'running', 'retryable', 'needs_action'
           )
-      `, [req.tenantId, agentId, JSON.stringify(retirementMetadata)]);
+      `, [
+        req.tenantId,
+        agentId,
+        JSON.stringify(retirementMetadata),
+        lifecycleMetadataKey,
+      ]);
 
       const retiredTasks = await tx.queryAll(`
         UPDATE capture_tasks
         SET status = 'canceled',
-          message = '原执行节点已永久归档，任务已终结；历史采集结果已保留',
+          message = $6,
           error = error || $4::jsonb,
           metadata = metadata || jsonb_build_object(
-            'agentRetirement', $4::jsonb
+            $5::text, $4::jsonb
           ),
           finished_at = COALESCE(finished_at, now()),
           updated_at = now(),
@@ -5012,6 +5113,10 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         agentId,
         AGENT_REMOVAL_TASK_STATUSES,
         JSON.stringify(retirementMetadata),
+        lifecycleMetadataKey,
+        movedToAnotherTenant
+          ? '原执行节点已移出当前租户，任务已终结；历史采集结果已保留'
+          : '原执行节点已永久停用，任务已终结；历史采集结果已保留',
       ]);
 
       let retiredTemplateTasks = [];
@@ -5019,10 +5124,10 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         retiredTemplateTasks = await tx.queryAll(`
           UPDATE capture_tasks
           SET status = 'canceled',
-            message = '计划中的执行节点已永久归档，云端计划已停止',
+            message = $6,
             error = error || $3::jsonb,
             metadata = metadata || jsonb_build_object(
-              'agentRetirement', $3::jsonb
+              $5::text, $3::jsonb
             ),
             finished_at = COALESCE(finished_at, now()),
             updated_at = now(),
@@ -5036,6 +5141,10 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
           retiredTemplateTaskIds,
           JSON.stringify(retirementMetadata),
           AGENT_REMOVAL_TASK_STATUSES,
+          lifecycleMetadataKey,
+          movedToAnotherTenant
+            ? '计划中的执行节点已移出当前租户，云端计划已停止'
+            : '计划中的执行节点已永久停用，云端计划已停止',
         ]);
       }
 
@@ -5049,17 +5158,21 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
             tenant_id, task_id, agent_id, event_type,
             actor_type, actor_id, actor_name, status, message, payload
           ) VALUES (
-            $1, $2, $3, 'capture_agent_retired',
-            'user', $4, $5, 'canceled',
-            '执行节点已永久归档，任务控制状态已终结',
-            $6::jsonb
+            $1, $2, $3, $4,
+            'user', $5, $6, 'canceled',
+            $7,
+            $8::jsonb
           )
         `, [
           req.tenantId,
           task.id,
           agentId,
+          lifecycleEventType,
           actorId,
           actorName,
+          movedToAnotherTenant
+            ? '执行节点已移出当前租户，任务控制状态已终结'
+            : '执行节点已永久停用，任务控制状态已终结',
           JSON.stringify({
             previousAgentId: agentId,
             reason: retirementReason,
@@ -5098,8 +5211,8 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         `, [parentId, req.tenantId]);
         const aggregate = aggregateParentTaskItems(items);
         const parentMessage = aggregate.terminal
-          ? '执行节点永久归档后，多 Agent 任务已结算'
-          : '部分工作项因执行节点永久归档而停止，其余工作项继续执行';
+          ? `执行节点${lifecycleLabel}后，多 Agent 任务已结算`
+          : `部分工作项因执行节点${lifecycleLabel}而停止，其余工作项继续执行`;
         await tx.execute(`
           UPDATE capture_tasks
           SET status = $1,
@@ -5107,20 +5220,21 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
             counts = $3::jsonb,
             message = $4,
             metadata = metadata || jsonb_build_object(
-              'lastAgentRetirement', $5::jsonb
+              $5::text, $6::jsonb
             ),
             finished_at = CASE
-              WHEN $6::boolean THEN COALESCE(finished_at, now())
+              WHEN $7::boolean THEN COALESCE(finished_at, now())
               ELSE NULL
             END,
             updated_at = now(),
             source_updated_at = now()
-          WHERE id = $7 AND tenant_id = $8
+          WHERE id = $8 AND tenant_id = $9
         `, [
           aggregate.status,
           JSON.stringify(aggregate.progress),
           JSON.stringify(aggregate.counts),
           parentMessage,
+          lastLifecycleMetadataKey,
           JSON.stringify(retirementMetadata),
           aggregate.terminal,
           parentId,
@@ -5131,13 +5245,14 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
             tenant_id, task_id, agent_id, event_type,
             actor_type, actor_id, actor_name, status, message, payload
           ) VALUES (
-            $1, $2, $3, 'capture_agent_retirement_projected',
-            'user', $4, $5, $6, $7, $8::jsonb
+            $1, $2, $3, $4,
+            'user', $5, $6, $7, $8, $9::jsonb
           )
         `, [
           req.tenantId,
           parentId,
           agentId,
+          lifecycleProjectionEventType,
           actorId,
           actorName,
           aggregate.status,
@@ -5150,32 +5265,44 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         UPDATE capture_agent_commands
         SET status = 'expired',
           result = result || jsonb_build_object(
-            'reason', 'agent_retired',
+            'reason', $4::text,
             'retirementReason', $3::text
           ),
           finished_at = COALESCE(finished_at, now()),
           updated_at = now()
         WHERE tenant_id = $1 AND agent_id = $2
           AND status IN ('pending', 'acknowledged')
-      `, [req.tenantId, agentId, retirementReason]);
+      `, [req.tenantId, agentId, retirementReason, lifecycleCode]);
       const revokedTokens = await tx.execute(`
         UPDATE capture_agent_tokens
         SET revoked_at = COALESCE(revoked_at, now())
         WHERE agent_id = $1
       `, [agentId]);
+      const socialBindingLifecycleMetadata = movedToAnotherTenant
+        ? {
+            nodeMigrated: true,
+            nodeMigratedAt: retirementMetadata.migratedAt,
+            nodeMigratedReason: retirementReason,
+            nodeMigratedByUserId: actorId,
+          }
+        : {
+            nodeRetired: true,
+            nodeRetiredAt: retirementMetadata.retiredAt,
+            nodeRetiredReason: retirementReason,
+            nodeRetiredByUserId: actorId,
+          };
       const historicalBindings = await tx.execute(`
         UPDATE social_account_bindings
         SET status = 'historical',
           ended_at = COALESCE(ended_at, now()),
-          metadata = metadata || jsonb_build_object(
-            'nodeRetired', true,
-            'nodeRetiredAt', now(),
-            'nodeRetiredReason', $3::text,
-            'nodeRetiredByUserId', $4::text
-          ),
+          metadata = metadata || $3::jsonb,
           updated_at = now()
         WHERE tenant_id = $1 AND agent_id = $2 AND status = 'current'
-      `, [req.tenantId, agentId, retirementReason, actorId]);
+      `, [
+        req.tenantId,
+        agentId,
+        JSON.stringify(socialBindingLifecycleMetadata),
+      ]);
       await tx.execute(`
         UPDATE social_accounts
         SET last_agent_id = NULL, updated_at = now()
@@ -5184,26 +5311,27 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
 
       const retired = await tx.queryOne(`
         UPDATE capture_agents
-        SET status = 'revoked',
+        SET status = $3,
           unattended_plan = '{}'::jsonb,
           unattended_plan_updated_at = now(),
           last_error = '',
           updated_at = now()
         WHERE id = $1 AND tenant_id = $2
         RETURNING id, display_name, status, updated_at
-      `, [agentId, req.tenantId]);
+      `, [agentId, req.tenantId, terminalAgentStatus]);
       await tx.execute(`
         INSERT INTO audit_logs (
           tenant_id, actor_type, actor_id, actor_user_id,
           action, target_type, target_id, metadata
         ) VALUES (
-          $1, 'user', $2, $3, 'capture_agent.retired',
-          'capture_agent', $4, $5::jsonb
+          $1, 'user', $2, $3, $4,
+          'capture_agent', $5, $6::jsonb
         )
       `, [
         req.tenantId,
         actorId,
         req.user?.id || null,
+        lifecycleAction,
         agentId,
         JSON.stringify({
           displayName: agent.display_name || '',
@@ -5222,6 +5350,7 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
           historicalSocialBindingCount: Number(historicalBindings.changes || 0),
           historyPreserved: true,
           authBindingPreserved: true,
+          reversible: movedToAnotherTenant,
         }),
       ]);
       return {
@@ -5244,12 +5373,15 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
       return res.status(409).json({
         ok: false,
         error: 'agent_retirement_online',
-        message: '节点仍在线，不能执行永久归档。请先确认 Extension 已切换租户或关闭，并等待约 2 分钟。',
+        message: movedToAnotherTenant
+          ? '节点仍在线，请先在 Extension 切换到其他租户，并等待约 2 分钟后再移出。'
+          : '节点仍在线，不能永久停用。请先关闭 Extension，并等待约 2 分钟。',
       });
     }
     return res.json({
       ok: true,
       alreadyRetired: result.alreadyRetired === true,
+      alreadyMigrated: result.alreadyMigrated === true,
       agent: result.agent,
       summary: {
         expiredCommands: result.expiredCommandCount || 0,
@@ -5258,8 +5390,12 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
         historicalSocialBindings: result.historicalSocialBindingCount || 0,
       },
       message: result.alreadyRetired
-        ? '该节点已永久归档'
-        : `节点“${result.agent?.display_name || '未命名节点'}”已永久归档；历史任务、采集结果和审计记录均已保留。`,
+        ? '该节点已永久停用'
+        : result.alreadyMigrated
+          ? '该节点已移出当前租户'
+          : movedToAnotherTenant
+            ? `节点“${result.agent?.display_name || '未命名节点'}”已移出当前租户；客户列表和新建任务不再显示，以后重新验证本租户激活码会自动恢复。`
+            : `节点“${result.agent?.display_name || '未命名节点'}”已永久停用；历史任务、采集结果和审计记录均已保留。`,
     });
   } catch (err) {
     return next(err);

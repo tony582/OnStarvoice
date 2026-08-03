@@ -1950,6 +1950,65 @@ function isCloudTargetedPostPayload(payload = {}) {
   );
 }
 
+function resolveOfficialPatrolRunError(request = {}) {
+  const source =
+    request && typeof request === 'object' && !Array.isArray(request)
+      ? request
+      : {};
+  const rootError =
+    source.error &&
+    typeof source.error === 'object' &&
+    !Array.isArray(source.error)
+      ? source.error
+      : null;
+  if (rootError && Object.keys(rootError).length > 0) return rootError;
+  if (
+    String(source.workflow || '').trim() !==
+    'official_account_comment_patrol'
+  ) {
+    return rootError;
+  }
+  if (
+    ![
+      'completed_with_warnings',
+      'failed',
+      'canceled',
+      'needs_action',
+    ].includes(String(source.status || '').trim())
+  ) {
+    return null;
+  }
+
+  const results = Array.isArray(source.targetResults)
+    ? source.targetResults
+    : [];
+  const statusPriority = new Map([
+    ['failed', 0],
+    ['completed_with_warnings', 1],
+    ['canceled', 2],
+  ]);
+  const representative = results
+    .filter((result) => {
+      const error = result?.error;
+      return Boolean(
+        error &&
+          typeof error === 'object' &&
+          !Array.isArray(error) &&
+          (String(error.code || error.reason || '').trim() ||
+            String(error.message || '').trim()),
+      );
+    })
+    .sort((left, right) => {
+      const leftPriority =
+        statusPriority.get(String(left?.status || '').trim()) ?? 3;
+      const rightPriority =
+        statusPriority.get(String(right?.status || '').trim()) ?? 3;
+      if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+      return (Number(left?.ordinal) || 0) - (Number(right?.ordinal) || 0);
+    })[0];
+  return representative?.error || null;
+}
+
 function normalizeStoredTargetedPostRunRequest(request) {
   if (
     !request ||
@@ -1983,11 +2042,14 @@ function normalizeStoredTargetedPostRunRequest(request) {
     targetResults,
     checkpoint,
   };
+  const resolvedError = resolveOfficialPatrolRunError(normalized);
+  if (resolvedError) normalized.error = resolvedError;
   return {
     request: normalized,
     changed:
       JSON.stringify(targetResults) !== JSON.stringify(request.targetResults) ||
-      JSON.stringify(checkpoint) !== JSON.stringify(request.checkpoint),
+      JSON.stringify(checkpoint) !== JSON.stringify(request.checkpoint) ||
+      JSON.stringify(resolvedError) !== JSON.stringify(request.error || null),
   };
 }
 
@@ -2143,6 +2205,32 @@ function targetedPostPhysicalRunId(request = {}) {
   const requestId = targetedPostLogicalRequestId(request);
   const attemptId = String(request?.attemptId || '').trim();
   return requestId && attemptId ? `${requestId}::${attemptId}` : requestId;
+}
+
+async function inspectTargetedPostCaptureTaskAttempt({
+  taskId = '',
+  attemptId = '',
+} = {}) {
+  const normalizedTaskId = String(taskId || '').trim();
+  const incomingAttemptId = String(attemptId || '').trim();
+  if (!normalizedTaskId) {
+    return {targeted: false, current: false, request: null};
+  }
+  const request = await readTargetedPostRunRequest({
+    persistNormalized: false,
+  });
+  const currentTaskId = targetedPostPhysicalRunId(request);
+  const currentAttemptId = String(request?.attemptId || '').trim();
+  const current = Boolean(
+    request &&
+      currentTaskId === normalizedTaskId &&
+      (!incomingAttemptId || incomingAttemptId === currentAttemptId),
+  );
+  return {
+    targeted: Boolean(request && currentTaskId === normalizedTaskId),
+    current,
+    request: current ? request : null,
+  };
 }
 
 function isSameTargetedPostAttempt(
@@ -2343,7 +2431,7 @@ function buildTargetedPostTaskCenterRun(request, existingRun = null) {
     message:
       String(progress.message || request.message || '').trim() ||
       (request.cancelRequested === true ? '正在停止定向巡查任务' : ''),
-    error: request.error || null,
+    error: resolveOfficialPatrolRunError(request),
     runnerTabId: request.runnerTabId,
     counts: {
       total,
@@ -2398,6 +2486,8 @@ async function persistTargetedPostRunRequest(request) {
     await chrome.storage.local.remove(STORAGE_KEYS.targetedPostRunRequest);
     return null;
   }
+  const normalized = normalizeStoredTargetedPostRunRequest(request);
+  const requestToPersist = normalized.request || request;
   return await runTaskLedgerMutation(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
@@ -2411,15 +2501,18 @@ async function persistTargetedPostRunRequest(request) {
         };
     const existingRun = Array.isArray(ledger?.runs)
       ? ledger.runs.find(
-          (item) => item?.id === targetedPostPhysicalRunId(request),
+          (item) => item?.id === targetedPostPhysicalRunId(requestToPersist),
         ) || null
       : null;
-    const taskRun = buildTargetedPostTaskCenterRun(request, existingRun);
+    const taskRun = buildTargetedPostTaskCenterRun(
+      requestToPersist,
+      existingRun,
+    );
     if (!taskRun) {
       await chrome.storage.local.set({
-        [STORAGE_KEYS.targetedPostRunRequest]: request,
+        [STORAGE_KEYS.targetedPostRunRequest]: requestToPersist,
       });
-      return request;
+      return requestToPersist;
     }
     if (!taskRun.metadata.cloudAgentScopeId) {
       taskRun.metadata.cloudAgentScopeId = String(
@@ -2438,11 +2531,11 @@ async function persistTargetedPostRunRequest(request) {
       ledger = result.ledger;
     }
     await chrome.storage.local.set({
-      [STORAGE_KEYS.targetedPostRunRequest]: request,
+      [STORAGE_KEYS.targetedPostRunRequest]: requestToPersist,
       [STORAGE_KEYS.taskLedger]: ledger,
     });
     scheduleCloudTaskAgentSync('targeted_post_state_changed');
-    return request;
+    return requestToPersist;
   });
 }
 
@@ -2680,10 +2773,7 @@ function summarizeTargetedPostRunForCloud(request, commandId) {
         ? request.checkpoint
         : {},
     message: String(request?.message || '').slice(0, 1000),
-    error:
-      request?.error && typeof request.error === 'object'
-        ? request.error
-        : null,
+    error: resolveOfficialPatrolRunError(request),
   };
 }
 
@@ -9061,6 +9151,20 @@ async function endCaptureTask(message) {
       reason: 'stale_unattended_attempt',
     };
   }
+  const targetedAttempt = attemptFence.unattended
+    ? {targeted: false, current: false}
+    : await inspectTargetedPostCaptureTaskAttempt({
+        taskId,
+        attemptId: request.attemptId,
+      });
+  if (targetedAttempt.targeted && !targetedAttempt.current) {
+    return {
+      taskId,
+      released: false,
+      ignored: true,
+      reason: 'stale_targeted_post_attempt',
+    };
+  }
   const reason =
     String(request.reason || '').trim() || 'capture_task_finished';
   const status = String(request.status || '').trim().toLowerCase();
@@ -9080,6 +9184,7 @@ async function endCaptureTask(message) {
     // 浏览器资源。不要再凭 unattended-capture:<id> 创建第二条 recovering
     // 记录，否则作品级进度会和关键词级 counts 混在一起。
     if (!attemptFence.unattended) {
+      if (targetedAttempt.current) return result;
       const now = new Date().toISOString();
       await upsertTaskLedgerRun({
         patch: {
@@ -9106,7 +9211,11 @@ async function endCaptureTask(message) {
     }
     return result;
   }
-  if (!attemptFence.unattended) {
+  // The targeted request root is the sole public task-ledger authority. Its
+  // native Debug END only releases tabs/Debug ownership; detail capture can
+  // finish before sync, so terminalizing here would absorb a later real sync
+  // failure as an update to an already-terminal task-center record.
+  if (!attemptFence.unattended && !targetedAttempt.current) {
     await terminalizeCaptureTaskLedgerRun(taskId, {
       reason,
       status: terminalStatus,
@@ -9914,12 +10023,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             request,
             message?.patch,
           );
-          await persistTargetedPostRunRequest(next);
+          const persisted = await persistTargetedPostRunRequest(next);
           return {
             ok: true,
             accepted: true,
             reason: '',
-            data: next,
+            data: persisted,
           };
         });
         let cloudReport = null;

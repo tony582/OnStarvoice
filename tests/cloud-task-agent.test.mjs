@@ -192,6 +192,137 @@ test("the live targeted request replaces a same-id compact ledger snapshot", () 
   );
 });
 
+test("a physical targeted ledger row and its live request report one business task", () => {
+  const logicalRequestId = "54c0b3fd-a7f8-41a3-94f6-a3bd0e3cd018";
+  const attemptId = "16249468-e006-4c97-af3c-773691dbda65";
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-targeted-physical-id"},
+    ledger: {
+      runs: [{
+        id: `${logicalRequestId}::${attemptId}`,
+        taskType: "official_account_comment_patrol",
+        platform: "douyin",
+        status: "failed",
+        attemptId,
+        attemptNumber: 1,
+        checkpoint: {processedCount: 1, total: 1},
+        metadata: {
+          workflow: "official_account_comment_patrol",
+          logicalRequestId,
+          attemptId,
+        },
+        updatedAt: "2026-08-03T05:01:40.716Z",
+      }],
+    },
+    targetedPostRequest: {
+      id: logicalRequestId,
+      taskId: logicalRequestId,
+      attemptId,
+      attemptNumber: 1,
+      workflow: "official_account_comment_patrol",
+      protocolVersion: 1,
+      platform: "douyin",
+      status: "failed",
+      checkpoint: {
+        processedCount: 1,
+        failedCount: 1,
+        total: 1,
+      },
+      targetResults: [{
+        itemId: "official-account-1",
+        status: "failed",
+        error: {code: "TASK_TAB_GROUP_UNAVAILABLE"},
+      }],
+    },
+  });
+
+  assert.equal(payload.tasks.length, 1);
+  assert.equal(payload.tasks[0].id, logicalRequestId);
+  assert.equal(payload.tasks[0].attemptId, attemptId);
+  assert.equal(payload.tasks[0].targetResults.length, 1);
+  assert.equal(
+    payload.tasks[0].targetResults[0].error.code,
+    "TASK_TAB_GROUP_UNAVAILABLE",
+  );
+  assert.equal(payload.tasks[0].checkpoint.failedCount, 1);
+});
+
+test("a historical physical targeted ledger row reports the canonical business id", () => {
+  const logicalRequestId = "42b03c27-d266-488c-9b87-7ac4e96ae058";
+  const attemptId = "3492ba37-1863-492b-81c1-0e39193396bd";
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-targeted-history"},
+    ledger: {
+      runs: [{
+        id: `${logicalRequestId}::${attemptId}`,
+        taskType: "official_account_comment_patrol",
+        platform: "xiaohongshu",
+        status: "failed",
+        attemptId,
+        attemptNumber: 1,
+        metadata: {
+          workflow: "official_account_comment_patrol",
+          logicalRequestId,
+          attemptId,
+        },
+        updatedAt: "2026-08-03T05:05:07.183Z",
+      }],
+    },
+  });
+
+  assert.equal(payload.tasks.length, 1);
+  assert.equal(payload.tasks[0].id, logicalRequestId);
+  assert.equal(payload.tasks[0].attemptId, attemptId);
+  assert.equal(payload.tasks[0].controlTaskId, "");
+});
+
+test("canonical targeted task ids retain distinct historical attempts", () => {
+  const logicalRequestId = "targeted-request-with-retries";
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "profile-targeted-attempt-history"},
+    ledger: {
+      runs: [
+        {
+          id: `${logicalRequestId}::attempt-2`,
+          taskType: "official_account_comment_patrol",
+          status: "completed",
+          attemptId: "attempt-2",
+          attemptNumber: 2,
+          metadata: {
+            workflow: "official_account_comment_patrol",
+            logicalRequestId,
+          },
+          updatedAt: "2026-08-03T06:00:00.000Z",
+        },
+        {
+          id: `${logicalRequestId}::attempt-1`,
+          taskType: "official_account_comment_patrol",
+          status: "failed",
+          attemptId: "attempt-1",
+          attemptNumber: 1,
+          metadata: {
+            workflow: "official_account_comment_patrol",
+            logicalRequestId,
+          },
+          updatedAt: "2026-08-03T05:00:00.000Z",
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(
+    plain(payload.tasks.map((task) => ({
+      id: task.id,
+      attemptId: task.attemptId,
+      attemptNumber: task.attemptNumber,
+    }))),
+    [
+      {id: logicalRequestId, attemptId: "attempt-2", attemptNumber: 2},
+      {id: logicalRequestId, attemptId: "attempt-1", attemptNumber: 1},
+    ],
+  );
+});
+
 test("heartbeat preserves the official-account comment patrol workflow and capability", () => {
   const payload = agent.buildHeartbeatPayload({
     runtime: {clientUuid: "profile-official-comments"},

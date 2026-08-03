@@ -203,23 +203,60 @@ test("admin UI exposes guarded Agent deletion without a nested row button", asyn
   assert.match(page, /onDeleteAgent=\{deleteAgent\}/u);
 });
 
-test("admin UI exposes a strongly confirmed retirement flow only for offline legacy Agents", async () => {
+test("admin UI separates reversible tenant migration from destructive node retirement", async () => {
   const [page, rail] = await Promise.all([
     read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
     read("web/admin/src/pages/dispatch/cloud-tasks/AgentRail.tsx"),
   ]);
-  assert.match(rail, /永久归档旧节点/u);
-  assert.match(rail, /disabled=\{agent\.online\}/u);
-  assert.match(rail, /普通离线和临时关机不要使用/u);
-  assert.match(rail, /已换租户或激活码/u);
-  assert.match(rail, /设备永久停用/u);
-  assert.match(rail, /输入“永久归档”确认/u);
-  assert.match(rail, /confirmation !== '永久归档'/u);
-  assert.match(rail, /后续心跳不能自动恢复/u);
-  assert.match(rail, /历史任务、采集结果、用量和审计记录全部保留/u);
+
+  const detachMenuStart = rail.indexOf('<DropdownMenu.Item onSelect={onDetach}');
+  const retireMenuStart = rail.indexOf('<DropdownMenu.Item onSelect={onRetire}', detachMenuStart);
+  assert.ok(detachMenuStart >= 0 && retireMenuStart > detachMenuStart);
+  const detachMenu = rail.slice(detachMenuStart, retireMenuStart);
+  assert.match(detachMenu, /移出当前租户/u);
+  assert.match(detachMenu, /disabled=\{agent\.online\}/u);
+  assert.doesNotMatch(detachMenu, /text-destructive/u);
+
+  const detachDialogStart = rail.indexOf('function DetachAgentDialog');
+  const retireDialogStart = rail.indexOf('function RetireAgentDialog', detachDialogStart);
+  assert.ok(detachDialogStart >= 0 && retireDialogStart > detachDialogStart);
+  const detachDialog = rail.slice(detachDialogStart, retireDialogStart);
+  assert.match(detachDialog, /仅用于浏览器已经切换到其他租户或激活码/u);
+  assert.match(detachDialog, /从当前租户的节点列表和新建任务选择中隐藏/u);
+  assert.match(detachDialog, /现有等待任务与无人值守计划会终止/u);
+  assert.match(detachDialog, /切回本租户并重新验证激活码，会恢复为可用节点/u);
+  assert.match(detachDialog, /<Button size="sm" onClick=\{onConfirm\}/u);
+
+  const detachActionStart = page.indexOf('const detachAgent =');
+  const retireActionStart = page.indexOf('const retireAgent =', detachActionStart);
+  assert.ok(detachActionStart >= 0 && retireActionStart > detachActionStart);
+  const detachAction = page.slice(detachActionStart, retireActionStart);
+  assert.match(
+    detachAction,
+    /`\/capture-cloud\/agents\/\$\{agent\.id\}\/retire`[\s\S]*confirmation: '移出当前租户'[\s\S]*reason: 'tenant_migrated'/u,
+  );
+  assert.match(page, /onDetachAgent=\{detachAgent\}/u);
   assert.match(
     page,
-    /api\.post<\{ message\?: string \}>\([\s\S]*`\/capture-cloud\/agents\/\$\{agent\.id\}\/retire`[\s\S]*confirmation: '永久归档'[\s\S]*reason/u,
+    /operationalAgents[\s\S]*agent\.status === 'active' \|\| agent\.status === 'paused'/u,
+  );
+  assert.match(page, /<CreateTaskDrawer agents=\{operationalAgents\}/u);
+  assert.match(page, /<OrchestrationComposerDrawer[\s\S]*agents=\{operationalAgents\}/u);
+
+  const retireDialogEnd = rail.indexOf('function AgentDetailPane', retireDialogStart);
+  const retireDialog = rail.slice(retireDialogStart, retireDialogEnd);
+  assert.match(retireDialog, /永久停用节点/u);
+  assert.match(retireDialog, /确认永远不会再使用/u);
+  assert.match(retireDialog, /换租户、普通离线和临时关机不要使用/u);
+  assert.match(retireDialog, /以后重新验证也不能恢复/u);
+  assert.match(retireDialog, /输入“永久停用”确认/u);
+  assert.match(retireDialog, /confirmation !== '永久停用'/u);
+  assert.doesNotMatch(retireDialog, /tenant_migrated/u);
+
+  const retireAction = page.slice(retireActionStart, page.indexOf('if (loading && !overview)', retireActionStart));
+  assert.match(
+    retireAction,
+    /`\/capture-cloud\/agents\/\$\{agent\.id\}\/retire`[\s\S]*confirmation: '永久停用'[\s\S]*reason: 'permanently_offline'/u,
   );
   assert.match(page, /onRetireAgent=\{retireAgent\}/u);
 });

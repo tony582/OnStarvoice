@@ -1,6 +1,6 @@
 # StarVoice 星语 API 接口文档
 
-> 稳定版基线：Extension `0.3.73`，以仓库 `main` 分支为准，数据库迁移截至 `054_restore_iso_publish_timestamps.sql`。
+> 稳定版基线：Extension `0.3.74`，以仓库 `main` 分支为准，数据库迁移截至 `055_capture_agent_tenant_migration.sql`。
 > 本文用于开发、联调、排障和交接，不替代路由源码。接口发生变化时，应同时更新对应路由、测试和本文。
 
 ## 1. 基址与服务边界
@@ -212,7 +212,7 @@ Content-Type: application/json
 | `GET` | `/overview` | 节点、任务、计划和统计总览 |
 | `PATCH` | `/agents/:id` | 修改节点名称、设备归组、负责平台等 |
 | `DELETE` | `/agents/:id` | 删除允许删除的节点 |
-| `POST` | `/agents/:id/retire` | 将不可再上线的节点退役 |
+| `POST` | `/agents/:id/retire` | `tenant_migrated` 可逆地移出当前租户，或以 `permanently_offline` 永久停用节点 |
 | `POST` | `/agents/:id/tasks` | 给单个 Agent 下发一次性任务或无人值守计划 |
 | `DELETE` | `/agents/:id/unattended-plan` | 删除节点无人值守计划 |
 | `POST` | `/tasks/:id/resume` | 从服务端检查点继续任务 |

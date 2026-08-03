@@ -1957,7 +1957,9 @@ async function handleCaptureComments(request, sendResponse) {
       waitMinMs: request.waitMinMs,
       waitMaxMs: request.waitMaxMs,
       stallTimeoutMs: request.stallTimeoutMs,
-      maxScrollTimes: request.maxScrollTimes || 50, // 兼容旧请求参数
+      // 评论采集由数量、平台耗尽、无新增或安全时长终止；
+      // 只在调用方显式传入时才使用固定滚动次数上限。
+      maxScrollTimes: request.maxScrollTimes,
       expandReplies: request.expandReplies || false, // 兼容旧请求参数
     });
 

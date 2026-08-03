@@ -1697,6 +1697,115 @@ test("a terminal targeted-post update reports its cloud command before the messa
   assert.equal(Object.hasOwn(ledgerRun.metadata, "targetResults"), false);
 });
 
+test("official patrol promotes a representative target failure to the request, task ledger, and cloud result", async () => {
+  const harness = createHarness();
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "agent-official-error",
+      token: "official-error-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    workflow: "official_account_comment_patrol",
+    id: "official-error-request",
+    taskId: "official-error-task",
+    attemptId: "official-error-attempt",
+    cloudCommandId: "official-error-command",
+    platform: "xiaohongshu",
+    status: "running",
+    createdAt: "2026-08-03T05:00:00.000Z",
+    updatedAt: "2026-08-03T05:00:01.000Z",
+    error: null,
+    targets: [
+      {
+        workflow: "official_account_comment_patrol",
+        itemId: "official-error-item-1",
+        recordId: "official-error-record-1",
+        externalId: "note-official-error-1",
+        ordinal: 1,
+        url: "https://www.xiaohongshu.com/explore/note-official-error-1",
+      },
+      {
+        workflow: "official_account_comment_patrol",
+        itemId: "official-error-item-2",
+        recordId: "official-error-record-2",
+        externalId: "note-official-error-2",
+        ordinal: 2,
+        url: "https://www.xiaohongshu.com/explore/note-official-error-2",
+      },
+    ],
+    targetResults: [],
+    checkpoint: {processedCount: 0, total: 2},
+  };
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: "official-error-request",
+    attemptId: "official-error-attempt",
+    patch: {
+      status: "completed_with_warnings",
+      finishedAt: "2026-08-03T05:00:05.000Z",
+      message: "官方账号评论巡查已完成，部分账号采集失败",
+      targetResults: [
+        {
+          workflow: "official_account_comment_patrol",
+          itemId: "official-error-item-1",
+          recordId: "official-error-record-1",
+          externalId: "note-official-error-1",
+          ordinal: 1,
+          status: "completed",
+          recordIds: ["official-error-record-1"],
+        },
+        {
+          workflow: "official_account_comment_patrol",
+          itemId: "official-error-item-2",
+          recordId: "official-error-record-2",
+          externalId: "note-official-error-2",
+          ordinal: 2,
+          status: "failed",
+          error: {
+            code: "TASK_TAB_GROUP_UNAVAILABLE",
+            stage: "comments",
+            message: "任务专属评论采集页面不可用",
+            retryable: true,
+          },
+        },
+      ],
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.cloudReported, true);
+  assert.equal(response.data.status, "completed_with_warnings");
+  assert.equal(response.data.error.code, "TASK_TAB_GROUP_UNAVAILABLE");
+  assert.equal(response.data.error.message, "任务专属评论采集页面不可用");
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].error.code,
+    "TASK_TAB_GROUP_UNAVAILABLE",
+  );
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].success, true);
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.error.code,
+    "TASK_TAB_GROUP_UNAVAILABLE",
+  );
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.targetResults[1].status,
+    "failed",
+  );
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) =>
+      run.id === "official-error-request::official-error-attempt",
+  );
+  assert.equal(ledgerRun.status, "completed_with_warnings");
+  assert.equal(ledgerRun.counts.success, 1);
+  assert.equal(ledgerRun.counts.failed, 1);
+  assert.equal(ledgerRun.error.code, "TASK_TAB_GROUP_UNAVAILABLE");
+  assert.equal(ledgerRun.error.message, "任务专属评论采集页面不可用");
+});
+
 test("a cloud create command starts exactly one local task without replacing the saved plan", async () => {
   const harness = createHarness();
   harness.storage["onstarvoice.unattendedKeywordPlan"] = {
@@ -4173,6 +4282,104 @@ test("normal persistent task end directly terminalizes its task-center run", asy
   assert.equal(run.status, "completed");
   assert.equal(Boolean(run.finishedAt), true);
   assert.equal(run.error, null);
+});
+
+test("targeted native task end releases resources without absorbing a later sync failure", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    workflow: "official_account_comment_patrol",
+    id: "official-sync-failure-request",
+    clientTaskId: "official-sync-failure-request",
+    taskId: "official-sync-failure-task",
+    attemptId: "official-sync-failure-attempt",
+    cloudCommandId: "official-sync-failure-command",
+    platform: "xiaohongshu",
+    title: "官方账号评论巡查",
+    targets: [
+      {
+        workflow: "official_account_comment_patrol",
+        itemId: "official-sync-failure-item",
+        recordId: "official-sync-failure-record",
+        externalId: "official-sync-failure-account",
+        ordinal: 1,
+        url: "https://www.xiaohongshu.com/user/profile/sync-failure",
+      },
+    ],
+  });
+  const physicalTaskId = `${request.id}::${request.attemptId}`;
+  await harness.api.persistTargetedPostRunRequest(request);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    url: "https://www.xiaohongshu.com/user/profile/sync-failure",
+  }));
+
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: physicalTaskId,
+    attemptId: request.attemptId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.ok(harness.api.getCaptureDebugSessionByTaskId(physicalTaskId));
+
+  const ended = await harness.sendBackgroundMessage({
+    type: "onstarvoice:end-capture-task",
+    taskId: physicalTaskId,
+    attemptId: request.attemptId,
+    reason: "completed",
+    status: "completed",
+  });
+  assert.equal(ended.ok, true, JSON.stringify(ended));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(physicalTaskId), null);
+
+  const afterNativeEnd = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === physicalTaskId,
+  );
+  assert.equal(afterNativeEnd.status, "running");
+  assert.equal(Boolean(afterNativeEnd.finishedAt), false);
+
+  const failed = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      status: "failed",
+      finishedAt: "2026-08-03T05:10:00.000Z",
+      message: "官方账号评论巡查同步失败",
+      targetResults: [
+        {
+          workflow: "official_account_comment_patrol",
+          itemId: "official-sync-failure-item",
+          recordId: "official-sync-failure-record",
+          externalId: "official-sync-failure-account",
+          ordinal: 1,
+          status: "failed",
+          error: {
+            code: "SYNC_RECORD_BATCH_FAILED",
+            stage: "sync",
+            message: "评论巡查结果同步失败",
+            retryable: true,
+          },
+        },
+      ],
+    },
+  });
+  assert.equal(failed.ok, true, JSON.stringify(failed));
+  assert.equal(failed.data.status, "failed");
+  assert.equal(failed.data.error.code, "SYNC_RECORD_BATCH_FAILED");
+
+  const matchingRuns = harness.storage[TASK_LEDGER_KEY].runs.filter(
+    (run) => run.id === physicalTaskId,
+  );
+  assert.equal(harness.storage[TASK_LEDGER_KEY].runs.length, 1);
+  assert.equal(matchingRuns.length, 1);
+  assert.equal(matchingRuns[0].status, "failed");
+  assert.equal(matchingRuns[0].error.code, "SYNC_RECORD_BATCH_FAILED");
+  assert.equal(matchingRuns[0].error.message, "评论巡查结果同步失败");
 });
 
 test("unexpected native Debug detach clears badge and group before the next task starts", async () => {

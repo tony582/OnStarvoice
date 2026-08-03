@@ -275,8 +275,8 @@
       skipAlreadyCapturedOnDetailCapture:
         source.skipAlreadyCapturedOnDetailCapture !== false,
       commentsMaxDetectedItems:
-        Number.isFinite(commentLimit) && commentLimit > 0
-          ? Math.min(commentLimit, 500)
+        Number.isSafeInteger(commentLimit) && commentLimit > 0
+          ? commentLimit
           : 50,
     };
   }

@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS capture_agents (
   allowed_platforms TEXT[] NOT NULL DEFAULT '{}',
   capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
   status TEXT NOT NULL DEFAULT 'active'
-    CHECK (status IN ('active', 'paused', 'revoked')),
+    CHECK (status IN ('active', 'paused', 'migrated', 'revoked')),
   last_heartbeat_at TIMESTAMPTZ,
   last_error TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

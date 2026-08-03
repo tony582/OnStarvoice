@@ -388,7 +388,7 @@ export async function waitForPageLoad(timeout = 10000) {
  * @param {Object} options - 配置选项
  * @param {Function} options.onProgress - 进度回调函数
  * @param {Function} options.detectNewContent - 检测新内容的函数
- * @param {number} options.maxScrollTimes - 最大滚动次数
+ * @param {number|null} options.maxScrollTimes - 最大滚动次数；null 表示不设固定次数上限
  * @param {number} options.noNewContentThreshold - 连续多少次无新内容后停止
  * @returns {Promise<Object>} 滚动结果
  */
@@ -405,6 +405,12 @@ export async function autoScrollLoad({
   stepTimeoutMs = CAPTURE_STEP_TIMEOUT_MS,
   resetCancelOnStart = true,
 } = {}) {
+  const parsedMaxScrollTimes = Number(maxScrollTimes);
+  const normalizedMaxScrollTimes =
+    Number.isFinite(parsedMaxScrollTimes) && parsedMaxScrollTimes > 0
+      ? Math.floor(parsedMaxScrollTimes)
+      : null;
+  const hasFixedMaxScrollTimes = normalizedMaxScrollTimes !== null;
   let scrollCount = 0;
   let noNewContentCount = 0;
   let previousContentCount = 0;
@@ -483,7 +489,10 @@ export async function autoScrollLoad({
     resetCancelFlag();
   }
 
-  while (scrollCount < maxScrollTimes && !isCanceled()) {
+  while (
+    (!hasFixedMaxScrollTimes || scrollCount < normalizedMaxScrollTimes) &&
+    !isCanceled()
+  ) {
     checkpointActiveClock();
     const beforeScrollNetworkPause = await waitForNetworkRecovery(onProgress);
     pausedDurationMs += beforeScrollNetworkPause.pausedDurationMs;
@@ -502,7 +511,7 @@ export async function autoScrollLoad({
     if (onProgress) {
       onProgress({
         scrollCount,
-        maxScrollTimes,
+        maxScrollTimes: normalizedMaxScrollTimes,
         noNewContentCount,
         phase: 'scrolling',
         message: `正在向下滚动... (第 ${scrollCount} 次)`,
@@ -685,15 +694,18 @@ export async function autoScrollLoad({
   }
 
   // 检查是否达到最大滚动次数
-  if (scrollCount >= maxScrollTimes && !isCanceled()) {
-    if (!stopReason) {
-      stopReason = 'max_scroll';
-    }
+  if (
+    hasFixedMaxScrollTimes &&
+    scrollCount >= normalizedMaxScrollTimes &&
+    !isCanceled() &&
+    !stopReason
+  ) {
+    stopReason = 'max_scroll';
     if (onProgress) {
       onProgress({
         scrollCount,
         phase: 'max_reached',
-        message: `已达到最大滚动次数 (${maxScrollTimes})，停止采集`,
+        message: `已达到最大滚动次数 (${normalizedMaxScrollTimes})，停止采集`,
       });
     }
   }
@@ -705,7 +717,7 @@ export async function autoScrollLoad({
       noNewContentCount >= noNewContentThreshold,
     canceled: isCanceled(),
     scrollCount,
-    maxScrollTimes,
+    maxScrollTimes: normalizedMaxScrollTimes,
     noNewContentCount,
     finalContentCount: previousContentCount,
     stopReason:
