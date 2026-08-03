@@ -554,6 +554,61 @@ async function appendEvent(tx, {
   ]);
 }
 
+export async function supersedeStalePlanConfigurationAttention(tx, {
+  tenantId,
+  agentId,
+  supersededByTaskId,
+  supersededByCreatedAt,
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+  taskMessage,
+  eventMessage,
+}) {
+  const supersededTasks = await tx.queryAll(`
+    UPDATE capture_tasks
+    SET status = 'superseded',
+      message = $5,
+      metadata = metadata || jsonb_build_object(
+        'supersededByTaskId', $3::text,
+        'supersededAt', now()
+      ),
+      finished_at = COALESCE(finished_at, now()),
+      updated_at = now()
+    WHERE tenant_id = $1
+      AND COALESCE(assigned_agent_id, origin_agent_id) = $2
+      AND id <> $3::uuid
+      AND task_type = 'unattended_plan_configuration'
+      AND status = 'needs_action'
+      AND (
+        created_at < $4::timestamptz
+        OR (created_at = $4::timestamptz AND id < $3::uuid)
+      )
+    RETURNING id
+  `, [
+    tenantId,
+    agentId,
+    supersededByTaskId,
+    supersededByCreatedAt,
+    taskMessage,
+  ]);
+
+  for (const supersededTask of supersededTasks) {
+    await appendEvent(tx, {
+      tenantId,
+      taskId: supersededTask.id,
+      agentId,
+      eventType: 'plan_configuration_superseded',
+      actorType,
+      actorId,
+      actorName,
+      status: 'superseded',
+      message: eventMessage,
+      payload: {supersededByTaskId},
+    });
+  }
+}
+
 async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) {
   const scopedTaskId = text(taskId, 100);
   const scopedAgentId = text(agentId, 100);
@@ -3952,7 +4007,7 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       // Match heartbeat and expiry ordering: task first, then its command.
       const lockedTask = await tx.queryOne(`
         SELECT id, parent_task_id, assigned_agent_id, task_type,
-          status, error, metadata
+          status, error, metadata, created_at
         FROM capture_tasks
         WHERE id = $1 AND tenant_id = $2
         FOR UPDATE
@@ -4298,6 +4353,31 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
             : {}),
         },
       });
+      if (
+        success &&
+        updatedTask &&
+        command.command_type === 'create' &&
+        createExecutionMode === 'unattended_plan' &&
+        lockedTask.task_type === 'unattended_plan_configuration'
+      ) {
+        const planWasDeleted = createPlanOperation === 'delete';
+        await supersedeStalePlanConfigurationAttention(tx, {
+          tenantId: req.tenantId,
+          agentId: req.captureAgent.id,
+          supersededByTaskId: command.task_id,
+          supersededByCreatedAt: lockedTask.created_at,
+          actorType: 'capture_agent',
+          actorId: req.captureAgent.id,
+          actorName:
+            req.captureAgent.display_name || req.captureAgent.client_label,
+          taskMessage: planWasDeleted
+            ? '已被成功删除无人值守计划的指令替代'
+            : '已被成功保存的无人值守计划替代',
+          eventMessage: planWasDeleted
+            ? '设备已成功删除计划，较早失败的计划配置已封存'
+            : '设备已成功保存计划，较早失败的计划配置已封存',
+        });
+      }
       if (updatedTask?.parent_task_id && command.command_type === 'create') {
         const createError = success
           ? {}
@@ -4395,19 +4475,19 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
               AS agent_id,
             COUNT(*) FILTER (
               WHERE assigned.status IN (
-                'claimed', 'running', 'recovering', 'interrupted',
-                'needs_action', 'resume_requested'
+                'claimed', 'running', 'recovering', 'resume_requested'
               )
             ) AS active_task_count,
             COUNT(*) FILTER (
-              WHERE assigned.status = 'pending'
+              WHERE assigned.status IN ('pending', 'waiting_device')
             ) AS queued_task_count
           FROM capture_tasks assigned
           WHERE assigned.tenant_id = $1
-            AND assigned.status IN (
-              'pending', 'claimed', 'running', 'recovering', 'interrupted',
-              'needs_action', 'resume_requested'
+            AND assigned.status = ANY($2::text[])
+            AND assigned.task_type NOT IN (
+              'capture_orchestration', 'unattended_plan_configuration', 'sync'
             )
+            AND RIGHT(assigned.task_type, 5) <> '_sync'
             AND COALESCE(
               assigned.assigned_agent_id,
               assigned.origin_agent_id
@@ -4434,7 +4514,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         LEFT JOIN task_load ON task_load.agent_id = ca.id
         WHERE ca.tenant_id = $1 AND ca.status <> 'revoked'
         ORDER BY ca.host_label, ca.display_name, ca.created_at
-      `, [req.tenantId]),
+      `, [req.tenantId, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]),
       queryAll(`
         SELECT t.*,
           ca.display_name AS agent_display_name,

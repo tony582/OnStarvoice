@@ -31,6 +31,7 @@ import {
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
   resolveStopCommandOutcome,
+  supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
 
 const captureCloudRouteSource = await readFile(
@@ -665,14 +666,32 @@ test("late Agent heartbeat and command receipts are absorbed after retirement wi
   assert.match(completion, /'agent_retired'/u);
 });
 
-test("overview never presents interrupted or needs-action Agents as idle", () => {
+test("overview separates execution load from attention history and technical tasks", () => {
   const overview = readRouteSection(
     "router.get('/overview'",
     "router.patch('/agents/:id'",
   );
+  const workloadStart = overview.indexOf("WITH task_load AS");
+  const workloadEnd = overview.indexOf("SELECT ca.id", workloadStart);
+  assert.ok(workloadStart >= 0 && workloadEnd > workloadStart);
+  const workload = overview.slice(workloadStart, workloadEnd);
+  assert.match(
+    workload,
+    /'claimed', 'running', 'recovering', 'resume_requested'[\s\S]*AS active_task_count/u,
+  );
+  assert.match(
+    workload,
+    /assigned\.status IN \('pending', 'waiting_device'\)[\s\S]*AS queued_task_count/u,
+  );
+  assert.doesNotMatch(workload, /'interrupted'|'needs_action'/u);
+  assert.match(workload, /assigned\.status = ANY\(\$2::text\[\]\)/u);
   assert.match(
     overview,
-    /AS active_task_count[\s\S]*assigned\.status IN \([\s\S]*'interrupted'[\s\S]*'needs_action'/u,
+    /req\.tenantId, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES/u,
+  );
+  assert.match(
+    workload,
+    /assigned\.task_type NOT IN \([\s\S]*'capture_orchestration', 'unattended_plan_configuration', 'sync'[\s\S]*RIGHT\(assigned\.task_type, 5\) <> '_sync'/u,
   );
 });
 
@@ -1008,8 +1027,9 @@ test("overview reports child-inclusive agent load but root-only task summary", (
   );
   assert.match(
     overview,
-    /assigned\.status IN \([\s\S]*'claimed', 'running', 'recovering', 'interrupted',[\s\S]*'needs_action', 'resume_requested'/u,
+    /assigned\.status = ANY\(\$2::text\[\]\)/u,
   );
+  assert.match(overview, /assigned\.task_type NOT IN/u);
   assert.ok(
     [...overview.matchAll(/AND t\.parent_task_id IS NULL/gu)].length >= 2,
   );
@@ -1130,6 +1150,99 @@ test("a newer unattended plan fences older active plan commands after idempotenc
     /SET status = 'superseded'[\s\S]*task_type = 'unattended_plan_configuration'[\s\S]*status IN \('pending', 'claimed'\)/u,
   );
   assert.match(createRoute, /eventType: 'plan_configuration_superseded'/u);
+});
+
+test("a successful plan command supersedes only older needs-action configurations", async () => {
+  const statements = [];
+  await supersedeStalePlanConfigurationAttention({
+    async queryAll(sql, params) {
+      statements.push({kind: "update", sql, params});
+      return [{id: "11111111-1111-4111-8111-111111111111"}];
+    },
+    async execute(sql, params) {
+      statements.push({kind: "event", sql, params});
+    },
+  }, {
+    tenantId: "tenant-id",
+    agentId: "22222222-2222-4222-8222-222222222222",
+    supersededByTaskId: "33333333-3333-4333-8333-333333333333",
+    supersededByCreatedAt: "2026-08-03T02:19:17.694Z",
+    actorType: "capture_agent",
+    actorId: "22222222-2222-4222-8222-222222222222",
+    actorName: "Surface-Chrome",
+    taskMessage: "已被成功删除无人值守计划的指令替代",
+    eventMessage: "设备已成功删除计划，较早失败的计划配置已封存",
+  });
+  assert.equal(statements.length, 2);
+  assert.equal(statements[0].kind, "update");
+  assert.deepEqual(statements[0].params, [
+    "tenant-id",
+    "22222222-2222-4222-8222-222222222222",
+    "33333333-3333-4333-8333-333333333333",
+    "2026-08-03T02:19:17.694Z",
+    "已被成功删除无人值守计划的指令替代",
+  ]);
+  assert.match(statements[0].sql, /message = \$5/u);
+  assert.doesNotMatch(statements[0].sql, /error\s*=/u);
+  assert.equal(statements[1].kind, "event");
+  assert.equal(statements[1].params[1], "11111111-1111-4111-8111-111111111111");
+  assert.equal(statements[1].params[4], "plan_configuration_superseded");
+  assert.equal(statements[1].params[5], "capture_agent");
+  assert.equal(statements[1].params[8], "superseded");
+  assert.equal(
+    JSON.parse(statements[1].params[10]).supersededByTaskId,
+    "33333333-3333-4333-8333-333333333333",
+  );
+
+  const helperStart = captureCloudRouteSource.indexOf(
+    "export async function supersedeStalePlanConfigurationAttention",
+  );
+  const helperEnd = captureCloudRouteSource.indexOf(
+    "async function expireStaleCommands",
+    helperStart,
+  );
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helper = captureCloudRouteSource.slice(helperStart, helperEnd);
+  assert.match(helper, /SET status = 'superseded'/u);
+  assert.match(
+    helper,
+    /task_type = 'unattended_plan_configuration'[\s\S]*status = 'needs_action'/u,
+  );
+  assert.match(
+    helper,
+    /created_at < \$4::timestamptz[\s\S]*created_at = \$4::timestamptz AND id < \$3::uuid/u,
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  const completionEvent = completion.indexOf("await appendEvent(tx");
+  const staleSettlement = completion.indexOf(
+    "await supersedeStalePlanConfigurationAttention(tx",
+  );
+  assert.ok(staleSettlement > completionEvent);
+  assert.match(
+    completion.slice(completionEvent, staleSettlement + 500),
+    /success &&[\s\S]*updatedTask &&[\s\S]*command\.command_type === 'create'[\s\S]*createExecutionMode === 'unattended_plan'[\s\S]*lockedTask\.task_type === 'unattended_plan_configuration'/u,
+  );
+
+  const saveRoute = readRouteSection(
+    "router.post('/agents/:id/tasks'",
+    "router.post('/tasks/:id/resume'",
+  );
+  const deleteRoute = readRouteSection(
+    "router.delete('/agents/:id/unattended-plan'",
+    "router.post('/tasks/:id/dismiss-attention'",
+  );
+  assert.doesNotMatch(
+    saveRoute,
+    /await supersedeStalePlanConfigurationAttention\(tx/gu,
+  );
+  assert.doesNotMatch(
+    deleteRoute,
+    /await supersedeStalePlanConfigurationAttention\(tx/gu,
+  );
 });
 
 test("plan configuration bypasses capture queue blockers and late receipts stay fenced", () => {
