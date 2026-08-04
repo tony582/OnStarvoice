@@ -6,7 +6,7 @@ import {
   User, FileText, Bell, ExternalLink,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
 } from 'lucide-react'
-import { api } from '@/lib/api'
+import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -35,6 +35,9 @@ interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
   customTags?: unknown
   custom_tags?: unknown
+  record?: unknown
+}
+interface ManualFieldsMutationResponse {
   record?: unknown
 }
 type SortField = 'publish' | 'interactions' | 'comments' | 'likes' | 'first_seen' | 'last_seen'
@@ -73,6 +76,40 @@ function contentAvailabilityLabel(record: Record<string, unknown>) {
   if (status === 'deleted') return '原帖已删除'
   if (status === 'page_unavailable') return '已删除或不可访问'
   return ''
+}
+
+function responseRecord(data?: ManualFieldsMutationResponse): Record<string, unknown> | null {
+  return data?.record && typeof data.record === 'object' && !Array.isArray(data.record)
+    ? data.record as Record<string, unknown>
+    : null
+}
+
+function manualFieldsMatch(record: Record<string, unknown>, fields: ManualRecordFields) {
+  return (fields.sentiment === undefined || String(record.sentiment || '') === fields.sentiment)
+    && (fields.category === undefined || String(record.category || '') === fields.category)
+    && (fields.identityOverride === undefined || String(record.identity_override || '') === fields.identityOverride)
+    && (fields.publishTime === undefined || String(record.publish_time || '') === fields.publishTime)
+}
+
+function localManualFieldsPatch(
+  fields: ManualRecordFields,
+  savedRecord: Record<string, unknown> | null,
+) {
+  const patch: Record<string, unknown> = {}
+  if (fields.sentiment !== undefined) patch.sentiment = fields.sentiment
+  if (fields.category !== undefined) patch.category = fields.category
+  if (fields.identityOverride !== undefined) patch.identity_override = fields.identityOverride
+  if (fields.publishTime !== undefined) {
+    patch.publish_time = fields.publishTime
+    patch.publish_display = fields.publishTime
+  }
+  return { ...patch, ...(savedRecord || {}) }
+}
+
+async function verifyManualFieldsSaved(recordId: string, fields: ManualRecordFields) {
+  const data = await api.get<ManualFieldsMutationResponse>(`/records/${recordId}/manual-fields`)
+  const record = responseRecord(data)
+  return record && manualFieldsMatch(record, fields) ? record : null
 }
 
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
@@ -211,9 +248,43 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const updateManualFields = async (recordId: string, fields: ManualRecordFields): Promise<boolean> => {
     if (archiveView === 'archived') return false
-    await api.patch('/records/' + recordId + '/manual-fields', fields)
-    await reloadAfterMutation()
+    let data: ManualFieldsMutationResponse
+    try {
+      data = await api.patch<ManualFieldsMutationResponse>('/records/' + recordId + '/manual-fields', fields)
+    } catch (error) {
+      if (!isApiNetworkError(error)) throw error
+      const verified = await verifyManualFieldsSaved(recordId, fields).catch(() => null)
+      if (!verified) {
+        const verificationError = new Error(
+          '网络连接中断，暂时无法确认是否保存；请刷新页面核对后再操作，避免重复提交。',
+        ) as Error & { cause?: unknown }
+        verificationError.cause = error
+        throw verificationError
+      }
+      console.warn('保存响应中断，已通过当前记录状态确认修改成功')
+      data = { record: verified }
+    }
+
+    const savedRecord = responseRecord(data)
+    const patch = localManualFieldsPatch(fields, savedRecord)
+    const savedSentiment = savedRecord && Object.prototype.hasOwnProperty.call(savedRecord, 'sentiment')
+      ? String(savedRecord.sentiment || '')
+      : fields.sentiment
+    const leavesCurrentSentiment = Boolean(sentiment && savedSentiment !== undefined && savedSentiment !== sentiment)
+    setRecords(current => current.flatMap(record => {
+      if (record.id !== recordId) return [record]
+      return leavesCurrentSentiment ? [] : [{ ...record, ...patch }]
+    }))
+    if (leavesCurrentSentiment) {
+      setPagination(current => {
+        if (!current) return current
+        const total = Math.max(0, current.total - 1)
+        return { ...current, total, totalPages: Math.ceil(total / pageSize) }
+      })
+    }
     setDrawerRecord(null)
+    // 数据已保存即返回成功；列表与角标刷新是尽力而为，不能反向把成功写入误报成失败。
+    void reloadAfterMutation().catch(error => console.warn('保存后的列表刷新失败', error))
     return true
   }
 

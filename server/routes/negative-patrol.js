@@ -249,6 +249,18 @@ export function normalizeNegativePatrolFilter(body = {}) {
   };
 }
 
+function xiaohongshuNoteIdFromPathname(pathname) {
+  const directNoteMatch = String(pathname || '').match(
+    /\/(?:explore|discovery\/item|note|video|search_result)\/([a-z0-9_-]+)(?:\/|$)/iu,
+  );
+  if (directNoteMatch?.[1]) return directNoteMatch[1];
+
+  const profileNoteMatch = String(pathname || '').match(
+    /\/user\/profile\/[a-z0-9_-]+\/([a-z0-9_-]+)(?:\/|$)/iu,
+  );
+  return profileNoteMatch?.[1] || '';
+}
+
 function validPlatformUrl(platform, rawUrl, externalId) {
   if (!rawUrl) return '';
   try {
@@ -256,13 +268,13 @@ function validPlatformUrl(platform, rawUrl, externalId) {
     const hostname = parsed.hostname.toLowerCase();
     const pathname = parsed.pathname;
     if (platform === 'xiaohongshu') {
+      const noteId = xiaohongshuNoteIdFromPathname(pathname);
       if (
         !(
           hostname === 'xiaohongshu.com' ||
           hostname.endsWith('.xiaohongshu.com')
         ) ||
-        !/\/(?:explore|discovery\/item)\//u.test(pathname) ||
-        !pathname.includes(externalId)
+        noteId !== externalId
       ) {
         return '';
       }

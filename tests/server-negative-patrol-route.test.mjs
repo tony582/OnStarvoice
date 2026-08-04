@@ -110,6 +110,60 @@ test('target URLs are bound to the selected platform and record identity', () =>
   );
 });
 
+test('xiaohongshu target URLs preserve supported note paths and access context', () => {
+  const externalId = '6a66eea9000000000f00a1ad';
+  const sourceUrls = [
+    `https://www.xiaohongshu.com/explore/${externalId}?xsec_token=token&xsec_source=pc_search`,
+    `https://www.xiaohongshu.com/discovery/item/${externalId}?xsec_token=token&xsec_source=pc_search`,
+    `https://www.xiaohongshu.com/note/${externalId}?xsec_token=token&xsec_source=pc_search`,
+    `https://www.xiaohongshu.com/video/${externalId}?xsec_token=token&xsec_source=pc_search`,
+    `https://www.xiaohongshu.com/search_result/${externalId}?xsec_token=token&xsec_source=pc_search`,
+    `https://www.xiaohongshu.com/user/profile/63da61fe000000002702ba15/${externalId}?xsec_token=token&xsec_source=pc_user`,
+  ];
+
+  for (const url of sourceUrls) {
+    assert.equal(
+      negativePatrolTargetUrl({
+        platform: 'xiaohongshu',
+        external_id: externalId,
+        url,
+      }),
+      url,
+    );
+  }
+
+  assert.equal(
+    negativePatrolTargetUrl({
+      platform: 'xiaohongshu',
+      external_id: externalId,
+      url: `https://www.xiaohongshu.com/search_result/${externalId}?xsec_token=token`,
+    }),
+    `https://www.xiaohongshu.com/search_result/${externalId}?xsec_token=token&xsec_source=pc_search`,
+  );
+});
+
+test('xiaohongshu profile URLs must bind the record id to the note segment', () => {
+  const externalId = '6a66eea9000000000f00a1ad';
+  const fallbackUrl = `https://www.xiaohongshu.com/explore/${externalId}`;
+
+  assert.equal(
+    negativePatrolTargetUrl({
+      platform: 'xiaohongshu',
+      external_id: externalId,
+      url: `https://www.xiaohongshu.com/user/profile/${externalId}/different-note?xsec_token=token&xsec_source=pc_user`,
+    }),
+    fallbackUrl,
+  );
+  assert.equal(
+    negativePatrolTargetUrl({
+      platform: 'xiaohongshu',
+      external_id: externalId,
+      url: `https://www.xiaohongshu.com/user/profile/${externalId}?xsec_token=token&xsec_source=pc_user`,
+    }),
+    fallbackUrl,
+  );
+});
+
 test('preview and create are tenant-writer routes with identical candidate SQL', () => {
   for (const marker of [
     "'/negative-patrol/candidates/preview'",

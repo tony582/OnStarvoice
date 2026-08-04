@@ -10,6 +10,7 @@ import {
   normalizeReviewStatus,
 } from "../server/services/record-feedback.js";
 import {
+  manualFieldsRecordResponse,
   publishTimestampFromDate,
   validateManualFields,
 } from "../server/routes/records.js";
@@ -75,6 +76,33 @@ test("manual publish dates are normalized to Shanghai midnight", () => {
     "2026-07-02T16:00:00.000Z",
   );
   assert.equal(publishTimestampFromDate(""), null);
+});
+
+test("manual field mutations return a lightweight record projection", () => {
+  const record = manualFieldsRecordResponse({
+    id: "record-1",
+    sentiment: "neutral",
+    category: "renewal_billing",
+    identity_override: "koe",
+    publish_time: "2026-08-03",
+    published_ts: "2026-08-02T16:00:00.000Z",
+    created_at: "2026-08-03T08:00:00.000Z",
+    manual_updated_name: "复核人员",
+    manual_updated_at: "2026-08-04T05:15:00.851Z",
+    updated_at: "2026-08-04T05:15:00.851Z",
+    payload: {raw: "x".repeat(80_000)},
+    ai_result: {summary: "y".repeat(20_000)},
+    image_urls: ["https://example.com/large-image"],
+    manual_overrides: {sentiment: {reason: "large internal metadata"}},
+  });
+
+  assert.equal(record.sentiment, "neutral");
+  assert.equal(record.publish_display, "2026-08-03");
+  assert.equal(Object.hasOwn(record, "payload"), false);
+  assert.equal(Object.hasOwn(record, "ai_result"), false);
+  assert.equal(Object.hasOwn(record, "image_urls"), false);
+  assert.equal(Object.hasOwn(record, "manual_overrides"), false);
+  assert.ok(Buffer.byteLength(JSON.stringify({ok: true, record})) < 1_024);
 });
 
 test("feedback review statuses cover the human review lifecycle", () => {
@@ -163,7 +191,9 @@ test("backend contracts persist feedback and protect manual overrides", async ()
   assert.doesNotMatch(recordStore, /category\s*=/);
   assert.doesNotMatch(recordStore, /identity_override\s*=/);
   assert.match(recordsRoute, /router\.get\('\/:id\/manual-history'/);
+  assert.match(recordsRoute, /router\.get\('\/:id\/manual-fields'/);
   assert.match(recordsRoute, /feedback_type = 'manual_correction'/);
+  assert.match(recordsRoute, /record: manualFieldsRecordResponse\(result\.record\)/);
   assert.match(recordsRoute, /router\.get\('\/:id\/activity'/);
   assert.match(drawer, /\/activity/);
   assert.match(workspace, /feedbackPending/);
@@ -178,7 +208,7 @@ test("backend contracts persist feedback and protect manual overrides", async ()
 });
 
 test("React admin exposes drawer-only reporting and a review queue", async () => {
-  const [triage, drawer, notePrompt, feedbackQueue, sidebar, workbench, mobile] =
+  const [triage, drawer, notePrompt, feedbackQueue, sidebar, workbench, mobile, apiClient] =
     await Promise.all([
       source("web/admin/src/pages/workbench/TriageQueue.tsx"),
       source("web/admin/src/components/shared/RecordDrawer.tsx"),
@@ -187,6 +217,7 @@ test("React admin exposes drawer-only reporting and a review queue", async () =>
       source("web/admin/src/components/layout/Sidebar.tsx"),
       source("web/admin/src/pages/WorkbenchPage.tsx"),
       source("web/admin/src/mobile/MobileApp.tsx"),
+      source("web/admin/src/lib/api.ts"),
     ]);
 
   assert.doesNotMatch(triage, /MenuBtn icon=\{Ban\}/);
@@ -217,6 +248,16 @@ test("React admin exposes drawer-only reporting and a review queue", async () =>
   assert.match(drawer, /data-record-detail-trigger/);
   assert.match(drawer, /loadedRecordId !== r\.id/);
   assert.match(triage, /data-record-detail-trigger/);
+  const manualUpdateAction = triage.slice(
+    triage.indexOf('const updateManualFields'),
+    triage.indexOf('const updateCustomTags'),
+  );
+  assert.match(manualUpdateAction, /isApiNetworkError/);
+  assert.match(manualUpdateAction, /verifyManualFieldsSaved/);
+  assert.match(manualUpdateAction, /void reloadAfterMutation\(\)/);
+  assert.doesNotMatch(manualUpdateAction, /await reloadAfterMutation\(\)/);
+  assert.match(apiClient, /class ApiNetworkError extends Error/);
+  assert.match(apiClient, /网络连接中断，请检查网络后重试/);
   assert.doesNotMatch(triage, /<RecordDrawer key=/);
   assert.match(notePrompt, /请填写原因后再确认/);
   assert.match(feedbackQueue, /仅作为内部记录，不会发送给 AI/);

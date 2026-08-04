@@ -4,6 +4,11 @@
 
 import { queryOne, queryAll, getSetting } from '../db/init.js';
 import {runWithTenantAiAdmission} from './ai-admission.js';
+import {
+  recordAiModelFailure,
+  recordAiModelSuccess,
+  resolveAiFailoverConfig,
+} from './ai-failover.js';
 import { parsePublishTimestamp } from './publish-date.js';
 import {
   formatMonitoringIntentForPrompt,
@@ -246,7 +251,7 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
     : parsed;
 }
 
-async function getLLMConfig(tenantId) {
+async function getBaseLLMConfig(tenantId) {
   const provider = ((await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini').toLowerCase();
   const apiKey = (await getSetting('llm_api_key', tenantId)) || process.env.LLM_API_KEY || '';
   const model = (await getSetting('llm_model', tenantId)) || process.env.LLM_MODEL || '';
@@ -259,6 +264,107 @@ async function getLLMConfig(tenantId) {
   };
   const d = defaults[provider] || defaults.gemini;
   return { provider, apiKey, model: model || d.model, endpoint: endpoint || d.endpoint };
+}
+
+async function getLLMConfig(tenantId) {
+  const baseConfig = await getBaseLLMConfig(tenantId);
+  return await resolveAiFailoverConfig(tenantId, baseConfig);
+}
+
+async function safeRecordAiFailure(tenantId, details) {
+  try {
+    return await recordAiModelFailure(tenantId, details);
+  } catch (failoverError) {
+    console.error('[AIFailover] failed to record model failure:', failoverError?.message || failoverError);
+    return {
+      switched: false,
+      retryModel: '',
+      retryRoute: '',
+      retryCurrent: false,
+    };
+  }
+}
+
+async function safeRecordAiSuccess(tenantId, details) {
+  try {
+    await recordAiModelSuccess(tenantId, details);
+  } catch (failoverError) {
+    // Health bookkeeping must never turn a successful model response into a
+    // failed business request.
+    console.error('[AIFailover] failed to record model success:', failoverError?.message || failoverError);
+  }
+}
+
+async function runModelOperationWithFailover(
+  tenantId,
+  initialConfig,
+  operation,
+  admissionOptions = {},
+) {
+  let activeConfig = initialConfig;
+  let failureRecorded = false;
+  try {
+    const data = await runWithTenantAiAdmission(
+      tenantId,
+      async () => {
+        try {
+          return await operation(activeConfig);
+        } catch (error) {
+          const decision = await safeRecordAiFailure(tenantId, {
+            config: activeConfig,
+            error,
+            kind: admissionOptions.kind || 'llm',
+          });
+          failureRecorded = true;
+          if (
+            decision.retryCurrent &&
+            decision.retryModel &&
+            decision.retryModel !== activeConfig.model
+          ) {
+            activeConfig = {
+              ...activeConfig,
+              model: decision.retryModel,
+              failover: {
+                ...(activeConfig.failover || {}),
+                enabled: true,
+                route: decision.retryRoute || activeConfig.failover?.route || 'backup',
+              },
+            };
+            console.warn('[AIFailover] retrying current request on active backup', {
+              tenantId,
+              kind: admissionOptions.kind || 'llm',
+              model: activeConfig.model,
+            });
+            try {
+              return await operation(activeConfig);
+            } catch (backupError) {
+              await safeRecordAiFailure(tenantId, {
+                config: activeConfig,
+                error: backupError,
+                kind: admissionOptions.kind || 'llm',
+              });
+              failureRecorded = true;
+              throw backupError;
+            }
+          }
+          throw error;
+        }
+      },
+      admissionOptions,
+    );
+    await safeRecordAiSuccess(tenantId, {config: activeConfig});
+    return {data, config: activeConfig};
+  } catch (error) {
+    // Admission queue failures happen before the operation callback runs.
+    if (!failureRecorded) {
+      await safeRecordAiFailure(tenantId, {
+        config: activeConfig,
+        error,
+        kind: admissionOptions.kind || 'llm',
+      });
+    }
+    throw error;
+  }
 }
 
 /**
@@ -282,17 +388,19 @@ export async function getDeepSeekConfig(tenantId) {
     apiKey: config.apiKey,
     model: config.model || 'deepseek-chat',
     endpoint: String(config.endpoint || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
+    failover: config.failover,
   };
 }
 
 export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
   const config = await getDeepSeekConfig(tenantId);
-  const data = await runWithTenantAiAdmission(
+  const outcome = await runModelOperationWithFailover(
     tenantId,
-    () => callOpenAICompatible(
-      config.apiKey,
-      config.model,
-      config.endpoint,
+    config,
+    currentConfig => callOpenAICompatible(
+      currentConfig.apiKey,
+      currentConfig.model,
+      currentConfig.endpoint,
       systemPrompt,
       userMessage,
       {
@@ -307,11 +415,12 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
       queueTimeoutMs: options.queueTimeoutMs,
     },
   );
+  const data = outcome.data;
   if (options.returnMetadata) {
     return {
       data: data.data,
-      provider: config.provider,
-      model: config.model,
+      provider: outcome.config.provider,
+      model: outcome.config.model,
       finishReason: data.finishReason,
       responseLength: data.responseLength,
       promptTokens: data.promptTokens,
@@ -328,14 +437,15 @@ async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
   const brand = await getBrandContext(tenantId);
   const intent = resolveMonitoringIntent(keyword, { brand });
   const systemPrompt = buildSystemPrompt(brand, intent);
-  const result = await runWithTenantAiAdmission(
+  const outcome = await runModelOperationWithFailover(
     tenantId,
-    () => config.provider === 'gemini'
-      ? callGemini(config.apiKey, config.model, systemPrompt, userMessage)
+    config,
+    currentConfig => currentConfig.provider === 'gemini'
+      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
       : callOpenAICompatible(
-        config.apiKey,
-        config.model,
-        config.endpoint,
+        currentConfig.apiKey,
+        currentConfig.model,
+        currentConfig.endpoint,
         systemPrompt,
         userMessage,
       ),
@@ -345,20 +455,26 @@ async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
       queueTimeoutMs: options.queueTimeoutMs,
     },
   );
-  return { result, intent, provider: config.provider, model: config.model };
+  return {
+    result: outcome.data,
+    intent,
+    provider: outcome.config.provider,
+    model: outcome.config.model,
+  };
 }
 
 export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
   const config = await getLLMConfig(tenantId);
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
-  return await runWithTenantAiAdmission(
+  const outcome = await runModelOperationWithFailover(
     tenantId,
-    () => config.provider === 'gemini'
-      ? callGemini(config.apiKey, config.model, systemPrompt, userMessage)
+    config,
+    currentConfig => currentConfig.provider === 'gemini'
+      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
       : callOpenAICompatible(
-        config.apiKey,
-        config.model,
-        config.endpoint,
+        currentConfig.apiKey,
+        currentConfig.model,
+        currentConfig.endpoint,
         systemPrompt,
         userMessage,
         options,
@@ -369,6 +485,31 @@ export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage, opt
       queueTimeoutMs: options.queueTimeoutMs,
     },
   );
+  return outcome.data;
+}
+
+export async function probeDeepSeekPrimaryModel({tenantId, model}) {
+  const config = await getBaseLLMConfig(tenantId);
+  if (config.provider !== 'deepseek' || !config.apiKey || !String(model || '').trim()) {
+    return false;
+  }
+  const result = await runWithTenantAiAdmission(
+    tenantId,
+    () => callOpenAICompatible(
+      config.apiKey,
+      String(model).trim(),
+      String(config.endpoint || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
+      'You are a health probe. Return only a JSON object.',
+      'Return exactly {"ok":true}.',
+      {timeoutMs: 10000, maxTokens: 256},
+    ),
+    {
+      priority: 'background',
+      kind: 'ai_failover_probe',
+      queueTimeoutMs: 15000,
+    },
+  );
+  return result?.ok === true;
 }
 
 function normalizeRelevance(value) {

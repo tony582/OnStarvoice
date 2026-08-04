@@ -8,6 +8,21 @@ type ApiCallOptions = {
   timeoutMs?: number
 }
 
+export class ApiNetworkError extends Error {
+  readonly code = 'network_error'
+  readonly originalError?: unknown
+
+  constructor(message = '网络连接中断，请检查网络后重试', originalError?: unknown) {
+    super(message)
+    this.name = 'ApiNetworkError'
+    this.originalError = originalError
+  }
+}
+
+export function isApiNetworkError(error: unknown): error is ApiNetworkError {
+  return error instanceof ApiNetworkError
+}
+
 function responseMessage(data: unknown, fallback: string) {
   if (!data || typeof data !== 'object') return fallback
   const response = data as { message?: unknown; error?: unknown }
@@ -64,7 +79,7 @@ class ApiClient {
         timeoutError.cause = error
         throw timeoutError
       }
-      throw error
+      throw new ApiNetworkError(undefined, error)
     } finally {
       if (timeoutId !== null) window.clearTimeout(timeoutId)
     }

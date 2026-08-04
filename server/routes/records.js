@@ -104,6 +104,24 @@ export function publishTimestampFromDate(value) {
   return date ? new Date(`${date}T00:00:00+08:00`).toISOString() : null;
 }
 
+// 人工判断保存只回传页面需要的轻量字段。records.payload / ai_result / 图片等字段
+// 可能达到数十 KB，写入已经提交后若大响应在客户端中断，会让页面误以为保存失败。
+export function manualFieldsRecordResponse(record = {}) {
+  return {
+    id: record.id || null,
+    sentiment: String(record.sentiment || ''),
+    category: String(record.category || ''),
+    identity_override: String(record.identity_override || ''),
+    publish_time: String(record.publish_time || ''),
+    published_ts: record.published_ts || null,
+    publish_display: formatPublishDate(record.publish_time, record.created_at),
+    manual_updated_by: record.manual_updated_by || null,
+    manual_updated_name: String(record.manual_updated_name || ''),
+    manual_updated_at: record.manual_updated_at || null,
+    updated_at: record.updated_at || null,
+  };
+}
+
 const RECORD_TABLE_TYPES = {
   single_notes: ['single_note', ''],
   keyword_notes: ['keyword_notes', 'keyword'],
@@ -352,6 +370,26 @@ router.get('/:id/manual-history', requireTenantAccess, requireSessionUser, async
       LIMIT 100
     `, [req.params.id, req.tenantId]);
     return res.json({ ok: true, history });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 保存响应途中断线时，前端用当前轻量状态确认事务是否已经提交，避免重复修改。
+router.get('/:id/manual-fields', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    const record = await queryOne(`
+      SELECT
+        id, sentiment, category, identity_override,
+        publish_time, published_ts, created_at,
+        manual_updated_by, manual_updated_name, manual_updated_at, updated_at
+      FROM records
+      WHERE id = $1 AND tenant_id = $2
+    `, [req.params.id, req.tenantId]);
+    if (!record) {
+      return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    }
+    return res.json({ ok: true, record: manualFieldsRecordResponse(record) });
   } catch (err) {
     return next(err);
   }
@@ -657,8 +695,11 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
 
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     if (result.archived) return sendRecordArchived(res, [req.params.id]);
-    result.record.publish_display = formatPublishDate(result.record.publish_time, result.record.created_at);
-    return res.json({ ok: true, ...result });
+    return res.json({
+      ok: true,
+      ...result,
+      record: manualFieldsRecordResponse(result.record),
+    });
   } catch (err) {
     return next(err);
   }

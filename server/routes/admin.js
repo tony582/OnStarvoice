@@ -3,6 +3,10 @@ import { queryAll, queryOne, execute, withTransaction, getAllSettings, setSettin
 import { requireAdmin, requirePlatformAdmin } from '../middleware/auth.js';
 import { serializeRecords } from '../services/record-store.js';
 import { hashPassword, normalizeEmail } from '../services/auth-service.js';
+import {
+  getAiFailoverStatus,
+  normalizeAiFailoverPolicy,
+} from '../services/ai-failover.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
@@ -626,10 +630,17 @@ router.get('/settings', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || await getDefaultTenantId();
     const settings = await getAllSettings(tenantId);
+    const aiFailoverStatus = await getAiFailoverStatus(tenantId);
     const masked = { ...settings };
     if (masked.llm_api_key) masked.llm_api_key = masked.llm_api_key.slice(0, 8) + '***';
     if (masked.smtp_pass) masked.smtp_pass = '***';
-    return res.json({ ok: true, settings: masked, raw: settings, tenantId });
+    return res.json({
+      ok: true,
+      settings: masked,
+      raw: settings,
+      tenantId,
+      aiFailoverStatus,
+    });
   } catch (err) {
     return next(err);
   }
@@ -640,7 +651,56 @@ router.put('/settings', async (req, res, next) => {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body.tenantId || await getDefaultTenantId();
     const { tenantId: _tenantId, ...settings } = req.body || {};
     if (settings.smtp_pass === '***') delete settings.smtp_pass;
-    await setSettings(settings, tenantId);
+    const failoverKeys = Object.keys(settings).filter(key =>
+      key.startsWith('llm_failover_'));
+    if (failoverKeys.length > 0) {
+      const current = await getAllSettings(tenantId);
+      const merged = {...current, ...settings};
+      const policy = normalizeAiFailoverPolicy(merged, {
+        provider: merged.llm_provider || process.env.LLM_PROVIDER || 'gemini',
+        model: merged.llm_model || process.env.LLM_MODEL || '',
+      });
+      if (policy.requested && !policy.enabled) {
+        return res.status(400).json({
+          ok: false,
+          error: 'invalid_ai_failover_config',
+          message: policy.disabledReason === 'provider_not_deepseek'
+            ? '自动备用切换目前只支持 DeepSeek 提供商'
+            : '主模型和备用模型必须填写且不能相同',
+        });
+      }
+    }
+    if (failoverKeys.length > 0) {
+      const safeValues = Object.fromEntries(
+        failoverKeys.map(key => [key, String(settings[key] ?? '')]),
+      );
+      await withTransaction(async tx => {
+        for (const [key, value] of Object.entries(settings)) {
+          await tx.execute(
+            `INSERT INTO tenant_settings (tenant_id, key, value, updated_at)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (tenant_id, key)
+             DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+            [tenantId, key, String(value ?? '')],
+          );
+        }
+        await tx.execute(
+          `INSERT INTO audit_logs (
+             tenant_id, actor_type, actor_id, actor_user_id,
+             action, target_type, target_id, metadata
+           ) VALUES (
+             $1, 'user', $2, $2::uuid,
+             'ai.failover_settings_updated', 'tenant', $1::uuid::text, $3::jsonb
+           )`,
+          [tenantId, String(req.user.id), JSON.stringify({
+            keys: failoverKeys,
+            values: safeValues,
+          })],
+        );
+      });
+    } else {
+      await setSettings(settings, tenantId);
+    }
     return res.json({ ok: true });
   } catch (err) {
     return next(err);

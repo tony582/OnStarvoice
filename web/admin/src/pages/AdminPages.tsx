@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useState } from 'react'
 import { Loader2, Building2, Users, KeyRound, Save, Pencil } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatExpiry, LABELS } from '@/lib/utils'
@@ -577,23 +577,46 @@ export function AuthCodesPage() {
 }
 
 /* ==================== SettingsPage ==================== */
+type AiFailoverStatus = {
+  route?: 'primary' | 'backup' | 'configured'
+  effectiveModel?: string
+  consecutiveFailures?: number
+  lastFailureAt?: string
+  lastFailureCode?: string
+  nextPrimaryProbeAt?: string
+}
+
 export function SettingsPage() {
   const [settings, setSettings] = useState<Record<string, string>>({})
+  const [aiFailoverStatus, setAiFailoverStatus] = useState<AiFailoverStatus | null>(null)
   const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
-    Promise.all([
+  const loadSettings = useCallback(() => Promise.all([
       api.get<any>('/admin/settings'),
       api.get<any>('/admin/official-accounts'),
     ]).then(([sData]) => {
       setSettings(sData.settings || {})
-    }).finally(() => setLoading(false))
-  }, [])
+      setAiFailoverStatus(sData.aiFailoverStatus || null)
+    }), [])
+
+  useEffect(() => {
+    loadSettings().finally(() => setLoading(false))
+  }, [loadSettings])
 
   const save = async (group: string) => {
     const body: any = {}
     if (group === 'llm') {
       body.llm_provider = settings.llm_provider; body.llm_model = settings.llm_model
+      for (const key of [
+        'llm_failover_enabled',
+        'llm_failover_primary_model',
+        'llm_failover_backup_model',
+        'llm_failover_failure_threshold',
+        'llm_failover_window_seconds',
+        'llm_failover_pending_threshold',
+        'llm_failover_recovery_probe_seconds',
+        'llm_failover_recovery_success_threshold',
+      ]) body[key] = settings[key] || ''
       const key = settings._llm_api_key; if (key) body.llm_api_key = key
     } else if (group === 'brand') {
       for (const k of ['brand_name', 'brand_aliases', 'brand_business_context', 'brand_relevance_terms', 'brand_noise_terms']) body[k] = settings[k] || ''
@@ -613,6 +636,7 @@ export function SettingsPage() {
       for (const k of ['report_daily_time', 'report_weekly_time', 'report_monthly_day', 'report_monthly_time']) body[k] = settings[k]
     }
     await api.put('/admin/settings', body)
+    if (group === 'llm') await loadSettings()
     alert('保存成功')
   }
 
@@ -622,11 +646,49 @@ export function SettingsPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
-      <SettingsCard title="AI 模型" description="配置舆情分析所使用的模型服务。" onSave={() => save('llm')}>
+      <SettingsCard title="AI 模型" description="配置舆情分析模型，并在主模型拥堵时自动切到备用模型。" onSave={() => save('llm')}>
         <div className="grid gap-3 lg:grid-cols-2">
           <Field label="提供商"><Input value={settings.llm_provider || ''} onChange={e => u('llm_provider', e.target.value)} /></Field>
-          <Field label="模型"><Input value={settings.llm_model || ''} onChange={e => u('llm_model', e.target.value)} /></Field>
+          <Field label="当前手工模型"><Input value={settings.llm_model || ''} onChange={e => u('llm_model', e.target.value)} /></Field>
           <Field label="API Key" full><Input type="password" value={settings._llm_api_key || ''} onChange={e => u('_llm_api_key', e.target.value)} placeholder="留空不修改" /></Field>
+          <label className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3 lg:col-span-2">
+            <input
+              type="checkbox"
+              checked={settings.llm_failover_enabled === 'true'}
+              onChange={event => u('llm_failover_enabled', event.target.checked ? 'true' : 'false')}
+              className="mt-0.5 h-4 w-4 accent-primary"
+            />
+            <span>
+              <span className="block text-sm font-semibold">自动备用切换</span>
+              <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                连续出现上游 503、超时或排队失败，并确认存在待处理任务后切到备用模型；主模型连续探测恢复后自动切回。
+              </span>
+            </span>
+          </label>
+          <Field label="主模型"><Input value={settings.llm_failover_primary_model || ''} onChange={e => u('llm_failover_primary_model', e.target.value)} placeholder="deepseek-v4-flash" /></Field>
+          <Field label="备用模型"><Input value={settings.llm_failover_backup_model || ''} onChange={e => u('llm_failover_backup_model', e.target.value)} placeholder="deepseek-v4-pro" /></Field>
+          <Field label="连续失败阈值"><Input type="number" min="2" max="20" value={settings.llm_failover_failure_threshold || '3'} onChange={e => u('llm_failover_failure_threshold', e.target.value)} /></Field>
+          <Field label="失败统计窗口（秒）"><Input type="number" min="30" max="900" value={settings.llm_failover_window_seconds || '120'} onChange={e => u('llm_failover_window_seconds', e.target.value)} /></Field>
+          <Field label="待处理数量阈值"><Input type="number" min="1" max="10000" value={settings.llm_failover_pending_threshold || '1'} onChange={e => u('llm_failover_pending_threshold', e.target.value)} /></Field>
+          <Field label="主模型探测间隔（秒）"><Input type="number" min="60" max="3600" value={settings.llm_failover_recovery_probe_seconds || '300'} onChange={e => u('llm_failover_recovery_probe_seconds', e.target.value)} /></Field>
+          <Field label="恢复所需连续成功"><Input type="number" min="2" max="10" value={settings.llm_failover_recovery_success_threshold || '2'} onChange={e => u('llm_failover_recovery_success_threshold', e.target.value)} /></Field>
+          <div className="rounded-lg border border-border bg-card p-3 text-xs leading-5 lg:col-span-2">
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span className="font-semibold text-foreground">
+                当前线路：{aiFailoverStatus?.route === 'backup' ? '备用模型' : aiFailoverStatus?.route === 'primary' ? '主模型' : '手工配置'}
+              </span>
+              <span>生效模型：{aiFailoverStatus?.effectiveModel || settings.llm_model || '未配置'}</span>
+              <span>连续失败：{aiFailoverStatus?.consecutiveFailures || 0}</span>
+            </div>
+            <div className="mt-1 text-muted-foreground">
+              {aiFailoverStatus?.lastFailureAt
+                ? `最近失败：${formatDate(aiFailoverStatus.lastFailureAt)} · ${aiFailoverStatus.lastFailureCode || '未知错误'}`
+                : '最近失败：无'}
+              {aiFailoverStatus?.nextPrimaryProbeAt
+                ? `；下次主模型探测：${formatDate(aiFailoverStatus.nextPrimaryProbeAt)}`
+                : ''}
+            </div>
+          </div>
         </div>
       </SettingsCard>
 

@@ -11,7 +11,11 @@ import { dirname, join } from 'path';
 import { initDb, closeDb } from './db/init.js';
 import { startCronJobs } from './cron.js';
 import { sendTestEmail } from './services/email-notifier.js';
-import { labelPendingRecords } from './services/ai-labeler.js';
+import {
+  labelPendingRecords,
+  probeDeepSeekPrimaryModel,
+} from './services/ai-labeler.js';
+import {runAiFailoverRecoverySweep} from './services/ai-failover.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
 import { failStaleAnalyses } from './services/opinion-analysis.js';
 import { requireAdmin } from './middleware/auth.js';
@@ -278,6 +282,25 @@ async function start() {
     }
   };
   setTimeout(drainCommentAi, 20000); // 启动 20s 后开始(让 15s 的 reprocess 先把评论入库)
+
+  // AI 主模型恢复探测:只有已切到备用模型且到达 next_primary_probe_at 的
+  // 租户才会发送一条不含业务数据的最小 JSON 探针。连续通过配置次数后自动回主模型。
+  // 自调度且不重叠;数据库 claim + advisory lock 也避免未来多进程重复探测。
+  const checkAiFailoverRecovery = async () => {
+    try {
+      const result = await runAiFailoverRecoverySweep({
+        probe: probeDeepSeekPrimaryModel,
+      });
+      if (result.probed || result.recovered) {
+        console.info('[AIFailover] recovery sweep', result);
+      }
+    } catch (error) {
+      console.error('[AIFailover] recovery sweep failed:', error?.message || error);
+    } finally {
+      setTimeout(checkAiFailoverRecovery, 60000);
+    }
+  };
+  setTimeout(checkAiFailoverRecovery, 60000);
 
   // 一次性:上汽通用监控范围放宽(别克/凯迪拉克/雪佛兰/车机壁纸等现算相关)后,
   // 把存量"原判 irrelevant"的记录重判一遍 —— 该进分诊的自动进,无需重采。gated 只跑一次。
