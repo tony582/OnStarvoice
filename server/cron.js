@@ -9,7 +9,10 @@ import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
-import {reconcilePendingCaptureCommands} from './routes/capture-cloud.js';
+import {
+  reconcileAutomaticCaptureRetries,
+  reconcilePendingCaptureCommands,
+} from './routes/capture-cloud.js';
 
 function shanghaiNowParts() {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -103,8 +106,16 @@ export function startCronJobs() {
           `[Cron] Multi-Agent schedules: ${created} run(s) created, ${skipped} occurrence(s) advanced`,
         );
       }
+      const recovery = await reconcileAutomaticCaptureRetries(10);
+      if (recovery.dispatched > 0 || recovery.failed > 0) {
+        console.log(
+          `[Cron] Capture auto-dispatch: ${recovery.dispatched} dispatched, ` +
+          `${recovery.waitingForAgent} waiting for Agent, ` +
+          `${recovery.manualOnly} manual-only, ${recovery.failed} failed`,
+        );
+      }
     } catch (err) {
-      console.error('[Cron] Multi-Agent schedule error:', err.message);
+      console.error('[Cron] Multi-Agent schedule/recovery error:', err.message);
     }
   });
 

@@ -22,6 +22,7 @@ import {
   captureTaskBusinessRootVisibilitySql,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  classifyCaptureRecoveryDisposition,
   crossDeviceRetryAgentSupportsTask,
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetryTaskSupported,
@@ -117,7 +118,7 @@ test("physical Agent slots ignore attention history but block live commands", as
   assert.deepEqual(statement.params[3], ["11111111-1111-4111-8111-111111111111"]);
 });
 
-test("cross-device retry is limited to settled root business tasks", () => {
+test("cross-device retry supports root business tasks and keyword orchestrations", () => {
   assert.equal(crossDeviceRetryTaskSupported({
     task_type: "unattended_keyword_capture",
     parent_task_id: null,
@@ -138,11 +139,51 @@ test("cross-device retry is limited to settled root business tasks", () => {
     task_type: "capture_orchestration",
     parent_task_id: null,
     metadata: {},
-  }), false);
+  }), true);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "capture_orchestration",
+    feature_key: "keyword_orchestration",
+    parent_task_id: null,
+    metadata: {},
+  }), true);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "capture_orchestration",
+    feature_key: "negative_post_patrol",
+    parent_task_id: null,
+    metadata: {},
+  }), true);
   assert.equal(crossDeviceRetryTaskSupported({
     task_type: "negative_post_patrol",
     parent_task_id: "11111111-1111-4111-8111-111111111111",
   }), false);
+});
+
+test("recovery grading keeps captcha current and automates technical or unstarted items", () => {
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "needs_action",
+    started_at: "2026-08-06T01:00:00.000Z",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+  }), {kind: "manual_current", automatic: false});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "dispatched",
+    started_at: null,
+  }), {kind: "auto_handoff", automatic: true});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    error: {code: "TAB_NOT_FOUND"},
+  }), {kind: "auto_retry_or_handoff", automatic: true});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    error: {code: "IDENTITY_MISMATCH"},
+  }), {kind: "terminal_business_failure", automatic: false});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 3,
+    error: {code: "TAB_NOT_FOUND"},
+  }), {kind: "automatic_attempts_exhausted", automatic: false});
 });
 
 test("cross-device retry requires exact workflow capabilities and blocks safety items", () => {
@@ -167,11 +208,43 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
     task_type: "followed_creator_post_patrol",
     platform: "xiaohongshu",
   }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      officialAccountCommentPatrol: true,
+    },
+  }, {
+    task_type: "capture_orchestration",
+    platform: "douyin",
+    metadata: {
+      workflow: "official_account_comment_patrol",
+      targetMode: "profile",
+    },
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      officialAccountCommentPatrolProfileV1: true,
+      officialAccountLatestPostsByCountV1: true,
+    },
+  }, {
+    task_type: "capture_orchestration",
+    platform: "douyin",
+    metadata: {
+      workflow: "official_account_comment_patrol",
+      targetMode: "profile",
+    },
+  }), true);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     error: {code: "DOUYIN_SEARCH_CAPTCHA_REQUIRED"},
   }), true);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     metadata: {checkpoint: {requiresManualAction: true}},
+  }), true);
+  assert.equal(crossDeviceRetryItemNeedsManualSafety({
+    error: {code: "LOGIN_REQUIRED", category: "login_required"},
   }), true);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     error: {code: "CONTENT_RELAY_STALLED"},
@@ -1824,22 +1897,29 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(retry, /requireTenantAccess/u);
   assert.match(retry, /requireSessionUser/u);
   assert.match(retry, /requireTenantWriter/u);
-  assert.match(retry, /loadIdleCrossDeviceRetryAgent/u);
+  assert.match(retry, /dispatchCrossDeviceRetry/u);
+  const dispatchCore = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf("async function dispatchCrossDeviceRetry"),
+    captureCloudRouteSource.indexOf(
+      "export async function reconcileAutomaticCaptureRetries",
+    ),
+  );
+  assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
   assert.match(captureCloudRouteSource, /AS active_command_count/u);
   assert.match(
     captureCloudRouteSource,
     /Number\(agent\.active_command_count \|\| 0\) === 0/u,
   );
   assert.match(captureCloudRouteSource, /findCaptureAgentExecutionSlotBlocker/u);
-  assert.match(retry, /promoteSingleNodeTaskForRetry/u);
-  assert.match(retry, /task_type = 'capture_orchestration'/u);
-  assert.match(retry, /parent_task_id/u);
-  assert.match(retry, /crossDeviceRetryRequestKey/u);
-  assert.match(retry, /INSERT INTO capture_task_item_attempts/u);
-  assert.match(retry, /renewProfileRetryExecutions/u);
-  assert.match(retry, /cross_device_retry_dispatched/u);
-  assert.match(retry, /abortCrossDeviceRetry\(promoted\.error\)/u);
-  assert.match(retry, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
+  assert.match(dispatchCore, /promoteSingleNodeTaskForRetry/u);
+  assert.match(dispatchCore, /task_type = 'capture_orchestration'/u);
+  assert.match(dispatchCore, /parent_task_id/u);
+  assert.match(dispatchCore, /crossDeviceRetryRequestKey/u);
+  assert.match(dispatchCore, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(dispatchCore, /renewProfileRetryExecutions/u);
+  assert.match(dispatchCore, /cross_device_retry_dispatched/u);
+  assert.match(dispatchCore, /abortCrossDeviceRetry\(promoted\.error\)/u);
+  assert.match(dispatchCore, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
   assert.match(
     captureCloudRouteSource,
     /cross_device_retry_transaction_abort/u,
@@ -1847,5 +1927,36 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(
     captureCloudRouteSource,
     /promotedRetryParent' IS DISTINCT FROM 'true'/u,
+  );
+});
+
+test("cron automatically dispatches unfinished items before attention delivery", () => {
+  assert.match(
+    captureCloudRouteSource,
+    /export async function reconcileAutomaticCaptureRetries/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /status = ANY\(\$1::text\[\]\)[\s\S]*allowIdleAgentHandoff/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /classifyCaptureRecoveryDisposition\(item\)\.automatic/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /sort\(\(left, right\) => Number\(left\.ordinal\) - Number\(right\.ordinal\)\)[\s\S]*\.slice\(0, 1\)/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES[\s\S]*lastAutomaticRecoveryTaskId/u,
+  );
+  assert.match(
+    cronSource,
+    /reconcileAutomaticCaptureRetries\(10\)/u,
+  );
+  assert.ok(
+    cronSource.indexOf("reconcileAutomaticCaptureRetries(10)") <
+      cronSource.indexOf("processCaptureAttentionNotifications(20)"),
   );
 });

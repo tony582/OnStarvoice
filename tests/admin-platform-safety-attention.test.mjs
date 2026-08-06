@@ -23,7 +23,7 @@ test('admin task diagnostics retain the plan total and identify task-level platf
   assert.match(source, /等待人工安全验证/u)
 })
 
-test('admin attention card names the original Agent and exposes explicit human resolution actions', async () => {
+test('admin attention card keeps captcha human-only and makes later keyword handoff automatic', async () => {
   const [card, diagnostics, page, orchestration, composer, navigation, admin] = await Promise.all([
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskDiagnostics.tsx'),
@@ -39,6 +39,7 @@ test('admin attention card names the original Agent and exposes explicit human r
   assert.match(card, /验证完成，原设备继续/u)
   assert.match(card, /结束并保留结果/u)
   assert.match(card, /此前结果已保留/u)
+  assert.match(card, /其他未开始关键词由系统自动分配/u)
   assert.match(diagnostics, /latestResultByIndex\.get\(index\) \|\| null/u)
   assert.match(diagnostics, /中断位置/u)
   assert.match(page, /后续关键词将不再执行，已经采集和保存的结果会保留/u)
@@ -50,13 +51,15 @@ test('admin attention card names the original Agent and exposes explicit human r
   )
   assert.match(page, /params\?\.view === 'attention'/u)
   assert.match(page, /params\?\.orchestrationId/u)
-  assert.match(orchestration, /验证码和安全审核不会自动换设备/u)
+  assert.match(orchestration, /验证码、登录和安全审核不会自动换设备/u)
+  assert.match(orchestration, /login\[_ -\]\?required/u)
+  assert.match(orchestration, /requiresManualAction/u)
   assert.match(orchestration, /验证完成，原 Agent 继续/u)
   assert.match(orchestration, /结束并保留/u)
-  assert.match(orchestration, /转交后续 \{attentionContext\.unstartedCount\} 个词/u)
-  assert.match(orchestration, /sourceExecutionTaskId: attentionContext\.sourceTaskId/u)
-  assert.match(orchestration, /targetAgentId/u)
-  assert.match(orchestration, /crypto\.randomUUID\(\)/u)
+  assert.match(orchestration, /系统正在按词分配后续/u)
+  assert.match(orchestration, /其他未开始关键词由系统逐词分配，无需运营人员选择设备/u)
+  assert.doesNotMatch(orchestration, /handoffAttentionSource/u)
+  assert.doesNotMatch(orchestration, /sourceExecutionTaskId: attentionContext\.sourceTaskId/u)
   assert.match(
     orchestration,
     /candidate\.status === 'needs_action' &&[\s\S]*safetyDiagnostic\(candidate\.error\)/u,
@@ -68,10 +71,10 @@ test('admin attention card names the original Agent and exposes explicit human r
   assert.match(orchestration, /metadata\.handoffSuccessorTaskId \|\| metadata\.recoveryTaskId/u)
   assert.match(orchestration, /executionStatus\(execution\) === 'superseded'/u)
   assert.match(orchestration, /HANDOFF_UNSTARTED_EXCLUDED_STATUSES/u)
-  assert.match(orchestration, /原 Agent 已结束，可接力后续关键词/u)
-  assert.match(composer, /允许空闲 Agent 接力/u)
+  assert.match(orchestration, /原 Agent 已结束，后续关键词由系统自动接力/u)
+  assert.match(composer, /系统自动接力已启用/u)
   assert.match(composer, /allowIdleAgentHandoff/u)
-  assert.match(composer, /验证码和安全审核不会自动换设备/u)
+  assert.match(composer, /验证码或登录异常所在关键词留在原 Agent 等待人工/u)
   assert.match(navigation, /new URLSearchParams\(window\.location\.search\)/u)
   assert.match(navigation, /publicLinkParams\.delete\('page'\)/u)
   assert.match(admin, /任务需人工介入通知邮箱/u)

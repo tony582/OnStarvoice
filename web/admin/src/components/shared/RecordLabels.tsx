@@ -74,7 +74,6 @@ export function RecordLabelChips({
               tone.chip,
             )}
           >
-            <span className={cn('shrink-0 rounded-full', compact ? 'h-1.5 w-1.5' : 'h-2 w-2', tone.dot)} />
             <span className="truncate">{tag.name}</span>
             {removable && onRemove && (
               <button
@@ -293,8 +292,9 @@ export function RecordLabelEditor({
                 selected && 'bg-accent/70',
               )}
             >
-              <span className={cn('h-2 w-2 shrink-0 rounded-full', tone.dot)} />
-              <span className="min-w-0 flex-1 truncate font-medium">{tag.name}</span>
+              <span className="min-w-0 flex-1">
+                <span className={cn('inline-block max-w-full truncate rounded-md px-2 py-0.5 font-semibold ring-1 ring-inset', tone.chip)}>{tag.name}</span>
+              </span>
               {Number(tag.usageCount || 0) > 0 && (
                 <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{Number(tag.usageCount).toLocaleString('zh-CN')}</span>
               )}

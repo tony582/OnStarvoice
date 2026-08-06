@@ -3338,6 +3338,7 @@ async function executeCloudTaskAgentCommand(command, token) {
           requestId,
           mode: String(payload.mode || 'remaining'),
           cloudCommandId: commandId,
+          allowedKeywords: payload.allowedKeywords,
         });
         commandResult = await rememberCloudCommandResult(
           commandId,
@@ -6153,6 +6154,7 @@ async function manuallyRecoverUnattendedKeywordRun({
   requestId = '',
   mode = 'remaining',
   cloudCommandId = '',
+  allowedKeywords = [],
 } = {}) {
   const normalizedMode = new Set(['remaining', 'failed', 'skip_current']).has(mode)
     ? mode
@@ -6212,7 +6214,7 @@ async function manuallyRecoverUnattendedKeywordRun({
     }
 
     const now = new Date().toISOString();
-    const checkpoint = buildManualRecoveryCheckpoint(current, normalizedMode);
+    let checkpoint = buildManualRecoveryCheckpoint(current, normalizedMode);
     let planSnapshot = normalizeUnattendedKeywordPlan(current.planSnapshot || {});
     if (normalizedMode === 'failed') {
       const taskCheckpoint = buildTaskCenterCheckpointFromUnattendedRequest(current);
@@ -6261,6 +6263,73 @@ async function manuallyRecoverUnattendedKeywordRun({
         };
       }
     }
+    const scopedKeywords = Array.from(
+      new Set(
+        (Array.isArray(allowedKeywords) ? allowedKeywords : [])
+          .map((keyword) => String(keyword || '').trim())
+          .filter(Boolean),
+      ),
+    ).slice(0, 30);
+    if (scopedKeywords.length > 0) {
+      const allowedSet = new Set(scopedKeywords);
+      const planKeywords = planSnapshot.keywords.filter((keyword) =>
+        allowedSet.has(keyword),
+      );
+      if (planKeywords.length === 0) {
+        return {
+          accepted: false,
+          reason: 'no_allowed_keywords',
+          request: current,
+        };
+      }
+      const indexByKeyword = new Map(
+        planKeywords.map((keyword, index) => [keyword, index]),
+      );
+      const activeKeyword = String(
+        checkpoint.activeKeyword || checkpoint.currentKeyword || '',
+      ).trim();
+      const retainedActiveKeyword = allowedSet.has(activeKeyword)
+        ? activeKeyword
+        : planKeywords[0];
+      checkpoint = {
+        ...checkpoint,
+        round: 1,
+        activeKeywordIndex: indexByKeyword.get(retainedActiveKeyword) || 0,
+        keywordIndex: indexByKeyword.get(retainedActiveKeyword) || 0,
+        activeKeyword: retainedActiveKeyword,
+        currentKeyword: retainedActiveKeyword,
+        keywordResults: checkpoint.keywordResults
+          .filter((entry) => allowedSet.has(String(entry?.keyword || '').trim()))
+          .map((entry) => ({
+            ...entry,
+            round: 1,
+            index:
+              indexByKeyword.get(String(entry?.keyword || '').trim()) || 0,
+          })),
+        completedKeywords: checkpoint.completedKeywords.filter((keyword) =>
+          allowedSet.has(keyword),
+        ),
+        failedKeywords: checkpoint.failedKeywords.filter((keyword) =>
+          allowedSet.has(keyword),
+        ),
+        skippedKeywords: checkpoint.skippedKeywords.filter((keyword) =>
+          allowedSet.has(keyword),
+        ),
+        attempts: Object.fromEntries(
+          Object.entries(checkpoint.attempts).filter(([keyword]) =>
+            allowedSet.has(keyword),
+          ),
+        ),
+        updatedAt: new Date().toISOString(),
+      };
+      planSnapshot = normalizeUnattendedKeywordPlan({
+        ...planSnapshot,
+        keywords: planKeywords,
+        autoLoop: false,
+        maxRounds: 1,
+        roundGapMin: 0,
+      });
+    }
     const labels = {
       remaining: '继续采集剩余关键词',
       failed: '仅重试失败关键词',
@@ -6282,6 +6351,9 @@ async function manuallyRecoverUnattendedKeywordRun({
         Math.max(0, Number(current.manualRecoveryCount) || 0) + 1,
       recoveryMode: normalizedMode,
       recoveryReason: 'manual_recovery',
+      ...(scopedKeywords.length > 0
+        ? {recoveryAllowedKeywords: scopedKeywords}
+        : {}),
       recoveryPendingLaunch: true,
       recoveryLaunchFailures: 0,
       recoveryWaitUntil: '',
@@ -6827,8 +6899,82 @@ async function cleanupStaleCaptureRuntimeSession(session) {
   }
 }
 
+let captureRuntimeRestorePromise = null;
+
+async function restorePersistedCaptureRuntimeSession(runtime) {
+  const snapshot = runtime?.captureDebugSession;
+  if (
+    !snapshot ||
+    snapshot.persistent !== true ||
+    captureDebugSessionManager?.getActiveSessions().length > 0
+  ) {
+    return {restored: false, reason: 'not_required'};
+  }
+  if (captureRuntimeRestorePromise) return await captureRuntimeRestorePromise;
+
+  captureRuntimeRestorePromise = (async () => {
+    const taskId = String(snapshot.taskId || '').trim();
+    if (!taskId) return {restored: false, reason: 'missing_task_id'};
+    let attemptId = String(
+      snapshot.attemptId ||
+        runtime?.lastCaptureProgress?.unattendedAttemptId ||
+        '',
+    ).trim();
+    const initialFence = await inspectUnattendedCaptureTaskAttempt({
+      taskId,
+      attemptId,
+    });
+    if (initialFence.unattended && !attemptId) {
+      attemptId = String(initialFence.currentAttemptId || '').trim();
+    }
+    if (initialFence.unattended) {
+      const currentFence = await inspectUnattendedCaptureTaskAttempt({
+        taskId,
+        attemptId,
+      });
+      if (!currentFence.active || !currentFence.lockMatchesTaskAttempt) {
+        return {restored: false, reason: 'stale_unattended_attempt'};
+      }
+    }
+
+    const restoreSnapshot = {...snapshot, attemptId};
+    let group = null;
+    try {
+      group = await captureTaskTabGroupManager.restore(restoreSnapshot);
+      const session = await captureDebugSessionManager.restore(
+        {
+          ...restoreSnapshot,
+          workerTabIds: group.workerTabIds,
+          groupId: group.groupId,
+          originalGroupId: group.originalGroupId,
+        },
+      );
+      return {restored: true, session, group};
+    } catch (error) {
+      if (group) captureTaskTabGroupManager.forget(taskId);
+      console.warn(
+        '[CaptureTask] persisted runtime restore failed:',
+        error?.message || error,
+      );
+      return {
+        restored: false,
+        reason: error?.code || 'capture_runtime_restore_failed',
+        error,
+      };
+    }
+  })();
+  try {
+    return await captureRuntimeRestorePromise;
+  } finally {
+    captureRuntimeRestorePromise = null;
+  }
+}
+
 async function ensureRuntimeState() {
-  return await runRuntimeMutation(async () => {
+  const beforeRestore = await readRuntimeState();
+  await restorePersistedCaptureRuntimeSession(beforeRestore);
+  let unattendedRecoveryTaskId = '';
+  const nextRuntime = await runRuntimeMutation(async () => {
     const current = await readRuntimeState();
     const nextPatch = {};
 
@@ -6839,6 +6985,9 @@ async function ensureRuntimeState() {
       const staleTaskId = String(
         current.captureDebugSession?.taskId || '',
       ).trim();
+      const unattended = staleTaskId
+        ? await inspectStableUnattendedCaptureTask(staleTaskId)
+        : {unattended: false, active: false};
       if (staleTaskId) {
         nextPatch.captureTaskCancellation = buildCaptureTaskCancellation(
           staleTaskId,
@@ -6850,8 +6999,10 @@ async function ensureRuntimeState() {
         typeof current.lastCaptureProgress === 'object'
           ? current.lastCaptureProgress
           : {}),
-        phase: 'canceled',
-        message: '扩展已重新加载，上一采集任务已安全停止',
+        phase: unattended.active ? 'recovering' : 'canceled',
+        message: unattended.active
+          ? '浏览器后台已重启，正在自动恢复采集任务'
+          : '扩展已重新加载，上一采集任务已安全停止',
         updatedAt: new Date().toISOString(),
       };
       // Fence every downstream write before touching debugger, workers or groups.
@@ -6863,7 +7014,7 @@ async function ensureRuntimeState() {
         },
       });
       await cleanupStaleCaptureRuntimeSession(current.captureDebugSession);
-      if (staleTaskId) {
+      if (staleTaskId && !unattended.active) {
         await terminalizeCaptureTaskLedgerRun(staleTaskId, {
           reason: 'extension_runtime_restarted',
           message: '扩展已重新加载，上一采集任务已停止',
@@ -6873,6 +7024,7 @@ async function ensureRuntimeState() {
       if (staleTaskId) {
         captureTaskOwnerCoordinator?.clearTask(staleTaskId);
       }
+      if (unattended.active) unattendedRecoveryTaskId = staleTaskId;
     }
 
     if (!current.clientUuid) {
@@ -6901,6 +7053,18 @@ async function ensureRuntimeState() {
     });
     return next;
   });
+  if (unattendedRecoveryTaskId) {
+    await recoverUnattendedCaptureTaskInterruption({
+      taskId: unattendedRecoveryTaskId,
+      reason: 'extension_runtime_restore_failed',
+    }).catch((error) => {
+      console.warn(
+        '[CaptureTask] automatic recovery after runtime restore failed:',
+        error?.message || error,
+      );
+    });
+  }
+  return nextRuntime;
 }
 
 async function openSidePanelForTab(tabId) {
@@ -8244,6 +8408,7 @@ async function beginCaptureTaskNow(message, sender) {
       platform: sourcePlatform,
       persistent: true,
       taskId,
+      attemptId: request.attemptId,
       progress: request.progress ?? null,
       workerTabIds: existingSession?.workerTabIds || [],
       groupId: group.groupId,

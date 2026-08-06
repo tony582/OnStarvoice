@@ -41,7 +41,7 @@ export function OverviewPage() {
   const negRatio = sb.total ? Math.round((sb.negative / sb.total) * 100) : 0
   const events = data?.pendingRecords || []
   const handled = Number(k.issue_linked || 0)
-  const activeTotal = Number(k.unhandled || 0) + Number(k.reviewing || 0) + handled
+  const activeTotal = Number(k.active_or_ticketed ?? (Number(k.unhandled || 0) + Number(k.reviewing || 0) + handled))
   const handledPct = activeTotal ? Math.round((handled / activeTotal) * 100) : 0
 
   return (
@@ -128,9 +128,9 @@ export function OverviewPage() {
             </div>
           )}
 
-          {/* 处置进度电池条 */}
+          {/* 工单覆盖电池条 */}
           <div className="mt-4 border-t border-border pt-3.5">
-            <div className="mb-1.5 flex items-center justify-between text-[11px] text-muted-foreground"><span>处置进度(已关联问题 / 活跃)</span><span className="tabular-nums">{formatNumber(handled)} / {formatNumber(activeTotal)}</span></div>
+            <div className="mb-1.5 flex items-center justify-between text-[11px] text-muted-foreground"><span>工单覆盖（有工单内容 / 当前相关内容）</span><span className="tabular-nums">{formatNumber(handled)} / {formatNumber(activeTotal)}</span></div>
             <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green transition-all" style={{ width: `${handledPct}%` }} /></div>
           </div>
         </section>

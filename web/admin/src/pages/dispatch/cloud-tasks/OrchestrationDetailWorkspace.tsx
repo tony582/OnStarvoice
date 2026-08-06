@@ -198,12 +198,12 @@ function dataMessage(value: unknown) {
 function safetyDiagnostic(value: unknown): boolean {
   if (!value) return false
   if (typeof value === 'string') {
-    return /platform[_ -]?safety|security[_ -]?(?:challenge|blocked)|captcha|验证码|安全验证|请选择所有符合/u.test(value)
+    return /platform[_ -]?safety|security[_ -]?(?:challenge|blocked)|captcha|login[_ -]?required|auth[_ -]?required|验证码|安全验证|请(?:先|重新)?登录|请选择所有符合/u.test(value)
   }
   if (Array.isArray(value)) return value.some(safetyDiagnostic)
   if (typeof value !== 'object') return false
   return Object.entries(value as Record<string, unknown>).some(([key, nested]) =>
-    /platformSafetyBlocked|securityChallenge|captcha/u.test(key) || safetyDiagnostic(nested),
+    /platformSafetyBlocked|securityChallenge|captcha|requiresManualAction|loginRequired|authRequired/u.test(key) || safetyDiagnostic(nested),
   )
 }
 
@@ -268,8 +268,7 @@ export function OrchestrationDetailWorkspace({
   const [stopping, setStopping] = useState(false)
   const [scheduleUpdating, setScheduleUpdating] = useState(false)
   const [scheduleRunningNow, setScheduleRunningNow] = useState(false)
-  const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | 'handoff' | ''>('')
-  const [handoffTargetAgentId, setHandoffTargetAgentId] = useState('')
+  const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | ''>('')
   const [keywordRetryTargetAgentId, setKeywordRetryTargetAgentId] = useState('')
   const [keywordRetrying, setKeywordRetrying] = useState(false)
   const [negativeReassignOpen, setNegativeReassignOpen] = useState(false)
@@ -371,6 +370,9 @@ export function OrchestrationDetailWorkspace({
     if (!detail || negativePatrol || isScheduleTemplate) return []
     return sortedItems.filter(item => {
       if (!KEYWORD_RETRY_STATUSES.has(item.status)) return false
+      if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
+        return false
+      }
       const sourceExecution = executionsById.get(
         String(item.execution_task_id || ''),
       )
@@ -406,10 +408,19 @@ export function OrchestrationDetailWorkspace({
         )
       })
   }, [availableAgents, detail, keywordRetrySourceAgentIds, negativePatrol])
+  const keywordAutomaticCandidates = useMemo(
+    () => keywordRetryCandidates.filter(agent =>
+      !keywordRetrySourceAgentIds.has(agent.id),
+    ),
+    [keywordRetryCandidates, keywordRetrySourceAgentIds],
+  )
   const negativeReassignItems = useMemo(() => {
     if (!negativePatrol) return []
     return sortedItems.filter(item => {
       if (itemAvailabilityLabel(item)) return false
+      if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
+        return false
+      }
       if (NEGATIVE_REASSIGN_EXPLICIT_STATUSES.has(item.status)) return true
       if (
         !item.started_at &&
@@ -713,69 +724,6 @@ export function OrchestrationDetailWorkspace({
       await onChanged?.()
     } catch (err) {
       setActionError(err instanceof Error ? err.message : '发送结束指令失败')
-    } finally {
-      setAttentionAction('')
-    }
-  }
-
-  const handoffAttentionSource = async () => {
-    if (!attentionContext || !detail || !writable || attentionAction) return
-    const targetAgentId = handoffTargetAgentId || handoffCandidates[0]?.id || ''
-    const target = handoffCandidates.find(agent => agent.id === targetAgentId)
-    if (!target) {
-      setActionError('当前没有在线且空闲的兼容 Agent，请先释放一个节点后再接力。')
-      return
-    }
-    const sourceName = agentName(attentionContext.sourceAgent)
-    const targetName = agentName(target)
-    if (!window.confirm(
-      `确定由“${targetName}”接力吗？系统会先结束“${sourceName}”，触发验证的当前关键词不会跨设备迁移，后面的 ${attentionContext.unstartedCount} 个未开始关键词将转交；已保存结果会保留。`,
-    )) return
-    setAttentionAction('handoff')
-    setActionFeedback('')
-    setActionError('')
-    try {
-      let currentDetail = detail
-      let sourceExecution = currentDetail.executions.find(
-        execution => executionTaskId(execution) === attentionContext.sourceTaskId,
-      )
-      if (!FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution))) {
-        await api.post(`/capture-cloud/tasks/${attentionContext.sourceTaskId}/stop`, {})
-        for (let attempt = 0; attempt < 12; attempt += 1) {
-          await new Promise(resolve => window.setTimeout(resolve, 1_250))
-          currentDetail = await api.get<OrchestrationDetailResponse>(
-            `/capture-cloud/orchestrations/${orchestrationId}`,
-          )
-          sourceExecution = currentDetail.executions.find(
-            execution => executionTaskId(execution) === attentionContext.sourceTaskId,
-          )
-          if (FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution))) break
-        }
-      }
-      if (!FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution))) {
-        throw new Error('原 Agent 还未确认结束。停止指令已保留，请稍后刷新并再次接力。')
-      }
-      const result = await api.post<{ message?: string }>(
-        `/capture-cloud/orchestrations/${orchestrationId}/resolve-attention`,
-        {
-          action: 'handoff',
-          expectedRevision: Number(
-            currentDetail.orchestration.revision ??
-            currentDetail.orchestration.orchestration_revision ??
-            0,
-          ),
-          requestKey: crypto.randomUUID(),
-          sourceExecutionTaskId: attentionContext.sourceTaskId,
-          targetAgentId,
-        },
-        { timeoutMs: 30_000 },
-      )
-      setActionFeedback(result.message || `剩余未开始关键词已转交给 ${targetName}`)
-      setHandoffTargetAgentId('')
-      await load(true)
-      await onChanged?.()
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : '转交空闲 Agent 失败')
     } finally {
       setAttentionAction('')
     }
@@ -1102,8 +1050,8 @@ export function OrchestrationDetailWorkspace({
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                   <h3 className="text-sm font-bold text-foreground">
                     {attentionContext.sourceEnded
-                      ? '原 Agent 已结束，可接力后续关键词'
-                      : '抖音需要人工验证，自动操作已停止'}
+                      ? '原 Agent 已结束，后续关键词由系统自动接力'
+                      : '当前关键词等待人工验证，其他关键词继续自动接力'}
                   </h3>
                   <span className="rounded-full bg-status-red/10 px-2 py-0.5 text-[10px] font-semibold text-status-red">
                     {attentionContext.currentOrdinal > 0
@@ -1145,44 +1093,21 @@ export function OrchestrationDetailWorkspace({
                     </Button>
                   )}
                   {idleHandoffAllowed && attentionContext.unstartedCount > 0 && (
-                    <>
-                      <select
-                        aria-label="选择接力 Agent"
-                        value={handoffTargetAgentId || handoffCandidates[0]?.id || ''}
-                        onChange={event => setHandoffTargetAgentId(event.target.value)}
-                        disabled={!writable || Boolean(attentionAction) || handoffCandidates.length === 0}
-                        className="h-9 min-w-48 max-w-full rounded-lg border border-border bg-background px-3 text-xs text-foreground outline-none focus:ring-2 focus:ring-primary"
-                      >
-                        {handoffCandidates.length === 0
-                          ? <option value="">没有在线空闲 Agent</option>
-                          : handoffCandidates.map(agent => (
-                              <option key={agent.id} value={agent.id}>
-                                {agentName(agent)}
-                              </option>
-                            ))}
-                      </select>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => void handoffAttentionSource()}
-                        disabled={!writable || Boolean(attentionAction) || handoffCandidates.length === 0}
-                      >
-                        {attentionAction === 'handoff'
-                          ? <Loader2 className="h-4 w-4 animate-spin" />
-                          : <Send className="h-4 w-4" />}
-                        转交后续 {attentionContext.unstartedCount} 个词
-                      </Button>
-                    </>
+                    <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
+                      {handoffCandidates.length > 0
+                        ? `系统正在按词分配后续 ${attentionContext.unstartedCount} 个关键词`
+                        : `后续 ${attentionContext.unstartedCount} 个关键词正在等待空闲 Agent`}
+                    </span>
                   )}
                 </div>
                 <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
                   {attentionContext.sourceEnded
                     ? idleHandoffAllowed
-                      ? '原任务已结束，现有结果已保留。不需要接力时可直接关闭；需要继续时，只会转交尚未开始的整词。'
-                      : '原任务已结束，现有结果已保留；该任务创建时未启用空闲 Agent 接力。'
+                      ? '原任务结果已保留；系统只接力尚未开始的完整关键词，并按空闲情况逐词分配。'
+                      : '原任务已结束，现有结果已保留；该历史任务创建时未启用自动接力。'
                     : idleHandoffAllowed
-                    ? '验证码和安全审核不会自动换设备；只有你确认后，系统才会把尚未开始的整词交给空闲 Agent。'
-                    : '该任务创建时未启用空闲 Agent 接力；你可以在原 Agent 验证后继续，或结束并保留结果。'}
+                    ? '验证码、登录和安全审核不会自动换设备；当前关键词留在原 Agent。其他未开始关键词由系统逐词分配，无需运营人员选择设备。'
+                    : '该历史任务创建时未启用自动接力；你可以在原 Agent 验证后继续，或结束并保留结果。'}
                 </p>
               </div>
             </div>
@@ -1198,18 +1123,28 @@ export function OrchestrationDetailWorkspace({
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-sm font-bold text-foreground">
-                      {keywordRetryItems.length} 个关键词可云端重试
+                      {idleHandoffAllowed
+                        ? `${keywordRetryItems.length} 个关键词正在自动恢复`
+                        : `${keywordRetryItems.length} 个关键词可云端重试`}
                     </h3>
                     <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
-                      回写当前父任务
+                      {idleHandoffAllowed ? '系统自动分配' : '回写当前父任务'}
                     </span>
                   </div>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    可选择原 Agent 或其他在线空闲 Agent；新的执行记录和结果都会保留在本轮无人值守任务下。
+                    {idleHandoffAllowed
+                      ? '技术失败会按关键词自动重试，并优先交给近期更稳定的空闲 Agent；新结果仍回写当前任务。'
+                      : '此历史任务未启用自动接力，可选择原 Agent 或其他在线空闲 Agent 手工重试。'}
                   </p>
                 </div>
               </div>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              {idleHandoffAllowed ? (
+                <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
+                  {keywordAutomaticCandidates.length > 0
+                    ? '系统将在一分钟内自动下发，无需人工操作'
+                    : '正在等待兼容的空闲 Agent，上线后自动继续'}
+                </span>
+              ) : <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <select
                   aria-label="选择失败关键词重试 Agent"
                   value={keywordRetryTargetAgentId || keywordRetryCandidates[0]?.id || ''}
@@ -1236,7 +1171,7 @@ export function OrchestrationDetailWorkspace({
                     : <Send className="h-4 w-4" />}
                   重试失败关键词
                 </Button>
-              </div>
+              </div>}
             </div>
           </section>
         )}
@@ -1253,15 +1188,23 @@ export function OrchestrationDetailWorkspace({
                       {negativeReassignItems.length} 条帖子尚未完成
                     </h3>
                     <span className="rounded-full bg-status-red/8 px-2 py-0.5 text-[10px] font-semibold text-status-red">
-                      可重新分配
+                      {idleHandoffAllowed ? '系统自动分配' : '可重新分配'}
                     </span>
                   </div>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    只会重建失败或未结算的逐帖任务；已完成、已删除或不可访问的帖子继续保留原结果。
+                    {idleHandoffAllowed
+                      ? '系统按单条帖子选择在线空闲 Agent；已完成、已删除或不可访问的帖子不会重复执行。'
+                      : '只会重建失败或未结算的逐帖任务；已完成、已删除或不可访问的帖子继续保留原结果。'}
                   </p>
                 </div>
               </div>
-              {!negativeReassignOpen && (
+              {idleHandoffAllowed ? (
+                <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
+                  {negativeReassignCandidates.length > 0
+                    ? '系统将在一分钟内自动下发，无需人工操作'
+                    : '正在等待兼容的空闲 Agent，上线后自动继续'}
+                </span>
+              ) : !negativeReassignOpen && (
                 <Button
                   size="sm"
                   onClick={openNegativeReassign}
@@ -1281,10 +1224,12 @@ export function OrchestrationDetailWorkspace({
             </div>
             {negativeReassignBlockedByActiveExecution && !negativeReassignOpen && (
               <p className="border-t border-border/70 bg-background/55 px-4 py-2.5 text-[11px] leading-4 text-muted-foreground">
-                当前批次仍有 Agent 在执行或等待设备。为避免同一帖子并发执行，请先等待批次结束，或停止任务后再重新分配。
+                {idleHandoffAllowed
+                  ? '当前批次仍有 Agent 在执行或等待设备；系统会先避免同一帖子并发，待可安全接力时自动继续。'
+                  : '当前批次仍有 Agent 在执行或等待设备。为避免同一帖子并发执行，请先等待批次结束，或停止任务后再重新分配。'}
               </p>
             )}
-            {negativeReassignOpen && (
+            {!idleHandoffAllowed && negativeReassignOpen && (
               <div className="border-t border-border/70 bg-background/70 p-4">
                 <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
                   <div>
@@ -1587,7 +1532,7 @@ export function OrchestrationDetailWorkspace({
             )}
             {!negativePatrol && <div className="border-t border-border/70 bg-muted/25 p-3">
               <p className="text-[10px] leading-4 text-muted-foreground">
-                任务遇到安全验证时，上方会提供人工继续、结束保留和转交空闲 Agent；接力只处理尚未开始的完整关键词。
+                任务遇到安全验证时（包括验证码或登录要求），运营只需处理当前受阻关键词；它留在原 Agent。接力只处理尚未开始的完整关键词，并由系统自动逐词分配。
               </p>
             </div>}
           </section>

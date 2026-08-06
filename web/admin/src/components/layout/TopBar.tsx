@@ -1,8 +1,5 @@
-import { LogOut, ChevronsUpDown, PanelLeftOpen } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { ThemeToggle } from './ThemeToggle'
+import { ChevronsUpDown, PanelLeftOpen } from 'lucide-react'
 import { useAuth } from '@/lib/auth'
-import { LABELS } from '@/lib/utils'
 
 interface TopBarProps {
   eyebrow: string
@@ -14,7 +11,7 @@ interface TopBarProps {
 }
 
 export function TopBar({ eyebrow, title, badge, collapsed, onToggleCollapse, onOpenMobileNavigation }: TopBarProps) {
-  const { user, tenants, tenantId, switchTenant, logout } = useAuth()
+  const { tenants, tenantId, switchTenant } = useAuth()
 
   return (
     <header className="sticky top-0 z-20 border-b border-border/60 bg-background/92 px-3 pt-[env(safe-area-inset-top)] backdrop-blur-md sm:px-4">
@@ -56,17 +53,6 @@ export function TopBar({ eyebrow, title, badge, collapsed, onToggleCollapse, onO
               <ChevronsUpDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             </div>
           )}
-          <div className="hidden items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1 lg:flex">
-            <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-[10px] font-semibold text-muted-foreground">
-              {(user?.name || user?.email || '?').slice(0, 1).toUpperCase()}
-            </div>
-            <span className="max-w-[140px] truncate text-[13px] font-medium">{user?.name || user?.email}</span>
-            <span className="text-[11px] text-muted-foreground">{LABELS.role[user?.globalRole || ''] || ''}</span>
-          </div>
-          <ThemeToggle />
-          <Button variant="ghost" size="sm" onClick={logout} aria-label="退出登录" title="退出登录" className="h-10 px-3 text-muted-foreground hover:text-destructive sm:h-8">
-            <LogOut className="h-4 w-4" />
-          </Button>
         </div>
       </div>
       {tenants.length > 1 && (

@@ -92,6 +92,7 @@
       if (session.persistent) {
         result.persistent = true;
         result.taskId = session.taskId;
+        if (session.attemptId) result.attemptId = session.attemptId;
         result.progress = normalizeProgress(session.progress);
         result.workerTabIds = [...session.workerTabIds];
         result.groupId = session.groupId;
@@ -345,6 +346,7 @@
         platform = "",
         persistent = false,
         taskId = "",
+        attemptId = "",
         progress = null,
         workerTabIds = [],
         groupId = null,
@@ -361,6 +363,7 @@
           const normalizedPlatform = cleanText(platform, 40).toLowerCase();
           const normalizedPersistent = Boolean(persistent);
           const normalizedTaskId = cleanText(taskId, 320);
+          const normalizedAttemptId = cleanText(attemptId, 320);
           if (!normalizedTabId || !normalizedRunId) {
             throw createError(
               "invalid_debug_session",
@@ -456,6 +459,7 @@
             ...(normalizedPersistent
               ? {
                   taskId: normalizedTaskId,
+                  attemptId: normalizedAttemptId,
                   progress: normalizeProgress(progress),
                   workerTabIds: normalizeWorkerTabIds(
                     workerTabIds,
@@ -471,6 +475,140 @@
           sessionsByTab.set(normalizedTabId, session);
           await publish(session, {reason: "capture_started"});
           return publicSession(session);
+        });
+      }
+
+      function isDebuggerNotAttachedError(error) {
+        const message = cleanText(error?.message || error, 320);
+        return /not attached|debugger is not attached|no tab with (given )?id|no tab with id|target closed/iu.test(
+          message,
+        );
+      }
+
+      async function restore(snapshot = {}, {publishState = true} = {}) {
+        return enqueue(async () => {
+          const normalizedTabId = normalizeTabId(snapshot?.tabId);
+          const normalizedRunId = cleanText(snapshot?.runId, 320);
+          const normalizedTaskId = cleanText(snapshot?.taskId, 320);
+          if (
+            snapshot?.persistent !== true ||
+            !normalizedTabId ||
+            !normalizedRunId ||
+            !normalizedTaskId
+          ) {
+            throw createError(
+              "invalid_capture_restore_snapshot",
+              "持久采集会话恢复快照不完整",
+            );
+          }
+
+          const current = findSessionByTaskId(normalizedTaskId);
+          if (current) {
+            if (
+              current.tabId !== normalizedTabId ||
+              current.runId !== normalizedRunId
+            ) {
+              throw createError(
+                "debug_session_restore_conflict",
+                "采集会话已经由另一个页面恢复",
+              );
+            }
+            return publicSession(current, {restored: true, reused: true});
+          }
+          if (sessionsByTab.size > 0) {
+            throw createError(
+              "debug_session_busy",
+              "已有页面处于 AI Debug Session，不能恢复另一采集任务",
+            );
+          }
+
+          const debuggee = {tabId: normalizedTabId};
+          const pendingAttach = {detached: false, reason: ""};
+          pendingAttachesByTab.set(normalizedTabId, pendingAttach);
+          let attachedByRestore = false;
+          let attachmentReused = false;
+          try {
+            try {
+              // A MV3 worker can be reclaimed while Chromium keeps the
+              // extension-owned debugger attachment alive. A successful CDP
+              // command proves this extension still owns that attachment.
+              await applyFocusEmulation(normalizedTabId, true);
+              attachmentReused = true;
+            } catch (error) {
+              if (!isDebuggerNotAttachedError(error)) throw error;
+              await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
+              attachedByRestore = true;
+              await applyFocusEmulation(normalizedTabId, true);
+            }
+            if (pendingAttach.detached) {
+              throw createError(
+                "debug_session_detached_during_restore",
+                "浏览器接管在恢复期间再次断开",
+              );
+            }
+          } catch (error) {
+            if (attachedByRestore) {
+              expectedDetachTabs.add(normalizedTabId);
+              try {
+                await debuggerApi.detach(debuggee).catch(() => null);
+              } finally {
+                expectedDetachTabs.delete(normalizedTabId);
+              }
+            }
+            throw createError(
+              "debug_session_restore_failed",
+              "无法恢复上一采集会话",
+              error,
+            );
+          } finally {
+            if (pendingAttachesByTab.get(normalizedTabId) === pendingAttach) {
+              pendingAttachesByTab.delete(normalizedTabId);
+            }
+          }
+
+          const startedAt = cleanText(snapshot?.startedAt, 100);
+          const session = {
+            tabId: normalizedTabId,
+            runId: normalizedRunId,
+            label: cleanText(snapshot?.label, 120) || "采集任务",
+            state: "attached",
+            startedAt:
+              startedAt && Number.isFinite(Date.parse(startedAt))
+                ? new Date(Date.parse(startedAt)).toISOString()
+                : new Date(now()).toISOString(),
+            ...(cleanText(snapshot?.pageTitle, 180)
+              ? {pageTitle: cleanText(snapshot.pageTitle, 180)}
+              : {}),
+            ...(cleanText(snapshot?.pageUrl, 800)
+              ? {pageUrl: cleanText(snapshot.pageUrl, 800)}
+              : {}),
+            ...(cleanText(snapshot?.platform, 40)
+              ? {platform: cleanText(snapshot.platform, 40).toLowerCase()}
+              : {}),
+            persistent: true,
+            taskId: normalizedTaskId,
+            attemptId: cleanText(snapshot?.attemptId, 320),
+            progress: normalizeProgress(snapshot?.progress),
+            workerTabIds: normalizeWorkerTabIds(
+              snapshot?.workerTabIds,
+              normalizedTabId,
+            ),
+            groupId: normalizeGroupId(snapshot?.groupId),
+            originalGroupId: normalizeGroupId(snapshot?.originalGroupId),
+            minimized: Boolean(snapshot?.minimized),
+            activeListRunId: cleanText(snapshot?.activeListRunId, 320),
+          };
+          sessionsByTab.set(normalizedTabId, session);
+          if (publishState) {
+            await publish(session, {
+              reason: "capture_restored",
+              attachmentReused,
+            });
+          }
+          return publicSession(session, {
+            restored: true,
+            attachmentReused,
+          });
         });
       }
 
@@ -776,6 +914,7 @@
 
       return Object.freeze({
         start,
+        restore,
         stop,
         stopByTab(tabId, reason = "capture_cancelled") {
           return stop({tabId, reason, force: true});

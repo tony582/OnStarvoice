@@ -138,6 +138,17 @@ test('only structured safety evidence can create a needs-action notification', (
     isStructuredSafetyAttention(safetySnapshot(), task({status: 'running'})),
     false,
   );
+  assert.equal(
+    isStructuredSafetyAttention(
+      safetySnapshot({
+        error: {code: 'LOGIN_REQUIRED', category: 'login_required'},
+        checkpoint: {},
+        progress: {},
+      }),
+      task(),
+    ),
+    true,
+  );
 });
 
 test('accepted first transition enqueues one idempotent outbox row', async () => {
@@ -331,6 +342,9 @@ test('admin task link is optional and only accepts an HTTP public base URL', () 
       'https://voice.example.com/admin/?page=dispatch&view=attention&taskId=11111111-1111-4111-8111-111111111111&orchestrationId=66666666-6666-4666-8666-666666666666#/m/page/dispatch?view=attention&taskId=11111111-1111-4111-8111-111111111111&orchestrationId=66666666-6666-4666-8666-666666666666',
     );
     assert.match(withLink.html, /打开调度中心处理/u);
+    assert.match(withLink.html, /当前关键词已停在原 Agent 等待人工/u);
+    assert.match(withLink.html, /如有其他未开始关键词，系统会自动分配/u);
+    assert.doesNotMatch(withLink.html, /结束\/接力任务/u);
 
     process.env.ADMIN_PUBLIC_URL = 'javascript:alert(1)';
     assert.equal(buildCaptureAttentionEmail(claimedRow()).adminUrl, '');

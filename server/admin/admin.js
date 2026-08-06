@@ -72,7 +72,8 @@ const LABELS = {
   triage: {
     unhandled: '待处理',
     reviewing: '负面流程',
-    issue_linked: '已转工单',
+    issue_linked: '已关联事件',
+    ticketed: '已转工单',
     official_responded: '官方已评',
     no_action: '无需操作',
     false_positive: '误报',

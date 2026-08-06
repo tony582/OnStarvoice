@@ -1,6 +1,6 @@
 # StarVoice 星语 API 接口文档
 
-> 稳定版基线：Extension `0.3.74`，以仓库 `main` 分支为准，数据库迁移截至 `055_capture_agent_tenant_migration.sql`。
+> 当前稳定基线：Extension `0.3.75`，以仓库 `main` 分支为准，数据库迁移截至 `058_content_ticket_processing_mode.sql`。
 > 本文用于开发、联调、排障和交接，不替代路由源码。接口发生变化时，应同时更新对应路由、测试和本文。
 
 ## 1. 基址与服务边界
@@ -331,23 +331,24 @@ Content-Type: application/json
 | `POST` | `/records/:id/analyze-transcript` | 分析逐字稿 |
 | `PATCH` | `/records/:id/official-response` | 标记官方已响应 |
 
-内容列表常用筛选包括平台、情感、风险、处置状态、关键词、发布时间和排序。最终字段名以对应路由中的参数解析器为准。
+内容列表常用筛选包括平台、情感、风险、处理模式、关键词、发布时间和排序。`status=ticketed` 筛选已转工单内容；旧链接中的 `ticket=with|without` 仍由接口兼容。`keyword` 也会匹配关联工单号码。最终字段名以对应路由中的参数解析器为准。
 
 ### 4.9 工单 `/api/tickets`
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/` | 用户显式转工单 |
-| `GET` | `/` | 工单列表 |
-| `GET` | `/dispatched` | 已转工单工作台 |
+| `GET` | `/` | 工单列表；内容工单在内容分诊中维护，评论工单继续兼容原有流程 |
+| `GET` | `/dispatched` | 旧工单闭环列表兼容接口（当前后台不再提供独立入口） |
 | `GET` | `/export` | 导出 |
 | `GET` | `/assignees` | 可选处理人 |
 | `GET` | `/:id/source` | 工单来源内容与关联巡查数据 |
 | `POST` | `/:id/notes` | 追加处理记录 |
-| `PATCH` | `/:id` | 更新状态、处理人等 |
-| `PATCH` | `/:id/review` | 复核 |
+| `PATCH` | `/:id/external-number` | 为现有未结案工单录入号码；内容工单可携带旧号码安全修改，评论工单仍只补空号，不会创建新单 |
+| `PATCH` | `/:id` | 更新状态、处理人等；内容工单 `action=close` 会在同一事务中归档来源内容 |
+| `PATCH` | `/:id/review` | 旧复核流程兼容接口（当前后台无独立复核页面） |
 
-迁移 `050_ticket_comment_record_link.sql` 使工单可以追溯评论与作品；工单详情还应保留相关互动快照和巡查时间线，而不是只复制转单时的一份静态数据。
+迁移 `050_ticket_comment_record_link.sql` 使工单可以追溯评论与作品；迁移 `057_content_ticket_inline_triage.sql` 增加客户外部工单号，并把“已转工单”纳入内容处理模式。`058_content_ticket_processing_mode.sql` 修正已登记早期 057 的环境。工单详情还应保留相关互动快照和巡查时间线，而不是只复制转单时的一份静态数据。
 
 ### 4.10 社交账号与每日负载 `/api/social-accounts`
 
@@ -427,11 +428,15 @@ x-tenant-id: <tenant-id>
 Content-Type: application/json
 
 {
-  "recordId": "<record-id>",
+  "sourceType": "content",
+  "sourceId": "<record-id>",
+  "externalTicketNo": "WO-2026-00123",
   "priority": "normal",
   "note": "已私信，需要持续跟踪"
 }
 ```
+
+`externalTicketNo` 最多 100 个字符；为兼容旧客户端可为空。内容转单会把 `record_triage.status` 更新为 `ticketed`，评论转单仍沿用评论队列的 `ticketed` 状态。通用分诊更新接口不接受 `ticketed`，必须实际创建工单后才能进入该模式。重复转单请求会返回同一张在途工单。列表录入或修改号码使用 `PATCH /api/tickets/:id/external-number`：只接受未结案、未归档的现有工单，不会创建新单；内容工单修改已有号码时应同时提交 `previousExternalTicketNo`，服务端在锁内校验旧值，若已被其他人修改则返回 `409 ticket_number_conflict`；同值重试幂等。评论工单仍只允许从空号补录，已有号码拒绝覆盖。
 
 ## 6. 开发与发布校验
 

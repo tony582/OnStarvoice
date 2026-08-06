@@ -508,6 +508,8 @@ export async function runEnhancementWithSingleRetry({
   prepareRetry = null,
   waitBeforeRetry = null,
   shouldStop = null,
+  smallBatchThreshold = 2,
+  smallBatchMaxRetries = 2,
 } = {}) {
   if (typeof runAttempt !== "function") {
     throw new TypeError("enhancement retry requires runAttempt");
@@ -539,7 +541,7 @@ export async function runEnhancementWithSingleRetry({
   } catch (error) {
     initialResult = normalizeThrownAttemptError(error, normalizedRecordIds);
   }
-  const retryRecordIds = collectRetryableEnhancementRecordIds(initialResult, {
+  let retryRecordIds = collectRetryableEnhancementRecordIds(initialResult, {
     fallbackRecordIds: normalizedRecordIds,
   });
   if (retryRecordIds.length === 0) {
@@ -577,87 +579,141 @@ export async function runEnhancementWithSingleRetry({
     };
   }
 
-  const retryMetadata = {
-    recordIds: retryRecordIds,
-    retryCount: 1,
-    maxRetries: 1,
-    initialResult,
-    requiresContextRebuild: isRunnerContextFailure(initialResult),
-    initialFailureCode: readTopLevelFailureCode(initialResult),
-  };
-  try {
-    await onRetryScheduled?.(retryMetadata);
-  } catch (error) {
-    console.warn("[EnhancementRetry] retry scheduled hook failed:", error);
-  }
-  try {
-    await waitBeforeRetry?.(retryMetadata);
-  } catch (error) {
-    console.warn("[EnhancementRetry] retry wait hook failed:", error);
-  }
-  if (stopRequested()) {
-    return {
-      ...initialResult,
-      canceled: true,
-      autoRetryHandled: true,
-      autoRetryAttempted: false,
-      autoRetryCount: 0,
-      autoRetryRecordIds: retryRecordIds,
-      autoRetryRecoveredIds: [],
-      autoRetryStillFailedIds: retryRecordIds,
-      autoRetrySkippedReason: "stopped_during_retry_wait",
-      autoRetryScheduled: true,
-    };
-  }
+  const normalizedSmallBatchThreshold = Math.max(
+    0,
+    Math.floor(Number(smallBatchThreshold) || 0),
+  );
+  const normalizedSmallBatchMaxRetries = Math.max(
+    1,
+    Math.floor(Number(smallBatchMaxRetries) || 1),
+  );
+  // Keep ordinary batches at one retry. Only one or two transiently failed
+  // records receive a second item-only compensation, which is materially
+  // cheaper and safer than rerunning the whole keyword.
+  const maxRetries =
+    retryRecordIds.length <= normalizedSmallBatchThreshold
+      ? normalizedSmallBatchMaxRetries
+      : 1;
+  const originalInitialResult = initialResult;
+  let mergedResult = initialResult;
+  let retryCount = 0;
+  let retryScheduled = false;
+  const attemptedRecordIds = new Set();
 
-  try {
-    await onRetryStarted?.(retryMetadata);
-  } catch (error) {
-    console.warn("[EnhancementRetry] retry started hook failed:", error);
-  }
-  let retryResult;
-  if (typeof prepareRetry === "function") {
+  const withRetrySummary = (result, overrides = {}) => {
+    const attemptedIds = [...attemptedRecordIds];
+    const finalById = new Map(
+      (Array.isArray(result?.results) ? result.results : [])
+        .map((item) => [normalizeText(item?.recordId), item])
+        .filter(([recordId]) => Boolean(recordId)),
+    );
+    const recoveredIds = attemptedIds.filter(
+      (recordId) => finalById.get(recordId)?.ok === true,
+    );
+    const stillFailedIds = attemptedIds.filter(
+      (recordId) => finalById.get(recordId)?.ok !== true,
+    );
+    return {
+      ...result,
+      autoRetryHandled: true,
+      autoRetryAttempted: retryCount > 0,
+      autoRetryCount: retryCount,
+      autoRetryMaxRetries: maxRetries,
+      autoRetryRecordIds: attemptedIds,
+      autoRetryRecoveredIds: recoveredIds,
+      autoRetryStillFailedIds: stillFailedIds,
+      autoRetryInitialRunnerInterrupted:
+        originalInitialResult?.runnerInterrupted === true,
+      autoRetryInitialRecoveryRequired:
+        originalInitialResult?.recoveryRequired === true,
+      autoRetryScheduled: retryScheduled,
+      ...overrides,
+    };
+  };
+
+  for (let retryIndex = 1; retryIndex <= maxRetries; retryIndex += 1) {
+    if (retryRecordIds.length === 0) break;
+    const retryMetadata = {
+      recordIds: retryRecordIds,
+      retryCount: retryIndex,
+      maxRetries,
+      initialResult: mergedResult,
+      requiresContextRebuild: isRunnerContextFailure(mergedResult),
+      initialFailureCode: readTopLevelFailureCode(mergedResult),
+    };
+    retryScheduled = true;
     try {
-      await prepareRetry(retryMetadata);
+      await onRetryScheduled?.(retryMetadata);
+    } catch (error) {
+      console.warn("[EnhancementRetry] retry scheduled hook failed:", error);
+    }
+    try {
+      await waitBeforeRetry?.(retryMetadata);
+    } catch (error) {
+      console.warn("[EnhancementRetry] retry wait hook failed:", error);
+    }
+    if (stopRequested()) {
+      return withRetrySummary(mergedResult, {
+        canceled: true,
+        autoRetrySkippedReason: "stopped_during_retry_wait",
+      });
+    }
+
+    retryCount = retryIndex;
+    retryRecordIds.forEach((recordId) => attemptedRecordIds.add(recordId));
+    try {
+      await onRetryStarted?.(retryMetadata);
+    } catch (error) {
+      console.warn("[EnhancementRetry] retry started hook failed:", error);
+    }
+
+    let retryResult;
+    if (typeof prepareRetry === "function") {
+      try {
+        await prepareRetry(retryMetadata);
+      } catch (error) {
+        retryResult = normalizeAttemptResult(null, retryRecordIds, {
+          thrownError: error,
+          synthesizeMissing: true,
+          missingMeansRecovery: true,
+        });
+        mergedResult = mergeEnhancementAttemptResults({
+          initialResult: mergedResult,
+          retryResult,
+          retryRecordIds,
+        });
+        return withRetrySummary(mergedResult, {
+          autoRetryPreparationFailed: true,
+        });
+      }
+    }
+    try {
+      const rawRetryResult = await runAttempt(retryRecordIds, {
+        attempt: retryIndex + 1,
+        isRetry: true,
+        retryCount: retryIndex,
+        maxRetries,
+      });
+      retryResult = normalizeAttemptResult(rawRetryResult, retryRecordIds, {
+        synthesizeMissing: true,
+        missingMeansRecovery: true,
+      });
     } catch (error) {
       retryResult = normalizeAttemptResult(null, retryRecordIds, {
         thrownError: error,
         synthesizeMissing: true,
         missingMeansRecovery: true,
       });
-      return {
-        ...mergeEnhancementAttemptResults({
-          initialResult,
-          retryResult,
-          retryRecordIds,
-        }),
-        autoRetryScheduled: true,
-        autoRetryPreparationFailed: true,
-      };
     }
-  }
-  try {
-    const rawRetryResult = await runAttempt(retryRecordIds, {
-      attempt: 2,
-      isRetry: true,
-    });
-    retryResult = normalizeAttemptResult(rawRetryResult, retryRecordIds, {
-      synthesizeMissing: true,
-      missingMeansRecovery: true,
-    });
-  } catch (error) {
-    retryResult = normalizeAttemptResult(null, retryRecordIds, {
-      thrownError: error,
-      synthesizeMissing: true,
-      missingMeansRecovery: true,
-    });
-  }
-  return {
-    ...mergeEnhancementAttemptResults({
-      initialResult,
+    mergedResult = mergeEnhancementAttemptResults({
+      initialResult: mergedResult,
       retryResult,
       retryRecordIds,
-    }),
-    autoRetryScheduled: true,
-  };
+    });
+    retryRecordIds = collectRetryableEnhancementRecordIds(mergedResult, {
+      fallbackRecordIds: retryRecordIds,
+    });
+  }
+
+  return withRetrySummary(mergedResult);
 }

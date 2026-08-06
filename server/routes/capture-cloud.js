@@ -63,10 +63,20 @@ const DISMISSIBLE_ATTENTION_STATUSES = new Set([
   'completed_with_failures',
 ]);
 const CROSS_DEVICE_RETRY_SOURCE_STATUSES = new Set([
+  'needs_action',
   'failed',
   'completed_with_failures',
 ]);
+const AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES = new Set([
+  'pending',
+  'running',
+]);
 const CROSS_DEVICE_RETRY_ITEM_STATUSES = new Set([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
   'retryable',
   'needs_action',
   'failed',
@@ -79,12 +89,18 @@ const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
   'canceled',
   'skipped',
   'superseded',
+  'needs_action',
 ]);
+const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
 const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
   'DOUYIN_SEARCH_SECURITY_CHALLENGE',
   'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
   'DOUYIN_CAPTCHA_REQUIRED',
   'CAPTCHA_PAGE_DETECTED',
+  'LOGIN_REQUIRED',
+  'AUTH_REQUIRED',
+  'DOUYIN_LOGIN_REQUIRED',
+  'XHS_LOGIN_REQUIRED',
 ]);
 const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
   'unattended_keyword_capture',
@@ -92,6 +108,25 @@ const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
+]);
+const CROSS_DEVICE_RETRY_UNSTARTED_ITEM_STATUSES = new Set([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+]);
+const CROSS_DEVICE_RETRY_PERMANENT_CODES = new Set([
+  'CONTENT_UNAVAILABLE',
+  'INVALID_RECORD',
+  'LINK_MISSING',
+  'IDENTITY_MISMATCH',
+  'DOUYIN_DETAIL_ID_MISMATCH',
+  'DOUYIN_COMMENT_ID_MISMATCH',
+  'DOUYIN_COMMENT_ID_CONFLICT',
+  'CANCELED',
+  'DETAIL_CAPTURE_CANCELED',
+  'USER_CANCELED',
 ]);
 const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
   task_not_found: ['task_not_found', '任务不存在'],
@@ -139,6 +174,14 @@ const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
   retry_profile_execution_busy: [
     'retry_profile_execution_busy',
     '该账号已有另一轮巡查正在等待或执行',
+  ],
+  automatic_retry_disabled: [
+    'automatic_retry_disabled',
+    '该任务已关闭自动空闲 Agent 接力',
+  ],
+  retry_items_not_automatically_recoverable: [
+    'retry_items_not_automatically_recoverable',
+    '未完成项已达到自动恢复上限或属于不可重试业务失败',
   ],
   idempotency_key_conflict: [
     'idempotency_key_conflict',
@@ -361,27 +404,75 @@ export function captureTaskSnapshotFingerprint(snapshot = {}) {
 
 function promotedRetryBusinessTaskType(task = {}) {
   const metadata = safeJson(task.metadata);
+  const featureTaskType = text(task.feature_key, 80);
   return text(
     metadata.promotedBusinessTaskType ||
       metadata.businessTaskType ||
       metadata.workflow ||
-      task.task_type,
+      (CROSS_DEVICE_RETRY_TASK_TYPES.has(featureTaskType)
+        ? featureTaskType
+        : '') ||
+      (task.task_type === 'capture_orchestration'
+        ? 'unattended_keyword_capture'
+        : task.task_type),
     80,
   );
 }
 
 export function crossDeviceRetryTaskSupported(task = {}) {
   if (task.parent_task_id) return false;
-  const metadata = safeJson(task.metadata);
-  if (
-    task.task_type === 'capture_orchestration' &&
-    metadata.promotedRetryParent !== true
-  ) {
-    return false;
-  }
   return CROSS_DEVICE_RETRY_TASK_TYPES.has(
     promotedRetryBusinessTaskType(task),
   );
+}
+
+function crossDeviceRetrySourceReady(task = {}, {automatic = false} = {}) {
+  if (CROSS_DEVICE_RETRY_SOURCE_STATUSES.has(task.status)) return true;
+  if (!automatic || !AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES.has(task.status)) {
+    return false;
+  }
+  const metadata = safeJson(task.metadata);
+  return Boolean(text(metadata.lastAutomaticRecoveryTaskId, 100));
+}
+
+export function classifyCaptureRecoveryDisposition(item = {}) {
+  if (crossDeviceRetryItemNeedsManualSafety(item)) {
+    return {kind: 'manual_current', automatic: false};
+  }
+  const status = text(item.status, 80).toLowerCase();
+  if (
+    Number(item.attempt_count || 0) >=
+    AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
+  ) {
+    return {kind: 'automatic_attempts_exhausted', automatic: false};
+  }
+  if (
+    !item.started_at &&
+    CROSS_DEVICE_RETRY_UNSTARTED_ITEM_STATUSES.has(status)
+  ) {
+    return {kind: 'auto_handoff', automatic: true};
+  }
+  const error = safeJson(item.error);
+  const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
+  const code = text(
+    error.code || checkpoint.errorCode || checkpoint.error_code,
+    100,
+  ).toUpperCase();
+  const category = text(
+    error.category || checkpoint.errorCategory || checkpoint.error_category,
+    100,
+  ).toLowerCase();
+  if (
+    CROSS_DEVICE_RETRY_PERMANENT_CODES.has(code) ||
+    ['invalid_record', 'link_missing', 'integrity_blocked', 'user_canceled']
+      .includes(category)
+  ) {
+    return {kind: 'terminal_business_failure', automatic: false};
+  }
+  if (['retryable', 'needs_action', 'failed'].includes(status)) {
+    return {kind: 'auto_retry_or_handoff', automatic: true};
+  }
+  return {kind: 'wait', automatic: false};
 }
 
 export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
@@ -392,7 +483,8 @@ export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
     100,
   ).toUpperCase();
   return CROSS_DEVICE_RETRY_SAFETY_CODES.has(code) ||
-    error.category === 'platform_safety_block' ||
+    ['platform_safety_block', 'login_required', 'authentication_required']
+      .includes(text(error.category, 100).toLowerCase()) ||
     error.securityBlocked === true ||
     error.platformSafetyBlocked === true ||
     error.requiresManualAction === true ||
@@ -457,7 +549,7 @@ export function crossDeviceRetryAgentSupportsTask(
     return capabilities.officialAccountPostDiscovery === true;
   }
   if (taskType === 'official_account_comment_patrol') {
-    if (isProfilePatrolTask(task, commandPayload)) {
+    if (isProfilePatrolTask({...task, task_type: taskType}, commandPayload)) {
       return capabilities.officialAccountCommentPatrolProfileV1 === true &&
         capabilities.officialAccountLatestPostsByCountV1 === true;
     }
@@ -6472,7 +6564,10 @@ async function synthesizePromotedKeywordItems(tx, task, sourceTaskId) {
 
 async function promoteSingleNodeTaskForRetry(tx, task) {
   const metadata = safeJson(task.metadata);
-  if (metadata.promotedRetryParent === true) {
+  if (
+    task.task_type === 'capture_orchestration' ||
+    metadata.promotedRetryParent === true
+  ) {
     return {
       parent: task,
       businessTaskType: promotedRetryBusinessTaskType(task),
@@ -6654,6 +6749,41 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
             active_command.expires_at > now()
           )
       ) AS active_command_count
+      , (
+        SELECT COUNT(*)::integer
+        FROM capture_tasks recent_failure
+        WHERE recent_failure.tenant_id = ca.tenant_id
+          AND COALESCE(
+            recent_failure.assigned_agent_id,
+            recent_failure.origin_agent_id
+          ) = ca.id
+          AND recent_failure.created_at > now() - interval '2 hours'
+          AND recent_failure.status IN ('failed', 'completed_with_failures')
+          AND NOT (
+            COALESCE(recent_failure.error::text, '') ~*
+              'captcha|security.verification|login.required|safety.block'
+          )
+      ) AS recent_technical_failure_count
+      , (
+        SELECT COUNT(*)::integer
+        FROM capture_tasks recent_success
+        WHERE recent_success.tenant_id = ca.tenant_id
+          AND COALESCE(
+            recent_success.assigned_agent_id,
+            recent_success.origin_agent_id
+          ) = ca.id
+          AND recent_success.created_at > now() - interval '2 hours'
+          AND recent_success.status IN ('completed', 'completed_with_warnings')
+      ) AS recent_success_count
+      , (
+        SELECT MAX(recent_assignment.created_at)
+        FROM capture_tasks recent_assignment
+        WHERE recent_assignment.tenant_id = ca.tenant_id
+          AND COALESCE(
+            recent_assignment.assigned_agent_id,
+            recent_assignment.origin_agent_id
+          ) = ca.id
+      ) AS last_assignment_at
     FROM capture_agents ca
     JOIN tenants tenant ON tenant.id = ca.tenant_id
     LEFT JOIN auth_codes ac
@@ -6663,7 +6793,11 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
     WHERE ca.tenant_id = $1
       AND ca.status = 'active'
       AND NOT (ca.id = ANY($2::uuid[]))
-    ORDER BY ca.last_heartbeat_at DESC NULLS LAST, ca.id
+    ORDER BY recent_technical_failure_count ASC,
+      recent_success_count DESC,
+      last_assignment_at ASC NULLS FIRST,
+      ca.last_heartbeat_at DESC NULLS LAST,
+      ca.id
   `, [
     tenantId,
     excludedIds,
@@ -6841,27 +6975,22 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
   return {executionIdByItem};
 }
 
-router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
-  try {
-    const taskId = text(req.params.id, 100).toLowerCase();
-    const requestKey = text(req.body?.requestKey, 100).toLowerCase();
-    const expectedRevision = Number(req.body?.expectedRevision);
-    if (!UUID_PATTERN.test(taskId) || !UUID_PATTERN.test(requestKey)) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_retry_request',
-        message: '任务标识或重试请求标识无效，请刷新后重试',
-      });
-    }
-    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_expected_revision',
-        message: '任务版本无效，请刷新后重试',
-      });
-    }
-
-    const result = await withTransaction(async tx => {
+async function dispatchCrossDeviceRetry({
+  tenantId,
+  taskId,
+  requestKey,
+  expectedRevision,
+  actorType = 'system',
+  requestedByUserId = '',
+  requestedByName = '自动调度中心',
+  automatic = false,
+} = {}) {
+  const req = {
+    tenantId,
+    user: requestedByUserId ? {id: requestedByUserId} : null,
+    actorName: requestedByName,
+  };
+  return await withTransaction(async tx => {
       await tx.execute(
         'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
         ['capture_cross_device_retry', requestKey],
@@ -6889,10 +7018,20 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         WHERE id = $1 AND tenant_id = $2
       `, [taskId, req.tenantId]);
       if (!initialTask) return {error: 'task_not_found'};
+      const initialPlanSnapshot = safeJson(
+        safeJson(initialTask.metadata).planSnapshot,
+      );
+      if (
+        automatic &&
+        safeJson(initialPlanSnapshot.recoveryPolicy)
+          .allowIdleAgentHandoff === false
+      ) {
+        return {error: 'automatic_retry_disabled'};
+      }
       if (!crossDeviceRetryTaskSupported(initialTask)) {
         return {error: 'task_cross_device_retry_unsupported'};
       }
-      if (!CROSS_DEVICE_RETRY_SOURCE_STATUSES.has(initialTask.status)) {
+      if (!crossDeviceRetrySourceReady(initialTask, {automatic})) {
         return {error: 'task_not_settled_for_retry'};
       }
       if (Number(initialTask.orchestration_revision || 0) !== expectedRevision) {
@@ -6942,7 +7081,7 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
       if (!task) return {error: 'task_not_found'};
       if (
         !crossDeviceRetryTaskSupported(task) ||
-        !CROSS_DEVICE_RETRY_SOURCE_STATUSES.has(task.status)
+        !crossDeviceRetrySourceReady(task, {automatic})
       ) {
         return {error: 'task_not_settled_for_retry'};
       }
@@ -6969,14 +7108,46 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         parent.id,
         [...CROSS_DEVICE_RETRY_ITEM_STATUSES],
       ]);
-      const retryItems = items.filter(item =>
-        !crossDeviceRetryItemNeedsManualSafety(item)
+      let retryItems = items.filter(
+        item => classifyCaptureRecoveryDisposition(item).automatic,
       );
+      if (automatic && retryItems.length > 0) {
+        const executionTaskIds = Array.from(new Set(
+          retryItems
+            .map(item => text(item.execution_task_id, 100))
+            .filter(Boolean),
+        ));
+        const sourceStates = executionTaskIds.length > 0
+          ? await tx.queryAll(`
+              SELECT id, status
+              FROM capture_tasks
+              WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+            `, [req.tenantId, executionTaskIds])
+          : [];
+        const sourceStatusById = new Map(
+          sourceStates.map(source => [String(source.id), source.status]),
+        );
+        retryItems = retryItems
+          .filter(item => {
+            const executionTaskId = text(item.execution_task_id, 100);
+            return !executionTaskId ||
+              CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES.has(
+                sourceStatusById.get(executionTaskId),
+              );
+          })
+          .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
+          .slice(0, 1);
+      }
       if (retryItems.length === 0) {
+        const hasManualSafetyItem = items.some(item =>
+          classifyCaptureRecoveryDisposition(item).kind === 'manual_current',
+        );
         abortCrossDeviceRetry(
-          items.length > 0
+          hasManualSafetyItem
             ? 'retry_requires_manual_safety_action'
-            : 'retry_items_unavailable',
+            : items.length > 0
+              ? 'retry_items_not_automatically_recoverable'
+              : 'retry_items_unavailable',
         );
       }
       if (
@@ -7114,6 +7285,7 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         crossDeviceRetry: true,
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
+        automaticRecovery: automatic,
         requestedByUserId: req.user?.id || '',
         requestedByName: text(req.actorName, 240),
       };
@@ -7261,17 +7433,29 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         ORDER BY ordinal, id
       `, [req.tenantId, parent.id]);
       const aggregate = aggregateParentTaskItems(refreshedItems);
+      const parentRetryMetadata = {
+        lastCrossDeviceRetryAt: new Date().toISOString(),
+        lastCrossDeviceRetryTaskId: child.id,
+        lastCrossDeviceRetryAgentId: targetAgent.id,
+        lastCrossDeviceRetryRequestKey: child.id,
+        ...(automatic
+          ? {
+              automaticRecoveryCount:
+                Math.max(
+                  0,
+                  Number(safeJson(parent.metadata).automaticRecoveryCount) || 0,
+                ) + 1,
+              lastAutomaticRecoveryAt: new Date().toISOString(),
+              lastAutomaticRecoveryTaskId: child.id,
+            }
+          : {}),
+      };
       const parentUpdate = await tx.queryOne(`
         UPDATE capture_tasks
         SET orchestration_revision = $1,
           status = $2, progress = $3::jsonb, counts = $4::jsonb,
-          metadata = metadata || jsonb_build_object(
-            'lastCrossDeviceRetryAt', now(),
-            'lastCrossDeviceRetryTaskId', $5::uuid::text,
-            'lastCrossDeviceRetryAgentId', $6::uuid::text,
-            'lastCrossDeviceRetryRequestKey', $5::uuid::text
-          ),
-          message = '未完成项已在原任务内转交其他空闲设备重试',
+          metadata = metadata || $5::jsonb,
+          message = $6,
           finished_at = NULL, attention_dismissed_at = NULL,
           updated_at = now(), source_updated_at = now()
         WHERE id = $7 AND tenant_id = $8
@@ -7283,8 +7467,10 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         aggregate.status,
         JSON.stringify(aggregate.progress),
         JSON.stringify(aggregate.counts),
-        child.id,
-        targetAgent.id,
+        JSON.stringify(parentRetryMetadata),
+        automatic
+          ? '系统已把未完成项自动转交其他空闲设备'
+          : '未完成项已在原任务内转交其他空闲设备重试',
         parent.id,
         req.tenantId,
         Number(parent.orchestration_revision || 0),
@@ -7299,17 +7485,20 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         taskId: parent.id,
         agentId: targetAgent.id,
         eventType: 'cross_device_retry_dispatched',
-        actorType: 'user',
+        actorType,
         actorId: req.user?.id || '',
         actorName: req.actorName,
         status: parentUpdate.status,
-        message: '未完成项已转交在线空闲设备，并保留在原任务中',
+        message: automatic
+          ? '系统已自动选择在线空闲设备接管未完成项'
+          : '未完成项已转交在线空闲设备，并保留在原任务中',
         payload: {
           retryTaskId: child.id,
           targetAgentId: targetAgent.id,
           itemIds: retryItems.map(item => item.id),
           sourceExecutionTaskIds,
           revision: parentUpdate.orchestration_revision,
+          automatic,
         },
       });
       return {
@@ -7320,6 +7509,166 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
         parent: parentUpdate,
         itemCount: retryItems.length,
       };
+  });
+}
+
+export async function reconcileAutomaticCaptureRetries(limit = 10) {
+  const normalizedLimit = Math.max(1, Math.min(50, Number(limit) || 10));
+  const candidates = await queryAll(`
+    SELECT id, tenant_id, status, orchestration_revision
+    FROM capture_tasks
+    WHERE parent_task_id IS NULL
+      AND attention_dismissed_at IS NULL
+      AND (
+        status = ANY($1::text[])
+        OR (
+          status = ANY($2::text[])
+          AND COALESCE(metadata->>'lastAutomaticRecoveryTaskId', '') <> ''
+        )
+      )
+      AND updated_at > now() - interval '24 hours'
+      AND COALESCE(metadata->>'orchestrationTemplate', 'false') <> 'true'
+      AND COALESCE(
+        metadata #>> '{planSnapshot,recoveryPolicy,allowIdleAgentHandoff}',
+        'true'
+      ) <> 'false'
+      AND (
+        task_type = ANY($3::text[])
+        OR (
+          task_type = 'capture_orchestration'
+          AND COALESCE(
+            NULLIF(metadata->>'promotedBusinessTaskType', ''),
+            NULLIF(metadata->>'workflow', ''),
+            CASE
+              WHEN feature_key = ANY($3::text[]) THEN feature_key
+              ELSE NULL
+            END,
+            'unattended_keyword_capture'
+          ) = ANY($3::text[])
+        )
+      )
+    ORDER BY
+      CASE status WHEN 'needs_action' THEN 0 ELSE 1 END,
+      updated_at,
+      id
+    LIMIT $4
+  `, [
+    [...CROSS_DEVICE_RETRY_SOURCE_STATUSES],
+    [...AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES],
+    [...CROSS_DEVICE_RETRY_TASK_TYPES],
+    normalizedLimit,
+  ]);
+
+  const summary = {
+    scanned: candidates.length,
+    dispatched: 0,
+    waitingForAgent: 0,
+    manualOnly: 0,
+    skipped: 0,
+    failed: 0,
+    results: [],
+  };
+  for (const candidate of candidates) {
+    let expectedRevision = Number(candidate.orchestration_revision || 0);
+    for (let allocation = 0; allocation < 30; allocation += 1) {
+      try {
+        const result = await dispatchCrossDeviceRetry({
+          tenantId: candidate.tenant_id,
+          taskId: candidate.id,
+          requestKey: crypto.randomUUID(),
+          expectedRevision,
+          actorType: 'system',
+          requestedByName: '自动调度中心',
+          automatic: true,
+        });
+        if (!result?.error) {
+          summary.dispatched += result.existing ? 0 : 1;
+          expectedRevision = Number(
+            result.parent?.orchestration_revision ?? expectedRevision,
+          );
+          summary.results.push({
+            taskId: candidate.id,
+            action: result.existing ? 'existing' : 'dispatched',
+            retryTaskId: result.child?.id || '',
+            itemCount: Number(result.itemCount || 0),
+          });
+          if (result.existing) break;
+          continue;
+        }
+        if (result.error === 'idle_compatible_agent_unavailable') {
+          summary.waitingForAgent += 1;
+        } else if (
+          [
+            'retry_requires_manual_safety_action',
+            'automatic_retry_disabled',
+          ].includes(result.error)
+        ) {
+          summary.manualOnly += 1;
+        } else {
+          summary.skipped += 1;
+        }
+        summary.results.push({
+          taskId: candidate.id,
+          action: result.error,
+        });
+        break;
+      } catch (error) {
+        if (
+          error?.crossDeviceRetryError ||
+          [
+            'cross_device_retry_item_conflict',
+            'cross_device_retry_revision_conflict',
+          ].includes(error?.code)
+        ) {
+          summary.skipped += 1;
+          summary.results.push({
+            taskId: candidate.id,
+            action: error.crossDeviceRetryError || error.code,
+          });
+          break;
+        }
+        summary.failed += 1;
+        summary.results.push({
+          taskId: candidate.id,
+          action: 'worker_error',
+          message: text(error?.message, 240),
+        });
+        break;
+      }
+    }
+  }
+  return summary;
+}
+
+router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const taskId = text(req.params.id, 100).toLowerCase();
+    const requestKey = text(req.body?.requestKey, 100).toLowerCase();
+    const expectedRevision = Number(req.body?.expectedRevision);
+    if (!UUID_PATTERN.test(taskId) || !UUID_PATTERN.test(requestKey)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_retry_request',
+        message: '任务标识或重试请求标识无效，请刷新后重试',
+      });
+    }
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_expected_revision',
+        message: '任务版本无效，请刷新后重试',
+      });
+    }
+
+    const result = await dispatchCrossDeviceRetry({
+      tenantId: req.tenantId,
+      taskId,
+      requestKey,
+      expectedRevision,
+      actorType: 'user',
+      requestedByUserId: req.user?.id || '',
+      requestedByName: text(req.actorName, 240),
+      automatic: false,
     });
 
     if (result.error) {
@@ -7447,6 +7796,35 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
         return { error: 'task_not_recoverable', task };
       }
 
+      let allowedKeywords = [];
+      if (task.parent_task_id) {
+        const parent = await tx.queryOne(`
+          SELECT metadata
+          FROM capture_tasks
+          WHERE id = $1 AND tenant_id = $2
+        `, [task.parent_task_id, req.tenantId]);
+        const parentMetadata = safeJson(parent?.metadata);
+        if (text(parentMetadata.lastCrossDeviceRetryTaskId, 100)) {
+          const retainedItems = await tx.queryAll(`
+            SELECT keyword
+            FROM capture_task_items
+            WHERE tenant_id = $1
+              AND task_id = $2
+              AND execution_task_id = $3
+              AND status = 'needs_action'
+              AND started_at IS NOT NULL
+            ORDER BY ordinal, id
+            LIMIT 30
+          `, [req.tenantId, task.parent_task_id, task.id]);
+          allowedKeywords = retainedItems
+            .map(item => text(item.keyword, 120))
+            .filter(Boolean);
+          if (allowedKeywords.length === 0) {
+            return {error: 'task_handed_off', task};
+          }
+        }
+      }
+
       const command = await tx.queryOne(`
         INSERT INTO capture_agent_commands (
           tenant_id, agent_id, task_id, command_type, payload,
@@ -7461,6 +7839,7 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
           mode,
           controlTaskId: task.control_task_id,
           previousStatus: task.status,
+          ...(allowedKeywords.length > 0 ? {allowedKeywords} : {}),
           authCodeId: task.agent_auth_code_id,
           authBindingId: task.agent_auth_binding_id,
           platform: task.platform,
@@ -7491,7 +7870,7 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
         actorName: req.actorName,
         status: 'resume_requested',
         message: '后台请求继续剩余任务',
-        payload: { commandId: command.id, mode },
+        payload: {commandId: command.id, mode, allowedKeywords},
       });
       return { task, command, existing: false };
     });

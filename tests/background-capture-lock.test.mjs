@@ -3066,6 +3066,83 @@ test("human-confirmed continuation reopens only the blocked keyword without repl
   assert.equal(nextCheckpoint.activePhase, "pending");
 });
 
+test("human-confirmed continuation stays scoped to the captcha keyword after later keywords are handed off", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    status: "needs_action",
+    finishedAt: new Date().toISOString(),
+    planSnapshot: {
+      keywords: ["已完成词", "验证码词", "已接力词一", "已接力词二"],
+      autoLoop: true,
+      maxRounds: 3,
+    },
+    checkpoint: {
+      schemaVersion: 1,
+      round: 2,
+      activeKeywordIndex: 1,
+      activeKeyword: "验证码词",
+      currentKeyword: "验证码词",
+      activePhase: "failed",
+      completedKeywords: ["已完成词"],
+      failedKeywords: ["验证码词"],
+      skippedKeywords: [],
+      attempts: {
+        验证码词: 3,
+        已接力词一: 1,
+      },
+      keywordResults: [
+        {
+          round: 2,
+          index: 0,
+          keyword: "已完成词",
+          status: "completed",
+          savedCount: 8,
+        },
+        {
+          round: 2,
+          index: 1,
+          keyword: "验证码词",
+          status: "failed",
+          attemptCount: 3,
+          securityBlocked: true,
+          requiresManualAction: true,
+        },
+        {
+          round: 2,
+          index: 2,
+          keyword: "已接力词一",
+          status: "pending",
+        },
+      ],
+    },
+    progress: {
+      current: 2,
+      total: 4,
+      keyword: "验证码词",
+    },
+  });
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+    allowedKeywords: ["验证码词"],
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  const recovered = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.deepEqual(Array.from(recovered.planSnapshot.keywords), ["验证码词"]);
+  assert.equal(recovered.planSnapshot.autoLoop, false);
+  assert.equal(recovered.planSnapshot.maxRounds, 1);
+  assert.deepEqual(Array.from(recovered.recoveryAllowedKeywords), ["验证码词"]);
+  assert.deepEqual(
+    Array.from(recovered.checkpoint.keywordResults, entry => entry.keyword),
+    ["验证码词"],
+  );
+  assert.deepEqual(Object.keys(recovered.checkpoint.attempts), []);
+  assert.equal(recovered.checkpoint.activeKeyword, "验证码词");
+  assert.equal(recovered.checkpoint.activeKeywordIndex, 0);
+});
+
 test("progress refreshes the business clock but only a durable milestone resets recovery budgets", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness, {

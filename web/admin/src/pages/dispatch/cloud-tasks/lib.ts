@@ -448,7 +448,7 @@ export function taskPhaseLabel(phase = '') {
 }
 
 const PLATFORM_SAFETY_EVIDENCE_PATTERN =
-  /(platform_safety_block|security_verification|page_challenge|xhs_security_block|douyin_search_security_challenge|http_?429|rate_?limited|captcha|risk.?control|账号异常|账号限制|平台安全|安全限制|安全审核|安全验证|访问频繁|访问受限|验证码|风控)/iu
+  /(platform_safety_block|security_verification|page_challenge|xhs_security_block|douyin_search_security_challenge|http_?429|rate_?limited|captcha|login.?required|auth.?required|risk.?control|登录失效|请(?:先|重新)?登录|账号异常|账号限制|平台安全|安全限制|安全审核|安全验证|访问频繁|访问受限|验证码|风控)/iu
 
 export function isPlatformSafetyAttention(task: CloudTask) {
   const status = String(task.effective_status || task.status || '').toLowerCase()
@@ -705,11 +705,24 @@ const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
 
 export function canRetryOnIdleAgent(task: CloudTask) {
   if (task.parent_task_id || task.pending_command_id) return false
-  if (!['failed', 'completed_with_failures'].includes(task.status)) return false
+  if (!['needs_action', 'failed', 'completed_with_failures'].includes(task.status)) return false
   if (task.task_type === 'capture_orchestration') {
     return task.metadata?.promotedRetryParent === true
   }
   return CROSS_DEVICE_RETRY_TASK_TYPES.has(task.task_type)
+}
+
+export function automaticIdleAgentRecoveryEnabled(task: CloudTask) {
+  const metadata = task.metadata && typeof task.metadata === 'object'
+    ? task.metadata
+    : {}
+  const planSnapshot = metadata.planSnapshot && typeof metadata.planSnapshot === 'object'
+    ? metadata.planSnapshot as Record<string, unknown>
+    : {}
+  const recoveryPolicy = planSnapshot.recoveryPolicy && typeof planSnapshot.recoveryPolicy === 'object'
+    ? planSnapshot.recoveryPolicy as Record<string, unknown>
+    : {}
+  return recoveryPolicy.allowIdleAgentHandoff !== false
 }
 
 export function canStop(task: CloudTask) {

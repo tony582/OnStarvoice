@@ -18,6 +18,11 @@
       return Number.isSafeInteger(tabId) && tabId > 0 ? tabId : null;
     }
 
+    function normalizeGroupId(value) {
+      const groupId = Number(value);
+      return Number.isSafeInteger(groupId) && groupId >= 0 ? groupId : null;
+    }
+
     function normalizeTaskTabRole(value) {
       const role = cleanText(value, 40).toLowerCase();
       if (!role || role === "worker" || role === "detail_worker") {
@@ -197,6 +202,114 @@
           groupsByTaskId.set(normalizedTaskId, group);
           return publicTaskGroup(group);
         });
+      }
+
+      async function restore(snapshot = {}) {
+        return enqueue(async () => {
+          const normalizedTaskId = cleanText(snapshot?.taskId, 320);
+          const normalizedSourceTabId = normalizeTabId(
+            snapshot?.sourceTabId || snapshot?.tabId,
+          );
+          const normalizedGroupId = normalizeGroupId(snapshot?.groupId);
+          if (
+            !normalizedTaskId ||
+            !normalizedSourceTabId ||
+            normalizedGroupId === null
+          ) {
+            throw createError(
+              "invalid_capture_task_group_restore",
+              "采集标签组恢复快照不完整",
+            );
+          }
+
+          const current = groupsByTaskId.get(normalizedTaskId);
+          if (current) {
+            if (
+              current.sourceTabId !== normalizedSourceTabId ||
+              current.groupId !== normalizedGroupId
+            ) {
+              throw createError(
+                "capture_task_group_restore_conflict",
+                "采集标签组已经由另一个页面恢复",
+              );
+            }
+            return publicTaskGroup(current, {restored: true, reused: true});
+          }
+          if (groupsByTaskId.size > 0) {
+            throw createError(
+              "capture_task_group_busy",
+              "已有其它采集标签组正在运行",
+            );
+          }
+
+          let sourceTab;
+          try {
+            sourceTab = await tabsApi.get(normalizedSourceTabId);
+          } catch (error) {
+            throw createError(
+              "capture_task_source_tab_missing",
+              "找不到待恢复采集任务的来源 Tab",
+              error,
+            );
+          }
+          if (normalizeGroupId(sourceTab?.groupId) !== normalizedGroupId) {
+            throw createError(
+              "capture_task_group_restore_mismatch",
+              "来源页面已不在原采集标签组中",
+            );
+          }
+
+          const sourceWindowId = Number.isSafeInteger(sourceTab?.windowId)
+            ? sourceTab.windowId
+            : null;
+          const workerTabIds = [];
+          const missingWorkerTabIds = [];
+          for (const candidate of Array.isArray(snapshot?.workerTabIds)
+            ? snapshot.workerTabIds
+            : []) {
+            const workerTabId = normalizeTabId(candidate);
+            if (!workerTabId || workerTabId === normalizedSourceTabId) continue;
+            try {
+              const workerTab = await tabsApi.get(workerTabId);
+              if (
+                normalizeGroupId(workerTab?.groupId) === normalizedGroupId &&
+                (sourceWindowId === null ||
+                  !Number.isSafeInteger(workerTab?.windowId) ||
+                  workerTab.windowId === sourceWindowId)
+              ) {
+                workerTabIds.push(workerTabId);
+              } else {
+                missingWorkerTabIds.push(workerTabId);
+              }
+            } catch {
+              missingWorkerTabIds.push(workerTabId);
+            }
+          }
+
+          const group = {
+            taskId: normalizedTaskId,
+            sourceTabId: normalizedSourceTabId,
+            workerTabIds: Array.from(new Set(workerTabIds)),
+            groupId: normalizedGroupId,
+            originalGroupId: normalizeGroupId(snapshot?.originalGroupId),
+            windowId: sourceWindowId,
+            title: cleanText(snapshot?.title, 25) ||
+              cleanText(groupTitle, 25) || DEFAULT_GROUP_TITLE,
+          };
+          groupsByTaskId.set(normalizedTaskId, group);
+          return publicTaskGroup(group, {
+            restored: true,
+            missingWorkerTabIds,
+          });
+        });
+      }
+
+      function forget(taskId) {
+        const normalizedTaskId = cleanText(taskId, 320);
+        const group = groupsByTaskId.get(normalizedTaskId);
+        if (!group) return {forgotten: false, reason: "not_grouped"};
+        groupsByTaskId.delete(normalizedTaskId);
+        return {forgotten: true, group: publicTaskGroup(group)};
       }
 
       async function register({taskId, tabId, role = "worker"} = {}) {
@@ -405,6 +518,8 @@
 
       return Object.freeze({
         begin,
+        restore,
+        forget,
         register,
         unregister,
         replaceTab,

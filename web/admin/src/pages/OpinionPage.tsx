@@ -17,11 +17,6 @@ const STATE_TABS = [
   { key: 'done', label: '已处理', countKeys: ['done'] },
   { key: 'dismissed', label: '已忽略', countKeys: ['dismissed'] },
 ]
-const TYPE_OPTIONS = [
-  { value: '', label: '全部来源' },
-  { value: 'content', label: '内容(主贴)' },
-  { value: 'comment', label: '评论' },
-]
 const PLATFORM_OPTIONS = [
   { value: '', label: '全部平台' },
   { value: 'xiaohongshu', label: '小红书' },
@@ -30,7 +25,7 @@ const PLATFORM_OPTIONS = [
 ]
 const STATE_TONE: Record<string, string> = { pending: 'orange', doing: 'blue', done: 'positive', dismissed: 'muted' }
 const STATE_LABEL: Record<string, string> = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略' }
-const FEEDBACK_LABEL: Record<string, string> = { pending_review: '待分诊确认', confirmed: '分诊已确认', reopened: '被打回' }
+const FEEDBACK_LABEL: Record<string, string> = { pending_review: '待结案', confirmed: '已结案', reopened: '已重开' }
 
 interface Pagination { page: number; totalPages: number; total: number }
 
@@ -42,7 +37,6 @@ export function OpinionPage() {
   const [toast, setToast] = useState('')
   const toastTimer = useRef<number | undefined>(undefined)
   useEffect(() => () => window.clearTimeout(toastTimer.current), [])
-  const [type, setType] = useState('')
   const [platform, setPlatform] = useState('')
   const [keyword, setKeyword] = useState('')
   const [items, setItems] = useState<any[]>([])
@@ -55,8 +49,8 @@ export function OpinionPage() {
   const load = useCallback(async (page = 1) => {
     setLoading(true); setError('')
     try {
-      const p = new URLSearchParams({ page: String(page), pageSize: '30', status: state })
-      if (type) p.set('type', type)
+      // 客服工单只承接评论工单；内容工单始终留在内容分诊中处理和结案。
+      const p = new URLSearchParams({ page: String(page), pageSize: '30', status: state, type: 'comment' })
       if (platform) p.set('platform', platform)
       if (keyword.trim()) p.set('q', keyword.trim())
       const data = await api.get<any>('/tickets?' + p.toString())
@@ -66,20 +60,27 @@ export function OpinionPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败')
     } finally { setLoading(false) }
-  }, [state, type, platform, keyword])
+  }, [state, platform, keyword])
 
   useEffect(() => {
     let active = true
     queueMicrotask(() => { if (active) void load(1) })
     return () => { active = false }
-  }, [state, type, platform]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [state, platform]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const act = async (item: any, action: string, needNote = false) => {
     let note: string | undefined
-    if (needNote) {
+    if (needNote || action === 'close') {
+      const closing = action === 'close'
       const v = await ask({
-        title: action === 'dismiss' ? '忽略原因' : '处理结果',
-        placeholder: action === 'dismiss' ? '例如:与本品牌无关 / 重复工单' : '例如:已官方回复并私信用户 / 已转售后跟进',
+        title: closing ? '结案' : action === 'dismiss' ? '忽略原因' : '处理结果',
+        helpText: closing ? '选填，结案说明会保留在工单处理记录中。' : undefined,
+        placeholder: closing
+          ? '填写结案说明 / 处理结论（可留空）'
+          : action === 'dismiss'
+            ? '例如:与本品牌无关 / 重复工单'
+            : '例如:已官方回复并私信用户 / 已转售后跟进',
+        confirmLabel: closing ? '结案' : undefined,
       })
       if (v === null) return false
       note = v
@@ -89,16 +90,22 @@ export function OpinionPage() {
     setDrawer((current: any) => current?.id === item.id ? { ...current, ...updated } : current)
     await load(pagination?.page ?? 1)
     refreshBadges()
-    if (action === 'done' || action === 'dismiss') {
-      setToast(action === 'done' ? '已处理完成,已回执给分诊确认' : '已忽略,已回执给分诊')
+    if (action === 'done' || action === 'dismiss' || action === 'close') {
+      if (action === 'close') setDrawer(null)
+      setToast(action === 'close'
+        ? '评论工单已结案'
+        : action === 'done'
+          ? '已处理完成，可在工单详情中结案'
+          : '已忽略，可在工单详情中结案')
       window.clearTimeout(toastTimer.current)
       toastTimer.current = window.setTimeout(() => setToast(''), 2600)
     }
+    return updated
   }
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
-      <p className="text-[13px] text-muted-foreground">分诊团队转来的工单在这里处理:认领 →「处理中」→ 处理完成。处理完会回执给分诊确认。</p>
+      <p className="text-[13px] text-muted-foreground">评论工单在这里处理：记录进展 → 处理完成或忽略 → 直接结案。内容工单始终在内容分诊中跟进。</p>
 
       <WorkbenchTabs
         tabs={STATE_TABS.map(t => { const n = t.countKeys.reduce((s, k) => s + (counts[k] || 0), 0); return { key: t.key, label: `${t.label}${n ? ` (${n})` : ''}` } })}
@@ -107,15 +114,12 @@ export function OpinionPage() {
       />
 
       <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? items.length)} 个工单`}>
-        <WorkbenchSelect value={type} onChange={e => setType(e.target.value)}>
-          {TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </WorkbenchSelect>
         <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
           {PLATFORM_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
         </WorkbenchSelect>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input value={keyword} onChange={e => setKeyword(e.target.value)} onKeyDown={e => e.key === 'Enter' && load(1)} placeholder="搜索工单内容 / 作者" className="h-8 w-48 pl-8 text-[13px]" />
+          <Input value={keyword} onChange={e => setKeyword(e.target.value)} onKeyDown={e => e.key === 'Enter' && load(1)} placeholder="搜索工单号 / 内容 / 作者" className="h-8 w-48 pl-8 text-[13px]" />
         </div>
         <Button variant="outline" size="sm" onClick={() => load(1)}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
       </WorkbenchToolbar>
@@ -125,12 +129,13 @@ export function OpinionPage() {
       ) : error ? (
         <EmptyState icon={Inbox} title="加载失败" description={error} />
       ) : items.length === 0 ? (
-        <EmptyState icon={Inbox} title={`暂无${STATE_TABS.find(t => t.key === state)?.label || ''}的工单`} description="分诊团队在「工作台」点【转工单】后,工单会进入这里" />
+        <EmptyState icon={Inbox} title={`暂无${STATE_TABS.find(t => t.key === state)?.label || ''}的工单`} description="在评论分诊中点击【转工单】后，评论工单会进入这里" />
       ) : (
         <>
           <div className="space-y-2 lg:hidden">
             {items.map(it => {
               const actionable = canWrite() && (it.status === 'pending' || it.status === 'doing')
+              const closable = canWrite() && (it.status === 'done' || it.status === 'dismissed')
               return (
                 <article key={it.id} data-ticket-detail-trigger className="relative overflow-hidden rounded-xl border border-border bg-card p-3.5 shadow-xs">
                   <span className={`absolute inset-y-0 left-0 w-1 ${it.priority === 'urgent' ? 'bg-status-darkred' : it.priority === 'high' ? 'bg-status-red' : 'bg-status-blue'}`} />
@@ -140,6 +145,7 @@ export function OpinionPage() {
                       <StatusBadge tone={STATE_TONE[it.status] || 'muted'}>{STATE_LABEL[it.status] || it.status}</StatusBadge>
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
                       <StatusBadge tone="neutral">{platformName(it.platform)}</StatusBadge>
+                      {it.external_ticket_no && <StatusBadge tone="ticketed" className="max-w-40"><span className="truncate">工单 {it.external_ticket_no}</span></StatusBadge>}
                       <ChevronRight className="absolute right-3 top-4 h-4 w-4 text-muted-foreground" />
                     </div>
                     <p className="mt-2.5 line-clamp-3 text-[13px] font-semibold leading-5">{it.item_text || it.title || '(无内容)'}</p>
@@ -156,6 +162,7 @@ export function OpinionPage() {
                     {it.url && <Button variant="outline" size="sm" onClick={() => window.open(it.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="h-3.5 w-3.5" />原文</Button>}
                     {actionable && <Button size="sm" className="flex-1" onClick={() => act(it, 'done', true)}>处理完成</Button>}
                     {actionable && <Button variant="ghost" size="sm" onClick={() => act(it, 'dismiss', true)}>忽略</Button>}
+                    {closable && <Button size="sm" className="flex-1" onClick={() => act(it, 'close')}>结案</Button>}
                   </div>
                 </article>
               )
@@ -178,6 +185,7 @@ export function OpinionPage() {
                     <div className="mb-1 flex items-center gap-1.5">
                       <StatusBadge tone={it.source_type === 'comment' ? 'neutral' : 'active'}>{it.source_type === 'comment' ? '评论' : '内容'}</StatusBadge>
                       <StatusBadge tone="neutral">{platformName(it.platform)}</StatusBadge>
+                      {it.external_ticket_no && <StatusBadge tone="ticketed" className="max-w-40"><span className="truncate">工单 {it.external_ticket_no}</span></StatusBadge>}
                       {it.category && <StatusBadge tone="neutral">{LABELS.leadType[it.category] || it.category}</StatusBadge>}
                       {it.url && <a href={it.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
                     </div>
@@ -210,8 +218,8 @@ export function OpinionPage() {
                         <Button size="sm" onClick={() => act(it, 'done', true)}>处理完成</Button>
                         <Button variant="ghost" size="sm" onClick={() => act(it, 'dismiss', true)}>忽略</Button>
                       </>}
-                      {(it.status === 'done' || it.status === 'dismissed') &&
-                        <span className="text-[11px] text-muted-foreground">{it.feedback_status === 'pending_review' ? '待分诊确认' : '已完成'}</span>}
+                      {canWrite() && (it.status === 'done' || it.status === 'dismissed') &&
+                        <Button size="sm" onClick={() => act(it, 'close')}>结案</Button>}
                     </div>
                   </td>
                 </tr>
@@ -237,9 +245,20 @@ export function OpinionPage() {
           canWrite={canWrite()}
           onClose={() => setDrawer(null)}
           onAction={(action) => act(drawer, action, action === 'done' || action === 'dismiss')}
+          onCloseTicket={drawer.source_type === 'comment' && (drawer.status === 'done' || drawer.status === 'dismissed')
+            ? () => act(drawer, 'close')
+            : undefined}
           onNoteAdded={note => {
             setDrawer((current: any) => current ? { ...current, status: current.status === 'pending' ? 'doing' : current.status, updated_at: note.created_at } : current)
             void load(pagination?.page ?? 1)
+          }}
+          onTicketNumberAdded={externalTicketNo => {
+            setItems(current => current.map(item => item.id === drawer.id
+              ? { ...item, external_ticket_no: externalTicketNo }
+              : item))
+            setDrawer((current: any) => current?.id === drawer.id
+              ? { ...current, external_ticket_no: externalTicketNo }
+              : current)
           }}
         />
       )}

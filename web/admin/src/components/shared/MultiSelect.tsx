@@ -102,7 +102,7 @@ export function MultiSelect({
         <div
           ref={menuRef}
           className={cn(
-            'responsive-filter-popover absolute top-full z-50 mt-1 max-w-[calc(100vw-24px)] rounded-xl border border-border bg-card p-2 shadow-lg lg:z-30 lg:rounded-lg',
+            'responsive-filter-popover absolute top-full z-50 mt-1 max-w-[calc(100vw-24px)] rounded-xl border border-border bg-card p-2 shadow-lg lg:rounded-lg',
             alignRight ? 'right-0' : 'left-0',
             width,
           )}

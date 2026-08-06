@@ -24,7 +24,7 @@ import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { TopBar } from '@/components/layout/TopBar'
-import { Smartphone } from 'lucide-react'
+import { PanelLeftOpen, Smartphone } from 'lucide-react'
 import { switchUiMode } from '@/lib/ui-mode'
 
 const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
@@ -81,14 +81,14 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
 const QUEUE_TITLES: Record<string, string> = {
   triage: '内容分诊',
   leads: '评论分诊',
-  feedback: '已转工单',
   misjudgments: '误判反馈',
   issues: '问题处置',
 }
 
 function pageTitle(page: string, params?: Record<string, string> | null) {
   const config = PAGE_CONFIG[page] || PAGE_CONFIG.overview
-  return page === 'workbench' ? (QUEUE_TITLES[params?.queue || 'triage'] || config.title) : config.title
+  const queue = params?.queue === 'feedback' ? 'triage' : (params?.queue || 'triage')
+  return page === 'workbench' ? (QUEUE_TITLES[queue] || config.title) : config.title
 }
 
 export default function DesktopApp() {
@@ -123,24 +123,33 @@ export default function DesktopApp() {
         showInternalItems={officialCommentPreview}
       />
       <main className={cn(
-        'app-main min-w-0 flex-1 overflow-y-auto transition-[margin-left,margin-right] duration-200',
-        collapsed ? 'lg:ml-0' : 'lg:ml-[240px]',
+        'app-main min-w-0 flex-1 overflow-y-auto transition-[margin-left,margin-right] duration-200 [container-type:inline-size]',
+        collapsed ? 'lg:ml-0' : 'lg:ml-[208px]',
         page === 'dispatch' && 'xl:overflow-hidden',
       )}>
-        <TopBar
-          eyebrow={config.eyebrow}
-          title={pageTitle(page, params)}
-          badge={page === 'dispatch' ? 'BETA' : undefined}
-          collapsed={collapsed}
-          onToggleCollapse={toggleCollapse}
-          onOpenMobileNavigation={() => setMobileNavigationOpen(true)}
-        />
+        <div className="lg:hidden">
+          <TopBar
+            eyebrow={config.eyebrow}
+            title={pageTitle(page, params)}
+            badge={page === 'dispatch' ? 'BETA' : undefined}
+            collapsed={collapsed}
+            onToggleCollapse={toggleCollapse}
+            onOpenMobileNavigation={() => setMobileNavigationOpen(true)}
+          />
+        </div>
+        {collapsed && (
+          <button type="button" onClick={toggleCollapse} title="展开导航" aria-label="展开导航"
+            className="fixed left-3 top-3 z-30 hidden h-9 w-9 items-center justify-center rounded-lg border border-border bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground lg:flex">
+            <PanelLeftOpen className="h-[18px] w-[18px]" strokeWidth={1.9} />
+          </button>
+        )}
         <div className={cn(
           'animate-fade-up px-3 sm:px-4 lg:px-6',
           page === 'official-comments'
-            ? 'pb-0 pt-0 xl:h-[calc(100dvh-3.5rem)] xl:overflow-hidden'
+            ? 'pb-0 pt-0 xl:h-dvh xl:overflow-hidden'
             : 'pb-[max(2rem,env(safe-area-inset-bottom))] pt-4 sm:pt-5',
-          page === 'dispatch' && 'xl:h-[calc(100dvh-3.5rem)] xl:pb-0 xl:pr-0 xl:pt-0',
+          page === 'dispatch' && 'xl:h-dvh xl:pb-0 xl:pr-0 xl:pt-0',
+          collapsed && 'lg:pl-14',
         )} key={`${page}:${seq}:${tenantId}`}>
           {PageComponent ? <PageComponent /> : <ComingSoon pageId={page} />}
         </div>

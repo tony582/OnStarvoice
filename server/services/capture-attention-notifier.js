@@ -21,6 +21,10 @@ const SAFETY_CODES = new Set([
   'XHS_SECURITY_BLOCK',
   'PAGE_CHALLENGE',
   'CAPTCHA_REQUIRED',
+  'LOGIN_REQUIRED',
+  'AUTH_REQUIRED',
+  'DOUYIN_LOGIN_REQUIRED',
+  'XHS_LOGIN_REQUIRED',
 ]);
 const CONFIGURATION_ERROR_CODES = new Set([
   'SMTP_NOT_CONFIGURED',
@@ -101,7 +105,11 @@ function hasStructuredSafetyEvidence(value) {
       nestedError.platform_safety_blocked === true ||
       nestedError.requiresManualAction === true ||
       nestedError.requires_manual_action === true ||
-      safetyCategory(source) === 'platform_safety_block' ||
+      [
+        'platform_safety_block',
+        'login_required',
+        'authentication_required',
+      ].includes(safetyCategory(source)) ||
       SAFETY_CODES.has(code)
   );
 }
@@ -300,11 +308,11 @@ export function buildCaptureAttentionEmail(notification = {}) {
   const link = adminUrl
     ? `<p style="margin:24px 0 0"><a href="${escapeHtml(adminUrl)}" style="display:inline-block;padding:10px 16px;border-radius:8px;background:#316ff6;color:#fff;text-decoration:none">打开调度中心处理</a></p>`
     : '';
-  const subject = `[StarVoice 星语] 采集任务需要人工安全验证 · ${title}`;
+  const subject = `[StarVoice 星语] 采集任务需要人工登录或安全验证 · ${title}`;
   const html = `
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:640px;margin:0 auto;color:#111827">
-      <h2 style="font-size:20px;margin:0 0 8px">采集任务需要人工介入</h2>
-      <p style="margin:0 0 20px;color:#6b7280">平台要求完成安全验证，任务已停止继续搜索。请在原 Agent 完成验证，或在调度中心结束/接力任务。</p>
+      <h2 style="font-size:20px;margin:0 0 8px">采集任务需要人工登录或验证</h2>
+      <p style="margin:0 0 20px;color:#6b7280">平台要求重新登录或完成安全验证，当前关键词已停在原 Agent 等待人工。如有其他未开始关键词，系统会自动分配，无需人工选择接力设备。</p>
       <table style="width:100%;border-collapse:collapse;font-size:14px">
         <tr><td style="padding:8px 0;color:#6b7280;width:120px">任务</td><td>${escapeHtml(title)}</td></tr>
         <tr><td style="padding:8px 0;color:#6b7280">Agent</td><td>${escapeHtml(payload.agentName || '—')}</td></tr>

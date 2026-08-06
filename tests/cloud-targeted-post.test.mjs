@@ -298,6 +298,54 @@ test("settles a deleted or unavailable post without retrying it", () => {
   });
 });
 
+test("a deleted post advances the patrol cursor instead of stopping later posts", () => {
+  const targets = [
+    {
+      workflow: "negative_post_patrol",
+      itemId: "item-deleted-first",
+      recordId: "record-deleted-first",
+      externalId: "note-deleted-first",
+      ordinal: 1,
+    },
+    {
+      workflow: "negative_post_patrol",
+      itemId: "item-still-pending",
+      recordId: "record-still-pending",
+      externalId: "note-still-pending",
+      ordinal: 2,
+    },
+  ];
+  const deletedResult = targeted.buildTargetResult({
+    target: targets[0],
+    batchResult: {
+      results: [{
+        ok: true,
+        captured: false,
+        unavailable: true,
+        businessOutcome: "post_unavailable",
+        availabilityStatus: "deleted",
+        retryable: false,
+        availability: {
+          status: "unavailable",
+          availabilityStatus: "deleted",
+          reason: "post_deleted_or_unavailable",
+          code: "TARGET_POST_UNAVAILABLE",
+          message: "平台提示该帖子已删除",
+        },
+      }],
+    },
+  });
+
+  const checkpoint = targeted.buildCheckpoint(targets, [deletedResult]);
+  assert.equal(deletedResult.status, "skipped");
+  assert.equal(deletedResult.retryable, false);
+  assert.equal(checkpoint.nextOrdinal, 2);
+  assert.equal(checkpoint.processedCount, 1);
+  assert.equal(checkpoint.failedCount, 0);
+  assert.equal(checkpoint.unavailableCount, 1);
+  assert.deepEqual(plain(checkpoint.completedItemIds), ["item-deleted-first"]);
+});
+
 test("upgrades an older QR unavailable result to deleted", () => {
   const targets = [{
     workflow: "negative_post_patrol",

@@ -95,7 +95,7 @@ test('transient enhancement failure runs exactly two total attempts and records 
   assert.deepEqual(result.autoRetryRecoveredIds, ['record-retry']);
 });
 
-test('a second transient failure is terminal after exactly two total attempts', async () => {
+test('one transient item receives two bounded item-only retries before settlement', async () => {
   const calls = [];
   const result = await runEnhancementWithSingleRetry({
     recordIds: ['record-retry'],
@@ -112,16 +112,66 @@ test('a second transient failure is terminal after exactly two total attempts', 
     shouldStop: () => false,
   });
 
-  assert.equal(calls.length, 2, 'retry budget must not grow after retry failure');
+  assert.equal(calls.length, 3, 'one item receives two retries, then settles');
   assert.deepEqual(calls[1].recordIds, ['record-retry']);
+  assert.deepEqual(calls[2].recordIds, ['record-retry']);
+  assert.equal(calls[2].attempt, 3);
   assert.equal(result.ok, false);
   assert.equal(result.successCount, 0);
   assert.equal(result.failedCount, 1);
   assert.equal(result.results[0].reason, 'NOTE_CAPTURE_FAILED');
   assert.equal(result.autoRetryAttempted, true);
-  assert.equal(result.autoRetryCount, 1);
+  assert.equal(result.autoRetryCount, 2);
+  assert.equal(result.autoRetryMaxRetries, 2);
   assert.deepEqual(result.autoRetryRecordIds, ['record-retry']);
   assert.deepEqual(result.autoRetryRecoveredIds, []);
+});
+
+test('a one-item second compensation can recover without rerunning successful records', async () => {
+  const calls = [];
+  const result = await runEnhancementWithSingleRetry({
+    recordIds: ['already-ok', 'small-retry'],
+    runAttempt: async (recordIds, metadata) => {
+      calls.push({recordIds: [...recordIds], ...metadata});
+      if (metadata.attempt === 1) {
+        return detailResult([
+          successful('already-ok'),
+          transientFailure('small-retry'),
+        ]);
+      }
+      return metadata.attempt === 2
+        ? detailResult([transientFailure('small-retry')])
+        : detailResult([successful('small-retry')]);
+    },
+  });
+
+  assert.deepEqual(calls.map((call) => call.recordIds), [
+    ['already-ok', 'small-retry'],
+    ['small-retry'],
+    ['small-retry'],
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(result.autoRetryCount, 2);
+  assert.deepEqual(result.autoRetryRecoveredIds, ['small-retry']);
+});
+
+test('larger enhancement failures keep one retry to avoid excess device load', async () => {
+  const recordIds = ['large-a', 'large-b', 'large-c'];
+  let calls = 0;
+  const result = await runEnhancementWithSingleRetry({
+    recordIds,
+    runAttempt: async (attemptRecordIds) => {
+      calls += 1;
+      return detailResult(
+        attemptRecordIds.map((recordId) => transientFailure(recordId)),
+      );
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.autoRetryCount, 1);
+  assert.equal(result.autoRetryMaxRetries, 1);
+  assert.deepEqual(result.autoRetryStillFailedIds, recordIds);
 });
 
 test('retry classifier accepts transient stages and rejects permanent or unsafe failures', () => {
@@ -562,7 +612,7 @@ test('a thrown first attempt is converted to failures and retried once', async (
   assert.deepEqual(result.autoRetryRecoveredIds, ['throw-a', 'throw-b']);
 });
 
-test('a thrown retry is terminal, explicit and preserves unresolved recovery state', async () => {
+test('repeated thrown retries settle after the bounded small-item budget', async () => {
   const calls = [];
   const result = await runEnhancementWithSingleRetry({
     recordIds: ['retry-throws'],
@@ -577,7 +627,7 @@ test('a thrown retry is terminal, explicit and preserves unresolved recovery sta
     },
   });
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.equal(result.ok, false);
   assert.equal(result.failedCount, 1);
   assert.equal(result.processedCount, 1);
@@ -585,6 +635,7 @@ test('a thrown retry is terminal, explicit and preserves unresolved recovery sta
   assert.equal(result.results[0].reason, 'TASK_TAB_GROUP_UNAVAILABLE');
   assert.equal(result.runnerInterrupted, true);
   assert.equal(result.recoveryRequired, true);
+  assert.equal(result.autoRetryCount, 2);
   assert.deepEqual(result.autoRetryStillFailedIds, ['retry-throws']);
 });
 

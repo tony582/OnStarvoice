@@ -175,9 +175,9 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   }
 
   const dispatchTicket = async (lead: any): Promise<boolean> => {
-    const r = await dispatch({ summary: lead.comment_content, defaultPriority: lead.priority })
+    const r = await dispatch({ sourceType: 'comment', summary: lead.comment_content, defaultPriority: lead.priority })
     if (!r) return false
-    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
+    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, externalTicketNo: r.externalTicketNo, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
     await reloadAfterMutation()
     return true
   }

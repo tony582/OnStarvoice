@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.74',
+  latestVersion: '0.3.75',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-03',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.74-20260803.zip',
+  releaseDate: '2026-08-06',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.75-20260806.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.75',
+      releaseDate: '2026-08-06',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: '失败任务自动恢复与逐项接力',
+              desc: '技术失败会自动局部重试，并按关键词或单条帖子分配给兼容的空闲 Agent；验证码与登录验证留在原 Agent，其他未开始项继续运行。',
+            },
+            {
+              title: '内容工单留在内容分诊',
+              desc: '转工单后保留原内容上下文，支持工单号搜索、统一处理记录和结案归档；负面巡查确认删帖后显示“已删帖”风险信号。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '采集现场恢复与小批量增强重试',
+              desc: 'Extension 重启或调试连接中断后会尝试恢复执行现场；少量增强失败只重试失败条目，减少运营介入和整批重跑。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.74',
       releaseDate: '2026-08-03',
