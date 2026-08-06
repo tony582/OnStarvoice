@@ -176,7 +176,6 @@ function getPaginationItems(currentPage: number, totalPages: number): Array<numb
 
 function contentAvailabilityLabel(record: Record<string, unknown>) {
   const status = String(record.content_availability_status || '')
-  if (status === 'deleted') return '原帖已删除'
   if (status === 'page_unavailable') return '已删除或不可访问'
   return ''
 }

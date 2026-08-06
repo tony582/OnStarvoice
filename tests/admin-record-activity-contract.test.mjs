@@ -45,10 +45,12 @@ test('triage risk signals include deleted posts while official response stays se
   assert.match(queue, /\{ value: 'deleted', label: '已删帖' \}/);
   assert.match(queueRisk, /content_availability_status/);
   assert.match(queueRisk, /已删帖/);
+  assert.doesNotMatch(queue, /if \(status === 'deleted'\) return '原帖已删除'/);
   assert.match(route, /risks\.includes\('deleted'\)[^\n]+content_availability_status = 'deleted'/);
   assert.match(drawer, /const deleted = String\(r\.content_availability_status \|\| ''\) === 'deleted'/);
   assert.match(drawer, /const hasSignals = alerts > 0 \|\| negComments > 0 \|\| deleted/);
   assert.match(drawer, /已删帖/);
+  assert.doesNotMatch(drawer, /<StatusBadge tone="muted"><Ban className="h-3 w-3" \/>原帖已删除<\/StatusBadge>/);
   assert.doesNotMatch(drawer, /风险信号[\s\S]{0,900}已官方回复/);
 });
 
