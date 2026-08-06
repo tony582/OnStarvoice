@@ -43,6 +43,36 @@ const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
   'CAPTCHA_PAGE_DETECTED',
 ]);
 const RETRY_ITEM_STATUSES = new Set(['retryable', 'needs_action', 'failed']);
+const ORCHESTRATION_STOPPABLE_STATUSES = new Set([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'resume_requested',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
+]);
+const ORCHESTRATION_STOPPABLE_EXECUTION_STATUSES = [
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'resume_requested',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
+];
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -249,6 +279,29 @@ function publicAgent(agent) {
   };
 }
 
+function publicParentItem(item) {
+  const {
+    source_record_title: sourceRecordTitle,
+    source_record_content: sourceRecordContent,
+    ...publicItem
+  } = item;
+  const metadata = safeJson(item.metadata);
+  const sourceRecord = safeJson(metadata.sourceRecord);
+  return {
+    ...publicItem,
+    metadata: {
+      ...metadata,
+      sourceRecord: {
+        ...sourceRecord,
+        title:
+          text(sourceRecord.title, 500) || text(sourceRecordTitle, 500),
+        content:
+          text(sourceRecord.content, 1000) || text(sourceRecordContent, 1000),
+      },
+    },
+  };
+}
+
 function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
   if (
     agent.tenant_status !== 'active' ||
@@ -409,6 +462,8 @@ async function listParentItems(executor, tenantId, taskId, {lock = false} = {}) 
       item.assignment_revision, item.request_hash, item.error, item.metadata,
       item.assigned_at, item.dispatched_at, item.started_at, item.finished_at,
       item.created_at, item.updated_at,
+      record.title AS source_record_title,
+      record.content AS source_record_content,
       record.content_availability_status,
       record.content_availability_checked_at
     FROM capture_task_items item
@@ -1553,6 +1608,236 @@ router.post(
           409,
         ));
       }
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/orchestrations/:id/stop',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const result = await withTransaction(async tx => {
+        // Negative-patrol reassignment has to lock Agent rows before items.
+        // A parent-scoped advisory fence serializes it with operator stop and
+        // prevents the two valid row-lock orders from deadlocking each other.
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['capture_orchestration_control', orchestrationId],
+        );
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parent) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        const parentMetadata = safeJson(parent.metadata);
+        if (parentMetadata.orchestrationTemplate === true) {
+          return {failure: requestError(
+            'orchestration_schedule_template_stop_unsupported',
+            '这是无人值守计划模板，请使用暂停计划；停止全部只终止具体运行批次',
+            409,
+          )};
+        }
+
+        const loadExecutionTaskIds = async () => {
+          const rows = await tx.queryAll(`
+            SELECT id
+            FROM capture_tasks
+            WHERE tenant_id = $1
+              AND parent_task_id = $2
+              AND status = ANY($3::text[])
+            ORDER BY id
+          `, [
+            req.tenantId,
+            parent.id,
+            ORCHESTRATION_STOPPABLE_EXECUTION_STATUSES,
+          ]);
+          return rows.map(row => row.id);
+        };
+
+        if (parent.status === 'canceled') {
+          return {
+            parent,
+            existing: true,
+            canceledItemCount: 0,
+            executionTaskIds: await loadExecutionTaskIds(),
+          };
+        }
+        if (!ORCHESTRATION_STOPPABLE_STATUSES.has(parent.status)) {
+          return {failure: requestError(
+            'orchestration_not_stoppable',
+            '编排任务当前状态不能停止',
+            409,
+            {status: parent.status},
+          )};
+        }
+
+        // Parent -> item is the same lock order used by dispatch/retry and
+        // heartbeat projection. Once the parent is locked, no new handoff can
+        // enter this orchestration while the operator stop is settling it.
+        await listParentItems(tx, req.tenantId, parent.id, {lock: true});
+        const canceledItems = await tx.queryAll(`
+          UPDATE capture_task_items
+          SET status = 'canceled',
+            metadata = metadata || jsonb_build_object(
+              'operatorStopped', true,
+              'operatorStoppedAt', now()
+            ),
+            finished_at = COALESCE(finished_at, now()),
+            updated_at = now()
+          WHERE tenant_id = $1
+            AND task_id = $2
+            AND status NOT IN (
+              'completed', 'completed_with_warnings', 'skipped', 'canceled'
+            )
+          RETURNING id
+        `, [req.tenantId, parent.id]);
+        await tx.execute(`
+          UPDATE capture_task_item_attempts attempt
+          SET status = 'canceled',
+            finished_at = COALESCE(attempt.finished_at, now()),
+            updated_at = now()
+          FROM capture_task_items item
+          WHERE item.id = attempt.item_id
+            AND item.tenant_id = $1
+            AND item.task_id = $2
+            AND item.status = 'canceled'
+            AND attempt.parent_task_id = $2
+            AND attempt.status NOT IN (
+              'completed', 'completed_with_warnings',
+              'failed', 'skipped', 'canceled'
+            )
+        `, [req.tenantId, parent.id]);
+        const settledItems = await tx.queryAll(`
+          SELECT status
+          FROM capture_task_items
+          WHERE tenant_id = $1 AND task_id = $2
+          ORDER BY ordinal, id
+        `, [req.tenantId, parent.id]);
+        const aggregate = aggregateParentTaskItems(settledItems);
+        const stoppedAt = new Date().toISOString();
+        const parentUpdate = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET status = 'canceled',
+            progress = $1::jsonb,
+            counts = $2::jsonb,
+            metadata = metadata || jsonb_build_object(
+              'operatorStopped', true,
+              'operatorStoppedAt', $3::text,
+              'operatorStoppedByUserId', $4::text,
+              'operatorStoppedByName', $5::text,
+              'automaticRetryDisabled', true
+            ),
+            message = '任务已停止，已完成结果保留，未完成项不再自动接力',
+            orchestration_revision = orchestration_revision + 1,
+            attention_dismissed_at = COALESCE(attention_dismissed_at, now()),
+            finished_at = COALESCE(finished_at, now()),
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $6 AND tenant_id = $7
+          RETURNING id, status, progress, counts, metadata,
+            orchestration_revision, finished_at
+        `, [
+          JSON.stringify({...aggregate.progress, phase: 'canceled'}),
+          JSON.stringify(aggregate.counts),
+          stoppedAt,
+          text(req.user?.id, 240),
+          text(req.actorName, 240),
+          parent.id,
+          req.tenantId,
+        ]);
+        const executionTaskIds = await loadExecutionTaskIds();
+
+        if (
+          parent.orchestration_schedule_id &&
+          parentMetadata.orchestrationScheduleRun === true
+        ) {
+          const schedule = await tx.queryOne(`
+            UPDATE capture_orchestration_schedules
+            SET last_run_at = COALESCE(last_run_at, now()),
+              last_run_status = 'canceled',
+              last_error = '{}'::jsonb,
+              updated_at = now()
+            WHERE id = $1
+              AND tenant_id = $2
+              AND last_run_task_id = $3
+            RETURNING template_task_id, status, next_run_at, last_run_at
+          `, [
+            parent.orchestration_schedule_id,
+            req.tenantId,
+            parent.id,
+          ]);
+          if (schedule) {
+            await tx.execute(`
+              UPDATE capture_tasks
+              SET metadata = metadata || jsonb_build_object(
+                  'scheduleStatus', $1::text,
+                  'nextRunAt', COALESCE($2::timestamptz::text, ''),
+                  'lastRunAt', COALESCE($3::timestamptz::text, ''),
+                  'lastRunStatus', 'canceled',
+                  'lastRunTaskId', $4::uuid::text
+                ),
+                message = '上一轮多 Agent 任务已停止，计划等待下一次运行',
+                updated_at = now(),
+                source_updated_at = now()
+              WHERE id = $5 AND tenant_id = $6
+            `, [
+              schedule.status,
+              schedule.next_run_at,
+              schedule.last_run_at,
+              parent.id,
+              schedule.template_task_id,
+              req.tenantId,
+            ]);
+          }
+        }
+
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_stopped',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: 'canceled',
+          message: '运营人员已停止整个编排任务，未完成项不再自动接力',
+          payload: {
+            previousStatus: parent.status,
+            revision: parentUpdate.orchestration_revision,
+            canceledItemCount: canceledItems.length,
+            executionTaskIds,
+          },
+        });
+        return {
+          parent: parentUpdate,
+          existing: false,
+          canceledItemCount: canceledItems.length,
+          executionTaskIds,
+        };
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.json({
+        ok: true,
+        existing: result.existing === true,
+        status: 'canceled',
+        revision: Number(result.parent.orchestration_revision || 0),
+        canceledItemCount: result.canceledItemCount,
+        executionTaskIds: result.executionTaskIds,
+        message: result.existing
+          ? '任务已经停止'
+          : '整个任务已停止；已完成结果保留，未完成项不再自动接力',
+      });
+    } catch (error) {
       return next(error);
     }
   },
@@ -3259,9 +3544,9 @@ router.get(
           ...orchestration,
           revision: Number(orchestration.orchestration_revision || 0),
         },
-        items: items.sort(
-          (left, right) => Number(left.ordinal) - Number(right.ordinal),
-        ),
+        items: items
+          .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
+          .map(publicParentItem),
         executions: executions.map(execution => ({
           ...execution,
           agent_online: captureAgentOnline(execution.agent_last_heartbeat_at),

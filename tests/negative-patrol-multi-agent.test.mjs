@@ -230,6 +230,11 @@ test('multi-Agent patrol uses a parent business task and one execution child per
   );
   assert.match(
     route,
+    /sourceRecord:\s*\{[\s\S]*content: text\(candidate\.content, 1000\)/u,
+  );
+  assert.match(route, /capture_orchestration_control/u);
+  assert.match(
+    route,
     /negativePatrolExistingRequestMatches\(existing, requestHash\)/u,
   );
   assert.match(route, /task:\s*existing[\s\S]*existing:\s*true/u);

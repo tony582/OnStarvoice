@@ -42,6 +42,10 @@ const RECOVERABLE_STATUSES = new Set([
 ]);
 const REMOTELY_STOPPABLE_STATUSES = new Set([
   'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
   'claimed',
   'running',
   'recovering',
@@ -2058,6 +2062,7 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
   );
   if (
     !parent ||
+    ['canceled', 'superseded'].includes(parent.status) ||
     safeJson(parent.metadata).orchestrationTemplate === true ||
     safeJson(parent.metadata).executionMode === 'unattended_plan'
   ) {
@@ -2297,6 +2302,7 @@ async function refreshOrchestrationParentTask(tx, {
   const parent = lockedParent ||
     await lockOrchestrationParent(tx, tenantId, parentTaskId);
   if (!parent) return null;
+  if (['canceled', 'superseded'].includes(parent.status)) return parent;
 
   const items = await tx.queryAll(`
     SELECT status
@@ -2519,6 +2525,18 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   }
 
   const parentTaskId = text(task.parent_task_id, 100).toLowerCase();
+  const orchestrationParent = parentTaskId
+    ? await lockOrchestrationParent(tx, agent.tenant_id, parentTaskId)
+    : null;
+  if (
+    parentTaskId &&
+    (
+      !orchestrationParent ||
+      ['canceled', 'superseded'].includes(orchestrationParent.status)
+    )
+  ) {
+    return null;
+  }
   const itemOwnerTaskId = parentTaskId || task.id;
   const executionRevision = Math.max(
     0,
@@ -3007,6 +3025,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
     await refreshOrchestrationParentTask(tx, {
       tenantId: agent.tenant_id,
       parentTaskId,
+      parent: orchestrationParent,
       agent,
       snapshot,
       childTaskId: task.id,
@@ -3123,6 +3142,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     task.parent_task_id,
   );
   if (!parent) return null;
+  if (['canceled', 'superseded'].includes(parent.status)) return parent;
 
   // Receiving an accepted child snapshot proves the create command reached a
   // local task. It does not prove that any keyword has started yet.
@@ -7023,8 +7043,11 @@ async function dispatchCrossDeviceRetry({
       );
       if (
         automatic &&
-        safeJson(initialPlanSnapshot.recoveryPolicy)
-          .allowIdleAgentHandoff === false
+        (
+          safeJson(initialTask.metadata).automaticRetryDisabled === true ||
+          safeJson(initialPlanSnapshot.recoveryPolicy)
+            .allowIdleAgentHandoff === false
+        )
       ) {
         return {error: 'automatic_retry_disabled'};
       }
@@ -7528,6 +7551,7 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
       )
       AND updated_at > now() - interval '24 hours'
       AND COALESCE(metadata->>'orchestrationTemplate', 'false') <> 'true'
+      AND COALESCE(metadata->>'automaticRetryDisabled', 'false') <> 'true'
       AND COALESCE(
         metadata #>> '{planSnapshot,recoveryPolicy,allowIdleAgentHandoff}',
         'true'

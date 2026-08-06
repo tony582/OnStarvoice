@@ -14230,11 +14230,19 @@ async function classifyTargetPageAvailabilityInTab(tabId, targetUrl) {
   try {
     const [snapshotExecution] = await chrome.scripting.executeScript({
       target: {tabId: Number(tabId)},
-      func: () => ({
-        url: String(window.location.href || ""),
-        title: String(document.title || ""),
-        bodyText: String(document.body?.innerText || "").slice(0, 20000),
-      }),
+      func: () => {
+        const bodyText = String(document.body?.innerText || "");
+        // 弹窗通常挂在页面末尾。只截正文开头会在长推荐流中丢掉
+        // “当前笔记暂时无法浏览”等真正决定业务结果的弹窗文案。
+        const bodyWindow = bodyText.length <= 20000
+          ? bodyText
+          : `${bodyText.slice(0, 10000)}\n${bodyText.slice(-10000)}`;
+        return {
+          url: String(window.location.href || ""),
+          title: String(document.title || ""),
+          bodyText: bodyWindow,
+        };
+      },
     });
     return (
       targetPageAvailabilityApi.classifySnapshot({
@@ -14534,10 +14542,23 @@ export async function batchCaptureByUrls({
       const captureErrorCode = String(
         captureResult?.error?.code || "",
       ).toUpperCase();
+      const targetPlatform = detectPlatformFromUrl(url);
+      const shouldRecheckUnavailableXhsTarget =
+        mode === "single" &&
+        captureParams.detectUnavailableTargetPage === true &&
+        targetPlatform === "xiaohongshu" &&
+        captureResult?.ok !== true;
+      if (shouldRecheckUnavailableXhsTarget) {
+        // 小红书的不可用弹窗会把地址退回 /explore。页面信号有时晚于
+        // 首次导航探针出现，此时单帖采集会先报“无法从 URL 提取笔记 ID”。
+        // 失败后再读一次高置信不可用页信号，避免把删帖当普通采集失败重试。
+        unavailableAfterCapture =
+          await classifyTargetPageAvailabilityInTab(runnerTabId, url);
+      }
       const shouldRecheckUnavailableDouyinTarget =
         mode === "single" &&
         captureParams.detectUnavailableTargetPage === true &&
-        detectPlatformFromUrl(url) === "douyin" &&
+        targetPlatform === "douyin" &&
         [
           "DOUYIN_CONTENT_UNAVAILABLE",
           "DOUYIN_DETAIL_ID_MISMATCH",
