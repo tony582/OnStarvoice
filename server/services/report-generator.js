@@ -53,7 +53,7 @@ const ISSUE_STATUS_LABEL = {
 const TRIAGE_LABEL = {
   unhandled: '待处理',
   reviewing: '待复核',
-  issue_linked: '已转工单',
+  issue_linked: '已关联事件',
   ticketed: '已转工单',
   official_responded: '官方已响应',
   no_action: '无需操作',
@@ -604,7 +604,14 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        ) as active_inbox,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') as unhandled,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') as reviewing,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') IN ('issue_linked', 'ticketed')) as issue_linked,
+       COUNT(*) FILTER (
+         WHERE COALESCE(rt.status, 'unhandled') = 'ticketed'
+           AND r.record_type <> 'official_content'
+       ) as issue_linked,
+       COUNT(*) FILTER (WHERE r.record_type <> 'official_content' AND (
+         (COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing') AND rt.archived_at IS NULL)
+         OR COALESCE(rt.status, 'unhandled') = 'ticketed'
+       )) as active_or_ticketed,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'no_action') as no_action
      FROM records r
      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
@@ -686,6 +693,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     workflowStats: {
       official_responded: rowNum(workflowStats, 'official_responded'),
       active_inbox: rowNum(workflowStats, 'active_inbox'),
+      active_or_ticketed: rowNum(workflowStats, 'active_or_ticketed'),
       unhandled: rowNum(workflowStats, 'unhandled'),
       reviewing: rowNum(workflowStats, 'reviewing'),
       issue_linked: rowNum(workflowStats, 'issue_linked'),
@@ -958,7 +966,7 @@ function buildOpinionIndex(stats, previousStats, negativeRate, previousNegativeR
     previousCriticalAlerts * 24
   ));
   const response = Math.min(100, Math.round(
-    pct(stats.workflowStats?.issue_linked || 0, Math.max(1, stats.workflowStats?.active_inbox || 0) + num(stats.workflowStats?.issue_linked)) * 0.55 +
+    pct(stats.workflowStats?.issue_linked || 0, Math.max(1, stats.workflowStats?.active_or_ticketed || 0)) * 0.55 +
     pct(stats.officialPeriod?.record_count || 0, Math.max(1, stats.total)) * 0.45
   ));
   return {
@@ -1637,7 +1645,7 @@ function renderOpinionIndex(stats) {
         <div class="osv-track"><div class="osv-fill" style="width:${Math.min(100, Math.max(3, idx.risk))}%;background:${riskColor};"></div></div>
       </div>
       <div class="osv-index-item">
-        <header><span>处置响应指数</span><strong style="color:#059669">${n0(idx.response)}</strong></header>
+        <header><span>处置覆盖指数</span><strong style="color:#059669">${n0(idx.response)}</strong></header>
         <div class="osv-track"><div class="osv-fill" style="width:${Math.min(100, Math.max(3, idx.response))}%;background:#059669;"></div></div>
       </div>
       <div class="osv-index-item">
@@ -1904,7 +1912,7 @@ function buildDataDashboardHTML(title, periodLabel, stats) {
           <div>
             <div class="osv-kicker">Public Opinion Intelligence Dashboard</div>
             <h1 class="osv-title">${escHtml(title)} · 报告看板</h1>
-            <div class="osv-subtitle">${escHtml(periodLabel)} · ${escHtml(stats.periodFocus)} · 声量、情绪、热词、风险样本与处置闭环统一呈现</div>
+            <div class="osv-subtitle">${escHtml(periodLabel)} · ${escHtml(stats.periodFocus)} · 声量、情绪、热词、风险样本与处置覆盖统一呈现</div>
           </div>
           <aside class="osv-risk">
             <span>本期舆情总量</span>
@@ -1977,12 +1985,13 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
   const pnsr = (num(psm.positive) + num(psm.negative)) ? Math.round((num(psm.positive) - num(psm.negative)) / (num(psm.positive) + num(psm.negative)) * 100) : 0;
   const w = stats.workflowStats || {};
   const dispatched = num(w.issue_linked), inbox = num(w.active_inbox);
-  const dispatchRate = (inbox + dispatched) ? Math.round(dispatched / (inbox + dispatched) * 100) : 0;
+  const activeOrTicketed = num(w.active_or_ticketed);
+  const dispatchRate = activeOrTicketed ? Math.round(dispatched / activeOrTicketed * 100) : 0;
   const officialRate = num(stats.total) ? Math.round(num(stats.officialPeriod?.record_count) / num(stats.total) * 100) : 0;
   const repeatIssues = (stats.topIssues || []).filter(i => num(i.record_count) > 1);
   const trendBars = (rows, n) => renderBarRows((rows || []).slice(-n), { labelKey: 'label', valueKey: 'total', color: '#2563EB', maxRows: n });
   const driftLine = `负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})`;
-  const closeLine = `转工单率 ${dispatchRate}% · 官方响应率 ${officialRate}% · 当前待处理 ${n0(inbox)} 条`;
+  const closeLine = `工单覆盖率 ${dispatchRate}% · 官方响应率 ${officialRate}% · 当前待处理 ${n0(inbox)} 条`;
 
   let body = '';
   if (type === 'weekly') {
@@ -1990,7 +1999,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
       ${renderSection('管理摘要', renderList(stats.executiveSummary), '')}
       ${renderSection('本周声量趋势', trendBars(stats.volumeTrend, 7), '按日聚合')}
       ${renderSection('情感漂移', `<p style="${P}">${escHtml(driftLine)}</p>`, '本周 vs 上周')}
-      ${renderSection('处置闭环', `<p style="${P}">${escHtml(closeLine)}</p>`, '监测 → 处置效率')}
+      ${renderSection('处置覆盖', `<p style="${P}">${escHtml(closeLine)}</p>`, '监测 → 人工处置覆盖')}
       ${renderSection('行动建议', renderList(stats.actionItems.slice(0, 6), true), '')}
       ${renderSection('本周 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 5), '暂无重点风险内容'), '')}
       ${renderSection('待处理问题', renderIssues(stats.topIssues.slice(0, 5)), '')}`;
@@ -1998,7 +2007,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
     body = `
       ${renderSection('管理层复盘摘要', renderList(stats.executiveSummary), '')}
       ${renderSection('月度声量趋势', trendBars(bucketTrend(stats.volumeTrend, 6), 6), '分段聚合,避免日点拥挤')}
-      ${renderSection('月度复盘', `<p style="${P}">处置效率:转工单率 ${dispatchRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置效率 + 口碑环比')}
+      ${renderSection('月度复盘', `<p style="${P}">处置覆盖:工单覆盖率 ${dispatchRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置覆盖 + 口碑环比')}
       ${repeatIssues.length ? renderSection('重复发酵问题', renderIssues(repeatIssues.slice(0, 8)), '关联多条内容/多次出现的问题,需根因处理') : ''}
       ${renderSection('下月策略建议', renderList(stats.actionItems, true), '按优先级执行')}
       ${renderSection('本月 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 6), '暂无重点风险内容'), '')}`;

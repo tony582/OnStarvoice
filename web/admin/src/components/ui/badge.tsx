@@ -22,11 +22,11 @@ const SOLID: Record<ColorKey, string> = {
   green: 'bg-status-green text-white',
   red: 'bg-status-red text-white',
   darkred: 'bg-status-darkred text-white',
-  orange: 'bg-status-orange text-[#663d00]',
-  amber: 'bg-status-amber text-[#5c4700]',
-  blue: 'bg-status-blue text-[#0a3d7a]',
+  orange: 'bg-status-orange text-white',
+  amber: 'bg-status-amber text-white',
+  blue: 'bg-status-blue text-white',
   purple: 'bg-status-purple text-white',
-  teal: 'bg-status-teal text-[#06484a]',
+  teal: 'bg-status-teal text-white',
   grey: 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200',
 }
 

@@ -6,11 +6,15 @@ await import("../../utils/capture/task-tab-group.js");
 const {createManager, normalizeTaskTabRole} =
   globalThis.OnStarvoiceCaptureTaskTabGroup;
 
-function createTabGroupDouble({sourceGroupId = -1, updateError = null} = {}) {
+function createTabGroupDouble({
+  sourceGroupId = -1,
+  workerGroupId = -1,
+  updateError = null,
+} = {}) {
   const tabs = new Map([
     [41, {id: 41, windowId: 5, groupId: sourceGroupId}],
-    [42, {id: 42, windowId: 5}],
-    [44, {id: 44, windowId: 5}],
+    [42, {id: 42, windowId: 5, groupId: workerGroupId}],
+    [44, {id: 44, windowId: 5, groupId: workerGroupId}],
     [43, {id: 43, windowId: 6}],
   ]);
   const calls = [];
@@ -120,6 +124,44 @@ test("task end restores a source tab to its original native group", async () => 
       ([type, tabIds]) => type === "ungroup" && tabIds?.includes(41),
     ),
     false,
+  );
+});
+
+test("a service-worker restart rehydrates an existing native task group", async () => {
+  const double = createTabGroupDouble({
+    sourceGroupId: 700,
+    workerGroupId: 700,
+  });
+  const manager = createManager(double);
+
+  const restored = await manager.restore({
+    taskId: "task-restored",
+    tabId: 41,
+    workerTabIds: [42, 43, 99],
+    groupId: 700,
+    originalGroupId: 55,
+    title: "StarVoice 采集任务",
+  });
+
+  assert.equal(restored.restored, true);
+  assert.deepEqual(restored.workerTabIds, [42]);
+  assert.deepEqual(restored.missingWorkerTabIds, [43, 99]);
+  assert.equal(
+    double.calls.some(([type]) => type === "group" || type === "ungroup"),
+    false,
+  );
+  assert.equal(manager.getTask("task-restored").groupId, 700);
+
+  const forgotten = manager.forget("task-restored");
+  assert.equal(forgotten.forgotten, true);
+  assert.equal(manager.getTask("task-restored"), null);
+});
+
+test("runtime restore refuses a source tab that left its persisted group", async () => {
+  const manager = createManager(createTabGroupDouble({sourceGroupId: -1}));
+  await assert.rejects(
+    manager.restore({taskId: "task-moved", tabId: 41, groupId: 700}),
+    (error) => error?.code === "capture_task_group_restore_mismatch",
   );
 });
 

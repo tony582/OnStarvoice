@@ -4,8 +4,8 @@ import { Button } from '@/components/ui/button'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { useAuth } from '@/lib/auth'
 
-export interface DispatchResult { priority: string; assigneeUserId: string; assigneeName: string; note: string }
-interface AskOptions { title?: string; summary?: string; defaultPriority?: string }
+export interface DispatchResult { externalTicketNo: string; priority: string; assigneeUserId: string; assigneeName: string; note: string }
+interface AskOptions { title?: string; summary?: string; defaultPriority?: string; sourceType?: 'content' | 'comment' }
 interface DispatchState extends AskOptions { resolve: (v: DispatchResult | null) => void }
 interface Assignee { userId: string; name: string; email: string; role: string }
 
@@ -40,8 +40,9 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
   const [priority, setPriority] = useState(state.defaultPriority || 'normal')
   const [assigneeUserId, setAssigneeUserId] = useState(user?.id || '')
   const [assignees, setAssignees] = useState<Assignee[]>([])
+  const [externalTicketNo, setExternalTicketNo] = useState('')
   const [note, setNote] = useState('')
-  const ref = useRef<HTMLTextAreaElement>(null)
+  const ref = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     let alive = true
@@ -55,7 +56,7 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
     const name = assigneeUserId === user?.id
       ? (user?.name || '本人')
       : (assignees.find(a => a.userId === assigneeUserId)?.name || '')
-    onConfirm({ priority, assigneeUserId, assigneeName: name, note })
+    onConfirm({ externalTicketNo: externalTicketNo.trim(), priority, assigneeUserId, assigneeName: name, note })
   }
 
   useEffect(() => {
@@ -66,17 +67,26 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
     }
     window.addEventListener('keydown', h)
     return () => { clearTimeout(t); window.removeEventListener('keydown', h) }
-  }, [priority, assigneeUserId, note, assignees]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [externalTicketNo, priority, assigneeUserId, note, assignees]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4 animate-in fade-in duration-150" onMouseDown={onCancel}>
-      <div className="max-h-[calc(100dvh-1.5rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-border bg-card p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl sm:rounded-xl sm:p-5 animate-in zoom-in-95 duration-150" onMouseDown={e => e.stopPropagation()}>
-        <h3 className="text-sm font-bold">{state.title || '转工单'}</h3>
-        <p className="mt-1 text-[12px] text-muted-foreground">默认本人跟进,流转到「已转工单」后填写过程备注并结案;也可改派其他成员。</p>
+      <div role="dialog" aria-modal="true" aria-labelledby="ticket-dispatch-title" className="max-h-[calc(100dvh-1.5rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-border bg-card p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-2xl sm:rounded-xl sm:p-5 animate-in zoom-in-95 duration-150" onMouseDown={e => e.stopPropagation()}>
+        <h3 id="ticket-dispatch-title" className="text-sm font-bold">{state.title || '转工单'}</h3>
         {state.summary && (
           <div className="mt-3 line-clamp-2 rounded-lg bg-muted/60 px-3 py-2 text-[12px] leading-5 text-muted-foreground">{state.summary}</div>
         )}
 
+        <label htmlFor="ticket-dispatch-number" className="mt-4 block text-[12px] font-semibold text-foreground">工单号码（选填）</label>
+        <input
+          id="ticket-dispatch-number"
+          ref={ref}
+          value={externalTicketNo}
+          maxLength={100}
+          onChange={event => setExternalTicketNo(event.target.value)}
+          placeholder="填写客户 Excel 中的工单号"
+          className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-[13px] outline-none transition-colors placeholder:text-muted-foreground/50 focus:border-primary focus:ring-2 focus:ring-primary/10"
+        />
         <label className="mt-4 block text-[12px] font-semibold text-foreground">优先级</label>
         <div className="mt-1.5 flex flex-wrap gap-1">
           {PRIORITIES.map(p => (
@@ -87,14 +97,14 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
           ))}
         </div>
 
-        <label className="mt-4 block text-[12px] font-semibold text-foreground">处理人</label>
-        <WorkbenchSelect value={assigneeUserId} onChange={e => setAssigneeUserId(e.target.value)} className="mt-1.5 h-9 w-full border border-border bg-background">
+        <label htmlFor="ticket-dispatch-assignee" className="mt-4 block text-[12px] font-semibold text-foreground">处理人</label>
+        <WorkbenchSelect id="ticket-dispatch-assignee" value={assigneeUserId} onChange={e => setAssigneeUserId(e.target.value)} className="mt-1.5 h-9 w-full border border-border bg-background">
           <option value={user?.id || ''}>本人跟进{user?.name ? ` · ${user.name}` : ''}</option>
           {assignees.filter(a => a.userId !== user?.id).map(a => <option key={a.userId} value={a.userId}>{a.name}{a.email ? ` · ${a.email}` : ''}</option>)}
         </WorkbenchSelect>
 
-        <label className="mt-4 block text-[12px] font-semibold text-foreground">转单说明(选填)</label>
-        <textarea ref={ref} value={note} onChange={e => setNote(e.target.value)} rows={3}
+        <label htmlFor="ticket-dispatch-note" className="mt-4 block text-[12px] font-semibold text-foreground">转单说明(选填)</label>
+        <textarea id="ticket-dispatch-note" value={note} onChange={e => setNote(e.target.value)} rows={3}
           placeholder="例如:用户投诉续费乱扣费,请尽快私信安抚并核实订单"
           className="mt-1.5 w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-[13px] leading-6 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20" />
 

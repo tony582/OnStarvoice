@@ -10,6 +10,7 @@ function createDebuggerDouble({
   attachError = null,
   attachErrors = null,
   focusError = null,
+  focusErrors = null,
   detachError = null,
   detachDuringFocus = false,
   emitDetachOnStop = true,
@@ -18,6 +19,9 @@ function createDebuggerDouble({
   const calls = [];
   const queuedAttachErrors = Array.isArray(attachErrors)
     ? [...attachErrors]
+    : null;
+  const queuedFocusErrors = Array.isArray(focusErrors)
+    ? [...focusErrors]
     : null;
   const api = {
     calls,
@@ -41,7 +45,10 @@ function createDebuggerDouble({
           listener(debuggee, "canceled_by_user"),
         );
       }
-      if (focusError && params?.enabled === true) throw focusError;
+      const nextFocusError = queuedFocusErrors?.length
+        ? queuedFocusErrors.shift()
+        : focusError;
+      if (nextFocusError && params?.enabled === true) throw nextFocusError;
       return {};
     },
     async detach(debuggee) {
@@ -164,6 +171,89 @@ test("a capture run attaches, applies focus emulation and detaches cleanly", asy
   assert.equal(unexpectedDetaches.length, 0);
   assert.equal(stateChanges[0].session.state, "attached");
   assert.equal(stateChanges.at(-1).session, null);
+});
+
+test("a persisted task adopts an extension-owned debugger after worker restart", async () => {
+  const debuggerApi = createDebuggerDouble();
+  const stateChanges = [];
+  const manager = createManager({
+    debuggerApi,
+    onStateChange: (session, metadata) =>
+      stateChanges.push({session, metadata}),
+  });
+
+  const restored = await manager.restore({
+    persistent: true,
+    taskId: "task-restored",
+    attemptId: "attempt-restored",
+    tabId: 41,
+    runId: "capture-task:task-restored",
+    label: "恢复中的关键词任务",
+    startedAt: "2026-08-06T01:00:00.000Z",
+    progress: {keyword: "智能座舱"},
+    workerTabIds: [42],
+    groupId: 700,
+    originalGroupId: 55,
+    minimized: true,
+  });
+
+  assert.equal(restored.restored, true);
+  assert.equal(restored.attachmentReused, true);
+  assert.equal(restored.attemptId, "attempt-restored");
+  assert.equal(manager.getSessionByTaskId("task-restored").state, "attached");
+  assert.deepEqual(debuggerApi.calls, [[
+    "sendCommand",
+    {tabId: 41},
+    "Emulation.setFocusEmulationEnabled",
+    {enabled: true},
+  ]]);
+  assert.equal(stateChanges.at(-1).metadata.reason, "capture_restored");
+});
+
+test("a persisted task reattaches when the worker restart dropped debugger ownership", async () => {
+  const debuggerApi = createDebuggerDouble({
+    focusErrors: [new Error("Debugger is not attached to the tab with id: 41")],
+  });
+  const manager = createManager({debuggerApi});
+
+  const restored = await manager.restore({
+    persistent: true,
+    taskId: "task-reattached",
+    tabId: 41,
+    runId: "capture-task:task-reattached",
+    groupId: 700,
+  });
+
+  assert.equal(restored.restored, true);
+  assert.equal(restored.attachmentReused, false);
+  assert.deepEqual(debuggerApi.calls.map(([type]) => type), [
+    "sendCommand",
+    "attach",
+    "sendCommand",
+  ]);
+});
+
+test("runtime restore rejects incomplete or conflicting persisted ownership", async () => {
+  const manager = createManager({debuggerApi: createDebuggerDouble()});
+  await assert.rejects(
+    manager.restore({persistent: true, taskId: "missing-tab"}),
+    (error) => error?.code === "invalid_capture_restore_snapshot",
+  );
+  await manager.restore({
+    persistent: true,
+    taskId: "task-one",
+    tabId: 41,
+    runId: "capture-task:task-one",
+  });
+  await assert.rejects(
+    manager.restore({
+      persistent: true,
+      taskId: "task-two",
+      tabId: 42,
+      runId: "capture-task:task-two",
+    }),
+    (error) => error?.code === "debug_session_busy",
+  );
 });
 
 test("one active AI debug session blocks another tab and mismatched release", async () => {

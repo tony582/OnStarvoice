@@ -267,7 +267,7 @@ export function OrchestrationComposerDrawer({
   const [includeComments, setIncludeComments] = useState(false)
   const [commentLimit, setCommentLimit] = useState(50)
   const [skipCaptured, setSkipCaptured] = useState(true)
-  const [allowIdleAgentHandoff, setAllowIdleAgentHandoff] = useState(true)
+  const allowIdleAgentHandoff = true
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
   const [selectionNotice, setSelectionNotice] = useState('')
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null)
@@ -350,7 +350,6 @@ export function OrchestrationComposerDrawer({
     setIncludeComments(false)
     setCommentLimit(50)
     setSkipCaptured(true)
-    setAllowIdleAgentHandoff(true)
     const compatibleInitialAgentIds = (initialAgentIds ?? []).filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
       return agent && !agentBlockReason(agent, 'xiaohongshu', false)
@@ -1033,24 +1032,15 @@ export function OrchestrationComposerDrawer({
                   <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 规则均衡</div>
                   <p className="mt-1 text-[11px] leading-4 text-muted-foreground">按关键词顺序连续均分给已选 Agent；结果可在下一步逐项调整。这里不会调用 AI。</p>
                 </div>
-                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-card px-3 py-3">
-                  <input
-                    type="checkbox"
-                    checked={allowIdleAgentHandoff}
-                    onChange={event => {
-                      markDefinitionChanged()
-                      setAllowIdleAgentHandoff(event.target.checked)
-                    }}
-                    disabled={busy}
-                    className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
-                  />
+                <div className="mt-3 flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/[0.035] px-3 py-3">
+                  <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">✓</span>
                   <span>
-                    <span className="block text-xs font-semibold text-foreground">允许空闲 Agent 接力</span>
+                    <span className="block text-xs font-semibold text-foreground">系统自动接力已启用</span>
                     <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
-                      任务中断时可由人工把尚未开始的整词转给在线空闲节点；验证码和安全审核不会自动换设备。
+                      技术失败由系统自动重试或按关键词转给空闲 Agent；验证码或登录异常所在关键词留在原 Agent 等待人工，其他未开始关键词继续自动分配。
                     </span>
                   </span>
-                </label>
+                </div>
                 {sortedAgents.length === 0 ? (
                   <div className="mt-3 rounded-xl border border-dashed border-border px-4 py-8 text-center">
                     <Bot className="mx-auto h-6 w-6 text-muted-foreground" />

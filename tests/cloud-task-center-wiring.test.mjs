@@ -586,14 +586,17 @@ test("verify input and extension API origins are bounded before credentials are 
   assert.match(state, /changes\[STORAGE_KEY\.AUTH\]/u);
 });
 
-test("settled root tasks can move unfinished work to another idle Agent", async () => {
+test("settled root tasks auto-recover while retaining the legacy manual fallback", async () => {
   const [page, card, lib] = await Promise.all([
     read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
     read("web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx"),
     read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts"),
   ]);
   assert.match(lib, /export function canRetryOnIdleAgent/u);
+  assert.match(lib, /export function automaticIdleAgentRecoveryEnabled/u);
   assert.match(lib, /promotedRetryParent/u);
+  assert.match(card, /系统正在选择兼容的空闲 Agent 自动重试/u);
+  assert.match(card, /retryEligible && !safetyEvidence && !automaticRecoveryPending/u);
   assert.match(card, /换空闲设备重试/u);
   assert.match(card, /onRetryOnIdleAgent/u);
   assert.match(page, /retry-on-idle-agent/u);

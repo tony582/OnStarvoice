@@ -400,7 +400,7 @@ router.get('/:id/manual-fields', requireTenantAccess, requireSessionUser, async 
 router.get('/:id/activity', requireTenantAccess, requireSessionUser, async (req, res, next) => {
   try {
     if (!await ensureRecord(req, res)) return;
-    const [audits, notes, legacyTriage] = await Promise.all([
+    const [audits, notes, ticketActivities, legacyTriage] = await Promise.all([
       queryAll(`
         SELECT
           al.id,
@@ -432,6 +432,27 @@ router.get('/:id/activity', requireTenantAccess, requireSessionUser, async (req,
         ORDER BY rn.created_at DESC, rn.id DESC
         LIMIT 200
       `, [req.params.id, req.tenantId]),
+      queryAll(`
+        SELECT
+          tn.id,
+          tn.event_type,
+          tn.body,
+          COALESCE(NULLIF(tn.author_name, ''), NULLIF(u.name, ''), u.email, '未知用户') AS actor_name,
+          tn.created_at,
+          t.id AS ticket_id,
+          t.external_ticket_no,
+          t.status AS ticket_status
+        FROM ticket_notes tn
+        JOIN tickets t
+          ON t.id = tn.ticket_id
+          AND t.tenant_id = tn.tenant_id
+        LEFT JOIN users u ON u.id = tn.author_user_id
+        WHERE t.source_record_id = $1
+          AND t.tenant_id = $2
+          AND t.source_type = 'content'
+        ORDER BY tn.created_at DESC, tn.id DESC
+        LIMIT 200
+      `, [req.params.id, req.tenantId]),
       queryOne(`
         SELECT id, note, owner_name, updated_at
         FROM record_triage
@@ -449,6 +470,26 @@ router.get('/:id/activity', requireTenantAccess, requireSessionUser, async (req,
         id: item.id,
         action: 'record.note_added',
         metadata: { body: item.body },
+        actor_name: item.actor_name,
+        created_at: item.created_at,
+      })),
+      ...ticketActivities.map(item => ({
+        id: `ticket-${item.id}`,
+        action: item.event_type === 'closed'
+          ? 'record.ticket_closed'
+          : item.event_type === 'reopened'
+            ? 'record.ticket_reopened'
+            : item.event_type === 'done'
+              ? 'record.ticket_done'
+              : item.event_type === 'dismissed'
+                ? 'record.ticket_dismissed'
+            : 'record.ticket_progress_added',
+        metadata: {
+          body: item.body,
+          ticketId: item.ticket_id,
+          externalTicketNo: item.external_ticket_no,
+          ticketStatus: item.ticket_status,
+        },
         actor_name: item.actor_name,
         created_at: item.created_at,
       })),
@@ -798,6 +839,17 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
       });
       if (!lifecycle) return { notFound: true };
       if (lifecycle.archived_at) return { archived: true };
+      const activeTicket = await tx.queryOne(`
+        SELECT id, external_ticket_no
+        FROM tickets
+        WHERE tenant_id = $1
+          AND source_type = 'content'
+          AND source_record_id = $2
+          AND status <> 'closed'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `, [req.tenantId, req.params.id]);
+      if (activeTicket) return { activeTicket };
       const previous = await tx.queryOne(`
         SELECT r.official_response_status,
           COALESCE(rt.status, 'unhandled') AS triage_status
@@ -836,6 +888,15 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
     });
     if (result.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     if (result.archived) return sendRecordArchived(res, [req.params.id]);
+    if (result.activeTicket) {
+      return res.status(409).json({
+        ok: false,
+        error: 'content_ticket_active',
+        message: '工单结案前，处理模式须保留为“已转工单”',
+        ticketId: result.activeTicket.id,
+        externalTicketNo: result.activeTicket.external_ticket_no || '',
+      });
+    }
     return res.json({ ok: true });
   } catch (err) {
     return next(err);

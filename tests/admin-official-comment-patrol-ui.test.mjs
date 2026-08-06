@@ -112,7 +112,7 @@ test('official social is one top-level navigation entry', () => {
   assert.match(navigation, /'official-accounts': \{ page: 'official-comments' \}/u)
   assert.match(
     desktopApp,
-    /page === 'official-comments'[\s\S]*\? 'pb-0 pt-0 xl:h-\[calc\(100dvh-3\.5rem\)\] xl:overflow-hidden'/u,
+    /page === 'official-comments'[\s\S]*\? 'pb-0 pt-0 xl:h-dvh xl:overflow-hidden'/u,
   )
   assert.doesNotMatch(monitoringPage, /官方账号评论巡查/u)
 })

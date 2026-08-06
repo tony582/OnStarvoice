@@ -65,7 +65,12 @@ test('content triage UI keeps each date range and sends it to list and export qu
   for (const key of ['publishFrom', 'publishTo', 'recentFrom', 'recentTo', 'firstFrom', 'firstTo']) {
     assert.match(queue, new RegExp(`params\\.set\\('${key}'`));
   }
-  assert.match(filter, /组合日期筛选/);
-  assert.match(filter, /多项按“且”生效/);
-  assert.match(filter, /不会清掉其它条件/);
+  assert.match(filter, /\['publish', '发布时间'\]/);
+  assert.match(filter, /\['first', '首次发现'\]/);
+  assert.match(filter, /\['recent', '最近采集'\]/);
+  assert.match(filter, /label: '今日'/);
+  assert.match(filter, /label: '本周'/);
+  assert.match(filter, /label: '本月'/);
+  assert.match(filter, /各自保留区间/);
+  assert.doesNotMatch(filter, /组合日期筛选/);
 });

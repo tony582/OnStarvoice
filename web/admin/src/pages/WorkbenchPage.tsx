@@ -2,13 +2,12 @@ import { useNav } from '@/lib/navigation'
 import { TriageQueue } from '@/pages/workbench/TriageQueue'
 import { LeadsQueue } from '@/pages/workbench/LeadsQueue'
 import { IssuesQueue } from '@/pages/workbench/IssuesQueue'
-import { TicketFeedbackQueue } from '@/pages/workbench/TicketFeedbackQueue'
 import { MisjudgmentQueue } from '@/pages/workbench/MisjudgmentQueue'
 import { ProcessingBanner } from '@/components/shared/ProcessingBanner'
 import { useAuth } from '@/lib/auth'
 
-type QueueKey = 'triage' | 'leads' | 'feedback' | 'misjudgments' | 'issues'
-const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'misjudgments', 'issues']
+type QueueKey = 'triage' | 'leads' | 'misjudgments' | 'issues'
+const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'misjudgments', 'issues']
 
 /**
  * 舆情工作台:队列(内容分诊/评论线索/问题处置)已移到侧边栏二级导航,
@@ -18,16 +17,19 @@ const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'feedback', 'misjudgments', '
 export function WorkbenchPage() {
   const { params } = useNav()
   const { isPlatformAdmin } = useAuth()
+  // 旧版 feedback 链接继续可用，但统一落到内容分诊的“已转工单”处理模式。
+  const legacyTicketQueue = params?.queue === 'feedback'
   const requestedQueue: QueueKey = QUEUE_KEYS.includes(params?.queue as QueueKey) ? (params!.queue as QueueKey) : 'triage'
   const queue: QueueKey = requestedQueue === 'misjudgments' && !isPlatformAdmin() ? 'triage' : requestedQueue
-  const initial = params ?? undefined
+  const initial = legacyTicketQueue
+    ? { ...(params || {}), queue: 'triage', status: 'ticketed' }
+    : params ?? undefined
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
       {(queue === 'triage' || queue === 'leads') && <ProcessingBanner />}
       {queue === 'triage' && <TriageQueue initial={initial} />}
       {queue === 'leads' && <LeadsQueue initial={initial} category="opinion" />}
-      {queue === 'feedback' && <TicketFeedbackQueue />}
       {queue === 'misjudgments' && <MisjudgmentQueue />}
       {queue === 'issues' && <IssuesQueue initial={initial} />}
     </div>

@@ -20273,20 +20273,24 @@ async function resolveMonitorRecordIdsForPublishWindow({
   const detailResult = await runEnhancementWithSingleRetry({
     recordIds: detailCandidateIds,
     shouldStop,
-    onRetryScheduled: ({recordIds: retryRecordIds}) => {
+    onRetryScheduled: ({recordIds: retryRecordIds, retryCount, maxRetries}) => {
       reportMonitorRunProgress(
         onProgress,
         {
           phase: "profile_publish_date_retry_waiting",
           current: 0,
           total: retryRecordIds.length,
-          autoRetryCount: 1,
+          autoRetryCount: retryCount,
+          autoRetryMaxRetries: maxRetries,
         },
         `发布时间读取工作页中断，正在续跑剩余 ${retryRecordIds.length} 条`,
       );
     },
     runAttempt: async (attemptRecordIds, attemptContext = {}) => {
       const isRetry = attemptContext.isRetry === true;
+      const retryLabel = isRetry
+        ? `${attemptContext.retryCount}/${attemptContext.maxRetries}`
+        : "";
       return await batchCaptureDetailsForRecords(attemptRecordIds, {
         shouldStop,
         onProgress: (progress = {}) => {
@@ -20302,10 +20306,13 @@ async function resolveMonitorRecordIdsForPublishWindow({
                     progress.phase ||
                       "profile_publish_date_verification",
                   ),
-              autoRetryCount: isRetry ? 1 : 0,
+              autoRetryCount: isRetry ? attemptContext.retryCount : 0,
+              autoRetryMaxRetries: isRetry
+                ? attemptContext.maxRetries
+                : 0,
             },
             `正在读取发布时间 (${index + 1}/${total})：${displayName} · ${
-              isRetry ? "续跑 1/1 · " : ""
+              isRetry ? `续跑 ${retryLabel} · ` : ""
             }${detailMessage}`,
           );
         },
@@ -20849,20 +20856,28 @@ async function executeMonitorRunItem({
             await runEnhancementWithSingleRetry({
               recordIds: hitRecordIds,
               shouldStop,
-              onRetryScheduled: ({recordIds: retryRecordIds}) => {
+              onRetryScheduled: ({
+                recordIds: retryRecordIds,
+                retryCount,
+                maxRetries,
+              }) => {
                 reportMonitorRunProgress(
                   onProgress,
                   {
                     phase: "profile_comment_retry_waiting",
                     current: 0,
                     total: retryRecordIds.length,
-                    autoRetryCount: 1,
+                    autoRetryCount: retryCount,
+                    autoRetryMaxRetries: maxRetries,
                   },
                   `评论巡查工作页中断，正在续跑剩余 ${retryRecordIds.length} 条`,
                 );
               },
               runAttempt: async (attemptRecordIds, attemptContext = {}) => {
                 const isRetry = attemptContext.isRetry === true;
+                const retryLabel = isRetry
+                  ? `${attemptContext.retryCount}/${attemptContext.maxRetries}`
+                  : "";
                 return await batchCaptureDetailsForRecords(attemptRecordIds, {
                   shouldStop,
                   onProgress: (progress = {}) => {
@@ -20878,10 +20893,15 @@ async function executeMonitorRunItem({
                           : String(
                               progress.phase || "profile_comment_patrol",
                             ),
-                        autoRetryCount: isRetry ? 1 : 0,
+                        autoRetryCount: isRetry
+                          ? attemptContext.retryCount
+                          : 0,
+                        autoRetryMaxRetries: isRetry
+                          ? attemptContext.maxRetries
+                          : 0,
                       },
                       `正在巡查账号评论 (${index + 1}/${total})：${displayName} · ${
-                        isRetry ? "续跑 1/1 · " : ""
+                        isRetry ? `续跑 ${retryLabel} · ` : ""
                       }${commentMessage}`,
                     );
                   },
@@ -23202,7 +23222,7 @@ async function runDetailCaptureForRecordIds(
 
   try {
     // 每次新的增强批次都从“尚未自动重试”开始，避免上一次任务留下的
-    // 重试次数误导当前卡片。真正开始第二次尝试时再写入 1/1。
+    // 重试次数误导当前卡片。真正开始补偿尝试时再写入当前次数。
     try {
       const initialRecords = await getRecords(normalizedRecordIds);
       const {updateRecord} = await import("../utils/storage.js");
@@ -23228,7 +23248,7 @@ async function runDetailCaptureForRecordIds(
     const settledOnRetryRecordIds = new Set();
     const handleDetailProgress = (
       progress = {},
-      {attempt = 1, isRetry = false} = {},
+      {attempt = 1, isRetry = false, retryCount = 0, maxRetries = 1} = {},
     ) => {
       const taskScopedProgress = {
         ...progress,
@@ -23247,8 +23267,9 @@ async function runDetailCaptureForRecordIds(
               taskScopedProgress?.captureTaskId || captureTaskId || "",
             ).trim(),
             autoRetryAttempt: attempt,
-            autoRetryCount: 1,
-            message: `自动重试 1/1：${taskScopedProgress?.message || "正在重新采集增强"}`,
+            autoRetryCount: retryCount,
+            autoRetryMaxRetries: maxRetries,
+            message: `自动重试 ${retryCount}/${maxRetries}：${taskScopedProgress?.message || "正在重新采集增强"}`,
           }
         : {
             ...taskScopedProgress,
@@ -23292,21 +23313,31 @@ async function runDetailCaptureForRecordIds(
         detailBatchCancelRequested ||
         !ownsDetailInvocation() ||
         !isCurrentDetailInvocation(),
-      onRetryScheduled: async ({recordIds: retryRecordIds}) => {
+      onRetryScheduled: async ({
+        recordIds: retryRecordIds,
+        retryCount,
+        maxRetries,
+      }) => {
         const retryProgress = {
           phase: "enhance_retry_waiting",
           current: 0,
           total: retryRecordIds.length,
-          autoRetryAttempt: 2,
-          autoRetryCount: 1,
-          message: `采集增强有 ${retryRecordIds.length} 条临时失败，3 秒后自动重试 1/1...`,
+          autoRetryAttempt: retryCount + 1,
+          autoRetryCount: retryCount,
+          autoRetryMaxRetries: maxRetries,
+          message: `采集增强有 ${retryRecordIds.length} 条临时失败，3 秒后自动重试 ${retryCount}/${maxRetries}...`,
         };
-        handleDetailProgress(retryProgress, {attempt: 2, isRetry: false});
+        handleDetailProgress(retryProgress, {
+          attempt: retryCount + 1,
+          isRetry: false,
+        });
         showProgress(retryProgress.message, "info");
       },
       onRetryStarted: async ({
         recordIds: retryRecordIds,
         requiresContextRebuild = false,
+        retryCount,
+        maxRetries,
       }) => {
         const retryProgress = {
           phase: requiresContextRebuild
@@ -23314,13 +23345,17 @@ async function runDetailCaptureForRecordIds(
             : "enhance_retry_starting",
           current: 0,
           total: retryRecordIds.length,
-          autoRetryAttempt: 2,
-          autoRetryCount: 1,
+          autoRetryAttempt: retryCount + 1,
+          autoRetryCount: retryCount,
+          autoRetryMaxRetries: maxRetries,
           message: requiresContextRebuild
-            ? `正在重建采集上下文 · 1/1（${retryRecordIds.length} 条）...`
-            : `正在自动重试当前作品 · 1/1（${retryRecordIds.length} 条）...`,
+            ? `正在重建采集上下文 · ${retryCount}/${maxRetries}（${retryRecordIds.length} 条）...`
+            : `正在自动重试当前作品 · ${retryCount}/${maxRetries}（${retryRecordIds.length} 条）...`,
         };
-        handleDetailProgress(retryProgress, {attempt: 2, isRetry: false});
+        handleDetailProgress(retryProgress, {
+          attempt: retryCount + 1,
+          isRetry: false,
+        });
         showProgress(retryProgress.message, "info");
         try {
           const retryRecords = await getRecords(retryRecordIds);
@@ -23331,7 +23366,7 @@ async function runDetailCaptureForRecordIds(
                 payload: {
                   ...(record?.payload || {}),
                   detailCaptureAutoRetryCount: Math.max(
-                    1,
+                    retryCount,
                     Number(record?.payload?.detailCaptureAutoRetryCount) || 0,
                   ),
                   detailCaptureLastAutoRetryAt: new Date().toISOString(),
@@ -23346,7 +23381,11 @@ async function runDetailCaptureForRecordIds(
           );
         }
       },
-      prepareRetry: async ({requiresContextRebuild = false}) => {
+      prepareRetry: async ({
+        requiresContextRebuild = false,
+        retryCount,
+        maxRetries,
+      }) => {
         if (!requiresContextRebuild || !captureTaskId) {
           return;
         }
@@ -23368,7 +23407,7 @@ async function runDetailCaptureForRecordIds(
           taskId: captureTaskId,
           preferredTabId: preferredSourceTabId,
           platform: getPagePlatform(runtime) || getViewPlatform(runtime),
-          label: "采集增强自动恢复 · 1/1",
+          label: `采集增强自动恢复 · ${retryCount}/${maxRetries}`,
           unattendedAttemptId: scopedUnattendedAttemptId,
         });
       },
@@ -23378,7 +23417,7 @@ async function runDetailCaptureForRecordIds(
         const isRetry = attemptContext.isRetry === true;
         if (isRetry) {
           showProgress(
-            `正在自动重试采集增强 1/1（0/${attemptRecordIds.length}）...`,
+            `正在自动重试采集增强 ${attemptContext.retryCount}/${attemptContext.maxRetries}（0/${attemptRecordIds.length}）...`,
             "info",
           );
         }
@@ -23441,11 +23480,12 @@ async function runDetailCaptureForRecordIds(
               ...item,
               phase: item.ok ? "detail_item_done" : "detail_item_failed",
               recordId,
-              autoRetryAttempt: 2,
-              autoRetryCount: 1,
+              autoRetryAttempt: Number(result.autoRetryCount || 0) + 1,
+              autoRetryCount: Number(result.autoRetryCount || 0),
+              autoRetryMaxRetries: Number(result.autoRetryMaxRetries || 1),
               message: item.ok
-                ? "自动重试 1/1 成功"
-                : "自动重试 1/1 后仍失败",
+                ? `自动重试 ${result.autoRetryCount}/${result.autoRetryMaxRetries} 成功`
+                : `自动重试 ${result.autoRetryCount}/${result.autoRetryMaxRetries} 后仍失败`,
             }),
           ).catch((error) => {
             console.warn("[Sidebar] Retry detail settlement failed:", error);

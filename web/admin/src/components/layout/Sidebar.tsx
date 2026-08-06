@@ -4,12 +4,13 @@ import {
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
   ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X, ScanSearch,
-  Megaphone,
+  Megaphone, LogOut, ChevronsUpDown,
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, LABELS } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
 import { useBadges, type Badges } from '@/lib/badges'
 import { useNav, type Workspace } from '@/lib/navigation'
+import { ThemeToggle } from '@/components/layout/ThemeToggle'
 
 type NavChild = {
   id: string
@@ -36,7 +37,6 @@ const WORKSPACES: Array<{ key: Workspace; label: string; desc: string; icon: Rea
 const WORKBENCH_QUEUES: Array<{ queue: string; label: string; badgeKey?: keyof Badges; dot: string; platformAdmin?: boolean }> = [
   { queue: 'triage', label: '内容分诊', badgeKey: 'triagePending', dot: 'bg-blue-500' },
   { queue: 'leads', label: '评论分诊', badgeKey: 'leadsNew', dot: 'bg-amber-500' },
-  { queue: 'feedback', label: '已转工单', badgeKey: 'ticketsPending', dot: 'bg-violet-500' },
   { queue: 'misjudgments', label: '误判反馈', badgeKey: 'feedbackPending', dot: 'bg-rose-500', platformAdmin: true },
 ]
 
@@ -90,13 +90,16 @@ export function Sidebar({
   onMobileClose,
   showInternalItems = false,
 }: SidebarProps) {
-  const { isInternal, isPlatformAdmin } = useAuth()
+  const { user, tenants, tenantId, switchTenant, logout, isInternal, isPlatformAdmin } = useAuth()
   const { badges } = useBadges()
   const { workspace, switchWorkspace, params } = useNav()
-  const activeQueue = activePage === 'workbench' ? (params?.queue || 'triage') : null
-  const activeWs = WORKSPACES.find(w => w.key === workspace) || WORKSPACES[0]
+  const activeQueue = activePage === 'workbench'
+    ? (params?.queue === 'feedback' ? 'triage' : (params?.queue || 'triage'))
+    : null
   const [adminOpen, setAdminOpen] = useState(false)
   const adminActive = ADMIN_NAV.some(i => i.id === activePage)
+  const alternateWorkspace = WORKSPACES.find(item => item.key !== workspace) || WORKSPACES[0]
+  const AlternateWorkspaceIcon = alternateWorkspace.icon
 
   useEffect(() => {
     if (!mobileOpen) return
@@ -112,6 +115,15 @@ export function Sidebar({
     }
   }, [mobileOpen, onMobileClose])
 
+  useEffect(() => {
+    if (!adminOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setAdminOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [adminOpen])
+
   return (
     <>
       {mobileOpen && (
@@ -126,13 +138,13 @@ export function Sidebar({
         id="mobile-navigation"
         aria-label="主导航"
         className={cn(
-          'fixed inset-y-0 left-0 z-50 flex w-[min(88vw,320px)] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar shadow-xl transition-transform duration-200 lg:z-30 lg:w-[240px] lg:shadow-none',
+          'fixed inset-y-0 left-0 z-50 flex w-[min(88vw,320px)] flex-col overflow-hidden border-r border-sidebar-border bg-sidebar shadow-xl transition-transform duration-200 lg:z-30 lg:w-[208px] lg:shadow-none',
           mobileOpen ? 'visible translate-x-0 pointer-events-auto' : 'invisible -translate-x-full pointer-events-none',
           collapsed ? 'lg:invisible lg:-translate-x-full lg:pointer-events-none' : 'lg:visible lg:translate-x-0 lg:pointer-events-auto',
         )}
       >
       {/* 头部:Logo + 隐藏 */}
-      <div className="flex items-center gap-2.5 px-4 pb-1 pt-[max(1rem,env(safe-area-inset-top))]">
+      <div className="flex items-center gap-2.5 px-3 pb-1 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary lg:h-8 lg:w-8">
           <img src="/images/logo-starvoice.svg" alt="" className="h-[18px] w-[18px] object-contain brightness-0 invert" />
         </div>
@@ -150,26 +162,7 @@ export function Sidebar({
         </button>
       </div>
 
-      {/* 工作区分段切换:舆情风控 / 内容创意(横向来回切)*/}
-      <div className="mx-3 mt-2 flex gap-1 rounded-xl bg-sidebar-accent/50 p-1">
-        {WORKSPACES.map(w => {
-          const Icon = w.icon
-          const on = w.key === workspace
-          return (
-            <button key={w.key} onClick={() => { switchWorkspace(w.key); onMobileClose() }} title={w.desc}
-              className={cn(
-                'flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-[12.5px] font-semibold transition-colors lg:min-h-0 lg:py-1.5',
-                on ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
-              )}>
-              <Icon className={cn('h-4 w-4', on && w.accent)} strokeWidth={2} />
-              {w.label}
-            </button>
-          )
-        })}
-      </div>
-      <div className="px-4 pb-0.5 pt-1.5 text-[10px] text-muted-foreground">{activeWs.desc}</div>
-
-      <nav className="mt-1 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-3 pb-4 pt-1">
+      <nav className="mt-2 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-2 pb-3 pt-1">
         <NavGroup
           label="WORKSPACE"
           items={NAV_BY_WORKSPACE[workspace]}
@@ -182,39 +175,76 @@ export function Sidebar({
         />
       </nav>
 
-      {/* 底部:平台管理(向上弹出菜单)+ 版本 —— 管理类不进日常导航 */}
-      {isInternal() && (
-        <div className="relative mx-3 mb-1">
-          {adminOpen && (
-            <>
-              <div className="fixed inset-0 z-30" onClick={() => setAdminOpen(false)} />
-              <div className="absolute bottom-[calc(100%+6px)] left-0 right-0 z-40 rounded-xl border border-border bg-card p-1 shadow-lg animate-in fade-in slide-in-from-bottom-1 duration-150">
-                {ADMIN_NAV.map(item => {
-                  if (item.platformAdmin && !isPlatformAdmin()) return null
-                  const Icon = item.icon
-                  const on = activePage === item.id
-                  return (
-                    <button key={item.id} onClick={() => { onNavigate(item.id); setAdminOpen(false) }}
-                      className={cn('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors',
-                        on ? 'bg-accent font-semibold text-primary' : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
-                      <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} />{item.label}
-                    </button>
-                  )
-                })}
-              </div>
-            </>
-          )}
-          <button onClick={() => setAdminOpen(o => !o)}
-            className={cn('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors',
-              adminActive || adminOpen ? 'bg-accent text-primary' : 'text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
-            <Settings className="h-[17px] w-[17px] shrink-0" strokeWidth={1.8} />
-            <span>平台管理</span>
-            <ChevronRight className={cn('ml-auto h-3.5 w-3.5 transition-transform', adminOpen && '-rotate-90')} />
-          </button>
-        </div>
-      )}
-      <div className="mx-4 h-px bg-sidebar-border" />
-      <div className="px-4 pb-[max(0.625rem,env(safe-area-inset-bottom))] pt-2.5 text-[10px] text-muted-foreground">v0.3.0 · Dual Workspace</div>
+      {/* 左下账号入口：工作区、管理、主题与退出统一收进一个菜单。 */}
+      <div className="relative mx-2 mb-[max(0.5rem,env(safe-area-inset-bottom))] border-t border-sidebar-border pt-2">
+        {adminOpen && (
+          <>
+            <button type="button" aria-label="关闭账号与设置菜单" className="fixed inset-0 z-30" onClick={() => setAdminOpen(false)} />
+            <div id="account-settings-menu" role="menu" aria-label="账号与设置"
+              className="absolute bottom-[calc(100%+8px)] left-0 right-0 z-40 max-h-[min(70dvh,560px)] overflow-y-auto rounded-xl border border-border bg-card p-1.5 shadow-xl animate-in fade-in slide-in-from-bottom-1 duration-150">
+              {tenants.length > 1 && (
+                <label className="mb-1 block px-2 py-1.5">
+                  <span className="mb-1 block text-[10px] font-medium text-muted-foreground">当前租户</span>
+                  <span className="relative block">
+                    <select value={tenantId} onChange={event => switchTenant(event.target.value)}
+                      className="h-8 w-full appearance-none rounded-md border border-border bg-background pl-2.5 pr-7 text-[12px] font-medium outline-none focus:border-primary focus:ring-2 focus:ring-primary/10">
+                      {tenants.map(tenant => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}
+                    </select>
+                    <ChevronsUpDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  </span>
+                </label>
+              )}
+
+              <button type="button" role="menuitem" onClick={() => {
+                switchWorkspace(alternateWorkspace.key)
+                setAdminOpen(false)
+                onMobileClose()
+              }} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[12.5px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground">
+                <AlternateWorkspaceIcon className={cn('h-4 w-4 shrink-0', alternateWorkspace.accent)} strokeWidth={1.8} />
+                <span>{alternateWorkspace.label}</span>
+              </button>
+
+              {isInternal() && (
+                <>
+                  <div className="my-1 h-px bg-border" />
+                  {ADMIN_NAV.map(item => {
+                    if (item.platformAdmin && !isPlatformAdmin()) return null
+                    const Icon = item.icon
+                    const on = activePage === item.id
+                    return (
+                      <button key={item.id} type="button" role="menuitem" onClick={() => { onNavigate(item.id); setAdminOpen(false) }}
+                        className={cn('flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[12.5px] transition-colors',
+                          on ? 'bg-accent font-semibold text-primary' : 'font-medium text-sidebar-foreground hover:bg-sidebar-accent/60 hover:text-foreground')}>
+                        <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} />{item.label}
+                      </button>
+                    )
+                  })}
+                </>
+              )}
+
+              <div className="my-1 h-px bg-border" />
+              <ThemeToggle variant="menu" />
+              <button type="button" role="menuitem" onClick={() => void logout()}
+                className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[12.5px] font-medium text-destructive transition-colors hover:bg-destructive/10">
+                <LogOut className="h-4 w-4 shrink-0" strokeWidth={1.8} />退出登录
+              </button>
+            </div>
+          </>
+        )}
+
+        <button type="button" onClick={() => setAdminOpen(open => !open)} aria-haspopup="menu" aria-expanded={adminOpen} aria-controls="account-settings-menu"
+          className={cn('flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left transition-colors',
+            adminActive || adminOpen ? 'bg-accent' : 'hover:bg-sidebar-accent/60')}>
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted text-[11px] font-bold text-muted-foreground">
+            {(user?.name || user?.email || '?').slice(0, 1).toUpperCase()}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[12.5px] font-semibold text-foreground">{user?.name || user?.email || '账号'}</span>
+            <span className="block truncate text-[10px] text-muted-foreground">{LABELS.role[user?.globalRole || ''] || user?.email || ''}</span>
+          </span>
+          <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        </button>
+      </div>
       </aside>
     </>
   )

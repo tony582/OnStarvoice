@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
   ExternalLink, User, FileText, Camera, Bell, Archive, ArchiveRestore, Eye, Sparkles, ZoomIn,
-  Pencil, Ban, ArrowLeft, History, ArrowRight, StickyNote, Tags, AlertTriangle,
-  Copy, RefreshCw, Radar,
+  Pencil, Ban, ArrowLeft, ArrowRight, History, StickyNote, Tags, AlertTriangle,
+  Copy, RefreshCw, Radar, ClipboardCheck, Inbox, CircleOff, ChevronDown, Check,
 } from 'lucide-react'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
@@ -13,6 +14,7 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
+import { CopyTicketNumberButton } from '@/components/shared/CopyTicketNumberButton'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import {
   recordDisplayImageEntries,
@@ -24,7 +26,7 @@ import {
 import { tagsFromRecord, type CustomTag, type CustomTagPatch } from '@/lib/custom-tags'
 
 /**
- * 舆情内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
+ * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
  */
 export interface ManualRecordFields {
   sentiment?: string
@@ -42,12 +44,27 @@ interface RecordActivity {
 }
 
 type AsyncDrawerAction = () => Promise<boolean | void> | boolean | void
+type RecordDrawerTab = 'content' | 'comments' | 'official' | 'snapshot' | 'patrol' | 'history'
+
+export interface ContentTicketCloseResult {
+  recordArchived?: boolean
+  recordArchiveBlockedByActiveTicket?: boolean
+  blockingActiveTicketId?: string | null
+  blockingActiveTicketNumber?: string | null
+}
+
+export interface RecordProgressSummary {
+  body: string
+  authorName: string
+  createdAt: string
+  eventType: string
+}
 
 interface RecordDrawerProps {
   record: any
   onClose: () => void
   canWrite: boolean
-  onLinkIssue: () => void
+  onLinkIssue: AsyncDrawerAction
   onSetStatus?: (status: string) => Promise<boolean | void> | boolean | void
   onMarkResponded?: AsyncDrawerAction
   onSetArchived?: (archived: boolean) => Promise<boolean | void> | boolean | void
@@ -56,10 +73,15 @@ interface RecordDrawerProps {
   onUpdateFields?: (fields: ManualRecordFields) => Promise<boolean | void> | boolean | void
   customTagCatalog?: CustomTag[]
   onUpdateCustomTags?: (patch: CustomTagPatch) => Promise<CustomTag[]>
+  initialTab?: RecordDrawerTab
+  onTicketNumberAdded?: (externalTicketNo: string) => void
+  onTicketStatusChanged?: (status: string) => void
+  onProgressAdded?: (progress: RecordProgressSummary) => void
+  onTicketClosed?: (result: ContentTicketCloseResult) => Promise<void> | void
 }
 
 export function RecordDrawer(props: RecordDrawerProps) {
-  return <RecordDrawerContent key={String(props.record?.id ?? '')} {...props} />
+  return <RecordDrawerContent key={`${String(props.record?.id ?? '')}:${props.initialTab || 'content'}`} {...props} />
 }
 
 function RecordDrawerContent({
@@ -75,8 +97,13 @@ function RecordDrawerContent({
   onUpdateFields,
   customTagCatalog = [],
   onUpdateCustomTags,
+  initialTab = 'content',
+  onTicketNumberAdded,
+  onTicketStatusChanged,
+  onProgressAdded,
+  onTicketClosed,
 }: RecordDrawerProps) {
-  const [tab, setTab] = useState<'content' | 'comments' | 'official' | 'snapshot' | 'patrol' | 'history'>('content')
+  const [tab, setTab] = useState<RecordDrawerTab>(initialTab)
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
   const [observations, setObservations] = useState<any[]>([])
@@ -96,7 +123,15 @@ function RecordDrawerContent({
   const [savingNote, setSavingNote] = useState(false)
   const [noteError, setNoteError] = useState('')
   const [actionError, setActionError] = useState('')
-  const [pendingMode, setPendingMode] = useState<string | null>(null)
+  const [ticketCloseConfirmOpen, setTicketCloseConfirmOpen] = useState(false)
+  const [ticketCloseNote, setTicketCloseNote] = useState('')
+  const [ticketStatus, setTicketStatus] = useState(String(r.ticket_status || ''))
+  const [ticketNumber, setTicketNumber] = useState(String(r.ticket_number || ''))
+  const [ticketNumberDraft, setTicketNumberDraft] = useState(String(r.ticket_number || ''))
+  const [editingTicketNumber, setEditingTicketNumber] = useState(false)
+  const [savingTicketNumber, setSavingTicketNumber] = useState(false)
+  const [ticketNumberError, setTicketNumberError] = useState('')
+  const ticketNumberCancelRef = useRef(false)
   const panelRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
@@ -123,8 +158,17 @@ function RecordDrawerContent({
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote) return
-      if (pendingMode) setPendingMode(null)
+      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || savingTicketNumber) return
+      if (ticketCloseConfirmOpen) {
+        setTicketCloseConfirmOpen(false)
+        setTicketCloseNote('')
+      }
+      else if (editingTicketNumber) {
+        ticketNumberCancelRef.current = true
+        setTicketNumberDraft(ticketNumber)
+        setTicketNumberError('')
+        setEditingTicketNumber(false)
+      }
       else if (editingLabels) setEditingLabels(false)
       else if (editingJudgement) setEditingJudgement(false)
       else if (lightbox) setLightbox('')
@@ -132,11 +176,11 @@ function RecordDrawerContent({
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, pendingMode, savingEdit, savingLabels, savingNote, statusBusy])
+  }, [editingJudgement, editingLabels, editingTicketNumber, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, savingTicketNumber, statusBusy, ticketCloseConfirmOpen, ticketNumber])
 
   useEffect(() => {
     const h = (e: MouseEvent) => {
-      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || editingJudgement || editingLabels || pendingMode || lightbox) return
+      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || savingTicketNumber || editingJudgement || editingLabels || editingTicketNumber || ticketCloseConfirmOpen || lightbox) return
       const target = e.target
       if (!(target instanceof Node) || panelRef.current?.contains(target)) return
       if (target instanceof Element && target.closest('[role="dialog"], [data-radix-popper-content-wrapper], [data-record-detail-trigger]')) return
@@ -144,7 +188,7 @@ function RecordDrawerContent({
     }
     document.addEventListener('mousedown', h)
     return () => document.removeEventListener('mousedown', h)
-  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, pendingMode, savingEdit, savingLabels, savingNote, statusBusy])
+  }, [editingJudgement, editingLabels, editingTicketNumber, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, savingTicketNumber, statusBusy, ticketCloseConfirmOpen])
 
   // 小屏笔记本用覆盖式抽屉，避免把列表和筛选工具条挤变形；大屏才为抽屉留位。
   useEffect(() => {
@@ -252,13 +296,12 @@ function RecordDrawerContent({
     if (Array.isArray(data?.activity)) setActivity(data.activity)
   }
 
-  const confirmModeChange = async () => {
-    if (archived || !pendingMode || pendingMode === triageStatus) return
-    const success = pendingMode === 'official_responded' && onMarkResponded
+  const changeMode = async (nextMode: string) => {
+    if (archived || nextMode === triageStatus) return
+    const success = nextMode === 'official_responded' && onMarkResponded
       ? await runStatusAction(onMarkResponded)
-      : await runStatusAction(() => onSetStatus?.(pendingMode))
+      : await runStatusAction(() => onSetStatus?.(nextMode))
     if (!success) return
-    setPendingMode(null)
     await refreshActivity()
   }
 
@@ -282,20 +325,108 @@ function RecordDrawerContent({
     setSavingNote(true)
     setNoteError('')
     try {
-      const data = await api.post<{ note?: Record<string, unknown> }>('/records/' + r.id + '/notes', { body })
+      const isTicketProgress = Boolean(r.ticket_id && ticketStatus !== 'closed')
+      const endpoint = isTicketProgress ? `/tickets/${r.ticket_id}/notes` : `/records/${r.id}/notes`
+      const data = await api.post<{ note?: Record<string, unknown> }>(endpoint, { body })
       const note = data.note || {}
+      const progress = {
+        body: String(note.body || body),
+        authorName: String(note.author_name || '当前用户'),
+        createdAt: String(note.created_at || new Date().toISOString()),
+        eventType: String(note.event_type || 'note'),
+      }
       setActivity(current => [{
         id: String(note.id || `note-${Date.now()}`),
-        action: 'record.note_added',
-        metadata: { body: String(note.body || body) },
-        actor_name: String(note.author_name || '当前用户'),
-        created_at: String(note.created_at || new Date().toISOString()),
+        action: isTicketProgress ? 'record.ticket_progress_added' : 'record.note_added',
+        metadata: {
+          body: progress.body,
+          ...(isTicketProgress ? {
+            ticketId: r.ticket_id,
+            externalTicketNo: ticketNumber,
+            ticketStatus: ticketStatus === 'pending' ? 'doing' : ticketStatus,
+          } : {}),
+        },
+        actor_name: progress.authorName,
+        created_at: progress.createdAt,
       }, ...current])
+      onProgressAdded?.(progress)
+      if (isTicketProgress && ticketStatus === 'pending') {
+        setTicketStatus('doing')
+        onTicketStatusChanged?.('doing')
+      }
       setNoteDraft('')
     } catch (err) {
       setNoteError(err instanceof Error ? err.message : '备注保存失败，请稍后重试')
     } finally {
       setSavingNote(false)
+    }
+  }
+
+  const saveTicketNumber = async () => {
+    const externalTicketNo = ticketNumberDraft.trim()
+    if (!externalTicketNo) {
+      setTicketNumberDraft(ticketNumber)
+      setTicketNumberError('')
+      setEditingTicketNumber(false)
+      return
+    }
+    if (externalTicketNo === ticketNumber.trim()) {
+      setTicketNumberError('')
+      setEditingTicketNumber(false)
+      return
+    }
+    const closedNumberBackfill = ticketStatus === 'closed' && !ticketNumber.trim()
+    if (!r.ticket_id || savingTicketNumber || ((ticketStatus === 'closed' || archived) && !closedNumberBackfill)) return
+    setSavingTicketNumber(true)
+    setTicketNumberError('')
+    try {
+      await api.patch(`/tickets/${r.ticket_id}/external-number`, {
+        externalTicketNo,
+        previousExternalTicketNo: ticketNumber.trim(),
+      })
+      setTicketNumber(externalTicketNo)
+      onTicketNumberAdded?.(externalTicketNo)
+      setTicketNumberDraft(externalTicketNo)
+      setEditingTicketNumber(false)
+      await refreshActivity()
+    } catch (err) {
+      setTicketNumberError(err instanceof Error ? err.message : '工单号码保存失败，请稍后重试')
+    } finally {
+      setSavingTicketNumber(false)
+    }
+  }
+
+  const closeTicket = async () => {
+    if (!r.ticket_id || ticketStatus === 'closed' || statusBusy) return
+    setStatusBusy(true)
+    setActionError('')
+    try {
+      const result = await api.patch(`/tickets/${r.ticket_id}`, {
+        action: 'close',
+        note: ticketCloseNote,
+      }) as ContentTicketCloseResult
+      setTicketStatus('closed')
+      setTicketCloseConfirmOpen(false)
+      setTicketCloseNote('')
+      if (onTicketClosed) {
+        try {
+          await onTicketClosed(result)
+        } catch (error) {
+          // 结案已经成功；父列表刷新失败不能反向把成功操作提示成失败。
+          console.warn('工单结案后的内容列表刷新失败', error)
+        }
+      } else if (result.recordArchived === true) {
+        onClose()
+      } else {
+        await refreshActivity()
+        setActionError(result.recordArchiveBlockedByActiveTicket
+          ? '本工单已结案，但该内容仍有另一张活动工单，因此继续保留在“工作中”。'
+          : '本工单已结案，但内容归档状态未确认，请刷新列表核对。')
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '工单结案失败，请稍后重试')
+    } finally {
+      setStatusBusy(false)
     }
   }
 
@@ -316,8 +447,13 @@ function RecordDrawerContent({
 
   const alerts = Number(r.alert_count || 0)
   const negComments = Number(r.negative_comment_count || 0)
-  const hasSignals = alerts > 0 || negComments > 0
+  const deleted = String(r.content_availability_status || '') === 'deleted'
+  const hasSignals = alerts > 0 || negComments > 0 || deleted
   const triageStatus = r.triage_status || 'unhandled'
+  const hasTicket = Boolean(r.ticket_id)
+  const addingTicketProgress = hasTicket && ticketStatus !== 'closed'
+  const canEditTicketNumber = canWrite && hasTicket
+    && ((!archived && ticketStatus !== 'closed') || (ticketStatus === 'closed' && !ticketNumber.trim()))
 
   const TABS = [
     { id: 'content' as const, label: '内容', icon: FileText },
@@ -330,15 +466,15 @@ function RecordDrawerContent({
     { id: 'history' as const, label: `处理记录 (${activity.length})`, icon: History },
   ]
   const modeActions = [
-    { value: 'unhandled', label: '待处理', activeClass: 'bg-amber-100 text-amber-800 shadow-sm dark:bg-amber-950/50 dark:text-amber-200' },
-    { value: 'reviewing', label: '负面流程', activeClass: 'bg-violet-100 text-violet-800 shadow-sm dark:bg-violet-950/50 dark:text-violet-200' },
-    { value: 'official_responded', label: '官方已评', activeClass: 'bg-cyan-100 text-cyan-800 shadow-sm dark:bg-cyan-950/50 dark:text-cyan-200' },
-    { value: 'no_action', label: '无需操作', activeClass: 'bg-card text-foreground shadow-sm ring-1 ring-border/70' },
+    { value: 'unhandled', label: '待处理', icon: Inbox },
+    { value: 'reviewing', label: '负面流程', icon: Bell },
+    { value: 'official_responded', label: '官方已评', icon: CheckCircle },
+    { value: 'no_action', label: '无需操作', icon: CircleOff },
   ]
-  const pendingModeOption = modeActions.find(item => item.value === pendingMode)
+  const currentModeLabel = LABELS.triage[triageStatus] || triageStatus || '待处理'
 
   return (
-    <div ref={panelRef} style={{ width }} role="dialog" aria-modal="true" aria-label="舆情内容详情"
+    <div ref={panelRef} style={{ width }} role="dialog" aria-label="舆情内容详情"
       className="detail-drawer fixed inset-y-0 right-0 z-40 flex flex-col border-l border-border bg-card shadow-[-8px_0_24px_-12px_rgba(17,24,39,0.12)] animate-in slide-in-from-right duration-200">
       {/* 拖拽分隔条:贯穿到顶,与 banner 一体;hover 出蓝线(Asana) */}
       <div onMouseDown={startResize} title="拖动调整宽度"
@@ -351,9 +487,63 @@ function RecordDrawerContent({
         <div data-drawer-header className="flex min-h-16 shrink-0 items-center gap-2 border-b border-border/60 bg-card px-2 pt-[env(safe-area-inset-top)] sm:gap-3 sm:px-5 lg:min-h-14">
           <button onClick={onClose} aria-label="返回内容列表" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground transition active:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
-          <h2 className="min-w-0 truncate text-[16px] font-bold">舆情内容详情</h2>
-          {r.triage_status && <StatusBadge tone={r.triage_status}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>}
-          {archived && <StatusBadge tone="muted"><Archive className="h-3 w-3" />已归档</StatusBadge>}
+          <h2 className="shrink-0 text-[16px] font-bold text-foreground">舆情内容详情</h2>
+          {hasTicket && (
+            <div className="flex min-w-0 flex-1 items-center gap-2 text-[12px] tabular-nums">
+              <span className="shrink-0 font-medium text-primary">工单号</span>
+              {editingTicketNumber && canEditTicketNumber ? (
+                <input
+                  autoFocus
+                  value={ticketNumberDraft}
+                  maxLength={100}
+                  autoComplete="off"
+                  aria-label="工单号"
+                  placeholder="输入工单号"
+                  disabled={savingTicketNumber}
+                  onChange={event => { setTicketNumberDraft(event.target.value); setTicketNumberError('') }}
+                  onBlur={() => {
+                    if (ticketNumberCancelRef.current) {
+                      ticketNumberCancelRef.current = false
+                      return
+                    }
+                    void saveTicketNumber()
+                  }}
+                  onKeyDown={event => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      event.currentTarget.blur()
+                    } else if (event.key === 'Escape') {
+                      event.preventDefault()
+                      ticketNumberCancelRef.current = true
+                      setTicketNumberDraft(ticketNumber)
+                      setTicketNumberError('')
+                      setEditingTicketNumber(false)
+                    }
+                  }}
+                  className="ticket-number-input h-8 w-40 min-w-0 border-0 border-b border-primary bg-transparent px-0.5 text-[13px] font-semibold text-foreground outline-none disabled:opacity-60"
+                />
+              ) : (
+                <div className="flex min-w-0 items-center gap-0.5">
+                  <button
+                    type="button"
+                    aria-label="修改工单号"
+                    disabled={!canEditTicketNumber}
+                    onClick={() => {
+                      ticketNumberCancelRef.current = false
+                      setTicketNumberDraft(ticketNumber)
+                      setTicketNumberError('')
+                      setEditingTicketNumber(true)
+                    }}
+                    className="min-w-0 truncate rounded px-0.5 py-1 font-semibold text-foreground outline-none transition-colors enabled:hover:bg-muted enabled:hover:text-primary focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
+                  >
+                    {ticketNumber || '待补录'}
+                  </button>
+                  <CopyTicketNumberButton value={ticketNumber} className="h-7 w-7" />
+                </div>
+              )}
+              {ticketNumberError && <span role="alert" className="min-w-0 truncate text-[11px] font-medium text-destructive">{ticketNumberError}</span>}
+            </div>
+          )}
           <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
             className="ml-auto hidden rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:block"><X className="h-5 w-5" /></button>
         </div>
@@ -458,10 +648,13 @@ function RecordDrawerContent({
               <div className="mt-4 flex flex-wrap items-center gap-2 border-l-2 border-status-red bg-status-red/[0.04] px-3 py-2.5 dark:bg-status-red/[0.08]">
                 <span className="text-[11px] font-semibold text-muted-foreground">风险信号</span>
                 {alerts > 0 && (
-                  <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}><span className="inline-flex cursor-help items-center gap-1 rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300"><Bell className="h-3 w-3" />预警 {alerts}</span></Tooltip>
+                  <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}><span className="cursor-help rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300">预警 {alerts}</span></Tooltip>
                 )}
                 {negComments > 0 && (
                   <Tooltip text="该内容下被判为负面/风险的评论条数;下方可查看具体评论"><span className="cursor-help rounded bg-status-orange/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300">负评 {negComments}</span></Tooltip>
+                )}
+                {deleted && (
+                  <Tooltip text="负面巡查已确认平台提示该内容已删除"><span className="inline-flex cursor-help items-center gap-1 rounded bg-muted px-2 py-0.5 text-[11px] font-semibold text-muted-foreground"><CircleOff className="h-3 w-3" />已删帖</span></Tooltip>
                 )}
                 {r.latest_negative_comment_at && (
                   <span className="ml-auto text-[11px] text-muted-foreground">最近负评 {formatDate(r.latest_negative_comment_at)}</span>
@@ -478,9 +671,9 @@ function RecordDrawerContent({
           </section>
 
           {/* Tabs */}
-          <div className="mobile-table-scroll sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-border/70 bg-muted/30 px-2 py-2 backdrop-blur-sm sm:px-4">
+          <div role="tablist" aria-label="内容详情栏目" className="mobile-table-scroll sticky top-0 z-10 flex gap-1 overflow-x-auto border-b border-border/70 bg-muted/30 px-2 py-2 backdrop-blur-sm sm:px-4">
             {TABS.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)}
+              <button key={t.id} id={`record-tab-${t.id}`} role="tab" aria-selected={tab === t.id} aria-controls={`record-panel-${t.id}`} onClick={() => setTab(t.id)}
                 className={cn('flex h-9 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors sm:px-3',
                   tab === t.id ? 'bg-card text-primary shadow-sm ring-1 ring-border/50' : 'text-muted-foreground hover:bg-card/70 hover:text-foreground')}>
                 <t.icon className="h-3.5 w-3.5" />
@@ -490,7 +683,7 @@ function RecordDrawerContent({
           </div>
 
           {/* Tab panels */}
-          <div className="min-h-[260px] bg-background/35 p-4 sm:p-5">
+          <div id={`record-panel-${tab}`} role="tabpanel" aria-labelledby={`record-tab-${tab}`} className="min-h-[260px] bg-background/35 p-4 sm:p-5">
             {loading || loadedRecordId !== r.id ? (
               <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
             ) : (
@@ -636,20 +829,18 @@ function RecordDrawerContent({
                 )}
 
                 {tab === 'history' && (
-                  <div className="space-y-5">
+                  <div className="space-y-4">
                     {canProcess && (
-                      <section className="border-b border-border/60 pb-5">
+                      <section className="border-b border-border/60 pb-4">
                         <div className="mb-2 flex items-center justify-between gap-3">
-                          <h4 className="flex items-center gap-1.5 text-[13px] font-semibold">
-                            <StickyNote className="h-4 w-4 text-primary" />新增备注
-                          </h4>
+                          <h4 className="text-[13px] font-semibold">新增记录</h4>
                           <span className="text-[11px] tabular-nums text-muted-foreground">{noteDraft.length}/2000</span>
                         </div>
                         <textarea
                           value={noteDraft}
                           maxLength={2000}
                           rows={3}
-                          placeholder="记录沟通进展、判断依据或后续安排"
+                          placeholder="记录当前进展…"
                           onChange={event => {
                             setNoteDraft(event.target.value)
                             if (noteError) setNoteError('')
@@ -663,19 +854,15 @@ function RecordDrawerContent({
                           {noteError && <span className="mr-auto text-[12px] font-medium text-destructive">{noteError}</span>}
                           <Button size="sm" disabled={!noteDraft.trim() || savingNote} onClick={() => void addNote()}>
                             {savingNote ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <StickyNote className="h-3.5 w-3.5" />}
-                            添加备注
+                            添加记录
                           </Button>
                         </div>
                       </section>
                     )}
 
-                    <section>
-                      <div className="mb-4 flex items-center justify-between gap-3">
-                        <h4 className="text-[13px] font-semibold">处理时间线</h4>
-                        <span className="text-[11px] text-muted-foreground">最新在前</span>
-                      </div>
+                    <section aria-label="处理记录列表">
                       {activity.length === 0 ? (
-                        <EmptyState icon={History} title="暂无处理记录" description="状态、判断、标签、归档、工单和备注变更会显示在这里" />
+                        <EmptyState icon={History} title="暂无处理记录" />
                       ) : (
                         <ActivityTimeline items={activity} recordId={r.id} />
                       )}
@@ -708,117 +895,148 @@ function RecordDrawerContent({
                 )}
               </div>
             ) : (
-              <div className="flex w-full min-w-0 items-center gap-2" aria-label="内容处理操作">
-                {onSetStatus && (
-                  <section className="grid min-w-0 flex-1 grid-cols-4 gap-0.5 rounded-lg border border-border bg-muted/45 p-0.5" aria-label="处理模式">
-                    {modeActions.map(item => {
-                      const active = item.value === triageStatus
-                      return (
-                        <button
-                          key={item.value}
-                          type="button"
-                          disabled={active || statusBusy || falsePositiveBusy}
-                          onClick={() => {
-                            setActionError('')
-                            setPendingMode(item.value)
-                          }}
-                          aria-pressed={active}
-                          className={cn(
-                            'inline-flex h-8 min-w-0 items-center justify-center whitespace-nowrap rounded-md px-0.5 text-[9px] font-semibold transition-colors disabled:pointer-events-none sm:text-[11px]',
-                            active
-                              ? item.activeClass
-                              : 'text-muted-foreground hover:bg-card/80 hover:text-foreground',
-                          )}
-                        >
-                          {item.label}
+              <div className="flex w-full min-w-0 flex-wrap items-center gap-2" aria-label="内容处理操作">
+                <div className="shrink-0" aria-label="处理模式">
+                  {addingTicketProgress ? (
+                    <StatusBadge tone="ticketed" className="h-8 gap-1.5 px-3 text-[12px]">
+                      <ClipboardCheck className="h-3.5 w-3.5" />已转工单
+                    </StatusBadge>
+                  ) : onSetStatus ? (
+                    <DropdownMenu.Root>
+                      <DropdownMenu.Trigger asChild>
+                        <button type="button" disabled={statusBusy || falsePositiveBusy}
+                          aria-label={`当前处理模式：${currentModeLabel}，点击修改`}
+                          className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60">
+                          <StatusBadge tone={triageStatus} className="h-8 gap-1.5 px-3 text-[12px]">
+                            {currentModeLabel}
+                            {statusBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <ChevronDown className="h-3 w-3" />}
+                          </StatusBadge>
                         </button>
-                      )
-                    })}
-                  </section>
-                )}
-                {(onFalsePositive || onSetArchived) && (
-                  <div className="inline-flex shrink-0 items-center gap-0.5 rounded-lg border border-border bg-muted/45 p-0.5" aria-label="其他操作">
-                    {onFalsePositive && (
-                      <Tooltip text={falsePositivePending ? '误报已提交，等待平台管理员复核' : '提交误报'}>
-                        <Button variant="ghost" size="sm" disabled={falsePositivePending || statusBusy || falsePositiveBusy} onClick={markFalsePositive}
-                          className={cn(
-                            'h-8 shrink-0 gap-1 px-2 text-[11px]',
-                            falsePositivePending
-                              ? 'text-emerald-600 disabled:opacity-100 dark:text-emerald-300'
-                              : 'text-rose-600 hover:bg-rose-100 hover:text-rose-700 dark:text-rose-300 dark:hover:bg-rose-950/40',
-                          )}
-                          aria-label={falsePositivePending ? '误报已提交' : '提交误报'}>
-                          {falsePositiveBusy
-                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            : falsePositivePending
-                              ? <CheckCircle className="h-3.5 w-3.5" />
-                              : <Ban className="h-3.5 w-3.5" />}
-                          <span>{falsePositivePending ? '已提交' : '误报'}</span>
-                        </Button>
-                      </Tooltip>
-                    )}
-                    {onSetArchived && (
-                      <Tooltip text="归档">
-                        <Button variant="ghost" size="sm" className="h-8 shrink-0 gap-1 px-2 text-[11px]" disabled={statusBusy || falsePositiveBusy}
-                          onClick={() => runStatusAction(() => onSetArchived(true))} aria-label="归档">
-                          <Archive className="h-3.5 w-3.5" />
-                          <span>归档</span>
-                        </Button>
-                      </Tooltip>
-                    )}
-                  </div>
-                )}
-                <Button className="h-9 shrink-0 rounded-lg px-3 sm:px-4" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={onLinkIssue}>转工单</Button>
+                      </DropdownMenu.Trigger>
+                      <DropdownMenu.Portal>
+                        <DropdownMenu.Content align="start" sideOffset={8} collisionPadding={10}
+                          className="z-[100] w-52 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg animate-in fade-in zoom-in-95">
+                          <DropdownMenu.RadioGroup value={triageStatus} aria-label="内容处理模式">
+                            {modeActions.map(item => {
+                              const active = item.value === triageStatus
+                              const Icon = item.icon
+                              return (
+                                <DropdownMenu.RadioItem key={item.value} value={item.value}
+                                  disabled={statusBusy || falsePositiveBusy}
+                                  onSelect={() => { if (!active) void changeMode(item.value) }}
+                                  className="flex h-10 cursor-default select-none items-center gap-2.5 rounded-md px-2.5 text-[13px] outline-none transition-colors data-[highlighted]:bg-accent data-[disabled]:opacity-45">
+                                  <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                  <span className={cn(active && 'font-semibold')}>{item.label}</span>
+                                  <span className="ml-auto flex h-4 w-4 items-center justify-center"><DropdownMenu.ItemIndicator><Check className="h-4 w-4 text-primary" /></DropdownMenu.ItemIndicator></span>
+                                </DropdownMenu.RadioItem>
+                              )
+                            })}
+                          </DropdownMenu.RadioGroup>
+                          <DropdownMenu.Separator className="my-1 h-px bg-border/70" />
+                          <DropdownMenu.Item disabled={statusBusy || falsePositiveBusy}
+                            onSelect={() => {
+                              setActionError('')
+                              void runStatusAction(onLinkIssue).then(success => { if (success) void refreshActivity() })
+                            }}
+                            className="flex h-10 cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 text-[13px] font-semibold text-primary outline-none transition-colors data-[highlighted]:bg-primary/10 data-[disabled]:cursor-default data-[disabled]:opacity-45">
+                            <ClipboardCheck className="h-4 w-4 shrink-0 text-primary" />转工单
+                          </DropdownMenu.Item>
+                        </DropdownMenu.Content>
+                      </DropdownMenu.Portal>
+                    </DropdownMenu.Root>
+                  ) : (
+                    <StatusBadge tone={triageStatus}>{currentModeLabel}</StatusBadge>
+                  )}
+                </div>
+
+                <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+                  {onFalsePositive && (
+                    <Tooltip text={falsePositivePending ? '误报已提交，等待平台管理员复核' : '提交误报'}>
+                      <Button variant="ghost" size="sm" disabled={falsePositivePending || statusBusy || falsePositiveBusy} onClick={markFalsePositive}
+                        className={cn('h-9 shrink-0 gap-1.5 px-2.5 text-[12px]', falsePositivePending ? 'text-emerald-600 disabled:opacity-100 dark:text-emerald-300' : 'text-rose-600 hover:bg-rose-100 hover:text-rose-700 dark:text-rose-300 dark:hover:bg-rose-950/40')}
+                        aria-label={falsePositivePending ? '误报已提交' : '提交误报'}>
+                        {falsePositiveBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : falsePositivePending ? <CheckCircle className="h-3.5 w-3.5" /> : <Ban className="h-3.5 w-3.5" />}
+                        <span>{falsePositivePending ? '已提交' : '误报'}</span>
+                      </Button>
+                    </Tooltip>
+                  )}
+                  {onSetArchived && !addingTicketProgress && (
+                    <Button variant="ghost" size="sm" className="h-9 shrink-0 gap-1.5 px-2.5 text-[12px]" disabled={statusBusy || falsePositiveBusy}
+                      onClick={() => runStatusAction(() => onSetArchived(true))} aria-label="归档">
+                      <Archive className="h-3.5 w-3.5" />归档
+                    </Button>
+                  )}
+                  {addingTicketProgress && (
+                    <>
+                      <Button className="h-9 shrink-0 px-3" variant="outline" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={() => setTab('history')}>
+                        <History className="h-3.5 w-3.5" />处理记录
+                      </Button>
+                      <Button className="h-9 shrink-0 px-3" size="sm" disabled={statusBusy || falsePositiveBusy}
+                        onClick={() => { setActionError(''); setTicketCloseNote(''); setTicketCloseConfirmOpen(true) }}>
+                        <CheckCircle className="h-3.5 w-3.5" />结案
+                      </Button>
+                    </>
+                  )}
+                </div>
               </div>
             )}
-            {actionError && <div className="mt-2 text-[12px] font-medium text-destructive">{actionError}</div>}
+            {actionError && <div role="alert" className="mt-2 text-[12px] font-medium text-destructive">{actionError}</div>}
           </div>
         )}
       </div>
 
-      {!archived && pendingModeOption && (
+      {!archived && ticketCloseConfirmOpen && addingTicketProgress && (
         <div
           className="fixed inset-0 z-[70] flex items-end justify-center bg-black/35 p-3 sm:items-center sm:p-4 animate-in fade-in duration-150"
-          onMouseDown={() => { if (!statusBusy) setPendingMode(null) }}
+          onMouseDown={() => {
+            if (statusBusy) return
+            setTicketCloseConfirmOpen(false)
+            setTicketCloseNote('')
+          }}
         >
           <div
             role="alertdialog"
             aria-modal="true"
-            aria-labelledby="mode-confirm-title"
-            aria-describedby="mode-confirm-description"
+            aria-labelledby="ticket-close-confirm-title"
+            aria-describedby="ticket-close-confirm-description"
             className="w-full max-w-sm rounded-xl border border-border bg-card p-5 shadow-2xl animate-in zoom-in-95 duration-150"
             onMouseDown={event => event.stopPropagation()}
           >
             <div className="flex items-start gap-3">
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/12 text-amber-700 dark:text-amber-300">
-                <AlertTriangle className="h-4.5 w-4.5" />
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <CheckCircle className="h-4.5 w-4.5" />
               </span>
               <div className="min-w-0">
-                <h3 id="mode-confirm-title" className="text-[15px] font-bold">确认更改处理模式？</h3>
-                <p id="mode-confirm-description" className="mt-1 text-[12px] leading-5 text-muted-foreground">
-                  本次只更新处理模式，不会自动归档内容。
+                <h3 id="ticket-close-confirm-title" className="text-[15px] font-bold">确认结案？</h3>
+                <p id="ticket-close-confirm-description" className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                  结案后内容将自动移入已归档，并从“工作中”移除；如该内容另有活动工单，则会继续保留。工单与处理记录仍会保留。
                 </p>
               </div>
             </div>
-
-            <div className="mt-4 grid grid-cols-[minmax(0,1fr)_20px_minmax(0,1fr)] items-center gap-2 rounded-lg border border-border/70 bg-muted/25 px-3 py-3 text-center">
-              <div>
-                <div className="text-[10px] font-medium text-muted-foreground">当前</div>
-                <div className="mt-0.5 text-[13px] font-semibold">{LABELS.triage[triageStatus] || triageStatus}</div>
-              </div>
-              <ArrowRight className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <div className="text-[10px] font-medium text-muted-foreground">更改为</div>
-                <div className="mt-0.5 text-[13px] font-semibold text-primary">{pendingModeOption.label}</div>
-              </div>
-            </div>
-
+            <label htmlFor={`ticket-close-note-${r.id}`} className="mt-4 block text-[12px] font-semibold text-foreground">
+              结案说明 <span className="font-normal text-muted-foreground">（选填）</span>
+            </label>
+            <textarea
+              id={`ticket-close-note-${r.id}`}
+              aria-label="结案说明"
+              value={ticketCloseNote}
+              onChange={event => setTicketCloseNote(event.target.value)}
+              placeholder="填写结案说明 / 处理结论（可留空）"
+              rows={4}
+              maxLength={2000}
+              disabled={statusBusy}
+              className="mt-2 w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-[13px] leading-6 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:opacity-60"
+            />
+            <div className="mt-1 text-right text-[10px] tabular-nums text-muted-foreground">{ticketCloseNote.length}/2000</div>
             {actionError && <div className="mt-3 text-[12px] font-medium text-destructive">{actionError}</div>}
             <div className="mt-5 flex justify-end gap-2">
-              <Button variant="outline" size="sm" disabled={statusBusy} onClick={() => setPendingMode(null)}>取消</Button>
-              <Button size="sm" disabled={statusBusy} onClick={() => void confirmModeChange()}>
+              <Button variant="outline" size="sm" disabled={statusBusy} onClick={() => {
+                setTicketCloseConfirmOpen(false)
+                setTicketCloseNote('')
+              }}>取消</Button>
+              <Button size="sm" disabled={statusBusy} onClick={() => void closeTicket()}>
                 {statusBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                确认更改
+                结案
               </Button>
             </div>
           </div>
@@ -856,38 +1074,29 @@ function RecordDrawerContent({
 
 function ActivityTimeline({ items, recordId }: { items: RecordActivity[]; recordId: string }) {
   return (
-    <div>
+    <div className="divide-y divide-border/50">
       {items.map(item => {
         const detail = activityDetail(item, recordId)
-        const Icon = detail.icon
         return (
-          <div key={`${item.action}-${item.id}`} className="relative border-l border-border pb-6 pl-6 last:pb-0">
-            <span className={cn(
-              'absolute -left-[9px] top-0 flex h-[18px] w-[18px] items-center justify-center rounded-full ring-4 ring-card',
-              detail.tone === 'note' ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground',
-            )}>
-              <Icon className="h-3 w-3" />
-            </span>
+          <div key={`${item.action}-${item.id}`} className="py-3 first:pt-0 last:pb-0">
             <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-              <div className="text-[13px] font-semibold">
-                <span>{item.actor_name || '系统'}</span>
-                <span className="ml-1 font-medium text-muted-foreground">{detail.title}</span>
+              <div className="min-w-0 text-[12px]">
+                <span className="font-semibold text-foreground">{item.actor_name || '系统'}</span>
+                <span className="ml-1 text-muted-foreground">{detail.title}</span>
               </div>
-              <div className="text-[11px] tabular-nums text-muted-foreground">{formatFullDateSec(item.created_at)}</div>
+              <time className="text-[10.5px] tabular-nums text-muted-foreground">{formatFullDateSec(item.created_at)}</time>
             </div>
             {detail.body && (
-              <p className="mt-2 whitespace-pre-wrap break-words text-[13px] leading-5 text-foreground/85">{detail.body}</p>
+              <p className="mt-1.5 whitespace-pre-wrap break-words text-[12px] leading-5 text-foreground/85">{detail.body}</p>
             )}
             {detail.changes.length > 0 && (
-              <div className="mt-2.5 space-y-2">
+              <div className="mt-1.5 space-y-1.5">
                 {detail.changes.map((change, index) => (
-                  <div key={`${change.label}-${index}`} className="grid grid-cols-[64px_minmax(0,1fr)] items-center gap-2 text-[12px]">
+                  <div key={`${change.label}-${index}`} className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11.5px]">
                     <span className="text-muted-foreground">{change.label}</span>
-                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_16px_minmax(0,1fr)] items-center gap-1.5">
-                      <span className="break-words rounded-md bg-muted/60 px-2 py-1 text-center text-muted-foreground">{change.before}</span>
-                      <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/60" />
-                      <span className="break-words rounded-md bg-primary/[0.07] px-2 py-1 text-center font-semibold text-foreground">{change.after}</span>
-                    </div>
+                    <span className="break-words text-muted-foreground">{change.before}</span>
+                    <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground/50" />
+                    <span className="break-words font-semibold text-foreground">{change.after}</span>
                   </div>
                 ))}
               </div>
@@ -970,7 +1179,7 @@ function activityDetail(item: RecordActivity, recordId: string): {
       ...result,
       title: item.action === 'record.triage_batch_updated' ? '批量更新了处理模式' : '更新了处理模式',
       icon: CheckCircle,
-      body: reason ? `说明：${reason}` : '',
+      body: reason,
       changes,
     }
   }
@@ -991,14 +1200,53 @@ function activityDetail(item: RecordActivity, recordId: string): {
       }],
     }
   }
+  if (item.action === 'record.ticket_progress_added') {
+    const body = String(metadata.body || '').trim()
+    return {
+      ...result,
+      title: '添加了工单进展',
+      icon: ClipboardCheck,
+      tone: 'note',
+      body,
+    }
+  }
+  if (item.action === 'record.ticket_closed' || item.action === 'record.ticket_reopened') {
+    const body = String(metadata.body || '').trim()
+    return {
+      ...result,
+      title: item.action === 'record.ticket_closed' ? '结案了工单' : '重开了工单',
+      icon: ClipboardCheck,
+      body,
+    }
+  }
+  if (item.action === 'record.ticket_done' || item.action === 'record.ticket_dismissed') {
+    const body = String(metadata.body || '').trim()
+    return {
+      ...result,
+      title: item.action === 'record.ticket_done' ? '完成了工单处理' : '忽略了工单',
+      icon: ClipboardCheck,
+      body,
+    }
+  }
+  if (item.action === 'record.ticket_number_added' || item.action === 'record.ticket_number_changed') {
+    const externalTicketNo = String(metadata.externalTicketNo || '').trim()
+    const previousExternalTicketNo = String(metadata.previousExternalTicketNo || '').trim()
+    return {
+      ...result,
+      title: item.action === 'record.ticket_number_changed' ? '修改了工单号码' : '补录了工单号码',
+      icon: ClipboardCheck,
+      body: previousExternalTicketNo
+        ? `${previousExternalTicketNo} → ${externalTicketNo}`
+        : externalTicketNo,
+    }
+  }
   if (item.action === 'record.ticket_created') {
-    const assignee = String(metadata.assigneeName || '').trim()
     const note = String(metadata.note || '').trim()
     return {
       ...result,
       title: '转为工单',
       icon: LinkIcon,
-      body: [assignee ? `处理人：${assignee}` : '', note ? `说明：${note}` : ''].filter(Boolean).join('\n'),
+      body: note,
     }
   }
   if (item.action === 'record.official_responded') return { ...result, title: '采集到官方回复', icon: CheckCircle }

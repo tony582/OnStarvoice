@@ -9,6 +9,7 @@ import type { CloudTask } from './lib'
 import {
   PLATFORM_LABELS,
   STATUS_LABELS,
+  automaticIdleAgentRecoveryEnabled,
   canDismissAttention,
   canResume,
   canRetryOnIdleAgent,
@@ -101,13 +102,16 @@ export function TaskCard({
   )
   const hasKeywordDiagnostics = !orchestration && diagnostics.items.length > 0
   const resumable = !orchestration && canResume(task)
-  const retryOnIdleAgent = canRetryOnIdleAgent(task)
+  const safetyEvidence = isPlatformSafetyAttention(task)
+  const safetyAttention = !orchestration && safetyEvidence
+  const retryEligible = canRetryOnIdleAgent(task)
+  const automaticRecoveryPending = retryEligible && !safetyEvidence && automaticIdleAgentRecoveryEnabled(task)
+  const retryOnIdleAgent = retryEligible && !safetyEvidence && !automaticRecoveryPending
   const stoppable = !orchestration && canStop(task)
   const commandPending = Boolean(task.pending_command_id)
   const stopPending = task.pending_command_type === 'stop'
   const resumeBlocked = resumable ? resumeBlockReason(task) : ''
   const taskError = taskErrorText(task)
-  const safetyAttention = !orchestration && isPlatformSafetyAttention(task)
   const safetyPosition = diagnostics.currentKeyword && diagnostics.currentOrdinal > 0
     ? `${diagnostics.currentOrdinal}/${Math.max(diagnostics.total, 1)}「${diagnostics.currentKeyword}」`
     : ''
@@ -194,6 +198,11 @@ export function TaskCard({
         </p>
       )}
       {!safetyAttention && !hasKeywordDiagnostics && taskError && taskError !== task.message && <p role="alert" className="mt-2 line-clamp-1 text-xs leading-5 text-status-red">{taskError}</p>}
+      {automaticRecoveryPending && !commandPending && (
+        <p role="status" className="mt-2 rounded-lg border border-primary/20 bg-primary/[0.04] px-3 py-2 text-xs leading-5 text-primary">
+          系统正在选择兼容的空闲 Agent 自动重试；暂无空闲节点时会保留任务并继续排队，无需人工点击。
+        </p>
+      )}
       {hasKeywordDiagnostics ? (
         <KeywordProgressSummary task={task} diagnostics={diagnostics} />
       ) : progress.total > 0 && (
@@ -216,7 +225,9 @@ export function TaskCard({
                 。请先在 <strong>{task.agent_display_name || '原 Agent'}</strong> 完成验证；此前结果已保留。
               </p>
               <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-                验证完成后继续剩余关键词；若不再执行，可结束任务并保留现有结果。
+                {resumable
+                  ? '验证完成后只由原 Agent 继续当前受阻关键词；其他未开始关键词由系统自动分配。'
+                  : '当前受阻项保留给原 Agent；其他可恢复的未开始项由系统自动分配。'}
               </p>
             </div>
           </div>

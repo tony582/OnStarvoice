@@ -40,7 +40,7 @@ export function KeywordFilter({ label = '采集关键词', value, onChange, trig
         <ChevronDown className="h-3 w-3" />
       </button>
       {open && (
-        <div className="responsive-filter-popover absolute left-0 top-full z-50 mt-1 w-60 rounded-xl border border-border bg-card p-2 shadow-lg lg:z-30 lg:rounded-lg">
+        <div className="responsive-filter-popover absolute left-0 top-full z-50 mt-1 w-60 rounded-xl border border-border bg-card p-2 shadow-lg lg:rounded-lg">
           <div className="relative mb-1.5">
             <Search className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
             <input value={q} onChange={e => setQ(e.target.value)} placeholder="筛选关键词…"

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 
 const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
-test('content triage exposes the four customer handling modes consistently', () => {
+test('content triage keeps five states but presents content handling and work orders as two paths', () => {
   const labels = source('web/admin/src/lib/utils.ts');
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
@@ -14,7 +14,7 @@ test('content triage exposes the four customer handling modes consistently', () 
   const migration = source('server/db/migrations/036_record_triage_no_action.sql');
   const feedbackOnlyMigration = source('server/db/migrations/038_false_positive_feedback_only.sql');
 
-  for (const label of ['待处理', '负面流程', '官方已评', '无需操作']) {
+  for (const label of ['待处理', '负面流程', '官方已评', '无需操作', '已转工单']) {
     assert.match(labels, new RegExp(label));
     assert.match(queue, new RegExp(label));
     assert.match(board, new RegExp(label));
@@ -26,18 +26,43 @@ test('content triage exposes the four customer handling modes consistently', () 
     assert.doesNotMatch([labels, queue, board, drawer, dashboard, route].join('\n'), new RegExp(staleLabel));
   }
 
-  assert.match(queue, /<Button size="sm" onClick=\{onLinkIssue\}>转工单<\/Button>/);
+  const queueContentModes = queue.slice(
+    queue.indexOf('const CONTENT_TRIAGE_MODES'),
+    queue.indexOf('const TICKET_TRIAGE_MODE'),
+  );
+  for (const [value, label] of [
+    ['unhandled', '待处理'],
+    ['reviewing', '负面流程'],
+    ['official_responded', '官方已评'],
+    ['no_action', '无需操作'],
+  ]) {
+    assert.match(queueContentModes, new RegExp(`value: '${value}'[^\\n]+label: '${label}'`));
+  }
+  assert.doesNotMatch(queueContentModes, /value: 'ticketed'/);
+  assert.match(queue, /const TICKET_TRIAGE_MODE = \{ value: 'ticketed' as const, label: '已转工单'/);
+  assert.match(queue, /newStatus === 'ticketed' \? dispatchTicket\(record\)/);
   assert.match(queue, /function TriageStatusMenu/);
-  assert.match(queue, /<DropdownMenu\.Portal>/);
   assert.match(queue, /onChangeMode=\{\(nextStatus: TriageMode\)/);
   assert.match(queue, /api\.patch\('\/triage\/records\/' \+ recordId, \{ status: newStatus \}\)/);
   assert.match(queue, /params\.set\('queue', 'triage'\)/);
   assert.match(queue, /return !triageStatus \|\| triageStatus === newStatus/);
+  assert.doesNotMatch(queue, /initial\?\.ticket === 'with'/);
   assert.doesNotMatch(queue, /label: '已处理'/);
-  assert.match(queue, /\{ key: 'unhandled', label: '待处理'/);
-  assert.match(queue, /\{ key: 'reviewing', label: '负面流程'/);
-  assert.match(queue, /\{ key: 'official_responded', label: '官方已评'/);
-  assert.match(queue, /\{ key: 'no_action', label: '无需操作'/);
+  assert.match(queue, /aria-label="内容处理模式"/);
+  assert.match(drawer, /aria-label="内容处理模式"/);
+  assert.match(drawer, /addingTicketProgress/);
+
+  const boardContentModes = board.slice(
+    board.indexOf('const CONTENT_COLUMNS'),
+    board.indexOf('const TICKET_COLUMN'),
+  );
+  for (const value of ['unhandled', 'reviewing', 'official_responded', 'no_action']) {
+    assert.match(boardContentModes, new RegExp(`key: '${value}'`));
+  }
+  assert.doesNotMatch(boardContentModes, /ticketed/);
+  assert.match(board, /\{ key: 'ticketed', label: '已转工单'/);
+  assert.match(board, /to === 'ticketed'/);
+  assert.match(board, /onDispatchTicket\(card\)/);
   assert.match(board, /to === 'official_responded'/);
   assert.match(board, /\/official-response/);
   assert.match(board, /queue: 'triage'/);
@@ -45,7 +70,11 @@ test('content triage exposes the four customer handling modes consistently', () 
   assert.match(route, /official_response_status = 'responded'/);
   assert.match(route, /const TRIAGE_QUEUE_CONDITION/);
   assert.match(route, /queue === 'triage'/);
-  assert.match(route, /IN \('unhandled', 'reviewing', 'official_responded', 'no_action'\)/);
+  assert.match(route, /IN \('unhandled', 'reviewing', 'official_responded', 'no_action', 'ticketed'\)/);
+  const recordModeRoute = route.slice(route.indexOf("router.patch('/records/:recordId'"));
+  assert.match(recordModeRoute, /status <> 'closed'/);
+  assert.match(recordModeRoute, /error: 'content_ticket_active'/);
+  assert.match(recordModeRoute, /工单结案前，处理模式须保留为“已转工单”/);
   const activeQueue = route.slice(
     route.indexOf('export const ACTIVE_QUEUE_CONDITION'),
     route.indexOf('// 处理模式和归档生命周期相互独立'),
@@ -56,6 +85,7 @@ test('content triage exposes the four customer handling modes consistently', () 
   assert.match(migration, /archived_at = COALESCE\(archived_at, updated_at, now\(\)\)/);
   const statusSet = route.match(/const TRIAGE_STATUSES = new Set\(\[[^\]]+\]\)/)?.[0] || '';
   assert.doesNotMatch(statusSet, /false_positive/);
+  assert.doesNotMatch(statusSet, /ticketed/);
   assert.match(route, /false_positive_is_feedback_only/);
   assert.doesNotMatch(
     feedbackOnlyMigration.match(/ADD CONSTRAINT record_triage_status_check[\s\S]*$/)?.[0] || '',
@@ -66,7 +96,6 @@ test('content triage exposes the four customer handling modes consistently', () 
 test('archive is an explicit single or batch lifecycle action, independent from handling mode', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
-  const batchBar = source('web/admin/src/components/shared/BatchBar.tsx');
   const route = source('server/routes/triage.js');
   const migration = source('server/db/migrations/035_record_triage_archive.sql');
 
@@ -78,8 +107,6 @@ test('archive is an explicit single or batch lifecycle action, independent from 
   assert.match(queue, /api\.patch\('\/triage\/records\/archive', \{ ids, archived \}\)/);
   assert.match(queue, /key: 'archive', label: '归档'/);
   assert.match(queue, /key: 'unarchive', label: '取消归档'/);
-  assert.match(queue, /separatorBefore: true/);
-  assert.match(batchBar, /separatorBefore\?: boolean/);
   assert.match(drawer, /onSetArchived/);
 
   const archiveStart = route.indexOf("router.patch('/records/archive'");
@@ -90,6 +117,12 @@ test('archive is an explicit single or batch lifecycle action, independent from 
   assert.match(archiveRoute, /archived_at = NULL/);
   assert.match(archiveRoute, /DO UPDATE SET\s+archived_at = now\(\)/);
   assert.doesNotMatch(archiveRoute, /DO UPDATE SET\s+status\s*=/);
+  assert.match(archiveRoute, /let targetIds = validIds/);
+  assert.match(archiveRoute, /if \(archived\)/);
+  assert.match(archiveRoute, /source_type = 'content'/);
+  assert.match(archiveRoute, /status <> 'closed'/);
+  assert.match(archiveRoute, /activeTicketRecordIds/);
+  assert.match(archiveRoute, /skippedActiveTicketIds/);
   assert.match(route, /const TRIAGE_ARCHIVE_CONDITION/);
   assert.match(route, /rt\.archived_at IS NULL/);
   assert.match(route, /rt\.archived_at IS NOT NULL/);
@@ -111,13 +144,12 @@ test('archived content is sealed until an explicit unarchive', () => {
   assert.match(queue, /canWrite && !archived/);
   assert.match(queue, /archived \? '查看详情' : '查看并处理'/);
   assert.match(queue, /archiveView === 'archived'\s*\? \[\{ key: 'unarchive', label: '取消归档'/);
-  assert.match(queue, /archived \? \(\s*<Button variant="outline" size="sm" disabled=\{archiveBusy\} onClick=\{onArchive\}>/);
 
   assert.match(drawer, /const canProcess = canWrite && !archived/);
   assert.match(drawer, /该内容已封存为只读状态，取消归档后才能继续处理/);
   assert.match(drawer, /aria-label="归档内容操作"/);
   assert.match(drawer, /内容已封存/);
-  assert.match(drawer, /!archived && pendingModeOption/);
+  assert.match(drawer, /onSetArchived\(false\)/);
 
   assert.match(lifecycle, /RECORD_ARCHIVED_ERROR = 'record_archived'/);
   assert.match(lifecycle, /内容已归档，请先取消归档后再处理/);

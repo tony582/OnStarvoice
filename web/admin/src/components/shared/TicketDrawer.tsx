@@ -26,7 +26,7 @@ type TicketAction = () => Promise<unknown> | unknown
 
 interface TicketNote {
   id: string
-  event_type?: 'note' | 'closed' | 'reopened'
+  event_type?: 'note' | 'closed' | 'reopened' | 'done' | 'dismissed'
   body?: string
   author_name?: string
   created_at?: string
@@ -50,6 +50,7 @@ interface TicketDrawerProps {
   onCloseTicket?: TicketAction
   onReopenTicket?: TicketAction
   onNoteAdded?: (note: any) => void
+  onTicketNumberAdded?: (externalTicketNo: string) => void
 }
 
 /**
@@ -69,6 +70,7 @@ function TicketDrawerContent({
   onCloseTicket,
   onReopenTicket,
   onNoteAdded,
+  onTicketNumberAdded,
 }: TicketDrawerProps) {
   const [tab, setTab] = useState<TicketTab>('content')
   const [source, setSource] = useState<TicketSource | null>(null)
@@ -80,6 +82,9 @@ function TicketDrawerContent({
   const [savingNote, setSavingNote] = useState(false)
   const [actionBusy, setActionBusy] = useState(false)
   const [actionError, setActionError] = useState('')
+  const [ticketNumber, setTicketNumber] = useState(String(t.external_ticket_no || ''))
+  const [ticketNumberDraft, setTicketNumberDraft] = useState('')
+  const [ticketNumberError, setTicketNumberError] = useState('')
   const [lightbox, setLightbox] = useState('')
   const panelRef = useRef<HTMLDivElement>(null)
   const noteRef = useRef<HTMLTextAreaElement>(null)
@@ -205,6 +210,24 @@ function TicketDrawerContent({
     }
   }
 
+  const saveTicketNumber = async () => {
+    const externalTicketNo = ticketNumberDraft.trim()
+    const sourceId = t.source_type === 'content' ? t.source_record_id : t.source_comment_id
+    if (!externalTicketNo || !sourceId || t.status === 'closed' || actionBusy) return
+    setActionBusy(true)
+    setTicketNumberError('')
+    try {
+      await api.patch(`/tickets/${t.id}/external-number`, { externalTicketNo })
+      setTicketNumber(externalTicketNo)
+      setTicketNumberDraft('')
+      onTicketNumberAdded?.(externalTicketNo)
+    } catch (error) {
+      setTicketNumberError(error instanceof Error ? error.message : '工单号码保存失败，请稍后重试')
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
   const openProgress = () => {
     setTab('history')
     window.setTimeout(() => noteRef.current?.focus(), 50)
@@ -312,11 +335,30 @@ function TicketDrawerContent({
             <div className="mt-4 border-t border-border/50 pt-3">
               <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 text-[11.5px]">
                 <span className="inline-flex items-center gap-1.5 font-semibold text-foreground"><ClipboardCheck className="h-3.5 w-3.5 text-primary" />工单信息</span>
+                <span className="inline-flex min-w-0 max-w-full items-start gap-1 text-muted-foreground">工单号 <strong className="min-w-0 break-all font-semibold text-foreground">{ticketNumber || '未填写'}</strong></span>
                 <span className="inline-flex items-center gap-1.5 text-muted-foreground">优先级 <StatusBadge tone={t.priority}>{LABELS.priority[t.priority] || t.priority}</StatusBadge></span>
                 <span className="inline-flex items-center gap-1.5 text-muted-foreground"><UserCog className="h-3.5 w-3.5" />处理人 <strong className="font-semibold text-foreground">{t.assignee_name || '本人跟进'}</strong></span>
                 <span className="text-muted-foreground">转单人 <strong className="font-semibold text-foreground">{t.created_by_name || '-'}</strong></span>
                 <span className="ml-auto tabular-nums text-muted-foreground">{formatFullDate(t.created_at)}</span>
               </div>
+              {!ticketNumber && !closed && canWrite && (
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <label htmlFor="ticket-detail-number" className="text-[11px] font-semibold text-foreground">补录工单号</label>
+                  <input
+                    id="ticket-detail-number"
+                    value={ticketNumberDraft}
+                    maxLength={100}
+                    onChange={event => { setTicketNumberDraft(event.target.value); setTicketNumberError('') }}
+                    onKeyDown={event => { if (event.key === 'Enter') void saveTicketNumber() }}
+                    placeholder="客户 Excel 中的工单号"
+                    className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 text-[12px] outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                  />
+                  <Button size="sm" className="h-8" disabled={!ticketNumberDraft.trim() || actionBusy} onClick={() => void saveTicketNumber()}>
+                    {actionBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}保存
+                  </Button>
+                  {ticketNumberError && <span className="w-full text-[11px] font-medium text-destructive">{ticketNumberError}</span>}
+                </div>
+              )}
               {t.dispatch_note && (
                 <div className="mt-2 border-l-2 border-amber-400 bg-amber-500/[0.05] px-3 py-2 text-[12px] leading-5">
                   <span className="mr-2 font-semibold text-foreground">转单说明</span>
@@ -592,7 +634,15 @@ function buildTimeline(ticket: any, notes: TicketNote[]): TimelineItem[] {
     return {
       id: note.id,
       type,
-      title: type === 'closed' ? '结案了工单' : type === 'reopened' ? '重开了工单' : '添加了处理进展',
+      title: type === 'closed'
+        ? '结案了工单'
+        : type === 'reopened'
+          ? '重开了工单'
+          : type === 'done'
+            ? '完成了处理'
+            : type === 'dismissed'
+              ? '忽略了工单'
+              : '添加了处理进展',
       actor: note.author_name || '-',
       at: note.created_at,
       body: note.body || '',
@@ -621,7 +671,8 @@ function buildTimeline(ticket: any, notes: TicketNote[]): TimelineItem[] {
     })
   }
 
-  if ((ticket.status === 'done' || ticket.status === 'dismissed') && ticket.handled_at) {
+  if ((ticket.status === 'done' || ticket.status === 'dismissed') && ticket.handled_at
+    && !notes.some(note => note.event_type === ticket.status)) {
     items.push({
       id: `handled-${ticket.id}`,
       type: ticket.status,

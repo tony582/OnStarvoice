@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity, AlertTriangle, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
-  CircleAlert, ClipboardList, Database, Eye, FileText, Headphones,
+  CircleAlert, Database, Eye, FileText,
   Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageCircle, MessageSquare, Monitor,
   MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
   Sparkles, User, Users,
@@ -79,7 +79,7 @@ const PAGE_TITLES: Record<string, string> = {
 }
 
 const QUEUE_TITLES: Record<string, string> = {
-  triage: '内容分诊', leads: '评论分诊', feedback: '已转工单',
+  triage: '内容分诊', leads: '评论分诊',
   misjudgments: '误判反馈', issues: '问题处置',
 }
 
@@ -146,7 +146,7 @@ function BottomNav({ active }: { active: RootTab | null }) {
   const { badges } = useBadges()
   const { isPlatformAdmin } = useAuth()
   const routerNavigate = useRouterNavigate()
-  const taskCount = badges.triagePending + badges.leadsNew + badges.ticketsPending
+  const taskCount = badges.triagePending + badges.leadsNew
     + (isPlatformAdmin() ? badges.feedbackPending : 0) + badges.issuesOpen
 
   return (
@@ -245,12 +245,11 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
   const k = data?.kpi || {}
   const high = Number(k.high_open_issues || 0)
   const overdue = Number(k.overdue_issues || 0)
-  const urgentTotal = high + overdue + badges.triagePending + badges.ticketsPending
+  const urgentTotal = high + overdue + badges.triagePending
   const sb = data?.sentimentBreakdown || { negative: 0, neutral: 0, positive: 0, unlabeled: 0, total: 0 }
   const tasks = [
     { key: 'issues', count: high + overdue, label: overdue ? `${overdue} 个问题已超时` : `${high} 个高优问题开放中`, reason: '需要确认负责人和处置结论', tone: 'red', icon: CircleAlert, action: () => openPage('workbench', { queue: 'issues' }) },
     { key: 'triage', count: badges.triagePending, label: `${badges.triagePending} 条内容待判断`, reason: '负面与高互动内容优先', tone: 'orange', icon: Eye, action: () => openPage('workbench', { queue: 'triage' }) },
-    { key: 'tickets', count: badges.ticketsPending, label: `${badges.ticketsPending} 个工单待推进`, reason: '补充进展或完成结案', tone: 'blue', icon: Headphones, action: () => openPage('workbench', { queue: 'feedback' }) },
     { key: 'comments', count: badges.leadsNew, label: `${badges.leadsNew} 条风险评论待跟进`, reason: '转工单、归档或忽略', tone: 'purple', icon: MessageSquare, action: () => openPage('workbench', { queue: 'leads' }) },
   ].filter(item => item.count > 0)
 
@@ -263,7 +262,7 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
         : '当前没有紧急待办，可以继续观察'
 
   const handled = Number(k.issue_linked || 0)
-  const active = Number(k.unhandled || 0) + Number(k.reviewing || 0) + handled
+  const active = Number(k.active_or_ticketed ?? (Number(k.unhandled || 0) + Number(k.reviewing || 0) + handled))
   const handledPct = active ? Math.round((handled / active) * 100) : 0
 
   return (
@@ -348,12 +347,12 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
         </section>
 
         <section className="rounded-2xl border border-border bg-card p-4">
-          <SectionHeading label="处置进度" meta={`${handled} / ${active}`} />
+          <SectionHeading label="工单覆盖" meta={`${handled} / ${active}`} />
           <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green" style={{ width: `${handledPct}%` }} /></div>
           <div className="mt-3 grid grid-cols-3 divide-x divide-border text-center">
             <MiniMetric label="待判断" value={k.unhandled} />
             <MiniMetric label="负面流程" value={k.reviewing} />
-            <MiniMetric label="已关联" value={k.issue_linked} />
+            <MiniMetric label="已转工单" value={k.issue_linked} />
           </div>
         </section>
 
@@ -372,11 +371,10 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
   const { badges } = useBadges()
   const { isPlatformAdmin } = useAuth()
   const adminFeedback = isPlatformAdmin() ? badges.feedbackPending : 0
-  const total = badges.triagePending + badges.leadsNew + badges.ticketsPending + adminFeedback + badges.issuesOpen
+  const total = badges.triagePending + badges.leadsNew + adminFeedback + badges.issuesOpen
   const queues = [
-    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、人工修正、转工单或标记处理模式', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
+    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、跟进工单或标记处理模式', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
     { title: '评论分诊', count: badges.leadsNew, copy: '跟进风险评论，转工单或忽略', icon: MessageSquare, tone: 'orange', page: 'workbench', params: { queue: 'leads' } },
-    { title: '已转工单', count: badges.ticketsPending, copy: '补充进展、追踪处理并完成结案', icon: Headphones, tone: 'blue', page: 'workbench', params: { queue: 'feedback' } },
     { title: '问题处置', count: badges.issuesOpen, copy: '确认负责人、解决问题或关闭事件', icon: CircleAlert, tone: 'purple', page: 'workbench', params: { queue: 'issues' } },
     ...(isPlatformAdmin() ? [{ title: '误判反馈', count: badges.feedbackPending, copy: '核对客户提交的误报并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } }] : []),
   ]
@@ -393,7 +391,7 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
 
         <div className="grid grid-cols-2 gap-2">
           <QuickFilter label="高风险" value={String(badges.triagePending)} onClick={() => openPage('workbench', { queue: 'triage', sentiment: 'negative' })} />
-          <QuickFilter label="待我处理" value={String(badges.ticketsPending + badges.issuesOpen)} onClick={() => openPage('workbench', { queue: 'feedback' })} />
+          <QuickFilter label="已转工单" value="处理模式" onClick={() => openPage('workbench', { queue: 'triage', status: 'ticketed' })} />
         </div>
 
         <section>
@@ -406,7 +404,6 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
         <section>
           <SectionHeading label="其他任务" />
           <div className="mt-2 overflow-hidden rounded-2xl border border-border bg-card">
-            <DirectoryRow icon={ClipboardList} title="客服工单" subtitle="接收、处理、打回与回执" onClick={() => openPage('opinion')} />
             <DirectoryRow icon={User} title="销售客资" subtitle="跟进、处理或忽略购买意向" onClick={() => openPage('salesleads')} divided />
           </div>
         </section>
@@ -508,7 +505,6 @@ const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
   ] },
   { label: '业务能力', items: [
     { title: '官方社媒', subtitle: '帖子趋势、评论情绪与运营建议', icon: MessageCircle, page: 'official-comments' },
-    { title: '客服工单', subtitle: '处理、打回、归档与回执', icon: Headphones, page: 'opinion' },
     { title: '销售客资', subtitle: '购买意向跟进与处理', icon: User, page: 'salesleads' },
     { title: '社交账号', subtitle: '登录账号、Agent 绑定与每日负载', icon: Users, page: 'social-accounts' },
     { title: '事件中心', subtitle: '严重度、状态与关联内容时间线', icon: Bell, page: 'events' },
@@ -599,7 +595,7 @@ function MobilePageSurface() {
   }, [page, pageId, params, query, navigate])
 
   const PageComponent = PAGE_COMPONENTS[pageId]
-  const requestedQueue = query.queue || 'triage'
+  const requestedQueue = query.queue === 'feedback' ? 'triage' : (query.queue || 'triage')
   const visibleQueue = requestedQueue === 'misjudgments' && !isPlatformAdmin() ? 'triage' : requestedQueue
   const title = pageId === 'workbench' ? (QUEUE_TITLES[visibleQueue] || PAGE_TITLES[pageId]) : (PAGE_TITLES[pageId] || '功能')
   const backRoot = rootForPage(pageId, query)

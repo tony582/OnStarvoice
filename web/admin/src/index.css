@@ -300,6 +300,11 @@ body::before {
   outline-offset: 2px;
 }
 
+.ticket-number-input:focus-visible {
+  outline: none;
+  outline-offset: 0;
+}
+
 /* ── Selection ────────────────────────────── */
 ::selection {
   background: var(--primary);

@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
-import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import { requireTenantAccess, requireSessionUser, requireTenantWriter } from '../middleware/auth.js';
 import { sendXlsx, fmtTs } from '../services/xlsx-export.js';
 import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifecycle.js';
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
 import { formatPublishDate } from '../services/publish-date.js';
+import { TICKET_EVENT_TYPE_BY_ACTION } from '../services/ticket-event-types.js';
 
 const router = Router();
 
@@ -15,7 +16,7 @@ const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const TICKET_COLUMNS = `
   id, source_type, source_record_id, source_comment_id,
   platform, title, item_text, author, url, cover_url,
-  category, priority, status,
+  category, external_ticket_no, priority, status,
   assignee_user_id, assignee_name, created_by_name, dispatch_note,
   handle_result, handle_note, handled_by_name, handled_at,
   feedback_status, reviewed_by_name, reviewed_at, review_note,
@@ -28,13 +29,182 @@ const ORDER = `
     created_at DESC
 `;
 
-// ==================== 转工单(分诊侧:创建工单 + 把源移出分诊队列)====================
+async function lockTicketSource(tx, ticket, tenantId) {
+  if (ticket.source_type === 'content' && ticket.source_record_id) {
+    return tx.queryOne(
+      `SELECT id FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+      [ticket.source_record_id, tenantId],
+    );
+  }
+  if (ticket.source_type === 'comment' && ticket.source_comment_id) {
+    return tx.queryOne(
+      `SELECT id FROM comment_leads WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+      [ticket.source_comment_id, tenantId],
+    );
+  }
+  return null;
+}
+
+async function findOtherActiveTicket(tx, ticket, tenantId) {
+  const sourceColumn = ticket.source_type === 'content' ? 'source_record_id' : 'source_comment_id';
+  const sourceId = ticket.source_type === 'content' ? ticket.source_record_id : ticket.source_comment_id;
+  if (!sourceId) return null;
+  return tx.queryOne(
+    `SELECT id, external_ticket_no
+     FROM tickets
+     WHERE tenant_id = $1
+       AND source_type = $2
+       AND ${sourceColumn} = $3
+       AND id <> $4
+       AND status <> 'closed'
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1`,
+    [tenantId, ticket.source_type, sourceId, ticket.id],
+  );
+}
+
+async function archiveContentRecordForTicketClose(tx, {
+  ticket,
+  tenantId,
+  actorType,
+  actorId,
+  actorUserId,
+  actorName,
+  idempotentTicketClose = false,
+}) {
+  if (ticket.source_type !== 'content') return null;
+  const recordId = ticket.source_record_id;
+  if (!recordId) {
+    return {
+      archived: false,
+      changed: false,
+      recordId: null,
+      archivedAt: null,
+      blockedByActiveTicket: false,
+      blockingActiveTicketId: null,
+      blockingActiveTicketNumber: '',
+    };
+  }
+
+  // 同一内容可能已有一张更新的在途工单（例如旧工单结案后，内容取消归档并再次转单）。
+  // 旧工单的结案重试绝不能把新工单对应的内容再次藏入归档。
+  const activeTicket = await findOtherActiveTicket(tx, ticket, tenantId);
+  if (activeTicket) {
+    const existing = await tx.queryOne(`
+      SELECT record_id, archived_at
+      FROM record_triage
+      WHERE tenant_id = $1 AND record_id = $2
+    `, [tenantId, recordId]);
+    return {
+      archived: Boolean(existing?.archived_at),
+      changed: false,
+      recordId,
+      archivedAt: existing?.archived_at || null,
+      blockedByActiveTicket: true,
+      blockingActiveTicketId: activeTicket.id,
+      blockingActiveTicketNumber: activeTicket.external_ticket_no || '',
+    };
+  }
+
+  // 来源 records 行已由调用方先锁住。这里再以 archived_at IS NULL 作为数据库级
+  // 幂等门：内容已归档时不覆盖首次归档时间/归档人，也不重复写 record.archived。
+  const archived = await tx.queryOne(`
+    INSERT INTO record_triage (
+      tenant_id, record_id, status, priority, owner_user_id, owner_name,
+      archived_at, archived_by_user_id, archived_by_name, updated_at
+    ) VALUES ($1, $2, 'ticketed', 'normal', NULL, '', now(), $3, $4, now())
+    ON CONFLICT (tenant_id, record_id)
+    DO UPDATE SET
+      archived_at = excluded.archived_at,
+      archived_by_user_id = excluded.archived_by_user_id,
+      archived_by_name = excluded.archived_by_name,
+      updated_at = excluded.updated_at
+    WHERE record_triage.archived_at IS NULL
+    RETURNING record_id, archived_at, archived_by_user_id, archived_by_name
+  `, [tenantId, recordId, actorUserId, actorName]);
+
+  if (archived) {
+    await tx.execute(`
+      INSERT INTO audit_logs (
+        tenant_id, actor_type, actor_id, actor_user_id,
+        action, target_type, target_id, metadata
+      ) VALUES ($1, $2, $3, $4, 'record.archived', 'record', $5, $6::jsonb)
+    `, [
+      tenantId,
+      actorType,
+      actorId,
+      actorUserId,
+      recordId,
+      JSON.stringify({
+        recordIds: [recordId],
+        archived: true,
+        updated: 1,
+        source: 'ticket_close',
+        ticketId: ticket.id,
+        externalTicketNo: ticket.external_ticket_no || '',
+        idempotentTicketClose,
+      }),
+    ]);
+    return {
+      archived: true,
+      changed: true,
+      recordId,
+      archivedAt: archived.archived_at,
+      blockedByActiveTicket: false,
+      blockingActiveTicketId: null,
+      blockingActiveTicketNumber: '',
+    };
+  }
+
+  const existing = await tx.queryOne(`
+    SELECT record_id, archived_at
+    FROM record_triage
+    WHERE tenant_id = $1 AND record_id = $2
+  `, [tenantId, recordId]);
+  return {
+    archived: Boolean(existing?.archived_at),
+    changed: false,
+    recordId,
+    archivedAt: existing?.archived_at || null,
+    blockedByActiveTicket: false,
+    blockingActiveTicketId: null,
+    blockingActiveTicketNumber: '',
+  };
+}
+
+async function markContentRecordTicketed(tx, { tenantId, recordId, userId, userName }) {
+  const previous = await tx.queryOne(
+    `SELECT COALESCE(status, 'unhandled') AS status
+     FROM record_triage
+     WHERE tenant_id = $1 AND record_id = $2`,
+    [tenantId, recordId],
+  );
+  await tx.execute(
+    `INSERT INTO record_triage (
+       tenant_id, record_id, status, owner_user_id, owner_name, updated_at
+     ) VALUES ($1, $2, 'ticketed', $3, $4, now())
+     ON CONFLICT (tenant_id, record_id)
+     DO UPDATE SET status = 'ticketed', updated_at = now()`,
+    [tenantId, recordId, userId || null, userName || ''],
+  );
+  return previous?.status || 'unhandled';
+}
+
+// ==================== 转工单(分诊侧:创建工单；内容进入“已转工单”处理模式)====================
 router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const sourceType = String(req.body?.sourceType || '');
     const sourceId = String(req.body?.sourceId || '');
     if (!['content', 'comment'].includes(sourceType) || !sourceId) {
       return res.status(400).json({ ok: false, error: 'invalid_source', message: '来源无效' });
+    }
+    const externalTicketNo = String(req.body?.externalTicketNo || '').trim();
+    if (externalTicketNo.length > 100) {
+      return res.status(400).json({
+        ok: false,
+        error: 'external_ticket_no_too_long',
+        message: '工单号码最多 100 个字符',
+      });
     }
     const priority = PRIORITIES.has(String(req.body?.priority)) ? String(req.body.priority) : '';
     const dispatchNote = String(req.body?.note || '');
@@ -61,16 +231,6 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
       assigneeUserId = req.user?.id || null;
       assigneeName = req.user?.name || req.user?.email || '';
     }
-
-    // 防重:同一源若已有未关闭工单,直接返回它
-    const existing = await queryOne(
-      `SELECT ${TICKET_COLUMNS} FROM tickets
-       WHERE tenant_id = $1 AND status <> 'closed'
-         AND ${sourceType === 'content' ? 'source_record_id' : 'source_comment_id'} = $2
-       LIMIT 1`,
-      [req.tenantId, sourceId],
-    );
-    if (existing) return res.json({ ok: true, ticket: existing, existed: true });
 
     // 取源快照
     let snap;
@@ -102,14 +262,66 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
         });
         if (!lifecycle) return { notFound: true };
         if (lifecycle.archived_at) return { archived: true };
+      } else {
+        const lockedComment = await tx.queryOne(
+          `SELECT id FROM comment_leads WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+          [sourceId, req.tenantId],
+        );
+        if (!lockedComment) return { notFound: true };
+      }
+
+      // 锁住来源后再防重，避免并发请求为同一来源创建两张在途工单。
+      let existing = await tx.queryOne(
+        `SELECT ${TICKET_COLUMNS} FROM tickets
+         WHERE tenant_id = $1 AND source_type = $2 AND status <> 'closed'
+           AND ${sourceType === 'content' ? 'source_record_id' : 'source_comment_id'} = $3
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [req.tenantId, sourceType, sourceId],
+      );
+      if (existing) {
+        if (externalTicketNo && existing.external_ticket_no && existing.external_ticket_no !== externalTicketNo) {
+          return { externalNumberConflict: existing.external_ticket_no };
+        }
+        if (externalTicketNo && !existing.external_ticket_no) {
+          existing = await tx.queryOne(
+            `UPDATE tickets SET external_ticket_no = $3, updated_at = now()
+             WHERE id = $1 AND tenant_id = $2
+             RETURNING ${TICKET_COLUMNS}`,
+            [existing.id, req.tenantId, externalTicketNo],
+          );
+          if (sourceType === 'content') {
+            await tx.execute(`
+              INSERT INTO audit_logs (
+                tenant_id, actor_type, actor_id, actor_user_id,
+                action, target_type, target_id, metadata
+              ) VALUES ($1, 'user', $2, $3, 'record.ticket_number_added', 'record', $4, $5::jsonb)
+            `, [
+              req.tenantId,
+              req.user?.id || '',
+              req.user?.id || null,
+              sourceId,
+              JSON.stringify({ ticketId: existing.id, externalTicketNo }),
+            ]);
+          }
+        }
+        if (sourceType === 'content') {
+          await markContentRecordTicketed(tx, {
+            tenantId: req.tenantId,
+            recordId: sourceId,
+            userId: req.user?.id,
+            userName: req.user?.name || req.user?.email || '',
+          });
+        }
+        return { ticket: existing, existed: true };
       }
       const row = await tx.queryOne(
         `INSERT INTO tickets (
            tenant_id, source_type, source_record_id, source_comment_id,
            platform, title, item_text, author, url, cover_url,
-           category, priority, assignee_user_id, assignee_name,
+           category, external_ticket_no, priority, assignee_user_id, assignee_name,
            created_by_user_id, created_by_name, dispatch_note
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
          RETURNING ${TICKET_COLUMNS}`,
         [
           req.tenantId, sourceType,
@@ -117,24 +329,18 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           sourceType === 'comment' ? sourceId : null,
           snap.platform || '', snap.title || '', snap.item_text || '', snap.author || '',
           snap.url || '', snap.cover_url || '',
-          snap.category || '', priority || snap.src_priority || 'normal', assigneeUserId, assigneeName,
+          snap.category || '', externalTicketNo, priority || snap.src_priority || 'normal', assigneeUserId, assigneeName,
           req.user?.id || null, req.user?.name || req.user?.email || '', dispatchNote,
         ],
       );
-      // 把源移出分诊队列:内容与评论统一标记为 ticketed(已转工单)
+      // 内容进入第五种“已转工单”处理模式；评论沿用既有独立队列语义。
       if (sourceType === 'content') {
-        const previousTriage = await tx.queryOne(
-          `SELECT COALESCE(status, 'unhandled') AS status
-           FROM record_triage WHERE tenant_id = $1 AND record_id = $2`,
-          [req.tenantId, sourceId],
-        );
-        await tx.execute(
-          `INSERT INTO record_triage (tenant_id, record_id, status, owner_user_id, owner_name, updated_at)
-           VALUES ($1, $2, 'ticketed', $3, $4, now())
-           ON CONFLICT (tenant_id, record_id)
-           DO UPDATE SET status = 'ticketed', updated_at = now()`,
-          [req.tenantId, sourceId, req.user?.id || null, req.user?.name || req.user?.email || ''],
-        );
+        const previousStatus = await markContentRecordTicketed(tx, {
+          tenantId: req.tenantId,
+          recordId: sourceId,
+          userId: req.user?.id,
+          userName: req.user?.name || req.user?.email || '',
+        });
         await tx.execute(`
           INSERT INTO audit_logs (
             tenant_id, actor_type, actor_id, actor_user_id,
@@ -147,8 +353,11 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           sourceId,
           JSON.stringify({
             ticketId: row.id,
-            previousStatus: previousTriage?.status || 'unhandled',
+            externalTicketNo: row.external_ticket_no,
+            previousStatus,
             nextStatus: 'ticketed',
+            ticketStatus: row.status,
+            processingModeChanged: previousStatus !== 'ticketed',
             priority: row.priority,
             assigneeName: row.assignee_name,
             note: dispatchNote,
@@ -166,7 +375,134 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
 
     if (ticketResult.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '来源不存在' });
     if (ticketResult.archived) return sendRecordArchived(res, [sourceId]);
-    return res.json({ ok: true, ticket: ticketResult.ticket });
+    if (ticketResult.externalNumberConflict) {
+      return res.status(409).json({
+        ok: false,
+        error: 'active_ticket_number_conflict',
+        message: `该来源已有未结案工单（${ticketResult.externalNumberConflict}）`,
+      });
+    }
+    return res.json({ ok: true, ticket: ticketResult.ticket, existed: Boolean(ticketResult.existed) });
+  } catch (err) { return next(err); }
+});
+
+// ==================== 录入或修改工单号（更新现有工单；允许已结案舆情补录空缺号码）====================
+router.patch('/:id/external-number', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const externalTicketNo = String(req.body?.externalTicketNo || '').trim();
+    const hasExpectedNumber = Object.prototype.hasOwnProperty.call(req.body || {}, 'previousExternalTicketNo');
+    const previousExternalTicketNo = String(req.body?.previousExternalTicketNo || '').trim();
+    if (!externalTicketNo) {
+      return res.status(400).json({ ok: false, error: 'external_ticket_no_required', message: '请输入工单号码' });
+    }
+    if (externalTicketNo.length > 100) {
+      return res.status(400).json({
+        ok: false,
+        error: 'external_ticket_no_too_long',
+        message: '工单号码最多 100 个字符',
+      });
+    }
+
+    const outcome = await withTransaction(async tx => {
+      // 与结案、再次转单保持同一锁顺序：先锁来源，再锁工单。
+      const ticketHint = await tx.queryOne(
+        `SELECT id, source_type, source_record_id, source_comment_id
+         FROM tickets WHERE id = $1 AND tenant_id = $2`,
+        [req.params.id, req.tenantId],
+      );
+      if (!ticketHint) return { notFound: true };
+
+      await lockTicketSource(tx, ticketHint, req.tenantId);
+      const ticket = await tx.queryOne(
+        `SELECT ${TICKET_COLUMNS} FROM tickets
+         WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+        [req.params.id, req.tenantId],
+      );
+      if (!ticket) return { notFound: true };
+      const currentExternalTicketNo = String(ticket.external_ticket_no || '').trim();
+      const closedContentBackfill = ticket.status === 'closed'
+        && ticket.source_type === 'content'
+        && Boolean(ticket.source_record_id)
+        && !currentExternalTicketNo;
+      if (ticket.status === 'closed' && !closedContentBackfill) return { closed: true };
+
+      if (ticket.source_type === 'content' && ticket.source_record_id) {
+        const lifecycle = await getRecordLifecycle({
+          tenantId: req.tenantId,
+          recordId: ticket.source_record_id,
+          tx,
+        });
+        if (!lifecycle) return { notFound: true };
+        if (lifecycle.archived_at && !closedContentBackfill) {
+          return { archived: true, recordId: ticket.source_record_id };
+        }
+      }
+
+      if (currentExternalTicketNo === externalTicketNo) return { ticket, idempotent: true };
+      const isContent = ticket.source_type === 'content' && ticket.source_record_id;
+      if (currentExternalTicketNo && (!isContent || !hasExpectedNumber)) {
+        return { numberLocked: currentExternalTicketNo };
+      }
+      if (hasExpectedNumber && currentExternalTicketNo !== previousExternalTicketNo) {
+        return { numberChanged: currentExternalTicketNo };
+      }
+
+      const updated = await tx.queryOne(
+        `UPDATE tickets SET external_ticket_no = $3, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2
+         RETURNING ${TICKET_COLUMNS}`,
+        [ticket.id, req.tenantId, externalTicketNo],
+      );
+
+      const targetId = isContent ? ticket.source_record_id : ticket.source_comment_id;
+      if (targetId) {
+        const action = currentExternalTicketNo
+          ? 'record.ticket_number_changed'
+          : (isContent ? 'record.ticket_number_added' : 'comment.ticket_number_added');
+        await tx.execute(`
+          INSERT INTO audit_logs (
+            tenant_id, actor_type, actor_id, actor_user_id,
+            action, target_type, target_id, metadata
+          ) VALUES ($1, 'user', $2, $3, $4, $5, $6, $7::jsonb)
+        `, [
+          req.tenantId,
+          req.user?.id || '',
+          req.user?.id || null,
+          action,
+          isContent ? 'record' : 'comment',
+          targetId,
+          JSON.stringify({
+            ticketId: ticket.id,
+            externalTicketNo,
+            previousExternalTicketNo: currentExternalTicketNo,
+          }),
+        ]);
+      }
+
+      return { ticket: updated };
+    });
+
+    if (outcome.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
+    if (outcome.closed) {
+      return res.status(409).json({ ok: false, error: 'ticket_closed', message: '工单已结案，不能修改号码' });
+    }
+    if (outcome.archived) return sendRecordArchived(res, [outcome.recordId]);
+    if (outcome.numberLocked) {
+      return res.status(409).json({
+        ok: false,
+        error: 'ticket_number_locked',
+        message: `工单号已填写为 ${outcome.numberLocked}，不能直接覆盖`,
+      });
+    }
+    if (Object.prototype.hasOwnProperty.call(outcome, 'numberChanged')) {
+      return res.status(409).json({
+        ok: false,
+        error: 'ticket_number_conflict',
+        message: `工单号已被其他人改为 ${outcome.numberChanged || '空'}，请刷新后重试`,
+        currentExternalTicketNo: outcome.numberChanged || '',
+      });
+    }
+    return res.json({ ok: true, ticket: outcome.ticket, idempotent: Boolean(outcome.idempotent) });
   } catch (err) { return next(err); }
 });
 
@@ -188,7 +524,10 @@ router.get('/', requireTenantAccess, async (req, res, next) => {
     if (type) { params.push(type); where += ` AND source_type = $${params.length}`; }
     if (platform) { params.push(platform); where += ` AND platform = $${params.length}`; }
     if (priority) { params.push(priority); where += ` AND priority = $${params.length}`; }
-    if (q) { params.push(`%${q}%`); where += ` AND (item_text ILIKE $${params.length} OR title ILIKE $${params.length} OR author ILIKE $${params.length})`; }
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND (item_text ILIKE $${params.length} OR title ILIKE $${params.length} OR author ILIKE $${params.length} OR external_ticket_no ILIKE $${params.length})`;
+    }
 
     const countRows = await queryAll(
       `SELECT status, COUNT(*)::int AS n FROM tickets ${where} GROUP BY status`, params,
@@ -287,7 +626,7 @@ router.get('/export', requireTenantAccess, async (req, res, next) => {
          WHERE ticket_id = ANY($1::uuid[]) AND tenant_id = $2 ORDER BY created_at ASC`,
         [ids, req.tenantId],
       );
-      const eventLabel = { note: '过程备注', closed: '结案', reopened: '重开' };
+      const eventLabel = { note: '过程备注', closed: '结案', reopened: '重开', done: '完成处理', dismissed: '忽略' };
       for (const n of allNotes) {
         const label = eventLabel[n.event_type] || '过程记录';
         const body = n.body ? `：${n.body}` : '';
@@ -298,6 +637,7 @@ router.get('/export', requireTenantAccess, async (req, res, next) => {
     const PRIORITY_CN = { urgent: '紧急', high: '高', normal: '普通', low: '低' };
     const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
     const columns = [
+      { header: '工单号码', key: 'externalTicketNo', width: 20 },
       { header: '类型', key: 'type', width: 8 },
       { header: '平台', key: 'platform', width: 10 },
       { header: '工单内容', key: 'content', width: 44 },
@@ -318,6 +658,7 @@ router.get('/export', requireTenantAccess, async (req, res, next) => {
       { header: '创建时间', key: 'createdAt', width: 18 },
     ];
     const rows = items.map((t) => ({
+      externalTicketNo: t.external_ticket_no || '',
       type: t.source_type === 'comment' ? '评论' : '内容',
       platform: PLATFORM_CN[t.platform] || t.platform || '',
       content: t.item_text || t.title || '',
@@ -481,7 +822,7 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
       const st = action === 'done' ? 'done' : 'dismissed';
       sets = {
         sql: `status = '${st}', feedback_status = 'pending_review',
-              handle_result = $P, handle_note = COALESCE($P, handle_note),
+              handle_result = $P, handle_note = COALESCE(NULLIF($P, ''), handle_note),
               handled_by_user_id = $P, handled_by_name = $P, handled_at = now(), updated_at = now()`,
         params: [result, note, actorId, actor],
       };
@@ -491,7 +832,7 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
       // reviewed_* 与结案动作一起落本人。
       sets = {
         sql: `status = 'closed', feedback_status = 'confirmed',
-              handle_note = COALESCE($P, handle_note),
+              handle_note = COALESCE(NULLIF($P, ''), handle_note),
               handle_result = COALESCE(NULLIF($P, ''), NULLIF(handle_result, ''), '已结案'),
               handled_by_user_id = CASE WHEN handled_at IS NULL THEN $P ELSE handled_by_user_id END,
               handled_by_name = CASE WHEN handled_at IS NULL THEN $P ELSE handled_by_name END,
@@ -516,6 +857,15 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
     }
 
     const outcome = await withTransaction(async tx => {
+      // 与创建新工单保持同一锁顺序：先锁来源，再锁工单，避免“再次转单”与重开并发
+      // 生成两张在途工单，也避免反向加锁造成死锁。
+      const ticketHint = await tx.queryOne(
+        `SELECT id, source_type, source_record_id, source_comment_id
+         FROM tickets WHERE id = $1 AND tenant_id = $2`,
+        [req.params.id, req.tenantId],
+      );
+      if (!ticketHint) return { notFound: true };
+      await lockTicketSource(tx, ticketHint, req.tenantId);
       const current = await tx.queryOne(
         `SELECT ${TICKET_COLUMNS}, handled_by_user_id, reviewed_by_user_id
          FROM tickets WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
@@ -523,7 +873,30 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
       );
       if (!current) return { notFound: true };
       if (action === 'reopen' && current.status !== 'closed') return { invalidState: 'not_closed' };
-      if (action !== 'reopen' && current.status === 'closed') return { invalidState: 'closed' };
+      if (action === 'reopen' && current.source_type === 'content') {
+        return { invalidState: 'content_reopen_not_allowed' };
+      }
+      if (action !== 'reopen' && current.status === 'closed') {
+        // 内容工单的 close 是可安全重试的：不重复结案事件，只补齐/确认内容归档。
+        // 评论工单继续沿用原来的 409 语义。
+        if (action === 'close' && current.source_type === 'content') {
+          const recordArchive = await archiveContentRecordForTicketClose(tx, {
+            ticket: current,
+            tenantId: req.tenantId,
+            actorType: req.actorType || 'system',
+            actorId: req.user?.id || req.authCode || '',
+            actorUserId: actorId,
+            actorName: req.actorName || actor,
+            idempotentTicketClose: true,
+          });
+          return { row: current, recordArchive, idempotent: true };
+        }
+        return { invalidState: 'closed' };
+      }
+      if (action === 'reopen') {
+        const activeTicket = await findOtherActiveTicket(tx, current, req.tenantId);
+        if (activeTicket) return { activeTicket };
+      }
 
       // 兼容迁移前已经结案的工单:首次重开时补一条历史结案事件,避免清空快照后丢记录。
       if (action === 'reopen') {
@@ -563,11 +936,11 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
         vals,
       );
 
-      if (action === 'close' || action === 'reopen') {
-        const eventType = action === 'close' ? 'closed' : 'reopened';
+      const eventType = TICKET_EVENT_TYPE_BY_ACTION[action];
+      if (eventType) {
         const eventBody = action === 'close'
           ? (note || (result && result !== '已结案' ? result : '') || '')
-          : (note || '');
+          : (note || result || '');
         await tx.queryOne(
           `INSERT INTO ticket_notes (tenant_id, ticket_id, event_type, body, author_user_id, author_name)
            VALUES ($1, $2, $3, $4, $5, $6)
@@ -575,7 +948,17 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
           [req.tenantId, req.params.id, eventType, eventBody, actorId, actor],
         );
       }
-      return { row };
+      const recordArchive = action === 'close'
+        ? await archiveContentRecordForTicketClose(tx, {
+            ticket: row,
+            tenantId: req.tenantId,
+            actorType: req.actorType || 'system',
+            actorId: req.user?.id || req.authCode || '',
+            actorUserId: actorId,
+            actorName: req.actorName || actor,
+          })
+        : null;
+      return { row, recordArchive, idempotent: false };
     });
 
     if (outcome.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
@@ -585,7 +968,33 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
     if (outcome.invalidState === 'closed') {
       return res.status(409).json({ ok: false, error: 'ticket_closed', message: '工单已结案，请先重开' });
     }
-    return res.json({ ok: true, ticket: outcome.row });
+    if (outcome.invalidState === 'content_reopen_not_allowed') {
+      return res.status(409).json({
+        ok: false,
+        error: 'content_ticket_reopen_not_allowed',
+        message: '内容工单结案后不可重开，请先取消归档，再新建工单',
+      });
+    }
+    if (outcome.activeTicket) {
+      const suffix = outcome.activeTicket.external_ticket_no ? `（${outcome.activeTicket.external_ticket_no}）` : '';
+      return res.status(409).json({
+        ok: false,
+        error: 'active_ticket_exists',
+        message: `该来源已有另一张未结案工单${suffix}，不能重开旧工单`,
+      });
+    }
+    const response = { ok: true, ticket: outcome.row };
+    if (outcome.recordArchive) {
+      response.recordArchived = outcome.recordArchive.archived;
+      response.recordArchiveChanged = outcome.recordArchive.changed;
+      response.archivedRecordId = outcome.recordArchive.recordId;
+      response.recordArchivedAt = outcome.recordArchive.archivedAt;
+      response.recordArchiveBlockedByActiveTicket = outcome.recordArchive.blockedByActiveTicket;
+      response.blockingActiveTicketId = outcome.recordArchive.blockingActiveTicketId;
+      response.blockingActiveTicketNumber = outcome.recordArchive.blockingActiveTicketNumber;
+      response.idempotent = Boolean(outcome.idempotent);
+    }
+    return res.json(response);
   } catch (err) { return next(err); }
 });
 
@@ -601,16 +1010,71 @@ router.patch('/:id/review', requireTenantAccess, requireTenantWriter, async (req
     }
     const status = decision === 'confirm' ? 'closed' : 'pending';
     const feedback = decision === 'confirm' ? 'confirmed' : 'reopened';
-    const row = await queryOne(
-      `UPDATE tickets
-       SET status = $3, feedback_status = $4, reviewed_by_user_id = $5, reviewed_by_name = $6,
-           reviewed_at = now(), review_note = $7, updated_at = now()
-       WHERE id = $1 AND tenant_id = $2 AND feedback_status = 'pending_review'
-       RETURNING ${TICKET_COLUMNS}`,
-      [req.params.id, req.tenantId, status, feedback, actorId, actor, note],
-    );
-    if (!row) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在或不在待确认状态' });
-    return res.json({ ok: true, ticket: row });
+    const outcome = await withTransaction(async tx => {
+      // 与创建、客服动作保持同一锁顺序：先锁来源，再锁工单。
+      const ticketHint = await tx.queryOne(
+        `SELECT id, source_type, source_record_id, source_comment_id
+         FROM tickets WHERE id = $1 AND tenant_id = $2`,
+        [req.params.id, req.tenantId],
+      );
+      if (!ticketHint) return { notFound: true };
+      await lockTicketSource(tx, ticketHint, req.tenantId);
+      const current = await tx.queryOne(
+        `SELECT ${TICKET_COLUMNS}, handled_by_user_id, reviewed_by_user_id
+         FROM tickets
+         WHERE id = $1 AND tenant_id = $2 AND feedback_status = 'pending_review'
+         FOR UPDATE`,
+        [req.params.id, req.tenantId],
+      );
+      if (!current) return { notFound: true };
+      if (decision === 'reopen' && current.source_type === 'content') {
+        return { invalidState: 'content_reopen_not_allowed' };
+      }
+      const row = await tx.queryOne(
+        `UPDATE tickets
+         SET status = $3, feedback_status = $4, reviewed_by_user_id = $5, reviewed_by_name = $6,
+             reviewed_at = now(), review_note = $7, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2
+         RETURNING ${TICKET_COLUMNS}`,
+        [req.params.id, req.tenantId, status, feedback, actorId, actor, note],
+      );
+      await tx.queryOne(
+        `INSERT INTO ticket_notes (tenant_id, ticket_id, event_type, body, author_user_id, author_name)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
+        [req.tenantId, req.params.id, decision === 'confirm' ? 'closed' : 'reopened', note, actorId, actor],
+      );
+      const recordArchive = decision === 'confirm'
+        ? await archiveContentRecordForTicketClose(tx, {
+            ticket: row,
+            tenantId: req.tenantId,
+            actorType: req.actorType || 'system',
+            actorId: req.user?.id || req.authCode || '',
+            actorUserId: actorId,
+            actorName: req.actorName || actor,
+          })
+        : null;
+      return { row, recordArchive };
+    });
+    if (outcome.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在或不在待确认状态' });
+    if (outcome.invalidState === 'content_reopen_not_allowed') {
+      return res.status(409).json({
+        ok: false,
+        error: 'content_ticket_reopen_not_allowed',
+        message: '内容工单不支持审核退回；如需再次处理，请确认结案后取消归档并新建工单',
+      });
+    }
+    const response = { ok: true, ticket: outcome.row };
+    if (outcome.recordArchive) {
+      response.recordArchived = outcome.recordArchive.archived;
+      response.recordArchiveChanged = outcome.recordArchive.changed;
+      response.archivedRecordId = outcome.recordArchive.recordId;
+      response.recordArchivedAt = outcome.recordArchive.archivedAt;
+      response.recordArchiveBlockedByActiveTicket = outcome.recordArchive.blockedByActiveTicket;
+      response.blockingActiveTicketId = outcome.recordArchive.blockingActiveTicketId;
+      response.blockingActiveTicketNumber = outcome.recordArchive.blockingActiveTicketNumber;
+    }
+    return res.json(response);
   } catch (err) { return next(err); }
 });
 
