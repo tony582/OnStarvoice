@@ -25,6 +25,7 @@ import {
   classifyCaptureRecoveryDisposition,
   crossDeviceRetryAgentSupportsTask,
   crossDeviceRetryItemNeedsManualSafety,
+  crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
   isProfilePatrolTask,
   lockActiveCaptureAgentSession,
@@ -184,6 +185,25 @@ test("recovery grading keeps captcha current and automates technical or unstarte
     attempt_count: 3,
     error: {code: "TAB_NOT_FOUND"},
   }), {kind: "automatic_attempts_exhausted", automatic: false});
+});
+
+test("automatic relay excludes devices per selected item instead of per parent task", () => {
+  const selectedItemId = "11111111-1111-4111-8111-111111111111";
+  const otherItemId = "22222222-2222-4222-8222-222222222222";
+  const selectedCurrentAgent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const selectedEarlierAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const otherItemAgent = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+  assert.deepEqual(
+    crossDeviceRetrySourceAgentIdsForItems(
+      [{id: selectedItemId, assigned_agent_id: selectedCurrentAgent}],
+      [
+        {item_id: selectedItemId, agent_id: selectedEarlierAgent},
+        {item_id: otherItemId, agent_id: otherItemAgent},
+      ],
+    ).sort(),
+    [selectedCurrentAgent, selectedEarlierAgent].sort(),
+  );
 });
 
 test("cross-device retry requires exact workflow capabilities and blocks safety items", () => {
@@ -1950,6 +1970,10 @@ test("cron automatically dispatches unfinished items before attention delivery",
   assert.match(
     captureCloudRouteSource,
     /AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES[\s\S]*lastAutomaticRecoveryTaskId/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /item_id = ANY\(\$2::uuid\[\]\)[\s\S]*crossDeviceRetrySourceAgentIdsForItems/u,
   );
   assert.match(
     cronSource,
