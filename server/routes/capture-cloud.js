@@ -479,6 +479,25 @@ export function classifyCaptureRecoveryDisposition(item = {}) {
   return {kind: 'wait', automatic: false};
 }
 
+export function crossDeviceRetrySourceAgentIdsForItems(
+  items = [],
+  attempts = [],
+) {
+  const selectedItemIds = new Set(
+    items.map(item => text(item?.id, 100).toLowerCase()).filter(Boolean),
+  );
+  return Array.from(new Set([
+    ...items.map(item => item?.assigned_agent_id),
+    ...attempts
+      .filter(attempt => selectedItemIds.has(
+        text(attempt?.item_id, 100).toLowerCase(),
+      ))
+      .map(attempt => attempt?.agent_id),
+  ]
+    .map(value => text(value, 100).toLowerCase())
+    .filter(value => UUID_PATTERN.test(value))));
+}
+
 export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
   const error = safeJson(item.error);
   const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
@@ -7065,21 +7084,6 @@ async function dispatchCrossDeviceRetry({
       }
       await expireStaleCommands(tx, req.tenantId, initialTask.id);
 
-      const initialItems = await tx.queryAll(`
-        SELECT assigned_agent_id, item_type, external_id, metadata
-        FROM capture_task_items
-        WHERE tenant_id = $1 AND task_id = $2
-          AND status = ANY($3::text[])
-      `, [
-        req.tenantId,
-        initialTask.id,
-        [...CROSS_DEVICE_RETRY_ITEM_STATUSES],
-      ]);
-      const sourceAgentIds = Array.from(new Set([
-        initialTask.assigned_agent_id,
-        initialTask.origin_agent_id,
-        ...initialItems.map(item => item.assigned_agent_id),
-      ].filter(Boolean).map(String)));
       const sourceCommand = await tx.queryOne(`
         SELECT payload
         FROM capture_agent_commands
@@ -7087,13 +7091,21 @@ async function dispatchCrossDeviceRetry({
         ORDER BY created_at DESC, id DESC
         LIMIT 1
       `, [req.tenantId, initialTask.id]);
-      const targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
-        tenantId: req.tenantId,
-        task: initialTask,
-        sourceAgentIds,
-        commandPayload: safeJson(sourceCommand?.payload),
-      });
-      if (!targetAgent) return {error: 'idle_compatible_agent_unavailable'};
+      let targetAgent = null;
+      if (initialTask.task_type !== 'capture_orchestration') {
+        targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
+          tenantId: req.tenantId,
+          task: initialTask,
+          sourceAgentIds: [
+            initialTask.assigned_agent_id,
+            initialTask.origin_agent_id,
+          ],
+          commandPayload: safeJson(sourceCommand?.payload),
+        });
+        if (!targetAgent) {
+          return {error: 'idle_compatible_agent_unavailable'};
+        }
+      }
 
       const task = await tx.queryOne(`
         SELECT *
@@ -7209,6 +7221,28 @@ async function dispatchCrossDeviceRetry({
       `, [req.tenantId, [parent.id, ...sourceExecutionTaskIds]]);
       if (activeSourceCommand) {
         abortCrossDeviceRetry('retry_source_command_active');
+      }
+
+      if (!targetAgent) {
+        const attemptedAgents = await tx.queryAll(`
+          SELECT item_id, agent_id
+          FROM capture_task_item_attempts
+          WHERE tenant_id = $1
+            AND item_id = ANY($2::uuid[])
+            AND agent_id IS NOT NULL
+        `, [req.tenantId, retryItems.map(item => item.id)]);
+        targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
+          tenantId: req.tenantId,
+          task: parent,
+          sourceAgentIds: crossDeviceRetrySourceAgentIdsForItems(
+            retryItems,
+            attemptedAgents,
+          ),
+          commandPayload: safeJson(sourceCommand?.payload),
+        });
+        if (!targetAgent) {
+          return {error: 'idle_compatible_agent_unavailable'};
+        }
       }
 
       const nextRevision = Number(parent.orchestration_revision || 0) + 1;
