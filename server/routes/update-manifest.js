@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.75',
+  latestVersion: '0.3.76',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-06',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.75-20260806.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.76-20260806.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.76',
+      releaseDate: '2026-08-06',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书删帖页准确结算',
+              desc: '识别新版“当前笔记暂时无法浏览”扫码弹窗及关闭按钮；即使页面跳回推荐页，也会按已删帖结算，不再误报链接解析失败并重复重试。',
+            },
+            {
+              title: '停止全部真正终止父任务',
+              desc: '停止多 Agent 任务时同步关闭父任务和自动接力，保留已完成结果；迟到回报不会再把已停止任务重新打开。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '负面巡查帖子名称可读',
+              desc: '标题为空的历史小红书帖子会回退显示正文摘要，不再显示 record UUID。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.75',
       releaseDate: '2026-08-06',

@@ -36,6 +36,7 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     "'/orchestrations/:id/draft'",
     "'/orchestrations/:id/allocation-preview'",
     "'/orchestrations/:id/dispatch'",
+    "'/orchestrations/:id/stop'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
     "'/orchestrations/:id/schedule/run-now'",
@@ -124,7 +125,7 @@ test('allocation preview uses deterministic balanced groups and validates compat
 test('dispatch is revision-CAS protected and locks parent, items, then agents', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
-    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+    "router.post(\n  '/orchestrations/:id/stop'",
   );
   const parentLock = dispatch.indexOf('parentSelect({lock: true})');
   const itemLock = dispatch.indexOf('listParentItems(', parentLock);
@@ -149,7 +150,7 @@ test('dispatch is revision-CAS protected and locks parent, items, then agents', 
 test('one-time dispatch creates disjoint ordinary child tasks, create commands, item attempts, and audit events', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
-    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+    "router.post(\n  '/orchestrations/:id/stop'",
   );
   assert.match(dispatch, /parent_task_id, origin_agent_id, assigned_agent_id/u);
   assert.match(dispatch, /\$1::uuid[\s\S]*\$1::uuid::text/u);
@@ -174,7 +175,7 @@ test('one-time dispatch creates disjoint ordinary child tasks, create commands, 
 test('unattended dispatch stores a cloud schedule and fixed assignments without issuing immediate child commands', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
-    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+    "router.post(\n  '/orchestrations/:id/stop'",
   );
   const unattendedStart = dispatch.indexOf(
     "if (parentExecutionMode === 'unattended_plan')",
@@ -193,6 +194,33 @@ test('unattended dispatch stores a cloud schedule and fixed assignments without 
   assert.match(unattended, /eventType: 'orchestration_schedule_created'/u);
   assert.doesNotMatch(unattended, /INSERT INTO capture_agent_commands/u);
   assert.doesNotMatch(unattended, /INSERT INTO capture_task_item_attempts/u);
+});
+
+test('operator stop atomically settles the parent and disables automatic relay', () => {
+  const stop = section(
+    "router.post(\n  '/orchestrations/:id/stop'",
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+  );
+  const parentLock = stop.indexOf('parentSelect({lock: true})');
+  const itemLock = stop.indexOf(
+    'listParentItems(tx, req.tenantId, parent.id, {lock: true})',
+  );
+  assert.ok(parentLock >= 0);
+  assert.ok(itemLock > parentLock);
+  assert.match(stop, /capture_orchestration_control/u);
+  assert.match(route, /ORCHESTRATION_STOPPABLE_STATUSES[\s\S]*'waiting_device'/u);
+  assert.match(stop, /orchestrationScheduleTemplate_stop_unsupported|orchestration_schedule_template_stop_unsupported/u);
+  assert.match(stop, /SET status = 'canceled'/u);
+  assert.match(
+    stop,
+    /'completed', 'completed_with_warnings', 'skipped', 'canceled'/u,
+  );
+  assert.match(stop, /'automaticRetryDisabled', true/u);
+  assert.match(stop, /attention_dismissed_at = COALESCE/u);
+  assert.match(stop, /orchestration_revision = orchestration_revision \+ 1/u);
+  assert.match(stop, /last_run_status = 'canceled'/u);
+  assert.match(stop, /eventType: 'orchestration_stopped'/u);
+  assert.match(stop, /executionTaskIds/u);
 });
 
 test('schedule pause and resume are tenant scoped, idempotent, and never backfill missed runs', () => {
@@ -353,6 +381,9 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
     detail,
     /WHERE item\.tenant_id = \$1 AND item\.task_id = \$2/u,
   );
+  assert.match(route, /record\.content AS source_record_content/u);
+  assert.match(route, /function publicParentItem/u);
+  assert.match(detail, /\.map\(publicParentItem\)/u);
   assert.match(
     detail,
     /WHERE attempt\.tenant_id = \$1[\s\S]*attempt\.parent_task_id = \$2/u,
@@ -374,6 +405,7 @@ test('all id-addressed orchestration routes validate UUIDs before database casts
     "'/orchestrations/:id/draft'",
     "'/orchestrations/:id/allocation-preview'",
     "'/orchestrations/:id/dispatch'",
+    "'/orchestrations/:id/stop'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
     "'/orchestrations/:id/resolve-attention'",

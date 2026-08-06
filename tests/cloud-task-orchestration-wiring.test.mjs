@@ -23,6 +23,10 @@ test('accepted child snapshots project keyword checkpoints to their exact parent
   assert.match(projection, /entry\.errorCode \|\| entry\.error_code/u);
   assert.match(projection, /requiresManualAction/u);
   assert.match(projection, /refreshOrchestrationParentTask/u);
+  assert.match(
+    projection,
+    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+  );
   assert.match(route, /'orchestrationChild', capture_tasks\.metadata->'orchestrationChild'/u);
   assert.match(route, /'parentTaskId', capture_tasks\.metadata->'parentTaskId'/u);
 
@@ -54,6 +58,10 @@ test('a device-side retry is adopted by the original orchestration parent', asyn
   assert.match(adoption, /attempt_count = attempt_count \+ 1/u);
   assert.match(adoption, /INSERT INTO capture_task_item_attempts/u);
   assert.match(adoption, /orchestration_local_recovery_adopted/u);
+  assert.match(
+    adoption,
+    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+  );
   assert.match(
     route,
     /task = await adoptLocalOrchestrationRecovery\(tx, agent, task, snapshot\)/u,
@@ -100,6 +108,10 @@ test('schedule status follows its latest run before and after terminal settlemen
   );
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
   const refresh = route.slice(refreshStart, refreshEnd);
+  assert.match(
+    refresh,
+    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+  );
   assert.match(refresh, /last_run_status = \$2/u);
   assert.match(refresh, /scheduled_run_needs_action/u);
   assert.match(refresh, /orchestration_schedule_run_status_updated/u);
@@ -178,7 +190,50 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /立即运行/u);
   assert.match(
     detail,
+    /\/capture-cloud\/orchestrations\/\$\{orchestrationId\}\/stop/u,
+  );
+  assert.match(detail, /canStopOrchestration/u);
+  assert.match(detail, /整个任务和自动接力已停止/u);
+  assert.match(
+    detail,
     /\['active', 'completed'\]\.includes\(schedule\.status\)/u,
+  );
+});
+
+test('negative-patrol snapshots lock and fence an operator-stopped parent before item projection', async () => {
+  const route = await read('server/routes/capture-cloud.js');
+  const projectionStart = route.indexOf(
+    'async function projectNegativePatrolSnapshot',
+  );
+  const projectionEnd = route.indexOf(
+    'async function projectOrchestrationSnapshot',
+    projectionStart,
+  );
+  assert.ok(projectionStart >= 0 && projectionEnd > projectionStart);
+  const projection = route.slice(projectionStart, projectionEnd);
+  const parentLock = projection.indexOf('lockOrchestrationParent(');
+  const itemProjection = projection.indexOf('const itemOwnerTaskId');
+  assert.ok(parentLock >= 0 && itemProjection > parentLock);
+  assert.match(
+    projection,
+    /\['canceled', 'superseded'\]\.includes\(orchestrationParent\.status\)/u,
+  );
+  assert.match(projection, /parent: orchestrationParent/u);
+});
+
+test('automatic retry excludes parents explicitly stopped by an operator', async () => {
+  const route = await read('server/routes/capture-cloud.js');
+  assert.match(
+    route,
+    /REMOTELY_STOPPABLE_STATUSES[\s\S]*'waiting_device'/u,
+  );
+  assert.match(
+    route,
+    /safeJson\(initialTask\.metadata\)\.automaticRetryDisabled === true/u,
+  );
+  assert.match(
+    route,
+    /metadata->>'automaticRetryDisabled', 'false'\) <> 'true'/u,
   );
 });
 

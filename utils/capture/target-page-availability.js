@@ -84,6 +84,8 @@
       /问题反馈|返回首页|重新加载|返回上一页/u.test(bodyText);
     const englishUnavailable =
       /Sorry,\s*This Page Isn['’]t Available Right Now\.?/iu.test(combined);
+    const currentUnavailableModalCopy =
+      /当前笔记暂时无法浏览|该内容暂时无法查看/u.test(combined);
     const directDeletedCopy =
       /(?:^|[，,。！？；;\s])(?:该|此)(?:篇)?笔记已(?:被作者)?删除(?:[，,。！？；;\s]|$)/u.test(
         bodyText,
@@ -101,9 +103,10 @@
       );
 
     const qrUnavailableLayout =
+      (englishUnavailable || currentUnavailableModalCopy) &&
       /请打开小红书\s*App\s*扫码查看/iu.test(combined) &&
       /问题反馈/u.test(combined) &&
-      /返回首页/u.test(combined);
+      /返回首页|关闭/u.test(combined);
 
     const highConfidenceUnavailable =
       qrUnavailableLayout ||
@@ -130,8 +133,8 @@
     }
 
     if (evidence.length === 0) return null;
-    // 小红书详情页出现固定的“扫码查看 + 问题反馈 + 返回首页”不可用
-    // 布局时，目标作品已经不能再从 Web 端访问。业务上按删帖结算，
+    // 小红书详情页出现固定的“不可浏览 + 扫码查看 + 问题反馈 +
+    // 返回首页/关闭”布局时，目标作品已经不能再从 Web 端访问。按删帖结算，
     // 避免负面巡查把它留成模糊的“暂不可用”或继续重试。
     const availabilityStatus =
       evidence.includes("xhs_deleted_copy") ||

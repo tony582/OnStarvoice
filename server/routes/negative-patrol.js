@@ -995,6 +995,7 @@ async function createMultiAgentPatrolTask(tx, {
       const itemMetadata = {
         sourceRecord: {
           title: candidate.title,
+          content: text(candidate.content, 1000),
           authorName: candidate.authorName,
           publishedAt: candidate.publishedAt,
           publishTime: candidate.publishTime,
@@ -1567,6 +1568,7 @@ router.post(
           const itemMetadata = {
             sourceRecord: {
               title: candidate.title,
+              content: text(candidate.content, 1000),
               authorName: candidate.authorName,
               publishedAt: candidate.publishedAt,
               publishTime: candidate.publishTime,
@@ -1829,6 +1831,10 @@ router.post(
             `negative_post_patrol_reassignment:${orchestrationId}`,
             requestKey,
           ],
+        );
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['capture_orchestration_control', orchestrationId],
         );
         const parent = await tx.queryOne(`
           SELECT *

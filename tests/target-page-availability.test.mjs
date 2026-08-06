@@ -10,6 +10,10 @@ const source = await readFile(
   resolve(repoRoot, "utils/capture/target-page-availability.js"),
   "utf8",
 );
+const captureSyncSource = await readFile(
+  resolve(repoRoot, "utils/capture-sync.js"),
+  "utf8",
+);
 const context = vm.createContext({});
 vm.runInContext(source, context, {
   filename: "utils/capture/target-page-availability.js",
@@ -56,6 +60,44 @@ test("classifies the Chinese Xiaohongshu QR unavailable page as deleted", () => 
   assert.equal(result.availabilityStatus, "deleted");
   assert.equal(result.message, "平台提示该帖子已删除");
   assert.ok(result.evidence.includes("xhs_unavailable_qr_layout"));
+});
+
+test("classifies the current Xiaohongshu close-button modal over a long feed", () => {
+  const result = availability.classifySnapshot({
+    platform: "xiaohongshu",
+    url: "https://www.xiaohongshu.com/explore",
+    title: "小红书 - 你的生活兴趣社区",
+    bodyText: [
+      "推荐内容 点赞 评论 收藏".repeat(300),
+      "当前笔记暂时无法浏览",
+      "该内容暂时无法查看",
+      "请打开小红书App扫码查看",
+      "小红书如何扫码",
+      "问题反馈",
+      "关闭",
+    ].join("\n"),
+  });
+
+  assert.equal(result.unavailable, true);
+  assert.equal(result.businessOutcome, "post_unavailable");
+  assert.equal(result.availabilityStatus, "deleted");
+  assert.equal(result.retryable, false);
+  assert.ok(result.evidence.includes("xhs_unavailable_qr_layout"));
+});
+
+test("rechecks a failed Xiaohongshu target after redirect and retains both ends of a long page", () => {
+  assert.match(
+    captureSyncSource,
+    /bodyText\.slice\(0, 10000\)[\s\S]*bodyText\.slice\(-10000\)/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /targetPlatform === "xiaohongshu"[\s\S]*captureResult\?\.ok !== true/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /shouldRecheckUnavailableXhsTarget[\s\S]*classifyTargetPageAvailabilityInTab\(runnerTabId, url\)/u,
+  );
 });
 
 test("classifies explicit platform deletion copy as deleted", () => {

@@ -50,7 +50,13 @@ const SETTLED_ITEM_STATUSES = new Set(['completed', 'completed_with_warnings', '
 const FAILURE_STATUSES = new Set(['retryable', 'needs_action', 'failed', 'interrupted', 'completed_with_failures'])
 const ACTIVE_STATUSES = new Set(['pending', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device', 'claimed', 'running', 'recovering'])
 const STOPPABLE_EXECUTION_STATUSES = new Set([
-  'pending', 'claimed', 'running', 'recovering', 'interrupted',
+  'pending', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device',
+  'claimed', 'running', 'recovering', 'interrupted',
+  'resume_requested', 'needs_action', 'failed', 'completed_with_failures',
+])
+const STOPPABLE_ORCHESTRATION_STATUSES = new Set([
+  'pending', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device',
+  'claimed', 'running', 'recovering', 'interrupted',
   'resume_requested', 'needs_action', 'failed', 'completed_with_failures',
 ])
 const FINAL_EXECUTION_STATUSES = new Set([
@@ -496,6 +502,13 @@ export function OrchestrationDetailWorkspace({
       .filter(Boolean))),
     [detail?.executions],
   )
+  const canStopOrchestration = Boolean(
+    detail &&
+    !isScheduleTemplate &&
+    STOPPABLE_ORCHESTRATION_STATUSES.has(
+      String(detail.orchestration.status || ''),
+    ),
+  )
   const hasActiveWork = Boolean(detail && !isScheduleTemplate && (
     ACTIVE_STATUSES.has(String(detail.orchestration.status || '')) ||
     activeCount > 0
@@ -603,21 +616,36 @@ export function OrchestrationDetailWorkspace({
   }, [hasActiveWork, load, orchestrationId])
 
   const stopAllExecutions = async () => {
-    if (!writable || stopping || stoppableTaskIds.length === 0) return
-    if (!window.confirm(`确定停止这个编排任务的 ${stoppableTaskIds.length} 条执行任务吗？已采集结果会保留。`)) return
+    if (!writable || stopping || !canStopOrchestration) return
+    const executionHint = stoppableTaskIds.length > 0
+      ? `，并向 ${stoppableTaskIds.length} 条 Agent 子任务发送停止指令`
+      : ''
+    if (!window.confirm(`确定停止整个任务吗？系统会立即终止父任务和自动接力${executionHint}；已采集结果会保留。`)) return
     setStopping(true)
     setActionFeedback('')
     setActionError('')
     try {
+      const stopResult = await api.post<{
+        executionTaskIds?: string[]
+        message?: string
+      }>(`/capture-cloud/orchestrations/${orchestrationId}/stop`, {})
+      const executionTaskIds = Array.from(new Set([
+        ...stoppableTaskIds,
+        ...(Array.isArray(stopResult.executionTaskIds)
+          ? stopResult.executionTaskIds
+          : []),
+      ].filter(Boolean)))
       const results = await Promise.allSettled(
-        stoppableTaskIds.map(taskId => api.post(`/capture-cloud/tasks/${taskId}/stop`, {})),
+        executionTaskIds.map(taskId => api.post(`/capture-cloud/tasks/${taskId}/stop`, {})),
       )
       const succeeded = results.filter(result => result.status === 'fulfilled').length
       const failed = results.length - succeeded
       if (failed > 0) {
-        setActionError(`已向 ${succeeded} 条子任务发送停止指令，另有 ${failed} 条未能停止；请刷新后检查。`)
+        setActionError(`整个任务和自动接力已停止；已向 ${succeeded} 条子任务发送停止指令，另有 ${failed} 条未能送达，请刷新检查 Agent 状态。`)
       } else {
-        setActionFeedback(`已向 ${succeeded} 条子任务发送停止指令；离线 Agent 上线后执行。`)
+        setActionFeedback(executionTaskIds.length > 0
+          ? `整个任务和自动接力已停止；已向 ${succeeded} 条子任务发送停止指令。`
+          : stopResult.message || '整个任务和自动接力已停止。')
       }
       await load(true)
       await onChanged?.()
@@ -1021,8 +1049,8 @@ export function OrchestrationDetailWorkspace({
             </>
           ) : (
             <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
-              disabled={!writable || stopping || stoppableTaskIds.length === 0}
-              title={!writable ? '当前账号为只读权限' : stoppableTaskIds.length === 0 ? '当前没有可停止的子任务' : '停止所有仍可控制的 Agent 子任务'}>
+              disabled={!writable || stopping || !canStopOrchestration}
+              title={!writable ? '当前账号为只读权限' : !canStopOrchestration ? '当前任务已经结束或不能停止' : '停止整个父任务、自动接力和仍可控制的 Agent 子任务'}>
               {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
               停止全部
             </Button>

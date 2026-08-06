@@ -1,6 +1,6 @@
 # StarVoice 星语 API 接口文档
 
-> 当前稳定基线：Extension `0.3.75`，以仓库 `main` 分支为准，数据库迁移截至 `058_content_ticket_processing_mode.sql`。
+> 当前稳定基线：Extension `0.3.76`，以仓库 `main` 分支为准，数据库迁移截至 `058_content_ticket_processing_mode.sql`。
 > 本文用于开发、联调、排障和交接，不替代路由源码。接口发生变化时，应同时更新对应路由、测试和本文。
 
 ## 1. 基址与服务边界
@@ -251,6 +251,7 @@ Content-Type: application/json
 | `DELETE` | `/orchestrations/:id/draft` | 删除未下发草稿 |
 | `POST` | `/orchestrations/:id/allocation-preview` | 预览关键词工作项分配 |
 | `POST` | `/orchestrations/:id/dispatch` | 按确认方案创建真实子任务 |
+| `POST` | `/orchestrations/:id/stop` | 停止父任务、未完成工作项和自动接力 |
 | `POST` | `/orchestrations/:id/schedule/pause` | 暂停定期计划 |
 | `POST` | `/orchestrations/:id/schedule/resume` | 恢复定期计划 |
 | `POST` | `/orchestrations/:id/resolve-attention` | 人工处理或安排接力 |
@@ -263,6 +264,7 @@ Content-Type: application/json
 - 使用确定性的连续、互斥、均衡切片；
 - 各 Agent 工作项数之差不超过 `1`；
 - 默认 `maxRounds=1`；
+- “停止全部”会先将父任务结算为 `canceled` 并关闭自动接力，再向仍可控制的 Agent 子任务发送停止指令；
 - 调度不会把验证码或明确风控任务自动迁移给其他账号继续冒险。
 
 ### 4.5 负面帖子巡查
