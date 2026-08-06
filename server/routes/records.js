@@ -395,8 +395,8 @@ router.get('/:id/manual-fields', requireTenantAccess, requireSessionUser, async 
   }
 });
 
-// 内容处理时间线：汇总人工判断、模式、归档、标签、工单等审计记录与追加备注。
-// 采集快照单独留在 observations，避免互动数字变化淹没真正的客户处理动作。
+// 内容处理时间线：只汇总人工判断、模式、归档、标签、工单等客户处置记录与追加备注。
+// 系统事件继续保留在 audit_logs 供内部审计，但不混入客户处理记录；采集快照另留 observations。
 router.get('/:id/activity', requireTenantAccess, requireSessionUser, async (req, res, next) => {
   try {
     if (!await ensureRecord(req, res)) return;
@@ -412,6 +412,7 @@ router.get('/:id/activity', requireTenantAccess, requireSessionUser, async (req,
         LEFT JOIN users u ON u.id = al.actor_user_id
         WHERE al.tenant_id = $2
           AND al.target_type = 'record'
+          AND al.actor_type = 'user'
           AND al.action <> 'record.note_added'
           AND (
             al.target_id = $1

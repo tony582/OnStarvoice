@@ -3,12 +3,35 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.76',
+  latestVersion: '0.3.77',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-06',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.76-20260806.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.77-20260806.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.77',
+      releaseDate: '2026-08-06',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书倒计时删帖页直接结算',
+              desc: '识别“你访问的页面不见了”及返回首页倒计时，并在自动跳转前记录为已删帖，不再误报无法提取笔记 ID。',
+            },
+            {
+              title: '零评论帖子不再滚动背景页',
+              desc: '详情页已明确显示评论数为 0 时直接完成评论巡查，不启动评论滚动，也不触碰弹窗背后的推荐内容。',
+            },
+            {
+              title: '客户处理记录只显示人工处置',
+              desc: '系统分类、评论提醒等过程继续保留在内部审计日志，但不再混入客户可见的处理记录。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.76',
       releaseDate: '2026-08-06',

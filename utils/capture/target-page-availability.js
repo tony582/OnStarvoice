@@ -86,6 +86,9 @@
       /Sorry,\s*This Page Isn['’]t Available Right Now\.?/iu.test(combined);
     const currentUnavailableModalCopy =
       /当前笔记暂时无法浏览|该内容暂时无法查看/u.test(combined);
+    const vanishedPageCopy = /你访问的页面不见了/u.test(combined);
+    const vanishedPageCountdown =
+      /\d+\s*秒后将自动返回首页/u.test(combined);
     const directDeletedCopy =
       /(?:^|[，,。！？；;\s])(?:该|此)(?:篇)?笔记已(?:被作者)?删除(?:[，,。！？；;\s]|$)/u.test(
         bodyText,
@@ -107,6 +110,11 @@
       /请打开小红书\s*App\s*扫码查看/iu.test(combined) &&
       /问题反馈/u.test(combined) &&
       /返回首页|关闭/u.test(combined);
+    const vanishedPageLayout =
+      shortErrorPage &&
+      vanishedPageCopy &&
+      vanishedPageCountdown &&
+      /返回首页/u.test(bodyText);
 
     const highConfidenceUnavailable =
       qrUnavailableLayout ||
@@ -114,13 +122,16 @@
       exactUnavailableErrorCopy;
     const highConfidenceDeleted =
       exactDeletedErrorCopy ||
-      (compactErrorPage && directDeletedCopy && hasErrorPageAction);
+      (compactErrorPage && directDeletedCopy && hasErrorPageAction) ||
+      vanishedPageLayout;
 
     if (englishUnavailable && highConfidenceUnavailable) {
       evidence.push("xhs_page_not_available");
     }
     if (highConfidenceDeleted) {
-      evidence.push("xhs_deleted_copy");
+      evidence.push(
+        vanishedPageLayout ? "xhs_page_gone_countdown" : "xhs_deleted_copy",
+      );
     }
     if (qrUnavailableLayout) {
       evidence.push("xhs_unavailable_qr_layout");
@@ -138,6 +149,7 @@
     // 避免负面巡查把它留成模糊的“暂不可用”或继续重试。
     const availabilityStatus =
       evidence.includes("xhs_deleted_copy") ||
+      evidence.includes("xhs_page_gone_countdown") ||
       evidence.includes("xhs_unavailable_qr_layout")
         ? "deleted"
         : "page_unavailable";
