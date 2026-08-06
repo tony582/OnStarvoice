@@ -228,6 +228,19 @@ router.post('/users', requirePlatformAdmin, async (req, res, next) => {
 router.patch('/users/:id', requirePlatformAdmin, async (req, res, next) => {
   try {
     const { status, name, isInternal, globalRole, tenantId, role, membershipStatus } = req.body || {};
+    let normalizedName;
+    if (name !== undefined) {
+      if (typeof name !== 'string') {
+        return res.status(400).json({ ok: false, error: 'invalid_name', message: '用户名称格式不正确' });
+      }
+      normalizedName = name.trim();
+      if (!normalizedName) {
+        return res.status(400).json({ ok: false, error: 'invalid_name', message: '用户名称不能为空' });
+      }
+      if (normalizedName.length > 100) {
+        return res.status(400).json({ ok: false, error: 'invalid_name', message: '用户名称不能超过 100 个字符' });
+      }
+    }
     if (globalRole !== undefined && !validGlobalRole(globalRole)) {
       return res.status(400).json({ ok: false, error: 'invalid_role', message: '全局角色不合法' });
     }
@@ -236,6 +249,12 @@ router.patch('/users/:id', requirePlatformAdmin, async (req, res, next) => {
     }
 
     const result = await withTransaction(async tx => {
+      const targetUser = await tx.queryOne(
+        'SELECT id, name FROM users WHERE id = $1 FOR UPDATE',
+        [req.params.id]
+      );
+      if (!targetUser) return null;
+
       const updates = [];
       const params = [];
       const add = (field, value) => {
@@ -243,7 +262,7 @@ router.patch('/users/:id', requirePlatformAdmin, async (req, res, next) => {
         updates.push(`${field} = $${params.length}`);
       };
       if (status !== undefined) add('status', status);
-      if (name !== undefined) add('name', name);
+      if (normalizedName !== undefined) add('name', normalizedName);
       if (isInternal !== undefined) add('is_internal', Boolean(isInternal));
       if (globalRole !== undefined) add('global_role', globalRole);
       if (updates.length) {
@@ -269,10 +288,19 @@ router.patch('/users/:id', requirePlatformAdmin, async (req, res, next) => {
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1::uuid, 'user', $2::text, $3::uuid, 'user.updated', 'user', $4::text, $5::jsonb)
-      `, [tenantId || null, String(req.user.id), req.user.id, String(req.params.id), JSON.stringify(req.body || {})]);
-      return true;
+      `, [tenantId || null, String(req.user.id), req.user.id, String(req.params.id), JSON.stringify({
+        ...(req.body || {}),
+        ...(normalizedName !== undefined ? { name: normalizedName } : {}),
+      })]);
+      return {
+        id: targetUser.id,
+        name: normalizedName !== undefined ? normalizedName : targetUser.name,
+      };
     });
-    return res.json({ ok: result });
+    if (!result) {
+      return res.status(404).json({ ok: false, error: 'user_not_found', message: '用户不存在' });
+    }
+    return res.json({ ok: true, user: result });
   } catch (err) {
     return next(err);
   }

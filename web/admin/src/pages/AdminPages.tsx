@@ -94,6 +94,11 @@ export function UsersPage() {
   const [mobileDisableId, setMobileDisableId] = useState('')
   const [mobileActionError, setMobileActionError] = useState('')
   const [mobileNotice, setMobileNotice] = useState({ id: '', text: '', error: false })
+  const [editingNameId, setEditingNameId] = useState('')
+  const [editingNameSurface, setEditingNameSurface] = useState<'mobile' | 'desktop' | ''>('')
+  const [editingName, setEditingName] = useState('')
+  const [editingNameBusy, setEditingNameBusy] = useState(false)
+  const [editingNameError, setEditingNameError] = useState('')
   const [form, setForm] = useState({ email: '', name: '', password: '', type: 'tenant', tenantId: '', role: 'tenant_viewer', globalRole: 'internal_operator' })
 
   const load = async () => {
@@ -169,6 +174,45 @@ export function UsersPage() {
     } finally { setMobileActionBusy(false) }
   }
 
+  const beginNameEdit = (user: any, surface: 'mobile' | 'desktop') => {
+    setEditingNameId(user.id)
+    setEditingNameSurface(surface)
+    setEditingName(String(user.name || ''))
+    setEditingNameError('')
+    setMobileResetId('')
+    setMobileDisableId('')
+    setMobileActionError('')
+    setMobileNotice({ id: '', text: '', error: false })
+  }
+
+  const cancelNameEdit = () => {
+    if (editingNameBusy) return
+    setEditingNameId('')
+    setEditingNameSurface('')
+    setEditingName('')
+    setEditingNameError('')
+  }
+
+  const saveUserName = async (user: any) => {
+    const nextName = editingName.trim()
+    if (!nextName) { setEditingNameError('用户名称不能为空'); return }
+    if (nextName.length > 100) { setEditingNameError('用户名称不能超过 100 个字符'); return }
+    if (nextName === String(user.name || '').trim()) { cancelNameEdit(); return }
+
+    setEditingNameBusy(true)
+    setEditingNameError('')
+    try {
+      await api.patch('/admin/users/' + user.id, { name: nextName }, { skipTenant: true })
+      setUsers(current => current.map(item => item.id === user.id ? { ...item, name: nextName } : item))
+      setEditingNameId('')
+      setEditingNameSurface('')
+      setEditingName('')
+      setMobileNotice({ id: user.id, text: '用户名称已更新', error: false })
+    } catch (err) {
+      setEditingNameError('保存失败:' + (err instanceof Error ? err.message : ''))
+    } finally { setEditingNameBusy(false) }
+  }
+
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
       {/* Create form */}
@@ -229,7 +273,27 @@ export function UsersPage() {
                   <MobileMeta label="最近登录" value={formatDate(u.last_login_at)} />
                 </div>
                 {mobileNotice.id === u.id && <p className={`mt-3 rounded-lg px-3 py-2 text-xs font-semibold ${mobileNotice.error ? 'bg-destructive/10 text-destructive' : 'bg-status-green/10 text-status-green'}`}>{mobileNotice.text}</p>}
-                {mobileResetId === u.id ? (
+                {editingNameId === u.id && editingNameSurface === 'mobile' ? (
+                  <form onSubmit={e => { e.preventDefault(); void saveUserName(u) }} className="mt-4 space-y-3 rounded-xl border border-primary/25 bg-primary/5 p-3">
+                    <Field label="用户名称">
+                      <Input
+                        autoFocus
+                        value={editingName}
+                        maxLength={100}
+                        onChange={e => { setEditingName(e.target.value); setEditingNameError('') }}
+                        onKeyDown={e => { if (e.key === 'Escape') cancelNameEdit() }}
+                        aria-label={`修改 ${u.email} 的用户名称`}
+                      />
+                    </Field>
+                    {editingNameError && <p role="alert" className="text-xs font-semibold text-destructive">{editingNameError}</p>}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button type="button" className="h-11" variant="outline" disabled={editingNameBusy} onClick={cancelNameEdit}>取消</Button>
+                      <Button type="submit" className="h-11" disabled={editingNameBusy || !editingName.trim()}>
+                        {editingNameBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存名称
+                      </Button>
+                    </div>
+                  </form>
+                ) : mobileResetId === u.id ? (
                   <div className="mt-4 space-y-3 rounded-xl border border-primary/25 bg-primary/5 p-3">
                     <Field label="为此账号设置新密码">
                       <Input autoFocus type="password" value={mobilePassword} onChange={e => setMobilePassword(e.target.value)} placeholder="至少 8 位" />
@@ -252,10 +316,11 @@ export function UsersPage() {
                   </div>
                 ) : (
                   <>
-                    <div className="mt-4 grid grid-cols-2 gap-2 border-t border-border/70 pt-4">
-                      <Button className="h-11" variant="outline" onClick={() => { setMobileResetId(u.id); setMobilePassword(''); setMobileDisableId(''); setMobileActionError(''); setMobileNotice({ id: '', text: '', error: false }) }}>重置密码</Button>
+                    <div className="mt-4 grid grid-cols-3 gap-2 border-t border-border/70 pt-4">
+                      <Button className="h-11 px-2" variant="outline" onClick={() => beginNameEdit(u, 'mobile')}><Pencil className="h-3.5 w-3.5" />编辑名称</Button>
+                      <Button className="h-11 px-2" variant="outline" onClick={() => { cancelNameEdit(); setMobileResetId(u.id); setMobilePassword(''); setMobileDisableId(''); setMobileActionError(''); setMobileNotice({ id: '', text: '', error: false }) }}>重置密码</Button>
                       <Button className="h-11" disabled={mobileActionBusy} variant={u.status === 'active' ? 'destructive' : 'default'} onClick={() => {
-                        setMobileActionError(''); setMobileNotice({ id: '', text: '', error: false })
+                        cancelNameEdit(); setMobileActionError(''); setMobileNotice({ id: '', text: '', error: false })
                         if (u.status === 'active') { setMobileDisableId(u.id); setMobileResetId('') }
                         else toggleStatusOnMobile(u.id, u.status)
                       }}>{u.status === 'active' ? '停用账号' : '启用账号'}</Button>
@@ -269,12 +334,41 @@ export function UsersPage() {
           <Table heads={['用户', '角色', '状态', '最近登录', '操作']}>
             {users.map(u => (
               <tr key={u.id} className="transition-colors hover:bg-muted/30">
-                <td className="px-4 py-3"><div className="font-medium">{u.name || u.email}</div><div className="text-xs text-muted-foreground">{u.email}</div></td>
+                <td className="px-4 py-3">
+                  {editingNameId === u.id && editingNameSurface === 'desktop' ? (
+                    <form onSubmit={e => { e.preventDefault(); void saveUserName(u) }} className="min-w-[320px]">
+                      <div className="flex items-center gap-2">
+                        <Input
+                          autoFocus
+                          value={editingName}
+                          maxLength={100}
+                          onChange={e => { setEditingName(e.target.value); setEditingNameError('') }}
+                          onKeyDown={e => { if (e.key === 'Escape') cancelNameEdit() }}
+                          aria-label={`修改 ${u.email} 的用户名称`}
+                          className="h-8 min-w-0 flex-1"
+                        />
+                        <Button type="submit" size="sm" disabled={editingNameBusy || !editingName.trim()}>
+                          {editingNameBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存
+                        </Button>
+                        <Button type="button" variant="ghost" size="sm" disabled={editingNameBusy} onClick={cancelNameEdit}>取消</Button>
+                      </div>
+                      {editingNameError && <p role="alert" className="mt-1.5 text-xs font-semibold text-destructive">{editingNameError}</p>}
+                      <div className="mt-1 text-xs text-muted-foreground">{u.email}</div>
+                    </form>
+                  ) : (
+                    <>
+                      <div className="font-medium">{u.name || u.email}</div>
+                      <div className="text-xs text-muted-foreground">{u.email}</div>
+                      {mobileNotice.id === u.id && <div className={`mt-1 text-xs font-medium ${mobileNotice.error ? 'text-destructive' : 'text-status-green'}`}>{mobileNotice.text}</div>}
+                    </>
+                  )}
+                </td>
                 <td className="px-4 py-3"><StatusBadge tone={u.global_role || 'viewer'}>{u.is_internal ? (LABELS.role[u.global_role] || u.global_role) : '客户'}</StatusBadge></td>
                 <td className="px-4 py-3"><StatusBadge tone={u.status}>{u.status === 'active' ? '启用' : '禁用'}</StatusBadge></td>
                 <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(u.last_login_at)}</td>
                 <td className="px-4 py-3 text-right">
                   <div className="flex justify-end gap-1">
+                    <Button variant="outline" size="sm" disabled={editingNameBusy && editingNameId === u.id} onClick={() => beginNameEdit(u, 'desktop')}><Pencil className="h-3.5 w-3.5" />编辑名称</Button>
                     <Button variant="outline" size="sm" onClick={() => resetPwd(u.id)}>重置密码</Button>
                     <Button variant={u.status === 'active' ? 'destructive' : 'default'} size="sm" onClick={() => toggleStatus(u.id, u.status)}>{u.status === 'active' ? '禁用' : '启用'}</Button>
                   </div>
