@@ -571,9 +571,6 @@ function RecordDrawerContent({
                 <div className="mb-2 flex flex-wrap items-center gap-1.5">
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
-                  {r.content_availability_status === 'deleted' && (
-                    <StatusBadge tone="muted"><Ban className="h-3 w-3" />原帖已删除</StatusBadge>
-                  )}
                   {r.content_availability_status === 'page_unavailable' && (
                     <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
                   )}
