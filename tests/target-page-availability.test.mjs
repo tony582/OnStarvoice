@@ -85,6 +85,25 @@ test("classifies the current Xiaohongshu close-button modal over a long feed", (
   assert.ok(result.evidence.includes("xhs_unavailable_qr_layout"));
 });
 
+test("classifies the Xiaohongshu page-gone countdown as deleted", () => {
+  const result = availability.classifySnapshot({
+    platform: "xiaohongshu",
+    url: "https://www.xiaohongshu.com/explore/note-gone",
+    title: "小红书",
+    bodyText: [
+      "你访问的页面不见了",
+      "2 秒后将自动返回首页",
+      "返回首页",
+    ].join("\n"),
+  });
+
+  assert.equal(result.unavailable, true);
+  assert.equal(result.businessOutcome, "post_unavailable");
+  assert.equal(result.availabilityStatus, "deleted");
+  assert.equal(result.retryable, false);
+  assert.ok(result.evidence.includes("xhs_page_gone_countdown"));
+});
+
 test("rechecks a failed Xiaohongshu target after redirect and retains both ends of a long page", () => {
   assert.match(
     captureSyncSource,
@@ -98,6 +117,25 @@ test("rechecks a failed Xiaohongshu target after redirect and retains both ends 
     captureSyncSource,
     /shouldRecheckUnavailableXhsTarget[\s\S]*classifyTargetPageAvailabilityInTab\(runnerTabId, url\)/u,
   );
+});
+
+test("probes a short-lived unavailable page before the fixed render wait", () => {
+  const navigationStart = captureSyncSource.indexOf(
+    "await openUrlInTab(runnerTabId, url, {",
+  );
+  const captureStart = captureSyncSource.indexOf(
+    "const singleNoteEnhancementOptions =",
+    navigationStart,
+  );
+  assert.ok(navigationStart >= 0 && captureStart > navigationStart);
+
+  const block = captureSyncSource.slice(navigationStart, captureStart);
+  const immediateProbe = block.indexOf(
+    "await classifyTargetPageAvailabilityInTab(runnerTabId, url)",
+  );
+  const fixedWait = block.indexOf("BATCH_KEYWORD_AFTER_NAV_WAIT_MS");
+  assert.ok(immediateProbe >= 0);
+  assert.ok(fixedWait > immediateProbe);
 });
 
 test("classifies explicit platform deletion copy as deleted", () => {
@@ -175,6 +213,11 @@ test("does not infer deletion from phrases quoted inside a normal post body", ()
       "有人曾看到“该笔记已被作者删除。”，但当前页面正文和评论仍正常展示。",
       "下面还有大量正文、互动区、评论和相关推荐。",
       "普通页面不能因为引用一句错误提示就被标成删帖。",
+    ].join(" "),
+    [
+      "这是一篇正常的长笔记，作者在讨论平台错误页。",
+      "有人曾看到“你访问的页面不见了”，但当前笔记仍正常展示。",
+      "下面还有大量正文、互动区、评论和相关推荐。".repeat(120),
     ].join(" "),
   ]) {
     assert.equal(

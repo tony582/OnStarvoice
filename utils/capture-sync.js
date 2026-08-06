@@ -9082,11 +9082,6 @@ async function captureCommentsForSingleNoteRecord(
     };
   }
 
-  const commentCaptureIdentity = await ensureCommentCaptureIdentity({
-    captureRequestId,
-    runnerTabId,
-    resolveRunnerTab: () => resolveCaptureTargetTab({mode: 'comments'}),
-  });
   const settings = await getCaptureSettings();
   const commentLeadsConfig = buildCommentLeadsConfigFromSettings({
     ...settings,
@@ -9097,6 +9092,81 @@ async function captureCommentsForSingleNoteRecord(
     commentsMaxDetectedItems ?? commentsMaxItems,
     settings.commentsMaxDetectedItems,
   );
+  const knownCommentsCount = resolveKnownCommentsCountForDetailCapture(
+    record,
+    record.payload,
+  );
+  if (knownCommentsCount === 0) {
+    const confirmedAt = Date.now();
+    let confirmedEmptyPayload = {
+      ...applyCommentStatusToPayload(
+        clearInterruptedCommentObservation(record.payload),
+        createCommentStatusPatch({
+          status: COMMENT_CAPTURE_STATUS.DONE,
+          startedAt: confirmedAt,
+          finishedAt: confirmedAt,
+          stoppedByUser: false,
+          error: '',
+          cleanedItems: [],
+          mergedText: '',
+        }),
+      ),
+      commentsCaptureSkipReason: 'confirmed_zero',
+    };
+    confirmedEmptyPayload = applyCommentLeadsToPayload({
+      syncType: SYNC_TYPE.SINGLE_NOTE,
+      payload: confirmedEmptyPayload,
+      commentLeadsConfig,
+      computedAt: confirmedAt,
+    }).payload;
+    await updateRecord(recordId, {
+      status: RECORD_STATUS.DRAFT,
+      payload: confirmedEmptyPayload,
+    });
+
+    if (onProgress) {
+      onProgress({
+        phase: 'comments_done',
+        message: '已确认评论数为 0，跳过评论区并进入下一条',
+        recordId,
+        collectedCount: 0,
+        captureRequestId: String(captureRequestId || ''),
+        runnerTabId:
+          Number.isSafeInteger(Number(runnerTabId)) && Number(runnerTabId) > 0
+            ? Number(runnerTabId)
+            : null,
+        captureAction: 'captureComments',
+        stopReason: 'confirmed_zero',
+      });
+    }
+
+    return {
+      ok: true,
+      phase: 'comments_done',
+      recordId,
+      captureRequestId: String(captureRequestId || ''),
+      runnerTabId:
+        Number.isSafeInteger(Number(runnerTabId)) && Number(runnerTabId) > 0
+          ? Number(runnerTabId)
+          : null,
+      commentsCount: 0,
+      currentObservedCount: 0,
+      currentObservedItems: [],
+      partial: false,
+      stoppedByUser: false,
+      stoppedByStall: false,
+      stoppedByNetwork: false,
+      stopReason: 'confirmed_zero',
+      skipped: true,
+      error: null,
+    };
+  }
+
+  const commentCaptureIdentity = await ensureCommentCaptureIdentity({
+    captureRequestId,
+    runnerTabId,
+    resolveRunnerTab: () => resolveCaptureTargetTab({mode: 'comments'}),
+  });
   const expectedNoteId = resolveExpectedDouyinCommentNoteId(
     record,
     resolveRecordNoteUrl(record),
@@ -14391,6 +14461,17 @@ export async function batchCaptureByUrls({
         active: true,
       });
 
+      const shouldDetectUnavailableTarget =
+        mode === "single" &&
+        captureParams.detectUnavailableTargetPage === true &&
+        targetPageAvailabilityApi?.classifySnapshot;
+      // 小红书“你访问的页面不见了”会在约 2 秒后自动跳回首页。
+      // openUrlInTab 已等到目标文档加载完成，先立即取一次页面证据，
+      // 避免固定渲染等待正好错过这个短暂但明确的删帖状态。
+      let unavailablePage = shouldDetectUnavailableTarget
+        ? await classifyTargetPageAvailabilityInTab(runnerTabId, url)
+        : null;
+
       // 等待页面渲染
       await waitMsWithStop(
         BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
@@ -14398,13 +14479,10 @@ export async function batchCaptureByUrls({
         "BATCH_CAPTURE_CANCELED",
       );
 
-      if (
-        mode === "single" &&
-        captureParams.detectUnavailableTargetPage === true &&
-        targetPageAvailabilityApi?.classifySnapshot
-      ) {
-        const unavailablePage =
-          await classifyTargetPageAvailabilityInTab(runnerTabId, url);
+      if (shouldDetectUnavailableTarget) {
+        unavailablePage =
+          unavailablePage ||
+          (await classifyTargetPageAvailabilityInTab(runnerTabId, url));
         if (unavailablePage?.unavailable === true) {
           results.push(
             buildUnavailableBatchCaptureResult(url, unavailablePage),

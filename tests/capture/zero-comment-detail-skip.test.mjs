@@ -143,3 +143,29 @@ test("detail batch zero-count branch precedes and guards the comment relay", () 
     "confirmed-zero handling must not relay a comment-capture request",
   );
 });
+
+test("single-note enhancements settle a proven zero before creating a comment runner", () => {
+  const gateStart = captureSyncSource.indexOf(
+    "async function captureCommentsForSingleNoteRecord(",
+  );
+  const gateEnd = captureSyncSource.indexOf(
+    "async function captureBloggerMetricsForSingleNoteRecord(",
+    gateStart,
+  );
+  assert.ok(gateStart >= 0 && gateEnd > gateStart);
+
+  const block = captureSyncSource.slice(gateStart, gateEnd);
+  const resolverIndex = block.indexOf(
+    "resolveKnownCommentsCountForDetailCapture(\n    record,\n    record.payload,",
+  );
+  const zeroCheckIndex = block.indexOf("knownCommentsCount === 0");
+  const settledIndex = block.indexOf("commentsCaptureSkipReason: 'confirmed_zero'");
+  const runnerIndex = block.indexOf("ensureCommentCaptureIdentity({");
+
+  assert.ok(resolverIndex >= 0);
+  assert.ok(zeroCheckIndex > resolverIndex);
+  assert.ok(settledIndex > zeroCheckIndex);
+  assert.ok(runnerIndex > settledIndex);
+  assert.match(block, /已确认评论数为 0，跳过评论区并进入下一条/u);
+  assert.match(block, /stopReason: 'confirmed_zero'/u);
+});

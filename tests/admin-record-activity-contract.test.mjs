@@ -15,6 +15,7 @@ test('record and ticket notes are append-only, appear in one processing timeline
   assert.match(records, /router\.post\('\/:id\/notes'/);
   assert.match(records, /INSERT INTO record_notes/);
   assert.match(records, /router\.get\('\/:id\/activity'/);
+  assert.match(records, /al\.actor_type = 'user'/);
   assert.match(records, /record\.note_added/);
   assert.match(records, /record\.legacy_triage_note/);
   assert.match(drawer, /新增记录/);
