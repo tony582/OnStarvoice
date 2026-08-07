@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { TICKET_EVENT_TYPE_BY_ACTION } from '../server/services/ticket-event-types.js';
+import { appendTicketLifecycleFilter } from '../server/routes/triage.js';
 
 const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
@@ -32,6 +33,7 @@ test('content tickets become the fifth handling mode and persist a searchable ex
   assert.match(triage, /matchedTicketSql/);
   assert.match(triage, /AS matched_ticket_number/);
   assert.match(triage, /appendTicketFilter/);
+  assert.match(triage, /appendTicketLifecycleFilter/);
   assert.match(triage, /ticketFilter === 'with'/);
   assert.match(triage, /ticketFilter === 'without'/);
   assert.match(triage, /AS ticket_number/);
@@ -48,8 +50,11 @@ test('content triage marks and filters tickets while transfer accepts the client
   assert.doesNotMatch(queue, /const \[ticketFilter, setTicketFilter\]/);
   assert.doesNotMatch(queue, /params\.set\('ticket', ticketFilter\)/);
   assert.doesNotMatch(queue, /aria-label="工单筛选"/);
-  assert.match(queue, /aria-label="只看已转工单"/);
-  assert.match(queue, /setTriageStatus\(ticketOnly \? '' : 'ticketed'\)/);
+  assert.match(queue, /aria-label=\{`工单状态筛选，当前\$\{selected\.label\}`\}/);
+  assert.match(queue, /setTriageStatus\(value \? 'ticketed' : ''\)/);
+  assert.match(queue, /\{ value: 'active', label: '处理中'/);
+  assert.match(queue, /\{ value: 'closed', label: '已结案'/);
+  assert.match(queue, /params\.set\('ticketStatus', ticketStatusFilter\)/);
   assert.doesNotMatch(queue, /<optgroup label="工单">/);
   assert.match(queue, /newStatus === 'ticketed' \? dispatchTicket\(record\)/);
   assert.match(queue, /搜索标题、正文、作者、工单号/);
@@ -103,6 +108,27 @@ test('content triage marks and filters tickets while transfer accepts the client
   assert.match(dispatch, /role="dialog"/);
   assert.match(dispatch, /htmlFor="ticket-dispatch-number"/);
   assert.doesNotMatch(dispatch, /稍后在内容列表补录|保存后支持搜索|后续进展和结案/);
+
+  const initialFocusEffect = dispatch.slice(
+    dispatch.lastIndexOf('useEffect(() => {', dispatch.indexOf('ref.current?.focus()')),
+    dispatch.indexOf('useEffect(() => {', dispatch.indexOf('ref.current?.focus()') + 1),
+  );
+  assert.match(initialFocusEffect, /ref\.current\?\.focus\(\)[\s\S]*\}, \[\]\)/);
+  assert.doesNotMatch(initialFocusEffect, /externalTicketNo|priority|assigneeUserId|note|assignees/);
+});
+
+test('ticket lifecycle filtering follows the same active-first ticket shown in the list', () => {
+  const active = appendTicketLifecycleFilter('WHERE r.tenant_id = $1', { ticketStatus: 'active' });
+  const closed = appendTicketLifecycleFilter('WHERE r.tenant_id = $1', { ticketStatus: 'closed' });
+  const ignored = appendTicketLifecycleFilter('WHERE r.tenant_id = $1', { ticketStatus: 'unexpected' });
+
+  for (const sql of [active, closed]) {
+    assert.match(sql, /tfs\.source_type = 'content'/);
+    assert.match(sql, /ORDER BY \(tfs\.status <> 'closed'\) DESC, tfs\.created_at DESC, tfs\.id DESC/);
+  }
+  assert.match(active, /\) <> 'closed'$/);
+  assert.match(closed, /\) = 'closed'$/);
+  assert.equal(ignored, 'WHERE r.tenant_id = $1');
 });
 
 test('ticket progress is merged into the content processing timeline', () => {

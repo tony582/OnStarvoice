@@ -236,6 +236,23 @@ function appendTicketFilter(where, query = {}) {
   return where;
 }
 
+// 工单状态筛选与列表展示使用同一张“当前工单”：在途优先，否则取最近结案。
+// 标量子查询在没有内容工单时返回 NULL，active/closed 两种比较都会自然排除该记录。
+export function appendTicketLifecycleFilter(where, query = {}) {
+  const ticketStatus = String(query.ticketStatus || '');
+  if (ticketStatus !== 'active' && ticketStatus !== 'closed') return where;
+  const currentTicketStatusSql = `(
+    SELECT tfs.status
+    FROM tickets tfs
+    WHERE tfs.tenant_id = r.tenant_id
+      AND tfs.source_type = 'content'
+      AND tfs.source_record_id = r.id
+    ORDER BY (tfs.status <> 'closed') DESC, tfs.created_at DESC, tfs.id DESC
+    LIMIT 1
+  )`;
+  return `${where} AND ${currentTicketStatusSql} ${ticketStatus === 'closed' ? '=' : '<>'} 'closed'`;
+}
+
 function appendKeywordFilter(where, params, keyword) {
   const normalized = String(keyword || '').trim();
   if (!normalized) return { where, matchedTicketSql: `NULL::text` };
@@ -437,6 +454,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     const keywordFilter = appendKeywordFilter(where, params, keyword);
     where = keywordFilter.where;
     where = appendTicketFilter(where, req.query);
+    where = appendTicketLifecycleFilter(where, req.query);
     // 采集关键词多选(每个关键词=一次采集 session)
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
       .map(s => String(s).trim()).filter(Boolean);
@@ -670,7 +688,7 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
 
     const updatedSet = new Set(updatedIds);
     const skipped = ids.filter(id => !updatedSet.has(id));
-    return res.json({ ok: true, updated: updatedSet.size, skipped });
+    return res.json({ ok: true, updated: updatedSet.size, updatedIds: [...updatedSet], skipped });
   } catch (err) {
     return next(err);
   }
@@ -1012,6 +1030,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     const keywordFilter = appendKeywordFilter(where, params, keyword);
     where = keywordFilter.where;
     where = appendTicketFilter(where, req.query);
+    where = appendTicketLifecycleFilter(where, req.query);
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
       .map(s => String(s).trim()).filter(Boolean);
     if (captureKeywords.length) {

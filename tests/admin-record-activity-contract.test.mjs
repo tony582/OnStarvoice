@@ -100,6 +100,19 @@ test('drawer and batch actions keep handling, ticketing, and archiving semantics
   assert.doesNotMatch(batchActions, /key: 'ticketed'/);
   assert.match(batchBar, /aria-label="批量处理"/);
   assert.match(batchBar, /批量处理/);
+  assert.match(batchBar, /aria-busy=\{busy \|\| undefined\}/);
+  assert.match(batchBar, /busy \? '处理中' : '批量处理'/);
+
+  const batchMutation = queue.slice(
+    queue.indexOf('const runBatch'),
+    queue.indexOf('const syncArchiveLocally'),
+  );
+  assert.match(batchMutation, /api\.patch<BatchModeMutationResponse>\('\/triage\/records\/batch'/);
+  assert.match(batchMutation, /changedBatchModeIds\(result, ids\)/);
+  assert.match(batchMutation, /已将 \$\{changedIds\.length\} 条内容改为/);
+  assert.match(batchMutation, /批量修改失败：/);
+  assert.match(queue, /aria-label="关闭批量处理提示"/);
+  assert.match(queue, /aria-live=\{batchFeedback\.tone === 'error' \? 'assertive' : 'polite'\}/);
 });
 
 test('triage filters preserve the operational dimensions without fixing their layout', () => {

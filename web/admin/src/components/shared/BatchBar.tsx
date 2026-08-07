@@ -93,11 +93,12 @@ export function BatchBar({ count, actions, onAction, onClear, busy }: {
       <div
         role="toolbar"
         aria-label="批量处理"
+        aria-busy={busy || undefined}
         className="mobile-table-scroll pointer-events-auto flex max-w-full items-center overflow-x-auto rounded-lg border-2 border-primary/30 bg-card shadow-[0_16px_40px_-12px_rgba(15,23,42,0.35)] animate-in fade-in slide-in-from-bottom-3 duration-200"
       >
         <div className="flex h-12 shrink-0 items-center gap-2 bg-primary px-4 text-primary-foreground lg:h-11">
           {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-          <span className="text-[12px] font-semibold">批量处理</span>
+          <span className="text-[12px] font-semibold" aria-live="polite">{busy ? '处理中' : '批量处理'}</span>
           <span className="rounded bg-white/20 px-1.5 py-0.5 text-[12px] font-bold tabular-nums">{count} 条</span>
         </div>
         <div className="flex items-center gap-1 px-2">
@@ -126,8 +127,9 @@ export function BatchBar({ count, actions, onAction, onClear, busy }: {
         <div className="mx-1 h-6 w-px shrink-0 bg-border" />
         <button
           type="button"
+          disabled={busy}
           onClick={onClear}
-          className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8 lg:w-8"
+          className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 lg:h-8 lg:w-8"
           aria-label="取消选择"
         >
           <X className="h-4 w-4" />

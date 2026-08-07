@@ -68,6 +68,7 @@ test('content triage keeps five states but presents content handling and work or
   assert.match(board, /queue: 'triage'/);
   assert.match(route, /status === 'official_responded'/);
   assert.match(route, /official_response_status = 'responded'/);
+  assert.match(route, /updatedIds: \[\.\.\.updatedSet\]/);
   assert.match(route, /const TRIAGE_QUEUE_CONDITION/);
   assert.match(route, /queue === 'triage'/);
   assert.match(route, /IN \('unhandled', 'reviewing', 'official_responded', 'no_action', 'ticketed'\)/);

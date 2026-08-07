@@ -49,7 +49,8 @@ test('platform and handling-mode pills use shared fixed-width contracts', () => 
 
   const menu = between(queue, 'function TriageStatusMenu', 'function SortableTh');
   assert.match(menu, /<StatusBadge[^>]*className=\{cn\(TRIAGE_MODE_BADGE_CLASS,/);
-  assert.match(queue, /<StatusBadge tone=\{triageStatus\} className=\{TRIAGE_MODE_BADGE_CLASS\}/);
+  assert.match(queue, /<StatusBadge tone=\{ticketClosed \? 'resolved' : triageStatus\} className=\{TRIAGE_MODE_BADGE_CLASS\}/);
+  assert.match(queue, /ticketClosed \? '工单已结案'/);
 });
 
 test('risk warning drops its decorative bell while preserving the warning count', () => {
@@ -61,17 +62,18 @@ test('risk warning drops its decorative bell while preserving the warning count'
   assert.doesNotMatch(riskSignals, /<Bell\b/);
 });
 
-test('row accent prioritizes a work order, then negative, positive, and neutral sentiment', () => {
+test('row accent distinguishes closed work orders before active tickets and sentiment', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const accent = between(queue, 'function recordAccentClass', 'function MobileRecordCard');
 
-  const ticketAt = Math.max(accent.indexOf("triage_status === 'ticketed'"), accent.indexOf('ticket_id'));
+  const closedTicketAt = accent.indexOf("ticket_status === 'closed'");
+  const ticketAt = accent.indexOf("triage_status === 'ticketed'", closedTicketAt + 1);
   const negativeAt = accent.indexOf("sentiment === 'negative'");
   const positiveAt = accent.indexOf("sentiment === 'positive'");
   const neutralAt = Math.max(accent.lastIndexOf('bg-status-grey'), accent.lastIndexOf('bg-slate-'));
-  assert.ok(ticketAt >= 0, 'ticketed content must have an explicit accent branch');
-  assert.ok(ticketAt < negativeAt && negativeAt < positiveAt && positiveAt < neutralAt,
-    'accent priority must be ticketed blue, negative red, positive green, then neutral grey');
+  assert.ok(closedTicketAt >= 0 && ticketAt >= 0, 'closed and active tickets must have explicit accent branches');
+  assert.ok(closedTicketAt < ticketAt && ticketAt < negativeAt && negativeAt < positiveAt && positiveAt < neutralAt,
+    'accent priority must be closed green, active ticket blue, negative red, positive green, then neutral grey');
   assert.match(accent, /bg-status-blue/);
   assert.match(accent, /bg-status-red/);
   assert.match(accent, /bg-status-green/);
@@ -205,9 +207,9 @@ test('desktop triage toolbar balances primary commands and secondary filters acr
   assert.match(primary, /exportXlsx/);
 
   assert.match(secondary, /aria-label="情感筛选"/);
-  assert.match(secondary, /aria-label="只看已转工单"/);
-  assert.match(secondary, /aria-pressed=\{ticketOnly\}/);
-  assert.match(secondary, /<Check className="h-3\.5 w-3\.5"/);
+  assert.match(queue, /function TicketStatusFilter/);
+  assert.match(queue, /aria-label=\{`工单状态筛选，当前\$\{selected\.label\}`\}/);
+  assert.match(secondary, /<TicketStatusFilter value=\{visibleTicketStatusFilter\}/);
   assert.doesNotMatch(secondary, /今日采集/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
@@ -215,7 +217,7 @@ test('desktop triage toolbar balances primary commands and secondary filters acr
   assert.match(secondary, /aria-label="处理模式筛选"/);
   assert.match(secondary, /xl:grid-cols-\[232px_repeat\(7,minmax\(0,1fr\)\)_58px\]/);
   assert.match(secondary, /aria-label="情感筛选"[^>]*xl:w-full/);
-  assert.match(secondary, /lg:w-\[94px\] xl:w-full/);
+  assert.match(secondary, /lg:w-\[94px\] xl:w-\[94px\] xl:justify-self-center/);
   assert.match(secondary, /lg:!w-\[82px\][^"']*xl:!w-full/);
   assert.match(secondary, /triggerClassName="xl:w-full xl:justify-between"/);
   assert.doesNotMatch(secondary, /lg:ml-auto lg:block/);
@@ -225,7 +227,7 @@ test('desktop triage toolbar balances primary commands and secondary filters acr
   assert.doesNotMatch(secondary, /exportXlsx/);
   assert.match(
     secondary,
-    /aria-label="处理模式筛选"[\s\S]*aria-label="只看已转工单"[\s\S]*aria-label="平台筛选"[\s\S]*<CombinedDateRangeFilter[\s\S]*<MultiSelect label="风险信号"[\s\S]*onClick=\{clearFilters\}/,
+    /aria-label="处理模式筛选"[\s\S]*<TicketStatusFilter[\s\S]*aria-label="平台筛选"[\s\S]*<CombinedDateRangeFilter[\s\S]*<MultiSelect label="风险信号"[\s\S]*onClick=\{clearFilters\}/,
   );
 });
 
@@ -243,7 +245,7 @@ test('list header filters share the same platform, sentiment, and handling-mode 
   assert.match(queue, /function HeaderSingleFilter/);
   assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);
   assert.match(header, /label="情感"[\s\S]*value=\{sentiment\}[\s\S]*onChange=\{setSentiment\}/);
-  assert.match(header, /label="处理模式"[\s\S]*value=\{handlingStatus\}[\s\S]*onChange=\{setTriageStatus\}/);
+  assert.match(header, /label="处理模式"[\s\S]*value=\{handlingStatus\}[\s\S]*onChange=\{changeHandlingStatusFilter\}/);
 });
 
 test('filter popovers stay above the sticky list header', () => {
