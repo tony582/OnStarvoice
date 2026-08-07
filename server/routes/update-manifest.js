@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.77',
+  latestVersion: '0.3.78',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-06',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.77-20260806.zip',
+  releaseDate: '2026-08-07',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.78-20260807.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.78',
+      releaseDate: '2026-08-07',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书空评论立即进入下一帖',
+              desc: '评论空态即使稍晚出现也会在滚动前再次确认；详情弹窗没有可滚动评论区时不再回退滚动背景推荐流。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.77',
       releaseDate: '2026-08-06',

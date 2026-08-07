@@ -1043,7 +1043,7 @@ function hasExplicitNumericCommentCount(node) {
   return /(?:^|[^0-9])\d+(?:\.\d+)?(?:[wW万kK])?(?:$|[^0-9])/.test(text);
 }
 
-function hasExplicitEmptyCommentsState(noteContext) {
+export function hasExplicitEmptyCommentsState(noteContext) {
   const commentRoots = querySelectorAll(
     COMMENTS_SELECTORS.container,
     noteContext,
