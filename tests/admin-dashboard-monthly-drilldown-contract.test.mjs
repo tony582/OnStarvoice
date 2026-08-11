@@ -25,6 +25,8 @@ test('dashboard opens on a calendar-month report and puts basic distributions be
   assert.match(dashboard, /正在生成 \{monthLabel\} 月报/);
   assert.match(dashboard, /计算三类分布/);
   assert.match(dashboard, /无需重复刷新/);
+  assert.match(dashboard, /发布时间口径/);
+  assert.match(dashboard, /无法识别发布时间的内容不纳入月报/);
   assert.doesNotMatch(dashboard, /<div className="flex justify-center py-24">\s*<Loader2/);
 
   const coreAt = dashboard.indexOf('<CoreMonthlyAnalysis');
@@ -82,6 +84,9 @@ test('basic distribution cards cross-filter the in-report analysis and export on
   assert.match(workbook, /title: '处理模式分布'/);
   assert.match(workbook, /workbook\.calcProperties\.fullCalcOnLoad = true/);
   assert.match(workbook, /return `'\$\{SOURCE_SHEET\}'!\$\$\{letter\}\$2:/);
+  assert.match(workbook, /PUBLISHED_RECORD_PERIOD_SQL/);
+  assert.doesNotMatch(workbook, /period_observation/);
+  assert.match(workbook, /发布时间落在本统计周期内的内容/);
 
   assert.match(drilldown, /WITH base AS/);
   assert.match(drilldown, /selected AS/);
@@ -89,7 +94,14 @@ test('basic distribution cards cross-filter the in-report analysis and export on
   assert.doesNotMatch(drilldown, /LIMIT 30/);
   assert.doesNotMatch(drilldown, /records:/);
   assert.match(drilldown, /RELEVANT_RECORD_SQL/);
-  assert.match(source('server/services/report-generator.js'), /const \[currentStats, previousStats\] = await Promise\.all/);
+  assert.match(drilldown, /PUBLISHED_RECORD_PERIOD_SQL/);
+  assert.doesNotMatch(drilldown, /period_observation/);
+
+  const reportGenerator = source('server/services/report-generator.js');
+  assert.match(reportGenerator, /const \[currentStats, previousStats\] = await Promise\.all/);
+  assert.match(reportGenerator, /PUBLISHED_RECORD_PERIOD_SQL = 'r\.published_ts >= \$2 AND r\.published_ts < \$3'/);
+  assert.match(reportGenerator, /timeBasis: 'published'/);
+  assert.match(reportGenerator, /date_trunc\('day', r\.published_ts AT TIME ZONE 'Asia\/Shanghai'\)/);
 });
 
 test('dashboard drill-down presets preserve unknown platform while pending sentiment stays backend-only', () => {

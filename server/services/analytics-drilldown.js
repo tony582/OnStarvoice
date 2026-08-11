@@ -1,5 +1,5 @@
 import { queryAll, queryOne } from '../db/init.js';
-import { RELEVANT_RECORD_SQL } from './report-generator.js';
+import { PUBLISHED_RECORD_PERIOD_SQL, RELEVANT_RECORD_SQL } from './report-generator.js';
 
 const DIMENSION_VALUES = {
   platform: new Set(['xiaohongshu', 'douyin', 'weibo', 'unknown']),
@@ -94,16 +94,7 @@ export async function buildAnalyticsDrilldown({
         AND ${RELEVANT_RECORD_SQL}
         AND COALESCE(rt.status, 'unhandled') IN ${STATUS_SQL}
         ${keywordSql}
-        AND (
-          (r.created_at >= $2 AND r.created_at < $3)
-          OR EXISTS (
-            SELECT 1 FROM record_observations period_observation
-            WHERE period_observation.record_id = r.id
-              AND period_observation.tenant_id = r.tenant_id
-              AND period_observation.captured_at >= $2
-              AND period_observation.captured_at < $3
-          )
-        )
+        AND ${PUBLISHED_RECORD_PERIOD_SQL}
     ), selected AS (
       SELECT * FROM base WHERE ${selectionSql}
     )

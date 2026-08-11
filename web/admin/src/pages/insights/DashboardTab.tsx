@@ -21,8 +21,8 @@ const ChinaMap = lazy(() => import('@/components/shared/ChinaMap'))
 
 // 指标口径词典(给"只看报告"的客户:每个指标怎么统计/算)
 const G = {
-  volume: '声量=本期监测到的内容条数(去重)。含老帖在本期被再次采集到的,所以时间范围越大越接近库存量;要看"真正新增"请对照「新增内容」。不含 AI 判定不相关的内容。',
-  newRecords: '新增内容=首次入库时间落在本期内的内容,即本期真正新冒出来的(声量则含老帖复采)。',
+  volume: '声量=发布时间落在所选自然月内的内容条数(去重)。无法识别发布时间的内容不纳入月报；不含 AI 判定不相关的内容。',
+  newRecords: '本期入库=发布时间属于本期、且首次入库时间也落在本期的内容；跨期入库内容仍归属其实际发布月份。',
   interaction: '互动总量=点赞+评论+收藏+转发 之和。为采集那一刻的快照,非实时;本系统不采阅读/播放量,故不报"触达人数"。',
   nsr: '净情感 NSR=(正面−负面)/(正面+负面)×100,范围 −100~+100。只看正负、不计中性,比负面率更敏感反映口碑好坏。',
   negativeRate: '负面率=负面内容数 ÷ 已 AI 标注内容数 ×100%。分母不含"待标注",AI 覆盖率低时该值会被放大,请对照待标注量解读。',
@@ -407,7 +407,7 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
           {/* 2. 声量总览与趋势 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.8fr)]">
             <Panel title="声量总览与趋势" hint={G.volume}
-              note={`本期声量 ${formatNumber(s.total)} 条(新增 ${formatNumber(s.newRecords)}、复现 ${formatNumber(s.updatedRecords)}),${trendNote(s)}`}>
+              note={`发布时间口径 · 本期 ${formatNumber(s.total)} 条(本期入库 ${formatNumber(s.newRecords)}、跨期入库 ${formatNumber(s.updatedRecords)}),${trendNote(s)}`}>
               <VolumeTrend rows={s.volumeTrend || []} />
             </Panel>
             <Panel title="舆情态势指数" hint={G.heat}>
@@ -704,6 +704,7 @@ function CoreMonthlyAnalysis({
           <div className="flex flex-wrap items-center gap-2">
             <h2 id="monthly-core-title" className="text-base font-bold">月报基础分析</h2>
             <StatusBadge tone="muted">{periodLabel}</StatusBadge>
+            <StatusBadge tone="muted">发布时间口径</StatusBadge>
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">三类分布始终显示；点击图形或图例，顶部指标和其他图表会一起更新。</p>
         </div>
@@ -1157,7 +1158,7 @@ function ExecutiveSummary({ s }: { s: any }) {
     { label: '净情感 NSR', value: nsr, d: delta(nsr, nsrOf(prev.sentimentMap)), tone: nsr < 0 ? 'danger' : 'normal', hint: G.nsr },
     { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: G.risk },
     { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
-    { label: '新增内容', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
+    { label: '本期入库', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
     { label: '本期待处理', value: formatNumber(periodPending), tone: periodPending > 0 ? 'warning' : 'normal', hint: G.pending },
     { label: '官方响应率', value: `${officialRate}%`, hint: G.official },
   ]
@@ -1169,7 +1170,7 @@ function ExecutiveSummary({ s }: { s: any }) {
         <StatusBadge tone={riskTone}>风险{status}</StatusBadge>
       </div>
       <p className="mt-2 text-[13px] leading-6 text-muted-foreground">
-        本期共监测 <strong className="text-foreground">{formatNumber(s.total)}</strong> 条内容(新增 {formatNumber(s.newRecords)}),
+        本期发布 <strong className="text-foreground">{formatNumber(s.total)}</strong> 条内容(其中本期入库 {formatNumber(s.newRecords)}),
         负面率 <strong className="text-foreground">{negRate}%</strong>、净情感 NSR <strong className="text-foreground">{nsr}</strong>,
         舆情风险指数 <strong className="text-foreground">{risk}</strong>({status});本期待处理 {formatNumber(periodPending)} 条,官方响应率 {officialRate}%。
       </p>
