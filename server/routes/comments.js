@@ -60,13 +60,6 @@ router.post('/:id/issues', requireTenantAccess, requireTenantWriter, async (req,
         req.actorName || '',
         JSON.stringify({ commentId: comment.id, recordId: record.id, sentiment: comment.sentiment, riskLevel: comment.risk_level }),
       ]);
-      await tx.execute(`
-        INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, updated_at)
-        VALUES ($1, $2, 'issue_linked', 'high', $3, $4, now())
-        ON CONFLICT (tenant_id, record_id)
-        DO UPDATE SET status = 'issue_linked', priority = 'high', owner_user_id = excluded.owner_user_id,
-          owner_name = excluded.owner_name, updated_at = now()
-      `, [req.tenantId, record.id, req.user?.id || null, req.actorName || '']);
       return issue;
     });
 

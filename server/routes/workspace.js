@@ -144,15 +144,22 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     const triageStats = await queryOne(`
       SELECT
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled' AND rt.archived_at IS NULL) AS unhandled,
-        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing' AND rt.archived_at IS NULL) AS reviewing,
-        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'ticketed') AS issue_linked,
-        COUNT(*) FILTER (WHERE (
-          (COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing') AND rt.archived_at IS NULL)
-          OR COALESCE(rt.status, 'unhandled') = 'ticketed'
-        )) AS active_or_ticketed
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'replied' AND rt.archived_at IS NULL) AS replied,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed' AND rt.archived_at IS NULL) AS reviewed,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor' AND rt.archived_at IS NULL) AS reviewed_non_monitor,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unavailable' AND rt.archived_at IS NULL) AS unavailable,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu' AND rt.archived_at IS NULL) AS negative_feishu,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold' AND rt.archived_at IS NULL) AS negative_cold,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') <> 'unhandled' AND rt.archived_at IS NULL) AS handled_total,
+        COUNT(*) FILTER (WHERE rt.archived_at IS NULL) AS status_total,
+        -- 旧客户端字段兼容。
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold' AND rt.archived_at IS NULL) AS reviewing,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu' AND rt.archived_at IS NULL) AS issue_linked,
+        COUNT(*) FILTER (WHERE rt.archived_at IS NULL) AS active_or_ticketed
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
+        AND r.record_type NOT IN ('official_content', 'blogger_profile')
     `, [req.tenantId]);
 
     const operationsStats = await queryOne(`
@@ -182,7 +189,8 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       FROM records r
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
-        AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
+        AND r.record_type NOT IN ('official_content', 'blogger_profile')
+        AND COALESCE(rt.status, 'unhandled') = 'unhandled'
         AND rt.archived_at IS NULL
       ORDER BY
         CASE WHEN r.sentiment = 'negative' THEN 1 ELSE 2 END,

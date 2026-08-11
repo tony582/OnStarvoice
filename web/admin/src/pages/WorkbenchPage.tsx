@@ -17,12 +17,12 @@ const QUEUE_KEYS: QueueKey[] = ['triage', 'leads', 'misjudgments', 'issues']
 export function WorkbenchPage() {
   const { params } = useNav()
   const { isPlatformAdmin } = useAuth()
-  // 旧版 feedback 链接继续可用，但统一落到内容分诊的“已转工单”处理模式。
+  // 旧版 feedback 链接继续可用，但统一落到替代原工单流的“负面-飞书表”状态。
   const legacyTicketQueue = params?.queue === 'feedback'
   const requestedQueue: QueueKey = QUEUE_KEYS.includes(params?.queue as QueueKey) ? (params!.queue as QueueKey) : 'triage'
   const queue: QueueKey = requestedQueue === 'misjudgments' && !isPlatformAdmin() ? 'triage' : requestedQueue
   const initial = legacyTicketQueue
-    ? { ...(params || {}), queue: 'triage', status: 'ticketed' }
+    ? { ...(params || {}), queue: 'triage', status: 'negative_feishu' }
     : params ?? undefined
 
   return (

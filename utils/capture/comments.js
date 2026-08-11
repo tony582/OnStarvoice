@@ -28,6 +28,7 @@ import {
   buildCommentLoadStage,
   resolveCommentCaptureStatus,
 } from "./stage-diagnostics.js";
+import {hasExplicitEmptyCommentsState} from "./single-note.js";
 
 const DEFAULT_MAX_ITEMS = 100;
 const COMMENT_CONTENT_MAX_LENGTH = 280;
@@ -103,8 +104,43 @@ export async function captureComments({
       throw new Error("无法找到评论区容器");
     }
 
-    await scrollElementIntoView(commentContainer);
+    const commentScope =
+      findCommentScopeRoot(commentContainer) || commentContainer;
+    if (hasExplicitEmptyCommentsState(commentScope)) {
+      return buildConfirmedEmptyCommentsResult({
+        captureStartedAt,
+        noteId,
+        commentContainer,
+        normalizedMaxDetectedItems,
+        normalizedMaxScrollTimes,
+        normalizedStallTimeoutMs,
+        normalizedMaxDurationMs,
+        waitRange,
+        onProgress,
+      });
+    }
+
+    // 小红书详情弹层位于搜索/推荐流上方。弹层内没有可滚动评论区时，
+    // 绝不能退回 window 滚动，否则实际滚动的是被遮住的背景内容。
+    const initialScrollTarget = resolveCommentScrollTarget(commentContainer);
+    if (initialScrollTarget === window) {
+      await scrollElementIntoView(commentContainer);
+    }
     await wait(400);
+
+    if (hasExplicitEmptyCommentsState(commentScope)) {
+      return buildConfirmedEmptyCommentsResult({
+        captureStartedAt,
+        noteId,
+        commentContainer,
+        normalizedMaxDetectedItems,
+        normalizedMaxScrollTimes,
+        normalizedStallTimeoutMs,
+        normalizedMaxDurationMs,
+        waitRange,
+        onProgress,
+      });
+    }
 
     const commentsMap = new Map();
     let lastGrowthAt = Date.now();
@@ -153,6 +189,17 @@ export async function captureComments({
       waitMaxMs: waitRange.max,
       resetCancelOnStart: false,
       stopWhen: ({currentContentCount}) => {
+        if (
+          currentContentCount === 0 &&
+          hasExplicitEmptyCommentsState(commentScope)
+        ) {
+          return {
+            stop: true,
+            reason: "confirmed_zero",
+            message: "已确认评论数为 0，立即进入下一条",
+          };
+        }
+
         if (currentContentCount > lastObservedCount) {
           lastObservedCount = currentContentCount;
           lastGrowthAt = Date.now();
@@ -290,6 +337,92 @@ export async function captureComments({
       },
     };
   }
+}
+
+function buildConfirmedEmptyCommentsResult({
+  captureStartedAt,
+  noteId,
+  commentContainer,
+  normalizedMaxDetectedItems,
+  normalizedMaxScrollTimes,
+  normalizedStallTimeoutMs,
+  normalizedMaxDurationMs,
+  waitRange,
+  onProgress,
+}) {
+  const elapsedMs = Math.max(
+    0,
+    Date.now() - Date.parse(captureStartedAt),
+  );
+  const scrollResult = {
+    scrollCount: 0,
+    maxScrollTimes: normalizedMaxScrollTimes,
+    completed: true,
+    canceled: false,
+    stopReason: "confirmed_zero",
+    finalContentCount: 0,
+    noNewContentCount: 0,
+    elapsedMs,
+    stalled: false,
+  };
+  const captureStatus = "done";
+  const noteTitleElement = querySelector(NOTE_DETAIL_SELECTORS.title);
+  const noteTitle = noteTitleElement
+    ? cleanText(noteTitleElement.textContent)
+    : "";
+  const stageTrace = [
+    buildCommentLoadStage({
+      label: "小红书评论加载",
+      status: "completed",
+      commentsMaxDetectedItems: normalizedMaxDetectedItems,
+      collectedCount: 0,
+      uniqueCount: 0,
+      commentContainerFound: Boolean(commentContainer),
+      scrollResult,
+      maxScrollTimes: normalizedMaxScrollTimes,
+      waitMinMs: waitRange.min,
+      waitMaxMs: waitRange.max,
+      stallTimeoutMs: normalizedStallTimeoutMs,
+      maxDurationMs: normalizedMaxDurationMs,
+    }),
+  ];
+
+  if (onProgress) {
+    onProgress({
+      phase: "comments_done",
+      message: "已确认评论数为 0，立即进入下一条",
+      collectedCount: 0,
+      stopReason: "confirmed_zero",
+    });
+  }
+
+  return {
+    ok: true,
+    type: SYNC_TYPE.COMMENTS,
+    data: {
+      noteId,
+      noteUrl: window.location.href,
+      noteTitle,
+      totalCount: 0,
+      items: [],
+      captureTimestamp: Date.now(),
+      captureStatus,
+      stoppedByUser: false,
+      stoppedByStall: false,
+      stopReason: "confirmed_zero",
+    },
+    meta: {
+      pageType: PAGE_TYPE.NOTE_DETAIL,
+      captureStartedAt,
+      captureFinishedAt: new Date().toISOString(),
+      captureStatus,
+      stoppedByUser: false,
+      stoppedByStall: false,
+      scrollInfo: scrollResult,
+    },
+    diagnostics: {stageTrace},
+    error: null,
+  };
 }
 
 function normalizePositiveInteger(value, fallback) {
@@ -718,30 +851,35 @@ async function scrollWithinCommentArea(
   container,
   {aggressive = false, stallRounds = 0} = {},
 ) {
-  const target = findScrollableTarget(container);
+  const target = resolveCommentScrollTarget(container);
+  if (!target) {
+    return false;
+  }
   const strongPush = stallRounds >= 2;
   const minDistance = aggressive ? 500 : 300;
   const maxDistance = strongPush ? 1800 : aggressive ? 1100 : 800;
   const distance = randomScrollDistance(minDistance, maxDistance);
 
-  dispatchWheelHint(container, distance);
-  dispatchWheelHint(target, distance);
-
   if (target === window) {
+    dispatchWheelHint(container, distance);
+    dispatchWheelHint(target, distance);
     window.scrollBy({
       top: distance,
       behavior: "smooth",
     });
-    return;
+    return true;
   }
 
+  dispatchWheelHint(target, distance);
   target.scrollTo({
     top: target.scrollTop + distance,
     behavior: "smooth",
   });
+  return true;
 }
 
-function findScrollableTarget(startNode) {
+export function resolveCommentScrollTarget(startNode) {
+  const overlayBoundary = findFixedOverlayBoundary(startNode);
   const descendant = findScrollableDescendant(startNode);
   if (descendant) {
     return descendant;
@@ -752,13 +890,42 @@ function findScrollableTarget(startNode) {
     if (isScrollableElement(node)) {
       return node;
     }
+    if (node === overlayBoundary) {
+      break;
+    }
     node = node.parentElement;
   }
-  return window;
+  return overlayBoundary ? null : window;
+}
+
+function findFixedOverlayBoundary(startNode) {
+  let node = startNode;
+  while (node && node !== document.body && node !== document.documentElement) {
+    if (isFixedOverlayElement(node)) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function isFixedOverlayElement(node) {
+  if (!node || typeof node !== "object" || node === window) return false;
+  if (
+    node.getAttribute?.("role") === "dialog" ||
+    node.getAttribute?.("aria-modal") === "true"
+  ) {
+    return true;
+  }
+  try {
+    return window.getComputedStyle(node)?.position === "fixed";
+  } catch {
+    return false;
+  }
 }
 
 function isCommentAreaExhausted(container) {
-  const target = findScrollableTarget(container);
+  const target = resolveCommentScrollTarget(container);
   if (target === window && !isWindowScrollable()) {
     return false;
   }

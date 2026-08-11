@@ -112,7 +112,7 @@ async function archiveContentRecordForTicketClose(tx, {
     INSERT INTO record_triage (
       tenant_id, record_id, status, priority, owner_user_id, owner_name,
       archived_at, archived_by_user_id, archived_by_name, updated_at
-    ) VALUES ($1, $2, 'ticketed', 'normal', NULL, '', now(), $3, $4, now())
+    ) VALUES ($1, $2, 'negative_feishu', 'normal', NULL, '', now(), $3, $4, now())
     ON CONFLICT (tenant_id, record_id)
     DO UPDATE SET
       archived_at = excluded.archived_at,
@@ -172,7 +172,7 @@ async function archiveContentRecordForTicketClose(tx, {
   };
 }
 
-async function markContentRecordTicketed(tx, { tenantId, recordId, userId, userName }) {
+async function markContentRecordNegativeFeishu(tx, { tenantId, recordId, userId, userName, feishuTableNo }) {
   const previous = await tx.queryOne(
     `SELECT COALESCE(status, 'unhandled') AS status
      FROM record_triage
@@ -181,16 +181,16 @@ async function markContentRecordTicketed(tx, { tenantId, recordId, userId, userN
   );
   await tx.execute(
     `INSERT INTO record_triage (
-       tenant_id, record_id, status, owner_user_id, owner_name, updated_at
-     ) VALUES ($1, $2, 'ticketed', $3, $4, now())
+       tenant_id, record_id, status, owner_user_id, owner_name, feishu_table_no, updated_at
+     ) VALUES ($1, $2, 'negative_feishu', $3, $4, $5, now())
      ON CONFLICT (tenant_id, record_id)
-     DO UPDATE SET status = 'ticketed', updated_at = now()`,
-    [tenantId, recordId, userId || null, userName || ''],
+     DO UPDATE SET status = 'negative_feishu', feishu_table_no = excluded.feishu_table_no, updated_at = now()`,
+    [tenantId, recordId, userId || null, userName || '', String(feishuTableNo || '').trim()],
   );
   return previous?.status || 'unhandled';
 }
 
-// ==================== 转工单(分诊侧:创建工单；内容进入“已转工单”处理模式)====================
+// ==================== 旧客户端兼容：内容工单写入“负面-飞书表”状态 ====================
 router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const sourceType = String(req.body?.sourceType || '');
@@ -204,6 +204,13 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
         ok: false,
         error: 'external_ticket_no_too_long',
         message: '工单号码最多 100 个字符',
+      });
+    }
+    if (sourceType === 'content' && !externalTicketNo) {
+      return res.status(400).json({
+        ok: false,
+        error: 'feishu_table_no_required',
+        message: '负面-飞书表需填写飞书表号',
       });
     }
     const priority = PRIORITIES.has(String(req.body?.priority)) ? String(req.body.priority) : '';
@@ -306,11 +313,12 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           }
         }
         if (sourceType === 'content') {
-          await markContentRecordTicketed(tx, {
+          await markContentRecordNegativeFeishu(tx, {
             tenantId: req.tenantId,
             recordId: sourceId,
             userId: req.user?.id,
             userName: req.user?.name || req.user?.email || '',
+            feishuTableNo: existing.external_ticket_no || externalTicketNo,
           });
         }
         return { ticket: existing, existed: true };
@@ -333,13 +341,14 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           req.user?.id || null, req.user?.name || req.user?.email || '', dispatchNote,
         ],
       );
-      // 内容进入第五种“已转工单”处理模式；评论沿用既有独立队列语义。
+      // 内容端已不再提供工单流程；旧客户端若仍调用，映射到“负面-飞书表”状态。
       if (sourceType === 'content') {
-        const previousStatus = await markContentRecordTicketed(tx, {
+        const previousStatus = await markContentRecordNegativeFeishu(tx, {
           tenantId: req.tenantId,
           recordId: sourceId,
           userId: req.user?.id,
           userName: req.user?.name || req.user?.email || '',
+          feishuTableNo: row.external_ticket_no,
         });
         await tx.execute(`
           INSERT INTO audit_logs (
@@ -355,9 +364,9 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
             ticketId: row.id,
             externalTicketNo: row.external_ticket_no,
             previousStatus,
-            nextStatus: 'ticketed',
+            nextStatus: 'negative_feishu',
             ticketStatus: row.status,
-            processingModeChanged: previousStatus !== 'ticketed',
+            processingModeChanged: previousStatus !== 'negative_feishu',
             priority: row.priority,
             assigneeName: row.assignee_name,
             note: dispatchNote,
@@ -438,8 +447,17 @@ router.patch('/:id/external-number', requireTenantAccess, requireSessionUser, re
         }
       }
 
-      if (currentExternalTicketNo === externalTicketNo) return { ticket, idempotent: true };
-      const isContent = ticket.source_type === 'content' && ticket.source_record_id;
+      const isContent = Boolean(ticket.source_type === 'content' && ticket.source_record_id);
+      if (currentExternalTicketNo === externalTicketNo) {
+        if (isContent) {
+          await tx.execute(
+            `UPDATE record_triage SET feishu_table_no = $3, updated_at = now()
+             WHERE tenant_id = $1 AND record_id = $2`,
+            [req.tenantId, ticket.source_record_id, externalTicketNo],
+          );
+        }
+        return { ticket, idempotent: true };
+      }
       if (currentExternalTicketNo && (!isContent || !hasExpectedNumber)) {
         return { numberLocked: currentExternalTicketNo };
       }
@@ -453,6 +471,13 @@ router.patch('/:id/external-number', requireTenantAccess, requireSessionUser, re
          RETURNING ${TICKET_COLUMNS}`,
         [ticket.id, req.tenantId, externalTicketNo],
       );
+      if (isContent) {
+        await tx.execute(
+          `UPDATE record_triage SET feishu_table_no = $3, updated_at = now()
+           WHERE tenant_id = $1 AND record_id = $2`,
+          [req.tenantId, ticket.source_record_id, externalTicketNo],
+        );
+      }
 
       const targetId = isContent ? ticket.source_record_id : ticket.source_comment_id;
       if (targetId) {

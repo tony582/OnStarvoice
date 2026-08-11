@@ -52,22 +52,25 @@ function DispatchModal({ state, onCancel, onConfirm }: { state: DispatchState; o
     return () => { alive = false }
   }, [])
 
-  const submit = () => {
+  const submit = useCallback(() => {
     const name = assigneeUserId === user?.id
       ? (user?.name || '本人')
       : (assignees.find(a => a.userId === assigneeUserId)?.name || '')
     onConfirm({ externalTicketNo: externalTicketNo.trim(), priority, assigneeUserId, assigneeName: name, note })
-  }
+  }, [assigneeUserId, assignees, externalTicketNo, note, onConfirm, priority, user?.id, user?.name])
 
   useEffect(() => {
-    const t = setTimeout(() => ref.current?.focus(), 30)
+    ref.current?.focus()
+  }, [])
+
+  useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onCancel()
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit()
     }
     window.addEventListener('keydown', h)
-    return () => { clearTimeout(t); window.removeEventListener('keydown', h) }
-  }, [externalTicketNo, priority, assigneeUserId, note, assignees]) // eslint-disable-line react-hooks/exhaustive-deps
+    return () => window.removeEventListener('keydown', h)
+  }, [onCancel, submit])
 
   return (
     <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4 animate-in fade-in duration-150" onMouseDown={onCancel}>

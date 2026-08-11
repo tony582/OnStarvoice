@@ -1,0 +1,95 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+
+test('dashboard opens on a calendar-month report and puts basic distributions before extensions', () => {
+  const dashboard = source('web/admin/src/pages/insights/DashboardTab.tsx');
+  const route = source('server/routes/analytics.js');
+
+  assert.match(dashboard, /useState\(currentShanghaiMonth\)/);
+  assert.match(dashboard, /aria-label="统计月份" type="month"/);
+  assert.match(dashboard, /aria-label="上一个月"/);
+  assert.match(dashboard, /aria-label="下一个月"/);
+  assert.doesNotMatch(dashboard, /近30天/);
+  assert.doesNotMatch(dashboard, /RANGE_OPTIONS/);
+  assert.match(route, /String\(query\.range \|\| 'month'\)/);
+  assert.match(route, /function parseShanghaiMonth/);
+  assert.match(route, /parseShanghaiMonth\(query\.month/);
+  assert.match(route, /label: `\$\{year\}年\$\{month\}月（月报）`/);
+
+  const coreAt = dashboard.indexOf('<CoreMonthlyAnalysis');
+  const extensionAt = dashboard.indexOf('延展分析</span>');
+  const summaryAt = dashboard.indexOf('<ExecutiveSummary');
+  assert.ok(coreAt > -1 && extensionAt > coreAt && summaryAt > extensionAt);
+  for (const title of ['平台分布', '情感分布', '处理模式分布']) {
+    assert.match(dashboard, new RegExp(`title="${title}"`));
+  }
+});
+
+test('basic distribution cards cross-filter the in-report analysis and export one auditable monthly workbook', () => {
+  const dashboard = source('web/admin/src/pages/insights/DashboardTab.tsx');
+  const route = source('server/routes/analytics.js');
+  const drilldown = source('server/services/analytics-drilldown.js');
+  const workbook = source('server/services/analytics-workbook.js');
+
+  assert.doesNotMatch(dashboard, /navigate\('workbench'/);
+  assert.match(dashboard, /new URLSearchParams\(\{ range: 'month', month, dimension, value \}\)/);
+  assert.match(dashboard, /\/analytics\/dashboard\/drilldown\?/);
+  assert.doesNotMatch(dashboard, /<DashboardDrilldownPanel/);
+  assert.match(dashboard, /三类分布始终显示；点击任一项会联动筛选顶部指标和另外两个分布/);
+  assert.match(dashboard, /const crossFilteredRows/);
+  assert.match(dashboard, /drilldownData\?\.breakdowns\[dimension\]/);
+  assert.match(dashboard, /aria-label="当前联动筛选"/);
+  assert.match(dashboard, /再次点击已选项可清除筛选/);
+  assert.doesNotMatch(dashboard, /内容证据/);
+  assert.match(dashboard, /\/analytics\/dashboard\/export\?/);
+  assert.match(dashboard, /导出月报数据/);
+  assert.doesNotMatch(dashboard, /aria-label=\{`导出\$\{title\}`\}/);
+
+  assert.match(route, /router\.get\('\/dashboard\/drilldown'/);
+  assert.match(route, /buildAnalyticsDrilldown\(/);
+  assert.match(route, /router\.get\('\/dashboard\/export'/);
+  assert.match(route, /buildAnalyticsWorkbook\(/);
+  assert.match(route, /sendWorkbook\(res/);
+  assert.match(route, /filename: `\$\{period\.label\}-月报基础分析及数据源\.xlsx`/);
+
+  for (const sheetName of ['月报主体', '内容分诊数据源']) {
+    assert.match(workbook, new RegExp(`['\"]${sheetName}['\"]`));
+  }
+  for (const removedSheet of ['内容数据源', '采集快照源', '评论数据源', '问题数据源', '预警数据源', '官方回复源']) {
+    assert.doesNotMatch(workbook, new RegExp(`addWorksheet\\(['\"]${removedSheet}['\"]`));
+  }
+  assert.match(workbook, /formula: `=COUNTA\(\$\{contentId\}\)`/);
+  assert.match(workbook, /`=COUNTIF\(\$\{contentSentiment\},"负面"\)`/);
+  assert.match(workbook, /`=SUM\(\$\{contentInteractions\}\)`/);
+  assert.match(workbook, /title: '平台分布'/);
+  assert.match(workbook, /title: '情感分布'/);
+  assert.match(workbook, /title: '处理模式分布'/);
+  assert.match(workbook, /workbook\.calcProperties\.fullCalcOnLoad = true/);
+  assert.match(workbook, /return `'\$\{SOURCE_SHEET\}'!\$\$\{letter\}\$2:/);
+
+  assert.match(drilldown, /WITH base AS/);
+  assert.match(drilldown, /selected AS/);
+  assert.match(drilldown, /breakdowns:/);
+  assert.doesNotMatch(drilldown, /LIMIT 30/);
+  assert.doesNotMatch(drilldown, /records:/);
+  assert.match(drilldown, /RELEVANT_RECORD_SQL/);
+});
+
+test('dashboard drill-down presets preserve unknown platform while pending sentiment stays backend-only', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const triage = source('server/routes/triage.js');
+
+  assert.match(queue, /function initialDateRanges/);
+  assert.match(queue, /initial\?\.recentFrom/);
+  assert.match(queue, /initial\?\.recentTo/);
+  assert.match(queue, /initial\?\.captureKeywords/);
+  assert.doesNotMatch(queue, /待标注/);
+  assert.match(queue, /value="unknown">未知平台/);
+  assert.match(triage, /sentiment === 'pending'/);
+  assert.match(triage, /COALESCE\(r\.sentiment, ''\) = ''/);
+  assert.match(triage, /platform === 'unknown'/);
+  assert.match(triage, /COALESCE\(NULLIF\(r\.platform, ''\), 'unknown'\) = 'unknown'/);
+});

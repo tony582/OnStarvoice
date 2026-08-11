@@ -6,15 +6,16 @@ type ColorKey = 'green' | 'red' | 'darkred' | 'orange' | 'amber' | 'blue' | 'pur
 
 const TONE_TO_COLOR: Record<string, ColorKey> = {
   positive: 'green', active: 'green', resolved: 'green', sent: 'green',
-  negative: 'red', high: 'red',
+  negative: 'red', high: 'red', negative_feishu: 'red', negative_cold: 'red',
   urgent: 'darkred', critical: 'darkred',
   unhandled: 'orange', new: 'orange', open: 'orange',
   pending: 'amber', medium: 'amber',
   reviewing: 'purple', generated: 'purple',
+  reviewed: 'green',
   issue_linked: 'blue', ticketed: 'blue', following: 'blue', platform_admin: 'blue',
-  official_responded: 'teal', internal_operator: 'teal',
+  official_responded: 'teal', replied: 'teal', internal_operator: 'teal',
   neutral: 'grey', muted: 'grey', low: 'grey', normal: 'grey',
-  closed: 'grey', archived: 'grey', no_action: 'grey', false_positive: 'grey', ignored: 'grey', viewer: 'grey',
+  closed: 'grey', archived: 'grey', no_action: 'grey', reviewed_non_monitor: 'grey', unavailable: 'grey', false_positive: 'grey', ignored: 'grey', viewer: 'grey',
 }
 
 // 实色块(Monday 点睛):饱和底 + 对比文字。浅色底用同系深字,深色底用白字。

@@ -71,6 +71,13 @@ const LABELS = {
   },
   triage: {
     unhandled: '待处理',
+    replied: '已回复',
+    reviewed: '已复核',
+    reviewed_non_monitor: '已复核-非监控内容',
+    unavailable: '已不可见',
+    negative_feishu: '负面-飞书表',
+    negative_cold: '负面-冷处理',
+    // 历史状态兼容。
     reviewing: '负面流程',
     issue_linked: '已关联事件',
     ticketed: '已转工单',
@@ -280,11 +287,14 @@ async function renderOverview() {
 async function renderTriage() {
   const el = content();
   const statusTabs = [
-    { value: '', label: '全部模式' },
+    { value: '', label: '全部状态' },
     { value: 'unhandled', label: '待处理' },
-    { value: 'reviewing', label: '负面流程' },
-    { value: 'official_responded', label: '官方已评' },
-    { value: 'no_action', label: '无需操作' },
+    { value: 'replied', label: '已回复' },
+    { value: 'reviewed', label: '已复核' },
+    { value: 'reviewed_non_monitor', label: '已复核-非监控内容' },
+    { value: 'unavailable', label: '已不可见' },
+    { value: 'negative_feishu', label: '负面-飞书表' },
+    { value: 'negative_cold', label: '负面-冷处理' },
   ];
   el.innerHTML = `
     <div class="page-intro">
@@ -306,7 +316,7 @@ async function renderTriage() {
         </select>
         <div class="search-box">
           <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input id="triageKeyword" placeholder="搜索标题、正文、关键词…" onkeydown="if(event.key==='Enter')loadTriageTable()">
+          <input id="triageKeyword" placeholder="搜索标题、正文、关键词、飞书表号…" onkeydown="if(event.key==='Enter')loadTriageTable()">
         </div>
       </div>
     </div>
@@ -563,7 +573,7 @@ function recordTable(records, pagination, withActions, pageHandlerName) {
       <td class="number-group">${n(r.likes)} / ${n(r.comments_count)} / ${n(r.collects)} / ${n(r.shares)}</td>
       <td>${commentRiskCell(r)}</td>
       <td>${officialResponseCell(r)}</td>
-      <td>${badge(LABELS.triage[r.triage_status] || r.triage_status, r.triage_status)}</td>
+      <td>${badge(LABELS.triage[r.triage_status] || r.triage_status, r.triage_status)}${r.triage_status === 'negative_feishu' ? `<div class="subtext">飞书表号 ${esc(r.feishu_table_no || '待填写')}</div>` : ''}</td>
       ${withActions ? `<td>${triageActions(r)}</td>` : ''}
     </tr>`).join('');
   const cols = withActions ? 8 : 7;
@@ -628,9 +638,13 @@ function triageActions(r) {
     <div class="action-dropdown">
       <button class="secondary action-more" onclick="this.parentElement.classList.toggle('open')">更多</button>
       <div class="action-menu">
-        <button onclick="markOfficialResponded('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">标为已响应</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','reviewing'); this.closest('.action-dropdown').classList.remove('open')">负面流程</button>
-        <button onclick="updateTriage('${escAttr(r.id)}','no_action'); this.closest('.action-dropdown').classList.remove('open')">无需操作</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','unhandled'); this.closest('.action-dropdown').classList.remove('open')">待处理</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','replied'); this.closest('.action-dropdown').classList.remove('open')">已回复</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','reviewed'); this.closest('.action-dropdown').classList.remove('open')">已复核</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','reviewed_non_monitor'); this.closest('.action-dropdown').classList.remove('open')">已复核-非监控内容</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','unavailable'); this.closest('.action-dropdown').classList.remove('open')">已不可见</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','negative_feishu'); this.closest('.action-dropdown').classList.remove('open')">负面-飞书表</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','negative_cold'); this.closest('.action-dropdown').classList.remove('open')">负面-冷处理</button>
         <button onclick="archiveRecord('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">归档</button>
       </div>
     </div>
@@ -645,7 +659,23 @@ function issueActions(i) {
 }
 
 async function updateTriage(recordId, status) {
-  await api('/triage/records/' + recordId, { method: 'PATCH', body: { status } });
+  const record = (state.cache.get('triageRecords') || []).find(item => item.id === recordId) || {};
+  let feishuTableNo = '';
+  if (status === 'negative_feishu') {
+    const input = prompt('飞书表号（必填）', record.feishu_table_no || '');
+    if (input === null) return;
+    feishuTableNo = input.trim();
+    if (!feishuTableNo) {
+      toast('请填写飞书表号', 'error');
+      return;
+    }
+  }
+  const note = prompt('备注（选填）', '');
+  if (note === null) return;
+  await api('/triage/records/' + recordId, {
+    method: 'PATCH',
+    body: { status, note: note.trim(), ...(status === 'negative_feishu' ? { feishuTableNo } : {}) },
+  });
   toast('分诊已更新', 'success');
   if (state.page === 'overview') renderOverview(); else loadTriageTable();
 }

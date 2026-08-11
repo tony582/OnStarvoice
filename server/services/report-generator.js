@@ -52,6 +52,13 @@ const ISSUE_STATUS_LABEL = {
 };
 const TRIAGE_LABEL = {
   unhandled: '待处理',
+  replied: '已回复',
+  reviewed: '已复核',
+  reviewed_non_monitor: '已复核-非监控内容',
+  unavailable: '已不可见',
+  negative_feishu: '负面-飞书表',
+  negative_cold: '负面-冷处理',
+  // 历史状态兼容。
   reviewing: '待复核',
   issue_linked: '已关联事件',
   ticketed: '已转工单',
@@ -59,8 +66,11 @@ const TRIAGE_LABEL = {
   no_action: '无需操作',
   false_positive: '误报',
 };
-// 舆情剖析(opinion-analysis.js)自建的 records/alerts SQL 与预检 COUNT 同拼此口径,保持与报告一致
-export const RELEVANT_RECORD_SQL = "(r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')";
+// 月报、舆情剖析和下钻统一使用内容分诊的数据范围。
+export const RELEVANT_RECORD_SQL = `(
+  r.record_type NOT IN ('official_content', 'blogger_profile')
+  AND r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'
+)`;
 
 function escHtml(value) {
   return String(value ?? '')
@@ -598,24 +608,41 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
            AND r.record_type <> 'official_content'
        ) as official_responded,
        COUNT(*) FILTER (
-         WHERE COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
+         WHERE COALESCE(rt.status, 'unhandled') = 'unhandled'
           AND rt.archived_at IS NULL
           AND r.record_type <> 'official_content'
        ) as active_inbox,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled') as unhandled,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewing') as reviewing,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'replied') as replied,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed') as reviewed,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor') as reviewed_non_monitor,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unavailable') as unavailable,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu') as negative_feishu,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold') as negative_cold,
        COUNT(*) FILTER (
-         WHERE COALESCE(rt.status, 'unhandled') = 'ticketed'
+         WHERE COALESCE(rt.status, 'unhandled') <> 'unhandled'
+           AND rt.archived_at IS NULL
+           AND r.record_type NOT IN ('official_content', 'blogger_profile')
+       ) as handled_total,
+       COUNT(*) FILTER (
+         WHERE rt.archived_at IS NULL
+           AND r.record_type NOT IN ('official_content', 'blogger_profile')
+       ) as status_total,
+       -- 旧报告字段兼容。
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold') as reviewing,
+       COUNT(*) FILTER (
+         WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu'
            AND r.record_type <> 'official_content'
        ) as issue_linked,
-       COUNT(*) FILTER (WHERE r.record_type <> 'official_content' AND (
-         (COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing') AND rt.archived_at IS NULL)
-         OR COALESCE(rt.status, 'unhandled') = 'ticketed'
-       )) as active_or_ticketed,
-       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'no_action') as no_action
+       COUNT(*) FILTER (
+         WHERE rt.archived_at IS NULL
+           AND r.record_type NOT IN ('official_content', 'blogger_profile')
+       ) as active_or_ticketed,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor') as no_action
      FROM records r
      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
      WHERE r.tenant_id = $1
+       AND r.record_type NOT IN ('official_content', 'blogger_profile')
        AND ${recordFilterWf}`,
     [tenantId, ...(kw.length ? [kw] : [])]
   );
@@ -695,6 +722,14 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
       active_inbox: rowNum(workflowStats, 'active_inbox'),
       active_or_ticketed: rowNum(workflowStats, 'active_or_ticketed'),
       unhandled: rowNum(workflowStats, 'unhandled'),
+      replied: rowNum(workflowStats, 'replied'),
+      reviewed: rowNum(workflowStats, 'reviewed'),
+      reviewed_non_monitor: rowNum(workflowStats, 'reviewed_non_monitor'),
+      unavailable: rowNum(workflowStats, 'unavailable'),
+      negative_feishu: rowNum(workflowStats, 'negative_feishu'),
+      negative_cold: rowNum(workflowStats, 'negative_cold'),
+      handled_total: rowNum(workflowStats, 'handled_total'),
+      status_total: rowNum(workflowStats, 'status_total'),
       reviewing: rowNum(workflowStats, 'reviewing'),
       issue_linked: rowNum(workflowStats, 'issue_linked'),
       no_action: rowNum(workflowStats, 'no_action'),
@@ -966,7 +1001,7 @@ function buildOpinionIndex(stats, previousStats, negativeRate, previousNegativeR
     previousCriticalAlerts * 24
   ));
   const response = Math.min(100, Math.round(
-    pct(stats.workflowStats?.issue_linked || 0, Math.max(1, stats.workflowStats?.active_or_ticketed || 0)) * 0.55 +
+    pct(stats.workflowStats?.handled_total || 0, Math.max(1, stats.workflowStats?.status_total || 0)) * 0.55 +
     pct(stats.officialPeriod?.record_count || 0, Math.max(1, stats.total)) * 0.45
   ));
   return {
@@ -1984,14 +2019,15 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
   const nsr = (num(sm.positive) + num(sm.negative)) ? Math.round((num(sm.positive) - num(sm.negative)) / (num(sm.positive) + num(sm.negative)) * 100) : 0;
   const pnsr = (num(psm.positive) + num(psm.negative)) ? Math.round((num(psm.positive) - num(psm.negative)) / (num(psm.positive) + num(psm.negative)) * 100) : 0;
   const w = stats.workflowStats || {};
-  const dispatched = num(w.issue_linked), inbox = num(w.active_inbox);
-  const activeOrTicketed = num(w.active_or_ticketed);
-  const dispatchRate = activeOrTicketed ? Math.round(dispatched / activeOrTicketed * 100) : 0;
+  const inbox = num(w.active_inbox);
+  const statusTotal = num(w.status_total);
+  const handled = num(w.handled_total);
+  const handlingRate = statusTotal ? Math.round(handled / statusTotal * 100) : 0;
   const officialRate = num(stats.total) ? Math.round(num(stats.officialPeriod?.record_count) / num(stats.total) * 100) : 0;
   const repeatIssues = (stats.topIssues || []).filter(i => num(i.record_count) > 1);
   const trendBars = (rows, n) => renderBarRows((rows || []).slice(-n), { labelKey: 'label', valueKey: 'total', color: '#2563EB', maxRows: n });
   const driftLine = `负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})`;
-  const closeLine = `工单覆盖率 ${dispatchRate}% · 官方响应率 ${officialRate}% · 当前待处理 ${n0(inbox)} 条`;
+  const closeLine = `状态处理率 ${handlingRate}% · 官方响应率 ${officialRate}% · 当前待处理 ${n0(inbox)} 条`;
 
   let body = '';
   if (type === 'weekly') {
@@ -2007,7 +2043,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
     body = `
       ${renderSection('管理层复盘摘要', renderList(stats.executiveSummary), '')}
       ${renderSection('月度声量趋势', trendBars(bucketTrend(stats.volumeTrend, 6), 6), '分段聚合,避免日点拥挤')}
-      ${renderSection('月度复盘', `<p style="${P}">处置覆盖:工单覆盖率 ${dispatchRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置覆盖 + 口碑环比')}
+      ${renderSection('月度复盘', `<p style="${P}">处置覆盖:状态处理率 ${handlingRate}%、官方响应率 ${officialRate}%(覆盖 ${n0(stats.officialPeriod?.record_count)} 条内容、待处理 ${n0(inbox)} 条);口碑环比:负面率 ${stats.negativeRate}%(上期 ${stats.previousNegativeRate}%)、净情感 NSR ${nsr}(上期 ${pnsr})。</p>`, '处置覆盖 + 口碑环比')}
       ${repeatIssues.length ? renderSection('重复发酵问题', renderIssues(repeatIssues.slice(0, 8)), '关联多条内容/多次出现的问题,需根因处理') : ''}
       ${renderSection('下月策略建议', renderList(stats.actionItems, true), '按优先级执行')}
       ${renderSection('本月 TOP 风险内容', renderEvidenceRows(stats.riskItems.slice(0, 6), '暂无重点风险内容'), '')}`;

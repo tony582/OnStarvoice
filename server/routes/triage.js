@@ -19,9 +19,23 @@ const router = Router();
 // 导出用中文标签映射(MAP[v]||v||'')
 const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
 const SENTIMENT_CN = { positive: '正面', neutral: '中性', negative: '负面' };
-const TRIAGE_STATUS_CN = { unhandled: '待处理', reviewing: '负面流程', issue_linked: '已关联事件', ticketed: '已转工单', no_action: '无需操作', false_positive: '误报', official_responded: '官方已评' };
+const TRIAGE_STATUS_CN = {
+  unhandled: '待处理',
+  replied: '已回复',
+  reviewed: '已复核',
+  reviewed_non_monitor: '已复核-非监控内容',
+  unavailable: '已不可见',
+  negative_feishu: '负面-飞书表',
+  negative_cold: '负面-冷处理',
+  // 仅用于历史导出与审计展示；059 迁移后不会再作为当前状态写入。
+  reviewing: '负面流程',
+  issue_linked: '已关联事件',
+  ticketed: '已转工单',
+  no_action: '无需操作',
+  false_positive: '误报',
+  official_responded: '官方已评',
+};
 const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
-const TICKET_STATUS_CN = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略', closed: '已结案' };
 const CATEGORY_CN = { safety_rescue: '安全救援', feature_usage: '功能使用', renewal_billing: '续费收费', privacy: '隐私安全', app_issue: 'App问题', service_quality: '服务质量', brand_image: '品牌形象', other: '其他' };
 const NOTE_TYPE_CN = { image: '图文', video: '视频', normal: '图文' };
 // 账号名带品牌/车型(全称·简称)= 品牌关联号(非真实车主)。⚠ 与 web/admin utils.ts 的同名正则保持一致。
@@ -110,7 +124,15 @@ function postUrl(r) {
   return r.url || '';
 }
 
-const TRIAGE_STATUSES = new Set(['unhandled', 'reviewing', 'issue_linked', 'official_responded', 'no_action']);
+const TRIAGE_STATUSES = new Set([
+  'unhandled',
+  'replied',
+  'reviewed',
+  'reviewed_non_monitor',
+  'unavailable',
+  'negative_feishu',
+  'negative_cold',
+]);
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -119,15 +141,18 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const ACTIVE_QUEUE_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
-  AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing')
+  AND COALESCE(rt.status, 'unhandled') = 'unhandled'
   AND rt.archived_at IS NULL
 `;
 
-// 处理模式和归档生命周期相互独立。两个列表共享模式范围，只按 archived_at 分组。
+// 处理状态和归档生命周期相互独立。两个列表共享状态范围，只按 archived_at 分组。
 const TRIAGE_CONTENT_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
-  AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing', 'official_responded', 'no_action', 'ticketed')
+  AND COALESCE(rt.status, 'unhandled') IN (
+    'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
+    'unavailable', 'negative_feishu', 'negative_cold'
+  )
 `;
 
 const TRIAGE_QUEUE_CONDITION = `
@@ -180,8 +205,8 @@ const LATEST_CONTENT_TICKET_JOIN = `
   ) ticket ON true
 `;
 
-// 列表“进展”对所有处理模式开放：普通内容备注与工单过程记录共用一个最近进展入口。
-// 这里只取最近一条和总数；完整时间线仍由 /records/:id/activity 按需加载。
+// 列表备注统计独立内容备注与状态变更时填写的备注。旧工单过程记录仍保留在详情历史中，
+// 但不再驱动当前处置入口。这里只取最近一条和总数；完整时间线按需加载。
 const LATEST_CONTENT_PROGRESS_JOIN = `
   LEFT JOIN LATERAL (
     SELECT
@@ -192,7 +217,7 @@ const LATEST_CONTENT_PROGRESS_JOIN = `
       COUNT(*) OVER ()::int AS notes_count
     FROM (
       SELECT
-        'record-' || rn.id::text AS activity_id,
+        rn.id::text AS activity_id,
         rn.body,
         rn.author_name,
         rn.created_at,
@@ -204,18 +229,20 @@ const LATEST_CONTENT_PROGRESS_JOIN = `
       UNION ALL
 
       SELECT
-        'ticket-' || tn.id::text AS activity_id,
-        tn.body,
-        tn.author_name,
-        tn.created_at,
-        tn.event_type
-      FROM ticket_notes tn
-      JOIN tickets progress_ticket
-        ON progress_ticket.id = tn.ticket_id
-        AND progress_ticket.tenant_id = tn.tenant_id
-      WHERE progress_ticket.tenant_id = r.tenant_id
-        AND progress_ticket.source_type = 'content'
-        AND progress_ticket.source_record_id = r.id
+        al.id::text AS activity_id,
+        al.metadata->>'note' AS body,
+        COALESCE(NULLIF(u.name, ''), u.email, NULLIF(al.actor_id, ''), '系统') AS author_name,
+        al.created_at,
+        'status_note'::text AS event_type
+      FROM audit_logs al
+      LEFT JOIN users u ON u.id = al.actor_user_id
+      WHERE al.tenant_id = r.tenant_id
+        AND al.action IN ('record.triage_updated', 'record.triage_batch_updated')
+        AND btrim(COALESCE(al.metadata->>'note', '')) <> ''
+        AND (
+          al.target_id = r.id::text
+          OR COALESCE(al.metadata->'recordIds', '[]'::jsonb) ? r.id::text
+        )
     ) progress
     ORDER BY progress.created_at DESC, progress.activity_id DESC
     LIMIT 1
@@ -236,6 +263,23 @@ function appendTicketFilter(where, query = {}) {
   return where;
 }
 
+// 工单状态筛选与列表展示使用同一张“当前工单”：在途优先，否则取最近结案。
+// 标量子查询在没有内容工单时返回 NULL，active/closed 两种比较都会自然排除该记录。
+export function appendTicketLifecycleFilter(where, query = {}) {
+  const ticketStatus = String(query.ticketStatus || '');
+  if (ticketStatus !== 'active' && ticketStatus !== 'closed') return where;
+  const currentTicketStatusSql = `(
+    SELECT tfs.status
+    FROM tickets tfs
+    WHERE tfs.tenant_id = r.tenant_id
+      AND tfs.source_type = 'content'
+      AND tfs.source_record_id = r.id
+    ORDER BY (tfs.status <> 'closed') DESC, tfs.created_at DESC, tfs.id DESC
+    LIMIT 1
+  )`;
+  return `${where} AND ${currentTicketStatusSql} ${ticketStatus === 'closed' ? '=' : '<>'} 'closed'`;
+}
+
 function appendKeywordFilter(where, params, keyword) {
   const normalized = String(keyword || '').trim();
   if (!normalized) return { where, matchedTicketSql: `NULL::text` };
@@ -249,6 +293,7 @@ function appendKeywordFilter(where, params, keyword) {
     OR r.author_name ILIKE ${p}
     OR r.author_account_no ILIKE ${p}
     OR r.author_id ILIKE ${p}
+    OR rt.feishu_table_no ILIKE ${p}
     OR EXISTS (
       SELECT 1 FROM tickets ts
       WHERE ts.tenant_id = r.tenant_id
@@ -281,7 +326,7 @@ function validatePriority(priority) {
 function riskOrderSql() {
   return `
     CASE
-      WHEN r.negative_comment_count > 0 AND COALESCE(rt.status, 'unhandled') IN ('unhandled', 'reviewing') THEN 0
+      WHEN r.negative_comment_count > 0 AND COALESCE(rt.status, 'unhandled') = 'unhandled' THEN 0
       WHEN r.sentiment = 'negative' AND (r.likes + r.comments_count + r.collects + r.shares) >= 500 THEN 1
       WHEN r.sentiment = 'negative' THEN 2
       WHEN EXISTS (SELECT 1 FROM alerts a WHERE a.record_id = r.id) THEN 3
@@ -359,6 +404,24 @@ export function appendTriageDateFilters(where, params, query = {}) {
   });
 }
 
+function appendPlatformFilter(where, params, platform) {
+  if (!platform) return where;
+  if (platform === 'unknown') {
+    return `${where} AND COALESCE(NULLIF(r.platform, ''), 'unknown') = 'unknown'`;
+  }
+  params.push(platform);
+  return `${where} AND r.platform = $${params.length}`;
+}
+
+function appendSentimentFilter(where, params, sentiment) {
+  if (!sentiment) return where;
+  if (sentiment === 'pending') {
+    return `${where} AND COALESCE(r.sentiment, '') = ''`;
+  }
+  params.push(sentiment);
+  return `${where} AND r.sentiment = $${params.length}`;
+}
+
 // 风险信号多选筛选(有预警 / 有负评 / 已删帖),命中任一即入选(OR)。条件为字面 SQL,不绑定参数。
 // 注:作者身份(原"疑似KOE")已从风险信号拆出,改为独立的「疑似身份」维度(见 identityWhereClause)。
 function riskWhereClause(reqRisk) {
@@ -414,8 +477,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     }
     const params = [req.tenantId];
     let where = 'WHERE r.tenant_id = $1';
-    if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
-    if (sentiment) { params.push(sentiment); where += ` AND r.sentiment = $${params.length}`; }
+    where = appendPlatformFilter(where, params, platform);
+    where = appendSentimentFilter(where, params, sentiment);
     const bucket = String(req.query.bucket || '');
     // 先按 bucket/queue 圈定大范围,再叠加具体处置状态(status)与风险(risk)筛选。
     // 关键:bucket/queue 与 status 必须叠加而非互斥 —— 否则按状态筛选会丢掉 active 队列
@@ -431,12 +494,13 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       params.push(status);
       where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
     }
-    // 风险信号只包含预警与负评；身份、处理模式分别使用独立筛选。
+    // 风险信号只包含预警与负评；身份、处理状态分别使用独立筛选。
     where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     const keywordFilter = appendKeywordFilter(where, params, keyword);
     where = keywordFilter.where;
     where = appendTicketFilter(where, req.query);
+    where = appendTicketLifecycleFilter(where, req.query);
     // 采集关键词多选(每个关键词=一次采集 session)
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
       .map(s => String(s).trim()).filter(Boolean);
@@ -476,6 +540,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         COALESCE(rt.priority, 'normal') AS triage_priority,
         COALESCE(rt.owner_name, '') AS triage_owner_name,
         COALESCE(rt.note, '') AS triage_note,
+        COALESCE(rt.feishu_table_no, '') AS feishu_table_no,
         rt.updated_at AS triage_updated_at,
         rt.archived_at,
         COALESCE(rt.archived_by_name, '') AS archived_by_name,
@@ -549,15 +614,32 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
 
     const status = req.body?.status ? String(req.body.status) : null;
     const priority = req.body?.priority ? String(req.body.priority) : null;
+    const note = String(req.body?.note || '').trim();
+    const requestedFeishuTableNo = Object.prototype.hasOwnProperty.call(req.body || {}, 'feishuTableNo')
+      ? String(req.body.feishuTableNo || '').trim()
+      : null;
+    if (note.length > 2000) {
+      return res.status(400).json({ ok: false, error: 'note_too_long', message: '备注最多 2000 个字符' });
+    }
+    if (requestedFeishuTableNo !== null && requestedFeishuTableNo.length > 100) {
+      return res.status(400).json({ ok: false, error: 'feishu_table_no_too_long', message: '飞书表号最多 100 个字符' });
+    }
     if (status === 'false_positive') {
       return res.status(400).json({
         ok: false,
         error: 'false_positive_is_feedback_only',
-        message: '误报只能提交给平台管理员复核，不会改变内容处理模式',
+        message: '误报只能提交给平台管理员复核，不会改变内容处理状态',
       });
     }
     if (status !== null && !validateStatus(status)) {
       return res.status(400).json({ ok: false, error: 'invalid_status', message: '分诊状态无效' });
+    }
+    if (status === 'negative_feishu' && !requestedFeishuTableNo) {
+      return res.status(400).json({
+        ok: false,
+        error: 'feishu_table_no_required',
+        message: '请选择负面-飞书表时填写飞书表号',
+      });
     }
     if (priority !== null && !validatePriority(priority)) {
       return res.status(400).json({ ok: false, error: 'invalid_priority', message: '优先级无效' });
@@ -568,7 +650,6 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
 
     let updatedIds = [];
     let archivedIds = [];
-    let blockedActiveTicketIds = [];
     if (validIds.length) {
       const mutation = await withTransaction(async tx => {
         const lifecycles = await getRecordLifecycles({
@@ -582,32 +663,22 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
           .map(row => String(row.id).toLowerCase());
         if (sealedIds.length) return { updatedIds: [], archivedIds: sealedIds };
 
-        if (status !== null) {
-          const activeTicketRows = await tx.queryAll(`
-            SELECT DISTINCT source_record_id AS record_id
-            FROM tickets
-            WHERE tenant_id = $1
-              AND source_type = 'content'
-              AND source_record_id = ANY($2::uuid[])
-              AND status <> 'closed'
-          `, [req.tenantId, validIds]);
-          const activeTicketIds = activeTicketRows.map(row => String(row.record_id).toLowerCase());
-          if (activeTicketIds.length) {
-            return { updatedIds: [], archivedIds: [], blockedActiveTicketIds: activeTicketIds };
-          }
-        }
-
         const previousRows = await tx.queryAll(`
           SELECT r.id AS record_id,
             COALESCE(rt.status, 'unhandled') AS status,
-            COALESCE(rt.priority, 'normal') AS priority
+            COALESCE(rt.priority, 'normal') AS priority,
+            COALESCE(rt.feishu_table_no, '') AS feishu_table_no
           FROM records r
           LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
           WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[])
         `, [req.tenantId, validIds]);
         const rows = await tx.queryAll(`
-          INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, updated_at)
-          SELECT r.tenant_id, r.id, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, $6, now()
+          INSERT INTO record_triage (
+            tenant_id, record_id, status, priority, owner_user_id, owner_name,
+            feishu_table_no, updated_at
+          )
+          SELECT r.tenant_id, r.id, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, $6,
+            COALESCE($7, ''), now()
           FROM records r
           WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[])
           ON CONFLICT (tenant_id, record_id)
@@ -616,18 +687,18 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
             priority = CASE WHEN $4::text IS NOT NULL THEN excluded.priority ELSE record_triage.priority END,
             owner_user_id = excluded.owner_user_id,
             owner_name = excluded.owner_name,
+            feishu_table_no = CASE WHEN $7::text IS NOT NULL THEN excluded.feishu_table_no ELSE record_triage.feishu_table_no END,
             updated_at = now()
           RETURNING record_id
-        `, [req.tenantId, validIds, status, priority, req.user?.id || null, req.actorName || '']);
-        if (status === 'official_responded' && rows.length) {
-          await tx.execute(`
-            UPDATE records
-            SET official_replied = true,
-              official_response_status = 'responded',
-              updated_at = now()
-            WHERE tenant_id = $1 AND id = ANY($2::uuid[])
-          `, [req.tenantId, rows.map(row => row.record_id)]);
-        }
+        `, [
+          req.tenantId,
+          validIds,
+          status,
+          priority,
+          req.user?.id || null,
+          req.actorName || '',
+          status === 'negative_feishu' ? requestedFeishuTableNo : null,
+        ]);
         await tx.execute(`
           INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
           VALUES ($1, $2, $3, $4, 'record.triage_batch_updated', 'record', '', $5::jsonb)
@@ -640,9 +711,12 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
             recordIds: rows.map(row => row.record_id),
             status,
             priority,
+            note,
+            feishuTableNo: status === 'negative_feishu' ? requestedFeishuTableNo : '',
             previous: Object.fromEntries(previousRows.map(row => [row.record_id, {
               status: row.status,
               priority: row.priority,
+              feishuTableNo: row.feishu_table_no,
             }])),
             updated: rows.length,
           }),
@@ -650,33 +724,23 @@ router.patch('/records/batch', requireTenantAccess, requireTenantWriter, async (
         return {
           updatedIds: rows.map(row => String(row.record_id).toLowerCase()),
           archivedIds: [],
-          blockedActiveTicketIds: [],
         };
       });
       updatedIds = mutation.updatedIds;
       archivedIds = mutation.archivedIds;
-      blockedActiveTicketIds = mutation.blockedActiveTicketIds || [];
     }
 
     if (archivedIds.length) return sendRecordArchived(res, archivedIds);
-    if (blockedActiveTicketIds.length) {
-      return res.status(409).json({
-        ok: false,
-        error: 'content_ticket_active',
-        message: '存在未结案工单，处理模式须保留为“已转工单”',
-        recordIds: blockedActiveTicketIds,
-      });
-    }
 
     const updatedSet = new Set(updatedIds);
     const skipped = ids.filter(id => !updatedSet.has(id));
-    return res.json({ ok: true, updated: updatedSet.size, skipped });
+    return res.json({ ok: true, updated: updatedSet.size, updatedIds: [...updatedSet], skipped });
   } catch (err) {
     return next(err);
   }
 });
 
-// 归档是独立生命周期：只更新 archived_* 字段，绝不改处理模式 status。
+// 归档是独立生命周期：只更新 archived_* 字段，绝不改处理状态 status。
 router.patch('/records/archive', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const rawIds = req.body?.ids;
@@ -691,7 +755,6 @@ router.patch('/records/archive', requireTenantAccess, requireTenantWriter, async
     const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()).filter(Boolean))];
     const validIds = ids.filter(id => UUID_RE.test(id));
     let updatedIds = [];
-    let skippedActiveTicketIds = [];
 
     if (validIds.length) {
       const mutation = await withTransaction(async tx => {
@@ -703,23 +766,7 @@ router.patch('/records/archive', requireTenantAccess, requireTenantWriter, async
           lock: true,
         });
 
-        let targetIds = validIds;
-        let activeTicketRecordIds = [];
-        if (archived) {
-          const activeTicketRows = await tx.queryAll(`
-            SELECT DISTINCT source_record_id AS record_id
-            FROM tickets
-            WHERE tenant_id = $1
-              AND source_type = 'content'
-              AND source_record_id = ANY($2::uuid[])
-              AND status <> 'closed'
-          `, [req.tenantId, validIds]);
-          const activeTicketSet = new Set(
-            activeTicketRows.map(row => String(row.record_id).toLowerCase()),
-          );
-          activeTicketRecordIds = validIds.filter(id => activeTicketSet.has(id));
-          targetIds = validIds.filter(id => !activeTicketSet.has(id));
-        }
+        const targetIds = validIds;
 
         let rows = [];
         if (targetIds.length && archived) {
@@ -775,14 +822,12 @@ router.patch('/records/archive', requireTenantAccess, requireTenantWriter, async
               recordIds: changedIds,
               archived,
               updated: changedIds.length,
-              skippedActiveTicketIds: activeTicketRecordIds,
             }),
           ]);
         }
-        return { changedIds, skippedActiveTicketIds: activeTicketRecordIds };
+        return { changedIds };
       });
       updatedIds = mutation.changedIds;
-      skippedActiveTicketIds = mutation.skippedActiveTicketIds;
     }
 
     const updatedSet = new Set(updatedIds);
@@ -791,7 +836,6 @@ router.patch('/records/archive', requireTenantAccess, requireTenantWriter, async
       ok: true,
       updated: updatedSet.size,
       skipped,
-      skippedActiveTicketIds,
     });
   } catch (err) {
     return next(err);
@@ -805,11 +849,13 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
     const body = req.body || {};
     const status = body.status ? String(body.status) : null;
     const priority = body.priority ? String(body.priority) : null;
+    const hasFeishuTableNo = Object.prototype.hasOwnProperty.call(body, 'feishuTableNo');
+    const feishuTableNo = hasFeishuTableNo ? String(body.feishuTableNo || '').trim() : null;
     if (status === 'false_positive') {
       return res.status(400).json({
         ok: false,
         error: 'false_positive_is_feedback_only',
-        message: '误报只能提交给平台管理员复核，不会改变内容处理模式',
+        message: '误报只能提交给平台管理员复核，不会改变内容处理状态',
       });
     }
     if (status !== null && !validateStatus(status)) {
@@ -818,8 +864,14 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
     if (priority !== null && !validatePriority(priority)) {
       return res.status(400).json({ ok: false, error: 'invalid_priority', message: '优先级无效' });
     }
+    if (feishuTableNo !== null && feishuTableNo.length > 100) {
+      return res.status(400).json({ ok: false, error: 'feishu_table_no_too_long', message: '飞书表号最多 100 个字符' });
+    }
     const ownerName = Object.prototype.hasOwnProperty.call(body, 'ownerName') ? String(body.ownerName || '') : null;
-    const requestedNote = Object.prototype.hasOwnProperty.call(body, 'note') ? String(body.note || '') : null;
+    const requestedNote = Object.prototype.hasOwnProperty.call(body, 'note') ? String(body.note || '').trim() : null;
+    if (requestedNote !== null && requestedNote.length > 2000) {
+      return res.status(400).json({ ok: false, error: 'note_too_long', message: '备注最多 2000 个字符' });
+    }
     const note = requestedNote;
 
     const result = await withTransaction(async tx => {
@@ -835,25 +887,27 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
         'SELECT * FROM record_triage WHERE tenant_id = $1 AND record_id = $2',
         [req.tenantId, req.params.recordId],
       );
-      if (status !== null) {
-        const activeTicket = await tx.queryOne(`
-          SELECT id, external_ticket_no
-          FROM tickets
-          WHERE tenant_id = $1
-            AND source_type = 'content'
-            AND source_record_id = $2
-            AND status <> 'closed'
-          ORDER BY created_at DESC, id DESC
-          LIMIT 1
-        `, [req.tenantId, req.params.recordId]);
-        if (activeTicket) return { activeTicket };
+      const triageNote = note;
+      const effectiveStatus = status || currentTriage?.status || 'unhandled';
+      const effectiveFeishuTableNo = feishuTableNo !== null
+        ? feishuTableNo
+        : String(currentTriage?.feishu_table_no || '').trim();
+      if (
+        (status === 'negative_feishu' || (hasFeishuTableNo && effectiveStatus === 'negative_feishu'))
+        && !effectiveFeishuTableNo
+      ) {
+        return { feishuTableNoRequired: true };
       }
 
-      const triageNote = note;
-
       const triage = await tx.queryOne(`
-        INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, note, updated_at)
-        VALUES ($1, $2, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5, COALESCE($6, ''), COALESCE($7, ''), now())
+        INSERT INTO record_triage (
+          tenant_id, record_id, status, priority, owner_user_id, owner_name, note,
+          feishu_table_no, updated_at
+        )
+        VALUES (
+          $1, $2, COALESCE($3, 'unhandled'), COALESCE($4, 'normal'), $5,
+          COALESCE($6, ''), COALESCE($7, ''), COALESCE($8, ''), now()
+        )
         ON CONFLICT (tenant_id, record_id)
         DO UPDATE SET
           status = CASE WHEN $3::text IS NOT NULL THEN excluded.status ELSE record_triage.status END,
@@ -861,9 +915,19 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
           owner_user_id = excluded.owner_user_id,
           owner_name = CASE WHEN $6::text IS NOT NULL THEN excluded.owner_name ELSE record_triage.owner_name END,
           note = CASE WHEN $7::text IS NOT NULL THEN excluded.note ELSE record_triage.note END,
+          feishu_table_no = CASE WHEN $8::text IS NOT NULL THEN excluded.feishu_table_no ELSE record_triage.feishu_table_no END,
           updated_at = now()
         RETURNING *
-      `, [req.tenantId, req.params.recordId, status, priority, req.user?.id || null, ownerName, triageNote]);
+      `, [
+        req.tenantId,
+        req.params.recordId,
+        status,
+        priority,
+        req.user?.id || null,
+        ownerName,
+        triageNote,
+        feishuTableNo,
+      ]);
       await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1, $2, $3, $4, 'record.triage_updated', 'record', $5, $6::jsonb)
@@ -879,6 +943,8 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
           previousPriority: currentTriage?.priority || 'normal',
           nextPriority: priority || currentTriage?.priority || 'normal',
           note: triageNote || '',
+          previousFeishuTableNo: currentTriage?.feishu_table_no || '',
+          nextFeishuTableNo: effectiveFeishuTableNo,
         }),
       ]);
       return { triage };
@@ -886,13 +952,11 @@ router.patch('/records/:recordId', requireTenantAccess, requireTenantWriter, asy
 
     if (!result) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     if (result.archived) return sendRecordArchived(res, [req.params.recordId]);
-    if (result.activeTicket) {
-      return res.status(409).json({
+    if (result.feishuTableNoRequired) {
+      return res.status(400).json({
         ok: false,
-        error: 'content_ticket_active',
-        message: '工单结案前，处理模式须保留为“已转工单”',
-        ticketId: result.activeTicket.id,
-        externalTicketNo: result.activeTicket.external_ticket_no || '',
+        error: 'feishu_table_no_required',
+        message: '请选择负面-飞书表时填写飞书表号',
       });
     }
     return res.json({ ok: true, ...result });
@@ -953,14 +1017,6 @@ router.post('/records/:recordId/issues', requireTenantAccess, requireTenantWrite
         INSERT INTO issue_events (tenant_id, issue_id, event_type, body, actor_type, actor_name, metadata)
         VALUES ($1, $2, 'record_linked', '从舆情收件箱关联内容', 'user', $3, $4::jsonb)
       `, [req.tenantId, issue.id, req.actorName || '', JSON.stringify({ recordId: record.id })]);
-      await tx.execute(`
-        INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, updated_at)
-        VALUES ($1, $2, 'issue_linked', 'high', $3, $4, now())
-        ON CONFLICT (tenant_id, record_id)
-        DO UPDATE SET status = 'issue_linked', priority = 'high', owner_user_id = excluded.owner_user_id,
-          owner_name = excluded.owner_name, updated_at = now()
-      `, [req.tenantId, record.id, req.user?.id || null, req.actorName || '']);
-
       return issue;
     });
 
@@ -993,8 +1049,8 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     }
     const params = [req.tenantId];
     let where = 'WHERE r.tenant_id = $1';
-    if (platform) { params.push(platform); where += ` AND r.platform = $${params.length}`; }
-    if (sentiment) { params.push(sentiment); where += ` AND r.sentiment = $${params.length}`; }
+    where = appendPlatformFilter(where, params, platform);
+    where = appendSentimentFilter(where, params, sentiment);
     const bucket = String(req.query.bucket || '');
     if (queue === 'triage') {
       where += ` AND (${TRIAGE_QUEUE_CONDITION})`;
@@ -1012,6 +1068,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     const keywordFilter = appendKeywordFilter(where, params, keyword);
     where = keywordFilter.where;
     where = appendTicketFilter(where, req.query);
+    where = appendTicketLifecycleFilter(where, req.query);
     const captureKeywords = (Array.isArray(req.query.captureKeyword) ? req.query.captureKeyword : String(req.query.captureKeyword || '').split(','))
       .map(s => String(s).trim()).filter(Boolean);
     if (captureKeywords.length) {
@@ -1054,6 +1111,24 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
             UNION ALL
 
             SELECT
+              al.created_at,
+              al.id::text AS activity_id,
+              to_char(al.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
+                || ' ' || COALESCE(NULLIF(u.name, ''), u.email, NULLIF(al.actor_id, ''), '系统')
+                || ' 状态备注：' || al.metadata->>'note' AS line
+            FROM audit_logs al
+            LEFT JOIN users u ON u.id = al.actor_user_id
+            WHERE al.tenant_id = r.tenant_id
+              AND al.action IN ('record.triage_updated', 'record.triage_batch_updated')
+              AND btrim(COALESCE(al.metadata->>'note', '')) <> ''
+              AND (
+                al.target_id = r.id::text
+                OR COALESCE(al.metadata->'recordIds', '[]'::jsonb) ? r.id::text
+              )
+
+            UNION ALL
+
+            SELECT
               tn.created_at,
               tn.id::text AS activity_id,
               to_char(tn.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
@@ -1077,6 +1152,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
         r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
+        COALESCE(rt.feishu_table_no, '') AS feishu_table_no,
         rt.archived_at,
         COALESCE(rt.archived_by_name, '') AS archived_by_name,
         (ticket.ticket_id IS NOT NULL) AS has_ticket,
@@ -1118,10 +1194,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       negative_comment_count: r.negative_comment_count,
       triage_status: TRIAGE_STATUS_CN[r.triage_status] || r.triage_status || '',
       triage_priority: PRIORITY_CN[r.triage_priority] || r.triage_priority || '',
-      has_ticket: r.has_ticket ? '是' : '否',
-      ticket_number: r.ticket_number || '',
-      ticket_status: TICKET_STATUS_CN[r.ticket_status] || r.ticket_status || '',
-      matched_ticket_number: r.matched_ticket_number || '',
+      feishu_table_no: r.feishu_table_no || '',
       archived_at: fmtTs(r.archived_at),
       archived_by_name: r.archived_by_name || '',
       publish: formatPublishDate(r.publish_time, r.created_at),
@@ -1153,12 +1226,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: '处理记录', key: 'processing_records', width: 50, style: { alignment: { wrapText: true, vertical: 'top' } } },
       { header: 'AI摘要', key: 'ai_summary', width: 40 },
       { header: '负评数', key: 'negative_comment_count', width: 8 },
-      { header: '处理模式', key: 'triage_status', width: 14 },
+      { header: '处理状态', key: 'triage_status', width: 24 },
+      { header: '飞书表号', key: 'feishu_table_no', width: 20 },
       { header: '优先级', key: 'triage_priority', width: 8 },
-      { header: '是否工单', key: 'has_ticket', width: 10 },
-      { header: '工单号码', key: 'ticket_number', width: 20 },
-      { header: '匹配工单号码', key: 'matched_ticket_number', width: 20 },
-      { header: '工单状态', key: 'ticket_status', width: 12 },
       { header: '归档时间', key: 'archived_at', width: 18 },
       { header: '归档人', key: 'archived_by_name', width: 14 },
       { header: '发布时间', key: 'publish', width: 18 },
