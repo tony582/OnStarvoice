@@ -1,6 +1,6 @@
 import ExcelJS from 'exceljs';
 import { queryAll, queryOne } from '../db/init.js';
-import { RELEVANT_RECORD_SQL } from './report-generator.js';
+import { PUBLISHED_RECORD_PERIOD_SQL, RELEVANT_RECORD_SQL } from './report-generator.js';
 
 const SOURCE_SHEET = '内容分诊数据源';
 const COLORS = {
@@ -81,7 +81,7 @@ const CONTENT_COLUMNS = [
   { header: '最近采集', key: 'lastSeenAt', width: 20, date: true },
   { header: '入库时间', key: 'createdAt', width: 20, date: true },
   { header: '归档时间', key: 'archivedAt', width: 20, date: true },
-  { header: '本期新增标记（1=是）', key: 'isNewPeriod', width: 20, numberFormat: '0' },
+  { header: '本期入库标记（1=是）', key: 'isNewPeriod', width: 20, numberFormat: '0' },
   { header: '原文链接', key: 'url', width: 42 },
 ];
 
@@ -310,16 +310,6 @@ async function loadContentSource({ tenantId, periodStart, periodEnd, keywords })
     ? [tenantId, periodStart.toISOString(), periodEnd.toISOString(), keywordList]
     : [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
   const keywordSql = keywordList.length ? ' AND r.keyword = ANY($4::text[])' : '';
-  const observedSql = `(
-    (r.created_at >= $2 AND r.created_at < $3)
-    OR EXISTS (
-      SELECT 1 FROM record_observations period_observation
-      WHERE period_observation.record_id = r.id
-        AND period_observation.tenant_id = r.tenant_id
-        AND period_observation.captured_at >= $2
-        AND period_observation.captured_at < $3
-    )
-  )`;
   const [tenant, rawRows] = await Promise.all([
     queryOne('SELECT name FROM tenants WHERE id = $1', [tenantId]),
     queryAll(`
@@ -336,8 +326,8 @@ async function loadContentSource({ tenantId, periodStart, periodEnd, keywords })
         AND ${RELEVANT_RECORD_SQL}
         AND COALESCE(rt.status, 'unhandled') IN ${HANDLING_STATUS_SQL}
         ${keywordSql}
-        AND ${observedSql}
-      ORDER BY r.last_seen_at DESC, r.id DESC
+        AND ${PUBLISHED_RECORD_PERIOD_SQL}
+      ORDER BY r.published_ts DESC, r.id DESC
     `, params),
   ]);
   const startMs = periodStart.getTime();
@@ -417,7 +407,7 @@ function addMonthlySummary(workbook, { periodLabel, periodStart, periodEnd, gene
 
   sheet.getCell('A3').value = '数据口径';
   sheet.mergeCells('B3:K3');
-  sheet.getCell('B3').value = `本期进入内容分诊的数据；关注关键词：${keywords.length ? keywords.join('、') : '全部'}。月报主体所有统计值均由“${SOURCE_SHEET}”公式计算。`;
+  sheet.getCell('B3').value = `发布时间落在本统计周期内的内容；无法识别发布时间的内容不纳入月报。关注关键词：${keywords.length ? keywords.join('、') : '全部'}。月报主体所有统计值均由“${SOURCE_SHEET}”公式计算。`;
   sheet.getCell('A3').font = { bold: true, color: { argb: COLORS.muted } };
   sheet.getCell('B3').font = { color: { argb: COLORS.muted }, italic: true };
   sheet.getCell('B3').alignment = { wrapText: true, vertical: 'middle' };

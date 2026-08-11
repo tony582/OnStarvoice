@@ -72,6 +72,10 @@ export const RELEVANT_RECORD_SQL = `(
   AND r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'
 )`;
 
+// 月报/数据看板的内容归属统一按平台发布时间判断。published_ts 由原始
+// publish_time 解析并规范为 timestamptz；无法解析的内容不归入任何自然月。
+export const PUBLISHED_RECORD_PERIOD_SQL = 'r.published_ts >= $2 AND r.published_ts < $3';
+
 function escHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -175,7 +179,9 @@ function normalizeRows(rows = [], numberKeys = []) {
   });
 }
 
-export async function getReportStats(tenantId, periodStart, periodEnd, keywords = []) {
+export async function getReportStats(tenantId, periodStart, periodEnd, keywords = [], options = {}) {
+  const timeBasis = options?.timeBasis === 'published' ? 'published' : 'captured';
+  const usesPublishedTime = timeBasis === 'published';
   const baseParams = [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
   // 可选「采集关键词」过滤:仅数据看板按主题/关键词收敛时传入;报告路径不传 → kw 空 → recordFilter 退化、零影响。
   // 口径与内容分诊一致(精确 r.keyword)。⚠ PG 不允许"绑了却没引用"的参数(会报 could not determine type):
@@ -194,11 +200,9 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
       AND ${recordFilter}
   `;
-  const periodWhere = `
-    FROM records r
-    WHERE r.tenant_id = $1
-      AND ${recordFilter}
-      AND (
+  const recordPeriodSql = usesPublishedTime
+    ? PUBLISHED_RECORD_PERIOD_SQL
+    : `(
         (r.created_at >= $2 AND r.created_at < $3)
         OR EXISTS (
           SELECT 1 FROM record_observations ro
@@ -207,7 +211,12 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
             AND ro.captured_at >= $2
             AND ro.captured_at < $3
         )
-      )
+      )`;
+  const periodWhere = `
+    FROM records r
+    WHERE r.tenant_id = $1
+      AND ${recordFilter}
+      AND ${recordPeriodSql}
   `;
   const observedCte = `
     WITH observed AS (
@@ -218,22 +227,32 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
         r.sentiment, r.category, r.intent, r.keyword, r.ai_summary,
         r.likes, r.comments_count, r.collects, r.shares, r.official_response_status,
         r.official_replied, r.negative_comment_count, r.latest_negative_comment_at,
-        r.created_at, r.last_seen_at
+        r.published_ts, r.created_at, r.last_seen_at
       ${periodWhere}
     )
   `;
 
   const total = await scalar(`SELECT COUNT(DISTINCT r.id) as n ${periodWhere}`, params);
-  const newRecords = await scalar(
-    `SELECT COUNT(*) as n FROM records r
-     WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
-       AND ${recordFilter}`,
-    params
-  );
-  const updatedRecords = await scalar(
-    `SELECT COUNT(DISTINCT r.id) as n ${observedWhere} AND r.created_at < $2`,
-    params
-  );
+  const newRecords = usesPublishedTime
+    ? await scalar(
+      `SELECT COUNT(DISTINCT r.id) as n ${periodWhere}
+       AND r.created_at >= $2 AND r.created_at < $3`,
+      params
+    )
+    : await scalar(
+      `SELECT COUNT(*) as n FROM records r
+       WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
+         AND ${recordFilter}`,
+      params
+    );
+  // 发布时间口径下用“本期入库 / 跨期入库”完整拆分本期发布内容，避免旧帖复采
+  // 被误写成本月声量；旧日报/周报仍保留原来的复采统计。
+  const updatedRecords = usesPublishedTime
+    ? Math.max(0, total - newRecords)
+    : await scalar(
+      `SELECT COUNT(DISTINCT r.id) as n ${observedWhere} AND r.created_at < $2`,
+      params
+    );
   const observations = await scalar(
     `SELECT COUNT(*) as n
      FROM record_observations ro
@@ -307,29 +326,68 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     params
   ), ['count', 'negative_count', 'interaction_total']);
 
-  const volumeTrend = normalizeRows(await queryAll(
-    `SELECT
-       to_char(ro.captured_at AT TIME ZONE 'Asia/Shanghai', 'MM-DD') as label,
-       date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') as day_bucket,
-       COUNT(DISTINCT ro.record_id) as total,
-       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'positive') as positive,
-       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'neutral') as neutral,
-       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'negative') as negative,
-       COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = '') as pending
-     FROM record_observations ro
-     JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
-     WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
-       AND ${recordFilter}
-     GROUP BY day_bucket, label
-     ORDER BY day_bucket ASC`,
-    params
-  ), ['total', 'positive', 'neutral', 'negative', 'pending']);
+  const volumeTrendSql = usesPublishedTime
+    ? `SELECT
+         to_char(r.published_ts AT TIME ZONE 'Asia/Shanghai', 'MM-DD') as label,
+         date_trunc('day', r.published_ts AT TIME ZONE 'Asia/Shanghai') as day_bucket,
+         COUNT(*) as total,
+         COUNT(*) FILTER (WHERE r.sentiment = 'positive') as positive,
+         COUNT(*) FILTER (WHERE r.sentiment = 'neutral') as neutral,
+         COUNT(*) FILTER (WHERE r.sentiment = 'negative') as negative,
+         COUNT(*) FILTER (WHERE r.sentiment = '') as pending
+       FROM records r
+       WHERE r.tenant_id = $1
+         AND ${recordFilter}
+         AND ${PUBLISHED_RECORD_PERIOD_SQL}
+       GROUP BY day_bucket, label
+       ORDER BY day_bucket ASC`
+    : `SELECT
+         to_char(ro.captured_at AT TIME ZONE 'Asia/Shanghai', 'MM-DD') as label,
+         date_trunc('day', ro.captured_at AT TIME ZONE 'Asia/Shanghai') as day_bucket,
+         COUNT(DISTINCT ro.record_id) as total,
+         COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'positive') as positive,
+         COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'neutral') as neutral,
+         COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = 'negative') as negative,
+         COUNT(DISTINCT ro.record_id) FILTER (WHERE r.sentiment = '') as pending
+       FROM record_observations ro
+       JOIN records r ON r.id = ro.record_id AND r.tenant_id = ro.tenant_id
+       WHERE ro.tenant_id = $1 AND ro.captured_at >= $2 AND ro.captured_at < $3
+         AND ${recordFilter}
+       GROUP BY day_bucket, label
+       ORDER BY day_bucket ASC`;
+  const volumeTrend = normalizeRows(
+    await queryAll(volumeTrendSql, params),
+    ['total', 'positive', 'neutral', 'negative', 'pending'],
+  );
 
   // 近 14 天滚动趋势(独立于周期长度):日报用来补"近期走势",避免单日只有一个点
   const trailingStart = new Date(periodEnd.getTime() - 14 * 86400000);
   // 用日历骨架(generate_series)左连观测,零声量的天补 total=0,避免"跌到0"的异动从图里消失
-  const trailingTrend = normalizeRows(await queryAll(
-    `WITH days AS (
+  const trailingTrendSql = usesPublishedTime
+    ? `WITH days AS (
+         SELECT generate_series(
+           date_trunc('day', $2::timestamptz AT TIME ZONE 'Asia/Shanghai'),
+           date_trunc('day', $3::timestamptz AT TIME ZONE 'Asia/Shanghai') - interval '1 day',
+           interval '1 day'
+         ) AS day_bucket
+       ), published AS (
+         SELECT date_trunc('day', r.published_ts AT TIME ZONE 'Asia/Shanghai') AS day_bucket,
+           r.id AS record_id, r.sentiment
+         FROM records r
+         WHERE r.tenant_id = $1
+           AND ${recordFilter}
+           AND ${PUBLISHED_RECORD_PERIOD_SQL}
+       )
+       SELECT
+         to_char(d.day_bucket, 'MM-DD') AS label,
+         d.day_bucket,
+         COUNT(DISTINCT p.record_id) AS total,
+         COUNT(DISTINCT p.record_id) FILTER (WHERE p.sentiment = 'negative') AS negative
+       FROM days d
+       LEFT JOIN published p ON p.day_bucket = d.day_bucket
+       GROUP BY d.day_bucket
+       ORDER BY d.day_bucket ASC`
+    : `WITH days AS (
        SELECT generate_series(
          date_trunc('day', $2::timestamptz AT TIME ZONE 'Asia/Shanghai'),
          date_trunc('day', $3::timestamptz AT TIME ZONE 'Asia/Shanghai') - interval '1 day',
@@ -352,9 +410,14 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      FROM days d
      LEFT JOIN obs o ON o.day_bucket = d.day_bucket
      GROUP BY d.day_bucket
-     ORDER BY d.day_bucket ASC`,
-    [tenantId, trailingStart.toISOString(), periodEnd.toISOString(), ...(kw.length ? [kw] : [])]
-  ), ['total', 'negative']);
+     ORDER BY d.day_bucket ASC`;
+  const trailingTrend = normalizeRows(
+    await queryAll(
+      trailingTrendSql,
+      [tenantId, trailingStart.toISOString(), periodEnd.toISOString(), ...(kw.length ? [kw] : [])],
+    ),
+    ['total', 'negative'],
+  );
 
   const mediaDistribution = normalizeRows(await queryAll(
     `${observedCte}
@@ -479,6 +542,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      JOIN records r ON r.id = obs.record_id AND r.tenant_id = $1
      WHERE obs.snapshots > 1
        AND ${recordFilter}
+       ${usesPublishedTime ? `AND ${PUBLISHED_RECORD_PERIOD_SQL}` : ''}
      ORDER BY interaction_growth DESC, obs.last_captured_at DESC
      LIMIT 8`,
     params
@@ -676,6 +740,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
   });
 
   return {
+    timeBasis,
     total,
     newRecords,
     updatedRecords,
@@ -1223,7 +1288,7 @@ async function enrichReportData(type, current, previous, tenantId) {
 
 // 看板按需触发的 AI 研判(独立于看板加载,避免每次打开都跑 LLM)
 export async function generateOpinionInsight({ tenantId, periodStart, periodEnd }) {
-  const stats = await getReportStats(tenantId, periodStart, periodEnd);
+  const stats = await getReportStats(tenantId, periodStart, periodEnd, [], { timeBasis: 'published' });
   return await buildAiOpinionInsight(tenantId, stats);
 }
 
@@ -1231,8 +1296,8 @@ export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd
   const previous = previousPeriod(periodStart, periodEnd);
   // 两个自然周期彼此独立，并行读取可避免月报等待时间简单相加。
   const [currentStats, previousStats] = await Promise.all([
-    getReportStats(tenantId, periodStart, periodEnd, keywords),
-    getReportStats(tenantId, previous.start, previous.end, keywords),
+    getReportStats(tenantId, periodStart, periodEnd, keywords, { timeBasis: 'published' }),
+    getReportStats(tenantId, previous.start, previous.end, keywords, { timeBasis: 'published' }),
   ]);
   return await enrichReportData('dashboard', currentStats, previousStats, tenantId);
 }
@@ -2140,8 +2205,9 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
   `, [tenantId, type, start.toISOString(), end.toISOString()]);
   if (send && existing?.status === 'sent') return existing;
 
-  const currentStats = await getReportStats(tenantId, start, end);
-  const previousStats = await getReportStats(tenantId, previous.start, previous.end);
+  const reportStatsOptions = type === 'monthly' ? { timeBasis: 'published' } : {};
+  const currentStats = await getReportStats(tenantId, start, end, [], reportStatsOptions);
+  const previousStats = await getReportStats(tenantId, previous.start, previous.end, [], reportStatsOptions);
   const stats = await enrichReportData(type, currentStats, previousStats, tenantId);
   const typeLabel = { daily: '日报', weekly: '周报', monthly: '月报' }[type] || '报表';
   const title = `StarVoice 星语舆情${typeLabel}`;
