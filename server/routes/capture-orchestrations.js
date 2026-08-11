@@ -234,6 +234,44 @@ function normalizeCreateRequest(body) {
   }
 }
 
+function normalizeScheduleUpdate(body, orchestrationId) {
+  const expectedRevision = Number(body?.expectedRevision);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+    return {failure: requestError(
+      'invalid_expected_revision',
+      'expectedRevision 必须是大于 0 的计划版本',
+    )};
+  }
+  const rawDistributionMode = text(body?.distributionMode, 40).toLowerCase();
+  if (!['fixed_batch', 'elastic_pool'].includes(rawDistributionMode)) {
+    return {failure: requestError(
+      'invalid_distribution_mode',
+      '请选择固定分配或弹性节点池',
+    )};
+  }
+  if (!text(body?.title, 240)) {
+    return {failure: requestError(
+      'title_required',
+      '请填写任务名称',
+    )};
+  }
+  const normalizedAgents = normalizedAgentIds(body?.agentIds);
+  if (normalizedAgents.failure) return normalizedAgents;
+  const normalized = normalizeCreateRequest({
+    ...safeJson(body),
+    requestKey: orchestrationId,
+    executionMode: 'unattended_plan',
+    distributionMode: rawDistributionMode,
+    agentIds: normalizedAgents.agentIds,
+  });
+  if (normalized.failure) return normalized;
+  return {
+    expectedRevision,
+    request: normalized.request,
+    agentIds: normalizedAgents.agentIds,
+  };
+}
+
 async function appendEvent(tx, {
   tenantId,
   taskId,
@@ -1975,6 +2013,466 @@ router.post(
           : '整个任务已停止；已完成结果保留，未完成项不再自动接力',
       });
     } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.patch(
+  '/orchestrations/:id/schedule',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const orchestrationId = orchestrationRouteId(req, res);
+      if (!orchestrationId) return;
+      const normalized = normalizeScheduleUpdate(req.body, orchestrationId);
+      if (normalized.failure) return sendRequestError(res, normalized.failure);
+      const result = await withTransaction(async tx => {
+        const parentSnapshot = await tx.queryOne(
+          parentSelect(),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parentSnapshot) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        if (
+          !parentSnapshot.orchestration_schedule_id ||
+          parentSnapshot.metadata?.orchestrationTemplate !== true
+        ) {
+          return {failure: requestError(
+            'orchestration_schedule_not_found',
+            '当前编排任务不是可编辑的无人值守计划',
+            409,
+          )};
+        }
+
+        // Match the scheduler and pause/resume lock order. A due occurrence
+        // either materializes completely before this edit, or waits and sees
+        // the new template; an already-created run is never rewritten.
+        const schedule = await loadOrchestrationSchedule(
+          tx,
+          req.tenantId,
+          parentSnapshot.orchestration_schedule_id,
+          {lock: true},
+        );
+        if (!schedule) {
+          return {failure: requestError(
+            'orchestration_schedule_not_found',
+            '无人值守计划不存在',
+            404,
+          )};
+        }
+        const parent = await tx.queryOne(
+          parentSelect({lock: true}),
+          [orchestrationId, req.tenantId],
+        );
+        if (
+          !parent ||
+          String(parent.orchestration_schedule_id || '') !== String(schedule.id)
+        ) {
+          return {failure: requestError(
+            'orchestration_schedule_conflict',
+            '计划状态刚刚发生变化，请刷新后重试',
+            409,
+          )};
+        }
+        if (!['active', 'paused', 'completed'].includes(schedule.status)) {
+          return {failure: requestError(
+            'orchestration_schedule_not_editable',
+            '当前无人值守计划不能编辑',
+            409,
+          )};
+        }
+        const currentRevision = Number(schedule.revision || 0);
+        if (currentRevision !== normalized.expectedRevision) {
+          return {failure: requestError(
+            'schedule_revision_conflict',
+            '计划已被更新，请刷新后重新编辑',
+            409,
+            {currentRevision},
+          )};
+        }
+
+        const {request, agentIds} = normalized;
+        const planSnapshot = request.taskInput.planSnapshot;
+        const distributionMode = request.distributionMode;
+        const nextRunAt = computeNextOrchestrationRunAt(planSnapshot, {
+          after: new Date(),
+          seed: schedule.id,
+        });
+        if (!nextRunAt) {
+          return {failure: requestError(
+            'schedule_has_no_future_run',
+            '无人值守计划没有未来可执行时间，请调整日期或开始时间',
+            400,
+          )};
+        }
+        const compatible = await loadCompatibleAgents(
+          tx,
+          req.tenantId,
+          agentIds,
+          request.platform,
+          planSnapshot,
+          {lock: true},
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+
+        const nextScheduleRevision = currentRevision + 1;
+        const allocation = allocateKeywordWorkItems({
+          keywords: request.keywords,
+          agentIds,
+          revision: nextScheduleRevision,
+        });
+        if (
+          distributionMode === 'fixed_batch' &&
+          allocation.groups.some(group => group.keywords.length > 30)
+        ) {
+          return {failure: requestError(
+            'insufficient_agents',
+            '固定分配时，所选节点不足以承载全部关键词，请增加执行节点',
+            409,
+            {minimumAgentCount: Math.ceil(request.keywords.length / 30)},
+          )};
+        }
+
+        const existingItems = await listParentItems(
+          tx,
+          req.tenantId,
+          parent.id,
+          {lock: true},
+        );
+        const usedTemplateItem = existingItems.find(item =>
+          Number(item.attempt_count || 0) > 0 ||
+          Boolean(item.execution_task_id) ||
+          Boolean(item.dispatched_at) ||
+          Boolean(item.started_at) ||
+          Boolean(item.finished_at) ||
+          !['pending', 'assigned'].includes(item.status)
+        );
+        const templateAttempt = await tx.queryOne(`
+          SELECT attempt.id
+          FROM capture_task_item_attempts attempt
+          WHERE attempt.tenant_id = $1 AND attempt.parent_task_id = $2
+          LIMIT 1
+        `, [req.tenantId, parent.id]);
+        if (usedTemplateItem || templateAttempt) {
+          return {failure: requestError(
+            'orchestration_template_items_not_editable',
+            '计划模板的工作项已产生执行记录，不能直接改写，请联系管理员检查',
+            409,
+          )};
+        }
+
+        const previousAgentRows = await tx.queryAll(`
+          SELECT agent_id
+          FROM capture_orchestration_schedule_agents
+          WHERE tenant_id = $1 AND schedule_id = $2
+          ORDER BY ordinal, agent_id
+          FOR UPDATE
+        `, [req.tenantId, schedule.id]);
+        const previousAgentIds = previousAgentRows.map(row => String(row.agent_id));
+        const assignmentByKeyword = new Map(
+          allocation.items.map(item => [item.keyword, item.assignedAgentId]),
+        );
+        const existingByKeyword = new Map(
+          existingItems.map(item => [String(item.keyword || '').trim(), item]),
+        );
+        const retainedItemIds = new Set();
+        for (let index = 0; index < request.keywords.length; index += 1) {
+          const keyword = request.keywords[index];
+          const existingItem = existingByKeyword.get(keyword);
+          const assignedAgentId = distributionMode === 'fixed_batch'
+            ? assignmentByKeyword.get(keyword) || null
+            : null;
+          const itemStatus = assignedAgentId ? 'assigned' : 'pending';
+          const itemMetadata = JSON.stringify({keyword, ordinal: index});
+          if (existingItem) {
+            retainedItemIds.add(String(existingItem.id));
+            await tx.execute(`
+              UPDATE capture_task_items
+              SET item_key = $1,
+                ordinal = $2,
+                keyword = $3,
+                platform = $4,
+                status = $5,
+                assigned_agent_id = $6::uuid,
+                execution_task_id = NULL,
+                assignment_revision = $7,
+                request_hash = '',
+                error = '{}'::jsonb,
+                metadata = $8::jsonb,
+                assigned_at = CASE WHEN $6::uuid IS NULL THEN NULL ELSE now() END,
+                dispatched_at = NULL,
+                started_at = NULL,
+                finished_at = NULL,
+                updated_at = now()
+              WHERE id = $9 AND tenant_id = $10 AND task_id = $11
+            `, [
+              keywordItemKey(keyword, index),
+              index,
+              keyword,
+              request.platform,
+              itemStatus,
+              assignedAgentId,
+              nextScheduleRevision,
+              itemMetadata,
+              existingItem.id,
+              req.tenantId,
+              parent.id,
+            ]);
+          } else {
+            await tx.execute(`
+              INSERT INTO capture_task_items (
+                id, tenant_id, task_id, item_key, ordinal, keyword,
+                platform, item_type, status, assigned_agent_id,
+                assignment_revision, metadata, assigned_at
+              ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, 'keyword', $8, $9::uuid,
+                $10, $11::jsonb,
+                CASE WHEN $9::uuid IS NULL THEN NULL ELSE now() END
+              )
+            `, [
+              crypto.randomUUID(),
+              req.tenantId,
+              parent.id,
+              keywordItemKey(keyword, index),
+              index,
+              keyword,
+              request.platform,
+              itemStatus,
+              assignedAgentId,
+              nextScheduleRevision,
+              itemMetadata,
+            ]);
+          }
+        }
+        const removedItemIds = existingItems
+          .map(item => String(item.id))
+          .filter(itemId => !retainedItemIds.has(itemId));
+        if (removedItemIds.length > 0) {
+          await tx.execute(`
+            DELETE FROM capture_task_items
+            WHERE tenant_id = $1 AND task_id = $2
+              AND id = ANY($3::uuid[])
+          `, [req.tenantId, parent.id, removedItemIds]);
+        }
+
+        await tx.execute(`
+          DELETE FROM capture_orchestration_schedule_agents
+          WHERE tenant_id = $1 AND schedule_id = $2
+        `, [req.tenantId, schedule.id]);
+        for (let index = 0; index < agentIds.length; index += 1) {
+          await tx.execute(`
+            INSERT INTO capture_orchestration_schedule_agents (
+              schedule_id, tenant_id, agent_id, ordinal
+            ) VALUES ($1, $2, $3, $4)
+          `, [schedule.id, req.tenantId, agentIds[index], index]);
+        }
+
+        const scheduleMode = planSnapshot.mode === 'custom_dates'
+          ? 'custom_dates'
+          : 'daily';
+        const customDates = scheduleMode === 'custom_dates'
+          ? String(planSnapshot.customDates || '')
+            .split(/\r?\n/gu)
+            .map(value => value.trim())
+            .filter(Boolean)
+          : [];
+        const nextStatus = schedule.status === 'completed'
+          ? 'active'
+          : schedule.status;
+        const updatedSchedule = await tx.queryOne(`
+          UPDATE capture_orchestration_schedules
+          SET title = $1,
+            platform = $2,
+            status = $3,
+            schedule_mode = $4,
+            start_time = $5,
+            random_offset_min = $6,
+            custom_dates = $7::date[],
+            late_start_grace_min = $8,
+            distribution_mode = $9,
+            plan_snapshot = $10::jsonb,
+            next_run_at = $11,
+            last_error = '{}'::jsonb,
+            revision = revision + 1,
+            updated_at = now()
+          WHERE id = $12 AND tenant_id = $13 AND revision = $14
+          RETURNING id, revision, status
+        `, [
+          request.title,
+          request.platform,
+          nextStatus,
+          scheduleMode,
+          planSnapshot.startTime || '09:00',
+          Number(planSnapshot.randomOffsetMin || 0),
+          customDates,
+          Number(planSnapshot.lateStartGraceMin || 360),
+          distributionMode,
+          JSON.stringify(planSnapshot),
+          nextRunAt,
+          schedule.id,
+          req.tenantId,
+          currentRevision,
+        ]);
+        if (!updatedSchedule) {
+          const conflict = new Error('orchestration_schedule_revision_conflict');
+          conflict.code = 'orchestration_schedule_revision_conflict';
+          throw conflict;
+        }
+
+        const nextMetadata = {
+          ...safeJson(parent.metadata),
+          draft: undefined,
+          executionMode: 'unattended_plan',
+          allocationMode: 'balanced',
+          distributionMode,
+          eligibleAgentIds: agentIds,
+          claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
+          planSnapshot,
+          scheduleId: schedule.id,
+          scheduleStatus: nextStatus,
+          scheduleRevision: nextScheduleRevision,
+          nextRunAt,
+          orchestrationTemplate: true,
+          updatedByUserId: req.user?.id || '',
+          updatedByName: text(req.actorName, 240),
+          planUpdatedAt: new Date().toISOString(),
+        };
+        delete nextMetadata.draft;
+        const parentUpdate = await tx.queryOne(`
+          UPDATE capture_tasks
+          SET title = $1,
+            platform = $2,
+            orchestration_revision = orchestration_revision + 1,
+            schedule_revision = $3,
+            progress = $4::jsonb,
+            counts = $5::jsonb,
+            metadata = $6::jsonb,
+            message = $7,
+            updated_at = now(),
+            source_updated_at = now()
+          WHERE id = $8 AND tenant_id = $9
+            AND task_type = 'capture_orchestration'
+            AND orchestration_schedule_id = $10
+          RETURNING id, title, platform, status, orchestration_revision,
+            schedule_revision
+        `, [
+          request.title,
+          request.platform,
+          nextScheduleRevision,
+          JSON.stringify({
+            current: 0,
+            total: request.keywords.length,
+            phase: nextStatus === 'paused' ? 'paused' : 'scheduled',
+            nextRunAt,
+          }),
+          JSON.stringify({
+            total: request.keywords.length,
+            assigned: distributionMode === 'fixed_batch'
+              ? request.keywords.length
+              : 0,
+            processed: 0,
+            success: 0,
+            failed: 0,
+            skipped: 0,
+          }),
+          JSON.stringify(nextMetadata),
+          nextStatus === 'paused'
+            ? '无人值守计划已保存，仍保持暂停'
+            : distributionMode === 'elastic_pool'
+              ? '无人值守计划已更新，下一轮将使用弹性节点池'
+              : '无人值守计划已更新，下一轮将使用固定分配',
+          parent.id,
+          req.tenantId,
+          schedule.id,
+        ]);
+        if (!parentUpdate) {
+          const conflict = new Error('orchestration_schedule_parent_conflict');
+          conflict.code = 'orchestration_schedule_parent_conflict';
+          throw conflict;
+        }
+
+        await appendEvent(tx, {
+          tenantId: req.tenantId,
+          taskId: parent.id,
+          eventType: 'orchestration_schedule_updated',
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          status: parentUpdate.status,
+          message: '无人值守计划已编辑；已生成的运行批次保持不变',
+          payload: {
+            scheduleId: schedule.id,
+            previousRevision: currentRevision,
+            revision: nextScheduleRevision,
+            previous: {
+              title: schedule.title,
+              platform: schedule.platform,
+              scheduleMode: schedule.schedule_mode,
+              startTime: schedule.start_time,
+              randomOffsetMin: schedule.random_offset_min,
+              distributionMode: schedule.distribution_mode,
+              keywordCount: existingItems.length,
+              agentIds: previousAgentIds,
+            },
+            next: {
+              title: request.title,
+              platform: request.platform,
+              scheduleMode,
+              startTime: planSnapshot.startTime,
+              randomOffsetMin: planSnapshot.randomOffsetMin,
+              distributionMode,
+              keywordCount: request.keywords.length,
+              agentIds,
+              nextRunAt,
+            },
+          },
+        });
+        const responseSchedule = await loadOrchestrationSchedule(
+          tx,
+          req.tenantId,
+          schedule.id,
+        );
+        return {
+          schedule: responseSchedule,
+          parent: parentUpdate,
+          itemCount: request.keywords.length,
+          agentIds,
+          reactivated: schedule.status === 'completed',
+        };
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      return res.json({
+        ok: true,
+        orchestrationId: result.parent.id,
+        revision: Number(result.parent.orchestration_revision || 0),
+        schedule: result.schedule,
+        itemCount: result.itemCount,
+        agentIds: result.agentIds,
+        message: result.reactivated
+          ? '计划已保存并重新启用；修改从下一次运行开始生效'
+          : result.schedule.status === 'paused'
+            ? '计划已保存并保持暂停；重新启用后按新设置运行'
+            : '计划已保存；修改从下一次运行开始生效',
+      });
+    } catch (error) {
+      if (
+        error?.code === 'orchestration_schedule_revision_conflict' ||
+        error?.code === 'orchestration_schedule_parent_conflict'
+      ) {
+        return sendRequestError(res, requestError(
+          'schedule_update_conflict',
+          '计划编辑时发生并发更新，请刷新后重试',
+          409,
+        ));
+      }
       return next(error);
     }
   },

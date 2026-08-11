@@ -8,6 +8,7 @@ import {
   ClipboardList,
   Loader2,
   Pause,
+  Pencil,
   Play,
   Send,
   ShieldAlert,
@@ -264,6 +265,7 @@ export function OrchestrationDetailWorkspace({
   writable = false,
   availableAgents = [],
   onClose,
+  onEditPlan,
   onChanged,
   className,
   refreshKey,
@@ -997,7 +999,7 @@ export function OrchestrationDetailWorkspace({
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
       <header className="border-b border-border/70 px-4 py-4 sm:px-5">
-        <div className="flex items-start gap-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${scheduleTemplate && schedule?.status === 'active' ? 'border-status-green/25 bg-status-green/8 text-status-green' : statusTone(orchestration.status)}`}>
@@ -1019,52 +1021,64 @@ export function OrchestrationDetailWorkspace({
             <h2 id="orchestration-detail-title" className="mt-2.5 truncate text-lg font-bold text-foreground">{orchestration.title || '未命名编排任务'}</h2>
             <p className="mt-1 text-xs text-muted-foreground">创建于 {formatTime(orchestration.created_at)} · 版本 {orchestration.revision ?? orchestration.orchestration_revision ?? '—'}</p>
           </div>
-          {scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
-            <>
-              {['active', 'completed'].includes(schedule.status) && (
+          <div className="flex w-full flex-wrap items-center justify-start gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
+            {scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
+              <>
                 <Button
+                  variant="outline"
                   size="sm"
-                  onClick={() => void runScheduleNow()}
-                  disabled={!writable || scheduleRunningNow || scheduleUpdating}
-                  title={!writable ? '当前账号为只读权限' : '立即生成并下发一轮无人值守任务'}
+                  onClick={() => onEditPlan?.(detail)}
+                  disabled={!writable || scheduleRunningNow || scheduleUpdating || !onEditPlan}
+                  title={!writable ? '当前账号为只读权限' : '编辑同一个计划；修改只影响后续运行'}
                 >
-                  {scheduleRunningNow
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : <Play className="h-4 w-4" />}
-                  立即运行
+                  <Pencil className="h-4 w-4" />
+                  编辑计划
                 </Button>
-              )}
-              {schedule.status !== 'completed' && (
-                <Button
-                  variant={schedule.status === 'active' ? 'outline' : 'default'}
-                  size="sm"
-                  onClick={() => void updateScheduleStatus()}
-                  disabled={!writable || scheduleUpdating || scheduleRunningNow}
-                  title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
-                >
-                  {scheduleUpdating
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : schedule.status === 'active'
-                      ? <Pause className="h-4 w-4" />
+                {['active', 'completed'].includes(schedule.status) && (
+                  <Button
+                    size="sm"
+                    onClick={() => void runScheduleNow()}
+                    disabled={!writable || scheduleRunningNow || scheduleUpdating}
+                    title={!writable ? '当前账号为只读权限' : '立即生成并下发一轮无人值守任务'}
+                  >
+                    {scheduleRunningNow
+                      ? <Loader2 className="h-4 w-4 animate-spin" />
                       : <Play className="h-4 w-4" />}
-                  {schedule.status === 'active' ? '暂停计划' : '重新启用'}
-                </Button>
-              )}
-            </>
-          ) : (
-            <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
-              disabled={!writable || stopping || !canStopOrchestration}
-              title={!writable ? '当前账号为只读权限' : !canStopOrchestration ? '当前任务已经结束或不能停止' : '停止整个父任务、自动接力和仍可控制的 Agent 子任务'}>
-              {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
-              停止全部
+                    立即运行
+                  </Button>
+                )}
+                {schedule.status !== 'completed' && (
+                  <Button
+                    variant={schedule.status === 'active' ? 'outline' : 'default'}
+                    size="sm"
+                    onClick={() => void updateScheduleStatus()}
+                    disabled={!writable || scheduleUpdating || scheduleRunningNow}
+                    title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
+                  >
+                    {scheduleUpdating
+                      ? <Loader2 className="h-4 w-4 animate-spin" />
+                      : schedule.status === 'active'
+                        ? <Pause className="h-4 w-4" />
+                        : <Play className="h-4 w-4" />}
+                    {schedule.status === 'active' ? '暂停计划' : '重新启用'}
+                  </Button>
+                )}
+              </>
+            ) : (
+              <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
+                disabled={!writable || stopping || !canStopOrchestration}
+                title={!writable ? '当前账号为只读权限' : !canStopOrchestration ? '当前任务已经结束或不能停止' : '停止整个父任务、自动接力和仍可控制的 Agent 子任务'}>
+                {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
+                停止全部
+              </Button>
+            )}
+            <Button variant="outline" size="icon" onClick={() => void load(true)} disabled={refreshing} aria-label="刷新编排任务详情">
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
             </Button>
-          )}
-          <Button variant="outline" size="icon" onClick={() => void load(true)} disabled={refreshing} aria-label="刷新编排任务详情">
-            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-          </Button>
-          {onClose && (
-            <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭编排任务详情" data-dialog-initial-focus><X className="h-5 w-5" /></Button>
-          )}
+            {onClose && (
+              <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭编排任务详情" data-dialog-initial-focus><X className="h-5 w-5" /></Button>
+            )}
+          </div>
         </div>
         {error && <p role="alert" className="mt-3 text-xs text-status-red">{error}</p>}
         {actionError && <p role="alert" className="mt-3 text-xs text-status-red">{actionError}</p>}

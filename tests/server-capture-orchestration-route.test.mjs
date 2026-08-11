@@ -37,6 +37,7 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     "'/orchestrations/:id/allocation-preview'",
     "'/orchestrations/:id/dispatch'",
     "'/orchestrations/:id/stop'",
+    "'/orchestrations/:id/schedule'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
     "'/orchestrations/:id/schedule/run-now'",
@@ -242,6 +243,38 @@ test('operator stop atomically settles the parent and disables automatic relay',
   assert.match(stop, /last_run_status = 'canceled'/u);
   assert.match(stop, /eventType: 'orchestration_stopped'/u);
   assert.match(stop, /executionTaskIds/u);
+});
+
+test('schedule edit updates the same template with revision protection and leaves generated runs untouched', () => {
+  const edit = section(
+    "router.patch(\n  '/orchestrations/:id/schedule'",
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+  );
+  const scheduleLock = edit.indexOf('loadOrchestrationSchedule(');
+  const parentLock = edit.indexOf('parentSelect({lock: true})', scheduleLock);
+  const agentLock = edit.indexOf('loadCompatibleAgents(', parentLock);
+  const itemLock = edit.indexOf('listParentItems(', agentLock);
+  assert.ok(scheduleLock >= 0);
+  assert.ok(parentLock > scheduleLock);
+  assert.ok(agentLock > parentLock);
+  assert.ok(itemLock > agentLock);
+  assert.match(edit, /currentRevision !== normalized\.expectedRevision/u);
+  assert.match(edit, /'schedule_revision_conflict'/u);
+  assert.match(edit, /computeNextOrchestrationRunAt\(planSnapshot/u);
+  assert.match(edit, /WHERE id = \$12 AND tenant_id = \$13 AND revision = \$14/u);
+  assert.match(edit, /revision = revision \+ 1/u);
+  assert.match(edit, /orchestration_revision = orchestration_revision \+ 1/u);
+  assert.match(edit, /UPDATE capture_orchestration_schedules/u);
+  assert.doesNotMatch(edit, /INSERT INTO capture_orchestration_schedules/u);
+  assert.doesNotMatch(edit, /DELETE FROM capture_orchestration_schedules/u);
+  assert.doesNotMatch(edit, /DELETE FROM capture_tasks/u);
+  assert.match(edit, /capture_task_item_attempts/u);
+  assert.match(edit, /orchestration_template_items_not_editable/u);
+  assert.match(edit, /distributionMode === 'fixed_batch'/u);
+  assert.match(edit, /assigned_agent_id = \$6::uuid/u);
+  assert.match(edit, /eventType: 'orchestration_schedule_updated'/u);
+  assert.match(edit, /已生成的运行批次保持不变/u);
+  assert.match(edit, /修改从下一次运行开始生效/u);
 });
 
 test('schedule pause and resume are tenant scoped, idempotent, and never backfill missed runs', () => {

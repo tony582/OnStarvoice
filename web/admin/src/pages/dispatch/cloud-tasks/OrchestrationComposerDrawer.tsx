@@ -30,10 +30,12 @@ import type {
   OrchestrationItemRecord,
   OrchestrationPlatform,
   OrchestrationRecord,
+  OrchestrationScheduleUpdateResult,
 } from './types'
 
 type ComposerStage = 'define' | 'allocate' | 'dispatched'
 type PlanMode = 'daily' | 'custom_dates'
+type DistributionMode = 'fixed_batch' | 'elastic_pool'
 
 type CreateResponse = {
   ok: true
@@ -155,6 +157,18 @@ function safeCount(value: unknown) {
   return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0
 }
 
+function safeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function stringList(value: unknown) {
+  return Array.isArray(value)
+    ? value.map(item => String(item || '').trim()).filter(Boolean)
+    : []
+}
+
 function agentPlatforms(agent: OrchestrationCloudAgent) {
   const supportedPlatforms = Array.isArray(agent.capabilities?.supportedPlatforms)
     ? agent.capabilities.supportedPlatforms.map(value => String(value || '').trim()).filter(Boolean)
@@ -225,6 +239,63 @@ function buildAssignments(createResult: CreateResponse, preview: AllocationPrevi
     }))
 }
 
+function buildEditPreview({
+  orchestrationId,
+  revision,
+  platform,
+  keywords,
+  selectedAgents,
+  existingItems,
+}: {
+  orchestrationId: string
+  revision: number
+  platform: string
+  keywords: string[]
+  selectedAgents: OrchestrationCloudAgent[]
+  existingItems: OrchestrationItemRecord[]
+}) {
+  const existingItemIdByKeyword = new Map(
+    existingItems.map(item => [keywordForItem(item), item.id]),
+  )
+  const baseSize = Math.floor(keywords.length / selectedAgents.length)
+  const remainder = keywords.length % selectedAgents.length
+  const groups: AllocationPreviewGroup[] = []
+  const assignments: EditableAssignment[] = []
+  let cursor = 0
+  selectedAgents.forEach((agent, agentIndex) => {
+    const size = baseSize + (agentIndex < remainder ? 1 : 0)
+    if (size === 0) return
+    const groupKeywords = keywords.slice(cursor, cursor + size)
+    const itemIds = groupKeywords.map((keyword, offset) =>
+      existingItemIdByKeyword.get(keyword) || `edit-${cursor + offset}`,
+    )
+    groups.push({
+      agentId: agent.id,
+      agent,
+      itemIds,
+      keywords: groupKeywords,
+      itemCount: groupKeywords.length,
+    })
+    groupKeywords.forEach((keyword, offset) => assignments.push({
+      itemId: itemIds[offset],
+      keyword,
+      agentId: agent.id,
+    }))
+    cursor += size
+  })
+  return {
+    preview: {
+      ok: true as const,
+      orchestrationId,
+      revision,
+      platform,
+      itemCount: keywords.length,
+      groups,
+    },
+    assignments,
+  }
+}
+
 function StepPill({ active, complete, children }: { active: boolean; complete: boolean; children: ReactNode }) {
   return (
     <div className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg border px-3 py-2 ${active ? 'border-primary/35 bg-primary/8' : complete ? 'border-status-green/25 bg-status-green/5' : 'border-border/70 bg-muted/30'}`}>
@@ -244,10 +315,13 @@ export function OrchestrationComposerDrawer({
   lockExecutionMode = false,
   minimumAgentCount = 1,
   initialAgentIds,
+  editingPlan,
   onClose,
   onDispatched,
+  onPlanUpdated,
   onChanged,
 }: OrchestrationComposerDrawerProps) {
+  const editMode = Boolean(editingPlan)
   const [stage, setStage] = useState<ComposerStage>('define')
   const [title, setTitle] = useState('')
   const [platform, setPlatform] = useState<OrchestrationPlatform>('xiaohongshu')
@@ -268,7 +342,7 @@ export function OrchestrationComposerDrawer({
   const [commentLimit, setCommentLimit] = useState(50)
   const [skipCaptured, setSkipCaptured] = useState(true)
   const allowIdleAgentHandoff = true
-  const distributionMode = 'elastic_pool' as const
+  const [distributionMode, setDistributionMode] = useState<DistributionMode>('elastic_pool')
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
   const [selectionNotice, setSelectionNotice] = useState('')
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null)
@@ -280,6 +354,7 @@ export function OrchestrationComposerDrawer({
   const [pendingDraftCount, setPendingDraftCount] = useState(0)
   const [error, setError] = useState('')
   const [dispatchResult, setDispatchResult] = useState<OrchestrationDispatchResult | null>(null)
+  const [updateResult, setUpdateResult] = useState<OrchestrationScheduleUpdateResult | null>(null)
   const requestKeyRef = useRef(randomRequestKey())
   const previouslyOpenRef = useRef(false)
   const submittingRef = useRef(false)
@@ -313,37 +388,73 @@ export function OrchestrationComposerDrawer({
   const requiredAgentCount = Number.isFinite(minimumAgentCount)
     ? Math.max(1, Math.floor(minimumAgentCount))
     : 1
-  const dispatchedSchedule = dispatchResult?.schedule
+  const dispatchedSchedule = updateResult?.schedule || dispatchResult?.schedule
   const nextScheduleRunAt = dispatchedSchedule?.next_run_at || dispatchedSchedule?.nextRunAt || null
 
   const reset = useCallback(() => {
-    setStage('define')
-    setTitle('')
-    setPlatform('xiaohongshu')
-    setExecutionMode(initialExecutionMode)
-    setPlanMode('daily')
-    setStartTime('09:00')
-    setRandomOffsetMin(20)
-    setCustomDates('')
-    setKeywordText('')
-    setKeywordMaxDetectedItems(50)
-    setSort('comprehensive')
-    setPublishTime('all')
-    setEnhancementEnabled(false)
-    setAutoSync(false)
-    setAiPrefilter(false)
-    setBloggerMetrics(false)
-    setIncludeComments(false)
-    setCommentLimit(50)
-    setSkipCaptured(true)
-    const compatibleInitialAgentIds = (initialAgentIds ?? []).filter(agentId => {
+    const schedule = editingPlan?.schedule
+    const metadata = safeRecord(editingPlan?.orchestration.metadata)
+    const planSnapshot = {
+      ...safeRecord(metadata.planSnapshot),
+      ...safeRecord(schedule?.plan_snapshot),
+    }
+    const searchFilters = safeRecord(planSnapshot.searchFilters)
+    const enhancementSettings = safeRecord(planSnapshot.captureSettings)
+    const editingPlatform = editingPlan?.orchestration.platform === 'douyin'
+      ? 'douyin'
+      : 'xiaohongshu'
+    const editingEnhancementEnabled = enhancementSettings.autoDetailCaptureAfterListCapture === true
+    const scheduleDates = planSnapshot.customDates ?? schedule?.custom_dates ?? ''
+    const editingAgentIds = stringList(metadata.eligibleAgentIds).length > 0
+      ? stringList(metadata.eligibleAgentIds)
+      : (editingPlan?.agents || []).map(agent => agent.id)
+    const candidateAgentIds = editMode ? editingAgentIds : (initialAgentIds ?? [])
+    const targetPlatform = editMode ? editingPlatform : 'xiaohongshu'
+    const targetEnhancementEnabled = editMode ? editingEnhancementEnabled : false
+    const compatibleInitialAgentIds = candidateAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
-      return agent && !agentBlockReason(agent, 'xiaohongshu', false)
+      return agent && !agentBlockReason(agent, targetPlatform, targetEnhancementEnabled)
     })
+
+    setStage('define')
+    setTitle(editingPlan?.orchestration.title || '')
+    setPlatform(targetPlatform)
+    setExecutionMode(editMode ? 'unattended_plan' : initialExecutionMode)
+    setPlanMode(
+      (schedule?.schedule_mode || planSnapshot.mode) === 'custom_dates'
+        ? 'custom_dates'
+        : 'daily',
+    )
+    setStartTime(String(schedule?.start_time || planSnapshot.startTime || '09:00').slice(0, 5))
+    setRandomOffsetMin(safeCount(schedule?.random_offset_min ?? planSnapshot.randomOffsetMin ?? 20))
+    setCustomDates(Array.isArray(scheduleDates) ? scheduleDates.join('\n') : String(scheduleDates || ''))
+    setKeywordText(editingPlan
+      ? [...editingPlan.items]
+        .sort((left, right) => safeCount(left.ordinal) - safeCount(right.ordinal))
+        .map(keywordForItem)
+        .join('\n')
+      : '')
+    setKeywordMaxDetectedItems(safeCount(planSnapshot.keywordMaxDetectedItems) || 50)
+    setSort(String(searchFilters.sort || 'comprehensive'))
+    setPublishTime(String(searchFilters.publishTime || 'all'))
+    setEnhancementEnabled(editingEnhancementEnabled)
+    setAutoSync(enhancementSettings.autoSyncAfterDetailCapture === true)
+    setAiPrefilter(enhancementSettings.enableAiRelevancePrefilter === true)
+    setBloggerMetrics(enhancementSettings.includeBloggerMetricsOnDetailCapture === true)
+    setIncludeComments(enhancementSettings.includeCommentsOnDetailCapture === true)
+    setCommentLimit(safeCount(enhancementSettings.detailCommentsMaxDetectedItems) || 50)
+    setSkipCaptured(enhancementSettings.skipAlreadyCapturedOnDetailCapture !== false)
+    setDistributionMode(
+      (schedule?.distribution_mode || metadata.distributionMode) === 'fixed_batch'
+        ? 'fixed_batch'
+        : 'elastic_pool',
+    )
     setSelectedAgentIds(compatibleInitialAgentIds)
     setSelectionNotice(
-      compatibleInitialAgentIds.length < (initialAgentIds?.length ?? 0)
-        ? '已移除与默认小红书平台不兼容的预选节点，请重新确认 Agent 小队。'
+      compatibleInitialAgentIds.length < candidateAgentIds.length
+        ? editMode
+          ? '原计划中有节点当前不可用或不兼容，已移除；保存前请重新确认 Agent 小队。'
+          : '已移除与默认小红书平台不兼容的预选节点，请重新确认 Agent 小队。'
         : '',
     )
     setCreateResult(null)
@@ -355,8 +466,9 @@ export function OrchestrationComposerDrawer({
     setPendingDraftCount(draftIdsRef.current.size)
     setError('')
     setDispatchResult(null)
+    setUpdateResult(null)
     requestKeyRef.current = randomRequestKey()
-  }, [agents, initialAgentIds, initialExecutionMode])
+  }, [agents, editMode, editingPlan, initialAgentIds, initialExecutionMode])
 
   useEffect(() => {
     if (open && !previouslyOpenRef.current) reset()
@@ -534,7 +646,7 @@ export function OrchestrationComposerDrawer({
   const generatePreview = async () => {
     setError('')
     if (!writable) {
-      setError('当前账号为只读权限，不能创建编排任务。')
+      setError(editMode ? '当前账号为只读权限，不能编辑计划。' : '当前账号为只读权限，不能创建编排任务。')
       return
     }
     if (!title.trim()) {
@@ -580,6 +692,32 @@ export function OrchestrationComposerDrawer({
     }
     if (validSelectedAgentIds.length < requiredAgentCount) {
       setError(`请至少选择 ${requiredAgentCount} 个与当前平台和采集设置兼容的 Agent。`)
+      return
+    }
+    if (
+      distributionMode === 'fixed_batch' &&
+      validSelectedAgentIds.length < Math.ceil(keywords.length / 30)
+    ) {
+      setError(`固定分配时每个 Agent 最多接收 30 个关键词，请至少选择 ${Math.ceil(keywords.length / 30)} 个兼容 Agent。`)
+      return
+    }
+    if (editMode) {
+      const scheduleRevision = Number(editingPlan?.schedule?.revision || 0)
+      if (!editingPlan?.schedule || scheduleRevision < 1) {
+        setError('计划版本缺失，请关闭后刷新详情再编辑。')
+        return
+      }
+      const localPreview = buildEditPreview({
+        orchestrationId: editingPlan.orchestration.id,
+        revision: scheduleRevision,
+        platform,
+        keywords,
+        selectedAgents,
+        existingItems: editingPlan.items,
+      })
+      setPreview(localPreview.preview)
+      setAssignments(localPreview.assignments)
+      setStage('allocate')
       return
     }
     if ((!createResult || createFingerprint !== currentFingerprint) && draftIdsRef.current.size > 0) {
@@ -649,20 +787,63 @@ export function OrchestrationComposerDrawer({
 
   const dispatch = async () => {
     setError('')
-    if (!preview || !createResult) {
+    if (!preview || (!editMode && !createResult)) {
       setError('当前队列预览已失效，请返回上一步重新生成。')
       return
     }
-    if (assignments.length !== createResult.items.length || assignments.some(assignment => !assignment.agentId)) {
+    if (
+      assignments.length !== (editMode ? keywords.length : createResult?.items.length) ||
+      assignments.some(assignment => !assignment.agentId)
+    ) {
       setError('工作项清单不完整，请返回上一步重新生成。')
       return
     }
     if (validSelectedAgentIds.length < requiredAgentCount) {
-      setError(`弹性节点池至少需要 ${requiredAgentCount} 个兼容 Agent。`)
+      setError(`请至少选择 ${requiredAgentCount} 个兼容 Agent。`)
       return
     }
     setSubmitting(true)
     try {
+      if (editMode) {
+        const customDateResult = parseCustomDates(customDates)
+        const result = await api.patch<OrchestrationScheduleUpdateResult>(
+          `/capture-cloud/orchestrations/${preview.orchestrationId}/schedule`,
+          {
+            expectedRevision: preview.revision,
+            title: title.trim(),
+            platform,
+            executionMode: 'unattended_plan',
+            distributionMode,
+            agentIds: validSelectedAgentIds,
+            schedule: {
+              mode: planMode,
+              planMode,
+              startTime,
+              randomOffsetMin,
+              customDates: planMode === 'custom_dates' ? customDateResult.dates.join('\n') : '',
+              maxRounds: 1,
+              roundGapMin: 10,
+            },
+            keywords,
+            keywordMaxDetectedItems,
+            searchFilters: { sort, publishTime },
+            recoveryPolicy: {
+              allowIdleAgentHandoff,
+              platformSafetyMode: 'manual_confirmed',
+            },
+            ...(captureSettings ? { captureSettings } : {}),
+          },
+          { timeoutMs: 30_000 },
+        )
+        setUpdateResult(result)
+        setStage('dispatched')
+        try {
+          await onPlanUpdated?.(result)
+        } catch {
+          setError('计划已经保存，但父页面刷新失败。关闭抽屉后可手动刷新计划列表。')
+        }
+        return
+      }
       const result = await api.post<OrchestrationDispatchResult>(
         `/capture-cloud/orchestrations/${preview.orchestrationId}/dispatch`,
         {
@@ -685,9 +866,13 @@ export function OrchestrationComposerDrawer({
         setError('云端队列已经创建，但父页面刷新失败。关闭抽屉后可手动刷新任务列表。')
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : '创建云端队列失败'
-      setError(/revision|版本|冲突/i.test(message)
-        ? '任务草稿已经变化，当前预览已过期。请返回并重新生成分配预览。'
+      const message = err instanceof Error
+        ? err.message
+        : editMode ? '保存计划修改失败' : '创建云端队列失败'
+      setError(/revision|版本|冲突|已被更新/i.test(message)
+        ? editMode
+          ? '计划在编辑期间已经发生变化。请关闭编辑器，刷新计划详情后再修改。'
+          : '任务草稿已经变化，当前预览已过期。请返回并重新生成分配预览。'
         : message)
     } finally {
       setSubmitting(false)
@@ -708,7 +893,7 @@ export function OrchestrationComposerDrawer({
               type="button"
               data-dialog-initial-focus
               onClick={stage === 'allocate' ? () => { setStage('define'); setError('') } : () => void requestClose()}
-              aria-label={stage === 'allocate' ? '返回任务配置' : '关闭新建编排任务'}
+              aria-label={stage === 'allocate' ? '返回任务配置' : editMode ? '关闭计划编辑' : '关闭新建编排任务'}
               disabled={busy}
               className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             >
@@ -716,20 +901,24 @@ export function OrchestrationComposerDrawer({
             </button>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
-                <h2 id="orchestration-composer-title" className="text-lg font-bold text-foreground">新建弹性节点池任务</h2>
+                <h2 id="orchestration-composer-title" className="text-lg font-bold text-foreground">
+                  {editMode ? '编辑无人值守计划' : '新建弹性节点池任务'}
+                </h2>
                 <span className="rounded-full border border-primary/25 bg-primary/8 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">Beta</span>
               </div>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                {executionMode === 'unattended_plan'
+                {editMode
+                  ? '保留原计划和运行历史；保存后的设置从下一次运行开始生效。'
+                  : executionMode === 'unattended_plan'
                   ? '无人值守 · 每次到点生成云端工作项，由空闲节点逐个领取。'
                   : '执行一次 · 关键词留在云端，兼容节点空闲后逐个领取。'}
               </p>
             </div>
           </div>
-          <div className="mt-4 flex gap-2" aria-label="新建任务步骤">
+          <div className="mt-4 flex gap-2" aria-label={editMode ? '编辑计划步骤' : '新建任务步骤'}>
             <StepPill active={stage === 'define'} complete={stage !== 'define'}>定义任务与节点池</StepPill>
             <ChevronRight className="mt-3 h-4 w-4 shrink-0 text-muted-foreground/45" />
-            <StepPill active={stage === 'allocate'} complete={stage === 'dispatched'}>确认云端队列</StepPill>
+            <StepPill active={stage === 'allocate'} complete={stage === 'dispatched'}>{editMode ? '确认修改范围' : '确认云端队列'}</StepPill>
           </div>
         </header>
 
@@ -743,11 +932,13 @@ export function OrchestrationComposerDrawer({
                     <div>
                       <h3 className="text-sm font-bold text-foreground">运行方式</h3>
                       <p className="text-[11px] text-muted-foreground">
-                        {lockExecutionMode ? '已从上一步带入；这里只配置具体运行规则。' : '选择只执行一次，或让云端按固定计划反复生成任务。'}
+                        {editMode
+                          ? '当前编辑的是云端无人值守计划，只调整后续运行规则。'
+                          : lockExecutionMode ? '已从上一步带入；这里只配置具体运行规则。' : '选择只执行一次，或让云端按固定计划反复生成任务。'}
                       </p>
                     </div>
                   </div>
-                  {lockExecutionMode ? (
+                  {lockExecutionMode || editMode ? (
                     <div role="status" className="flex items-center gap-3 rounded-xl border border-primary/20 bg-card px-3 py-2.5">
                       <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                         {executionMode === 'unattended_plan' ? <CalendarDays className="h-4 w-4" /> : <Play className="h-4 w-4" />}
@@ -756,7 +947,9 @@ export function OrchestrationComposerDrawer({
                         <span className="block text-xs font-bold text-foreground">
                           {executionMode === 'unattended_plan' ? '无人值守' : '执行一次'}
                         </span>
-                        <span className="mt-0.5 block text-[10px] text-muted-foreground">已从上一步确定，无需重复选择。</span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          {editMode ? '计划类型保持不变；修改只作用于后续批次。' : '已从上一步确定，无需重复选择。'}
+                        </span>
                       </span>
                       <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">已确定</span>
                     </div>
@@ -808,7 +1001,9 @@ export function OrchestrationComposerDrawer({
                         <div className="flex items-start gap-2">
                           <Bot className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
                           <p className="text-[11px] leading-4 text-muted-foreground">
-                            这是独立的云端计划。到点后才创建当次任务并发给下方 Agent，<span className="font-semibold text-foreground">不会覆盖设备 Extension 里已有的本地无人值守计划</span>。
+                            {editMode
+                              ? <>保存后继续使用同一个云端计划，<span className="font-semibold text-foreground">已经生成、正在运行或已完成的批次不会改变</span>。</>
+                              : <>这是独立的云端计划。到点后才创建当次任务并发给下方 Agent，<span className="font-semibold text-foreground">不会覆盖设备 Extension 里已有的本地无人值守计划</span>。</>}
                           </p>
                         </div>
                       </div>
@@ -915,7 +1110,9 @@ export function OrchestrationComposerDrawer({
                         placeholder={'别克\n凯迪拉克\n雪佛兰'}
                         className={textareaClassName}
                       />
-                      <span className={`mt-1.5 block text-[11px] ${keywords.length > 300 ? 'text-status-red' : 'text-muted-foreground'}`}>{keywords.length}/300 个工作项 · 每个 Agent 一次领取 1 个</span>
+                      <span className={`mt-1.5 block text-[11px] ${keywords.length > 300 ? 'text-status-red' : 'text-muted-foreground'}`}>
+                        {keywords.length}/300 个工作项 · {distributionMode === 'elastic_pool' ? '每个 Agent 一次领取 1 个' : '保存时按节点均衡固定分配'}
+                      </span>
                     </label>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="block text-xs font-medium text-muted-foreground">
@@ -1011,16 +1208,61 @@ export function OrchestrationComposerDrawer({
                     {selectionNotice}
                   </p>
                 )}
-                <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[0.045] px-3 py-2.5">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 弹性节点池</div>
-                  <p className="mt-1 text-[11px] leading-4 text-muted-foreground">关键词先留在云端。节点空闲时只领 1 个，完成后再领下一个；速度快的节点会自然多做。</p>
-                </div>
-                <div className="mt-3 flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/[0.035] px-3 py-3">
+                {editMode ? (
+                  <fieldset className="mt-3">
+                    <legend className="text-xs font-medium text-muted-foreground">任务分配方式</legend>
+                    <div className="mt-1.5 grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+                      {([
+                        {
+                          value: 'elastic_pool' as const,
+                          label: '弹性节点池',
+                          description: '空闲节点逐个领取，快的自然多做',
+                        },
+                        {
+                          value: 'fixed_batch' as const,
+                          label: '固定分配',
+                          description: '保存时把关键词固定分给各节点',
+                        },
+                      ]).map(option => {
+                        const active = distributionMode === option.value
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            aria-pressed={active}
+                            disabled={busy}
+                            onClick={() => {
+                              if (active) return
+                              markDefinitionChanged()
+                              setDistributionMode(option.value)
+                            }}
+                            className={`rounded-xl border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${active ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/15' : 'border-border bg-card hover:border-primary/35'}`}
+                          >
+                            <span className={`flex items-center gap-2 text-xs font-semibold ${active ? 'text-primary' : 'text-foreground'}`}>
+                              <Settings2 className="h-3.5 w-3.5" /> {option.label}
+                            </span>
+                            <span className="mt-1 block text-[10px] leading-4 text-muted-foreground">{option.description}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </fieldset>
+                ) : (
+                  <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[0.045] px-3 py-2.5">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 弹性节点池</div>
+                    <p className="mt-1 text-[11px] leading-4 text-muted-foreground">关键词先留在云端。节点空闲时只领 1 个，完成后再领下一个；速度快的节点会自然多做。</p>
+                  </div>
+                )}
+                <div className={`mt-3 flex items-start gap-3 rounded-xl border px-3 py-3 ${distributionMode === 'elastic_pool' ? 'border-primary/20 bg-primary/[0.035]' : 'border-status-orange/25 bg-status-orange/[0.045]'}`}>
                   <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">✓</span>
                   <span>
-                    <span className="block text-xs font-semibold text-foreground">离线不会拖住整批任务</span>
+                    <span className="block text-xs font-semibold text-foreground">
+                      {distributionMode === 'elastic_pool' ? '离线不会拖住整批任务' : '保留固定分配方式'}
+                    </span>
                     <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
-                      创建指令 3 分钟未确认会退回队列；执行节点持续离线 10 分钟也会回收。验证码或登录验证只暂停当前关键词，不会自动扩散到其他节点。
+                      {distributionMode === 'elastic_pool'
+                        ? '创建指令 3 分钟未确认会退回队列；执行节点持续离线 10 分钟也会回收。验证码或登录验证只暂停当前关键词，不会自动扩散到其他节点。'
+                        : '关键词会均衡后固定给各节点；某台设备较慢或离线时，其他设备不会自动领取它的关键词。'}
                     </span>
                   </span>
                 </div>
@@ -1072,7 +1314,13 @@ export function OrchestrationComposerDrawer({
                                       {queuedTasks > 0 ? ` · 排队 ${queuedTasks}` : ''}
                                     </>
                                   : '当前负载未提供'}
-                                {!agent.online ? ' · 当前不参与领取，上线后自动加入' : ' · 空闲时可领取'}
+                                {!agent.online
+                                  ? distributionMode === 'elastic_pool'
+                                    ? ' · 当前不参与领取，上线后自动加入'
+                                    : ' · 固定任务会等待该节点上线'
+                                  : distributionMode === 'elastic_pool'
+                                    ? ' · 空闲时可领取'
+                                    : ' · 将接收固定关键词'}
                               </span>
                             )}
                           </span>
@@ -1092,11 +1340,37 @@ export function OrchestrationComposerDrawer({
 
           {stage === 'allocate' && preview && (
             <div className="space-y-4">
+              {editMode && (
+                <section className="rounded-2xl border border-status-orange/30 bg-status-orange/[0.055] p-4" aria-label="修改影响范围">
+                  <div className="flex items-start gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-status-orange/12 text-amber-700 dark:text-amber-300">
+                      <CalendarDays className="h-4.5 w-4.5" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700 dark:text-amber-300">修改影响范围</div>
+                      <h3 className="mt-1 text-sm font-bold text-foreground">只影响下一次及之后生成的批次</h3>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                        已经生成、正在运行或已经完成的批次继续使用原配置；计划 ID、运行次数和历史记录全部保留。
+                      </p>
+                      {editingPlan?.schedule?.status === 'paused' && (
+                        <p className="mt-2 rounded-lg border border-border/70 bg-card/70 px-3 py-2 text-[11px] text-muted-foreground">
+                          当前计划处于暂停状态。保存后仍保持暂停，等你重新启用才会按新设置运行。
+                        </p>
+                      )}
+                      {editingPlan?.schedule?.status === 'completed' && (
+                        <p className="mt-2 rounded-lg border border-border/70 bg-card/70 px-3 py-2 text-[11px] text-muted-foreground">
+                          当前计划已经结束。保存有效的未来日期后，计划会重新启用。
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </section>
+              )}
               <section className="rounded-2xl border border-primary/20 bg-primary/[0.035] p-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">云端队列确认</div>
+                      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">{editMode ? '计划修改确认' : '云端队列确认'}</div>
                       <span className="inline-flex items-center gap-1 rounded-full border border-primary/20 bg-card px-2 py-0.5 text-[10px] font-semibold text-primary">
                         {executionMode === 'unattended_plan' ? <CalendarDays className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                         {executionMode === 'unattended_plan' ? '无人值守' : '执行一次'}
@@ -1104,20 +1378,22 @@ export function OrchestrationComposerDrawer({
                     </div>
                     <h3 className="mt-1 text-base font-bold text-foreground">{title}</h3>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {preview.itemCount} 个工作项 · {selectedAgents.length} 个可领取节点 · 一次领取 1 项
+                      {preview.itemCount} 个工作项 · {selectedAgents.length} 个执行节点 · {distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
                       {executionMode === 'unattended_plan'
                         ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
                         : ''}
                     </p>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => { setStage('define'); setError('') }} disabled={busy}>调整节点池</Button>
+                  <Button variant="outline" size="sm" onClick={() => { setStage('define'); setError('') }} disabled={busy}>{editMode ? '返回修改' : '调整节点池'}</Button>
                 </div>
                 <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                   {selectedAgents.map(agent => (
                     <div key={agent.id} className="rounded-xl border border-border/70 bg-card px-3 py-2.5">
                       <div className="truncate text-xs font-bold text-foreground">{allocationAgentLabel(agent)}</div>
                       <div className="mt-1 text-[11px] text-muted-foreground">
-                        {agent.online ? '在线 · 空闲时可领取' : '离线 · 不阻塞其他节点'}
+                        {distributionMode === 'elastic_pool'
+                          ? agent.online ? '在线 · 空闲时可领取' : '离线 · 不阻塞其他节点'
+                          : agent.online ? '在线 · 接收固定关键词' : '离线 · 固定关键词会等待'}
                       </div>
                     </div>
                   ))}
@@ -1128,7 +1404,11 @@ export function OrchestrationComposerDrawer({
                 <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
                   <div>
                     <h3 className="text-sm font-bold text-foreground">云端工作项</h3>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">这里确认要跑哪些词；实际执行节点由当时的空闲状态决定。</p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      {distributionMode === 'elastic_pool'
+                        ? '这里确认要跑哪些词；实际执行节点由当时的空闲状态决定。'
+                        : '这里确认要跑哪些词，以及保存后采用的固定均衡分配。'}
+                    </p>
                   </div>
                   <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{assignments.length} 项</span>
                 </div>
@@ -1140,7 +1420,11 @@ export function OrchestrationComposerDrawer({
                           <div className="truncate text-sm font-semibold text-foreground">{assignment.keyword}</div>
                           <div className="mt-0.5 text-[11px] text-muted-foreground">每词最多 {keywordMaxDetectedItems} 条 · {PLATFORM_OPTIONS.find(option => option.value === platform)?.label}</div>
                         </div>
-                        <span className="rounded-full border border-primary/20 bg-primary/[0.055] px-2.5 py-1 text-[10px] font-semibold text-primary">等待动态领取</span>
+                        <span className="rounded-full border border-primary/20 bg-primary/[0.055] px-2.5 py-1 text-[10px] font-semibold text-primary">
+                          {distributionMode === 'elastic_pool'
+                            ? '等待动态领取'
+                            : selectedAgents.find(agent => agent.id === assignment.agentId)?.display_name || '固定分配'}
+                        </span>
                       </div>
                   ))}
                 </div>
@@ -1148,21 +1432,28 @@ export function OrchestrationComposerDrawer({
             </div>
           )}
 
-          {stage === 'dispatched' && dispatchResult && (
+          {stage === 'dispatched' && (dispatchResult || updateResult) && (
             <div className="mx-auto flex min-h-[480px] max-w-xl items-center justify-center">
               <div className="w-full rounded-2xl border border-status-green/25 bg-status-green/5 p-6 text-center">
                 <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-status-green text-white"><CheckCircle2 className="h-6 w-6" /></span>
                 <h3 className="mt-4 text-lg font-bold text-foreground">
-                  {executionMode === 'unattended_plan' ? '无人值守弹性计划已启用' : '云端队列已创建'}
+                  {editMode
+                    ? '计划修改已保存'
+                    : executionMode === 'unattended_plan' ? '无人值守弹性计划已启用' : '云端队列已创建'}
                 </h3>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                  {executionMode === 'unattended_plan'
+                  {editMode
+                    ? '同一个计划会继续运行，原有历史保持不变。新配置从下一次生成批次时开始使用。'
+                    : executionMode === 'unattended_plan'
                     ? '云端会在每个运行时间生成当次工作项。在线空闲节点逐个领取，设备本地计划保持不变。'
                     : '关键词已留在云端队列。在线节点空闲时一次领取一个，完成后继续领取。'}
                 </p>
                 <div className="mt-4 rounded-xl border border-border/70 bg-card px-4 py-3 text-left text-xs text-muted-foreground">
-                  <div>编排任务：<span className="font-mono text-foreground">{dispatchResult.orchestrationId}</span></div>
-                  <div className="mt-1">当前状态：<span className="font-semibold text-foreground">{dispatchResult.status}</span></div>
+                  <div>编排任务：<span className="font-mono text-foreground">{updateResult?.orchestrationId || dispatchResult?.orchestrationId}</span></div>
+                  <div className="mt-1">
+                    {editMode ? '计划版本：' : '当前状态：'}
+                    <span className="font-semibold text-foreground">{editMode ? `v${updateResult?.schedule.revision || '—'}` : dispatchResult?.status}</span>
+                  </div>
                   {executionMode === 'unattended_plan' && (
                     <>
                       <div className="mt-1">
@@ -1170,7 +1461,7 @@ export function OrchestrationComposerDrawer({
                         <span className="font-semibold text-foreground">
                           {planMode === 'daily' ? '每天' : '指定日期'} {startTime}
                           {randomOffsetMin > 0 ? ` 后随机延迟 0–${randomOffsetMin} 分钟` : ''}
-                          {' · 每个关键词执行 1 次'}
+                          {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词执行 1 次`}
                         </span>
                       </div>
                       <div className="mt-1">
@@ -1216,20 +1507,26 @@ export function OrchestrationComposerDrawer({
                 <div role="status" className="mb-3 flex items-center gap-2 rounded-xl border border-primary/20 bg-primary/8 px-3 py-2.5 text-xs font-medium text-primary">
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                   {stage === 'allocate'
-                    ? executionMode === 'unattended_plan'
+                    ? editMode
+                      ? '正在保存计划修改，请稍候…'
+                      : executionMode === 'unattended_plan'
                       ? '正在保存弹性节点池并启用云端计划，请稍候…'
                       : '正在创建云端工作队列，请稍候…'
-                    : '正在创建任务草稿并检查节点池，请稍候…'}
+                    : editMode ? '正在检查计划修改，请稍候…' : '正在创建任务草稿并检查节点池，请稍候…'}
                 </div>
               )}
             </div>
             <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-[11px] leading-4 text-muted-foreground">
                 {stage === 'define'
-                  ? executionMode === 'unattended_plan'
+                  ? editMode
+                    ? '可修改名称、平台、时间、关键词、采集设置、分配方式和 Agent 小队。'
+                    : executionMode === 'unattended_plan'
                     ? '这是云端无人值守计划，不会修改设备已有的本地计划。'
                     : '执行一次会在确认后立即创建云端队列，不会修改设备已有的无人值守计划。'
-                  : executionMode === 'unattended_plan'
+                  : editMode
+                    ? '保存后只更新计划模板；已经生成的批次和历史记录保持不变。'
+                    : executionMode === 'unattended_plan'
                     ? '确认后保存节点池；云端将在每次到点时生成可动态领取的工作项。'
                     : '确认后创建云端工作项；每个节点一次只领取一个。'}
               </div>
@@ -1240,14 +1537,14 @@ export function OrchestrationComposerDrawer({
                 {stage === 'define' ? (
                   <Button onClick={() => void generatePreview()} disabled={busy || !writable || selectedAgents.length < requiredAgentCount} className="min-w-44">
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Settings2 className="h-4 w-4" />}
-                    {busy ? '正在生成预览…' : '预览云端队列'}
+                    {busy ? '正在生成预览…' : editMode ? '预览计划修改' : '预览云端队列'}
                   </Button>
                 ) : (
                   <Button onClick={() => void dispatch()} disabled={busy || validSelectedAgentIds.length < requiredAgentCount} className="min-w-36">
-                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : editMode ? <CheckCircle2 className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                     {busy
-                      ? executionMode === 'unattended_plan' ? '正在启用…' : '正在创建…'
-                      : executionMode === 'unattended_plan' ? '确认并启用计划' : '确认并创建队列'}
+                      ? editMode ? '正在保存…' : executionMode === 'unattended_plan' ? '正在启用…' : '正在创建…'
+                      : editMode ? '保存修改' : executionMode === 'unattended_plan' ? '确认并启用计划' : '确认并创建队列'}
                   </Button>
                 )}
               </div>

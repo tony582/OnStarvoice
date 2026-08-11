@@ -22,7 +22,7 @@ import type {
   Overview,
   TaskView,
 } from './cloud-tasks/lib'
-import type { OrchestrationLaunchIntent } from './cloud-tasks/types'
+import type { OrchestrationDetailResponse, OrchestrationLaunchIntent } from './cloud-tasks/types'
 import {
   ACTIVE_TASK_STATUSES,
   canDismissAttention,
@@ -64,6 +64,7 @@ export function DispatchPage() {
         : null,
   )
   const [orchestrationLaunchIntent, setOrchestrationLaunchIntent] = useState<OrchestrationLaunchIntent | null>(null)
+  const [editingOrchestrationPlan, setEditingOrchestrationPlan] = useState<OrchestrationDetailResponse | null>(null)
   const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(
     () => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
       String(params?.orchestrationId || ''),
@@ -554,6 +555,27 @@ export function DispatchPage() {
         />
       )}
 
+      {editingOrchestrationPlan && (
+        <OrchestrationComposerDrawer
+          open
+          writable={canWrite()}
+          agents={operationalAgents}
+          initialExecutionMode="unattended_plan"
+          lockExecutionMode
+          editingPlan={editingOrchestrationPlan}
+          onClose={() => {
+            const orchestrationId = editingOrchestrationPlan.orchestration.id
+            setEditingOrchestrationPlan(null)
+            setSelectedOrchestrationId(orchestrationId)
+          }}
+          onPlanUpdated={async result => {
+            setFeedback(result.message || '无人值守计划已保存，修改从下一次运行开始生效。')
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+        />
+      )}
+
       {selectedOrchestrationId && (
         <div ref={orchestrationDetailDialogRef}
           className="fixed inset-0 z-[60] overflow-y-auto bg-black/35 p-0 outline-none sm:p-4 lg:p-8"
@@ -568,6 +590,10 @@ export function DispatchPage() {
               writable={canWrite()}
               availableAgents={operationalAgents}
               onClose={closeOrchestrationDetail}
+              onEditPlan={plan => {
+                setEditingOrchestrationPlan(plan)
+                setSelectedOrchestrationId(null)
+              }}
               onChanged={async () => {
                 setOrchestrationRefreshKey(value => value + 1)
                 await load(true)

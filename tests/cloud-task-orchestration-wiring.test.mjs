@@ -174,6 +174,14 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /不会覆盖设备 Extension 里已有的本地无人值守计划/u);
   assert.match(composer, /每个节点一次只领取一个/u);
   assert.match(composer, /1–300 个关键词/u);
+  assert.match(composer, /editingPlan/u);
+  assert.match(composer, /api\.patch<OrchestrationScheduleUpdateResult>/u);
+  assert.match(composer, /expectedRevision: preview\.revision/u);
+  assert.match(composer, /保存修改/u);
+  assert.match(composer, /只影响下一次及之后生成的批次/u);
+  assert.match(composer, /计划 ID、运行次数和历史记录全部保留/u);
+  assert.match(composer, /'fixed_batch' as const/u);
+  assert.match(composer, /'elastic_pool' as const/u);
 
   assert.match(detail, /detail\?\.items/u);
   assert.match(detail, /orchestration, executions, agents, attempts, schedule/u);
@@ -188,6 +196,10 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /重试失败关键词/u);
   assert.match(detail, /\/schedule\/run-now/u);
   assert.match(detail, /立即运行/u);
+  assert.match(detail, /onEditPlan\?\.\(detail\)/u);
+  assert.match(detail, /编辑计划/u);
+  assert.match(dispatchPage, /editingOrchestrationPlan/u);
+  assert.match(dispatchPage, /onPlanUpdated/u);
   assert.match(
     detail,
     /\/capture-cloud\/orchestrations\/\$\{orchestrationId\}\/stop/u,

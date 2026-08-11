@@ -189,6 +189,16 @@ export type OrchestrationDispatchResult = {
   }>
 }
 
+export type OrchestrationScheduleUpdateResult = {
+  ok: true
+  orchestrationId: string
+  revision: number
+  schedule: OrchestrationScheduleRecord
+  itemCount: number
+  agentIds: string[]
+  message: string
+}
+
 export type OrchestrationComposerDrawerProps = {
   open: boolean
   writable: boolean
@@ -200,8 +210,11 @@ export type OrchestrationComposerDrawerProps = {
   minimumAgentCount?: number
   /** 兼容直接打开编排器时的预选节点；统一向导的多节点链路不再提前选节点。 */
   initialAgentIds?: string[]
+  /** 传入已发布的云端计划详情时，复用同一配置器编辑原计划，不创建新计划。 */
+  editingPlan?: OrchestrationDetailResponse | null
   onClose: () => void
   onDispatched?: (result: OrchestrationDispatchResult) => void | Promise<void>
+  onPlanUpdated?: (result: OrchestrationScheduleUpdateResult) => void | Promise<void>
   onChanged?: () => void | Promise<void>
 }
 
@@ -210,6 +223,7 @@ export type OrchestrationDetailWorkspaceProps = {
   writable?: boolean
   availableAgents?: OrchestrationCloudAgent[]
   onClose?: () => void
+  onEditPlan?: (detail: OrchestrationDetailResponse) => void
   onChanged?: () => void | Promise<void>
   className?: string
   refreshKey?: string | number

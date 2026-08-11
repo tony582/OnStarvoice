@@ -367,12 +367,12 @@ test("multi-Agent handoff keeps unattended mode and selects platform-compatible 
   assert.match(dispatch, /\{orchestrationLaunchIntent && \([\s\S]*initialExecutionMode=\{orchestrationLaunchIntent\.executionMode\}/u);
   assert.match(dispatch, /minimumAgentCount=\{orchestrationLaunchIntent\.minimumAgentCount\}/u);
   assert.match(types, /executionMode: OrchestrationExecutionMode/u);
-  assert.match(composer, /setExecutionMode\(initialExecutionMode\)/u);
+  assert.match(composer, /setExecutionMode\(editMode \? 'unattended_plan' : initialExecutionMode\)/u);
   assert.match(composer, /已从上一步确定，无需重复选择/u);
   assert.match(composer, /validSelectedAgentIds\.length < requiredAgentCount/u);
   assert.doesNotMatch(composer, /keywords\.length < requiredAgentCount/u);
   assert.match(composer, /validSelectedAgentIds\.length < requiredAgentCount/u);
-  assert.match(composer, /distributionMode = 'elastic_pool'/u);
+  assert.match(composer, /useState<DistributionMode>\('elastic_pool'\)/u);
   assert.match(composer, /eligibleAgentIds: validSelectedAgentIds/u);
   assert.match(composer, /eligibleAgentIds: \[\.\.\.validSelectedAgentIds\]\.sort\(\)/u);
   assert.match(composer, /至少 \{requiredAgentCount\} 个/u);
