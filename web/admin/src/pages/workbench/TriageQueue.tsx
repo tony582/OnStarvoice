@@ -5,7 +5,7 @@ import {
   Check, CheckCircle, Archive, ArchiveRestore, CircleOff, Loader2, ChevronDown,
   User, FileText, Bell, ExternalLink,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
-  ClipboardCheck, Rows3, Kanban,
+  Rows3, Kanban,
 } from 'lucide-react'
 import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
@@ -15,17 +15,20 @@ import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import {
   RecordDrawer, getCover,
-  type ContentTicketCloseResult, type ManualRecordFields, type RecordProgressSummary,
+  type ManualRecordFields, type RecordProgressSummary,
 } from '@/components/shared/RecordDrawer'
 import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { CombinedDateRangeFilter, type CombinedDateRanges } from '@/components/shared/DateRangeFilter'
 import { MultiSelect } from '@/components/shared/MultiSelect'
 import { Tooltip } from '@/components/shared/Tooltip'
-import { CopyTicketNumberButton } from '@/components/shared/CopyTicketNumberButton'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
-import { useTicketDispatch } from '@/components/shared/TicketDispatch'
+import { useStatusChangePrompt, type StatusChangeValues } from '@/components/shared/StatusChangePrompt'
+import {
+  FeishuTableNumberControl,
+  type FeishuTableNumberSaveResult,
+} from '@/components/shared/FeishuTableNumberControl'
 import { RecordLabelChips } from '@/components/shared/RecordLabels'
 import {
   normalizeCustomTags, tagsFromRecord,
@@ -46,7 +49,6 @@ interface ManualFieldsMutationResponse {
 }
 interface ArchiveMutationResponse {
   updatedIds?: unknown
-  skippedActiveTicketIds?: unknown
   skipped?: unknown
 }
 interface BatchModeMutationResponse {
@@ -58,10 +60,6 @@ type BatchFeedback = {
   message: string
   tone: 'success' | 'warning' | 'error'
 }
-interface TicketNumberSaveResult {
-  ok: boolean
-  message?: string
-}
 type SortField = 'publish' | 'interactions' | 'comments' | 'likes' | 'first_seen' | 'last_seen'
 const RISK_OPTIONS = [
   { value: 'alert', label: '有预警' },
@@ -69,24 +67,19 @@ const RISK_OPTIONS = [
   { value: 'deleted', label: '已删帖' },
 ]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
-type TriageMode = 'unhandled' | 'reviewing' | 'official_responded' | 'no_action' | 'ticketed'
+type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'negative_feishu' | 'negative_cold'
 type ArchiveView = 'active' | 'archived'
-type TicketStatusFilterValue = '' | 'all' | 'active' | 'closed'
-const CONTENT_TRIAGE_MODES: Array<{ value: Exclude<TriageMode, 'ticketed'>; label: string; icon: React.ElementType }> = [
+const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: React.ElementType }> = [
   { value: 'unhandled', label: '待处理', icon: Inbox },
-  { value: 'reviewing', label: '负面流程', icon: Bell },
-  { value: 'official_responded', label: '官方已评', icon: CheckCircle },
-  { value: 'no_action', label: '无需操作', icon: CircleOff },
-]
-const TICKET_TRIAGE_MODE = { value: 'ticketed' as const, label: '已转工单' }
-const TICKET_STATUS_FILTERS: Array<{ value: TicketStatusFilterValue; label: string; tone: 'muted' | 'blue' | 'green' }> = [
-  { value: '', label: '不限工单', tone: 'muted' },
-  { value: 'all', label: '全部工单', tone: 'blue' },
-  { value: 'active', label: '处理中', tone: 'blue' },
-  { value: 'closed', label: '已结案', tone: 'green' },
+  { value: 'replied', label: '已回复', icon: CheckCircle },
+  { value: 'reviewed', label: '已复核', icon: Check },
+  { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
+  { value: 'unavailable', label: '已不可见', icon: CircleOff },
+  { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
+  { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
 ]
 const PLATFORM_BADGE_CLASS = 'w-14 justify-center dark:text-white'
-const TRIAGE_MODE_BADGE_CLASS = 'w-[88px] justify-center dark:text-white'
+const TRIAGE_MODE_BADGE_CLASS = 'w-[132px] justify-center dark:text-white'
 const ARCHIVE_VIEWS: Array<{ value: ArchiveView; label: string; icon: React.ElementType }> = [
   { value: 'active', label: '工作中', icon: Inbox },
   { value: 'archived', label: '已归档', icon: Archive },
@@ -97,6 +90,14 @@ const emptyDateRanges = (): CombinedDateRanges => ({
   recent: { from: '', to: '' },
   first: { from: '', to: '' },
 })
+
+function initialDateRanges(initial?: Record<string, string>): CombinedDateRanges {
+  return {
+    publish: { from: initial?.publishFrom || '', to: initial?.publishTo || '' },
+    recent: { from: initial?.recentFrom || '', to: initial?.recentTo || '' },
+    first: { from: initial?.firstFrom || '', to: initial?.firstTo || '' },
+  }
+}
 
 function TriageSelect({ className, disabled, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
   return (
@@ -114,68 +115,6 @@ function TriageSelect({ className, disabled, ...props }: React.SelectHTMLAttribu
         )}
       />
     </span>
-  )
-}
-
-function TicketStatusFilter({ value, onChange }: {
-  value: TicketStatusFilterValue
-  onChange: (value: TicketStatusFilterValue) => void
-}) {
-  const selected = TICKET_STATUS_FILTERS.find(option => option.value === value) || TICKET_STATUS_FILTERS[0]
-  const triggerLabel = value ? selected.label : '工单状态'
-  return (
-    <DropdownMenu.Root>
-      <DropdownMenu.Trigger asChild>
-        <button
-          type="button"
-          aria-label={`工单状态筛选，当前${selected.label}`}
-          title="筛选工单处理状态"
-          className={cn(
-            'inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg border px-2 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary/20 lg:h-8',
-            selected.tone === 'green'
-              ? 'border-status-green/30 bg-status-green/10 text-emerald-700 hover:bg-status-green/15 dark:text-emerald-300'
-              : selected.tone === 'blue'
-                ? 'border-primary/25 bg-accent text-primary hover:bg-primary/[0.12]'
-                : 'border-border/80 bg-card text-muted-foreground hover:border-input hover:bg-muted hover:text-foreground',
-          )}
-        >
-          <span className={cn(
-            'h-2 w-2 shrink-0 rounded-full',
-            selected.tone === 'green' ? 'bg-status-green' : selected.tone === 'blue' ? 'bg-status-blue' : 'bg-status-grey',
-          )} />
-          <span className="min-w-0 truncate">{triggerLabel}</span>
-          <ChevronDown className="h-3 w-3 shrink-0" />
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="start"
-          sideOffset={5}
-          collisionPadding={10}
-          className="z-[100] min-w-32 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
-        >
-          <DropdownMenu.RadioGroup value={value || '__none__'} aria-label="工单状态筛选选项">
-            {TICKET_STATUS_FILTERS.map(option => (
-              <DropdownMenu.RadioItem
-                key={option.value || 'none'}
-                value={option.value || '__none__'}
-                onSelect={() => onChange(option.value)}
-                className="flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent"
-              >
-                <span className={cn(
-                  'h-2 w-2 shrink-0 rounded-full',
-                  option.tone === 'green' ? 'bg-status-green' : option.tone === 'blue' ? 'bg-status-blue' : 'bg-status-grey',
-                )} />
-                <span className={cn('flex-1', option.value === value && 'font-semibold')}>{option.label}</span>
-                <span className="flex h-4 w-4 items-center justify-center">
-                  <DropdownMenu.ItemIndicator><Check className="h-3.5 w-3.5 text-primary" /></DropdownMenu.ItemIndicator>
-                </span>
-              </DropdownMenu.RadioItem>
-            ))}
-          </DropdownMenu.RadioGroup>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
   )
 }
 
@@ -237,8 +176,8 @@ function HeaderSingleFilter({ label, value, options, onChange }: {
 }
 
 function recordAccentClass(record: Record<string, unknown>) {
-  if (record.ticket_id && record.ticket_status === 'closed') return 'bg-status-green'
-  if (record.ticket_id || record.triage_status === 'ticketed') return 'bg-status-blue'
+  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold') return 'bg-status-red'
+  if (record.triage_status === 'replied' || record.triage_status === 'reviewed') return 'bg-status-green'
   if (record.sentiment === 'negative') return 'bg-status-red'
   if (record.sentiment === 'positive') return 'bg-status-green'
   return 'bg-status-grey'
@@ -299,7 +238,6 @@ function changedArchiveIds(data: ArchiveMutationResponse | undefined, requestedI
     return data.updatedIds.map(id => String(id).toLowerCase())
   }
   const skipped = new Set([
-    ...(Array.isArray(data?.skippedActiveTicketIds) ? data.skippedActiveTicketIds : []),
     ...(Array.isArray(data?.skipped) ? data.skipped : []),
   ].map(id => String(id).toLowerCase()))
   return normalizedRequested.filter(id => !skipped.has(id))
@@ -329,18 +267,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
   const [triageStatus, setTriageStatus] = useState(initial?.status ?? '')
-  const [ticketStatusFilter, setTicketStatusFilter] = useState<TicketStatusFilterValue>(() => {
-    if (initial?.status !== 'ticketed') return ''
-    return initial?.ticketStatus === 'active' || initial?.ticketStatus === 'closed'
-      ? initial.ticketStatus
-      : 'all'
-  })
   const [risk, setRisk] = useState<string[]>([])
   const [identity, setIdentity] = useState<string[]>([])
-  const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
+  const [captureKeywords, setCaptureKeywords] = useState<string[]>(() => String(initial?.captureKeywords || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean))
   const [customTagIds, setCustomTagIds] = useState<string[]>([])
   const [customTagCatalog, setCustomTagCatalog] = useState<CustomTag[]>([])
-  const [dateRanges, setDateRanges] = useState<CombinedDateRanges>(emptyDateRanges)
+  const [dateRanges, setDateRanges] = useState<CombinedDateRanges>(() => initialDateRanges(initial))
   const [exporting, setExporting] = useState(false)
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量/首次发现/最近采集、升降序
@@ -351,18 +286,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [jumpPage, setJumpPage] = useState('')
   const [loading, setLoading] = useState(true)
   const [modeBusyId, setModeBusyId] = useState<string | null>(null)
+  const [noteBusyId, setNoteBusyId] = useState<string | null>(null)
   const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null)
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState<'content' | 'history'>('content')
-  const [ticketCloseNotice, setTicketCloseNotice] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
   const [batchFeedback, setBatchFeedback] = useState<BatchFeedback | null>(null)
   const batchFeedbackTimer = useRef<number | undefined>(undefined)
   const customTagRequestSeq = useRef(0)
   const { ask, dialog } = useNotePrompt()
-  const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
+  const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
-  const sel = useSelection(`${archiveView}|${triageStatus}|${ticketStatusFilter}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
 
   const showBatchFeedback = useCallback((message: string, tone: BatchFeedback['tone']) => {
     window.clearTimeout(batchFeedbackTimer.current)
@@ -391,9 +326,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (archiveView === 'archived') params.set('bucket', 'archived')
     else params.set('queue', 'triage')
     if (triageStatus) params.set('status', triageStatus)
-    if (triageStatus === 'ticketed' && (ticketStatusFilter === 'active' || ticketStatusFilter === 'closed')) {
-      params.set('ticketStatus', ticketStatusFilter)
-    }
     risk.forEach(rk => params.append('risk', rk))
     identity.forEach(id => params.append('identity', id))
     params.set('sort', sort.field)
@@ -408,7 +340,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
     if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
     return params
-  }, [archiveView, triageStatus, ticketStatusFilter, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (!options?.silent) setLoading(true)
@@ -435,25 +367,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
-  const ticketOnly = triageStatus === 'ticketed'
-  const handlingStatus = ticketOnly ? '' : triageStatus
-  const visibleTicketStatusFilter: TicketStatusFilterValue = ticketOnly ? (ticketStatusFilter || 'all') : ''
+  const handlingStatus = triageStatus
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
   const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment, triageStatus].filter(Boolean).length
     + Number(Boolean(keyword)) + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setTicketStatusFilter(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setSort({ field: 'publish', dir: 'desc' })
   }
   const changeHandlingStatusFilter = (value: string) => {
     setTriageStatus(value)
-    setTicketStatusFilter('')
-  }
-  const changeTicketStatusFilter = (value: TicketStatusFilterValue) => {
-    setTicketStatusFilter(value)
-    setTriageStatus(value ? 'ticketed' : '')
   }
   useEffect(() => { void load() }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
@@ -472,7 +397,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       placeholder: '请说明为什么这条内容属于误报',
       confirmLabel: '提交误报',
       required: true,
-      helpText: '提交后仅进入平台管理员复核，不会改变当前处理模式或归档状态。',
+      helpText: '提交后仅进入平台管理员复核，不会改变当前处理状态或归档状态。',
     })
     if (reason === null) return false
     await api.post('/feedback/false-positive', { recordId, reason })
@@ -552,53 +477,89 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return tags
   }
 
-  const dispatchTicket = async (record: any): Promise<boolean> => {
-    if (archiveView === 'archived' || record.archived_at) return false
-    const r = await dispatch({ sourceType: 'content', summary: record.title || record.content, defaultPriority: record.triage_priority })
-    if (!r) return false
-    await api.post('/tickets', { sourceType: 'content', sourceId: record.id, externalTicketNo: r.externalTicketNo, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
-    await reloadAfterMutation()
-    setBoardNonce(n => n + 1)
-    return true
-  }
+  const addRecordNote = useCallback(async (record: any): Promise<boolean> => {
+    if (archiveView === 'archived' || record.archived_at || noteBusyId) return false
+    const body = await ask({
+      title: '填写备注',
+      placeholder: '填写本次处理备注…',
+      confirmLabel: '保存备注',
+      required: true,
+      requiredMessage: '请填写备注后再保存',
+      helpText: '备注会追加到处理记录中，悬浮备注按钮可查看最近一条。',
+    })
+    if (body === null) return false
 
-  const saveInlineTicketNumber = useCallback(async (record: any, value: string): Promise<TicketNumberSaveResult> => {
-    const externalTicketNo = value.trim()
-    if (!record?.ticket_id || !externalTicketNo) return { ok: false, message: '请输入工单号' }
-    const previousExternalTicketNo = String(record.ticket_number || '').trim()
-    const closedNumberBackfill = record.ticket_status === 'closed' && !previousExternalTicketNo
-    if ((record.ticket_status === 'closed' || record.archived_at) && !closedNumberBackfill) {
-      return { ok: false, message: record.ticket_status === 'closed' ? '该工单已结案，不能修改号码' : '该内容已归档，不能修改工单号' }
+    setNoteBusyId(record.id)
+    try {
+      const data = await api.post<{ note?: Record<string, unknown> }>(`/records/${record.id}/notes`, { body })
+      const note = data.note || {}
+      const progress = {
+        body: String(note.body || body),
+        authorName: String(note.author_name || '当前用户'),
+        createdAt: String(note.created_at || new Date().toISOString()),
+        eventType: 'note',
+      }
+      const applyProgress = (item: any) => ({
+        ...item,
+        progress_count: Number(item.progress_count || 0) + 1,
+        progress_latest_body: progress.body,
+        progress_latest_author: progress.authorName,
+        progress_latest_at: progress.createdAt,
+        progress_latest_type: progress.eventType,
+      })
+      setRecords(current => current.map(item => item.id === record.id ? applyProgress(item) : item))
+      setDrawerRecord((current: any) => current?.id === record.id ? applyProgress(current) : current)
+      setBoardNonce(n => n + 1)
+      showBatchFeedback('备注已保存', 'success')
+      return true
+    } catch (error) {
+      console.error(error)
+      showBatchFeedback(`备注保存失败：${error instanceof Error ? error.message : '请稍后重试'}`, 'error')
+      return false
+    } finally {
+      setNoteBusyId(null)
+    }
+  }, [archiveView, ask, noteBusyId, showBatchFeedback])
+
+  const saveFeishuTableNo = useCallback(async (
+    record: any,
+    value: string,
+  ): Promise<FeishuTableNumberSaveResult> => {
+    const feishuTableNo = value.trim()
+    if (!feishuTableNo) return { ok: false, message: '请输入飞书表号' }
+    if (archiveView === 'archived' || record.archived_at) {
+      return { ok: false, message: '该内容已归档，不能修改飞书表号' }
     }
     try {
-      const response = await api.patch<{ ticket?: { external_ticket_no?: string } }>(
-        `/tickets/${record.ticket_id}/external-number`,
-        {
-          externalTicketNo,
-          previousExternalTicketNo,
-        },
+      const response = await api.patch<{ triage?: { feishu_table_no?: string } }>(
+        `/triage/records/${record.id}`,
+        { feishuTableNo },
       )
-      const savedNumber = String(response.ticket?.external_ticket_no || externalTicketNo).trim()
+      const savedNumber = String(response.triage?.feishu_table_no || feishuTableNo).trim()
       setRecords(current => current.map(item => item.id === record.id
-        ? { ...item, ticket_number: savedNumber, matched_ticket_number: '' }
+        ? { ...item, feishu_table_no: savedNumber }
         : item))
       setDrawerRecord((current: any) => current?.id === record.id
-        ? { ...current, ticket_number: savedNumber, matched_ticket_number: '' }
+        ? { ...current, feishu_table_no: savedNumber }
         : current)
-      setBoardNonce(n => n + 1)
+      setBoardNonce(nonce => nonce + 1)
       if (keyword.trim()) await load(pagination?.page || 1, { silent: true })
       return { ok: true }
     } catch (error) {
       console.error(error)
-      return { ok: false, message: error instanceof Error ? error.message : '工单号保存失败' }
+      return { ok: false, message: error instanceof Error ? error.message : '飞书表号保存失败' }
     }
-  }, [keyword, load, pagination])
+  }, [archiveView, keyword, load, pagination])
 
   const modeVisibleInCurrentList = useCallback((newStatus: string) => {
     return !triageStatus || triageStatus === newStatus
   }, [triageStatus])
 
-  const syncModeLocally = useCallback((ids: Iterable<string>, newStatus: TriageMode) => {
+  const syncModeLocally = useCallback((
+    ids: Iterable<string>,
+    newStatus: TriageMode,
+    feishuTableNo?: string,
+  ) => {
     const changed = new Set(ids)
     const keepInList = modeVisibleInCurrentList(newStatus)
     setRecords(current => current.flatMap(record => {
@@ -607,7 +568,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       return [{
         ...record,
         triage_status: newStatus,
-        official_response_status: newStatus === 'official_responded' ? 'responded' : record.official_response_status,
+        ...(feishuTableNo !== undefined ? { feishu_table_no: feishuTableNo } : {}),
       }]
     }))
     setDrawerRecord((current: any) => {
@@ -615,49 +576,79 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       return {
         ...current,
         triage_status: newStatus,
-        official_response_status: newStatus === 'official_responded' ? 'responded' : current.official_response_status,
+        ...(feishuTableNo !== undefined ? { feishu_table_no: feishuTableNo } : {}),
       }
     })
   }, [modeVisibleInCurrentList])
 
-  const changeTriageMode = useCallback(async (recordId: string, newStatus: TriageMode): Promise<boolean> => {
-    if (newStatus === 'ticketed') return false
+  const changeTriageMode = useCallback(async (
+    recordId: string,
+    newStatus: TriageMode,
+    values: StatusChangeValues,
+  ): Promise<boolean> => {
     if (archiveView === 'archived' || modeBusyId || archiveBusyId) return false
     setModeBusyId(recordId)
     try {
-      if (newStatus === 'official_responded') {
-        await api.patch('/records/' + recordId + '/official-response', { status: 'responded' })
-      } else {
-        await api.patch('/triage/records/' + recordId, { status: newStatus })
+      const payload = {
+        status: newStatus,
+        note: values.note,
+        ...(newStatus === 'negative_feishu' ? { feishuTableNo: values.feishuTableNo } : {}),
       }
+      await api.patch('/triage/records/' + recordId, payload)
       const page = pagination?.page || 1
       const targetPage = !modeVisibleInCurrentList(newStatus) && records.length <= 1 && page > 1 ? page - 1 : page
-      syncModeLocally([recordId], newStatus)
+      syncModeLocally(
+        [recordId],
+        newStatus,
+        newStatus === 'negative_feishu' ? values.feishuTableNo : undefined,
+      )
       refreshBadges()
       await load(targetPage, { silent: true })
       return true
     } catch (err) {
       console.error(err)
+      showBatchFeedback(`状态修改失败：${err instanceof Error ? err.message : '请稍后重试'}`, 'error')
       return false
     } finally {
       setModeBusyId(null)
     }
-  }, [archiveBusyId, archiveView, load, modeBusyId, modeVisibleInCurrentList, pagination, records.length, refreshBadges, syncModeLocally])
+  }, [archiveBusyId, archiveView, load, modeBusyId, modeVisibleInCurrentList, pagination, records.length, refreshBadges, showBatchFeedback, syncModeLocally])
 
-  const changeRecordMode = (record: any, newStatus: TriageMode) => (
-    newStatus === 'ticketed' ? dispatchTicket(record) : changeTriageMode(record.id, newStatus)
-  )
+  const changeRecordMode = async (record: any, newStatus: TriageMode): Promise<boolean> => {
+    if (archiveView === 'archived' || modeBusyId || archiveBusyId) return false
+    const currentStatus = String(record.triage_status || 'unhandled')
+    if (currentStatus === newStatus) return false
+    const modeLabel = CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus
+    const values = await askStatusChange({
+      statusLabel: modeLabel,
+      requireFeishuTableNo: newStatus === 'negative_feishu',
+      defaultFeishuTableNo: String(record.feishu_table_no || ''),
+    })
+    if (!values) return false
+    return changeTriageMode(record.id, newStatus, values)
+  }
 
   const runBatch = async (newStatus: TriageMode) => {
     if (archiveView === 'archived' || sel.count === 0) return
+    const modeLabel = CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus
+    const values = await askStatusChange({
+      statusLabel: modeLabel,
+      batchCount: sel.count,
+      requireFeishuTableNo: newStatus === 'negative_feishu',
+    })
+    if (!values) return
     setBatchFeedback(null)
     setBatchBusy(true)
     try {
       const ids = [...sel.selected]
-      const result = await api.patch<BatchModeMutationResponse>('/triage/records/batch', { ids, status: newStatus })
+      const result = await api.patch<BatchModeMutationResponse>('/triage/records/batch', {
+        ids,
+        status: newStatus,
+        note: values.note,
+        ...(newStatus === 'negative_feishu' ? { feishuTableNo: values.feishuTableNo } : {}),
+      })
       const changedIds = changedBatchModeIds(result, ids)
       const skippedCount = Math.max(0, ids.length - changedIds.length)
-      const modeLabel = CONTENT_TRIAGE_MODES.find(mode => mode.value === newStatus)?.label || newStatus
       const page = pagination?.page || 1
       const changedSet = new Set(changedIds)
       const changedOnPage = records.filter(record => changedSet.has(String(record.id).toLowerCase())).length
@@ -669,7 +660,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         return
       }
 
-      syncModeLocally(changedIds, newStatus)
+      syncModeLocally(
+        changedIds,
+        newStatus,
+        newStatus === 'negative_feishu' ? values.feishuTableNo : undefined,
+      )
       sel.clear()
       showBatchFeedback(
         skippedCount > 0
@@ -734,12 +729,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const interactions = (r: any) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
   const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
   const someChecked = records.some(r => sel.has(r.id))
-  const contentStatusOptions: Array<[string, string]> = [
-    ['unhandled', '待处理'],
-    ['reviewing', '负面流程'],
-    ['official_responded', '官方已评'],
-    ['no_action', '无需操作'],
-  ]
+  const contentStatusOptions: Array<[string, string]> = CONTENT_TRIAGE_MODES.map(mode => [mode.value, mode.label])
 
   const narrow = false
   const drawerArchived = Boolean(drawerRecord?.archived_at)
@@ -751,15 +741,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     record: drawerRecord,
     onClose: () => setDrawerRecord(null),
     canWrite: canWrite(),
-    onLinkIssue: async () => {
-      const changed = await dispatchTicket(drawerRecord)
-      if (changed) setDrawerRecord(null)
-      return changed
-    },
     onSetStatus: drawerArchived ? undefined : async (s: string) => {
       return changeRecordMode(drawerRecord, s as TriageMode)
     },
-    onMarkResponded: drawerArchived ? undefined : async () => changeTriageMode(drawerRecord.id, 'official_responded'),
+    onSetFeishuTableNo: drawerArchived
+      ? undefined
+      : (value: string) => saveFeishuTableNo(drawerRecord, value),
     onSetArchived: async (archived: boolean) => changeArchive(drawerRecord.id, archived),
     onFalsePositive: drawerArchived ? undefined : () => markFalsePositive(drawerRecord.id),
     falsePositivePending: Boolean(drawerRecord.false_positive_pending),
@@ -767,65 +754,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     customTagCatalog,
     onUpdateCustomTags: drawerArchived ? undefined : (patch: CustomTagPatch) => updateCustomTags(drawerRecord.id, patch),
     initialTab: drawerInitialTab,
-    onTicketNumberAdded: (externalTicketNo: string) => {
-      setRecords(current => current.map(record => record.id === drawerRecord.id
-        ? { ...record, ticket_number: externalTicketNo }
-        : record))
-      setDrawerRecord((current: any) => current?.id === drawerRecord.id
-        ? { ...current, ticket_number: externalTicketNo }
-        : current)
-      setBoardNonce(n => n + 1)
-    },
-    onTicketStatusChanged: (ticketStatus: string) => {
-      setRecords(current => current.map(record => record.id === drawerRecord.id
-        ? { ...record, ticket_status: ticketStatus }
-        : record))
-      setDrawerRecord((current: any) => current?.id === drawerRecord.id
-        ? { ...current, ticket_status: ticketStatus }
-        : current)
-      setBoardNonce(n => n + 1)
-    },
     onProgressAdded: (progress: RecordProgressSummary) => {
       const recordId = drawerRecord.id
-      const applyProgress = (record: any) => {
-        const activeTicket = Boolean(record.ticket_id && record.ticket_status !== 'closed')
-        return {
-          ...record,
-          progress_count: Number(record.progress_count || 0) + 1,
-          progress_latest_body: progress.body,
-          progress_latest_author: progress.authorName,
-          progress_latest_at: progress.createdAt,
-          progress_latest_type: progress.eventType,
-          ...(activeTicket ? {
-            ticket_notes_count: Number(record.ticket_notes_count || 0) + 1,
-            ticket_latest_note: progress.body,
-            ticket_latest_note_author: progress.authorName,
-            ticket_latest_note_at: progress.createdAt,
-            ticket_latest_note_type: progress.eventType,
-          } : {}),
-        }
-      }
+      const applyProgress = (record: any) => ({
+        ...record,
+        progress_count: Number(record.progress_count || 0) + 1,
+        progress_latest_body: progress.body,
+        progress_latest_author: progress.authorName,
+        progress_latest_at: progress.createdAt,
+        progress_latest_type: progress.eventType,
+      })
       setRecords(current => current.map(record => record.id === recordId ? applyProgress(record) : record))
       setDrawerRecord((current: any) => current?.id === recordId ? applyProgress(current) : current)
-    },
-    onTicketClosed: async (result: ContentTicketCloseResult) => {
-      const recordId = String(drawerRecord.id)
-      const page = pagination?.page || 1
-      const recordArchived = result.recordArchived === true
-      const targetPage = recordArchived && records.length <= 1 && page > 1 ? page - 1 : page
-      if (recordArchived) {
-        setTicketCloseNotice('')
-        syncArchiveLocally([recordId])
-      } else {
-        const blockingTicket = String(result.blockingActiveTicketNumber || '').trim()
-        setDrawerRecord(null)
-        setTicketCloseNotice(result.recordArchiveBlockedByActiveTicket
-          ? `本工单已结案，但该内容仍有另一张活动工单${blockingTicket ? `（${blockingTicket}）` : ''}，因此继续保留在“工作中”。`
-          : '本工单已结案，但内容归档状态未确认，已保留在“工作中”并刷新列表。')
-      }
-      setBoardNonce(n => n + 1)
-      refreshBadges()
-      await load(targetPage, { silent: true })
     },
   } : null
 
@@ -880,19 +820,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <button
             type="button"
             onClick={() => setBatchFeedback(null)}
-            aria-label="关闭批量处理提示"
+            aria-label="关闭操作提示"
             className="ml-1 rounded p-0.5 opacity-70 transition-opacity hover:opacity-100"
           >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      )}
-      {ticketCloseNotice && (
-        <div role="status" className="flex items-start gap-2 rounded-lg border border-primary/20 bg-primary/[0.05] px-3 py-2.5 text-[12px] text-foreground">
-          <ClipboardCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-          <span className="min-w-0 flex-1 leading-5">{ticketCloseNotice}</span>
-          <button type="button" onClick={() => setTicketCloseNotice('')} aria-label="关闭结案提示"
-            className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
             <X className="h-3.5 w-3.5" />
           </button>
         </div>
@@ -909,7 +839,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   onClick={() => {
                     setArchiveView(item.value)
                     setTriageStatus('')
-                    setTicketStatusFilter('')
                     if (item.value === 'archived') setView('list')
                   }}
                   role="tab"
@@ -931,7 +860,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、作者、工单号…" className="h-10 w-full border-transparent bg-muted pl-8 text-[12px] focus:bg-card lg:h-8" />
+                onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、作者、飞书表号…" className="h-10 w-full border-transparent bg-muted pl-8 text-[12px] focus:bg-card lg:h-8" />
             </div>
             <button
               type="button"
@@ -1012,7 +941,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             'w-full flex-wrap items-center gap-2 rounded-xl bg-muted/30 p-3',
             mobileFiltersOpen ? 'flex' : 'hidden',
             'lg:flex lg:min-h-8 lg:rounded-none lg:bg-transparent lg:p-0',
-            view === 'list' && 'xl:grid xl:grid-cols-[232px_repeat(7,minmax(0,1fr))_58px]',
+            view === 'list' && 'xl:grid xl:grid-cols-[232px_repeat(6,minmax(0,1fr))_58px]',
           )}
         >
           <div className="contents lg:hidden">
@@ -1043,19 +972,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           {view === 'list' && (
-            <>
-              <div className="w-full lg:w-[124px] xl:w-full">
-                <TriageSelect value={handlingStatus} onChange={e => changeHandlingStatusFilter(e.target.value)}
-                  aria-label="处理模式筛选"
-                  className={cn('bg-muted font-medium hover:bg-muted/70', handlingStatus ? 'text-foreground' : 'text-muted-foreground')}>
-                  <option value="">全部模式</option>
-                  {contentStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-                </TriageSelect>
-              </div>
-              <div className="w-full lg:w-[94px] xl:w-[94px] xl:justify-self-center">
-                <TicketStatusFilter value={visibleTicketStatusFilter} onChange={changeTicketStatusFilter} />
-              </div>
-            </>
+            <div className="w-full lg:w-[160px] xl:w-full">
+              <TriageSelect value={handlingStatus} onChange={e => changeHandlingStatusFilter(e.target.value)}
+                aria-label="处理状态筛选"
+                className={cn('bg-muted font-medium hover:bg-muted/70', handlingStatus ? 'text-foreground' : 'text-muted-foreground')}>
+                <option value="">全部状态</option>
+                {contentStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+              </TriageSelect>
+            </div>
           )}
 
           <div className="w-full lg:w-[108px] xl:w-full">
@@ -1066,6 +990,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               <option value="xiaohongshu">小红书</option>
               <option value="douyin">抖音</option>
               <option value="weibo">微博</option>
+              <option value="unknown">未知平台</option>
             </TriageSelect>
           </div>
 
@@ -1100,7 +1025,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           reloadKey={`${sentiment}|${platform}|${boardNonce}`}
           canWrite={canWrite()}
           onOpen={record => openDrawer(record)}
-          onDispatchTicket={dispatchTicket}
+          onChangeMode={(record, nextStatus) => changeRecordMode(record, nextStatus)}
+          onSaveFeishuTableNo={(record, value) => saveFeishuTableNo(record, value)}
           refreshBadges={refreshBadges}
         />
       ) : loading ? (
@@ -1120,9 +1046,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 selected={sel.has(r.id)}
                 onToggle={() => sel.toggle(r.id)}
                 onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
+                onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                 modeBusy={modeBusyId === r.id}
                 modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
-                onSaveTicketNumber={(value: string) => saveInlineTicketNumber(r, value)}
+                onAddNote={() => addRecordNote(r)}
+                noteBusy={noteBusyId === r.id}
                 onArchive={() => changeArchive(r.id, archiveView === 'active')}
                 archiveBusy={archiveBusyId === r.id}
                 archived={archiveView === 'archived'}
@@ -1155,6 +1083,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                         { value: 'xiaohongshu', label: '小红书' },
                         { value: 'douyin', label: '抖音' },
                         { value: 'weibo', label: '微博' },
+                        { value: 'unknown', label: '未知平台' },
                       ]}
                     />
                   </th>
@@ -1181,20 +1110,20 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <th className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
-                <th className="sticky right-0 z-50 w-[180px] min-w-[180px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
-                  <div className="grid grid-cols-[88px_48px] items-center gap-2">
+                <th className="sticky right-0 z-50 w-[224px] min-w-[224px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
+                  <div className="grid grid-cols-[132px_48px] items-center gap-2">
                     <div className="flex justify-center">
                       <HeaderSingleFilter
-                        label="处理模式"
+                        label="处理状态"
                         value={handlingStatus}
                         onChange={changeHandlingStatusFilter}
                         options={[
-                          { value: '', label: '全部模式' },
+                          { value: '', label: '全部状态' },
                           ...contentStatusOptions.map(([value, label]) => ({ value, label })),
                         ]}
                       />
                     </div>
-                    <span className="sr-only">处理记录</span>
+                    <span className="sr-only">备注</span>
                   </div>
                 </th>
               </tr>
@@ -1215,11 +1144,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
                   onToggle={() => sel.toggle(r.id)}
-                  onOpenProgress={() => openDrawer(r, 'history')}
+                  onAddNote={() => addRecordNote(r)}
+                  noteBusy={noteBusyId === r.id}
                   onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
+                  onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                   modeBusy={modeBusyId === r.id}
                   modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
-                  onSaveTicketNumber={(value: string) => saveInlineTicketNumber(r, value)}
                   onArchive={() => changeArchive(r.id, archiveView === 'active')}
                   archiveBusy={archiveBusyId === r.id}
                   archived={archiveView === 'archived'}
@@ -1339,10 +1269,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           actions={archiveView === 'archived'
             ? [{ key: 'unarchive', label: '取消归档', icon: ArchiveRestore }]
             : [
-                { key: 'unhandled', label: '待处理', icon: Inbox },
-                { key: 'reviewing', label: '负面流程', icon: Bell },
-                { key: 'official_responded', label: '官方已评', icon: CheckCircle },
-                { key: 'no_action', label: '无需操作', icon: CircleOff },
+                ...CONTENT_TRIAGE_MODES
+                  .map(mode => ({ key: mode.value, label: mode.label, icon: mode.icon })),
                 { key: 'archive', label: '归档', icon: Archive, separatorBefore: true },
               ]}
         />
@@ -1353,7 +1281,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {/* eslint-disable-next-line react-hooks/refs */}
       {drawerProps && <RecordDrawer {...drawerProps} />}
       {dialog}
-      {dispatchDialog}
+      {statusChangeDialog}
     </div>
   )
 }
@@ -1361,7 +1289,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 /* 手机值守卡片：把桌面表格里最需要扫读的判断、风险和时间压到一屏内。 */
 // Mirrors the long-standing desktop row contract while keeping the mobile view local.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMode, modeBusy, modeDisabled, onSaveTicketNumber, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
+function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
@@ -1372,8 +1300,6 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
     || String(r.content_availability_status || '') === 'deleted'
     || (r.official_response_status && r.official_response_status !== 'none')
   const availabilityLabel = contentAvailabilityLabel(r)
-  const hasOpenTicket = Boolean(r.ticket_id && r.ticket_status !== 'closed')
-  const ticketClosed = Boolean(r.ticket_id && r.ticket_status === 'closed')
 
   return (
     <article
@@ -1420,13 +1346,24 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
       </div>
 
       <div className={cn('mt-3 flex flex-wrap items-center gap-1.5', canWrite && 'pl-10')}>
-        <StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
-        <TicketMarker record={r} canEditNumber={canWrite} onSaveNumber={onSaveTicketNumber} />
+        <StatusBadge tone={tone}>{r.sentiment ? (LABELS.sentiment[r.sentiment] || r.sentiment) : '—'}</StatusBadge>
+        {r.triage_status === 'negative_feishu' && (
+          <FeishuTableNumberControl
+            value={r.feishu_table_no}
+            onSave={canWrite && !archived ? onSaveFeishuTableNo : undefined}
+            disabled={modeDisabled}
+          />
+        )}
         {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
         {canWrite && !archived ? (
-          <TriageStatusMenu status={r.triage_status || 'unhandled'} ticketClosed={ticketClosed} hasOpenTicket={hasOpenTicket} busy={modeBusy} disabled={modeDisabled} onChange={onChangeMode} />
+          <TriageStatusMenu
+            status={r.triage_status || 'unhandled'}
+            busy={modeBusy}
+            disabled={modeDisabled}
+            onChange={onChangeMode}
+          />
         ) : (
-          <StatusBadge tone={ticketClosed ? 'resolved' : r.triage_status}>{ticketClosed ? '工单已结案' : (LABELS.triage[r.triage_status] || r.triage_status)}</StatusBadge>
+          <StatusBadge tone={r.triage_status || 'unhandled'}>{LABELS.triage[r.triage_status] || r.triage_status}</StatusBadge>
         )}
         {hasRiskSignals && <RiskSignals record={r} />}
         {mobileIdentity && <IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} />}
@@ -1441,7 +1378,8 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
       <div className={cn('mt-2.5 flex min-w-0 items-center justify-between gap-2', canWrite && 'pl-10')}>
         <div className="min-w-0">{customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}</div>
         <div className="flex shrink-0 items-center gap-1.5">
-          {canWrite && (archived || !hasOpenTicket) && (
+          {canWrite && !archived && <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} />}
+          {canWrite && (
             <Button
               variant="outline"
               size="icon"
@@ -1473,15 +1411,13 @@ function MobileMetric({ label, value }: { label: string; value: string }) {
 }
 
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onOpenProgress, onChangeMode, modeBusy, modeDisabled, onSaveTicketNumber, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const accentBar = recordAccentClass(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
   const triageStatus = r.triage_status || 'unhandled'
   const availabilityLabel = contentAvailabilityLabel(r)
-  const hasOpenTicket = Boolean(r.ticket_id && r.ticket_status !== 'closed')
-  const ticketClosed = Boolean(r.ticket_id && r.ticket_status === 'closed')
 
   return (
     <tr data-record-detail-trigger className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
@@ -1508,7 +1444,15 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onOp
               {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><ExternalLink className="h-2.5 w-2.5" />原文</a>}
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
             </div>
-            {r.ticket_id && <TicketMarker record={r} className="mt-1" canEditNumber={canWrite} onSaveNumber={onSaveTicketNumber} />}
+            {triageStatus === 'negative_feishu' && (
+              <FeishuTableNumberControl
+                value={r.feishu_table_no}
+                onSave={canWrite && !archived ? onSaveFeishuTableNo : undefined}
+                disabled={modeDisabled}
+                className="mt-1"
+                inputClassName="w-32"
+              />
+            )}
             {customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact className="mt-1" />}
           </div>
         </div>
@@ -1516,7 +1460,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onOp
       {!narrow && <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral" className={PLATFORM_BADGE_CLASS}>{platformName(r.platform)}</StatusBadge></td>}
       <td className="px-3 py-3.5 align-middle">
         <div className="flex flex-wrap gap-1">
-          <StatusBadge tone={tone}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
+          <StatusBadge tone={tone}>{r.sentiment ? (LABELS.sentiment[r.sentiment] || r.sentiment) : '—'}</StatusBadge>
           {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
         </div>
       </td>
@@ -1530,46 +1474,36 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onOp
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>}
       {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
       <td className={cn(
-        "sticky right-0 z-20 w-[180px] min-w-[180px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
+        "sticky right-0 z-20 w-[224px] min-w-[224px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
         open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
       )} onClick={e => e.stopPropagation()}>
-        <div className="grid grid-cols-[88px_48px] items-center gap-2">
+        <div className="grid grid-cols-[132px_48px] items-center gap-2">
           {canWrite && !archived ? (
             <TriageStatusMenu
               status={triageStatus}
-              ticketClosed={ticketClosed}
-              hasOpenTicket={hasOpenTicket}
               busy={modeBusy}
               archiveBusy={archiveBusy}
               disabled={modeDisabled}
               onChange={onChangeMode}
-              onArchiveChange={hasOpenTicket ? undefined : onArchive}
+              onArchiveChange={onArchive}
             />
           ) : (
-            <StatusBadge tone={ticketClosed ? 'resolved' : triageStatus} className={TRIAGE_MODE_BADGE_CLASS}>{ticketClosed ? '工单已结案' : (LABELS.triage[triageStatus] || triageStatus)}</StatusBadge>
+            <StatusBadge tone={triageStatus} className={TRIAGE_MODE_BADGE_CLASS}>{LABELS.triage[triageStatus] || triageStatus}</StatusBadge>
           )}
-          <InlineRecordProgress record={r} onOpen={onOpenProgress} />
+          <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} />
         </div>
       </td>
     </tr>
   )
 }
 
-const TICKET_EVENT_LABELS: Record<string, string> = {
-  note: '新增进展',
-  done: '处理完成',
-  dismissed: '无需处理',
-  closed: '已结案',
-  reopened: '重新处理',
-}
-
-function InlineRecordProgress({ record, onOpen }: {
+function InlineRecordProgress({ record, onAdd, busy = false }: {
   record: any
-  onOpen: () => void
+  onAdd: () => void
+  busy?: boolean
 }) {
   const latestBody = String(record.progress_latest_body || '').trim()
-  const latestType = String(record.progress_latest_type || 'note')
-  const latestPreview = latestBody || TICKET_EVENT_LABELS[latestType] || '暂无进展'
+  const latestPreview = latestBody || '暂无备注'
   const latestAuthor = String(record.progress_latest_author || '').trim()
   const latestAt = String(record.progress_latest_at || '')
   const notesCount = Number(record.progress_count || 0)
@@ -1580,15 +1514,18 @@ function InlineRecordProgress({ record, onOpen }: {
   return (
     <button
       type="button"
-      aria-label={notesCount > 0 ? `查看处理进展：${latestPreview}` : '查看并添加处理进展'}
+      aria-label={notesCount > 0 ? `填写备注，最近备注：${latestPreview}` : '填写备注'}
+      disabled={busy}
       onClick={event => {
         event.stopPropagation()
-        onOpen()
+        onAdd()
       }}
       onPointerDown={event => event.stopPropagation()}
       className="group/progress relative flex h-8 w-12 items-center justify-center gap-1 rounded-lg border border-primary/20 bg-primary/[0.06] text-primary outline-none transition-[color,background-color,border-color,box-shadow] hover:border-primary/35 hover:bg-primary/[0.12] hover:shadow-sm focus-visible:border-primary/35 focus-visible:bg-primary/[0.12] focus-visible:ring-2 focus-visible:ring-primary/20"
     >
-      {notesCount > 0 ? (
+      {busy ? (
+        <Loader2 className="h-4 w-4 animate-spin" />
+      ) : notesCount > 0 ? (
         <>
           <MessageSquareText className="h-4 w-4 shrink-0" />
           <span className="text-[10px] font-semibold tabular-nums">{notesCount > 99 ? '99+' : notesCount}</span>
@@ -1600,198 +1537,54 @@ function InlineRecordProgress({ record, onOpen }: {
         aria-hidden="true"
         className="pointer-events-none absolute right-[calc(100%+8px)] top-1/2 z-50 w-64 -translate-y-1/2 translate-x-2 rounded-lg border border-border bg-card px-3 py-2.5 text-left text-foreground opacity-0 shadow-xl transition-[opacity,transform] duration-150 group-hover/progress:translate-x-0 group-hover/progress:opacity-100 group-focus-visible/progress:translate-x-0 group-focus-visible/progress:opacity-100 motion-reduce:transition-none"
       >
-        <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">最近进展</span>
+        <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">最近备注</span>
         <span className={cn('mt-1 block line-clamp-2 text-[12px] font-medium leading-5', notesCount > 0 ? 'text-foreground' : 'text-muted-foreground')}>
           {latestPreview}
         </span>
         <span className="mt-1.5 block truncate text-[10px] text-muted-foreground">
-          {fullMeta || '点击查看并添加'}
+          {fullMeta || '点击填写备注'}
         </span>
       </span>
     </button>
   )
 }
 
-function TicketMarker({ record, className = '', canEditNumber = false, onSaveNumber }: {
-  record: any
-  className?: string
-  canEditNumber?: boolean
-  onSaveNumber?: (value: string) => Promise<TicketNumberSaveResult>
-}) {
-  const [editing, setEditing] = useState(false)
-  if (!record?.ticket_id) return null
-  const number = String(record.ticket_number || '').trim()
-  const matchedNumber = String(record.matched_ticket_number || '').trim()
-  const closed = record.ticket_status === 'closed'
-  const closedNumberBackfill = closed && !number
-  const editable = canEditNumber && Boolean(onSaveNumber)
-    && ((!record.archived_at && !closed) || closedNumberBackfill)
-  if (editing && editable && onSaveNumber) {
-    return (
-      <InlineTicketNumberEditor
-        key={`${record.ticket_id}:${number}`}
-        className={className}
-        initialValue={number}
-        onSave={onSaveNumber}
-        onCancel={() => setEditing(false)}
-        onSaved={() => setEditing(false)}
-      />
-    )
-  }
-  if (!number && editable) {
-    return (
-      <button
-        type="button"
-        className={cn('inline-flex h-5 items-center gap-1 rounded px-0.5 text-[10.5px] font-medium text-primary outline-none transition-colors hover:bg-primary/[0.06] focus-visible:bg-primary/[0.06]', className)}
-        onClick={event => { event.stopPropagation(); setEditing(true) }}
-        onPointerDown={event => event.stopPropagation()}
-        aria-label="补录工单号"
-        title="点击补录工单号"
-      >
-        <span>工单号</span><span aria-hidden>—</span>
-      </button>
-    )
-  }
-  const label = matchedNumber && matchedNumber !== number
-    ? `匹配工单号 ${matchedNumber} · 当前工单号 ${number || '待补录'}`
-    : (number ? `工单号 ${number}` : '工单号待补录')
-  if (editable) {
-    return (
-      <span className={cn('inline-flex h-5 max-w-full items-center gap-0.5', className)} title={label}>
-        <button
-          type="button"
-          className="inline-flex h-5 min-w-0 items-center gap-1.5 rounded px-0.5 text-[10.5px] outline-none transition-colors hover:bg-muted focus-visible:bg-muted"
-          onClick={event => { event.stopPropagation(); setEditing(true) }}
-          onPointerDown={event => event.stopPropagation()}
-          aria-label={`修改工单号：${number}`}
-        >
-          <span className="shrink-0 font-medium text-primary">工单号</span>
-          <span className="max-w-40 truncate font-semibold text-foreground">{matchedNumber && matchedNumber !== number ? `${matchedNumber} / ${number}` : number}</span>
-        </button>
-        <CopyTicketNumberButton value={number} className="h-5 w-5 rounded" />
-      </span>
-    )
-  }
-  return (
-    <span className={cn('inline-flex h-5 max-w-full items-center gap-0.5 text-[10.5px]', className)} title={label}>
-      <span className="inline-flex min-w-0 items-center gap-1.5 px-0.5">
-        <span className="shrink-0 font-medium text-primary">工单号</span>
-        <span className="max-w-40 truncate font-semibold text-foreground">{number || '—'}</span>
-      </span>
-      <CopyTicketNumberButton value={number} className="h-5 w-5 rounded" />
-    </span>
-  )
-}
-
-function InlineTicketNumberEditor({ className = '', initialValue = '', onSave, onCancel, onSaved }: {
-  className?: string
-  initialValue?: string
-  onSave: (value: string) => Promise<TicketNumberSaveResult>
-  onCancel?: () => void
-  onSaved?: () => void
-}) {
-  const [value, setValue] = useState(initialValue)
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-  const savingRef = useRef(false)
-
-  const save = async () => {
-    const externalTicketNo = value.trim()
-    if (!externalTicketNo || savingRef.current) return
-    if (externalTicketNo === initialValue.trim()) {
-      onSaved?.()
-      return
-    }
-    savingRef.current = true
-    setSaving(true)
-    setError('')
-    const result = await onSave(externalTicketNo)
-    if (!result.ok) setError(result.message || '工单号保存失败')
-    else onSaved?.()
-    setSaving(false)
-    savingRef.current = false
-  }
-
-  return (
-    <div className={cn('inline-flex max-w-full flex-col items-start', className)}>
-      <form
-        onSubmit={event => { event.preventDefault(); event.stopPropagation(); void save() }}
-        onClick={event => event.stopPropagation()}
-        onPointerDown={event => event.stopPropagation()}
-        onKeyDown={event => {
-          event.stopPropagation()
-          if (event.key === 'Escape') {
-            event.preventDefault()
-            onCancel?.()
-          }
-        }}
-        className="inline-flex h-6 max-w-full items-center gap-1.5"
-      >
-        <span className="shrink-0 text-[10.5px] font-medium text-primary">工单号</span>
-        <input
-          autoFocus
-          value={value}
-          maxLength={100}
-          autoComplete="off"
-          onChange={event => { setValue(event.target.value); setError('') }}
-          onBlur={() => {
-            if (value.trim()) void save()
-            else onCancel?.()
-          }}
-          placeholder="输入工单号"
-          aria-label="补录工单号"
-          disabled={saving}
-          className={cn(
-            'ticket-number-input h-6 w-28 min-w-0 rounded-none border-0 border-b bg-transparent px-0.5 text-[11px] font-medium text-foreground outline-none transition-colors placeholder:text-muted-foreground/55 disabled:opacity-60',
-            error ? 'border-destructive' : 'border-border focus:border-primary',
-          )}
-        />
-      </form>
-      {error && <span role="alert" className="mt-1 max-w-44 text-[10px] font-medium leading-3 text-destructive">{error}</span>}
-    </div>
-  )
-}
-
-function TriageStatusMenu({ status, ticketClosed, hasOpenTicket, busy, archiveBusy, disabled, onChange, onArchiveChange }: {
+function TriageStatusMenu({ status, busy, archiveBusy, disabled, onChange, onArchiveChange }: {
   status: string
-  ticketClosed?: boolean
-  hasOpenTicket?: boolean
   busy?: boolean
   archiveBusy?: boolean
   disabled?: boolean
   onChange: (status: TriageMode) => void | Promise<unknown>
   onArchiveChange?: () => void | Promise<unknown>
 }) {
-  const label = ticketClosed ? '工单已结案' : (LABELS.triage[status] || status || '待处理')
-  const ticketActive = status === 'ticketed'
-  const ticketBranchLabel = hasOpenTicket || ticketActive ? '已转工单' : '转工单'
+  const label = LABELS.triage[status] || status || '待处理'
   return (
     <DropdownMenu.Root>
-      <DropdownMenu.Trigger asChild>
-        <button
-          type="button"
-          disabled={busy || archiveBusy || disabled}
-          aria-label={`当前处理模式：${label}，点击修改`}
-          onClick={event => event.stopPropagation()}
-          className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
-        >
-          <StatusBadge tone={ticketClosed ? 'resolved' : status} className={cn(TRIAGE_MODE_BADGE_CLASS, 'gap-1 transition-[filter,box-shadow] hover:brightness-95 hover:shadow-sm')}>
-            <span className="min-w-0 flex-1 text-center">{label}</span>
-            {busy || archiveBusy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <ChevronDown className="h-3 w-3 shrink-0" />}
-          </StatusBadge>
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="start"
-          sideOffset={6}
-          collisionPadding={10}
-          onClick={event => event.stopPropagation()}
-          className="z-[100] w-[196px] max-w-[calc(100vw-16px)] animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
-        >
-          <div className="px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground">处理模式</div>
+        <DropdownMenu.Trigger asChild>
+          <button
+            type="button"
+            disabled={busy || archiveBusy || disabled}
+            aria-label={`当前处理状态：${label}，点击修改`}
+            onClick={event => event.stopPropagation()}
+            className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+          >
+            <StatusBadge tone={status} className={cn(TRIAGE_MODE_BADGE_CLASS, 'gap-1 transition-[filter,box-shadow] hover:brightness-95 hover:shadow-sm')}>
+              <span className="min-w-0 flex-1 text-center">{label}</span>
+              {busy || archiveBusy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <ChevronDown className="h-3 w-3 shrink-0" />}
+            </StatusBadge>
+          </button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="start"
+            sideOffset={6}
+            collisionPadding={10}
+            onClick={event => event.stopPropagation()}
+            className="z-[100] w-[236px] max-w-[calc(100vw-16px)] animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
+          >
+          <div className="px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground">处理状态</div>
           <DropdownMenu.Separator className="mb-1 h-px bg-border/70" />
-          <DropdownMenu.RadioGroup value={status} aria-label="内容处理模式">
+          <DropdownMenu.RadioGroup value={status} aria-label="内容处理状态">
             {CONTENT_TRIAGE_MODES.map(option => {
               const active = option.value === status
               const Icon = option.icon
@@ -1799,7 +1592,7 @@ function TriageStatusMenu({ status, ticketClosed, hasOpenTicket, busy, archiveBu
                 <DropdownMenu.RadioItem
                   key={option.value}
                   value={option.value}
-                  disabled={busy || disabled || hasOpenTicket}
+                  disabled={busy || disabled}
                   onSelect={() => { if (!active) void onChange(option.value) }}
                   className="flex h-10 cursor-default select-none items-center gap-2.5 rounded-md px-2.5 text-[13px] text-foreground outline-none transition-colors data-[disabled]:opacity-45 data-[highlighted]:bg-accent"
                 >
@@ -1827,17 +1620,8 @@ function TriageStatusMenu({ status, ticketClosed, hasOpenTicket, busy, archiveBu
               </DropdownMenu.Item>
             </>
           )}
-          <DropdownMenu.Separator className="my-1 h-px bg-border/70" />
-          <DropdownMenu.Item
-            onSelect={() => { if (!hasOpenTicket && !ticketActive) void onChange(TICKET_TRIAGE_MODE.value) }}
-            aria-current={ticketActive ? 'true' : undefined}
-            className="flex h-10 cursor-default select-none items-center gap-2.5 rounded-md px-2.5 text-[13px] font-semibold text-primary outline-none transition-colors data-[highlighted]:bg-primary/[0.08]"
-          >
-            <ClipboardCheck className="h-4 w-4 shrink-0" />
-            <span>{ticketBranchLabel}</span>
-          </DropdownMenu.Item>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
     </DropdownMenu.Root>
   )
 }

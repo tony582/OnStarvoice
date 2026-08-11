@@ -148,7 +148,7 @@ export function OpinionAnalysisPage() {
           onOpenRecord={openRecord} />
         {drawerRecord && (
           <RecordDrawer record={drawerRecord} onClose={() => setDrawerRecord(null)}
-            canWrite={canWrite()} onLinkIssue={() => {}} />
+            canWrite={canWrite()} />
         )}
       </>
     )

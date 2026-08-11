@@ -411,7 +411,7 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
-// 评论写库后:重算事实计数与官方回复状态，只追加提醒，绝不改人工处理模式。
+// 评论写库后:重算事实计数与官方回复状态，只追加提醒，绝不改人工处理状态。
 // Phase A(规则入库后)与 Phase B(AI 精炼后)共用。
 async function finalizeRecordAggregate(tx, { tenantId, recordId, previousAggregate }) {
   const aggregate = await aggregateRecordComments(tx, tenantId, recordId);

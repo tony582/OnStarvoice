@@ -261,8 +261,8 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
         ? `当前有 ${urgentTotal} 项需要你关注`
         : '当前没有紧急待办，可以继续观察'
 
-  const handled = Number(k.issue_linked || 0)
-  const active = Number(k.active_or_ticketed ?? (Number(k.unhandled || 0) + Number(k.reviewing || 0) + handled))
+  const handled = Number(k.handled_total || 0)
+  const active = Number(k.status_total ?? (Number(k.unhandled || 0) + handled))
   const handledPct = active ? Math.round((handled / active) * 100) : 0
 
   return (
@@ -347,12 +347,12 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
         </section>
 
         <section className="rounded-2xl border border-border bg-card p-4">
-          <SectionHeading label="工单覆盖" meta={`${handled} / ${active}`} />
+          <SectionHeading label="状态处理进度" meta={`${handled} / ${active}`} />
           <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green" style={{ width: `${handledPct}%` }} /></div>
           <div className="mt-3 grid grid-cols-3 divide-x divide-border text-center">
-            <MiniMetric label="待判断" value={k.unhandled} />
-            <MiniMetric label="负面流程" value={k.reviewing} />
-            <MiniMetric label="已转工单" value={k.issue_linked} />
+            <MiniMetric label="待处理" value={k.unhandled} />
+            <MiniMetric label="飞书表" value={k.negative_feishu} />
+            <MiniMetric label="冷处理" value={k.negative_cold} />
           </div>
         </section>
 
@@ -373,7 +373,7 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
   const adminFeedback = isPlatformAdmin() ? badges.feedbackPending : 0
   const total = badges.triagePending + badges.leadsNew + adminFeedback + badges.issuesOpen
   const queues = [
-    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、跟进工单或标记处理模式', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
+    { title: '内容分诊', count: badges.triagePending, copy: '判断风险、更新处理状态或填写备注', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
     { title: '评论分诊', count: badges.leadsNew, copy: '跟进风险评论，转工单或忽略', icon: MessageSquare, tone: 'orange', page: 'workbench', params: { queue: 'leads' } },
     { title: '问题处置', count: badges.issuesOpen, copy: '确认负责人、解决问题或关闭事件', icon: CircleAlert, tone: 'purple', page: 'workbench', params: { queue: 'issues' } },
     ...(isPlatformAdmin() ? [{ title: '误判反馈', count: badges.feedbackPending, copy: '核对客户提交的误报并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } }] : []),
@@ -391,7 +391,7 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
 
         <div className="grid grid-cols-2 gap-2">
           <QuickFilter label="高风险" value={String(badges.triagePending)} onClick={() => openPage('workbench', { queue: 'triage', sentiment: 'negative' })} />
-          <QuickFilter label="已转工单" value="处理模式" onClick={() => openPage('workbench', { queue: 'triage', status: 'ticketed' })} />
+          <QuickFilter label="负面-飞书表" value="处理状态" onClick={() => openPage('workbench', { queue: 'triage', status: 'negative_feishu' })} />
         </div>
 
         <section>

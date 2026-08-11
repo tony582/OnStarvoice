@@ -2,6 +2,12 @@ import { Router } from 'express';
 import { queryOne, queryAll, execute } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
 import { buildAnalyticsDashboard, generateOpinionInsight } from '../services/report-generator.js';
+import {
+  buildAnalyticsDrilldown,
+  isValidAnalyticsDrilldownSelection,
+} from '../services/analytics-drilldown.js';
+import { buildAnalyticsWorkbook } from '../services/analytics-workbook.js';
+import { sendWorkbook } from '../services/xlsx-export.js';
 
 const router = Router();
 
@@ -18,6 +24,30 @@ function shanghaiParts(date = new Date()) {
 function shanghaiDayStart(date = new Date()) {
   const parts = shanghaiParts(date);
   return new Date(`${parts.year}-${parts.month}-${parts.day}T00:00:00+08:00`);
+}
+
+function shanghaiMonthStart(date = new Date()) {
+  const parts = shanghaiParts(date);
+  return new Date(`${parts.year}-${parts.month}-01T00:00:00+08:00`);
+}
+
+function parseShanghaiMonth(value, now = new Date()) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(value || ''));
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (year < 2000 || year > 2100 || month < 1 || month > 12) return null;
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const start = new Date(`${year}-${String(month).padStart(2, '0')}-01T00:00:00+08:00`);
+  const nextStart = new Date(`${nextYear}-${String(nextMonth).padStart(2, '0')}-01T00:00:00+08:00`);
+  const end = now >= start && now < nextStart ? now : nextStart;
+  return {
+    month: `${year}-${String(month).padStart(2, '0')}`,
+    start,
+    end,
+    label: `${year}年${month}月（月报）`,
+  };
 }
 
 function addDays(date, days) {
@@ -52,8 +82,18 @@ async function dataBounds(tenantId) {
 }
 
 async function resolveRange(tenantId, query) {
-  const range = String(query.range || '7d');
+  const range = String(query.range || 'month');
   const today = shanghaiDayStart();
+
+  if (range === 'month') {
+    const parts = shanghaiParts();
+    const selected = parseShanghaiMonth(query.month || `${parts.year}-${parts.month}`);
+    if (!selected) return { error: '请选择有效的统计月份' };
+    return {
+      range,
+      ...selected,
+    };
+  }
 
   if (range === 'custom') {
     const start = parseLocalDate(query.start);
@@ -73,6 +113,10 @@ async function resolveRange(tenantId, query) {
 
   if (range === 'yesterday') {
     return { range, start: addDays(today, -1), end: today, label: '昨日' };
+  }
+
+  if (range === '7d') {
+    return { range, start: addDays(today, -6), end: new Date(), label: '近7天' };
   }
 
   if (range === '30d') {
@@ -95,7 +139,20 @@ async function resolveRange(tenantId, query) {
     };
   }
 
-  return { range: '7d', start: addDays(today, -6), end: new Date(), label: '近7天' };
+  const parts = shanghaiParts();
+  return {
+    range: 'month',
+    start: shanghaiMonthStart(),
+    end: new Date(),
+    label: `${parts.year}年${Number(parts.month)}月（月报）`,
+  };
+}
+
+function dashboardKeywords(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
@@ -106,10 +163,7 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
     }
 
     // 数据看板按「采集关键词」收敛(关注主题/临时筛选);多个用逗号分隔。空=全量。
-    const keywords = String(req.query.keywords || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const keywords = dashboardKeywords(req.query.keywords);
 
     const snapshot = await buildAnalyticsDashboard({
       tenantId: req.tenantId,
@@ -122,12 +176,70 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
       ok: true,
       period: {
         range: period.range,
+        month: period.month || null,
         label: period.label,
         start: period.start.toISOString(),
         end: period.end.toISOString(),
         generatedAt: new Date().toISOString(),
       },
       snapshot,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/dashboard/export', requireTenantAccess, async (req, res, next) => {
+  try {
+    const period = await resolveRange(req.tenantId, req.query);
+    if (period.error) {
+      return res.status(400).json({ ok: false, error: 'invalid_range', message: period.error });
+    }
+    const workbook = await buildAnalyticsWorkbook({
+      tenantId: req.tenantId,
+      periodStart: period.start,
+      periodEnd: period.end,
+      periodLabel: period.label,
+      keywords: dashboardKeywords(req.query.keywords),
+    });
+    return await sendWorkbook(res, {
+      workbook,
+      filename: `${period.label}-月报基础分析及数据源.xlsx`,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/dashboard/drilldown', requireTenantAccess, async (req, res, next) => {
+  try {
+    const dimension = String(req.query.dimension || '');
+    const value = String(req.query.value || '');
+    if (!isValidAnalyticsDrilldownSelection(dimension, value)) {
+      return res.status(400).json({ ok: false, error: 'invalid_drilldown', message: '不支持的下钻条件' });
+    }
+    const period = await resolveRange(req.tenantId, req.query);
+    if (period.error) {
+      return res.status(400).json({ ok: false, error: 'invalid_range', message: period.error });
+    }
+    const drilldown = await buildAnalyticsDrilldown({
+      tenantId: req.tenantId,
+      periodStart: period.start,
+      periodEnd: period.end,
+      keywords: dashboardKeywords(req.query.keywords),
+      dimension,
+      value,
+    });
+    return res.json({
+      ok: true,
+      period: {
+        range: period.range,
+        month: period.month || null,
+        label: period.label,
+        start: period.start.toISOString(),
+        end: period.end.toISOString(),
+      },
+      drilldown,
     });
   } catch (err) {
     return next(err);

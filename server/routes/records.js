@@ -840,17 +840,6 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
       });
       if (!lifecycle) return { notFound: true };
       if (lifecycle.archived_at) return { archived: true };
-      const activeTicket = await tx.queryOne(`
-        SELECT id, external_ticket_no
-        FROM tickets
-        WHERE tenant_id = $1
-          AND source_type = 'content'
-          AND source_record_id = $2
-          AND status <> 'closed'
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-      `, [req.tenantId, req.params.id]);
-      if (activeTicket) return { activeTicket };
       const previous = await tx.queryOne(`
         SELECT r.official_response_status,
           COALESCE(rt.status, 'unhandled') AS triage_status
@@ -866,21 +855,11 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
         WHERE id = $2 AND tenant_id = $3
       `, [nextStatus, req.params.id, req.tenantId]);
       await tx.execute(`
-        INSERT INTO record_triage (tenant_id, record_id, status, priority, owner_user_id, owner_name, note, updated_at)
-        VALUES ($1, $2, 'official_responded', 'normal', $3, $4, $5, now())
-        ON CONFLICT (tenant_id, record_id)
-        DO UPDATE SET status = 'official_responded',
-          owner_user_id = excluded.owner_user_id,
-          owner_name = excluded.owner_name,
-          note = excluded.note,
-          updated_at = now()
-      `, [req.tenantId, req.params.id, req.user?.id || null, req.actorName || '', note]);
-      await tx.execute(`
         INSERT INTO audit_logs (tenant_id, actor_type, actor_id, actor_user_id, action, target_type, target_id, metadata)
         VALUES ($1, 'user', $2, $3, 'record.official_response_marked', 'record', $4, $5::jsonb)
       `, [req.tenantId, req.user?.id || '', req.user?.id || null, req.params.id, JSON.stringify({
         previousStatus: previous?.triage_status || 'unhandled',
-        nextStatus: 'official_responded',
+        nextStatus: previous?.triage_status || 'unhandled',
         previousOfficialStatus: previous?.official_response_status || 'none',
         nextOfficialStatus: nextStatus,
         note,
@@ -889,15 +868,6 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
     });
     if (result.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     if (result.archived) return sendRecordArchived(res, [req.params.id]);
-    if (result.activeTicket) {
-      return res.status(409).json({
-        ok: false,
-        error: 'content_ticket_active',
-        message: '工单结案前，处理模式须保留为“已转工单”',
-        ticketId: result.activeTicket.id,
-        externalTicketNo: result.activeTicket.external_ticket_no || '',
-      });
-    }
     return res.json({ ok: true });
   } catch (err) {
     return next(err);

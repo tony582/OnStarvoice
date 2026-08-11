@@ -28,7 +28,6 @@ import {
 } from 'recharts'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
-import { useNav } from '@/lib/navigation'
 import { cn, formatNumber, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -652,7 +651,6 @@ function CompactMetric({
 
 export function NegativePatrolTab() {
   const { canWrite } = useAuth()
-  const { navigate } = useNav()
   const [range, setRange] = useState<RangePreset>('7d')
   const [start, setStart] = useState(inputDate(-6))
   const [end, setEnd] = useState(inputDate())
@@ -849,10 +847,6 @@ export function NegativePatrolTab() {
           record={drawerRecord}
           onClose={() => setDrawerRecord(null)}
           canWrite={canWrite()}
-          onLinkIssue={() => {
-            setDrawerRecord(null)
-            navigate('workbench', { queue: 'triage' })
-          }}
         />
       )}
     </div>

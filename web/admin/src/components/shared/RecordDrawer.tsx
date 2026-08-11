@@ -14,8 +14,11 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
-import { CopyTicketNumberButton } from '@/components/shared/CopyTicketNumberButton'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
+import {
+  FeishuTableNumberControl,
+  type FeishuTableNumberSaveResult,
+} from '@/components/shared/FeishuTableNumberControl'
 import {
   recordDisplayImageEntries,
   recordDisplayImages,
@@ -46,13 +49,6 @@ interface RecordActivity {
 type AsyncDrawerAction = () => Promise<boolean | void> | boolean | void
 type RecordDrawerTab = 'content' | 'comments' | 'official' | 'snapshot' | 'patrol' | 'history'
 
-export interface ContentTicketCloseResult {
-  recordArchived?: boolean
-  recordArchiveBlockedByActiveTicket?: boolean
-  blockingActiveTicketId?: string | null
-  blockingActiveTicketNumber?: string | null
-}
-
 export interface RecordProgressSummary {
   body: string
   authorName: string
@@ -64,9 +60,8 @@ interface RecordDrawerProps {
   record: any
   onClose: () => void
   canWrite: boolean
-  onLinkIssue: AsyncDrawerAction
   onSetStatus?: (status: string) => Promise<boolean | void> | boolean | void
-  onMarkResponded?: AsyncDrawerAction
+  onSetFeishuTableNo?: (value: string) => Promise<FeishuTableNumberSaveResult>
   onSetArchived?: (archived: boolean) => Promise<boolean | void> | boolean | void
   onFalsePositive?: AsyncDrawerAction
   falsePositivePending?: boolean
@@ -74,10 +69,7 @@ interface RecordDrawerProps {
   customTagCatalog?: CustomTag[]
   onUpdateCustomTags?: (patch: CustomTagPatch) => Promise<CustomTag[]>
   initialTab?: RecordDrawerTab
-  onTicketNumberAdded?: (externalTicketNo: string) => void
-  onTicketStatusChanged?: (status: string) => void
   onProgressAdded?: (progress: RecordProgressSummary) => void
-  onTicketClosed?: (result: ContentTicketCloseResult) => Promise<void> | void
 }
 
 export function RecordDrawer(props: RecordDrawerProps) {
@@ -88,9 +80,8 @@ function RecordDrawerContent({
   record: r,
   onClose,
   canWrite,
-  onLinkIssue,
   onSetStatus,
-  onMarkResponded,
+  onSetFeishuTableNo,
   onSetArchived,
   onFalsePositive,
   falsePositivePending = false,
@@ -98,10 +89,7 @@ function RecordDrawerContent({
   customTagCatalog = [],
   onUpdateCustomTags,
   initialTab = 'content',
-  onTicketNumberAdded,
-  onTicketStatusChanged,
   onProgressAdded,
-  onTicketClosed,
 }: RecordDrawerProps) {
   const [tab, setTab] = useState<RecordDrawerTab>(initialTab)
   const [comments, setComments] = useState<any[]>([])
@@ -123,15 +111,6 @@ function RecordDrawerContent({
   const [savingNote, setSavingNote] = useState(false)
   const [noteError, setNoteError] = useState('')
   const [actionError, setActionError] = useState('')
-  const [ticketCloseConfirmOpen, setTicketCloseConfirmOpen] = useState(false)
-  const [ticketCloseNote, setTicketCloseNote] = useState('')
-  const [ticketStatus, setTicketStatus] = useState(String(r.ticket_status || ''))
-  const [ticketNumber, setTicketNumber] = useState(String(r.ticket_number || ''))
-  const [ticketNumberDraft, setTicketNumberDraft] = useState(String(r.ticket_number || ''))
-  const [editingTicketNumber, setEditingTicketNumber] = useState(false)
-  const [savingTicketNumber, setSavingTicketNumber] = useState(false)
-  const [ticketNumberError, setTicketNumberError] = useState('')
-  const ticketNumberCancelRef = useRef(false)
   const panelRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
@@ -158,29 +137,19 @@ function RecordDrawerContent({
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || savingTicketNumber) return
-      if (ticketCloseConfirmOpen) {
-        setTicketCloseConfirmOpen(false)
-        setTicketCloseNote('')
-      }
-      else if (editingTicketNumber) {
-        ticketNumberCancelRef.current = true
-        setTicketNumberDraft(ticketNumber)
-        setTicketNumberError('')
-        setEditingTicketNumber(false)
-      }
-      else if (editingLabels) setEditingLabels(false)
+      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote) return
+      if (editingLabels) setEditingLabels(false)
       else if (editingJudgement) setEditingJudgement(false)
       else if (lightbox) setLightbox('')
       else onClose()
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
-  }, [editingJudgement, editingLabels, editingTicketNumber, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, savingTicketNumber, statusBusy, ticketCloseConfirmOpen, ticketNumber])
+  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, statusBusy])
 
   useEffect(() => {
     const h = (e: MouseEvent) => {
-      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || savingTicketNumber || editingJudgement || editingLabels || editingTicketNumber || ticketCloseConfirmOpen || lightbox) return
+      if (statusBusy || falsePositiveBusy || savingEdit || savingLabels || savingNote || editingJudgement || editingLabels || lightbox) return
       const target = e.target
       if (!(target instanceof Node) || panelRef.current?.contains(target)) return
       if (target instanceof Element && target.closest('[role="dialog"], [data-radix-popper-content-wrapper], [data-record-detail-trigger]')) return
@@ -188,7 +157,7 @@ function RecordDrawerContent({
     }
     document.addEventListener('mousedown', h)
     return () => document.removeEventListener('mousedown', h)
-  }, [editingJudgement, editingLabels, editingTicketNumber, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, savingTicketNumber, statusBusy, ticketCloseConfirmOpen])
+  }, [editingJudgement, editingLabels, falsePositiveBusy, lightbox, onClose, savingEdit, savingLabels, savingNote, statusBusy])
 
   // 小屏笔记本用覆盖式抽屉，避免把列表和筛选工具条挤变形；大屏才为抽屉留位。
   useEffect(() => {
@@ -297,10 +266,8 @@ function RecordDrawerContent({
   }
 
   const changeMode = async (nextMode: string) => {
-    if (archived || nextMode === triageStatus) return
-    const success = nextMode === 'official_responded' && onMarkResponded
-      ? await runStatusAction(onMarkResponded)
-      : await runStatusAction(() => onSetStatus?.(nextMode))
+    if (archived || (nextMode === triageStatus && nextMode !== 'negative_feishu')) return
+    const success = await runStatusAction(() => onSetStatus?.(nextMode))
     if (!success) return
     await refreshActivity()
   }
@@ -325,9 +292,7 @@ function RecordDrawerContent({
     setSavingNote(true)
     setNoteError('')
     try {
-      const isTicketProgress = Boolean(r.ticket_id && ticketStatus !== 'closed')
-      const endpoint = isTicketProgress ? `/tickets/${r.ticket_id}/notes` : `/records/${r.id}/notes`
-      const data = await api.post<{ note?: Record<string, unknown> }>(endpoint, { body })
+      const data = await api.post<{ note?: Record<string, unknown> }>(`/records/${r.id}/notes`, { body })
       const note = data.note || {}
       const progress = {
         body: String(note.body || body),
@@ -337,96 +302,17 @@ function RecordDrawerContent({
       }
       setActivity(current => [{
         id: String(note.id || `note-${Date.now()}`),
-        action: isTicketProgress ? 'record.ticket_progress_added' : 'record.note_added',
-        metadata: {
-          body: progress.body,
-          ...(isTicketProgress ? {
-            ticketId: r.ticket_id,
-            externalTicketNo: ticketNumber,
-            ticketStatus: ticketStatus === 'pending' ? 'doing' : ticketStatus,
-          } : {}),
-        },
+        action: 'record.note_added',
+        metadata: { body: progress.body },
         actor_name: progress.authorName,
         created_at: progress.createdAt,
       }, ...current])
       onProgressAdded?.(progress)
-      if (isTicketProgress && ticketStatus === 'pending') {
-        setTicketStatus('doing')
-        onTicketStatusChanged?.('doing')
-      }
       setNoteDraft('')
     } catch (err) {
       setNoteError(err instanceof Error ? err.message : '备注保存失败，请稍后重试')
     } finally {
       setSavingNote(false)
-    }
-  }
-
-  const saveTicketNumber = async () => {
-    const externalTicketNo = ticketNumberDraft.trim()
-    if (!externalTicketNo) {
-      setTicketNumberDraft(ticketNumber)
-      setTicketNumberError('')
-      setEditingTicketNumber(false)
-      return
-    }
-    if (externalTicketNo === ticketNumber.trim()) {
-      setTicketNumberError('')
-      setEditingTicketNumber(false)
-      return
-    }
-    const closedNumberBackfill = ticketStatus === 'closed' && !ticketNumber.trim()
-    if (!r.ticket_id || savingTicketNumber || ((ticketStatus === 'closed' || archived) && !closedNumberBackfill)) return
-    setSavingTicketNumber(true)
-    setTicketNumberError('')
-    try {
-      await api.patch(`/tickets/${r.ticket_id}/external-number`, {
-        externalTicketNo,
-        previousExternalTicketNo: ticketNumber.trim(),
-      })
-      setTicketNumber(externalTicketNo)
-      onTicketNumberAdded?.(externalTicketNo)
-      setTicketNumberDraft(externalTicketNo)
-      setEditingTicketNumber(false)
-      await refreshActivity()
-    } catch (err) {
-      setTicketNumberError(err instanceof Error ? err.message : '工单号码保存失败，请稍后重试')
-    } finally {
-      setSavingTicketNumber(false)
-    }
-  }
-
-  const closeTicket = async () => {
-    if (!r.ticket_id || ticketStatus === 'closed' || statusBusy) return
-    setStatusBusy(true)
-    setActionError('')
-    try {
-      const result = await api.patch(`/tickets/${r.ticket_id}`, {
-        action: 'close',
-        note: ticketCloseNote,
-      }) as ContentTicketCloseResult
-      setTicketStatus('closed')
-      setTicketCloseConfirmOpen(false)
-      setTicketCloseNote('')
-      if (onTicketClosed) {
-        try {
-          await onTicketClosed(result)
-        } catch (error) {
-          // 结案已经成功；父列表刷新失败不能反向把成功操作提示成失败。
-          console.warn('工单结案后的内容列表刷新失败', error)
-        }
-      } else if (result.recordArchived === true) {
-        onClose()
-      } else {
-        await refreshActivity()
-        setActionError(result.recordArchiveBlockedByActiveTicket
-          ? '本工单已结案，但该内容仍有另一张活动工单，因此继续保留在“工作中”。'
-          : '本工单已结案，但内容归档状态未确认，请刷新列表核对。')
-      }
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : '工单结案失败，请稍后重试')
-    } finally {
-      setStatusBusy(false)
     }
   }
 
@@ -450,10 +336,6 @@ function RecordDrawerContent({
   const deleted = String(r.content_availability_status || '') === 'deleted'
   const hasSignals = alerts > 0 || negComments > 0 || deleted
   const triageStatus = r.triage_status || 'unhandled'
-  const hasTicket = Boolean(r.ticket_id)
-  const addingTicketProgress = hasTicket && ticketStatus !== 'closed'
-  const canEditTicketNumber = canWrite && hasTicket
-    && ((!archived && ticketStatus !== 'closed') || (ticketStatus === 'closed' && !ticketNumber.trim()))
 
   const TABS = [
     { id: 'content' as const, label: '内容', icon: FileText },
@@ -467,9 +349,12 @@ function RecordDrawerContent({
   ]
   const modeActions = [
     { value: 'unhandled', label: '待处理', icon: Inbox },
-    { value: 'reviewing', label: '负面流程', icon: Bell },
-    { value: 'official_responded', label: '官方已评', icon: CheckCircle },
-    { value: 'no_action', label: '无需操作', icon: CircleOff },
+    { value: 'replied', label: '已回复', icon: CheckCircle },
+    { value: 'reviewed', label: '已复核', icon: Check },
+    { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
+    { value: 'unavailable', label: '已不可见', icon: CircleOff },
+    { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
+    { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
   ]
   const currentModeLabel = LABELS.triage[triageStatus] || triageStatus || '待处理'
 
@@ -488,60 +373,15 @@ function RecordDrawerContent({
           <button onClick={onClose} aria-label="返回内容列表" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground transition active:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
           <h2 className="shrink-0 text-[16px] font-bold text-foreground">舆情内容详情</h2>
-          {hasTicket && (
-            <div className="flex min-w-0 flex-1 items-center gap-2 text-[12px] tabular-nums">
-              <span className="shrink-0 font-medium text-primary">工单号</span>
-              {editingTicketNumber && canEditTicketNumber ? (
-                <input
-                  autoFocus
-                  value={ticketNumberDraft}
-                  maxLength={100}
-                  autoComplete="off"
-                  aria-label="工单号"
-                  placeholder="输入工单号"
-                  disabled={savingTicketNumber}
-                  onChange={event => { setTicketNumberDraft(event.target.value); setTicketNumberError('') }}
-                  onBlur={() => {
-                    if (ticketNumberCancelRef.current) {
-                      ticketNumberCancelRef.current = false
-                      return
-                    }
-                    void saveTicketNumber()
-                  }}
-                  onKeyDown={event => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      event.currentTarget.blur()
-                    } else if (event.key === 'Escape') {
-                      event.preventDefault()
-                      ticketNumberCancelRef.current = true
-                      setTicketNumberDraft(ticketNumber)
-                      setTicketNumberError('')
-                      setEditingTicketNumber(false)
-                    }
-                  }}
-                  className="ticket-number-input h-8 w-40 min-w-0 border-0 border-b border-primary bg-transparent px-0.5 text-[13px] font-semibold text-foreground outline-none disabled:opacity-60"
-                />
-              ) : (
-                <div className="flex min-w-0 items-center gap-0.5">
-                  <button
-                    type="button"
-                    aria-label="修改工单号"
-                    disabled={!canEditTicketNumber}
-                    onClick={() => {
-                      ticketNumberCancelRef.current = false
-                      setTicketNumberDraft(ticketNumber)
-                      setTicketNumberError('')
-                      setEditingTicketNumber(true)
-                    }}
-                    className="min-w-0 truncate rounded px-0.5 py-1 font-semibold text-foreground outline-none transition-colors enabled:hover:bg-muted enabled:hover:text-primary focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
-                  >
-                    {ticketNumber || '待补录'}
-                  </button>
-                  <CopyTicketNumberButton value={ticketNumber} className="h-7 w-7" />
-                </div>
-              )}
-              {ticketNumberError && <span role="alert" className="min-w-0 truncate text-[11px] font-medium text-destructive">{ticketNumberError}</span>}
+          {triageStatus === 'negative_feishu' && (
+            <div className="min-w-0 flex-1">
+              <FeishuTableNumberControl
+                value={r.feishu_table_no}
+                onSave={!archived ? onSetFeishuTableNo : undefined}
+                disabled={statusBusy || falsePositiveBusy}
+                className="max-w-full"
+                inputClassName="w-44"
+              />
             </div>
           )}
           <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
@@ -893,16 +733,12 @@ function RecordDrawerContent({
               </div>
             ) : (
               <div className="flex w-full min-w-0 flex-wrap items-center gap-2" aria-label="内容处理操作">
-                <div className="shrink-0" aria-label="处理模式">
-                  {addingTicketProgress ? (
-                    <StatusBadge tone="ticketed" className="h-8 gap-1.5 px-3 text-[12px]">
-                      <ClipboardCheck className="h-3.5 w-3.5" />已转工单
-                    </StatusBadge>
-                  ) : onSetStatus ? (
+                <div className="flex shrink-0 flex-col items-start gap-1" aria-label="处理状态">
+                  {onSetStatus ? (
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger asChild>
                         <button type="button" disabled={statusBusy || falsePositiveBusy}
-                          aria-label={`当前处理模式：${currentModeLabel}，点击修改`}
+                          aria-label={`当前处理状态：${currentModeLabel}，点击修改`}
                           className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60">
                           <StatusBadge tone={triageStatus} className="h-8 gap-1.5 px-3 text-[12px]">
                             {currentModeLabel}
@@ -912,8 +748,8 @@ function RecordDrawerContent({
                       </DropdownMenu.Trigger>
                       <DropdownMenu.Portal>
                         <DropdownMenu.Content align="start" sideOffset={8} collisionPadding={10}
-                          className="z-[100] w-52 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg animate-in fade-in zoom-in-95">
-                          <DropdownMenu.RadioGroup value={triageStatus} aria-label="内容处理模式">
+                          className="z-[100] w-60 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg animate-in fade-in zoom-in-95">
+                          <DropdownMenu.RadioGroup value={triageStatus} aria-label="内容处理状态">
                             {modeActions.map(item => {
                               const active = item.value === triageStatus
                               const Icon = item.icon
@@ -929,15 +765,6 @@ function RecordDrawerContent({
                               )
                             })}
                           </DropdownMenu.RadioGroup>
-                          <DropdownMenu.Separator className="my-1 h-px bg-border/70" />
-                          <DropdownMenu.Item disabled={statusBusy || falsePositiveBusy}
-                            onSelect={() => {
-                              setActionError('')
-                              void runStatusAction(onLinkIssue).then(success => { if (success) void refreshActivity() })
-                            }}
-                            className="flex h-10 cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 text-[13px] font-semibold text-primary outline-none transition-colors data-[highlighted]:bg-primary/10 data-[disabled]:cursor-default data-[disabled]:opacity-45">
-                            <ClipboardCheck className="h-4 w-4 shrink-0 text-primary" />转工单
-                          </DropdownMenu.Item>
                         </DropdownMenu.Content>
                       </DropdownMenu.Portal>
                     </DropdownMenu.Root>
@@ -957,22 +784,11 @@ function RecordDrawerContent({
                       </Button>
                     </Tooltip>
                   )}
-                  {onSetArchived && !addingTicketProgress && (
+                  {onSetArchived && (
                     <Button variant="ghost" size="sm" className="h-9 shrink-0 gap-1.5 px-2.5 text-[12px]" disabled={statusBusy || falsePositiveBusy}
                       onClick={() => runStatusAction(() => onSetArchived(true))} aria-label="归档">
                       <Archive className="h-3.5 w-3.5" />归档
                     </Button>
-                  )}
-                  {addingTicketProgress && (
-                    <>
-                      <Button className="h-9 shrink-0 px-3" variant="outline" size="sm" disabled={statusBusy || falsePositiveBusy} onClick={() => setTab('history')}>
-                        <History className="h-3.5 w-3.5" />处理记录
-                      </Button>
-                      <Button className="h-9 shrink-0 px-3" size="sm" disabled={statusBusy || falsePositiveBusy}
-                        onClick={() => { setActionError(''); setTicketCloseNote(''); setTicketCloseConfirmOpen(true) }}>
-                        <CheckCircle className="h-3.5 w-3.5" />结案
-                      </Button>
-                    </>
                   )}
                 </div>
               </div>
@@ -981,64 +797,6 @@ function RecordDrawerContent({
           </div>
         )}
       </div>
-
-      {!archived && ticketCloseConfirmOpen && addingTicketProgress && (
-        <div
-          className="fixed inset-0 z-[70] flex items-end justify-center bg-black/35 p-3 sm:items-center sm:p-4 animate-in fade-in duration-150"
-          onMouseDown={() => {
-            if (statusBusy) return
-            setTicketCloseConfirmOpen(false)
-            setTicketCloseNote('')
-          }}
-        >
-          <div
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="ticket-close-confirm-title"
-            aria-describedby="ticket-close-confirm-description"
-            className="w-full max-w-sm rounded-xl border border-border bg-card p-5 shadow-2xl animate-in zoom-in-95 duration-150"
-            onMouseDown={event => event.stopPropagation()}
-          >
-            <div className="flex items-start gap-3">
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <CheckCircle className="h-4.5 w-4.5" />
-              </span>
-              <div className="min-w-0">
-                <h3 id="ticket-close-confirm-title" className="text-[15px] font-bold">确认结案？</h3>
-                <p id="ticket-close-confirm-description" className="mt-1 text-[12px] leading-5 text-muted-foreground">
-                  结案后内容将自动移入已归档，并从“工作中”移除；如该内容另有活动工单，则会继续保留。工单与处理记录仍会保留。
-                </p>
-              </div>
-            </div>
-            <label htmlFor={`ticket-close-note-${r.id}`} className="mt-4 block text-[12px] font-semibold text-foreground">
-              结案说明 <span className="font-normal text-muted-foreground">（选填）</span>
-            </label>
-            <textarea
-              id={`ticket-close-note-${r.id}`}
-              aria-label="结案说明"
-              value={ticketCloseNote}
-              onChange={event => setTicketCloseNote(event.target.value)}
-              placeholder="填写结案说明 / 处理结论（可留空）"
-              rows={4}
-              maxLength={2000}
-              disabled={statusBusy}
-              className="mt-2 w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-[13px] leading-6 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20 disabled:opacity-60"
-            />
-            <div className="mt-1 text-right text-[10px] tabular-nums text-muted-foreground">{ticketCloseNote.length}/2000</div>
-            {actionError && <div className="mt-3 text-[12px] font-medium text-destructive">{actionError}</div>}
-            <div className="mt-5 flex justify-end gap-2">
-              <Button variant="outline" size="sm" disabled={statusBusy} onClick={() => {
-                setTicketCloseConfirmOpen(false)
-                setTicketCloseNote('')
-              }}>取消</Button>
-              <Button size="sm" disabled={statusBusy} onClick={() => void closeTicket()}>
-                {statusBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                结案
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {editingJudgement && canProcess && (
         <JudgementEditor
@@ -1167,14 +925,23 @@ function activityDetail(item: RecordActivity, recordId: string): {
     const beforeStatus = String(metadata.previousStatus || recordPrevious.status || '')
     const afterStatus = String(metadata.nextStatus || metadata.status || beforeStatus)
     const changes = beforeStatus !== afterStatus ? [{
-      label: '处理模式',
+      label: '处理状态',
       before: LABELS.triage[beforeStatus] || beforeStatus || '待处理',
       after: LABELS.triage[afterStatus] || afterStatus || '待处理',
     }] : []
+    const beforeFeishuTableNo = String(metadata.previousFeishuTableNo || recordPrevious.feishuTableNo || '')
+    const afterFeishuTableNo = String(metadata.nextFeishuTableNo || beforeFeishuTableNo)
+    if (beforeFeishuTableNo !== afterFeishuTableNo) {
+      changes.push({
+        label: '飞书表号',
+        before: beforeFeishuTableNo || '未填写',
+        after: afterFeishuTableNo || '未填写',
+      })
+    }
     const reason = String(metadata.reason || metadata.note || '').trim()
     return {
       ...result,
-      title: item.action === 'record.triage_batch_updated' ? '批量更新了处理模式' : '更新了处理模式',
+      title: item.action === 'record.triage_batch_updated' ? '批量更新了处理状态' : '更新了处理状态',
       icon: CheckCircle,
       body: reason,
       changes,
@@ -1191,7 +958,7 @@ function activityDetail(item: RecordActivity, recordId: string): {
       icon: CheckCircle,
       body: String(metadata.note || '').trim(),
       changes: [{
-        label: '处理模式',
+        label: '处理状态',
         before: LABELS.triage[beforeStatus] || beforeStatus,
         after: LABELS.triage[afterStatus] || afterStatus,
       }],
@@ -1256,7 +1023,7 @@ function activityDetail(item: RecordActivity, recordId: string): {
       ...result,
       title: '新增负评提醒',
       icon: Bell,
-      body: `检测到 ${added} 条新增负评；仅作提醒，处理模式仍为“${LABELS.triage[mode] || mode}”。`,
+      body: `检测到 ${added} 条新增负评；仅作提醒，处理状态仍为“${LABELS.triage[mode] || mode}”。`,
     }
   }
   if (item.action === 'record.official_response_detected') {
@@ -1266,7 +1033,7 @@ function activityDetail(item: RecordActivity, recordId: string): {
       ...result,
       title: '官方回复提醒',
       icon: CheckCircle,
-      body: `采集到 ${added} 条新增官方回复；仅作提醒，处理模式仍为“${LABELS.triage[mode] || mode}”。`,
+      body: `采集到 ${added} 条新增官方回复；仅作提醒，处理状态仍为“${LABELS.triage[mode] || mode}”。`,
     }
   }
   if (item.action === 'record.official_content_identified') {
@@ -1274,7 +1041,7 @@ function activityDetail(item: RecordActivity, recordId: string): {
       ...result,
       title: '识别为官方内容并移出分诊',
       icon: Eye,
-      body: '仅更新内容归属，未改变处理模式。',
+      body: '仅更新内容归属，未改变处理状态。',
     }
   }
   if (item.action === 'record.official_content_exclusion_removed') {
@@ -1282,7 +1049,7 @@ function activityDetail(item: RecordActivity, recordId: string): {
       ...result,
       title: '取消了官方内容排除',
       icon: Eye,
-      body: '仅更新内容归属，未改变处理模式。',
+      body: '仅更新内容归属，未改变处理状态。',
     }
   }
   return result

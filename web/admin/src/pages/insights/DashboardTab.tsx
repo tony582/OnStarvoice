@@ -1,7 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import cloud from 'd3-cloud'
 import {
-  AlertTriangle, BarChart3, CalendarDays, ChevronDown, Loader2, MessageSquareWarning, RefreshCw, Sparkles, Star, X,
+  AlertTriangle, BarChart3, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, Download, Loader2,
+  MessageSquareWarning, RefreshCw, Sparkles, Star, X,
 } from 'lucide-react'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import {
@@ -28,14 +29,14 @@ const G = {
   risk: '舆情风险指数(0~100)=负面率/负面评论/高危未关闭问题/告警 加权,封顶 100。≥70 重点处置,≥45 风险抬升,≥20 持续观察。是促处置的相对警戒分,非概率。',
   heat: '舆情热度指数=内容数/互动/新评论/观测 加权综合,无固定上限;数值本身无绝对含义,只看相对高低与环比。',
   official: '官方响应率=有官方回复的内容数 ÷ 总声量。',
-  pending: '待处理=当前处理模式为待处理或负面流程、且尚未归档的内容。已转工单是独立处理模式，不计入待处理。',
+  pending: '待处理=当前处理状态仍为“待处理”、且尚未归档的内容。其它状态均由客户按实际处置结果灵活维护。',
   sentiment: '情感由 AI 标注为 正面/中性/负面;"待标注"单列为灰色、不并入中性。',
   platform: '平台分布=各平台内容条数与负面率;注:平台字段缺失的内容会默认归到小红书,占比可能略有偏差。',
   category: '主题分类由 AI 归入 9 类(安全救援/续费收费/服务质量 等),其中安全/续费/服务为车企高优先级风险议题。',
   topInteraction: '按 点赞+评论+收藏+转发 之和排序的高互动内容(采集时刻快照)。',
   topNegative: '重点负面=按 负评/转发/互动 加权排序的负面内容,可逐条点开核实处置。',
   negativeComment: '负面评论为评论层风险线索,带风险等级(低~严重),与内容层"负面"是两套口径。',
-  workflow: '处置概览按互斥处理模式展示待处理与已转工单，并配合未关闭问题观察后续处置。',
+  workflow: '处置概览按当前处理状态展示；状态可按实际结果自由切换，备注单独留痕。',
   hotTerms: '热词来自标题/正文/摘要/标签的文本挖掘,与"监控关键词"(只统计监控订阅采集)口径不同。',
   media: '媒体/来源类型来自内容的类型字段(record_type / mediaType)。',
 }
@@ -61,9 +62,6 @@ const MEDIA_LABELS: Record<string, string> = {
   normal: '图文笔记', video: '视频', image: '图文', article: '文章', text: '文字', live: '直播',
   '未采集': '未知类型', '': '未知类型',
 }
-// 平台品牌色点(让平台板块更有辨识度)
-const PLATFORM_DOT: Record<string, string> = { xiaohongshu: 'bg-status-red', douyin: 'bg-foreground', weibo: 'bg-status-orange' }
-
 function mergeRegions(a: any[] = [], b: any[] = []) {
   const m = new Map<string, { region: string; count: number; negative_count: number }>()
   for (const r of [...a, ...b]) {
@@ -76,11 +74,12 @@ function mergeRegions(a: any[] = [], b: any[] = []) {
   return [...m.values()].sort((x, y) => y.count - x.count)
 }
 
-type RangePreset = 'today' | 'yesterday' | '7d' | '30d' | '90d' | 'all' | 'custom'
+type CoreDimension = 'platform' | 'sentiment' | 'status'
 
 type DashboardResponse = {
   period: {
-    range: RangePreset
+    range: 'month'
+    month: string | null
     label: string
     start: string
     end: string
@@ -89,20 +88,56 @@ type DashboardResponse = {
   snapshot: any
 }
 
-const RANGE_OPTIONS: Array<{ id: RangePreset; label: string }> = [
-  { id: 'today', label: '今日' },
-  { id: 'yesterday', label: '昨日' },
-  { id: '7d', label: '近7天' },
-  { id: '30d', label: '近30天' },
-  { id: '90d', label: '近90天' },
-  { id: 'all', label: '全部' },
-  { id: 'custom', label: '自定义' },
-]
+type DrilldownSelection = { dimension: CoreDimension; value: string }
+type DrilldownBreakdownRow = {
+  key: string
+  count: number
+  share: number
+  interactions: number
+  negativeCount: number
+}
+type DashboardDrilldown = {
+  selection: DrilldownSelection & { dimensionLabel: string; label: string }
+  summary: {
+    count: number
+    shareOfPeriod: number
+    interactions: number
+    negativeCount: number
+    negativeRate: number
+  }
+  breakdowns: Record<CoreDimension, DrilldownBreakdownRow[]>
+}
+type DashboardDrilldownResponse = { drilldown: DashboardDrilldown }
 
-function inputDate(offsetDays = 0) {
-  const date = new Date()
-  date.setDate(date.getDate() + offsetDays)
-  return date.toLocaleDateString('en-CA')
+const HANDLING_STATUS_ROWS = [
+  { key: 'unhandled', label: '待处理', color: '#D97706' },
+  { key: 'replied', label: '已回复', color: '#059669' },
+  { key: 'reviewed', label: '已复核', color: '#059669' },
+  { key: 'reviewed_non_monitor', label: '已复核-非监控内容', color: '#64748B' },
+  { key: 'unavailable', label: '已不可见', color: '#64748B' },
+  { key: 'negative_feishu', label: '负面-飞书表', color: '#DC2626' },
+  { key: 'negative_cold', label: '负面-冷处理', color: '#DC2626' },
+] as const
+
+const PLATFORM_COLOR: Record<string, string> = {
+  xiaohongshu: '#DC2626',
+  douyin: '#111827',
+  weibo: '#D97706',
+  unknown: '#94A3B8',
+}
+
+function currentShanghaiMonth() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit',
+  }).formatToParts(new Date())
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]))
+  return `${values.year}-${values.month}`
+}
+
+function shiftMonth(value: string, offset: number) {
+  const [year, month] = value.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1 + offset, 1))
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
 }
 
 function percent(value: number) {
@@ -195,23 +230,23 @@ function FocusTopicBar({ keywords, setKeywords }: { keywords: string[]; setKeywo
 }
 
 export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
-  const [range, setRange] = useState<RangePreset>('7d')
-  const [start, setStart] = useState(inputDate(-6))
-  const [end, setEnd] = useState(inputDate())
+  const [month, setMonth] = useState(currentShanghaiMonth)
   const [data, setData] = useState<DashboardResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [keywords, setKeywords] = useState<string[]>([]) // 关注主题/临时关键词:空=全量
+  const [exporting, setExporting] = useState(false)
+  const [drilldownSelection, setDrilldownSelection] = useState<DrilldownSelection | null>(null)
+  const [drilldownData, setDrilldownData] = useState<DashboardDrilldown | null>(null)
+  const [drilldownLoading, setDrilldownLoading] = useState(false)
+  const [drilldownError, setDrilldownError] = useState('')
+  const drilldownRequestRef = useRef(0)
 
   const load = useCallback(() => Promise.resolve().then(async () => {
     setLoading(true)
     setError('')
     try {
-      const params = new URLSearchParams({ range })
-      if (range === 'custom') {
-        params.set('start', start)
-        params.set('end', end)
-      }
+      const params = new URLSearchParams({ range: 'month', month })
       if (keywords.length) params.set('keywords', keywords.join(','))
       const result = await api.get<DashboardResponse>('/analytics/dashboard?' + params.toString())
       setData(result)
@@ -220,11 +255,62 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
     } finally {
       setLoading(false)
     }
-  }), [range, start, end, keywords])
+  }), [month, keywords])
 
   useEffect(() => { void load() }, [load])
 
   const s = data?.snapshot
+  const exportMonthlyWorkbook = async () => {
+    setExporting(true)
+    setError('')
+    try {
+      const params = new URLSearchParams({ range: 'month', month })
+      if (keywords.length) params.set('keywords', keywords.join(','))
+      await api.download(
+        '/analytics/dashboard/export?' + params.toString(),
+        `${data?.period?.label || '月报'}-月报基础分析及数据源.xlsx`,
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const clearDrilldown = useCallback(() => {
+    drilldownRequestRef.current += 1
+    setDrilldownSelection(null)
+    setDrilldownData(null)
+    setDrilldownLoading(false)
+    setDrilldownError('')
+  }, [])
+
+  useEffect(() => { clearDrilldown() }, [clearDrilldown, month, keywords])
+
+  const drillDown = async (dimension: CoreDimension, value: string) => {
+    if (drilldownSelection?.dimension === dimension && drilldownSelection.value === value) {
+      clearDrilldown()
+      return
+    }
+    const requestId = drilldownRequestRef.current + 1
+    drilldownRequestRef.current = requestId
+    setDrilldownSelection({ dimension, value })
+    setDrilldownData(null)
+    setDrilldownError('')
+    setDrilldownLoading(true)
+    try {
+      const params = new URLSearchParams({ range: 'month', month, dimension, value })
+      if (keywords.length) params.set('keywords', keywords.join(','))
+      const result = await api.get<DashboardDrilldownResponse>('/analytics/dashboard/drilldown?' + params.toString())
+      if (drilldownRequestRef.current === requestId) setDrilldownData(result.drilldown)
+    } catch (err) {
+      if (drilldownRequestRef.current === requestId) {
+        setDrilldownError(err instanceof Error ? err.message : '下钻分析加载失败')
+      }
+    } finally {
+      if (drilldownRequestRef.current === requestId) setDrilldownLoading(false)
+    }
+  }
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-5 duration-300">
@@ -235,25 +321,25 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
             <h2 className="mt-2 text-2xl font-bold tracking-normal text-foreground">数据看板</h2>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               <CalendarDays className="h-3.5 w-3.5" />
-              <span>{data?.period?.label || '近7天'}</span>
+              <span>{data?.period?.label || '本月（月报）'}</span>
               {data?.period?.generatedAt && <span>刷新于 {formatDate(data.period.generatedAt)}</span>}
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex flex-wrap rounded-lg border border-border bg-muted p-1">
-              {RANGE_OPTIONS.map(option => (
-                <button
-                  key={option.id}
-                  type="button"
-                  onClick={() => setRange(option.id)}
-                  className={`h-8 rounded-md px-3 text-xs font-semibold transition ${
-                    range === option.id ? 'bg-card text-primary' : 'text-muted-foreground hover:text-foreground'
-                  }`}
-                >
-                  {option.label}
-                </button>
-              ))}
+            <div className="flex h-9 items-center gap-1 rounded-lg border border-border bg-background px-2 text-xs font-semibold text-muted-foreground" aria-label="统计月份选择">
+              <span className="px-1">统计月份</span>
+              <button type="button" onClick={() => setMonth(value => shiftMonth(value, -1))} className="grid h-7 w-7 place-items-center rounded-md hover:bg-accent hover:text-foreground" aria-label="上一个月">
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </button>
+              <Input aria-label="统计月份" type="month" className="h-7 w-[138px] border-0 bg-transparent px-0 shadow-none focus-visible:ring-0" value={month} onChange={event => setMonth(event.target.value || currentShanghaiMonth())} />
+              <button type="button" onClick={() => setMonth(value => shiftMonth(value, 1))} className="grid h-7 w-7 place-items-center rounded-md hover:bg-accent hover:text-foreground" aria-label="下一个月">
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
             </div>
+            <Button variant="outline" size="sm" onClick={() => void exportMonthlyWorkbook()} disabled={exporting || !s}>
+              <Download className={`h-3.5 w-3.5 ${exporting ? 'animate-pulse' : ''}`} />
+              {exporting ? '导出中…' : '导出月报数据'}
+            </Button>
             <Button variant="outline" size="sm" onClick={load} disabled={loading}>
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
               刷新
@@ -261,18 +347,6 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
           </div>
         </div>
         <FocusTopicBar keywords={keywords} setKeywords={setKeywords} />
-        {range === 'custom' && (
-          <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border pt-4">
-            <label className="grid gap-1 text-xs font-semibold text-muted-foreground">
-              开始日期
-              <Input type="date" className="w-[170px]" value={start} onChange={e => setStart(e.target.value)} />
-            </label>
-            <label className="grid gap-1 text-xs font-semibold text-muted-foreground">
-              结束日期
-              <Input type="date" className="w-[170px]" value={end} onChange={e => setEnd(e.target.value)} />
-            </label>
-          </div>
-        )}
       </section>
 
       {error && (
@@ -289,11 +363,25 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
         <EmptyState icon={BarChart3} title="暂无看板数据" />
       ) : (
         <>
-          {/* 1. 执行摘要 —— 结论先行 */}
-          <ExecutiveSummary s={s} />
+          {/* 客户基础月报：先看核心数字，再按分布下钻或导出。 */}
+          <CoreMonthlyAnalysis
+            snapshot={s}
+            periodLabel={data?.period?.label || '月报'}
+            activeSelection={drilldownSelection}
+            drilldownData={drilldownData}
+            drilldownLoading={drilldownLoading}
+            drilldownError={drilldownError}
+            onClearFilter={clearDrilldown}
+            onDrillDown={(dimension, value) => void drillDown(dimension, value)}
+          />
 
-          {/* 1.5 AI 舆情研判 —— 按需触发,LLM 跨样本六维(议题/情绪/诉求/信号/建议,挂样本回链) */}
-          <AiInsightPanel range={range} start={start} end={end} />
+          <div className="flex items-center gap-3 pt-1" aria-label="延展分析分隔">
+            <span className="shrink-0 text-xs font-bold uppercase tracking-[0.12em] text-muted-foreground">延展分析</span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+
+          {/* 执行摘要与专业分析统一后移。 */}
+          <ExecutiveSummary s={s} />
 
           {/* 数据看板只保留巡查摘要，完整趋势与升温内容在独立页面查看 */}
           <NegativePatrolOverview data={s.negativePatrol} onOpen={onOpenPatrol} />
@@ -309,17 +397,14 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
             </Panel>
           </section>
 
-          {/* 3. 情感 / 4. 平台 / 主题 */}
-          <section className="grid gap-4 xl:grid-cols-3">
-            <Panel title="情感分析" hint={G.sentiment}
-              note={`负面率 ${s.negativeRate}%、净情感 NSR ${nsrOf(s.sentimentMap)}${(s.pendingLabel || 0) > 0 ? `;另有 ${formatNumber(s.pendingLabel)} 条待 AI 标注` : ''}`}>
-              <SentimentRing rows={s.sentimentStructure || []} />
-            </Panel>
-            <Panel title="平台分布" hint={G.platform} note={platformNote(s)}>
-              <PlatformMatrix rows={s.platformMatrix || []} />
-            </Panel>
+          {/* 主题与评论风险属于延展维度，基础三分布已在首屏呈现。 */}
+          <section className="grid gap-4 xl:grid-cols-2">
             <Panel title="主题分类" hint={G.category}>
               <Distribution rows={s.category || []} labelKey="category" labelMap={LABELS.category} />
+            </Panel>
+            <Panel title="负面评论与风险" hint={G.negativeComment}
+              note={`本期负面评论 ${formatNumber(s.commentStats?.negative_comments || 0)} 条${(s.issueStats?.high_open_issues || 0) > 0 ? `,高危未关闭问题 ${formatNumber(s.issueStats.high_open_issues)} 个` : ''}`}>
+              <CommentRisks rows={s.commentRisks || s.negativeComments || []} />
             </Panel>
           </section>
 
@@ -333,16 +418,8 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
             </Panel>
           </section>
 
-          {/* 6. 负面预警 / 7. 处置闭环 */}
-          <section className="grid gap-4 xl:grid-cols-2">
-            <Panel title="负面评论与风险" hint={G.negativeComment}
-              note={`本期负面评论 ${formatNumber(s.commentStats?.negative_comments || 0)} 条${(s.issueStats?.high_open_issues || 0) > 0 ? `,高危未关闭问题 ${formatNumber(s.issueStats.high_open_issues)} 个` : ''}`}>
-              <CommentRisks rows={s.commentRisks || s.negativeComments || []} />
-            </Panel>
-            <Panel title="处置与闭环" hint={G.workflow} note={workflowNote(s)}>
-              <WorkflowSummary snapshot={s} />
-            </Panel>
-          </section>
+          {/* AI 舆情研判按需触发,不阻塞基础月报。 */}
+          <AiInsightPanel month={month} />
 
           {/* 更多维度 */}
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(390px,0.8fr)]">
@@ -390,15 +467,297 @@ function Panel({ title, hint, note, children }: { title: string; hint?: string; 
   )
 }
 
-function AiInsightPanel({ range, start, end }: { range: string; start: string; end: string }) {
+type CoreDistributionRow = {
+  key: string
+  label: string
+  count: number
+  share: number
+  color: string
+  detail?: string
+}
+
+function CoreMonthlyAnalysis({
+  snapshot,
+  periodLabel,
+  activeSelection,
+  drilldownData,
+  drilldownLoading,
+  drilldownError,
+  onClearFilter,
+  onDrillDown,
+}: {
+  snapshot: any
+  periodLabel: string
+  activeSelection: DrilldownSelection | null
+  drilldownData: DashboardDrilldown | null
+  drilldownLoading: boolean
+  drilldownError: string
+  onClearFilter: () => void
+  onDrillDown: (dimension: CoreDimension, value: string) => void
+}) {
+  const basePlatformRows: CoreDistributionRow[] = [...(snapshot.platformMatrix || [])]
+    .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
+    .map(row => {
+      const key = String(row.platform || 'unknown')
+      return {
+        key,
+        label: row.label || platformName(key) || '未知平台',
+        count: Number(row.count) || 0,
+        share: Number(row.share) || 0,
+        color: PLATFORM_COLOR[key] || '#2563EB',
+        detail: `负面 ${Number(row.negativeRate) || 0}% · 互动 ${formatNumber(row.interactions)}`,
+      }
+    })
+  const baseSentimentRows: CoreDistributionRow[] = (snapshot.sentimentStructure || []).map((row: any) => ({
+    key: String(row.key || 'pending'),
+    label: row.label || LABELS.sentiment[row.key] || '待标注',
+    count: Number(row.count) || 0,
+    share: Number(row.share) || 0,
+    color: row.color || '#94A3B8',
+  }))
+  const statusCount = new Map<string, number>(
+    (snapshot.triagePeriod || []).map((row: any) => [String(row.status || 'unhandled'), Number(row.count) || 0]),
+  )
+  const statusTotal = HANDLING_STATUS_ROWS.reduce((sum, row) => sum + (statusCount.get(row.key) || 0), 0)
+  const baseStatusRows: CoreDistributionRow[] = HANDLING_STATUS_ROWS.map(row => {
+    const count = statusCount.get(row.key) || 0
+    return {
+      ...row,
+      count,
+      share: statusTotal ? Math.round(count / statusTotal * 100) : 0,
+    }
+  })
+
+  const filterReady = Boolean(activeSelection && drilldownData)
+  const crossFilteredRows = (dimension: CoreDimension, baseRows: CoreDistributionRow[]) => {
+    if (!filterReady || activeSelection?.dimension === dimension) return baseRows
+    const filtered = new Map<string, DrilldownBreakdownRow>(
+      (drilldownData?.breakdowns[dimension] || []).map(row => [row.key, row]),
+    )
+    return baseRows.map(row => {
+      const current = filtered.get(row.key)
+      return {
+        ...row,
+        count: current?.count || 0,
+        share: current?.share || 0,
+        detail: current
+          ? `互动 ${formatNumber(current.interactions)}${current.negativeCount ? ` · 负面 ${formatNumber(current.negativeCount)}` : ''}`
+          : undefined,
+      }
+    })
+  }
+  const platformRows = crossFilteredRows('platform', basePlatformRows)
+  const sentimentRows = crossFilteredRows('sentiment', baseSentimentRows)
+  const statusRows = crossFilteredRows('status', baseStatusRows)
+
+  const filteredStatus = new Map<string, number>(
+    filterReady
+      ? (drilldownData?.breakdowns.status || []).map(row => [row.key, row.count])
+      : baseStatusRows.map(row => [row.key, row.count]),
+  )
+  const metricTotal = filterReady ? Number(drilldownData?.summary.count) || 0 : Number(snapshot.total) || 0
+  const metricInteractions = filterReady
+    ? Number(drilldownData?.summary.interactions) || 0
+    : sumInteractions(snapshot.platformMatrix)
+  const unhandled = filteredStatus.get('unhandled') || 0
+  const handled = Math.max(0, metricTotal - unhandled)
+  const handledRate = metricTotal ? Math.round(handled / metricTotal * 100) : 0
+  const negativeCount = filterReady
+    ? Number(drilldownData?.summary.negativeCount) || 0
+    : Number(snapshot.sentimentMap?.negative) || 0
+  const stats = [
+    {
+      label: filterReady ? '筛选内容' : '本期内容',
+      value: formatNumber(metricTotal),
+      suffix: filterReady ? `${drilldownData?.summary.shareOfPeriod || 0}%` : undefined,
+      tone: 'accent',
+      hint: G.volume,
+    },
+    { label: '互动总量', value: formatNumber(metricInteractions), tone: 'accent', hint: G.interaction },
+    { label: '负面内容', value: formatNumber(negativeCount), tone: negativeCount > 0 ? 'danger' : 'normal', hint: G.sentiment },
+    { label: '已处理', value: formatNumber(handled), suffix: `${handledRate}%`, tone: 'positive', hint: G.workflow },
+  ]
+  const filterLabel = activeSelection
+    ? `${activeSelection.dimension === 'platform' ? '平台' : activeSelection.dimension === 'sentiment' ? '情感' : '处理模式'} · ${drilldownLabel(activeSelection.dimension, activeSelection.value)}`
+    : ''
+
+  return (
+    <section className="overflow-hidden rounded-lg border border-border bg-card" aria-labelledby="monthly-core-title">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-5 py-4">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 id="monthly-core-title" className="text-base font-bold">月报基础分析</h2>
+            <StatusBadge tone="muted">{periodLabel}</StatusBadge>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">三类分布始终显示；点击任一项会联动筛选顶部指标和另外两个分布。</p>
+        </div>
+        {activeSelection ? (
+          <div className="flex items-center gap-2 rounded-lg border border-primary/20 bg-primary/[0.05] px-2.5 py-1.5 text-xs" aria-label="当前联动筛选">
+            <span className="font-semibold text-primary">联动筛选</span>
+            <strong>{filterLabel}</strong>
+            {drilldownLoading && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
+            <button type="button" onClick={onClearFilter} className="ml-1 rounded px-1.5 py-0.5 text-muted-foreground hover:bg-accent hover:text-foreground">清除筛选</button>
+          </div>
+        ) : (
+          <span className="rounded-md bg-primary/8 px-2.5 py-1 text-[11px] font-semibold text-primary">自然月月报</span>
+        )}
+      </div>
+      <div className="p-5">
+        {drilldownError && (
+          <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+            <span>{drilldownError}</span>
+            <button type="button" onClick={onClearFilter} className="font-semibold hover:underline">恢复整月数据</button>
+          </div>
+        )}
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {stats.map(stat => (
+            <CoreMetric key={stat.label} {...stat} />
+          ))}
+        </div>
+        <div className="mt-4 grid gap-4 xl:grid-cols-3">
+          <CoreDistributionCard
+            title="平台分布"
+            hint={G.platform}
+            rows={platformRows}
+            dimension="platform"
+            activeValue={activeSelection?.dimension === 'platform' ? activeSelection.value : ''}
+            filterState={activeSelection?.dimension === 'platform' ? 'source' : activeSelection ? 'filtered' : 'none'}
+            onSelect={onDrillDown}
+          />
+          <CoreDistributionCard
+            title="情感分布"
+            hint={G.sentiment}
+            rows={sentimentRows}
+            dimension="sentiment"
+            activeValue={activeSelection?.dimension === 'sentiment' ? activeSelection.value : ''}
+            filterState={activeSelection?.dimension === 'sentiment' ? 'source' : activeSelection ? 'filtered' : 'none'}
+            onSelect={onDrillDown}
+          />
+          <CoreDistributionCard
+            title="处理模式分布"
+            hint={G.workflow}
+            rows={statusRows}
+            dimension="status"
+            activeValue={activeSelection?.dimension === 'status' ? activeSelection.value : ''}
+            filterState={activeSelection?.dimension === 'status' ? 'source' : activeSelection ? 'filtered' : 'none'}
+            onSelect={onDrillDown}
+          />
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function CoreMetric({ label, value, suffix, tone = 'normal', hint }: {
+  label: string
+  value: React.ReactNode
+  suffix?: string
+  tone?: string
+  hint?: string
+}) {
+  const toneClass = tone === 'danger'
+    ? 'border-status-red/20 bg-status-red/[0.06] text-destructive'
+    : tone === 'positive'
+      ? 'border-status-green/20 bg-status-green/[0.06] text-emerald-700 dark:text-emerald-300'
+      : tone === 'accent'
+        ? 'border-primary/15 bg-primary/[0.05] text-primary'
+        : 'border-border bg-muted/35 text-foreground'
+  return (
+    <div className={`rounded-lg border px-3.5 py-3 ${toneClass}`}>
+      <div className="flex items-center gap-1 text-[11.5px] font-medium text-muted-foreground">{label}{hint && <InfoHint text={hint} />}</div>
+      <div className="mt-1.5 flex items-baseline gap-2">
+        <strong className="text-[22px] font-bold tabular-nums">{value}</strong>
+        {suffix && <span className="text-[11px] font-semibold text-muted-foreground">占比 {suffix}</span>}
+      </div>
+    </div>
+  )
+}
+
+function CoreDistributionCard({
+  title,
+  hint,
+  rows,
+  dimension,
+  activeValue,
+  filterState,
+  onSelect,
+}: {
+  title: string
+  hint: string
+  rows: CoreDistributionRow[]
+  dimension: CoreDimension
+  activeValue: string
+  filterState: 'none' | 'source' | 'filtered'
+  onSelect: (dimension: CoreDimension, value: string) => void
+}) {
+  return (
+    <section className="flex min-h-[320px] flex-col overflow-hidden rounded-lg border border-border bg-background">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+        <h3 className="flex items-center gap-1.5 text-sm font-bold">{title}<InfoHint text={hint} /></h3>
+        {filterState !== 'none' && (
+          <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${filterState === 'source' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>
+            {filterState === 'source' ? '筛选来源' : '已联动'}
+          </span>
+        )}
+      </div>
+      {rows.length ? (
+        <div className="flex-1 divide-y divide-border/60 px-2">
+          {rows.map(row => (
+            <button
+              key={row.key}
+              type="button"
+              onClick={() => onSelect(dimension, row.key)}
+              aria-pressed={activeValue === row.key}
+              className={`group grid w-full gap-1.5 rounded-md px-2 py-2.5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25 ${activeValue === row.key ? 'bg-primary/8 ring-1 ring-primary/15' : 'hover:bg-accent'}`}
+              aria-label={`${title}：${row.label}，${formatNumber(row.count)}条，占比${row.share}%，点击联动筛选`}
+            >
+              <span className="flex items-center justify-between gap-3 text-[12.5px]">
+                <span className="flex min-w-0 items-center gap-2 font-semibold">
+                  <i className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
+                  <span className="truncate">{row.label}</span>
+                </span>
+                <span className="flex shrink-0 items-center gap-1 text-xs tabular-nums text-muted-foreground">
+                  <strong className="text-foreground">{formatNumber(row.count)}</strong>
+                  <span>· {row.share}%</span>
+                </span>
+              </span>
+              <span className="h-1.5 overflow-hidden rounded-full bg-muted">
+                <span
+                  className="block h-full rounded-full transition-all"
+                  style={{
+                    width: `${row.share > 0 ? Math.max(3, Math.min(100, row.share)) : 0}%`,
+                    backgroundColor: row.color,
+                  }}
+                />
+              </span>
+              {row.detail && <span className="text-[10.5px] text-muted-foreground">{row.detail}</span>}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="grid flex-1 place-items-center p-4"><EmptyState icon={BarChart3} title={`暂无${title}`} /></div>
+      )}
+      <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
+        {filterState === 'source' ? '再次点击已选项可清除筛选' : filterState === 'filtered' ? '数据已按当前选择联动筛选' : '点击任一项，联动筛选本月报告'}
+      </div>
+    </section>
+  )
+}
+
+function drilldownLabel(dimension: CoreDimension, key: string) {
+  if (dimension === 'platform') return platformName(key) || '未知平台'
+  if (dimension === 'sentiment') return LABELS.sentiment[key] || (key === 'pending' ? '待标注' : key)
+  return HANDLING_STATUS_ROWS.find(row => row.key === key)?.label || key
+}
+
+function AiInsightPanel({ month }: { month: string }) {
   const [insight, setInsight] = useState<any>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const run = async () => {
     setLoading(true); setError('')
     try {
-      const params = new URLSearchParams({ range })
-      if (range === 'custom') { params.set('start', start); params.set('end', end) }
+      const params = new URLSearchParams({ range: 'month', month })
       const r: any = await api.get('/analytics/ai-insight?' + params.toString())
       setInsight(r?.insight || null)
       if (!r?.insight) setError('本期代表样本不足或未配置 LLM,暂无法生成研判。')
@@ -505,18 +864,6 @@ function trendNote(s: any) {
   const d = delta(s.total, s.previous?.total)
   return d ? `较上期${d.up ? '上升' : '下降'} ${d.pct}%` : '暂无可比上期'
 }
-function platformNote(s: any) {
-  const rows = s.platformMatrix || []
-  if (!rows.length) return ''
-  const top = rows[0]
-  const worst = [...rows].sort((a, b) => (Number(b.negativeRate) || 0) - (Number(a.negativeRate) || 0))[0]
-  return `主战场「${platformName(top.platform)}」占 ${top.share}%;负面最集中「${platformName(worst.platform)}」(${Number(worst.negativeRate) || 0}%)`
-}
-function workflowNote(s: any) {
-  const w = s.workflowStats || {}
-  const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
-  return `待处理 ${formatNumber(w.active_inbox || 0)}、已转工单 ${formatNumber(w.issue_linked || 0)}；官方响应率 ${officialRate}%`
-}
 
 function ExecutiveSummary({ s }: { s: any }) {
   const prev = s.previous || {}
@@ -528,6 +875,7 @@ function ExecutiveSummary({ s }: { s: any }) {
   const interaction = sumInteractions(s.platformMatrix)
   const officialRate = s.total ? Math.round((s.officialPeriod?.record_count || 0) / s.total * 100) : 0
   const negRate = Number(s.negativeRate) || 0
+  const periodPending = Number((s.triagePeriod || []).find((row: any) => row.status === 'unhandled')?.count) || 0
   const stats = [
     { label: '总声量', value: formatNumber(s.total), d: delta(s.total, prev.total), tone: 'accent', hint: G.volume },
     { label: '互动总量', value: formatNumber(interaction), tone: 'accent', hint: G.interaction },
@@ -535,7 +883,7 @@ function ExecutiveSummary({ s }: { s: any }) {
     { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: G.risk },
     { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
     { label: '新增内容', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
-    { label: '待处理', value: formatNumber(s.workflowStats?.active_inbox || 0), tone: (s.workflowStats?.active_inbox || 0) > 0 ? 'warning' : 'normal', hint: G.pending },
+    { label: '本期待处理', value: formatNumber(periodPending), tone: periodPending > 0 ? 'warning' : 'normal', hint: G.pending },
     { label: '官方响应率', value: `${officialRate}%`, hint: G.official },
   ]
   return (
@@ -548,7 +896,7 @@ function ExecutiveSummary({ s }: { s: any }) {
       <p className="mt-2 text-[13px] leading-6 text-muted-foreground">
         本期共监测 <strong className="text-foreground">{formatNumber(s.total)}</strong> 条内容(新增 {formatNumber(s.newRecords)}),
         负面率 <strong className="text-foreground">{negRate}%</strong>、净情感 NSR <strong className="text-foreground">{nsr}</strong>,
-        舆情风险指数 <strong className="text-foreground">{risk}</strong>({status});待处理 {formatNumber(s.workflowStats?.active_inbox || 0)} 条,官方响应率 {officialRate}%。
+        舆情风险指数 <strong className="text-foreground">{risk}</strong>({status});本期待处理 {formatNumber(periodPending)} 条,官方响应率 {officialRate}%。
       </p>
       <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {stats.map(st => <Stat key={st.label} {...st} />)}
@@ -688,69 +1036,6 @@ function IndexBar({ label, value, color, suffix = '' }: { label: string; value: 
       </div>
       <div className="h-2 overflow-hidden rounded-full bg-muted">
         <div className="h-full rounded-full" style={{ width: `${percent(value)}%`, background: color }} />
-      </div>
-    </div>
-  )
-}
-
-function PlatformMatrix({ rows }: { rows: any[] }) {
-  if (!rows.length) return <EmptyState icon={BarChart3} title="暂无平台数据" />
-  const maxHeat = Math.max(1, ...rows.map(row => Number(row.heat) || 0))
-  return (
-    <div className="space-y-4">
-      {rows.map(row => {
-        const negativeRate = Number(row.negativeRate) || 0
-        const color = negativeRate >= 30 ? '#DC2626' : negativeRate >= 12 ? '#D97706' : '#2563EB'
-        return (
-          <div key={row.platform || row.label} className="grid gap-2">
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <strong className="flex items-center gap-1.5"><span className={`h-2 w-2 shrink-0 rounded-full ${PLATFORM_DOT[row.platform] || 'bg-muted-foreground/40'}`} />{platformName(row.platform) || row.label}</strong>
-              <span className="text-xs text-muted-foreground">{formatNumber(row.count)} 条 · 负面 {negativeRate}%</span>
-            </div>
-            <div className="h-2 overflow-hidden rounded-full bg-muted">
-              <div className="h-full rounded-full" style={{ width: `${percent((Number(row.heat) || 0) / maxHeat * 100)}%`, background: color }} />
-            </div>
-            <div className="flex justify-between text-xs text-muted-foreground">
-              <span>互动 {formatNumber(row.interactions)}</span>
-              <span>占比 {row.share}%</span>
-            </div>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-function SentimentRing({ rows }: { rows: any[] }) {
-  if (!rows.length) return <EmptyState icon={BarChart3} title="暂无情绪数据" />
-  const stops = rows.reduce<{ cursor: number; values: string[] }>((result, row) => {
-    const nextCursor = result.cursor + (Number(row.share) || 0)
-    return {
-      cursor: nextCursor,
-      values: [...result.values, `${row.color} ${result.cursor}% ${Math.min(100, nextCursor)}%`],
-    }
-  }, { cursor: 0, values: [] }).values.join(', ')
-  const negative = rows.find(row => row.key === 'negative') || { share: 0 }
-  return (
-    <div className="grid gap-5 sm:grid-cols-[150px_minmax(0,1fr)]">
-      <div className="mx-auto grid h-[142px] w-[142px] place-items-center rounded-full" style={{ background: `conic-gradient(${stops || '#E5E7EB 0 100%'})` }}>
-        <div className="grid h-[82px] w-[82px] place-items-center rounded-full border border-border bg-card text-center">
-          <div>
-            <strong className="block text-xl tabular-nums">{negative.share}%</strong>
-            <span className="text-[11px] text-muted-foreground">负面占比</span>
-          </div>
-        </div>
-      </div>
-      <div className="grid content-center gap-3">
-        {rows.map(row => (
-          <div key={row.key} className="flex items-center justify-between gap-3 text-sm">
-            <span className="flex items-center gap-2">
-              <i className="h-2.5 w-2.5 rounded-full" style={{ background: row.color }} />
-              {row.label}
-            </span>
-            <strong>{formatNumber(row.count)} · {row.share}%</strong>
-          </div>
-        ))}
       </div>
     </div>
   )
@@ -952,26 +1237,6 @@ function CommentRisks({ rows }: { rows: any[] }) {
             <span>{compact(row.record_title || '原帖', 32)}</span>
             <span>{formatNumber(row.like_count)} 赞</span>
           </div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function WorkflowSummary({ snapshot }: { snapshot: any }) {
-  const rows = [
-    ['待处理/负面流程', snapshot.workflowStats?.active_inbox || 0, 'unhandled'],
-    ['已转工单', snapshot.workflowStats?.issue_linked || 0, 'issue_linked'],
-    ['官方已评', snapshot.workflowStats?.official_responded || 0, 'official_responded'],
-    ['无需操作', snapshot.workflowStats?.no_action || 0, 'no_action'],
-    ['未关闭问题', snapshot.issueStats?.open_issues || 0, 'medium'],
-  ]
-  return (
-    <div className="grid gap-3">
-      {rows.map(([label, value, tone]) => (
-        <div key={label} className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2.5">
-          <span className="text-sm text-muted-foreground">{label}</span>
-          <StatusBadge tone={String(tone)}>{formatNumber(Number(value) || 0)}</StatusBadge>
         </div>
       ))}
     </div>

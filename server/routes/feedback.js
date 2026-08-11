@@ -24,7 +24,7 @@ router.use(requireTenantAccess, requireSessionUser);
 const TYPE_LABELS = { false_positive: '误报', manual_correction: '人工修正' };
 const STATUS_LABELS = { pending: '待复核', reviewed: '已复核', summarized: '已记录', dismissed: '已忽略' };
 
-// 客户提交误报只复制一份快照到反馈台账，不改变帖子的处理模式、备注或归档状态。
+// 客户提交误报只复制一份快照到反馈台账，不改变帖子的处理状态、备注或归档状态。
 router.post('/false-positive', requireTenantWriter, async (req, res, next) => {
   try {
     const recordId = String(req.body?.recordId || '').trim();

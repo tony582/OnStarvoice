@@ -29,9 +29,10 @@ async function copyText(value: string) {
   }
 }
 
-export function CopyTicketNumberButton({ value, className }: {
+export function CopyTicketNumberButton({ value, className, label = '工单号' }: {
   value: string
   className?: string
+  label?: string
 }) {
   const number = value.trim()
   const [feedback, setFeedback] = useState<'idle' | 'copied' | 'failed'>('idle')
@@ -50,17 +51,17 @@ export function CopyTicketNumberButton({ value, className }: {
     timerRef.current = window.setTimeout(() => setFeedback('idle'), 1600)
   }
 
-  const label = feedback === 'copied'
-    ? '工单号已复制'
+  const copyLabel = feedback === 'copied'
+    ? `${label}已复制`
     : feedback === 'failed'
       ? '复制失败，请重试'
-      : `复制工单号 ${number}`
+      : `复制${label} ${number}`
 
   return (
     <button
       type="button"
-      aria-label={label}
-      title={label}
+      aria-label={copyLabel}
+      title={copyLabel}
       onClick={event => {
         event.stopPropagation()
         void handleCopy()

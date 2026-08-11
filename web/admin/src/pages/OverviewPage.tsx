@@ -40,8 +40,8 @@ export function OverviewPage() {
   const sb = data?.sentimentBreakdown || { negative: 0, neutral: 0, positive: 0, unlabeled: 0, total: 0 }
   const negRatio = sb.total ? Math.round((sb.negative / sb.total) * 100) : 0
   const events = data?.pendingRecords || []
-  const handled = Number(k.issue_linked || 0)
-  const activeTotal = Number(k.active_or_ticketed ?? (Number(k.unhandled || 0) + Number(k.reviewing || 0) + handled))
+  const handled = Number(k.handled_total || 0)
+  const activeTotal = Number(k.status_total ?? (Number(k.unhandled || 0) + handled))
   const handledPct = activeTotal ? Math.round((handled / activeTotal) * 100) : 0
 
   return (
@@ -128,16 +128,16 @@ export function OverviewPage() {
             </div>
           )}
 
-          {/* 工单覆盖电池条 */}
+          {/* 状态处理进度 */}
           <div className="mt-4 border-t border-border pt-3.5">
-            <div className="mb-1.5 flex items-center justify-between text-[11px] text-muted-foreground"><span>工单覆盖（有工单内容 / 当前相关内容）</span><span className="tabular-nums">{formatNumber(handled)} / {formatNumber(activeTotal)}</span></div>
+            <div className="mb-1.5 flex items-center justify-between text-[11px] text-muted-foreground"><span>状态处理进度（非待处理 / 当前相关内容）</span><span className="tabular-nums">{formatNumber(handled)} / {formatNumber(activeTotal)}</span></div>
             <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green transition-all" style={{ width: `${handledPct}%` }} /></div>
           </div>
         </section>
       </div>
 
       {drawer && (
-        <RecordDrawer record={drawer} onClose={() => setDrawer(null)} canWrite={canWrite()} onLinkIssue={() => { navigate('workbench', { queue: 'triage' }); setDrawer(null) }} />
+        <RecordDrawer record={drawer} onClose={() => setDrawer(null)} canWrite={canWrite()} />
       )}
     </div>
   )

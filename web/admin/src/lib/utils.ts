@@ -86,7 +86,11 @@ export const LABELS = {
     brand_image: '品牌形象', other: '其他', '': '待分类',
   } as Record<string, string>,
   triage: {
-    unhandled: '待处理', reviewing: '负面流程', issue_linked: '已关联事件', ticketed: '已转工单',
+    unhandled: '待处理', replied: '已回复', reviewed: '已复核',
+    reviewed_non_monitor: '已复核-非监控内容', unavailable: '已不可见',
+    negative_feishu: '负面-飞书表', negative_cold: '负面-冷处理',
+    // 历史处理记录兼容标签。
+    reviewing: '负面流程', issue_linked: '已关联事件', ticketed: '已转工单',
     official_responded: '官方已评', no_action: '无需操作', archived: '已归档', false_positive: '误报',
   } as Record<string, string>,
   priority: { low: '低', normal: '普通', high: '高', urgent: '紧急' } as Record<string, string>,

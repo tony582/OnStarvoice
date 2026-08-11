@@ -4,171 +4,141 @@ import { readFileSync } from 'node:fs';
 
 const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
-test('content triage keeps five states but presents content handling and work orders as two paths', () => {
+const STATUSES = [
+  ['unhandled', '待处理'],
+  ['replied', '已回复'],
+  ['reviewed', '已复核'],
+  ['reviewed_non_monitor', '已复核-非监控内容'],
+  ['unavailable', '已不可见'],
+  ['negative_feishu', '负面-飞书表'],
+  ['negative_cold', '负面-冷处理'],
+];
+
+function between(text, start, end) {
+  const startAt = text.indexOf(start);
+  assert.notEqual(startAt, -1, `missing contract boundary: ${start}`);
+  const endAt = text.indexOf(end, startAt + start.length);
+  assert.notEqual(endAt, -1, `missing contract boundary: ${end}`);
+  return text.slice(startAt, endAt);
+}
+
+test('content handling exposes exactly the seven customer-maintained states', () => {
   const labels = source('web/admin/src/lib/utils.ts');
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
-  const dashboard = source('web/admin/src/pages/insights/DashboardTab.tsx');
   const route = source('server/routes/triage.js');
-  const migration = source('server/db/migrations/036_record_triage_no_action.sql');
-  const feedbackOnlyMigration = source('server/db/migrations/038_false_positive_feedback_only.sql');
+  const migration = source('server/db/migrations/059_content_handling_statuses.sql');
 
-  for (const label of ['待处理', '负面流程', '官方已评', '无需操作', '已转工单']) {
-    assert.match(labels, new RegExp(label));
-    assert.match(queue, new RegExp(label));
-    assert.match(board, new RegExp(label));
-    assert.match(drawer, new RegExp(label));
-    assert.match(dashboard, new RegExp(label));
-    assert.match(route, new RegExp(label));
-  }
-  for (const staleLabel of ['走负面流程', '官方已评论', '不需要操作']) {
-    assert.doesNotMatch([labels, queue, board, drawer, dashboard, route].join('\n'), new RegExp(staleLabel));
-  }
+  const statusSet = between(route, 'const TRIAGE_STATUSES = new Set([', ']);');
+  const queueModes = between(queue, 'const CONTENT_TRIAGE_MODES', 'const PLATFORM_BADGE_CLASS');
+  const boardColumns = between(board, 'const COLUMNS', 'const PER_COL');
+  const drawerModes = between(drawer, 'const modeActions', 'const currentModeLabel');
+  const constraint = between(migration, 'ADD CONSTRAINT record_triage_status_check', '));');
 
-  const queueContentModes = queue.slice(
-    queue.indexOf('const CONTENT_TRIAGE_MODES'),
-    queue.indexOf('const TICKET_TRIAGE_MODE'),
-  );
-  for (const [value, label] of [
-    ['unhandled', '待处理'],
-    ['reviewing', '负面流程'],
-    ['official_responded', '官方已评'],
-    ['no_action', '无需操作'],
-  ]) {
-    assert.match(queueContentModes, new RegExp(`value: '${value}'[^\\n]+label: '${label}'`));
+  for (const [value, label] of STATUSES) {
+    for (const block of [labels, queueModes, boardColumns, drawerModes, route]) {
+      assert.match(block, new RegExp(value));
+      assert.match(block, new RegExp(label));
+    }
+    assert.match(constraint, new RegExp(`'${value}'`));
   }
-  assert.doesNotMatch(queueContentModes, /value: 'ticketed'/);
-  assert.match(queue, /const TICKET_TRIAGE_MODE = \{ value: 'ticketed' as const, label: '已转工单'/);
-  assert.match(queue, /newStatus === 'ticketed' \? dispatchTicket\(record\)/);
-  assert.match(queue, /function TriageStatusMenu/);
-  assert.match(queue, /onChangeMode=\{\(nextStatus: TriageMode\)/);
-  assert.match(queue, /api\.patch\('\/triage\/records\/' \+ recordId, \{ status: newStatus \}\)/);
-  assert.match(queue, /params\.set\('queue', 'triage'\)/);
-  assert.match(queue, /return !triageStatus \|\| triageStatus === newStatus/);
-  assert.doesNotMatch(queue, /initial\?\.ticket === 'with'/);
-  assert.doesNotMatch(queue, /label: '已处理'/);
-  assert.match(queue, /aria-label="内容处理模式"/);
-  assert.match(drawer, /aria-label="内容处理模式"/);
-  assert.match(drawer, /addingTicketProgress/);
-
-  const boardContentModes = board.slice(
-    board.indexOf('const CONTENT_COLUMNS'),
-    board.indexOf('const TICKET_COLUMN'),
-  );
-  for (const value of ['unhandled', 'reviewing', 'official_responded', 'no_action']) {
-    assert.match(boardContentModes, new RegExp(`key: '${value}'`));
+  for (const legacy of ['reviewing', 'official_responded', 'no_action', 'ticketed', 'issue_linked']) {
+    assert.doesNotMatch(statusSet, new RegExp(`['"]${legacy}['"]`));
+    assert.doesNotMatch(queueModes, new RegExp(`value: ['"]${legacy}['"]`));
+    assert.doesNotMatch(boardColumns, new RegExp(`key: ['"]${legacy}['"]`));
+    assert.doesNotMatch(drawerModes, new RegExp(`value: ['"]${legacy}['"]`));
+    assert.doesNotMatch(constraint, new RegExp(`['"]${legacy}['"]`));
   }
-  assert.doesNotMatch(boardContentModes, /ticketed/);
-  assert.match(board, /\{ key: 'ticketed', label: '已转工单'/);
-  assert.match(board, /to === 'ticketed'/);
-  assert.match(board, /onDispatchTicket\(card\)/);
-  assert.match(board, /to === 'official_responded'/);
-  assert.match(board, /\/official-response/);
-  assert.match(board, /queue: 'triage'/);
-  assert.match(route, /status === 'official_responded'/);
-  assert.match(route, /official_response_status = 'responded'/);
-  assert.match(route, /updatedIds: \[\.\.\.updatedSet\]/);
-  assert.match(route, /const TRIAGE_QUEUE_CONDITION/);
-  assert.match(route, /queue === 'triage'/);
-  assert.match(route, /IN \('unhandled', 'reviewing', 'official_responded', 'no_action', 'ticketed'\)/);
-  const recordModeRoute = route.slice(route.indexOf("router.patch('/records/:recordId'"));
-  assert.match(recordModeRoute, /status <> 'closed'/);
-  assert.match(recordModeRoute, /error: 'content_ticket_active'/);
-  assert.match(recordModeRoute, /工单结案前，处理模式须保留为“已转工单”/);
-  const activeQueue = route.slice(
-    route.indexOf('export const ACTIVE_QUEUE_CONDITION'),
-    route.indexOf('// 处理模式和归档生命周期相互独立'),
-  );
-  assert.doesNotMatch(activeQueue, /official_response_status/);
-  assert.match(route, /header: '处理模式'/);
-  assert.match(migration, /status = 'no_action'/);
-  assert.match(migration, /archived_at = COALESCE\(archived_at, updated_at, now\(\)\)/);
-  const statusSet = route.match(/const TRIAGE_STATUSES = new Set\(\[[^\]]+\]\)/)?.[0] || '';
-  assert.doesNotMatch(statusSet, /false_positive/);
-  assert.doesNotMatch(statusSet, /ticketed/);
-  assert.match(route, /false_positive_is_feedback_only/);
-  assert.doesNotMatch(
-    feedbackOnlyMigration.match(/ADD CONSTRAINT record_triage_status_check[\s\S]*$/)?.[0] || '',
-    /false_positive/,
-  );
 });
 
-test('archive is an explicit single or batch lifecycle action, independent from handling mode', () => {
+test('migration preserves historical evidence while mapping old current states', () => {
+  const migration = source('server/db/migrations/059_content_handling_statuses.sql');
+
+  for (const [from, to] of [
+    ['official_responded', 'replied'],
+    ['ticketed', 'negative_feishu'],
+    ['issue_linked', 'negative_feishu'],
+    ['reviewing', 'negative_cold'],
+    ['no_action', 'reviewed_non_monitor'],
+  ]) {
+    assert.match(migration, new RegExp(`WHEN '${from}' THEN '${to}'`));
+  }
+  assert.match(migration, /历史审计与工单记录继续保留/);
+  assert.doesNotMatch(migration, /DELETE FROM (?:audit_logs|tickets|ticket_notes)/);
+});
+
+test('status changes are generic and unrestricted by content work orders', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const route = source('server/routes/triage.js');
-  const migration = source('server/db/migrations/035_record_triage_archive.sql');
+  const records = source('server/routes/records.js');
 
-  assert.match(queue, /label: '工作中'/);
-  assert.match(queue, /label: '已归档'/);
-  assert.doesNotMatch(queue, /label: '未归档'/);
-  assert.match(queue, /params\.set\('bucket', 'archived'\)/);
-  assert.match(queue, /api\.patch\('\/triage\/records\/archive', \{ ids: \[recordId\], archived \}\)/);
-  assert.match(queue, /api\.patch\('\/triage\/records\/archive', \{ ids, archived \}\)/);
-  assert.match(queue, /key: 'archive', label: '归档'/);
-  assert.match(queue, /key: 'unarchive', label: '取消归档'/);
-  assert.match(drawer, /onSetArchived/);
+  const queueMutation = between(queue, 'const changeTriageMode', 'const changeRecordMode');
+  assert.match(queueMutation, /status: newStatus/);
+  assert.match(queueMutation, /note: values\.note/);
+  assert.match(queueMutation, /feishuTableNo: values\.feishuTableNo/);
+  assert.match(queueMutation, /api\.patch\('\/triage\/records\/' \+ recordId, payload\)/);
+  assert.doesNotMatch(queueMutation, /dispatchTicket|official-response|ticket_id|ticket_status/);
 
-  const archiveStart = route.indexOf("router.patch('/records/archive'");
-  const recordStart = route.indexOf("router.patch('/records/:recordId'");
-  assert.ok(archiveStart > -1 && recordStart > archiveStart, 'archive route must precede the parameter route');
-  const archiveRoute = route.slice(archiveStart, recordStart);
+  const boardMove = between(board, 'const move = useCallback', 'if (loading)');
+  assert.match(boardMove, /await onChangeMode\(card, to\)/);
+  assert.doesNotMatch(boardMove, /dispatch|official-response|ticket/);
+
+  const recordRoute = route.slice(route.indexOf("router.patch('/records/:recordId'"));
+  assert.match(recordRoute, /status = CASE WHEN \$3::text IS NOT NULL THEN excluded\.status/);
+  assert.doesNotMatch(recordRoute.slice(0, recordRoute.indexOf("router.post('/records/:recordId/issues'")), /content_ticket_active|status <> 'closed'|activeTicket/);
+  assert.doesNotMatch(drawer, /TicketDispatch|确认结案|onLinkIssue/);
+
+  const officialResponseRoute = between(records, "router.patch('/:id/official-response'", '/**\n * 媒体透明代理下载');
+  assert.match(officialResponseRoute, /official_response_status/);
+  assert.doesNotMatch(officialResponseRoute, /(?:INSERT INTO|UPDATE) record_triage|official_responded/);
+});
+
+test('negative Feishu status requires a searchable Feishu table number without restoring ticket workflow', () => {
+  const migration = source('server/db/migrations/060_content_feishu_table_no.sql');
+  const route = source('server/routes/triage.js');
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const prompt = source('web/admin/src/components/shared/StatusChangePrompt.tsx');
+  const badges = source('web/admin/src/components/ui/badge.tsx');
+
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS feishu_table_no/);
+  assert.match(migration, /t\.external_ticket_no/);
+  assert.doesNotMatch(migration, /DELETE FROM/);
+
+  const keywordFilter = between(route, 'function appendKeywordFilter', 'function validateStatus');
+  assert.match(keywordFilter, /rt\.feishu_table_no ILIKE/);
+  assert.match(route, /feishu_table_no_required/);
+  assert.match(route, /COALESCE\(rt\.feishu_table_no, ''\) AS feishu_table_no/);
+  assert.match(route, /header: '飞书表号'/);
+
+  assert.match(queue, /搜索标题、正文、作者、飞书表号/);
+  assert.match(queue, /requireFeishuTableNo: newStatus === 'negative_feishu'/);
+  assert.match(queue, /batchCount: sel\.count/);
+  assert.match(queue, /feishuTableNo: values\.feishuTableNo/);
+  const batchRoute = between(route, "router.patch('/records/batch'", '// 归档是独立生命周期');
+  assert.match(batchRoute, /feishu_table_no_required/);
+  assert.match(batchRoute, /feishu_table_no = CASE WHEN \$7::text IS NOT NULL/);
+  assert.match(prompt, /飞书表号 <span/);
+  assert.match(prompt, /备注（选填）/);
+  assert.match(badges, /negative_feishu: 'red'/);
+  assert.match(badges, /negative_cold: 'red'/);
+});
+
+test('pending queue and archive lifecycle remain independent from the selected state', () => {
+  const route = source('server/routes/triage.js');
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+
+  const activeQueue = between(route, 'export const ACTIVE_QUEUE_CONDITION', '// 处理状态和归档生命周期相互独立');
+  assert.match(activeQueue, /COALESCE\(rt\.status, 'unhandled'\) = 'unhandled'/);
+  assert.match(activeQueue, /rt\.archived_at IS NULL/);
+
+  const archiveRoute = between(route, "router.patch('/records/archive'", "router.patch('/records/:recordId'");
   assert.match(archiveRoute, /archived_at = now\(\)/);
   assert.match(archiveRoute, /archived_at = NULL/);
-  assert.match(archiveRoute, /DO UPDATE SET\s+archived_at = now\(\)/);
-  assert.doesNotMatch(archiveRoute, /DO UPDATE SET\s+status\s*=/);
-  assert.match(archiveRoute, /let targetIds = validIds/);
-  assert.match(archiveRoute, /if \(archived\)/);
-  assert.match(archiveRoute, /source_type = 'content'/);
-  assert.match(archiveRoute, /status <> 'closed'/);
-  assert.match(archiveRoute, /activeTicketRecordIds/);
-  assert.match(archiveRoute, /skippedActiveTicketIds/);
-  assert.match(route, /const TRIAGE_ARCHIVE_CONDITION/);
-  assert.match(route, /rt\.archived_at IS NULL/);
-  assert.match(route, /rt\.archived_at IS NOT NULL/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS archived_by_user_id UUID/);
-});
-
-test('archived content is sealed until an explicit unarchive', () => {
-  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
-  const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
-  const lifecycle = source('server/services/record-lifecycle.js');
-  const triageRoute = source('server/routes/triage.js');
-  const recordsRoute = source('server/routes/records.js');
-  const ticketsRoute = source('server/routes/tickets.js');
-  const feedbackRoute = source('server/routes/feedback.js');
-  const commentWorkflow = source('server/services/comment-workflow.js');
-
-  assert.match(queue, /if \(archiveView === 'archived' \|\| record\.archived_at\) return/);
-  assert.match(queue, /canWrite && !archived/);
-  assert.match(queue, /archived \? '查看详情' : '查看并处理'/);
-  assert.match(queue, /archiveView === 'archived'\s*\? \[\{ key: 'unarchive', label: '取消归档'/);
-
-  assert.match(drawer, /const canProcess = canWrite && !archived/);
-  assert.match(drawer, /该内容已封存为只读状态，取消归档后才能继续处理/);
-  assert.match(drawer, /aria-label="归档内容操作"/);
-  assert.match(drawer, /内容已封存/);
-  assert.match(drawer, /onSetArchived\(false\)/);
-
-  assert.match(lifecycle, /RECORD_ARCHIVED_ERROR = 'record_archived'/);
-  assert.match(lifecycle, /内容已归档，请先取消归档后再处理/);
-  assert.match(lifecycle, /FOR UPDATE OF r/);
-  assert.match(triageRoute, /getRecordLifecycles/);
-  assert.match(triageRoute, /sendRecordArchived\(res, archivedIds\)/);
-  assert.match(recordsRoute, /sendRecordArchived\(res, \[req\.params\.id\]\)/);
-  assert.match(ticketsRoute, /if \(lifecycle\.archived_at\) return sendRecordArchived\(res, \[sourceId\]\)/);
-  assert.match(feedbackRoute, /if \(result\.archived\) return sendRecordArchived\(res, \[recordId\]\)/);
-
-  const workflowStart = commentWorkflow.indexOf('async function appendCommentSignals');
-  const workflowEnd = commentWorkflow.indexOf('// ── 抖音过采兜底', workflowStart);
-  const archivedWorkflowGuard = commentWorkflow.slice(workflowStart, workflowEnd);
-  assert.match(archivedWorkflowGuard, /rt\.archived_at/);
-  assert.match(archivedWorkflowGuard, /if \(!current \|\| current\.archived_at\) return \[\]/);
-  assert.doesNotMatch(commentWorkflow, /INSERT INTO record_triage/);
-  assert.doesNotMatch(commentWorkflow, /UPDATE record_triage/);
-  assert.match(commentWorkflow, /processingModeChanged:\s*false/);
-  assert.match(commentWorkflow, /record\.comment_risk_detected/);
-  assert.match(commentWorkflow, /record\.official_response_detected/);
+  assert.doesNotMatch(archiveRoute, /status <> 'closed'|activeTicket|skippedActiveTicketIds/);
+  assert.match(queue, /label: '工作中'/);
+  assert.match(queue, /label: '已归档'/);
+  assert.match(queue, /api\.patch\('\/triage\/records\/archive', \{ ids: \[recordId\], archived \}\)/);
 });

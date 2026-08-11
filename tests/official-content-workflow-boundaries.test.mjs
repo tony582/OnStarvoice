@@ -157,14 +157,14 @@ test('评论变化只生成提醒事件，重复采集不重复提醒', () => {
   const events = buildCommentSignalEvents({
     previousAggregate: {negativeCount: 1, officialCount: 0},
     aggregate: {negativeCount: 3, officialCount: 1},
-    processingMode: 'no_action',
+    processingMode: 'reviewed_non_monitor',
   });
   assert.deepEqual(events.map(event => event.action), [
     'record.comment_risk_detected',
     'record.official_response_detected',
   ]);
   for (const event of events) {
-    assert.equal(event.metadata.processingMode, 'no_action');
+    assert.equal(event.metadata.processingMode, 'reviewed_non_monitor');
     assert.equal(event.metadata.processingModeChanged, false);
     assert.equal('nextStatus' in event.metadata, false);
   }
@@ -172,7 +172,7 @@ test('评论变化只生成提醒事件，重复采集不重复提醒', () => {
   assert.deepEqual(buildCommentSignalEvents({
     previousAggregate: {negativeCount: 3, officialCount: 1},
     aggregate: {negativeCount: 3, officialCount: 1},
-    processingMode: 'no_action',
+    processingMode: 'reviewed_non_monitor',
   }), []);
 });
 
@@ -209,7 +209,7 @@ test('同步、AI 与预警链路都对官方内容做独立兜底', async () =>
   assert.match(aiLabeler, /\['official_content', 'blogger_profile'\]\.includes\(record\?\.record_type\)/);
   assert.match(alertEngine, /\['official_content', 'blogger_profile'\]\.includes\(record\.record_type\)/);
   assert.match(drawer, /新增负评提醒/);
-  assert.match(drawer, /仅作提醒，处理模式仍为/);
+  assert.match(drawer, /仅作提醒，处理状态仍为/);
   assert.match(patrolRoute, /skipOfficialAccounts:\s*true/);
   assert.match(patrolDispatch, /skipOfficialAccounts:\s*true/);
 });
