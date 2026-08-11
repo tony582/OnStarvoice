@@ -2,11 +2,11 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import cloud from 'd3-cloud'
 import {
   AlertTriangle, BarChart3, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, Download, Loader2,
-  MessageSquareWarning, RefreshCw, Sparkles, Star, X,
+  Link2, MessageSquareWarning, RefreshCw, Sparkles, Star, X,
 } from 'lucide-react'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import {
-  Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area, AreaChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { api } from '@/lib/api'
 import { compact, formatDate, formatNumber, LABELS, platformName, proxiedImg } from '@/lib/utils'
@@ -233,6 +233,7 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
   const [month, setMonth] = useState(currentShanghaiMonth)
   const [data, setData] = useState<DashboardResponse | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadingElapsedSeconds, setLoadingElapsedSeconds] = useState(0)
   const [error, setError] = useState('')
   const [keywords, setKeywords] = useState<string[]>([]) // 关注主题/临时关键词:空=全量
   const [exporting, setExporting] = useState(false)
@@ -241,13 +242,15 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
   const [drilldownLoading, setDrilldownLoading] = useState(false)
   const [drilldownError, setDrilldownError] = useState('')
   const drilldownRequestRef = useRef(0)
+  const hasSnapshot = Boolean(data?.snapshot)
 
-  const load = useCallback(() => Promise.resolve().then(async () => {
+  const load = useCallback((forceRefresh = false) => Promise.resolve().then(async () => {
     setLoading(true)
     setError('')
     try {
       const params = new URLSearchParams({ range: 'month', month })
       if (keywords.length) params.set('keywords', keywords.join(','))
+      if (forceRefresh) params.set('refresh', '1')
       const result = await api.get<DashboardResponse>('/analytics/dashboard?' + params.toString())
       setData(result)
     } catch (err) {
@@ -257,7 +260,19 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
     }
   }), [month, keywords])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load(false) }, [load])
+
+  useEffect(() => {
+    if (!loading || hasSnapshot) {
+      setLoadingElapsedSeconds(0)
+      return
+    }
+    const startedAt = Date.now()
+    const updateElapsed = () => setLoadingElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000))
+    updateElapsed()
+    const timer = window.setInterval(updateElapsed, 1000)
+    return () => window.clearInterval(timer)
+  }, [loading, hasSnapshot])
 
   const s = data?.snapshot
   const exportMonthlyWorkbook = async () => {
@@ -323,6 +338,11 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
               <CalendarDays className="h-3.5 w-3.5" />
               <span>{data?.period?.label || '本月（月报）'}</span>
               {data?.period?.generatedAt && <span>刷新于 {formatDate(data.period.generatedAt)}</span>}
+              {loading && hasSnapshot && (
+                <span className="inline-flex items-center gap-1 font-semibold text-primary" role="status">
+                  <Loader2 className="h-3 w-3 animate-spin" />正在更新月报
+                </span>
+              )}
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -340,7 +360,7 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
               <Download className={`h-3.5 w-3.5 ${exporting ? 'animate-pulse' : ''}`} />
               {exporting ? '导出中…' : '导出月报数据'}
             </Button>
-            <Button variant="outline" size="sm" onClick={load} disabled={loading}>
+            <Button variant="outline" size="sm" onClick={() => void load(true)} disabled={loading}>
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
               刷新
             </Button>
@@ -356,9 +376,7 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
       )}
 
       {loading && !s ? (
-        <div className="flex justify-center py-24">
-          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-        </div>
+        <DashboardLoadingState month={month} elapsedSeconds={loadingElapsedSeconds} />
       ) : !s ? (
         <EmptyState icon={BarChart3} title="暂无看板数据" />
       ) : (
@@ -453,6 +471,94 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
   )
 }
 
+function DashboardLoadingState({ month, elapsedSeconds }: { month: string; elapsedSeconds: number }) {
+  const [year, monthNumber] = month.split('-').map(Number)
+  const monthLabel = Number.isFinite(year) && Number.isFinite(monthNumber)
+    ? `${year}年${monthNumber}月`
+    : '本月'
+  const activeStage = elapsedSeconds < 2 ? 0 : elapsedSeconds < 6 ? 1 : 2
+  const stages = ['读取本月内容', '计算三类分布', '整理延展分析']
+  const detail = activeStage === 0
+    ? `正在锁定 ${monthLabel} 的内容范围`
+    : activeStage === 1
+      ? '正在汇总平台、情感与处理模式分布'
+      : elapsedSeconds < 10
+        ? '正在整理趋势、风险和重点内容'
+        : '本月数据量较大，正在完成最后汇总，无需重复刷新'
+
+  return (
+    <section
+      className="overflow-hidden rounded-lg border border-border bg-card"
+      role="status"
+      aria-live="polite"
+      aria-label={`正在生成${monthLabel}月报`}
+      data-testid="dashboard-loading-state"
+    >
+      <div className="border-b border-border px-5 py-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="grid h-8 w-8 place-items-center rounded-lg bg-primary/10 text-primary">
+                <BarChart3 className="h-4 w-4" />
+              </span>
+              <div>
+                <h2 className="text-sm font-bold">正在生成 {monthLabel} 月报</h2>
+                <p className="mt-0.5 text-xs text-muted-foreground">{detail}</p>
+              </div>
+            </div>
+          </div>
+          <span className="rounded-md bg-primary/8 px-2.5 py-1 text-[11px] font-semibold text-primary">
+            已等待 {elapsedSeconds} 秒
+          </span>
+        </div>
+        <div className="mt-4 grid gap-2 sm:grid-cols-3" aria-label="月报生成阶段">
+          {stages.map((stage, index) => (
+            <div
+              key={stage}
+              className={`flex items-center gap-2 rounded-md px-2.5 py-2 text-[11.5px] font-semibold ${index === activeStage ? 'bg-primary/[0.07] text-primary' : 'bg-muted/35 text-muted-foreground'}`}
+            >
+              <span className={`h-2 w-2 rounded-full ${index === activeStage ? 'animate-pulse bg-primary' : 'bg-border'}`} />
+              {stage}
+            </div>
+          ))}
+        </div>
+        <div className="skeleton mt-3 h-1 w-full" aria-hidden="true" />
+      </div>
+
+      <div className="p-5" aria-hidden="true">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 4 }, (_, index) => (
+            <div key={index} className="rounded-lg border border-border bg-muted/20 px-3.5 py-3">
+              <div className="skeleton h-3 w-20" />
+              <div className="skeleton mt-3 h-7 w-24" />
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 grid gap-4 xl:grid-cols-3">
+          {stages.map((stage) => (
+            <div key={stage} className="min-h-[270px] overflow-hidden rounded-lg border border-border bg-background">
+              <div className="border-b border-border px-4 py-3">
+                <div className="skeleton h-4 w-24" />
+              </div>
+              <div className="space-y-4 p-4">
+                {Array.from({ length: 4 }, (_, index) => (
+                  <div key={index}>
+                    <div className="flex justify-between gap-4">
+                      <div className="skeleton h-3.5 w-20" />
+                      <div className="skeleton h-3.5 w-14" />
+                    </div>
+                    <div className="skeleton mt-2 h-1.5 w-full" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function Panel({ title, hint, note, children }: { title: string; hint?: string; note?: React.ReactNode; children: React.ReactNode }) {
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card">
@@ -475,6 +581,8 @@ type CoreDistributionRow = {
   color: string
   detail?: string
 }
+
+type CoreFilterState = 'none' | 'source' | 'loading' | 'filtered'
 
 function CoreMonthlyAnalysis({
   snapshot,
@@ -524,7 +632,7 @@ function CoreMonthlyAnalysis({
     return {
       ...row,
       count,
-      share: statusTotal ? Math.round(count / statusTotal * 100) : 0,
+      share: statusTotal ? Math.round(count / statusTotal * 1000) / 10 : 0,
     }
   })
 
@@ -540,7 +648,9 @@ function CoreMonthlyAnalysis({
         ...row,
         count: current?.count || 0,
         share: current?.share || 0,
-        detail: current
+        detail: dimension === 'status'
+          ? undefined
+          : current
           ? `互动 ${formatNumber(current.interactions)}${current.negativeCount ? ` · 负面 ${formatNumber(current.negativeCount)}` : ''}`
           : undefined,
       }
@@ -580,6 +690,12 @@ function CoreMonthlyAnalysis({
   const filterLabel = activeSelection
     ? `${activeSelection.dimension === 'platform' ? '平台' : activeSelection.dimension === 'sentiment' ? '情感' : '处理模式'} · ${drilldownLabel(activeSelection.dimension, activeSelection.value)}`
     : ''
+  const filterStateFor = (dimension: CoreDimension): CoreFilterState => {
+    if (!activeSelection) return 'none'
+    if (activeSelection.dimension === dimension) return 'source'
+    if (drilldownLoading) return 'loading'
+    return filterReady ? 'filtered' : 'none'
+  }
 
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card" aria-labelledby="monthly-core-title">
@@ -589,18 +705,11 @@ function CoreMonthlyAnalysis({
             <h2 id="monthly-core-title" className="text-base font-bold">月报基础分析</h2>
             <StatusBadge tone="muted">{periodLabel}</StatusBadge>
           </div>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">三类分布始终显示；点击任一项会联动筛选顶部指标和另外两个分布。</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">三类分布始终显示；点击图形或图例，顶部指标和其他图表会一起更新。</p>
         </div>
-        {activeSelection ? (
-          <div className="flex items-center gap-2 rounded-lg border border-primary/20 bg-primary/[0.05] px-2.5 py-1.5 text-xs" aria-label="当前联动筛选">
-            <span className="font-semibold text-primary">联动筛选</span>
-            <strong>{filterLabel}</strong>
-            {drilldownLoading && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
-            <button type="button" onClick={onClearFilter} className="ml-1 rounded px-1.5 py-0.5 text-muted-foreground hover:bg-accent hover:text-foreground">清除筛选</button>
-          </div>
-        ) : (
-          <span className="rounded-md bg-primary/8 px-2.5 py-1 text-[11px] font-semibold text-primary">自然月月报</span>
-        )}
+        {activeSelection
+          ? <span className="inline-flex items-center gap-1.5 rounded-md bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary"><Link2 className="h-3 w-3" />联动分析已开启</span>
+          : <span className="rounded-md bg-primary/8 px-2.5 py-1 text-[11px] font-semibold text-primary">自然月月报</span>}
       </div>
       <div className="p-5">
         {drilldownError && (
@@ -609,37 +718,67 @@ function CoreMonthlyAnalysis({
             <button type="button" onClick={onClearFilter} className="font-semibold hover:underline">恢复整月数据</button>
           </div>
         )}
+        {activeSelection && (
+          <div
+            className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/20 border-l-[3px] border-l-primary bg-primary/[0.045] px-3.5 py-3"
+            aria-label="当前联动筛选"
+            aria-live="polite"
+          >
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground"><Link2 className="h-4 w-4" /></span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+                  <span className="text-muted-foreground">当前查看</span>
+                  <strong className="text-sm text-primary">{filterLabel}</strong>
+                  {!drilldownLoading && filterReady && (
+                    <span className="font-semibold tabular-nums text-foreground">{formatNumber(metricTotal)} 条 · 占本月 {drilldownData?.summary.shareOfPeriod || 0}%</span>
+                  )}
+                </div>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  {drilldownLoading
+                    ? '正在重新计算顶部指标和另外两个分布…'
+                    : filterReady
+                      ? '顶部指标和另外两个分布已按当前选择联动更新'
+                      : '保留当前选择；可退出联动恢复整月数据'}
+                </p>
+              </div>
+            </div>
+            <button type="button" onClick={onClearFilter} className="inline-flex h-8 items-center gap-1 rounded-md border border-border bg-card px-2.5 text-xs font-semibold text-muted-foreground transition hover:border-primary/30 hover:text-primary">
+              <X className="h-3.5 w-3.5" />退出联动
+            </button>
+          </div>
+        )}
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {stats.map(stat => (
             <CoreMetric key={stat.label} {...stat} />
           ))}
         </div>
-        <div className="mt-4 grid gap-4 xl:grid-cols-3">
-          <CoreDistributionCard
+        <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,1.2fr)]">
+          <CoreDonutCard
             title="平台分布"
             hint={G.platform}
             rows={platformRows}
             dimension="platform"
             activeValue={activeSelection?.dimension === 'platform' ? activeSelection.value : ''}
-            filterState={activeSelection?.dimension === 'platform' ? 'source' : activeSelection ? 'filtered' : 'none'}
+            filterState={filterStateFor('platform')}
             onSelect={onDrillDown}
           />
-          <CoreDistributionCard
+          <CoreDonutCard
             title="情感分布"
             hint={G.sentiment}
             rows={sentimentRows}
             dimension="sentiment"
             activeValue={activeSelection?.dimension === 'sentiment' ? activeSelection.value : ''}
-            filterState={activeSelection?.dimension === 'sentiment' ? 'source' : activeSelection ? 'filtered' : 'none'}
+            filterState={filterStateFor('sentiment')}
             onSelect={onDrillDown}
           />
-          <CoreDistributionCard
+          <CoreStatusCompositionCard
             title="处理模式分布"
             hint={G.workflow}
             rows={statusRows}
             dimension="status"
             activeValue={activeSelection?.dimension === 'status' ? activeSelection.value : ''}
-            filterState={activeSelection?.dimension === 'status' ? 'source' : activeSelection ? 'filtered' : 'none'}
+            filterState={filterStateFor('status')}
             onSelect={onDrillDown}
           />
         </div>
@@ -673,7 +812,33 @@ function CoreMetric({ label, value, suffix, tone = 'normal', hint }: {
   )
 }
 
-function CoreDistributionCard({
+function CoreFilterBadge({ state }: { state: CoreFilterState }) {
+  if (state === 'none') return null
+  const label = state === 'source' ? '筛选来源' : state === 'loading' ? '正在联动' : '已联动更新'
+  return (
+    <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold ${state === 'source' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>
+      {state === 'loading' ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Link2 className="h-2.5 w-2.5" />}
+      {label}
+    </span>
+  )
+}
+
+function CoreFilterFooter({ state }: { state: CoreFilterState }) {
+  const copy = state === 'source'
+    ? '再次点击当前项可退出联动'
+    : state === 'loading'
+      ? '正在按当前选择重算本图数据'
+      : state === 'filtered'
+        ? '本图数据已按当前选择重新计算'
+        : '点击图形或图例，联动查看另外两个分布'
+  return (
+    <div className={`border-t px-4 py-2 text-[10.5px] ${state === 'source' ? 'border-primary/15 bg-primary/[0.04] text-primary' : 'border-border bg-muted/20 text-muted-foreground'}`}>
+      {copy}
+    </div>
+  )
+}
+
+function CoreDonutCard({
   title,
   hint,
   rows,
@@ -687,59 +852,169 @@ function CoreDistributionCard({
   rows: CoreDistributionRow[]
   dimension: CoreDimension
   activeValue: string
-  filterState: 'none' | 'source' | 'filtered'
+  filterState: CoreFilterState
   onSelect: (dimension: CoreDimension, value: string) => void
 }) {
+  const chartRows = rows.filter(row => row.count > 0)
+  const total = rows.reduce((sum, row) => sum + row.count, 0)
+  const activeRow = rows.find(row => row.key === activeValue)
+  const centerValue = activeRow ? activeRow.count : total
+  const centerLabel = activeRow ? activeRow.label : '内容总量'
+
   return (
-    <section className="flex min-h-[320px] flex-col overflow-hidden rounded-lg border border-border bg-background">
+    <section className={`flex min-h-[330px] flex-col overflow-hidden rounded-lg border bg-background transition-colors ${filterState === 'source' ? 'border-primary/40 ring-2 ring-primary/10' : filterState === 'filtered' ? 'border-primary/20' : 'border-border'}`}>
       <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
-        <h3 className="flex items-center gap-1.5 text-sm font-bold">{title}<InfoHint text={hint} /></h3>
-        {filterState !== 'none' && (
-          <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${filterState === 'source' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'}`}>
-            {filterState === 'source' ? '筛选来源' : '已联动'}
-          </span>
-        )}
+        <div>
+          <h3 className="flex items-center gap-1.5 text-sm font-bold">{title}<InfoHint text={hint} /></h3>
+          <p className="mt-0.5 text-[10.5px] text-muted-foreground">内容条数占比 · 共 {formatNumber(total)} 条</p>
+        </div>
+        <CoreFilterBadge state={filterState} />
       </div>
-      {rows.length ? (
-        <div className="flex-1 divide-y divide-border/60 px-2">
+      <div className="grid flex-1 grid-cols-1 items-center gap-2 px-3 py-4 sm:grid-cols-[138px_minmax(0,1fr)]">
+        <div className="relative mx-auto h-[138px] w-[138px]" role="img" aria-label={`${title}环形图，共${formatNumber(total)}条`}>
+          {chartRows.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={chartRows}
+                  dataKey="count"
+                  nameKey="label"
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={45}
+                  outerRadius={65}
+                  paddingAngle={2}
+                  cornerRadius={3}
+                  animationDuration={450}
+                  onClick={(entry) => {
+                    const key = String(entry.payload?.key || '')
+                    if (key) onSelect(dimension, key)
+                  }}
+                  className="cursor-pointer focus:outline-none"
+                >
+                  {chartRows.map(row => (
+                    <Cell
+                      key={row.key}
+                      fill={row.color}
+                      fillOpacity={activeValue && activeValue !== row.key ? 0.2 : 1}
+                      stroke="var(--card)"
+                      strokeWidth={activeValue === row.key ? 4 : 2}
+                    />
+                  ))}
+                </Pie>
+              </PieChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="absolute inset-2 rounded-full border-[18px] border-muted" />
+          )}
+          <div className="pointer-events-none absolute inset-0 grid place-content-center text-center">
+            <strong className="text-xl font-bold tabular-nums text-foreground">{formatNumber(centerValue)}</strong>
+            <span className="mt-0.5 max-w-[82px] truncate text-[10px] font-semibold text-muted-foreground">{centerLabel}</span>
+          </div>
+        </div>
+        <div className="divide-y divide-border/60">
           {rows.map(row => (
             <button
               key={row.key}
               type="button"
               onClick={() => onSelect(dimension, row.key)}
               aria-pressed={activeValue === row.key}
-              className={`group grid w-full gap-1.5 rounded-md px-2 py-2.5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25 ${activeValue === row.key ? 'bg-primary/8 ring-1 ring-primary/15' : 'hover:bg-accent'}`}
+              className={`group grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md px-2 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25 ${activeValue === row.key ? 'bg-primary/8 ring-1 ring-primary/15' : 'hover:bg-accent'}`}
               aria-label={`${title}：${row.label}，${formatNumber(row.count)}条，占比${row.share}%，点击联动筛选`}
             >
-              <span className="flex items-center justify-between gap-3 text-[12.5px]">
-                <span className="flex min-w-0 items-center gap-2 font-semibold">
+              <span className="min-w-0">
+                <span className="flex min-w-0 items-center gap-2 text-[12px] font-semibold">
                   <i className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
                   <span className="truncate">{row.label}</span>
                 </span>
-                <span className="flex shrink-0 items-center gap-1 text-xs tabular-nums text-muted-foreground">
-                  <strong className="text-foreground">{formatNumber(row.count)}</strong>
-                  <span>· {row.share}%</span>
-                </span>
+                {row.detail && <span className="mt-0.5 block truncate pl-4 text-[9.5px] text-muted-foreground">{row.detail}</span>}
               </span>
-              <span className="h-1.5 overflow-hidden rounded-full bg-muted">
-                <span
-                  className="block h-full rounded-full transition-all"
-                  style={{
-                    width: `${row.share > 0 ? Math.max(3, Math.min(100, row.share)) : 0}%`,
-                    backgroundColor: row.color,
-                  }}
-                />
+              <span className="text-right text-[11px] tabular-nums text-muted-foreground">
+                <strong className="block text-[12px] text-foreground">{formatNumber(row.count)}</strong>
+                {row.share}%
               </span>
-              {row.detail && <span className="text-[10.5px] text-muted-foreground">{row.detail}</span>}
             </button>
           ))}
         </div>
-      ) : (
-        <div className="grid flex-1 place-items-center p-4"><EmptyState icon={BarChart3} title={`暂无${title}`} /></div>
-      )}
-      <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
-        {filterState === 'source' ? '再次点击已选项可清除筛选' : filterState === 'filtered' ? '数据已按当前选择联动筛选' : '点击任一项，联动筛选本月报告'}
       </div>
+      <CoreFilterFooter state={filterState} />
+    </section>
+  )
+}
+
+function CoreStatusCompositionCard({
+  title,
+  hint,
+  rows,
+  dimension,
+  activeValue,
+  filterState,
+  onSelect,
+}: {
+  title: string
+  hint: string
+  rows: CoreDistributionRow[]
+  dimension: CoreDimension
+  activeValue: string
+  filterState: CoreFilterState
+  onSelect: (dimension: CoreDimension, value: string) => void
+}) {
+  const total = rows.reduce((sum, row) => sum + row.count, 0)
+  const chartRows = rows.filter(row => row.count > 0)
+  return (
+    <section className={`flex min-h-[330px] flex-col overflow-hidden rounded-lg border bg-background transition-colors ${filterState === 'source' ? 'border-primary/40 ring-2 ring-primary/10' : filterState === 'filtered' ? 'border-primary/20' : 'border-border'}`}>
+      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+        <div>
+          <h3 className="flex items-center gap-1.5 text-sm font-bold">{title}<InfoHint text={hint} /></h3>
+          <p className="mt-0.5 text-[10.5px] text-muted-foreground">仅比较内容条数与占比 · 共 {formatNumber(total)} 条</p>
+        </div>
+        <CoreFilterBadge state={filterState} />
+      </div>
+      <div className="flex-1 p-4">
+        <div className="mb-2 flex items-baseline justify-between gap-3">
+          <span className="text-[11px] font-semibold text-muted-foreground">处理结构</span>
+          <strong className="text-sm tabular-nums">{formatNumber(total)} 条</strong>
+        </div>
+        <div className="flex h-10 overflow-hidden rounded-lg bg-muted" role="img" aria-label={`${title}百分比堆叠图，共${formatNumber(total)}条`}>
+          {chartRows.length ? chartRows.map(row => {
+            const width = total ? row.count / total * 100 : 0
+            const selected = activeValue === row.key
+            return (
+              <button
+                key={row.key}
+                type="button"
+                onClick={() => onSelect(dimension, row.key)}
+                title={`${row.label}：${formatNumber(row.count)}条，占比${row.share}%`}
+                aria-label={`${title}：${row.label}，${formatNumber(row.count)}条，占比${row.share}%，点击联动筛选`}
+                aria-pressed={selected}
+                className={`relative grid h-full place-items-center overflow-hidden border-r-2 border-card text-[10px] font-bold text-white transition-[width,opacity,filter] duration-500 last:border-r-0 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white ${activeValue && !selected ? 'opacity-20 grayscale-[35%]' : ''}`}
+                style={{ width: `${width}%`, backgroundColor: row.color }}
+              >
+                {width >= 14 && <span className="truncate px-2 drop-shadow-sm">{row.label}</span>}
+              </button>
+            )
+          }) : <div className="grid w-full place-items-center text-[11px] text-muted-foreground">暂无处理模式数据</div>}
+        </div>
+        <div className="mt-4 grid gap-1.5 sm:grid-cols-2">
+          {rows.map(row => (
+            <button
+              key={row.key}
+              type="button"
+              onClick={() => onSelect(dimension, row.key)}
+              aria-pressed={activeValue === row.key}
+              className={`flex min-w-0 items-center justify-between gap-2 rounded-md border px-2.5 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25 ${activeValue === row.key ? 'border-primary/25 bg-primary/8 ring-1 ring-primary/10' : 'border-transparent hover:border-border hover:bg-accent'} ${row.count === 0 ? 'text-muted-foreground' : ''}`}
+              aria-label={`${title}：${row.label}，${formatNumber(row.count)}条，占比${row.share}%，点击联动筛选`}
+            >
+              <span className="flex min-w-0 items-center gap-2 text-[11.5px] font-semibold">
+                <i className="h-2 w-2 shrink-0 rounded-sm" style={{ backgroundColor: row.color }} />
+                <span className="truncate">{row.label}</span>
+              </span>
+              <span className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground"><strong className="text-foreground">{formatNumber(row.count)}</strong> · {row.share}%</span>
+            </button>
+          ))}
+        </div>
+      </div>
+      <CoreFilterFooter state={filterState} />
     </section>
   )
 }
