@@ -30,8 +30,8 @@ const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string
 ]
 
 const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [
-  { value: 'single', title: '单个节点', description: '指定一个 Agent 执行；离线也可排队，上线自动领取。', icon: Bot },
-  { value: 'multi', title: '多节点编排', description: '把关键词拆分到多个 Agent 并行执行，适合大批量采集。', icon: Network },
+  { value: 'single', title: '固定一个节点', description: '只交给指定 Agent；节点离线时任务原地等待，不自动转交。', icon: Bot },
+  { value: 'multi', title: '弹性节点池（推荐）', description: '工作项留在云端，哪个兼容节点先空闲就先领取一个。', icon: Network },
 ]
 
 const STEP_LABELS: Array<{ step: WizardStep; label: string }> = [
@@ -197,7 +197,7 @@ export function CreateTaskDrawer({
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {editingExisting
                 ? '更新该设备的无人值守计划，保存后覆盖原计划。'
-                : '先选择任务类型，再决定交给哪个 Agent（浏览器节点）执行。'}
+                : '先选择任务类型，再决定固定给一个节点，还是交给弹性节点池。'}
             </p>
           </div>
         </div>
@@ -247,13 +247,16 @@ export function CreateTaskDrawer({
           <div className="mx-auto max-w-2xl">
             <div className="mb-4">
               <h3 className="text-base font-bold">怎么执行这批采集？</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">Agent 指浏览器执行节点。量小指定单个即可，量大可编排到多个节点并行。</p>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">固定节点适合必须保留同一浏览器现场的任务；弹性池适合可拆分的批量工作。</p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="执行方式">
               {EXECUTION_METHODS.map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
                 const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
+                const elasticPool = item.value === 'multi'
+                  && ['keyword', 'unattended_plan', 'negative_patrol'].includes(taskType)
+                const itemTitle = item.title
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
                     onClick={() => {
@@ -268,19 +271,20 @@ export function CreateTaskDrawer({
                         ? <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">后续开放</span>
                         : <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>}
                     </div>
-                    <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
+                    <div className="mt-3 flex items-center gap-2 text-sm font-bold text-foreground">
+                      {itemTitle}
+                      {elasticPool && <span className="rounded-full bg-status-green/10 px-2 py-0.5 text-[9px] font-semibold text-status-green">动态领取</span>}
+                    </div>
                     <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
                       {unavailable
                         ? taskType === 'creator_patrol'
                           ? '账号作品发现首版由一个 Agent 串行执行；每个账号只打开一次，避免重复发现。'
                           : '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
-                        : taskType === 'negative_patrol' && item.value === 'multi'
-                          ? '把负面帖子均衡拆给多个在线 Agent 并行巡查，降低单账号连续打开大量帖子的压力。'
                         : item.description}
                     </p>
-                    {!unavailable && item.value === 'multi' && selected && taskType !== 'negative_patrol' && (
+                    {!unavailable && item.value === 'multi' && selected && (
                       <p className="mt-2 text-[11px] leading-4 text-primary">
-                        下一页先确定平台和采集规则，再选择兼容节点；Agent 只选一次。
+                        每个节点一次只领一个工作项；做完继续领，快的自然多做。
                       </p>
                     )}
                   </button>
@@ -297,9 +301,9 @@ export function CreateTaskDrawer({
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
                 {method === 'multi'
                   ? taskType === 'negative_patrol'
-                    ? '可多选；确认帖子清单后，系统会把帖子均衡分给这些在线节点，每条帖子只交给一个 Agent。'
-                    : '可多选；关键词会在下一步按规则均分给这些节点。'
-                  : '任务会绑定到具体浏览器扩展。离线 Agent 仍可接单，上线后自动领取。'}
+                    ? '可多选；帖子保留在云端，由这些兼容节点空闲时逐篇领取。'
+                    : '可多选；关键词保留在云端，由这些兼容节点空闲时逐个领取。'
+                  : '任务会绑定到具体浏览器扩展。节点离线时原地等待，不会自动转交。'}
               </p>
             </div>
             <AgentPicker

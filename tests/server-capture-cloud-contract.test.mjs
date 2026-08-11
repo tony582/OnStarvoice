@@ -1067,7 +1067,7 @@ test("create command failures and successful stops settle orchestration work ite
   );
   assert.match(
     expiry,
-    /status: 'needs_action',[\s\S]*code: 'create_command_expired'/u,
+    /elasticQueueItem \? 'retryable' : 'needs_action',[\s\S]*code: 'create_command_expired'/u,
   );
   assert.match(
     expiry,
@@ -1123,6 +1123,76 @@ test("create command failures and successful stops settle orchestration work ite
   assert.match(
     completion,
     /SELECT id, parent_task_id,[\s\S]*?status, error, metadata/u,
+  );
+});
+
+test("elastic queue claims one keyword or negative post per idle heartbeat and fences late attempts", () => {
+  const claim = readRouteSection(
+    "async function dispatchNextElasticWorkItem",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(claim, /findCaptureAgentExecutionSlotBlocker/u);
+  assert.match(claim, /item\.status IN \('pending', 'retryable'\)/u);
+  assert.match(claim, /FOR UPDATE OF parent, item SKIP LOCKED/u);
+  assert.match(claim, /keywords: \[candidate\.keyword\]/u);
+  assert.match(claim, /item\.item_type = 'negative_post'/u);
+  assert.match(claim, /targets: \[target\]/u);
+  assert.match(claim, /claimUnit = 'negative_post'/u);
+  assert.match(claim, /createAckTimeoutSeconds/u);
+  assert.match(claim, /ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS/u);
+  assert.match(claim, /attempt_count = \$1/u);
+  assert.match(claim, /assignment_revision = \$4/u);
+  assert.match(claim, /execution_task_id = \$3/u);
+  assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(claim, /classifyCaptureRecoveryDisposition/u);
+  assert.match(claim, /'manual_current'/u);
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  const mirror = heartbeat.indexOf('mirrorTaskSnapshot');
+  const elastic = heartbeat.indexOf('dispatchNextElasticWorkItem');
+  const commandRead = heartbeat.indexOf('SELECT c.id, c.command_type');
+  assert.ok(mirror >= 0);
+  assert.ok(elastic > mirror);
+  assert.ok(commandRead > elastic);
+});
+
+test("elastic queue reclaims only stale offline work and leaves platform safety manual", () => {
+  const lease = readRouteSection(
+    'export async function reconcileElasticCaptureLeases',
+    'export async function reconcileAutomaticCaptureRetries',
+  );
+  assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
+  assert.match(lease, /agent\.last_heartbeat_at/u);
+  assert.match(lease, /status: 'retryable'/u);
+  assert.match(lease, /elastic_agent_offline_timeout/u);
+  assert.match(lease, /FOR UPDATE SKIP LOCKED/u);
+  assert.match(
+    captureCloudRouteSource,
+    /COALESCE\(metadata->>'distributionMode', ''\) <> 'elastic_pool'/u,
+  );
+});
+
+test("elastic negative patrol retries technical failures but keeps safety challenges on the current Agent", () => {
+  const projection = readRouteSection(
+    'async function projectNegativePatrolSnapshot',
+    'async function projectOrchestrationChildControlOutcome',
+  );
+  assert.match(projection, /distributionMode ===[\s\S]*'elastic_pool'/u);
+  assert.match(projection, /classifyCaptureRecoveryDisposition/u);
+  assert.match(
+    projection,
+    /recoveryDisposition\.kind === 'manual_current'[\s\S]*\? 'needs_action'/u,
+  );
+  assert.match(
+    projection,
+    /recoveryDisposition\.automatic[\s\S]*\? 'retryable'/u,
+  );
+  assert.match(
+    projection,
+    /elasticPool && !isProfilePatrol && !snapshotNeedsManualSafety[\s\S]*\? 'retryable'/u,
   );
 });
 

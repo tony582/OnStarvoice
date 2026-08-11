@@ -172,7 +172,26 @@ test('one-time dispatch creates disjoint ordinary child tasks, create commands, 
   assert.doesNotMatch(dispatch, /\b(?:handoff|reassign|fencing_token|lease_expires_at)\b/u);
 });
 
-test('unattended dispatch stores a cloud schedule and fixed assignments without issuing immediate child commands', () => {
+test('elastic one-time dispatch publishes an unassigned queue and defers commands to idle Agent heartbeats', () => {
+  const dispatch = section(
+    "router.post(\n  '/orchestrations/:id/dispatch'",
+    "router.post(\n  '/orchestrations/:id/stop'",
+  );
+  const elasticStart = dispatch.indexOf("if (distributionMode === 'elastic_pool')");
+  const fixedStart = dispatch.indexOf('const executions = [];', elasticStart);
+  assert.ok(elasticStart >= 0);
+  assert.ok(fixedStart > elasticStart);
+  const elastic = dispatch.slice(elasticStart, fixedStart);
+  assert.match(elastic, /eligibleAgentIds/u);
+  assert.match(elastic, /'claimUnit', 'keyword'/u);
+  assert.match(elastic, /phase: 'queued'/u);
+  assert.match(elastic, /assigned: 0/u);
+  assert.match(elastic, /eventType: 'orchestration_elastic_pool_opened'/u);
+  assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
+  assert.match(route, /function normalizeDispatch[\s\S]*eligibleAgentIds/u);
+});
+
+test('unattended dispatch stores either fixed assignments or an elastic cloud pool without issuing immediate child commands', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
     "router.post(\n  '/orchestrations/:id/stop'",
@@ -187,7 +206,9 @@ test('unattended dispatch stores a cloud schedule and fixed assignments without 
 
   assert.match(unattended, /INSERT INTO capture_orchestration_schedules/u);
   assert.match(unattended, /INSERT INTO capture_orchestration_schedule_agents/u);
-  assert.match(unattended, /SET status = 'assigned'/u);
+  assert.match(unattended, /distribution_mode/u);
+  assert.match(unattended, /WHEN \$1 = 'elastic_pool' THEN 'pending'/u);
+  assert.match(unattended, /eligibleAgentIds/u);
   assert.match(unattended, /orchestration_schedule_id = \$1/u);
   assert.match(unattended, /schedule_revision = 1/u);
   assert.match(unattended, /orchestrationTemplate/u);
@@ -379,7 +400,7 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
   );
   assert.match(
     detail,
-    /WHERE item\.tenant_id = \$1 AND item\.task_id = \$2/u,
+    /ca\.id = ANY\(\$3::uuid\[\]\)[\s\S]*item\.task_id = \$2[\s\S]*item\.assigned_agent_id = ca\.id/u,
   );
   assert.match(route, /record\.content AS source_record_content/u);
   assert.match(route, /function publicParentItem/u);

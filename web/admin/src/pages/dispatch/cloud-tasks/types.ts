@@ -147,6 +147,8 @@ export type OrchestrationScheduleRecord = {
   randomOffsetMin?: number
   custom_dates?: string[] | string
   customDates?: string[] | string
+  distribution_mode?: 'fixed_batch' | 'elastic_pool' | string
+  distributionMode?: 'fixed_batch' | 'elastic_pool' | string
   plan_snapshot?: Record<string, unknown> | null
   next_run_at?: string | null
   nextRunAt?: string | null

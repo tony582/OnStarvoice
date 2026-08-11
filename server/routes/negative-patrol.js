@@ -624,6 +624,13 @@ async function loadCompatibleAgent(tx, tenantId, agentId, platform) {
       409,
     )};
   }
+  if (capabilities.remoteTargetedPostCaptureV1 !== true) {
+    return {failure: requestError(
+      'agent_targeted_post_capability_missing',
+      '目标执行节点版本尚不支持云端逐帖采集，请先升级扩展',
+      409,
+    )};
+  }
   const allowedPlatforms = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
     : [];
@@ -736,14 +743,26 @@ function patrolRequestHash({
   filter,
   recordIds,
   captureSettings,
+  distributionMode = 'fixed_batch',
 }) {
   const normalizedAgentIds = Array.isArray(agentIds)
     ? agentIds.filter(Boolean)
     : [];
+  const elasticPool =
+    distributionMode === 'elastic_pool' && normalizedAgentIds.length > 1;
   return crypto.createHash('sha256').update(JSON.stringify({
     workflow: 'negative_post_patrol',
-    protocolVersion: normalizedAgentIds.length > 1 ? 2 : 1,
-    ...(normalizedAgentIds.length > 1
+    protocolVersion: elasticPool
+      ? 3
+      : normalizedAgentIds.length > 1
+        ? 2
+        : 1,
+    ...(elasticPool
+      ? {
+          distributionMode: 'elastic_pool',
+          eligibleAgentIds: normalizedAgentIds,
+        }
+      : normalizedAgentIds.length > 1
       ? {agentIds: normalizedAgentIds}
       : {agentId: normalizedAgentIds[0] || ''}),
     title,
@@ -751,6 +770,175 @@ function patrolRequestHash({
     recordIds: [...recordIds].sort(),
     captureSettings,
   })).digest('hex');
+}
+
+async function createElasticPatrolTask(tx, {
+  tenantId,
+  requestKey,
+  title,
+  filter,
+  candidates,
+  agents,
+  captureSettings,
+  requestHash,
+  actorId,
+  actorName,
+}) {
+  const selectedRecordIds = candidates.map(candidate => candidate.id);
+  const eligibleAgentIds = agents.map(agent => agent.id);
+  const recoveryPolicy = {
+    allowIdleAgentHandoff: true,
+    platformSafetyMode: 'manual_confirmed',
+  };
+  const metadata = {
+    workflow: 'negative_post_patrol',
+    businessTaskType: 'negative_post_patrol',
+    protocolVersion: 3,
+    multiAgent: true,
+    allocationMode: 'elastic_pool',
+    distributionMode: 'elastic_pool',
+    cloudWorkQueue: true,
+    claimUnit: 'negative_post',
+    remoteCreated: true,
+    remoteRequestHash: requestHash,
+    requestedByUserId: actorId || '',
+    requestedByName: text(actorName, 240),
+    filter,
+    selectedRecordIds,
+    selectedAgentIds: eligibleAgentIds,
+    eligibleAgentIds,
+    captureSettings,
+    planSnapshot: {recoveryPolicy},
+    recoveryPolicy,
+  };
+  const parent = await tx.queryOne(`
+    INSERT INTO capture_tasks (
+      id, tenant_id, client_task_id, task_type, feature_key,
+      title, platform, source, trigger_type, status,
+      progress, checkpoint, counts, metadata, message,
+      orchestration_revision, source_updated_at
+    ) VALUES (
+      $1::uuid, $2, $1::uuid::text, 'capture_orchestration',
+      'negative_post_patrol', $3, $4, 'cloud',
+      'negative_patrol_elastic_pool', 'pending',
+      $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
+      '帖子保留在云端，等待弹性节点逐篇领取',
+      1, now()
+    )
+    RETURNING *
+  `, [
+    requestKey,
+    tenantId,
+    title,
+    filter.platform,
+    JSON.stringify({
+      current: 0,
+      total: candidates.length,
+      percent: 0,
+      phase: 'queued',
+    }),
+    JSON.stringify({
+      total: candidates.length,
+      assigned: 0,
+      processed: 0,
+      success: 0,
+      failed: 0,
+      skipped: 0,
+      agents: agents.length,
+    }),
+    JSON.stringify(metadata),
+  ]);
+
+  for (let ordinal = 0; ordinal < candidates.length; ordinal += 1) {
+    const candidate = candidates[ordinal];
+    await tx.execute(`
+      INSERT INTO capture_task_items (
+        id, tenant_id, task_id, item_key, ordinal,
+        platform, item_type, record_id, external_id, url_snapshot,
+        status, assigned_agent_id, execution_task_id,
+        assignment_revision, request_hash, metadata
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, 'negative_post', $7, $8, $9,
+        'pending', NULL, NULL,
+        0, '', $10::jsonb
+      )
+    `, [
+      crypto.randomUUID(),
+      tenantId,
+      parent.id,
+      `record:${candidate.id}`,
+      ordinal,
+      candidate.platform,
+      candidate.id,
+      candidate.externalId,
+      candidate.url,
+      JSON.stringify({
+        sourceRecord: {
+          title: candidate.title,
+          content: text(candidate.content, 1000),
+          authorName: candidate.authorName,
+          publishedAt: candidate.publishedAt,
+          publishTime: candidate.publishTime,
+          keyword: candidate.keyword,
+          noteType: candidate.noteType,
+        },
+        baseline: candidate.baseline,
+      }),
+    ]);
+  }
+
+  await appendTaskEvent(tx, {
+    tenantId,
+    taskId: parent.id,
+    agentId: null,
+    actorId,
+    actorName,
+    status: parent.status,
+    message: '负面帖子已进入云端弹性队列',
+    eventType: 'negative_patrol_elastic_pool_opened',
+    payload: {
+      platform: filter.platform,
+      candidateCount: candidates.length,
+      eligibleAgentIds,
+      claimUnit: 'negative_post',
+      requestHash,
+    },
+  });
+  await tx.execute(`
+    INSERT INTO audit_logs (
+      tenant_id, actor_type, actor_id, actor_user_id,
+      action, target_type, target_id, metadata
+    ) VALUES (
+      $1, 'user', $2, $3,
+      'negative_patrol.create_elastic_pool',
+      'capture_task', $4, $5::jsonb
+    )
+  `, [
+    tenantId,
+    text(actorId, 240),
+    actorId || null,
+    parent.id,
+    JSON.stringify({
+      platform: filter.platform,
+      candidateCount: candidates.length,
+      eligibleAgentIds,
+      requestHash,
+    }),
+  ]);
+  return {
+    task: parent,
+    commandId: null,
+    commandIds: [],
+    commandExpiresAt: null,
+    agentOnline: agents.some(agent =>
+      captureAgentOnline(agent.last_heartbeat_at),
+    ),
+    agentCount: agents.length,
+    allocation: [],
+    executions: [],
+    existing: false,
+  };
 }
 
 function patrolGroupRequestHash(parentRequestHash, agentId, recordIds) {
@@ -1309,6 +1497,10 @@ router.post(
       }
       const agentIds = normalizedAgents.agentIds;
       const agentId = agentIds[0] || '';
+      const distributionMode =
+        req.body?.distributionMode === 'elastic_pool' && agentIds.length > 1
+          ? 'elastic_pool'
+          : 'fixed_batch';
       const rawRequestKey = text(req.body?.requestKey, 100);
       const requestKey = rawRequestKey
         ? normalizedUuid(rawRequestKey)
@@ -1362,6 +1554,7 @@ router.post(
             filter: normalized.filter,
             recordIds: requestRecordIds,
             captureSettings,
+            distributionMode,
           });
           if (
             !negativePatrolExistingRequestMatches(existing, requestHash)
@@ -1453,10 +1646,14 @@ router.post(
           filter: normalized.filter,
           recordIds: selectedRecordIds,
           captureSettings,
+          distributionMode,
         });
 
         if (agentIds.length > 1) {
-          if (selection.candidates.length < agentIds.length) {
+          if (
+            distributionMode !== 'elastic_pool' &&
+            selection.candidates.length < agentIds.length
+          ) {
             return {failure: requestError(
               'negative_patrol_candidates_fewer_than_agents',
               `当前选择 ${selection.candidates.length} 条帖子，少于 ${agentIds.length} 个执行节点；请减少节点或增加帖子`,
@@ -1472,9 +1669,23 @@ router.post(
             req.tenantId,
             agentIds,
             normalized.filter.platform,
-            {requireOnline: true},
+            {requireOnline: distributionMode !== 'elastic_pool'},
           );
           if (compatible.failure) return {failure: compatible.failure};
+          if (distributionMode === 'elastic_pool') {
+            return createElasticPatrolTask(tx, {
+              tenantId: req.tenantId,
+              requestKey,
+              title,
+              filter: normalized.filter,
+              candidates: selection.candidates,
+              agents: compatible.agents,
+              captureSettings,
+              requestHash,
+              actorId: req.user?.id || '',
+              actorName: req.actorName,
+            });
+          }
           return createMultiAgentPatrolTask(tx, {
             tenantId: req.tenantId,
             requestKey,
@@ -1503,6 +1714,9 @@ router.post(
         const metadata = {
           workflow: 'negative_post_patrol',
           protocolVersion: 1,
+          distributionMode: 'fixed_batch',
+          automaticRetryDisabled:
+            req.body?.recoveryPolicy?.allowIdleAgentHandoff === false,
           remoteCreated: true,
           remoteRequestHash: requestHash,
           createCommandId: commandId || '',
@@ -1741,8 +1955,13 @@ router.post(
       if (result.failure) {
         return sendRequestError(res, result.failure);
       }
+      const resultMetadata = safeJson(result.task?.metadata);
+      const elasticPool =
+        resultMetadata.distributionMode === 'elastic_pool';
       const message = result.existing
         ? '相同请求已存在，已返回原任务状态'
+        : elasticPool
+          ? `${result.task?.counts?.total || 0} 条帖子已进入云端队列，空闲节点将逐篇领取`
         : result.agentCount > 1
           ? `任务已均衡分配给 ${result.agentCount} 个在线节点`
         : result.task.assigned_agent_id

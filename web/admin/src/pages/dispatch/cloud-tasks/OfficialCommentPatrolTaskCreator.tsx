@@ -116,6 +116,11 @@ export function OfficialCommentPatrolTaskCreator({
       postsLimit,
       commentsLimit,
       agentId: agent.id,
+      distributionMode: 'fixed_batch' as const,
+      recoveryPolicy: {
+        allowIdleAgentHandoff: false,
+        platformSafetyMode: 'manual_confirmed',
+      },
       title: `${accountLabel(selectedAccount)}评论巡查`,
     }
     const fingerprint = JSON.stringify(taskInput)

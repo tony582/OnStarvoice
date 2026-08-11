@@ -973,6 +973,8 @@ export function OrchestrationDetailWorkspace({
 
   const { orchestration, executions, agents, attempts, schedule } = detail
   const metadata = orchestration.metadata || {}
+  const elasticPool = metadata.distributionMode === 'elastic_pool'
+    || schedule?.distribution_mode === 'elastic_pool'
   const scheduleTemplate = metadata.orchestrationTemplate === true
   const scheduleRun = metadata.orchestrationScheduleRun === true
   const planSnapshot = metadata.planSnapshot && typeof metadata.planSnapshot === 'object'
@@ -987,8 +989,10 @@ export function OrchestrationDetailWorkspace({
     : null
   const recoveryPolicy = planSnapshot.recoveryPolicy && typeof planSnapshot.recoveryPolicy === 'object'
     ? planSnapshot.recoveryPolicy as Record<string, unknown>
-    : {}
-  const idleHandoffAllowed = recoveryPolicy.allowIdleAgentHandoff !== false
+    : metadata.recoveryPolicy && typeof metadata.recoveryPolicy === 'object'
+      ? metadata.recoveryPolicy as Record<string, unknown>
+      : {}
+  const idleHandoffAllowed = elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false
 
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
@@ -1394,8 +1398,8 @@ export function OrchestrationDetailWorkspace({
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-border bg-muted/30 px-3 py-2">
             <Activity className="h-4 w-4 shrink-0 text-primary" />
             <span>
-              <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '固定分配' : '工作项状态'}</span>
-              <span className="block text-xs font-bold">{scheduleTemplate ? `${sortedItems.length} 个关键词已分配` : `${settledCount} 已结算 · ${activeCount} 进行/等待`}</span>
+              <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? (elasticPool ? '领取策略' : '固定分配') : '工作项状态'}</span>
+              <span className="block text-xs font-bold">{scheduleTemplate ? (elasticPool ? '空闲节点逐个领取' : `${sortedItems.length} 个关键词已分配`) : `${settledCount} 已结算 · ${activeCount} 进行/等待`}</span>
             </span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
@@ -1412,7 +1416,9 @@ export function OrchestrationDetailWorkspace({
               <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : '父任务进度'}</h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 {scheduleTemplate
-                  ? '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
+                  ? elasticPool
+                    ? '这里展示后续每轮都会沿用的关键词和弹性节点池；实际领取量由节点空闲速度决定。'
+                    : '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
                   : negativePatrol
                     ? '按每条帖子的真实巡查结果汇总，并展示它由哪个 Agent 执行。'
                     : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
@@ -1502,7 +1508,7 @@ export function OrchestrationDetailWorkspace({
               <Bot className="h-4 w-4 text-primary" />
             </div>
             {agents.length === 0 ? (
-              <div className="px-4 py-10 text-center text-xs text-muted-foreground">服务端尚未返回分配节点。</div>
+              <div className="px-4 py-10 text-center text-xs text-muted-foreground">{elasticPool ? '尚未有节点领取工作项。' : '服务端尚未返回分配节点。'}</div>
             ) : (
               <div className="divide-y divide-border/70">
                 {agents.map(agent => {

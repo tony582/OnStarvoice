@@ -124,24 +124,16 @@ export function NegativePatrolTaskCreator({
   const pendingSubmission = useRef<{ fingerprint: string; requestKey: string } | null>(null)
 
   const supportsPatrol = agents.length > 0
-    && agents.every(agent => agent.capabilities?.negativePostPatrol === true)
-  const allOnline = agents.every(agent => agent.online)
+    && agents.every(agent =>
+      agent.capabilities?.negativePostPatrol === true
+      && agent.capabilities?.remoteTargetedPostCaptureV1 === true,
+    )
   const multiAgent = agents.length > 1
   const selectedPlatform = availablePlatforms.includes(platform)
     ? platform
     : availablePlatforms[0] || ''
   const allSelected = candidates.length > 0 && selectedIds.size === candidates.length
-  const allocationInvalid = multiAgent && selectedIds.size < agents.length
-  const allocationPreview = useMemo(() => {
-    const total = selectedIds.size
-    if (total === 0 || agents.length === 0) return []
-    const base = Math.floor(total / agents.length)
-    const remainder = total % agents.length
-    return agents.map((agent, index) => ({
-      agent,
-      count: base + (index < remainder ? 1 : 0),
-    }))
-  }, [agents, selectedIds])
+  const onlineAgentCount = agents.filter(agent => agent.online).length
 
   const filters = {
     publishDateFrom,
@@ -166,7 +158,6 @@ export function NegativePatrolTaskCreator({
     if (agents.length === 0) return '请至少选择一个执行节点。'
     if (!supportsPatrol) return '部分节点版本尚不支持负面帖子巡查，请先升级 Extension。'
     if (agents.some(agent => agent.status !== 'active')) return '已选节点中包含暂停或停用节点，请返回重新选择。'
-    if (multiAgent && !allOnline) return '多节点巡查只分配给在线 Agent，请移除离线节点后再创建。'
     if (!selectedPlatform) return '已选 Agent 没有共同可执行的平台，请调整节点负责平台。'
     if (!publishDateFrom || !publishDateTo) return '发布时间范围不能为空。'
     if (publishDateFrom > publishDateTo) return '发布时间的开始日期不能晚于结束日期。'
@@ -241,14 +232,15 @@ export function NegativePatrolTaskCreator({
       setError('请至少选择一条需要定向采集的帖子。')
       return
     }
-    if (multiAgent && selectedIds.size < agents.length) {
-      setError(`当前选择 ${selectedIds.size} 条帖子，少于 ${agents.length} 个节点；请减少节点或增加帖子。`)
-      return
-    }
     const taskInput = {
       ...filters,
       agentIds: agents.map(agent => agent.id),
       ...(agents.length === 1 ? { agentId: agents[0].id } : {}),
+      distributionMode: multiAgent ? 'elastic_pool' : 'fixed_batch',
+      recoveryPolicy: {
+        allowIdleAgentHandoff: multiAgent,
+        platformSafetyMode: 'manual_confirmed',
+      },
       title: title.trim() || '负面帖子巡查',
       recordIds: Array.from(selectedIds),
       captureSettings: {
@@ -274,7 +266,7 @@ export function NegativePatrolTaskCreator({
       pendingSubmission.current = null
       setFeedback(result.message || (
         multiAgent
-          ? `已把 ${selectedIds.size} 条帖子均衡分配给 ${agents.length} 个在线 Agent。`
+          ? `已把 ${selectedIds.size} 条帖子放入云端队列，由 ${agents.length} 个候选 Agent 逐篇领取。`
           : agents[0]?.online
             ? `已向 ${agents[0].display_name} 下发 ${selectedIds.size} 条定向采集任务。`
             : `已创建 ${selectedIds.size} 条定向采集任务，Agent 上线后自动领取。`
@@ -290,7 +282,6 @@ export function NegativePatrolTaskCreator({
   const disabled = !writable
     || agents.length === 0
     || agents.some(agent => agent.status !== 'active')
-    || (multiAgent && !allOnline)
     || availablePlatforms.length === 0
     || submitting
 
@@ -468,22 +459,20 @@ export function NegativePatrolTaskCreator({
               <Users className="h-4 w-4" />
             </span>
             <div className="min-w-0 flex-1">
-              <h3 className="text-sm font-bold text-foreground">帖子分配预览</h3>
+              <h3 className="text-sm font-bold text-foreground">弹性领取确认</h3>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                按当前清单连续均衡分配，每条帖子只由一个 Agent 巡查。
+                {selectedIds.size} 条帖子保留在云端；每个空闲 Agent 一次只领 1 条，完成后再领取下一条。
               </p>
-              {allocationInvalid && (
-                <p role="alert" className="mt-2 text-xs leading-5 text-status-red">
-                  帖子数少于节点数，无法保证每个节点至少分到 1 条；请增加帖子或返回减少节点。
-                </p>
-              )}
-              <div className="mt-3 flex flex-wrap gap-2">
-                {allocationPreview.map(({ agent, count }) => (
-                  <span key={agent.id} className={`rounded-lg border bg-background px-2.5 py-1.5 text-[11px] ${count > 0 ? 'border-border/70 text-muted-foreground' : 'border-status-red/30 text-status-red'}`}>
-                    <strong className="font-semibold text-foreground">{agent.display_name}</strong>
-                    {' · '}{count} 条
-                  </span>
-                ))}
+              <div className="mt-3 grid gap-2 text-[11px] leading-4 text-muted-foreground sm:grid-cols-2">
+                <span className="rounded-lg border border-border/70 bg-background px-2.5 py-2">
+                  候选节点 <strong className="font-semibold text-foreground">{agents.length}</strong> 个 · 当前在线 {onlineAgentCount} 个
+                </span>
+                <span className="rounded-lg border border-border/70 bg-background px-2.5 py-2">
+                  节点离线后，未完成帖子会退回队列；旧结果不会重复写入
+                </span>
+                <span className="rounded-lg border border-border/70 bg-background px-2.5 py-2 sm:col-span-2">
+                  验证码、登录失效等平台安全问题不会自动换账号；当前帖子保留人工处理，其他帖子继续领取
+                </span>
               </div>
             </div>
           </div>
@@ -494,11 +483,11 @@ export function NegativePatrolTaskCreator({
       {feedback && <p role="status" className="text-xs leading-5 text-status-green">{feedback}</p>}
 
       <Button type="button" onClick={submit}
-        disabled={disabled || !previewed || selectedIds.size === 0 || allocationInvalid}
+        disabled={disabled || !previewed || selectedIds.size === 0}
         className="min-h-11 w-full">
         {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
         {multiAgent
-          ? `分配 ${selectedIds.size || ''} 条帖子给 ${agents.length} 个节点`
+          ? `把 ${selectedIds.size || ''} 条帖子放入弹性队列`
           : agents[0]?.online
             ? `下发 ${selectedIds.size || ''} 条定向采集`
             : `创建 ${selectedIds.size || ''} 条任务并排队`}

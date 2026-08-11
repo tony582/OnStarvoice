@@ -315,11 +315,38 @@ test("admin UI creates one task draft and explicitly assigns it to a browser age
   assert.match(page, /setSelectedAgentIds/u);
   assert.match(page, /key=\{`\$\{selectedAgent\.id\}:\$\{mode\}:/u);
   assert.match(page, /agent=\{selectedAgent\}/u);
-  assert.match(page, /离线 Agent 仍可接单，上线后自动领取/u);
+  assert.match(page, /节点离线时原地等待，不会自动转交/u);
   assert.match(lib, /Agent 已暂停，不能接收新任务/u);
   assert.match(lib, /客户端扩展版本过低，需升级后才能远程接单/u);
   assert.equal((page.match(/<AgentTaskCreator\b/gu) || []).length, 1,
     "the long task form must render only once inside the assignment drawer");
+});
+
+test("new fixed-node tasks explicitly disable automatic cross-device handoff", async () => {
+  const [
+    keywordCreator,
+    negativeCreator,
+    officialCreator,
+    accountCreator,
+    profileDispatch,
+  ] = await Promise.all([
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentTaskCreator.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/NegativePatrolTaskCreator.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/OfficialCommentPatrolTaskCreator.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AccountDiscoveryTaskCreator.tsx"),
+    read("server/services/profile-patrol-dispatch.js"),
+  ]);
+
+  assert.match(keywordCreator, /distributionMode: 'fixed_batch'/u);
+  assert.match(keywordCreator, /allowIdleAgentHandoff: false/u);
+  assert.match(
+    negativeCreator,
+    /allowIdleAgentHandoff: multiAgent/u,
+  );
+  assert.match(officialCreator, /allowIdleAgentHandoff: false/u);
+  assert.match(accountCreator, /allowIdleAgentHandoff: false/u);
+  assert.match(profileDispatch, /automaticRetryDisabled: automaticRetryDisabled === true/u);
+  assert.match(profileDispatch, /allowIdleAgentHandoff: automaticRetryDisabled !== true/u);
 });
 
 test("multi-Agent handoff keeps unattended mode and selects platform-compatible agents only once", async () => {
@@ -343,10 +370,22 @@ test("multi-Agent handoff keeps unattended mode and selects platform-compatible 
   assert.match(composer, /setExecutionMode\(initialExecutionMode\)/u);
   assert.match(composer, /已从上一步确定，无需重复选择/u);
   assert.match(composer, /validSelectedAgentIds\.length < requiredAgentCount/u);
-  assert.match(composer, /keywords\.length < requiredAgentCount/u);
-  assert.match(composer, /assignedAgentCount < requiredAgentCount/u);
+  assert.doesNotMatch(composer, /keywords\.length < requiredAgentCount/u);
+  assert.match(composer, /validSelectedAgentIds\.length < requiredAgentCount/u);
+  assert.match(composer, /distributionMode = 'elastic_pool'/u);
+  assert.match(composer, /eligibleAgentIds: validSelectedAgentIds/u);
+  assert.match(composer, /eligibleAgentIds: \[\.\.\.validSelectedAgentIds\]\.sort\(\)/u);
   assert.match(composer, /至少 \{requiredAgentCount\} 个/u);
   assert.match(composer, /已移除不兼容节点/u);
+  assert.match(drawer, /固定一个节点/u);
+  assert.match(drawer, /弹性节点池（推荐）/u);
+  assert.match(
+    drawer,
+    /\['keyword', 'unattended_plan', 'negative_patrol'\]\.includes\(taskType\)/u,
+  );
+  assert.match(composer, /一次领取 1 项/u);
+  assert.match(composer, /创建指令 3 分钟未确认/u);
+  assert.match(composer, /持续离线 10 分钟/u);
 });
 
 test("admin UI keeps the business task list newest-first and hides technical child jobs", async () => {

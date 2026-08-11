@@ -268,6 +268,7 @@ export function OrchestrationComposerDrawer({
   const [commentLimit, setCommentLimit] = useState(50)
   const [skipCaptured, setSkipCaptured] = useState(true)
   const allowIdleAgentHandoff = true
+  const distributionMode = 'elastic_pool' as const
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
   const [selectionNotice, setSelectionNotice] = useState('')
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null)
@@ -307,21 +308,6 @@ export function OrchestrationComposerDrawer({
       .map(agentId => agents.find(agent => agent.id === agentId))
       .filter((agent): agent is OrchestrationCloudAgent => Boolean(agent)),
     [agents, validSelectedAgentIds],
-  )
-  const assignmentCounts = useMemo(() => {
-    const counts = new Map<string, number>()
-    assignments.forEach(assignment => counts.set(assignment.agentId, (counts.get(assignment.agentId) || 0) + 1))
-    return counts
-  }, [assignments])
-  const assignedAgentCount = useMemo(
-    () => new Set(assignments.map(assignment => assignment.agentId).filter(Boolean)).size,
-    [assignments],
-  )
-  const overloadedAgentIds = useMemo(
-    () => Array.from(assignmentCounts.entries())
-      .filter(([, count]) => count > 30)
-      .map(([agentId]) => agentId),
-    [assignmentCounts],
   )
   const busy = submitting || discardingDraft
   const requiredAgentCount = Number.isFinite(minimumAgentCount)
@@ -541,6 +527,8 @@ export function OrchestrationComposerDrawer({
     publishTime,
     captureSettings,
     allowIdleAgentHandoff,
+    distributionMode,
+    eligibleAgentIds: [...validSelectedAgentIds].sort(),
   })
 
   const generatePreview = async () => {
@@ -554,11 +542,7 @@ export function OrchestrationComposerDrawer({
       return
     }
     if (keywords.length < 1 || keywords.length > 300) {
-      setError('请输入 1–300 个关键词，每行一个。单个 Agent 最多承载 30 个。')
-      return
-    }
-    if (requiredAgentCount > 1 && keywords.length < requiredAgentCount) {
-      setError(`多节点任务至少需要 ${requiredAgentCount} 个关键词；一个关键词只能交给一个 Agent。`)
+      setError('请输入 1–300 个关键词，每行一个。弹性池会让节点逐个领取。')
       return
     }
     if (!Number.isSafeInteger(keywordMaxDetectedItems) || keywordMaxDetectedItems < 1) {
@@ -615,6 +599,8 @@ export function OrchestrationComposerDrawer({
           title: title.trim(),
           platform,
           executionMode,
+          distributionMode,
+          agentIds: validSelectedAgentIds,
           ...(executionMode === 'unattended_plan'
             ? {
                 schedule: {
@@ -649,13 +635,13 @@ export function OrchestrationComposerDrawer({
       )
       const nextAssignments = buildAssignments(nextCreateResult, nextPreview)
       if (nextAssignments.length !== nextPreview.itemCount || nextAssignments.some(assignment => !assignment.agentId)) {
-        throw new Error('分配预览不完整，请刷新 Agent 状态后重试。')
+        throw new Error('工作项预览不完整，请刷新 Agent 状态后重试。')
       }
       setPreview(nextPreview)
       setAssignments(nextAssignments)
       setStage('allocate')
     } catch (err) {
-      setError(err instanceof Error ? err.message : '生成分配预览失败')
+      setError(err instanceof Error ? err.message : '生成队列预览失败')
     } finally {
       setSubmitting(false)
     }
@@ -664,19 +650,15 @@ export function OrchestrationComposerDrawer({
   const dispatch = async () => {
     setError('')
     if (!preview || !createResult) {
-      setError('当前分配预览已失效，请返回上一步重新生成分配预览。')
+      setError('当前队列预览已失效，请返回上一步重新生成。')
       return
     }
     if (assignments.length !== createResult.items.length || assignments.some(assignment => !assignment.agentId)) {
-      setError('每个工作项都必须分配给一个已选择的 Agent。')
+      setError('工作项清单不完整，请返回上一步重新生成。')
       return
     }
-    if (assignedAgentCount < requiredAgentCount) {
-      setError(`多节点任务必须实际分配给至少 ${requiredAgentCount} 个 Agent。`)
-      return
-    }
-    if (overloadedAgentIds.length > 0) {
-      setError('单个 Agent 最多只能承载 30 个工作项。请调整超载 Agent 的分配后再下发。')
+    if (validSelectedAgentIds.length < requiredAgentCount) {
+      setError(`弹性节点池至少需要 ${requiredAgentCount} 个兼容 Agent。`)
       return
     }
     setSubmitting(true)
@@ -685,6 +667,7 @@ export function OrchestrationComposerDrawer({
         `/capture-cloud/orchestrations/${preview.orchestrationId}/dispatch`,
         {
           expectedRevision: preview.revision,
+          eligibleAgentIds: validSelectedAgentIds,
           assignments: assignments.map(assignment => ({
             itemId: assignment.itemId,
             agentId: assignment.agentId,
@@ -699,10 +682,10 @@ export function OrchestrationComposerDrawer({
       try {
         await onDispatched?.(result)
       } catch {
-        setError('任务已经分配成功，但父页面刷新失败。关闭抽屉后可手动刷新任务列表。')
+        setError('云端队列已经创建，但父页面刷新失败。关闭抽屉后可手动刷新任务列表。')
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : '确认并分配任务失败'
+      const message = err instanceof Error ? err.message : '创建云端队列失败'
       setError(/revision|版本|冲突/i.test(message)
         ? '任务草稿已经变化，当前预览已过期。请返回并重新生成分配预览。'
         : message)
@@ -733,20 +716,20 @@ export function OrchestrationComposerDrawer({
             </button>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
-                <h2 id="orchestration-composer-title" className="text-lg font-bold text-foreground">新建多 Agent 任务</h2>
+                <h2 id="orchestration-composer-title" className="text-lg font-bold text-foreground">新建弹性节点池任务</h2>
                 <span className="rounded-full border border-primary/25 bg-primary/8 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">Beta</span>
               </div>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
                 {executionMode === 'unattended_plan'
-                  ? '无人值守 · 先固定关键词与 Agent 分配，再由云端按计划创建每次任务。'
-                  : '执行一次 · 先拆成关键词工作项，再明确分配给浏览器节点。'}
+                  ? '无人值守 · 每次到点生成云端工作项，由空闲节点逐个领取。'
+                  : '执行一次 · 关键词留在云端，兼容节点空闲后逐个领取。'}
               </p>
             </div>
           </div>
           <div className="mt-4 flex gap-2" aria-label="新建任务步骤">
-            <StepPill active={stage === 'define'} complete={stage !== 'define'}>定义任务与 Agent</StepPill>
+            <StepPill active={stage === 'define'} complete={stage !== 'define'}>定义任务与节点池</StepPill>
             <ChevronRight className="mt-3 h-4 w-4 shrink-0 text-muted-foreground/45" />
-            <StepPill active={stage === 'allocate'} complete={stage === 'dispatched'}>检查工作项分配</StepPill>
+            <StepPill active={stage === 'allocate'} complete={stage === 'dispatched'}>确认云端队列</StepPill>
           </div>
         </header>
 
@@ -884,7 +867,7 @@ export function OrchestrationComposerDrawer({
                         </div>
                       </div>
                       <p className="text-[11px] leading-4 text-muted-foreground">
-                        随机延迟会在设定时间后 0–{randomOffsetMin} 分钟内启动，避免多个任务同时拥挤；Agent 分配可在下一步逐项确认。
+                        随机延迟会在设定时间后 0–{randomOffsetMin} 分钟内启动，避免多个任务同时拥挤；节点池可在下一步统一确认。
                       </p>
                     </div>
                   )}
@@ -932,7 +915,7 @@ export function OrchestrationComposerDrawer({
                         placeholder={'别克\n凯迪拉克\n雪佛兰'}
                         className={textareaClassName}
                       />
-                      <span className={`mt-1.5 block text-[11px] ${keywords.length > 300 ? 'text-status-red' : 'text-muted-foreground'}`}>{keywords.length}/300 个工作项 · 单个 Agent 最多 30 个</span>
+                      <span className={`mt-1.5 block text-[11px] ${keywords.length > 300 ? 'text-status-red' : 'text-muted-foreground'}`}>{keywords.length}/300 个工作项 · 每个 Agent 一次领取 1 个</span>
                     </label>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="block text-xs font-medium text-muted-foreground">
@@ -1029,15 +1012,15 @@ export function OrchestrationComposerDrawer({
                   </p>
                 )}
                 <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[0.045] px-3 py-2.5">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 规则均衡</div>
-                  <p className="mt-1 text-[11px] leading-4 text-muted-foreground">按关键词顺序连续均分给已选 Agent；结果可在下一步逐项调整。这里不会调用 AI。</p>
+                  <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 弹性节点池</div>
+                  <p className="mt-1 text-[11px] leading-4 text-muted-foreground">关键词先留在云端。节点空闲时只领 1 个，完成后再领下一个；速度快的节点会自然多做。</p>
                 </div>
                 <div className="mt-3 flex items-start gap-3 rounded-xl border border-primary/20 bg-primary/[0.035] px-3 py-3">
                   <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">✓</span>
                   <span>
-                    <span className="block text-xs font-semibold text-foreground">系统自动接力已启用</span>
+                    <span className="block text-xs font-semibold text-foreground">离线不会拖住整批任务</span>
                     <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
-                      技术失败由系统自动重试或按关键词转给空闲 Agent；验证码或登录异常所在关键词留在原 Agent 等待人工，其他未开始关键词继续自动分配。
+                      创建指令 3 分钟未确认会退回队列；执行节点持续离线 10 分钟也会回收。验证码或登录验证只暂停当前关键词，不会自动扩散到其他节点。
                     </span>
                   </span>
                 </div>
@@ -1089,7 +1072,7 @@ export function OrchestrationComposerDrawer({
                                       {queuedTasks > 0 ? ` · 排队 ${queuedTasks}` : ''}
                                     </>
                                   : '当前负载未提供'}
-                                {!agent.online ? ' · 上线后领取' : ''}
+                                {!agent.online ? ' · 当前不参与领取，上线后自动加入' : ' · 空闲时可领取'}
                               </span>
                             )}
                           </span>
@@ -1113,7 +1096,7 @@ export function OrchestrationComposerDrawer({
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">规则分配预览</div>
+                      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">云端队列确认</div>
                       <span className="inline-flex items-center gap-1 rounded-full border border-primary/20 bg-card px-2 py-0.5 text-[10px] font-semibold text-primary">
                         {executionMode === 'unattended_plan' ? <CalendarDays className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                         {executionMode === 'unattended_plan' ? '无人值守' : '执行一次'}
@@ -1121,21 +1104,20 @@ export function OrchestrationComposerDrawer({
                     </div>
                     <h3 className="mt-1 text-base font-bold text-foreground">{title}</h3>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {preview.itemCount} 个工作项 · {selectedAgents.length} 个 Agent · 连续均衡分配
+                      {preview.itemCount} 个工作项 · {selectedAgents.length} 个可领取节点 · 一次领取 1 项
                       {executionMode === 'unattended_plan'
                         ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
                         : ''}
                     </p>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => { setStage('define'); setError('') }} disabled={busy}>调整 Agent</Button>
+                  <Button variant="outline" size="sm" onClick={() => { setStage('define'); setError('') }} disabled={busy}>调整节点池</Button>
                 </div>
                 <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                   {selectedAgents.map(agent => (
                     <div key={agent.id} className="rounded-xl border border-border/70 bg-card px-3 py-2.5">
                       <div className="truncate text-xs font-bold text-foreground">{allocationAgentLabel(agent)}</div>
-                      <div className={`mt-1 text-[11px] ${(assignmentCounts.get(agent.id) || 0) > 30 ? 'font-semibold text-status-red' : 'text-muted-foreground'}`}>
-                        {assignmentCounts.get(agent.id) || 0} 个工作项 · {agent.online ? '在线' : '离线排队'}
-                        {(assignmentCounts.get(agent.id) || 0) > 30 ? ' · 超出 30 项上限' : ''}
+                      <div className="mt-1 text-[11px] text-muted-foreground">
+                        {agent.online ? '在线 · 空闲时可领取' : '离线 · 不阻塞其他节点'}
                       </div>
                     </div>
                   ))}
@@ -1145,61 +1127,24 @@ export function OrchestrationComposerDrawer({
               <section className="overflow-hidden rounded-2xl border border-border/70 bg-card">
                 <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
                   <div>
-                    <h3 className="text-sm font-bold text-foreground">工作项分配</h3>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">默认结果来自确定性规则；你可以逐项指定其他已选 Agent。</p>
+                    <h3 className="text-sm font-bold text-foreground">云端工作项</h3>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">这里确认要跑哪些词；实际执行节点由当时的空闲状态决定。</p>
                   </div>
                   <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{assignments.length} 项</span>
                 </div>
                 <div className="divide-y divide-border/70">
-                  {assignments.map((assignment, index) => {
-                    const assignedAgent = agents.find(agent => agent.id === assignment.agentId)
-                    return (
-                      <div key={assignment.itemId} className="grid gap-3 px-4 py-3 sm:grid-cols-[44px_minmax(0,1fr)_minmax(210px,0.75fr)] sm:items-center">
+                  {assignments.map((assignment, index) => (
+                      <div key={assignment.itemId} className="grid gap-3 px-4 py-3 sm:grid-cols-[44px_minmax(0,1fr)_auto] sm:items-center">
                         <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted text-xs font-bold tabular-nums text-muted-foreground">{index + 1}</span>
                         <div className="min-w-0">
                           <div className="truncate text-sm font-semibold text-foreground">{assignment.keyword}</div>
                           <div className="mt-0.5 text-[11px] text-muted-foreground">每词最多 {keywordMaxDetectedItems} 条 · {PLATFORM_OPTIONS.find(option => option.value === platform)?.label}</div>
                         </div>
-                        <label className="block text-[11px] font-medium text-muted-foreground">
-                          执行 Agent
-                          <select
-                            value={assignment.agentId}
-                            aria-label={`为关键词“${assignment.keyword}”选择执行 Agent`}
-                            onChange={event => setAssignments(current => current.map(item =>
-                              item.itemId === assignment.itemId ? { ...item, agentId: event.target.value } : item,
-                            ))}
-                            disabled={busy}
-                            className="mt-1 h-9 w-full rounded-lg border border-input bg-card px-2.5 text-xs font-semibold text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
-                          >
-                            {selectedAgents.map(agent => (
-                              <option key={agent.id} value={agent.id}>{allocationAgentLabel(agent)}{agent.online ? '' : '（离线）'}</option>
-                            ))}
-                          </select>
-                          {assignedAgent && <span className="sr-only">当前分配给 {assignedAgent.display_name}</span>}
-                        </label>
+                        <span className="rounded-full border border-primary/20 bg-primary/[0.055] px-2.5 py-1 text-[10px] font-semibold text-primary">等待动态领取</span>
                       </div>
-                    )
-                  })}
+                  ))}
                 </div>
               </section>
-              {overloadedAgentIds.length > 0 && (
-                <div role="alert" className="flex items-start gap-2 rounded-xl border border-status-red/25 bg-status-red/8 px-3 py-2.5 text-xs leading-5 text-status-red">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    {overloadedAgentIds.map(agentId => {
-                      const agent = agents.find(candidate => candidate.id === agentId)
-                      return agent ? allocationAgentLabel(agent) : `Agent ${agentId.slice(0, 8)}`
-                    }).join('、')}
-                    {' '}超过单节点 30 个工作项上限。请把部分关键词改分配给其他 Agent。
-                  </span>
-                </div>
-              )}
-              {assignedAgentCount < requiredAgentCount && (
-                <div role="alert" className="flex items-start gap-2 rounded-xl border border-status-orange/25 bg-status-orange/8 px-3 py-2.5 text-xs leading-5 text-amber-700 dark:text-amber-300">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>多节点任务必须实际分配给至少 {requiredAgentCount} 个 Agent；请把至少一个关键词分给另一节点。</span>
-                </div>
-              )}
             </div>
           )}
 
@@ -1208,12 +1153,12 @@ export function OrchestrationComposerDrawer({
               <div className="w-full rounded-2xl border border-status-green/25 bg-status-green/5 p-6 text-center">
                 <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-status-green text-white"><CheckCircle2 className="h-6 w-6" /></span>
                 <h3 className="mt-4 text-lg font-bold text-foreground">
-                  {executionMode === 'unattended_plan' ? '无人值守计划已启用' : '任务已分配'}
+                  {executionMode === 'unattended_plan' ? '无人值守弹性计划已启用' : '云端队列已创建'}
                 </h3>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">
                   {executionMode === 'unattended_plan'
-                    ? '云端会在每个运行时间创建当次任务，并按已确认的关键词分配发送给 Agent。设备本地计划保持不变。'
-                    : `已创建 ${dispatchResult.executions.length} 条 Agent 执行指令。在线节点将在下一次心跳领取，离线节点上线后领取。`}
+                    ? '云端会在每个运行时间生成当次工作项。在线空闲节点逐个领取，设备本地计划保持不变。'
+                    : '关键词已留在云端队列。在线节点空闲时一次领取一个，完成后继续领取。'}
                 </p>
                 <div className="mt-4 rounded-xl border border-border/70 bg-card px-4 py-3 text-left text-xs text-muted-foreground">
                   <div>编排任务：<span className="font-mono text-foreground">{dispatchResult.orchestrationId}</span></div>
@@ -1272,9 +1217,9 @@ export function OrchestrationComposerDrawer({
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                   {stage === 'allocate'
                     ? executionMode === 'unattended_plan'
-                      ? '正在保存 Agent 分配并启用云端计划，请稍候…'
-                      : `正在创建 ${new Set(assignments.map(assignment => assignment.agentId)).size} 条 Agent 执行指令并写入云端，请稍候…`
-                    : '正在创建任务草稿并生成规则分配预览，请稍候…'}
+                      ? '正在保存弹性节点池并启用云端计划，请稍候…'
+                      : '正在创建云端工作队列，请稍候…'
+                    : '正在创建任务草稿并检查节点池，请稍候…'}
                 </div>
               )}
             </div>
@@ -1283,10 +1228,10 @@ export function OrchestrationComposerDrawer({
                 {stage === 'define'
                   ? executionMode === 'unattended_plan'
                     ? '这是云端无人值守计划，不会修改设备已有的本地计划。'
-                    : '执行一次会在确认分配后立即创建任务，不会修改设备已有的无人值守计划。'
+                    : '执行一次会在确认后立即创建云端队列，不会修改设备已有的无人值守计划。'
                   : executionMode === 'unattended_plan'
-                    ? '确认后保存长期分配；云端将在每次到点时创建真实子任务。'
-                    : '确认后将按当前分配创建真实子任务；每个工作项只归属一个 Agent。'}
+                    ? '确认后保存节点池；云端将在每次到点时生成可动态领取的工作项。'
+                    : '确认后创建云端工作项；每个节点一次只领取一个。'}
               </div>
               <div className="flex shrink-0 gap-2">
                 <Button variant="ghost" onClick={stage === 'allocate' ? () => setStage('define') : () => void requestClose()} disabled={busy}>
@@ -1295,14 +1240,14 @@ export function OrchestrationComposerDrawer({
                 {stage === 'define' ? (
                   <Button onClick={() => void generatePreview()} disabled={busy || !writable || selectedAgents.length < requiredAgentCount} className="min-w-44">
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Settings2 className="h-4 w-4" />}
-                    {busy ? '正在生成预览…' : '生成规则分配预览'}
+                    {busy ? '正在生成预览…' : '预览云端队列'}
                   </Button>
                 ) : (
-                  <Button onClick={() => void dispatch()} disabled={busy || overloadedAgentIds.length > 0 || assignedAgentCount < requiredAgentCount} className="min-w-36">
+                  <Button onClick={() => void dispatch()} disabled={busy || validSelectedAgentIds.length < requiredAgentCount} className="min-w-36">
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                     {busy
-                      ? executionMode === 'unattended_plan' ? '正在启用…' : '正在分配…'
-                      : executionMode === 'unattended_plan' ? '确认并启用计划' : '确认并分配'}
+                      ? executionMode === 'unattended_plan' ? '正在启用…' : '正在创建…'
+                      : executionMode === 'unattended_plan' ? '确认并启用计划' : '确认并创建队列'}
                   </Button>
                 )}
               </div>

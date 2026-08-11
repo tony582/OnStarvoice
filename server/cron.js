@@ -11,6 +11,7 @@ import { enqueueDueCaptureOrchestrations } from './services/capture-orchestratio
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
 import {
   reconcileAutomaticCaptureRetries,
+  reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
 
@@ -104,6 +105,12 @@ export function startCronJobs() {
       if (results.length > 0) {
         console.log(
           `[Cron] Multi-Agent schedules: ${created} run(s) created, ${skipped} occurrence(s) advanced`,
+        );
+      }
+      const elasticLeases = await reconcileElasticCaptureLeases(50);
+      if (elasticLeases.requeued > 0) {
+        console.log(
+          `[Cron] Elastic work queue: ${elasticLeases.requeued} offline item(s) requeued`,
         );
       }
       const recovery = await reconcileAutomaticCaptureRetries(10);

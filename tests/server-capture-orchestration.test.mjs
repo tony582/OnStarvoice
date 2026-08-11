@@ -45,6 +45,7 @@ test('orchestration input keeps a validated cloud schedule without changing allo
   assert.equal(normalized.platform, 'xiaohongshu');
   assert.equal(normalized.executionMode, 'unattended_plan');
   assert.equal(normalized.allocationMode, 'balanced');
+  assert.equal(normalized.distributionMode, 'fixed_batch');
   assert.deepEqual(normalized.keywords, ['别克', '雪佛兰', '凯迪拉克']);
   assert.deepEqual(normalized.agentIds, ['agent-a', 'agent-b']);
   assert.equal(normalized.taskInput.searchFilters.sort, 'latest');
@@ -61,6 +62,19 @@ test('orchestration input keeps a validated cloud schedule without changing allo
     allowIdleAgentHandoff: false,
     platformSafetyMode: 'manual_confirmed',
   });
+});
+
+test('elastic distribution is explicit and unknown values stay backward-compatible', () => {
+  assert.equal(
+    normalizeOrchestrationRequest({distributionMode: 'elastic_pool'})
+      .distributionMode,
+    'elastic_pool',
+  );
+  assert.equal(
+    normalizeOrchestrationRequest({distributionMode: 'future_mode'})
+      .distributionMode,
+    'fixed_batch',
+  );
 });
 
 test('custom-date schedules reject malformed dates and normalize accepted dates', () => {
@@ -340,6 +354,21 @@ test('cloud orchestration schedule migration keeps each occurrence unique and cl
   assert.doesNotMatch(migration, /\bDELETE FROM capture_tasks\b/);
 });
 
+test('elastic work queue migration is additive and keeps old schedules fixed', async () => {
+  const migration = await readFile(
+    new URL(
+      '../server/db/migrations/061_capture_cloud_work_queue.sql',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(migration, /distribution_mode TEXT NOT NULL DEFAULT 'fixed_batch'/u);
+  assert.match(migration, /'fixed_batch', 'elastic_pool'/u);
+  assert.match(migration, /idx_capture_task_items_elastic_claim/u);
+  assert.match(migration, /idx_capture_task_items_negative_claim/u);
+  assert.doesNotMatch(migration, /DELETE FROM/u);
+});
+
 test('schedule overlap guard ignores its template but still detects active occurrences', async () => {
   const scheduler = await readFile(
     new URL(
@@ -366,6 +395,27 @@ test('schedule overlap guard ignores its template but still detects active occur
   assert.match(overlap, /item\.status = ANY\(\$6::text\[\]\)/u);
   assert.match(overlap, /NOT EXISTS \([\s\S]*any_child/u);
   assert.match(overlap, /NOT EXISTS \([\s\S]*any_item/u);
+});
+
+test('elastic schedule occurrences materialize pending work without preassigning child commands', async () => {
+  const scheduler = await readFile(
+    new URL(
+      '../server/services/capture-orchestration-scheduler.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(scheduler, /schedule\.distribution_mode === 'elastic_pool'/u);
+  assert.match(scheduler, /capture_orchestration_schedule_agents/u);
+  assert.match(scheduler, /eligibleAgentIds/u);
+  assert.match(scheduler, /distributionMode === 'elastic_pool' \? 'pending' : 'assigned'/u);
+  const elasticStart = scheduler.indexOf("if (distributionMode === 'elastic_pool')");
+  const fixedDispatch = scheduler.indexOf('const itemsByAgent = new Map()', elasticStart);
+  assert.ok(elasticStart >= 0);
+  assert.ok(fixedDispatch > elasticStart);
+  const elastic = scheduler.slice(elasticStart, fixedDispatch);
+  assert.match(elastic, /orchestration_schedule_queue_created/u);
+  assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
 });
 
 test('terminal or attention-only schedule residue never blocks the next occurrence', async () => {

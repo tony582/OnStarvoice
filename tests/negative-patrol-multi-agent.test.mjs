@@ -240,7 +240,33 @@ test('multi-Agent patrol uses a parent business task and one execution child per
   assert.match(route, /task:\s*existing[\s\S]*existing:\s*true/u);
 });
 
-test('multi-Agent patrol UI requires two nodes and enough posts for every node', async () => {
+test('elastic negative patrol keeps posts unassigned until an eligible idle Agent claims one', async () => {
+  const route = await read('server/routes/negative-patrol.js');
+  const start = route.indexOf('async function createElasticPatrolTask');
+  const end = route.indexOf('async function createMultiAgentPatrolTask');
+  assert.ok(start >= 0 && end > start);
+  const elastic = route.slice(start, end);
+
+  assert.match(elastic, /distributionMode: 'elastic_pool'/u);
+  assert.match(elastic, /claimUnit: 'negative_post'/u);
+  assert.match(elastic, /eligibleAgentIds/u);
+  assert.match(
+    elastic,
+    /'pending', NULL, NULL,[\s\S]*0, '', \$10::jsonb/u,
+  );
+  assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
+  assert.match(elastic, /negative_patrol_elastic_pool_opened/u);
+  assert.match(
+    route,
+    /distributionMode === 'elastic_pool'[\s\S]*createElasticPatrolTask/u,
+  );
+  assert.match(
+    route,
+    /requireOnline: distributionMode !== 'elastic_pool'/u,
+  );
+});
+
+test('multi-Agent patrol UI requires two nodes but allows fewer posts than pool nodes', async () => {
   const [drawer, creator] = await Promise.all([
     read('web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/NegativePatrolTaskCreator.tsx'),
@@ -252,11 +278,10 @@ test('multi-Agent patrol UI requires two nodes and enough posts for every node',
   );
   assert.match(drawer, /多 Agent 模式至少选择 2 个可用节点/u);
   assert.match(creator, /agentIds:\s*agents\.map\(agent => agent\.id\)/u);
-  assert.match(
-    creator,
-    /allocationInvalid = multiAgent && selectedIds\.size < agents\.length/u,
-  );
-  assert.match(creator, /帖子数少于节点数/u);
+  assert.match(creator, /distributionMode: multiAgent \? 'elastic_pool' : 'fixed_batch'/u);
+  assert.doesNotMatch(creator, /allocationInvalid/u);
+  assert.doesNotMatch(creator, /帖子数少于节点数/u);
+  assert.match(creator, /每个空闲 Agent 一次只领 1 条/u);
 });
 
 test('negative patrol detail can reassign only unfinished posts to an explicit online Agent team', async () => {

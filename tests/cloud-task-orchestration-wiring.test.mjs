@@ -160,9 +160,9 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /expectedRevision: preview\.revision/u);
   assert.match(composer, /assignments: assignments\.map/u);
   assert.match(composer, /\{ timeoutMs: 30_000 \}/u);
-  assert.match(composer, /当前分配预览已失效/u);
-  assert.match(composer, /正在创建 \$\{new Set\(assignments/u);
-  assert.match(composer, /<footer[\s\S]*aria-live="polite"[\s\S]*role="alert"[\s\S]*确认并分配/u);
+  assert.match(composer, /当前队列预览已失效/u);
+  assert.match(composer, /正在创建云端工作队列/u);
+  assert.match(composer, /<footer[\s\S]*aria-live="polite"[\s\S]*role="alert"[\s\S]*确认并创建队列/u);
   assert.match(composer, /'执行一次'/u);
   assert.match(composer, /'无人值守'/u);
   assert.match(composer, /platform,\s*\n\s*executionMode,/u);
@@ -170,9 +170,9 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /roundGapMin:\s*10/u);
   assert.match(composer, /schedule:\s*\{/u);
   assert.match(composer, /'确认并启用计划'/u);
-  assert.match(composer, /'确认并分配'/u);
+  assert.match(composer, /'确认并创建队列'/u);
   assert.match(composer, /不会覆盖设备 Extension 里已有的本地无人值守计划/u);
-  assert.match(composer, /这里不会调用 AI/u);
+  assert.match(composer, /每个节点一次只领取一个/u);
   assert.match(composer, /1–300 个关键词/u);
 
   assert.match(detail, /detail\?\.items/u);

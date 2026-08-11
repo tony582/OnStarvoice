@@ -445,6 +445,7 @@ async function loadOrchestrationSchedule(executor, tenantId, scheduleId, {lock =
         ORDER BY scheduled_date
       ) AS custom_dates,
       overlap_policy, late_start_grace_min, allocation_mode, revision,
+      distribution_mode,
       plan_snapshot, next_run_at, last_scheduled_for, last_run_at,
       last_run_task_id, last_run_status, last_error, run_count,
       created_at, updated_at
@@ -595,6 +596,7 @@ router.post(
           orchestrationRequestHash: requestHash,
           draft: true,
           allocationMode: request.allocationMode || 'balanced',
+          distributionMode: request.distributionMode || 'fixed_batch',
           executionMode: request.executionMode,
           planSnapshot,
           requestedByUserId: req.user?.id || '',
@@ -680,6 +682,7 @@ router.post(
             platform: parent.platform,
             keywordCount: items.length,
             allocationMode: metadata.allocationMode,
+            distributionMode: metadata.distributionMode,
             executionMode: request.executionMode,
           },
         });
@@ -836,7 +839,10 @@ router.post(
         agentIds: normalizedAgents.agentIds,
         revision: Number(parent.orchestration_revision || 0),
       });
-      if (allocation.groups.some(group => group.keywords.length > 30)) {
+      if (
+        parent.metadata?.distributionMode !== 'elastic_pool' &&
+        allocation.groups.some(group => group.keywords.length > 30)
+      ) {
         return sendRequestError(res, requestError(
           'insufficient_agents',
           '所选节点不足以承载全部关键词，请增加执行节点',
@@ -899,7 +905,13 @@ function normalizeDispatch(body) {
     seenItems.add(itemId);
     assignments.push({itemId, agentId});
   }
-  return {expectedRevision, assignments};
+  let eligibleAgentIds = [];
+  if (Object.hasOwn(safeJson(body), 'eligibleAgentIds')) {
+    const normalizedEligible = normalizedAgentIds(body.eligibleAgentIds);
+    if (normalizedEligible.failure) return normalizedEligible;
+    eligibleAgentIds = normalizedEligible.agentIds;
+  }
+  return {expectedRevision, assignments, eligibleAgentIds};
 }
 
 function normalizeAttentionHandoff(body) {
@@ -1017,13 +1029,35 @@ router.post(
           {lock: true},
         );
         if (currentRevision !== normalized.expectedRevision) {
+          const distributionMode = text(
+            parent.metadata?.distributionMode,
+            40,
+          ) || 'fixed_batch';
+          const requestedAgentIds = [...new Set(
+            normalized.eligibleAgentIds.length > 0
+              ? normalized.eligibleAgentIds
+              : normalized.assignments.map(assignment => assignment.agentId),
+          )].sort();
+          const committedEligibleAgentIds = Array.isArray(
+            parent.metadata?.eligibleAgentIds,
+          )
+            ? parent.metadata.eligibleAgentIds.map(String).sort()
+            : [];
           const requestedAgentByItem = new Map(
             normalized.assignments.map(assignment => [
               assignment.itemId,
               assignment.agentId,
             ]),
           );
-          const exactCommittedReplay =
+          const elasticCommittedReplay =
+            distributionMode === 'elastic_pool' &&
+            currentRevision === normalized.expectedRevision + 1 &&
+            items.length === normalized.assignments.length &&
+            requestedAgentIds.length === committedEligibleAgentIds.length &&
+            requestedAgentIds.every(
+              (agentId, index) => agentId === committedEligibleAgentIds[index],
+            );
+          const fixedCommittedReplay =
             currentRevision === normalized.expectedRevision + 1 &&
             items.length === normalized.assignments.length &&
             items.every(item =>
@@ -1036,11 +1070,14 @@ router.post(
               ) &&
               Number(item.assignment_revision || 0) === currentRevision
             );
+          const exactCommittedReplay =
+            elasticCommittedReplay || fixedCommittedReplay;
           if (exactCommittedReplay) {
             const schedule = parentExecutionMode === 'unattended_plan'
               ? await tx.queryOne(`
                   SELECT id, status, schedule_mode, timezone, start_time,
-                    random_offset_min, custom_dates, next_run_at,
+                    random_offset_min, custom_dates, distribution_mode,
+                    next_run_at,
                     last_run_at, last_run_task_id, run_count, revision
                   FROM capture_orchestration_schedules
                   WHERE tenant_id = $1 AND template_task_id = $2
@@ -1128,9 +1165,16 @@ router.post(
             409,
           )};
         }
-        const agentIds = [...new Set(
+        const distributionMode = parent.metadata?.distributionMode === 'elastic_pool'
+          ? 'elastic_pool'
+          : 'fixed_batch';
+        const assignmentAgentIds = [...new Set(
           normalized.assignments.map(assignment => assignment.agentId),
         )];
+        const agentIds = distributionMode === 'elastic_pool' &&
+          normalized.eligibleAgentIds.length > 0
+          ? normalized.eligibleAgentIds
+          : assignmentAgentIds;
         const planSnapshot = safeJson(parent.metadata?.planSnapshot);
         const compatible = await loadCompatibleAgents(
           tx,
@@ -1156,9 +1200,11 @@ router.post(
             (left, right) => Number(left.ordinal) - Number(right.ordinal),
           );
         }
-        const oversizedGroup = [...assignmentsByAgent.entries()].find(
-          ([, groupItems]) => groupItems.length > 30,
-        );
+        const oversizedGroup = distributionMode === 'fixed_batch'
+          ? [...assignmentsByAgent.entries()].find(
+              ([, groupItems]) => groupItems.length > 30,
+            )
+          : null;
         if (oversizedGroup) {
           return {failure: requestError(
             'agent_keyword_capacity_exceeded',
@@ -1199,17 +1245,18 @@ router.post(
               id, tenant_id, template_task_id, title, platform, status,
               schedule_mode, timezone, start_time, random_offset_min,
               custom_dates, overlap_policy, late_start_grace_min,
-              allocation_mode, revision, plan_snapshot, next_run_at,
+              allocation_mode, distribution_mode, revision, plan_snapshot,
+              next_run_at,
               created_by_user_id, created_by_name
             ) VALUES (
               $1, $2, $3, $4, $5, 'active',
               $6, 'Asia/Shanghai', $7, $8,
               $9::date[], 'skip', $10,
-              'balanced', 1, $11::jsonb, $12,
-              $13, $14
+              'balanced', $11, 1, $12::jsonb, $13,
+              $14, $15
             )
             RETURNING id, status, schedule_mode, timezone, start_time,
-              random_offset_min, custom_dates, next_run_at,
+              random_offset_min, custom_dates, distribution_mode, next_run_at,
               last_run_at, last_run_task_id, run_count, revision
           `, [
             scheduleId,
@@ -1222,17 +1269,22 @@ router.post(
             Number(planSnapshot.randomOffsetMin || 0),
             customDates,
             Number(planSnapshot.lateStartGraceMin || 360),
+            distributionMode,
             JSON.stringify(planSnapshot),
             nextRunAt,
             req.user?.id || null,
             text(req.actorName, 240),
           ]);
-          const orderedAgentIds = [];
-          const seenAgentIds = new Set();
-          for (const assignment of normalized.assignments) {
-            if (seenAgentIds.has(assignment.agentId)) continue;
-            seenAgentIds.add(assignment.agentId);
-            orderedAgentIds.push(assignment.agentId);
+          const orderedAgentIds = distributionMode === 'elastic_pool'
+            ? [...agentIds]
+            : [];
+          const seenAgentIds = new Set(orderedAgentIds);
+          if (distributionMode === 'fixed_batch') {
+            for (const assignment of normalized.assignments) {
+              if (seenAgentIds.has(assignment.agentId)) continue;
+              seenAgentIds.add(assignment.agentId);
+              orderedAgentIds.push(assignment.agentId);
+            }
           }
           for (let index = 0; index < orderedAgentIds.length; index += 1) {
             await tx.execute(`
@@ -1244,17 +1296,27 @@ router.post(
           for (const assignment of normalized.assignments) {
             const updatedItem = await tx.queryOne(`
               UPDATE capture_task_items
-              SET status = 'assigned',
-                assigned_agent_id = $1,
-                assignment_revision = $2,
-                assigned_at = now(),
+              SET status = CASE
+                    WHEN $1 = 'elastic_pool' THEN 'pending'
+                    ELSE 'assigned'
+                  END,
+                assigned_agent_id = CASE
+                  WHEN $1 = 'elastic_pool' THEN NULL
+                  ELSE $2::uuid
+                END,
+                assignment_revision = $3,
+                assigned_at = CASE
+                  WHEN $1 = 'elastic_pool' THEN NULL
+                  ELSE now()
+                END,
                 updated_at = now()
-              WHERE id = $3 AND tenant_id = $4 AND task_id = $5
+              WHERE id = $4 AND tenant_id = $5 AND task_id = $6
                 AND status = 'pending'
                 AND assigned_agent_id IS NULL
                 AND execution_task_id IS NULL
               RETURNING id
             `, [
+              distributionMode,
               assignment.agentId,
               nextRevision,
               assignment.itemId,
@@ -1280,9 +1342,15 @@ router.post(
                 'orchestrationTemplate', true,
                 'scheduleId', $1::uuid::text,
                 'scheduleStatus', 'active',
-                'nextRunAt', $4::timestamptz::text
+                'nextRunAt', $4::timestamptz::text,
+                'distributionMode', $8::text,
+                'eligibleAgentIds', $9::jsonb
               ),
-              message = '多 Agent 无人值守计划已启用，等待下一次云端运行',
+              message = CASE
+                WHEN $8 = 'elastic_pool'
+                  THEN '弹性节点池无人值守计划已启用，工作项将在运行时动态领取'
+                ELSE '多 Agent 无人值守计划已启用，等待下一次云端运行'
+              END,
               updated_at = now(),
               source_updated_at = now()
             WHERE id = $5 AND tenant_id = $6
@@ -1300,12 +1368,14 @@ router.post(
             }),
             JSON.stringify({
               total: items.length,
-              assigned: items.length,
+              assigned: distributionMode === 'elastic_pool' ? 0 : items.length,
             }),
             nextRunAt,
             parent.id,
             req.tenantId,
             currentRevision,
+            distributionMode,
+            JSON.stringify(orderedAgentIds),
           ]);
           if (!parentUpdate) {
             const conflict = new Error('orchestration_revision_conflict');
@@ -1319,7 +1389,9 @@ router.post(
             actorId: req.user?.id || '',
             actorName: req.actorName,
             status: parentUpdate.status,
-            message: '多 Agent 无人值守计划已按确认分配启用',
+            message: distributionMode === 'elastic_pool'
+              ? '弹性节点池无人值守计划已启用'
+              : '多 Agent 无人值守计划已按确认分配启用',
             payload: {
               scheduleId: schedule.id,
               revision: parentUpdate.orchestration_revision,
@@ -1327,11 +1399,76 @@ router.post(
               agentIds: orderedAgentIds,
               nextRunAt,
               scheduleMode,
+              distributionMode,
             },
           });
           return {
             parent: parentUpdate,
             schedule,
+            executions: [],
+          };
+        }
+
+        if (distributionMode === 'elastic_pool') {
+          const eligibleAgentIds = [...agentIds].sort(
+            (left, right) => left.localeCompare(right),
+          );
+          const parentUpdate = await tx.queryOne(`
+            UPDATE capture_tasks
+            SET orchestration_revision = orchestration_revision + 1,
+              status = 'pending',
+              progress = $1::jsonb,
+              counts = counts || $2::jsonb,
+              metadata = (metadata - 'draft') || jsonb_build_object(
+                'publishedAt', now(),
+                'distributionMode', 'elastic_pool',
+                'eligibleAgentIds', $3::jsonb,
+                'claimUnit', 'keyword'
+              ),
+              message = '关键词已进入云端队列，空闲节点将逐个领取',
+              updated_at = now(),
+              source_updated_at = now()
+            WHERE id = $4 AND tenant_id = $5
+              AND task_type = 'capture_orchestration'
+              AND orchestration_revision = $6
+            RETURNING id, orchestration_revision, status
+          `, [
+            JSON.stringify({
+              current: 0,
+              total: items.length,
+              phase: 'queued',
+            }),
+            JSON.stringify({
+              total: items.length,
+              assigned: 0,
+            }),
+            JSON.stringify(eligibleAgentIds),
+            parent.id,
+            req.tenantId,
+            currentRevision,
+          ]);
+          if (!parentUpdate) {
+            const conflict = new Error('orchestration_revision_conflict');
+            conflict.code = 'orchestration_revision_conflict';
+            throw conflict;
+          }
+          await appendEvent(tx, {
+            tenantId: req.tenantId,
+            taskId: parent.id,
+            eventType: 'orchestration_elastic_pool_opened',
+            actorId: req.user?.id || '',
+            actorName: req.actorName,
+            status: parentUpdate.status,
+            message: '关键词云端队列已开启，空闲节点将逐个领取',
+            payload: {
+              revision: parentUpdate.orchestration_revision,
+              itemCount: items.length,
+              eligibleAgentIds,
+              claimUnit: 'keyword',
+            },
+          });
+          return {
+            parent: parentUpdate,
             executions: [],
           };
         }
@@ -3500,18 +3637,33 @@ router.get(
             AND child.parent_task_id = $2
           ORDER BY child.created_at, child.id
         `, [req.tenantId, orchestration.id]);
+        const eligibleAgentIds = Array.isArray(
+          safeJson(orchestration.metadata).eligibleAgentIds,
+        )
+          ? safeJson(orchestration.metadata).eligibleAgentIds
+            .map(normalizedUuid)
+            .filter(Boolean)
+            .slice(0, 50)
+          : [];
         const agents = await tx.queryAll(`
-          SELECT DISTINCT ON (ca.id)
+          SELECT
             ca.id, ca.display_name, ca.host_label, ca.browser_name,
             ca.operating_system, ca.app_version, ca.allowed_platforms,
             ca.capabilities, ca.status, ca.last_heartbeat_at
           FROM capture_agents ca
-          JOIN capture_task_items item
-            ON item.assigned_agent_id = ca.id
-            AND item.tenant_id = ca.tenant_id
-          WHERE item.tenant_id = $1 AND item.task_id = $2
+          WHERE ca.tenant_id = $1
+            AND (
+              ca.id = ANY($3::uuid[])
+              OR EXISTS (
+                SELECT 1
+                FROM capture_task_items item
+                WHERE item.tenant_id = ca.tenant_id
+                  AND item.task_id = $2
+                  AND item.assigned_agent_id = ca.id
+              )
+            )
           ORDER BY ca.id
-        `, [req.tenantId, orchestration.id]);
+        `, [req.tenantId, orchestration.id, eligibleAgentIds]);
         const attempts = await tx.queryAll(`
           SELECT attempt.*,
             item.ordinal, item.keyword, item.item_key
