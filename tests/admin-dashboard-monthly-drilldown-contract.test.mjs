@@ -18,6 +18,14 @@ test('dashboard opens on a calendar-month report and puts basic distributions be
   assert.match(route, /function parseShanghaiMonth/);
   assert.match(route, /parseShanghaiMonth\(query\.month/);
   assert.match(route, /label: `\$\{year\}年\$\{month\}月（月报）`/);
+  assert.match(route, /DASHBOARD_CACHE_TTL_MS = 60_000/);
+  assert.match(route, /compactAnalyticsDashboard\(snapshot\)/);
+  assert.match(route, /forceRefresh: req\.query\.refresh === '1'/);
+  assert.match(dashboard, /data-testid="dashboard-loading-state"/);
+  assert.match(dashboard, /正在生成 \{monthLabel\} 月报/);
+  assert.match(dashboard, /计算三类分布/);
+  assert.match(dashboard, /无需重复刷新/);
+  assert.doesNotMatch(dashboard, /<div className="flex justify-center py-24">\s*<Loader2/);
 
   const coreAt = dashboard.indexOf('<CoreMonthlyAnalysis');
   const extensionAt = dashboard.indexOf('延展分析</span>');
@@ -38,11 +46,16 @@ test('basic distribution cards cross-filter the in-report analysis and export on
   assert.match(dashboard, /new URLSearchParams\(\{ range: 'month', month, dimension, value \}\)/);
   assert.match(dashboard, /\/analytics\/dashboard\/drilldown\?/);
   assert.doesNotMatch(dashboard, /<DashboardDrilldownPanel/);
-  assert.match(dashboard, /三类分布始终显示；点击任一项会联动筛选顶部指标和另外两个分布/);
+  assert.match(dashboard, /三类分布始终显示；点击图形或图例，顶部指标和其他图表会一起更新/);
   assert.match(dashboard, /const crossFilteredRows/);
   assert.match(dashboard, /drilldownData\?\.breakdowns\[dimension\]/);
   assert.match(dashboard, /aria-label="当前联动筛选"/);
-  assert.match(dashboard, /再次点击已选项可清除筛选/);
+  assert.match(dashboard, /再次点击当前项可退出联动/);
+  assert.match(dashboard, /<PieChart>/);
+  assert.match(dashboard, /function CoreStatusCompositionCard/);
+  assert.match(dashboard, /仅比较内容条数与占比/);
+  assert.match(dashboard, /detail: dimension === 'status'\s*\? undefined/);
+  assert.match(dashboard, /顶部指标和另外两个分布已按当前选择联动更新/);
   assert.doesNotMatch(dashboard, /内容证据/);
   assert.match(dashboard, /\/analytics\/dashboard\/export\?/);
   assert.match(dashboard, /导出月报数据/);
@@ -76,6 +89,7 @@ test('basic distribution cards cross-filter the in-report analysis and export on
   assert.doesNotMatch(drilldown, /LIMIT 30/);
   assert.doesNotMatch(drilldown, /records:/);
   assert.match(drilldown, /RELEVANT_RECORD_SQL/);
+  assert.match(source('server/services/report-generator.js'), /const \[currentStats, previousStats\] = await Promise\.all/);
 });
 
 test('dashboard drill-down presets preserve unknown platform while pending sentiment stays backend-only', () => {

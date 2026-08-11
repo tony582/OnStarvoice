@@ -7,9 +7,63 @@ import {
   isValidAnalyticsDrilldownSelection,
 } from '../services/analytics-drilldown.js';
 import { buildAnalyticsWorkbook } from '../services/analytics-workbook.js';
+import { compactAnalyticsDashboard } from '../services/analytics-dashboard-payload.js';
 import { sendWorkbook } from '../services/xlsx-export.js';
 
 const router = Router();
+const DASHBOARD_CACHE_TTL_MS = 60_000;
+const DASHBOARD_CACHE_MAX_ENTRIES = 100;
+const dashboardCache = new Map();
+
+function dashboardCacheKey(tenantId, period, keywords) {
+  if (period.range !== 'month' || !period.month) return '';
+  return [
+    tenantId,
+    period.month,
+    [...keywords].sort((a, b) => a.localeCompare(b, 'zh-CN')).join('\u0001'),
+  ].join('\u0002');
+}
+
+function pruneDashboardCache(now = Date.now()) {
+  for (const [key, entry] of dashboardCache) {
+    if (entry.expiresAt <= now) dashboardCache.delete(key);
+  }
+  while (dashboardCache.size >= DASHBOARD_CACHE_MAX_ENTRIES) {
+    const oldestKey = dashboardCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    dashboardCache.delete(oldestKey);
+  }
+}
+
+async function loadDashboardSnapshot({ tenantId, period, keywords, forceRefresh = false }) {
+  const key = dashboardCacheKey(tenantId, period, keywords);
+  const now = Date.now();
+  if (key && !forceRefresh) {
+    const cached = dashboardCache.get(key);
+    if (cached?.expiresAt > now) return await cached.promise;
+  }
+
+  const promise = buildAnalyticsDashboard({
+    tenantId,
+    periodStart: period.start,
+    periodEnd: period.end,
+    keywords,
+  }).then(snapshot => ({
+    snapshot: compactAnalyticsDashboard(snapshot),
+    generatedAt: new Date().toISOString(),
+  }));
+
+  if (!key) return await promise;
+  pruneDashboardCache(now);
+  const entry = { promise, expiresAt: now + DASHBOARD_CACHE_TTL_MS };
+  dashboardCache.set(key, entry);
+  try {
+    return await promise;
+  } catch (error) {
+    if (dashboardCache.get(key) === entry) dashboardCache.delete(key);
+    throw error;
+  }
+}
 
 function shanghaiParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -165,11 +219,11 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
     // 数据看板按「采集关键词」收敛(关注主题/临时筛选);多个用逗号分隔。空=全量。
     const keywords = dashboardKeywords(req.query.keywords);
 
-    const snapshot = await buildAnalyticsDashboard({
+    const dashboard = await loadDashboardSnapshot({
       tenantId: req.tenantId,
-      periodStart: period.start,
-      periodEnd: period.end,
+      period,
       keywords,
+      forceRefresh: req.query.refresh === '1',
     });
 
     return res.json({
@@ -180,9 +234,9 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
         label: period.label,
         start: period.start.toISOString(),
         end: period.end.toISOString(),
-        generatedAt: new Date().toISOString(),
+        generatedAt: dashboard.generatedAt,
       },
-      snapshot,
+      snapshot: dashboard.snapshot,
     });
   } catch (err) {
     return next(err);

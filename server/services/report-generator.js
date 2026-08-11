@@ -1229,8 +1229,11 @@ export async function generateOpinionInsight({ tenantId, periodStart, periodEnd 
 
 export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd, keywords = [] }) {
   const previous = previousPeriod(periodStart, periodEnd);
-  const currentStats = await getReportStats(tenantId, periodStart, periodEnd, keywords);
-  const previousStats = await getReportStats(tenantId, previous.start, previous.end, keywords);
+  // 两个自然周期彼此独立，并行读取可避免月报等待时间简单相加。
+  const [currentStats, previousStats] = await Promise.all([
+    getReportStats(tenantId, periodStart, periodEnd, keywords),
+    getReportStats(tenantId, previous.start, previous.end, keywords),
+  ]);
   return await enrichReportData('dashboard', currentStats, previousStats, tenantId);
 }
 
