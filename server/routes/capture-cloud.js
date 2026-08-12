@@ -99,6 +99,11 @@ const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
 const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
+const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
+const ELASTIC_SAFETY_AGENT_HOLD_MS = 30 * 60 * 1000;
+const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
+const ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS = 1;
 const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
   'DOUYIN_SEARCH_SECURITY_CHALLENGE',
   'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
@@ -517,6 +522,128 @@ export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
     checkpoint.securityBlocked === true ||
     checkpoint.platformSafetyBlocked === true ||
     checkpoint.requiresManualAction === true;
+}
+
+export function projectElasticKeywordRecoveryStatus({
+  elasticPool = false,
+  status = '',
+  error = {},
+  checkpoint = {},
+  attemptCount = 0,
+} = {}) {
+  const normalizedStatus = text(status, 80).toLowerCase();
+  if (!elasticPool) return normalizedStatus;
+  if (![
+    'interrupted',
+    'needs_action',
+    'failed',
+    'completed_with_failures',
+    'retryable',
+  ].includes(normalizedStatus)) {
+    return normalizedStatus;
+  }
+  const normalizedAttemptCount = Math.max(0, Number(attemptCount) || 0);
+  const safetyBlocked = crossDeviceRetryItemNeedsManualSafety({
+    status: normalizedStatus,
+    error,
+    metadata: {checkpoint},
+  });
+  if (safetyBlocked) {
+    return normalizedAttemptCount <= ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS
+      ? 'retryable'
+      : 'needs_action';
+  }
+  return normalizedAttemptCount < AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
+    ? 'retryable'
+    : 'failed';
+}
+
+export function elasticRecoveryHoldRemainingMs(
+  attempt = {},
+  now = Date.now(),
+) {
+  const source = attempt && typeof attempt === 'object' ? attempt : {};
+  const updatedAt = Date.parse(String(
+    source.updated_at || source.updatedAt || source.finished_at || '',
+  ));
+  if (!Number.isFinite(updatedAt)) return 0;
+  const safetyBlocked = crossDeviceRetryItemNeedsManualSafety({
+    status: source.status,
+    error: source.error,
+    metadata: {checkpoint: safeJson(source.checkpoint)},
+  });
+  const holdMs = safetyBlocked
+    ? ELASTIC_SAFETY_AGENT_HOLD_MS
+    : ELASTIC_TECHNICAL_AGENT_HOLD_MS;
+  return Math.max(0, updatedAt + holdMs - Number(now || Date.now()));
+}
+
+function buildElasticRecoveryMetadata({
+  status = '',
+  error = {},
+  checkpoint = {},
+  attemptCount = 0,
+  sourceAgentId = '',
+  now = new Date(),
+} = {}) {
+  if (status !== 'retryable') return {};
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const nowMs = Number.isFinite(nowDate.getTime())
+    ? nowDate.getTime()
+    : Date.now();
+  const recoveryError = safeJson(error);
+  const recoveryCheckpoint = safeJson(checkpoint);
+  const safetyBlocked = crossDeviceRetryItemNeedsManualSafety({
+    status,
+    error: recoveryError,
+    metadata: {checkpoint: recoveryCheckpoint},
+  });
+  const sourceAgentHoldMs = safetyBlocked
+    ? ELASTIC_SAFETY_AGENT_HOLD_MS
+    : ELASTIC_TECHNICAL_AGENT_HOLD_MS;
+  return {
+    // retryable means the current child no longer owns this item. Another
+    // compatible Agent may claim it immediately; only the failing source Agent
+    // is cooled down, and it is kept off the same item for a longer window.
+    state: 'released_for_handoff',
+    reason: safetyBlocked ? 'platform_safety_handoff' : 'technical_recovery',
+    attemptCurrent: Math.max(1, Number(attemptCount) || 1),
+    attemptTotal: AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
+    sourceAgentId: text(sourceAgentId, 100),
+    queuedAt: new Date(nowMs).toISOString(),
+    handoffReadyAt: new Date(nowMs).toISOString(),
+    itemLockReleased: true,
+    sourceAgentCooling: true,
+    ...(Object.prototype.hasOwnProperty.call(recoveryError, 'cooldownHomeRestored') ||
+    Object.prototype.hasOwnProperty.call(recoveryCheckpoint, 'cooldownHomeRestored')
+      ? {
+          cooldownHomeRestored:
+            recoveryError.cooldownHomeRestored === true ||
+            recoveryCheckpoint.cooldownHomeRestored === true,
+        }
+      : {}),
+    ...(text(
+      recoveryError.cooldownHomeUrl || recoveryCheckpoint.cooldownHomeUrl,
+      2000,
+    )
+      ? {
+          cooldownHomeUrl: text(
+            recoveryError.cooldownHomeUrl || recoveryCheckpoint.cooldownHomeUrl,
+            2000,
+          ),
+        }
+      : {}),
+    nextEvaluationAt: new Date(
+      nowMs + ELASTIC_DISPATCH_RECHECK_MS,
+    ).toISOString(),
+    sourceAgentHoldUntil: new Date(
+      nowMs + sourceAgentHoldMs,
+    ).toISOString(),
+    sourceAgentSameItemRetryAfter: new Date(
+      nowMs + Math.max(sourceAgentHoldMs, ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS),
+    ).toISOString(),
+    automatic: true,
+  };
 }
 
 export function crossDeviceRetryAgentSupportsTask(
@@ -2338,6 +2465,17 @@ async function refreshOrchestrationParentTask(tx, {
   const aggregate = aggregateParentTaskItems(items);
   const parentMetadata = safeJson(parent.metadata);
   const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
+  if (
+    elasticPool &&
+    aggregate.status === 'needs_action' &&
+    Number(aggregate.counts.retryable || 0) > 0 &&
+    Number(aggregate.counts.needsAction || 0) === 0
+  ) {
+    // retryable 是弹性队列的主动恢复状态，不是人工待办。父任务继续保持
+    // running，详情页也会持续刷新，直到其它 Agent 领取或尝试真正耗尽。
+    aggregate.status = 'running';
+    aggregate.terminal = false;
+  }
   const negativePatrol =
     parent.feature_key === 'negative_post_patrol' ||
     parentMetadata.workflow === 'negative_post_patrol';
@@ -2351,7 +2489,13 @@ async function refreshOrchestrationParentTask(tx, {
     Number(previousProgress.current || 0) !== aggregate.progress.current ||
     Number(previousProgress.total || 0) !== aggregate.progress.total;
   const message = aggregate.status === 'running'
-    ? negativePatrol
+    ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
+      ? negativePatrol
+        ? '部分负面帖子正在自动恢复，等待空闲节点逐篇接力'
+        : profilePatrol
+          ? '部分账号巡查项正在自动恢复，等待空闲节点接力'
+          : '部分关键词正在自动恢复，等待空闲节点逐词接力'
+      : negativePatrol
       ? '多个执行节点正在巡查负面帖子'
       : profilePatrol
         ? '执行节点正在重试未完成的账号巡查项'
@@ -2581,19 +2725,50 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   const isProfilePatrol = isProfilePatrolTask(task);
   const projectedItemIds = [];
   for (const entry of negativePatrolTargetResults(snapshot)) {
+    const currentItemState = elasticPool
+      ? await tx.queryOne(`
+          SELECT attempt_count
+          FROM capture_task_items
+          WHERE tenant_id = $1
+            AND task_id = $2
+            AND execution_task_id = $3
+            AND assigned_agent_id = $4
+            AND id = $5::uuid
+          FOR UPDATE
+        `, [
+          agent.tenant_id,
+          itemOwnerTaskId,
+          task.id,
+          agent.id,
+          entry.itemId,
+        ])
+      : null;
+    const serverAttemptCount = Math.max(
+      0,
+      Number(currentItemState?.attempt_count) || 0,
+    );
     const recoveryDisposition = classifyCaptureRecoveryDisposition({
       status: entry.status,
       error: entry.error,
       metadata: {checkpoint: entry},
+      attempt_count: serverAttemptCount,
     });
-    const projectedStatus =
-      elasticPool && entry.status === 'failed'
-        ? recoveryDisposition.kind === 'manual_current'
-          ? 'needs_action'
-          : recoveryDisposition.automatic
-            ? 'retryable'
-            : 'failed'
-        : entry.status;
+    const recoverableStatus = recoveryDisposition.kind === 'manual_current'
+      ? 'needs_action'
+      : recoveryDisposition.automatic
+        ? 'retryable'
+        : 'failed';
+    const projectedStatus = elasticPool && entry.status === 'failed'
+      ? recoveryDisposition.kind === 'manual_current' || recoveryDisposition.automatic
+        ? projectElasticKeywordRecoveryStatus({
+            elasticPool,
+            status: recoverableStatus,
+            error: entry.error,
+            checkpoint: entry,
+            attemptCount: serverAttemptCount,
+          })
+        : 'failed'
+      : entry.status;
     let resultObservationId = null;
     if (
       !isProfilePatrol &&
@@ -2621,6 +2796,16 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       startedAt: entry.startedAt,
       finishedAt: entry.finishedAt,
     };
+    const recovery = buildElasticRecoveryMetadata({
+      status: projectedStatus,
+      error: entry.error,
+      checkpoint: entry,
+      attemptCount: serverAttemptCount,
+      sourceAgentId: agent.id,
+    });
+    if (Object.keys(recovery).length > 0) {
+      checkpoint.recovery = recovery;
+    }
     const result = sanitizeCloudStructuredObject(entry);
     const terminal = NEGATIVE_PATROL_RESULT_STATUSES.has(projectedStatus);
     const item = await tx.queryOne(`
@@ -2872,70 +3057,157 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
     }
   }
   if (NEGATIVE_PATROL_TERMINAL_TASK_STATUSES.has(snapshotStatus)) {
-    const snapshotNeedsManualSafety = crossDeviceRetryItemNeedsManualSafety({
-      status: snapshotStatus,
-      error: safeJson(snapshot.error),
-      metadata: {checkpoint: safeJson(snapshot.checkpoint)},
-    });
-    const unresolvedStatus = snapshotStatus === 'canceled'
-      ? 'canceled'
-      : snapshotStatus === 'skipped'
-        ? 'skipped'
-        : elasticPool && !isProfilePatrol && !snapshotNeedsManualSafety
-          ? 'retryable'
-          : 'needs_action';
-    await tx.execute(`
-      UPDATE capture_task_items
-      SET status = $1,
-        error = CASE
-          WHEN $1 IN ('needs_action', 'retryable') THEN jsonb_build_object(
-            'code', 'missing_target_result',
-            'message', $7::text
-          )
-          ELSE error
-        END,
-        finished_at = CASE
-          WHEN $1 IN ('canceled', 'skipped') THEN COALESCE(finished_at, now())
-          ELSE NULL
-        END,
-        updated_at = now()
-      WHERE tenant_id = $2
-        AND task_id = $3
-        AND execution_task_id = $4
-        AND assigned_agent_id = $5
-        AND NOT (id = ANY($6::uuid[]))
+    const unresolvedMessage = isProfilePatrol
+      ? '设备任务已结束，但该账号没有返回可验证的扫描结果'
+      : '设备任务已结束，但该帖子没有返回可验证的逐帖结果';
+    const rawSnapshotError = snapshot.error;
+    const snapshotError = {
+      ...(rawSnapshotError && typeof rawSnapshotError === 'object'
+        ? sanitizeCloudStructuredObject(rawSnapshotError)
+        : text(rawSnapshotError, 1000)
+          ? {message: text(rawSnapshotError, 1000)}
+          : {}),
+      ...(text(
+        snapshot?.error?.code || snapshot?.errorCode || snapshot?.error_code,
+        100,
+      )
+        ? {
+            code: text(
+              snapshot?.error?.code ||
+                snapshot?.errorCode ||
+                snapshot?.error_code,
+              100,
+            ),
+          }
+        : {}),
+    };
+    const unresolvedError = {
+      ...snapshotError,
+      code: text(snapshotError.code, 100) || 'missing_target_result',
+      message: text(snapshotError.message, 1000) || unresolvedMessage,
+    };
+    const snapshotCheckpoint = safeJson(snapshot.checkpoint);
+    const unresolvedItems = await tx.queryAll(`
+      SELECT id, attempt_count, assignment_revision, metadata, error
+      FROM capture_task_items
+      WHERE tenant_id = $1
+        AND task_id = $2
+        AND execution_task_id = $3
+        AND assigned_agent_id = $4
+        AND NOT (id = ANY($5::uuid[]))
         AND status NOT IN (
           'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
         )
+      ORDER BY ordinal, id
+      FOR UPDATE
     `, [
-      unresolvedStatus,
       agent.tenant_id,
       itemOwnerTaskId,
       task.id,
       agent.id,
       projectedItemIds,
-      isProfilePatrol
-        ? '设备任务已结束，但该账号没有返回可验证的扫描结果'
-        : '设备任务已结束，但该帖子没有返回可验证的逐帖结果',
     ]);
-    await tx.execute(`
-      UPDATE capture_task_item_attempts attempt
-      SET status = item.status,
-        error = item.error,
-        finished_at = item.finished_at,
-        updated_at = now()
-      FROM capture_task_items item
-      WHERE item.id = attempt.item_id
-        AND item.tenant_id = $1
-        AND item.task_id = $2
-        AND item.execution_task_id = $3
-        AND item.assigned_agent_id = $4
-        AND attempt.execution_task_id = $3
-        AND attempt.agent_id = $4
-        AND attempt.status NOT IN (
-          'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+    for (const unresolvedItem of unresolvedItems) {
+      const attemptCount = Math.max(
+        0,
+        Number(unresolvedItem.attempt_count) || 0,
+      );
+      const unresolvedStatus = snapshotStatus === 'canceled'
+        ? 'canceled'
+        : snapshotStatus === 'skipped'
+          ? 'skipped'
+          : elasticPool && !isProfilePatrol
+            ? projectElasticKeywordRecoveryStatus({
+                elasticPool: true,
+                status: 'failed',
+                error: unresolvedError,
+                checkpoint: snapshotCheckpoint,
+                attemptCount,
+              })
+            : 'needs_action';
+      const recovery = buildElasticRecoveryMetadata({
+        status: unresolvedStatus,
+        error: unresolvedError,
+        checkpoint: snapshotCheckpoint,
+        attemptCount,
+        sourceAgentId: agent.id,
+      });
+      const checkpoint = {
+        ...safeJson(safeJson(unresolvedItem.metadata).checkpoint),
+        missingTargetResult: true,
+        status: unresolvedStatus,
+        ...(Object.keys(recovery).length > 0 ? {recovery} : {}),
+      };
+      const error = ['needs_action', 'retryable', 'failed'].includes(
+        unresolvedStatus,
+      )
+        ? {
+            ...unresolvedError,
+            ...(Object.keys(recovery).length > 0 ? {recovery} : {}),
+          }
+        : safeJson(unresolvedItem.error);
+      const terminal = NEGATIVE_PATROL_RESULT_STATUSES.has(unresolvedStatus);
+      await tx.execute(`
+        UPDATE capture_task_items
+        SET status = $1,
+          error = $2::jsonb,
+          metadata = metadata || jsonb_build_object('checkpoint', $3::jsonb),
+          finished_at = CASE
+            WHEN $4::boolean THEN COALESCE(finished_at, now())
+            ELSE NULL
+          END,
+          updated_at = now()
+        WHERE id = $5
+          AND tenant_id = $6
+          AND task_id = $7
+          AND execution_task_id = $8
+          AND assigned_agent_id = $9
+          AND assignment_revision = $10
+      `, [
+        unresolvedStatus,
+        JSON.stringify(error),
+        JSON.stringify(checkpoint),
+        terminal,
+        unresolvedItem.id,
+        agent.tenant_id,
+        itemOwnerTaskId,
+        task.id,
+        agent.id,
+        unresolvedItem.assignment_revision,
+      ]);
+      await tx.execute(`
+        UPDATE capture_task_item_attempts
+        SET status = $1,
+          checkpoint = $2::jsonb,
+          error = $3::jsonb,
+          finished_at = CASE
+            WHEN $4::boolean THEN COALESCE(finished_at, now())
+            ELSE NULL
+          END,
+          updated_at = now()
+        WHERE id = (
+          SELECT id
+          FROM capture_task_item_attempts
+          WHERE tenant_id = $5
+            AND item_id = $6
+            AND execution_task_id = $7
+            AND agent_id = $8
+            AND assignment_revision = $9
+          ORDER BY attempt_number DESC
+          LIMIT 1
         )
-    `, [agent.tenant_id, itemOwnerTaskId, task.id, agent.id]);
+      `, [
+        orchestrationItemAttemptStatus(unresolvedStatus),
+        JSON.stringify(checkpoint),
+        JSON.stringify(error),
+        terminal,
+        agent.tenant_id,
+        unresolvedItem.id,
+        task.id,
+        agent.id,
+        unresolvedItem.assignment_revision,
+      ]);
+    }
     if (isProfilePatrol) {
       const fallbackExecutions = await tx.queryAll(`
         UPDATE monitor_executions execution
@@ -3195,6 +3467,8 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   );
   if (!parent) return null;
   if (['canceled', 'superseded'].includes(parent.status)) return parent;
+  const elasticPool =
+    safeJson(parent.metadata).distributionMode === 'elastic_pool';
 
   // Receiving an accepted child snapshot proves the create command reached a
   // local task. It does not prove that any keyword has started yet.
@@ -3229,7 +3503,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     const keywordServiceAbnormal =
       entryErrorCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL';
     const checkpointStatus = checkpointEntryToItemStatus(entry);
-    const status = checkpointStatus === 'pending' || checkpointStatus === 'assigned'
+    const checkpointProjectedStatus = checkpointStatus === 'pending' || checkpointStatus === 'assigned'
       ? 'dispatched'
       : checkpointStatus;
     const attemptCount = orchestrationCheckpointInteger(entry.attemptCount);
@@ -3260,6 +3534,18 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       ...(!keywordServiceAbnormal && entry.requiresManualAction === true
         ? {requiresManualAction: true}
         : {}),
+      ...(entry.itemLockReleased === true
+        ? {itemLockReleased: true}
+        : {}),
+      ...(entry.sourceAgentCooling === true
+        ? {sourceAgentCooling: true}
+        : {}),
+      ...(entry.cooldownHomeRestored === true
+        ? {cooldownHomeRestored: true}
+        : {}),
+      ...(text(entry.cooldownHomeUrl, 2000)
+        ? {cooldownHomeUrl: text(entry.cooldownHomeUrl, 2000)}
+        : {}),
     };
     const checkpoint = {
       round: Math.max(1, Number(entry.round) || 1),
@@ -3277,8 +3563,59 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       ...(!keywordServiceAbnormal && entry.requiresManualAction === true
         ? {requiresManualAction: true}
         : {}),
+      ...(entry.itemLockReleased === true
+        ? {itemLockReleased: true}
+        : {}),
+      ...(entry.sourceAgentCooling === true
+        ? {sourceAgentCooling: true}
+        : {}),
+      ...(entry.cooldownHomeRestored === true
+        ? {cooldownHomeRestored: true}
+        : {}),
+      ...(text(entry.cooldownHomeUrl, 2000)
+        ? {cooldownHomeUrl: text(entry.cooldownHomeUrl, 2000)}
+        : {}),
       finishedAt,
     };
+    const currentItemState = elasticPool
+      ? await tx.queryOne(`
+          SELECT id, attempt_count
+          FROM capture_task_items
+          WHERE tenant_id = $1
+            AND task_id = $2
+            AND execution_task_id = $3
+            AND assigned_agent_id = $4
+            AND keyword = $5
+          FOR UPDATE
+        `, [
+          agent.tenant_id,
+          task.parent_task_id,
+          task.id,
+          agent.id,
+          keyword,
+        ])
+      : null;
+    const serverAttemptCount = Math.max(
+      0,
+      Number(currentItemState?.attempt_count) || 0,
+    );
+    const status = projectElasticKeywordRecoveryStatus({
+      elasticPool,
+      status: checkpointProjectedStatus,
+      error,
+      checkpoint,
+      attemptCount: serverAttemptCount,
+    });
+    const recovery = buildElasticRecoveryMetadata({
+      status,
+      error,
+      checkpoint,
+      attemptCount: serverAttemptCount,
+      sourceAgentId: agent.id,
+    });
+    if (Object.keys(recovery).length > 0) {
+      checkpoint.recovery = recovery;
+    }
     const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(status);
     const item = await tx.queryOne(`
       UPDATE capture_task_items
@@ -3307,7 +3644,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       RETURNING id, assignment_revision
     `, [
       status,
-      attemptCount,
+      elasticPool ? serverAttemptCount : attemptCount,
       JSON.stringify(error),
       JSON.stringify(checkpoint),
       terminal,
@@ -3378,7 +3715,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       'failed',
       'completed_with_failures',
     ].includes(childStatus);
-  const unresolvedStatus = childServiceAbnormalNeedsRetry
+  const baseUnresolvedStatus = childServiceAbnormalNeedsRetry
     ? 'retryable'
     : childStatus === 'canceled'
       ? 'canceled'
@@ -3394,8 +3731,8 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         ].includes(childStatus)
           ? 'needs_action'
           : '';
-  if (unresolvedStatus) {
-    const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(unresolvedStatus);
+  if (baseUnresolvedStatus) {
+    const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(baseUnresolvedStatus);
     const rawChildError = snapshot.error;
     const childError = {
       ...(rawChildError && typeof rawChildError === 'object'
@@ -3418,6 +3755,50 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         : {}),
     };
     if (activeKeyword) {
+      const currentActiveItem = elasticPool
+        ? await tx.queryOne(`
+            SELECT id, attempt_count
+            FROM capture_task_items
+            WHERE tenant_id = $1
+              AND task_id = $2
+              AND execution_task_id = $3
+              AND assigned_agent_id = $4
+              AND keyword = $5
+              AND NOT (id = ANY($6::uuid[]))
+            FOR UPDATE
+          `, [
+            agent.tenant_id,
+            task.parent_task_id,
+            task.id,
+            agent.id,
+            activeKeyword,
+            projectedItemIds,
+          ])
+        : null;
+      const serverAttemptCount = Math.max(
+        0,
+        Number(currentActiveItem?.attempt_count) || 0,
+      );
+      const activeUnresolvedStatus = projectElasticKeywordRecoveryStatus({
+        elasticPool,
+        status: baseUnresolvedStatus,
+        error: childError,
+        checkpoint: snapshotCheckpoint,
+        attemptCount: serverAttemptCount,
+      });
+      const recovery = buildElasticRecoveryMetadata({
+        status: activeUnresolvedStatus,
+        error: childError,
+        checkpoint: snapshotCheckpoint,
+        attemptCount: serverAttemptCount,
+        sourceAgentId: agent.id,
+      });
+      const activeChildError = Object.keys(recovery).length > 0
+        ? {...childError, recovery}
+        : childError;
+      const activeTerminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(
+        activeUnresolvedStatus,
+      );
       const activeItem = await tx.queryOne(`
         UPDATE capture_task_items
         SET status = $1,
@@ -3446,9 +3827,9 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           )
         RETURNING id
       `, [
-        unresolvedStatus,
-        JSON.stringify(childError),
-        terminal,
+        activeUnresolvedStatus,
+        JSON.stringify(activeChildError),
+        activeTerminal,
         agent.tenant_id,
         task.parent_task_id,
         task.id,
@@ -3493,7 +3874,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
         )
     `, [
-      unresolvedStatus,
+      baseUnresolvedStatus,
       terminal,
       agent.tenant_id,
       task.parent_task_id,
@@ -3992,6 +4373,24 @@ async function dispatchNextElasticWorkItem(tx, {
     agent.id,
   );
   if (busy) return null;
+  const recentRecoveryAttempt = await tx.queryOne(`
+    SELECT attempt.status, attempt.error, attempt.checkpoint,
+      attempt.finished_at, attempt.updated_at
+    FROM capture_task_item_attempts attempt
+    JOIN capture_tasks parent
+      ON parent.id = attempt.parent_task_id
+      AND parent.tenant_id = attempt.tenant_id
+    WHERE attempt.tenant_id = $1
+      AND attempt.agent_id = $2
+      AND attempt.status IN ('retryable', 'needs_action', 'failed')
+      AND attempt.updated_at > now() - interval '30 minutes'
+      AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+    ORDER BY attempt.updated_at DESC, attempt.id DESC
+    LIMIT 1
+  `, [agent.tenant_id, agent.id]);
+  if (elasticRecoveryHoldRemainingMs(recentRecoveryAttempt) > 0) {
+    return null;
+  }
   const unresolvedSafetyItem = await tx.queryOne(`
     SELECT item.error, item.metadata
     FROM capture_task_items item
@@ -4087,6 +4486,18 @@ async function dispatchNextElasticWorkItem(tx, {
           AND active_command.task_id = item.execution_task_id
           AND active_command.status IN ('pending', 'acknowledged')
       )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM capture_task_item_attempts recent_same_agent_attempt
+        WHERE recent_same_agent_attempt.tenant_id = item.tenant_id
+          AND recent_same_agent_attempt.item_id = item.id
+          AND recent_same_agent_attempt.agent_id = $2
+          AND recent_same_agent_attempt.status IN (
+            'retryable', 'needs_action', 'failed'
+          )
+          AND recent_same_agent_attempt.updated_at >
+            now() - ($8::bigint * interval '1 millisecond')
+      )
     ORDER BY
       COALESCE(parent.scheduled_for, parent.created_at),
       parent.created_at,
@@ -4102,6 +4513,7 @@ async function dispatchNextElasticWorkItem(tx, {
     supportedPlatforms,
     canClaimKeyword,
     canClaimNegativePost,
+    ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS,
   ]);
   if (!candidate) return null;
 
@@ -4261,6 +4673,35 @@ async function dispatchNextElasticWorkItem(tx, {
     scheduleId: candidate.orchestration_schedule_id || undefined,
     scheduledFor: candidate.scheduled_for || undefined,
   };
+  const previousExecutionTaskId = text(candidate.execution_task_id, 100);
+  if (
+    UUID_PATTERN.test(previousExecutionTaskId) &&
+    previousExecutionTaskId !== childTaskId
+  ) {
+    await tx.execute(`
+      UPDATE capture_tasks
+      SET status = 'superseded',
+        metadata = metadata || jsonb_build_object(
+          'handoffSuccessorTaskId', $1::uuid::text,
+          'handoffReason', 'elastic_retry_claimed',
+          'handoffAt', now()::text
+        ),
+        message = '当前工作项已由其它 Agent 自动接力',
+        updated_at = now()
+      WHERE id = $2
+        AND tenant_id = $3
+        AND parent_task_id = $4
+        AND status IN (
+          'interrupted', 'needs_action', 'failed',
+          'completed_with_failures', 'canceled', 'skipped'
+        )
+    `, [
+      childTaskId,
+      previousExecutionTaskId,
+      agent.tenant_id,
+      candidate.parent_id,
+    ]);
+  }
   await tx.execute(`
     INSERT INTO capture_tasks (
       id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,

@@ -3,12 +3,31 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.78',
+  latestVersion: '0.3.79',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-07',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.78-20260807.zip',
+  releaseDate: '2026-08-12',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.79-20260812.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.79',
+      releaseDate: '2026-08-12',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '失败关键词立即释放并自动接力',
+              desc: '弱网或页面加载异常经过一次短重试仍失败时，关键词会解除原 Agent 锁定并交回云端，由其他空闲 Agent 立即接手；故障 Agent 单独冷却，不会马上领取新任务。',
+            },
+            {
+              title: '冷却设备退出卡住的关键词页',
+              desc: '进入冷却的抖音或小红书 Agent 会先返回平台入口，避免停留在持续 loading 的搜索页；任务中心和调度中心同步显示等待原因、倒计时与接力状态。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.78',
       releaseDate: '2026-08-07',

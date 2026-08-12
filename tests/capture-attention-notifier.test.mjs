@@ -199,6 +199,53 @@ test('accepted first transition enqueues one idempotent outbox row', async () =>
   assert.equal(calls.length, 1);
 });
 
+test('elastic safety handoff suppresses only retryable-only items, not a real needs-action item', async () => {
+  const elasticTask = task({
+    parent_task_id: '66666666-6666-4666-8666-666666666666',
+  });
+  const suppressedCalls = [];
+  const suppressed = await enqueueCaptureSafetyAttentionNotification(
+    {
+      queryOne: async (sql) => {
+        suppressedCalls.push(sql);
+        return {retryable_count: 1, needs_action_count: 0};
+      },
+    },
+    {
+      agent: agent(),
+      task: elasticTask,
+      snapshot: safetySnapshot(),
+      previous: {status: 'running', attempt_number: 2},
+      snapshotAccepted: true,
+    },
+  );
+  assert.equal(suppressed, null);
+  assert.equal(suppressedCalls.length, 1);
+
+  const mixedCalls = [];
+  const inserted = await enqueueCaptureSafetyAttentionNotification(
+    {
+      queryOne: async (sql) => {
+        mixedCalls.push(sql);
+        return mixedCalls.length === 1
+          ? {retryable_count: 1, needs_action_count: 1}
+          : {id: 'notification-mixed'};
+      },
+    },
+    {
+      agent: agent(),
+      task: elasticTask,
+      snapshot: safetySnapshot(),
+      previous: {status: 'running', attempt_number: 2},
+      snapshotAccepted: true,
+    },
+  );
+  assert.equal(inserted.id, 'notification-mixed');
+  assert.equal(mixedCalls.length, 2);
+  assert.match(mixedCalls[0], /needs_action_count/u);
+  assert.match(mixedCalls[1], /capture_attention_notifications/u);
+});
+
 test('a new attempt can generate a new safety-attention event', async () => {
   const calls = [];
   const tx = {
@@ -342,8 +389,8 @@ test('admin task link is optional and only accepts an HTTP public base URL', () 
       'https://voice.example.com/admin/?page=dispatch&view=attention&taskId=11111111-1111-4111-8111-111111111111&orchestrationId=66666666-6666-4666-8666-666666666666#/m/page/dispatch?view=attention&taskId=11111111-1111-4111-8111-111111111111&orchestrationId=66666666-6666-4666-8666-666666666666',
     );
     assert.match(withLink.html, /打开调度中心处理/u);
-    assert.match(withLink.html, /当前关键词已停在原 Agent 等待人工/u);
-    assert.match(withLink.html, /如有其他未开始关键词，系统会自动分配/u);
+    assert.match(withLink.html, /等待人工处理当前 Agent/u);
+    assert.match(withLink.html, /其它未开始关键词仍由系统自动分配/u);
     assert.doesNotMatch(withLink.html, /结束\/接力任务/u);
 
     process.env.ADMIN_PUBLIC_URL = 'javascript:alert(1)';

@@ -1538,8 +1538,8 @@ function createUnattendedNavigationHarness({
     url: "https://www.douyin.com/jingxuan",
   };
   const sandbox = vm.createContext({
-    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 2,
-    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAY_MS: 0,
+    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 4,
+    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0, 0],
     buildSidebarKeywordSearchUrl: (keyword) =>
       `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`,
     chrome: {
@@ -1560,6 +1560,7 @@ function createUnattendedNavigationHarness({
     detectPlatformFromUrl: (url) =>
       String(url || "").includes("douyin.com") ? "douyin" : "unknown",
     sleep: async () => {},
+    sleepWithStop: async () => {},
     waitForActiveTabReady: async () => {
       const ready = Boolean(tabReadiness.shift());
       if (stopAfterTabReadiness) stopRequested = true;
@@ -1615,16 +1616,16 @@ test("unattended bootstrap reopens the same keyword after a transient page drift
 
 test("unattended bootstrap retry is bounded and exposes a recoverable error code", async () => {
   const harness = createUnattendedNavigationHarness({
-    tabReadiness: [false, false, true],
+    tabReadiness: [false, false, false, false],
   });
 
   await assert.rejects(harness.navigate(), (error) => {
     assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
-    assert.equal(error.attempts, 2);
+    assert.equal(error.attempts, 4);
     return true;
   });
-  assert.equal(harness.updates.length, 2);
-  assert.equal(harness.retries.length, 1);
+  assert.equal(harness.updates.length, 4);
+  assert.equal(harness.retries.length, 3);
   assert.equal(harness.runtimeChecks(), 0);
 });
 
@@ -1678,7 +1679,7 @@ test("a missing tracked tab never hijacks the user's unrelated active page", asy
     return true;
   });
   assert.equal(harness.updates.length, 0);
-  assert.equal(harness.retries.length, 1);
+  assert.equal(harness.retries.length, 3);
 });
 
 test("tab readiness never promotes an unrelated same-platform tab to the task tab", async () => {
@@ -1741,13 +1742,14 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   const navigationIndex = section.indexOf(
     "const navigationResult = await navigateActiveTabToKeywordSearchForPlan({",
   );
-  const retryIndex = section.indexOf("onRetry: async ({nextAttempt, maxAttempts})", navigationIndex);
+  const retryIndex = section.indexOf("onRetry: async ({nextAttempt, maxAttempts, retryDelayMs, waitUntil})", navigationIndex);
   const batchIndex = section.indexOf("batchRunResult = await handleBatchKeywordCapture({", retryIndex);
 
   assert.ok(navigationIndex > -1);
   assert.ok(retryIndex > navigationIndex);
   assert.ok(batchIndex > retryIndex);
-  assert.match(section.slice(retryIndex, batchIndex), /phase: "recovering_search_page"/);
+  assert.match(section.slice(retryIndex, batchIndex), /phase: "waiting_search_page_retry"/);
+  assert.match(section.slice(retryIndex, batchIndex), /waitUntil,/);
   assert.match(section.slice(retryIndex, batchIndex), /retried: Math\.max\(0, Number\(nextAttempt\) - 1\)/);
   assert.match(
     section,
@@ -1757,6 +1759,57 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
     section,
     /const terminalStatus = cancellation\?\.status \|\|\s*\(needsAction \? "needs_action" : "failed"\)/,
   );
+});
+
+test("unattended keyword failures use four spaced attempts with a durable countdown", () => {
+  assert.match(sidebarSource, /const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4/u);
+  assert.match(
+    sidebarSource,
+    /const UNATTENDED_KEYWORD_RETRY_DELAYS_MS = Object\.freeze\(\[\s*30 \* 1000,\s*2 \* 60 \* 1000,\s*5 \* 60 \* 1000,/u,
+  );
+  const handlerSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  assert.match(handlerSection, /Math\.min\(4, Number\(runOptions\.maxKeywordAttempts\) \|\| 1\)/u);
+  assert.match(handlerSection, /UNATTENDED_KEYWORD_RETRY_DELAYS_MS\[/u);
+  assert.match(handlerSection, /"keyword_retry_wait"/u);
+  assert.match(handlerSection, /waitUntil,/u);
+  assert.match(handlerSection, /attemptTotal: maxKeywordAttempts/u);
+});
+
+test("elastic keyword cooldown releases the work item, pauses the source Agent, and leaves the loading page", () => {
+  const handlerSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  const cooldownHomeSection = readFunctionSection(
+    "async function returnUnattendedAgentToCooldownHome({",
+    "function buildSidebarKeywordSearchUrl(",
+  );
+
+  assert.match(handlerSection, /releaseElasticItemOnLongRetry/u);
+  assert.match(handlerSection, /UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS/u);
+  assert.match(handlerSection, /UNATTENDED_ELASTIC_ITEM_RELEASED/u);
+  assert.match(handlerSection, /itemLockReleased = true/u);
+  assert.match(
+    unattendedSection,
+    /request\?\.orchestrationContext\?\.distributionMode === "elastic_pool"/u,
+  );
+  assert.match(unattendedSection, /returnUnattendedAgentToCooldownHome/u);
+  assert.match(
+    unattendedSection,
+    /elasticQueueAssigned && \(elasticItemReleased \|\| bootstrapFailed\)/u,
+  );
+  assert.match(unattendedSection, /cooldownHomeRestored/u);
+  assert.match(cooldownHomeSection, /chrome\.tabs\.update\(normalizedTabId/u);
+  assert.match(cooldownHomeSection, /url: homeUrl/u);
+  assert.match(sidebarSource, /https:\/\/www\.douyin\.com\/jingxuan/u);
+  assert.match(sidebarSource, /https:\/\/www\.xiaohongshu\.com\/explore/u);
 });
 
 test("unattended final source tab stays pinned through the batch runner", () => {

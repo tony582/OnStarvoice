@@ -575,6 +575,18 @@ function seedUnattendedRequest(harness, overrides = {}) {
   return harness.storage[UNATTENDED_REQUEST_KEY];
 }
 
+async function launchDeferredUnattendedRecovery(harness) {
+  const request = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(request?.status, "recovering");
+  assert.equal(request?.recoveryPendingLaunch, true);
+  const expiredAt = new Date(Date.now() - 1000).toISOString();
+  request.recoveryWaitUntil = expiredAt;
+  if (request.progress && typeof request.progress === "object") {
+    request.progress.waitUntil = expiredAt;
+  }
+  return await harness.api.superviseUnattendedKeywordRun();
+}
+
 function buildUnattendedRunnerSender(request, holderDocumentId) {
   return {
     documentId: String(holderDocumentId || ""),
@@ -1862,6 +1874,45 @@ test("a cloud create command starts exactly one local task without replacing the
   assert.equal(
     harness.storage["onstarvoice.unattendedKeywordRunRequest"].id,
     "cloud-task-local-1",
+  );
+});
+
+test("an elastic cloud assignment keeps its distribution mode on the local request", async () => {
+  const harness = createHarness();
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-elastic-context",
+      command_type: "create",
+      client_task_id: "cloud-task-elastic-context",
+      platform: "douyin",
+      payload: {
+        clientTaskId: "cloud-task-elastic-context",
+        planSnapshot: {
+          enabled: true,
+          platform: "douyin",
+          keywords: ["弹性工作项"],
+        },
+        orchestration: {
+          parentTaskId: "parent-elastic-context",
+          revision: 2,
+          itemIds: ["item-elastic-context"],
+          distributionMode: "elastic_pool",
+        },
+      },
+    },
+    "agent-token",
+  );
+
+  const request = harness.storage["onstarvoice.unattendedKeywordRunRequest"];
+  assert.equal(request.orchestrationContext.parentTaskId, "parent-elastic-context");
+  assert.equal(request.orchestrationContext.revision, 2);
+  assert.deepEqual(
+    Array.from(request.orchestrationContext.itemIds),
+    ["item-elastic-context"],
+  );
+  assert.equal(
+    request.orchestrationContext.distributionMode,
+    "elastic_pool",
   );
 });
 
@@ -3258,37 +3309,40 @@ test("a repeated checkpoint does not reset recovery but an advanced checkpoint d
   );
 });
 
-test("repeated old progress cannot replenish more than two automatic recoveries", async () => {
+test("repeated old progress cannot replenish the four spaced automatic recoveries", async () => {
   const harness = createHarness();
   let request = seedUnattendedRequest(harness);
 
-  const first = await harness.api.recoverUnattendedKeywordRunRequest(request, {
-    healthy: false,
-    reason: "runner_heartbeat_stale",
-  });
-  assert.equal(first.recovered, true, JSON.stringify(first));
-  request = harness.storage[UNATTENDED_REQUEST_KEY];
-  assert.equal(request.recoveryCount, 1);
+  for (let expectedRecoveryCount = 1; expectedRecoveryCount <= 4; expectedRecoveryCount += 1) {
+    const scheduled = await harness.api.recoverUnattendedKeywordRunRequest(
+      request,
+      {healthy: false, reason: "runner_heartbeat_stale"},
+    );
+    assert.equal(scheduled.deferred, true, JSON.stringify(scheduled));
+    request = harness.storage[UNATTENDED_REQUEST_KEY];
+    assert.equal(request.recoveryCount, expectedRecoveryCount);
+    assert.equal(request.progress.phase, "waiting_automatic_recovery");
+    assert.equal(request.progress.attemptCurrent, expectedRecoveryCount);
+    assert.equal(request.progress.attemptTotal, 4);
+    assert.ok(Date.parse(request.recoveryWaitUntil) > Date.now());
 
-  const duplicate = await harness.api.updateUnattendedKeywordRun({
-    requestId: request.id,
-    attemptId: request.attemptId,
-    patch: {
-      progressSeq: request.progressSeq + 1,
-      progress: {...request.progress, updatedAt: new Date().toISOString()},
-    },
-  });
-  assert.equal(duplicate.accepted, true);
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
+    if (expectedRecoveryCount === 1) {
+      const duplicate = await harness.api.updateUnattendedKeywordRun({
+        requestId: request.id,
+        attemptId: request.attemptId,
+        patch: {
+          progressSeq: request.progressSeq + 1,
+          progress: {...request.progress, updatedAt: new Date().toISOString()},
+        },
+      });
+      assert.equal(duplicate.accepted, true);
+      assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
+    }
 
-  request = harness.storage[UNATTENDED_REQUEST_KEY];
-  const second = await harness.api.recoverUnattendedKeywordRunRequest(request, {
-    healthy: false,
-    reason: "runner_heartbeat_stale",
-  });
-  assert.equal(second.recovered, true, JSON.stringify(second));
-  request = harness.storage[UNATTENDED_REQUEST_KEY];
-  assert.equal(request.recoveryCount, 2);
+    const launched = await launchDeferredUnattendedRecovery(harness);
+    assert.equal(launched.recovered, true, JSON.stringify(launched));
+    request = harness.storage[UNATTENDED_REQUEST_KEY];
+  }
 
   const exhausted = await harness.api.recoverUnattendedKeywordRunRequest(
     request,
@@ -3296,7 +3350,7 @@ test("repeated old progress cannot replenish more than two automatic recoveries"
   );
   assert.equal(exhausted.terminal, true, JSON.stringify(exhausted));
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 4);
 });
 
 test("a legacy service-abnormal checkpoint no longer blocks recovery", async () => {
@@ -3322,15 +3376,18 @@ test("a legacy service-abnormal checkpoint no longer blocks recovery", async () 
     },
   });
 
-  const recovery = await harness.api.recoverUnattendedKeywordRunRequest(
+  const scheduled = await harness.api.recoverUnattendedKeywordRunRequest(
     request,
     {healthy: false, reason: "runner_heartbeat_stale"},
   );
-  const stored = harness.storage[UNATTENDED_REQUEST_KEY];
-
-  assert.equal(recovery.recovered, true, JSON.stringify(recovery));
+  assert.equal(scheduled.deferred, true, JSON.stringify(scheduled));
+  let stored = harness.storage[UNATTENDED_REQUEST_KEY];
   assert.notEqual(stored.attemptId, request.attemptId);
   assert.equal(stored.recoveryCount, 1);
+  const recovery = await launchDeferredUnattendedRecovery(harness);
+  assert.equal(recovery.recovered, true, JSON.stringify(recovery));
+  stored = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(stored.status, "pending");
   assert.equal(harness.createdTabs.length, 2);
 });
 
@@ -3390,10 +3447,12 @@ test("a concurrent plan save cannot overwrite the request terminal mirror", asyn
 test("a recovered attempt fences updates from the old runner", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness);
-  const recovery = await harness.api.recoverUnattendedKeywordRunRequest(
+  const scheduled = await harness.api.recoverUnattendedKeywordRunRequest(
     request,
     {healthy: false, reason: "business_progress_stalled"},
   );
+  assert.equal(scheduled.deferred, true, JSON.stringify(scheduled));
+  const recovery = await launchDeferredUnattendedRecovery(harness);
   assert.equal(recovery.recovered, true, JSON.stringify(recovery));
   const recovered = harness.storage[UNATTENDED_REQUEST_KEY];
   assert.notEqual(recovered.attemptId, request.attemptId);
@@ -3608,8 +3667,11 @@ test("supervisor detects business stalls even while runner heartbeats are fresh"
     heartbeatAt: new Date().toISOString(),
     businessProgressAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
   });
-  const result = await harness.api.superviseUnattendedKeywordRun();
+  const scheduled = await harness.api.superviseUnattendedKeywordRun();
 
+  assert.equal(scheduled.deferred, true, JSON.stringify(scheduled));
+  assert.equal(scheduled.reason, "recovery_wait");
+  const result = await launchDeferredUnattendedRecovery(harness);
   assert.equal(result.recovered, true, JSON.stringify(result));
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
   assert.notEqual(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
@@ -3703,7 +3765,7 @@ test("stalled list capture recovery cancels the old lock holder before replaceme
     reason: "business_progress_stalled",
   });
 
-  assert.equal(result.recovered, true);
+  assert.equal(result.deferred, true);
   assert.ok(
     harness.sentTabMessages.some(
       ({tabId, payload}) => tabId === 73 && payload?.action === "cancelCapture",
@@ -3713,6 +3775,9 @@ test("stalled list capture recovery cancels the old lock holder before replaceme
     harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
     request.attemptId,
   );
+  assert.equal(harness.createdTabs.length, 0);
+  const launched = await launchDeferredUnattendedRecovery(harness);
+  assert.equal(launched.recovered, true, JSON.stringify(launched));
 });
 
 test("automatic recovery never launches a replacement when the old capture cannot be stopped", async () => {
@@ -3859,8 +3924,10 @@ test("a frozen runner falls back to bounded recovery when it cannot be woken", a
     return {id: Number(tabId), ...patch};
   });
 
-  const result = await harness.api.superviseUnattendedKeywordRun();
+  const scheduled = await harness.api.superviseUnattendedKeywordRun();
 
+  assert.equal(scheduled.deferred, true, JSON.stringify(scheduled));
+  const result = await launchDeferredUnattendedRecovery(harness);
   assert.equal(result.recovered, true, JSON.stringify(result));
   assert.notEqual(
     harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
@@ -3884,8 +3951,10 @@ test("a discarded runner is recovered without waiting for heartbeat expiry", asy
     url: "chrome-extension://test/sidebar/sidebar.html",
   }));
 
-  const result = await harness.api.superviseUnattendedKeywordRun();
+  const scheduled = await harness.api.superviseUnattendedKeywordRun();
 
+  assert.equal(scheduled.deferred, true, JSON.stringify(scheduled));
+  const result = await launchDeferredUnattendedRecovery(harness);
   assert.equal(result.recovered, true, JSON.stringify(result));
   assert.equal(
     harness.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
@@ -3911,11 +3980,15 @@ test("startup and sleep recovery apply a short grace before retrying", async () 
     Date.parse(harness.storage[UNATTENDED_REQUEST_KEY].wakeGraceUntil) > Date.now(),
   );
 
-  harness.storage[UNATTENDED_REQUEST_KEY].wakeGraceUntil = new Date(
-    Date.now() - 1000,
-  ).toISOString();
+  const expiredAt = new Date(Date.now() - 1000).toISOString();
+  harness.storage[UNATTENDED_REQUEST_KEY].wakeGraceUntil = expiredAt;
+  harness.storage[UNATTENDED_REQUEST_KEY].recoveryWaitUntil = expiredAt;
+  harness.storage[UNATTENDED_REQUEST_KEY].progress.waitUntil = expiredAt;
   const afterGrace = await harness.api.superviseUnattendedKeywordRun();
-  assert.equal(afterGrace.recovered, true, JSON.stringify(afterGrace));
+  assert.equal(afterGrace.deferred, true, JSON.stringify(afterGrace));
+  assert.equal(afterGrace.reason, "recovery_wait");
+  const launched = await launchDeferredUnattendedRecovery(harness);
+  assert.equal(launched.recovered, true, JSON.stringify(launched));
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
 });
 
@@ -3938,7 +4011,7 @@ test("a delayed supervisor alarm identifies wake-from-sleep without storage chur
 test("recovery stops at the bounded retry limit and requires attention", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness, {
-    recoveryCount: 2,
+    recoveryCount: 4,
     heartbeatAt: new Date().toISOString(),
     businessProgressAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
   });
@@ -3947,7 +4020,7 @@ test("recovery stops at the bounded retry limit and requires attention", async (
   assert.equal(result.terminal, true);
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
-  assert.match(harness.storage[UNATTENDED_REQUEST_KEY].message, /达到 2 次/);
+  assert.match(harness.storage[UNATTENDED_REQUEST_KEY].message, /达到 4 次/);
 });
 
 test("repeated runner launch failures also stop instead of recovering forever", async () => {
@@ -3960,17 +4033,22 @@ test("repeated runner launch failures also stop instead of recovering forever", 
     throw new Error("cannot create tab");
   });
 
-  const first = await harness.api.superviseUnattendedKeywordRun();
-  assert.equal(first.deferred, true);
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures, 1);
-  harness.storage[UNATTENDED_REQUEST_KEY].recoveryWaitUntil = new Date(
-    Date.now() - 1000,
-  ).toISOString();
-  const second = await harness.api.superviseUnattendedKeywordRun();
+  const scheduled = await harness.api.superviseUnattendedKeywordRun();
+  assert.equal(scheduled.deferred, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures, 0);
 
-  assert.equal(second.terminal, true);
+  for (let failure = 1; failure <= 4; failure += 1) {
+    const result = await launchDeferredUnattendedRecovery(harness);
+    assert.equal(
+      harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+      failure,
+    );
+    assert.equal(Boolean(result.terminal), failure === 4, JSON.stringify(result));
+    assert.equal(Boolean(result.deferred), failure < 4, JSON.stringify(result));
+  }
+
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures, 2);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures, 4);
 });
 
 test("keyword checkpoints become task-center success failure and skip details", async () => {
@@ -4824,7 +4902,7 @@ test("unattended recovery releases the previous child Debug group before relaunc
     {healthy: false, reason: "runner_heartbeat_stale"},
   );
 
-  assert.equal(recovery.recovered, true, JSON.stringify(recovery));
+  assert.equal(recovery.deferred, true, JSON.stringify(recovery));
   assert.equal(
     harness.api.getCaptureTaskGroup("unattended-child-attempt-1"),
     null,
@@ -4833,6 +4911,8 @@ test("unattended recovery releases the previous child Debug group before relaunc
     harness.api.getCaptureDebugSessionByTaskId("unattended-child-attempt-1"),
     null,
   );
+  const launched = await launchDeferredUnattendedRecovery(harness);
+  assert.equal(launched.recovered, true, JSON.stringify(launched));
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptNumber, 2);
   assert.deepEqual(
     harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.keywordResults,
@@ -5022,9 +5102,10 @@ test("closing an active unattended source tab recovers the root request without 
 
   await harness.api.handleCaptureRuntimeTabRemoved(41);
 
-  const recoveredRequest = harness.storage[UNATTENDED_REQUEST_KEY];
+  let recoveredRequest = harness.storage[UNATTENDED_REQUEST_KEY];
   assert.equal(recoveredRequest.attemptNumber, 2);
-  assert.equal(recoveredRequest.status, "pending");
+  assert.equal(recoveredRequest.status, "recovering");
+  assert.equal(recoveredRequest.progress.phase, "waiting_automatic_recovery");
   assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
   assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
   assert.equal(
@@ -5035,6 +5116,10 @@ test("closing an active unattended source tab recovers the root request without 
     ),
     false,
   );
+  const launched = await launchDeferredUnattendedRecovery(harness);
+  assert.equal(launched.recovered, true, JSON.stringify(launched));
+  recoveredRequest = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(recoveredRequest.status, "pending");
 });
 
 test("a replacement runner reclaims its own stale unattended child instead of reporting group busy", async () => {
@@ -5257,7 +5342,9 @@ test("a late END from the recovered unattended attempt cannot stop the replaceme
     request,
     {healthy: false, reason: "runner_heartbeat_stale"},
   );
-  assert.equal(recovery.recovered, true, JSON.stringify(recovery));
+  assert.equal(recovery.deferred, true, JSON.stringify(recovery));
+  const launched = await launchDeferredUnattendedRecovery(harness);
+  assert.equal(launched.recovered, true, JSON.stringify(launched));
   const replacementRequest = harness.storage[UNATTENDED_REQUEST_KEY];
   assert.notEqual(replacementRequest.attemptId, request.attemptId);
 

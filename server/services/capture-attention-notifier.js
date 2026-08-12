@@ -312,7 +312,7 @@ export function buildCaptureAttentionEmail(notification = {}) {
   const html = `
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:640px;margin:0 auto;color:#111827">
       <h2 style="font-size:20px;margin:0 0 8px">采集任务需要人工登录或验证</h2>
-      <p style="margin:0 0 20px;color:#6b7280">平台要求重新登录或完成安全验证，当前关键词已停在原 Agent 等待人工。如有其他未开始关键词，系统会自动分配，无需人工选择接力设备。</p>
+      <p style="margin:0 0 20px;color:#6b7280">当前关键词已在多轮自动恢复或跨 Agent 接力后再次遇到登录或安全验证，系统已停止继续扩散重试，等待人工处理当前 Agent。其它未开始关键词仍由系统自动分配。</p>
       <table style="width:100%;border-collapse:collapse;font-size:14px">
         <tr><td style="padding:8px 0;color:#6b7280;width:120px">任务</td><td>${escapeHtml(title)}</td></tr>
         <tr><td style="padding:8px 0;color:#6b7280">Agent</td><td>${escapeHtml(payload.agentName || '—')}</td></tr>
@@ -343,6 +343,35 @@ export async function enqueueCaptureSafetyAttentionNotification(tx, {
 } = {}) {
   if (!snapshotAccepted || !task?.id) return null;
   if (!isStructuredSafetyAttention(snapshot, task)) return null;
+
+  if (task.parent_task_id) {
+    const recoveryProjection = await tx.queryOne(`
+      SELECT
+        COUNT(*) FILTER (WHERE item.status = 'retryable') AS retryable_count,
+        COUNT(*) FILTER (WHERE item.status = 'needs_action') AS needs_action_count
+      FROM capture_task_items item
+      JOIN capture_tasks parent
+        ON parent.id = item.task_id
+        AND parent.tenant_id = item.tenant_id
+      WHERE item.tenant_id = $1
+        AND item.task_id = $2
+        AND item.execution_task_id = $3
+        AND item.status IN ('retryable', 'needs_action')
+        AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+    `, [
+      agent.tenant_id || task.tenant_id,
+      task.parent_task_id,
+      task.id,
+    ]);
+    // 弹性队列第一次遇到验证码时先自动换一个账号验证是否为节点局部问题。
+    // 只有跨节点仍然命中安全限制、工作项保持 needs_action 时才通知人。
+    if (
+      Number(recoveryProjection?.retryable_count || 0) > 0 &&
+      Number(recoveryProjection?.needs_action_count || 0) === 0
+    ) {
+      return null;
+    }
+  }
 
   const attemptNumber = integer(
     task.attempt_number ?? snapshot.attemptNumber,

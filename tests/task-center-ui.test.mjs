@@ -181,6 +181,36 @@ test("task center orders all business tasks by start time descending", async () 
   ]);
 });
 
+test("task center preserves automatic recovery timing and renders a live countdown", async () => {
+  const waitUntil = "2026-08-12T02:30:45.000Z";
+  const {normalizeTaskCenterItem} = await import(
+    `../sidebar/task-center-ui.js?task-center-recovery-wait-test=${Date.now()}`
+  );
+  const item = normalizeTaskCenterItem({
+    id: "recovery-wait",
+    taskType: "unattended_keyword_capture",
+    status: "recovering",
+    progress: {
+      phase: "waiting_supervisor_retry",
+      message: "弱网恢复等待中",
+      waitUntil,
+      attemptCurrent: 2,
+      attemptTotal: 4,
+    },
+  });
+
+  assert.equal(item.progress.waitUntil, Date.parse(waitUntil));
+  assert.equal(item.progress.attemptCurrent, 2);
+  assert.equal(item.progress.attemptTotal, 4);
+  assert.equal(item.progress.message, "弱网恢复等待中");
+
+  const ui = await read("sidebar/task-center-ui.js");
+  assert.match(ui, /data-task-wait-countdown/u);
+  assert.match(ui, /data-task-wait-until="\$\{waitUntil\}"/u);
+  assert.match(ui, /已到重试时间，正在等待设备回报/u);
+  assert.match(ui, /window\.setInterval\([\s\S]*updateTaskCenterCountdowns\(document\)[\s\S]*1000/u);
+});
+
 test("task center hides capture child syncs but keeps user initiated sync tasks", async () => {
   const {buildTaskCenterItems} = await import(
     `../sidebar/task-center-ui.js?task-center-sync-visibility-test=${Date.now()}`

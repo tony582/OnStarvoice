@@ -27,12 +27,14 @@ import {
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
+  elasticRecoveryHoldRemainingMs,
   isProfilePatrolTask,
   lockActiveCaptureAgentSession,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
+  projectElasticKeywordRecoveryStatus,
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
@@ -185,6 +187,61 @@ test("recovery grading keeps captcha current and automates technical or unstarte
     attempt_count: 3,
     error: {code: "TAB_NOT_FOUND"},
   }), {kind: "automatic_attempts_exhausted", automatic: false});
+});
+
+test("elastic keyword recovery is patient, bounded, and escalates safety only after a cross-Agent check", () => {
+  const safety = {
+    code: "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+    securityBlocked: true,
+    requiresManualAction: true,
+  };
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "needs_action",
+    error: safety,
+    attemptCount: 1,
+  }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "needs_action",
+    error: safety,
+    attemptCount: 2,
+  }), "needs_action");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "failed",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    attemptCount: 2,
+  }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "failed",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    attemptCount: 3,
+  }), "failed");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: false,
+    status: "needs_action",
+    error: safety,
+    attemptCount: 1,
+  }), "needs_action");
+
+  const now = Date.parse("2026-08-12T02:00:00.000Z");
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    updated_at: "2026-08-12T01:59:00.000Z",
+  }, now), 60_000);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: safety,
+    updated_at: "2026-08-12T01:50:00.000Z",
+  }, now), 20 * 60_000);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    updated_at: "2026-08-12T01:55:00.000Z",
+  }, now), 0);
 });
 
 test("automatic relay excludes devices per selected item instead of per parent task", () => {
@@ -499,7 +556,7 @@ test("negative patrol result projection binds server records and fresh observati
   assert.match(projection, /visible_comments_bounded/u);
   assert.match(
     projection,
-    /'message', \$7::text/u,
+    /code: text\(snapshotError\.code, 100\) \|\| 'missing_target_result'/u,
   );
   assert.match(
     projection,
@@ -1146,6 +1203,13 @@ test("elastic queue claims one keyword or negative post per idle heartbeat and f
   assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
   assert.match(claim, /classifyCaptureRecoveryDisposition/u);
   assert.match(claim, /'manual_current'/u);
+  assert.match(claim, /elasticRecoveryHoldRemainingMs\(recentRecoveryAttempt\)/u);
+  assert.match(claim, /recent_same_agent_attempt/u);
+  assert.match(claim, /ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS/u);
+  assert.doesNotMatch(
+    claim,
+    /recovery[^\n]*nextEvaluationAt|nextEvaluationAt[^\n]*recovery/u,
+  );
 
   const heartbeat = readRouteSection(
     "router.post('/agent/heartbeat'",
@@ -1159,7 +1223,23 @@ test("elastic queue claims one keyword or negative post per idle heartbeat and f
   assert.ok(commandRead > elastic);
 });
 
-test("elastic queue reclaims only stale offline work and leaves platform safety manual", () => {
+test("elastic recovery releases the item immediately while cooling only the source Agent", () => {
+  const recovery = readRouteSection(
+    "function buildElasticRecoveryMetadata({",
+    "export function crossDeviceRetryAgentSupportsTask(",
+  );
+
+  assert.match(recovery, /state: 'released_for_handoff'/u);
+  assert.match(recovery, /handoffReadyAt/u);
+  assert.match(recovery, /itemLockReleased: true/u);
+  assert.match(recovery, /sourceAgentCooling: true/u);
+  assert.match(recovery, /cooldownHomeRestored/u);
+  assert.match(recovery, /cooldownHomeUrl/u);
+  assert.match(recovery, /sourceAgentHoldUntil/u);
+  assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
+});
+
+test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
   const lease = readRouteSection(
     'export async function reconcileElasticCaptureLeases',
     'export async function reconcileAutomaticCaptureRetries',
@@ -1175,25 +1255,19 @@ test("elastic queue reclaims only stale offline work and leaves platform safety 
   );
 });
 
-test("elastic negative patrol retries technical failures but keeps safety challenges on the current Agent", () => {
+test("elastic negative patrol uses the same bounded technical and safety handoff policy", () => {
   const projection = readRouteSection(
     'async function projectNegativePatrolSnapshot',
     'async function projectOrchestrationChildControlOutcome',
   );
   assert.match(projection, /distributionMode ===[\s\S]*'elastic_pool'/u);
   assert.match(projection, /classifyCaptureRecoveryDisposition/u);
-  assert.match(
-    projection,
-    /recoveryDisposition\.kind === 'manual_current'[\s\S]*\? 'needs_action'/u,
-  );
-  assert.match(
-    projection,
-    /recoveryDisposition\.automatic[\s\S]*\? 'retryable'/u,
-  );
-  assert.match(
-    projection,
-    /elasticPool && !isProfilePatrol && !snapshotNeedsManualSafety[\s\S]*\? 'retryable'/u,
-  );
+  assert.match(projection, /SELECT attempt_count[\s\S]*FOR UPDATE/u);
+  assert.match(projection, /projectElasticKeywordRecoveryStatus/u);
+  assert.match(projection, /buildElasticRecoveryMetadata/u);
+  assert.match(projection, /sourceAgentId:\s*agent\.id/u);
+  assert.match(projection, /missingTargetResult:\s*true/u);
+  assert.doesNotMatch(projection, /snapshotNeedsManualSafety/u);
 });
 
 test("unattended plan deletion is a durable device command and clears the mirror only after acknowledgement", () => {

@@ -10,6 +10,7 @@ let activeTaskCenterDetailId = "";
 let taskCenterDetailReturnFocus = null;
 let lastTaskCenterStatusAnnouncementKey = "";
 let lastTaskCenterStatusById = new Map();
+let taskCenterCountdownTimer = null;
 
 const INTERNAL_SYNC_TRIGGERS = new Set(["capture_auto", "detail_auto"]);
 const INTERNAL_TASK_VISIBILITY_VALUES = new Set([
@@ -284,6 +285,23 @@ function normalizeTaskCenterProgress(source) {
     source?.checkpoint && typeof source.checkpoint === "object"
       ? source.checkpoint
       : {};
+  const metadata =
+    source?.metadata && typeof source.metadata === "object"
+      ? source.metadata
+      : {};
+  const waitUntil = normalizeTaskCenterTimestamp(
+    readTaskField(progress, "waitUntil", "wait_until", "nextRetryAt", "next_retry_at") ||
+      readTaskField(source, "recoveryWaitUntil", "recovery_wait_until") ||
+      readTaskField(metadata, "recoveryWaitUntil", "recovery_wait_until"),
+  );
+  const attemptCurrent = Number(
+    readTaskField(progress, "attemptCurrent", "attempt_current", "attempt") || 0,
+  );
+  const attemptTotal = Number(
+    readTaskField(progress, "attemptTotal", "attempt_total", "maxAttempts", "max_attempts") ||
+      readTaskField(metadata, "maxRecoveryAttempts", "max_recovery_attempts") ||
+      0,
+  );
   return {
     current: Number.isFinite(current) && current >= 0 ? current : 0,
     total: Number.isFinite(total) && total >= 0 ? total : 0,
@@ -297,10 +315,72 @@ function normalizeTaskCenterProgress(source) {
       readTaskField(progress, "phase", "stage") || checkpoint.phase || "",
     ).trim(),
     message: String(readTaskField(progress, "message", "lastMessage", "last_message") || "").trim(),
+    waitUntil,
+    attemptCurrent:
+      Number.isFinite(attemptCurrent) && attemptCurrent > 0
+        ? Math.floor(attemptCurrent)
+        : 0,
+    attemptTotal:
+      Number.isFinite(attemptTotal) && attemptTotal > 0
+        ? Math.floor(attemptTotal)
+        : 0,
     updatedAt: normalizeTaskCenterTimestamp(
       readTaskField(progress, "updatedAt", "updated_at", "lastBusinessProgressAt", "last_business_progress_at"),
     ),
   };
+}
+
+function formatTaskCenterCountdown(remainingMs) {
+  const totalSeconds = Math.max(0, Math.ceil(Number(remainingMs) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function renderTaskCenterWaitState(item, {detail = false} = {}) {
+  const waitUntil = Number(item?.progress?.waitUntil || 0);
+  if (
+    !waitUntil ||
+    !["running", "recovering"].includes(String(item?.status || ""))
+  ) {
+    return "";
+  }
+  const attempt =
+    item.progress.attemptCurrent > 0 && item.progress.attemptTotal > 0
+      ? `第 ${item.progress.attemptCurrent}/${item.progress.attemptTotal} 次`
+      : "自动恢复";
+  const exactTime = new Date(waitUntil).toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return `<div class="task-center-wait-state${detail ? " is-detail" : ""}">
+    <div class="task-center-wait-state-head">
+      <span>${escapeHtml(attempt)}</span>
+      <strong data-task-wait-countdown data-task-wait-until="${waitUntil}">${escapeHtml(formatTaskCenterCountdown(waitUntil - Date.now()))} 后重试</strong>
+    </div>
+    <div class="task-center-wait-state-copy">${escapeHtml(item.progress.message || "正在等待下一次自动恢复")}</div>
+    <time>下次动作 ${escapeHtml(exactTime)}</time>
+  </div>`;
+}
+
+function updateTaskCenterCountdowns(root = document) {
+  root.querySelectorAll("[data-task-wait-countdown]").forEach((element) => {
+    const waitUntil = Number(element.dataset.taskWaitUntil || 0);
+    if (!waitUntil) return;
+    const remainingMs = waitUntil - Date.now();
+    const nextText = remainingMs > 0
+      ? `${formatTaskCenterCountdown(remainingMs)} 后重试`
+      : "已到重试时间，正在等待设备回报";
+    setTextIfChanged(element, nextText);
+    element.closest(".task-center-wait-state")?.classList.toggle(
+      "is-due",
+      remainingMs <= 0,
+    );
+  });
 }
 
 export function normalizeTaskCenterItem(source, index = 0) {
@@ -947,6 +1027,7 @@ function renderTaskCenterCard(item) {
           <span>${escapeHtml(item.triggerLabel)}</span>
           <span>${escapeHtml(formatTaskCenterTime(item.startedAt || item.finishedAt))}</span>
         </div>
+        ${renderTaskCenterWaitState(item)}
         ${
           shouldShowProgress
             ? `<div class="task-center-card-progress">
@@ -1101,6 +1182,7 @@ export function renderTaskCenterPanel(state = {}) {
       list.querySelector(selector)?.focus();
     }
   }
+  updateTaskCenterCountdowns(list);
 }
 
 function normalizeTaskCenterTimeline(item) {
@@ -1165,13 +1247,15 @@ function renderTaskCenterDetail(item) {
   if (progressSection && progressContainer) {
     progressSection.hidden = !hasProgress;
     progressContainer.innerHTML = hasProgress
-      ? `<div class="task-center-detail-progress-copy">${escapeHtml(item.progress.message || item.progress.keyword || item.progress.phase || "任务执行中")}</div>
+      ? `${renderTaskCenterWaitState(item, {detail: true})}
+         <div class="task-center-detail-progress-copy">${escapeHtml(item.progress.message || item.progress.keyword || item.progress.phase || "任务执行中")}</div>
          <div class="task-center-card-progress">
            <div class="task-center-progress-copy"><span>${escapeHtml(item.progress.keyword || item.progress.phase || "总体进度")}</span><span>${item.progress.total > 0 ? `${item.progress.current}/${item.progress.total}` : `${item.progress.percent}%`}</span></div>
            <div class="task-center-progress-track"><span class="task-center-progress-bar" style="width:${item.progress.percent}%"></span></div>
          </div>
          <div class="task-center-detail-counts">${renderTaskCenterCountChips(item.counts)}</div>`
       : "";
+    updateTaskCenterCountdowns(progressContainer);
   }
 
   const timeline = normalizeTaskCenterTimeline(item);
@@ -1250,6 +1334,12 @@ export function initializeTaskCenterInteractions(render = renderTaskCenterPanel)
   const panel = document.getElementById("historyTab");
   if (!panel || panel.dataset.taskCenterBound === "true") return;
   panel.dataset.taskCenterBound = "true";
+  if (taskCenterCountdownTimer === null) {
+    taskCenterCountdownTimer = window.setInterval(
+      () => updateTaskCenterCountdowns(document),
+      1000,
+    );
+  }
 
   panel.querySelectorAll("#taskCenterStatusFilter, #taskCenterTypeFilter, #taskCenterPlatformFilter, #taskCenterTimeFilter")
     .forEach((select) => select.addEventListener("change", render));

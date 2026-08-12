@@ -1136,13 +1136,40 @@ const UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS = 1500;
 const UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
 const UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS = 30 * 1000;
 const UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS = 10 * 1000;
-const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 2;
+const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4;
+const UNATTENDED_KEYWORD_RETRY_DELAYS_MS = Object.freeze([
+  30 * 1000,
+  2 * 60 * 1000,
+  5 * 60 * 1000,
+]);
+const UNATTENDED_AGENT_COOLDOWN_HOME_URLS = Object.freeze({
+  xiaohongshu:
+    "https://www.xiaohongshu.com/explore?channel_id=homefeed_recommend",
+  douyin: "https://www.douyin.com/jingxuan",
+});
+const UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS = 2 * 60 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
-// 首次把平台页切到首个关键词时，用户误点视频或平台自身改写页面都可能让
-// 单次就绪检查错过目标搜索页。这里只允许一次有界自愈，避免持续抢用户页面。
-const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 2;
-const UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAY_MS = 1200;
+// 首次把平台页切到关键词时，弱网、平台改写页面或标签替换都可能让短时
+// 就绪检查错过目标页。重试必须分散到真实等待窗口，并把 nextRetryAt 上报给
+// 任务中心；不能连续快速刷新两次后就把普通技术故障升级成人工介入。
+const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4;
+const UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS = Object.freeze([
+  20 * 1000,
+  60 * 1000,
+  3 * 60 * 1000,
+]);
+const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4;
+const UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS = Object.freeze([
+  15 * 1000,
+  45 * 1000,
+  2 * 60 * 1000,
+]);
+const UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES = new Set([
+  "capture_task_group_busy",
+  "capture_task_cleanup_pending",
+  "capture_task_debug_busy",
+]);
 let activeUnattendedRunRequestId = "";
 let activeUnattendedRunAttemptId = "";
 let pendingUnattendedCancellationRequestId = "";
@@ -13345,6 +13372,8 @@ async function handleBatchKeywordCapture(options = {}) {
       : executionLockOwner === "unattended_keyword_plan"
         ? "unattended_plan"
         : "manual";
+  const releaseElasticItemOnLongRetry =
+    runOptions.releaseElasticItemOnLongRetry === true;
   // Unattended identity belongs to this invocation, not to the mutable global
   // claim slot.  A delayed callback from a previous runner must never be
   // relabeled with the request/attempt that happens to be active later.
@@ -13718,7 +13747,7 @@ async function handleBatchKeywordCapture(options = {}) {
         : null;
     const maxKeywordAttempts = Math.max(
       1,
-      Math.min(3, Number(runOptions.maxKeywordAttempts) || 1),
+      Math.min(4, Number(runOptions.maxKeywordAttempts) || 1),
     );
 
     let result;
@@ -14134,10 +14163,20 @@ async function handleBatchKeywordCapture(options = {}) {
         },
         onRetryScheduled: async ({keywords: failedKeywords, attempt}) => {
           keywordAttempt = attempt;
-          const retryDelay =
-            UNATTENDED_KEYWORD_RETRY_MIN_MS +
-            Math.random() *
-              (UNATTENDED_KEYWORD_RETRY_MAX_MS - UNATTENDED_KEYWORD_RETRY_MIN_MS);
+          const retryDelay = Math.max(
+            0,
+            Number(
+              UNATTENDED_KEYWORD_RETRY_DELAYS_MS[
+                Math.max(0, Number(attempt) - 2)
+              ] ?? UNATTENDED_KEYWORD_RETRY_DELAYS_MS.at(-1),
+            ) || 0,
+          );
+          const waitUntil = new Date(Date.now() + retryDelay).toISOString();
+          const releaseElasticItem = Boolean(
+            releaseElasticItemOnLongRetry &&
+              failedKeywords.length > 0 &&
+              retryDelay >= UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS,
+          );
           const retryProgress = {
             current: 0,
             total: keywords.length,
@@ -14152,12 +14191,29 @@ async function handleBatchKeywordCapture(options = {}) {
             attemptCurrent: attempt,
             attemptTotal: maxKeywordAttempts,
             maxAttempts: maxKeywordAttempts,
-            phase: "keyword_retry_wait",
+            phase: releaseElasticItem
+              ? "releasing_elastic_keyword"
+              : "keyword_retry_wait",
             remainingMs: retryDelay,
-            message: `${Math.ceil(retryDelay / 1000)} 秒后自动重试 ${failedKeywords.length} 个失败关键词（第 ${attempt}/${maxKeywordAttempts} 次）`,
+            waitUntil,
+            updatedAt: new Date().toISOString(),
+            message: releaseElasticItem
+              ? `关键词「${failedKeywords[0]}」已解除当前 Agent 锁定，正在交回云端；当前 Agent 进入 ${Math.ceil(retryDelay / 1000)} 秒冷却`
+              : `${Math.ceil(retryDelay / 1000)} 秒后自动重试 ${failedKeywords.length} 个失败关键词（第 ${attempt}/${maxKeywordAttempts} 次）`,
           };
           updateBatchProgress(retryProgress, "modal");
           notifyProgress?.(retryProgress);
+          if (releaseElasticItem) {
+            const releaseError = new Error(retryProgress.message);
+            releaseError.code = "UNATTENDED_ELASTIC_ITEM_RELEASED";
+            releaseError.keyword = failedKeywords[0] || "";
+            releaseError.retryAfterMs = retryDelay;
+            releaseError.retryAt = waitUntil;
+            releaseError.itemLockReleased = true;
+            releaseError.requiresManualAction = false;
+            releaseError.retryable = true;
+            throw releaseError;
+          }
           await sleepWithStop(retryDelay, shouldStopBatchInvocation);
         },
         shouldStop: shouldStopBatchInvocation,
@@ -14354,6 +14410,9 @@ async function handleBatchKeywordCapture(options = {}) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
     sidebarTaskStatus = "failed";
     sidebarTaskError = error;
+    if (error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED") {
+      throw error;
+    }
     showMessage("批量采集失败: " + error.message, "error");
     return {
       started: true,
@@ -16771,6 +16830,38 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
   }
 }
 
+async function returnUnattendedAgentToCooldownHome({
+  tabId = null,
+  platform = "",
+} = {}) {
+  const normalizedTabId = Number(tabId);
+  const normalizedPlatform = String(platform || "").trim().toLowerCase();
+  const homeUrl =
+    UNATTENDED_AGENT_COOLDOWN_HOME_URLS[normalizedPlatform] || "";
+  if (
+    !Number.isSafeInteger(normalizedTabId) ||
+    normalizedTabId <= 0 ||
+    !homeUrl
+  ) {
+    return {ok: false, homeUrl, reason: "cooldown_home_unavailable"};
+  }
+  try {
+    await chrome.tabs.update(normalizedTabId, {
+      url: homeUrl,
+      active: true,
+    });
+    return {ok: true, homeUrl, reason: "cooldown_home_opened"};
+  } catch (error) {
+    console.warn("[Sidebar] Restore unattended cooldown home failed:", error);
+    return {
+      ok: false,
+      homeUrl,
+      reason: "cooldown_home_navigation_failed",
+      message: String(error?.message || error || "页面导航失败"),
+    };
+  }
+}
+
 function buildSidebarKeywordSearchUrl(keyword, platform, baseSearchUrl = "") {
   const encodedKeyword = encodeURIComponent(keyword);
   if (platform === "douyin") {
@@ -16970,15 +17061,29 @@ async function navigateActiveTabToKeywordSearchForPlan({
   baseSearchUrl = "",
   tabId = null,
   maxAttempts = UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS,
-  retryDelayMs = UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAY_MS,
+  retryDelaysMs = UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS,
+  retryDelayMs = null,
   shouldStop = null,
+  onAttempt = null,
   onRetry = null,
 } = {}) {
   const searchUrl = buildSidebarKeywordSearchUrl(keyword, platform, baseSearchUrl);
   const boundedMaxAttempts = Math.max(
     1,
-    Math.min(3, Math.floor(Number(maxAttempts) || 1)),
+    Math.min(4, Math.floor(Number(maxAttempts) || 1)),
   );
+  const resolveRetryDelayMs = (attempt) => {
+    if (retryDelayMs !== null && retryDelayMs !== undefined) {
+      return Math.max(0, Number(retryDelayMs) || 0);
+    }
+    const schedule = Array.isArray(retryDelaysMs)
+      ? retryDelaysMs
+      : UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS;
+    return Math.max(
+      0,
+      Number(schedule[Math.max(0, attempt - 1)] ?? schedule.at(-1)) || 0,
+    );
+  };
   let preferredTabId =
     Number.isFinite(Number(tabId)) && Number(tabId) > 0
       ? Number(tabId)
@@ -16992,6 +17097,15 @@ async function navigateActiveTabToKeywordSearchForPlan({
       const stoppedError = new Error("无人值守搜索页恢复已取消");
       stoppedError.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
       throw stoppedError;
+    }
+    if (typeof onAttempt === "function") {
+      await onAttempt({
+        attempt,
+        maxAttempts: boundedMaxAttempts,
+        keyword,
+        platform,
+        tabId: preferredTabId,
+      });
     }
 
     let targetTab = null;
@@ -17128,11 +17242,15 @@ async function navigateActiveTabToKeywordSearchForPlan({
     if (attempt >= boundedMaxAttempts) {
       break;
     }
+    const nextRetryDelayMs = resolveRetryDelayMs(attempt);
+    const waitUntil = new Date(Date.now() + nextRetryDelayMs).toISOString();
     if (typeof onRetry === "function") {
       await onRetry({
         attempt,
         nextAttempt: attempt + 1,
         maxAttempts: boundedMaxAttempts,
+        retryDelayMs: nextRetryDelayMs,
+        waitUntil,
         keyword,
         platform,
         tabId: preferredTabId,
@@ -17144,7 +17262,7 @@ async function navigateActiveTabToKeywordSearchForPlan({
       stoppedError.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
       throw stoppedError;
     }
-    await sleep(Math.max(0, Number(retryDelayMs) || 0));
+    await sleepWithStop(nextRetryDelayMs, shouldStop);
   }
 
   const error = new Error(
@@ -17426,6 +17544,7 @@ async function runUnattendedKeywordPlanRequest(request) {
   let reportKeywordProgress = null;
   let batchRunResult = null;
   let unattendedCaptureTaskTerminalProgress = null;
+  let unattendedSourceTabId = null;
 
   if (keywords.length === 0) {
     throw new Error(`${executionCopy.taskLabel}没有可执行关键词`);
@@ -17612,6 +17731,51 @@ async function runUnattendedKeywordPlanRequest(request) {
   };
   renderCaptureDebugSession(getCurrentRuntime() || {});
 
+  const reportAutomaticRecoveryStage = async ({
+    phase,
+    message,
+    attemptCurrent = null,
+    attemptTotal = null,
+    waitUntil = "",
+    remainingMs = null,
+    retried = 0,
+  }) => {
+    const recoveryProgress = {
+      ...startingProgress,
+      phase,
+      message,
+      attempt: attemptCurrent,
+      attemptCurrent,
+      attemptTotal,
+      maxAttempts: attemptTotal,
+      waitUntil,
+      remainingMs,
+      phaseStartedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    rememberCaptureTaskProgressContext(recoveryProgress);
+    showMessage(message, waitUntil ? "warning" : "info");
+    return await reportUnattendedKeywordRun(
+      requestId,
+      {
+        status: "running",
+        waitUntil,
+        checkpoint,
+        counts: buildUnattendedTaskCounts(
+          checkpoint,
+          summarizeUnattendedKeywordCheckpoint(checkpoint),
+          {
+            total: plannedTaskTotal,
+            retried,
+          },
+        ),
+        message,
+        progress: recoveryProgress,
+      },
+      {attemptId: requestAttemptId},
+    );
+  };
+
   let switchResult = null;
   try {
     switchResult = await chrome.runtime.sendMessage({
@@ -17628,7 +17792,7 @@ async function runUnattendedKeywordPlanRequest(request) {
   }
 
   try {
-    let unattendedSourceTabId = await resolveCaptureTaskSourceTabId({
+    unattendedSourceTabId = await resolveCaptureTaskSourceTabId({
       preferredTabId: switchResult?.data?.tabId,
       platform,
     });
@@ -17647,30 +17811,93 @@ async function runUnattendedKeywordPlanRequest(request) {
     // Debug taskId。控制页只是观察与编排 UI，不再拥有任务生命周期。
     unattendedCaptureTaskContext.taskId = `unattended-capture:${requestId}`;
     const startUnattendedCaptureTaskSession = async (sourceTabId) => {
-      try {
-        await startRequiredCaptureTaskSession({
-          taskId: unattendedCaptureTaskContext.taskId,
-          tabId: sourceTabId,
-          label: `${executionCopy.captureLabel} · ${keywords.length} 个关键词`,
-          platform,
-          ownerRequired: false,
-          attemptId: requestAttemptId,
+      let lastError = null;
+      for (
+        let attempt = 1;
+        attempt <= UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
+        attempt += 1
+      ) {
+        const attemptMessage =
+          attempt === 1
+            ? "正在建立浏览器采集接管"
+            : `正在第 ${attempt}/${UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS} 次建立浏览器采集接管`;
+        await reportAutomaticRecoveryStage({
+          phase: "starting_capture_session",
+          message: attemptMessage,
+          attemptCurrent: attempt,
+          attemptTotal: UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
+          retried: Math.max(0, attempt - 1),
         });
-      } catch (error) {
-        const code =
-          String(error?.code || "").trim() ||
-          "CAPTURE_TASK_START_FAILED";
-        const message = String(
-          error?.message || "无法启动浏览器 AI Debug 接管",
-        ).trim();
-        const startError = new Error(
-          `AI Debug 启动失败（${code}）：${message}`,
-        );
-        startError.code = code;
-        startError.cause = error;
-        throw startError;
+        try {
+          await startRequiredCaptureTaskSession({
+            taskId: unattendedCaptureTaskContext.taskId,
+            tabId: sourceTabId,
+            label: `${executionCopy.captureLabel} · ${keywords.length} 个关键词`,
+            platform,
+            ownerRequired: false,
+            attemptId: requestAttemptId,
+          });
+          unattendedCaptureTaskSessionStarted = true;
+          return;
+        } catch (error) {
+          lastError = error;
+          const code = String(error?.code || "").trim();
+          const retryable = UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES.has(code);
+          if (
+            !retryable ||
+            attempt >= UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS
+          ) {
+            break;
+          }
+          const delayMs = Math.max(
+            0,
+            Number(
+              UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS[attempt - 1] ??
+                UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS.at(-1),
+            ) || 0,
+          );
+          const waitUntil = new Date(Date.now() + delayMs).toISOString();
+          const nextAttempt = attempt + 1;
+          const waitMessage = `浏览器采集资源暂时占用，第 ${nextAttempt}/${UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS} 次接管将在倒计时结束后开始`;
+          await reportAutomaticRecoveryStage({
+            phase: "waiting_capture_session_retry",
+            message: waitMessage,
+            attemptCurrent: nextAttempt,
+            attemptTotal: UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
+            waitUntil,
+            remainingMs: delayMs,
+            retried: attempt,
+          });
+          await sleepWithStop(delayMs, () =>
+            activeUnattendedAttemptRejected ||
+            !isCurrentRequestAttempt() ||
+            batchKeywordCancelRequested ||
+            Boolean(activeCaptureTaskCancellationReason),
+          );
+          if (
+            activeUnattendedAttemptRejected ||
+            !isCurrentRequestAttempt() ||
+            batchKeywordCancelRequested ||
+            Boolean(activeCaptureTaskCancellationReason)
+          ) {
+            const canceledError = new Error("无人值守浏览器接管恢复已取消");
+            canceledError.code = "UNATTENDED_ATTEMPT_CANCELED";
+            throw canceledError;
+          }
+        }
       }
-      unattendedCaptureTaskSessionStarted = true;
+      const code =
+        String(lastError?.code || "").trim() ||
+        "CAPTURE_TASK_START_FAILED";
+      const message = String(
+        lastError?.message || "无法启动浏览器 AI Debug 接管",
+      ).trim();
+      const startError = new Error(
+        `AI Debug 启动失败（${code}）：${message}`,
+      );
+      startError.code = code;
+      startError.cause = lastError;
+      throw startError;
     };
     // 抖音首个 /jingxuan -> /search 导航可能触发 Chrome Tab replacement。
     // 先让合成状态页保持可见，等拿到 replacement 后的最终 Tab id 再建立
@@ -17728,38 +17955,28 @@ async function runUnattendedKeywordPlanRequest(request) {
         !isCurrentRequestAttempt() ||
         batchKeywordCancelRequested ||
         Boolean(activeCaptureTaskCancellationReason),
-      onRetry: async ({nextAttempt, maxAttempts}) => {
-        const retryMessage = `检测到搜索页被切走或尚未加载，正在重新打开「${resumeKeyword}」（${nextAttempt}/${maxAttempts}）`;
-        const retryProgress = {
-          ...startingProgress,
-          attempt: nextAttempt,
+      onAttempt: async ({attempt, maxAttempts}) => {
+        await reportAutomaticRecoveryStage({
+          phase: "opening_search_page",
+          message:
+            attempt === 1
+              ? `正在打开关键词「${resumeKeyword}」的搜索页`
+              : `正在第 ${attempt}/${maxAttempts} 次打开关键词「${resumeKeyword}」的搜索页`,
+          attemptCurrent: attempt,
+          attemptTotal: maxAttempts,
+          retried: Math.max(0, Number(attempt) - 1),
+        });
+      },
+      onRetry: async ({nextAttempt, maxAttempts, retryDelayMs, waitUntil}) => {
+        await reportAutomaticRecoveryStage({
+          phase: "waiting_search_page_retry",
+          message: `搜索页被切走或尚未就绪，第 ${nextAttempt}/${maxAttempts} 次打开将在倒计时结束后开始`,
           attemptCurrent: nextAttempt,
           attemptTotal: maxAttempts,
-          maxAttempts,
-          phase: "recovering_search_page",
-          message: retryMessage,
-          updatedAt: new Date().toISOString(),
-        };
-        rememberCaptureTaskProgressContext(retryProgress);
-        showMessage(retryMessage, "warning");
-        await reportUnattendedKeywordRun(
-          requestId,
-          {
-            status: "running",
-            checkpoint,
-            counts: buildUnattendedTaskCounts(
-              checkpoint,
-              summarizeUnattendedKeywordCheckpoint(checkpoint),
-              {
-                total: plannedTaskTotal,
-                retried: Math.max(0, Number(nextAttempt) - 1),
-              },
-            ),
-            message: retryMessage,
-            progress: retryProgress,
-          },
-          {attemptId: requestAttemptId},
-        );
+          waitUntil,
+          remainingMs: retryDelayMs,
+          retried: Math.max(0, Number(nextAttempt) - 1),
+        });
       },
     });
     const finalSourceTabId = Number(navigationResult?.tabId);
@@ -17894,6 +18111,10 @@ async function runUnattendedKeywordPlanRequest(request) {
       captureTaskSessionStarted: unattendedCaptureTaskSessionStarted,
       captureTaskLifecycleOwnedByCaller:
         unattendedCaptureTaskSessionStarted,
+      releaseElasticItemOnLongRetry: Boolean(
+        request?.cloudAssigned === true &&
+          request?.orchestrationContext?.distributionMode === "elastic_pool",
+      ),
     });
     if (!batchRunResult?.started) {
       throw new Error(batchRunResult?.reason || "采集流程未启动");
@@ -18053,6 +18274,8 @@ async function runUnattendedKeywordPlanRequest(request) {
     unattendedCaptureTaskError = error;
     if (!activeUnattendedAttemptRejected) {
       const safetyBlocked = isUnattendedSafetyBlock(error);
+      const elasticItemReleased =
+        error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED";
       const bootstrapFailed =
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED";
       const bootstrapCanceled =
@@ -18063,7 +18286,63 @@ async function runUnattendedKeywordPlanRequest(request) {
             `${executionCopy.taskLabel}已取消`,
           )
         : null;
-      const needsAction = safetyBlocked || bootstrapFailed;
+      const elasticQueueAssigned = Boolean(
+        request?.cloudAssigned === true &&
+          request?.orchestrationContext?.distributionMode === "elastic_pool",
+      );
+      const elasticCooldownRelease = Boolean(
+        elasticQueueAssigned && (elasticItemReleased || bootstrapFailed),
+      );
+      let cooldownHomeResult = null;
+      if (elasticCooldownRelease) {
+        if (
+          unattendedCaptureTaskSessionStarted &&
+          unattendedCaptureTaskContext
+        ) {
+          const captureTaskEnd = await endCaptureTaskSession({
+            taskId: unattendedCaptureTaskContext.taskId,
+            status: "failed",
+            reason: "elastic_item_released_for_handoff",
+          }).catch(() => null);
+          const captureTaskEnded =
+            captureTaskEnd?.ok === true ||
+            captureTaskEnd?.reason === "capture_task_not_found" ||
+            captureTaskEnd?.response?.error?.code ===
+              "capture_task_not_found";
+          if (captureTaskEnded) {
+            releaseCaptureTaskOwner(unattendedCaptureTaskContext.taskId);
+            unattendedCaptureTaskSessionStarted = false;
+          }
+        }
+        cooldownHomeResult = await returnUnattendedAgentToCooldownHome({
+          tabId: unattendedSourceTabId,
+          platform,
+        });
+        const releasedKeyword = String(
+          error?.keyword || resumeKeyword || "",
+        ).trim();
+        const releasedEntry = (
+          Array.isArray(checkpoint?.keywordResults)
+            ? checkpoint.keywordResults
+            : []
+        ).find(
+          (entry) => String(entry?.keyword || "").trim() === releasedKeyword,
+        );
+        if (releasedEntry) {
+          Object.assign(releasedEntry, {
+            itemLockReleased: true,
+            sourceAgentCooling: true,
+            cooldownHomeRestored: cooldownHomeResult?.ok === true,
+            cooldownHomeUrl: String(cooldownHomeResult?.homeUrl || ""),
+          });
+        }
+      }
+      const cloudTechnicalRecovery = Boolean(
+        request?.cloudAssigned === true &&
+          (bootstrapFailed || elasticItemReleased),
+      );
+      const needsAction =
+        safetyBlocked || (bootstrapFailed && !cloudTechnicalRecovery);
       const terminalStatus = cancellation?.status ||
         (needsAction ? "needs_action" : "failed");
       unattendedCaptureTaskStatus =
@@ -18073,8 +18352,12 @@ async function runUnattendedKeywordPlanRequest(request) {
             ? "completed_with_failures"
             : "failed";
       const failureSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
-      const terminalMessage = bootstrapFailed
-        ? `自动恢复搜索页 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次仍未就绪，请在任务中心点击继续`
+      const terminalMessage = elasticItemReleased
+        ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 进入冷却${cooldownHomeResult?.ok ? "并已返回平台首页" : ""}`
+        : cloudTechnicalRecovery
+        ? `搜索页经过 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次分散恢复仍未就绪，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
+        : bootstrapFailed
+          ? `搜索页经过 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次分散恢复仍未就绪，请检查设备网络后继续`
         : cancellation?.message || error.message;
       showMessage(
         terminalStatus === "canceled"
@@ -18109,6 +18392,31 @@ async function runUnattendedKeywordPlanRequest(request) {
                     ? "PLATFORM_SAFETY_BLOCK"
                     : error?.code || "",
                   message: terminalMessage,
+                  ...(cloudTechnicalRecovery
+                    ? {
+                        retryable: true,
+                        requiresManualAction: false,
+                        category: elasticItemReleased
+                          ? "elastic_item_handoff"
+                          : "temporary_page_readiness",
+                        ...(elasticCooldownRelease
+                          ? {
+                              itemLockReleased: true,
+                              sourceAgentCooling: true,
+                              retryAfterMs: Math.max(
+                                0,
+                                Number(error?.retryAfterMs) || 0,
+                              ),
+                              retryAt: String(error?.retryAt || ""),
+                              cooldownHomeRestored:
+                                cooldownHomeResult?.ok === true,
+                              cooldownHomeUrl: String(
+                                cooldownHomeResult?.homeUrl || "",
+                              ),
+                            }
+                          : {}),
+                      }
+                    : {}),
                 },
         },
         {attemptId: requestAttemptId},
