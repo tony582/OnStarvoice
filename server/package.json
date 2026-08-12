@@ -5,6 +5,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "zsh ../scripts/check-extension-snapshot.zsh && node ../scripts/run-node-regression-tests.mjs",
+    "test:integration": "node ../scripts/run-postgres-integration-tests.mjs",
+    "check:syntax": "find . -path './node_modules' -prune -o -type f -name '*.js' -print0 | xargs -0 -n 1 node --check",
     "start": "node index.js",
     "dev": "node --watch index.js",
     "migrate": "node db/migrate.js",

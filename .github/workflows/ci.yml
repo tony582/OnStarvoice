@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Tests and builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            web/admin/package-lock.json
+            web/dashboard/package-lock.json
+
+      - name: Install locked dependencies
+        run: |
+          npm --prefix server ci
+          npm --prefix web/admin ci
+          npm --prefix web/dashboard ci
+
+      - name: Check repository hygiene
+        run: node scripts/check-repository-hygiene.mjs
+
+      - name: Check pull request whitespace
+        if: github.event_name == 'pull_request'
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+
+      - name: Check pushed commit range whitespace
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            git show --check --format= "$AFTER_SHA"
+          else
+            git diff --check "$BEFORE_SHA..$AFTER_SHA"
+          fi
+
+      - name: Check manually dispatched commit whitespace
+        if: github.event_name == 'workflow_dispatch'
+        run: git show --check --format= HEAD
+
+      - name: Check server syntax
+        run: npm --prefix server run check:syntax
+
+      - name: Run full Node.js regression suite
+        run: npm --prefix server test
+
+      - name: Check Admin lint debt
+        run: node scripts/check-admin-lint-baseline.mjs
+
+      - name: Build Admin
+        run: npm --prefix web/admin run build
+
+      - name: Lint Dashboard
+        run: npm --prefix web/dashboard run lint
+
+      - name: Build Dashboard
+        run: npm --prefix web/dashboard run build
+
+      - name: Confirm checks did not mutate tracked files
+        run: git diff --exit-code
+
+  postgres-integration:
+    name: PostgreSQL ${{ matrix.postgres }} integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres:
+          - '14'
+          - '16'
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_DB: onstarvoice_ci
+          POSTGRES_USER: onstarvoice
+          POSTGRES_PASSWORD: onstarvoice-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U onstarvoice -d onstarvoice_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      NODE_ENV: test
+      TEST_DATABASE_URL: postgresql://onstarvoice:onstarvoice-ci-only@127.0.0.1:5432/onstarvoice_ci
+      ALLOW_RESET_MIGRATIONS: '0'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install locked server dependencies
+        run: npm --prefix server ci
+
+      - name: Run isolated PostgreSQL integration tests
+        run: npm --prefix server run test:integration
