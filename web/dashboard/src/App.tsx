@@ -1,13 +1,65 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, type ReactNode } from 'react'
 import {
   Moon, Sun, LogOut, Search, ChevronLeft, ChevronRight,
   TrendingUp, AlertTriangle, Database, Tag, BarChart3,
   Loader2, Inbox, ExternalLink,
 } from 'lucide-react'
-import { clsx } from 'clsx'
+import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 
-function cn(...inputs: any[]) { return twMerge(clsx(inputs)) }
+function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)) }
+
+type ApiOptions = Omit<RequestInit, 'body' | 'headers'> & {
+  body?: unknown
+  headers?: Record<string, string>
+}
+
+type NumericValue = number | string | null | undefined
+
+interface LoginResponse {
+  ok: boolean
+  owner?: string
+  message?: string
+}
+
+interface DashboardStats {
+  total?: NumericValue
+  periodNew?: NumericValue
+  negative?: NumericValue
+  pendingLabel?: NumericValue
+  monitoring?: NumericValue
+}
+
+interface RecordRow {
+  id: number | string
+  platform: string
+  created_at: string
+  title?: string | null
+  author_name?: string | null
+  sentiment?: string | null
+  category?: string | null
+  likes?: NumericValue
+  comments_count?: NumericValue
+  collects?: NumericValue
+  url?: string | null
+  content?: string | null
+  ai_summary?: string | null
+}
+
+interface Pagination {
+  page: number
+  total: NumericValue
+  totalPages: number
+}
+
+interface RecordsResponse {
+  records?: RecordRow[]
+  pagination?: Pagination | null
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
 
 const SL: Record<string, string> = { positive: '正面', neutral: '中性', negative: '负面' }
 const PL: Record<string, string> = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' }
@@ -22,7 +74,7 @@ const TONE: Record<string, string> = {
   neutral: 'bg-blue-500/10 text-blue-600',
 }
 
-function Badge({ tone, children }: { tone?: string; children: React.ReactNode }) {
+function Badge({ tone, children }: { tone?: string; children: ReactNode }) {
   const cls = (tone && TONE[tone]) || 'bg-muted text-muted-foreground'
   return <span className={cn('inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold', cls)}>{children}</span>
 }
@@ -30,10 +82,10 @@ function Badge({ tone, children }: { tone?: string; children: React.ReactNode })
 /* ---- API ---- */
 let authCode = ''
 
-async function api<T = any>(path: string, opts: any = {}): Promise<T> {
+async function api<T>(path: string, opts: ApiOptions = {}): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-auth-code': authCode, ...opts.headers }
   const resp = await fetch('/api/user' + path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined })
-  return resp.json()
+  return resp.json() as Promise<T>
 }
 
 /* ---- Theme Toggle ---- */
@@ -64,14 +116,14 @@ function LoginView({ onLogin }: { onLogin: (owner: string) => void }) {
     setError(''); setLoading(true)
     authCode = code.trim()
     try {
-      const data = await api<any>('/login', { method: 'POST', body: { code: code.trim() } })
+      const data = await api<LoginResponse>('/login', { method: 'POST', body: { code: code.trim() } })
       if (data.ok) {
         localStorage.setItem('osv_user_code', code.trim())
         onLogin(data.owner || code.trim().slice(0, 8))
       } else {
         setError(data.message || '激活码无效')
       }
-    } catch (e: any) { setError('连接失败: ' + e.message) }
+    } catch (error: unknown) { setError('连接失败: ' + errorMessage(error)) }
     finally { setLoading(false) }
   }
 
@@ -102,31 +154,34 @@ function LoginView({ onLogin }: { onLogin: (owner: string) => void }) {
 
 /* ==================== Main Dashboard ==================== */
 function DashboardView({ owner }: { owner: string }) {
-  const [stats, setStats] = useState<any>(null)
-  const [records, setRecords] = useState<any[]>([])
-  const [pagination, setPagination] = useState<any>(null)
+  const [stats, setStats] = useState<DashboardStats | null>(null)
+  const [records, setRecords] = useState<RecordRow[]>([])
+  const [pagination, setPagination] = useState<Pagination | null>(null)
   const [platform, setPlatform] = useState('')
   const [sentiment, setSentiment] = useState('')
   const [keyword, setKeyword] = useState('')
-  const [selected, setSelected] = useState<any>(null)
+  const [selected, setSelected] = useState<RecordRow | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    api<any>('/stats?days=7').then(setStats).catch(console.error)
+    api<DashboardStats>('/stats?days=7').then(setStats).catch(console.error)
   }, [])
 
   const loadRecords = useCallback(async (page = 1) => {
     setLoading(true)
     const params = new URLSearchParams({ page: String(page), pageSize: '30', platform, sentiment, keyword })
-    const data = await api<any>('/records?' + params)
+    const data = await api<RecordsResponse>('/records?' + params)
     setRecords(data.records || [])
     setPagination(data.pagination || null)
     setLoading(false)
   }, [platform, sentiment, keyword])
 
-  useEffect(() => { loadRecords() }, [loadRecords])
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadRecords() }, 0)
+    return () => window.clearTimeout(timer)
+  }, [loadRecords])
 
-  const fmt = (v: any) => { const n = Number(v); return isNaN(n) ? '0' : n >= 10000 ? (n / 10000).toFixed(1) + '万' : n.toLocaleString() }
+  const fmt = (value: unknown) => { const n = Number(value); return Number.isNaN(n) ? '0' : n >= 10000 ? (n / 10000).toFixed(1) + '万' : n.toLocaleString() }
 
   const KPI = [
     { label: '总记录', value: stats?.total, icon: Database },
@@ -210,7 +265,7 @@ function DashboardView({ owner }: { owner: string }) {
                   <th className="px-4 py-3 text-right text-[11px] font-bold uppercase tracking-wide text-muted-foreground">链接</th>
                 </tr></thead>
                 <tbody className="divide-y divide-border">
-                  {records.map((r: any) => (
+                  {records.map(r => (
                     <tr key={r.id} className="cursor-pointer transition hover:bg-muted/30" onClick={() => setSelected(r)}>
                       <td className="max-w-sm px-4 py-3">
                         <div className="flex items-center gap-2">
@@ -221,7 +276,7 @@ function DashboardView({ owner }: { owner: string }) {
                       </td>
                       <td className="whitespace-nowrap px-4 py-3">{r.author_name || '-'}</td>
                       <td className="px-4 py-3">
-                        <Badge tone={r.sentiment}>{SL[r.sentiment] || '待标注'}</Badge>
+                        <Badge tone={r.sentiment || undefined}>{SL[r.sentiment || ''] || '待标注'}</Badge>
                         {r.category && <div className="mt-1"><Badge>{CL[r.category] || r.category}</Badge></div>}
                       </td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{fmt(r.likes)}/{fmt(r.comments_count)}/{fmt(r.collects)}</td>
@@ -258,7 +313,7 @@ function DashboardView({ owner }: { owner: string }) {
             </div>
             <div className="mb-3 flex flex-wrap gap-2">
               <Badge tone="neutral">{PL[selected.platform] || selected.platform}</Badge>
-              <Badge tone={selected.sentiment}>{SL[selected.sentiment] || '待标注'}</Badge>
+              <Badge tone={selected.sentiment || undefined}>{SL[selected.sentiment || ''] || '待标注'}</Badge>
               {selected.category && <Badge>{CL[selected.category] || selected.category}</Badge>}
             </div>
             <p className="mb-4 whitespace-pre-wrap text-sm leading-relaxed">{selected.content || selected.ai_summary || '无内容'}</p>
@@ -275,20 +330,17 @@ function DashboardView({ owner }: { owner: string }) {
 
 /* ==================== App ==================== */
 export default function App() {
+  const [savedCode] = useState(() => localStorage.getItem('osv_user_code'))
   const [owner, setOwner] = useState<string | null>(null)
-  const [checking, setChecking] = useState(true)
+  const [checking, setChecking] = useState(() => Boolean(savedCode))
 
   useEffect(() => {
-    const saved = localStorage.getItem('osv_user_code')
-    if (saved) {
-      authCode = saved
-      api<any>('/login', { method: 'POST', body: { code: saved } })
-        .then(d => { if (d.ok) setOwner(d.owner || saved.slice(0, 8)); })
-        .finally(() => setChecking(false))
-    } else {
-      setChecking(false)
-    }
-  }, [])
+    if (!savedCode) return
+    authCode = savedCode
+    api<LoginResponse>('/login', { method: 'POST', body: { code: savedCode } })
+      .then(data => { if (data.ok) setOwner(data.owner || savedCode.slice(0, 8)) })
+      .finally(() => setChecking(false))
+  }, [savedCode])
 
   if (checking) return <div className="flex min-h-screen items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>
   if (!owner) return <LoginView onLogin={setOwner} />
