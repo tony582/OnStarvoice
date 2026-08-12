@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.79',
+  latestVersion: '0.3.80',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-12',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.79-20260812.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.80-20260812.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.80',
+      releaseDate: '2026-08-12',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: 'Agent 每日采集与安全验证统计',
+              desc: '搜索、增强、采集和结果数量统一归属实际执行 Agent，并上报验证码、登录验证与平台风控证据；未绑定社交账号也会正常计数。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.79',
       releaseDate: '2026-08-12',

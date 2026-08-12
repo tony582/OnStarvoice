@@ -178,9 +178,29 @@ export type Overview = {
     onlineAgents: number
     runningTasks: number
     attentionTasks: number
+    historyTasks?: number
     aiActive?: number
     aiQueued?: number
     aiConcurrencyLimit?: number
+  }
+}
+
+export type TaskHistoryResponse = {
+  ok: true
+  tasks: CloudTask[]
+  pagination: {
+    page: number
+    pageSize: number
+    total: number
+    totalPages: number
+  }
+  filters?: {
+    q?: string
+    platform?: string
+    status?: string
+    from?: string
+    to?: string
+    days?: number
   }
 }
 

@@ -111,6 +111,8 @@ export type OrchestrationExecutionRecord = {
   agent_app_version?: string
   agent_status?: string
   agent_last_heartbeat_at?: string | null
+  progress?: Record<string, unknown> | null
+  checkpoint?: Record<string, unknown> | null
   command_status?: string
   command_expires_at?: string | null
   created_at?: string | null
@@ -129,6 +131,8 @@ export type OrchestrationAttemptRecord = {
   taskId?: string
   attempt_number?: number
   status?: string
+  agent_display_name?: string
+  agentDisplayName?: string
   error?: Record<string, unknown> | null
   created_at?: string | null
   updated_at?: string | null
@@ -159,6 +163,10 @@ export type OrchestrationScheduleRecord = {
   last_error?: Record<string, unknown> | null
   run_count?: number
   revision?: number
+  archived_at?: string | null
+  archived_by_user_id?: string | null
+  archived_by_name?: string
+  archived_previous_status?: string | null
   [key: string]: unknown
 }
 
@@ -212,6 +220,8 @@ export type OrchestrationComposerDrawerProps = {
   initialAgentIds?: string[]
   /** 传入已发布的云端计划详情时，复用同一配置器编辑原计划，不创建新计划。 */
   editingPlan?: OrchestrationDetailResponse | null
+  /** 传入归档计划详情时，只预填配置并创建一个独立的新计划。 */
+  copyingPlan?: OrchestrationDetailResponse | null
   onClose: () => void
   onDispatched?: (result: OrchestrationDispatchResult) => void | Promise<void>
   onPlanUpdated?: (result: OrchestrationScheduleUpdateResult) => void | Promise<void>

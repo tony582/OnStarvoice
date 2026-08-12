@@ -29,6 +29,7 @@ test('record notes are append-only and remain in one processing timeline and exp
   assert.match(drawer, /<ActivityTimeline items=\{activity\}/);
   assert.match(triage, /string_agg\(/);
   assert.match(triage, /FROM record_notes rn/);
+  assert.match(triage, /\|\| ' 状态备注：' \|\| \(al\.metadata->>'note'\) AS line/);
   assert.match(triage, /header: '处理记录'/);
   assert.match(triage, /wrapText: true/);
 });

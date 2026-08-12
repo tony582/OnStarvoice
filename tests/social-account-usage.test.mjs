@@ -105,6 +105,7 @@ test("extension usage events distinguish search, enhancement, runs, and captured
     captureRuns: 1,
     capturedItems: 2,
     succeeded: true,
+    safetyVerification: false,
     occurredAt: event.occurredAt,
     accountIdentity: {
       platformAccountId: "account-a",
@@ -141,6 +142,32 @@ test("display name alone is not used as a durable account identity", async () =>
     observedAccount: {displayName: "页面里可能重复出现的昵称"},
   });
   assert.equal(event.accountIdentity, null);
+});
+
+test("extension usage events preserve explicit platform safety evidence", async () => {
+  const usage = await loadUsageUtility();
+  const event = usage.buildUsageEventFromRelay({
+    action: "captureKeywordNotes",
+    platform: "douyin",
+    response: {
+      ok: false,
+      platformSafetyBlocked: true,
+      error: {
+        code: "SECURITY_VERIFICATION_REQUIRED",
+        message: "检测到抖音图片安全验证",
+      },
+    },
+  });
+  assert.equal(event.safetyVerification, true);
+  assert.equal(event.succeeded, false);
+
+  const thrownError = new Error("当前页面触发安全验证");
+  const thrownEvent = usage.buildUsageEventFromRelay({
+    action: "captureKeywordNotes",
+    platform: "xiaohongshu",
+    error: thrownError,
+  });
+  assert.equal(thrownEvent.safetyVerification, true);
 });
 
 test("offline usage queue is idempotent and acknowledges only accepted event ids", async () => {
@@ -297,11 +324,19 @@ test("manual Agent binding cannot be overwritten by a conflicting heartbeat", as
   );
 });
 
-test("unassigned usage remains queued instead of being acknowledged and lost", async () => {
+test("unbound Agent usage is persisted and acknowledged without an account", async () => {
+  const executed = [];
   const tx = {
     async queryOne(sql) {
       if (sql.includes("FROM social_account_bindings b")) return null;
+      if (sql.includes("INSERT INTO social_account_usage_events")) {
+        return {id: 1};
+      }
       throw new Error(`unexpected query: ${sql}`);
+    },
+    async execute(sql, params) {
+      executed.push({sql, params});
+      return null;
     },
   };
   const result = await processSocialAccountHeartbeat(tx, {
@@ -317,12 +352,16 @@ test("unassigned usage remains queued instead of being acknowledged and lost", a
       },
     }],
   });
-  assert.deepEqual(result.acceptedUsageEventIds, []);
+  assert.deepEqual(result.acceptedUsageEventIds, ["usage-unassigned"]);
+  assert.equal(executed.length, 1);
+  assert.match(executed[0].sql, /INSERT INTO social_agent_daily_usage/u);
+  assert.equal(executed[0].params[1], "agent-unassigned");
 });
 
-test("schema, heartbeat, tenant api, and admin page are wired as one account-health flow", async () => {
+test("schema, heartbeat, tenant api, and admin page are wired as one Agent-first daily-health flow", async () => {
   const [
     migration,
+    agentDailyMigration,
     bindingModeMigration,
     captureRoute,
     accountRoute,
@@ -335,6 +374,7 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
     navigation,
   ] = await Promise.all([
     source("server/db/migrations/045_social_account_usage.sql"),
+    source("server/db/migrations/063_social_agent_daily_health.sql"),
     source("server/db/migrations/047_social_account_binding_mode.sql"),
     source("server/routes/capture-cloud.js"),
     source("server/routes/social-accounts.js"),
@@ -356,6 +396,11 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
     assert.match(migration, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
   }
   assert.match(migration, /UNIQUE \(tenant_id, event_id\)/u);
+  assert.match(agentDailyMigration, /ALTER COLUMN social_account_id DROP NOT NULL/u);
+  assert.match(agentDailyMigration, /CREATE TABLE IF NOT EXISTS social_agent_daily_usage/u);
+  assert.match(agentDailyMigration, /Asia\/Shanghai/u);
+  assert.match(agentDailyMigration, /ALTER COLUMN agent_binding_mode SET DEFAULT 'manual'/u);
+  assert.match(agentDailyMigration, /WHERE agent_binding_mode <> 'manual'/u);
   assert.match(bindingModeMigration, /agent_binding_mode/u);
   assert.match(bindingModeMigration, /'auto', 'manual'/u);
   assert.match(bindingModeMigration, /invalidIdentityArchived/u);
@@ -364,6 +409,10 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
   assert.match(captureRoute, /acceptedSocialUsageEventIds/u);
   assert.match(accountRoute, /router\.get\(\s*'\/overview'/u);
   assert.match(accountRoute, /registered_phone/u);
+  assert.match(accountRoute, /FROM social_agent_daily_usage du/u);
+  assert.match(accountRoute, /today_safety_verifications/u);
+  assert.match(accountRoute, /task\.source_updated_at/u);
+  assert.match(accountRoute, /task\.error::text ~\* \$2/u);
   assert.match(accountRoute, /router\.put\(\s*'\/:id\/bindings'/u);
   assert.match(accountRoute, /agent_binding_mode = \$1/u);
   assert.match(accountRoute, /bindingModeAtUnbind', \$5::text/u);
@@ -382,17 +431,12 @@ test("schema, heartbeat, tenant api, and admin page are wired as one account-hea
   assert.match(background, /schemaVersion:\s*2/u);
   assert.match(background, /remove\(STORAGE_KEYS\.observedSocialAccounts\)/u);
   assert.match(cloudAgent, /socialAccountDailyUsage:\s*true/u);
-  assert.match(page, /今天哪些账号该继续，哪些该休息/u);
-  assert.match(
-    page,
-    /knownAgents[\s\S]*agent\.status === 'active' \|\| agent\.status === 'paused'/u,
-  );
-  assert.match(page, /建议休息/u);
-  assert.match(page, /bindingMode: form\.agentBindingMode/u);
-  assert.match(page, /api\.put\(`\/social-accounts\/\$\{accountId\}\/bindings`/u);
-  assert.match(page, /手动指定/u);
-  assert.match(page, /未勾选的 Agent 不会被心跳自动加回/u);
-  assert.match(page, /已移出或停用，请取消/u);
+  assert.match(page, /今天每个 Agent 跑了多少，有没有安全验证/u);
+  assert.match(page, /每天 00:00 按上海自然日进入新一天/u);
+  assert.match(page, /社交账号只作可选信息，不影响计数/u);
+  assert.match(page, /未登记账号，不影响 Agent 搜索、采集和安全验证统计/u);
+  assert.match(page, /每个平台最多 1 个/u);
+  assert.match(page, /api\.post\(`\/social-accounts\/\$\{accountId\}\/bindings`/u);
   assert.match(desktop, /'social-accounts': SocialAccountsPage/u);
   assert.match(mobile, /'social-accounts': SocialAccountsPage/u);
   assert.match(navigation, /'social-accounts': 'opinion'/u);

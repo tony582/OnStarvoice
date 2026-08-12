@@ -428,7 +428,7 @@ function MonitorHub({ openPage }: { openPage: OpenPage }) {
         )}
         <section className="space-y-2">
           <MonitorCard icon={ServerCog} kicker="设备" title="调度中心" badge="BETA" copy="查看各浏览器节点的实时进度，并远程继续中断任务" action="打开调度中心" onClick={() => openPage('dispatch')} tone="blue" />
-          <MonitorCard icon={Users} kicker="账号" title="社交账号负载" copy="查看每个登录账号今天的搜索、增强和采集次数，及时安排休息" action="管理账号负载" onClick={() => openPage('social-accounts')} tone="blue" />
+          <MonitorCard icon={Users} kicker="Agent" title="Agent 今日运行" copy="查看每个 Agent 今天的搜索、采集和安全验证；账号登记不影响统计" action="查看 Agent 运行" onClick={() => openPage('social-accounts')} tone="blue" />
           <MonitorCard icon={Activity} kicker="动态" title="关注对象的新内容" copy="按时间线查看最新命中、互动与情感变化" action="看新动态" onClick={() => openPage('monitoring', { tab: 'hits' })} />
           <MonitorCard icon={Bell} kicker="事件" title="正在扩散的风险事件" copy="沿事件时间线查看关联内容和当前处置状态" action="进事件中心" onClick={() => openPage('events')} tone="red" />
           <MonitorCard icon={Radio} kicker="关注" title="监测对象与运行状态" copy="查看频率、最近运行、异常原因并立即扫描" action="管理关注" onClick={() => openPage('monitoring', { tab: 'tasks' })} tone="blue" />
@@ -506,7 +506,7 @@ const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
   { label: '业务能力', items: [
     { title: '官方社媒', subtitle: '帖子趋势、评论情绪与运营建议', icon: MessageCircle, page: 'official-comments' },
     { title: '销售客资', subtitle: '购买意向跟进与处理', icon: User, page: 'salesleads' },
-    { title: '社交账号', subtitle: '登录账号、Agent 绑定与每日负载', icon: Users, page: 'social-accounts' },
+    { title: '社交账号', subtitle: 'Agent 每日用量、安全验证与可选账号信息', icon: Users, page: 'social-accounts' },
     { title: '事件中心', subtitle: '严重度、状态与关联内容时间线', icon: Bell, page: 'events' },
   ] },
   { label: '平台管理', items: [

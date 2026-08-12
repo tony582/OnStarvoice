@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Archive, CheckCircle2, ClipboardList,
-  History, ListChecks, Loader2, Plus, RefreshCw,
+  ListChecks, Loader2, Plus, RefreshCw,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
@@ -14,6 +14,7 @@ import {
 import { AgentRail } from './cloud-tasks/AgentRail'
 import { CreateTaskDrawer } from './cloud-tasks/CreateTaskDrawer'
 import { PlansView } from './cloud-tasks/PlansView'
+import { HistoryView } from './cloud-tasks/HistoryView'
 import { TaskCard } from './cloud-tasks/TaskCard'
 import type {
   CloudAgent,
@@ -49,6 +50,7 @@ export function DispatchPage() {
   const [actionError, setActionError] = useState('')
   const [actionTaskId, setActionTaskId] = useState('')
   const [planActionAgentId, setPlanActionAgentId] = useState('')
+  const [templateActionId, setTemplateActionId] = useState('')
   const [agentActionId, setAgentActionId] = useState('')
   const [taskView, setTaskView] = useState<TaskView>(
     () => params?.view === 'attention' ? 'attention' : 'active',
@@ -65,6 +67,7 @@ export function DispatchPage() {
   )
   const [orchestrationLaunchIntent, setOrchestrationLaunchIntent] = useState<OrchestrationLaunchIntent | null>(null)
   const [editingOrchestrationPlan, setEditingOrchestrationPlan] = useState<OrchestrationDetailResponse | null>(null)
+  const [copyingOrchestrationPlan, setCopyingOrchestrationPlan] = useState<OrchestrationDetailResponse | null>(null)
   const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(
     () => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
       String(params?.orchestrationId || ''),
@@ -73,6 +76,8 @@ export function DispatchPage() {
       : null,
   )
   const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
+  const [historyTotal, setHistoryTotal] = useState<number | null>(null)
   const loadGeneration = useRef(0)
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
 
@@ -188,7 +193,6 @@ export function DispatchPage() {
       const status = task.effective_status || task.status
       if (taskView === 'active') return ACTIVE_TASK_STATUSES.has(status)
       if (taskView === 'attention') return isAttentionTask(task)
-      if (taskView === 'history') return !ACTIVE_TASK_STATUSES.has(status) && !isAttentionTask(task)
       return false
     }).sort((left, right) => {
       const leftTime = new Date(left.created_at || left.updated_at || left.finished_at || 0).getTime()
@@ -205,8 +209,9 @@ export function DispatchPage() {
       else if (isAttentionTask(task)) counts.attention += 1
       else counts.history += 1
     }
+    counts.history = historyTotal ?? Number(overview?.summary.historyTasks || counts.history)
     return counts
-  }, [queueTasks])
+  }, [historyTotal, overview?.summary.historyTasks, queueTasks])
 
   const configuredPlanAgentCount = useMemo(
     () => operationalAgents.filter(agent => hasConfiguredUnattendedPlan(agent.unattended_plan)).length,
@@ -340,6 +345,59 @@ export function DispatchPage() {
     }
   }
 
+  const archiveTemplate = async (task: CloudTask) => {
+    if (!window.confirm(
+      `确定删除计划“${task.title || '未命名计划'}”吗？计划会进入归档并停止后续排期；正在执行的批次、历史任务和采集结果都会保留。`,
+    )) return
+    setTemplateActionId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/orchestrations/${task.id}/schedule/archive`,
+        {},
+      )
+      setFeedback(result.message || '计划已移入归档')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '归档计划失败')
+    } finally {
+      setTemplateActionId('')
+    }
+  }
+
+  const restoreTemplate = async (task: CloudTask) => {
+    setTemplateActionId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/orchestrations/${task.id}/schedule/restore`,
+        {},
+      )
+      setFeedback(result.message || '计划已恢复为暂停状态')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '恢复计划失败')
+    } finally {
+      setTemplateActionId('')
+    }
+  }
+
+  const copyTemplate = async (task: CloudTask) => {
+    setTemplateActionId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const detail = await api.get<OrchestrationDetailResponse>(`/capture-cloud/orchestrations/${task.id}`)
+      setCopyingOrchestrationPlan(detail)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '读取计划配置失败')
+    } finally {
+      setTemplateActionId('')
+    }
+  }
+
   const deleteAgent = async (agent: CloudAgent) => {
     setAgentActionId(agent.id)
     setFeedback('')
@@ -424,7 +482,7 @@ export function DispatchPage() {
                 )}
               </div>
               <div className="flex shrink-0 items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
+                <Button variant="outline" size="sm" onClick={() => { void load(true); if (taskView === 'history') setHistoryRefreshKey(value => value + 1) }} disabled={refreshing} className="min-h-10">
                   <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
                 </Button>
               <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建任务">
@@ -456,8 +514,24 @@ export function DispatchPage() {
                 onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
                 onEditPlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan', editExisting: true })}
                 onDeletePlan={agent => void deleteUnattendedPlan(agent)}
+                onArchiveTemplate={task => void archiveTemplate(task)}
+                onRestoreTemplate={task => void restoreTemplate(task)}
+                onCopyTemplate={task => void copyTemplate(task)}
+                templateActionId={templateActionId}
                 deletingAgentId={planActionAgentId}
                 pendingDeleteAgentIds={pendingPlanDeleteAgentIds}
+              />
+            ) : taskView === 'history' ? (
+              <HistoryView
+                writable={canWrite()}
+                actionTaskId={actionTaskId}
+                refreshKey={historyRefreshKey}
+                onResume={resume}
+                onRetryOnIdleAgent={retryOnIdleAgent}
+                onStop={stop}
+                onDismissAttention={dismissAttention}
+                onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
+                onTotalChange={setHistoryTotal}
               />
             ) : (
               <>
@@ -473,7 +547,7 @@ export function DispatchPage() {
 
                 {visibleTasks.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-12 text-center xl:flex xl:h-full xl:min-h-[22rem] xl:flex-col xl:justify-center">
-                    {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
+                    {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
                     <div className="mt-3 text-sm font-semibold">{taskView === 'active' ? '当前没有执行中或排队中的任务' : taskView === 'attention' ? '当前没有需要人工处理的任务' : '最近任务中还没有历史记录'}</div>
                     <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">{taskView === 'active' ? '新建任务后分配给 Agent；Agent 离线时任务会保留在云端队列，上线后自动领取。' : taskView === 'attention' ? '中断、失败和部分失败会集中出现在这里。' : '已完成、已停止和已跳过的任务会进入历史。'}</p>
                     {taskView === 'active' && canWrite() && (
@@ -570,6 +644,29 @@ export function DispatchPage() {
           }}
           onPlanUpdated={async result => {
             setFeedback(result.message || '无人值守计划已保存，修改从下一次运行开始生效。')
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+        />
+      )}
+
+      {copyingOrchestrationPlan && (
+        <OrchestrationComposerDrawer
+          open
+          writable={canWrite()}
+          agents={operationalAgents}
+          initialExecutionMode="unattended_plan"
+          lockExecutionMode
+          copyingPlan={copyingOrchestrationPlan}
+          onClose={() => setCopyingOrchestrationPlan(null)}
+          onChanged={async () => {
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+          onDispatched={async result => {
+            setFeedback(result.schedule
+              ? '已从归档配置创建独立的新计划。'
+              : '已从归档配置创建新任务。')
             setOrchestrationRefreshKey(value => value + 1)
             await load(true)
           }}

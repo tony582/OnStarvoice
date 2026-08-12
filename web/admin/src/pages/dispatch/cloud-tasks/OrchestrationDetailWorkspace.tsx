@@ -33,6 +33,7 @@ import type {
 } from './types'
 // 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
+import { KeywordExecutionReport } from './KeywordExecutionReport'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -1653,7 +1654,16 @@ export function OrchestrationDetailWorkspace({
           )}
         </section>
 
-        <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
+        {!negativePatrol && !scheduleTemplate ? (
+          <div className="mt-4">
+            <KeywordExecutionReport
+              items={sortedItems}
+              executions={executions}
+              agents={agents}
+              attempts={attempts}
+            />
+          </div>
+        ) : <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
           <section className="overflow-hidden rounded-2xl border border-border/70 bg-card">
             <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
               <div>
@@ -1770,7 +1780,7 @@ export function OrchestrationDetailWorkspace({
               </p>
             </div>}
           </section>
-        </div>
+        </div>}
       </div>
     </section>
   )

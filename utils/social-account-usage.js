@@ -58,6 +58,37 @@
     );
   }
 
+  const SAFETY_EVIDENCE_PATTERN =
+    /captcha|security.?verification|verification.?required|page.?challenge|security.?challenge|platform.?safety|safety.?block|risk.?control|forbidden|login.?required|auth(?:entication)?.?required|logged.?out|验证码|安全验证|安全限制|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|账号异常|账号限制/iu;
+
+  function containsSafetyEvidence(value, depth = 0) {
+    if (depth > 4 || value == null) return false;
+    if (typeof value === "string") return SAFETY_EVIDENCE_PATTERN.test(value);
+    if (typeof value === "boolean" || typeof value === "number") return false;
+    if (Array.isArray(value)) {
+      return value.slice(0, 30).some(item => containsSafetyEvidence(item, depth + 1));
+    }
+    if (typeof value !== "object") return false;
+    if (
+      [value.code, value.category, value.message, value.reason]
+        .some(candidate =>
+          typeof candidate === "string" &&
+          SAFETY_EVIDENCE_PATTERN.test(candidate),
+        )
+    ) {
+      return true;
+    }
+    return Object.entries(value).slice(0, 80).some(([key, nested]) => {
+      if (
+        /platformSafetyBlocked|platform_safety_blocked|securityBlocked|security_blocked|requiresManualAction|requires_manual_action|loginRequired|login_required/iu.test(key) &&
+        nested === true
+      ) {
+        return true;
+      }
+      return containsSafetyEvidence(nested, depth + 1);
+    });
+  }
+
   function buildUsageEventFromRelay({
     action,
     platform,
@@ -82,6 +113,8 @@
     // captureRuns 只表示列表/页面采集动作，三项指标因此可以独立解释。
     const captureRuns = normalizedAction === "captureSingleNote" ? 0 : 1;
     const capturedItems = capturedItemCount(normalizedAction, response);
+    const safetyVerification =
+      containsSafetyEvidence(error) || containsSafetyEvidence(response);
     const account = objectValue(observedAccount);
     return {
       eventId: createEventId(),
@@ -91,6 +124,7 @@
       captureRuns,
       capturedItems,
       succeeded,
+      safetyVerification,
       occurredAt: new Date().toISOString(),
       accountIdentity:
         text(account.platformAccountId, 240) ||

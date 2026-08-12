@@ -24,6 +24,25 @@ const HEALTH_STATUSES = new Set([
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const AGENT_BINDING_MODES = new Set(['auto', 'manual']);
+const TASK_SAFETY_EVIDENCE_PATTERN = [
+  'captcha',
+  'security[ _-]+verification',
+  'login[ _-]+required',
+  'authentication[ _-]+required',
+  'auth[ _-]+required',
+  'platform[ _-]+safety[ _-]+block',
+  'risk[ _-]+control',
+  'douyin[ _-]+search[ _-]+security[ _-]+challenge',
+  'xhs[ _-]+security[ _-]+block',
+  '"(platformSafetyBlocked|platform_safety_blocked|securityBlocked|security_blocked|loginRequired|login_required)"[[:space:]]*:[[:space:]]*true',
+  '验证码',
+  '安全验证',
+  '安全限制',
+  '访问频繁',
+  '访问受限',
+  '风控',
+  '登录失效',
+].join('|');
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -242,6 +261,7 @@ router.get(
             ca.id, ca.display_name, ca.host_label, ca.client_label,
             ca.browser_name, ca.operating_system, ca.app_version,
             ca.allowed_platforms, ca.status, ca.last_heartbeat_at,
+            ca.last_error,
             (
               ca.status = 'active'
               AND ca.last_heartbeat_at >= now() - interval '2 minutes'
@@ -253,12 +273,12 @@ router.get(
         `, [req.tenantId]),
         queryAll(`
           SELECT
-            du.social_account_id, du.agent_id, du.platform,
+            du.agent_id, du.platform,
             du.usage_date::text AS usage_date,
             du.searches, du.enhancements,
             du.capture_runs, du.captured_items, du.failed_events,
-            du.last_event_at
-          FROM social_account_daily_usage du
+            du.safety_verifications, du.last_event_at, du.last_safety_at
+          FROM social_agent_daily_usage du
           WHERE du.tenant_id = $1
             AND du.usage_date >= (
               (now() AT TIME ZONE 'Asia/Shanghai')::date - ($2::integer - 1)
@@ -271,30 +291,20 @@ router.get(
       const visibleBindings = bindings.filter(binding =>
         visibleAccountIds.has(binding.social_account_id),
       );
-      const visibleUsage = usage.filter(row =>
-        visibleAccountIds.has(row.social_account_id),
-      );
       const bindingsByAccount = new Map();
       for (const binding of visibleBindings) {
         const list = bindingsByAccount.get(binding.social_account_id) || [];
         list.push(binding);
         bindingsByAccount.set(binding.social_account_id, list);
       }
-      const usageByAccount = new Map();
-      for (const row of visibleUsage) {
-        const list = usageByAccount.get(row.social_account_id) || [];
-        list.push(row);
-        usageByAccount.set(row.social_account_id, list);
-      }
       const enrichedAccounts = accounts.map(account => ({
         ...account,
         bindings: bindingsByAccount.get(account.id) || [],
-        usage: usageByAccount.get(account.id) || [],
       }));
       const today = new Intl.DateTimeFormat('en-CA', {
         timeZone: 'Asia/Shanghai',
       }).format(new Date());
-      const todayUsage = visibleUsage.filter(
+      const todayUsage = usage.filter(
         row => String(row.usage_date) === today,
       );
       const todayTotals = todayUsage.reduce(
@@ -306,20 +316,116 @@ router.get(
             totals.captureRuns + Number(row.capture_runs || 0),
           capturedItems:
             totals.capturedItems + Number(row.captured_items || 0),
+          safetyVerifications:
+            totals.safetyVerifications + Number(row.safety_verifications || 0),
         }),
         {
           searches: 0,
           enhancements: 0,
           captureRuns: 0,
           capturedItems: 0,
+          safetyVerifications: 0,
         },
+      );
+      const currentBindings = visibleBindings.filter(
+        binding => binding.status === 'current',
+      );
+      const accountById = new Map(
+        enrichedAccounts.map(account => [String(account.id), account]),
+      );
+      const bindingsByAgent = new Map();
+      for (const binding of currentBindings) {
+        const list = bindingsByAgent.get(binding.agent_id) || [];
+        const account = accountById.get(String(binding.social_account_id));
+        if (account) {
+          list.push({
+            id: account.id,
+            platform: account.platform,
+            display_name: account.display_name,
+            account_handle: account.account_handle,
+            platform_account_id: account.platform_account_id,
+            registered_phone: account.registered_phone,
+            notes: account.notes,
+            binding_id: binding.id,
+            binding_source: binding.source,
+          });
+        }
+        bindingsByAgent.set(binding.agent_id, list);
+      }
+      const usageByAgent = new Map();
+      for (const row of usage) {
+        const list = usageByAgent.get(row.agent_id) || [];
+        list.push(row);
+        usageByAgent.set(row.agent_id, list);
+      }
+      const taskSafety = await queryAll(`
+        SELECT
+          COALESCE(task.assigned_agent_id, task.origin_agent_id) AS agent_id,
+          COUNT(*)::integer AS safety_verifications,
+          MAX(COALESCE(task.finished_at, task.source_updated_at, task.created_at)) AS last_safety_at
+        FROM capture_tasks task
+        WHERE task.tenant_id = $1
+          AND COALESCE(task.assigned_agent_id, task.origin_agent_id) IS NOT NULL
+          AND COALESCE(task.finished_at, task.source_updated_at, task.created_at) >=
+            ((now() AT TIME ZONE 'Asia/Shanghai')::date::timestamp AT TIME ZONE 'Asia/Shanghai')
+          AND COALESCE(task.finished_at, task.source_updated_at, task.created_at) <
+            ((((now() AT TIME ZONE 'Asia/Shanghai')::date + 1)::timestamp) AT TIME ZONE 'Asia/Shanghai')
+          AND (
+            task.error::text ~* $2
+            OR task.checkpoint::text ~* $2
+            OR task.progress::text ~* $2
+            OR task.metadata::text ~* $2
+            OR task.message ~* $2
+          )
+        GROUP BY COALESCE(task.assigned_agent_id, task.origin_agent_id)
+      `, [req.tenantId, TASK_SAFETY_EVIDENCE_PATTERN]);
+      const taskSafetyByAgent = new Map(
+        taskSafety.map(row => [String(row.agent_id), row]),
+      );
+      const agentRows = agents.map(agent => {
+        const agentUsage = usageByAgent.get(agent.id) || [];
+        const usageSafetyCount = agentUsage
+          .filter(row => String(row.usage_date) === today)
+          .reduce((total, row) => total + Number(row.safety_verifications || 0), 0);
+        const taskSafetyRow = taskSafetyByAgent.get(String(agent.id));
+        const taskSafetyCount = Number(taskSafetyRow?.safety_verifications || 0);
+        const lastUsageSafetyAt = agentUsage.reduce((latest, row) => {
+          const current = new Date(row.last_safety_at || 0).getTime();
+          return current > latest.time ? {time: current, value: row.last_safety_at} : latest;
+        }, {time: 0, value: null});
+        const taskSafetyAt = taskSafetyRow?.last_safety_at || null;
+        const lastSafetyAt = new Date(taskSafetyAt || 0).getTime() > lastUsageSafetyAt.time
+          ? taskSafetyAt
+          : lastUsageSafetyAt.value;
+        return {
+          ...agent,
+          accounts: bindingsByAgent.get(agent.id) || [],
+          usage: agentUsage,
+          // Extension events provide the event count. Task evidence is a
+          // compatibility fallback and represents presence only, otherwise a
+          // parent and child carrying the same safety signal would double it.
+          today_safety_verifications: usageSafetyCount > 0
+            ? usageSafetyCount
+            : taskSafetyCount > 0
+              ? 1
+              : 0,
+          last_safety_at: lastSafetyAt,
+        };
+      });
+      const agentsWithSafety = agentRows.filter(
+        agent => Number(agent.today_safety_verifications || 0) > 0,
+      ).length;
+      const todaySafetyVerifications = agentRows.reduce(
+        (total, agent) =>
+          total + Number(agent.today_safety_verifications || 0),
+        0,
       );
       return res.json({
         ok: true,
         days,
         today,
         accounts: enrichedAccounts,
-        agents,
+        agents: agentRows,
         summary: {
           accounts: accounts.length,
           boundAgents: new Set(
@@ -335,7 +441,13 @@ router.get(
           resting: accounts.filter(account =>
             account.effective_health_status === 'resting',
           ).length,
-          today: todayTotals,
+          agents: agentRows.length,
+          onlineAgents: agentRows.filter(agent => agent.online).length,
+          agentsWithSafety,
+          today: {
+            ...todayTotals,
+            safetyVerifications: todaySafetyVerifications,
+          },
         },
       });
     } catch (error) {

@@ -1115,7 +1115,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
               al.id::text AS activity_id,
               to_char(al.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
                 || ' ' || COALESCE(NULLIF(u.name, ''), u.email, NULLIF(al.actor_id, ''), '系统')
-                || ' 状态备注：' || al.metadata->>'note' AS line
+                || ' 状态备注：' || (al.metadata->>'note') AS line
             FROM audit_logs al
             LEFT JOIN users u ON u.id = al.actor_user_id
             WHERE al.tenant_id = r.tenant_id

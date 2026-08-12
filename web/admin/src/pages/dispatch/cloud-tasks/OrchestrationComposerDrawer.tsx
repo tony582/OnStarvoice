@@ -316,12 +316,18 @@ export function OrchestrationComposerDrawer({
   minimumAgentCount = 1,
   initialAgentIds,
   editingPlan,
+  copyingPlan,
   onClose,
   onDispatched,
   onPlanUpdated,
   onChanged,
 }: OrchestrationComposerDrawerProps) {
   const editMode = Boolean(editingPlan)
+  const copyMode = !editMode && Boolean(copyingPlan)
+  const sourcePlan = useMemo(
+    () => editingPlan || copyingPlan || null,
+    [copyingPlan, editingPlan],
+  )
   const [stage, setStage] = useState<ComposerStage>('define')
   const [title, setTitle] = useState('')
   const [platform, setPlatform] = useState<OrchestrationPlatform>('xiaohongshu')
@@ -392,34 +398,37 @@ export function OrchestrationComposerDrawer({
   const nextScheduleRunAt = dispatchedSchedule?.next_run_at || dispatchedSchedule?.nextRunAt || null
 
   const reset = useCallback(() => {
-    const schedule = editingPlan?.schedule
-    const metadata = safeRecord(editingPlan?.orchestration.metadata)
+    const schedule = sourcePlan?.schedule
+    const metadata = safeRecord(sourcePlan?.orchestration.metadata)
     const planSnapshot = {
       ...safeRecord(metadata.planSnapshot),
       ...safeRecord(schedule?.plan_snapshot),
     }
     const searchFilters = safeRecord(planSnapshot.searchFilters)
     const enhancementSettings = safeRecord(planSnapshot.captureSettings)
-    const editingPlatform = editingPlan?.orchestration.platform === 'douyin'
+    const editingPlatform = sourcePlan?.orchestration.platform === 'douyin'
       ? 'douyin'
       : 'xiaohongshu'
     const editingEnhancementEnabled = enhancementSettings.autoDetailCaptureAfterListCapture === true
     const scheduleDates = planSnapshot.customDates ?? schedule?.custom_dates ?? ''
     const editingAgentIds = stringList(metadata.eligibleAgentIds).length > 0
       ? stringList(metadata.eligibleAgentIds)
-      : (editingPlan?.agents || []).map(agent => agent.id)
-    const candidateAgentIds = editMode ? editingAgentIds : (initialAgentIds ?? [])
-    const targetPlatform = editMode ? editingPlatform : 'xiaohongshu'
-    const targetEnhancementEnabled = editMode ? editingEnhancementEnabled : false
+      : (sourcePlan?.agents || []).map(agent => agent.id)
+    const candidateAgentIds = sourcePlan ? editingAgentIds : (initialAgentIds ?? [])
+    const targetPlatform = sourcePlan ? editingPlatform : 'xiaohongshu'
+    const targetEnhancementEnabled = sourcePlan ? editingEnhancementEnabled : false
     const compatibleInitialAgentIds = candidateAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
       return agent && !agentBlockReason(agent, targetPlatform, targetEnhancementEnabled)
     })
 
     setStage('define')
-    setTitle(editingPlan?.orchestration.title || '')
+    setTitle(copyMode ? `${sourcePlan?.orchestration.title || '无人值守计划'}（副本）` : sourcePlan?.orchestration.title || '')
     setPlatform(targetPlatform)
     setExecutionMode(editMode ? 'unattended_plan' : initialExecutionMode)
+    if (copyMode && initialExecutionMode !== 'unattended_plan') {
+      setExecutionMode('unattended_plan')
+    }
     setPlanMode(
       (schedule?.schedule_mode || planSnapshot.mode) === 'custom_dates'
         ? 'custom_dates'
@@ -428,8 +437,8 @@ export function OrchestrationComposerDrawer({
     setStartTime(String(schedule?.start_time || planSnapshot.startTime || '09:00').slice(0, 5))
     setRandomOffsetMin(safeCount(schedule?.random_offset_min ?? planSnapshot.randomOffsetMin ?? 20))
     setCustomDates(Array.isArray(scheduleDates) ? scheduleDates.join('\n') : String(scheduleDates || ''))
-    setKeywordText(editingPlan
-      ? [...editingPlan.items]
+    setKeywordText(sourcePlan
+      ? [...sourcePlan.items]
         .sort((left, right) => safeCount(left.ordinal) - safeCount(right.ordinal))
         .map(keywordForItem)
         .join('\n')
@@ -452,7 +461,7 @@ export function OrchestrationComposerDrawer({
     setSelectedAgentIds(compatibleInitialAgentIds)
     setSelectionNotice(
       compatibleInitialAgentIds.length < candidateAgentIds.length
-        ? editMode
+        ? sourcePlan
           ? '原计划中有节点当前不可用或不兼容，已移除；保存前请重新确认 Agent 小队。'
           : '已移除与默认小红书平台不兼容的预选节点，请重新确认 Agent 小队。'
         : '',
@@ -468,7 +477,7 @@ export function OrchestrationComposerDrawer({
     setDispatchResult(null)
     setUpdateResult(null)
     requestKeyRef.current = randomRequestKey()
-  }, [agents, editMode, editingPlan, initialAgentIds, initialExecutionMode])
+  }, [agents, copyMode, editMode, initialAgentIds, initialExecutionMode, sourcePlan])
 
   useEffect(() => {
     if (open && !previouslyOpenRef.current) reset()
@@ -893,7 +902,7 @@ export function OrchestrationComposerDrawer({
               type="button"
               data-dialog-initial-focus
               onClick={stage === 'allocate' ? () => { setStage('define'); setError('') } : () => void requestClose()}
-              aria-label={stage === 'allocate' ? '返回任务配置' : editMode ? '关闭计划编辑' : '关闭新建编排任务'}
+              aria-label={stage === 'allocate' ? '返回任务配置' : editMode ? '关闭计划编辑' : copyMode ? '关闭复制计划' : '关闭新建编排任务'}
               disabled={busy}
               className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             >
@@ -902,13 +911,15 @@ export function OrchestrationComposerDrawer({
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <h2 id="orchestration-composer-title" className="text-lg font-bold text-foreground">
-                  {editMode ? '编辑无人值守计划' : '新建弹性节点池任务'}
+                  {editMode ? '编辑无人值守计划' : copyMode ? '复制为新计划' : '新建弹性节点池任务'}
                 </h2>
                 <span className="rounded-full border border-primary/25 bg-primary/8 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">Beta</span>
               </div>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
                 {editMode
                   ? '保留原计划和运行历史；保存后的设置从下一次运行开始生效。'
+                  : copyMode
+                    ? '已带入原计划设置；确认后创建独立的新计划，不改动归档记录。'
                   : executionMode === 'unattended_plan'
                   ? '无人值守 · 每次到点生成云端工作项，由空闲节点逐个领取。'
                   : '执行一次 · 关键词留在云端，兼容节点空闲后逐个领取。'}
@@ -938,7 +949,7 @@ export function OrchestrationComposerDrawer({
                       </p>
                     </div>
                   </div>
-                  {lockExecutionMode || editMode ? (
+                  {lockExecutionMode || editMode || copyMode ? (
                     <div role="status" className="flex items-center gap-3 rounded-xl border border-primary/20 bg-card px-3 py-2.5">
                       <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                         {executionMode === 'unattended_plan' ? <CalendarDays className="h-4 w-4" /> : <Play className="h-4 w-4" />}
@@ -948,7 +959,7 @@ export function OrchestrationComposerDrawer({
                           {executionMode === 'unattended_plan' ? '无人值守' : '执行一次'}
                         </span>
                         <span className="mt-0.5 block text-[10px] text-muted-foreground">
-                          {editMode ? '计划类型保持不变；修改只作用于后续批次。' : '已从上一步确定，无需重复选择。'}
+                          {editMode ? '计划类型保持不变；修改只作用于后续批次。' : copyMode ? '从原计划复制，创建后独立运行。' : '已从上一步确定，无需重复选择。'}
                         </span>
                       </span>
                       <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">已确定</span>

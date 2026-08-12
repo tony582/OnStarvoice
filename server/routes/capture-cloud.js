@@ -5551,6 +5551,139 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
   }
 });
 
+router.get('/history', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 50));
+    const offset = (page - 1) * pageSize;
+    const queryText = text(req.query.q, 120);
+    const platform = text(req.query.platform, 40).toLowerCase();
+    const status = text(req.query.status, 80).toLowerCase();
+    const from = text(req.query.from, 20);
+    const to = text(req.query.to, 20);
+    const daysInput = Number(req.query.days);
+    const days = Number.isFinite(daysInput)
+      ? Math.min(3650, Math.max(0, Math.floor(daysInput)))
+      : 30;
+    const allowedPlatforms = new Set([
+      'xiaohongshu', 'douyin', 'weibo', 'mixed', 'unknown',
+    ]);
+    const allowedStatuses = new Set([
+      'completed', 'completed_with_warnings', 'completed_with_failures',
+      'failed', 'canceled', 'skipped', 'interrupted', 'needs_action',
+    ]);
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/u;
+    if (platform && !allowedPlatforms.has(platform)) {
+      return res.status(400).json({ok: false, error: 'invalid_platform', message: '历史平台筛选无效'});
+    }
+    if (status && !allowedStatuses.has(status)) {
+      return res.status(400).json({ok: false, error: 'invalid_status', message: '历史状态筛选无效'});
+    }
+    if ((from && !datePattern.test(from)) || (to && !datePattern.test(to))) {
+      return res.status(400).json({ok: false, error: 'invalid_date_range', message: '历史日期需使用 YYYY-MM-DD 格式'});
+    }
+    if (from && to && from > to) {
+      return res.status(400).json({ok: false, error: 'invalid_date_range', message: '开始日期不能晚于结束日期'});
+    }
+
+    const params = [req.tenantId];
+    const where = [`
+      t.tenant_id = $1
+      AND t.parent_task_id IS NULL
+      AND ${captureTaskBusinessRootVisibilitySql('t')}
+      AND t.task_type NOT IN ('unattended_plan_configuration', 'sync')
+      AND RIGHT(t.task_type, 5) <> '_sync'
+      AND t.status <> 'superseded'
+      AND NOT (
+        t.task_type = 'capture_orchestration'
+        AND (
+          (t.orchestration_revision = 0 AND t.metadata->>'draft' = 'true')
+          OR t.metadata->>'orchestrationTemplate' = 'true'
+        )
+      )
+      AND t.status NOT IN (
+        'pending', 'waiting_device', 'claimed', 'running', 'recovering',
+        'resume_requested'
+      )
+      AND NOT (
+        t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
+        AND t.attention_dismissed_at IS NULL
+      )
+    `];
+    if (queryText) {
+      params.push(`%${queryText}%`);
+      where.push(`t.title ILIKE $${params.length}`);
+    }
+    if (platform) {
+      params.push(platform);
+      where.push(`t.platform = $${params.length}`);
+    }
+    if (status) {
+      params.push(status);
+      where.push(`t.status = $${params.length}`);
+    }
+    if (from) {
+      params.push(from);
+      where.push(`COALESCE(t.finished_at, t.updated_at, t.created_at) >= ($${params.length}::date::timestamp AT TIME ZONE 'Asia/Shanghai')`);
+    } else if (!to && days > 0) {
+      params.push(days);
+      where.push(`COALESCE(t.finished_at, t.updated_at, t.created_at) >= now() - ($${params.length}::integer * interval '1 day')`);
+    }
+    if (to) {
+      params.push(to);
+      where.push(`COALESCE(t.finished_at, t.updated_at, t.created_at) < (($${params.length}::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')`);
+    }
+    const whereSql = where.join('\n AND ');
+    const listParams = [...params, pageSize, offset];
+    const [totalRow, tasks] = await Promise.all([
+      queryOne(`SELECT COUNT(*)::integer AS total FROM capture_tasks t WHERE ${whereSql}`, params),
+      queryAll(`
+        SELECT t.*,
+          ca.display_name AS agent_display_name,
+          ca.host_label AS agent_host_label,
+          ca.browser_name AS agent_browser_name,
+          ca.operating_system AS agent_operating_system,
+          ca.allowed_platforms AS agent_allowed_platforms,
+          ca.capabilities AS agent_capabilities,
+          ca.last_heartbeat_at AS agent_last_heartbeat_at,
+          (ca.status = 'active' AND ca.last_heartbeat_at >= now() - interval '2 minutes') AS agent_online,
+          ca.status AS agent_status,
+          t.status AS effective_status
+        FROM capture_tasks t
+        LEFT JOIN capture_agents ca
+          ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
+          AND ca.tenant_id = t.tenant_id
+        WHERE ${whereSql}
+        ORDER BY COALESCE(t.finished_at, t.updated_at, t.created_at) DESC, t.id DESC
+        LIMIT $${listParams.length - 1} OFFSET $${listParams.length}
+      `, listParams),
+    ]);
+    const total = Number(totalRow?.total || 0);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    if (page > totalPages) {
+      return res.json({
+        ok: true,
+        tasks: [],
+        pagination: {page, pageSize, total, totalPages},
+        filters: {q: queryText, platform, status, from, to, days},
+      });
+    }
+    return res.json({
+      ok: true,
+      tasks,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+      },
+      filters: {q: queryText, platform, status, from, to, days},
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res, next) => {
   try {
     const limit = Math.min(200, Math.max(10, Number(req.query.limit) || 100));
@@ -5689,7 +5822,24 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           COUNT(*) FILTER (
             WHERE t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
               AND t.attention_dismissed_at IS NULL
-          ) AS attention_tasks
+          ) AS attention_tasks,
+          COUNT(*) FILTER (
+            WHERE t.status NOT IN (
+              'pending', 'waiting_device', 'claimed', 'running', 'recovering',
+              'resume_requested', 'superseded'
+            )
+              AND NOT (
+                t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
+                AND t.attention_dismissed_at IS NULL
+              )
+              AND t.task_type NOT IN ('unattended_plan_configuration', 'sync')
+              AND RIGHT(t.task_type, 5) <> '_sync'
+              AND NOT (
+                t.task_type = 'capture_orchestration'
+                AND t.metadata->>'orchestrationTemplate' = 'true'
+              )
+              AND COALESCE(t.finished_at, t.updated_at, t.created_at) >= now() - interval '30 days'
+          ) AS history_tasks
         FROM capture_tasks t
         LEFT JOIN capture_agents ca
           ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
@@ -5722,6 +5872,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         onlineAgents: agents.filter(agent => agent.status === 'active' && captureAgentOnline(agent.last_heartbeat_at)).length,
         runningTasks: Number(taskSummary?.running_tasks || 0),
         attentionTasks: Number(taskSummary?.attention_tasks || 0),
+        historyTasks: Number(taskSummary?.history_tasks || 0),
         aiActive: aiAdmission.active,
         aiQueued: aiAdmission.queued,
         aiConcurrencyLimit: aiAdmission.limit,
