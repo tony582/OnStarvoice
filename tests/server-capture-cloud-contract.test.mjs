@@ -1205,6 +1205,7 @@ test("elastic queue claims one keyword or negative post per idle heartbeat and f
   assert.match(claim, /'manual_current'/u);
   assert.match(claim, /elasticRecoveryHoldRemainingMs\(recentRecoveryAttempt\)/u);
   assert.match(claim, /recent_same_agent_attempt/u);
+  assert.match(claim, /recent_same_agent_attempt\.agent_id = \$2::uuid/u);
   assert.match(claim, /ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS/u);
   assert.doesNotMatch(
     claim,

@@ -4491,7 +4491,7 @@ async function dispatchNextElasticWorkItem(tx, {
         FROM capture_task_item_attempts recent_same_agent_attempt
         WHERE recent_same_agent_attempt.tenant_id = item.tenant_id
           AND recent_same_agent_attempt.item_id = item.id
-          AND recent_same_agent_attempt.agent_id = $2
+          AND recent_same_agent_attempt.agent_id = $2::uuid
           AND recent_same_agent_attempt.status IN (
             'retryable', 'needs_action', 'failed'
           )
