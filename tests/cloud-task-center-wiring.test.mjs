@@ -594,7 +594,7 @@ test("admin can move ended failures to history individually or in bulk", async (
 });
 
 test("verify input and extension API origins are bounded before credentials are sent", async () => {
-  const [verifyRoute, api, sidebar, storage, state, runtimeConfig, localRuntimeConfig, snapshotScript, packageScript] = await Promise.all([
+  const [verifyRoute, api, sidebar, storage, state, runtimeConfig, localRuntimeConfig, snapshotScript, checkScript, packageScript, serverPackage] = await Promise.all([
     read("server/routes/verify.js"),
     read("utils/api.js"),
     read("sidebar/sidebar-logic.js"),
@@ -603,7 +603,9 @@ test("verify input and extension API origins are bounded before credentials are 
     read("utils/runtime-config.js"),
     read("scripts/extension-runtime-config.local.js"),
     read("scripts/sync-extension-build.zsh"),
+    read("scripts/check-extension-snapshot.zsh"),
     read("scripts/package-extension.zsh"),
+    read("server/package.json"),
   ]);
   assert.match(verifyRoute, /resolvedFingerprint\.length > 240/u);
   assert.match(verifyRoute, /resolvedUserAgent\.length > 1000/u);
@@ -614,8 +616,13 @@ test("verify input and extension API origins are bounded before credentials are 
   assert.match(localRuntimeConfig, /http:\/\/localhost:3001/u);
   assert.match(snapshotScript, /build_target=\$\{1:-production\}/u);
   assert.match(snapshotScript, /extension-runtime-config\.local\.js/u);
-  assert.match(packageScript, /sync-extension-build\.zsh" production/u);
+  assert.match(snapshotScript, /^#!\/usr\/bin\/env bash/u);
+  assert.match(checkScript, /^#!\/usr\/bin\/env bash/u);
+  assert.doesNotMatch(snapshotScript, /\$\{0:A|\bprint\s+-u2\b/u);
+  assert.doesNotMatch(checkScript, /\$\{0:A|\bprint\s+-u2\b/u);
+  assert.match(packageScript, /bash "\$script_dir\/sync-extension-build\.zsh" production/u);
   assert.match(packageScript, /已停止打包/u);
+  assert.match(JSON.parse(serverPackage).scripts.test, /^bash \.\.\/scripts\/check-extension-snapshot\.zsh/u);
   assert.match(sidebar, /function queueAuthVerification/u);
   assert.match(sidebar, /revision !== authCodeRevision/u);
   assert.match(sidebar, /旧验证结果已忽略/u);

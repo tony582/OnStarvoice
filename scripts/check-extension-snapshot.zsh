@@ -1,11 +1,11 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-script_dir=${0:A:h}
-repo_root=${script_dir:h}
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(dirname -- "$script_dir")
 snapshot_dir="$repo_root/extension-build"
 
-zsh "$script_dir/sync-extension-build.zsh" production
+bash "$script_dir/sync-extension-build.zsh" production
 
 for source_file in manifest.json background.js content-loader.js content-v2.js; do
   diff -q "$repo_root/$source_file" "$snapshot_dir/$source_file" >/dev/null
@@ -37,18 +37,18 @@ for source_dir in images sidebar utils; do
 done
 
 if grep -n -E 'https?://(localhost|127\.0\.0\.1)(:|/|$)' "$snapshot_dir/utils/runtime-config.js" >/dev/null; then
-  print -u2 'Extension production runtime config contains a localhost API origin.'
+  printf '%s\n' 'Extension production runtime config contains a localhost API origin.' >&2
   exit 1
 fi
 
 if ! grep -q 'https://voice\.minilife\.online' "$snapshot_dir/utils/runtime-config.js"; then
-  print -u2 'Extension production snapshot is missing the approved API origin.'
+  printf '%s\n' 'Extension production snapshot is missing the approved API origin.' >&2
   exit 1
 fi
 
 if ! grep -q '"production"' "$snapshot_dir/utils/runtime-config.js"; then
-  print -u2 'Extension production snapshot is missing its production target marker.'
+  printf '%s\n' 'Extension production snapshot is missing its production target marker.' >&2
   exit 1
 fi
 
-print "StarVoice extension delivery snapshot verified: $snapshot_dir"
+printf '%s\n' "StarVoice extension delivery snapshot verified: $snapshot_dir"
