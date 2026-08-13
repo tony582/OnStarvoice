@@ -355,7 +355,7 @@ function RecordDrawerContent({
     { value: 'reviewed', label: '已复核', icon: Check },
     { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
     { value: 'unavailable', label: '已不可见', icon: CircleOff },
-    { value: 'privacy_unreachable', label: '隐私限制-无法触达', icon: CircleOff },
+    { value: 'privacy_unreachable', label: '负面–隐私设置无法触达', icon: CircleOff },
     { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
     { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
   ]

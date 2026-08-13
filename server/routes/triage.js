@@ -25,7 +25,7 @@ const TRIAGE_STATUS_CN = {
   reviewed: '已复核',
   reviewed_non_monitor: '已复核-非监控内容',
   unavailable: '已不可见',
-  privacy_unreachable: '隐私限制-无法触达',
+  privacy_unreachable: '负面–隐私设置无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
   // 仅用于历史导出与审计展示；059 迁移后不会再作为当前状态写入。

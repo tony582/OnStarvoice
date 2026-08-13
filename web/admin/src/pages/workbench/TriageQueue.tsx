@@ -83,12 +83,12 @@ const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: Reac
   { value: 'reviewed', label: '已复核', icon: Check },
   { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
   { value: 'unavailable', label: '已不可见', icon: CircleOff },
-  { value: 'privacy_unreachable', label: '隐私限制-无法触达', icon: CircleOff },
+  { value: 'privacy_unreachable', label: '负面–隐私设置无法触达', icon: CircleOff },
   { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
   { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
 ]
 const PLATFORM_BADGE_CLASS = 'w-14 justify-center dark:text-white'
-const TRIAGE_MODE_BADGE_CLASS = 'w-[132px] justify-center dark:text-white'
+const TRIAGE_MODE_BADGE_CLASS = 'w-[168px] justify-center dark:text-white'
 const ARCHIVE_VIEWS: Array<{ value: ArchiveView; label: string; icon: React.ElementType }> = [
   { value: 'active', label: '工作中', icon: Inbox },
   { value: 'archived', label: '已归档', icon: Archive },
@@ -250,7 +250,7 @@ function HeaderMultiFilter({ label, value, options, onChange }: {
 }
 
 function recordAccentClass(record: Record<string, unknown>) {
-  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold') return 'bg-status-red'
+  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
   if (record.triage_status === 'replied' || record.triage_status === 'reviewed') return 'bg-status-green'
   if (record.sentiment === 'negative') return 'bg-status-red'
   if (record.sentiment === 'positive') return 'bg-status-green'
@@ -1208,8 +1208,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <th className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
-                <th className="sticky right-0 z-50 w-[224px] min-w-[224px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
-                  <div className="grid grid-cols-[132px_48px] items-center gap-2">
+                <th className="sticky right-0 z-50 w-[264px] min-w-[264px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
+                  <div className="grid grid-cols-[168px_48px] items-center gap-2">
                     <div className="flex justify-center">
                       <HeaderMultiFilter
                         label="处理状态"
@@ -1569,10 +1569,10 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>}
       {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
       <td className={cn(
-        "sticky right-0 z-20 w-[224px] min-w-[224px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
+        "sticky right-0 z-20 w-[264px] min-w-[264px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
         open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
       )} onClick={e => e.stopPropagation()}>
-        <div className="grid grid-cols-[132px_48px] items-center gap-2">
+        <div className="grid grid-cols-[168px_48px] items-center gap-2">
           {canWrite && !archived ? (
             <TriageStatusMenu
               status={triageStatus}

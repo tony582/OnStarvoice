@@ -10,7 +10,7 @@ const STATUSES = [
   ['reviewed', '已复核'],
   ['reviewed_non_monitor', '已复核-非监控内容'],
   ['unavailable', '已不可见'],
-  ['privacy_unreachable', '隐私限制-无法触达'],
+  ['privacy_unreachable', '负面–隐私设置无法触达'],
   ['negative_feishu', '负面-飞书表'],
   ['negative_cold', '负面-冷处理'],
 ];
@@ -64,6 +64,20 @@ test('content status filtering supports selecting multiple states end to end', (
   assert.match(route, /function appendStatusFilter/);
   assert.match(route, /= ANY\(\$\$\{params\.length\}::text\[\]\)/);
   assert.equal((route.match(/appendStatusFilter\(where, params, status\)/g) || []).length, 2);
+});
+
+test('privacy-unreachable remains data-compatible while presenting as a negative state', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
+  const badges = source('web/admin/src/components/ui/badge.tsx');
+  const dashboard = source('web/admin/src/pages/insights/DashboardTab.tsx');
+  const legacyCss = source('server/admin/admin.css');
+
+  assert.match(queue, /value: 'privacy_unreachable', label: '负面–隐私设置无法触达'/);
+  assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-red[^\n]+ring-status-red/);
+  assert.match(badges, /privacy_unreachable: 'red'/);
+  assert.match(dashboard, /key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#DC2626'/);
+  assert.match(legacyCss, /badge\.negative_feishu, \.badge\.negative_cold, \.badge\.privacy_unreachable/);
 });
 
 test('migration preserves historical evidence while mapping old current states', () => {

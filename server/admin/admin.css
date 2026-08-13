@@ -514,7 +514,7 @@ tbody tr:last-child td { border-bottom: none; }
 /* Tones */
 .badge { background: var(--bg-elevated); color: var(--text-secondary); }
 .badge.negative, .badge.critical, .badge.high, .badge.urgent,
-.badge.negative_feishu, .badge.negative_cold {
+.badge.negative_feishu, .badge.negative_cold, .badge.privacy_unreachable {
   background: var(--danger-soft); color: var(--danger);
   box-shadow: 0 0 8px rgba(239,68,68,0.08);
 }
@@ -528,7 +528,7 @@ tbody tr:last-child td { border-bottom: none; }
 .badge.neutral, .badge.generated, .badge.viewer {
   background: var(--primary-soft); color: var(--primary);
 }
-.badge.muted, .badge.archived, .badge.skipped, .badge.reviewed_non_monitor, .badge.unavailable, .badge.privacy_unreachable {
+.badge.muted, .badge.archived, .badge.skipped, .badge.reviewed_non_monitor, .badge.unavailable {
   background: var(--bg-elevated); color: var(--text-muted);
 }
 

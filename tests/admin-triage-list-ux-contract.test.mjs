@@ -24,7 +24,7 @@ test('platform and handling-state pills keep stable scan widths', () => {
   const feishuControl = source('web/admin/src/components/shared/FeishuTableNumberControl.tsx');
   const copyButton = source('web/admin/src/components/shared/CopyTicketNumberButton.tsx');
   assert.match(queue, /const PLATFORM_BADGE_CLASS\s*=\s*['"][^'"]*w-14[^'"]*justify-center/);
-  assert.match(queue, /const TRIAGE_MODE_BADGE_CLASS\s*=\s*['"][^'"]*w-\[132px\][^'"]*justify-center/);
+  assert.match(queue, /const TRIAGE_MODE_BADGE_CLASS\s*=\s*['"][^'"]*w-\[168px\][^'"]*justify-center/);
   assert.match(queue, /dark:text-white/);
 
   const menu = between(queue, 'function TriageStatusMenu', 'function SortableTh');
@@ -52,7 +52,7 @@ test('row accent reflects handling state and sentiment without work-order lifecy
   const badge = source('web/admin/src/components/ui/badge.tsx');
   const accent = between(queue, 'function recordAccentClass', 'function getPaginationItems');
 
-  assert.match(accent, /triage_status === 'negative_feishu' \|\| record\.triage_status === 'negative_cold'\) return 'bg-status-red'/);
+  assert.match(accent, /triage_status === 'negative_feishu' \|\| record\.triage_status === 'negative_cold' \|\| record\.triage_status === 'privacy_unreachable'\) return 'bg-status-red'/);
   assert.match(accent, /triage_status === 'replied'/);
   assert.match(accent, /sentiment === 'negative'/);
   assert.match(accent, /sentiment === 'positive'/);
@@ -61,8 +61,10 @@ test('row accent reflects handling state and sentiment without work-order lifecy
   assert.match(functionBlock(queue, 'RecordRow'), /recordAccentClass\(r\)/);
   assert.match(board, /key: 'negative_feishu'[^\n]+bg-status-red/);
   assert.match(board, /key: 'negative_cold'[^\n]+bg-status-red/);
+  assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-red/);
   assert.match(badge, /negative_feishu: 'red'/);
   assert.match(badge, /negative_cold: 'red'/);
+  assert.match(badge, /privacy_unreachable: 'red'/);
 });
 
 test('fixed processing cell combines handling state with a direct note action', () => {
@@ -72,11 +74,11 @@ test('fixed processing cell combines handling state with a direct note action', 
   const row = functionBlock(queue, 'RecordRow');
   const progress = functionBlock(queue, 'InlineRecordProgress');
 
-  assert.match(header, /sticky right-0 z-50 w-\[224px\] min-w-\[224px\]/);
-  assert.match(header, /grid-cols-\[132px_48px\]/);
+  assert.match(header, /sticky right-0 z-50 w-\[264px\] min-w-\[264px\]/);
+  assert.match(header, /grid-cols-\[168px_48px\]/);
   assert.match(header, /label="处理状态"/);
   assert.match(header, /sr-only">备注/);
-  assert.match(row, /sticky right-0 z-20 w-\[224px\] min-w-\[224px\]/);
+  assert.match(row, /sticky right-0 z-20 w-\[264px\] min-w-\[264px\]/);
   assert.match(row, /<TriageStatusMenu[\s\S]*<InlineRecordProgress record=\{r\} onAdd=\{onAddNote\}/);
 
   assert.match(progress, /record\.progress_latest_body/);
@@ -104,7 +106,7 @@ test('desktop keeps one native scroll surface and sticky state-note cell', () =>
   assert.doesNotMatch(queue, /data-triage-table-scroll[\s\S]{0,180}overflow-x-auto|tableHead\.style\.transform|ResizeObserver/);
   assert.match(queue, /min-w-\[1080px\][^\"]*xl:min-w-full/);
   assert.match(queue, /<thead data-sticky-header className="[^"]*sticky top-0 z-40/);
-  assert.match(queue, /sticky right-0 z-20 w-\[224px\] min-w-\[224px\][^\"]*before:inset-y-0/);
+  assert.match(queue, /sticky right-0 z-20 w-\[264px\] min-w-\[264px\][^\"]*before:inset-y-0/);
 });
 
 test('empty list keeps filters and the table header usable', () => {
