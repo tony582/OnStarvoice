@@ -44,12 +44,13 @@ const HANDLING_LABELS = {
   reviewed: '已复核',
   reviewed_non_monitor: '已复核-非监控内容',
   unavailable: '已不可见',
+  privacy_unreachable: '隐私限制-无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
 };
 const HANDLING_STATUS_SQL = `(
   'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
-  'unavailable', 'negative_feishu', 'negative_cold'
+  'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold'
 )`;
 
 const CONTENT_COLUMNS = [

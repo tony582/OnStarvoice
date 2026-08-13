@@ -10,6 +10,7 @@ const STATUSES = [
   ['reviewed', '已复核'],
   ['reviewed_non_monitor', '已复核-非监控内容'],
   ['unavailable', '已不可见'],
+  ['privacy_unreachable', '隐私限制-无法触达'],
   ['negative_feishu', '负面-飞书表'],
   ['negative_cold', '负面-冷处理'],
 ];
@@ -22,19 +23,19 @@ function between(text, start, end) {
   return text.slice(startAt, endAt);
 }
 
-test('content handling exposes exactly the seven customer-maintained states', () => {
+test('content handling exposes exactly the eight customer-maintained states', () => {
   const labels = source('web/admin/src/lib/utils.ts');
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const route = source('server/routes/triage.js');
-  const migration = source('server/db/migrations/059_content_handling_statuses.sql');
+  const privacyMigration = source('server/db/migrations/064_content_privacy_unreachable_status.sql');
 
   const statusSet = between(route, 'const TRIAGE_STATUSES = new Set([', ']);');
   const queueModes = between(queue, 'const CONTENT_TRIAGE_MODES', 'const PLATFORM_BADGE_CLASS');
   const boardColumns = between(board, 'const COLUMNS', 'const PER_COL');
   const drawerModes = between(drawer, 'const modeActions', 'const currentModeLabel');
-  const constraint = between(migration, 'ADD CONSTRAINT record_triage_status_check', '));');
+  const constraint = between(privacyMigration, 'ADD CONSTRAINT record_triage_status_check', '));');
 
   for (const [value, label] of STATUSES) {
     for (const block of [labels, queueModes, boardColumns, drawerModes, route]) {
@@ -52,8 +53,22 @@ test('content handling exposes exactly the seven customer-maintained states', ()
   }
 });
 
+test('content status filtering supports selecting multiple states end to end', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const route = source('server/routes/triage.js');
+
+  assert.match(queue, /const \[triageStatuses, setTriageStatuses\] = useState<string\[]>/);
+  assert.match(queue, /triageStatuses\.forEach\(status => params\.append\('status', status\)\)/);
+  assert.match(queue, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*value=\{triageStatuses\}/);
+  assert.match(queue, /<HeaderMultiFilter[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}/);
+  assert.match(route, /function appendStatusFilter/);
+  assert.match(route, /= ANY\(\$\$\{params\.length\}::text\[\]\)/);
+  assert.equal((route.match(/appendStatusFilter\(where, params, status\)/g) || []).length, 2);
+});
+
 test('migration preserves historical evidence while mapping old current states', () => {
   const migration = source('server/db/migrations/059_content_handling_statuses.sql');
+  const privacyMigration = source('server/db/migrations/064_content_privacy_unreachable_status.sql');
 
   for (const [from, to] of [
     ['official_responded', 'replied'],
@@ -66,6 +81,8 @@ test('migration preserves historical evidence while mapping old current states',
   }
   assert.match(migration, /历史审计与工单记录继续保留/);
   assert.doesNotMatch(migration, /DELETE FROM (?:audit_logs|tickets|ticket_notes)/);
+  assert.match(privacyMigration, /内容仍可见，但因用户隐私设置无法直接联系/);
+  assert.doesNotMatch(privacyMigration, /UPDATE record_triage|DELETE FROM/);
 });
 
 test('status changes are generic and unrestricted by content work orders', () => {

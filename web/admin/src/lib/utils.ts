@@ -88,6 +88,7 @@ export const LABELS = {
   triage: {
     unhandled: '待处理', replied: '已回复', reviewed: '已复核',
     reviewed_non_monitor: '已复核-非监控内容', unavailable: '已不可见',
+    privacy_unreachable: '隐私限制-无法触达',
     negative_feishu: '负面-飞书表', negative_cold: '负面-冷处理',
     // 历史处理记录兼容标签。
     reviewing: '负面流程', issue_linked: '已关联事件', ticketed: '已转工单',

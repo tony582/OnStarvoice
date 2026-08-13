@@ -719,11 +719,15 @@ function normalizeOrchestrationExecutionContext(value) {
         .filter(Boolean),
     ),
   ).slice(0, 30);
+  const attemptIdentity = String(
+    source.attemptIdentity || source.attempt_identity || '',
+  ).trim().slice(0, 100);
   return {
     parentTaskId,
     revision: Math.max(0, Math.floor(Number(source.revision) || 0)),
     itemIds,
     ...(distributionMode ? {distributionMode} : {}),
+    ...(attemptIdentity ? {attemptIdentity} : {}),
     scheduleId: String(source.scheduleId || '').trim().slice(0, 100),
     scheduledFor: String(source.scheduledFor || '').trim().slice(0, 100),
     sourceExecutionTaskId: String(
@@ -1199,6 +1203,7 @@ function buildUnattendedTaskRun(request, previousRun = null) {
       executionMode,
       cloudAgentScopeId: String(normalized.cloudAgentScopeId || ''),
       recoveryMode: String(normalized.recoveryMode || ''),
+      attemptIdentity: String(orchestrationContext?.attemptIdentity || ''),
       ...(orchestrationContext ? {orchestrationContext} : {}),
     },
     createdAt: normalized.createdAt,
@@ -1344,14 +1349,64 @@ async function persistUnattendedRunMutation(
       normalized,
       {previousRequest, allowAttemptTransition, event, now},
     );
+    const shouldMirrorPlan = mirrorPlan && normalized.cloudAssigned !== true;
     if (ledgerResult.accepted === false) {
+      if (
+        ledgerResult.reason === 'terminal_absorbed' &&
+        isTerminalUnattendedRunStatus(normalized.status)
+      ) {
+        const preservedRequest = normalizeUnattendedRunRequest({
+          ...normalized,
+          status: ledgerResult.run?.status || normalized.status,
+          message: ledgerResult.run?.message || normalized.message,
+          error: ledgerResult.run?.error || normalized.error,
+          finishedAt:
+            ledgerResult.run?.finishedAt ||
+            normalized.finishedAt ||
+            normalized.updatedAt,
+          recoveryPendingLaunch: false,
+          recoveryWaitUntil: '',
+          wakeGraceUntil: '',
+          progress: {
+            ...(normalized.progress && typeof normalized.progress === 'object'
+              ? normalized.progress
+              : {}),
+            phase: `unattended_${ledgerResult.run?.status || normalized.status}`,
+            waitUntil: '',
+            remainingMs: null,
+          },
+        });
+        const preservedPlan = shouldMirrorPlan
+          ? buildPlanMirrorForUnattendedRequest(
+              plan,
+              preservedRequest,
+              now,
+            )
+          : plan;
+        const terminalValues = {
+          [STORAGE_KEYS.unattendedKeywordRunRequest]: preservedRequest,
+          [STORAGE_KEYS.taskLedger]: ledgerResult.ledger,
+        };
+        if (shouldMirrorPlan) {
+          terminalValues[STORAGE_KEYS.unattendedKeywordPlan] = preservedPlan;
+        }
+        await chrome.storage.local.set(terminalValues);
+        scheduleCloudTaskAgentSync('unattended_terminal_reconciled');
+        return {
+          request: preservedRequest,
+          plan: preservedPlan,
+          ledger: ledgerResult.ledger,
+          ledgerAccepted: false,
+          ledgerReason: ledgerResult.reason,
+          alreadyTerminal: true,
+        };
+      }
       const error = new Error(
         `task ledger rejected unattended mutation: ${ledgerResult.reason || 'unknown'}`,
       );
       error.code = 'UNATTENDED_LEDGER_REJECTED';
       throw error;
     }
-    const shouldMirrorPlan = mirrorPlan && normalized.cloudAssigned !== true;
     const nextPlan = shouldMirrorPlan
       ? buildPlanMirrorForUnattendedRequest(plan, normalized, now)
       : plan;
@@ -3219,9 +3274,13 @@ async function executeCloudTaskAgentCommand(command, token) {
                 cloudCommandId: commandId,
                 cloudAssigned: true,
                 executionMode,
-                orchestrationContext: normalizeOrchestrationExecutionContext(
-                  payload.orchestration,
-                ),
+                orchestrationContext: normalizeOrchestrationExecutionContext({
+                  ...(payload.orchestration &&
+                  typeof payload.orchestration === 'object'
+                    ? payload.orchestration
+                    : {}),
+                  attemptIdentity: payload.attemptIdentity,
+                }),
               },
             );
             if (!request) {
@@ -3960,9 +4019,22 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
     const nextRequest = {
       ...request,
       status: 'canceled',
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      wakeGraceUntil: '',
       finishedAt: now,
       updatedAt: now,
       message,
+      progress: {
+        ...(request.progress && typeof request.progress === 'object'
+          ? request.progress
+          : {}),
+        phase: 'unattended_canceled',
+        waitUntil: '',
+        remainingMs: null,
+        message,
+        updatedAt: now,
+      },
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
@@ -4069,6 +4141,53 @@ async function releaseUnattendedKeywordPlanLock() {
   return await releaseCaptureExecutionLock(activeLock.id);
 }
 
+async function cleanupTerminalUnattendedRuntime(request, tabIds = []) {
+  const normalizedRequest = normalizeUnattendedRunRequest(request);
+  if (!normalizedRequest) return {request: null, relayedCount: 0};
+  const reconciledRequest = normalizeUnattendedRunRequest({
+    ...normalizedRequest,
+    recoveryPendingLaunch: false,
+    recoveryWaitUntil: '',
+    wakeGraceUntil: '',
+    progress: {
+      ...(normalizedRequest.progress &&
+      typeof normalizedRequest.progress === 'object'
+        ? normalizedRequest.progress
+        : {}),
+      phase: `unattended_${normalizedRequest.status}`,
+      waitUntil: '',
+      remainingMs: null,
+    },
+  });
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
+  });
+  const terminalLock = await snapshotUnattendedKeywordPlanLock();
+  const progress = normalizeUnattendedRunProgress(
+    reconciledRequest.progress,
+    reconciledRequest.message,
+  );
+  const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
+    terminalLock,
+    [
+      ...tabIds,
+      reconciledRequest.runnerTabId,
+      progress?.runnerTabId,
+    ],
+  );
+  // The local ledger can reach a terminal state after the execution lease was
+  // already released.  The stable unattended task id is still sufficient to
+  // find and close a stranded Debug/group/worker session, so cleanup must not
+  // depend on a surviving lock document.
+  await releaseUnattendedCaptureTaskResourcesForRecovery(terminalLock, {
+    reason: 'unattended_terminal_cleanup',
+    request: reconciledRequest,
+  }).catch((error) => {
+    console.warn('[Background] terminal unattended cleanup pending:', error);
+  });
+  return {request: reconciledRequest, relayedCount};
+}
+
 async function snapshotUnattendedKeywordPlanLock() {
   const activeLock = await readActiveCaptureExecutionLock();
   return String(activeLock?.owner || '') === 'unattended_keyword_plan'
@@ -4130,10 +4249,16 @@ async function cancelUnattendedKeywordRunFromControl({
     isTerminalUnattendedRunStatus(request.status) &&
     request.status !== 'needs_action'
   ) {
-    if (isRetryableUnattendedRunRequest(request)) {
+    const terminalCleanup = await cleanupTerminalUnattendedRuntime(
+      request,
+      [tabId],
+    );
+    const reconciledTerminalRequest = terminalCleanup.request || request;
+    const relayedCount = terminalCleanup.relayedCount;
+    if (isRetryableUnattendedRunRequest(reconciledTerminalRequest)) {
       const now = new Date().toISOString();
       const dismissedRequest = {
-        ...request,
+        ...reconciledTerminalRequest,
         recoveryDismissedAt: now,
         recoveryDismissedMessage: message,
         updatedAt: now,
@@ -4148,15 +4273,15 @@ async function cancelUnattendedKeywordRunFromControl({
         reason: 'results_kept',
         request: dismissedRequest,
         plan: await readUnattendedKeywordPlan(),
-        relayedCount: 0,
+        relayedCount,
       };
     }
     return {
       accepted: true,
       reason: 'already_terminal',
-      request,
+      request: reconciledTerminalRequest,
       plan: await readUnattendedKeywordPlan(),
-      relayedCount: 0,
+      relayedCount,
     };
   }
   if (!request) {
@@ -5184,7 +5309,7 @@ async function claimUnattendedKeywordRun({
 }
 
 async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch = {}} = {}) {
-  return await runUnattendedRunMutation(async () => {
+  const result = await runUnattendedRunMutation(async () => {
     const request = await readUnattendedKeywordRunRequest();
     if (!request || !requestId || request.id !== requestId) {
       return {accepted: false, reason: 'not_found', data: null};
@@ -5306,11 +5431,21 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
     };
     if (isTerminalUnattendedRunStatus(nextStatus)) {
       nextRequest.finishedAt = String(safePatch.finishedAt || now);
+      nextRequest.recoveryPendingLaunch = false;
+      nextRequest.recoveryWaitUntil = '';
+      nextRequest.wakeGraceUntil = '';
+      nextRequest.progress = {
+        ...(nextRequest.progress && typeof nextRequest.progress === 'object'
+          ? nextRequest.progress
+          : {}),
+        waitUntil: '',
+        remainingMs: null,
+      };
     }
     delete nextRequest.requestId;
 
     const statusChanged = nextStatus !== request.status;
-    await persistUnattendedRunMutation(nextRequest, {
+    const persisted = await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
       event:
         statusChanged || hasBusinessProgress
@@ -5327,8 +5462,27 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
             }
           : null,
     });
-    return {accepted: true, reason: 'updated', data: nextRequest};
+    return {
+      accepted: true,
+      reason: 'updated',
+      data: persisted?.request || nextRequest,
+      previousRunnerTabId: request.runnerTabId,
+    };
   });
+  if (
+    result?.accepted &&
+    isTerminalUnattendedRunStatus(result.data?.status)
+  ) {
+    const terminalCleanup = await cleanupTerminalUnattendedRuntime(
+      result.data,
+      [result.previousRunnerTabId, result.data?.progress?.runnerTabId],
+    );
+    return {
+      ...result,
+      data: terminalCleanup.request || result.data,
+    };
+  }
+  return result;
 }
 
 async function launchUnattendedKeywordRun(
@@ -9241,7 +9395,7 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   } else {
     captureTaskOwnerCoordinator?.clearTask(taskId);
   }
-  await clearUnattendedCaptureTaskLockBinding(lock.id, taskId, {
+  await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
     expectedHolderId: lock?.holderId,
     expectedHolderDocumentId: lock?.holderDocumentId,
     expectedHolderTabId: lock?.holderTabId,

@@ -27,6 +27,8 @@ import {
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
+  elasticAttemptBudgetAfterOutcome,
+  projectElasticAttemptBudget,
   elasticRecoveryHoldRemainingMs,
   isProfilePatrolTask,
   lockActiveCaptureAgentSession,
@@ -242,6 +244,46 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     updated_at: "2026-08-12T01:55:00.000Z",
   }, now), 0);
+});
+
+test("elastic queue does not spend business retries on local capacity or dispatch failures", () => {
+  assert.equal(elasticAttemptBudgetAfterOutcome(3, {
+    error: {code: "capture_task_group_busy"},
+  }), 2);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "create_command_expired"},
+  }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+  }), 2);
+  const firstProjection = projectElasticAttemptBudget({
+    attempt_count: 3,
+    metadata: {elasticAttemptBudgetUsed: 3},
+  }, {
+    error: {code: "capture_task_group_busy"},
+  }, "11111111-1111-4111-8111-111111111111");
+  assert.equal(firstProjection.attemptBudget, 2);
+  assert.equal(firstProjection.refunded, true);
+  const replayProjection = projectElasticAttemptBudget({
+    attempt_count: 3,
+    metadata: firstProjection.metadataPatch,
+  }, {
+    error: {code: "capture_task_group_busy"},
+  }, "11111111-1111-4111-8111-111111111111");
+  assert.equal(replayProjection.attemptBudget, 2);
+  assert.equal(replayProjection.refunded, false);
+
+  const now = Date.parse("2026-08-13T02:00:00.000Z");
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "capture_task_group_busy"},
+    updated_at: "2026-08-13T01:45:00.000Z",
+  }, now), 15 * 60_000);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "elastic_task_heartbeat_timeout"},
+    updated_at: "2026-08-13T01:55:00.000Z",
+  }, now), 5 * 60_000);
 });
 
 test("automatic relay excludes devices per selected item instead of per parent task", () => {
@@ -712,7 +754,7 @@ test("operator stop terminal snapshots settle every unresolved child item", () =
   );
   assert.match(
     projection,
-    /metadata = metadata \|\| jsonb_build_object\('checkpoint', \$4::jsonb\)/u,
+    /metadata = metadata \|\| jsonb_build_object\('checkpoint', \$3::jsonb\)/u,
     "checkpoint evidence must remain stored before terminal settlement",
   );
 });
@@ -1198,8 +1240,13 @@ test("elastic queue claims one keyword or negative post per idle heartbeat and f
   assert.match(claim, /createAckTimeoutSeconds/u);
   assert.match(claim, /ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS/u);
   assert.match(claim, /attempt_count = \$1/u);
-  assert.match(claim, /assignment_revision = \$4/u);
-  assert.match(claim, /execution_task_id = \$3/u);
+  assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
+  assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
+  assert.match(claim, /elasticAttemptBudgetUsed/u);
+  assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
+  assert.match(claim, /attemptIdentity,/u);
+  assert.match(claim, /assignment_revision = \$5/u);
+  assert.match(claim, /execution_task_id = \$4/u);
   assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
   assert.match(claim, /classifyCaptureRecoveryDisposition/u);
   assert.match(claim, /'manual_current'/u);
@@ -1247,6 +1294,9 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   );
   assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
   assert.match(lease, /agent\.last_heartbeat_at/u);
+  assert.match(lease, /child\.heartbeat_at/u);
+  assert.match(lease, /elastic_task_heartbeat_timeout/u);
+  assert.match(lease, /!Number\.isFinite\(agentHeartbeatAt\)/u);
   assert.match(lease, /status: 'retryable'/u);
   assert.match(lease, /elastic_agent_offline_timeout/u);
   assert.match(lease, /FOR UPDATE SKIP LOCKED/u);

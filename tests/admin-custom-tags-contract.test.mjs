@@ -28,10 +28,19 @@ test('React admin exposes reusable custom tag editing and filtering', async () =
   assert.match(tagUi, /addTagIds/);
   assert.match(tagUi, /removeTagIds/);
   assert.match(tagUi, /保存标签/);
+  assert.match(tagUi, /onSave\(\{ addTagIds: \[\], addNames: \[\], removeTagIds: \[tag\.id\] \}\)/);
+  assert.match(tagUi, /只解除当前内容的关联/);
+  assert.match(tagUi, /标签选项仍会保留，其他内容不受影响/);
+  assert.match(tagUi, /上方 × 只从当前内容移除；下方垃圾桶删除整个标签选项/);
+  assert.match(tagUi, /onDeleteCatalogTag/);
+  assert.match(tagUi, /window\.confirm/);
+  assert.match(tagUi, /删除整个标签选项/);
+  assert.match(tagUi, /Trash2/);
 
   assert.match(drawer, /onUpdateCustomTags/);
   assert.match(drawer, /RecordLabelEditor/);
   assert.match(drawer, /RecordLabelsHeading/);
+  assert.match(drawer, /onDeleteCustomTag/);
 
   assert.match(triage, /api\.get<\{ tags\?: unknown \}>\('\/custom-tags\?' \+ params\)/);
   assert.match(triage, /api\.patch<CustomTagsMutationResponse>\('\/records\/' \+ recordId \+ '\/custom-tags'/);
@@ -40,6 +49,10 @@ test('React admin exposes reusable custom tag editing and filtering', async () =
   assert.match(triage, /customTagIds\.length[\s\S]*await load/);
   assert.match(triage, /stillMatches[\s\S]*current\.filter\(record => record\.id !== recordId\)/);
   assert.match(triage, /onSearch=\{loadCustomTagCatalog\}/);
+  assert.match(triage, /api\.delete<DeleteCustomTagResponse>\('\/custom-tags\/'/);
+  assert.match(triage, /setCustomTagCatalog\(current => current\.filter/);
+  assert.match(triage, /tagsFromRecord\(record\)\.filter/);
+  assert.match(triage, /并已从 \$\{affectedRecords\.toLocaleString\('zh-CN'\)\} 条内容中移除/);
 
   assert.match(multiSelect, /searchable = false/);
   assert.match(multiSelect, /onSearch\?: \(query: string\) => void/);

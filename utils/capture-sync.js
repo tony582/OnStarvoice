@@ -6524,6 +6524,25 @@ function mergeHydratedDetailIntoRecordPayload(record) {
   };
   protectDouyinDetailAuthorAgainstListItem(record, mergedItem, firstItem);
 
+  // 同一抖音作品的详情正文可能先返回折叠 DOM，稍后才有完整 desc。
+  // 只有 DOM 未经接口验证时才保护长版本；完整 API desc 允许真实编辑变短。
+  const listTitle = /^抖音搜索结果/.test(String(firstItem.title || ''))
+    ? ''
+    : firstItem.title;
+  const detailPlatform = String(
+    record?.platform || detail?.platform || resolvePayloadPlatform(detail),
+  ).trim().toLowerCase();
+  const detailTextVerified =
+    String(detail.contentCompleteness || '').trim().toLowerCase() === 'complete' ||
+    String(detail.contentSource || '').trim().toLowerCase() === 'api_detail';
+  if (detailPlatform === 'douyin' && !detailTextVerified) {
+    mergedItem.title = pickMoreCompleteCapturedText(listTitle, detail.title);
+    mergedItem.content = pickMoreCompleteCapturedText(
+      firstItem.content || listTitle,
+      detail.content || detail.title,
+    );
+  }
+
   // 详情增强若返回空标题/正文(典型:抖音图文 desc 常为空),别用空覆盖搜索卡片已采到的真实值。
   // 卡片兜底占位「抖音搜索结果 N」不算真标题,不回填;抖音正文=标题,缺正文时用标题补。
   if (!mergedItem.title && firstItem.title && !/^抖音搜索结果/.test(String(firstItem.title))) {
@@ -6553,9 +6572,44 @@ function mergeHydratedDetailIntoRecordPayload(record) {
   const mergedItems = items.length > 0 ? [mergedItem, ...items.slice(1)] : [mergedItem];
   return {
     ...payload,
+    detailPayload:
+      payload.detailPayload && typeof payload.detailPayload === 'object'
+        ? {
+            ...payload.detailPayload,
+            title: mergedItem.title,
+            content: mergedItem.content,
+          }
+        : payload.detailPayload,
     items: mergedItems,
     totalCount: payload.totalCount || mergedItems.length,
   };
+}
+
+export function pickMoreCompleteCapturedText(existingValue, incomingValue) {
+  const existing = String(existingValue || '').trim();
+  const incoming = String(incomingValue || '').trim();
+  if (!incoming) return existing;
+  if (!existing) return incoming;
+  const comparable = value => String(value || '')
+    .normalize('NFKC')
+    .trim()
+    .replace(/\s*(?:\.{3}|…+)\s*展开\s*$/u, '')
+    .replace(/\s+/gu, '');
+  const existingComparable = comparable(existing);
+  const incomingComparable = comparable(incoming);
+  if (
+    incomingComparable.length < existingComparable.length &&
+    existingComparable.startsWith(incomingComparable)
+  ) {
+    return existing;
+  }
+  if (
+    existingComparable.length < incomingComparable.length &&
+    incomingComparable.startsWith(existingComparable)
+  ) {
+    return incoming;
+  }
+  return incoming;
 }
 
 function isSyncCancellationRequested(shouldStop, signal = null) {
@@ -10876,8 +10930,19 @@ function ensureBloggerMetricsFields(payload) {
 
 function applyBloggerMetricsPatch(payload, patch) {
   const base = ensureBloggerMetricsFields(payload);
+  const bloggerName = patch.bloggerName === undefined
+    ? ''
+    : String(patch.bloggerName || '').trim();
   return {
     ...base,
+    ...(bloggerName
+      ? {
+          bloggerName,
+          author: bloggerName,
+          authorName: bloggerName,
+          authorNameBoundToProfile: true,
+        }
+      : {}),
     bloggerFollowersCount:
       patch.bloggerFollowersCount ?? base.bloggerFollowersCount,
     bloggerLikedAndCollectedCount:
@@ -10900,6 +10965,7 @@ function createBloggerMetricsPatch({
   error,
   accountType,
   bloggerId,
+  bloggerName,
 }) {
   const patch = {
     bloggerMetricsCaptureStatus: status,
@@ -10922,6 +10988,9 @@ function createBloggerMetricsPatch({
   }
   if (bloggerId !== undefined) {
     patch.bloggerUserId = String(bloggerId || '');
+  }
+  if (bloggerName !== undefined) {
+    patch.bloggerName = String(bloggerName || '').trim();
   }
 
   return patch;
@@ -10977,6 +11046,11 @@ function resolveBloggerMetricsFromProfilePayload(
       fallbackProfileUrl,
     error: '',
     accountType: safePayload.bloggerAccountType || safePayload.accountType,
+    bloggerName:
+      safePayload.bloggerName ||
+      safePayload.authorName ||
+      safePayload.author ||
+      safePayload.nickname,
     // 只回填「人看的号」,内部 hex / sec_uid 一律不写(宁可空也不写错)
     bloggerId: pickHumanAccountNo(safePayload),
   });
@@ -12119,10 +12193,16 @@ function isSupportedCaptureHostname(hostname) {
 
 function buildDetailCapturePreview(record, detailPayload) {
   const baseTitle = String(record?.title || '').trim();
-  const title =
-    String(detailPayload?.title || '').trim() ||
-    baseTitle ||
-    '笔记详情';
+  const detailTitle = String(detailPayload?.title || '').trim();
+  const detailTextVerified =
+    String(detailPayload?.contentCompleteness || '').trim().toLowerCase() === 'complete' ||
+    String(detailPayload?.contentSource || '').trim().toLowerCase() === 'api_detail';
+  const title = (
+    String(record?.platform || '').trim().toLowerCase() === 'douyin' &&
+    !detailTextVerified
+      ? pickMoreCompleteCapturedText(baseTitle, detailTitle)
+      : detailTitle || baseTitle
+  ) || '笔记详情';
   const author = String(detailPayload?.author || '').trim();
   const likes = Number(detailPayload?.likes || 0);
   const summary = author ? `${author} · 点赞 ${likes}` : `点赞 ${likes}`;

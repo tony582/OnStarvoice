@@ -4,8 +4,10 @@ import test from 'node:test';
 import {normalizeRecord} from '../server/routes/sync.js';
 import {
   guardRecordCommentCount,
+  guardRecordTextCompleteness,
   mergeObservationMetrics,
   resolveGuardedCommentsCount,
+  resolveCapturedTextUpdate,
 } from '../server/services/record-store.js';
 import {
   resolveMetricUpdateFromPayload,
@@ -89,6 +91,52 @@ test('sync normalization preserves comment count certainty and source', () => {
   assert.equal(record.comments_count, 22);
   assert.equal(record.comments_count_known, true);
   assert.equal(record.comments_count_source, 'api_statistics');
+});
+
+test('a collapsed prefix cannot overwrite a more complete captured body', () => {
+  const full = '接到安吉星续费推销电话。客服原话：套餐即将到期，到期所有功能都会被婉拒。';
+  const short = '接到安吉星续费推销电话。客服原话：套餐即将到期，到期所';
+  assert.deepEqual(resolveCapturedTextUpdate(full, short), {
+    value: full,
+    preserved: true,
+    reason: 'truncated_prefix',
+  });
+  assert.equal(resolveCapturedTextUpdate(short, full).value, full);
+  assert.equal(resolveCapturedTextUpdate(full, '作者重新编辑后的另一段内容').value, '作者重新编辑后的另一段内容');
+
+  const guarded = guardRecordTextCompleteness({
+    platform: 'douyin',
+    title: short,
+    content: short,
+    payload: JSON.stringify({
+      title: short,
+      content: short,
+      contentCompleteness: 'unverified_dom',
+    }),
+  }, { title: full, content: full });
+  assert.equal(guarded.title, full);
+  assert.equal(guarded.content, full);
+  assert.equal(JSON.parse(guarded.payload).content, full);
+
+  const legacyGuarded = guardRecordTextCompleteness({
+    platform: 'douyin',
+    title: short,
+    content: short,
+    payload: JSON.stringify({ title: short, content: short }),
+  }, { title: full, content: full });
+  assert.equal(legacyGuarded.content, full);
+
+  const verifiedShortEdit = guardRecordTextCompleteness({
+    platform: 'douyin',
+    title: short,
+    content: short,
+    payload: JSON.stringify({
+      title: short,
+      content: short,
+      contentCompleteness: 'complete',
+    }),
+  }, { title: full, content: full });
+  assert.equal(verifiedShortEdit.content, short);
 });
 
 test('confirmed zero updates while an unproven displayed zero stays unknown', () => {

@@ -25,6 +25,7 @@ const TRIAGE_STATUS_CN = {
   reviewed: '已复核',
   reviewed_non_monitor: '已复核-非监控内容',
   unavailable: '已不可见',
+  privacy_unreachable: '隐私限制-无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
   // 仅用于历史导出与审计展示；059 迁移后不会再作为当前状态写入。
@@ -130,6 +131,7 @@ const TRIAGE_STATUSES = new Set([
   'reviewed',
   'reviewed_non_monitor',
   'unavailable',
+  'privacy_unreachable',
   'negative_feishu',
   'negative_cold',
 ]);
@@ -151,7 +153,7 @@ const TRIAGE_CONTENT_CONDITION = `
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
   AND COALESCE(rt.status, 'unhandled') IN (
     'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
-    'unavailable', 'negative_feishu', 'negative_cold'
+    'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold'
   )
 `;
 
@@ -422,6 +424,24 @@ function appendSentimentFilter(where, params, sentiment) {
   return `${where} AND r.sentiment = $${params.length}`;
 }
 
+function appendStatusFilter(where, params, rawStatus) {
+  const requested = (Array.isArray(rawStatus) ? rawStatus : [rawStatus])
+    .flatMap(value => String(value || '').split(','))
+    .map(value => value.trim())
+    .filter(Boolean);
+  const invalid = requested.filter(value => !TRIAGE_STATUSES.has(value));
+  if (invalid.length > 0) {
+    const error = new Error('处理状态筛选包含无效值');
+    error.status = 400;
+    error.code = 'invalid_status_filter';
+    throw error;
+  }
+  const statuses = [...new Set(requested)];
+  if (!statuses.length) return where;
+  params.push(statuses);
+  return `${where} AND COALESCE(rt.status, 'unhandled') = ANY($${params.length}::text[])`;
+}
+
 // 风险信号多选筛选(有预警 / 有负评 / 已删帖),命中任一即入选(OR)。条件为字面 SQL,不绑定参数。
 // 注:作者身份(原"疑似KOE")已从风险信号拆出,改为独立的「疑似身份」维度(见 identityWhereClause)。
 function riskWhereClause(reqRisk) {
@@ -490,10 +510,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
     }
-    if (status) {
-      params.push(status);
-      where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
-    }
+    where = appendStatusFilter(where, params, status);
     // 风险信号只包含预警与负评；身份、处理状态分别使用独立筛选。
     where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
@@ -598,6 +615,9 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       pagination: { page: Number(page), pageSize: limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
+    }
     return next(err);
   }
 });
@@ -1059,10 +1079,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
     }
-    if (status) {
-      params.push(status);
-      where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
-    }
+    where = appendStatusFilter(where, params, status);
     where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     const keywordFilter = appendKeywordFilter(where, params, keyword);
@@ -1240,6 +1257,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
 
     await sendXlsx(res, { sheetName: '内容分诊', columns, rows, filename: `内容分诊_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
   } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
+    }
     return next(err);
   }
 });

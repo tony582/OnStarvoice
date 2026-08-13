@@ -44,6 +44,14 @@ interface CustomTagsMutationResponse {
   custom_tags?: unknown
   record?: unknown
 }
+interface DeleteCustomTagResponse {
+  affectedRecords?: unknown
+  tag?: {
+    id?: unknown
+    name?: unknown
+    affectedRecords?: unknown
+  }
+}
 interface ManualFieldsMutationResponse {
   record?: unknown
 }
@@ -67,7 +75,7 @@ const RISK_OPTIONS = [
   { value: 'deleted', label: '已删帖' },
 ]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
-type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'negative_feishu' | 'negative_cold'
+type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold'
 type ArchiveView = 'active' | 'archived'
 const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: React.ElementType }> = [
   { value: 'unhandled', label: '待处理', icon: Inbox },
@@ -75,6 +83,7 @@ const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: Reac
   { value: 'reviewed', label: '已复核', icon: Check },
   { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
   { value: 'unavailable', label: '已不可见', icon: CircleOff },
+  { value: 'privacy_unreachable', label: '隐私限制-无法触达', icon: CircleOff },
   { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
   { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
 ]
@@ -175,6 +184,71 @@ function HeaderSingleFilter({ label, value, options, onChange }: {
   )
 }
 
+function HeaderMultiFilter({ label, value, options, onChange }: {
+  label: string
+  value: string[]
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string[]) => void
+}) {
+  const toggle = (nextValue: string) => onChange(
+    value.includes(nextValue)
+      ? value.filter(item => item !== nextValue)
+      : [...value, nextValue],
+  )
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`${label}筛选${value.length ? `，已选${value.length}项` : '，全部'}`}
+          className={cn(
+            'inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium uppercase tracking-wider outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20',
+            value.length ? 'text-primary' : 'text-muted-foreground',
+          )}
+        >
+          <span>{label}</span>
+          {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
+          <ChevronDown className="h-3 w-3" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={5}
+          collisionPadding={10}
+          className="z-[100] min-w-48 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
+        >
+          {value.length > 0 && (
+            <DropdownMenu.Item
+              onSelect={event => { event.preventDefault(); onChange([]) }}
+              className="flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 text-[11px] text-muted-foreground outline-none data-[highlighted]:bg-accent data-[highlighted]:text-foreground"
+            >
+              <X className="h-3 w-3" />清空已选（{value.length}）
+            </DropdownMenu.Item>
+          )}
+          {options.map(option => {
+            const checked = value.includes(option.value)
+            return (
+              <DropdownMenu.CheckboxItem
+                key={option.value}
+                checked={checked}
+                onCheckedChange={() => toggle(option.value)}
+                onSelect={event => event.preventDefault()}
+                className="flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent"
+              >
+                <span className={cn('flex-1', checked && 'font-semibold')}>{option.label}</span>
+                <span className="flex h-4 w-4 items-center justify-center rounded border border-border">
+                  <DropdownMenu.ItemIndicator><Check className="h-3 w-3 text-primary" /></DropdownMenu.ItemIndicator>
+                </span>
+              </DropdownMenu.CheckboxItem>
+            )
+          })}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  )
+}
+
 function recordAccentClass(record: Record<string, unknown>) {
   if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold') return 'bg-status-red'
   if (record.triage_status === 'replied' || record.triage_status === 'reviewed') return 'bg-status-green'
@@ -266,7 +340,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
-  const [triageStatus, setTriageStatus] = useState(initial?.status ?? '')
+  const [triageStatuses, setTriageStatuses] = useState<string[]>(() =>
+    String(initial?.status || '').split(',').map(value => value.trim()).filter(Boolean))
   const [risk, setRisk] = useState<string[]>([])
   const [identity, setIdentity] = useState<string[]>([])
   const [captureKeywords, setCaptureKeywords] = useState<string[]>(() => String(initial?.captureKeywords || '')
@@ -297,7 +372,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
-  const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
 
   const showBatchFeedback = useCallback((message: string, tone: BatchFeedback['tone']) => {
     window.clearTimeout(batchFeedbackTimer.current)
@@ -325,7 +400,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const params = new URLSearchParams({ sentiment, platform, keyword })
     if (archiveView === 'archived') params.set('bucket', 'archived')
     else params.set('queue', 'triage')
-    if (triageStatus) params.set('status', triageStatus)
+    triageStatuses.forEach(status => params.append('status', status))
     risk.forEach(rk => params.append('risk', rk))
     identity.forEach(id => params.append('identity', id))
     params.set('sort', sort.field)
@@ -340,7 +415,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
     if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
     return params
-  }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (!options?.silent) setLoading(true)
@@ -367,18 +442,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
-  const handlingStatus = triageStatus
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
-  const activeFilterCount = [platform, sentiment, triageStatus].filter(Boolean).length
-    + Number(Boolean(keyword)) + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
+  const activeFilterCount = [platform, sentiment].filter(Boolean).length
+    + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setSort({ field: 'publish', dir: 'desc' })
-  }
-  const changeHandlingStatusFilter = (value: string) => {
-    setTriageStatus(value)
   }
   useEffect(() => { void load() }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
@@ -477,6 +548,31 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return tags
   }
 
+  const deleteCustomTag = async (tag: CustomTag): Promise<number> => {
+    if (archiveView === 'archived') return 0
+    const data = await api.delete<DeleteCustomTagResponse>('/custom-tags/' + encodeURIComponent(tag.id))
+    const affectedRecords = Math.max(0, Number(data.affectedRecords ?? data.tag?.affectedRecords ?? tag.usageCount ?? 0))
+    const deletedId = String(data.tag?.id || tag.id)
+
+    // 使删除前发出的目录请求失效，避免旧响应把刚删掉的标签重新放回列表。
+    customTagRequestSeq.current += 1
+    setCustomTagCatalog(current => current.filter(item => item.id !== deletedId))
+    setCustomTagIds(current => current.filter(id => id !== deletedId))
+    const withoutDeletedTag = (record: Record<string, unknown>) => withCustomTags(
+      record,
+      tagsFromRecord(record).filter(item => item.id !== deletedId),
+    )
+    setRecords(current => current.map(record => withoutDeletedTag(record)))
+    setDrawerRecord((current: Record<string, unknown> | null) => current ? withoutDeletedTag(current) : current)
+    showBatchFeedback(
+      affectedRecords > 0
+        ? `标签“${String(data.tag?.name || tag.name)}”已删除，并已从 ${affectedRecords.toLocaleString('zh-CN')} 条内容中移除`
+        : `标签“${String(data.tag?.name || tag.name)}”已删除`,
+      'success',
+    )
+    return affectedRecords
+  }
+
   const addRecordNote = useCallback(async (record: any): Promise<boolean> => {
     if (archiveView === 'archived' || record.archived_at || noteBusyId) return false
     const body = await ask({
@@ -552,8 +648,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }, [archiveView, keyword, load, pagination])
 
   const modeVisibleInCurrentList = useCallback((newStatus: string) => {
-    return !triageStatus || triageStatus === newStatus
-  }, [triageStatus])
+    return triageStatuses.length === 0 || triageStatuses.includes(newStatus)
+  }, [triageStatuses])
 
   const syncModeLocally = useCallback((
     ids: Iterable<string>,
@@ -753,6 +849,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     onUpdateFields: drawerArchived ? undefined : (fields: ManualRecordFields) => updateManualFields(drawerRecord.id, fields),
     customTagCatalog,
     onUpdateCustomTags: drawerArchived ? undefined : (patch: CustomTagPatch) => updateCustomTags(drawerRecord.id, patch),
+    onDeleteCustomTag: drawerArchived ? undefined : deleteCustomTag,
     initialTab: drawerInitialTab,
     onProgressAdded: (progress: RecordProgressSummary) => {
       const recordId = drawerRecord.id
@@ -838,7 +935,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   type="button"
                   onClick={() => {
                     setArchiveView(item.value)
-                    setTriageStatus('')
+                    setTriageStatuses([])
                     if (item.value === 'archived') setView('list')
                   }}
                   role="tab"
@@ -973,12 +1070,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
           {view === 'list' && (
             <div className="w-full lg:w-[160px] xl:w-full">
-              <TriageSelect value={handlingStatus} onChange={e => changeHandlingStatusFilter(e.target.value)}
-                aria-label="处理状态筛选"
-                className={cn('bg-muted font-medium hover:bg-muted/70', handlingStatus ? 'text-foreground' : 'text-muted-foreground')}>
-                <option value="">全部状态</option>
-                {contentStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-              </TriageSelect>
+              <MultiSelect
+                label="全部状态"
+                options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
+                value={triageStatuses}
+                onChange={setTriageStatuses}
+                triggerClassName="w-full justify-between"
+              />
             </div>
           )}
 
@@ -1113,14 +1211,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="sticky right-0 z-50 w-[224px] min-w-[224px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
                   <div className="grid grid-cols-[132px_48px] items-center gap-2">
                     <div className="flex justify-center">
-                      <HeaderSingleFilter
+                      <HeaderMultiFilter
                         label="处理状态"
-                        value={handlingStatus}
-                        onChange={changeHandlingStatusFilter}
-                        options={[
-                          { value: '', label: '全部状态' },
-                          ...contentStatusOptions.map(([value, label]) => ({ value, label })),
-                        ]}
+                        value={triageStatuses}
+                        onChange={setTriageStatuses}
+                        options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
                       />
                     </div>
                     <span className="sr-only">备注</span>

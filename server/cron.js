@@ -125,7 +125,7 @@ export function startCronJobs() {
       const elasticLeases = await reconcileElasticCaptureLeases(50);
       if (elasticLeases.requeued > 0) {
         console.log(
-          `[Cron] Elastic work queue: ${elasticLeases.requeued} offline item(s) requeued`,
+          `[Cron] Elastic work queue: ${elasticLeases.requeued} stale item(s) requeued`,
         );
       }
       const recovery = await reconcileAutomaticCaptureRetries(10);

@@ -1898,6 +1898,7 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
           itemIds: ["item-elastic-context"],
           distributionMode: "elastic_pool",
         },
+        attemptIdentity: "elastic-attempt-context",
       },
     },
     "agent-token",
@@ -1913,6 +1914,10 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
   assert.equal(
     request.orchestrationContext.distributionMode,
     "elastic_pool",
+  );
+  assert.equal(
+    request.orchestrationContext.attemptIdentity,
+    "elastic-attempt-context",
   );
 });
 
@@ -4244,6 +4249,83 @@ test("cancel rejects a stale task id without touching the current request", asyn
   assert.equal(response.reason, "request_mismatch");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, request.id);
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+});
+
+test("terminal cancellation is idempotent and clears a stranded recovery wait", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    recoveryPendingLaunch: true,
+    recoveryWaitUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    progress: {
+      current: 2,
+      total: 2,
+      phase: "waiting_automatic_recovery",
+      waitUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      remainingMs: 5 * 60 * 1000,
+    },
+  });
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{
+      id: request.id,
+      attemptId: request.attemptId,
+      status: "completed",
+      message: "任务已完成",
+      finishedAt: request.finishedAt,
+    }],
+  };
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const terminalLock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "terminal-holder",
+    holderDocumentId: "terminal-document",
+    holderTabId: 81,
+  });
+  assert.equal(terminalLock.ok, true);
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 81,
+      platform: "xiaohongshu",
+    },
+    buildUnattendedRunnerSender(request, terminalLock.lock.holderDocumentId),
+  );
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  await harness.api.releaseUnattendedKeywordPlanLock();
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.notEqual(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId),
+    null,
+  );
+  const finishedAt = new Date().toISOString();
+  Object.assign(harness.storage[UNATTENDED_REQUEST_KEY], {
+    status: "completed",
+    finishedAt,
+    updatedAt: finishedAt,
+  });
+  Object.assign(request, {status: "completed", finishedAt});
+  harness.storage[TASK_LEDGER_KEY].runs[0].finishedAt = finishedAt;
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:cancel-unattended-keyword-run",
+    requestId: request.id,
+    message: "停止任务",
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.reason, "already_terminal");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "completed");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryPendingLaunch,
+    false,
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryWaitUntil, "");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progress.waitUntil, "");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progress.remainingMs, null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId), null);
 });
 
 test("cancel snapshots the unattended lock holder and stops list capture before release", async () => {

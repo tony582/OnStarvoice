@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Check, Loader2, Plus, Search, Tag, X } from 'lucide-react'
+import { Check, Loader2, Plus, Search, Tag, Trash2, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
@@ -108,26 +108,34 @@ export function RecordLabelEditor({
   initialTags,
   catalog,
   onSave,
+  onDeleteCatalogTag,
   onCancel,
   onSavingChange,
 }: {
   initialTags: CustomTag[]
   catalog: CustomTag[]
   onSave: (patch: CustomTagPatch) => Promise<CustomTag[]>
+  onDeleteCatalogTag?: (tag: CustomTag) => Promise<number>
   onCancel: () => void
   onSavingChange?: (saving: boolean) => void
 }) {
   const [draft, setDraft] = useState<DraftTag[]>(() => initialTags.map(tag => ({ ...tag })))
   const [query, setQuery] = useState('')
   const [saving, setSaving] = useState(false)
+  const [deletingTagId, setDeletingTagId] = useState('')
+  const [removingTagId, setRemovingTagId] = useState('')
+  const [globallyDeletedTagIds, setGloballyDeletedTagIds] = useState<Set<string>>(() => new Set())
   const [error, setError] = useState('')
 
   const mergedCatalog = useMemo(() => {
     const byId = new Map<string, CustomTag>()
-    for (const tag of [...catalog, ...initialTags]) byId.set(tag.id, tag)
+    // 目录里的 usageCount 比记录上的精简标签更完整，因此同 ID 时以目录数据为准。
+    for (const tag of [...initialTags, ...catalog]) {
+      if (!globallyDeletedTagIds.has(tag.id)) byId.set(tag.id, tag)
+    }
     return [...byId.values()].sort((a, b) =>
       Number(b.usageCount || 0) - Number(a.usageCount || 0) || a.name.localeCompare(b.name, 'zh-CN'))
-  }, [catalog, initialTags])
+  }, [catalog, globallyDeletedTagIds, initialTags])
 
   const normalizedQuery = normalizeName(query)
   const filteredCatalog = mergedCatalog.filter(tag =>
@@ -135,13 +143,18 @@ export function RecordLabelEditor({
   const exactCatalogTag = mergedCatalog.find(tag => normalizeName(tag.name) === normalizedQuery)
   const exactDraftTag = draft.find(tag => normalizeName(tag.name) === normalizedQuery)
   const canCreate = Boolean(normalizedQuery && !exactCatalogTag && !exactDraftTag)
-  const initialIds = useMemo(() => new Set(initialTags.map(tag => tag.id)), [initialTags])
+  const initialIds = useMemo(() => new Set(
+    initialTags.filter(tag => !globallyDeletedTagIds.has(tag.id)).map(tag => tag.id),
+  ), [globallyDeletedTagIds, initialTags])
   const draftExistingIds = draft.filter(tag => !tag.pending).map(tag => tag.id)
   const draftPendingNames = draft.filter(tag => tag.pending).map(tag => tag.name)
   const addTagIds = draftExistingIds.filter(id => !initialIds.has(id))
-  const removeTagIds = initialTags.filter(tag => !draftExistingIds.includes(tag.id)).map(tag => tag.id)
+  const removeTagIds = initialTags
+    .filter(tag => !globallyDeletedTagIds.has(tag.id) && !draftExistingIds.includes(tag.id))
+    .map(tag => tag.id)
   const changed = addTagIds.length > 0 || removeTagIds.length > 0 || draftPendingNames.length > 0
   const atLimit = draft.length >= MAX_CUSTOM_TAGS
+  const busy = saving || Boolean(deletingTagId) || Boolean(removingTagId)
 
   const toggleCatalogTag = (tag: CustomTag) => {
     setError('')
@@ -183,7 +196,7 @@ export function RecordLabelEditor({
   }
 
   const save = async () => {
-    if (!changed || saving) return
+    if (!changed || busy) return
     setSaving(true)
     onSavingChange?.(true)
     setError('')
@@ -202,12 +215,64 @@ export function RecordLabelEditor({
     }
   }
 
+  const deleteCatalogTag = async (tag: CustomTag) => {
+    if (!onDeleteCatalogTag || busy) return
+    const affectedRecords = Math.max(0, Number(tag.usageCount || 0))
+    const message = affectedRecords > 0
+      ? `确定删除标签“${tag.name}”吗？这会删除整个标签选项，并从已关联的 ${affectedRecords.toLocaleString('zh-CN')} 条内容中移除；内容本身不会被删除。`
+      : `确定删除标签“${tag.name}”吗？这会删除整个标签选项，之后将无法再选择它。`
+    if (!window.confirm(message)) return
+
+    setDeletingTagId(tag.id)
+    onSavingChange?.(true)
+    setError('')
+    try {
+      await onDeleteCatalogTag(tag)
+      setGloballyDeletedTagIds(current => new Set([...current, tag.id]))
+      setDraft(current => current.filter(item => item.id !== tag.id))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '删除标签失败，请稍后重试')
+    } finally {
+      setDeletingTagId('')
+      onSavingChange?.(false)
+    }
+  }
+
+  const removeCurrentRecordTag = async (tag: DraftTag) => {
+    if (busy) return
+    if (tag.pending || !initialIds.has(tag.id)) {
+      setDraft(current => current.filter(item => item.id !== tag.id))
+      setError('')
+      return
+    }
+
+    if (!window.confirm(`确定从当前这条内容中移除标签“${tag.name}”吗？标签选项仍会保留，其他内容不受影响。`)) {
+      return
+    }
+
+    setRemovingTagId(tag.id)
+    onSavingChange?.(true)
+    setError('')
+    try {
+      await onSave({ addTagIds: [], addNames: [], removeTagIds: [tag.id] })
+      // 这里只解除当前内容的关联；目录中的标签选项和其他内容保持不变。
+      setDraft(current => current.filter(item => item.id !== tag.id))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '移除当前内容标签失败，请稍后重试')
+    } finally {
+      setRemovingTagId('')
+      onSavingChange?.(false)
+    }
+  }
+
   return (
     <div className="mt-2 rounded-xl border border-border bg-background/80 p-3 shadow-sm animate-in fade-in slide-in-from-top-1 duration-150">
       <div className="flex items-start gap-2">
         <div>
           <div className="text-[12px] font-bold text-foreground">管理自定义标签</div>
-          <div className="mt-0.5 text-[11px] text-muted-foreground">选择已有标签，或输入名称创建新标签。</div>
+          <div className="mt-0.5 text-[11px] text-muted-foreground">
+            上方 × 只从当前内容移除；下方垃圾桶删除整个标签选项。
+          </div>
         </div>
         <span className={cn('ml-auto text-[10.5px] font-semibold tabular-nums', atLimit ? 'text-amber-600 dark:text-amber-300' : 'text-muted-foreground')}>
           {draft.length}/{MAX_CUSTOM_TAGS}
@@ -218,11 +283,8 @@ export function RecordLabelEditor({
         <RecordLabelChips
           tags={draft}
           removable
-          disabled={saving}
-          onRemove={tag => {
-            setDraft(current => current.filter(item => item.id !== tag.id))
-            setError('')
-          }}
+          disabled={busy}
+          onRemove={tag => void removeCurrentRecordTag(tag)}
           className="mt-3"
         />
       ) : (
@@ -236,7 +298,7 @@ export function RecordLabelEditor({
         <input
           value={query}
           maxLength={MAX_CUSTOM_TAG_NAME}
-          disabled={saving}
+          disabled={busy}
           onChange={event => {
             setQuery(event.target.value)
             if (error) setError('')
@@ -266,7 +328,7 @@ export function RecordLabelEditor({
         {canCreate && (
           <button
             type="button"
-            disabled={atLimit || saving}
+            disabled={atLimit || busy}
             onClick={addFromInput}
             className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-[12px] font-semibold text-primary transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40"
           >
@@ -282,29 +344,47 @@ export function RecordLabelEditor({
           const selected = draft.some(item => item.id === tag.id)
           const tone = toneForTag(tag)
           return (
-            <button
+            <div
               key={tag.id}
-              type="button"
-              disabled={saving || (!selected && atLimit)}
-              onClick={() => toggleCatalogTag(tag)}
               className={cn(
-                'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40',
+                'group flex w-full items-center rounded-md text-[12px] transition hover:bg-accent',
                 selected && 'bg-accent/70',
               )}
             >
-              <span className="min-w-0 flex-1">
-                <span className={cn('inline-block max-w-full truncate rounded-md px-2 py-0.5 font-semibold ring-1 ring-inset', tone.chip)}>{tag.name}</span>
-              </span>
-              {Number(tag.usageCount || 0) > 0 && (
-                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{Number(tag.usageCount).toLocaleString('zh-CN')}</span>
+              <button
+                type="button"
+                disabled={busy || (!selected && atLimit)}
+                onClick={() => toggleCatalogTag(tag)}
+                className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left transition disabled:pointer-events-none disabled:opacity-40"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className={cn('inline-block max-w-full truncate rounded-md px-2 py-0.5 font-semibold ring-1 ring-inset', tone.chip)}>{tag.name}</span>
+                </span>
+                {Number(tag.usageCount || 0) > 0 && (
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{Number(tag.usageCount).toLocaleString('zh-CN')}</span>
+                )}
+                <span className={cn(
+                  'flex h-4 w-4 shrink-0 items-center justify-center rounded border',
+                  selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border',
+                )}>
+                  {selected && <Check className="h-3 w-3" strokeWidth={3} />}
+                </span>
+              </button>
+              {onDeleteCatalogTag && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void deleteCatalogTag(tag)}
+                  title={`删除整个标签选项“${tag.name}”`}
+                  aria-label={`删除整个标签选项 ${tag.name}`}
+                  className="mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 opacity-70 transition hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none disabled:opacity-40"
+                >
+                  {deletingTagId === tag.id
+                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    : <Trash2 className="h-3.5 w-3.5" />}
+                </button>
               )}
-              <span className={cn(
-                'flex h-4 w-4 shrink-0 items-center justify-center rounded border',
-                selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border',
-              )}>
-                {selected && <Check className="h-3 w-3" strokeWidth={3} />}
-              </span>
-            </button>
+            </div>
           )
         })}
       </div>
@@ -313,8 +393,8 @@ export function RecordLabelEditor({
       {!error && atLimit && <p className="mt-2 text-[11px] text-amber-600 dark:text-amber-300">已达到每条内容的标签上限。</p>}
 
       <div className="mt-3 flex items-center justify-end gap-2">
-        <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>取消</Button>
-        <Button size="sm" onClick={save} disabled={!changed || saving}>
+        <Button variant="outline" size="sm" onClick={onCancel} disabled={busy}>取消</Button>
+        <Button size="sm" onClick={save} disabled={!changed || busy}>
           {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
           保存标签
         </Button>

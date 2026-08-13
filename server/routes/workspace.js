@@ -148,6 +148,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed' AND rt.archived_at IS NULL) AS reviewed,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor' AND rt.archived_at IS NULL) AS reviewed_non_monitor,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unavailable' AND rt.archived_at IS NULL) AS unavailable,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'privacy_unreachable' AND rt.archived_at IS NULL) AS privacy_unreachable,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu' AND rt.archived_at IS NULL) AS negative_feishu,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold' AND rt.archived_at IS NULL) AS negative_cold,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') <> 'unhandled' AND rt.archived_at IS NULL) AS handled_total,

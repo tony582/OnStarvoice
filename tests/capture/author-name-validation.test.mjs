@@ -13,6 +13,10 @@ const verifiedNumericAuthor = {
     "https://www.xiaohongshu.com/user/profile/668e7f3f0000000003021234?xsec_token=test",
   userId: "668e7f3f0000000003021234",
 };
+const profileBoundAuthor = {
+  ...verifiedNumericAuthor,
+  nameFromProfileLink: true,
+};
 
 class FakeAuthorNode {
   constructor({className = "", href = ""} = {}) {
@@ -75,6 +79,8 @@ test("accepts emoji-only social display names", () => {
   assert.equal(validateAuthorName("🌻"), true);
   assert.equal(validateAuthorName("✨"), true);
   assert.equal(validateAuthorName("🌻小红"), true);
+  assert.equal(validateAuthorName("エコガ？エ"), true);
+  assert.equal(validateAuthorName("한글 닉네임"), true);
 });
 
 test("still rejects non-name placeholders", () => {
@@ -82,6 +88,13 @@ test("still rejects non-name placeholders", () => {
   assert.equal(validateAuthorName("昨天 22:41"), false);
   assert.equal(validateAuthorName("..."), false);
   assert.equal(validateAuthorName("关注"), false);
+  assert.equal(validateAuthorName("作者"), false);
+});
+
+test("profile-bound display text is preserved verbatim without language guessing", () => {
+  assert.equal(validateAuthorName("...", profileBoundAuthor), true);
+  assert.equal(validateAuthorName("作者", profileBoundAuthor), true);
+  assert.equal(validateAuthorName("昨天 22:41", profileBoundAuthor), true);
 });
 
 test("accepts a numeric display name only with container-bound XHS profile identity", () => {
@@ -221,10 +234,14 @@ test("derives numeric identity only from an unambiguous profile in the author co
   );
 });
 
-test("identity evidence cannot override time or placeholder rejection", () => {
-  assert.equal(validateAuthorName("12天前", verifiedNumericAuthor), false);
-  assert.equal(validateAuthorName("昨天 22:41", verifiedNumericAuthor), false);
-  assert.equal(validateAuthorName("关注", verifiedNumericAuthor), false);
+test("container identity without a profile-bound name cannot override placeholders", () => {
+  const unboundIdentity = {
+    ...profileBoundAuthor,
+    nameFromProfileLink: false,
+  };
+  assert.equal(validateAuthorName("12天前", unboundIdentity), false);
+  assert.equal(validateAuthorName("昨天 22:41", unboundIdentity), false);
+  assert.equal(validateAuthorName("关注", unboundIdentity), false);
 });
 
 test("final payload requires matching profile identity for numeric authors only", () => {
@@ -233,6 +250,7 @@ test("final payload requires matching profile identity for numeric authors only"
       author: "123",
       authorId: verifiedNumericAuthor.userId,
       authorUrl: verifiedNumericAuthor.profileUrl,
+      authorNameBoundToProfile: true,
     }),
     true,
   );
@@ -242,6 +260,7 @@ test("final payload requires matching profile identity for numeric authors only"
         author: "123",
         authorId: "different-user-id",
         authorUrl: verifiedNumericAuthor.profileUrl,
+        authorNameBoundToProfile: true,
       }),
     /纯数字作者身份不完整/u,
   );

@@ -56,6 +56,7 @@ const TRIAGE_LABEL = {
   reviewed: '已复核',
   reviewed_non_monitor: '已复核-非监控内容',
   unavailable: '已不可见',
+  privacy_unreachable: '隐私限制-无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
   // 历史状态兼容。
@@ -681,6 +682,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed') as reviewed,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor') as reviewed_non_monitor,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unavailable') as unavailable,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'privacy_unreachable') as privacy_unreachable,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu') as negative_feishu,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold') as negative_cold,
        COUNT(*) FILTER (
@@ -791,6 +793,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
       reviewed: rowNum(workflowStats, 'reviewed'),
       reviewed_non_monitor: rowNum(workflowStats, 'reviewed_non_monitor'),
       unavailable: rowNum(workflowStats, 'unavailable'),
+      privacy_unreachable: rowNum(workflowStats, 'privacy_unreachable'),
       negative_feishu: rowNum(workflowStats, 'negative_feishu'),
       negative_cold: rowNum(workflowStats, 'negative_cold'),
       handled_total: rowNum(workflowStats, 'handled_total'),

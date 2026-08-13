@@ -3,12 +3,31 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.80',
+  latestVersion: '0.3.81',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-12',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.80-20260812.zip',
+  releaseDate: '2026-08-13',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.81-20260813.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.81',
+      releaseDate: '2026-08-13',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '无人值守尾部任务可靠接力',
+              desc: '空闲 Agent 会继续领取最后少量待执行词；弱网或页面异常会释放当前词、进入可见冷却倒计时并返回平台入口，停止任务也不会再被迟到结果重新打开。',
+            },
+            {
+              title: '抖音正文和作者名称完整采集',
+              desc: '采集时会优先保留完整正文并防止短文本覆盖长文本；日文、特殊符号等真实昵称按页面原值保存，不再误降级为“作者”。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.80',
       releaseDate: '2026-08-12',

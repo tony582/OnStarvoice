@@ -5174,7 +5174,11 @@ function renderCaptureDebugSession(runtime = {}) {
   );
   const stopButton = document.getElementById("btnDebugSessionStop");
   const minimizeButton = document.getElementById("btnDebugSessionMinimize");
-  if (stopButton) stopButton.hidden = Boolean(session?.terminal);
+  if (stopButton) {
+    stopButton.hidden = Boolean(session?.terminal);
+    stopButton.style.display = session?.terminal ? "none" : "";
+    stopButton.disabled = Boolean(session?.terminal);
+  }
   if (minimizeButton) {
     minimizeButton.textContent = session?.terminal ? "关闭" : "隐藏";
   }
@@ -5466,6 +5470,13 @@ function setupDebugSessionPanelControls() {
   });
   stop.addEventListener("click", async () => {
     if (stop.disabled) return;
+    if (
+      document.getElementById("debugSessionPanel")?.dataset?.terminal === "true"
+    ) {
+      stop.hidden = true;
+      stop.style.display = "none";
+      return;
+    }
     stop.disabled = true;
     stop.textContent = "正在停止…";
     try {

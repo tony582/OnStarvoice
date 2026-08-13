@@ -114,7 +114,7 @@ test('empty list keeps filters and the table header usable', () => {
   assert.doesNotMatch(queue, /records\.length === 0 \? \(\s*<EmptyState[\s\S]{0,300}\) : \(\s*<div className="isolate/);
 });
 
-test('toolbar and header filter the seven handling states without ticket filters', () => {
+test('toolbar and header filter the eight handling states without ticket filters', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const primary = between(queue, 'data-triage-toolbar="primary"', 'data-triage-toolbar="secondary"');
   const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* Board view */}');
@@ -129,7 +129,7 @@ test('toolbar and header filter the seven handling states without ticket filters
   assert.match(primary, /exportXlsx/);
 
   assert.match(secondary, /aria-label="情感筛选"/);
-  assert.match(secondary, /aria-label="处理状态筛选"/);
+  assert.match(secondary, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*value=\{triageStatuses\}/);
   assert.match(secondary, /aria-label="平台筛选"/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
@@ -138,7 +138,7 @@ test('toolbar and header filter the seven handling states without ticket filters
 
   assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);
   assert.match(header, /label="情感"[\s\S]*value=\{sentiment\}[\s\S]*onChange=\{setSentiment\}/);
-  assert.match(header, /label="处理状态"[\s\S]*value=\{handlingStatus\}[\s\S]*onChange=\{changeHandlingStatusFilter\}/);
+  assert.match(header, /label="处理状态"[\s\S]*value=\{triageStatuses\}[\s\S]*onChange=\{setTriageStatuses\}/);
 });
 
 test('drawer header keeps the Feishu number in the old inline-edit position while history remains available', () => {

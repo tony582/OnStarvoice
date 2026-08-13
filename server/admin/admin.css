@@ -528,7 +528,7 @@ tbody tr:last-child td { border-bottom: none; }
 .badge.neutral, .badge.generated, .badge.viewer {
   background: var(--primary-soft); color: var(--primary);
 }
-.badge.muted, .badge.archived, .badge.skipped, .badge.reviewed_non_monitor, .badge.unavailable {
+.badge.muted, .badge.archived, .badge.skipped, .badge.reviewed_non_monitor, .badge.unavailable, .badge.privacy_unreachable {
   background: var(--bg-elevated); color: var(--text-muted);
 }
 
