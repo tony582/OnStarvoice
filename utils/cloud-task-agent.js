@@ -62,6 +62,7 @@
 
   const TARGETED_TASK_TYPES = new Set([
     "negative_post_patrol",
+    "watched_content_patrol",
     "official_account_comment_patrol",
     "followed_creator_post_patrol",
     "official_account_post_discovery",
@@ -131,6 +132,14 @@
   function targetedPostTaskDescriptor(request = {}) {
     const source = objectValue(request);
     const workflow = text(source.workflow, 80);
+    if (workflow === "watched_content_patrol") {
+      return {
+        workflow,
+        taskType: "watched_content_patrol",
+        featureKey: "watched_content_patrol",
+        title: text(source.title, 500) || "关注内容巡查",
+      };
+    }
     if (workflow === "official_account_comment_patrol") {
       return {
         workflow,
@@ -490,6 +499,7 @@
           remoteTaskKeywordPostLimit: true,
           remoteOrchestrationRecoveryMergeV1: true,
           negativePostPatrol: true,
+          watchedContentPatrol: true,
           officialAccountCommentPatrol: true,
           officialAccountCommentPatrolProfileV1: true,
           officialAccountDetailPublishDateV1: true,

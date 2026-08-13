@@ -4949,6 +4949,9 @@ function isTargetedProfileDiscoveryWorkflow(workflow = "", targetMode = "") {
 
 function getTargetedWorkflowLabel(workflow = "") {
   const normalized = String(workflow || "").trim();
+  if (normalized === "watched_content_patrol") {
+    return "关注内容巡查";
+  }
   if (normalized === "official_account_comment_patrol") {
     return "官方账号评论巡查";
   }
@@ -16441,7 +16444,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           runnerTabId: targetTabId,
           captureParams: {
             detectUnavailableTargetPage:
-              targetedWorkflow === "negative_post_patrol",
+              [
+                "negative_post_patrol",
+                "watched_content_patrol",
+              ].includes(targetedWorkflow),
             includeComments: captureSettings.includeComments === true,
             includeBloggerMetrics:
               captureSettings.includeBloggerMetrics === true,

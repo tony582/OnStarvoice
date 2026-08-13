@@ -52,6 +52,9 @@ export function TaskCard({
   const negativePatrol = task.task_type === 'negative_post_patrol'
     || task.feature_key === 'negative_post_patrol'
     || task.feature_key === 'capture.negative_post_patrol'
+  const watchedContentPatrol = task.task_type === 'watched_content_patrol'
+    || task.feature_key === 'watched_content_patrol'
+  const contentPatrol = negativePatrol || watchedContentPatrol
   const negativePatrolFilter = negativePatrol
     && task.metadata?.filter
     && typeof task.metadata.filter === 'object'
@@ -132,8 +135,8 @@ export function TaskCard({
     ? '多 Agent 无人值守'
     : scheduleRun
       ? '计划运行批次'
-      : orchestration && negativePatrol
-        ? '多 Agent 负面巡查'
+      : orchestration && contentPatrol
+        ? watchedContentPatrol ? '关注内容巡查' : '多 Agent 负面巡查'
       : orchestration
         ? '多 Agent 编排'
         : officialCommentPatrol
@@ -144,6 +147,8 @@ export function TaskCard({
             ? '官方账号作品发现'
           : negativePatrol
           ? '负面帖子巡查'
+          : watchedContentPatrol
+            ? '关注内容巡查'
         : task.source === 'cloud' && task.task_type.includes('plan')
           ? '自动计划'
           : task.source === 'cloud'
@@ -156,8 +161,8 @@ export function TaskCard({
     <article className={`rounded-2xl border border-border/70 bg-card p-4 shadow-xs ${orchestration ? 'border-l-2 border-l-primary/40' : ''}`}>
       {/* 第一行：类型图标 + 标题 + 状态 chip（右对齐） */}
       <div className="flex min-w-0 items-center gap-2">
-        {negativePatrol
-          ? <ShieldAlert className="h-4 w-4 shrink-0 text-status-red" />
+        {contentPatrol
+          ? <ShieldAlert className={`h-4 w-4 shrink-0 ${watchedContentPatrol ? 'text-primary' : 'text-status-red'}`} />
           : orchestration
             ? <Network className="h-4 w-4 shrink-0 text-primary" />
           : officialCommentPatrol
@@ -176,7 +181,7 @@ export function TaskCard({
           {PLATFORM_LABELS[task.platform] || task.platform}
           {' · '}{taskMode}{' · '}
           {orchestration
-            ? negativePatrol
+            ? contentPatrol
               ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子`
               : `${safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词`
             : `${task.agent_host_label || '未分配设备'} › ${task.agent_display_name || '未分配 Agent'}`}

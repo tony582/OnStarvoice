@@ -248,7 +248,8 @@ test('elastic negative patrol keeps posts unassigned until an eligible idle Agen
   const elastic = route.slice(start, end);
 
   assert.match(elastic, /distributionMode: 'elastic_pool'/u);
-  assert.match(elastic, /claimUnit: 'negative_post'/u);
+  assert.match(elastic, /itemType = 'negative_post'/u);
+  assert.match(elastic, /claimUnit: itemType/u);
   assert.match(elastic, /eligibleAgentIds/u);
   assert.match(
     elastic,
@@ -260,10 +261,7 @@ test('elastic negative patrol keeps posts unassigned until an eligible idle Agen
     route,
     /distributionMode === 'elastic_pool'[\s\S]*createElasticPatrolTask/u,
   );
-  assert.match(
-    route,
-    /requireOnline: distributionMode !== 'elastic_pool'/u,
-  );
+  assert.match(route, /requiredPlatforms[\s\S]*loadCompatibleAgents/u);
 });
 
 test('multi-Agent patrol UI requires two nodes but allows fewer posts than pool nodes', async () => {
@@ -277,11 +275,16 @@ test('multi-Agent patrol UI requires two nodes but allows fewer posts than pool 
     /method === 'multi'[\s\S]*selectedAssignableIds\.length < 2/u,
   );
   assert.match(drawer, /多 Agent 模式至少选择 2 个可用节点/u);
-  assert.match(creator, /agentIds:\s*agents\.map\(agent => agent\.id\)/u);
-  assert.match(creator, /distributionMode: multiAgent \? 'elastic_pool' : 'fixed_batch'/u);
+  assert.match(creator, /const eligibleAgents = agents\.filter\(agent => selectedCandidatePlatforms\.some/u);
+  assert.match(creator, /agentIds:\s*eligibleAgents\.map\(agent => agent\.id\)/u);
+  assert.match(creator, /const elasticPool = multiAgent \|\| selectedPlatforms\.length > 1/u);
+  assert.match(creator, /selectedCandidatePlatforms[\s\S]*selectedCandidates\.map\(candidate => candidate\.platform\)/u);
+  assert.match(creator, /distributionMode: elasticPool \? 'elastic_pool' : 'fixed_batch'/u);
   assert.doesNotMatch(creator, /allocationInvalid/u);
   assert.doesNotMatch(creator, /帖子数少于节点数/u);
   assert.match(creator, /每个空闲 Agent 一次只领 1 条/u);
+  assert.match(creator, /平台覆盖与固定节点/u);
+  assert.match(creator, /节点离线时原地等待，不自动转交/u);
 });
 
 test('negative patrol detail can reassign only unfinished posts to an explicit online Agent team', async () => {

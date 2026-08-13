@@ -2154,6 +2154,13 @@ async function readTargetedPostRunRequest({persistNormalized = true} = {}) {
 
 function targetedPostTaskCenterDescriptor(request = {}) {
   const workflow = String(request?.workflow || '').trim();
+  if (workflow === 'watched_content_patrol') {
+    return {
+      workflow,
+      taskType: 'watched_content_patrol',
+      title: String(request?.title || '').trim() || '关注内容巡查',
+    };
+  }
   if (workflow === 'official_account_comment_patrol') {
     return {
       workflow,

@@ -3,12 +3,36 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.81',
+  latestVersion: '0.3.82',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-13',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.81-20260813.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.82-20260813.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.82',
+      releaseDate: '2026-08-13',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: '关注内容定向巡查',
+              desc: '内容分诊可单条或批量关注内容，并从关注清单创建巡查；任务调度支持小红书与抖音混合清单，按内容平台分配给对应 Agent。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '负面巡查支持混合平台',
+              desc: '负面巡查可同时承载小红书与抖音内容，并按每条内容的平台交给具备对应能力的 Agent。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.81',
       releaseDate: '2026-08-13',

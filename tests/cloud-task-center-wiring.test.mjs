@@ -341,7 +341,7 @@ test("new fixed-node tasks explicitly disable automatic cross-device handoff", a
   assert.match(keywordCreator, /allowIdleAgentHandoff: false/u);
   assert.match(
     negativeCreator,
-    /allowIdleAgentHandoff: multiAgent/u,
+    /const elasticPool = multiAgent \|\| selectedPlatforms\.length > 1[\s\S]*allowIdleAgentHandoff: elasticPool/u,
   );
   assert.match(officialCreator, /allowIdleAgentHandoff: false/u);
   assert.match(accountCreator, /allowIdleAgentHandoff: false/u);

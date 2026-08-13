@@ -19,15 +19,17 @@ function functionBlock(text, name) {
   return text.slice(start, next === -1 ? text.length : next);
 }
 
-test('platform and handling-state pills keep stable scan widths', () => {
+test('platform and handling-state pills keep compact stable scan widths', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const feishuControl = source('web/admin/src/components/shared/FeishuTableNumberControl.tsx');
   const copyButton = source('web/admin/src/components/shared/CopyTicketNumberButton.tsx');
   assert.match(queue, /const PLATFORM_BADGE_CLASS\s*=\s*['"][^'"]*w-14[^'"]*justify-center/);
-  assert.match(queue, /const TRIAGE_MODE_BADGE_CLASS\s*=\s*['"][^'"]*w-\[168px\][^'"]*justify-center/);
+  assert.match(queue, /const TRIAGE_MODE_BADGE_CLASS\s*=\s*['"][^'"]*w-\[112px\][^'"]*justify-center[^'"]*overflow-hidden/);
   assert.match(queue, /dark:text-white/);
 
   const menu = between(queue, 'function TriageStatusMenu', 'function SortableTh');
+  assert.match(menu, /title=\{label\}/);
+  assert.match(menu, /flex-1 truncate text-center/);
   assert.match(menu, /w-\[236px\]/);
   assert.match(menu, />处理状态</);
   assert.match(menu, /CONTENT_TRIAGE_MODES\.map/);
@@ -74,11 +76,11 @@ test('fixed processing cell combines handling state with a direct note action', 
   const row = functionBlock(queue, 'RecordRow');
   const progress = functionBlock(queue, 'InlineRecordProgress');
 
-  assert.match(header, /sticky right-0 z-50 w-\[264px\] min-w-\[264px\]/);
-  assert.match(header, /grid-cols-\[168px_48px\]/);
+  assert.match(header, /sticky right-0 z-50 w-\[208px\] min-w-\[208px\]/);
+  assert.match(header, /grid-cols-\[112px_48px\]/);
   assert.match(header, /label="处理状态"/);
   assert.match(header, /sr-only">备注/);
-  assert.match(row, /sticky right-0 z-20 w-\[264px\] min-w-\[264px\]/);
+  assert.match(row, /sticky right-0 z-20 w-\[208px\] min-w-\[208px\]/);
   assert.match(row, /<TriageStatusMenu[\s\S]*<InlineRecordProgress record=\{r\} onAdd=\{onAddNote\}/);
 
   assert.match(progress, /record\.progress_latest_body/);
@@ -106,7 +108,7 @@ test('desktop keeps one native scroll surface and sticky state-note cell', () =>
   assert.doesNotMatch(queue, /data-triage-table-scroll[\s\S]{0,180}overflow-x-auto|tableHead\.style\.transform|ResizeObserver/);
   assert.match(queue, /min-w-\[1080px\][^\"]*xl:min-w-full/);
   assert.match(queue, /<thead data-sticky-header className="[^"]*sticky top-0 z-40/);
-  assert.match(queue, /sticky right-0 z-20 w-\[264px\] min-w-\[264px\][^\"]*before:inset-y-0/);
+  assert.match(queue, /sticky right-0 z-20 w-\[208px\] min-w-\[208px\][^\"]*before:inset-y-0/);
 });
 
 test('empty list keeps filters and the table header usable', () => {
@@ -122,7 +124,12 @@ test('toolbar and header filter the eight handling states without ticket filters
   const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* Board view */}');
   const header = between(queue, '<thead data-sticky-header', '</thead>');
 
-  assert.match(primary, /aria-label="内容归档范围"/);
+  const lifecycleViews = between(queue, 'const ARCHIVE_VIEWS', 'const PAGE_SIZE_OPTIONS');
+  assert.match(primary, /aria-label="内容生命周期"/);
+  assert.match(primary, /ARCHIVE_VIEWS/);
+  assert.doesNotMatch(lifecycleViews, /watched|已关注|Star/);
+  assert.match(primary, /打开关注清单/);
+  assert.match(primary, /aria-pressed=\{viewingWatchlist\}/);
   assert.match(primary, /搜索标题、正文、作者、飞书表号…/);
   assert.match(primary, /<MultiSelect label="疑似身份"/);
   assert.match(primary, /<KeywordFilter/);
@@ -133,6 +140,7 @@ test('toolbar and header filter the eight handling states without ticket filters
   assert.match(secondary, /aria-label="情感筛选"/);
   assert.match(secondary, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*value=\{triageStatuses\}/);
   assert.match(secondary, /aria-label="平台筛选"/);
+  assert.doesNotMatch(secondary, /关注状态筛选|未关注/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
   assert.match(secondary, /xl:grid-cols-\[232px_repeat\(6,minmax\(0,1fr\)\)_58px\]/);

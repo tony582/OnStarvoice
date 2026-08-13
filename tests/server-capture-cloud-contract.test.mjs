@@ -161,6 +161,10 @@ test("cross-device retry supports root business tasks and keyword orchestrations
     task_type: "negative_post_patrol",
     parent_task_id: "11111111-1111-4111-8111-111111111111",
   }), false);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "watched_content_patrol",
+    parent_task_id: null,
+  }), true);
 });
 
 test("recovery grading keeps captcha current and automates technical or unstarted items", () => {
@@ -323,6 +327,16 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
     task_type: "negative_post_patrol",
     platform: "douyin",
   }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      watchedContentPatrol: true,
+    },
+  }, {
+    task_type: "watched_content_patrol",
+    platform: "douyin",
+  }), true);
   assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
     task_type: "followed_creator_post_patrol",
     platform: "xiaohongshu",
@@ -565,7 +579,7 @@ test("official comment patrol distinguishes profile scans from legacy direct-det
 test("targeted detail result projection has a closed workflow allow-list", () => {
   assert.match(
     captureCloudRouteSource,
-    /const TARGETED_POST_TASK_TYPES = new Set\(\[\s*'negative_post_patrol',\s*'official_account_comment_patrol',/u,
+    /const TARGETED_POST_TASK_TYPES = new Set\(\[\s*'negative_post_patrol',\s*'watched_content_patrol',\s*'official_account_comment_patrol',/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -1225,7 +1239,7 @@ test("create command failures and successful stops settle orchestration work ite
   );
 });
 
-test("elastic queue claims one keyword or negative post per idle heartbeat and fences late attempts", () => {
+test("elastic queue claims one keyword or platform-bound content item per idle heartbeat and fences late attempts", () => {
   const claim = readRouteSection(
     "async function dispatchNextElasticWorkItem",
     "router.post('/agent/heartbeat'",
@@ -1235,8 +1249,13 @@ test("elastic queue claims one keyword or negative post per idle heartbeat and f
   assert.match(claim, /FOR UPDATE OF parent, item SKIP LOCKED/u);
   assert.match(claim, /keywords: \[candidate\.keyword\]/u);
   assert.match(claim, /item\.item_type = 'negative_post'/u);
+  assert.match(claim, /item\.item_type = 'watched_content'/u);
+  assert.match(claim, /item\.platform AS item_platform/u);
+  assert.match(claim, /item\.platform = ANY\(\$4::text\[\]\)/u);
+  assert.match(claim, /item\.platform = ANY\(\$5::text\[\]\)/u);
   assert.match(claim, /targets: \[target\]/u);
-  assert.match(claim, /claimUnit = 'negative_post'/u);
+  assert.match(claim, /claimUnit = candidate\.item_type/u);
+  assert.match(claim, /platform: candidate\.item_platform/u);
   assert.match(claim, /createAckTimeoutSeconds/u);
   assert.match(claim, /ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS/u);
   assert.match(claim, /attempt_count = \$1/u);

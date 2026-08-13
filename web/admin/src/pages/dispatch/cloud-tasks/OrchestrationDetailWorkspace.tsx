@@ -397,6 +397,9 @@ export function OrchestrationDetailWorkspace({
     || detail?.schedule?.distribution_mode === 'elastic_pool'
   const negativePatrol = detail?.orchestration.feature_key === 'negative_post_patrol'
     || detail?.orchestration.metadata?.workflow === 'negative_post_patrol'
+  const watchedContentPatrol = detail?.orchestration.feature_key === 'watched_content_patrol'
+    || detail?.orchestration.metadata?.workflow === 'watched_content_patrol'
+  const contentPatrol = negativePatrol || watchedContentPatrol
   const executionsById = useMemo(
     () => new Map((detail?.executions || []).map(execution => [
       executionTaskId(execution),
@@ -405,7 +408,7 @@ export function OrchestrationDetailWorkspace({
     [detail?.executions],
   )
   const keywordRetryItems = useMemo(() => {
-    if (!detail || negativePatrol || isScheduleTemplate) return []
+    if (!detail || contentPatrol || isScheduleTemplate) return []
     return sortedItems.filter(item => {
       if (!KEYWORD_RETRY_STATUSES.has(item.status)) return false
       if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
@@ -424,7 +427,7 @@ export function OrchestrationDetailWorkspace({
         ),
       )
     })
-  }, [detail, elasticPool, executionsById, isScheduleTemplate, negativePatrol, sortedItems])
+  }, [contentPatrol, detail, elasticPool, executionsById, isScheduleTemplate, sortedItems])
   const keywordRetrySourceAgentIds = useMemo(() => new Set(
     keywordRetryItems
       .map(item => itemAssignedAgentId(
@@ -435,7 +438,7 @@ export function OrchestrationDetailWorkspace({
       .filter(Boolean),
   ), [detail?.attempts, detail?.executions, keywordRetryItems])
   const keywordRetryCandidates = useMemo(() => {
-    if (!detail || negativePatrol) return []
+    if (!detail || contentPatrol) return []
     return availableAgents
       .filter(agent => agentSupportsKeywordRetry(
         agent,
@@ -450,7 +453,7 @@ export function OrchestrationDetailWorkspace({
           'zh-CN',
         )
       })
-  }, [availableAgents, detail, keywordRetrySourceAgentIds, negativePatrol])
+  }, [availableAgents, contentPatrol, detail, keywordRetrySourceAgentIds])
   const keywordAutomaticCandidates = useMemo(
     () => keywordRetryCandidates.filter(agent =>
       !keywordRetrySourceAgentIds.has(agent.id),
@@ -547,7 +550,7 @@ export function OrchestrationDetailWorkspace({
     ),
   )
   const attentionContext = useMemo(() => {
-    if (!detail || negativePatrol) return null
+    if (!detail || contentPatrol) return null
     const item = sortedItems.find(candidate =>
       Boolean(candidate.execution_task_id) &&
       candidate.status === 'needs_action' &&
@@ -627,7 +630,7 @@ export function OrchestrationDetailWorkspace({
         !HANDOFF_UNSTARTED_EXCLUDED_STATUSES.has(candidate.status),
       ).length,
     }
-  }, [detail, elasticPool, negativePatrol, sortedItems])
+  }, [contentPatrol, detail, elasticPool, sortedItems])
   const handoffCandidates = useMemo(() => {
     if (!attentionContext || !detail) return []
     return availableAgents
@@ -712,7 +715,7 @@ export function OrchestrationDetailWorkspace({
       const attemptTotal = Math.max(attemptCurrent, Number(
         recovery.attemptTotal || recovery.attempt_total || 3,
       ) || 3)
-      const workUnit = negativePatrol || item.item_type === 'negative_post'
+      const workUnit = contentPatrol || ['negative_post', 'watched_content'].includes(item.item_type)
         ? '帖子'
         : '关键词'
       const cooldownHomeStatus = Object.prototype.hasOwnProperty.call(
@@ -737,7 +740,7 @@ export function OrchestrationDetailWorkspace({
       })
     }
     return states
-  }, [agentsById, detail, isScheduleTemplate, negativePatrol, nowMs, sortedItems])
+  }, [agentsById, contentPatrol, detail, isScheduleTemplate, nowMs, sortedItems])
 
   useEffect(() => {
     if (!orchestrationId) return
@@ -1151,8 +1154,8 @@ export function OrchestrationDetailWorkspace({
                   ? '多 Agent 无人值守计划'
                   : scheduleRun
                     ? '无人值守计划运行批次'
-                    : negativePatrol
-                      ? '多 Agent 负面帖子巡查'
+                    : contentPatrol
+                      ? watchedContentPatrol ? '关注内容巡查' : '多 Agent 负面帖子巡查'
                     : '一次性多 Agent 任务'}
               </span>
             </div>
@@ -1593,7 +1596,7 @@ export function OrchestrationDetailWorkspace({
         <ol className="mb-4 flex items-center gap-2 overflow-x-auto pb-1" aria-label="编排任务结构">
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-primary/25 bg-primary/[0.045] px-3 py-2">
             <ClipboardList className="h-4 w-4 shrink-0 text-primary" />
-            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} {negativePatrol ? '条帖子' : '个工作项'}</span></span>
+            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} {contentPatrol ? '条帖子' : '个工作项'}</span></span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-border bg-muted/30 px-3 py-2">
@@ -1620,7 +1623,7 @@ export function OrchestrationDetailWorkspace({
                   ? elasticPool
                     ? '这里展示后续每轮都会沿用的关键词和弹性节点池；实际领取量由节点空闲速度决定。'
                     : '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
-                  : negativePatrol
+                  : contentPatrol
                     ? '按每条帖子的真实巡查结果汇总，并展示它由哪个 Agent 执行。'
                     : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
               </p>
@@ -1654,7 +1657,7 @@ export function OrchestrationDetailWorkspace({
           )}
         </section>
 
-        {!negativePatrol && !scheduleTemplate ? (
+        {!contentPatrol && !scheduleTemplate ? (
           <div className="mt-4">
             <KeywordExecutionReport
               items={sortedItems}
@@ -1668,7 +1671,7 @@ export function OrchestrationDetailWorkspace({
             <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
               <div>
                 <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">Work items</div>
-                <h3 className="mt-0.5 text-sm font-bold text-foreground">{negativePatrol ? '负面帖子工作项' : '关键词工作项'}</h3>
+                <h3 className="mt-0.5 text-sm font-bold text-foreground">{watchedContentPatrol ? '关注内容工作项' : negativePatrol ? '负面帖子工作项' : '关键词工作项'}</h3>
               </div>
               <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{sortedItems.length} 项</span>
             </div>
@@ -1690,6 +1693,11 @@ export function OrchestrationDetailWorkspace({
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
                           <h4 className="truncate text-sm font-semibold text-foreground">{keywordForItem(item)}</h4>
+                          {contentPatrol && (
+                            <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                              {PLATFORM_LABELS[item.platform] || item.platform}
+                            </span>
+                          )}
                           <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusTone(item.status)}`}>
                             {availabilityLabel || statusLabel(item.status)}
                           </span>
@@ -1737,7 +1745,7 @@ export function OrchestrationDetailWorkspace({
                             </span>
                           </div>
                           <p className="mt-1 truncate text-[11px] text-muted-foreground">{agent.host_label} › {agent.browser_name} · {agent.operating_system}</p>
-                          <p className="mt-1 text-[11px] text-muted-foreground">分配 {assignedItems.length} {negativePatrol ? '条帖子' : '个工作项'} · {agentExecutions.length} 条子任务记录</p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">分配 {assignedItems.length} {contentPatrol ? '条帖子' : '个工作项'} · {agentExecutions.length} 条子任务记录</p>
                         </div>
                       </div>
                       {agentExecutions.length > 0 && (
@@ -1750,7 +1758,7 @@ export function OrchestrationDetailWorkspace({
                                 return <>
                               <div className="flex items-center justify-between gap-2">
                                 <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(String(execution.status || ''))}`}>{statusLabel(String(execution.status || ''))}</span>
-                                <span className="text-[10px] text-muted-foreground">{itemCount} {negativePatrol ? '条帖子' : '个工作项'}</span>
+                                <span className="text-[10px] text-muted-foreground">{itemCount} {contentPatrol ? '条帖子' : '个工作项'}</span>
                               </div>
                               <div className="mt-1.5 truncate font-mono text-[10px] text-muted-foreground">{executionTaskId(execution) || '未返回子任务 ID'}</div>
                               {(execution.command_status || execution.command_expires_at) && (
@@ -1774,7 +1782,7 @@ export function OrchestrationDetailWorkspace({
                 })}
               </div>
             )}
-            {!negativePatrol && <div className="border-t border-border/70 bg-muted/25 p-3">
+            {!contentPatrol && <div className="border-t border-border/70 bg-muted/25 p-3">
               <p className="text-[10px] leading-4 text-muted-foreground">
                 任务遇到安全验证时（包括验证码或登录要求），运营只需处理当前受阻关键词；它留在原 Agent。接力只处理尚未开始的完整关键词，并由系统自动逐词分配。
               </p>

@@ -63,6 +63,16 @@ export function DispatchPage() {
         }
       : params?.create === 'creator_patrol'
         ? { taskType: 'creator_patrol', subscriptionId: String(params?.subscriptionId || '') || undefined }
+        : params?.create === 'negative_patrol'
+          ? {
+              taskType: 'negative_patrol',
+              recordIds: String(params?.recordIds || '').split(',').map(value => value.trim()).filter(Boolean).slice(0, 100),
+            }
+        : params?.create === 'watched_content'
+          ? {
+              taskType: 'watched_content',
+              recordIds: String(params?.recordIds || '').split(',').map(value => value.trim()).filter(Boolean).slice(0, 100),
+            }
         : null,
   )
   const [orchestrationLaunchIntent, setOrchestrationLaunchIntent] = useState<OrchestrationLaunchIntent | null>(null)
@@ -599,8 +609,12 @@ export function DispatchPage() {
             setComposerIntent(null)
             setOrchestrationLaunchIntent(launchIntent)
           }}
-          onCreated={async () => {
-            setFeedback('任务已创建并分配给指定 Agent。')
+          onCreated={async createdTaskType => {
+            setFeedback(createdTaskType === 'watched_content'
+              ? '关注内容巡查已创建，内容将按平台由兼容 Agent 领取。'
+              : createdTaskType === 'negative_patrol'
+                ? '负面帖子巡查已创建，内容将按平台由兼容 Agent 领取。'
+                : '任务已创建并分配给指定 Agent。')
             await load(true)
           }} />
       )}

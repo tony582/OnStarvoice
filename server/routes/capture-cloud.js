@@ -134,6 +134,7 @@ const ELASTIC_STALE_TASK_CODES = new Set([
 const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
   'unattended_keyword_capture',
   'negative_post_patrol',
+  'watched_content_patrol',
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
@@ -289,6 +290,7 @@ export function captureTaskBusinessRootVisibilitySql(alias = 't') {
   return `NOT (
     ${alias}.task_type IN (
       'negative_post_patrol',
+      'watched_content_patrol',
       'official_account_comment_patrol',
       'followed_creator_post_patrol',
       'official_account_post_discovery'
@@ -791,6 +793,9 @@ export function crossDeviceRetryAgentSupportsTask(
   if (capabilities.remoteTargetedPostCaptureV1 !== true) return false;
   if (taskType === 'negative_post_patrol') {
     return capabilities.negativePostPatrol === true;
+  }
+  if (taskType === 'watched_content_patrol') {
+    return capabilities.watchedContentPatrol === true;
   }
   if (taskType === 'followed_creator_post_patrol') {
     return capabilities.followedCreatorPostPatrol === true;
@@ -1558,6 +1563,7 @@ const CONTENT_UNAVAILABLE_STATUSES = new Set([
 // types into browser-driven URL capture.
 const TARGETED_POST_TASK_TYPES = new Set([
   'negative_post_patrol',
+  'watched_content_patrol',
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
@@ -1568,6 +1574,9 @@ function isTargetedPostTaskType(value) {
 }
 
 function targetedPostTaskLabel(taskType) {
+  if (taskType === 'watched_content_patrol') {
+    return '关注内容巡查';
+  }
   if (taskType === 'official_account_comment_patrol') {
     return '官方账号评论巡查';
   }
@@ -2576,6 +2585,11 @@ async function refreshOrchestrationParentTask(tx, {
   const negativePatrol =
     parent.feature_key === 'negative_post_patrol' ||
     parentMetadata.workflow === 'negative_post_patrol';
+  const watchedContentPatrol =
+    parent.feature_key === 'watched_content_patrol' ||
+    parentMetadata.workflow === 'watched_content_patrol';
+  const contentPatrol = negativePatrol || watchedContentPatrol;
+  const contentPatrolLabel = watchedContentPatrol ? '关注内容' : '负面帖子';
   const profilePatrol = [
     'official_account_comment_patrol',
     'followed_creator_post_patrol',
@@ -2587,32 +2601,32 @@ async function refreshOrchestrationParentTask(tx, {
     Number(previousProgress.total || 0) !== aggregate.progress.total;
   const message = aggregate.status === 'running'
     ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
-      ? negativePatrol
-        ? '部分负面帖子正在自动恢复，等待空闲节点逐篇接力'
+      ? contentPatrol
+        ? `部分${contentPatrolLabel}正在自动恢复，等待空闲节点逐篇接力`
         : profilePatrol
           ? '部分账号巡查项正在自动恢复，等待空闲节点接力'
           : '部分关键词正在自动恢复，等待空闲节点逐词接力'
-      : negativePatrol
-      ? '多个执行节点正在巡查负面帖子'
+      : contentPatrol
+      ? `执行节点正在巡查${contentPatrolLabel}`
       : profilePatrol
         ? '执行节点正在重试未完成的账号巡查项'
       : '多个执行节点正在处理关键词工作项'
     : aggregate.status === 'needs_action'
-      ? negativePatrol
-        ? '部分负面帖子需要人工处理'
+      ? contentPatrol
+        ? `部分${contentPatrolLabel}需要人工处理`
         : profilePatrol
           ? '部分账号巡查项仍需要处理'
         : '部分关键词工作项需要人工处理'
       : aggregate.terminal
-        ? negativePatrol
-          ? '多 Agent 负面帖子巡查已结算'
+        ? contentPatrol
+          ? `${watchedContentPatrol ? '关注内容' : '多 Agent 负面帖子'}巡查已结算`
           : profilePatrol
         ? '账号巡查任务已结算'
           : '多 Agent 关键词任务已结算'
-        : negativePatrol
+        : contentPatrol
           ? elasticPool
-            ? '负面帖子保留在云端，等待空闲节点逐篇领取'
-            : '负面帖子已分配，等待执行节点处理'
+            ? `${contentPatrolLabel}保留在云端，等待空闲节点逐篇领取`
+            : `${contentPatrolLabel}已分配，等待执行节点处理`
           : profilePatrol
             ? '账号巡查项已重新分配，等待执行节点处理'
           : '关键词工作项已分配，等待执行节点处理';
@@ -3060,7 +3074,10 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       );
     }
 
-    if (task.task_type === 'negative_post_patrol') {
+    if ([
+      'negative_post_patrol',
+      'watched_content_patrol',
+    ].includes(task.task_type)) {
       const availability = targetResultContentAvailability(entry);
       if (availability) {
         await tx.execute(`
@@ -4537,7 +4554,13 @@ async function dispatchNextElasticWorkItem(tx, {
     freshCapabilities.remoteTaskCreate === true &&
     freshCapabilities.remoteTargetedPostCaptureV1 === true &&
     freshCapabilities.negativePostPatrol === true;
-  if (!canClaimKeyword && !canClaimNegativePost) return null;
+  const canClaimWatchedContent =
+    freshCapabilities.remoteTaskCreate === true &&
+    freshCapabilities.remoteTargetedPostCaptureV1 === true &&
+    freshCapabilities.watchedContentPatrol === true;
+  if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
+    return null;
+  }
   const busy = await findCaptureAgentExecutionSlotBlocker(
     tx,
     agent.tenant_id,
@@ -4599,6 +4622,7 @@ async function dispatchNextElasticWorkItem(tx, {
       parent.scheduled_for,
       parent.schedule_revision,
       item.id AS item_id,
+      item.platform AS item_platform,
       item.ordinal,
       item.keyword,
       item.item_type,
@@ -4639,6 +4663,7 @@ async function dispatchNextElasticWorkItem(tx, {
       AND (
         (item.item_type = 'keyword' AND $6::boolean)
         OR (item.item_type = 'negative_post' AND $7::boolean)
+        OR (item.item_type = 'watched_content' AND $8::boolean)
       )
       AND item.status IN ('pending', 'retryable')
       AND COALESCE(
@@ -4649,8 +4674,8 @@ async function dispatchNextElasticWorkItem(tx, {
         END,
         item.attempt_count
       ) < $3
-      AND (cardinality($4::text[]) = 0 OR parent.platform = ANY($4::text[]))
-      AND (cardinality($5::text[]) = 0 OR parent.platform = ANY($5::text[]))
+      AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
+      AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
       AND (
         item.execution_task_id IS NULL
         OR EXISTS (
@@ -4682,7 +4707,7 @@ async function dispatchNextElasticWorkItem(tx, {
             'retryable', 'needs_action', 'failed'
           )
           AND recent_same_agent_attempt.updated_at >
-            now() - ($8::bigint * interval '1 millisecond')
+            now() - ($9::bigint * interval '1 millisecond')
       )
     ORDER BY
       COALESCE(parent.scheduled_for, parent.created_at),
@@ -4699,6 +4724,7 @@ async function dispatchNextElasticWorkItem(tx, {
     supportedPlatforms,
     canClaimKeyword,
     canClaimNegativePost,
+    canClaimWatchedContent,
     ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS,
   ]);
   if (!candidate) return null;
@@ -4706,8 +4732,13 @@ async function dispatchNextElasticWorkItem(tx, {
   const parentMetadata = safeJson(candidate.parent_metadata);
   const planSnapshot = safeJson(parentMetadata.planSnapshot);
   const negativePost = candidate.item_type === 'negative_post';
+  const watchedContent = candidate.item_type === 'watched_content';
+  const targetedContent = negativePost || watchedContent;
+  const targetedWorkflow = watchedContent
+    ? 'watched_content_patrol'
+    : 'negative_post_patrol';
   if (
-    !negativePost &&
+    !targetedContent &&
     Object.keys(safeJson(planSnapshot.captureSettings)).length > 0 &&
     freshCapabilities.remoteTaskEnhancementOptions !== true
   ) {
@@ -4739,7 +4770,7 @@ async function dispatchNextElasticWorkItem(tx, {
   let claimUnit = 'keyword';
   let childMessage = '已从云端领取 1 个关键词，等待设备确认';
   let commandPayload = {};
-  if (negativePost) {
+  if (targetedContent) {
     const itemMetadata = safeJson(candidate.item_metadata);
     const sourceRecord = safeJson(itemMetadata.sourceRecord);
     const captureSettings = safeJson(parentMetadata.captureSettings);
@@ -4755,7 +4786,7 @@ async function dispatchNextElasticWorkItem(tx, {
       baseline: safeJson(itemMetadata.baseline),
     };
     requestHash = crypto.createHash('sha256').update(JSON.stringify({
-      workflow: 'negative_post_patrol',
+      workflow: targetedWorkflow,
       protocolVersion: 3,
       parentTaskId: candidate.parent_id,
       itemId: candidate.item_id,
@@ -4764,10 +4795,10 @@ async function dispatchNextElasticWorkItem(tx, {
       recordId: candidate.record_id,
       captureSettings,
     })).digest('hex');
-    childTaskType = 'negative_post_patrol';
-    childFeatureKey = 'negative_post_patrol';
+    childTaskType = targetedWorkflow;
+    childFeatureKey = targetedWorkflow;
     childCheckpoint = {targetIndex: 0};
-    claimUnit = 'negative_post';
+    claimUnit = candidate.item_type;
     childMessage = '已从云端领取 1 篇帖子，等待设备确认';
     commandPayload = {
       taskId: childTaskId,
@@ -4775,9 +4806,9 @@ async function dispatchNextElasticWorkItem(tx, {
       parentTaskId: candidate.parent_id,
       title: childTitle,
       executionMode: 'one_time',
-      platform: candidate.parent_platform,
-      workflow: 'negative_post_patrol',
-      taskKind: 'negative_post_patrol',
+      platform: candidate.item_platform,
+      workflow: targetedWorkflow,
+      taskKind: targetedWorkflow,
       protocolVersion: 1,
       targets: [target],
       items: [target],
@@ -4842,10 +4873,10 @@ async function dispatchNextElasticWorkItem(tx, {
     requestedByUserId: '',
     requestedByName: '云端弹性调度器',
     executionMode: 'one_time',
-    ...(negativePost
+    ...(targetedContent
       ? {
-          workflow: 'negative_post_patrol',
-          taskKind: 'negative_post_patrol',
+          workflow: targetedWorkflow,
+          taskKind: targetedWorkflow,
           protocolVersion: 1,
           filter: safeJson(parentMetadata.filter),
           selectedRecordIds: [candidate.record_id],
@@ -4919,7 +4950,7 @@ async function dispatchNextElasticWorkItem(tx, {
     childTaskType,
     childFeatureKey,
     childTitle,
-    candidate.parent_platform,
+    targetedContent ? candidate.item_platform : candidate.parent_platform,
     JSON.stringify({current: 0, total: 1, percent: 0, phase: 'queued'}),
     JSON.stringify(childCheckpoint),
     JSON.stringify({
@@ -5029,14 +5060,14 @@ async function dispatchNextElasticWorkItem(tx, {
     agentId: agent.id,
     eventType: 'elastic_work_item_dispatched',
     status: 'pending',
-    message: negativePost
+    message: targetedContent
       ? '空闲节点已从云端领取 1 篇帖子'
       : '空闲节点已从云端领取 1 个关键词',
     payload: {
       parentTaskId: candidate.parent_id,
       itemId: candidate.item_id,
       claimUnit,
-      ...(negativePost
+      ...(targetedContent
         ? {recordId: candidate.record_id}
         : {keyword: candidate.keyword}),
       assignmentRevision,
