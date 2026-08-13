@@ -613,6 +613,13 @@
     });
   }
 
+  async function sendLiveness(options = {}) {
+    return await requestJson({
+      ...options,
+      endpoint: "/api/capture-cloud/agent/liveness",
+    });
+  }
+
   async function completeCommand({commandId, success, result = {}, ...options}) {
     const normalizedCommandId = text(commandId, 240);
     if (!normalizedCommandId) {
@@ -633,6 +640,7 @@
     buildSocialUsageEventSnapshot,
     buildHeartbeatPayload,
     requestJson,
+    sendLiveness,
     sendHeartbeat,
     completeCommand,
   });

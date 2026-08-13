@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.82',
+  latestVersion: '0.3.83',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-13',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.82-20260813.zip',
+  releaseDate: '2026-08-14',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.83-20260814.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.83',
+      releaseDate: '2026-08-14',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '任务运行中不再误判 Agent 离线',
+              desc: '在线心跳与任务快照、账号识别和指令处理解耦；即使采集流程耗时，任务调度仍能持续识别设备在线，并会自动回收已失去心跳的弹性工作项。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.82',
       releaseDate: '2026-08-13',

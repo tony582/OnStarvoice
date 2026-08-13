@@ -1306,6 +1306,19 @@ test("elastic recovery releases the item immediately while cooling only the sour
   assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
 });
 
+test("elastic cleanup tolerates child tasks whose work item already settled", () => {
+  assert.deepEqual(
+    projectElasticAttemptBudget(null, {
+      error: {code: 'elastic_agent_offline_timeout'},
+    }),
+    {
+      attemptBudget: 0,
+      metadataPatch: {elasticAttemptBudgetUsed: 0},
+      refunded: false,
+    },
+  );
+});
+
 test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
   const lease = readRouteSection(
     'export async function reconcileElasticCaptureLeases',
@@ -1319,6 +1332,7 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   assert.match(lease, /status: 'retryable'/u);
   assert.match(lease, /elastic_agent_offline_timeout/u);
   assert.match(lease, /FOR UPDATE SKIP LOCKED/u);
+  assert.doesNotMatch(lease, /child\.metadata->>'cloudWorkQueue'/u);
   assert.match(
     captureCloudRouteSource,
     /COALESCE\(metadata->>'distributionMode', ''\) <> 'elastic_pool'/u,

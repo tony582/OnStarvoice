@@ -1502,6 +1502,7 @@ async function readTaskLedger() {
 }
 
 let cloudTaskAgentSyncInFlight = false;
+let cloudTaskAgentLivenessInFlight = false;
 let cloudTaskAgentSyncPending = false;
 let cloudTaskAgentLastSyncAt = 0;
 let cloudTaskAgentSyncTimer = null;
@@ -3431,6 +3432,32 @@ async function executeCloudTaskAgentCommand(command, token) {
     success: commandResult.accepted === true,
     result: commandResult,
   });
+}
+
+async function syncCloudTaskAgentLiveness({reason = 'liveness'} = {}) {
+  if (!cloudTaskAgentApi?.sendLiveness) {
+    return {ok: false, skipped: true, reason: 'cloud_agent_unavailable'};
+  }
+  if (cloudTaskAgentLivenessInFlight) {
+    return {ok: false, skipped: true, reason: 'liveness_in_flight'};
+  }
+  const credential = await readCloudTaskAgentCredential();
+  if (!credential.id || !credential.token) {
+    return {ok: false, skipped: true, reason: 'missing_agent_credential'};
+  }
+
+  cloudTaskAgentLivenessInFlight = true;
+  try {
+    return await cloudTaskAgentApi.sendLiveness({
+      token: credential.token,
+      body: {
+        reason: String(reason || 'liveness').slice(0, 120),
+        sentAt: new Date().toISOString(),
+      },
+    });
+  } finally {
+    cloudTaskAgentLivenessInFlight = false;
+  }
 }
 
 async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
@@ -10128,6 +10155,9 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm?.name === CLOUD_TASK_AGENT_ALARM_NAME) {
+    syncCloudTaskAgentLiveness({reason: 'cloud_agent_alarm'}).catch((error) => {
+      console.error('[onstarvoice] cloud task agent liveness failed', error);
+    });
     syncCloudTaskAgent({reason: 'cloud_agent_alarm', force: true}).catch((error) => {
       console.error('[onstarvoice] cloud task agent heartbeat failed', error);
     });

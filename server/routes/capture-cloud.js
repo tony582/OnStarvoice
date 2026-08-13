@@ -606,11 +606,11 @@ export function projectElasticAttemptBudget(
   source = {},
   executionTaskId = '',
 ) {
-  const metadata = safeJson(item.metadata);
+  const metadata = safeJson(item?.metadata);
   const explicitBudget = Number(metadata.elasticAttemptBudgetUsed);
   const currentBudget = Number.isInteger(explicitBudget) && explicitBudget >= 0
     ? explicitBudget
-    : Math.max(0, Number(item.attempt_count) || 0);
+    : Math.max(0, Number(item?.attempt_count) || 0);
   const errorCode = elasticRecoveryErrorCode(source);
   const normalizedExecutionTaskId = text(executionTaskId, 100).toLowerCase();
   const refundState = safeJson(metadata.elasticAttemptBudget);
@@ -5084,6 +5084,44 @@ async function dispatchNextElasticWorkItem(tx, {
   };
 }
 
+// Keep the short online lease independent from the full state reconciliation.
+// A capture snapshot, account probe, or command can legitimately take longer
+// than one heartbeat interval; that work must never make a healthy browser look
+// offline to the scheduler.
+router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
+  try {
+    const result = await withTransaction(async tx => {
+      const currentAgent = await lockActiveCaptureAgentSession(
+        tx,
+        req.captureAgent,
+      );
+      if (!currentAgent) return {agentInactive: true};
+      await tx.execute(`
+        UPDATE capture_agents
+        SET last_heartbeat_at = now(), updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+      `, [req.captureAgent.id, req.captureAgent.tenant_id]);
+      return {agentInactive: false};
+    });
+    if (result.agentInactive) {
+      return res.status(403).json({
+        ok: false,
+        error: 'agent_inactive',
+        message: '采集节点已撤销或授权已变更，请重新验证扩展',
+      });
+    }
+    return res.json({
+      ok: true,
+      agent: {
+        id: req.captureAgent.id,
+        heartbeatAt: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
   try {
     const agent = req.captureAgent;
@@ -8888,7 +8926,6 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
       AND child.status IN (
         'pending', 'claimed', 'running', 'recovering', 'waiting_device'
       )
-      AND COALESCE(child.metadata->>'cloudWorkQueue', 'false') = 'true'
       AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
       AND parent.status NOT IN (
         'completed', 'completed_with_warnings', 'completed_with_failures',
@@ -8945,7 +8982,6 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
           AND child.status IN (
             'pending', 'claimed', 'running', 'recovering', 'waiting_device'
           )
-          AND COALESCE(child.metadata->>'cloudWorkQueue', 'false') = 'true'
           AND (
             (
               agent.last_heartbeat_at <
