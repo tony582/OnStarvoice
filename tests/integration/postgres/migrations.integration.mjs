@@ -4,6 +4,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { validatePostgresIntegrationTarget } from '../../../scripts/lib/postgres-integration-target.mjs';
+
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',
@@ -12,6 +14,12 @@ const repositoryRoot = path.resolve(
 );
 
 test('all non-reset migrations apply idempotently to an isolated PostgreSQL database', async t => {
+  validatePostgresIntegrationTarget({
+    testDatabaseUrl: process.env.TEST_DATABASE_URL,
+    databaseUrl: process.env.DATABASE_URL,
+    requireDatabaseUrl: true,
+  });
+
   const { runMigrations } = await import('../../../server/db/migrate.js');
   const { closePool, getPool } = await import('../../../server/db/pool.js');
   t.after(closePool);
