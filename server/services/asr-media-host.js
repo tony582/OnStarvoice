@@ -25,6 +25,7 @@ const STAGE_TTL_MS = Number(process.env.ASR_STAGE_TTL_MS) || 15 * 60 * 1000; // 
 
 /** name(token+ext) -> { path, contentType, expiresAt } */
 const STORE = new Map();
+let asrMediaCleanupTimer = null;
 
 function publicBaseUrl() {
   const explicit = process.env.PUBLIC_BASE_URL;
@@ -55,13 +56,27 @@ async function cleanupName(name) {
   await unlink(entry.path).catch(() => {});
 }
 
-// 定期清理过期临时文件(兜底,正常路径转写完会主动 cleanup)
-setInterval(() => {
+function cleanupExpiredStagedMedia() {
   const now = Date.now();
   for (const [name, entry] of STORE) {
     if (now > entry.expiresAt) cleanupName(name);
   }
-}, 60 * 1000).unref?.();
+}
+
+// 定期清理过期临时文件(兜底,正常路径转写完会主动 cleanup)
+export function startAsrMediaCleanup() {
+  if (asrMediaCleanupTimer) return asrMediaCleanupTimer;
+  asrMediaCleanupTimer = setInterval(cleanupExpiredStagedMedia, 60 * 1000);
+  asrMediaCleanupTimer.unref?.();
+  return asrMediaCleanupTimer;
+}
+
+export function stopAsrMediaCleanup() {
+  if (!asrMediaCleanupTimer) return false;
+  clearInterval(asrMediaCleanupTimer);
+  asrMediaCleanupTimer = null;
+  return true;
+}
 
 /**
  * 下载媒体到临时文件并返回公网 URL。

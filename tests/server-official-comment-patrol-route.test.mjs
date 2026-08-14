@@ -10,8 +10,8 @@ const route = await readFile(
   new URL('../server/routes/official-comment-patrol.js', import.meta.url),
   'utf8',
 );
-const serverIndex = await readFile(
-  new URL('../server/index.js', import.meta.url),
+const serverApp = await readFile(
+  new URL('../server/app.js', import.meta.url),
   'utf8',
 );
 const taskCreator = await readFile(
@@ -39,11 +39,11 @@ function sourceSection(source, start, end) {
 
 test('official comment patrol is mounted under capture-cloud', () => {
   assert.match(
-    serverIndex,
+    serverApp,
     /import officialCommentPatrolRouter from '\.\/routes\/official-comment-patrol\.js';/u,
   );
   assert.match(
-    serverIndex,
+    serverApp,
     /app\.use\('\/api\/capture-cloud', officialCommentPatrolRouter\);/u,
   );
 });

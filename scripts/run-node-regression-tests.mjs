@@ -3,7 +3,7 @@ import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const minimumTestCount = 1133;
+const minimumTestCount = 1144;
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testRoot = path.join(repositoryRoot, 'tests');
 

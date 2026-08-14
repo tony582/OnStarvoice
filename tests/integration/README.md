@@ -1,6 +1,6 @@
 # StarVoice 集成测试约定
 
-此目录只承载真实边界测试，不纳入默认的源码契约测试通配符。
+此目录只承载真实边界测试。隔离 PostgreSQL 用例由专用 Runner 执行；不应依赖数据库的 HTTP `*.test.mjs` 在不可达本地测试库保护下纳入默认 Node 回归。
 
 ## PostgreSQL
 
@@ -20,11 +20,11 @@ TEST_DATABASE_URL=postgresql://USER:PASSWORD@127.0.0.1:5432/onstarvoice_test \
 
 ## HTTP
 
-HTTP 集成测试放在 `tests/integration/http/`。P2 提取 `createApp()` 后再加入首批用例，必须满足：
+HTTP 集成测试放在 `tests/integration/http/`。P2-A1 已提取 `createApp()` 并加入首批无数据库用例，后续用例必须继续满足：
 
 - 测试导入无监听、无 Cron、无迁移、无回填副作用的 `createApp()`，禁止导入即启动的 `server/index.js`；
-- 使用系统分配的临时端口，覆盖认证、租户、404、500、liveness 与 readiness；
+- 使用系统分配的临时端口；P2-A1 已覆盖认证/租户拒绝路径、404、500 和当前健康端点，readiness 及成功租户隔离留待后续阶段；
 - 需要数据库的 HTTP 用例继续使用上述 `TEST_DATABASE_URL` 保护；
 - 不调用真实 AI、SMTP、外部媒体或客户浏览器。
 
-目前 HTTP 目录只建立约定，不提前抽离应用入口；该行为改造属于 P2-A。
+当前入口与覆盖范围见 `tests/integration/http/README.md`。任何需要 PostgreSQL 的 HTTP 用例都不得绕过上述连接保护。

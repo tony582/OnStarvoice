@@ -140,7 +140,7 @@ test("backend contracts persist feedback and protect manual overrides", async ()
     aiLabeler,
     recordStore,
     workspace,
-    serverIndex,
+    serverApp,
     recordsRoute,
     drawer,
     feedbackOnlyMigration,
@@ -151,7 +151,7 @@ test("backend contracts persist feedback and protect manual overrides", async ()
     source("server/services/ai-labeler.js"),
     source("server/services/record-store.js"),
     source("server/routes/workspace.js"),
-    source("server/index.js"),
+    source("server/app.js"),
     source("server/routes/records.js"),
     source("web/admin/src/components/shared/RecordDrawer.tsx"),
     source("server/db/migrations/038_false_positive_feedback_only.sql"),
@@ -198,7 +198,7 @@ test("backend contracts persist feedback and protect manual overrides", async ()
   assert.match(drawer, /\/activity/);
   assert.match(workspace, /feedbackPending/);
   assert.match(workspace, /global_role === 'platform_admin'/);
-  assert.match(serverIndex, /app\.use\('\/api\/feedback', feedbackRouter\)/);
+  assert.match(serverApp, /app\.use\('\/api\/feedback', feedbackRouter\)/);
   assert.match(feedbackOnlyMigration, /WHERE status = 'false_positive'/);
   assert.match(feedbackOnlyMigration, /original_values->>'triage_status'/);
   assert.doesNotMatch(

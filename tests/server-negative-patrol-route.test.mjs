@@ -11,8 +11,8 @@ const route = await readFile(
   new URL('../server/routes/negative-patrol.js', import.meta.url),
   'utf8',
 );
-const serverIndex = await readFile(
-  new URL('../server/index.js', import.meta.url),
+const serverApp = await readFile(
+  new URL('../server/app.js', import.meta.url),
   'utf8',
 );
 
@@ -26,11 +26,11 @@ function section(startMarker, endMarker) {
 
 test('negative patrol router is mounted under capture-cloud', () => {
   assert.match(
-    serverIndex,
+    serverApp,
     /import negativePatrolRouter from '\.\/routes\/negative-patrol\.js';/u,
   );
   assert.match(
-    serverIndex,
+    serverApp,
     /app\.use\('\/api\/capture-cloud', negativePatrolRouter\);/u,
   );
 });

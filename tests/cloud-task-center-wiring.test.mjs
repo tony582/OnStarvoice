@@ -19,11 +19,11 @@ async function readMigration(prefix) {
 }
 
 test("server mounts the tenant cloud task center and agent endpoints", async () => {
-  const [index, route] = await Promise.all([
-    read("server/index.js"),
+  const [app, route] = await Promise.all([
+    read("server/app.js"),
     read("server/routes/capture-cloud.js"),
   ]);
-  assert.match(index, /app\.use\('\/api\/capture-cloud', captureCloudRouter\)/u);
+  assert.match(app, /app\.use\('\/api\/capture-cloud', captureCloudRouter\)/u);
   assert.match(route, /router\.post\('\/agent\/heartbeat', requireCaptureAgent/u);
   assert.match(route, /router\.post\(\s*'\/agents\/:id\/tasks'\s*,\s*requireTenantAccess\s*,\s*requireSessionUser\s*,\s*requireTenantWriter/u);
   assert.match(route, /router\.post\('\/tasks\/:id\/resume', requireTenantAccess, requireSessionUser, requireTenantWriter/u);

@@ -100,7 +100,7 @@ test('backend contracts keep custom tags tenant-scoped, audited and recapture-sa
     records,
     triage,
     workspace,
-    serverIndex,
+    serverApp,
     recordStore,
   ] = await Promise.all([
     source('server/db/migrations/030_record_custom_tags.sql'),
@@ -109,7 +109,7 @@ test('backend contracts keep custom tags tenant-scoped, audited and recapture-sa
     source('server/routes/records.js'),
     source('server/routes/triage.js'),
     source('server/routes/workspace.js'),
-    source('server/index.js'),
+    source('server/app.js'),
     source('server/services/record-store.js'),
   ]);
 
@@ -137,6 +137,6 @@ test('backend contracts keep custom tags tenant-scoped, audited and recapture-sa
   assert.match(triage, /AS custom_tags/);
   assert.match(triage, /header: '自定义标签'/);
   assert.match(workspace, /customTagsSelectSql\('r'\)\} AS custom_tags/);
-  assert.match(serverIndex, /app\.use\('\/api\/custom-tags', customTagsRouter\)/);
+  assert.match(serverApp, /app\.use\('\/api\/custom-tags', customTagsRouter\)/);
   assert.doesNotMatch(recordStore, /record_custom_tags|customTags|custom_tags/);
 });
