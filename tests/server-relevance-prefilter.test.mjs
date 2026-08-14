@@ -188,13 +188,13 @@ test('idempotency body hash ignores request ids but detects logical content chan
 });
 
 test('backend contract uses tenant auth, shared AI admission and an audit ledger', async () => {
-  const [migration, service, route, aiLabeler, admission, serverIndex] = await Promise.all([
+  const [migration, service, route, aiLabeler, admission, serverApp] = await Promise.all([
     source('server/db/migrations/031_relevance_prefilter.sql'),
     source('server/services/relevance-prefilter.js'),
     source('server/routes/relevance-prefilter.js'),
     source('server/services/ai-labeler.js'),
     source('server/services/ai-admission.js'),
-    source('server/index.js'),
+    source('server/app.js'),
   ]);
 
   assert.match(migration, /CREATE TABLE IF NOT EXISTS relevance_prefilter_requests/);
@@ -221,5 +221,5 @@ test('backend contract uses tenant auth, shared AI admission and an audit ledger
   assert.match(admission, /DEFAULT_AI_TENANT_CONCURRENCY = 6/u);
   assert.match(admission, /priority/u);
   assert.match(admission, /AI_ADMISSION_QUEUE_TIMEOUT/u);
-  assert.match(serverIndex, /app\.use\('\/api\/relevance\/prefilter', relevancePrefilterRouter\)/);
+  assert.match(serverApp, /app\.use\('\/api\/relevance\/prefilter', relevancePrefilterRouter\)/);
 });

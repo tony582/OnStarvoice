@@ -6,8 +6,8 @@ const route = await readFile(
   new URL('../server/routes/followed-creator-patrol.js', import.meta.url),
   'utf8',
 );
-const serverIndex = await readFile(
-  new URL('../server/index.js', import.meta.url),
+const serverApp = await readFile(
+  new URL('../server/app.js', import.meta.url),
   'utf8',
 );
 const captureCloud = await readFile(
@@ -29,11 +29,11 @@ const sidebar = await readFile(
 
 test('profile patrol is mounted under capture-cloud', () => {
   assert.match(
-    serverIndex,
+    serverApp,
     /import followedCreatorPatrolRouter from '\.\/routes\/followed-creator-patrol\.js';/u,
   );
   assert.match(
-    serverIndex,
+    serverApp,
     /app\.use\('\/api\/capture-cloud', followedCreatorPatrolRouter\);/u,
   );
 });

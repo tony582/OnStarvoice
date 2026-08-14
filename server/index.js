@@ -3,212 +3,27 @@
  */
 
 import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 
+import { createApp } from './app.js';
 import { initDb, closeDb } from './db/init.js';
 import { startCronJobs } from './cron.js';
-import { sendTestEmail } from './services/email-notifier.js';
-import {
-  labelPendingRecords,
-  probeDeepSeekPrimaryModel,
-} from './services/ai-labeler.js';
+import { probeDeepSeekPrimaryModel } from './services/ai-labeler.js';
 import {runAiFailoverRecoverySweep} from './services/ai-failover.js';
-import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
 import { failStaleAnalyses } from './services/opinion-analysis.js';
-import { requireAdmin } from './middleware/auth.js';
+import { startVerifyRateLimitCleanup, stopVerifyRateLimitCleanup } from './routes/verify.js';
+import { startAsrMediaCleanup, stopAsrMediaCleanup } from './services/asr-media-host.js';
+import { ensureMediaDirs, backfillRecentCovers, backfillRecentImages } from './services/media-store.js';
 
-import authRouter from './routes/auth.js';
-import verifyRouter from './routes/verify.js';
-import syncRouter from './routes/sync.js';
-import targetRouter from './routes/target.js';
-import monitorRouter from './routes/monitor.js';
-import updateManifestRouter from './routes/update-manifest.js';
-import adminRouter from './routes/admin.js';
-import userRouter from './routes/user.js';
-import issuesRouter from './routes/issues.js';
-import reportsRouter from './routes/reports.js';
-import recordsRouter from './routes/records.js';
-import commentsRouter from './routes/comments.js';
-import triageRouter from './routes/triage.js';
-import workspaceRouter from './routes/workspace.js';
-import analyticsRouter from './routes/analytics.js';
-import leadsRouter from './routes/leads.js';
-import keywordOpportunityRouter, { keywordAnalysisRouter, benchmarkDiscoveryRouter } from './routes/keyword-strategy.js';
-import contentRouter from './routes/content.js';
-import imageProxyRouter from './routes/image-proxy.js';
-import ticketsRouter from './routes/tickets.js';
-import feedbackRouter from './routes/feedback.js';
-import customTagsRouter from './routes/custom-tags.js';
-import relevancePrefilterRouter from './routes/relevance-prefilter.js';
-import captureCloudRouter from './routes/capture-cloud.js';
-import captureOrchestrationsRouter from './routes/capture-orchestrations.js';
-import negativePatrolRouter from './routes/negative-patrol.js';
-import officialCommentPatrolRouter from './routes/official-comment-patrol.js';
-import followedCreatorPatrolRouter from './routes/followed-creator-patrol.js';
-import opinionAnalysisRouter from './routes/opinion-analysis.js';
-import socialAccountsRouter from './routes/social-accounts.js';
-import { asrMediaRouter } from './services/asr-media-host.js';
-import { ensureMediaDirs, backfillRecentCovers, backfillRecentImages, MEDIA_DIR } from './services/media-store.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const app = express();
+const app = createApp();
 const PORT = process.env.PORT || 3000;
-
-// ==================== 中间件 ====================
-
-const configuredCorsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:5173,http://127.0.0.1:5173')
-  .split(',')
-  .map(origin => origin.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (configuredCorsOrigins.includes(origin) || origin.startsWith('chrome-extension://')) {
-      return callback(null, true);
-    }
-    return callback(new Error(`CORS origin not allowed: ${origin}`));
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-auth-code', 'x-admin-token', 'x-tenant-id', 'x-session-token', 'x-capture-agent-token', 'Authorization'],
-}));
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// Cookie 解析
-app.use((req, res, next) => {
-  req.cookies = {};
-  const cookieHeader = req.headers.cookie || '';
-  cookieHeader.split(';').forEach(pair => {
-    const [key, value] = pair.trim().split('=');
-    if (key) req.cookies[key] = decodeURIComponent(value || '');
-  });
-  next();
-});
-
-// 请求日志
-app.use((req, res, next) => {
-  if (req.path.startsWith('/api/')) {
-    console.log(`[REQ] ${req.method} ${req.path} body-keys: ${Object.keys(req.body || {}).join(',')}`);
-  }
-  next();
-});
-
-// ==================== 静态文件 ====================
-
-// React 构建产物
-app.use('/admin', express.static(join(__dirname, '..', 'web', 'admin', 'dist')));
-app.use('/dashboard', express.static(join(__dirname, '..', 'web', 'dashboard', 'dist')));
-// 旧版静态文件（向后兼容，作为 fallback）
-app.use('/admin', express.static(join(__dirname, 'admin')));
-app.use('/dashboard', express.static(join(__dirname, 'dashboard')));
-app.use('/images', express.static(join(__dirname, '..', 'images')));
-// 手动安装/侧载 Extension 的正式更新包。发布时把版本包放在
-// /opt/onstarvoice/releases；目录在 server rsync 之外，后端更新不会误删历史包。
-app.use('/downloads', express.static(join(__dirname, '..', 'releases'), {
-  maxAge: '1h',
-  fallthrough: true,
-}));
-// 封面落地的本地副本(在 rsync 之外的 MEDIA_DIR,部署不清空)
-app.use('/media', express.static(MEDIA_DIR, { maxAge: '7d' }));
-
-// 关于 / 联系 / 定价 / 更新日志(插件内多处入口指向此页）
-app.get(['/about', '/contact', '/changelog', '/pricing'], (req, res) => {
-  res.sendFile(join(__dirname, 'public', 'about.html'));
-});
-
-// 使用教程 / 常见问题(插件「使用教程」「常见问题」入口指向此页;#guide / #faq 锚点定位)
-app.get(['/help', '/guide', '/faq', '/tutorial'], (req, res) => {
-  res.sendFile(join(__dirname, 'public', 'help.html'));
-});
-
-// ==================== API 路由 ====================
-
-app.use('/api/auth', authRouter);
-app.use('/api/verify', verifyRouter);
-app.use('/api/sync', syncRouter);
-app.use('/api/target', targetRouter);
-app.use('/api/monitor', monitorRouter);
-app.use('/api/update-manifest', updateManifestRouter);
-app.use('/api/admin', adminRouter);
-app.use('/api/user', userRouter);
-app.use('/api/issues', issuesRouter);
-app.use('/api/reports', reportsRouter);
-app.use('/api/records', recordsRouter);
-app.use('/api/comments', commentsRouter);
-app.use('/api/triage', triageRouter);
-app.use('/api/workspace', workspaceRouter);
-app.use('/api/analytics', analyticsRouter);
-app.use('/api/leads', leadsRouter);
-app.use('/api/keyword-analysis', keywordAnalysisRouter);
-app.use('/api/keyword-opportunity', keywordOpportunityRouter);
-app.use('/api/benchmark-discovery', benchmarkDiscoveryRouter);
-app.use('/api/content', contentRouter);
-app.use('/api/img', imageProxyRouter);
-app.use('/api/tickets', ticketsRouter);
-app.use('/api/feedback', feedbackRouter);
-app.use('/api/custom-tags', customTagsRouter);
-app.use('/api/relevance/prefilter', relevancePrefilterRouter);
-app.use('/api/capture-cloud', captureCloudRouter);
-app.use('/api/capture-cloud', captureOrchestrationsRouter);
-app.use('/api/capture-cloud', negativePatrolRouter);
-app.use('/api/capture-cloud', officialCommentPatrolRouter);
-app.use('/api/capture-cloud', followedCreatorPatrolRouter);
-app.use('/api/opinion-analysis', opinionAnalysisRouter);
-app.use('/api/social-accounts', socialAccountsRouter);
-// 公网无鉴权:仅供阿里云百炼拉取 ASR 临时托管的媒体(token 一次性、短时效)
-app.use('/api/asr-media', asrMediaRouter);
-
-app.post('/api/admin/test-email', requireAdmin, async (req, res) => {
-  try { return res.json(await sendTestEmail()); }
-  catch (err) { return res.json({ ok: false, message: err.message }); }
-});
-
-app.post('/api/admin/run-labeling', requireAdmin, async (req, res) => {
-  try { return res.json({ ok: true, ...(await labelPendingRecords(req.body?.limit || 20)) }); }
-  catch (err) { return res.json({ ok: false, message: err.message }); }
-});
-
-app.post('/api/admin/generate-report', requireAdmin, async (req, res) => {
-  try {
-    const { type = 'daily', tenantId = null } = req.body;
-    if (type === 'monthly') await generateMonthlyReport(tenantId);
-    else if (type === 'weekly') await generateWeeklyReport(tenantId);
-    else await generateDailyReport(tenantId);
-    return res.json({ ok: true, message: `${type} 报表已生成并发送` });
-  } catch (err) { return res.json({ ok: false, message: err.message }); }
-});
-
-app.get('/api/health', (req, res) => {
-  return res.json({ ok: true, version: '0.1.0', uptime: process.uptime() });
-});
-
-// SPA fallback — 让 React Router 处理客户端路由
-app.get('/admin/*', (req, res) => {
-  res.sendFile(join(__dirname, '..', 'web', 'admin', 'dist', 'index.html'));
-});
-app.get('/dashboard/*', (req, res) => {
-  res.sendFile(join(__dirname, '..', 'web', 'dashboard', 'dist', 'index.html'));
-});
-
-app.get('/', (req, res) => { res.redirect('/admin'); });
-
-app.use((err, req, res, next) => {
-  console.error('[Server] Unhandled error:', err);
-  return res.status(500).json({ ok: false, error: 'server_error', message: err.message });
-});
 
 // ==================== 启动 ====================
 
 async function start() {
   await initDb();
   ensureMediaDirs();
+  startVerifyRateLimitCleanup();
+  startAsrMediaCleanup();
   startCronJobs();
 
   // 舆情剖析收尸:剖析任务靠 setImmediate 在内存里跑,进程重启即丢,
@@ -331,5 +146,16 @@ start().catch(err => {
   process.exit(1);
 });
 
-process.on('SIGINT', async () => { console.log('\n[Server] Shutting down...'); await closeDb(); process.exit(0); });
-process.on('SIGTERM', async () => { await closeDb(); process.exit(0); });
+process.on('SIGINT', async () => {
+  console.log('\n[Server] Shutting down...');
+  stopVerifyRateLimitCleanup();
+  stopAsrMediaCleanup();
+  await closeDb();
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  stopVerifyRateLimitCleanup();
+  stopAsrMediaCleanup();
+  await closeDb();
+  process.exit(0);
+});

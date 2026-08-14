@@ -8,6 +8,8 @@ const router = Router();
 // 轻量 IP 限流:/api/verify 是公开接口,防被刷(枚举激活码 / 消耗绑定名额)。
 const VERIFY_RATE = { windowMs: 60000, max: 20 };
 const verifyHits = new Map(); // ip -> { count, resetAt }
+let verifyRateLimitCleanupTimer = null;
+
 function verifyRateLimited(ip) {
   const key = String(ip || 'unknown');
   const now = Date.now();
@@ -19,10 +21,25 @@ function verifyRateLimited(ip) {
   entry.count += 1;
   return entry.count > VERIFY_RATE.max;
 }
-setInterval(() => {
+
+function cleanupExpiredVerifyHits() {
   const now = Date.now();
   for (const [key, entry] of verifyHits) if (now > entry.resetAt) verifyHits.delete(key);
-}, 5 * 60000).unref?.();
+}
+
+export function startVerifyRateLimitCleanup() {
+  if (verifyRateLimitCleanupTimer) return verifyRateLimitCleanupTimer;
+  verifyRateLimitCleanupTimer = setInterval(cleanupExpiredVerifyHits, 5 * 60000);
+  verifyRateLimitCleanupTimer.unref?.();
+  return verifyRateLimitCleanupTimer;
+}
+
+export function stopVerifyRateLimitCleanup() {
+  if (!verifyRateLimitCleanupTimer) return false;
+  clearInterval(verifyRateLimitCleanupTimer);
+  verifyRateLimitCleanupTimer = null;
+  return true;
+}
 
 /**
  * POST /api/verify

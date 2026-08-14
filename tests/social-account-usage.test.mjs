@@ -365,7 +365,7 @@ test("schema, heartbeat, tenant api, and admin page are wired as one Agent-first
     bindingModeMigration,
     captureRoute,
     accountRoute,
-    serverIndex,
+    serverApp,
     background,
     cloudAgent,
     page,
@@ -378,7 +378,7 @@ test("schema, heartbeat, tenant api, and admin page are wired as one Agent-first
     source("server/db/migrations/047_social_account_binding_mode.sql"),
     source("server/routes/capture-cloud.js"),
     source("server/routes/social-accounts.js"),
-    source("server/index.js"),
+    source("server/app.js"),
     source("background.js"),
     source("utils/cloud-task-agent.js"),
     source("web/admin/src/pages/SocialAccountsPage.tsx"),
@@ -423,7 +423,7 @@ test("schema, heartbeat, tenant api, and admin page are wired as one Agent-first
     "migrated and revoked Agents must not be offered for social-account binding",
   );
   assert.doesNotMatch(accountRoute, /status <> 'revoked'/u);
-  assert.match(serverIndex, /app\.use\('\/api\/social-accounts', socialAccountsRouter\)/u);
+  assert.match(serverApp, /app\.use\('\/api\/social-accounts', socialAccountsRouter\)/u);
   assert.match(background, /onstarvoice\.socialAccountUsageQueue/u);
   assert.match(background, /recordSocialAccountUsageFromRelay/u);
   assert.match(background, /acknowledgeSocialAccountUsageEvents/u);

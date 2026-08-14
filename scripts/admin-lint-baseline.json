@@ -1,0 +1,42 @@
+{
+  "maximumTotals": {
+    "errors": 288,
+    "warnings": 0
+  },
+  "files": {
+    "src/components/shared/BatchBar.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/ChinaMap.tsx": { "errors": 5, "warnings": 0 },
+    "src/components/shared/CommentLeadDrawer.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/EventDrawer.tsx": { "errors": 5, "warnings": 0 },
+    "src/components/shared/IssueDrawer.tsx": { "errors": 3, "warnings": 0 },
+    "src/components/shared/KeywordFilter.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/NotePrompt.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/ProcessingBanner.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/RecordDrawer.tsx": { "errors": 31, "warnings": 0 },
+    "src/components/shared/StatusChangePrompt.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/TicketDispatch.tsx": { "errors": 1, "warnings": 0 },
+    "src/components/shared/TicketDrawer.tsx": { "errors": 12, "warnings": 0 },
+    "src/lib/auth.tsx": { "errors": 1, "warnings": 0 },
+    "src/lib/badges.tsx": { "errors": 1, "warnings": 0 },
+    "src/lib/navigation.tsx": { "errors": 5, "warnings": 0 },
+    "src/pages/AdminPages.tsx": { "errors": 21, "warnings": 0 },
+    "src/pages/BenchmarksPage.tsx": { "errors": 5, "warnings": 0 },
+    "src/pages/ContentHomePage.tsx": { "errors": 11, "warnings": 0 },
+    "src/pages/DataPage.tsx": { "errors": 44, "warnings": 0 },
+    "src/pages/EventsPage.tsx": { "errors": 2, "warnings": 0 },
+    "src/pages/HitsPage.tsx": { "errors": 7, "warnings": 0 },
+    "src/pages/KeywordsPage.tsx": { "errors": 6, "warnings": 0 },
+    "src/pages/LoginPage.tsx": { "errors": 1, "warnings": 0 },
+    "src/pages/OpinionAnalysisPage.tsx": { "errors": 23, "warnings": 0 },
+    "src/pages/OpinionPage.tsx": { "errors": 8, "warnings": 0 },
+    "src/pages/OverviewPage.tsx": { "errors": 3, "warnings": 0 },
+    "src/pages/TracksPage.tsx": { "errors": 6, "warnings": 0 },
+    "src/pages/insights/DashboardTab.tsx": { "errors": 39, "warnings": 0 },
+    "src/pages/insights/ReportsTab.tsx": { "errors": 1, "warnings": 0 },
+    "src/pages/monitoring/HitsTab.tsx": { "errors": 6, "warnings": 0 },
+    "src/pages/workbench/IssuesQueue.tsx": { "errors": 4, "warnings": 0 },
+    "src/pages/workbench/LeadsQueue.tsx": { "errors": 6, "warnings": 0 },
+    "src/pages/workbench/TriageBoard.tsx": { "errors": 7, "warnings": 0 },
+    "src/pages/workbench/TriageQueue.tsx": { "errors": 18, "warnings": 0 }
+  }
+}

@@ -20,7 +20,7 @@ trap cleanup EXIT INT TERM
 
 # Customer packages are always rebuilt from the production target. This makes
 # it impossible for a preceding local test sync to leak localhost into a zip.
-zsh "$script_dir/sync-extension-build.zsh" production
+bash "$script_dir/sync-extension-build.zsh" production
 
 runtime_config="$build_dir/utils/runtime-config.js"
 if [[ ! -f "$runtime_config" ]] ||

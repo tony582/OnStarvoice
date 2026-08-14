@@ -6,8 +6,8 @@ const route = await readFile(
   new URL('../server/routes/capture-orchestrations.js', import.meta.url),
   'utf8',
 );
-const serverIndex = await readFile(
-  new URL('../server/index.js', import.meta.url),
+const serverApp = await readFile(
+  new URL('../server/app.js', import.meta.url),
   'utf8',
 );
 
@@ -21,11 +21,11 @@ function section(startMarker, endMarker) {
 
 test('orchestration router is mounted under the existing capture-cloud namespace', () => {
   assert.match(
-    serverIndex,
+    serverApp,
     /import captureOrchestrationsRouter from '\.\/routes\/capture-orchestrations\.js';/u,
   );
   assert.match(
-    serverIndex,
+    serverApp,
     /app\.use\('\/api\/capture-cloud', captureOrchestrationsRouter\);/u,
   );
 });
