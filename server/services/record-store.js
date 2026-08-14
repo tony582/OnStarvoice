@@ -213,6 +213,111 @@ export function guardRecordCommentCount(record = {}, existing = {}) {
   };
 }
 
+function normalizeCapturedTextForComparison(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .trim()
+    .replace(/\s*(?:\.{3}|…+)\s*展开\s*$/u, '')
+    .replace(/\s+/gu, '');
+}
+
+/**
+ * 同一 external_id 再次采集时，如果新正文只是旧正文的开头一段，视为
+ * 页面折叠/异步加载造成的回退。其他真实改写仍以本次平台结果为准。
+ */
+export function resolveCapturedTextUpdate(existingValue, incomingValue) {
+  const existing = String(existingValue || '').trim();
+  const incoming = String(incomingValue || '').trim();
+  if (!incoming) {
+    return { value: existing, preserved: Boolean(existing), reason: 'not_observed' };
+  }
+  if (!existing) {
+    return { value: incoming, preserved: false, reason: 'accepted' };
+  }
+
+  const existingComparable = normalizeCapturedTextForComparison(existing);
+  const incomingComparable = normalizeCapturedTextForComparison(incoming);
+  if (
+    incomingComparable &&
+    incomingComparable.length < existingComparable.length &&
+    existingComparable.startsWith(incomingComparable)
+  ) {
+    return { value: existing, preserved: true, reason: 'truncated_prefix' };
+  }
+  return { value: incoming, preserved: false, reason: 'accepted' };
+}
+
+function patchPayloadCapturedText(payload, { title, content }) {
+  let parsed;
+  try {
+    parsed = typeof payload === 'string' ? JSON.parse(payload) : structuredClone(payload);
+  } catch {
+    return payload;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return payload;
+
+  const listItem = Array.isArray(parsed.items)
+    ? parsed.items.find(item => item && typeof item === 'object' && !Array.isArray(item))
+    : null;
+  const candidates = [
+    parsed.detailPayload,
+    listItem?.detailPayload,
+    listItem,
+    parsed,
+  ].filter(candidate => candidate && typeof candidate === 'object' && !Array.isArray(candidate));
+
+  for (const candidate of candidates) {
+    for (const key of ['title', 'noteTitle']) {
+      if (title && Object.prototype.hasOwnProperty.call(candidate, key)) candidate[key] = title;
+    }
+    for (const key of ['content', 'noteContent', 'fullContent', 'body', 'desc']) {
+      if (content && Object.prototype.hasOwnProperty.call(candidate, key)) candidate[key] = content;
+    }
+  }
+  return JSON.stringify(parsed);
+}
+
+export function guardRecordTextCompleteness(record = {}, existing = {}) {
+  const platform = String(record.platform || existing.platform || '').trim().toLowerCase();
+  const completeness = resolvePayloadTextCompleteness(record.payload);
+  if (
+    platform !== 'douyin' ||
+    completeness === 'complete'
+  ) {
+    return record;
+  }
+  const title = resolveCapturedTextUpdate(existing.title, record.title);
+  const content = resolveCapturedTextUpdate(existing.content, record.content);
+  if (!title.preserved && !content.preserved) return record;
+  return {
+    ...record,
+    title: title.value,
+    content: content.value,
+    payload: patchPayloadCapturedText(record.payload, {
+      title: title.value,
+      content: content.value,
+    }),
+  };
+}
+
+function resolvePayloadTextCompleteness(payload) {
+  let parsed;
+  try {
+    parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
+  } catch {
+    return '';
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+  const listItem = Array.isArray(parsed.items)
+    ? parsed.items.find(item => item && typeof item === 'object' && !Array.isArray(item))
+    : null;
+  for (const candidate of [parsed.detailPayload, listItem?.detailPayload, listItem, parsed]) {
+    const value = String(candidate?.contentCompleteness || '').trim().toLowerCase();
+    if (value) return value;
+  }
+  return '';
+}
+
 function meaningful(value) {
   if (value == null) return false;
   if (typeof value === 'string') return value !== '' && value !== '[]' && value !== '{}';
@@ -379,6 +484,7 @@ export async function upsertCapturedRecord(record, context) {
     record = {...record, record_type: officialResolution.recordType};
 
     record = guardRecordCommentCount(record, existing || {});
+    record = guardRecordTextCompleteness(record, existing || {});
     payload = jsonText(record.payload, '{}');
 
     if (existing) {

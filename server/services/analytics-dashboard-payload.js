@@ -58,6 +58,7 @@ export function compactAnalyticsDashboard(snapshot = {}) {
   const commentRisks = snapshot.commentRisks || snapshot.negativeComments || [];
   return {
     timeBasis: snapshot.timeBasis === 'published' ? 'published' : 'captured',
+    commentRiskAttentionEnabled: snapshot.commentRiskAttentionEnabled !== false,
     total: number(snapshot.total),
     newRecords: number(snapshot.newRecords),
     updatedRecords: number(snapshot.updatedRecords),

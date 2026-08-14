@@ -2,13 +2,14 @@ import { useState } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import {
   ArrowLeft, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
-  MessagesSquare, Network, Radar, Search, ShieldAlert, X,
+  MessagesSquare, Network, Radar, Search, ShieldAlert, Star, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drawer } from '@/components/shared/Drawer'
 import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
 import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
+import { WatchedContentTaskCreator } from './WatchedContentTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
 import { AccountDiscoveryTaskCreator } from './AccountDiscoveryTaskCreator'
 import type { CloudAgent, CloudCreateTaskType, CloudTask, ComposerIntent } from './lib'
@@ -26,6 +27,7 @@ const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
   { value: 'creator_patrol', title: '关注博主扫描', description: '打开已关注博主主页，发现近期作品并更新博主新动态。', note: '主页作品发现', icon: Radar, planned: false },
   { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
+  { value: 'watched_content', title: '关注内容巡查', description: '从人工关注的内容中勾选帖子，按每条内容的平台交给对应 Agent 补采。', note: '支持小红书＋抖音混合清单', icon: Star, planned: false },
   { value: 'comment_patrol', title: '官方账号评论巡查', description: '打开官方账号主页，按最新顺序读取指定数量的作品及当前可见评论。', note: '账号主页增强', icon: MessagesSquare, planned: false },
 ]
 
@@ -83,7 +85,7 @@ export function CreateTaskDrawer({
   writable: boolean
   intent: ComposerIntent
   onClose: () => void
-  onCreated: () => Promise<void>
+  onCreated: (taskType: TaskType) => Promise<void>
   onLaunchOrchestration: (intent: OrchestrationLaunchIntent) => void
 }) {
   const editingExisting = intent.editExisting === true
@@ -96,12 +98,18 @@ export function CreateTaskDrawer({
       ? 'comment_patrol'
       : intent.taskType === 'creator_patrol'
         ? 'creator_patrol'
-        : null
+        : intent.taskType === 'negative_patrol'
+          ? 'negative_patrol'
+          : intent.taskType === 'watched_content'
+            ? 'watched_content'
+            : null
   const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
 
   const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : 'type')
   const [taskType, setTaskType] = useState<TaskType>(presetTaskType || 'keyword')
-  const [method, setMethod] = useState<ExecutionMethod>('single')
+  const [method, setMethod] = useState<ExecutionMethod>(() => (
+    ['negative_patrol', 'watched_content'].includes(presetTaskType || '') ? 'multi' : 'single'
+  ))
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>(presetAgentId ? [presetAgentId] : [])
 
   const mode: 'one_time' | 'unattended_plan' = taskType === 'unattended_plan' ? 'unattended_plan' : 'one_time'
@@ -116,7 +124,8 @@ export function CreateTaskDrawer({
   })
   const showIndicator = !editingExisting
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
-  const orchestrationPath = method === 'multi' && taskType !== 'negative_patrol'
+  const contentPatrolTask = ['negative_patrol', 'watched_content'].includes(taskType)
+  const orchestrationPath = method === 'multi' && !contentPatrolTask
   const stepLabels = orchestrationPath
     ? [
         { step: 'type' as const, label: '任务类型' },
@@ -143,7 +152,7 @@ export function CreateTaskDrawer({
       return setStep('method')
     }
     if (step === 'method') {
-      if (method === 'multi' && taskType !== 'negative_patrol') {
+      if (method === 'multi' && !contentPatrolTask) {
         return onLaunchOrchestration({
           executionMode: mode,
           agentIds: [],
@@ -179,7 +188,7 @@ export function CreateTaskDrawer({
   const nextLabel = step === 'type'
     ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
     : step === 'method'
-      ? method === 'multi' && taskType !== 'negative_patrol'
+      ? method === 'multi' && !contentPatrolTask
         ? '配置多节点任务'
         : '下一步：选择节点'
       : '下一步：任务配置'
@@ -220,7 +229,9 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
-                        if (['comment_patrol', 'creator_patrol'].includes(item.value)) {
+                        if (['negative_patrol', 'watched_content'].includes(item.value)) {
+                          setMethod('multi')
+                        } else if (['comment_patrol', 'creator_patrol'].includes(item.value)) {
                           setMethod('single')
                           setSelectedAgentIds(current => current.slice(0, 1))
                         }
@@ -255,7 +266,10 @@ export function CreateTaskDrawer({
                 const selected = method === item.value
                 const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
                 const elasticPool = item.value === 'multi'
-                  && ['keyword', 'unattended_plan', 'negative_patrol'].includes(taskType)
+                  && (
+                    ['keyword', 'unattended_plan', 'negative_patrol'].includes(taskType)
+                    || taskType === 'watched_content'
+                  )
                 const itemTitle = item.title
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
@@ -300,7 +314,7 @@ export function CreateTaskDrawer({
               <h3 className="text-base font-bold">{method === 'multi' ? '选择参与编排的节点' : '选择一个执行节点'}</h3>
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
                 {method === 'multi'
-                  ? taskType === 'negative_patrol'
+                  ? contentPatrolTask
                     ? '可多选；帖子保留在云端，由这些兼容节点空闲时逐篇领取。'
                     : '可多选；关键词保留在云端，由这些兼容节点空闲时逐个领取。'
                   : '任务会绑定到具体浏览器扩展。节点离线时原地等待，不会自动转交。'}
@@ -336,6 +350,8 @@ export function CreateTaskDrawer({
                       ? '关注博主扫描'
                     : taskType === 'negative_patrol'
                       ? '负面帖子巡查'
+                    : taskType === 'watched_content'
+                      ? '关注内容巡查'
                       : taskType === 'comment_patrol'
                         ? '官方账号评论巡查'
                         : '关键词采集'}
@@ -360,8 +376,20 @@ export function CreateTaskDrawer({
                   key={`${selectedAgentIds.join(':')}:negative-patrol`}
                   agents={method === 'multi' ? selectedAgents : [selectedAgent]}
                   writable={writable}
+                  initialRecordIds={intent.recordIds}
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'watched_content' ? (
+                <WatchedContentTaskCreator
+                  key={`${selectedAgentIds.join(':')}:watched-content`}
+                  agents={method === 'multi' ? selectedAgents : [selectedAgent]}
+                  writable={writable}
+                  initialRecordIds={intent.recordIds}
+                  onCreated={async () => {
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />
@@ -372,7 +400,7 @@ export function CreateTaskDrawer({
                   writable={writable}
                   initialOfficialAccountId={intent.officialAccountId}
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />
@@ -384,7 +412,7 @@ export function CreateTaskDrawer({
                   initialSubscriptionId={intent.subscriptionId}
                   subjectType="creator"
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />
@@ -399,7 +427,7 @@ export function CreateTaskDrawer({
                   hideLauncher
                   lockExecutionMode
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />

@@ -16,9 +16,9 @@ test('accepted child snapshots project keyword checkpoints to their exact parent
 
   assert.match(projection, /checkpointEntryToItemStatus\(entry\)/u);
   assert.match(projection, /task\.parent_task_id/u);
-  assert.match(projection, /execution_task_id = \$9/u);
-  assert.match(projection, /assigned_agent_id = \$10/u);
-  assert.match(projection, /keyword = \$11/u);
+  assert.match(projection, /execution_task_id = \$8/u);
+  assert.match(projection, /assigned_agent_id = \$9/u);
+  assert.match(projection, /keyword = \$10/u);
   assert.match(projection, /capture_task_item_attempts/u);
   assert.match(projection, /entry\.errorCode \|\| entry\.error_code/u);
   assert.match(projection, /requiresManualAction/u);

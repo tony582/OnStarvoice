@@ -9,6 +9,7 @@ import {
   Area, AreaChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { api } from '@/lib/api'
+import { useBadges } from '@/lib/badges'
 import { compact, formatDate, formatNumber, LABELS, platformName, proxiedImg } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -27,6 +28,7 @@ const G = {
   nsr: '净情感 NSR=(正面−负面)/(正面+负面)×100,范围 −100~+100。只看正负、不计中性,比负面率更敏感反映口碑好坏。',
   negativeRate: '负面率=负面内容数 ÷ 已 AI 标注内容数 ×100%。分母不含"待标注",AI 覆盖率低时该值会被放大,请对照待标注量解读。',
   risk: '舆情风险指数(0~100)=负面率/负面评论/高危未关闭问题/告警 加权,封顶 100。≥70 重点处置,≥45 风险抬升,≥20 持续观察。是促处置的相对警戒分,非概率。',
+  riskWithoutComments: '舆情风险指数(0~100)=负面率/高危未关闭问题/告警 加权,封顶 100。当前租户不将评论纳入风险统计。≥70 重点处置,≥45 风险抬升,≥20 持续观察。',
   heat: '舆情热度指数=内容数/互动/新评论/观测 加权综合,无固定上限;数值本身无绝对含义,只看相对高低与环比。',
   official: '官方响应率=有官方回复的内容数 ÷ 总声量。',
   pending: '待处理=当前处理状态仍为“待处理”、且尚未归档的内容。其它状态均由客户按实际处置结果灵活维护。',
@@ -85,6 +87,9 @@ type DashboardResponse = {
     end: string
     generatedAt: string
   }
+  features?: {
+    commentRiskAttentionEnabled?: boolean
+  }
   snapshot: any
 }
 
@@ -115,6 +120,7 @@ const HANDLING_STATUS_ROWS = [
   { key: 'reviewed', label: '已复核', color: '#059669' },
   { key: 'reviewed_non_monitor', label: '已复核-非监控内容', color: '#64748B' },
   { key: 'unavailable', label: '已不可见', color: '#64748B' },
+  { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#DC2626' },
   { key: 'negative_feishu', label: '负面-飞书表', color: '#DC2626' },
   { key: 'negative_cold', label: '负面-冷处理', color: '#DC2626' },
 ] as const
@@ -230,6 +236,7 @@ function FocusTopicBar({ keywords, setKeywords }: { keywords: string[]; setKeywo
 }
 
 export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
+  const { features: workspaceFeatures } = useBadges()
   const [month, setMonth] = useState(currentShanghaiMonth)
   const [data, setData] = useState<DashboardResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -243,6 +250,11 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
   const [drilldownError, setDrilldownError] = useState('')
   const drilldownRequestRef = useRef(0)
   const hasSnapshot = Boolean(data?.snapshot)
+  // 优先使用看板同步返回的租户口径；旧服务端则回退到全局工作台配置。
+  // 配置请求失败时维持历史默认开启，避免已开启租户误丢看板信息。
+  const commentRiskAttentionEnabled = data?.snapshot?.commentRiskAttentionEnabled
+    ?? data?.features?.commentRiskAttentionEnabled
+    ?? (workspaceFeatures.loaded ? workspaceFeatures.commentRiskAttentionEnabled : true)
 
   const load = useCallback((forceRefresh = false) => Promise.resolve().then(async () => {
     setLoading(true)
@@ -399,7 +411,7 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
           </div>
 
           {/* 执行摘要与专业分析统一后移。 */}
-          <ExecutiveSummary s={s} />
+          <ExecutiveSummary s={s} includeCommentRisk={commentRiskAttentionEnabled} />
 
           {/* 数据看板只保留巡查摘要，完整趋势与升温内容在独立页面查看 */}
           <NegativePatrolOverview data={s.negativePatrol} onOpen={onOpenPatrol} />
@@ -415,15 +427,17 @@ export function DashboardTab({ onOpenPatrol }: { onOpenPatrol?: () => void }) {
             </Panel>
           </section>
 
-          {/* 主题与评论风险属于延展维度，基础三分布已在首屏呈现。 */}
-          <section className="grid gap-4 xl:grid-cols-2">
+          {/* 评论仍可采集、标注和分诊；只有租户开启舆情关注时才进入风险分析。 */}
+          <section className={`grid gap-4 ${commentRiskAttentionEnabled ? 'xl:grid-cols-2' : ''}`}>
             <Panel title="主题分类" hint={G.category}>
               <Distribution rows={s.category || []} labelKey="category" labelMap={LABELS.category} />
             </Panel>
-            <Panel title="负面评论与风险" hint={G.negativeComment}
-              note={`本期负面评论 ${formatNumber(s.commentStats?.negative_comments || 0)} 条${(s.issueStats?.high_open_issues || 0) > 0 ? `,高危未关闭问题 ${formatNumber(s.issueStats.high_open_issues)} 个` : ''}`}>
-              <CommentRisks rows={s.commentRisks || s.negativeComments || []} />
-            </Panel>
+            {commentRiskAttentionEnabled && (
+              <Panel title="负面评论与风险" hint={G.negativeComment}
+                note={`本期负面评论 ${formatNumber(s.commentStats?.negative_comments || 0)} 条${(s.issueStats?.high_open_issues || 0) > 0 ? `,高危未关闭问题 ${formatNumber(s.issueStats.high_open_issues)} 个` : ''}`}>
+                <CommentRisks rows={s.commentRisks || s.negativeComments || []} />
+              </Panel>
+            )}
           </section>
 
           {/* 5. 高影响内容 */}
@@ -1141,7 +1155,7 @@ function trendNote(s: any) {
   return d ? `较上期${d.up ? '上升' : '下降'} ${d.pct}%` : '暂无可比上期'
 }
 
-function ExecutiveSummary({ s }: { s: any }) {
+function ExecutiveSummary({ s, includeCommentRisk }: { s: any; includeCommentRisk: boolean }) {
   const prev = s.previous || {}
   const risk = Number(s.opinionIndex?.risk) || 0
   const status = s.opinionIndex?.status || '平稳'
@@ -1156,7 +1170,7 @@ function ExecutiveSummary({ s }: { s: any }) {
     { label: '总声量', value: formatNumber(s.total), d: delta(s.total, prev.total), tone: 'accent', hint: G.volume },
     { label: '互动总量', value: formatNumber(interaction), tone: 'accent', hint: G.interaction },
     { label: '净情感 NSR', value: nsr, d: delta(nsr, nsrOf(prev.sentimentMap)), tone: nsr < 0 ? 'danger' : 'normal', hint: G.nsr },
-    { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: G.risk },
+    { label: '风险指数', value: risk, tone: risk >= 70 ? 'danger' : risk >= 45 ? 'warning' : 'normal', hint: includeCommentRisk ? G.risk : G.riskWithoutComments },
     { label: '负面率', value: `${negRate}%`, d: delta(negRate, prev.negativeRate), tone: negRate >= 20 ? 'danger' : 'normal', hint: G.negativeRate },
     { label: '本期入库', value: formatNumber(s.newRecords), d: delta(s.newRecords, prev.newRecords), hint: G.newRecords },
     { label: '本期待处理', value: formatNumber(periodPending), tone: periodPending > 0 ? 'warning' : 'normal', hint: G.pending },

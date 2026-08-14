@@ -6,7 +6,7 @@ type ColorKey = 'green' | 'red' | 'darkred' | 'orange' | 'amber' | 'blue' | 'pur
 
 const TONE_TO_COLOR: Record<string, ColorKey> = {
   positive: 'green', active: 'green', resolved: 'green', sent: 'green',
-  negative: 'red', high: 'red', negative_feishu: 'red', negative_cold: 'red',
+  negative: 'red', high: 'red', negative_feishu: 'red', negative_cold: 'red', privacy_unreachable: 'red',
   urgent: 'darkred', critical: 'darkred',
   unhandled: 'orange', new: 'orange', open: 'orange',
   pending: 'amber', medium: 'amber',

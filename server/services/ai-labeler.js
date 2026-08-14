@@ -5,6 +5,7 @@
 import { queryOne, queryAll, getSetting } from '../db/init.js';
 import {runWithTenantAiAdmission} from './ai-admission.js';
 import {
+  selectActiveActiveModel,
   recordAiModelFailure,
   recordAiModelSuccess,
   resolveAiFailoverConfig,
@@ -17,6 +18,7 @@ import {
 
 export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v2';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
+const activeActiveRequestSequences = new Map();
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -302,6 +304,18 @@ async function runModelOperationWithFailover(
   admissionOptions = {},
 ) {
   let activeConfig = initialConfig;
+  if (initialConfig?.failover?.mode === 'active_active') {
+    const sequence = activeActiveRequestSequences.get(tenantId) || 0;
+    activeActiveRequestSequences.set(tenantId, sequence + 1);
+    activeConfig = {
+      ...initialConfig,
+      model: selectActiveActiveModel(initialConfig, sequence),
+      failover: {
+        ...(initialConfig.failover || {}),
+        route: 'active_active',
+      },
+    };
+  }
   let failureRecorded = false;
   try {
     const data = await runWithTenantAiAdmission(
@@ -330,11 +344,15 @@ async function runModelOperationWithFailover(
                 route: decision.retryRoute || activeConfig.failover?.route || 'backup',
               },
             };
-            console.warn('[AIFailover] retrying current request on active backup', {
+            console.warn(
+              activeConfig.failover?.mode === 'active_active'
+                ? '[AIFailover] retrying current request on peer model'
+                : '[AIFailover] retrying current request on active backup', {
               tenantId,
               kind: admissionOptions.kind || 'llm',
               model: activeConfig.model,
-            });
+              },
+            );
             try {
               return await operation(activeConfig);
             } catch (backupError) {

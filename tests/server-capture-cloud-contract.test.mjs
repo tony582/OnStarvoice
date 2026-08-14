@@ -27,6 +27,8 @@ import {
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
+  elasticAttemptBudgetAfterOutcome,
+  projectElasticAttemptBudget,
   elasticRecoveryHoldRemainingMs,
   isProfilePatrolTask,
   lockActiveCaptureAgentSession,
@@ -159,6 +161,10 @@ test("cross-device retry supports root business tasks and keyword orchestrations
     task_type: "negative_post_patrol",
     parent_task_id: "11111111-1111-4111-8111-111111111111",
   }), false);
+  assert.equal(crossDeviceRetryTaskSupported({
+    task_type: "watched_content_patrol",
+    parent_task_id: null,
+  }), true);
 });
 
 test("recovery grading keeps captcha current and automates technical or unstarted items", () => {
@@ -244,6 +250,46 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
   }, now), 0);
 });
 
+test("elastic queue does not spend business retries on local capacity or dispatch failures", () => {
+  assert.equal(elasticAttemptBudgetAfterOutcome(3, {
+    error: {code: "capture_task_group_busy"},
+  }), 2);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "create_command_expired"},
+  }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+  }), 2);
+  const firstProjection = projectElasticAttemptBudget({
+    attempt_count: 3,
+    metadata: {elasticAttemptBudgetUsed: 3},
+  }, {
+    error: {code: "capture_task_group_busy"},
+  }, "11111111-1111-4111-8111-111111111111");
+  assert.equal(firstProjection.attemptBudget, 2);
+  assert.equal(firstProjection.refunded, true);
+  const replayProjection = projectElasticAttemptBudget({
+    attempt_count: 3,
+    metadata: firstProjection.metadataPatch,
+  }, {
+    error: {code: "capture_task_group_busy"},
+  }, "11111111-1111-4111-8111-111111111111");
+  assert.equal(replayProjection.attemptBudget, 2);
+  assert.equal(replayProjection.refunded, false);
+
+  const now = Date.parse("2026-08-13T02:00:00.000Z");
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "capture_task_group_busy"},
+    updated_at: "2026-08-13T01:45:00.000Z",
+  }, now), 15 * 60_000);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "elastic_task_heartbeat_timeout"},
+    updated_at: "2026-08-13T01:55:00.000Z",
+  }, now), 5 * 60_000);
+});
+
 test("automatic relay excludes devices per selected item instead of per parent task", () => {
   const selectedItemId = "11111111-1111-4111-8111-111111111111";
   const otherItemId = "22222222-2222-4222-8222-222222222222";
@@ -281,6 +327,16 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
     task_type: "negative_post_patrol",
     platform: "douyin",
   }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      watchedContentPatrol: true,
+    },
+  }, {
+    task_type: "watched_content_patrol",
+    platform: "douyin",
+  }), true);
   assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
     task_type: "followed_creator_post_patrol",
     platform: "xiaohongshu",
@@ -523,7 +579,7 @@ test("official comment patrol distinguishes profile scans from legacy direct-det
 test("targeted detail result projection has a closed workflow allow-list", () => {
   assert.match(
     captureCloudRouteSource,
-    /const TARGETED_POST_TASK_TYPES = new Set\(\[\s*'negative_post_patrol',\s*'official_account_comment_patrol',/u,
+    /const TARGETED_POST_TASK_TYPES = new Set\(\[\s*'negative_post_patrol',\s*'watched_content_patrol',\s*'official_account_comment_patrol',/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -712,7 +768,7 @@ test("operator stop terminal snapshots settle every unresolved child item", () =
   );
   assert.match(
     projection,
-    /metadata = metadata \|\| jsonb_build_object\('checkpoint', \$4::jsonb\)/u,
+    /metadata = metadata \|\| jsonb_build_object\('checkpoint', \$3::jsonb\)/u,
     "checkpoint evidence must remain stored before terminal settlement",
   );
 });
@@ -1183,7 +1239,7 @@ test("create command failures and successful stops settle orchestration work ite
   );
 });
 
-test("elastic queue claims one keyword or negative post per idle heartbeat and fences late attempts", () => {
+test("elastic queue claims one keyword or platform-bound content item per idle heartbeat and fences late attempts", () => {
   const claim = readRouteSection(
     "async function dispatchNextElasticWorkItem",
     "router.post('/agent/heartbeat'",
@@ -1193,13 +1249,23 @@ test("elastic queue claims one keyword or negative post per idle heartbeat and f
   assert.match(claim, /FOR UPDATE OF parent, item SKIP LOCKED/u);
   assert.match(claim, /keywords: \[candidate\.keyword\]/u);
   assert.match(claim, /item\.item_type = 'negative_post'/u);
+  assert.match(claim, /item\.item_type = 'watched_content'/u);
+  assert.match(claim, /item\.platform AS item_platform/u);
+  assert.match(claim, /item\.platform = ANY\(\$4::text\[\]\)/u);
+  assert.match(claim, /item\.platform = ANY\(\$5::text\[\]\)/u);
   assert.match(claim, /targets: \[target\]/u);
-  assert.match(claim, /claimUnit = 'negative_post'/u);
+  assert.match(claim, /claimUnit = candidate\.item_type/u);
+  assert.match(claim, /platform: candidate\.item_platform/u);
   assert.match(claim, /createAckTimeoutSeconds/u);
   assert.match(claim, /ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS/u);
   assert.match(claim, /attempt_count = \$1/u);
-  assert.match(claim, /assignment_revision = \$4/u);
-  assert.match(claim, /execution_task_id = \$3/u);
+  assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
+  assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
+  assert.match(claim, /elasticAttemptBudgetUsed/u);
+  assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
+  assert.match(claim, /attemptIdentity,/u);
+  assert.match(claim, /assignment_revision = \$5/u);
+  assert.match(claim, /execution_task_id = \$4/u);
   assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
   assert.match(claim, /classifyCaptureRecoveryDisposition/u);
   assert.match(claim, /'manual_current'/u);
@@ -1240,6 +1306,19 @@ test("elastic recovery releases the item immediately while cooling only the sour
   assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
 });
 
+test("elastic cleanup tolerates child tasks whose work item already settled", () => {
+  assert.deepEqual(
+    projectElasticAttemptBudget(null, {
+      error: {code: 'elastic_agent_offline_timeout'},
+    }),
+    {
+      attemptBudget: 0,
+      metadataPatch: {elasticAttemptBudgetUsed: 0},
+      refunded: false,
+    },
+  );
+});
+
 test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
   const lease = readRouteSection(
     'export async function reconcileElasticCaptureLeases',
@@ -1247,9 +1326,13 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   );
   assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
   assert.match(lease, /agent\.last_heartbeat_at/u);
+  assert.match(lease, /child\.heartbeat_at/u);
+  assert.match(lease, /elastic_task_heartbeat_timeout/u);
+  assert.match(lease, /!Number\.isFinite\(agentHeartbeatAt\)/u);
   assert.match(lease, /status: 'retryable'/u);
   assert.match(lease, /elastic_agent_offline_timeout/u);
   assert.match(lease, /FOR UPDATE SKIP LOCKED/u);
+  assert.doesNotMatch(lease, /child\.metadata->>'cloudWorkQueue'/u);
   assert.match(
     captureCloudRouteSource,
     /COALESCE\(metadata->>'distributionMode', ''\) <> 'elastic_pool'/u,

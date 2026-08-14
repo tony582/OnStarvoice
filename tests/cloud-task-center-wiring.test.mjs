@@ -24,6 +24,7 @@ test("server mounts the tenant cloud task center and agent endpoints", async () 
     read("server/routes/capture-cloud.js"),
   ]);
   assert.match(app, /app\.use\('\/api\/capture-cloud', captureCloudRouter\)/u);
+  assert.match(route, /router\.post\('\/agent\/liveness', requireCaptureAgent/u);
   assert.match(route, /router\.post\('\/agent\/heartbeat', requireCaptureAgent/u);
   assert.match(route, /router\.post\(\s*'\/agents\/:id\/tasks'\s*,\s*requireTenantAccess\s*,\s*requireSessionUser\s*,\s*requireTenantWriter/u);
   assert.match(route, /router\.post\('\/tasks\/:id\/resume', requireTenantAccess, requireSessionUser, requireTenantWriter/u);
@@ -63,6 +64,9 @@ test("extension heartbeat and remote task controls are wired into the service wo
       sidebarHtml.indexOf('src="sidebar-logic.js"'),
   );
   assert.match(background, /CLOUD_TASK_AGENT_PERIOD_MINUTES = 1/u);
+  assert.match(background, /syncCloudTaskAgentLiveness/u);
+  assert.match(background, /cloudTaskAgentApi\.sendLiveness/u);
+  assert.match(background, /syncCloudTaskAgentLiveness\(\{reason: 'cloud_agent_alarm'\}\)/u);
   assert.match(background, /manuallyRecoverUnattendedKeywordRun/u);
   assert.match(background, /cloudTaskAgentApi\.completeCommand/u);
   assert.match(background, /scheduleCloudTaskAgentSync\('task_ledger_changed'\)/u);
@@ -341,7 +345,7 @@ test("new fixed-node tasks explicitly disable automatic cross-device handoff", a
   assert.match(keywordCreator, /allowIdleAgentHandoff: false/u);
   assert.match(
     negativeCreator,
-    /allowIdleAgentHandoff: multiAgent/u,
+    /const elasticPool = multiAgent \|\| selectedPlatforms\.length > 1[\s\S]*allowIdleAgentHandoff: elasticPool/u,
   );
   assert.match(officialCreator, /allowIdleAgentHandoff: false/u);
   assert.match(accountCreator, /allowIdleAgentHandoff: false/u);

@@ -74,6 +74,7 @@ function AgentTaskRow({ task }: { task: CloudTask }) {
 function AgentRow({
   agent,
   tasks,
+  compact,
   withBorder,
   writable,
   onOpen,
@@ -83,6 +84,7 @@ function AgentRow({
 }: {
   agent: CloudAgent
   tasks: CloudTask[]
+  compact: boolean
   withBorder: boolean
   writable: boolean
   onOpen: () => void
@@ -99,7 +101,7 @@ function AgentRow({
   return (
     <div className={`flex min-w-0 items-stretch transition-colors hover:bg-sidebar-accent/60 ${withBorder ? 'border-t border-border/60' : ''} ${agent.online ? '' : 'opacity-60'}`}>
       <button type="button" onClick={onOpen}
-        className="flex min-w-0 flex-1 items-center gap-2.5 px-3 py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary">
+        className={`flex min-w-0 flex-1 items-center gap-2.5 px-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${compact ? 'py-3.5' : 'py-2.5'}`}>
         <span className={`h-2 w-2 shrink-0 rounded-full ${dotClass}`} aria-hidden="true" />
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-1.5">
@@ -114,10 +116,11 @@ function AgentRow({
                   <span key={platform} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">{PLATFORM_LABELS[platform] || platform}</span>
                 ))
               : <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">无平台</span>}
+            {compact && <span className="ml-auto text-[10px] tabular-nums text-muted-foreground">执行中 {activeTaskCount} · 排队 {queuedTaskCount}</span>}
           </span>
         </span>
         <span className="flex shrink-0 items-center gap-1.5 text-[11px] tabular-nums text-muted-foreground">
-          <span>执行中 {activeTaskCount} · 排队 {queuedTaskCount}</span>
+          {!compact && <span>执行中 {activeTaskCount} · 排队 {queuedTaskCount}</span>}
           <ChevronRight className="h-4 w-4" />
         </span>
       </button>
@@ -125,7 +128,7 @@ function AgentRow({
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
             <button type="button" aria-label={`管理节点 ${agent.display_name}`}
-              className="my-auto mr-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              className={`my-auto flex shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${compact ? 'mr-1 h-11 w-11' : 'mr-2 h-8 w-8'}`}>
               <MoreHorizontal className="h-4 w-4" />
             </button>
           </DropdownMenu.Trigger>
@@ -405,6 +408,7 @@ function AgentDetailPane({
   deletingPlan,
   onSaved,
   onBack,
+  compact,
 }: {
   agent: CloudAgent
   tasks: CloudTask[]
@@ -416,6 +420,7 @@ function AgentDetailPane({
   deletingPlan: boolean
   onSaved: () => Promise<void>
   onBack: () => void
+  compact: boolean
 }) {
   const { activeTaskCount, queuedTaskCount } = agentWorkload(agent, tasks)
   const blockReason = agentAssignmentBlockReason(agent, 'one_time')
@@ -497,10 +502,10 @@ function AgentDetailPane({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="shrink-0 border-b border-border/70 pb-3 pr-5">
+      <header className={`shrink-0 border-b border-border/70 pb-3 ${compact ? '' : 'pr-5'}`}>
         <div className="flex items-start gap-3">
           <button type="button" onClick={onBack} aria-label="返回执行节点列表"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+            className={`flex shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${compact ? 'h-11 w-11' : 'h-9 w-9'}`}>
             <ArrowLeft className="h-4 w-4" />
           </button>
           <div className="min-w-0 flex-1">
@@ -519,14 +524,14 @@ function AgentDetailPane({
                 <CheckCircle2 className="h-3.5 w-3.5" /> 已保存
               </span>
             )}
-            <Button variant="outline" size="sm" onClick={toggleProfileEditor} disabled={!writable} className="min-h-9">
+            <Button variant="outline" size="sm" onClick={toggleProfileEditor} disabled={!writable} className={compact ? 'min-h-11' : 'min-h-9'}>
               <Pencil className="h-3.5 w-3.5" /> {profileEditing ? '取消编辑' : '编辑节点'}
             </Button>
           </div>
         </div>
       </header>
 
-      <div className="workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain py-4 pr-5">
+      <div className={`workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain py-4 ${compact ? '' : 'pr-5'}`}>
         {agent.last_error && <div role="alert" className="mt-3 rounded-lg bg-status-red/8 px-2.5 py-2 text-[11px] leading-4 text-status-red">Agent 异常：{agent.last_error}</div>}
         {blockReason && <p className="mt-2 text-[11px] leading-4 text-status-red">{blockReason}</p>}
 
@@ -560,7 +565,7 @@ function AgentDetailPane({
               </span>
               <div className="ml-auto flex items-center gap-2">
                 <Button variant="ghost" size="sm" onClick={toggleProfileEditor} disabled={saving}>取消</Button>
-                <Button size="sm" onClick={() => void save()} disabled={saving || !displayName.trim()} className="min-h-9">
+                <Button size="sm" onClick={() => void save()} disabled={saving || !displayName.trim()} className={compact ? 'min-h-11' : 'min-h-9'}>
                   {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />} 保存资料
                 </Button>
               </div>
@@ -578,7 +583,7 @@ function AgentDetailPane({
               </div>
               <p className="mt-1 text-[11px] leading-4 text-muted-foreground">优先显示正在执行、等待设备和已启用的计划。</p>
             </div>
-            <Button size="sm" onClick={() => onAssign(agent)} disabled={!writable || Boolean(blockReason)} className="min-h-9">
+            <Button size="sm" onClick={() => onAssign(agent)} disabled={!writable || Boolean(blockReason)} className={compact ? 'min-h-11' : 'min-h-9'}>
               <Plus className="h-4 w-4" /> 分配任务
             </Button>
           </div>
@@ -662,6 +667,7 @@ function AgentDetailPane({
 export function AgentRail({
   agents,
   tasks,
+  surface = 'desktop',
   writable,
   onAssign,
   onEditPlan,
@@ -678,6 +684,7 @@ export function AgentRail({
 }: {
   agents: CloudAgent[]
   tasks: CloudTask[]
+  surface?: 'desktop' | 'mobile'
   writable: boolean
   onAssign: (agent: CloudAgent) => void
   onEditPlan: (agent: CloudAgent) => void
@@ -692,6 +699,7 @@ export function AgentRail({
   retiringAgentId?: string
   onSaved: () => Promise<void>
 }) {
+  const compact = surface === 'mobile'
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null)
   const [deleteCandidate, setDeleteCandidate] = useState<CloudAgent | null>(null)
   const [deleteError, setDeleteError] = useState('')
@@ -754,14 +762,15 @@ export function AgentRail({
           deletingPlan={deletingPlanAgentId === activeAgent.id}
           onSaved={onSaved}
           onBack={() => setActiveAgentId(null)}
+          compact={compact}
         />
       ) : (
         <>
-          <header className="mb-3 shrink-0 pr-5">
+          <header className={`mb-3 shrink-0 ${compact ? '' : 'pr-5'}`}>
             <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">执行节点 · 在线 {onlineAgentCount}/{agents.length}</h3></div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">每个浏览器均为独立 Agent · 2 分钟无心跳即视为离线</p>
           </header>
-          <div className="workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain pb-4 pr-5">
+          <div className={`workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain pb-4 ${compact ? '' : 'pr-5'}`}>
             {agents.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-10 text-center">
                 <CircleOff className="mx-auto h-7 w-7 text-muted-foreground" />
@@ -771,7 +780,7 @@ export function AgentRail({
             ) : (
               <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-xs">
                 {agents.map((agent, index) => (
-                  <AgentRow key={agent.id} agent={agent} tasks={tasks} withBorder={index > 0}
+                  <AgentRow key={agent.id} agent={agent} tasks={tasks} compact={compact} withBorder={index > 0}
                     writable={writable}
                     onOpen={() => setActiveAgentId(agent.id)}
                     onDelete={() => {

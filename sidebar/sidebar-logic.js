@@ -4949,6 +4949,9 @@ function isTargetedProfileDiscoveryWorkflow(workflow = "", targetMode = "") {
 
 function getTargetedWorkflowLabel(workflow = "") {
   const normalized = String(workflow || "").trim();
+  if (normalized === "watched_content_patrol") {
+    return "关注内容巡查";
+  }
   if (normalized === "official_account_comment_patrol") {
     return "官方账号评论巡查";
   }
@@ -5174,7 +5177,11 @@ function renderCaptureDebugSession(runtime = {}) {
   );
   const stopButton = document.getElementById("btnDebugSessionStop");
   const minimizeButton = document.getElementById("btnDebugSessionMinimize");
-  if (stopButton) stopButton.hidden = Boolean(session?.terminal);
+  if (stopButton) {
+    stopButton.hidden = Boolean(session?.terminal);
+    stopButton.style.display = session?.terminal ? "none" : "";
+    stopButton.disabled = Boolean(session?.terminal);
+  }
   if (minimizeButton) {
     minimizeButton.textContent = session?.terminal ? "关闭" : "隐藏";
   }
@@ -5466,6 +5473,13 @@ function setupDebugSessionPanelControls() {
   });
   stop.addEventListener("click", async () => {
     if (stop.disabled) return;
+    if (
+      document.getElementById("debugSessionPanel")?.dataset?.terminal === "true"
+    ) {
+      stop.hidden = true;
+      stop.style.display = "none";
+      return;
+    }
     stop.disabled = true;
     stop.textContent = "正在停止…";
     try {
@@ -16430,7 +16444,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           runnerTabId: targetTabId,
           captureParams: {
             detectUnavailableTargetPage:
-              targetedWorkflow === "negative_post_patrol",
+              [
+                "negative_post_patrol",
+                "watched_content_patrol",
+              ].includes(targetedWorkflow),
             includeComments: captureSettings.includeComments === true,
             includeBloggerMetrics:
               captureSettings.includeBloggerMetrics === true,

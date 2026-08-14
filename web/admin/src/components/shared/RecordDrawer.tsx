@@ -63,11 +63,13 @@ interface RecordDrawerProps {
   onSetStatus?: (status: string) => Promise<boolean | void> | boolean | void
   onSetFeishuTableNo?: (value: string) => Promise<FeishuTableNumberSaveResult>
   onSetArchived?: (archived: boolean) => Promise<boolean | void> | boolean | void
+  onSetWatched?: (watched: boolean) => Promise<boolean | void> | boolean | void
   onFalsePositive?: AsyncDrawerAction
   falsePositivePending?: boolean
   onUpdateFields?: (fields: ManualRecordFields) => Promise<boolean | void> | boolean | void
   customTagCatalog?: CustomTag[]
   onUpdateCustomTags?: (patch: CustomTagPatch) => Promise<CustomTag[]>
+  onDeleteCustomTag?: (tag: CustomTag) => Promise<number>
   initialTab?: RecordDrawerTab
   onProgressAdded?: (progress: RecordProgressSummary) => void
 }
@@ -83,11 +85,13 @@ function RecordDrawerContent({
   onSetStatus,
   onSetFeishuTableNo,
   onSetArchived,
+  onSetWatched,
   onFalsePositive,
   falsePositivePending = false,
   onUpdateFields,
   customTagCatalog = [],
   onUpdateCustomTags,
+  onDeleteCustomTag,
   initialTab = 'content',
   onProgressAdded,
 }: RecordDrawerProps) {
@@ -107,6 +111,7 @@ function RecordDrawerContent({
   const [savingLabels, setSavingLabels] = useState(false)
   const [statusBusy, setStatusBusy] = useState(false)
   const [falsePositiveBusy, setFalsePositiveBusy] = useState(false)
+  const [watchBusy, setWatchBusy] = useState(false)
   const [noteDraft, setNoteDraft] = useState('')
   const [savingNote, setSavingNote] = useState(false)
   const [noteError, setNoteError] = useState('')
@@ -216,6 +221,20 @@ function RecordDrawerContent({
     setActionError('')
     setEditingLabels(false)
     setEditingJudgement(true)
+  }
+
+  const setWatched = async () => {
+    if (!onSetWatched || watchBusy) return
+    setWatchBusy(true)
+    setActionError('')
+    try {
+      const result = await onSetWatched(!r.is_watched)
+      if (result === false) setActionError('关注状态修改失败，请稍后重试')
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '关注状态修改失败，请稍后重试')
+    } finally {
+      setWatchBusy(false)
+    }
   }
 
   const saveJudgement = async () => {
@@ -353,6 +372,7 @@ function RecordDrawerContent({
     { value: 'reviewed', label: '已复核', icon: Check },
     { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
     { value: 'unavailable', label: '已不可见', icon: CircleOff },
+    { value: 'privacy_unreachable', label: '负面–隐私设置无法触达', icon: CircleOff },
     { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
     { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
   ]
@@ -415,6 +435,23 @@ function RecordDrawerContent({
                     <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
                   )}
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
+                  {canWrite && onSetWatched ? (
+                    <button type="button" onClick={() => void setWatched()} disabled={watchBusy}
+                      aria-label={r.is_watched ? '取消关注内容' : '关注内容'}
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-semibold transition-colors disabled:opacity-60',
+                        r.is_watched
+                          ? 'border-primary/30 bg-primary/8 text-primary'
+                          : 'border-border text-muted-foreground hover:border-primary/40 hover:bg-accent hover:text-primary',
+                      )}>
+                      {watchBusy
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : <Star className={cn('h-3 w-3', r.is_watched && 'fill-current')} />}
+                      {r.is_watched ? '已关注' : '关注'}
+                    </button>
+                  ) : r.is_watched ? (
+                    <StatusBadge tone="neutral"><Star className="h-3 w-3 fill-current" />已关注</StatusBadge>
+                  ) : null}
                   {resolvedIdentity && (
                     <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
                   )}
@@ -474,6 +511,7 @@ function RecordDrawerContent({
                   initialTags={customTags}
                   catalog={customTagCatalog}
                   onSave={updateLabels}
+                  onDeleteCatalogTag={onDeleteCustomTag}
                   onCancel={() => setEditingLabels(false)}
                   onSavingChange={setSavingLabels}
                 />
@@ -1467,6 +1505,8 @@ type PatrolRun = {
   agent_name?: string | null
   errorMessage?: string | null
   error_message?: string | null
+  workflow?: string
+  workflowLabel?: string
   availabilityStatus?: string | null
   availability_status?: string | null
   measured?: boolean
@@ -1516,7 +1556,7 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
 
   useEffect(() => {
     let active = true
-    api.get<PatrolTimeline & { timeline?: PatrolTimeline }>(`/capture-cloud/negative-patrol/posts/${record.id}/timeline`)
+    api.get<PatrolTimeline & { timeline?: PatrolTimeline }>(`/capture-cloud/content-patrol/posts/${record.id}/timeline`)
       .then(data => { if (active) setTimeline(data.timeline || data) })
       .catch(err => { if (active) setError(err instanceof Error ? err.message : '舆情巡查数据读取失败') })
       .finally(() => { if (active) setLoading(false) })
@@ -1560,15 +1600,15 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
       return (
         <EmptyState
           icon={Radar}
-          title="该内容未纳入负面舆情巡查"
-          description="尚无负面巡查任务记录；普通采集快照请在「采集」中查看。"
+          title="该内容尚未纳入内容巡查"
+          description="尚无内容巡查任务记录；普通采集快照请在「采集」中查看。"
         />
       )
     }
     return (
       <EmptyState
         icon={Radar}
-        title="尚未形成负面巡查记录"
+        title="尚未形成内容巡查记录"
         description="该内容已判为负面，但还没有经过「负面帖子巡查」任务。普通采集快照不会被计入巡查声量。"
       />
     )
@@ -1586,10 +1626,10 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
           <div>
             <div className="flex items-center gap-2">
               <Radar className="h-4 w-4 text-primary" />
-              <h4 className="text-[13px] font-semibold text-foreground">负面内容巡查状态</h4>
+              <h4 className="text-[13px] font-semibold text-foreground">内容巡查状态</h4>
             </div>
             <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
-              仅统计真实负面巡查任务；普通重复采集不会混入这里。
+              汇总负面巡查与关注内容巡查；普通重复采集不会混入这里。
             </p>
           </div>
           <StatusBadge tone={unavailable ? 'muted' : latestStatus === 'failed' ? 'negative' : latestStatus === 'running' ? 'reviewing' : 'positive'}>
@@ -1608,7 +1648,7 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
         <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
           <div>
             <h4 className="text-[13px] font-semibold text-foreground">最近一次可比巡查增量</h4>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">同一条内容两次巡查快照之间的互动变化，不等同于新增负面评论。</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">同一条内容两次巡查快照之间的互动变化，不代表新增评论的情感结论。</p>
           </div>
           <span className="text-[11px] text-muted-foreground">
             {hasMeasuredDelta ? `${measuredRuns} 次可比巡查` : '待形成第二次巡查快照'}
@@ -1659,6 +1699,9 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
                   <StatusBadge tone={status === 'failed' ? 'negative' : status === 'running' ? 'reviewing' : status.includes('unavailable') || status === 'deleted' ? 'muted' : 'positive'}>
                     {PATROL_STATUS_LABEL[status] || status || '已完成'}
                   </StatusBadge>
+                  <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                    {run.workflowLabel || (run.workflow === 'watched_content_patrol' ? '关注内容巡查' : '负面帖子巡查')}
+                  </span>
                   <span className="ml-auto text-[11px] text-muted-foreground">
                     {formatFullDateSec(run.finishedAt || run.finished_at || run.updatedAt || run.updated_at || run.startedAt || run.started_at || run.createdAt || run.created_at)}
                   </span>
@@ -1728,7 +1771,7 @@ function PatrolTrendChart({ snapshots }: { snapshots: PatrolSnapshot[] }) {
 
   return (
     <div className="mt-3">
-      <svg viewBox={`0 0 ${width} ${height}`} className="h-32 w-full overflow-visible" role="img" aria-label="负面内容互动变化趋势">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-32 w-full overflow-visible" role="img" aria-label="内容巡查互动变化趋势">
         {[0.2, 0.5, 0.8].map(ratio => (
           <line key={ratio} x1={insetX} x2={width - insetX} y1={height * ratio} y2={height * ratio}
             className="stroke-border/70" strokeDasharray="4 5" strokeWidth="1" />

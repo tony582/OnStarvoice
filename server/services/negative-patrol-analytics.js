@@ -15,6 +15,19 @@ const NEGATIVE_PATROL_TASK_SQL = alias => `(
   OR ${alias}.metadata->>'businessTaskType' = 'negative_post_patrol'
 )`;
 
+const WATCHED_CONTENT_PATROL_TASK_SQL = alias => `(
+  ${alias}.task_type = 'watched_content_patrol'
+  OR ${alias}.feature_key = 'watched_content_patrol'
+  OR ${alias}.metadata->>'workflow' = 'watched_content_patrol'
+  OR ${alias}.metadata->>'taskKind' = 'watched_content_patrol'
+  OR ${alias}.metadata->>'businessTaskType' = 'watched_content_patrol'
+)`;
+
+const CONTENT_PATROL_TASK_SQL = alias => `(
+  ${NEGATIVE_PATROL_TASK_SQL(alias)}
+  OR ${WATCHED_CONTENT_PATROL_TASK_SQL(alias)}
+)`;
+
 const JSON_NUMBER_RE = "'^-?[0-9]+([.][0-9]+)?$'";
 
 function jsonNumberSql(expression) {
@@ -438,6 +451,7 @@ function mapTimelineRun(row) {
   const availabilityStatus = row.availability_status || 'unknown';
   const availabilityReason = row.availability_reason || '';
   const errorMessage = row.error_message || null;
+  const workflow = row.workflow || 'negative_post_patrol';
   return {
     id,
     itemId: id,
@@ -463,6 +477,10 @@ function mapTimelineRun(row) {
     availability_reason: availabilityReason,
     errorMessage,
     error_message: errorMessage,
+    workflow,
+    workflowLabel: workflow === 'watched_content_patrol'
+      ? '关注内容巡查'
+      : '负面帖子巡查',
     baseline,
     endpoint,
     measured: Boolean(baseline && endpoint),
@@ -502,10 +520,11 @@ export function summarizeNegativePatrolTimeline(runs = [], snapshots = []) {
   };
 }
 
-export async function getNegativePatrolPostTimeline({
+async function getPatrolPostTimeline({
   tenantId,
   recordId,
   db = {queryAll, queryOne},
+  includeWatched = false,
 }) {
   const record = await db.queryOne(`
     SELECT
@@ -534,6 +553,12 @@ export async function getNegativePatrolPostTimeline({
       item.updated_at,
       item.started_at,
       item.finished_at,
+      CASE
+        WHEN ${WATCHED_CONTENT_PATROL_TASK_SQL('parent_task')}
+          OR ${WATCHED_CONTENT_PATROL_TASK_SQL('execution_task')}
+        THEN 'watched_content_patrol'
+        ELSE 'negative_post_patrol'
+      END AS workflow,
       COALESCE(
         NULLIF(item.error->>'message', ''),
         NULLIF(item.error->>'error', ''),
@@ -576,8 +601,8 @@ export async function getNegativePatrolPostTimeline({
      AND endpoint.record_id = record.id
     WHERE item.tenant_id = $1
       AND COALESCE(item.result_record_id, item.record_id) = $2
-      AND (${NEGATIVE_PATROL_TASK_SQL('parent_task')}
-        OR ${NEGATIVE_PATROL_TASK_SQL('execution_task')})
+      AND (${includeWatched ? CONTENT_PATROL_TASK_SQL('parent_task') : NEGATIVE_PATROL_TASK_SQL('parent_task')}
+        OR ${includeWatched ? CONTENT_PATROL_TASK_SQL('execution_task') : NEGATIVE_PATROL_TASK_SQL('execution_task')})
     ORDER BY COALESCE(item.finished_at, item.updated_at, item.created_at) DESC, item.id DESC
   `, [tenantId, recordId]);
   const runs = rows.map(mapTimelineRun);
@@ -620,8 +645,18 @@ export async function getNegativePatrolPostTimeline({
   };
 }
 
+export function getNegativePatrolPostTimeline(options) {
+  return getPatrolPostTimeline({...options, includeWatched: false});
+}
+
+export function getContentPatrolPostTimeline(options) {
+  return getPatrolPostTimeline({...options, includeWatched: true});
+}
+
 export const __negativePatrolAnalyticsInternals = {
   NEGATIVE_PATROL_TASK_SQL,
+  WATCHED_CONTENT_PATROL_TASK_SQL,
+  CONTENT_PATROL_TASK_SQL,
   UNAVAILABLE_STATUSES,
   latestRowsByRecord,
   negativePatrolStatus,

@@ -12,6 +12,11 @@ export interface Badges {
   feedbackPending: number
 }
 
+export interface WorkspaceFeatures {
+  loaded: boolean
+  commentRiskAttentionEnabled: boolean
+}
+
 const EMPTY: Badges = {
   triagePending: 0,
   leadsNew: 0,
@@ -22,8 +27,15 @@ const EMPTY: Badges = {
   feedbackPending: 0,
 }
 
+// 切换租户或尚未加载时先不制造评论待办；服务端对旧租户的正式缺省仍是开启。
+const EMPTY_FEATURES: WorkspaceFeatures = {
+  loaded: false,
+  commentRiskAttentionEnabled: false,
+}
+
 interface BadgesContextValue {
   badges: Badges
+  features: WorkspaceFeatures
   refresh: () => void
 }
 
@@ -34,11 +46,13 @@ const POLL_MS = 60_000
 export function BadgesProvider({ children }: { children: ReactNode }) {
   const { tenantId, user } = useAuth()
   const badgeScope = user && tenantId ? `${user.id}:${tenantId}` : ''
-  const [badgeState, setBadgeState] = useState<{ scope: string; badges: Badges }>({
+  const [badgeState, setBadgeState] = useState<{ scope: string; badges: Badges; features: WorkspaceFeatures }>({
     scope: '',
     badges: EMPTY,
+    features: EMPTY_FEATURES,
   })
   const badges = badgeState.scope === badgeScope ? badgeState.badges : EMPTY
+  const features = badgeState.scope === badgeScope ? badgeState.features : EMPTY_FEATURES
   // 标识当前生效的拉取批次:租户切换/卸载时递增,丢弃在途的旧响应,避免计数串租户
   const tokenRef = useRef(0)
   const invalidatePending = useCallback(() => {
@@ -48,12 +62,17 @@ export function BadgesProvider({ children }: { children: ReactNode }) {
   const refresh = useCallback(() => {
     if (!user || !tenantId) return
     const token = ++tokenRef.current
-    api.get<{ ok: boolean; badges: Badges }>('/workspace/badges')
+    api.get<{ ok: boolean; badges: Badges; features?: Partial<WorkspaceFeatures> }>('/workspace/badges')
       .then(data => {
         if (token === tokenRef.current && data?.ok) {
+          const commentRiskAttentionEnabled = data.features?.commentRiskAttentionEnabled !== false
           setBadgeState({
             scope: badgeScope,
             badges: { ...EMPTY, ...(data.badges || {}) },
+            features: {
+              loaded: true,
+              commentRiskAttentionEnabled,
+            },
           })
         }
       })
@@ -74,7 +93,7 @@ export function BadgesProvider({ children }: { children: ReactNode }) {
   }, [invalidatePending, refresh])
 
   return (
-    <BadgesContext.Provider value={{ badges, refresh }}>
+    <BadgesContext.Provider value={{ badges, features, refresh }}>
       {children}
     </BadgesContext.Provider>
   )

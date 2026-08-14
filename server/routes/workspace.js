@@ -4,13 +4,18 @@ import { requireTenantAccess } from '../middleware/auth.js';
 import { customTagsSelectSql } from '../services/record-custom-tags.js';
 import { applyResolvedMetrics } from '../utils/metrics.js';
 import { ACTIVE_QUEUE_CONDITION } from './triage.js';
+import {
+  exposeCommentAttentionCount,
+  getCommentRiskAttentionPolicy,
+} from '../services/comment-risk-attention.js';
 
 const router = Router();
 
 // 侧边栏徽标计数:单次往返。triagePending 与收件箱「待处理队列」同条件。
 router.get('/badges', requireTenantAccess, async (req, res, next) => {
   try {
-    const row = await queryOne(`
+    const [row, commentRiskPolicy] = await Promise.all([
+      queryOne(`
       SELECT
         (SELECT COUNT(*)
          FROM records r
@@ -19,22 +24,27 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new' AND lead_type <> 'sales_intent'
           AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND r.ai_result->>'relevance' = 'irrelevant')) AS leads_new,
         (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
-        (SELECT COUNT(*) FROM monitor_subscriptions WHERE tenant_id = $1 AND status <> 'deleted' AND COALESCE(last_error, '') <> '') AS monitor_attention,
         (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')) AS tickets_pending,
         (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review') AS tickets_feedback,
         (SELECT COUNT(*) FROM record_feedback WHERE tenant_id = $1 AND review_status = 'pending') AS feedback_pending
-    `, [req.tenantId]);
+    `, [req.tenantId]),
+      getCommentRiskAttentionPolicy(req.tenantId),
+    ]);
 
     return res.json({
       ok: true,
       badges: {
         triagePending: Number(row?.triage_pending || 0),
-        leadsNew: Number(row?.leads_new || 0),
+        leadsNew: exposeCommentAttentionCount(row?.leads_new, commentRiskPolicy.enabled),
         issuesOpen: Number(row?.issues_open || 0),
-        monitorAttention: Number(row?.monitor_attention || 0),
+        // 监测异常只在关注博主页内显示，不再投影成无法一一落地的全局导航徽标。
+        monitorAttention: 0,
         ticketsPending: Number(row?.tickets_pending || 0),
         ticketsFeedback: Number(row?.tickets_feedback || 0),
         feedbackPending: req.user?.global_role === 'platform_admin' ? Number(row?.feedback_pending || 0) : 0,
+      },
+      features: {
+        commentRiskAttentionEnabled: commentRiskPolicy.enabled,
       },
       generatedAt: new Date().toISOString(),
     });
@@ -119,6 +129,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     const since = new Date(Date.now() - days * 86400000).toISOString();
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
+    const commentRiskPolicy = await getCommentRiskAttentionPolicy(req.tenantId);
 
     const kpi = await queryOne(`
       SELECT
@@ -148,6 +159,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed' AND rt.archived_at IS NULL) AS reviewed,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor' AND rt.archived_at IS NULL) AS reviewed_non_monitor,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unavailable' AND rt.archived_at IS NULL) AS unavailable,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'privacy_unreachable' AND rt.archived_at IS NULL) AS privacy_unreachable,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu' AND rt.archived_at IS NULL) AS negative_feishu,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold' AND rt.archived_at IS NULL) AS negative_cold,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') <> 'unhandled' AND rt.archived_at IS NULL) AS handled_total,
@@ -172,12 +184,41 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         (SELECT COUNT(*)
          FROM comment_leads cl
          WHERE cl.tenant_id = $1
-           AND cl.created_at >= $2) AS today_comment_leads,
+           AND cl.lead_type <> 'sales_intent'
+           AND cl.created_at >= $2
+           AND NOT EXISTS (
+             SELECT 1 FROM records parent
+             WHERE parent.id = cl.record_id
+               AND parent.tenant_id = cl.tenant_id
+               AND parent.ai_result->>'relevance' = 'irrelevant'
+           )) AS today_comment_leads,
+        (SELECT COUNT(*)
+         FROM comment_leads cl
+         WHERE cl.tenant_id = $1
+           AND cl.lead_type <> 'sales_intent'
+           AND cl.created_at >= $3
+           AND NOT EXISTS (
+             SELECT 1 FROM records parent
+             WHERE parent.id = cl.record_id
+               AND parent.tenant_id = cl.tenant_id
+               AND parent.ai_result->>'relevance' = 'irrelevant'
+           )) AS period_comment_leads,
         (SELECT COUNT(*)
          FROM monitor_subscriptions ms
          WHERE ms.tenant_id = $1
            AND ms.status = 'active') AS active_monitors
-    `, [req.tenantId, todayStart.toISOString()]);
+    `, [req.tenantId, todayStart.toISOString(), since]);
+    const visibleOperationsStats = {
+      ...operationsStats,
+      today_comment_leads: exposeCommentAttentionCount(
+        operationsStats?.today_comment_leads,
+        commentRiskPolicy.enabled,
+      ),
+      period_comment_leads: exposeCommentAttentionCount(
+        operationsStats?.period_comment_leads,
+        commentRiskPolicy.enabled,
+      ),
+    };
 
     const pendingRecords = await queryAll(`
       SELECT r.id, r.platform, r.title, r.content, r.author_name, r.url, r.likes, r.comments_count,
@@ -228,6 +269,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LIMIT 8
     `, [req.tenantId]);
 
+    // 原始评论线索仍可供评论分诊读取；开关只改变默认值守投影，不删除或隐藏数据接口。
     const latestCommentLeads = await queryAll(`
       SELECT *
       FROM comment_leads
@@ -346,7 +388,10 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       ok: true,
       tenant: { id: req.tenantId, name: req.tenantName },
       days,
-      kpi: { ...kpi, ...issueStats, ...triageStats, ...operationsStats },
+      kpi: { ...kpi, ...issueStats, ...triageStats, ...visibleOperationsStats },
+      features: {
+        commentRiskAttentionEnabled: commentRiskPolicy.enabled,
+      },
       sentimentBreakdown,
       platformRisk,
       pendingRecords,

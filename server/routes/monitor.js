@@ -122,6 +122,10 @@ function normalizeMonitorSubscriptionRow(row = {}) {
     officialAccountId: row.official_account_id || null,
     assignedAgentId: row.assigned_agent_id || null,
     hasOfficialRole: Boolean(row.has_official_role),
+    attentionRequired: Boolean(row.attention_required),
+    latestExecutionStatus: row.latest_execution_status || '',
+    latestExecutionError: row.latest_execution_error || '',
+    latestExecutionAt: row.latest_execution_at || null,
     notifyOnNegative: Boolean(row.notify_on_negative),
     cadenceMinutes: Number(row.cadence_minutes || 0),
     lastCursor: row.last_cursor || '',
@@ -592,8 +596,35 @@ router.get('/subscriptions', requireTenantAccess, async (req, res, next) => {
                 AND official.keyword = ms.keyword
               )
             )
-        ) AS has_official_role
+        ) AS has_official_role,
+        latest_execution.status AS latest_execution_status,
+        latest_execution.error_message AS latest_execution_error,
+        latest_execution.created_at AS latest_execution_at,
+        (
+          ms.status = 'active'
+          AND ms.subject_type = 'creator'
+          AND COALESCE(ms.account_url, '') <> ''
+          AND latest_execution.status = 'failed'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM monitor_subscriptions official
+            WHERE official.tenant_id = ms.tenant_id
+              AND official.platform = ms.platform
+              AND official.subject_type = 'official'
+              AND official.status = 'active'
+              AND official.account_url <> ''
+              AND official.account_url = ms.account_url
+          )
+        ) AS attention_required
       FROM monitor_subscriptions ms
+      LEFT JOIN LATERAL (
+        SELECT execution.status, execution.error_message, execution.created_at
+        FROM monitor_executions execution
+        WHERE execution.tenant_id = ms.tenant_id
+          AND execution.subscription_id = ms.id
+        ORDER BY execution.created_at DESC, execution.id DESC
+        LIMIT 1
+      ) latest_execution ON true
       WHERE ms.tenant_id = $1
     `;
     // 监控中心只做对标监控:仅显示账号(博主)订阅(account_url 非空),过滤旧的关键词订阅

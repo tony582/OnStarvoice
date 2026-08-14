@@ -1,7 +1,14 @@
 import { Router } from 'express';
-import { queryAll } from '../db/init.js';
-import { requireSessionUser, requireTenantAccess } from '../middleware/auth.js';
-import { normalizeCustomTagKeyword } from '../services/record-custom-tags.js';
+import { queryAll, withTransaction } from '../db/init.js';
+import {
+  requireSessionUser,
+  requireTenantAccess,
+  requireTenantWriter,
+} from '../middleware/auth.js';
+import {
+  normalizeCustomTagId,
+  normalizeCustomTagKeyword,
+} from '../services/record-custom-tags.js';
 
 const router = Router();
 
@@ -45,6 +52,77 @@ router.get('/', async (req, res, next) => {
         lastUsedAt: row.last_used_at,
       })),
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.delete('/:id', requireTenantWriter, async (req, res, next) => {
+  try {
+    const normalizedId = normalizeCustomTagId(req.params.id);
+    if (!normalizedId.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: normalizedId.error,
+        message: normalizedId.message,
+      });
+    }
+
+    const actorUserId = req.user?.id || null;
+    const result = await withTransaction(async tx => {
+      const tag = await tx.queryOne(`
+        SELECT id, name
+        FROM custom_tags
+        WHERE tenant_id = $1 AND id = $2
+        FOR UPDATE
+      `, [req.tenantId, normalizedId.value]);
+      if (!tag) return null;
+
+      const usage = await tx.queryOne(`
+        SELECT COUNT(*)::int AS affected_records
+        FROM record_custom_tags
+        WHERE tenant_id = $1 AND tag_id = $2
+      `, [req.tenantId, tag.id]);
+      const affectedRecords = Number(usage?.affected_records || 0);
+
+      // FK ON DELETE CASCADE 仅解除该标签与所有内容的关联；
+      // 不会删除内容记录，也不会影响其他标签。
+      await tx.execute(`
+        DELETE FROM custom_tags
+        WHERE tenant_id = $1 AND id = $2
+      `, [req.tenantId, tag.id]);
+
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES ($1, 'user', $2, $3, 'custom_tag.deleted', 'custom_tag', $4, $5::jsonb)
+      `, [
+        req.tenantId,
+        actorUserId || '',
+        actorUserId,
+        tag.id,
+        JSON.stringify({
+          tagName: tag.name,
+          affectedRecords,
+        }),
+      ]);
+
+      return {
+        id: String(tag.id),
+        name: String(tag.name),
+        affectedRecords,
+      };
+    });
+
+    if (!result) {
+      return res.status(404).json({
+        ok: false,
+        error: 'tag_not_found',
+        message: '标签不存在或已删除',
+      });
+    }
+    return res.json({ok: true, tag: result, affectedRecords: result.affectedRecords});
   } catch (err) {
     return next(err);
   }

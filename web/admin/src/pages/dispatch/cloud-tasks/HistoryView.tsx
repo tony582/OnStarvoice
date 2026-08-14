@@ -14,6 +14,7 @@ type HistoryFilters = {
 }
 
 type Props = {
+  surface?: 'desktop' | 'mobile'
   writable: boolean
   actionTaskId: string
   refreshKey?: string | number
@@ -41,6 +42,7 @@ function defaultFilters(): HistoryFilters {
 }
 
 export function HistoryView({
+  surface = 'desktop',
   writable,
   actionTaskId,
   refreshKey,
@@ -213,6 +215,7 @@ export function HistoryView({
             <TaskCard
               key={task.id}
               task={task}
+              surface={surface}
               writable={writable}
               actionTaskId={actionTaskId}
               onResume={onResume}

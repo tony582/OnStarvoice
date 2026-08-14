@@ -44,7 +44,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
   opinion: [
     { id: 'overview', label: '指挥中心', icon: LayoutDashboard },
     { id: 'workbench', label: '舆情工作台', icon: Columns3 },
-    { id: 'monitoring', label: '关注博主', icon: UserCheck, badgeKeys: ['monitorAttention'] },
+    { id: 'monitoring', label: '关注博主', icon: UserCheck },
     { id: 'official-comments', label: '官方社媒', icon: Megaphone },
     { id: 'dispatch', label: '调度中心', icon: Waypoints, tag: 'BETA' },
     { id: 'social-accounts', label: '社交账号', icon: Users },
@@ -341,7 +341,6 @@ function NavButton({ item, active, sectionActive, badges, onClick }: {
 }) {
   const Icon = item.icon
   const badgeCount = (item.badgeKeys || []).reduce((sum, k) => sum + badges[k], 0)
-  const isAttention = item.badgeKeys?.length === 1 && item.badgeKeys[0] === 'monitorAttention'
   const hot = active || sectionActive
   return (
     <button onClick={onClick}
@@ -365,7 +364,7 @@ function NavButton({ item, active, sectionActive, badges, onClick }: {
         {badgeCount > 0 ? (
           <span className={cn(
             'inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[10px] font-bold tabular-nums',
-            isAttention ? 'bg-status-orange/20 text-amber-600 dark:text-amber-400' : 'bg-primary/12 text-primary',
+            'bg-primary/12 text-primary',
           )}>{badgeCount > 99 ? '99+' : badgeCount}</span>
         ) : active && !sectionActive ? (
           <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />

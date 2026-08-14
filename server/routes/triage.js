@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import { queryAll, queryOne, withTransaction } from '../db/init.js';
-import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
+import {
+  requireSessionUser,
+  requireTenantAccess,
+  requireTenantWriter,
+} from '../middleware/auth.js';
 import { formatPublishDate } from '../services/publish-date.js';
 import {
   appendCustomTagFilter,
@@ -25,6 +29,7 @@ const TRIAGE_STATUS_CN = {
   reviewed: '已复核',
   reviewed_non_monitor: '已复核-非监控内容',
   unavailable: '已不可见',
+  privacy_unreachable: '负面–隐私设置无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
   // 仅用于历史导出与审计展示；059 迁移后不会再作为当前状态写入。
@@ -130,6 +135,7 @@ const TRIAGE_STATUSES = new Set([
   'reviewed',
   'reviewed_non_monitor',
   'unavailable',
+  'privacy_unreachable',
   'negative_feishu',
   'negative_cold',
 ]);
@@ -148,10 +154,17 @@ export const ACTIVE_QUEUE_CONDITION = `
 // 处理状态和归档生命周期相互独立。两个列表共享状态范围，只按 archived_at 分组。
 const TRIAGE_CONTENT_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
-  AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
+  AND (
+    r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'
+    OR EXISTS (
+      SELECT 1 FROM record_watchlist watched_override
+      WHERE watched_override.tenant_id = r.tenant_id
+        AND watched_override.record_id = r.id
+    )
+  )
   AND COALESCE(rt.status, 'unhandled') IN (
     'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
-    'unavailable', 'negative_feishu', 'negative_cold'
+    'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold'
   )
 `;
 
@@ -422,6 +435,24 @@ function appendSentimentFilter(where, params, sentiment) {
   return `${where} AND r.sentiment = $${params.length}`;
 }
 
+function appendStatusFilter(where, params, rawStatus) {
+  const requested = (Array.isArray(rawStatus) ? rawStatus : [rawStatus])
+    .flatMap(value => String(value || '').split(','))
+    .map(value => value.trim())
+    .filter(Boolean);
+  const invalid = requested.filter(value => !TRIAGE_STATUSES.has(value));
+  if (invalid.length > 0) {
+    const error = new Error('处理状态筛选包含无效值');
+    error.status = 400;
+    error.code = 'invalid_status_filter';
+    throw error;
+  }
+  const statuses = [...new Set(requested)];
+  if (!statuses.length) return where;
+  params.push(statuses);
+  return `${where} AND COALESCE(rt.status, 'unhandled') = ANY($${params.length}::text[])`;
+}
+
 // 风险信号多选筛选(有预警 / 有负评 / 已删帖),命中任一即入选(OR)。条件为字面 SQL,不绑定参数。
 // 注:作者身份(原"疑似KOE")已从风险信号拆出,改为独立的「疑似身份」维度(见 identityWhereClause)。
 function riskWhereClause(reqRisk) {
@@ -451,6 +482,29 @@ function identityWhereClause(reqIdentity) {
   };
   const clauses = ids.map((id) => SQL[id]).filter(Boolean);
   return clauses.length ? ` AND (${clauses.join(' OR ')})` : '';
+}
+
+function appendWatchedFilter(where, rawValue) {
+  const value = String(rawValue || '').trim().toLowerCase();
+  if (!value || value === 'all') return { where };
+  const watched = ['watched', 'true', '1'].includes(value);
+  const unwatched = ['unwatched', 'false', '0'].includes(value);
+  if (!watched && !unwatched) {
+    return {
+      failure: {
+        status: 400,
+        code: 'invalid_watched_filter',
+        message: 'watched 只支持 watched 或 unwatched',
+      },
+    };
+  }
+  return {
+    where: `${where} AND ${watched ? '' : 'NOT '}EXISTS (
+      SELECT 1 FROM record_watchlist rw_filter
+      WHERE rw_filter.tenant_id = r.tenant_id
+        AND rw_filter.record_id = r.id
+    )`,
+  };
 }
 
 router.get('/records', requireTenantAccess, async (req, res, next) => {
@@ -490,10 +544,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
     }
-    if (status) {
-      params.push(status);
-      where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
-    }
+    where = appendStatusFilter(where, params, status);
     // 风险信号只包含预警与负评；身份、处理状态分别使用独立筛选。
     where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
@@ -511,6 +562,15 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     where = appendCustomTagFilter(where, params, customTagFilter, 'r');
     where += identityWhereClause(req.query.identity);
     where = appendTriageDateFilters(where, params, req.query);
+    const watchedFilter = appendWatchedFilter(where, req.query.watched);
+    if (watchedFilter.failure) {
+      return res.status(watchedFilter.failure.status).json({
+        ok: false,
+        error: watchedFilter.failure.code,
+        message: watchedFilter.failure.message,
+      });
+    }
+    where = watchedFilter.where;
 
     const total = (await queryOne(`
       SELECT COUNT(*) AS total
@@ -544,6 +604,18 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         rt.updated_at AS triage_updated_at,
         rt.archived_at,
         COALESCE(rt.archived_by_name, '') AS archived_by_name,
+        EXISTS (
+          SELECT 1 FROM record_watchlist rw
+          WHERE rw.tenant_id = r.tenant_id AND rw.record_id = r.id
+        ) AS is_watched,
+        (
+          SELECT rw.watched_at FROM record_watchlist rw
+          WHERE rw.tenant_id = r.tenant_id AND rw.record_id = r.id
+        ) AS watched_at,
+        COALESCE((
+          SELECT rw.watched_by_name FROM record_watchlist rw
+          WHERE rw.tenant_id = r.tenant_id AND rw.record_id = r.id
+        ), '') AS watched_by_name,
         (ticket.ticket_id IS NOT NULL) AS has_ticket,
         ticket.ticket_id,
         ticket.ticket_number,
@@ -596,6 +668,82 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       ok: true,
       records,
       pagination: { page: Number(page), pageSize: limit, total, totalPages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
+    }
+    return next(err);
+  }
+});
+
+// 人工关注是内容本身的独立标记，不改变情感、分诊状态或归档状态。
+// 同一接口同时承载单条与批量操作，保证两种入口语义一致且幂等。
+router.patch('/records/watch', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const rawIds = req.body?.ids;
+    if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 100) {
+      return res.status(400).json({ ok: false, error: 'invalid_ids', message: 'ids 需为 1-100 个内容ID' });
+    }
+    if (typeof req.body?.watched !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'invalid_watched', message: 'watched 必须为布尔值' });
+    }
+    const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()).filter(Boolean))];
+    const validIds = ids.filter(id => UUID_RE.test(id));
+    const watched = req.body.watched;
+    const mutation = validIds.length
+      ? await withTransaction(async tx => {
+          const existing = await tx.queryAll(`
+            SELECT id
+            FROM records
+            WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+            FOR UPDATE
+          `, [req.tenantId, validIds]);
+          const recordIds = existing.map(row => String(row.id).toLowerCase());
+          let changedRows = [];
+          if (recordIds.length && watched) {
+            changedRows = await tx.queryAll(`
+              INSERT INTO record_watchlist (
+                tenant_id, record_id, watched_by_user_id, watched_by_name, watched_at
+              )
+              SELECT $1, record_id, $3, $4, now()
+              FROM unnest($2::uuid[]) AS record_id
+              ON CONFLICT (tenant_id, record_id) DO NOTHING
+              RETURNING record_id
+            `, [req.tenantId, recordIds, req.user?.id || null, req.actorName || '']);
+          } else if (recordIds.length) {
+            changedRows = await tx.queryAll(`
+              DELETE FROM record_watchlist
+              WHERE tenant_id = $1 AND record_id = ANY($2::uuid[])
+              RETURNING record_id
+            `, [req.tenantId, recordIds]);
+          }
+          const changedIds = changedRows.map(row => String(row.record_id).toLowerCase());
+          await tx.execute(`
+            INSERT INTO audit_logs (
+              tenant_id, actor_type, actor_id, actor_user_id,
+              action, target_type, target_id, metadata
+            ) VALUES ($1, $2, $3, $4, $5, 'record', '', $6::jsonb)
+          `, [
+            req.tenantId,
+            req.actorType || 'user',
+            req.user?.id || req.authCode || '',
+            req.user?.id || null,
+            watched ? 'record.watch_batch_added' : 'record.watch_batch_removed',
+            JSON.stringify({ recordIds, changedIds, watched }),
+          ]);
+          return { recordIds, changedIds };
+        })
+      : { recordIds: [], changedIds: [] };
+    const existingSet = new Set(mutation.recordIds);
+    return res.json({
+      ok: true,
+      watched,
+      records: mutation.recordIds.length,
+      changed: mutation.changedIds.length,
+      recordIds: mutation.recordIds,
+      changedIds: mutation.changedIds,
+      skipped: ids.filter(id => !existingSet.has(id)),
     });
   } catch (err) {
     return next(err);
@@ -1059,10 +1207,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
     }
-    if (status) {
-      params.push(status);
-      where += ` AND COALESCE(rt.status, 'unhandled') = $${params.length}`;
-    }
+    where = appendStatusFilter(where, params, status);
     where += riskWhereClause(req.query.risk);
     if (priority) { params.push(priority); where += ` AND COALESCE(rt.priority, 'normal') = $${params.length}`; }
     const keywordFilter = appendKeywordFilter(where, params, keyword);
@@ -1078,6 +1223,15 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     where = appendCustomTagFilter(where, params, customTagFilter, 'r');
     where += identityWhereClause(req.query.identity);
     where = appendTriageDateFilters(where, params, req.query);
+    const watchedFilter = appendWatchedFilter(where, req.query.watched);
+    if (watchedFilter.failure) {
+      return res.status(watchedFilter.failure.status).json({
+        ok: false,
+        error: watchedFilter.failure.code,
+        message: watchedFilter.failure.message,
+      });
+    }
+    where = watchedFilter.where;
 
     const records = await queryAll(`
       SELECT
@@ -1155,6 +1309,18 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
         COALESCE(rt.feishu_table_no, '') AS feishu_table_no,
         rt.archived_at,
         COALESCE(rt.archived_by_name, '') AS archived_by_name,
+        EXISTS (
+          SELECT 1 FROM record_watchlist rw
+          WHERE rw.tenant_id = r.tenant_id AND rw.record_id = r.id
+        ) AS is_watched,
+        (
+          SELECT rw.watched_at FROM record_watchlist rw
+          WHERE rw.tenant_id = r.tenant_id AND rw.record_id = r.id
+        ) AS watched_at,
+        COALESCE((
+          SELECT rw.watched_by_name FROM record_watchlist rw
+          WHERE rw.tenant_id = r.tenant_id AND rw.record_id = r.id
+        ), '') AS watched_by_name,
         (ticket.ticket_id IS NOT NULL) AS has_ticket,
         ticket.ticket_number,
         ticket.ticket_status,
@@ -1197,6 +1363,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       feishu_table_no: r.feishu_table_no || '',
       archived_at: fmtTs(r.archived_at),
       archived_by_name: r.archived_by_name || '',
+      watched: r.is_watched ? '已关注' : '未关注',
+      watched_at: fmtTs(r.watched_at),
+      watched_by_name: r.watched_by_name || '',
       publish: formatPublishDate(r.publish_time, r.created_at),
       publish_location: r.publish_location || '',
       first_seen: fmtTs(r.first_seen_at),
@@ -1231,6 +1400,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: '优先级', key: 'triage_priority', width: 8 },
       { header: '归档时间', key: 'archived_at', width: 18 },
       { header: '归档人', key: 'archived_by_name', width: 14 },
+      { header: '关注状态', key: 'watched', width: 10 },
+      { header: '关注时间', key: 'watched_at', width: 18 },
+      { header: '关注人', key: 'watched_by_name', width: 14 },
       { header: '发布时间', key: 'publish', width: 18 },
       { header: '发布位置', key: 'publish_location', width: 10 },
       { header: '首次发现', key: 'first_seen', width: 18 },
@@ -1240,6 +1412,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
 
     await sendXlsx(res, { sheetName: '内容分诊', columns, rows, filename: `内容分诊_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
   } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
+    }
     return next(err);
   }
 });

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   Activity, AlertOctagon, Inbox, Loader2, ShieldAlert, ArrowRight,
-  Radio, Heart, MessageCircle,
+  Radio, Heart, MessageCircle, MessageSquare,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { compact, formatNumber, formatDate, platformName, cn } from '@/lib/utils'
@@ -15,6 +15,7 @@ import { useAuth } from '@/lib/auth'
 
 interface OverviewData {
   kpi: Record<string, number>
+  features?: { commentRiskAttentionEnabled?: boolean }
   sentimentBreakdown: { negative: number; neutral: number; positive: number; unlabeled: number; total: number }
   platformRisk: Array<{ platform: string; total: number; negative: number }>
   pendingRecords: any[]
@@ -38,34 +39,42 @@ export function OverviewPage() {
 
   const k = data?.kpi || {}
   const sb = data?.sentimentBreakdown || { negative: 0, neutral: 0, positive: 0, unlabeled: 0, total: 0 }
-  const negRatio = sb.total ? Math.round((sb.negative / sb.total) * 100) : 0
+  const labeledTotal = Number(sb.negative || 0) + Number(sb.neutral || 0) + Number(sb.positive || 0)
+  const negRatio = labeledTotal ? Math.round((Number(sb.negative || 0) / labeledTotal) * 100) : 0
   const events = data?.pendingRecords || []
   const handled = Number(k.handled_total || 0)
   const activeTotal = Number(k.status_total ?? (Number(k.unhandled || 0) + handled))
   const handledPct = activeTotal ? Math.round((handled / activeTotal) * 100) : 0
+  const commentRiskAttentionEnabled = data?.features?.commentRiskAttentionEnabled !== false
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
       {/* 顶部状态条 */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="inline-flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <span className="relative flex h-2 w-2"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-status-green opacity-60" /><span className="relative inline-flex h-2 w-2 rounded-full bg-status-green" /></span>
           实时值守中 · 近 7 日
         </span>
+        <span className="text-[11px] font-medium text-muted-foreground">
+          评论风险提醒 · {commentRiskAttentionEnabled ? '已开启' : '已关闭'}
+        </span>
       </div>
 
       {/* Numbers 行 */}
-      <div className="grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 lg:grid-cols-4">
+      <div className={cn('grid grid-cols-1 gap-3 min-[360px]:grid-cols-2', commentRiskAttentionEnabled ? 'lg:grid-cols-3 xl:grid-cols-5' : 'lg:grid-cols-4')}>
         <NumberCard label="互动总量" hint="互动总量=点赞+评论+收藏+转发 之和(全部内容累计),不是内容条数。「声量」才指内容条数,见分析与报告。本系统不采阅读/播放量,不报触达人数。" value={formatNumber(k.total_interaction)} sub={`周期新增内容 ${formatNumber(k.period_new)}`} icon={Radio} onClick={() => navigate('data')} />
         <NumberCard label="待处理" hint="待处理=进入内容分诊、尚未完成处理的内容。" value={formatNumber(badges.triagePending)} sub="待人工研判" tone="orange" icon={Inbox} onClick={() => navigate('workbench', { queue: 'triage' })} />
-        <NumberCard label="累计负面" hint="累计负面=情感被 AI 标注为负面的内容总数;负面占比=负面 ÷ 已标注内容。" value={formatNumber(sb.negative)} sub={`负面占比 ${negRatio}%`} tone="red" icon={ShieldAlert} onClick={() => navigate('workbench', { queue: 'triage', sentiment: 'negative' })} />
+        <NumberCard label="内容负面" hint="内容负面=情感被 AI 标注为负面的内容总数;负面占比=负面 ÷ 已标注内容。评论风险单独统计，避免两种处置入口混在一起。" value={formatNumber(sb.negative)} sub={`负面占比 ${negRatio}%`} tone="red" icon={ShieldAlert} onClick={() => navigate('workbench', { queue: 'triage', sentiment: 'negative' })} />
+        {commentRiskAttentionEnabled && (
+          <NumberCard label="风险评论" hint="风险评论=评论分诊中尚未跟进的非销售评论；评论采集和 AI 标注不受此卡片影响。" value={formatNumber(badges.leadsNew)} sub={`近 7 日新增 ${formatNumber(k.period_comment_leads)}`} tone="orange" icon={MessageSquare} onClick={() => navigate('workbench', { queue: 'leads' })} />
+        )}
         <NumberCard label="开放问题" hint="开放问题=未解决/未关闭的问题单(issue);高优=高/紧急级别。" value={formatNumber(k.open_issues)} sub={`高优 ${formatNumber(k.high_open_issues)}`} tone={Number(k.high_open_issues || 0) > 0 ? 'red' : 'default'} icon={AlertOctagon} onClick={() => navigate('workbench', { queue: 'issues' })} />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
         {/* 左:情感结构 + 分平台风险 */}
         <section className="rounded-xl border border-border bg-card p-4 shadow-xs sm:p-5">
-          <h2 className="text-[13px] font-semibold tracking-tight">情感结构</h2>
+          <h2 className="text-[13px] font-semibold tracking-tight">内容情感结构</h2>
           <div className="mt-3 flex h-2.5 overflow-hidden rounded-full bg-muted">
             <div className="bg-status-red" style={{ width: pct(sb.negative, sb.total) }} />
             <div className="bg-status-grey" style={{ width: pct(sb.neutral, sb.total) }} />
@@ -77,7 +86,7 @@ export function OverviewPage() {
             <span className="font-medium text-emerald-600 dark:text-emerald-400">正面 {formatNumber(sb.positive)}</span>
           </div>
 
-          <h2 className="mt-5 text-[13px] font-semibold tracking-tight">分平台风险</h2>
+          <h2 className="mt-5 text-[13px] font-semibold tracking-tight">内容分平台风险</h2>
           <div className="mt-3 space-y-2.5">
             {(data?.platformRisk || []).filter(p => p.platform).slice(0, 5).map(p => {
               const ratio = p.total ? p.negative / p.total : 0

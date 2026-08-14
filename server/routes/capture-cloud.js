@@ -100,6 +100,8 @@ const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
+const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
+const ELASTIC_AGENT_CAPACITY_HOLD_MS = 30 * 60 * 1000;
 const ELASTIC_SAFETY_AGENT_HOLD_MS = 30 * 60 * 1000;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
@@ -114,9 +116,25 @@ const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
   'DOUYIN_LOGIN_REQUIRED',
   'XHS_LOGIN_REQUIRED',
 ]);
+const ELASTIC_AGENT_CAPACITY_CODES = new Set([
+  'CAPTURE_TASK_GROUP_BUSY',
+  'CAPTURE_TASK_CLEANUP_PENDING',
+  'CAPTURE_TASK_DEBUG_BUSY',
+  'CAPTURE_LOCK_CONFLICT',
+]);
+const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
+  ...ELASTIC_AGENT_CAPACITY_CODES,
+  'CREATE_COMMAND_EXPIRED',
+  'CREATE_AGENT_UNAVAILABLE',
+]);
+const ELASTIC_STALE_TASK_CODES = new Set([
+  'ELASTIC_TASK_HEARTBEAT_TIMEOUT',
+  'ELASTIC_AGENT_OFFLINE_TIMEOUT',
+]);
 const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
   'unattended_keyword_capture',
   'negative_post_patrol',
+  'watched_content_patrol',
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
@@ -272,6 +290,7 @@ export function captureTaskBusinessRootVisibilitySql(alias = 't') {
   return `NOT (
     ${alias}.task_type IN (
       'negative_post_patrol',
+      'watched_content_patrol',
       'official_account_comment_patrol',
       'followed_creator_post_patrol',
       'official_account_post_discovery'
@@ -558,6 +577,91 @@ export function projectElasticKeywordRecoveryStatus({
     : 'failed';
 }
 
+function elasticRecoveryErrorCode(source = {}) {
+  const error = safeJson(source.error);
+  const checkpoint = safeJson(source.checkpoint);
+  return text(
+    error.code ||
+      error.errorCode ||
+      checkpoint.errorCode ||
+      checkpoint.error_code,
+    100,
+  ).toUpperCase();
+}
+
+export function elasticAttemptBudgetAfterOutcome(
+  attemptCount = 0,
+  source = {},
+) {
+  const normalizedAttemptCount = Math.max(0, Number(attemptCount) || 0);
+  return ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(
+    elasticRecoveryErrorCode(source),
+  )
+    ? Math.max(0, normalizedAttemptCount - 1)
+    : normalizedAttemptCount;
+}
+
+export function projectElasticAttemptBudget(
+  item = {},
+  source = {},
+  executionTaskId = '',
+) {
+  const metadata = safeJson(item?.metadata);
+  const explicitBudget = Number(metadata.elasticAttemptBudgetUsed);
+  const currentBudget = Number.isInteger(explicitBudget) && explicitBudget >= 0
+    ? explicitBudget
+    : Math.max(0, Number(item?.attempt_count) || 0);
+  const errorCode = elasticRecoveryErrorCode(source);
+  const normalizedExecutionTaskId = text(executionTaskId, 100).toLowerCase();
+  const refundState = safeJson(metadata.elasticAttemptBudget);
+  const alreadyRefunded = Boolean(
+    normalizedExecutionTaskId &&
+      text(refundState.refundedExecutionTaskId, 100).toLowerCase() ===
+        normalizedExecutionTaskId,
+  );
+  const shouldRefund = Boolean(
+    normalizedExecutionTaskId &&
+      ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(errorCode) &&
+      !alreadyRefunded,
+  );
+  const attemptBudget = shouldRefund
+    ? elasticAttemptBudgetAfterOutcome(currentBudget, source)
+    : currentBudget;
+  return {
+    attemptBudget,
+    metadataPatch: {
+      elasticAttemptBudgetUsed: attemptBudget,
+      ...(shouldRefund
+        ? {
+            elasticAttemptBudget: {
+              refundedExecutionTaskId: normalizedExecutionTaskId,
+              refundedCode: errorCode,
+              refundedAt: new Date().toISOString(),
+            },
+          }
+        : {}),
+    },
+    refunded: shouldRefund,
+  };
+}
+
+function elasticAgentRecoveryHoldMs(source = {}) {
+  const errorCode = elasticRecoveryErrorCode(source);
+  if (ELASTIC_AGENT_CAPACITY_CODES.has(errorCode)) {
+    return ELASTIC_AGENT_CAPACITY_HOLD_MS;
+  }
+  if (ELASTIC_STALE_TASK_CODES.has(errorCode)) {
+    return ELASTIC_STALE_TASK_AGENT_HOLD_MS;
+  }
+  return crossDeviceRetryItemNeedsManualSafety({
+    status: source.status,
+    error: safeJson(source.error),
+    metadata: {checkpoint: safeJson(source.checkpoint)},
+  })
+    ? ELASTIC_SAFETY_AGENT_HOLD_MS
+    : ELASTIC_TECHNICAL_AGENT_HOLD_MS;
+}
+
 export function elasticRecoveryHoldRemainingMs(
   attempt = {},
   now = Date.now(),
@@ -567,14 +671,7 @@ export function elasticRecoveryHoldRemainingMs(
     source.updated_at || source.updatedAt || source.finished_at || '',
   ));
   if (!Number.isFinite(updatedAt)) return 0;
-  const safetyBlocked = crossDeviceRetryItemNeedsManualSafety({
-    status: source.status,
-    error: source.error,
-    metadata: {checkpoint: safeJson(source.checkpoint)},
-  });
-  const holdMs = safetyBlocked
-    ? ELASTIC_SAFETY_AGENT_HOLD_MS
-    : ELASTIC_TECHNICAL_AGENT_HOLD_MS;
+  const holdMs = elasticAgentRecoveryHoldMs(source);
   return Math.max(0, updatedAt + holdMs - Number(now || Date.now()));
 }
 
@@ -598,9 +695,11 @@ function buildElasticRecoveryMetadata({
     error: recoveryError,
     metadata: {checkpoint: recoveryCheckpoint},
   });
-  const sourceAgentHoldMs = safetyBlocked
-    ? ELASTIC_SAFETY_AGENT_HOLD_MS
-    : ELASTIC_TECHNICAL_AGENT_HOLD_MS;
+  const sourceAgentHoldMs = elasticAgentRecoveryHoldMs({
+    status,
+    error: recoveryError,
+    checkpoint: recoveryCheckpoint,
+  });
   return {
     // retryable means the current child no longer owns this item. Another
     // compatible Agent may claim it immediately; only the failing source Agent
@@ -694,6 +793,9 @@ export function crossDeviceRetryAgentSupportsTask(
   if (capabilities.remoteTargetedPostCaptureV1 !== true) return false;
   if (taskType === 'negative_post_patrol') {
     return capabilities.negativePostPatrol === true;
+  }
+  if (taskType === 'watched_content_patrol') {
+    return capabilities.watchedContentPatrol === true;
   }
   if (taskType === 'followed_creator_post_patrol') {
     return capabilities.followedCreatorPostPatrol === true;
@@ -1461,6 +1563,7 @@ const CONTENT_UNAVAILABLE_STATUSES = new Set([
 // types into browser-driven URL capture.
 const TARGETED_POST_TASK_TYPES = new Set([
   'negative_post_patrol',
+  'watched_content_patrol',
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
@@ -1471,6 +1574,9 @@ function isTargetedPostTaskType(value) {
 }
 
 function targetedPostTaskLabel(taskType) {
+  if (taskType === 'watched_content_patrol') {
+    return '关注内容巡查';
+  }
   if (taskType === 'official_account_comment_patrol') {
     return '官方账号评论巡查';
   }
@@ -2479,6 +2585,11 @@ async function refreshOrchestrationParentTask(tx, {
   const negativePatrol =
     parent.feature_key === 'negative_post_patrol' ||
     parentMetadata.workflow === 'negative_post_patrol';
+  const watchedContentPatrol =
+    parent.feature_key === 'watched_content_patrol' ||
+    parentMetadata.workflow === 'watched_content_patrol';
+  const contentPatrol = negativePatrol || watchedContentPatrol;
+  const contentPatrolLabel = watchedContentPatrol ? '关注内容' : '负面帖子';
   const profilePatrol = [
     'official_account_comment_patrol',
     'followed_creator_post_patrol',
@@ -2490,32 +2601,32 @@ async function refreshOrchestrationParentTask(tx, {
     Number(previousProgress.total || 0) !== aggregate.progress.total;
   const message = aggregate.status === 'running'
     ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
-      ? negativePatrol
-        ? '部分负面帖子正在自动恢复，等待空闲节点逐篇接力'
+      ? contentPatrol
+        ? `部分${contentPatrolLabel}正在自动恢复，等待空闲节点逐篇接力`
         : profilePatrol
           ? '部分账号巡查项正在自动恢复，等待空闲节点接力'
           : '部分关键词正在自动恢复，等待空闲节点逐词接力'
-      : negativePatrol
-      ? '多个执行节点正在巡查负面帖子'
+      : contentPatrol
+      ? `执行节点正在巡查${contentPatrolLabel}`
       : profilePatrol
         ? '执行节点正在重试未完成的账号巡查项'
       : '多个执行节点正在处理关键词工作项'
     : aggregate.status === 'needs_action'
-      ? negativePatrol
-        ? '部分负面帖子需要人工处理'
+      ? contentPatrol
+        ? `部分${contentPatrolLabel}需要人工处理`
         : profilePatrol
           ? '部分账号巡查项仍需要处理'
         : '部分关键词工作项需要人工处理'
       : aggregate.terminal
-        ? negativePatrol
-          ? '多 Agent 负面帖子巡查已结算'
+        ? contentPatrol
+          ? `${watchedContentPatrol ? '关注内容' : '多 Agent 负面帖子'}巡查已结算`
           : profilePatrol
         ? '账号巡查任务已结算'
           : '多 Agent 关键词任务已结算'
-        : negativePatrol
+        : contentPatrol
           ? elasticPool
-            ? '负面帖子保留在云端，等待空闲节点逐篇领取'
-            : '负面帖子已分配，等待执行节点处理'
+            ? `${contentPatrolLabel}保留在云端，等待空闲节点逐篇领取`
+            : `${contentPatrolLabel}已分配，等待执行节点处理`
           : profilePatrol
             ? '账号巡查项已重新分配，等待执行节点处理'
           : '关键词工作项已分配，等待执行节点处理';
@@ -2963,7 +3074,10 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       );
     }
 
-    if (task.task_type === 'negative_post_patrol') {
+    if ([
+      'negative_post_patrol',
+      'watched_content_patrol',
+    ].includes(task.task_type)) {
       const availability = targetResultContentAvailability(entry);
       if (availability) {
         await tx.execute(`
@@ -3380,11 +3494,55 @@ async function projectOrchestrationChildControlOutcome(tx, {
   );
   if (!parent) return null;
 
-  const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(status);
+  const elasticPool =
+    safeJson(parent.metadata).distributionMode === 'elastic_pool';
+  const normalizedError = safeJson(error);
+  const currentItemState = elasticPool
+    ? await tx.queryOne(`
+        SELECT id, attempt_count, metadata
+        FROM capture_task_items
+        WHERE tenant_id = $1
+          AND task_id = $2
+          AND execution_task_id = $3
+          AND assigned_agent_id = $4
+          AND status NOT IN (
+            'completed', 'completed_with_warnings',
+            'failed', 'skipped', 'canceled'
+          )
+        ORDER BY ordinal, id
+        LIMIT 1
+        FOR UPDATE
+      `, [tenantId, childTask.parent_task_id, childTask.id, agentId])
+    : null;
+  const attemptBudgetProjection = elasticPool
+    ? projectElasticAttemptBudget(
+        currentItemState,
+        {error: normalizedError},
+        childTask.id,
+      )
+    : {
+        attemptBudget: Math.max(
+          0,
+          Number(currentItemState?.attempt_count) || 0,
+        ),
+        metadataPatch: {},
+      };
+  const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
+  const projectedStatus = projectElasticKeywordRecoveryStatus({
+    elasticPool,
+    status,
+    error: normalizedError,
+    attemptCount: projectedAttemptCount,
+  });
+  const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(projectedStatus);
   await tx.execute(`
     UPDATE capture_task_items
     SET status = $1,
       error = $2::jsonb,
+      metadata = CASE
+        WHEN $8::boolean THEN metadata || $9::jsonb
+        ELSE metadata
+      END,
       finished_at = CASE
         WHEN $3::boolean THEN COALESCE(finished_at, now())
         ELSE NULL
@@ -3398,13 +3556,15 @@ async function projectOrchestrationChildControlOutcome(tx, {
         'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
       )
   `, [
-    status,
-    JSON.stringify(safeJson(error)),
+    projectedStatus,
+    JSON.stringify(normalizedError),
     terminal,
     tenantId,
     childTask.parent_task_id,
     childTask.id,
     agentId,
+    elasticPool,
+    JSON.stringify(attemptBudgetProjection.metadataPatch),
   ]);
   await tx.execute(`
     UPDATE capture_task_item_attempts attempt
@@ -3428,8 +3588,8 @@ async function projectOrchestrationChildControlOutcome(tx, {
         'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
       )
   `, [
-    status,
-    JSON.stringify(safeJson(error)),
+    projectedStatus,
+    JSON.stringify(normalizedError),
     terminal,
     tenantId,
     childTask.parent_task_id,
@@ -3579,7 +3739,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     };
     const currentItemState = elasticPool
       ? await tx.queryOne(`
-          SELECT id, attempt_count
+          SELECT id, attempt_count, metadata
           FROM capture_task_items
           WHERE tenant_id = $1
             AND task_id = $2
@@ -3599,18 +3759,26 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       0,
       Number(currentItemState?.attempt_count) || 0,
     );
+    const attemptBudgetProjection = elasticPool
+      ? projectElasticAttemptBudget(
+          currentItemState,
+          {error, checkpoint},
+          task.id,
+        )
+      : {attemptBudget: serverAttemptCount, metadataPatch: {}};
+    const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
     const status = projectElasticKeywordRecoveryStatus({
       elasticPool,
       status: checkpointProjectedStatus,
       error,
       checkpoint,
-      attemptCount: serverAttemptCount,
+      attemptCount: projectedAttemptCount,
     });
     const recovery = buildElasticRecoveryMetadata({
       status,
       error,
       checkpoint,
-      attemptCount: serverAttemptCount,
+      attemptCount: projectedAttemptCount,
       sourceAgentId: agent.id,
     });
     if (Object.keys(recovery).length > 0) {
@@ -3620,9 +3788,12 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     const item = await tx.queryOne(`
       UPDATE capture_task_items
       SET status = $1,
-        attempt_count = GREATEST(attempt_count, $2),
-        error = $3::jsonb,
-        metadata = metadata || jsonb_build_object('checkpoint', $4::jsonb),
+        error = $2::jsonb,
+        metadata = metadata || jsonb_build_object('checkpoint', $3::jsonb) ||
+          CASE
+            WHEN $11::boolean THEN $12::jsonb
+            ELSE '{}'::jsonb
+          END,
         started_at = CASE
           WHEN $1 IN (
             'running', 'retryable', 'needs_action', 'completed',
@@ -3631,20 +3802,19 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           ELSE started_at
         END,
         finished_at = CASE
-          WHEN $5::boolean THEN COALESCE($6::timestamptz, finished_at, now())
+          WHEN $4::boolean THEN COALESCE($5::timestamptz, finished_at, now())
           ELSE NULL
         END,
         updated_at = now()
-      WHERE tenant_id = $7
-        AND task_id = $8
-        AND execution_task_id = $9
-        AND assigned_agent_id = $10
-        AND keyword = $11
+      WHERE tenant_id = $6
+        AND task_id = $7
+        AND execution_task_id = $8
+        AND assigned_agent_id = $9
+        AND keyword = $10
         AND (capture_task_items.status <> 'canceled' OR $1 = 'canceled')
       RETURNING id, assignment_revision
     `, [
       status,
-      elasticPool ? serverAttemptCount : attemptCount,
       JSON.stringify(error),
       JSON.stringify(checkpoint),
       terminal,
@@ -3654,6 +3824,8 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       task.id,
       agent.id,
       keyword,
+      elasticPool,
+      JSON.stringify(attemptBudgetProjection.metadataPatch),
     ]);
     if (!item) continue;
     projectedItemIds.push(item.id);
@@ -3757,7 +3929,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     if (activeKeyword) {
       const currentActiveItem = elasticPool
         ? await tx.queryOne(`
-            SELECT id, attempt_count
+            SELECT id, attempt_count, metadata
             FROM capture_task_items
             WHERE tenant_id = $1
               AND task_id = $2
@@ -3779,18 +3951,26 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         0,
         Number(currentActiveItem?.attempt_count) || 0,
       );
+      const attemptBudgetProjection = elasticPool
+        ? projectElasticAttemptBudget(
+            currentActiveItem,
+            {error: childError, checkpoint: snapshotCheckpoint},
+            task.id,
+          )
+        : {attemptBudget: serverAttemptCount, metadataPatch: {}};
+      const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
       const activeUnresolvedStatus = projectElasticKeywordRecoveryStatus({
         elasticPool,
         status: baseUnresolvedStatus,
         error: childError,
         checkpoint: snapshotCheckpoint,
-        attemptCount: serverAttemptCount,
+        attemptCount: projectedAttemptCount,
       });
       const recovery = buildElasticRecoveryMetadata({
         status: activeUnresolvedStatus,
         error: childError,
         checkpoint: snapshotCheckpoint,
-        attemptCount: serverAttemptCount,
+        attemptCount: projectedAttemptCount,
         sourceAgentId: agent.id,
       });
       const activeChildError = Object.keys(recovery).length > 0
@@ -3802,6 +3982,10 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       const activeItem = await tx.queryOne(`
         UPDATE capture_task_items
         SET status = $1,
+          metadata = CASE
+            WHEN $10::boolean THEN metadata || $11::jsonb
+            ELSE metadata
+          END,
           error = CASE
             WHEN $2::jsonb = '{}'::jsonb THEN jsonb_build_object(
               'code', 'missing_keyword_checkpoint',
@@ -3836,6 +4020,8 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         agent.id,
         activeKeyword,
         projectedItemIds,
+        elasticPool,
+        JSON.stringify(attemptBudgetProjection.metadataPatch),
       ]);
       if (activeItem) projectedItemIds.push(activeItem.id);
     }
@@ -4024,11 +4210,13 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'parentTaskId', capture_tasks.metadata->'parentTaskId',
             'orchestrationRevision', capture_tasks.metadata->'orchestrationRevision',
             'itemIds', capture_tasks.metadata->'itemIds',
+            'attemptIdentity', capture_tasks.metadata->'attemptIdentity',
             'handoffRequestHash', capture_tasks.metadata->'handoffRequestHash',
             'handoffRequestKey', capture_tasks.metadata->'handoffRequestKey',
             'handoffSourceExecutionTaskId', capture_tasks.metadata->'handoffSourceExecutionTaskId',
             'handoffConfirmedByUser', capture_tasks.metadata->'handoffConfirmedByUser',
             'handoffSuccessorTaskId', capture_tasks.metadata->'handoffSuccessorTaskId',
+            'handoffSuccessorAttemptIdentity', capture_tasks.metadata->'handoffSuccessorAttemptIdentity',
             'handoffSourcePreviousStatus', capture_tasks.metadata->'handoffSourcePreviousStatus',
             'handedOffAt', capture_tasks.metadata->'handedOffAt',
             'retryRequestHash', capture_tasks.metadata->'retryRequestHash',
@@ -4366,7 +4554,13 @@ async function dispatchNextElasticWorkItem(tx, {
     freshCapabilities.remoteTaskCreate === true &&
     freshCapabilities.remoteTargetedPostCaptureV1 === true &&
     freshCapabilities.negativePostPatrol === true;
-  if (!canClaimKeyword && !canClaimNegativePost) return null;
+  const canClaimWatchedContent =
+    freshCapabilities.remoteTaskCreate === true &&
+    freshCapabilities.remoteTargetedPostCaptureV1 === true &&
+    freshCapabilities.watchedContentPatrol === true;
+  if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
+    return null;
+  }
   const busy = await findCaptureAgentExecutionSlotBlocker(
     tx,
     agent.tenant_id,
@@ -4428,6 +4622,7 @@ async function dispatchNextElasticWorkItem(tx, {
       parent.scheduled_for,
       parent.schedule_revision,
       item.id AS item_id,
+      item.platform AS item_platform,
       item.ordinal,
       item.keyword,
       item.item_type,
@@ -4439,6 +4634,14 @@ async function dispatchNextElasticWorkItem(tx, {
       item.assignment_revision,
       item.execution_task_id,
       item.metadata AS item_metadata,
+      COALESCE(
+        CASE
+          WHEN (item.metadata->>'elasticAttemptBudgetUsed') ~ '^[0-9]+$'
+          THEN (item.metadata->>'elasticAttemptBudgetUsed')::integer
+          ELSE NULL
+        END,
+        item.attempt_count
+      ) AS attempt_budget_used,
       (
         SELECT COUNT(*)
         FROM capture_task_items all_items
@@ -4460,11 +4663,19 @@ async function dispatchNextElasticWorkItem(tx, {
       AND (
         (item.item_type = 'keyword' AND $6::boolean)
         OR (item.item_type = 'negative_post' AND $7::boolean)
+        OR (item.item_type = 'watched_content' AND $8::boolean)
       )
       AND item.status IN ('pending', 'retryable')
-      AND item.attempt_count < $3
-      AND (cardinality($4::text[]) = 0 OR parent.platform = ANY($4::text[]))
-      AND (cardinality($5::text[]) = 0 OR parent.platform = ANY($5::text[]))
+      AND COALESCE(
+        CASE
+          WHEN (item.metadata->>'elasticAttemptBudgetUsed') ~ '^[0-9]+$'
+          THEN (item.metadata->>'elasticAttemptBudgetUsed')::integer
+          ELSE NULL
+        END,
+        item.attempt_count
+      ) < $3
+      AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
+      AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
       AND (
         item.execution_task_id IS NULL
         OR EXISTS (
@@ -4496,7 +4707,7 @@ async function dispatchNextElasticWorkItem(tx, {
             'retryable', 'needs_action', 'failed'
           )
           AND recent_same_agent_attempt.updated_at >
-            now() - ($8::bigint * interval '1 millisecond')
+            now() - ($9::bigint * interval '1 millisecond')
       )
     ORDER BY
       COALESCE(parent.scheduled_for, parent.created_at),
@@ -4513,6 +4724,7 @@ async function dispatchNextElasticWorkItem(tx, {
     supportedPlatforms,
     canClaimKeyword,
     canClaimNegativePost,
+    canClaimWatchedContent,
     ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS,
   ]);
   if (!candidate) return null;
@@ -4520,8 +4732,13 @@ async function dispatchNextElasticWorkItem(tx, {
   const parentMetadata = safeJson(candidate.parent_metadata);
   const planSnapshot = safeJson(parentMetadata.planSnapshot);
   const negativePost = candidate.item_type === 'negative_post';
+  const watchedContent = candidate.item_type === 'watched_content';
+  const targetedContent = negativePost || watchedContent;
+  const targetedWorkflow = watchedContent
+    ? 'watched_content_patrol'
+    : 'negative_post_patrol';
   if (
-    !negativePost &&
+    !targetedContent &&
     Object.keys(safeJson(planSnapshot.captureSettings)).length > 0 &&
     freshCapabilities.remoteTaskEnhancementOptions !== true
   ) {
@@ -4537,10 +4754,13 @@ async function dispatchNextElasticWorkItem(tx, {
     FROM capture_task_item_attempts
     WHERE tenant_id = $1 AND item_id = $2
   `, [agent.tenant_id, candidate.item_id]);
+  const attemptBudget =
+    Math.max(0, Number(candidate.attempt_budget_used) || 0) + 1;
   const attemptNumber = Math.max(
     Math.max(0, Number(candidate.attempt_count) || 0) + 1,
     Number(attempt?.next_attempt_number || 1),
   );
+  const attemptIdentity = crypto.randomUUID();
   const childTitle = `${candidate.parent_title} · ${Number(candidate.ordinal) + 1}/${Number(candidate.parent_item_count)}`;
   let requestHash = '';
   let childPlan = {};
@@ -4550,7 +4770,7 @@ async function dispatchNextElasticWorkItem(tx, {
   let claimUnit = 'keyword';
   let childMessage = '已从云端领取 1 个关键词，等待设备确认';
   let commandPayload = {};
-  if (negativePost) {
+  if (targetedContent) {
     const itemMetadata = safeJson(candidate.item_metadata);
     const sourceRecord = safeJson(itemMetadata.sourceRecord);
     const captureSettings = safeJson(parentMetadata.captureSettings);
@@ -4566,7 +4786,7 @@ async function dispatchNextElasticWorkItem(tx, {
       baseline: safeJson(itemMetadata.baseline),
     };
     requestHash = crypto.createHash('sha256').update(JSON.stringify({
-      workflow: 'negative_post_patrol',
+      workflow: targetedWorkflow,
       protocolVersion: 3,
       parentTaskId: candidate.parent_id,
       itemId: candidate.item_id,
@@ -4575,10 +4795,10 @@ async function dispatchNextElasticWorkItem(tx, {
       recordId: candidate.record_id,
       captureSettings,
     })).digest('hex');
-    childTaskType = 'negative_post_patrol';
-    childFeatureKey = 'negative_post_patrol';
+    childTaskType = targetedWorkflow;
+    childFeatureKey = targetedWorkflow;
     childCheckpoint = {targetIndex: 0};
-    claimUnit = 'negative_post';
+    claimUnit = candidate.item_type;
     childMessage = '已从云端领取 1 篇帖子，等待设备确认';
     commandPayload = {
       taskId: childTaskId,
@@ -4586,9 +4806,9 @@ async function dispatchNextElasticWorkItem(tx, {
       parentTaskId: candidate.parent_id,
       title: childTitle,
       executionMode: 'one_time',
-      platform: candidate.parent_platform,
-      workflow: 'negative_post_patrol',
-      taskKind: 'negative_post_patrol',
+      platform: candidate.item_platform,
+      workflow: targetedWorkflow,
+      taskKind: targetedWorkflow,
       protocolVersion: 1,
       targets: [target],
       items: [target],
@@ -4602,6 +4822,7 @@ async function dispatchNextElasticWorkItem(tx, {
         itemIds: [candidate.item_id],
         distributionMode: 'elastic_pool',
       },
+      attemptIdentity,
     };
   } else {
     const childInput = normalizeRemoteTaskInput({
@@ -4642,6 +4863,7 @@ async function dispatchNextElasticWorkItem(tx, {
         itemIds: [candidate.item_id],
         distributionMode: 'elastic_pool',
       },
+      attemptIdentity,
     };
   }
   const childMetadata = {
@@ -4651,10 +4873,10 @@ async function dispatchNextElasticWorkItem(tx, {
     requestedByUserId: '',
     requestedByName: '云端弹性调度器',
     executionMode: 'one_time',
-    ...(negativePost
+    ...(targetedContent
       ? {
-          workflow: 'negative_post_patrol',
-          taskKind: 'negative_post_patrol',
+          workflow: targetedWorkflow,
+          taskKind: targetedWorkflow,
           protocolVersion: 1,
           filter: safeJson(parentMetadata.filter),
           selectedRecordIds: [candidate.record_id],
@@ -4668,6 +4890,7 @@ async function dispatchNextElasticWorkItem(tx, {
     cloudWorkQueue: true,
     distributionMode: 'elastic_pool',
     claimUnit,
+    attemptIdentity,
     createAckTimeoutSeconds:
       Math.floor(ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS / 1000),
     scheduleId: candidate.orchestration_schedule_id || undefined,
@@ -4684,7 +4907,8 @@ async function dispatchNextElasticWorkItem(tx, {
         metadata = metadata || jsonb_build_object(
           'handoffSuccessorTaskId', $1::uuid::text,
           'handoffReason', 'elastic_retry_claimed',
-          'handoffAt', now()::text
+          'handoffAt', now()::text,
+          'handoffSuccessorAttemptIdentity', $5::text
         ),
         message = '当前工作项已由其它 Agent 自动接力',
         updated_at = now()
@@ -4700,6 +4924,7 @@ async function dispatchNextElasticWorkItem(tx, {
       previousExecutionTaskId,
       agent.tenant_id,
       candidate.parent_id,
+      attemptIdentity,
     ]);
   }
   await tx.execute(`
@@ -4725,7 +4950,7 @@ async function dispatchNextElasticWorkItem(tx, {
     childTaskType,
     childFeatureKey,
     childTitle,
-    candidate.parent_platform,
+    targetedContent ? candidate.item_platform : candidate.parent_platform,
     JSON.stringify({current: 0, total: 1, percent: 0, phase: 'queued'}),
     JSON.stringify(childCheckpoint),
     JSON.stringify({
@@ -4762,23 +4987,25 @@ async function dispatchNextElasticWorkItem(tx, {
     UPDATE capture_task_items
     SET status = 'dispatched',
       attempt_count = $1,
-      assigned_agent_id = $2,
-      execution_task_id = $3,
-      assignment_revision = $4,
-      request_hash = $5,
+      metadata = (metadata - 'checkpoint' - 'targetResult') ||
+        jsonb_build_object('elasticAttemptBudgetUsed', $2::integer),
+      assigned_agent_id = $3,
+      execution_task_id = $4,
+      assignment_revision = $5,
+      request_hash = $6,
       error = '{}'::jsonb,
-      metadata = metadata - 'checkpoint' - 'targetResult',
       assigned_at = now(),
       dispatched_at = now(),
       started_at = NULL,
       finished_at = NULL,
       updated_at = now()
-    WHERE id = $6 AND tenant_id = $7 AND task_id = $8
-      AND status = $9
-      AND assignment_revision = $10
+    WHERE id = $7 AND tenant_id = $8 AND task_id = $9
+      AND status = $10
+      AND assignment_revision = $11
     RETURNING id
   `, [
     attemptNumber,
+    attemptBudget,
     agent.id,
     childTaskId,
     assignmentRevision,
@@ -4805,7 +5032,7 @@ async function dispatchNextElasticWorkItem(tx, {
       $9, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
     )
   `, [
-    crypto.randomUUID(),
+    attemptIdentity,
     agent.tenant_id,
     candidate.item_id,
     candidate.parent_id,
@@ -4833,18 +5060,19 @@ async function dispatchNextElasticWorkItem(tx, {
     agentId: agent.id,
     eventType: 'elastic_work_item_dispatched',
     status: 'pending',
-    message: negativePost
+    message: targetedContent
       ? '空闲节点已从云端领取 1 篇帖子'
       : '空闲节点已从云端领取 1 个关键词',
     payload: {
       parentTaskId: candidate.parent_id,
       itemId: candidate.item_id,
       claimUnit,
-      ...(negativePost
+      ...(targetedContent
         ? {recordId: candidate.record_id}
         : {keyword: candidate.keyword}),
       assignmentRevision,
       attemptNumber,
+      attemptBudget,
       commandId,
     },
   });
@@ -4855,6 +5083,44 @@ async function dispatchNextElasticWorkItem(tx, {
     claimUnit,
   };
 }
+
+// Keep the short online lease independent from the full state reconciliation.
+// A capture snapshot, account probe, or command can legitimately take longer
+// than one heartbeat interval; that work must never make a healthy browser look
+// offline to the scheduler.
+router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
+  try {
+    const result = await withTransaction(async tx => {
+      const currentAgent = await lockActiveCaptureAgentSession(
+        tx,
+        req.captureAgent,
+      );
+      if (!currentAgent) return {agentInactive: true};
+      await tx.execute(`
+        UPDATE capture_agents
+        SET last_heartbeat_at = now(), updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+      `, [req.captureAgent.id, req.captureAgent.tenant_id]);
+      return {agentInactive: false};
+    });
+    if (result.agentInactive) {
+      return res.status(403).json({
+        ok: false,
+        error: 'agent_inactive',
+        message: '采集节点已撤销或授权已变更，请重新验证扩展',
+      });
+    }
+    return res.json({
+      ok: true,
+      agent: {
+        id: req.captureAgent.id,
+        heartbeatAt: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
   try {
@@ -8660,16 +8926,24 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
       AND child.status IN (
         'pending', 'claimed', 'running', 'recovering', 'waiting_device'
       )
-      AND COALESCE(child.metadata->>'cloudWorkQueue', 'false') = 'true'
       AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
       AND parent.status NOT IN (
         'completed', 'completed_with_warnings', 'completed_with_failures',
         'failed', 'canceled', 'skipped', 'superseded'
       )
-      AND agent.last_heartbeat_at <
-        now() - make_interval(mins => $1::integer)
-      AND child.updated_at <
-        now() - make_interval(mins => $1::integer)
+      AND (
+        (
+          agent.last_heartbeat_at <
+            now() - make_interval(mins => $1::integer)
+          AND child.updated_at <
+            now() - make_interval(mins => $1::integer)
+        )
+        OR (
+          child.status IN ('claimed', 'running', 'recovering')
+          AND COALESCE(child.heartbeat_at, child.started_at, child.created_at) <
+            now() - make_interval(mins => $1::integer)
+        )
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM capture_agent_commands command
@@ -8698,7 +8972,7 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
       `, [candidate.parent_task_id, candidate.tenant_id]);
       if (!parent) return false;
       const child = await tx.queryOne(`
-        SELECT child.*
+        SELECT child.*, agent.last_heartbeat_at AS agent_last_heartbeat_at
         FROM capture_tasks child
         JOIN capture_agents agent
           ON agent.id = child.assigned_agent_id
@@ -8708,11 +8982,22 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
           AND child.status IN (
             'pending', 'claimed', 'running', 'recovering', 'waiting_device'
           )
-          AND COALESCE(child.metadata->>'cloudWorkQueue', 'false') = 'true'
-          AND agent.last_heartbeat_at <
-            now() - make_interval(mins => $4::integer)
-          AND child.updated_at <
-            now() - make_interval(mins => $4::integer)
+          AND (
+            (
+              agent.last_heartbeat_at <
+                now() - make_interval(mins => $4::integer)
+              AND child.updated_at <
+                now() - make_interval(mins => $4::integer)
+            )
+            OR (
+              child.status IN ('claimed', 'running', 'recovering')
+              AND COALESCE(
+                child.heartbeat_at,
+                child.started_at,
+                child.created_at
+              ) < now() - make_interval(mins => $4::integer)
+            )
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM capture_agent_commands command
@@ -8728,28 +9013,41 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
         ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
       ]);
       if (!child) return false;
+      const agentHeartbeatAt = Date.parse(
+        String(child.agent_last_heartbeat_at || ''),
+      );
+      const agentOffline =
+        !Number.isFinite(agentHeartbeatAt) ||
+        agentHeartbeatAt <
+          Date.now() - ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000;
+      const timeoutCode = agentOffline
+        ? 'elastic_agent_offline_timeout'
+        : 'elastic_task_heartbeat_timeout';
+      const timeoutMessage = agentOffline
+        ? '执行节点持续离线，工作项已退回弹性队列'
+        : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
       const failed = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'failed',
           error = jsonb_build_object(
-            'code', 'elastic_agent_offline_timeout',
-            'message', '执行节点持续离线，工作项已退回弹性队列',
+            'code', $3::text,
+            'message', $4::text,
             'retryable', true
           ),
-          message = '执行节点持续离线，工作项已退回弹性队列',
+          message = $4,
           finished_at = now(),
           updated_at = now()
         WHERE id = $1 AND tenant_id = $2
         RETURNING *
-      `, [child.id, candidate.tenant_id]);
+      `, [child.id, candidate.tenant_id, timeoutCode, timeoutMessage]);
       await projectOrchestrationChildControlOutcome(tx, {
         tenantId: candidate.tenant_id,
         childTask: failed,
         agentId: child.assigned_agent_id,
         status: 'retryable',
         error: {
-          code: 'elastic_agent_offline_timeout',
-          message: '执行节点持续离线，工作项已退回弹性队列',
+          code: timeoutCode,
+          message: timeoutMessage,
           automaticRetry: true,
         },
         actorType: 'system',
@@ -8761,10 +9059,11 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
         agentId: child.assigned_agent_id,
         eventType: 'elastic_work_item_requeued',
         status: 'failed',
-        message: '节点持续离线，工作项已自动退回云端队列',
+        message: timeoutMessage,
         payload: {
           parentTaskId: candidate.parent_task_id,
           offlineTimeoutMinutes: ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+          timeoutCode,
         },
       });
       return true;

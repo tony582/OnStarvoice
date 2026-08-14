@@ -10,6 +10,7 @@ export const DEFAULT_AI_FAILOVER_RECOVERY_SUCCESS_THRESHOLD = 2;
 const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const POLICY_SETTING_KEYS = [
   'llm_failover_enabled',
+  'llm_failover_mode',
   'llm_failover_primary_model',
   'llm_failover_backup_model',
   'llm_failover_failure_threshold',
@@ -89,12 +90,18 @@ export function normalizeAiFailoverPolicy(settings = {}, baseConfig = {}) {
   );
   const backupModel = boundedText(settings.llm_failover_backup_model);
   const requested = enabledValue(settings.llm_failover_enabled);
+  const mode = String(settings.llm_failover_mode || '')
+    .trim()
+    .toLowerCase() === 'active_active'
+    ? 'active_active'
+    : 'failover';
   const validModels = Boolean(
     primaryModel && backupModel && primaryModel !== backupModel,
   );
   const enabled = requested && provider === 'deepseek' && validModels;
   return {
     requested,
+    mode,
     enabled,
     disabledReason: !requested
       ? 'disabled'
@@ -138,6 +145,30 @@ export function normalizeAiFailoverPolicy(settings = {}, baseConfig = {}) {
       10,
     ),
   };
+}
+
+export function selectActiveActiveModel(config = {}, sequence = 0) {
+  const failover = config.failover || {};
+  if (!failover.enabled || failover.mode !== 'active_active') {
+    return boundedText(config.model);
+  }
+  const models = [failover.primaryModel, failover.backupModel]
+    .map(model => boundedText(model))
+    .filter((model, index, values) => model && values.indexOf(model) === index);
+  if (models.length < 2) return boundedText(config.model) || models[0] || '';
+  const normalizedSequence = Math.max(0, Number(sequence) || 0);
+  return models[Math.floor(normalizedSequence) % models.length];
+}
+
+export function activeActivePeerModel(config = {}, attemptedModel = '') {
+  const failover = config.failover || {};
+  if (!failover.enabled || failover.mode !== 'active_active') return '';
+  const attempted = boundedText(attemptedModel || config.model);
+  const primary = boundedText(failover.primaryModel);
+  const backup = boundedText(failover.backupModel);
+  if (attempted === primary) return backup;
+  if (attempted === backup) return primary;
+  return primary || backup;
 }
 
 export function initialAiFailoverRoute(policy = {}) {
@@ -440,6 +471,7 @@ export async function resolveAiFailoverConfig(tenantId, baseConfig) {
     model: activeModelForState(state),
     failover: {
       enabled: true,
+      mode: policy.mode,
       route: state.route,
       primaryModel: policy.primaryModel,
       backupModel: policy.backupModel,
@@ -527,6 +559,33 @@ export async function recordAiModelFailure(
       retryModel: '',
       retryRoute: '',
       retryCurrent: false,
+      failure,
+    };
+  }
+  if (failover.mode === 'active_active') {
+    const retryModel = activeActivePeerModel(config, config?.model);
+    await queryOne(
+      `UPDATE ai_failover_states
+       SET last_failure_at = now(),
+           last_failure_code = $2,
+           last_failure_status = $3,
+           last_failure_kind = $4,
+           updated_at = now()
+       WHERE tenant_id = $1
+       RETURNING tenant_id`,
+      [
+        tenantId,
+        failure.code,
+        failure.status,
+        boundedText(kind, 100),
+      ],
+    );
+    return {
+      switched: false,
+      retryModel,
+      retryRoute: 'active_active',
+      retryCurrent: Boolean(failure.retryCurrent && retryModel),
+      pressureDetected: true,
       failure,
     };
   }
@@ -625,6 +684,23 @@ export async function recordAiModelSuccess(
 ) {
   const failover = config?.failover || {};
   if (!failover.enabled) return;
+  if (failover.mode === 'active_active') {
+    await queryOne(
+      `UPDATE ai_failover_states
+       SET route = 'primary',
+           last_success_at = now(),
+           consecutive_failures = 0,
+           failure_window_started_at = NULL,
+           backup_since = NULL,
+           next_primary_probe_at = NULL,
+           recovery_probe_successes = 0,
+           updated_at = now()
+       WHERE tenant_id = $1
+       RETURNING tenant_id`,
+      [tenantId],
+    );
+    return;
+  }
   await queryOne(
     `UPDATE ai_failover_states
      SET last_success_at = now(),
@@ -819,9 +895,14 @@ export async function getAiFailoverStatus(tenantId) {
     requested: policy.requested,
     enabled: policy.enabled,
     disabledReason: policy.disabledReason,
-    route: policy.enabled ? route : 'configured',
+    mode: policy.mode,
+    route: policy.enabled
+      ? policy.mode === 'active_active' ? 'active_active' : route
+      : 'configured',
     effectiveModel: policy.enabled
-      ? (route === 'backup' ? policy.backupModel : policy.primaryModel)
+      ? policy.mode === 'active_active'
+        ? `${policy.primaryModel}+${policy.backupModel}`
+        : (route === 'backup' ? policy.backupModel : policy.primaryModel)
       : policy.configuredModel,
     primaryModel: policy.primaryModel,
     backupModel: policy.backupModel,
