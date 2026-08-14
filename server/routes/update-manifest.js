@@ -3,12 +3,104 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.78',
+  latestVersion: '0.3.83',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-07',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.78-20260807.zip',
+  releaseDate: '2026-08-14',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.83-20260814.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.83',
+      releaseDate: '2026-08-14',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '任务运行中不再误判 Agent 离线',
+              desc: '在线心跳与任务快照、账号识别和指令处理解耦；即使采集流程耗时，任务调度仍能持续识别设备在线，并会自动回收已失去心跳的弹性工作项。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.82',
+      releaseDate: '2026-08-13',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: '关注内容定向巡查',
+              desc: '内容分诊可单条或批量关注内容，并从关注清单创建巡查；任务调度支持小红书与抖音混合清单，按内容平台分配给对应 Agent。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '负面巡查支持混合平台',
+              desc: '负面巡查可同时承载小红书与抖音内容，并按每条内容的平台交给具备对应能力的 Agent。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.81',
+      releaseDate: '2026-08-13',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '无人值守尾部任务可靠接力',
+              desc: '空闲 Agent 会继续领取最后少量待执行词；弱网或页面异常会释放当前词、进入可见冷却倒计时并返回平台入口，停止任务也不会再被迟到结果重新打开。',
+            },
+            {
+              title: '抖音正文和作者名称完整采集',
+              desc: '采集时会优先保留完整正文并防止短文本覆盖长文本；日文、特殊符号等真实昵称按页面原值保存，不再误降级为“作者”。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.80',
+      releaseDate: '2026-08-12',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: 'Agent 每日采集与安全验证统计',
+              desc: '搜索、增强、采集和结果数量统一归属实际执行 Agent，并上报验证码、登录验证与平台风控证据；未绑定社交账号也会正常计数。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.79',
+      releaseDate: '2026-08-12',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '失败关键词立即释放并自动接力',
+              desc: '弱网或页面加载异常经过一次短重试仍失败时，关键词会解除原 Agent 锁定并交回云端，由其他空闲 Agent 立即接手；故障 Agent 单独冷却，不会马上领取新任务。',
+            },
+            {
+              title: '冷却设备退出卡住的关键词页',
+              desc: '进入冷却的抖音或小红书 Agent 会先返回平台入口，避免停留在持续 loading 的搜索页；任务中心和调度中心同步显示等待原因、倒计时与接力状态。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.78',
       releaseDate: '2026-08-07',

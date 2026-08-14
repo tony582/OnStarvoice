@@ -411,6 +411,13 @@ export function normalizeOrchestrationRequest(
     ),
     platformSafetyMode: 'manual_confirmed',
   };
+  const rawDistributionMode = text(
+    source.distributionMode || source.distribution_mode || 'fixed_batch',
+    40,
+  ).toLowerCase();
+  const distributionMode = rawDistributionMode === 'elastic_pool'
+    ? 'elastic_pool'
+    : 'fixed_batch';
 
   return {
     requestKey: text(
@@ -424,6 +431,7 @@ export function normalizeOrchestrationRequest(
     platform: normalizePlatform(source.platform),
     executionMode,
     allocationMode: 'balanced',
+    distributionMode,
     keywords,
     agentIds,
     taskInput: {

@@ -128,6 +128,7 @@ export async function captureSingleNote() {
       author: authorInfo.name,
       authorId: authorInfo.userId,
       authorUrl: authorInfo.url,
+      authorNameBoundToProfile: authorInfo.nameFromProfileLink === true,
       content,
       tags,
       likes: interactions.likes,
@@ -256,6 +257,13 @@ function extractNoteIdFromUrl() {
 export function validateCapturedData(payload) {
   const fatalIssues = [];
   const warnings = [];
+  const authorIdentity = {
+    fromAuthorContainer: true,
+    profileUrl: payload.authorUrl,
+    userId: payload.authorId,
+    nameFromProfileLink: payload.authorNameBoundToProfile === true,
+  };
+  const authorNameBoundToProfile = hasProfileBoundAuthorName(authorIdentity);
 
   // 必需字段检查 (标题和正文可以为空)
   if (!payload.author || payload.author.length === 0) {
@@ -263,7 +271,7 @@ export function validateCapturedData(payload) {
   }
 
   // 作者名格式检查（不应该是时间文本）
-  if (payload.author) {
+  if (payload.author && !authorNameBoundToProfile) {
     const timePatterns = [
       /^\d+[分秒小时天月年]/,
       /^[0-9]+\s*(分钟|小时|天|月|年)前?/,
@@ -281,11 +289,7 @@ export function validateCapturedData(payload) {
   // 这是最终防线，避免后续提取分支意外把互动数、时间等裸数字当成作者。
   if (
     isPureNumericAuthorName(payload.author) &&
-    !validateAuthorName(payload.author, {
-      fromAuthorContainer: true,
-      profileUrl: payload.authorUrl,
-      userId: payload.authorId,
-    })
+    !validateAuthorName(payload.author, authorIdentity)
   ) {
     fatalIssues.push("纯数字作者身份不完整");
   }
@@ -333,18 +337,17 @@ function extractAuthorInfo(noteContext = document) {
     noteContext,
   );
 
-  let nameElement, linkElement;
+  let nameElement, linkElement, profileBoundCandidate;
 
   if (authorContainer) {
+    profileBoundCandidate = findProfileBoundAuthorName(authorContainer);
     // 在作者容器内查询（优先）
-    nameElement = querySelector(
-      NOTE_DETAIL_SELECTORS.author.name,
-      authorContainer,
-    );
-    linkElement = querySelector(
-      NOTE_DETAIL_SELECTORS.author.link,
-      authorContainer,
-    );
+    nameElement =
+      profileBoundCandidate?.nameElement ||
+      querySelector(NOTE_DETAIL_SELECTORS.author.name, authorContainer);
+    linkElement =
+      profileBoundCandidate?.linkElement ||
+      querySelector(NOTE_DETAIL_SELECTORS.author.link, authorContainer);
     console.log("[SingleNote] Found author container:", {
       containerClass: authorContainer.className,
       nameFound: Boolean(nameElement),
@@ -371,10 +374,9 @@ function extractAuthorInfo(noteContext = document) {
   }
 
   let name = nameElement ? cleanText(nameElement.textContent) : "";
-  const authorIdentity = resolveAuthorProfileIdentity(
-    authorContainer,
+  let authorIdentity = profileBoundCandidate?.identity || withAuthorNameBindingEvidence(
+    resolveAuthorProfileIdentity(authorContainer, nameElement, linkElement),
     nameElement,
-    linkElement,
   );
   let url = authorIdentity.profileUrl || (linkElement ? linkElement.href : "");
 
@@ -383,6 +385,16 @@ function extractAuthorInfo(noteContext = document) {
     if (wrappedLink?.href) {
       url = wrappedLink.href;
     }
+  }
+
+  if (
+    authorIdentity?.nameFromProfileLink === true &&
+    url &&
+    authorIdentity.profileUrl &&
+    String(url) !== String(authorIdentity.profileUrl)
+  ) {
+    // 昵称证据与最终主页链接不再指向同一作者时，撤销“主页内原样昵称”信任。
+    authorIdentity = {...authorIdentity, nameFromProfileLink: false};
   }
 
   const userId = authorIdentity.userId || (url ? extractUserId(url) : "");
@@ -395,7 +407,12 @@ function extractAuthorInfo(noteContext = document) {
       ", trying fallback...",
     );
     // 尝试备用策略（仅在 noteContext 内）
-    name = extractAuthorNameFallback(noteContext);
+    const fallback = extractAuthorNameFallback(noteContext);
+    name = fallback.name;
+    if (fallback.url) {
+      url = fallback.url;
+    }
+    authorIdentity = fallback.identity || authorIdentity;
   }
 
   // 移除全局回退逻辑 - 如果容器内找不到有效作者名，就返回空值
@@ -410,7 +427,12 @@ function extractAuthorInfo(noteContext = document) {
   });
 
   const nextUserId = url ? extractUserId(url) : "";
-  return {name, url, userId: nextUserId || userId};
+  return {
+    name,
+    url,
+    userId: nextUserId || userId,
+    nameFromProfileLink: authorIdentity?.nameFromProfileLink === true,
+  };
 }
 
 /**
@@ -419,12 +441,24 @@ function extractAuthorInfo(noteContext = document) {
 export function validateAuthorName(name, identityEvidence = {}) {
   if (!name || typeof name !== "string") return false;
 
-  // 长度检查（从 2-20 扩展到 1-50）
-  if (name.length < 1 || name.length > 50) return false;
+  const normalizedName = cleanText(name);
+  if (!normalizedName) return false;
+  // 只防止误把整块页面文本当昵称；不限制昵称使用何种语言或符号。
+  if ([...normalizedName].length > 200) return false;
+  if (/[\u0000-\u001f\u007f]/u.test(normalizedName)) return false;
 
-  // 排除无效文本
-  const invalidTexts = [
+  // 可信作者主页链接里的可见文字就是昵称本身。日文、韩文、Emoji、
+  // 纯数字甚至与 UI 文案同名的昵称都应原样保留，不再做字符种类猜测。
+  if (hasProfileBoundAuthorName(identityEvidence)) return true;
+
+  // 非主页链接内的兜底候选仍需排除明确的页面控件，避免串栏。
+  const invalidTexts = new Set([
     "关注",
+    "已关注",
+    "作者",
+    "用户",
+    "博主",
+    "粉丝",
     "token",
     "http",
     "www",
@@ -437,8 +471,8 @@ export function validateAuthorName(name, identityEvidence = {}) {
     "昨天",
     "前天",
     "刚刚",
-  ];
-  if (invalidTexts.some((text) => name.includes(text))) return false;
+  ]);
+  if (invalidTexts.has(normalizedName.toLowerCase())) return false;
 
   // 增强的时间文本黑名单模式
   const timePatterns = [
@@ -453,22 +487,22 @@ export function validateAuthorName(name, identityEvidence = {}) {
   ];
 
   for (const pattern of timePatterns) {
-    if (pattern.test(name)) {
+    if (pattern.test(normalizedName)) {
       return false;
     }
   }
 
   // 裸数字仍默认拒绝。只有来自当前作者容器、且主页 URL 与作者 ID
   // 相互印证时才放行合法的纯数字昵称（例如“123”）。
-  if (isPureNumericAuthorName(name)) {
+  if (isPureNumericAuthorName(normalizedName)) {
     return hasMatchingVerifiedXhsProfileIdentity(identityEvidence);
   }
-  if (/^[\d\s]+$/.test(name)) {
+  if (/^[\d\s]+$/.test(normalizedName)) {
     return false;
   }
-  const hasWordOrCjk = /[\w\u3400-\u9fff]/.test(name);
-  const hasEmoji = /\p{Extended_Pictographic}/u.test(name);
-  if (!hasWordOrCjk && !hasEmoji) {
+  const hasUnicodeLetter = /[\p{L}\p{M}]/u.test(normalizedName);
+  const hasEmoji = /\p{Extended_Pictographic}/u.test(normalizedName);
+  if (!hasUnicodeLetter && !hasEmoji) {
     return false;
   }
 
@@ -490,6 +524,78 @@ function hasMatchingVerifiedXhsProfileIdentity(identityEvidence = {}) {
     identityEvidence?.profileUrl,
   );
   return Boolean(profileUserId && profileUserId === expectedUserId);
+}
+
+function hasProfileBoundAuthorName(identityEvidence = {}) {
+  return Boolean(
+    identityEvidence?.nameFromProfileLink === true &&
+      hasMatchingVerifiedXhsProfileIdentity(identityEvidence),
+  );
+}
+
+function withAuthorNameBindingEvidence(identityEvidence = {}, nameElement = null) {
+  const wrappedProfileLink = nameElement?.closest?.(
+    'a[href*="/user/profile/"]',
+  );
+  const wrappedUserId = extractVerifiedXhsProfileUserId(
+    wrappedProfileLink?.href || wrappedProfileLink?.getAttribute?.("href") || "",
+  );
+  return {
+    ...identityEvidence,
+    nameFromProfileLink: Boolean(
+      wrappedUserId && wrappedUserId === identityEvidence?.userId,
+    ),
+  };
+}
+
+function findProfileBoundAuthorName(authorContainer) {
+  if (!authorContainer?.querySelectorAll) return null;
+
+  const profileLinks = Array.from(
+    authorContainer.querySelectorAll('a[href*="/user/profile/"]'),
+  ).filter((link) => !isIgnoredAuthorNode(link));
+  const nameSelectors = [
+    ".username",
+    ".user-name",
+    ".nickname",
+    '[class*="username"]',
+    'span[class*="name"]',
+    'span[class*="user"]',
+    "span",
+  ];
+
+  for (const linkElement of profileLinks) {
+    const profileUrl = String(
+      linkElement.href || linkElement.getAttribute?.("href") || "",
+    ).trim();
+    const userId = extractVerifiedXhsProfileUserId(profileUrl);
+    if (!userId) continue;
+
+    const candidates = [];
+    for (const selector of nameSelectors) {
+      try {
+        candidates.push(...Array.from(linkElement.querySelectorAll(selector)));
+      } catch {
+        // ignore selector drift
+      }
+    }
+    candidates.push(linkElement);
+
+    for (const nameElement of Array.from(new Set(candidates))) {
+      const text = cleanText(nameElement?.textContent || "");
+      const identity = {
+        fromAuthorContainer: true,
+        profileUrl,
+        userId,
+        nameFromProfileLink: true,
+      };
+      if (validateAuthorName(text, identity)) {
+        return {nameElement, linkElement, identity};
+      }
+    }
+  }
+
+  return null;
 }
 
 function extractVerifiedXhsProfileUserId(profileUrl) {
@@ -610,12 +716,20 @@ function extractAuthorNameFallback(noteContext = document) {
     // 跳过评论区、推荐流中的链接
     if (isIgnoredAuthorNode(link)) continue;
 
-    const span = link.querySelector("span:first-of-type");
-    if (span) {
+    const profileUrl = String(link.href || link.getAttribute?.("href") || "");
+    const userId = extractVerifiedXhsProfileUserId(profileUrl);
+    const span = link.querySelector("span:first-of-type") || link;
+    if (span && userId) {
       const text = cleanText(span.textContent);
-      if (validateAuthorName(text)) {
+      const identity = {
+        fromAuthorContainer: true,
+        profileUrl,
+        userId,
+        nameFromProfileLink: true,
+      };
+      if (validateAuthorName(text, identity)) {
         console.log("[SingleNote] Found author by link strategy:", text);
-        return text;
+        return {name: text, url: profileUrl, identity};
       }
     }
   }
@@ -633,7 +747,7 @@ function extractAuthorNameFallback(noteContext = document) {
       const text = cleanText(el.textContent);
       if (validateAuthorName(text)) {
         console.log("[SingleNote] Found author by avatar strategy:", text);
-        return text;
+        return {name: text, url: "", identity: null};
       }
     }
   }
@@ -641,7 +755,8 @@ function extractAuthorNameFallback(noteContext = document) {
   console.warn(
     "[SingleNote] All author extraction strategies failed within container, returning empty",
   );
-  return ""; // 返回空字符串，而不是"未知作者"，让后续验证处理
+  // 返回空值而不是占位“作者”，让后续验证明确报出作者缺失。
+  return {name: "", url: "", identity: null};
 }
 
 function extractAuthorInfoGlobalFallback() {
@@ -802,10 +917,9 @@ function validateContainer(container, noteId) {
     ? querySelector(NOTE_DETAIL_SELECTORS.author.link, authorContainer)
     : null;
   const authorText = cleanText(authorName?.textContent || "");
-  const authorIdentity = resolveAuthorProfileIdentity(
-    authorContainer,
+  const authorIdentity = withAuthorNameBindingEvidence(
+    resolveAuthorProfileIdentity(authorContainer, authorName, authorLink),
     authorName,
-    authorLink,
   );
   const authorValid =
     authorText &&

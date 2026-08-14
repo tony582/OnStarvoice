@@ -1557,6 +1557,8 @@ router.post(
           triggerType: 'official_comment_patrol_manual',
           requestedByUserId: req.user?.id || null,
           requestedByName: req.actorName,
+          automaticRetryDisabled:
+            req.body?.recoveryPolicy?.allowIdleAgentHandoff === false,
         });
         await tx.execute(`
           INSERT INTO audit_logs (

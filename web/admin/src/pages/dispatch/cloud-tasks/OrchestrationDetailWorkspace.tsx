@@ -6,8 +6,10 @@ import {
   CalendarDays,
   ChevronRight,
   ClipboardList,
+  Clock3,
   Loader2,
   Pause,
+  Pencil,
   Play,
   Send,
   ShieldAlert,
@@ -31,6 +33,7 @@ import type {
 } from './types'
 // 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
+import { KeywordExecutionReport } from './KeywordExecutionReport'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -201,6 +204,30 @@ function dataMessage(value: unknown) {
   return String(record.message || record.reason || record.code || '').trim()
 }
 
+function timestamp(value: unknown) {
+  const parsed = Date.parse(String(value || ''))
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function formatRecoveryCountdown(waitUntil: number, now: number) {
+  const remainingSeconds = Math.max(0, Math.ceil((waitUntil - now) / 1000))
+  const hours = Math.floor(remainingSeconds / 3600)
+  const minutes = Math.floor((remainingSeconds % 3600) / 60)
+  const seconds = remainingSeconds % 60
+  const clock = hours > 0
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+    : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  return waitUntil > now ? `${clock} 后重试` : '已到重试时间，正在等待 Agent 回报'
+}
+
+function formatAgentCooldownCountdown(waitUntil: number, now: number) {
+  const remainingSeconds = Math.max(0, Math.ceil((waitUntil - now) / 1000))
+  const minutes = Math.floor(remainingSeconds / 60)
+  const seconds = remainingSeconds % 60
+  const clock = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  return waitUntil > now ? `原 Agent 冷却 ${clock}` : '原 Agent 冷却已结束'
+}
+
 function safetyDiagnostic(value: unknown): boolean {
   if (!value) return false
   if (typeof value === 'string') {
@@ -264,6 +291,7 @@ export function OrchestrationDetailWorkspace({
   writable = false,
   availableAgents = [],
   onClose,
+  onEditPlan,
   onChanged,
   className,
   refreshKey,
@@ -283,6 +311,7 @@ export function OrchestrationDetailWorkspace({
   const [actionFeedback, setActionFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [error, setError] = useState('')
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const loadGeneration = useRef(0)
   const pendingNegativeReassign = useRef<{
     fingerprint: string
@@ -363,8 +392,14 @@ export function OrchestrationDetailWorkspace({
   const progressPercent = sortedItems.length > 0 ? Math.round((settledCount / sortedItems.length) * 100) : 0
   const isScheduleTemplate =
     detail?.orchestration.metadata?.orchestrationTemplate === true
+  const metadata = detail?.orchestration.metadata || {}
+  const elasticPool = metadata.distributionMode === 'elastic_pool'
+    || detail?.schedule?.distribution_mode === 'elastic_pool'
   const negativePatrol = detail?.orchestration.feature_key === 'negative_post_patrol'
     || detail?.orchestration.metadata?.workflow === 'negative_post_patrol'
+  const watchedContentPatrol = detail?.orchestration.feature_key === 'watched_content_patrol'
+    || detail?.orchestration.metadata?.workflow === 'watched_content_patrol'
+  const contentPatrol = negativePatrol || watchedContentPatrol
   const executionsById = useMemo(
     () => new Map((detail?.executions || []).map(execution => [
       executionTaskId(execution),
@@ -373,21 +408,26 @@ export function OrchestrationDetailWorkspace({
     [detail?.executions],
   )
   const keywordRetryItems = useMemo(() => {
-    if (!detail || negativePatrol || isScheduleTemplate) return []
+    if (!detail || contentPatrol || isScheduleTemplate) return []
     return sortedItems.filter(item => {
       if (!KEYWORD_RETRY_STATUSES.has(item.status)) return false
       if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
-        return false
+        // 弹性池第一次命中验证码会自动换 Agent；此时 item 已被服务端明确
+        // 标为 retryable，不应提前显示成人工待办。
+        if (!(elasticPool && item.status === 'retryable')) return false
       }
       const sourceExecution = executionsById.get(
         String(item.execution_task_id || ''),
       )
       return Boolean(
         sourceExecution &&
-        FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution)),
+        (
+          FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution)) ||
+          (elasticPool && executionStatus(sourceExecution) === 'needs_action')
+        ),
       )
     })
-  }, [detail, executionsById, isScheduleTemplate, negativePatrol, sortedItems])
+  }, [contentPatrol, detail, elasticPool, executionsById, isScheduleTemplate, sortedItems])
   const keywordRetrySourceAgentIds = useMemo(() => new Set(
     keywordRetryItems
       .map(item => itemAssignedAgentId(
@@ -398,7 +438,7 @@ export function OrchestrationDetailWorkspace({
       .filter(Boolean),
   ), [detail?.attempts, detail?.executions, keywordRetryItems])
   const keywordRetryCandidates = useMemo(() => {
-    if (!detail || negativePatrol) return []
+    if (!detail || contentPatrol) return []
     return availableAgents
       .filter(agent => agentSupportsKeywordRetry(
         agent,
@@ -413,7 +453,7 @@ export function OrchestrationDetailWorkspace({
           'zh-CN',
         )
       })
-  }, [availableAgents, detail, keywordRetrySourceAgentIds, negativePatrol])
+  }, [availableAgents, contentPatrol, detail, keywordRetrySourceAgentIds])
   const keywordAutomaticCandidates = useMemo(
     () => keywordRetryCandidates.filter(agent =>
       !keywordRetrySourceAgentIds.has(agent.id),
@@ -509,12 +549,8 @@ export function OrchestrationDetailWorkspace({
       String(detail.orchestration.status || ''),
     ),
   )
-  const hasActiveWork = Boolean(detail && !isScheduleTemplate && (
-    ACTIVE_STATUSES.has(String(detail.orchestration.status || '')) ||
-    activeCount > 0
-  ))
   const attentionContext = useMemo(() => {
-    if (!detail || negativePatrol) return null
+    if (!detail || contentPatrol) return null
     const item = sortedItems.find(candidate =>
       Boolean(candidate.execution_task_id) &&
       candidate.status === 'needs_action' &&
@@ -537,9 +573,18 @@ export function OrchestrationDetailWorkspace({
             safetyDiagnostic(candidate.checkpoint) ||
             safetyDiagnostic(candidate.message)
           if (!safetyEvidence) return false
+          const taskId = executionTaskId(candidate)
+          if (
+            elasticPool &&
+            sortedItems.some(candidateItem =>
+              candidateItem.execution_task_id === taskId &&
+              candidateItem.status === 'retryable',
+            )
+          ) {
+            return false
+          }
           if (status === 'needs_action') return true
           if (!FINAL_EXECUTION_STATUSES.has(status)) return false
-          const taskId = executionTaskId(candidate)
           return sortedItems.some(candidateItem =>
             candidateItem.execution_task_id === taskId &&
             !candidateItem.started_at &&
@@ -585,7 +630,7 @@ export function OrchestrationDetailWorkspace({
         !HANDOFF_UNSTARTED_EXCLUDED_STATUSES.has(candidate.status),
       ).length,
     }
-  }, [detail, negativePatrol, sortedItems])
+  }, [contentPatrol, detail, elasticPool, sortedItems])
   const handoffCandidates = useMemo(() => {
     if (!attentionContext || !detail) return []
     return availableAgents
@@ -602,18 +647,119 @@ export function OrchestrationDetailWorkspace({
       )
   }, [attentionContext, availableAgents, detail])
 
+  const automaticRecoveryStates = useMemo(() => {
+    if (!detail || isScheduleTemplate) return []
+    const states: Array<{
+      id: string
+      label: string
+      message: string
+      attemptCurrent: number
+      attemptTotal: number
+      waitUntil: number
+      agentLabel: string
+      countdownKind: 'retry' | 'agent_cooldown'
+    }> = []
+    for (const execution of detail.executions) {
+      const progress = execution.progress && typeof execution.progress === 'object'
+        ? execution.progress as Record<string, unknown>
+        : {}
+      const waitUntil = timestamp(
+        progress.waitUntil || progress.wait_until || progress.nextRetryAt,
+      )
+      const phase = String(progress.phase || '')
+      if (!waitUntil || (!phase.startsWith('waiting_') && waitUntil < nowMs - 10 * 60 * 1000)) {
+        continue
+      }
+      const agentId = executionAgentId(execution)
+      const attemptCurrent = Math.max(0, Number(
+        progress.attemptCurrent || progress.attempt_current || progress.attempt || 0,
+      ) || 0)
+      const attemptTotal = Math.max(0, Number(
+        progress.attemptTotal || progress.attempt_total || progress.maxAttempts || 0,
+      ) || 0)
+      states.push({
+        id: `execution:${executionTaskId(execution)}`,
+        label: attemptCurrent > 0 && attemptTotal > 0
+          ? `当前 Agent 自动恢复 ${attemptCurrent}/${attemptTotal}`
+          : '当前 Agent 自动恢复',
+        message: String(progress.message || execution.message || '正在等待下一次自动恢复'),
+        attemptCurrent,
+        attemptTotal,
+        waitUntil,
+        agentLabel: agentName(agentsById.get(agentId)),
+        countdownKind: 'retry',
+      })
+    }
+    for (const item of sortedItems) {
+      if (item.status !== 'retryable') continue
+      const checkpoint = item.metadata?.checkpoint
+      const checkpointRecord = checkpoint && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
+        ? checkpoint as Record<string, unknown>
+        : {}
+      const itemError = item.error && typeof item.error === 'object'
+        ? item.error as Record<string, unknown>
+        : {}
+      const recoveryValue = checkpointRecord.recovery || itemError.recovery
+      const recovery = recoveryValue && typeof recoveryValue === 'object' && !Array.isArray(recoveryValue)
+        ? recoveryValue as Record<string, unknown>
+        : {}
+      const waitUntil = timestamp(
+        recovery.sourceAgentHoldUntil ||
+        recovery.source_agent_hold_until ||
+        recovery.nextEvaluationAt ||
+        recovery.next_evaluation_at,
+      )
+      const attemptCurrent = Math.max(1, Number(
+        recovery.attemptCurrent || recovery.attempt_current || item.attempt_count || 1,
+      ) || 1)
+      const attemptTotal = Math.max(attemptCurrent, Number(
+        recovery.attemptTotal || recovery.attempt_total || 3,
+      ) || 3)
+      const workUnit = contentPatrol || ['negative_post', 'watched_content'].includes(item.item_type)
+        ? '帖子'
+        : '关键词'
+      const cooldownHomeStatus = Object.prototype.hasOwnProperty.call(
+        recovery,
+        'cooldownHomeRestored',
+      )
+        ? recovery.cooldownHomeRestored === true
+          ? '；原 Agent 已返回平台首页'
+          : '；原 Agent 返回平台首页未确认'
+        : ''
+      states.push({
+        id: `item:${item.id}`,
+        label: `工作项已释放 · 换 Agent ${attemptCurrent}/${attemptTotal}`,
+        message: String(recovery.reason || '') === 'platform_safety_handoff'
+          ? `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他账号可立即复核；原 Agent 冷却期间不会领取新任务${cooldownHomeStatus}`
+          : `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他空闲 Agent 可立即领取；原 Agent 冷却期间不会领取新任务${cooldownHomeStatus}`,
+        attemptCurrent,
+        attemptTotal,
+        waitUntil,
+        agentLabel: `原 Agent：${agentName(agentsById.get(String(recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
+        countdownKind: 'agent_cooldown',
+      })
+    }
+    return states
+  }, [agentsById, contentPatrol, detail, isScheduleTemplate, nowMs, sortedItems])
+
   useEffect(() => {
-    if (!orchestrationId || !hasActiveWork) return
+    if (!orchestrationId) return
     const refreshWhenVisible = () => {
       if (document.visibilityState === 'visible') void load(true, false)
     }
-    const timer = window.setInterval(refreshWhenVisible, 15_000)
+    const timer = window.setInterval(refreshWhenVisible, 5_000)
     document.addEventListener('visibilitychange', refreshWhenVisible)
     return () => {
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
-  }, [hasActiveWork, load, orchestrationId])
+  }, [load, orchestrationId])
+
+  useEffect(() => {
+    if (!orchestrationId) return
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [orchestrationId])
 
   const stopAllExecutions = async () => {
     if (!writable || stopping || !canStopOrchestration) return
@@ -717,7 +863,7 @@ export function OrchestrationDetailWorkspace({
 
   const resumeAttentionSource = async () => {
     if (!attentionContext || !writable || attentionAction) return
-    if (!window.confirm('请确认已经在原 Agent 的抖音页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。')) return
+    if (!window.confirm('请确认已经在当前 Agent 的平台页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。')) return
     setAttentionAction('resume')
     setActionFeedback('')
     setActionError('')
@@ -726,7 +872,7 @@ export function OrchestrationDetailWorkspace({
         `/capture-cloud/tasks/${attentionContext.sourceTaskId}/resume`,
         { mode: 'remaining' },
       )
-      setActionFeedback(result.message || '已向原 Agent 发送继续剩余关键词指令')
+      setActionFeedback(result.message || '已向当前 Agent 发送继续剩余关键词指令')
       await load(true)
       await onChanged?.()
     } catch (err) {
@@ -738,7 +884,7 @@ export function OrchestrationDetailWorkspace({
 
   const stopAttentionSource = async () => {
     if (!attentionContext || !writable || attentionAction) return
-    if (!window.confirm('确定结束原 Agent 的任务吗？后续关键词不再执行，已经采集和保存的结果会保留。')) return
+    if (!window.confirm('确定结束当前 Agent 的任务吗？后续关键词不再执行，已经采集和保存的结果会保留。')) return
     setAttentionAction('stop')
     setActionFeedback('')
     setActionError('')
@@ -747,7 +893,7 @@ export function OrchestrationDetailWorkspace({
         `/capture-cloud/tasks/${attentionContext.sourceTaskId}/stop`,
         {},
       )
-      setActionFeedback(result.message || '已向原 Agent 发送结束并保留结果指令')
+      setActionFeedback(result.message || '已向当前 Agent 发送结束并保留结果指令')
       await load(true)
       await onChanged?.()
     } catch (err) {
@@ -972,7 +1118,6 @@ export function OrchestrationDetailWorkspace({
   }
 
   const { orchestration, executions, agents, attempts, schedule } = detail
-  const metadata = orchestration.metadata || {}
   const scheduleTemplate = metadata.orchestrationTemplate === true
   const scheduleRun = metadata.orchestrationScheduleRun === true
   const planSnapshot = metadata.planSnapshot && typeof metadata.planSnapshot === 'object'
@@ -987,13 +1132,15 @@ export function OrchestrationDetailWorkspace({
     : null
   const recoveryPolicy = planSnapshot.recoveryPolicy && typeof planSnapshot.recoveryPolicy === 'object'
     ? planSnapshot.recoveryPolicy as Record<string, unknown>
-    : {}
-  const idleHandoffAllowed = recoveryPolicy.allowIdleAgentHandoff !== false
+    : metadata.recoveryPolicy && typeof metadata.recoveryPolicy === 'object'
+      ? metadata.recoveryPolicy as Record<string, unknown>
+      : {}
+  const idleHandoffAllowed = elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false
 
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
       <header className="border-b border-border/70 px-4 py-4 sm:px-5">
-        <div className="flex items-start gap-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${scheduleTemplate && schedule?.status === 'active' ? 'border-status-green/25 bg-status-green/8 text-status-green' : statusTone(orchestration.status)}`}>
@@ -1007,60 +1154,72 @@ export function OrchestrationDetailWorkspace({
                   ? '多 Agent 无人值守计划'
                   : scheduleRun
                     ? '无人值守计划运行批次'
-                    : negativePatrol
-                      ? '多 Agent 负面帖子巡查'
+                    : contentPatrol
+                      ? watchedContentPatrol ? '关注内容巡查' : '多 Agent 负面帖子巡查'
                     : '一次性多 Agent 任务'}
               </span>
             </div>
             <h2 id="orchestration-detail-title" className="mt-2.5 truncate text-lg font-bold text-foreground">{orchestration.title || '未命名编排任务'}</h2>
             <p className="mt-1 text-xs text-muted-foreground">创建于 {formatTime(orchestration.created_at)} · 版本 {orchestration.revision ?? orchestration.orchestration_revision ?? '—'}</p>
           </div>
-          {scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
-            <>
-              {['active', 'completed'].includes(schedule.status) && (
+          <div className="flex w-full flex-wrap items-center justify-start gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
+            {scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
+              <>
                 <Button
+                  variant="outline"
                   size="sm"
-                  onClick={() => void runScheduleNow()}
-                  disabled={!writable || scheduleRunningNow || scheduleUpdating}
-                  title={!writable ? '当前账号为只读权限' : '立即生成并下发一轮无人值守任务'}
+                  onClick={() => onEditPlan?.(detail)}
+                  disabled={!writable || scheduleRunningNow || scheduleUpdating || !onEditPlan}
+                  title={!writable ? '当前账号为只读权限' : '编辑同一个计划；修改只影响后续运行'}
                 >
-                  {scheduleRunningNow
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : <Play className="h-4 w-4" />}
-                  立即运行
+                  <Pencil className="h-4 w-4" />
+                  编辑计划
                 </Button>
-              )}
-              {schedule.status !== 'completed' && (
-                <Button
-                  variant={schedule.status === 'active' ? 'outline' : 'default'}
-                  size="sm"
-                  onClick={() => void updateScheduleStatus()}
-                  disabled={!writable || scheduleUpdating || scheduleRunningNow}
-                  title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
-                >
-                  {scheduleUpdating
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : schedule.status === 'active'
-                      ? <Pause className="h-4 w-4" />
+                {['active', 'completed'].includes(schedule.status) && (
+                  <Button
+                    size="sm"
+                    onClick={() => void runScheduleNow()}
+                    disabled={!writable || scheduleRunningNow || scheduleUpdating}
+                    title={!writable ? '当前账号为只读权限' : '立即生成并下发一轮无人值守任务'}
+                  >
+                    {scheduleRunningNow
+                      ? <Loader2 className="h-4 w-4 animate-spin" />
                       : <Play className="h-4 w-4" />}
-                  {schedule.status === 'active' ? '暂停计划' : '重新启用'}
-                </Button>
-              )}
-            </>
-          ) : (
-            <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
-              disabled={!writable || stopping || !canStopOrchestration}
-              title={!writable ? '当前账号为只读权限' : !canStopOrchestration ? '当前任务已经结束或不能停止' : '停止整个父任务、自动接力和仍可控制的 Agent 子任务'}>
-              {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
-              停止全部
+                    立即运行
+                  </Button>
+                )}
+                {schedule.status !== 'completed' && (
+                  <Button
+                    variant={schedule.status === 'active' ? 'outline' : 'default'}
+                    size="sm"
+                    onClick={() => void updateScheduleStatus()}
+                    disabled={!writable || scheduleUpdating || scheduleRunningNow}
+                    title={!writable ? '当前账号为只读权限' : schedule.status === 'active' ? '暂停后不再生成新任务' : '从下一个有效时间重新运行'}
+                  >
+                    {scheduleUpdating
+                      ? <Loader2 className="h-4 w-4 animate-spin" />
+                      : schedule.status === 'active'
+                        ? <Pause className="h-4 w-4" />
+                        : <Play className="h-4 w-4" />}
+                    {schedule.status === 'active' ? '暂停计划' : '重新启用'}
+                  </Button>
+                )}
+              </>
+            ) : (
+              <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
+                disabled={!writable || stopping || !canStopOrchestration}
+                title={!writable ? '当前账号为只读权限' : !canStopOrchestration ? '当前任务已经结束或不能停止' : '停止整个父任务、自动接力和仍可控制的 Agent 子任务'}>
+                {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
+                停止全部
+              </Button>
+            )}
+            <Button variant="outline" size="icon" onClick={() => void load(true)} disabled={refreshing} aria-label="刷新编排任务详情">
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
             </Button>
-          )}
-          <Button variant="outline" size="icon" onClick={() => void load(true)} disabled={refreshing} aria-label="刷新编排任务详情">
-            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-          </Button>
-          {onClose && (
-            <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭编排任务详情" data-dialog-initial-focus><X className="h-5 w-5" /></Button>
-          )}
+            {onClose && (
+              <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭编排任务详情" data-dialog-initial-focus><X className="h-5 w-5" /></Button>
+            )}
+          </div>
         </div>
         {error && <p role="alert" className="mt-3 text-xs text-status-red">{error}</p>}
         {actionError && <p role="alert" className="mt-3 text-xs text-status-red">{actionError}</p>}
@@ -1068,6 +1227,55 @@ export function OrchestrationDetailWorkspace({
       </header>
 
       <div className="p-4 sm:p-5">
+        {automaticRecoveryStates.length > 0 && (
+          <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4" aria-label="自动恢复实时状态">
+            <div className="flex items-start gap-3">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                <Clock3 className="h-4.5 w-4.5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-bold text-foreground">自动恢复实时状态</h3>
+                  <span className="text-[10px] text-muted-foreground">每 5 秒同步设备状态</span>
+                </div>
+                <div className="mt-3 grid gap-2">
+                  {automaticRecoveryStates.map(state => {
+                    const due = state.waitUntil > 0 && state.waitUntil <= nowMs
+                    return (
+                      <div key={state.id} className={cn(
+                        'rounded-xl border px-3 py-2.5',
+                        due
+                          ? 'border-status-orange/25 bg-status-orange/[0.045]'
+                          : 'border-primary/15 bg-background/70',
+                      )}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <strong className="text-xs font-semibold text-foreground">{state.label}</strong>
+                          <span className={cn(
+                            'font-mono text-xs font-bold tabular-nums',
+                            due ? 'text-status-orange' : 'text-primary',
+                          )}>
+                            {state.waitUntil > 0
+                              ? state.countdownKind === 'agent_cooldown'
+                                ? formatAgentCooldownCountdown(state.waitUntil, nowMs)
+                                : formatRecoveryCountdown(state.waitUntil, nowMs)
+                              : '排队中，空闲 Agent 自动领取'}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{state.message}</p>
+                        <p className="mt-1 text-[10px] text-muted-foreground">
+                          {state.agentLabel}
+                          {state.waitUntil > 0
+                            ? ` · ${state.countdownKind === 'agent_cooldown' ? '冷却结束' : '下次动作'} ${new Date(state.waitUntil).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+                            : ''}
+                        </p>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
         {attentionContext && (
           <section className="mb-4 rounded-2xl border border-status-red/25 bg-status-red/[0.035] p-4" role="alert">
             <div className="flex items-start gap-3">
@@ -1078,8 +1286,8 @@ export function OrchestrationDetailWorkspace({
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                   <h3 className="text-sm font-bold text-foreground">
                     {attentionContext.sourceEnded
-                      ? '原 Agent 已结束，后续关键词由系统自动接力'
-                      : '当前关键词等待人工验证，其他关键词继续自动接力'}
+                      ? '当前 Agent 已结束，后续关键词由系统自动接力'
+                      : '自动恢复与换设备复核后仍需人工验证'}
                   </h3>
                   <span className="rounded-full bg-status-red/10 px-2 py-0.5 text-[10px] font-semibold text-status-red">
                     {attentionContext.currentOrdinal > 0
@@ -1088,7 +1296,7 @@ export function OrchestrationDetailWorkspace({
                   </span>
                 </div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  原 Agent：<strong className="font-semibold text-foreground">{agentName(attentionContext.sourceAgent)}</strong>
+                  当前 Agent：<strong className="font-semibold text-foreground">{agentName(attentionContext.sourceAgent)}</strong>
                   {attentionContext.currentItem
                     ? <> · 当前关键词：<strong className="font-semibold text-foreground">{keywordForItem(attentionContext.currentItem)}</strong></>
                     : null}
@@ -1104,7 +1312,7 @@ export function OrchestrationDetailWorkspace({
                       {attentionAction === 'resume'
                         ? <Loader2 className="h-4 w-4 animate-spin" />
                         : <Play className="h-4 w-4" />}
-                      验证完成，原 Agent 继续
+                      验证完成，当前 Agent 继续
                     </Button>
                   )}
                   {!attentionContext.sourceFinal && (
@@ -1131,11 +1339,11 @@ export function OrchestrationDetailWorkspace({
                 <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
                   {attentionContext.sourceEnded
                     ? idleHandoffAllowed
-                      ? '原任务结果已保留；系统只接力尚未开始的完整关键词，并按空闲情况逐词分配。'
-                      : '原任务已结束，现有结果已保留；该历史任务创建时未启用自动接力。'
+                      ? '当前任务结果已保留；系统只接力尚未开始的完整关键词，并按空闲情况逐词分配。'
+                      : '当前任务已结束，现有结果已保留；该历史任务创建时未启用自动接力。'
                     : idleHandoffAllowed
-                    ? '验证码、登录和安全审核不会自动换设备；当前关键词留在原 Agent。其他未开始关键词由系统逐词分配，无需运营人员选择设备。'
-                    : '该历史任务创建时未启用自动接力；你可以在原 Agent 验证后继续，或结束并保留结果。'}
+                    ? '系统已经先做过原 Agent 分散重试，并尝试换一个账号复核；再次遇到验证码或登录限制后才暂停，避免在多个账号间继续扩散风控。其他未开始关键词仍会自动分配。'
+                    : '该历史任务创建时未启用自动接力；你可以在当前 Agent 验证后继续，或结束并保留结果。'}
                 </p>
               </div>
             </div>
@@ -1169,8 +1377,8 @@ export function OrchestrationDetailWorkspace({
               {idleHandoffAllowed ? (
                 <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
                   {keywordAutomaticCandidates.length > 0
-                    ? '系统将在一分钟内自动下发，无需人工操作'
-                    : '正在等待兼容的空闲 Agent，上线后自动继续'}
+                    ? '系统按上方倒计时自动检查并下发，无需人工操作'
+                    : '正在等待兼容的空闲 Agent；上方会显示检查状态'}
                 </span>
               ) : <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <select
@@ -1388,14 +1596,14 @@ export function OrchestrationDetailWorkspace({
         <ol className="mb-4 flex items-center gap-2 overflow-x-auto pb-1" aria-label="编排任务结构">
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-primary/25 bg-primary/[0.045] px-3 py-2">
             <ClipboardList className="h-4 w-4 shrink-0 text-primary" />
-            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} {negativePatrol ? '条帖子' : '个工作项'}</span></span>
+            <span><span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '计划模板' : '父任务'}</span><span className="block text-xs font-bold">{sortedItems.length} {contentPatrol ? '条帖子' : '个工作项'}</span></span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-border bg-muted/30 px-3 py-2">
             <Activity className="h-4 w-4 shrink-0 text-primary" />
             <span>
-              <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? '固定分配' : '工作项状态'}</span>
-              <span className="block text-xs font-bold">{scheduleTemplate ? `${sortedItems.length} 个关键词已分配` : `${settledCount} 已结算 · ${activeCount} 进行/等待`}</span>
+              <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? (elasticPool ? '领取策略' : '固定分配') : '工作项状态'}</span>
+              <span className="block text-xs font-bold">{scheduleTemplate ? (elasticPool ? '空闲节点逐个领取' : `${sortedItems.length} 个关键词已分配`) : `${settledCount} 已结算 · ${activeCount} 进行/等待`}</span>
             </span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
@@ -1412,8 +1620,10 @@ export function OrchestrationDetailWorkspace({
               <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : '父任务进度'}</h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 {scheduleTemplate
-                  ? '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
-                  : negativePatrol
+                  ? elasticPool
+                    ? '这里展示后续每轮都会沿用的关键词和弹性节点池；实际领取量由节点空闲速度决定。'
+                    : '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
+                  : contentPatrol
                     ? '按每条帖子的真实巡查结果汇总，并展示它由哪个 Agent 执行。'
                     : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
               </p>
@@ -1447,12 +1657,21 @@ export function OrchestrationDetailWorkspace({
           )}
         </section>
 
-        <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
+        {!contentPatrol && !scheduleTemplate ? (
+          <div className="mt-4">
+            <KeywordExecutionReport
+              items={sortedItems}
+              executions={executions}
+              agents={agents}
+              attempts={attempts}
+            />
+          </div>
+        ) : <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
           <section className="overflow-hidden rounded-2xl border border-border/70 bg-card">
             <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
               <div>
                 <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">Work items</div>
-                <h3 className="mt-0.5 text-sm font-bold text-foreground">{negativePatrol ? '负面帖子工作项' : '关键词工作项'}</h3>
+                <h3 className="mt-0.5 text-sm font-bold text-foreground">{watchedContentPatrol ? '关注内容工作项' : negativePatrol ? '负面帖子工作项' : '关键词工作项'}</h3>
               </div>
               <span className="rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{sortedItems.length} 项</span>
             </div>
@@ -1474,6 +1693,11 @@ export function OrchestrationDetailWorkspace({
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
                           <h4 className="truncate text-sm font-semibold text-foreground">{keywordForItem(item)}</h4>
+                          {contentPatrol && (
+                            <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                              {PLATFORM_LABELS[item.platform] || item.platform}
+                            </span>
+                          )}
                           <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusTone(item.status)}`}>
                             {availabilityLabel || statusLabel(item.status)}
                           </span>
@@ -1502,7 +1726,7 @@ export function OrchestrationDetailWorkspace({
               <Bot className="h-4 w-4 text-primary" />
             </div>
             {agents.length === 0 ? (
-              <div className="px-4 py-10 text-center text-xs text-muted-foreground">服务端尚未返回分配节点。</div>
+              <div className="px-4 py-10 text-center text-xs text-muted-foreground">{elasticPool ? '尚未有节点领取工作项。' : '服务端尚未返回分配节点。'}</div>
             ) : (
               <div className="divide-y divide-border/70">
                 {agents.map(agent => {
@@ -1521,7 +1745,7 @@ export function OrchestrationDetailWorkspace({
                             </span>
                           </div>
                           <p className="mt-1 truncate text-[11px] text-muted-foreground">{agent.host_label} › {agent.browser_name} · {agent.operating_system}</p>
-                          <p className="mt-1 text-[11px] text-muted-foreground">分配 {assignedItems.length} {negativePatrol ? '条帖子' : '个工作项'} · {agentExecutions.length} 条子任务记录</p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">分配 {assignedItems.length} {contentPatrol ? '条帖子' : '个工作项'} · {agentExecutions.length} 条子任务记录</p>
                         </div>
                       </div>
                       {agentExecutions.length > 0 && (
@@ -1534,7 +1758,7 @@ export function OrchestrationDetailWorkspace({
                                 return <>
                               <div className="flex items-center justify-between gap-2">
                                 <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(String(execution.status || ''))}`}>{statusLabel(String(execution.status || ''))}</span>
-                                <span className="text-[10px] text-muted-foreground">{itemCount} {negativePatrol ? '条帖子' : '个工作项'}</span>
+                                <span className="text-[10px] text-muted-foreground">{itemCount} {contentPatrol ? '条帖子' : '个工作项'}</span>
                               </div>
                               <div className="mt-1.5 truncate font-mono text-[10px] text-muted-foreground">{executionTaskId(execution) || '未返回子任务 ID'}</div>
                               {(execution.command_status || execution.command_expires_at) && (
@@ -1558,13 +1782,13 @@ export function OrchestrationDetailWorkspace({
                 })}
               </div>
             )}
-            {!negativePatrol && <div className="border-t border-border/70 bg-muted/25 p-3">
+            {!contentPatrol && <div className="border-t border-border/70 bg-muted/25 p-3">
               <p className="text-[10px] leading-4 text-muted-foreground">
                 任务遇到安全验证时（包括验证码或登录要求），运营只需处理当前受阻关键词；它留在原 Agent。接力只处理尚未开始的完整关键词，并由系统自动逐词分配。
               </p>
             </div>}
           </section>
-        </div>
+        </div>}
       </div>
     </section>
   )

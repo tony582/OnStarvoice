@@ -29,6 +29,7 @@ test('record notes are append-only and remain in one processing timeline and exp
   assert.match(drawer, /<ActivityTimeline items=\{activity\}/);
   assert.match(triage, /string_agg\(/);
   assert.match(triage, /FROM record_notes rn/);
+  assert.match(triage, /\|\| ' 状态备注：' \|\| \(al\.metadata->>'note'\) AS line/);
   assert.match(triage, /header: '处理记录'/);
   assert.match(triage, /wrapText: true/);
 });
@@ -48,7 +49,7 @@ test('deleted-post risk stays separate from the manually selected unavailable st
   assert.match(drawer, /value: 'unavailable', label: '已不可见'/);
 });
 
-test('drawer and batch expose all seven states with shared status-change prompts', () => {
+test('drawer and batch expose all eight states with shared status-change prompts', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const feishuControl = source('web/admin/src/components/shared/FeishuTableNumberControl.tsx');
@@ -62,6 +63,7 @@ test('drawer and batch expose all seven states with shared status-change prompts
     ['reviewed', '已复核'],
     ['reviewed_non_monitor', '已复核-非监控内容'],
     ['unavailable', '已不可见'],
+    ['privacy_unreachable', '负面–隐私设置无法触达'],
     ['negative_feishu', '负面-飞书表'],
     ['negative_cold', '负面-冷处理'],
   ]) {
@@ -107,7 +109,8 @@ test('triage filters keep operational dimensions without work-order controls', (
   assert.match(queue, /搜索标题、正文、作者、飞书表号/);
   assert.doesNotMatch(queue, /搜索标题、正文、作者、工单号/);
   assert.match(queue, /aria-label="平台筛选"/);
-  assert.match(queue, /aria-label="处理状态筛选"/);
+  assert.match(queue, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*value=\{triageStatuses\}/);
+  assert.match(queue, /<HeaderMultiFilter[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}/);
   assert.match(queue, /label="风险信号"/);
   assert.match(queue, /label="疑似身份"/);
   assert.match(queue, /<KeywordFilter value=\{captureKeywords\}/);

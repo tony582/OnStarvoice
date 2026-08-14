@@ -23,7 +23,7 @@ test('admin task diagnostics retain the plan total and identify task-level platf
   assert.match(source, /等待人工安全验证/u)
 })
 
-test('admin attention card keeps captcha human-only and makes later keyword handoff automatic', async () => {
+test('admin waits visibly, retries one safety challenge across Agents, and escalates repeated safety blocks', async () => {
   const [card, diagnostics, page, orchestration, composer, navigation, admin] = await Promise.all([
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskDiagnostics.tsx'),
@@ -51,13 +51,23 @@ test('admin attention card keeps captcha human-only and makes later keyword hand
   )
   assert.match(page, /params\?\.view === 'attention'/u)
   assert.match(page, /params\?\.orchestrationId/u)
-  assert.match(orchestration, /验证码、登录和安全审核不会自动换设备/u)
+  assert.match(orchestration, /系统已经先做过原 Agent 分散重试，并尝试换一个账号复核/u)
   assert.match(orchestration, /login\[_ -\]\?required/u)
   assert.match(orchestration, /requiresManualAction/u)
-  assert.match(orchestration, /验证完成，原 Agent 继续/u)
+  assert.match(orchestration, /验证完成，当前 Agent 继续/u)
   assert.match(orchestration, /结束并保留/u)
   assert.match(orchestration, /系统正在按词分配后续/u)
-  assert.match(orchestration, /其他未开始关键词由系统逐词分配，无需运营人员选择设备/u)
+  assert.match(orchestration, /其他未开始关键词仍会自动分配/u)
+  assert.match(orchestration, /自动恢复实时状态/u)
+  assert.match(orchestration, /formatRecoveryCountdown/u)
+  assert.match(orchestration, /formatAgentCooldownCountdown/u)
+  assert.match(orchestration, /工作项已释放 · 换 Agent/u)
+  assert.match(orchestration, /其他空闲 Agent 可立即领取/u)
+  assert.match(orchestration, /原 Agent 冷却期间不会领取新任务/u)
+  assert.match(orchestration, /原 Agent 已返回平台首页/u)
+  assert.match(orchestration, /原 Agent 返回平台首页未确认/u)
+  assert.match(orchestration, /recovery\.sourceAgentHoldUntil/u)
+  assert.match(orchestration, /window\.setInterval\(refreshWhenVisible, 5_000\)/u)
   assert.doesNotMatch(orchestration, /handoffAttentionSource/u)
   assert.doesNotMatch(orchestration, /sourceExecutionTaskId: attentionContext\.sourceTaskId/u)
   assert.match(
@@ -71,10 +81,10 @@ test('admin attention card keeps captcha human-only and makes later keyword hand
   assert.match(orchestration, /metadata\.handoffSuccessorTaskId \|\| metadata\.recoveryTaskId/u)
   assert.match(orchestration, /executionStatus\(execution\) === 'superseded'/u)
   assert.match(orchestration, /HANDOFF_UNSTARTED_EXCLUDED_STATUSES/u)
-  assert.match(orchestration, /原 Agent 已结束，后续关键词由系统自动接力/u)
-  assert.match(composer, /系统自动接力已启用/u)
+  assert.match(orchestration, /当前 Agent 已结束，后续关键词由系统自动接力/u)
+  assert.match(composer, /离线不会拖住整批任务/u)
   assert.match(composer, /allowIdleAgentHandoff/u)
-  assert.match(composer, /验证码或登录异常所在关键词留在原 Agent 等待人工/u)
+  assert.match(composer, /验证码或登录验证只暂停当前关键词/u)
   assert.match(navigation, /new URLSearchParams\(window\.location\.search\)/u)
   assert.match(navigation, /publicLinkParams\.delete\('page'\)/u)
   assert.match(admin, /任务需人工介入通知邮箱/u)

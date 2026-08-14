@@ -16,9 +16,9 @@ test('accepted child snapshots project keyword checkpoints to their exact parent
 
   assert.match(projection, /checkpointEntryToItemStatus\(entry\)/u);
   assert.match(projection, /task\.parent_task_id/u);
-  assert.match(projection, /execution_task_id = \$9/u);
-  assert.match(projection, /assigned_agent_id = \$10/u);
-  assert.match(projection, /keyword = \$11/u);
+  assert.match(projection, /execution_task_id = \$8/u);
+  assert.match(projection, /assigned_agent_id = \$9/u);
+  assert.match(projection, /keyword = \$10/u);
   assert.match(projection, /capture_task_item_attempts/u);
   assert.match(projection, /entry\.errorCode \|\| entry\.error_code/u);
   assert.match(projection, /requiresManualAction/u);
@@ -160,9 +160,9 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /expectedRevision: preview\.revision/u);
   assert.match(composer, /assignments: assignments\.map/u);
   assert.match(composer, /\{ timeoutMs: 30_000 \}/u);
-  assert.match(composer, /当前分配预览已失效/u);
-  assert.match(composer, /正在创建 \$\{new Set\(assignments/u);
-  assert.match(composer, /<footer[\s\S]*aria-live="polite"[\s\S]*role="alert"[\s\S]*确认并分配/u);
+  assert.match(composer, /当前队列预览已失效/u);
+  assert.match(composer, /正在创建云端工作队列/u);
+  assert.match(composer, /<footer[\s\S]*aria-live="polite"[\s\S]*role="alert"[\s\S]*确认并创建队列/u);
   assert.match(composer, /'执行一次'/u);
   assert.match(composer, /'无人值守'/u);
   assert.match(composer, /platform,\s*\n\s*executionMode,/u);
@@ -170,10 +170,18 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /roundGapMin:\s*10/u);
   assert.match(composer, /schedule:\s*\{/u);
   assert.match(composer, /'确认并启用计划'/u);
-  assert.match(composer, /'确认并分配'/u);
+  assert.match(composer, /'确认并创建队列'/u);
   assert.match(composer, /不会覆盖设备 Extension 里已有的本地无人值守计划/u);
-  assert.match(composer, /这里不会调用 AI/u);
+  assert.match(composer, /每个节点一次只领取一个/u);
   assert.match(composer, /1–300 个关键词/u);
+  assert.match(composer, /editingPlan/u);
+  assert.match(composer, /api\.patch<OrchestrationScheduleUpdateResult>/u);
+  assert.match(composer, /expectedRevision: preview\.revision/u);
+  assert.match(composer, /保存修改/u);
+  assert.match(composer, /只影响下一次及之后生成的批次/u);
+  assert.match(composer, /计划 ID、运行次数和历史记录全部保留/u);
+  assert.match(composer, /'fixed_batch' as const/u);
+  assert.match(composer, /'elastic_pool' as const/u);
 
   assert.match(detail, /detail\?\.items/u);
   assert.match(detail, /orchestration, executions, agents, attempts, schedule/u);
@@ -188,6 +196,10 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /重试失败关键词/u);
   assert.match(detail, /\/schedule\/run-now/u);
   assert.match(detail, /立即运行/u);
+  assert.match(detail, /onEditPlan\?\.\(detail\)/u);
+  assert.match(detail, /编辑计划/u);
+  assert.match(dispatchPage, /editingOrchestrationPlan/u);
+  assert.match(dispatchPage, /onPlanUpdated/u);
   assert.match(
     detail,
     /\/capture-cloud\/orchestrations\/\$\{orchestrationId\}\/stop/u,

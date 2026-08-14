@@ -9,17 +9,19 @@ import {
 import { buildAnalyticsWorkbook } from '../services/analytics-workbook.js';
 import { compactAnalyticsDashboard } from '../services/analytics-dashboard-payload.js';
 import { sendWorkbook } from '../services/xlsx-export.js';
+import { getCommentRiskAttentionPolicy } from '../services/comment-risk-attention.js';
 
 const router = Router();
 const DASHBOARD_CACHE_TTL_MS = 60_000;
 const DASHBOARD_CACHE_MAX_ENTRIES = 100;
 const dashboardCache = new Map();
 
-function dashboardCacheKey(tenantId, period, keywords) {
+function dashboardCacheKey(tenantId, period, keywords, commentRiskAttentionEnabled) {
   if (period.range !== 'month' || !period.month) return '';
   return [
     tenantId,
     period.month,
+    commentRiskAttentionEnabled ? 'comment-risk:on' : 'comment-risk:off',
     [...keywords].sort((a, b) => a.localeCompare(b, 'zh-CN')).join('\u0001'),
   ].join('\u0002');
 }
@@ -36,7 +38,8 @@ function pruneDashboardCache(now = Date.now()) {
 }
 
 async function loadDashboardSnapshot({ tenantId, period, keywords, forceRefresh = false }) {
-  const key = dashboardCacheKey(tenantId, period, keywords);
+  const commentRiskAttentionEnabled = (await getCommentRiskAttentionPolicy(tenantId)).enabled;
+  const key = dashboardCacheKey(tenantId, period, keywords, commentRiskAttentionEnabled);
   const now = Date.now();
   if (key && !forceRefresh) {
     const cached = dashboardCache.get(key);
@@ -48,8 +51,10 @@ async function loadDashboardSnapshot({ tenantId, period, keywords, forceRefresh 
     periodStart: period.start,
     periodEnd: period.end,
     keywords,
+    commentRiskAttentionEnabled,
   }).then(snapshot => ({
     snapshot: compactAnalyticsDashboard(snapshot),
+    commentRiskAttentionEnabled,
     generatedAt: new Date().toISOString(),
   }));
 
@@ -235,6 +240,9 @@ router.get('/dashboard', requireTenantAccess, async (req, res, next) => {
         start: period.start.toISOString(),
         end: period.end.toISOString(),
         generatedAt: dashboard.generatedAt,
+      },
+      features: {
+        commentRiskAttentionEnabled: dashboard.commentRiskAttentionEnabled,
       },
       snapshot: dashboard.snapshot,
     });

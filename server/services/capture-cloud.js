@@ -42,6 +42,7 @@ const TERMINAL_TASK_STATUSES = new Set([
 
 const TARGETED_TASK_TYPES = new Set([
   'negative_post_patrol',
+  'watched_content_patrol',
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',

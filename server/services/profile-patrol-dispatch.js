@@ -366,6 +366,7 @@ export async function materializeProfilePatrolTask(tx, {
   scheduledFor = '',
   preferredAgentId = null,
   agentSelection = 'manual',
+  automaticRetryDisabled = false,
 }) {
   const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
   if (!workflow) throw new Error(`Unsupported profile patrol subject: ${subjectType}`);
@@ -407,6 +408,12 @@ export async function materializeProfilePatrolTask(tx, {
     scheduledFor: scheduledFor || null,
     scheduledPreferredAgentId: preferredAgentId || null,
     scheduledAgentSelection: agentSelection,
+    distributionMode: 'fixed_batch',
+    automaticRetryDisabled: automaticRetryDisabled === true,
+    recoveryPolicy: {
+      allowIdleAgentHandoff: automaticRetryDisabled !== true,
+      platformSafetyMode: 'manual_confirmed',
+    },
   };
   const resolvedExecutionsBySubscription = new Map();
   for (const subscription of subscriptions) {

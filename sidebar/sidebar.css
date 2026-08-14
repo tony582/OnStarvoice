@@ -3347,6 +3347,55 @@ body.is-unsupported-platform-cover-visible .platform-switcher {
   margin-top: 8px;
 }
 
+.task-center-wait-state {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid rgba(64, 135, 229, 0.22);
+  border-radius: var(--radius-sm);
+  background: rgba(64, 135, 229, 0.055);
+  color: var(--status-info-text);
+}
+
+.task-center-wait-state.is-detail {
+  margin: 0 0 9px;
+  padding: 10px;
+}
+
+.task-center-wait-state.is-due {
+  border-color: rgba(255, 143, 0, 0.28);
+  background: rgba(255, 143, 0, 0.075);
+  color: var(--status-warning-text);
+}
+
+.task-center-wait-state-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+}
+
+.task-center-wait-state-head strong {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-center-wait-state-copy {
+  margin-top: 4px;
+  color: var(--text-primary);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.task-center-wait-state time {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
 .task-center-progress-copy {
   display: flex;
   justify-content: space-between;

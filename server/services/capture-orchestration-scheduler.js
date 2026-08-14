@@ -386,9 +386,15 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     WHERE tenant_id = $1 AND task_id = $2
     ORDER BY ordinal, id
   `, [schedule.tenant_id, schedule.template_task_id]);
+  const distributionMode = schedule.distribution_mode === 'elastic_pool'
+    ? 'elastic_pool'
+    : 'fixed_batch';
   if (
     templateItems.length === 0 ||
-    templateItems.some(item => !item.assigned_agent_id)
+    (
+      distributionMode === 'fixed_batch' &&
+      templateItems.some(item => !item.assigned_agent_id)
+    )
   ) {
     const advanced = await advanceSchedule(tx, schedule, {
       after: scheduledFor,
@@ -403,9 +409,31 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   }
 
   const planSnapshot = object(schedule.plan_snapshot);
+  const elasticScheduleAgents = distributionMode === 'elastic_pool'
+    ? await tx.queryAll(`
+        SELECT agent_id
+        FROM capture_orchestration_schedule_agents
+        WHERE tenant_id = $1 AND schedule_id = $2
+        ORDER BY ordinal, agent_id
+      `, [schedule.tenant_id, schedule.id])
+    : [];
   const agentIds = [...new Set(
-    templateItems.map(item => String(item.assigned_agent_id)),
+    distributionMode === 'elastic_pool'
+      ? elasticScheduleAgents.map(item => String(item.agent_id))
+      : templateItems.map(item => String(item.assigned_agent_id)),
   )].sort((left, right) => left.localeCompare(right));
+  if (agentIds.length === 0) {
+    const advanced = await advanceSchedule(tx, schedule, {
+      after: scheduledFor,
+      lastRunStatus: 'failed_template',
+      lastError: {
+        code: 'schedule_agent_pool_empty',
+        message: '计划没有可用的执行节点池，无法生成本轮任务',
+      },
+      message: '无人值守计划未配置执行节点，本轮未生成任务',
+    });
+    return {kind: 'failed_template', scheduleId: schedule.id, ...advanced};
+  }
   const agents = await tx.queryAll(`
     SELECT ca.*,
       tenant.status AS tenant_status,
@@ -428,6 +456,9 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   const runTitle = occurrenceTitle(schedule.title, scheduledFor);
   const runMetadata = {
     allocationMode: schedule.allocation_mode,
+    distributionMode,
+    eligibleAgentIds: distributionMode === 'elastic_pool' ? agentIds : [],
+    claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
     executionMode: 'one_time',
     planSnapshot,
     orchestrationScheduleRun: true,
@@ -449,7 +480,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       'keyword_orchestration', $3, $4, 'cloud',
       'orchestration_schedule', 'pending',
       $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
-      '无人值守计划已生成本轮任务，正在下发到执行节点',
+      $11,
       1, $8, $9, $10, now()
     )
   `, [
@@ -457,10 +488,14 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     schedule.tenant_id,
     runTitle,
     schedule.platform,
-    JSON.stringify({current: 0, total: templateItems.length, phase: 'dispatched'}),
+    JSON.stringify({
+      current: 0,
+      total: templateItems.length,
+      phase: distributionMode === 'elastic_pool' ? 'queued' : 'dispatched',
+    }),
     JSON.stringify({
       total: templateItems.length,
-      assigned: templateItems.length,
+      assigned: distributionMode === 'elastic_pool' ? 0 : templateItems.length,
       processed: 0,
       success: 0,
       failed: 0,
@@ -470,6 +505,9 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     schedule.id,
     scheduledFor.toISOString(),
     Number(schedule.revision),
+    distributionMode === 'elastic_pool'
+      ? '无人值守计划已生成本轮云端队列，等待空闲节点领取'
+      : '无人值守计划已生成本轮任务，正在下发到执行节点',
   ]);
 
   const runItems = [];
@@ -481,8 +519,8 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         assignment_revision, assigned_at, metadata
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
-        $7, 'keyword', 'assigned', $8,
-        1, now(), $9::jsonb
+        $7, 'keyword', $8, $9,
+        $10, $11, $12::jsonb
       )
       RETURNING *
     `, [
@@ -497,7 +535,12 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       Number(templateItem.ordinal),
       templateItem.keyword,
       schedule.platform,
-      templateItem.assigned_agent_id,
+      distributionMode === 'elastic_pool' ? 'pending' : 'assigned',
+      distributionMode === 'elastic_pool'
+        ? null
+        : templateItem.assigned_agent_id,
+      distributionMode === 'elastic_pool' ? 0 : 1,
+      distributionMode === 'elastic_pool' ? null : schedulerNow.toISOString(),
       JSON.stringify({
         keyword: templateItem.keyword,
         ordinal: Number(templateItem.ordinal),
@@ -505,6 +548,53 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       }),
     ]);
     runItems.push(item);
+  }
+
+  if (distributionMode === 'elastic_pool') {
+    const aggregate = aggregateParentTaskItems(runItems);
+    await appendEvent(tx, {
+      tenantId: schedule.tenant_id,
+      taskId: runTaskId,
+      eventType: 'orchestration_schedule_queue_created',
+      status: aggregate.status,
+      message: '无人值守计划本轮工作项已进入弹性节点池',
+      payload: {
+        scheduleId: schedule.id,
+        scheduledFor: scheduledFor.toISOString(),
+        eligibleAgentIds: agentIds,
+        itemCount: runItems.length,
+      },
+    });
+    const advanced = await advanceSchedule(tx, schedule, {
+      after: scheduledFor,
+      lastRunStatus: aggregate.status,
+      lastRunTaskId: runTaskId,
+      incrementRunCount: true,
+      message: '无人值守计划已生成本轮云端队列，等待空闲节点领取',
+    });
+    await appendEvent(tx, {
+      tenantId: schedule.tenant_id,
+      taskId: schedule.template_task_id,
+      eventType: 'orchestration_schedule_run_materialized',
+      status: advanced.scheduleStatus,
+      message: '无人值守计划已生成一轮弹性节点池任务',
+      payload: {
+        runTaskId,
+        scheduledFor: scheduledFor.toISOString(),
+        nextRunAt: advanced.nextRunAt,
+        executionCount: 0,
+        itemCount: runItems.length,
+        distributionMode,
+      },
+    });
+    return {
+      kind: 'created',
+      scheduleId: schedule.id,
+      runTaskId,
+      executionCount: 0,
+      itemCount: runItems.length,
+      ...advanced,
+    };
   }
 
   const itemsByAgent = new Map();

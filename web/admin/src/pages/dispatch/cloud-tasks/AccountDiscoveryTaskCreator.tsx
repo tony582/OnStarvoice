@@ -118,6 +118,11 @@ export function AccountDiscoveryTaskCreator({
       agentId: agent.id,
       subscriptionIds: dispatchableIds,
       subjectType,
+      distributionMode: 'fixed_batch' as const,
+      recoveryPolicy: {
+        allowIdleAgentHandoff: false,
+        platformSafetyMode: 'manual_confirmed',
+      },
     }
     const fingerprint = JSON.stringify(taskInput)
     let submission = pendingSubmission.current

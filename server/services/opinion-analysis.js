@@ -9,6 +9,7 @@ import { queryOne, queryAll, execute, getSetting } from '../db/init.js';
 import { getReportStats, RELEVANT_RECORD_SQL, RISK_LEVEL_LABEL, buildInsightSamplePool } from './report-generator.js';
 import { ALERT_REASON_PREFIXES } from './alert-engine.js';
 import { getBrandContext, callLLMWithPrompt } from './ai-labeler.js';
+import { getCommentRiskAttentionPolicy } from './comment-risk-attention.js';
 
 const RISK_LEVELS = ['critical', 'warning', 'attention', 'watch']; // 越靠前越严重
 const PLATFORM_TEXT = { xiaohongshu: '小红书', weibo: '微博', douyin: '抖音', unknown: '未知平台' };
@@ -94,7 +95,8 @@ export function withRecordAnalysisSingleFlight(key, runner) {
 export function computeRecordAnalysisInputHashFromState(state = {}) {
   const record = state.record || {};
   const observation = state.latestObservation || {};
-  const negativeComments = state.negativeComments || {};
+  const commentRiskAttentionEnabled = state.commentRiskAttentionEnabled !== false;
+  const negativeComments = commentRiskAttentionEnabled ? (state.negativeComments || {}) : {};
   const ocr = state.ocr || {};
   const alertFingerprints = [...new Set((Array.isArray(state.alerts) ? state.alerts : [])
     .map(alert => [
@@ -114,8 +116,10 @@ export function computeRecordAnalysisInputHashFromState(state = {}) {
       comments: num(record.comments_count),
       collects: num(record.collects),
       shares: num(record.shares),
-      negativeComments: num(record.negative_comment_count),
-      latestNegativeCommentAt: normalizedTimestamp(record.latest_negative_comment_at),
+      negativeComments: commentRiskAttentionEnabled ? num(record.negative_comment_count) : 0,
+      latestNegativeCommentAt: commentRiskAttentionEnabled
+        ? normalizedTimestamp(record.latest_negative_comment_at)
+        : '',
       transcript: String(record.transcript || ''),
       transcriptAnalysis: record.transcript_analysis || null,
     },
@@ -140,8 +144,22 @@ export function computeRecordAnalysisInputHashFromState(state = {}) {
       count: num(ocr.count),
       latestUpdatedAt: normalizedTimestamp(ocr.latest_updated_at),
     },
+    policy: { commentRiskAttentionEnabled },
   };
   return crypto.createHash('sha1').update(JSON.stringify(basis)).digest('hex');
+}
+
+export function applyRecordCommentRiskAttentionPolicy({ record = {}, comments = [] } = {}, enabled = true) {
+  if (enabled) return { record, comments, commentRiskAttentionEnabled: true };
+  return {
+    record: {
+      ...record,
+      negative_comment_count: 0,
+      latest_negative_comment_at: null,
+    },
+    comments: [],
+    commentRiskAttentionEnabled: false,
+  };
 }
 
 function parseKeywordsColumn(value) {
@@ -238,6 +256,7 @@ export async function collectTopicStats(tenantId, periodStart, periodEnd, keywor
     negativeCount: sentimentCounts.negative,
     negativeRate: pctOf(sentimentCounts.negative, stats.total),
     negativeComments: num(stats.commentStats?.negative_comments),
+    commentRiskAttentionEnabled: stats.commentRiskAttentionEnabled !== false,
     alertCounts,
     lowFansHighSpreadCount: num(lowFansRow?.n),
     scopedIssueCount: num(issueRow?.n),
@@ -252,13 +271,16 @@ export async function collectTopicStats(tenantId, periodStart, periodEnd, keywor
  * issue 把专题定级抬到 critical(口径污染)。调打分时与 classifyRisk 两边对照。
  */
 export function classifyTopicRisk(metrics) {
+  const negativeComments = metrics.commentRiskAttentionEnabled === false
+    ? 0
+    : num(metrics.negativeComments);
   let score = 0;
   if (num(metrics.alertCounts?.critical) > 0) score += 4;
   if (num(metrics.lowFansHighSpreadCount) > 0) score += 2;
   if (metrics.negativeRate >= 30 && metrics.negativeCount >= 3) score += 3;
   else if (metrics.negativeRate >= 15 && metrics.negativeCount >= 2) score += 2;
-  if (metrics.negativeComments >= 10) score += 2;
-  else if (metrics.negativeComments > 0) score += 1;
+  if (negativeComments >= 10) score += 2;
+  else if (negativeComments > 0) score += 1;
   if (num(metrics.alertCounts?.warning) > 0) score += 1;
   if (metrics.cliffPct >= 70 && metrics.negativeCount > 0) score += 1; // 负面被单一爆款主导,易引导易反转
 
@@ -321,7 +343,9 @@ export function buildTopicFallback({ stats, metrics, samples, sampleMap, keyword
     share: pctOf(metrics.sentimentCounts?.[key], metrics.total),
   }));
 
-  const representativeVoices = (stats.negativeComments || []).slice(0, 5).map(row => ({
+  const representativeVoices = (metrics.commentRiskAttentionEnabled === false
+    ? []
+    : (stats.negativeComments || [])).slice(0, 5).map(row => ({
     content: compact(row.content, 100),
     likeCount: num(row.like_count),
     recordId: row.record_id,
@@ -352,7 +376,7 @@ export function buildTopicFallback({ stats, metrics, samples, sampleMap, keyword
   if (num(metrics.alertCounts?.critical) > 0) {
     actions.push(`优先复核 ${metrics.alertCounts.critical} 条重点预警内容,明确处置负责人与对外口径。`);
   }
-  if (metrics.negativeComments > 0) {
+  if (metrics.commentRiskAttentionEnabled !== false && metrics.negativeComments > 0) {
     actions.push(`核查 ${metrics.negativeComments} 条负面评论,确认是否需要官方回复或转为问题单。`);
   }
   if (metrics.scopedIssueCount > 0) {
@@ -369,6 +393,7 @@ export function buildTopicFallback({ stats, metrics, samples, sampleMap, keyword
       sampleCount: samples.length,
       insufficientSamples: samples.length < 3,
       generatedAt: new Date().toISOString(),
+      commentRiskAttentionEnabled: metrics.commentRiskAttentionEnabled !== false,
     },
     ruleMetrics: metrics,
     riskAssessment: {
@@ -376,7 +401,7 @@ export function buildTopicFallback({ stats, metrics, samples, sampleMap, keyword
       ruleRiskLevel,
       riskLevelLabel: RISK_LEVEL_LABEL[ruleRiskLevel],
       riskSummary: `圈定范围内共 ${metrics.total} 条内容,负面 ${metrics.negativeCount} 条(负面率 ${metrics.negativeRate}%),` +
-        `周期内预警 ${alertTotal} 条,负面评论 ${metrics.negativeComments} 条。`,
+        `周期内预警 ${alertTotal} 条${metrics.commentRiskAttentionEnabled === false ? '' : `,负面评论 ${metrics.negativeComments} 条`}。`,
       trendJudgment: judgeTrend(stats),
       keyDrivers,
       watchPoints,
@@ -427,7 +452,7 @@ function pctClamp(value) {
 
 function sampleLines(samples) {
   return samples
-    .map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}负评${x.negComments} | ${x.title} | ${x.summary}`)
+    .map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}${Object.hasOwn(x, 'negComments') ? `负评${x.negComments}` : ''} | ${x.title} | ${x.summary}`)
     .join('\n');
 }
 
@@ -452,8 +477,8 @@ async function enhanceRiskAndOpinion(tenantId, { metrics, samples, fallback }) {
     "viewpointClusters": [{"viewpoint":"观点","stance":"negative|mixed|neutral|positive","share":0到100的数字,"summary":"该观点在讲什么/集中在哪","sampleIds":["..."]}]
   }
 }
-要求:riskLevel 只能取四级枚举 ${RISK_LEVEL_ENUM_TEXT} 之一;sampleIds 只能引用我给的样本 id,不得编造;聚类要跨样本归纳而非逐条复述;基于事实不臆造;空字段用空数组/空串;简洁中文。`;
-    const userMessage = `【话题概览】圈定 ${metrics.total} 条内容,负面 ${metrics.negativeCount} 条(负面率 ${metrics.negativeRate}%),负面评论 ${metrics.negativeComments} 条;周期内预警 critical ${num(metrics.alertCounts?.critical)} 条/warning ${num(metrics.alertCounts?.warning)} 条,低粉高扩散 ${metrics.lowFansHighSpreadCount} 条。
+要求:riskLevel 只能取四级枚举 ${RISK_LEVEL_ENUM_TEXT} 之一;sampleIds 只能引用我给的样本 id,不得编造;聚类要跨样本归纳而非逐条复述;基于事实不臆造;空字段用空数组/空串;简洁中文。${metrics.commentRiskAttentionEnabled === false ? '当前租户不将评论纳入舆情风险，禁止把评论作为定级、研判或关注点的依据。' : ''}`;
+    const userMessage = `【话题概览】圈定 ${metrics.total} 条内容,负面 ${metrics.negativeCount} 条(负面率 ${metrics.negativeRate}%)${metrics.commentRiskAttentionEnabled === false ? '' : `,负面评论 ${metrics.negativeComments} 条`};周期内预警 critical ${num(metrics.alertCounts?.critical)} 条/warning ${num(metrics.alertCounts?.warning)} 条,低粉高扩散 ${metrics.lowFansHighSpreadCount} 条。
 【热度结构】Top1 内容占 Top5 互动的 ${metrics.cliffPct}%(越高=越被少数爆款主导/易引导易反转,越低=普遍发酵/更接近真实民意)。
 【规则走势】${fallback.riskAssessment.trendJudgment}
 【代表样本】(${samples.length} 条)
@@ -501,7 +526,7 @@ async function enhanceSpreadAndResponse(tenantId, { metrics, fallback, riskOpini
     "contentIdeas": [{"title":"承接性内容选题","angle":"切入角度"}]
   }
 }
-要求:话术必须贴合上述业务语境,克制、基于事实,不承诺无法兑现的事,不编造数据;简洁中文;空字段用空数组/空串。`;
+要求:话术必须贴合上述业务语境,克制、基于事实,不承诺无法兑现的事,不编造数据;简洁中文;空字段用空数组/空串。${metrics.commentRiskAttentionEnabled === false ? '当前租户不将评论纳入舆情风险，应对建议不得使用评论风险或评论样本作为依据。' : ''}`;
     const userMessage = `【风险结论】等级 ${riskLevel}(${RISK_LEVEL_LABEL[riskLevel]});${riskSummary}
 【主要观点】
 ${clusterLines.join('\n') || '无'}
@@ -717,7 +742,15 @@ const RECORD_STANCES = ['positive', 'neutral', 'negative'];
  * 负面优先评论样本(≤50)+命中预警,覆盖 overview 文字层/contentInsights/commentInsights/回应话术。
  * 回应话术是客户可见交付物,口径依据只来自系统提示词注入的品牌业务语境。失败/未配 key 返回 null 回落规则。
  */
-async function enhanceRecordAnalysis(tenantId, { record, comments, ocrText, transcript, transcriptAnalysis, alerts }) {
+async function enhanceRecordAnalysis(tenantId, {
+  record,
+  comments,
+  ocrText,
+  transcript,
+  transcriptAnalysis,
+  alerts,
+  commentRiskAttentionEnabled = true,
+}) {
   try {
     const brand = await getBrandContext(tenantId);
     const systemPrompt = `你是「${brand.brandName}」的资深舆情分析师。业务语境:${brand.businessContext}
@@ -741,11 +774,11 @@ async function enhanceRecordAnalysis(tenantId, { record, comments, ocrText, tran
     "escalation": "需要升级或跨部门协同的事项(无则空串)"
   }
 }
-要求:stance 只能取三值枚举;评论观点要跨评论归纳而非逐条复述;话术必须贴合上述业务语境,不编造数据;简洁中文;空字段用空数组/空串。`;
+要求:stance 只能取三值枚举;评论观点要跨评论归纳而非逐条复述;话术必须贴合上述业务语境,不编造数据;简洁中文;空字段用空数组/空串。${commentRiskAttentionEnabled ? '' : '当前租户不将评论纳入舆情风险，commentInsights 必须为空，其他结论和建议不得使用评论作为依据。'}`;
     const parts = [
       `【标题】${record.title || ''}`,
       `【正文】${compact(record.content, 2000) || '(无正文)'}`,
-      `【互动】赞${num(record.likes)} 评${num(record.comments_count)} 藏${num(record.collects)} 转${num(record.shares)};负面评论 ${num(record.negative_comment_count)} 条`,
+      `【互动】赞${num(record.likes)} 评${num(record.comments_count)} 藏${num(record.collects)} 转${num(record.shares)}${commentRiskAttentionEnabled ? `;负面评论 ${num(record.negative_comment_count)} 条` : ''}`,
     ];
     if (transcript) parts.push(`【视频口播逐字稿】\n${transcript}`);
     if (transcriptAnalysis && typeof transcriptAnalysis === 'object') {
@@ -754,11 +787,11 @@ async function enhanceRecordAnalysis(tenantId, { record, comments, ocrText, tran
     }
     if (ocrText) parts.push(`【图文提取文字】${ocrText}`);
     if (alerts.length) parts.push(`【已命中预警】${alerts.map(a => cleanText(a.reason, 120)).filter(Boolean).join(';') || '无'}`);
-    if (comments.length) {
+    if (commentRiskAttentionEnabled && comments.length) {
       parts.push(`【评论摘录】(${comments.length} 条,负面优先)\n` + comments
         .map(c => `- ${c.is_negative ? `负面/${c.risk_level || 'low'}` : (c.sentiment || '中性')} | 赞${num(c.like_count)} | ${compact(c.content, 100)}`)
         .join('\n'));
-    } else {
+    } else if (commentRiskAttentionEnabled) {
       parts.push('【评论摘录】无评论数据');
     }
     const result = await callLLMWithPrompt(tenantId, systemPrompt, parts.join('\n'));
@@ -774,13 +807,14 @@ async function enhanceRecordAnalysis(tenantId, { record, comments, ocrText, tran
  * 兜底/降级结果同样落缓存 —— 抽屉重开有内容;POST 读到 rule_fallback 缓存会隐式再试一次(防一次超时永久钉死)。
  */
 export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = null }) {
-  const record = await queryOne(
+  const commentRiskAttentionEnabled = (await getCommentRiskAttentionPolicy(tenantId)).enabled;
+  const rawRecord = await queryOne(
     `SELECT id, title, content, sentiment, ai_summary, likes, comments_count, collects, shares,
             negative_comment_count, latest_negative_comment_at, transcript, transcript_analysis
      FROM records WHERE id = $1 AND tenant_id = $2`,
     [recordId, tenantId]
   );
-  if (!record) return null;
+  if (!rawRecord) return null;
   // 在读取剖析证据和调用模型前固定输入版本。之后若证据继续变化，缓存会自然变为 stale，
   // 避免把“旧内容分析”错误写成“最新输入”的有效缓存。
   const analysisInputHash = inputHash || await computeRecordInputHash(tenantId, recordId);
@@ -790,7 +824,7 @@ export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = nul
     [tenantId, recordId]
   );
   // 评论样本:负面优先 + 高风险 + 高赞 + 最新,排除官方回复,≤50 条(与报告线负评排序同口径)
-  const comments = await queryAll(
+  const rawComments = commentRiskAttentionEnabled ? await queryAll(
     `SELECT content, like_count, is_negative, risk_level, sentiment
      FROM record_comments
      WHERE tenant_id = $1 AND record_id = $2 AND is_official = false AND content <> ''
@@ -799,6 +833,10 @@ export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = nul
        like_count DESC, last_seen_at DESC
      LIMIT 50`,
     [tenantId, recordId]
+  ) : [];
+  const { record, comments } = applyRecordCommentRiskAttentionPolicy(
+    { record: rawRecord, comments: rawComments },
+    commentRiskAttentionEnabled,
   );
   // OCR 只消费 done 行的可见文字,拼到 1500 字上限(不触发新的图片识别)
   const ocrRows = await queryAll(
@@ -835,7 +873,12 @@ export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = nul
     summary: '',
   }));
   const payload = {
-    meta: { promptVersion: RECORD_ANALYSIS_PROMPT_VERSION, generatedAt: new Date().toISOString(), evidenceSources },
+    meta: {
+      promptVersion: RECORD_ANALYSIS_PROMPT_VERSION,
+      generatedAt: new Date().toISOString(),
+      evidenceSources,
+      commentRiskAttentionEnabled,
+    },
     overview: {
       stance: RECORD_STANCES.includes(record.sentiment) ? record.sentiment : 'neutral',
       riskLevel,
@@ -869,7 +912,15 @@ export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = nul
   // LLM 覆盖文字层(事务外),失败则整体保留规则兜底。品牌语境二次校验同 runTopicAnalysis:
   // 无配置(路由预检后被清空的竞态)直接跳过 LLM,避免 getBrandContext 回落硬编码默认品牌泄漏错口径。
   const llm = (await hasBrandContextConfigured(tenantId))
-    ? await enhanceRecordAnalysis(tenantId, { record, comments, ocrText, transcript, transcriptAnalysis: ta, alerts })
+    ? await enhanceRecordAnalysis(tenantId, {
+      record,
+      comments,
+      ocrText,
+      transcript,
+      transcriptAnalysis: ta,
+      alerts,
+      commentRiskAttentionEnabled,
+    })
     : null;
   let analysisSource = 'rule_fallback';
   if (llm) {
@@ -890,7 +941,7 @@ export async function analyzeOpinionRecord({ tenantId, recordId, inputHash = nul
       if (issues.length) payload.contentInsights.issues = issues;
     }
     const cm = llm.commentInsights;
-    if (cm && typeof cm === 'object') {
+    if (commentRiskAttentionEnabled && cm && typeof cm === 'object') {
       const summary = cleanText(cm.summary, 400);
       if (summary) payload.commentInsights.summary = summary;
       const points = (Array.isArray(cm.points) ? cm.points : [])
@@ -940,7 +991,8 @@ export async function computeRecordInputHash(tenantId, recordOrId) {
   const recordId = typeof recordOrId === 'object' ? recordOrId?.id : recordOrId;
   if (!recordId) return '';
 
-  const [record, latestObservation, alerts, negativeComments, ocr] = await Promise.all([
+  const [commentRiskPolicy, record, latestObservation, alerts, negativeComments, ocr] = await Promise.all([
+    getCommentRiskAttentionPolicy(tenantId),
     queryOne(
       `SELECT id, title, content, sentiment, ai_summary, likes, comments_count, collects, shares,
               negative_comment_count, latest_negative_comment_at, transcript, transcript_analysis
@@ -985,6 +1037,7 @@ export async function computeRecordInputHash(tenantId, recordOrId) {
   if (!record) return '';
 
   return computeRecordAnalysisInputHashFromState({
+    commentRiskAttentionEnabled: commentRiskPolicy.enabled,
     record,
     latestObservation,
     alerts,

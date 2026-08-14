@@ -432,6 +432,8 @@ router.post(
             requestedByUserId: req.user?.id || null,
             requestedByName: req.actorName,
             actorType: 'user',
+            automaticRetryDisabled:
+              req.body?.recoveryPolicy?.allowIdleAgentHandoff === false,
           }),
           existing: false,
         };

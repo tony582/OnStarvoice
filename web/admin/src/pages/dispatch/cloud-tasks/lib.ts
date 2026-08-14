@@ -157,7 +157,8 @@ export type TaskView = 'active' | 'attention' | 'plans' | 'history'
 export type ComposerIntent = {
   agentId?: string
   mode?: 'one_time' | 'unattended_plan'
-  taskType?: 'comment_patrol' | 'creator_patrol'
+  taskType?: 'comment_patrol' | 'creator_patrol' | 'negative_patrol' | 'watched_content'
+  recordIds?: string[]
   subscriptionId?: string
   officialAccountId?: string
   editExisting?: boolean
@@ -168,6 +169,7 @@ export type CloudCreateTaskType =
   | 'unattended_plan'
   | 'creator_patrol'
   | 'negative_patrol'
+  | 'watched_content'
   | 'comment_patrol'
 
 export type Overview = {
@@ -178,9 +180,29 @@ export type Overview = {
     onlineAgents: number
     runningTasks: number
     attentionTasks: number
+    historyTasks?: number
     aiActive?: number
     aiQueued?: number
     aiConcurrencyLimit?: number
+  }
+}
+
+export type TaskHistoryResponse = {
+  ok: true
+  tasks: CloudTask[]
+  pagination: {
+    page: number
+    pageSize: number
+    total: number
+    totalPages: number
+  }
+  filters?: {
+    q?: string
+    platform?: string
+    status?: string
+    from?: string
+    to?: string
+    days?: number
   }
 }
 
@@ -188,7 +210,7 @@ export const PLATFORM_LABELS: Record<string, string> = {
   xiaohongshu: '小红书',
   douyin: '抖音',
   weibo: '微博',
-  mixed: '多平台',
+  mixed: '小红书＋抖音',
   unknown: '未识别',
 }
 
@@ -698,6 +720,7 @@ export function canResume(task: CloudTask) {
 const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
   'unattended_keyword_capture',
   'negative_post_patrol',
+  'watched_content_patrol',
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
@@ -778,7 +801,7 @@ export function agentTaskTypeBlockReason(
 ) {
   const genericReason = agentAssignmentBlockReason(agent, mode)
   if (genericReason) return genericReason
-  if (['creator_patrol', 'negative_patrol', 'comment_patrol'].includes(taskType)
+  if (['creator_patrol', 'negative_patrol', 'watched_content', 'comment_patrol'].includes(taskType)
     && agent.capabilities?.remoteTargetedPostCaptureV1 !== true) {
     return '客户端扩展版本过低，尚不支持定向页面任务'
   }
@@ -787,6 +810,9 @@ export function agentTaskTypeBlockReason(
   }
   if (taskType === 'negative_patrol' && agent.capabilities?.negativePostPatrol !== true) {
     return '客户端扩展版本过低，尚不支持负面帖子巡查'
+  }
+  if (taskType === 'watched_content' && agent.capabilities?.watchedContentPatrol !== true) {
+    return '客户端扩展版本过低，尚不支持关注内容巡查'
   }
   if (taskType === 'comment_patrol'
     && (agent.capabilities?.officialAccountCommentPatrolProfileV1 !== true

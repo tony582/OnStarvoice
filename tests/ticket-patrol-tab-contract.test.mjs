@@ -9,7 +9,9 @@ test('tickets with a linked content record reuse the live patrol timeline withou
   const ticketDrawer = source('web/admin/src/components/shared/TicketDrawer.tsx');
 
   assert.match(recordDrawer, /export function RecordPatrolPanel/);
-  assert.match(recordDrawer, /negative-patrol\/posts\/\$\{record\.id\}\/timeline/);
+  assert.match(recordDrawer, /content-patrol\/posts\/\$\{record\.id\}\/timeline/);
+  assert.match(recordDrawer, /汇总负面巡查与关注内容巡查/);
+  assert.match(recordDrawer, /run\.workflowLabel/);
   assert.match(recordDrawer, /runs\.length === 0/);
   assert.match(recordDrawer, /record\.sentiment !== 'negative'/);
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Archive, CheckCircle2, ClipboardList,
-  History, ListChecks, Loader2, Plus, RefreshCw,
+  ListChecks, Loader2, Plus, RefreshCw,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
@@ -14,6 +14,7 @@ import {
 import { AgentRail } from './cloud-tasks/AgentRail'
 import { CreateTaskDrawer } from './cloud-tasks/CreateTaskDrawer'
 import { PlansView } from './cloud-tasks/PlansView'
+import { HistoryView } from './cloud-tasks/HistoryView'
 import { TaskCard } from './cloud-tasks/TaskCard'
 import type {
   CloudAgent,
@@ -22,7 +23,7 @@ import type {
   Overview,
   TaskView,
 } from './cloud-tasks/lib'
-import type { OrchestrationLaunchIntent } from './cloud-tasks/types'
+import type { OrchestrationDetailResponse, OrchestrationLaunchIntent } from './cloud-tasks/types'
 import {
   ACTIVE_TASK_STATUSES,
   canDismissAttention,
@@ -38,9 +39,19 @@ function isScheduleTemplateTask(task: CloudTask) {
   return task.task_type === 'capture_orchestration' && task.metadata?.orchestrationTemplate === true
 }
 
-export function DispatchPage() {
+function MobileDispatchMetric({ label, value, tone = 'text-foreground' }: { label: string; value: string | number; tone?: string }) {
+  return (
+    <div className="px-2">
+      <div className={`text-[20px] font-black leading-none tabular-nums ${tone}`}>{value}</div>
+      <div className="mt-1.5 text-[10px] font-semibold text-muted-foreground">{label}</div>
+    </div>
+  )
+}
+
+export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'mobile' } = {}) {
   const { canWrite } = useAuth()
   const { params } = useNav()
+  const mobile = surface === 'mobile'
   const [overview, setOverview] = useState<Overview | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -49,10 +60,12 @@ export function DispatchPage() {
   const [actionError, setActionError] = useState('')
   const [actionTaskId, setActionTaskId] = useState('')
   const [planActionAgentId, setPlanActionAgentId] = useState('')
+  const [templateActionId, setTemplateActionId] = useState('')
   const [agentActionId, setAgentActionId] = useState('')
   const [taskView, setTaskView] = useState<TaskView>(
     () => params?.view === 'attention' ? 'attention' : 'active',
   )
+  const [mobileWorkspace, setMobileWorkspace] = useState<'tasks' | 'agents'>('tasks')
   const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(
     () => params?.create === 'comment_patrol'
       ? {
@@ -61,9 +74,21 @@ export function DispatchPage() {
         }
       : params?.create === 'creator_patrol'
         ? { taskType: 'creator_patrol', subscriptionId: String(params?.subscriptionId || '') || undefined }
+        : params?.create === 'negative_patrol'
+          ? {
+              taskType: 'negative_patrol',
+              recordIds: String(params?.recordIds || '').split(',').map(value => value.trim()).filter(Boolean).slice(0, 100),
+            }
+        : params?.create === 'watched_content'
+          ? {
+              taskType: 'watched_content',
+              recordIds: String(params?.recordIds || '').split(',').map(value => value.trim()).filter(Boolean).slice(0, 100),
+            }
         : null,
   )
   const [orchestrationLaunchIntent, setOrchestrationLaunchIntent] = useState<OrchestrationLaunchIntent | null>(null)
+  const [editingOrchestrationPlan, setEditingOrchestrationPlan] = useState<OrchestrationDetailResponse | null>(null)
+  const [copyingOrchestrationPlan, setCopyingOrchestrationPlan] = useState<OrchestrationDetailResponse | null>(null)
   const [selectedOrchestrationId, setSelectedOrchestrationId] = useState<string | null>(
     () => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(
       String(params?.orchestrationId || ''),
@@ -72,6 +97,8 @@ export function DispatchPage() {
       : null,
   )
   const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
+  const [historyTotal, setHistoryTotal] = useState<number | null>(null)
   const loadGeneration = useRef(0)
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
 
@@ -82,6 +109,15 @@ export function DispatchPage() {
   const closeOrchestrationDetail = useCallback(() => {
     setSelectedOrchestrationId(null)
   }, [])
+
+  const focusMobileTaskView = useCallback((view: TaskView) => {
+    if (!mobile) return
+    setMobileWorkspace('tasks')
+    setTaskView(view)
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>('.mobile-shell-main')?.scrollTo({ top: 0 })
+    })
+  }, [mobile])
 
   const load = useCallback(async (quiet = false) => {
     const generation = ++loadGeneration.current
@@ -187,7 +223,6 @@ export function DispatchPage() {
       const status = task.effective_status || task.status
       if (taskView === 'active') return ACTIVE_TASK_STATUSES.has(status)
       if (taskView === 'attention') return isAttentionTask(task)
-      if (taskView === 'history') return !ACTIVE_TASK_STATUSES.has(status) && !isAttentionTask(task)
       return false
     }).sort((left, right) => {
       const leftTime = new Date(left.created_at || left.updated_at || left.finished_at || 0).getTime()
@@ -204,8 +239,9 @@ export function DispatchPage() {
       else if (isAttentionTask(task)) counts.attention += 1
       else counts.history += 1
     }
+    counts.history = historyTotal ?? Number(overview?.summary.historyTasks || counts.history)
     return counts
-  }, [queueTasks])
+  }, [historyTotal, overview?.summary.historyTasks, queueTasks])
 
   const configuredPlanAgentCount = useMemo(
     () => operationalAgents.filter(agent => hasConfiguredUnattendedPlan(agent.unattended_plan)).length,
@@ -223,6 +259,7 @@ export function DispatchPage() {
     () => queueTasks.filter(canDismissAttention).length,
     [queueTasks],
   )
+  const onlineAgentCount = operationalAgents.filter(agent => agent.online).length
 
   const resume = async (task: CloudTask) => {
     setActionTaskId(task.id)
@@ -339,6 +376,59 @@ export function DispatchPage() {
     }
   }
 
+  const archiveTemplate = async (task: CloudTask) => {
+    if (!window.confirm(
+      `确定删除计划“${task.title || '未命名计划'}”吗？计划会进入归档并停止后续排期；正在执行的批次、历史任务和采集结果都会保留。`,
+    )) return
+    setTemplateActionId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/orchestrations/${task.id}/schedule/archive`,
+        {},
+      )
+      setFeedback(result.message || '计划已移入归档')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '归档计划失败')
+    } finally {
+      setTemplateActionId('')
+    }
+  }
+
+  const restoreTemplate = async (task: CloudTask) => {
+    setTemplateActionId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/orchestrations/${task.id}/schedule/restore`,
+        {},
+      )
+      setFeedback(result.message || '计划已恢复为暂停状态')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '恢复计划失败')
+    } finally {
+      setTemplateActionId('')
+    }
+  }
+
+  const copyTemplate = async (task: CloudTask) => {
+    setTemplateActionId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const detail = await api.get<OrchestrationDetailResponse>(`/capture-cloud/orchestrations/${task.id}`)
+      setCopyingOrchestrationPlan(detail)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '读取计划配置失败')
+    } finally {
+      setTemplateActionId('')
+    }
+  }
+
   const deleteAgent = async (agent: CloudAgent) => {
     setAgentActionId(agent.id)
     setFeedback('')
@@ -408,11 +498,33 @@ export function DispatchPage() {
       {actionError && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{actionError}</div>}
       {feedback && <div role="status" aria-live="polite" className="rounded-xl border border-primary/20 bg-primary/8 px-4 py-3 text-sm text-primary">{feedback}</div>}
 
-      <div className="grid items-stretch gap-5 xl:h-full xl:min-h-[36rem] xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)] xl:gap-0 xl:overflow-hidden">
-        <section className="flex min-h-0 min-w-0 flex-col xl:py-5 xl:pr-5">
+      {mobile && (
+        <section className="overflow-hidden rounded-2xl border border-border/70 bg-card" aria-label="调度中心概览">
+          <div className="grid grid-cols-3 divide-x divide-border/70 px-1 py-3 text-center">
+            <MobileDispatchMetric label="执行中" value={taskCounts.active} tone="text-primary" />
+            <MobileDispatchMetric label="需处理" value={taskCounts.attention} tone={taskCounts.attention > 0 ? 'text-status-red' : undefined} />
+            <MobileDispatchMetric label="在线 Agent" value={`${onlineAgentCount}/${operationalAgents.length}`} tone={onlineAgentCount > 0 ? 'text-status-green' : undefined} />
+          </div>
+          <div className="grid grid-cols-2 border-t border-border/70 bg-muted/30 p-1" role="tablist" aria-label="调度工作区">
+            {([
+              { value: 'tasks' as const, label: '任务' },
+              { value: 'agents' as const, label: '设备' },
+            ]).map(item => (
+              <button key={item.value} type="button" role="tab" aria-selected={mobileWorkspace === item.value}
+                onClick={() => setMobileWorkspace(item.value)}
+                className={`min-h-11 rounded-xl text-xs font-bold transition-colors ${mobileWorkspace === item.value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground'}`}>
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <div className={mobile ? 'min-h-0' : 'grid items-stretch gap-5 xl:h-full xl:min-h-[36rem] xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)] xl:gap-0 xl:overflow-hidden'}>
+        <section className={`${mobile && mobileWorkspace !== 'tasks' ? 'hidden ' : ''}flex min-h-0 min-w-0 flex-col ${mobile ? '' : 'xl:py-5 xl:pr-5'}`}>
           <div className="mb-3 shrink-0 space-y-3">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div className="min-w-0">
+              <div className={mobile ? 'hidden' : 'min-w-0'}>
                 <div className="flex items-center gap-2"><ListChecks className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">任务队列</h3></div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">{taskView === 'plans' ? '集中管理多 Agent 编排模板与各设备的无人值守计划' : '按创建时间倒序，新任务在最前'}</p>
                 {Number(overview?.summary.aiConcurrencyLimit || 0) > 0 && (
@@ -422,11 +534,11 @@ export function DispatchPage() {
                   </p>
                 )}
               </div>
-              <div className="flex shrink-0 items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing} className="min-h-10">
+              <div className={`flex shrink-0 items-center gap-2 ${mobile ? 'w-full justify-end' : ''}`}>
+                <Button variant="outline" size="sm" onClick={() => { void load(true); if (taskView === 'history') setHistoryRefreshKey(value => value + 1) }} disabled={refreshing} className={mobile ? 'min-h-11' : 'min-h-10'}>
                   <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
                 </Button>
-              <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className="min-h-10 px-4" aria-label="新建任务">
+              <Button size="sm" onClick={() => setComposerIntent({})} disabled={!canWrite()} className={`${mobile ? 'min-h-11' : 'min-h-10'} px-4`} aria-label="新建任务">
                 <Plus className="h-4 w-4" /> 新建任务
               </Button>
             </div>
@@ -439,7 +551,7 @@ export function DispatchPage() {
                 { value: 'history' as const, label: '历史', count: taskCounts.history },
               ]).map(item => (
                 <button key={item.value} type="button" role="tab" aria-selected={taskView === item.value} onClick={() => setTaskView(item.value)}
-                  className={`min-h-9 shrink-0 rounded-lg px-3 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${taskView === item.value ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
+                  className={`${mobile ? 'min-h-11' : 'min-h-9'} shrink-0 rounded-lg px-3 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${taskView === item.value ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted hover:text-foreground'}`}>
                   {item.label} <span className="ml-1 tabular-nums opacity-80">{item.count}</span>
                 </button>
               ))}
@@ -455,8 +567,25 @@ export function DispatchPage() {
                 onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
                 onEditPlan={agent => setComposerIntent({ agentId: agent.id, mode: 'unattended_plan', editExisting: true })}
                 onDeletePlan={agent => void deleteUnattendedPlan(agent)}
+                onArchiveTemplate={task => void archiveTemplate(task)}
+                onRestoreTemplate={task => void restoreTemplate(task)}
+                onCopyTemplate={task => void copyTemplate(task)}
+                templateActionId={templateActionId}
                 deletingAgentId={planActionAgentId}
                 pendingDeleteAgentIds={pendingPlanDeleteAgentIds}
+              />
+            ) : taskView === 'history' ? (
+              <HistoryView
+                surface={surface}
+                writable={canWrite()}
+                actionTaskId={actionTaskId}
+                refreshKey={historyRefreshKey}
+                onResume={resume}
+                onRetryOnIdleAgent={retryOnIdleAgent}
+                onStop={stop}
+                onDismissAttention={dismissAttention}
+                onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
+                onTotalChange={setHistoryTotal}
               />
             ) : (
               <>
@@ -472,7 +601,7 @@ export function DispatchPage() {
 
                 {visibleTasks.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-border bg-card px-5 py-12 text-center xl:flex xl:h-full xl:min-h-[22rem] xl:flex-col xl:justify-center">
-                    {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : taskView === 'history' ? <History className="mx-auto h-7 w-7 text-muted-foreground" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
+                    {taskView === 'attention' ? <CheckCircle2 className="mx-auto h-7 w-7 text-status-green" /> : <ClipboardList className="mx-auto h-7 w-7 text-primary" />}
                     <div className="mt-3 text-sm font-semibold">{taskView === 'active' ? '当前没有执行中或排队中的任务' : taskView === 'attention' ? '当前没有需要人工处理的任务' : '最近任务中还没有历史记录'}</div>
                     <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">{taskView === 'active' ? '新建任务后分配给 Agent；Agent 离线时任务会保留在云端队列，上线后自动领取。' : taskView === 'attention' ? '中断、失败和部分失败会集中出现在这里。' : '已完成、已停止和已跳过的任务会进入历史。'}</p>
                     {taskView === 'active' && canWrite() && (
@@ -484,7 +613,7 @@ export function DispatchPage() {
                 ) : (
                   <div className="space-y-3">
                     {visibleTasks.map(task => (
-                      <TaskCard key={task.id} task={task} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
+                      <TaskCard key={task.id} task={task} surface={surface} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
                         onRetryOnIdleAgent={retryOnIdleAgent}
                         onDismissAttention={dismissAttention}
                         onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
@@ -496,8 +625,9 @@ export function DispatchPage() {
           </div>
         </section>
 
-        <aside className="flex min-h-0 min-w-0 flex-col xl:border-l xl:border-border/70 xl:py-5 xl:pl-5">
+        <aside className={`${mobile && mobileWorkspace !== 'agents' ? 'hidden ' : ''}flex min-h-0 min-w-0 flex-col ${mobile ? '' : 'xl:border-l xl:border-border/70 xl:py-5 xl:pl-5'}`}>
           <AgentRail
+            surface={surface}
             agents={operationalAgents}
             tasks={overview?.tasks || []}
             writable={canWrite()}
@@ -524,8 +654,19 @@ export function DispatchPage() {
             setComposerIntent(null)
             setOrchestrationLaunchIntent(launchIntent)
           }}
-          onCreated={async () => {
-            setFeedback('任务已创建并分配给指定 Agent。')
+          onCreated={async createdTaskType => {
+            if (mobile) {
+              if (createdTaskType === 'unattended_plan' && composerIntent?.editExisting) {
+                setMobileWorkspace('agents')
+              } else {
+                focusMobileTaskView(createdTaskType === 'unattended_plan' ? 'plans' : 'active')
+              }
+            }
+            setFeedback(createdTaskType === 'watched_content'
+              ? '关注内容巡查已创建，内容将按平台由兼容 Agent 领取。'
+              : createdTaskType === 'negative_patrol'
+                ? '负面帖子巡查已创建，内容将按平台由兼容 Agent 领取。'
+                : '任务已创建并分配给指定 Agent。')
             await load(true)
           }} />
       )}
@@ -545,9 +686,55 @@ export function DispatchPage() {
             await load(true)
           }}
           onDispatched={async result => {
+            focusMobileTaskView(result.schedule ? 'plans' : 'active')
             setFeedback(result.schedule
               ? '多 Agent 无人值守计划已启用，将按云端时间生成每轮任务。'
               : `多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+        />
+      )}
+
+      {editingOrchestrationPlan && (
+        <OrchestrationComposerDrawer
+          open
+          writable={canWrite()}
+          agents={operationalAgents}
+          initialExecutionMode="unattended_plan"
+          lockExecutionMode
+          editingPlan={editingOrchestrationPlan}
+          onClose={() => {
+            const orchestrationId = editingOrchestrationPlan.orchestration.id
+            setEditingOrchestrationPlan(null)
+            setSelectedOrchestrationId(orchestrationId)
+          }}
+          onPlanUpdated={async result => {
+            setFeedback(result.message || '无人值守计划已保存，修改从下一次运行开始生效。')
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+        />
+      )}
+
+      {copyingOrchestrationPlan && (
+        <OrchestrationComposerDrawer
+          open
+          writable={canWrite()}
+          agents={operationalAgents}
+          initialExecutionMode="unattended_plan"
+          lockExecutionMode
+          copyingPlan={copyingOrchestrationPlan}
+          onClose={() => setCopyingOrchestrationPlan(null)}
+          onChanged={async () => {
+            setOrchestrationRefreshKey(value => value + 1)
+            await load(true)
+          }}
+          onDispatched={async result => {
+            focusMobileTaskView(result.schedule ? 'plans' : 'active')
+            setFeedback(result.schedule
+              ? '已从归档配置创建独立的新计划。'
+              : '已从归档配置创建新任务。')
             setOrchestrationRefreshKey(value => value + 1)
             await load(true)
           }}
@@ -568,6 +755,10 @@ export function DispatchPage() {
               writable={canWrite()}
               availableAgents={operationalAgents}
               onClose={closeOrchestrationDetail}
+              onEditPlan={plan => {
+                setEditingOrchestrationPlan(plan)
+                setSelectedOrchestrationId(null)
+              }}
               onChanged={async () => {
                 setOrchestrationRefreshKey(value => value + 1)
                 await load(true)

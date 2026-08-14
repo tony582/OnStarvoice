@@ -9,8 +9,10 @@ import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
+import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
 import {
   reconcileAutomaticCaptureRetries,
+  reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
 
@@ -64,6 +66,20 @@ async function runConfiguredReports() {
 }
 
 export function startCronJobs() {
+  cron.schedule('17 3 * * *', async () => {
+    try {
+      const result = await compactOldCaptureTaskTechnicalHistory();
+      if (result.rootCount > 0) {
+        console.log(
+          `[Cron] Capture task retention: ${result.rootCount} root task(s), ` +
+          `${result.deletedSnapshotCount} raw snapshot(s) compacted`,
+        );
+      }
+    } catch (err) {
+      console.error('[Cron] Capture task retention error:', err.message);
+    }
+  });
+
   cron.schedule('*/10 * * * *', async () => {
     console.log('[Cron] Running batch AI labeling...');
     try {
@@ -104,6 +120,12 @@ export function startCronJobs() {
       if (results.length > 0) {
         console.log(
           `[Cron] Multi-Agent schedules: ${created} run(s) created, ${skipped} occurrence(s) advanced`,
+        );
+      }
+      const elasticLeases = await reconcileElasticCaptureLeases(50);
+      if (elasticLeases.requeued > 0) {
+        console.log(
+          `[Cron] Elastic work queue: ${elasticLeases.requeued} stale item(s) requeued`,
         );
       }
       const recovery = await reconcileAutomaticCaptureRetries(10);

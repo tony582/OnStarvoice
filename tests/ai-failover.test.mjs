@@ -5,9 +5,11 @@ import test from 'node:test';
 import {fileURLToPath} from 'node:url';
 
 import {
+  activeActivePeerModel,
   classifyAiFailure,
   initialAiFailoverRoute,
   normalizeAiFailoverPolicy,
+  selectActiveActiveModel,
   transitionAiFailoverFailure,
   transitionAiFailoverProbe,
 } from '../server/services/ai-failover.js';
@@ -78,6 +80,31 @@ test('failover policy is opt-in, DeepSeek-only and requires distinct models', ()
   const sameModel = policy({llm_failover_backup_model: 'deepseek-v4-flash'});
   assert.equal(sameModel.enabled, false);
   assert.equal(sameModel.disabledReason, 'invalid_models');
+});
+
+test('active-active mode alternates both models and retries on its peer', () => {
+  const activePolicy = policy({llm_failover_mode: 'active_active'});
+  assert.equal(activePolicy.mode, 'active_active');
+  const config = {
+    model: activePolicy.primaryModel,
+    failover: {
+      enabled: true,
+      mode: activePolicy.mode,
+      primaryModel: activePolicy.primaryModel,
+      backupModel: activePolicy.backupModel,
+    },
+  };
+  assert.equal(selectActiveActiveModel(config, 0), 'deepseek-v4-flash');
+  assert.equal(selectActiveActiveModel(config, 1), 'deepseek-v4-pro');
+  assert.equal(selectActiveActiveModel(config, 2), 'deepseek-v4-flash');
+  assert.equal(
+    activeActivePeerModel(config, 'deepseek-v4-flash'),
+    'deepseek-v4-pro',
+  );
+  assert.equal(
+    activeActivePeerModel(config, 'deepseek-v4-pro'),
+    'deepseek-v4-flash',
+  );
 });
 
 test('enabling while the manually configured model is Pro preserves Pro first', () => {
@@ -296,6 +323,8 @@ test('integration keeps credentials out of failover state and preserves Extensio
   assert.match(service, /\$1::uuid::text/u);
   assert.doesNotMatch(service, /'tenant', \$1::text/u);
   assert.match(labeler, /runModelOperationWithFailover/u);
+  assert.match(labeler, /selectActiveActiveModel/u);
+  assert.match(labeler, /retrying current request on peer model/u);
   assert.match(labeler, /retrying current request on active backup/u);
   assert.match(labeler, /probeDeepSeekPrimaryModel/u);
   assert.match(serverIndex, /runAiFailoverRecoverySweep/u);

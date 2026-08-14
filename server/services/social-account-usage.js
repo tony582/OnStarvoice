@@ -30,6 +30,28 @@ function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
+const SAFETY_EVIDENCE_PATTERN =
+  /captcha|security.?verification|verification.?required|page.?challenge|security.?challenge|platform.?safety|safety.?block|risk.?control|forbidden|login.?required|auth(?:entication)?.?required|logged.?out|验证码|安全验证|安全限制|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|账号异常|账号限制/iu;
+
+function containsSafetyEvidence(value, depth = 0) {
+  if (depth > 4 || value == null) return false;
+  if (typeof value === 'string') return SAFETY_EVIDENCE_PATTERN.test(value);
+  if (typeof value === 'boolean' || typeof value === 'number') return false;
+  if (Array.isArray(value)) {
+    return value.slice(0, 30).some(item => containsSafetyEvidence(item, depth + 1));
+  }
+  if (typeof value !== 'object') return false;
+  return Object.entries(value).slice(0, 80).some(([key, nested]) => {
+    if (
+      /platformSafetyBlocked|platform_safety_blocked|securityBlocked|security_blocked|requiresManualAction|requires_manual_action|loginRequired|login_required/iu.test(key) &&
+      nested === true
+    ) {
+      return true;
+    }
+    return containsSafetyEvidence(nested, depth + 1);
+  });
+}
+
 export function normalizeSocialPlatform(value) {
   const platform = text(value, 40).toLowerCase();
   return SUPPORTED_PLATFORMS.has(platform) ? platform : '';
@@ -172,6 +194,7 @@ export function normalizeSocialUsageEvent(value = {}, now = Date.now()) {
   if (searches + enhancements + captureRuns + capturedItems === 0) {
     return null;
   }
+  const metadata = safeJson(source.metadata);
   return {
     eventId,
     platform,
@@ -180,6 +203,10 @@ export function normalizeSocialUsageEvent(value = {}, now = Date.now()) {
     captureRuns,
     capturedItems,
     succeeded: source.succeeded !== false,
+    safetyVerification:
+      source.safetyVerification === true ||
+      source.securityVerification === true ||
+      containsSafetyEvidence(metadata),
     occurredAt: occurredAt.toISOString(),
     usageDate: shanghaiDate(occurredAt),
     accountIdentity: normalizeObservedSocialAccount({
@@ -190,7 +217,7 @@ export function normalizeSocialUsageEvent(value = {}, now = Date.now()) {
         safeJson(source.accountIdentity).observedAt ||
         occurredAt.toISOString(),
     }),
-    metadata: safeJson(source.metadata),
+    metadata,
   };
 }
 
@@ -643,25 +670,22 @@ export async function processSocialAccountHeartbeat(
           event.platform,
           observedByPlatform.get(event.platform),
         );
-    if (!account) {
-      continue;
-    }
     const inserted = await tx.queryOne(`
       INSERT INTO social_account_usage_events (
         tenant_id, event_id, social_account_id, agent_id, platform,
         searches, enhancements, capture_runs, captured_items,
-        succeeded, occurred_at, usage_date, metadata
+        succeeded, safety_verification, occurred_at, usage_date, metadata
       ) VALUES (
         $1, $2, $3, $4, $5,
         $6, $7, $8, $9,
-        $10, $11::timestamptz, $12::date, $13::jsonb
+        $10, $11, $12::timestamptz, $13::date, $14::jsonb
       )
       ON CONFLICT (tenant_id, event_id) DO NOTHING
       RETURNING id
     `, [
       agent.tenant_id,
       event.eventId,
-      account.id,
+      account?.id || null,
       agent.id,
       event.platform,
       event.searches,
@@ -669,12 +693,52 @@ export async function processSocialAccountHeartbeat(
       event.captureRuns,
       event.capturedItems,
       event.succeeded,
+      event.safetyVerification,
       event.occurredAt,
       event.usageDate,
       JSON.stringify(event.metadata),
     ]);
     acceptedUsageEventIds.push(event.eventId);
     if (!inserted) continue;
+    await tx.execute(`
+      INSERT INTO social_agent_daily_usage (
+        tenant_id, agent_id, platform, usage_date,
+        searches, enhancements, capture_runs, captured_items,
+        failed_events, safety_verifications, last_event_at, last_safety_at
+      ) VALUES (
+        $1, $2, $3, $4::date,
+        $5, $6, $7, $8,
+        $9, $10, $11::timestamptz,
+        CASE WHEN $10::integer > 0 THEN $11::timestamptz ELSE NULL END
+      )
+      ON CONFLICT (tenant_id, agent_id, platform, usage_date)
+      DO UPDATE SET
+        searches = social_agent_daily_usage.searches + EXCLUDED.searches,
+        enhancements = social_agent_daily_usage.enhancements + EXCLUDED.enhancements,
+        capture_runs = social_agent_daily_usage.capture_runs + EXCLUDED.capture_runs,
+        captured_items = social_agent_daily_usage.captured_items + EXCLUDED.captured_items,
+        failed_events = social_agent_daily_usage.failed_events + EXCLUDED.failed_events,
+        safety_verifications = social_agent_daily_usage.safety_verifications + EXCLUDED.safety_verifications,
+        last_event_at = GREATEST(social_agent_daily_usage.last_event_at, EXCLUDED.last_event_at),
+        last_safety_at = CASE
+          WHEN EXCLUDED.last_safety_at IS NULL THEN social_agent_daily_usage.last_safety_at
+          ELSE GREATEST(social_agent_daily_usage.last_safety_at, EXCLUDED.last_safety_at)
+        END,
+        updated_at = now()
+    `, [
+      agent.tenant_id,
+      agent.id,
+      event.platform,
+      event.usageDate,
+      event.searches,
+      event.enhancements,
+      event.captureRuns,
+      event.capturedItems,
+      event.succeeded ? 0 : 1,
+      event.safetyVerification ? 1 : 0,
+      event.occurredAt,
+    ]);
+    if (!account) continue;
     await tx.execute(`
       INSERT INTO social_account_daily_usage (
         tenant_id, social_account_id, agent_id, platform, usage_date,

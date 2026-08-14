@@ -8,6 +8,7 @@ import { queryOne, queryAll, execute, withTransaction, getSetting } from '../db/
 import { sendReportEmail } from './email-notifier.js';
 import { callLLMWithPrompt } from './ai-labeler.js';
 import { getNegativePatrolAnalytics } from './negative-patrol-analytics.js';
+import { getCommentRiskAttentionPolicy } from './comment-risk-attention.js';
 
 const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
 const SENTIMENT_COLOR = { positive: '#059669', neutral: '#6B7280', negative: '#DC2626' };
@@ -56,6 +57,7 @@ const TRIAGE_LABEL = {
   reviewed: '已复核',
   reviewed_non_monitor: '已复核-非监控内容',
   unavailable: '已不可见',
+  privacy_unreachable: '负面–隐私设置无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
   // 历史状态兼容。
@@ -179,9 +181,58 @@ function normalizeRows(rows = [], numberKeys = []) {
   });
 }
 
+function maskRecordCommentRisk(rows = [], enabled = true) {
+  if (enabled) return rows;
+  return rows.map(row => ({
+    ...row,
+    negative_comment_count: 0,
+    latest_negative_comment_at: null,
+  }));
+}
+
+// 这是“值守/统计投影”，不是数据清洗：关闭后原始评论、AI 标签和记录聚合事实都继续保留，
+// 只是生成报告、看板和舆情剖析时不再把评论风险当作风险证据。
+export function applyCommentRiskAttentionPolicy(stats = {}, enabled = true) {
+  const commentStats = stats.commentStats || {};
+  const collectionStats = stats.collectionStats || {};
+  return {
+    ...stats,
+    commentRiskAttentionEnabled: enabled,
+    commentStats: {
+      ...commentStats,
+      negative_comments: enabled ? num(commentStats.negative_comments) : 0,
+    },
+    negativeComments: enabled ? (stats.negativeComments || []) : [],
+    commentRegionDistribution: enabled
+      ? (stats.commentRegionDistribution || [])
+      : (stats.commentRegionDistribution || []).map(row => ({ ...row, negative_count: 0 })),
+    sentimentSamples: maskRecordCommentRisk(stats.sentimentSamples, enabled),
+    topNegative: maskRecordCommentRisk(stats.topNegative, enabled),
+    topInteraction: maskRecordCommentRisk(stats.topInteraction, enabled),
+    collectionStats: {
+      ...collectionStats,
+      records_with_negative_comments: enabled
+        ? num(collectionStats.records_with_negative_comments)
+        : 0,
+    },
+  };
+}
+
 export async function getReportStats(tenantId, periodStart, periodEnd, keywords = [], options = {}) {
   const timeBasis = options?.timeBasis === 'published' ? 'published' : 'captured';
   const usesPublishedTime = timeBasis === 'published';
+  const commentRiskAttentionEnabled = typeof options?.commentRiskAttentionEnabled === 'boolean'
+    ? options.commentRiskAttentionEnabled
+    : (await getCommentRiskAttentionPolicy(tenantId)).enabled;
+  const negativeCommentCountSql = commentRiskAttentionEnabled
+    ? 'r.negative_comment_count'
+    : '0::integer';
+  const latestNegativeCommentAtSql = commentRiskAttentionEnabled
+    ? 'r.latest_negative_comment_at'
+    : 'NULL::timestamptz';
+  const negativeCommentWeightSql = commentRiskAttentionEnabled
+    ? 'COALESCE(negative_comment_count, 0) * 20'
+    : '0';
   const baseParams = [tenantId, periodStart.toISOString(), periodEnd.toISOString()];
   // 可选「采集关键词」过滤:仅数据看板按主题/关键词收敛时传入;报告路径不传 → kw 空 → recordFilter 退化、零影响。
   // 口径与内容分诊一致(精确 r.keyword)。⚠ PG 不允许"绑了却没引用"的参数(会报 could not determine type):
@@ -226,7 +277,8 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
         r.tags, r.image_urls, r.payload, r.publish_location,
         r.sentiment, r.category, r.intent, r.keyword, r.ai_summary,
         r.likes, r.comments_count, r.collects, r.shares, r.official_response_status,
-        r.official_replied, r.negative_comment_count, r.latest_negative_comment_at,
+        r.official_replied, ${negativeCommentCountSql} AS negative_comment_count,
+        ${latestNegativeCommentAtSql} AS latest_negative_comment_at,
         r.published_ts, r.created_at, r.last_seen_at
       ${periodWhere}
     )
@@ -480,7 +532,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     `${observedCte}
      SELECT COALESCE(NULLIF(rc.ip_location, ''), '未采集') AS region,
        COUNT(*) as count,
-       COUNT(*) FILTER (WHERE rc.is_negative) as negative_count
+       ${commentRiskAttentionEnabled ? 'COUNT(*) FILTER (WHERE rc.is_negative)' : '0::bigint'} as negative_count
      FROM record_comments rc
      JOIN observed o ON o.id = rc.record_id
      WHERE rc.tenant_id = $1 AND rc.is_official = false
@@ -496,7 +548,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      FROM observed
      WHERE sentiment <> ''
      ORDER BY (
-       comments_count * 3 + shares * 3 + likes + collects + COALESCE(negative_comment_count, 0) * 20
+       comments_count * 3 + shares * 3 + likes + collects + ${negativeCommentWeightSql}
      ) DESC, last_seen_at DESC
      LIMIT 24`,
     params
@@ -508,7 +560,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
      FROM observed
      WHERE sentiment = 'negative'
      ORDER BY (
-       comments_count * 3 + shares * 3 + likes + collects + COALESCE(negative_comment_count, 0) * 20
+       comments_count * 3 + shares * 3 + likes + collects + ${negativeCommentWeightSql}
      ) DESC, last_seen_at DESC
      LIMIT 8`,
     params
@@ -616,7 +668,9 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
   const commentStats = await queryOne(
     `SELECT
        COUNT(*) FILTER (WHERE rc.created_at >= $2 AND rc.created_at < $3) as new_comments,
-       COUNT(*) FILTER (WHERE rc.is_negative = true AND rc.last_seen_at >= $2 AND rc.last_seen_at < $3) as negative_comments,
+       ${commentRiskAttentionEnabled
+    ? 'COUNT(*) FILTER (WHERE rc.is_negative = true AND rc.last_seen_at >= $2 AND rc.last_seen_at < $3)'
+    : '0::bigint'} as negative_comments,
        COUNT(*) FILTER (WHERE rc.is_official = true AND rc.last_seen_at >= $2 AND rc.last_seen_at < $3) as official_comments
      FROM record_comments rc
      JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
@@ -625,7 +679,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     params
   );
 
-  const negativeComments = normalizeRows(await queryAll(
+  const negativeComments = commentRiskAttentionEnabled ? normalizeRows(await queryAll(
     `SELECT rc.id, rc.record_id, rc.platform, rc.author_name, rc.author_avatar, rc.content, rc.like_count,
        rc.risk_level, rc.sentiment, rc.category, rc.published_at, rc.last_seen_at,
        r.title as record_title, r.url as record_url, r.cover_url as record_cover_url, r.author_name as record_author_name
@@ -642,7 +696,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        rc.last_seen_at DESC
      LIMIT 10`,
     params
-  ), ['like_count']);
+  ), ['like_count']) : [];
 
   const officialResponses = normalizeRows(await queryAll(
     `SELECT o.id, o.record_id, o.platform, o.account_name, o.content, o.published_at, o.created_at,
@@ -681,6 +735,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed') as reviewed,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'reviewed_non_monitor') as reviewed_non_monitor,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unavailable') as unavailable,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'privacy_unreachable') as privacy_unreachable,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu') as negative_feishu,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold') as negative_cold,
        COUNT(*) FILTER (
@@ -739,7 +794,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     keywords: kw,
   });
 
-  return {
+  const rawStats = {
     timeBasis,
     total,
     newRecords,
@@ -791,6 +846,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
       reviewed: rowNum(workflowStats, 'reviewed'),
       reviewed_non_monitor: rowNum(workflowStats, 'reviewed_non_monitor'),
       unavailable: rowNum(workflowStats, 'unavailable'),
+      privacy_unreachable: rowNum(workflowStats, 'privacy_unreachable'),
       negative_feishu: rowNum(workflowStats, 'negative_feishu'),
       negative_cold: rowNum(workflowStats, 'negative_cold'),
       handled_total: rowNum(workflowStats, 'handled_total'),
@@ -808,6 +864,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
     },
     negativePatrol,
   };
+  return applyCommentRiskAttentionPolicy(rawStats, commentRiskAttentionEnabled);
 }
 
 function sentimentMap(stats) {
@@ -841,7 +898,9 @@ function classifyRisk(stats, negativeRate) {
   const criticalAlerts = alertCount(stats, 'critical');
   const warningAlerts = alertCount(stats, 'warning');
   const negativeCount = sentimentMap(stats).negative;
-  const negativeComments = stats.commentStats?.negative_comments || 0;
+  const negativeComments = stats.commentRiskAttentionEnabled === false
+    ? 0
+    : stats.commentStats?.negative_comments || 0;
   const highOpenIssues = stats.issueStats?.high_open_issues || 0;
   const activeInbox = stats.workflowStats?.active_inbox || 0;
 
@@ -869,7 +928,7 @@ function buildActionItems(stats, negativeRate, riskLevel) {
   if ((stats.workflowStats?.active_inbox || 0) > 0) {
     items.push(`完成舆情收件箱 ${stats.workflowStats.active_inbox} 条待处理/待复核线索分诊。`);
   }
-  if ((stats.commentStats?.negative_comments || 0) > 0) {
+  if (stats.commentRiskAttentionEnabled !== false && (stats.commentStats?.negative_comments || 0) > 0) {
     items.push(`核查 ${stats.commentStats.negative_comments} 条负面评论，确认是否需要官方回复或转为问题单。`);
   }
   if ((stats.issueStats?.open_issues || 0) > 0) {
@@ -878,7 +937,7 @@ function buildActionItems(stats, negativeRate, riskLevel) {
   if (negativeRate >= 15) {
     items.push('对负面占比较高的主题补充原因分析，区分真实产品/服务问题、价格认知问题和误解传播。');
   }
-  if ((stats.officialPeriod?.record_count || 0) > 0) {
+  if (stats.commentRiskAttentionEnabled !== false && (stats.officialPeriod?.record_count || 0) > 0) {
     items.push('复盘官方回复后的评论走势，若回复后仍新增负评，需要重新打开为待复核。');
   }
   if ((stats.pendingLabel || 0) > 0) {
@@ -892,7 +951,7 @@ function buildActionItems(stats, negativeRate, riskLevel) {
 
 function buildCollectionRecommendations(stats) {
   const items = [];
-  if (stats.total > 0 && (stats.commentStats?.new_comments || 0) === 0) {
+  if (stats.commentRiskAttentionEnabled !== false && stats.total > 0 && (stats.commentStats?.new_comments || 0) === 0) {
     items.push('建议在重点负面和高互动内容上开启评论采集，日报才能识别“帖子已平稳但评论区发酵”的风险。');
   }
   if (stats.total > 0 && pct(stats.collectionStats?.records_with_content || 0, stats.total) < 80) {
@@ -1039,36 +1098,54 @@ function buildOpinionIndex(stats, previousStats, negativeRate, previousNegativeR
   const criticalAlerts = alertCount(stats, 'critical');
   const previousWarningAlerts = alertCount(previousStats, 'warning');
   const previousCriticalAlerts = alertCount(previousStats, 'critical');
+  const currentNegativeComments = stats.commentRiskAttentionEnabled === false
+    ? 0
+    : num(stats.commentStats?.negative_comments);
+  const previousNegativeComments = previousStats.commentRiskAttentionEnabled === false
+    ? 0
+    : num(previousStats.commentStats?.negative_comments);
+  const currentNewComments = stats.commentRiskAttentionEnabled === false
+    ? 0
+    : num(stats.commentStats?.new_comments);
+  const previousNewComments = previousStats.commentRiskAttentionEnabled === false
+    ? 0
+    : num(previousStats.commentStats?.new_comments);
   const heat = Math.round(
     num(stats.total) * 3 +
     currentInteraction / 40 +
-    num(stats.commentStats?.new_comments) * 1.2 +
+    currentNewComments * 1.2 +
     num(stats.observations) * 0.8
   );
   const previousHeat = Math.round(
     num(previousStats.total) * 3 +
     previousInteraction / 40 +
-    num(previousStats.commentStats?.new_comments) * 1.2 +
+    previousNewComments * 1.2 +
     num(previousStats.observations) * 0.8
   );
   const risk = Math.min(100, Math.round(
     negativeRate * 1.2 +
-    num(stats.commentStats?.negative_comments) * 3 +
+    currentNegativeComments * 3 +
     num(stats.issueStats?.high_open_issues) * 18 +
     warningAlerts * 10 +
     criticalAlerts * 24
   ));
   const previousRisk = Math.min(100, Math.round(
     previousNegativeRate * 1.2 +
-    num(previousStats.commentStats?.negative_comments) * 3 +
+    previousNegativeComments * 3 +
     num(previousStats.issueStats?.high_open_issues) * 18 +
     previousWarningAlerts * 10 +
     previousCriticalAlerts * 24
   ));
-  const response = Math.min(100, Math.round(
-    pct(stats.workflowStats?.handled_total || 0, Math.max(1, stats.workflowStats?.status_total || 0)) * 0.55 +
-    pct(stats.officialPeriod?.record_count || 0, Math.max(1, stats.total)) * 0.45
-  ));
+  const contentResponseRate = pct(
+    stats.workflowStats?.handled_total || 0,
+    Math.max(1, stats.workflowStats?.status_total || 0),
+  );
+  const response = stats.commentRiskAttentionEnabled === false
+    ? Math.min(100, Math.round(contentResponseRate))
+    : Math.min(100, Math.round(
+      contentResponseRate * 0.55 +
+      pct(stats.officialPeriod?.record_count || 0, Math.max(1, stats.total)) * 0.45
+    ));
   return {
     heat,
     heatDelta: delta(heat, previousHeat),
@@ -1113,6 +1190,7 @@ function buildSentimentStructure(stats, sentimentCounts) {
 // 附带头部断层比 cliffPct(Top1 占 Top5 互动比例,判舆情是被少数爆款主导(易引导/易反转)还是普遍发酵(真实民意))。
 // 报告线 buildAiOpinionInsight 与舆情剖析(opinion-analysis.js)共用此池,保证两处样本口径永远一致。
 export function buildInsightSamplePool(stats) {
+  const includeCommentRisk = stats.commentRiskAttentionEnabled !== false;
   const ss = stats.sentimentSamples || [];
   const mid = Math.floor(ss.length / 2);
   const stratified = [...ss.slice(0, 10), ...ss.slice(mid, mid + 5), ...ss.slice(-5)];
@@ -1140,7 +1218,7 @@ export function buildInsightSamplePool(stats) {
       sentiment: r.sentiment || '',
       likes: Number(r.likes || 0),
       comments: Number(r.comments_count || 0),
-      negComments: Number(r.negative_comment_count || 0),
+      ...(includeCommentRisk ? { negComments: Number(r.negative_comment_count || 0) } : {}),
       summary: String(r.ai_summary || r.content || '').replace(/\s+/g, ' ').slice(0, 160),
     });
     if (samples.length >= 30) break;
@@ -1168,11 +1246,11 @@ async function buildAiOpinionInsight(tenantId, current) {
   "brandSignals": ["对品牌/产品的具体信号(正或负)"],
   "actionSuggestions": [{"title":"处置建议","rationale":"依据(哪些样本/信号)","nextStep":"具体下一步动作","sampleIds":["..."]}]
 }
-要求:sampleIds 只能用我给的样本 id;基于事实不臆造;聚类要跨样本归纳而非逐条复述;空字段用空数组/空串;简洁中文。`;
+要求:sampleIds 只能用我给的样本 id;基于事实不臆造;聚类要跨样本归纳而非逐条复述;空字段用空数组/空串;简洁中文。${current.commentRiskAttentionEnabled === false ? '当前租户不将评论纳入舆情风险，禁止把评论作为风险判断、用户诉求或处置建议的依据。' : ''}`;
   const userMessage = `【本周期概览】总量 ${current.total},负面 ${s.negative} 条(负面率 ${negativeRate}%)。
 【热度结构】Top1 内容占 Top5 互动的 ${cliffPct}%(断层比:越高=越被少数爆款主导/易引导易反转,越低=普遍发酵/更接近真实民意;请在 heatTrend 里据此判断本期舆情是"爆款主导"还是"普遍发酵")。
 【代表样本】(${samples.length} 条)
-${samples.map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}负评${x.negComments} | ${x.title} | ${x.summary}`).join('\n')}`;
+${samples.map(x => `- id=${x.id} | ${x.sentiment || '未标'} | 赞${x.likes}评${x.comments}${Object.hasOwn(x, 'negComments') ? `负评${x.negComments}` : ''} | ${x.title} | ${x.summary}`).join('\n')}`;
 
   try {
     const result = await callLLMWithPrompt(tenantId, systemPrompt, userMessage);
@@ -1197,12 +1275,13 @@ async function enrichReportData(type, current, previous, tenantId) {
     .sort((a, b) => b.negative_count - a.negative_count)[0] || null;
   const topKeyword = firstNonEmpty(current.keyword);
   const typeName = { daily: '日报', weekly: '周报', monthly: '月报', dashboard: '数据看板' }[type] || '报表';
+  const commentRiskAttentionEnabled = current.commentRiskAttentionEnabled !== false;
 
   const dashboardCards = [
     { label: '声量', value: n0(current.total), delta: delta(current.total, previous.total), help: '本周期涉及的帖子/内容量' },
     { label: '新增线索', value: n0(current.newRecords), delta: delta(current.newRecords, previous.newRecords), help: '首次入库内容' },
     { label: '负面率', value: `${negativeRate}%`, delta: rateDelta(negativeRate, previousNegativeRate), tone: negativeRate >= 20 ? 'danger' : 'normal', help: '负面内容 / 已标注内容' },
-    { label: '负面评论', value: n0(current.commentStats.negative_comments), delta: delta(current.commentStats.negative_comments, previous.commentStats.negative_comments), tone: current.commentStats.negative_comments > 0 ? 'danger' : 'normal', help: '评论层面的负面线索' },
+    ...(commentRiskAttentionEnabled ? [{ label: '负面评论', value: n0(current.commentStats.negative_comments), delta: delta(current.commentStats.negative_comments, previous.commentStats.negative_comments), tone: current.commentStats.negative_comments > 0 ? 'danger' : 'normal', help: '评论层面的负面线索' }] : []),
     { label: '待处理线索', value: n0(current.workflowStats.active_inbox), delta: null, tone: current.workflowStats.active_inbox > 0 ? 'warning' : 'normal', help: '当前收件箱待处理/复核' },
     { label: '未关闭问题', value: n0(current.issueStats.open_issues), delta: delta(current.issueStats.open_issues, previous.issueStats.open_issues), tone: current.issueStats.high_open_issues > 0 ? 'danger' : 'normal', help: '未 resolved/closed 的 issue' },
     { label: '官方响应', value: n0(current.officialPeriod.record_count), delta: delta(current.officialPeriod.record_count, previous.officialPeriod.record_count), help: '本周期出现官方回复的内容' },
@@ -1211,7 +1290,7 @@ async function enrichReportData(type, current, previous, tenantId) {
 
   const executiveSummary = [
     `本周期舆情风险等级为「${RISK_LEVEL_LABEL[riskLevel]}」，共观察 ${current.total} 条内容，较上一周期${delta(current.total, previous.total).value}。`,
-    `负面内容 ${currentSentiment.negative} 条，负面率 ${negativeRate}%（上一周期 ${previousNegativeRate}%）；负面评论 ${current.commentStats.negative_comments} 条。`,
+    `负面内容 ${currentSentiment.negative} 条，负面率 ${negativeRate}%（上一周期 ${previousNegativeRate}%）${commentRiskAttentionEnabled ? `；负面评论 ${current.commentStats.negative_comments} 条` : ''}。`,
     dominantPlatform
       ? `主要声量来自「${PLATFORM_LABEL[dominantPlatform.platform] || dominantPlatform.platform}」，占本周期内容 ${pct(dominantPlatform.count, current.total)}%。`
       : '本周期暂无明确平台集中度。',
@@ -1292,12 +1371,15 @@ export async function generateOpinionInsight({ tenantId, periodStart, periodEnd 
   return await buildAiOpinionInsight(tenantId, stats);
 }
 
-export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd, keywords = [] }) {
+export async function buildAnalyticsDashboard({ tenantId, periodStart, periodEnd, keywords = [], commentRiskAttentionEnabled }) {
   const previous = previousPeriod(periodStart, periodEnd);
+  const includeCommentRisk = typeof commentRiskAttentionEnabled === 'boolean'
+    ? commentRiskAttentionEnabled
+    : (await getCommentRiskAttentionPolicy(tenantId)).enabled;
   // 两个自然周期彼此独立，并行读取可避免月报等待时间简单相加。
   const [currentStats, previousStats] = await Promise.all([
-    getReportStats(tenantId, periodStart, periodEnd, keywords, { timeBasis: 'published' }),
-    getReportStats(tenantId, previous.start, previous.end, keywords, { timeBasis: 'published' }),
+    getReportStats(tenantId, periodStart, periodEnd, keywords, { timeBasis: 'published', commentRiskAttentionEnabled: includeCommentRisk }),
+    getReportStats(tenantId, previous.start, previous.end, keywords, { timeBasis: 'published', commentRiskAttentionEnabled: includeCommentRisk }),
   ]);
   return await enrichReportData('dashboard', currentStats, previousStats, tenantId);
 }
@@ -1477,15 +1559,15 @@ function buildLegacyReportHTML(title, periodLabel, stats) {
     </div>` : ''}`;
 
   const riskBody = `
-    <div class="report-grid" style="display:grid; grid-template-columns:1fr 1fr; gap:18px;">
+    <div class="report-grid" style="display:grid; grid-template-columns:${stats.commentRiskAttentionEnabled === false ? '1fr' : '1fr 1fr'}; gap:18px;">
       <div>
         <h4 style="margin:0 0 10px; color:#111827;">重点负面内容</h4>
         ${renderEvidenceRows(stats.topNegative, '暂无重点负面内容')}
       </div>
-      <div>
+      ${stats.commentRiskAttentionEnabled === false ? '' : `<div>
         <h4 style="margin:0 0 10px; color:#111827;">负面评论样本</h4>
         ${renderNegativeComments(stats.negativeComments)}
-      </div>
+      </div>`}
     </div>`;
 
   const handlingBody = `
@@ -1528,7 +1610,7 @@ function buildLegacyReportHTML(title, periodLabel, stats) {
           ${renderSection('采集质量与补强建议', renderList(stats.collectionRecommendations), '帮助后续把报告越做越准')}
 
           <div style="margin-top:24px; padding:12px; background:#F9FAFB; border-radius:8px; font-size:12px; color:#6B7280; line-height:1.7;">
-            生成时间：${escHtml(generatedAt)}。本报告基于公开内容、采集快照、评论舆情、官方响应、告警和问题单自动生成；建议由运营/公关负责人在发送前复核重点样本和处置建议。
+            生成时间：${escHtml(generatedAt)}。本报告基于公开内容、采集快照、${stats.commentRiskAttentionEnabled === false ? '' : '评论舆情、'}官方响应、告警和问题单自动生成；建议由运营/公关负责人在发送前复核重点样本和处置建议。
           </div>
         </div>
       </div>
@@ -1949,6 +2031,7 @@ function renderOfficialResponseList(rows = []) {
 
 function buildManagementReportHTML(title, periodLabel, stats) {
   const generatedAt = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  const includeCommentRisk = stats.commentRiskAttentionEnabled !== false;
   return `${reportCss()}
     <main class="osv-report">
       <div class="osv-shell">
@@ -1979,7 +2062,7 @@ function buildManagementReportHTML(title, periodLabel, stats) {
         </section>
         <section class="osv-grid">
           ${renderReportCard('声量与情绪趋势', renderTrendSvg(stats.volumeTrend), '按采集快照聚合')}
-          ${renderReportCard('热点词云', renderWordCloud(stats.hotTerms), '关键词 / 正文 / 评论')}
+          ${renderReportCard('热点词云', renderWordCloud(stats.hotTerms), includeCommentRisk ? '关键词 / 正文 / 评论' : '关键词 / 正文')}
         </section>
         <section class="osv-grid-3">
           ${renderReportCard('平台分布', renderDistribution(stats.platformDistribution, { labelKey: 'platform', total: Math.max(stats.total, 1), labelMap: PLATFORM_LABEL, color: '#2563EB' }))}
@@ -1992,7 +2075,7 @@ function buildManagementReportHTML(title, periodLabel, stats) {
         </section>
         <section class="osv-grid">
           ${renderReportCard('重点负面内容', renderSampleCards(stats.riskItems, '暂无重点负面内容'), '按风险和互动排序')}
-          ${renderReportCard('负面评论舆情', renderCommentRiskTable(stats.commentRisks), '评论同样进入舆情判断')}
+          ${includeCommentRisk ? renderReportCard('负面评论舆情', renderCommentRiskTable(stats.commentRisks), '评论同样进入舆情判断') : ''}
         </section>
         <section class="osv-grid">
           ${renderReportCard('问题闭环', renderIssueSummary(stats), '问题状态和负责人')}
@@ -2002,12 +2085,13 @@ function buildManagementReportHTML(title, periodLabel, stats) {
           ${renderReportCard('互动增长内容', renderSampleCards(stats.risingRecords, '暂无互动明显增长内容'), '重复采集快照识别增长')}
           ${renderReportCard('采集质量与补强', renderList(stats.collectionRecommendations), '用于提升下一期报告准确性')}
         </section>
-        <footer class="osv-footer">本报告基于公开内容、采集快照、评论舆情、官方响应、告警和问题单自动生成。发送前建议复核重点样本、官方回复语境和处置建议。</footer>
+        <footer class="osv-footer">本报告基于公开内容、采集快照、${includeCommentRisk ? '评论舆情、' : ''}官方响应、告警和问题单自动生成。发送前建议复核重点样本、官方回复语境和处置建议。</footer>
       </div>
     </main>`;
 }
 
 function buildDataDashboardHTML(title, periodLabel, stats) {
+  const includeCommentRisk = stats.commentRiskAttentionEnabled !== false;
   return `${reportCss()}
     <main class="osv-report osv-screen">
       <div class="osv-shell">
@@ -2046,7 +2130,7 @@ function buildDataDashboardHTML(title, periodLabel, stats) {
           <div style="display:grid;gap:14px;">
             ${renderReportCard('预警快报', renderAlertFeed(stats.topAlerts), '告警优先级')}
             ${renderReportCard('高风险内容', renderSampleCards(stats.riskItems.slice(0, 4), '暂无高风险内容'), '帖子/内容样本')}
-            ${renderReportCard('负面评论', renderCommentRiskTable(stats.commentRisks.slice(0, 5)), '评论同样进入舆情')}
+            ${includeCommentRisk ? renderReportCard('负面评论', renderCommentRiskTable(stats.commentRisks.slice(0, 5)), '评论同样进入舆情') : ''}
           </div>
         </section>
         <section class="osv-grid">
@@ -2148,7 +2232,7 @@ function buildEmailSummaryHTML(title, periodLabel, stats, reportId = '') {
             </div>`).join('')}
           </div>
           ${body}
-          <div style="margin-top:22px; padding:12px; background:#F9FAFB; border-radius:8px; color:#6B7280; font-size:12px; line-height:1.7;">完整图表、词云、评论样本和处置看板请在后台「报告中心」打开预览。若邮件发送失败，请检查系统设置中的 SMTP 与收件人配置。</div>
+          <div style="margin-top:22px; padding:12px; background:#F9FAFB; border-radius:8px; color:#6B7280; font-size:12px; line-height:1.7;">完整图表、词云、${stats.commentRiskAttentionEnabled === false ? '' : '评论样本和'}处置看板请在后台「报告中心」打开预览。若邮件发送失败，请检查系统设置中的 SMTP 与收件人配置。</div>
         </div>
       </div>
     </div>`;
@@ -2203,9 +2287,14 @@ export async function generateReport({ tenantId, type = 'daily', send = true, no
     SELECT * FROM report_runs
     WHERE tenant_id = $1 AND report_type = $2 AND period_start = $3 AND period_end = $4
   `, [tenantId, type, start.toISOString(), end.toISOString()]);
+  // 已发送报告是历史快照，配置变化不回写、不触发当期自动重发；新口径从看板和下一周期生效。
   if (send && existing?.status === 'sent') return existing;
 
-  const reportStatsOptions = type === 'monthly' ? { timeBasis: 'published' } : {};
+  const commentRiskAttentionEnabled = (await getCommentRiskAttentionPolicy(tenantId)).enabled;
+  const reportStatsOptions = {
+    ...(type === 'monthly' ? { timeBasis: 'published' } : {}),
+    commentRiskAttentionEnabled,
+  };
   const currentStats = await getReportStats(tenantId, start, end, [], reportStatsOptions);
   const previousStats = await getReportStats(tenantId, previous.start, previous.end, [], reportStatsOptions);
   const stats = await enrichReportData(type, currentStats, previousStats, tenantId);
@@ -2277,6 +2366,9 @@ export async function resendReport(reportId, tenantId = null) {
 }
 
 export const __reportGeneratorInternals = {
+  classifyRisk,
+  buildOpinionIndex,
+  buildActionItems,
   buildManagementReportHTML,
   buildDataDashboardHTML,
   buildEmailSummaryHTML,

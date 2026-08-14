@@ -242,7 +242,10 @@ function listDouyinApiCacheKeys() {
   }
 }
 
-async function waitForDouyinApiCache(awemeId, { timeoutMs = 2000, intervalMs = 120 } = {}) {
+async function waitForDouyinApiCache(
+  awemeId,
+  { timeoutMs = 2000, intervalMs = 120, acceptDetail = null } = {},
+) {
   const normalizedId = String(awemeId || "").trim();
   if (!normalizedId) {
     return null;
@@ -251,7 +254,7 @@ async function waitForDouyinApiCache(awemeId, { timeoutMs = 2000, intervalMs = 1
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
     const cached = readDouyinApiCache(normalizedId);
-    if (cached) {
+    if (cached && (!acceptDetail || acceptDetail(cached))) {
       return cached;
     }
     await wait(intervalMs);
@@ -262,7 +265,12 @@ async function waitForDouyinApiCache(awemeId, { timeoutMs = 2000, intervalMs = 1
 
 async function requestDouyinApiDetailFromMainWorld(
   awemeId,
-  { timeoutMs = 2200, intervalMs = 120 } = {},
+  {
+    timeoutMs = 2200,
+    intervalMs = 120,
+    forceRefresh = false,
+    acceptDetail = null,
+  } = {},
 ) {
   const normalizedId = String(awemeId || "").trim();
   if (!normalizedId) {
@@ -270,7 +278,7 @@ async function requestDouyinApiDetailFromMainWorld(
   }
 
   const cached = readDouyinApiCache(normalizedId);
-  if (cached) {
+  if (cached && !forceRefresh && (!acceptDetail || acceptDetail(cached))) {
     return cached;
   }
 
@@ -288,7 +296,11 @@ async function requestDouyinApiDetailFromMainWorld(
     return null;
   }
 
-  return waitForDouyinApiCache(normalizedId, { timeoutMs, intervalMs });
+  return waitForDouyinApiCache(normalizedId, {
+    timeoutMs,
+    intervalMs,
+    acceptDetail,
+  });
 }
 
 function readInterceptedMediaRequests() {
@@ -502,6 +514,8 @@ function buildPayloadFromApiDetail(detail, noteId) {
     authorUsername: author.unique_id || "",
     authorUrl,
     content: title,
+    contentCompleteness: title ? "complete" : "missing",
+    contentSource: "api_detail",
     tags,
     likes: stats.digg_count ?? null,
     collects: stats.collect_count ?? null,
@@ -553,12 +567,20 @@ function isUsableApiPayload(payload, detail, options = {}) {
     awemeType === 4 ||
     awemeType === 68 ||
     Boolean(detail?.video?.duration);
+  // 详情缓存刚创建时可能只有封面和作者，desc 字段虽然已经存在却仍是
+  // 空值。只有拿到非空正文才提前采用 API 结果，否则继续等待同一作品
+  // 的完整详情，最终仍可回退 DOM，兼容确实没有配文的作品。
+  const hasCompleteDescription = Boolean(cleanText(detail?.desc || ""));
 
   if (isVideoLike) {
-    return Boolean(payload.coverImageUrl || payload.title || payload.author);
+    return Boolean(
+      hasCompleteDescription &&
+      (payload.coverImageUrl || payload.title || payload.author),
+    );
   }
 
   return Boolean(
+    hasCompleteDescription &&
     Array.isArray(payload.imageUrls) && payload.imageUrls.length > 0,
   );
 }
@@ -822,7 +844,8 @@ export async function captureDouyinSingleNote({
     await waitForDouyinMediaBootstrap(noteId, noteUrl);
 
     const authorInfo = extractDouyinAuthorInfo(detailRoot);
-    const title = extractDouyinTitle(detailRoot);
+    const contentResolution = await resolveDouyinCompleteText(detailRoot, noteId);
+    const title = contentResolution.text;
     const tags = extractDouyinTags(detailRoot, title);
     const interactions = extractDouyinInteractions(detailRoot, {
       apiDetail: readDouyinApiCache(noteId),
@@ -904,6 +927,12 @@ export async function captureDouyinSingleNote({
       authorId: authorInfo.userId,
       authorUrl: authorInfo.url,
       content: title,
+      contentCompleteness: contentResolution.complete
+        ? "complete"
+        : contentResolution.collapsed
+          ? "possibly_truncated"
+          : "unverified_dom",
+      contentSource: contentResolution.source,
       tags,
       likes: interactions.likes,
       collects: interactions.collects,
@@ -2654,6 +2683,91 @@ function extractDouyinTitle(detailRoot) {
   if (title) return title;
 
   return cleanText(document.title.replace(/\s*-\s*抖音.*$/i, ""));
+}
+
+function normalizeDouyinTextCandidate(value) {
+  return cleanText(String(value || ""))
+    .replace(/\s*(?:\.{3}|…+)\s*展开\s*$/u, "")
+    .trim();
+}
+
+/**
+ * 同一作品的正文候选只取信息量最大的版本。调用方必须先完成作品 ID
+ * 绑定；这里不做跨作品的相似文本猜测。
+ */
+export function pickMostCompleteDouyinText(...candidates) {
+  return candidates
+    .map((candidate, index) => ({
+      text: normalizeDouyinTextCandidate(candidate),
+      index,
+    }))
+    .filter((candidate) => candidate.text)
+    .sort((left, right) => {
+      const lengthDelta = [...right.text].length - [...left.text].length;
+      return lengthDelta || left.index - right.index;
+    })[0]?.text || "";
+}
+
+export function isLikelyTruncatedDouyinText(value) {
+  const text = cleanText(String(value || ""));
+  return Boolean(text && /(?:\.{3}|…+|展开)\s*$/u.test(text));
+}
+
+function hasCollapsedDouyinTextUi(detailRoot) {
+  const titleElement = getFirstMatch(
+    DOUYIN_DOM_PROFILE.noteDetail.fields.title,
+    detailRoot,
+  );
+  if (!titleElement) return false;
+
+  if (isLikelyTruncatedDouyinText(titleElement.textContent)) return true;
+
+  let scope = titleElement;
+  for (let depth = 0; depth < 3 && scope; depth += 1) {
+    const controls = Array.from(
+      scope.querySelectorAll?.("button, [role='button'], span") || [],
+    );
+    if (controls.some((node) => cleanText(node.textContent) === "展开" && isElementVisible(node))) {
+      return true;
+    }
+    scope = scope.parentElement;
+  }
+
+  try {
+    const style = window.getComputedStyle(titleElement);
+    const lineClamp = String(style.webkitLineClamp || style.getPropertyValue("-webkit-line-clamp") || "");
+    if (lineClamp && lineClamp !== "none" && Number(lineClamp) > 0) return true;
+    return titleElement.scrollHeight > titleElement.clientHeight + 2;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveDouyinCompleteText(detailRoot, noteId) {
+  const domText = extractDouyinTitle(detailRoot);
+  let apiDetail = readDouyinApiCache(noteId);
+  let apiText = cleanText(apiDetail?.desc || "");
+  const collapsed = hasCollapsedDouyinTextUi(detailRoot);
+
+  // DOM 显示“展开”时不点击页面控件：再次向已注入的详情接口请求同一
+  // aweme_id，等待完整 desc。这样不会依赖用户是否手工展开。
+  if (!apiText) {
+    apiDetail = await requestDouyinApiDetailFromMainWorld(noteId, {
+      timeoutMs: 3200,
+      intervalMs: 120,
+      forceRefresh: Boolean(apiDetail),
+      acceptDetail: detail => Boolean(cleanText(detail?.desc || "")),
+    });
+    apiText = cleanText(apiDetail?.desc || "");
+  }
+
+  const text = apiText || pickMostCompleteDouyinText(domText);
+  return {
+    text,
+    complete: Boolean(apiText),
+    source: apiText ? "api_detail" : "dom",
+    collapsed,
+  };
 }
 
 function extractDouyinTags(detailRoot, title = "") {

@@ -2,13 +2,14 @@ import { useState } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import {
   ArrowLeft, Bot, CalendarClock, Check, CheckCircle2, ChevronRight, CircleOff,
-  MessagesSquare, Network, Radar, Search, ShieldAlert, X,
+  MessagesSquare, Network, Radar, Search, ShieldAlert, Star, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Drawer } from '@/components/shared/Drawer'
 import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
 import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
+import { WatchedContentTaskCreator } from './WatchedContentTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
 import { AccountDiscoveryTaskCreator } from './AccountDiscoveryTaskCreator'
 import type { CloudAgent, CloudCreateTaskType, CloudTask, ComposerIntent } from './lib'
@@ -26,12 +27,13 @@ const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string
   { value: 'unattended_plan', title: '无人值守计划', description: '保存为定时计划，Agent 到点自动执行关键词采集。', note: '定时自动执行', icon: CalendarClock, planned: false },
   { value: 'creator_patrol', title: '关注博主扫描', description: '打开已关注博主主页，发现近期作品并更新博主新动态。', note: '主页作品发现', icon: Radar, planned: false },
   { value: 'negative_patrol', title: '负面帖子巡查', description: '从已有负面内容中按发布日期等条件圈定帖子，再交给 Agent 逐帖补采。', note: '定向逐帖采集', icon: ShieldAlert, planned: false },
+  { value: 'watched_content', title: '关注内容巡查', description: '从人工关注的内容中勾选帖子，按每条内容的平台交给对应 Agent 补采。', note: '支持小红书＋抖音混合清单', icon: Star, planned: false },
   { value: 'comment_patrol', title: '官方账号评论巡查', description: '打开官方账号主页，按最新顺序读取指定数量的作品及当前可见评论。', note: '账号主页增强', icon: MessagesSquare, planned: false },
 ]
 
 const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [
-  { value: 'single', title: '单个节点', description: '指定一个 Agent 执行；离线也可排队，上线自动领取。', icon: Bot },
-  { value: 'multi', title: '多节点编排', description: '把关键词拆分到多个 Agent 并行执行，适合大批量采集。', icon: Network },
+  { value: 'single', title: '固定一个节点', description: '只交给指定 Agent；节点离线时任务原地等待，不自动转交。', icon: Bot },
+  { value: 'multi', title: '弹性节点池（推荐）', description: '工作项留在云端，哪个兼容节点先空闲就先领取一个。', icon: Network },
 ]
 
 const STEP_LABELS: Array<{ step: WizardStep; label: string }> = [
@@ -83,7 +85,7 @@ export function CreateTaskDrawer({
   writable: boolean
   intent: ComposerIntent
   onClose: () => void
-  onCreated: () => Promise<void>
+  onCreated: (taskType: TaskType) => Promise<void>
   onLaunchOrchestration: (intent: OrchestrationLaunchIntent) => void
 }) {
   const editingExisting = intent.editExisting === true
@@ -96,12 +98,18 @@ export function CreateTaskDrawer({
       ? 'comment_patrol'
       : intent.taskType === 'creator_patrol'
         ? 'creator_patrol'
-        : null
+        : intent.taskType === 'negative_patrol'
+          ? 'negative_patrol'
+          : intent.taskType === 'watched_content'
+            ? 'watched_content'
+            : null
   const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
 
   const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : 'type')
   const [taskType, setTaskType] = useState<TaskType>(presetTaskType || 'keyword')
-  const [method, setMethod] = useState<ExecutionMethod>('single')
+  const [method, setMethod] = useState<ExecutionMethod>(() => (
+    ['negative_patrol', 'watched_content'].includes(presetTaskType || '') ? 'multi' : 'single'
+  ))
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>(presetAgentId ? [presetAgentId] : [])
 
   const mode: 'one_time' | 'unattended_plan' = taskType === 'unattended_plan' ? 'unattended_plan' : 'one_time'
@@ -116,7 +124,8 @@ export function CreateTaskDrawer({
   })
   const showIndicator = !editingExisting
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
-  const orchestrationPath = method === 'multi' && taskType !== 'negative_patrol'
+  const contentPatrolTask = ['negative_patrol', 'watched_content'].includes(taskType)
+  const orchestrationPath = method === 'multi' && !contentPatrolTask
   const stepLabels = orchestrationPath
     ? [
         { step: 'type' as const, label: '任务类型' },
@@ -143,7 +152,7 @@ export function CreateTaskDrawer({
       return setStep('method')
     }
     if (step === 'method') {
-      if (method === 'multi' && taskType !== 'negative_patrol') {
+      if (method === 'multi' && !contentPatrolTask) {
         return onLaunchOrchestration({
           executionMode: mode,
           agentIds: [],
@@ -179,7 +188,7 @@ export function CreateTaskDrawer({
   const nextLabel = step === 'type'
     ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
     : step === 'method'
-      ? method === 'multi' && taskType !== 'negative_patrol'
+      ? method === 'multi' && !contentPatrolTask
         ? '配置多节点任务'
         : '下一步：选择节点'
       : '下一步：任务配置'
@@ -197,7 +206,7 @@ export function CreateTaskDrawer({
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {editingExisting
                 ? '更新该设备的无人值守计划，保存后覆盖原计划。'
-                : '先选择任务类型，再决定交给哪个 Agent（浏览器节点）执行。'}
+                : '先选择任务类型，再决定固定给一个节点，还是交给弹性节点池。'}
             </p>
           </div>
         </div>
@@ -220,7 +229,9 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
-                        if (['comment_patrol', 'creator_patrol'].includes(item.value)) {
+                        if (['negative_patrol', 'watched_content'].includes(item.value)) {
+                          setMethod('multi')
+                        } else if (['comment_patrol', 'creator_patrol'].includes(item.value)) {
                           setMethod('single')
                           setSelectedAgentIds(current => current.slice(0, 1))
                         }
@@ -247,13 +258,19 @@ export function CreateTaskDrawer({
           <div className="mx-auto max-w-2xl">
             <div className="mb-4">
               <h3 className="text-base font-bold">怎么执行这批采集？</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">Agent 指浏览器执行节点。量小指定单个即可，量大可编排到多个节点并行。</p>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">固定节点适合必须保留同一浏览器现场的任务；弹性池适合可拆分的批量工作。</p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="执行方式">
               {EXECUTION_METHODS.map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
                 const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
+                const elasticPool = item.value === 'multi'
+                  && (
+                    ['keyword', 'unattended_plan', 'negative_patrol'].includes(taskType)
+                    || taskType === 'watched_content'
+                  )
+                const itemTitle = item.title
                 return (
                   <button key={item.value} type="button" role="radio" aria-checked={selected} aria-disabled={unavailable || undefined}
                     onClick={() => {
@@ -268,19 +285,20 @@ export function CreateTaskDrawer({
                         ? <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">后续开放</span>
                         : <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>{selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}</span>}
                     </div>
-                    <div className="mt-3 text-sm font-bold text-foreground">{item.title}</div>
+                    <div className="mt-3 flex items-center gap-2 text-sm font-bold text-foreground">
+                      {itemTitle}
+                      {elasticPool && <span className="rounded-full bg-status-green/10 px-2 py-0.5 text-[9px] font-semibold text-status-green">动态领取</span>}
+                    </div>
                     <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
                       {unavailable
                         ? taskType === 'creator_patrol'
                           ? '账号作品发现首版由一个 Agent 串行执行；每个账号只打开一次，避免重复发现。'
                           : '评论巡查首版由一个 Agent 串行执行，避免同一作品被重复打开。'
-                        : taskType === 'negative_patrol' && item.value === 'multi'
-                          ? '把负面帖子均衡拆给多个在线 Agent 并行巡查，降低单账号连续打开大量帖子的压力。'
                         : item.description}
                     </p>
-                    {!unavailable && item.value === 'multi' && selected && taskType !== 'negative_patrol' && (
+                    {!unavailable && item.value === 'multi' && selected && (
                       <p className="mt-2 text-[11px] leading-4 text-primary">
-                        下一页先确定平台和采集规则，再选择兼容节点；Agent 只选一次。
+                        每个节点一次只领一个工作项；做完继续领，快的自然多做。
                       </p>
                     )}
                   </button>
@@ -296,10 +314,10 @@ export function CreateTaskDrawer({
               <h3 className="text-base font-bold">{method === 'multi' ? '选择参与编排的节点' : '选择一个执行节点'}</h3>
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
                 {method === 'multi'
-                  ? taskType === 'negative_patrol'
-                    ? '可多选；确认帖子清单后，系统会把帖子均衡分给这些在线节点，每条帖子只交给一个 Agent。'
-                    : '可多选；关键词会在下一步按规则均分给这些节点。'
-                  : '任务会绑定到具体浏览器扩展。离线 Agent 仍可接单，上线后自动领取。'}
+                  ? contentPatrolTask
+                    ? '可多选；帖子保留在云端，由这些兼容节点空闲时逐篇领取。'
+                    : '可多选；关键词保留在云端，由这些兼容节点空闲时逐个领取。'
+                  : '任务会绑定到具体浏览器扩展。节点离线时原地等待，不会自动转交。'}
               </p>
             </div>
             <AgentPicker
@@ -332,6 +350,8 @@ export function CreateTaskDrawer({
                       ? '关注博主扫描'
                     : taskType === 'negative_patrol'
                       ? '负面帖子巡查'
+                    : taskType === 'watched_content'
+                      ? '关注内容巡查'
                       : taskType === 'comment_patrol'
                         ? '官方账号评论巡查'
                         : '关键词采集'}
@@ -356,8 +376,20 @@ export function CreateTaskDrawer({
                   key={`${selectedAgentIds.join(':')}:negative-patrol`}
                   agents={method === 'multi' ? selectedAgents : [selectedAgent]}
                   writable={writable}
+                  initialRecordIds={intent.recordIds}
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
+                    onClose()
+                  }}
+                />
+              ) : taskType === 'watched_content' ? (
+                <WatchedContentTaskCreator
+                  key={`${selectedAgentIds.join(':')}:watched-content`}
+                  agents={method === 'multi' ? selectedAgents : [selectedAgent]}
+                  writable={writable}
+                  initialRecordIds={intent.recordIds}
+                  onCreated={async () => {
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />
@@ -368,7 +400,7 @@ export function CreateTaskDrawer({
                   writable={writable}
                   initialOfficialAccountId={intent.officialAccountId}
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />
@@ -380,7 +412,7 @@ export function CreateTaskDrawer({
                   initialSubscriptionId={intent.subscriptionId}
                   subjectType="creator"
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />
@@ -395,7 +427,7 @@ export function CreateTaskDrawer({
                   hideLauncher
                   lockExecutionMode
                   onCreated={async () => {
-                    await onCreated()
+                    await onCreated(taskType)
                     onClose()
                   }}
                 />

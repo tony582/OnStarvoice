@@ -7,12 +7,14 @@
   // explicit allow-list instead of treating arbitrary workflow strings as
   // executable browser work.
   const WORKFLOW = "negative_post_patrol";
+  const WATCHED_CONTENT_WORKFLOW = "watched_content_patrol";
   const OFFICIAL_ACCOUNT_COMMENT_WORKFLOW = "official_account_comment_patrol";
   const FOLLOWED_CREATOR_POST_WORKFLOW = "followed_creator_post_patrol";
   const OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW =
     "official_account_post_discovery";
   const SUPPORTED_WORKFLOWS = new Set([
     WORKFLOW,
+    WATCHED_CONTENT_WORKFLOW,
     OFFICIAL_ACCOUNT_COMMENT_WORKFLOW,
     FOLLOWED_CREATOR_POST_WORKFLOW,
     OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW,
@@ -1024,6 +1026,7 @@
   root.OnStarvoiceCloudTargetedPost = Object.freeze({
     PROTOCOL_VERSION,
     WORKFLOW,
+    WATCHED_CONTENT_WORKFLOW,
     OFFICIAL_ACCOUNT_COMMENT_WORKFLOW,
     FOLLOWED_CREATOR_POST_WORKFLOW,
     OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW,

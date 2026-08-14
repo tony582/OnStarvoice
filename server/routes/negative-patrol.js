@@ -16,6 +16,7 @@ import {
 } from '../services/capture-cloud.js';
 import {aggregateParentTaskItems} from '../services/capture-orchestration.js';
 import {
+  getContentPatrolPostTimeline,
   getNegativePatrolAnalytics,
   getNegativePatrolPostTimeline,
 } from '../services/negative-patrol-analytics.js';
@@ -206,8 +207,20 @@ export function normalizeNegativePatrolFilter(body = {}) {
     )};
   }
 
-  const platform = text(source.platform, 40).toLowerCase();
-  if (!SUPPORTED_PLATFORMS.has(platform)) {
+  const rawPlatforms = Array.isArray(source.platforms)
+    ? source.platforms
+    : source.platform === 'mixed'
+      ? [...SUPPORTED_PLATFORMS]
+      : source.platform
+      ? [source.platform]
+      : [];
+  const platforms = [...new Set(rawPlatforms
+    .map(value => text(value, 40).toLowerCase())
+    .filter(Boolean))];
+  if (
+    platforms.length === 0 ||
+    platforms.some(platform => !SUPPORTED_PLATFORMS.has(platform))
+  ) {
     return {failure: requestError(
       'unsupported_platform',
       '负面帖子巡查当前只支持小红书和抖音',
@@ -238,13 +251,51 @@ export function normalizeNegativePatrolFilter(body = {}) {
     filter: {
       publishDateFrom,
       publishDateTo,
-      platform,
+      platform: platforms.length === 1 ? platforms[0] : 'mixed',
+      platforms,
       query: text(source.query, 200),
       minInteractions,
       limit,
       timezone: 'Asia/Shanghai',
       sentiment: 'negative',
       excludePendingFalsePositive: true,
+    },
+  };
+}
+
+export function normalizeWatchedContentFilter(body = {}) {
+  const source = safeJson(body);
+  const rawPlatforms = Array.isArray(source.platforms)
+    ? source.platforms
+    : source.platform && source.platform !== 'mixed'
+      ? [source.platform]
+      : [...SUPPORTED_PLATFORMS];
+  const platforms = [...new Set(rawPlatforms
+    .map(value => text(value, 40).toLowerCase())
+    .filter(Boolean))];
+  if (
+    platforms.length === 0 ||
+    platforms.some(platform => !SUPPORTED_PLATFORMS.has(platform))
+  ) {
+    return {failure: requestError(
+      'unsupported_platform',
+      '关注内容巡查当前只支持小红书和抖音',
+    )};
+  }
+  const limit = boundedInteger(source.limit, 100, 1, MAX_CANDIDATES);
+  if (limit == null) {
+    return {failure: requestError(
+      'invalid_limit',
+      `limit 必须是 1-${MAX_CANDIDATES} 的整数`,
+    )};
+  }
+  return {
+    filter: {
+      platform: platforms.length === 1 ? platforms[0] : 'mixed',
+      platforms,
+      query: text(source.query, 200),
+      limit,
+      watchedOnly: true,
     },
   };
 }
@@ -335,14 +386,14 @@ export function negativePatrolTargetUrl(record = {}) {
 function candidateWhere(tenantId, filter, recordIds = []) {
   const params = [
     tenantId,
-    filter.platform,
+    filter.platforms || [filter.platform],
     filter.publishDateFrom,
     filter.publishDateTo,
     filter.minInteractions,
   ];
   let where = `
     WHERE r.tenant_id = $1
-      AND r.platform = $2
+      AND r.platform = ANY($2::text[])
       AND r.sentiment = 'negative'
       AND r.record_type <> 'official_content'
       AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
@@ -476,6 +527,97 @@ async function loadCandidates(
   };
 }
 
+function watchedCandidateWhere(tenantId, filter, recordIds = []) {
+  const params = [tenantId, filter.platforms || [filter.platform]];
+  let where = `
+    WHERE r.tenant_id = $1
+      AND r.platform = ANY($2::text[])
+      AND r.record_type NOT IN ('official_content', 'blogger_profile')
+      AND r.content_availability_status NOT IN ('deleted', 'page_unavailable')
+      AND r.external_id ~ '^[[:alnum:]_-]{5,200}$'
+      AND EXISTS (
+        SELECT 1
+        FROM record_watchlist rw
+        WHERE rw.tenant_id = r.tenant_id
+          AND rw.record_id = r.id
+      )
+  `;
+  if (filter.query) {
+    params.push(`%${filter.query}%`);
+    where += ` AND (
+      r.title ILIKE $${params.length}
+      OR r.content ILIKE $${params.length}
+      OR r.author_name ILIKE $${params.length}
+      OR r.keyword ILIKE $${params.length}
+    )`;
+  }
+  if (recordIds.length > 0) {
+    params.push(recordIds);
+    where += ` AND r.id = ANY($${params.length}::uuid[])`;
+  }
+  return {where, params};
+}
+
+async function loadWatchedCandidates(
+  executor,
+  tenantId,
+  filter,
+  {recordIds = [], lock = false} = {},
+) {
+  const {where, params} = watchedCandidateWhere(
+    tenantId,
+    filter,
+    recordIds,
+  );
+  const totalRow = await executor.queryOne(`
+    SELECT COUNT(*) AS total
+    FROM records r
+    ${where}
+  `, params);
+  const queryLimit = recordIds.length > 0 ? recordIds.length : filter.limit;
+  const rowParams = [...params, queryLimit];
+  const rows = await executor.queryAll(`
+    SELECT
+      r.id, r.platform, r.external_id, r.title, r.content,
+      r.author_name, r.url, r.canonical_url, r.note_type,
+      r.publish_time, r.published_ts, r.keyword, r.sentiment,
+      r.likes, r.comments_count, r.collects, r.shares, r.last_seen_at,
+      watch.watched_at, watch.watched_by_name,
+      baseline.id AS baseline_observation_id,
+      baseline.captured_at AS baseline_captured_at,
+      baseline.likes AS baseline_likes,
+      baseline.comments_count AS baseline_comments_count,
+      baseline.collects AS baseline_collects,
+      baseline.shares AS baseline_shares
+    FROM records r
+    JOIN record_watchlist watch
+      ON watch.tenant_id = r.tenant_id AND watch.record_id = r.id
+    LEFT JOIN LATERAL (
+      SELECT ro.id, ro.captured_at, ro.likes, ro.comments_count,
+        ro.collects, ro.shares
+      FROM record_observations ro
+      WHERE ro.tenant_id = r.tenant_id AND ro.record_id = r.id
+      ORDER BY ro.captured_at DESC, ro.id DESC
+      LIMIT 1
+    ) baseline ON true
+    ${where}
+    ORDER BY watch.watched_at DESC, r.id
+    LIMIT $${rowParams.length}
+    ${lock ? 'FOR SHARE OF r, watch' : ''}
+  `, rowParams);
+  const candidates = rows.map(row => ({
+    ...publicCandidate(row),
+    watchedAt: row.watched_at,
+    watchedByName: row.watched_by_name,
+  }));
+  return {
+    rows,
+    candidates,
+    total: Number(totalRow?.total || 0),
+    limited: Number(totalRow?.total || 0) > rows.length,
+  };
+}
+
 function normalizedUuid(value) {
   const candidate = text(value, 100).toLowerCase();
   return UUID_PATTERN.test(candidate) ? candidate : '';
@@ -569,7 +711,13 @@ export function allocateNegativePatrolCandidates(
   return {groups, assignments};
 }
 
-async function loadCompatibleAgent(tx, tenantId, agentId, platform) {
+async function loadCompatibleAgent(
+  tx,
+  tenantId,
+  agentId,
+  platform,
+  {workflow = 'negative_post_patrol'} = {},
+) {
   if (!agentId) return {agent: null};
   const agent = await tx.queryOne(`
     SELECT ca.*,
@@ -617,10 +765,30 @@ async function loadCompatibleAgent(tx, tenantId, agentId, platform) {
       409,
     )};
   }
-  if (capabilities.negativePostPatrol !== true) {
+  if (
+    workflow === 'negative_post_patrol' &&
+    capabilities.negativePostPatrol !== true
+  ) {
     return {failure: requestError(
       'agent_negative_patrol_capability_missing',
       '目标执行节点版本尚不支持负面帖子巡查，请先升级扩展',
+      409,
+    )};
+  }
+  if (
+    workflow === 'watched_content_patrol' &&
+    capabilities.watchedContentPatrol !== true
+  ) {
+    return {failure: requestError(
+      'agent_watched_content_patrol_capability_missing',
+      '目标执行节点版本尚不支持关注内容巡查，请先升级扩展',
+      409,
+    )};
+  }
+  if (capabilities.remoteTargetedPostCaptureV1 !== true) {
+    return {failure: requestError(
+      'agent_targeted_post_capability_missing',
+      '目标执行节点版本尚不支持云端逐帖采集，请先升级扩展',
       409,
     )};
   }
@@ -654,23 +822,54 @@ async function loadCompatibleAgents(
   tx,
   tenantId,
   agentIds,
-  platform,
-  {requireOnline = false, requireIdle = false} = {},
+  platformOrPlatforms,
+  {
+    requireOnline = false,
+    requireIdle = false,
+    workflow = 'negative_post_patrol',
+  } = {},
 ) {
+  const platforms = [...new Set((Array.isArray(platformOrPlatforms)
+    ? platformOrPlatforms
+    : [platformOrPlatforms])
+    .map(value => text(value, 40).toLowerCase())
+    .filter(value => SUPPORTED_PLATFORMS.has(value)))];
   const byId = new Map();
+  const coveredPlatforms = new Set();
   // Lock in a stable UUID order so concurrent task creation cannot deadlock
   // when the same Agent set is submitted in a different visual order.
   for (const agentId of [...agentIds].sort()) {
     if (requireIdle) {
       await lockCaptureAgentExecutionSlot(tx, tenantId, agentId);
     }
-    const compatible = await loadCompatibleAgent(
-      tx,
-      tenantId,
-      agentId,
-      platform,
-    );
-    if (compatible.failure) return compatible;
+    let compatible = null;
+    let lastFailure = null;
+    for (const platform of platforms) {
+      const candidate = await loadCompatibleAgent(
+        tx,
+        tenantId,
+        agentId,
+        platform,
+        {workflow},
+      );
+      if (!candidate.failure) {
+        compatible = candidate;
+        break;
+      }
+      lastFailure = candidate.failure;
+      // 平台不匹配可继续尝试清单中的另一个平台；能力或授权错误无需重复。
+      if (![
+        'agent_platform_mismatch',
+        'agent_platform_unsupported',
+      ].includes(candidate.failure.error)) {
+        return candidate;
+      }
+    }
+    if (!compatible) return {failure: lastFailure || requestError(
+      'agent_platform_mismatch',
+      '目标执行节点不能处理当前清单中的任何平台',
+      409,
+    )};
     if (
       requireOnline &&
       !captureAgentOnline(compatible.agent?.last_heartbeat_at)
@@ -712,7 +911,32 @@ async function loadCompatibleAgents(
         )};
       }
     }
+    const capabilities = safeJson(compatible.agent?.capabilities);
+    const allowedPlatforms = Array.isArray(compatible.agent?.allowed_platforms)
+      ? compatible.agent.allowed_platforms
+      : [];
+    const supportedPlatforms = normalizeCaptureAgentPlatforms(
+      capabilities.supportedPlatforms,
+    );
+    for (const platform of platforms) {
+      if (
+        (allowedPlatforms.length === 0 || allowedPlatforms.includes(platform)) &&
+        (supportedPlatforms.length === 0 || supportedPlatforms.includes(platform))
+      ) {
+        coveredPlatforms.add(platform);
+      }
+    }
     byId.set(agentId, compatible.agent);
+  }
+  const missingPlatforms = platforms.filter(platform => !coveredPlatforms.has(platform));
+  if (missingPlatforms.length > 0) {
+    return {failure: requestError(
+      'agent_platform_coverage_missing',
+      `已选执行节点未覆盖${missingPlatforms.map(platform =>
+        platform === 'xiaohongshu' ? '小红书' : '抖音').join('、')}平台`,
+      409,
+      {missingPlatforms},
+    )};
   }
   return {agents: agentIds.map(agentId => byId.get(agentId)).filter(Boolean)};
 }
@@ -736,14 +960,26 @@ function patrolRequestHash({
   filter,
   recordIds,
   captureSettings,
+  distributionMode = 'fixed_batch',
+  workflow = 'negative_post_patrol',
 }) {
   const normalizedAgentIds = Array.isArray(agentIds)
     ? agentIds.filter(Boolean)
     : [];
+  const elasticPool = distributionMode === 'elastic_pool';
   return crypto.createHash('sha256').update(JSON.stringify({
-    workflow: 'negative_post_patrol',
-    protocolVersion: normalizedAgentIds.length > 1 ? 2 : 1,
-    ...(normalizedAgentIds.length > 1
+    workflow,
+    protocolVersion: elasticPool
+      ? 3
+      : normalizedAgentIds.length > 1
+        ? 2
+        : 1,
+    ...(elasticPool
+      ? {
+          distributionMode: 'elastic_pool',
+          eligibleAgentIds: normalizedAgentIds,
+        }
+      : normalizedAgentIds.length > 1
       ? {agentIds: normalizedAgentIds}
       : {agentId: normalizedAgentIds[0] || ''}),
     title,
@@ -751,6 +987,188 @@ function patrolRequestHash({
     recordIds: [...recordIds].sort(),
     captureSettings,
   })).digest('hex');
+}
+
+async function createElasticPatrolTask(tx, {
+  tenantId,
+  requestKey,
+  title,
+  filter,
+  candidates,
+  agents,
+  captureSettings,
+  requestHash,
+  actorId,
+  actorName,
+  workflow = 'negative_post_patrol',
+  featureKey = 'negative_post_patrol',
+  itemType = 'negative_post',
+  triggerType = 'negative_patrol_elastic_pool',
+  queuedMessage = '帖子保留在云端，等待弹性节点逐篇领取',
+  openedMessage = '负面帖子已进入云端弹性队列',
+  openedEventType = 'negative_patrol_elastic_pool_opened',
+  auditAction = 'negative_patrol.create_elastic_pool',
+}) {
+  const selectedRecordIds = candidates.map(candidate => candidate.id);
+  const eligibleAgentIds = agents.map(agent => agent.id);
+  const recoveryPolicy = {
+    allowIdleAgentHandoff: true,
+    platformSafetyMode: 'manual_confirmed',
+  };
+  const metadata = {
+    workflow,
+    businessTaskType: workflow,
+    protocolVersion: 3,
+    multiAgent: true,
+    allocationMode: 'elastic_pool',
+    distributionMode: 'elastic_pool',
+    cloudWorkQueue: true,
+    claimUnit: itemType,
+    remoteCreated: true,
+    remoteRequestHash: requestHash,
+    requestedByUserId: actorId || '',
+    requestedByName: text(actorName, 240),
+    filter,
+    selectedRecordIds,
+    selectedAgentIds: eligibleAgentIds,
+    eligibleAgentIds,
+    captureSettings,
+    planSnapshot: {recoveryPolicy},
+    recoveryPolicy,
+  };
+  const parent = await tx.queryOne(`
+    INSERT INTO capture_tasks (
+      id, tenant_id, client_task_id, task_type, feature_key,
+      title, platform, source, trigger_type, status,
+      progress, checkpoint, counts, metadata, message,
+      orchestration_revision, source_updated_at
+    ) VALUES (
+      $1::uuid, $2, $1::uuid::text, 'capture_orchestration',
+      $8, $3, $4, 'cloud',
+      $9, 'pending',
+      $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
+      $10,
+      1, now()
+    )
+    RETURNING *
+  `, [
+    requestKey,
+    tenantId,
+    title,
+    filter.platform,
+    JSON.stringify({
+      current: 0,
+      total: candidates.length,
+      percent: 0,
+      phase: 'queued',
+    }),
+    JSON.stringify({
+      total: candidates.length,
+      assigned: 0,
+      processed: 0,
+      success: 0,
+      failed: 0,
+      skipped: 0,
+      agents: agents.length,
+    }),
+    JSON.stringify(metadata),
+    featureKey,
+    triggerType,
+    queuedMessage,
+  ]);
+
+  for (let ordinal = 0; ordinal < candidates.length; ordinal += 1) {
+    const candidate = candidates[ordinal];
+    await tx.execute(`
+      INSERT INTO capture_task_items (
+        id, tenant_id, task_id, item_key, ordinal,
+        platform, item_type, record_id, external_id, url_snapshot,
+        status, assigned_agent_id, execution_task_id,
+        assignment_revision, request_hash, metadata
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $11, $7, $8, $9,
+        'pending', NULL, NULL,
+        0, '', $10::jsonb
+      )
+    `, [
+      crypto.randomUUID(),
+      tenantId,
+      parent.id,
+      `record:${candidate.id}`,
+      ordinal,
+      candidate.platform,
+      candidate.id,
+      candidate.externalId,
+      candidate.url,
+      JSON.stringify({
+        sourceRecord: {
+          title: candidate.title,
+          content: text(candidate.content, 1000),
+          authorName: candidate.authorName,
+          publishedAt: candidate.publishedAt,
+          publishTime: candidate.publishTime,
+          keyword: candidate.keyword,
+          noteType: candidate.noteType,
+        },
+        baseline: candidate.baseline,
+      }),
+      itemType,
+    ]);
+  }
+
+  await appendTaskEvent(tx, {
+    tenantId,
+    taskId: parent.id,
+    agentId: null,
+    actorId,
+    actorName,
+    status: parent.status,
+    message: openedMessage,
+    eventType: openedEventType,
+    payload: {
+      platform: filter.platform,
+      candidateCount: candidates.length,
+      eligibleAgentIds,
+      claimUnit: itemType,
+      requestHash,
+    },
+  });
+  await tx.execute(`
+    INSERT INTO audit_logs (
+      tenant_id, actor_type, actor_id, actor_user_id,
+      action, target_type, target_id, metadata
+    ) VALUES (
+      $1, 'user', $2, $3,
+      $6,
+      'capture_task', $4, $5::jsonb
+    )
+  `, [
+    tenantId,
+    text(actorId, 240),
+    actorId || null,
+    parent.id,
+    JSON.stringify({
+      platform: filter.platform,
+      candidateCount: candidates.length,
+      eligibleAgentIds,
+      requestHash,
+    }),
+    auditAction,
+  ]);
+  return {
+    task: parent,
+    commandId: null,
+    commandIds: [],
+    commandExpiresAt: null,
+    agentOnline: agents.some(agent =>
+      captureAgentOnline(agent.last_heartbeat_at),
+    ),
+    agentCount: agents.length,
+    allocation: [],
+    executions: [],
+    existing: false,
+  };
 }
 
 function patrolGroupRequestHash(parentRequestHash, agentId, recordIds) {
@@ -808,6 +1226,22 @@ export function negativePatrolExistingRequestMatches(
     );
   return (
     negativePatrolTask &&
+    Boolean(requestHash) &&
+    metadata.remoteRequestHash === requestHash
+  );
+}
+
+function watchedContentPatrolExistingRequestMatches(
+  existing = {},
+  requestHash = '',
+) {
+  const metadata = safeJson(existing.metadata);
+  return (
+    existing.task_type === 'capture_orchestration' &&
+    (
+      existing.feature_key === 'watched_content_patrol' ||
+      metadata.workflow === 'watched_content_patrol'
+    ) &&
     Boolean(requestHash) &&
     metadata.remoteRequestHash === requestHash
   );
@@ -1212,10 +1646,49 @@ router.post(
       if (normalized.failure) {
         return sendRequestError(res, normalized.failure);
       }
+      const normalizedIds = normalizeRecordIds(req.body?.recordIds);
+      if (normalizedIds.failure) {
+        return sendRequestError(res, normalizedIds.failure);
+      }
       const result = await loadCandidates(
         {queryAll, queryOne},
         req.tenantId,
         normalized.filter,
+        {recordIds: normalizedIds.recordIds},
+      );
+      return res.json({
+        ok: true,
+        candidates: result.candidates,
+        total: result.total,
+        limited: result.limited,
+        filter: normalized.filter,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/watched-content/candidates/preview',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const normalized = normalizeWatchedContentFilter(req.body);
+      if (normalized.failure) {
+        return sendRequestError(res, normalized.failure);
+      }
+      const normalizedIds = normalizeRecordIds(req.body?.recordIds);
+      if (normalizedIds.failure) {
+        return sendRequestError(res, normalizedIds.failure);
+      }
+      const result = await loadWatchedCandidates(
+        {queryAll, queryOne},
+        req.tenantId,
+        normalized.filter,
+        {recordIds: normalizedIds.recordIds},
       );
       return res.json({
         ok: true,
@@ -1288,6 +1761,240 @@ router.get(
   },
 );
 
+router.get(
+  '/content-patrol/posts/:recordId/timeline',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const recordId = normalizedUuid(req.params.recordId);
+      if (!recordId) {
+        return sendRequestError(res, requestError(
+          'invalid_record_id',
+          'recordId 必须是有效 UUID',
+        ));
+      }
+      const timeline = await getContentPatrolPostTimeline({
+        tenantId: req.tenantId,
+        recordId,
+      });
+      if (!timeline) {
+        return res.status(404).json({
+          ok: false,
+          error: 'record_not_found',
+          message: '未找到该舆情内容',
+        });
+      }
+      return res.json({ok: true, ...timeline, timeline});
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/watched-content/tasks',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const normalized = normalizeWatchedContentFilter(req.body);
+      if (normalized.failure) {
+        return sendRequestError(res, normalized.failure);
+      }
+      const normalizedIds = normalizeRecordIds(req.body?.recordIds);
+      if (normalizedIds.failure) {
+        return sendRequestError(res, normalizedIds.failure);
+      }
+      const normalizedAgents = normalizeNegativePatrolAgentIds(req.body);
+      if (normalizedAgents.failure) {
+        return sendRequestError(res, normalizedAgents.failure);
+      }
+      const agentIds = normalizedAgents.agentIds;
+      if (agentIds.length === 0) {
+        return sendRequestError(res, requestError(
+          'watched_content_patrol_agents_required',
+          '请至少选择一个执行节点',
+        ));
+      }
+      const rawRequestKey = text(req.body?.requestKey, 100);
+      const requestKey = rawRequestKey
+        ? normalizedUuid(rawRequestKey)
+        : crypto.randomUUID();
+      if (rawRequestKey && !requestKey) {
+        return sendRequestError(res, requestError(
+          'invalid_request_key',
+          'requestKey 必须是有效 UUID',
+        ));
+      }
+      const title = text(req.body?.title || '关注内容巡查', 240);
+      const captureSettings = sanitizeCloudStructuredObject(
+        req.body?.captureSettings,
+      );
+
+      const result = await withTransaction(async tx => {
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['watched_content_patrol', requestKey],
+        );
+        const existing = await tx.queryOne(`
+          SELECT *
+          FROM capture_tasks
+          WHERE id = $1::uuid AND tenant_id = $2
+          FOR UPDATE
+        `, [requestKey, req.tenantId]);
+        if (existing) {
+          const existingMetadata = safeJson(existing.metadata);
+          const requestRecordIds = normalizedIds.recordIds.length > 0
+            ? normalizedIds.recordIds
+            : Array.isArray(existingMetadata.selectedRecordIds)
+              ? existingMetadata.selectedRecordIds
+              : [];
+          const existingFilter = Object.keys(safeJson(existingMetadata.filter)).length
+            ? safeJson(existingMetadata.filter)
+            : normalized.filter;
+          const requestHash = patrolRequestHash({
+            workflow: 'watched_content_patrol',
+            agentIds,
+            title,
+            filter: existingFilter,
+            recordIds: requestRecordIds,
+            captureSettings,
+            distributionMode: 'elastic_pool',
+          });
+          if (!watchedContentPatrolExistingRequestMatches(
+            existing,
+            requestHash,
+          )) {
+            return {failure: requestError(
+              'idempotency_key_conflict',
+              '该 requestKey 已用于不同的任务请求',
+              409,
+            )};
+          }
+          return {
+            task: existing,
+            agentCount: Array.isArray(existingMetadata.eligibleAgentIds)
+              ? existingMetadata.eligibleAgentIds.length
+              : 0,
+            existing: true,
+          };
+        }
+
+        const globalCollision = await tx.queryOne(
+          'SELECT id FROM capture_tasks WHERE id = $1::uuid',
+          [requestKey],
+        );
+        if (globalCollision) {
+          return {failure: requestError(
+            'idempotency_key_conflict',
+            '该 requestKey 已用于其他任务',
+            409,
+          )};
+        }
+
+        const selection = await loadWatchedCandidates(
+          tx,
+          req.tenantId,
+          normalized.filter,
+          {recordIds: normalizedIds.recordIds, lock: true},
+        );
+        if (selection.candidates.length === 0) {
+          return {failure: requestError(
+            'watched_content_candidates_empty',
+            '当前筛选条件下没有可巡查的已关注内容',
+            409,
+          )};
+        }
+        if (
+          normalizedIds.recordIds.length > 0 &&
+          selection.candidates.length !== normalizedIds.recordIds.length
+        ) {
+          const selected = new Set(
+            selection.candidates.map(candidate => candidate.id),
+          );
+          return {failure: requestError(
+            'candidate_selection_changed',
+            '部分已选内容已取消关注、不可访问或不再符合平台条件，请刷新清单',
+            409,
+            {
+              invalidRecordIds: normalizedIds.recordIds.filter(
+                id => !selected.has(id),
+              ),
+            },
+          )};
+        }
+        const requiredPlatforms = [...new Set(
+          selection.candidates.map(candidate => candidate.platform),
+        )];
+        const filter = {
+          ...normalized.filter,
+          platform: requiredPlatforms.length === 1
+            ? requiredPlatforms[0]
+            : 'mixed',
+          platforms: requiredPlatforms,
+        };
+        const selectedRecordIds = selection.candidates.map(
+          candidate => candidate.id,
+        );
+        const requestHash = patrolRequestHash({
+          workflow: 'watched_content_patrol',
+          agentIds,
+          title,
+          filter,
+          recordIds: selectedRecordIds,
+          captureSettings,
+          distributionMode: 'elastic_pool',
+        });
+        const compatible = await loadCompatibleAgents(
+          tx,
+          req.tenantId,
+          agentIds,
+          requiredPlatforms,
+          {workflow: 'watched_content_patrol'},
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+        return createElasticPatrolTask(tx, {
+          tenantId: req.tenantId,
+          requestKey,
+          title,
+          filter,
+          candidates: selection.candidates,
+          agents: compatible.agents,
+          captureSettings,
+          requestHash,
+          actorId: req.user?.id || '',
+          actorName: req.actorName,
+          workflow: 'watched_content_patrol',
+          featureKey: 'watched_content_patrol',
+          itemType: 'watched_content',
+          triggerType: 'watched_content_elastic_pool',
+          queuedMessage: '关注内容保留在云端，等待兼容节点逐篇领取',
+          openedMessage: '关注内容已进入云端弹性队列',
+          openedEventType: 'watched_content_patrol_elastic_pool_opened',
+          auditAction: 'watched_content_patrol.create_elastic_pool',
+        });
+      });
+
+      if (result.failure) {
+        return sendRequestError(res, result.failure);
+      }
+      return res.status(result.existing ? 200 : 201).json({
+        ok: true,
+        task: result.task,
+        agentCount: result.agentCount || 0,
+        existing: result.existing,
+        message: result.existing
+          ? '相同请求已存在，已返回原任务状态'
+          : `${result.task?.counts?.total || 0} 条关注内容已进入云端队列，兼容节点将按平台逐篇领取`,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
 router.post(
   '/negative-patrol/tasks',
   requireTenantAccess,
@@ -1309,6 +2016,13 @@ router.post(
       }
       const agentIds = normalizedAgents.agentIds;
       const agentId = agentIds[0] || '';
+      const mixedPlatform = normalized.filter.platforms.length > 1;
+      const distributionMode =
+        mixedPlatform || (
+          req.body?.distributionMode === 'elastic_pool' && agentIds.length > 0
+        )
+          ? 'elastic_pool'
+          : 'fixed_batch';
       const rawRequestKey = text(req.body?.requestKey, 100);
       const requestKey = rawRequestKey
         ? normalizedUuid(rawRequestKey)
@@ -1362,6 +2076,7 @@ router.post(
             filter: normalized.filter,
             recordIds: requestRecordIds,
             captureSettings,
+            distributionMode,
           });
           if (
             !negativePatrolExistingRequestMatches(existing, requestHash)
@@ -1453,10 +2168,45 @@ router.post(
           filter: normalized.filter,
           recordIds: selectedRecordIds,
           captureSettings,
+          distributionMode,
         });
 
+        if (distributionMode === 'elastic_pool') {
+          if (agentIds.length === 0) {
+            return {failure: requestError(
+              'negative_patrol_agents_required',
+              '混合平台或弹性巡查请至少选择一个执行节点',
+              409,
+            )};
+          }
+          const requiredPlatforms = [...new Set(
+            selection.candidates.map(candidate => candidate.platform),
+          )];
+          const compatible = await loadCompatibleAgents(
+            tx,
+            req.tenantId,
+            agentIds,
+            requiredPlatforms,
+          );
+          if (compatible.failure) return {failure: compatible.failure};
+          return createElasticPatrolTask(tx, {
+            tenantId: req.tenantId,
+            requestKey,
+            title,
+            filter: normalized.filter,
+            candidates: selection.candidates,
+            agents: compatible.agents,
+            captureSettings,
+            requestHash,
+            actorId: req.user?.id || '',
+            actorName: req.actorName,
+          });
+        }
+
         if (agentIds.length > 1) {
-          if (selection.candidates.length < agentIds.length) {
+          if (
+            selection.candidates.length < agentIds.length
+          ) {
             return {failure: requestError(
               'negative_patrol_candidates_fewer_than_agents',
               `当前选择 ${selection.candidates.length} 条帖子，少于 ${agentIds.length} 个执行节点；请减少节点或增加帖子`,
@@ -1503,6 +2253,9 @@ router.post(
         const metadata = {
           workflow: 'negative_post_patrol',
           protocolVersion: 1,
+          distributionMode: 'fixed_batch',
+          automaticRetryDisabled:
+            req.body?.recoveryPolicy?.allowIdleAgentHandoff === false,
           remoteCreated: true,
           remoteRequestHash: requestHash,
           createCommandId: commandId || '',
@@ -1741,8 +2494,13 @@ router.post(
       if (result.failure) {
         return sendRequestError(res, result.failure);
       }
+      const resultMetadata = safeJson(result.task?.metadata);
+      const elasticPool =
+        resultMetadata.distributionMode === 'elastic_pool';
       const message = result.existing
         ? '相同请求已存在，已返回原任务状态'
+        : elasticPool
+          ? `${result.task?.counts?.total || 0} 条帖子已进入云端队列，空闲节点将逐篇领取`
         : result.agentCount > 1
           ? `任务已均衡分配给 ${result.agentCount} 个在线节点`
         : result.task.assigned_agent_id
@@ -2003,7 +2761,9 @@ router.post(
           tx,
           req.tenantId,
           agentIds,
-          parent.platform,
+          Array.isArray(safeJson(parentMetadata.filter).platforms)
+            ? safeJson(parentMetadata.filter).platforms
+            : parent.platform,
           {requireOnline: true, requireIdle: true},
         );
         if (compatible.failure) return {failure: compatible.failure};

@@ -109,7 +109,13 @@ const UNATTENDED_SUPERVISOR_LOCK_WAIT_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_SCHEMA_VERSION = 2;
 const UNATTENDED_RUN_ARCHIVE_LIMIT = 50;
 const UNATTENDED_RUN_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-const UNATTENDED_MAX_RECOVERY_ATTEMPTS = 2;
+const UNATTENDED_MAX_RECOVERY_ATTEMPTS = 4;
+const UNATTENDED_RECOVERY_RETRY_DELAYS_MS = Object.freeze([
+  60 * 1000,
+  2 * 60 * 1000,
+  5 * 60 * 1000,
+  10 * 60 * 1000,
+]);
 const CONTENT_SCRIPT_READY_TIMEOUT_MS = 10 * 1000;
 const CONTENT_RELAY_DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
 const CONTENT_RELAY_MAX_TIMEOUT_MS = 11 * 60 * 1000;
@@ -702,6 +708,10 @@ function normalizeOrchestrationExecutionContext(value) {
     value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const parentTaskId = String(source.parentTaskId || '').trim().slice(0, 100);
   if (!parentTaskId) return null;
+  const distributionMode =
+    String(source.distributionMode || '').trim() === 'elastic_pool'
+      ? 'elastic_pool'
+      : '';
   const itemIds = Array.from(
     new Set(
       (Array.isArray(source.itemIds) ? source.itemIds : [])
@@ -709,10 +719,15 @@ function normalizeOrchestrationExecutionContext(value) {
         .filter(Boolean),
     ),
   ).slice(0, 30);
+  const attemptIdentity = String(
+    source.attemptIdentity || source.attempt_identity || '',
+  ).trim().slice(0, 100);
   return {
     parentTaskId,
     revision: Math.max(0, Math.floor(Number(source.revision) || 0)),
     itemIds,
+    ...(distributionMode ? {distributionMode} : {}),
+    ...(attemptIdentity ? {attemptIdentity} : {}),
     scheduleId: String(source.scheduleId || '').trim().slice(0, 100),
     scheduledFor: String(source.scheduledFor || '').trim().slice(0, 100),
     sourceExecutionTaskId: String(
@@ -1188,6 +1203,7 @@ function buildUnattendedTaskRun(request, previousRun = null) {
       executionMode,
       cloudAgentScopeId: String(normalized.cloudAgentScopeId || ''),
       recoveryMode: String(normalized.recoveryMode || ''),
+      attemptIdentity: String(orchestrationContext?.attemptIdentity || ''),
       ...(orchestrationContext ? {orchestrationContext} : {}),
     },
     createdAt: normalized.createdAt,
@@ -1333,14 +1349,64 @@ async function persistUnattendedRunMutation(
       normalized,
       {previousRequest, allowAttemptTransition, event, now},
     );
+    const shouldMirrorPlan = mirrorPlan && normalized.cloudAssigned !== true;
     if (ledgerResult.accepted === false) {
+      if (
+        ledgerResult.reason === 'terminal_absorbed' &&
+        isTerminalUnattendedRunStatus(normalized.status)
+      ) {
+        const preservedRequest = normalizeUnattendedRunRequest({
+          ...normalized,
+          status: ledgerResult.run?.status || normalized.status,
+          message: ledgerResult.run?.message || normalized.message,
+          error: ledgerResult.run?.error || normalized.error,
+          finishedAt:
+            ledgerResult.run?.finishedAt ||
+            normalized.finishedAt ||
+            normalized.updatedAt,
+          recoveryPendingLaunch: false,
+          recoveryWaitUntil: '',
+          wakeGraceUntil: '',
+          progress: {
+            ...(normalized.progress && typeof normalized.progress === 'object'
+              ? normalized.progress
+              : {}),
+            phase: `unattended_${ledgerResult.run?.status || normalized.status}`,
+            waitUntil: '',
+            remainingMs: null,
+          },
+        });
+        const preservedPlan = shouldMirrorPlan
+          ? buildPlanMirrorForUnattendedRequest(
+              plan,
+              preservedRequest,
+              now,
+            )
+          : plan;
+        const terminalValues = {
+          [STORAGE_KEYS.unattendedKeywordRunRequest]: preservedRequest,
+          [STORAGE_KEYS.taskLedger]: ledgerResult.ledger,
+        };
+        if (shouldMirrorPlan) {
+          terminalValues[STORAGE_KEYS.unattendedKeywordPlan] = preservedPlan;
+        }
+        await chrome.storage.local.set(terminalValues);
+        scheduleCloudTaskAgentSync('unattended_terminal_reconciled');
+        return {
+          request: preservedRequest,
+          plan: preservedPlan,
+          ledger: ledgerResult.ledger,
+          ledgerAccepted: false,
+          ledgerReason: ledgerResult.reason,
+          alreadyTerminal: true,
+        };
+      }
       const error = new Error(
         `task ledger rejected unattended mutation: ${ledgerResult.reason || 'unknown'}`,
       );
       error.code = 'UNATTENDED_LEDGER_REJECTED';
       throw error;
     }
-    const shouldMirrorPlan = mirrorPlan && normalized.cloudAssigned !== true;
     const nextPlan = shouldMirrorPlan
       ? buildPlanMirrorForUnattendedRequest(plan, normalized, now)
       : plan;
@@ -1436,6 +1502,7 @@ async function readTaskLedger() {
 }
 
 let cloudTaskAgentSyncInFlight = false;
+let cloudTaskAgentLivenessInFlight = false;
 let cloudTaskAgentSyncPending = false;
 let cloudTaskAgentLastSyncAt = 0;
 let cloudTaskAgentSyncTimer = null;
@@ -2088,6 +2155,13 @@ async function readTargetedPostRunRequest({persistNormalized = true} = {}) {
 
 function targetedPostTaskCenterDescriptor(request = {}) {
   const workflow = String(request?.workflow || '').trim();
+  if (workflow === 'watched_content_patrol') {
+    return {
+      workflow,
+      taskType: 'watched_content_patrol',
+      title: String(request?.title || '').trim() || '关注内容巡查',
+    };
+  }
   if (workflow === 'official_account_comment_patrol') {
     return {
       workflow,
@@ -3208,9 +3282,13 @@ async function executeCloudTaskAgentCommand(command, token) {
                 cloudCommandId: commandId,
                 cloudAssigned: true,
                 executionMode,
-                orchestrationContext: normalizeOrchestrationExecutionContext(
-                  payload.orchestration,
-                ),
+                orchestrationContext: normalizeOrchestrationExecutionContext({
+                  ...(payload.orchestration &&
+                  typeof payload.orchestration === 'object'
+                    ? payload.orchestration
+                    : {}),
+                  attemptIdentity: payload.attemptIdentity,
+                }),
               },
             );
             if (!request) {
@@ -3354,6 +3432,32 @@ async function executeCloudTaskAgentCommand(command, token) {
     success: commandResult.accepted === true,
     result: commandResult,
   });
+}
+
+async function syncCloudTaskAgentLiveness({reason = 'liveness'} = {}) {
+  if (!cloudTaskAgentApi?.sendLiveness) {
+    return {ok: false, skipped: true, reason: 'cloud_agent_unavailable'};
+  }
+  if (cloudTaskAgentLivenessInFlight) {
+    return {ok: false, skipped: true, reason: 'liveness_in_flight'};
+  }
+  const credential = await readCloudTaskAgentCredential();
+  if (!credential.id || !credential.token) {
+    return {ok: false, skipped: true, reason: 'missing_agent_credential'};
+  }
+
+  cloudTaskAgentLivenessInFlight = true;
+  try {
+    return await cloudTaskAgentApi.sendLiveness({
+      token: credential.token,
+      body: {
+        reason: String(reason || 'liveness').slice(0, 120),
+        sentAt: new Date().toISOString(),
+      },
+    });
+  } finally {
+    cloudTaskAgentLivenessInFlight = false;
+  }
 }
 
 async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
@@ -3949,9 +4053,22 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
     const nextRequest = {
       ...request,
       status: 'canceled',
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      wakeGraceUntil: '',
       finishedAt: now,
       updatedAt: now,
       message,
+      progress: {
+        ...(request.progress && typeof request.progress === 'object'
+          ? request.progress
+          : {}),
+        phase: 'unattended_canceled',
+        waitUntil: '',
+        remainingMs: null,
+        message,
+        updatedAt: now,
+      },
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
@@ -4058,6 +4175,53 @@ async function releaseUnattendedKeywordPlanLock() {
   return await releaseCaptureExecutionLock(activeLock.id);
 }
 
+async function cleanupTerminalUnattendedRuntime(request, tabIds = []) {
+  const normalizedRequest = normalizeUnattendedRunRequest(request);
+  if (!normalizedRequest) return {request: null, relayedCount: 0};
+  const reconciledRequest = normalizeUnattendedRunRequest({
+    ...normalizedRequest,
+    recoveryPendingLaunch: false,
+    recoveryWaitUntil: '',
+    wakeGraceUntil: '',
+    progress: {
+      ...(normalizedRequest.progress &&
+      typeof normalizedRequest.progress === 'object'
+        ? normalizedRequest.progress
+        : {}),
+      phase: `unattended_${normalizedRequest.status}`,
+      waitUntil: '',
+      remainingMs: null,
+    },
+  });
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
+  });
+  const terminalLock = await snapshotUnattendedKeywordPlanLock();
+  const progress = normalizeUnattendedRunProgress(
+    reconciledRequest.progress,
+    reconciledRequest.message,
+  );
+  const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
+    terminalLock,
+    [
+      ...tabIds,
+      reconciledRequest.runnerTabId,
+      progress?.runnerTabId,
+    ],
+  );
+  // The local ledger can reach a terminal state after the execution lease was
+  // already released.  The stable unattended task id is still sufficient to
+  // find and close a stranded Debug/group/worker session, so cleanup must not
+  // depend on a surviving lock document.
+  await releaseUnattendedCaptureTaskResourcesForRecovery(terminalLock, {
+    reason: 'unattended_terminal_cleanup',
+    request: reconciledRequest,
+  }).catch((error) => {
+    console.warn('[Background] terminal unattended cleanup pending:', error);
+  });
+  return {request: reconciledRequest, relayedCount};
+}
+
 async function snapshotUnattendedKeywordPlanLock() {
   const activeLock = await readActiveCaptureExecutionLock();
   return String(activeLock?.owner || '') === 'unattended_keyword_plan'
@@ -4119,10 +4283,16 @@ async function cancelUnattendedKeywordRunFromControl({
     isTerminalUnattendedRunStatus(request.status) &&
     request.status !== 'needs_action'
   ) {
-    if (isRetryableUnattendedRunRequest(request)) {
+    const terminalCleanup = await cleanupTerminalUnattendedRuntime(
+      request,
+      [tabId],
+    );
+    const reconciledTerminalRequest = terminalCleanup.request || request;
+    const relayedCount = terminalCleanup.relayedCount;
+    if (isRetryableUnattendedRunRequest(reconciledTerminalRequest)) {
       const now = new Date().toISOString();
       const dismissedRequest = {
-        ...request,
+        ...reconciledTerminalRequest,
         recoveryDismissedAt: now,
         recoveryDismissedMessage: message,
         updatedAt: now,
@@ -4137,15 +4307,15 @@ async function cancelUnattendedKeywordRunFromControl({
         reason: 'results_kept',
         request: dismissedRequest,
         plan: await readUnattendedKeywordPlan(),
-        relayedCount: 0,
+        relayedCount,
       };
     }
     return {
       accepted: true,
       reason: 'already_terminal',
-      request,
+      request: reconciledTerminalRequest,
       plan: await readUnattendedKeywordPlan(),
-      relayedCount: 0,
+      relayedCount,
     };
   }
   if (!request) {
@@ -5173,7 +5343,7 @@ async function claimUnattendedKeywordRun({
 }
 
 async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch = {}} = {}) {
-  return await runUnattendedRunMutation(async () => {
+  const result = await runUnattendedRunMutation(async () => {
     const request = await readUnattendedKeywordRunRequest();
     if (!request || !requestId || request.id !== requestId) {
       return {accepted: false, reason: 'not_found', data: null};
@@ -5264,6 +5434,13 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       Object.prototype.hasOwnProperty.call(safePatch.progress, 'waitUntil')
     ) {
       waitUntil = String(safePatch.progress.waitUntil || '');
+    } else if (
+      hasProgress &&
+      !String(safePatch.progress?.phase || '').startsWith('waiting_')
+    ) {
+      // 收到真实执行阶段后，清掉上一段恢复等待。否则任务中心会在任务已经
+      // 前进时继续展示一个过期倒计时。
+      waitUntil = '';
     }
     const nextRequest = {
       ...request,
@@ -5288,11 +5465,21 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
     };
     if (isTerminalUnattendedRunStatus(nextStatus)) {
       nextRequest.finishedAt = String(safePatch.finishedAt || now);
+      nextRequest.recoveryPendingLaunch = false;
+      nextRequest.recoveryWaitUntil = '';
+      nextRequest.wakeGraceUntil = '';
+      nextRequest.progress = {
+        ...(nextRequest.progress && typeof nextRequest.progress === 'object'
+          ? nextRequest.progress
+          : {}),
+        waitUntil: '',
+        remainingMs: null,
+      };
     }
     delete nextRequest.requestId;
 
     const statusChanged = nextStatus !== request.status;
-    await persistUnattendedRunMutation(nextRequest, {
+    const persisted = await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
       event:
         statusChanged || hasBusinessProgress
@@ -5309,8 +5496,27 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
             }
           : null,
     });
-    return {accepted: true, reason: 'updated', data: nextRequest};
+    return {
+      accepted: true,
+      reason: 'updated',
+      data: persisted?.request || nextRequest,
+      previousRunnerTabId: request.runnerTabId,
+    };
   });
+  if (
+    result?.accepted &&
+    isTerminalUnattendedRunStatus(result.data?.status)
+  ) {
+    const terminalCleanup = await cleanupTerminalUnattendedRuntime(
+      result.data,
+      [result.previousRunnerTabId, result.data?.progress?.runnerTabId],
+    );
+    return {
+      ...result,
+      data: terminalCleanup.request || result.data,
+    };
+  }
+  return result;
 }
 
 async function launchUnattendedKeywordRun(
@@ -5651,6 +5857,16 @@ async function deferPendingUnattendedRecoveryForLock(request, activeLock) {
       status: 'recovering',
       recoveryPendingLaunch: true,
       recoveryWaitUntil: waitUntil,
+      progress: {
+        ...(current.progress && typeof current.progress === 'object'
+          ? current.progress
+          : {}),
+        phase: 'waiting_capture_slot',
+        waitUntil,
+        remainingMs: UNATTENDED_SUPERVISOR_LOCK_WAIT_MS,
+        message,
+        updatedAt: now.toISOString(),
+      },
       updatedAt: now.toISOString(),
       message,
     };
@@ -5757,6 +5973,18 @@ async function launchPendingUnattendedRecovery(request) {
       businessProgressAt: now,
       updatedAt: now,
       message: `正在启动第 ${current.attemptNumber} 次${executionCopy.runLabel}`,
+      progress: {
+        ...(current.progress && typeof current.progress === 'object'
+          ? current.progress
+          : {}),
+        phase: 'launching_recovery',
+        waitUntil: '',
+        remainingMs: null,
+        attemptCurrent: Math.max(1, Number(current.recoveryCount) || 1),
+        attemptTotal: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+        message: `正在启动第 ${current.attemptNumber} 次${executionCopy.runLabel}`,
+        updatedAt: now,
+      },
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
@@ -5795,31 +6023,67 @@ async function launchPendingUnattendedRecovery(request) {
       const launchFailures =
         Math.max(0, Number(current.recoveryLaunchFailures) || 0) + 1;
       const exhausted = launchFailures >= UNATTENDED_MAX_RECOVERY_ATTEMPTS;
-      const exhaustedMessage = `${message}；运行页连续启动失败 ${launchFailures} 次，请人工检查`;
+      const returnToCloud = exhausted && current.cloudAssigned === true;
+      const exhaustedMessage = returnToCloud
+        ? `${message}；运行页经过 ${launchFailures} 次分散启动仍失败，当前关键词已交回云端等待其它 Agent 接力`
+        : `${message}；运行页连续启动失败 ${launchFailures} 次，请人工检查`;
+      const waitUntil = exhausted
+        ? ''
+        : new Date(
+            now.getTime() + UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
+          ).toISOString();
+      const nextMessage = exhausted
+        ? exhaustedMessage
+        : `${message}；下一次运行页启动将在倒计时结束后开始（${launchFailures + 1}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS}）`;
       const nextRequest = {
         ...current,
-        status: exhausted ? 'needs_action' : 'recovering',
+        status: exhausted
+          ? returnToCloud
+            ? 'failed'
+            : 'needs_action'
+          : 'recovering',
         recoveryPendingLaunch: !exhausted,
-        recoveryWaitUntil: exhausted
-          ? ''
-          : new Date(
-              now.getTime() + UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
-            ).toISOString(),
+        recoveryWaitUntil: waitUntil,
         recoveryLaunchFailures: launchFailures,
         finishedAt: exhausted ? now.toISOString() : '',
         updatedAt: now.toISOString(),
-        message: exhausted ? exhaustedMessage : message,
+        message: nextMessage,
+        progress: {
+          ...(current.progress && typeof current.progress === 'object'
+            ? current.progress
+            : {}),
+          phase: exhausted
+            ? returnToCloud
+              ? 'returned_to_cloud_queue'
+              : 'recovery_launch_exhausted'
+            : 'waiting_recovery_launch',
+          waitUntil,
+          remainingMs: exhausted
+            ? null
+            : UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
+          attemptCurrent: Math.min(
+            UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+            launchFailures + 1,
+          ),
+          attemptTotal: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+          message: nextMessage,
+          updatedAt: now.toISOString(),
+        },
         error: {
           code: exhausted
             ? 'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED'
             : 'RECOVERY_LAUNCH_FAILED',
-          message: exhausted ? exhaustedMessage : message,
+          message: nextMessage,
+          retryable: returnToCloud || !exhausted,
+          requiresManualAction: exhausted && !returnToCloud,
+          category: 'temporary_runtime_recovery',
         },
       };
       await persistUnattendedRunMutation(nextRequest, {
         previousRequest: current,
         event: {
           type: exhausted ? 'needs_action' : 'recovery_launch_failed',
+          ...(returnToCloud ? {type: 'failed'} : {}),
           message: nextRequest.message,
           at: now.toISOString(),
         },
@@ -5828,11 +6092,11 @@ async function launchPendingUnattendedRecovery(request) {
     });
     return {
       recovered: false,
-      deferred: deferredRequest?.status !== 'needs_action',
-      terminal: deferredRequest?.status === 'needs_action',
+      deferred: !['needs_action', 'failed'].includes(deferredRequest?.status),
+      terminal: ['needs_action', 'failed'].includes(deferredRequest?.status),
       request: deferredRequest,
       reason:
-        deferredRequest?.status === 'needs_action'
+        ['needs_action', 'failed'].includes(deferredRequest?.status)
           ? 'recovery_launch_exhausted'
           : 'recovery_launch_failed',
     };
@@ -5903,25 +6167,62 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
         health.reason,
         current,
       );
-      const message = `${reasonText}，自动恢复已达到 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次，请人工检查后继续`;
+      const cloudAssigned = current.cloudAssigned === true;
+      const message = cloudAssigned
+        ? `${reasonText}，已完成 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次分散恢复，当前关键词已交回云端等待其它 Agent 接力`
+        : `${reasonText}，自动恢复已达到 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次，请人工检查后继续`;
       const nextRequest = {
         ...current,
-        status: 'needs_action',
+        status: cloudAssigned ? 'failed' : 'needs_action',
         finishedAt: now,
         updatedAt: now,
         message,
-        error: {code: 'UNATTENDED_RECOVERY_EXHAUSTED', message},
+        progress: {
+          ...(current.progress && typeof current.progress === 'object'
+            ? current.progress
+            : {}),
+          phase: cloudAssigned
+            ? 'returned_to_cloud_queue'
+            : 'automatic_recovery_exhausted',
+          waitUntil: '',
+          remainingMs: null,
+          attemptCurrent: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+          attemptTotal: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+          message,
+          updatedAt: now,
+        },
+        error: {
+          code: 'UNATTENDED_RECOVERY_EXHAUSTED',
+          message,
+          retryable: cloudAssigned,
+          requiresManualAction: !cloudAssigned,
+          category: 'temporary_runtime_recovery',
+        },
       };
       await persistUnattendedRunMutation(nextRequest, {
         previousRequest: current,
-        event: {type: 'needs_action', message, at: now},
+        event: {
+          type: cloudAssigned ? 'failed' : 'needs_action',
+          message,
+          at: now,
+        },
       });
       return {action: 'terminal', request: nextRequest};
     }
 
     const nextRecoveryCount = recoveryCount + 1;
     const reasonText = formatUnattendedRecoveryReason(health.reason, current);
-    const message = `${reasonText}，正在自动恢复（${nextRecoveryCount}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS}）`;
+    const recoveryDelayMs = Math.max(
+      0,
+      Number(
+        UNATTENDED_RECOVERY_RETRY_DELAYS_MS[nextRecoveryCount - 1] ??
+          UNATTENDED_RECOVERY_RETRY_DELAYS_MS.at(-1),
+      ) || 0,
+    );
+    const recoveryWaitUntil = new Date(
+      Date.now() + recoveryDelayMs,
+    ).toISOString();
+    const message = `${reasonText}，第 ${nextRecoveryCount}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次自动恢复将在倒计时结束后开始`;
     const nextRequest = {
       ...current,
       attemptId: createUuid(),
@@ -5931,13 +6232,25 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       recoveryReason: String(health.reason || ''),
       recoveryPendingLaunch: true,
       recoveryLaunchFailures: 0,
-      recoveryWaitUntil: '',
+      recoveryWaitUntil,
       status: 'recovering',
       runnerTabId: null,
       heartbeatAt: now,
       businessProgressAt: now,
       updatedAt: now,
       message,
+      progress: {
+        ...(current.progress && typeof current.progress === 'object'
+          ? current.progress
+          : {}),
+        phase: 'waiting_automatic_recovery',
+        waitUntil: recoveryWaitUntil,
+        remainingMs: recoveryDelayMs,
+        attemptCurrent: nextRecoveryCount,
+        attemptTotal: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
+        message,
+        updatedAt: now,
+      },
       error: null,
     };
     await persistUnattendedRunMutation(nextRequest, {
@@ -5982,6 +6295,17 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
   }
   if (transition.action === 'terminal') {
     return {recovered: false, terminal: true, request: transition.request};
+  }
+  const recoveryWaitUntil = parseTimestampMs(
+    transition.request?.recoveryWaitUntil,
+  );
+  if (Number.isFinite(recoveryWaitUntil) && recoveryWaitUntil > Date.now()) {
+    return {
+      recovered: false,
+      deferred: true,
+      reason: 'recovery_wait',
+      request: transition.request,
+    };
   }
   return await launchPendingUnattendedRecovery(transition.request);
 }
@@ -6426,17 +6750,30 @@ async function applyUnattendedWakeGrace(request, reason = 'wake') {
     const wakeGraceUntil = new Date(
       now.getTime() + UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
     ).toISOString();
+    const message = '检测到浏览器或电脑恢复，等待运行页重新连接';
     const nextRequest = {
       ...current,
       wakeGraceUntil,
+      recoveryWaitUntil: wakeGraceUntil,
       updatedAt: now.toISOString(),
       wakeReason: reason,
+      message,
+      progress: {
+        ...(current.progress && typeof current.progress === 'object'
+          ? current.progress
+          : {}),
+        phase: 'waiting_runner_reconnect',
+        waitUntil: wakeGraceUntil,
+        remainingMs: UNATTENDED_SUPERVISOR_WAKE_GRACE_MS,
+        message,
+        updatedAt: now.toISOString(),
+      },
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
       event: {
         type: 'wake_grace',
-        message: '检测到浏览器或电脑恢复，等待运行页重新连接',
+        message,
         at: now.toISOString(),
       },
     });
@@ -9092,7 +9429,7 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   } else {
     captureTaskOwnerCoordinator?.clearTask(taskId);
   }
-  await clearUnattendedCaptureTaskLockBinding(lock.id, taskId, {
+  await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
     expectedHolderId: lock?.holderId,
     expectedHolderDocumentId: lock?.holderDocumentId,
     expectedHolderTabId: lock?.holderTabId,
@@ -9818,6 +10155,9 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm?.name === CLOUD_TASK_AGENT_ALARM_NAME) {
+    syncCloudTaskAgentLiveness({reason: 'cloud_agent_alarm'}).catch((error) => {
+      console.error('[onstarvoice] cloud task agent liveness failed', error);
+    });
     syncCloudTaskAgent({reason: 'cloud_agent_alarm', force: true}).catch((error) => {
       console.error('[onstarvoice] cloud task agent heartbeat failed', error);
     });

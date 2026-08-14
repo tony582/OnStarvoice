@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useState } from 'react'
-import { Check, Minus, X, Loader2 } from 'lucide-react'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
+import { Check, ChevronDown, Minus, X, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /**
@@ -77,19 +78,28 @@ export type BatchAction = {
   separatorBefore?: boolean
 }
 
+export type BatchActionMenu = {
+  key: string
+  label: string
+  icon?: React.ElementType
+  tone?: 'default' | 'primary'
+  actions: BatchAction[]
+}
+
 /**
  * 浮动批量操作条。选中数 > 0 时从底部浮起,居中显示,操作执行期间禁用并转圈。
  */
-export function BatchBar({ count, actions, onAction, onClear, busy }: {
+export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }: {
   count: number
   actions: BatchAction[]
+  menus?: BatchActionMenu[]
   onAction: (key: string) => void
   onClear: () => void
   busy?: boolean
 }) {
   if (count <= 0) return null
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-[max(1rem,env(safe-area-inset-bottom))] z-40 flex justify-center px-3 sm:px-4">
+    <div className="pointer-events-none fixed inset-x-0 bottom-[calc(max(1rem,env(safe-area-inset-bottom))+3.75rem)] z-40 flex justify-center px-3 sm:px-4 lg:bottom-[max(1rem,env(safe-area-inset-bottom))]">
       <div
         role="toolbar"
         aria-label="批量处理"
@@ -102,38 +112,88 @@ export function BatchBar({ count, actions, onAction, onClear, busy }: {
           <span className="rounded bg-white/20 px-1.5 py-0.5 text-[12px] font-bold tabular-nums">{count} 条</span>
         </div>
         <div className="flex items-center gap-1 px-2">
-        {actions.map(action => {
-          const Icon = action.icon
-          return (
-            <Fragment key={action.key}>
-              {action.separatorBefore && <div className="mx-1 h-6 w-px shrink-0 bg-border" />}
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => onAction(action.key)}
-                className={cn(
-                  'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-50 lg:h-8',
-                  action.tone === 'danger'
-                    ? 'text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30'
-                    : 'text-foreground hover:bg-accent hover:text-primary',
-                )}
-              >
-                {Icon && <Icon className="h-3.5 w-3.5" />}
-                {action.label}
-              </button>
-            </Fragment>
-          )
-        })}
-        <div className="mx-1 h-6 w-px shrink-0 bg-border" />
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onClear}
-          className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 lg:h-8 lg:w-8"
-          aria-label="取消选择"
-        >
-          <X className="h-4 w-4" />
-        </button>
+          {actions.map(action => {
+            const Icon = action.icon
+            return (
+              <Fragment key={action.key}>
+                {action.separatorBefore && <div className="mx-1 h-6 w-px shrink-0 bg-border" />}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => onAction(action.key)}
+                  className={cn(
+                    'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-50 lg:h-8',
+                    action.tone === 'danger'
+                      ? 'text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30'
+                      : 'text-foreground hover:bg-accent hover:text-primary',
+                  )}
+                >
+                  {Icon && <Icon className="h-3.5 w-3.5" />}
+                  {action.label}
+                </button>
+              </Fragment>
+            )
+          })}
+          {menus.map(menu => {
+            const MenuIcon = menu.icon
+            return (
+              <DropdownMenu.Root key={menu.key}>
+                <DropdownMenu.Trigger asChild>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    className={cn(
+                      'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-50 lg:h-8',
+                      menu.tone === 'primary'
+                        ? 'bg-primary/10 text-primary hover:bg-primary/15'
+                        : 'text-foreground hover:bg-accent hover:text-primary',
+                    )}
+                  >
+                    {MenuIcon && <MenuIcon className="h-3.5 w-3.5" />}
+                    {menu.label}
+                    <ChevronDown className="h-3 w-3 text-muted-foreground" />
+                  </button>
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Portal>
+                  <DropdownMenu.Content
+                    side="top"
+                    align="start"
+                    sideOffset={8}
+                    className="z-[90] min-w-44 rounded-lg border border-border bg-popover p-1.5 text-popover-foreground shadow-xl"
+                  >
+                    {menu.actions.map(action => {
+                      const Icon = action.icon
+                      return (
+                        <Fragment key={action.key}>
+                          {action.separatorBefore && <DropdownMenu.Separator className="my-1 h-px bg-border/70" />}
+                          <DropdownMenu.Item
+                            onSelect={() => onAction(action.key)}
+                            className={cn(
+                              'flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-md px-2.5 text-[12px] font-medium outline-none data-[highlighted]:bg-accent data-[highlighted]:text-primary',
+                              action.tone === 'danger' && 'text-rose-600 data-[highlighted]:bg-rose-50 dark:data-[highlighted]:bg-rose-950/30',
+                            )}
+                          >
+                            {Icon && <Icon className="h-3.5 w-3.5" />}
+                            {action.label}
+                          </DropdownMenu.Item>
+                        </Fragment>
+                      )
+                    })}
+                  </DropdownMenu.Content>
+                </DropdownMenu.Portal>
+              </DropdownMenu.Root>
+            )
+          })}
+          <div className="mx-1 h-6 w-px shrink-0 bg-border" />
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onClear}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 lg:h-8 lg:w-8"
+            aria-label="取消选择"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </div>
       </div>
     </div>

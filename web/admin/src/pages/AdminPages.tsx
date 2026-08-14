@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { useBadges } from '@/lib/badges'
 
 /* ==================== TenantsPage ==================== */
 export function TenantsPage() {
@@ -681,6 +682,7 @@ type AiFailoverStatus = {
 }
 
 export function SettingsPage() {
+  const { refresh: refreshBadges } = useBadges()
   const [settings, setSettings] = useState<Record<string, string>>({})
   const [aiFailoverStatus, setAiFailoverStatus] = useState<AiFailoverStatus | null>(null)
   const [loading, setLoading] = useState(true)
@@ -728,9 +730,12 @@ export function SettingsPage() {
       if (smtpPass && smtpPass !== '***') body.smtp_pass = smtpPass
     } else if (group === 'report') {
       for (const k of ['report_daily_time', 'report_weekly_time', 'report_monthly_day', 'report_monthly_time']) body[k] = settings[k]
+    } else if (group === 'comment-risk') {
+      body.comment_risk_attention_enabled = settings.comment_risk_attention_enabled === 'false' ? 'false' : 'true'
     }
     await api.put('/admin/settings', body)
     if (group === 'llm') await loadSettings()
+    if (group === 'comment-risk') refreshBadges()
     alert('保存成功')
   }
 
@@ -795,6 +800,27 @@ export function SettingsPage() {
           <Field label="噪音/排除词（逗号分隔）" full><Input value={settings.brand_noise_terms || ''} onChange={e => u('brand_noise_terms', e.target.value)} placeholder="出现这些词多为无关，如：同名地名/小区/人名" /></Field>
         </div>
         <p className="mt-3 text-xs text-muted-foreground">留空则回退到系统默认（安吉星）语境。给新公司开租户后，请在这里填该公司自己的品牌，AI 才会按它的语境判舆情。</p>
+      </SettingsCard>
+
+      <SettingsCard
+        title="舆情值守范围"
+        description="决定风险评论是否进入日常值守提醒和舆情风险统计。"
+        onSave={() => save('comment-risk')}
+      >
+        <label className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+          <input
+            type="checkbox"
+            checked={settings.comment_risk_attention_enabled !== 'false'}
+            onChange={event => u('comment_risk_attention_enabled', event.target.checked ? 'true' : 'false')}
+            className="mt-0.5 h-4 w-4 accent-primary"
+          />
+          <span>
+            <span className="block text-sm font-semibold">评论纳入舆情关注</span>
+            <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+              开启后，风险评论进入手机待办、指挥中心、分析看板、报告和舆情剖析；关闭后仍持续采集、AI 标注并保留评论分诊，但不再计入值守提醒和舆情风险数字。
+            </span>
+          </span>
+        </label>
       </SettingsCard>
 
       <SettingsCard title="报告时间" description="分别设置日报、周报和月报的生成时点。" onSave={() => save('report')}>

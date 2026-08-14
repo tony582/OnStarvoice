@@ -75,6 +75,7 @@ const LABELS = {
     reviewed: '已复核',
     reviewed_non_monitor: '已复核-非监控内容',
     unavailable: '已不可见',
+    privacy_unreachable: '负面–隐私设置无法触达',
     negative_feishu: '负面-飞书表',
     negative_cold: '负面-冷处理',
     // 历史状态兼容。
@@ -293,6 +294,7 @@ async function renderTriage() {
     { value: 'reviewed', label: '已复核' },
     { value: 'reviewed_non_monitor', label: '已复核-非监控内容' },
     { value: 'unavailable', label: '已不可见' },
+    { value: 'privacy_unreachable', label: '负面–隐私设置无法触达' },
     { value: 'negative_feishu', label: '负面-飞书表' },
     { value: 'negative_cold', label: '负面-冷处理' },
   ];
@@ -643,6 +645,7 @@ function triageActions(r) {
         <button onclick="updateTriage('${escAttr(r.id)}','reviewed'); this.closest('.action-dropdown').classList.remove('open')">已复核</button>
         <button onclick="updateTriage('${escAttr(r.id)}','reviewed_non_monitor'); this.closest('.action-dropdown').classList.remove('open')">已复核-非监控内容</button>
         <button onclick="updateTriage('${escAttr(r.id)}','unavailable'); this.closest('.action-dropdown').classList.remove('open')">已不可见</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','privacy_unreachable'); this.closest('.action-dropdown').classList.remove('open')">负面–隐私设置无法触达</button>
         <button onclick="updateTriage('${escAttr(r.id)}','negative_feishu'); this.closest('.action-dropdown').classList.remove('open')">负面-飞书表</button>
         <button onclick="updateTriage('${escAttr(r.id)}','negative_cold'); this.closest('.action-dropdown').classList.remove('open')">负面-冷处理</button>
         <button onclick="archiveRecord('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">归档</button>

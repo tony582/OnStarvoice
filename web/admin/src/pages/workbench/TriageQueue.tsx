@@ -5,7 +5,7 @@ import {
   Check, CheckCircle, Archive, ArchiveRestore, CircleOff, Loader2, ChevronDown,
   User, FileText, Bell, ExternalLink,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
-  Rows3, Kanban,
+  Rows3, Kanban, MoreHorizontal, Radar, ShieldAlert, Star,
 } from 'lucide-react'
 import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
@@ -37,12 +37,21 @@ import {
 import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
+import { useNav } from '@/lib/navigation'
 
 interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
   customTags?: unknown
   custom_tags?: unknown
   record?: unknown
+}
+interface DeleteCustomTagResponse {
+  affectedRecords?: unknown
+  tag?: {
+    id?: unknown
+    name?: unknown
+    affectedRecords?: unknown
+  }
 }
 interface ManualFieldsMutationResponse {
   record?: unknown
@@ -56,6 +65,11 @@ interface BatchModeMutationResponse {
   updatedIds?: unknown
   skipped?: unknown
 }
+interface WatchMutationResponse {
+  recordIds?: unknown
+  changedIds?: unknown
+  skipped?: unknown
+}
 type BatchFeedback = {
   message: string
   tone: 'success' | 'warning' | 'error'
@@ -67,7 +81,7 @@ const RISK_OPTIONS = [
   { value: 'deleted', label: '已删帖' },
 ]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
-type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'negative_feishu' | 'negative_cold'
+type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold'
 type ArchiveView = 'active' | 'archived'
 const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: React.ElementType }> = [
   { value: 'unhandled', label: '待处理', icon: Inbox },
@@ -75,11 +89,12 @@ const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: Reac
   { value: 'reviewed', label: '已复核', icon: Check },
   { value: 'reviewed_non_monitor', label: '已复核-非监控内容', icon: CircleOff },
   { value: 'unavailable', label: '已不可见', icon: CircleOff },
+  { value: 'privacy_unreachable', label: '负面–隐私设置无法触达', icon: CircleOff },
   { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
   { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
 ]
 const PLATFORM_BADGE_CLASS = 'w-14 justify-center dark:text-white'
-const TRIAGE_MODE_BADGE_CLASS = 'w-[132px] justify-center dark:text-white'
+const TRIAGE_MODE_BADGE_CLASS = 'w-[112px] justify-center overflow-hidden dark:text-white'
 const ARCHIVE_VIEWS: Array<{ value: ArchiveView; label: string; icon: React.ElementType }> = [
   { value: 'active', label: '工作中', icon: Inbox },
   { value: 'archived', label: '已归档', icon: Archive },
@@ -175,8 +190,73 @@ function HeaderSingleFilter({ label, value, options, onChange }: {
   )
 }
 
+function HeaderMultiFilter({ label, value, options, onChange }: {
+  label: string
+  value: string[]
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string[]) => void
+}) {
+  const toggle = (nextValue: string) => onChange(
+    value.includes(nextValue)
+      ? value.filter(item => item !== nextValue)
+      : [...value, nextValue],
+  )
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`${label}筛选${value.length ? `，已选${value.length}项` : '，全部'}`}
+          className={cn(
+            'inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium uppercase tracking-wider outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20',
+            value.length ? 'text-primary' : 'text-muted-foreground',
+          )}
+        >
+          <span>{label}</span>
+          {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
+          <ChevronDown className="h-3 w-3" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={5}
+          collisionPadding={10}
+          className="z-[100] min-w-48 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
+        >
+          {value.length > 0 && (
+            <DropdownMenu.Item
+              onSelect={event => { event.preventDefault(); onChange([]) }}
+              className="flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 text-[11px] text-muted-foreground outline-none data-[highlighted]:bg-accent data-[highlighted]:text-foreground"
+            >
+              <X className="h-3 w-3" />清空已选（{value.length}）
+            </DropdownMenu.Item>
+          )}
+          {options.map(option => {
+            const checked = value.includes(option.value)
+            return (
+              <DropdownMenu.CheckboxItem
+                key={option.value}
+                checked={checked}
+                onCheckedChange={() => toggle(option.value)}
+                onSelect={event => event.preventDefault()}
+                className="flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent"
+              >
+                <span className={cn('flex-1', checked && 'font-semibold')}>{option.label}</span>
+                <span className="flex h-4 w-4 items-center justify-center rounded border border-border">
+                  <DropdownMenu.ItemIndicator><Check className="h-3 w-3 text-primary" /></DropdownMenu.ItemIndicator>
+                </span>
+              </DropdownMenu.CheckboxItem>
+            )
+          })}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  )
+}
+
 function recordAccentClass(record: Record<string, unknown>) {
-  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold') return 'bg-status-red'
+  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
   if (record.triage_status === 'replied' || record.triage_status === 'reviewed') return 'bg-status-green'
   if (record.sentiment === 'negative') return 'bg-status-red'
   if (record.sentiment === 'positive') return 'bg-status-green'
@@ -260,13 +340,16 @@ function changedBatchModeIds(data: BatchModeMutationResponse | undefined, reques
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
+  const { navigate } = useNav()
   const [view, setView] = useState<'list' | 'board'>('list')
   const [boardNonce, setBoardNonce] = useState(0)
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
+  const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
-  const [triageStatus, setTriageStatus] = useState(initial?.status ?? '')
+  const [triageStatuses, setTriageStatuses] = useState<string[]>(() =>
+    String(initial?.status || '').split(',').map(value => value.trim()).filter(Boolean))
   const [risk, setRisk] = useState<string[]>([])
   const [identity, setIdentity] = useState<string[]>([])
   const [captureKeywords, setCaptureKeywords] = useState<string[]>(() => String(initial?.captureKeywords || '')
@@ -288,6 +371,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [modeBusyId, setModeBusyId] = useState<string | null>(null)
   const [noteBusyId, setNoteBusyId] = useState<string | null>(null)
   const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null)
+  const [watchBusyId, setWatchBusyId] = useState<string | null>(null)
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState<'content' | 'history'>('content')
   const [batchBusy, setBatchBusy] = useState(false)
@@ -297,7 +381,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
-  const sel = useSelection(`${archiveView}|${triageStatus}|${risk}|${identity}|${platform}|${sentiment}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
 
   const showBatchFeedback = useCallback((message: string, tone: BatchFeedback['tone']) => {
     window.clearTimeout(batchFeedbackTimer.current)
@@ -323,9 +407,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
+    if (watchedFilter) params.set('watched', watchedFilter)
     if (archiveView === 'archived') params.set('bucket', 'archived')
     else params.set('queue', 'triage')
-    if (triageStatus) params.set('status', triageStatus)
+    triageStatuses.forEach(status => params.append('status', status))
     risk.forEach(rk => params.append('risk', rk))
     identity.forEach(id => params.append('identity', id))
     params.set('sort', sort.field)
@@ -340,7 +425,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
     if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
     return params
-  }, [archiveView, triageStatus, risk, identity, sentiment, platform, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (!options?.silent) setLoading(true)
@@ -367,18 +452,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
-  const handlingStatus = triageStatus
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatus || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
-  const activeFilterCount = [platform, sentiment, triageStatus].filter(Boolean).length
-    + Number(Boolean(keyword)) + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
+  const activeFilterCount = [platform, sentiment].filter(Boolean).length
+    + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatus(''); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
+    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setSort({ field: 'publish', dir: 'desc' })
-  }
-  const changeHandlingStatusFilter = (value: string) => {
-    setTriageStatus(value)
   }
   useEffect(() => { void load() }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
@@ -477,6 +558,31 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return tags
   }
 
+  const deleteCustomTag = async (tag: CustomTag): Promise<number> => {
+    if (archiveView === 'archived') return 0
+    const data = await api.delete<DeleteCustomTagResponse>('/custom-tags/' + encodeURIComponent(tag.id))
+    const affectedRecords = Math.max(0, Number(data.affectedRecords ?? data.tag?.affectedRecords ?? tag.usageCount ?? 0))
+    const deletedId = String(data.tag?.id || tag.id)
+
+    // 使删除前发出的目录请求失效，避免旧响应把刚删掉的标签重新放回列表。
+    customTagRequestSeq.current += 1
+    setCustomTagCatalog(current => current.filter(item => item.id !== deletedId))
+    setCustomTagIds(current => current.filter(id => id !== deletedId))
+    const withoutDeletedTag = (record: Record<string, unknown>) => withCustomTags(
+      record,
+      tagsFromRecord(record).filter(item => item.id !== deletedId),
+    )
+    setRecords(current => current.map(record => withoutDeletedTag(record)))
+    setDrawerRecord((current: Record<string, unknown> | null) => current ? withoutDeletedTag(current) : current)
+    showBatchFeedback(
+      affectedRecords > 0
+        ? `标签“${String(data.tag?.name || tag.name)}”已删除，并已从 ${affectedRecords.toLocaleString('zh-CN')} 条内容中移除`
+        : `标签“${String(data.tag?.name || tag.name)}”已删除`,
+      'success',
+    )
+    return affectedRecords
+  }
+
   const addRecordNote = useCallback(async (record: any): Promise<boolean> => {
     if (archiveView === 'archived' || record.archived_at || noteBusyId) return false
     const body = await ask({
@@ -552,8 +658,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }, [archiveView, keyword, load, pagination])
 
   const modeVisibleInCurrentList = useCallback((newStatus: string) => {
-    return !triageStatus || triageStatus === newStatus
-  }, [triageStatus])
+    return triageStatuses.length === 0 || triageStatuses.includes(newStatus)
+  }, [triageStatuses])
 
   const syncModeLocally = useCallback((
     ids: Iterable<string>,
@@ -726,6 +832,87 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     finally { setBatchBusy(false) }
   }
 
+  const syncWatchedLocally = useCallback((ids: Iterable<string>, watched: boolean) => {
+    const changed = new Set([...ids].map(id => String(id).toLowerCase()))
+    setRecords(current => current.flatMap(record => {
+      if (!changed.has(String(record.id).toLowerCase())) return [record]
+      if ((watchedFilter === 'watched' && !watched) || (watchedFilter === 'unwatched' && watched)) return []
+      return [{
+        ...record,
+        is_watched: watched,
+        watched_at: watched ? new Date().toISOString() : null,
+        watched_by_name: watched ? '当前用户' : '',
+      }]
+    }))
+    setDrawerRecord((current: { id?: unknown } | null) => current && changed.has(String(current.id).toLowerCase())
+      ? { ...current, is_watched: watched, watched_at: watched ? new Date().toISOString() : null, watched_by_name: watched ? '当前用户' : '' }
+      : current)
+  }, [watchedFilter])
+
+  const setRecordsWatched = useCallback(async (ids: string[], watched: boolean) => {
+    const result = await api.patch<WatchMutationResponse>('/triage/records/watch', { ids, watched })
+    const existingIds = Array.isArray(result.recordIds)
+      ? result.recordIds.map(id => String(id).toLowerCase())
+      : ids.map(id => String(id).toLowerCase())
+    syncWatchedLocally(existingIds, watched)
+    return existingIds
+  }, [syncWatchedLocally])
+
+  const toggleWatch = useCallback(async (record: { id: string; is_watched?: boolean }) => {
+    if (watchBusyId) return false
+    const watched = !record.is_watched
+    setWatchBusyId(record.id)
+    try {
+      const updatedIds = await setRecordsWatched([record.id], watched)
+      showBatchFeedback(watched ? '已关注该内容' : '已取消关注', 'success')
+      await load(pagination?.page || 1, { silent: true })
+      return updatedIds.includes(String(record.id).toLowerCase())
+    } catch (error) {
+      showBatchFeedback(`关注状态修改失败：${error instanceof Error ? error.message : '请稍后重试'}`, 'error')
+      return false
+    } finally {
+      setWatchBusyId(null)
+    }
+  }, [load, pagination, setRecordsWatched, showBatchFeedback, watchBusyId])
+
+  const runWatchBatch = async (watched: boolean) => {
+    if (sel.count === 0) return
+    setBatchBusy(true)
+    try {
+      const ids = [...sel.selected]
+      const updatedIds = await setRecordsWatched(ids, watched)
+      sel.clear()
+      showBatchFeedback(`已${watched ? '关注' : '取消关注'} ${updatedIds.length} 条内容`, 'success')
+      await load(pagination?.page || 1, { silent: true })
+    } catch (error) {
+      showBatchFeedback(`批量${watched ? '关注' : '取消关注'}失败：${error instanceof Error ? error.message : '请稍后重试'}`, 'error')
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
+  const createPatrolFromSelection = (taskType: 'negative_patrol' | 'watched_content') => {
+    const selectedRecords = records.filter(record => sel.has(record.id))
+    if (selectedRecords.length === 0) return
+    if (taskType === 'watched_content') {
+      const unwatchedCount = selectedRecords.filter(record => !record.is_watched).length
+      if (unwatchedCount > 0) {
+        showBatchFeedback(`所选内容中有 ${unwatchedCount} 条尚未关注，请先关注后再创建关注巡查`, 'warning')
+        return
+      }
+    } else {
+      const nonNegativeCount = selectedRecords.filter(record => record.sentiment !== 'negative').length
+      if (nonNegativeCount > 0) {
+        showBatchFeedback(`所选内容中有 ${nonNegativeCount} 条不是负面内容，不能创建负面巡查`, 'warning')
+        return
+      }
+    }
+    navigate('dispatch', {
+      create: taskType,
+      recordIds: selectedRecords.map(record => record.id).join(','),
+    })
+  }
+
   const interactions = (r: any) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
   const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
   const someChecked = records.some(r => sel.has(r.id))
@@ -748,11 +935,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ? undefined
       : (value: string) => saveFeishuTableNo(drawerRecord, value),
     onSetArchived: async (archived: boolean) => changeArchive(drawerRecord.id, archived),
+    onSetWatched: (watched: boolean) => !!drawerRecord.is_watched === watched
+      ? true
+      : toggleWatch(drawerRecord),
     onFalsePositive: drawerArchived ? undefined : () => markFalsePositive(drawerRecord.id),
     falsePositivePending: Boolean(drawerRecord.false_positive_pending),
     onUpdateFields: drawerArchived ? undefined : (fields: ManualRecordFields) => updateManualFields(drawerRecord.id, fields),
     customTagCatalog,
     onUpdateCustomTags: drawerArchived ? undefined : (patch: CustomTagPatch) => updateCustomTags(drawerRecord.id, patch),
+    onDeleteCustomTag: drawerArchived ? undefined : deleteCustomTag,
     initialTab: drawerInitialTab,
     onProgressAdded: (progress: RecordProgressSummary) => {
       const recordId = drawerRecord.id
@@ -790,13 +981,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const paginationItems = pagination
     ? getPaginationItems(pagination.page, Math.max(1, pagination.totalPages))
     : []
+  const viewingWatchlist = watchedFilter === 'watched'
   const emptyTitle = hasActiveFilters
     ? '没有搜索结果'
-    : archiveView === 'archived' ? '暂无已归档内容' : '暂无记录'
+    : viewingWatchlist
+      ? archiveView === 'archived' ? '已归档的关注清单暂无内容' : '关注清单暂无内容'
+      : archiveView === 'archived' ? '暂无已归档内容' : '暂无记录'
   const emptyDescription = hasActiveFilters
     ? '调整表头筛选或清空筛选条件后重试'
-    : archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '暂无可处理内容'
-  const EmptyIcon = hasActiveFilters ? Search : archiveView === 'archived' ? Archive : Inbox
+    : viewingWatchlist
+      ? archiveView === 'archived' ? '已关注内容归档后会保留在这里' : '点击内容旁的星标即可加入关注清单'
+      : archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '暂无可处理内容'
+  const EmptyIcon = hasActiveFilters ? Search : viewingWatchlist ? Star : archiveView === 'archived' ? Archive : Inbox
 
   return (
     <div className={cn('space-y-3', view === 'list' && 'lg:w-max lg:min-w-full')}>
@@ -829,7 +1025,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       )}
       <div className="sticky left-0 z-30 !mb-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
         <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容归档范围">
+          <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容生命周期">
             {ARCHIVE_VIEWS.map(item => {
               const Icon = item.icon
               return (
@@ -838,7 +1034,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   type="button"
                   onClick={() => {
                     setArchiveView(item.value)
-                    setTriageStatus('')
+                    setTriageStatuses([])
                     if (item.value === 'archived') setView('list')
                   }}
                   role="tab"
@@ -909,7 +1105,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   key={value}
                   type="button"
                   aria-pressed={view === value}
-                  onClick={() => setView(value)}
+                  onClick={() => {
+                    setView(value)
+                    if (value === 'board') setWatchedFilter('')
+                  }}
                   className={cn(
                     'inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors',
                     view === value
@@ -925,10 +1124,24 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
           <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1">
             {view === 'list' && (
-              <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
-                <Download className={cn('h-3.5 w-3.5', exporting && 'animate-pulse')} />
-                {exporting ? '导出中…' : '导出'}
-              </Button>
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={viewingWatchlist}
+                  aria-label={viewingWatchlist ? '关闭关注清单，显示当前生命周期的全部内容' : '打开关注清单'}
+                  title={viewingWatchlist ? '显示当前生命周期的全部内容' : '查看人工关注的内容'}
+                  onClick={() => setWatchedFilter(viewingWatchlist ? '' : 'watched')}
+                  className={cn(viewingWatchlist && 'border-primary/35 bg-primary/8 text-primary hover:bg-primary/12')}
+                >
+                  <Star className={cn('h-3.5 w-3.5', viewingWatchlist && 'fill-current')} />
+                  关注清单
+                </Button>
+                <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
+                  <Download className={cn('h-3.5 w-3.5', exporting && 'animate-pulse')} />
+                  {exporting ? '导出中…' : '导出'}
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -973,12 +1186,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
           {view === 'list' && (
             <div className="w-full lg:w-[160px] xl:w-full">
-              <TriageSelect value={handlingStatus} onChange={e => changeHandlingStatusFilter(e.target.value)}
-                aria-label="处理状态筛选"
-                className={cn('bg-muted font-medium hover:bg-muted/70', handlingStatus ? 'text-foreground' : 'text-muted-foreground')}>
-                <option value="">全部状态</option>
-                {contentStatusOptions.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-              </TriageSelect>
+              <MultiSelect
+                label="全部状态"
+                options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
+                value={triageStatuses}
+                onChange={setTriageStatuses}
+                triggerClassName="w-full justify-between"
+              />
             </div>
           )}
 
@@ -1053,6 +1267,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 noteBusy={noteBusyId === r.id}
                 onArchive={() => changeArchive(r.id, archiveView === 'active')}
                 archiveBusy={archiveBusyId === r.id}
+                watchBusy={watchBusyId === r.id}
+                onToggleWatch={() => toggleWatch(r)}
                 archived={archiveView === 'archived'}
                 onOpenDetail={() => openDrawer(r)}
                 interactions={interactions(r)}
@@ -1110,17 +1326,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
                 {!narrow && <th className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
-                <th className="sticky right-0 z-50 w-[224px] min-w-[224px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
-                  <div className="grid grid-cols-[132px_48px] items-center gap-2">
+                <th className="sticky right-0 z-50 w-[208px] min-w-[208px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
+                  <div className="grid grid-cols-[112px_48px] items-center gap-2">
                     <div className="flex justify-center">
-                      <HeaderSingleFilter
+                      <HeaderMultiFilter
                         label="处理状态"
-                        value={handlingStatus}
-                        onChange={changeHandlingStatusFilter}
-                        options={[
-                          { value: '', label: '全部状态' },
-                          ...contentStatusOptions.map(([value, label]) => ({ value, label })),
-                        ]}
+                        value={triageStatuses}
+                        onChange={setTriageStatuses}
+                        options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
                       />
                     </div>
                     <span className="sr-only">备注</span>
@@ -1152,6 +1365,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
                   onArchive={() => changeArchive(r.id, archiveView === 'active')}
                   archiveBusy={archiveBusyId === r.id}
+                  watchBusy={watchBusyId === r.id}
+                  onToggleWatch={() => toggleWatch(r)}
                   archived={archiveView === 'archived'}
                   onOpenDetail={() => openDrawer(r)}
                   interactions={interactions(r)}
@@ -1264,15 +1479,48 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           onAction={key => {
             if (key === 'archive') void runArchiveBatch(true)
             else if (key === 'unarchive') void runArchiveBatch(false)
+            else if (key === 'watch') void runWatchBatch(true)
+            else if (key === 'unwatch') void runWatchBatch(false)
+            else if (key === 'create_negative_patrol') createPatrolFromSelection('negative_patrol')
+            else if (key === 'create_watched_patrol') createPatrolFromSelection('watched_content')
             else void runBatch(key as TriageMode)
           }}
-          actions={archiveView === 'archived'
-            ? [{ key: 'unarchive', label: '取消归档', icon: ArchiveRestore }]
-            : [
-                ...CONTENT_TRIAGE_MODES
-                  .map(mode => ({ key: mode.value, label: mode.label, icon: mode.icon })),
-                { key: 'archive', label: '归档', icon: Archive, separatorBefore: true },
-              ]}
+          actions={[]}
+          menus={[
+            {
+              key: 'patrol',
+              label: '创建巡查',
+              icon: Radar,
+              tone: 'primary',
+              actions: [
+                { key: 'create_negative_patrol', label: '负面巡查', icon: ShieldAlert },
+                { key: 'create_watched_patrol', label: '关注巡查', icon: Star },
+              ],
+            },
+            {
+              key: 'watch-state',
+              label: '关注状态',
+              icon: Star,
+              actions: [
+                { key: 'watch', label: '设为已关注', icon: Star },
+                { key: 'unwatch', label: '取消关注', icon: Star },
+              ],
+            },
+            ...(archiveView === 'archived' ? [] : [{
+              key: 'triage-state',
+              label: '处理状态',
+              icon: CheckCircle,
+              actions: CONTENT_TRIAGE_MODES.map(mode => ({ key: mode.value, label: mode.label, icon: mode.icon })),
+            }]),
+            {
+              key: 'more',
+              label: '更多',
+              icon: MoreHorizontal,
+              actions: archiveView === 'archived'
+                ? [{ key: 'unarchive', label: '取消归档', icon: ArchiveRestore }]
+                : [{ key: 'archive', label: '归档', icon: Archive }],
+            },
+          ]}
         />
       )}
 
@@ -1289,7 +1537,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 /* 手机值守卡片：把桌面表格里最需要扫读的判断、风险和时间压到一屏内。 */
 // Mirrors the long-standing desktop row contract while keeping the mobile view local.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
+function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
@@ -1342,6 +1590,15 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
             {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()} className="inline-flex items-center gap-0.5 font-semibold text-primary">原文<ExternalLink className="h-3 w-3" /></a>}
           </div>
         </div>
+        {canWrite ? (
+          <button type="button" onClick={event => { event.stopPropagation(); void onToggleWatch() }}
+            disabled={watchBusy} aria-label={r.is_watched ? '取消关注' : '关注内容'} title={r.is_watched ? '取消关注' : '关注内容'}
+            className={cn('mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition-colors', r.is_watched ? 'border-primary/30 bg-primary/8 text-primary' : 'border-border text-muted-foreground hover:text-foreground')}>
+            {watchBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Star className={cn('h-4 w-4', r.is_watched && 'fill-current')} />}
+          </button>
+        ) : r.is_watched ? (
+          <span title="已关注" className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center text-primary"><Star className="h-4 w-4 fill-current" /></span>
+        ) : null}
         <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-muted-foreground/60" />
       </div>
 
@@ -1411,12 +1668,13 @@ function MobileMetric({ label, value }: { label: string; value: string }) {
 }
 
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, archived, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const accentBar = recordAccentClass(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
   const triageStatus = r.triage_status || 'unhandled'
+  const triageLabel = LABELS.triage[triageStatus] || triageStatus
   const availabilityLabel = contentAvailabilityLabel(r)
 
   return (
@@ -1437,7 +1695,18 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-dashed border-border bg-muted/40"><FileText className="h-4 w-4 text-muted-foreground/40" /></div>
           )}
           <div className="min-w-0 max-w-[300px]">
-            <div className="line-clamp-2 text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
+            <div className="flex items-start gap-1.5">
+              <div className="line-clamp-2 min-w-0 flex-1 text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
+              {canWrite ? (
+                <button type="button" onClick={event => { event.stopPropagation(); void onToggleWatch() }}
+                  disabled={watchBusy} aria-label={r.is_watched ? '取消关注' : '关注内容'} title={r.is_watched ? '取消关注' : '关注内容'}
+                  className={cn('flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors', r.is_watched ? 'bg-primary/8 text-primary' : 'text-muted-foreground/60 hover:bg-muted hover:text-foreground')}>
+                  {watchBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Star className={cn('h-3.5 w-3.5', r.is_watched && 'fill-current')} />}
+                </button>
+              ) : r.is_watched ? (
+                <span title="已关注" className="flex h-6 w-6 shrink-0 items-center justify-center text-primary"><Star className="h-3.5 w-3.5 fill-current" /></span>
+              ) : null}
+            </div>
             <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
@@ -1474,10 +1743,10 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>}
       {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
       <td className={cn(
-        "sticky right-0 z-20 w-[224px] min-w-[224px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
+        "sticky right-0 z-20 w-[208px] min-w-[208px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
         open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
       )} onClick={e => e.stopPropagation()}>
-        <div className="grid grid-cols-[132px_48px] items-center gap-2">
+        <div className="grid grid-cols-[112px_48px] items-center gap-2">
           {canWrite && !archived ? (
             <TriageStatusMenu
               status={triageStatus}
@@ -1488,7 +1757,9 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
               onArchiveChange={onArchive}
             />
           ) : (
-            <StatusBadge tone={triageStatus} className={TRIAGE_MODE_BADGE_CLASS}>{LABELS.triage[triageStatus] || triageStatus}</StatusBadge>
+            <StatusBadge tone={triageStatus} className={TRIAGE_MODE_BADGE_CLASS}>
+              <span className="min-w-0 truncate" title={triageLabel}>{triageLabel}</span>
+            </StatusBadge>
           )}
           <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} />
         </div>
@@ -1565,11 +1836,12 @@ function TriageStatusMenu({ status, busy, archiveBusy, disabled, onChange, onArc
             type="button"
             disabled={busy || archiveBusy || disabled}
             aria-label={`当前处理状态：${label}，点击修改`}
+            title={label}
             onClick={event => event.stopPropagation()}
             className="rounded-full outline-none ring-offset-2 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
           >
             <StatusBadge tone={status} className={cn(TRIAGE_MODE_BADGE_CLASS, 'gap-1 transition-[filter,box-shadow] hover:brightness-95 hover:shadow-sm')}>
-              <span className="min-w-0 flex-1 text-center">{label}</span>
+              <span className="min-w-0 flex-1 truncate text-center">{label}</span>
               {busy || archiveBusy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <ChevronDown className="h-3 w-3 shrink-0" />}
             </StatusBadge>
           </button>

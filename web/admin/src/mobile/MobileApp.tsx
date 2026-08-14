@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  Activity, AlertTriangle, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
+  Activity, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
   CircleAlert, Database, Eye, FileText,
   Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageCircle, MessageSquare, Monitor,
   MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
@@ -103,6 +103,7 @@ function MobileRouter() {
   const routerNavigate = useRouterNavigate()
   const location = useLocation()
   const { navigate } = useNav()
+  const { tenantId } = useAuth()
 
   const openPage = useCallback<OpenPage>((page, params) => {
     navigate(page, params)
@@ -120,9 +121,9 @@ function MobileRouter() {
     <div className="mobile-shell flex h-dvh min-h-[520px] flex-col overflow-hidden bg-background text-foreground">
       <main className="mobile-shell-main flex-1 overflow-y-auto overscroll-y-contain">
         <Routes>
-          <Route path="/m/today" element={<TodayPage openPage={openPage} />} />
+          <Route path="/m/today" element={<TodayPage key={tenantId} openPage={openPage} />} />
           <Route path="/m/tasks" element={<TasksHub openPage={openPage} />} />
-          <Route path="/m/monitor" element={<MonitorHub openPage={openPage} />} />
+          <Route path="/m/monitor" element={<MonitorHub key={tenantId} openPage={openPage} />} />
           <Route path="/m/insights" element={<InsightsHub openPage={openPage} />} />
           <Route path="/m/more" element={<MoreHub openPage={openPage} />} />
           <Route path="/m/page/:pageId" element={<MobilePageSurface />} />
@@ -143,10 +144,11 @@ function rootFromPath(path: string, search = ''): RootTab | null {
 }
 
 function BottomNav({ active }: { active: RootTab | null }) {
-  const { badges } = useBadges()
+  const { badges, features } = useBadges()
   const { isPlatformAdmin } = useAuth()
   const routerNavigate = useRouterNavigate()
-  const taskCount = badges.triagePending + badges.leadsNew
+  const taskCount = badges.triagePending
+    + (features.commentRiskAttentionEnabled ? badges.leadsNew : 0)
     + (isPlatformAdmin() ? badges.feedbackPending : 0) + badges.issuesOpen
 
   return (
@@ -154,7 +156,7 @@ function BottomNav({ active }: { active: RootTab | null }) {
       {ROOTS.map(item => {
         const Icon = item.icon
         const selected = active === item.key
-        const badge = item.key === 'tasks' ? taskCount : item.key === 'monitor' ? badges.monitorAttention : 0
+        const badge = item.key === 'tasks' ? taskCount : 0
         return (
           <button key={item.key} type="button" onClick={() => routerNavigate(`/m/${item.key}`)}
             aria-current={selected ? 'page' : undefined}
@@ -221,7 +223,7 @@ interface OverviewData {
 
 function TodayPage({ openPage }: { openPage: OpenPage }) {
   const { tenantId } = useAuth()
-  const { badges } = useBadges()
+  const { badges, features } = useBadges()
   const [data, setData] = useState<OverviewData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -245,12 +247,15 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
   const k = data?.kpi || {}
   const high = Number(k.high_open_issues || 0)
   const overdue = Number(k.overdue_issues || 0)
+  const commentRiskAttentionEnabled = features.commentRiskAttentionEnabled
   const urgentTotal = high + overdue + badges.triagePending
-  const sb = data?.sentimentBreakdown || { negative: 0, neutral: 0, positive: 0, unlabeled: 0, total: 0 }
+    + (commentRiskAttentionEnabled ? badges.leadsNew : 0)
   const tasks = [
     { key: 'issues', count: high + overdue, label: overdue ? `${overdue} 个问题已超时` : `${high} 个高优问题开放中`, reason: '需要确认负责人和处置结论', tone: 'red', icon: CircleAlert, action: () => openPage('workbench', { queue: 'issues' }) },
     { key: 'triage', count: badges.triagePending, label: `${badges.triagePending} 条内容待判断`, reason: '负面与高互动内容优先', tone: 'orange', icon: Eye, action: () => openPage('workbench', { queue: 'triage' }) },
-    { key: 'comments', count: badges.leadsNew, label: `${badges.leadsNew} 条风险评论待跟进`, reason: '转工单、归档或忽略', tone: 'purple', icon: MessageSquare, action: () => openPage('workbench', { queue: 'leads' }) },
+    ...(commentRiskAttentionEnabled ? [
+      { key: 'comments', count: badges.leadsNew, label: `${badges.leadsNew} 条风险评论待跟进`, reason: '转工单、归档或忽略', tone: 'purple', icon: MessageSquare, action: () => openPage('workbench', { queue: 'leads' }) },
+    ] : []),
   ].filter(item => item.count > 0)
 
   const pulseHeadline = loading
@@ -286,7 +291,7 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
           <p className="mt-3 text-[24px] font-extrabold leading-[1.18] tracking-[-0.035em]">{pulseHeadline}</p>
           {!loading && !error && (
             <p className="mt-2 text-[12px] leading-5 text-muted-foreground">
-              近 7 日负面 {formatNumber(sb.negative)} 条 · 开放问题 {formatNumber(k.open_issues)} 个 · 今日新增 {formatNumber(k.today_new)} 条
+              近 7 日内容负面 {formatNumber(k.negative_period)} 条 · 开放问题 {formatNumber(k.open_issues)} 个 · 今日新增 {formatNumber(k.today_new)} 条
             </p>
           )}
           {error && <button className="mt-3 text-xs font-bold text-primary" onClick={load}>重新加载</button>}
@@ -368,13 +373,19 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
 }
 
 function TasksHub({ openPage }: { openPage: OpenPage }) {
-  const { badges } = useBadges()
+  const { badges, features } = useBadges()
   const { isPlatformAdmin } = useAuth()
   const adminFeedback = isPlatformAdmin() ? badges.feedbackPending : 0
-  const total = badges.triagePending + badges.leadsNew + adminFeedback + badges.issuesOpen
+  const commentRiskAttentionLoaded = features.loaded
+  const commentRiskAttentionEnabled = features.commentRiskAttentionEnabled
+  const total = badges.triagePending
+    + (commentRiskAttentionEnabled ? badges.leadsNew : 0)
+    + adminFeedback + badges.issuesOpen
   const queues = [
     { title: '内容分诊', count: badges.triagePending, copy: '判断风险、更新处理状态或填写备注', icon: Eye, tone: 'red', page: 'workbench', params: { queue: 'triage' } },
-    { title: '评论分诊', count: badges.leadsNew, copy: '跟进风险评论，转工单或忽略', icon: MessageSquare, tone: 'orange', page: 'workbench', params: { queue: 'leads' } },
+    ...(commentRiskAttentionEnabled ? [
+      { title: '评论分诊', count: badges.leadsNew, copy: '跟进风险评论，转工单或忽略', icon: MessageSquare, tone: 'orange', page: 'workbench', params: { queue: 'leads' } },
+    ] : []),
     { title: '问题处置', count: badges.issuesOpen, copy: '确认负责人、解决问题或关闭事件', icon: CircleAlert, tone: 'purple', page: 'workbench', params: { queue: 'issues' } },
     ...(isPlatformAdmin() ? [{ title: '误判反馈', count: badges.feedbackPending, copy: '核对客户提交的误报并复核', icon: Sparkles, tone: 'green', page: 'workbench', params: { queue: 'misjudgments' } }] : []),
   ]
@@ -404,7 +415,10 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
         <section>
           <SectionHeading label="其他任务" />
           <div className="mt-2 overflow-hidden rounded-2xl border border-border bg-card">
-            <DirectoryRow icon={User} title="销售客资" subtitle="跟进、处理或忽略购买意向" onClick={() => openPage('salesleads')} divided />
+            {commentRiskAttentionLoaded && !commentRiskAttentionEnabled && (
+              <DirectoryRow icon={MessageSquare} title="评论分诊" subtitle="持续采集和标注，不计入当前值守待办" onClick={() => openPage('workbench', { queue: 'leads' })} />
+            )}
+            <DirectoryRow icon={User} title="销售客资" subtitle="跟进、处理或忽略购买意向" onClick={() => openPage('salesleads')} divided={commentRiskAttentionLoaded && !commentRiskAttentionEnabled} />
           </div>
         </section>
       </div>
@@ -413,28 +427,26 @@ function TasksHub({ openPage }: { openPage: OpenPage }) {
 }
 
 function MonitorHub({ openPage }: { openPage: OpenPage }) {
-  const { badges } = useBadges()
   return (
     <div className="min-h-full pb-5">
-      <RootHeader eyebrow="Watch" title="监测" badge="BETA" />
-      <div className="space-y-5 px-4">
-        {badges.monitorAttention > 0 && (
-          <button type="button" onClick={() => openPage('monitoring', { tab: 'tasks' })}
-            className="flex w-full items-center gap-3 rounded-2xl border border-status-orange/30 bg-status-orange/[0.08] p-4 text-left">
-            <AlertTriangle className="h-6 w-6 shrink-0 text-amber-600" />
-            <span className="min-w-0 flex-1"><span className="block text-sm font-bold">{badges.monitorAttention} 个监测任务需要检查</span><span className="mt-0.5 block text-[11px] text-muted-foreground">运行异常或最近执行失败</span></span>
-            <ChevronRight className="h-4 w-4" />
-          </button>
-        )}
-        <section className="space-y-2">
-          <MonitorCard icon={ServerCog} kicker="设备" title="调度中心" badge="BETA" copy="查看各浏览器节点的实时进度，并远程继续中断任务" action="打开调度中心" onClick={() => openPage('dispatch')} tone="blue" />
-          <MonitorCard icon={Users} kicker="账号" title="社交账号负载" copy="查看每个登录账号今天的搜索、增强和采集次数，及时安排休息" action="管理账号负载" onClick={() => openPage('social-accounts')} tone="blue" />
-          <MonitorCard icon={Activity} kicker="动态" title="关注对象的新内容" copy="按时间线查看最新命中、互动与情感变化" action="看新动态" onClick={() => openPage('monitoring', { tab: 'hits' })} />
-          <MonitorCard icon={Bell} kicker="事件" title="正在扩散的风险事件" copy="沿事件时间线查看关联内容和当前处置状态" action="进事件中心" onClick={() => openPage('events')} tone="red" />
-          <MonitorCard icon={Radio} kicker="关注" title="监测对象与运行状态" copy="查看频率、最近运行、异常原因并立即扫描" action="管理关注" onClick={() => openPage('monitoring', { tab: 'tasks' })} tone="blue" />
-        </section>
-        <section className="rounded-2xl border border-border bg-card p-4">
-          <div className="flex items-center gap-3"><Monitor className="h-5 w-5 text-primary" /><div><div className="text-sm font-bold">值守说明</div><p className="mt-1 text-[11px] leading-5 text-muted-foreground">手机端按“对象和时间线”查看；运行、筛选、查看命中等原有操作全部保留。</p></div></div>
+      <RootHeader eyebrow="Watch" title="监测" />
+      <div className="space-y-4 px-4">
+        <button type="button" onClick={() => openPage('dispatch')}
+          className="w-full rounded-2xl bg-[#10233f] p-4 text-left text-white active:opacity-90 dark:bg-[#dfe8ff] dark:text-[#10233f]">
+          <span className="flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-[0.16em] opacity-65">
+            <ServerCog className="h-4 w-4" />任务与设备<span className="rounded border border-current/25 px-1.5 py-0.5 text-[8px] tracking-[0.1em]">BETA</span>
+          </span>
+          <span className="mt-3 flex items-center gap-2 text-[21px] font-extrabold tracking-[-0.025em]">调度中心<ChevronRight className="ml-auto h-5 w-5 opacity-70" /></span>
+          <span className="mt-1 block text-[11px] leading-5 opacity-70">先看执行中与需处理任务，再按需切到 Agent 设备。</span>
+        </button>
+
+        <section>
+          <SectionHeading label="监测目录" />
+          <div className="mt-2 overflow-hidden rounded-2xl border border-border bg-card">
+            <DirectoryRow icon={Users} title="Agent 今日运行" subtitle="搜索、采集、安全验证与账号用量" onClick={() => openPage('social-accounts')} />
+            <DirectoryRow icon={Radio} title="关注博主" subtitle="管理关注对象，并在页内查看博主新动态" onClick={() => openPage('monitoring', { tab: 'tasks' })} divided />
+            <DirectoryRow icon={Bell} title="风险事件" subtitle="查看扩散中的事件与当前处置状态" onClick={() => openPage('events')} divided />
+          </div>
         </section>
       </div>
     </div>
@@ -506,7 +518,7 @@ const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
   { label: '业务能力', items: [
     { title: '官方社媒', subtitle: '帖子趋势、评论情绪与运营建议', icon: MessageCircle, page: 'official-comments' },
     { title: '销售客资', subtitle: '购买意向跟进与处理', icon: User, page: 'salesleads' },
-    { title: '社交账号', subtitle: '登录账号、Agent 绑定与每日负载', icon: Users, page: 'social-accounts' },
+    { title: '社交账号', subtitle: 'Agent 每日用量、安全验证与可选账号信息', icon: Users, page: 'social-accounts' },
     { title: '事件中心', subtitle: '严重度、状态与关联内容时间线', icon: Bell, page: 'events' },
   ] },
   { label: '平台管理', items: [
@@ -609,7 +621,11 @@ function MobilePageSurface() {
         <button type="button" onClick={() => routerNavigate('/m/more')} aria-label="更多功能" className="flex h-11 w-11 items-center justify-center rounded-full active:bg-muted"><MoreHorizontal className="h-5 w-5" /></button>
       </header>
       <div className="mobile-feature-page animate-fade-up px-3 py-3" key={`${pageId}:${seq}:${tenantId}:${querySignature}`}>
-        {PageComponent ? <PageComponent /> : <ComingSoon pageId={pageId} />}
+        {PageComponent
+          ? pageId === 'dispatch'
+            ? <DispatchPage surface="mobile" />
+            : <PageComponent />
+          : <ComingSoon pageId={pageId} />}
       </div>
     </div>
   )
@@ -655,17 +671,6 @@ function DirectoryRow({ icon: Icon, title, subtitle, onClick, divided = false }:
       <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground"><Icon className="h-[18px] w-[18px]" /></span>
       <span className="min-w-0 flex-1"><span className="block text-[13px] font-bold">{title}</span><span className="mt-0.5 block text-[10.5px] leading-4 text-muted-foreground">{subtitle}</span></span>
       <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-    </button>
-  )
-}
-
-function MonitorCard({ icon: Icon, kicker, title, badge, copy, action, onClick, tone = 'green' }: { icon: React.ElementType; kicker: string; title: string; badge?: string; copy: string; action: string; onClick: () => void; tone?: string }) {
-  const color = tone === 'red' ? 'text-status-red bg-status-red/10' : tone === 'blue' ? 'text-status-indigo bg-status-blue/10' : 'text-emerald-600 bg-status-green/10 dark:text-emerald-400'
-  return (
-    <button type="button" onClick={onClick} className="w-full rounded-2xl border border-border bg-card p-4 text-left active:bg-muted">
-      <div className="flex items-start gap-3"><span className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-xl', color)}><Icon className="h-5 w-5" /></span><span className="min-w-0 flex-1"><span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-muted-foreground">{kicker}{badge && <span className="rounded border border-primary/20 bg-primary/10 px-1 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-primary">{badge}</span>}</span><span className="mt-0.5 block text-[15px] font-extrabold">{title}</span></span></div>
-      <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{copy}</p>
-      <span className="mt-3 inline-flex items-center gap-1 text-[11px] font-bold text-primary">{action}<ChevronRight className="h-3.5 w-3.5" /></span>
     </button>
   )
 }

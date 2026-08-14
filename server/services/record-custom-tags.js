@@ -22,6 +22,14 @@ function normalizeUuidArray(value, field) {
   return { ok: true, value: ids };
 }
 
+export function normalizeCustomTagId(value) {
+  const id = String(value || '').trim().toLowerCase();
+  if (!UUID_RE.test(id)) {
+    return errorResult('invalid_tag_id', '标签ID无效');
+  }
+  return { ok: true, value: id };
+}
+
 export function normalizeCustomTagName(value) {
   let name = String(value ?? '').normalize('NFKC').trim();
   name = name.replace(/^#+\s*/u, '').replace(/\s+/gu, ' ').trim();

@@ -79,7 +79,7 @@ test('official comment patrol uses the same remote profile capability bundle as 
   const compatibility = taskLib.slice(start, end)
   assert.match(
     compatibility,
-    /\['creator_patrol', 'negative_patrol', 'comment_patrol'\]\.includes\(taskType\)[\s\S]*remoteTargetedPostCaptureV1/u,
+    /\['creator_patrol', 'negative_patrol', 'watched_content', 'comment_patrol'\]\.includes\(taskType\)[\s\S]*remoteTargetedPostCaptureV1/u,
   )
   assert.match(compatibility, /officialAccountCommentPatrolProfileV1/u)
   assert.match(compatibility, /officialAccountLatestPostsByCountV1/u)

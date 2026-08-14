@@ -8,6 +8,7 @@ import {
   MAX_CUSTOM_TAG_NAME_LENGTH,
   MAX_CUSTOM_TAGS_PER_RECORD,
   appendCustomTagFilter,
+  normalizeCustomTagId,
   normalizeCustomTagFilter,
   normalizeCustomTagName,
   validateCustomTagPatch,
@@ -56,6 +57,8 @@ test('custom tag patch inputs are strict, deduplicated and UUID validated', () =
     validateCustomTagPatch({ addNames: Array.from({ length: 21 }, (_, index) => `标签${index}`) }).error,
     'too_many_tag_operations',
   );
+  assert.deepEqual(normalizeCustomTagId(first.toUpperCase()), { ok: true, value: first });
+  assert.equal(normalizeCustomTagId('bad-id').error, 'invalid_tag_id');
 });
 
 test('triage custom tag filters support repeated UUIDs and any/all modes', () => {
@@ -122,12 +125,21 @@ test('backend contracts keep custom tags tenant-scoped, audited and recapture-sa
   assert.match(service, /ON CONFLICT \(tenant_id, normalized_name\)/);
   assert.match(customTagRoute, /router\.use\(requireTenantAccess, requireSessionUser\)/);
   assert.match(customTagRoute, /usageCount/);
+  assert.match(customTagRoute, /router\.delete\('\/:id', requireTenantWriter/);
+  assert.match(customTagRoute, /WHERE tenant_id = \$1 AND id = \$2[\s\S]*FOR UPDATE/);
+  assert.match(customTagRoute, /DELETE FROM custom_tags[\s\S]*WHERE tenant_id = \$1 AND id = \$2/);
+  assert.match(customTagRoute, /custom_tag\.deleted/);
+  assert.match(customTagRoute, /affectedRecords/);
+  assert.match(migration, /REFERENCES custom_tags\(tenant_id, id\)[\s\S]*ON DELETE CASCADE/);
 
   const routeStart = records.indexOf("router.patch('/:id/custom-tags'");
   const routeEnd = records.indexOf("router.patch('/:id/official-response'", routeStart);
   assert.ok(routeStart >= 0 && routeEnd > routeStart);
   const customTagRecordRoute = records.slice(routeStart, routeEnd);
   assert.match(customTagRecordRoute, /requireSessionUser, requireTenantWriter/);
+  assert.match(customTagRecordRoute, /applyRecordCustomTagPatch/);
+  assert.doesNotMatch(customTagRecordRoute, /DELETE FROM custom_tags/);
+  assert.match(service, /DELETE FROM record_custom_tags[\s\S]*record_id = \$2[\s\S]*tag_id = ANY/);
   assert.match(customTagRecordRoute, /record_versions/);
   assert.match(customTagRecordRoute, /record\.custom_tags_updated/);
   assert.doesNotMatch(customTagRecordRoute, /insertRecordFeedback/);

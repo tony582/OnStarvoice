@@ -49,6 +49,7 @@ test('negative patrol filters require a real publish date range and platform', (
       publishDateFrom: '2026-07-01',
       publishDateTo: '2026-07-26',
       platform: 'douyin',
+      platforms: ['douyin'],
       query: '门店',
       minInteractions: 50,
       limit: 80,
@@ -80,6 +81,30 @@ test('negative patrol filters require a real publish date range and platform', (
       platform: 'weibo',
     }).failure.error,
     'unsupported_platform',
+  );
+  assert.deepEqual(
+    normalizeNegativePatrolFilter({
+      publishDateFrom: '2026-07-01',
+      publishDateTo: '2026-07-02',
+      platforms: ['xiaohongshu', 'douyin', 'xiaohongshu'],
+    }).filter.platforms,
+    ['xiaohongshu', 'douyin'],
+  );
+  assert.equal(
+    normalizeNegativePatrolFilter({
+      publishDateFrom: '2026-07-01',
+      publishDateTo: '2026-07-02',
+      platforms: ['xiaohongshu', 'douyin'],
+    }).filter.platform,
+    'mixed',
+  );
+  assert.deepEqual(
+    normalizeNegativePatrolFilter({
+      publishDateFrom: '2026-07-01',
+      publishDateTo: '2026-07-02',
+      platform: 'mixed',
+    }).filter.platforms,
+    ['xiaohongshu', 'douyin'],
   );
 });
 
@@ -177,7 +202,7 @@ test('preview and create are tenant-writer routes with identical candidate SQL',
     assert.match(middleware, /requireTenantWriter/u);
   }
   assert.match(route, /r\.tenant_id = \$1/u);
-  assert.match(route, /r\.platform = \$2/u);
+  assert.match(route, /r\.platform = ANY\(\$2::text\[\]\)/u);
   assert.match(route, /r\.sentiment = 'negative'/u);
   assert.match(route, /NULLIF\(BTRIM\(r\.publish_time\), ''\) IS NOT NULL/u);
   assert.match(route, /r\.published_ts IS NOT NULL/u);

@@ -37,6 +37,7 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     "'/orchestrations/:id/allocation-preview'",
     "'/orchestrations/:id/dispatch'",
     "'/orchestrations/:id/stop'",
+    "'/orchestrations/:id/schedule'",
     "'/orchestrations/:id/schedule/pause'",
     "'/orchestrations/:id/schedule/resume'",
     "'/orchestrations/:id/schedule/run-now'",
@@ -172,7 +173,26 @@ test('one-time dispatch creates disjoint ordinary child tasks, create commands, 
   assert.doesNotMatch(dispatch, /\b(?:handoff|reassign|fencing_token|lease_expires_at)\b/u);
 });
 
-test('unattended dispatch stores a cloud schedule and fixed assignments without issuing immediate child commands', () => {
+test('elastic one-time dispatch publishes an unassigned queue and defers commands to idle Agent heartbeats', () => {
+  const dispatch = section(
+    "router.post(\n  '/orchestrations/:id/dispatch'",
+    "router.post(\n  '/orchestrations/:id/stop'",
+  );
+  const elasticStart = dispatch.indexOf("if (distributionMode === 'elastic_pool')");
+  const fixedStart = dispatch.indexOf('const executions = [];', elasticStart);
+  assert.ok(elasticStart >= 0);
+  assert.ok(fixedStart > elasticStart);
+  const elastic = dispatch.slice(elasticStart, fixedStart);
+  assert.match(elastic, /eligibleAgentIds/u);
+  assert.match(elastic, /'claimUnit', 'keyword'/u);
+  assert.match(elastic, /phase: 'queued'/u);
+  assert.match(elastic, /assigned: 0/u);
+  assert.match(elastic, /eventType: 'orchestration_elastic_pool_opened'/u);
+  assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
+  assert.match(route, /function normalizeDispatch[\s\S]*eligibleAgentIds/u);
+});
+
+test('unattended dispatch stores either fixed assignments or an elastic cloud pool without issuing immediate child commands', () => {
   const dispatch = section(
     "router.post(\n  '/orchestrations/:id/dispatch'",
     "router.post(\n  '/orchestrations/:id/stop'",
@@ -187,7 +207,9 @@ test('unattended dispatch stores a cloud schedule and fixed assignments without 
 
   assert.match(unattended, /INSERT INTO capture_orchestration_schedules/u);
   assert.match(unattended, /INSERT INTO capture_orchestration_schedule_agents/u);
-  assert.match(unattended, /SET status = 'assigned'/u);
+  assert.match(unattended, /distribution_mode/u);
+  assert.match(unattended, /WHEN \$1 = 'elastic_pool' THEN 'pending'/u);
+  assert.match(unattended, /eligibleAgentIds/u);
   assert.match(unattended, /orchestration_schedule_id = \$1/u);
   assert.match(unattended, /schedule_revision = 1/u);
   assert.match(unattended, /orchestrationTemplate/u);
@@ -221,6 +243,38 @@ test('operator stop atomically settles the parent and disables automatic relay',
   assert.match(stop, /last_run_status = 'canceled'/u);
   assert.match(stop, /eventType: 'orchestration_stopped'/u);
   assert.match(stop, /executionTaskIds/u);
+});
+
+test('schedule edit updates the same template with revision protection and leaves generated runs untouched', () => {
+  const edit = section(
+    "router.patch(\n  '/orchestrations/:id/schedule'",
+    "router.post(\n  '/orchestrations/:id/schedule/pause'",
+  );
+  const scheduleLock = edit.indexOf('loadOrchestrationSchedule(');
+  const parentLock = edit.indexOf('parentSelect({lock: true})', scheduleLock);
+  const agentLock = edit.indexOf('loadCompatibleAgents(', parentLock);
+  const itemLock = edit.indexOf('listParentItems(', agentLock);
+  assert.ok(scheduleLock >= 0);
+  assert.ok(parentLock > scheduleLock);
+  assert.ok(agentLock > parentLock);
+  assert.ok(itemLock > agentLock);
+  assert.match(edit, /currentRevision !== normalized\.expectedRevision/u);
+  assert.match(edit, /'schedule_revision_conflict'/u);
+  assert.match(edit, /computeNextOrchestrationRunAt\(planSnapshot/u);
+  assert.match(edit, /WHERE id = \$12 AND tenant_id = \$13 AND revision = \$14/u);
+  assert.match(edit, /revision = revision \+ 1/u);
+  assert.match(edit, /orchestration_revision = orchestration_revision \+ 1/u);
+  assert.match(edit, /UPDATE capture_orchestration_schedules/u);
+  assert.doesNotMatch(edit, /INSERT INTO capture_orchestration_schedules/u);
+  assert.doesNotMatch(edit, /DELETE FROM capture_orchestration_schedules/u);
+  assert.doesNotMatch(edit, /DELETE FROM capture_tasks/u);
+  assert.match(edit, /capture_task_item_attempts/u);
+  assert.match(edit, /orchestration_template_items_not_editable/u);
+  assert.match(edit, /distributionMode === 'fixed_batch'/u);
+  assert.match(edit, /assigned_agent_id = \$6::uuid/u);
+  assert.match(edit, /eventType: 'orchestration_schedule_updated'/u);
+  assert.match(edit, /已生成的运行批次保持不变/u);
+  assert.match(edit, /修改从下一次运行开始生效/u);
 });
 
 test('schedule pause and resume are tenant scoped, idempotent, and never backfill missed runs', () => {
@@ -379,7 +433,7 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
   );
   assert.match(
     detail,
-    /WHERE item\.tenant_id = \$1 AND item\.task_id = \$2/u,
+    /ca\.id = ANY\(\$3::uuid\[\]\)[\s\S]*item\.task_id = \$2[\s\S]*item\.assigned_agent_id = ca\.id/u,
   );
   assert.match(route, /record\.content AS source_record_content/u);
   assert.match(route, /function publicParentItem/u);

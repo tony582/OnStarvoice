@@ -315,6 +315,11 @@ export function AgentTaskCreator({
       publishTime,
       maxRounds: executionMode === 'unattended_plan' ? maxRounds : 1,
       roundGapMin: executionMode === 'unattended_plan' ? roundGapMin : 0,
+      distributionMode: 'fixed_batch' as const,
+      recoveryPolicy: {
+        allowIdleAgentHandoff: false,
+        platformSafetyMode: 'manual_confirmed',
+      },
       ...(remoteTaskKeywordPostLimit && keywordLimitOverrideEnabled ? { keywordMaxDetectedItems } : {}),
       ...(captureSettings ? { captureSettings } : {}),
       ...(executionMode === 'unattended_plan' ? {
