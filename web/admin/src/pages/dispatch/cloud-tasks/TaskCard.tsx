@@ -27,6 +27,7 @@ import {
 
 export function TaskCard({
   task,
+  surface = 'desktop',
   writable,
   actionTaskId,
   onResume,
@@ -36,6 +37,7 @@ export function TaskCard({
   onOpenOrchestration,
 }: {
   task: CloudTask
+  surface?: 'desktop' | 'mobile'
   writable: boolean
   actionTaskId: string
   onResume: (task: CloudTask) => Promise<void>
@@ -44,6 +46,7 @@ export function TaskCard({
   onDismissAttention: (task: CloudTask) => Promise<void>
   onOpenOrchestration: (task: CloudTask) => void
 }) {
+  const mobile = surface === 'mobile'
   const [detailsOpen, setDetailsOpen] = useState(false)
   const effectiveStatus = task.effective_status || task.status
   const progress = taskProgress(task)
@@ -156,41 +159,128 @@ export function TaskCard({
             : '设备任务'
 
   const hasActions = orchestration || resumable || retryOnIdleAgent || stoppable || commandPending || dismissible
+  const resumeActionLabel = resumeBlocked
+    ? diagnostics.retryExhausted
+      ? '失败词已达上限'
+      : '暂时不能继续'
+    : safetyAttention && task.agent_online
+      ? '验证完成，原设备继续'
+      : safetyAttention
+        ? '原设备上线后继续'
+        : task.agent_online
+          ? '继续剩余任务'
+          : '上线后继续'
+  const stopActionLabel = safetyAttention
+    ? task.agent_online
+      ? '结束并保留结果'
+      : '上线后结束并保留'
+    : task.agent_online
+      ? '停止任务'
+      : '上线后停止'
+  const stopPendingLabel = safetyAttention
+    ? task.agent_online
+      ? '等待设备结束并保留'
+      : '已排队，上线后结束'
+    : task.agent_online
+      ? '等待设备停止'
+      : '已排队，上线后停止'
+  const mobilePrimaryAction = orchestration
+    ? 'orchestration'
+    : retryOnIdleAgent && !commandPending
+      ? 'retry'
+      : resumable && !commandPending
+        ? 'resume'
+        : stopPending
+          ? 'stop-pending'
+          : commandPending
+            ? 'command-pending'
+            : stoppable
+              ? 'stop'
+              : dismissible
+                ? 'dismiss'
+                : ''
+  const hasMobileSecondaryActions =
+    (resumable && !commandPending && mobilePrimaryAction !== 'resume') ||
+    (stoppable && !stopPending && mobilePrimaryAction !== 'stop') ||
+    (dismissible && mobilePrimaryAction !== 'dismiss')
+  const orchestrationAgentCount = Array.isArray(task.metadata?.selectedAgentIds)
+    ? task.metadata.selectedAgentIds.length
+    : Array.isArray(task.metadata?.eligibleAgentIds)
+      ? task.metadata.eligibleAgentIds.length
+      : safeNumber(task.counts?.agents)
 
   return (
-    <article className={`rounded-2xl border border-border/70 bg-card p-4 shadow-xs ${orchestration ? 'border-l-2 border-l-primary/40' : ''}`}>
-      {/* 第一行：类型图标 + 标题 + 状态 chip（右对齐） */}
-      <div className="flex min-w-0 items-center gap-2">
-        {contentPatrol
-          ? <ShieldAlert className={`h-4 w-4 shrink-0 ${watchedContentPatrol ? 'text-primary' : 'text-status-red'}`} />
-          : orchestration
-            ? <Network className="h-4 w-4 shrink-0 text-primary" />
-          : officialCommentPatrol
-            ? <MessagesSquare className="h-4 w-4 shrink-0 text-primary" />
-          : followedCreatorPatrol
-            ? <Radar className="h-4 w-4 shrink-0 text-primary" />
-          : officialAccountDiscovery
-            ? <BadgeCheck className="h-4 w-4 shrink-0 text-primary" />
-          : <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />}
-        <h4 className="min-w-0 flex-1 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
-        <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
-      </div>
-      {/* 第二行：一条 meta 线（平台 · 形态 · Agent/关键词数 · 创建时间） */}
-      <div className="mt-2 flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-        <span className="min-w-0 flex-1 truncate">
-          {PLATFORM_LABELS[task.platform] || task.platform}
-          {' · '}{taskMode}{' · '}
-          {orchestration
-            ? contentPatrol
-              ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子`
-              : `${safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词`
-            : `${task.agent_host_label || '未分配设备'} › ${task.agent_display_name || '未分配 Agent'}`}
-        </span>
-        {!orchestration && (
-          <span className={`shrink-0 ${task.agent_online ? 'text-status-green' : ''}`}>· {task.agent_online ? '在线' : '离线'}</span>
-        )}
-        <span className="shrink-0">· {formatTime(task.created_at || task.updated_at)}</span>
-      </div>
+    <article className={`rounded-2xl border border-border/70 bg-card shadow-xs ${mobile ? 'p-3.5' : 'p-4'} ${orchestration ? 'border-l-2 border-l-primary/40' : ''}`}>
+      {mobile ? (
+        <>
+          <div className="flex min-w-0 items-center gap-2">
+            {contentPatrol
+              ? <ShieldAlert className={`h-4 w-4 shrink-0 ${watchedContentPatrol ? 'text-primary' : 'text-status-red'}`} />
+              : orchestration
+                ? <Network className="h-4 w-4 shrink-0 text-primary" />
+                : officialCommentPatrol
+                  ? <MessagesSquare className="h-4 w-4 shrink-0 text-primary" />
+                  : followedCreatorPatrol
+                    ? <Radar className="h-4 w-4 shrink-0 text-primary" />
+                    : officialAccountDiscovery
+                      ? <BadgeCheck className="h-4 w-4 shrink-0 text-primary" />
+                      : <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />}
+            <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
+            <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">{formatTime(task.created_at || task.updated_at)}</span>
+          </div>
+          <h4 className="mt-2 line-clamp-2 text-[15px] font-bold leading-5">{task.title || '采集任务'}</h4>
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+            <span className="rounded-md bg-muted px-2 py-1 font-semibold text-foreground">{PLATFORM_LABELS[task.platform] || task.platform || '未识别平台'}</span>
+            <span>{taskMode}</span>
+            <span>·</span>
+            <span>{contentPatrol ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子` : `${safeNumber(task.counts?.total ?? task.progress?.total)} 个工作项`}</span>
+          </div>
+          <div className="mt-2 flex items-center gap-2 text-[11px] leading-4 text-muted-foreground">
+            <Bot className="h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">
+              {orchestration
+                ? orchestrationAgentCount > 0 ? `${orchestrationAgentCount} 个兼容 Agent` : '等待兼容 Agent 分配'
+                : `${task.agent_host_label || '未分配设备'} · ${task.agent_display_name || '未分配 Agent'}`}
+            </span>
+            {!orchestration && <span className={`shrink-0 font-semibold ${task.agent_online ? 'text-status-green' : ''}`}>{task.agent_online ? '在线' : '离线'}</span>}
+          </div>
+        </>
+      ) : (
+        <>
+          {/* 第一行：类型图标 + 标题 + 状态 chip（右对齐） */}
+          <div className="flex min-w-0 items-center gap-2">
+            {contentPatrol
+              ? <ShieldAlert className={`h-4 w-4 shrink-0 ${watchedContentPatrol ? 'text-primary' : 'text-status-red'}`} />
+              : orchestration
+                ? <Network className="h-4 w-4 shrink-0 text-primary" />
+              : officialCommentPatrol
+                ? <MessagesSquare className="h-4 w-4 shrink-0 text-primary" />
+              : followedCreatorPatrol
+                ? <Radar className="h-4 w-4 shrink-0 text-primary" />
+              : officialAccountDiscovery
+                ? <BadgeCheck className="h-4 w-4 shrink-0 text-primary" />
+              : <Bot className="h-4 w-4 shrink-0 text-muted-foreground" />}
+            <h4 className="min-w-0 flex-1 truncate text-[15px] font-bold">{task.title || '采集任务'}</h4>
+            <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
+          </div>
+          {/* 第二行：一条 meta 线（平台 · 形态 · Agent/关键词数 · 创建时间） */}
+          <div className="mt-2 flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+            <span className="min-w-0 flex-1 truncate">
+              {PLATFORM_LABELS[task.platform] || task.platform}
+              {' · '}{taskMode}{' · '}
+              {orchestration
+                ? contentPatrol
+                  ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子`
+                  : `${safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词`
+                : `${task.agent_host_label || '未分配设备'} › ${task.agent_display_name || '未分配 Agent'}`}
+            </span>
+            {!orchestration && (
+              <span className={`shrink-0 ${task.agent_online ? 'text-status-green' : ''}`}>· {task.agent_online ? '在线' : '离线'}</span>
+            )}
+            <span className="shrink-0">· {formatTime(task.created_at || task.updated_at)}</span>
+          </div>
+        </>
+      )}
       {!safetyAttention && (hasKeywordDiagnostics ? diagnostics.headline : task.message) && (
         <p className={`mt-2 line-clamp-1 text-xs leading-5 ${
           hasKeywordDiagnostics && diagnostics.tone === 'danger'
@@ -239,13 +329,45 @@ export function TaskCard({
         </div>
       )}
       {/* 底部：左侧运行详情开关；右侧操作按钮（主操作实心、次操作 outline/ghost，最多 3 个） */}
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
+      <div className={`mt-3 flex flex-wrap gap-2 border-t border-border/60 pt-3 ${mobile ? 'items-stretch' : 'items-center justify-between'}`}>
         <button type="button" onClick={() => setDetailsOpen(value => !value)} aria-expanded={detailsOpen}
-          className="flex min-h-9 items-center gap-1.5 rounded-lg text-left text-[11px] font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary">
+          className={`flex items-center gap-1.5 rounded-lg text-left text-[11px] font-medium text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary ${mobile ? 'min-h-11 px-1' : 'min-h-9'}`}>
           <span>{hasKeywordDiagnostics ? '运行报告' : '运行详情'}</span>
           {detailsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
         </button>
-        {hasActions && (
+        {hasActions && (mobile ? (
+          <div className="ml-auto flex items-center gap-2">
+            {mobilePrimaryAction === 'orchestration' && (
+              <Button size="sm" className="min-h-11" onClick={() => onOpenOrchestration(task)}><Network className="h-4 w-4" /> 查看编排</Button>
+            )}
+            {mobilePrimaryAction === 'retry' && (
+              <Button size="sm" className="min-h-11" onClick={() => void onRetryOnIdleAgent(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} 换设备重试
+              </Button>
+            )}
+            {mobilePrimaryAction === 'resume' && (
+              <Button size="sm" className="min-h-11" onClick={() => void onResume(task)} disabled={!writable || Boolean(resumeBlocked) || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />} {resumeActionLabel}
+              </Button>
+            )}
+            {mobilePrimaryAction === 'stop' && (
+              <Button variant="outline" size="sm" className="min-h-11" onClick={() => void onStop(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />} {stopActionLabel}
+              </Button>
+            )}
+            {mobilePrimaryAction === 'stop-pending' && (
+              <Button variant="outline" size="sm" className="min-h-11" disabled><Loader2 className="h-4 w-4 animate-spin" /> {stopPendingLabel}</Button>
+            )}
+            {mobilePrimaryAction === 'command-pending' && (
+              <Button size="sm" className="min-h-11" disabled><Loader2 className="h-4 w-4 animate-spin" /> 等待设备响应</Button>
+            )}
+            {mobilePrimaryAction === 'dismiss' && (
+              <Button variant="outline" size="sm" className="min-h-11" onClick={() => void onDismissAttention(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />} 移到历史
+              </Button>
+            )}
+          </div>
+        ) : (
           <div className="flex flex-wrap justify-end gap-2">
             {orchestration && (
               <Button size="sm" onClick={() => onOpenOrchestration(task)}>
@@ -306,8 +428,32 @@ export function TaskCard({
               </Button>
             )}
           </div>
-        )}
+        ))}
       </div>
+      {mobile && hasMobileSecondaryActions && (
+        <details className="mt-2 border-t border-border/60 pt-1">
+          <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between rounded-lg px-1 text-[11px] font-semibold text-muted-foreground [&::-webkit-details-marker]:hidden">
+            其他操作<ChevronDown className="h-4 w-4" />
+          </summary>
+          <div className="grid gap-2 pb-1">
+            {resumable && !commandPending && mobilePrimaryAction !== 'resume' && (
+              <Button size="sm" className="min-h-11 w-full" onClick={() => void onResume(task)} disabled={!writable || Boolean(resumeBlocked) || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />} {resumeActionLabel}
+              </Button>
+            )}
+            {stoppable && !stopPending && mobilePrimaryAction !== 'stop' && (
+              <Button variant="outline" size="sm" className="min-h-11 w-full" onClick={() => void onStop(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />} {stopActionLabel}
+              </Button>
+            )}
+            {dismissible && mobilePrimaryAction !== 'dismiss' && (
+              <Button variant="ghost" size="sm" className="min-h-11 w-full" onClick={() => void onDismissAttention(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />} 移到历史
+              </Button>
+            )}
+          </div>
+        </details>
+      )}
       {detailsOpen && (
         hasKeywordDiagnostics ? (
           <TaskDiagnosticsPanel task={task} diagnostics={diagnostics} />

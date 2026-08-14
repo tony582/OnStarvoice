@@ -27,6 +27,12 @@ type CreatorSubscription = {
   nextRunAt?: string
   last_error?: string
   lastError?: string
+  attention_required?: boolean
+  attentionRequired?: boolean
+  latest_execution_error?: string
+  latestExecutionError?: string
+  latest_execution_status?: string
+  latestExecutionStatus?: string
   has_official_role?: boolean
   hasOfficialRole?: boolean
 }
@@ -68,9 +74,11 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
     navigate('dispatch', { create: 'creator_patrol', subscriptionId: id })
   }
 
-  const followedCreatorSubs = subs.filter(s => s.hasOfficialRole !== true && s.has_official_role !== true)
+  const followedCreatorSubs = subs
+    .filter(s => s.hasOfficialRole !== true && s.has_official_role !== true)
+    .sort((left, right) => Number(isAttentionRequired(right)) - Number(isAttentionRequired(left)))
   const active = followedCreatorSubs.filter(s => s.status === 'active').length
-  const errored = followedCreatorSubs.filter(s => String(s.last_error || s.lastError || '').trim()).length
+  const errored = followedCreatorSubs.filter(isAttentionRequired).length
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-4 duration-300">
@@ -81,9 +89,9 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
           <div>
             <div className="text-[11px] font-semibold tracking-[0.16em] text-muted-foreground">监控值守</div>
             <div className="mt-1.5 text-[22px] font-bold leading-tight text-foreground">
-              {loading ? '正在读取监控状态' : errored > 0 ? `${errored} 个关注对象需处理` : '所有关注对象运行正常'}
+              {loading ? '正在读取监控状态' : errored > 0 ? `${errored} 个关注对象需处理` : '暂无需要处理的异常'}
             </div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">{loading ? '正在同步最新运行结果' : '先处理异常，再检查最新命中'}</div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">{loading ? '正在同步最新运行结果' : errored > 0 ? '巡查失败已置顶' : '可继续查看博主新动态'}</div>
           </div>
           <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl ${loading ? 'bg-primary/10 text-primary' : errored > 0 ? 'bg-status-red/12 text-status-red' : 'bg-status-green/12 text-status-green'}`}>
             {loading ? <Loader2 className="h-5 w-5 animate-spin" /> : errored > 0 ? <AlertTriangle className="h-5 w-5" /> : <Radar className="h-5 w-5" />}
@@ -120,21 +128,26 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
         <>
           <div className="space-y-3 lg:hidden">
             {followedCreatorSubs.map(s => {
-              const err = String(s.last_error || s.lastError || '').trim()
+              const attentionRequired = isAttentionRequired(s)
+              const err = attentionRequired
+                ? String(s.latest_execution_error || s.latestExecutionError || s.last_error || s.lastError || '').trim()
+                : ''
               const accountUrl = s.account_url || s.accountUrl
               return (
                 <article key={s.id} className="relative overflow-hidden rounded-[20px] border border-border/70 bg-card shadow-sm">
-                  <span className={`absolute inset-y-0 left-0 w-1 ${err ? 'bg-status-red' : s.status === 'active' ? 'bg-status-green' : 'bg-muted-foreground/40'}`} />
+                  <span className={`absolute inset-y-0 left-0 w-1 ${attentionRequired ? 'bg-status-red' : s.status === 'active' ? 'bg-status-green' : 'bg-muted-foreground/40'}`} />
                   <div className="px-5 pb-4 pt-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
                           <StatusBadge tone="neutral">{platformName(s.platform)}</StatusBadge>
-                          {err
-                            ? <StatusDot tone="negative">异常</StatusDot>
-                            : s.status === 'active'
+                          {s.status !== 'active'
+                            ? <StatusDot tone="muted">{s.status === 'paused' ? '已暂停' : s.status}</StatusDot>
+                            : attentionRequired
+                              ? <StatusDot tone="negative">巡查失败</StatusDot>
+                              : s.status === 'active'
                               ? <StatusDot tone="active">已启用</StatusDot>
-                              : <StatusDot tone="muted">{s.status === 'paused' ? '已暂停' : s.status}</StatusDot>}
+                              : null}
                         </div>
                         <h3 className="mt-2.5 truncate text-[17px] font-bold leading-6 text-foreground">{s.name || s.bloggerName || '博主'}</h3>
                         <div className="mt-1 truncate text-xs text-muted-foreground">{s.platformBloggerId || s.keyword || '未记录账号 ID'}</div>
@@ -209,7 +222,10 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
             </tr></thead>
             <tbody className="divide-y divide-border/40">
               {followedCreatorSubs.map(s => {
-                const err = String(s.last_error || s.lastError || '').trim()
+                const attentionRequired = isAttentionRequired(s)
+                const err = attentionRequired
+                  ? String(s.latest_execution_error || s.latestExecutionError || s.last_error || s.lastError || '').trim()
+                  : ''
                 return (
                   <tr key={s.id} className="align-top transition-colors hover:bg-accent/45">
                     <td className="px-4 py-3">
@@ -220,11 +236,13 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
                     </td>
                     <td className="px-4 py-3"><StatusBadge tone="neutral">{platformName(s.platform)}</StatusBadge></td>
                     <td className="px-4 py-3">
-                      {err
-                        ? <StatusDot tone="negative">异常</StatusDot>
-                        : s.status === 'active'
+                      {s.status !== 'active'
+                        ? <StatusDot tone="muted">{s.status === 'paused' ? '已暂停' : s.status}</StatusDot>
+                        : attentionRequired
+                          ? <StatusDot tone="negative">巡查失败</StatusDot>
+                          : s.status === 'active'
                           ? <StatusDot tone="active">已启用</StatusDot>
-                          : <StatusDot tone="muted">{s.status === 'paused' ? '已暂停' : s.status}</StatusDot>}
+                          : null}
                       {err && <div className="mt-1 max-w-[180px] truncate text-[10.5px] text-status-red" title={err}>{err}</div>}
                     </td>
                     <td className="px-4 py-3 text-sm text-muted-foreground">{formatCadence(s.cadence_minutes ?? s.cadenceMinutes ?? 0)}</td>
@@ -255,6 +273,10 @@ export function MonitorTasksTab({ onViewHits }: { onViewHits?: (subscriptionId: 
       )}
     </div>
   )
+}
+
+function isAttentionRequired(subscription: CreatorSubscription) {
+  return subscription.attentionRequired === true || subscription.attention_required === true
 }
 
 function MobileStat({ label, value, tone = 'text-foreground' }: { label: string; value: string; tone?: string }) {

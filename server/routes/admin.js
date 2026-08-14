@@ -7,6 +7,10 @@ import {
   getAiFailoverStatus,
   normalizeAiFailoverPolicy,
 } from '../services/ai-failover.js';
+import {
+  COMMENT_RISK_ATTENTION_SETTING,
+  normalizeCommentRiskAttentionSetting,
+} from '../services/comment-risk-attention.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
@@ -118,6 +122,14 @@ router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
            -- 人工安全验证通知属于客户自己的收件地址，绝不能继承默认租户。
            AND key <> 'capture_attention_email_to'`,
         [created.id, defaultTenantId]
+      );
+      // 评论值守默认开启。新租户不能因为默认租户恰好关闭了关注而静默继承关闭。
+      await tx.execute(
+        `INSERT INTO tenant_settings (tenant_id, key, value, updated_at)
+         VALUES ($1, $2, 'true', now())
+         ON CONFLICT (tenant_id, key)
+         DO UPDATE SET value = 'true', updated_at = excluded.updated_at`,
+        [created.id, COMMENT_RISK_ATTENTION_SETTING],
       );
       await tx.execute(
         `INSERT INTO audit_logs (tenant_id, actor_type, actor_id, action, target_type, target_id, metadata)
@@ -679,6 +691,17 @@ router.put('/settings', async (req, res, next) => {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body.tenantId || await getDefaultTenantId();
     const { tenantId: _tenantId, ...settings } = req.body || {};
     if (settings.smtp_pass === '***') delete settings.smtp_pass;
+    if (Object.prototype.hasOwnProperty.call(settings, COMMENT_RISK_ATTENTION_SETTING)) {
+      const value = normalizeCommentRiskAttentionSetting(settings[COMMENT_RISK_ATTENTION_SETTING]);
+      if (value === null) {
+        return res.status(400).json({
+          ok: false,
+          error: 'invalid_comment_risk_attention_setting',
+          message: '评论舆情关注设置必须为开启或关闭',
+        });
+      }
+      settings[COMMENT_RISK_ATTENTION_SETTING] = value;
+    }
     const failoverKeys = Object.keys(settings).filter(key =>
       key.startsWith('llm_failover_'));
     if (failoverKeys.length > 0) {

@@ -4,6 +4,9 @@ import test from 'node:test';
 
 import {
   RECORD_ANALYSIS_PROMPT_VERSION,
+  applyRecordCommentRiskAttentionPolicy,
+  buildTopicFallback,
+  classifyTopicRisk,
   computeRecordAnalysisInputHashFromState,
   isRecordAnalysisCacheCurrent,
   isValidRecordAnalysisCache,
@@ -127,6 +130,60 @@ test('互动快照、风险预警与负面评论变化都会使 input hash 失�
   negativeCommentChanged.negativeComments.high_count = 2;
   negativeCommentChanged.negativeComments.latest_negative_updated_at = '2026-07-29T02:00:00.000Z';
   assert.notEqual(computeRecordAnalysisInputHashFromState(negativeCommentChanged), baseHash);
+});
+
+test('关闭评论舆情关注后，评论变化不再污染剖析缓存与风险证据', () => {
+  const disabled = clone(BASE_STATE);
+  disabled.commentRiskAttentionEnabled = false;
+  const disabledHash = computeRecordAnalysisInputHashFromState(disabled);
+
+  const commentsChanged = clone(disabled);
+  commentsChanged.record.negative_comment_count = 99;
+  commentsChanged.record.latest_negative_comment_at = '2026-07-30T03:00:00.000Z';
+  commentsChanged.negativeComments.negative_count = 99;
+  commentsChanged.negativeComments.critical_count = 99;
+  commentsChanged.negativeComments.latest_negative_updated_at = '2026-07-30T03:00:00.000Z';
+  assert.equal(computeRecordAnalysisInputHashFromState(commentsChanged), disabledHash);
+  assert.notEqual(disabledHash, computeRecordAnalysisInputHashFromState(BASE_STATE));
+
+  const rawRecord = { id: 'record-1', negative_comment_count: 9, latest_negative_comment_at: '2026-07-30T03:00:00.000Z' };
+  const rawComments = [{ content: '不会进入剖析样本', is_negative: true }];
+  const projected = applyRecordCommentRiskAttentionPolicy({ record: rawRecord, comments: rawComments }, false);
+  assert.equal(projected.record.negative_comment_count, 0);
+  assert.equal(projected.record.latest_negative_comment_at, null);
+  assert.deepEqual(projected.comments, []);
+  assert.equal(rawRecord.negative_comment_count, 9);
+  assert.equal(rawComments.length, 1);
+});
+
+test('关闭评论关注后，话题定级、摘要和行动建议只消费内容风险', () => {
+  const withComments = {
+    alertCounts: {}, negativeRate: 0, negativeCount: 0, negativeComments: 10,
+    lowFansHighSpreadCount: 0, scopedIssueCount: 0, cliffPct: 0,
+    sentimentCounts: { positive: 0, neutral: 0, negative: 0 },
+    total: 0, commentRiskAttentionEnabled: true,
+  };
+  const withoutComments = { ...withComments, commentRiskAttentionEnabled: false };
+  assert.equal(classifyTopicRisk(withComments), 'attention');
+  assert.equal(classifyTopicRisk(withoutComments), 'watch');
+
+  const fallback = buildTopicFallback({
+    stats: {
+      commentRiskAttentionEnabled: false,
+      topNegative: [], negativeComments: [], keyword: [], platform: [],
+      risingRecords: [], volumeTrend: [], trailingTrend: [],
+    },
+    metrics: withoutComments,
+    samples: [],
+    sampleMap: {},
+    keywords: [],
+    periodStart: new Date('2026-08-01T00:00:00.000Z'),
+    periodEnd: new Date('2026-08-02T00:00:00.000Z'),
+  });
+  assert.equal(fallback.meta.commentRiskAttentionEnabled, false);
+  assert.doesNotMatch(fallback.riskAssessment.riskSummary, /负面评论/u);
+  assert.deepEqual(fallback.opinionBreakdown.representativeVoices, []);
+  assert.doesNotMatch(fallback.responseStrategy.actions.join('\n'), /负面评论/u);
 });
 
 test('分类落库后异步派生，sync 不再重复触发 alert，手动路由也按新 hash 防旧缓存', async () => {
