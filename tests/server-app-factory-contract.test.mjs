@@ -4,6 +4,10 @@ import test from 'node:test';
 
 const appSource = await readFile(new URL('../server/app.js', import.meta.url), 'utf8');
 const indexSource = await readFile(new URL('../server/index.js', import.meta.url), 'utf8');
+const compatibilityProcessSource = await readFile(
+  new URL('../server/runtime/compatibility-process.js', import.meta.url),
+  'utf8',
+);
 
 function assertAppearsInOrder(source, snippets, message) {
   let cursor = -1;
@@ -33,17 +37,27 @@ test('app factory owns HTTP composition without process startup side effects', (
   assert.doesNotMatch(appSource, /\bsetTimeout\b/u);
 
   assert.match(indexSource, /import \{ createApp \} from '\.\/app\.js';/u);
+  assert.match(
+    indexSource,
+    /import \{ prepareCompatibilityProcess \} from '\.\/runtime\/compatibility-process\.js';/u,
+  );
   assert.match(indexSource, /const app = createApp\(\);/u);
-  assert.match(indexSource, /await initDb\(\);/u);
+  assert.match(indexSource, /await prepareCompatibilityProcess\(\{/u);
   assert.match(indexSource, /startCronJobs\(\);/u);
   assert.match(indexSource, /app\.listen\(PORT/u);
+
+  assertAppearsInOrder(compatibilityProcessSource, [
+    'const roleConfig = resolveRole({',
+    'const lockHandle = await acquireLocks({',
+    'await initializeDatabase();',
+  ], 'compatibility role fence');
 
   const startupSource = indexSource.slice(
     indexSource.indexOf('async function start()'),
     indexSource.indexOf('\nstart().catch'),
   );
   assertAppearsInOrder(startupSource, [
-    'await initDb();',
+    'await prepareCompatibilityProcess({',
     'startVerifyRateLimitCleanup();',
     'startAsrMediaCleanup();',
     'startCronJobs();',

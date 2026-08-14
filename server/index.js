@@ -5,7 +5,7 @@
 import 'dotenv/config';
 
 import { createApp } from './app.js';
-import { initDb, closeDb } from './db/init.js';
+import { closeDb } from './db/init.js';
 import { startCronJobs } from './cron.js';
 import { probeDeepSeekPrimaryModel } from './services/ai-labeler.js';
 import {runAiFailoverRecoverySweep} from './services/ai-failover.js';
@@ -13,14 +13,33 @@ import { failStaleAnalyses } from './services/opinion-analysis.js';
 import { startVerifyRateLimitCleanup, stopVerifyRateLimitCleanup } from './routes/verify.js';
 import { startAsrMediaCleanup, stopAsrMediaCleanup } from './services/asr-media-host.js';
 import { ensureMediaDirs, backfillRecentCovers, backfillRecentImages } from './services/media-store.js';
+import { prepareCompatibilityProcess } from './runtime/compatibility-process.js';
 
 const app = createApp();
 const PORT = process.env.PORT || 3000;
+let processRoleLockHandle = null;
+let lockLossExitStarted = false;
+
+function exitOnProcessRoleLockLoss(details) {
+  if (lockLossExitStarted) return;
+  lockLossExitStarted = true;
+  console.error(
+    `[ProcessRole] Lost ${details.role} execution authority; exiting immediately.`,
+  );
+  // P2-B cannot safely demote this process: Cron and recursive AI timers do
+  // not yet expose complete stop handles. Exiting is the fail-closed fence.
+  process.exit(1);
+}
 
 // ==================== 启动 ====================
 
 async function start() {
-  await initDb();
+  const runtime = await prepareCompatibilityProcess({
+    env: process.env,
+    logger: console,
+    onLockLost: exitOnProcessRoleLockLoss,
+  });
+  processRoleLockHandle = runtime.lockHandle;
   ensureMediaDirs();
   startVerifyRateLimitCleanup();
   startAsrMediaCleanup();
@@ -151,6 +170,8 @@ process.on('SIGINT', async () => {
   stopVerifyRateLimitCleanup();
   stopAsrMediaCleanup();
   await closeDb();
+  // Keep the role-lock session until process exit. P2-C will add complete
+  // Cron/timer/server stop handles before graceful early unlock is safe.
   process.exit(0);
 });
 process.on('SIGTERM', async () => {

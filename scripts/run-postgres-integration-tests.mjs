@@ -23,9 +23,23 @@ const tests = entries
   .filter(entry => entry.isFile() && entry.name.endsWith('.integration.mjs'))
   .map(entry => path.join(integrationRoot, entry.name))
   .sort();
+const requiredTestFiles = [
+  'http-auth.integration.mjs',
+  'migrations.integration.mjs',
+  'process-role-entrypoint.integration.mjs',
+  'process-role-lock.integration.mjs',
+];
+const discoveredNames = new Set(tests.map(testPath => path.basename(testPath)));
+const missingRequiredTests = requiredTestFiles.filter(name => !discoveredNames.has(name));
 
 if (tests.length === 0) {
   console.error(`No PostgreSQL integration tests found in ${integrationRoot}.`);
+  process.exit(2);
+}
+if (missingRequiredTests.length > 0) {
+  console.error(
+    `Required PostgreSQL integration tests are missing: ${missingRequiredTests.join(', ')}`,
+  );
   process.exit(2);
 }
 
