@@ -993,13 +993,7 @@ node tests/capture/extension-snapshot.browser.mjs
 - 暗色运行页通过；
 - 等待倒计时状态通过。
 
-测试期间唯一已知警告：
-
-```text
-MODULE_TYPELESS_PACKAGE_JSON
-```
-
-该警告来自仓库未在 `package.json` 明确声明模块类型，当前不影响上述用例通过，但属于工程债，见后文。
+根级 `package.json` 已显式声明 `"type": "module"`。该文件不会进入 Extension 交付快照，只用于让 Node 18/24 以与源码一致的 ESM 语义执行测试；`MODULE_TYPELESS_PACKAGE_JSON` 不再是已知警告。
 
 ### 17.1 测试证据的边界
 
@@ -1129,18 +1123,20 @@ MODULE_TYPELESS_PACKAGE_JSON
 
 ## 20. 已知工程债
 
+### 已关闭
+
+1. **ES Module 类型已显式声明**
+   2026-08-14 已增加最小根级 `package.json`，Node 18.20.8 与 Node 24.12.0 的 1180 项全量回归均通过；该文件不进入 Chrome/Edge Extension 包。
+
 ### P1：稳定后尽快处理
 
-1. **ES Module 类型未显式声明**
-   Node 测试出现 `MODULE_TYPELESS_PACKAGE_JSON`。应评估给合适的测试/工具包声明 `"type": "module"`，但不要未经全量脚本验证直接改仓库根模块语义。
-
-2. **关键业务文件仍然过大**
+1. **关键业务文件仍然过大**
    `background.js`、`sidebar/sidebar-logic.js`、`utils/task-center.js` 职责多。优先按协议、状态机、视图适配器渐进拆分，不做一次性重写。
 
-3. **平台 DOM 持续漂移**
+2. **平台 DOM 持续漂移**
    需要为高风险信号维护真实、脱敏的 DOM fixture，并增加“正文包含异常词但不应误判”的反例。
 
-4. **AI 可观测性不够直观**
+3. **AI 可观测性不够直观**
    UI 开关与实际 AI 命中容易混淆。应展示“确定性规则 / AI 返回 / 超时 fail-open / 服务未配置”四种来源。
 
 ### P2：计划治理
