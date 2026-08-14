@@ -23,3 +23,7 @@ node --test tests/integration/http/app.test.mjs tests/server-app-factory-contrac
 需要 PostgreSQL 的 HTTP 用例仍必须使用隔离的 `TEST_DATABASE_URL`；不得连接生产库，
 不得请求真实 AI、SMTP、外部媒体或客户浏览器。具体隔离规则见
 [上级约定](../README.md)。
+
+`../postgres/http-auth.integration.mjs` 通过受保护的 PostgreSQL Runner 执行真实成功路径，
+覆盖登录与 Cookie/Token 会话、成员租户默认选择、显式租户读取、跨租户 403、激活码
+租户路由以及注销后会话失效。该用例使用每次随机生成的测试租户和账号，不读取生产快照。
