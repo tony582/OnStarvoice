@@ -88,6 +88,36 @@ jobs:
       - name: Confirm checks did not mutate tracked files
         run: git diff --exit-code
 
+  production-runtime-compatibility:
+    name: Production Node 18 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up production Node.js runtime
+        uses: actions/setup-node@v7
+        with:
+          node-version: 18.20.8
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install locked server dependencies
+        run: npm --prefix server ci
+
+      - name: Check server syntax on the production runtime
+        run: npm --prefix server run check:syntax
+
+      - name: Run the full regression suite on the production runtime
+        run: npm --prefix server test
+
+      - name: Confirm checks did not mutate tracked files
+        run: git diff --exit-code
+
   postgres-integration:
     name: PostgreSQL ${{ matrix.postgres }} integration
     runs-on: ubuntu-latest
