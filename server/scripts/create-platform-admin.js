@@ -1,8 +1,22 @@
 import 'dotenv/config';
-import { initDb, closeDb, getDefaultTenantId, queryOne, withTransaction } from '../db/init.js';
+import { resolveEntrypointProcessRole } from '../config/process-role.js';
+import {
+  closeDb,
+  connectRuntimeDb,
+  getDefaultTenantId,
+  queryOne,
+  withTransaction,
+} from '../db/init.js';
 import { hashPassword, normalizeEmail } from '../services/auth-service.js';
+import { assertProductionDatabaseUrl } from '../maintenance/cli.js';
 
 async function main() {
+  resolveEntrypointProcessRole({
+    env: process.env,
+    expectedRole: 'maintenance',
+    entrypoint: 'server/scripts/create-platform-admin.js',
+  });
+  assertProductionDatabaseUrl(process.env);
   const [, , emailRaw, password, nameRaw = 'Platform Admin'] = process.argv;
   const email = normalizeEmail(emailRaw);
   if (!email || !password || password.length < 8) {
@@ -10,7 +24,7 @@ async function main() {
     process.exit(1);
   }
 
-  await initDb();
+  await connectRuntimeDb();
   const tenantId = await getDefaultTenantId();
   const existing = await queryOne('SELECT id FROM users WHERE email = $1', [email]);
   if (existing) {

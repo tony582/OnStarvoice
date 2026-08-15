@@ -25,6 +25,8 @@ const tests = entries
   .sort();
 const requiredTestFiles = [
   'http-auth.integration.mjs',
+  'maintenance-entrypoint.integration.mjs',
+  'migration-governance.integration.mjs',
   'migrations.integration.mjs',
   'process-role-entrypoint.integration.mjs',
   'process-role-lock.integration.mjs',

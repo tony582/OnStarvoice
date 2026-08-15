@@ -12,10 +12,11 @@
     "start:api": "node entrypoints/api.js",
     "start:scheduler": "node entrypoints/scheduler.js",
     "start:ai-media": "node entrypoints/ai-media.js",
+    "maintenance": "node entrypoints/maintenance.js",
     "dev": "node --watch index.js",
-    "migrate": "node db/migrate.js",
-    "migrate:legacy": "node scripts/migrate-sqljs-to-postgres.js",
-    "comments:backfill": "node scripts/backfill-comments-workflow.js",
+    "migrate": "node entrypoints/maintenance.js migrate",
+    "migrate:legacy": "node entrypoints/maintenance.js run legacy-sqljs-import",
+    "comments:backfill": "node entrypoints/maintenance.js run comments-workflow-backfill",
     "user:create-admin": "node scripts/create-platform-admin.js"
   },
   "dependencies": {

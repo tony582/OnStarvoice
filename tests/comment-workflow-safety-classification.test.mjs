@@ -68,14 +68,15 @@ test('单条和批量评论 AI 提示都禁止按“安全”裸词判负面', (
 });
 
 test('启动回填只筛选历史候选，并重新排队给 AI 语义分类', async () => {
-  const [runtimeSource, workflowSource] = await Promise.all([
-    readFile(new URL('../server/runtime/ai-media-runtime.js', import.meta.url), 'utf8'),
+  const [maintenanceSource, workflowSource] = await Promise.all([
+    readFile(new URL('../server/maintenance/registry.js', import.meta.url), 'utf8'),
     readFile(new URL('../server/services/comment-workflow.js', import.meta.url), 'utf8'),
   ]);
 
-  assert.match(runtimeSource, /comment_safety_semantic_reclassify_v1/);
-  assert.match(runtimeSource, /safetySemanticReviewCandidatesOnly:\s*true/);
-  assert.match(runtimeSource, /queueForAI:\s*true/);
+  assert.match(maintenanceSource, /comment-safety-semantic-reclassify-v1/);
+  assert.match(maintenanceSource, /comment_safety_semantic_reclassify_v1/);
+  assert.match(maintenanceSource, /safetySemanticReviewCandidatesOnly:\s*true/);
+  assert.match(maintenanceSource, /queueForAI:\s*true/);
   assert.match(workflowSource, /rc\.is_official = false AND rc\.is_negative = true AND rc\.content LIKE '%安全%'/);
   assert.match(workflowSource, /is_negative = CASE WHEN \$7 THEN is_negative ELSE \$1 END/);
   assert.match(workflowSource, /ai_classified_at = CASE WHEN \$7 THEN NULL ELSE ai_classified_at END/);

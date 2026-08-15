@@ -440,35 +440,100 @@ function printSummary(sources, options) {
   }, null, 2));
 }
 
-async function importRows(sources, options) {
-  dotenv.config({ path: options.envFile, override: true });
-  const { queryOne, closeDb } = await import('../db/init.js');
-  const { upsertCapturedRecord } = await import('../services/record-store.js');
-  const { upsertRecordComments } = await import('../services/comment-workflow.js');
-
-  const tenant = await queryOne('SELECT id, name FROM tenants WHERE id = $1 AND status <> $2', [options.tenantId, 'deleted']);
-  if (!tenant) throw new Error(`Target tenant not found or deleted: ${options.tenantId}`);
-
-  const before = {
-    records: Number((await queryOne('SELECT COUNT(*) AS n FROM records WHERE tenant_id = $1', [options.tenantId]))?.n || 0),
-    comments: Number((await queryOne('SELECT COUNT(*) AS n FROM record_comments WHERE tenant_id = $1', [options.tenantId]))?.n || 0),
-  };
-
-  const stats = {
-    tenant,
-    before,
-    total: 0,
-    inserted: 0,
-    updated: 0,
-    commentInserted: 0,
-    commentUpdated: 0,
-    commentNegative: 0,
-    officialResponses: 0,
-    failed: 0,
-    failures: [],
-  };
+export async function closeCsvImportResources({
+  closeDatabase,
+  executionLock,
+  primaryError = null,
+} = {}) {
+  try {
+    await closeDatabase();
+  } catch (closeError) {
+    // The role locks are the last execution fence. Retain their PostgreSQL
+    // session until the top-level handler exits the process when pool closure
+    // cannot be confirmed.
+    if (primaryError) {
+      throw new AggregateError(
+        [primaryError, closeError],
+        `CSV import failed (${primaryError?.message || primaryError}); database close also failed (${closeError?.message || closeError})`,
+      );
+    }
+    throw closeError;
+  }
 
   try {
+    await executionLock.release();
+  } catch (releaseError) {
+    if (primaryError) {
+      throw new AggregateError(
+        [primaryError, releaseError],
+        `CSV import failed (${primaryError?.message || primaryError}); execution-lock release also failed (${releaseError?.message || releaseError})`,
+      );
+    }
+    throw releaseError;
+  }
+}
+
+async function importRows(sources, options) {
+  dotenv.config({ path: options.envFile, override: true });
+  const { resolveEntrypointProcessRole } = await import('../config/process-role.js');
+  const { assertProductionDatabaseUrl } = await import('../maintenance/cli.js');
+  const { acquireProcessRoleLocks } = await import('../runtime/process-role-locks.js');
+
+  resolveEntrypointProcessRole({
+    env: process.env,
+    expectedRole: 'maintenance',
+    entrypoint: 'server/scripts/import-extension-csv.js',
+  });
+  assertProductionDatabaseUrl(process.env);
+  if (process.env.MAINTENANCE_OFFLINE_CONFIRMED !== '1') {
+    const error = new Error('CSV commit import requires MAINTENANCE_OFFLINE_CONFIRMED=1.');
+    error.code = 'MAINTENANCE_OFFLINE_CONFIRMATION_REQUIRED';
+    throw error;
+  }
+
+  const executionLock = await acquireProcessRoleLocks({
+    role: 'all',
+    databaseUrl: process.env.DATABASE_URL,
+    applicationName: `onstarvoice:maintenance-csv-import:${process.pid}`,
+    connectionTimeoutMillis: process.env.PG_CONNECT_TIMEOUT_MS,
+    logger: console,
+    onLockLost(details) {
+      console.error(
+        `[ImportCSV] lost offline execution authority (${details?.event || 'unknown'}); exiting.`,
+      );
+      process.exit(1);
+    },
+  });
+  const { connectRuntimeDb, queryOne, closeDb } = await import('../db/init.js');
+  let primaryError = null;
+
+  try {
+    await connectRuntimeDb();
+    const { upsertCapturedRecord } = await import('../services/record-store.js');
+    const { upsertRecordComments } = await import('../services/comment-workflow.js');
+
+    const tenant = await queryOne('SELECT id, name FROM tenants WHERE id = $1 AND status <> $2', [options.tenantId, 'deleted']);
+    if (!tenant) throw new Error(`Target tenant not found or deleted: ${options.tenantId}`);
+
+    const before = {
+      records: Number((await queryOne('SELECT COUNT(*) AS n FROM records WHERE tenant_id = $1', [options.tenantId]))?.n || 0),
+      comments: Number((await queryOne('SELECT COUNT(*) AS n FROM record_comments WHERE tenant_id = $1', [options.tenantId]))?.n || 0),
+    };
+
+    const stats = {
+      tenant,
+      before,
+      total: 0,
+      inserted: 0,
+      updated: 0,
+      commentInserted: 0,
+      commentUpdated: 0,
+      commentNegative: 0,
+      officialResponses: 0,
+      failed: 0,
+      failures: [],
+    };
+
     outer:
     for (const source of sources) {
       for (const record of source.rows) {
@@ -479,6 +544,7 @@ async function importRows(sources, options) {
             tenantId: options.tenantId,
             authCode: options.authCode,
             monitorExecutionId: null,
+            localizeMedia: false,
           });
           if (result.action === 'inserted') stats.inserted += 1;
           else if (result.action === 'updated') stats.updated += 1;
@@ -516,8 +582,15 @@ async function importRows(sources, options) {
     };
     stats.after = after;
     return stats;
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    await closeDb();
+    await closeCsvImportResources({
+      closeDatabase: closeDb,
+      executionLock,
+      primaryError,
+    });
   }
 }
 
@@ -542,7 +615,9 @@ async function main() {
   if (stats.failed > 0) process.exitCode = 1;
 }
 
-main().catch(err => {
-  console.error(`[ImportCSV] ${err?.stack || err?.message || err}`);
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === __filename) {
+  main().catch(err => {
+    console.error(`[ImportCSV] ${err?.stack || err?.message || err}`);
+    process.exit(1);
+  });
+}

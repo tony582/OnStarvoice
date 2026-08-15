@@ -199,7 +199,17 @@ function buildCommentHash(recordId, comment) {
 
 // classification:入库用的(规则)分类。aiClassified:是否已是终判(官方评论)。
 // 评论入库不调 LLM —— 新评论先存规则分类、ai_classified_at 留 NULL,由后台 refineCommentsWithAI 精炼。
-async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification = null, aiClassified = false, koeTerms = [] }) {
+async function upsertComment(tx, {
+  tenantId,
+  recordId,
+  platform,
+  comment,
+  officialAccount,
+  classification = null,
+  aiClassified = false,
+  koeTerms = [],
+  preserveExisting = false,
+}) {
   const contentHash = buildCommentHash(recordId, comment);
   const sourceType = detectKoeSourceType(comment.author_name, koeTerms);
   if (!classification) classification = ruleClassificationWithMetadata(classifyComment(comment, Boolean(officialAccount)));
@@ -218,6 +228,55 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
   }
 
   if (existing) {
+    // 历史回填只补缺失评论。重复执行时不能把旧评论伪装成一次新的采集，
+    // 也不能膨胀 seen_count。但官方账号强身份可能是后补的：此时只纠正身份与
+    // 分类事实，不刷新 first/last_seen_at、seen_count 或采集 payload。
+    if (preserveExisting) {
+      let row = existing;
+      let officialIdentityCorrected = false;
+      if (officialAccount && !Boolean(existing.is_official)) {
+        const corrected = await tx.queryOne(`
+          UPDATE record_comments SET
+            author_name = COALESCE(NULLIF($1, ''), author_name),
+            author_id = COALESCE(NULLIF($2, ''), author_id),
+            author_avatar = COALESCE(NULLIF($3, ''), author_avatar),
+            is_official = true,
+            is_negative = $4,
+            sentiment = $5,
+            category = $6,
+            risk_level = $7,
+            ai_summary = $8,
+            ai_result = $9::jsonb,
+            ai_classified_at = COALESCE(ai_classified_at, now()),
+            source_type = '',
+            updated_at = now()
+          WHERE id = $10 AND is_official = false
+          RETURNING *
+        `, [
+          comment.author_name,
+          comment.author_id,
+          comment.author_avatar,
+          classification.is_negative,
+          classification.sentiment,
+          classification.category,
+          classification.risk_level,
+          classificationSummary(classification),
+          JSON.stringify(classification.ai_result || {}),
+          existing.id,
+        ]);
+        if (corrected) {
+          row = corrected;
+          officialIdentityCorrected = true;
+        }
+      }
+      return {
+        row,
+        inserted: false,
+        preserved: !officialIdentityCorrected,
+        officialIdentityCorrected,
+        officialAccount,
+      };
+    }
     // 已存在:只刷新元数据(点赞/内容/最近见到),不动已有分类与 ai_classified_at ——
     // 否则重采会把后台已 AI 精炼的结果降级回规则、并把它重新标成待精炼。
     const row = await tx.queryOne(`
@@ -275,12 +334,13 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
 
 async function upsertOfficialResponse(tx, { tenantId, recordId, platform, comment, commentId, officialAccount }) {
   const contentHash = sha256([recordId, officialAccount?.id || '', comment.content, comment.published_at].join('|'));
-  await tx.execute(`
+  const inserted = await tx.execute(`
     INSERT INTO official_responses (
       tenant_id, record_id, comment_id, official_account_id, platform,
       account_name, account_id, content, published_at, content_hash, payload
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
     ON CONFLICT (tenant_id, record_id, content_hash) WHERE content_hash <> '' DO NOTHING
+    RETURNING id
   `, [
     tenantId, recordId, commentId, officialAccount?.id || null, platform || '',
     comment.author_name || officialAccount?.account_name || '',
@@ -288,6 +348,7 @@ async function upsertOfficialResponse(tx, { tenantId, recordId, platform, commen
     comment.content, comment.published_at, contentHash,
     JSON.stringify(comment.payload || {}),
   ]);
+  return Number(inserted?.rowCount || 0);
 }
 
 async function aggregateRecordComments(tx, tenantId, recordId) {
@@ -413,9 +474,22 @@ async function mapLimit(items, limit, fn) {
 
 // 评论写库后:重算事实计数与官方回复状态，只追加提醒，绝不改人工处理状态。
 // Phase A(规则入库后)与 Phase B(AI 精炼后)共用。
-async function finalizeRecordAggregate(tx, { tenantId, recordId, previousAggregate }) {
+async function finalizeRecordAggregate(tx, {
+  tenantId,
+  recordId,
+  previousAggregate,
+  updateOnlyWhenFactsChange = false,
+}) {
   const aggregate = await aggregateRecordComments(tx, tenantId, recordId);
   const responseFacts = resolveOfficialResponseFacts(aggregate);
+  const factsChangeGuard = updateOnlyWhenFactsChange
+    ? `AND (
+        official_replied IS DISTINCT FROM $1
+        OR official_response_status IS DISTINCT FROM $2
+        OR negative_comment_count IS DISTINCT FROM $3
+        OR latest_negative_comment_at IS DISTINCT FROM $4
+      )`
+    : '';
   await tx.execute(`
     UPDATE records
     SET official_replied = $1,
@@ -424,6 +498,7 @@ async function finalizeRecordAggregate(tx, { tenantId, recordId, previousAggrega
       latest_negative_comment_at = $4,
       updated_at = now()
     WHERE id = $5 AND tenant_id = $6
+      ${factsChangeGuard}
   `, [
     responseFacts.officialReplied,
     responseFacts.responseStatus,
@@ -518,12 +593,21 @@ export async function upsertRecordComments(recordId, record, context) {
     }
 
     for (const { comment, officialAccount, classification, aiClassified } of prepared) {
-      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification, aiClassified, koeTerms });
+      const result = await upsertComment(tx, {
+        tenantId,
+        recordId,
+        platform,
+        comment,
+        officialAccount,
+        classification,
+        aiClassified,
+        koeTerms,
+        preserveExisting: context.preserveExisting === true,
+      });
       if (result.inserted) inserted += 1;
-      else updated += 1;
+      else if (!result.preserved) updated += 1;
       if (officialAccount) {
-        officialResponses += 1;
-        await upsertOfficialResponse(tx, {
+        officialResponses += await upsertOfficialResponse(tx, {
           tenantId,
           recordId,
           platform,
@@ -539,6 +623,9 @@ export async function upsertRecordComments(recordId, record, context) {
       tenantId,
       recordId,
       previousAggregate,
+      updateOnlyWhenFactsChange: context.preserveExisting === true
+        && inserted === 0
+        && updated === 0,
     });
 
     return {
