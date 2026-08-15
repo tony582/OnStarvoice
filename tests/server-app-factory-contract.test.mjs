@@ -8,6 +8,18 @@ const compatibilityProcessSource = await readFile(
   new URL('../server/runtime/compatibility-process.js', import.meta.url),
   'utf8',
 );
+const processEntrypointSource = await readFile(
+  new URL('../server/runtime/process-entrypoint.js', import.meta.url),
+  'utf8',
+);
+const processRuntimeSource = await readFile(
+  new URL('../server/runtime/process-runtime.js', import.meta.url),
+  'utf8',
+);
+const apiRuntimeSource = await readFile(
+  new URL('../server/runtime/api-runtime.js', import.meta.url),
+  'utf8',
+);
 
 function assertAppearsInOrder(source, snippets, message) {
   let cursor = -1;
@@ -19,15 +31,6 @@ function assertAppearsInOrder(source, snippets, message) {
   }
 }
 
-function signalHandlerSource(signal) {
-  const marker = `process.on('${signal}'`;
-  const start = indexSource.indexOf(marker);
-  assert.notEqual(start, -1, `missing ${signal} handler`);
-  const end = indexSource.indexOf('\n});', start);
-  assert.notEqual(end, -1, `unterminated ${signal} handler`);
-  return indexSource.slice(start, end);
-}
-
 test('app factory owns HTTP composition without process startup side effects', () => {
   assert.match(appSource, /export function createApp\(/u);
   assert.doesNotMatch(appSource, /\.listen\s*\(/u);
@@ -36,15 +39,13 @@ test('app factory owns HTTP composition without process startup side effects', (
   assert.doesNotMatch(appSource, /\bsetInterval\b/u);
   assert.doesNotMatch(appSource, /\bsetTimeout\b/u);
 
-  assert.match(indexSource, /import \{ createApp \} from '\.\/app\.js';/u);
   assert.match(
     indexSource,
-    /import \{ prepareCompatibilityProcess \} from '\.\/runtime\/compatibility-process\.js';/u,
+    /import \{ runProcessEntrypoint \} from '\.\/runtime\/process-entrypoint\.js';/u,
   );
-  assert.match(indexSource, /const app = createApp\(\);/u);
-  assert.match(indexSource, /await prepareCompatibilityProcess\(\{/u);
-  assert.match(indexSource, /startCronJobs\(\);/u);
-  assert.match(indexSource, /app\.listen\(PORT/u);
+  assert.match(indexSource, /await runProcessEntrypoint\(\{/u);
+  assert.match(indexSource, /expectedRole: 'all'/u);
+  assert.doesNotMatch(indexSource, /\bcreateApp\b|\bstartCronJobs\b|\.listen\s*\(/u);
 
   assertAppearsInOrder(compatibilityProcessSource, [
     'const roleConfig = resolveRole({',
@@ -52,25 +53,30 @@ test('app factory owns HTTP composition without process startup side effects', (
     'await initializeDatabase();',
   ], 'compatibility role fence');
 
-  const startupSource = indexSource.slice(
-    indexSource.indexOf('async function start()'),
-    indexSource.indexOf('\nstart().catch'),
-  );
-  assertAppearsInOrder(startupSource, [
-    'await prepareCompatibilityProcess({',
-    'startVerifyRateLimitCleanup();',
-    'startAsrMediaCleanup();',
-    'startCronJobs();',
-    'app.listen(PORT',
-  ], 'compatibility entrypoint startup');
+  assertAppearsInOrder(processRuntimeSource, [
+    "await prepareCompatibility({ env, logger, onLockLost: notifyLockLost })",
+    'for (const runtimeRole of rolesForProcess(preparation.roleConfig.role))',
+    'health.markReady?.();',
+  ], 'compatibility runtime startup');
 
-  for (const signal of ['SIGINT', 'SIGTERM']) {
-    assertAppearsInOrder(signalHandlerSource(signal), [
-      'stopVerifyRateLimitCleanup();',
-      'stopAsrMediaCleanup();',
-      'await closeDb();',
-    ], `${signal} shutdown`);
-  }
+  assertAppearsInOrder(apiRuntimeSource, [
+    'prepareMediaDirectories();',
+    'startVerifyCleanup();',
+    'startMediaCleanup();',
+    'server = await listen(',
+  ], 'API runtime startup');
+
+  assertAppearsInOrder(processRuntimeSource, [
+    'health.markDraining?.(reason);',
+    'runtime.stopNewWork?.();',
+    'const drainResults = await Promise.all(',
+    'await closeDatabase();',
+    'await preparation.lockHandle.release();',
+  ], 'graceful shutdown fence');
+
+  assert.match(processEntrypointSource, /processObject\.on\('SIGINT', onSigint\)/u);
+  assert.match(processEntrypointSource, /processObject\.on\('SIGTERM', onSigterm\)/u);
+  assert.match(processEntrypointSource, /received \$\{signal\} during shutdown; forcing exit/u);
 });
 
 test('importing and creating the app adds no timers or signal listeners while cleanups are idempotent', async () => {

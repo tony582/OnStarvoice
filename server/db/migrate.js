@@ -8,6 +8,15 @@ import { upsertRecordComments } from '../services/comment-workflow.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const RESET_MIGRATION_RE = /reset/i;
+
+export async function listMigrationVersions({ includeReset = false } = {}) {
+  const migrationsDir = join(__dirname, 'migrations');
+  return (await readdir(migrationsDir))
+    .filter(file => file.endsWith('.sql'))
+    .filter(file => includeReset || !RESET_MIGRATION_RE.test(file))
+    .sort();
+}
 
 async function ensureMigrationTable(client) {
   await client.query(`
@@ -116,9 +125,7 @@ export async function runMigrations() {
   try {
     await ensureMigrationTable(client);
     const migrationsDir = join(__dirname, 'migrations');
-    const files = (await readdir(migrationsDir))
-      .filter(file => file.endsWith('.sql'))
-      .sort();
+    const files = await listMigrationVersions({ includeReset: true });
 
     const appliedRows = await client.query('SELECT version FROM schema_migrations');
     const applied = new Set(appliedRows.rows.map(row => row.version));
@@ -126,7 +133,6 @@ export async function runMigrations() {
     // 破坏性「清库」迁移(reset_captured_data / reset_anjixing 等会 DELETE records/issues/…)移出自动链:
     // 默认启动时【不跑】—— 否则备份恢复、或拿生产数据灌一个 schema_migrations 不同步的新库时,启动即清库。
     // 需要时显式 ALLOW_RESET_MIGRATIONS=1 启动一次(或单独跑 maintenance)。已 applied 的不受影响。
-    const RESET_MIGRATION_RE = /reset/i;
     const allowReset = process.env.ALLOW_RESET_MIGRATIONS === '1';
 
     for (const file of files) {

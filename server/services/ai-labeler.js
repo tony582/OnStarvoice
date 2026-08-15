@@ -15,6 +15,7 @@ import {
   formatMonitoringIntentForPrompt,
   resolveMonitoringIntent,
 } from './monitoring-intent.js';
+import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
 
 export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v2';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
@@ -573,7 +574,7 @@ function hasRelevanceResult(record) {
  * 不影响分类主链路，也不会让同步接口因深度剖析失败而失败。
  */
 function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment }) {
-  setImmediate(async () => {
+  void scheduleProcessBackgroundWork(async () => {
     try {
       if (relevance !== 'irrelevant' || sentiment === 'negative') {
         const { checkAlerts } = await import('./alert-engine.js');
@@ -586,11 +587,11 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
     if (sentiment !== 'negative') return;
     try {
       const { queueNegativeRecordAnalysis } = await import('./opinion-analysis.js');
-      void queueNegativeRecordAnalysis({ tenantId, recordId });
+      await queueNegativeRecordAnalysis({ tenantId, recordId });
     } catch (err) {
       console.error(`[AI] Negative analysis dispatch failed for record ${recordId}:`, err?.message || err);
     }
-  });
+  }, { label: 'AiPostClassification' });
 }
 
 export async function labelRecord(recordId, options = {}) {

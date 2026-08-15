@@ -16,6 +16,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { queryOne, queryAll, execute } from '../db/query.js';
 import { resolveReferer, isAllowedMediaHost } from './media-proxy.js';
+import { runProcessBackgroundWork } from '../runtime/process-background-work.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // server 在 /opt/onstarvoice/server,上两级 + media = /opt/onstarvoice/media(rsync 不碰)
@@ -98,7 +99,10 @@ export async function ensureCoverLocal(recordId, coverUrl, platform) {
 
 // 非阻塞触发(入库后调用,不阻塞采集响应)
 export function queueCoverLocalization(recordId, coverUrl, platform) {
-  ensureCoverLocal(recordId, coverUrl, platform).catch(() => {});
+  void runProcessBackgroundWork(
+    () => ensureCoverLocal(recordId, coverUrl, platform),
+    { label: 'CoverLocalization' },
+  );
 }
 
 export function imageSourceIdentity(value) {
@@ -207,7 +211,10 @@ export async function ensureRecordImagesLocal(recordId, imageUrls, platform) {
 }
 
 export function queueRecordImagesLocalization(recordId, imageUrls, platform) {
-  ensureRecordImagesLocal(recordId, imageUrls, platform).catch(() => {});
+  void runProcessBackgroundWork(
+    () => ensureRecordImagesLocal(recordId, imageUrls, platform),
+    { label: 'RecordImagesLocalization' },
+  );
 }
 
 // 启动回填:近 24h 采集、还没落地的图片(链接多半还有效)批量下载。过期的会下载失败、自动跳过。

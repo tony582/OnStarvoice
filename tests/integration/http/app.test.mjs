@@ -56,10 +56,20 @@ test('createApp serves the HTTP boundary without database or background startup'
   const appUrl = new URL('../../../server/app.js', import.meta.url);
   appUrl.searchParams.set('http-contract', String(Date.now()));
   const { createApp } = await import(appUrl.href);
+  const { createProcessHealth } = await import(
+    '../../../server/runtime/process-health.js'
+  );
   const logs = [];
   const errors = [];
+  const health = createProcessHealth({ role: 'api', uptime: () => 42 });
+  const asyncHealth = Object.freeze({
+    getLegacyHealth: () => health.getLegacyHealth(),
+    getLiveness: () => health.getLiveness(),
+    getReadiness: async () => health.getReadiness(),
+  });
   const app = createApp({
     corsOrigins: [ALLOWED_ORIGIN],
+    health: asyncHealth,
     logger: {
       log: (...args) => logs.push(args),
       error: (...args) => errors.push(args),
@@ -79,8 +89,43 @@ test('createApp serves the HTTP boundary without database or background startup'
     const body = await json(response);
     assert.equal(body.ok, true);
     assert.equal(body.version, '0.1.0');
-    assert.equal(typeof body.uptime, 'number');
-    assert.ok(body.uptime >= 0);
+    assert.equal(body.uptime, 42);
+  });
+
+  await t.test('separates liveness from readiness', async () => {
+    const liveResponse = await fetch(`${baseUrl}/api/health/live`);
+    assert.equal(liveResponse.status, 200);
+    assert.deepEqual(await json(liveResponse), {
+      ok: true,
+      status: 'live',
+      version: '0.1.0',
+      role: 'api',
+      uptime: 42,
+    });
+
+    const initializingResponse = await fetch(`${baseUrl}/api/health/ready`);
+    assert.equal(initializingResponse.status, 503);
+    assert.equal((await json(initializingResponse)).reason, 'initializing');
+
+    health.markReady();
+    const readyResponse = await fetch(`${baseUrl}/api/health/ready`);
+    assert.equal(readyResponse.status, 200);
+    assert.deepEqual(await json(readyResponse), {
+      ok: true,
+      status: 'ready',
+      version: '0.1.0',
+      role: 'api',
+      uptime: 42,
+    });
+
+    health.markFailed('database_unavailable');
+    const unavailableResponse = await fetch(`${baseUrl}/api/health/ready`);
+    assert.equal(unavailableResponse.status, 503);
+    assert.equal((await json(unavailableResponse)).reason, 'database_unavailable');
+
+    const failedLiveResponse = await fetch(`${baseUrl}/api/health/live`);
+    assert.equal(failedLiveResponse.status, 503);
+    assert.equal((await json(failedLiveResponse)).reason, 'database_unavailable');
   });
 
   await t.test('redirects the root to the Admin application', async () => {

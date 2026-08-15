@@ -67,9 +67,9 @@ test('production entrypoint rejects unsafe roles before database or background s
       message: /PROCESS_ROLE is not one of the supported roles/u,
     },
     {
-      name: 'future independent role',
+      name: 'independent role on compatibility entrypoint',
       processRole: 'api',
-      message: /independent role entrypoints are deferred to P2-C/u,
+      message: /use the dedicated entrypoint for role api/u,
     },
   ];
 

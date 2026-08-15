@@ -12,6 +12,7 @@ import {
   isRecordAnalysisCacheCurrent,
   isValidRecordAnalysisCache,
 } from '../services/opinion-analysis.js';
+import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
 
 const router = Router();
 
@@ -82,9 +83,10 @@ router.post('/topics', requireTenantWriter, async (req, res, next) => {
         periodStart.toISOString(), periodEnd.toISOString(), initialProgress(), req.actorName || '',
       ]
     );
-    setImmediate(() => {
-      runTopicAnalysis({ tenantId: req.tenantId, analysisId: inserted.id }).catch(() => {});
-    });
+    void scheduleProcessBackgroundWork(
+      () => runTopicAnalysis({ tenantId: req.tenantId, analysisId: inserted.id }),
+      { label: 'OpinionTopicAnalysis' },
+    );
     return res.json({ ok: true, analysis: inserted });
   } catch (err) {
     return next(err);
@@ -144,9 +146,10 @@ router.post('/topics/:id/rerun', requireTenantWriter, async (req, res, next) => 
         source.period_start, source.period_end, initialProgress(), req.actorName || '',
       ]
     );
-    setImmediate(() => {
-      runTopicAnalysis({ tenantId: req.tenantId, analysisId: inserted.id }).catch(() => {});
-    });
+    void scheduleProcessBackgroundWork(
+      () => runTopicAnalysis({ tenantId: req.tenantId, analysisId: inserted.id }),
+      { label: 'OpinionTopicAnalysis' },
+    );
     return res.json({ ok: true, analysis: inserted });
   } catch (err) {
     return next(err);

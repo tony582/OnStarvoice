@@ -62,7 +62,6 @@ function spawnServer({
   port,
   mediaDirectory,
   guardSchema,
-  exitDelayMs = 0,
 }) {
   assert.match(guardSchema, /^p2b_guard_[a-f0-9]+$/u);
   const env = {
@@ -101,7 +100,6 @@ function spawnServer({
     SMTP_PASS: '',
     EMAIL_FROM: '',
     EMAIL_TO: '',
-    ONSTARVOICE_TEST_EXIT_DELAY_MS: String(exitDelayMs),
   };
 
   const child = spawn(process.execPath, [
@@ -125,19 +123,6 @@ function spawnServer({
     child,
     output: () => `${stdout}\n${stderr}`,
   };
-}
-
-async function waitForOutput(server, pattern, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const output = server.output();
-    if (pattern.test(output)) return output;
-    if (server.child.exitCode != null || server.child.signalCode != null) {
-      throw new Error(`Server exited before output matched ${pattern}:\n${output}`);
-    }
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
-  throw new Error(`Server output did not match ${pattern}:\n${server.output()}`);
 }
 
 function assertServerGuarded(server) {
@@ -296,7 +281,7 @@ test('real compatibility entrypoint fences all startup work and exits when its l
     await blocker.release();
   });
 
-  await t.test('SIGTERM keeps execution locks until the compatibility process exits', async () => {
+  await t.test('SIGTERM drains the compatibility process before clean exit and replacement', async () => {
     const mediaDirectory = path.join(tempDirectory, 'sigterm-media');
     const port = await temporaryPort();
     const server = spawnServer({
@@ -304,7 +289,6 @@ test('real compatibility entrypoint fences all startup work and exits when its l
       port,
       mediaDirectory,
       guardSchema,
-      exitDelayMs: 2000,
     });
     servers.add(server);
     await waitForHealth(server, port);
@@ -327,24 +311,8 @@ test('real compatibility entrypoint fences all startup work and exits when its l
     assert.equal(heldLocks.rows[0].count, 2);
 
     server.child.kill('SIGTERM');
-    await waitForOutput(server, /\[P2BTestGuard\] exit-delayed/u);
-    assert.equal(server.child.exitCode, null);
-    assert.equal(server.child.signalCode, null);
-    const locksDuringShutdown = await pool.query(`
-      SELECT count(*)::integer AS count
-      FROM pg_locks
-      WHERE locktype = 'advisory' AND granted AND pid = $1
-    `, [roleBackendPid]);
-    assert.equal(locksDuringShutdown.rows[0].count, 2);
-    await assert.rejects(
-      acquire('all', 'during-sigterm'),
-      error => {
-        assert.equal(error.code, 'PROCESS_ROLE_LOCK_UNAVAILABLE');
-        assert.equal(error.contendedRole, 'scheduler');
-        return true;
-      },
-    );
     assert.deepEqual(await waitForChildExit(server.child), { code: 0, signal: null });
+    assert.match(server.output(), /SIGTERM received; draining/u);
     await waitForQuery(
       async () => (await pool.query(
         'SELECT count(*)::integer AS count FROM pg_stat_activity WHERE pid = $1',
@@ -385,7 +353,7 @@ test('real compatibility entrypoint fences all startup work and exits when its l
     );
     assert.equal(terminated.rows[0].terminated, true);
     assert.deepEqual(await waitForChildExit(server.child), { code: 1, signal: null });
-    assert.match(server.output(), /Lost all execution authority; exiting immediately/u);
+    assert.match(server.output(), /lost all execution authority; exiting immediately/iu);
 
     const replacement = await acquire('all', 'after-lock-loss');
     await replacement.release();

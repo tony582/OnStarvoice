@@ -4,6 +4,8 @@ StarVoice 是一套面向企业客户的多平台社交舆情采集、任务调�
 
 > P2-A1 的合并与发布来源锚点为 `0ec5508`。2026-08-14 生产核对值为 Extension `0.3.83`、数据库迁移 `066_tenant_comment_risk_attention.sql`；生产中纳入 Git 的 Server 文件，是 `236aa4d` 完整基线叠加来自 `0ec5508` 的 4 个白名单文件，不是完整 `0ec5508` 树。精确清单见 [开发运行与生产发布手册](docs/开发运行与生产发布手册.md#14-2026-08-14-p2-a1-限定生产快照)。
 >
+> 2026-08-15，P2-B 已通过 PR #21 合并到 `main`，merge commit 为 `7c3e47ef1717a3fc498d63a1e3b7952e9100ecee`，但**尚未部署生产**；线上不能被描述为已经配置 `PROCESS_ROLE` 或已受角色锁保护。P2-C 实现提交 `bc4d665` 已推送至分支 `codex/architecture-modernization-p2c-process-runtime`，并由 [PR #22](https://github.com/tony582/OnStarvoice/pull/22) 跟踪评审与主线交付；仓库合并状态以该 PR 和当前 `main` 为准，生产尚未部署。
+>
 > “稳定基线”表示当前主链路已经形成可交接、可回归、可发布的版本锚点，不表示所有能力都已脱离 Beta。调度中心、多 Agent 接力、无人值守、平台风控识别和依赖页面 DOM 的采集仍需按客户环境逐项验收。
 
 ## 10 分钟重新接手
@@ -82,6 +84,10 @@ PostgreSQL
 
 ## 本地快速启动
 
+当前标准本地启动仍使用兼容 `all` 入口。P2-C 分支中已建立 `api`、`scheduler`、`ai-media` 三个独立入口，以及兼容 `/api/health` 的 `/api/health/live`、`/api/health/ready` 候选语义；响应后继续执行的进程内后台工作也已纳入统一的有界 drain。独立角色启动前会只读核对仓库中的全部非 reset 迁移都已记录为 applied，不会自行运行迁移或 bootstrap。
+
+该候选已通过 Node 24 与生产 Node 18 的 1250/1250 回归、在两版 Node 下各 13/13 的隔离 PostgreSQL 集成，以及语法、拓扑、前端、仓库卫生和 92 文件 Extension 生产快照门禁；门禁前后工作区状态一致。实现由 PR #22 跟踪，但不是生产操作指令且尚未部署；拆分上线继续受 P2-D、P2-E 和另行发布授权阻断。
+
 ### 1. 服务端
 
 ```bash
@@ -149,7 +155,7 @@ scripts/package-extension.zsh
 - PostgreSQL 数据库：`onstarvoice`
 - 管理后台：`/admin`
 - 独立看板：`/dashboard`
-- 健康检查：`/api/health`
+- 生产健康检查：`/api/health`（P2-C 的 `/api/health/live`、`/api/health/ready` 尚未部署）
 
 现有 `deploy/deploy.sh` 不是原子发布：它只构建主管理后台，不构建独立 Dashboard；它不会自动创建生产备份，也会通过删除再启动 PM2 产生短暂中断。生产操作必须以 [开发运行与生产发布手册](docs/开发运行与生产发布手册.md) 为准。
 

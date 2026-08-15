@@ -10,6 +10,10 @@ import {
 } from '../utils/metrics.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
 import { queryAll } from '../db/init.js';
+import {
+  runProcessBackgroundWork,
+  scheduleProcessBackgroundWork,
+} from '../runtime/process-background-work.js';
 
 const router = Router();
 const commentWorkflowQueue = [];
@@ -104,7 +108,9 @@ function queuedCommentStats(total) {
 function enqueueCommentWorkflow(task) {
   if (typeof task !== 'function') return;
   commentWorkflowQueue.push(task);
-  void drainCommentWorkflowQueue();
+  void runProcessBackgroundWork(drainCommentWorkflowQueue, {
+    label: 'SyncCommentWorkflow',
+  });
 }
 
 async function drainCommentWorkflowQueue() {
@@ -239,9 +245,19 @@ export function normalizeRecord(body) {
   });
 }
 
+async function labelRecordsNow(recordIds) {
+  for (const id of recordIds) {
+    try {
+      await labelRecord(id);
+    } catch (err) {
+      console.error(`[Sync] AI label error for record ${id}:`, err.message);
+    }
+  }
+}
+
 function queueAiJobs(recordIds) {
-  if (!recordIds.length) return;
-  setImmediate(async () => {
+  if (!recordIds.length) return Promise.resolve();
+  return scheduleProcessBackgroundWork(async () => {
     for (const id of recordIds) {
       try {
         await labelRecord(id);
@@ -249,7 +265,7 @@ function queueAiJobs(recordIds) {
         console.error(`[Sync] AI label error for record ${id}:`, err.message);
       }
     }
-  });
+  }, { label: 'SyncAiLabeling' });
 }
 
 async function applyCommentWorkflow(record, result, req) {
@@ -269,7 +285,7 @@ function queueCommentWorkflow(record, result, context) {
   enqueueCommentWorkflow(async () => {
     const commentStats = await applyCommentWorkflow(record, result, context);
     if (result.action === 'inserted' && !result.officialContent && !commentStats.officialContent) {
-      queueAiJobs([result.id]);
+      await labelRecordsNow([result.id]);
     }
   });
   return queuedCommentStats(total);

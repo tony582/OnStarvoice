@@ -47,6 +47,9 @@ function dependencies(events, overrides = {}) {
     async initializeDatabase() {
       events.push('init-db');
     },
+    async closeDatabase() {
+      events.push('close-db');
+    },
     ...overrides,
   };
 }
@@ -113,6 +116,7 @@ test('database initialization failure releases locks before any background start
     'resolve-role',
     'acquire-locks',
     'init-db',
+    'close-db',
     'release-locks',
   ]);
 });

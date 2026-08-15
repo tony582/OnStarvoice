@@ -9,6 +9,11 @@ export const PROCESS_TOPOLOGIES = Object.freeze(['compatibility', 'split']);
 
 const PROCESS_TOPOLOGY_SET = new Set(PROCESS_TOPOLOGIES);
 const EXCLUSIVE_EXECUTION_ROLES = new Set(['scheduler', 'ai-media']);
+const SPLIT_ROLE_COUNTS = Object.freeze({
+  api: 1,
+  scheduler: 1,
+  'ai-media': 1,
+});
 const DEFAULT_MANIFEST_PATH = fileURLToPath(
   new URL('../deploy/process-topology.production.json', import.meta.url),
 );
@@ -132,8 +137,25 @@ export function validateProcessTopology(manifest) {
     if (allInstances > 0) {
       fail('TOPOLOGY_SPLIT_CONTAINS_ALL', 'Split topology cannot contain the all role.');
     }
-    if ((roleInstanceCounts.get('api') || 0) < 1) {
-      fail('TOPOLOGY_SPLIT_API_REQUIRED', 'Split topology must include an api process.');
+
+    for (const [role, expectedCount] of Object.entries(SPLIT_ROLE_COUNTS)) {
+      const actualCount = roleInstanceCounts.get(role) || 0;
+      if (actualCount !== expectedCount) {
+        fail(
+          'TOPOLOGY_SPLIT_ROLE_COUNT_INVALID',
+          `Split topology requires exactly ${expectedCount} ${role} instance.`,
+        );
+      }
+    }
+
+    const unexpectedRoles = [...roleInstanceCounts.keys()].filter(role => (
+      !Object.hasOwn(SPLIT_ROLE_COUNTS, role)
+    ));
+    if (unexpectedRoles.length > 0) {
+      fail(
+        'TOPOLOGY_SPLIT_ROLE_SET_INVALID',
+        'Split topology may contain only api, scheduler, and ai-media roles.',
+      );
     }
   }
 
@@ -156,8 +178,8 @@ export function assertProcessTopologyDeployable(manifest) {
   const topology = validateProcessTopology(manifest);
   if (!topology.deployable) {
     fail(
-      'TOPOLOGY_SPLIT_NOT_IMPLEMENTED',
-      'Split topology is recognized, but production release remains blocked until P2-C is implemented.',
+      'TOPOLOGY_SPLIT_RELEASE_BLOCKED',
+      'Split topology is validated only as a local candidate; production release remains blocked pending P2-D/P2-E and explicit release authorization.',
     );
   }
   return topology;
@@ -187,12 +209,23 @@ export function formatProcessTopologySummary(topology) {
 }
 
 async function main() {
-  const manifestPath = process.argv[2]
-    ? path.resolve(process.cwd(), process.argv[2])
+  const args = process.argv.slice(2);
+  const candidateMode = args[0] === '--candidate';
+  const manifestArgument = candidateMode ? args[1] : args[0];
+  const manifestPath = manifestArgument
+    ? path.resolve(process.cwd(), manifestArgument)
     : DEFAULT_MANIFEST_PATH;
   try {
-    const topology = await loadProcessTopology(manifestPath, { requireDeployable: true });
-    console.log(`Process topology preflight passed: ${formatProcessTopologySummary(topology)}`);
+    const topology = await loadProcessTopology(manifestPath, {
+      requireDeployable: !candidateMode,
+    });
+    if (candidateMode) {
+      console.log(
+        `Process topology candidate validation passed (not production deployable): ${formatProcessTopologySummary(topology)}`,
+      );
+    } else {
+      console.log(`Process topology preflight passed: ${formatProcessTopologySummary(topology)}`);
+    }
   } catch (error) {
     const code = error instanceof ProcessTopologyError ? error.code : 'TOPOLOGY_PREFLIGHT_FAILED';
     const message = error instanceof ProcessTopologyError

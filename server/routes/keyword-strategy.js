@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { requireTenantAccess, requireAuthCodeFirst } from '../middleware/auth.js';
 import { callLLMWithPrompt } from '../services/ai-labeler.js';
 import { execute, getSetting } from '../db/init.js';
+import { runProcessBackgroundWork } from '../runtime/process-background-work.js';
 
 const keywordOpportunityRouter = Router();
 export const keywordAnalysisRouter = Router();
@@ -9,28 +10,31 @@ export const keywordAnalysisRouter = Router();
 // ── 内容创意面持久化:算完顺手落库,失败不影响响应(fire-and-forget)──
 function persistTrackStrategy(tenantId, keyword, platform, sampleCount, data) {
   const m = data?.ruleMetrics || data?.metrics || {};
-  execute(`
-    INSERT INTO track_strategies (tenant_id, keyword, platform, heat_level, cliff_drop_ratio, sample_count, direction_count, angle_count, payload)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
-  `, [tenantId, keyword, platform, String(m.heatLevel || ''), Number(m.cliffDropRatio || 0),
-      sampleCount, (data?.hotTopicDirections || []).length, (data?.recommendedAngles || []).length, JSON.stringify(data || {})])
-    .catch(err => console.warn('[ContentStudio] persist track_strategy failed:', err.message));
+  void runProcessBackgroundWork(() => execute(`
+      INSERT INTO track_strategies (tenant_id, keyword, platform, heat_level, cliff_drop_ratio, sample_count, direction_count, angle_count, payload)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+    `, [tenantId, keyword, platform, String(m.heatLevel || ''), Number(m.cliffDropRatio || 0),
+    sampleCount, (data?.hotTopicDirections || []).length, (data?.recommendedAngles || []).length, JSON.stringify(data || {})]), {
+    label: 'ContentStudioTrackStrategy',
+  });
 }
 
 function persistBenchmark(tenantId, keyword, platform, candidateCount, data) {
-  execute(`
-    INSERT INTO benchmark_results (tenant_id, keyword, platform, candidate_count, payload)
-    VALUES ($1, $2, $3, $4, $5::jsonb)
-  `, [tenantId, keyword, platform, candidateCount, JSON.stringify(data || {})])
-    .catch(err => console.warn('[ContentStudio] persist benchmark failed:', err.message));
+  void runProcessBackgroundWork(() => execute(`
+      INSERT INTO benchmark_results (tenant_id, keyword, platform, candidate_count, payload)
+      VALUES ($1, $2, $3, $4, $5::jsonb)
+    `, [tenantId, keyword, platform, candidateCount, JSON.stringify(data || {})]), {
+    label: 'ContentStudioBenchmark',
+  });
 }
 
 function persistKeywordExpansion(tenantId, seedKeyword, platform, keywordCount, data) {
-  execute(`
-    INSERT INTO keyword_expansions (tenant_id, seed_keyword, platform, keyword_count, payload)
-    VALUES ($1, $2, $3, $4, $5::jsonb)
-  `, [tenantId, seedKeyword, platform, keywordCount, JSON.stringify(data || {})])
-    .catch(err => console.warn('[ContentStudio] persist keyword_expansion failed:', err.message));
+  void runProcessBackgroundWork(() => execute(`
+      INSERT INTO keyword_expansions (tenant_id, seed_keyword, platform, keyword_count, payload)
+      VALUES ($1, $2, $3, $4, $5::jsonb)
+    `, [tenantId, seedKeyword, platform, keywordCount, JSON.stringify(data || {})]), {
+    label: 'ContentStudioKeywordExpansion',
+  });
 }
 
 const AUTOMOTIVE_TOPIC_DEFINITIONS = [

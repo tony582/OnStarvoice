@@ -1,4 +1,4 @@
-import { runMigrations } from './migrate.js';
+import { listMigrationVersions, runMigrations } from './migrate.js';
 import { assertDbConnection, closePool } from './pool.js';
 import { queryAll, queryOne, execute, withTransaction } from './query.js';
 import { ensureBootstrapAdmin } from '../services/auth-service.js';
@@ -13,6 +13,60 @@ export async function initDb() {
   await ensureBootstrapAdmin();
   initialized = true;
   console.log('[DB] PostgreSQL initialized');
+  return true;
+}
+
+/**
+ * Connect an independent runtime role to an already prepared database.
+ *
+ * P2-C deliberately keeps migrations and bootstrap writes out of the split
+ * API/Worker entrypoints. The compatibility `all` entrypoint continues to use
+ * initDb() until P2-D introduces a single, explicit maintenance owner.
+ */
+export async function assertRuntimeSchemaReady({
+  requiredMigrationVersions,
+  queryAppliedVersions = queryAll,
+} = {}) {
+  const required = requiredMigrationVersions || await listMigrationVersions();
+  if (!Array.isArray(required) || required.length === 0) {
+    const error = new Error('No required runtime migrations were found.');
+    error.code = 'DATABASE_SCHEMA_REQUIREMENTS_EMPTY';
+    throw error;
+  }
+  const rows = await queryAppliedVersions(
+    'SELECT version FROM schema_migrations WHERE version = ANY($1::text[])',
+    [required],
+  );
+  const applied = new Set(rows.map(row => row.version));
+  const missing = required.filter(version => !applied.has(version));
+  if (missing.length > 0) {
+    const error = new Error(
+      `Database schema is missing ${missing.length} required migration(s); `
+      + 'run the approved maintenance migration before starting split runtimes.',
+    );
+    error.code = 'DATABASE_SCHEMA_NOT_READY';
+    error.missingMigrationCount = missing.length;
+    throw error;
+  }
+  return true;
+}
+
+export async function connectRuntimeDb({
+  assertConnection = assertDbConnection,
+  checkSchema = assertRuntimeSchemaReady,
+} = {}) {
+  await assertConnection();
+  await checkSchema();
+  console.log('[DB] PostgreSQL runtime connection ready');
+  return true;
+}
+
+export async function probeDbReadiness({
+  assertConnection = assertDbConnection,
+  checkSchema = assertRuntimeSchemaReady,
+} = {}) {
+  await assertConnection();
+  await checkSchema();
   return true;
 }
 
