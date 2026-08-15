@@ -29,6 +29,7 @@ const requiredTestFiles = [
   'maintenance-entrypoint.integration.mjs',
   'migration-governance.integration.mjs',
   'migrations.integration.mjs',
+  'p2eh-local-canary.integration.mjs',
   'process-role-entrypoint.integration.mjs',
   'process-role-lock.integration.mjs',
   'process-runtime-split.integration.mjs',
