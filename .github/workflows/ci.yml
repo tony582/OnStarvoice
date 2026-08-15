@@ -50,6 +50,9 @@ jobs:
       - name: Validate production process topology
         run: node scripts/check-process-topology.mjs deploy/process-topology.production.json
 
+      - name: Validate local split-topology candidate
+        run: node scripts/check-process-topology.mjs --candidate deploy/process-topology.split.candidate.json
+
       - name: Check pull request whitespace
         if: github.event_name == 'pull_request'
         run: git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"

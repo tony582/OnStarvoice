@@ -40,6 +40,7 @@ import opinionAnalysisRouter from './routes/opinion-analysis.js';
 import socialAccountsRouter from './routes/social-accounts.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
 import { MEDIA_DIR } from './services/media-store.js';
+import { createProcessHealth } from './runtime/process-health.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -64,12 +65,34 @@ function configuredCorsOrigins(value = process.env.CORS_ORIGINS) {
 
 /**
  * Build the HTTP application without opening a port, initializing PostgreSQL,
- * starting Cron, or registering background timers. The compatibility entrypoint
- * in index.js retains ownership of those process-level side effects.
+ * starting Cron, or registering background timers. The process runtimes retain
+ * ownership of those process-level side effects.
  */
-export function createApp({ corsOrigins, logger = console } = {}) {
+export function createApp({ corsOrigins, health, healthProvider, logger = console } = {}) {
   const app = express();
   const allowedCorsOrigins = configuredCorsOrigins(corsOrigins);
+  if (health && healthProvider && health !== healthProvider) {
+    throw new TypeError('health and healthProvider must not specify different providers');
+  }
+  const processHealth = health || healthProvider || createProcessHealth();
+
+  for (const method of ['getLegacyHealth', 'getLiveness', 'getReadiness']) {
+    if (typeof processHealth?.[method] !== 'function') {
+      throw new TypeError(`healthProvider.${method} must be a function`);
+    }
+  }
+
+  function healthRoute(method, { unavailableWhenNotOk = false } = {}) {
+    return (req, res, next) => {
+      Promise.resolve()
+        .then(() => processHealth[method]())
+        .then(snapshot => {
+          const status = unavailableWhenNotOk && snapshot?.ok !== true ? 503 : 200;
+          return res.status(status).json(snapshot);
+        })
+        .catch(next);
+    };
+  }
 
   app.use(cors({
     origin(origin, callback) {
@@ -175,9 +198,9 @@ export function createApp({ corsOrigins, logger = console } = {}) {
     } catch (err) { return res.json({ ok: false, message: err.message }); }
   });
 
-  app.get('/api/health', (req, res) => {
-    return res.json({ ok: true, version: '0.1.0', uptime: process.uptime() });
-  });
+  app.get('/api/health', healthRoute('getLegacyHealth'));
+  app.get('/api/health/live', healthRoute('getLiveness', { unavailableWhenNotOk: true }));
+  app.get('/api/health/ready', healthRoute('getReadiness', { unavailableWhenNotOk: true }));
 
   app.get('/admin/*', (req, res) => {
     res.sendFile(join(__dirname, '..', 'web', 'admin', 'dist', 'index.html'));

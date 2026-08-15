@@ -28,6 +28,7 @@ const requiredTestFiles = [
   'migrations.integration.mjs',
   'process-role-entrypoint.integration.mjs',
   'process-role-lock.integration.mjs',
+  'process-runtime-split.integration.mjs',
 ];
 const discoveredNames = new Set(tests.map(testPath => path.basename(testPath)));
 const missingRequiredTests = requiredTestFiles.filter(name => !discoveredNames.has(name));

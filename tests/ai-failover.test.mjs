@@ -302,11 +302,11 @@ test('two spaced successful primary probes recover; a failed probe resets progre
 });
 
 test('integration keeps credentials out of failover state and preserves Extension fail-open', async () => {
-  const [migration, service, labeler, serverIndex, adminRoute, adminPage, prefilter] = await Promise.all([
+  const [migration, service, labeler, aiMediaRuntime, adminRoute, adminPage, prefilter] = await Promise.all([
     source('server/db/migrations/056_ai_model_failover.sql'),
     source('server/services/ai-failover.js'),
     source('server/services/ai-labeler.js'),
-    source('server/index.js'),
+    source('server/runtime/ai-media-runtime.js'),
     source('server/routes/admin.js'),
     source('web/admin/src/pages/AdminPages.tsx'),
     source('server/services/relevance-prefilter.js'),
@@ -327,7 +327,7 @@ test('integration keeps credentials out of failover state and preserves Extensio
   assert.match(labeler, /retrying current request on peer model/u);
   assert.match(labeler, /retrying current request on active backup/u);
   assert.match(labeler, /probeDeepSeekPrimaryModel/u);
-  assert.match(serverIndex, /runAiFailoverRecoverySweep/u);
+  assert.match(aiMediaRuntime, /runAiFailoverRecoverySweep/u);
   assert.match(adminRoute, /getAiFailoverStatus/u);
   assert.match(
     adminRoute,

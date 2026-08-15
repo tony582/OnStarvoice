@@ -6,7 +6,9 @@ import {
   PROCESS_ROLES,
   ProcessRoleConfigError,
   assertCompatibilityEntrypointRole,
+  assertProcessEntrypointRole,
   parseProcessRole,
+  resolveEntrypointProcessRole,
   resolveProcessRole,
 } from '../server/config/process-role.js';
 
@@ -71,13 +73,60 @@ test('non-production defaults only a missing role to all and records a warning',
   assert.equal(config.source, 'non-production-default');
   assert.deepEqual(warnings, config.warnings);
   assert.equal(warnings[0].code, 'PROCESS_ROLE_DEFAULTED');
+  assert.equal(
+    warnings[0].message,
+    'PROCESS_ROLE is not set; non-production compatibility mode defaults to all.',
+  );
   assertRoleError(
     () => parseProcessRole('', { nodeEnv: 'development' }),
     'PROCESS_ROLE_EMPTY',
   );
 });
 
-test('current compatibility entrypoint accepts only all until P2-C', () => {
+test('independent entrypoints default only outside production and require their expected role', () => {
+  const warnings = [];
+  const defaulted = resolveEntrypointProcessRole({
+    env: { NODE_ENV: 'test' },
+    entrypoint: 'server/entrypoints/scheduler.js',
+    expectedRole: 'scheduler',
+    onWarning: warning => warnings.push(warning),
+  });
+
+  assert.equal(defaulted.role, 'scheduler');
+  assert.equal(defaulted.source, 'non-production-default');
+  assert.equal(warnings[0].code, 'PROCESS_ROLE_DEFAULTED');
+  assert.match(warnings[0].message, /defaults to scheduler/u);
+
+  assert.equal(assertProcessEntrypointRole('api', {
+    expectedRole: 'api',
+    entrypoint: 'server/entrypoints/api.js',
+  }), 'api');
+  assertRoleError(
+    () => resolveEntrypointProcessRole({
+      env: { NODE_ENV: 'production' },
+      entrypoint: 'server/entrypoints/api.js',
+      expectedRole: 'api',
+    }),
+    'PROCESS_ROLE_REQUIRED',
+  );
+  assertRoleError(
+    () => resolveEntrypointProcessRole({
+      env: { NODE_ENV: 'production', PROCESS_ROLE: 'scheduler' },
+      entrypoint: 'server/entrypoints/api.js',
+      expectedRole: 'api',
+    }),
+    'PROCESS_ROLE_ENTRYPOINT_MISMATCH',
+  );
+  assertRoleError(
+    () => resolveEntrypointProcessRole({
+      env: { NODE_ENV: 'test' },
+      expectedRole: 'worker',
+    }),
+    'PROCESS_ROLE_EXPECTED_UNKNOWN',
+  );
+});
+
+test('compatibility entrypoint stays all-only while dedicated P2-C entrypoints own split roles', () => {
   assert.equal(assertCompatibilityEntrypointRole('all'), 'all');
 
   for (const role of PROCESS_ROLES.filter(candidate => candidate !== 'all')) {

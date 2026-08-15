@@ -7,6 +7,7 @@ import { queryOne, execute, getSetting } from '../db/init.js';
 import { isAllowedMediaHost } from './media-proxy.js';
 import { stageMediaForAsr } from './asr-media-host.js';
 import { transcribeFileUrl } from './dashscope-asr.js';
+import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
 
 const MAX_TRANSCRIPT_CHARS = 50000;
 const INFLIGHT = new Set(); // recordId,防并发重复转写
@@ -153,8 +154,9 @@ export async function startTranscription({ tenantId, recordId }) {
   }
   await setStatus(recordId, tenantId, { transcript_status: 'pending', transcript_error: '' });
   // 后台执行,不阻塞 HTTP
-  setImmediate(() => {
-    transcribeRecord({ tenantId, recordId }).catch(() => {});
-  });
+  void scheduleProcessBackgroundWork(
+    () => transcribeRecord({ tenantId, recordId }),
+    { label: 'Transcription' },
+  );
   return { ok: true, status: 'pending' };
 }

@@ -1,5 +1,5 @@
 import { resolveProcessRole } from '../config/process-role.js';
-import { initDb } from '../db/init.js';
+import { closeDb, initDb } from '../db/init.js';
 import { acquireProcessRoleLocks } from './process-role-locks.js';
 
 function warnAboutDefaultRole(logger, warning) {
@@ -37,6 +37,7 @@ export async function prepareCompatibilityProcess({
   resolveRole = resolveProcessRole,
   acquireLocks = acquireProcessRoleLocks,
   initializeDatabase = initDb,
+  closeDatabase = closeDb,
 } = {}) {
   if (typeof onLockLost !== 'function') {
     throw new TypeError('onLockLost is required for the compatibility process');
@@ -60,6 +61,7 @@ export async function prepareCompatibilityProcess({
   } catch (error) {
     // No background responsibility has started yet, so releasing here cannot
     // overlap a replacement process with old work.
+    try { await closeDatabase(); } catch {}
     await lockHandle.release();
     throw error;
   }

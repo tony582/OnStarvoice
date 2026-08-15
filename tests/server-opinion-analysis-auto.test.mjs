@@ -196,8 +196,8 @@ test('分类落库后异步派生，sync 不再重复触发 alert，手动路由
   assert.match(labeler, /RETURNING tenant_id, sentiment/);
   assert.match(labeler, /sentiment !== 'negative'/);
   assert.match(labeler, /import\('\.\/opinion-analysis\.js'\)/);
-  assert.match(labeler, /void queueNegativeRecordAnalysis\(\{ tenantId, recordId \}\)/);
-  assert.match(labeler, /setImmediate\(async \(\) =>/);
+  assert.match(labeler, /await queueNegativeRecordAnalysis\(\{ tenantId, recordId \}\)/);
+  assert.match(labeler, /scheduleProcessBackgroundWork\(async \(\) =>/);
 
   assert.doesNotMatch(syncRoute, /checkAlerts/);
   assert.match(syncRoute, /await labelRecord\(id\)/);

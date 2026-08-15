@@ -20,6 +20,12 @@ const productionManifest = path.join(
   'deploy',
   'process-topology.production.json',
 );
+const splitCandidateManifest = path.join(
+  repositoryRoot,
+  'deploy',
+  'process-topology.split.candidate.json',
+);
+const serverPackage = path.join(repositoryRoot, 'server', 'package.json');
 
 function processConfig(name, role, instances = 1) {
   return { name, role, instances };
@@ -89,7 +95,7 @@ test('topology validation rejects mixed mode, multiple all, and duplicate execut
 
 test('split topology is recognized for review but remains blocked from production release', () => {
   const splitManifest = manifest('split', [
-    processConfig('api', 'api', 2),
+    processConfig('api', 'api'),
     processConfig('scheduler', 'scheduler'),
     processConfig('ai-media', 'ai-media'),
   ]);
@@ -97,10 +103,64 @@ test('split topology is recognized for review but remains blocked from productio
 
   assert.equal(topology.topology, 'split');
   assert.equal(topology.deployable, false);
-  assert.deepEqual(topology.roleCounts, { 'ai-media': 1, api: 2, scheduler: 1 });
+  assert.deepEqual(topology.roleCounts, { 'ai-media': 1, api: 1, scheduler: 1 });
   assertTopologyError(
     () => assertProcessTopologyDeployable(splitManifest),
-    'TOPOLOGY_SPLIT_NOT_IMPLEMENTED',
+    'TOPOLOGY_SPLIT_RELEASE_BLOCKED',
+  );
+});
+
+test('versioned split candidate has exactly one instance for every P2-C runtime role', async () => {
+  const candidateManifest = parseProcessTopologyJson(
+    await readFile(splitCandidateManifest, 'utf8'),
+  );
+  const topology = validateProcessTopology(candidateManifest);
+
+  assert.equal(topology.schemaVersion, 1);
+  assert.equal(topology.topology, 'split');
+  assert.equal(topology.deployable, false);
+  assert.equal(topology.totalInstances, 3);
+  assert.deepEqual(topology.roleCounts, { 'ai-media': 1, api: 1, scheduler: 1 });
+  assertTopologyError(
+    () => assertProcessTopologyDeployable(candidateManifest),
+    'TOPOLOGY_SPLIT_RELEASE_BLOCKED',
+  );
+});
+
+test('server package exposes dedicated P2-C entrypoint scripts without changing compatibility scripts', async () => {
+  const packageConfig = JSON.parse(await readFile(serverPackage, 'utf8'));
+
+  assert.equal(packageConfig.scripts.start, 'node index.js');
+  assert.equal(packageConfig.scripts.dev, 'node --watch index.js');
+  assert.equal(packageConfig.scripts['start:api'], 'node entrypoints/api.js');
+  assert.equal(packageConfig.scripts['start:scheduler'], 'node entrypoints/scheduler.js');
+  assert.equal(packageConfig.scripts['start:ai-media'], 'node entrypoints/ai-media.js');
+});
+
+test('split candidate rejects missing, duplicate, or out-of-scope runtime roles', () => {
+  assertTopologyError(
+    () => validateProcessTopology(manifest('split', [
+      processConfig('api', 'api'),
+      processConfig('scheduler', 'scheduler'),
+    ])),
+    'TOPOLOGY_SPLIT_ROLE_COUNT_INVALID',
+  );
+  assertTopologyError(
+    () => validateProcessTopology(manifest('split', [
+      processConfig('api', 'api', 2),
+      processConfig('scheduler', 'scheduler'),
+      processConfig('ai-media', 'ai-media'),
+    ])),
+    'TOPOLOGY_SPLIT_ROLE_COUNT_INVALID',
+  );
+  assertTopologyError(
+    () => validateProcessTopology(manifest('split', [
+      processConfig('api', 'api'),
+      processConfig('scheduler', 'scheduler'),
+      processConfig('ai-media', 'ai-media'),
+      processConfig('maintenance', 'maintenance'),
+    ])),
+    'TOPOLOGY_SPLIT_ROLE_SET_INVALID',
   );
 });
 
@@ -134,6 +194,7 @@ test('CLI uses the shared validator, accepts compatibility, and blocks split wit
       JSON.stringify(manifest('split', [
         processConfig('api', 'api'),
         processConfig('scheduler', 'scheduler'),
+        processConfig('ai-media', 'ai-media'),
       ])),
     );
     await writeFile(malformedPath, `{"databaseUrl":"postgresql://user:${secret}@host/db"`);
@@ -147,12 +208,20 @@ test('CLI uses the shared validator, accepts compatibility, and blocks split wit
     assert.match(compatible.stdout, /topology=compatibility roles=all:1/u);
     assert.doesNotMatch(`${compatible.stdout}\n${compatible.stderr}`, new RegExp(secret, 'u'));
 
+    const splitCandidate = spawnSync(process.execPath, [checker, '--candidate', splitPath], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+    });
+    assert.equal(splitCandidate.status, 0, splitCandidate.stderr);
+    assert.match(splitCandidate.stdout, /candidate validation passed \(not production deployable\)/u);
+    assert.match(splitCandidate.stdout, /topology=split roles=ai-media:1,api:1,scheduler:1/u);
+
     const split = spawnSync(process.execPath, [checker, splitPath], {
       cwd: repositoryRoot,
       encoding: 'utf8',
     });
     assert.equal(split.status, 2);
-    assert.match(split.stderr, /TOPOLOGY_SPLIT_NOT_IMPLEMENTED/u);
+    assert.match(split.stderr, /TOPOLOGY_SPLIT_RELEASE_BLOCKED/u);
 
     const malformed = spawnSync(process.execPath, [checker, malformedPath], {
       cwd: repositoryRoot,

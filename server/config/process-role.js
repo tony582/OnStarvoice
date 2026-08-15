@@ -33,8 +33,14 @@ function isProduction(nodeEnv) {
  */
 export function parseProcessRole(
   rawValue,
-  { nodeEnv = process.env.NODE_ENV, onWarning } = {},
+  { defaultRole = 'all', nodeEnv = process.env.NODE_ENV, onWarning } = {},
 ) {
+  if (!isProcessRole(defaultRole)) {
+    throw new ProcessRoleConfigError(
+      'PROCESS_ROLE_EXPECTED_UNKNOWN',
+      'The expected process role is not supported.',
+    );
+  }
   if (rawValue === undefined || rawValue === null) {
     if (isProduction(nodeEnv)) {
       throw new ProcessRoleConfigError(
@@ -45,11 +51,13 @@ export function parseProcessRole(
 
     const warning = {
       code: 'PROCESS_ROLE_DEFAULTED',
-      message: 'PROCESS_ROLE is not set; non-production compatibility mode defaults to all.',
+      message: defaultRole === 'all'
+        ? 'PROCESS_ROLE is not set; non-production compatibility mode defaults to all.'
+        : `PROCESS_ROLE is not set; non-production entrypoint defaults to ${defaultRole}.`,
     };
     if (typeof onWarning === 'function') onWarning(warning);
     return Object.freeze({
-      role: 'all',
+      role: defaultRole,
       source: 'non-production-default',
       warnings: Object.freeze([warning]),
     });
@@ -83,8 +91,58 @@ export function parseProcessRole(
 }
 
 /**
- * P2-B keeps server/index.js as the compatibility entrypoint. Independent
- * role entrypoints intentionally remain unavailable until P2-C.
+ * Validate the one role owned by an explicit process entrypoint.
+ */
+export function assertProcessEntrypointRole(
+  role,
+  { expectedRole, entrypoint = 'process entrypoint' } = {},
+) {
+  if (!isProcessRole(expectedRole)) {
+    throw new ProcessRoleConfigError(
+      'PROCESS_ROLE_EXPECTED_UNKNOWN',
+      'The expected process role is not supported.',
+    );
+  }
+  if (!isProcessRole(role)) {
+    throw new ProcessRoleConfigError(
+      'PROCESS_ROLE_UNKNOWN',
+      'PROCESS_ROLE is not one of the supported roles.',
+    );
+  }
+  if (role !== expectedRole) {
+    throw new ProcessRoleConfigError(
+      'PROCESS_ROLE_ENTRYPOINT_MISMATCH',
+      `${entrypoint} requires PROCESS_ROLE=${expectedRole}.`,
+    );
+  }
+  return role;
+}
+
+/**
+ * Resolve the one role owned by an independent process entrypoint.
+ *
+ * Production always requires an explicit PROCESS_ROLE. Outside production a
+ * missing value defaults to this entrypoint's expected role and emits the same
+ * auditable warning used by the compatibility entrypoint.
+ */
+export function resolveEntrypointProcessRole({
+  env = process.env,
+  expectedRole,
+  entrypoint = 'process entrypoint',
+  onWarning,
+} = {}) {
+  const config = parseProcessRole(env.PROCESS_ROLE, {
+    defaultRole: expectedRole,
+    nodeEnv: env.NODE_ENV,
+    onWarning,
+  });
+  assertProcessEntrypointRole(config.role, { entrypoint, expectedRole });
+  return config;
+}
+
+/**
+ * server/index.js remains the compatibility entrypoint. Independent P2-C
+ * roles must use their dedicated entrypoints instead of this one.
  */
 export function assertCompatibilityEntrypointRole(
   role,
@@ -99,7 +157,7 @@ export function assertCompatibilityEntrypointRole(
   if (role !== 'all') {
     throw new ProcessRoleConfigError(
       'PROCESS_ROLE_ENTRYPOINT_NOT_IMPLEMENTED',
-      `${entrypoint} only supports PROCESS_ROLE=all; independent role entrypoints are deferred to P2-C.`,
+      `${entrypoint} only supports PROCESS_ROLE=all; use the dedicated entrypoint for role ${role}.`,
     );
   }
   return role;
@@ -114,6 +172,7 @@ export function resolveProcessRole({
   onWarning,
 } = {}) {
   const config = parseProcessRole(env.PROCESS_ROLE, {
+    defaultRole: 'all',
     nodeEnv: env.NODE_ENV,
     onWarning,
   });
