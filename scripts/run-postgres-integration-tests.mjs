@@ -19,6 +19,7 @@ try {
 const { databaseName, databaseUrl, rawUrl } = target;
 
 const entries = await readdir(integrationRoot, { withFileTypes: true });
+const topologyRehearsalTestFile = 'process-topology-rehearsal.integration.mjs';
 const tests = entries
   .filter(entry => entry.isFile() && entry.name.endsWith('.integration.mjs'))
   .map(entry => path.join(integrationRoot, entry.name))
@@ -31,6 +32,7 @@ const requiredTestFiles = [
   'process-role-entrypoint.integration.mjs',
   'process-role-lock.integration.mjs',
   'process-runtime-split.integration.mjs',
+  topologyRehearsalTestFile,
 ];
 const discoveredNames = new Set(tests.map(testPath => path.basename(testPath)));
 const missingRequiredTests = requiredTestFiles.filter(name => !discoveredNames.has(name));
@@ -48,20 +50,35 @@ if (missingRequiredTests.length > 0) {
 
 console.log(`PostgreSQL integration target accepted: ${databaseUrl.hostname}/${databaseName}`);
 
-const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...tests], {
-  cwd: repositoryRoot,
-  env: {
-    ...process.env,
-    NODE_ENV: 'test',
-    DATABASE_URL: rawUrl,
-    ALLOW_RESET_MIGRATIONS: '0',
-  },
-  stdio: 'inherit',
-});
+const topologyRehearsalPath = tests.find(
+  testPath => path.basename(testPath) === topologyRehearsalTestFile,
+);
+const testPhases = [
+  [topologyRehearsalPath],
+  tests.filter(testPath => testPath !== topologyRehearsalPath),
+];
 
-if (result.error) {
-  console.error(`Could not start PostgreSQL integration tests: ${result.error.message}`);
-  process.exit(2);
+for (const phaseTests of testPhases) {
+  const result = spawnSync(
+    process.execPath,
+    ['--test', '--test-concurrency=1', ...phaseTests],
+    {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        NODE_ENV: 'test',
+        DATABASE_URL: rawUrl,
+        ALLOW_RESET_MIGRATIONS: '0',
+      },
+      stdio: 'inherit',
+    },
+  );
+
+  if (result.error) {
+    console.error(`Could not start PostgreSQL integration tests: ${result.error.message}`);
+    process.exit(2);
+  }
+  if (result.status !== 0) process.exit(result.status ?? 2);
 }
 
-process.exit(result.status ?? 2);
+process.exit(0);
