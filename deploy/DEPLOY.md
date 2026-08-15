@@ -7,6 +7,8 @@
 
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
+>
+> **当前生产发布必须以该受控手册为准。仓库中的 `deploy/deploy.sh` 是旧库存脚本，只用于审计历史行为，不是获批生产入口；不要直接运行。** P2-B 当前只是尚未合并、未部署的 Draft PR #21 候选，以下角色说明不表示线上已经配置或部署。
 
 ## 1. 当前拓扑
 
@@ -121,6 +123,7 @@ cp deploy/onstarvoice.env.production.example server/.env.production
 ```dotenv
 NODE_ENV=production
 PORT=3002
+PROCESS_ROLE=all
 DATABASE_URL=postgres://onstarvoice:PASSWORD@127.0.0.1:5432/onstarvoice
 CORS_ORIGINS=https://voice.minilife.online
 ADMIN_PUBLIC_URL=https://voice.minilife.online/admin/
@@ -143,6 +146,7 @@ LLM_API_KEY=...
   当前部署脚本会在上传后强制设置并校验；手工上传时必须自行完成。
 - `ALLOW_RESET_MIGRATIONS` 正常必须为 `0`。只有完成可恢复备份并明确审核
   reset 迁移后，才允许临时设为 `1`。
+- 只有未来发布批次明确包含 P2-B 运行时代码时，才把 `PROCESS_ROLE=all` 作为新代码首次启动前的强制前置条件；仓库 topology JSON 只是期望清单，仍需独立核对真实 PM2 只有一个 `onstarvoice` 实例。
 - `FEISHU_WEBHOOK_URL` 当前代码没有消费，不要误以为配置后会产生飞书通知。
   当前安全事件通知通道是 SMTP 邮件。
 
@@ -199,13 +203,9 @@ ssh root@47.103.125.200 '
 避免远端系统用户 `root` 被误当成 PostgreSQL 角色。备份完成后还要记录文件
 大小、校验值和当前 Git 提交；恢复演练应在非生产数据库上进行。
 
-## 4. 执行发布
+## 4. 旧库存脚本行为说明（禁止直接执行）
 
-从仓库根目录执行：
-
-```bash
-bash deploy/deploy.sh 47.103.125.200
-```
+不要把本节当成可复制的生产发布步骤。当前受控发布、原子切换、完整回滚和验证流程只以 [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md) 第 9–11 节为准。下面仅记录旧库存 `deploy/deploy.sh` 的实际行为，便于审计风险。
 
 当前脚本实际执行顺序：
 
@@ -267,14 +267,7 @@ curl --fail --silent --show-error --head \
 
 ### 5.3 数据库迁移
 
-```bash
-ssh root@47.103.125.200 '
-  cd /opt/onstarvoice/server
-  node db/migrate.js
-'
-```
-
-第二次运行应幂等完成，不应重复执行已记录迁移。也可以只读检查：
+核对本次启动日志中的 migration 结果，再只读检查已登记版本。不要为了“验证幂等”在生产发布后再次执行 `node db/migrate.js`；该入口会运行尚未登记的迁移和既有回填，不是只读命令。
 
 ```bash
 ssh root@47.103.125.200 \
@@ -306,9 +299,10 @@ ssh root@47.103.125.200 \
 
 当数据库迁移向后兼容时：
 
-1. 切回已验证的 Git 提交；
-2. 重新运行 `deploy/deploy.sh`；
-3. 重做健康检查和业务冒烟。
+1. 按本次受控发布记录定位完整旧应用目录，不从一个 Git SHA 猜测限定生产树；
+2. 按主发布手册在同一文件系统原子交换回完整旧目录，并用既有 PM2 配置重启；
+3. 重新执行启动健康、数据库/迁移、认证、Agent/队列和业务冒烟；
+4. 不运行旧库存 `deploy/deploy.sh`，避免 `rsync --delete`、依赖安装、迁移和 PM2 删除/重建扩大回滚范围。
 
 ### 6.2 数据库也需恢复
 
@@ -316,13 +310,7 @@ ssh root@47.103.125.200 \
 降级必须走发布前备份恢复：推荐先停止新写入，恢复到新数据库并验证，再切换
 `DATABASE_URL`；不要在未验证时直接覆盖唯一生产库。
 
-```bash
-sudo -u postgres dropdb --if-exists onstarvoice_restore_check
-sudo -u postgres createdb --owner=onstarvoice onstarvoice_restore_check
-sudo -u postgres pg_restore --exit-on-error --clean --if-exists \
-  --no-owner --no-acl --role=onstarvoice \
-  --dbname=onstarvoice_restore_check BACKUP.dump
-```
+恢复演练必须按主发布手册使用带 release ID 的唯一新验证库名，先只读确认该库不存在，再创建并恢复；若同名库已存在就停止，不自动 `dropdb`。不要把演练命令指向唯一生产库。
 
 reset 迁移不会因 Git 回滚而自动撤销。涉及清空或重建数据的迁移必须依赖
 发布前备份恢复。

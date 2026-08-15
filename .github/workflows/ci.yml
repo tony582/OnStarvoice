@@ -47,6 +47,9 @@ jobs:
       - name: Check repository hygiene
         run: node scripts/check-repository-hygiene.mjs
 
+      - name: Validate production process topology
+        run: node scripts/check-process-topology.mjs deploy/process-topology.production.json
+
       - name: Check pull request whitespace
         if: github.event_name == 'pull_request'
         run: git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
