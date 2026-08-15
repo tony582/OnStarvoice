@@ -8,7 +8,7 @@
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
 >
-> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** P2-C 已通过 PR #22 合并到 `main@c47800f`；P2-D 由 [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 跟踪交付，PR 与合并状态必须以 GitHub 和 `main` commit graph 的实时结果为准。`adbb47f` 已有 push/PR 两组远端 CI 合计 12/12 全绿；任何晚于它的 head 必须使用自身对应 CI，不能沿用旧 head 结果。PR 合并不等于部署，生产状态始终需要另行核对。P2-B/P2-C/P2-D 当前均未部署；生产仍为迁移 066、单一 `all`，未启用 split。以下角色、checksum 和 Maintenance 说明都不表示线上已经配置或部署。
+> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 已合并为 `main@7bf7ab1f91a41fc6327c1070e345f1ce8055974b`，但 P2-B/P2-C/P2-D 当前均未部署；生产仍为迁移 066、单一 `all`，未启用 split。P2-E-L 本机隔离轮次已完成：最新两阶段 PostgreSQL runner 在 Node 24/18.20.8 下均以原始 TAP `1/1 + 25/25` 通过，可分别汇总为 `26/26`，两版非 PostgreSQL 回归均为 `1289/1289`，工程门禁通过；每轮清理前连接、P2-E/P2-D schema 与 advisory lock 均为 0，精确专用库均已删除。该证据只证明空业务库 ownership、Maintenance ledger/checksum、真实进程角色锁与启停，不覆盖真实 PM2、Ingress、流量、任务 lineage、1/5/10 分钟周期或备份回切。P2-E-H 尚未执行，生产 split 阻断保留。
 
 ## 1. 当前拓扑
 
@@ -145,7 +145,7 @@ LLM_API_KEY=...
 - 不要把模板占位邮箱或占位密码当成“未配置”。应用会把非空值视为真实凭据。
 - 远端 `/opt/onstarvoice/server/.env` 必须归属 `root:root` 且权限为 `600`。
   每次受控发布都必须显式设置并校验 owner、权限与内容哈希；当前没有获批脚本代劳。
-- `ALLOW_RESET_MIGRATIONS` 必须为 `0`。P2-D 候选中设为 `1` 会 fail-closed，
+- `ALLOW_RESET_MIGRATIONS` 必须为 `0`。P2-D 主线代码中设为 `1` 会 fail-closed，
   不再是 reset 授权开关；当前没有通用 reset 执行器。
 - P2-D 生产 Maintenance 必须显式获得非空 `DATABASE_URL`；缺失或空白会在
   取得任何进程/迁移锁或访问数据库前以 `MAINTENANCE_DATABASE_URL_REQUIRED`
@@ -237,7 +237,7 @@ ssh root@47.103.125.200 '
 6. 将 `.env.production` 复制为远端 `server/.env`，随后强制设置
    `root:root`、权限 `600` 并校验；校验失败则停止发布；
 7. 远端执行 `npm install --omit=dev`；
-8. 远端执行 `node db/migrate.js`；P2-D 候选已禁用该直接入口，因此旧脚本与候选代码不兼容，会在这里失败；
+8. 远端执行 `node db/migrate.js`；P2-D 主线代码已禁用该直接入口，因此旧脚本与当前代码不兼容，会在这里失败；
 9. 删除旧 PM2 进程，再启动新进程，内存上限为 `400M`；
 10. 执行 `pm2 save`。
 
@@ -285,7 +285,7 @@ curl --fail --silent --show-error --head \
 
 ### 5.3 数据库迁移
 
-核对本次启动日志中的 migration 结果，再只读检查已登记版本。P2-D 候选已禁用 `node db/migrate.js` 直接入口；Maintenance `migrate` 仍是写入命令。未来只有 P2-D 获批部署后才能用 `PROCESS_ROLE=maintenance npm --prefix server run maintenance -- verify` 做候选只读校验；当前生产仍使用只读 SQL。
+核对本次启动日志中的 migration 结果，再只读检查已登记版本。P2-D 主线代码已禁用 `node db/migrate.js` 直接入口；Maintenance `migrate` 仍是写入命令。未来只有 P2-D 获批部署后才能用 `PROCESS_ROLE=maintenance npm --prefix server run maintenance -- verify` 做只读校验；当前生产仍使用只读 SQL。
 
 ```bash
 ssh root@47.103.125.200 \

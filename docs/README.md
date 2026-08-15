@@ -2,7 +2,7 @@
 
 本目录是 StarVoice 当前稳定基线的文档入口。代码、数据库迁移和运行脚本是最终事实来源；当专题旧文档与本索引列出的稳定版文档冲突时，应先核对当前代码，再修正文档，不要沿用历史假设。
 
-> 2026-08-15 状态：P2-C 已通过 PR #22 合并为 `main@c47800f`；P2-D 从该锚点创建分支 `codex/architecture-modernization-p2d-migration-governance`，由 [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 跟踪交付，PR 与合并状态以 GitHub 和 `main` commit graph 的实时结果为准。`adbb47f` 已在 push run `31881397937` 与 PR run `31881416216` 各通过 6 个任务（合计 12/12）；任何晚于它的 head 必须使用自身对应 CI，不能沿用旧 head 结果。P2-B/P2-C/P2-D 当前均未部署，生产仍是单一 `all` 拓扑和迁移 066，未启用 split；不能把 PR 候选中的 Migration/Maintenance 能力当作线上能力，PR 合并也不等于部署，生产状态始终需要另行核对。
+> 2026-08-15 状态：[PR #23](https://github.com/tony582/OnStarvoice/pull/23) 已合并，P2-D 进入 `main@7bf7ab1f91a41fc6327c1070e345f1ce8055974b`；P2-B/P2-C/P2-D 当前均未部署，生产仍是单一 `all` 拓扑和迁移 066，未启用 split。P2-E-L 本机隔离轮次已完成：最新 diff 使用两阶段 PostgreSQL runner，先在严格空库运行 topology rehearsal，再运行其他 integration；启动前 session 门禁要求连续稳定空闲快照，容忍瞬时 CI 探测但拒绝持久会话。Node 24/18.20.8 定向 topology 均为 `1/1`，完整 runner 均以原始 TAP `1/1 + 25/25` 通过并可汇总为 `26/26`，非 PostgreSQL 回归均为 `1289/1289`，工程门禁通过；每轮数据库清理证据为 0 且精确专用库已删除。P2-E-H 尚未执行，P2-E 整体仅部分完成，生产 split 阻断保留。
 
 ## 按角色阅读
 
