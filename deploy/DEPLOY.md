@@ -8,7 +8,7 @@
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
 >
-> **当前生产发布必须以该受控手册为准。仓库中的 `deploy/deploy.sh` 是旧库存脚本，只用于审计历史行为，不是获批生产入口；不要直接运行。** P2-B 已通过 PR #21 合并到 `main`，但尚未部署；以下角色说明不表示线上已经配置或部署。
+> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** P2-C 已通过 PR #22 合并到 `main@c47800f`，但 P2-B/P2-C 均未部署；P2-D 只在本地分支实现，尚未提交、推送、建 PR 或部署。以下角色、checksum 和 Maintenance 说明都不表示线上已经配置或部署。
 
 ## 1. 当前拓扑
 
@@ -111,8 +111,9 @@ ssh root@47.103.125.200 \
 
 ### 2.4 生产环境变量
 
-生产文件固定为本机 `server/.env.production`。它被 Git 忽略，发布脚本会将其
-复制为远端 `/opt/onstarvoice/server/.env`。
+生产来源文件固定为本机 `server/.env.production`，并被 Git 忽略。受控发布时必须
+把它作为明确白名单输入，原子安装为远端 `/opt/onstarvoice/server/.env`；退役脚本
+不会复制任何文件。
 
 ```bash
 cp deploy/onstarvoice.env.production.example server/.env.production
@@ -143,17 +144,33 @@ LLM_API_KEY=...
   全新数据库首次创建平台管理员时临时填写；创建完成后立即清空并重新发布。
 - 不要把模板占位邮箱或占位密码当成“未配置”。应用会把非空值视为真实凭据。
 - 远端 `/opt/onstarvoice/server/.env` 必须归属 `root:root` 且权限为 `600`。
-  当前部署脚本会在上传后强制设置并校验；手工上传时必须自行完成。
-- `ALLOW_RESET_MIGRATIONS` 正常必须为 `0`。只有完成可恢复备份并明确审核
-  reset 迁移后，才允许临时设为 `1`。
+  每次受控发布都必须显式设置并校验 owner、权限与内容哈希；当前没有获批脚本代劳。
+- `ALLOW_RESET_MIGRATIONS` 必须为 `0`。P2-D 候选中设为 `1` 会 fail-closed，
+  不再是 reset 授权开关；当前没有通用 reset 执行器。
+- P2-D 生产 Maintenance 必须显式获得非空 `DATABASE_URL`；缺失或空白会在
+  取得任何进程/迁移锁或访问数据库前以 `MAINTENANCE_DATABASE_URL_REQUIRED`
+  拒绝，不能使用开发兜底。
+- `migrate:legacy` 与 `comments:backfill` 只能通过 Maintenance package alias 在
+  人工停机确认后运行；旧 JS direct 入口禁用。`repair-*.sql` 和 tenant-specific
+  repair SQL 仅为历史证据，禁止直接生产执行。legacy import 的固定文件缺失可在
+  补齐复核后重新授权重试；其他 failed 或遗留 running 必须恢复任务前整库备份，
+  不得直接重试或手工改 ledger/marker。
+- SAIC-GM once 的任何 prior failed/running 都要求保持所有长期进程停止，恢复任务
+  前整库备份并确认 ledger/业务数据一起回退后再重新授权。禁止自动重跑，也禁止
+  失败后回滚代码并直接启动旧 `all`；旧版本可能因缺失成功 marker 再次执行任务。
+- `import-extension-csv.js` 的帮助/dry-run 不连接数据库；`--commit` 是另行授权的
+  参数化写入操作，必须显式使用 maintenance role、生产非空 `DATABASE_URL`、
+  offline 确认、`all` 执行权锁和 checksum readiness。它不写 `maintenance_runs`
+  且不是全量单事务，不能因预览、抢锁或非零退出假定未写入/已完整回滚。legacy
+  与 CSV upsert 均禁用即时媒体落地；媒体下载/落库另行授权 `recent-media-backfill`。
 - 只有未来发布批次明确包含 P2-B 运行时代码时，才把 `PROCESS_ROLE=all` 作为新代码首次启动前的强制前置条件；仓库 topology JSON 只是期望清单，仍需独立核对真实 PM2 只有一个 `onstarvoice` 实例。
 - `FEISHU_WEBHOOK_URL` 当前代码没有消费，不要误以为配置后会产生飞书通知。
   当前安全事件通知通道是 SMTP 邮件。
 
 ## 3. 每次发布前
 
-发布脚本会直接同步代码、安装生产依赖、执行数据库迁移并重启 PM2。脚本
-**不会自动创建生产备份，也不是零停机滚动发布**，所以发布前必须人工完成：
+当前没有获批的一键发布脚本。每次受控发布都可能涉及代码/依赖、迁移和 PM2，
+且单实例重启不是零停机滚动发布；因此发布前必须人工完成并留存证据：
 
 1. 确认待发布分支和提交范围；
 2. 确认工作区没有误带密钥、调试文件或客户导出数据；
@@ -205,9 +222,9 @@ ssh root@47.103.125.200 '
 
 ## 4. 旧库存脚本行为说明（禁止直接执行）
 
-不要把本节当成可复制的生产发布步骤。当前受控发布、原子切换、完整回滚和验证流程只以 [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md) 第 9–11 节为准。下面仅记录旧库存 `deploy/deploy.sh` 的实际行为，便于审计风险。
+不要把本节当成可复制的生产发布步骤。当前受控发布、原子切换、完整回滚和验证流程只以 [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md) 第 9–11 节为准。当前 `deploy/deploy.sh` 只会 fail-closed；下面仅记录它退役前的历史实现，便于审计风险，所列动作现在都不可达。
 
-当前脚本实际执行顺序：
+退役前脚本的历史执行顺序：
 
 1. 把若干常见 Node.js 24/20 安装目录追加到 `PATH` 后构建 `web/admin`。
    这一步既不选择 Node 版本，也不验证实际命中的 `node`：若候选目录不存在，
@@ -220,7 +237,7 @@ ssh root@47.103.125.200 '
 6. 将 `.env.production` 复制为远端 `server/.env`，随后强制设置
    `root:root`、权限 `600` 并校验；校验失败则停止发布；
 7. 远端执行 `npm install --omit=dev`；
-8. 远端执行 `node db/migrate.js`；
+8. 远端执行 `node db/migrate.js`；P2-D 候选已禁用该直接入口，因此旧脚本与候选代码不兼容，会在这里失败；
 9. 删除旧 PM2 进程，再启动新进程，内存上限为 `400M`；
 10. 执行 `pm2 save`。
 
@@ -234,6 +251,7 @@ ssh root@47.103.125.200 '
 - 持久化媒体应放在 `/opt/onstarvoice/media`，不要放在会被代码同步覆盖的
   临时目录；
 - 发布脚本没有自动健康检查门禁，必须执行下一节的人工验证。
+- P2-D 首次发布还要求停止旧 migrator/所有长期进程、完整备份、显式 v066 checksum adoption 和 Maintenance verify；旧脚本既不实现这些步骤，也不能安全滚动混跑。
 
 ## 5. 发布后验证
 
@@ -267,7 +285,7 @@ curl --fail --silent --show-error --head \
 
 ### 5.3 数据库迁移
 
-核对本次启动日志中的 migration 结果，再只读检查已登记版本。不要为了“验证幂等”在生产发布后再次执行 `node db/migrate.js`；该入口会运行尚未登记的迁移和既有回填，不是只读命令。
+核对本次启动日志中的 migration 结果，再只读检查已登记版本。P2-D 候选已禁用 `node db/migrate.js` 直接入口；Maintenance `migrate` 仍是写入命令。未来只有 P2-D 获批部署后才能用 `PROCESS_ROLE=maintenance npm --prefix server run maintenance -- verify` 做候选只读校验；当前生产仍使用只读 SQL。
 
 ```bash
 ssh root@47.103.125.200 \
@@ -302,7 +320,7 @@ ssh root@47.103.125.200 \
 1. 按本次受控发布记录定位完整旧应用目录，不从一个 Git SHA 猜测限定生产树；
 2. 按主发布手册在同一文件系统原子交换回完整旧目录，并用既有 PM2 配置重启；
 3. 重新执行启动健康、数据库/迁移、认证、Agent/队列和业务冒烟；
-4. 不运行旧库存 `deploy/deploy.sh`，避免 `rsync --delete`、依赖安装、迁移和 PM2 删除/重建扩大回滚范围。
+4. 确认退役 `deploy/deploy.sh` 仍保持 fail-closed，不移除 guard 恢复历史 `rsync --delete`、依赖安装、迁移和 PM2 删除/重建路径。
 
 ### 6.2 数据库也需恢复
 
@@ -322,7 +340,7 @@ reset 迁移不会因 Git 回滚而自动撤销。涉及清空或重建数据的
 
 ### 6.3 Dashboard 独立发布与回退
 
-`deploy/deploy.sh` 不处理 `web/dashboard/dist/`。数据看板必须独立构建、备份
+退役 `deploy/deploy.sh` 不发布任何产物；其历史实现也不处理 `web/dashboard/dist/`。数据看板必须独立构建、备份
 远端旧产物、同步、验证；出现问题时把已记录的备份目录原样恢复。可直接照做的
 命令见
 [开发运行与生产发布手册：Dashboard 独立发布](../docs/开发运行与生产发布手册.md#101-dashboard-独立发布)。

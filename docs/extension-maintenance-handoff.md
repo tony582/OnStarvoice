@@ -859,7 +859,7 @@ scripts/package-extension.zsh /absolute/output/StarVoice-extension-0.3.67.zip
 6. 再次解压流检查本地地址；
 7. 输出最终客户包。
 
-`deploy/deploy.sh` 不负责 Extension 发布。后端部署成功不表示 Extension 客户包已更新。
+`deploy/deploy.sh` 已退役并 fail-closed，不发布任何产物。后端经受控流程发布成功也不表示 Extension 客户包已更新。
 
 ### 15.4 包体人工审查
 

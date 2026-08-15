@@ -457,8 +457,12 @@ Content-Type: application/json
 ```bash
 find tests -name '*.test.mjs' -print0 | xargs -0 node --test
 cd web/admin && npm run build
-cd server && npm run migrate
+cd ../..
+PROCESS_ROLE=maintenance npm --prefix server run maintenance -- migrate
+PROCESS_ROLE=maintenance npm --prefix server run maintenance -- verify
 ```
+
+迁移命令只允许指向隔离数据库；`migrate` 会写入，不能用于生产发布后的只读验证。生产 Maintenance 必须显式提供非空 `DATABASE_URL`，缺失时会在任何锁或数据库动作前 fail-closed。已有 v066 数据库首次 adoption、checksum 与 reset 边界见数据库说明。
 
 Extension 相关接口还应执行：
 
