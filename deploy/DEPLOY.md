@@ -8,7 +8,7 @@
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
 >
-> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** P2-C 已通过 PR #22 合并到 `main@c47800f`，但 P2-B/P2-C 均未部署；P2-D 只在本地分支实现，尚未提交、推送、建 PR 或部署。以下角色、checksum 和 Maintenance 说明都不表示线上已经配置或部署。
+> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** P2-C 已通过 PR #22 合并到 `main@c47800f`；P2-D 由 [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 跟踪交付，PR 与合并状态必须以 GitHub 和 `main` commit graph 的实时结果为准。`adbb47f` 已有 push/PR 两组远端 CI 合计 12/12 全绿；任何晚于它的 head 必须使用自身对应 CI，不能沿用旧 head 结果。PR 合并不等于部署，生产状态始终需要另行核对。P2-B/P2-C/P2-D 当前均未部署；生产仍为迁移 066、单一 `all`，未启用 split。以下角色、checksum 和 Maintenance 说明都不表示线上已经配置或部署。
 
 ## 1. 当前拓扑
 

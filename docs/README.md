@@ -2,7 +2,7 @@
 
 本目录是 StarVoice 当前稳定基线的文档入口。代码、数据库迁移和运行脚本是最终事实来源；当专题旧文档与本索引列出的稳定版文档冲突时，应先核对当前代码，再修正文档，不要沿用历史假设。
 
-> 2026-08-15 状态：P2-C 已通过 PR #22 合并为 `main@c47800f`，但未部署生产；P2-D 仅在本地分支 `codex/architecture-modernization-p2d-migration-governance` 实现和验证，尚未提交、推送、创建 PR 或部署。生产仍是单一 `all` 拓扑和迁移 066，不能把本地 Migration/Maintenance 能力当作线上能力。
+> 2026-08-15 状态：P2-C 已通过 PR #22 合并为 `main@c47800f`；P2-D 从该锚点创建分支 `codex/architecture-modernization-p2d-migration-governance`，由 [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 跟踪交付，PR 与合并状态以 GitHub 和 `main` commit graph 的实时结果为准。`adbb47f` 已在 push run `31881397937` 与 PR run `31881416216` 各通过 6 个任务（合计 12/12）；任何晚于它的 head 必须使用自身对应 CI，不能沿用旧 head 结果。P2-B/P2-C/P2-D 当前均未部署，生产仍是单一 `all` 拓扑和迁移 066，未启用 split；不能把 PR 候选中的 Migration/Maintenance 能力当作线上能力，PR 合并也不等于部署，生产状态始终需要另行核对。
 
 ## 按角色阅读
 
