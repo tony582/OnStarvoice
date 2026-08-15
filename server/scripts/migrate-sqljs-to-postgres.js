@@ -1,21 +1,31 @@
 /**
  * One-time migration from the old sql.js database file to PostgreSQL.
  *
- * Usage:
- *   DATABASE_URL=postgres://... node scripts/migrate-sqljs-to-postgres.js
+ * Supported invocation:
+ *   npm run maintenance -- run legacy-sqljs-import
+ *
+ * Direct execution is intentionally disabled so the import always runs under
+ * the Maintenance role, offline execution locks, task lock, and audit ledger.
  */
 
 import initSqlJs from 'sql.js';
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { initDb, closeDb, queryAll, queryOne, execute, getDefaultTenantId } from '../db/init.js';
+import { fileURLToPath, pathToFileURL } from 'url';
+import {
+  queryAll,
+  queryOne,
+  execute,
+  getDefaultTenantId,
+} from '../db/init.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
+import { v5 as uuidv5 } from 'uuid';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const LEGACY_DB_PATH = join(__dirname, '..', 'data', 'onstarvoice.db');
+const LEGACY_ALERT_NAMESPACE = 'de53c0c5-6fe8-50d9-a4a0-237b2fe774ad';
 
 function legacyAll(db, sql, params = []) {
   const stmt = db.prepare(sql);
@@ -196,6 +206,7 @@ async function insertRecords(tenantId, records) {
     const result = await upsertCapturedRecord(legacyRecordToSyncRecord(row), {
       tenantId,
       authCode: row.auth_code || '',
+      localizeMedia: false,
     });
     idMap.set(Number(row.id), result.id);
 
@@ -231,12 +242,33 @@ async function insertRecords(tenantId, records) {
 
 async function insertAlerts(tenantId, alerts, recordIdMap) {
   for (const alert of alerts) {
+    const sourceIdentity = alert.id ?? JSON.stringify([
+      alert.record_id,
+      alert.level,
+      alert.reason,
+      alert.title,
+      alert.created_at,
+    ]);
+    const alertId = uuidv5(`${tenantId}:${sourceIdentity}`, LEGACY_ALERT_NAMESPACE);
     await execute(`
       INSERT INTO alerts (
-        tenant_id, record_id, level, reason, title, summary, url,
+        id, tenant_id, record_id, level, reason, title, summary, url,
         interaction_total, notified, notified_at, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::timestamptz, now()))
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()))
+      ON CONFLICT (id) DO UPDATE SET
+        tenant_id = excluded.tenant_id,
+        record_id = excluded.record_id,
+        level = excluded.level,
+        reason = excluded.reason,
+        title = excluded.title,
+        summary = excluded.summary,
+        url = excluded.url,
+        interaction_total = excluded.interaction_total,
+        notified = excluded.notified,
+        notified_at = excluded.notified_at,
+        created_at = COALESCE($12::timestamptz, alerts.created_at)
     `, [
+      alertId,
       tenantId,
       recordIdMap.get(Number(alert.record_id)) || null,
       alert.level || 'info',
@@ -252,47 +284,52 @@ async function insertAlerts(tenantId, alerts, recordIdMap) {
   }
 }
 
-async function main() {
+export async function runLegacySqljsImport() {
   if (!existsSync(LEGACY_DB_PATH)) {
-    console.log(`[LegacyMigration] No legacy DB found at ${LEGACY_DB_PATH}`);
-    return;
+    const error = new Error('The fixed legacy sql.js database file is not available.');
+    error.code = 'LEGACY_SQLJS_DATABASE_NOT_FOUND';
+    throw error;
   }
 
-  await initDb();
   const SQL = await initSqlJs();
   const legacyDb = new SQL.Database(readFileSync(LEGACY_DB_PATH));
-  const tenantId = await getDefaultTenantId();
+  try {
+    const tenantId = await getDefaultTenantId();
 
-  const settings = legacyAll(legacyDb, 'SELECT * FROM settings');
-  const authCodes = legacyAll(legacyDb, 'SELECT * FROM auth_codes');
-  const authBindings = legacyAll(legacyDb, 'SELECT * FROM auth_bindings');
-  const records = legacyAll(legacyDb, 'SELECT * FROM records');
-  const alerts = legacyAll(legacyDb, 'SELECT * FROM alerts');
+    const settings = legacyAll(legacyDb, 'SELECT * FROM settings');
+    const authCodes = legacyAll(legacyDb, 'SELECT * FROM auth_codes');
+    const authBindings = legacyAll(legacyDb, 'SELECT * FROM auth_bindings');
+    const records = legacyAll(legacyDb, 'SELECT * FROM records');
+    const alerts = legacyAll(legacyDb, 'SELECT * FROM alerts');
 
-  await insertSettings(tenantId, settings);
-  await insertAuthCodes(tenantId, authCodes, authBindings);
-  const recordIdMap = await insertRecords(tenantId, records);
-  await insertAlerts(tenantId, alerts, recordIdMap);
+    await insertSettings(tenantId, settings);
+    await insertAuthCodes(tenantId, authCodes, authBindings);
+    const recordIdMap = await insertRecords(tenantId, records);
+    await insertAlerts(tenantId, alerts, recordIdMap);
 
-  legacyDb.close();
-
-  const counts = {
-    settings: settings.length,
-    authCodes: authCodes.length,
-    authBindings: authBindings.length,
-    records: records.length,
-    alerts: alerts.length,
-    postgresRecords: (await queryOne('SELECT COUNT(*) as n FROM records WHERE tenant_id = $1', [tenantId])).n,
-    postgresAuthCodes: (await queryOne('SELECT COUNT(*) as n FROM auth_codes WHERE tenant_id = $1', [tenantId])).n,
-  };
-  console.log('[LegacyMigration] Complete:', counts);
+    return Object.freeze({
+      settings: settings.length,
+      authCodes: authCodes.length,
+      authBindings: authBindings.length,
+      records: records.length,
+      alerts: alerts.length,
+      postgresRecords: (await queryOne(
+        'SELECT COUNT(*) as n FROM records WHERE tenant_id = $1',
+        [tenantId],
+      )).n,
+      postgresAuthCodes: (await queryOne(
+        'SELECT COUNT(*) as n FROM auth_codes WHERE tenant_id = $1',
+        [tenantId],
+      )).n,
+    });
+  } finally {
+    legacyDb.close();
+  }
 }
 
-main()
-  .catch(err => {
-    console.error('[LegacyMigration] Failed:', err);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await closeDb();
-  });
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  console.error(
+    'Direct execution is disabled. Use: npm run maintenance -- run legacy-sqljs-import',
+  );
+  process.exitCode = 2;
+}

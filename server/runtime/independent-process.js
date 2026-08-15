@@ -27,8 +27,8 @@ function logPreparedRole(logger, roleConfig, lockHandle) {
 /**
  * Prepare one P2-C independent process without registering HTTP, Cron, or AI
  * timers. Independent roles only verify an already-migrated database; they do
- * not run migrations or bootstrap writes before P2-D provides a maintenance
- * owner.
+ * not run migrations or bootstrap writes. P2-D assigns those operations to the
+ * explicit Maintenance entrypoint while this runtime remains read-only.
  */
 export async function prepareIndependentProcess({
   expectedRole,

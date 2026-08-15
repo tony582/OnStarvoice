@@ -8,7 +8,7 @@ test('captured body images are persisted while platform links are still valid', 
   const migration = source('server/db/migrations/040_record_local_images.sql');
   const mediaStore = source('server/services/media-store.js');
   const recordStore = source('server/services/record-store.js');
-  const server = source('server/runtime/ai-media-runtime.js');
+  const maintenance = source('server/maintenance/registry.js');
 
   assert.match(migration, /image_local_urls JSONB NOT NULL DEFAULT '\[\]'::jsonb/);
   assert.match(mediaStore, /const IMAGES_DIR = join\(MEDIA_DIR, 'images'\)/);
@@ -16,7 +16,7 @@ test('captured body images are persisted while platform links are still valid', 
   assert.match(mediaStore, /export function queueRecordImagesLocalization/);
   assert.match(mediaStore, /export async function backfillRecentImages/);
   assert.match(recordStore, /queueRecordImagesLocalization\(__result\.id, imageUrls, record\.platform\)/);
-  assert.match(server, /Promise\.all\(\[\s*jobs\.backfillRecentCovers\(\),\s*jobs\.backfillRecentImages\(\),?\s*\]\)/u);
+  assert.match(maintenance, /Promise\.all\(\[\s*jobs\.backfillRecentCovers\(\),\s*jobs\.backfillRecentImages\(\),?\s*\]\)/u);
 });
 
 test('triage and ticket details expose local body image paths', () => {

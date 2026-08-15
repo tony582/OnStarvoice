@@ -1,4 +1,6 @@
-import { closeDb, queryAll } from '../db/init.js';
+import { pathToFileURL } from 'node:url';
+
+import { queryAll } from '../db/init.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
 
 function arrayFromPayload(payload, key) {
@@ -6,7 +8,7 @@ function arrayFromPayload(payload, key) {
   return Array.isArray(payload[key]) ? payload[key] : [];
 }
 
-async function main() {
+export async function runCommentsWorkflowBackfill() {
   const rows = await queryAll(`
     SELECT id, tenant_id, platform, author_name, author_id, payload
     FROM records
@@ -29,20 +31,19 @@ async function main() {
     }, {
       tenantId: row.tenant_id,
       authCode: '',
+      preserveExisting: true,
     });
     processed += 1;
     comments += Number(stats.inserted || 0) + Number(stats.updated || 0);
     officialResponses += Number(stats.officialResponses || 0);
   }
 
-  console.log(JSON.stringify({ processed, comments, officialResponses }, null, 2));
+  return Object.freeze({ processed, comments, officialResponses });
 }
 
-main()
-  .catch(err => {
-    console.error(err.stack || err.message);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await closeDb();
-  });
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  console.error(
+    'Direct execution is disabled. Use: npm run maintenance -- run comments-workflow-backfill',
+  );
+  process.exitCode = 2;
+}

@@ -1,16 +1,77 @@
-import { listMigrationVersions, runMigrations } from './migrate.js';
+import { runMigrations } from './migrate.js';
+import {
+  loadMigrationInventory,
+  MigrationGovernanceError,
+} from './migration-inventory.js';
 import { assertDbConnection, closePool } from './pool.js';
 import { queryAll, queryOne, execute, withTransaction } from './query.js';
 import { ensureBootstrapAdmin } from '../services/auth-service.js';
 
 let initialized = false;
 let defaultTenantId = null;
+let runtimeMigrationInventoryPromise = null;
 
-export async function initDb() {
+async function runDefaultCompatibilityDatabaseMaintenance() {
+  const { runCompatibilityDatabaseMaintenance } = await import(
+    '../maintenance/compatibility-startup.js'
+  );
+  return runCompatibilityDatabaseMaintenance();
+}
+
+function runtimeMigrationInventory() {
+  runtimeMigrationInventoryPromise ||= loadMigrationInventory().catch(error => {
+    runtimeMigrationInventoryPromise = null;
+    throw error;
+  });
+  return runtimeMigrationInventoryPromise;
+}
+
+function schemaError(code, message, details = {}, cause) {
+  return new MigrationGovernanceError(code, message, {
+    ...details,
+    ...(cause ? { cause } : {}),
+  });
+}
+
+async function resolveRequiredMigrations({
+  requiredMigrations,
+  requiredMigrationVersions,
+} = {}) {
+  if (requiredMigrations !== undefined) return requiredMigrations;
+
+  const inventory = await runtimeMigrationInventory();
+  if (requiredMigrationVersions === undefined) return inventory;
+  if (!Array.isArray(requiredMigrationVersions)) {
+    throw new TypeError('requiredMigrationVersions must be an array when provided');
+  }
+  const byVersion = new Map(inventory.map(migration => [migration.version, migration]));
+  return requiredMigrationVersions.map(version => {
+    const migration = byVersion.get(version);
+    if (!migration) {
+      throw schemaError(
+        'DATABASE_SCHEMA_REQUIREMENT_UNKNOWN',
+        `Required runtime migration is not in the repository inventory: ${version}`,
+        { version },
+      );
+    }
+    return migration;
+  });
+}
+
+export async function initDb({
+  migrate = runMigrations,
+  databaseMaintenance = runDefaultCompatibilityDatabaseMaintenance,
+  bootstrap = ensureBootstrapAdmin,
+} = {}) {
   if (initialized) return true;
-  await assertDbConnection();
-  await runMigrations();
-  await ensureBootstrapAdmin();
+  if (typeof migrate !== 'function'
+      || typeof databaseMaintenance !== 'function'
+      || typeof bootstrap !== 'function') {
+    throw new TypeError('migrate, databaseMaintenance, and bootstrap must be functions');
+  }
+  await migrate();
+  await databaseMaintenance();
+  await bootstrap();
   initialized = true;
   console.log('[DB] PostgreSQL initialized');
   return true;
@@ -19,34 +80,96 @@ export async function initDb() {
 /**
  * Connect an independent runtime role to an already prepared database.
  *
- * P2-C deliberately keeps migrations and bootstrap writes out of the split
- * API/Worker entrypoints. The compatibility `all` entrypoint continues to use
- * initDb() until P2-D introduces a single, explicit maintenance owner.
+ * P2-D keeps migrations and bootstrap writes out of split API/Worker
+ * entrypoints. The compatibility `all` entrypoint still uses initDb(), but its
+ * schema work is now serialized and checksum-verified by the migration core.
+ * Explicit maintenance remains the only path that may adopt legacy checksums.
  */
 export async function assertRuntimeSchemaReady({
+  requiredMigrations,
   requiredMigrationVersions,
-  queryAppliedVersions = queryAll,
+  queryAppliedMigrations,
+  queryAppliedVersions,
 } = {}) {
-  const required = requiredMigrationVersions || await listMigrationVersions();
+  const required = await resolveRequiredMigrations({
+    requiredMigrations,
+    requiredMigrationVersions,
+  });
   if (!Array.isArray(required) || required.length === 0) {
-    const error = new Error('No required runtime migrations were found.');
-    error.code = 'DATABASE_SCHEMA_REQUIREMENTS_EMPTY';
+    throw schemaError(
+      'DATABASE_SCHEMA_REQUIREMENTS_EMPTY',
+      'No required runtime migrations were found.',
+    );
+  }
+  for (const migration of required) {
+    if (!migration
+      || typeof migration.version !== 'string'
+      || typeof migration.checksumSha256 !== 'string') {
+      throw new TypeError('requiredMigrations must contain version and checksumSha256');
+    }
+  }
+
+  const queryMigrations = queryAppliedMigrations || queryAppliedVersions || queryAll;
+  let rows;
+  try {
+    rows = await queryMigrations(
+      `SELECT version, checksum_sha256, checksum_recorded_at
+       FROM schema_migrations
+       WHERE version = ANY($1::text[])`,
+      [required.map(migration => migration.version)],
+    );
+  } catch (error) {
+    if (error?.code === '42703') {
+      throw schemaError(
+        'DATABASE_SCHEMA_CHECKSUMS_NOT_READY',
+        'Database migration checksums have not been adopted.',
+        {},
+        error,
+      );
+    }
+    if (error?.code === '42P01') {
+      throw schemaError(
+        'DATABASE_SCHEMA_NOT_READY',
+        'Database migration metadata is missing.',
+        {},
+        error,
+      );
+    }
     throw error;
   }
-  const rows = await queryAppliedVersions(
-    'SELECT version FROM schema_migrations WHERE version = ANY($1::text[])',
-    [required],
-  );
-  const applied = new Set(rows.map(row => row.version));
-  const missing = required.filter(version => !applied.has(version));
+
+  const applied = new Map(rows.map(row => [row.version, row]));
+  const missing = required.filter(migration => !applied.has(migration.version));
   if (missing.length > 0) {
-    const error = new Error(
+    throw schemaError(
+      'DATABASE_SCHEMA_NOT_READY',
       `Database schema is missing ${missing.length} required migration(s); `
       + 'run the approved maintenance migration before starting split runtimes.',
+      { missingMigrationCount: missing.length },
     );
-    error.code = 'DATABASE_SCHEMA_NOT_READY';
-    error.missingMigrationCount = missing.length;
-    throw error;
+  }
+
+  const checksumMissing = required.filter(
+    migration => !applied.get(migration.version)?.checksum_sha256
+      || !applied.get(migration.version)?.checksum_recorded_at,
+  );
+  if (checksumMissing.length > 0) {
+    throw schemaError(
+      'DATABASE_SCHEMA_CHECKSUMS_NOT_READY',
+      'Database migration checksums have not been adopted.',
+      { missingChecksumCount: checksumMissing.length },
+    );
+  }
+
+  const mismatched = required.filter(
+    migration => applied.get(migration.version).checksum_sha256 !== migration.checksumSha256,
+  );
+  if (mismatched.length > 0) {
+    throw schemaError(
+      'DATABASE_MIGRATION_CHECKSUM_MISMATCH',
+      'Applied migration checksum does not match the running release.',
+      { mismatchedMigrationCount: mismatched.length },
+    );
   }
   return true;
 }

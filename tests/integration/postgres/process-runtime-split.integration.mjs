@@ -10,7 +10,7 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { validatePostgresIntegrationTarget } from '../../../scripts/lib/postgres-integration-target.mjs';
-import { listMigrationVersions } from '../../../server/db/migrate.js';
+import { loadMigrationInventory } from '../../../server/db/migration-inventory.js';
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -455,10 +455,13 @@ test('real split API, scheduler, and ai-media processes keep exclusive PostgreSQ
   await pool.query(`
     CREATE TABLE "${guardSchema}".schema_migrations (
       version text PRIMARY KEY,
-      applied_at timestamptz NOT NULL DEFAULT now()
+      applied_at timestamptz NOT NULL DEFAULT now(),
+      checksum_sha256 text,
+      checksum_recorded_at timestamptz
     )
   `);
-  const requiredMigrationVersions = await listMigrationVersions();
+  const requiredMigrations = await loadMigrationInventory();
+  const requiredMigrationVersions = requiredMigrations.map(migration => migration.version);
 
   const staleSchemaApi = register(spawnRole({
     databaseUrl: target.rawUrl,
@@ -475,9 +478,18 @@ test('real split API, scheduler, and ai-media processes keep exclusive PostgreSQ
   assert.equal(existsSync(staleSchemaApi.mediaDirectory), false);
 
   await pool.query(
-    `INSERT INTO "${guardSchema}".schema_migrations (version)
-     SELECT unnest($1::text[])`,
-    [requiredMigrationVersions],
+    `INSERT INTO "${guardSchema}".schema_migrations (
+       version,
+       checksum_sha256,
+       checksum_recorded_at
+     )
+     SELECT migration.version, migration.checksum_sha256, now()
+     FROM unnest($1::text[], $2::text[])
+       AS migration(version, checksum_sha256)`,
+    [
+      requiredMigrationVersions,
+      requiredMigrations.map(migration => migration.checksumSha256),
+    ],
   );
 
   const api = register(spawnRole({

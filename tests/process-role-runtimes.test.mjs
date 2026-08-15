@@ -339,6 +339,10 @@ test('compatibility ai-media owns the explicit one-shot boundary in addition to 
     },
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
+    maintenanceTaskRunner: async ({ task }) => ({
+      status: 'succeeded',
+      result: await task.run(),
+    }),
     logger: quietLogger(),
   });
   await new Promise((resolve) => setImmediate(resolve));

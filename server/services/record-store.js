@@ -451,6 +451,7 @@ export async function upsertCapturedRecord(record, context) {
   const tenantId = context.tenantId;
   const authCode = context.authCode || '';
   const monitorExecutionId = context.monitorExecutionId || null;
+  const localizeMedia = context.localizeMedia !== false;
   const canonicalUrl = normalizeUrl(record.url);
   const contentHash = buildContentHash(record, canonicalUrl);
   const tags = jsonText(record.tags, '[]');
@@ -662,8 +663,12 @@ export async function upsertCapturedRecord(record, context) {
     };
   });
   // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
-  if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
-  if (imageUrls !== '[]') queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
+  if (localizeMedia && record.cover_url) {
+    queueCoverLocalization(__result.id, record.cover_url, record.platform);
+  }
+  if (localizeMedia && imageUrls !== '[]') {
+    queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
+  }
   return __result;
 }
 

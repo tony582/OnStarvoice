@@ -1,175 +1,464 @@
-import 'dotenv/config'; // 独立运行迁移时也要加载 .env(否则 DATABASE_URL 缺失会回落到默认弱密码)
-import { readdir, readFile } from 'fs/promises';
+import 'dotenv/config'; // Maintenance 导入迁移核心时仍需加载 server/.env。
 import { fileURLToPath } from 'url';
-import { dirname, join, resolve } from 'path';
-import { getPool, closePool } from './pool.js';
-import { parsePublishTimestamp } from '../services/publish-date.js';
-import { upsertRecordComments } from '../services/comment-workflow.js';
+import { resolve } from 'path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { getPool } from './pool.js';
+import {
+  loadMigrationInventory,
+  MigrationGovernanceError,
+} from './migration-inventory.js';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const RESET_MIGRATION_RE = /reset/i;
+
+const MIGRATION_LOCK_NAMESPACE = 'onstarvoice:migrations:v1';
+const MIGRATION_LOCK_NAME = 'global';
+const DEFAULT_MIGRATION_LOCK_WAIT_MS = 60_000;
+const DEFAULT_MIGRATION_LOCK_POLL_MS = 100;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const CHECKSUM_RE = /^[a-f0-9]{64}$/u;
+const TRY_MIGRATION_LOCK_SQL = `
+  SELECT pg_try_advisory_lock(hashtext($1), hashtext($2)) AS acquired
+`;
+const RELEASE_MIGRATION_LOCK_SQL = `
+  SELECT pg_advisory_unlock(hashtext($1), hashtext($2)) AS released
+`;
 
 export async function listMigrationVersions({ includeReset = false } = {}) {
-  const migrationsDir = join(__dirname, 'migrations');
-  return (await readdir(migrationsDir))
-    .filter(file => file.endsWith('.sql'))
-    .filter(file => includeReset || !RESET_MIGRATION_RE.test(file))
-    .sort();
+  const migrations = await loadMigrationInventory({ includeReset });
+  return migrations.map(migration => migration.version);
 }
 
-async function ensureMigrationTable(client) {
+function positiveInteger(value, fallback, label) {
+  const candidate = value === undefined ? fallback : value;
+  const parsed = typeof candidate === 'number'
+    ? candidate
+    : (/^[1-9]\d*$/u.test(String(candidate)) ? Number(candidate) : Number.NaN);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_TIMER_DELAY_MS) {
+    throw new TypeError(`${label} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function migrationError(code, message, details = {}) {
+  return new MigrationGovernanceError(code, message, details);
+}
+
+function resolveMigrationLockOptions({ lockWaitMs, lockPollMs } = {}) {
+  return Object.freeze({
+    waitMs: positiveInteger(
+      lockWaitMs,
+      process.env.MIGRATION_LOCK_WAIT_MS ?? DEFAULT_MIGRATION_LOCK_WAIT_MS,
+      'lockWaitMs',
+    ),
+    pollMs: positiveInteger(
+      lockPollMs,
+      process.env.MIGRATION_LOCK_POLL_MS ?? DEFAULT_MIGRATION_LOCK_POLL_MS,
+      'lockPollMs',
+    ),
+  });
+}
+
+/**
+ * Acquire the one database-wide migration lock with a bounded wait.
+ * No schema query or mutation may happen before this resolves.
+ */
+export async function acquireMigrationAdvisoryLock(client, {
+  waitMs = DEFAULT_MIGRATION_LOCK_WAIT_MS,
+  pollMs = DEFAULT_MIGRATION_LOCK_POLL_MS,
+  now = Date.now,
+  sleep = delay,
+} = {}) {
+  const boundedWaitMs = positiveInteger(waitMs, DEFAULT_MIGRATION_LOCK_WAIT_MS, 'waitMs');
+  const boundedPollMs = positiveInteger(pollMs, DEFAULT_MIGRATION_LOCK_POLL_MS, 'pollMs');
+  if (typeof now !== 'function' || typeof sleep !== 'function') {
+    throw new TypeError('now and sleep must be functions');
+  }
+
+  const deadline = now() + boundedWaitMs;
+  do {
+    const result = await client.query(
+      TRY_MIGRATION_LOCK_SQL,
+      [MIGRATION_LOCK_NAMESPACE, MIGRATION_LOCK_NAME],
+    );
+    if (result.rows[0]?.acquired === true) return true;
+
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(boundedPollMs, remainingMs));
+  } while (now() < deadline);
+
+  throw migrationError(
+    'DATABASE_MIGRATION_LOCK_TIMEOUT',
+    'Timed out waiting for the PostgreSQL migration lock.',
+    { lockWaitMs: boundedWaitMs },
+  );
+}
+
+export async function releaseMigrationAdvisoryLock(client) {
+  const result = await client.query(
+    RELEASE_MIGRATION_LOCK_SQL,
+    [MIGRATION_LOCK_NAMESPACE, MIGRATION_LOCK_NAME],
+  );
+  if (result.rows[0]?.released !== true) {
+    throw migrationError(
+      'DATABASE_MIGRATION_LOCK_RELEASE_FAILED',
+      'PostgreSQL migration lock was not held during release.',
+    );
+  }
+}
+
+async function migrationTableColumns(client) {
+  const relation = await client.query(
+    'SELECT to_regclass($1) AS relation',
+    ['schema_migrations'],
+  );
+  if (!relation.rows[0]?.relation) return null;
+
+  const columns = await client.query(`
+    SELECT attribute.attname AS name
+    FROM pg_attribute attribute
+    WHERE attribute.attrelid = to_regclass($1)
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+  `, ['schema_migrations']);
+  return new Set(columns.rows.map(row => row.name));
+}
+
+async function createMigrationTable(client) {
   await client.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
+    CREATE TABLE schema_migrations (
       version TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      checksum_sha256 TEXT,
+      checksum_recorded_at TIMESTAMPTZ
     )
   `);
 }
 
-// 一次性回填:把存量的 published_ts/comment_published_ts 从原始发布时间串解析出来
-// (迁移 014 先回落成采集时间,这里覆盖成真发布时间;解析不了/无发布时间 → NULL,排序靠后)。
-// 用 schema_migrations 标记只跑一次。
-async function backfillPublishTs(client) {
-  const FLAG = 'publish_ts_backfill_v1';
-  const done = await client.query('SELECT 1 FROM schema_migrations WHERE version = $1', [FLAG]);
-  if (done.rowCount) return;
-  console.log('[DB] Backfilling published_ts from publish_time …');
-
-  const recs = await client.query('SELECT id, publish_time, created_at FROM records');
-  let rUpdated = 0;
-  for (const r of recs.rows) {
-    const ts = String(r.publish_time || '').trim() ? parsePublishTimestamp(r.publish_time, r.created_at) : null;
-    await client.query('UPDATE records SET published_ts = $2 WHERE id = $1', [r.id, ts]);
-    rUpdated += 1;
+async function upgradeLegacyMigrationTable(client, columns, adoptLegacyChecksums) {
+  const missingChecksumColumns = !columns.has('checksum_sha256')
+    || !columns.has('checksum_recorded_at');
+  if (!missingChecksumColumns) return;
+  if (!adoptLegacyChecksums) {
+    throw migrationError(
+      'DATABASE_MIGRATION_CHECKSUMS_NOT_READY',
+      'Legacy migration checksums require explicit v066 adoption.',
+    );
   }
-  console.log(`[DB]   records: ${rUpdated} 条`);
-
-  const leads = await client.query(`
-    SELECT cl.id, cl.captured_at, rc.published_at
-    FROM comment_leads cl LEFT JOIN record_comments rc ON rc.id = cl.comment_id`);
-  let cUpdated = 0;
-  for (const l of leads.rows) {
-    const ts = String(l.published_at || '').trim() ? parsePublishTimestamp(l.published_at, l.captured_at) : null;
-    await client.query('UPDATE comment_leads SET comment_published_ts = $2 WHERE id = $1', [l.id, ts]);
-    cUpdated += 1;
-  }
-  console.log(`[DB]   comment_leads: ${cUpdated} 条`);
-
-  await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [FLAG]);
+  await client.query(`
+    ALTER TABLE schema_migrations
+      ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT,
+      ADD COLUMN IF NOT EXISTS checksum_recorded_at TIMESTAMPTZ
+  `);
 }
 
-// 一次性回填:修复"评论异步入库会丢失"后,把"payload 里有评论、但 record_comments 为空"的
-// 记录重新入库一遍。评论数据本就安全存在 records.payload —— 关键词采集嵌在
-// payload.items[0].commentsCleanedItems,单篇在 payload 顶层。两处都兜。只跑一次。
-async function backfillMissingComments(client) {
-  const FLAG = 'comment_promotion_backfill_v2';
-  const done = await client.query('SELECT 1 FROM schema_migrations WHERE version = $1', [FLAG]);
-  if (done.rowCount) return;
-  console.log('[DB] Backfilling missing comment promotions from payload …');
+function validateAppliedMigrationRow(row, migration, adoptLegacyChecksums) {
+  const checksum = row.checksum_sha256;
+  const recordedAt = row.checksum_recorded_at;
 
-  const recs = await client.query(`
-    SELECT r.id, r.tenant_id, r.platform, r.title, r.content, r.author_name, r.author_id,
-           r.url, r.keyword,
-           COALESCE(
-             CASE WHEN jsonb_typeof(r.payload->'items'->0->'commentsCleanedItems') = 'array'
-                  THEN r.payload->'items'->0->'commentsCleanedItems' END,
-             CASE WHEN jsonb_typeof(r.payload->'commentsCleanedItems') = 'array'
-                  THEN r.payload->'commentsCleanedItems' END,
-             '[]'::jsonb) AS cleaned,
-           COALESCE(
-             CASE WHEN jsonb_typeof(r.payload->'items'->0->'officialReplyItems') = 'array'
-                  THEN r.payload->'items'->0->'officialReplyItems' END,
-             CASE WHEN jsonb_typeof(r.payload->'officialReplyItems') = 'array'
-                  THEN r.payload->'officialReplyItems' END,
-             '[]'::jsonb) AS official_reply
-    FROM records r
-    WHERE NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.record_id = r.id)
-      AND (
-        (jsonb_typeof(r.payload->'items'->0->'commentsCleanedItems') = 'array'
-           AND jsonb_array_length(r.payload->'items'->0->'commentsCleanedItems') > 0)
-        OR (jsonb_typeof(r.payload->'commentsCleanedItems') = 'array'
-           AND jsonb_array_length(r.payload->'commentsCleanedItems') > 0)
-      )
-  `);
+  if (checksum == null) {
+    if (recordedAt != null) {
+      throw migrationError(
+        'DATABASE_MIGRATION_CHECKSUM_METADATA_INVALID',
+        `Migration checksum metadata is incomplete for ${migration.version}.`,
+        { version: migration.version },
+      );
+    }
+    if (!migration.legacyBaseline) {
+      throw migrationError(
+        'DATABASE_MIGRATION_CHECKSUM_MISSING',
+        `Applied migration has no trusted checksum: ${migration.version}.`,
+        { version: migration.version },
+      );
+    }
+    if (!adoptLegacyChecksums) {
+      throw migrationError(
+        'DATABASE_MIGRATION_CHECKSUMS_NOT_READY',
+        'Legacy migration checksums require explicit v066 adoption.',
+        { version: migration.version },
+      );
+    }
+    return 'adopt';
+  }
 
-  let fixed = 0;
-  let comments = 0;
-  for (const r of recs.rows) {
+  if (typeof checksum !== 'string' || !CHECKSUM_RE.test(checksum) || recordedAt == null) {
+    throw migrationError(
+      'DATABASE_MIGRATION_CHECKSUM_METADATA_INVALID',
+      `Migration checksum metadata is invalid for ${migration.version}.`,
+      { version: migration.version },
+    );
+  }
+  if (checksum !== migration.checksumSha256) {
+    throw migrationError(
+      'DATABASE_MIGRATION_CHECKSUM_MISMATCH',
+      `Applied migration checksum does not match ${migration.version}.`,
+      { version: migration.version },
+    );
+  }
+  return 'verified';
+}
+
+/**
+ * Prepare and verify schema_migrations under the migration advisory lock.
+ * Existing non-SQL maintenance markers remain untouched and checksum-free.
+ */
+export async function prepareMigrationTracker(
+  client,
+  migrations,
+  { adoptLegacyChecksums = false } = {},
+) {
+  if (typeof adoptLegacyChecksums !== 'boolean') {
+    throw new TypeError('adoptLegacyChecksums must be a boolean');
+  }
+  const migrationByVersion = new Map(
+    migrations.map(migration => [migration.version, migration]),
+  );
+
+  await client.query('BEGIN');
+  try {
+    const columns = await migrationTableColumns(client);
+    if (columns === null) await createMigrationTable(client);
+    else await upgradeLegacyMigrationTable(client, columns, adoptLegacyChecksums);
+
+    const result = await client.query(`
+      SELECT version, applied_at, checksum_sha256, checksum_recorded_at
+      FROM schema_migrations
+      ORDER BY version
+    `);
+    const applied = new Set(result.rows.map(row => row.version));
+    const toAdopt = [];
+
+    for (const row of result.rows) {
+      const migration = migrationByVersion.get(row.version);
+      if (!migration) continue;
+      if (validateAppliedMigrationRow(row, migration, adoptLegacyChecksums) === 'adopt') {
+        toAdopt.push(migration);
+      }
+    }
+
+    for (const migration of toAdopt) {
+      const updated = await client.query(`
+        UPDATE schema_migrations
+        SET checksum_sha256 = $2,
+            checksum_recorded_at = now()
+        WHERE version = $1
+          AND checksum_sha256 IS NULL
+          AND checksum_recorded_at IS NULL
+      `, [migration.version, migration.checksumSha256]);
+      if (updated.rowCount !== 1) {
+        throw migrationError(
+          'DATABASE_MIGRATION_CHECKSUM_ADOPTION_CONFLICT',
+          `Migration checksum adoption raced for ${migration.version}.`,
+          { version: migration.version },
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    return Object.freeze({
+      applied,
+      adoptedVersions: Object.freeze(toAdopt.map(migration => migration.version)),
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw error;
+  }
+}
+
+async function applySchemaMigrations(client, migrations, applied) {
+  const appliedVersions = [];
+  for (const migration of migrations) {
+    if (migration.kind !== 'schema' || applied.has(migration.version)) continue;
+
+    console.log(`[DB] Applying migration ${migration.version}`);
+    await client.query('BEGIN');
     try {
-      const stats = await upsertRecordComments(r.id, {
-        platform: r.platform,
-        title: r.title,
-        content: r.content,
-        author_name: r.author_name,
-        author_id: r.author_id,
-        url: r.url,
-        keyword: r.keyword,
-        comments_cleaned_items: JSON.stringify(r.cleaned || []),
-        official_reply_items: JSON.stringify(r.official_reply || []),
-      }, { tenantId: r.tenant_id, authCode: '' });
-      fixed += 1;
-      comments += Number(stats.inserted || 0);
-    } catch (err) {
-      console.error(`[DB]   comment backfill failed for record ${r.id}:`, err.message);
+      await client.query(migration.sql);
+      await client.query(`
+        INSERT INTO schema_migrations (
+          version,
+          checksum_sha256,
+          checksum_recorded_at
+        ) VALUES ($1, $2, now())
+      `, [migration.version, migration.checksumSha256]);
+      await client.query('COMMIT');
+      applied.add(migration.version);
+      appliedVersions.push(migration.version);
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw error;
     }
   }
-  console.log(`[DB]   recovered ${fixed} records, ${comments} comments`);
-  await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [FLAG]);
+  return appliedVersions;
 }
 
-export async function runMigrations() {
-  const pool = getPool();
-  const client = await pool.connect();
+function attachSecondaryError(primaryError, secondaryError) {
+  if (!primaryError || !secondaryError) return;
+  try { primaryError.migrationLockReleaseError = secondaryError; } catch {}
+}
+
+async function finishMigrationClient(client, { lockAcquired, operationError }) {
+  let releaseError = null;
+  if (lockAcquired) {
+    try {
+      await releaseMigrationAdvisoryLock(client);
+    } catch (error) {
+      releaseError = error;
+    }
+  }
 
   try {
-    await ensureMigrationTable(client);
-    const migrationsDir = join(__dirname, 'migrations');
-    const files = await listMigrationVersions({ includeReset: true });
+    client.release(releaseError || undefined);
+  } catch (error) {
+    releaseError ||= error;
+  }
 
-    const appliedRows = await client.query('SELECT version FROM schema_migrations');
-    const applied = new Set(appliedRows.rows.map(row => row.version));
+  if (releaseError && operationError) {
+    attachSecondaryError(operationError, releaseError);
+    return operationError;
+  }
+  return releaseError || operationError;
+}
 
-    // 破坏性「清库」迁移(reset_captured_data / reset_anjixing 等会 DELETE records/issues/…)移出自动链:
-    // 默认启动时【不跑】—— 否则备份恢复、或拿生产数据灌一个 schema_migrations 不同步的新库时,启动即清库。
-    // 需要时显式 ALLOW_RESET_MIGRATIONS=1 启动一次(或单独跑 maintenance)。已 applied 的不受影响。
-    const allowReset = process.env.ALLOW_RESET_MIGRATIONS === '1';
+/** Read-only verification used by the explicit Maintenance CLI. */
+export async function verifyMigrations({ lockWaitMs, lockPollMs } = {}) {
+  const lockOptions = resolveMigrationLockOptions({ lockWaitMs, lockPollMs });
+  const migrations = await loadMigrationInventory({ includeReset: true });
+  const pool = getPool();
+  const client = await pool.connect();
+  let lockAcquired = false;
+  let operationError = null;
+  let result;
 
-    for (const file of files) {
-      if (applied.has(file)) continue;
-      if (RESET_MIGRATION_RE.test(file) && !allowReset) {
-        console.warn(`[DB] 跳过破坏性 reset 迁移 ${file}(不自动执行;需 ALLOW_RESET_MIGRATIONS=1 才跑)`);
-        continue;
-      }
-      const sql = await readFile(join(migrationsDir, file), 'utf8');
-      console.log(`[DB] Applying migration ${file}`);
-      await client.query('BEGIN');
-      try {
-        await client.query(sql);
-        await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [file]);
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      }
+  try {
+    await acquireMigrationAdvisoryLock(client, {
+      waitMs: lockOptions.waitMs,
+      pollMs: lockOptions.pollMs,
+    });
+    lockAcquired = true;
+
+    const columns = await migrationTableColumns(client);
+    if (columns === null) {
+      throw migrationError(
+        'DATABASE_SCHEMA_NOT_READY',
+        'Database migration metadata is missing.',
+      );
+    }
+    if (!columns.has('checksum_sha256') || !columns.has('checksum_recorded_at')) {
+      throw migrationError(
+        'DATABASE_MIGRATION_CHECKSUMS_NOT_READY',
+        'Legacy migration checksums require explicit v066 adoption.',
+      );
     }
 
-    await backfillPublishTs(client);
+    const rows = await client.query(`
+      SELECT version, applied_at, checksum_sha256, checksum_recorded_at
+      FROM schema_migrations
+      ORDER BY version
+    `);
+    const migrationByVersion = new Map(
+      migrations.map(migration => [migration.version, migration]),
+    );
+    const applied = new Set(rows.rows.map(row => row.version));
+    for (const row of rows.rows) {
+      const migration = migrationByVersion.get(row.version);
+      if (migration) validateAppliedMigrationRow(row, migration, false);
+    }
+
+    const missing = migrations.filter(
+      migration => migration.kind === 'schema' && !applied.has(migration.version),
+    );
+    if (missing.length > 0) {
+      throw migrationError(
+        'DATABASE_SCHEMA_NOT_READY',
+        `Database schema is missing ${missing.length} required migration(s).`,
+        { missingMigrationCount: missing.length },
+      );
+    }
+
+    result = Object.freeze({
+      verifiedVersions: Object.freeze(
+        migrations
+          .filter(migration => applied.has(migration.version))
+          .map(migration => migration.version),
+      ),
+    });
+  } catch (error) {
+    operationError = error;
   } finally {
-    client.release();
+    operationError = await finishMigrationClient(client, {
+      lockAcquired,
+      operationError,
+    });
   }
+
+  if (operationError) throw operationError;
+  return result;
+}
+
+export async function runMigrations({
+  adoptLegacyChecksums = false,
+  lockWaitMs,
+  lockPollMs,
+} = {}) {
+  if (typeof adoptLegacyChecksums !== 'boolean') {
+    throw new TypeError('adoptLegacyChecksums must be a boolean');
+  }
+  if (process.env.ALLOW_RESET_MIGRATIONS === '1') {
+    throw migrationError(
+      'DATABASE_RESET_MIGRATIONS_DISABLED',
+      'Automatic reset migrations are disabled; use an approved maintenance workflow.',
+    );
+  }
+
+  const lockOptions = resolveMigrationLockOptions({ lockWaitMs, lockPollMs });
+
+  // Reset files are loaded only so an already-recorded historical reset can be
+  // checksum-verified. applySchemaMigrations() never executes them.
+  const migrations = await loadMigrationInventory({ includeReset: true });
+  const pool = getPool();
+  const client = await pool.connect();
+  let lockAcquired = false;
+  let operationError = null;
+  let result;
+
+  try {
+    await acquireMigrationAdvisoryLock(client, {
+      waitMs: lockOptions.waitMs,
+      pollMs: lockOptions.pollMs,
+    });
+    lockAcquired = true;
+    const tracker = await prepareMigrationTracker(client, migrations, {
+      adoptLegacyChecksums,
+    });
+    const appliedVersions = await applySchemaMigrations(
+      client,
+      migrations,
+      tracker.applied,
+    );
+
+    result = Object.freeze({
+      appliedVersions: Object.freeze(appliedVersions),
+      adoptedVersions: tracker.adoptedVersions,
+    });
+  } catch (error) {
+    operationError = error;
+  } finally {
+    operationError = await finishMigrationClient(client, {
+      lockAcquired,
+      operationError,
+    });
+  }
+
+  if (operationError) throw operationError;
+  return result;
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === __filename;
 if (isMain) {
-  runMigrations()
-    .then(async () => {
-      console.log('[DB] Migrations complete');
-      await closePool();
-    })
-    .catch(async err => {
-      console.error('[DB] Migration failed:', err);
-      await closePool();
-      process.exit(1);
-    });
+  console.error(
+    '[DB] DATABASE_MIGRATION_DIRECT_ENTRYPOINT_DISABLED: '
+    + 'use PROCESS_ROLE=maintenance npm run maintenance -- migrate',
+  );
+  process.exitCode = 2;
 }

@@ -1,0 +1,2 @@
+server/db/migrations/*.sql text eol=lf
+server/db/migration-baseline-v066.json text eol=lf

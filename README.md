@@ -4,7 +4,7 @@ StarVoice 是一套面向企业客户的多平台社交舆情采集、任务调�
 
 > P2-A1 的合并与发布来源锚点为 `0ec5508`。2026-08-14 生产核对值为 Extension `0.3.83`、数据库迁移 `066_tenant_comment_risk_attention.sql`；生产中纳入 Git 的 Server 文件，是 `236aa4d` 完整基线叠加来自 `0ec5508` 的 4 个白名单文件，不是完整 `0ec5508` 树。精确清单见 [开发运行与生产发布手册](docs/开发运行与生产发布手册.md#14-2026-08-14-p2-a1-限定生产快照)。
 >
-> 2026-08-15，P2-B 已通过 PR #21 合并到 `main`，merge commit 为 `7c3e47ef1717a3fc498d63a1e3b7952e9100ecee`，但**尚未部署生产**；线上不能被描述为已经配置 `PROCESS_ROLE` 或已受角色锁保护。P2-C 实现提交 `bc4d665` 已推送至分支 `codex/architecture-modernization-p2c-process-runtime`，并由 [PR #22](https://github.com/tony582/OnStarvoice/pull/22) 跟踪评审与主线交付；仓库合并状态以该 PR 和当前 `main` 为准，生产尚未部署。
+> 2026-08-15，P2-C 已通过 [PR #22](https://github.com/tony582/OnStarvoice/pull/22) 合并到 `main@c47800f3184effc9e6ef05aedba9f37a81053886`。P2-D 从该锚点创建分支 `codex/architecture-modernization-p2d-migration-governance`，由 [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 跟踪交付；PR 与合并状态必须以 GitHub 和 `main` commit graph 的实时结果为准。head `adbb47f94f2fe2eb8b37e7642ba1cc68700bc882` 已在 push run [31881397937](https://github.com/tony582/OnStarvoice/actions/runs/31881397937) 与 PR run [31881416216](https://github.com/tony582/OnStarvoice/actions/runs/31881416216) 各通过 6 个任务（合计 12/12），该证据快照核对时无评论或评审；任何晚于 `adbb47f` 的 head 必须使用自身对应 CI，不能沿用旧 head 结果。P2-B/P2-C/P2-D **当前均未部署生产**；生产仍为迁移 066、单一 `all`，未启用 split。任何 PR 合并也不等于生产部署，生产状态始终需要另行核对。
 >
 > “稳定基线”表示当前主链路已经形成可交接、可回归、可发布的版本锚点，不表示所有能力都已脱离 Beta。调度中心、多 Agent 接力、无人值守、平台风控识别和依赖页面 DOM 的采集仍需按客户环境逐项验收。
 
@@ -84,9 +84,9 @@ PostgreSQL
 
 ## 本地快速启动
 
-当前标准本地启动仍使用兼容 `all` 入口。P2-C 分支中已建立 `api`、`scheduler`、`ai-media` 三个独立入口，以及兼容 `/api/health` 的 `/api/health/live`、`/api/health/ready` 候选语义；响应后继续执行的进程内后台工作也已纳入统一的有界 drain。独立角色启动前会只读核对仓库中的全部非 reset 迁移都已记录为 applied，不会自行运行迁移或 bootstrap。
+当前标准本地启动仍使用兼容 `all` 入口。`main@c47800f` 已包含 `api`、`scheduler`、`ai-media` 三个独立入口，以及兼容 `/api/health` 的 `/api/health/live`、`/api/health/ready` 候选语义；响应后继续执行的进程内后台工作也已纳入统一的有界 drain。这些能力尚未部署生产。
 
-该候选已通过 Node 24 与生产 Node 18 的 1250/1250 回归、在两版 Node 下各 13/13 的隔离 PostgreSQL 集成，以及语法、拓扑、前端、仓库卫生和 92 文件 Extension 生产快照门禁；门禁前后工作区状态一致。实现由 PR #22 跟踪，但不是生产操作指令且尚未部署；拆分上线继续受 P2-D、P2-E 和另行发布授权阻断。
+P2-D PR #23 候选增加冻结在 `main@c47800f` 的 v066 checksum 基线、数据库迁移 advisory lock、显式 legacy checksum adoption、`067_maintenance_runs.sql`、Maintenance CLI，以及 split 角色的 checksum readiness。独立角色只读核对全部非 reset 迁移的版本与 checksum，不运行迁移或 bootstrap；兼容 `all` 暂时保留受锁迁移和原有 immediate/15 秒/25 秒维护时序。legacy sql.js import 与 comments workflow backfill 已进入 offline allowlist/锁/ledger，旧 JS 直接入口禁用；SAIC-GM once 的 prior failed/running 会要求保持停机并恢复任务前整库备份，禁止自动重跑或切回旧 `all`；带参数的 Extension CSV importer 仅在 `--commit` 时进入 maintenance/offline/锁/readiness 边界，但仍需单独授权且不写 ledger；tenant-specific repair SQL 只保留历史证据，禁止直接生产执行。Node 24 与生产 Node 18 本地回归各为 1289/1289，隔离 PostgreSQL 17 在两版 Node 下各为 25/25；`adbb47f` 已有两组远端 CI 合计 12/12 全绿证据，任何晚于它的 head 必须使用自身对应 CI。该证据不代表 PR 已合并或代码已部署。生产拓扑仍为单一 `all`，split 上线继续受 PR #23 实时交付状态、P2-E 演练和另行发布授权阻断。
 
 ### 1. 服务端
 
@@ -94,11 +94,11 @@ PostgreSQL
 cd server
 cp .env.example .env
 npm install
-npm run migrate
+PROCESS_ROLE=maintenance npm run maintenance -- migrate
 npm run dev
 ```
 
-默认服务端端口为 `3001`。请确保 `DATABASE_URL` 指向本地或明确授权的测试数据库。
+默认服务端端口为 `3001`。请确保 `DATABASE_URL` 指向本地或明确授权的测试数据库。生产 Maintenance 除 `PROCESS_ROLE=maintenance` 外还必须从受控环境获得显式、非空的 `DATABASE_URL`；缺失或只含空白会在取得任何锁或访问数据库前以 `MAINTENANCE_DATABASE_URL_REQUIRED` 拒绝，不使用本地兜底。已有 v066 数据库首次使用 P2-D 候选时，不会自动信任历史迁移文件；只能在确认基线和备份后显式运行 `PROCESS_ROLE=maintenance npm run maintenance -- migrate --adopt-v066-checksums`。该首次 adoption 锚定的是 `main@c47800f` 中冻结的文件字节，不能反向证明历史环境实际执行过的字节完全相同。
 
 ### 2. 管理后台
 
@@ -155,9 +155,9 @@ scripts/package-extension.zsh
 - PostgreSQL 数据库：`onstarvoice`
 - 管理后台：`/admin`
 - 独立看板：`/dashboard`
-- 生产健康检查：`/api/health`（P2-C 的 `/api/health/live`、`/api/health/ready` 尚未部署）
+- 生产健康检查：`/api/health`（`main@c47800f` 已包含的 `/api/health/live`、`/api/health/ready` 尚未部署）
 
-现有 `deploy/deploy.sh` 不是原子发布：它只构建主管理后台，不构建独立 Dashboard；它不会自动创建生产备份，也会通过删除再启动 PM2 产生短暂中断。生产操作必须以 [开发运行与生产发布手册](docs/开发运行与生产发布手册.md) 为准。
+`deploy/deploy.sh` 已退役为 fail-closed 墓碑入口：会在任何构建、网络连接或文件写入前提示受控手册并退出 64。历史非原子行为仅保留在文档中作审计；生产操作必须以 [开发运行与生产发布手册](docs/开发运行与生产发布手册.md) 为准。
 
 ## 文档入口
 

@@ -1,9 +1,10 @@
 import { startAiCronJobs } from '../cron.js';
-import { execute, queryAll, queryOne } from '../db/init.js';
+import { execute, queryAll } from '../db/init.js';
 import { probeDeepSeekPrimaryModel, labelRecord } from '../services/ai-labeler.js';
 import { runAiFailoverRecoverySweep } from '../services/ai-failover.js';
 import { backfillRecentCovers, backfillRecentImages } from '../services/media-store.js';
 import { failStaleAnalyses } from '../services/opinion-analysis.js';
+import { startCompatibilityStartupMaintenance } from '../maintenance/compatibility-startup.js';
 import { createDrainController } from './drain-controller.js';
 
 export const AI_MEDIA_RUNTIME_RESPONSIBILITIES = Object.freeze([
@@ -28,7 +29,6 @@ const DEFAULT_JOBS = Object.freeze({
   probeDeepSeekPrimaryModel,
   labelRecord,
   queryAll,
-  queryOne,
   execute,
   async loadCommentWorkflow() {
     return import('../services/comment-workflow.js');
@@ -58,6 +58,8 @@ export function startAiMediaRuntime({
   setTimer = setTimeout,
   clearTimer = clearTimeout,
   createDrain = createDrainController,
+  startCompatibilityMaintenance = startCompatibilityStartupMaintenance,
+  maintenanceTaskRunner,
 } = {}) {
   if (typeof setTimer !== 'function' || typeof clearTimer !== 'function') {
     throw new TypeError('setTimer and clearTimer must be functions');
@@ -93,40 +95,6 @@ export function startAiMediaRuntime({
     schedule(initialDelayMs, runOnce);
   }
 
-  async function reprocessCommentsAndSafetyLabels() {
-    const workflow = await jobs.loadCommentWorkflow();
-    await workflow.reprocessPendingComments();
-
-    const flag = 'comment_safety_semantic_reclassify_v1';
-    const done = await jobs.queryOne(
-      'SELECT 1 FROM schema_migrations WHERE version = $1',
-      [flag],
-    );
-    if (done) return;
-    const stats = await workflow.reclassifyComments(null, {
-      safetySemanticReviewCandidatesOnly: true,
-      queueForAI: true,
-    });
-    await jobs.execute(
-      'INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING',
-      [flag],
-    );
-    safeLog(
-      logger,
-      'log',
-      `[CommentSafety] 存量评论已重新排入 AI 语义分类:${stats.changed} 条`,
-    );
-  }
-
-  async function backfillRecentMedia() {
-    const [covers, images] = await Promise.all([
-      jobs.backfillRecentCovers(),
-      jobs.backfillRecentImages(),
-    ]);
-    if (covers) safeLog(logger, 'log', `[CoverStore] 启动回填:尝试 ${covers} 条封面落地`);
-    if (images) safeLog(logger, 'log', `[ImageStore] 启动回填:尝试 ${images} 条正文图片落地`);
-  }
-
   async function drainCommentAi() {
     const workflow = await jobs.loadCommentWorkflow();
     let total = 0;
@@ -147,44 +115,19 @@ export function startAiMediaRuntime({
     }
   }
 
-  async function relabelSaicgmScope() {
-    const flag = 'relabel_saicgm_scope_v3';
-    const done = await jobs.queryAll(
-      'SELECT 1 FROM schema_migrations WHERE version = $1',
-      [flag],
-    );
-    if (done.length) return;
-    const records = await jobs.queryAll(
-      "SELECT id FROM records WHERE ai_result->>'relevance' = 'irrelevant'",
-    );
-    if (records.length) {
-      safeLog(logger, 'log', `[Relabel] 上汽通用范围放宽:重判 ${records.length} 条原判无关的记录`);
-      for (const record of records) {
-        try {
-          await jobs.labelRecord(record.id, { force: true });
-        } catch (error) {
-          safeLog(logger, 'error', '[Relabel]', record.id, error?.message || error);
-        }
-      }
-    }
-    await jobs.execute(
-      'INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING',
-      [flag],
-    );
-    safeLog(logger, 'log', '[Relabel] 完成');
-  }
-
   scheduleRecurring(20_000, 15_000, 'CommentRefine', drainCommentAi);
   scheduleRecurring(60_000, 60_000, 'AIFailover', checkAiFailoverRecovery);
 
-  // These historical startup repairs are not safe to run in split mode: they
-  // lack an owner/lease and can mistake another process's work for stale work.
-  // They stay compatibility-only until Maintenance/P2-D gives them one owner.
+  // Keep the legacy `all` schedule through an explicit Maintenance adapter.
+  // Split AI/Media never invokes this adapter and therefore owns no one-shots.
   if (compatibilityMode) {
-    void runTracked('OpinionAnalysis', () => jobs.failStaleAnalyses());
-    schedule(15_000, () => runTracked('Reprocess', reprocessCommentsAndSafetyLabels));
-    schedule(25_000, () => runTracked('MediaBackfill', backfillRecentMedia));
-    schedule(25_000, () => runTracked('Relabel', relabelSaicgmScope));
+    startCompatibilityMaintenance({
+      jobs,
+      logger,
+      schedule,
+      runTracked,
+      taskRunner: maintenanceTaskRunner,
+    });
   }
 
   function stopNewWork() {
