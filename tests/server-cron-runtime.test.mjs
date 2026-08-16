@@ -137,6 +137,7 @@ test('drain controller exposes the Node 18 compatible bounded lifecycle contract
 
 test('scheduler cron owns only scheduler work and every task is non-overlapping', async () => {
   const fakeCron = createFakeCron();
+  const sequence = [];
   let reconcileCalls = 0;
   let patrolCalls = 0;
   const runtime = startSchedulerCronJobs({
@@ -145,10 +146,12 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
     jobs: safeJobs({
       async reconcilePendingCaptureCommands() {
         reconcileCalls += 1;
+        sequence.push('reconcile');
         return {commandCount: 0};
       },
       async enqueueDueProfilePatrolTasks(limit) {
         patrolCalls += 1;
+        sequence.push('profile-patrol');
         assert.equal(limit, 20);
         return [];
       },
@@ -174,6 +177,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   await fakeCron.registrations[1].task.fire();
   assert.equal(reconcileCalls, 1);
   assert.equal(patrolCalls, 1);
+  assert.deepEqual(sequence, ['reconcile', 'profile-patrol']);
 
   assert.equal(runtime.stop(), true);
   assert.equal(runtime.stop(), false);
@@ -187,6 +191,116 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   assert.equal(runtime.destroy(), true);
   assert.equal(runtime.destroy(), false);
   assert.ok(fakeCron.registrations.every(item => item.task.destroyCalls === 1));
+});
+
+test('scheduler recovery preserves reconciliation and dispatch ordering', async () => {
+  const fakeCron = createFakeCron();
+  const sequence = [];
+  const runtime = startSchedulerCronJobs({
+    cronModule: fakeCron,
+    logger: quietLogger(),
+    jobs: safeJobs({
+      async reconcilePendingCaptureCommands() {
+        sequence.push('reconcile');
+        return {commandCount: 1};
+      },
+      async enqueueDueCaptureOrchestrations(limit) {
+        sequence.push(`orchestration:${limit}`);
+        return [];
+      },
+      async reconcileElasticCaptureLeases(limit) {
+        sequence.push(`elastic:${limit}`);
+        return {requeued: 0};
+      },
+      async reconcileAutomaticCaptureRetries(limit) {
+        sequence.push(`automatic:${limit}`);
+        return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
+      },
+    }),
+  });
+
+  await fakeCron.registrations[2].task.fire();
+  assert.deepEqual(sequence, [
+    'reconcile',
+    'orchestration:20',
+    'elastic:50',
+    'automatic:10',
+  ]);
+  runtime.destroy();
+});
+
+test('profile patrol stops when command reconciliation fails', async () => {
+  const fakeCron = createFakeCron();
+  const sequence = [];
+  const errors = [];
+  const runtime = startSchedulerCronJobs({
+    cronModule: fakeCron,
+    logger: {
+      log() {},
+      error(...args) {
+        errors.push(args);
+      },
+    },
+    jobs: safeJobs({
+      async reconcilePendingCaptureCommands() {
+        sequence.push('reconcile');
+        throw new Error('reconciliation failed');
+      },
+      async enqueueDueProfilePatrolTasks() {
+        sequence.push('profile-patrol');
+        return [];
+      },
+    }),
+  });
+
+  await fakeCron.registrations[1].task.fire();
+  assert.deepEqual(sequence, ['reconcile']);
+  assert.deepEqual(errors, [[
+    '[Cron] Profile patrol enqueue error:',
+    'reconciliation failed',
+  ]]);
+  runtime.destroy();
+});
+
+test('scheduler recovery stops when command reconciliation fails', async () => {
+  const fakeCron = createFakeCron();
+  const sequence = [];
+  const errors = [];
+  const runtime = startSchedulerCronJobs({
+    cronModule: fakeCron,
+    logger: {
+      log() {},
+      error(...args) {
+        errors.push(args);
+      },
+    },
+    jobs: safeJobs({
+      async reconcilePendingCaptureCommands() {
+        sequence.push('reconcile');
+        throw new Error('reconciliation failed');
+      },
+      async enqueueDueCaptureOrchestrations() {
+        sequence.push('orchestration');
+        return [];
+      },
+      async reconcileElasticCaptureLeases() {
+        sequence.push('elastic');
+        return {requeued: 0};
+      },
+      async reconcileAutomaticCaptureRetries() {
+        sequence.push('automatic');
+        return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
+      },
+    }),
+  });
+
+  await fakeCron.registrations[2].task.fire();
+  assert.deepEqual(sequence, ['reconcile']);
+  assert.deepEqual(errors, [[
+    '[Cron] Multi-Agent schedule/recovery error:',
+    'reconciliation failed',
+  ]]);
+  runtime.destroy();
 });
 
 test('AI cron owns batch labeling and configured reports only', async () => {

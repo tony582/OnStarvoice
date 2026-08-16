@@ -31,6 +31,9 @@ import {getTenantAiAdmissionSnapshot} from '../services/ai-admission.js';
 import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
+import {
+  createPendingCaptureCommandReconciler,
+} from '../modules/capture/application/command-lifecycle.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -1367,34 +1370,23 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
   return [...expired, ...unavailable, ...obsolete];
 }
 
-let pendingCommandReconciliation = null;
-
-export async function reconcilePendingCaptureCommands({tenantLimit = 100} = {}) {
-  if (pendingCommandReconciliation) return pendingCommandReconciliation;
-  const limit = Math.max(1, Math.min(500, Number(tenantLimit) || 100));
-  pendingCommandReconciliation = (async () => {
-    const tenants = await queryAll(`
+const reconcilePendingCaptureCommandsImpl =
+  createPendingCaptureCommandReconciler({
+    listPendingTenants: limit => queryAll(`
       SELECT tenant_id, MIN(created_at) AS oldest_command_at
       FROM capture_agent_commands
       WHERE status IN ('pending', 'acknowledged')
       GROUP BY tenant_id
       ORDER BY MIN(created_at), tenant_id
       LIMIT $1
-    `, [limit]);
-    let commandCount = 0;
-    for (const tenant of tenants) {
-      const reconciled = await withTransaction(tx =>
-        expireStaleCommands(tx, tenant.tenant_id)
-      );
-      commandCount += reconciled.length;
-    }
-    return {tenantCount: tenants.length, commandCount};
-  })();
-  try {
-    return await pendingCommandReconciliation;
-  } finally {
-    pendingCommandReconciliation = null;
-  }
+    `, [limit]),
+    withTransaction,
+    expireTenantCommands: (tx, tenantId) =>
+      expireStaleCommands(tx, tenantId),
+  });
+
+export async function reconcilePendingCaptureCommands(options = {}) {
+  return reconcilePendingCaptureCommandsImpl(options);
 }
 
 async function resolveResumeCommandFromSuccessor(tx, agent, snapshot) {
