@@ -25,6 +25,7 @@ const tests = entries
   .map(entry => path.join(integrationRoot, entry.name))
   .sort();
 const requiredTestFiles = [
+  'capture-automatic-recovery.integration.mjs',
   'capture-command-reconciliation.integration.mjs',
   'capture-elastic-lease-reconciliation.integration.mjs',
   'http-auth.integration.mjs',

@@ -87,6 +87,13 @@ const leaseReconciliationSource = await readFile(
   ),
   "utf8",
 );
+const automaticRecoverySource = await readFile(
+  new URL(
+    "../server/modules/capture/application/automatic-recovery.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function readRouteSection(startMarker, endMarker) {
   const start = captureCloudRouteSource.indexOf(startMarker);
@@ -4181,7 +4188,7 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   const dispatchCore = captureCloudRouteSource.slice(
     captureCloudRouteSource.indexOf("async function dispatchCrossDeviceRetry"),
     captureCloudRouteSource.indexOf(
-      "export async function reconcileAutomaticCaptureRetries",
+      "async function listAutomaticCaptureRetryCandidates",
     ),
   );
   const idleAgentSelection = captureCloudRouteSource.slice(
@@ -4607,7 +4614,15 @@ test("recovery verification and replay clocks require exact business evidence", 
 test("legacy retry remains only as a fallback outside guarded duty Agent tenants", () => {
   assert.match(
     captureCloudRouteSource,
-    /export async function reconcileAutomaticCaptureRetries/u,
+    /createAutomaticCaptureRetryReconciler\(\{[\s\S]*listCandidates: listAutomaticCaptureRetryCandidates,[\s\S]*dispatchRetry: dispatchCrossDeviceRetry/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /createRequestKey: \(\) => crypto\.randomUUID\(\)[\s\S]*formatErrorMessage: message => text\(message, 240\)/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /export async function reconcileAutomaticCaptureRetries\(input = 10\)[\s\S]*invalid_tenant_id[\s\S]*invalid_task_scope[\s\S]*return reconcileAutomaticCaptureRetriesImpl\(\{[\s\S]*tenantId,[\s\S]*taskIds,[\s\S]*maxDispatchesPerTask,[\s\S]*requestedByName/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -4633,6 +4648,15 @@ test("legacy retry remains only as a fallback outside guarded duty Agent tenants
     captureCloudRouteSource,
     /\$7::boolean = false[\s\S]*recovery_enabled\.key = 'ops_control_recovery_enabled'[\s\S]*LOWER\(BTRIM\(recovery_mode\.value\)\) = 'guarded'/u,
   );
+  assert.match(
+    automaticRecoverySource,
+    /normalizeCandidateLimit\(options\.limit\)[\s\S]*for \(const candidate of candidates\)[\s\S]*allocation < dispatchLimit[\s\S]*dispatchCandidateRetry/u,
+  );
+  assert.match(
+    automaticRecoverySource,
+    /idle_compatible_agent_unavailable[\s\S]*MANUAL_ONLY_ERRORS[\s\S]*CONFLICT_ERROR_CODES[\s\S]*worker_error/u,
+  );
+  assert.doesNotMatch(automaticRecoverySource, /pendingReconciliation/u);
   assert.match(
     cronSource,
     /reconcileAutomaticCaptureRetries\(10\)/u,
