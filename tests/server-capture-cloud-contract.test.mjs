@@ -56,6 +56,13 @@ const commandLifecycleSource = await readFile(
   ),
   "utf8",
 );
+const leaseReconciliationSource = await readFile(
+  new URL(
+    "../server/modules/capture/application/lease-reconciliation.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function readRouteSection(startMarker, endMarker) {
   const start = captureCloudRouteSource.indexOf(startMarker);
@@ -1328,8 +1335,8 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
 
 test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
   const lease = readRouteSection(
-    'export async function reconcileElasticCaptureLeases',
-    'export async function reconcileAutomaticCaptureRetries',
+    'async function listElasticCaptureLeaseCandidates',
+    'const reconcileElasticCaptureLeasesImpl',
   );
   assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
   assert.match(lease, /agent\.last_heartbeat_at/u);
@@ -1339,7 +1346,35 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   assert.match(lease, /status: 'retryable'/u);
   assert.match(lease, /elastic_agent_offline_timeout/u);
   assert.match(lease, /FOR UPDATE SKIP LOCKED/u);
+  assert.match(lease, /FOR UPDATE OF child SKIP LOCKED/u);
+  assert.equal(
+    lease.match(
+      /command\.status IN \('pending', 'acknowledged'\)/gu,
+    )?.length,
+    2,
+  );
+  assert.ok(
+    lease.indexOf('SELECT id') <
+      lease.indexOf('SELECT child.*, agent.last_heartbeat_at'),
+  );
+  assert.ok(
+    lease.indexOf('await projectOrchestrationChildControlOutcome') <
+      lease.indexOf('await appendEvent'),
+  );
   assert.doesNotMatch(lease, /child\.metadata->>'cloudWorkQueue'/u);
+  assert.match(
+    leaseReconciliationSource,
+    /normalizeCandidateLimit\(limit\)[\s\S]*for \(const candidate of candidates\)[\s\S]*runTransaction\(tx =>[\s\S]*settleLeaseCandidate\(tx, candidate\)/u,
+  );
+  assert.doesNotMatch(leaseReconciliationSource, /pendingReconciliation/u);
+  assert.match(
+    captureCloudRouteSource,
+    /createElasticCaptureLeaseReconciler\(\{[\s\S]*listCandidates: listElasticCaptureLeaseCandidates,[\s\S]*settleCandidate: settleElasticCaptureLeaseCandidate/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /export async function reconcileElasticCaptureLeases\(limit = 50\)[\s\S]*return reconcileElasticCaptureLeasesImpl\(limit\)/u,
+  );
   assert.match(
     captureCloudRouteSource,
     /COALESCE\(metadata->>'distributionMode', ''\) <> 'elastic_pool'/u,
