@@ -4,7 +4,7 @@ StarVoice 是一套面向企业客户的多平台社交舆情采集、任务调�
 
 > P2-A1 的合并与发布来源锚点为 `0ec5508`。2026-08-14 生产核对值为 Extension `0.3.83`、数据库迁移 `066_tenant_comment_risk_attention.sql`；生产中纳入 Git 的 Server 文件，是 `236aa4d` 完整基线叠加来自 `0ec5508` 的 4 个白名单文件，不是完整 `0ec5508` 树。精确清单见 [开发运行与生产发布手册](docs/开发运行与生产发布手册.md#14-2026-08-14-p2-a1-限定生产快照)。
 >
-> 截至 2026-08-16，[PR #24](https://github.com/tony582/OnStarvoice/pull/24) 已合并为 `main@a5faf6b0f80b080b371f0ee1ef657ab8b29fb707`，但 P2-B/P2-C/P2-D/P2-E **均未因此部署生产**；生产仍为迁移 066、单一 `all`，未启用 split。在此前 P2-E-L 本机隔离门禁通过后，P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 又在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下完成真实本机 PM2/Nginx、`all → split → all`、canary 与备份恢复：`all` 在 `60.181/300.794/646.675s` 观察通过，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）为 `1/1/0/0`；split 在 `60.107/300.549s` 观察通过，其下一次 AI 周期在 `599.115s` 出现且摘要同为 `1/1/0/0`；v066 dump 已实际恢复验证，v067 最终 dump 恢复后的 canary digest 相等，清理项全为 `true`，生产未触碰。P2-E-HL 不是 Hosted 测试服务器；split 的 `599.115s` 是 rearm 后遇到的下一次计划周期，不是完整满 10 分钟。P2-E-H 仍未执行，P2-E 整体仅部分完成，生产 split 阻断保留。
+> 截至 2026-08-16，[PR #25](https://github.com/tony582/OnStarvoice/pull/25) 已以 merge commit `fcc876d9ce4822943e5df837674e517495674161` 进入 `main`；最终 head `e6a48571985c91a8fcc02b8d7252e0f8950964c4` 的 push/PR 两组 CI 共 12/12、合并后 `main` CI 6/6 均通过。该合并及 P2-B/P2-C/P2-D/P2-E **均未因此部署生产**；生产仍为迁移 066、单一 `all`，未启用 split。在此前 P2-E-L 本机隔离门禁通过后，P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 又在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下完成真实本机 PM2/Nginx、`all → split → all`、canary 与备份恢复：`all` 在 `60.181/300.794/646.675s` 观察通过，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）为 `1/1/0/0`；split 在 `60.107/300.549s` 观察通过，其下一次 AI 周期在 `599.115s` 出现且摘要同为 `1/1/0/0`；v066 dump 已实际恢复验证，v067 最终 dump 恢复后的 canary digest 相等，清理项全为 `true`，生产未触碰。P2-E-HL 不是 Hosted 测试服务器；split 的 `599.115s` 是 rearm 后遇到的下一次计划周期，不是完整满 10 分钟。P2-E-H 仍未执行，P2-E 整体仅部分完成，G2 尚未关闭，P3 尚未开始，生产 split 阻断保留。
 >
 > “稳定基线”表示当前主链路已经形成可交接、可回归、可发布的版本锚点，不表示所有能力都已脱离 Beta。调度中心、多 Agent 接力、无人值守、平台风控识别和依赖页面 DOM 的采集仍需按客户环境逐项验收。
 
@@ -84,7 +84,7 @@ PostgreSQL
 
 ## 本地快速启动
 
-当前标准本地启动仍使用兼容 `all` 入口。`main@a5faf6b` 已包含 `api`、`scheduler`、`ai-media` 三个独立入口，以及兼容 `/api/health` 的 `/api/health/live`、`/api/health/ready` 语义；响应后继续执行的进程内后台工作也已纳入统一的有界 drain。这些能力尚未部署生产。
+当前标准本地启动仍使用兼容 `all` 入口。PR #25 的 P2-E-HL 代码合并基线 `fcc876d` 已包含 `api`、`scheduler`、`ai-media` 三个独立入口，以及兼容 `/api/health` 的 `/api/health/live`、`/api/health/ready` 语义；响应后继续执行的进程内后台工作也已纳入统一的有界 drain。这些能力尚未部署生产。
 
 P2-D 已随 PR #23 进入主线，增加冻结在 `main@c47800f` 的 v066 checksum 基线、数据库迁移 advisory lock、显式 legacy checksum adoption、`067_maintenance_runs.sql`、Maintenance CLI，以及 split 角色的 checksum readiness。独立角色只读核对全部非 reset 迁移的版本与 checksum，不运行迁移或 bootstrap；兼容 `all` 暂时保留受锁迁移和原有 immediate/15 秒/25 秒维护时序。legacy sql.js import 与 comments workflow backfill 已进入 offline allowlist/锁/ledger，旧 JS 直接入口禁用；SAIC-GM once 的 prior failed/running 会要求保持停机并恢复任务前整库备份，禁止自动重跑或切回旧 `all`；带参数的 Extension CSV importer 仅在 `--commit` 时进入 maintenance/offline/锁/readiness 边界，但仍需单独授权且不写 ledger；tenant-specific repair SQL 只保留历史证据，禁止直接生产执行。P2-D 的历史验证证据仍绑定其对应提交，不能冒充 P2-E 或生产证据。生产拓扑仍为单一 `all`，split 上线继续受 P2-E-H、生产前置核对和另行发布授权阻断。
 
