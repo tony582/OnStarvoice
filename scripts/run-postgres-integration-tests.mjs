@@ -26,6 +26,7 @@ const tests = entries
   .sort();
 const requiredTestFiles = [
   'capture-command-reconciliation.integration.mjs',
+  'capture-elastic-lease-reconciliation.integration.mjs',
   'http-auth.integration.mjs',
   'maintenance-entrypoint.integration.mjs',
   'migration-governance.integration.mjs',
