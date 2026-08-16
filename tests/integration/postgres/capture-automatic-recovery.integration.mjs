@@ -23,6 +23,7 @@ const requireFromServer = createRequire(
   path.join(repositoryRoot, 'server', 'package.json'),
 );
 const {Client} = requireFromServer('pg');
+const forcedCloseClients = new WeakSet();
 
 function restoreEnvironment(name, value) {
   if (value === undefined) delete process.env[name];
@@ -40,12 +41,214 @@ async function withTimeout(promise, timeoutMs, message) {
     return await Promise.race([
       promise,
       new Promise((resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        timer = setTimeout(() => {
+          const error = new Error(message);
+          error.code = 'P3_AUTOMATIC_TIMEOUT';
+          reject(error);
+        }, timeoutMs);
       }),
     ]);
   } finally {
     clearTimeout(timer);
   }
+}
+
+function destroyClientStream(client) {
+  if (client && !forcedCloseClients.has(client)) {
+    client.on('error', () => {});
+    forcedCloseClients.add(client);
+  }
+  if (!client?.connection?.stream?.destroyed) {
+    client.connection?.stream?.destroy();
+  }
+}
+
+async function runBoundedClientStep({
+  client,
+  promise,
+  timeoutMs,
+  message,
+}) {
+  try {
+    return await withTimeout(promise, timeoutMs, message);
+  } catch (error) {
+    if (error?.code !== 'P3_AUTOMATIC_TIMEOUT') throw error;
+    destroyClientStream(client);
+    try {
+      await withTimeout(
+        Promise.allSettled([promise]),
+        timeoutMs,
+        `${message}; operation did not settle after stream destroy`,
+      );
+    } catch (settlementError) {
+      throw new AggregateError(
+        [error, settlementError],
+        `${message}; forced settlement failed`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function connectBoundedClient(client, timeoutMs, label) {
+  const connectPromise = client.connect();
+  try {
+    await runBoundedClientStep({
+      client,
+      promise: connectPromise,
+      timeoutMs,
+      message: `Timed out connecting ${label}`,
+    });
+  } catch (error) {
+    destroyClientStream(client);
+    throw error;
+  }
+}
+
+async function closeBoundedClient(client, timeoutMs, label) {
+  if (!client || client.connection?.stream?.destroyed) return;
+  const endPromise = client.end();
+  try {
+    await runBoundedClientStep({
+      client,
+      promise: endPromise,
+      timeoutMs,
+      message: `Timed out closing ${label}`,
+    });
+  } catch (error) {
+    destroyClientStream(client);
+    throw error;
+  }
+}
+
+async function closeOwnedPoolClients(
+  pool,
+  poolApplicationName,
+  timeoutMs = 5000,
+) {
+  const clients = Array.isArray(pool?._clients) ? pool._clients : [];
+  const ownedClients = clients.filter(client =>
+    client?.connectionParameters?.application_name === poolApplicationName,
+  );
+  const results = await Promise.allSettled(ownedClients.map(async client => {
+    if (client._connecting && !client._connected) {
+      destroyClientStream(client);
+    } else {
+      const endPromise = client.end();
+      await runBoundedClientStep({
+        client,
+        promise: endPromise,
+        timeoutMs,
+        message: `Timed out hard-closing ${poolApplicationName} pool client`,
+      });
+    }
+    const removalDeadline = Date.now() + timeoutMs;
+    while (pool._clients.includes(client)) {
+      if (Date.now() >= removalDeadline) {
+        throw new Error(
+          `Timed out removing ${poolApplicationName} pool client`,
+        );
+      }
+      await delay(20);
+    }
+  }));
+  const errors = results
+    .filter(result => result.status === 'rejected')
+    .map(result => result.reason);
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      `Failed to hard-close ${poolApplicationName} pool clients`,
+    );
+  }
+  return ownedClients.length;
+}
+
+async function withCleanupClient({
+  databaseUrl,
+  applicationName,
+  operation,
+  timeoutMs = 5000,
+}) {
+  const client = new Client({
+    connectionString: databaseUrl,
+    application_name: applicationName,
+    connectionTimeoutMillis: timeoutMs * 2,
+    query_timeout: timeoutMs * 2,
+  });
+  const errors = [];
+  let result;
+  let connected = false;
+  try {
+    await connectBoundedClient(client, timeoutMs, applicationName);
+    connected = true;
+    const operationPromise = Promise.resolve().then(() => operation(client));
+    result = await runBoundedClientStep({
+      client,
+      promise: operationPromise,
+      timeoutMs,
+      message: `Timed out running cleanup through ${applicationName}`,
+    });
+  } catch (error) {
+    errors.push(error);
+  }
+  if (connected) {
+    try {
+      await closeBoundedClient(client, timeoutMs, applicationName);
+    } catch (error) {
+      errors.push(error);
+    }
+  } else {
+    destroyClientStream(client);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, `${applicationName} cleanup client failed`);
+  }
+  return result;
+}
+
+async function terminateOwnedPoolSessions({
+  databaseUrl,
+  poolApplicationName,
+  controlApplicationName,
+}) {
+  await withCleanupClient({
+    databaseUrl,
+    applicationName: controlApplicationName,
+    timeoutMs: 5000,
+    async operation(client) {
+      const deadline = Date.now() + 4000;
+      let stableZeroSnapshots = 0;
+      while (Date.now() < deadline) {
+        await client.query(`
+          SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND application_name = $1
+            AND pid <> pg_backend_pid()
+        `, [poolApplicationName]);
+        await client.query('SELECT pg_stat_clear_snapshot()');
+        const remaining = await client.query(`
+          SELECT count(*)::integer AS count
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND application_name = $1
+            AND pid <> pg_backend_pid()
+        `, [poolApplicationName]);
+        if (remaining.rows[0].count === 0) {
+          stableZeroSnapshots += 1;
+          if (stableZeroSnapshots >= 2) return;
+        } else {
+          stableZeroSnapshots = 0;
+        }
+        await delay(20);
+      }
+      throw new Error(
+        'P3 automatic recovery cleanup could not release its pool sessions',
+      );
+    },
+  });
 }
 
 async function waitForRootLockWaiters(
@@ -460,9 +663,10 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
   });
   const token = randomUUID().replaceAll('-', '').slice(0, 16);
   const applicationPrefix = `p3-automatic-${token}`;
+  const poolApplicationName = `${applicationPrefix}-pool`;
   const originalApplicationName = process.env.PGAPPNAME;
   const originalPoolMax = process.env.PG_POOL_MAX;
-  process.env.PGAPPNAME = `${applicationPrefix}-pool`;
+  process.env.PGAPPNAME = poolApplicationName;
   process.env.PG_POOL_MAX = '2';
 
   let pool;
@@ -488,72 +692,149 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
     };
 
     if (blockerClient && blockerTransactionOpen) {
-      await attemptCleanup(() => blockerClient.query('ROLLBACK'));
+      await attemptCleanup(() => runBoundedClientStep({
+        client: blockerClient,
+        promise: blockerClient.query('ROLLBACK'),
+        timeoutMs: 5000,
+        message: 'Timed out rolling back the automatic recovery blocker',
+      }));
       blockerTransactionOpen = false;
     }
     if (blockerClient) {
       const clientToClose = blockerClient;
       blockerClient = null;
-      await attemptCleanup(() => withTimeout(
-        clientToClose.end(),
+      await attemptCleanup(() => closeBoundedClient(
+        clientToClose,
         5000,
-        'Timed out closing the automatic recovery blocker client',
-      ));
-      if (!clientToClose.connection?.stream?.destroyed) {
-        clientToClose.connection?.stream?.destroy();
-      }
-    }
-    await attemptCleanup(() => withTimeout(
-      Promise.allSettled(reconciliationPromises),
-      10000,
-      'Timed out settling automatic recovery promises',
-    ));
-    if (pool && rollbackProbe) {
-      await attemptCleanup(() => pool.query(
-        `DROP TRIGGER IF EXISTS ${quoteProbeIdentifier(rollbackProbe.trigger)} ON capture_task_events`,
-      ));
-      await attemptCleanup(() => pool.query(
-        `DROP FUNCTION IF EXISTS ${quoteProbeIdentifier(rollbackProbe.function)}()`,
-      ));
-      rollbackProbe = null;
-    }
-    if (pool && tenantId) {
-      await attemptCleanup(() => pool.query(
-        'DELETE FROM tenants WHERE id = $1',
-        [tenantId],
+        'the automatic recovery blocker client',
       ));
     }
-    await attemptCleanup(closePool);
-    restoreEnvironment('PGAPPNAME', originalApplicationName);
-    restoreEnvironment('PG_POOL_MAX', originalPoolMax);
-
-    const verifier = new Client({
-      connectionString: target.rawUrl,
-      application_name: `${applicationPrefix}-cleanup`,
-      query_timeout: 5000,
-    });
+    const closePoolPromise = pool ? closePool() : Promise.resolve();
+    closePoolPromise.catch(() => {});
+    let reconciliationsSettled = false;
     try {
-      await verifier.connect();
-      const active = await verifier.query(`
-        SELECT count(*)::integer AS count
-        FROM pg_stat_activity
-        WHERE application_name LIKE $1
-          AND pid <> pg_backend_pid()
-      `, [`${applicationPrefix}%`]);
-      assert.equal(
-        active.rows[0].count,
-        0,
-        'P3 automatic recovery test left a PostgreSQL session open',
+      await withTimeout(
+        Promise.allSettled(reconciliationPromises),
+        10000,
+        'Timed out settling automatic recovery promises',
       );
+      reconciliationsSettled = true;
     } catch (error) {
       cleanupErrors.push(error);
-    } finally {
+    }
+    if (!reconciliationsSettled) {
+      await attemptCleanup(() => terminateOwnedPoolSessions({
+        databaseUrl: target.rawUrl,
+        poolApplicationName,
+        controlApplicationName: `${applicationPrefix}-settlement-control`,
+      }));
+      let settledAfterTermination = false;
       try {
-        await verifier.end();
+        await withTimeout(
+          Promise.allSettled(reconciliationPromises),
+          5000,
+          'Timed out settling automatic recovery promises after termination',
+        );
+        settledAfterTermination = true;
       } catch (error) {
         cleanupErrors.push(error);
       }
+      if (!settledAfterTermination) {
+        await attemptCleanup(() => closeOwnedPoolClients(
+          pool,
+          poolApplicationName,
+        ));
+        await attemptCleanup(() => withTimeout(
+          Promise.allSettled(reconciliationPromises),
+          5000,
+          'Timed out settling automatic recovery promises after hard close',
+        ));
+      }
     }
+
+    await attemptCleanup(() => withCleanupClient({
+      databaseUrl: target.rawUrl,
+      applicationName: `${applicationPrefix}-resource-cleanup`,
+      timeoutMs: 10000,
+      async operation(client) {
+        if (rollbackProbe) {
+          await client.query(
+            `DROP TRIGGER IF EXISTS ${quoteProbeIdentifier(rollbackProbe.trigger)} ON capture_task_events`,
+          );
+          await client.query(
+            `DROP FUNCTION IF EXISTS ${quoteProbeIdentifier(rollbackProbe.function)}()`,
+          );
+        }
+        if (tenantId) {
+          await client.query('DELETE FROM tenants WHERE id = $1', [tenantId]);
+        }
+      },
+    }));
+    rollbackProbe = null;
+
+    if (pool) {
+      let poolClosed = false;
+      try {
+        await withTimeout(
+          closePoolPromise,
+          5000,
+          'Timed out closing the automatic recovery pool',
+        );
+        poolClosed = true;
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (!poolClosed) {
+        await attemptCleanup(() => terminateOwnedPoolSessions({
+          databaseUrl: target.rawUrl,
+          poolApplicationName,
+          controlApplicationName: `${applicationPrefix}-pool-close-control`,
+        }));
+        try {
+          await withTimeout(
+            closePoolPromise,
+            5000,
+            'Timed out closing the automatic recovery pool after termination',
+          );
+          poolClosed = true;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (!poolClosed) {
+        await attemptCleanup(() => closeOwnedPoolClients(
+          pool,
+          poolApplicationName,
+        ));
+        await attemptCleanup(() => withTimeout(
+          closePoolPromise,
+          5000,
+          'Timed out closing the automatic recovery pool after hard close',
+        ));
+      }
+    }
+    restoreEnvironment('PGAPPNAME', originalApplicationName);
+    restoreEnvironment('PG_POOL_MAX', originalPoolMax);
+
+    await attemptCleanup(() => withCleanupClient({
+      databaseUrl: target.rawUrl,
+      applicationName: `${applicationPrefix}-verifier`,
+      timeoutMs: 5000,
+      async operation(verifier) {
+        const active = await verifier.query(`
+          SELECT count(*)::integer AS count
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND application_name LIKE $1
+            AND pid <> pg_backend_pid()
+        `, [`${applicationPrefix}%`]);
+        assert.equal(
+          active.rows[0].count,
+          0,
+          'P3 automatic recovery test left a PostgreSQL session open',
+        );
+      },
+    }));
     if (cleanupErrors.length > 0) {
       throw new AggregateError(
         cleanupErrors,
@@ -745,15 +1026,30 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
   blockerClient = new Client({
     connectionString: target.rawUrl,
     application_name: `${applicationPrefix}-blocker`,
-    query_timeout: 5000,
+    connectionTimeoutMillis: 10000,
+    query_timeout: 10000,
   });
-  await blockerClient.connect();
-  await blockerClient.query('BEGIN');
-  blockerTransactionOpen = true;
-  await blockerClient.query(
-    'SELECT id FROM capture_tasks WHERE id = $1 FOR UPDATE',
-    [concurrent.parentTaskId],
+  await connectBoundedClient(
+    blockerClient,
+    5000,
+    'the automatic recovery blocker client',
   );
+  await runBoundedClientStep({
+    client: blockerClient,
+    promise: blockerClient.query('BEGIN'),
+    timeoutMs: 5000,
+    message: 'Timed out starting the automatic recovery blocker transaction',
+  });
+  blockerTransactionOpen = true;
+  await runBoundedClientStep({
+    client: blockerClient,
+    promise: blockerClient.query(
+      'SELECT id FROM capture_tasks WHERE id = $1 FOR UPDATE',
+      [concurrent.parentTaskId],
+    ),
+    timeoutMs: 5000,
+    message: 'Timed out acquiring the automatic recovery blocker lock',
+  });
   const firstConcurrent = trackReconciliation(
     reconcileAutomaticCaptureRetries(1),
   );
@@ -761,14 +1057,23 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
     reconcileAutomaticCaptureRetries(1),
   );
   await waitForRootLockWaiters(blockerClient, applicationPrefix);
-  await blockerClient.query('COMMIT');
+  await runBoundedClientStep({
+    client: blockerClient,
+    promise: blockerClient.query('COMMIT'),
+    timeoutMs: 5000,
+    message: 'Timed out committing the automatic recovery blocker',
+  });
   blockerTransactionOpen = false;
   const concurrentSummaries = await withTimeout(
     Promise.all([firstConcurrent, secondConcurrent]),
     10000,
     'Timed out settling concurrent automatic recovery runs',
   );
-  await blockerClient.end();
+  await closeBoundedClient(
+    blockerClient,
+    5000,
+    'the automatic recovery blocker client',
+  );
   blockerClient = null;
 
   assert.deepEqual(
