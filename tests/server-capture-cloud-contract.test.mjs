@@ -63,6 +63,20 @@ const leaseReconciliationSource = await readFile(
   ),
   "utf8",
 );
+const controlOutcomeProjectionSource = await readFile(
+  new URL(
+    "../server/modules/capture/application/control-outcome-projection.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const postgresLeaseReconciliationSource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-lease-reconciliation.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const automaticRecoverySource = await readFile(
   new URL(
     "../server/modules/capture/application/automatic-recovery.js",
@@ -71,15 +85,22 @@ const automaticRecoverySource = await readFile(
   "utf8",
 );
 
+function readSourceSection(source, label, startMarker, endMarker = "") {
+  const start = source.indexOf(startMarker);
+  assert.notEqual(start, -1, `missing ${label} marker: ${startMarker}`);
+  if (!endMarker) return source.slice(start);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(end, -1, `missing ${label} marker: ${endMarker}`);
+  return source.slice(start, end);
+}
+
 function readRouteSection(startMarker, endMarker) {
-  const start = captureCloudRouteSource.indexOf(startMarker);
-  assert.notEqual(start, -1, `missing route marker: ${startMarker}`);
-  const end = captureCloudRouteSource.indexOf(
+  return readSourceSection(
+    captureCloudRouteSource,
+    "route",
+    startMarker,
     endMarker,
-    start + startMarker.length,
   );
-  assert.notEqual(end, -1, `missing route marker: ${endMarker}`);
-  return captureCloudRouteSource.slice(start, end);
 }
 
 test("capture agents distinguish browser profiles while retaining their environment", () => {
@@ -615,7 +636,7 @@ test("targeted detail result projection has a closed workflow allow-list", () =>
 test("negative patrol result projection binds server records and fresh observations", () => {
   const projection = readRouteSection(
     "async function projectNegativePatrolSnapshot",
-    "async function projectOrchestrationChildControlOutcome",
+    "async function projectOrchestrationSnapshot",
   );
   assert.match(projection, /id = \$14::uuid/u);
   assert.match(projection, /record_id = \$15::uuid/u);
@@ -1177,9 +1198,10 @@ test("orchestration checkpoint database values are bounded and timestamp-safe", 
 });
 
 test("orchestration control outcomes lock parent before updating items", () => {
-  const helper = readRouteSection(
-    "async function projectOrchestrationChildControlOutcome",
-    "async function projectOrchestrationSnapshot",
+  const helper = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export async function projectOrchestrationChildControlOutcome",
   );
   const parentLock = helper.indexOf("await lockOrchestrationParent");
   const itemUpdate = helper.indexOf("UPDATE capture_task_items");
@@ -1341,7 +1363,9 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
 });
 
 test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
-  const lease = readRouteSection(
+  const lease = readSourceSection(
+    postgresLeaseReconciliationSource,
+    "PostgreSQL lease reconciliation",
     'async function listElasticCaptureLeaseCandidates',
     'const reconcileElasticCaptureLeasesImpl',
   );
@@ -1375,12 +1399,20 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   );
   assert.doesNotMatch(leaseReconciliationSource, /pendingReconciliation/u);
   assert.match(
-    captureCloudRouteSource,
+    postgresLeaseReconciliationSource,
     /createElasticCaptureLeaseReconciler\(\{[\s\S]*listCandidates: listElasticCaptureLeaseCandidates,[\s\S]*settleCandidate: settleElasticCaptureLeaseCandidate/u,
   );
-  assert.match(
+  assert.doesNotMatch(
     captureCloudRouteSource,
-    /export async function reconcileElasticCaptureLeases\(limit = 50\)[\s\S]*return reconcileElasticCaptureLeasesImpl\(limit\)/u,
+    /(?:async\s+)?function\s+(?:listElasticCaptureLeaseCandidates|settleElasticCaptureLeaseCandidate|reconcileElasticCaptureLeases)\b/u,
+  );
+  assert.doesNotMatch(
+    captureCloudRouteSource,
+    /\breconcileElasticCaptureLeasesImpl\b|createElasticCaptureLeaseReconciler/u,
+  );
+  assert.match(
+    cronSource,
+    /from '\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -1391,7 +1423,7 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
 test("elastic negative patrol uses the same bounded technical and safety handoff policy", () => {
   const projection = readRouteSection(
     'async function projectNegativePatrolSnapshot',
-    'async function projectOrchestrationChildControlOutcome',
+    'async function projectOrchestrationSnapshot',
   );
   assert.match(projection, /distributionMode ===[\s\S]*'elastic_pool'/u);
   assert.match(projection, /classifyCaptureRecoveryDisposition/u);
@@ -1990,10 +2022,12 @@ test("remote keyword post limits are optional, normalized, and fail safely", () 
 });
 
 test("remote request identity changes when only the keyword post limit changes", () => {
-  const safeJsonSource = readRouteSection(
-    "function safeJson(value)",
-    "function remoteTaskRequestHash(",
-  );
+  const safeJsonSource = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export function safeJson(value)",
+    "export function promotedRetryBusinessTaskType(",
+  ).replace("export function safeJson", "function safeJson");
   const hashSource = readRouteSection(
     "function remoteTaskRequestHash(",
     "export function captureTaskSnapshotFingerprint(",
