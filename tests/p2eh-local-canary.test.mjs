@@ -257,6 +257,21 @@ test('seed refuses a query connected to another database before mutation', async
     error => error.code === 'executor_target_mismatch',
   );
   assert.equal(calls, 1);
+
+  calls = 0;
+  await assert.rejects(
+    seedP2ehLocalCanary({
+      transaction: transactionUsing(async () => {
+        calls += 1;
+        return targetRow({server_address: '172.18.0.2'});
+      }),
+      testDatabaseUrl: databaseUrl,
+      runId,
+      schema,
+    }),
+    error => error.code === 'executor_target_mismatch',
+  );
+  assert.equal(calls, 1);
 });
 
 test('seed rolls a marker collision out of the transaction before verification', async () => {

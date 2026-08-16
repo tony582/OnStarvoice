@@ -10,7 +10,10 @@ import {
   inspectP2ehLocalCanary,
   seedP2ehLocalCanary,
 } from '../../../scripts/lib/p2eh-local-canary.mjs';
-import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-integration-target.mjs';
+import {
+  isAllowedPostgresIntegrationServerAddress,
+  validatePostgresIntegrationTarget,
+} from '../../../scripts/lib/postgres-integration-target.mjs';
 import {loadMigrationInventory} from '../../../server/db/migration-inventory.js';
 
 const repositoryRoot = path.resolve(
@@ -21,7 +24,6 @@ const repositoryRoot = path.resolve(
 );
 const requireFromServer = createRequire(path.join(repositoryRoot, 'server', 'package.json'));
 const {Client, Pool} = requireFromServer('pg');
-const LOCAL_ADDRESSES = new Set([null, '127.0.0.1', '127.0.0.1/32', '::1', '::1/128']);
 
 function quoteIdentifier(identifier) {
   assert.match(identifier, /^p2eh_canary_[a-f0-9]{24}$/u);
@@ -72,7 +74,15 @@ async function assertPhysicalTarget(client, target, schema) {
   );
   const row = result.rows[0];
   assert.equal(row.database_name, target.databaseName);
-  assert.equal(LOCAL_ADDRESSES.has(row.server_address), true);
+  assert.equal(
+    isAllowedPostgresIntegrationServerAddress({
+      serverAddress: row.server_address,
+      target,
+    }),
+    true,
+    `unexpected PostgreSQL server address ${String(row.server_address)} for ` +
+      `${target.databaseUrl.hostname}:${target.databaseUrl.port}/${target.databaseName}`,
+  );
   assert.equal(row.schema_exists, true);
 }
 
