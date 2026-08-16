@@ -11,6 +11,9 @@ import {runMigrations} from '../../../server/db/migrate.js';
 import {closePool, getPool} from '../../../server/db/pool.js';
 import {
   reconcileElasticCaptureLeases,
+} from '../../../server/modules/capture/infrastructure/postgres-lease-reconciliation.js';
+import {
+  reconcileElasticCaptureLeases as routeReconcileElasticCaptureLeases,
 } from '../../../server/routes/capture-cloud.js';
 
 const repositoryRoot = path.resolve(
@@ -243,6 +246,10 @@ function assertRequeued(state, timeoutCode) {
 }
 
 test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollback, and locking', async t => {
+  assert.strictEqual(
+    routeReconcileElasticCaptureLeases,
+    reconcileElasticCaptureLeases,
+  );
   const target = validatePostgresIntegrationTarget({
     testDatabaseUrl: process.env.TEST_DATABASE_URL,
     databaseUrl: process.env.DATABASE_URL,

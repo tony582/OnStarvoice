@@ -32,14 +32,42 @@ import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
 import {
+  AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
+  CROSS_DEVICE_RETRY_TASK_TYPES,
+  ELASTIC_AGENT_CAPACITY_CODES,
+  ORCHESTRATION_ITEM_TERMINAL_STATUSES,
+  appendEvent,
+  crossDeviceRetryItemNeedsManualSafety,
+  elasticAttemptBudgetAfterOutcome,
+  elasticRecoveryErrorCode,
+  lockOrchestrationParent,
+  orchestrationCheckpointTimestamp,
+  projectElasticAttemptBudget,
+  projectElasticKeywordRecoveryStatus,
+  projectOrchestrationChildControlOutcome,
+  promotedRetryBusinessTaskType,
+  refreshOrchestrationParentTask,
+  safeJson,
+  text,
+} from '../modules/capture/application/control-outcome-projection.js';
+import {
   createPendingCaptureCommandReconciler,
 } from '../modules/capture/application/command-lifecycle.js';
 import {
-  createElasticCaptureLeaseReconciler,
-} from '../modules/capture/application/lease-reconciliation.js';
-import {
   createAutomaticCaptureRetryReconciler,
 } from '../modules/capture/application/automatic-recovery.js';
+import {
+  reconcileElasticCaptureLeases,
+} from '../modules/capture/infrastructure/postgres-lease-reconciliation.js';
+
+export {
+  crossDeviceRetryItemNeedsManualSafety,
+  elasticAttemptBudgetAfterOutcome,
+  orchestrationCheckpointTimestamp,
+  projectElasticAttemptBudget,
+  projectElasticKeywordRecoveryStatus,
+  reconcileElasticCaptureLeases,
+};
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -105,48 +133,16 @@ const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
   'superseded',
   'needs_action',
 ]);
-const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
-const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
 const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 const ELASTIC_AGENT_CAPACITY_HOLD_MS = 30 * 60 * 1000;
 const ELASTIC_SAFETY_AGENT_HOLD_MS = 30 * 60 * 1000;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
-const ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS = 1;
-const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
-  'DOUYIN_SEARCH_SECURITY_CHALLENGE',
-  'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
-  'DOUYIN_CAPTCHA_REQUIRED',
-  'CAPTCHA_PAGE_DETECTED',
-  'LOGIN_REQUIRED',
-  'AUTH_REQUIRED',
-  'DOUYIN_LOGIN_REQUIRED',
-  'XHS_LOGIN_REQUIRED',
-]);
-const ELASTIC_AGENT_CAPACITY_CODES = new Set([
-  'CAPTURE_TASK_GROUP_BUSY',
-  'CAPTURE_TASK_CLEANUP_PENDING',
-  'CAPTURE_TASK_DEBUG_BUSY',
-  'CAPTURE_LOCK_CONFLICT',
-]);
-const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
-  ...ELASTIC_AGENT_CAPACITY_CODES,
-  'CREATE_COMMAND_EXPIRED',
-  'CREATE_AGENT_UNAVAILABLE',
-]);
 const ELASTIC_STALE_TASK_CODES = new Set([
   'ELASTIC_TASK_HEARTBEAT_TIMEOUT',
   'ELASTIC_AGENT_OFFLINE_TIMEOUT',
-]);
-const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
-  'unattended_keyword_capture',
-  'negative_post_patrol',
-  'watched_content_patrol',
-  'official_account_comment_patrol',
-  'followed_creator_post_patrol',
-  'official_account_post_discovery',
 ]);
 const CROSS_DEVICE_RETRY_UNSTARTED_ITEM_STATUSES = new Set([
   'pending',
@@ -285,10 +281,6 @@ export function captureAgentRemovalBlockerMessage(blockers = {}) {
     : '';
 }
 
-function text(value, limit = 1000) {
-  const normalized = String(value ?? '').trim();
-  return normalized.length > limit ? normalized.slice(0, limit) : normalized;
-}
 
 const CAPTURE_TASK_VISIBILITY_ALIASES = new Set(['assigned', 't']);
 
@@ -362,16 +354,7 @@ export function orchestrationCheckpointInteger(value) {
   return Math.min(POSTGRES_INTEGER_MAX, Math.max(0, parsed));
 }
 
-export function orchestrationCheckpointTimestamp(value) {
-  const normalized = text(value, 100);
-  if (!normalized) return null;
-  const timestamp = Date.parse(normalized);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
-}
 
-function safeJson(value) {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-}
 
 function hasConfiguredAgentPlan(value) {
   const plan = safeJson(value);
@@ -442,22 +425,6 @@ export function captureTaskSnapshotFingerprint(snapshot = {}) {
     .digest('hex');
 }
 
-function promotedRetryBusinessTaskType(task = {}) {
-  const metadata = safeJson(task.metadata);
-  const featureTaskType = text(task.feature_key, 80);
-  return text(
-    metadata.promotedBusinessTaskType ||
-      metadata.businessTaskType ||
-      metadata.workflow ||
-      (CROSS_DEVICE_RETRY_TASK_TYPES.has(featureTaskType)
-        ? featureTaskType
-        : '') ||
-      (task.task_type === 'capture_orchestration'
-        ? 'unattended_keyword_capture'
-        : task.task_type),
-    80,
-  );
-}
 
 export function crossDeviceRetryTaskSupported(task = {}) {
   if (task.parent_task_id) return false;
@@ -534,125 +501,10 @@ export function crossDeviceRetrySourceAgentIdsForItems(
     .filter(value => UUID_PATTERN.test(value))));
 }
 
-export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
-  const error = safeJson(item.error);
-  const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
-  const code = text(
-    error.code || checkpoint.errorCode || checkpoint.error_code,
-    100,
-  ).toUpperCase();
-  return CROSS_DEVICE_RETRY_SAFETY_CODES.has(code) ||
-    ['platform_safety_block', 'login_required', 'authentication_required']
-      .includes(text(error.category, 100).toLowerCase()) ||
-    error.securityBlocked === true ||
-    error.platformSafetyBlocked === true ||
-    error.requiresManualAction === true ||
-    checkpoint.securityBlocked === true ||
-    checkpoint.platformSafetyBlocked === true ||
-    checkpoint.requiresManualAction === true;
-}
 
-export function projectElasticKeywordRecoveryStatus({
-  elasticPool = false,
-  status = '',
-  error = {},
-  checkpoint = {},
-  attemptCount = 0,
-} = {}) {
-  const normalizedStatus = text(status, 80).toLowerCase();
-  if (!elasticPool) return normalizedStatus;
-  if (![
-    'interrupted',
-    'needs_action',
-    'failed',
-    'completed_with_failures',
-    'retryable',
-  ].includes(normalizedStatus)) {
-    return normalizedStatus;
-  }
-  const normalizedAttemptCount = Math.max(0, Number(attemptCount) || 0);
-  const safetyBlocked = crossDeviceRetryItemNeedsManualSafety({
-    status: normalizedStatus,
-    error,
-    metadata: {checkpoint},
-  });
-  if (safetyBlocked) {
-    return normalizedAttemptCount <= ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS
-      ? 'retryable'
-      : 'needs_action';
-  }
-  return normalizedAttemptCount < AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
-    ? 'retryable'
-    : 'failed';
-}
 
-function elasticRecoveryErrorCode(source = {}) {
-  const error = safeJson(source.error);
-  const checkpoint = safeJson(source.checkpoint);
-  return text(
-    error.code ||
-      error.errorCode ||
-      checkpoint.errorCode ||
-      checkpoint.error_code,
-    100,
-  ).toUpperCase();
-}
 
-export function elasticAttemptBudgetAfterOutcome(
-  attemptCount = 0,
-  source = {},
-) {
-  const normalizedAttemptCount = Math.max(0, Number(attemptCount) || 0);
-  return ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(
-    elasticRecoveryErrorCode(source),
-  )
-    ? Math.max(0, normalizedAttemptCount - 1)
-    : normalizedAttemptCount;
-}
 
-export function projectElasticAttemptBudget(
-  item = {},
-  source = {},
-  executionTaskId = '',
-) {
-  const metadata = safeJson(item?.metadata);
-  const explicitBudget = Number(metadata.elasticAttemptBudgetUsed);
-  const currentBudget = Number.isInteger(explicitBudget) && explicitBudget >= 0
-    ? explicitBudget
-    : Math.max(0, Number(item?.attempt_count) || 0);
-  const errorCode = elasticRecoveryErrorCode(source);
-  const normalizedExecutionTaskId = text(executionTaskId, 100).toLowerCase();
-  const refundState = safeJson(metadata.elasticAttemptBudget);
-  const alreadyRefunded = Boolean(
-    normalizedExecutionTaskId &&
-      text(refundState.refundedExecutionTaskId, 100).toLowerCase() ===
-        normalizedExecutionTaskId,
-  );
-  const shouldRefund = Boolean(
-    normalizedExecutionTaskId &&
-      ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(errorCode) &&
-      !alreadyRefunded,
-  );
-  const attemptBudget = shouldRefund
-    ? elasticAttemptBudgetAfterOutcome(currentBudget, source)
-    : currentBudget;
-  return {
-    attemptBudget,
-    metadataPatch: {
-      elasticAttemptBudgetUsed: attemptBudget,
-      ...(shouldRefund
-        ? {
-            elasticAttemptBudget: {
-              refundedExecutionTaskId: normalizedExecutionTaskId,
-              refundedCode: errorCode,
-              refundedAt: new Date().toISOString(),
-            },
-          }
-        : {}),
-    },
-    refunded: shouldRefund,
-  };
-}
 
 function elasticAgentRecoveryHoldMs(source = {}) {
   const errorCode = elasticRecoveryErrorCode(source);
@@ -909,38 +761,6 @@ export function resolveStopCommandOutcome({
   };
 }
 
-async function appendEvent(tx, {
-  tenantId,
-  taskId,
-  attemptId = null,
-  agentId = null,
-  eventType,
-  actorType = 'system',
-  actorId = '',
-  actorName = '',
-  status = '',
-  message = '',
-  payload = {},
-}) {
-  await tx.execute(`
-    INSERT INTO capture_task_events (
-      tenant_id, task_id, attempt_id, agent_id, event_type,
-      actor_type, actor_id, actor_name, status, message, payload
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-  `, [
-    tenantId,
-    taskId,
-    attemptId,
-    agentId,
-    eventType,
-    actorType,
-    text(actorId, 240),
-    text(actorName, 240),
-    text(status, 80),
-    text(message, 2000),
-    JSON.stringify(safeJson(payload)),
-  ]);
-}
 
 export async function supersedeStalePlanConfigurationAttention(tx, {
   tenantId,
@@ -1525,13 +1345,6 @@ async function resolveCreateCommandFromSnapshot(tx, agent, task, snapshot, evide
   return command;
 }
 
-const ORCHESTRATION_ITEM_TERMINAL_STATUSES = new Set([
-  'completed',
-  'completed_with_warnings',
-  'failed',
-  'skipped',
-  'canceled',
-]);
 const NEGATIVE_PATROL_RESULT_STATUSES = new Set([
   'completed',
   'completed_with_warnings',
@@ -2229,17 +2042,6 @@ function orchestrationItemAttemptStatus(itemStatus) {
     : itemStatus;
 }
 
-async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
-  return tx.queryOne(`
-    SELECT id, title, status, progress, metadata, feature_key,
-      orchestration_revision,
-      orchestration_schedule_id, scheduled_for
-    FROM capture_tasks
-    WHERE id = $1 AND tenant_id = $2
-      AND task_type = 'capture_orchestration'
-    FOR UPDATE
-  `, [parentTaskId, tenantId]);
-}
 
 async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
   if (
@@ -2543,259 +2345,6 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
   return adoptedTask;
 }
 
-async function refreshOrchestrationParentTask(tx, {
-  tenantId,
-  parentTaskId,
-  parent: lockedParent = null,
-  agent = null,
-  snapshot = {},
-  childTaskId = '',
-  actorType = 'system',
-  actorId = '',
-  actorName = '',
-  eventAgentId = null,
-}) {
-  const parent = lockedParent ||
-    await lockOrchestrationParent(tx, tenantId, parentTaskId);
-  if (!parent) return null;
-  if (['canceled', 'superseded'].includes(parent.status)) return parent;
-
-  const items = await tx.queryAll(`
-    SELECT status
-    FROM capture_task_items
-    WHERE task_id = $1 AND tenant_id = $2
-    ORDER BY ordinal, id
-  `, [parentTaskId, tenantId]);
-  const aggregate = aggregateParentTaskItems(items);
-  const parentMetadata = safeJson(parent.metadata);
-  const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
-  if (
-    elasticPool &&
-    aggregate.status === 'needs_action' &&
-    Number(aggregate.counts.retryable || 0) > 0 &&
-    Number(aggregate.counts.needsAction || 0) === 0
-  ) {
-    // retryable 是弹性队列的主动恢复状态，不是人工待办。父任务继续保持
-    // running，详情页也会持续刷新，直到其它 Agent 领取或尝试真正耗尽。
-    aggregate.status = 'running';
-    aggregate.terminal = false;
-  }
-  const negativePatrol =
-    parent.feature_key === 'negative_post_patrol' ||
-    parentMetadata.workflow === 'negative_post_patrol';
-  const watchedContentPatrol =
-    parent.feature_key === 'watched_content_patrol' ||
-    parentMetadata.workflow === 'watched_content_patrol';
-  const contentPatrol = negativePatrol || watchedContentPatrol;
-  const contentPatrolLabel = watchedContentPatrol ? '关注内容' : '负面帖子';
-  const profilePatrol = [
-    'official_account_comment_patrol',
-    'followed_creator_post_patrol',
-    'official_account_post_discovery',
-  ].includes(promotedRetryBusinessTaskType(parent));
-  const previousProgress = safeJson(parent.progress);
-  const businessProgressChanged =
-    Number(previousProgress.current || 0) !== aggregate.progress.current ||
-    Number(previousProgress.total || 0) !== aggregate.progress.total;
-  const message = aggregate.status === 'running'
-    ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
-      ? contentPatrol
-        ? `部分${contentPatrolLabel}正在自动恢复，等待空闲节点逐篇接力`
-        : profilePatrol
-          ? '部分账号巡查项正在自动恢复，等待空闲节点接力'
-          : '部分关键词正在自动恢复，等待空闲节点逐词接力'
-      : contentPatrol
-      ? `执行节点正在巡查${contentPatrolLabel}`
-      : profilePatrol
-        ? '执行节点正在重试未完成的账号巡查项'
-      : '多个执行节点正在处理关键词工作项'
-    : aggregate.status === 'needs_action'
-      ? contentPatrol
-        ? `部分${contentPatrolLabel}需要人工处理`
-        : profilePatrol
-          ? '部分账号巡查项仍需要处理'
-        : '部分关键词工作项需要人工处理'
-      : aggregate.terminal
-        ? contentPatrol
-          ? `${watchedContentPatrol ? '关注内容' : '多 Agent 负面帖子'}巡查已结算`
-          : profilePatrol
-        ? '账号巡查任务已结算'
-          : '多 Agent 关键词任务已结算'
-        : contentPatrol
-          ? elasticPool
-            ? `${contentPatrolLabel}保留在云端，等待空闲节点逐篇领取`
-            : `${contentPatrolLabel}已分配，等待执行节点处理`
-          : profilePatrol
-            ? '账号巡查项已重新分配，等待执行节点处理'
-          : '关键词工作项已分配，等待执行节点处理';
-
-  const updated = await tx.queryOne(`
-    UPDATE capture_tasks
-    SET status = $1,
-      progress = $2::jsonb,
-      counts = $3::jsonb,
-      message = $4,
-      heartbeat_at = GREATEST(heartbeat_at, $5::timestamptz),
-      business_progress_at = CASE
-        WHEN $6::boolean THEN GREATEST(business_progress_at, $7::timestamptz)
-        ELSE business_progress_at
-      END,
-      finished_at = CASE
-        WHEN $8::boolean THEN COALESCE(finished_at, $7::timestamptz, now())
-        ELSE NULL
-      END,
-      source_updated_at = CASE
-        WHEN $9::timestamptz IS NULL THEN source_updated_at
-        ELSE GREATEST(source_updated_at, $9::timestamptz)
-      END,
-      updated_at = now()
-    WHERE id = $10 AND tenant_id = $11
-    RETURNING *
-  `, [
-    aggregate.status,
-    JSON.stringify(aggregate.progress),
-    JSON.stringify(aggregate.counts),
-    message,
-    orchestrationCheckpointTimestamp(snapshot.heartbeatAt),
-    businessProgressChanged,
-    orchestrationCheckpointTimestamp(
-      snapshot.businessProgressAt ||
-      snapshot.updatedAt ||
-      snapshot.heartbeatAt,
-    ),
-    aggregate.terminal,
-    orchestrationCheckpointTimestamp(snapshot.updatedAt || snapshot.heartbeatAt),
-    parentTaskId,
-    tenantId,
-  ]);
-
-  if (
-    updated &&
-    parent.status !== updated.status &&
-    parent.orchestration_schedule_id &&
-    safeJson(parent.metadata).orchestrationScheduleRun === true
-  ) {
-    const schedule = await tx.queryOne(`
-      UPDATE capture_orchestration_schedules
-      SET last_run_at = CASE
-          WHEN $7::boolean THEN COALESCE($1::timestamptz, now())
-          ELSE last_run_at
-        END,
-        last_run_status = $2,
-        last_error = CASE
-          WHEN $2 IN (
-            'pending', 'running', 'completed',
-            'completed_with_warnings', 'canceled'
-          )
-            THEN '{}'::jsonb
-          WHEN $2 = 'needs_action'
-            THEN jsonb_build_object(
-              'code', 'scheduled_run_needs_action',
-              'message', $3::text
-            )
-          ELSE jsonb_build_object(
-            'code', 'scheduled_run_settled_with_failures',
-            'message', $3::text
-          )
-        END,
-        updated_at = now()
-      WHERE id = $4
-        AND tenant_id = $5
-        AND last_run_task_id = $6
-      RETURNING template_task_id, status, next_run_at, last_run_at
-    `, [
-      updated.finished_at,
-      updated.status,
-      message,
-      parent.orchestration_schedule_id,
-      tenantId,
-      parent.id,
-      aggregate.terminal,
-    ]);
-    if (schedule) {
-      await tx.execute(`
-        UPDATE capture_tasks
-        SET metadata = metadata || jsonb_build_object(
-            'scheduleStatus', $1::text,
-            'nextRunAt', COALESCE($2::timestamptz::text, ''),
-            'lastRunAt', COALESCE($3::timestamptz::text, ''),
-            'lastRunStatus', $4::text,
-            'lastRunTaskId', $5::uuid::text
-          ),
-          message = CASE
-            WHEN $4 IN ('completed', 'completed_with_warnings')
-              THEN '上一轮多 Agent 任务已结算，计划等待下一次运行'
-            WHEN $4 = 'canceled'
-              THEN '上一轮多 Agent 任务已停止，计划等待下一次运行'
-            WHEN $4 = 'needs_action'
-              THEN '上一轮有待处理项，可在云端重试失败关键词'
-            WHEN $4 = 'running'
-              THEN '上一轮多 Agent 任务正在执行'
-            WHEN $4 = 'pending'
-              THEN '上一轮多 Agent 任务已下发，等待执行节点'
-            ELSE '上一轮多 Agent 任务有失败项，计划仍会按下一次时间运行'
-          END,
-          updated_at = now(),
-          source_updated_at = now()
-        WHERE id = $6 AND tenant_id = $7
-      `, [
-        schedule.status,
-        schedule.next_run_at,
-        schedule.last_run_at,
-        updated.status,
-        parent.id,
-        schedule.template_task_id,
-        tenantId,
-      ]);
-      await appendEvent(tx, {
-        tenantId,
-        taskId: schedule.template_task_id,
-        agentId: agent?.id || eventAgentId || null,
-        eventType: aggregate.terminal
-          ? 'orchestration_schedule_run_settled'
-          : 'orchestration_schedule_run_status_updated',
-        actorType: agent ? 'capture_agent' : actorType,
-        actorId: agent?.id || actorId,
-        actorName: agent
-          ? agent.display_name || agent.client_label
-          : actorName,
-        status: schedule.status,
-        message: aggregate.terminal
-          ? '无人值守计划的一轮多 Agent 任务已结算'
-          : '无人值守计划的本轮状态已同步',
-        payload: {
-          runTaskId: parent.id,
-          runStatus: updated.status,
-          nextRunAt: schedule.next_run_at,
-        },
-      });
-    }
-  }
-
-  if (updated && parent.status !== updated.status) {
-    const resolvedEventAgentId =
-      agent?.id || eventAgentId || null;
-    await appendEvent(tx, {
-      tenantId,
-      taskId: parentTaskId,
-      agentId: resolvedEventAgentId,
-      eventType: 'orchestration_status_changed',
-      actorType: agent ? 'capture_agent' : actorType,
-      actorId: agent?.id || actorId,
-      actorName: agent
-        ? agent.display_name || agent.client_label
-        : actorName,
-      status: updated.status,
-      message,
-      payload: {
-        previousStatus: parent.status,
-        childTaskId: childTaskId || snapshot.clientTaskId || '',
-        progress: aggregate.progress,
-      },
-    });
-  }
-  return updated;
-}
 
 async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   if (
@@ -3470,148 +3019,6 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   return updatedTask;
 }
 
-async function projectOrchestrationChildControlOutcome(tx, {
-  tenantId,
-  childTask,
-  agentId,
-  status,
-  error = {},
-  actorType = 'system',
-  actorId = '',
-  actorName = '',
-}) {
-  if (!childTask?.parent_task_id) return null;
-
-  // The caller has already locked and mutated the child task. Lock the parent
-  // before touching item rows so command completion, expiry, and heartbeat
-  // projection all use the same task -> parent -> item order.
-  const parent = await lockOrchestrationParent(
-    tx,
-    tenantId,
-    childTask.parent_task_id,
-  );
-  if (!parent) return null;
-
-  const elasticPool =
-    safeJson(parent.metadata).distributionMode === 'elastic_pool';
-  const normalizedError = safeJson(error);
-  const currentItemState = elasticPool
-    ? await tx.queryOne(`
-        SELECT id, attempt_count, metadata
-        FROM capture_task_items
-        WHERE tenant_id = $1
-          AND task_id = $2
-          AND execution_task_id = $3
-          AND assigned_agent_id = $4
-          AND status NOT IN (
-            'completed', 'completed_with_warnings',
-            'failed', 'skipped', 'canceled'
-          )
-        ORDER BY ordinal, id
-        LIMIT 1
-        FOR UPDATE
-      `, [tenantId, childTask.parent_task_id, childTask.id, agentId])
-    : null;
-  const attemptBudgetProjection = elasticPool
-    ? projectElasticAttemptBudget(
-        currentItemState,
-        {error: normalizedError},
-        childTask.id,
-      )
-    : {
-        attemptBudget: Math.max(
-          0,
-          Number(currentItemState?.attempt_count) || 0,
-        ),
-        metadataPatch: {},
-      };
-  const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
-  const projectedStatus = projectElasticKeywordRecoveryStatus({
-    elasticPool,
-    status,
-    error: normalizedError,
-    attemptCount: projectedAttemptCount,
-  });
-  const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(projectedStatus);
-  await tx.execute(`
-    UPDATE capture_task_items
-    SET status = $1,
-      error = $2::jsonb,
-      metadata = CASE
-        WHEN $8::boolean THEN metadata || $9::jsonb
-        ELSE metadata
-      END,
-      finished_at = CASE
-        WHEN $3::boolean THEN COALESCE(finished_at, now())
-        ELSE NULL
-      END,
-      updated_at = now()
-    WHERE tenant_id = $4
-      AND task_id = $5
-      AND execution_task_id = $6
-      AND assigned_agent_id = $7
-      AND status NOT IN (
-        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
-      )
-  `, [
-    projectedStatus,
-    JSON.stringify(normalizedError),
-    terminal,
-    tenantId,
-    childTask.parent_task_id,
-    childTask.id,
-    agentId,
-    elasticPool,
-    JSON.stringify(attemptBudgetProjection.metadataPatch),
-  ]);
-  await tx.execute(`
-    UPDATE capture_task_item_attempts attempt
-    SET status = $1,
-      error = $2::jsonb,
-      finished_at = CASE
-        WHEN $3::boolean THEN COALESCE(attempt.finished_at, now())
-        ELSE NULL
-      END,
-      updated_at = now()
-    FROM capture_task_items item
-    WHERE item.id = attempt.item_id
-      AND item.tenant_id = $4
-      AND item.task_id = $5
-      AND item.execution_task_id = $6
-      AND item.assigned_agent_id = $7
-      AND item.status = $1
-      AND attempt.execution_task_id = $6
-      AND attempt.agent_id = $7
-      AND attempt.status NOT IN (
-        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
-      )
-  `, [
-    projectedStatus,
-    JSON.stringify(normalizedError),
-    terminal,
-    tenantId,
-    childTask.parent_task_id,
-    childTask.id,
-    agentId,
-  ]);
-
-  const now = new Date().toISOString();
-  return refreshOrchestrationParentTask(tx, {
-    tenantId,
-    parentTaskId: childTask.parent_task_id,
-    parent,
-    snapshot: {
-      heartbeatAt: now,
-      businessProgressAt: now,
-      updatedAt: now,
-    },
-    childTaskId: childTask.id,
-    actorType,
-    actorId,
-    actorName,
-    eventAgentId: agentId,
-  });
-}
 
 async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   if (!task?.parent_task_id || isTargetedPostTaskType(task.task_type)) {
@@ -8909,172 +8316,6 @@ async function dispatchCrossDeviceRetry({
   });
 }
 
-async function listElasticCaptureLeaseCandidates(limit) {
-  return queryAll(`
-    SELECT child.id, child.tenant_id, child.parent_task_id
-    FROM capture_tasks child
-    JOIN capture_tasks parent
-      ON parent.id = child.parent_task_id
-      AND parent.tenant_id = child.tenant_id
-    JOIN capture_agents agent
-      ON agent.id = child.assigned_agent_id
-      AND agent.tenant_id = child.tenant_id
-    WHERE child.parent_task_id IS NOT NULL
-      AND child.status IN (
-        'pending', 'claimed', 'running', 'recovering', 'waiting_device'
-      )
-      AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
-      AND parent.status NOT IN (
-        'completed', 'completed_with_warnings', 'completed_with_failures',
-        'failed', 'canceled', 'skipped', 'superseded'
-      )
-      AND (
-        (
-          agent.last_heartbeat_at <
-            now() - make_interval(mins => $1::integer)
-          AND child.updated_at <
-            now() - make_interval(mins => $1::integer)
-        )
-        OR (
-          child.status IN ('claimed', 'running', 'recovering')
-          AND COALESCE(child.heartbeat_at, child.started_at, child.created_at) <
-            now() - make_interval(mins => $1::integer)
-        )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM capture_agent_commands command
-        WHERE command.tenant_id = child.tenant_id
-          AND command.task_id = child.id
-          AND command.status IN ('pending', 'acknowledged')
-      )
-    ORDER BY child.updated_at, child.id
-    LIMIT $2
-  `, [ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN, limit]);
-}
-
-async function settleElasticCaptureLeaseCandidate(tx, candidate) {
-  const parent = await tx.queryOne(`
-    SELECT id
-    FROM capture_tasks
-    WHERE id = $1 AND tenant_id = $2
-      AND status NOT IN (
-        'completed', 'completed_with_warnings',
-        'completed_with_failures', 'failed', 'canceled',
-        'skipped', 'superseded'
-      )
-      AND COALESCE(metadata->>'distributionMode', '') = 'elastic_pool'
-    FOR UPDATE SKIP LOCKED
-  `, [candidate.parent_task_id, candidate.tenant_id]);
-  if (!parent) return false;
-  const child = await tx.queryOne(`
-    SELECT child.*, agent.last_heartbeat_at AS agent_last_heartbeat_at
-    FROM capture_tasks child
-    JOIN capture_agents agent
-      ON agent.id = child.assigned_agent_id
-      AND agent.tenant_id = child.tenant_id
-    WHERE child.id = $1 AND child.tenant_id = $2
-      AND child.parent_task_id = $3
-      AND child.status IN (
-        'pending', 'claimed', 'running', 'recovering', 'waiting_device'
-      )
-      AND (
-        (
-          agent.last_heartbeat_at <
-            now() - make_interval(mins => $4::integer)
-          AND child.updated_at <
-            now() - make_interval(mins => $4::integer)
-        )
-        OR (
-          child.status IN ('claimed', 'running', 'recovering')
-          AND COALESCE(
-            child.heartbeat_at,
-            child.started_at,
-            child.created_at
-          ) < now() - make_interval(mins => $4::integer)
-        )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM capture_agent_commands command
-        WHERE command.tenant_id = child.tenant_id
-          AND command.task_id = child.id
-          AND command.status IN ('pending', 'acknowledged')
-      )
-    FOR UPDATE OF child SKIP LOCKED
-  `, [
-    candidate.id,
-    candidate.tenant_id,
-    candidate.parent_task_id,
-    ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
-  ]);
-  if (!child) return false;
-  const agentHeartbeatAt = Date.parse(
-    String(child.agent_last_heartbeat_at || ''),
-  );
-  const agentOffline =
-    !Number.isFinite(agentHeartbeatAt) ||
-    agentHeartbeatAt <
-      Date.now() - ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000;
-  const timeoutCode = agentOffline
-    ? 'elastic_agent_offline_timeout'
-    : 'elastic_task_heartbeat_timeout';
-  const timeoutMessage = agentOffline
-    ? '执行节点持续离线，工作项已退回弹性队列'
-    : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
-  const failed = await tx.queryOne(`
-    UPDATE capture_tasks
-    SET status = 'failed',
-      error = jsonb_build_object(
-        'code', $3::text,
-        'message', $4::text,
-        'retryable', true
-      ),
-      message = $4,
-      finished_at = now(),
-      updated_at = now()
-    WHERE id = $1 AND tenant_id = $2
-    RETURNING *
-  `, [child.id, candidate.tenant_id, timeoutCode, timeoutMessage]);
-  await projectOrchestrationChildControlOutcome(tx, {
-    tenantId: candidate.tenant_id,
-    childTask: failed,
-    agentId: child.assigned_agent_id,
-    status: 'retryable',
-    error: {
-      code: timeoutCode,
-      message: timeoutMessage,
-      automaticRetry: true,
-    },
-    actorType: 'system',
-    actorName: '云端弹性调度器',
-  });
-  await appendEvent(tx, {
-    tenantId: candidate.tenant_id,
-    taskId: child.id,
-    agentId: child.assigned_agent_id,
-    eventType: 'elastic_work_item_requeued',
-    status: 'failed',
-    message: timeoutMessage,
-    payload: {
-      parentTaskId: candidate.parent_task_id,
-      offlineTimeoutMinutes: ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
-      timeoutCode,
-    },
-  });
-  return true;
-}
-
-const reconcileElasticCaptureLeasesImpl =
-  createElasticCaptureLeaseReconciler({
-    listCandidates: listElasticCaptureLeaseCandidates,
-    withTransaction,
-    settleCandidate: settleElasticCaptureLeaseCandidate,
-  });
-
-export async function reconcileElasticCaptureLeases(limit = 50) {
-  return reconcileElasticCaptureLeasesImpl(limit);
-}
 
 async function listAutomaticCaptureRetryCandidates(normalizedLimit) {
   return queryAll(`

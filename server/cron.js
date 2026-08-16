@@ -12,9 +12,11 @@ import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.j
 import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
 import {
   reconcileAutomaticCaptureRetries,
-  reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
+import {
+  reconcileElasticCaptureLeases,
+} from './modules/capture/infrastructure/postgres-lease-reconciliation.js';
 import {createDrainController} from './runtime/drain-controller.js';
 
 const DEFAULT_JOBS = Object.freeze({
