@@ -1,0 +1,789 @@
+import {aggregateParentTaskItems} from '../../../services/capture-orchestration.js';
+
+import {CAPTURE_PLATFORM_SAFETY_CODES} from '../../../services/capture-health-schema.js';
+
+import {CAPTURE_SAFETY_HANDOFF_SEARCH_CODES} from '../../../services/capture-safety-handoff-policy.js';
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+// One normal execution plus one different-Agent relay. More generations make
+
+// a congested host or weak network noisier without improving the real result.
+
+export const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 2;
+
+const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 2;
+
+const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set(
+  CAPTURE_PLATFORM_SAFETY_CODES,
+);
+
+const AUTOMATIC_SEARCH_SAFETY_HANDOFF_CODES = new Set(
+  CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
+);
+
+export const ELASTIC_AGENT_CAPACITY_CODES = new Set([
+  'CAPTURE_TASK_GROUP_BUSY',
+  'CAPTURE_TASK_CLEANUP_PENDING',
+  'CAPTURE_TASK_DEBUG_BUSY',
+  'CAPTURE_TASK_DEBUG_PREFLIGHT_UNAVAILABLE',
+  'CAPTURE_TASK_DEBUG_PREFLIGHT_FAILED',
+  'CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE',
+  'CAPTURE_TASK_EXTERNAL_DEBUGGER_BUSY',
+  'CAPTURE_TASK_DEBUG_OWNERSHIP_UNKNOWN',
+  'CAPTURE_LOCK_CONFLICT',
+]);
+
+const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
+  ...ELASTIC_AGENT_CAPACITY_CODES,
+  'CREATE_COMMAND_EXPIRED',
+  'CREATE_AGENT_UNAVAILABLE',
+  'UNATTENDED_BEGIN_FENCE_CHANGED',
+  'UNATTENDED_ATTEMPT_REPLACED',
+  'UNATTENDED_STATUS_REPORT_TIMEOUT',
+  'UNATTENDED_STATUS_REPORT_REJECTED',
+  'UNATTENDED_RUNTIME_MESSAGE_TIMEOUT',
+  'UNATTENDED_REQUEST_NOT_FOUND',
+  'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+]);
+
+export const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
+  'unattended_keyword_capture',
+  'negative_post_patrol',
+  'watched_content_patrol',
+  'official_account_comment_patrol',
+  'followed_creator_post_patrol',
+  'official_account_post_discovery',
+]);
+
+export function text(value, limit = 1000) {
+  const normalized = String(value ?? '').trim();
+  return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+}
+
+export function orchestrationCheckpointTimestamp(value) {
+  const normalized = text(value, 100);
+  if (!normalized) return null;
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+
+export function safeJson(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+export function promotedRetryBusinessTaskType(task = {}) {
+  const metadata = safeJson(task.metadata);
+  const featureTaskType = text(task.feature_key, 80);
+  return text(
+    metadata.promotedBusinessTaskType ||
+      metadata.businessTaskType ||
+      metadata.workflow ||
+      (CROSS_DEVICE_RETRY_TASK_TYPES.has(featureTaskType)
+        ? featureTaskType
+        : '') ||
+      (task.task_type === 'capture_orchestration'
+        ? 'unattended_keyword_capture'
+        : task.task_type),
+    80,
+  );
+}
+
+export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
+  const error = safeJson(item.error);
+  const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
+  const evidence = [error, checkpoint];
+  const code = text(
+    error.code || checkpoint.errorCode || checkpoint.error_code,
+    100,
+  ).toUpperCase();
+  if ([
+    'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+    'SEARCH_FILTER_APPLICATION_FAILED',
+    'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+  ].includes(code)) {
+    return false;
+  }
+  return CROSS_DEVICE_RETRY_SAFETY_CODES.has(code) ||
+    evidence.some(value => [
+      'platform_safety_block',
+      'login_required',
+      'authentication_required',
+    ].includes(text(
+      value.category || value.errorCategory || value.error_category,
+      100,
+    ).toLowerCase())) ||
+    evidence.some(value => (
+      value.securityBlocked === true
+      || value.security_blocked === true
+      || value.platformSafetyBlocked === true
+      || value.platform_safety_blocked === true
+      || safeJson(value.securityEvidence).confirmed === true
+      || safeJson(value.security_evidence).confirmed === true
+    ));
+}
+
+export function projectElasticKeywordRecoveryStatus({
+  elasticPool = false,
+  status = '',
+  error = {},
+  checkpoint = {},
+  attemptCount = 0,
+  safetyHandoffCount = 0,
+  sourceLocalClosureProven = false,
+  technicalLimitReached = false,
+  agentAttemptLimit = AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
+} = {}) {
+  const normalizedStatus = text(status, 80).toLowerCase();
+  if (!elasticPool) return normalizedStatus;
+  if (![
+    'interrupted',
+    'needs_action',
+    'failed',
+    'completed_with_failures',
+    'retryable',
+  ].includes(normalizedStatus)) {
+    return normalizedStatus;
+  }
+  const normalizedAttemptCount = Math.max(0, Number(attemptCount) || 0);
+  const normalizedAttemptLimit = Math.max(
+    1,
+    Number(agentAttemptLimit) || AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
+  );
+  const safetyBlocked = crossDeviceRetryItemNeedsManualSafety({
+    status: normalizedStatus,
+    error,
+    metadata: {checkpoint},
+  });
+  if (normalizedAttemptCount >= normalizedAttemptLimit) {
+    return safetyBlocked || technicalLimitReached ? 'needs_action' : 'failed';
+  }
+  if (safetyBlocked) {
+    const safetyCode = text(
+      safeJson(error).code ||
+        safeJson(checkpoint).errorCode ||
+        safeJson(checkpoint).error_code,
+      100,
+    ).toUpperCase();
+    if (!AUTOMATIC_SEARCH_SAFETY_HANDOFF_CODES.has(safetyCode)) {
+      return 'needs_action';
+    }
+    // A challenge belongs to the source account/session, not to the keyword.
+    // Keep relaying the keyword to distinct Agents; the immutable same-Agent
+    // attempt fence below bounds this naturally without freezing fresh work.
+    return 'retryable';
+  }
+  return normalizedAttemptCount < normalizedAttemptLimit
+    ? 'retryable'
+    : 'failed';
+}
+
+export function elasticRecoveryErrorCode(source = {}) {
+  const error = safeJson(source.error);
+  const checkpoint = safeJson(source.checkpoint);
+  return text(
+    error.code ||
+      error.errorCode ||
+      checkpoint.errorCode ||
+      checkpoint.error_code,
+    100,
+  ).toUpperCase();
+}
+
+export function elasticAttemptBudgetAfterOutcome(
+  attemptCount = 0,
+  source = {},
+) {
+  const normalizedAttemptCount = Math.max(0, Number(attemptCount) || 0);
+  return ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(
+    elasticRecoveryErrorCode(source),
+  )
+    ? Math.max(0, normalizedAttemptCount - 1)
+    : normalizedAttemptCount;
+}
+
+export function projectElasticAttemptBudget(
+  item = {},
+  source = {},
+  executionTaskId = '',
+) {
+  const metadata = safeJson(item?.metadata);
+  const explicitBudget = Number(metadata.elasticAttemptBudgetUsed);
+  const currentBudget = Number.isInteger(explicitBudget) && explicitBudget >= 0
+    ? explicitBudget
+    : Math.max(0, Number(item?.attempt_count) || 0);
+  const explicitTechnicalAttemptCount = Number(
+    metadata.elasticTechnicalAttemptCount,
+  );
+  const currentTechnicalAttemptCount =
+    Number.isInteger(explicitTechnicalAttemptCount) &&
+    explicitTechnicalAttemptCount >= 0
+      ? explicitTechnicalAttemptCount
+      : 0;
+  const errorCode = elasticRecoveryErrorCode(source);
+  const normalizedExecutionTaskId = text(executionTaskId, 100).toLowerCase();
+  const refundState = safeJson(metadata.elasticAttemptBudget);
+  const alreadyRefunded = Boolean(
+    normalizedExecutionTaskId &&
+      text(refundState.refundedExecutionTaskId, 100).toLowerCase() ===
+        normalizedExecutionTaskId,
+  );
+  const shouldRefund = Boolean(
+    normalizedExecutionTaskId &&
+      ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(errorCode) &&
+      !alreadyRefunded,
+  );
+  const attemptBudget = shouldRefund
+    ? elasticAttemptBudgetAfterOutcome(currentBudget, source)
+    : currentBudget;
+  const technicalAttemptCount = shouldRefund
+    ? currentTechnicalAttemptCount + 1
+    : currentTechnicalAttemptCount;
+  const technicalLimitReached = Boolean(
+    ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(errorCode) &&
+      technicalAttemptCount >= ELASTIC_TECHNICAL_HANDOFF_LIMIT,
+  );
+  return {
+    attemptBudget,
+    technicalAttemptCount,
+    technicalLimitReached,
+    metadataPatch: {
+      elasticAttemptBudgetUsed: attemptBudget,
+      elasticTechnicalAttemptCount: technicalAttemptCount,
+      ...(shouldRefund
+        ? {
+            elasticAttemptBudget: {
+              refundedExecutionTaskId: normalizedExecutionTaskId,
+              refundedCode: errorCode,
+              refundedAt: new Date().toISOString(),
+            },
+          }
+        : {}),
+    },
+    refunded: shouldRefund,
+  };
+}
+
+export function elasticParentAgentAttemptLimit(metadata = {}) {
+  const parentMetadata = safeJson(metadata);
+  const planSnapshot = safeJson(parentMetadata.planSnapshot);
+  const resourcePolicy = safeJson(planSnapshot.resourcePolicy);
+  const configuredAgentIds = [
+    ...(Array.isArray(parentMetadata.eligibleAgentIds)
+      ? parentMetadata.eligibleAgentIds
+      : []),
+    ...(Array.isArray(resourcePolicy.relayAgentIds)
+      ? resourcePolicy.relayAgentIds
+      : []),
+  ]
+    .map(value => text(value, 100).toLowerCase())
+    .filter(value => UUID_PATTERN.test(value));
+  const distinctAgentCount = new Set(configuredAgentIds).size;
+  return distinctAgentCount > 0
+    ? Math.min(20, distinctAgentCount)
+    : AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT;
+}
+
+export async function appendEvent(tx, {
+  tenantId,
+  taskId,
+  attemptId = null,
+  agentId = null,
+  eventType,
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+  status = '',
+  message = '',
+  payload = {},
+}) {
+  await tx.execute(`
+    INSERT INTO capture_task_events (
+      tenant_id, task_id, attempt_id, agent_id, event_type,
+      actor_type, actor_id, actor_name, status, message, payload
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+  `, [
+    tenantId,
+    taskId,
+    attemptId,
+    agentId,
+    eventType,
+    actorType,
+    text(actorId, 240),
+    text(actorName, 240),
+    text(status, 80),
+    text(message, 2000),
+    JSON.stringify(safeJson(payload)),
+  ]);
+}
+
+export const ORCHESTRATION_ITEM_TERMINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'failed',
+  'skipped',
+  'canceled',
+]);
+
+const ORCHESTRATION_PARENT_TERMINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'superseded',
+]);
+
+export function orchestrationParentAcceptsProjection(status) {
+  return !ORCHESTRATION_PARENT_TERMINAL_STATUSES.has(text(status, 80));
+}
+
+export async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
+  return tx.queryOne(`
+    SELECT id, title, status, progress, metadata, feature_key,
+      orchestration_revision,
+      orchestration_schedule_id, scheduled_for
+    FROM capture_tasks
+    WHERE id = $1 AND tenant_id = $2
+      AND task_type = 'capture_orchestration'
+    FOR UPDATE
+  `, [parentTaskId, tenantId]);
+}
+
+export async function refreshOrchestrationParentTask(tx, {
+  tenantId,
+  parentTaskId,
+  parent: lockedParent = null,
+  agent = null,
+  snapshot = {},
+  childTaskId = '',
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+  eventAgentId = null,
+}) {
+  const parent = lockedParent ||
+    await lockOrchestrationParent(tx, tenantId, parentTaskId);
+  if (!parent) return null;
+  if (!orchestrationParentAcceptsProjection(parent.status)) return parent;
+  const parentMetadata = safeJson(parent.metadata);
+  const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
+
+  if (!elasticPool) {
+    // Fixed-device patrols remain single-shot. Elastic patrols use their own
+    // bounded handoff budget: one different Agent may continue an unfinished
+    // sequential search pass, and a second safety failure becomes manual.
+    await tx.execute(`
+      UPDATE capture_task_items
+      SET status = 'needs_action',
+        metadata = metadata || jsonb_build_object(
+          'automaticRetrySuppressed', true,
+          'requiresManualAction', true
+        ),
+        error = error || jsonb_build_object(
+          'automaticRetrySuppressed', true,
+          'requiresManualAction', true
+        ),
+        finished_at = COALESCE(finished_at, now()),
+        updated_at = now()
+      WHERE task_id = $1
+        AND tenant_id = $2
+        AND status = 'retryable'
+        AND started_at IS NOT NULL
+        AND COALESCE(metadata->>'disableAutomaticSearchRetry', 'false') = 'true'
+    `, [parentTaskId, tenantId]);
+  }
+
+  const items = await tx.queryAll(`
+    SELECT status
+    FROM capture_task_items
+    WHERE task_id = $1 AND tenant_id = $2
+    ORDER BY ordinal, id
+  `, [parentTaskId, tenantId]);
+  const aggregate = aggregateParentTaskItems(items);
+  if (
+    elasticPool &&
+    aggregate.status === 'needs_action' &&
+    Number(aggregate.counts.retryable || 0) > 0 &&
+    Number(aggregate.counts.needsAction || 0) === 0
+  ) {
+    // retryable 是弹性队列的主动恢复状态，不是人工待办。父任务继续保持
+    // running，详情页也会持续刷新，直到其它 Agent 领取或尝试真正耗尽。
+    aggregate.status = 'running';
+    aggregate.terminal = false;
+  }
+  const negativePatrol =
+    parent.feature_key === 'negative_post_patrol' ||
+    parentMetadata.workflow === 'negative_post_patrol';
+  const watchedContentPatrol =
+    parent.feature_key === 'watched_content_patrol' ||
+    parentMetadata.workflow === 'watched_content_patrol';
+  const contentPatrol = negativePatrol || watchedContentPatrol;
+  const contentPatrolLabel = watchedContentPatrol ? '关注内容' : '负面帖子';
+  const profilePatrol = [
+    'official_account_comment_patrol',
+    'followed_creator_post_patrol',
+    'official_account_post_discovery',
+  ].includes(promotedRetryBusinessTaskType(parent));
+  const previousProgress = safeJson(parent.progress);
+  const settledProgressChanged =
+    Number(previousProgress.current || 0) !== aggregate.progress.current ||
+    Number(previousProgress.total || 0) !== aggregate.progress.total;
+  const reportedBusinessProgressAt = orchestrationCheckpointTimestamp(
+    snapshot.businessProgressAt,
+  );
+  const message = aggregate.status === 'running'
+    ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
+      ? contentPatrol
+        ? `部分${contentPatrolLabel}正在自动恢复，等待空闲节点逐篇接力`
+        : profilePatrol
+          ? '部分账号巡查项正在自动恢复，等待空闲节点接力'
+          : '部分关键词正在自动恢复，等待空闲节点逐词接力'
+      : contentPatrol
+      ? `执行节点正在巡查${contentPatrolLabel}`
+      : profilePatrol
+        ? '执行节点正在重试未完成的账号巡查项'
+      : '多个执行节点正在处理关键词工作项'
+    : aggregate.status === 'needs_action'
+      ? contentPatrol
+        ? `部分${contentPatrolLabel}需要人工处理`
+        : profilePatrol
+          ? '部分账号巡查项仍需要处理'
+        : '部分关键词工作项需要人工处理'
+      : aggregate.terminal
+        ? contentPatrol
+          ? `${watchedContentPatrol ? '关注内容' : '多 Agent 负面帖子'}巡查已结算`
+          : profilePatrol
+        ? '账号巡查任务已结算'
+          : '多 Agent 关键词任务已结算'
+        : contentPatrol
+          ? elasticPool
+            ? `${contentPatrolLabel}保留在云端，等待空闲节点逐篇领取`
+            : `${contentPatrolLabel}已分配，等待执行节点处理`
+          : profilePatrol
+            ? '账号巡查项已重新分配，等待执行节点处理'
+          : '关键词工作项已分配，等待执行节点处理';
+
+  const updated = await tx.queryOne(`
+    UPDATE capture_tasks
+    SET status = $1,
+      progress = $2::jsonb,
+      counts = $3::jsonb,
+      message = $4,
+      heartbeat_at = GREATEST(heartbeat_at, $5::timestamptz),
+      business_progress_at = CASE
+        WHEN $6::timestamptz IS NOT NULL THEN GREATEST(
+          COALESCE(business_progress_at, $6::timestamptz),
+          $6::timestamptz
+        )
+        WHEN $7::boolean THEN GREATEST(
+          COALESCE(business_progress_at, now()),
+          now()
+        )
+        ELSE business_progress_at
+      END,
+      finished_at = CASE
+        WHEN $8::boolean THEN COALESCE(finished_at, $6::timestamptz, now())
+        ELSE NULL
+      END,
+      source_updated_at = CASE
+        WHEN $9::timestamptz IS NULL THEN source_updated_at
+        ELSE GREATEST(source_updated_at, $9::timestamptz)
+      END,
+      updated_at = now()
+    WHERE id = $10 AND tenant_id = $11
+    RETURNING *
+  `, [
+    aggregate.status,
+    JSON.stringify(aggregate.progress),
+    JSON.stringify(aggregate.counts),
+    message,
+    orchestrationCheckpointTimestamp(snapshot.heartbeatAt),
+    reportedBusinessProgressAt,
+    settledProgressChanged,
+    aggregate.terminal,
+    orchestrationCheckpointTimestamp(snapshot.updatedAt || snapshot.heartbeatAt),
+    parentTaskId,
+    tenantId,
+  ]);
+
+  if (
+    updated &&
+    parent.status !== updated.status &&
+    parent.orchestration_schedule_id &&
+    safeJson(parent.metadata).orchestrationScheduleRun === true
+  ) {
+    const schedule = await tx.queryOne(`
+      UPDATE capture_orchestration_schedules
+      SET last_run_at = CASE
+          WHEN $7::boolean THEN COALESCE($1::timestamptz, now())
+          ELSE last_run_at
+        END,
+        last_run_status = $2,
+        last_error = CASE
+          WHEN $2 IN (
+            'pending', 'running', 'completed',
+            'completed_with_warnings', 'canceled'
+          )
+            THEN '{}'::jsonb
+          WHEN $2 = 'needs_action'
+            THEN jsonb_build_object(
+              'code', 'scheduled_run_needs_action',
+              'message', $3::text
+            )
+          ELSE jsonb_build_object(
+            'code', 'scheduled_run_settled_with_failures',
+            'message', $3::text
+          )
+        END,
+        updated_at = now()
+      WHERE id = $4
+        AND tenant_id = $5
+        AND last_run_task_id = $6
+      RETURNING template_task_id, status, next_run_at, last_run_at
+    `, [
+      updated.finished_at,
+      updated.status,
+      message,
+      parent.orchestration_schedule_id,
+      tenantId,
+      parent.id,
+      aggregate.terminal,
+    ]);
+    if (schedule) {
+      await tx.execute(`
+        UPDATE capture_tasks
+        SET metadata = metadata || jsonb_build_object(
+            'scheduleStatus', $1::text,
+            'nextRunAt', COALESCE($2::timestamptz::text, ''),
+            'lastRunAt', COALESCE($3::timestamptz::text, ''),
+            'lastRunStatus', $4::text,
+            'lastRunTaskId', $5::uuid::text
+          ),
+          message = CASE
+            WHEN $4 IN ('completed', 'completed_with_warnings')
+              THEN '上一轮多 Agent 任务已结算，计划等待下一次运行'
+            WHEN $4 = 'canceled'
+              THEN '上一轮多 Agent 任务已停止，计划等待下一次运行'
+            WHEN $4 = 'needs_action'
+              THEN '上一轮有待处理项，可在云端重试失败关键词'
+            WHEN $4 = 'running'
+              THEN '上一轮多 Agent 任务正在执行'
+            WHEN $4 = 'pending'
+              THEN '上一轮多 Agent 任务已下发，等待执行节点'
+            ELSE '上一轮多 Agent 任务有失败项，计划仍会按下一次时间运行'
+          END,
+          updated_at = now(),
+          source_updated_at = now()
+        WHERE id = $6 AND tenant_id = $7
+      `, [
+        schedule.status,
+        schedule.next_run_at,
+        schedule.last_run_at,
+        updated.status,
+        parent.id,
+        schedule.template_task_id,
+        tenantId,
+      ]);
+      await appendEvent(tx, {
+        tenantId,
+        taskId: schedule.template_task_id,
+        agentId: agent?.id || eventAgentId || null,
+        eventType: aggregate.terminal
+          ? 'orchestration_schedule_run_settled'
+          : 'orchestration_schedule_run_status_updated',
+        actorType: agent ? 'capture_agent' : actorType,
+        actorId: agent?.id || actorId,
+        actorName: agent
+          ? agent.display_name || agent.client_label
+          : actorName,
+        status: schedule.status,
+        message: aggregate.terminal
+          ? '无人值守计划的一轮多 Agent 任务已结算'
+          : '无人值守计划的本轮状态已同步',
+        payload: {
+          runTaskId: parent.id,
+          runStatus: updated.status,
+          nextRunAt: schedule.next_run_at,
+        },
+      });
+    }
+  }
+
+  if (updated && parent.status !== updated.status) {
+    const resolvedEventAgentId =
+      agent?.id || eventAgentId || null;
+    await appendEvent(tx, {
+      tenantId,
+      taskId: parentTaskId,
+      agentId: resolvedEventAgentId,
+      eventType: 'orchestration_status_changed',
+      actorType: agent ? 'capture_agent' : actorType,
+      actorId: agent?.id || actorId,
+      actorName: agent
+        ? agent.display_name || agent.client_label
+        : actorName,
+      status: updated.status,
+      message,
+      payload: {
+        previousStatus: parent.status,
+        childTaskId: childTaskId || snapshot.clientTaskId || '',
+        progress: aggregate.progress,
+      },
+    });
+  }
+  return updated;
+}
+
+export async function projectOrchestrationChildControlOutcome(tx, {
+  tenantId,
+  childTask,
+  agentId,
+  status,
+  error = {},
+  actorType = 'system',
+  actorId = '',
+  actorName = '',
+}) {
+  if (!childTask?.parent_task_id) return null;
+
+  // The caller has already locked and mutated the child task. Lock the parent
+  // before touching item rows so command completion, expiry, and heartbeat
+  // projection all use the same task -> parent -> item order.
+  const parent = await lockOrchestrationParent(
+    tx,
+    tenantId,
+    childTask.parent_task_id,
+  );
+  if (!parent) return null;
+  if (!orchestrationParentAcceptsProjection(parent.status)) return parent;
+
+  const elasticPool =
+    safeJson(parent.metadata).distributionMode === 'elastic_pool';
+  const elasticAgentAttemptLimit = elasticParentAgentAttemptLimit(
+    parent.metadata,
+  );
+  const normalizedError = safeJson(error);
+  const currentItemState = elasticPool
+    ? await tx.queryOne(`
+        SELECT id, attempt_count, safety_handoff_count, metadata, error
+        FROM capture_task_items
+        WHERE tenant_id = $1
+          AND task_id = $2
+          AND execution_task_id = $3
+          AND assigned_agent_id = $4
+          AND status NOT IN (
+            'completed', 'completed_with_warnings',
+            'failed', 'skipped', 'canceled'
+          )
+        ORDER BY ordinal, id
+        LIMIT 1
+        FOR UPDATE
+      `, [tenantId, childTask.parent_task_id, childTask.id, agentId])
+    : null;
+  const attemptBudgetProjection = elasticPool
+    ? projectElasticAttemptBudget(
+        currentItemState,
+        {error: normalizedError},
+        childTask.id,
+      )
+    : {
+        attemptBudget: Math.max(
+          0,
+          Number(currentItemState?.attempt_count) || 0,
+        ),
+        metadataPatch: {},
+      };
+  const projectedStatus = projectElasticKeywordRecoveryStatus({
+    elasticPool,
+    status,
+    error: normalizedError,
+    attemptCount: Math.max(
+      0,
+      Number(currentItemState?.attempt_count) || 0,
+    ),
+    safetyHandoffCount: currentItemState?.safety_handoff_count,
+    technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
+    agentAttemptLimit: elasticAgentAttemptLimit,
+  });
+  const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(projectedStatus);
+  await tx.execute(`
+    UPDATE capture_task_items
+    SET status = $1,
+      error = $2::jsonb,
+      metadata = CASE
+        WHEN $8::boolean THEN metadata || $9::jsonb
+        ELSE metadata
+      END,
+      finished_at = CASE
+        WHEN $3::boolean THEN COALESCE(finished_at, now())
+        ELSE NULL
+      END,
+      updated_at = now()
+    WHERE tenant_id = $4
+      AND task_id = $5
+      AND execution_task_id = $6
+      AND assigned_agent_id = $7
+      AND status NOT IN (
+        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+      )
+  `, [
+    projectedStatus,
+    JSON.stringify(normalizedError),
+    terminal,
+    tenantId,
+    childTask.parent_task_id,
+    childTask.id,
+    agentId,
+    elasticPool,
+    JSON.stringify(attemptBudgetProjection.metadataPatch),
+  ]);
+  await tx.execute(`
+    UPDATE capture_task_item_attempts attempt
+    SET status = $1,
+      error = $2::jsonb,
+      finished_at = CASE
+        WHEN $3::boolean THEN COALESCE(attempt.finished_at, now())
+        ELSE NULL
+      END,
+      updated_at = now()
+    FROM capture_task_items item
+    WHERE item.id = attempt.item_id
+      AND item.tenant_id = $4
+      AND item.task_id = $5
+      AND item.execution_task_id = $6
+      AND item.assigned_agent_id = $7
+      AND item.status = $1
+      AND attempt.execution_task_id = $6
+      AND attempt.agent_id = $7
+      AND attempt.status NOT IN (
+        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+      )
+  `, [
+    projectedStatus,
+    JSON.stringify(normalizedError),
+    terminal,
+    tenantId,
+    childTask.parent_task_id,
+    childTask.id,
+    agentId,
+  ]);
+
+  const now = new Date().toISOString();
+  return refreshOrchestrationParentTask(tx, {
+    tenantId,
+    parentTaskId: childTask.parent_task_id,
+    parent,
+    snapshot: {
+      heartbeatAt: now,
+      businessProgressAt: now,
+      updatedAt: now,
+    },
+    childTaskId: childTask.id,
+    actorType,
+    actorId,
+    actorName,
+    eventAgentId: agentId,
+  });
+}

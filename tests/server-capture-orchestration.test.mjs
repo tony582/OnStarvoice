@@ -684,9 +684,10 @@ test('elastic schedule occurrences materialize pending work without preassigning
 });
 
 test('sequential patrol stays one keyword item and is executed inside one Agent task', async () => {
-  const [scheduler, route, agent] = await Promise.all([
+  const [scheduler, route, projection, agent] = await Promise.all([
     readFile(new URL('../server/services/capture-orchestration-scheduler.js', import.meta.url), 'utf8'),
     readFile(new URL('../server/routes/capture-cloud.js', import.meta.url), 'utf8'),
+    readFile(new URL('../server/modules/capture/application/control-outcome-projection.js', import.meta.url), 'utf8'),
     readFile(new URL('../utils/cloud-task-agent.js', import.meta.url), 'utf8'),
   ]);
 
@@ -706,9 +707,12 @@ test('sequential patrol stays one keyword item and is executed inside one Agent 
   assert.match(claim, /planSnapshot,[\s\S]*maxRounds: 1/u);
   assert.doesNotMatch(claim, /dependsOnItemId/u);
 
-  const refreshStart = route.indexOf('async function refreshOrchestrationParentTask');
-  const refreshEnd = route.indexOf('async function projectNegativePatrolSnapshot', refreshStart);
-  const refresh = route.slice(refreshStart, refreshEnd);
+  const refreshStart = projection.indexOf('export async function refreshOrchestrationParentTask');
+  const refreshEnd = projection.indexOf(
+    'export async function projectOrchestrationChildControlOutcome',
+    refreshStart,
+  );
+  const refresh = projection.slice(refreshStart, refreshEnd);
   assert.match(refresh, /status = 'needs_action'[\s\S]*status = 'retryable'[\s\S]*disableAutomaticSearchRetry/u);
   assert.doesNotMatch(refresh, /staged_patrol_predecessor_not_safe/u);
   assert.match(agent, /remoteSequentialSearchPassesV1: true/u);

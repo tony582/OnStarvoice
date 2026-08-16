@@ -47,7 +47,7 @@ test('a device-side retry is adopted by the original orchestration parent', asyn
     read('utils/cloud-task-agent.js'),
   ]);
   const adoptionStart = route.indexOf('async function adoptLocalOrchestrationRecovery');
-  const adoptionEnd = route.indexOf('async function refreshOrchestrationParentTask', adoptionStart);
+  const adoptionEnd = route.indexOf('async function projectNegativePatrolSnapshot', adoptionStart);
   assert.ok(adoptionStart >= 0 && adoptionEnd > adoptionStart);
   const adoption = route.slice(adoptionStart, adoptionEnd);
   assert.match(adoption, /snapshotMetadata\.parentRequestId/u);
@@ -100,20 +100,24 @@ test('device recovery accepts the local client task id recorded by resume comple
 });
 
 test('schedule status follows its latest run before and after terminal settlement', async () => {
-  const route = await read('server/routes/capture-cloud.js');
-  const refreshStart = route.indexOf('async function refreshOrchestrationParentTask');
-  const refreshEnd = route.indexOf(
-    'async function projectNegativePatrolSnapshot',
+  const projection = await read(
+    'server/modules/capture/application/control-outcome-projection.js',
+  );
+  const refreshStart = projection.indexOf(
+    'export async function refreshOrchestrationParentTask',
+  );
+  const refreshEnd = projection.indexOf(
+    'export async function projectOrchestrationChildControlOutcome',
     refreshStart,
   );
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
-  const refresh = route.slice(refreshStart, refreshEnd);
+  const refresh = projection.slice(refreshStart, refreshEnd);
   assert.match(
     refresh,
     /!orchestrationParentAcceptsProjection\(parent\.status\)/u,
   );
   assert.match(
-    route,
+    projection,
     /const ORCHESTRATION_PARENT_TERMINAL_STATUSES = new Set\(\[[\s\S]*'completed_with_failures'[\s\S]*'superseded'[\s\S]*\]\)/u,
   );
   assert.match(refresh, /last_run_status = \$2/u);

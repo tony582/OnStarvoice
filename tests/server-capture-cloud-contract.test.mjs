@@ -87,6 +87,27 @@ const leaseReconciliationSource = await readFile(
   ),
   "utf8",
 );
+const controlOutcomeProjectionSource = await readFile(
+  new URL(
+    "../server/modules/capture/application/control-outcome-projection.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const postgresLeaseReconciliationSource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-lease-reconciliation.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const postgresLocalClosureProofSource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-local-closure-proof.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const automaticRecoverySource = await readFile(
   new URL(
     "../server/modules/capture/application/automatic-recovery.js",
@@ -95,15 +116,22 @@ const automaticRecoverySource = await readFile(
   "utf8",
 );
 
+function readSourceSection(source, label, startMarker, endMarker = "") {
+  const start = source.indexOf(startMarker);
+  assert.notEqual(start, -1, `missing ${label} marker: ${startMarker}`);
+  if (!endMarker) return source.slice(start);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(end, -1, `missing ${label} marker: ${endMarker}`);
+  return source.slice(start, end);
+}
+
 function readRouteSection(startMarker, endMarker) {
-  const start = captureCloudRouteSource.indexOf(startMarker);
-  assert.notEqual(start, -1, `missing route marker: ${startMarker}`);
-  const end = captureCloudRouteSource.indexOf(
+  return readSourceSection(
+    captureCloudRouteSource,
+    "route",
+    startMarker,
     endMarker,
-    start + startMarker.length,
   );
-  assert.notEqual(end, -1, `missing route marker: ${endMarker}`);
-  return captureCloudRouteSource.slice(start, end);
 }
 
 test("capture agents distinguish browser profiles while retaining their environment", () => {
@@ -369,9 +397,11 @@ test("duty cross-device retry fails closed before opening a transaction", async 
 });
 
 test('search-challenge handoff is counted independently without blocking the elastic queue', () => {
-  const projection = readRouteSection(
+  const projection = readSourceSection(
+    controlOutcomeProjectionSource,
+    'control outcome projection',
     'export function projectElasticKeywordRecoveryStatus({',
-    'export function isExplicitUserCancellationSnapshot',
+    'export function elasticRecoveryErrorCode',
   );
   assert.match(projection, /safetyHandoffCount = 0/u);
   assert.match(projection, /sourceLocalClosureProven = false/u);
@@ -399,7 +429,7 @@ test('search-challenge handoff is counted independently without blocking the ela
 
   const dutyDispatch = readRouteSection(
     'export async function dispatchCrossDeviceRetry',
-    'export async function reconcileElasticCaptureLeases',
+    'async function listAutomaticCaptureRetryCandidates',
   );
   assert.match(
     dutyDispatch,
@@ -424,13 +454,10 @@ test('search-challenge handoff is counted independently without blocking the ela
       .length >= 2,
     'safety handoff must verify local closure at source classification and again before writes',
   );
-  const closureProofLoader = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf(
-      'async function loadVerifiedCaptureLocalClosureProof',
-    ),
-    captureCloudRouteSource.indexOf(
-      'export async function dispatchCrossDeviceRetry',
-    ),
+  const closureProofLoader = readSourceSection(
+    postgresLocalClosureProofSource,
+    'PostgreSQL local closure proof',
+    'export async function loadVerifiedCaptureLocalClosureProof',
   );
   assert.match(closureProofLoader, /FROM capture_task_snapshots snapshot/u);
   assert.match(closureProofLoader, /snapshot\.attempt_id/u);
@@ -1566,7 +1593,7 @@ test("targeted detail result projection has a closed workflow allow-list", () =>
 test("negative patrol result projection binds server records and fresh observations", () => {
   const projection = readRouteSection(
     "async function projectNegativePatrolSnapshot",
-    "async function projectOrchestrationChildControlOutcome",
+    "async function projectOrchestrationSnapshot",
   );
   assert.match(projection, /id = \$14::uuid/u);
   assert.match(projection, /record_id = \$15::uuid/u);
@@ -1800,9 +1827,11 @@ test("sequential Douyin checkpoints retain both passes and resume only the unfin
 });
 
 test("elastic sequential patrol keeps one bounded cross-agent handoff", () => {
-  const refresh = readRouteSection(
-    "async function refreshOrchestrationParentTask",
-    "async function projectNegativePatrolSnapshot",
+  const refresh = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export async function refreshOrchestrationParentTask",
+    "export async function projectOrchestrationChildControlOutcome",
   );
   assert.match(
     refresh,
@@ -1853,13 +1882,16 @@ test("every settled orchestration parent is absorbing against late projections",
     assert.equal(orchestrationParentAcceptsProjection(status), true);
   }
 
-  const refresh = readRouteSection(
-    "async function refreshOrchestrationParentTask",
-    "async function projectNegativePatrolSnapshot",
+  const refresh = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export async function refreshOrchestrationParentTask",
+    "export async function projectOrchestrationChildControlOutcome",
   );
-  const controlProjection = readRouteSection(
-    "async function projectOrchestrationChildControlOutcome",
-    "async function projectOrchestrationSnapshot",
+  const controlProjection = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export async function projectOrchestrationChildControlOutcome",
   );
   const snapshotProjection = readRouteSection(
     "async function projectOrchestrationSnapshot",
@@ -1872,9 +1904,11 @@ test("every settled orchestration parent is absorbing against late projections",
     );
   }
 
-  const leaseRecovery = readRouteSection(
-    "async function reconcileElasticCaptureLeasesInRoute",
-    "export async function reconcileAutomaticCaptureRetries",
+  const leaseRecovery = readSourceSection(
+    postgresLeaseReconciliationSource,
+    "PostgreSQL lease reconciliation",
+    "async function reconcileElasticCaptureLeasesInPostgres",
+    "const reconcileElasticCaptureLeasesImpl",
   );
   assert.match(
     leaseRecovery,
@@ -2461,9 +2495,10 @@ test("orchestration checkpoint database values are bounded and timestamp-safe", 
 });
 
 test("orchestration control outcomes lock parent before updating items", () => {
-  const helper = readRouteSection(
-    "async function projectOrchestrationChildControlOutcome",
-    "async function projectOrchestrationSnapshot",
+  const helper = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export async function projectOrchestrationChildControlOutcome",
   );
   const parentLock = helper.indexOf("await lockOrchestrationParent");
   const itemUpdate = helper.indexOf("UPDATE capture_task_items");
@@ -3012,8 +3047,10 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
 });
 
 test("elastic queue requires exact closure before reclaiming stale current-schema work", () => {
-  const lease = readRouteSection(
-    'async function reconcileElasticCaptureLeasesInRoute',
+  const lease = readSourceSection(
+    postgresLeaseReconciliationSource,
+    "PostgreSQL lease reconciliation",
+    'async function reconcileElasticCaptureLeasesInPostgres',
     'const reconcileElasticCaptureLeasesImpl',
   );
   assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
@@ -3108,12 +3145,20 @@ test("elastic queue requires exact closure before reclaiming stale current-schem
   );
   assert.doesNotMatch(leaseReconciliationSource, /pendingReconciliation/u);
   assert.match(
+    postgresLeaseReconciliationSource,
+    /createElasticCaptureLeaseReconciler\(\{[\s\S]*reconcileLeases: reconcileElasticCaptureLeasesInPostgres/u,
+  );
+  assert.doesNotMatch(
     captureCloudRouteSource,
-    /createElasticCaptureLeaseReconciler\(\{[\s\S]*reconcileLeases: reconcileElasticCaptureLeasesInRoute/u,
+    /(?:async\s+)?function\s+(?:listElasticCaptureLeaseCandidates|settleElasticCaptureLeaseCandidate|reconcileElasticCaptureLeases)\b/u,
+  );
+  assert.doesNotMatch(
+    captureCloudRouteSource,
+    /\breconcileElasticCaptureLeasesImpl\b|createElasticCaptureLeaseReconciler/u,
   );
   assert.match(
-    captureCloudRouteSource,
-    /export async function reconcileElasticCaptureLeases\(input = 50\)[\s\S]*return reconcileElasticCaptureLeasesImpl\(input\)/u,
+    cronSource,
+    /from '\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -3124,7 +3169,7 @@ test("elastic queue requires exact closure before reclaiming stale current-schem
 test("elastic negative patrol uses the same bounded technical and safety handoff policy", () => {
   const projection = readRouteSection(
     'async function projectNegativePatrolSnapshot',
-    'async function projectOrchestrationChildControlOutcome',
+    'async function projectOrchestrationSnapshot',
   );
   assert.match(projection, /distributionMode ===[\s\S]*'elastic_pool'/u);
   assert.match(projection, /classifyCaptureRecoveryDisposition/u);
@@ -3972,10 +4017,12 @@ test("remote keyword post limits are optional, normalized, and fail safely", () 
 });
 
 test("remote request identity changes when only the keyword post limit changes", () => {
-  const safeJsonSource = readRouteSection(
-    "function safeJson(value)",
-    "function remoteTaskRequestHash(",
-  );
+  const safeJsonSource = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export function safeJson(value)",
+    "export function promotedRetryBusinessTaskType(",
+  ).replace("export function safeJson", "function safeJson");
   const hashSource = readRouteSection(
     "function remoteTaskRequestHash(",
     "export function captureTaskSnapshotFingerprint(",
@@ -4591,7 +4638,7 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
 test("recovery verification and replay clocks require exact business evidence", () => {
   const recoverySource = readRouteSection(
     "async function projectNegativePatrolSnapshot",
-    "async function projectOrchestrationChildControlOutcome",
+    "async function projectOrchestrationSnapshot",
   );
   assert.match(
     recoverySource,
