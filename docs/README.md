@@ -2,7 +2,7 @@
 
 本目录是 StarVoice 当前稳定基线的文档入口。代码、数据库迁移和运行脚本是最终事实来源；当专题旧文档与本索引列出的稳定版文档冲突时，应先核对当前代码，再修正文档，不要沿用历史假设。
 
-> 截至 2026-08-16，[PR #24](https://github.com/tony582/OnStarvoice/pull/24) 已合并为 `main@a5faf6b0f80b080b371f0ee1ef657ab8b29fb707`，但生产仍是迁移 066、单一 `all`，未启用 split。P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下通过：`all` 在 `60.181/300.794/646.675s` 通过观察，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）为 `1/1/0/0`；split 在 `60.107/300.549s` 通过观察，下一 AI 周期于 `599.115s` 出现且摘要同为 `1/1/0/0`；v066 dump 恢复已验证，v067 最终 dump 恢复 digest 相等，清理全为 `true`，生产未触碰。P2-E-HL 不是 Hosted 测试服务器，split 的 `599.115s` 也不是 rearm 后完整满 10 分钟；P2-E-H 仍未执行，P2-E 整体仅部分完成，生产 split 阻断保留。
+> 截至 2026-08-16，[PR #25](https://github.com/tony582/OnStarvoice/pull/25) 已以 merge commit `fcc876d9ce4822943e5df837674e517495674161` 进入 `main`；最终 head `e6a4857` 的两组 CI 共 12/12、合并后 `main` CI 6/6 均通过，但生产仍是迁移 066、单一 `all`，未启用 split。P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下通过：`all` 在 `60.181/300.794/646.675s` 通过观察，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）为 `1/1/0/0`；split 在 `60.107/300.549s` 通过观察，下一 AI 周期于 `599.115s` 出现且摘要同为 `1/1/0/0`；v066 dump 恢复已验证，v067 最终 dump 恢复 digest 相等，清理全为 `true`，生产未触碰。P2-E-HL 不是 Hosted 测试服务器，split 的 `599.115s` 也不是 rearm 后完整满 10 分钟；P2-E-H 仍未执行，P2-E 整体仅部分完成，G2 尚未关闭，P3 尚未开始，生产 split 阻断保留。
 
 ## 按角色阅读
 
