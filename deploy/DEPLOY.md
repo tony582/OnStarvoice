@@ -8,7 +8,7 @@
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
 >
-> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** [PR #23](https://github.com/tony582/OnStarvoice/pull/23) 已合并为 `main@7bf7ab1f91a41fc6327c1070e345f1ce8055974b`，但 P2-B/P2-C/P2-D 当前均未部署；生产仍为迁移 066、单一 `all`，未启用 split。P2-E-L 本机隔离轮次已完成：最新两阶段 PostgreSQL runner 在 Node 24/18.20.8 下均以原始 TAP `1/1 + 25/25` 通过，可分别汇总为 `26/26`，两版非 PostgreSQL 回归均为 `1289/1289`，工程门禁通过；每轮清理前连接、P2-E/P2-D schema 与 advisory lock 均为 0，精确专用库均已删除。该证据只证明空业务库 ownership、Maintenance ledger/checksum、真实进程角色锁与启停，不覆盖真实 PM2、Ingress、流量、任务 lineage、1/5/10 分钟周期或备份回切。P2-E-H 尚未执行，生产 split 阻断保留。
+> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** [PR #24](https://github.com/tony582/OnStarvoice/pull/24) 已合并为 `main@a5faf6b0f80b080b371f0ee1ef657ab8b29fb707`，但该合并及 P2-B/P2-C/P2-D/P2-E 均未部署；生产仍为迁移 066、单一 `all`，未启用 split。P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下通过：`all` 观察点为 `60.181/300.794/646.675s`，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）`1/1/0/0`；split 观察点为 `60.107/300.549s`，下一 AI 周期为 `599.115s`、摘要 `1/1/0/0`；v066 dump 恢复已验证，v067 最终 dump 恢复 digest 相等，清理全为 `true`，生产未触碰。它不是 Hosted 测试服务器，且 split 的 `599.115s` 不是 rearm 后完整满 10 分钟；P2-E-H 仍未执行，生产 split 阻断保留。
 
 ## 1. 当前拓扑
 

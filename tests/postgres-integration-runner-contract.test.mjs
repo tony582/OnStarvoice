@@ -4,6 +4,11 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import {
+  isAllowedPostgresIntegrationServerAddress,
+  validatePostgresIntegrationTarget,
+} from '../scripts/lib/postgres-integration-target.mjs';
+
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runner = path.join(repositoryRoot, 'scripts', 'run-postgres-integration-tests.mjs');
 const migrationIntegration = path.join(
@@ -14,7 +19,7 @@ const migrationIntegration = path.join(
   'migrations.integration.mjs',
 );
 
-test('PostgreSQL integration runner rejects URL parameters that can override the local host', () => {
+test('PostgreSQL integration guards reject URL overrides and fence Docker bridge exceptions', () => {
   const unsafeUrl = 'postgresql://127.0.0.1:5432/onstarvoice_test?host=%2Fdefinitely-not-an-onstarvoice-socket';
   const env = { ...process.env, TEST_DATABASE_URL: unsafeUrl };
   delete env.DATABASE_URL;
@@ -30,6 +35,62 @@ test('PostgreSQL integration runner rejects URL parameters that can override the
   assert.equal(result.status, 2);
   assert.match(result.stderr, /query parameters are not allowed/u);
   assert.doesNotMatch(result.stdout, /target accepted/u);
+
+  const target = validatePostgresIntegrationTarget({
+    testDatabaseUrl: 'postgresql://onstarvoice:test-only@127.0.0.1:5432/onstarvoice_ci',
+  });
+  const githubHostedLinux = {
+    CI: 'true',
+    GITHUB_ACTIONS: 'true',
+    RUNNER_ENVIRONMENT: 'github-hosted',
+    RUNNER_OS: 'Linux',
+  };
+  const accepts = (serverAddress, overrides = {}) =>
+    isAllowedPostgresIntegrationServerAddress({
+      serverAddress,
+      target: overrides.target || target,
+      environment: {...githubHostedLinux, ...overrides.environment},
+    });
+
+  assert.equal(isAllowedPostgresIntegrationServerAddress({
+    serverAddress: '127.0.0.1/32',
+    target,
+    environment: {},
+  }), true);
+  for (const address of ['10.0.0.2', '172.18.0.2', '172.31.255.254/32', '192.168.50.2']) {
+    assert.equal(accepts(address), true, `expected GitHub Docker address ${address} to pass`);
+  }
+  for (const address of [
+    '8.8.8.8',
+    '100.64.0.1',
+    '169.254.1.1',
+    '172.32.0.1',
+    '172.18.0.2/24',
+    'fc00::1',
+    'not-an-address',
+  ]) {
+    assert.equal(accepts(address), false, `expected address ${address} to remain blocked`);
+  }
+  assert.equal(accepts('172.18.0.2', {
+    environment: {GITHUB_ACTIONS: 'false'},
+  }), false);
+  assert.equal(accepts('172.18.0.2', {
+    environment: {RUNNER_ENVIRONMENT: 'self-hosted'},
+  }), false);
+  assert.equal(accepts('172.18.0.2', {
+    environment: {RUNNER_OS: 'macOS'},
+  }), false);
+
+  const targetWith = rawUrl => validatePostgresIntegrationTarget({testDatabaseUrl: rawUrl});
+  assert.equal(accepts('172.18.0.2', {
+    target: targetWith('postgresql://onstarvoice:test-only@localhost:5432/onstarvoice_ci'),
+  }), false);
+  assert.equal(accepts('172.18.0.2', {
+    target: targetWith('postgresql://onstarvoice:test-only@127.0.0.1:5433/onstarvoice_ci'),
+  }), false);
+  assert.equal(accepts('172.18.0.2', {
+    target: targetWith('postgresql://onstarvoice:test-only@127.0.0.1:5432/onstarvoice_ci_extra'),
+  }), false);
 });
 
 test('migration integration fails closed when executed directly without an explicit test database', () => {
