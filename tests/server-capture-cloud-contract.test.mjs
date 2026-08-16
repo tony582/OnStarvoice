@@ -63,6 +63,13 @@ const leaseReconciliationSource = await readFile(
   ),
   "utf8",
 );
+const automaticRecoverySource = await readFile(
+  new URL(
+    "../server/modules/capture/application/automatic-recovery.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function readRouteSection(startMarker, endMarker) {
   const start = captureCloudRouteSource.indexOf(startMarker);
@@ -2199,7 +2206,7 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   const dispatchCore = captureCloudRouteSource.slice(
     captureCloudRouteSource.indexOf("async function dispatchCrossDeviceRetry"),
     captureCloudRouteSource.indexOf(
-      "export async function reconcileAutomaticCaptureRetries",
+      "async function listAutomaticCaptureRetryCandidates",
     ),
   );
   assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
@@ -2231,7 +2238,15 @@ test("settled single-node tasks can retry on another idle Agent without forking 
 test("cron automatically dispatches unfinished items before attention delivery", () => {
   assert.match(
     captureCloudRouteSource,
-    /export async function reconcileAutomaticCaptureRetries/u,
+    /createAutomaticCaptureRetryReconciler\(\{[\s\S]*listCandidates: listAutomaticCaptureRetryCandidates,[\s\S]*dispatchRetry: dispatchCrossDeviceRetry/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /createRequestKey: \(\) => crypto\.randomUUID\(\)[\s\S]*formatErrorMessage: message => text\(message, 240\)/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /export async function reconcileAutomaticCaptureRetries\(limit = 10\)[\s\S]*return reconcileAutomaticCaptureRetriesImpl\(limit\)/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -2253,6 +2268,15 @@ test("cron automatically dispatches unfinished items before attention delivery",
     captureCloudRouteSource,
     /item_id = ANY\(\$2::uuid\[\]\)[\s\S]*crossDeviceRetrySourceAgentIdsForItems/u,
   );
+  assert.match(
+    automaticRecoverySource,
+    /normalizeCandidateLimit\(limit\)[\s\S]*for \(const candidate of candidates\)[\s\S]*allocation < 30[\s\S]*dispatchCandidateRetry/u,
+  );
+  assert.match(
+    automaticRecoverySource,
+    /idle_compatible_agent_unavailable[\s\S]*MANUAL_ONLY_ERRORS[\s\S]*CONFLICT_ERROR_CODES[\s\S]*worker_error/u,
+  );
+  assert.doesNotMatch(automaticRecoverySource, /pendingReconciliation/u);
   assert.match(
     cronSource,
     /reconcileAutomaticCaptureRetries\(10\)/u,
