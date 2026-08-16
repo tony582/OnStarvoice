@@ -37,6 +37,9 @@ import {
 import {
   createElasticCaptureLeaseReconciler,
 } from '../modules/capture/application/lease-reconciliation.js';
+import {
+  createAutomaticCaptureRetryReconciler,
+} from '../modules/capture/application/automatic-recovery.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -9073,9 +9076,8 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
   return reconcileElasticCaptureLeasesImpl(limit);
 }
 
-export async function reconcileAutomaticCaptureRetries(limit = 10) {
-  const normalizedLimit = Math.max(1, Math.min(50, Number(limit) || 10));
-  const candidates = await queryAll(`
+async function listAutomaticCaptureRetryCandidates(normalizedLimit) {
+  return queryAll(`
     SELECT id, tenant_id, status, orchestration_revision
     FROM capture_tasks
     WHERE parent_task_id IS NULL
@@ -9121,86 +9123,18 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
     [...CROSS_DEVICE_RETRY_TASK_TYPES],
     normalizedLimit,
   ]);
+}
 
-  const summary = {
-    scanned: candidates.length,
-    dispatched: 0,
-    waitingForAgent: 0,
-    manualOnly: 0,
-    skipped: 0,
-    failed: 0,
-    results: [],
-  };
-  for (const candidate of candidates) {
-    let expectedRevision = Number(candidate.orchestration_revision || 0);
-    for (let allocation = 0; allocation < 30; allocation += 1) {
-      try {
-        const result = await dispatchCrossDeviceRetry({
-          tenantId: candidate.tenant_id,
-          taskId: candidate.id,
-          requestKey: crypto.randomUUID(),
-          expectedRevision,
-          actorType: 'system',
-          requestedByName: '自动调度中心',
-          automatic: true,
-        });
-        if (!result?.error) {
-          summary.dispatched += result.existing ? 0 : 1;
-          expectedRevision = Number(
-            result.parent?.orchestration_revision ?? expectedRevision,
-          );
-          summary.results.push({
-            taskId: candidate.id,
-            action: result.existing ? 'existing' : 'dispatched',
-            retryTaskId: result.child?.id || '',
-            itemCount: Number(result.itemCount || 0),
-          });
-          if (result.existing) break;
-          continue;
-        }
-        if (result.error === 'idle_compatible_agent_unavailable') {
-          summary.waitingForAgent += 1;
-        } else if (
-          [
-            'retry_requires_manual_safety_action',
-            'automatic_retry_disabled',
-          ].includes(result.error)
-        ) {
-          summary.manualOnly += 1;
-        } else {
-          summary.skipped += 1;
-        }
-        summary.results.push({
-          taskId: candidate.id,
-          action: result.error,
-        });
-        break;
-      } catch (error) {
-        if (
-          error?.crossDeviceRetryError ||
-          [
-            'cross_device_retry_item_conflict',
-            'cross_device_retry_revision_conflict',
-          ].includes(error?.code)
-        ) {
-          summary.skipped += 1;
-          summary.results.push({
-            taskId: candidate.id,
-            action: error.crossDeviceRetryError || error.code,
-          });
-          break;
-        }
-        summary.failed += 1;
-        summary.results.push({
-          taskId: candidate.id,
-          action: 'worker_error',
-          message: text(error?.message, 240),
-        });
-        break;
-      }
-    }
-  }
-  return summary;
+const reconcileAutomaticCaptureRetriesImpl =
+  createAutomaticCaptureRetryReconciler({
+    listCandidates: listAutomaticCaptureRetryCandidates,
+    dispatchRetry: dispatchCrossDeviceRetry,
+    createRequestKey: () => crypto.randomUUID(),
+    formatErrorMessage: message => text(message, 240),
+  });
+
+export async function reconcileAutomaticCaptureRetries(limit = 10) {
+  return reconcileAutomaticCaptureRetriesImpl(limit);
 }
 
 router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
