@@ -8,7 +8,7 @@
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
 >
-> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** [PR #25](https://github.com/tony582/OnStarvoice/pull/25) 已以 merge commit `fcc876d9ce4822943e5df837674e517495674161` 进入 `main`，但该合并及 P2-B/P2-C/P2-D/P2-E 均未部署；生产仍为迁移 066、单一 `all`，未启用 split。P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下通过：`all` 观察点为 `60.181/300.794/646.675s`，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）`1/1/0/0`；split 观察点为 `60.107/300.549s`，下一 AI 周期为 `599.115s`、摘要 `1/1/0/0`；v066 dump 恢复已验证，v067 最终 dump 恢复 digest 相等，清理全为 `true`，生产未触碰。它不是 Hosted 测试服务器，且 split 的 `599.115s` 不是 rearm 后完整满 10 分钟；P2-E-H 仍未执行，G2 尚未关闭，P3 尚未开始，生产 split 阻断保留。
+> **当前生产发布必须以该受控手册为准。`deploy/deploy.sh` 已退役为 fail-closed 墓碑，会在任何构建、网络或写入动作前退出 64；不得移除 guard 后复用。** [PR #25](https://github.com/tony582/OnStarvoice/pull/25) 已以 merge commit `fcc876d9ce4822943e5df837674e517495674161` 进入 `main`，但该合并及 P2-B/P2-C/P2-D/P2-E 均未部署；生产仍为迁移 066、单一 `all`，未启用 split。P2-E-HL 本机 production-like 替代演练 `local_20260815172649_967d28` 在 Node `18.20.8`、PM2 `7.0.3`、Nginx `1.31.3`、PostgreSQL `17.9` 下通过：`all` 观察点为 `60.181/300.794/646.675s`，AI 摘要（cycleStarts/emptyBatches/errors/labeledRecords）`1/1/0/0`；split 观察点为 `60.107/300.549s`，下一 AI 周期为 `599.115s`、摘要 `1/1/0/0`；v066 dump 恢复已验证，v067 最终 dump 恢复 digest 相等，清理全为 `true`，生产未触碰。它不是 Hosted 测试服务器，且 split 的 `599.115s` 不是 rearm 后完整满 10 分钟；P2-E-H 仍未执行，G2 尚未关闭；P3 已按 2026-08-16 有限豁免获准本地实现、隔离测试、提交、推送及创建 Draft PR，Ready、合并、生产数据操作、生产部署与 split 均未授权。
 
 ## 1. 当前拓扑
 

@@ -25,6 +25,7 @@ const tests = entries
   .map(entry => path.join(integrationRoot, entry.name))
   .sort();
 const requiredTestFiles = [
+  'capture-command-reconciliation.integration.mjs',
   'http-auth.integration.mjs',
   'maintenance-entrypoint.integration.mjs',
   'migration-governance.integration.mjs',

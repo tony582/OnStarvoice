@@ -49,6 +49,13 @@ const cronSource = await readFile(
   new URL("../server/cron.js", import.meta.url),
   "utf8",
 );
+const commandLifecycleSource = await readFile(
+  new URL(
+    "../server/modules/capture/application/command-lifecycle.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function readRouteSection(startMarker, endMarker) {
   const start = captureCloudRouteSource.indexOf(startMarker);
@@ -2121,11 +2128,19 @@ test("ended failures can be dismissed from attention without deleting task histo
 test("stale cloud commands are reconciled by cron without waiting for UI or Agent heartbeat", () => {
   assert.match(
     captureCloudRouteSource,
-    /export async function reconcilePendingCaptureCommands/u,
+    /createPendingCaptureCommandReconciler\(\{[\s\S]*listPendingTenants:[\s\S]*expireTenantCommands:/u,
   );
   assert.match(
     captureCloudRouteSource,
-    /WHERE status IN \('pending', 'acknowledged'\)[\s\S]*expireStaleCommands\(tx, tenant\.tenant_id\)/u,
+    /WHERE status IN \('pending', 'acknowledged'\)[\s\S]*GROUP BY tenant_id[\s\S]*ORDER BY MIN\(created_at\), tenant_id[\s\S]*LIMIT \$1/u,
+  );
+  assert.match(
+    commandLifecycleSource,
+    /if \(pendingReconciliation\) return pendingReconciliation;[\s\S]*for \(const tenant of tenants\)[\s\S]*runTransaction\(tx =>[\s\S]*expireCommands\(tx, tenant\.tenant_id\)/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /export async function reconcilePendingCaptureCommands\(options = \{\}\)[\s\S]*return reconcilePendingCaptureCommandsImpl\(options\)/u,
   );
   assert.match(
     cronSource,
