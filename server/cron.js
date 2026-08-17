@@ -12,8 +12,10 @@ import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.j
 import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
 import {
   reconcileAutomaticCaptureRetries,
-  reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
+import {
+  reconcilePendingCaptureCommands,
+} from './modules/capture/infrastructure/postgres-command-reconciliation.js';
 import {
   reconcileElasticCaptureLeases,
 } from './modules/capture/infrastructure/postgres-lease-reconciliation.js';

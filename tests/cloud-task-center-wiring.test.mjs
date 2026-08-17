@@ -19,9 +19,10 @@ async function readMigration(prefix) {
 }
 
 test("server mounts the tenant cloud task center and agent endpoints", async () => {
-  const [app, route] = await Promise.all([
+  const [app, route, commandReconciliation] = await Promise.all([
     read("server/app.js"),
     read("server/routes/capture-cloud.js"),
+    read("server/modules/capture/infrastructure/postgres-command-reconciliation.js"),
   ]);
   assert.match(app, /app\.use\('\/api\/capture-cloud', captureCloudRouter\)/u);
   assert.match(route, /router\.post\('\/agent\/liveness', requireCaptureAgent/u);
@@ -29,14 +30,20 @@ test("server mounts the tenant cloud task center and agent endpoints", async () 
   assert.match(route, /router\.post\(\s*'\/agents\/:id\/tasks'\s*,\s*requireTenantAccess\s*,\s*requireSessionUser\s*,\s*requireTenantWriter/u);
   assert.match(route, /router\.post\('\/tasks\/:id\/resume', requireTenantAccess, requireSessionUser, requireTenantWriter/u);
   assert.match(route, /router\.post\('\/tasks\/:id\/stop', requireTenantAccess, requireSessionUser, requireTenantWriter/u);
-  assert.match(route, /status IN \('pending', 'acknowledged'\)/u);
+  assert.match(commandReconciliation, /status IN \('pending', 'acknowledged'\)/u);
   assert.match(route, /t\.status = 'resume_requested'[\s\S]*t\.metadata->>'resumeCommandId' = c\.id::text/u);
   assert.match(route, /WHEN EXCLUDED\.attempt_number > capture_tasks\.attempt_number[\s\S]*THEN EXCLUDED\.progress_seq/u);
   assert.match(route, /jsonb_strip_nulls\(jsonb_build_object\([\s\S]*'resumeCommandId'/u);
-  assert.match(route, /command_canceled_task_changed/u);
-  assert.match(route, /c\.payload->>'authCodeId' = ca\.auth_code_id::text/u);
-  assert.match(route, /c\.payload->>'authBindingId' = ca\.auth_binding_id::text/u);
-  assert.match(route, /c\.payload->>'platform' = t\.platform/u);
+  assert.match(commandReconciliation, /command_canceled_task_changed/u);
+  assert.match(
+    commandReconciliation,
+    /c\.payload->>'authCodeId' = ca\.auth_code_id::text/u,
+  );
+  assert.match(
+    commandReconciliation,
+    /c\.payload->>'authBindingId' = ca\.auth_binding_id::text/u,
+  );
+  assert.match(commandReconciliation, /c\.payload->>'platform' = t\.platform/u);
 });
 
 test("agent credentials remain bound to an active code and active environment binding", async () => {

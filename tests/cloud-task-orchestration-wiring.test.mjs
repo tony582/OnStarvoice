@@ -238,10 +238,13 @@ test('negative-patrol snapshots lock and fence an operator-stopped parent before
 });
 
 test('automatic retry excludes parents explicitly stopped by an operator', async () => {
-  const route = await read('server/routes/capture-cloud.js');
+  const [route, commandLifecycle] = await Promise.all([
+    read('server/routes/capture-cloud.js'),
+    read('server/modules/capture/application/command-lifecycle.js'),
+  ]);
   assert.match(
-    route,
-    /REMOTELY_STOPPABLE_STATUSES[\s\S]*'waiting_device'/u,
+    commandLifecycle,
+    /export const REMOTELY_STOPPABLE_STATUSES = new Set\(\[[\s\S]*?'waiting_device'[\s\S]*?\]\);/u,
   );
   assert.match(
     route,
