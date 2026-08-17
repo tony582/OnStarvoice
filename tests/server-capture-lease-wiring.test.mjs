@@ -151,13 +151,7 @@ test('Cron consumes the canonical lease while route retains one compatibility ex
     cronSource,
     /import\s*\{\s*reconcileElasticCaptureLeases,?\s*\}\s*from '\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
   );
-  const routeImport = cronSource.match(
-    /import\s*\{([\s\S]*?)\}\s*from '\.\/routes\/capture-cloud\.js';/u,
-  );
-  assert.ok(routeImport);
-  assert.match(routeImport[1], /reconcileAutomaticCaptureRetries/u);
-  assert.doesNotMatch(routeImport[1], /reconcilePendingCaptureCommands/u);
-  assert.doesNotMatch(routeImport[1], /reconcileElasticCaptureLeases/u);
+  assert.doesNotMatch(cronSource, /from '\.\/routes\/capture-cloud\.js';/u);
 
   assert.match(
     routeSource,

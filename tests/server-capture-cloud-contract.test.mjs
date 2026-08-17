@@ -91,6 +91,13 @@ const postgresLeaseReconciliationSource = await readFile(
   ),
   "utf8",
 );
+const postgresCrossDeviceRetrySource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-cross-device-retry.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const automaticRecoverySource = await readFile(
   new URL(
     "../server/modules/capture/application/automatic-recovery.js",
@@ -1353,7 +1360,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
 test("elastic recovery releases the item immediately while cooling only the source Agent", () => {
   const recovery = readRouteSection(
     "function buildElasticRecoveryMetadata({",
-    "export function crossDeviceRetryAgentSupportsTask(",
+    "function sendCrossDeviceRetryError(",
   );
 
   assert.match(recovery, /state: 'released_for_handoff'/u);
@@ -1432,7 +1439,7 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
     /from '\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /COALESCE\(metadata->>'distributionMode', ''\) <> 'elastic_pool'/u,
   );
 });
@@ -2043,7 +2050,7 @@ test("remote request identity changes when only the keyword post limit changes",
     controlOutcomeProjectionSource,
     "control outcome projection",
     "export function safeJson(value)",
-    "export function promotedRetryBusinessTaskType(",
+    "export function orchestrationCheckpointInteger(",
   ).replace("export function safeJson", "function safeJson");
   const hashSource = readRouteSection(
     "function remoteTaskRequestHash(",
@@ -2254,19 +2261,45 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(retry, /requireSessionUser/u);
   assert.match(retry, /requireTenantWriter/u);
   assert.match(retry, /dispatchCrossDeviceRetry/u);
-  const dispatchCore = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf("async function dispatchCrossDeviceRetry"),
-    captureCloudRouteSource.indexOf(
-      "async function listAutomaticCaptureRetryCandidates",
-    ),
+  const dispatchCore = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "PostgreSQL cross-device dispatch",
+    "export async function dispatchCrossDeviceRetry",
+    "async function listAutomaticCaptureRetryCandidates",
+  );
+  const promotion = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "single-node promotion",
+    "async function synthesizePromotedKeywordItems",
+    "async function loadIdleCrossDeviceRetryAgent",
+  );
+  const agentSelection = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "cross-device Agent selection",
+    "async function loadIdleCrossDeviceRetryAgent",
+    "function promotedRetryFallbackTarget",
+  );
+  const profileRenewal = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "profile retry renewal",
+    "async function renewProfileRetryExecutions",
+    "export async function dispatchCrossDeviceRetry",
   );
   assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
-  assert.match(captureCloudRouteSource, /AS active_command_count/u);
+  assert.match(postgresCrossDeviceRetrySource, /AS active_command_count/u);
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /Number\(agent\.active_command_count \|\| 0\) === 0/u,
   );
-  assert.match(captureCloudRouteSource, /findCaptureAgentExecutionSlotBlocker/u);
+  assert.match(agentSelection, /lockCaptureAgentExecutionSlot/u);
+  assert.ok(
+    agentSelection.indexOf("await lockCaptureAgentExecutionSlot") <
+      agentSelection.indexOf("FOR UPDATE OF ca"),
+  );
+  assert.ok(
+    agentSelection.indexOf("FOR UPDATE OF ca") <
+      agentSelection.indexOf("findCaptureAgentExecutionSlotBlocker"),
+  );
   assert.match(dispatchCore, /promoteSingleNodeTaskForRetry/u);
   assert.match(dispatchCore, /task_type = 'capture_orchestration'/u);
   assert.match(dispatchCore, /parent_task_id/u);
@@ -2277,46 +2310,122 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(dispatchCore, /abortCrossDeviceRetry\(promoted\.error\)/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /cross_device_retry_transaction_abort/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    promotion,
     /promotedRetryParent' IS DISTINCT FROM 'true'/u,
+  );
+
+  assert.match(
+    promotion,
+    /orchestrationCheckpointEntries\(task\)[\s\S]*INSERT INTO capture_task_items[\s\S]*INSERT INTO capture_task_item_attempts/u,
+  );
+  const promotedSourceMarker = promotion.indexOf(
+    'promotedSourceExecution: true',
+  );
+  const sourceChildInsert = promotion.indexOf(
+    'INSERT INTO capture_tasks',
+    promotedSourceMarker,
+  );
+  const sourceItemRelink = promotion.indexOf(
+    'UPDATE capture_task_items',
+    sourceChildInsert,
+  );
+  const sourceAttemptRelink = promotion.indexOf(
+    'UPDATE capture_task_item_attempts',
+    sourceItemRelink,
+  );
+  assert.ok(
+    promotedSourceMarker >= 0 &&
+      promotedSourceMarker < sourceChildInsert &&
+      sourceChildInsert < sourceItemRelink &&
+      sourceItemRelink < sourceAttemptRelink,
+    'single-node promotion must create its source child before relinking items and attempts',
+  );
+  assert.match(
+    promotion,
+    /synthesizePromotedKeywordItems\([\s\S]*SET task_type = 'capture_orchestration'[\s\S]*'promotedRetryParent', true[\s\S]*'promotedSourceExecutionTaskId'/u,
+  );
+
+  assert.match(
+    profileRenewal,
+    /item\.item_type !== 'profile_subscription'[\s\S]*UUID_PATTERN\.test\(subscriptionId\)[\s\S]*FROM monitor_subscriptions[\s\S]*subscription\.status !== 'active'/u,
+  );
+  assert.match(
+    profileRenewal,
+    /UPDATE monitor_executions[\s\S]*status IN \('pending', 'running'\)[\s\S]*INSERT INTO monitor_executions[\s\S]*ON CONFLICT \(subscription_id\)[\s\S]*WHERE status IN \('pending', 'running'\)[\s\S]*DO NOTHING/u,
+  );
+  assert.match(
+    profileRenewal,
+    /executionIdByItem\.set\(String\(item\.id\), execution\.id\)[\s\S]*executionId: execution\.id/u,
+  );
+  assert.match(
+    dispatchCore,
+    /renewedExecutions\.executionIdByItem\.get\([\s\S]*'monitorExecutionId', \$8::text/u,
+  );
+
+  const requestLock = dispatchCore.indexOf("'capture_cross_device_retry', requestKey");
+  const replayRead = dispatchCore.indexOf("const replay = await tx.queryOne");
+  const singleNodeAgentSelection = dispatchCore.indexOf(
+    "if (initialTask.task_type !== 'capture_orchestration')",
+  );
+  const taskLock = dispatchCore.indexOf("const task = await tx.queryOne");
+  const itemLock = dispatchCore.indexOf("const items = await tx.queryAll");
+  const orchestrationAgentSelection = dispatchCore.indexOf(
+    "if (!targetAgent)",
+    itemLock,
+  );
+  assert.ok(requestLock >= 0 && requestLock < replayRead);
+  assert.ok(
+    singleNodeAgentSelection >= 0 &&
+      singleNodeAgentSelection < taskLock &&
+      taskLock < itemLock &&
+      itemLock < orchestrationAgentSelection,
+    "preserve the pre-existing single-node and orchestration Agent lock order",
+  );
+  assert.match(
+    dispatchCore,
+    /AND execution_task_id IS NOT DISTINCT FROM \$6::uuid[\s\S]*AND assignment_revision = \$12/u,
+  );
+  assert.match(
+    dispatchCore,
+    /AND task_type = 'capture_orchestration'[\s\S]*AND orchestration_revision = \$9/u,
   );
 });
 
 test("cron automatically dispatches unfinished items before attention delivery", () => {
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /createAutomaticCaptureRetryReconciler\(\{[\s\S]*listCandidates: listAutomaticCaptureRetryCandidates,[\s\S]*dispatchRetry: dispatchCrossDeviceRetry/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /createRequestKey: \(\) => crypto\.randomUUID\(\)[\s\S]*formatErrorMessage: message => text\(message, 240\)/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /export async function reconcileAutomaticCaptureRetries\(limit = 10\)[\s\S]*return reconcileAutomaticCaptureRetriesImpl\(limit\)/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /status = ANY\(\$1::text\[\]\)[\s\S]*allowIdleAgentHandoff/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /classifyCaptureRecoveryDisposition\(item\)\.automatic/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /sort\(\(left, right\) => Number\(left\.ordinal\) - Number\(right\.ordinal\)\)[\s\S]*\.slice\(0, 1\)/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES[\s\S]*lastAutomaticRecoveryTaskId/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /item_id = ANY\(\$2::uuid\[\]\)[\s\S]*crossDeviceRetrySourceAgentIdsForItems/u,
   );
   assert.match(
@@ -2328,6 +2437,10 @@ test("cron automatically dispatches unfinished items before attention delivery",
     /idle_compatible_agent_unavailable[\s\S]*MANUAL_ONLY_ERRORS[\s\S]*CONFLICT_ERROR_CODES[\s\S]*worker_error/u,
   );
   assert.doesNotMatch(automaticRecoverySource, /pendingReconciliation/u);
+  assert.match(
+    cronSource,
+    /from '\.\/modules\/capture\/infrastructure\/postgres-cross-device-retry\.js';/u,
+  );
   assert.match(
     cronSource,
     /reconcileAutomaticCaptureRetries\(10\)/u,

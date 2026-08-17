@@ -1,4 +1,12 @@
-import {aggregateParentTaskItems} from '../../../services/capture-orchestration.js';
+import {
+  aggregateParentTaskItems,
+  checkpointEntryToItemStatus,
+} from '../../../services/capture-orchestration.js';
+
+export const CAPTURE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+const POSTGRES_INTEGER_MAX = 2147483647;
 
 export const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
 
@@ -50,6 +58,66 @@ export function orchestrationCheckpointTimestamp(value) {
 
 export function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+export function orchestrationCheckpointInteger(value) {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.min(POSTGRES_INTEGER_MAX, Math.max(0, parsed));
+}
+
+export function orchestrationCheckpointEntries(snapshot) {
+  const checkpoint = safeJson(snapshot?.checkpoint);
+  const progress = safeJson(snapshot?.progress);
+  const entries = Array.isArray(checkpoint.keywordResults)
+    ? checkpoint.keywordResults
+      .map(entry => safeJson(entry))
+      .filter(entry => text(entry.keyword, 120))
+    : [];
+  const byKeyword = new Map(entries.map(entry => [text(entry.keyword, 120), entry]));
+  const activeKeyword = text(
+    progress.keyword ||
+      progress.currentKeyword ||
+      checkpoint.currentKeyword ||
+      checkpoint.activeKeyword,
+    120,
+  );
+  const existingEntry = byKeyword.get(activeKeyword);
+  const existingStatus = existingEntry
+    ? checkpointEntryToItemStatus(existingEntry)
+    : '';
+  const taskIsActivelyExecuting = ['claimed', 'running', 'recovering'].includes(
+    text(snapshot?.status, 80),
+  );
+  // settleUnattendedKeywordCheckpoint intentionally retains activeKeyword and
+  // activePhase after a keyword finishes, including in the final completed
+  // snapshot. Only a genuinely active child task may project a running item,
+  // and it must never overwrite an already terminal keyword result.
+  if (
+    activeKeyword &&
+    taskIsActivelyExecuting &&
+    !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus)
+  ) {
+    byKeyword.set(activeKeyword, {
+      ...safeJson(existingEntry),
+      keyword: activeKeyword,
+      status: 'running',
+      round: Math.max(1, Number(checkpoint.round) || 1),
+      index: Math.max(
+        0,
+        Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex) || 0,
+      ),
+    });
+  }
+  return Array.from(byKeyword.values());
+}
+
+export function orchestrationItemAttemptStatus(itemStatus) {
+  // Item attempts start at dispatch, so a checkpoint entry with no meaningful
+  // status must not move the append-only audit back to a pre-dispatch state.
+  return itemStatus === 'pending' || itemStatus === 'assigned'
+    ? 'dispatched'
+    : itemStatus;
 }
 
 export function promotedRetryBusinessTaskType(task = {}) {
