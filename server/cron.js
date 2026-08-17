@@ -12,7 +12,7 @@ import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.j
 import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
 import {
   reconcileAutomaticCaptureRetries,
-} from './routes/capture-cloud.js';
+} from './modules/capture/infrastructure/postgres-cross-device-retry.js';
 import {
   reconcilePendingCaptureCommands,
 } from './modules/capture/infrastructure/postgres-command-reconciliation.js';

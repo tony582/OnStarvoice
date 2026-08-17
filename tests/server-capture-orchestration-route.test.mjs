@@ -395,6 +395,25 @@ test('failed keyword retry stays inside the same parent and can target an idle A
   assert.match(retry, /retry_requires_safety_confirmation/u);
   assert.match(retry, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(task\.status\)/u);
   assert.match(retry, /lockCaptureAgentExecutionSlot/u);
+  const agentSlotLock = retry.indexOf('await lockCaptureAgentExecutionSlot(');
+  const sourceTaskLocks = retry.indexOf(
+    'const sourceTasks = await tx.queryAll',
+  );
+  const parentLock = retry.indexOf(
+    'const parent = await tx.queryOne',
+    sourceTaskLocks,
+  );
+  const itemLocks = retry.indexOf(
+    'const items = await listParentItems',
+    parentLock,
+  );
+  assert.ok(
+    agentSlotLock >= 0 &&
+      agentSlotLock < sourceTaskLocks &&
+      sourceTaskLocks < parentLock &&
+      parentLock < itemLocks,
+    'preserve the pre-existing retry-items lock order: Agent slot, source tasks, parent, items',
+  );
   assert.match(retry, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
   assert.match(retry, /retry_target_busy/u);
   assert.match(retry, /'orchestration_retry'/u);

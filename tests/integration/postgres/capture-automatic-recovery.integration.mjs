@@ -10,7 +10,11 @@ import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-i
 import {runMigrations} from '../../../server/db/migrate.js';
 import {closePool, getPool} from '../../../server/db/pool.js';
 import {
+  dispatchCrossDeviceRetry,
   reconcileAutomaticCaptureRetries,
+} from '../../../server/modules/capture/infrastructure/postgres-cross-device-retry.js';
+import {
+  reconcileAutomaticCaptureRetries as routeReconcileAutomaticCaptureRetries,
 } from '../../../server/routes/capture-cloud.js';
 
 const repositoryRoot = path.resolve(
@@ -465,6 +469,76 @@ async function createRecoveryFixture(pool, {
   };
 }
 
+async function createSingleNodeRecoveryFixture(pool, {
+  tenantId,
+  sourceAgentId,
+  label,
+  checkpointErrorCode = 'TRANSIENT_NETWORK',
+  checkpointErrorCategory = '',
+  checkpointRequiresManualAction = false,
+} = {}) {
+  const suffix = randomUUID();
+  const defaultKeyword = `keyword-${label}-${suffix}`;
+  const planKeywords = [defaultKeyword];
+  const keywordResults = planKeywords.map((keyword, index) => ({
+    keyword,
+    index,
+    status: 'retry',
+    attemptCount: 1,
+    savedCount: 0,
+    errorCode: checkpointErrorCode,
+    ...(checkpointErrorCategory
+      ? {errorCategory: checkpointErrorCategory}
+      : {}),
+    ...(checkpointRequiresManualAction ? {requiresManualAction: true} : {}),
+  }));
+  const task = await pool.query(`
+    INSERT INTO capture_tasks (
+      tenant_id, origin_agent_id, assigned_agent_id, client_task_id,
+      task_type, feature_key, title, platform, source, trigger_type,
+      status, progress, checkpoint, counts, metadata, error,
+      orchestration_revision, started_at, finished_at
+    ) VALUES (
+      $1, $2, $2, $3,
+      'unattended_keyword_capture', 'unattended_keyword_capture', $4,
+      'douyin', 'extension', 'scheduled',
+      'completed_with_failures', $5::jsonb, $6::jsonb, $7::jsonb,
+      $8::jsonb, '{"code":"TRANSIENT_NETWORK"}'::jsonb,
+      0, now() - interval '2 minutes', now() - interval '1 minute'
+    )
+    RETURNING id
+  `, [
+    tenantId,
+    sourceAgentId,
+    `p3-automatic-single-${suffix}`,
+    `P3 automatic single ${label}`,
+    JSON.stringify({
+      current: 0,
+      total: planKeywords.length,
+      percent: 0,
+      ...(planKeywords[0] ? {keyword: planKeywords[0]} : {}),
+    }),
+    JSON.stringify({keywordResults}),
+    JSON.stringify({
+      total: planKeywords.length,
+      failed: planKeywords.length,
+    }),
+    JSON.stringify({
+      planSnapshot: {
+        enabled: true,
+        platform: 'douyin',
+        keywords: planKeywords,
+        recoveryPolicy: {allowIdleAgentHandoff: true},
+      },
+    }),
+  ]);
+  return {
+    keyword: planKeywords[0] || '',
+    parentTaskId: task.rows[0].id,
+    sourceAgentId,
+  };
+}
+
 async function dismissFixture(pool, fixture) {
   await pool.query(`
     UPDATE capture_tasks
@@ -535,6 +609,163 @@ async function readRecoveryState(pool, fixture) {
     item: item.rows[0],
     parent: parent.rows[0],
   };
+}
+
+async function readSingleNodePromotionState(pool, fixture) {
+  const [parent, children, items, attempts, commands, events] = await Promise.all([
+    pool.query(`
+      SELECT id, parent_task_id, assigned_agent_id, task_type, feature_key,
+        trigger_type, status, progress, checkpoint, counts, metadata, error,
+        message, orchestration_revision,
+        started_at::text AS started_at, finished_at::text AS finished_at
+      FROM capture_tasks
+      WHERE id = $1
+    `, [fixture.parentTaskId]),
+    pool.query(`
+      SELECT id, parent_task_id, assigned_agent_id, task_type, feature_key,
+        trigger_type, status, metadata, orchestration_revision,
+        started_at::text AS started_at, finished_at::text AS finished_at
+      FROM capture_tasks
+      WHERE parent_task_id = $1
+      ORDER BY created_at, id
+    `, [fixture.parentTaskId]),
+    pool.query(`
+      SELECT id, keyword, status, attempt_count, assigned_agent_id,
+        execution_task_id, assignment_revision, request_hash, error, metadata,
+        started_at::text AS started_at, finished_at::text AS finished_at
+      FROM capture_task_items
+      WHERE task_id = $1
+      ORDER BY ordinal, id
+    `, [fixture.parentTaskId]),
+    pool.query(`
+      SELECT attempt.id, attempt.item_id, attempt.execution_task_id,
+        attempt.agent_id, attempt.attempt_number, attempt.assignment_revision,
+        attempt.status, attempt.request_hash, attempt.checkpoint,
+        attempt.result, attempt.error
+      FROM capture_task_item_attempts attempt
+      JOIN capture_task_items item ON item.id = attempt.item_id
+      WHERE item.task_id = $1
+      ORDER BY attempt.attempt_number, attempt.id
+    `, [fixture.parentTaskId]),
+    pool.query(`
+      SELECT command.id, command.agent_id, command.task_id,
+        command.command_type, command.status, command.payload,
+        command.requested_by_user_id, command.requested_by_name
+      FROM capture_agent_commands command
+      JOIN capture_tasks child ON child.id = command.task_id
+      WHERE child.parent_task_id = $1
+      ORDER BY command.created_at, command.id
+    `, [fixture.parentTaskId]),
+    pool.query(`
+      SELECT event_type, actor_type, actor_id, actor_name, status, payload
+      FROM capture_task_events
+      WHERE task_id = $1 AND event_type = 'cross_device_retry_dispatched'
+      ORDER BY id
+    `, [fixture.parentTaskId]),
+  ]);
+  return {
+    attempts: attempts.rows,
+    children: children.rows,
+    commands: commands.rows,
+    events: events.rows,
+    items: items.rows,
+    parent: parent.rows[0],
+  };
+}
+
+function assertManualSingleNodeDispatch(
+  state,
+  fixture,
+  target,
+  requestKey,
+  requestedByName,
+) {
+  assert.equal(state.parent.task_type, 'capture_orchestration');
+  assert.equal(state.parent.assigned_agent_id, null);
+  assert.equal(state.parent.status, 'pending');
+  assert.equal(state.parent.orchestration_revision, 2);
+  assert.equal(state.parent.finished_at, null);
+  assert.equal(state.parent.metadata.promotedRetryParent, true);
+  assert.equal(
+    state.parent.metadata.promotedBusinessTaskType,
+    'unattended_keyword_capture',
+  );
+  assert.equal(state.parent.metadata.lastCrossDeviceRetryTaskId, requestKey);
+  assert.equal(state.parent.metadata.lastCrossDeviceRetryAgentId, target.agentId);
+  assert.equal(state.parent.metadata.lastAutomaticRecoveryTaskId, undefined);
+
+  assert.equal(state.children.length, 2);
+  const source = state.children.find(
+    child => child.metadata.promotedSourceExecution === true,
+  );
+  const retry = state.children.find(child => child.id === requestKey);
+  assert.ok(source);
+  assert.ok(retry);
+  assert.equal(source.parent_task_id, fixture.parentTaskId);
+  assert.equal(source.assigned_agent_id, fixture.sourceAgentId);
+  assert.equal(source.status, 'completed_with_failures');
+  assert.equal(source.orchestration_revision, 1);
+  assert.equal(state.parent.metadata.promotedSourceExecutionTaskId, source.id);
+  assert.equal(retry.parent_task_id, fixture.parentTaskId);
+  assert.equal(retry.assigned_agent_id, target.agentId);
+  assert.equal(retry.trigger_type, 'cross_device_retry');
+  assert.equal(retry.status, 'pending');
+  assert.equal(retry.orchestration_revision, 2);
+  assert.equal(retry.metadata.crossDeviceRetryRequestKey, requestKey);
+  assert.equal(retry.metadata.automaticRecovery, false);
+  assert.equal(retry.metadata.requestedByName, requestedByName);
+
+  assert.equal(state.items.length, 1);
+  const item = state.items[0];
+  assert.equal(item.keyword, fixture.keyword);
+  assert.equal(item.status, 'dispatched');
+  assert.equal(item.attempt_count, 2);
+  assert.equal(item.assigned_agent_id, target.agentId);
+  assert.equal(item.execution_task_id, requestKey);
+  assert.equal(item.assignment_revision, 2);
+  assert.equal(item.metadata.crossDeviceRetrySourceExecutionTaskId, source.id);
+  assert.equal(item.metadata.crossDeviceRetryRequestKey, requestKey);
+  assert.match(item.request_hash, /^[0-9a-f]{64}$/u);
+
+  assert.equal(state.attempts.length, 2);
+  assert.equal(state.attempts[0].execution_task_id, source.id);
+  assert.equal(state.attempts[0].agent_id, fixture.sourceAgentId);
+  assert.equal(state.attempts[0].attempt_number, 1);
+  assert.equal(state.attempts[0].assignment_revision, 1);
+  assert.equal(state.attempts[0].status, 'retryable');
+  assert.equal(state.attempts[1].execution_task_id, requestKey);
+  assert.equal(state.attempts[1].agent_id, target.agentId);
+  assert.equal(state.attempts[1].attempt_number, 2);
+  assert.equal(state.attempts[1].assignment_revision, 2);
+  assert.equal(state.attempts[1].status, 'dispatched');
+  assert.equal(state.attempts[1].request_hash, item.request_hash);
+
+  assert.equal(state.commands.length, 1);
+  const command = state.commands[0];
+  assert.equal(command.task_id, requestKey);
+  assert.equal(command.agent_id, target.agentId);
+  assert.equal(command.command_type, 'create');
+  assert.equal(command.status, 'pending');
+  assert.equal(command.requested_by_user_id, null);
+  assert.equal(command.requested_by_name, requestedByName);
+  assert.equal(command.payload.authCodeId, target.authCodeId);
+  assert.equal(command.payload.authBindingId, target.authBindingId);
+  assert.equal(command.payload.orchestration.parentTaskId, fixture.parentTaskId);
+  assert.equal(command.payload.orchestration.revision, 2);
+  assert.deepEqual(command.payload.orchestration.itemIds, [item.id]);
+  assert.deepEqual(command.payload.planSnapshot.keywords, [fixture.keyword]);
+
+  assert.equal(state.events.length, 1);
+  const event = state.events[0];
+  assert.equal(event.actor_type, 'user');
+  assert.equal(event.actor_id, '');
+  assert.equal(event.actor_name, requestedByName);
+  assert.equal(event.status, 'pending');
+  assert.equal(event.payload.retryTaskId, requestKey);
+  assert.equal(event.payload.targetAgentId, target.agentId);
+  assert.equal(event.payload.automatic, false);
+  assert.equal(event.payload.revision, 2);
+  assert.deepEqual(event.payload.itemIds, [item.id]);
 }
 
 function assertSingleDispatch(state, fixture, target, retryTaskId) {
@@ -656,6 +887,36 @@ function assertFirstAutomaticDispatchSummary(summary, fixture) {
 }
 
 test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollback', async t => {
+  assert.strictEqual(
+    routeReconcileAutomaticCaptureRetries,
+    reconcileAutomaticCaptureRetries,
+    'the PostgreSQL automatic gate must exercise the route-compatible canonical binding',
+  );
+  const canonicalDispatchSource = Function.prototype.toString.call(
+    dispatchCrossDeviceRetry,
+  );
+  const promotionCall = canonicalDispatchSource.indexOf(
+    'await promoteSingleNodeTaskForRetry',
+  );
+  const promotedParentRead = canonicalDispatchSource.indexOf(
+    'const parent = promoted.parent',
+    promotionCall,
+  );
+  const retryItemRead = canonicalDispatchSource.indexOf(
+    'const items = await tx.queryAll',
+    promotedParentRead,
+  );
+  const manualSafetyAbort = canonicalDispatchSource.indexOf(
+    "'retry_requires_manual_safety_action'",
+    retryItemRead,
+  );
+  assert.ok(
+    promotionCall >= 0 &&
+      promotionCall < promotedParentRead &&
+      promotedParentRead < retryItemRead &&
+      retryItemRead < manualSafetyAbort,
+    'manual-safety rejection must remain downstream of successful single-node promotion',
+  );
   const target = validatePostgresIntegrationTarget({
     testDatabaseUrl: process.env.TEST_DATABASE_URL,
     databaseUrl: process.env.DATABASE_URL,
@@ -906,6 +1167,120 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
   );
   tenantId = tenant.rows[0].id;
   const sourceAgentId = await createSourceAgent(pool, tenantId, token);
+
+  const manualTarget = await createTargetAgent(
+    pool,
+    tenantId,
+    `${token}-manual`,
+  );
+  const promotionRollback = await createSingleNodeRecoveryFixture(pool, {
+    tenantId,
+    sourceAgentId,
+    label: 'promotion-rollback',
+    checkpointErrorCode: 'DOUYIN_CAPTCHA_REQUIRED',
+    checkpointErrorCategory: 'platform_safety_block',
+    checkpointRequiresManualAction: true,
+  });
+  const promotionRollbackBefore = await readSingleNodePromotionState(
+    pool,
+    promotionRollback,
+  );
+  assert.equal(
+    promotionRollbackBefore.parent.task_type,
+    'unattended_keyword_capture',
+  );
+  assert.equal(promotionRollbackBefore.children.length, 0);
+  assert.equal(promotionRollbackBefore.items.length, 0);
+  assert.deepEqual(
+    promotionRollbackBefore.parent.checkpoint.keywordResults.map(entry => ({
+      keyword: entry.keyword,
+      errorCode: entry.errorCode,
+      errorCategory: entry.errorCategory,
+      requiresManualAction: entry.requiresManualAction,
+    })),
+    [{
+      keyword: promotionRollback.keyword,
+      errorCode: 'DOUYIN_CAPTCHA_REQUIRED',
+      errorCategory: 'platform_safety_block',
+      requiresManualAction: true,
+    }],
+  );
+  await assert.rejects(
+    dispatchCrossDeviceRetry({
+      tenantId,
+      taskId: promotionRollback.parentTaskId,
+      requestKey: randomUUID(),
+      expectedRevision: 0,
+      actorType: 'user',
+      requestedByName: 'P3 rollback operator',
+      automatic: false,
+    }),
+    error => {
+      assert.equal(error.code, 'cross_device_retry_transaction_abort');
+      assert.equal(
+        error.crossDeviceRetryError,
+        'retry_requires_manual_safety_action',
+        'the abort must come from post-promotion retry-item classification',
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(
+    await readSingleNodePromotionState(pool, promotionRollback),
+    promotionRollbackBefore,
+    'a post-promotion business error must roll back the source child and parent conversion',
+  );
+  await dismissFixture(pool, promotionRollback);
+
+  const manualFixture = await createSingleNodeRecoveryFixture(pool, {
+    tenantId,
+    sourceAgentId,
+    label: 'manual-dispatch',
+  });
+  const manualRequestKey = randomUUID();
+  const requestedByName = 'P3 manual operator';
+  const manualOptions = {
+    tenantId,
+    taskId: manualFixture.parentTaskId,
+    requestKey: manualRequestKey,
+    expectedRevision: 0,
+    actorType: 'user',
+    requestedByName,
+    automatic: false,
+  };
+  const firstManualDispatch = await dispatchCrossDeviceRetry(manualOptions);
+  assert.equal(firstManualDispatch.existing, false);
+  assert.equal(firstManualDispatch.child.id, manualRequestKey);
+  assert.equal(firstManualDispatch.itemCount, 1);
+  assert.equal(firstManualDispatch.agent.id, manualTarget.agentId);
+  assert.equal(firstManualDispatch.parent.orchestration_revision, 2);
+  const manualAfterFirstDispatch = await readSingleNodePromotionState(
+    pool,
+    manualFixture,
+  );
+  assertManualSingleNodeDispatch(
+    manualAfterFirstDispatch,
+    manualFixture,
+    manualTarget,
+    manualRequestKey,
+    requestedByName,
+  );
+  const manualReplay = await dispatchCrossDeviceRetry(manualOptions);
+  assert.equal(manualReplay.existing, true);
+  assert.equal(manualReplay.child.id, manualRequestKey);
+  assert.equal(manualReplay.child.parent_task_id, manualFixture.parentTaskId);
+  assert.equal(manualReplay.child.assigned_agent_id, manualTarget.agentId);
+  assert.equal(
+    manualReplay.child.metadata.crossDeviceRetryRequestKey,
+    manualRequestKey,
+  );
+  assert.deepEqual(
+    await readSingleNodePromotionState(pool, manualFixture),
+    manualAfterFirstDispatch,
+    'same-requestKey replay must not duplicate actor, metadata, command, item, parent, or event state',
+  );
+  await dismissFixture(pool, manualFixture);
+  await pauseTargetAgent(pool, manualTarget);
 
   const disabled = await createRecoveryFixture(pool, {
     tenantId,
