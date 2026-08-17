@@ -13,7 +13,7 @@ import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-ret
 import {runOpsControlCycle} from './services/ops-control.js';
 import {
   reconcileAutomaticCaptureRetries,
-} from './routes/capture-cloud.js';
+} from './modules/capture/infrastructure/postgres-cross-device-retry.js';
 import {
   reconcilePendingOrchestrationRetries,
 } from './routes/capture-orchestrations.js';

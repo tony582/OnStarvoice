@@ -146,13 +146,7 @@ test('Cron consumes the canonical command while route retains one compatibility 
     cronSource,
     /import\s*\{\s*reconcilePendingCaptureCommands,?\s*\}\s*from '\.\/modules\/capture\/infrastructure\/postgres-command-reconciliation\.js';/u,
   );
-  const routeImport = cronSource.match(
-    /import\s*\{([\s\S]*?)\}\s*from '\.\/routes\/capture-cloud\.js';/u,
-  );
-  assert.ok(routeImport);
-  assert.match(routeImport[1], /reconcileAutomaticCaptureRetries/u);
-  assert.doesNotMatch(routeImport[1], /reconcilePendingCaptureCommands/u);
-  assert.doesNotMatch(routeImport[1], /reconcileElasticCaptureLeases/u);
+  assert.doesNotMatch(cronSource, /from '\.\/routes\/capture-cloud\.js';/u);
 
   assert.match(
     routeSource,
