@@ -5,18 +5,10 @@ import test from 'node:test';
 import {fileURLToPath} from 'node:url';
 
 import {
-  elasticAttemptBudgetAfterOutcome as canonicalElasticAttemptBudgetAfterOutcome,
-  projectElasticAttemptBudget as canonicalProjectElasticAttemptBudget,
-  projectElasticKeywordRecoveryStatus as canonicalProjectElasticKeywordRecoveryStatus,
-} from '../server/modules/capture/application/control-outcome-projection.js';
+  reconcilePendingCaptureCommands as canonicalReconcilePendingCaptureCommands,
+} from '../server/modules/capture/infrastructure/postgres-command-reconciliation.js';
 import {
-  reconcileElasticCaptureLeases as canonicalReconcileElasticCaptureLeases,
-} from '../server/modules/capture/infrastructure/postgres-lease-reconciliation.js';
-import {
-  elasticAttemptBudgetAfterOutcome as routeElasticAttemptBudgetAfterOutcome,
-  projectElasticAttemptBudget as routeProjectElasticAttemptBudget,
-  projectElasticKeywordRecoveryStatus as routeProjectElasticKeywordRecoveryStatus,
-  reconcileElasticCaptureLeases as routeReconcileElasticCaptureLeases,
+  reconcilePendingCaptureCommands as routeReconcilePendingCaptureCommands,
 } from '../server/routes/capture-cloud.js';
 
 const repositoryRoot = path.resolve(
@@ -25,21 +17,13 @@ const repositoryRoot = path.resolve(
 );
 const routePath = path.join(repositoryRoot, 'server', 'routes', 'capture-cloud.js');
 const cronPath = path.join(repositoryRoot, 'server', 'cron.js');
-const projectionPath = path.join(
-  repositoryRoot,
-  'server',
-  'modules',
-  'capture',
-  'application',
-  'control-outcome-projection.js',
-);
-const leasePath = path.join(
+const commandPath = path.join(
   repositoryRoot,
   'server',
   'modules',
   'capture',
   'infrastructure',
-  'postgres-lease-reconciliation.js',
+  'postgres-command-reconciliation.js',
 );
 
 const staticModuleSpecifierPattern =
@@ -93,31 +77,18 @@ function collectRelativeImportGraph(entryPaths) {
   return {paths: [...visited], externalSpecifiers: [...externalSpecifiers]};
 }
 
-test('lease and projection compatibility exports preserve canonical identity', () => {
+test('command compatibility export preserves canonical identity', () => {
   assert.strictEqual(
-    routeReconcileElasticCaptureLeases,
-    canonicalReconcileElasticCaptureLeases,
-  );
-  assert.strictEqual(
-    routeElasticAttemptBudgetAfterOutcome,
-    canonicalElasticAttemptBudgetAfterOutcome,
-  );
-  assert.strictEqual(
-    routeProjectElasticAttemptBudget,
-    canonicalProjectElasticAttemptBudget,
-  );
-  assert.strictEqual(
-    routeProjectElasticKeywordRecoveryStatus,
-    canonicalProjectElasticKeywordRecoveryStatus,
+    routeReconcilePendingCaptureCommands,
+    canonicalReconcilePendingCaptureCommands,
   );
 });
 
-test('lease canonical dependency graph is route and Express independent', () => {
-  const graph = collectRelativeImportGraph([leasePath, projectionPath]);
+test('command canonical dependency graph is route and Express independent', () => {
+  const graph = collectRelativeImportGraph([commandPath]);
   const routeDirectory = `${path.join(repositoryRoot, 'server', 'routes')}${path.sep}`;
   for (const expectedPath of [
-    leasePath,
-    projectionPath,
+    commandPath,
     path.join(repositoryRoot, 'server', 'db', 'init.js'),
     path.join(
       repositoryRoot,
@@ -125,7 +96,31 @@ test('lease canonical dependency graph is route and Express independent', () => 
       'modules',
       'capture',
       'application',
-      'lease-reconciliation.js',
+      'command-lifecycle.js',
+    ),
+    path.join(
+      repositoryRoot,
+      'server',
+      'modules',
+      'capture',
+      'application',
+      'control-outcome-projection.js',
+    ),
+    path.join(
+      repositoryRoot,
+      'server',
+      'modules',
+      'capture',
+      'application',
+      'profile-patrol.js',
+    ),
+    path.join(
+      repositoryRoot,
+      'server',
+      'modules',
+      'capture',
+      'infrastructure',
+      'postgres-profile-discovery-work.js',
     ),
     path.join(repositoryRoot, 'server', 'services', 'capture-orchestration.js'),
   ]) {
@@ -143,13 +138,13 @@ test('lease canonical dependency graph is route and Express independent', () => 
   );
 });
 
-test('Cron consumes the canonical lease while route retains one compatibility export', () => {
+test('Cron consumes the canonical command while route retains one compatibility export', () => {
   const cronSource = readFileSync(cronPath, 'utf8');
   const routeSource = readFileSync(routePath, 'utf8');
 
   assert.match(
     cronSource,
-    /import\s*\{\s*reconcileElasticCaptureLeases,?\s*\}\s*from '\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
+    /import\s*\{\s*reconcilePendingCaptureCommands,?\s*\}\s*from '\.\/modules\/capture\/infrastructure\/postgres-command-reconciliation\.js';/u,
   );
   const routeImport = cronSource.match(
     /import\s*\{([\s\S]*?)\}\s*from '\.\/routes\/capture-cloud\.js';/u,
@@ -161,22 +156,12 @@ test('Cron consumes the canonical lease while route retains one compatibility ex
 
   assert.match(
     routeSource,
-    /from '\.\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
+    /from '\.\.\/modules\/capture\/infrastructure\/postgres-command-reconciliation\.js';/u,
   );
-  assert.doesNotMatch(routeSource, /function listElasticCaptureLeaseCandidates\b/u);
-  assert.doesNotMatch(routeSource, /function settleElasticCaptureLeaseCandidate\b/u);
-  assert.doesNotMatch(routeSource, /\breconcileElasticCaptureLeasesImpl\b/u);
-  assert.doesNotMatch(routeSource, /createElasticCaptureLeaseReconciler/u);
-  for (const movedFunction of [
-    'appendEvent',
-    'elasticAttemptBudgetAfterOutcome',
-    'projectElasticAttemptBudget',
-    'projectElasticKeywordRecoveryStatus',
-    'projectOrchestrationChildControlOutcome',
-  ]) {
-    assert.doesNotMatch(
-      routeSource,
-      new RegExp(`(?:async\\s+)?function\\s+${movedFunction}\\b`, 'u'),
-    );
-  }
+  assert.doesNotMatch(
+    routeSource,
+    /(?:async\s+)?function\s+(?:expireStaleCommands|failProfileDiscoveryWork|isProfilePatrolTask|profilePatrolIntent|syncProfileDiscoverySubscriptions)\b/u,
+  );
+  assert.doesNotMatch(routeSource, /\breconcilePendingCaptureCommandsImpl\b/u);
+  assert.doesNotMatch(routeSource, /createPendingCaptureCommandReconciler/u);
 });

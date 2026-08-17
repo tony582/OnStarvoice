@@ -14,6 +14,13 @@ const captureCloud = await readFile(
   new URL('../server/routes/capture-cloud.js', import.meta.url),
   'utf8',
 );
+const profileDiscoveryWork = await readFile(
+  new URL(
+    '../server/modules/capture/infrastructure/postgres-profile-discovery-work.js',
+    import.meta.url,
+  ),
+  'utf8',
+);
 const dispatchService = await readFile(
   new URL('../server/services/profile-patrol-dispatch.js', import.meta.url),
   'utf8',
@@ -469,7 +476,7 @@ test('profile scan results project through task center without pretending subscr
   );
   assert.match(captureCloud, /syncProfileDiscoverySubscriptions/u);
   assert.match(
-    captureCloud,
+    profileDiscoveryWork,
     /WHEN execution\.status = 'failed'\s+THEN now\(\) \+ interval '15 minutes'/u,
   );
 });
