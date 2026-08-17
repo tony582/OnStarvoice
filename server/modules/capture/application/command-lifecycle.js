@@ -1,3 +1,36 @@
+import {text} from './control-outcome-projection.js';
+
+export const RECOVERABLE_STATUSES = new Set([
+  'interrupted',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
+]);
+
+export const REMOTELY_STOPPABLE_STATUSES = new Set([
+  'pending',
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'interrupted',
+  'resume_requested',
+  'needs_action',
+  'failed',
+  'completed_with_failures',
+]);
+
+export function stopFailureStatus(previousStatus) {
+  const normalized = text(previousStatus, 80);
+  if (normalized === 'resume_requested') return 'needs_action';
+  return REMOTELY_STOPPABLE_STATUSES.has(normalized)
+    ? normalized
+    : 'needs_action';
+}
+
 function requireDependency(name, value) {
   if (typeof value !== 'function') {
     throw new TypeError(`${name} must be a function`);

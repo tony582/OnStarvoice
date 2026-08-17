@@ -56,6 +56,20 @@ const commandLifecycleSource = await readFile(
   ),
   "utf8",
 );
+const postgresCommandReconciliationSource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-command-reconciliation.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const postgresProfileDiscoveryWorkSource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-profile-discovery-work.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const leaseReconciliationSource = await readFile(
   new URL(
     "../server/modules/capture/application/lease-reconciliation.js",
@@ -1217,9 +1231,11 @@ test("orchestration control outcomes lock parent before updating items", () => {
 });
 
 test("create command failures and successful stops settle orchestration work items", () => {
-  const expiry = readRouteSection(
-    "async function expireStaleCommands",
-    "async function resolveResumeCommandFromSuccessor",
+  const expiry = readSourceSection(
+    postgresCommandReconciliationSource,
+    "PostgreSQL command reconciliation",
+    "export async function expireStaleCommands",
+    "async function listPendingCaptureCommandTenants",
   );
   assert.match(
     expiry,
@@ -1238,9 +1254,10 @@ test("create command failures and successful stops settle orchestration work ite
     /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_agent_unavailable'/u,
   );
 
-  const profileFailure = readRouteSection(
-    "async function failProfileDiscoveryWork",
-    "async function cancelProfileDiscoveryWork",
+  const profileFailure = readSourceSection(
+    postgresProfileDiscoveryWorkSource,
+    "PostgreSQL profile discovery work",
+    "export async function failProfileDiscoveryWork",
   );
   assert.match(
     profileFailure,
@@ -1700,7 +1717,7 @@ test("a successful plan command supersedes only older needs-action configuration
     "export async function supersedeStalePlanConfigurationAttention",
   );
   const helperEnd = captureCloudRouteSource.indexOf(
-    "async function expireStaleCommands",
+    "async function resolveResumeCommandFromSuccessor",
     helperStart,
   );
   assert.ok(helperStart >= 0 && helperEnd > helperStart);
@@ -2203,11 +2220,11 @@ test("ended failures can be dismissed from attention without deleting task histo
 
 test("stale cloud commands are reconciled by cron without waiting for UI or Agent heartbeat", () => {
   assert.match(
-    captureCloudRouteSource,
+    postgresCommandReconciliationSource,
     /createPendingCaptureCommandReconciler\(\{[\s\S]*listPendingTenants:[\s\S]*expireTenantCommands:/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCommandReconciliationSource,
     /WHERE status IN \('pending', 'acknowledged'\)[\s\S]*GROUP BY tenant_id[\s\S]*ORDER BY MIN\(created_at\), tenant_id[\s\S]*LIMIT \$1/u,
   );
   assert.match(
@@ -2215,7 +2232,7 @@ test("stale cloud commands are reconciled by cron without waiting for UI or Agen
     /if \(pendingReconciliation\) return pendingReconciliation;[\s\S]*for \(const tenant of tenants\)[\s\S]*runTransaction\(tx =>[\s\S]*expireCommands\(tx, tenant\.tenant_id\)/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCommandReconciliationSource,
     /export async function reconcilePendingCaptureCommands\(options = \{\}\)[\s\S]*return reconcilePendingCaptureCommandsImpl\(options\)/u,
   );
   assert.match(
