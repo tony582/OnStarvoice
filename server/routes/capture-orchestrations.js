@@ -4778,9 +4778,15 @@ router.post(
             },
       );
       const result = await withTransaction(async tx => {
+        // Reserve the global child ID, then serialize every control mutation of
+        // this parent before taking any Agent, source, parent or item locks.
         await tx.execute(
           'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
           ['capture_task_global_id', normalized.requestKey],
+        );
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['capture_orchestration_control', orchestrationId],
         );
         const parentPreview = await tx.queryOne(
           parentSelect(),
@@ -5518,11 +5524,15 @@ router.post(
       });
       const result = await withTransaction(async tx => {
         // requestKey is also a globally unique task ID. Serialize that global
-        // namespace first, then reserve the target Agent execution slot before
-        // taking task, parent, command or Agent row locks.
+        // namespace first, then the parent control namespace, before reserving
+        // the target Agent execution slot and taking row locks.
         await tx.execute(
           'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
           ['capture_task_global_id', normalized.requestKey],
+        );
+        await tx.execute(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['capture_orchestration_control', orchestrationId],
         );
         await lockCaptureAgentExecutionSlot(
           tx,

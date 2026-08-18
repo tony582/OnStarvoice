@@ -51,6 +51,14 @@ const adapterPath = path.join(
   'infrastructure',
   'postgres-cross-device-retry.js',
 );
+const automaticRecoveryPath = path.join(
+  repositoryRoot,
+  'server',
+  'modules',
+  'capture',
+  'application',
+  'automatic-recovery.js',
+);
 
 const staticModuleSpecifierPattern =
   /\b(?:import|export)\s+(?:[\w*\s{},]*?\s+from\s+)?['"]([^'"]+)['"]/gu;
@@ -209,6 +217,10 @@ test('Cron and the manual endpoint consume the canonical cross-device bindings',
   const cronSource = readFileSync(cronPath, 'utf8');
   const routeSource = readFileSync(routePath, 'utf8');
   const adapterSource = readFileSync(adapterPath, 'utf8');
+  const automaticRecoverySource = readFileSync(
+    automaticRecoveryPath,
+    'utf8',
+  );
 
   assert.match(
     cronSource,
@@ -260,6 +272,11 @@ test('Cron and the manual endpoint consume the canonical cross-device bindings',
   assert.match(
     adapterSource,
     /createAutomaticCaptureRetryReconciler\(\{[\s\S]*dispatchRetry: dispatchCrossDeviceRetry/u,
+  );
+  assert.match(
+    automaticRecoverySource,
+    /const result = await dispatchCandidateRetry\(\{[\s\S]*automatic: true/u,
+    'automatic recovery must enter the same public dispatch with automatic=true',
   );
   assert.equal(
     adapterSource.match(

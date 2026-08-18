@@ -337,7 +337,43 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.match(route, /text\(body\?\.action, 40\) !== 'handoff'/u);
   assert.match(handoff, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
   assert.match(handoff, /\['capture_task_global_id', normalized\.requestKey\]/u);
+  assert.match(
+    handoff,
+    /\['capture_orchestration_control', orchestrationId\]/u,
+  );
   assert.match(handoff, /await lockCaptureAgentExecutionSlot\([\s\S]*normalized\.targetAgentId/u);
+  const handoffRequestFence = handoff.indexOf(
+    "'capture_task_global_id', normalized.requestKey",
+  );
+  const handoffParentFence = handoff.indexOf(
+    "'capture_orchestration_control', orchestrationId",
+    handoffRequestFence,
+  );
+  const handoffAgentSlot = handoff.indexOf(
+    'await lockCaptureAgentExecutionSlot(',
+    handoffParentFence,
+  );
+  const handoffSourceLock = handoff.indexOf(
+    'const sourceTask = await tx.queryOne',
+    handoffAgentSlot,
+  );
+  const handoffParentLock = handoff.indexOf(
+    'const parent = await tx.queryOne',
+    handoffSourceLock,
+  );
+  const handoffItemLocks = handoff.indexOf(
+    'const items = await listParentItems',
+    handoffParentLock,
+  );
+  assert.ok(
+    handoffRequestFence >= 0 &&
+      handoffRequestFence < handoffParentFence &&
+      handoffParentFence < handoffAgentSlot &&
+      handoffAgentSlot < handoffSourceLock &&
+      handoffSourceLock < handoffParentLock &&
+      handoffParentLock < handoffItemLocks,
+    'handoff must lock request, parent control, Agent, source, parent, then items',
+  );
   assert.match(handoff, /handoffRequestHash/u);
   assert.match(handoff, /exactReplay/u);
   assert.match(
@@ -449,6 +485,46 @@ test('failed keyword retry atomically shards each item to a distinct idle Agent 
   assert.match(retry, /const itemAttemptId = crypto\.randomUUID\(\)/u);
   assert.match(retry, /itemAttempts: itemAttemptBindings/u);
   assert.match(retry, /itemIds: \[item\.id\]/u);
+  assert.match(
+    retry,
+    /\['capture_orchestration_control', orchestrationId\]/u,
+  );
+  const requestFence = retry.indexOf(
+    "'capture_task_global_id', normalized.requestKey",
+  );
+  const parentControlFence = retry.indexOf(
+    "'capture_orchestration_control', orchestrationId",
+    requestFence,
+  );
+  const agentSlotLock = retry.indexOf(
+    'await lockCaptureAgentExecutionSlot(',
+    parentControlFence,
+  );
+  const sourceTaskLocks = retry.indexOf(
+    'const sourceTasks = await tx.queryAll',
+  );
+  const parentLock = retry.indexOf(
+    'const parent = await tx.queryOne',
+    sourceTaskLocks,
+  );
+  const itemLocks = retry.indexOf(
+    'const items = await listParentItems',
+    parentLock,
+  );
+  assert.ok(
+    requestFence >= 0 &&
+      requestFence < parentControlFence &&
+      parentControlFence < agentSlotLock &&
+      agentSlotLock < sourceTaskLocks &&
+      sourceTaskLocks < parentLock &&
+      parentLock < itemLocks,
+    'retry-items must lock request, parent control, Agent, sources, parent, then items',
+  );
+  assert.match(
+    retry.slice(sourceTaskLocks, parentLock),
+    /ORDER BY source\.id[\s\S]*FOR UPDATE/u,
+    'retry-items must lock selected source tasks in stable UUID order',
+  );
   assert.match(retry, /'orchestration_retry'/u);
   assert.match(retry, /parent_task_id/u);
   assert.match(retry, /attempt_count = attempt_count \+ 1/u);

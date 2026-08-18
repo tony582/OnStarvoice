@@ -28,6 +28,7 @@ const requiredTestFiles = [
   'capture-automatic-recovery.integration.mjs',
   'capture-command-reconciliation.integration.mjs',
   'capture-elastic-lease-reconciliation.integration.mjs',
+  'capture-retry-lock-order.integration.mjs',
   'http-auth.integration.mjs',
   'maintenance-entrypoint.integration.mjs',
   'migration-governance.integration.mjs',
