@@ -255,7 +255,7 @@ async function terminateOwnedPoolSessions({
   });
 }
 
-async function waitForRootLockWaiters(
+async function waitForAutomaticRecoveryLockWaiters(
   observerClient,
   applicationPrefix,
   expectedCount = 2,
@@ -265,20 +265,32 @@ async function waitForRootLockWaiters(
   while (Date.now() < deadline) {
     await observerClient.query('SELECT pg_stat_clear_snapshot()');
     const result = await observerClient.query(`
-      SELECT count(*)::integer AS count
+      SELECT
+        count(*)::integer AS count,
+        count(*) FILTER (
+          WHERE query LIKE '%pg_advisory_xact_lock%'
+        )::integer AS parent_fence_waiter_count,
+        count(*) FILTER (
+          WHERE query LIKE '%SELECT *%'
+            AND query LIKE '%FROM capture_tasks%'
+            AND query LIKE '%FOR UPDATE%'
+        )::integer AS root_row_waiter_count
       FROM pg_stat_activity
       WHERE datname = current_database()
         AND application_name LIKE $1
         AND state = 'active'
         AND wait_event_type = 'Lock'
-        AND query LIKE '%SELECT *%'
-        AND query LIKE '%FROM capture_tasks%'
-        AND query LIKE '%FOR UPDATE%'
     `, [`${applicationPrefix}%`]);
-    if (result.rows[0].count >= expectedCount) return;
+    if (
+      result.rows[0].count >= expectedCount &&
+      result.rows[0].parent_fence_waiter_count >= 1 &&
+      result.rows[0].root_row_waiter_count >= 1
+    ) return;
     await delay(20);
   }
-  throw new Error('Timed out waiting for both automatic recovery root locks');
+  throw new Error(
+    'Timed out waiting for both serialized automatic recovery lock waiters',
+  );
 }
 
 async function createSourceAgent(pool, tenantId, suffix) {
@@ -903,11 +915,11 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
     promotionCall,
   );
   const retryItemRead = canonicalDispatchSource.indexOf(
-    'const items = await tx.queryAll',
+    'const lockedSelection = await loadCrossDeviceRetryItemSelection',
     promotedParentRead,
   );
   const manualSafetyAbort = canonicalDispatchSource.indexOf(
-    "'retry_requires_manual_safety_action'",
+    'if (lockedSelection.error) abortCrossDeviceRetry(lockedSelection.error)',
     retryItemRead,
   );
   assert.ok(
@@ -1431,7 +1443,10 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
   const secondConcurrent = trackReconciliation(
     reconcileAutomaticCaptureRetries(1),
   );
-  await waitForRootLockWaiters(blockerClient, applicationPrefix);
+  await waitForAutomaticRecoveryLockWaiters(
+    blockerClient,
+    applicationPrefix,
+  );
   await runBoundedClientStep({
     client: blockerClient,
     promise: blockerClient.query('COMMIT'),

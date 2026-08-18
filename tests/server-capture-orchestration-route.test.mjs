@@ -307,7 +307,43 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.match(route, /text\(body\?\.action, 40\) !== 'handoff'/u);
   assert.match(handoff, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
   assert.match(handoff, /\['capture_task_global_id', normalized\.requestKey\]/u);
+  assert.match(
+    handoff,
+    /\['capture_orchestration_control', orchestrationId\]/u,
+  );
   assert.match(handoff, /await lockCaptureAgentExecutionSlot\([\s\S]*normalized\.targetAgentId/u);
+  const handoffRequestFence = handoff.indexOf(
+    "'capture_task_global_id', normalized.requestKey",
+  );
+  const handoffParentFence = handoff.indexOf(
+    "'capture_orchestration_control', orchestrationId",
+    handoffRequestFence,
+  );
+  const handoffAgentSlot = handoff.indexOf(
+    'await lockCaptureAgentExecutionSlot(',
+    handoffParentFence,
+  );
+  const handoffSourceLock = handoff.indexOf(
+    'const sourceTask = await tx.queryOne',
+    handoffAgentSlot,
+  );
+  const handoffParentLock = handoff.indexOf(
+    'const parent = await tx.queryOne',
+    handoffSourceLock,
+  );
+  const handoffItemLocks = handoff.indexOf(
+    'const items = await listParentItems',
+    handoffParentLock,
+  );
+  assert.ok(
+    handoffRequestFence >= 0 &&
+      handoffRequestFence < handoffParentFence &&
+      handoffParentFence < handoffAgentSlot &&
+      handoffAgentSlot < handoffSourceLock &&
+      handoffSourceLock < handoffParentLock &&
+      handoffParentLock < handoffItemLocks,
+    'handoff must lock request, parent control, Agent, source, parent, then items',
+  );
   assert.match(handoff, /handoffRequestHash/u);
   assert.match(handoff, /exactReplay/u);
   assert.match(
@@ -395,7 +431,21 @@ test('failed keyword retry stays inside the same parent and can target an idle A
   assert.match(retry, /retry_requires_safety_confirmation/u);
   assert.match(retry, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(task\.status\)/u);
   assert.match(retry, /lockCaptureAgentExecutionSlot/u);
-  const agentSlotLock = retry.indexOf('await lockCaptureAgentExecutionSlot(');
+  assert.match(
+    retry,
+    /\['capture_orchestration_control', orchestrationId\]/u,
+  );
+  const requestFence = retry.indexOf(
+    "'capture_task_global_id', normalized.requestKey",
+  );
+  const parentControlFence = retry.indexOf(
+    "'capture_orchestration_control', orchestrationId",
+    requestFence,
+  );
+  const agentSlotLock = retry.indexOf(
+    'await lockCaptureAgentExecutionSlot(',
+    parentControlFence,
+  );
   const sourceTaskLocks = retry.indexOf(
     'const sourceTasks = await tx.queryAll',
   );
@@ -408,11 +458,18 @@ test('failed keyword retry stays inside the same parent and can target an idle A
     parentLock,
   );
   assert.ok(
-    agentSlotLock >= 0 &&
+    requestFence >= 0 &&
+      requestFence < parentControlFence &&
+      parentControlFence < agentSlotLock &&
       agentSlotLock < sourceTaskLocks &&
       sourceTaskLocks < parentLock &&
       parentLock < itemLocks,
-    'preserve the pre-existing retry-items lock order: Agent slot, source tasks, parent, items',
+    'retry-items must lock request, parent control, Agent, sources, parent, then items',
+  );
+  assert.match(
+    retry.slice(sourceTaskLocks, parentLock),
+    /ORDER BY source\.id[\s\S]*FOR UPDATE/u,
+    'retry-items must lock selected source tasks in stable UUID order',
   );
   assert.match(retry, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
   assert.match(retry, /retry_target_busy/u);

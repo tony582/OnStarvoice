@@ -2271,12 +2271,12 @@ test("settled single-node tasks can retry on another idle Agent without forking 
     postgresCrossDeviceRetrySource,
     "single-node promotion",
     "async function synthesizePromotedKeywordItems",
-    "async function loadIdleCrossDeviceRetryAgent",
+    "function crossDeviceRetryAgentEligible",
   );
   const agentSelection = readSourceSection(
     postgresCrossDeviceRetrySource,
     "cross-device Agent selection",
-    "async function loadIdleCrossDeviceRetryAgent",
+    "async function findIdleCrossDeviceRetryAgent",
     "function promotedRetryFallbackTarget",
   );
   const profileRenewal = readSourceSection(
@@ -2285,7 +2285,14 @@ test("settled single-node tasks can retry on another idle Agent without forking 
     "async function renewProfileRetryExecutions",
     "export async function dispatchCrossDeviceRetry",
   );
-  assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
+  assert.match(dispatchCore, /findIdleCrossDeviceRetryAgent/u);
+  assert.match(dispatchCore, /lockIdleCrossDeviceRetryAgent/u);
+  assert.match(dispatchCore, /lockedCrossDeviceRetryAgentStillEligible/u);
+  assert.match(
+    dispatchCore,
+    /export async function dispatchCrossDeviceRetry\(\{[\s\S]*automatic = false,[\s\S]*\} = \{\}\)/u,
+    'the public retry dispatch must retain an explicit automatic=false default',
+  );
   assert.match(postgresCrossDeviceRetrySource, /AS active_command_count/u);
   assert.match(
     postgresCrossDeviceRetrySource,
@@ -2366,24 +2373,61 @@ test("settled single-node tasks can retry on another idle Agent without forking 
     /renewedExecutions\.executionIdByItem\.get\([\s\S]*'monitorExecutionId', \$8::text/u,
   );
 
-  const requestLock = dispatchCore.indexOf("'capture_cross_device_retry', requestKey");
-  const replayRead = dispatchCore.indexOf("const replay = await tx.queryOne");
-  const singleNodeAgentSelection = dispatchCore.indexOf(
-    "if (initialTask.task_type !== 'capture_orchestration')",
+  const requestLock = dispatchCore.indexOf(
+    "'capture_task_global_id', requestKey",
   );
-  const taskLock = dispatchCore.indexOf("const task = await tx.queryOne");
-  const itemLock = dispatchCore.indexOf("const items = await tx.queryAll");
-  const orchestrationAgentSelection = dispatchCore.indexOf(
-    "if (!targetAgent)",
-    itemLock,
+  const parentControlLock = dispatchCore.indexOf(
+    "'capture_orchestration_control', taskId",
+    requestLock,
   );
-  assert.ok(requestLock >= 0 && requestLock < replayRead);
+  const candidateSelection = dispatchCore.indexOf(
+    'const candidateAgent = await findIdleCrossDeviceRetryAgent',
+    parentControlLock,
+  );
+  const agentSlotLock = dispatchCore.indexOf(
+    'const targetAgent = await lockIdleCrossDeviceRetryAgent',
+    candidateSelection,
+  );
+  const sourceTaskLocks = dispatchCore.indexOf(
+    'const lockedSourceTasks =',
+    agentSlotLock,
+  );
+  const expireCommands = dispatchCore.indexOf(
+    'await expireStaleCommands(',
+    sourceTaskLocks,
+  );
+  const taskLock = dispatchCore.indexOf(
+    'const task = await tx.queryOne',
+    expireCommands,
+  );
+  const itemLocks = dispatchCore.indexOf(
+    'const lockedSelection = await loadCrossDeviceRetryItemSelection',
+    taskLock,
+  );
   assert.ok(
-    singleNodeAgentSelection >= 0 &&
-      singleNodeAgentSelection < taskLock &&
-      taskLock < itemLock &&
-      itemLock < orchestrationAgentSelection,
-    "preserve the pre-existing single-node and orchestration Agent lock order",
+    requestLock >= 0 &&
+      requestLock < parentControlLock &&
+      parentControlLock < candidateSelection &&
+      candidateSelection < agentSlotLock &&
+      agentSlotLock < sourceTaskLocks &&
+      sourceTaskLocks < expireCommands &&
+      expireCommands < taskLock &&
+      taskLock < itemLocks,
+    'common retry must lock request, parent control, Agent, sources, parent, then items',
+  );
+  const lockedSourceSection = dispatchCore.slice(
+    sourceTaskLocks,
+    expireCommands,
+  );
+  assert.match(
+    lockedSourceSection,
+    /ORDER BY id[\s\S]*FOR UPDATE/u,
+    'common retry must lock source tasks in stable UUID order',
+  );
+  assert.match(
+    dispatchCore.slice(itemLocks),
+    /lock: true/u,
+    'the final item selection must take row locks after the parent',
   );
   assert.match(
     dispatchCore,
