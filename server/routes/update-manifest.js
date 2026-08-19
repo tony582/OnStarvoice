@@ -3,12 +3,31 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.83',
+  latestVersion: '0.3.84',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-14',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.83-20260814.zip',
+  releaseDate: '2026-08-19',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.84-20260819.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.84',
+      releaseDate: '2026-08-19',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '相关内容不再因当前搜索词不同而漏采',
+              desc: 'AI 前置筛选会同时判断当前搜索词和租户全部监测范围；紧急救援、远程控制故障、客服投诉及续费争议等内容会保守进入完整采集。',
+            },
+            {
+              title: '详情补全后重新判断相关性与情感',
+              desc: '正文、评论或新关键词上下文补全后会触发重新研判；明确故障和投诉不再误判为中性，整体无关内容的情感标记为不适用。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.83',
       releaseDate: '2026-08-14',

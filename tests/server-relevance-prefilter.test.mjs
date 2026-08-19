@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   PREFILTER_DEFAULT_MODEL_TIMEOUT_MS,
   PREFILTER_MAX_LIST_BATCH,
+  PREFILTER_MAX_TENANT_SKIP_MATCH,
   PREFILTER_MIN_SKIP_THRESHOLD,
   PREFILTER_PROMPT_VERSION,
   buildPrefilterSystemPrompt,
@@ -113,12 +114,13 @@ test('first release sends DeepSeek only minimal list text', () => {
     resolveMonitoringIntent('别克壁纸'),
   );
   assert.match(prompt, /keep\|skip\|need_detail/);
-  assert.match(prompt, /不是在做宽泛的品牌舆情判断/);
+  assert.match(prompt, /双维度相关性筛选器/);
+  assert.match(prompt, /全部监测关键词/);
+  assert.match(prompt, /tenantRelevance/);
   assert.match(prompt, /目标对象：别克、Buick/);
   assert.match(prompt, /目标主题：车机壁纸、手机壁纸/);
-  assert.match(prompt, /必须同时符合任务的目标对象和目标主题/);
-  assert.match(prompt, /其它汽车品牌[\s\S]*0\.98-1\.00/);
-  assert.match(prompt, /合理相关解释[\s\S]*need_detail[\s\S]*0\.96/);
+  assert.match(prompt, /currentKeywordMatch/);
+  assert.match(prompt, /凯迪拉克CT5紧急救援电话误拨/);
 });
 
 test('three-state normalization preserves partial success and fail-opens missing or invalid items', () => {
@@ -136,6 +138,7 @@ test('three-state normalization preserves partial success and fail-opens missing
       {
         itemId: 'x:a',
         decision: 'skip',
+        tenantRelevance: 'irrelevant',
         queryMatch: 0.01,
         brandMatch: 0.02,
         confidence: 0.98,
@@ -143,7 +146,7 @@ test('three-state normalization preserves partial success and fail-opens missing
         evidence: ['大众'],
         missingSignals: [],
       },
-      { itemId: 'unknown', decision: 'skip', queryMatch: 0, brandMatch: 0, confidence: 1, reason: '未知项' },
+      { itemId: 'unknown', decision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 1, reason: '未知项' },
     ],
   }, policy);
 
@@ -162,16 +165,49 @@ test('three-state normalization preserves partial success and fail-opens missing
 test('shadow mode and scores below 0.97 can never skip full capture', () => {
   const shadow = resolvePrefilterPolicyValues({ requestedMode: 'shadow' });
   assert.equal(shadow.effectiveMode, 'shadow');
-  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', confidence: 1 }, shadow), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 1 }, shadow), 'collect_full');
 
   const conservative = resolvePrefilterPolicyValues({ requestedMode: 'conservative', requestedThreshold: 0.97 });
   assert.equal(conservative.effectiveMode, 'conservative');
-  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', confidence: 0.9699 }, conservative), 'collect_full');
-  assert.equal(determineExecutionDisposition({ status: 'model_error', modelDecision: 'skip', confidence: 1 }, conservative), 'collect_full');
-  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', confidence: 0.97 }, conservative), 'skip_full_capture');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 0.9699 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'model_error', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 1 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 0.97 }, conservative), 'skip_full_capture');
+  assert.equal(PREFILTER_MAX_TENANT_SKIP_MATCH, 0.2);
 
   const serverShadow = resolvePrefilterPolicyValues({ requestedMode: 'conservative', serverMode: 'shadow' });
   assert.equal(serverShadow.effectiveMode, 'shadow');
+});
+
+test('tenant-relevant or protected incident results can never skip full capture', () => {
+  const validation = validatePrefilterRequest(validBody({
+    keyword: '凯迪拉克车机升级',
+    items: [
+      { itemId: 'ct5', title: '凯迪拉克CT 5经常莫名拨打紧急救援电话', author: '车主' },
+      { itemId: 'remote', title: '昂科威plus远程失败', author: '车主' },
+      { itemId: 'onstar', title: '安吉星，一生黑', author: '车主' },
+    ],
+  }));
+  const policy = resolvePrefilterPolicyValues({ requestedMode: 'conservative' });
+  const normalized = normalizePrefilterModelResponse(validation.value, {
+    items: validation.value.items.map((item, index) => ({
+      itemId: item.itemId,
+      decision: 'skip',
+      tenantRelevance: index === 0 ? 'relevant' : 'irrelevant',
+      queryMatch: 0,
+      brandMatch: index === 0 ? 0.8 : 0,
+      confidence: 1,
+      reason: '模拟当前关键词不匹配',
+    })),
+  }, policy);
+
+  assert.deepEqual(
+    normalized.items.map(item => item.executionDisposition),
+    ['collect_full', 'collect_full', 'collect_full'],
+  );
+  assert.deepEqual(
+    normalized.items.map(item => item.protectedSignal),
+    [true, true, true],
+  );
 });
 
 test('idempotency body hash ignores request ids but detects logical content changes', () => {

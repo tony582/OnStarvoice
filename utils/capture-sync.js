@@ -3577,11 +3577,13 @@ export async function batchCaptureDetailsForRecords(
               aiRelevancePrefilter: {
                 status: decision.status,
                 modelDecision: decision.modelDecision,
+                tenantRelevance: decision.tenantRelevance,
                 confidence: decision.confidence,
+                protectedSignal: Boolean(decision.protectedSignal),
                 reason: decision.reason,
                 keyword: decision.keyword,
                 stage: 'list',
-                promptVersion: 'prefilter-list-v2',
+                promptVersion: 'prefilter-list-v3',
                 executionDisposition: decision.shouldSkip
                   ? 'skip_expensive'
                   : 'collect_full',

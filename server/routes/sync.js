@@ -245,24 +245,33 @@ export function normalizeRecord(body) {
   });
 }
 
-async function labelRecordsNow(recordIds) {
-  for (const id of recordIds) {
+export function buildSyncAiJob(result = {}) {
+  if (!result.id || result.officialContent) return null;
+  if (result.action === 'inserted') return { id: result.id, force: false };
+  if (result.action === 'updated' && result.shouldRelabel) {
+    return { id: result.id, force: true, reason: result.relabelReason || 'capture_enriched' };
+  }
+  return null;
+}
+
+async function labelRecordsNow(jobs) {
+  for (const job of jobs) {
     try {
-      await labelRecord(id);
+      await labelRecord(job.id, { force: job.force === true });
     } catch (err) {
-      console.error(`[Sync] AI label error for record ${id}:`, err.message);
+      console.error(`[Sync] AI label error for record ${job.id}:`, err.message);
     }
   }
 }
 
-function queueAiJobs(recordIds) {
-  if (!recordIds.length) return Promise.resolve();
+function queueAiJobs(jobs) {
+  if (!jobs.length) return Promise.resolve();
   return scheduleProcessBackgroundWork(async () => {
-    for (const id of recordIds) {
+    for (const job of jobs) {
       try {
-        await labelRecord(id);
+        await labelRecord(job.id, { force: job.force === true });
       } catch (err) {
-        console.error(`[Sync] AI label error for record ${id}:`, err.message);
+        console.error(`[Sync] AI label error for record ${job.id}:`, err.message);
       }
     }
   }, { label: 'SyncAiLabeling' });
@@ -284,8 +293,9 @@ function queueCommentWorkflow(record, result, context) {
   const total = countCommentWorkflowItems(record);
   enqueueCommentWorkflow(async () => {
     const commentStats = await applyCommentWorkflow(record, result, context);
-    if (result.action === 'inserted' && !result.officialContent && !commentStats.officialContent) {
-      await labelRecordsNow([result.id]);
+    const aiJob = buildSyncAiJob(result);
+    if (aiJob && !commentStats.officialContent) {
+      await labelRecordsNow([aiJob]);
     }
   });
   return queuedCommentStats(total);
@@ -320,7 +330,8 @@ router.post('/', requireAuth, async (req, res) => {
       authCode: req.authCode,
     });
 
-    if (result.action === 'inserted' && !result.officialContent && !commentStats.queued && !commentStats.officialContent) queueAiJobs([result.id]);
+    const aiJob = buildSyncAiJob(result);
+    if (aiJob && !commentStats.queued && !commentStats.officialContent) queueAiJobs([aiJob]);
 
     return res.json({
       ok: true,
@@ -344,7 +355,7 @@ router.post('/batch', requireAuth, async (req, res) => {
   }
 
   const results = [];
-  const insertedIds = [];
+  const aiJobs = [];
 
   for (let i = 0; i < allRecords.length; i++) {
     const record = allRecords[i];
@@ -366,7 +377,8 @@ router.post('/batch', requireAuth, async (req, res) => {
         backendRecordId: result.id,
         commentStats,
       });
-      if (result.action === 'inserted' && !result.officialContent && !commentStats.queued && !commentStats.officialContent) insertedIds.push(result.id);
+      const aiJob = buildSyncAiJob(result);
+      if (aiJob && !commentStats.queued && !commentStats.officialContent) aiJobs.push(aiJob);
     } catch (err) {
       const message = err?.message || '同步失败';
       results.push({
@@ -383,7 +395,7 @@ router.post('/batch', requireAuth, async (req, res) => {
     }
   }
 
-  queueAiJobs(insertedIds);
+  queueAiJobs(aiJobs);
 
   const inserted = results.filter(r => r.action === 'inserted').length;
   const updated = results.filter(r => r.action === 'updated').length;

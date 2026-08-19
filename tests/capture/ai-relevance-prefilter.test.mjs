@@ -74,6 +74,7 @@ test('only valid high-confidence skip is actionable', () => {
     normalizeRelevancePrefilterDecision({
       status: 'ok',
       modelDecision: 'skip',
+      tenantRelevance: 'irrelevant',
       confidence: 0.97,
       executionDisposition: 'skip_full_capture',
     }).shouldSkip,
@@ -83,6 +84,7 @@ test('only valid high-confidence skip is actionable', () => {
     normalizeRelevancePrefilterDecision({
       status: 'ok',
       decision: 'skip',
+      tenantRelevance: 'irrelevant',
       confidence: 0.99,
       executionDisposition: 'skip_full_capture',
     }).shouldSkip,
@@ -93,10 +95,11 @@ test('only valid high-confidence skip is actionable', () => {
     {
       status: 'ok',
       modelDecision: 'skip',
+      tenantRelevance: 'irrelevant',
       confidence: 0.969,
       executionDisposition: 'skip_full_capture',
     },
-    {status: 'ok', modelDecision: 'need_detail', confidence: 1},
+    {status: 'ok', modelDecision: 'need_detail', tenantRelevance: 'uncertain', confidence: 1},
     {status: 'timeout', modelDecision: 'skip', confidence: 1},
     {status: 'ok', modelDecision: 'skip', confidence: 'invalid'},
     {status: 'ok', modelDecision: 'skip', confidence: 1},
@@ -106,6 +109,16 @@ test('only valid high-confidence skip is actionable', () => {
       false,
     );
   }
+  assert.equal(
+    normalizeRelevancePrefilterDecision({
+      status: 'ok',
+      modelDecision: 'skip',
+      tenantRelevance: 'relevant',
+      confidence: 1,
+      executionDisposition: 'skip_full_capture',
+    }).shouldSkip,
+    false,
+  );
 });
 
 test('fallback titles cannot be skipped even when model is overconfident', async () => {
@@ -118,6 +131,7 @@ test('fallback titles cannot be skipped even when model is overconfident', async
         itemId: item.itemId,
         status: 'ok',
         modelDecision: 'skip',
+        tenantRelevance: 'irrelevant',
         confidence: 1,
         executionDisposition: 'skip_full_capture',
       })),
@@ -149,6 +163,7 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
             itemId: item.itemId,
             status: 'ok',
             modelDecision: index === 0 ? 'skip' : 'keep',
+            tenantRelevance: index === 0 ? 'irrelevant' : 'relevant',
             confidence: 0.99,
             executionDisposition:
               index === 0 ? 'skip_full_capture' : 'collect_full',
@@ -199,6 +214,7 @@ test('a whole timed-out batch is split and retried once before failing open', as
           itemId: item.itemId,
           status: 'ok',
           modelDecision: 'keep',
+          tenantRelevance: 'relevant',
           confidence: 1,
           executionDisposition: 'collect_full',
         })),
@@ -254,6 +270,7 @@ test('identical list text in a later capture run receives a new idempotency key'
         itemId: item.itemId,
         status: 'ok',
         modelDecision: 'keep',
+        tenantRelevance: 'relevant',
         confidence: 1,
         executionDisposition: 'collect_full',
       })),
@@ -332,6 +349,7 @@ test('parallel DeepSeek batches stay within the server tenant concurrency', asyn
           itemId: item.itemId,
           status: 'ok',
           modelDecision: 'keep',
+          tenantRelevance: 'relevant',
           confidence: 1,
           executionDisposition: 'collect_full',
         })),
@@ -377,6 +395,7 @@ test('request failure, missing items and need_detail all fail open', async () =>
           itemId: items[0].itemId,
           status: 'ok',
           modelDecision: 'need_detail',
+          tenantRelevance: 'uncertain',
           confidence: 0.99,
         },
       ],

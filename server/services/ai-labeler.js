@@ -13,11 +13,13 @@ import {
 import { parsePublishTimestamp } from './publish-date.js';
 import {
   formatMonitoringIntentForPrompt,
+  formatTenantMonitoringScopeForPrompt,
   resolveMonitoringIntent,
+  resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v2';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v3';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 
@@ -53,45 +55,59 @@ export async function getBrandContext(tenantId) {
   return { brandName, brandAliases, businessContext, positiveContextTerms, noiseTerms };
 }
 
-export function buildSystemPrompt(brand, intent = {}) {
+export function buildSystemPrompt(
+  brand,
+  intent = {},
+  tenantScope = resolveTenantMonitoringScope(brand),
+) {
   return `你是一个可配置品牌的舆情分析专家。当前品牌：${brand.brandName}。
 品牌别名：${brand.brandAliases.join('、') || brand.brandName}。
 业务语境：${brand.businessContext}
 强相关语境词：${brand.positiveContextTerms.join('、') || '无'}。
 常见误命中/噪声：${brand.noiseTerms.join('、') || '无'}。
 
+${formatTenantMonitoringScopeForPrompt(tenantScope)}
+
 ${formatMonitoringIntentForPrompt(intent)}
 
-第一步判断内容是否符合【本次采集任务标准】，不是判断它是否宽泛涉及租户品牌家族：
-- relevant：内容有证据同时指向本次任务的目标对象和目标主题。
-- irrelevant：内容只涉及关联车型/品牌，却没有本次功能主题；或只是相似功能、泛行业话题、搜索词/标签/作者名巧合命中。
-- uncertain：已经出现目标对象或目标功能的直接线索，但列表或正文信息残缺，暂时无法确认两者关系。不能因为“功能相似”就判 uncertain。
+第一步判断 relevance，即内容是否属于【租户整体监控范围】：
+- relevant：内容有证据指向任一监测对象与任一监测主题的合理组合，不要求匹配本次采集关键词。
+- irrelevant：内容明确不属于全部监测关键词、对象和主题，或只是人名、地名、谐音、标签、作者名等噪声巧合。
+- uncertain：已经出现整体监控对象或主题的直接线索，但正文、图片、视频或评价对象仍不足以确认。
 
-第二步先识别“内容实际评价的对象”，再判断情绪：
-- sentiment 必须表示内容对本次监控对象/主题的态度，而不是整段文字里最强烈的情绪。
-- 负面表达若指向其它品牌、其它产品或泛行业现象，不得判为对本次监控对象的 negative。
-- 客观询问、故障确认、经验交流，且没有明显抱怨、指责或维权诉求时，判 neutral + inquiry。
+第二步单独判断 currentKeywordMatch：
+- relevant：符合本次搜索词的目标对象和目标主题。
+- irrelevant：不符合本次搜索词，但这不影响整体 relevance。
+- uncertain：信息不足，无法判断与本次搜索词的关系。
+
+第三步识别“内容实际评价的对象”，独立判断情感：
+- 只有整体 relevance 为 relevant 或 uncertain 时才判断 sentiment；整体 irrelevant 时 sentimentStatus=not_applicable、sentiment=null，禁止用 neutral 伪装“未判断”。
+- sentiment 必须表示内容对租户整体监控对象/主题的态度，而不是只看本次采集关键词。
+- 明确的故障、失败、误拨、抱怨、指责、误导、收费争议或维权诉求判 negative；客观询问且无明显不满判 neutral + inquiry。
 - 内容相关与内容负面是两个独立结论；壁纸、教程、咨询可以 relevant 但 sentiment=neutral。
-- “安全”“安全感”“隐私”等普通词本身不代表负面或风险；必须有明确的故障、隐患、泄露、威胁、抱怨等上下文证据。
+- “安全”“安全感”“隐私”等普通词本身不代表负面或风险，必须结合完整上下文。
 
 校准样例：
-- “别克威朗车轮抱死”在“别克哨兵”任务中 irrelevant：它是机械故障，不是哨兵/驻车监控。
-- “至境E7胎噪”在“至境哨兵”任务中 irrelevant：它是车辆体验，不是哨兵功能。
-- “凯迪拉克碰撞测试”在“凯迪拉克OTA”任务中 irrelevant：它没有软件升级主题。
-- “安吉星反复提示更换空调滤芯，怎么关闭”可 relevant；若只是客观询问，则 sentiment=neutral、intent=inquiry。
+- “凯迪拉克CT5经常莫名拨打紧急救援电话”：即使采集关键词是“凯迪拉克车机升级”，currentKeywordMatch=irrelevant；但属于上汽通用安全救援监测，relevance=relevant、sentiment=negative、category=safety_rescue。
+- “昂科威plus远程失败”：即使没有明确写 iBuick，也属于别克远程控制故障，relevance=relevant、sentiment=negative、category=feature_usage。
+- “安吉星，一生黑”且正文投诉续费与客服误导：relevance=relevant、sentiment=negative，并按正文判 renewal_billing 或 service_quality。
+- “别克威朗车轮抱死”不属于哨兵、车机、远控、OTA、客服或其它监测主题时，整体 relevance=irrelevant，而不只是当前关键词不匹配。
+- “凯迪拉克碰撞测试”没有软件升级、安全救援或其它整体监测主题时，整体 relevance=irrelevant。
 - “安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论。
 
-对每条内容，你需要输出以下JSON格式：
-
+对每条内容，只输出以下 JSON：
 {
   "relevance": "relevant|irrelevant|uncertain",
+  "currentKeywordMatch": "relevant|irrelevant|uncertain",
+  "matchedTopics": ["命中的整体监测关键词或主题"],
   "relevanceConfidence": 0.0-1.0,
-  "relevanceReason": "判断相关或无关的简短原因",
+  "relevanceReason": "同时说明整体相关性与当前关键词关系",
   "noiseType": "none|place_name|person_name|real_estate|store|homophone|generic_word|other",
   "targetEntity": "内容实际讨论或评价的对象",
   "sentimentTarget": "情绪实际指向的对象",
   "evidence": ["支持判断的原文短语"],
-  "sentiment": "positive|neutral|negative",
+  "sentiment": "positive|neutral|negative|null",
+  "sentimentStatus": "classified|not_applicable",
   "intent": "inquiry|complaint|share|suggestion|other",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
   "subcategory": "具体子分类（中文）",
@@ -117,18 +133,24 @@ ${formatMonitoringIntentForPrompt(intent)}
   · 账号名信号:若作者账号名带本品牌或其别名/子品牌/产品/门店词，且像围绕该品牌运营(如带"官方""客服""旗舰店""XX店""服务中心""4S"等字样),多为经销商/员工/官方相关,优先判 dealer 或 employee。
 
 规则：
-- irrelevant 内容的 sentiment 固定为 neutral，category 固定为 other，summary 说明为何无关。
+- 搜索关键词、话题标签和作者名称是召回线索，不是整体相关性结论。
+- 当前关键词不匹配不能把整体相关内容判成 irrelevant。
 - uncertain 内容的 sentiment 尽量保守，能判断再给 positive/negative，不能判断则 neutral。
-- 租户品牌背景只能帮助理解实体，不能覆盖本次采集任务的目标主题和排除项。
-- 搜索关键词、话题标签和作者名称是召回线索，不是相关性结论。
 - 只输出JSON，不要其他文字。`;
 }
 
 export function buildUserMessage(record) {
   let text = '';
-  if (record.keyword) text += `采集关键词（仅表示召回入口，不代表一定相关）：${record.keyword}\n`;
+  if (record.keyword) text += `当前记录关键词（仅表示最近召回入口）：${record.keyword}\n`;
+  const observedKeywords = Array.isArray(record.observed_keywords)
+    ? [...new Set(record.observed_keywords.map(value => String(value || '').trim()).filter(Boolean))]
+    : [];
+  if (observedKeywords.length > 0) {
+    text += `全部召回关键词（只用于归属，不覆盖整体相关性）：${observedKeywords.slice(0, 30).join('、')}\n`;
+  }
   if (record.title) text += `标题：${record.title}\n`;
   if (record.content) text += `正文：${record.content.slice(0, 2000)}\n`;
+  if (record.comments_text) text += `评论上下文：${String(record.comments_text).slice(0, 1800)}\n`;
   if (record.author_name) text += `作者：${record.author_name}\n`;
   if (record.platform) text += `平台：${record.platform}\n`;
   if (record.tags) {
@@ -455,7 +477,8 @@ async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
   if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
   const brand = await getBrandContext(tenantId);
   const intent = resolveMonitoringIntent(keyword, { brand });
-  const systemPrompt = buildSystemPrompt(brand, intent);
+  const tenantScope = resolveTenantMonitoringScope(brand);
+  const systemPrompt = buildSystemPrompt(brand, intent, tenantScope);
   const outcome = await runModelOperationWithFailover(
     tenantId,
     config,
@@ -477,6 +500,7 @@ async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
   return {
     result: outcome.data,
     intent,
+    tenantScope,
     provider: outcome.config.provider,
     model: outcome.config.model,
   };
@@ -537,21 +561,47 @@ function normalizeRelevance(value) {
   return 'relevant';
 }
 
-function normalizeResult(result) {
+function normalizeCurrentKeywordMatch(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['relevant', 'irrelevant', 'uncertain'].includes(normalized)) return normalized;
+  return 'uncertain';
+}
+
+function normalizeRecordSentiment(value, fallback = 'neutral') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['positive', 'neutral', 'negative'].includes(normalized)) return normalized;
+  return fallback;
+}
+
+export function normalizeRecordClassificationResult(result) {
   const relevance = normalizeRelevance(result?.relevance);
+  const currentKeywordMatch = normalizeCurrentKeywordMatch(
+    result?.currentKeywordMatch ?? result?.current_keyword_match,
+  );
   const normalized = {
     ...result,
     relevance,
+    currentKeywordMatch,
+    matchedTopics: Array.isArray(result?.matchedTopics ?? result?.matched_topics)
+      ? (result.matchedTopics ?? result.matched_topics)
+        .map(value => String(value || '').trim().slice(0, 100))
+        .filter(Boolean)
+        .slice(0, 30)
+      : [],
     relevanceConfidence: Number(result?.relevanceConfidence ?? result?.relevance_confidence ?? result?.confidence ?? 0),
     relevanceReason: String(result?.relevanceReason || result?.relevance_reason || ''),
     noiseType: String(result?.noiseType || result?.noise_type || (relevance === 'irrelevant' ? 'other' : 'none')),
   };
   if (relevance === 'irrelevant') {
-    normalized.sentiment = 'neutral';
+    normalized.sentiment = '';
+    normalized.sentimentStatus = 'not_applicable';
     normalized.intent = 'other';
     normalized.category = 'other';
     normalized.subcategory = normalized.noiseType || '无关内容';
     normalized.summary = normalized.summary || normalized.relevanceReason || '与当前品牌无关';
+  } else {
+    normalized.sentiment = normalizeRecordSentiment(result?.sentiment);
+    normalized.sentimentStatus = 'classified';
   }
   return normalized;
 }
@@ -566,6 +616,30 @@ function hasRelevanceResult(record) {
   } catch {
     return false;
   }
+}
+
+function parseJsonObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function applyManualRelevanceOverride(result, manualOverrides) {
+  const override = parseJsonObject(manualOverrides).relevance;
+  const rawValue = override && typeof override === 'object' ? override.value : override;
+  const value = String(rawValue || '').trim().toLowerCase();
+  if (!['relevant', 'irrelevant', 'uncertain'].includes(value)) return result;
+  return {
+    ...result,
+    relevance: value,
+    relevanceReason: String(override?.reason || result.relevanceReason || ''),
+    manualRelevanceOverride: true,
+  };
 }
 
 /**
@@ -599,7 +673,21 @@ export async function labelRecord(recordId, options = {}) {
   if (['official_content', 'blogger_profile'].includes(record?.record_type)) return null;
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
 
-  const userMessage = buildUserMessage(record);
+  const observationRows = await queryAll(`
+    SELECT DISTINCT keyword
+    FROM record_observations
+    WHERE record_id = $1 AND tenant_id = $2 AND BTRIM(keyword) <> ''
+    ORDER BY keyword
+  `, [recordId, record.tenant_id]);
+  const observedKeywords = [
+    record.keyword,
+    ...observationRows.map(row => row.keyword),
+  ].map(value => String(value || '').trim()).filter(Boolean);
+  const uniqueObservedKeywords = [...new Set(observedKeywords)];
+  const userMessage = buildUserMessage({
+    ...record,
+    observed_keywords: uniqueObservedKeywords,
+  });
   try {
     const labeled = await callLLM(
       userMessage,
@@ -608,8 +696,10 @@ export async function labelRecord(recordId, options = {}) {
       {priority: 'normal', kind: 'record_classification'},
     );
     if (!labeled?.result) return null;
+    const manuallyProtectedResult = applyManualRelevanceOverride(labeled.result, record.manual_overrides);
+    const effectiveResult = normalizeRecordClassificationResult(manuallyProtectedResult);
     const result = {
-      ...normalizeResult(labeled.result),
+      ...effectiveResult,
       classifierMetadata: {
         promptVersion: RECORD_CLASSIFICATION_PROMPT_VERSION,
         provider: labeled.provider,
@@ -617,6 +707,9 @@ export async function labelRecord(recordId, options = {}) {
         monitoringIntentId: labeled.intent.intentId,
         monitoringIntentVersion: labeled.intent.intentVersion,
         monitoringObjective: labeled.intent.objective,
+        monitoringScopeId: labeled.tenantScope.scopeId,
+        monitoringScopeVersion: labeled.tenantScope.scopeVersion,
+        observedKeywords: uniqueObservedKeywords.slice(0, 30),
       },
     };
     const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;

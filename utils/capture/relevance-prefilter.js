@@ -277,15 +277,21 @@ export function normalizeRelevancePrefilterDecision(
     raw?.modelDecision || raw?.decision,
     40,
   ).toLocaleLowerCase();
+  const tenantRelevance = normalizeText(
+    raw?.tenantRelevance || raw?.tenant_relevance,
+    40,
+  ).toLocaleLowerCase();
   const confidence = Number(raw?.confidence);
   const executionDisposition = normalizeText(
     raw?.executionDisposition,
     80,
   ).toLocaleLowerCase();
   const normalizedThreshold = normalizeThreshold(threshold);
+  const protectedSignal = raw?.protectedSignal === true;
   const valid =
     status === 'ok' &&
     new Set(['keep', 'skip', 'need_detail']).has(modelDecision) &&
+    new Set(['relevant', 'irrelevant', 'uncertain']).has(tenantRelevance) &&
     Number.isFinite(confidence) &&
     confidence >= 0 &&
     confidence <= 1;
@@ -293,6 +299,8 @@ export function normalizeRelevancePrefilterDecision(
     valid &&
       canSkip &&
       modelDecision === 'skip' &&
+      tenantRelevance === 'irrelevant' &&
+      !protectedSignal &&
       executionDisposition === 'skip_full_capture' &&
       confidence >= normalizedThreshold,
   );
@@ -301,7 +309,9 @@ export function normalizeRelevancePrefilterDecision(
     shouldSkip,
     status: status || 'model_error',
     modelDecision: valid ? modelDecision : null,
+    tenantRelevance: valid ? tenantRelevance : null,
     confidence: valid ? confidence : null,
+    protectedSignal,
     executionDisposition: executionDisposition || null,
     reason: normalizeText(raw?.reason, 320),
     evidence: Array.isArray(raw?.evidence)
@@ -412,7 +422,7 @@ export async function evaluateRelevancePrefilterRecords(
           platform: batch[0].platform,
           stage: 'list',
           keyword: batch[0].keyword,
-          promptVersion: 'prefilter-list-v2',
+          promptVersion: 'prefilter-list-v3',
           mode: 'conservative',
           skipThreshold: normalizedThreshold,
           items: requestItems,

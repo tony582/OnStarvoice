@@ -200,7 +200,7 @@ test('分类落库后异步派生，sync 不再重复触发 alert，手动路由
   assert.match(labeler, /scheduleProcessBackgroundWork\(async \(\) =>/);
 
   assert.doesNotMatch(syncRoute, /checkAlerts/);
-  assert.match(syncRoute, /await labelRecord\(id\)/);
+  assert.match(syncRoute, /await labelRecord\(job\.id, \{ force: job\.force === true \}\)/);
 
   assert.match(analysisRoute, /isValidRecordAnalysisCache/);
   assert.match(analysisRoute, /isRecordAnalysisCacheCurrent/);

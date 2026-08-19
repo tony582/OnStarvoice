@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {normalizeRecord} from '../server/routes/sync.js';
+import {buildSyncAiJob, normalizeRecord} from '../server/routes/sync.js';
 import {
   guardRecordCommentCount,
   guardRecordTextCompleteness,
   mergeObservationMetrics,
   resolveGuardedCommentsCount,
   resolveCapturedTextUpdate,
+  resolveRecordRelabelReason,
 } from '../server/services/record-store.js';
 import {
   resolveMetricUpdateFromPayload,
@@ -250,6 +251,69 @@ test('unknown latest metrics fall back to the older enhanced values', () => {
 
   assert.equal(metrics.comments_count, 7);
   assert.equal(metrics.collects, 1);
+});
+
+test('capture enrichment and new keyword context request a bounded AI relabel', () => {
+  const filtered = {
+    keyword: '凯迪拉克车机升级',
+    content: '',
+    comments_text: '',
+    payload: {detailCaptureStatus: 'filtered'},
+    ai_result: {relevance: 'irrelevant'},
+  };
+  assert.equal(
+    resolveRecordRelabelReason(
+      filtered,
+      {
+        keyword: '安吉星',
+        content: '车辆经常莫名拨打紧急救援电话。',
+        payload: {detailCaptureStatus: 'done'},
+      },
+      ['content', 'payload'],
+    ),
+    'detail_completed',
+  );
+  assert.equal(
+    resolveRecordRelabelReason(
+      {...filtered, payload: {detailCaptureStatus: 'done'}},
+      {keyword: '安吉星', payload: {detailCaptureStatus: 'done'}},
+      [],
+    ),
+    'new_keyword_context',
+  );
+  assert.equal(
+    resolveRecordRelabelReason(
+      {...filtered, payload: {detailCaptureStatus: 'done'}, ai_result: {relevance: 'relevant'}},
+      {keyword: '安吉星', payload: {detailCaptureStatus: 'done'}},
+      [],
+    ),
+    '',
+  );
+  assert.equal(
+    resolveRecordRelabelReason(
+      {...filtered, payload: {detailCaptureStatus: 'done'}},
+      {keyword: filtered.keyword, comments_text: '新增负面评论', payload: {detailCaptureStatus: 'done'}},
+      ['comments_text'],
+    ),
+    'comments_enriched',
+  );
+});
+
+test('sync forces AI only for enriched updates while preserving normal inserts', () => {
+  assert.deepEqual(
+    buildSyncAiJob({id: 'new-record', action: 'inserted'}),
+    {id: 'new-record', force: false},
+  );
+  assert.deepEqual(
+    buildSyncAiJob({
+      id: 'existing-record',
+      action: 'updated',
+      shouldRelabel: true,
+      relabelReason: 'new_keyword_context',
+    }),
+    {id: 'existing-record', force: true, reason: 'new_keyword_context'},
+  );
+  assert.equal(buildSyncAiJob({id: 'existing-record', action: 'updated'}), null);
 });
 
 test('legacy comment count cannot overwrite a trusted stored count', () => {

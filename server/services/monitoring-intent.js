@@ -1,4 +1,5 @@
-export const MONITORING_INTENT_VERSION = 2;
+export const MONITORING_INTENT_VERSION = 3;
+export const TENANT_MONITORING_SCOPE_VERSION = 1;
 
 const VEHICLE_TOPIC_EXCLUSIONS = [
   '与当前功能无关的车辆机械故障',
@@ -122,6 +123,20 @@ function boundedText(value, maxLength = 500) {
   return String(value ?? '').trim().slice(0, maxLength);
 }
 
+function uniqueBounded(values = [], { maxItems = 120, maxLength = 100 } = {}) {
+  const result = [];
+  const seen = new Set();
+  for (const raw of values) {
+    const value = boundedText(raw, maxLength);
+    const key = value.normalize('NFKC').toLocaleLowerCase();
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
 export function normalizeMonitoringKeyword(value) {
   return boundedText(value, 200)
     .normalize('NFKC')
@@ -176,7 +191,7 @@ export function resolveMonitoringIntent(keyword, { brand = {}, fallbackIntent = 
 
 export function formatMonitoringIntentForPrompt(intent = {}) {
   const list = value => Array.isArray(value) && value.length > 0 ? value.join('、') : '未指定';
-  return `本次采集任务标准（优先级高于宽泛品牌背景）：
+  return `本次搜索词标准（只用于判断 currentKeywordMatch 和记录召回入口，不覆盖租户整体相关性）：
 - 搜索关键词：${intent.keyword || '未提供'}
 - 采集目标：${intent.objective || 'keyword_relevance'}
 - 目标对象：${list(intent.targetEntity)}
@@ -184,7 +199,39 @@ export function formatMonitoringIntentForPrompt(intent = {}) {
 - 明确排除：${list(intent.exclusions)}
 - 补充说明：${intent.notes || '无'}
 
-必须同时核对“目标对象”和“目标主题”。只命中品牌、车型、作者名、话题标签或搜索词，不足以证明相关。`;
+判断 currentKeywordMatch 时必须同时核对“目标对象”和“目标主题”。只命中品牌、车型、作者名、话题标签或搜索词，不足以证明与当前搜索词匹配。`;
+}
+
+export function resolveTenantMonitoringScope(brand = {}) {
+  const brandEntities = [brand.brandName, ...(brand.brandAliases || [])];
+  const keywordRules = KEYWORD_INTENTS.flatMap(rule => rule.keys);
+  const targetEntities = KEYWORD_INTENTS.flatMap(rule => rule.targetEntity);
+  const targetContent = KEYWORD_INTENTS.flatMap(rule => rule.targetContent);
+  return {
+    scopeId: 'tenant-monitoring-scope',
+    scopeVersion: TENANT_MONITORING_SCOPE_VERSION,
+    brandName: boundedText(brand.brandName, 100),
+    businessContext: boundedText(brand.businessContext, 1000),
+    keywords: uniqueBounded(keywordRules, { maxItems: 60, maxLength: 100 }),
+    targetEntity: uniqueBounded([...brandEntities, ...targetEntities], { maxItems: 80, maxLength: 100 }),
+    targetContent: uniqueBounded([
+      ...(brand.positiveContextTerms || []),
+      ...targetContent,
+    ], { maxItems: 120, maxLength: 100 }),
+    noiseTerms: uniqueBounded(brand.noiseTerms || [], { maxItems: 60, maxLength: 100 }),
+  };
+}
+
+export function formatTenantMonitoringScopeForPrompt(scope = {}) {
+  const list = value => Array.isArray(value) && value.length > 0 ? value.join('、') : '未指定';
+  return `租户整体监控范围（用于判断 relevance/tenantRelevance，优先于单个搜索词）：
+- 品牌与业务背景：${scope.brandName || '未配置'}；${scope.businessContext || '无'}
+- 全部监测关键词：${list(scope.keywords)}
+- 监测对象：${list(scope.targetEntity)}
+- 监测主题：${list(scope.targetContent)}
+- 常见噪声：${list(scope.noiseTerms)}
+
+只要内容有证据属于上述任一监测对象与任一监测主题的合理组合，就属于租户整体相关；它可以与本次搜索词不匹配。`;
 }
 
 export function listKnownMonitoringIntents() {

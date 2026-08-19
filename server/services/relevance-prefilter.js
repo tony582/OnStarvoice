@@ -4,19 +4,24 @@ import { execute, getSetting, queryAll, queryOne, withTransaction } from '../db/
 import { callDeepSeekWithPrompt, getBrandContext, getDeepSeekConfig } from './ai-labeler.js';
 import {
   formatMonitoringIntentForPrompt,
+  formatTenantMonitoringScopeForPrompt,
   resolveMonitoringIntent,
+  resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 
-export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v2';
+export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v3';
 export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
+export const PREFILTER_MAX_TENANT_SKIP_MATCH = 0.2;
 export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 25000;
 
 const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const VALID_MODES = new Set(['disabled', 'shadow', 'conservative']);
 const VALID_DECISIONS = new Set(['keep', 'skip', 'need_detail']);
+const VALID_TENANT_RELEVANCE = new Set(['relevant', 'irrelevant', 'uncertain']);
 const MODE_RANK = { disabled: 0, shadow: 1, conservative: 2 };
+const PROTECTED_MONITORING_SIGNAL_PATTERN = /(?:安吉星|onstar|紧急(?:救援|求助)|道路救援|\bsos\b|远程(?:启动|控制|解锁|上锁|空调)?.{0,8}(?:失败|失效|不能|无法|用不了|没反应|故障|异常)|客服.{0,8}(?:投诉|误导|不处理|不解决)|续费.{0,8}(?:投诉|误导|收费|争议|贵|坑|不续)|一生黑)/iu;
 
 export class PrefilterRequestError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -126,7 +131,7 @@ export function validatePrefilterRequest(body = {}) {
   if (!VALID_PLATFORMS.has(platform)) return { ok: false, status: 422, error: 'INVALID_PLATFORM', message: '仅支持小红书和抖音' };
   if (stage !== 'list') return { ok: false, status: 422, error: 'UNSUPPORTED_STAGE', message: '第一期仅支持 list 文字判断' };
   if (!keyword) return { ok: false, status: 422, error: 'KEYWORD_REQUIRED', message: '缺少搜索关键词' };
-  if (!['prefilter-list-v1', PREFILTER_PROMPT_VERSION].includes(requestedPromptVersion)) {
+  if (!['prefilter-list-v1', 'prefilter-list-v2', PREFILTER_PROMPT_VERSION].includes(requestedPromptVersion)) {
     return { ok: false, status: 409, error: 'PROMPT_VERSION_CONFLICT', message: '前置筛选提示词版本不匹配' };
   }
   const promptVersion = PREFILTER_PROMPT_VERSION;
@@ -258,15 +263,36 @@ async function resolvePrefilterPolicy(tenantId, request) {
   });
 }
 
-export function determineExecutionDisposition({ status, modelDecision, confidence }, policy) {
+export function hasProtectedMonitoringSignal(item = {}) {
+  return PROTECTED_MONITORING_SIGNAL_PATTERN.test(`${item.title || ''} ${item.author || ''}`);
+}
+
+export function determineExecutionDisposition({
+  status,
+  modelDecision,
+  tenantRelevance,
+  brandMatch,
+  confidence,
+  protectedSignal = false,
+}, policy) {
   if (status !== 'ok') return 'collect_full';
   if (policy.effectiveMode !== 'conservative') return 'collect_full';
-  if (modelDecision === 'skip' && confidence >= policy.skipThreshold) return 'skip_full_capture';
+  if (protectedSignal) return 'collect_full';
+  if (
+    modelDecision === 'skip'
+    && tenantRelevance === 'irrelevant'
+    && Number(brandMatch) <= PREFILTER_MAX_TENANT_SKIP_MATCH
+    && confidence >= policy.skipThreshold
+  ) return 'skip_full_capture';
   return 'collect_full';
 }
 
-export function buildPrefilterSystemPrompt(brand = {}, intent = {}) {
-  return `你是采集前的查询意图相关性筛选器。你不是在做宽泛的品牌舆情判断，而是在判断每条搜索结果是否符合用户本次搜索词的具体意图。
+export function buildPrefilterSystemPrompt(
+  brand = {},
+  intent = {},
+  tenantScope = resolveTenantMonitoringScope(brand),
+) {
+  return `你是采集前的双维度相关性筛选器。你必须分别判断“当前搜索词是否匹配”和“是否属于租户整体监控范围”，两者不能互相覆盖。
 
 租户品牌：${brand.brandName || '未配置'}
 品牌别名：${(brand.brandAliases || []).join('、') || '无'}
@@ -274,26 +300,36 @@ export function buildPrefilterSystemPrompt(brand = {}, intent = {}) {
 品牌相关词：${(brand.positiveContextTerms || []).join('、') || '无'}
 常见噪声：${(brand.noiseTerms || []).join('、') || '无'}
 
+${formatTenantMonitoringScopeForPrompt(tenantScope)}
+
 ${formatMonitoringIntentForPrompt(intent)}
 
 对每一项只允许三种决定：
-- keep：现有列表文字已经足以确认符合本次查询意图；
-- skip：现有列表文字已经足以确认不符合本次查询意图；
-- need_detail：可能相关但证据不足，需要正文、标签、画面或口播才能判断。
+- keep：现有列表文字已经足以确认符合本次搜索词；
+- skip：现有列表文字已经足以确认不符合本次搜索词；
+- need_detail：可能匹配本次搜索词，但证据不足，需要正文、标签、画面或口播才能判断。
+
+同时必须输出 tenantRelevance：
+- relevant：即使不匹配当前搜索词，仍明确属于租户整体监控对象与主题；
+- irrelevant：明确不属于全部监测关键词、对象和主题；
+- uncertain：列表文字不足以排除整体相关性，需要完整内容。
 
 规则：
-1. 不要因为内容提到了品牌、车型、搜索词、话题标签或作者名就自动 keep，必须同时符合任务的目标对象和目标主题。
-2. 人名、地名、谐音、其它品牌、泛词巧合命中应 skip。
-3. 标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail。
-4. 证据不足时必须 need_detail，禁止为了提高跳过率猜测。
-5. 每个输入 itemId 必须恰好输出一次；不得输出未知 itemId。
-6. 只输出 JSON 对象，不要 Markdown 或解释性前后缀。
-7. confidence 表示你对当前决定的确定程度，不是相关度分数。若标题已经明确指向其它汽车品牌/产品，且目标品牌或目标实体完全缺失，这是可由列表文字直接证实的无关项，decision=skip，confidence 应为 0.98-1.00。
-8. 只有部分词相似、可能需要画面/口播/正文才能排除，或仍存在合理相关解释时，不得用高置信 skip，必须输出 need_detail，confidence 不高于 0.96。
-9. 关联品牌的其它车辆话题不属于当前功能任务。例如“别克OTA”不包含别克机械故障，“至境哨兵”不包含至境胎噪，“凯迪拉克壁纸”不包含凯迪拉克碰撞测试。
+1. decision 只表示 currentKeywordMatch；tenantRelevance 表示租户整体相关性。decision=skip 绝不等于 tenantRelevance=irrelevant。
+2. 判断当前搜索词时仍须同时符合其目标对象和目标主题，不能因为只出现品牌、车型或搜索词就自动 keep。
+3. 内容命中任一其它监测关键词或主题时，即使当前 decision=skip，tenantRelevance 也必须是 relevant 或 uncertain。
+4. 安吉星、紧急/道路救援、远程控制故障、客服投诉、续费争议等风险线索必须保守采集，不得仅因当前搜索词不匹配而判整体无关。
+5. 人名、地名、谐音、租户范围外的其它品牌、泛词巧合命中可判 decision=skip 且 tenantRelevance=irrelevant。
+6. 标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail，tenantRelevance 至少 uncertain。
+7. 证据不足时必须 need_detail，禁止为了提高跳过率猜测。
+8. 每个输入 itemId 必须恰好输出一次；不得输出未知 itemId。
+9. 只输出 JSON 对象，不要 Markdown 或解释性前后缀。
+10. confidence 表示你对 decision 和 tenantRelevance 组合的确定程度，不是相关度分数。
+11. queryMatch 是当前搜索词匹配分；brandMatch 是租户整体监控范围匹配分，不是当前关键词目标品牌分。
+12. “凯迪拉克CT5紧急救援电话误拨”对“凯迪拉克车机升级”可 decision=skip，但属于安全救援监测，必须 tenantRelevance=relevant 并完整采集。
 
 输出格式：
-{"items":[{"itemId":"原值","decision":"keep|skip|need_detail","queryMatch":0.0,"brandMatch":0.0,"confidence":0.0,"reason":"简短中文原因","evidence":["证据"],"missingSignals":["缺失证据"]}]}`;
+{"items":[{"itemId":"原值","decision":"keep|skip|need_detail","tenantRelevance":"relevant|irrelevant|uncertain","queryMatch":0.0,"brandMatch":0.0,"confidence":0.0,"reason":"同时说明当前词匹配和整体相关性的简短中文原因","evidence":["证据"],"missingSignals":["缺失证据"]}]}`;
 }
 
 export function buildPrefilterUserMessage(request) {
@@ -319,6 +355,7 @@ function failOpenItem(item, status, reason, policy) {
     itemId: item.itemId,
     status,
     modelDecision: null,
+    tenantRelevance: null,
     decisionFinality: 'provisional',
     queryMatch: null,
     brandMatch: null,
@@ -328,6 +365,7 @@ function failOpenItem(item, status, reason, policy) {
     missingSignals: [],
     executionDisposition: 'collect_full',
     failOpen: true,
+    protectedSignal: hasProtectedMonitoringSignal(item),
     cacheHit: false,
   };
   result.executionDisposition = determineExecutionDisposition(result, policy);
@@ -336,21 +374,35 @@ function failOpenItem(item, status, reason, policy) {
 
 function normalizeOneModelItem(item, raw, policy) {
   const decision = boundedText(raw?.decision || raw?.modelDecision, 30).toLowerCase();
+  const tenantRelevance = boundedText(
+    raw?.tenantRelevance ?? raw?.tenant_relevance,
+    30,
+  ).toLowerCase();
   const queryMatch = normalizeScore(raw?.queryMatch ?? raw?.query_match);
   const brandMatch = normalizeScore(raw?.brandMatch ?? raw?.brand_match);
   const confidence = normalizeScore(raw?.confidence);
   const reason = boundedText(raw?.reason, 1000);
-  if (!VALID_DECISIONS.has(decision) || queryMatch === null || brandMatch === null || confidence === null || !reason) {
+  if (
+    !VALID_DECISIONS.has(decision)
+    || !VALID_TENANT_RELEVANCE.has(tenantRelevance)
+    || queryMatch === null
+    || brandMatch === null
+    || confidence === null
+    || !reason
+  ) {
     return failOpenItem(item, 'model_error', 'DeepSeek 返回字段不完整，已按安全策略继续采集', policy);
   }
+  const protectedSignal = hasProtectedMonitoringSignal(item);
   const result = {
     itemId: item.itemId,
     status: 'ok',
     modelDecision: decision,
+    tenantRelevance,
     decisionFinality: 'provisional',
     queryMatch,
     brandMatch,
     confidence,
+    protectedSignal,
     reason,
     evidence: boundedStringArray(raw?.evidence, { maxItems: 10, maxLength: 120 }),
     missingSignals: boundedStringArray(raw?.missingSignals ?? raw?.missing_signals, { maxItems: 10, maxLength: 120 }),
@@ -557,7 +609,12 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
         response.skipThreshold,
         response.latencyMs,
         Boolean(result.cacheHit),
-        JSON.stringify({ failOpen: result.failOpen, itemIndex: index }),
+        JSON.stringify({
+          failOpen: result.failOpen,
+          itemIndex: index,
+          tenantRelevance: result.tenantRelevance || null,
+          protectedSignal: Boolean(result.protectedSignal),
+        }),
       ]);
       if (result.status === 'ok' && !result.cacheHit) {
         await tx.execute(`
@@ -618,6 +675,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
     throw new PrefilterRequestError(validation.status, validation.error, validation.message);
   }
   const brand = await getBrandContext(tenantId);
+  const tenantScope = resolveTenantMonitoringScope(brand);
   const request = {
     ...validation.value,
     intent: resolveMonitoringIntent(validation.value.keyword, {
@@ -663,7 +721,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
               try {
                 result = await callDeepSeekWithPrompt(
                   tenantId,
-                  buildPrefilterSystemPrompt(brand, request.intent),
+                  buildPrefilterSystemPrompt(brand, request.intent, tenantScope),
                   buildPrefilterUserMessage(pendingRequest),
                   {
                     timeoutMs: modelTimeoutMs(),
@@ -752,6 +810,11 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       intentId: request.intent.intentId,
       intentVersion: request.intent.intentVersion,
       intent: request.intent,
+      tenantScope: {
+        scopeId: tenantScope.scopeId,
+        scopeVersion: tenantScope.scopeVersion,
+        keywords: tenantScope.keywords,
+      },
       promptVersion: request.promptVersion,
       provider: PREFILTER_PROVIDER,
       model,
