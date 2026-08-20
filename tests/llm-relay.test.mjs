@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   isLlmRelayEligibleKind,
   LLM_RELAY_CLASSIFICATION_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
   LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
   LLM_RELAY_PREFILTER_TIMEOUT_MS,
   LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS,
@@ -25,7 +26,8 @@ test('local relay is bounded to final and prefilter classification with short de
   assert.equal(LLM_RELAY_CLASSIFICATION_TIMEOUT_MS, 15_000);
   assert.equal(LLM_RELAY_PREFILTER_TIMEOUT_MS, 9_000);
   assert.equal(LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS, 1_000);
-  assert.equal(LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS, 27_000);
+  assert.equal(LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS, 8_000);
+  assert.equal(LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS, 28_000);
 });
 
 test('relay settings are opt-in and validate the model name', () => {

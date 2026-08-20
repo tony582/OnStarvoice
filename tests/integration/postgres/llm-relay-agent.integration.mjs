@@ -34,7 +34,10 @@ test('outbound AI Agent claims and completes a tenant-isolated PostgreSQL job', 
     requestLlmRelayAgentCompletion,
     claimNextLlmRelayJob,
   } = await import('../../../server/services/llm-relay-jobs.js');
-  const {callRelevancePrefilterWithPrompt} = await import(
+  const {
+    callRelevancePrefilterWithPrompt,
+    getRelevancePrefilterRouteConfigs,
+  } = await import(
     '../../../server/services/ai-labeler.js'
   );
 
@@ -120,10 +123,25 @@ test('outbound AI Agent claims and completes a tenant-isolated PostgreSQL job', 
       ($1, 'llm_model', 'deepseek-v4-flash'),
       ($1, 'llm_api_key', 'integration-cloud-fallback-key'),
       ($1, 'llm_relay_mode', 'primary'),
-      ($1, 'llm_relay_model', 'gemini-3.7-flash-low')
+      ($1, 'llm_relay_model', 'gemini-3.7-flash-low'),
+      ($1, 'llm_failover_enabled', 'true'),
+      ($1, 'llm_failover_primary_model', 'deepseek-v4-flash'),
+      ($1, 'llm_failover_backup_model', 'deepseek-v4-pro'),
+      ($1, 'relevance_prefilter_qwen_fallback_enabled', 'true'),
+      ($1, 'relevance_prefilter_qwen_fallback_model', 'qwen3.7-flash-2026-07-15'),
+      ($1, 'dashscope_api_key', 'integration-qwen-fallback-key')
     ON CONFLICT (tenant_id, key)
     DO UPDATE SET value = excluded.value, updated_at = now()
   `, [tenant.id]);
+  const routeConfigs = await getRelevancePrefilterRouteConfigs(tenant.id);
+  assert.equal(routeConfigs.primaryConfig.model, 'deepseek-v4-flash');
+  assert.equal(routeConfigs.primaryConfig.failover, undefined);
+  assert.equal(routeConfigs.qwenFallbackConfig.enabled, true);
+  assert.deepEqual(routeConfigs.cacheRoutes, [
+    {provider: 'antigravity', model: 'gemini-3.7-flash-low'},
+    {provider: 'deepseek', model: 'deepseek-v4-flash'},
+    {provider: 'qianwen', model: 'qwen3.7-flash-2026-07-15'},
+  ]);
   const prefilterPromise = callRelevancePrefilterWithPrompt(
     tenant.id,
     'Return one prefilter JSON object.',
@@ -134,6 +152,7 @@ test('outbound AI Agent claims and completes a tenant-isolated PostgreSQL job', 
       returnMetadata: true,
       priority: 'capture',
       kind: 'relevance_prefilter',
+      routeConfigs,
     },
   );
   await waitForQueuedJob(pool, tenant.id);

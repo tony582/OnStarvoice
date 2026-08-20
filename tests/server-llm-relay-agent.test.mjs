@@ -43,7 +43,7 @@ test('Agent API is mounted separately and local-offline errors retain cloud fall
   assert.match(labeler, /LLM_RELAY_PREFILTER_TIMEOUT_MS/);
   assert.match(labeler, /relayQueueTimeoutMs/);
   assert.match(prefilter, /callRelevancePrefilterWithPrompt/);
-  assert.match(prefilter, /getRelevancePrefilterCacheRoutes/);
+  assert.match(prefilter, /getRelevancePrefilterRouteConfigs/);
   assert.doesNotMatch(prefilter, /requestLlmRelayAgentCompletion/);
 });
 

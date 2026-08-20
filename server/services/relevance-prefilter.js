@@ -4,8 +4,7 @@ import { execute, getSetting, queryAll, queryOne, withTransaction } from '../db/
 import {
   callRelevancePrefilterWithPrompt,
   getBrandContext,
-  getRelevancePrefilterCacheRoutes,
-  getRelevancePrefilterLLMConfig,
+  getRelevancePrefilterRouteConfigs,
 } from './ai-labeler.js';
 import {
   formatMonitoringIntentForPrompt,
@@ -774,8 +773,9 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       items = allFailOpenItems(request, 'model_error', 'AI 前置筛选已由服务端关闭，已继续原采集流程', policy);
     } else {
       try {
-        const llmConfig = await getRelevancePrefilterLLMConfig(tenantId);
-        const cacheRoutes = await getRelevancePrefilterCacheRoutes(tenantId, llmConfig);
+        const routeConfigs = await getRelevancePrefilterRouteConfigs(tenantId);
+        const llmConfig = routeConfigs.primaryConfig;
+        const cacheRoutes = routeConfigs.cacheRoutes;
         provider = cacheRoutes[0]?.provider || llmConfig.provider;
         model = cacheRoutes[0]?.model || llmConfig.model;
         const cacheResult = await loadCachedPrefilterItems(
@@ -809,6 +809,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
                 returnMetadata: true,
                 priority: 'capture',
                 kind: 'relevance_prefilter',
+                routeConfigs,
               },
             );
             if (!result) {

@@ -23,10 +23,15 @@ import {
   validatePrefilterRequest,
 } from '../server/services/relevance-prefilter.js';
 import {
+  DEFAULT_PREFILTER_QWEN_FALLBACK_MODEL,
+  PREFILTER_QWEN_FALLBACK_SETTING_KEYS,
   buildOpenAICompatibleRequestBody,
+  callRelevancePrefilterWithPrompt,
   resolveDeadlineBoundedTimeoutMs,
+  resolvePrefilterQwenFallbackConfigValues,
   resolveRelevancePrefilterCacheRoutes,
   resolvePurposeLLMConfigValues,
+  runPrefilterCloudFallbackPolicy,
 } from '../server/services/ai-labeler.js';
 import { resolveMonitoringIntent } from '../server/services/monitoring-intent.js';
 
@@ -340,29 +345,214 @@ test('purpose route never reuses a credential across providers', () => {
   assert.equal(qwen.endpoint, 'https://example.aliyuncs.com/compatible-mode/v1');
 });
 
-test('prefilter cache follows local-primary and cloud-fallback route order', () => {
+test('Qwen prefilter fallback is explicit, fixed-purpose and never borrows a DeepSeek key', () => {
+  const disabled = resolvePrefilterQwenFallbackConfigValues({}, {
+    DASHSCOPE_API_KEY: 'env-qwen-secret',
+  });
+  assert.equal(disabled.requested, false);
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.model, DEFAULT_PREFILTER_QWEN_FALLBACK_MODEL);
+
+  const missingQwenKey = resolvePrefilterQwenFallbackConfigValues({
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]: 'true',
+    llm_api_key: 'deepseek-secret-must-not-be-used',
+  }, {});
+  assert.equal(missingQwenKey.requested, true);
+  assert.equal(missingQwenKey.enabled, false);
+  assert.equal(missingQwenKey.apiKey, '');
+  assert.match(missingQwenKey.validationError, /DashScope API Key/);
+
+  const fromEnvironment = resolvePrefilterQwenFallbackConfigValues({
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]: 'on',
+  }, {DASHSCOPE_API_KEY: 'env-qwen-secret'});
+  assert.equal(fromEnvironment.enabled, true);
+  assert.equal(fromEnvironment.provider, 'qianwen');
+  assert.equal(fromEnvironment.apiKey, 'env-qwen-secret');
+  assert.equal(
+    fromEnvironment.endpoint,
+    'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  );
+
+  const tenantKeyWins = resolvePrefilterQwenFallbackConfigValues({
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]: '1',
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey]: 'tenant-qwen-secret',
+  }, {DASHSCOPE_API_KEY: 'env-qwen-secret'});
+  assert.equal(tenantKeyWins.apiKey, 'tenant-qwen-secret');
+
+  const unsafeEndpoint = resolvePrefilterQwenFallbackConfigValues({
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]: 'true',
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint]: 'https://example.com/v1',
+  }, {DASHSCOPE_API_KEY: 'env-qwen-secret'});
+  assert.equal(unsafeEndpoint.enabled, false);
+  assert.match(unsafeEndpoint.validationError, /阿里云百炼/);
+});
+
+test('prefilter cloud fallback calls DeepSeek before Qwen and fails open only after both fail', async () => {
+  const calls = [];
+  const primary = await runPrefilterCloudFallbackPolicy({
+    primaryAvailable: true,
+    fallbackAvailable: true,
+    callPrimary: async () => {
+      calls.push('deepseek');
+      return 'primary-result';
+    },
+    callFallback: async () => {
+      calls.push('qwen');
+      return 'fallback-result';
+    },
+  });
+  assert.equal(primary, 'primary-result');
+  assert.deepEqual(calls, ['deepseek']);
+
+  calls.length = 0;
+  const fallback = await runPrefilterCloudFallbackPolicy({
+    primaryAvailable: true,
+    fallbackAvailable: true,
+    callPrimary: async () => {
+      calls.push('deepseek');
+      throw new Error('primary unavailable');
+    },
+    callFallback: async () => {
+      calls.push('qwen');
+      return 'fallback-result';
+    },
+  });
+  assert.equal(fallback, 'fallback-result');
+  assert.deepEqual(calls, ['deepseek', 'qwen']);
+
+  calls.length = 0;
+  const fallbackOnly = await runPrefilterCloudFallbackPolicy({
+    primaryAvailable: false,
+    fallbackAvailable: true,
+    callPrimary: async () => calls.push('deepseek'),
+    callFallback: async () => {
+      calls.push('qwen');
+      return 'fallback-only-result';
+    },
+  });
+  assert.equal(fallbackOnly, 'fallback-only-result');
+  assert.deepEqual(calls, ['qwen']);
+
+  calls.length = 0;
+  await assert.rejects(
+    runPrefilterCloudFallbackPolicy({
+      primaryAvailable: true,
+      fallbackAvailable: true,
+      callPrimary: async () => {
+        calls.push('deepseek');
+        throw new Error('primary unavailable');
+      },
+      callFallback: async () => {
+        calls.push('qwen');
+        throw new Error('fallback unavailable');
+      },
+    }),
+    /fallback unavailable/,
+  );
+  assert.deepEqual(calls, ['deepseek', 'qwen']);
+});
+
+test('whole prefilter route reports Qwen only after one bounded DeepSeek failure', async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    calls.push({url: String(url), request});
+    if (calls.length === 1) {
+      return new Response('{"error":"temporary"}', {status: 503});
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        finish_reason: 'stop',
+        message: {content: '{"items":[{"itemId":"x:1","decision":"keep"}]}'},
+      }],
+      usage: {prompt_tokens: 12, completion_tokens: 8, total_tokens: 20},
+    }), {
+      status: 200,
+      headers: {'Content-Type': 'application/json'},
+    });
+  };
+
+  const result = await callRelevancePrefilterWithPrompt(
+    'tenant-unit-test',
+    'Return JSON.',
+    'One list item.',
+    {
+      timeoutMs: 20_000,
+      maxTokens: 1800,
+      returnMetadata: true,
+      routeConfigs: {
+        primaryConfig: {
+          provider: 'deepseek',
+          model: 'deepseek-v4-flash',
+          apiKey: 'deepseek-test-key',
+          endpoint: 'https://api.deepseek.com/v1',
+        },
+        qwenFallbackConfig: {
+          enabled: true,
+          provider: 'qianwen',
+          model: 'qwen3.7-flash-2026-07-15',
+          apiKey: 'qwen-test-key',
+          endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        },
+        relayConfig: {
+          mode: 'off',
+          model: 'gemini-3.7-flash-low',
+          enabled: false,
+        },
+      },
+    },
+  );
+
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].url, /api\.deepseek\.com/);
+  assert.deepEqual(calls[0].request.thinking, {type: 'disabled'});
+  assert.match(calls[1].url, /dashscope\.aliyuncs\.com/);
+  assert.equal(calls[1].request.enable_thinking, false);
+  assert.equal(result.provider, 'qianwen');
+  assert.equal(result.model, 'qwen3.7-flash-2026-07-15');
+  assert.equal(result.route, 'qwen_fallback');
+  assert.deepEqual(result.data, {
+    items: [{itemId: 'x:1', decision: 'keep'}],
+  });
+});
+
+test('prefilter cache follows local, DeepSeek and Qwen route order', () => {
   const cloud = {provider: 'deepseek', model: 'deepseek-v4-flash'};
+  const qwen = {
+    provider: 'qianwen',
+    model: 'qwen3.7-flash-2026-07-15',
+    enabled: true,
+  };
   const relay = {
     mode: 'primary',
     model: 'gemini-3.7-flash-low',
     enabled: true,
   };
-  assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, relay), [
+  assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, relay, qwen), [
     {provider: 'antigravity', model: 'gemini-3.7-flash-low'},
     cloud,
+    {provider: 'qianwen', model: 'qwen3.7-flash-2026-07-15'},
   ]);
   assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, {
     ...relay,
     mode: 'fallback',
-  }), [
+  }, qwen), [
     cloud,
+    {provider: 'qianwen', model: 'qwen3.7-flash-2026-07-15'},
     {provider: 'antigravity', model: 'gemini-3.7-flash-low'},
   ]);
   assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, {
     ...relay,
     mode: 'off',
     enabled: false,
-  }), [cloud]);
+  }, qwen), [
+    cloud,
+    {provider: 'qianwen', model: 'qwen3.7-flash-2026-07-15'},
+  ]);
 });
 
 test('prefilter cloud fallback stays inside the shared client deadline', () => {
@@ -395,7 +585,7 @@ test('backend contract uses tenant auth, shared AI admission and an audit ledger
   assert.match(migration, /server_model_status IN \('ok', 'invalid_input', 'model_error', 'timeout'\)/);
   assert.match(migration, /execution_disposition IN \('collect_full', 'skip_full_capture', 'request_detail'\)/);
   assert.match(service, /callRelevancePrefilterWithPrompt/);
-  assert.match(service, /getRelevancePrefilterCacheRoutes/);
+  assert.match(service, /getRelevancePrefilterRouteConfigs/);
   assert.doesNotMatch(service, /acquireTenantSlot|tenantSlotStates/u);
   assert.match(service, /Math\.max\(1800, pendingItems\.length \* 320\)/u);
   assert.match(service, /finishReason/u);
@@ -406,6 +596,10 @@ test('backend contract uses tenant auth, shared AI admission and an audit ledger
   assert.match(route, /requireAuthCodeFirst, requireTenantWriter/);
   assert.match(route, /failOpen: true/);
   assert.match(aiLabeler, /getRelevancePrefilterLLMConfig/u);
+  assert.match(aiLabeler, /relevance_prefilter_qwen_fallback_enabled/u);
+  assert.match(aiLabeler, /DASHSCOPE_API_KEY/u);
+  assert.match(aiLabeler, /disableModelFailover: qwenFallbackConfig\.requested/u);
+  assert.match(aiLabeler, /route: 'qwen_fallback'/u);
   assert.match(aiLabeler, /PREFILTER_LLM_API_KEY_MISSING/u);
   assert.match(aiLabeler, /enable_thinking = false/u);
   assert.match(aiLabeler, /LLM_JSON_PARSE_FAILED/u);

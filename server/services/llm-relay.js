@@ -10,7 +10,8 @@ export const DEFAULT_LLM_RELAY_MODEL = 'gemini-3.7-flash-low';
 export const LLM_RELAY_CLASSIFICATION_TIMEOUT_MS = 15_000;
 export const LLM_RELAY_PREFILTER_TIMEOUT_MS = 9_000;
 export const LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS = 1_000;
-export const LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS = 27_000;
+export const LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS = 8_000;
+export const LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS = 28_000;
 export const LLM_RELAY_ELIGIBLE_KINDS = Object.freeze([
   'record_classification',
   'relevance_prefilter',

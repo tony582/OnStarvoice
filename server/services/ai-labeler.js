@@ -22,6 +22,7 @@ import {
   getLlmRelayConfig,
   isLlmRelayEligibleKind,
   LLM_RELAY_CLASSIFICATION_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
   LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
   LLM_RELAY_PREFILTER_TIMEOUT_MS,
   LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS,
@@ -50,6 +51,13 @@ const PREFILTER_LLM_SETTING_KEYS = Object.freeze({
   apiKey: 'relevance_prefilter_llm_api_key',
   endpoint: 'relevance_prefilter_llm_api_endpoint',
 });
+export const PREFILTER_QWEN_FALLBACK_SETTING_KEYS = Object.freeze({
+  enabled: 'relevance_prefilter_qwen_fallback_enabled',
+  model: 'relevance_prefilter_qwen_fallback_model',
+  endpoint: 'relevance_prefilter_qwen_fallback_endpoint',
+  apiKey: 'dashscope_api_key',
+});
+export const DEFAULT_PREFILTER_QWEN_FALLBACK_MODEL = 'qwen3.7-flash-2026-07-15';
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -377,6 +385,60 @@ export function resolvePurposeLLMConfigValues(baseConfig, overrides = {}) {
   };
 }
 
+function settingEnabled(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+export function resolvePrefilterQwenFallbackConfigValues(
+  settings = {},
+  environment = {},
+) {
+  const requested = settingEnabled(settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]);
+  const model = String(
+    settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.model]
+      || DEFAULT_PREFILTER_QWEN_FALLBACK_MODEL,
+  ).trim();
+  const endpoint = String(
+    settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint]
+      || LLM_PROVIDER_DEFAULTS.qianwen.endpoint,
+  ).trim().replace(/\/+$/, '');
+  const apiKey = String(
+    settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey]
+      || environment.DASHSCOPE_API_KEY
+      || '',
+  ).trim();
+  let validationError = '';
+  if (requested && !/^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(model)) {
+    validationError = '千问兜底模型名称不合法';
+  } else if (requested) {
+    try {
+      const url = new URL(endpoint);
+      if (
+        url.protocol !== 'https:'
+        || url.username
+        || url.password
+        || url.hostname !== 'dashscope.aliyuncs.com'
+      ) {
+        validationError = '千问兜底地址必须使用阿里云百炼 HTTPS 地址';
+      }
+    } catch {
+      validationError = '千问兜底地址不合法';
+    }
+  }
+  if (requested && !validationError && !apiKey) {
+    validationError = '千问兜底缺少 DashScope API Key';
+  }
+  return {
+    requested,
+    enabled: requested && !validationError,
+    provider: 'qianwen',
+    model,
+    endpoint,
+    apiKey,
+    validationError,
+  };
+}
+
 async function getBaseLLMConfig(tenantId) {
   const provider = normalizeLLMProvider(
     (await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini',
@@ -391,6 +453,28 @@ async function getBaseLLMConfig(tenantId) {
 async function getLLMConfig(tenantId) {
   const baseConfig = await getBaseLLMConfig(tenantId);
   return await resolveAiFailoverConfig(tenantId, baseConfig);
+}
+
+export async function getRelevancePrefilterQwenFallbackConfig(tenantId) {
+  const values = await Promise.all([
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled, tenantId),
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.model, tenantId),
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint, tenantId),
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey, tenantId),
+  ]);
+  const config = resolvePrefilterQwenFallbackConfigValues({
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]: values[0],
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.model]: values[1],
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint]: values[2],
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey]: values[3],
+  }, process.env);
+  if (config.requested && !config.enabled) {
+    console.warn('[RelevancePrefilter] Qwen fallback is requested but unavailable', {
+      tenantId,
+      reason: config.validationError,
+    });
+  }
+  return config;
 }
 
 async function runRelayModelOperation(
@@ -534,8 +618,13 @@ async function runTenantLlmPolicy(
   });
 }
 
-export async function getRelevancePrefilterLLMConfig(tenantId) {
-  const baseConfig = await getLLMConfig(tenantId);
+export async function getRelevancePrefilterLLMConfig(
+  tenantId,
+  {disableModelFailover = false, allowMissingApiKey = false} = {},
+) {
+  const baseConfig = disableModelFailover
+    ? await getBaseLLMConfig(tenantId)
+    : await getLLMConfig(tenantId);
   const values = await Promise.all([
     getSetting(PREFILTER_LLM_SETTING_KEYS.provider, tenantId),
     getSetting(PREFILTER_LLM_SETTING_KEYS.model, tenantId),
@@ -548,7 +637,7 @@ export async function getRelevancePrefilterLLMConfig(tenantId) {
     apiKey: values[2],
     endpoint: values[3],
   });
-  if (!config.apiKey) {
+  if (!config.apiKey && !allowMissingApiKey) {
     const error = new Error(`采集前预判尚未配置 ${config.provider} API Key`);
     error.code = 'PREFILTER_LLM_API_KEY_MISSING';
     error.provider = config.provider;
@@ -558,9 +647,21 @@ export async function getRelevancePrefilterLLMConfig(tenantId) {
   return config;
 }
 
-export function resolveRelevancePrefilterCacheRoutes(cloudConfig = {}, relayConfig = {}) {
+export function resolveRelevancePrefilterCacheRoutes(
+  cloudConfig = {},
+  relayConfig = {},
+  qwenFallbackConfig = {},
+) {
   const cloudRoute = cloudConfig.provider && cloudConfig.model
     ? {provider: String(cloudConfig.provider), model: String(cloudConfig.model)}
+    : null;
+  const qwenFallbackRoute = qwenFallbackConfig.enabled
+    && qwenFallbackConfig.provider
+    && qwenFallbackConfig.model
+    ? {
+      provider: String(qwenFallbackConfig.provider),
+      model: String(qwenFallbackConfig.model),
+    }
     : null;
   const relayRoute = relayConfig.enabled
     && isLlmRelayEligibleKind('relevance_prefilter')
@@ -568,8 +669,8 @@ export function resolveRelevancePrefilterCacheRoutes(cloudConfig = {}, relayConf
     ? {provider: 'antigravity', model: String(relayConfig.model)}
     : null;
   const ordered = relayConfig.mode === 'primary'
-    ? [relayRoute, cloudRoute]
-    : [cloudRoute, relayRoute];
+    ? [relayRoute, cloudRoute, qwenFallbackRoute]
+    : [cloudRoute, qwenFallbackRoute, relayRoute];
   const seen = new Set();
   return ordered.filter(route => {
     if (!route) return false;
@@ -580,12 +681,63 @@ export function resolveRelevancePrefilterCacheRoutes(cloudConfig = {}, relayConf
   });
 }
 
-export async function getRelevancePrefilterCacheRoutes(tenantId, cloudConfig = null) {
-  const [resolvedCloudConfig, relayConfig] = await Promise.all([
-    cloudConfig ? Promise.resolve(cloudConfig) : getRelevancePrefilterLLMConfig(tenantId),
+export async function getRelevancePrefilterRouteConfigs(tenantId) {
+  const [qwenFallbackConfig, relayConfig] = await Promise.all([
+    getRelevancePrefilterQwenFallbackConfig(tenantId),
     getLlmRelayConfig(tenantId),
   ]);
-  return resolveRelevancePrefilterCacheRoutes(resolvedCloudConfig, relayConfig);
+  // Once Qwen is explicitly requested, do not let the generic same-provider
+  // DeepSeek Pro failover jump ahead of it, even if Qwen is misconfigured.
+  const primaryConfig = await getRelevancePrefilterLLMConfig(tenantId, {
+    disableModelFailover: qwenFallbackConfig.requested,
+    allowMissingApiKey: qwenFallbackConfig.enabled,
+  });
+  return {
+    primaryConfig,
+    qwenFallbackConfig,
+    relayConfig,
+    cacheRoutes: resolveRelevancePrefilterCacheRoutes(
+      primaryConfig,
+      relayConfig,
+      qwenFallbackConfig,
+    ),
+  };
+}
+
+export async function getRelevancePrefilterCacheRoutes(tenantId, routeConfigs = null) {
+  const resolved = routeConfigs?.primaryConfig
+    ? routeConfigs
+    : await getRelevancePrefilterRouteConfigs(tenantId);
+  return resolved.cacheRoutes;
+}
+
+export async function runPrefilterCloudFallbackPolicy({
+  primaryAvailable,
+  fallbackAvailable,
+  callPrimary,
+  callFallback,
+  onPrimaryError = () => {},
+  onFallbackError = () => {},
+}) {
+  let primaryError = null;
+  if (primaryAvailable && typeof callPrimary === 'function') {
+    try {
+      return await callPrimary();
+    } catch (error) {
+      primaryError = error;
+      onPrimaryError(error);
+    }
+  }
+  if (fallbackAvailable && typeof callFallback === 'function') {
+    try {
+      return await callFallback();
+    } catch (error) {
+      onFallbackError(error);
+      throw error;
+    }
+  }
+  if (primaryError) throw primaryError;
+  return null;
 }
 
 async function safeRecordAiFailure(tenantId, details) {
@@ -775,27 +927,72 @@ export async function callRelevancePrefilterWithPrompt(
   options = {},
 ) {
   const deadlineAtMs = Date.now() + LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS;
-  const requestKind = String(options.kind || 'relevance_prefilter').trim()
+  const {
+    routeConfigs: suppliedRouteConfigs,
+    ...callerOptions
+  } = options;
+  const requestKind = String(callerOptions.kind || 'relevance_prefilter').trim()
     || 'relevance_prefilter';
-  const [config, relayConfig] = await Promise.all([
-    getRelevancePrefilterLLMConfig(tenantId),
-    getLlmRelayConfig(tenantId),
-  ]);
+  const routeConfigs = suppliedRouteConfigs?.primaryConfig
+    ? suppliedRouteConfigs
+    : await getRelevancePrefilterRouteConfigs(tenantId);
+  const {primaryConfig, qwenFallbackConfig, relayConfig} = routeConfigs;
   const prefilterOptions = {
-    ...options,
-    priority: options.priority || 'capture',
+    ...callerOptions,
+    priority: callerOptions.priority || 'capture',
     kind: requestKind,
     thinking: false,
     maxAttempts: 1,
     deadlineAtMs,
-    relayTimeoutMs: Number(options.relayTimeoutMs) || LLM_RELAY_PREFILTER_TIMEOUT_MS,
-    relayQueueTimeoutMs: Number(options.relayQueueTimeoutMs)
+    relayTimeoutMs: Number(callerOptions.relayTimeoutMs) || LLM_RELAY_PREFILTER_TIMEOUT_MS,
+    relayQueueTimeoutMs: Number(callerOptions.relayQueueTimeoutMs)
       || LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
   };
+  const callCloud = () => runPrefilterCloudFallbackPolicy({
+    primaryAvailable: Boolean(primaryConfig.apiKey),
+    fallbackAvailable: qwenFallbackConfig.enabled,
+    callPrimary: async () => ({
+      ...await runBaseModelOperation(
+        tenantId,
+        primaryConfig,
+        systemPrompt,
+        userMessage,
+        {
+          ...prefilterOptions,
+          timeoutMs: Math.min(
+            Number(prefilterOptions.timeoutMs) || LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
+            LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
+          ),
+        },
+      ),
+      route: 'primary_cloud',
+    }),
+    callFallback: async () => ({
+      ...await runBaseModelOperation(
+        tenantId,
+        qwenFallbackConfig,
+        systemPrompt,
+        userMessage,
+        prefilterOptions,
+      ),
+      route: 'qwen_fallback',
+    }),
+    onPrimaryError: error => console.warn('[RelevancePrefilter] primary cloud model failed; trying Qwen', {
+      tenantId,
+      provider: primaryConfig.provider,
+      model: primaryConfig.model,
+      code: error?.code || 'PREFILTER_PRIMARY_CLOUD_ERROR',
+    }),
+    onFallbackError: error => console.warn('[RelevancePrefilter] Qwen fallback failed; failing open', {
+      tenantId,
+      model: qwenFallbackConfig.model,
+      code: error?.code || 'PREFILTER_QWEN_FALLBACK_ERROR',
+    }),
+  });
   const outcome = await runLlmRelayPolicy({
     mode: relayConfig.mode,
     relayAvailable: relayConfig.enabled && isLlmRelayEligibleKind(requestKind),
-    baseAvailable: Boolean(config.apiKey),
+    baseAvailable: Boolean(primaryConfig.apiKey) || qwenFallbackConfig.enabled,
     callRelay: () => runRelayModelOperation(
       tenantId,
       relayConfig,
@@ -803,13 +1000,7 @@ export async function callRelevancePrefilterWithPrompt(
       userMessage,
       prefilterOptions,
     ),
-    callBase: () => runBaseModelOperation(
-      tenantId,
-      config,
-      systemPrompt,
-      userMessage,
-      prefilterOptions,
-    ),
+    callBase: callCloud,
     onRelayError: error => console.warn('[RelevancePrefilter] local relay unavailable; using cloud model', {
       tenantId,
       code: error?.code || 'LLM_RELAY_ERROR',
@@ -822,7 +1013,7 @@ export async function callRelevancePrefilterWithPrompt(
   if (!outcome) return null;
   const data = outcome.data;
   if (
-    options.returnMetadata
+    callerOptions.returnMetadata
     && outcome.route !== 'relay'
     && outcome.config.provider !== 'gemini'
   ) {
@@ -839,7 +1030,7 @@ export async function callRelevancePrefilterWithPrompt(
       reasoningTokens: data.reasoningTokens,
     };
   }
-  return options.returnMetadata
+  return callerOptions.returnMetadata
     ? {
       data,
       provider: outcome.config.provider,
