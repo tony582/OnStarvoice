@@ -19,6 +19,8 @@ export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
 export const PREFILTER_MAX_TENANT_SKIP_MATCH = 0.2;
+export const PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD = 0.95;
+export const PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH = 0.05;
 export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 20000;
 export const PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS = 5000;
 
@@ -257,6 +259,8 @@ export function resolvePrefilterPolicyValues({
   return {
     effectiveMode: safestMode(serverMode, tenantMode, requestedMode),
     skipThreshold: effectiveThreshold,
+    clearIrrelevantSkipThreshold: PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD,
+    clearIrrelevantMaxMatch: PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH,
   };
 }
 
@@ -282,6 +286,7 @@ export function determineExecutionDisposition({
   status,
   modelDecision,
   tenantRelevance,
+  queryMatch,
   brandMatch,
   confidence,
   protectedSignal = false,
@@ -289,11 +294,29 @@ export function determineExecutionDisposition({
   if (status !== 'ok') return 'collect_full';
   if (policy.effectiveMode !== 'conservative') return 'collect_full';
   if (protectedSignal) return 'collect_full';
+  const numericQueryMatch = normalizeScore(queryMatch);
+  const numericBrandMatch = normalizeScore(brandMatch);
+  const numericConfidence = normalizeScore(confidence);
+  // Only the strongest double-zero-style noise signal may use the lower 0.95 gate.
+  // Everything else keeps the original 0.97 conservative threshold and fail-open path.
+  const clearIrrelevant = modelDecision === 'skip'
+    && tenantRelevance === 'irrelevant'
+    && numericQueryMatch !== null
+    && numericBrandMatch !== null
+    && numericConfidence !== null
+    && numericQueryMatch <= (policy.clearIrrelevantMaxMatch ?? PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH)
+    && numericBrandMatch <= (policy.clearIrrelevantMaxMatch ?? PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH)
+    && numericConfidence >= (
+      policy.clearIrrelevantSkipThreshold ?? PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD
+    );
+  if (clearIrrelevant) return 'skip_full_capture';
   if (
     modelDecision === 'skip'
     && tenantRelevance === 'irrelevant'
-    && Number(brandMatch) <= PREFILTER_MAX_TENANT_SKIP_MATCH
-    && confidence >= policy.skipThreshold
+    && numericBrandMatch !== null
+    && numericBrandMatch <= PREFILTER_MAX_TENANT_SKIP_MATCH
+    && numericConfidence !== null
+    && numericConfidence >= policy.skipThreshold
   ) return 'skip_full_capture';
   return 'collect_full';
 }
@@ -356,6 +379,8 @@ export function buildPrefilterUserMessage(request) {
 }
 
 function normalizeScore(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && !value.trim()) return null;
   const score = Number(value);
   if (!Number.isFinite(score) || score < 0 || score > 1) return null;
   return Math.round(score * 10000) / 10000;
@@ -872,6 +897,8 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       latencyMs: Date.now() - startedAt,
       effectiveMode: policy.effectiveMode,
       skipThreshold: policy.skipThreshold,
+      clearIrrelevantSkipThreshold: policy.clearIrrelevantSkipThreshold,
+      clearIrrelevantMaxMatch: policy.clearIrrelevantMaxMatch,
       unknownOutputCount,
       modelDiagnostics,
       cacheHitCount: items.filter(item => item.cacheHit).length,

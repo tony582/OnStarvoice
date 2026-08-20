@@ -5,9 +5,11 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD,
   PREFILTER_DEFAULT_MODEL_TIMEOUT_MS,
   PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
   PREFILTER_MAX_LIST_BATCH,
+  PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH,
   PREFILTER_MAX_TENANT_SKIP_MATCH,
   PREFILTER_MIN_SKIP_THRESHOLD,
   PREFILTER_PROMPT_VERSION,
@@ -170,20 +172,71 @@ test('three-state normalization preserves partial success and fail-opens missing
   assert.equal(normalized.degraded, true);
 });
 
-test('shadow mode and scores below 0.97 can never skip full capture', () => {
+test('shadow mode never skips while conservative mode has a narrow clear-noise path', () => {
   const shadow = resolvePrefilterPolicyValues({ requestedMode: 'shadow' });
   assert.equal(shadow.effectiveMode, 'shadow');
-  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 1 }, shadow), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 1 }, shadow), 'collect_full');
 
   const conservative = resolvePrefilterPolicyValues({ requestedMode: 'conservative', requestedThreshold: 0.97 });
   assert.equal(conservative.effectiveMode, 'conservative');
-  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 0.9699 }, conservative), 'collect_full');
-  assert.equal(determineExecutionDisposition({ status: 'model_error', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 1 }, conservative), 'collect_full');
+  assert.equal(PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD, 0.95);
+  assert.equal(PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH, 0.05);
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 0.9499 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 0.95 }, conservative), 'skip_full_capture');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0.0501, brandMatch: 0, confidence: 0.95 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0.0501, confidence: 0.95 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: '', brandMatch: '', confidence: 0.95 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 0.9 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'model_error', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 1 }, conservative), 'collect_full');
   assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 0.97 }, conservative), 'skip_full_capture');
   assert.equal(PREFILTER_MAX_TENANT_SKIP_MATCH, 0.2);
 
   const serverShadow = resolvePrefilterPolicyValues({ requestedMode: 'conservative', serverMode: 'shadow' });
   assert.equal(serverShadow.effectiveMode, 'shadow');
+});
+
+test('clear unrelated noise skips at 0.95 without weakening existing monitoring-signal protection', () => {
+  const validation = validatePrefilterRequest(validBody({
+    keyword: '安吉星',
+    items: [
+      { itemId: 'housing', title: '城市两居室出租信息', author: '房产顾问' },
+      { itemId: 'competitor', title: '其他品牌智慧场景演示', author: '其他品牌车主' },
+      { itemId: 'festival', title: '夏日音乐节返程拼车', author: '活动参与者' },
+      { itemId: 'author-signal', title: '海外运营经验分享', author: '安吉星专题号' },
+      { itemId: 'official-author', title: '全新服务上线', author: '上汽通用安吉星官方账号' },
+      { itemId: 'brand-title', title: '安吉星服务介绍', author: '车主' },
+      { itemId: 'incident', title: '车辆远程启动失败', author: '车主' },
+    ],
+  }));
+  const policy = resolvePrefilterPolicyValues({ requestedMode: 'conservative' });
+  const normalized = normalizePrefilterModelResponse(validation.value, {
+    items: validation.value.items.map(item => ({
+      itemId: item.itemId,
+      decision: 'skip',
+      tenantRelevance: 'irrelevant',
+      queryMatch: 0,
+      brandMatch: 0,
+      confidence: item.itemId === 'incident' || item.itemId === 'brand-title' ? 1 : 0.95,
+      reason: '模拟明确无关',
+    })),
+  }, policy);
+
+  assert.deepEqual(
+    normalized.items.map(item => item.executionDisposition),
+    [
+      'skip_full_capture',
+      'skip_full_capture',
+      'skip_full_capture',
+      'collect_full',
+      'collect_full',
+      'collect_full',
+      'collect_full',
+    ],
+  );
+  assert.deepEqual(
+    normalized.items.map(item => item.protectedSignal),
+    [false, false, false, true, true, true, true],
+  );
 });
 
 test('tenant-relevant or protected incident results can never skip full capture', () => {
