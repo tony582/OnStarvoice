@@ -878,7 +878,7 @@ export function SettingsPage() {
 
       <SettingsCard
         title="本机 Antigravity AI"
-        description="由你的 Mac 主动向阿里云领取最终相关性与情感判断，不开放本机端口。"
+        description="由你的 Mac 主动向阿里云领取列表前置预判及最终相关性与情感判断，不开放本机端口。"
         onSave={() => save('llm-relay')}
       >
         <div className="grid gap-3 lg:grid-cols-2">
@@ -889,8 +889,8 @@ export function SettingsPage() {
               className="h-11 w-full rounded-md border border-input bg-background px-3 text-sm lg:h-9"
             >
               <option value="off">关闭</option>
-              <option value="primary">最终判断优先使用本机，忙碌或离线时立即走云模型</option>
-              <option value="fallback">最终判断在云模型失败后使用本机</option>
+              <option value="primary">前置预判和最终判断优先使用本机，忙碌或离线时立即走云模型</option>
+              <option value="fallback">前置预判和最终判断在云模型失败后使用本机</option>
             </select>
           </Field>
           <Field label="Antigravity 模型">
@@ -935,7 +935,7 @@ export function SettingsPage() {
               阿里云只运行 StarVoice 后端；你的 Mac 上 Antigravity 和本机 Agent 都要保持运行。Agent 只向外连接阿里云，不会领取或修改采集任务。
             </p>
             <p className="mt-1 text-muted-foreground">
-              当前只接最终相关性与情感判断；列表预判、报告和关键词分析仍使用各自的云模型。本机一次处理 1 条，忙碌时新请求不会排队等待。
+              当前接列表前置预判（每批最多 8 条）及最终相关性与情感判断；报告和关键词分析仍使用各自的云模型。本机一次处理 1 个批次，忙碌时新请求立即回退云模型，不会排队等待。
             </p>
             {activeLlmRelayAgent?.last_seen_at && (
               <p className="mt-1 text-muted-foreground">最近连接：{formatDate(activeLlmRelayAgent.last_seen_at)}</p>

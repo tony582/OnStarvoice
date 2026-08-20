@@ -22,6 +22,9 @@ import {
   getLlmRelayConfig,
   isLlmRelayEligibleKind,
   LLM_RELAY_CLASSIFICATION_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS,
   runLlmRelayPolicy,
 } from './llm-relay.js';
 import { requestLlmRelayAgentCompletion } from './llm-relay-jobs.js';
@@ -237,7 +240,10 @@ async function requestModelResponse(url, buildRequest, errorPrefix, options = {}
   throw new Error(`${errorPrefix}: retry exhausted`);
 }
 
-async function callGemini(apiKey, model, systemPrompt, userMessage) {
+async function callGemini(apiKey, model, systemPrompt, userMessage, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+    ? Math.max(1000, Math.min(40000, Number(options.timeoutMs)))
+    : 40000;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const resp = await requestModelResponse(url, () => ({
     method: 'POST',
@@ -247,8 +253,8 @@ async function callGemini(apiKey, model, systemPrompt, userMessage) {
       contents: [{ parts: [{ text: userMessage }] }],
       generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
     }),
-    signal: AbortSignal.timeout(40000), // 防止 LLM 请求挂死冻住整个评论入库串行队列
-  }), 'Gemini API error');
+    signal: AbortSignal.timeout(timeoutMs), // 防止 LLM 请求挂死冻住整个评论入库串行队列
+  }), 'Gemini API error', {maxAttempts: options.maxAttempts});
   const data = await resp.json();
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
   return JSON.parse(text);
@@ -413,7 +419,7 @@ async function runRelayModelOperation(
     {
       priority: options.priority || 'normal',
       kind: options.kind || 'llm_relay',
-      queueTimeoutMs: options.queueTimeoutMs,
+      queueTimeoutMs: options.relayQueueTimeoutMs ?? options.queueTimeoutMs,
     },
   );
   return {
@@ -436,20 +442,35 @@ async function runBaseModelOperation(
   const outcome = await runModelOperationWithFailover(
     tenantId,
     config,
-    currentConfig => currentConfig.provider === 'gemini'
-      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
-      : callOpenAICompatible(
-        currentConfig.apiKey,
-        currentConfig.model,
-        currentConfig.endpoint,
-        systemPrompt,
-        userMessage,
-        {
-          ...options,
-          provider: currentConfig.provider,
-          thinking: options.thinking ?? false,
-        },
-      ),
+    currentConfig => {
+      const timeoutMs = resolveDeadlineBoundedTimeoutMs(options);
+      if (timeoutMs <= 0) {
+        const error = new Error('AI 前置筛选总等待预算已用完');
+        error.code = 'PREFILTER_TOTAL_BUDGET_EXHAUSTED';
+        throw error;
+      }
+      return currentConfig.provider === 'gemini'
+        ? callGemini(
+          currentConfig.apiKey,
+          currentConfig.model,
+          systemPrompt,
+          userMessage,
+          {...options, timeoutMs},
+        )
+        : callOpenAICompatible(
+          currentConfig.apiKey,
+          currentConfig.model,
+          currentConfig.endpoint,
+          systemPrompt,
+          userMessage,
+          {
+            ...options,
+            timeoutMs,
+            provider: currentConfig.provider,
+            thinking: options.thinking ?? false,
+          },
+        );
+    },
     {
       priority: options.priority || 'normal',
       kind: options.kind || 'llm_prompt',
@@ -457,6 +478,18 @@ async function runBaseModelOperation(
     },
   );
   return {...outcome, route: 'base'};
+}
+
+export function resolveDeadlineBoundedTimeoutMs(options = {}, nowMs = Date.now()) {
+  const requested = Number(options.timeoutMs);
+  const requestedTimeoutMs = Number.isFinite(requested)
+    ? Math.max(1000, Math.min(40000, requested))
+    : 40000;
+  const deadlineAtMs = Number(options.deadlineAtMs);
+  if (!Number.isFinite(deadlineAtMs)) return requestedTimeoutMs;
+  const remainingMs = Math.floor(deadlineAtMs - Number(nowMs));
+  if (remainingMs < 1000) return 0;
+  return Math.min(requestedTimeoutMs, remainingMs);
 }
 
 async function runTenantLlmPolicy(
@@ -472,8 +505,7 @@ async function runTenantLlmPolicy(
   ]);
   return await runLlmRelayPolicy({
     mode: relayConfig.mode,
-    // The local desktop bridge starts with the narrowest operational scope:
-    // final relevance/sentiment classification only. Prefilter, reports,
+    // Keep the local desktop bridge on bounded classification work. Reports,
     // summaries and keyword strategy stay on their configured cloud route.
     relayAvailable: relayConfig.enabled && isLlmRelayEligibleKind(requestKind),
     baseAvailable: Boolean(baseConfig.apiKey),
@@ -524,6 +556,36 @@ export async function getRelevancePrefilterLLMConfig(tenantId) {
     throw error;
   }
   return config;
+}
+
+export function resolveRelevancePrefilterCacheRoutes(cloudConfig = {}, relayConfig = {}) {
+  const cloudRoute = cloudConfig.provider && cloudConfig.model
+    ? {provider: String(cloudConfig.provider), model: String(cloudConfig.model)}
+    : null;
+  const relayRoute = relayConfig.enabled
+    && isLlmRelayEligibleKind('relevance_prefilter')
+    && relayConfig.model
+    ? {provider: 'antigravity', model: String(relayConfig.model)}
+    : null;
+  const ordered = relayConfig.mode === 'primary'
+    ? [relayRoute, cloudRoute]
+    : [cloudRoute, relayRoute];
+  const seen = new Set();
+  return ordered.filter(route => {
+    if (!route) return false;
+    const key = `${route.provider}\n${route.model}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export async function getRelevancePrefilterCacheRoutes(tenantId, cloudConfig = null) {
+  const [resolvedCloudConfig, relayConfig] = await Promise.all([
+    cloudConfig ? Promise.resolve(cloudConfig) : getRelevancePrefilterLLMConfig(tenantId),
+    getLlmRelayConfig(tenantId),
+  ]);
+  return resolveRelevancePrefilterCacheRoutes(resolvedCloudConfig, relayConfig);
 }
 
 async function safeRecordAiFailure(tenantId, details) {
@@ -712,44 +774,63 @@ export async function callRelevancePrefilterWithPrompt(
   userMessage,
   options = {},
 ) {
-  const config = await getRelevancePrefilterLLMConfig(tenantId);
-  const outcome = await runModelOperationWithFailover(
-    tenantId,
-    config,
-    currentConfig => currentConfig.provider === 'gemini'
-      ? callGemini(
-        currentConfig.apiKey,
-        currentConfig.model,
-        systemPrompt,
-        userMessage,
-      )
-      : callOpenAICompatible(
-        currentConfig.apiKey,
-        currentConfig.model,
-        currentConfig.endpoint,
-        systemPrompt,
-        userMessage,
-        {
-          provider: currentConfig.provider,
-          timeoutMs: options.timeoutMs,
-          maxTokens: options.maxTokens,
-          returnMetadata: options.returnMetadata === true,
-          thinking: false,
-          maxAttempts: 1,
-        },
-      ),
-    {
-      priority: options.priority || 'capture',
-      kind: options.kind || 'relevance_prefilter',
-      queueTimeoutMs: options.queueTimeoutMs,
-    },
-  );
+  const deadlineAtMs = Date.now() + LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS;
+  const requestKind = String(options.kind || 'relevance_prefilter').trim()
+    || 'relevance_prefilter';
+  const [config, relayConfig] = await Promise.all([
+    getRelevancePrefilterLLMConfig(tenantId),
+    getLlmRelayConfig(tenantId),
+  ]);
+  const prefilterOptions = {
+    ...options,
+    priority: options.priority || 'capture',
+    kind: requestKind,
+    thinking: false,
+    maxAttempts: 1,
+    deadlineAtMs,
+    relayTimeoutMs: Number(options.relayTimeoutMs) || LLM_RELAY_PREFILTER_TIMEOUT_MS,
+    relayQueueTimeoutMs: Number(options.relayQueueTimeoutMs)
+      || LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
+  };
+  const outcome = await runLlmRelayPolicy({
+    mode: relayConfig.mode,
+    relayAvailable: relayConfig.enabled && isLlmRelayEligibleKind(requestKind),
+    baseAvailable: Boolean(config.apiKey),
+    callRelay: () => runRelayModelOperation(
+      tenantId,
+      relayConfig,
+      systemPrompt,
+      userMessage,
+      prefilterOptions,
+    ),
+    callBase: () => runBaseModelOperation(
+      tenantId,
+      config,
+      systemPrompt,
+      userMessage,
+      prefilterOptions,
+    ),
+    onRelayError: error => console.warn('[RelevancePrefilter] local relay unavailable; using cloud model', {
+      tenantId,
+      code: error?.code || 'LLM_RELAY_ERROR',
+    }),
+    onBaseError: error => console.warn('[RelevancePrefilter] cloud model failed; trying local relay', {
+      tenantId,
+      code: error?.code || 'LLM_BASE_ERROR',
+    }),
+  });
+  if (!outcome) return null;
   const data = outcome.data;
-  if (options.returnMetadata && outcome.config.provider !== 'gemini') {
+  if (
+    options.returnMetadata
+    && outcome.route !== 'relay'
+    && outcome.config.provider !== 'gemini'
+  ) {
     return {
       data: data.data,
       provider: outcome.config.provider,
       model: outcome.config.model,
+      route: outcome.route,
       finishReason: data.finishReason,
       responseLength: data.responseLength,
       promptTokens: data.promptTokens,
@@ -763,6 +844,7 @@ export async function callRelevancePrefilterWithPrompt(
       data,
       provider: outcome.config.provider,
       model: outcome.config.model,
+      route: outcome.route,
       finishReason: '',
       responseLength: 0,
       promptTokens: 0,

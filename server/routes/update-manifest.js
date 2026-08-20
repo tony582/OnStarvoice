@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.85',
+  latestVersion: '0.3.86',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-20',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.85-20260820.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.86-20260820.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.86',
+      releaseDate: '2026-08-20',
+      releaseNotes: [
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '列表前置预判优先使用本机 AI',
+              desc: '关键词搜索结果按每批最多 8 条交给本机 Antigravity 判断；本机忙碌、离线或超时会立即回退 DeepSeek Flash，不会在 Mac 后面堆积请求。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.85',
       releaseDate: '2026-08-20',

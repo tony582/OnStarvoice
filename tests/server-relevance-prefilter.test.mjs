@@ -22,6 +22,8 @@ import {
 } from '../server/services/relevance-prefilter.js';
 import {
   buildOpenAICompatibleRequestBody,
+  resolveDeadlineBoundedTimeoutMs,
+  resolveRelevancePrefilterCacheRoutes,
   resolvePurposeLLMConfigValues,
 } from '../server/services/ai-labeler.js';
 import { resolveMonitoringIntent } from '../server/services/monitoring-intent.js';
@@ -285,6 +287,43 @@ test('purpose route never reuses a credential across providers', () => {
   assert.equal(qwen.endpoint, 'https://example.aliyuncs.com/compatible-mode/v1');
 });
 
+test('prefilter cache follows local-primary and cloud-fallback route order', () => {
+  const cloud = {provider: 'deepseek', model: 'deepseek-v4-flash'};
+  const relay = {
+    mode: 'primary',
+    model: 'gemini-3.7-flash-low',
+    enabled: true,
+  };
+  assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, relay), [
+    {provider: 'antigravity', model: 'gemini-3.7-flash-low'},
+    cloud,
+  ]);
+  assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, {
+    ...relay,
+    mode: 'fallback',
+  }), [
+    cloud,
+    {provider: 'antigravity', model: 'gemini-3.7-flash-low'},
+  ]);
+  assert.deepEqual(resolveRelevancePrefilterCacheRoutes(cloud, {
+    ...relay,
+    mode: 'off',
+    enabled: false,
+  }), [cloud]);
+});
+
+test('prefilter cloud fallback stays inside the shared client deadline', () => {
+  assert.equal(resolveDeadlineBoundedTimeoutMs({timeoutMs: 20_000}), 20_000);
+  assert.equal(resolveDeadlineBoundedTimeoutMs({
+    timeoutMs: 20_000,
+    deadlineAtMs: 30_000,
+  }, 17_500), 12_500);
+  assert.equal(resolveDeadlineBoundedTimeoutMs({
+    timeoutMs: 20_000,
+    deadlineAtMs: 30_000,
+  }, 29_500), 0);
+});
+
 test('backend contract uses tenant auth, shared AI admission and an audit ledger', async () => {
   const [migration, service, route, aiLabeler, admission, serverApp] = await Promise.all([
     source('server/db/migrations/031_relevance_prefilter.sql'),
@@ -303,6 +342,7 @@ test('backend contract uses tenant auth, shared AI admission and an audit ledger
   assert.match(migration, /server_model_status IN \('ok', 'invalid_input', 'model_error', 'timeout'\)/);
   assert.match(migration, /execution_disposition IN \('collect_full', 'skip_full_capture', 'request_detail'\)/);
   assert.match(service, /callRelevancePrefilterWithPrompt/);
+  assert.match(service, /getRelevancePrefilterCacheRoutes/);
   assert.doesNotMatch(service, /acquireTenantSlot|tenantSlotStates/u);
   assert.match(service, /Math\.max\(1800, pendingItems\.length \* 320\)/u);
   assert.match(service, /finishReason/u);

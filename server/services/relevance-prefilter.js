@@ -4,6 +4,7 @@ import { execute, getSetting, queryAll, queryOne, withTransaction } from '../db/
 import {
   callRelevancePrefilterWithPrompt,
   getBrandContext,
+  getRelevancePrefilterCacheRoutes,
   getRelevancePrefilterLLMConfig,
 } from './ai-labeler.js';
 import {
@@ -462,33 +463,48 @@ export function normalizePrefilterModelResponse(request, rawResponse, policy) {
 async function loadCachedPrefilterItems(
   tenantId,
   request,
-  provider,
-  model,
+  routes,
   policy,
 ) {
   const candidates = request.items.filter(item => item.inputValid);
-  if (candidates.length === 0) return new Map();
-  const keyToItem = new Map(candidates.map(item => [
-    prefilterCacheKey(request, item, model, provider),
-    item,
+  const normalizedRoutes = Array.isArray(routes)
+    ? routes.filter(route => route?.provider && route?.model)
+    : [];
+  if (candidates.length === 0 || normalizedRoutes.length === 0) {
+    return {items: new Map(), firstRoute: null};
+  }
+  const candidateKeys = new Map(candidates.map(item => [
+    item.itemId,
+    normalizedRoutes.map(route => ({
+      cacheKey: prefilterCacheKey(request, item, route.model, route.provider),
+      route,
+    })),
   ]));
+  const allKeys = [...candidateKeys.values()].flat().map(entry => entry.cacheKey);
   const rows = await queryAll(`
     SELECT cache_key, response_item
     FROM relevance_prefilter_cache
     WHERE tenant_id = $1
       AND cache_key = ANY($2::text[])
       AND expires_at > now()
-  `, [tenantId, [...keyToItem.keys()]]);
+  `, [tenantId, allKeys]);
+  const rowsByKey = new Map(rows.map(row => [row.cache_key, row.response_item]));
   const cached = new Map();
-  for (const row of rows) {
-    const sourceItem = keyToItem.get(row.cache_key);
-    if (!sourceItem) continue;
-    const normalized = normalizeOneModelItem(sourceItem, row.response_item, policy);
-    if (normalized.status !== 'ok') continue;
-    normalized.cacheHit = true;
-    cached.set(sourceItem.itemId, normalized);
+  let firstRoute = null;
+  for (const sourceItem of candidates) {
+    const keys = candidateKeys.get(sourceItem.itemId) || [];
+    for (const entry of keys) {
+      const responseItem = rowsByKey.get(entry.cacheKey);
+      if (!responseItem) continue;
+      const normalized = normalizeOneModelItem(sourceItem, responseItem, policy);
+      if (normalized.status !== 'ok') continue;
+      normalized.cacheHit = true;
+      cached.set(sourceItem.itemId, normalized);
+      firstRoute ||= entry.route;
+      break;
+    }
   }
-  return cached;
+  return {items: cached, firstRoute};
 }
 
 function allFailOpenItems(request, status, reason, policy) {
@@ -734,15 +750,20 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
     } else {
       try {
         const llmConfig = await getRelevancePrefilterLLMConfig(tenantId);
-        provider = llmConfig.provider;
-        model = llmConfig.model;
-        const cached = await loadCachedPrefilterItems(
+        const cacheRoutes = await getRelevancePrefilterCacheRoutes(tenantId, llmConfig);
+        provider = cacheRoutes[0]?.provider || llmConfig.provider;
+        model = cacheRoutes[0]?.model || llmConfig.model;
+        const cacheResult = await loadCachedPrefilterItems(
           tenantId,
           request,
-          provider,
-          model,
+          cacheRoutes,
           policy,
         );
+        const cached = cacheResult.items;
+        if (cacheResult.firstRoute) {
+          provider = cacheResult.firstRoute.provider;
+          model = cacheResult.firstRoute.model;
+        }
         const pendingItems = request.items.filter(item => item.inputValid && !cached.has(item.itemId));
         const pendingResults = new Map();
         if (pendingItems.length > 0) {
@@ -780,6 +801,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
             provider = result.provider || provider;
             model = result.model;
             modelDiagnostics = {
+              route: result.route || (result.provider === 'antigravity' ? 'relay' : 'base'),
               finishReason: result.finishReason || '',
               responseLength: Math.max(0, Number(result.responseLength) || 0),
               promptTokens: Math.max(0, Number(result.promptTokens) || 0),

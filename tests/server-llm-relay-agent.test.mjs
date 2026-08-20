@@ -40,7 +40,10 @@ test('Agent API is mounted separately and local-offline errors retain cloud fall
   assert.match(labeler, /callRelevancePrefilterWithPrompt/);
   assert.match(labeler, /isLlmRelayEligibleKind\(requestKind\)/);
   assert.match(labeler, /LLM_RELAY_CLASSIFICATION_TIMEOUT_MS/);
+  assert.match(labeler, /LLM_RELAY_PREFILTER_TIMEOUT_MS/);
+  assert.match(labeler, /relayQueueTimeoutMs/);
   assert.match(prefilter, /callRelevancePrefilterWithPrompt/);
+  assert.match(prefilter, /getRelevancePrefilterCacheRoutes/);
   assert.doesNotMatch(prefilter, /requestLlmRelayAgentCompletion/);
 });
 
@@ -55,6 +58,6 @@ test('admin only returns plaintext agent token once and never exposes its hash',
   assert.doesNotMatch(admin, /RETURNING[^\n]*token_hash/);
   assert.match(ui, /一次性 Agent 令牌/);
   assert.match(ui, /Agent 只向外连接阿里云，不会领取或修改采集任务/);
-  assert.match(ui, /当前只接最终相关性与情感判断/);
+  assert.match(ui, /当前接列表前置预判（每批最多 8 条）及最终相关性与情感判断/);
   assert.match(ui, /测试本机 AI/);
 });

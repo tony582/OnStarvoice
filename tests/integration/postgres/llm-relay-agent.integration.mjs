@@ -34,6 +34,9 @@ test('outbound AI Agent claims and completes a tenant-isolated PostgreSQL job', 
     requestLlmRelayAgentCompletion,
     claimNextLlmRelayJob,
   } = await import('../../../server/services/llm-relay-jobs.js');
+  const {callRelevancePrefilterWithPrompt} = await import(
+    '../../../server/services/ai-labeler.js'
+  );
 
   await runMigrations();
   const pool = getPool();
@@ -109,6 +112,55 @@ test('outbound AI Agent claims and completes a tenant-isolated PostgreSQL job', 
   assert.equal(stored.user_message, '');
   assert.equal(stored.lease_token_hash, '');
   assert.deepEqual(stored.result, {ok: true, source: 'integration'});
+
+  await pool.query(`
+    INSERT INTO tenant_settings (tenant_id, key, value)
+    VALUES
+      ($1, 'llm_provider', 'deepseek'),
+      ($1, 'llm_model', 'deepseek-v4-flash'),
+      ($1, 'llm_api_key', 'integration-cloud-fallback-key'),
+      ($1, 'llm_relay_mode', 'primary'),
+      ($1, 'llm_relay_model', 'gemini-3.7-flash-low')
+    ON CONFLICT (tenant_id, key)
+    DO UPDATE SET value = excluded.value, updated_at = now()
+  `, [tenant.id]);
+  const prefilterPromise = callRelevancePrefilterWithPrompt(
+    tenant.id,
+    'Return one prefilter JSON object.',
+    'Synthetic list prefilter request.',
+    {
+      timeoutMs: 20_000,
+      maxTokens: 1800,
+      returnMetadata: true,
+      priority: 'capture',
+      kind: 'relevance_prefilter',
+    },
+  );
+  await waitForQueuedJob(pool, tenant.id);
+  const prefilterJob = await claimNextLlmRelayJob(agent);
+  assert.equal(prefilterJob.requestOptions.kind, 'relevance_prefilter');
+  assert.equal(prefilterJob.requestOptions.timeoutMs, 9000);
+  assert.equal(prefilterJob.requestOptions.maxTokens, 1800);
+  const prefilterResult = {
+    items: [{itemId: 'integration-item', decision: 'keep'}],
+  };
+  await completeLlmRelayJob(agent, prefilterJob.id, {
+    leaseToken: prefilterJob.leaseToken,
+    success: true,
+    result: prefilterResult,
+  });
+  assert.deepEqual(await prefilterPromise, {
+    data: prefilterResult,
+    provider: 'antigravity',
+    model: 'gemini-3.7-flash-low',
+    route: 'relay',
+    finishReason: '',
+    responseLength: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    reasoningTokens: 0,
+  });
 
   await pool.query(`
     UPDATE llm_relay_agent_tokens

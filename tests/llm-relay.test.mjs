@@ -4,6 +4,9 @@ import test from 'node:test';
 import {
   isLlmRelayEligibleKind,
   LLM_RELAY_CLASSIFICATION_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS,
   normalizeLlmRelaySettings,
   runLlmRelayPolicy,
   sanitizeLlmRelayRequestOptions,
@@ -14,11 +17,15 @@ import {
   validateLlmRelayJobInput,
 } from '../server/services/llm-relay-jobs.js';
 
-test('local relay is bounded to final classification with a short deadline', () => {
+test('local relay is bounded to final and prefilter classification with short deadlines', () => {
   assert.equal(isLlmRelayEligibleKind('record_classification'), true);
+  assert.equal(isLlmRelayEligibleKind('relevance_prefilter'), true);
   assert.equal(isLlmRelayEligibleKind('llm_prompt'), false);
   assert.equal(isLlmRelayEligibleKind('report'), false);
   assert.equal(LLM_RELAY_CLASSIFICATION_TIMEOUT_MS, 15_000);
+  assert.equal(LLM_RELAY_PREFILTER_TIMEOUT_MS, 9_000);
+  assert.equal(LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS, 1_000);
+  assert.equal(LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS, 27_000);
 });
 
 test('relay settings are opt-in and validate the model name', () => {
