@@ -30,17 +30,40 @@ function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
-const SAFETY_EVIDENCE_PATTERN =
-  /captcha|security.?verification|verification.?required|page.?challenge|security.?challenge|platform.?safety|safety.?block|risk.?control|forbidden|login.?required|auth(?:entication)?.?required|logged.?out|验证码|安全验证|安全限制|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|账号异常|账号限制/iu;
+const SAFETY_EVIDENCE_CODES = new Set([
+  'XHS_SECURITY_BLOCK',
+  'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+  'SECURITY_VERIFICATION_REQUIRED',
+  'PAGE_CHALLENGE_BLOCK',
+  'PLATFORM_SAFETY_BLOCK',
+  'HTTP_429',
+  'RATE_LIMITED',
+  'LOGIN_REQUIRED',
+  'AUTHENTICATION_REQUIRED',
+]);
+const SAFETY_EVIDENCE_CATEGORIES = new Set([
+  'platform_safety_block',
+  'login_required',
+  'authentication_required',
+]);
 
 function containsSafetyEvidence(value, depth = 0) {
   if (depth > 4 || value == null) return false;
-  if (typeof value === 'string') return SAFETY_EVIDENCE_PATTERN.test(value);
-  if (typeof value === 'boolean' || typeof value === 'number') return false;
+  if (typeof value !== 'object') return false;
   if (Array.isArray(value)) {
     return value.slice(0, 30).some(item => containsSafetyEvidence(item, depth + 1));
   }
-  if (typeof value !== 'object') return false;
+  const code = text(value.code || value.errorCode, 120).toUpperCase();
+  const category = text(value.category || value.errorCategory, 120)
+    .toLowerCase();
+  if (
+    SAFETY_EVIDENCE_CODES.has(code) ||
+    SAFETY_EVIDENCE_CATEGORIES.has(category) ||
+    value.securityEvidence?.confirmed === true ||
+    value.safetyEvidence?.confirmed === true
+  ) {
+    return true;
+  }
   return Object.entries(value).slice(0, 80).some(([key, nested]) => {
     if (
       /platformSafetyBlocked|platform_safety_blocked|securityBlocked|security_blocked|requiresManualAction|requires_manual_action|loginRequired|login_required/iu.test(key) &&

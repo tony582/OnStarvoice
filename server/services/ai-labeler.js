@@ -18,10 +18,35 @@ import {
   resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
+import {
+  getLlmRelayConfig,
+  isLlmRelayEligibleKind,
+  LLM_RELAY_CLASSIFICATION_TIMEOUT_MS,
+  runLlmRelayPolicy,
+} from './llm-relay.js';
+import { requestLlmRelayAgentCompletion } from './llm-relay-jobs.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v3';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v4';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
+const LLM_PROVIDER_ALIASES = Object.freeze({
+  aliyun: 'qianwen',
+  alibaba: 'qianwen',
+  dashscope: 'qianwen',
+  qwen: 'qianwen',
+});
+const LLM_PROVIDER_DEFAULTS = Object.freeze({
+  gemini: {model: 'gemini-2.0-flash', endpoint: ''},
+  openai: {model: 'gpt-4o-mini', endpoint: 'https://api.openai.com/v1'},
+  deepseek: {model: 'deepseek-chat', endpoint: 'https://api.deepseek.com/v1'},
+  qianwen: {model: 'qwen-turbo', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1'},
+});
+const PREFILTER_LLM_SETTING_KEYS = Object.freeze({
+  provider: 'relevance_prefilter_llm_provider',
+  model: 'relevance_prefilter_llm_model',
+  apiKey: 'relevance_prefilter_llm_api_key',
+  endpoint: 'relevance_prefilter_llm_api_endpoint',
+});
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -81,6 +106,8 @@ ${formatMonitoringIntentForPrompt(intent)}
 - uncertain：信息不足，无法判断与本次搜索词的关系。
 
 第三步识别“内容实际评价的对象”，独立判断情感：
+- 内容分诊的 relevance、sentiment、intent、category 和 summary 只依据主贴本身（标题、正文、话题标签、作者及主贴媒体文字）；评论区不属于主贴判断证据。
+- 评论必须走独立的评论风险判断。即使评论区有大量负面评论，也绝不能反向把中性或正向主贴判为 negative。
 - 只有整体 relevance 为 relevant 或 uncertain 时才判断 sentiment；整体 irrelevant 时 sentimentStatus=not_applicable、sentiment=null，禁止用 neutral 伪装“未判断”。
 - sentiment 必须表示内容对租户整体监控对象/主题的态度，而不是只看本次采集关键词。
 - 明确的故障、失败、误拨、抱怨、指责、误导、收费争议或维权诉求判 negative；客观询问且无明显不满判 neutral + inquiry。
@@ -150,7 +177,6 @@ export function buildUserMessage(record) {
   }
   if (record.title) text += `标题：${record.title}\n`;
   if (record.content) text += `正文：${record.content.slice(0, 2000)}\n`;
-  if (record.comments_text) text += `评论上下文：${String(record.comments_text).slice(0, 1800)}\n`;
   if (record.author_name) text += `作者：${record.author_name}\n`;
   if (record.platform) text += `平台：${record.platform}\n`;
   if (record.tags) {
@@ -177,14 +203,15 @@ export function modelRetryDelayMs(attempt, retryAfter = '') {
   return Math.min(5000, 500 * (2 ** Math.max(0, Number(attempt) || 0)));
 }
 
-async function requestModelResponse(url, buildRequest, errorPrefix) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+async function requestModelResponse(url, buildRequest, errorPrefix, options = {}) {
+  const maxAttempts = Math.max(1, Math.min(3, Number(options.maxAttempts) || 3));
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const response = await fetch(url, buildRequest());
     if (response.ok) return response;
     const responseText = await response.text();
     if (
       RETRYABLE_MODEL_HTTP_STATUSES.has(response.status) &&
-      attempt < 2
+      attempt < maxAttempts - 1
     ) {
       const waitMs = modelRetryDelayMs(
         attempt,
@@ -234,19 +261,23 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
   const maxTokens = Number.isFinite(Number(options.maxTokens))
     ? Math.max(256, Math.min(8192, Number(options.maxTokens)))
     : undefined;
+  const provider = normalizeLLMProvider(options.provider);
+  const requestBody = buildOpenAICompatibleRequestBody({
+    provider,
+    model,
+    systemPrompt,
+    userMessage,
+    temperature: 0.1,
+    maxTokens,
+    thinking: options.thinking,
+  });
   const url = `${endpoint}/chat/completions`;
   const resp = await requestModelResponse(url, () => ({
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      max_tokens: maxTokens,
-    }),
+    body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(timeoutMs), // 前置筛选使用更短预算；现有标注默认仍为 40 秒
-  }), 'LLM API error');
+  }), 'LLM API error', {maxAttempts: options.maxAttempts});
   const data = await resp.json();
   const content = String(data.choices?.[0]?.message?.content || '');
   const finishReason = String(data.choices?.[0]?.finish_reason || '');
@@ -256,6 +287,10 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
     promptTokens: Math.max(0, Number(data.usage?.prompt_tokens) || 0),
     completionTokens: Math.max(0, Number(data.usage?.completion_tokens) || 0),
     totalTokens: Math.max(0, Number(data.usage?.total_tokens) || 0),
+    reasoningTokens: Math.max(
+      0,
+      Number(data.usage?.completion_tokens_details?.reasoning_tokens) || 0,
+    ),
   };
   let parsed;
   try {
@@ -276,24 +311,219 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
     : parsed;
 }
 
+export function normalizeLLMProvider(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return LLM_PROVIDER_ALIASES[normalized] || normalized || 'gemini';
+}
+
+export function buildOpenAICompatibleRequestBody({
+  provider,
+  model,
+  systemPrompt,
+  userMessage,
+  temperature = 0.1,
+  maxTokens,
+  thinking,
+}) {
+  const normalizedProvider = normalizeLLMProvider(provider);
+  const body = {
+    model,
+    messages: [
+      {role: 'system', content: systemPrompt},
+      {role: 'user', content: userMessage},
+    ],
+    temperature,
+    response_format: {type: 'json_object'},
+  };
+  if (Number.isFinite(Number(maxTokens))) {
+    body.max_tokens = Number(maxTokens);
+  }
+  if (thinking === false) {
+    if (normalizedProvider === 'deepseek') {
+      body.thinking = {type: 'disabled'};
+    } else if (normalizedProvider === 'qianwen') {
+      body.enable_thinking = false;
+    }
+  }
+  return body;
+}
+
+function providerDefaults(provider) {
+  return LLM_PROVIDER_DEFAULTS[normalizeLLMProvider(provider)]
+    || LLM_PROVIDER_DEFAULTS.gemini;
+}
+
+export function resolvePurposeLLMConfigValues(baseConfig, overrides = {}) {
+  const baseProvider = normalizeLLMProvider(baseConfig?.provider);
+  const provider = normalizeLLMProvider(overrides.provider || baseProvider);
+  const defaults = providerDefaults(provider);
+  const sameProvider = provider === baseProvider;
+  return {
+    provider,
+    apiKey: String(
+      overrides.apiKey || (sameProvider ? baseConfig?.apiKey : '') || '',
+    ).trim(),
+    model: String(overrides.model || (sameProvider ? baseConfig?.model : '') || defaults.model).trim(),
+    endpoint: String(
+      overrides.endpoint || (sameProvider ? baseConfig?.endpoint : '') || defaults.endpoint,
+    ).replace(/\/+$/, ''),
+    failover: sameProvider ? baseConfig?.failover : undefined,
+  };
+}
+
 async function getBaseLLMConfig(tenantId) {
-  const provider = ((await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini').toLowerCase();
+  const provider = normalizeLLMProvider(
+    (await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini',
+  );
   const apiKey = (await getSetting('llm_api_key', tenantId)) || process.env.LLM_API_KEY || '';
   const model = (await getSetting('llm_model', tenantId)) || process.env.LLM_MODEL || '';
   const endpoint = (await getSetting('llm_api_endpoint', tenantId)) || process.env.LLM_API_ENDPOINT || '';
-  const defaults = {
-    gemini: { model: 'gemini-2.0-flash', endpoint: '' },
-    openai: { model: 'gpt-4o-mini', endpoint: 'https://api.openai.com/v1' },
-    deepseek: { model: 'deepseek-chat', endpoint: 'https://api.deepseek.com/v1' },
-    qianwen: { model: 'qwen-turbo', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-  };
-  const d = defaults[provider] || defaults.gemini;
+  const d = providerDefaults(provider);
   return { provider, apiKey, model: model || d.model, endpoint: endpoint || d.endpoint };
 }
 
 async function getLLMConfig(tenantId) {
   const baseConfig = await getBaseLLMConfig(tenantId);
   return await resolveAiFailoverConfig(tenantId, baseConfig);
+}
+
+async function runRelayModelOperation(
+  tenantId,
+  relayConfig,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const relayTimeoutMs = Number(options.relayTimeoutMs)
+    || LLM_RELAY_CLASSIFICATION_TIMEOUT_MS;
+  const data = await runWithTenantAiAdmission(
+    tenantId,
+    () => requestLlmRelayAgentCompletion({
+      tenantId,
+      model: relayConfig.model,
+      systemPrompt,
+      userMessage,
+      timeoutMs: relayTimeoutMs,
+      requestOptions: {
+        maxTokens: options.maxTokens,
+        timeoutMs: relayTimeoutMs,
+        kind: options.kind,
+      },
+    }),
+    {
+      priority: options.priority || 'normal',
+      kind: options.kind || 'llm_relay',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
+  );
+  return {
+    data,
+    config: {
+      provider: 'antigravity',
+      model: relayConfig.model,
+    },
+    route: 'relay',
+  };
+}
+
+async function runBaseModelOperation(
+  tenantId,
+  config,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const outcome = await runModelOperationWithFailover(
+    tenantId,
+    config,
+    currentConfig => currentConfig.provider === 'gemini'
+      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
+      : callOpenAICompatible(
+        currentConfig.apiKey,
+        currentConfig.model,
+        currentConfig.endpoint,
+        systemPrompt,
+        userMessage,
+        {
+          ...options,
+          provider: currentConfig.provider,
+          thinking: options.thinking ?? false,
+        },
+      ),
+    {
+      priority: options.priority || 'normal',
+      kind: options.kind || 'llm_prompt',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
+  );
+  return {...outcome, route: 'base'};
+}
+
+async function runTenantLlmPolicy(
+  tenantId,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const requestKind = String(options.kind || 'llm_prompt').trim() || 'llm_prompt';
+  const [baseConfig, relayConfig] = await Promise.all([
+    getLLMConfig(tenantId),
+    getLlmRelayConfig(tenantId),
+  ]);
+  return await runLlmRelayPolicy({
+    mode: relayConfig.mode,
+    // The local desktop bridge starts with the narrowest operational scope:
+    // final relevance/sentiment classification only. Prefilter, reports,
+    // summaries and keyword strategy stay on their configured cloud route.
+    relayAvailable: relayConfig.enabled && isLlmRelayEligibleKind(requestKind),
+    baseAvailable: Boolean(baseConfig.apiKey),
+    callRelay: () => runRelayModelOperation(
+      tenantId,
+      relayConfig,
+      systemPrompt,
+      userMessage,
+      options,
+    ),
+    callBase: () => runBaseModelOperation(
+      tenantId,
+      baseConfig,
+      systemPrompt,
+      userMessage,
+      options,
+    ),
+    onRelayError: error => console.warn('[AI] local relay unavailable; using configured cloud model', {
+      tenantId,
+      code: error?.code || 'LLM_RELAY_ERROR',
+    }),
+    onBaseError: error => console.warn('[AI] configured cloud model failed; trying local relay', {
+      tenantId,
+      code: error?.code || 'LLM_BASE_ERROR',
+    }),
+  });
+}
+
+export async function getRelevancePrefilterLLMConfig(tenantId) {
+  const baseConfig = await getLLMConfig(tenantId);
+  const values = await Promise.all([
+    getSetting(PREFILTER_LLM_SETTING_KEYS.provider, tenantId),
+    getSetting(PREFILTER_LLM_SETTING_KEYS.model, tenantId),
+    getSetting(PREFILTER_LLM_SETTING_KEYS.apiKey, tenantId),
+    getSetting(PREFILTER_LLM_SETTING_KEYS.endpoint, tenantId),
+  ]);
+  const config = resolvePurposeLLMConfigValues(baseConfig, {
+    provider: values[0],
+    model: values[1],
+    apiKey: values[2],
+    endpoint: values[3],
+  });
+  if (!config.apiKey) {
+    const error = new Error(`采集前预判尚未配置 ${config.provider} API Key`);
+    error.code = 'PREFILTER_LLM_API_KEY_MISSING';
+    error.provider = config.provider;
+    error.model = config.model;
+    throw error;
+  }
+  return config;
 }
 
 async function safeRecordAiFailure(tenantId, details) {
@@ -409,8 +639,8 @@ async function runModelOperationWithFailover(
 }
 
 /**
- * 前置相关性筛选只允许使用服务端保存的 DeepSeek 配置。
- * 扩展只提交待判断的最小文字字段，永远不会取得或传入模型 Key。
+ * Legacy DeepSeek-only entry point retained for callers outside the relevance
+ * prefilter. The prefilter itself uses its purpose-scoped provider route.
  */
 export async function getDeepSeekConfig(tenantId) {
   const config = await getLLMConfig(tenantId);
@@ -445,9 +675,12 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
       systemPrompt,
       userMessage,
       {
+        provider: currentConfig.provider,
         timeoutMs: options.timeoutMs,
         maxTokens: options.maxTokens,
         returnMetadata: options.returnMetadata === true,
+        thinking: options.thinking ?? false,
+        maxAttempts: options.maxAttempts,
       },
     ),
     {
@@ -467,36 +700,99 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
       promptTokens: data.promptTokens,
       completionTokens: data.completionTokens,
       totalTokens: data.totalTokens,
+      reasoningTokens: data.reasoningTokens,
     };
   }
   return data;
 }
 
-async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
-  const config = await getLLMConfig(tenantId);
-  if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
-  const brand = await getBrandContext(tenantId);
-  const intent = resolveMonitoringIntent(keyword, { brand });
-  const tenantScope = resolveTenantMonitoringScope(brand);
-  const systemPrompt = buildSystemPrompt(brand, intent, tenantScope);
+export async function callRelevancePrefilterWithPrompt(
+  tenantId,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const config = await getRelevancePrefilterLLMConfig(tenantId);
   const outcome = await runModelOperationWithFailover(
     tenantId,
     config,
     currentConfig => currentConfig.provider === 'gemini'
-      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
+      ? callGemini(
+        currentConfig.apiKey,
+        currentConfig.model,
+        systemPrompt,
+        userMessage,
+      )
       : callOpenAICompatible(
         currentConfig.apiKey,
         currentConfig.model,
         currentConfig.endpoint,
         systemPrompt,
         userMessage,
+        {
+          provider: currentConfig.provider,
+          timeoutMs: options.timeoutMs,
+          maxTokens: options.maxTokens,
+          returnMetadata: options.returnMetadata === true,
+          thinking: false,
+          maxAttempts: 1,
+        },
       ),
+    {
+      priority: options.priority || 'capture',
+      kind: options.kind || 'relevance_prefilter',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
+  );
+  const data = outcome.data;
+  if (options.returnMetadata && outcome.config.provider !== 'gemini') {
+    return {
+      data: data.data,
+      provider: outcome.config.provider,
+      model: outcome.config.model,
+      finishReason: data.finishReason,
+      responseLength: data.responseLength,
+      promptTokens: data.promptTokens,
+      completionTokens: data.completionTokens,
+      totalTokens: data.totalTokens,
+      reasoningTokens: data.reasoningTokens,
+    };
+  }
+  return options.returnMetadata
+    ? {
+      data,
+      provider: outcome.config.provider,
+      model: outcome.config.model,
+      finishReason: '',
+      responseLength: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      reasoningTokens: 0,
+    }
+    : data;
+}
+
+async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
+  const brand = await getBrandContext(tenantId);
+  const intent = resolveMonitoringIntent(keyword, { brand });
+  const tenantScope = resolveTenantMonitoringScope(brand);
+  const systemPrompt = buildSystemPrompt(brand, intent, tenantScope);
+  const outcome = await runTenantLlmPolicy(
+    tenantId,
+    systemPrompt,
+    userMessage,
     {
       priority: options.priority || 'normal',
       kind: options.kind || 'record_classification',
       queueTimeoutMs: options.queueTimeoutMs,
+      thinking: false,
     },
   );
+  if (!outcome) {
+    console.warn('[AI] No cloud API key or enabled local relay configured, skipping');
+    return null;
+  }
   return {
     result: outcome.data,
     intent,
@@ -507,27 +803,21 @@ async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
 }
 
 export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
-  const config = await getLLMConfig(tenantId);
-  if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
-  const outcome = await runModelOperationWithFailover(
+  const outcome = await runTenantLlmPolicy(
     tenantId,
-    config,
-    currentConfig => currentConfig.provider === 'gemini'
-      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
-      : callOpenAICompatible(
-        currentConfig.apiKey,
-        currentConfig.model,
-        currentConfig.endpoint,
-        systemPrompt,
-        userMessage,
-        options,
-      ),
+    systemPrompt,
+    userMessage,
     {
+      ...options,
       priority: options.priority || 'normal',
       kind: options.kind || 'llm_prompt',
       queueTimeoutMs: options.queueTimeoutMs,
     },
   );
+  if (!outcome) {
+    console.warn('[AI] No cloud API key or enabled local relay configured, skipping');
+    return null;
+  }
   return outcome.data;
 }
 
@@ -544,7 +834,13 @@ export async function probeDeepSeekPrimaryModel({tenantId, model}) {
       String(config.endpoint || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
       'You are a health probe. Return only a JSON object.',
       'Return exactly {"ok":true}.',
-      {timeoutMs: 10000, maxTokens: 256},
+      {
+        provider: 'deepseek',
+        timeoutMs: 10000,
+        maxTokens: 256,
+        thinking: false,
+        maxAttempts: 1,
+      },
     ),
     {
       priority: 'background',
@@ -709,6 +1005,8 @@ export async function labelRecord(recordId, options = {}) {
         monitoringObjective: labeled.intent.objective,
         monitoringScopeId: labeled.tenantScope.scopeId,
         monitoringScopeVersion: labeled.tenantScope.scopeVersion,
+        sentimentScope: 'main_post_only',
+        commentRiskScope: 'separate_classifier',
         observedKeywords: uniqueObservedKeywords.slice(0, 30),
       },
     };

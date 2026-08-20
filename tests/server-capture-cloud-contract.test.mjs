@@ -31,12 +31,14 @@ import {
   projectElasticAttemptBudget,
   elasticRecoveryHoldRemainingMs,
   isProfilePatrolTask,
+  isExplicitUserCancellationSnapshot,
   lockActiveCaptureAgentSession,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
   projectElasticKeywordRecoveryStatus,
+  projectCanceledChildItemStatus,
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
@@ -193,6 +195,88 @@ test("recovery grading keeps captcha current and automates technical or unstarte
     attempt_count: 3,
     error: {code: "TAB_NOT_FOUND"},
   }), {kind: "automatic_attempts_exhausted", automatic: false});
+});
+
+test("only explicit operator cancellation is terminal", () => {
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: true,
+      explicitUserCancellation: true,
+    }),
+    "canceled",
+  );
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: true,
+      explicitUserCancellation: false,
+    }),
+    "retryable",
+  );
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: false,
+      explicitUserCancellation: false,
+    }),
+    "needs_action",
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {stopCommandId: "11111111-1111-4111-8111-111111111111"}},
+      {status: "canceled", error: {}},
+    ),
+    true,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "USER_CANCELED", category: "user_canceled"},
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "runner_owner_disconnected"},
+        message: "用户手动中止当前采集任务",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "STALE_TASK_HEARTBEAT_TIMEOUT", retryable: true},
+      },
+    ),
+    false,
+  );
+});
+
+test("elastic timeout fences reject stale snapshots from the revoked attempt", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "async function dispatchNextElasticWorkItem",
+  );
+  assert.match(
+    mirror,
+    /ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT/u,
+  );
+  assert.match(
+    mirror,
+    /EXCLUDED\.attempt_number = capture_tasks\.attempt_number/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /unexpectedChildCancellation/u,
+  );
+  assert.match(captureCloudRouteSource, /UNEXPECTED_TASK_CANCELLATION/u);
 });
 
 test("elastic keyword recovery is patient, bounded, and escalates safety only after a cross-Agent check", () => {

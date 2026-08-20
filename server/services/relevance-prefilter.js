@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 
 import { execute, getSetting, queryAll, queryOne, withTransaction } from '../db/init.js';
-import { callDeepSeekWithPrompt, getBrandContext, getDeepSeekConfig } from './ai-labeler.js';
+import {
+  callRelevancePrefilterWithPrompt,
+  getBrandContext,
+  getRelevancePrefilterLLMConfig,
+} from './ai-labeler.js';
 import {
   formatMonitoringIntentForPrompt,
   formatTenantMonitoringScopeForPrompt,
@@ -14,7 +18,8 @@ export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
 export const PREFILTER_MAX_TENANT_SKIP_MATCH = 0.2;
-export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 25000;
+export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 20000;
+export const PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS = 5000;
 
 const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const VALID_MODES = new Set(['disabled', 'shadow', 'conservative']);
@@ -209,7 +214,12 @@ export function contentSummaryHash(item) {
   }));
 }
 
-export function prefilterCacheKey(request, item, model) {
+export function prefilterCacheKey(
+  request,
+  item,
+  model,
+  provider = PREFILTER_PROVIDER,
+) {
   return sha256(stableStringify({
     platform: request.platform,
     stage: request.stage,
@@ -219,7 +229,7 @@ export function prefilterCacheKey(request, item, model) {
     externalId: item.externalId || item.itemId,
     contentSummaryHash: contentSummaryHash(item),
     promptVersion: request.promptVersion,
-    modelProvider: PREFILTER_PROVIDER,
+    modelProvider: provider,
     modelName: model,
   }));
 }
@@ -390,7 +400,7 @@ function normalizeOneModelItem(item, raw, policy) {
     || confidence === null
     || !reason
   ) {
-    return failOpenItem(item, 'model_error', 'DeepSeek 返回字段不完整，已按安全策略继续采集', policy);
+    return failOpenItem(item, 'model_error', 'AI 返回字段不完整，已按安全策略继续采集', policy);
   }
   const protectedSignal = hasProtectedMonitoringSignal(item);
   const result = {
@@ -435,8 +445,8 @@ export function normalizePrefilterModelResponse(request, rawResponse, policy) {
     const matches = byId.get(item.itemId) || [];
     if (matches.length !== 1) {
       const reason = matches.length > 1
-        ? 'DeepSeek 为同一 itemId 返回了重复结果，已按安全策略继续采集'
-        : 'DeepSeek 未返回该 itemId，已按安全策略继续采集';
+        ? 'AI 为同一 itemId 返回了重复结果，已按安全策略继续采集'
+        : 'AI 未返回该 itemId，已按安全策略继续采集';
       return failOpenItem(item, 'model_error', reason, policy);
     }
     return normalizeOneModelItem(item, matches[0], policy);
@@ -449,10 +459,19 @@ export function normalizePrefilterModelResponse(request, rawResponse, policy) {
   };
 }
 
-async function loadCachedPrefilterItems(tenantId, request, model, policy) {
+async function loadCachedPrefilterItems(
+  tenantId,
+  request,
+  provider,
+  model,
+  policy,
+) {
   const candidates = request.items.filter(item => item.inputValid);
   if (candidates.length === 0) return new Map();
-  const keyToItem = new Map(candidates.map(item => [prefilterCacheKey(request, item, model), item]));
+  const keyToItem = new Map(candidates.map(item => [
+    prefilterCacheKey(request, item, model, provider),
+    item,
+  ]));
   const rows = await queryAll(`
     SELECT cache_key, response_item
     FROM relevance_prefilter_cache
@@ -550,7 +569,14 @@ async function reservePrefilterRequest(tenantId, request, bodyHash) {
   return await findIdempotentRequest(tenantId, request, bodyHash);
 }
 
-async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, response, model }) {
+async function persistPrefilterOutcome({
+  tenantId,
+  prefilterRequestId,
+  request,
+  response,
+  provider,
+  model,
+}) {
   await withTransaction(async tx => {
     for (const [index, result] of response.items.entries()) {
       const sourceItem = request.items[index];
@@ -569,10 +595,10 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
           $4, $5, $6, $7, $8,
           $9, $10, $11, $12, $13,
           $14, $15,
-          $16, $17, $18, 'deepseek', $19,
-          $20, $21, $22, $23,
-          $24, $25, $26, $27, $28::jsonb, $29::jsonb,
-          $30, $31, $32, $33, $34::jsonb
+          $16, $17, $18, $19, $20,
+          $21, $22, $23, $24,
+          $25, $26, $27, $28, $29::jsonb, $30::jsonb,
+          $31, $32, $33, $34, $35::jsonb
         )
         ON CONFLICT (tenant_id, prefilter_request_id, item_id) DO NOTHING
       `, [
@@ -594,6 +620,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
         request.intent.intentId,
         request.intent.intentVersion,
         request.promptVersion,
+        provider,
         model,
         result.status,
         result.modelDecision,
@@ -627,7 +654,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
             $1, $2, $3, $4,
             $5, $6,
             $7, $8, $9,
-            'deepseek', $10, $11::jsonb, now() + interval '14 days'
+            $10, $11, $12::jsonb, now() + interval '14 days'
           )
           ON CONFLICT (tenant_id, cache_key)
           DO UPDATE SET
@@ -636,7 +663,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
             expires_at = excluded.expires_at
         `, [
           tenantId,
-          prefilterCacheKey(request, sourceItem, model),
+          prefilterCacheKey(request, sourceItem, model, provider),
           request.platform,
           request.stage,
           request.keywordHash,
@@ -644,6 +671,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
           request.intent.intentId,
           request.intent.intentVersion,
           request.promptVersion,
+          provider,
           model,
           JSON.stringify(result),
         ]);
@@ -651,9 +679,10 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
     }
     await tx.execute(`
       UPDATE relevance_prefilter_requests
-      SET status = 'completed', model_name = $3, response_body = $4::jsonb, updated_at = now()
+      SET status = 'completed', model_provider = $3, model_name = $4,
+          response_body = $5::jsonb, updated_at = now()
       WHERE id = $1 AND tenant_id = $2
-    `, [prefilterRequestId, tenantId, model, JSON.stringify(response)]);
+    `, [prefilterRequestId, tenantId, provider, model, JSON.stringify(response)]);
   });
 }
 
@@ -692,6 +721,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
     const reservation = await reservePrefilterRequest(tenantId, request, bodyHash);
     if (reservation.kind === 'replay') return reservation.response;
     const startedAt = Date.now();
+    let provider = PREFILTER_PROVIDER;
     let model = 'deepseek-chat';
     let items;
     let degraded = false;
@@ -703,54 +733,51 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       items = allFailOpenItems(request, 'model_error', 'AI 前置筛选已由服务端关闭，已继续原采集流程', policy);
     } else {
       try {
-        const deepSeekConfig = await getDeepSeekConfig(tenantId);
-        model = deepSeekConfig.model;
-        const cached = await loadCachedPrefilterItems(tenantId, request, model, policy);
+        const llmConfig = await getRelevancePrefilterLLMConfig(tenantId);
+        provider = llmConfig.provider;
+        model = llmConfig.model;
+        const cached = await loadCachedPrefilterItems(
+          tenantId,
+          request,
+          provider,
+          model,
+          policy,
+        );
         const pendingItems = request.items.filter(item => item.inputValid && !cached.has(item.itemId));
         const pendingResults = new Map();
         if (pendingItems.length > 0) {
           const pendingRequest = { ...request, items: pendingItems };
           try {
             const baseMaxTokens = Math.min(
-              8192,
-              Math.max(3000, pendingItems.length * 600),
+              4096,
+              Math.max(1800, pendingItems.length * 320),
             );
-            let result = null;
-            let retryCount = 0;
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-              try {
-                result = await callDeepSeekWithPrompt(
-                  tenantId,
-                  buildPrefilterSystemPrompt(brand, request.intent, tenantScope),
-                  buildPrefilterUserMessage(pendingRequest),
-                  {
-                    timeoutMs: modelTimeoutMs(),
-                    maxTokens: attempt === 0
-                      ? baseMaxTokens
-                      : Math.min(8192, Math.max(5000, baseMaxTokens * 2)),
-                    returnMetadata: true,
-                    priority: 'capture',
-                    kind: 'relevance_prefilter',
-                  },
-                );
-                if (result.finishReason === 'length' && attempt === 0) {
-                  retryCount += 1;
-                  continue;
-                }
-                break;
-              } catch (error) {
-                const truncated =
-                  error?.code === 'LLM_JSON_PARSE_FAILED' ||
-                  String(error?.finishReason || '') === 'length';
-                if (!truncated || attempt > 0) throw error;
-                retryCount += 1;
-              }
-            }
+            const result = await callRelevancePrefilterWithPrompt(
+              tenantId,
+              buildPrefilterSystemPrompt(brand, request.intent, tenantScope),
+              buildPrefilterUserMessage(pendingRequest),
+              {
+                timeoutMs: modelTimeoutMs(),
+                queueTimeoutMs: PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
+                maxTokens: baseMaxTokens,
+                returnMetadata: true,
+                priority: 'capture',
+                kind: 'relevance_prefilter',
+              },
+            );
             if (!result) {
-              const error = new Error('DeepSeek 未返回可用的结构化结果');
+              const error = new Error('AI 未返回可用的结构化结果');
               error.code = 'LLM_EMPTY_RESULT';
               throw error;
             }
+            if (result.finishReason === 'length') {
+              const error = new Error('AI 结构化结果被截断，已安全放行');
+              error.code = 'LLM_OUTPUT_TRUNCATED';
+              error.finishReason = result.finishReason;
+              error.responseLength = result.responseLength;
+              throw error;
+            }
+            provider = result.provider || provider;
             model = result.model;
             modelDiagnostics = {
               finishReason: result.finishReason || '',
@@ -758,7 +785,9 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
               promptTokens: Math.max(0, Number(result.promptTokens) || 0),
               completionTokens: Math.max(0, Number(result.completionTokens) || 0),
               totalTokens: Math.max(0, Number(result.totalTokens) || 0),
-              retryCount,
+              reasoningTokens: Math.max(0, Number(result.reasoningTokens) || 0),
+              retryCount: 0,
+              thinkingEnabled: false,
             };
             const normalized = normalizePrefilterModelResponse(pendingRequest, result.data, policy);
             for (const item of normalized.items) pendingResults.set(item.itemId, item);
@@ -775,8 +804,8 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
               pendingRequest,
               timedOut ? 'timeout' : 'model_error',
               timedOut
-                ? 'DeepSeek 判断超时，已按安全策略继续采集'
-                : `DeepSeek 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
+                ? 'AI 判断超时，已按安全策略继续采集'
+                : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
               policy
             );
             for (const item of failed) pendingResults.set(item.itemId, item);
@@ -786,7 +815,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
           if (!item.inputValid) return failOpenItem(item, 'invalid_input', item.inputError, policy);
           return cached.get(item.itemId)
             || pendingResults.get(item.itemId)
-            || failOpenItem(item, 'model_error', 'DeepSeek 未返回该项目，已继续原采集流程', policy);
+            || failOpenItem(item, 'model_error', 'AI 未返回该项目，已继续原采集流程', policy);
         });
         degraded = unknownOutputCount > 0 || items.some(item => item.status !== 'ok');
       } catch (error) {
@@ -796,8 +825,8 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
           request,
           timedOut ? 'timeout' : 'model_error',
           timedOut
-            ? 'DeepSeek 判断超时，已按安全策略继续采集'
-            : `DeepSeek 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
+            ? 'AI 判断超时，已按安全策略继续采集'
+            : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
           policy
         );
       }
@@ -816,7 +845,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
         keywords: tenantScope.keywords,
       },
       promptVersion: request.promptVersion,
-      provider: PREFILTER_PROVIDER,
+      provider,
       model,
       latencyMs: Date.now() - startedAt,
       effectiveMode: policy.effectiveMode,
@@ -833,6 +862,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
         prefilterRequestId: reservation.id,
         request,
         response,
+        provider,
         model,
       });
     } catch (error) {

@@ -523,11 +523,29 @@ test("enhancement retry keeps checkpoint partial when any failed record remains"
 });
 
 test("platform safety signals are circuit breakers", () => {
-  assert.equal(isUnattendedSafetyBlock("请完成验证码后继续"), true);
-  assert.equal(isUnattendedSafetyBlock({message: "login required"}), true);
-  assert.equal(isUnattendedSafetyBlock("请重新登录后继续"), true);
-  assert.equal(isUnattendedSafetyBlock("账号触发安全验证"), true);
-  assert.equal(isUnattendedSafetyBlock({code: "ACCOUNT_FORBIDDEN"}), true);
+  assert.equal(
+    isUnattendedSafetyBlock({
+      code: "XHS_SECURITY_BLOCK",
+      securityEvidence: {
+        confirmed: true,
+        platform: "xiaohongshu",
+        variant: "cn_rate_limit_300013",
+      },
+    }),
+    true,
+  );
+  assert.equal(
+    isUnattendedSafetyBlock({
+      code: "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+      platformSafetyBlocked: true,
+    }),
+    true,
+  );
+  assert.equal(isUnattendedSafetyBlock({code: "LOGIN_REQUIRED"}), true);
+  assert.equal(isUnattendedSafetyBlock("请完成验证码后继续"), false);
+  assert.equal(isUnattendedSafetyBlock({message: "login required"}), false);
+  assert.equal(isUnattendedSafetyBlock("账号触发安全验证"), false);
+  assert.equal(isUnattendedSafetyBlock({code: "ACCOUNT_FORBIDDEN"}), false);
   assert.equal(
     isUnattendedSafetyBlock({
       code: "DOUYIN_SEARCH_SERVICE_ABNORMAL",
@@ -548,6 +566,46 @@ test("platform safety signals are circuit breakers", () => {
     "plain copy alone is not structured evidence and may be a work title",
   );
   assert.equal(isUnattendedSafetyBlock("导航超时"), false);
+});
+
+test("confirmed safety page variant survives checkpoint settlement and restore", () => {
+  const planKeywords = ["安吉星"];
+  const evidence = {
+    confirmed: true,
+    platform: "xiaohongshu",
+    variant: "cn_rate_limit_300013",
+    language: "zh-CN",
+    reason: "rate_limit",
+    pageUrl: "https://www.xiaohongshu.com/explore/example",
+  };
+  const settled = settleUnattendedKeywordCheckpoint({
+    checkpoint: normalizeUnattendedKeywordCheckpoint({}, planKeywords),
+    keywords: planKeywords,
+    keyword: "安吉星",
+    result: {
+      ok: false,
+      error: {
+        code: "XHS_SECURITY_BLOCK",
+        category: "platform_safety_block",
+        message: "小红书提示访问频繁，已暂停采集",
+        securityBlocked: true,
+        platformSafetyBlocked: true,
+        requiresManualAction: true,
+        securityEvidence: evidence,
+      },
+    },
+  });
+  assert.equal(settled.entry.securityEvidence.variant, "cn_rate_limit_300013");
+  assert.equal(settled.entry.platformSafetyBlocked, true);
+
+  const restored = normalizeUnattendedKeywordCheckpoint(
+    settled.checkpoint,
+    planKeywords,
+  );
+  assert.equal(
+    restored.keywordResults[0].securityEvidence.variant,
+    "cn_rate_limit_300013",
+  );
 });
 
 test("service-abnormal checkpoint remains a bounded retryable keyword failure", () => {

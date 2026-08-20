@@ -9,12 +9,12 @@
 import {prefilterRelevance} from '../api.js';
 
 export const RELEVANCE_PREFILTER_DEFAULT_THRESHOLD = 0.97;
-// DeepSeek handles smaller groups much more predictably. Keep each request
-// small enough to finish inside the extension's bounded wait while still
-// running the requests for one keyword in parallel.
-export const RELEVANCE_PREFILTER_BATCH_SIZE = 5;
-export const RELEVANCE_PREFILTER_TIMEOUT_MS = 90000;
-export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 2;
+// Each Agent submits one bounded micro-batch at a time. The server owns the
+// tenant-wide concurrency gate across every Agent, so local parallel calls
+// would only create queue pressure and duplicate retries.
+export const RELEVANCE_PREFILTER_BATCH_SIZE = 8;
+export const RELEVANCE_PREFILTER_TIMEOUT_MS = 30000;
+export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 1;
 
 const KEYWORD_RECORD_TYPE = 'keyword_notes';
 const INSUFFICIENT_TITLE_PATTERN =
@@ -485,29 +485,7 @@ export async function evaluateRelevancePrefilterRecords(
     batchJobs,
     async ({batch, batchIndex}) => {
       const initialDecisions = await requestBatchOnce(batch, {batchIndex});
-      const wholeBatchTimedOut =
-        batch.length > 1 &&
-        initialDecisions.length === batch.length &&
-        initialDecisions.every((decision) => decision.status === 'timeout');
-      if (!wholeBatchTimedOut || isStopRequested(shouldStop)) {
-        decisions.push(...initialDecisions);
-        return;
-      }
-
-      const splitAt = Math.ceil(batch.length / 2);
-      const retryBatches = [batch.slice(0, splitAt), batch.slice(splitAt)].filter(
-        (retryBatch) => retryBatch.length > 0,
-      );
-      retriedItemCount += batch.length;
-      for (let retryPart = 0; retryPart < retryBatches.length; retryPart += 1) {
-        retryCount += 1;
-        decisions.push(
-          ...(await requestBatchOnce(retryBatches[retryPart], {
-            batchIndex,
-            retryPart: retryPart + 1,
-          })),
-        );
-      }
+      decisions.push(...initialDecisions);
     },
   );
 

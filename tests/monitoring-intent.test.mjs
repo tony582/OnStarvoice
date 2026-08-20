@@ -85,7 +85,7 @@ test('至境哨兵不会扩展为所有至境车型舆情', () => {
 });
 
 test('后台最终标注以整体范围为准并保留当前关键词归属', () => {
-  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v3');
+  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v4');
   const intent = resolveMonitoringIntent('凯迪拉克OTA');
   const prompt = buildSystemPrompt(BRAND, intent);
   const userMessage = buildUserMessage({
@@ -103,9 +103,12 @@ test('后台最终标注以整体范围为准并保留当前关键词归属', ()
   assert.match(prompt, /昂科威plus远程失败/);
   assert.match(prompt, /安吉星，一生黑/);
   assert.match(prompt, /“安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论/);
+  assert.match(prompt, /评论区不属于主贴判断证据/);
+  assert.match(prompt, /不能反向把中性或正向主贴判为 negative/);
   assert.match(userMessage, /当前记录关键词（仅表示最近召回入口）：凯迪拉克OTA/);
   assert.match(userMessage, /全部召回关键词[\s\S]*安吉星/);
-  assert.match(userMessage, /评论上下文：评论只是讨论碰撞成绩/);
+  assert.doesNotMatch(userMessage, /评论只是讨论碰撞成绩/);
+  assert.doesNotMatch(userMessage, /评论上下文/);
 });
 
 test('整体无关不再伪装成中性，整体相关投诉保持负面', () => {

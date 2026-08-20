@@ -418,6 +418,7 @@
       captureRuns: count(source.captureRuns, 10000),
       capturedItems: count(source.capturedItems),
       succeeded: source.succeeded !== false,
+      safetyVerification: source.safetyVerification === true,
       occurredAt: text(source.occurredAt, 80),
       accountIdentity,
       metadata: sanitizeStructuredValue(objectValue(source.metadata)),

@@ -164,15 +164,17 @@ export function createDetailPrefetchPipeline({
       }
     }
     const code = cleanText(error?.code, 120).toUpperCase();
-    const message = cleanText(error?.message || error, 520);
     return (
       code === 'XHS_SECURITY_BLOCK' ||
+      code === 'DOUYIN_SEARCH_SECURITY_CHALLENGE' ||
+      code === 'SECURITY_VERIFICATION_REQUIRED' ||
+      code === 'PLATFORM_SAFETY_BLOCK' ||
       code === 'PAGE_CHALLENGE_BLOCK' ||
       code === 'HTTP_429' ||
       code === 'RATE_LIMITED' ||
-      /300013|安全限制|访问频繁|验证码|captcha|challenge|too many requests|\b429\b/iu.test(
-        message,
-      )
+      error?.securityBlocked === true ||
+      error?.platformSafetyBlocked === true ||
+      error?.securityEvidence?.confirmed === true
     );
   }
 

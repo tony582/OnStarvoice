@@ -19,7 +19,10 @@ const SAFETY_CODES = new Set([
   'PLATFORM_SAFETY_BLOCK',
   'SECURITY_VERIFICATION_REQUIRED',
   'XHS_SECURITY_BLOCK',
+  'PAGE_CHALLENGE_BLOCK',
   'PAGE_CHALLENGE',
+  'HTTP_429',
+  'RATE_LIMITED',
   'CAPTCHA_REQUIRED',
   'LOGIN_REQUIRED',
   'AUTH_REQUIRED',
@@ -105,6 +108,8 @@ function hasStructuredSafetyEvidence(value) {
       nestedError.platform_safety_blocked === true ||
       nestedError.requiresManualAction === true ||
       nestedError.requires_manual_action === true ||
+      object(source.securityEvidence).confirmed === true ||
+      object(nestedError.securityEvidence).confirmed === true ||
       [
         'platform_safety_block',
         'login_required',
@@ -389,6 +394,10 @@ export async function enqueueCaptureSafetyAttentionNotification(tx, {
   const keyword = currentKeywordDetails(snapshot, task);
   const evidenceObject = object(evidence);
   const evidenceError = evidenceObject.error;
+  const detailedEvidence = object(
+    evidenceObject.securityEvidence ||
+      object(evidenceError).securityEvidence,
+  );
   const eventKey = buildCaptureAttentionEventKey(
     task.id,
     attemptNumber,
@@ -415,6 +424,9 @@ export async function enqueueCaptureSafetyAttentionNotification(tx, {
     savedCount: keyword.savedCount,
     errorCode: code,
     errorCategory: category,
+    securityVariant: text(detailedEvidence.variant, 100),
+    securityLanguage: text(detailedEvidence.language, 40),
+    securityReason: text(detailedEvidence.reason, 100),
     errorMessage: text(
       evidenceObject.message ||
         object(evidenceError).message ||

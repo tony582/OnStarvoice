@@ -38,6 +38,7 @@ import officialCommentPatrolRouter from './routes/official-comment-patrol.js';
 import followedCreatorPatrolRouter from './routes/followed-creator-patrol.js';
 import opinionAnalysisRouter from './routes/opinion-analysis.js';
 import socialAccountsRouter from './routes/social-accounts.js';
+import llmRelayAgentRouter from './routes/llm-relay-agent.js';
 import { asrMediaRouter } from './services/asr-media-host.js';
 import { MEDIA_DIR } from './services/media-store.js';
 import { createProcessHealth } from './runtime/process-health.js';
@@ -103,7 +104,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
       return callback(new Error(`CORS origin not allowed: ${origin}`));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'x-auth-code', 'x-admin-token', 'x-tenant-id', 'x-session-token', 'x-capture-agent-token', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'x-auth-code', 'x-admin-token', 'x-tenant-id', 'x-session-token', 'x-capture-agent-token', 'x-llm-relay-agent-token', 'Authorization'],
   }));
 
   app.use(express.json({ limit: '10mb' }));
@@ -176,6 +177,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/capture-cloud', followedCreatorPatrolRouter);
   app.use('/api/opinion-analysis', opinionAnalysisRouter);
   app.use('/api/social-accounts', socialAccountsRouter);
+  app.use('/api/llm-relay', llmRelayAgentRouter);
   app.use('/api/asr-media', asrMediaRouter);
 
   app.post('/api/admin/test-email', requireAdmin, async (req, res) => {

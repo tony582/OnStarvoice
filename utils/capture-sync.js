@@ -92,6 +92,10 @@ import {
   isDouyinSearchSecurityChallengeError,
 } from './capture/douyin-search-guard.js';
 import {
+  createXhsSecurityBlockError,
+  XHS_SECURITY_PAGE_MARKERS,
+} from './capture/xiaohongshu-security.js';
+import {
   evaluateRelevancePrefilterRecords,
   RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
 } from './capture/relevance-prefilter.js';
@@ -4851,11 +4855,16 @@ export async function batchCaptureDetailsForRecords(
           }
           if (noteResult?.error?.code === 'XHS_SECURITY_BLOCK') {
             securityBlocked = true; // 撞风控,下面 catch 会停整批
-            throw new Error('XHS_SECURITY_BLOCK');
           }
           const noteCaptureError = new Error(
             noteResult?.error?.message || '详情采集失败',
           );
+          if (
+            noteResult?.error &&
+            typeof noteResult.error === 'object'
+          ) {
+            Object.assign(noteCaptureError, noteResult.error);
+          }
           noteCaptureError.code = String(noteResult?.error?.code || '').trim();
           throw noteCaptureError;
         }
@@ -12411,8 +12420,9 @@ async function probeDetailPreloadSafety(
         args: [
           String(expectedNoteId || ''),
           Boolean(requireVisibleDetailRoot),
+          XHS_SECURITY_PAGE_MARKERS,
         ],
-        func: (targetNoteId, requireVisibleRoot) => {
+        func: (targetNoteId, requireVisibleRoot, xhsMarkers) => {
           const title = String(document.title || '').trim();
           const bodyText = String(document.body?.innerText || '')
             .replace(/\s+/gu, ' ')
@@ -12439,12 +12449,62 @@ async function probeDetailPreloadSafety(
             /(?:图文|视频|作品|内容)不存在|该作品已删除|内容已下架/u.test(
               `${title} ${bodyText}`,
             );
-          const xhsBlocked =
-            (/安全限制/u.test(bodyText) &&
-              /(访问频繁|稍后再试|300013)/u.test(bodyText)) ||
-            (/300013/u.test(bodyText) &&
-              /(访问频繁|稍后再试|安全)/u.test(bodyText));
+          const normalizedPageText = `${title} ${bodyText}`
+            .replace(/[\u2010-\u2015]/gu, '-')
+            .replace(/[\u2018\u2019\u201c\u201d\u300c\u300d\u300e\u300f"']/gu, '')
+            .replace(/\s+/gu, ' ')
+            .trim()
+            .toLowerCase();
+          const xhsChineseBlocked =
+            normalizedPageText.includes(xhsMarkers.chineseTitle) &&
+            normalizedPageText.includes(xhsMarkers.chineseRateLimit) &&
+            normalizedPageText.includes(xhsMarkers.chineseRetry) &&
+            (
+              normalizedPageText.includes(xhsMarkers.chineseCode) ||
+              xhsMarkers.chineseActions.every((action) =>
+                normalizedPageText.includes(action),
+              )
+            );
+          const xhsEnglishQrBlocked =
+            normalizedPageText.includes(xhsMarkers.englishQrLead) &&
+            normalizedPageText.includes(xhsMarkers.englishQrReason);
+          const xhsEnglishRateBlocked =
+            normalizedPageText.includes(xhsMarkers.englishRateLimit) &&
+            normalizedPageText.includes(xhsMarkers.englishRetry);
+          const xhsSecurityEvidence = xhsChineseBlocked
+            ? {
+                confirmed: true,
+                platform: 'xiaohongshu',
+                variant: 'cn_rate_limit_300013',
+                language: 'zh-CN',
+                reason: 'rate_limit',
+                pageUrl: currentUrl,
+              }
+            : xhsEnglishQrBlocked
+              ? {
+                  confirmed: true,
+                  platform: 'xiaohongshu',
+                  variant: 'en_account_security_qr',
+                  language: 'en',
+                  reason: 'account_security_qr',
+                  pageUrl: currentUrl,
+                }
+              : xhsEnglishRateBlocked
+                ? {
+                    confirmed: true,
+                    platform: 'xiaohongshu',
+                    variant: 'en_rate_limit',
+                    language: 'en',
+                    reason: 'rate_limit',
+                    pageUrl: currentUrl,
+                  }
+                : null;
+          const xhsBlocked = Boolean(xhsSecurityEvidence);
+          const isXiaohongshu = /(^|\.)xiaohongshu\.com$/i.test(
+            location.hostname,
+          );
           const challengeBlocked =
+            !isXiaohongshu &&
             /(验证码中间页|请完成下列验证后继续|请完成验证|captcha|challenge)/iu.test(
               `${title} ${bodyText}`,
             );
@@ -12790,19 +12850,24 @@ async function probeDetailPreloadSafety(
                 ? 'PAGE_CHALLENGE_BLOCK'
                 : '',
             message: xhsBlocked
-              ? '触发小红书安全限制(访问频繁/300013)'
+              ? xhsSecurityEvidence.reason === 'account_security_qr'
+                ? '小红书要求扫码完成账号安全验证，已暂停采集'
+                : '小红书提示访问频繁，已暂停采集'
               : douyinRateLimited
                 ? '抖音提示访问或操作频繁，已停止继续请求'
               : challengeBlocked
                 ? '详情预加载遇到验证码或风险验证页'
                 : '',
+            securityEvidence: xhsSecurityEvidence,
           };
         },
       });
       const result = execution?.result || {};
       if (result.blocked) {
-        const error = new Error(result.message || '详情预加载遇到安全验证页');
-        error.code = result.code || 'PAGE_CHALLENGE_BLOCK';
+        const error = result.securityEvidence?.confirmed === true
+          ? createXhsSecurityBlockError(result.securityEvidence)
+          : new Error(result.message || '详情预加载遇到安全验证页');
+        error.code = result.code || error.code || 'PAGE_CHALLENGE_BLOCK';
         error.currentUrl = result.currentUrl || '';
         throw error;
       }
@@ -13149,15 +13214,17 @@ async function ensureDouyinCommentTargetReadyInTab({
 
 function isDetailSecurityBlockError(error) {
   const code = String(error?.code || '').trim().toUpperCase();
-  const message = String(error?.message || error || '').trim();
   return (
     code === 'XHS_SECURITY_BLOCK' ||
+    code === DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE ||
+    code === 'SECURITY_VERIFICATION_REQUIRED' ||
+    code === 'PLATFORM_SAFETY_BLOCK' ||
     code === 'PAGE_CHALLENGE_BLOCK' ||
     code === 'HTTP_429' ||
     code === 'RATE_LIMITED' ||
-    /300013|安全限制|访问频繁|验证码|captcha|challenge|too many requests|\b429\b/iu.test(
-      message,
-    )
+    error?.securityBlocked === true ||
+    error?.platformSafetyBlocked === true ||
+    error?.securityEvidence?.confirmed === true
   );
 }
 
@@ -15265,6 +15332,11 @@ export async function batchCaptureByKeywords({
           value?.error?.platformSafetyBlocked === true,
       ),
     };
+    const confirmedSecurityEvidence = candidates
+      .map((value) =>
+        value?.securityEvidence || value?.error?.securityEvidence,
+      )
+      .find((value) => value?.confirmed === true) || null;
     return {
       code: errorCode,
       message,
@@ -15289,6 +15361,7 @@ export async function batchCaptureByKeywords({
           value?.requiresManualAction === true ||
           value?.error?.requiresManualAction === true,
       ),
+      securityEvidence: confirmedSecurityEvidence,
       fatal: candidates.some(
         (value) =>
           value?.fatal === true ||
@@ -15682,6 +15755,7 @@ export async function batchCaptureByKeywords({
           securityBlocked: captureFailure.securityBlocked,
           platformSafetyBlocked: captureFailure.platformSafetyBlocked,
           requiresManualAction: captureFailure.requiresManualAction,
+          securityEvidence: captureFailure.securityEvidence,
         };
         results.push(keywordResult);
         failedCount++;
@@ -15742,6 +15816,7 @@ export async function batchCaptureByKeywords({
             securityBlocked: captureFailure.securityBlocked,
             platformSafetyBlocked: captureFailure.platformSafetyBlocked,
             requiresManualAction: captureFailure.requiresManualAction,
+            securityEvidence: captureFailure.securityEvidence,
           };
           results.push(keywordResult);
           successCount++;
@@ -15759,6 +15834,7 @@ export async function batchCaptureByKeywords({
             securityBlocked: captureFailure.securityBlocked,
             platformSafetyBlocked: captureFailure.platformSafetyBlocked,
             requiresManualAction: captureFailure.requiresManualAction,
+            securityEvidence: captureFailure.securityEvidence,
           };
           results.push(keywordResult);
           failedCount++;
@@ -15814,6 +15890,7 @@ export async function batchCaptureByKeywords({
         securityBlocked: captureFailure.securityBlocked,
         platformSafetyBlocked: captureFailure.platformSafetyBlocked,
         requiresManualAction: captureFailure.requiresManualAction,
+        securityEvidence: captureFailure.securityEvidence,
       };
       results.push(keywordResult);
       failedCount++;
@@ -15856,6 +15933,9 @@ export async function batchCaptureByKeywords({
             keywordResult.requiresManualAction,
           ),
           retryable: false,
+          ...(keywordResult.securityEvidence?.confirmed === true
+            ? {securityEvidence: keywordResult.securityEvidence}
+            : {}),
         };
       }
     }
@@ -15951,11 +16031,41 @@ export async function batchCaptureByKeywords({
           }
         }
         if (enhanceResult?.securityBlocked) {
+          const enhanceFailure = resolveKeywordFailure(enhanceResult);
           keywordResult.enhanceStatus = 'failed';
           keywordResult.securityBlocked = true;
+          keywordResult.platformSafetyBlocked =
+            enhanceFailure.platformSafetyBlocked;
+          keywordResult.requiresManualAction =
+            enhanceFailure.requiresManualAction;
+          keywordResult.errorCode =
+            enhanceFailure.code || keywordResult.errorCode;
+          keywordResult.errorCategory =
+            enhanceFailure.category || keywordResult.errorCategory;
+          keywordResult.securityEvidence =
+            enhanceFailure.securityEvidence || keywordResult.securityEvidence;
+          keywordResult.warning =
+            enhanceFailure.message || keywordResult.warning;
           securityBlocked = true;
           canceled = true;
           stopAfterKeyword = true;
+          blockingError = {
+            code: enhanceFailure.code || 'PLATFORM_SAFETY_BLOCK',
+            message:
+              enhanceFailure.message ||
+              '检测到平台安全验证，已停止任务',
+            category:
+              enhanceFailure.category || 'platform_safety_block',
+            securityBlocked: true,
+            platformSafetyBlocked:
+              enhanceFailure.platformSafetyBlocked,
+            requiresManualAction:
+              enhanceFailure.requiresManualAction,
+            retryable: false,
+            ...(enhanceFailure.securityEvidence?.confirmed === true
+              ? {securityEvidence: enhanceFailure.securityEvidence}
+              : {}),
+          };
         }
         if (!stopAfterKeyword && isExplicitFatalKeywordFailure(enhanceResult)) {
           keywordResult.enhanceStatus = 'failed';
@@ -16024,10 +16134,39 @@ export async function batchCaptureByKeywords({
             keywordResult.recoverableInterruption = true;
           }
           if (isUnattendedSafetyBlock(error)) {
+            const enhanceFailure = resolveKeywordFailure(error);
             keywordResult.securityBlocked = true;
+            keywordResult.platformSafetyBlocked =
+              enhanceFailure.platformSafetyBlocked;
+            keywordResult.requiresManualAction =
+              enhanceFailure.requiresManualAction;
+            keywordResult.errorCode =
+              enhanceFailure.code || keywordResult.errorCode;
+            keywordResult.errorCategory =
+              enhanceFailure.category || keywordResult.errorCategory;
+            keywordResult.securityEvidence =
+              enhanceFailure.securityEvidence || keywordResult.securityEvidence;
             securityBlocked = true;
             canceled = true;
             stopAfterKeyword = true;
+            blockingError = {
+              code: enhanceFailure.code || 'PLATFORM_SAFETY_BLOCK',
+              message:
+                enhanceFailure.message ||
+                keywordResult.warning ||
+                '检测到平台安全验证，已停止任务',
+              category:
+                enhanceFailure.category || 'platform_safety_block',
+              securityBlocked: true,
+              platformSafetyBlocked:
+                enhanceFailure.platformSafetyBlocked,
+              requiresManualAction:
+                enhanceFailure.requiresManualAction,
+              retryable: false,
+              ...(enhanceFailure.securityEvidence?.confirmed === true
+                ? {securityEvidence: enhanceFailure.securityEvidence}
+                : {}),
+            };
           } else if (isExplicitFatalKeywordFailure(error)) {
             keywordResult.fatal = true;
             fatal = true;
@@ -17393,7 +17532,7 @@ async function waitForKeywordSearchResultsInTab(
     const snapshot = await chrome.scripting
       .executeScript({
         target: {tabId: normalizedTabId},
-        func: (platformName, expectedKeyword) => {
+        func: (platformName, expectedKeyword, xhsMarkers) => {
           const normalizeText = (value) =>
             String(value || '')
               .trim()
@@ -17408,6 +17547,72 @@ async function waitForKeywordSearchResultsInTab(
           };
           const expected = normalizeText(expectedKeyword);
           const platformKey = String(platformName || '').toLowerCase();
+          if (platformKey === 'xiaohongshu') {
+            const pageText = `${document.title || ''} ${document.body?.innerText || ''}`
+              .replace(/[\u2010-\u2015]/gu, '-')
+              .replace(/[\u2018\u2019\u201c\u201d\u300c\u300d\u300e\u300f"']/gu, '')
+              .replace(/\s+/gu, ' ')
+              .trim()
+              .toLowerCase();
+            const chineseBlocked =
+              pageText.includes(xhsMarkers.chineseTitle) &&
+              pageText.includes(xhsMarkers.chineseRateLimit) &&
+              pageText.includes(xhsMarkers.chineseRetry) &&
+              (
+                pageText.includes(xhsMarkers.chineseCode) ||
+                xhsMarkers.chineseActions.every((action) =>
+                  pageText.includes(action),
+                )
+              );
+            const englishQrBlocked =
+              pageText.includes(xhsMarkers.englishQrLead) &&
+              pageText.includes(xhsMarkers.englishQrReason);
+            const englishRateBlocked =
+              pageText.includes(xhsMarkers.englishRateLimit) &&
+              pageText.includes(xhsMarkers.englishRetry);
+            const securityEvidence = chineseBlocked
+              ? {
+                  confirmed: true,
+                  platform: 'xiaohongshu',
+                  variant: 'cn_rate_limit_300013',
+                  language: 'zh-CN',
+                  reason: 'rate_limit',
+                  pageUrl: window.location.href,
+                }
+              : englishQrBlocked
+                ? {
+                    confirmed: true,
+                    platform: 'xiaohongshu',
+                    variant: 'en_account_security_qr',
+                    language: 'en',
+                    reason: 'account_security_qr',
+                    pageUrl: window.location.href,
+                  }
+                : englishRateBlocked
+                  ? {
+                      confirmed: true,
+                      platform: 'xiaohongshu',
+                      variant: 'en_rate_limit',
+                      language: 'en',
+                      reason: 'rate_limit',
+                      pageUrl: window.location.href,
+                    }
+                  : null;
+            if (securityEvidence) {
+              return {
+                cardCount: 0,
+                keywordMatched: false,
+                pageUrl: window.location.href,
+                signature: '',
+                blockingCode: 'XHS_SECURITY_BLOCK',
+                blockingMessage:
+                  securityEvidence.reason === 'account_security_qr'
+                    ? '小红书要求扫码完成账号安全验证，已暂停采集'
+                    : '小红书提示访问频繁，已暂停采集',
+                securityEvidence,
+              };
+            }
+          }
           const selectorsByPlatform = {
             xiaohongshu: [
               '.feeds-container a[href*="/explore/"]',
@@ -17714,7 +17919,7 @@ async function waitForKeywordSearchResultsInTab(
               : '',
           };
         },
-        args: [platform, keyword],
+        args: [platform, keyword, XHS_SECURITY_PAGE_MARKERS],
       })
       .then(([result]) => result?.result || null)
       .catch(() => null);
@@ -17727,6 +17932,13 @@ async function waitForKeywordSearchResultsInTab(
         message: snapshot?.blockingMessage,
         pageUrl: snapshot?.pageUrl,
       });
+    }
+    if (
+      String(snapshot?.blockingCode || '').trim().toUpperCase() ===
+      'XHS_SECURITY_BLOCK' &&
+      snapshot?.securityEvidence?.confirmed === true
+    ) {
+      throw createXhsSecurityBlockError(snapshot.securityEvidence);
     }
 
     const cardCount = Number(snapshot?.cardCount || 0);

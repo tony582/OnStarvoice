@@ -437,6 +437,7 @@ test("heartbeat reports social identity and idempotent usage without phone numbe
       captureRuns: 3,
       capturedItems: 20,
       succeeded: true,
+      safetyVerification: true,
       occurredAt: "2026-07-25T03:01:00.000Z",
       accountIdentity: {
         platformAccountId: "account-a",
@@ -457,6 +458,7 @@ test("heartbeat reports social identity and idempotent usage without phone numbe
   assert.equal(payload.observedSocialAccounts[0].platformAccountId, "account-a");
   assert.equal(Object.hasOwn(payload.observedSocialAccounts[0], "registeredPhone"), false);
   assert.equal(payload.socialUsageEvents[0].eventId, "usage-a");
+  assert.equal(payload.socialUsageEvents[0].safetyVerification, true);
   assert.equal(
     payload.socialUsageEvents[0].accountIdentity.confidence,
     "high",

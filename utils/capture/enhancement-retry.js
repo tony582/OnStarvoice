@@ -275,6 +275,21 @@ function normalizeAttemptResult(
       code: thrownCode,
       message:
         normalizeText(thrownError?.message) || "采集增强执行发生异常",
+      ...(normalizeCategory(thrownError?.category)
+        ? {category: normalizeCategory(thrownError.category)}
+        : {}),
+      ...(thrownError?.securityBlocked === true
+        ? {securityBlocked: true}
+        : {}),
+      ...(thrownError?.platformSafetyBlocked === true
+        ? {platformSafetyBlocked: true}
+        : {}),
+      ...(thrownError?.requiresManualAction === true
+        ? {requiresManualAction: true}
+        : {}),
+      ...(thrownError?.securityEvidence?.confirmed === true
+        ? {securityEvidence: {...thrownError.securityEvidence}}
+        : {}),
     };
     baseResult.canceled = Boolean(
       thrownError?.canceled === true ||
@@ -285,6 +300,15 @@ function normalizeAttemptResult(
       thrownError?.securityBlocked === true ||
         thrownCode === "XHS_SECURITY_BLOCK",
     );
+    baseResult.platformSafetyBlocked = Boolean(
+      thrownError?.platformSafetyBlocked === true,
+    );
+    baseResult.requiresManualAction = Boolean(
+      thrownError?.requiresManualAction === true,
+    );
+    if (thrownError?.securityEvidence?.confirmed === true) {
+      baseResult.securityEvidence = {...thrownError.securityEvidence};
+    }
   }
 
   const results = Array.isArray(baseResult.results)
@@ -440,6 +464,14 @@ export function mergeEnhancementAttemptResults({
     retryResult?.recoveryRequired === true || runnerInterrupted,
   );
   const securityBlocked = retryResult?.securityBlocked === true;
+  const platformSafetyBlocked = Boolean(
+    initialResult?.platformSafetyBlocked === true ||
+      retryResult?.platformSafetyBlocked === true,
+  );
+  const requiresManualAction = Boolean(
+    initialResult?.requiresManualAction === true ||
+      retryResult?.requiresManualAction === true,
+  );
   const integrityBlocked = Boolean(
     initialResult?.integrityBlocked === true ||
       retryResult?.integrityBlocked === true ||
@@ -472,6 +504,12 @@ export function mergeEnhancementAttemptResults({
     runnerInterrupted,
     recoveryRequired,
     securityBlocked,
+    platformSafetyBlocked,
+    requiresManualAction,
+    securityEvidence:
+      retryResult?.securityEvidence ||
+      initialResult?.securityEvidence ||
+      null,
     integrityBlocked,
     fatal,
     stopBatch,

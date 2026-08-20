@@ -6118,8 +6118,13 @@ test("task ledger reads reconcile abandoned running records", async () => {
   });
 
   assert.equal(response.ok, true);
-  assert.equal(response.data.runs[0].status, "canceled");
-  assert.equal(harness.storage[TASK_LEDGER_KEY].runs[0].status, "canceled");
+  assert.equal(response.data.runs[0].status, "failed");
+  assert.equal(
+    response.data.runs[0].error.code,
+    "STALE_TASK_HEARTBEAT_TIMEOUT",
+  );
+  assert.equal(response.data.runs[0].error.retryable, true);
+  assert.equal(harness.storage[TASK_LEDGER_KEY].runs[0].status, "failed");
 });
 
 test("clearing task center removes history but preserves a recently active task", async () => {

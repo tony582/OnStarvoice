@@ -161,13 +161,35 @@ test("extension usage events preserve explicit platform safety evidence", async 
   assert.equal(event.safetyVerification, true);
   assert.equal(event.succeeded, false);
 
-  const thrownError = new Error("当前页面触发安全验证");
-  const thrownEvent = usage.buildUsageEventFromRelay({
+  const ambiguousError = new Error("帖子正文提到了安全验证");
+  const ambiguousEvent = usage.buildUsageEventFromRelay({
     action: "captureKeywordNotes",
     platform: "xiaohongshu",
-    error: thrownError,
+    error: ambiguousError,
   });
-  assert.equal(thrownEvent.safetyVerification, true);
+  assert.equal(ambiguousEvent.safetyVerification, false);
+
+  const xhsError = new Error("小红书提示访问频繁，已暂停采集");
+  xhsError.code = "XHS_SECURITY_BLOCK";
+  xhsError.securityBlocked = true;
+  xhsError.platformSafetyBlocked = true;
+  xhsError.securityEvidence = {
+    confirmed: true,
+    platform: "xiaohongshu",
+    variant: "cn_rate_limit_300013",
+    language: "zh-CN",
+    reason: "rate_limit",
+  };
+  const xhsEvent = usage.buildUsageEventFromRelay({
+    action: "captureKeywordNotes",
+    platform: "xiaohongshu",
+    error: xhsError,
+  });
+  assert.equal(xhsEvent.safetyVerification, true);
+  assert.equal(
+    xhsEvent.metadata.safetyEvidence.variant,
+    "cn_rate_limit_300013",
+  );
 });
 
 test("offline usage queue is idempotent and acknowledges only accepted event ids", async () => {
@@ -265,6 +287,37 @@ test("server normalizes identity snapshots and uses the Shanghai usage day", () 
     normalizeSocialUsageEvents([event, event], Date.parse("2026-07-25T16:02:00.000Z")).length,
     1,
   );
+
+  const ambiguous = normalizeSocialUsageEvent(
+    {
+      eventId: "event-ambiguous",
+      platform: "xiaohongshu",
+      searches: 1,
+      occurredAt: "2026-07-25T16:01:00.000Z",
+      metadata: {message: "帖子正文提到安全限制和访问频繁"},
+    },
+    Date.parse("2026-07-25T16:02:00.000Z"),
+  );
+  assert.equal(ambiguous.safetyVerification, false);
+
+  const confirmed = normalizeSocialUsageEvent(
+    {
+      eventId: "event-confirmed",
+      platform: "xiaohongshu",
+      searches: 1,
+      occurredAt: "2026-07-25T16:01:00.000Z",
+      metadata: {
+        errorCode: "XHS_SECURITY_BLOCK",
+        safetyEvidence: {
+          confirmed: true,
+          platform: "xiaohongshu",
+          variant: "cn_rate_limit_300013",
+        },
+      },
+    },
+    Date.parse("2026-07-25T16:02:00.000Z"),
+  );
+  assert.equal(confirmed.safetyVerification, true);
 });
 
 test("account overview returns usage dates without UTC day rollover", async () => {
@@ -411,6 +464,9 @@ test("schema, heartbeat, tenant api, and admin page are wired as one Agent-first
   assert.match(accountRoute, /registered_phone/u);
   assert.match(accountRoute, /FROM social_agent_daily_usage du/u);
   assert.match(accountRoute, /today_safety_verifications/u);
+  assert.doesNotMatch(accountRoute, /task\.message ~\* \$2/u);
+  assert.match(accountRoute, /XHS_SECURITY_BLOCK/u);
+  assert.match(accountRoute, /securityEvidence\|safetyEvidence/u);
   assert.match(accountRoute, /task\.source_updated_at/u);
   assert.match(accountRoute, /task\.error::text ~\* \$2/u);
   assert.match(accountRoute, /router\.put\(\s*'\/:id\/bindings'/u);

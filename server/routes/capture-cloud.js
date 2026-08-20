@@ -158,6 +158,11 @@ const CROSS_DEVICE_RETRY_PERMANENT_CODES = new Set([
   'DETAIL_CAPTURE_CANCELED',
   'USER_CANCELED',
 ]);
+const EXPLICIT_USER_CANCELLATION_CODES = new Set([
+  'USER_CANCELED',
+  'USER_CANCELLED',
+  'USER_CANCEL_REQUESTED',
+]);
 const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
   task_not_found: ['task_not_found', '任务不存在'],
   task_cross_device_retry_unsupported: [
@@ -575,6 +580,58 @@ export function projectElasticKeywordRecoveryStatus({
   return normalizedAttemptCount < AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
     ? 'retryable'
     : 'failed';
+}
+
+export function isExplicitUserCancellationSnapshot(task = {}, snapshot = {}) {
+  const taskMetadata = safeJson(task.metadata);
+  const snapshotMetadata = safeJson(snapshot.metadata);
+  const snapshotError = safeJson(snapshot.error);
+  const code = text(
+    snapshotError.code || snapshot.errorCode || snapshot.error_code,
+    100,
+  ).toUpperCase();
+  const category = text(
+    snapshotError.category || snapshot.errorCategory || snapshot.error_category,
+    100,
+  ).toLowerCase();
+  const cancelSource = text(
+    snapshotMetadata.cancelSource ||
+      snapshotMetadata.cancel_source ||
+      snapshotError.cancelSource ||
+      snapshotError.cancel_source,
+    80,
+  ).toLowerCase();
+  return Boolean(
+    taskMetadata.stopCommandId ||
+      EXPLICIT_USER_CANCELLATION_CODES.has(code) ||
+      category === 'user_canceled' ||
+      cancelSource === 'user'
+  );
+}
+
+export function projectCanceledChildItemStatus({
+  elasticPool = false,
+  explicitUserCancellation = false,
+} = {}) {
+  if (explicitUserCancellation) return 'canceled';
+  return elasticPool ? 'retryable' : 'needs_action';
+}
+
+function unexpectedTaskCancellationError(snapshot = {}) {
+  const originalError = safeJson(snapshot.error);
+  return {
+    ...sanitizeCloudStructuredObject(originalError),
+    code: 'UNEXPECTED_TASK_CANCELLATION',
+    category: 'technical_recovery',
+    message:
+      '执行节点意外结束任务，未完成关键词已释放等待重新分配',
+    retryable: true,
+    automaticRetry: true,
+    originalCode: text(
+      originalError.code || snapshot.errorCode || snapshot.error_code,
+      100,
+    ),
+  };
 }
 
 function elasticRecoveryErrorCode(source = {}) {
@@ -3629,6 +3686,10 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   if (['canceled', 'superseded'].includes(parent.status)) return parent;
   const elasticPool =
     safeJson(parent.metadata).distributionMode === 'elastic_pool';
+  const childStatus = text(snapshot.status, 80);
+  const explicitUserCancellation =
+    childStatus === 'canceled' &&
+    isExplicitUserCancellationSnapshot(task, snapshot);
 
   // Receiving an accepted child snapshot proves the create command reached a
   // local task. It does not prove that any keyword has started yet.
@@ -3663,9 +3724,13 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     const keywordServiceAbnormal =
       entryErrorCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL';
     const checkpointStatus = checkpointEntryToItemStatus(entry);
-    const checkpointProjectedStatus = checkpointStatus === 'pending' || checkpointStatus === 'assigned'
-      ? 'dispatched'
-      : checkpointStatus;
+    const unexpectedCheckpointCancellation =
+      checkpointStatus === 'canceled' && !explicitUserCancellation;
+    const checkpointProjectedStatus = unexpectedCheckpointCancellation
+      ? projectCanceledChildItemStatus({elasticPool})
+      : checkpointStatus === 'pending' || checkpointStatus === 'assigned'
+        ? 'dispatched'
+        : checkpointStatus;
     const attemptCount = orchestrationCheckpointInteger(entry.attemptCount);
     const savedCount = orchestrationCheckpointInteger(entry.savedCount);
     const finishedAt = orchestrationCheckpointTimestamp(entry.finishedAt);
@@ -3676,8 +3741,11 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         ? {message: text(rawEntryError, 1000)}
         : {};
     const error = {
-      ...baseError,
-      ...(text(entry.errorCode || entry.error_code, 100)
+      ...(unexpectedCheckpointCancellation
+        ? unexpectedTaskCancellationError({error: baseError})
+        : baseError),
+      ...(!unexpectedCheckpointCancellation &&
+      text(entry.errorCode || entry.error_code, 100)
         ? {code: text(entry.errorCode || entry.error_code, 100)}
         : {}),
       ...(text(entry.errorCategory || entry.error_category, 100)
@@ -3690,6 +3758,9 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         : {}),
       ...(!keywordServiceAbnormal && entry.securityBlocked === true
         ? {securityBlocked: true}
+        : {}),
+      ...(!keywordServiceAbnormal && entry.platformSafetyBlocked === true
+        ? {platformSafetyBlocked: true}
         : {}),
       ...(!keywordServiceAbnormal && entry.requiresManualAction === true
         ? {requiresManualAction: true}
@@ -3705,6 +3776,14 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         : {}),
       ...(text(entry.cooldownHomeUrl, 2000)
         ? {cooldownHomeUrl: text(entry.cooldownHomeUrl, 2000)}
+        : {}),
+      ...(!keywordServiceAbnormal &&
+      entry.securityEvidence?.confirmed === true
+        ? {
+            securityEvidence: sanitizeCloudStructuredObject(
+              entry.securityEvidence,
+            ),
+          }
         : {}),
     };
     const checkpoint = {
@@ -3720,6 +3799,9 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       ...(!keywordServiceAbnormal && entry.securityBlocked === true
         ? {securityBlocked: true}
         : {}),
+      ...(!keywordServiceAbnormal && entry.platformSafetyBlocked === true
+        ? {platformSafetyBlocked: true}
+        : {}),
       ...(!keywordServiceAbnormal && entry.requiresManualAction === true
         ? {requiresManualAction: true}
         : {}),
@@ -3734,6 +3816,14 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         : {}),
       ...(text(entry.cooldownHomeUrl, 2000)
         ? {cooldownHomeUrl: text(entry.cooldownHomeUrl, 2000)}
+        : {}),
+      ...(!keywordServiceAbnormal &&
+      entry.securityEvidence?.confirmed === true
+        ? {
+            securityEvidence: sanitizeCloudStructuredObject(
+              entry.securityEvidence,
+            ),
+          }
         : {}),
       finishedAt,
     };
@@ -3872,7 +3962,6 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     ]);
   }
 
-  const childStatus = text(snapshot.status, 80);
   const childErrorCode = text(
     snapshot?.error?.code || snapshot?.errorCode || snapshot?.error_code,
     100,
@@ -3887,10 +3976,15 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       'failed',
       'completed_with_failures',
     ].includes(childStatus);
+  const unexpectedChildCancellation =
+    childStatus === 'canceled' && !explicitUserCancellation;
   const baseUnresolvedStatus = childServiceAbnormalNeedsRetry
     ? 'retryable'
     : childStatus === 'canceled'
-      ? 'canceled'
+      ? projectCanceledChildItemStatus({
+          elasticPool,
+          explicitUserCancellation,
+        })
       : childStatus === 'skipped'
         ? 'skipped'
         : [
@@ -3907,12 +4001,14 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(baseUnresolvedStatus);
     const rawChildError = snapshot.error;
     const childError = {
-      ...(rawChildError && typeof rawChildError === 'object'
-        ? sanitizeCloudStructuredObject(rawChildError)
-        : text(rawChildError, 1000)
-          ? {message: text(rawChildError, 1000)}
-          : {}),
-      ...(text(
+      ...(unexpectedChildCancellation
+        ? unexpectedTaskCancellationError(snapshot)
+        : rawChildError && typeof rawChildError === 'object'
+          ? sanitizeCloudStructuredObject(rawChildError)
+          : text(rawChildError, 1000)
+            ? {message: text(rawChildError, 1000)}
+            : {}),
+      ...(!unexpectedChildCancellation && text(
         snapshot?.error?.code || snapshot?.errorCode || snapshot?.error_code,
         100,
       )
@@ -4041,6 +4137,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
             'code', 'missing_keyword_checkpoint',
             'message', '子任务已停止，但未收到该关键词的完成检查点'
           )
+          WHEN $8::boolean THEN $9::jsonb
           ELSE error
         END,
         finished_at = CASE
@@ -4067,6 +4164,8 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       task.id,
       agent.id,
       projectedItemIds,
+      unexpectedChildCancellation,
+      JSON.stringify(childError),
     ]);
     await tx.execute(`
       UPDATE capture_task_item_attempts attempt
@@ -4301,6 +4400,18 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
       -- browser task keeps the same clientTaskId for audit correlation only.
       -- Late source snapshots must never overwrite the aggregate parent.
       AND capture_tasks.metadata->>'promotedRetryParent' IS DISTINCT FROM 'true'
+      -- The elastic scheduler revokes the old lease before requeueing a stale
+      -- work item. A final snapshot from that same runner incarnation (often a
+      -- local stale-ledger "canceled" record) no longer owns the task and must
+      -- not turn the requeued item into a terminal cancellation.
+      AND NOT (
+        EXCLUDED.attempt_number = capture_tasks.attempt_number
+        AND capture_tasks.status = 'failed'
+        AND UPPER(COALESCE(capture_tasks.error->>'code', '')) IN (
+          'ELASTIC_AGENT_OFFLINE_TIMEOUT',
+          'ELASTIC_TASK_HEARTBEAT_TIMEOUT'
+        )
+      )
       -- attempt_number is a monotonic slot, while client_attempt_id identifies
       -- the concrete runner incarnation occupying it. Once a non-empty ID is
       -- recorded, a different non-empty ID may not overwrite that slot's task

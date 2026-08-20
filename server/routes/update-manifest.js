@@ -3,12 +3,44 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.84',
+  latestVersion: '0.3.85',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-19',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.84-20260819.zip',
+  releaseDate: '2026-08-20',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.85-20260820.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.85',
+      releaseDate: '2026-08-20',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '主贴情感不再被评论区带偏',
+              desc: '内容分诊只依据主贴标题、正文、标签和媒体文字判断主贴情感；评论区风险继续独立研判，不再把中性或正向主贴误判为负面。',
+            },
+            {
+              title: '异常取消的关键词自动接力',
+              desc: '仅用户主动取消会终止任务；Agent 异常、心跳超时或迟到状态不会再吞掉未完成关键词，空闲 Agent 会自动重新领取。',
+            },
+            {
+              title: '小红书安全验证精确记录',
+              desc: '精确识别中文安全限制、英文账号扫码和英文请求频繁页面，并保留类型与语言证据，普通内容文案不再误计为安全验证。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '批量 AI 支持云端与本机 Agent 路由',
+              desc: '批量相关性与内容研判可按后台策略使用云模型或本机 Antigravity Agent，并在本机不可用时按配置自动回退。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.84',
       releaseDate: '2026-08-19',

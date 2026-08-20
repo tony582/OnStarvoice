@@ -11,6 +11,17 @@ import {
   COMMENT_RISK_ATTENTION_SETTING,
   normalizeCommentRiskAttentionSetting,
 } from '../services/comment-risk-attention.js';
+import {
+  createLlmRelayAgentToken,
+  hashLlmRelayAgentToken,
+  LLM_RELAY_AGENT_ONLINE_MS,
+  requestLlmRelayAgentCompletion,
+} from '../services/llm-relay-jobs.js';
+import {
+  getLlmRelayConfig,
+  LLM_RELAY_SETTING_KEYS,
+  normalizeLlmRelaySettings,
+} from '../services/llm-relay.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
@@ -673,11 +684,15 @@ router.get('/settings', async (req, res, next) => {
     const aiFailoverStatus = await getAiFailoverStatus(tenantId);
     const masked = { ...settings };
     if (masked.llm_api_key) masked.llm_api_key = masked.llm_api_key.slice(0, 8) + '***';
+    if (masked.relevance_prefilter_llm_api_key) {
+      masked.relevance_prefilter_llm_api_key =
+        masked.relevance_prefilter_llm_api_key.slice(0, 8) + '***';
+    }
     if (masked.smtp_pass) masked.smtp_pass = '***';
     return res.json({
       ok: true,
       settings: masked,
-      raw: settings,
+      raw: masked,
       tenantId,
       aiFailoverStatus,
     });
@@ -686,11 +701,189 @@ router.get('/settings', async (req, res, next) => {
   }
 });
 
+router.get('/llm-relay-agents', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || await getDefaultTenantId();
+    const agents = await queryAll(`
+      SELECT
+        id,
+        name,
+        last_seen_at,
+        revoked_at,
+        created_at,
+        updated_at,
+        (
+          revoked_at IS NULL
+          AND last_seen_at >= now() - ($2::int * interval '1 millisecond')
+        ) AS online
+      FROM llm_relay_agent_tokens
+      WHERE tenant_id = $1
+      ORDER BY created_at DESC
+      LIMIT 20
+    `, [tenantId, LLM_RELAY_AGENT_ONLINE_MS]);
+    return res.json({ok: true, agents, tenantId});
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/llm-relay-agents/rotate', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
+    const name = String(req.body?.name || '本机 Antigravity').trim().slice(0, 100);
+    if (!name) {
+      return res.status(400).json({ok: false, error: 'invalid_agent_name', message: '本机 AI Agent 名称不能为空'});
+    }
+    const token = createLlmRelayAgentToken();
+    const agent = await withTransaction(async tx => {
+      await tx.execute(`
+        UPDATE llm_relay_agent_tokens
+        SET revoked_at = now(), updated_at = now()
+        WHERE tenant_id = $1 AND revoked_at IS NULL
+      `, [tenantId]);
+      await tx.execute(`
+        UPDATE llm_relay_jobs
+        SET status = 'failed',
+            error_code = 'LLM_RELAY_AGENT_TOKEN_ROTATED',
+            error_message = '本机 AI Agent 令牌已轮换',
+            system_prompt = '',
+            user_message = '',
+            lease_token_hash = '',
+            lease_expires_at = NULL,
+            completed_at = now(),
+            updated_at = now()
+        WHERE tenant_id = $1 AND status IN ('queued', 'leased')
+      `, [tenantId]);
+      const created = await tx.queryOne(`
+        INSERT INTO llm_relay_agent_tokens (tenant_id, name, token_hash)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, created_at
+      `, [tenantId, name, hashLlmRelayAgentToken(token)]);
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES (
+          $1, 'user', $2, $2::uuid,
+          'ai.relay_agent_token_rotated', 'llm_relay_agent', $3, $4::jsonb
+        )
+      `, [tenantId, String(req.user.id), String(created.id), JSON.stringify({name})]);
+      return created;
+    });
+    return res.json({
+      ok: true,
+      agent,
+      token,
+      message: '令牌只显示这一次，请立即复制到本机 Agent。',
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/llm-relay-agents/test', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body?.tenantId || await getDefaultTenantId();
+    const relay = await getLlmRelayConfig(tenantId);
+    const startedAt = Date.now();
+    try {
+      const result = await requestLlmRelayAgentCompletion({
+        tenantId,
+        model: relay.model,
+        systemPrompt: 'You are a connectivity probe. Return only the JSON object requested by the user.',
+        userMessage: 'Return exactly {"ok":true,"source":"antigravity"}.',
+        timeoutMs: 15_000,
+        requestOptions: {kind: 'relay_healthcheck', maxTokens: 256, timeoutMs: 15_000},
+      });
+      if (result?.ok !== true || result?.source !== 'antigravity') {
+        return res.status(502).json({
+          ok: false,
+          error: 'llm_relay_probe_invalid',
+          message: '本机 AI 已响应，但探针结果不符合预期',
+        });
+      }
+      const latencyMs = Date.now() - startedAt;
+      await execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES (
+          $1, 'user', $2, $2::uuid,
+          'ai.relay_agent_tested', 'tenant', $1::uuid::text, $3::jsonb
+        )
+      `, [tenantId, String(req.user.id), JSON.stringify({model: relay.model, latencyMs})]);
+      return res.json({ok: true, model: relay.model, latencyMs});
+    } catch (error) {
+      const status = Number(error?.status);
+      return res.status(Number.isInteger(status) && status >= 400 && status <= 599 ? status : 503).json({
+        ok: false,
+        error: error?.code || 'llm_relay_probe_failed',
+        message: error?.message || '本机 AI 连通测试失败',
+      });
+    }
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.delete('/llm-relay-agents/:id', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || await getDefaultTenantId();
+    const agentId = String(req.params.id || '').trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(agentId)) {
+      return res.status(400).json({ok: false, error: 'invalid_agent_id', message: '本机 AI Agent 标识不合法'});
+    }
+    const revoked = await withTransaction(async tx => {
+      const row = await tx.queryOne(`
+        UPDATE llm_relay_agent_tokens
+        SET revoked_at = COALESCE(revoked_at, now()), updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING id, name, revoked_at
+      `, [agentId, tenantId]);
+      if (!row) return null;
+      await tx.execute(`
+        UPDATE llm_relay_jobs
+        SET status = 'failed',
+            error_code = 'LLM_RELAY_AGENT_REVOKED',
+            error_message = '本机 AI Agent 已撤销',
+            system_prompt = '',
+            user_message = '',
+            lease_token_hash = '',
+            lease_expires_at = NULL,
+            completed_at = now(),
+            updated_at = now()
+        WHERE tenant_id = $1
+          AND status IN ('queued', 'leased')
+          AND (agent_token_id = $2 OR agent_token_id IS NULL)
+      `, [tenantId, agentId]);
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES (
+          $1, 'user', $2, $2::uuid,
+          'ai.relay_agent_token_revoked', 'llm_relay_agent', $3, $4::jsonb
+        )
+      `, [tenantId, String(req.user.id), agentId, JSON.stringify({name: row.name})]);
+      return row;
+    });
+    if (!revoked) {
+      return res.status(404).json({ok: false, error: 'agent_not_found', message: '本机 AI Agent 不存在'});
+    }
+    return res.json({ok: true, agent: revoked});
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.put('/settings', async (req, res, next) => {
   try {
     const tenantId = req.query.tenantId || req.headers['x-tenant-id'] || req.body.tenantId || await getDefaultTenantId();
     const { tenantId: _tenantId, ...settings } = req.body || {};
     if (settings.smtp_pass === '***') delete settings.smtp_pass;
+    if (String(settings.relevance_prefilter_llm_api_key || '').endsWith('***')) {
+      delete settings.relevance_prefilter_llm_api_key;
+    }
     if (Object.prototype.hasOwnProperty.call(settings, COMMENT_RISK_ATTENTION_SETTING)) {
       const value = normalizeCommentRiskAttentionSetting(settings[COMMENT_RISK_ATTENTION_SETTING]);
       if (value === null) {
@@ -704,6 +897,17 @@ router.put('/settings', async (req, res, next) => {
     }
     const failoverKeys = Object.keys(settings).filter(key =>
       key.startsWith('llm_failover_'));
+    const relaySettingKeys = new Set(Object.values(LLM_RELAY_SETTING_KEYS));
+    const relayKeys = Object.keys(settings).filter(key => relaySettingKeys.has(key));
+    const unknownRelayKeys = Object.keys(settings).filter(key =>
+      key.startsWith('llm_relay_') && !relaySettingKeys.has(key));
+    if (unknownRelayKeys.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_llm_relay_setting',
+        message: '包含未知的本机 AI 设置',
+      });
+    }
     if (failoverKeys.length > 0) {
       const current = await getAllSettings(tenantId);
       const merged = {...current, ...settings};
@@ -721,7 +925,18 @@ router.put('/settings', async (req, res, next) => {
         });
       }
     }
-    if (failoverKeys.length > 0) {
+    if (relayKeys.length > 0) {
+      const current = await getAllSettings(tenantId);
+      const relay = normalizeLlmRelaySettings({...current, ...settings});
+      if (relay.validationError) {
+        return res.status(400).json({
+          ok: false,
+          error: 'invalid_llm_relay_config',
+          message: relay.validationError,
+        });
+      }
+    }
+    if (failoverKeys.length > 0 || relayKeys.length > 0) {
       const safeValues = Object.fromEntries(
         failoverKeys.map(key => [key, String(settings[key] ?? '')]),
       );
@@ -735,19 +950,38 @@ router.put('/settings', async (req, res, next) => {
             [tenantId, key, String(value ?? '')],
           );
         }
-        await tx.execute(
-          `INSERT INTO audit_logs (
-             tenant_id, actor_type, actor_id, actor_user_id,
-             action, target_type, target_id, metadata
-           ) VALUES (
-             $1, 'user', $2, $2::uuid,
-             'ai.failover_settings_updated', 'tenant', $1::uuid::text, $3::jsonb
-           )`,
-          [tenantId, String(req.user.id), JSON.stringify({
-            keys: failoverKeys,
-            values: safeValues,
-          })],
-        );
+        if (failoverKeys.length > 0) {
+          await tx.execute(
+            `INSERT INTO audit_logs (
+               tenant_id, actor_type, actor_id, actor_user_id,
+               action, target_type, target_id, metadata
+             ) VALUES (
+               $1, 'user', $2, $2::uuid,
+               'ai.failover_settings_updated', 'tenant', $1::uuid::text, $3::jsonb
+             )`,
+            [tenantId, String(req.user.id), JSON.stringify({
+              keys: failoverKeys,
+              values: safeValues,
+            })],
+          );
+        }
+        if (relayKeys.length > 0) {
+          await tx.execute(
+            `INSERT INTO audit_logs (
+               tenant_id, actor_type, actor_id, actor_user_id,
+               action, target_type, target_id, metadata
+             ) VALUES (
+               $1, 'user', $2, $2::uuid,
+               'ai.relay_settings_updated', 'tenant', $1::uuid::text, $3::jsonb
+             )`,
+            [tenantId, String(req.user.id), JSON.stringify({
+              keys: relayKeys,
+              values: Object.fromEntries(
+                relayKeys.map(key => [key, String(settings[key] ?? '')]),
+              ),
+            })],
+          );
+        }
       });
     } else {
       await setSettings(settings, tenantId);

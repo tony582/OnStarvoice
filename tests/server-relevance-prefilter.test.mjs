@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   PREFILTER_DEFAULT_MODEL_TIMEOUT_MS,
+  PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
   PREFILTER_MAX_LIST_BATCH,
   PREFILTER_MAX_TENANT_SKIP_MATCH,
   PREFILTER_MIN_SKIP_THRESHOLD,
@@ -19,6 +20,10 @@ import {
   resolvePrefilterPolicyValues,
   validatePrefilterRequest,
 } from '../server/services/relevance-prefilter.js';
+import {
+  buildOpenAICompatibleRequestBody,
+  resolvePurposeLLMConfigValues,
+} from '../server/services/ai-labeler.js';
 import { resolveMonitoringIntent } from '../server/services/monitoring-intent.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -75,7 +80,8 @@ test('list request validation is bounded, normalized and conservative-only for r
 
 test('invalid batch shapes are rejected before any model call', () => {
   assert.equal(PREFILTER_MAX_LIST_BATCH, 40);
-  assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 25000);
+  assert.equal(PREFILTER_DEFAULT_MODEL_TIMEOUT_MS, 20000);
+  assert.equal(PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS, 5000);
   assert.equal(validatePrefilterRequest(validBody({ items: [] })).error, 'ITEMS_REQUIRED');
   assert.equal(
     validatePrefilterRequest(validBody({
@@ -93,7 +99,7 @@ test('invalid batch shapes are rejected before any model call', () => {
   assert.equal(validatePrefilterRequest(validBody({ promptVersion: 'prefilter-list-v0' })).error, 'PROMPT_VERSION_CONFLICT');
 });
 
-test('first release sends DeepSeek only minimal list text', () => {
+test('prefilter sends every configured provider only minimal list text', () => {
   const validation = validatePrefilterRequest(validBody({
     authCode: 'must-not-enter-prompt',
     items: [{
@@ -221,6 +227,62 @@ test('idempotency body hash ignores request ids but detects logical content chan
     prefilterCacheKey(first, first.items[0], 'deepseek-chat'),
     prefilterCacheKey(first, first.items[0], 'deepseek-reasoner'),
   );
+  assert.notEqual(
+    prefilterCacheKey(first, first.items[0], 'shared-model', 'deepseek'),
+    prefilterCacheKey(first, first.items[0], 'shared-model', 'qianwen'),
+  );
+});
+
+test('routine DeepSeek and Qwen requests explicitly disable thinking', () => {
+  const shared = {
+    model: 'model-a',
+    systemPrompt: 'Return JSON.',
+    userMessage: '{}',
+    maxTokens: 2048,
+    thinking: false,
+  };
+  const deepseek = buildOpenAICompatibleRequestBody({
+    ...shared,
+    provider: 'deepseek',
+  });
+  assert.deepEqual(deepseek.thinking, {type: 'disabled'});
+  assert.equal(Object.hasOwn(deepseek, 'enable_thinking'), false);
+
+  const qwen = buildOpenAICompatibleRequestBody({
+    ...shared,
+    provider: 'qwen',
+  });
+  assert.equal(qwen.enable_thinking, false);
+  assert.equal(Object.hasOwn(qwen, 'thinking'), false);
+  assert.deepEqual(qwen.response_format, {type: 'json_object'});
+});
+
+test('purpose route never reuses a credential across providers', () => {
+  const base = {
+    provider: 'deepseek',
+    apiKey: 'deepseek-secret',
+    model: 'deepseek-v4-flash',
+    endpoint: 'https://api.deepseek.com/v1',
+  };
+  const missingQwenKey = resolvePurposeLLMConfigValues(base, {
+    provider: 'qwen',
+    model: 'qwen3.7-flash-2026-07-15',
+  });
+  assert.equal(missingQwenKey.provider, 'qianwen');
+  assert.equal(missingQwenKey.apiKey, '');
+  assert.equal(
+    missingQwenKey.endpoint,
+    'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  );
+
+  const qwen = resolvePurposeLLMConfigValues(base, {
+    provider: 'qianwen',
+    apiKey: 'qwen-secret',
+    model: 'qwen3.7-flash-2026-07-15',
+    endpoint: 'https://example.aliyuncs.com/compatible-mode/v1/',
+  });
+  assert.equal(qwen.apiKey, 'qwen-secret');
+  assert.equal(qwen.endpoint, 'https://example.aliyuncs.com/compatible-mode/v1');
 });
 
 test('backend contract uses tenant auth, shared AI admission and an audit ledger', async () => {
@@ -240,17 +302,19 @@ test('backend contract uses tenant auth, shared AI admission and an audit ledger
   assert.match(migration, /UNIQUE \(tenant_id, idempotency_key\)/);
   assert.match(migration, /server_model_status IN \('ok', 'invalid_input', 'model_error', 'timeout'\)/);
   assert.match(migration, /execution_disposition IN \('collect_full', 'skip_full_capture', 'request_detail'\)/);
-  assert.match(service, /callDeepSeekWithPrompt/);
+  assert.match(service, /callRelevancePrefilterWithPrompt/);
   assert.doesNotMatch(service, /acquireTenantSlot|tenantSlotStates/u);
-  assert.match(service, /Math\.max\(3000, pendingItems\.length \* 600\)/u);
+  assert.match(service, /Math\.max\(1800, pendingItems\.length \* 320\)/u);
   assert.match(service, /finishReason/u);
-  assert.match(service, /retryCount/u);
+  assert.match(service, /thinkingEnabled: false/u);
+  assert.match(service, /PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS/u);
   assert.match(service, /relevance_prefilter_daily_item_limit/);
-  assert.match(service, /response_body = \$4::jsonb/);
+  assert.match(service, /response_body = \$5::jsonb/);
   assert.match(route, /requireAuthCodeFirst, requireTenantWriter/);
   assert.match(route, /failOpen: true/);
-  assert.match(aiLabeler, /config\.provider !== 'deepseek'/);
-  assert.match(aiLabeler, /租户后台尚未配置 DeepSeek API Key/);
+  assert.match(aiLabeler, /getRelevancePrefilterLLMConfig/u);
+  assert.match(aiLabeler, /PREFILTER_LLM_API_KEY_MISSING/u);
+  assert.match(aiLabeler, /enable_thinking = false/u);
   assert.match(aiLabeler, /LLM_JSON_PARSE_FAILED/u);
   assert.match(aiLabeler, /finish_reason/u);
   assert.match(aiLabeler, /runWithTenantAiAdmission/u);

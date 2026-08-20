@@ -142,12 +142,12 @@ test('fallback titles cannot be skipped even when model is overconfident', async
   assert.equal(result.decisions[0].shouldSkip, false);
 });
 
-test('records use small DeepSeek batches and the bounded response deadline', async () => {
-  assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 5);
-  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 90000);
+test('records use sequential micro-batches and the bounded response deadline', async () => {
+  assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 8);
+  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 30000);
   assert.match(
     apiSource,
-    /Math\.min\(120000, Number\(options\?\.timeout\) \|\| 90000\)/u,
+    /Math\.min\(120000, Number\(options\?\.timeout\) \|\| 30000\)/u,
     'API layer must not clamp the prefilter back below its response deadline',
   );
   const records = Array.from({length: 41}, (_, index) => keywordRecord(index + 1));
@@ -172,10 +172,10 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
       };
     },
   });
-  assert.equal(calls.length, 9);
+  assert.equal(calls.length, 6);
   assert.deepEqual(
     calls.map(({request}) => request.items.length).sort((a, b) => b - a),
-    [5, 5, 5, 5, 5, 5, 5, 5, 1],
+    [8, 8, 8, 8, 8, 1],
   );
   assert.equal(calls.every(({request}) => request.mode === 'conservative'), true);
   assert.equal(calls.every(({request}) => request.skipThreshold === 0.97), true);
@@ -183,55 +183,42 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
     calls.every(({request}) => request.idempotencyKey.includes(':conservative:0.9700:')),
     true,
   );
-  assert.equal(calls.every(({options}) => options.timeout === 90000), true);
-  assert.equal(result.skippedRecordIds.length, 9);
+  assert.equal(calls.every(({options}) => options.timeout === 30000), true);
+  assert.equal(result.skippedRecordIds.length, 6);
   assert.equal(result.failedOpenCount, 0);
 });
 
-test('a whole timed-out batch is split and retried once before failing open', async () => {
+test('a whole timed-out batch fails open without split retries', async () => {
   const records = Array.from({length: 5}, (_, index) => keywordRecord(index + 1));
   const calls = [];
   const result = await evaluateRelevancePrefilterRecords(records, {
     enabled: true,
     requestBatch: async ({items}) => {
       calls.push(items.map((item) => item.itemId));
-      if (calls.length === 1) {
-        return {
-          ok: true,
-          items: items.map((item) => ({
-            itemId: item.itemId,
-            status: 'timeout',
-            modelDecision: null,
-            confidence: null,
-            executionDisposition: 'collect_full',
-            reason: 'MODEL_TIMEOUT',
-          })),
-        };
-      }
       return {
         ok: true,
         items: items.map((item) => ({
           itemId: item.itemId,
-          status: 'ok',
-          modelDecision: 'keep',
-          tenantRelevance: 'relevant',
-          confidence: 1,
+          status: 'timeout',
+          modelDecision: null,
+          confidence: null,
           executionDisposition: 'collect_full',
+          reason: 'MODEL_TIMEOUT',
         })),
       };
     },
   });
 
-  assert.deepEqual(calls.map((items) => items.length), [5, 3, 2]);
-  assert.equal(result.retryCount, 2);
-  assert.equal(result.retriedItemCount, 5);
-  assert.equal(result.timeoutCount, 0);
-  assert.equal(result.evaluatedCount, 5);
-  assert.equal(result.failedOpenCount, 0);
+  assert.deepEqual(calls.map((items) => items.length), [5]);
+  assert.equal(result.retryCount, 0);
+  assert.equal(result.retriedItemCount, 0);
+  assert.equal(result.timeoutCount, 5);
+  assert.equal(result.evaluatedCount, 0);
+  assert.equal(result.failedOpenCount, 5);
 });
 
-test('split retries stop after one layer and expose the remaining timeout count', async () => {
-  const records = Array.from({length: 5}, (_, index) => keywordRecord(index + 1));
+test('multiple timed-out micro-batches each make one request only', async () => {
+  const records = Array.from({length: 17}, (_, index) => keywordRecord(index + 1));
   const calls = [];
   const result = await evaluateRelevancePrefilterRecords(records, {
     enabled: true,
@@ -251,12 +238,12 @@ test('split retries stop after one layer and expose the remaining timeout count'
     },
   });
 
-  assert.deepEqual(calls, [5, 3, 2]);
-  assert.equal(result.retryCount, 2);
-  assert.equal(result.retriedItemCount, 5);
-  assert.equal(result.timeoutCount, 5);
+  assert.deepEqual(calls, [8, 8, 1]);
+  assert.equal(result.retryCount, 0);
+  assert.equal(result.retriedItemCount, 0);
+  assert.equal(result.timeoutCount, 17);
   assert.equal(result.evaluatedCount, 0);
-  assert.equal(result.failedOpenCount, 5);
+  assert.equal(result.failedOpenCount, 17);
   assert.deepEqual(result.skippedRecordIds, []);
 });
 
@@ -331,8 +318,8 @@ test('prefilter idempotency scoping is stable for retries and bounded for the AP
   );
 });
 
-test('parallel DeepSeek batches stay within the server tenant concurrency', async () => {
-  assert.equal(RELEVANCE_PREFILTER_MAX_CONCURRENCY, 2);
+test('each Agent submits only one AI micro-batch at a time', async () => {
+  assert.equal(RELEVANCE_PREFILTER_MAX_CONCURRENCY, 1);
   const records = Array.from({length: 70}, (_, index) => keywordRecord(index + 1));
   let active = 0;
   let maxActive = 0;
@@ -356,7 +343,7 @@ test('parallel DeepSeek batches stay within the server tenant concurrency', asyn
       };
     },
   });
-  assert.equal(maxActive, 2);
+  assert.equal(maxActive, 1);
   assert.equal(result.evaluatedCount, 70);
   assert.equal(result.failedOpenCount, 0);
 });

@@ -4053,6 +4053,20 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
     const nextRequest = {
       ...request,
       status: 'canceled',
+      error: {
+        code: 'USER_CANCELED',
+        reason: 'user_canceled',
+        category: 'user_canceled',
+        message,
+        retryable: false,
+      },
+      metadata: {
+        ...(request.metadata && typeof request.metadata === 'object'
+          ? request.metadata
+          : {}),
+        cancelSource: 'user',
+        cancelReason: 'user_canceled',
+      },
       recoveryPendingLaunch: false,
       recoveryWaitUntil: '',
       wakeGraceUntil: '',
@@ -4072,7 +4086,12 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
-      event: {type: 'canceled', message, at: now},
+      event: {
+        type: 'canceled',
+        message,
+        at: now,
+        metadata: {cancelSource: 'user', reason: 'user_canceled'},
+      },
     });
     return nextRequest;
   });
