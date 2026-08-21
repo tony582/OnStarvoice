@@ -1992,6 +1992,48 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
   );
 });
 
+test("remote sequential search passes force verified filters and disable hidden retries", () => {
+  const sequential = normalizeRemoteTaskInput({
+    executionMode: "one_time",
+    platform: "douyin",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "video"],
+  });
+  assert.deepEqual(sequential.planSnapshot.searchPasses, ["all", "video"]);
+  assert.equal(sequential.planSnapshot.searchFilters.contentType, "all");
+  assert.equal(
+    sequential.planSnapshot.recoveryPolicy.disableAutomaticSearchRetry,
+    true,
+  );
+  assert.equal(sequential.planSnapshot.recoveryPolicy.requireVerifiedFilters, true);
+
+  const xhs = normalizeRemoteTaskInput({
+    executionMode: "unattended_plan",
+    platform: "xiaohongshu",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "image"],
+  });
+  assert.equal(Object.hasOwn(xhs.planSnapshot, "searchPasses"), false);
+  assert.equal(
+    Object.hasOwn(xhs.planSnapshot.recoveryPolicy, "disableAutomaticSearchRetry"),
+    false,
+  );
+
+  const constrained = normalizeRemoteTaskInput({
+    executionMode: "one_time",
+    platform: "douyin",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "image"],
+    searchFilters: {
+      publishTime: ["day", "week"],
+      sort: ["latest", "likes"],
+    },
+  });
+  assert.equal(constrained.planSnapshot.searchFilters.publishTime, "day");
+  assert.equal(constrained.planSnapshot.searchFilters.sort, "latest");
+  assert.deepEqual(constrained.planSnapshot.searchPasses, ["all", "image"]);
+});
+
 test("remote keyword post limits are optional, normalized, and fail safely", () => {
   const explicit = normalizeRemoteTaskInput({
     platform: "douyin",

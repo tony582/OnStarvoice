@@ -504,6 +504,7 @@ test("heartbeat advertises remote task creation and mirrors a sanitized unattend
         publishTime: "week",
         cookie: "must-not-leak-cookie",
       },
+      searchPasses: ["all", "video", "video"],
       captureSettings: {
         autoDetailCaptureAfterListCapture: true,
         autoSyncAfterDetailCapture: true,
@@ -534,6 +535,7 @@ test("heartbeat advertises remote task creation and mirrors a sanitized unattend
   assert.equal(payload.agent.capabilities.remoteUnattendedPlanDelete, true);
   assert.equal(payload.agent.capabilities.remoteTaskEnhancementOptions, true);
   assert.equal(payload.agent.capabilities.remoteTaskKeywordPostLimit, true);
+  assert.equal(payload.agent.capabilities.remoteSequentialSearchPassesV1, true);
   assert.equal(payload.agent.capabilities.negativePostPatrol, true);
   assert.equal(payload.agent.capabilities.remoteTargetedPostCaptureV1, true);
   assert.equal(payload.agent.capabilities.unattendedPlanMirror, true);
@@ -553,6 +555,7 @@ test("heartbeat advertises remote task creation and mirrors a sanitized unattend
     publishTime: "week",
     cookie: "[REDACTED]",
   });
+  assert.deepEqual(plain(payload.unattendedPlan.searchPasses), ["all", "video"]);
   assert.deepEqual(plain(payload.unattendedPlan.captureSettings), {
     autoDetailCaptureAfterListCapture: true,
     autoSyncAfterDetailCapture: true,

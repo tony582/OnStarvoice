@@ -381,6 +381,16 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
       message: '目标节点版本尚不支持远程任务增强选项',
     };
   }
+  if (
+    Array.isArray(planSnapshot.searchPasses) &&
+    planSnapshot.searchPasses.length > 1 &&
+    capabilities.remoteSequentialSearchPassesV1 !== true
+  ) {
+    return {
+      code: 'agent_sequential_search_capability_missing',
+      message: '目标节点版本尚不支持同一关键词串行补充巡检，请先更新扩展',
+    };
+  }
   const allowedPlatforms = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
     : [];

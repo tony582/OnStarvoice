@@ -2619,6 +2619,29 @@ async function refreshOrchestrationParentTask(tx, {
   if (!parent) return null;
   if (['canceled', 'superseded'].includes(parent.status)) return parent;
 
+  // A multi-pass patrol is intentionally single-shot. Once a browser actually
+  // started searching, any retryable result becomes an operator-visible stop
+  // instead of silently repeating the search on this or another device.
+  await tx.execute(`
+    UPDATE capture_task_items
+    SET status = 'needs_action',
+      metadata = metadata || jsonb_build_object(
+        'automaticRetrySuppressed', true,
+        'requiresManualAction', true
+      ),
+      error = error || jsonb_build_object(
+        'automaticRetrySuppressed', true,
+        'requiresManualAction', true
+      ),
+      finished_at = COALESCE(finished_at, now()),
+      updated_at = now()
+    WHERE task_id = $1
+      AND tenant_id = $2
+      AND status = 'retryable'
+      AND started_at IS NOT NULL
+      AND COALESCE(metadata->>'disableAutomaticSearchRetry', 'false') = 'true'
+  `, [parentTaskId, tenantId]);
+
   const items = await tx.queryAll(`
     SELECT status
     FROM capture_task_items
@@ -4669,6 +4692,8 @@ async function dispatchNextElasticWorkItem(tx, {
     freshCapabilities.remoteTaskCreate === true &&
     freshCapabilities.remoteTargetedPostCaptureV1 === true &&
     freshCapabilities.watchedContentPatrol === true;
+  const canClaimSequentialSearch =
+    freshCapabilities.remoteSequentialSearchPassesV1 === true;
   if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
     return null;
   }
@@ -4777,6 +4802,10 @@ async function dispatchNextElasticWorkItem(tx, {
         OR (item.item_type = 'watched_content' AND $8::boolean)
       )
       AND item.status IN ('pending', 'retryable')
+      AND (
+        COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'), 0) <= 1
+        OR $10::boolean
+      )
       AND COALESCE(
         CASE
           WHEN (item.metadata->>'elasticAttemptBudgetUsed') ~ '^[0-9]+$'
@@ -4837,11 +4866,13 @@ async function dispatchNextElasticWorkItem(tx, {
     canClaimNegativePost,
     canClaimWatchedContent,
     ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS,
+    canClaimSequentialSearch,
   ]);
   if (!candidate) return null;
 
   const parentMetadata = safeJson(candidate.parent_metadata);
   const planSnapshot = safeJson(parentMetadata.planSnapshot);
+  const itemMetadata = safeJson(candidate.item_metadata);
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
   const targetedContent = negativePost || watchedContent;
@@ -4882,7 +4913,6 @@ async function dispatchNextElasticWorkItem(tx, {
   let childMessage = '已从云端领取 1 个关键词，等待设备确认';
   let commandPayload = {};
   if (targetedContent) {
-    const itemMetadata = safeJson(candidate.item_metadata);
     const sourceRecord = safeJson(itemMetadata.sourceRecord);
     const captureSettings = safeJson(parentMetadata.captureSettings);
     const target = {
@@ -4948,6 +4978,16 @@ async function dispatchNextElasticWorkItem(tx, {
         roundGapMin: 0,
         platform: candidate.parent_platform,
         keywords: [candidate.keyword],
+        searchFilters: {
+          ...safeJson(planSnapshot.searchFilters),
+        },
+        recoveryPolicy: {
+          ...safeJson(planSnapshot.recoveryPolicy),
+          disableAutomaticSearchRetry:
+            itemMetadata.disableAutomaticSearchRetry === true,
+          requireVerifiedFilters:
+            itemMetadata.requireVerifiedFilters === true,
+        },
       },
     });
     childPlan = childInput.planSnapshot;

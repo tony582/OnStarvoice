@@ -293,26 +293,56 @@ export function appendTicketLifecycleFilter(where, query = {}) {
   return `${where} AND ${currentTicketStatusSql} ${ticketStatus === 'closed' ? '=' : '<>'} 'closed'`;
 }
 
+function escapeLikePattern(value) {
+  return String(value || '').replace(/[\\%_]/g, '\\$&');
+}
+
 function appendKeywordFilter(where, params, keyword) {
   const normalized = String(keyword || '').trim();
   if (!normalized) return { where, matchedTicketSql: `NULL::text` };
-  params.push(`%${normalized}%`);
+  // Treat %, _ and backslash as literal user input. Besides preventing an accidental
+  // "match everything" query, this keeps list totals stable while users type symbols.
+  params.push(`%${escapeLikePattern(normalized)}%`);
   const p = `$${params.length}`;
   return {
     where: `${where} AND (
-    r.title ILIKE ${p}
-    OR r.content ILIKE ${p}
-    OR r.keyword ILIKE ${p}
-    OR r.author_name ILIKE ${p}
-    OR r.author_account_no ILIKE ${p}
-    OR r.author_id ILIKE ${p}
-    OR rt.feishu_table_no ILIKE ${p}
+    r.title ILIKE ${p} ESCAPE '\\'
+    OR r.content ILIKE ${p} ESCAPE '\\'
+    OR r.keyword ILIKE ${p} ESCAPE '\\'
+    OR r.author_name ILIKE ${p} ESCAPE '\\'
+    OR r.author_account_no ILIKE ${p} ESCAPE '\\'
+    OR r.author_id ILIKE ${p} ESCAPE '\\'
+    OR r.external_id ILIKE ${p} ESCAPE '\\'
+    OR r.publish_location ILIKE ${p} ESCAPE '\\'
+    OR r.ai_summary ILIKE ${p} ESCAPE '\\'
+    OR r.category ILIKE ${p} ESCAPE '\\'
+    OR r.intent ILIKE ${p} ESCAPE '\\'
+    OR rt.feishu_table_no ILIKE ${p} ESCAPE '\\'
+    OR rt.owner_name ILIKE ${p} ESCAPE '\\'
+    OR rt.note ILIKE ${p} ESCAPE '\\'
+    OR EXISTS (
+      SELECT 1
+      FROM record_custom_tags rct_search
+      JOIN custom_tags ct_search
+        ON ct_search.tenant_id = rct_search.tenant_id
+        AND ct_search.id = rct_search.tag_id
+      WHERE rct_search.tenant_id = r.tenant_id
+        AND rct_search.record_id = r.id
+        AND ct_search.name ILIKE ${p} ESCAPE '\\'
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM record_notes rn_search
+      WHERE rn_search.tenant_id = r.tenant_id
+        AND rn_search.record_id = r.id
+        AND rn_search.body ILIKE ${p} ESCAPE '\\'
+    )
     OR EXISTS (
       SELECT 1 FROM tickets ts
       WHERE ts.tenant_id = r.tenant_id
         AND ts.source_type = 'content'
         AND ts.source_record_id = r.id
-        AND ts.external_ticket_no ILIKE ${p}
+        AND ts.external_ticket_no ILIKE ${p} ESCAPE '\\'
     )
   )`,
     matchedTicketSql: `(
@@ -321,7 +351,7 @@ function appendKeywordFilter(where, params, keyword) {
       WHERE ts.tenant_id = r.tenant_id
         AND ts.source_type = 'content'
         AND ts.source_record_id = r.id
-        AND ts.external_ticket_no ILIKE ${p}
+        AND ts.external_ticket_no ILIKE ${p} ESCAPE '\\'
       ORDER BY (ts.status <> 'closed') DESC, ts.created_at DESC, ts.id DESC
       LIMIT 1
     )`,

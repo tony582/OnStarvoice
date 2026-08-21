@@ -1072,6 +1072,7 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
       searchScope: request?.searchScope || "",
       distance: request?.distance || "",
       videoDuration: request?.videoDuration || "",
+      verifyDefaults: request?.verifyDefaults === true,
     });
     sendResponse({ ok: true, data: result });
   } catch (error) {
@@ -1171,6 +1172,21 @@ async function applyBatchFilterOption({
   return ok;
 }
 
+function isBatchFilterOptionActive({field, labels, platform} = {}) {
+  if (!labels) {
+    return false;
+  }
+  const panel = findStrategyFilterPanel();
+  if (!panel) {
+    return false;
+  }
+  return findOptionCandidatesInFilterSection(
+    panel,
+    getBatchFilterSectionCandidates(field, platform),
+    labels,
+  ).some((node) => isStrategyControlActive(node));
+}
+
 // 复用「找对标账号」的筛选点击能力(ensureKeywordStrategyFilterPanelOpen + applyStrategyFilterInSection),
 // 给批量采集在采集前按需切「排序 / 范围」。默认值则不改,直接返回。
 async function applyBatchSearchFilters({
@@ -1180,10 +1196,19 @@ async function applyBatchSearchFilters({
   searchScope = "",
   distance = "",
   videoDuration = "",
+  verifyDefaults = false,
 } = {}) {
   const pageType = detectPageType(window.location.href);
   if (pageType !== "search_results") {
-    return { applied: false, reason: "not_search_page" };
+    return {
+      applied: false,
+      complete: false,
+      reason: "not_search_page",
+      requestedCount: 0,
+      appliedCount: 0,
+      failedFields: [],
+      results: [],
+    };
   }
   const platform = /douyin\.com/i.test(window.location.href)
     ? "douyin"
@@ -1229,6 +1254,7 @@ async function applyBatchSearchFilters({
       defaultValue: "all",
       labels: BATCH_DISTANCE_LABELS[distance],
       displayLabel: "位置距离",
+      platforms: ["xiaohongshu"],
     },
     {
       field: "videoDuration",
@@ -1236,29 +1262,74 @@ async function applyBatchSearchFilters({
       defaultValue: "all",
       labels: BATCH_VIDEO_DURATION_LABELS[videoDuration],
       displayLabel: "视频时长",
+      platforms: ["douyin"],
     },
-  ].filter((item) => shouldApplyBatchFilter(item.value, item.defaultValue));
+  ]
+    .filter((item) => !item.platforms || item.platforms.includes(platform))
+    .filter((item) => verifyDefaults
+      ? Boolean(String(item.value || "").trim())
+      : shouldApplyBatchFilter(item.value, item.defaultValue));
   if (filterRequests.length === 0) {
-    return { applied: false, reason: "no_filter" };
+    return {
+      applied: false,
+      complete: true,
+      reason: "no_filter",
+      requestedCount: 0,
+      appliedCount: 0,
+      failedFields: [],
+      results: [],
+    };
   }
   const notes = [];
   const opened = await ensureKeywordStrategyFilterPanelOpen(notes);
   if (!opened) {
-    return { applied: false, reason: "panel_not_opened", notes };
+    return {
+      applied: false,
+      complete: false,
+      reason: "panel_not_opened",
+      requestedCount: filterRequests.length,
+      appliedCount: 0,
+      failedFields: filterRequests.map((item) => item.field),
+      results: filterRequests.map((item) => ({
+        field: item.field,
+        value: item.value,
+        applied: false,
+      })),
+      notes,
+    };
   }
-  let applied = false;
+  const results = [];
   for (const request of filterRequests) {
-    const ok = await applyBatchFilterOption({
+    const alreadyActive = isBatchFilterOptionActive({
+      ...request,
+      platform,
+    });
+    const ok = alreadyActive || await applyBatchFilterOption({
       ...request,
       notes,
       platform,
     });
-    if (ok) {
-      applied = true;
-    }
+    results.push({
+      field: request.field,
+      value: request.value,
+      applied: ok,
+      changed: ok && !alreadyActive,
+    });
   }
   await closeKeywordStrategyFilterPanel(notes);
-  return { applied, notes };
+  const appliedCount = results.filter((item) => item.applied).length;
+  const failedFields = results
+    .filter((item) => !item.applied)
+    .map((item) => item.field);
+  return {
+    applied: appliedCount > 0,
+    complete: failedFields.length === 0,
+    requestedCount: results.length,
+    appliedCount,
+    failedFields,
+    results,
+    notes,
+  };
 }
 
 async function prepareKeywordStrategyCapture() {

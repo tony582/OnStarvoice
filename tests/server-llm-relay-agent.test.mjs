@@ -61,3 +61,22 @@ test('admin only returns plaintext agent token once and never exposes its hash',
   assert.match(ui, /当前接列表前置预判（每批最多 8 条）及最终相关性与情感判断/);
   assert.match(ui, /测试本机 AI/);
 });
+
+test('AI admin audit writes use distinct typed parameters for actor text and UUID', async () => {
+  const admin = await source('server/routes/admin.js');
+  const aiAuditActions = [
+    'ai.relay_agent_token_rotated',
+    'ai.relay_agent_tested',
+    'ai.relay_agent_token_revoked',
+    'ai.failover_settings_updated',
+    'ai.relay_settings_updated',
+  ];
+
+  for (const action of aiAuditActions) {
+    const actionIndex = admin.indexOf(action);
+    assert.notEqual(actionIndex, -1, `${action} audit write must exist`);
+    const valuesClause = admin.slice(Math.max(0, actionIndex - 180), actionIndex);
+    assert.match(valuesClause, /actor_id, actor_user_id[\s\S]*\$2::text, \$3::uuid/);
+    assert.doesNotMatch(valuesClause, /\$2, \$2::uuid/);
+  }
+});

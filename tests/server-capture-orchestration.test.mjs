@@ -77,6 +77,84 @@ test('elastic distribution is explicit and unknown values stay backward-compatib
   );
 });
 
+test('Douyin unattended elastic plans allow one focused search after comprehensive', () => {
+  const imageSupplement = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['all', 'image'],
+    keywords: ['别克壁纸'],
+    agents: [{id: 'agent-a'}],
+    schedule: {mode: 'daily', startTime: '06:30'},
+  });
+  assert.deepEqual(imageSupplement.taskInput.searchPasses, ['all', 'image']);
+  assert.equal(imageSupplement.taskInput.searchFilters.contentType, 'all');
+  assert.equal(imageSupplement.taskInput.recoveryPolicy.disableAutomaticSearchRetry, true);
+  assert.equal(imageSupplement.taskInput.recoveryPolicy.requireVerifiedFilters, true);
+
+  const videoSupplement = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['all', 'video'],
+    schedule: {mode: 'daily'},
+  });
+  assert.deepEqual(videoSupplement.taskInput.searchPasses, ['all', 'video']);
+
+  const incompatiblePair = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['image', 'video'],
+    searchFilters: {contentType: 'image'},
+    schedule: {mode: 'daily'},
+  });
+  assert.equal(Object.hasOwn(incompatiblePair.taskInput, 'searchPasses'), false);
+  assert.equal(incompatiblePair.taskInput.searchFilters.contentType, 'image');
+
+  for (const input of [
+    {
+      platform: 'xiaohongshu', executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool', searchPasses: ['all', 'image'],
+      schedule: {mode: 'daily'},
+    },
+    {
+      platform: 'douyin', executionMode: 'unattended_plan',
+      distributionMode: 'fixed_batch', searchPasses: ['all', 'image'],
+      schedule: {mode: 'daily'},
+    },
+    {
+      platform: 'douyin', executionMode: 'one_time',
+      distributionMode: 'elastic_pool', searchPasses: ['all', 'image'],
+    },
+  ]) {
+    const normalized = normalizeOrchestrationRequest(input);
+    assert.equal(Object.hasOwn(normalized.taskInput, 'searchPasses'), false);
+  }
+});
+
+test('non-patrol search filters remain single-choice even when an API sends arrays', () => {
+  const normalized = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['all', 'video'],
+    searchFilters: {
+      publishTime: ['day', 'week'],
+      sort: ['latest', 'likes'],
+      searchScope: ['unviewed', 'viewed'],
+      videoDuration: ['under_1m', 'over_5m'],
+    },
+    schedule: {mode: 'daily'},
+  });
+
+  assert.equal(normalized.taskInput.searchFilters.publishTime, 'day');
+  assert.equal(normalized.taskInput.searchFilters.sort, 'latest');
+  assert.equal(normalized.taskInput.searchFilters.searchScope, 'unviewed');
+  assert.equal(normalized.taskInput.searchFilters.videoDuration, 'under_1m');
+  assert.deepEqual(normalized.taskInput.searchPasses, ['all', 'video']);
+});
+
 test('custom-date schedules reject malformed dates and normalize accepted dates', () => {
   assert.throws(
     () => normalizeOrchestrationSchedule({mode: 'daily', maxRounds: 2}),
@@ -416,6 +494,37 @@ test('elastic schedule occurrences materialize pending work without preassigning
   const elastic = scheduler.slice(elasticStart, fixedDispatch);
   assert.match(elastic, /orchestration_schedule_queue_created/u);
   assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
+});
+
+test('sequential patrol stays one keyword item and is executed inside one Agent task', async () => {
+  const [scheduler, route, agent] = await Promise.all([
+    readFile(new URL('../server/services/capture-orchestration-scheduler.js', import.meta.url), 'utf8'),
+    readFile(new URL('../server/routes/capture-cloud.js', import.meta.url), 'utf8'),
+    readFile(new URL('../utils/cloud-task-agent.js', import.meta.url), 'utf8'),
+  ]);
+
+  assert.match(scheduler, /const runItemTotal = templateItems\.length/u);
+  assert.match(scheduler, /sequentialSearch:[\s\S]*passes: searchPasses/u);
+  assert.match(scheduler, /searchPasses,[\s\S]*disableAutomaticSearchRetry: true/u);
+  assert.match(scheduler, /disableAutomaticSearchRetry: true/u);
+  assert.match(scheduler, /requireVerifiedFilters: true/u);
+  assert.match(scheduler, /remoteSequentialSearchPassesV1/u);
+  assert.doesNotMatch(scheduler, /dependsOnItemId/u);
+
+  const claimStart = route.indexOf('async function dispatchNextElasticWorkItem');
+  const claimEnd = route.indexOf('async function dispatchQueuedCommands', claimStart);
+  const claim = route.slice(claimStart, claimEnd);
+  assert.match(claim, /remoteSequentialSearchPassesV1 === true/u);
+  assert.match(claim, /parent\.metadata->'planSnapshot'->'searchPasses'/u);
+  assert.match(claim, /planSnapshot,[\s\S]*maxRounds: 1/u);
+  assert.doesNotMatch(claim, /dependsOnItemId/u);
+
+  const refreshStart = route.indexOf('async function refreshOrchestrationParentTask');
+  const refreshEnd = route.indexOf('async function projectNegativePatrolSnapshot', refreshStart);
+  const refresh = route.slice(refreshStart, refreshEnd);
+  assert.match(refresh, /status = 'needs_action'[\s\S]*status = 'retryable'[\s\S]*disableAutomaticSearchRetry/u);
+  assert.doesNotMatch(refresh, /staged_patrol_predecessor_not_safe/u);
+  assert.match(agent, /remoteSequentialSearchPassesV1: true/u);
 });
 
 test('terminal or attention-only schedule residue never blocks the next occurrence', async () => {

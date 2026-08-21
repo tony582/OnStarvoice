@@ -15073,13 +15073,40 @@ function hasActiveBatchSearchFilters(searchFilters = {}) {
 // 采集前切搜索「排序 / 范围」:转发到 content 的 applyBatchSearchFilters。
 // 普通筛选失败仍由后续结果就绪检查兜底；抖音明确显示“服务出现异常”时
 // 保留结构化的单关键词错误，由批处理跳过本词并继续，而不是误判为账号风控。
-async function applySearchFiltersInTab(tabId, searchFilters = {}) {
+function createSearchFilterApplicationError(result = null) {
+  const failedFields = Array.isArray(result?.failedFields)
+    ? result.failedFields.map((field) => String(field || '').trim()).filter(Boolean)
+    : [];
+  const error = new Error(
+    failedFields.length > 0
+      ? `搜索筛选未完整生效：${failedFields.join('、')}`
+      : '无法确认搜索筛选已完整生效',
+  );
+  error.code = 'SEARCH_FILTER_APPLICATION_FAILED';
+  error.category = 'filter_verification';
+  error.fatal = true;
+  error.stopBatch = true;
+  error.requiresManualAction = true;
+  error.retryable = false;
+  error.filterResult = result;
+  return error;
+}
+
+async function applySearchFiltersInTab(
+  tabId,
+  searchFilters = {},
+  {requireVerifiedFilters = false} = {},
+) {
   try {
     await assertNoDouyinSearchSecurityChallengeInTab(tabId);
     const response = await chrome.runtime.sendMessage({
       type: MESSAGE_TYPE.RELAY_TO_CONTENT,
       tabId: Number(tabId),
-      payload: { action: 'applyBatchSearchFilters', ...searchFilters },
+      payload: {
+        action: 'applyBatchSearchFilters',
+        ...searchFilters,
+        verifyDefaults: requireVerifiedFilters,
+      },
     });
     const contentResponse = response?.data;
     const responseError =
@@ -15099,13 +15126,26 @@ async function applySearchFiltersInTab(tabId, searchFilters = {}) {
       });
     }
     if (responseError) {
+      if (requireVerifiedFilters) {
+        throw createSearchFilterApplicationError(responseError);
+      }
       return null;
     }
-    return contentResponse?.data ?? contentResponse ?? null;
+    const result = contentResponse?.data ?? contentResponse ?? null;
+    if (requireVerifiedFilters && result?.complete !== true) {
+      throw createSearchFilterApplicationError(result);
+    }
+    return result;
   } catch (error) {
     if (
       isDouyinSearchServiceAbnormalError(error) ||
       isDouyinSearchSecurityChallengeError(error)
+    ) {
+      throw error;
+    }
+    if (
+      String(error?.code || '').trim().toUpperCase() ===
+      'SEARCH_FILTER_APPLICATION_FAILED'
     ) {
       throw error;
     }
@@ -15168,6 +15208,8 @@ export async function batchCaptureByKeywords({
   captureParams = {},
   captureTaskId = '',
   searchFilters = null,
+  disableAutomaticSearchRetry = false,
+  requireVerifiedFilters = false,
   afterKeywordCapture = null,
   onKeywordSettled = null,
   waitForegroundTabId = null,
@@ -15501,7 +15543,8 @@ export async function batchCaptureByKeywords({
       // 抖音撞到异常页时,像手动一样重新点一次搜索并把筛选重挂;仍失败则本词判失败跳过,宁缺勿错。
       if (hasActiveBatchSearchFilters(searchFilters)) {
         let filteredResultsReady = false;
-        const maxFilterAttempts = isDouyinPlatform(platform) ? 2 : 1;
+        const maxFilterAttempts =
+          isDouyinPlatform(platform) && !disableAutomaticSearchRetry ? 2 : 1;
         for (
           let filterAttempt = 0;
           filterAttempt < maxFilterAttempts && !filteredResultsReady;
@@ -15546,7 +15589,9 @@ export async function batchCaptureByKeywords({
               message: `正在切换排序筛选「${keyword}」(${i + 1}/${keywords.length})...`,
             });
           }
-          await applySearchFiltersInTab(runnerTabId, searchFilters);
+          await applySearchFiltersInTab(runnerTabId, searchFilters, {
+            requireVerifiedFilters,
+          });
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
           if (isDouyinPlatform(platform)) {
             await waitForDouyinSearchPacingWindow(
@@ -15633,7 +15678,10 @@ export async function batchCaptureByKeywords({
         });
       let captureRunResult = await runKeywordCapture();
       let captureResult = captureRunResult?.captureResult || null;
-      if (isEmptyKeywordCaptureResult(captureResult)) {
+      if (
+        isEmptyKeywordCaptureResult(captureResult) &&
+        !disableAutomaticSearchRetry
+      ) {
         if (onProgress) {
           onProgress({
             current: i + 1,
@@ -15688,7 +15736,9 @@ export async function batchCaptureByKeywords({
         // 抖音上面刚重新点了搜索,已挂的筛选会被清空:配置了筛选就必须重挂再采,
         // 否则采到的是未筛选(可能好几年前)的内容。
         if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
-          await applySearchFiltersInTab(runnerTabId, searchFilters);
+          await applySearchFiltersInTab(runnerTabId, searchFilters, {
+            requireVerifiedFilters,
+          });
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
           await waitForDouyinSearchPacingWindow(
             runnerTabId,

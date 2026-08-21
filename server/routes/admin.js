@@ -764,10 +764,10 @@ router.post('/llm-relay-agents/rotate', async (req, res, next) => {
           tenant_id, actor_type, actor_id, actor_user_id,
           action, target_type, target_id, metadata
         ) VALUES (
-          $1, 'user', $2, $2::uuid,
-          'ai.relay_agent_token_rotated', 'llm_relay_agent', $3, $4::jsonb
+          $1::uuid, 'user', $2::text, $3::uuid,
+          'ai.relay_agent_token_rotated', 'llm_relay_agent', $4::text, $5::jsonb
         )
-      `, [tenantId, String(req.user.id), String(created.id), JSON.stringify({name})]);
+      `, [tenantId, String(req.user.id), req.user.id, String(created.id), JSON.stringify({name})]);
       return created;
     });
     return res.json({
@@ -808,10 +808,10 @@ router.post('/llm-relay-agents/test', async (req, res, next) => {
           tenant_id, actor_type, actor_id, actor_user_id,
           action, target_type, target_id, metadata
         ) VALUES (
-          $1, 'user', $2, $2::uuid,
-          'ai.relay_agent_tested', 'tenant', $1::uuid::text, $3::jsonb
+          $1::uuid, 'user', $2::text, $3::uuid,
+          'ai.relay_agent_tested', 'tenant', $1::uuid::text, $4::jsonb
         )
-      `, [tenantId, String(req.user.id), JSON.stringify({model: relay.model, latencyMs})]);
+      `, [tenantId, String(req.user.id), req.user.id, JSON.stringify({model: relay.model, latencyMs})]);
       return res.json({ok: true, model: relay.model, latencyMs});
     } catch (error) {
       const status = Number(error?.status);
@@ -861,10 +861,10 @@ router.delete('/llm-relay-agents/:id', async (req, res, next) => {
           tenant_id, actor_type, actor_id, actor_user_id,
           action, target_type, target_id, metadata
         ) VALUES (
-          $1, 'user', $2, $2::uuid,
-          'ai.relay_agent_token_revoked', 'llm_relay_agent', $3, $4::jsonb
+          $1::uuid, 'user', $2::text, $3::uuid,
+          'ai.relay_agent_token_revoked', 'llm_relay_agent', $4::text, $5::jsonb
         )
-      `, [tenantId, String(req.user.id), agentId, JSON.stringify({name: row.name})]);
+      `, [tenantId, String(req.user.id), req.user.id, agentId, JSON.stringify({name: row.name})]);
       return row;
     });
     if (!revoked) {
@@ -956,10 +956,10 @@ router.put('/settings', async (req, res, next) => {
                tenant_id, actor_type, actor_id, actor_user_id,
                action, target_type, target_id, metadata
              ) VALUES (
-               $1, 'user', $2, $2::uuid,
-               'ai.failover_settings_updated', 'tenant', $1::uuid::text, $3::jsonb
+               $1::uuid, 'user', $2::text, $3::uuid,
+               'ai.failover_settings_updated', 'tenant', $1::uuid::text, $4::jsonb
              )`,
-            [tenantId, String(req.user.id), JSON.stringify({
+            [tenantId, String(req.user.id), req.user.id, JSON.stringify({
               keys: failoverKeys,
               values: safeValues,
             })],
@@ -971,10 +971,10 @@ router.put('/settings', async (req, res, next) => {
                tenant_id, actor_type, actor_id, actor_user_id,
                action, target_type, target_id, metadata
              ) VALUES (
-               $1, 'user', $2, $2::uuid,
-               'ai.relay_settings_updated', 'tenant', $1::uuid::text, $3::jsonb
+               $1::uuid, 'user', $2::text, $3::uuid,
+               'ai.relay_settings_updated', 'tenant', $1::uuid::text, $4::jsonb
              )`,
-            [tenantId, String(req.user.id), JSON.stringify({
+            [tenantId, String(req.user.id), req.user.id, JSON.stringify({
               keys: relayKeys,
               values: Object.fromEntries(
                 relayKeys.map(key => [key, String(settings[key] ?? '')]),

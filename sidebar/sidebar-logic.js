@@ -2406,6 +2406,41 @@ function getKeywordExecutionCopy(source = {}) {
   };
 }
 
+function normalizeUnattendedSearchPasses(plan = {}) {
+  const allowed = new Set(["all", "image", "video"]);
+  const fallback = allowed.has(String(plan?.searchFilters?.contentType || ""))
+    ? String(plan.searchFilters.contentType)
+    : "all";
+  const requested = [];
+  const seen = new Set();
+  for (const rawValue of Array.isArray(plan?.searchPasses)
+    ? plan.searchPasses
+    : []) {
+    const value = String(rawValue || "").trim().toLowerCase();
+    if (!allowed.has(value) || seen.has(value)) continue;
+    seen.add(value);
+    requested.push(value);
+    if (requested.length >= 3) break;
+  }
+  if (requested.length === 0) return [fallback];
+  if (requested.length === 1) return requested;
+  if (requested.includes("all")) {
+    const supplement = requested.find(
+      (value) => value === "image" || value === "video",
+    );
+    return supplement ? ["all", supplement] : ["all"];
+  }
+  return [requested[0]];
+}
+
+function unattendedSearchPassLabel(value = "") {
+  return {
+    all: "综合巡检",
+    image: "图文巡检",
+    video: "视频巡检",
+  }[String(value || "").trim()] || "巡检";
+}
+
 function buildKeywordRunDisplayPlan(
   plan = keywordPlanState,
   request = activeKeywordRunState,
@@ -13388,6 +13423,15 @@ async function handleBatchKeywordCapture(options = {}) {
         : "manual";
   const releaseElasticItemOnLongRetry =
     runOptions.releaseElasticItemOnLongRetry === true;
+  const disableAutomaticSearchRetry =
+    runOptions.disableAutomaticSearchRetry === true;
+  const requireVerifiedFilters =
+    runOptions.requireVerifiedFilters === true;
+  const sequentialSearchPasses = normalizeUnattendedSearchPasses({
+    searchPasses: runOptions.searchPasses,
+    searchFilters: runOptions.searchFilters,
+  });
+  const sequentialSearchEnabled = sequentialSearchPasses.length > 1;
   // Unattended identity belongs to this invocation, not to the mutable global
   // claim slot.  A delayed callback from a previous runner must never be
   // relabeled with the request/attempt that happens to be active later.
@@ -13741,6 +13785,9 @@ async function handleBatchKeywordCapture(options = {}) {
     captureTaskDisplayMeta = {
       ...captureTaskDisplayMeta,
       searchFilters: {...(searchFilters || {})},
+      ...(sequentialSearchEnabled
+        ? {searchPasses: [...sequentialSearchPasses]}
+        : {}),
       enhancementEnabled: Boolean(settings.autoDetailCaptureAfterListCapture),
       aiRelevancePrefilterEnabled: Boolean(
         settings.enableAiRelevancePrefilter,
@@ -13842,6 +13889,22 @@ async function handleBatchKeywordCapture(options = {}) {
 
     do {
       round += 1;
+      const activeSearchPass = sequentialSearchEnabled
+        ? sequentialSearchPasses[Math.min(round - 1, sequentialSearchPasses.length - 1)]
+        : "";
+      const activeSearchPassLabel = unattendedSearchPassLabel(activeSearchPass);
+      const roundSearchFilters = activeSearchPass
+        ? {...searchFilters, contentType: activeSearchPass}
+        : searchFilters;
+      if (activeSearchPass) {
+        captureTaskDisplayMeta = {
+          ...captureTaskDisplayMeta,
+          searchFilters: {...roundSearchFilters},
+          searchPassCurrent: round,
+          searchPassTotal: sequentialSearchPasses.length,
+          searchPassLabel: activeSearchPassLabel,
+        };
+      }
       const completedBeforeRun = resolveCompletedCheckpointKeywords(
         resumeCheckpoint,
         round,
@@ -13866,7 +13929,9 @@ async function handleBatchKeywordCapture(options = {}) {
         baseSearchUrl,
         sourceTabId: activeBatchRunnerTabId,
         captureTaskId: persistentCaptureTaskId,
-        searchFilters,
+        searchFilters: roundSearchFilters,
+        disableAutomaticSearchRetry,
+        requireVerifiedFilters,
         captureParams: {
           minLikes: keywordMinLikes,
           sortDimension: sortContext.dimension,
@@ -14108,8 +14173,20 @@ async function handleBatchKeywordCapture(options = {}) {
             maxAttempts: maxKeywordAttempts,
           };
           const progressForUi = autoLoop
-            ? { ...normalizedProgress, round, message: `第 ${round} 轮 · ${progress.message || ""}` }
+            ? {
+                ...normalizedProgress,
+                round,
+                message: sequentialSearchEnabled
+                  ? `${activeSearchPassLabel} · ${progress.message || ""}`
+                  : `第 ${round} 轮 · ${progress.message || ""}`,
+              }
             : { ...normalizedProgress, round };
+          if (sequentialSearchEnabled) {
+            progressForUi.searchPass = activeSearchPass;
+            progressForUi.searchPassCurrent = round;
+            progressForUi.searchPassTotal = sequentialSearchPasses.length;
+            progressForUi.searchPassLabel = activeSearchPassLabel;
+          }
           progressForUi.message = appendStreamingSyncSummary(
             progressForUi.message,
             streamingSyncQueue,
@@ -14245,6 +14322,8 @@ async function handleBatchKeywordCapture(options = {}) {
       if (
         shouldStopBatchInvocation() ||
         result.canceled ||
+        result.fatal ||
+        result.recoveryRequired ||
         !autoLoop ||
         round >= maxRounds
       ) {
@@ -14360,7 +14439,9 @@ async function handleBatchKeywordCapture(options = {}) {
     } else if (autoLoop) {
       const stopped = result.canceled || batchKeywordCancelRequested;
       showMessage(
-        `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
+        sequentialSearchEnabled
+          ? `无人值守采集${stopped ? "已停止" : "结束"}：已执行 ${round}/${sequentialSearchPasses.length} 个巡检步骤，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`
+          : `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
         stopped ? "warning" : "success",
       );
     } else if (result.canceled) {
@@ -17546,9 +17627,14 @@ async function runUnattendedKeywordPlanRequest(request) {
     Array.isArray(plan.keywords) ? plan.keywords : [],
   ).slice(0, MAX_BATCH_KEYWORDS);
   const platform = String(plan.platform || "xiaohongshu").trim();
+  const searchPasses = normalizeUnattendedSearchPasses(plan);
+  const sequentialSearchEnabled =
+    platform === "douyin" && searchPasses.length > 1;
   const captureTaskDebugSupported =
     supportsPersistentCaptureTaskPlatform(platform);
-  const plannedRounds = Math.max(1, Number(plan.maxRounds) || 1);
+  const plannedRounds = sequentialSearchEnabled
+    ? searchPasses.length
+    : Math.max(1, Number(plan.maxRounds) || 1);
   const plannedTaskTotal = keywords.length * plannedRounds;
   const checkpoint = normalizeUnattendedKeywordCheckpoint(request, keywords, {
     maxRounds: plannedRounds,
@@ -17670,6 +17756,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     taskMeta: {
       keywordList: [...keywords],
       searchFilters: {...(plan.searchFilters || {})},
+      ...(sequentialSearchEnabled ? {searchPasses: [...searchPasses]} : {}),
       executionMode,
       ...(Object.prototype.hasOwnProperty.call(
         plan,
@@ -17948,11 +18035,13 @@ async function runUnattendedKeywordPlanRequest(request) {
     }
     const loopGapInput = document.getElementById("inputLoopGapMin");
     if (loopGapInput) {
-      loopGapInput.value = String(Math.max(0, Number(plan.roundGapMin) || 0));
+      loopGapInput.value = String(
+        sequentialSearchEnabled ? 0 : Math.max(0, Number(plan.roundGapMin) || 0),
+      );
     }
     const loopRoundsInput = document.getElementById("inputLoopRounds");
     if (loopRoundsInput) {
-      loopRoundsInput.value = String(Math.max(1, Number(plan.maxRounds) || 1));
+      loopRoundsInput.value = String(plannedRounds);
     }
     const scheduledInput = document.getElementById("inputBatchScheduledStart");
     if (scheduledInput) {
@@ -18049,8 +18138,10 @@ async function runUnattendedKeywordPlanRequest(request) {
       {
         status: "running",
         message:
-          plannedRounds > 1
-            ? "已交给多轮采集流程执行"
+          sequentialSearchEnabled
+            ? `已交给同一 Agent 串行执行：${searchPasses.map(unattendedSearchPassLabel).join(" → ")}`
+            : plannedRounds > 1
+              ? "已交给多轮采集流程执行"
             : "已交给采集流程执行",
         checkpoint,
         counts: buildUnattendedTaskCounts(
@@ -18103,7 +18194,10 @@ async function runUnattendedKeywordPlanRequest(request) {
       onProgress: reportKeywordProgress,
       onKeywordSettled: reportKeywordCheckpoint,
       resumeCheckpoint: checkpoint,
-      maxKeywordAttempts: UNATTENDED_KEYWORD_MAX_ATTEMPTS,
+      maxKeywordAttempts:
+        plan.recoveryPolicy?.disableAutomaticSearchRetry === true
+          ? 1
+          : UNATTENDED_KEYWORD_MAX_ATTEMPTS,
       waitForegroundTabId: null,
       sourceTabId: unattendedSourceTabId,
       executionLockOwner: "unattended_keyword_plan",
@@ -18112,7 +18206,12 @@ async function runUnattendedKeywordPlanRequest(request) {
       executionMode,
       unattendedRequestId: requestId,
       unattendedAttemptId: requestAttemptId,
+      searchPasses: sequentialSearchEnabled ? searchPasses : null,
       searchFilters: plan.searchFilters || {},
+      disableAutomaticSearchRetry:
+        plan.recoveryPolicy?.disableAutomaticSearchRetry === true,
+      requireVerifiedFilters:
+        plan.recoveryPolicy?.requireVerifiedFilters === true,
       keywordMaxDetectedItems:
         Object.prototype.hasOwnProperty.call(
           plan,
@@ -18257,7 +18356,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         ? "completed_with_failures"
         : "completed";
     unattendedCaptureTaskStatus = status;
-    const message = `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个关键词次，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
+    const message = `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个${sequentialSearchEnabled ? "巡检步骤" : "关键词次"}，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
     const finishedAt = new Date().toISOString();
     await reportUnattendedTerminalRun(
       requestId,

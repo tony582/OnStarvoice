@@ -36,6 +36,8 @@ import type {
 type ComposerStage = 'define' | 'allocate' | 'dispatched'
 type PlanMode = 'daily' | 'custom_dates'
 type DistributionMode = 'fixed_batch' | 'elastic_pool'
+type PatrolContentType = 'all' | 'image' | 'video'
+type SupplementalContentType = '' | 'image' | 'video'
 
 type CreateResponse = {
   ok: true
@@ -79,6 +81,8 @@ const SORT_OPTIONS = [
   { value: 'comprehensive', label: '综合排序' },
   { value: 'latest', label: '最新发布' },
   { value: 'likes', label: '最多点赞' },
+  { value: 'comments', label: '最多评论', platform: 'xiaohongshu' },
+  { value: 'collects', label: '最多收藏', platform: 'xiaohongshu' },
 ]
 
 const PUBLISH_TIME_OPTIONS = [
@@ -86,6 +90,38 @@ const PUBLISH_TIME_OPTIONS = [
   { value: 'day', label: '一天内' },
   { value: 'week', label: '一周内' },
   { value: 'halfyear', label: '半年内' },
+]
+
+const CONTENT_TYPE_OPTIONS = [
+  { value: 'all', label: '全部' },
+  { value: 'video', label: '视频' },
+  { value: 'image', label: '图文' },
+]
+
+const DOUYIN_PATROL_TYPE_OPTIONS = [
+  { value: 'all', label: '综合' },
+  { value: 'image', label: '图文' },
+  { value: 'video', label: '视频' },
+] as const
+
+const SEARCH_SCOPE_OPTIONS = [
+  { value: 'all', label: '全部' },
+  { value: 'viewed', label: '已看过' },
+  { value: 'unviewed', label: '未看过' },
+  { value: 'followed', label: '已关注' },
+]
+
+const DISTANCE_OPTIONS = [
+  { value: 'all', label: '不限距离' },
+  { value: 'city', label: '同城' },
+  { value: 'nearby', label: '附近' },
+]
+
+const VIDEO_DURATION_OPTIONS = [
+  { value: 'all', label: '不限时长' },
+  { value: 'under_1m', label: '1 分钟以内' },
+  { value: '1_5m', label: '1–5 分钟' },
+  { value: 'over_5m', label: '5 分钟以上' },
 ]
 
 const inputClassName = 'mt-1.5 h-10 w-full rounded-lg border border-input bg-card px-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground/55 hover:border-muted-foreground/35 focus:border-primary focus:ring-2 focus:ring-primary/10 disabled:cursor-not-allowed disabled:opacity-55'
@@ -188,6 +224,7 @@ function agentBlockReason(
   agent: OrchestrationCloudAgent,
   platform: OrchestrationPlatform,
   enhancementEnabled: boolean,
+  sequentialSearchEnabled = false,
 ) {
   if (agent.status !== 'active') return agent.status === 'paused' ? '节点已暂停接单' : '节点已撤销'
   if (agent.capabilities?.remoteTaskCreate !== true) return 'Extension 版本不支持云端任务'
@@ -197,6 +234,9 @@ function agentBlockReason(
   if (agent.capabilities?.remoteTaskKeywordPostLimit !== true) return 'Extension 版本不支持任务级帖子上限'
   if (enhancementEnabled && agent.capabilities?.remoteTaskEnhancementOptions !== true) {
     return 'Extension 版本不支持远程采集增强'
+  }
+  if (sequentialSearchEnabled && agent.capabilities?.remoteSequentialSearchPassesV1 !== true) {
+    return 'Extension 版本不支持同一关键词串行补充巡检'
   }
   return ''
 }
@@ -340,6 +380,11 @@ export function OrchestrationComposerDrawer({
   const [keywordMaxDetectedItems, setKeywordMaxDetectedItems] = useState(50)
   const [sort, setSort] = useState('comprehensive')
   const [publishTime, setPublishTime] = useState('all')
+  const [contentType, setContentType] = useState<PatrolContentType>('all')
+  const [searchScope, setSearchScope] = useState('all')
+  const [distance, setDistance] = useState('all')
+  const [videoDuration, setVideoDuration] = useState('all')
+  const [supplementalContentType, setSupplementalContentType] = useState<SupplementalContentType>('')
   const [enhancementEnabled, setEnhancementEnabled] = useState(false)
   const [autoSync, setAutoSync] = useState(false)
   const [aiPrefilter, setAiPrefilter] = useState(false)
@@ -370,19 +415,43 @@ export function OrchestrationComposerDrawer({
   const draftCleanupPromiseRef = useRef<Promise<boolean> | null>(null)
 
   const keywords = useMemo(() => uniqueKeywords(keywordText), [keywordText])
+  const sequentialSearchEnabled = Boolean(
+    supplementalContentType &&
+    platform === 'douyin' &&
+    executionMode === 'unattended_plan' &&
+    distributionMode === 'elastic_pool',
+  )
+  const patrolTypeMultiSelectEnabled = Boolean(
+    platform === 'douyin' &&
+    executionMode === 'unattended_plan' &&
+    distributionMode === 'elastic_pool',
+  )
+  const selectedPatrolTypes = useMemo<PatrolContentType[]>(() =>
+    sequentialSearchEnabled
+      ? ['all', supplementalContentType as Exclude<SupplementalContentType, ''>]
+      : [contentType],
+  [contentType, sequentialSearchEnabled, supplementalContentType])
+  const searchPasses = selectedPatrolTypes
+  const patrolPathLabel = searchPasses
+    .map(value => DOUYIN_PATROL_TYPE_OPTIONS.find(option => option.value === value)?.label || value)
+    .join(' → ')
+  const platformSortOptions = useMemo(
+    () => SORT_OPTIONS.filter(option => !option.platform || option.platform === platform),
+    [platform],
+  )
   const sortedAgents = useMemo(() => [...agents].sort((left, right) => {
-    const leftBlocked = Boolean(agentBlockReason(left, platform, enhancementEnabled))
-    const rightBlocked = Boolean(agentBlockReason(right, platform, enhancementEnabled))
+    const leftBlocked = Boolean(agentBlockReason(left, platform, enhancementEnabled, sequentialSearchEnabled))
+    const rightBlocked = Boolean(agentBlockReason(right, platform, enhancementEnabled, sequentialSearchEnabled))
     if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1
     if (left.online !== right.online) return left.online ? -1 : 1
     return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
-  }), [agents, enhancementEnabled, platform])
+  }), [agents, enhancementEnabled, platform, sequentialSearchEnabled])
   const validSelectedAgentIds = useMemo(
     () => selectedAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
-      return agent ? !agentBlockReason(agent, platform, enhancementEnabled) : false
+      return agent ? !agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled) : false
     }),
-    [agents, enhancementEnabled, platform, selectedAgentIds],
+    [agents, enhancementEnabled, platform, selectedAgentIds, sequentialSearchEnabled],
   )
   const selectedAgents = useMemo(
     () => validSelectedAgentIds
@@ -410,6 +479,20 @@ export function OrchestrationComposerDrawer({
       ? 'douyin'
       : 'xiaohongshu'
     const editingEnhancementEnabled = enhancementSettings.autoDetailCaptureAfterListCapture === true
+    const editingDistributionMode: DistributionMode =
+      (schedule?.distribution_mode || metadata.distributionMode) === 'fixed_batch'
+        ? 'fixed_batch'
+        : 'elastic_pool'
+    const rawEditingSearchPasses = stringList(planSnapshot.searchPasses)
+      .filter((value): value is PatrolContentType => ['all', 'image', 'video'].includes(value))
+    const editingSupplementalContentType: SupplementalContentType =
+      editingPlatform === 'douyin' &&
+      editingDistributionMode === 'elastic_pool' &&
+      rawEditingSearchPasses[0] === 'all' &&
+      (rawEditingSearchPasses[1] === 'image' || rawEditingSearchPasses[1] === 'video')
+        ? rawEditingSearchPasses[1]
+        : ''
+    const editingSequentialSearchEnabled = Boolean(editingSupplementalContentType)
     const scheduleDates = planSnapshot.customDates ?? schedule?.custom_dates ?? ''
     const editingAgentIds = stringList(metadata.eligibleAgentIds).length > 0
       ? stringList(metadata.eligibleAgentIds)
@@ -417,9 +500,15 @@ export function OrchestrationComposerDrawer({
     const candidateAgentIds = sourcePlan ? editingAgentIds : (initialAgentIds ?? [])
     const targetPlatform = sourcePlan ? editingPlatform : 'xiaohongshu'
     const targetEnhancementEnabled = sourcePlan ? editingEnhancementEnabled : false
+    const targetSequentialSearchEnabled = sourcePlan ? editingSequentialSearchEnabled : false
     const compatibleInitialAgentIds = candidateAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
-      return agent && !agentBlockReason(agent, targetPlatform, targetEnhancementEnabled)
+      return agent && !agentBlockReason(
+        agent,
+        targetPlatform,
+        targetEnhancementEnabled,
+        targetSequentialSearchEnabled,
+      )
     })
 
     setStage('define')
@@ -446,6 +535,17 @@ export function OrchestrationComposerDrawer({
     setKeywordMaxDetectedItems(safeCount(planSnapshot.keywordMaxDetectedItems) || 50)
     setSort(String(searchFilters.sort || 'comprehensive'))
     setPublishTime(String(searchFilters.publishTime || 'all'))
+    setContentType(
+      editingSequentialSearchEnabled
+        ? 'all'
+        : ['all', 'image', 'video'].includes(String(searchFilters.contentType || ''))
+          ? String(searchFilters.contentType) as PatrolContentType
+          : 'all',
+    )
+    setSearchScope(String(searchFilters.searchScope || 'all'))
+    setDistance(String(searchFilters.distance || 'all'))
+    setVideoDuration(String(searchFilters.videoDuration || 'all'))
+    setSupplementalContentType(editingSupplementalContentType)
     setEnhancementEnabled(editingEnhancementEnabled)
     setAutoSync(enhancementSettings.autoSyncAfterDetailCapture === true)
     setAiPrefilter(enhancementSettings.enableAiRelevancePrefilter === true)
@@ -453,11 +553,7 @@ export function OrchestrationComposerDrawer({
     setIncludeComments(enhancementSettings.includeCommentsOnDetailCapture === true)
     setCommentLimit(safeCount(enhancementSettings.detailCommentsMaxDetectedItems) || 50)
     setSkipCaptured(enhancementSettings.skipAlreadyCapturedOnDetailCapture !== false)
-    setDistributionMode(
-      (schedule?.distribution_mode || metadata.distributionMode) === 'fixed_batch'
-        ? 'fixed_batch'
-        : 'elastic_pool',
-    )
+    setDistributionMode(editingDistributionMode)
     setSelectedAgentIds(compatibleInitialAgentIds)
     setSelectionNotice(
       compatibleInitialAgentIds.length < candidateAgentIds.length
@@ -572,10 +668,16 @@ export function OrchestrationComposerDrawer({
     candidateIds: string[],
     targetPlatform: OrchestrationPlatform,
     targetEnhancementEnabled: boolean,
+    targetSequentialSearchEnabled = false,
   ) => {
     const compatibleIds = candidateIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
-      return agent && !agentBlockReason(agent, targetPlatform, targetEnhancementEnabled)
+      return agent && !agentBlockReason(
+        agent,
+        targetPlatform,
+        targetEnhancementEnabled,
+        targetSequentialSearchEnabled,
+      )
     })
     const removedNames = candidateIds
       .filter(agentId => !compatibleIds.includes(agentId))
@@ -590,8 +692,18 @@ export function OrchestrationComposerDrawer({
 
   const changePlatform = (value: OrchestrationPlatform) => {
     markDefinitionChanged()
+    const nextSequentialSearchEnabled = sequentialSearchEnabled && value === 'douyin'
     setPlatform(value)
-    keepCompatibleAgents(selectedAgentIds, value, enhancementEnabled)
+    if (value !== 'douyin') {
+      setSupplementalContentType('')
+      setVideoDuration('all')
+    } else {
+      setDistance('all')
+    }
+    if (!SORT_OPTIONS.some(option => option.value === sort && (!option.platform || option.platform === value))) {
+      setSort('comprehensive')
+    }
+    keepCompatibleAgents(selectedAgentIds, value, enhancementEnabled, nextSequentialSearchEnabled)
   }
 
   const changeEnhancementEnabled = (value: boolean) => {
@@ -603,7 +715,55 @@ export function OrchestrationComposerDrawer({
       setBloggerMetrics(false)
       setIncludeComments(false)
     }
-    keepCompatibleAgents(selectedAgentIds, platform, value)
+    keepCompatibleAgents(selectedAgentIds, platform, value, sequentialSearchEnabled)
+  }
+
+  const changeDistributionMode = (value: DistributionMode) => {
+    markDefinitionChanged()
+    setDistributionMode(value)
+    const nextSequentialSearchEnabled = sequentialSearchEnabled && value === 'elastic_pool'
+    if (value !== 'elastic_pool') setSupplementalContentType('')
+    keepCompatibleAgents(selectedAgentIds, platform, enhancementEnabled, nextSequentialSearchEnabled)
+  }
+
+  const togglePatrolType = (value: 'all' | 'image' | 'video', checked: boolean) => {
+    markDefinitionChanged()
+    let nextContentType = contentType
+    let nextSupplementalContentType: SupplementalContentType
+    if (checked) {
+      if (value === 'all') {
+        nextSupplementalContentType = contentType === 'image' || contentType === 'video'
+          ? contentType
+          : supplementalContentType
+        nextContentType = 'all'
+      } else if (contentType === 'all') {
+        // A comprehensive patrol accepts exactly one focused supplement.
+        nextSupplementalContentType = value
+      } else {
+        // Image + video is intentionally not a valid pair; selecting one
+        // focused type replaces the other.
+        nextContentType = value
+        nextSupplementalContentType = ''
+      }
+    } else if (value === 'all' && supplementalContentType) {
+      nextContentType = supplementalContentType
+      nextSupplementalContentType = ''
+    } else if (value === supplementalContentType) {
+      nextSupplementalContentType = ''
+    } else {
+      return
+    }
+
+    const nextSequentialSearchEnabled = Boolean(nextSupplementalContentType)
+
+    setContentType(nextContentType)
+    setSupplementalContentType(nextSupplementalContentType)
+    keepCompatibleAgents(
+      selectedAgentIds,
+      platform,
+      enhancementEnabled,
+      nextSequentialSearchEnabled,
+    )
   }
 
   const toggleAgent = (agentId: string) => {
@@ -646,6 +806,11 @@ export function OrchestrationComposerDrawer({
     keywordMaxDetectedItems,
     sort,
     publishTime,
+    contentType: searchPasses[0],
+    searchPasses,
+    searchScope,
+    distance: platform === 'xiaohongshu' ? distance : 'all',
+    videoDuration: platform === 'douyin' ? videoDuration : 'all',
     captureSettings,
     allowIdleAgentHandoff,
     distributionMode,
@@ -763,10 +928,20 @@ export function OrchestrationComposerDrawer({
             : {}),
           keywords,
           keywordMaxDetectedItems,
-          searchFilters: { sort, publishTime },
+          searchFilters: {
+            sort,
+            publishTime,
+            contentType: searchPasses[0],
+            searchScope,
+            distance: platform === 'xiaohongshu' ? distance : 'all',
+            videoDuration: platform === 'douyin' ? videoDuration : 'all',
+          },
+          ...(sequentialSearchEnabled ? { searchPasses } : {}),
           recoveryPolicy: {
             allowIdleAgentHandoff,
             platformSafetyMode: 'manual_confirmed',
+            disableAutomaticSearchRetry: sequentialSearchEnabled,
+            requireVerifiedFilters: sequentialSearchEnabled,
           },
           ...(captureSettings ? { captureSettings } : {}),
         })
@@ -835,10 +1010,20 @@ export function OrchestrationComposerDrawer({
             },
             keywords,
             keywordMaxDetectedItems,
-            searchFilters: { sort, publishTime },
+            searchFilters: {
+              sort,
+              publishTime,
+              contentType: searchPasses[0],
+              searchScope,
+              distance: platform === 'xiaohongshu' ? distance : 'all',
+              videoDuration: platform === 'douyin' ? videoDuration : 'all',
+            },
+            ...(sequentialSearchEnabled ? { searchPasses } : {}),
             recoveryPolicy: {
               allowIdleAgentHandoff,
               platformSafetyMode: 'manual_confirmed',
+              disableAutomaticSearchRetry: sequentialSearchEnabled,
+              requireVerifiedFilters: sequentialSearchEnabled,
             },
             ...(captureSettings ? { captureSettings } : {}),
           },
@@ -992,6 +1177,10 @@ export function OrchestrationComposerDrawer({
                               if (executionMode === option.value) return
                               markDefinitionChanged()
                               setExecutionMode(option.value)
+                              if (option.value !== 'unattended_plan') {
+                                setSupplementalContentType('')
+                                keepCompatibleAgents(selectedAgentIds, platform, enhancementEnabled, false)
+                              }
                             }}
                             className={`flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${active ? 'border-primary/30 bg-card text-primary shadow-sm' : 'border-transparent text-muted-foreground hover:bg-card/70 hover:text-foreground'}`}
                           >
@@ -1122,14 +1311,17 @@ export function OrchestrationComposerDrawer({
                         className={textareaClassName}
                       />
                       <span className={`mt-1.5 block text-[11px] ${keywords.length > 300 ? 'text-status-red' : 'text-muted-foreground'}`}>
-                        {keywords.length}/300 个工作项 · {distributionMode === 'elastic_pool' ? '每个 Agent 一次领取 1 个' : '保存时按节点均衡固定分配'}
+                        {keywords.length}/300 个关键词
+                        {sequentialSearchEnabled
+                          ? ` · ${keywords.length} 个工作项，每个 Agent 按“${patrolPathLabel}”完成同词巡检`
+                          : distributionMode === 'elastic_pool' ? ' · 每个 Agent 一次领取 1 个' : ' · 保存时按节点均衡固定分配'}
                       </span>
                     </label>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="block text-xs font-medium text-muted-foreground">
                         排序方式
                         <select value={sort} onChange={event => { markDefinitionChanged(); setSort(event.target.value) }} disabled={busy} className={inputClassName}>
-                          {SORT_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          {platformSortOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
                       </label>
                       <label className="block text-xs font-medium text-muted-foreground">
@@ -1138,6 +1330,69 @@ export function OrchestrationComposerDrawer({
                           {PUBLISH_TIME_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
                       </label>
+                      {patrolTypeMultiSelectEnabled ? (
+                        <fieldset className="rounded-xl border border-border/70 bg-card px-3 py-2.5 sm:col-span-2">
+                          <legend className="px-1 text-xs font-medium text-muted-foreground">巡检类型（受限组合）</legend>
+                          <div className="mt-1 flex flex-wrap gap-2">
+                            {DOUYIN_PATROL_TYPE_OPTIONS.map(option => {
+                              const checked = selectedPatrolTypes.includes(option.value)
+                              const soleSelection = checked && selectedPatrolTypes.length === 1
+                              return (
+                                <label
+                                  key={option.value}
+                                  className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors ${checked ? 'border-primary/30 bg-primary/[0.055] text-primary' : 'border-border/70 bg-background text-foreground'} ${soleSelection || busy ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={event => togglePatrolType(option.value, event.target.checked)}
+                                    disabled={busy || soleSelection}
+                                    className="h-4 w-4 shrink-0 accent-primary"
+                                  />
+                                  {option.label}
+                                </label>
+                              )
+                            })}
+                          </div>
+                          <span className="mt-2 block text-[11px] leading-4 text-muted-foreground">
+                            只允许 5 种路径：综合、图文、视频、综合 → 图文、综合 → 视频。每个关键词最多两次搜索；图文与视频不能互相组合，发布时间等其它筛选仍保持单选。
+                          </span>
+                        </fieldset>
+                      ) : (
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          内容类型
+                          <select
+                            value={contentType}
+                            onChange={event => { markDefinitionChanged(); setContentType(event.target.value as PatrolContentType) }}
+                            disabled={busy}
+                            className={inputClassName}
+                          >
+                            {CONTENT_TYPE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          </select>
+                        </label>
+                      )}
+                      <label className="block text-xs font-medium text-muted-foreground">
+                        搜索范围
+                        <select value={searchScope} onChange={event => { markDefinitionChanged(); setSearchScope(event.target.value) }} disabled={busy} className={inputClassName}>
+                          {SEARCH_SCOPE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                        </select>
+                      </label>
+                      {platform === 'xiaohongshu' && (
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          位置距离
+                          <select value={distance} onChange={event => { markDefinitionChanged(); setDistance(event.target.value) }} disabled={busy} className={inputClassName}>
+                            {DISTANCE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          </select>
+                        </label>
+                      )}
+                      {platform === 'douyin' && (
+                        <label className="block text-xs font-medium text-muted-foreground">
+                          视频时长
+                          <select value={videoDuration} onChange={event => { markDefinitionChanged(); setVideoDuration(event.target.value) }} disabled={busy} className={inputClassName}>
+                            {VIDEO_DURATION_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          </select>
+                        </label>
+                      )}
                     </div>
                   </div>
                 </section>
@@ -1244,8 +1499,7 @@ export function OrchestrationComposerDrawer({
                             disabled={busy}
                             onClick={() => {
                               if (active) return
-                              markDefinitionChanged()
-                              setDistributionMode(option.value)
+                              changeDistributionMode(option.value)
                             }}
                             className={`rounded-xl border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${active ? 'border-primary bg-primary/[0.055] ring-1 ring-primary/15' : 'border-border bg-card hover:border-primary/35'}`}
                           >
@@ -1286,7 +1540,7 @@ export function OrchestrationComposerDrawer({
                 ) : (
                   <div className="mt-3 max-h-[520px] space-y-2 overflow-y-auto pr-1">
                     {sortedAgents.map(agent => {
-                      const blockReason = agentBlockReason(agent, platform, enhancementEnabled)
+                      const blockReason = agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled)
                       const checked = validSelectedAgentIds.includes(agent.id)
                       const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
                       const activeTasks = safeCount(agent.active_task_count)
@@ -1389,7 +1643,8 @@ export function OrchestrationComposerDrawer({
                     </div>
                     <h3 className="mt-1 text-base font-bold text-foreground">{title}</h3>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {preview.itemCount} 个工作项 · {selectedAgents.length} 个执行节点 · {distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
+                      {preview.itemCount} 个关键词工作项 · {selectedAgents.length} 个执行节点 · {distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
+                      {sequentialSearchEnabled ? ` · 每项串行执行 ${patrolPathLabel}` : ''}
                       {executionMode === 'unattended_plan'
                         ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
                         : ''}
@@ -1411,6 +1666,20 @@ export function OrchestrationComposerDrawer({
                 </div>
               </section>
 
+              {sequentialSearchEnabled && (
+                <section className="rounded-2xl border border-primary/25 bg-primary/[0.035] p-4" aria-label="同一任务串行巡检">
+                  <div className="flex items-start gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><ClipboardList className="h-4 w-4" /></span>
+                    <div className="min-w-0 flex-1">
+                      <h3 className="text-sm font-bold text-foreground">一个关键词任务，由同一 Agent 串行完成</h3>
+                      <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                        执行路径：<span className="font-semibold text-foreground">{patrolPathLabel}</span>。每次搜索先采集列表、再增强本次新增内容；完成后继续下一次搜索，重复内容自动跳过。筛选异常或安全验证会停止该任务，不刷新、不补搜、不换作者。
+                      </p>
+                    </div>
+                  </div>
+                </section>
+              )}
+
               <section className="overflow-hidden rounded-2xl border border-border/70 bg-card">
                 <div className="flex items-center justify-between gap-3 border-b border-border/70 px-4 py-3">
                   <div>
@@ -1429,7 +1698,10 @@ export function OrchestrationComposerDrawer({
                         <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted text-xs font-bold tabular-nums text-muted-foreground">{index + 1}</span>
                         <div className="min-w-0">
                           <div className="truncate text-sm font-semibold text-foreground">{assignment.keyword}</div>
-                          <div className="mt-0.5 text-[11px] text-muted-foreground">每词最多 {keywordMaxDetectedItems} 条 · {PLATFORM_OPTIONS.find(option => option.value === platform)?.label}</div>
+                          <div className="mt-0.5 text-[11px] text-muted-foreground">
+                            每词最多 {keywordMaxDetectedItems} 条 · {PLATFORM_OPTIONS.find(option => option.value === platform)?.label}
+                            {sequentialSearchEnabled ? ` · ${patrolPathLabel}` : ''}
+                          </div>
                         </div>
                         <span className="rounded-full border border-primary/20 bg-primary/[0.055] px-2.5 py-1 text-[10px] font-semibold text-primary">
                           {distributionMode === 'elastic_pool'
@@ -1456,7 +1728,9 @@ export function OrchestrationComposerDrawer({
                   {editMode
                     ? '同一个计划会继续运行，原有历史保持不变。新配置从下一次生成批次时开始使用。'
                     : executionMode === 'unattended_plan'
-                    ? '云端会在每个运行时间生成当次工作项。在线空闲节点逐个领取，设备本地计划保持不变。'
+                    ? sequentialSearchEnabled
+                      ? `云端仍按关键词排队；同一 Agent 领取后依次执行“${patrolPathLabel}”，中途异常即停止该词。`
+                      : '云端会在每个运行时间生成当次工作项。在线空闲节点逐个领取，设备本地计划保持不变。'
                     : '关键词已留在云端队列。在线节点空闲时一次领取一个，完成后继续领取。'}
                 </p>
                 <div className="mt-4 rounded-xl border border-border/70 bg-card px-4 py-3 text-left text-xs text-muted-foreground">
@@ -1472,7 +1746,7 @@ export function OrchestrationComposerDrawer({
                         <span className="font-semibold text-foreground">
                           {planMode === 'daily' ? '每天' : '指定日期'} {startTime}
                           {randomOffsetMin > 0 ? ` 后随机延迟 0–${randomOffsetMin} 分钟` : ''}
-                          {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词执行 1 次`}
+                          {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词${sequentialSearchEnabled ? `按“${patrolPathLabel}”串行执行` : '执行 1 次'}`}
                         </span>
                       </div>
                       <div className="mt-1">

@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.86',
+  latestVersion: '0.3.87',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-20',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.86-20260820.zip',
+  releaseDate: '2026-08-21',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.87-20260821.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.87',
+      releaseDate: '2026-08-21',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: '无人值守支持受控组合巡检',
+              desc: '每个关键词可选择综合、图文、视频、综合后图文或综合后视频；同一 Agent 按顺序完成搜索与采集增强，避免跨设备重复和高频补搜。',
+            },
+          ],
+        },
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '抖音筛选状态不再串到下一任务',
+              desc: '每轮搜索都会核验内容类型、排序与发布时间等筛选；上一任务停在图文时，下一轮综合不会继续沿用旧条件。',
+            },
+            {
+              title: '内容分诊搜索稳定显示结果',
+              desc: '标题、正文、作者、平台编号等字段统一检索，并防止输入过程中旧请求覆盖新结果或频繁跳页。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.86',
       releaseDate: '2026-08-20',

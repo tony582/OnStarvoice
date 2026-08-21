@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MessageSquarePlus, MessageSquareText,
@@ -347,7 +347,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
-  const [keyword, setKeyword] = useState(initial?.keyword ?? '')
+  const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
+  const [keywordDraft, setKeywordDraft] = useState(() => String(initial?.keyword ?? '').trim())
   const [triageStatuses, setTriageStatuses] = useState<string[]>(() =>
     String(initial?.status || '').split(',').map(value => value.trim()).filter(Boolean))
   const [risk, setRisk] = useState<string[]>([])
@@ -378,6 +379,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [batchFeedback, setBatchFeedback] = useState<BatchFeedback | null>(null)
   const batchFeedbackTimer = useRef<number | undefined>(undefined)
   const customTagRequestSeq = useRef(0)
+  const listRequestSeq = useRef(0)
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
@@ -427,17 +429,33 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return params
   }, [archiveView, triageStatuses, risk, identity, sentiment, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
+  // 看板与列表使用同一套筛选；看板逐列自行补 status，不能继承列表的状态多选。
+  const boardFilterQuery = useMemo(() => {
+    const params = filterParams()
+    params.delete('status')
+    params.delete('bucket')
+    params.delete('sort')
+    params.delete('dir')
+    params.set('queue', 'triage')
+    return params.toString()
+  }, [filterParams])
+
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
+    const requestSeq = ++listRequestSeq.current
     if (!options?.silent) setLoading(true)
     try {
       const params = filterParams()
       params.set('page', String(page))
       params.set('pageSize', String(pageSize))
       const data = await api.get<any>('/triage/records?' + params)
+      if (requestSeq !== listRequestSeq.current) return
       setRecords(data.records || [])
       setPagination(data.pagination || null)
-    } catch (err) { console.error(err) }
-    finally { if (!options?.silent) setLoading(false) }
+    } catch (err) {
+      if (requestSeq === listRequestSeq.current) console.error(err)
+    } finally {
+      if (requestSeq === listRequestSeq.current) setLoading(false)
+    }
   }), [filterParams, pageSize])
 
   const exportXlsx = async () => {
@@ -454,15 +472,23 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment].filter(Boolean).length
     + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
+    setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setSort({ field: 'publish', dir: 'desc' })
   }
+  // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
+  useEffect(() => {
+    const nextKeyword = keywordDraft.trim()
+    if (nextKeyword === keyword) return
+    const timeoutId = window.setTimeout(() => setKeyword(nextKeyword), 400)
+    return () => window.clearTimeout(timeoutId)
+  }, [keywordDraft, keyword])
   useEffect(() => { void load() }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
+  useEffect(() => () => { listRequestSeq.current += 1 }, [])
   // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
@@ -1055,8 +1081,22 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[140px] lg:max-w-[680px] lg:flex-1">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、作者、飞书表号…" className="h-10 w-full border-transparent bg-muted pl-8 text-[12px] focus:bg-card lg:h-8" />
+              <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key !== 'Enter') return
+                  e.preventDefault()
+                  setKeyword(keywordDraft.trim())
+                }} placeholder="搜索标题、正文、作者、飞书表号、账号、平台ID、采集词、标签…" className="h-10 w-full border-transparent bg-muted px-8 text-[12px] focus:bg-card lg:h-8" />
+              {keywordDraft && (
+                <button
+                  type="button"
+                  aria-label="清空搜索"
+                  onClick={() => { setKeywordDraft(''); setKeyword('') }}
+                  className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-card hover:text-foreground"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
             <button
               type="button"
@@ -1107,7 +1147,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   aria-pressed={view === value}
                   onClick={() => {
                     setView(value)
-                    if (value === 'board') setWatchedFilter('')
+                    if (value === 'board') {
+                      setWatchedFilter('')
+                      setTriageStatuses([])
+                      setSort({ field: 'publish', dir: 'desc' })
+                    }
                   }}
                   className={cn(
                     'inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors',
@@ -1208,14 +1252,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             </TriageSelect>
           </div>
 
-          {view === 'list' && (
-            <>
-              <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName="w-full justify-between lg:!w-[82px] lg:!px-2 xl:!w-full" />
-              <div className="hidden shrink-0 lg:block">
-                <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="xl:w-full xl:justify-between" />
-              </div>
-            </>
-          )}
+          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName="w-full justify-between lg:!w-[82px] lg:!px-2 xl:!w-full" />
+          <div className="hidden shrink-0 lg:block">
+            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="xl:w-full xl:justify-between" />
+          </div>
 
           <button
             type="button"
@@ -1233,10 +1273,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {/* Board view */}
       {view === 'board' ? (
         <TriageBoard
-          sentiment={sentiment}
-          platform={platform}
-          keyword={keyword}
-          reloadKey={`${sentiment}|${platform}|${boardNonce}`}
+          filterQuery={boardFilterQuery}
+          reloadKey={String(boardNonce)}
           canWrite={canWrite()}
           onOpen={record => openDrawer(record)}
           onChangeMode={(record, nextStatus) => changeRecordMode(record, nextStatus)}

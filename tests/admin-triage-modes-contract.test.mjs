@@ -157,6 +157,24 @@ test('negative Feishu status requires a searchable Feishu table number without r
   assert.match(badges, /negative_cold: 'red'/);
 });
 
+test('content search covers visible business fields and treats wildcard symbols literally', () => {
+  const route = source('server/routes/triage.js');
+  const keywordFilter = between(route, 'function escapeLikePattern', 'function validateStatus');
+
+  assert.match(keywordFilter, /replace\(\/\[\\\\%_\]\/g/);
+  assert.match(keywordFilter, /ESCAPE '\\\\'/);
+  for (const field of [
+    'r.title', 'r.content', 'r.keyword', 'r.author_name', 'r.author_account_no',
+    'r.author_id', 'r.external_id', 'r.publish_location', 'r.ai_summary',
+    'rt.feishu_table_no', 'rt.owner_name', 'rt.note',
+  ]) {
+    assert.match(keywordFilter, new RegExp(field.replace('.', '\\.')));
+  }
+  assert.match(keywordFilter, /JOIN custom_tags ct_search/);
+  assert.match(keywordFilter, /FROM record_notes rn_search/);
+  assert.match(keywordFilter, /ts\.external_ticket_no ILIKE/);
+});
+
 test('pending queue and archive lifecycle remain independent from the selected state', () => {
   const route = source('server/routes/triage.js');
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
