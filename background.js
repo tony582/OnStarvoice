@@ -156,8 +156,74 @@ const settledCaptureRequestIds = new Map();
 let captureDebugSessionManager = null;
 let captureTaskTabGroupManager = null;
 let captureTaskOwnerCoordinator = null;
+const CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS = 10 * 60 * 1000;
+const captureTaskReplacementTabIds = new Map();
 const captureTaskPendingWorkerTabIds = new Map();
 const captureTaskCleanupInProgress = new Set();
+
+function pruneCaptureTaskReplacementTabs(now = Date.now()) {
+  for (const [tabId, replacement] of captureTaskReplacementTabIds) {
+    if (Number(replacement?.expiresAt) <= now) {
+      captureTaskReplacementTabIds.delete(tabId);
+    }
+  }
+}
+
+function rememberCaptureTaskReplacementTab({
+  removedTabId,
+  addedTabId,
+  taskId,
+} = {}) {
+  const oldTabId = resolveCaptureTaskTabId(removedTabId);
+  const newTabId = resolveCaptureTaskTabId(addedTabId);
+  const normalizedTaskId = String(taskId || '').trim();
+  if (!oldTabId || !newTabId || !normalizedTaskId) return false;
+  pruneCaptureTaskReplacementTabs();
+  captureTaskReplacementTabIds.set(oldTabId, {
+    tabId: newTabId,
+    taskId: normalizedTaskId,
+    expiresAt: Date.now() + CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS,
+  });
+  return true;
+}
+
+function resolveCaptureTaskReplacementTab(tabId, taskId = '') {
+  const originalTabId = resolveCaptureTaskTabId(tabId);
+  const requestedTaskId = String(taskId || '').trim();
+  if (!originalTabId) return null;
+  pruneCaptureTaskReplacementTabs();
+
+  let replacementTabId = originalTabId;
+  let replacementTaskId = requestedTaskId;
+  const visited = new Set([originalTabId]);
+  for (let depth = 0; depth < 8; depth += 1) {
+    const replacement = captureTaskReplacementTabIds.get(replacementTabId);
+    if (!replacement) break;
+    if (
+      replacementTaskId &&
+      replacement.taskId !== replacementTaskId
+    ) {
+      return null;
+    }
+    replacementTaskId = replacementTaskId || replacement.taskId;
+    replacementTabId = resolveCaptureTaskTabId(replacement.tabId);
+    if (!replacementTabId || visited.has(replacementTabId)) return null;
+    visited.add(replacementTabId);
+  }
+  if (replacementTabId === originalTabId || !replacementTaskId) return null;
+
+  const group = captureTaskTabGroupManager?.getTask(replacementTaskId);
+  if (
+    !group ||
+    (
+      Number(group.sourceTabId) !== replacementTabId &&
+      !group.workerTabIds?.includes(replacementTabId)
+    )
+  ) {
+    return null;
+  }
+  return {tabId: replacementTabId, taskId: replacementTaskId};
+}
 const DEFAULT_UNATTENDED_KEYWORD_PLAN = Object.freeze({
   enabled: false,
   platform: 'xiaohongshu',
@@ -3289,6 +3355,10 @@ async function executeCloudTaskAgentCommand(command, token) {
                     : {}),
                   attemptIdentity: payload.attemptIdentity,
                 }),
+                checkpoint:
+                  payload.checkpoint && typeof payload.checkpoint === 'object'
+                    ? payload.checkpoint
+                    : null,
               },
             );
             if (!request) {
@@ -4053,6 +4123,20 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
     const nextRequest = {
       ...request,
       status: 'canceled',
+      error: {
+        code: 'USER_CANCELED',
+        reason: 'user_canceled',
+        category: 'user_canceled',
+        message,
+        retryable: false,
+      },
+      metadata: {
+        ...(request.metadata && typeof request.metadata === 'object'
+          ? request.metadata
+          : {}),
+        cancelSource: 'user',
+        cancelReason: 'user_canceled',
+      },
       recoveryPendingLaunch: false,
       recoveryWaitUntil: '',
       wakeGraceUntil: '',
@@ -4072,7 +4156,12 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: request,
-      event: {type: 'canceled', message, at: now},
+      event: {
+        type: 'canceled',
+        message,
+        at: now,
+        metadata: {cancelSource: 'user', reason: 'user_canceled'},
+      },
     });
     return nextRequest;
   });
@@ -5064,6 +5153,7 @@ async function createUnattendedKeywordRunRequest(
     cloudAssigned = false,
     executionMode = '',
     orchestrationContext = null,
+    checkpoint = null,
   } = {},
 ) {
   return await runUnattendedRunMutation(async () => {
@@ -5104,6 +5194,9 @@ async function createUnattendedKeywordRunRequest(
       heartbeatAt: now,
       businessProgressAt: now,
       planSnapshot: normalizeUnattendedKeywordPlan(plan),
+      ...(checkpoint && typeof checkpoint === 'object'
+        ? {checkpoint: JSON.parse(JSON.stringify(checkpoint))}
+        : {}),
       progress: null,
       error: null,
       message: `已创建${executionCopy.taskLabel}，等待运行页领取`,
@@ -5528,6 +5621,7 @@ async function launchUnattendedKeywordRun(
     cloudAssigned = false,
     executionMode = '',
     orchestrationContext = null,
+    checkpoint = null,
   } = {},
 ) {
   const normalizedPlan = normalizeUnattendedKeywordPlan(plan);
@@ -5542,6 +5636,7 @@ async function launchUnattendedKeywordRun(
     cloudAssigned,
     executionMode,
     orchestrationContext,
+    checkpoint,
   });
   if (requestId && request.id !== requestId) {
     return null;
@@ -10008,6 +10103,11 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
         normalizedAddedTabId,
       ),
     ]);
+    rememberCaptureTaskReplacementTab({
+      removedTabId: normalizedRemovedTabId,
+      addedTabId: normalizedAddedTabId,
+      taskId,
+    });
     return true;
   } catch (error) {
     const message = `浏览器替换采集页面后接管迁移失败：${String(
@@ -10800,8 +10900,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:relay-to-content') {
-        const tabId = message?.tabId;
-        if (typeof tabId !== 'number') {
+        const requestedTabId = message?.tabId;
+        if (typeof requestedTabId !== 'number') {
           throw new Error('invalid tabId');
         }
 
@@ -10810,20 +10910,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ? message.payload
             : {};
         const contentAction = String(sourcePayload.action || '');
+        const requestedTaskId = String(
+          sourcePayload.taskId || sourcePayload.taskContext?.taskId || '',
+        ).trim();
+        let relayTabId = requestedTabId;
         let relayTab = null;
         try {
-          relayTab = await chrome.tabs.get(tabId);
+          relayTab = await chrome.tabs.get(relayTabId);
         } catch {
-          relayTab = null;
+          const replacement = resolveCaptureTaskReplacementTab(
+            requestedTabId,
+            requestedTaskId,
+          );
+          if (replacement) {
+            relayTabId = replacement.tabId;
+            try {
+              relayTab = await chrome.tabs.get(relayTabId);
+            } catch {
+              relayTab = null;
+            }
+          }
         }
         const existingDebugSession =
-          captureDebugSessionManager.getSession(tabId);
+          captureDebugSessionManager.getSession(relayTabId);
         if (
           contentAction === 'cancelCapture' &&
           !existingDebugSession?.persistent
         ) {
           await captureDebugSessionManager.stopByTab(
-            tabId,
+            relayTabId,
             'user_cancel_requested',
           );
         }
@@ -10895,7 +11010,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                   : '搜索结果采集'
                 : '博主作品采集';
             debugSession = await captureDebugSessionManager.start({
-              tabId,
+              tabId: relayTabId,
               runId: listRunId,
               label,
               pageTitle: relayTab?.title || '',
@@ -10913,14 +11028,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         let response;
         let relayError = null;
         try {
-          response = await relayToContentWithRetry(tabId, relayPayload);
+          response = await relayToContentWithRetry(relayTabId, relayPayload);
         } catch (error) {
           relayError = error;
           throw error;
         } finally {
           if (debugSession && debugSessionStartedByRelay) {
             await captureDebugSessionManager.stop({
-              tabId,
+              tabId: relayTabId,
               runId: debugSession.runId,
               reason: 'capture_relay_finished',
             });

@@ -131,7 +131,6 @@ export default function DesktopApp() {
           <TopBar
             eyebrow={config.eyebrow}
             title={pageTitle(page, params)}
-            badge={page === 'dispatch' ? 'BETA' : undefined}
             collapsed={collapsed}
             onToggleCollapse={toggleCollapse}
             onOpenMobileNavigation={() => setMobileNavigationOpen(true)}

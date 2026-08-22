@@ -22,6 +22,12 @@ const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
   'XHS_LOGIN_REQUIRED',
 ]);
 
+const EXPLICIT_USER_CANCELLATION_CODES = new Set([
+  'USER_CANCELED',
+  'USER_CANCELLED',
+  'USER_CANCEL_REQUESTED',
+]);
+
 export const ELASTIC_AGENT_CAPACITY_CODES = new Set([
   'CAPTURE_TASK_GROUP_BUSY',
   'CAPTURE_TASK_CLEANUP_PENDING',
@@ -74,7 +80,42 @@ export function orchestrationCheckpointEntries(snapshot) {
       .map(entry => safeJson(entry))
       .filter(entry => text(entry.keyword, 120))
     : [];
-  const byKeyword = new Map(entries.map(entry => [text(entry.keyword, 120), entry]));
+  const groupedByKeyword = new Map();
+  for (const rawEntry of entries) {
+    const keyword = text(rawEntry.keyword, 120);
+    const entry = {...rawEntry};
+    delete entry.searchPassResults;
+    const group = groupedByKeyword.get(keyword) || {
+      representative: null,
+      searchPassResults: [],
+    };
+    group.searchPassResults.push(entry);
+    const currentRound = Math.max(1, Number(entry.round) || 1);
+    const representativeRound = Math.max(
+      1,
+      Number(group.representative?.round) || 1,
+    );
+    if (!group.representative || currentRound >= representativeRound) {
+      group.representative = entry;
+    }
+    groupedByKeyword.set(keyword, group);
+  }
+  const byKeyword = new Map(
+    Array.from(groupedByKeyword.entries(), ([keyword, group]) => {
+      const searchPassResults = group.searchPassResults
+        .sort((left, right) =>
+          Math.max(1, Number(left.round) || 1) -
+          Math.max(1, Number(right.round) || 1),
+        );
+      return [
+        keyword,
+        {
+          ...group.representative,
+          searchPassResults,
+        },
+      ];
+    }),
+  );
   const activeKeyword = text(
     progress.keyword ||
       progress.currentKeyword ||
@@ -86,6 +127,13 @@ export function orchestrationCheckpointEntries(snapshot) {
   const existingStatus = existingEntry
     ? checkpointEntryToItemStatus(existingEntry)
     : '';
+  const activeRound = Math.max(
+    1,
+    Number(progress.round) || 0,
+    Number(progress.roundCurrent) || 0,
+    Number(checkpoint.round) || 0,
+  );
+  const existingRound = Math.max(1, Number(existingEntry?.round) || 1);
   const taskIsActivelyExecuting = ['claimed', 'running', 'recovering'].includes(
     text(snapshot?.status, 80),
   );
@@ -96,13 +144,16 @@ export function orchestrationCheckpointEntries(snapshot) {
   if (
     activeKeyword &&
     taskIsActivelyExecuting &&
-    !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus)
+    (
+      !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus) ||
+      existingRound < activeRound
+    )
   ) {
     byKeyword.set(activeKeyword, {
       ...safeJson(existingEntry),
       keyword: activeKeyword,
       status: 'running',
-      round: Math.max(1, Number(checkpoint.round) || 1),
+      round: activeRound,
       index: Math.max(
         0,
         Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex) || 0,
@@ -110,6 +161,80 @@ export function orchestrationCheckpointEntries(snapshot) {
     });
   }
   return Array.from(byKeyword.values());
+}
+
+function sequentialSearchResumeEntry(entry = {}, keyword = '') {
+  const source = safeJson(entry);
+  return {
+    round: Math.max(1, Number(source.round) || 1),
+    index: 0,
+    keyword: text(keyword || source.keyword, 120),
+    status: 'completed',
+    attemptCount: Math.max(0, Number(source.attemptCount) || 0),
+    savedCount: Math.max(0, Number(source.savedCount) || 0),
+    error: '',
+    finishedAt: orchestrationCheckpointTimestamp(source.finishedAt),
+  };
+}
+
+export function buildSequentialSearchResumeCheckpoint({
+  planSnapshot = {},
+  itemMetadata = {},
+  keyword = '',
+  now = new Date(),
+} = {}) {
+  const plan = safeJson(planSnapshot);
+  const normalizedKeyword = text(keyword, 120);
+  const searchPasses = Array.isArray(plan.searchPasses)
+    ? plan.searchPasses.map(pass => text(pass, 80)).filter(Boolean)
+    : [];
+  if (
+    text(plan.platform, 80).toLowerCase() !== 'douyin' ||
+    searchPasses.length < 2 ||
+    !normalizedKeyword
+  ) {
+    return null;
+  }
+
+  const checkpoint = safeJson(safeJson(itemMetadata).checkpoint);
+  const passResults = Array.isArray(checkpoint.searchPassResults)
+    ? checkpoint.searchPassResults
+    : [];
+  const latestByRound = new Map();
+  for (const result of passResults) {
+    const source = safeJson(result);
+    if (text(source.keyword, 120) !== normalizedKeyword) continue;
+    const round = Math.max(1, Number(source.round) || 1);
+    if (round > searchPasses.length) continue;
+    latestByRound.set(round, source);
+  }
+
+  const completedPrefix = [];
+  for (let round = 1; round <= searchPasses.length; round += 1) {
+    const result = latestByRound.get(round);
+    if (text(result?.status, 80).toLowerCase() !== 'completed') break;
+    completedPrefix.push(sequentialSearchResumeEntry(result, normalizedKeyword));
+  }
+  if (
+    completedPrefix.length === 0 ||
+    completedPrefix.length >= searchPasses.length
+  ) {
+    return null;
+  }
+
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const updatedAt = Number.isFinite(nowDate.getTime())
+    ? nowDate.toISOString()
+    : new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    round: completedPrefix.length + 1,
+    activeKeywordIndex: 0,
+    activeKeyword: '',
+    activePhase: 'pending',
+    keywordResults: completedPrefix,
+    updatedAt,
+  };
 }
 
 export function orchestrationItemAttemptStatus(itemStatus) {
@@ -187,6 +312,41 @@ export function projectElasticKeywordRecoveryStatus({
   return normalizedAttemptCount < AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
     ? 'retryable'
     : 'failed';
+}
+
+export function isExplicitUserCancellationSnapshot(task = {}, snapshot = {}) {
+  const taskMetadata = safeJson(task.metadata);
+  const snapshotMetadata = safeJson(snapshot.metadata);
+  const snapshotError = safeJson(snapshot.error);
+  const code = text(
+    snapshotError.code || snapshot.errorCode || snapshot.error_code,
+    100,
+  ).toUpperCase();
+  const category = text(
+    snapshotError.category || snapshot.errorCategory || snapshot.error_category,
+    100,
+  ).toLowerCase();
+  const cancelSource = text(
+    snapshotMetadata.cancelSource ||
+      snapshotMetadata.cancel_source ||
+      snapshotError.cancelSource ||
+      snapshotError.cancel_source,
+    80,
+  ).toLowerCase();
+  return Boolean(
+    taskMetadata.stopCommandId ||
+      EXPLICIT_USER_CANCELLATION_CODES.has(code) ||
+      category === 'user_canceled' ||
+      cancelSource === 'user'
+  );
+}
+
+export function projectCanceledChildItemStatus({
+  elasticPool = false,
+  explicitUserCancellation = false,
+} = {}) {
+  if (explicitUserCancellation) return 'canceled';
+  return elasticPool ? 'retryable' : 'needs_action';
 }
 
 export function elasticRecoveryErrorCode(source = {}) {
@@ -327,6 +487,34 @@ export async function refreshOrchestrationParentTask(tx, {
   if (!parent) return null;
   if (['canceled', 'superseded'].includes(parent.status)) return parent;
 
+  const parentMetadata = safeJson(parent.metadata);
+  const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
+
+  if (!elasticPool) {
+    // Fixed-device patrols remain single-shot. Elastic patrols use their own
+    // bounded handoff budget: one different Agent may continue an unfinished
+    // sequential search pass, and a second safety failure becomes manual.
+    await tx.execute(`
+      UPDATE capture_task_items
+      SET status = 'needs_action',
+        metadata = metadata || jsonb_build_object(
+          'automaticRetrySuppressed', true,
+          'requiresManualAction', true
+        ),
+        error = error || jsonb_build_object(
+          'automaticRetrySuppressed', true,
+          'requiresManualAction', true
+        ),
+        finished_at = COALESCE(finished_at, now()),
+        updated_at = now()
+      WHERE task_id = $1
+        AND tenant_id = $2
+        AND status = 'retryable'
+        AND started_at IS NOT NULL
+        AND COALESCE(metadata->>'disableAutomaticSearchRetry', 'false') = 'true'
+    `, [parentTaskId, tenantId]);
+  }
+
   const items = await tx.queryAll(`
     SELECT status
     FROM capture_task_items
@@ -334,8 +522,6 @@ export async function refreshOrchestrationParentTask(tx, {
     ORDER BY ordinal, id
   `, [parentTaskId, tenantId]);
   const aggregate = aggregateParentTaskItems(items);
-  const parentMetadata = safeJson(parent.metadata);
-  const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
   if (
     elasticPool &&
     aggregate.status === 'needs_action' &&

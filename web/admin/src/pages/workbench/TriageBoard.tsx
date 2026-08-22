@@ -38,10 +38,8 @@ function emptyColumns(): Record<ColKey, any[]> {
   }
 }
 
-export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite, onOpen, onChangeMode, onSaveFeishuTableNo, refreshBadges }: {
-  sentiment: string
-  platform?: string
-  keyword: string
+export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChangeMode, onSaveFeishuTableNo, refreshBadges }: {
+  filterQuery: string
   reloadKey: string
   canWrite: boolean
   onOpen: (record: any) => void
@@ -54,32 +52,32 @@ export function TriageBoard({ sentiment, platform, keyword, reloadKey, canWrite,
   const [dragId, setDragId] = useState<string | null>(null)
   const [overCol, setOverCol] = useState<ColKey | null>(null)
   const dragFrom = useRef<ColKey | null>(null)
+  const requestSeq = useRef(0)
 
   const load = useCallback(() => Promise.resolve().then(async () => {
+    const seq = ++requestSeq.current
     setLoading(true)
     try {
       const results = await Promise.all(COLUMNS.map(column => {
-        const params = new URLSearchParams({
-          queue: 'triage',
-          status: column.key,
-          pageSize: String(PER_COL),
-          sentiment,
-          platform: platform || '',
-          keyword,
-        })
+        const params = new URLSearchParams(filterQuery)
+        params.set('queue', 'triage')
+        params.set('status', column.key)
+        params.set('pageSize', String(PER_COL))
         return api.get<any>('/triage/records?' + params)
           .then(data => [column.key, data.records || []] as const)
           .catch(() => [column.key, []] as const)
       }))
+      if (seq !== requestSeq.current) return
       const next = emptyColumns()
       for (const [key, records] of results) next[key] = records
       setCols(next)
     } finally {
-      setLoading(false)
+      if (seq === requestSeq.current) setLoading(false)
     }
-  }), [sentiment, platform, keyword])
+  }), [filterQuery])
 
   useEffect(() => { void load() }, [load, reloadKey])
+  useEffect(() => () => { requestSeq.current += 1 }, [])
 
   const move = useCallback(async (id: string, from: ColKey, to: ColKey) => {
     if (from === to) return

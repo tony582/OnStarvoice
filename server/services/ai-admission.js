@@ -1,9 +1,18 @@
 const PRIORITY_RANK = Object.freeze({
-  capture: 0,
-  interactive: 1,
-  normal: 2,
+  interactive: 0,
+  normal: 1,
+  capture: 2,
   background: 3,
 });
+
+function emptyPriorityCounts() {
+  return {
+    capture: 0,
+    interactive: 0,
+    normal: 0,
+    background: 0,
+  };
+}
 
 function boundedInteger(value, fallback, min, max) {
   const parsed = Number(value);
@@ -39,6 +48,7 @@ export class AiAdmissionError extends Error {
 export class TenantAiAdmissionController {
   constructor({
     concurrency = 6,
+    captureConcurrency = 4,
     maxQueue = 500,
     queueTimeoutMs = 120000,
     now = () => Date.now(),
@@ -46,6 +56,12 @@ export class TenantAiAdmissionController {
     clearTimer = clearTimeout,
   } = {}) {
     this.concurrency = boundedInteger(concurrency, 6, 1, 20);
+    this.captureConcurrency = boundedInteger(
+      captureConcurrency,
+      Math.min(4, this.concurrency),
+      1,
+      this.concurrency,
+    );
     this.maxQueue = boundedInteger(maxQueue, 500, 1, 5000);
     this.queueTimeoutMs = boundedInteger(
       queueTimeoutMs,
@@ -64,16 +80,35 @@ export class TenantAiAdmissionController {
     const key = normalizedTenantId(tenantId);
     let state = this.states.get(key);
     if (!state) {
-      state = {active: 0, queue: []};
+      state = {active: 0, activeByPriority: emptyPriorityCounts(), queue: []};
       this.states.set(key, state);
     }
     return {key, state};
   }
 
-  bestWaiterIndex(queue) {
-    let bestIndex = 0;
-    for (let index = 1; index < queue.length; index += 1) {
+  canAdmit(state, priority) {
+    if (state.active >= this.concurrency) return false;
+    if (
+      priority === 'capture'
+      && state.activeByPriority.capture >= this.captureConcurrency
+    ) return false;
+    return true;
+  }
+
+  activate(state, priority) {
+    state.active += 1;
+    state.activeByPriority[priority] += 1;
+  }
+
+  bestWaiterIndex(queue, state) {
+    let bestIndex = -1;
+    for (let index = 0; index < queue.length; index += 1) {
       const candidate = queue[index];
+      if (!this.canAdmit(state, candidate.priority)) continue;
+      if (bestIndex < 0) {
+        bestIndex = index;
+        continue;
+      }
       const best = queue[bestIndex];
       if (
         candidate.rank < best.rank ||
@@ -96,8 +131,8 @@ export class TenantAiAdmissionController {
     const priority = normalizedPriority(options.priority);
     const kind = String(options.kind || 'llm').trim().slice(0, 80) || 'llm';
     const queuedAt = this.now();
-    if (state.active < this.concurrency && state.queue.length === 0) {
-      state.active += 1;
+    if (this.canAdmit(state, priority)) {
+      this.activate(state, priority);
       return {tenantId: key, priority, kind, waitMs: 0};
     }
     if (state.queue.length >= this.maxQueue) {
@@ -143,25 +178,33 @@ export class TenantAiAdmissionController {
     });
   }
 
-  release(tenantId) {
-    const key = normalizedTenantId(tenantId);
+  release(admission) {
+    const key = normalizedTenantId(
+      typeof admission === 'string' ? admission : admission?.tenantId,
+    );
+    const releasedPriority = normalizedPriority(
+      typeof admission === 'string' ? 'normal' : admission?.priority,
+    );
     const state = this.states.get(key);
     if (!state) return;
-    if (state.queue.length > 0) {
-      const index = this.bestWaiterIndex(state.queue);
+    state.active = Math.max(0, state.active - 1);
+    state.activeByPriority[releasedPriority] = Math.max(
+      0,
+      state.activeByPriority[releasedPriority] - 1,
+    );
+    while (state.queue.length > 0 && state.active < this.concurrency) {
+      const index = this.bestWaiterIndex(state.queue, state);
+      if (index < 0) break;
       const [waiter] = state.queue.splice(index, 1);
       this.clearTimer(waiter.timer);
+      this.activate(state, waiter.priority);
       waiter.resolve({
         tenantId: key,
         priority: waiter.priority,
         kind: waiter.kind,
         waitMs: Math.max(0, this.now() - waiter.queuedAt),
       });
-      // The released slot is transferred directly to the selected waiter, so
-      // active remains unchanged and can never briefly exceed the limit.
-      return;
     }
-    state.active = Math.max(0, state.active - 1);
     this.cleanup(key, state);
   }
 
@@ -170,18 +213,13 @@ export class TenantAiAdmissionController {
     try {
       return await operation(admission);
     } finally {
-      this.release(admission.tenantId);
+      this.release(admission);
     }
   }
 
   snapshot(tenantId = '') {
     const summarize = (key, state) => {
-      const queuedByPriority = {
-        capture: 0,
-        interactive: 0,
-        normal: 0,
-        background: 0,
-      };
+      const queuedByPriority = emptyPriorityCounts();
       for (const waiter of state.queue) {
         queuedByPriority[waiter.priority] += 1;
       }
@@ -192,7 +230,9 @@ export class TenantAiAdmissionController {
       return {
         tenantId: key,
         limit: this.concurrency,
+        captureLimit: this.captureConcurrency,
         active: state.active,
+        activeByPriority: {...state.activeByPriority},
         queued: state.queue.length,
         queuedByPriority,
         oldestWaitMs: Number.isFinite(oldestQueuedAt)
@@ -202,7 +242,11 @@ export class TenantAiAdmissionController {
     };
     if (tenantId) {
       const key = normalizedTenantId(tenantId);
-      const state = this.states.get(key) || {active: 0, queue: []};
+      const state = this.states.get(key) || {
+        active: 0,
+        activeByPriority: emptyPriorityCounts(),
+        queue: [],
+      };
       return summarize(key, state);
     }
     return Array.from(this.states.entries()).map(([key, state]) =>
@@ -212,12 +256,19 @@ export class TenantAiAdmissionController {
 }
 
 export const DEFAULT_AI_TENANT_CONCURRENCY = 6;
+export const DEFAULT_AI_CAPTURE_CONCURRENCY = 4;
 export const DEFAULT_AI_QUEUE_TIMEOUT_MS = 120000;
 
 const controller = new TenantAiAdmissionController({
   concurrency: boundedInteger(
     process.env.AI_TENANT_CONCURRENCY,
     DEFAULT_AI_TENANT_CONCURRENCY,
+    1,
+    20,
+  ),
+  captureConcurrency: boundedInteger(
+    process.env.AI_TENANT_CAPTURE_CONCURRENCY,
+    DEFAULT_AI_CAPTURE_CONCURRENCY,
     1,
     20,
   ),

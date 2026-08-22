@@ -22,6 +22,7 @@ import {
   captureTaskBusinessRootVisibilitySql,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  buildSequentialSearchResumeCheckpoint,
   classifyCaptureRecoveryDisposition,
   crossDeviceRetryAgentSupportsTask,
   crossDeviceRetryItemNeedsManualSafety,
@@ -31,12 +32,14 @@ import {
   projectElasticAttemptBudget,
   elasticRecoveryHoldRemainingMs,
   isProfilePatrolTask,
+  isExplicitUserCancellationSnapshot,
   lockActiveCaptureAgentSession,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
   projectElasticKeywordRecoveryStatus,
+  projectCanceledChildItemStatus,
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
@@ -256,6 +259,88 @@ test("recovery grading keeps captcha current and automates technical or unstarte
     attempt_count: 3,
     error: {code: "TAB_NOT_FOUND"},
   }), {kind: "automatic_attempts_exhausted", automatic: false});
+});
+
+test("only explicit operator cancellation is terminal", () => {
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: true,
+      explicitUserCancellation: true,
+    }),
+    "canceled",
+  );
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: true,
+      explicitUserCancellation: false,
+    }),
+    "retryable",
+  );
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: false,
+      explicitUserCancellation: false,
+    }),
+    "needs_action",
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {stopCommandId: "11111111-1111-4111-8111-111111111111"}},
+      {status: "canceled", error: {}},
+    ),
+    true,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "USER_CANCELED", category: "user_canceled"},
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "runner_owner_disconnected"},
+        message: "用户手动中止当前采集任务",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "STALE_TASK_HEARTBEAT_TIMEOUT", retryable: true},
+      },
+    ),
+    false,
+  );
+});
+
+test("elastic timeout fences reject stale snapshots from the revoked attempt", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "async function dispatchNextElasticWorkItem",
+  );
+  assert.match(
+    mirror,
+    /ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT/u,
+  );
+  assert.match(
+    mirror,
+    /EXCLUDED\.attempt_number = capture_tasks\.attempt_number/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /unexpectedChildCancellation/u,
+  );
+  assert.match(captureCloudRouteSource, /UNEXPECTED_TASK_CANCELLATION/u);
 });
 
 test("elastic keyword recovery is patient, bounded, and escalates safety only after a cross-Agent check", () => {
@@ -749,6 +834,128 @@ test("orchestration checkpoint projection never reopens a terminal activeKeyword
   assert.deepEqual(
     resumedEntries.map(entry => [entry.keyword, entry.status]),
     [["雪佛兰", "completed"], ["凯迪拉克", "running"]],
+  );
+});
+
+test("sequential Douyin checkpoints retain both passes and resume only the unfinished pass", () => {
+  const runningEntries = orchestrationCheckpointEntries({
+    status: "running",
+    progress: {keyword: "别克壁纸", roundCurrent: 2},
+    checkpoint: {
+      round: 2,
+      activeKeyword: "别克壁纸",
+      keywordResults: [
+        {
+          round: 1,
+          keyword: "别克壁纸",
+          status: "completed",
+          savedCount: 8,
+        },
+      ],
+    },
+  });
+  assert.equal(runningEntries[0].round, 2);
+  assert.equal(runningEntries[0].status, "running");
+  assert.deepEqual(
+    runningEntries[0].searchPassResults.map(entry => [entry.round, entry.status]),
+    [[1, "completed"]],
+  );
+
+  const entries = orchestrationCheckpointEntries({
+    status: "needs_action",
+    checkpoint: {
+      round: 2,
+      activeKeyword: "别克壁纸",
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "别克壁纸",
+          status: "completed",
+          attemptCount: 1,
+          savedCount: 8,
+          finishedAt: "2026-08-22T00:10:00.000Z",
+        },
+        {
+          round: 2,
+          index: 0,
+          keyword: "别克壁纸",
+          status: "failed",
+          attemptCount: 1,
+          savedCount: 0,
+          errorCode: "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+          finishedAt: "2026-08-22T00:12:00.000Z",
+        },
+      ],
+    },
+  });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].round, 2);
+  assert.equal(entries[0].status, "failed");
+  assert.deepEqual(
+    entries[0].searchPassResults.map(entry => [entry.round, entry.status]),
+    [[1, "completed"], [2, "failed"]],
+  );
+
+  const checkpoint = buildSequentialSearchResumeCheckpoint({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {checkpoint: entries[0]},
+    keyword: "别克壁纸",
+    now: new Date("2026-08-22T00:15:00.000Z"),
+  });
+  assert.deepEqual(checkpoint, {
+    schemaVersion: 1,
+    round: 2,
+    activeKeywordIndex: 0,
+    activeKeyword: "",
+    activePhase: "pending",
+    keywordResults: [
+      {
+        round: 1,
+        index: 0,
+        keyword: "别克壁纸",
+        status: "completed",
+        attemptCount: 1,
+        savedCount: 8,
+        error: "",
+        finishedAt: "2026-08-22T00:10:00.000Z",
+      },
+    ],
+    updatedAt: "2026-08-22T00:15:00.000Z",
+  });
+  assert.equal(buildSequentialSearchResumeCheckpoint({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {
+      checkpoint: {
+        searchPassResults: [
+          {round: 1, keyword: "别克壁纸", status: "failed"},
+        ],
+      },
+    },
+    keyword: "别克壁纸",
+  }), null);
+});
+
+test("elastic sequential patrol keeps one bounded cross-agent handoff", () => {
+  const refresh = readSourceSection(
+    controlOutcomeProjectionSource,
+    "control outcome projection",
+    "export async function refreshOrchestrationParentTask",
+    "export async function projectOrchestrationChildControlOutcome",
+  );
+  assert.match(
+    refresh,
+    /const elasticPool = parentMetadata\.distributionMode === 'elastic_pool';[\s\S]*if \(!elasticPool\) \{[\s\S]*automaticRetrySuppressed/u,
+  );
+  assert.doesNotMatch(
+    refresh.slice(0, refresh.indexOf("if (!elasticPool)")),
+    /automaticRetrySuppressed/u,
   );
 });
 
@@ -2011,6 +2218,48 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
     unattendedPlan.planSnapshot.customDates,
     "2026-10-01\n2028-02-29\n2026-01-02",
   );
+});
+
+test("remote sequential search passes force verified filters and disable hidden retries", () => {
+  const sequential = normalizeRemoteTaskInput({
+    executionMode: "one_time",
+    platform: "douyin",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "video"],
+  });
+  assert.deepEqual(sequential.planSnapshot.searchPasses, ["all", "video"]);
+  assert.equal(sequential.planSnapshot.searchFilters.contentType, "all");
+  assert.equal(
+    sequential.planSnapshot.recoveryPolicy.disableAutomaticSearchRetry,
+    true,
+  );
+  assert.equal(sequential.planSnapshot.recoveryPolicy.requireVerifiedFilters, true);
+
+  const xhs = normalizeRemoteTaskInput({
+    executionMode: "unattended_plan",
+    platform: "xiaohongshu",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "image"],
+  });
+  assert.equal(Object.hasOwn(xhs.planSnapshot, "searchPasses"), false);
+  assert.equal(
+    Object.hasOwn(xhs.planSnapshot.recoveryPolicy, "disableAutomaticSearchRetry"),
+    false,
+  );
+
+  const constrained = normalizeRemoteTaskInput({
+    executionMode: "one_time",
+    platform: "douyin",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "image"],
+    searchFilters: {
+      publishTime: ["day", "week"],
+      sort: ["latest", "likes"],
+    },
+  });
+  assert.equal(constrained.planSnapshot.searchFilters.publishTime, "day");
+  assert.equal(constrained.planSnapshot.searchFilters.sort, "latest");
+  assert.deepEqual(constrained.planSnapshot.searchPasses, ["all", "image"]);
 });
 
 test("remote keyword post limits are optional, normalized, and fail safely", () => {

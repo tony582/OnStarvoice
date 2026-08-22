@@ -99,6 +99,38 @@ test("checkpoint normalization keeps bounded per-keyword history for task detail
   ]);
 });
 
+test("checkpoint normalization retains confirmed Xiaohongshu page evidence", () => {
+  const run = core.normalizeTaskRun({
+    id: "run-xhs-safety",
+    status: "needs_action",
+    checkpoint: {
+      keywordResults: [{
+        round: 1,
+        keyword: "安吉星",
+        status: "failed",
+        errorCode: "XHS_SECURITY_BLOCK",
+        errorCategory: "platform_safety_block",
+        securityBlocked: true,
+        platformSafetyBlocked: true,
+        requiresManualAction: true,
+        securityEvidence: {
+          confirmed: true,
+          platform: "xiaohongshu",
+          variant: "cn_rate_limit_300013",
+          language: "zh-CN",
+          reason: "rate_limit",
+        },
+      }],
+    },
+  }, {now: NOW});
+
+  const entry = run.checkpoint.keywordResults[0];
+  assert.equal(entry.securityBlocked, true);
+  assert.equal(entry.platformSafetyBlocked, true);
+  assert.equal(entry.requiresManualAction, true);
+  assert.equal(entry.securityEvidence.variant, "cn_rate_limit_300013");
+});
+
 test("terminal status absorbs later updates", () => {
   const completed = core.normalizeTaskRun(
     {
@@ -190,7 +222,7 @@ test("ledger normalization never lets an old terminal attempt overwrite a newer 
   assert.equal(ledger.runs[0].status, "running");
 });
 
-test("stale active tasks are terminally reconciled while live tasks stay running", () => {
+test("stale active tasks fail retryably while live tasks stay running", () => {
   const ledger = core.reconcileStaleTaskLedger(
     {
       runs: [
@@ -217,11 +249,19 @@ test("stale active tasks are terminally reconciled while live tasks stay running
     },
   );
 
-  assert.equal(ledger.runs.find((run) => run.id === "stale-run").status, "canceled");
+  assert.equal(ledger.runs.find((run) => run.id === "stale-run").status, "failed");
   assert.equal(ledger.runs.find((run) => run.id === "live-run").status, "running");
   assert.match(
     ledger.runs.find((run) => run.id === "stale-run").message,
-    /自动结束陈旧任务记录/,
+    /等待重新分配/,
+  );
+  assert.equal(
+    ledger.runs.find((run) => run.id === "stale-run").error.code,
+    "STALE_TASK_HEARTBEAT_TIMEOUT",
+  );
+  assert.equal(
+    ledger.runs.find((run) => run.id === "stale-run").error.retryable,
+    true,
   );
 });
 

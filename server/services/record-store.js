@@ -324,6 +324,40 @@ function meaningful(value) {
   return true;
 }
 
+function parseObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function resolveRecordRelabelReason(existing = {}, incoming = {}, changedFields = []) {
+  const fields = new Set(Array.isArray(changedFields) ? changedFields : []);
+  const existingPayload = parseObject(existing.payload);
+  const incomingPayload = parseObject(incoming.payload);
+  if (
+    String(existingPayload.detailCaptureStatus || '') !== 'done'
+    && String(incomingPayload.detailCaptureStatus || '') === 'done'
+  ) return 'detail_completed';
+  if (fields.has('content') && meaningful(incoming.content)) return 'content_enriched';
+  if (fields.has('comments_text') && meaningful(incoming.comments_text)) return 'comments_enriched';
+
+  const aiResult = parseObject(existing.ai_result);
+  const previousRelevance = String(aiResult.relevance || '').trim().toLowerCase();
+  const previousKeyword = String(existing.keyword || '').trim().toLocaleLowerCase();
+  const incomingKeyword = String(incoming.keyword || '').trim().toLocaleLowerCase();
+  if (
+    ['irrelevant', 'uncertain'].includes(previousRelevance)
+    && incomingKeyword
+    && incomingKeyword !== previousKeyword
+  ) return 'new_keyword_context';
+  return '';
+}
+
 function compareValue(existingValue, nextValue) {
   if (!meaningful(nextValue)) return false;
   if (Array.isArray(existingValue) || typeof existingValue === 'object') {
@@ -490,6 +524,11 @@ export async function upsertCapturedRecord(record, context) {
 
     if (existing) {
       const changedFields = detectChangedFields(existing, { ...record, tags, image_urls: imageUrls, payload });
+      const relabelReason = resolveRecordRelabelReason(
+        existing,
+        { ...record, tags, image_urls: imageUrls, payload },
+        changedFields,
+      );
 
       await tx.execute(`
         UPDATE records SET
@@ -594,6 +633,9 @@ export async function upsertCapturedRecord(record, context) {
         id: existing.id,
         action: 'updated',
         observationId,
+        shouldRelabel: Boolean(relabelReason),
+        relabelReason,
+        changedFields,
         officialContent: officialResolution.officialContent,
         officialContentSource: officialResolution.source,
       };

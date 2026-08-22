@@ -1891,6 +1891,24 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
           enabled: true,
           platform: "douyin",
           keywords: ["弹性工作项"],
+          searchPasses: ["general", "note"],
+        },
+        checkpoint: {
+          schemaVersion: 1,
+          round: 2,
+          activeKeywordIndex: 0,
+          activeKeyword: "",
+          activePhase: "pending",
+          keywordResults: [
+            {
+              round: 1,
+              index: 0,
+              keyword: "弹性工作项",
+              status: "completed",
+              attemptCount: 1,
+              savedCount: 3,
+            },
+          ],
         },
         orchestration: {
           parentTaskId: "parent-elastic-context",
@@ -1914,6 +1932,15 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
   assert.equal(
     request.orchestrationContext.distributionMode,
     "elastic_pool",
+  );
+  assert.equal(request.checkpoint.round, 2);
+  assert.deepEqual(
+    Array.from(request.checkpoint.keywordResults, entry => [
+      entry.round,
+      entry.keyword,
+      entry.status,
+    ]),
+    [[1, "弹性工作项", "completed"]],
   );
   assert.equal(
     request.orchestrationContext.attemptIdentity,
@@ -2695,20 +2722,22 @@ test("canceling a cloud one-off leaves the recurring local plan result untouched
 
 test("switching capture-agent identity does not mirror the previous tenant's local plan or history", async () => {
   const harness = createHarness();
+  const initialCreatedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const initialUpdatedAt = new Date(Date.now() - 60 * 1000).toISOString();
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-a", token: "token-a"},
   };
   harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
     keywords: ["客户 A 计划"],
-    updatedAt: "2026-07-20T01:00:00.000Z",
+    updatedAt: initialUpdatedAt,
   });
   harness.storage[TASK_LEDGER_KEY] = {
     version: 1,
     runs: [{
       id: "customer-a-task",
       status: "completed",
-      createdAt: "2026-07-20T01:00:00.000Z",
-      updatedAt: "2026-07-20T01:05:00.000Z",
+      createdAt: initialCreatedAt,
+      updatedAt: initialUpdatedAt,
     }],
   };
 
@@ -4940,6 +4969,90 @@ test("tabs.onReplaced migrates a persistent capture source instead of canceling 
   );
 });
 
+test("a stale sidebar relay follows only the exact Chrome replacement mapping", async () => {
+  const harness = createHarness();
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: 1,
+    status: "complete",
+    title: "小红书搜索",
+    url: "https://www.xiaohongshu.com/search_result?keyword=别克壁纸",
+  }));
+  const taskId = "xiaohongshu-tab-replaced-relay";
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true);
+  assert.equal(
+    await harness.api.handleCaptureRuntimeTabReplaced(44, 41),
+    true,
+  );
+  harness.setTabMissing(41, true);
+  harness.setTabMessageHandler(async (tabId) => {
+    if (tabId === 41) throw new Error("No tab with id: 41");
+    return {ok: true, data: {saved: 1}};
+  });
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:relay-to-content",
+    tabId: 41,
+    payload: {
+      action: "captureKeywordNotes",
+      keyword: "别克壁纸",
+      taskId,
+      taskContext: {taskId},
+      listCaptureRunId: "xiaohongshu-replaced-list-run",
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 44 && payload?.action === "captureKeywordNotes",
+    ),
+    true,
+  );
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 41 && payload?.action === "captureKeywordNotes",
+    ),
+    false,
+  );
+
+  const mismatched = await harness.sendBackgroundMessage({
+    type: "onstarvoice:relay-to-content",
+    tabId: 41,
+    payload: {
+      action: "captureKeywordNotes",
+      keyword: "另一个任务",
+      taskId: "different-task",
+      taskContext: {taskId: "different-task"},
+      listCaptureRunId: "different-list-run",
+    },
+  });
+  assert.equal(mismatched.ok, false);
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 41 && payload?.keyword === "另一个任务",
+    ),
+    true,
+  );
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 44 && payload?.keyword === "另一个任务",
+    ),
+    false,
+  );
+});
+
 test("unattended recovery releases the previous child Debug group before relaunching from checkpoint", async () => {
   const harness = createHarness();
   const keywords = Array.from({length: 13}, (_, index) => `关键词${index + 1}`);
@@ -6118,8 +6231,13 @@ test("task ledger reads reconcile abandoned running records", async () => {
   });
 
   assert.equal(response.ok, true);
-  assert.equal(response.data.runs[0].status, "canceled");
-  assert.equal(harness.storage[TASK_LEDGER_KEY].runs[0].status, "canceled");
+  assert.equal(response.data.runs[0].status, "failed");
+  assert.equal(
+    response.data.runs[0].error.code,
+    "STALE_TASK_HEARTBEAT_TIMEOUT",
+  );
+  assert.equal(response.data.runs[0].error.retryable, true);
+  assert.equal(harness.storage[TASK_LEDGER_KEY].runs[0].status, "failed");
 });
 
 test("clearing task center removes history but preserves a recently active task", async () => {

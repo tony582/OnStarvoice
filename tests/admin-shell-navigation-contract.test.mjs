@@ -25,6 +25,14 @@ test('desktop shell gives the workspace full height while preserving navigation 
   assert.doesNotMatch(desktopApp, /calc\(100dvh-3\.5rem\)|lg:ml-\[240px\]/u)
 })
 
+test('desktop navigation does not decorate dispatch or opinion analysis as preview features', () => {
+  assert.match(sidebar, /\{ id: 'dispatch', label: '调度中心', icon: Waypoints \}/u)
+  assert.match(sidebar, /\{ id: 'opinion-analysis', label: '舆情剖析', icon: ScanSearch \}/u)
+  assert.doesNotMatch(sidebar, /id: 'dispatch'[^\n]*tag:/u)
+  assert.doesNotMatch(sidebar, /id: 'opinion-analysis'[^\n]*tag:/u)
+  assert.doesNotMatch(desktopApp, /badge=\{page === 'dispatch'/u)
+})
+
 test('bottom-left account menu owns workspace and personal controls for every user', () => {
   const accountStart = sidebar.indexOf('左下账号入口')
   assert.notEqual(accountStart, -1)

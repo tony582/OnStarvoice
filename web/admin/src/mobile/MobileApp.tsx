@@ -434,7 +434,7 @@ function MonitorHub({ openPage }: { openPage: OpenPage }) {
         <button type="button" onClick={() => openPage('dispatch')}
           className="w-full rounded-2xl bg-[#10233f] p-4 text-left text-white active:opacity-90 dark:bg-[#dfe8ff] dark:text-[#10233f]">
           <span className="flex items-center gap-2 text-[10px] font-extrabold uppercase tracking-[0.16em] opacity-65">
-            <ServerCog className="h-4 w-4" />任务与设备<span className="rounded border border-current/25 px-1.5 py-0.5 text-[8px] tracking-[0.1em]">BETA</span>
+            <ServerCog className="h-4 w-4" />任务与设备
           </span>
           <span className="mt-3 flex items-center gap-2 text-[21px] font-extrabold tracking-[-0.025em]">调度中心<ChevronRight className="ml-auto h-5 w-5 opacity-70" /></span>
           <span className="mt-1 block text-[11px] leading-5 opacity-70">先看执行中与需处理任务，再按需切到 Agent 设备。</span>
@@ -472,7 +472,7 @@ function InsightsHub({ openPage }: { openPage: OpenPage }) {
             className="mt-2 w-full rounded-2xl border border-border bg-card p-4 text-left active:bg-muted">
             <div className="flex items-start gap-3">
               <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-status-purple/10 text-status-purple"><ScanSearch className="h-5 w-5" /></span>
-              <span className="min-w-0 flex-1"><span className="flex items-center gap-1.5 text-[15px] font-bold">舆情剖析<span className="rounded bg-status-green/15 px-1 py-0.5 text-[8px] font-extrabold tracking-[0.1em] text-emerald-600 dark:text-emerald-400">NEW</span></span><span className="mt-1 block text-[11px] leading-5 text-muted-foreground">圈定话题深度拆解：风险研判、观点情绪、传播与应对口径</span></span>
+              <span className="min-w-0 flex-1"><span className="block text-[15px] font-bold">舆情剖析</span><span className="mt-1 block text-[11px] leading-5 text-muted-foreground">圈定话题深度拆解：风险研判、观点情绪、传播与应对口径</span></span>
               <ChevronRight className="mt-1 h-4 w-4 text-muted-foreground" />
             </div>
           </button>
@@ -617,7 +617,7 @@ function MobilePageSurface() {
       <header className="mobile-page-header sticky top-0 z-20 flex min-h-[56px] items-center gap-2 border-b border-border/80 bg-background/95 px-2 pt-[env(safe-area-inset-top)] backdrop-blur-xl">
         <button type="button" onClick={() => location.key === 'default' ? routerNavigate(`/m/${backRoot}`, { replace: true }) : routerNavigate(-1)} aria-label="返回"
           className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full active:bg-muted"><ArrowLeft className="h-5 w-5" /></button>
-        <div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">StarVoice mobile</div><div className="flex min-w-0 items-center gap-2"><h1 className="truncate text-[17px] font-extrabold tracking-[-0.02em]">{title}</h1>{pageId === 'dispatch' && <span className="shrink-0 rounded border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[8px] font-extrabold uppercase tracking-[0.12em] text-primary">BETA</span>}</div></div>
+        <div className="min-w-0 flex-1"><div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">StarVoice mobile</div><div className="flex min-w-0 items-center gap-2"><h1 className="truncate text-[17px] font-extrabold tracking-[-0.02em]">{title}</h1></div></div>
         <button type="button" onClick={() => routerNavigate('/m/more')} aria-label="更多功能" className="flex h-11 w-11 items-center justify-center rounded-full active:bg-muted"><MoreHorizontal className="h-5 w-5" /></button>
       </header>
       <div className="mobile-feature-page animate-fade-up px-3 py-3" key={`${pageId}:${seq}:${tenantId}:${querySignature}`}>

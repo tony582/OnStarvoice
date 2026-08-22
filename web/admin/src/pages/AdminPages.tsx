@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
-import { Loader2, Building2, Users, KeyRound, Save, Pencil } from 'lucide-react'
+import { Loader2, Building2, Users, KeyRound, Save, Pencil, Copy, RefreshCw, Trash2, Laptop, FlaskConical } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatExpiry, LABELS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -681,18 +681,46 @@ type AiFailoverStatus = {
   nextPrimaryProbeAt?: string
 }
 
+type LlmRelayAgent = {
+  id: string
+  name: string
+  online: boolean
+  last_seen_at?: string
+  revoked_at?: string
+  created_at?: string
+}
+
+type LlmRelayAgentsResponse = {
+  agents?: LlmRelayAgent[]
+}
+
+type LlmRelayTokenResponse = {
+  token?: string
+}
+
+type LlmRelayTestResponse = {
+  model?: string
+  latencyMs?: number
+}
+
 export function SettingsPage() {
   const { refresh: refreshBadges } = useBadges()
   const [settings, setSettings] = useState<Record<string, string>>({})
   const [aiFailoverStatus, setAiFailoverStatus] = useState<AiFailoverStatus | null>(null)
+  const [llmRelayAgents, setLlmRelayAgents] = useState<LlmRelayAgent[]>([])
+  const [llmRelayToken, setLlmRelayToken] = useState('')
+  const [llmRelayBusy, setLlmRelayBusy] = useState(false)
+  const [llmRelayMessage, setLlmRelayMessage] = useState('')
   const [loading, setLoading] = useState(true)
 
   const loadSettings = useCallback(() => Promise.all([
       api.get<any>('/admin/settings'),
       api.get<any>('/admin/official-accounts'),
-    ]).then(([sData]) => {
+      api.get<LlmRelayAgentsResponse>('/admin/llm-relay-agents'),
+    ]).then(([sData, , relayData]) => {
       setSettings(sData.settings || {})
       setAiFailoverStatus(sData.aiFailoverStatus || null)
+      setLlmRelayAgents(relayData.agents || [])
     }), [])
 
   useEffect(() => {
@@ -704,6 +732,11 @@ export function SettingsPage() {
     if (group === 'llm') {
       body.llm_provider = settings.llm_provider; body.llm_model = settings.llm_model
       for (const key of [
+        'relevance_prefilter_llm_provider',
+        'relevance_prefilter_llm_model',
+        'relevance_prefilter_llm_api_endpoint',
+      ]) body[key] = settings[key] || ''
+      for (const key of [
         'llm_failover_enabled',
         'llm_failover_primary_model',
         'llm_failover_backup_model',
@@ -714,6 +747,8 @@ export function SettingsPage() {
         'llm_failover_recovery_success_threshold',
       ]) body[key] = settings[key] || ''
       const key = settings._llm_api_key; if (key) body.llm_api_key = key
+      const prefilterKey = settings._relevance_prefilter_llm_api_key
+      if (prefilterKey) body.relevance_prefilter_llm_api_key = prefilterKey
     } else if (group === 'brand') {
       for (const k of ['brand_name', 'brand_aliases', 'brand_business_context', 'brand_relevance_terms', 'brand_noise_terms']) body[k] = settings[k] || ''
     } else if (group === 'email') {
@@ -732,16 +767,69 @@ export function SettingsPage() {
       for (const k of ['report_daily_time', 'report_weekly_time', 'report_monthly_day', 'report_monthly_time']) body[k] = settings[k]
     } else if (group === 'comment-risk') {
       body.comment_risk_attention_enabled = settings.comment_risk_attention_enabled === 'false' ? 'false' : 'true'
+    } else if (group === 'llm-relay') {
+      body.llm_relay_mode = settings.llm_relay_mode || 'off'
+      body.llm_relay_model = settings.llm_relay_model || 'gemini-3.7-flash-low'
     }
     await api.put('/admin/settings', body)
-    if (group === 'llm') await loadSettings()
+    if (group === 'llm' || group === 'llm-relay') await loadSettings()
     if (group === 'comment-risk') refreshBadges()
     alert('保存成功')
   }
 
   const u = (key: string, val: string) => setSettings(prev => ({ ...prev, [key]: val }))
 
+  const rotateLlmRelayToken = async () => {
+    setLlmRelayBusy(true); setLlmRelayMessage('')
+    try {
+      const data = await api.post<LlmRelayTokenResponse>('/admin/llm-relay-agents/rotate', { name: '本机 Antigravity' })
+      setLlmRelayToken(data.token || '')
+      setLlmRelayMessage('新令牌已生成。旧令牌已经失效。')
+      await loadSettings()
+    } catch (error) {
+      setLlmRelayMessage('生成失败：' + (error instanceof Error ? error.message : '未知错误'))
+    } finally {
+      setLlmRelayBusy(false)
+    }
+  }
+
+  const revokeLlmRelayAgent = async (id: string) => {
+    if (!confirm('撤销后，本机 Agent 会立即失效。确定撤销吗？')) return
+    setLlmRelayBusy(true); setLlmRelayMessage('')
+    try {
+      await api.delete('/admin/llm-relay-agents/' + id)
+      setLlmRelayToken('')
+      setLlmRelayMessage('本机 Agent 已撤销。')
+      await loadSettings()
+    } catch (error) {
+      setLlmRelayMessage('撤销失败：' + (error instanceof Error ? error.message : '未知错误'))
+    } finally {
+      setLlmRelayBusy(false)
+    }
+  }
+
+  const testLlmRelayAgent = async () => {
+    setLlmRelayBusy(true); setLlmRelayMessage('')
+    try {
+      const data = await api.post<LlmRelayTestResponse>('/admin/llm-relay-agents/test', {})
+      setLlmRelayMessage(`测试成功：${data.model || '本机模型'}，${Number(data.latencyMs || 0)} ms。现在可以再启用“最终判断优先使用本机”。`)
+      await loadSettings()
+    } catch (error) {
+      setLlmRelayMessage('测试失败：' + (error instanceof Error ? error.message : '未知错误'))
+    } finally {
+      setLlmRelayBusy(false)
+    }
+  }
+
+  const copyLlmRelayToken = async () => {
+    if (!llmRelayToken) return
+    await navigator.clipboard.writeText(llmRelayToken)
+    setLlmRelayMessage('令牌已复制。')
+  }
+
   if (loading) return <Spin />
+
+  const activeLlmRelayAgent = llmRelayAgents.find(agent => !agent.revoked_at)
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
@@ -750,6 +838,16 @@ export function SettingsPage() {
           <Field label="提供商"><Input value={settings.llm_provider || ''} onChange={e => u('llm_provider', e.target.value)} /></Field>
           <Field label="当前手工模型"><Input value={settings.llm_model || ''} onChange={e => u('llm_model', e.target.value)} /></Field>
           <Field label="API Key" full><Input type="password" value={settings._llm_api_key || ''} onChange={e => u('_llm_api_key', e.target.value)} placeholder="留空不修改" /></Field>
+          <div className="rounded-lg border border-border bg-muted/30 p-3 lg:col-span-2">
+            <div className="text-sm font-semibold text-foreground">采集前 AI 预判</div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">
+              独立于采集后的相关性和情感终判。建议使用千问 Flash，并固定关闭思考模式；留空则沿用上方模型。
+            </div>
+          </div>
+          <Field label="预判提供商"><Input value={settings.relevance_prefilter_llm_provider || ''} onChange={e => u('relevance_prefilter_llm_provider', e.target.value)} placeholder="qianwen" /></Field>
+          <Field label="预判模型"><Input value={settings.relevance_prefilter_llm_model || ''} onChange={e => u('relevance_prefilter_llm_model', e.target.value)} placeholder="qwen3.7-flash-2026-07-15" /></Field>
+          <Field label="预判 API 地址" full><Input value={settings.relevance_prefilter_llm_api_endpoint || ''} onChange={e => u('relevance_prefilter_llm_api_endpoint', e.target.value)} placeholder="阿里云百炼 OpenAI 兼容地址" /></Field>
+          <Field label="预判 API Key" full><Input type="password" value={settings._relevance_prefilter_llm_api_key || ''} onChange={e => u('_relevance_prefilter_llm_api_key', e.target.value)} placeholder="留空不修改" /></Field>
           <label className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3 lg:col-span-2">
             <input
               type="checkbox"
@@ -788,6 +886,92 @@ export function SettingsPage() {
                 : ''}
             </div>
           </div>
+        </div>
+      </SettingsCard>
+
+      <SettingsCard
+        title="本机 Antigravity AI"
+        description="由你的 Mac 主动向阿里云领取列表前置预判及最终相关性与情感判断，不开放本机端口。"
+        onSave={() => save('llm-relay')}
+      >
+        <div className="grid gap-3 lg:grid-cols-2">
+          <Field label="使用方式">
+            <select
+              value={settings.llm_relay_mode || 'off'}
+              onChange={event => u('llm_relay_mode', event.target.value)}
+              className="h-11 w-full rounded-md border border-input bg-background px-3 text-sm lg:h-9"
+            >
+              <option value="off">关闭</option>
+              <option value="primary">前置预判和最终判断优先使用本机，忙碌或离线时立即走云模型</option>
+              <option value="fallback">前置预判和最终判断在云模型失败后使用本机</option>
+            </select>
+          </Field>
+          <Field label="Antigravity 模型">
+            <select
+              value={settings.llm_relay_model || 'gemini-3.7-flash-low'}
+              onChange={event => u('llm_relay_model', event.target.value)}
+              className="h-11 w-full rounded-md border border-input bg-background px-3 text-sm lg:h-9"
+            >
+              <option value="gemini-3.7-flash-low">Gemini 3.7 Flash Low（批量推荐）</option>
+              <option value="gemini-3.1-pro-low">Gemini 3.1 Pro Low（质量优先）</option>
+            </select>
+          </Field>
+
+          <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs leading-5 lg:col-span-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Laptop className="h-4 w-4 text-primary" />
+                <span className="font-semibold text-foreground">本机 Agent</span>
+                <StatusBadge tone={activeLlmRelayAgent?.online ? 'active' : 'neutral'}>
+                  {activeLlmRelayAgent?.online ? '在线' : activeLlmRelayAgent ? '离线' : '未配置'}
+                </StatusBadge>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => loadSettings()} disabled={llmRelayBusy}>
+                  <RefreshCw className="h-3.5 w-3.5" />刷新状态
+                </Button>
+                <Button size="sm" variant="outline" onClick={testLlmRelayAgent} disabled={llmRelayBusy || !activeLlmRelayAgent?.online}>
+                  <FlaskConical className="h-3.5 w-3.5" />测试本机 AI
+                </Button>
+                <Button size="sm" variant="outline" onClick={rotateLlmRelayToken} disabled={llmRelayBusy}>
+                  {llmRelayBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+                  {activeLlmRelayAgent ? '轮换令牌' : '生成令牌'}
+                </Button>
+                {activeLlmRelayAgent && (
+                  <Button size="sm" variant="outline" onClick={() => revokeLlmRelayAgent(activeLlmRelayAgent.id)} disabled={llmRelayBusy}>
+                    <Trash2 className="h-3.5 w-3.5" />撤销
+                  </Button>
+                )}
+              </div>
+            </div>
+            <p className="mt-2 text-muted-foreground">
+              阿里云只运行 StarVoice 后端；你的 Mac 上 Antigravity 和本机 Agent 都要保持运行。Agent 只向外连接阿里云，不会领取或修改采集任务。
+            </p>
+            <p className="mt-1 text-muted-foreground">
+              当前接列表前置预判（每批最多 8 条）及最终相关性与情感判断；报告和关键词分析仍使用各自的云模型。本机一次处理 1 个批次，忙碌时新请求立即回退云模型，不会排队等待。
+            </p>
+            {activeLlmRelayAgent?.last_seen_at && (
+              <p className="mt-1 text-muted-foreground">最近连接：{formatDate(activeLlmRelayAgent.last_seen_at)}</p>
+            )}
+          </div>
+
+          {llmRelayToken && (
+            <div className="rounded-lg border border-status-yellow/40 bg-status-yellow/5 p-3 lg:col-span-2">
+              <div className="text-xs font-semibold text-foreground">一次性 Agent 令牌</div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                离开本页后无法再次查看；复制后在 Mac 运行一次本机安装器，安装器会让你填写阿里云地址和此令牌，并安全保存到 macOS 钥匙串。以后登录 Mac 会自动启动，无需每天重新填写。
+              </p>
+              <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                <Input readOnly value={llmRelayToken} className="font-mono text-xs" />
+                <Button variant="outline" onClick={copyLlmRelayToken}><Copy className="h-4 w-4" />复制</Button>
+              </div>
+            </div>
+          )}
+          {llmRelayMessage && (
+            <p className={`text-xs lg:col-span-2 ${llmRelayMessage.includes('失败') ? 'text-status-red' : 'text-status-green'}`}>
+              {llmRelayMessage}
+            </p>
+          )}
         </div>
       </SettingsCard>
 

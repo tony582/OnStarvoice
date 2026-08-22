@@ -39,6 +39,8 @@ const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
   latest: '最新发布',
   likes: '最多点赞',
+  comments: '最多评论',
+  collects: '最多收藏',
 }
 
 const PUBLISH_TIME_LABELS: Record<string, string> = {
@@ -46,6 +48,29 @@ const PUBLISH_TIME_LABELS: Record<string, string> = {
   day: '一天内',
   week: '一周内',
   halfyear: '半年内',
+}
+
+const CONTENT_TYPE_LABELS: Record<string, string> = {
+  all: '全部内容',
+  video: '视频',
+  image: '图文',
+}
+const SEARCH_SCOPE_LABELS: Record<string, string> = {
+  all: '全部范围',
+  viewed: '已看过',
+  unviewed: '未看过',
+  followed: '已关注',
+}
+const DISTANCE_LABELS: Record<string, string> = {
+  all: '不限距离',
+  city: '同城',
+  nearby: '附近',
+}
+const VIDEO_DURATION_LABELS: Record<string, string> = {
+  all: '不限时长',
+  under_1m: '1 分钟以内',
+  '1_5m': '1–5 分钟',
+  over_5m: '5 分钟以上',
 }
 
 const SUCCESS_ITEM_STATUSES = new Set(['completed', 'completed_with_warnings'])
@@ -1135,6 +1160,14 @@ export function OrchestrationDetailWorkspace({
     : metadata.recoveryPolicy && typeof metadata.recoveryPolicy === 'object'
       ? metadata.recoveryPolicy as Record<string, unknown>
       : {}
+  const searchPasses = (Array.isArray(planSnapshot.searchPasses) ? planSnapshot.searchPasses : [])
+    .map(value => String(value || '').trim())
+    .filter(value => ['all', 'image', 'video'].includes(value))
+    .slice(0, 2)
+  const sequentialSearchEnabled = searchPasses.length > 1
+  const patrolPathLabel = searchPasses
+    .map(value => value === 'all' ? '综合' : CONTENT_TYPE_LABELS[value] || value)
+    .join(' → ')
   const idleHandoffAllowed = elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false
 
   return (
@@ -1588,7 +1621,11 @@ export function OrchestrationDetailWorkspace({
                   <div>已生成：<strong className="font-semibold text-foreground">{Number(schedule.run_count || 0)} 轮</strong></div>
                   <div>上轮状态：<strong className="font-semibold text-foreground">{schedule.last_run_status ? statusLabel(schedule.last_run_status) : '尚未运行'}</strong></div>
                 </div>
-                <p className="mt-2 text-[11px] leading-4 text-muted-foreground">每个计划时间，每个关键词执行 1 次。计划只保存在云端，不会覆盖任一 Extension 的本地无人值守计划。</p>
+                <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
+                  {sequentialSearchEnabled
+                    ? `每个关键词由同一 Agent 按“${patrolPathLabel}”串行完成；每次搜索采集后增强新增内容，不自动刷新补搜。`
+                    : '每个计划时间，每个关键词执行 1 次。'} 计划只保存在云端，不会覆盖任一 Extension 的本地无人值守计划。
+                </p>
               </div>
             </div>
           </section>
@@ -1651,7 +1688,11 @@ export function OrchestrationDetailWorkspace({
           {(Number.isFinite(keywordLimit) || searchFilters || captureSettings) && (
             <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-border/70 pt-3 text-[11px] text-muted-foreground">
               {Number.isFinite(keywordLimit) && keywordLimit > 0 && <span>每词上限 <strong className="font-semibold text-foreground">{keywordLimit} 条</strong></span>}
-              {searchFilters && <span>筛选 <strong className="font-semibold text-foreground">{SORT_LABELS[String(searchFilters.sort || '')] || String(searchFilters.sort || '默认')} · {PUBLISH_TIME_LABELS[String(searchFilters.publishTime || '')] || String(searchFilters.publishTime || '不限')}</strong></span>}
+              {searchFilters && <span>筛选 <strong className="font-semibold text-foreground">
+                {SORT_LABELS[String(searchFilters.sort || '')] || String(searchFilters.sort || '默认')} · {PUBLISH_TIME_LABELS[String(searchFilters.publishTime || '')] || String(searchFilters.publishTime || '不限')} · {sequentialSearchEnabled ? patrolPathLabel : CONTENT_TYPE_LABELS[String(searchFilters.contentType || 'all')] || String(searchFilters.contentType || '全部')} · {SEARCH_SCOPE_LABELS[String(searchFilters.searchScope || 'all')] || String(searchFilters.searchScope || '全部')}
+                {orchestration.platform === 'xiaohongshu' ? ` · ${DISTANCE_LABELS[String(searchFilters.distance || 'all')] || String(searchFilters.distance || '不限距离')}` : ''}
+                {orchestration.platform === 'douyin' ? ` · ${VIDEO_DURATION_LABELS[String(searchFilters.videoDuration || 'all')] || String(searchFilters.videoDuration || '不限时长')}` : ''}
+              </strong></span>}
               {captureSettings && <span>采集增强 <strong className="font-semibold text-foreground">{captureSettings.autoDetailCaptureAfterListCapture === true ? '已开启' : '未开启'}</strong></span>}
             </div>
           )}

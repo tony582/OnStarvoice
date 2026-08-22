@@ -1,22 +1,34 @@
 import { createHash } from 'node:crypto';
 
 import { execute, getSetting, queryAll, queryOne, withTransaction } from '../db/init.js';
-import { callDeepSeekWithPrompt, getBrandContext, getDeepSeekConfig } from './ai-labeler.js';
+import {
+  callRelevancePrefilterWithPrompt,
+  getBrandContext,
+  getRelevancePrefilterRouteConfigs,
+} from './ai-labeler.js';
 import {
   formatMonitoringIntentForPrompt,
+  formatTenantMonitoringScopeForPrompt,
   resolveMonitoringIntent,
+  resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 
-export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v2';
+export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v3';
 export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
-export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 25000;
+export const PREFILTER_MAX_TENANT_SKIP_MATCH = 0.2;
+export const PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD = 0.95;
+export const PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH = 0.05;
+export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 20000;
+export const PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS = 5000;
 
 const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const VALID_MODES = new Set(['disabled', 'shadow', 'conservative']);
 const VALID_DECISIONS = new Set(['keep', 'skip', 'need_detail']);
+const VALID_TENANT_RELEVANCE = new Set(['relevant', 'irrelevant', 'uncertain']);
 const MODE_RANK = { disabled: 0, shadow: 1, conservative: 2 };
+const PROTECTED_MONITORING_SIGNAL_PATTERN = /(?:安吉星|onstar|紧急(?:救援|求助)|道路救援|\bsos\b|远程(?:启动|控制|解锁|上锁|空调)?.{0,8}(?:失败|失效|不能|无法|用不了|没反应|故障|异常)|客服.{0,8}(?:投诉|误导|不处理|不解决)|续费.{0,8}(?:投诉|误导|收费|争议|贵|坑|不续)|一生黑)/iu;
 
 export class PrefilterRequestError extends Error {
   constructor(status, code, message, details = undefined) {
@@ -126,7 +138,7 @@ export function validatePrefilterRequest(body = {}) {
   if (!VALID_PLATFORMS.has(platform)) return { ok: false, status: 422, error: 'INVALID_PLATFORM', message: '仅支持小红书和抖音' };
   if (stage !== 'list') return { ok: false, status: 422, error: 'UNSUPPORTED_STAGE', message: '第一期仅支持 list 文字判断' };
   if (!keyword) return { ok: false, status: 422, error: 'KEYWORD_REQUIRED', message: '缺少搜索关键词' };
-  if (!['prefilter-list-v1', PREFILTER_PROMPT_VERSION].includes(requestedPromptVersion)) {
+  if (!['prefilter-list-v1', 'prefilter-list-v2', PREFILTER_PROMPT_VERSION].includes(requestedPromptVersion)) {
     return { ok: false, status: 409, error: 'PROMPT_VERSION_CONFLICT', message: '前置筛选提示词版本不匹配' };
   }
   const promptVersion = PREFILTER_PROMPT_VERSION;
@@ -204,7 +216,12 @@ export function contentSummaryHash(item) {
   }));
 }
 
-export function prefilterCacheKey(request, item, model) {
+export function prefilterCacheKey(
+  request,
+  item,
+  model,
+  provider = PREFILTER_PROVIDER,
+) {
   return sha256(stableStringify({
     platform: request.platform,
     stage: request.stage,
@@ -214,7 +231,7 @@ export function prefilterCacheKey(request, item, model) {
     externalId: item.externalId || item.itemId,
     contentSummaryHash: contentSummaryHash(item),
     promptVersion: request.promptVersion,
-    modelProvider: PREFILTER_PROVIDER,
+    modelProvider: provider,
     modelName: model,
   }));
 }
@@ -241,6 +258,8 @@ export function resolvePrefilterPolicyValues({
   return {
     effectiveMode: safestMode(serverMode, tenantMode, requestedMode),
     skipThreshold: effectiveThreshold,
+    clearIrrelevantSkipThreshold: PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD,
+    clearIrrelevantMaxMatch: PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH,
   };
 }
 
@@ -258,15 +277,55 @@ async function resolvePrefilterPolicy(tenantId, request) {
   });
 }
 
-export function determineExecutionDisposition({ status, modelDecision, confidence }, policy) {
+export function hasProtectedMonitoringSignal(item = {}) {
+  return PROTECTED_MONITORING_SIGNAL_PATTERN.test(`${item.title || ''} ${item.author || ''}`);
+}
+
+export function determineExecutionDisposition({
+  status,
+  modelDecision,
+  tenantRelevance,
+  queryMatch,
+  brandMatch,
+  confidence,
+  protectedSignal = false,
+}, policy) {
   if (status !== 'ok') return 'collect_full';
   if (policy.effectiveMode !== 'conservative') return 'collect_full';
-  if (modelDecision === 'skip' && confidence >= policy.skipThreshold) return 'skip_full_capture';
+  if (protectedSignal) return 'collect_full';
+  const numericQueryMatch = normalizeScore(queryMatch);
+  const numericBrandMatch = normalizeScore(brandMatch);
+  const numericConfidence = normalizeScore(confidence);
+  // Only the strongest double-zero-style noise signal may use the lower 0.95 gate.
+  // Everything else keeps the original 0.97 conservative threshold and fail-open path.
+  const clearIrrelevant = modelDecision === 'skip'
+    && tenantRelevance === 'irrelevant'
+    && numericQueryMatch !== null
+    && numericBrandMatch !== null
+    && numericConfidence !== null
+    && numericQueryMatch <= (policy.clearIrrelevantMaxMatch ?? PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH)
+    && numericBrandMatch <= (policy.clearIrrelevantMaxMatch ?? PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH)
+    && numericConfidence >= (
+      policy.clearIrrelevantSkipThreshold ?? PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD
+    );
+  if (clearIrrelevant) return 'skip_full_capture';
+  if (
+    modelDecision === 'skip'
+    && tenantRelevance === 'irrelevant'
+    && numericBrandMatch !== null
+    && numericBrandMatch <= PREFILTER_MAX_TENANT_SKIP_MATCH
+    && numericConfidence !== null
+    && numericConfidence >= policy.skipThreshold
+  ) return 'skip_full_capture';
   return 'collect_full';
 }
 
-export function buildPrefilterSystemPrompt(brand = {}, intent = {}) {
-  return `你是采集前的查询意图相关性筛选器。你不是在做宽泛的品牌舆情判断，而是在判断每条搜索结果是否符合用户本次搜索词的具体意图。
+export function buildPrefilterSystemPrompt(
+  brand = {},
+  intent = {},
+  tenantScope = resolveTenantMonitoringScope(brand),
+) {
+  return `你是采集前的双维度相关性筛选器。你必须分别判断“当前搜索词是否匹配”和“是否属于租户整体监控范围”，两者不能互相覆盖。
 
 租户品牌：${brand.brandName || '未配置'}
 品牌别名：${(brand.brandAliases || []).join('、') || '无'}
@@ -274,26 +333,36 @@ export function buildPrefilterSystemPrompt(brand = {}, intent = {}) {
 品牌相关词：${(brand.positiveContextTerms || []).join('、') || '无'}
 常见噪声：${(brand.noiseTerms || []).join('、') || '无'}
 
+${formatTenantMonitoringScopeForPrompt(tenantScope)}
+
 ${formatMonitoringIntentForPrompt(intent)}
 
 对每一项只允许三种决定：
-- keep：现有列表文字已经足以确认符合本次查询意图；
-- skip：现有列表文字已经足以确认不符合本次查询意图；
-- need_detail：可能相关但证据不足，需要正文、标签、画面或口播才能判断。
+- keep：现有列表文字已经足以确认符合本次搜索词；
+- skip：现有列表文字已经足以确认不符合本次搜索词；
+- need_detail：可能匹配本次搜索词，但证据不足，需要正文、标签、画面或口播才能判断。
+
+同时必须输出 tenantRelevance：
+- relevant：即使不匹配当前搜索词，仍明确属于租户整体监控对象与主题；
+- irrelevant：明确不属于全部监测关键词、对象和主题；
+- uncertain：列表文字不足以排除整体相关性，需要完整内容。
 
 规则：
-1. 不要因为内容提到了品牌、车型、搜索词、话题标签或作者名就自动 keep，必须同时符合任务的目标对象和目标主题。
-2. 人名、地名、谐音、其它品牌、泛词巧合命中应 skip。
-3. 标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail。
-4. 证据不足时必须 need_detail，禁止为了提高跳过率猜测。
-5. 每个输入 itemId 必须恰好输出一次；不得输出未知 itemId。
-6. 只输出 JSON 对象，不要 Markdown 或解释性前后缀。
-7. confidence 表示你对当前决定的确定程度，不是相关度分数。若标题已经明确指向其它汽车品牌/产品，且目标品牌或目标实体完全缺失，这是可由列表文字直接证实的无关项，decision=skip，confidence 应为 0.98-1.00。
-8. 只有部分词相似、可能需要画面/口播/正文才能排除，或仍存在合理相关解释时，不得用高置信 skip，必须输出 need_detail，confidence 不高于 0.96。
-9. 关联品牌的其它车辆话题不属于当前功能任务。例如“别克OTA”不包含别克机械故障，“至境哨兵”不包含至境胎噪，“凯迪拉克壁纸”不包含凯迪拉克碰撞测试。
+1. decision 只表示 currentKeywordMatch；tenantRelevance 表示租户整体相关性。decision=skip 绝不等于 tenantRelevance=irrelevant。
+2. 判断当前搜索词时仍须同时符合其目标对象和目标主题，不能因为只出现品牌、车型或搜索词就自动 keep。
+3. 内容命中任一其它监测关键词或主题时，即使当前 decision=skip，tenantRelevance 也必须是 relevant 或 uncertain。
+4. 安吉星、紧急/道路救援、远程控制故障、客服投诉、续费争议等风险线索必须保守采集，不得仅因当前搜索词不匹配而判整体无关。
+5. 人名、地名、谐音、租户范围外的其它品牌、泛词巧合命中可判 decision=skip 且 tenantRelevance=irrelevant。
+6. 标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail，tenantRelevance 至少 uncertain。
+7. 证据不足时必须 need_detail，禁止为了提高跳过率猜测。
+8. 每个输入 itemId 必须恰好输出一次；不得输出未知 itemId。
+9. 只输出 JSON 对象，不要 Markdown 或解释性前后缀。
+10. confidence 表示你对 decision 和 tenantRelevance 组合的确定程度，不是相关度分数。
+11. queryMatch 是当前搜索词匹配分；brandMatch 是租户整体监控范围匹配分，不是当前关键词目标品牌分。
+12. “凯迪拉克CT5紧急救援电话误拨”对“凯迪拉克车机升级”可 decision=skip，但属于安全救援监测，必须 tenantRelevance=relevant 并完整采集。
 
 输出格式：
-{"items":[{"itemId":"原值","decision":"keep|skip|need_detail","queryMatch":0.0,"brandMatch":0.0,"confidence":0.0,"reason":"简短中文原因","evidence":["证据"],"missingSignals":["缺失证据"]}]}`;
+{"items":[{"itemId":"原值","decision":"keep|skip|need_detail","tenantRelevance":"relevant|irrelevant|uncertain","queryMatch":0.0,"brandMatch":0.0,"confidence":0.0,"reason":"同时说明当前词匹配和整体相关性的简短中文原因","evidence":["证据"],"missingSignals":["缺失证据"]}]}`;
 }
 
 export function buildPrefilterUserMessage(request) {
@@ -309,6 +378,8 @@ export function buildPrefilterUserMessage(request) {
 }
 
 function normalizeScore(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && !value.trim()) return null;
   const score = Number(value);
   if (!Number.isFinite(score) || score < 0 || score > 1) return null;
   return Math.round(score * 10000) / 10000;
@@ -319,6 +390,7 @@ function failOpenItem(item, status, reason, policy) {
     itemId: item.itemId,
     status,
     modelDecision: null,
+    tenantRelevance: null,
     decisionFinality: 'provisional',
     queryMatch: null,
     brandMatch: null,
@@ -328,6 +400,7 @@ function failOpenItem(item, status, reason, policy) {
     missingSignals: [],
     executionDisposition: 'collect_full',
     failOpen: true,
+    protectedSignal: hasProtectedMonitoringSignal(item),
     cacheHit: false,
   };
   result.executionDisposition = determineExecutionDisposition(result, policy);
@@ -336,21 +409,35 @@ function failOpenItem(item, status, reason, policy) {
 
 function normalizeOneModelItem(item, raw, policy) {
   const decision = boundedText(raw?.decision || raw?.modelDecision, 30).toLowerCase();
+  const tenantRelevance = boundedText(
+    raw?.tenantRelevance ?? raw?.tenant_relevance,
+    30,
+  ).toLowerCase();
   const queryMatch = normalizeScore(raw?.queryMatch ?? raw?.query_match);
   const brandMatch = normalizeScore(raw?.brandMatch ?? raw?.brand_match);
   const confidence = normalizeScore(raw?.confidence);
   const reason = boundedText(raw?.reason, 1000);
-  if (!VALID_DECISIONS.has(decision) || queryMatch === null || brandMatch === null || confidence === null || !reason) {
-    return failOpenItem(item, 'model_error', 'DeepSeek 返回字段不完整，已按安全策略继续采集', policy);
+  if (
+    !VALID_DECISIONS.has(decision)
+    || !VALID_TENANT_RELEVANCE.has(tenantRelevance)
+    || queryMatch === null
+    || brandMatch === null
+    || confidence === null
+    || !reason
+  ) {
+    return failOpenItem(item, 'model_error', 'AI 返回字段不完整，已按安全策略继续采集', policy);
   }
+  const protectedSignal = hasProtectedMonitoringSignal(item);
   const result = {
     itemId: item.itemId,
     status: 'ok',
     modelDecision: decision,
+    tenantRelevance,
     decisionFinality: 'provisional',
     queryMatch,
     brandMatch,
     confidence,
+    protectedSignal,
     reason,
     evidence: boundedStringArray(raw?.evidence, { maxItems: 10, maxLength: 120 }),
     missingSignals: boundedStringArray(raw?.missingSignals ?? raw?.missing_signals, { maxItems: 10, maxLength: 120 }),
@@ -383,8 +470,8 @@ export function normalizePrefilterModelResponse(request, rawResponse, policy) {
     const matches = byId.get(item.itemId) || [];
     if (matches.length !== 1) {
       const reason = matches.length > 1
-        ? 'DeepSeek 为同一 itemId 返回了重复结果，已按安全策略继续采集'
-        : 'DeepSeek 未返回该 itemId，已按安全策略继续采集';
+        ? 'AI 为同一 itemId 返回了重复结果，已按安全策略继续采集'
+        : 'AI 未返回该 itemId，已按安全策略继续采集';
       return failOpenItem(item, 'model_error', reason, policy);
     }
     return normalizeOneModelItem(item, matches[0], policy);
@@ -397,27 +484,51 @@ export function normalizePrefilterModelResponse(request, rawResponse, policy) {
   };
 }
 
-async function loadCachedPrefilterItems(tenantId, request, model, policy) {
+async function loadCachedPrefilterItems(
+  tenantId,
+  request,
+  routes,
+  policy,
+) {
   const candidates = request.items.filter(item => item.inputValid);
-  if (candidates.length === 0) return new Map();
-  const keyToItem = new Map(candidates.map(item => [prefilterCacheKey(request, item, model), item]));
+  const normalizedRoutes = Array.isArray(routes)
+    ? routes.filter(route => route?.provider && route?.model)
+    : [];
+  if (candidates.length === 0 || normalizedRoutes.length === 0) {
+    return {items: new Map(), firstRoute: null};
+  }
+  const candidateKeys = new Map(candidates.map(item => [
+    item.itemId,
+    normalizedRoutes.map(route => ({
+      cacheKey: prefilterCacheKey(request, item, route.model, route.provider),
+      route,
+    })),
+  ]));
+  const allKeys = [...candidateKeys.values()].flat().map(entry => entry.cacheKey);
   const rows = await queryAll(`
     SELECT cache_key, response_item
     FROM relevance_prefilter_cache
     WHERE tenant_id = $1
       AND cache_key = ANY($2::text[])
       AND expires_at > now()
-  `, [tenantId, [...keyToItem.keys()]]);
+  `, [tenantId, allKeys]);
+  const rowsByKey = new Map(rows.map(row => [row.cache_key, row.response_item]));
   const cached = new Map();
-  for (const row of rows) {
-    const sourceItem = keyToItem.get(row.cache_key);
-    if (!sourceItem) continue;
-    const normalized = normalizeOneModelItem(sourceItem, row.response_item, policy);
-    if (normalized.status !== 'ok') continue;
-    normalized.cacheHit = true;
-    cached.set(sourceItem.itemId, normalized);
+  let firstRoute = null;
+  for (const sourceItem of candidates) {
+    const keys = candidateKeys.get(sourceItem.itemId) || [];
+    for (const entry of keys) {
+      const responseItem = rowsByKey.get(entry.cacheKey);
+      if (!responseItem) continue;
+      const normalized = normalizeOneModelItem(sourceItem, responseItem, policy);
+      if (normalized.status !== 'ok') continue;
+      normalized.cacheHit = true;
+      cached.set(sourceItem.itemId, normalized);
+      firstRoute ||= entry.route;
+      break;
+    }
   }
-  return cached;
+  return {items: cached, firstRoute};
 }
 
 function allFailOpenItems(request, status, reason, policy) {
@@ -498,7 +609,14 @@ async function reservePrefilterRequest(tenantId, request, bodyHash) {
   return await findIdempotentRequest(tenantId, request, bodyHash);
 }
 
-async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, response, model }) {
+async function persistPrefilterOutcome({
+  tenantId,
+  prefilterRequestId,
+  request,
+  response,
+  provider,
+  model,
+}) {
   await withTransaction(async tx => {
     for (const [index, result] of response.items.entries()) {
       const sourceItem = request.items[index];
@@ -517,10 +635,10 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
           $4, $5, $6, $7, $8,
           $9, $10, $11, $12, $13,
           $14, $15,
-          $16, $17, $18, 'deepseek', $19,
-          $20, $21, $22, $23,
-          $24, $25, $26, $27, $28::jsonb, $29::jsonb,
-          $30, $31, $32, $33, $34::jsonb
+          $16, $17, $18, $19, $20,
+          $21, $22, $23, $24,
+          $25, $26, $27, $28, $29::jsonb, $30::jsonb,
+          $31, $32, $33, $34, $35::jsonb
         )
         ON CONFLICT (tenant_id, prefilter_request_id, item_id) DO NOTHING
       `, [
@@ -542,6 +660,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
         request.intent.intentId,
         request.intent.intentVersion,
         request.promptVersion,
+        provider,
         model,
         result.status,
         result.modelDecision,
@@ -557,7 +676,12 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
         response.skipThreshold,
         response.latencyMs,
         Boolean(result.cacheHit),
-        JSON.stringify({ failOpen: result.failOpen, itemIndex: index }),
+        JSON.stringify({
+          failOpen: result.failOpen,
+          itemIndex: index,
+          tenantRelevance: result.tenantRelevance || null,
+          protectedSignal: Boolean(result.protectedSignal),
+        }),
       ]);
       if (result.status === 'ok' && !result.cacheHit) {
         await tx.execute(`
@@ -570,7 +694,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
             $1, $2, $3, $4,
             $5, $6,
             $7, $8, $9,
-            'deepseek', $10, $11::jsonb, now() + interval '14 days'
+            $10, $11, $12::jsonb, now() + interval '14 days'
           )
           ON CONFLICT (tenant_id, cache_key)
           DO UPDATE SET
@@ -579,7 +703,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
             expires_at = excluded.expires_at
         `, [
           tenantId,
-          prefilterCacheKey(request, sourceItem, model),
+          prefilterCacheKey(request, sourceItem, model, provider),
           request.platform,
           request.stage,
           request.keywordHash,
@@ -587,6 +711,7 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
           request.intent.intentId,
           request.intent.intentVersion,
           request.promptVersion,
+          provider,
           model,
           JSON.stringify(result),
         ]);
@@ -594,9 +719,10 @@ async function persistPrefilterOutcome({ tenantId, prefilterRequestId, request, 
     }
     await tx.execute(`
       UPDATE relevance_prefilter_requests
-      SET status = 'completed', model_name = $3, response_body = $4::jsonb, updated_at = now()
+      SET status = 'completed', model_provider = $3, model_name = $4,
+          response_body = $5::jsonb, updated_at = now()
       WHERE id = $1 AND tenant_id = $2
-    `, [prefilterRequestId, tenantId, model, JSON.stringify(response)]);
+    `, [prefilterRequestId, tenantId, provider, model, JSON.stringify(response)]);
   });
 }
 
@@ -618,6 +744,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
     throw new PrefilterRequestError(validation.status, validation.error, validation.message);
   }
   const brand = await getBrandContext(tenantId);
+  const tenantScope = resolveTenantMonitoringScope(brand);
   const request = {
     ...validation.value,
     intent: resolveMonitoringIntent(validation.value.keyword, {
@@ -634,6 +761,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
     const reservation = await reservePrefilterRequest(tenantId, request, bodyHash);
     if (reservation.kind === 'replay') return reservation.response;
     const startedAt = Date.now();
+    let provider = PREFILTER_PROVIDER;
     let model = 'deepseek-chat';
     let items;
     let degraded = false;
@@ -645,62 +773,69 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       items = allFailOpenItems(request, 'model_error', 'AI 前置筛选已由服务端关闭，已继续原采集流程', policy);
     } else {
       try {
-        const deepSeekConfig = await getDeepSeekConfig(tenantId);
-        model = deepSeekConfig.model;
-        const cached = await loadCachedPrefilterItems(tenantId, request, model, policy);
+        const routeConfigs = await getRelevancePrefilterRouteConfigs(tenantId);
+        const llmConfig = routeConfigs.primaryConfig;
+        const cacheRoutes = routeConfigs.cacheRoutes;
+        provider = cacheRoutes[0]?.provider || llmConfig.provider;
+        model = cacheRoutes[0]?.model || llmConfig.model;
+        const cacheResult = await loadCachedPrefilterItems(
+          tenantId,
+          request,
+          cacheRoutes,
+          policy,
+        );
+        const cached = cacheResult.items;
+        if (cacheResult.firstRoute) {
+          provider = cacheResult.firstRoute.provider;
+          model = cacheResult.firstRoute.model;
+        }
         const pendingItems = request.items.filter(item => item.inputValid && !cached.has(item.itemId));
         const pendingResults = new Map();
         if (pendingItems.length > 0) {
           const pendingRequest = { ...request, items: pendingItems };
           try {
             const baseMaxTokens = Math.min(
-              8192,
-              Math.max(3000, pendingItems.length * 600),
+              4096,
+              Math.max(1800, pendingItems.length * 320),
             );
-            let result = null;
-            let retryCount = 0;
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-              try {
-                result = await callDeepSeekWithPrompt(
-                  tenantId,
-                  buildPrefilterSystemPrompt(brand, request.intent),
-                  buildPrefilterUserMessage(pendingRequest),
-                  {
-                    timeoutMs: modelTimeoutMs(),
-                    maxTokens: attempt === 0
-                      ? baseMaxTokens
-                      : Math.min(8192, Math.max(5000, baseMaxTokens * 2)),
-                    returnMetadata: true,
-                    priority: 'capture',
-                    kind: 'relevance_prefilter',
-                  },
-                );
-                if (result.finishReason === 'length' && attempt === 0) {
-                  retryCount += 1;
-                  continue;
-                }
-                break;
-              } catch (error) {
-                const truncated =
-                  error?.code === 'LLM_JSON_PARSE_FAILED' ||
-                  String(error?.finishReason || '') === 'length';
-                if (!truncated || attempt > 0) throw error;
-                retryCount += 1;
-              }
-            }
+            const result = await callRelevancePrefilterWithPrompt(
+              tenantId,
+              buildPrefilterSystemPrompt(brand, request.intent, tenantScope),
+              buildPrefilterUserMessage(pendingRequest),
+              {
+                timeoutMs: modelTimeoutMs(),
+                queueTimeoutMs: PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
+                maxTokens: baseMaxTokens,
+                returnMetadata: true,
+                priority: 'capture',
+                kind: 'relevance_prefilter',
+                routeConfigs,
+              },
+            );
             if (!result) {
-              const error = new Error('DeepSeek 未返回可用的结构化结果');
+              const error = new Error('AI 未返回可用的结构化结果');
               error.code = 'LLM_EMPTY_RESULT';
               throw error;
             }
+            if (result.finishReason === 'length') {
+              const error = new Error('AI 结构化结果被截断，已安全放行');
+              error.code = 'LLM_OUTPUT_TRUNCATED';
+              error.finishReason = result.finishReason;
+              error.responseLength = result.responseLength;
+              throw error;
+            }
+            provider = result.provider || provider;
             model = result.model;
             modelDiagnostics = {
+              route: result.route || (result.provider === 'antigravity' ? 'relay' : 'base'),
               finishReason: result.finishReason || '',
               responseLength: Math.max(0, Number(result.responseLength) || 0),
               promptTokens: Math.max(0, Number(result.promptTokens) || 0),
               completionTokens: Math.max(0, Number(result.completionTokens) || 0),
               totalTokens: Math.max(0, Number(result.totalTokens) || 0),
-              retryCount,
+              reasoningTokens: Math.max(0, Number(result.reasoningTokens) || 0),
+              retryCount: 0,
+              thinkingEnabled: false,
             };
             const normalized = normalizePrefilterModelResponse(pendingRequest, result.data, policy);
             for (const item of normalized.items) pendingResults.set(item.itemId, item);
@@ -717,8 +852,8 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
               pendingRequest,
               timedOut ? 'timeout' : 'model_error',
               timedOut
-                ? 'DeepSeek 判断超时，已按安全策略继续采集'
-                : `DeepSeek 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
+                ? 'AI 判断超时，已按安全策略继续采集'
+                : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
               policy
             );
             for (const item of failed) pendingResults.set(item.itemId, item);
@@ -728,7 +863,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
           if (!item.inputValid) return failOpenItem(item, 'invalid_input', item.inputError, policy);
           return cached.get(item.itemId)
             || pendingResults.get(item.itemId)
-            || failOpenItem(item, 'model_error', 'DeepSeek 未返回该项目，已继续原采集流程', policy);
+            || failOpenItem(item, 'model_error', 'AI 未返回该项目，已继续原采集流程', policy);
         });
         degraded = unknownOutputCount > 0 || items.some(item => item.status !== 'ok');
       } catch (error) {
@@ -738,8 +873,8 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
           request,
           timedOut ? 'timeout' : 'model_error',
           timedOut
-            ? 'DeepSeek 判断超时，已按安全策略继续采集'
-            : `DeepSeek 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
+            ? 'AI 判断超时，已按安全策略继续采集'
+            : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
           policy
         );
       }
@@ -752,12 +887,19 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       intentId: request.intent.intentId,
       intentVersion: request.intent.intentVersion,
       intent: request.intent,
+      tenantScope: {
+        scopeId: tenantScope.scopeId,
+        scopeVersion: tenantScope.scopeVersion,
+        keywords: tenantScope.keywords,
+      },
       promptVersion: request.promptVersion,
-      provider: PREFILTER_PROVIDER,
+      provider,
       model,
       latencyMs: Date.now() - startedAt,
       effectiveMode: policy.effectiveMode,
       skipThreshold: policy.skipThreshold,
+      clearIrrelevantSkipThreshold: policy.clearIrrelevantSkipThreshold,
+      clearIrrelevantMaxMatch: policy.clearIrrelevantMaxMatch,
       unknownOutputCount,
       modelDiagnostics,
       cacheHitCount: items.filter(item => item.cacheHit).length,
@@ -770,6 +912,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
         prefilterRequestId: reservation.id,
         request,
         response,
+        provider,
         model,
       });
     } catch (error) {

@@ -130,7 +130,7 @@ test('toolbar and header filter the eight handling states without ticket filters
   assert.doesNotMatch(lifecycleViews, /watched|已关注|Star/);
   assert.match(primary, /打开关注清单/);
   assert.match(primary, /aria-pressed=\{viewingWatchlist\}/);
-  assert.match(primary, /搜索标题、正文、作者、飞书表号…/);
+  assert.match(primary, /搜索标题、正文、作者、飞书表号、账号、平台ID、采集词、标签…/);
   assert.match(primary, /<MultiSelect label="疑似身份"/);
   assert.match(primary, /<KeywordFilter/);
   assert.match(primary, /label="自定义标签"/);
@@ -149,6 +149,31 @@ test('toolbar and header filter the eight handling states without ticket filters
   assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);
   assert.match(header, /label="情感"[\s\S]*value=\{sentiment\}[\s\S]*onChange=\{setSentiment\}/);
   assert.match(header, /label="处理状态"[\s\S]*value=\{triageStatuses\}[\s\S]*onChange=\{setTriageStatuses\}/);
+});
+
+test('search commits once, ignores stale responses, and keeps board filters aligned with list filters', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
+  const searchInput = between(queue, '<Search className=', '<button\n              type="button"\n              onClick={() => setMobileFiltersOpen');
+
+  assert.match(queue, /const \[keywordDraft, setKeywordDraft\]/);
+  assert.match(queue, /window\.setTimeout\(\(\) => setKeyword\(nextKeyword\), 400\)/);
+  assert.match(searchInput, /setKeyword\(keywordDraft\.trim\(\)\)/);
+  assert.doesNotMatch(searchInput, /\bload\(/);
+  assert.match(queue, /const listRequestSeq = useRef\(0\)/);
+  assert.match(queue, /requestSeq !== listRequestSeq\.current/);
+  assert.match(queue, /if \(requestSeq === listRequestSeq\.current\) setLoading\(false\)/);
+
+  assert.match(queue, /const boardFilterQuery = useMemo/);
+  assert.match(queue, /params\.delete\('status'\)/);
+  assert.match(queue, /params\.delete\('sort'\)/);
+  assert.match(queue, /setTriageStatuses\(\[\]\)/);
+  assert.match(queue, /filterQuery=\{boardFilterQuery\}/);
+  assert.match(board, /new URLSearchParams\(filterQuery\)/);
+  assert.match(board, /params\.set\('status', column\.key\)/);
+  assert.match(board, /const requestSeq = useRef\(0\)/);
+  assert.match(board, /seq !== requestSeq\.current/);
+  assert.doesNotMatch(board, /sentiment: string|platform\?: string|keyword: string/);
 });
 
 test('drawer header keeps the Feishu number in the old inline-edit position while history remains available', () => {

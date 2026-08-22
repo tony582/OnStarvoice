@@ -137,6 +137,13 @@ function agentFailure(agent, platform, planSnapshot) {
   ) {
     return {code: 'scheduled_agent_enhancement_unsupported', message: '执行节点版本不支持采集增强参数'};
   }
+  if (
+    Array.isArray(planSnapshot.searchPasses) &&
+    planSnapshot.searchPasses.length > 1 &&
+    capabilities.remoteSequentialSearchPassesV1 !== true
+  ) {
+    return {code: 'scheduled_agent_sequential_search_unsupported', message: '执行节点版本不支持同一关键词串行补充巡检'};
+  }
   const allowed = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
     : [];
@@ -409,6 +416,15 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   }
 
   const planSnapshot = object(schedule.plan_snapshot);
+  const searchPasses = Array.isArray(planSnapshot.searchPasses)
+    ? planSnapshot.searchPasses.slice(0, 2)
+    : [];
+  const sequentialSearchEnabled = Boolean(
+    distributionMode === 'elastic_pool' &&
+    schedule.platform === 'douyin' &&
+    searchPasses.length > 1
+  );
+  const runItemTotal = templateItems.length;
   const elasticScheduleAgents = distributionMode === 'elastic_pool'
     ? await tx.queryAll(`
         SELECT agent_id
@@ -461,6 +477,16 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
     executionMode: 'one_time',
     planSnapshot,
+    ...(sequentialSearchEnabled
+      ? {
+          sequentialSearch: {
+            enabled: true,
+            passes: searchPasses,
+            keywordCount: templateItems.length,
+            itemCount: runItemTotal,
+          },
+        }
+      : {}),
     orchestrationScheduleRun: true,
     manualRunNow: manual,
     scheduleId: schedule.id,
@@ -490,12 +516,12 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     schedule.platform,
     JSON.stringify({
       current: 0,
-      total: templateItems.length,
+      total: runItemTotal,
       phase: distributionMode === 'elastic_pool' ? 'queued' : 'dispatched',
     }),
     JSON.stringify({
-      total: templateItems.length,
-      assigned: distributionMode === 'elastic_pool' ? 0 : templateItems.length,
+      total: runItemTotal,
+      assigned: distributionMode === 'elastic_pool' ? 0 : runItemTotal,
       processed: 0,
       success: 0,
       failed: 0,
@@ -506,7 +532,9 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     scheduledFor.toISOString(),
     Number(schedule.revision),
     distributionMode === 'elastic_pool'
-      ? '无人值守计划已生成本轮云端队列，等待空闲节点领取'
+      ? sequentialSearchEnabled
+        ? '无人值守计划已生成一词一任务的串行巡检队列，等待空闲节点领取'
+        : '无人值守计划已生成本轮云端队列，等待空闲节点领取'
       : '无人值守计划已生成本轮任务，正在下发到执行节点',
   ]);
 
@@ -545,6 +573,13 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         keyword: templateItem.keyword,
         ordinal: Number(templateItem.ordinal),
         scheduleTemplateItemId: templateItem.id,
+        ...(sequentialSearchEnabled
+          ? {
+              searchPasses,
+              disableAutomaticSearchRetry: true,
+              requireVerifiedFilters: true,
+            }
+          : {}),
       }),
     ]);
     runItems.push(item);

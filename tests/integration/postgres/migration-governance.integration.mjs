@@ -400,9 +400,24 @@ test('migration governance serializes processes, rejects drift, and explicitly a
   });
 
   await t.test('a two-column v066 ledger rejects normal paths until explicit adoption', async () => {
-    const postBaselinePath = path.join(copiedMigrations, postBaselineMigrationName);
-    const postBaselineBytes = await readFile(postBaselinePath);
-    await rm(postBaselinePath);
+    const postBaselineMigrationNames = (await readdir(copiedMigrations))
+      .filter(file => {
+        const match = /^(\d{3})_.+\.sql$/u.exec(file);
+        if (!match) return false;
+        const version = Number(match[1]);
+        return version > 66 && version < 900;
+      })
+      .sort();
+    assert.equal(postBaselineMigrationNames.includes(postBaselineMigrationName), true);
+    const postBaselineMigrations = await Promise.all(
+      postBaselineMigrationNames.map(async name => ({
+        name,
+        bytes: await readFile(path.join(copiedMigrations, name)),
+      })),
+    );
+    for (const migration of postBaselineMigrations) {
+      await rm(path.join(copiedMigrations, migration.name));
+    }
     await rm(path.join(copiedMigrations, pendingMigrationName));
     await rm(path.join(copiedMigrations, slowMigrationName));
     await rm(path.join(copiedMigrations, killedHolderMigrationName));
@@ -439,7 +454,9 @@ test('migration governance serializes processes, rejects drift, and explicitly a
       WHERE version = $1
     `, [legacyBaselineTargetName]);
 
-    await writeFile(postBaselinePath, postBaselineBytes);
+    for (const migration of postBaselineMigrations) {
+      await writeFile(path.join(copiedMigrations, migration.name), migration.bytes);
+    }
 
     for (const [suffix, args] of [
       ['legacy-verify-rejected', ['verify']],
@@ -489,7 +506,7 @@ test('migration governance serializes processes, rejects drift, and explicitly a
       FROM ${safeIdentifier(legacySchema)}.schema_migrations
       WHERE version = ANY($1::text[])
       ORDER BY version
-    `, [[legacyBaselineTargetName, postBaselineMigrationName, 'p2d_legacy_non_sql_flag']]);
+    `, [[legacyBaselineTargetName, ...postBaselineMigrationNames, 'p2d_legacy_non_sql_flag']]);
     const byVersion = new Map(adoptedRows.rows.map(row => [row.version, row]));
     assert.match(byVersion.get(legacyBaselineTargetName).checksum_sha256, /^[a-f0-9]{64}$/u);
     assert.equal(
@@ -497,7 +514,9 @@ test('migration governance serializes processes, rejects drift, and explicitly a
       timestampBeforeAdoption.rows[0].applied_at.getTime(),
       'adoption must preserve the original applied_at timestamp',
     );
-    assert.match(byVersion.get(postBaselineMigrationName).checksum_sha256, /^[a-f0-9]{64}$/u);
+    for (const migrationName of postBaselineMigrationNames) {
+      assert.match(byVersion.get(migrationName).checksum_sha256, /^[a-f0-9]{64}$/u);
+    }
     assert.equal(byVersion.get('p2d_legacy_non_sql_flag').checksum_sha256, null);
 
     const ready = spawnMaintenance({ args: ['verify'], suffix: 'legacy-ready', targetSchema: legacySchema });

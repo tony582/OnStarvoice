@@ -154,6 +154,7 @@ test("task center orders all business tasks by start time descending", async () 
   const {buildTaskCenterItems} = await import(
     `../sidebar/task-center-ui.js?task-center-time-order-test=${Date.now()}`
   );
+  const now = Date.now();
   const items = buildTaskCenterItems({
     ledgerState: {
       runs: [
@@ -161,15 +162,17 @@ test("task center orders all business tasks by start time descending", async () 
           id: "older-running-task",
           taskType: "capture",
           status: "running",
-          createdAt: "2026-07-21T02:00:00.000Z",
-          updatedAt: "2026-07-21T02:30:00.000Z",
+          createdAt: new Date(now - 20 * 60 * 1000).toISOString(),
+          startedAt: new Date(now - 20 * 60 * 1000).toISOString(),
+          updatedAt: new Date(now - 10 * 60 * 1000).toISOString(),
         },
         {
           id: "newer-completed-task",
           taskType: "capture",
           status: "completed",
-          createdAt: "2026-07-21T02:20:00.000Z",
-          updatedAt: "2026-07-21T02:21:00.000Z",
+          createdAt: new Date(now - 5 * 60 * 1000).toISOString(),
+          startedAt: new Date(now - 5 * 60 * 1000).toISOString(),
+          updatedAt: new Date(now - 4 * 60 * 1000).toISOString(),
         },
       ],
     },
@@ -215,6 +218,7 @@ test("task center hides capture child syncs but keeps user initiated sync tasks"
   const {buildTaskCenterItems} = await import(
     `../sidebar/task-center-ui.js?task-center-sync-visibility-test=${Date.now()}`
   );
+  const now = Date.now();
   const items = buildTaskCenterItems({
     ledgerState: {
       runs: [
@@ -222,13 +226,13 @@ test("task center hides capture child syncs but keeps user initiated sync tasks"
           id: "capture-task",
           taskType: "capture",
           status: "completed",
-          createdAt: "2026-07-21T02:00:00.000Z",
+          createdAt: new Date(now - 4 * 60 * 1000).toISOString(),
         },
         {
           id: "technical-sync-ledger",
           taskType: "sync",
           status: "completed",
-          createdAt: "2026-07-21T02:03:00.000Z",
+          createdAt: new Date(now - 60 * 1000).toISOString(),
           metadata: {taskCenterVisibility: "internal"},
         },
       ],
@@ -239,22 +243,22 @@ test("task center hides capture child syncs but keeps user initiated sync tasks"
           id: "detail-auto-sync",
           trigger: "detail_auto",
           status: "completed",
-          startedAt: "2026-07-21T02:02:00.000Z",
-          finishedAt: "2026-07-21T02:02:01.000Z",
+          startedAt: new Date(now - 2 * 60 * 1000).toISOString(),
+          finishedAt: new Date(now - 2 * 60 * 1000 + 1000).toISOString(),
         },
         {
           id: "capture-auto-sync",
           trigger: "capture_auto",
           status: "completed",
-          startedAt: "2026-07-21T02:01:00.000Z",
-          finishedAt: "2026-07-21T02:01:01.000Z",
+          startedAt: new Date(now - 3 * 60 * 1000).toISOString(),
+          finishedAt: new Date(now - 3 * 60 * 1000 + 1000).toISOString(),
         },
         {
           id: "manual-page-sync",
           trigger: "current_page",
           status: "completed",
-          startedAt: "2026-07-21T02:04:00.000Z",
-          finishedAt: "2026-07-21T02:04:01.000Z",
+          startedAt: new Date(now - 30 * 1000).toISOString(),
+          finishedAt: new Date(now - 29 * 1000).toISOString(),
         },
       ],
     },

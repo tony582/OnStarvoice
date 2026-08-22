@@ -3,12 +3,138 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.83',
+  latestVersion: '0.3.89',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-14',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.83-20260814.zip',
+  releaseDate: '2026-08-22',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.89-20260822.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.89',
+      releaseDate: '2026-08-22',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '组合巡检按断点安全接力',
+              desc: '综合搜索已经完成时会保留结果；后续图文异常仅允许另一台空闲 Agent 从图文阶段接力一次，用户主动取消仍保持取消。',
+            },
+            {
+              title: '小红书任务准确跟随替换标签页',
+              desc: '页面被浏览器替换时只接管系统确认的对应标签页，避免旧侧栏误跟随其他活动页面。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '本机 AI 不可用时更快回退',
+              desc: '本机 AI 最终判断等待上限缩短到 12 秒，超时后更早切回云端模型，减少巡检阻塞。',
+            },
+            {
+              title: '后台入口状态标识收敛',
+              desc: '调度中心移除 BETA，舆情剖析移除 NEW，桌面端与移动端保持一致。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.87',
+      releaseDate: '2026-08-21',
+      releaseNotes: [
+        {
+          tag: '新增',
+          notes: [
+            {
+              title: '无人值守支持受控组合巡检',
+              desc: '每个关键词可选择综合、图文、视频、综合后图文或综合后视频；同一 Agent 按顺序完成搜索与采集增强，避免跨设备重复和高频补搜。',
+            },
+          ],
+        },
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '抖音筛选状态不再串到下一任务',
+              desc: '每轮搜索都会核验内容类型、排序与发布时间等筛选；上一任务停在图文时，下一轮综合不会继续沿用旧条件。',
+            },
+            {
+              title: '内容分诊搜索稳定显示结果',
+              desc: '标题、正文、作者、平台编号等字段统一检索，并防止输入过程中旧请求覆盖新结果或频繁跳页。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.86',
+      releaseDate: '2026-08-20',
+      releaseNotes: [
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '列表前置预判优先使用本机 AI',
+              desc: '关键词搜索结果按每批最多 8 条交给本机 Antigravity 判断；本机忙碌、离线或超时会立即回退 DeepSeek Flash，不会在 Mac 后面堆积请求。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.85',
+      releaseDate: '2026-08-20',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '主贴情感不再被评论区带偏',
+              desc: '内容分诊只依据主贴标题、正文、标签和媒体文字判断主贴情感；评论区风险继续独立研判，不再把中性或正向主贴误判为负面。',
+            },
+            {
+              title: '异常取消的关键词自动接力',
+              desc: '仅用户主动取消会终止任务；Agent 异常、心跳超时或迟到状态不会再吞掉未完成关键词，空闲 Agent 会自动重新领取。',
+            },
+            {
+              title: '小红书安全验证精确记录',
+              desc: '精确识别中文安全限制、英文账号扫码和英文请求频繁页面，并保留类型与语言证据，普通内容文案不再误计为安全验证。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '批量 AI 支持云端与本机 Agent 路由',
+              desc: '批量相关性与内容研判可按后台策略使用云模型或本机 Antigravity Agent，并在本机不可用时按配置自动回退。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.3.84',
+      releaseDate: '2026-08-19',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '相关内容不再因当前搜索词不同而漏采',
+              desc: 'AI 前置筛选会同时判断当前搜索词和租户全部监测范围；紧急救援、远程控制故障、客服投诉及续费争议等内容会保守进入完整采集。',
+            },
+            {
+              title: '详情补全后重新判断相关性与情感',
+              desc: '正文、评论或新关键词上下文补全后会触发重新研判；明确故障和投诉不再误判为中性，整体无关内容的情感标记为不适用。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.83',
       releaseDate: '2026-08-14',

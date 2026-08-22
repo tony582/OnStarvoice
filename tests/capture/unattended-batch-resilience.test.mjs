@@ -158,8 +158,8 @@ function createBatchHarness({
         value?.securityBlocked ||
           value?.platformSafetyBlocked,
       ),
-    applySearchFiltersInTab: async (tabId, filters) => {
-      filterCalls.push({tabId, filters});
+    applySearchFiltersInTab: async (tabId, filters, applyOptions = {}) => {
+      filterCalls.push({tabId, filters, applyOptions});
       return {applied: true};
     },
     navigateToSearchUrl: async (tabId, url) => {
@@ -208,6 +208,9 @@ function createBatchHarness({
       onKeywordSettled: async (payload) => settled.push(payload),
       onProgress: (payload) => progress.push(payload),
       searchFilters: options.searchFilters || null,
+      disableAutomaticSearchRetry:
+        options.disableAutomaticSearchRetry === true,
+      requireVerifiedFilters: options.requireVerifiedFilters === true,
       shouldStop: options.shouldStop || (() => false),
     });
 
@@ -287,6 +290,66 @@ test("one empty keyword retry does not truncate the remaining 12 keyword plan", 
   );
   assert.equal(harness.settled.length, 13, "every keyword must reach the checkpoint reporter");
   assert.equal(result.canceled, false);
+});
+
+test("a strict sequential patrol never repeats an empty search and still settles later keywords", async () => {
+  const attempts = new Map();
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => {
+      const keyword = captureParams.keyword;
+      attempts.set(keyword, (attempts.get(keyword) || 0) + 1);
+      if (keyword === "词1") {
+        return {
+          ok: true,
+          captureResult: {ok: true, data: {items: []}},
+          recordIds: [],
+          savedRecords: [],
+        };
+      }
+      return successCapture(keyword);
+    },
+    hasActiveFilters: true,
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1", "词2"],
+    searchFilters: {contentType: "image"},
+    disableAutomaticSearchRetry: true,
+    requireVerifiedFilters: true,
+  });
+
+  assert.equal(attempts.get("词1"), 1);
+  assert.equal(attempts.get("词2"), 1);
+  assert.equal(harness.submitCalls.length, 0, "no hidden search submit is allowed");
+  assert.equal(harness.filterCalls.length, 2);
+  assert.ok(harness.filterCalls.every(call =>
+    call.applyOptions.requireVerifiedFilters === true));
+  assert.equal(result.stats.processed, 2);
+  assert.equal(result.results.length, 2);
+  assert.equal(result.canceled, false);
+});
+
+test("verified sequential-patrol filters fail closed instead of falling through to capture", () => {
+  const filterStart = captureSyncSource.indexOf(
+    "function createSearchFilterApplicationError(",
+  );
+  const filterEnd = captureSyncSource.indexOf(
+    "async function waitForKeywordSearchResultsInTab(",
+    filterStart,
+  );
+  const filterSource = captureSyncSource.slice(filterStart, filterEnd);
+
+  assert.match(filterSource, /SEARCH_FILTER_APPLICATION_FAILED/u);
+  assert.match(filterSource, /error\.fatal = true/u);
+  assert.match(filterSource, /error\.stopBatch = true/u);
+  assert.match(filterSource, /error\.requiresManualAction = true/u);
+  assert.match(filterSource, /result\?\.complete !== true/u);
+  assert.match(captureSyncSource, /verifyDefaults: requireVerifiedFilters/u);
+  assert.match(contentSource, /verifyDefaults: request\?\.verifyDefaults === true/u);
+  assert.match(contentSource, /verifyDefaults[\s\S]*item\.platforms\.includes\(platform\)/u);
+  assert.match(contentSource, /const alreadyActive = isBatchFilterOptionActive/u);
+  assert.match(contentSource, /changed: ok && !alreadyActive/u);
 });
 
 test("a drifted Douyin search page fails only the current keyword and continues", async () => {

@@ -24,6 +24,17 @@ export type UnattendedPlan = {
   searchFilters?: {
     sort?: string
     publishTime?: string
+    contentType?: string
+    searchScope?: string
+    distance?: string
+    videoDuration?: string
+  }
+  searchPasses?: string[]
+  recoveryPolicy?: {
+    allowIdleAgentHandoff?: boolean
+    platformSafetyMode?: string
+    disableAutomaticSearchRetry?: boolean
+    requireVerifiedFilters?: boolean
   }
   captureSettings?: CaptureEnhancementSettings
   keywordMaxDetectedItems?: number

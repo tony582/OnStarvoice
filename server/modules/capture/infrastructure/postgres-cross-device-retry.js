@@ -20,6 +20,7 @@ import {
   CROSS_DEVICE_RETRY_TASK_TYPES,
   ORCHESTRATION_ITEM_TERMINAL_STATUSES,
   appendEvent,
+  buildSequentialSearchResumeCheckpoint,
   crossDeviceRetryItemNeedsManualSafety,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
@@ -1309,8 +1310,16 @@ export async function dispatchCrossDeviceRetry({
 
       let commandPayload;
       let childPlan = {};
+      let sequentialResumeCheckpoint = null;
       if (businessTaskType === 'unattended_keyword_capture') {
-        const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+        const planSnapshot = safeJson(safeJson(parent.metadata).planSnapshot);
+        if (retryItems.length === 1) {
+          sequentialResumeCheckpoint = buildSequentialSearchResumeCheckpoint({
+            planSnapshot,
+            itemMetadata: retryItems[0].metadata,
+            keyword: retryItems[0].keyword,
+          });
+        }
         const normalized = normalizeRemoteTaskInput({
           clientTaskId: requestKey,
           title: `${parent.title} · 换设备重试`,
@@ -1333,6 +1342,9 @@ export async function dispatchCrossDeviceRetry({
           executionMode: 'one_time',
           platform: childPlan.platform,
           planSnapshot: childPlan,
+          ...(sequentialResumeCheckpoint
+            ? {checkpoint: sequentialResumeCheckpoint}
+            : {}),
           requestHash,
           authCodeId: targetAgent.auth_code_id,
           authBindingId: targetAgent.auth_binding_id,
@@ -1379,6 +1391,12 @@ export async function dispatchCrossDeviceRetry({
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
         automaticRecovery: automatic,
+        ...(sequentialResumeCheckpoint
+          ? {
+              resumedSequentialSearch: true,
+              resumeRound: sequentialResumeCheckpoint.round,
+            }
+          : {}),
         requestedByUserId: req.user?.id || '',
         requestedByName: text(req.actorName, 240),
       };
@@ -1411,7 +1429,7 @@ export async function dispatchCrossDeviceRetry({
           phase: 'queued',
         }),
         JSON.stringify(businessTaskType === 'unattended_keyword_capture'
-          ? {round: 1, keywordIndex: 0}
+          ? sequentialResumeCheckpoint || {round: 1, keywordIndex: 0}
           : {targetIndex: 0}),
         JSON.stringify({
           total: retryItems.length,

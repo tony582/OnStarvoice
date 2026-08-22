@@ -286,7 +286,30 @@
     const code = sanitizeText(input.code || input.errorCode, 100);
     const reason = sanitizeText(input.reason, 160);
     if (!message && !code && !reason) return null;
-    return {code, reason, message};
+    const category = sanitizeText(
+      input.category || input.errorCategory,
+      100,
+    );
+    const securityEvidence = sanitizeStructuredValue(
+      input.securityEvidence || input.security_evidence || {},
+    );
+    return {
+      code,
+      reason,
+      message,
+      ...(category ? {category} : {}),
+      ...(input.securityBlocked === true ? {securityBlocked: true} : {}),
+      ...(input.platformSafetyBlocked === true
+        ? {platformSafetyBlocked: true}
+        : {}),
+      ...(input.requiresManualAction === true
+        ? {requiresManualAction: true}
+        : {}),
+      ...(input.retryable === true ? {retryable: true} : {}),
+      ...(securityEvidence?.confirmed === true
+        ? {securityEvidence}
+        : {}),
+    };
   }
 
   function normalizeEvent(event, index = 0, options = {}) {
@@ -349,6 +372,12 @@
             const keywordServiceAbnormal =
               errorCode.toUpperCase() ===
               "DOUYIN_SEARCH_SERVICE_ABNORMAL";
+            const securityEvidence = sanitizeStructuredValue(
+              source.securityEvidence ||
+                source.security_evidence ||
+                source?.error?.securityEvidence ||
+                {},
+            );
             return {
               round: Math.max(1, normalizeNonNegativeInteger(source.round, 1)),
               index: normalizeNonNegativeInteger(source.index),
@@ -364,8 +393,16 @@
                 ? {securityBlocked: true}
                 : {}),
               ...(!keywordServiceAbnormal &&
+              source.platformSafetyBlocked === true
+                ? {platformSafetyBlocked: true}
+                : {}),
+              ...(!keywordServiceAbnormal &&
               source.requiresManualAction === true
                 ? {requiresManualAction: true}
+                : {}),
+              ...(!keywordServiceAbnormal &&
+              securityEvidence?.confirmed === true
+                ? {securityEvidence}
                 : {}),
               finishedAt: normalizeTimestamp(source.finishedAt),
             };
@@ -674,18 +711,28 @@
       return normalizeTaskRun(
         {
           ...run,
-          status: "canceled",
+          status: "failed",
           finishedAt: nowIso,
           updatedAt: nowIso,
-          message: "长时间无业务进展，已自动结束陈旧任务记录",
+          message: "长时间无业务进展，已释放任务等待重新分配",
+          error: {
+            code: "STALE_TASK_HEARTBEAT_TIMEOUT",
+            reason: "stale_task_heartbeat_timeout",
+            message: "长时间无业务进展，已释放任务等待重新分配",
+            retryable: true,
+          },
           events: [
             ...run.events,
             {
               id: `stale_reconciled_${now}`,
               type: "stale_reconciled",
-              status: "canceled",
+              status: "failed",
               at: nowIso,
-              message: "长时间无业务进展，已自动结束陈旧任务记录",
+              message: "长时间无业务进展，已释放任务等待重新分配",
+              metadata: {
+                reason: "stale_task_heartbeat_timeout",
+                retryable: true,
+              },
             },
           ],
         },

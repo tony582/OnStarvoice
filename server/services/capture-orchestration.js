@@ -67,6 +67,56 @@ function boolean(value, fallback = false) {
   return fallback;
 }
 
+const SEARCH_FILTER_VALUES = Object.freeze({
+  sort: new Set(['comprehensive', 'latest', 'likes', 'comments', 'collects']),
+  publishTime: new Set(['all', 'day', 'week', 'month', 'halfyear']),
+  contentType: new Set(['all', 'image', 'video']),
+  searchScope: new Set(['all', 'followed', 'viewed', 'unviewed']),
+  distance: new Set(['all', 'city', 'nearby']),
+  videoDuration: new Set(['all', 'under_1m', '1_5m', 'over_5m']),
+});
+
+const SEARCH_FILTER_DEFAULTS = Object.freeze({
+  sort: 'comprehensive',
+  publishTime: 'all',
+  contentType: 'all',
+  searchScope: 'all',
+  distance: 'all',
+  videoDuration: 'all',
+});
+
+function normalizeSingleSearchFilter(name, value) {
+  // Search filters other than the explicitly modeled patrol path are mutually
+  // exclusive. If an API caller sends an array, keep only its first valid
+  // choice rather than creating an unsupported cross-product of searches.
+  const candidates = Array.isArray(value) ? value : [value];
+  for (const candidate of candidates) {
+    const normalized = text(candidate, 80).toLowerCase();
+    if (SEARCH_FILTER_VALUES[name]?.has(normalized)) return normalized;
+  }
+  return SEARCH_FILTER_DEFAULTS[name] || '';
+}
+
+function normalizeSequentialSearchPasses(value, fallbackContentType = 'all') {
+  const allowed = new Set(['all', 'image', 'video']);
+  const fallback = allowed.has(fallbackContentType) ? fallbackContentType : 'all';
+  const requested = normalizeStringList(value, {
+    limit: 3,
+    itemLimit: 20,
+    map: item => text(item, 20).toLowerCase(),
+  }).filter(item => allowed.has(item));
+  if (requested.length === 0) return [fallback];
+  if (requested.length === 1) return requested;
+
+  // Only a comprehensive pass may have one focused supplement. Nested time
+  // filters and arbitrary media combinations remain intentionally unsupported.
+  if (requested.includes('all')) {
+    const supplement = requested.find(item => item === 'image' || item === 'video');
+    return supplement ? ['all', supplement] : ['all'];
+  }
+  return [requested[0]];
+}
+
 function normalizeStringList(value, {limit, itemLimit, map = item => item} = {}) {
   const source = Array.isArray(value)
     ? value
@@ -374,12 +424,12 @@ export function normalizeOrchestrationRequest(
     },
   );
   const rawFilters = object(source.searchFilters || source.search_filters);
-  const readFilter = name => text(
+  const readFilter = name => normalizeSingleSearchFilter(
+    name,
     Object.prototype.hasOwnProperty.call(source, name)
       ? source[name]
       : rawFilters[name],
-    80,
-  ).toLowerCase();
+  );
   const hasCaptureSettings = Boolean(
     source.captureSettings &&
     typeof source.captureSettings === 'object' &&
@@ -403,12 +453,24 @@ export function normalizeOrchestrationRequest(
   const rawRecoveryPolicy = object(
     source.recoveryPolicy || source.recovery_policy,
   );
+  const disableAutomaticSearchRetry = boolean(
+    rawRecoveryPolicy.disableAutomaticSearchRetry ??
+    rawRecoveryPolicy.disable_automatic_search_retry,
+    false,
+  );
+  const requireVerifiedFilters = boolean(
+    rawRecoveryPolicy.requireVerifiedFilters ??
+    rawRecoveryPolicy.require_verified_filters,
+    false,
+  );
   const recoveryPolicy = {
     allowIdleAgentHandoff: boolean(
       rawRecoveryPolicy.allowIdleAgentHandoff ??
       rawRecoveryPolicy.allow_idle_agent_handoff,
       true,
     ),
+    ...(disableAutomaticSearchRetry ? {disableAutomaticSearchRetry: true} : {}),
+    ...(requireVerifiedFilters ? {requireVerifiedFilters: true} : {}),
     platformSafetyMode: 'manual_confirmed',
   };
   const rawDistributionMode = text(
@@ -418,6 +480,25 @@ export function normalizeOrchestrationRequest(
   const distributionMode = rawDistributionMode === 'elastic_pool'
     ? 'elastic_pool'
     : 'fixed_batch';
+  const platform = normalizePlatform(source.platform);
+  const baseContentType = readFilter('contentType');
+  const searchPasses = normalizeSequentialSearchPasses(
+    source.searchPasses ?? source.search_passes,
+    baseContentType,
+  );
+  const sequentialSearchEnabled = Boolean(
+    executionMode === 'unattended_plan' &&
+    distributionMode === 'elastic_pool' &&
+    platform === 'douyin' &&
+    searchPasses.length > 1
+  );
+  const effectiveSearchPasses = sequentialSearchEnabled
+    ? searchPasses
+    : [baseContentType || 'all'];
+  if (sequentialSearchEnabled) {
+    recoveryPolicy.disableAutomaticSearchRetry = true;
+    recoveryPolicy.requireVerifiedFilters = true;
+  }
 
   return {
     requestKey: text(
@@ -428,7 +509,7 @@ export function normalizeOrchestrationRequest(
       240,
     ),
     title: text(source.title || '关键词采集任务', 240),
-    platform: normalizePlatform(source.platform),
+    platform,
     executionMode,
     allocationMode: 'balanced',
     distributionMode,
@@ -438,7 +519,7 @@ export function normalizeOrchestrationRequest(
       searchFilters: {
         sort: readFilter('sort'),
         publishTime: readFilter('publishTime'),
-        contentType: readFilter('contentType'),
+        contentType: effectiveSearchPasses[0],
         searchScope: readFilter('searchScope'),
         distance: readFilter('distance'),
         videoDuration: readFilter('videoDuration'),
@@ -451,6 +532,7 @@ export function normalizeOrchestrationRequest(
       ),
       maxRounds: schedule?.maxRounds || 1,
       roundGapMin: schedule?.roundGapMin || 10,
+      ...(sequentialSearchEnabled ? {searchPasses: effectiveSearchPasses} : {}),
       recoveryPolicy,
       ...(schedule ? schedule : {}),
       ...(hasCaptureSettings
