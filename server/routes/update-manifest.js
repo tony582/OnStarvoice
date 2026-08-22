@@ -3,12 +3,44 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.87',
+  latestVersion: '0.3.89',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-21',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.87-20260821.zip',
+  releaseDate: '2026-08-22',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.89-20260822.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.89',
+      releaseDate: '2026-08-22',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '组合巡检按断点安全接力',
+              desc: '综合搜索已经完成时会保留结果；后续图文异常仅允许另一台空闲 Agent 从图文阶段接力一次，用户主动取消仍保持取消。',
+            },
+            {
+              title: '小红书任务准确跟随替换标签页',
+              desc: '页面被浏览器替换时只接管系统确认的对应标签页，避免旧侧栏误跟随其他活动页面。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '本机 AI 不可用时更快回退',
+              desc: '本机 AI 最终判断等待上限缩短到 12 秒，超时后更早切回云端模型，减少巡检阻塞。',
+            },
+            {
+              title: '后台入口状态标识收敛',
+              desc: '调度中心移除 BETA，舆情剖析移除 NEW，桌面端与移动端保持一致。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.87',
       releaseDate: '2026-08-21',

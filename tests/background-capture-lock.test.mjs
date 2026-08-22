@@ -1891,6 +1891,24 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
           enabled: true,
           platform: "douyin",
           keywords: ["弹性工作项"],
+          searchPasses: ["general", "note"],
+        },
+        checkpoint: {
+          schemaVersion: 1,
+          round: 2,
+          activeKeywordIndex: 0,
+          activeKeyword: "",
+          activePhase: "pending",
+          keywordResults: [
+            {
+              round: 1,
+              index: 0,
+              keyword: "弹性工作项",
+              status: "completed",
+              attemptCount: 1,
+              savedCount: 3,
+            },
+          ],
         },
         orchestration: {
           parentTaskId: "parent-elastic-context",
@@ -1914,6 +1932,15 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
   assert.equal(
     request.orchestrationContext.distributionMode,
     "elastic_pool",
+  );
+  assert.equal(request.checkpoint.round, 2);
+  assert.deepEqual(
+    Array.from(request.checkpoint.keywordResults, entry => [
+      entry.round,
+      entry.keyword,
+      entry.status,
+    ]),
+    [[1, "弹性工作项", "completed"]],
   );
   assert.equal(
     request.orchestrationContext.attemptIdentity,
@@ -4935,6 +4962,90 @@ test("tabs.onReplaced migrates a persistent capture source instead of canceling 
   assert.equal(
     harness.sentTabMessages.some(
       ({payload}) => payload?.action === "cancelCapture",
+    ),
+    false,
+  );
+});
+
+test("a stale sidebar relay follows only the exact Chrome replacement mapping", async () => {
+  const harness = createHarness();
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: 1,
+    status: "complete",
+    title: "小红书搜索",
+    url: "https://www.xiaohongshu.com/search_result?keyword=别克壁纸",
+  }));
+  const taskId = "xiaohongshu-tab-replaced-relay";
+  const begun = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(begun.ok, true);
+  assert.equal(
+    await harness.api.handleCaptureRuntimeTabReplaced(44, 41),
+    true,
+  );
+  harness.setTabMissing(41, true);
+  harness.setTabMessageHandler(async (tabId) => {
+    if (tabId === 41) throw new Error("No tab with id: 41");
+    return {ok: true, data: {saved: 1}};
+  });
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:relay-to-content",
+    tabId: 41,
+    payload: {
+      action: "captureKeywordNotes",
+      keyword: "别克壁纸",
+      taskId,
+      taskContext: {taskId},
+      listCaptureRunId: "xiaohongshu-replaced-list-run",
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 44 && payload?.action === "captureKeywordNotes",
+    ),
+    true,
+  );
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 41 && payload?.action === "captureKeywordNotes",
+    ),
+    false,
+  );
+
+  const mismatched = await harness.sendBackgroundMessage({
+    type: "onstarvoice:relay-to-content",
+    tabId: 41,
+    payload: {
+      action: "captureKeywordNotes",
+      keyword: "另一个任务",
+      taskId: "different-task",
+      taskContext: {taskId: "different-task"},
+      listCaptureRunId: "different-list-run",
+    },
+  });
+  assert.equal(mismatched.ok, false);
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 41 && payload?.keyword === "另一个任务",
+    ),
+    true,
+  );
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 44 && payload?.keyword === "另一个任务",
     ),
     false,
   );

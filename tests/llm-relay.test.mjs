@@ -23,7 +23,7 @@ test('local relay is bounded to final and prefilter classification with short de
   assert.equal(isLlmRelayEligibleKind('relevance_prefilter'), true);
   assert.equal(isLlmRelayEligibleKind('llm_prompt'), false);
   assert.equal(isLlmRelayEligibleKind('report'), false);
-  assert.equal(LLM_RELAY_CLASSIFICATION_TIMEOUT_MS, 15_000);
+  assert.equal(LLM_RELAY_CLASSIFICATION_TIMEOUT_MS, 12_000);
   assert.equal(LLM_RELAY_PREFILTER_TIMEOUT_MS, 9_000);
   assert.equal(LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS, 1_000);
   assert.equal(LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS, 8_000);

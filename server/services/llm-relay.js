@@ -7,7 +7,10 @@ export const LLM_RELAY_SETTING_KEYS = Object.freeze({
 
 export const LLM_RELAY_MODES = Object.freeze(['off', 'primary', 'fallback']);
 export const DEFAULT_LLM_RELAY_MODEL = 'gemini-3.7-flash-low';
-export const LLM_RELAY_CLASSIFICATION_TIMEOUT_MS = 15_000;
+// Leave the configured cloud route enough time to answer when the Mac relay is
+// slow or temporarily unavailable. The relay remains primary, but it no longer
+// consumes the whole 15-second classification window before failover begins.
+export const LLM_RELAY_CLASSIFICATION_TIMEOUT_MS = 12_000;
 export const LLM_RELAY_PREFILTER_TIMEOUT_MS = 9_000;
 export const LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS = 1_000;
 export const LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS = 8_000;

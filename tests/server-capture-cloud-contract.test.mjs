@@ -22,6 +22,7 @@ import {
   captureTaskBusinessRootVisibilitySql,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  buildSequentialSearchResumeCheckpoint,
   classifyCaptureRecoveryDisposition,
   crossDeviceRetryAgentSupportsTask,
   crossDeviceRetryItemNeedsManualSafety,
@@ -770,6 +771,126 @@ test("orchestration checkpoint projection never reopens a terminal activeKeyword
   assert.deepEqual(
     resumedEntries.map(entry => [entry.keyword, entry.status]),
     [["雪佛兰", "completed"], ["凯迪拉克", "running"]],
+  );
+});
+
+test("sequential Douyin checkpoints retain both passes and resume only the unfinished pass", () => {
+  const runningEntries = orchestrationCheckpointEntries({
+    status: "running",
+    progress: {keyword: "别克壁纸", roundCurrent: 2},
+    checkpoint: {
+      round: 2,
+      activeKeyword: "别克壁纸",
+      keywordResults: [
+        {
+          round: 1,
+          keyword: "别克壁纸",
+          status: "completed",
+          savedCount: 8,
+        },
+      ],
+    },
+  });
+  assert.equal(runningEntries[0].round, 2);
+  assert.equal(runningEntries[0].status, "running");
+  assert.deepEqual(
+    runningEntries[0].searchPassResults.map(entry => [entry.round, entry.status]),
+    [[1, "completed"]],
+  );
+
+  const entries = orchestrationCheckpointEntries({
+    status: "needs_action",
+    checkpoint: {
+      round: 2,
+      activeKeyword: "别克壁纸",
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "别克壁纸",
+          status: "completed",
+          attemptCount: 1,
+          savedCount: 8,
+          finishedAt: "2026-08-22T00:10:00.000Z",
+        },
+        {
+          round: 2,
+          index: 0,
+          keyword: "别克壁纸",
+          status: "failed",
+          attemptCount: 1,
+          savedCount: 0,
+          errorCode: "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+          finishedAt: "2026-08-22T00:12:00.000Z",
+        },
+      ],
+    },
+  });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].round, 2);
+  assert.equal(entries[0].status, "failed");
+  assert.deepEqual(
+    entries[0].searchPassResults.map(entry => [entry.round, entry.status]),
+    [[1, "completed"], [2, "failed"]],
+  );
+
+  const checkpoint = buildSequentialSearchResumeCheckpoint({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {checkpoint: entries[0]},
+    keyword: "别克壁纸",
+    now: new Date("2026-08-22T00:15:00.000Z"),
+  });
+  assert.deepEqual(checkpoint, {
+    schemaVersion: 1,
+    round: 2,
+    activeKeywordIndex: 0,
+    activeKeyword: "",
+    activePhase: "pending",
+    keywordResults: [
+      {
+        round: 1,
+        index: 0,
+        keyword: "别克壁纸",
+        status: "completed",
+        attemptCount: 1,
+        savedCount: 8,
+        error: "",
+        finishedAt: "2026-08-22T00:10:00.000Z",
+      },
+    ],
+    updatedAt: "2026-08-22T00:15:00.000Z",
+  });
+  assert.equal(buildSequentialSearchResumeCheckpoint({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {
+      checkpoint: {
+        searchPassResults: [
+          {round: 1, keyword: "别克壁纸", status: "failed"},
+        ],
+      },
+    },
+    keyword: "别克壁纸",
+  }), null);
+});
+
+test("elastic sequential patrol keeps one bounded cross-agent handoff", () => {
+  const refresh = readRouteSection(
+    "async function refreshOrchestrationParentTask",
+    "async function projectNegativePatrolSnapshot",
+  );
+  assert.match(
+    refresh,
+    /const elasticPool = parentMetadata\.distributionMode === 'elastic_pool';[\s\S]*if \(!elasticPool\) \{[\s\S]*automaticRetrySuppressed/u,
+  );
+  assert.doesNotMatch(
+    refresh.slice(0, refresh.indexOf("if (!elasticPool)")),
+    /automaticRetrySuppressed/u,
   );
 });
 

@@ -2242,7 +2242,42 @@ export function orchestrationCheckpointEntries(snapshot) {
       .map(entry => safeJson(entry))
       .filter(entry => text(entry.keyword, 120))
     : [];
-  const byKeyword = new Map(entries.map(entry => [text(entry.keyword, 120), entry]));
+  const groupedByKeyword = new Map();
+  for (const rawEntry of entries) {
+    const keyword = text(rawEntry.keyword, 120);
+    const entry = {...rawEntry};
+    delete entry.searchPassResults;
+    const group = groupedByKeyword.get(keyword) || {
+      representative: null,
+      searchPassResults: [],
+    };
+    group.searchPassResults.push(entry);
+    const currentRound = Math.max(1, Number(entry.round) || 1);
+    const representativeRound = Math.max(
+      1,
+      Number(group.representative?.round) || 1,
+    );
+    if (!group.representative || currentRound >= representativeRound) {
+      group.representative = entry;
+    }
+    groupedByKeyword.set(keyword, group);
+  }
+  const byKeyword = new Map(
+    Array.from(groupedByKeyword.entries(), ([keyword, group]) => {
+      const searchPassResults = group.searchPassResults
+        .sort((left, right) =>
+          Math.max(1, Number(left.round) || 1) -
+          Math.max(1, Number(right.round) || 1),
+        );
+      return [
+        keyword,
+        {
+          ...group.representative,
+          searchPassResults,
+        },
+      ];
+    }),
+  );
   const activeKeyword = text(
     progress.keyword ||
       progress.currentKeyword ||
@@ -2254,6 +2289,13 @@ export function orchestrationCheckpointEntries(snapshot) {
   const existingStatus = existingEntry
     ? checkpointEntryToItemStatus(existingEntry)
     : '';
+  const activeRound = Math.max(
+    1,
+    Number(progress.round) || 0,
+    Number(progress.roundCurrent) || 0,
+    Number(checkpoint.round) || 0,
+  );
+  const existingRound = Math.max(1, Number(existingEntry?.round) || 1);
   const taskIsActivelyExecuting = ['claimed', 'running', 'recovering'].includes(
     text(snapshot?.status, 80),
   );
@@ -2264,13 +2306,16 @@ export function orchestrationCheckpointEntries(snapshot) {
   if (
     activeKeyword &&
     taskIsActivelyExecuting &&
-    !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus)
+    (
+      !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus) ||
+      existingRound < activeRound
+    )
   ) {
     byKeyword.set(activeKeyword, {
       ...safeJson(existingEntry),
       keyword: activeKeyword,
       status: 'running',
-      round: Math.max(1, Number(checkpoint.round) || 1),
+      round: activeRound,
       index: Math.max(
         0,
         Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex) || 0,
@@ -2278,6 +2323,80 @@ export function orchestrationCheckpointEntries(snapshot) {
     });
   }
   return Array.from(byKeyword.values());
+}
+
+function sequentialSearchResumeEntry(entry = {}, keyword = '') {
+  const source = safeJson(entry);
+  return {
+    round: Math.max(1, Number(source.round) || 1),
+    index: 0,
+    keyword: text(keyword || source.keyword, 120),
+    status: 'completed',
+    attemptCount: Math.max(0, Number(source.attemptCount) || 0),
+    savedCount: Math.max(0, Number(source.savedCount) || 0),
+    error: '',
+    finishedAt: orchestrationCheckpointTimestamp(source.finishedAt),
+  };
+}
+
+export function buildSequentialSearchResumeCheckpoint({
+  planSnapshot = {},
+  itemMetadata = {},
+  keyword = '',
+  now = new Date(),
+} = {}) {
+  const plan = safeJson(planSnapshot);
+  const normalizedKeyword = text(keyword, 120);
+  const searchPasses = Array.isArray(plan.searchPasses)
+    ? plan.searchPasses.map(pass => text(pass, 80)).filter(Boolean)
+    : [];
+  if (
+    text(plan.platform, 80).toLowerCase() !== 'douyin' ||
+    searchPasses.length < 2 ||
+    !normalizedKeyword
+  ) {
+    return null;
+  }
+
+  const checkpoint = safeJson(safeJson(itemMetadata).checkpoint);
+  const passResults = Array.isArray(checkpoint.searchPassResults)
+    ? checkpoint.searchPassResults
+    : [];
+  const latestByRound = new Map();
+  for (const result of passResults) {
+    const source = safeJson(result);
+    if (text(source.keyword, 120) !== normalizedKeyword) continue;
+    const round = Math.max(1, Number(source.round) || 1);
+    if (round > searchPasses.length) continue;
+    latestByRound.set(round, source);
+  }
+
+  const completedPrefix = [];
+  for (let round = 1; round <= searchPasses.length; round += 1) {
+    const result = latestByRound.get(round);
+    if (text(result?.status, 80).toLowerCase() !== 'completed') break;
+    completedPrefix.push(sequentialSearchResumeEntry(result, normalizedKeyword));
+  }
+  if (
+    completedPrefix.length === 0 ||
+    completedPrefix.length >= searchPasses.length
+  ) {
+    return null;
+  }
+
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const updatedAt = Number.isFinite(nowDate.getTime())
+    ? nowDate.toISOString()
+    : new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    round: completedPrefix.length + 1,
+    activeKeywordIndex: 0,
+    activeKeyword: '',
+    activePhase: 'pending',
+    keywordResults: completedPrefix,
+    updatedAt,
+  };
 }
 
 function orchestrationItemAttemptStatus(itemStatus) {
@@ -2618,29 +2737,33 @@ async function refreshOrchestrationParentTask(tx, {
     await lockOrchestrationParent(tx, tenantId, parentTaskId);
   if (!parent) return null;
   if (['canceled', 'superseded'].includes(parent.status)) return parent;
+  const parentMetadata = safeJson(parent.metadata);
+  const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
 
-  // A multi-pass patrol is intentionally single-shot. Once a browser actually
-  // started searching, any retryable result becomes an operator-visible stop
-  // instead of silently repeating the search on this or another device.
-  await tx.execute(`
-    UPDATE capture_task_items
-    SET status = 'needs_action',
-      metadata = metadata || jsonb_build_object(
-        'automaticRetrySuppressed', true,
-        'requiresManualAction', true
-      ),
-      error = error || jsonb_build_object(
-        'automaticRetrySuppressed', true,
-        'requiresManualAction', true
-      ),
-      finished_at = COALESCE(finished_at, now()),
-      updated_at = now()
-    WHERE task_id = $1
-      AND tenant_id = $2
-      AND status = 'retryable'
-      AND started_at IS NOT NULL
-      AND COALESCE(metadata->>'disableAutomaticSearchRetry', 'false') = 'true'
-  `, [parentTaskId, tenantId]);
+  if (!elasticPool) {
+    // Fixed-device patrols remain single-shot. Elastic patrols use their own
+    // bounded handoff budget: one different Agent may continue an unfinished
+    // sequential search pass, and a second safety failure becomes manual.
+    await tx.execute(`
+      UPDATE capture_task_items
+      SET status = 'needs_action',
+        metadata = metadata || jsonb_build_object(
+          'automaticRetrySuppressed', true,
+          'requiresManualAction', true
+        ),
+        error = error || jsonb_build_object(
+          'automaticRetrySuppressed', true,
+          'requiresManualAction', true
+        ),
+        finished_at = COALESCE(finished_at, now()),
+        updated_at = now()
+      WHERE task_id = $1
+        AND tenant_id = $2
+        AND status = 'retryable'
+        AND started_at IS NOT NULL
+        AND COALESCE(metadata->>'disableAutomaticSearchRetry', 'false') = 'true'
+    `, [parentTaskId, tenantId]);
+  }
 
   const items = await tx.queryAll(`
     SELECT status
@@ -2649,8 +2772,6 @@ async function refreshOrchestrationParentTask(tx, {
     ORDER BY ordinal, id
   `, [parentTaskId, tenantId]);
   const aggregate = aggregateParentTaskItems(items);
-  const parentMetadata = safeJson(parent.metadata);
-  const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
   if (
     elasticPool &&
     aggregate.status === 'needs_action' &&
@@ -3840,6 +3961,13 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       ...(text(entry.cooldownHomeUrl, 2000)
         ? {cooldownHomeUrl: text(entry.cooldownHomeUrl, 2000)}
         : {}),
+      ...(Array.isArray(entry.searchPassResults)
+        ? {
+            searchPassResults: entry.searchPassResults
+              .slice(0, 4)
+              .map(result => sanitizeCloudStructuredObject(result)),
+          }
+        : {}),
       ...(!keywordServiceAbnormal &&
       entry.securityEvidence?.confirmed === true
         ? {
@@ -4886,6 +5014,13 @@ async function dispatchNextElasticWorkItem(tx, {
   ) {
     return null;
   }
+  const sequentialResumeCheckpoint = targetedContent
+    ? null
+    : buildSequentialSearchResumeCheckpoint({
+        planSnapshot,
+        itemMetadata,
+        keyword: candidate.keyword,
+      });
 
   const childTaskId = crypto.randomUUID();
   const commandId = crypto.randomUUID();
@@ -4908,7 +5043,10 @@ async function dispatchNextElasticWorkItem(tx, {
   let childPlan = {};
   let childTaskType = 'unattended_keyword_capture';
   let childFeatureKey = 'unattended_keyword_plan';
-  let childCheckpoint = {round: 1, keywordIndex: 0};
+  let childCheckpoint = sequentialResumeCheckpoint || {
+    round: 1,
+    keywordIndex: 0,
+  };
   let claimUnit = 'keyword';
   let childMessage = '已从云端领取 1 个关键词，等待设备确认';
   let commandPayload = {};
@@ -5005,6 +5143,9 @@ async function dispatchNextElasticWorkItem(tx, {
       executionMode: 'one_time',
       platform: childPlan.platform,
       planSnapshot: childPlan,
+      ...(sequentialResumeCheckpoint
+        ? {checkpoint: sequentialResumeCheckpoint}
+        : {}),
       requestHash,
       authCodeId: agent.auth_code_id,
       authBindingId: agent.auth_binding_id,
@@ -5042,6 +5183,12 @@ async function dispatchNextElasticWorkItem(tx, {
     distributionMode: 'elastic_pool',
     claimUnit,
     attemptIdentity,
+    ...(sequentialResumeCheckpoint
+      ? {
+          resumedSequentialSearch: true,
+          resumeRound: sequentialResumeCheckpoint.round,
+        }
+      : {}),
     createAckTimeoutSeconds:
       Math.floor(ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS / 1000),
     scheduleId: candidate.orchestration_schedule_id || undefined,
@@ -8766,8 +8913,16 @@ async function dispatchCrossDeviceRetry({
 
       let commandPayload;
       let childPlan = {};
+      let sequentialResumeCheckpoint = null;
       if (businessTaskType === 'unattended_keyword_capture') {
-        const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+        const planSnapshot = safeJson(safeJson(parent.metadata).planSnapshot);
+        if (retryItems.length === 1) {
+          sequentialResumeCheckpoint = buildSequentialSearchResumeCheckpoint({
+            planSnapshot,
+            itemMetadata: retryItems[0].metadata,
+            keyword: retryItems[0].keyword,
+          });
+        }
         const normalized = normalizeRemoteTaskInput({
           clientTaskId: requestKey,
           title: `${parent.title} · 换设备重试`,
@@ -8790,6 +8945,9 @@ async function dispatchCrossDeviceRetry({
           executionMode: 'one_time',
           platform: childPlan.platform,
           planSnapshot: childPlan,
+          ...(sequentialResumeCheckpoint
+            ? {checkpoint: sequentialResumeCheckpoint}
+            : {}),
           requestHash,
           authCodeId: targetAgent.auth_code_id,
           authBindingId: targetAgent.auth_binding_id,
@@ -8836,6 +8994,12 @@ async function dispatchCrossDeviceRetry({
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
         automaticRecovery: automatic,
+        ...(sequentialResumeCheckpoint
+          ? {
+              resumedSequentialSearch: true,
+              resumeRound: sequentialResumeCheckpoint.round,
+            }
+          : {}),
         requestedByUserId: req.user?.id || '',
         requestedByName: text(req.actorName, 240),
       };
@@ -8868,7 +9032,7 @@ async function dispatchCrossDeviceRetry({
           phase: 'queued',
         }),
         JSON.stringify(businessTaskType === 'unattended_keyword_capture'
-          ? {round: 1, keywordIndex: 0}
+          ? sequentialResumeCheckpoint || {round: 1, keywordIndex: 0}
           : {targetIndex: 0}),
         JSON.stringify({
           total: retryItems.length,
