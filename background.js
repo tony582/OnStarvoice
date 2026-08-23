@@ -160,6 +160,7 @@ const CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS = 10 * 60 * 1000;
 const captureTaskReplacementTabIds = new Map();
 const captureTaskPendingWorkerTabIds = new Map();
 const captureTaskCleanupInProgress = new Set();
+let captureTaskBeginInFlight = null;
 
 function pruneCaptureTaskReplacementTabs(now = Date.now()) {
   for (const [tabId, replacement] of captureTaskReplacementTabIds) {
@@ -173,6 +174,7 @@ function rememberCaptureTaskReplacementTab({
   removedTabId,
   addedTabId,
   taskId,
+  attemptId = '',
 } = {}) {
   const oldTabId = resolveCaptureTaskTabId(removedTabId);
   const newTabId = resolveCaptureTaskTabId(addedTabId);
@@ -182,19 +184,25 @@ function rememberCaptureTaskReplacementTab({
   captureTaskReplacementTabIds.set(oldTabId, {
     tabId: newTabId,
     taskId: normalizedTaskId,
+    attemptId: String(attemptId || '').trim(),
     expiresAt: Date.now() + CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS,
   });
   return true;
 }
 
-function resolveCaptureTaskReplacementTab(tabId, taskId = '') {
+function resolveCaptureTaskReplacementLease(
+  tabId,
+  {taskId = '', attemptId = ''} = {},
+) {
   const originalTabId = resolveCaptureTaskTabId(tabId);
   const requestedTaskId = String(taskId || '').trim();
+  const requestedAttemptId = String(attemptId || '').trim();
   if (!originalTabId) return null;
   pruneCaptureTaskReplacementTabs();
 
   let replacementTabId = originalTabId;
   let replacementTaskId = requestedTaskId;
+  let replacementAttemptId = requestedAttemptId;
   const visited = new Set([originalTabId]);
   for (let depth = 0; depth < 8; depth += 1) {
     const replacement = captureTaskReplacementTabIds.get(replacementTabId);
@@ -205,24 +213,43 @@ function resolveCaptureTaskReplacementTab(tabId, taskId = '') {
     ) {
       return null;
     }
+    if (
+      replacementAttemptId &&
+      String(replacement.attemptId || '').trim() !== replacementAttemptId
+    ) {
+      return null;
+    }
     replacementTaskId = replacementTaskId || replacement.taskId;
+    replacementAttemptId =
+      replacementAttemptId || String(replacement.attemptId || '').trim();
     replacementTabId = resolveCaptureTaskTabId(replacement.tabId);
     if (!replacementTabId || visited.has(replacementTabId)) return null;
     visited.add(replacementTabId);
   }
   if (replacementTabId === originalTabId || !replacementTaskId) return null;
 
-  const group = captureTaskTabGroupManager?.getTask(replacementTaskId);
+  return {
+    tabId: replacementTabId,
+    taskId: replacementTaskId,
+    attemptId: replacementAttemptId,
+  };
+}
+
+function resolveCaptureTaskReplacementTab(tabId, taskId = '') {
+  const replacement = resolveCaptureTaskReplacementLease(tabId, {taskId});
+  if (!replacement) return null;
+
+  const group = captureTaskTabGroupManager?.getTask(replacement.taskId);
   if (
     !group ||
     (
-      Number(group.sourceTabId) !== replacementTabId &&
-      !group.workerTabIds?.includes(replacementTabId)
+      Number(group.sourceTabId) !== replacement.tabId &&
+      !group.workerTabIds?.includes(replacement.tabId)
     )
   ) {
     return null;
   }
-  return {tabId: replacementTabId, taskId: replacementTaskId};
+  return replacement;
 }
 const DEFAULT_UNATTENDED_KEYWORD_PLAN = Object.freeze({
   enabled: false,
@@ -8410,9 +8437,12 @@ captureDebugSessionManager =
     },
   });
 
-function createCaptureTaskError(code, message) {
+function createCaptureTaskError(code, message, details = null) {
   const error = new Error(message);
   error.code = code;
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    error.details = details;
+  }
   return error;
 }
 
@@ -8621,16 +8651,38 @@ async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
 }
 
 async function beginCaptureTask(message, sender) {
-  return await runCaptureTaskBeginOperation(() =>
-    beginCaptureTaskNow(message, sender),
-  );
+  return await runCaptureTaskBeginOperation(async () => {
+    const request = getCaptureTaskRequest(message);
+    const marker = {
+      taskId: requireCaptureTaskId(request),
+      attemptId: String(request.attemptId || '').trim(),
+      sourceTabId: resolveCaptureTaskTabId(
+        request.sourceTabId,
+        request.tabId,
+        sender?.tab?.id,
+      ),
+    };
+    captureTaskBeginInFlight = marker;
+    try {
+      return await beginCaptureTaskNow(message, sender);
+    } finally {
+      if (captureTaskBeginInFlight === marker) {
+        captureTaskBeginInFlight = null;
+      }
+    }
+  });
 }
 
 async function beginCaptureTaskNow(message, sender) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
   const ownerRequired = request.ownerRequired === true;
-  const sourceTabId = resolveCaptureTaskTabId(
+  const attemptId = String(request.attemptId || '').trim();
+  let sourceTabId = resolveCaptureTaskTabId(
+    captureTaskBeginInFlight?.taskId === taskId &&
+        captureTaskBeginInFlight?.attemptId === attemptId
+      ? captureTaskBeginInFlight.sourceTabId
+      : null,
     request.sourceTabId,
     request.tabId,
     sender?.tab?.id,
@@ -8641,10 +8693,29 @@ async function beginCaptureTaskNow(message, sender) {
       '采集任务缺少有效的来源 Tab',
     );
   }
-  const sourceTab = await chrome.tabs.get(sourceTabId);
-  const detectedPlatform = detectPlatformFromUrl(sourceTab?.url || '');
+  let sourceTab = null;
+  try {
+    sourceTab = await chrome.tabs.get(sourceTabId);
+  } catch (error) {
+    const replacement = resolveCaptureTaskReplacementLease(sourceTabId, {
+      taskId,
+      attemptId,
+    });
+    const replacementTabId = resolveCaptureTaskTabId(
+      captureTaskBeginInFlight?.taskId === taskId &&
+          captureTaskBeginInFlight?.attemptId === attemptId
+        ? captureTaskBeginInFlight.sourceTabId
+        : null,
+      replacement?.tabId,
+    );
+    if (!replacementTabId || replacementTabId === sourceTabId) {
+      throw error;
+    }
+    sourceTabId = replacementTabId;
+    sourceTab = await chrome.tabs.get(sourceTabId);
+  }
+  let sourcePlatform = detectPlatformFromUrl(sourceTab?.url || '');
   const requestedPlatform = normalizePlatformId(request.platform);
-  const sourcePlatform = detectedPlatform;
   if (!new Set(['xiaohongshu', 'douyin']).has(sourcePlatform)) {
     throw createCaptureTaskError(
       'capture_task_platform_unsupported',
@@ -8701,7 +8772,7 @@ async function beginCaptureTaskNow(message, sender) {
     attemptId: request.attemptId,
     sender,
   });
-  const boundExecutionLock = await bindCaptureExecutionLockToTask(
+  let boundExecutionLock = await bindCaptureExecutionLockToTask(
     taskId,
     sourceTabId,
     {
@@ -8726,27 +8797,98 @@ async function beginCaptureTaskNow(message, sender) {
       '无人值守任务执行锁未能绑定，未启动浏览器接管',
     );
   }
-  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
 
-  const finalBeginAttemptFence = await inspectUnattendedCaptureTaskAttempt({
-    taskId,
-    attemptId: request.attemptId,
-  });
-  if (
-    finalBeginAttemptFence.unattended &&
-    (!finalBeginAttemptFence.current ||
-      !finalBeginAttemptFence.active ||
-      !finalBeginAttemptFence.lockMatchesTaskAttempt ||
-      !matchesUnattendedBeginLease(
-        finalBeginAttemptFence.lock,
-        boundExecutionLock,
-      ))
-  ) {
-    throw createCaptureTaskError(
-      'unattended_begin_fence_changed',
-      '无人值守任务状态已经变化，未启动浏览器接管',
+  const reconcileUnattendedBeginFence = async ({rollback = false} = {}) => {
+    const fence = await inspectUnattendedCaptureTaskAttempt({
+      taskId,
+      attemptId,
+    });
+    const leaseMatches = !fence.unattended || matchesUnattendedBeginLease(
+      fence.lock,
+      boundExecutionLock,
+      {taskId, attemptId},
     );
-  }
+    if (
+      fence.unattended &&
+      (!fence.current ||
+        !fence.active ||
+        !fence.lockMatchesTaskAttempt ||
+        !leaseMatches)
+    ) {
+      const details = describeUnattendedBeginFenceMismatch(
+        fence,
+        boundExecutionLock,
+      );
+      console.warn('[CaptureTask] unattended BEGIN fence changed:', details);
+      throw createCaptureTaskError(
+        'unattended_begin_fence_changed',
+        rollback
+          ? '无人值守任务状态已经变化，已撤销浏览器接管'
+          : '无人值守任务状态已经变化，未启动浏览器接管',
+        details,
+      );
+    }
+    const inFlightReplacementTabId = resolveCaptureTaskTabId(
+      captureTaskBeginInFlight?.taskId === taskId &&
+          captureTaskBeginInFlight?.attemptId === attemptId
+        ? captureTaskBeginInFlight.sourceTabId
+        : null,
+    );
+    const replacementTabId = resolveCaptureTaskTabId(
+      inFlightReplacementTabId !== sourceTabId
+        ? inFlightReplacementTabId
+        : fence.unattended
+          ? fence.lock?.holderTabId
+          : null,
+    );
+    if (replacementTabId && replacementTabId !== sourceTabId) {
+      const replacement = resolveCaptureTaskReplacementLease(sourceTabId, {
+        taskId,
+        attemptId,
+      });
+      if (!replacement || replacement.tabId !== replacementTabId) {
+        const details = describeUnattendedBeginFenceMismatch(
+          fence,
+          boundExecutionLock,
+        );
+        throw createCaptureTaskError(
+          'unattended_begin_fence_changed',
+          '无人值守任务页面发生了未经确认的切换，未启动浏览器接管',
+          details,
+        );
+      }
+      const replacementTab = await chrome.tabs.get(replacementTabId);
+      const replacementPlatform = detectPlatformFromUrl(
+        replacementTab?.url || '',
+      );
+      if (
+        replacementPlatform !== sourcePlatform ||
+        (requestedPlatform !== 'unknown' &&
+          replacementPlatform !== requestedPlatform)
+      ) {
+        throw createCaptureTaskError(
+          'capture_task_platform_mismatch',
+          '浏览器替换后的任务页面与原任务平台不一致，已拒绝接管',
+        );
+      }
+      sourceTabId = replacementTabId;
+      sourceTab = replacementTab;
+      sourcePlatform = replacementPlatform;
+      if (
+        captureTaskBeginInFlight?.taskId === taskId &&
+        captureTaskBeginInFlight?.attemptId === attemptId
+      ) {
+        captureTaskBeginInFlight.sourceTabId = replacementTabId;
+      }
+    }
+    if (fence.unattended) {
+      boundExecutionLock = fence.lock;
+    }
+    return fence;
+  };
+
+  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
+  await reconcileUnattendedBeginFence();
 
   const existingSession =
     captureDebugSessionManager.getSessionByTaskId(taskId);
@@ -8819,6 +8961,7 @@ async function beginCaptureTaskNow(message, sender) {
       );
     }
   }
+  await reconcileUnattendedBeginFence();
   let group = null;
   let session = null;
 
@@ -8828,6 +8971,34 @@ async function beginCaptureTaskNow(message, sender) {
       sourceTabId,
       title: CAPTURE_TASK_GROUP_TITLE,
     });
+    await reconcileUnattendedBeginFence();
+    const activeGroupAfterFence =
+      captureTaskTabGroupManager.getTask(taskId) || group;
+    if (activeGroupAfterFence.sourceTabId !== sourceTabId) {
+      const groupReplacement = resolveCaptureTaskReplacementLease(
+        activeGroupAfterFence.sourceTabId,
+        {taskId, attemptId},
+      );
+      if (!groupReplacement || groupReplacement.tabId !== sourceTabId) {
+        throw createCaptureTaskError(
+          'capture_task_replacement_not_rebound',
+          '浏览器替换了采集页面，但任务标签组未能重新绑定',
+        );
+      }
+      const groupResult = await captureTaskTabGroupManager.replaceTab({
+        removedTabId: activeGroupAfterFence.sourceTabId,
+        addedTabId: sourceTabId,
+      });
+      if (groupResult?.replaced !== true) {
+        throw createCaptureTaskError(
+          'capture_task_replacement_not_rebound',
+          '浏览器替换了采集页面，但任务标签组未能重新绑定',
+        );
+      }
+      group = groupResult.group;
+    } else {
+      group = activeGroupAfterFence;
+    }
     session = await captureDebugSessionManager.start({
       tabId: sourceTabId,
       runId:
@@ -8863,26 +9034,7 @@ async function beginCaptureTaskNow(message, sender) {
       await requireConnectedCaptureTaskOwner(taskId);
     }
     await writeRuntimeState({captureTaskCancellation: null});
-    const completedBeginAttemptFence =
-      await inspectUnattendedCaptureTaskAttempt({
-        taskId,
-        attemptId: request.attemptId,
-      });
-    if (
-      completedBeginAttemptFence.unattended &&
-      (!completedBeginAttemptFence.current ||
-        !completedBeginAttemptFence.active ||
-        !completedBeginAttemptFence.lockMatchesTaskAttempt ||
-        !matchesUnattendedBeginLease(
-          completedBeginAttemptFence.lock,
-          boundExecutionLock,
-        ))
-    ) {
-      throw createCaptureTaskError(
-        'unattended_begin_fence_changed',
-        '无人值守任务状态已经变化，已撤销浏览器接管',
-      );
-    }
+    await reconcileUnattendedBeginFence({rollback: true});
     return {taskId, session, group};
   } catch (error) {
     if (session || group || existingSession || existingGroup) {
@@ -9435,8 +9587,12 @@ async function inspectUnattendedCaptureTaskAttempt({
   };
 }
 
-function matchesUnattendedBeginLease(actualLock, expectedLock) {
-  return Boolean(
+function matchesUnattendedBeginLease(
+  actualLock,
+  expectedLock,
+  {taskId = '', attemptId = ''} = {},
+) {
+  const stableLeaseMatches = Boolean(
     actualLock &&
       expectedLock &&
       String(actualLock.id || '') === String(expectedLock.id || '') &&
@@ -9445,13 +9601,52 @@ function matchesUnattendedBeginLease(actualLock, expectedLock) {
         String(expectedLock.holderId || '') &&
       String(actualLock.holderDocumentId || '') ===
         String(expectedLock.holderDocumentId || '') &&
-      resolveCaptureTaskTabId(actualLock.holderTabId) ===
-        resolveCaptureTaskTabId(expectedLock.holderTabId) &&
       String(actualLock.captureTaskId || '').trim() ===
         String(expectedLock.captureTaskId || '').trim() &&
       String(actualLock.captureTaskAttemptId || '').trim() ===
         String(expectedLock.captureTaskAttemptId || '').trim()
   );
+  if (!stableLeaseMatches) return false;
+
+  const actualTabId = resolveCaptureTaskTabId(actualLock.holderTabId);
+  const expectedTabId = resolveCaptureTaskTabId(expectedLock.holderTabId);
+  if (actualTabId === expectedTabId) return true;
+  const replacement = resolveCaptureTaskReplacementLease(expectedTabId, {
+    taskId:
+      String(taskId || '').trim() ||
+      String(expectedLock.captureTaskId || '').trim(),
+    attemptId:
+      String(attemptId || '').trim() ||
+      String(expectedLock.captureTaskAttemptId || '').trim(),
+  });
+  return Boolean(replacement && replacement.tabId === actualTabId);
+}
+
+function describeUnattendedBeginFenceMismatch(actualFence, expectedLock) {
+  const actualLock = actualFence?.lock || null;
+  return {
+    current: actualFence?.current === true,
+    active: actualFence?.active === true,
+    lockMatchesTaskAttempt: actualFence?.lockMatchesTaskAttempt === true,
+    expected: {
+      lockId: String(expectedLock?.id || ''),
+      owner: String(expectedLock?.owner || ''),
+      holderId: String(expectedLock?.holderId || ''),
+      holderDocumentId: String(expectedLock?.holderDocumentId || ''),
+      holderTabId: resolveCaptureTaskTabId(expectedLock?.holderTabId),
+      captureTaskId: String(expectedLock?.captureTaskId || ''),
+      attemptId: String(expectedLock?.captureTaskAttemptId || ''),
+    },
+    actual: {
+      lockId: String(actualLock?.id || ''),
+      owner: String(actualLock?.owner || ''),
+      holderId: String(actualLock?.holderId || ''),
+      holderDocumentId: String(actualLock?.holderDocumentId || ''),
+      holderTabId: resolveCaptureTaskTabId(actualLock?.holderTabId),
+      captureTaskId: String(actualLock?.captureTaskId || ''),
+      attemptId: String(actualLock?.captureTaskAttemptId || ''),
+    },
+  };
 }
 
 async function clearUnattendedCaptureTaskLockBinding(
@@ -10038,8 +10233,20 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
         Number(group?.sourceTabId) === normalizedRemovedTabId ||
         group?.workerTabIds?.includes(normalizedRemovedTabId),
     );
+  const pendingBegin =
+    captureTaskBeginInFlight &&
+    resolveCaptureTaskTabId(captureTaskBeginInFlight.sourceTabId) ===
+      normalizedRemovedTabId
+      ? captureTaskBeginInFlight
+      : null;
   const taskId = String(
-    previousDebugSession?.taskId || previousGroup?.taskId || '',
+    previousDebugSession?.taskId ||
+      previousGroup?.taskId ||
+      pendingBegin?.taskId ||
+      '',
+  ).trim();
+  const attemptId = String(
+    previousDebugSession?.attemptId || pendingBegin?.attemptId || '',
   ).trim();
   const replacementRole =
     Number(previousGroup?.sourceTabId) === normalizedRemovedTabId
@@ -10064,6 +10271,29 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
     return false;
   }
 
+  rememberCaptureTaskReplacementTab({
+    removedTabId: normalizedRemovedTabId,
+    addedTabId: normalizedAddedTabId,
+    taskId,
+    attemptId,
+  });
+  if (pendingBegin) {
+    pendingBegin.sourceTabId = normalizedAddedTabId;
+  }
+  if (pendingBegin && !previousDebugSession && !previousGroup) {
+    await Promise.all([
+      replaceCaptureExecutionLockTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+      replaceUnattendedRunnerTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+    ]);
+    return true;
+  }
+
   let replacementTab = null;
   try {
     replacementTab = await chrome.tabs.get(normalizedAddedTabId);
@@ -10077,9 +10307,16 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
       pageTitle: replacementTab?.title || '',
       pageUrl: replacementTab?.url || '',
     });
+    const debugBindingCanFinishInBegin = Boolean(
+      pendingBegin &&
+        replacementRole === 'source' &&
+        !previousDebugSession,
+    );
     if (
       groupResult?.replaced !== true ||
-      (replacementRole && debugResult?.replaced !== true)
+      (replacementRole &&
+        debugResult?.replaced !== true &&
+        !debugBindingCanFinishInBegin)
     ) {
       throw createCaptureTaskError(
         'capture_task_replacement_not_rebound',
@@ -10107,6 +10344,7 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
       removedTabId: normalizedRemovedTabId,
       addedTabId: normalizedAddedTabId,
       taskId,
+      attemptId,
     });
     return true;
   } catch (error) {
@@ -11077,6 +11315,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         error: {
           code: String(error?.code || 'runtime_error'),
           message: error instanceof Error ? error.message : 'unknown runtime error',
+          ...(error?.details &&
+          typeof error.details === 'object' &&
+          !Array.isArray(error.details)
+            ? {details: error.details}
+            : {}),
         },
       });
     }

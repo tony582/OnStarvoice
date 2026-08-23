@@ -91,6 +91,11 @@ const FINAL_EXECUTION_STATUSES = new Set([
   'completed', 'completed_with_warnings', 'completed_with_failures',
   'failed', 'canceled', 'skipped', 'superseded',
 ])
+const FINAL_ORCHESTRATION_STATUSES = new Set([
+  'completed', 'completed_with_warnings', 'completed_with_failures',
+  'failed', 'canceled', 'skipped', 'superseded',
+])
+const ELASTIC_AUTOMATIC_ATTEMPT_LIMIT = 3
 const HANDOFF_UNSTARTED_EXCLUDED_STATUSES = new Set([
   'completed', 'completed_with_warnings', 'failed', 'skipped',
 ])
@@ -117,6 +122,14 @@ const NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES = new Set([
   'resume_requested',
 ])
 const KEYWORD_RETRY_STATUSES = new Set(['retryable', 'needs_action', 'failed'])
+
+function elasticAttemptBudgetUsed(item: OrchestrationItemRecord) {
+  const rawBudget = item.metadata?.elasticAttemptBudgetUsed
+  const budget = Number(rawBudget)
+  return Number.isInteger(budget) && budget >= 0
+    ? budget
+    : Math.max(0, Number(item.attempt_count || 0))
+}
 
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
@@ -1169,6 +1182,26 @@ export function OrchestrationDetailWorkspace({
     .map(value => value === 'all' ? '综合' : CONTENT_TYPE_LABELS[value] || value)
     .join(' → ')
   const idleHandoffAllowed = elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false
+  const orchestrationFinal = FINAL_ORCHESTRATION_STATUSES.has(
+    String(orchestration.status || ''),
+  )
+  const automaticKeywordRecoveryActive = Boolean(
+    elasticPool &&
+    idleHandoffAllowed &&
+    !orchestrationFinal &&
+    keywordRetryItems.some(item =>
+      item.status === 'retryable' &&
+      elasticAttemptBudgetUsed(item) < ELASTIC_AUTOMATIC_ATTEMPT_LIMIT,
+    ),
+  )
+  const keywordRecoveryExhausted = Boolean(
+    elasticPool &&
+    orchestrationFinal &&
+    keywordRetryItems.length > 0 &&
+    keywordRetryItems.every(item =>
+      elasticAttemptBudgetUsed(item) >= ELASTIC_AUTOMATIC_ATTEMPT_LIMIT,
+    ),
+  )
 
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
@@ -1392,26 +1425,42 @@ export function OrchestrationDetailWorkspace({
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-sm font-bold text-foreground">
-                      {idleHandoffAllowed
+                      {automaticKeywordRecoveryActive
                         ? `${keywordRetryItems.length} 个关键词正在自动恢复`
-                        : `${keywordRetryItems.length} 个关键词可云端重试`}
+                        : keywordRecoveryExhausted
+                          ? `${keywordRetryItems.length} 个关键词自动尝试已耗尽`
+                          : orchestrationFinal && elasticPool
+                            ? `${keywordRetryItems.length} 个关键词自动恢复已停止`
+                            : `${keywordRetryItems.length} 个关键词可云端重试`}
                     </h3>
                     <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
-                      {idleHandoffAllowed ? '系统自动分配' : '回写当前父任务'}
+                      {automaticKeywordRecoveryActive
+                        ? '系统自动分配'
+                        : orchestrationFinal && elasticPool
+                          ? '任务已结算'
+                          : '回写当前父任务'}
                     </span>
                   </div>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    {idleHandoffAllowed
+                    {automaticKeywordRecoveryActive
                       ? '技术失败会按关键词自动重试，并优先交给近期更稳定的空闲 Agent；新结果仍回写当前任务。'
-                      : '此历史任务未启用自动接力，可选择原 Agent 或其他在线空闲 Agent 手工重试。'}
+                      : keywordRecoveryExhausted
+                        ? '该批次已完成结算，不会继续自动下发；请查看每次尝试的真实错误后决定是否新建补采任务。'
+                        : orchestrationFinal && elasticPool
+                          ? '该批次已经结算，页面不再把失败项误报为“正在自动恢复”。'
+                          : '此历史任务未启用自动接力，可选择原 Agent 或其他在线空闲 Agent 手工重试。'}
                   </p>
                 </div>
               </div>
-              {idleHandoffAllowed ? (
+              {automaticKeywordRecoveryActive ? (
                 <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
                   {keywordAutomaticCandidates.length > 0
                     ? '系统按上方倒计时自动检查并下发，无需人工操作'
                     : '正在等待兼容的空闲 Agent；上方会显示检查状态'}
+                </span>
+              ) : orchestrationFinal && elasticPool ? (
+                <span className="inline-flex min-h-9 items-center rounded-lg border border-border bg-muted/50 px-3 text-xs font-medium text-muted-foreground">
+                  当前任务已结算，不会继续自动分配
                 </span>
               ) : <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <select

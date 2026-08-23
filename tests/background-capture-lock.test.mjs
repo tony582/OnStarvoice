@@ -88,6 +88,7 @@ function createHarness() {
   let tabGetHandler = null;
   let tabQueryHandler = null;
   let tabUpdateHandler = null;
+  let tabGroupHandler = null;
   let storageGetHandler = null;
   let reloadHook = null;
   let nextRuntimeSetError = null;
@@ -236,7 +237,10 @@ function createHarness() {
         createdTabs.push(tab);
         return tab;
       },
-      async group() {
+      async group(options) {
+        if (typeof tabGroupHandler === "function") {
+          return await tabGroupHandler(options);
+        }
         return 1;
       },
       async ungroup() {},
@@ -449,6 +453,9 @@ function createHarness() {
     },
     setTabUpdateHandler(handler) {
       tabUpdateHandler = handler;
+    },
+    setTabGroupHandler(handler) {
+      tabGroupHandler = handler;
     },
     setStorageGetHandler(handler) {
       storageGetHandler = handler;
@@ -4964,6 +4971,153 @@ test("tabs.onReplaced migrates a persistent capture source instead of canceling 
       ({payload}) => payload?.action === "cancelCapture",
     ),
     false,
+  );
+});
+
+test("a Douyin tab replacement during unattended BEGIN keeps the same task attempt", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-douyin-begin-replacement",
+    planSnapshot: buildUnattendedPlan({
+      platform: "douyin",
+      searchPasses: ["all", "image"],
+    }),
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const holderDocumentId = "douyin-begin-replacement-document";
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "douyin-begin-replacement-holder",
+    holderDocumentId,
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    title: "抖音搜索",
+    url: "https://www.douyin.com/search/别克壁纸?type=general",
+  }));
+
+  let releasePreflight;
+  let markPreflight;
+  const preflightPaused = new Promise((resolve) => {
+    markPreflight = resolve;
+  });
+  const preflightGate = new Promise((resolve) => {
+    releasePreflight = resolve;
+  });
+  harness.chrome.debugger.getTargets = async () => {
+    markPreflight();
+    await preflightGate;
+    return [];
+  };
+
+  const beginPromise = harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "douyin",
+    },
+    buildUnattendedRunnerSender(request, holderDocumentId),
+  );
+  await preflightPaused;
+
+  assert.equal(
+    await harness.api.handleCaptureRuntimeTabReplaced(44, 41),
+    true,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderTabId, 44);
+  assert.equal(harness.storage[LOCK_KEY]?.captureTaskId, stableTaskId);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
+  );
+
+  releasePreflight();
+  const begun = await beginPromise;
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 44);
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    44,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderTabId, 44);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
+  );
+});
+
+test("a Douyin replacement while the native group is being created rebinds the same BEGIN", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-douyin-group-replacement",
+    planSnapshot: buildUnattendedPlan({
+      platform: "douyin",
+      searchPasses: ["all", "image"],
+    }),
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const holderDocumentId = "douyin-group-replacement-document";
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "douyin-group-replacement-holder",
+    holderDocumentId,
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    title: "抖音搜索",
+    url: "https://www.douyin.com/search/别克壁纸?type=general",
+  }));
+
+  let replacedDuringGroup = false;
+  harness.setTabGroupHandler(async (options) => {
+    if (
+      !replacedDuringGroup &&
+      Array.isArray(options?.tabIds) &&
+      options.tabIds.includes(41)
+    ) {
+      replacedDuringGroup = true;
+      assert.equal(
+        await harness.api.handleCaptureRuntimeTabReplaced(44, 41),
+        true,
+      );
+    }
+    return 1;
+  });
+
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "douyin",
+    },
+    buildUnattendedRunnerSender(request, holderDocumentId),
+  );
+
+  assert.equal(replacedDuringGroup, true);
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.api.getCaptureTaskGroup(stableTaskId)?.sourceTabId, 44);
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    44,
+  );
+  assert.equal(harness.storage[LOCK_KEY]?.holderTabId, 44);
+  assert.equal(
+    harness.storage[LOCK_KEY]?.captureTaskAttemptId,
+    request.attemptId,
   );
 });
 

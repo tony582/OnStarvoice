@@ -219,6 +219,10 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /\/retry-items/u);
   assert.match(detail, /回写当前父任务/u);
   assert.match(detail, /重试失败关键词/u);
+  assert.match(detail, /automaticKeywordRecoveryActive/u);
+  assert.match(detail, /关键词自动尝试已耗尽/u);
+  assert.match(detail, /页面不再把失败项误报为“正在自动恢复”/u);
+  assert.match(detail, /当前任务已结算，不会继续自动分配/u);
   assert.match(detail, /\/schedule\/run-now/u);
   assert.match(detail, /立即运行/u);
   assert.match(detail, /onEditPlan\?\.\(detail\)/u);

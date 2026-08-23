@@ -1134,6 +1134,7 @@ const UNATTENDED_RUN_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const UNATTENDED_PROTECTED_WAIT_TICK_MS = 30 * 1000;
 const UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS = 1500;
 const UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
+const UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
 const UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS = 30 * 1000;
 const UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS = 10 * 1000;
 const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4;
@@ -14710,6 +14711,27 @@ async function reportUnattendedKeywordRun(
   }
 }
 
+async function reportInitialUnattendedKeywordRun(
+  requestId,
+  patch = {},
+  {attemptId = activeUnattendedRunAttemptId} = {},
+) {
+  let lastResult = null;
+  for (const delayMs of UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      await sleep(delayMs);
+    }
+    lastResult = await reportUnattendedKeywordRun(requestId, patch, {
+      attemptId,
+      quiet: delayMs < UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS.at(-1),
+    });
+    if (lastResult.accepted || lastResult.reason !== "transport_error") {
+      return lastResult;
+    }
+  }
+  return lastResult;
+}
+
 async function sendUnattendedRuntimeMessage(message) {
   let timeoutId = null;
   try {
@@ -17800,7 +17822,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     throw error;
   }
   rememberCaptureTaskProgressContext(startingProgress);
-  const startReport = await reportUnattendedKeywordRun(
+  const startReport = await reportInitialUnattendedKeywordRun(
     requestId,
     {
       status: "running",
@@ -17816,8 +17838,41 @@ async function runUnattendedKeywordPlanRequest(request) {
     },
     {attemptId: requestAttemptId},
   );
-  if (!startReport?.accepted) {
-    throw new Error(`${executionCopy.taskLabel}已被其它恢复尝试接管`);
+  const startReportAlreadyApplied = Boolean(
+    startReport?.reason === "stale_progress" &&
+      String(startReport?.data?.id || "") === requestId &&
+      String(startReport?.data?.attemptId || "") === requestAttemptId &&
+      ["started", "running"].includes(
+        String(startReport?.data?.status || ""),
+      ),
+  );
+  if (!startReport?.accepted && !startReportAlreadyApplied) {
+    const rejectionReason = String(startReport?.reason || "unknown");
+    const replaced = ["attempt_mismatch", "terminal"].includes(
+      rejectionReason,
+    );
+    const transportFailure = rejectionReason === "transport_error";
+    const error = new Error(
+      replaced
+        ? `${executionCopy.taskLabel}已被新的恢复尝试接管`
+        : transportFailure
+          ? `${executionCopy.taskLabel}状态上报连续超时，尚未开始平台搜索`
+          : `${executionCopy.taskLabel}状态上报被拒绝（${rejectionReason}）`,
+    );
+    error.code = replaced
+      ? "UNATTENDED_ATTEMPT_REPLACED"
+      : transportFailure
+        ? "UNATTENDED_STATUS_REPORT_TIMEOUT"
+        : rejectionReason === "not_found"
+          ? "UNATTENDED_REQUEST_NOT_FOUND"
+          : "UNATTENDED_STATUS_REPORT_REJECTED";
+    error.details = {
+      reportReason: rejectionReason,
+      requestId,
+      attemptId: requestAttemptId,
+      platformSearchStarted: false,
+    };
+    throw error;
   }
   keywordPlanState = {
     ...(keywordPlanState && typeof keywordPlanState === "object"

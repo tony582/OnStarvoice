@@ -342,6 +342,18 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   assert.equal(elasticAttemptBudgetAfterOutcome(2, {
     error: {code: "create_command_expired"},
   }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(3, {
+    error: {code: "unattended_begin_fence_changed"},
+  }), 2);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_STATUS_REPORT_TIMEOUT"},
+  }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_STATUS_REPORT_REJECTED"},
+  }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_ATTEMPT_REPLACED"},
+  }), 1);
   assert.equal(elasticAttemptBudgetAfterOutcome(2, {
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
   }), 2);

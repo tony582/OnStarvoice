@@ -3,12 +3,35 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.89',
+  latestVersion: '0.3.90',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-22',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.89-20260822.zip',
+  releaseDate: '2026-08-23',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.90-20260823.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.90',
+      releaseDate: '2026-08-23',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '抖音换页不再误判为任务接管',
+              desc: '抖音进入搜索页或按综合、图文顺序巡检时，即使浏览器替换标签页，同一任务尝试也会继续绑定；真正的任务接管仍会被安全拦截。',
+            },
+            {
+              title: '内部启动故障不再消耗业务重试',
+              desc: '任务开始前的状态上报超时会有限重试并准确显示原因；尚未开始平台搜索的内部故障不占用关键词自动尝试额度。',
+            },
+            {
+              title: '已结算任务停止显示自动恢复中',
+              desc: '任务详情会根据父任务终态和真实尝试额度区分正在恢复、尝试耗尽与恢复已停止，不再把已结束任务误报为仍在分配。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.89',
       releaseDate: '2026-08-22',

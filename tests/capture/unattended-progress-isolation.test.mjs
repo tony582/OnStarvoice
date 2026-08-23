@@ -353,7 +353,7 @@ test("the awaited unattended start report cannot erase cancellation of the activ
     "runUnattendedKeywordPlanRequest",
   );
   const startReportAt = runSource.indexOf(
-    "const startReport = await reportUnattendedKeywordRun(",
+    "const startReport = await reportInitialUnattendedKeywordRun(",
   );
   const keywordPlanCommitAt = runSource.indexOf(
     "keywordPlanState =",
@@ -516,6 +516,41 @@ test("terminal reporting keeps confirming after the initial transport retries", 
     context.activeUnattendedTerminalProgressKey,
     "request-A:attempt-A",
   );
+});
+
+test("initial unattended reporting retries transport timeouts before platform search", async () => {
+  const reportSource = readAsyncFunctionSource(
+    "reportInitialUnattendedKeywordRun",
+  );
+  let calls = 0;
+  const context = {
+    activeUnattendedRunAttemptId: "attempt-A",
+    UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS: [0, 0, 0],
+    async sleep() {},
+    async reportUnattendedKeywordRun() {
+      calls += 1;
+      return calls < 3
+        ? {ok: false, accepted: false, reason: "transport_error"}
+        : {ok: true, accepted: true, reason: "updated"};
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${reportSource}\nthis.reportInitialUnattendedKeywordRun = reportInitialUnattendedKeywordRun;`,
+    context,
+  );
+
+  const result = await context.reportInitialUnattendedKeywordRun(
+    "request-A",
+    {status: "running"},
+    {attemptId: "attempt-A"},
+  );
+
+  assert.equal(result.accepted, true);
+  assert.equal(calls, 3);
+  const runSource = readAsyncFunctionSource("runUnattendedKeywordPlanRequest");
+  assert.match(runSource, /UNATTENDED_STATUS_REPORT_TIMEOUT/);
+  assert.match(runSource, /platformSearchStarted:\s*false/);
 });
 
 test("unattended status messages have a finite transport timeout", () => {

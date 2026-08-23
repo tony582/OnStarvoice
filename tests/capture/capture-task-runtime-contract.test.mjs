@@ -151,8 +151,10 @@ test("task-level Debug trusts the source URL and rejects unsupported or spoofed 
   const start = backgroundSource.indexOf("async function beginCaptureTask");
   const end = backgroundSource.indexOf("async function updateCaptureTask", start);
   const body = backgroundSource.slice(start, end);
-  assert.match(body, /const sourceTab = await chrome\.tabs\.get\(sourceTabId\)/u);
+  assert.match(body, /sourceTab = await chrome\.tabs\.get\(sourceTabId\)/u);
   assert.match(body, /detectPlatformFromUrl\(sourceTab\?\.url \|\| ''\)/u);
+  assert.match(body, /resolveCaptureTaskReplacementLease\(sourceTabId/u);
+  assert.match(body, /replacementPlatform !== sourcePlatform/u);
   assert.match(body, /new Set\(\['xiaohongshu', 'douyin'\]\)\.has\(sourcePlatform\)/u);
   assert.match(body, /capture_task_platform_unsupported/u);
   assert.match(body, /requestedPlatform !== sourcePlatform/u);
