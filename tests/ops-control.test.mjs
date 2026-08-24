@@ -7,6 +7,7 @@ import {
   buildOpsControlDigest,
   buildOpsControlDigestHtml,
   buildOpsControlIncidentAlertHtml,
+  buildOpsControlTaskWindow,
   buildOpsControlWindow,
   getOpsControlPublicHealth,
   maybeDeliverOpsControlIncidentAlerts,
@@ -14,7 +15,9 @@ import {
   normalizeOpsControlActionAllowlist,
   normalizeOpsControlSettingPatch,
   normalizeOpsControlSettings,
+  normalizeOpsControlTaskWakeState,
   OPS_CONTROL_RUNTIME_BASELINE_VERSION,
+  OPS_CONTROL_TASK_WAKE_GRACE_SECONDS,
   OpsControlSettingsError,
   resolveOpsControlGlobalEnabled,
   resolveOpsControlActionsGlobalEnabled,
@@ -202,6 +205,38 @@ test('Shanghai observation window is deterministic and includes the digest deadl
   assert.equal(window.start.toISOString(), '2026-08-23T21:30:00.000Z');
   assert.equal(window.end.toISOString(), '2026-08-24T00:30:00.000Z');
   assert.equal(window.digestAt.toISOString(), '2026-08-24T00:35:00.000Z');
+});
+
+test('task activity wakes the control plane outside the configured morning window', () => {
+  const active = normalizeOpsControlTaskWakeState({
+    active_task_count: '1',
+    recent_task_count: '1',
+    active_command_count: '0',
+    pending_action_count: '0',
+  });
+  assert.equal(active.shouldWake, true);
+  assert.equal(active.reason, 'active_task');
+  assert.equal(active.activeTaskCount, 1);
+
+  const settling = normalizeOpsControlTaskWakeState({recent_task_count: 1});
+  assert.equal(settling.shouldWake, true);
+  assert.equal(settling.reason, 'recent_task_settlement');
+
+  const idle = normalizeOpsControlTaskWakeState({});
+  assert.equal(idle.shouldWake, false);
+  assert.equal(idle.reason, 'idle');
+
+  const now = new Date('2026-08-24T12:00:00.000Z');
+  const configured = buildOpsControlWindow(now, policy());
+  const taskWindow = buildOpsControlTaskWindow(now, configured);
+  assert.equal(taskWindow.serviceDate, '2026-08-24');
+  assert.equal(taskWindow.start.toISOString(), '2026-08-23T21:30:00.000Z');
+  assert.equal(taskWindow.end.toISOString(), '2026-08-24T12:01:00.000Z');
+  assert.equal(
+    taskWindow.observationDeadline.toISOString(),
+    '2026-08-24T12:31:00.000Z',
+  );
+  assert.equal(OPS_CONTROL_TASK_WAKE_GRACE_SECONDS, 1800);
 });
 
 test('a single snapshot cannot declare healthy or stalled', () => {

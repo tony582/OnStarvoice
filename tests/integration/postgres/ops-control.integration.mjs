@@ -254,6 +254,92 @@ test('observe-only control plane reconciles a historical failure to final succes
   }
 });
 
+test('night task activity automatically wakes and settles the control plane without manual force', async () => {
+  await runMigrations();
+  const tenant = await queryOne(`
+    INSERT INTO tenants (name)
+    VALUES ($1)
+    RETURNING id
+  `, [`Ops Task Wake Integration ${Date.now()}`]);
+
+  try {
+    await execute(`
+      INSERT INTO tenant_settings (tenant_id, key, value)
+      VALUES ($1, 'ops_control_enabled', 'true')
+      ON CONFLICT (tenant_id, key) DO UPDATE SET value = excluded.value
+    `, [tenant.id]);
+    const task = await queryOne(`
+      INSERT INTO capture_tasks (
+        tenant_id, client_task_id, task_type, feature_key,
+        title, platform, source, trigger_type, status,
+        progress, counts, metadata, progress_seq,
+        business_progress_at, started_at, source_updated_at,
+        created_at, updated_at
+      ) VALUES (
+        $1, $2, 'capture_orchestration', 'keyword_orchestration',
+        '夜间自动值守任务', 'douyin', 'cloud', 'manual', 'running',
+        '{"current":1,"total":2}'::jsonb, '{"completed":1,"total":2}'::jsonb,
+        '{}'::jsonb, 1,
+        $3, $3, $3,
+        $3, $3
+      )
+      RETURNING id
+    `, [tenant.id, `ops-night-task-${Date.now()}`, '2026-08-24T12:00:00.000Z']);
+
+    const firstCycle = await runOpsControlCycle({
+      now: new Date('2026-08-24T12:01:00.000Z'),
+      env: {OPS_CONTROL_GLOBAL_ENABLED: 'true'},
+    });
+    const first = firstCycle.results.find(row => row.tenantId === tenant.id);
+    assert.equal(first?.kind, 'observed');
+    assert.equal(first?.activation?.kind, 'task_activity');
+    assert.equal(first?.activation?.reason, 'active_task');
+    assert.equal(first?.activation?.activeTaskCount, 1);
+    assert.ok(firstCycle.taskActivatedCount >= 1);
+    const firstSnapshot = await queryOne(`
+      SELECT normalized
+      FROM ops_control_snapshots
+      WHERE tenant_id = $1
+      ORDER BY sequence DESC
+      LIMIT 1
+    `, [tenant.id]);
+    assert.equal(firstSnapshot.normalized.taskSummary.active, 1);
+    assert.equal(firstSnapshot.normalized.tasks[0].id, task.id);
+
+    await execute(`
+      UPDATE capture_tasks
+      SET status = 'completed', progress_seq = 2,
+        progress = '{"current":2,"total":2,"phase":"completed"}'::jsonb,
+        counts = '{"completed":2,"total":2}'::jsonb,
+        business_progress_at = $2, heartbeat_at = $2,
+        finished_at = $2, source_updated_at = $2, updated_at = $2
+      WHERE id = $1
+    `, [task.id, '2026-08-24T12:02:00.000Z']);
+    const settledCycle = await runOpsControlCycle({
+      now: new Date('2026-08-24T12:03:00.000Z'),
+      env: {OPS_CONTROL_GLOBAL_ENABLED: 'true'},
+    });
+    const settled = settledCycle.results.find(row => row.tenantId === tenant.id);
+    assert.equal(settled?.kind, 'observed');
+    assert.equal(settled?.activation?.kind, 'task_activity');
+    assert.equal(settled?.activation?.reason, 'recent_task_settlement');
+    assert.equal(settled?.assessment?.lifecycleStatus, 'settled');
+    assert.equal(settled?.assessment?.verdict, 'healthy');
+
+    const idleCycle = await runOpsControlCycle({
+      now: new Date('2026-08-24T12:33:01.000Z'),
+      env: {OPS_CONTROL_GLOBAL_ENABLED: 'true'},
+    });
+    const idle = idleCycle.results.find(row => row.tenantId === tenant.id);
+    assert.equal(idle?.kind, 'outside_window');
+    assert.equal(idle?.activation?.kind, 'idle');
+    assert.equal(idle?.activation?.shouldWake, false);
+  } finally {
+    await execute('DELETE FROM tenants WHERE id = $1', [tenant.id]);
+    await closeDb();
+  }
+});
+
 test('guarded action ledger is idempotent and requires a later PostgreSQL-backed verification', async () => {
   await runMigrations();
   const tenant = await queryOne(`

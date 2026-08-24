@@ -68,6 +68,8 @@ const BOOLEAN_FALSE = new Set(['0', 'false', 'off', 'no']);
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/u;
 const SHANGHAI_OFFSET = '+08:00';
 const MAX_TENANTS_PER_CYCLE = 50;
+export const OPS_CONTROL_TASK_WAKE_GRACE_SECONDS = 30 * 60;
+const OPS_CONTROL_TASK_WINDOW_END_PADDING_MS = 60 * 1000;
 
 function object(value) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
@@ -379,6 +381,108 @@ export function shouldObserveOpsControlWindow(now, window, { force = false } = {
   return nowMs >= window.start.getTime() && nowMs <= window.observationDeadline.getTime();
 }
 
+export function normalizeOpsControlTaskWakeState(value = {}) {
+  const source = object(value);
+  const activeTaskCount = integer(source.active_task_count ?? source.activeTaskCount);
+  const recentTaskCount = integer(source.recent_task_count ?? source.recentTaskCount);
+  const activeCommandCount = integer(source.active_command_count ?? source.activeCommandCount);
+  const pendingActionCount = integer(source.pending_action_count ?? source.pendingActionCount);
+  const shouldWake = activeTaskCount > 0
+    || recentTaskCount > 0
+    || activeCommandCount > 0
+    || pendingActionCount > 0;
+  const reason = activeTaskCount > 0
+    ? 'active_task'
+    : activeCommandCount > 0
+      ? 'active_command'
+      : pendingActionCount > 0
+        ? 'pending_action_verification'
+        : recentTaskCount > 0
+          ? 'recent_task_settlement'
+          : 'idle';
+  return Object.freeze({
+    shouldWake,
+    reason,
+    activeTaskCount,
+    recentTaskCount,
+    activeCommandCount,
+    pendingActionCount,
+  });
+}
+
+export async function getOpsControlTaskWakeState({
+  tenantId,
+  now = new Date(),
+  queryOne = dbQueryOne,
+} = {}) {
+  const recentAfter = new Date(
+    new Date(now).getTime() - OPS_CONTROL_TASK_WAKE_GRACE_SECONDS * 1000,
+  );
+  const row = await queryOne(`
+    WITH business_tasks AS (
+      SELECT
+        task.status,
+        GREATEST(
+          COALESCE(task.business_progress_at, '-infinity'::timestamptz),
+          COALESCE(task.heartbeat_at, '-infinity'::timestamptz),
+          COALESCE(task.finished_at, '-infinity'::timestamptz),
+          task.updated_at,
+          task.created_at
+        ) AS activity_at
+      FROM capture_tasks task
+      WHERE task.tenant_id = $1
+        AND task.parent_task_id IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM capture_orchestration_schedules schedule
+          WHERE schedule.tenant_id = task.tenant_id
+            AND schedule.template_task_id = task.id
+        )
+    )
+    SELECT
+      COUNT(*) FILTER (
+        WHERE business_tasks.status = ANY($2::text[])
+      )::int AS active_task_count,
+      COUNT(*) FILTER (
+        WHERE business_tasks.activity_at >= $3::timestamptz
+      )::int AS recent_task_count,
+      (
+        SELECT COUNT(*)::int
+        FROM capture_agent_commands command
+        WHERE command.tenant_id = $1
+          AND command.status IN ('pending', 'acknowledged')
+      ) AS active_command_count,
+      (
+        SELECT COUNT(*)::int
+        FROM ops_control_actions action
+        WHERE action.tenant_id = $1
+          AND action.status IN ('claimed', 'pending_verification')
+      ) AS pending_action_count
+    FROM business_tasks
+  `, [tenantId, [...ACTIVE_TASK_STATUSES], recentAfter.toISOString()]);
+  return normalizeOpsControlTaskWakeState(row);
+}
+
+export function buildOpsControlTaskWindow(
+  now = new Date(),
+  configuredWindow,
+) {
+  const current = new Date(now);
+  const window = configuredWindow;
+  const recentStart = current.getTime() - OPS_CONTROL_TASK_WAKE_GRACE_SECONDS * 1000;
+  const paddedEnd = current.getTime() + OPS_CONTROL_TASK_WINDOW_END_PADDING_MS;
+  const start = new Date(Math.min(window.start.getTime(), recentStart));
+  const end = new Date(Math.max(window.end.getTime(), paddedEnd));
+  return Object.freeze({
+    ...window,
+    start,
+    end,
+    observationDeadline: new Date(
+      end.getTime() + OPS_CONTROL_TASK_WAKE_GRACE_SECONDS * 1000,
+    ),
+  });
+}
+
 async function collectSchedules(db, tenantId, window, now) {
   return db.queryAll(`
     SELECT
@@ -428,8 +532,29 @@ async function collectTasks(db, tenantId, window) {
           WHERE schedule.tenant_id = task.tenant_id
             AND schedule.template_task_id = task.id
         )
-        AND COALESCE(task.scheduled_for, task.created_at) >= $2
-        AND COALESCE(task.scheduled_for, task.created_at) < $3
+        AND (
+          (
+            COALESCE(task.scheduled_for, task.created_at) >= $2
+            AND COALESCE(task.scheduled_for, task.created_at) < $3
+          )
+          OR task.status = ANY($5::text[])
+          OR (
+            GREATEST(
+              COALESCE(task.business_progress_at, '-infinity'::timestamptz),
+              COALESCE(task.heartbeat_at, '-infinity'::timestamptz),
+              COALESCE(task.finished_at, '-infinity'::timestamptz),
+              task.updated_at,
+              task.created_at
+            ) >= $2
+            AND GREATEST(
+              COALESCE(task.business_progress_at, '-infinity'::timestamptz),
+              COALESCE(task.heartbeat_at, '-infinity'::timestamptz),
+              COALESCE(task.finished_at, '-infinity'::timestamptz),
+              task.updated_at,
+              task.created_at
+            ) < $3
+          )
+        )
       ORDER BY COALESCE(task.scheduled_for, task.created_at), task.id
       LIMIT 500
     )
@@ -1690,6 +1815,7 @@ export async function runOpsControlTenantObservation({
   settings = {},
   now = new Date(),
   force = false,
+  getTaskWakeState = getOpsControlTaskWakeState,
   withTransaction = dbWithTransaction,
   queryOne = dbQueryOne,
   execute = dbExecute,
@@ -1699,11 +1825,32 @@ export async function runOpsControlTenantObservation({
   const policy = settings.enabled === undefined
     ? normalizeOpsControlSettings(settings)
     : settings;
-  const window = buildOpsControlWindow(now, policy);
-  if (!policy.enabled) return {kind: 'disabled', tenantId, policy, window};
-  if (!shouldObserveOpsControlWindow(now, window, {force})) {
-    return {kind: 'outside_window', tenantId, policy, window};
+  const configuredWindow = buildOpsControlWindow(now, policy);
+  if (!policy.enabled) {
+    return {kind: 'disabled', tenantId, policy, window: configuredWindow};
   }
+  const scheduledWindowActive = shouldObserveOpsControlWindow(now, configuredWindow);
+  const taskWakeState = scheduledWindowActive
+    ? normalizeOpsControlTaskWakeState()
+    : await getTaskWakeState({tenantId, now, queryOne});
+  if (!scheduledWindowActive && !force && !taskWakeState.shouldWake) {
+    return {
+      kind: 'outside_window',
+      tenantId,
+      policy,
+      window: configuredWindow,
+      activation: {kind: 'idle', ...taskWakeState},
+    };
+  }
+  const taskDriven = !scheduledWindowActive && taskWakeState.shouldWake;
+  const window = taskDriven
+    ? buildOpsControlTaskWindow(now, configuredWindow)
+    : configuredWindow;
+  const activation = taskDriven
+    ? {kind: 'task_activity', ...taskWakeState}
+    : scheduledWindowActive
+      ? {kind: 'scheduled_window', ...taskWakeState}
+      : {kind: 'manual_force', ...taskWakeState};
 
   const result = await withTransaction(async tx => {
     const evidence = await collectOpsControlEvidence({tenantId, window, now, db: tx});
@@ -1758,6 +1905,7 @@ export async function runOpsControlTenantObservation({
     delivery,
     incidentAlert,
     actions,
+    activation,
     ...publicResult,
     digest: refreshedDigest,
   };
@@ -1900,6 +2048,9 @@ export async function runOpsControlCycle({
         + integer(row.actions?.verificationFailed),
       0,
     );
+    const taskActivatedCount = results.filter(
+      row => row.activation?.kind === 'task_activity',
+    ).length;
     const notificationFailureCount = results.filter(row =>
       ['retry_wait', 'blocked_config', 'failed'].includes(row.incidentAlert?.status)
       || ['retry_wait', 'blocked_config', 'failed'].includes(row.delivery?.status)
@@ -1926,6 +2077,7 @@ export async function runOpsControlCycle({
         blockedCount,
         actionExecutedCount,
         actionFailureCount,
+        taskActivatedCount,
         notificationFailureCount,
       },
       execute,
@@ -1939,6 +2091,7 @@ export async function runOpsControlCycle({
       blockedCount,
       actionExecutedCount,
       actionFailureCount,
+      taskActivatedCount,
       notificationFailureCount,
       truncated,
       results,
