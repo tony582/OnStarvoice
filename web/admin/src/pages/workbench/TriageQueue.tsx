@@ -6,6 +6,7 @@ import {
   User, FileText, Bell, ExternalLink,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
   Rows3, Kanban, MoreHorizontal, Radar, ShieldAlert, Star,
+  Tags,
 } from 'lucide-react'
 import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
@@ -23,6 +24,11 @@ import { CombinedDateRangeFilter, type CombinedDateRanges } from '@/components/s
 import { MultiSelect } from '@/components/shared/MultiSelect'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
+import {
+  BatchCustomTagDialog,
+  type BatchCustomTagMode,
+  type BatchCustomTagValues,
+} from '@/components/shared/BatchCustomTagDialog'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useStatusChangePrompt, type StatusChangeValues } from '@/components/shared/StatusChangePrompt'
 import {
@@ -63,6 +69,15 @@ interface ArchiveMutationResponse {
 interface BatchModeMutationResponse {
   updated?: unknown
   updatedIds?: unknown
+  skipped?: unknown
+}
+interface BatchCustomTagsMutationResponse {
+  operation?: unknown
+  tags?: unknown
+  updated?: unknown
+  updatedIds?: unknown
+  unchanged?: unknown
+  unchangedIds?: unknown
   skipped?: unknown
 }
 interface WatchMutationResponse {
@@ -376,6 +391,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState<'content' | 'history'>('content')
   const [batchBusy, setBatchBusy] = useState(false)
+  const [batchTagMode, setBatchTagMode] = useState<BatchCustomTagMode | null>(null)
   const [batchFeedback, setBatchFeedback] = useState<BatchFeedback | null>(null)
   const batchFeedbackTimer = useRef<number | undefined>(undefined)
   const customTagRequestSeq = useRef(0)
@@ -384,6 +400,19 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
   const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
+
+  const batchRemovalCatalog = (() => {
+    const tagsById = new Map<string, CustomTag>()
+    for (const record of records) {
+      if (!sel.has(String(record.id))) continue
+      for (const tag of tagsFromRecord(record)) {
+        const current = tagsById.get(tag.id)
+        if (current) current.usageCount = Number(current.usageCount || 0) + 1
+        else tagsById.set(tag.id, { ...tag, usageCount: 1 })
+      }
+    }
+    return [...tagsById.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  })()
 
   const showBatchFeedback = useCallback((message: string, tone: BatchFeedback['tone']) => {
     window.clearTimeout(batchFeedbackTimer.current)
@@ -582,6 +611,77 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       await load(willEmpty ? page - 1 : page)
     }
     return tags
+  }
+
+  const closeBatchTagDialog = useCallback(() => {
+    setBatchTagMode(null)
+    void loadCustomTagCatalog()
+  }, [loadCustomTagCatalog])
+
+  const applyBatchCustomTags = async (values: BatchCustomTagValues): Promise<void> => {
+    if (archiveView === 'archived' || sel.count === 0) return
+    setBatchFeedback(null)
+    setBatchBusy(true)
+    try {
+      const ids = [...sel.selected]
+      const result = await api.patch<BatchCustomTagsMutationResponse>('/records/custom-tags/batch', {
+        ids,
+        addTagIds: values.addTagIds,
+        addNames: values.addNames,
+        removeTagIds: values.removeTagIds,
+      })
+      const operation = values.removeTagIds.length ? 'remove' : 'add'
+      const updated = Math.max(0, Number(result.updated || 0))
+      const unchanged = Math.max(0, Number(result.unchanged || 0))
+      const skipped = Array.isArray(result.skipped)
+        ? result.skipped.flatMap(item => {
+          if (!item || typeof item !== 'object') return []
+          const row = item as { id?: unknown; reason?: unknown }
+          const id = String(row.id || '').toLowerCase()
+          const reason = String(row.reason || '')
+          return id ? [{ id, reason }] : []
+        })
+        : []
+      const limitIds = skipped.filter(item => item.reason === 'tag_limit').map(item => item.id)
+      const archivedCount = skipped.filter(item => item.reason === 'archived').length
+      const missingCount = skipped.filter(item => item.reason === 'not_found').length
+      const tagNames = normalizeCustomTags(result.tags).map(tag => `“${tag.name}”`).join('、')
+        || [
+          ...values.addNames,
+          ...(operation === 'remove' ? values.removeTagIds : values.addTagIds)
+            .map(id => (operation === 'remove' ? batchRemovalCatalog : customTagCatalog)
+              .find(tag => tag.id === id)?.name || ''),
+        ]
+          .filter(Boolean)
+          .map(name => `“${name}”`)
+          .join('、')
+      const skippedParts = [
+        limitIds.length ? `${limitIds.length} 条达到标签上限` : '',
+        archivedCount ? `${archivedCount} 条已归档` : '',
+        missingCount ? `${missingCount} 条已不存在` : '',
+      ].filter(Boolean)
+
+      if (operation === 'add' && limitIds.length) sel.setAll(limitIds, true)
+      else sel.clear()
+      const message = operation === 'remove'
+        ? updated > 0
+          ? `已从 ${updated} 条内容移除${tagNames || '所选标签'}${unchanged ? `，${unchanged} 条原本未关联` : ''}${skippedParts.length ? `；${skippedParts.join('，')}未处理` : ''}`
+          : unchanged > 0 && !skippedParts.length
+            ? `所选 ${unchanged} 条内容均未关联${tagNames || '所选标签'}，无需移除`
+            : `没有内容被修改${skippedParts.length ? `：${skippedParts.join('，')}` : ''}`
+        : updated > 0
+          ? `已将${tagNames || '所选标签'}添加到 ${updated} 条内容${unchanged ? `，${unchanged} 条原本已有` : ''}${skippedParts.length ? `；${skippedParts.join('，')}未处理` : ''}`
+          : unchanged > 0 && !skippedParts.length
+            ? `所选 ${unchanged} 条内容原本已有${tagNames || '所选标签'}，无需重复添加`
+            : `没有内容被修改${skippedParts.length ? `：${skippedParts.join('，')}` : ''}`
+      showBatchFeedback(message, skippedParts.length ? 'warning' : 'success')
+      await Promise.all([
+        loadCustomTagCatalog(),
+        load(pagination?.page || 1, { silent: true }),
+      ])
+    } finally {
+      setBatchBusy(false)
+    }
   }
 
   const deleteCustomTag = async (tag: CustomTag): Promise<number> => {
@@ -1515,7 +1615,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           busy={batchBusy}
           onClear={sel.clear}
           onAction={key => {
-            if (key === 'archive') void runArchiveBatch(true)
+            if (key === 'custom_tags_add') setBatchTagMode('add')
+            else if (key === 'custom_tags_remove') setBatchTagMode('remove')
+            else if (key === 'archive') void runArchiveBatch(true)
             else if (key === 'unarchive') void runArchiveBatch(false)
             else if (key === 'watch') void runWatchBatch(true)
             else if (key === 'unwatch') void runWatchBatch(false)
@@ -1523,7 +1625,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             else if (key === 'create_watched_patrol') createPatrolFromSelection('watched_content')
             else void runBatch(key as TriageMode)
           }}
-          actions={[]}
+          actions={archiveView === 'archived' ? [] : [
+            { key: 'custom_tags_add', label: '添加标签', icon: Tags },
+            { key: 'custom_tags_remove', label: '移除标签', icon: Tags, tone: 'danger' },
+          ]}
           menus={[
             {
               key: 'patrol',
@@ -1568,6 +1673,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {drawerProps && <RecordDrawer {...drawerProps} />}
       {dialog}
       {statusChangeDialog}
+      {batchTagMode && sel.count > 0 && (
+        <BatchCustomTagDialog
+          mode={batchTagMode}
+          count={sel.count}
+          catalog={batchTagMode === 'remove' ? batchRemovalCatalog : customTagCatalog}
+          onSearch={batchTagMode === 'add'
+            ? query => { void loadCustomTagCatalog(query) }
+            : undefined}
+          onApply={applyBatchCustomTags}
+          onCancel={closeBatchTagDialog}
+        />
+      )}
     </div>
   )
 }

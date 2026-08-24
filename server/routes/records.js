@@ -9,7 +9,9 @@ import {
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
 import { collectRecordMediaUrls, isAllowedMediaHost, streamMediaToResponse } from '../services/media-proxy.js';
 import {
+  applyRecordCustomTagBatch,
   applyRecordCustomTagPatch,
+  validateCustomTagBatch,
   validateCustomTagPatch,
 } from '../services/record-custom-tags.js';
 import { insertRecordFeedback, normalizeFeedbackReason } from '../services/record-feedback.js';
@@ -21,7 +23,7 @@ import {
   validateImageTextRequest,
 } from '../services/image-text-extraction.js';
 import { formatPublishDate } from '../services/publish-date.js';
-import { getRecordLifecycle, sendRecordArchived } from '../services/record-lifecycle.js';
+import { getRecordLifecycle, getRecordLifecycles, sendRecordArchived } from '../services/record-lifecycle.js';
 
 const router = Router();
 
@@ -743,6 +745,76 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
       record: manualFieldsRecordResponse(result.record),
     });
   } catch (err) {
+    return next(err);
+  }
+});
+
+router.patch('/custom-tags/batch', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const validated = validateCustomTagBatch(req.body || {});
+    if (!validated.ok) {
+      return res.status(400).json({ ok: false, error: validated.error, message: validated.message });
+    }
+
+    const actorUserId = req.user?.id || null;
+    const actorName = req.actorName || req.user?.name || req.user?.email || '';
+    const result = await withTransaction(async tx => {
+      const lifecycles = await getRecordLifecycles({
+        tenantId: req.tenantId,
+        recordIds: validated.ids,
+        tx,
+        lock: true,
+      });
+      const lifecycleById = new Map(lifecycles.map(row => [String(row.id).toLowerCase(), row]));
+      const activeIds = validated.ids.filter(id => {
+        const lifecycle = lifecycleById.get(id);
+        return lifecycle && !lifecycle.archived_at;
+      });
+      const archivedIds = validated.ids.filter(id => lifecycleById.get(id)?.archived_at);
+      const notFoundIds = validated.ids.filter(id => !lifecycleById.has(id));
+
+      const changed = activeIds.length
+        ? await applyRecordCustomTagBatch(tx, {
+          tenantId: req.tenantId,
+          recordIds: activeIds,
+          patch: validated.patch,
+          actorUserId,
+          actorName,
+        })
+        : {
+          operation: validated.operation,
+          updatedIds: [],
+          unchangedIds: [],
+          limitIds: [],
+          tags: [],
+        };
+      return { ...changed, archivedIds, notFoundIds };
+    });
+
+    const skipped = [
+      ...result.limitIds.map(id => ({ id, reason: 'tag_limit' })),
+      ...result.archivedIds.map(id => ({ id, reason: 'archived' })),
+      ...result.notFoundIds.map(id => ({ id, reason: 'not_found' })),
+    ];
+    return res.json({
+      ok: true,
+      operation: result.operation,
+      tags: result.tags,
+      updated: result.updatedIds.length,
+      updatedIds: result.updatedIds,
+      unchanged: result.unchangedIds.length,
+      unchangedIds: result.unchangedIds,
+      skipped,
+    });
+  } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({
+        ok: false,
+        error: err.code,
+        message: err.message,
+        ...(Array.isArray(err.recordIds) ? { recordIds: err.recordIds } : {}),
+      });
+    }
     return next(err);
   }
 });
