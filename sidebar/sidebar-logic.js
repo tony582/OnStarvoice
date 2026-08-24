@@ -1152,12 +1152,13 @@ const UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS = 2 * 60 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
 // 首次把平台页切到关键词时，弱网、平台改写页面或标签替换都可能让短时
-// 就绪检查错过目标页。客户端只做两次短等待；仍未恢复就尽快释放给云端
-// 换 Agent，避免最后一次 3 分钟本地等待把整批节奏拖住。
-const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 3;
+// 就绪检查错过目标页。优先给当前 Agent 足够时间等待同一页面完成加载；
+// 只有绑定页始终无法就绪才交给其它 Agent，避免多台设备反复搜索同一词。
+const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4;
 const UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS = Object.freeze([
   20 * 1000,
   60 * 1000,
+  3 * 60 * 1000,
 ]);
 const UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS = 60 * 1000;
 const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4;
@@ -17212,6 +17213,78 @@ async function waitForRuntimeSearchPage({
         throw error;
       }
       return true;
+    }
+    // 抖音页面在慢加载时，全局 runtime 可能晚于已绑定标签页更新。
+    // 直接核验任务绑定的 tab，只接受“正确搜索词 + 搜索页骨架已出现”；
+    // 结果卡片由后续的长等待检查负责，这里不因结果还在加载而刷新页面。
+    if (
+      platform === "douyin" &&
+      Number.isFinite(expectedTabId) &&
+      expectedTabId > 0
+    ) {
+      const boundTabReady = await chrome.scripting
+        .executeScript({
+          target: {tabId: expectedTabId},
+          args: [normalizedExpectedKeyword],
+          func: (expectedKeywordValue) => {
+            const normalize = (value) =>
+              String(value || "")
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/gu, "");
+            const decode = (value) => {
+              try {
+                return decodeURIComponent(String(value || ""));
+              } catch {
+                return String(value || "");
+              }
+            };
+            const expected = normalize(expectedKeywordValue);
+            const url = new URL(window.location.href);
+            const hostname = String(url.hostname || "").toLowerCase();
+            const pathname = String(url.pathname || "");
+            const urlKeyword = decode(
+              pathname.split("/search/")[1]?.split("/")[0] || "",
+            );
+            const inputKeyword =
+              Array.from(
+                document.querySelectorAll(
+                  '[data-e2e="searchbar-input"], input[type="search"], input[placeholder*="搜索"]',
+                ),
+              )
+                .map((node) => node.value || node.textContent || "")
+                .map((value) => String(value || "").trim())
+                .find(Boolean) || "";
+            const keywordMatched =
+              Boolean(expected) &&
+              (normalize(urlKeyword) === expected ||
+                normalize(inputKeyword).includes(expected));
+            const bodyText = String(document.body?.innerText || "");
+            const hasSearchShell = Boolean(
+              document.querySelector(
+                '[data-e2e="searchbar-input"], #search-result-container, #waterFallScrollContainer, [data-e2e="scroll-list"]',
+              ) || (/综合/u.test(bodyText) && /视频|用户|直播/u.test(bodyText)),
+            );
+            return Boolean(
+              (hostname === "douyin.com" ||
+                hostname.endsWith(".douyin.com")) &&
+                pathname.startsWith("/search/") &&
+                document.readyState !== "loading" &&
+                keywordMatched &&
+                hasSearchShell,
+            );
+          },
+        })
+        .then(([result]) => Boolean(result?.result))
+        .catch(() => false);
+      if (boundTabReady) {
+        if (typeof shouldStop === "function" && shouldStop()) {
+          const error = new Error("无人值守搜索页恢复已取消");
+          error.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
+          throw error;
+        }
+        return true;
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }

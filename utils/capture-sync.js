@@ -521,7 +521,8 @@ const DOUYIN_DETAIL_NAV_CANDIDATE_TIMEOUT_MS = 15000;
 // 抖音同一作品依次尝试“作品直达链接 / 本记录自己的搜索弹层”。
 // 这些候选必须共享总预算，不能每个候选都重新吃满超时，导致一条坏链接
 // 把无人值守任务拖成分钟级假死。
-const DOUYIN_DETAIL_NAV_TOTAL_TIMEOUT_MS = 32000;
+const DOUYIN_DETAIL_NAV_TOTAL_TIMEOUT_MS = 55000;
+const DOUYIN_DETAIL_READY_PROBE_TIMEOUT_MS = 20000;
 const DOUYIN_COMMENT_READY_PROBE_TIMEOUT_MS = 1800;
 const DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS = 8000;
 // 补采详情「条与条之间」的随机间隔。注:小红书 300013 的真因是 xsec_source 为空(见
@@ -4041,7 +4042,10 @@ export async function batchCaptureDetailsForRecords(
             ? await probeDouyinNavigationEntry(tabId, {
                 targetUrl: candidateUrl,
                 shouldStop: pipelineShouldStop,
-                timeoutMs: Math.min(8000, remainingProbeBudgetMs),
+                timeoutMs: Math.min(
+                  DOUYIN_DETAIL_READY_PROBE_TIMEOUT_MS,
+                  remainingProbeBudgetMs,
+                ),
               })
             : await probeDetailPreloadSafety(tabId, {
                 targetUrl: candidateUrl,
@@ -4929,7 +4933,7 @@ export async function batchCaptureDetailsForRecords(
                     targetUrl: candidateUrl,
                     shouldStop: shouldStopDetailBatch,
                     timeoutMs: Math.min(
-                      8000,
+                      DOUYIN_DETAIL_READY_PROBE_TIMEOUT_MS,
                       Math.max(1000, fallbackDeadline - Date.now()),
                     ),
                   },
@@ -14420,6 +14424,7 @@ const BATCH_KEYWORD_NAV_TIMEOUT_MS = 15000;
 const BATCH_KEYWORD_NAV_POLL_MS = 300;
 const BATCH_KEYWORD_AFTER_NAV_WAIT_MS = 2000;
 const BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS = 12000;
+const DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS = 45000;
 const BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS = 5000;
 const BATCH_KEYWORD_RESULTS_STABLE_POLLS = 2;
 // 0.3.32 在搜索后固定等待 2 秒、筛选后等待 1.2 秒。后来为尽快识别异常页移除了
@@ -17688,7 +17693,7 @@ async function waitForKeywordSearchResultsInTab(
   platform = '',
   shouldStop = null,
   {
-    timeoutMs = BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS,
+    timeoutMs = null,
     keyword = '',
     stablePolls = BATCH_KEYWORD_RESULTS_STABLE_POLLS,
     returnState = false,
@@ -17707,7 +17712,15 @@ async function waitForKeywordSearchResultsInTab(
   }
 
   const startedAt = Date.now();
-  const timeout = Math.max(0, Number(timeoutMs) || 0);
+  const hasExplicitTimeout = timeoutMs !== null && timeoutMs !== undefined;
+  const defaultTimeout =
+    String(platform || '').trim().toLowerCase() === 'douyin'
+      ? DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS
+      : BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS;
+  const timeout = Math.max(
+    0,
+    hasExplicitTimeout ? Number(timeoutMs) || 0 : defaultTimeout,
+  );
   const requiredStablePolls = Math.max(1, Math.floor(Number(stablePolls) || 1));
   let lastSignature = '';
   let lastCardCount = -1;

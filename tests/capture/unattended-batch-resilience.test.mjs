@@ -48,6 +48,32 @@ function inspectKeywordSearchPageUrl(pageUrl, platform, keyword) {
   return sandbox.__inspect(pageUrl, platform, keyword);
 }
 
+test("Douyin result readiness keeps waiting for a slow result page by default", () => {
+  const start = captureSyncSource.indexOf(
+    "async function waitForKeywordSearchResultsInTab(",
+  );
+  const end = captureSyncSource.indexOf(
+    "async function closeKeywordSearchFilterPanelInTab(",
+    start,
+  );
+  const block = captureSyncSource.slice(start, end);
+  assert.ok(start >= 0);
+  assert.match(
+    captureSyncSource,
+    /DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS = 45000/u,
+  );
+  assert.match(block, /timeoutMs = null/u);
+  assert.match(
+    block,
+    /String\(platform \|\| ''\)\.trim\(\)\.toLowerCase\(\) === 'douyin'[\s\S]*?DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS/u,
+  );
+  assert.match(
+    block,
+    /hasExplicitTimeout \? Number\(timeoutMs\) \|\| 0 : defaultTimeout/u,
+    "tests and callers may still request an explicit bounded timeout",
+  );
+});
+
 function createBatchHarness({
   captureKeyword,
   afterKeywordCapture = null,

@@ -33,6 +33,7 @@ import {
 } from "./douyin-author.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
+const DOUYIN_DETAIL_DOM_READY_TIMEOUT_MS = 25000;
 const DOUYIN_INLINE_BLOGGER_METRICS_SELECTORS = Object.freeze([
   '[data-e2e="user-info"] .ttf3L0K8',
   '[data-e2e="user-info"] p.ttf3L0K8',
@@ -819,7 +820,18 @@ export async function captureDouyinSingleNote({
     await wait(1200);
     assertNoDouyinUnavailablePage(normalizedExpectedNoteId);
     assertNoCaptchaPage();
-    await ensureDetailPageReady(DOUYIN_DOM_PROFILE, { timeout: 10000 });
+    try {
+      await ensureDetailPageReady(DOUYIN_DOM_PROFILE, {
+        timeout: DOUYIN_DETAIL_DOM_READY_TIMEOUT_MS,
+      });
+    } catch (error) {
+      const notReadyError = new Error(
+        "抖音详情页仍在加载，正在尝试备用作品入口",
+      );
+      notReadyError.code = "DOUYIN_DETAIL_NOT_READY";
+      notReadyError.cause = error;
+      throw notReadyError;
+    }
 
     const detailRoot = resolveActiveDouyinDetailRoot(urlNoteId);
     if (!detailRoot) {

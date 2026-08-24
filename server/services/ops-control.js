@@ -13,7 +13,7 @@ import {
 import {runOpsControlGuardedActions} from './ops-control-actions.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
-export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.91';
+export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.92';
 export const OPS_CONTROL_MODE = 'observe';
 export const OPS_CONTROL_MODES = Object.freeze(['observe', 'guarded']);
 export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
@@ -1332,7 +1332,7 @@ export function buildOpsControlDigestHtml(digest) {
       </table>
       <h3 style="font-size:15px;margin:22px 0 8px">事项</h3>
       <ul style="padding-left:20px;color:#374151">${rows}</ul>
-      <p style="margin:24px 0 0;color:#9ca3af;font-size:12px">规则控制面${guarded ? '受控动作模式' : '观察模式'} · 0.3.91 自愈运行时基线 · 本轮未调用大模型${guarded ? ' · 所有动作均写入幂等账本并等待后续快照验收' : '，未执行采集业务写操作'}。</p>
+      <p style="margin:24px 0 0;color:#9ca3af;font-size:12px">规则控制面${guarded ? '受控动作模式' : '观察模式'} · 0.3.92 自愈运行时基线 · 本轮未调用大模型${guarded ? ' · 所有动作均写入幂等账本并等待后续快照验收' : '，未执行采集业务写操作'}。</p>
     </div>
   `;
 }
@@ -1601,7 +1601,7 @@ export function buildOpsControlIncidentAlertHtml(incidents, {
       <h2 style="margin:0 0 8px;font-size:20px">StarVoice 值守需要关注</h2>
       <p style="margin:0 0 18px;color:#4b5563">以下事项当前没有正在等待验收的自动恢复动作，请及时查看。</p>
       <ul style="padding-left:20px">${rows}</ul>
-      <p style="margin:22px 0 0;color:#9ca3af;font-size:12px">规则控制面${mode === 'guarded' ? '受控动作模式' : '观察模式'} · 0.3.91 自愈运行时基线 · 本轮未调用大模型。</p>
+      <p style="margin:22px 0 0;color:#9ca3af;font-size:12px">规则控制面${mode === 'guarded' ? '受控动作模式' : '观察模式'} · 0.3.92 自愈运行时基线 · 本轮未调用大模型。</p>
     </div>
   `;
 }

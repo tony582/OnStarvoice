@@ -1493,6 +1493,15 @@ test("unattended Douyin navigation readiness is bound to the expected URL and ke
     "a stale complete tab must not be accepted before its search identity matches",
   );
 
+  const runtimeSection = readFunctionSection(
+    "async function waitForRuntimeSearchPage(",
+    "function resolveUnattendedBootstrapStartGate(",
+  );
+  assert.match(runtimeSection, /platform === "douyin"/);
+  assert.match(runtimeSection, /chrome\.scripting[\s\S]*?executeScript/);
+  assert.match(runtimeSection, /keywordMatched &&[\s\S]*?hasSearchShell/);
+  assert.match(runtimeSection, /pathname\.startsWith\("\/search\/"\)/);
+
   const navigationSection = readFunctionSection(
     "async function navigateActiveTabToKeywordSearchForPlan({",
     "function buildUnattendedTaskCounts(",
@@ -1538,7 +1547,7 @@ function createUnattendedNavigationHarness({
     url: "https://www.douyin.com/jingxuan",
   };
   const sandbox = vm.createContext({
-    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 3,
+    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 4,
     UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0],
     buildSidebarKeywordSearchUrl: (keyword) =>
       `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`,
@@ -1616,17 +1625,60 @@ test("unattended bootstrap reopens the same keyword after a transient page drift
 
 test("unattended bootstrap retry is bounded and exposes a recoverable error code", async () => {
   const harness = createUnattendedNavigationHarness({
-    tabReadiness: [false, false, false],
+    tabReadiness: [false, false, false, false],
   });
 
   await assert.rejects(harness.navigate(), (error) => {
     assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
-    assert.equal(error.attempts, 3);
+    assert.equal(error.attempts, 4);
     return true;
   });
-  assert.equal(harness.updates.length, 3);
-  assert.equal(harness.retries.length, 2);
+  assert.equal(harness.updates.length, 4);
+  assert.equal(harness.retries.length, 3);
   assert.equal(harness.runtimeChecks(), 0);
+});
+
+test("unattended Douyin bootstrap accepts the bound search shell while global runtime lags", async () => {
+  const runtimeSection = readFunctionSection(
+    "async function waitForRuntimeSearchPage(",
+    "function resolveUnattendedBootstrapStartGate(",
+  );
+  let probeCount = 0;
+  const sandbox = vm.createContext({
+    PAGE_TYPE: {SEARCH_RESULTS: "search_results"},
+    chrome: {
+      scripting: {
+        executeScript: async () => {
+          probeCount += 1;
+          return [{result: true}];
+        },
+      },
+    },
+    getCurrentRuntime: () => ({
+      platform: "douyin",
+      pageType: "note_detail",
+      lastActiveTabId: 101,
+      lastPageUrl: "https://www.douyin.com/video/123456789",
+    }),
+    getPagePlatform: (runtime) => runtime?.platform || "",
+    setTimeout: (resolve) => resolve(),
+  });
+  vm.runInContext(
+    `${runtimeSection}\nglobalThis.__wait = waitForRuntimeSearchPage;`,
+    sandbox,
+  );
+
+  const ready = await sandbox.__wait({
+    platform: "douyin",
+    tabId: 101,
+    expectedUrl:
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?type=general",
+    expectedKeyword: "凯迪拉克",
+    timeoutMs: 1000,
+  });
+
+  assert.equal(ready, true);
+  assert.equal(probeCount, 1);
 });
 
 test("unattended bootstrap retries when the tab is ready but runtime is a video page", async () => {
@@ -1679,7 +1731,7 @@ test("a missing tracked tab never hijacks the user's unrelated active page", asy
     return true;
   });
   assert.equal(harness.updates.length, 0);
-  assert.equal(harness.retries.length, 2);
+  assert.equal(harness.retries.length, 3);
 });
 
 test("elastic unattended starts obey a bounded soft gate and healthy manual runs do not wait", () => {

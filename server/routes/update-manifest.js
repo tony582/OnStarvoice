@@ -3,12 +3,31 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.91',
+  latestVersion: '0.3.92',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-24',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.91-20260824.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.92-20260824.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.92',
+      releaseDate: '2026-08-24',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '抖音慢搜索不再过早失败',
+              desc: '任务会继续等待已进入正确搜索词的抖音页面返回结果；弱网下的有限恢复次数同步恢复，避免在结果刚出现前误判失败。',
+            },
+            {
+              title: '抖音详情慢加载可自动续采',
+              desc: '直达作品保留 API 优先读取，详情 DOM 等待更充分；仍未就绪时会识别为可恢复错误并尝试该作品的备用入口。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.91',
       releaseDate: '2026-08-24',
