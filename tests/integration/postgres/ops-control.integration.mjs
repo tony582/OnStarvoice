@@ -212,6 +212,23 @@ test('observe-only control plane reconciles a historical failure to final succes
     assert.ok(cycle.skipped >= 1);
     assert.ok(cycle.results.some(row => row.tenantId === tenant.id));
 
+    const guardedCycle = await runOpsControlCycle({
+      now: new Date('2026-08-24T00:03:00.000Z'),
+      env: {
+        OPS_CONTROL_GLOBAL_ENABLED: 'true',
+        OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true',
+      },
+      observeTenant: async ({tenantId}) => ({kind: 'outside_window', tenantId}),
+    });
+    const guardedSystemState = await queryOne(`
+      SELECT mode, details
+      FROM ops_control_system_state
+      WHERE component = 'scheduler'
+    `);
+    assert.equal(guardedCycle.status, 'healthy');
+    assert.equal(guardedSystemState.mode, 'guarded');
+    assert.equal(guardedSystemState.details.actionsGlobalEnabled, true);
+
     const [run, snapshots, incidents, digest, after] = await Promise.all([
       queryOne('SELECT * FROM ops_control_runs WHERE tenant_id = $1', [tenant.id]),
       queryAll('SELECT * FROM ops_control_snapshots WHERE tenant_id = $1 ORDER BY sequence', [tenant.id]),

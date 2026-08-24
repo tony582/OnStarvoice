@@ -1786,6 +1786,7 @@ async function updateSystemState({
     ON CONFLICT (component)
     DO UPDATE SET
       status = excluded.status,
+      mode = excluded.mode,
       cycle_sequence = ops_control_system_state.cycle_sequence + 1,
       last_started_at = excluded.last_started_at,
       last_succeeded_at = CASE
