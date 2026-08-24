@@ -1424,6 +1424,7 @@ async function persistObservation(tx, {
   evidence,
   normalized,
   assessment,
+  expandExpectedSchedules = false,
 }) {
   let run = await tx.queryOne(`
     INSERT INTO ops_control_runs (
@@ -1458,10 +1459,16 @@ async function persistObservation(tx, {
     FOR UPDATE
   `, [run.id, tenantId]);
 
-  const expectedIds = integer(run.snapshot_count) > 0
+  const collectedScheduleIds = normalized.schedules.map(row => row.id).filter(Boolean);
+  const frozenExpectedIds = integer(run.snapshot_count) > 0
     && Array.isArray(run.expected_schedule_ids)
     ? run.expected_schedule_ids
-    : normalized.schedules.map(row => row.id).filter(Boolean);
+    : [];
+  const expectedIds = frozenExpectedIds.length > 0
+    ? expandExpectedSchedules
+      ? [...new Set([...frozenExpectedIds, ...collectedScheduleIds].map(String))]
+      : frozenExpectedIds
+    : collectedScheduleIds;
   const expectedIdSet = new Set(expectedIds.map(String));
   const expectedSchedules = normalized.schedules.filter(row => expectedIdSet.has(row.id));
   const presentExpectedIds = new Set(expectedSchedules.map(row => row.id));
@@ -1815,6 +1822,7 @@ export async function runOpsControlTenantObservation({
   settings = {},
   now = new Date(),
   force = false,
+  eventWake = null,
   getTaskWakeState = getOpsControlTaskWakeState,
   withTransaction = dbWithTransaction,
   queryOne = dbQueryOne,
@@ -1833,7 +1841,9 @@ export async function runOpsControlTenantObservation({
   const taskWakeState = scheduledWindowActive
     ? normalizeOpsControlTaskWakeState()
     : await getTaskWakeState({tenantId, now, queryOne});
-  if (!scheduledWindowActive && !force && !taskWakeState.shouldWake) {
+  const eventReason = text(eventWake?.reason, 120);
+  const eventTriggered = Boolean(eventReason);
+  if (!scheduledWindowActive && !force && !taskWakeState.shouldWake && !eventTriggered) {
     return {
       kind: 'outside_window',
       tenantId,
@@ -1842,12 +1852,27 @@ export async function runOpsControlTenantObservation({
       activation: {kind: 'idle', ...taskWakeState},
     };
   }
-  const taskDriven = !scheduledWindowActive && taskWakeState.shouldWake;
-  const window = taskDriven
+  const eventDriven = eventTriggered;
+  const taskDriven = !scheduledWindowActive && !eventDriven && taskWakeState.shouldWake;
+  const window = !scheduledWindowActive && (taskDriven || eventDriven)
     ? buildOpsControlTaskWindow(now, configuredWindow)
     : configuredWindow;
-  const activation = taskDriven
-    ? {kind: 'task_activity', ...taskWakeState}
+  const activation = eventDriven
+    ? {
+        kind: 'event_activity',
+        ...taskWakeState,
+        reason: eventReason,
+        reasons: Array.isArray(eventWake?.reasons)
+          ? eventWake.reasons.map(value => text(value, 120)).filter(Boolean).slice(0, 20)
+          : [eventReason],
+        sourceTypes: Array.isArray(eventWake?.sourceTypes)
+          ? eventWake.sourceTypes.map(value => text(value, 80)).filter(Boolean).slice(0, 20)
+          : [],
+        eventCount: integer(eventWake?.eventCount, 1),
+        firstEventAt: iso(eventWake?.firstEventAt),
+      }
+    : taskDriven
+      ? {kind: 'task_activity', ...taskWakeState}
     : scheduledWindowActive
       ? {kind: 'scheduled_window', ...taskWakeState}
       : {kind: 'manual_force', ...taskWakeState};
@@ -1862,6 +1887,9 @@ export async function runOpsControlTenantObservation({
       policy,
       evidence,
       normalized,
+      expandExpectedSchedules: ['event_activity', 'task_activity'].includes(
+        activation.kind,
+      ),
     });
   });
   const actions = await runOpsControlGuardedActions({
@@ -2187,12 +2215,41 @@ export async function getOpsControlPublicHealth({
 } = {}) {
   const globalEnabled = resolveOpsControlGlobalEnabled(env);
   const actionsGlobalEnabled = resolveOpsControlActionsGlobalEnabled(env);
-  const state = await queryOne(`
-    SELECT component, status, mode, cycle_sequence,
-      last_started_at, last_succeeded_at, last_failed_at, updated_at
-    FROM ops_control_system_state
-    WHERE component = 'scheduler'
+  const stateBundle = await queryOne(`
+    SELECT
+      (
+        SELECT jsonb_build_object(
+          'component', component,
+          'status', status,
+          'mode', mode,
+          'cycle_sequence', cycle_sequence,
+          'last_started_at', last_started_at,
+          'last_succeeded_at', last_succeeded_at,
+          'last_failed_at', last_failed_at,
+          'details', details,
+          'updated_at', updated_at
+        )
+        FROM ops_control_system_state
+        WHERE component = 'scheduler'
+      ) AS scheduler,
+      (
+        SELECT jsonb_build_object(
+          'component', component,
+          'status', status,
+          'mode', mode,
+          'cycle_sequence', cycle_sequence,
+          'last_started_at', last_started_at,
+          'last_succeeded_at', last_succeeded_at,
+          'last_failed_at', last_failed_at,
+          'details', details,
+          'updated_at', updated_at
+        )
+        FROM ops_control_system_state
+        WHERE component = 'event_listener'
+      ) AS event_listener
   `);
+  const state = stateBundle?.scheduler || null;
+  const eventListener = stateBundle?.event_listener || null;
   if (!state) {
     return {
       ok: false,
@@ -2202,14 +2259,36 @@ export async function getOpsControlPublicHealth({
       actionsGlobalEnabled,
       runtimeBaselineVersion: OPS_CONTROL_RUNTIME_BASELINE_VERSION,
       lastCycleAt: null,
+      eventDriven: true,
+      eventListenerStatus: eventListener?.status || 'not_started',
     };
   }
   const lagSeconds = ageSeconds(now, state.updated_at);
-  const fresh = lagSeconds !== null && lagSeconds <= 180;
-  const ok = fresh && ['healthy', 'disabled'].includes(state.status);
+  const eventListenerLagSeconds = ageSeconds(now, eventListener?.updated_at);
+  const fresh = lagSeconds !== null && lagSeconds <= 360;
+  const eventListenerFresh = eventListenerLagSeconds !== null
+    && eventListenerLagSeconds <= 180;
+  const eventListenerConnected = Boolean(
+    eventListener && eventListener.details?.connected === true,
+  );
+  const eventListenerOk = eventListenerFresh
+    && eventListener?.status === 'healthy'
+    && eventListenerConnected;
+  const ok = fresh
+    && ['healthy', 'disabled'].includes(state.status)
+    && eventListenerOk;
+  const status = !fresh
+    ? 'stale'
+    : !eventListener
+      ? 'event_listener_not_started'
+      : !eventListenerFresh
+        ? 'event_listener_stale'
+        : !eventListenerOk
+          ? 'event_listener_degraded'
+          : state.status;
   return {
     ok,
-    status: fresh ? state.status : 'stale',
+    status,
     mode: state.mode || OPS_CONTROL_MODE,
     globalEnabled,
     actionsGlobalEnabled,
@@ -2218,5 +2297,11 @@ export async function getOpsControlPublicHealth({
     lastSucceededAt: iso(state.last_succeeded_at),
     cycleSequence: integer(state.cycle_sequence),
     lagSeconds,
+    eventDriven: true,
+    eventListenerStatus: eventListener?.status || 'not_started',
+    eventListenerConnected,
+    eventListenerLastSeenAt: iso(eventListener?.updated_at),
+    eventListenerLagSeconds,
+    eventListenerSequence: integer(eventListener?.cycle_sequence),
   };
 }

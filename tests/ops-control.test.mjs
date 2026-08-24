@@ -507,10 +507,19 @@ test('public sentinel health fails closed on a degraded or stale scheduler', asy
     now,
     env: {OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true'},
     queryOne: async () => ({
-      status: 'degraded',
-      mode: 'guarded',
-      updated_at: '2026-08-24T00:02:30.000Z',
-      cycle_sequence: 7,
+      scheduler: {
+        status: 'degraded',
+        mode: 'guarded',
+        updated_at: '2026-08-24T00:02:30.000Z',
+        cycle_sequence: 7,
+      },
+      event_listener: {
+        status: 'healthy',
+        mode: 'guarded',
+        updated_at: '2026-08-24T00:02:45.000Z',
+        cycle_sequence: 2,
+        details: {connected: true},
+      },
     }),
   });
   assert.equal(degraded.ok, false);
@@ -521,26 +530,60 @@ test('public sentinel health fails closed on a degraded or stale scheduler', asy
   const stale = await getOpsControlPublicHealth({
     now,
     queryOne: async () => ({
-      status: 'healthy',
-      mode: 'observe',
-      updated_at: '2026-08-23T23:50:00.000Z',
-      cycle_sequence: 8,
+      scheduler: {
+        status: 'healthy',
+        mode: 'observe',
+        updated_at: '2026-08-23T23:50:00.000Z',
+        cycle_sequence: 8,
+      },
+      event_listener: {
+        status: 'healthy',
+        mode: 'observe',
+        updated_at: '2026-08-24T00:02:45.000Z',
+        cycle_sequence: 3,
+        details: {connected: true},
+      },
     }),
   });
   assert.equal(stale.ok, false);
   assert.equal(stale.status, 'stale');
+
+  const disconnected = await getOpsControlPublicHealth({
+    now,
+    queryOne: async () => ({
+      scheduler: {
+        status: 'healthy',
+        mode: 'observe',
+        updated_at: '2026-08-24T00:02:30.000Z',
+        cycle_sequence: 9,
+      },
+      event_listener: {
+        status: 'healthy',
+        mode: 'observe',
+        updated_at: '2026-08-24T00:02:45.000Z',
+        cycle_sequence: 4,
+        details: {connected: false},
+      },
+    }),
+  });
+  assert.equal(disconnected.ok, false);
+  assert.equal(disconnected.status, 'event_listener_degraded');
+  assert.equal(disconnected.eventListenerConnected, false);
 });
 
 test('migrations, API, scheduler and Admin UI wire the guarded control plane through isolated adapters', async () => {
-  const [migration, actionMigration, alertMigration, service, actionService, route, app, cron, overview, mobileApp, settingsPage, adminRoute] = await Promise.all([
+  const [migration, actionMigration, alertMigration, eventMigration, service, wakeupService, actionService, route, app, cron, schedulerRuntime, overview, mobileApp, settingsPage, adminRoute] = await Promise.all([
     source('server/db/migrations/070_ops_control_plane.sql'),
     source('server/db/migrations/071_ops_control_guarded_actions.sql'),
     source('server/db/migrations/072_ops_control_incident_alerts.sql'),
+    source('server/db/migrations/073_ops_control_event_wakeups.sql'),
     source('server/services/ops-control.js'),
+    source('server/services/ops-control-wakeup.js'),
     source('server/services/ops-control-actions.js'),
     source('server/routes/ops-control.js'),
     source('server/app.js'),
     source('server/cron.js'),
+    source('server/runtime/scheduler-runtime.js'),
     source('web/admin/src/pages/OverviewPage.tsx'),
     source('web/admin/src/mobile/MobileApp.tsx'),
     source('web/admin/src/pages/AdminPages.tsx'),
@@ -562,6 +605,12 @@ test('migrations, API, scheduler and Admin UI wire the guarded control plane thr
   assert.match(actionMigration, /\('ops_control_action_allowlist', ''\)/u);
   assert.match(alertMigration, /alert_delivery_status/u);
   assert.match(alertMigration, /idx_ops_control_incidents_alert_delivery/u);
+  assert.match(eventMigration, /CREATE TABLE IF NOT EXISTS ops_control_wakeups/u);
+  assert.match(eventMigration, /CREATE OR REPLACE FUNCTION enqueue_ops_control_wakeup/u);
+  assert.match(eventMigration, /pg_notify\('ops_control_wakeup'/u);
+  assert.match(eventMigration, /trg_ops_control_capture_task_wakeup/u);
+  assert.match(eventMigration, /trg_ops_control_capture_command_wakeup/u);
+  assert.match(eventMigration, /trg_ops_control_schedule_wakeup/u);
 
   assert.doesNotMatch(service, /(?:INSERT INTO|UPDATE|DELETE FROM)\s+capture_(?:tasks|task_items|task_item_attempts|agent_commands)/iu);
   assert.doesNotMatch(service, /(?:INSERT INTO|UPDATE|DELETE FROM)\s+(?:records|record_comments|relevance_prefilter_requests)/iu);
@@ -576,6 +625,11 @@ test('migrations, API, scheduler and Admin UI wire the guarded control plane thr
   assert.match(route, /router\.post\([\s\S]*'\/observe-now'/u);
   assert.match(app, /app\.use\('\/api\/ops-control', opsControlRouter\)/u);
   assert.match(cron, /name: 'ops-control-observer'[\s\S]*runOpsControlCycle/u);
+  assert.match(cron, /name: 'ops-control-observer'[\s\S]*expression: '\*\/5 \* \* \* \*'/u);
+  assert.match(wakeupService, /LISTEN \$\{OPS_CONTROL_WAKEUP_CHANNEL\}/u);
+  assert.match(wakeupService, /FOR UPDATE SKIP LOCKED/u);
+  assert.match(wakeupService, /runOpsControlTenantObservation/u);
+  assert.match(schedulerRuntime, /startOpsControlWakeupRuntime/u);
   assert.match(overview, /data-ops-control-card/u);
   assert.match(overview, /仅执行白名单动作/u);
   assert.match(mobileApp, /data-ops-control-card/u);

@@ -160,7 +160,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '*/5 * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),

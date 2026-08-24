@@ -204,7 +204,9 @@ function schedulerDefinitions(jobs, logger) {
     },
     {
       name: 'ops-control-observer',
-      expression: '* * * * *',
+      // Event wakeups are the primary path. This bounded reconciliation scan
+      // only recovers from a listener outage or an unexpected legacy writer.
+      expression: '*/5 * * * *',
       run: async () => {
         try {
           const result = await jobs.runOpsControlCycle({logger});
