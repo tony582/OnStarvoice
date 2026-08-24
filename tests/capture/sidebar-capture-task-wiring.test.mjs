@@ -1538,8 +1538,8 @@ function createUnattendedNavigationHarness({
     url: "https://www.douyin.com/jingxuan",
   };
   const sandbox = vm.createContext({
-    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 4,
-    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0, 0],
+    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 3,
+    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0],
     buildSidebarKeywordSearchUrl: (keyword) =>
       `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`,
     chrome: {
@@ -1616,16 +1616,16 @@ test("unattended bootstrap reopens the same keyword after a transient page drift
 
 test("unattended bootstrap retry is bounded and exposes a recoverable error code", async () => {
   const harness = createUnattendedNavigationHarness({
-    tabReadiness: [false, false, false, false],
+    tabReadiness: [false, false, false],
   });
 
   await assert.rejects(harness.navigate(), (error) => {
     assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
-    assert.equal(error.attempts, 4);
+    assert.equal(error.attempts, 3);
     return true;
   });
-  assert.equal(harness.updates.length, 4);
-  assert.equal(harness.retries.length, 3);
+  assert.equal(harness.updates.length, 3);
+  assert.equal(harness.retries.length, 2);
   assert.equal(harness.runtimeChecks(), 0);
 });
 
@@ -1679,7 +1679,45 @@ test("a missing tracked tab never hijacks the user's unrelated active page", asy
     return true;
   });
   assert.equal(harness.updates.length, 0);
-  assert.equal(harness.retries.length, 3);
+  assert.equal(harness.retries.length, 2);
+});
+
+test("elastic unattended starts obey a bounded soft gate and healthy manual runs do not wait", () => {
+  const gateSection = readFunctionSection(
+    "function resolveUnattendedBootstrapStartGate(request = {}, now = Date.now())",
+    "async function navigateActiveTabToKeywordSearchForPlan({",
+  );
+  const sandbox = vm.createContext({
+    UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS: 60_000,
+  });
+  vm.runInContext(
+    `${gateSection}\nglobalThis.__resolveGate = resolveUnattendedBootstrapStartGate;`,
+    sandbox,
+  );
+  const now = Date.parse("2026-08-24T00:00:00.000Z");
+  const manual = sandbox.__resolveGate({}, now);
+  assert.equal(manual.delayed, false);
+  assert.equal(manual.waitMs, 0);
+
+  const delayed = sandbox.__resolveGate({
+    orchestrationContext: {
+      distributionMode: "elastic_pool",
+      bootstrapStartNotBefore: "2026-08-24T00:00:25.000Z",
+      bootstrapPacingReason: "staggered_start",
+    },
+  }, now);
+  assert.equal(delayed.delayed, true);
+  assert.equal(delayed.waitMs, 25_000);
+  assert.equal(delayed.reason, "staggered_start");
+
+  const bounded = sandbox.__resolveGate({
+    orchestrationContext: {
+      distributionMode: "elastic_pool",
+      bootstrapStartNotBefore: "2026-08-24T00:05:00.000Z",
+      bootstrapPacingReason: "recent_technical_congestion",
+    },
+  }, now);
+  assert.equal(bounded.waitMs, 60_000);
 });
 
 test("tab readiness never promotes an unrelated same-platform tab to the task tab", async () => {
@@ -1742,15 +1780,30 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   const navigationIndex = section.indexOf(
     "const navigationResult = await navigateActiveTabToKeywordSearchForPlan({",
   );
+  const gateIndex = section.indexOf(
+    "const bootstrapGate = resolveUnattendedBootstrapStartGate(request)",
+  );
+  const switchIndex = section.indexOf("let switchResult = null");
   const retryIndex = section.indexOf("onRetry: async ({nextAttempt, maxAttempts, retryDelayMs, waitUntil})", navigationIndex);
   const batchIndex = section.indexOf("batchRunResult = await handleBatchKeywordCapture({", retryIndex);
+  const terminalCatchIndex = section.indexOf(
+    'console.error("[Sidebar] Unattended keyword plan failed:", error)',
+  );
 
-  assert.ok(navigationIndex > -1);
+  assert.ok(gateIndex > -1);
+  assert.ok(switchIndex > gateIndex);
+  assert.ok(navigationIndex > switchIndex);
   assert.ok(retryIndex > navigationIndex);
   assert.ok(batchIndex > retryIndex);
+  assert.ok(terminalCatchIndex > batchIndex);
   assert.match(section.slice(retryIndex, batchIndex), /phase: "waiting_search_page_retry"/);
   assert.match(section.slice(retryIndex, batchIndex), /waitUntil,/);
   assert.match(section.slice(retryIndex, batchIndex), /retried: Math\.max\(0, Number\(nextAttempt\) - 1\)/);
+  assert.match(section.slice(gateIndex, switchIndex), /phase: "waiting_bootstrap_slot"/);
+  assert.match(
+    section.slice(terminalCatchIndex),
+    /const bootstrapCanceled =\s+error\?\.code === "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED"/,
+  );
   assert.match(
     section,
     /const bootstrapFailed =\s+error\?\.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"/,

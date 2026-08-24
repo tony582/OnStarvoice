@@ -5,6 +5,7 @@ export const SCHEDULER_RUNTIME_RESPONSIBILITIES = Object.freeze([
   'profile-patrol-scheduling',
   'capture-orchestration-recovery',
   'capture-attention-notifications',
+  'ops-control-observation-and-guarded-recovery',
 ]);
 
 export function startSchedulerRuntime({

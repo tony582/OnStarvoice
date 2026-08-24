@@ -1152,14 +1152,14 @@ const UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS = 2 * 60 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
 // 首次把平台页切到关键词时，弱网、平台改写页面或标签替换都可能让短时
-// 就绪检查错过目标页。重试必须分散到真实等待窗口，并把 nextRetryAt 上报给
-// 任务中心；不能连续快速刷新两次后就把普通技术故障升级成人工介入。
-const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4;
+// 就绪检查错过目标页。客户端只做两次短等待；仍未恢复就尽快释放给云端
+// 换 Agent，避免最后一次 3 分钟本地等待把整批节奏拖住。
+const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 3;
 const UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS = Object.freeze([
   20 * 1000,
   60 * 1000,
-  3 * 60 * 1000,
 ]);
+const UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS = 60 * 1000;
 const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4;
 const UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS = Object.freeze([
   15 * 1000,
@@ -13236,6 +13236,8 @@ function createStreamingDetailAutoSyncQueue(
     ),
     shouldStop,
     signal,
+    retryDelaysMs: [1000, 3000, 8000],
+    shouldRetry: isTransientStreamingSyncFailure,
     processRecord: async ({recordId, meta = {}, signal: jobSignal = null}) => {
       const result = await maybeRunAutoSyncAfterDetailCapture(settings, {
         sourceLabel: String(meta?.sourceLabel || "当前笔记"),
@@ -13255,6 +13257,41 @@ function createStreamingDetailAutoSyncQueue(
       };
     },
   });
+}
+
+function isTransientStreamingSyncFailure(result = {}) {
+  if (
+    result?.ok !== false ||
+    result?.blocked ||
+    result?.skipped ||
+    result?.canceled ||
+    result?.phase === "check"
+  ) {
+    return false;
+  }
+  const fragments = [
+    result?.phase,
+    result?.reason,
+    result?.message,
+    result?.pausedReason,
+    result?.pausedMessage,
+    result?.error?.code,
+    result?.error?.message,
+    ...(Array.isArray(result?.results)
+      ? result.results.flatMap((item) => [
+          item?.reason,
+          item?.message,
+          item?.error?.code,
+          item?.error?.message,
+        ])
+      : []),
+  ]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  const failureText = fragments.join(" ");
+  return /(?:timeout|timed out|network|fetch|offline|rate.?limit|too many requests|econn|enet|eai_again|socket|connection|http[_ ]?5\d\d|\b(?:429|500|502|503|504)\b|网络|超时|限流|请求失败|服务繁忙|连接(?:失败|中断|重置))/i.test(
+    failureText,
+  );
 }
 
 function routeDetailItemToStreamingSync(
@@ -13291,7 +13328,11 @@ function formatStreamingSyncSummary(stats = {}) {
   if (!stats?.enabled || Number(stats.enqueuedCount || 0) === 0) {
     return "";
   }
-  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}`;
+  const retryNote =
+    Number(stats.retryCount || 0) > 0
+      ? `，瞬时重试 ${Number(stats.retryCount || 0)}`
+      : "";
+  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}${retryNote}`;
 }
 
 function buildStreamingSyncTaskIssue(stats = {}) {
@@ -13319,6 +13360,7 @@ function buildStreamingSyncTaskMetadata(stats = {}) {
     syncFailedCount: Number(stats?.failedCount || 0),
     syncSkippedCount: Number(stats?.skippedCount || 0),
     syncRemainingCount: Number(stats?.remainingCount || 0),
+    syncRetryCount: Number(stats?.retryCount || 0),
     syncBlocked: Boolean(stats?.blocked),
   };
 }
@@ -13362,7 +13404,8 @@ async function drainStreamingDetailSyncQueue(
     syncFailedCount: Number(result.failedCount || 0),
     syncSkippedCount: Number(result.skippedCount || 0),
     syncRemainingCount: Number(result.remainingCount || 0),
-    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}`,
+    syncRetryCount: Number(result.retryCount || 0),
+    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}${Number(result.retryCount || 0) > 0 ? `，瞬时重试 ${Number(result.retryCount || 0)}` : ""}`,
   };
   updateProgress?.(doneProgress);
   notifyProgress?.(doneProgress);
@@ -17175,6 +17218,36 @@ async function waitForRuntimeSearchPage({
   return false;
 }
 
+function resolveUnattendedBootstrapStartGate(request = {}, now = Date.now()) {
+  const orchestrationContext =
+    request?.orchestrationContext &&
+    typeof request.orchestrationContext === "object"
+      ? request.orchestrationContext
+      : {};
+  if (orchestrationContext.distributionMode !== "elastic_pool") {
+    return {delayed: false, waitMs: 0, waitUntil: "", reason: ""};
+  }
+  const notBeforeMs = Date.parse(
+    String(orchestrationContext.bootstrapStartNotBefore || ""),
+  );
+  if (!Number.isFinite(notBeforeMs)) {
+    return {delayed: false, waitMs: 0, waitUntil: "", reason: ""};
+  }
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const waitMs = Math.min(
+    UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS,
+    Math.max(0, notBeforeMs - nowMs),
+  );
+  return {
+    delayed: waitMs > 0,
+    waitMs,
+    waitUntil: new Date(nowMs + waitMs).toISOString(),
+    reason: String(
+      orchestrationContext.bootstrapPacingReason || "staggered_start",
+    ).trim(),
+  };
+}
+
 async function navigateActiveTabToKeywordSearchForPlan({
   keyword = "",
   platform = "xiaohongshu",
@@ -17935,22 +18008,55 @@ async function runUnattendedKeywordPlanRequest(request) {
     );
   };
 
-  let switchResult = null;
   try {
-    switchResult = await chrome.runtime.sendMessage({
-      type: "onstarvoice:switch-platform-tab",
-      platform,
-    });
-    if (!switchResult?.ok) {
-      throw new Error(
-        switchResult?.error?.message || "打开平台页面失败，无法执行计划",
+    const bootstrapGate = resolveUnattendedBootstrapStartGate(request);
+    if (bootstrapGate.delayed) {
+      const waitSeconds = Math.max(
+        1,
+        Math.ceil(bootstrapGate.waitMs / 1000),
       );
+      await reportAutomaticRecoveryStage({
+        phase: "waiting_bootstrap_slot",
+        message:
+          bootstrapGate.reason === "recent_technical_congestion"
+            ? `检测到多个节点刚发生技术卡顿，${waitSeconds} 秒后错峰打开搜索页`
+            : `正在错峰启动，${waitSeconds} 秒后打开搜索页`,
+        waitUntil: bootstrapGate.waitUntil,
+        remainingMs: bootstrapGate.waitMs,
+      });
+      await sleepWithStop(bootstrapGate.waitMs, () =>
+        activeUnattendedAttemptRejected ||
+        !isCurrentRequestAttempt() ||
+        batchKeywordCancelRequested ||
+        Boolean(activeCaptureTaskCancellationReason),
+      );
+      if (
+        activeUnattendedAttemptRejected ||
+        !isCurrentRequestAttempt() ||
+        batchKeywordCancelRequested ||
+        Boolean(activeCaptureTaskCancellationReason)
+      ) {
+        const canceledError = new Error("无人值守错峰启动已取消");
+        canceledError.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
+        throw canceledError;
+      }
     }
-  } catch (error) {
-    throw new Error(`打开平台页面失败：${error.message}`);
-  }
 
-  try {
+    let switchResult = null;
+    try {
+      switchResult = await chrome.runtime.sendMessage({
+        type: "onstarvoice:switch-platform-tab",
+        platform,
+      });
+      if (!switchResult?.ok) {
+        throw new Error(
+          switchResult?.error?.message || "打开平台页面失败，无法执行计划",
+        );
+      }
+    } catch (error) {
+      throw new Error(`打开平台页面失败：${error.message}`);
+    }
+
     unattendedSourceTabId = await resolveCaptureTaskSourceTabId({
       preferredTabId: switchResult?.data?.tabId,
       platform,

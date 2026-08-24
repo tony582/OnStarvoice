@@ -11,6 +11,8 @@ export function createRecordSyncQueue({
   onStateChange = null,
   shouldStop = null,
   signal = null,
+  retryDelaysMs = [],
+  shouldRetry = null,
 } = {}) {
   const queueEnabled = Boolean(enabled);
   if (queueEnabled && typeof processRecord !== "function") {
@@ -27,12 +29,20 @@ export function createRecordSyncQueue({
   let blockedError = null;
   let canceled = signal?.aborted === true;
   let cancelReason = canceled ? "aborted" : "";
+  const normalizedRetryDelaysMs = (Array.isArray(retryDelaysMs)
+    ? retryDelaysMs
+    : []
+  )
+    .map((value) => Math.max(0, Number(value) || 0))
+    .filter(Number.isFinite)
+    .slice(0, 5);
   const stats = {
     enqueuedCount: 0,
     processedCount: 0,
     successCount: 0,
     failedCount: 0,
     skippedCount: 0,
+    retryCount: 0,
   };
 
   const getStats = () => ({
@@ -162,6 +172,36 @@ export function createRecordSyncQueue({
     return addedCount;
   };
 
+  const isRetryableResult = (result, context = {}) => {
+    if (
+      typeof shouldRetry !== "function" ||
+      result?.ok !== false ||
+      result?.blocked ||
+      result?.skipped ||
+      result?.canceled ||
+      syncCancellationState()
+    ) {
+      return false;
+    }
+    try {
+      return shouldRetry(result, context) === true;
+    } catch (error) {
+      console.warn("[RecordSyncQueue] Retry predicate failed:", error);
+      return false;
+    }
+  };
+
+  const waitForRetryDelay = async (delayMs) => {
+    const finishAt = Date.now() + Math.max(0, Number(delayMs) || 0);
+    while (Date.now() < finishAt) {
+      if (syncCancellationState()) return false;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(100, Math.max(0, finishAt - Date.now()))),
+      );
+    }
+    return !syncCancellationState();
+  };
+
   const processJob = async (job) => {
     if (syncCancellationState()) return;
     activeJob = job;
@@ -171,19 +211,58 @@ export function createRecordSyncQueue({
     emitState("syncing", {recordId: job.recordId, meta: latestMeta});
 
     let result = null;
-    if (blockedError) {
-      result = {ok: false, blocked: true, error: blockedError};
-    } else {
-      try {
-        result =
-          (await processRecord({
-            recordId: job.recordId,
-            meta: latestMeta,
-            signal,
-          })) || {ok: true};
-      } catch (error) {
-        result = {ok: false, error};
+    let retryIndex = 0;
+    while (true) {
+      if (blockedError) {
+        result = {ok: false, blocked: true, error: blockedError};
+      } else {
+        try {
+          result =
+            (await processRecord({
+              recordId: job.recordId,
+              meta: latestMeta,
+              signal,
+            })) || {ok: true};
+        } catch (error) {
+          result = {ok: false, error};
+        }
       }
+
+      if (
+        retryIndex >= normalizedRetryDelaysMs.length ||
+        !isRetryableResult(result, {
+          recordId: job.recordId,
+          meta: latestMeta,
+          attempt: retryIndex + 1,
+        })
+      ) {
+        break;
+      }
+
+      const retryDelayMs = normalizedRetryDelaysMs[retryIndex];
+      retryIndex += 1;
+      emitState("retry_wait", {
+        recordId: job.recordId,
+        meta: latestMeta,
+        retryAttempt: retryIndex,
+        retryDelayMs,
+        result,
+      });
+      if (!(await waitForRetryDelay(retryDelayMs))) {
+        result = {
+          ok: false,
+          canceled: true,
+          skipped: true,
+          reason: cancelReason || "capture_task_canceled",
+        };
+        break;
+      }
+      stats.retryCount += 1;
+      emitState("retrying", {
+        recordId: job.recordId,
+        meta: latestMeta,
+        retryAttempt: retryIndex,
+      });
     }
 
     stats.processedCount += 1;

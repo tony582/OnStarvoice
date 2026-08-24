@@ -1922,6 +1922,12 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
           revision: 2,
           itemIds: ["item-elastic-context"],
           distributionMode: "elastic_pool",
+          bootstrapStartNotBefore: "2026-08-24T00:00:25.000Z",
+          bootstrapDelayMs: 25000,
+          bootstrapPacingReason: "staggered_start",
+          bootstrapStaggerBucket: 2,
+          recentTechnicalFailureCount: 1,
+          recentAffectedAgentCount: 1,
         },
         attemptIdentity: "elastic-attempt-context",
       },
@@ -1953,6 +1959,18 @@ test("an elastic cloud assignment keeps its distribution mode on the local reque
     request.orchestrationContext.attemptIdentity,
     "elastic-attempt-context",
   );
+  assert.equal(
+    request.orchestrationContext.bootstrapStartNotBefore,
+    "2026-08-24T00:00:25.000Z",
+  );
+  assert.equal(request.orchestrationContext.bootstrapDelayMs, 25000);
+  assert.equal(
+    request.orchestrationContext.bootstrapPacingReason,
+    "staggered_start",
+  );
+  assert.equal(request.orchestrationContext.bootstrapStaggerBucket, 2);
+  assert.equal(request.orchestrationContext.recentTechnicalFailureCount, 1);
+  assert.equal(request.orchestrationContext.recentAffectedAgentCount, 1);
 });
 
 test("cloud tasks without a valid post limit do not create a device override", async () => {
@@ -2729,20 +2747,22 @@ test("canceling a cloud one-off leaves the recurring local plan result untouched
 
 test("switching capture-agent identity does not mirror the previous tenant's local plan or history", async () => {
   const harness = createHarness();
+  const customerAAt = new Date(Date.now() - 60_000).toISOString();
+  const customerAUpdatedAt = new Date(Date.now() - 30_000).toISOString();
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-a", token: "token-a"},
   };
   harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
     keywords: ["客户 A 计划"],
-    updatedAt: "2026-07-20T01:00:00.000Z",
+    updatedAt: customerAAt,
   });
   harness.storage[TASK_LEDGER_KEY] = {
     version: 1,
     runs: [{
       id: "customer-a-task",
       status: "completed",
-      createdAt: "2026-07-20T01:00:00.000Z",
-      updatedAt: "2026-07-20T01:05:00.000Z",
+      createdAt: customerAAt,
+      updatedAt: customerAUpdatedAt,
     }],
   };
 

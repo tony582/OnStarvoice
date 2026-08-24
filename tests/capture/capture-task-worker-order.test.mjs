@@ -205,6 +205,7 @@ test("both double-buffer workers register before any site navigation", async () 
   ];
   const registrations = [];
   let createIndex = 0;
+  let stopRequested = false;
 
   globalThis.chrome = {
     storage: {local: createMemoryStorageArea()},
@@ -242,6 +243,7 @@ test("both double-buffer workers register before any site navigation", async () 
       async update(tabId, patch) {
         if (workers.some((worker) => worker.id === tabId) && patch?.url) {
           events.push(`navigate:${tabId}`);
+          stopRequested = true;
           throw new Error(`No tab with id: ${tabId}`);
         }
         return {id: tabId, ...patch};
@@ -298,6 +300,7 @@ test("both double-buffer workers register before any site navigation", async () 
   const batchPromise = captureSync.batchCaptureDetailsForRecords(recordIds, {
     skipAlreadyCaptured: false,
     captureTaskId: activeTask.taskId,
+    shouldStop: () => stopRequested,
   });
 
   await registrationStarted[0].promise;
@@ -312,6 +315,7 @@ test("both double-buffer workers register before any site navigation", async () 
   assert.deepEqual(
     registrations.map((item) => item.tabId),
     workers.map((worker) => worker.id),
+    events.join(" -> "),
   );
   const navigationIndex = events.findIndex((event) => event.startsWith("navigate:"));
   assert.ok(events.indexOf("register2:end") < navigationIndex, events.join(" -> "));
@@ -322,6 +326,191 @@ test("both double-buffer workers register before any site navigation", async () 
       .sort((a, b) => a - b),
     workers.map((worker) => worker.id),
   );
+
+  await captureSync.endCaptureTaskSession({
+    taskId: activeTask.taskId,
+    reason: "completed",
+    status: "completed",
+  });
+  taskContext.completeTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+});
+
+test("Xiaohongshu recreates a lost detail worker and retries the same record", async () => {
+  const sourceTab = {
+    id: 151,
+    windowId: 16,
+    index: 2,
+    active: true,
+    status: "complete",
+    url: "https://www.xiaohongshu.com/search_result?keyword=recovery",
+  };
+  const workers = [
+    {id: 692, windowId: 16, index: 3, active: false, status: "complete", url: "about:blank"},
+    {id: 693, windowId: 16, index: 4, active: false, status: "complete", url: "about:blank"},
+  ];
+  const currentUrls = new Map(workers.map((worker) => [worker.id, worker.url]));
+  const registrations = [];
+  const navigationTabIds = [];
+  const removedTabIds = [];
+  const progressPhases = [];
+  let createIndex = 0;
+  let firstWorkerLost = false;
+
+  globalThis.chrome = {
+    storage: {local: createMemoryStorageArea()},
+    runtime: {
+      async sendMessage(message) {
+        if (message?.type === "onstarvoice:begin-capture-task") {
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (message?.type === "onstarvoice:register-capture-task-tab") {
+          registrations.push(structuredClone(message));
+          return {ok: true, data: {taskId: message.taskId}};
+        }
+        if (
+          message?.type === "onstarvoice:relay-to-content" &&
+          message?.payload?.action === "captureSingleNote"
+        ) {
+          assert.equal(message.tabId, workers[1].id);
+          return {
+            ok: true,
+            data: {
+              ok: true,
+              platform: "xiaohongshu",
+              type: "single_note",
+              data: {
+                noteId: "xhs-recovery-note",
+                noteUrl:
+                  "https://www.xiaohongshu.com/explore/xhs-recovery-note?xsec_source=pc_search",
+                title: "Recovered detail",
+                content: "The replacement worker captured this record.",
+                author: "Recovery author",
+                likes: 8,
+              },
+              error: null,
+            },
+          };
+        }
+        return {ok: true, data: {ok: true}};
+      },
+      getURL(path) {
+        return `chrome-extension://test/${path}`;
+      },
+    },
+    tabs: {
+      async query() {
+        return [sourceTab];
+      },
+      async create(properties) {
+        const worker = workers[createIndex];
+        createIndex += 1;
+        assert.ok(worker, "worker recreation exceeded the bounded fixture");
+        currentUrls.set(worker.id, String(properties?.url || worker.url));
+        return {
+          ...worker,
+          ...properties,
+          id: worker.id,
+          url: currentUrls.get(worker.id),
+        };
+      },
+      async update(tabId, patch) {
+        const targetUrl = String(patch?.url || "");
+        if (targetUrl && workers.some((worker) => worker.id === tabId)) {
+          navigationTabIds.push(tabId);
+          if (tabId === workers[0].id && !firstWorkerLost) {
+            firstWorkerLost = true;
+            throw new Error(`No tab with id: ${tabId}`);
+          }
+          currentUrls.set(tabId, targetUrl);
+        }
+        if (tabId === sourceTab.id) return {...sourceTab, ...patch};
+        const worker = workers.find((candidate) => candidate.id === tabId);
+        return {
+          ...worker,
+          ...patch,
+          url: currentUrls.get(tabId) || worker?.url,
+          status: "complete",
+        };
+      },
+      async get(tabId) {
+        if (tabId === sourceTab.id) return {...sourceTab};
+        const worker = workers.find((candidate) => candidate.id === tabId);
+        if (!worker || (tabId === workers[0].id && firstWorkerLost)) {
+          throw new Error(`No tab with id: ${tabId}`);
+        }
+        return {
+          ...worker,
+          url: currentUrls.get(tabId) || worker.url,
+          status: "complete",
+        };
+      },
+      async remove(tabId) {
+        removedTabIds.push(tabId);
+      },
+    },
+    scripting: {
+      async executeScript() {
+        return [{result: {blocked: false, isDouyin: false}}];
+      },
+    },
+    windows: {async update() { return {}; }},
+  };
+
+  const [{addRecord}, captureSync, taskContext] = await Promise.all([
+    import("../../utils/storage.js"),
+    import("../../utils/capture-sync.js"),
+    import("../../utils/task-context.js"),
+  ]);
+  const recordId = "xiaohongshu-worker-recovery-r1";
+  await addRecord({
+    id: recordId,
+    type: "keyword_notes",
+    platform: "xiaohongshu",
+    payload: {
+      items: [{
+        noteId: "xhs-recovery-note",
+        url:
+          "https://www.xiaohongshu.com/explore/xhs-recovery-note?xsec_source=pc_search",
+      }],
+    },
+  });
+
+  const activeTask = taskContext.beginTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+  await captureSync.beginCaptureTaskSession({
+    taskId: activeTask.taskId,
+    tabId: sourceTab.id,
+    label: "XHS worker recovery test",
+    platform: "xiaohongshu",
+  });
+
+  const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
+    skipAlreadyCaptured: false,
+    captureTaskId: activeTask.taskId,
+    detailAfterNavWaitMs: 1,
+    onProgress(progress) {
+      progressPhases.push(progress?.phase);
+    },
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.successCount, 1);
+  assert.equal(result.failedCount, 0);
+  assert.equal(result.runnerInterrupted, false);
+  assert.equal(result.runnerRecoveryCount, 1);
+  assert.deepEqual(navigationTabIds, workers.map((worker) => worker.id));
+  assert.deepEqual(
+    registrations.map((item) => item.tabId),
+    workers.map((worker) => worker.id),
+  );
+  assert.deepEqual(removedTabIds, workers.map((worker) => worker.id));
+  assert.equal(progressPhases.includes("detail_runner_recreated"), true);
+  assert.equal(progressPhases.includes("detail_item_done"), true);
 
   await captureSync.endCaptureTaskSession({
     taskId: activeTask.taskId,

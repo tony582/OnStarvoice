@@ -106,6 +106,12 @@ const ELASTIC_SAFETY_AGENT_HOLD_MS = 30 * 60 * 1000;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
 const ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS = 1;
+const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 3;
+const ELASTIC_BOOTSTRAP_STAGGER_BUCKETS = 4;
+const ELASTIC_BOOTSTRAP_STAGGER_GAP_MS = 6 * 1000;
+const ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS = 2 * 60 * 1000;
+const ELASTIC_BOOTSTRAP_CONGESTION_MAX_DELAY_MS = 30 * 1000;
+const ELASTIC_BOOTSTRAP_MAX_DELAY_MS = 45 * 1000;
 const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
   'DOUYIN_SEARCH_SECURITY_CHALLENGE',
   'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
@@ -132,6 +138,12 @@ const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
   'UNATTENDED_STATUS_REPORT_REJECTED',
   'UNATTENDED_RUNTIME_MESSAGE_TIMEOUT',
   'UNATTENDED_REQUEST_NOT_FOUND',
+  'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+]);
+const ELASTIC_BOOTSTRAP_CONGESTION_CODES = new Set([
+  'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+  'UNATTENDED_STATUS_REPORT_TIMEOUT',
+  'UNATTENDED_RUNTIME_MESSAGE_TIMEOUT',
 ]);
 const ELASTIC_STALE_TASK_CODES = new Set([
   'ELASTIC_TASK_HEARTBEAT_TIMEOUT',
@@ -560,6 +572,7 @@ export function projectElasticKeywordRecoveryStatus({
   error = {},
   checkpoint = {},
   attemptCount = 0,
+  technicalLimitReached = false,
 } = {}) {
   const normalizedStatus = text(status, 80).toLowerCase();
   if (!elasticPool) return normalizedStatus;
@@ -582,6 +595,9 @@ export function projectElasticKeywordRecoveryStatus({
     return normalizedAttemptCount <= ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS
       ? 'retryable'
       : 'needs_action';
+  }
+  if (technicalLimitReached) {
+    return 'needs_action';
   }
   return normalizedAttemptCount < AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
     ? 'retryable'
@@ -652,6 +668,48 @@ function elasticRecoveryErrorCode(source = {}) {
   ).toUpperCase();
 }
 
+export function projectElasticBootstrapPacing({
+  seed = '',
+  recentFailureCount = 0,
+  recentAffectedAgentCount = 0,
+  now = new Date(),
+} = {}) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const nowMs = Number.isFinite(nowDate.getTime())
+    ? nowDate.getTime()
+    : Date.now();
+  const normalizedSeed = text(seed, 500) || 'elastic-bootstrap';
+  const digest = crypto.createHash('sha256').update(normalizedSeed).digest();
+  const staggerBucket = digest[0] % ELASTIC_BOOTSTRAP_STAGGER_BUCKETS;
+  const staggerDelayMs = staggerBucket * ELASTIC_BOOTSTRAP_STAGGER_GAP_MS;
+  const failureCount = Math.max(0, Math.floor(Number(recentFailureCount) || 0));
+  const affectedAgentCount = Math.max(
+    0,
+    Math.floor(Number(recentAffectedAgentCount) || 0),
+  );
+  const congestionDelayMs = affectedAgentCount >= 2
+    ? Math.min(
+        ELASTIC_BOOTSTRAP_CONGESTION_MAX_DELAY_MS,
+        10 * 1000 +
+          Math.max(0, affectedAgentCount - 2) * 6 * 1000 +
+          Math.max(0, failureCount - affectedAgentCount) * 2 * 1000,
+      )
+    : 0;
+  const delayMs = Math.min(
+    ELASTIC_BOOTSTRAP_MAX_DELAY_MS,
+    staggerDelayMs + congestionDelayMs,
+  );
+  return {
+    bootstrapStartNotBefore: new Date(nowMs + delayMs).toISOString(),
+    bootstrapDelayMs: delayMs,
+    bootstrapPacingReason:
+      congestionDelayMs > 0 ? 'recent_technical_congestion' : 'staggered_start',
+    bootstrapStaggerBucket: staggerBucket,
+    recentTechnicalFailureCount: failureCount,
+    recentAffectedAgentCount: affectedAgentCount,
+  };
+}
+
 export function elasticAttemptBudgetAfterOutcome(
   attemptCount = 0,
   source = {},
@@ -674,6 +732,14 @@ export function projectElasticAttemptBudget(
   const currentBudget = Number.isInteger(explicitBudget) && explicitBudget >= 0
     ? explicitBudget
     : Math.max(0, Number(item?.attempt_count) || 0);
+  const explicitTechnicalAttemptCount = Number(
+    metadata.elasticTechnicalAttemptCount,
+  );
+  const currentTechnicalAttemptCount =
+    Number.isInteger(explicitTechnicalAttemptCount) &&
+    explicitTechnicalAttemptCount >= 0
+      ? explicitTechnicalAttemptCount
+      : 0;
   const errorCode = elasticRecoveryErrorCode(source);
   const normalizedExecutionTaskId = text(executionTaskId, 100).toLowerCase();
   const refundState = safeJson(metadata.elasticAttemptBudget);
@@ -690,10 +756,20 @@ export function projectElasticAttemptBudget(
   const attemptBudget = shouldRefund
     ? elasticAttemptBudgetAfterOutcome(currentBudget, source)
     : currentBudget;
+  const technicalAttemptCount = shouldRefund
+    ? currentTechnicalAttemptCount + 1
+    : currentTechnicalAttemptCount;
+  const technicalLimitReached = Boolean(
+    ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES.has(errorCode) &&
+      technicalAttemptCount >= ELASTIC_TECHNICAL_HANDOFF_LIMIT,
+  );
   return {
     attemptBudget,
+    technicalAttemptCount,
+    technicalLimitReached,
     metadataPatch: {
       elasticAttemptBudgetUsed: attemptBudget,
+      elasticTechnicalAttemptCount: technicalAttemptCount,
       ...(shouldRefund
         ? {
             elasticAttemptBudget: {
@@ -1432,7 +1508,32 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
 
 let pendingCommandReconciliation = null;
 
-export async function reconcilePendingCaptureCommands({tenantLimit = 100} = {}) {
+export async function reconcilePendingCaptureCommands({
+  tenantLimit = 100,
+  tenantId = '',
+  taskId = '',
+} = {}) {
+  const scopedTenantId = text(tenantId, 100).toLowerCase();
+  const scopedTaskId = text(taskId, 100).toLowerCase();
+  if (scopedTaskId && !scopedTenantId) {
+    return {tenantCount: 0, commandCount: 0, error: 'tenant_scope_required'};
+  }
+  if (scopedTenantId) {
+    if (!UUID_PATTERN.test(scopedTenantId)) {
+      return {tenantCount: 0, commandCount: 0, error: 'invalid_tenant_id'};
+    }
+    if (scopedTaskId && !UUID_PATTERN.test(scopedTaskId)) {
+      return {tenantCount: 0, commandCount: 0, error: 'invalid_task_id'};
+    }
+    const reconciled = await withTransaction(tx =>
+      expireStaleCommands(tx, scopedTenantId, scopedTaskId)
+    );
+    return {
+      tenantCount: 1,
+      commandCount: reconciled.length,
+      taskId: scopedTaskId,
+    };
+  }
   if (pendingCommandReconciliation) return pendingCommandReconciliation;
   const limit = Math.max(1, Math.min(500, Number(tenantLimit) || 100));
   pendingCommandReconciliation = (async () => {
@@ -3740,6 +3841,7 @@ async function projectOrchestrationChildControlOutcome(tx, {
     status,
     error: normalizedError,
     attemptCount: projectedAttemptCount,
+    technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
   });
   const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(projectedStatus);
   await tx.execute(`
@@ -4020,6 +4122,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       error,
       checkpoint,
       attemptCount: projectedAttemptCount,
+      technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
     });
     const recovery = buildElasticRecoveryMetadata({
       status,
@@ -4218,6 +4321,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         error: childError,
         checkpoint: snapshotCheckpoint,
         attemptCount: projectedAttemptCount,
+        technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
       });
       const recovery = buildElasticRecoveryMetadata({
         status: activeUnresolvedStatus,
@@ -5010,6 +5114,35 @@ async function dispatchNextElasticWorkItem(tx, {
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
   const targetedContent = negativePost || watchedContent;
+  let bootstrapPacing = null;
+  if (!targetedContent) {
+    const recentBootstrapHealth = await tx.queryOne(`
+      SELECT
+        COUNT(*)::integer AS failure_count,
+        COUNT(DISTINCT attempt.agent_id)::integer AS affected_agent_count
+      FROM capture_task_item_attempts attempt
+      WHERE attempt.tenant_id = $1
+        AND attempt.updated_at >
+          now() - ($2::bigint * interval '1 millisecond')
+        AND attempt.status IN ('retryable', 'needs_action', 'failed')
+        AND UPPER(COALESCE(attempt.error->>'code', '')) = ANY($3::text[])
+    `, [
+      agent.tenant_id,
+      ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS,
+      Array.from(ELASTIC_BOOTSTRAP_CONGESTION_CODES),
+    ]);
+    bootstrapPacing = projectElasticBootstrapPacing({
+      seed: [
+        candidate.parent_id,
+        candidate.item_id,
+        candidate.ordinal,
+        candidate.assignment_revision,
+        agent.id,
+      ].join(':'),
+      recentFailureCount: recentBootstrapHealth?.failure_count,
+      recentAffectedAgentCount: recentBootstrapHealth?.affected_agent_count,
+    });
+  }
   const targetedWorkflow = watchedContent
     ? 'watched_content_patrol'
     : 'negative_post_patrol';
@@ -5106,6 +5239,7 @@ async function dispatchNextElasticWorkItem(tx, {
         revision: assignmentRevision,
         itemIds: [candidate.item_id],
         distributionMode: 'elastic_pool',
+        ...(bootstrapPacing || {}),
       },
       attemptIdentity,
     };
@@ -5160,6 +5294,7 @@ async function dispatchNextElasticWorkItem(tx, {
         revision: assignmentRevision,
         itemIds: [candidate.item_id],
         distributionMode: 'elastic_pool',
+        ...(bootstrapPacing || {}),
       },
       attemptIdentity,
     };
@@ -5189,6 +5324,7 @@ async function dispatchNextElasticWorkItem(tx, {
     distributionMode: 'elastic_pool',
     claimUnit,
     attemptIdentity,
+    ...(bootstrapPacing ? {bootstrapPacing} : {}),
     ...(sequentialResumeCheckpoint
       ? {
           resumedSequentialSearch: true,
@@ -5377,6 +5513,7 @@ async function dispatchNextElasticWorkItem(tx, {
       assignmentRevision,
       attemptNumber,
       attemptBudget,
+      ...(bootstrapPacing || {}),
       commandId,
     },
   });
@@ -9232,8 +9369,28 @@ async function dispatchCrossDeviceRetry({
   });
 }
 
-export async function reconcileElasticCaptureLeases(limit = 50) {
-  const normalizedLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+export async function reconcileElasticCaptureLeases(input = 50) {
+  const options = input && typeof input === 'object' ? input : {limit: input};
+  const normalizedLimit = Math.max(1, Math.min(200, Number(options.limit) || 50));
+  const tenantId = text(options.tenantId, 100).toLowerCase();
+  const parentTaskIdInput = Array.isArray(options.parentTaskIds)
+    ? options.parentTaskIds
+    : [];
+  const parentTaskIds = Array.from(new Set(
+    parentTaskIdInput
+      .map(value => text(value, 100).toLowerCase())
+      .filter(value => UUID_PATTERN.test(value)),
+  ));
+  if (tenantId && !UUID_PATTERN.test(tenantId)) {
+    return {scanned: 0, requeued: 0, skipped: 0, error: 'invalid_tenant_id'};
+  }
+  if (Object.hasOwn(options, 'parentTaskIds') && (
+    !tenantId
+    || parentTaskIds.length === 0
+    || parentTaskIds.length !== parentTaskIdInput.length
+  )) {
+    return {scanned: 0, requeued: 0, skipped: 0, error: 'invalid_parent_task_scope'};
+  }
   const candidates = await queryAll(`
     SELECT child.id, child.tenant_id, child.parent_task_id
     FROM capture_tasks child
@@ -9272,9 +9429,19 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
           AND command.task_id = child.id
           AND command.status IN ('pending', 'acknowledged')
       )
+      AND ($3::uuid IS NULL OR child.tenant_id = $3::uuid)
+      AND (
+        cardinality($4::uuid[]) = 0
+        OR child.parent_task_id = ANY($4::uuid[])
+      )
     ORDER BY child.updated_at, child.id
     LIMIT $2
-  `, [ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN, normalizedLimit]);
+  `, [
+    ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+    normalizedLimit,
+    tenantId || null,
+    parentTaskIds,
+  ]);
 
   const summary = {scanned: candidates.length, requeued: 0, skipped: 0};
   for (const candidate of candidates) {
@@ -9395,8 +9562,52 @@ export async function reconcileElasticCaptureLeases(limit = 50) {
   return summary;
 }
 
-export async function reconcileAutomaticCaptureRetries(limit = 10) {
-  const normalizedLimit = Math.max(1, Math.min(50, Number(limit) || 10));
+export async function reconcileAutomaticCaptureRetries(input = 10) {
+  const options = input && typeof input === 'object' ? input : {limit: input};
+  const normalizedLimit = Math.max(1, Math.min(50, Number(options.limit) || 10));
+  const tenantId = text(options.tenantId, 100).toLowerCase();
+  const taskIdInput = Array.isArray(options.taskIds) ? options.taskIds : [];
+  const taskIds = Array.from(new Set(
+    taskIdInput
+      .map(value => text(value, 100).toLowerCase())
+      .filter(value => UUID_PATTERN.test(value)),
+  ));
+  const maxDispatchesPerTask = Math.max(
+    1,
+    Math.min(30, Number(options.maxDispatchesPerTask) || 30),
+  );
+  const requestedByName = text(
+    options.requestedByName || '自动调度中心',
+    240,
+  );
+  if (tenantId && !UUID_PATTERN.test(tenantId)) {
+    return {
+      scanned: 0,
+      dispatched: 0,
+      waitingForAgent: 0,
+      manualOnly: 0,
+      skipped: 0,
+      failed: 0,
+      results: [],
+      error: 'invalid_tenant_id',
+    };
+  }
+  if (Object.hasOwn(options, 'taskIds') && (
+    !tenantId
+    || taskIds.length === 0
+    || taskIds.length !== taskIdInput.length
+  )) {
+    return {
+      scanned: 0,
+      dispatched: 0,
+      waitingForAgent: 0,
+      manualOnly: 0,
+      skipped: 0,
+      failed: 0,
+      results: [],
+      error: 'invalid_task_scope',
+    };
+  }
   const candidates = await queryAll(`
     SELECT id, tenant_id, status, orchestration_revision
     FROM capture_tasks
@@ -9432,6 +9643,8 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
           ) = ANY($3::text[])
         )
       )
+      AND ($5::uuid IS NULL OR tenant_id = $5::uuid)
+      AND (cardinality($6::uuid[]) = 0 OR id = ANY($6::uuid[]))
     ORDER BY
       CASE status WHEN 'needs_action' THEN 0 ELSE 1 END,
       updated_at,
@@ -9442,6 +9655,8 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
     [...AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES],
     [...CROSS_DEVICE_RETRY_TASK_TYPES],
     normalizedLimit,
+    tenantId || null,
+    taskIds,
   ]);
 
   const summary = {
@@ -9455,7 +9670,7 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
   };
   for (const candidate of candidates) {
     let expectedRevision = Number(candidate.orchestration_revision || 0);
-    for (let allocation = 0; allocation < 30; allocation += 1) {
+    for (let allocation = 0; allocation < maxDispatchesPerTask; allocation += 1) {
       try {
         const result = await dispatchCrossDeviceRetry({
           tenantId: candidate.tenant_id,
@@ -9463,7 +9678,7 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
           requestKey: crypto.randomUUID(),
           expectedRevision,
           actorType: 'system',
-          requestedByName: '自动调度中心',
+          requestedByName,
           automatic: true,
         });
         if (!result?.error) {
@@ -9486,6 +9701,7 @@ export async function reconcileAutomaticCaptureRetries(limit = 10) {
           [
             'retry_requires_manual_safety_action',
             'automatic_retry_disabled',
+            'retry_items_not_automatically_recoverable',
           ].includes(result.error)
         ) {
           summary.manualOnly += 1;

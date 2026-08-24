@@ -22,6 +22,10 @@ import {
   LLM_RELAY_SETTING_KEYS,
   normalizeLlmRelaySettings,
 } from '../services/llm-relay.js';
+import {
+  normalizeOpsControlSettingPatch,
+  OpsControlSettingsError,
+} from '../services/ops-control.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
@@ -131,8 +135,32 @@ router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
          FROM tenant_settings
          WHERE tenant_id = $2
            -- 人工安全验证通知属于客户自己的收件地址，绝不能继承默认租户。
-           AND key <> 'capture_attention_email_to'`,
+           AND key <> 'capture_attention_email_to'
+           -- 无人值守控制面必须由每个新租户单独启用，运维收件人也不得串租户。
+           AND key NOT IN (
+             'ops_control_enabled',
+             'ops_control_mode',
+             'ops_control_digest_email_enabled',
+             'ops_control_digest_email_to'
+           )
+           AND key NOT LIKE 'ops_control_action_%'`,
         [created.id, defaultTenantId]
+      );
+      await tx.execute(
+        `INSERT INTO tenant_settings (tenant_id, key, value, updated_at)
+         VALUES
+           ($1, 'ops_control_enabled', 'false', now()),
+           ($1, 'ops_control_mode', 'observe', now()),
+           ($1, 'ops_control_digest_email_enabled', 'false', now()),
+           ($1, 'ops_control_digest_email_to', '', now()),
+           ($1, 'ops_control_action_allowlist', '', now()),
+           ($1, 'ops_control_action_max_per_run', '3', now()),
+           ($1, 'ops_control_action_max_attempts', '2', now()),
+           ($1, 'ops_control_action_cooldown_seconds', '300', now()),
+           ($1, 'ops_control_action_verification_seconds', '900', now())
+         ON CONFLICT (tenant_id, key) DO UPDATE
+         SET value = excluded.value, updated_at = excluded.updated_at`,
+        [created.id],
       );
       // 评论值守默认开启。新租户不能因为默认租户恰好关闭了关注而静默继承关闭。
       await tx.execute(
@@ -897,6 +925,25 @@ router.put('/settings', async (req, res, next) => {
     }
     const failoverKeys = Object.keys(settings).filter(key =>
       key.startsWith('llm_failover_'));
+    const opsControlKeys = Object.keys(settings).filter(key =>
+      key.startsWith('ops_control_'));
+    if (opsControlKeys.length > 0) {
+      try {
+        const current = await getAllSettings(tenantId);
+        const normalized = normalizeOpsControlSettingPatch(settings, current);
+        for (const key of opsControlKeys) delete settings[key];
+        Object.assign(settings, normalized);
+      } catch (error) {
+        if (error instanceof OpsControlSettingsError) {
+          return res.status(400).json({
+            ok: false,
+            error: error.code,
+            message: error.message,
+          });
+        }
+        throw error;
+      }
+    }
     const relaySettingKeys = new Set(Object.values(LLM_RELAY_SETTING_KEYS));
     const relayKeys = Object.keys(settings).filter(key => relaySettingKeys.has(key));
     const unknownRelayKeys = Object.keys(settings).filter(key =>
@@ -936,7 +983,7 @@ router.put('/settings', async (req, res, next) => {
         });
       }
     }
-    if (failoverKeys.length > 0 || relayKeys.length > 0) {
+    if (failoverKeys.length > 0 || relayKeys.length > 0 || opsControlKeys.length > 0) {
       const safeValues = Object.fromEntries(
         failoverKeys.map(key => [key, String(settings[key] ?? '')]),
       );
@@ -978,6 +1025,23 @@ router.put('/settings', async (req, res, next) => {
               keys: relayKeys,
               values: Object.fromEntries(
                 relayKeys.map(key => [key, String(settings[key] ?? '')]),
+              ),
+            })],
+          );
+        }
+        if (opsControlKeys.length > 0) {
+          await tx.execute(
+            `INSERT INTO audit_logs (
+               tenant_id, actor_type, actor_id, actor_user_id,
+               action, target_type, target_id, metadata
+             ) VALUES (
+               $1::uuid, 'user', $2::text, $3::uuid,
+               'ops.control_settings_updated', 'tenant', $1::uuid::text, $4::jsonb
+             )`,
+            [tenantId, String(req.user.id), req.user.id, JSON.stringify({
+              keys: opsControlKeys,
+              values: Object.fromEntries(
+                opsControlKeys.map(key => [key, String(settings[key] ?? '')]),
               ),
             })],
           );

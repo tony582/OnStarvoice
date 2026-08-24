@@ -754,6 +754,24 @@ export function SettingsPage() {
       for (const k of ['report_daily_time', 'report_weekly_time', 'report_monthly_day', 'report_monthly_time']) body[k] = settings[k]
     } else if (group === 'comment-risk') {
       body.comment_risk_attention_enabled = settings.comment_risk_attention_enabled === 'false' ? 'false' : 'true'
+    } else if (group === 'ops-control') {
+      for (const key of [
+        'ops_control_enabled',
+        'ops_control_mode',
+        'ops_control_window_start',
+        'ops_control_window_end',
+        'ops_control_digest_time',
+        'ops_control_snapshot_gap_seconds',
+        'ops_control_stale_after_seconds',
+        'ops_control_ai_stale_after_seconds',
+        'ops_control_digest_email_enabled',
+        'ops_control_digest_email_to',
+        'ops_control_action_allowlist',
+        'ops_control_action_max_per_run',
+        'ops_control_action_max_attempts',
+        'ops_control_action_cooldown_seconds',
+        'ops_control_action_verification_seconds',
+      ]) body[key] = settings[key] || ''
     } else if (group === 'llm-relay') {
       body.llm_relay_mode = settings.llm_relay_mode || 'off'
       body.llm_relay_model = settings.llm_relay_model || 'gemini-3.7-flash-low'
@@ -765,6 +783,14 @@ export function SettingsPage() {
   }
 
   const u = (key: string, val: string) => setSettings(prev => ({ ...prev, [key]: val }))
+  const opsActionAllowlist = (settings.ops_control_action_allowlist || '')
+    .split(',').map(item => item.trim()).filter(Boolean)
+  const toggleOpsAction = (action: string, enabled: boolean) => {
+    const next = new Set(opsActionAllowlist)
+    if (enabled) next.add(action)
+    else next.delete(action)
+    u('ops_control_action_allowlist', Array.from(next).join(','))
+  }
 
   const rotateLlmRelayToken = async () => {
     setLlmRelayBusy(true); setLlmRelayMessage('')
@@ -992,6 +1018,117 @@ export function SettingsPage() {
             </span>
           </span>
         </label>
+      </SettingsCard>
+
+      <SettingsCard
+        title="无人值守控制面"
+        description="连续对账、受控恢复、二次验收和晨报；控制器本身不调用大模型。"
+        onSave={() => save('ops-control')}
+      >
+        <div className="space-y-3">
+          <label className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+            <input
+              type="checkbox"
+              checked={settings.ops_control_enabled === 'true'}
+              onChange={event => u('ops_control_enabled', event.target.checked ? 'true' : 'false')}
+              className="mt-0.5 h-4 w-4 accent-primary"
+            />
+            <span>
+              <span className="block text-sm font-semibold">开启本租户值守观察</span>
+              <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                还需服务端观察总开关允许。关闭后停止新快照、动作和晨报，但保留历史台账。
+              </span>
+            </span>
+          </label>
+          <Field label="运行模式">
+            <select
+              value={settings.ops_control_mode || 'observe'}
+              onChange={event => u('ops_control_mode', event.target.value)}
+              className="h-11 w-full rounded-md border border-input bg-background px-3 text-sm lg:h-9"
+            >
+              <option value="observe">observe · 只观察、判断和通知</option>
+              <option value="guarded">guarded · 允许白名单动作并二次验收</option>
+            </select>
+          </Field>
+          <div className="grid gap-3 lg:grid-cols-3">
+            <Field label="值守开始">
+              <Input type="time" value={settings.ops_control_window_start || '05:30'} onChange={e => u('ops_control_window_start', e.target.value)} />
+            </Field>
+            <Field label="值守结束">
+              <Input type="time" value={settings.ops_control_window_end || '08:30'} onChange={e => u('ops_control_window_end', e.target.value)} />
+            </Field>
+            <Field label="晨报时间">
+              <Input type="time" value={settings.ops_control_digest_time || '08:35'} onChange={e => u('ops_control_digest_time', e.target.value)} />
+            </Field>
+            <Field label="连续快照间隔（秒）">
+              <Input type="number" min="25" max="300" value={settings.ops_control_snapshot_gap_seconds || '25'} onChange={e => u('ops_control_snapshot_gap_seconds', e.target.value)} />
+            </Field>
+            <Field label="采集停滞阈值（秒）">
+              <Input type="number" min="120" max="3600" value={settings.ops_control_stale_after_seconds || '300'} onChange={e => u('ops_control_stale_after_seconds', e.target.value)} />
+            </Field>
+            <Field label="AI 停滞阈值（秒）">
+              <Input type="number" min="300" max="7200" value={settings.ops_control_ai_stale_after_seconds || '1200'} onChange={e => u('ops_control_ai_stale_after_seconds', e.target.value)} />
+            </Field>
+          </div>
+          <div className="rounded-lg border border-status-orange/30 bg-status-orange/5 p-3">
+            <div className="text-sm font-semibold">受控动作白名单</div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              只有 guarded 模式、服务端动作总开关和下列白名单同时允许时才会执行。验证码、登录、安全验证、永久业务失败和 Agent 全离线永远只转人工。
+            </p>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {[
+                ['capture_retry', '最终失败项换空闲 Agent 重试'],
+                ['schedule_materialize', '漏跑计划补建本轮任务'],
+                ['command_reconcile', '清理并对账陈旧远程指令'],
+                ['elastic_requeue', '回收停滞的弹性工作项'],
+              ].map(([action, label]) => (
+                <label key={action} className="flex items-start gap-2 rounded-md border border-border bg-background/70 p-2.5">
+                  <input
+                    type="checkbox"
+                    checked={opsActionAllowlist.includes(action)}
+                    onChange={event => toggleOpsAction(action, event.target.checked)}
+                    className="mt-0.5 h-4 w-4 accent-primary"
+                  />
+                  <span className="text-xs font-medium leading-5">{label}</span>
+                </label>
+              ))}
+            </div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Field label="单次值守最多动作">
+                <Input type="number" min="1" max="10" value={settings.ops_control_action_max_per_run || '3'} onChange={e => u('ops_control_action_max_per_run', e.target.value)} />
+              </Field>
+              <Field label="同一目标最多尝试">
+                <Input type="number" min="1" max="5" value={settings.ops_control_action_max_attempts || '2'} onChange={e => u('ops_control_action_max_attempts', e.target.value)} />
+              </Field>
+              <Field label="动作冷却（秒）">
+                <Input type="number" min="60" max="3600" value={settings.ops_control_action_cooldown_seconds || '300'} onChange={e => u('ops_control_action_cooldown_seconds', e.target.value)} />
+              </Field>
+              <Field label="验收期限（秒）">
+                <Input type="number" min="120" max="3600" value={settings.ops_control_action_verification_seconds || '900'} onChange={e => u('ops_control_action_verification_seconds', e.target.value)} />
+              </Field>
+            </div>
+          </div>
+          <label className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+            <input
+              type="checkbox"
+              checked={settings.ops_control_digest_email_enabled === 'true'}
+              onChange={event => u('ops_control_digest_email_enabled', event.target.checked ? 'true' : 'false')}
+              className="mt-0.5 h-4 w-4 accent-primary"
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-semibold">发送异常提醒与运维晨报</span>
+              <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                可自动恢复的事项先等待动作验收；无动作可做、动作失败或必须人工时立即提醒，正常结论在晨报时间汇总。
+              </span>
+              <Input
+                className="mt-2"
+                value={settings.ops_control_digest_email_to || ''}
+                onChange={e => u('ops_control_digest_email_to', e.target.value)}
+                placeholder="运维晨报收件人"
+              />
+            </span>
+          </label>
+        </div>
       </SettingsCard>
 
       <SettingsCard title="报告时间" description="分别设置日报、周报和月报的生成时点。" onSave={() => save('report')}>

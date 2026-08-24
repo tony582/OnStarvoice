@@ -3,7 +3,7 @@ import {
   Activity, ArrowLeft, BarChart3, Bell, Building2, ChevronRight,
   CircleAlert, Database, Eye, FileText,
   Home, KeyRound, Lightbulb, ListChecks, LogOut, MessageCircle, MessageSquare, Monitor,
-  MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
+  Loader2, MoonStar, MoreHorizontal, Radio, RefreshCw, ScanSearch, Search, Send, ServerCog, Settings, ShieldCheck,
   Sparkles, User, Users,
 } from 'lucide-react'
 import {
@@ -221,10 +221,49 @@ interface OverviewData {
   pendingRecords: OverviewPendingRecord[]
 }
 
+interface MobileOpsControlSummary {
+  runtimeBaselineVersion: string
+  mode: 'observe' | 'guarded'
+  policy: {
+    enabled: boolean
+    globalEnabled: boolean
+    actionsEnabled: boolean
+  }
+  run?: {
+    service_date: string
+    verdict: 'pending' | 'healthy' | 'degraded' | 'blocked_manual' | 'incident'
+    snapshot_count: number
+    summary?: {
+      headline?: string
+      observedScheduleCount?: number
+      expectedScheduleCount?: number
+      recoveredItemCount?: number
+      manualBlockerCount?: number
+      onlineAgentCount?: number
+      registeredAgentCount?: number
+      actions?: {
+        pendingVerification?: number
+        verified?: number
+        failed?: number
+        blocked?: number
+      }
+    }
+  } | null
+  digest?: { summary?: string } | null
+  incidents?: Array<{
+    id: string
+    title: string
+    alert_delivery_status?: string
+    alert_sent_at?: string
+  }>
+}
+
 function TodayPage({ openPage }: { openPage: OpenPage }) {
-  const { tenantId } = useAuth()
+  const { tenantId, canWrite } = useAuth()
   const { badges, features } = useBadges()
   const [data, setData] = useState<OverviewData | null>(null)
+  const [ops, setOps] = useState<MobileOpsControlSummary | null>(null)
+  const [opsBusy, setOpsBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
@@ -233,7 +272,12 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
     setLoading(true)
     setError('')
     try {
-      setData(await api.get<OverviewData>('/workspace/overview?days=7'))
+      const [overview, opsSummary] = await Promise.all([
+        api.get<OverviewData>('/workspace/overview?days=7'),
+        api.get<MobileOpsControlSummary>('/ops-control/summary').catch(() => null),
+      ])
+      setData(overview)
+      setOps(opsSummary)
       setUpdatedAt(new Date())
     } catch (err) {
       setError(err instanceof Error ? err.message : '值守数据加载失败')
@@ -243,6 +287,18 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
   }, [])
 
   useEffect(() => { load() }, [tenantId, load]) // eslint-disable-line react-hooks/set-state-in-effect
+
+  const observeNow = async () => {
+    setOpsBusy(true)
+    try {
+      await api.post('/ops-control/observe-now', {})
+      setOps(await api.get<MobileOpsControlSummary>('/ops-control/summary'))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '值守复核失败')
+    } finally {
+      setOpsBusy(false)
+    }
+  }
 
   const k = data?.kpi || {}
   const high = Number(k.high_open_issues || 0)
@@ -280,6 +336,14 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
       } />
 
       <div className="space-y-5 px-4">
+        <MobileOpsControlCard
+          data={ops}
+          busy={opsBusy}
+          canObserve={canWrite()}
+          onObserve={observeNow}
+          onOpenDispatch={() => openPage('dispatch')}
+        />
+
         <section className={cn('mobile-duty-pulse relative overflow-hidden rounded-2xl border bg-card px-4 py-4', urgentTotal > 0 ? 'border-status-red/25' : 'border-status-green/25')}>
           <span className={cn('absolute inset-y-0 left-0 w-1', urgentTotal > 0 ? 'bg-status-red' : 'bg-status-green')} />
           <div className="flex items-center justify-between gap-3">
@@ -370,6 +434,112 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
       </div>
     </div>
   )
+}
+
+const MOBILE_OPS_VERDICT = {
+  pending: { label: '观察中', tone: 'neutral', accent: 'border-l-status-blue' },
+  healthy: { label: '无需处理', tone: 'positive', accent: 'border-l-status-green' },
+  degraded: { label: '部分异常', tone: 'medium', accent: 'border-l-status-orange' },
+  blocked_manual: { label: '需要人工', tone: 'medium', accent: 'border-l-status-orange' },
+  incident: { label: '系统异常', tone: 'negative', accent: 'border-l-status-red' },
+} as const
+
+function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
+  data: MobileOpsControlSummary | null
+  busy: boolean
+  canObserve: boolean
+  onObserve: () => void
+  onOpenDispatch: () => void
+}) {
+  const enabled = data?.policy?.enabled === true
+  const run = data?.run || null
+  const verdict = run?.verdict || 'pending'
+  const style = MOBILE_OPS_VERDICT[verdict]
+  const summary = run?.summary || {}
+  const actionSummary = summary.actions || {}
+  const guarded = data?.mode === 'guarded'
+  const actionsEnabled = data?.policy?.actionsEnabled === true
+  const firstIncident = data?.incidents?.[0]
+  const alertLabel = firstIncident?.alert_delivery_status === 'sent'
+    ? '提醒已发'
+    : ['retry_wait', 'blocked_config', 'failed'].includes(firstIncident?.alert_delivery_status || '')
+      ? '提醒异常'
+      : firstIncident ? '恢复/提醒判定中' : ''
+  const attention = verdict === 'incident' || verdict === 'blocked_manual' || verdict === 'degraded'
+    || Number(actionSummary.failed || 0) > 0 || Number(actionSummary.blocked || 0) > 0
+  const headline = !data
+    ? '值守控制面暂不可用'
+    : !enabled
+      ? '观察模式尚未启用'
+      : summary.headline || data.digest?.summary || '等待首次连续观察'
+
+  return (
+    <section data-ops-control-card className={cn('overflow-hidden rounded-2xl border border-l-4 border-border bg-card p-4', enabled ? style.accent : 'border-l-border')}>
+      <div className="flex items-start gap-3">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+          <MoonStar className="h-[18px] w-[18px]" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <h2 className="text-[13px] font-extrabold">昨夜值守</h2>
+            <StatusBadge tone={enabled ? style.tone : 'neutral'}>{enabled ? style.label : '未开启'}</StatusBadge>
+            <span className="text-[9px] font-bold text-muted-foreground">
+              {guarded ? (actionsEnabled ? '受控动作' : '动作未放行') : '观察模式'}
+            </span>
+          </div>
+          <p className="mt-2 text-[15px] font-extrabold leading-5">{headline}</p>
+          {!enabled && (
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+              {data?.policy?.globalEnabled === false ? '服务端全局 kill switch 已关闭' : '本租户尚未开启值守观察'}
+            </p>
+          )}
+          {enabled && run && <p className="mt-1 text-[10px] text-muted-foreground">{run.service_date} · {Number(run.snapshot_count || 0)} 次快照</p>}
+        </div>
+      </div>
+
+      {enabled && run && (
+        <div className="mt-3 grid grid-cols-3 divide-x divide-border rounded-xl bg-muted/45 py-2.5 text-center">
+          <MobileOpsFact label="计划覆盖" value={`${Number(summary.observedScheduleCount || 0)}/${Number(summary.expectedScheduleCount || 0)}`} />
+          <MobileOpsFact label="已自动恢复" value={String(Number(summary.recoveredItemCount || 0))} />
+          <MobileOpsFact label="需人工" value={String(Number(summary.manualBlockerCount || 0))} />
+        </div>
+      )}
+
+      {enabled && run && (
+        <p className="mt-2 text-[10px] text-muted-foreground">
+          在线 Agent {Number(summary.onlineAgentCount || 0)}/{Number(summary.registeredAgentCount || 0)}
+          {guarded ? ` · 动作验收 ${Number(actionSummary.verified || 0)}/${Number(actionSummary.pendingVerification || 0)} 待验收` : ''}
+          {(data?.incidents || []).length > 0 ? ` · 当前事项 ${firstIncident?.title}` : ''}
+          {alertLabel ? ` · ${alertLabel}` : ''}
+        </p>
+      )}
+
+      <div className="mt-3 flex items-center gap-2">
+        {enabled && canObserve && (
+          <button type="button" onClick={onObserve} disabled={busy}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border px-3 text-[11px] font-bold text-muted-foreground active:bg-muted disabled:opacity-50">
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}立即复核
+          </button>
+        )}
+        {attention && (
+          <button type="button" onClick={onOpenDispatch}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-primary px-3 text-[11px] font-bold text-primary-foreground">
+            查看调度 <ChevronRight className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+
+      <p className="mt-3 border-t border-border/70 pt-2 text-[9.5px] leading-4 text-muted-foreground">
+        {data?.runtimeBaselineVersion || '0.3.91'} 已交付自愈基线 · 未调用 LLM · {actionsEnabled
+          ? '仅执行白名单动作，每次一个目标，并由后续快照验收'
+          : guarded ? '动作门禁尚未全部放行' : '当前只观察、判断和通知'}
+      </p>
+    </section>
+  )
+}
+
+function MobileOpsFact({ label, value }: { label: string; value: string }) {
+  return <div><div className="text-[17px] font-extrabold tabular-nums">{value}</div><div className="mt-0.5 text-[9.5px] text-muted-foreground">{label}</div></div>
 }
 
 function TasksHub({ openPage }: { openPage: OpenPage }) {

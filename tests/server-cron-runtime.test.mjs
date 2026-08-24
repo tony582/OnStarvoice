@@ -86,6 +86,9 @@ function safeJobs(overrides = {}) {
     async reconcilePendingCaptureCommands() {
       return {commandCount: 0};
     },
+    async runOpsControlCycle() {
+      return {status: 'healthy', observed: 0, failed: 0, incidentCount: 0};
+    },
     ...overrides,
   };
 }
@@ -157,7 +160,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),
@@ -166,6 +169,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       'onstarvoice:profile-patrol',
       'onstarvoice:capture-orchestration-recovery',
       'onstarvoice:capture-attention-notifications',
+      'onstarvoice:ops-control-observer',
     ],
   );
   assert.ok(fakeCron.registrations.every(item => item.options.noOverlap === true));
@@ -279,7 +283,7 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
     jobs: safeJobs(),
   });
 
-  assert.equal(fakeCron.registrations.length, 6);
+  assert.equal(fakeCron.registrations.length, 7);
   assert.deepEqual(runtime.runtimes.map(item => item.groupName), ['scheduler', 'ai']);
   assert.deepEqual(messages, ['[Cron] Scheduled jobs started']);
   assert.equal(runtime.stop(), true);

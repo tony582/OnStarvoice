@@ -10,6 +10,7 @@ import { processCaptureAttentionNotifications } from './services/capture-attenti
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
 import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
+import {runOpsControlCycle} from './services/ops-control.js';
 import {
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
@@ -31,6 +32,7 @@ const DEFAULT_JOBS = Object.freeze({
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
+  runOpsControlCycle,
 });
 
 function safeLog(logger, method, ...args) {
@@ -197,6 +199,25 @@ function schedulerDefinitions(jobs, logger) {
           }
         } catch (err) {
           safeLog(logger, 'error', '[Cron] Capture attention notification error:', err.message);
+        }
+      },
+    },
+    {
+      name: 'ops-control-observer',
+      expression: '* * * * *',
+      run: async () => {
+        try {
+          const result = await jobs.runOpsControlCycle({logger});
+          if (result.observed > 0 || result.failed > 0) {
+            safeLog(
+              logger,
+              'log',
+              `[Cron] Ops control: ${result.observed} tenant(s) observed, ` +
+              `${result.failed} failed, ${result.incidentCount || 0} incident(s)`,
+            );
+          }
+        } catch (err) {
+          safeLog(logger, 'error', '[Cron] Ops control error:', err.message);
         }
       },
     },

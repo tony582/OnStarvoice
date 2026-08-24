@@ -30,6 +30,7 @@ import {
   crossDeviceRetryTaskSupported,
   elasticAttemptBudgetAfterOutcome,
   projectElasticAttemptBudget,
+  projectElasticBootstrapPacing,
   elasticRecoveryHoldRemainingMs,
   isProfilePatrolTask,
   isExplicitUserCancellationSnapshot,
@@ -40,6 +41,9 @@ import {
   orchestrationCheckpointTimestamp,
   projectElasticKeywordRecoveryStatus,
   projectCanceledChildItemStatus,
+  reconcileAutomaticCaptureRetries,
+  reconcileElasticCaptureLeases,
+  reconcilePendingCaptureCommands,
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
@@ -78,6 +82,32 @@ test("capture agents distinguish browser profiles while retaining their environm
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/140.0 Safari/537.36",
     ),
     {browserName: "Chrome", operatingSystem: "macOS"},
+  );
+});
+
+test("guarded recovery adapters fail closed before an invalid target can widen scope", async () => {
+  const tenantId = "11111111-1111-4111-8111-111111111111";
+  assert.equal(
+    (await reconcilePendingCaptureCommands({
+      taskId: "22222222-2222-4222-8222-222222222222",
+    })).error,
+    "tenant_scope_required",
+  );
+  assert.equal(
+    (await reconcileElasticCaptureLeases({
+      tenantId,
+      parentTaskIds: ["not-a-uuid"],
+      limit: 1,
+    })).error,
+    "invalid_parent_task_scope",
+  );
+  assert.equal(
+    (await reconcileAutomaticCaptureRetries({
+      tenantId,
+      taskIds: [],
+      limit: 1,
+    })).error,
+    "invalid_task_scope",
   );
 });
 
@@ -311,6 +341,13 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     attemptCount: 3,
   }), "failed");
   assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "failed",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    attemptCount: 0,
+    technicalLimitReached: true,
+  }), "needs_action");
+  assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: false,
     status: "needs_action",
     error: safety,
@@ -356,7 +393,7 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   }), 1);
   assert.equal(elasticAttemptBudgetAfterOutcome(2, {
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
-  }), 2);
+  }), 1);
   const firstProjection = projectElasticAttemptBudget({
     attempt_count: 3,
     metadata: {elasticAttemptBudgetUsed: 3},
@@ -374,6 +411,28 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   assert.equal(replayProjection.attemptBudget, 2);
   assert.equal(replayProjection.refunded, false);
 
+  const firstBootstrapProjection = projectElasticAttemptBudget({
+    attempt_count: 1,
+    metadata: {elasticAttemptBudgetUsed: 1},
+  }, {
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+  }, "21111111-1111-4111-8111-111111111111");
+  assert.equal(firstBootstrapProjection.attemptBudget, 0);
+  assert.equal(firstBootstrapProjection.technicalAttemptCount, 1);
+  assert.equal(firstBootstrapProjection.technicalLimitReached, false);
+  const thirdBootstrapProjection = projectElasticAttemptBudget({
+    attempt_count: 3,
+    metadata: {
+      elasticAttemptBudgetUsed: 1,
+      elasticTechnicalAttemptCount: 2,
+    },
+  }, {
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+  }, "31111111-1111-4111-8111-111111111111");
+  assert.equal(thirdBootstrapProjection.attemptBudget, 0);
+  assert.equal(thirdBootstrapProjection.technicalAttemptCount, 3);
+  assert.equal(thirdBootstrapProjection.technicalLimitReached, true);
+
   const now = Date.parse("2026-08-13T02:00:00.000Z");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
@@ -385,6 +444,37 @@ test("elastic queue does not spend business retries on local capacity or dispatc
     error: {code: "elastic_task_heartbeat_timeout"},
     updated_at: "2026-08-13T01:55:00.000Z",
   }, now), 5 * 60_000);
+});
+
+test("elastic bootstrap pacing staggers healthy starts and only adds a short congestion delay", () => {
+  const now = "2026-08-24T00:00:00.000Z";
+  const healthy = projectElasticBootstrapPacing({
+    seed: "tenant:item:agent",
+    now,
+  });
+  const replay = projectElasticBootstrapPacing({
+    seed: "tenant:item:agent",
+    now,
+  });
+  assert.deepEqual(replay, healthy);
+  assert.equal(healthy.bootstrapPacingReason, "staggered_start");
+  assert.ok(healthy.bootstrapDelayMs >= 0);
+  assert.ok(healthy.bootstrapDelayMs <= 18_000);
+
+  const congested = projectElasticBootstrapPacing({
+    seed: "tenant:item:agent",
+    recentFailureCount: 5,
+    recentAffectedAgentCount: 3,
+    now,
+  });
+  assert.equal(
+    congested.bootstrapPacingReason,
+    "recent_technical_congestion",
+  );
+  assert.ok(congested.bootstrapDelayMs > healthy.bootstrapDelayMs);
+  assert.ok(congested.bootstrapDelayMs <= 45_000);
+  assert.equal(congested.recentTechnicalFailureCount, 5);
+  assert.equal(congested.recentAffectedAgentCount, 3);
 });
 
 test("automatic relay excludes devices per selected item instead of per parent task", () => {
@@ -1481,6 +1571,10 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /elasticAttemptBudgetUsed/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
   assert.match(claim, /attemptIdentity,/u);
+  assert.match(claim, /projectElasticBootstrapPacing/u);
+  assert.match(claim, /\.\.\.\(bootstrapPacing \|\| \{\}\)/u);
+  assert.match(claim, /ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS/u);
+  assert.match(claim, /recentAffectedAgentCount/u);
   assert.match(claim, /assignment_revision = \$5/u);
   assert.match(claim, /execution_task_id = \$4/u);
   assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
@@ -1530,7 +1624,12 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
     }),
     {
       attemptBudget: 0,
-      metadataPatch: {elasticAttemptBudgetUsed: 0},
+      technicalAttemptCount: 0,
+      technicalLimitReached: false,
+      metadataPatch: {
+        elasticAttemptBudgetUsed: 0,
+        elasticTechnicalAttemptCount: 0,
+      },
       refunded: false,
     },
   );

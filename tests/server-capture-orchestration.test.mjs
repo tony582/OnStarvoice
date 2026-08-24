@@ -11,6 +11,23 @@ import {
   normalizeOrchestrationRequest,
   normalizeOrchestrationSchedule,
 } from '../server/services/capture-orchestration.js';
+import {enqueueDueCaptureOrchestrations} from '../server/services/capture-orchestration-scheduler.js';
+
+test('guarded schedule materialization rejects an empty or invalid target scope', async () => {
+  const tenantId = '11111111-1111-4111-8111-111111111111';
+  assert.deepEqual(
+    await enqueueDueCaptureOrchestrations({tenantId, scheduleIds: [], limit: 1}),
+    [{kind: 'invalid_schedule_scope'}],
+  );
+  assert.deepEqual(
+    await enqueueDueCaptureOrchestrations({
+      tenantId,
+      scheduleIds: ['not-a-uuid'],
+      limit: 1,
+    }),
+    [{kind: 'invalid_schedule_scope'}],
+  );
+});
 
 test('orchestration input keeps a validated cloud schedule without changing allocation order', () => {
   const normalized = normalizeOrchestrationRequest({
@@ -445,6 +462,24 @@ test('elastic work queue migration is additive and keeps old schedules fixed', a
   assert.match(migration, /idx_capture_task_items_elastic_claim/u);
   assert.match(migration, /idx_capture_task_items_negative_claim/u);
   assert.doesNotMatch(migration, /DELETE FROM/u);
+});
+
+test('bootstrap pacing lookback stays tenant-scoped and index-backed', async () => {
+  const migration = await readFile(
+    new URL(
+      '../server/db/migrations/069_capture_bootstrap_pacing.sql',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(
+    migration,
+    /capture_task_item_attempts \(tenant_id, updated_at DESC\)/u,
+  );
+  assert.match(
+    migration,
+    /WHERE status IN \('retryable', 'needs_action', 'failed'\)/u,
+  );
 });
 
 test('schedule overlap guard ignores its template but still detects active occurrences', async () => {

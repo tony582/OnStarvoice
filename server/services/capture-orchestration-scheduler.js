@@ -38,6 +38,7 @@ export const SCHEDULE_TERMINAL_RUN_STATUSES = Object.freeze([
   'skipped',
   'superseded',
 ]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export function scheduleRunBlocksNextOccurrence({
   runStatus = '',
@@ -1000,9 +1001,29 @@ export async function runCaptureOrchestrationScheduleNow({
   });
 }
 
-export async function enqueueDueCaptureOrchestrations(limit = 10) {
+export async function enqueueDueCaptureOrchestrations(input = 10) {
+  const options = input && typeof input === 'object' ? input : {limit: input};
   const results = [];
-  const maximum = Math.min(50, Math.max(1, Number(limit) || 10));
+  const maximum = Math.min(50, Math.max(1, Number(options.limit) || 10));
+  const tenantId = text(options.tenantId, 100).toLowerCase();
+  const scheduleIdInput = Array.isArray(options.scheduleIds)
+    ? options.scheduleIds
+    : [];
+  const scheduleIds = Array.from(new Set(
+    scheduleIdInput
+      .map(value => text(value, 100).toLowerCase())
+      .filter(value => UUID_PATTERN.test(value)),
+  ));
+  if (tenantId && !UUID_PATTERN.test(tenantId)) {
+    return [{kind: 'invalid_tenant_id'}];
+  }
+  if (Object.hasOwn(options, 'scheduleIds') && (
+    !tenantId
+    || scheduleIds.length === 0
+    || scheduleIds.length !== scheduleIdInput.length
+  )) {
+    return [{kind: 'invalid_schedule_scope'}];
+  }
   for (let index = 0; index < maximum; index += 1) {
     let claimedSchedule = null;
     try {
@@ -1019,10 +1040,12 @@ export async function enqueueDueCaptureOrchestrations(limit = 10) {
         WHERE status = 'active'
           AND next_run_at IS NOT NULL
           AND next_run_at <= now()
+          AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+          AND (cardinality($2::uuid[]) = 0 OR id = ANY($2::uuid[]))
         ORDER BY next_run_at, id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
-      `);
+      `, [tenantId || null, scheduleIds]);
         if (!schedule) return null;
         claimedSchedule = {
           id: schedule.id,

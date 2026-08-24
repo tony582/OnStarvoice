@@ -3,12 +3,44 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.90',
+  latestVersion: '0.3.91',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-23',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.90-20260823.zip',
+  releaseDate: '2026-08-24',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.91-20260824.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.91',
+      releaseDate: '2026-08-24',
+      releaseNotes: [
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '早间任务柔性错峰启动',
+              desc: '多台 Agent 同时开工时按短时间槽启动；仅检测到近期集中启动故障时增加有限延迟，总等待不超过 45 秒，不采用长时间平台熔断。',
+            },
+            {
+              title: '技术启动故障自动换设备',
+              desc: '页面启动和状态握手类故障不再消耗关键词业务重试，任务会自动交给其他可用 Agent；技术接力仍有明确上限，避免无限循环。',
+            },
+          ],
+        },
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书详情工作页中断后批内恢复',
+              desc: '详情工作页意外关闭或丢失时会重建工作页并重试当前条，已完成条目不重跑；同条和整批均设有限恢复次数。',
+            },
+            {
+              title: '边采边同步自动补传瞬时失败',
+              desc: '网络超时、限流和临时服务错误会按 1、3、8 秒有限重试；鉴权、数据错误和用户取消不会重试。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.90',
       releaseDate: '2026-08-23',

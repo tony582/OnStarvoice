@@ -252,6 +252,46 @@ test("Douyin detail enhancement stays on one worker and delays unavailable failu
   );
 });
 
+test("Xiaohongshu interrupted detail workers are recreated with finite per-item and per-batch limits", () => {
+  assert.match(
+    captureSyncSource,
+    /DETAIL_RUNNER_RECREATE_MAX_PER_BATCH = 2/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /DETAIL_RUNNER_RECREATE_MAX_PER_ITEM = 1/u,
+  );
+  const helperStart = captureSyncSource.indexOf(
+    "const recreateInterruptedXhsDetailRunners",
+  );
+  const helperEnd = captureSyncSource.indexOf(
+    "const discardPrefetchForRecord",
+    helperStart,
+  );
+  const helperBody = captureSyncSource.slice(helperStart, helperEnd);
+  assert.match(helperBody, /!detailBatchIsXiaohongshu/u);
+  assert.match(helperBody, /previousPipeline\?\.stop/u);
+  assert.match(helperBody, /closeOwnedDetailRunnerTabs\(previousContexts\)/u);
+  assert.match(helperBody, /prepareDetailBatchRunnerContext/u);
+  assert.match(helperBody, /registerCaptureTaskTab/u);
+  assert.match(helperBody, /detail_runner_recreated/u);
+
+  const recoveryCallStart = captureSyncSource.indexOf(
+    "const runnerContextInterrupted",
+    helperEnd,
+  );
+  const recoveryCallEnd = captureSyncSource.indexOf(
+    "const terminalTraceState",
+    recoveryCallStart,
+  );
+  const recoveryCallBody = captureSyncSource.slice(
+    recoveryCallStart,
+    recoveryCallEnd,
+  );
+  assert.match(recoveryCallBody, /recreateInterruptedXhsDetailRunners/u);
+  assert.match(recoveryCallBody, /index -= 1;\s*continue;/u);
+});
+
 test("Douyin card identity and detail route are kept consistent", () => {
   assert.match(
     douyinKeywordSearchSource,

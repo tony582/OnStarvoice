@@ -815,12 +815,50 @@ function normalizeOrchestrationExecutionContext(value) {
   const attemptIdentity = String(
     source.attemptIdentity || source.attempt_identity || '',
   ).trim().slice(0, 100);
+  const bootstrapStartAt = Date.parse(
+    String(
+      source.bootstrapStartNotBefore ||
+        source.bootstrap_start_not_before ||
+        '',
+    ),
+  );
+  const bootstrapStartNotBefore = Number.isFinite(bootstrapStartAt)
+    ? new Date(bootstrapStartAt).toISOString()
+    : '';
+  const bootstrapDelayMs = Math.max(
+    0,
+    Math.min(60 * 1000, Math.floor(Number(source.bootstrapDelayMs) || 0)),
+  );
+  const bootstrapStaggerBucket = Math.max(
+    0,
+    Math.min(20, Math.floor(Number(source.bootstrapStaggerBucket) || 0)),
+  );
+  const recentTechnicalFailureCount = Math.max(
+    0,
+    Math.min(100, Math.floor(Number(source.recentTechnicalFailureCount) || 0)),
+  );
+  const recentAffectedAgentCount = Math.max(
+    0,
+    Math.min(100, Math.floor(Number(source.recentAffectedAgentCount) || 0)),
+  );
   return {
     parentTaskId,
     revision: Math.max(0, Math.floor(Number(source.revision) || 0)),
     itemIds,
     ...(distributionMode ? {distributionMode} : {}),
     ...(attemptIdentity ? {attemptIdentity} : {}),
+    ...(bootstrapStartNotBefore ? {bootstrapStartNotBefore} : {}),
+    ...(bootstrapDelayMs ? {bootstrapDelayMs} : {}),
+    ...(bootstrapStartNotBefore
+      ? {
+          bootstrapPacingReason: String(
+            source.bootstrapPacingReason || '',
+          ).trim().slice(0, 80),
+          bootstrapStaggerBucket,
+          recentTechnicalFailureCount,
+          recentAffectedAgentCount,
+        }
+      : {}),
     scheduleId: String(source.scheduleId || '').trim().slice(0, 100),
     scheduledFor: String(source.scheduledFor || '').trim().slice(0, 100),
     sourceExecutionTaskId: String(

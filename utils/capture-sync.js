@@ -531,6 +531,8 @@ const DETAIL_ITEM_DELAY_MAX_MS = 5000;
 const DETAIL_PREFETCH_WORKER_COUNT = 2;
 const DETAIL_PREFETCH_NAV_GAP_MS = 3000;
 const DETAIL_PREFETCH_STOP_TIMEOUT_MS = 1500;
+const DETAIL_RUNNER_RECREATE_MAX_PER_BATCH = 2;
+const DETAIL_RUNNER_RECREATE_MAX_PER_ITEM = 1;
 // 进博主主页前的小随机抖动:打散「笔记页 → 主页」的连续导航(burst 也是风控信号)。
 const PROFILE_NAV_JITTER_MIN_MS = 1200;
 const PROFILE_NAV_JITTER_MAX_MS = 3200;
@@ -3798,6 +3800,8 @@ export async function batchCaptureDetailsForRecords(
   let activeDetailItemContext = null;
   let batchUnexpectedError = null;
   const fatalCancelRequestedTabIds = new Set();
+  const detailRunnerRecoveryAttemptsByRecordId = new Map();
+  let detailRunnerRecoveryCount = 0;
 
   // 先确认本批平台，再决定是否启用双工作页。抖音恢复为已验证稳定的
   // “来源搜索页 + 一个独立详情工作页”串行模式；来源页绝不兼任 worker。
@@ -3838,6 +3842,11 @@ export async function batchCaptureDetailsForRecords(
     }
   }
   const detailBatchContainsDouyin = detailBatchPlatforms.has('douyin');
+  const detailBatchIsXiaohongshu =
+    detailBatchPlatforms.has('xiaohongshu') &&
+    [...detailBatchPlatforms].every(
+      (platform) => !platform || platform === 'xiaohongshu',
+    );
 
   try {
     runnerContext = await prepareDetailBatchRunnerContext({
@@ -4176,7 +4185,124 @@ export async function batchCaptureDetailsForRecords(
       }
     },
   });
+  const plannedDetailWorkerCount = runnerContexts.length;
   detailPrefetchPipeline = createCurrentDetailPrefetchPipeline();
+
+  const recreateInterruptedXhsDetailRunners = async ({
+    recordId = '',
+    current = 0,
+    total = uniqueRecordIds.length,
+  } = {}) => {
+    const normalizedRecordId = String(recordId || '').trim();
+    const itemRecoveryCount = Math.max(
+      0,
+      Number(detailRunnerRecoveryAttemptsByRecordId.get(normalizedRecordId)) ||
+        0,
+    );
+    if (
+      !detailBatchIsXiaohongshu ||
+      !normalizedRecordId ||
+      detailRunnerRecoveryCount >= DETAIL_RUNNER_RECREATE_MAX_PER_BATCH ||
+      itemRecoveryCount >= DETAIL_RUNNER_RECREATE_MAX_PER_ITEM ||
+      shouldStopDetailBatch()
+    ) {
+      return false;
+    }
+
+    const previousContexts = [...runnerContexts];
+    const previousPipeline = detailPrefetchPipeline;
+    await previousPipeline?.stop?.().catch(() => null);
+    try {
+      await closeOwnedDetailRunnerTabs(previousContexts);
+    } catch (error) {
+      console.warn(
+        '[CaptureSync] close interrupted XHS detail workers failed:',
+        error?.message || error,
+      );
+      // 无法确认旧工作页已关闭时不再创建新页，避免并发导航数量失控。
+      return false;
+    }
+
+    const replacementContexts = [];
+    let replacementError = null;
+    for (let index = 0; index < plannedDetailWorkerCount; index += 1) {
+      let replacementContext = null;
+      try {
+        replacementContext = await prepareDetailBatchRunnerContext({
+          sourceTab: activeTab,
+          runnerMode: DETAIL_RUNNER_MODE.DEDICATED_TAB,
+          indexOffset: index + 1,
+        });
+        const registration = await registerCaptureTaskTab({
+          taskId: normalizedCaptureTaskId,
+          tabId: replacementContext.runnerTabId,
+          role: 'detail_worker',
+        });
+        const registrationMissing =
+          Boolean(normalizedCaptureTaskId) &&
+          (registration?.ok !== true || registration?.skipped === true);
+        if (registration?.ok === false || registrationMissing) {
+          const error = new Error(
+            registration?.response?.error?.message ||
+              '重建的详情工作页无法加入当前任务标签组',
+          );
+          error.code = 'TASK_TAB_GROUP_UNAVAILABLE';
+          throw error;
+        }
+        replacementContexts.push(replacementContext);
+      } catch (error) {
+        replacementError = error;
+        if (replacementContext) {
+          await closeOwnedDetailRunnerTab({
+            runnerTabId: replacementContext.runnerTabId,
+            sourceTabId: replacementContext.sourceTabId,
+            ownsRunnerTab: replacementContext.ownsRunnerTab,
+          }).catch(() => false);
+        }
+        if (index > 0 && replacementContexts.length > 0) {
+          doubleBufferFallbackReason =
+            error?.message || '第二个重建工作页不可用，已降级为单工作页';
+        }
+        break;
+      }
+    }
+
+    if (replacementContexts.length === 0) {
+      detailPrefetchPipeline = previousPipeline;
+      // 旧工作页在重建前已经关闭，避免 finally 再次关闭同一批 tab。
+      runnerContexts.splice(0, runnerContexts.length);
+      console.warn(
+        '[CaptureSync] recreate interrupted XHS detail worker failed:',
+        replacementError?.message || replacementError || 'unknown error',
+      );
+      return false;
+    }
+
+    runnerContexts.splice(0, runnerContexts.length, ...replacementContexts);
+    runnerContext = runnerContexts[0];
+    detailRunnerRecoveryCount += 1;
+    detailRunnerRecoveryAttemptsByRecordId.set(
+      normalizedRecordId,
+      itemRecoveryCount + 1,
+    );
+    detailPrefetchPipeline = createCurrentDetailPrefetchPipeline();
+    await reportProgressFailSoft(onProgress, {
+      phase: 'detail_runner_recreated',
+      message: '小红书详情工作页已自动重建，正在重试当前条',
+      recordId: normalizedRecordId,
+      current,
+      total,
+      runnerRecoveryCount: detailRunnerRecoveryCount,
+      runnerRecoveryMax: DETAIL_RUNNER_RECREATE_MAX_PER_BATCH,
+      runnerTabId: runnerContext.runnerTabId,
+      runnerTabIds: runnerContexts.map((context) => context.runnerTabId),
+      workerMode:
+        runnerContexts.length > 1 ? 'double_buffer' : 'single_worker',
+      workerRevision: detailPrefetchPipeline.snapshot().revision,
+      workerStates: detailPrefetchPipeline.snapshot().slots,
+    }, 'detail runner recreated');
+    return true;
+  };
 
   const discardPrefetchForRecord = (recordId) => {
     const normalizedRecordId = String(recordId || '').trim();
@@ -5499,6 +5625,20 @@ export async function batchCaptureDetailsForRecords(
             failure.code === DETAIL_CAPTURE_FAILURE_CODE.CONTEXT_INTERRUPTED,
         );
         if (runnerContextInterrupted) {
+          if (detailWorkerLease) {
+            detailPrefetchPipeline.release(detailWorkerLease);
+            detailWorkerLease = null;
+          }
+          const recovered = await recreateInterruptedXhsDetailRunners({
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+          });
+          if (recovered) {
+            activeDetailItemContext = null;
+            index -= 1;
+            continue;
+          }
           runnerInterrupted = true;
         }
         const terminalTraceState = canceledByUser
@@ -6021,6 +6161,7 @@ export async function batchCaptureDetailsForRecords(
       failedCount,
       filteredCount,
       skippedCount,
+      runnerRecoveryCount: detailRunnerRecoveryCount,
       runnerTabId: runnerContext.runnerTabId,
     }, 'detail batch terminal');
   }
@@ -6036,6 +6177,7 @@ export async function batchCaptureDetailsForRecords(
     canceled,
     runnerInterrupted,
     recoveryRequired: runnerInterrupted,
+    runnerRecoveryCount: detailRunnerRecoveryCount,
     securityBlocked, // 撞平台安全限制 → 主循环据此停整轮无人值守
     integrityBlocked,
     fatal: integrityBlocked,
