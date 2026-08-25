@@ -79,3 +79,18 @@ test("missing Douyin works container reports a retryable capture error", () => {
   assert.match(source, /error\.retryable = true/);
   assert.match(source, /retryable: !isCanceled\(\) && error\?\.retryable === true/);
 });
+
+test("zero Douyin profile cards require a visible explicit empty state", () => {
+  assert.match(source, /PROFILE_SCAN_RESULTS_UNCONFIRMED_EMPTY/);
+  assert.match(
+    source,
+    /allItems\.length === 0[\s\S]*?findExplicitDouyinBloggerEmptyState/u,
+  );
+  const emptyState = getFunctionSource(
+    source,
+    "findExplicitDouyinBloggerEmptyState",
+  );
+  assert.match(emptyState, /暂无作品/);
+  assert.match(emptyState, /isVisibleDouyinBloggerStateNode/);
+  assert.doesNotMatch(emptyState, /document\.body/);
+});

@@ -812,6 +812,35 @@ function normalizeOrchestrationExecutionContext(value) {
         .filter(Boolean),
     ),
   ).slice(0, 30);
+  const itemAttempts = (Array.isArray(source.itemAttempts)
+    ? source.itemAttempts
+    : [])
+    .slice(0, 30)
+    .map((entry) => {
+      const attempt =
+        entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+      return {
+        itemId: String(attempt.itemId || '').trim().slice(0, 100),
+        attemptId: String(
+          attempt.attemptId || attempt.captureTaskItemAttemptId || '',
+        ).trim().slice(0, 100),
+        requestHash: String(
+          attempt.requestHash || attempt.captureTaskItemRequestHash || '',
+        ).trim().slice(0, 100),
+        keyword: String(attempt.keyword || '').trim().slice(0, 120),
+        recordId: String(attempt.recordId || '').trim().slice(0, 100),
+        externalId: String(attempt.externalId || '').trim().slice(0, 160),
+        attemptNumber: Math.max(
+          0,
+          Math.floor(Number(attempt.attemptNumber) || 0),
+        ),
+        assignmentRevision: Math.max(
+          0,
+          Math.floor(Number(attempt.assignmentRevision) || 0),
+        ),
+      };
+    })
+    .filter((attempt) => attempt.itemId && attempt.attemptId);
   const attemptIdentity = String(
     source.attemptIdentity || source.attempt_identity || '',
   ).trim().slice(0, 100);
@@ -845,6 +874,7 @@ function normalizeOrchestrationExecutionContext(value) {
     parentTaskId,
     revision: Math.max(0, Math.floor(Number(source.revision) || 0)),
     itemIds,
+    ...(itemAttempts.length > 0 ? {itemAttempts} : {}),
     ...(distributionMode ? {distributionMode} : {}),
     ...(attemptIdentity ? {attemptIdentity} : {}),
     ...(bootstrapStartNotBefore ? {bootstrapStartNotBefore} : {}),
@@ -1091,6 +1121,34 @@ function parseTimestampMs(value) {
   return Number.isFinite(timestamp) ? timestamp : NaN;
 }
 
+function resolveUnattendedBusinessProgressAt({
+  suppliedAt,
+  currentAt,
+  now,
+  hasProgressSequence = false,
+} = {}) {
+  const nowMs = parseTimestampMs(now);
+  const currentMs = parseTimestampMs(currentAt);
+  const suppliedMs = parseTimestampMs(suppliedAt);
+  if (
+    hasProgressSequence &&
+    Number.isFinite(suppliedMs) &&
+    Number.isFinite(nowMs) &&
+    suppliedMs <= nowMs &&
+    (!Number.isFinite(currentMs) || suppliedMs >= currentMs)
+  ) {
+    return new Date(suppliedMs).toISOString();
+  }
+  if (
+    Number.isFinite(suppliedMs) &&
+    Number.isFinite(currentMs) &&
+    suppliedMs < currentMs
+  ) {
+    return new Date(currentMs).toISOString();
+  }
+  return Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : String(now || '');
+}
+
 const UNATTENDED_PROGRESS_VOLATILE_FIELDS = new Set([
   'businessProgressAt',
   'elapsedMs',
@@ -1120,24 +1178,36 @@ function buildUnattendedBusinessProgressFingerprint(value) {
   return JSON.stringify(normalize(value));
 }
 
+const UNATTENDED_SETTLED_CHECKPOINT_STATUSES = new Set([
+  'completed',
+  'failed',
+  'partial',
+  'skipped',
+]);
+
 function buildUnattendedRecoveryMilestoneFingerprint(checkpoint) {
   const source =
     checkpoint && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
       ? checkpoint
       : {};
   const keywordResults = Array.isArray(source.keywordResults)
-    ? source.keywordResults.map((entry) => ({
-        round: Math.max(1, Number(entry?.round) || 1),
-        index: Math.max(0, Number(entry?.index) || 0),
-        keyword: String(entry?.keyword || ''),
-        status: String(entry?.status || ''),
-        attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
-        savedCount: Math.max(0, Number(entry?.savedCount) || 0),
-        error: String(entry?.error || ''),
-        errorCode: String(entry?.errorCode || ''),
-        securityBlocked: entry?.securityBlocked === true,
-        requiresManualAction: entry?.requiresManualAction === true,
-      }))
+    ? source.keywordResults
+        .filter((entry) =>
+          UNATTENDED_SETTLED_CHECKPOINT_STATUSES.has(
+            String(entry?.status || '').trim().toLowerCase(),
+          ),
+        )
+        .map((entry) => ({
+          round: Math.max(1, Number(entry?.round) || 1),
+          index: Math.max(0, Number(entry?.index) || 0),
+          keyword: String(entry?.keyword || ''),
+          status: String(entry?.status || '').trim().toLowerCase(),
+          savedCount: Math.max(0, Number(entry?.savedCount) || 0),
+          noResults: entry?.noResults === true,
+          resultKind: String(entry?.resultKind || ''),
+          candidateCount: Math.max(0, Number(entry?.candidateCount) || 0),
+          scanComplete: entry?.scanComplete === true,
+        }))
     : [];
   const normalizeKeywords = (value) =>
     Array.isArray(value)
@@ -1150,6 +1220,215 @@ function buildUnattendedRecoveryMilestoneFingerprint(checkpoint) {
     failedKeywords: normalizeKeywords(source.failedKeywords),
     skippedKeywords: normalizeKeywords(source.skippedKeywords),
   });
+}
+
+function normalizeUnattendedCheckpointRound(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function normalizeUnattendedCheckpointIndex(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function buildUnattendedCheckpointResultKey(entry) {
+  const round = normalizeUnattendedCheckpointRound(entry?.round);
+  const keyword = String(entry?.keyword || '').trim();
+  return keyword
+    ? `${round}:keyword:${keyword}`
+    : `${round}:index:${normalizeUnattendedCheckpointIndex(entry?.index)}`;
+}
+
+function collectUnattendedCheckpointResultKeys(checkpoint) {
+  return new Set(
+    (Array.isArray(checkpoint?.keywordResults)
+      ? checkpoint.keywordResults
+      : []
+    ).map((entry) => buildUnattendedCheckpointResultKey(entry)),
+  );
+}
+
+function normalizeUnattendedCheckpointResultStatus(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isUnattendedCheckpointResultStatusRegression(currentStatus, nextStatus) {
+  const current = normalizeUnattendedCheckpointResultStatus(currentStatus);
+  const next = normalizeUnattendedCheckpointResultStatus(nextStatus);
+  if (current === next) return false;
+  if (!current) return false;
+  const monotonicTransitions = {
+    retrying: new Set(['partial', 'failed', 'completed']),
+    partial: new Set(['failed', 'completed']),
+    failed: new Set(['completed']),
+  };
+  return !monotonicTransitions[current]?.has(next);
+}
+
+function isUnattendedCheckpointResultRegression(nextEntry, currentEntry) {
+  if (
+    isUnattendedCheckpointResultStatusRegression(
+      currentEntry?.status,
+      nextEntry?.status,
+    )
+  ) {
+    return true;
+  }
+  for (const field of ['index', 'attemptCount', 'savedCount']) {
+    if (
+      normalizeUnattendedCheckpointIndex(nextEntry?.[field]) <
+      normalizeUnattendedCheckpointIndex(currentEntry?.[field])
+    ) {
+      return true;
+    }
+  }
+  for (const field of [
+    'noResults',
+    'securityBlocked',
+    'platformSafetyBlocked',
+    'requiresManualAction',
+  ]) {
+    if (currentEntry?.[field] === true && nextEntry?.[field] !== true) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildUnattendedCheckpointResultMap(checkpoint) {
+  return new Map(
+    (Array.isArray(checkpoint?.keywordResults)
+      ? checkpoint.keywordResults
+      : []
+    ).map((entry) => [buildUnattendedCheckpointResultKey(entry), entry]),
+  );
+}
+
+function collectUnattendedSettledCheckpointKeywords(checkpoint) {
+  const keywords = new Set();
+  for (const field of [
+    'completedKeywords',
+    'failedKeywords',
+    'skippedKeywords',
+  ]) {
+    for (const value of Array.isArray(checkpoint?.[field])
+      ? checkpoint[field]
+      : []) {
+      const keyword = String(value || '').trim();
+      if (keyword) keywords.add(keyword);
+    }
+  }
+  for (const entry of Array.isArray(checkpoint?.keywordResults)
+    ? checkpoint.keywordResults
+    : []) {
+    const keyword = String(entry?.keyword || '').trim();
+    const status = String(entry?.status || '').trim();
+    if (keyword && UNATTENDED_SETTLED_CHECKPOINT_STATUSES.has(status)) {
+      keywords.add(keyword);
+    }
+  }
+  return keywords;
+}
+
+function collectUnattendedCheckpointSettlementStatuses(checkpoint) {
+  const statuses = new Map();
+  const add = (keywordValue, statusValue) => {
+    const keyword = String(keywordValue || '').trim();
+    const status = normalizeUnattendedCheckpointResultStatus(statusValue);
+    if (!keyword || !status) return;
+    const current = statuses.get(keyword) || new Set();
+    current.add(status);
+    statuses.set(keyword, current);
+  };
+  for (const [field, status] of [
+    ['completedKeywords', 'completed'],
+    ['failedKeywords', 'failed'],
+    ['skippedKeywords', 'skipped'],
+  ]) {
+    for (const keyword of Array.isArray(checkpoint?.[field])
+      ? checkpoint[field]
+      : []) {
+      add(keyword, status);
+    }
+  }
+  for (const entry of Array.isArray(checkpoint?.keywordResults)
+    ? checkpoint.keywordResults
+    : []) {
+    if (
+      UNATTENDED_SETTLED_CHECKPOINT_STATUSES.has(
+        normalizeUnattendedCheckpointResultStatus(entry?.status),
+      )
+    ) {
+      add(entry?.keyword, entry?.status);
+    }
+  }
+  return statuses;
+}
+
+function isUnattendedCheckpointSettlementRegression(
+  nextCheckpoint,
+  currentCheckpoint,
+) {
+  const nextStatuses = collectUnattendedCheckpointSettlementStatuses(
+    nextCheckpoint,
+  );
+  for (const [keyword, currentStatuses] of
+    collectUnattendedCheckpointSettlementStatuses(currentCheckpoint)) {
+    const available = nextStatuses.get(keyword) || new Set();
+    for (const status of currentStatuses) {
+      const preserved = available.has(status);
+      const upgraded =
+        (status === 'failed' && available.has('completed')) ||
+        (status === 'partial' &&
+          (available.has('failed') || available.has('completed')));
+      if (!preserved && !upgraded) return true;
+    }
+  }
+  return false;
+}
+
+function isLegacyUnattendedCheckpointRegression(nextCheckpoint, currentCheckpoint) {
+  const nextRound = normalizeUnattendedCheckpointRound(nextCheckpoint?.round);
+  const currentRound = normalizeUnattendedCheckpointRound(
+    currentCheckpoint?.round,
+  );
+  if (nextRound < currentRound) return true;
+  if (nextRound === currentRound) {
+    for (const field of ['keywordIndex', 'activeKeywordIndex']) {
+      if (
+        normalizeUnattendedCheckpointIndex(nextCheckpoint?.[field]) <
+        normalizeUnattendedCheckpointIndex(currentCheckpoint?.[field])
+      ) {
+        return true;
+      }
+    }
+  }
+
+  const nextSettledKeywords = collectUnattendedSettledCheckpointKeywords(
+    nextCheckpoint,
+  );
+  for (const keyword of collectUnattendedSettledCheckpointKeywords(
+    currentCheckpoint,
+  )) {
+    if (!nextSettledKeywords.has(keyword)) return true;
+  }
+  if (
+    isUnattendedCheckpointSettlementRegression(nextCheckpoint, currentCheckpoint)
+  ) {
+    return true;
+  }
+
+  const nextResults = buildUnattendedCheckpointResultMap(nextCheckpoint);
+  for (const [resultKey, currentEntry] of
+    buildUnattendedCheckpointResultMap(currentCheckpoint)) {
+    const nextEntry = nextResults.get(resultKey);
+    if (!nextEntry) return true;
+    if (isUnattendedCheckpointResultRegression(nextEntry, currentEntry)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function getUnattendedTaskCenterCore() {
@@ -1216,6 +1495,10 @@ function buildTaskCenterCheckpointFromUnattendedRequest(request) {
       status: String(entry?.status || '').trim(),
       attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
       savedCount: Math.max(0, Number(entry?.savedCount) || 0),
+      noResults: entry?.noResults === true,
+      resultKind: String(entry?.resultKind || '').trim(),
+      candidateCount: Math.max(0, Number(entry?.candidateCount) || 0),
+      scanComplete: entry?.scanComplete === true,
       error: String(entry?.error || '').trim(),
       errorCode: String(entry?.errorCode || '').trim(),
       errorCategory: String(entry?.errorCategory || '').trim(),
@@ -2632,7 +2915,12 @@ function buildTargetedPostTaskCenterRun(request, existingRun = null) {
     updatedAt,
     finishedAt: terminal ? String(request.finishedAt || updatedAt) : '',
     heartbeatAt: String(request.heartbeatAt || updatedAt),
-    businessProgressAt: String(progress.updatedAt || updatedAt),
+    businessProgressAt: String(
+      request.businessProgressAt ||
+        request.startedAt ||
+        request.createdAt ||
+        updatedAt,
+    ),
     message:
       String(progress.message || request.message || '').trim() ||
       (request.cancelRequested === true ? '正在停止定向巡查任务' : ''),
@@ -5506,15 +5794,80 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
     if (!request || !requestId || request.id !== requestId) {
       return {accepted: false, reason: 'not_found', data: null};
     }
+    const safePatch =
+      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+    const hasCheckpoint =
+      safePatch.checkpoint &&
+      typeof safePatch.checkpoint === 'object' &&
+      !Array.isArray(safePatch.checkpoint);
     if (!attemptId || request.attemptId !== attemptId) {
+      const previousAttemptCheckpointHandoff = Boolean(
+        hasCheckpoint &&
+          String(request.previousAttemptId || '') === String(attemptId || '') &&
+          !isTerminalUnattendedRunStatus(request.status) &&
+          buildUnattendedBusinessProgressFingerprint(safePatch.checkpoint) !==
+            buildUnattendedBusinessProgressFingerprint(
+              request.checkpoint || null,
+            ) &&
+          !isLegacyUnattendedCheckpointRegression(
+            safePatch.checkpoint,
+            request.checkpoint,
+          ),
+      );
+      if (previousAttemptCheckpointHandoff) {
+        const now = new Date().toISOString();
+        const milestoneAdvanced =
+          buildUnattendedRecoveryMilestoneFingerprint(safePatch.checkpoint) !==
+          buildUnattendedRecoveryMilestoneFingerprint(
+            request.checkpoint || null,
+          );
+        const nextRequest = {
+          ...request,
+          checkpoint: safePatch.checkpoint,
+          ...(safePatch.counts && typeof safePatch.counts === 'object'
+            ? {counts: safePatch.counts}
+            : {}),
+          ...(safePatch.summary && typeof safePatch.summary === 'object'
+            ? {summary: safePatch.summary}
+            : {}),
+          progressSeq: Math.max(
+            Math.max(0, Number(request.progressSeq) || 0) + 1,
+            Math.max(0, Number(safePatch.progressSeq) || 0),
+          ),
+          businessProgressAt: resolveUnattendedBusinessProgressAt({
+            suppliedAt: safePatch.businessProgressAt,
+            currentAt: request.businessProgressAt,
+            now,
+            hasProgressSequence: true,
+          }),
+          recoveryCount: milestoneAdvanced
+            ? 0
+            : Math.max(0, Number(request.recoveryCount) || 0),
+          recoveryLaunchFailures: milestoneAdvanced
+            ? 0
+            : Math.max(0, Number(request.recoveryLaunchFailures) || 0),
+          updatedAt: now,
+        };
+        await persistUnattendedRunMutation(nextRequest, {
+          previousRequest: request,
+          event: {
+            type: 'previous_attempt_checkpoint_handoff',
+            message: '已合并上一执行 attempt 尚未落盘的关键词检查点',
+            at: now,
+          },
+        });
+        return {
+          accepted: true,
+          reason: 'checkpoint_handoff',
+          data: nextRequest,
+        };
+      }
       return {accepted: false, reason: 'attempt_mismatch', data: request};
     }
     if (isTerminalUnattendedRunStatus(request.status)) {
       return {accepted: false, reason: 'terminal', data: request};
     }
 
-    const safePatch =
-      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
     const allowedPatchFields = [
       'status',
       'message',
@@ -5539,10 +5892,6 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       safePatch.progress &&
       typeof safePatch.progress === 'object' &&
       !Array.isArray(safePatch.progress);
-    const hasCheckpoint =
-      safePatch.checkpoint &&
-      typeof safePatch.checkpoint === 'object' &&
-      !Array.isArray(safePatch.checkpoint);
     // 恢复后的 runner 会先重放已保存的 progress/checkpoint。语义变化可
     // 刷新业务时钟，但只有关键词结算等持久检查点里程碑才能归还“连续恢复”
     // 预算；仅阶段切换、时间戳变化、心跳或同一检查点重试均不能清零预算。
@@ -5560,17 +5909,38 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       buildUnattendedRecoveryMilestoneFingerprint(safePatch.checkpoint) !==
         buildUnattendedRecoveryMilestoneFingerprint(request.checkpoint || null);
     let nextProgressSeq = request.progressSeq;
-    if (hasProgress) {
+    if (hasProgress || hasCheckpoint) {
       const suppliedProgressSeq = Number(safePatch.progressSeq);
-      if (
+      const staleSequence =
         Number.isFinite(suppliedProgressSeq) &&
-        suppliedProgressSeq <= request.progressSeq
+        suppliedProgressSeq <= request.progressSeq;
+      const monotonicCheckpointHandoff = Boolean(
+        staleSequence &&
+          hasCheckpoint &&
+          checkpointAdvanced &&
+          !isLegacyUnattendedCheckpointRegression(
+            safePatch.checkpoint,
+            request.checkpoint,
+          ),
+      );
+      if (
+        (staleSequence && !monotonicCheckpointHandoff) ||
+        (!Number.isFinite(suppliedProgressSeq) &&
+          hasCheckpoint &&
+          isLegacyUnattendedCheckpointRegression(
+            safePatch.checkpoint,
+            request.checkpoint,
+          ))
       ) {
         return {accepted: false, reason: 'stale_progress', data: request};
       }
-      nextProgressSeq = Number.isFinite(suppliedProgressSeq)
-        ? Math.floor(suppliedProgressSeq)
-        : request.progressSeq + 1;
+      nextProgressSeq = monotonicCheckpointHandoff
+        ? Math.max(0, Number(request.progressSeq) || 0) + 1
+        : Number.isFinite(suppliedProgressSeq)
+          ? Math.floor(suppliedProgressSeq)
+        : hasProgress
+          ? request.progressSeq + 1
+          : request.progressSeq;
     }
 
     const requestedStatus = String(safePatch.status || '').trim();
@@ -5611,7 +5981,14 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       progress: normalizedProgress,
       status: nextStatus,
       heartbeatAt: safePatch.heartbeatAt ? now : request.heartbeatAt,
-      businessProgressAt: hasBusinessProgress ? now : request.businessProgressAt,
+      businessProgressAt: hasBusinessProgress
+        ? resolveUnattendedBusinessProgressAt({
+            suppliedAt: safePatch.businessProgressAt,
+            currentAt: request.businessProgressAt,
+            now,
+            hasProgressSequence: Number.isFinite(Number(safePatch.progressSeq)),
+          })
+        : request.businessProgressAt,
       recoveryCount: recoveryMilestoneAdvanced
         ? 0
         : Math.max(0, Number(request.recoveryCount) || 0),
@@ -6385,6 +6762,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
     const message = `${reasonText}，第 ${nextRecoveryCount}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次自动恢复将在倒计时结束后开始`;
     const nextRequest = {
       ...current,
+      previousAttemptId: current.attemptId,
       attemptId: createUuid(),
       attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
       progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,

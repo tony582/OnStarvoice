@@ -9,6 +9,13 @@ import {
 } from '../db/init.js';
 import {createDrainController} from '../runtime/drain-controller.js';
 import {
+  CAPTURE_RECOVERY_AGENT_SLOT_SOURCE_TYPE,
+  CAPTURE_RECOVERY_BACKFILL_SOURCE_TYPE,
+  CAPTURE_RECOVERY_SCOPE_STOP_SOURCE_TYPE,
+  enqueueCaptureRecoveryBackfillsForEnabledTenants,
+  processCaptureRecoveryWakeups,
+} from './capture-recovery-intents.js';
+import {
   normalizeOpsControlSettings,
   resolveOpsControlActionsGlobalEnabled,
   resolveOpsControlGlobalEnabled,
@@ -242,6 +249,7 @@ async function observeWakeupTenant({
   wakeups,
   now,
   env,
+  forceObserveOnly = false,
   getSettings = getAllSettings,
   observeTenant = runOpsControlTenantObservation,
 } = {}) {
@@ -257,8 +265,9 @@ async function observeWakeupTenant({
     settings: policy,
     now,
     eventWake: buildOpsControlEventWake(wakeups),
+    forceObserveOnly,
   });
-  return {result, policy};
+  return {result, policy: result?.policy || policy};
 }
 
 export async function processOpsControlWakeupBatch({
@@ -268,6 +277,7 @@ export async function processOpsControlWakeupBatch({
   completeWakeups = completeOpsControlWakeups,
   retryWakeups = retryOpsControlWakeups,
   enqueueWakeup = enqueueOpsControlWakeup,
+  processRecoveryWakeups = processCaptureRecoveryWakeups,
   observeTenant = observeWakeupTenant,
   cleanupWakeups = cleanupProcessedOpsControlWakeups,
 } = {}) {
@@ -290,16 +300,44 @@ export async function processOpsControlWakeupBatch({
   let followups = 0;
   for (const [tenantId, tenantWakeups] of byTenant) {
     try {
+      const hasRecoveryWakeup = tenantWakeups.some(row => [
+        'capture_task_item',
+        'capture_recovery_intent',
+        CAPTURE_RECOVERY_AGENT_SLOT_SOURCE_TYPE,
+        CAPTURE_RECOVERY_BACKFILL_SOURCE_TYPE,
+        CAPTURE_RECOVERY_SCOPE_STOP_SOURCE_TYPE,
+      ].includes(text(row.source_type, 80)));
+      const recovery = hasRecoveryWakeup
+        ? await processRecoveryWakeups({
+            tenantId,
+            wakeups: tenantWakeups,
+            now: new Date(now),
+            env,
+            enqueueWakeup,
+          })
+        : {kind: 'not_applicable', actionsExecuted: 0};
       const outcome = await observeTenant({
         tenantId,
         wakeups: tenantWakeups,
         now: new Date(now),
         env,
+        // Recovery owns its exact-item guarded action path. The ordinary
+        // OpsControl observer stays read-only for the same batch so one event
+        // cannot also enter its broader legacy action allowlist.
+        forceObserveOnly: hasRecoveryWakeup,
       });
       const result = outcome?.result || outcome;
       const policy = outcome?.policy || null;
       if (result?.kind === 'observed') observed += 1;
-      if (shouldScheduleOpsControlFollowup(result) && policy) {
+      // Recovery wakeups are item-scoped and own their durable verification
+      // schedule. Turning their read-only broad observation into a plain
+      // ops_control_run followup would lose forceObserveOnly on the next batch
+      // and could enter the legacy guarded action allowlist.
+      if (
+        !hasRecoveryWakeup
+        && shouldScheduleOpsControlFollowup(result)
+        && policy
+      ) {
         const delaySeconds = Math.max(25, integer(policy.snapshotGapSeconds, 25));
         await enqueueWakeup({
           tenantId,
@@ -322,7 +360,12 @@ export async function processOpsControlWakeupBatch({
         claimToken: claimed.claimToken,
         now,
       });
-      results.push({tenantId, kind: result?.kind || 'unknown', result});
+      results.push({
+        tenantId,
+        kind: result?.kind || 'unknown',
+        result,
+        recovery,
+      });
     } catch (error) {
       failed += 1;
       await retryWakeups({
@@ -481,6 +524,7 @@ export function startOpsControlWakeupRuntime({
   processBatch = processOpsControlWakeupBatch,
   getNextWakeupAt = getNextOpsControlWakeupAt,
   recordState = recordOpsControlWakeupWorkerState,
+  enqueueRecoveryBackfills = enqueueCaptureRecoveryBackfillsForEnabledTenants,
   createDrain = createDrainController,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
@@ -501,6 +545,8 @@ export function startOpsControlWakeupRuntime({
   let stopPromise = null;
   let connectedAt = null;
   let lastNotificationAt = null;
+  let startupRecoveryBackfillComplete = false;
+  let startupRecoveryBackfillResult = null;
 
   function writeState(input) {
     const pending = Promise.resolve(recordState({...input, env}))
@@ -665,20 +711,38 @@ export function startOpsControlWakeupRuntime({
         void handleListenerFailure(error);
       },
     })).then(async opened => {
-      if (!accepting) {
-        await opened.close();
-        return null;
+      try {
+        if (!startupRecoveryBackfillComplete) {
+          startupRecoveryBackfillResult = await enqueueRecoveryBackfills({
+            env,
+            enqueueWakeup: enqueueOpsControlWakeup,
+            now: now(),
+          });
+          startupRecoveryBackfillComplete = true;
+        }
+        if (!accepting) {
+          await opened.close();
+          return null;
+        }
+        listener = opened;
+        connectedAt = now().toISOString();
+        await writeState({
+          status: 'healthy',
+          now: now(),
+          details: {
+            connected: true,
+            connectedAt,
+            channel: OPS_CONTROL_WAKEUP_CHANNEL,
+            recoveryBackfill: startupRecoveryBackfillResult,
+          },
+        });
+        requestDrainAt(now());
+        scheduleHeartbeat();
+        return opened;
+      } catch (error) {
+        try { await opened.close(); } catch {}
+        throw error;
       }
-      listener = opened;
-      connectedAt = now().toISOString();
-      await writeState({
-        status: 'healthy',
-        now: now(),
-        details: {connected: true, connectedAt, channel: OPS_CONTROL_WAKEUP_CHANNEL},
-      });
-      requestDrainAt(now());
-      scheduleHeartbeat();
-      return opened;
     }).catch(async error => {
       safeLog(logger, 'error', `[OpsControlWakeup] listener connect failed: ${error?.message || error}`);
       await writeState({

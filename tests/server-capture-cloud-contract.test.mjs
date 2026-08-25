@@ -6,11 +6,14 @@ import vm from "node:vm";
 
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  bindCloudTaskSnapshotHealthToAttempt,
   captureAgentOnline,
+  cloudTaskAttemptIdentityAcceptsSnapshot,
   findCaptureAgentExecutionSlotBlocker,
   isCloudTaskActive,
   isCloudTaskTerminal,
   lockCaptureAgentExecutionSlot,
+  tryLockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeCloudTaskSnapshot,
   normalizeCloudTaskStatus,
@@ -28,6 +31,7 @@ import {
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
+  dispatchCrossDeviceRetry,
   elasticAttemptBudgetAfterOutcome,
   projectElasticAttemptBudget,
   projectElasticBootstrapPacing,
@@ -35,6 +39,7 @@ import {
   isProfilePatrolTask,
   isExplicitUserCancellationSnapshot,
   lockActiveCaptureAgentSession,
+  mirrorTaskSnapshot,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
@@ -226,6 +231,43 @@ test("recovery grading keeps captcha current and automates technical or unstarte
     attempt_count: 3,
     error: {code: "TAB_NOT_FOUND"},
   }), {kind: "automatic_attempts_exhausted", automatic: false});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 9,
+    error: {code: "TAB_NOT_FOUND"},
+  }, {phase: "duty"}), {kind: "auto_retry_or_handoff", automatic: true});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 9,
+    error: {code: "IDENTITY_MISMATCH"},
+  }, {phase: "duty"}), {kind: "terminal_business_failure", automatic: false});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 9,
+    error: {code: "USER_CANCELLED"},
+  }, {phase: "duty"}), {kind: "terminal_business_failure", automatic: false});
+});
+
+test("duty cross-device retry fails closed before opening a transaction", async () => {
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    recoveryPhase: "duty",
+    automatic: true,
+    requestKey: "11111111-1111-4111-8111-111111111111",
+    dutyRecoveryIntentId: "11111111-1111-4111-8111-111111111111",
+    dutyRecoveryGeneration: 1,
+    itemIds: [
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ],
+    expectedItemRevision: 1,
+    expectedAttemptNumber: 3,
+  }), {error: "invalid_duty_recovery_request"});
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    itemIds: ["not-a-uuid"],
+  }), {error: "invalid_retry_item_scope"});
 });
 
 test("only explicit operator cancellation is terminal", () => {
@@ -511,6 +553,37 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
     platform: "douyin",
   }), true);
   assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }, {
+    dutyRecovery: {intentId: "11111111-1111-4111-8111-111111111111"},
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      remoteStop: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }, {
+    dutyRecovery: {intentId: "11111111-1111-4111-8111-111111111111"},
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      remoteStop: true,
+      dutyRecoveryLineageV1: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }, {
+    dutyRecovery: {intentId: "11111111-1111-4111-8111-111111111111"},
+  }), true);
+  assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
     task_type: "negative_post_patrol",
     platform: "douyin",
   }), false);
@@ -602,6 +675,333 @@ test("cloud task snapshots normalize local ledger aliases and timestamps", () =>
     normalizeCloudTaskSnapshot({id: "historical-task", status: "failed"}).controlTaskId,
     "",
   );
+});
+
+test("cloud task snapshots preserve bounded structured health without browser secrets", () => {
+  const snapshot = normalizeCloudTaskSnapshot({
+    id: "local-task-health-1",
+    type: "unattended_keyword_plan",
+    platform: "douyin",
+    status: "running",
+    attemptId: "attempt-health-1",
+    attemptNumber: 3,
+    appVersion: "0.3.93",
+    stage: "DETAIL_CAPTURE",
+    phase: "COMMENTS",
+    progressObserved: {
+      observed: true,
+      sequence: 999999999,
+      current: 4,
+      total: 12,
+      observedAt: "2026-08-25T01:50:00.000Z",
+      ageMs: 999999999,
+      url: "https://www.douyin.com/search/private",
+      cookie: "session=secret",
+    },
+    healthEvidence: {
+      version: 99,
+      sampledAt: "2026-08-25T01:50:01.000Z",
+      page: {
+        platform: "douyin",
+        pageType: "note_detail",
+        platformMatchesTask: true,
+        detailReady: false,
+        detailReadyReason: "dom_not_ready",
+        tabStatus: "complete",
+        discarded: false,
+        frozen: true,
+        url: "https://www.douyin.com/video/private",
+        title: "private title",
+      },
+      network: {
+        available: true,
+        status: "success",
+        lastRequestLatencyMs: 999999999,
+        lastRequestAt: "2026-08-25T01:50:02.000Z",
+        endpointClass: "heartbeat",
+        timeoutCount: 999999999,
+        url: "https://api.example.test/private",
+        authorization: "Bearer secret",
+      },
+      runtime: {
+        sampledAt: "2026-08-25T01:50:03.000Z",
+        stateAgeMs: 999999999,
+        captureProgressAgeMs: 999999999,
+        cpuAvailable: false,
+        eventLoopAvailable: true,
+        eventLoopSampleCount: 99,
+        eventLoopLagMs: 999999999,
+        heapAvailable: true,
+        heapUsedMb: 999999999,
+        heapTotalMb: 999999999,
+        heapLimitMb: 999999999,
+        serviceWorkerAgeMs: 999999999,
+        serviceWorkerRestartCount: 999999999,
+        body: "private post body",
+      },
+    },
+    metadata: {
+      structuredTaskHealth: {
+        appVersion: "attacker-controlled",
+        healthEvidence: {url: "https://evil.example/private"},
+      },
+    },
+  });
+
+  assert.equal(snapshot.appVersion, "0.3.93");
+  assert.equal(snapshot.stage, "detail_capture");
+  assert.equal(snapshot.phase, "comments");
+  assert.deepEqual(snapshot.progressObserved, {
+    observed: true,
+    sequence: 1000000,
+    current: 4,
+    total: 12,
+    observedAt: "2026-08-25T01:50:00.000Z",
+    ageMs: 7 * 24 * 60 * 60 * 1000,
+  });
+  assert.equal(snapshot.healthEvidence.version, 10);
+  assert.equal(snapshot.healthEvidence.page.tabStatus, "complete");
+  assert.equal(snapshot.healthEvidence.network.lastRequestLatencyMs, 120000);
+  assert.equal(snapshot.healthEvidence.network.timeoutCount, 1000000);
+  assert.equal(snapshot.healthEvidence.runtime.eventLoopSampleCount, 10);
+  assert.equal(snapshot.healthEvidence.runtime.eventLoopLagMs, 120000);
+  assert.equal(snapshot.healthEvidence.runtime.heapUsedMb, 1024 * 1024);
+  assert.equal(
+    snapshot.healthEvidence.runtime.serviceWorkerAgeMs,
+    7 * 24 * 60 * 60 * 1000,
+  );
+  assert.deepEqual(
+    snapshot.metadata.structuredTaskHealth,
+    snapshot.structuredTaskHealth,
+    "task metadata must use the authoritative top-level health snapshot",
+  );
+
+  const serialized = JSON.stringify(snapshot.structuredTaskHealth);
+  assert.ok(Buffer.byteLength(serialized, "utf8") < 4096);
+  assert.doesNotMatch(
+    serialized,
+    /https?:\/\/|cookie|authorization|bearer|private title|private post body|attacker-controlled/iu,
+  );
+
+  const rejectedVersion = normalizeCloudTaskSnapshot({
+    id: "local-task-health-bad-version",
+    appVersion: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.signature123",
+    stage: "apiKeyProdABC123",
+    phase: "aB3dE5fG7hJ9kL1mN3pR5tV7xZ9cD2fH",
+    healthEvidence: {
+      page: {
+        platform: "private/path",
+        pageType: "https://collector.example/private",
+        detailReadyReason: "password_prod_ABC123",
+      },
+      network: {
+        status: "secret_prod_ABC123",
+        endpointClass: "0123456789abcdef0123456789abcdef01234567",
+      },
+    },
+  });
+  assert.equal(rejectedVersion.appVersion, "");
+  assert.equal(rejectedVersion.stage, "unknown");
+  assert.equal(rejectedVersion.phase, "unknown");
+  assert.equal(rejectedVersion.healthEvidence.page.platform, "unknown");
+  assert.equal(rejectedVersion.healthEvidence.page.pageType, "unknown");
+  assert.equal(rejectedVersion.healthEvidence.page.detailReadyReason, "");
+  assert.equal(rejectedVersion.healthEvidence.network.status, "unavailable");
+  assert.equal(rejectedVersion.healthEvidence.network.endpointClass, "");
+  assert.equal(
+    rejectedVersion.healthEvidence.network.lastRequestLatencyMs,
+    null,
+  );
+  assert.equal(rejectedVersion.healthEvidence.runtime.eventLoopLagMs, null);
+  assert.doesNotMatch(
+    JSON.stringify(rejectedVersion.structuredTaskHealth),
+    /collector\.example|private\/path|eyJhbGci|apiKeyProd|aB3dE5fG|password_prod|secret_prod|0123456789abcdef/iu,
+  );
+
+  const identityShapedHealth = normalizeCloudTaskSnapshot({
+    id: "local-task-health-identity-shaped",
+    attemptId: "attempt-health-identity-shaped",
+    stage: "AKIAIOSFODNN7EXAMPLE",
+    phase: "prod-db.internal",
+    healthEvidence: {
+      page: {
+        platform: "192.168.1.7",
+        pageType: "customer_13800138000",
+        detailReadyReason: "AKIAIOSFODNN7EXAMPLE",
+        tabStatus: "prod-db.internal",
+      },
+      network: {
+        status: "customer_13800138000",
+        endpointClass: "prod-db.internal",
+      },
+    },
+  });
+  assert.equal(identityShapedHealth.stage, "unknown");
+  assert.equal(identityShapedHealth.phase, "unknown");
+  assert.equal(identityShapedHealth.healthEvidence.page.platform, "unknown");
+  assert.equal(identityShapedHealth.healthEvidence.page.pageType, "unknown");
+  assert.equal(identityShapedHealth.healthEvidence.page.detailReadyReason, "");
+  assert.equal(
+    identityShapedHealth.healthEvidence.page.tabStatus,
+    "unavailable",
+  );
+  assert.equal(
+    identityShapedHealth.healthEvidence.network.status,
+    "unavailable",
+  );
+  assert.equal(identityShapedHealth.healthEvidence.network.endpointClass, "");
+  assert.doesNotMatch(
+    JSON.stringify(identityShapedHealth.structuredTaskHealth),
+    /AKIAIOSFODNN7EXAMPLE|prod-db\.internal|192\.168\.1\.7|13800138000/iu,
+  );
+});
+
+test("legacy reports without an attempt id cannot bind or persist structured health", () => {
+  const normalized = normalizeCloudTaskSnapshot({
+    id: "legacy-unbound-health",
+    attemptNumber: 3,
+    progressSeq: 99,
+    appVersion: "0.3.93",
+    stage: "detail_capture",
+    phase: "comments",
+    progressObserved: {observed: true, current: 4, total: 12},
+    healthEvidence: {
+      page: {platform: "douyin", pageType: "note_detail"},
+      network: {available: true, status: "success"},
+    },
+  });
+
+  assert.ok(normalized.metadata.structuredTaskHealth);
+  const persisted = bindCloudTaskSnapshotHealthToAttempt(normalized);
+  assert.equal(persisted.attemptId, "");
+  assert.equal(persisted.appVersion, "");
+  assert.equal(persisted.stage, "unknown");
+  assert.equal(persisted.phase, "unknown");
+  assert.deepEqual(persisted.progressObserved, {});
+  assert.deepEqual(persisted.healthEvidence, {});
+  assert.deepEqual(persisted.structuredTaskHealth, {});
+  assert.equal(
+    Object.hasOwn(persisted.metadata, "structuredTaskHealth"),
+    false,
+  );
+  assert.ok(
+    normalized.metadata.structuredTaskHealth,
+    "binding must not mutate the normalized report used by other consumers",
+  );
+});
+
+test("health metadata aliases cannot bypass authoritative attempt-scoped health", () => {
+  const aliases = {
+    structuredTaskHealth: {stage: "comments"},
+    structured_task_health: {stage: "comments"},
+    agentPlanAudit: {stage: "comments"},
+    agent_plan_audit: {stage: "comments"},
+    healthEvidence: {network: {status: "success"}},
+    health_evidence: {network: {status: "success"}},
+    runtimeHealth: {eventLoopLagMs: 1},
+    runtime_health: {eventLoopLagMs: 1},
+    appVersion: "0.3.93",
+    app_version: "0.3.93",
+    stage: "comments",
+    phase: "comments",
+    progressObserved: {observed: true},
+    progress_observed: {observed: true},
+  };
+  const aliasKeys = Object.keys(aliases);
+  const normalized = normalizeCloudTaskSnapshot({
+    id: "attempt-bound-alias-health",
+    attemptId: "attempt-alias-A",
+    metadata: aliases,
+    appVersion: "0.3.93",
+    stage: "detail_capture",
+    healthEvidence: {network: {available: true, status: "success"}},
+  });
+
+  assert.equal(normalized.metadata.structuredTaskHealth.appVersion, "0.3.93");
+  assert.equal(normalized.metadata.structuredTaskHealth.stage, "detail_capture");
+  for (const key of aliasKeys) {
+    if (key === "structuredTaskHealth") continue;
+    assert.equal(Object.hasOwn(normalized.metadata, key), false, key);
+  }
+
+  const unbound = bindCloudTaskSnapshotHealthToAttempt({
+    ...normalized,
+    attemptId: "",
+    metadata: aliases,
+  });
+  for (const key of aliasKeys) {
+    assert.equal(Object.hasOwn(unbound.metadata, key), false, key);
+  }
+  assert.deepEqual(unbound.structuredTaskHealth, {});
+});
+
+test("attempt identity may upgrade from legacy empty but never downgrade or cross-bind", () => {
+  assert.equal(cloudTaskAttemptIdentityAcceptsSnapshot("", ""), true);
+  assert.equal(cloudTaskAttemptIdentityAcceptsSnapshot("", "attempt-A"), true);
+  assert.equal(
+    cloudTaskAttemptIdentityAcceptsSnapshot("attempt-A", "attempt-A"),
+    true,
+  );
+  assert.equal(cloudTaskAttemptIdentityAcceptsSnapshot("attempt-A", ""), false);
+  assert.equal(
+    cloudTaskAttemptIdentityAcceptsSnapshot("attempt-A", "attempt-B"),
+    false,
+  );
+});
+
+test("an empty-id replay performs no projection write after attempt A owns the slot", async () => {
+  const currentTask = {
+    id: "task-db-A",
+    status: "running",
+    attempt_number: 3,
+    progress_seq: 40,
+    progress: {current: 4, total: 12},
+    checkpoint: {activeKeywordIndex: 4},
+    error: {},
+    metadata: {structuredTaskHealth: {appVersion: "0.3.93"}},
+  };
+  const statements = [];
+  const tx = {
+    async queryOne(sql) {
+      statements.push(sql);
+      if (sql.includes("occupied_attempt.client_attempt_id")) {
+        return {
+          id: currentTask.id,
+          status: currentTask.status,
+          attempt_number: currentTask.attempt_number,
+          occupied_attempt_id: "attempt-A",
+        };
+      }
+      if (sql.includes("SELECT *") && sql.includes("WHERE id = $1")) {
+        return structuredClone(currentTask);
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+    async execute(sql) {
+      throw new Error(`unexpected write: ${sql}`);
+    },
+  };
+  const replay = normalizeCloudTaskSnapshot({
+    id: "legacy-unbound-replay",
+    attemptId: "",
+    attemptNumber: 3,
+    progressSeq: 999,
+    status: "failed",
+    progress: {current: 0, total: 12},
+    checkpoint: {activeKeywordIndex: 0},
+    error: {code: "LATE_LEGACY_FAILURE"},
+    appVersion: "0.3.93",
+    healthEvidence: {page: {platform: "douyin"}},
+  });
+
+  const result = await mirrorTaskSnapshot(
+    tx,
+    {id: "agent-A", tenant_id: "tenant-A"},
+    replay,
+  );
+  assert.deepEqual(result, currentTask);
+  assert.equal(statements.length, 2);
+  assert.equal(statements.some(sql => /INSERT|UPDATE/iu.test(sql)), false);
 });
 
 test("targeted physical run ids normalize to their canonical business task", () => {
@@ -1118,6 +1518,23 @@ test("agent execution-slot locks serialize heartbeat, resume, and handoff assign
     sql: "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
     params: ["capture_agent_execution_slot", "tenant-a:agent-a"],
   }]);
+
+  const tryCalls = [];
+  assert.equal(await tryLockCaptureAgentExecutionSlot(
+    {
+      queryOne: async (sql, params) => {
+        tryCalls.push({sql, params});
+        return {locked: true};
+      },
+    },
+    "tenant-a",
+    "agent-b",
+  ), true);
+  assert.match(tryCalls[0].sql, /pg_try_advisory_xact_lock/u);
+  assert.deepEqual(
+    tryCalls[0].params,
+    ["capture_agent_execution_slot", "tenant-a:agent-b"],
+  );
 
   const heartbeat = readRouteSection(
     "router.post('/agent/heartbeat'",
@@ -1728,6 +2145,21 @@ test("targeted stop commands and receipts are fenced to the current attempt", ()
     stopRoute,
     /SELECT client_attempt_id[\s\S]*FROM capture_task_attempts[\s\S]*attempt_number = \$3/u,
   );
+  assert.doesNotMatch(
+    stopRoute,
+    /agent_platform_mismatch/u,
+    "stopping an already-running exact task must not reuse dispatch eligibility",
+  );
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  assert.match(
+    heartbeat,
+    /c\.command_type = 'stop'[\s\S]*cardinality\(\$5::text\[\]\) = 0/u,
+    "stop delivery bypasses current platform assignment while retaining auth fences",
+  );
   assert.match(
     stopRoute,
     /task_attempt_unavailable[\s\S]*attemptId: clientAttemptId/u,
@@ -1819,7 +2251,17 @@ test("an occupied attempt number rejects a different concrete attempt id", () =>
   );
   assert.match(
     mirrorSection,
-    /FROM capture_task_attempts existing_attempt[\s\S]*existing_attempt\.attempt_number = EXCLUDED\.attempt_number[\s\S]*existing_attempt\.client_attempt_id <> ''[\s\S]*\$27 <> ''[\s\S]*existing_attempt\.client_attempt_id <> \$27/u,
+    /snapshot = bindCloudTaskSnapshotHealthToAttempt\(snapshot\)/u,
+    "unbound legacy reports must lose structured health before task persistence",
+  );
+  assert.match(
+    mirrorSection,
+    /cloudTaskAttemptIdentityAcceptsSnapshot\([\s\S]*previous\.occupied_attempt_id,[\s\S]*snapshot\.attemptId/u,
+    "the preflight must reject an empty or different identity before any projection write",
+  );
+  assert.match(
+    mirrorSection,
+    /FROM capture_task_attempts existing_attempt[\s\S]*existing_attempt\.attempt_number = EXCLUDED\.attempt_number[\s\S]*existing_attempt\.client_attempt_id <> ''[\s\S]*\$27 = ''[\s\S]*OR existing_attempt\.client_attempt_id <> \$27/u,
   );
   assert.match(
     mirrorSection,
@@ -1827,7 +2269,40 @@ test("an occupied attempt number rejects a different concrete attempt id", () =>
   );
   assert.match(
     mirrorSection,
-    /WHERE capture_task_attempts\.client_attempt_id = ''[\s\S]*OR EXCLUDED\.client_attempt_id = ''[\s\S]*OR capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id/u,
+    /WHERE capture_task_attempts\.client_attempt_id = ''[\s\S]*OR capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id/u,
+  );
+  assert.doesNotMatch(
+    mirrorSection,
+    /OR EXCLUDED\.client_attempt_id = ''/u,
+  );
+  assert.ok(
+    [...mirrorSection.matchAll(
+      /snapshot\.attemptId \? attempt\?\.id \|\| null : null/gu,
+    )].length >= 2,
+    "an empty attempt id must not bind snapshots or events to an occupied attempt slot",
+  );
+});
+
+test("accepted task attempts persist the bounded version and structured health evidence", () => {
+  const mirrorSection = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    mirrorSection,
+    /INSERT INTO capture_task_attempts \([\s\S]*app_version, health_evidence,[\s\S]*CASE WHEN \$4 <> '' THEN \$6 ELSE '' END,[\s\S]*CASE WHEN \$4 <> '' THEN \$7::jsonb ELSE '\{\}'::jsonb END/u,
+  );
+  assert.match(
+    mirrorSection,
+    /app_version = CASE[\s\S]*EXCLUDED\.client_attempt_id <> ''[\s\S]*capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id[\s\S]*EXCLUDED\.app_version <> ''[\s\S]*capture_task_attempts\.app_version/u,
+  );
+  assert.match(
+    mirrorSection,
+    /health_evidence = CASE[\s\S]*EXCLUDED\.client_attempt_id <> ''[\s\S]*capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id[\s\S]*EXCLUDED\.health_evidence <> '\{\}'::jsonb[\s\S]*capture_task_attempts\.health_evidence/u,
+  );
+  assert.match(
+    mirrorSection,
+    /snapshot\.appVersion,[\s\S]*JSON\.stringify\(snapshot\.structuredTaskHealth\),[\s\S]*normalizedAttemptStatus/u,
   );
 });
 
@@ -2510,7 +2985,31 @@ test("settled single-node tasks can retry on another idle Agent without forking 
       "export async function reconcileAutomaticCaptureRetries",
     ),
   );
+  const idleAgentSelection = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "async function loadIdleCrossDeviceRetryAgent",
+    ),
+    captureCloudRouteSource.indexOf("function promotedRetryFallbackTarget"),
+  );
+  const profileRetryRenewal = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "async function renewProfileRetryExecutions",
+    ),
+    captureCloudRouteSource.indexOf(
+      "export async function dispatchCrossDeviceRetry",
+    ),
+  );
   assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
+  assert.match(idleAgentSelection, /for \(const candidate of eligibleCandidates\)/u);
+  assert.match(
+    idleAgentSelection,
+    /const savepoint = 'capture_retry_agent_candidate'/u,
+  );
+  assert.match(idleAgentSelection, /tryLockCaptureAgentExecutionSlot/u);
+  assert.match(
+    idleAgentSelection,
+    /ROLLBACK TO SAVEPOINT \$\{savepoint\}/u,
+  );
   assert.match(captureCloudRouteSource, /AS active_command_count/u);
   assert.match(
     captureCloudRouteSource,
@@ -2523,6 +3022,27 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(dispatchCore, /crossDeviceRetryRequestKey/u);
   assert.match(dispatchCore, /INSERT INTO capture_task_item_attempts/u);
   assert.match(dispatchCore, /renewProfileRetryExecutions/u);
+  assert.ok(
+    dispatchCore.indexOf('renewProfileRetryExecutions') <
+      dispatchCore.indexOf('targetAgent = await loadIdleCrossDeviceRetryAgent'),
+    'profile execution renewal must precede Agent-slot acquisition',
+  );
+  assert.match(
+    profileRetryRenewal,
+    /FROM monitor_executions[\s\S]*FOR UPDATE SKIP LOCKED[\s\S]*FROM monitor_subscriptions[\s\S]*FOR SHARE SKIP LOCKED/u,
+  );
+  assert.match(
+    profileRetryRenewal,
+    /const subscriptionSnapshot = await tx\.queryOne[\s\S]*retry_profile_subscription_unavailable[\s\S]*FOR SHARE SKIP LOCKED[\s\S]*retry_profile_subscription_busy/u,
+  );
+  assert.match(
+    dispatchCore,
+    /abortCrossDeviceRetry\('idle_compatible_agent_unavailable'/u,
+  );
+  assert.match(
+    dispatchCore,
+    /crossDeviceRetryError ===[\s\S]*'idle_compatible_agent_unavailable'[\s\S]*return noIdleAgentResult\(\)/u,
+  );
   assert.match(dispatchCore, /cross_device_retry_dispatched/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(promoted\.error\)/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
@@ -2536,7 +3056,73 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   );
 });
 
-test("cron automatically dispatches unfinished items before attention delivery", () => {
+test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", () => {
+  const dispatchCore = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "export async function dispatchCrossDeviceRetry",
+    ),
+    captureCloudRouteSource.indexOf(
+      "export async function reconcileElasticCaptureLeases",
+    ),
+  );
+  assert.match(dispatchCore, /recoveryPhase = 'fast'/u);
+  assert.match(
+    captureCloudRouteSource,
+    /crossDeviceRetrySourceReady\([\s\S]*dutyRecovery = false[\s\S]*if \(dutyRecovery\) return true/u,
+  );
+  assert.match(dispatchCore, /requestedItemIds\.length !== 1/u);
+  assert.match(dispatchCore, /dutyRecoveryIntentId/u);
+  assert.match(dispatchCore, /dutyRecoveryGeneration/u);
+  assert.match(dispatchCore, /expectedItemRevision/u);
+  assert.match(dispatchCore, /expectedSourceAttemptId/u);
+  assert.match(dispatchCore, /expectedAttemptNumber/u);
+  assert.match(dispatchCore, /FOR UPDATE[\s\S]*source_attempt_changed/u);
+  assert.match(dispatchCore, /code: 'NO_IDLE_AGENT'/u);
+  assert.match(dispatchCore, /waitingForAgent: true/u);
+  assert.match(dispatchCore, /code: 'SOURCE_EXECUTION_ACTIVE'/u);
+  assert.match(dispatchCore, /code: 'SOURCE_COMMAND_ACTIVE'/u);
+  assert.match(dispatchCore, /waitingForSource: true/u);
+  assert.match(dispatchCore, /replayed: true/u);
+  assert.match(dispatchCore, /itemAttempts: dispatchedItemAttempts/u);
+  assert.match(dispatchCore, /captureTaskItemAttemptId: binding\.attemptId/u);
+  assert.match(dispatchCore, /captureTaskItemRequestHash: binding\.requestHash/u);
+  assert.match(
+    dispatchCore,
+    /const agentCompatibilityPayload = dutyRecovery[\s\S]*dutyRecovery: \{intentId: dutyIntentId, protocolVersion: 1\}[\s\S]*commandPayload: agentCompatibilityPayload/u,
+  );
+  assert.match(dispatchCore, /orchestration:[\s\S]*itemAttempts: itemAttemptBindings/u);
+  assert.match(
+    dispatchCore,
+    /UPDATE capture_agent_commands[\s\S]*payload = \$3::jsonb/u,
+  );
+  assert.match(dispatchCore, /dutyRecoverySourceAttemptId/u);
+  assert.match(dispatchCore, /recoveryPhase: 'duty'/u);
+});
+
+test("recovery verification and replay clocks require exact business evidence", () => {
+  const recoverySource = readRouteSection(
+    "async function projectNegativePatrolSnapshot",
+    "async function projectOrchestrationChildControlOutcome",
+  );
+  assert.match(
+    recoverySource,
+    /metadata->'targetResult'\s+IS DISTINCT FROM \$6::jsonb/u,
+  );
+  assert.match(
+    recoverySource,
+    /if \(!item\) continue;\s*projectedItemIds\.push\(item\.id\);/u,
+  );
+  assert.match(
+    recoverySource,
+    /const projectedBusinessProgressAt =\s*orchestrationCheckpointTimestamp\(snapshot\.businessProgressAt\) \|\|\s*\(projectedItemIds\.length > 0 \? now : null\);/u,
+  );
+  assert.doesNotMatch(
+    recoverySource,
+    /const projectedBusinessProgressAt[\s\S]{0,240}snapshot\.heartbeatAt/u,
+  );
+});
+
+test("legacy retry remains only as a fallback outside guarded duty Agent tenants", () => {
   assert.match(
     captureCloudRouteSource,
     /export async function reconcileAutomaticCaptureRetries/u,
@@ -2562,11 +3148,12 @@ test("cron automatically dispatches unfinished items before attention delivery",
     /item_id = ANY\(\$2::uuid\[\]\)[\s\S]*crossDeviceRetrySourceAgentIdsForItems/u,
   );
   assert.match(
+    captureCloudRouteSource,
+    /\$7::boolean = false[\s\S]*recovery_enabled\.key = 'ops_control_recovery_enabled'[\s\S]*LOWER\(BTRIM\(recovery_mode\.value\)\) = 'guarded'/u,
+  );
+  assert.match(
     cronSource,
     /reconcileAutomaticCaptureRetries\(10\)/u,
   );
-  assert.ok(
-    cronSource.indexOf("reconcileAutomaticCaptureRetries(10)") <
-      cronSource.indexOf("processCaptureAttentionNotifications(20)"),
-  );
+  assert.match(cronSource, /processCaptureAttentionNotifications\(20\)/u);
 });

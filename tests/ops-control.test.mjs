@@ -10,11 +10,13 @@ import {
   buildOpsControlTaskWindow,
   buildOpsControlWindow,
   getOpsControlPublicHealth,
+  getOpsControlTenantSummary,
   maybeDeliverOpsControlIncidentAlerts,
   normalizeOpsControlEvidence,
   normalizeOpsControlActionAllowlist,
   normalizeOpsControlSettingPatch,
   normalizeOpsControlSettings,
+  resolveOpsControlObservationPolicy,
   normalizeOpsControlTaskWakeState,
   OPS_CONTROL_RUNTIME_BASELINE_VERSION,
   OPS_CONTROL_TASK_WAKE_GRACE_SECONDS,
@@ -44,6 +46,32 @@ function policy(overrides = {}) {
     ...overrides,
   }, {env: {OPS_CONTROL_GLOBAL_ENABLED: 'true'}});
 }
+
+test('a recovery observation override disables an otherwise guarded policy', () => {
+  const guarded = normalizeOpsControlSettings({
+    ops_control_enabled: 'true',
+    ops_control_mode: 'guarded',
+    ops_control_action_allowlist: 'capture_retry,elastic_requeue',
+  }, {
+    env: {
+      OPS_CONTROL_GLOBAL_ENABLED: 'true',
+      OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true',
+    },
+  });
+  assert.equal(guarded.actionsEnabled, true);
+
+  const forced = resolveOpsControlObservationPolicy(guarded, {
+    forceObserveOnly: true,
+  });
+  assert.equal(forced.enabled, true);
+  assert.equal(forced.actionsGlobalEnabled, true);
+  assert.equal(forced.configuredMode, 'guarded');
+  assert.equal(forced.mode, 'observe');
+  assert.equal(forced.actionsEnabled, false);
+  assert.equal(forced.observeOnly, true);
+  assert.equal(forced.forcedObserveOnly, true);
+  assert.deepEqual(forced.actionAllowlist, []);
+});
 
 function snapshot(capturedAt, overrides = {}) {
   const base = {
@@ -121,7 +149,7 @@ test('control plane defaults to tenant-off observe-only mode with an explicit gl
   assert.equal(defaults.actionsEnabled, false);
   assert.equal(defaults.actionsGlobalEnabled, false);
   assert.equal(defaults.llmEnabled, false);
-  assert.equal(defaults.runtimeBaselineVersion, '0.3.92');
+  assert.equal(defaults.runtimeBaselineVersion, '0.3.93');
   assert.equal(resolveOpsControlGlobalEnabled({OPS_CONTROL_GLOBAL_ENABLED: 'off'}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true'}), true);
@@ -151,10 +179,12 @@ test('control plane defaults to tenant-off observe-only mode with an explicit gl
   );
 });
 
-test('settings patch accepts only bounded observe-mode control-plane values', () => {
+test('settings patch accepts bounded observe or guarded control-plane values', () => {
   const normalized = normalizeOpsControlSettingPatch({
     ops_control_enabled: true,
     ops_control_mode: 'observe',
+    ops_control_recovery_enabled: true,
+    ops_control_recovery_mode: 'guarded',
     ops_control_window_start: '05:45',
     ops_control_window_end: '08:45',
     ops_control_snapshot_gap_seconds: 30,
@@ -162,6 +192,8 @@ test('settings patch accepts only bounded observe-mode control-plane values', ()
   assert.deepEqual(normalized, {
     ops_control_enabled: 'true',
     ops_control_mode: 'observe',
+    ops_control_recovery_enabled: 'true',
+    ops_control_recovery_mode: 'guarded',
     ops_control_window_start: '05:45',
     ops_control_window_end: '08:45',
     ops_control_snapshot_gap_seconds: '30',
@@ -169,6 +201,10 @@ test('settings patch accepts only bounded observe-mode control-plane values', ()
   assert.throws(
     () => normalizeOpsControlSettingPatch({ops_control_mode: 'enforce'}),
     OpsControlSettingsError,
+  );
+  assert.throws(
+    () => normalizeOpsControlSettingPatch({ops_control_recovery_mode: 'enforce'}),
+    /只允许 observe 或 guarded/u,
   );
   assert.throws(
     () => normalizeOpsControlSettingPatch({ops_control_unknown: 'true'}),
@@ -194,6 +230,70 @@ test('settings patch accepts only bounded observe-mode control-plane values', ()
     }),
     /必须填写收件人/u,
   );
+});
+
+test('tenant summary recovery totals come from tenant-wide aggregates, not the 20-row display slice', async () => {
+  const displayedIntents = Array.from({length: 20}, (_, index) => ({
+    id: `intent-${index + 1}`,
+    status: index === 0 ? 'waiting_human' : 'resolved',
+  }));
+  const summary = await getOpsControlTenantSummary(
+    '10000000-0000-4000-8000-000000000001',
+    {
+      env: {OPS_CONTROL_GLOBAL_ENABLED: 'true'},
+      getSettings: async () => ({
+        ops_control_enabled: 'true',
+        ops_control_mode: 'observe',
+      }),
+      queryOne: async sql => {
+        if (/COUNT\(\*\) FILTER[\s\S]*FROM capture_recovery_intents/u.test(sql)) {
+          return {open_count: '25', human_required_count: '7', total_count: '31'};
+        }
+        return null;
+      },
+      queryAll: async sql => (
+        /FROM capture_recovery_intents/u.test(sql) ? displayedIntents : []
+      ),
+    },
+  );
+  assert.equal(summary.recovery.intents.length, 20);
+  assert.equal(summary.recovery.openCount, 25);
+  assert.equal(summary.recovery.humanRequiredCount, 7);
+  assert.equal(summary.recovery.totalCount, 31);
+});
+
+test('tenant summary reports the effective duty recovery gates instead of a hard-coded observe mode', async () => {
+  const summary = await getOpsControlTenantSummary(
+    '10000000-0000-4000-8000-000000000002',
+    {
+      env: {
+        OPS_CONTROL_GLOBAL_ENABLED: 'true',
+        OPS_CONTROL_RECOVERY_GLOBAL_ENABLED: 'true',
+        OPS_CONTROL_RECOVERY_ACTIONS_GLOBAL_ENABLED: 'true',
+      },
+      getSettings: async () => ({
+        ops_control_enabled: 'true',
+        ops_control_recovery_enabled: 'true',
+        ops_control_recovery_mode: 'guarded',
+      }),
+      queryOne: async sql => (
+        /COUNT\(\*\) FILTER[\s\S]*FROM capture_recovery_intents/u.test(sql)
+          ? {
+              open_count: '2',
+              human_required_count: '1',
+              stop_manual_required_count: '1',
+              total_count: '3',
+            }
+          : null
+      ),
+      queryAll: async () => [],
+    },
+  );
+  assert.equal(summary.recovery.mode, 'guarded');
+  assert.equal(summary.recovery.enabled, true);
+  assert.equal(summary.recovery.actionsEnabled, true);
+  assert.equal(summary.recovery.gate.blockedReason, '');
+  assert.equal(summary.recovery.stopManualRequiredCount, 1);
 });
 
 test('Shanghai observation window is deterministic and includes the digest deadline', () => {
@@ -246,6 +346,22 @@ test('a single snapshot cannot declare healthy or stalled', () => {
   assert.equal(assessment.lifecycleStatus, 'observing');
   assert.equal(assessment.summary.consecutiveEvidence, false);
   assert.deepEqual(assessment.incidents, []);
+});
+
+test('a duty recovery child that missed its stop deadline is immediately critical', () => {
+  const current = snapshot('2026-08-24T00:01:00.000Z', {
+    operations: {
+      manualRecoveryStopCount: 1,
+      manualRecoveryStopTaskId: 'recovery-child-a',
+    },
+  });
+  const assessment = assessOpsControlSnapshots(null, current, policy());
+  assert.equal(assessment.verdict, 'incident');
+  const incident = assessment.incidents.find(
+    row => row.type === 'duty_recovery_stop_failed',
+  );
+  assert.equal(incident.severity, 'critical');
+  assert.equal(incident.evidence.userStopBoundaryPreserved, true);
 });
 
 test('historical failed attempts followed by final success remain healthy and are counted as recovered', () => {
@@ -572,7 +688,7 @@ test('public sentinel health fails closed on a degraded or stale scheduler', asy
 });
 
 test('migrations, API, scheduler and Admin UI wire the guarded control plane through isolated adapters', async () => {
-  const [migration, actionMigration, alertMigration, eventMigration, service, wakeupService, actionService, route, app, cron, schedulerRuntime, overview, mobileApp, settingsPage, adminRoute] = await Promise.all([
+  const [migration, actionMigration, alertMigration, eventMigration, service, wakeupService, actionService, route, app, cron, schedulerRuntime, overview, mobileApp, settingsPage, adminRoute, productionEnvExample] = await Promise.all([
     source('server/db/migrations/070_ops_control_plane.sql'),
     source('server/db/migrations/071_ops_control_guarded_actions.sql'),
     source('server/db/migrations/072_ops_control_incident_alerts.sql'),
@@ -588,6 +704,7 @@ test('migrations, API, scheduler and Admin UI wire the guarded control plane thr
     source('web/admin/src/mobile/MobileApp.tsx'),
     source('web/admin/src/pages/AdminPages.tsx'),
     source('server/routes/admin.js'),
+    source('deploy/onstarvoice.env.production.example'),
   ]);
 
   for (const table of [
@@ -641,5 +758,18 @@ test('migrations, API, scheduler and Admin UI wire the guarded control plane thr
   assert.match(settingsPage, /发送异常提醒与运维晨报/u);
   assert.match(adminRoute, /ops\.control_settings_updated/u);
   assert.match(adminRoute, /key NOT IN \([\s\S]*'ops_control_enabled'[\s\S]*'ops_control_digest_email_to'/u);
+  assert.match(
+    adminRoute,
+    /key NOT IN \([\s\S]*'ops_control_recovery_enabled'[\s\S]*'ops_control_recovery_mode'/u,
+  );
+  assert.match(
+    adminRoute,
+    /\(\$1, 'ops_control_recovery_enabled', 'false', now\(\)\)[\s\S]*\(\$1, 'ops_control_recovery_mode', 'observe', now\(\)\)/u,
+  );
   assert.match(adminRoute, /key NOT LIKE 'ops_control_action_%'/u);
+  assert.match(productionEnvExample, /OPS_CONTROL_RECOVERY_GLOBAL_ENABLED=false/u);
+  assert.match(
+    productionEnvExample,
+    /OPS_CONTROL_RECOVERY_ACTIONS_GLOBAL_ENABLED=false/u,
+  );
 });

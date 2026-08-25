@@ -3,12 +3,44 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.92',
+  latestVersion: '0.3.93',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-24',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.92-20260824.zip',
+  releaseDate: '2026-08-25',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.93-20260825.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.93',
+      releaseDate: '2026-08-25',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '抖音搜索等待真实作品稳定出现',
+              desc: '搜索结果只在真实作品编号连续稳定后放行；瞬态“服务出现异常”会继续观察至少 1.5 秒，验证码和登录验证仍立即停止并等待人工处理。',
+            },
+            {
+              title: '抖音详情核心采集与作者指标解耦',
+              desc: '正文、媒体和作品身份先独立完成；可选作者指标失败不再推翻核心结果，详情工作页丢失时会在有限预算内重建并重试当前作品。',
+            },
+            {
+              title: '无人值守检查点可断网续传',
+              desc: '已结算的关键词检查点在浏览器消息通道短暂中断时会本地落盘，恢复后按任务尝试和进度栅栏自动补传。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '值守 Agent 获得结构化运行证据',
+              desc: '每次任务心跳附带脱敏后的页面、标签页、网络、事件循环和内存证据，并按具体任务尝试持久化，为后续受控自动处置提供可靠判断依据。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.92',
       releaseDate: '2026-08-24',

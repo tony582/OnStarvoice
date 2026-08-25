@@ -3368,6 +3368,519 @@ test("a repeated checkpoint does not reset recovery but an advanced checkpoint d
   );
 });
 
+test("a retrying checkpoint cannot replenish automatic recovery budgets", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    recoveryCount: 2,
+    recoveryLaunchFailures: 1,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 0,
+      activeKeywordIndex: 0,
+      completedKeywords: [],
+      failedKeywords: [],
+      skippedKeywords: [],
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "关键词一",
+          status: "retrying",
+          attemptCount: 1,
+          savedCount: 0,
+          error: "第一次暂时失败",
+        },
+      ],
+    },
+  });
+
+  const retrying = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: 11,
+      checkpoint: {
+        ...request.checkpoint,
+        keywordResults: [
+          {
+            ...request.checkpoint.keywordResults[0],
+            attemptCount: 2,
+            error: "第二次暂时失败，文案已变化",
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(retrying.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    1,
+  );
+
+  const settled = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: 12,
+      checkpoint: {
+        ...harness.storage[UNATTENDED_REQUEST_KEY].checkpoint,
+        failedKeywords: ["关键词一"],
+        keywordResults: [
+          {
+            ...harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.keywordResults[0],
+            status: "failed",
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(settled.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    0,
+  );
+});
+
+test("a durable checkpoint replay cannot overwrite a newer checkpoint sequence", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    checkpoint: {
+      keywordIndex: 1,
+      activeKeywordIndex: 2,
+      completedKeywords: ["关键词一", "关键词二"],
+    },
+  });
+
+  const stale = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: 9,
+      checkpoint: {
+        keywordIndex: 0,
+        activeKeywordIndex: 1,
+        completedKeywords: ["关键词一"],
+      },
+    },
+  });
+
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, "stale_progress");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.activeKeywordIndex,
+    2,
+  );
+  assert.deepEqual(
+    Array.from(
+      harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.completedKeywords,
+    ),
+    ["关键词一", "关键词二"],
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 10);
+
+  const advanced = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: 11,
+      checkpoint: {
+        keywordIndex: 2,
+        activeKeywordIndex: 3,
+        completedKeywords: ["关键词一", "关键词二", "关键词三"],
+      },
+    },
+  });
+
+  assert.equal(advanced.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 11);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.activeKeywordIndex,
+    3,
+  );
+});
+
+test("a lower sequence durable checkpoint is merged when it advances the stored boundary", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 11,
+    recoveryCount: 2,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 0,
+      activeKeywordIndex: 0,
+      completedKeywords: [],
+      failedKeywords: [],
+      skippedKeywords: [],
+      keywordResults: [],
+    },
+  });
+
+  const handoff = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: 10,
+      checkpoint: {
+        round: 1,
+        keywordIndex: 1,
+        activeKeywordIndex: 1,
+        completedKeywords: ["关键词一"],
+        failedKeywords: [],
+        skippedKeywords: [],
+        keywordResults: [{
+          round: 1,
+          index: 0,
+          keyword: "关键词一",
+          status: "completed",
+          savedCount: 3,
+        }],
+      },
+    },
+  });
+
+  assert.equal(handoff.accepted, true);
+  assert.equal(handoff.reason, "updated");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 12);
+  assert.deepEqual(
+    Array.from(
+      harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.completedKeywords,
+    ),
+    ["关键词一"],
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+});
+
+test("the immediate previous attempt can hand off one monotonic checkpoint after rotation", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-2",
+    previousAttemptId: "attempt-1",
+    attemptNumber: 2,
+    progressSeq: 12,
+    recoveryCount: 1,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 0,
+      activeKeywordIndex: 0,
+      completedKeywords: [],
+      failedKeywords: [],
+      skippedKeywords: [],
+      keywordResults: [],
+    },
+  });
+  const checkpoint = {
+    round: 1,
+    keywordIndex: 1,
+    activeKeywordIndex: 1,
+    completedKeywords: ["关键词一"],
+    failedKeywords: [],
+    skippedKeywords: [],
+    keywordResults: [{
+      round: 1,
+      index: 0,
+      keyword: "关键词一",
+      status: "completed",
+      savedCount: 2,
+    }],
+  };
+
+  const handedOff = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: "attempt-1",
+    patch: {progressSeq: 10, checkpoint},
+  });
+  assert.equal(handedOff.accepted, true);
+  assert.equal(handedOff.reason, "checkpoint_handoff");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, "attempt-2");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 13);
+  assert.deepEqual(
+    Array.from(
+      harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.completedKeywords,
+    ),
+    ["关键词一"],
+  );
+
+  const unrelated = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: "attempt-0",
+    patch: {
+      progressSeq: 9,
+      checkpoint: {...checkpoint, completedKeywords: ["关键词一", "关键词二"]},
+    },
+  });
+  assert.equal(unrelated.accepted, false);
+  assert.equal(unrelated.reason, "attempt_mismatch");
+});
+
+test("a legacy checkpoint replay without a sequence cannot roll durable progress backwards", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 2,
+      activeKeywordIndex: 2,
+      completedKeywords: ["关键词一", "关键词二"],
+      failedKeywords: [],
+      skippedKeywords: [],
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "关键词一",
+          status: "completed",
+        },
+        {
+          round: 1,
+          index: 1,
+          keyword: "关键词二",
+          status: "completed",
+        },
+      ],
+    },
+  });
+  const checkpointBeforeReplay = JSON.stringify(
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint,
+  );
+
+  const stale = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      checkpoint: {
+        round: 1,
+        keywordIndex: 1,
+        activeKeywordIndex: 1,
+        completedKeywords: ["关键词一"],
+        failedKeywords: [],
+        skippedKeywords: [],
+        keywordResults: [
+          {
+            round: 1,
+            index: 0,
+            keyword: "关键词一",
+            status: "completed",
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, "stale_progress");
+  assert.equal(
+    JSON.stringify(harness.storage[UNATTENDED_REQUEST_KEY].checkpoint),
+    checkpointBeforeReplay,
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 10);
+});
+
+test("a legacy checkpoint cannot downgrade the same settled result or replenish recovery", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    recoveryCount: 2,
+    recoveryLaunchFailures: 1,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 1,
+      activeKeywordIndex: 1,
+      completedKeywords: ["关键词一"],
+      failedKeywords: [],
+      skippedKeywords: [],
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "关键词一",
+          status: "completed",
+          attemptCount: 2,
+          savedCount: 8,
+        },
+      ],
+    },
+  });
+  const checkpointBeforeReplay = JSON.stringify(request.checkpoint);
+
+  const stale = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      checkpoint: {
+        round: 1,
+        keywordIndex: 1,
+        activeKeywordIndex: 1,
+        completedKeywords: [],
+        failedKeywords: ["关键词一"],
+        skippedKeywords: [],
+        keywordResults: [
+          {
+            round: 1,
+            index: 0,
+            keyword: "关键词一",
+            status: "failed",
+            attemptCount: 1,
+            savedCount: 0,
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, "stale_progress");
+  assert.equal(
+    JSON.stringify(harness.storage[UNATTENDED_REQUEST_KEY].checkpoint),
+    checkpointBeforeReplay,
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 10);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 2);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures,
+    1,
+  );
+});
+
+test("a legacy checkpoint still accepts a monotonic failed-to-completed upgrade", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    recoveryCount: 2,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 1,
+      activeKeywordIndex: 1,
+      completedKeywords: [],
+      failedKeywords: ["关键词一"],
+      skippedKeywords: [],
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "关键词一",
+          status: "failed",
+          attemptCount: 2,
+          savedCount: 3,
+        },
+      ],
+    },
+  });
+
+  const upgraded = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      checkpoint: {
+        round: 1,
+        keywordIndex: 1,
+        activeKeywordIndex: 1,
+        completedKeywords: ["关键词一"],
+        failedKeywords: [],
+        skippedKeywords: [],
+        keywordResults: [
+          {
+            round: 1,
+            index: 0,
+            keyword: "关键词一",
+            status: "completed",
+            attemptCount: 2,
+            savedCount: 3,
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(upgraded.accepted, true);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.keywordResults[0].status,
+    "completed",
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 10);
+});
+
+test("a legacy checkpoint cannot hide one cursor rollback behind another cursor advance", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    checkpoint: {
+      round: 1,
+      keywordIndex: 2,
+      activeKeywordIndex: 2,
+      completedKeywords: ["关键词一"],
+      keywordResults: [],
+    },
+  });
+
+  const stale = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      checkpoint: {
+        round: 1,
+        keywordIndex: 1,
+        activeKeywordIndex: 3,
+        completedKeywords: ["关键词一"],
+        keywordResults: [],
+      },
+    },
+  });
+
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, "stale_progress");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.keywordIndex,
+    2,
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].checkpoint.activeKeywordIndex,
+    2,
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progressSeq, 10);
+});
+
+test("a delayed durable checkpoint preserves its original business progress time", async () => {
+  const harness = createHarness();
+  const completedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const previousAt = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  const request = seedUnattendedRequest(harness, {
+    progressSeq: 10,
+    businessProgressAt: previousAt,
+    checkpoint: {
+      keywordIndex: 0,
+      activeKeywordIndex: 1,
+      completedKeywords: ["关键词一"],
+    },
+  });
+
+  const replayed = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: 11,
+      businessProgressAt: completedAt,
+      checkpoint: {
+        keywordIndex: 1,
+        activeKeywordIndex: 2,
+        completedKeywords: ["关键词一", "关键词二"],
+      },
+    },
+  });
+
+  assert.equal(replayed.accepted, true);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].businessProgressAt,
+    completedAt,
+  );
+});
+
 test("repeated old progress cannot replenish the four spaced automatic recoveries", async () => {
   const harness = createHarness();
   let request = seedUnattendedRequest(harness);

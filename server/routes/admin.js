@@ -140,6 +140,8 @@ router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
            AND key NOT IN (
              'ops_control_enabled',
              'ops_control_mode',
+             'ops_control_recovery_enabled',
+             'ops_control_recovery_mode',
              'ops_control_digest_email_enabled',
              'ops_control_digest_email_to'
            )
@@ -151,6 +153,8 @@ router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
          VALUES
            ($1, 'ops_control_enabled', 'false', now()),
            ($1, 'ops_control_mode', 'observe', now()),
+           ($1, 'ops_control_recovery_enabled', 'false', now()),
+           ($1, 'ops_control_recovery_mode', 'observe', now()),
            ($1, 'ops_control_digest_email_enabled', 'false', now()),
            ($1, 'ops_control_digest_email_to', '', now()),
            ($1, 'ops_control_action_allowlist', '', now()),

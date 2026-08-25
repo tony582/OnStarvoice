@@ -177,7 +177,7 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
   );
 });
 
-test("targeted patrol heartbeat keeps long profile scans alive as business progress", async () => {
+test("targeted patrol heartbeat does not masquerade as business progress", async () => {
   const heartbeatSection = readFunctionSection(
     "function startTargetedPostRunHeartbeat(",
     "async function cancelTargetedPostRunFromSidebar(",
@@ -190,11 +190,7 @@ test("targeted patrol heartbeat keeps long profile scans alive as business progr
     id: token.requestId,
     attemptId: token.attemptId,
     status: "running",
-    progress: {
-      phase: "target_profile_publish_date_verification",
-      current: 1,
-      total: 1,
-    },
+    businessProgressAt: "2026-08-25T01:00:00.000Z",
   };
   const context = {
     TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS: 20_000,
@@ -239,18 +235,7 @@ globalThis.__startTargetedPostRunHeartbeat = startTargetedPostRunHeartbeat;`,
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], request);
   assert.equal(calls[0][2], token);
-  assert.equal(
-    calls[0][1].heartbeatAt,
-    calls[0][1].businessProgressAt,
-  );
-  assert.equal(
-    calls[0][1].progress.updatedAt,
-    calls[0][1].heartbeatAt,
-  );
-  assert.equal(
-    calls[0][1].progress.phase,
-    "target_profile_publish_date_verification",
-  );
+  assert.deepEqual(Object.keys(calls[0][1]), ["heartbeatAt"]);
 
   stop();
   assert.equal(clearedTimer, 91);
@@ -628,6 +613,15 @@ test("official comment patrol starts one attempt-fenced task session before deta
         normalizeMonitorRunnerPlatform: (value) => String(value || ""),
         resolveMonitorRunnerAccountUrl: (runItem) => runItem.accountUrl,
         resolveMonitorRunnerName: (runItem) => runItem.title,
+        cloudTargetedPostApi: {
+          projectCaptureFailure: (_candidates, options = {}) => ({
+            code: String(options.fallbackCode || "CAPTURE_FAILED"),
+            message: String(options.fallbackMessage || "采集失败"),
+            category: "",
+            retryable: true,
+            requiresManualAction: false,
+          }),
+        },
         reportMonitorRunProgress: (onProgress, progress, message) => {
           onProgress?.({...progress, message});
           return message;
@@ -637,6 +631,7 @@ test("official comment patrol starts one attempt-fenced task session before deta
           events.push("profile_list");
           return {
             ok: true,
+            scanComplete: true,
             results: [{recordIds: [`${platform}-record`]}],
           };
         },
@@ -723,6 +718,7 @@ test("official comment patrol starts one attempt-fenced task session before deta
         JSON.parse(JSON.stringify(captureTaskContext)),
         {
           taskId: physicalTaskId,
+          captureTaskId: requestId,
           attemptId,
           label: "官方账号评论巡查",
           ownerRequired: true,

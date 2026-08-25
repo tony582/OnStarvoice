@@ -1,5 +1,11 @@
 import crypto from 'crypto';
-import { queryAll, queryOne, withTransaction, getSetting } from '../db/init.js';
+import {
+  execute,
+  queryAll,
+  queryOne,
+  withTransaction,
+  getSetting,
+} from '../db/init.js';
 import { classifyCommentWithAI, classifyCommentsBatch } from './ai-labeler.js';
 import { upsertCommentLeadForComment } from './comment-leads.js';
 import {
@@ -689,6 +695,132 @@ export async function reprocessPendingComments({ limit = 2000 } = {}) {
   }
   console.log(`[Reprocess] 自愈补回 ${fixed}/${rows.length} 条记录的评论`);
   return fixed;
+}
+
+export async function reprocessPendingCommentWorkflowReceipts({
+  limit = 100,
+} = {}) {
+  const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+  const rows = await queryAll(`
+    SELECT observation.id AS observation_id,
+      observation.tenant_id, observation.record_id,
+      observation.comment_workflow_expected_count,
+      observation.comment_workflow_updated_at,
+      record.platform, record.title, record.content,
+      record.author_name, record.author_id, record.author_account_no,
+      record.url, record.keyword,
+      COALESCE(
+        CASE
+          WHEN jsonb_typeof(observation.payload->'items'->0->'commentsCleanedItems') = 'array'
+            THEN observation.payload->'items'->0->'commentsCleanedItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'commentsCleanedItems') = 'array'
+            THEN observation.payload->'commentsCleanedItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'detailPayload'->'commentsCleanedItems') = 'array'
+            THEN observation.payload->'detailPayload'->'commentsCleanedItems'
+        END,
+        '[]'::jsonb
+      ) AS cleaned,
+      COALESCE(
+        CASE
+          WHEN jsonb_typeof(observation.payload->'items'->0->'officialReplyItems') = 'array'
+            THEN observation.payload->'items'->0->'officialReplyItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'officialReplyItems') = 'array'
+            THEN observation.payload->'officialReplyItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'detailPayload'->'officialReplyItems') = 'array'
+            THEN observation.payload->'detailPayload'->'officialReplyItems'
+        END,
+        '[]'::jsonb
+      ) AS official_reply
+    FROM record_observations observation
+    JOIN records record
+      ON record.id = observation.record_id
+      AND record.tenant_id = observation.tenant_id
+    WHERE (
+      observation.comment_workflow_status = 'queued'
+        AND observation.comment_workflow_updated_at < now() - interval '15 seconds'
+    ) OR (
+      observation.comment_workflow_status = 'running'
+        AND observation.comment_workflow_updated_at < now() - interval '2 minutes'
+    ) OR (
+      observation.comment_workflow_status = 'failed'
+        AND observation.comment_workflow_updated_at < now() - interval '30 seconds'
+    )
+    ORDER BY observation.comment_workflow_updated_at, observation.id
+    LIMIT $1
+  `, [boundedLimit]);
+  const summary = {claimed: 0, persisted: 0, failed: 0};
+  for (const row of rows) {
+    const claimed = await queryOne(`
+      UPDATE record_observations
+      SET comment_workflow_status = 'running',
+        comment_workflow_started_at = COALESCE(
+          comment_workflow_started_at,
+          now()
+        ),
+        comment_workflow_error = '',
+        comment_workflow_updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+        AND comment_workflow_status IN ('queued', 'running', 'failed')
+        AND comment_workflow_updated_at = $3::timestamptz
+      RETURNING id
+    `, [row.observation_id, row.tenant_id, row.comment_workflow_updated_at]);
+    if (!claimed) continue;
+    summary.claimed += 1;
+    try {
+      const stats = await upsertRecordComments(row.record_id, {
+        platform: row.platform,
+        title: row.title,
+        content: row.content,
+        author_name: row.author_name,
+        author_id: row.author_id,
+        author_account_no: row.author_account_no,
+        url: row.url,
+        keyword: row.keyword,
+        comments_cleaned_items: row.cleaned || [],
+        official_reply_items: row.official_reply || [],
+      }, {tenantId: row.tenant_id, authCode: ''});
+      await execute(`
+        UPDATE record_observations
+        SET comment_workflow_status = 'persisted',
+          comment_workflow_processed_count = $3,
+          comment_workflow_error = '',
+          comment_workflow_finished_at = now(),
+          comment_workflow_updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND comment_workflow_status = 'running'
+      `, [
+        row.observation_id,
+        row.tenant_id,
+        Math.max(0, Number(stats.inserted || 0) + Number(stats.updated || 0)),
+      ]);
+      summary.persisted += 1;
+    } catch (error) {
+      await execute(`
+        UPDATE record_observations
+        SET comment_workflow_status = 'failed',
+          comment_workflow_error = $3,
+          comment_workflow_finished_at = now(),
+          comment_workflow_updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND comment_workflow_status = 'running'
+      `, [
+        row.observation_id,
+        row.tenant_id,
+        String(error?.message || error || 'comment_workflow_failed')
+          .slice(0, 1000),
+      ]);
+      summary.failed += 1;
+    }
+  }
+  return summary;
 }
 
 export async function getRecordComments(tenantId, recordId) {

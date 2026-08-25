@@ -128,6 +128,18 @@ const CAPTURE_TASK_MESSAGE_TYPE = Object.freeze({
   END: 'onstarvoice:end-capture-task',
 });
 const activeCaptureTaskSessions = new Map();
+const CLOUD_CAPTURE_TASK_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function resolveActiveCloudCaptureTaskId(context = getActiveTaskContext()) {
+  const rawTaskId = String(
+    context?.metadata?.requestId || context?.taskId || '',
+  ).trim();
+  const taskId = rawTaskId.startsWith('unattended-capture:')
+    ? rawTaskId.slice('unattended-capture:'.length)
+    : rawTaskId;
+  return CLOUD_CAPTURE_TASK_ID_PATTERN.test(taskId) ? taskId.toLowerCase() : '';
+}
 
 function buildCaptureTaskProgressActivityKey(progress = {}) {
   return [
@@ -3843,12 +3855,6 @@ export async function batchCaptureDetailsForRecords(
     }
   }
   const detailBatchContainsDouyin = detailBatchPlatforms.has('douyin');
-  const detailBatchIsXiaohongshu =
-    detailBatchPlatforms.has('xiaohongshu') &&
-    [...detailBatchPlatforms].every(
-      (platform) => !platform || platform === 'xiaohongshu',
-    );
-
   try {
     runnerContext = await prepareDetailBatchRunnerContext({
       sourceTab: activeTab,
@@ -4192,20 +4198,33 @@ export async function batchCaptureDetailsForRecords(
   const plannedDetailWorkerCount = runnerContexts.length;
   detailPrefetchPipeline = createCurrentDetailPrefetchPipeline();
 
-  const recreateInterruptedXhsDetailRunners = async ({
+  const recreateInterruptedDetailRunners = async ({
     recordId = '',
+    recordPlatform = '',
+    expectedNoteId = '',
     current = 0,
     total = uniqueRecordIds.length,
   } = {}) => {
     const normalizedRecordId = String(recordId || '').trim();
+    const normalizedRecordPlatform = String(recordPlatform || '')
+      .trim()
+      .toLowerCase();
+    const normalizedExpectedNoteId =
+      normalizedRecordPlatform === 'douyin'
+        ? extractDouyinDetailGuardItemId(expectedNoteId)
+        : '';
+    const supportedPlatform =
+      normalizedRecordPlatform === 'xiaohongshu' ||
+      normalizedRecordPlatform === 'douyin';
     const itemRecoveryCount = Math.max(
       0,
       Number(detailRunnerRecoveryAttemptsByRecordId.get(normalizedRecordId)) ||
         0,
     );
     if (
-      !detailBatchIsXiaohongshu ||
+      !supportedPlatform ||
       !normalizedRecordId ||
+      (normalizedRecordPlatform === 'douyin' && !normalizedExpectedNoteId) ||
       detailRunnerRecoveryCount >= DETAIL_RUNNER_RECREATE_MAX_PER_BATCH ||
       itemRecoveryCount >= DETAIL_RUNNER_RECREATE_MAX_PER_ITEM ||
       shouldStopDetailBatch()
@@ -4220,7 +4239,7 @@ export async function batchCaptureDetailsForRecords(
       await closeOwnedDetailRunnerTabs(previousContexts);
     } catch (error) {
       console.warn(
-        '[CaptureSync] close interrupted XHS detail workers failed:',
+        '[CaptureSync] close interrupted detail workers failed:',
         error?.message || error,
       );
       // 无法确认旧工作页已关闭时不再创建新页，避免并发导航数量失控。
@@ -4276,7 +4295,7 @@ export async function batchCaptureDetailsForRecords(
       // 旧工作页在重建前已经关闭，避免 finally 再次关闭同一批 tab。
       runnerContexts.splice(0, runnerContexts.length);
       console.warn(
-        '[CaptureSync] recreate interrupted XHS detail worker failed:',
+        '[CaptureSync] recreate interrupted detail worker failed:',
         replacementError?.message || replacementError || 'unknown error',
       );
       return false;
@@ -4292,8 +4311,10 @@ export async function batchCaptureDetailsForRecords(
     detailPrefetchPipeline = createCurrentDetailPrefetchPipeline();
     await reportProgressFailSoft(onProgress, {
       phase: 'detail_runner_recreated',
-      message: '小红书详情工作页已自动重建，正在重试当前条',
+      message: `${normalizedRecordPlatform === 'douyin' ? '抖音' : '小红书'}详情工作页已自动重建，正在重试当前条`,
       recordId: normalizedRecordId,
+      recordPlatform: normalizedRecordPlatform,
+      expectedNoteId: normalizedExpectedNoteId,
       current,
       total,
       runnerRecoveryCount: detailRunnerRecoveryCount,
@@ -4831,9 +4852,7 @@ export async function batchCaptureDetailsForRecords(
             record.type === SYNC_TYPE.KEYWORD_NOTES,
         );
         const shouldCaptureBloggerMetricsForRecord =
-          includeBloggerMetrics ||
-          recordPlatform === 'douyin' ||
-          shouldApplyLowFollowerHitFilter;
+          includeBloggerMetrics || shouldApplyLowFollowerHitFilter;
 
         activeStage = 'note_capture';
         activeDetailItemContext.activeStage = activeStage;
@@ -4860,10 +4879,10 @@ export async function batchCaptureDetailsForRecords(
             mode: 'single',
             captureParams: {
               expectedNoteId: expectedDouyinNoteId,
-              includeBloggerMetrics: shouldCaptureBloggerMetricsForRecord,
-              preferWorksTabForBloggerMetrics:
-                recordPlatform === 'douyin' &&
-                isDouyinContentFlowUrl(noteUrl),
+              // 正文/媒体/作品身份是核心事务。博主指标会在核心结果通过
+              // 身份校验后按需补采，不能让可选指标拖垮或推翻正文采集。
+              includeBloggerMetrics: false,
+              preferWorksTabForBloggerMetrics: false,
             },
           });
         let noteResult = await captureCurrentNotePayload();
@@ -5066,14 +5085,21 @@ export async function batchCaptureDetailsForRecords(
               profileAfterNavWaitMs: normalizedProfileAfterNavWaitMs,
               shouldStop: shouldStopDetailBatch,
               cache: bloggerMetricsCache,
-              // 小红书:指标缺时进主页(原语义不变)。抖音保持 false——抖音指标在作品页那步已拿到,
-              // 不能放开此开关去跑小红书的进主页/缓存语义(会污染小红书路径)。
+              // 小红书:指标缺时进主页(原语义不变)。抖音走上方独立的
+              // 作品页指标补采，不进入小红书的主页/缓存语义。
               allowProfileNavigation: recordPlatform !== 'douyin',
               // 抖音专用:仅为补「抖音号(douyinId)」多进一次主页,与指标早返回解耦。
               // 真号只在博主主页正文,作品页/详情页拿不到 → 单独 fail-soft 取号。
               // 受总开关 ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH 控制:当前关闭=不进主页(回退原行为)。
               allowDouyinIdLookup:
                 ENABLE_DOUYIN_ID_LOOKUP_ON_BATCH && recordPlatform === 'douyin',
+              expectedNoteId: expectedDouyinNoteId,
+              preferWorksTabForBloggerMetrics:
+                recordPlatform === 'douyin' &&
+                isDouyinContentFlowUrl(
+                  douyinReadyEntryUrlByRecordId.get(String(recordId)) ||
+                    noteUrl,
+                ),
               navigate: async (
                 navigationTabId,
                 navigationUrl,
@@ -5106,6 +5132,10 @@ export async function batchCaptureDetailsForRecords(
           );
 
           if (metricsResult.canceled) {
+            if (shouldApplyLowFollowerHitFilter) {
+              const canceledError = new Error('DETAIL_CAPTURE_CANCELED');
+              throw attachPartialDetailPayload(canceledError, detailPayload);
+            }
             stopAfterCurrent = true;
           }
         }
@@ -5113,9 +5143,22 @@ export async function batchCaptureDetailsForRecords(
         throwIfDetailPrefetchFatal();
 
         if (shouldApplyLowFollowerHitFilter && !stopAfterCurrent) {
-          const followerCount = parseInteractionCount(
-            detailPayload.bloggerFollowersCount,
+          const followerCount = resolveProvenBloggerFollowersCount(
+            detailPayload,
           );
+          if (followerCount === null) {
+            const followerProofError = new Error(
+              detailPayload.bloggerMetricsCaptureError ||
+                '低粉丝筛选无法确认博主粉丝数，请稍后重试',
+            );
+            followerProofError.code =
+              DETAIL_CAPTURE_FAILURE_CODE.BLOGGER_METRICS_FAILED;
+            followerProofError.retryable = true;
+            throw attachPartialDetailPayload(
+              followerProofError,
+              detailPayload,
+            );
+          }
           if (followerCount > Number(resolvedLowFollowerHitThreshold)) {
             const filteredBinding = buildCaptureTraceBinding(
               bindCaptureTrace(
@@ -5633,8 +5676,10 @@ export async function batchCaptureDetailsForRecords(
             detailPrefetchPipeline.release(detailWorkerLease);
             detailWorkerLease = null;
           }
-          const recovered = await recreateInterruptedXhsDetailRunners({
+          const recovered = await recreateInterruptedDetailRunners({
             recordId,
+            recordPlatform,
+            expectedNoteId: expectedDouyinNoteId,
             current,
             total: uniqueRecordIds.length,
           });
@@ -5707,6 +5752,7 @@ export async function batchCaptureDetailsForRecords(
           stopBatch: integrityBlocked,
           runnerInterrupted: runnerContextInterrupted,
           recoveryRequired: runnerContextInterrupted,
+          retryable: effectiveError?.retryable === true,
           ...captureTraceFields,
         };
         results.push(result);
@@ -6905,6 +6951,15 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
         syncType: syncInput.syncType,
         target: requestTarget,
         payload: syncInput.payload,
+        captureTaskId:
+          String(options?.captureTaskId || '').trim() ||
+          resolveActiveCloudCaptureTaskId(),
+        captureTaskItemAttemptId: String(
+          options?.captureTaskItemAttemptId || '',
+        ).trim(),
+        captureTaskItemRequestHash: String(
+          options?.captureTaskItemRequestHash || '',
+        ).trim(),
       },
       {shouldStop, signal},
     );
@@ -7358,6 +7413,10 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
 
 async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   const startedAt = Date.now();
+  const captureTaskId =
+    resolveActiveCloudCaptureTaskId({
+      taskId: String(options?.captureTaskId || '').trim(),
+    }) || resolveActiveCloudCaptureTaskId();
   const shouldStop = options?.shouldStop;
   const signal = options?.signal || null;
   const requestedRecordIds = Array.isArray(recordIds)
@@ -7392,6 +7451,12 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
     options.monitorExecutionId.trim()
       ? options.monitorExecutionId.trim()
       : '';
+  const batchCaptureTaskItemAttemptId = String(
+    options?.captureTaskItemAttemptId || '',
+  ).trim();
+  const batchCaptureTaskItemRequestHash = String(
+    options?.captureTaskItemRequestHash || '',
+  ).trim();
   const sourceRecords = await getRecords(recordIdsToSync);
   const recordMap = new Map(sourceRecords.map((record) => [record.id, record]));
   const recordsToSync = recordIdsToSync
@@ -7414,6 +7479,13 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       workflow: syncInput.workflow,
       sourceType: record.type,
       monitorExecutionId,
+      captureTaskId,
+      captureTaskItemAttemptId:
+        batchCaptureTaskItemAttemptId ||
+        String(record?.captureTaskItemAttemptId || '').trim(),
+      captureTaskItemRequestHash:
+        batchCaptureTaskItemRequestHash ||
+        String(record?.captureTaskItemRequestHash || '').trim(),
       retryCommentLeadsOnly:
         commentLeadsConfig.enabled &&
         isCommentLeadsEligibleSyncType(syncInput.syncType) &&
@@ -8350,6 +8422,12 @@ function buildSyncBatchRecordInput(record) {
   return {
     id: record.id,
     type: syncType,
+    platform: record.platform || '',
+    workflow: record.workflow || '',
+    monitorExecutionId: record.monitorExecutionId || '',
+    captureTaskId: record.captureTaskId || '',
+    captureTaskItemAttemptId: record.captureTaskItemAttemptId || '',
+    captureTaskItemRequestHash: record.captureTaskItemRequestHash || '',
     payload: buildSyncRequestPayload(syncType, record.syncPayload || record.payload),
   };
 }
@@ -8359,6 +8437,12 @@ function buildSyncBatchRecordRequestShape(record) {
   return {
     recordId: record.id,
     syncType,
+    platform: record.platform || '',
+    workflow: record.workflow || '',
+    monitorExecutionId: record.monitorExecutionId || '',
+    captureTaskId: record.captureTaskId || '',
+    captureTaskItemAttemptId: record.captureTaskItemAttemptId || '',
+    captureTaskItemRequestHash: record.captureTaskItemRequestHash || '',
     payload: buildSyncRequestPayload(syncType, record.syncPayload || record.payload),
   };
 }
@@ -8992,6 +9076,9 @@ function buildSyncBatchRecord(record) {
     platform: record.platform,
     workflow: record.workflow,
     monitorExecutionId: record.monitorExecutionId || '',
+    captureTaskId: record.captureTaskId || '',
+    captureTaskItemAttemptId: record.captureTaskItemAttemptId || '',
+    captureTaskItemRequestHash: record.captureTaskItemRequestHash || '',
     payload: record.syncPayload || record.payload,
   };
 }
@@ -9948,6 +10035,7 @@ async function captureBloggerMetricsForSingleNoteRecord(
 
 async function captureDouyinBloggerMetricsFromNoteDetail({
   tabId,
+  expectedNoteId = '',
   preferWorksTabForBloggerMetrics = true,
 } = {}) {
   const normalizedTabId = Number(tabId);
@@ -9964,6 +10052,7 @@ async function captureDouyinBloggerMetricsFromNoteDetail({
     singleResult = await captureInTab(normalizedTabId, {
       mode: 'single',
       captureParams: {
+        expectedNoteId: String(expectedNoteId || ''),
         includeBloggerMetrics: true,
         preferWorksTabForBloggerMetrics: Boolean(
           preferWorksTabForBloggerMetrics,
@@ -9971,14 +10060,28 @@ async function captureDouyinBloggerMetricsFromNoteDetail({
       },
     });
   } catch (error) {
+    const canceled =
+      isBatchCaptureCanceledError(error) ||
+      isDetailCaptureCanceledError(error);
     return {
       ok: false,
+      canceled,
       patch: null,
-      error: error?.message || '抖音作品页补采失败',
+      error: canceled
+        ? 'DETAIL_CAPTURE_CANCELED'
+        : error?.message || '抖音作品页补采失败',
     };
   }
 
   if (!singleResult?.ok) {
+    if (isCaptureCanceledResult(singleResult)) {
+      return {
+        ok: false,
+        canceled: true,
+        patch: null,
+        error: singleResult?.error?.message || '抖音作品页补采已取消',
+      };
+    }
     return {
       ok: false,
       patch: null,
@@ -10027,6 +10130,8 @@ async function captureBloggerMetricsForDetailPayload(
     cache = null,
     allowProfileNavigation = true,
     allowDouyinIdLookup = false,
+    expectedNoteId = '',
+    preferWorksTabForBloggerMetrics = false,
     navigate = openUrlInTab,
   } = {},
 ) {
@@ -10070,39 +10175,51 @@ async function captureBloggerMetricsForDetailPayload(
     };
   }
 
-  if (!allowProfileNavigation || platform === 'douyin') {
-    // 抖音指标不全(无 directPatch):不走小红书的进主页指标分支,
-    // 但若允许取号,单独进主页补「抖音号」。
-    // 关键:指标确实没采到 → 用 FAILED 状态承载号,绝不误标 DONE
-    // (否则会把指标为 0 的抖音帖显示成「博主指标已完成」、掩盖失败、抑制重采)。
-    if (platform === 'douyin' && allowDouyinIdLookup) {
-      const idPatch = createBloggerMetricsPatch({
-        status: BLOGGER_METRICS_CAPTURE_STATUS.FAILED,
-        error: '未能从作品详情页直接解析博主指标',
+  if (platform === 'douyin') {
+    const douyinMetricsResult =
+      await captureDouyinBloggerMetricsFromNoteDetail({
+        tabId,
+        expectedNoteId,
+        preferWorksTabForBloggerMetrics,
       });
-      const attached = await maybeAttachDouyinAccountNo(
-        idPatch,
-        normalizedPayload,
-        {
-          tabId,
-          noteUrl,
-          detailNavTimeoutMs,
-          profileAfterNavWaitMs,
-          shouldStop,
-          cache,
-          navigate,
-        },
-      );
-      if (attached) {
-        return {
-          ok: true,
-          canceled: false,
-          profileUrl: normalizedPayload.bloggerProfileUrl || '',
-          patch: idPatch,
-          error: '',
-        };
+    if (douyinMetricsResult?.ok && douyinMetricsResult.patch) {
+      if (allowDouyinIdLookup) {
+        await maybeAttachDouyinAccountNo(
+          douyinMetricsResult.patch,
+          normalizedPayload,
+          {
+            tabId,
+            noteUrl,
+            detailNavTimeoutMs,
+            profileAfterNavWaitMs,
+            shouldStop,
+            cache,
+            navigate,
+          },
+        );
       }
+      return {
+        ok: true,
+        canceled: false,
+        profileUrl:
+          douyinMetricsResult.patch.bloggerProfileUrl ||
+          normalizedPayload.bloggerProfileUrl ||
+          '',
+        patch: douyinMetricsResult.patch,
+        error: '',
+      };
     }
+    return {
+      ok: false,
+      canceled: Boolean(douyinMetricsResult?.canceled),
+      profileUrl: normalizedPayload.bloggerProfileUrl || '',
+      error:
+        douyinMetricsResult?.error ||
+        '未能从作品详情页直接解析博主指标',
+    };
+  }
+
+  if (!allowProfileNavigation) {
     return {
       ok: false,
       canceled: false,
@@ -10163,6 +10280,16 @@ async function captureBloggerMetricsForDetailPayload(
     });
     if (!profileResult?.ok) {
       throw new Error(profileResult?.error?.message || '博主主页采集失败');
+    }
+    if (
+      String(profileResult?.data?.bloggerMetricsCaptureStatus || '')
+        .trim()
+        .toLowerCase() === BLOGGER_METRICS_CAPTURE_STATUS.FAILED
+    ) {
+      throw new Error(
+        profileResult?.data?.bloggerMetricsCaptureError ||
+          '博主主页未能确认粉丝与互动指标',
+      );
     }
 
     if (noteUrl) {
@@ -10965,6 +11092,60 @@ function normalizeOptionalCount(value) {
   return Math.floor(parsed);
 }
 
+function isExplicitCountValue(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value >= 0;
+  }
+  return /[0-9]/u.test(String(value ?? ''));
+}
+
+function resolveProvenBloggerMetricCount(
+  payload,
+  {
+    valueKeys = [],
+    knownKeys = [],
+  } = {},
+) {
+  const safePayload =
+    payload && typeof payload === 'object' ? payload : {};
+  const explicitlyKnown = knownKeys.some(
+    (key) => safePayload[key] === true,
+  );
+
+  for (const key of valueKeys) {
+    if (!Object.prototype.hasOwnProperty.call(safePayload, key)) continue;
+    const rawCount = safePayload[key];
+    if (!isExplicitCountValue(rawCount)) continue;
+    const count = normalizeOptionalCount(rawCount);
+    if (count === null) continue;
+    // Positive values cannot be introduced by the zero-default normalizer.
+    // Zero is evidence only when the extractor explicitly marks the metric
+    // known; a generic completed/defaulted payload is not sufficient proof.
+    if (count > 0 || explicitlyKnown) return count;
+  }
+  return null;
+}
+
+function resolveProvenBloggerFollowersCount(payload) {
+  return resolveProvenBloggerMetricCount(payload, {
+    valueKeys: ['bloggerFollowersCount', 'followersCount'],
+    knownKeys: ['bloggerFollowersCountKnown', 'followersCountKnown'],
+  });
+}
+
+function resolveProvenBloggerLikedAndCollectedCount(payload) {
+  return resolveProvenBloggerMetricCount(payload, {
+    valueKeys: [
+      'bloggerLikedAndCollectedCount',
+      'likedAndCollectedCount',
+    ],
+    knownKeys: [
+      'bloggerLikedAndCollectedCountKnown',
+      'likedAndCollectedCountKnown',
+    ],
+  });
+}
+
 function pickFirstCountFromSources(sources = [], keys = []) {
   for (const source of sources) {
     if (!source || typeof source !== 'object') continue;
@@ -11077,6 +11258,12 @@ function ensureBloggerMetricsFields(payload) {
     bloggerLikedAndCollectedCount: normalizeNonNegativeNumber(
       base.bloggerLikedAndCollectedCount ?? base.likedAndCollectedCount,
     ),
+    bloggerFollowersCountKnown:
+      base.bloggerFollowersCountKnown === true ||
+      base.followersCountKnown === true,
+    bloggerLikedAndCollectedCountKnown:
+      base.bloggerLikedAndCollectedCountKnown === true ||
+      base.likedAndCollectedCountKnown === true,
     bloggerProfileUrl: String(base.bloggerProfileUrl || base.authorUrl || ''),
     bloggerMetricsCaptureStatus: status,
     bloggerMetricsCaptureError: String(base.bloggerMetricsCaptureError || ''),
@@ -11104,6 +11291,11 @@ function applyBloggerMetricsPatch(payload, patch) {
       patch.bloggerFollowersCount ?? base.bloggerFollowersCount,
     bloggerLikedAndCollectedCount:
       patch.bloggerLikedAndCollectedCount ?? base.bloggerLikedAndCollectedCount,
+    bloggerFollowersCountKnown:
+      patch.bloggerFollowersCountKnown ?? base.bloggerFollowersCountKnown,
+    bloggerLikedAndCollectedCountKnown:
+      patch.bloggerLikedAndCollectedCountKnown ??
+      base.bloggerLikedAndCollectedCountKnown,
     bloggerProfileUrl: patch.bloggerProfileUrl ?? base.bloggerProfileUrl,
     bloggerMetricsCaptureStatus:
       patch.bloggerMetricsCaptureStatus ?? base.bloggerMetricsCaptureStatus,
@@ -11123,6 +11315,8 @@ function createBloggerMetricsPatch({
   accountType,
   bloggerId,
   bloggerName,
+  followersCountKnown,
+  likedAndCollectedCountKnown,
 }) {
   const patch = {
     bloggerMetricsCaptureStatus: status,
@@ -11136,6 +11330,13 @@ function createBloggerMetricsPatch({
     patch.bloggerLikedAndCollectedCount = normalizeNonNegativeNumber(
       likedAndCollectedCount,
     );
+  }
+  if (followersCountKnown !== undefined) {
+    patch.bloggerFollowersCountKnown = followersCountKnown === true;
+  }
+  if (likedAndCollectedCountKnown !== undefined) {
+    patch.bloggerLikedAndCollectedCountKnown =
+      likedAndCollectedCountKnown === true;
   }
   if (profileUrl !== undefined) {
     patch.bloggerProfileUrl = String(profileUrl || '');
@@ -11188,14 +11389,22 @@ function resolveBloggerMetricsFromProfilePayload(
 ) {
   const safePayload =
     profilePayload && typeof profilePayload === 'object' ? profilePayload : {};
+  const rawFollowersCount =
+    safePayload.bloggerFollowersCount ?? safePayload.followersCount;
+  const rawLikedAndCollectedCount =
+    safePayload.bloggerLikedAndCollectedCount ??
+    safePayload.likedAndCollectedCount;
 
   return createBloggerMetricsPatch({
     status: BLOGGER_METRICS_CAPTURE_STATUS.DONE,
-    followersCount:
-      safePayload.bloggerFollowersCount ?? safePayload.followersCount,
-    likedAndCollectedCount:
-      safePayload.bloggerLikedAndCollectedCount ??
-      safePayload.likedAndCollectedCount,
+    followersCount: rawFollowersCount,
+    likedAndCollectedCount: rawLikedAndCollectedCount,
+    followersCountKnown:
+      isExplicitCountValue(rawFollowersCount) &&
+      normalizeOptionalCount(rawFollowersCount) !== null,
+    likedAndCollectedCountKnown:
+      isExplicitCountValue(rawLikedAndCollectedCount) &&
+      normalizeOptionalCount(rawLikedAndCollectedCount) !== null,
     profileUrl:
       safePayload.bloggerProfileUrl ||
       safePayload.authorUrl ||
@@ -11218,26 +11427,24 @@ function resolveBloggerMetricsPatchFromCurrentPayload(
   { requireBothMetrics = false } = {},
 ) {
   const normalizedPayload = ensureBloggerMetricsFields(payload);
-  const followersCount = normalizeNonNegativeNumber(
-    normalizedPayload.bloggerFollowersCount ?? normalizedPayload.followersCount,
-  );
-  const likedAndCollectedCount = normalizeNonNegativeNumber(
-    normalizedPayload.bloggerLikedAndCollectedCount ??
-      normalizedPayload.likedAndCollectedCount,
-  );
+  const followersCount = resolveProvenBloggerFollowersCount(payload);
+  const likedAndCollectedCount =
+    resolveProvenBloggerLikedAndCollectedCount(payload);
 
   if (requireBothMetrics) {
-    if (!(followersCount > 0 && likedAndCollectedCount > 0)) {
+    if (followersCount === null || likedAndCollectedCount === null) {
       return null;
     }
-  } else if (!(followersCount > 0 || likedAndCollectedCount > 0)) {
+  } else if (followersCount === null && likedAndCollectedCount === null) {
     return null;
   }
 
   return createBloggerMetricsPatch({
     status: BLOGGER_METRICS_CAPTURE_STATUS.DONE,
-    followersCount,
-    likedAndCollectedCount,
+    followersCount: followersCount ?? undefined,
+    likedAndCollectedCount: likedAndCollectedCount ?? undefined,
+    followersCountKnown: followersCount !== null,
+    likedAndCollectedCountKnown: likedAndCollectedCount !== null,
     profileUrl:
       normalizedPayload.bloggerProfileUrl ||
       resolveBloggerProfileUrlFromPayload(normalizedPayload),
@@ -12649,11 +12856,80 @@ async function probeDetailPreloadSafety(
           const isXiaohongshu = /(^|\.)xiaohongshu\.com$/i.test(
             location.hostname,
           );
+          const normalizeChallengeText = (value) =>
+            String(value || '').trim().replace(/\s+/gu, '');
+          const isChallengeCopy = (value) => {
+            const normalized = normalizeChallengeText(value);
+            return (
+              /请完成下列验证后继续[:：]?/iu.test(normalized) ||
+              (
+                /请选择所有符合(?:上文|上述|下列)?描述的图片/iu.test(
+                  normalized,
+                ) &&
+                /(?:并)?拖拽到(?:下方|这里)/iu.test(normalized)
+              )
+            );
+          };
+          const isVisibleChallengeNode = (node) => {
+            if (!(node instanceof Element)) return false;
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return Boolean(
+              rect.width > 4 &&
+                rect.height > 4 &&
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                Number(style.opacity || 1) > 0.01,
+            );
+          };
+          const structuredChallengeSelectors = [
+            '[role="dialog"]',
+            'dialog',
+            '[id*="captcha" i]',
+            '[id*="verify" i]',
+            '[class*="captcha" i]',
+            '[class*="verify" i]',
+            '[class*="challenge" i]',
+            '[data-e2e*="captcha" i]',
+            '[data-testid*="captcha" i]',
+          ].join(',');
+          const structuredChallengeNodes = Array.from(
+            document.querySelectorAll(structuredChallengeSelectors),
+          );
+          for (const canvas of document.querySelectorAll('canvas')) {
+            const container = canvas.closest?.(
+              '[role="dialog"], dialog, section, aside, div',
+            );
+            if (container && !structuredChallengeNodes.includes(container)) {
+              structuredChallengeNodes.push(container);
+            }
+          }
+          const semanticChallenge = structuredChallengeNodes.some(
+            (node) =>
+              isVisibleChallengeNode(node) &&
+              isChallengeCopy(node.innerText || node.textContent || ''),
+          );
+          const challengeFrame = Array.from(
+            document.querySelectorAll('iframe'),
+          ).some((frame) => {
+            if (!isVisibleChallengeNode(frame)) return false;
+            const evidence = normalizeChallengeText(
+              [
+                frame.getAttribute?.('src'),
+                frame.getAttribute?.('title'),
+                frame.getAttribute?.('name'),
+                frame.id,
+                frame.className,
+              ].join(' '),
+            ).toLowerCase();
+            return /captcha|verify|verification|challenge/iu.test(evidence);
+          });
+          const exactChallengeTitle = /^(?:验证码中间页|抖音验证码中间页)$/iu.test(
+            normalizeChallengeText(title),
+          );
           const challengeBlocked =
             !isXiaohongshu &&
-            /(验证码中间页|请完成下列验证后继续|请完成验证|captcha|challenge)/iu.test(
-              `${title} ${bodyText}`,
-            );
+            (exactChallengeTitle || semanticChallenge || challengeFrame);
           const isDouyin = /(^|\.)douyin\.com$/i.test(location.hostname);
           const douyinRateLimitPattern =
             /(?:访问|请求|操作).{0,12}(?:过于?频繁|频繁|过多)|too many requests|(?:http|status|code|状态码|错误码)\s*[:：]?\s*429\b/iu;
@@ -14427,6 +14703,8 @@ const BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS = 12000;
 const DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS = 45000;
 const BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS = 5000;
 const BATCH_KEYWORD_RESULTS_STABLE_POLLS = 2;
+const DOUYIN_SEARCH_SERVICE_ABNORMAL_STABLE_POLLS = 2;
+const DOUYIN_SEARCH_SERVICE_ABNORMAL_MIN_STABLE_MS = 1500;
 // 0.3.32 在搜索后固定等待 2 秒、筛选后等待 1.2 秒。后来为尽快识别异常页移除了
 // 抖音等待，导致搜索→筛选→读取动作过密。恢复基础停顿并加入轻微随机化，同时轮询
 // 安全验证；这只降低触发概率，不会自动点击或绕过真实验证码。
@@ -14434,9 +14712,8 @@ const DOUYIN_SEARCH_PACING_MIN_MS = 2000;
 const DOUYIN_SEARCH_PACING_MAX_MS = 3000;
 const DOUYIN_FILTER_PACING_MIN_MS = 1200;
 const DOUYIN_FILTER_PACING_MAX_MS = 1900;
-// 抖音搜索 URL 常被改写/二次编码,"网址里的关键词"经常和目标词字面对不上。
-// 切词那步(switchDouyinKeywordSearchInTab)已先确认过页面切到了新词,这里再强判 keywordMatched 是冗余的,
-// 只会在"卡片其实已经出现"时白白空等到超时。给一个宽限期:超过它仍未字面匹配但卡片稳定,就放行。
+// 抖音搜索 URL 常被改写为无关键词路由。字面对不上时先给页面 6 秒完成改写，随后仍须
+// 证明受信作品集合相对提交前发生替换；旧卡片稳定或仅懒加载新增都不能放行。
 const BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS = 6000;
 
 async function waitForDouyinSearchPacingWindow(
@@ -15035,6 +15312,7 @@ export async function batchCaptureByUrls({
             ok: true,
             recordIds,
             partial: Boolean(enhancementResult && !enhancementResult.ok),
+            scanComplete: !(enhancementResult && !enhancementResult.ok),
             canceled: canceledDuringEnhancement,
             commentsResult: enhancementResult?.commentsResult || null,
             bloggerMetricsResult: enhancementResult?.bloggerMetricsResult || null,
@@ -15043,6 +15321,25 @@ export async function batchCaptureByUrls({
               enhancementResult && !enhancementResult.ok
                 ? enhancementResult.error?.message || "可选增强采集失败"
                 : "",
+            ...(enhancementResult && !enhancementResult.ok
+              ? {
+                  error:
+                    enhancementResult.error &&
+                    typeof enhancementResult.error === "object"
+                      ? enhancementResult.error
+                      : {
+                          code: String(
+                            enhancementResult.errorCode ||
+                              "CAPTURE_ENHANCEMENT_INCOMPLETE",
+                          ),
+                          message:
+                            enhancementResult.error?.message ||
+                            enhancementResult.message ||
+                            "采集增强未完整完成",
+                          retryable: enhancementResult.retryable !== false,
+                        },
+                }
+              : {}),
           });
           successCount++;
           if (canceledDuringEnhancement) {
@@ -15054,6 +15351,7 @@ export async function batchCaptureByUrls({
             url,
             ok: true,
             recordIds: profileRecordIds,
+            scanComplete: true,
             captureCacheStats: saveResult.cacheStats || null,
           });
           successCount++;
@@ -15068,13 +15366,23 @@ export async function batchCaptureByUrls({
         if (partialRecordIds.length > 0 || profileRecordIds.length > 0) {
           results.push({
             url,
-            ok: true,
+            ok: false,
             partial: true,
+            scanComplete: false,
             recordIds: [...profileRecordIds, ...partialRecordIds],
             captureCacheStats: createListCaptureCacheStats(checkpointSession),
             warning: captureResult?.error?.message || "采集未完整完成",
+            error:
+              captureResult?.error && typeof captureResult.error === "object"
+                ? captureResult.error
+                : {
+                    code: String(captureResult?.errorCode || "CAPTURE_INCOMPLETE"),
+                    message:
+                      captureResult?.error?.message || "采集未完整完成",
+                    retryable: true,
+                  },
           });
-          successCount++;
+          failedCount++;
         } else {
           results.push({
             url,
@@ -15121,13 +15429,32 @@ export async function batchCaptureByUrls({
         if (partialRecordIds.length > 0 || profileRecordIds.length > 0) {
           results.push({
             url,
-            ok: true,
+            ok: false,
             partial: true,
+            scanComplete: false,
             recordIds: [...profileRecordIds, ...partialRecordIds],
             captureCacheStats: createListCaptureCacheStats(checkpointSession),
             warning: error.message || "采集未完整完成",
+            error: {
+              code: String(error?.code || "CAPTURE_INCOMPLETE"),
+              category: String(error?.category || ""),
+              message: error.message || "采集未完整完成",
+              retryable: error?.retryable !== false,
+              ...(error?.securityBlocked === true
+                ? {securityBlocked: true}
+                : {}),
+              ...(error?.platformSafetyBlocked === true
+                ? {platformSafetyBlocked: true}
+                : {}),
+              ...(error?.requiresManualAction === true
+                ? {requiresManualAction: true}
+                : {}),
+              ...(error?.securityEvidence?.confirmed === true
+                ? {securityEvidence: error.securityEvidence}
+                : {}),
+            },
           });
-          successCount++;
+          failedCount++;
         } else {
           results.push({
             url,
@@ -15183,15 +15510,27 @@ export async function batchCaptureByUrls({
     });
   }
 
+  const partialCount = results.filter((entry) => entry?.partial === true).length;
+  const scanComplete = !canceled && failedCount === 0 && partialCount === 0;
   return {
-    ok: !canceled && failedCount === 0,
+    ok: scanComplete,
     canceled,
+    partial: partialCount > 0,
+    scanComplete,
+    incompleteReason: scanComplete
+      ? ""
+      : canceled
+        ? "capture_canceled"
+        : partialCount > 0
+          ? "partial_capture"
+          : "capture_failed",
     results,
     stats: {
       total: urls.length,
       processed: successCount + failedCount,
       success: successCount,
       failed: failedCount,
+      partial: partialCount,
     },
   };
 }
@@ -15622,8 +15961,9 @@ export async function batchCaptureByKeywords({
       // 构建搜索 URL
       const searchUrl = buildKeywordSearchUrl(keyword, platform, baseSearchUrl);
 
+      let douyinSearchTransition = null;
       if (isDouyinPlatform(platform)) {
-        await switchDouyinKeywordSearchInTab(
+        douyinSearchTransition = await switchDouyinKeywordSearchInTab(
           runnerTabId,
           keyword,
           searchUrl,
@@ -15673,6 +16013,17 @@ export async function batchCaptureByKeywords({
           {
             keyword,
             returnState: true,
+            requireResultTransition: isDouyinPlatform(platform),
+            previousWorkIds:
+              douyinSearchTransition?.baselineCaptured === true
+                ? douyinSearchTransition.previousWorkIds
+                : null,
+            submitAccepted:
+              douyinSearchTransition?.submitAccepted === true,
+            submissionNonce:
+              douyinSearchTransition?.submissionNonce || '',
+            navigationTransitionAccepted:
+              douyinSearchTransition?.navigationTransitionAccepted === true,
           },
         ),
       );
@@ -15708,7 +16059,12 @@ export async function batchCaptureByKeywords({
                 message: `「${keyword}」筛选后页面异常，正在重新搜索并重挂筛选(${i + 1}/${keywords.length})...`,
               });
             }
-            await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
+            const retrySearchTransition = await submitKeywordSearchInTab(
+              runnerTabId,
+              platform,
+              keyword,
+              shouldStop,
+            );
             await waitForDouyinSearchPacingWindow(
               runnerTabId,
               shouldStop,
@@ -15722,10 +16078,24 @@ export async function batchCaptureByKeywords({
                 {
                   keyword,
                   returnState: true,
+                  requireResultTransition: true,
+                  previousWorkIds:
+                    retrySearchTransition?.baselineCaptured === true
+                      ? retrySearchTransition.previousWorkIds
+                      : null,
+                  submitAccepted:
+                    retrySearchTransition?.accepted === true,
+                  submissionNonce:
+                    retrySearchTransition?.submissionNonce || '',
                 },
               ),
             );
             throwConfirmedEmptySearchResult(keyword, retrySearchReadiness);
+            if (!retrySearchReadiness.ready) {
+              throw new Error(
+                `「${keyword}」重新搜索未产生可信的新结果代际，已跳过以免采到旧结果`,
+              );
+            }
           }
           if (onProgress) {
             onProgress({
@@ -15736,9 +16106,31 @@ export async function batchCaptureByKeywords({
               message: `正在切换排序筛选「${keyword}」(${i + 1}/${keywords.length})...`,
             });
           }
-          await applySearchFiltersInTab(runnerTabId, searchFilters, {
+          const filterTransition = isDouyinPlatform(platform)
+            ? await beginDouyinSearchResultTransitionInTab(
+                runnerTabId,
+                keyword,
+              )
+            : null;
+          const filterApplication = await applySearchFiltersInTab(
+            runnerTabId,
+            searchFilters,
+            {
             requireVerifiedFilters,
-          });
+            },
+          );
+          if (
+            isDouyinPlatform(platform) &&
+            filterApplication?.complete !== true
+          ) {
+            throw createSearchFilterApplicationError(filterApplication);
+          }
+          const filterChanged = Boolean(
+            isDouyinPlatform(platform) &&
+              filterApplication?.results?.some?.(
+                (result) => result?.changed === true,
+              ),
+          );
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
           if (isDouyinPlatform(platform)) {
             await waitForDouyinSearchPacingWindow(
@@ -15769,9 +16161,19 @@ export async function batchCaptureByKeywords({
               shouldStop,
               {
                 keyword,
-                timeoutMs: 12000,
-                stablePolls: 1,
                 returnState: true,
+                requireResultTransition: filterChanged,
+                previousWorkIds:
+                  filterTransition?.baselineCaptured === true
+                    ? filterTransition.previousWorkIds
+                    : null,
+                submitAccepted:
+                  filterChanged &&
+                  Boolean(filterTransition?.submissionNonce),
+                submissionNonce:
+                  filterChanged
+                    ? filterTransition?.submissionNonce || ''
+                    : '',
               },
             ),
           );
@@ -15839,7 +16241,12 @@ export async function batchCaptureByKeywords({
           });
         }
         if (isDouyinPlatform(platform)) {
-          await submitKeywordSearchInTab(runnerTabId, platform, keyword, shouldStop);
+          douyinSearchTransition = await submitKeywordSearchInTab(
+            runnerTabId,
+            platform,
+            keyword,
+            shouldStop,
+          );
         }
         const reportRetryWaitProgress = (remainingMs = BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS) => {
           if (!onProgress) {
@@ -15870,7 +16277,19 @@ export async function batchCaptureByKeywords({
             runnerTabId,
             platform,
             shouldStop,
-            {keyword, returnState: true},
+            {
+              keyword,
+              returnState: true,
+              requireResultTransition: isDouyinPlatform(platform),
+              previousWorkIds:
+                douyinSearchTransition?.baselineCaptured === true
+                  ? douyinSearchTransition.previousWorkIds
+                  : null,
+              submitAccepted:
+                douyinSearchTransition?.accepted === true,
+              submissionNonce:
+                douyinSearchTransition?.submissionNonce || '',
+            },
           ),
         );
         throwConfirmedEmptySearchResult(keyword, retryReadiness);
@@ -15883,9 +16302,24 @@ export async function batchCaptureByKeywords({
         // 抖音上面刚重新点了搜索,已挂的筛选会被清空:配置了筛选就必须重挂再采,
         // 否则采到的是未筛选(可能好几年前)的内容。
         if (isDouyinPlatform(platform) && hasActiveBatchSearchFilters(searchFilters)) {
-          await applySearchFiltersInTab(runnerTabId, searchFilters, {
-            requireVerifiedFilters,
-          });
+          const refilterTransition =
+            await beginDouyinSearchResultTransitionInTab(
+              runnerTabId,
+              keyword,
+            );
+          const refilterApplication = await applySearchFiltersInTab(
+            runnerTabId,
+            searchFilters,
+            {requireVerifiedFilters},
+          );
+          if (refilterApplication?.complete !== true) {
+            throw createSearchFilterApplicationError(refilterApplication);
+          }
+          const refilterChanged = Boolean(
+            refilterApplication?.results?.some?.(
+              (result) => result?.changed === true,
+            ),
+          );
           await closeKeywordSearchFilterPanelInTab(runnerTabId);
           await waitForDouyinSearchPacingWindow(
             runnerTabId,
@@ -15899,9 +16333,19 @@ export async function batchCaptureByKeywords({
               shouldStop,
               {
                 keyword,
-                timeoutMs: 12000,
-                stablePolls: 1,
                 returnState: true,
+                requireResultTransition: refilterChanged,
+                previousWorkIds:
+                  refilterTransition?.baselineCaptured === true
+                    ? refilterTransition.previousWorkIds
+                    : null,
+                submitAccepted:
+                  refilterChanged &&
+                  Boolean(refilterTransition?.submissionNonce),
+                submissionNonce:
+                  refilterChanged
+                    ? refilterTransition?.submissionNonce || ''
+                    : '',
               },
             ),
           );
@@ -15969,6 +16413,8 @@ export async function batchCaptureByKeywords({
             keyword,
             ok: true,
             recordIds,
+            candidateCount: recordIds.length,
+            scanComplete: true,
             captureCacheStats: captureRunResult.captureCacheStats || null,
           };
           results.push(keywordResult);
@@ -15985,12 +16431,17 @@ export async function batchCaptureByKeywords({
         } else {
           keywordResult = {
             keyword,
-            ok: true,
+            ok: false,
+            partial: true,
             recordIds: [],
+            scanComplete: false,
+            errorCode: 'SEARCH_RESULTS_UNCONFIRMED_EMPTY',
+            error:
+              '搜索流程没有返回可验证的结果，已保留该关键词等待重试',
             captureCacheStats: captureRunResult.captureCacheStats || null,
           };
           results.push(keywordResult);
-          successCount++;
+          failedCount++;
         }
       } else {
         const partialRecordIds = Array.isArray(captureRunResult?.recordIds)
@@ -16001,6 +16452,7 @@ export async function batchCaptureByKeywords({
             keyword,
             ok: true,
             partial: true,
+            scanComplete: false,
             fatal: captureFatal || captureFailure.fatal,
             recordIds: partialRecordIds,
             captureCacheStats: captureRunResult?.captureCacheStats || null,
@@ -16054,6 +16506,8 @@ export async function batchCaptureByKeywords({
           noResults: true,
           emptyResult: true,
           resultKind: 'no_matching_results',
+          candidateCount: 0,
+          scanComplete: true,
           recordIds: [],
           message:
             error?.message ||
@@ -16875,6 +17329,11 @@ async function submitKeywordSearchInTab(
     });
   }
 
+  // Every click owns the exact visible result baseline that immediately
+  // preceded it. Resubmits must never reuse the first navigation baseline,
+  // otherwise a no-op click can be mistaken for a later result generation.
+  const previousResults = await readDouyinSearchWorkIdsInTab(normalizedTabId);
+
   const result = await chrome.scripting
     .executeScript({
       target: {tabId: normalizedTabId},
@@ -16923,7 +17382,7 @@ async function submitKeywordSearchInTab(
         const keywordMatched =
           !expected ||
           normalize(urlKeyword) === expected ||
-          normalize(inputKeyword).includes(expected);
+          normalize(inputKeyword) === expected;
         if (!keywordMatched) {
           return {
             clicked: false,
@@ -16932,6 +17391,129 @@ async function submitKeywordSearchInTab(
             inputKeyword,
           };
         }
+
+        const installSubmissionWitness = () => {
+          const witnessKey = '__STARVOICE_DOUYIN_SEARCH_WITNESS__';
+          const resultRootSelector = [
+            '#search-result-container',
+            '#waterFallScrollContainer',
+            '[data-e2e="scroll-list"]',
+          ].join(',');
+          const resultIdentitySelector = [
+            '[id^="waterfall_item_"]',
+            '[data-e2e-aweme-id]',
+            '[data-aweme-id]',
+            '[data-awemeid]',
+            '[data-modal-id]',
+            'a[href*="/video/"]',
+            'a[href*="/note/"]',
+            'a[href*="modal_id="]',
+          ].join(',');
+          const readRoot = () => document.querySelector(resultRootSelector);
+          const countResults = (root) =>
+            root?.querySelectorAll?.(resultIdentitySelector)?.length || 0;
+          const baselineRoot = readRoot();
+          const baselineCount = countResults(baselineRoot);
+          const baselineBusy =
+            String(baselineRoot?.getAttribute?.('aria-busy') || '')
+              .toLowerCase() === 'true';
+          const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          const witness = {
+            nonce,
+            keyword: expected,
+            submittedAt: Date.now(),
+            baselineCount,
+            mutationCount: 0,
+            baselineBusy,
+            sawBusyStart: false,
+            sawBusyRoundTrip: false,
+            sawCleared: false,
+            sawClearRepopulated: false,
+            rootReplaced: false,
+            generationChanged: false,
+            observer: null,
+          };
+          try {
+            window[witnessKey]?.observer?.disconnect?.();
+          } catch {
+            // A stale page-owned marker must not block the new submission.
+          }
+          window[witnessKey] = witness;
+          if (
+            typeof MutationObserver !== 'function' ||
+            !document.body
+          ) {
+            return nonce;
+          }
+          const isRelatedNode = (node, root) => {
+            if (!node || !root) return false;
+            if (node === root) return true;
+            try {
+              return Boolean(root.contains?.(node) || node.contains?.(root));
+            } catch {
+              return false;
+            }
+          };
+          const observer = new MutationObserver((records) => {
+            const currentRoot = readRoot();
+            const relevantRecords = Array.from(records || []).filter((record) => {
+              if (isRelatedNode(record?.target, baselineRoot) ||
+                  isRelatedNode(record?.target, currentRoot)) {
+                return true;
+              }
+              return Array.from(record?.addedNodes || [])
+                .concat(Array.from(record?.removedNodes || []))
+                .some((node) =>
+                  isRelatedNode(node, baselineRoot) ||
+                  isRelatedNode(node, currentRoot) ||
+                  node?.matches?.(resultRootSelector) ||
+                  node?.querySelector?.(resultRootSelector),
+                );
+            });
+            if (relevantRecords.length === 0) return;
+            witness.mutationCount += relevantRecords.length;
+            if (
+              baselineRoot &&
+              currentRoot &&
+              currentRoot !== baselineRoot
+            ) {
+              witness.rootReplaced = true;
+            }
+            const currentCount = countResults(currentRoot);
+            if (baselineCount > 0 && currentCount === 0) {
+              witness.sawCleared = true;
+            }
+            const busy =
+              String(currentRoot?.getAttribute?.('aria-busy') || '')
+                .toLowerCase() === 'true';
+            if (!witness.baselineBusy && busy) {
+              witness.sawBusyStart = true;
+            }
+            if (witness.sawBusyStart && !busy) {
+              witness.sawBusyRoundTrip = true;
+            }
+            if (witness.sawCleared && currentCount > 0) {
+              witness.sawClearRepopulated = true;
+            }
+            witness.generationChanged ||= Boolean(
+              witness.rootReplaced ||
+                witness.sawBusyRoundTrip ||
+                witness.sawClearRepopulated ||
+                (witness.sawCleared && currentCount === 0),
+            );
+          });
+          witness.observer = observer;
+          observer.observe(document.body, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ['aria-busy'],
+          });
+          if (typeof setTimeout === 'function') {
+            setTimeout(() => observer.disconnect(), 60_000);
+          }
+          return nonce;
+        };
 
         const buttonSelectors = [
           '[data-e2e="searchbar-button"]',
@@ -16950,6 +17532,7 @@ async function submitKeywordSearchInTab(
         const button = textButton;
         if (!button) {
           if (input) {
+            const submissionNonce = installSubmissionWitness();
             input.focus?.();
             input.dispatchEvent(
               new KeyboardEvent('keydown', {
@@ -16967,11 +17550,12 @@ async function submitKeywordSearchInTab(
                 cancelable: true,
               }),
             );
-            return {clicked: true, via: 'enter'};
+            return {clicked: true, via: 'enter', submissionNonce};
           }
           return {clicked: false, reason: 'button_not_found'};
         }
 
+        const submissionNonce = installSubmissionWitness();
         button.scrollIntoView?.({block: 'center', inline: 'center'});
         button.dispatchEvent(
           new PointerEvent('pointerdown', {
@@ -17004,14 +17588,329 @@ async function submitKeywordSearchInTab(
           }),
         );
         button.click?.();
-        return {clicked: true, via: 'button'};
+        return {clicked: true, via: 'button', submissionNonce};
       },
       args: [keyword],
     })
     .then(([scriptResult]) => scriptResult?.result || null)
     .catch(() => null);
 
-  return Boolean(result?.clicked);
+  if (result?.clicked !== true) return false;
+  return Object.freeze({
+    accepted: true,
+    via: String(result?.via || ''),
+    submissionNonce: String(result?.submissionNonce || ''),
+    baselineCaptured: previousResults.captured === true,
+    previousWorkIds: previousResults.workIds,
+  });
+}
+
+async function readDouyinSearchWorkIdsInTab(tabId) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return {captured: false, workIds: []};
+  }
+  return chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: () => {
+        const resultRoots = [
+          '#search-result-container',
+          '#waterFallScrollContainer',
+          '[data-e2e="scroll-list"]',
+        ];
+        const identitySelectors = [
+          '[id^="waterfall_item_"]',
+          '[data-e2e-aweme-id]',
+          '[data-aweme-id]',
+          '[data-awemeid]',
+          '[data-modal-id]',
+          'a[href*="/video/"]',
+          'a[href*="/note/"]',
+          'a[href*="modal_id="]',
+          'a[data-href*="/video/"]',
+          'a[data-href*="/note/"]',
+          'a[data-url*="/video/"]',
+          'a[data-url*="/note/"]',
+        ];
+        const selectors = resultRoots.flatMap((root) =>
+          identitySelectors.map((identity) => `${root} ${identity}`),
+        );
+        const decode = (value) => {
+          try {
+            return decodeURIComponent(String(value || ''));
+          } catch {
+            return String(value || '');
+          }
+        };
+        const extractFromUrl = (value) => {
+          const candidates = [String(value || ''), decode(value)];
+          for (const candidate of candidates) {
+            const matched = candidate.match(
+              /\/(?:video|note)\/(\d{8,})(?:[/?#]|$)|[?&]modal_id=(\d{8,})(?:[&#]|$)/iu,
+            );
+            if (matched?.[1] || matched?.[2]) return matched[1] || matched[2];
+          }
+          return '';
+        };
+        const isVisible = (node) => {
+          if (!(node instanceof Element)) return false;
+          const rect = node.getBoundingClientRect();
+          if (rect.width <= 8 || rect.height <= 8) return false;
+          const style = window.getComputedStyle(node);
+          return style.display !== 'none'
+            && style.visibility !== 'hidden'
+            && Number(style.opacity || 1) > 0.01;
+        };
+        const workIds = [];
+        const seen = new Set();
+        const nodes = Array.from(document.querySelectorAll(selectors.join(',')))
+          .slice(0, 200);
+        for (const node of nodes) {
+          if (!isVisible(node)) continue;
+          const waterfallId = String(node.id || '').match(
+            /^waterfall_item_(\d{8,})(?:$|[_:-])/u,
+          )?.[1];
+          const dedicatedId = [
+            node.getAttribute?.('data-e2e-aweme-id'),
+            node.getAttribute?.('data-aweme-id'),
+            node.getAttribute?.('data-awemeid'),
+            node.getAttribute?.('data-modal-id'),
+          ].map((value) => String(value || '').trim())
+            .find((value) => /^\d{8,}$/u.test(value));
+          const linkedId = [
+            node.getAttribute?.('href'),
+            node.getAttribute?.('data-href'),
+            node.getAttribute?.('data-url'),
+          ].map(extractFromUrl).find(Boolean);
+          const workId = waterfallId || dedicatedId || linkedId || '';
+          if (!/^\d{8,}$/u.test(workId) || seen.has(workId)) continue;
+          seen.add(workId);
+          workIds.push(workId);
+        }
+        return {captured: true, workIds};
+      },
+    })
+    .then(([result]) => {
+      const value = result?.result;
+      return {
+        captured: value?.captured === true,
+        workIds: Array.from(
+          new Set(
+            (Array.isArray(value?.workIds) ? value.workIds : [])
+              .map((workId) => String(workId || '').trim())
+              .filter((workId) => /^\d{8,}$/u.test(workId)),
+          ),
+        ),
+      };
+    })
+    .catch(() => ({captured: false, workIds: []}));
+}
+
+async function beginDouyinSearchResultTransitionInTab(
+  tabId,
+  keyword = '',
+) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return Object.freeze({
+      baselineCaptured: false,
+      previousWorkIds: [],
+      submissionNonce: '',
+    });
+  }
+  const previousResults = await readDouyinSearchWorkIdsInTab(normalizedTabId);
+  const submissionNonce = await chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: (expectedKeyword) => {
+        const witnessKey = '__STARVOICE_DOUYIN_SEARCH_WITNESS__';
+        const resultRootSelector = [
+          '#search-result-container',
+          '#waterFallScrollContainer',
+          '[data-e2e="scroll-list"]',
+        ].join(',');
+        const resultIdentitySelector = [
+          '[id^="waterfall_item_"]',
+          '[data-e2e-aweme-id]',
+          '[data-aweme-id]',
+          '[data-awemeid]',
+          '[data-modal-id]',
+          'a[href*="/video/"]',
+          'a[href*="/note/"]',
+          'a[href*="modal_id="]',
+        ].join(',');
+        const readRoot = () => document.querySelector(resultRootSelector);
+        const countResults = (root) =>
+          root?.querySelectorAll?.(resultIdentitySelector)?.length || 0;
+        const baselineRoot = readRoot();
+        const baselineCount = countResults(baselineRoot);
+        const baselineBusy =
+          String(baselineRoot?.getAttribute?.('aria-busy') || '')
+            .toLowerCase() === 'true';
+        const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const witness = {
+          nonce,
+          keyword: String(expectedKeyword || '').trim(),
+          submittedAt: Date.now(),
+          baselineCount,
+          baselineBusy,
+          mutationCount: 0,
+          sawBusyStart: false,
+          sawBusyRoundTrip: false,
+          sawCleared: false,
+          sawClearRepopulated: false,
+          rootReplaced: false,
+          generationChanged: false,
+          observer: null,
+        };
+        try {
+          window[witnessKey]?.observer?.disconnect?.();
+        } catch {
+          // A stale page-owned marker cannot block the next exact operation.
+        }
+        window[witnessKey] = witness;
+        if (typeof MutationObserver !== 'function' || !document.body) {
+          return nonce;
+        }
+        const isRelatedNode = (node, root) => {
+          if (!node || !root) return false;
+          if (node === root) return true;
+          try {
+            return Boolean(root.contains?.(node) || node.contains?.(root));
+          } catch {
+            return false;
+          }
+        };
+        const observer = new MutationObserver((records) => {
+          const currentRoot = readRoot();
+          const relevantRecords = Array.from(records || []).filter((record) => {
+            if (
+              isRelatedNode(record?.target, baselineRoot) ||
+              isRelatedNode(record?.target, currentRoot)
+            ) {
+              return true;
+            }
+            return Array.from(record?.addedNodes || [])
+              .concat(Array.from(record?.removedNodes || []))
+              .some((node) =>
+                isRelatedNode(node, baselineRoot) ||
+                isRelatedNode(node, currentRoot) ||
+                node?.matches?.(resultRootSelector) ||
+                node?.querySelector?.(resultRootSelector),
+              );
+          });
+          if (relevantRecords.length === 0) return;
+          witness.mutationCount += relevantRecords.length;
+          if (
+            baselineRoot &&
+            currentRoot &&
+            currentRoot !== baselineRoot
+          ) {
+            witness.rootReplaced = true;
+          }
+          const currentCount = countResults(currentRoot);
+          if (baselineCount > 0 && currentCount === 0) {
+            witness.sawCleared = true;
+          }
+          const busy =
+            String(currentRoot?.getAttribute?.('aria-busy') || '')
+              .toLowerCase() === 'true';
+          if (!witness.baselineBusy && busy) {
+            witness.sawBusyStart = true;
+          }
+          if (witness.sawBusyStart && !busy) {
+            witness.sawBusyRoundTrip = true;
+          }
+          if (witness.sawCleared && currentCount > 0) {
+            witness.sawClearRepopulated = true;
+          }
+          witness.generationChanged ||= Boolean(
+            witness.rootReplaced ||
+              witness.sawBusyRoundTrip ||
+              witness.sawClearRepopulated ||
+              (witness.sawCleared && currentCount === 0),
+          );
+        });
+        witness.observer = observer;
+        observer.observe(document.body, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: ['aria-busy'],
+        });
+        if (typeof setTimeout === 'function') {
+          setTimeout(() => observer.disconnect(), 60_000);
+        }
+        return nonce;
+      },
+      args: [keyword],
+    })
+    .then(([result]) => String(result?.result || ''))
+    .catch(() => '');
+  return Object.freeze({
+    baselineCaptured: previousResults.captured === true,
+    previousWorkIds: previousResults.workIds,
+    submissionNonce,
+  });
+}
+
+async function readDouyinSearchDocumentGenerationInTab(tabId) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
+    return null;
+  }
+  return chrome.scripting
+    .executeScript({
+      target: {tabId: normalizedTabId},
+      func: () => ({
+        timeOrigin: Number(globalThis.performance?.timeOrigin) || 0,
+        readyState: String(document.readyState || ''),
+        pageUrl: String(window.location.href || ''),
+      }),
+    })
+    .then(([result]) => {
+      const value = result?.result;
+      return Number(value?.timeOrigin) > 0
+        ? {
+            timeOrigin: Number(value.timeOrigin),
+            readyState: String(value.readyState || ''),
+            pageUrl: String(value.pageUrl || ''),
+          }
+        : null;
+    })
+    .catch(() => null);
+}
+
+async function waitForFreshDouyinSearchDocumentInTab(
+  tabId,
+  navigationContext,
+  previousGeneration,
+  shouldStop = null,
+  timeoutMs = 6000,
+) {
+  const previousTimeOrigin = Number(previousGeneration?.timeOrigin) || 0;
+  if (previousTimeOrigin <= 0) return false;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < Math.max(0, Number(timeoutMs) || 0)) {
+    if (typeof shouldStop === 'function' && shouldStop()) {
+      throw new Error('BATCH_CAPTURE_CANCELED');
+    }
+    const [tab, generation] = await Promise.all([
+      chrome.tabs.get(tabId).catch(() => null),
+      readDouyinSearchDocumentGenerationInTab(tabId),
+    ]);
+    if (
+      isKeywordSearchTabUrlReady(tab?.url || '', navigationContext) &&
+      generation?.readyState === 'complete' &&
+      Number(generation.timeOrigin) > 0 &&
+      Number(generation.timeOrigin) !== previousTimeOrigin
+    ) {
+      return true;
+    }
+    await waitMs(BATCH_KEYWORD_NAV_POLL_MS);
+  }
+  return false;
 }
 
 async function switchDouyinKeywordSearchInTab(
@@ -17025,7 +17924,10 @@ async function switchDouyinKeywordSearchInTab(
     throw new Error('BATCH_CAPTURE_CANCELED');
   }
 
+  let navigationTransitionAccepted = false;
   if (!(await isKeywordSearchTargetReadyInTab(tabId, navigationContext))) {
+    const previousDocumentGeneration =
+      await readDouyinSearchDocumentGenerationInTab(tabId);
     await chrome.tabs.update(tabId, {
       url: targetUrl,
       active: true,
@@ -17036,19 +17938,71 @@ async function switchDouyinKeywordSearchInTab(
       shouldStop,
       6000,
     );
-    // 抖音 URL/搜索框的关键词字面常和目标词对不上,导致"就绪判断"误判未就绪(页面其实已切好)。
-    // 这里不再因判否而抛错让整个词失败:判定就绪就继续;判不出也只是给页面固定加载时间后照常往下走,
-    // 由后面的 waitForKeywordSearchResultsInTab(卡片稳定即放行)兜底判断有没有真结果。
-    if (!ready) {
+    // 抖音可能把搜索 URL 重写为无关键词的 /jingxuan/search。目标词字面未确认时
+    // 仍允许继续提交，但后续结果必须证明作品集合相对提交前发生了替换；不能只凭旧卡片稳定放行。
+    if (ready) {
+      navigationTransitionAccepted =
+        await waitForFreshDouyinSearchDocumentInTab(
+          tabId,
+          navigationContext,
+          previousDocumentGeneration,
+          shouldStop,
+          6000,
+        );
+    }
+    if (!navigationTransitionAccepted && !ready) {
       await waitMsWithStop(
         BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
         shouldStop,
         'BATCH_CAPTURE_CANCELED',
       );
+    } else if (!navigationTransitionAccepted) {
+      const navigatedTab = await chrome.tabs.get(tabId).catch(() => null);
+      const exactNavigationTargetReady = isKeywordSearchTabUrlReady(
+        navigatedTab?.url || '',
+        navigationContext,
+      );
+      if (!exactNavigationTargetReady) {
+        await waitMsWithStop(
+          BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
+          shouldStop,
+          'BATCH_CAPTURE_CANCELED',
+        );
+      }
     }
   }
 
-  await submitKeywordSearchInTab(tabId, 'douyin', keyword, shouldStop);
+  // URL text alone is not navigation proof: a slow SPA can expose the new URL
+  // while the previous keyword cards remain mounted. Only a different
+  // performance.timeOrigin plus document.readyState=complete may bypass the
+  // click witness. Same-document navigation falls back to a fresh baseline
+  // and the strong result lifecycle below.
+  if (navigationTransitionAccepted) {
+    return Object.freeze({
+      baselineCaptured: false,
+      previousWorkIds: [],
+      submitAccepted: false,
+      submissionNonce: '',
+      navigationTransitionAccepted: true,
+    });
+  }
+
+  const submission = await submitKeywordSearchInTab(
+    tabId,
+    'douyin',
+    keyword,
+    shouldStop,
+  );
+  return Object.freeze({
+    baselineCaptured: submission?.baselineCaptured === true,
+    previousWorkIds: Array.isArray(submission?.previousWorkIds)
+      ? submission.previousWorkIds
+      : [],
+    submitAccepted:
+      submission === true || submission?.accepted === true,
+    submissionNonce: String(submission?.submissionNonce || ''),
+    navigationTransitionAccepted: false,
+  });
 }
 
 /**
@@ -17118,8 +18072,8 @@ async function navigateToSearchUrl(tabId, targetUrl, shouldStop) {
   // 于是 isKeywordSearchTabUrlReady(要求 keyword 参数严格相等)与 isKeywordSearchDomReadyInTab
   // (小红书选择器多为 /explore/,且命中卡片后仍 return keywordMatched)会在"结果其实已经
   // 渲染出来"时双双误判未就绪,白白空等到超时再把整词判失败跳过。
-  // 类比已修的抖音切词:只要文档确实完成过加载(导航已真实发生),就不再抛错,把"到底有没有
-  // 结果"交给随后的 waitForKeywordSearchResultsInTab(含关键词字面宽限期 + 卡片稳定即放行)兜底。
+  // 只要文档确实完成过加载(导航已真实发生),就不再抛错,把"到底有没有结果"交给随后
+  // 的 waitForKeywordSearchResultsInTab；抖音还会要求关键词字面或提交前后作品集合替换证明。
   // 仅当文档从未加载完成(导航真的没发生/一直卡在 loading)时才按超时抛错。
   if (reachedComplete) {
     return;
@@ -17226,7 +18180,7 @@ async function isKeywordSearchTargetReadyInTab(
         const ready =
           Boolean(expected) &&
           (normalize(urlKeyword) === expected ||
-            normalize(inputKeyword).includes(expected));
+            normalize(inputKeyword) === expected);
         console.log('[星语诊断] 切词就绪判断', {
           expected,
           urlKeyword,
@@ -17342,10 +18296,13 @@ async function isKeywordSearchDomReadyInTab(
             .map((node) => node.value || node.textContent || '')
             .map((value) => String(value || '').trim())
             .find(Boolean) || '';
+        const normalizedInputKeyword = normalizeText(inputKeyword);
         const keywordMatched =
           !expected ||
           normalizeText(urlKeyword) === expected ||
-          normalizeText(inputKeyword).includes(expected);
+          (platformKey === 'douyin'
+            ? normalizedInputKeyword === expected
+            : normalizedInputKeyword.includes(expected));
         const isVisible = (node) => {
           if (!(node instanceof Element)) {
             return false;
@@ -17573,7 +18530,9 @@ async function readDouyinSearchSecurityChallengeStateInTab(tabId) {
         const isChallengeText = (title, text) => {
           const normalizedTitle = normalize(title);
           const normalizedText = normalize(text);
-          if (/验证码中间页/iu.test(normalizedTitle)) return true;
+          if (/^(?:验证码中间页|抖音验证码中间页)$/iu.test(normalizedTitle)) {
+            return true;
+          }
           if (/请完成下列验证后继续[:：]?/iu.test(normalizedText)) {
             return true;
           }
@@ -17628,17 +18587,19 @@ async function readDouyinSearchSecurityChallengeStateInTab(tabId) {
           'a[href*="/note/"]',
           'a[href*="modal_id="]',
         ].join(',');
-        const challengeNode = [document.body]
-          .concat(
-            Array.from(
-              document.querySelectorAll(
-                '[role="dialog"], dialog, section, aside, h1, h2, h3, h4, p, span, div',
-              ),
-            ),
-          )
+        const challengeNode = Array.from(
+          document.querySelectorAll(
+            '[role="dialog"], dialog, section, aside, h1, h2, h3, h4, p, span, div',
+          ),
+        )
           .find((node) => {
             if (!isVisible(node)) return false;
             if (node?.closest?.(resultCardSelector)) return false;
+            // body/list wrappers aggregate descendant captions in innerText.
+            // If any trusted result subtree sits below this candidate, inspect
+            // the descendants instead of letting one quoted caption masquerade
+            // as a page-level verification dialog.
+            if (node?.querySelector?.(resultCardSelector)) return false;
             return isChallengeText(
               document.title,
               node?.innerText || node?.textContent || '',
@@ -17656,6 +18617,7 @@ async function readDouyinSearchSecurityChallengeStateInTab(tabId) {
           document.querySelectorAll('iframe'),
         ).find((node) => {
           if (!isVisible(node)) return false;
+          if (node?.closest?.(resultCardSelector)) return false;
           const evidence = normalize(
             [
               node.getAttribute?.('src'),
@@ -17697,6 +18659,11 @@ async function waitForKeywordSearchResultsInTab(
     keyword = '',
     stablePolls = BATCH_KEYWORD_RESULTS_STABLE_POLLS,
     returnState = false,
+    requireResultTransition = false,
+    previousWorkIds = null,
+    submitAccepted = false,
+    submissionNonce = '',
+    navigationTransitionAccepted = false,
   } = {},
 ) {
   const normalizedTabId = Number(tabId);
@@ -17722,10 +18689,21 @@ async function waitForKeywordSearchResultsInTab(
     hasExplicitTimeout ? Number(timeoutMs) || 0 : defaultTimeout,
   );
   const requiredStablePolls = Math.max(1, Math.floor(Number(stablePolls) || 1));
+  const normalizedPreviousWorkIds = Array.from(
+    new Set(
+      (Array.isArray(previousWorkIds) ? previousWorkIds : [])
+        .map((workId) => String(workId || '').trim())
+        .filter((workId) => /^\d{8,}$/u.test(workId)),
+    ),
+  );
+  const previousWorkIdSet = new Set(normalizedPreviousWorkIds);
   let lastSignature = '';
   let lastCardCount = -1;
   let stableCount = 0;
   let lastPageUrl = '';
+  let lastServiceAbnormalSignature = '';
+  let serviceAbnormalStableCount = 0;
+  let serviceAbnormalFirstObservedAt = null;
   while (Date.now() - startedAt < timeout) {
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('BATCH_CAPTURE_CANCELED');
@@ -17737,7 +18715,12 @@ async function waitForKeywordSearchResultsInTab(
     const snapshot = await chrome.scripting
       .executeScript({
         target: {tabId: normalizedTabId},
-        func: (platformName, expectedKeyword, xhsMarkers) => {
+        func: (
+          platformName,
+          expectedKeyword,
+          xhsMarkers,
+          expectedSubmissionNonce,
+        ) => {
           const normalizeText = (value) =>
             String(value || '')
               .trim()
@@ -17833,21 +18816,41 @@ async function waitForKeywordSearchResultsInTab(
               '#waterFallScrollContainer .search-result-card',
               '#search-result-container [id^="waterfall_item_"]',
               '#waterFallScrollContainer [id^="waterfall_item_"]',
-              '.search-result-card',
-              '[data-e2e-aweme-id]',
-              '[data-aweme-id]',
-              '[data-awemeid]',
-              '[data-id]',
-              '[data-item-id]',
-              '[data-modal-id]',
-              '[id^="waterfall_item_"]',
-              'a[href*="/video/"]',
-              'a[href*="/note/"]',
-              'a[href*="modal_id="]',
-              'a[data-href*="/video/"]',
-              'a[data-href*="/note/"]',
-              'a[data-url*="/video/"]',
-              'a[data-url*="/note/"]',
+              '[data-e2e="scroll-list"] .search-result-card',
+              '[data-e2e="scroll-list"] [id^="waterfall_item_"]',
+              '[data-e2e="scroll-list"] [data-e2e-aweme-id]',
+              '[data-e2e="scroll-list"] [data-aweme-id]',
+              '[data-e2e="scroll-list"] [data-awemeid]',
+              '[data-e2e="scroll-list"] [data-modal-id]',
+              '[data-e2e="scroll-list"] a[href*="/video/"]',
+              '[data-e2e="scroll-list"] a[href*="/note/"]',
+              '[data-e2e="scroll-list"] a[href*="modal_id="]',
+              '[data-e2e="scroll-list"] a[data-href*="/video/"]',
+              '[data-e2e="scroll-list"] a[data-href*="/note/"]',
+              '[data-e2e="scroll-list"] a[data-url*="/video/"]',
+              '[data-e2e="scroll-list"] a[data-url*="/note/"]',
+              '#search-result-container [data-e2e-aweme-id]',
+              '#search-result-container [data-aweme-id]',
+              '#search-result-container [data-awemeid]',
+              '#search-result-container [data-modal-id]',
+              '#search-result-container a[href*="/video/"]',
+              '#search-result-container a[href*="/note/"]',
+              '#search-result-container a[href*="modal_id="]',
+              '#search-result-container a[data-href*="/video/"]',
+              '#search-result-container a[data-href*="/note/"]',
+              '#search-result-container a[data-url*="/video/"]',
+              '#search-result-container a[data-url*="/note/"]',
+              '#waterFallScrollContainer [data-e2e-aweme-id]',
+              '#waterFallScrollContainer [data-aweme-id]',
+              '#waterFallScrollContainer [data-awemeid]',
+              '#waterFallScrollContainer [data-modal-id]',
+              '#waterFallScrollContainer a[href*="/video/"]',
+              '#waterFallScrollContainer a[href*="/note/"]',
+              '#waterFallScrollContainer a[href*="modal_id="]',
+              '#waterFallScrollContainer a[data-href*="/video/"]',
+              '#waterFallScrollContainer a[data-href*="/note/"]',
+              '#waterFallScrollContainer a[data-url*="/video/"]',
+              '#waterFallScrollContainer a[data-url*="/note/"]',
             ],
           };
           const selectors =
@@ -17908,8 +18911,7 @@ async function waitForKeywordSearchResultsInTab(
             'a[data-url*="/video/"]',
             'a[data-url*="/note/"]',
           ].join(',');
-          const douyinResultCardSelector = [
-            '.search-result-card',
+          const douyinTrustedResultIdentitySelector = [
             '[id^="waterfall_item_"]',
             '[data-e2e-aweme-id]',
             '[data-aweme-id]',
@@ -17919,36 +18921,57 @@ async function waitForKeywordSearchResultsInTab(
           ].join(',');
           const isInsideDouyinResultCard = (node) => {
             if (!node?.closest) return false;
-            if (node.closest(douyinResultCardSelector)) return true;
-            const idContainer = node.closest('[data-id], [data-item-id]');
-            if (!idContainer) return false;
-            const itemId = String(
-              idContainer.getAttribute?.('data-id') ||
-                idContainer.getAttribute?.('data-item-id') ||
-                '',
-            ).trim();
+            if (node.closest(douyinTrustedResultIdentitySelector)) return true;
+            const possibleCardContainer = node.closest(
+              '.search-result-card, [data-id], [data-item-id]',
+            );
             return Boolean(
-              /^\d{8,}$/u.test(itemId) ||
-                idContainer.querySelector?.(douyinResultLinkSelector),
+              possibleCardContainer?.querySelector?.(
+                douyinTrustedResultIdentitySelector,
+              ),
             );
           };
-          const serviceAbnormalNode = douyinSearchPathReady
-            ? Array.from(
-                document.querySelectorAll('h1, h2, h3, h4, p, span, div'),
-              ).find((node) => {
-                if (!isVisible(node)) return false;
-                if (isInsideDouyinResultCard(node)) return false;
-                const text = String(node.innerText || node.textContent || '')
-                  .trim()
-                  .replace(/\s+/gu, '');
-                return (
-                  text === '服务出现异常' ||
-                  /^(?:服务出现异常)(?:，|,)?(?:请稍后重试)[。！!]?$/u.test(
-                    text,
-                  )
+          let serviceAbnormalNode = null;
+          let confirmedEmptyNode = null;
+          if (douyinSearchPathReady) {
+            const maxDouyinSemanticStateCandidates = 64;
+            let inspectedSemanticStateCandidates = 0;
+            const semanticStateNodes = document.querySelectorAll(
+              'h1, h2, h3, h4, p, span, div',
+            );
+            // One flat traversal recognizes both terminal states. Cheap
+            // textContent checks happen first; layout/ancestor/subtree work is
+            // reserved for at most 64 nodes whose short text actually matches
+            // a service-abnormal or confirmed-empty phrase.
+            for (const node of semanticStateNodes) {
+              const rawText = String(node.textContent || '').trim();
+              if (!rawText || rawText.length > 120) continue;
+              const text = rawText.replace(/\s+/gu, '');
+              const serviceAbnormalMatched =
+                text === '服务出现异常' ||
+                /^(?:服务出现异常)(?:，|,)?(?:请稍后重试)[。！!]?$/u.test(
+                  text,
                 );
-              })
-            : null;
+              const confirmedEmptyMatched =
+                /^(?:暂无)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
+                /^(?:没有找到|没有搜索到|未找到|未搜索到)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
+                /^(?:暂无|没有)(?:符合)?(?:当前)?筛选条件的?(?:结果|内容|作品)[。！!]?$/u.test(text);
+              if (!serviceAbnormalMatched && !confirmedEmptyMatched) continue;
+              if (
+                inspectedSemanticStateCandidates >=
+                maxDouyinSemanticStateCandidates
+              ) {
+                break;
+              }
+              inspectedSemanticStateCandidates += 1;
+              if (!isVisible(node) || isInsideDouyinResultCard(node)) continue;
+              if (serviceAbnormalMatched) {
+                serviceAbnormalNode = node;
+                break;
+              }
+              confirmedEmptyNode ||= node;
+            }
+          }
           if (serviceAbnormalNode) {
             return {
               cardCount: 0,
@@ -17960,125 +18983,118 @@ async function waitForKeywordSearchResultsInTab(
                 '抖音当前关键词搜索暂时不可用，已结束本词并继续下一个关键词',
             };
           }
-          const confirmedEmptyNode = douyinSearchPathReady
-            ? Array.from(
-                document.querySelectorAll('h1, h2, h3, h4, p, span, div'),
-              ).find((node) => {
-                if (!isVisible(node)) return false;
-                if (isInsideDouyinResultCard(node)) return false;
-                const text = String(node.innerText || node.textContent || '')
-                  .trim()
-                  .replace(/\s+/gu, '');
-                return (
-                  /^(?:暂无)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
-                  /^(?:没有找到|没有搜索到|未找到|未搜索到)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
-                  /^(?:暂无|没有)(?:符合)?(?:当前)?筛选条件的?(?:结果|内容|作品)[。！!]?$/u.test(text)
-                );
-              })
-            : null;
-          const hasVisibleMedia = (node) =>
-            Boolean(
-              node?.querySelector?.(
-                'img[src], video, canvas, [style*="background-image"]',
-              ),
-            );
-          const hasDouyinResultSignal = (node) => {
-            if (!(node instanceof Element)) {
-              return false;
+          const extractDouyinWorkIdFromUrlValue = (value) => {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            const candidates = Array.from(new Set([raw, decode(raw)]));
+            const patterns = [
+              /\/(?:video|note)\/(\d{8,})(?:[/?#]|$)/iu,
+              /[?&]modal_id=(\d{8,})(?:[&#]|$)/iu,
+            ];
+            for (const candidate of candidates) {
+              for (const pattern of patterns) {
+                const matched = String(candidate).match(pattern);
+                if (matched?.[1]) return matched[1];
+              }
             }
-            const text = String(node.innerText || node.textContent || '');
-            if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
-              return false;
-            }
-            const linkSelectors = [
-              'a[href*="/video/"]',
-              'a[href*="/note/"]',
-              'a[href*="modal_id="]',
-              '[href*="/video/"]',
-              '[href*="/note/"]',
-              '[data-href*="/video/"]',
-              '[data-href*="/note/"]',
-              '[data-url*="/video/"]',
-              '[data-url*="/note/"]',
-            ].join(',');
-            return (
-              node.matches?.(linkSelectors) ||
-              node.querySelector?.(linkSelectors) ||
-              /^\s*\d{1,2}:\d{2}\s*$/m.test(text) ||
-              hasVisibleMedia(node)
+            return '';
+          };
+          const resolveDouyinWorkId = (node) => {
+            if (!(node instanceof Element)) return '';
+            const identitySelector =
+              '[id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-modal-id]';
+            const candidateNodes = [];
+            const seenCandidateNodes = new Set();
+            const addCandidateNode = (candidateNode) => {
+              if (
+                !(candidateNode instanceof Element) ||
+                seenCandidateNodes.has(candidateNode)
+              ) {
+                return;
+              }
+              seenCandidateNodes.add(candidateNode);
+              candidateNodes.push(candidateNode);
+            };
+            addCandidateNode(node);
+            addCandidateNode(node.closest?.(identitySelector));
+            // Read at most one identity-bearing descendant and one detail link.
+            // Readiness runs every ~300 ms, so a whole-subtree query per selector
+            // would amplify large result DOMs without improving the first real ID.
+            addCandidateNode(node.querySelector?.(identitySelector));
+            addCandidateNode(
+              node.matches?.(douyinResultLinkSelector)
+                ? node
+                : node.querySelector?.(douyinResultLinkSelector),
             );
+            for (const candidateNode of candidateNodes) {
+              const waterfallId = String(candidateNode.id || '').match(
+                /^waterfall_item_(\d{8,})(?:$|[_:-])/u,
+              )?.[1];
+              if (waterfallId) return waterfallId;
+              const dedicatedAttributeValues = [
+                candidateNode.getAttribute?.('data-e2e-aweme-id'),
+                candidateNode.getAttribute?.('data-aweme-id'),
+                candidateNode.getAttribute?.('data-awemeid'),
+                candidateNode.getAttribute?.('data-modal-id'),
+              ];
+              for (const value of dedicatedAttributeValues) {
+                const workId = String(value || '').trim();
+                if (/^\d{8,}$/u.test(workId)) return workId;
+              }
+              const linkValues = [
+                candidateNode.getAttribute?.('href'),
+                candidateNode.getAttribute?.('data-href'),
+                candidateNode.getAttribute?.('data-url'),
+              ];
+              for (const value of linkValues) {
+                const workId = extractDouyinWorkIdFromUrlValue(value);
+                if (workId) return workId;
+              }
+            }
+            return '';
           };
           const cardNodes = [];
           const seenNodes = new Set();
-          selectors.forEach((selector) => {
-            try {
-              document.querySelectorAll(selector).forEach((node) => {
-                const item =
-                  platformKey === 'douyin'
-                    ? node.closest?.(
-                        '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
-                      ) || node
-                    : node.closest?.('.note-item, .feed-item, section, [data-v-feed] a') ||
-                      node;
-                if (!item || seenNodes.has(item)) {
-                  return;
-                }
-                if (
-                  platformKey === 'douyin' &&
-                  !hasDouyinResultSignal(item) &&
-                  !isVisible(item)
-                ) {
-                  return;
-                }
-                seenNodes.add(item);
-                cardNodes.push(item);
-              });
-            } catch {
-              // ignore invalid selector in platform fallbacks
-            }
-          });
-          if (platformKey === 'douyin' && cardNodes.length <= 0) {
-            Array.from(document.querySelectorAll('span, div'))
-              .filter((node) => /^\s*\d{1,2}:\d{2}\s*$/.test(node.textContent || ''))
-              .filter(isVisible)
-              .forEach((node) => {
-                const item =
-                  node.closest?.(
-                    '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
-                  ) || node.parentElement || node;
-                if (!item || seenNodes.has(item)) {
-                  return;
-                }
-                seenNodes.add(item);
-                cardNodes.push(item);
-              });
-            if (cardNodes.length <= 0) {
-              const bodyText = String(document.body?.innerText || '');
-              const searchTabsVisible =
-                /综合/.test(bodyText) && /视频/.test(bodyText);
-              if (searchTabsVisible) {
-                Array.from(
-                  document.querySelectorAll(
-                    'main img[src], main video, #search-result-container img[src], #search-result-container video, #waterFallScrollContainer img[src], #waterFallScrollContainer video, [data-e2e="scroll-list"] img[src], [data-e2e="scroll-list"] video',
-                  ),
-                ).forEach((node) => {
-                  const item =
-                    node.closest?.(
-                      'a[href], article, li, section, [role="listitem"], .search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-id], [data-item-id], [data-modal-id]',
-                    ) || node.parentElement || node;
-                  if (!item || seenNodes.has(item) || !isVisible(item)) {
-                    return;
-                  }
-                  const text = String(item.innerText || item.textContent || '');
-                  if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) {
-                    return;
-                  }
-                  seenNodes.add(item);
-                  cardNodes.push(item);
-                });
+          const douyinWorkIdByNode = new Map();
+          const maxDouyinCandidateNodes = 200;
+          let inspectedDouyinCandidateNodes = 0;
+          const addCardNode = (item) => {
+            if (!item || seenNodes.has(item)) return;
+            if (platformKey === 'douyin') {
+              if (inspectedDouyinCandidateNodes >= maxDouyinCandidateNodes) {
+                return;
               }
+              inspectedDouyinCandidateNodes += 1;
+              if (!isVisible(item)) return;
+              const workId = resolveDouyinWorkId(item);
+              if (!/^\d{8,}$/u.test(workId)) return;
+              const text = String(item.innerText || item.textContent || '');
+              if (/^\s*相关搜索(?:\s|$|[:：])/m.test(text)) return;
+              douyinWorkIdByNode.set(item, workId);
             }
+            seenNodes.add(item);
+            cardNodes.push(item);
+          };
+          // Query once, normalize overlapping selectors, then resolve identity
+          // once per unique card. The 200-card ceiling bounds a 300 ms poll even
+          // if Douyin leaves a large virtualized result tree mounted.
+          const candidateNodes = new Set();
+          try {
+            document.querySelectorAll(selectors.join(',')).forEach((node) => {
+              const item =
+                platformKey === 'douyin'
+                  ? node.closest?.(
+                      '.search-result-card, [id^="waterfall_item_"], [data-e2e-aweme-id], [data-aweme-id], [data-awemeid], [data-modal-id]',
+                    ) || node
+                  : node.closest?.('.note-item, .feed-item, section, [data-v-feed] a') ||
+                    node;
+              if (item) candidateNodes.add(item);
+            });
+          } catch {
+            // All selectors are static and validated; a future invalid selector
+            // should leave this poll empty instead of starting repeated scans.
           }
+          candidateNodes.forEach(addCardNode);
 
           const url = new URL(window.location.href);
           const urlKeyword =
@@ -18094,26 +19110,59 @@ async function waitForKeywordSearchResultsInTab(
             .map((node) => node.value || node.textContent || '')
             .map((value) => String(value || '').trim())
             .find(Boolean) || '';
+          const normalizedInputKeyword = normalizeText(inputKeyword);
           const keywordMatched =
             !expected ||
             normalizeText(urlKeyword) === expected ||
-            normalizeText(inputKeyword).includes(expected);
-          const signature = cardNodes
-            .slice(0, 8)
-            .map((node) => {
-              const link = node.matches?.('a[href]') ? node : node.querySelector?.('a[href]');
-              return [
-                link?.getAttribute?.('href') || '',
-                node.textContent || '',
-              ].join('|');
-            })
-            .join('||')
-            .slice(0, 2000);
+            (platformKey === 'douyin'
+              ? normalizedInputKeyword === expected
+              : normalizedInputKeyword.includes(expected));
+          const workIds =
+            platformKey === 'douyin'
+              ? Array.from(
+                  new Set(
+                    cardNodes
+                      .map((node) => douyinWorkIdByNode.get(node) || '')
+                      .filter((workId) => /^\d{8,}$/u.test(workId)),
+                  ),
+                )
+              : [];
+          const signature =
+            platformKey === 'douyin'
+              ? `${workIds.length}:${workIds.join('|')}`
+              : cardNodes
+                  .slice(0, 8)
+                  .map((node) => {
+                    const link = node.matches?.('a[href]')
+                      ? node
+                      : node.querySelector?.('a[href]');
+                    return [
+                      link?.getAttribute?.('href') || '',
+                      node.textContent || '',
+                    ].join('|');
+                  })
+                  .join('||')
+                  .slice(0, 2000);
           return {
             cardCount: cardNodes.length,
             keywordMatched,
             pageUrl: window.location.href,
             signature,
+            workIds,
+            postSubmitGenerationChanged:
+              platformKey === 'douyin' &&
+              Boolean(expectedSubmissionNonce) &&
+              String(
+                window.__STARVOICE_DOUYIN_SEARCH_WITNESS__?.nonce || '',
+              ) === String(expectedSubmissionNonce) &&
+              window.__STARVOICE_DOUYIN_SEARCH_WITNESS__
+                ?.generationChanged === true,
+            submissionNonce:
+              platformKey === 'douyin'
+                ? String(
+                    window.__STARVOICE_DOUYIN_SEARCH_WITNESS__?.nonce || '',
+                  )
+                : '',
             confirmedEmpty: Boolean(confirmedEmptyNode),
             emptyMessage: confirmedEmptyNode
               ? String(
@@ -18124,7 +19173,12 @@ async function waitForKeywordSearchResultsInTab(
               : '',
           };
         },
-        args: [platform, keyword, XHS_SECURITY_PAGE_MARKERS],
+        args: [
+          platform,
+          keyword,
+          XHS_SECURITY_PAGE_MARKERS,
+          submissionNonce,
+        ],
       })
       .then(([result]) => result?.result || null)
       .catch(() => null);
@@ -18133,11 +19187,50 @@ async function waitForKeywordSearchResultsInTab(
       String(snapshot?.blockingCode || '').trim().toUpperCase() ===
       DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE
     ) {
-      throw createDouyinSearchServiceAbnormalError({
-        message: snapshot?.blockingMessage,
-        pageUrl: snapshot?.pageUrl,
-      });
+      const serviceAbnormalSignature = [
+        String(snapshot?.pageUrl || ''),
+        DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE,
+        String(snapshot?.blockingMessage || ''),
+      ].join('|');
+      const sameServiceAbnormalSignature = Boolean(
+        serviceAbnormalSignature &&
+          serviceAbnormalSignature === lastServiceAbnormalSignature,
+      );
+      if (sameServiceAbnormalSignature) {
+        serviceAbnormalStableCount += 1;
+      } else {
+        serviceAbnormalStableCount = 1;
+        serviceAbnormalFirstObservedAt = Date.now();
+      }
+      lastServiceAbnormalSignature = serviceAbnormalSignature;
+      stableCount = 0;
+      lastSignature = '';
+      lastCardCount = -1;
+      if (
+        serviceAbnormalStableCount >=
+        Math.max(
+          DOUYIN_SEARCH_SERVICE_ABNORMAL_STABLE_POLLS,
+          requiredStablePolls,
+        ) &&
+        Number.isFinite(serviceAbnormalFirstObservedAt) &&
+        Date.now() - serviceAbnormalFirstObservedAt >=
+          DOUYIN_SEARCH_SERVICE_ABNORMAL_MIN_STABLE_MS
+      ) {
+        throw createDouyinSearchServiceAbnormalError({
+          message: snapshot?.blockingMessage,
+          pageUrl: snapshot?.pageUrl,
+        });
+      }
+      await waitMsWithStop(
+        Math.min(500, Math.max(100, BATCH_KEYWORD_NAV_POLL_MS)),
+        shouldStop,
+        'BATCH_CAPTURE_CANCELED',
+      );
+      continue;
     }
+    lastServiceAbnormalSignature = '';
+    serviceAbnormalStableCount = 0;
+    serviceAbnormalFirstObservedAt = null;
     if (
       String(snapshot?.blockingCode || '').trim().toUpperCase() ===
       'XHS_SECURITY_BLOCK' &&
@@ -18146,8 +19239,21 @@ async function waitForKeywordSearchResultsInTab(
       throw createXhsSecurityBlockError(snapshot.securityEvidence);
     }
 
-    const cardCount = Number(snapshot?.cardCount || 0);
-    const signature = String(snapshot?.signature || '');
+    const isDouyinReadiness =
+      String(platform || '').trim().toLowerCase() === 'douyin';
+    const douyinWorkIds = Array.from(
+      new Set(
+        (Array.isArray(snapshot?.workIds) ? snapshot.workIds : [])
+          .map((workId) => String(workId || '').trim())
+          .filter((workId) => /^\d{8,}$/u.test(workId)),
+      ),
+    );
+    const cardCount = isDouyinReadiness
+      ? douyinWorkIds.length
+      : Number(snapshot?.cardCount || 0);
+    const signature = isDouyinReadiness
+      ? `${douyinWorkIds.length}:${douyinWorkIds.join('|')}`
+      : String(snapshot?.signature || '');
     const keywordMatched = Boolean(snapshot?.keywordMatched);
     const {searchPathReady, keywordConflict} = inspectKeywordSearchPageUrl(
       snapshot?.pageUrl || '',
@@ -18155,10 +19261,21 @@ async function waitForKeywordSearchResultsInTab(
       keyword,
     );
     lastPageUrl = String(snapshot?.pageUrl || '');
+    const postSubmitGenerationChanged = Boolean(
+      isDouyinReadiness &&
+        submitAccepted === true &&
+        String(submissionNonce || '') &&
+        String(snapshot?.submissionNonce || '') ===
+          String(submissionNonce || '') &&
+        snapshot?.postSubmitGenerationChanged === true,
+    );
     const confirmedEmpty =
       searchPathReady &&
       !keywordConflict &&
       keywordMatched &&
+      (requireResultTransition !== true ||
+        navigationTransitionAccepted === true ||
+        (submitAccepted === true && postSubmitGenerationChanged)) &&
       snapshot?.confirmedEmpty === true;
     if (confirmedEmpty) {
       const emptyState = {
@@ -18171,15 +19288,33 @@ async function waitForKeywordSearchResultsInTab(
       };
       return returnState ? emptyState : false;
     }
-    // 宽限期内仍要求关键词字面对上(防抢跑、防读到上一个词的旧结果);
-    // 超过宽限期后,只要结果卡片稳定出现就放行,不再因抖音 URL 编码对不上而空等到超时。
+    const hasNewLeadingWorkId = Boolean(
+      isDouyinReadiness &&
+        normalizedPreviousWorkIds.length > 0 &&
+        douyinWorkIds.length > 1 &&
+        !previousWorkIdSet.has(douyinWorkIds[0]) &&
+        douyinWorkIds
+          .slice(1)
+          .some((workId) => previousWorkIdSet.has(workId)),
+    );
+    // 输入框会先于结果卡更新，所以“关键词字面正确”只能证明提交目标，不能
+    // 证明旧卡已经替换。点击提交必须再有同一 nonce 的完整 busy/clear/root
+    // lifecycle，或“新首项插入、旧首屏仍在其后”的 DOM 顺序证据。严格子集、
+    // 尾部追加及“旧头卸载 + 新尾加载”都可能只是虚拟列表滚动，不能放行。
+    // 从不同关键词执行 tabs.update 并落到精确目标 URL 则由独立导航证据放行。
     const keywordMatchGraceElapsed =
       Date.now() - startedAt >= BATCH_KEYWORD_RESULTS_KEYWORD_MATCH_GRACE_MS;
+    const readinessEvidenceAccepted =
+      requireResultTransition === true
+        ? navigationTransitionAccepted === true ||
+          (submitAccepted === true &&
+            (postSubmitGenerationChanged || hasNewLeadingWorkId))
+        : keywordMatched || keywordMatchGraceElapsed;
     const resultsAccepted =
       searchPathReady &&
       !keywordConflict &&
       cardCount > 0 &&
-      (keywordMatched || keywordMatchGraceElapsed);
+      readinessEvidenceAccepted;
     if (
       resultsAccepted &&
       signature &&

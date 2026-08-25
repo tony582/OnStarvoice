@@ -129,6 +129,16 @@ export function startAiMediaRuntime({
 
   async function drainCommentAi() {
     const workflow = await jobs.loadCommentWorkflow();
+    const receipts = await workflow.reprocessPendingCommentWorkflowReceipts({
+      limit: 100,
+    });
+    if (receipts.persisted || receipts.failed) {
+      safeLog(
+        logger,
+        'log',
+        `[CommentReceipt] 持久化 ${receipts.persisted}，失败 ${receipts.failed}`,
+      );
+    }
     let total = 0;
     for (let index = 0; index < 30; index += 1) {
       const count = await workflow.refineCommentsWithAI({ limit: 300 });

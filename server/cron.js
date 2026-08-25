@@ -167,12 +167,16 @@ function schedulerDefinitions(jobs, logger) {
               `[Cron] Elastic work queue: ${elasticLeases.requeued} stale item(s) requeued`,
             );
           }
+          // Transitional safety net: the selector excludes tenants whose new
+          // duty Agent is globally enabled and in guarded action mode. Tenants
+          // that have not crossed that gate retain the proven legacy handoff
+          // instead of losing automatic recovery during a staged rollout.
           const recovery = await jobs.reconcileAutomaticCaptureRetries(10);
           if (recovery.dispatched > 0 || recovery.failed > 0) {
             safeLog(
               logger,
               'log',
-              `[Cron] Capture auto-dispatch: ${recovery.dispatched} dispatched, ` +
+              `[Cron] Capture fallback dispatch: ${recovery.dispatched} dispatched, ` +
               `${recovery.waitingForAgent} waiting for Agent, ` +
               `${recovery.manualOnly} manual-only, ${recovery.failed} failed`,
             );

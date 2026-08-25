@@ -142,6 +142,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   const fakeCron = createFakeCron();
   let reconcileCalls = 0;
   let patrolCalls = 0;
+  let fallbackRecoveryLimit = 0;
   const runtime = startSchedulerCronJobs({
     cronModule: fakeCron,
     logger: quietLogger(),
@@ -154,6 +155,10 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
         patrolCalls += 1;
         assert.equal(limit, 20);
         return [];
+      },
+      async reconcileAutomaticCaptureRetries(limit) {
+        fallbackRecoveryLimit = limit;
+        return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
       },
     }),
   });
@@ -178,6 +183,9 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   await fakeCron.registrations[1].task.fire();
   assert.equal(reconcileCalls, 1);
   assert.equal(patrolCalls, 1);
+  await fakeCron.registrations[2].task.fire();
+  assert.equal(reconcileCalls, 2);
+  assert.equal(fallbackRecoveryLimit, 10);
 
   assert.equal(runtime.stop(), true);
   assert.equal(runtime.stop(), false);

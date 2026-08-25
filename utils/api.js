@@ -87,6 +87,7 @@ async function request(endpoint, options = {}) {
     shouldStop = null,
     signal = null,
     maxBaseAttempts = null,
+    headers = null,
   } = options;
 
   const configuredBaseUrls = [
@@ -111,6 +112,7 @@ async function request(endpoint, options = {}) {
       timeout,
       shouldStop,
       signal,
+      headers,
     });
     if (result?.__canceled) return result;
     if (!result?.__networkError && !result?.__endpointMissing) {
@@ -130,6 +132,7 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
     timeout = DEFAULT_CONFIG.REQUEST_TIMEOUT,
     shouldStop = null,
     signal = null,
+    headers = null,
   } = options;
 
   if (isRequestCancellationRequested(shouldStop, signal)) {
@@ -173,6 +176,7 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
       method,
       headers: {
         'Content-Type': 'application/json',
+        ...(headers && typeof headers === 'object' ? headers : {}),
       },
       body: requestBody ? JSON.stringify(requestBody) : null,
       signal: controller.signal,
@@ -392,13 +396,22 @@ export async function verify(code, options = {}) {
  * @param {Object} params.payload - 业务数据
  * @returns {Promise<Object>} 同步结果
  */
-export async function sync({ syncType, target, payload }, options = {}) {
+export async function sync({
+  syncType,
+  target,
+  payload,
+  captureTaskId = '',
+  captureTaskItemAttemptId = '',
+  captureTaskItemRequestHash = '',
+}, options = {}) {
   const shouldStop = options?.shouldStop;
   const signal = options?.signal || null;
   if (isRequestCancellationRequested(shouldStop, signal)) {
     return buildCanceledRequestResult();
   }
   const runtime = await getRuntime();
+  const auth = captureTaskId ? await getAuth() : null;
+  const captureAgentToken = String(auth?.captureAgent?.token || '').trim();
   if (isRequestCancellationRequested(shouldStop, signal)) {
     return buildCanceledRequestResult();
   }
@@ -418,9 +431,19 @@ export async function sync({ syncType, target, payload }, options = {}) {
     syncType,
     target,
     payload,
+    captureTaskId,
+    captureTaskItemAttemptId,
+    captureTaskItemRequestHash,
   };
 
-  return await request(API_ENDPOINT.SYNC, {body, shouldStop, signal});
+  return await request(API_ENDPOINT.SYNC, {
+    body,
+    shouldStop,
+    signal,
+    headers: captureAgentToken
+      ? {Authorization: `Bearer ${captureAgentToken}`}
+      : null,
+  });
 }
 
 // ==================== 批量同步 ====================
@@ -438,6 +461,11 @@ export async function syncBatch(records, target, options = {}) {
     return buildCanceledRequestResult();
   }
   const runtime = await getRuntime();
+  const hasCaptureTaskLineage = (Array.isArray(records) ? records : []).some((record) =>
+    Boolean(String(record?.captureTaskId || '').trim()),
+  );
+  const auth = hasCaptureTaskLineage ? await getAuth() : null;
+  const captureAgentToken = String(auth?.captureAgent?.token || '').trim();
   if (isRequestCancellationRequested(shouldStop, signal)) {
     return buildCanceledRequestResult();
   }
@@ -471,11 +499,21 @@ export async function syncBatch(records, target, options = {}) {
       platform: record.platform,
       workflow: record.workflow,
       monitorExecutionId: record.monitorExecutionId || '',
+      captureTaskId: record.captureTaskId || '',
+      captureTaskItemAttemptId: record.captureTaskItemAttemptId || '',
+      captureTaskItemRequestHash: record.captureTaskItemRequestHash || '',
       payload: record.payload,
     })),
   };
 
-  return await request(API_ENDPOINT.SYNC_BATCH, {body, shouldStop, signal});
+  return await request(API_ENDPOINT.SYNC_BATCH, {
+    body,
+    shouldStop,
+    signal,
+    headers: captureAgentToken
+      ? {Authorization: `Bearer ${captureAgentToken}`}
+      : null,
+  });
 }
 
 // 增量采集:问后端这批 external_id 哪些已采全(detailCaptureStatus=done)。

@@ -111,6 +111,8 @@ export function normalizeUnattendedKeywordCheckpoint(
     const resultKind = text(
       rawEntry?.resultKind || rawEntry?.result_kind,
     );
+    const hasCandidateCount = rawEntry?.candidateCount !== undefined
+      || rawEntry?.candidate_count !== undefined;
     keywordResults.push({
       round,
       // 旧快照中的 DOM/index 可能已经失真；永远按当前计划关键词顺序重算。
@@ -122,6 +124,16 @@ export function normalizeUnattendedKeywordCheckpoint(
       error: text(rawError?.message || rawEntry?.error),
       ...(noResults ? {noResults: true} : {}),
       ...(resultKind ? {resultKind} : {}),
+      ...(hasCandidateCount
+        ? {
+            candidateCount: nonNegativeInt(
+              rawEntry?.candidateCount ?? rawEntry?.candidate_count,
+            ),
+          }
+        : {}),
+      ...(rawEntry?.scanComplete === true || rawEntry?.scan_complete === true
+        ? {scanComplete: true}
+        : {}),
       ...(errorCode ? {errorCode} : {}),
       ...(errorCategory ? {errorCategory} : {}),
       ...(securityBlocked ? {securityBlocked: true} : {}),
@@ -694,6 +706,8 @@ export function settleUnattendedKeywordCheckpoint({
   const resultKind =
     text(result?.resultKind || result?.result_kind) ||
     (noResults ? "no_matching_results" : "");
+  const hasCandidateCount = result?.candidateCount !== undefined
+    || result?.candidate_count !== undefined;
   const status = resolvedSecurityBlocked
     ? "failed"
     : canceled
@@ -733,6 +747,16 @@ export function settleUnattendedKeywordCheckpoint({
     ),
     ...(noResults ? {noResults: true} : {}),
     ...(resultKind ? {resultKind} : {}),
+    ...(hasCandidateCount
+      ? {
+          candidateCount: nonNegativeInt(
+            result?.candidateCount ?? result?.candidate_count,
+          ),
+        }
+      : {}),
+    ...(result?.scanComplete === true || result?.scan_complete === true
+      ? {scanComplete: true}
+      : {}),
     ...(resolvedErrorCode ? {errorCode: resolvedErrorCode} : {}),
     ...(resolvedErrorCategory
       ? {errorCategory: resolvedErrorCategory}

@@ -19,6 +19,19 @@ const [
 ]);
 const manifest = JSON.parse(manifestSource);
 
+function readDetailBatchFunctionSource() {
+  const start = captureSyncSource.indexOf(
+    "export async function batchCaptureDetailsForRecords",
+  );
+  const end = captureSyncSource.indexOf(
+    "export function resolveSyncInputForRecord",
+    start,
+  );
+  assert.ok(start >= 0, "missing batchCaptureDetailsForRecords");
+  assert.ok(end > start, "missing detail batch end marker");
+  return captureSyncSource.slice(start, end);
+}
+
 test("capture task runtime declares native tab-group permissions and worker module", () => {
   assert.equal(manifest.permissions.includes("tabs"), true);
   assert.equal(manifest.permissions.includes("tabGroups"), true);
@@ -252,7 +265,7 @@ test("Douyin detail enhancement stays on one worker and delays unavailable failu
   );
 });
 
-test("Xiaohongshu interrupted detail workers are recreated with finite per-item and per-batch limits", () => {
+test("Xiaohongshu and Douyin interrupted detail workers are recreated with finite per-item and per-batch limits", () => {
   assert.match(
     captureSyncSource,
     /DETAIL_RUNNER_RECREATE_MAX_PER_BATCH = 2/u,
@@ -262,18 +275,27 @@ test("Xiaohongshu interrupted detail workers are recreated with finite per-item 
     /DETAIL_RUNNER_RECREATE_MAX_PER_ITEM = 1/u,
   );
   const helperStart = captureSyncSource.indexOf(
-    "const recreateInterruptedXhsDetailRunners",
+    "const recreateInterruptedDetailRunners",
   );
   const helperEnd = captureSyncSource.indexOf(
     "const discardPrefetchForRecord",
     helperStart,
   );
   const helperBody = captureSyncSource.slice(helperStart, helperEnd);
-  assert.match(helperBody, /!detailBatchIsXiaohongshu/u);
+  assert.match(
+    helperBody,
+    /normalizedRecordPlatform === 'xiaohongshu'[\s\S]*normalizedRecordPlatform === 'douyin'/u,
+  );
+  assert.match(
+    helperBody,
+    /normalizedRecordPlatform === 'douyin' && !normalizedExpectedNoteId/u,
+    "a rebuilt Douyin worker must retain a real expected work ID",
+  );
   assert.match(helperBody, /previousPipeline\?\.stop/u);
   assert.match(helperBody, /closeOwnedDetailRunnerTabs\(previousContexts\)/u);
   assert.match(helperBody, /prepareDetailBatchRunnerContext/u);
   assert.match(helperBody, /registerCaptureTaskTab/u);
+  assert.match(helperBody, /taskId: normalizedCaptureTaskId/u);
   assert.match(helperBody, /detail_runner_recreated/u);
 
   const recoveryCallStart = captureSyncSource.indexOf(
@@ -288,8 +310,39 @@ test("Xiaohongshu interrupted detail workers are recreated with finite per-item 
     recoveryCallStart,
     recoveryCallEnd,
   );
-  assert.match(recoveryCallBody, /recreateInterruptedXhsDetailRunners/u);
+  assert.match(recoveryCallBody, /recreateInterruptedDetailRunners/u);
+  assert.match(recoveryCallBody, /recordPlatform/u);
+  assert.match(recoveryCallBody, /expectedNoteId: expectedDouyinNoteId/u);
   assert.match(recoveryCallBody, /index -= 1;\s*continue;/u);
+});
+
+test("Douyin detail core is captured without optional blogger metrics", () => {
+  const body = readDetailBatchFunctionSource();
+  assert.match(
+    body,
+    /const shouldCaptureBloggerMetricsForRecord =\s*includeBloggerMetrics \|\| shouldApplyLowFollowerHitFilter/u,
+  );
+  assert.doesNotMatch(
+    body,
+    /shouldCaptureBloggerMetricsForRecord =[^;]*recordPlatform === 'douyin'/u,
+  );
+  const coreCaptureAt = body.indexOf("const captureCurrentNotePayload");
+  const coreCaptureEnd = body.indexOf("let noteResult", coreCaptureAt);
+  const coreCapture = body.slice(coreCaptureAt, coreCaptureEnd);
+  assert.match(coreCapture, /expectedNoteId: expectedDouyinNoteId/u);
+  assert.match(coreCapture, /includeBloggerMetrics: false/u);
+  assert.match(coreCapture, /preferWorksTabForBloggerMetrics: false/u);
+
+  const optionalMetricsAt = body.indexOf(
+    "const metricsResult = await captureBloggerMetricsForDetailPayload",
+  );
+  const optionalMetricsEnd = body.indexOf(
+    "detailPayload = applyBloggerMetricsResultToPayload",
+    optionalMetricsAt,
+  );
+  const optionalMetrics = body.slice(optionalMetricsAt, optionalMetricsEnd);
+  assert.match(optionalMetrics, /expectedNoteId: expectedDouyinNoteId/u);
+  assert.match(optionalMetrics, /preferWorksTabForBloggerMetrics/u);
 });
 
 test("Douyin card identity and detail route are kept consistent", () => {
@@ -671,4 +724,25 @@ test("batch sync cancellation reaches spacing, retry, content and lead writes", 
   assert.match(body, /waitForCancelableSyncDelay\([\s\S]*shouldStop,[\s\S]*signal/u);
   assert.match(body, /syncBatch\([\s\S]*\{shouldStop, signal\}/u);
   assert.match(body, /COMMENT_LEADS_SYNC_CANCELED/u);
+});
+
+test("profile recovery lineage survives the final batch request builder", () => {
+  const start = captureSyncSource.indexOf("function buildSyncBatchRecordInput");
+  const end = captureSyncSource.indexOf("function buildSyncRequestPayload", start);
+  const body = captureSyncSource.slice(start, end);
+  assert.match(body, /platform: record\.platform \|\| ''/u);
+  assert.match(body, /workflow: record\.workflow \|\| ''/u);
+  assert.match(
+    body,
+    /monitorExecutionId: record\.monitorExecutionId \|\| ''/u,
+  );
+  assert.match(body, /captureTaskId: record\.captureTaskId \|\| ''/u);
+  assert.match(
+    body,
+    /captureTaskItemAttemptId: record\.captureTaskItemAttemptId \|\| ''/u,
+  );
+  assert.match(
+    body,
+    /captureTaskItemRequestHash: record\.captureTaskItemRequestHash \|\| ''/u,
+  );
 });

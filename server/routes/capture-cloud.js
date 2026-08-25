@@ -10,9 +10,12 @@ import {
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
   captureAgentOnline,
+  bindCloudTaskSnapshotHealthToAttempt,
+  cloudTaskAttemptIdentityAcceptsSnapshot,
   findCaptureAgentExecutionSlotBlocker,
   isCloudTaskActive,
   lockCaptureAgentExecutionSlot,
+  tryLockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeCloudTaskSnapshot,
   normalizeRemoteTaskInput,
@@ -31,6 +34,9 @@ import {getTenantAiAdmissionSnapshot} from '../services/ai-admission.js';
 import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
+import {
+  CAPTURE_PLATFORM_SAFETY_CODES,
+} from '../services/capture-health-schema.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -97,6 +103,11 @@ const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
   'needs_action',
 ]);
 const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
+const DUTY_RECOVERY_TRUE_VALUES = new Set(['1', 'true', 'on', 'yes']);
+const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
+  'ops_control_recovery_enabled',
+  'ops_control_recovery_mode',
+]);
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
@@ -112,22 +123,23 @@ const ELASTIC_BOOTSTRAP_STAGGER_GAP_MS = 6 * 1000;
 const ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS = 2 * 60 * 1000;
 const ELASTIC_BOOTSTRAP_CONGESTION_MAX_DELAY_MS = 30 * 1000;
 const ELASTIC_BOOTSTRAP_MAX_DELAY_MS = 45 * 1000;
-const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set([
-  'DOUYIN_SEARCH_SECURITY_CHALLENGE',
-  'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
-  'DOUYIN_CAPTCHA_REQUIRED',
-  'CAPTCHA_PAGE_DETECTED',
-  'LOGIN_REQUIRED',
-  'AUTH_REQUIRED',
-  'DOUYIN_LOGIN_REQUIRED',
-  'XHS_LOGIN_REQUIRED',
-]);
+const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set(
+  CAPTURE_PLATFORM_SAFETY_CODES,
+);
 const ELASTIC_AGENT_CAPACITY_CODES = new Set([
   'CAPTURE_TASK_GROUP_BUSY',
   'CAPTURE_TASK_CLEANUP_PENDING',
   'CAPTURE_TASK_DEBUG_BUSY',
   'CAPTURE_LOCK_CONFLICT',
 ]);
+
+function dutyRecoveryGlobalActionsEnabled(env = process.env) {
+  return DUTY_RECOVERY_TRUE_VALUES.has(
+    text(env.OPS_CONTROL_RECOVERY_GLOBAL_ENABLED, 20).toLowerCase(),
+  ) && DUTY_RECOVERY_TRUE_VALUES.has(
+    text(env.OPS_CONTROL_RECOVERY_ACTIONS_GLOBAL_ENABLED, 20).toLowerCase(),
+  );
+}
 const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
   ...ELASTIC_AGENT_CAPACITY_CODES,
   'CREATE_COMMAND_EXPIRED',
@@ -223,6 +235,10 @@ const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
   retry_profile_subscription_unavailable: [
     'retry_profile_subscription_unavailable',
     '账号关注已暂停或删除，不能自动重试',
+  ],
+  retry_profile_subscription_busy: [
+    'retry_profile_subscription_busy',
+    '该账号正在被另一轮巡查调度，请稍后自动重试',
   ],
   retry_profile_execution_busy: [
     'retry_profile_execution_busy',
@@ -480,21 +496,51 @@ export function crossDeviceRetryTaskSupported(task = {}) {
   );
 }
 
-function crossDeviceRetrySourceReady(task = {}, {automatic = false} = {}) {
+function crossDeviceRetrySourceReady(
+  task = {},
+  {automatic = false, dutyRecovery = false} = {},
+) {
   if (CROSS_DEVICE_RETRY_SOURCE_STATUSES.has(task.status)) return true;
   if (!automatic || !AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES.has(task.status)) {
     return false;
   }
+  if (dutyRecovery) return true;
   const metadata = safeJson(task.metadata);
   return Boolean(text(metadata.lastAutomaticRecoveryTaskId, 100));
 }
 
-export function classifyCaptureRecoveryDisposition(item = {}) {
+export function classifyCaptureRecoveryDisposition(
+  item = {},
+  {phase = 'fast'} = {},
+) {
+  const dutyRecovery = phase === 'duty';
   if (crossDeviceRetryItemNeedsManualSafety(item)) {
     return {kind: 'manual_current', automatic: false};
   }
   const status = text(item.status, 80).toLowerCase();
+  const error = safeJson(item.error);
+  const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
+  const code = text(
+    error.code || checkpoint.errorCode || checkpoint.error_code,
+    100,
+  ).toUpperCase();
+  const category = text(
+    error.category || checkpoint.errorCategory || checkpoint.error_category,
+    100,
+  ).toLowerCase();
   if (
+    dutyRecovery &&
+    (
+      CROSS_DEVICE_RETRY_PERMANENT_CODES.has(code) ||
+      EXPLICIT_USER_CANCELLATION_CODES.has(code) ||
+      ['invalid_record', 'link_missing', 'integrity_blocked', 'user_canceled']
+        .includes(category)
+    )
+  ) {
+    return {kind: 'terminal_business_failure', automatic: false};
+  }
+  if (
+    !dutyRecovery &&
     Number(item.attempt_count || 0) >=
     AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
   ) {
@@ -506,16 +552,6 @@ export function classifyCaptureRecoveryDisposition(item = {}) {
   ) {
     return {kind: 'auto_handoff', automatic: true};
   }
-  const error = safeJson(item.error);
-  const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
-  const code = text(
-    error.code || checkpoint.errorCode || checkpoint.error_code,
-    100,
-  ).toUpperCase();
-  const category = text(
-    error.category || checkpoint.errorCategory || checkpoint.error_category,
-    100,
-  ).toLowerCase();
   if (
     CROSS_DEVICE_RETRY_PERMANENT_CODES.has(code) ||
     ['invalid_record', 'link_missing', 'integrity_blocked', 'user_canceled']
@@ -548,22 +584,62 @@ export function crossDeviceRetrySourceAgentIdsForItems(
     .filter(value => UUID_PATTERN.test(value))));
 }
 
+export function crossDeviceRetrySafetyAgentIdsForItems(
+  items = [],
+  attempts = [],
+) {
+  const selectedItemIds = new Set(
+    items.map(item => text(item?.id, 100).toLowerCase()).filter(Boolean),
+  );
+  const safetyAgentIds = [
+    ...items
+      .filter(item => crossDeviceRetryItemNeedsManualSafety(item))
+      .map(item => item?.assigned_agent_id),
+    ...attempts
+      .filter(attempt => (
+        selectedItemIds.has(text(attempt?.item_id, 100).toLowerCase())
+        && crossDeviceRetryItemNeedsManualSafety({
+          status: attempt?.status,
+          error: safeJson(attempt?.error),
+          metadata: {checkpoint: safeJson(attempt?.checkpoint)},
+        })
+      ))
+      .map(attempt => attempt?.agent_id),
+  ];
+  return Array.from(new Set(
+    safetyAgentIds
+      .map(value => text(value, 100).toLowerCase())
+      .filter(value => UUID_PATTERN.test(value)),
+  ));
+}
+
 export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
   const error = safeJson(item.error);
   const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
+  const evidence = [error, checkpoint];
   const code = text(
     error.code || checkpoint.errorCode || checkpoint.error_code,
     100,
   ).toUpperCase();
   return CROSS_DEVICE_RETRY_SAFETY_CODES.has(code) ||
-    ['platform_safety_block', 'login_required', 'authentication_required']
-      .includes(text(error.category, 100).toLowerCase()) ||
-    error.securityBlocked === true ||
-    error.platformSafetyBlocked === true ||
-    error.requiresManualAction === true ||
-    checkpoint.securityBlocked === true ||
-    checkpoint.platformSafetyBlocked === true ||
-    checkpoint.requiresManualAction === true;
+    evidence.some(value => [
+      'platform_safety_block',
+      'login_required',
+      'authentication_required',
+    ].includes(text(
+      value.category || value.errorCategory || value.error_category,
+      100,
+    ).toLowerCase())) ||
+    evidence.some(value => (
+      value.securityBlocked === true
+      || value.security_blocked === true
+      || value.platformSafetyBlocked === true
+      || value.platform_safety_blocked === true
+      || value.requiresManualAction === true
+      || value.requires_manual_action === true
+      || safeJson(value.securityEvidence).confirmed === true
+      || safeJson(value.security_evidence).confirmed === true
+    ));
 }
 
 export function projectElasticKeywordRecoveryStatus({
@@ -891,6 +967,12 @@ export function crossDeviceRetryAgentSupportsTask(
 ) {
   const capabilities = safeJson(agent.capabilities);
   if (capabilities.remoteTaskCreate !== true) return false;
+  const dutyRecoveryRequested =
+    Object.keys(safeJson(commandPayload.dutyRecovery)).length > 0;
+  if (dutyRecoveryRequested && (
+    capabilities.remoteStop !== true ||
+    capabilities.dutyRecoveryLineageV1 !== true
+  )) return false;
   const platform = text(task.platform, 40).toLowerCase();
   const allowedPlatforms = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
@@ -2441,6 +2523,22 @@ function sequentialSearchResumeEntry(entry = {}, keyword = '') {
     status: 'completed',
     attemptCount: Math.max(0, Number(source.attemptCount) || 0),
     savedCount: Math.max(0, Number(source.savedCount) || 0),
+    ...(source.noResults === true || source.no_results === true
+      ? {noResults: true}
+      : {}),
+    ...(text(source.resultKind || source.result_kind, 80)
+      ? {resultKind: text(source.resultKind || source.result_kind, 80)}
+      : {}),
+    ...(source.candidateCount !== undefined || source.candidate_count !== undefined
+      ? {
+          candidateCount: orchestrationCheckpointInteger(
+            source.candidateCount ?? source.candidate_count,
+          ),
+        }
+      : {}),
+    ...(source.scanComplete === true || source.scan_complete === true
+      ? {scanComplete: true}
+      : {}),
     error: '',
     finishedAt: orchestrationCheckpointTimestamp(source.finishedAt),
   };
@@ -2904,9 +3002,12 @@ async function refreshOrchestrationParentTask(tx, {
     'official_account_post_discovery',
   ].includes(promotedRetryBusinessTaskType(parent));
   const previousProgress = safeJson(parent.progress);
-  const businessProgressChanged =
+  const settledProgressChanged =
     Number(previousProgress.current || 0) !== aggregate.progress.current ||
     Number(previousProgress.total || 0) !== aggregate.progress.total;
+  const reportedBusinessProgressAt = orchestrationCheckpointTimestamp(
+    snapshot.businessProgressAt,
+  );
   const message = aggregate.status === 'running'
     ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
       ? contentPatrol
@@ -2947,11 +3048,18 @@ async function refreshOrchestrationParentTask(tx, {
       message = $4,
       heartbeat_at = GREATEST(heartbeat_at, $5::timestamptz),
       business_progress_at = CASE
-        WHEN $6::boolean THEN GREATEST(business_progress_at, $7::timestamptz)
+        WHEN $6::timestamptz IS NOT NULL THEN GREATEST(
+          COALESCE(business_progress_at, $6::timestamptz),
+          $6::timestamptz
+        )
+        WHEN $7::boolean THEN GREATEST(
+          COALESCE(business_progress_at, now()),
+          now()
+        )
         ELSE business_progress_at
       END,
       finished_at = CASE
-        WHEN $8::boolean THEN COALESCE(finished_at, $7::timestamptz, now())
+        WHEN $8::boolean THEN COALESCE(finished_at, $6::timestamptz, now())
         ELSE NULL
       END,
       source_updated_at = CASE
@@ -2967,12 +3075,8 @@ async function refreshOrchestrationParentTask(tx, {
     JSON.stringify(aggregate.counts),
     message,
     orchestrationCheckpointTimestamp(snapshot.heartbeatAt),
-    businessProgressChanged,
-    orchestrationCheckpointTimestamp(
-      snapshot.businessProgressAt ||
-      snapshot.updatedAt ||
-      snapshot.heartbeatAt,
-    ),
+    reportedBusinessProgressAt,
+    settledProgressChanged,
     aggregate.terminal,
     orchestrationCheckpointTimestamp(snapshot.updatedAt || snapshot.heartbeatAt),
     parentTaskId,
@@ -3269,6 +3373,32 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
         AND external_id = $16
         AND assignment_revision = $17
         AND (capture_task_items.status <> 'canceled' OR $1 = 'canceled')
+        AND (
+          capture_task_items.status IS DISTINCT FROM $1
+          OR capture_task_items.attempt_count < 1
+          OR capture_task_items.error IS DISTINCT FROM $4::jsonb
+          OR capture_task_items.metadata->'checkpoint'
+            IS DISTINCT FROM $5::jsonb
+          OR capture_task_items.metadata->'targetResult'
+            IS DISTINCT FROM $6::jsonb
+          OR (
+            $2::boolean
+            AND $3::uuid IS NOT NULL
+            AND capture_task_items.result_observation_id
+              IS DISTINCT FROM $3::uuid
+          )
+          OR (
+            $2::boolean
+            AND NOT $18::boolean
+            AND capture_task_items.result_record_id
+              IS DISTINCT FROM capture_task_items.record_id
+          )
+          OR capture_task_items.started_at IS NULL
+          OR (
+            $8::boolean
+            AND capture_task_items.finished_at IS NULL
+          )
+        )
       RETURNING id, assignment_revision, result_record_id,
         result_observation_id
     `, [
@@ -3728,6 +3858,9 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       ? `${statusMessage}，本次读取 ${aggregate.counts.commentsSampled} 条可见评论样本`
       : statusMessage;
   const now = new Date().toISOString();
+  const projectedBusinessProgressAt =
+    orchestrationCheckpointTimestamp(snapshot.businessProgressAt) ||
+    (projectedItemIds.length > 0 ? now : null);
   const updatedTask = await tx.queryOne(`
     UPDATE capture_tasks
     SET status = $1,
@@ -3741,18 +3874,21 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
         )
       ),
       business_progress_at = CASE
-        WHEN $5::integer > 0
-          THEN GREATEST(COALESCE(business_progress_at, $6::timestamptz), $6::timestamptz)
+        WHEN $7::timestamptz IS NOT NULL
+          THEN GREATEST(
+            COALESCE(business_progress_at, $7::timestamptz),
+            $7::timestamptz
+          )
         ELSE business_progress_at
       END,
       finished_at = CASE
-        WHEN $7::boolean THEN COALESCE(finished_at, $6::timestamptz)
+        WHEN $8::boolean THEN COALESCE(finished_at, $6::timestamptz)
         ELSE NULL
       END,
       updated_at = now()
-    WHERE id = $8
-      AND tenant_id = $9
-      AND assigned_agent_id = $10
+    WHERE id = $9
+      AND tenant_id = $10
+      AND assigned_agent_id = $11
       AND status NOT IN ('canceled', 'superseded')
     RETURNING *
   `, [
@@ -3762,6 +3898,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
     message,
     projectedItemIds.length,
     now,
+    projectedBusinessProgressAt,
     aggregate.terminal,
     task.id,
     agent.tenant_id,
@@ -4045,6 +4182,27 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       status: text(entry.status, 80),
       attemptCount,
       savedCount,
+      ...(
+        entry.noResults === true
+        || entry.no_results === true
+        || entry.zeroResults === true
+        || entry.zero_results === true
+          ? {noResults: true}
+          : {}
+      ),
+      ...(text(entry.resultKind || entry.result_kind, 80)
+        ? {resultKind: text(entry.resultKind || entry.result_kind, 80)}
+        : {}),
+      ...(entry.candidateCount !== undefined || entry.candidate_count !== undefined
+        ? {
+            candidateCount: orchestrationCheckpointInteger(
+              entry.candidateCount ?? entry.candidate_count,
+            ),
+          }
+        : {}),
+      ...(entry.scanComplete === true || entry.scan_complete === true
+        ? {scanComplete: true}
+        : {}),
       ...(text(entry.errorCode || entry.error_code, 100)
         ? {errorCode: text(entry.errorCode || entry.error_code, 100)}
         : {}),
@@ -4469,13 +4627,39 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   });
 }
 
-async function mirrorTaskSnapshot(tx, agent, snapshot) {
+export async function mirrorTaskSnapshot(tx, agent, snapshot) {
+  snapshot = bindCloudTaskSnapshotHealthToAttempt(snapshot);
   const previous = await tx.queryOne(`
-    SELECT id, status, attempt_number
-    FROM capture_tasks
-    WHERE tenant_id = $1 AND origin_agent_id = $2 AND client_task_id = $3
+    SELECT task.id, task.status, task.attempt_number,
+      occupied_attempt.client_attempt_id AS occupied_attempt_id
+    FROM capture_tasks task
+    LEFT JOIN capture_task_attempts occupied_attempt
+      ON occupied_attempt.task_id = task.id
+      AND occupied_attempt.attempt_number = $4
+    WHERE task.tenant_id = $1
+      AND task.origin_agent_id = $2
+      AND task.client_task_id = $3
     LIMIT 1
-  `, [agent.tenant_id, agent.id, snapshot.clientTaskId]);
+  `, [
+    agent.tenant_id,
+    agent.id,
+    snapshot.clientTaskId,
+    snapshot.attemptNumber,
+  ]);
+
+  if (
+    previous
+    && !cloudTaskAttemptIdentityAcceptsSnapshot(
+      previous.occupied_attempt_id,
+      snapshot.attemptId,
+    )
+  ) {
+    return tx.queryOne(`
+      SELECT *
+      FROM capture_tasks
+      WHERE id = $1 AND tenant_id = $2
+    `, [previous.id, agent.tenant_id]);
+  }
 
   // Read exact create evidence without locking it; the task upsert below takes
   // the first write lock, and command reconciliation follows that same
@@ -4675,16 +4859,20 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
       )
       -- attempt_number is a monotonic slot, while client_attempt_id identifies
       -- the concrete runner incarnation occupying it. Once a non-empty ID is
-      -- recorded, a different non-empty ID may not overwrite that slot's task
-      -- projection. Empty legacy IDs remain compatible in either direction.
+      -- recorded, only that exact non-empty ID may overwrite the slot's task
+      -- projection. A legacy empty slot may upgrade to a concrete ID, never
+      -- the reverse; this asymmetry keeps late legacy reports from mutating a
+      -- bound attempt's status, progress, checkpoint, error, or health.
       AND NOT EXISTS (
         SELECT 1
         FROM capture_task_attempts existing_attempt
         WHERE existing_attempt.task_id = capture_tasks.id
           AND existing_attempt.attempt_number = EXCLUDED.attempt_number
           AND existing_attempt.client_attempt_id <> ''
-          AND $27 <> ''
-          AND existing_attempt.client_attempt_id <> $27
+          AND (
+            $27 = ''
+            OR existing_attempt.client_attempt_id <> $27
+          )
       )
       AND NOT (
         EXCLUDED.attempt_number = capture_tasks.attempt_number
@@ -4762,12 +4950,15 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
     attempt = await tx.queryOne(`
       INSERT INTO capture_task_attempts (
         tenant_id, task_id, agent_id, client_attempt_id, attempt_number,
+        app_version, health_evidence,
         status, progress_seq, heartbeat_at, business_progress_at,
         started_at, finished_at, progress, checkpoint, error, updated_at
       ) VALUES (
         $1, $2, $3, $4, $5,
-        $6, $7, $8, $9,
-        COALESCE($10, now()), $11, $12::jsonb, $13::jsonb, $14::jsonb, now()
+        CASE WHEN $4 <> '' THEN $6 ELSE '' END,
+        CASE WHEN $4 <> '' THEN $7::jsonb ELSE '{}'::jsonb END,
+        $8, $9, $10, $11,
+        COALESCE($12, now()), $13, $14::jsonb, $15::jsonb, $16::jsonb, now()
       )
       ON CONFLICT (task_id, attempt_number)
       DO UPDATE SET
@@ -4777,6 +4968,26 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
             AND EXCLUDED.client_attempt_id = ''
             THEN capture_task_attempts.client_attempt_id
           ELSE EXCLUDED.client_attempt_id
+        END,
+        app_version = CASE
+          WHEN EXCLUDED.client_attempt_id <> ''
+            AND (
+              capture_task_attempts.client_attempt_id = ''
+              OR capture_task_attempts.client_attempt_id = EXCLUDED.client_attempt_id
+            )
+            AND EXCLUDED.app_version <> ''
+            THEN EXCLUDED.app_version
+          ELSE capture_task_attempts.app_version
+        END,
+        health_evidence = CASE
+          WHEN EXCLUDED.client_attempt_id <> ''
+            AND (
+              capture_task_attempts.client_attempt_id = ''
+              OR capture_task_attempts.client_attempt_id = EXCLUDED.client_attempt_id
+            )
+            AND EXCLUDED.health_evidence <> '{}'::jsonb
+            THEN EXCLUDED.health_evidence
+          ELSE capture_task_attempts.health_evidence
         END,
         status = CASE
           WHEN capture_task_attempts.status IN (
@@ -4795,7 +5006,6 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
         error = EXCLUDED.error,
         updated_at = now()
       WHERE capture_task_attempts.client_attempt_id = ''
-        OR EXCLUDED.client_attempt_id = ''
         OR capture_task_attempts.client_attempt_id = EXCLUDED.client_attempt_id
       RETURNING id
     `, [
@@ -4804,6 +5014,8 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
       agent.id,
       snapshot.attemptId,
       snapshot.attemptNumber,
+      snapshot.appVersion,
+      JSON.stringify(snapshot.structuredTaskHealth),
       normalizedAttemptStatus,
       snapshot.progressSeq,
       snapshot.heartbeatAt,
@@ -4839,7 +5051,7 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
     `, [
       agent.tenant_id,
       task.id,
-      attempt?.id || null,
+      snapshot.attemptId ? attempt?.id || null : null,
       agent.id,
       snapshot.clientTaskId,
       snapshot.controlTaskId,
@@ -4892,7 +5104,7 @@ async function mirrorTaskSnapshot(tx, agent, snapshot) {
     await appendEvent(tx, {
       tenantId: agent.tenant_id,
       taskId: task.id,
-      attemptId: attempt?.id || null,
+      attemptId: snapshot.attemptId ? attempt?.id || null : null,
       agentId: agent.id,
       eventType: previous ? 'task_status_changed' : 'task_discovered',
       actorType: 'capture_agent',
@@ -5672,6 +5884,8 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
           AND c.payload->>'authBindingId' = $4
           AND c.payload->>'platform' = t.platform
           AND (
+            c.command_type = 'stop'
+            OR
             cardinality($5::text[]) = 0
             OR t.platform = ANY($5::text[])
           )
@@ -8626,7 +8840,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
     task.id,
     CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
   ]);
-  const candidate = candidates.find(agent => {
+  const eligibleCandidates = candidates.filter(agent => {
     const authExpired = agent.auth_code_expires_at &&
       new Date(agent.auth_code_expires_at) < new Date();
     return agent.tenant_status === 'active' &&
@@ -8638,40 +8852,69 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       Number(agent.active_command_count || 0) === 0 &&
       crossDeviceRetryAgentSupportsTask(agent, task, commandPayload);
   });
-  if (!candidate) return null;
-
-  await lockCaptureAgentExecutionSlot(tx, tenantId, candidate.id);
-  const locked = await tx.queryOne(`
-    SELECT ca.*, tenant.status AS tenant_status,
-      ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
-      ab.id AS active_auth_binding_id
-    FROM capture_agents ca
-    JOIN tenants tenant ON tenant.id = ca.tenant_id
-    LEFT JOIN auth_codes ac
-      ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
-    LEFT JOIN auth_bindings ab
-      ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
-    WHERE ca.id = $1 AND ca.tenant_id = $2
-    FOR UPDATE OF ca
-  `, [candidate.id, tenantId]);
-  if (
-    !locked ||
-    locked.status !== 'active' ||
-    locked.tenant_status !== 'active' ||
-    locked.auth_code_status !== 'active' ||
-    !locked.active_auth_binding_id ||
-    !captureAgentOnline(locked.last_heartbeat_at) ||
-    !crossDeviceRetryAgentSupportsTask(locked, task, commandPayload)
-  ) {
-    return null;
+  for (const candidate of eligibleCandidates) {
+    const savepoint = 'capture_retry_agent_candidate';
+    await tx.execute(`SAVEPOINT ${savepoint}`);
+    try {
+      const slotLocked = await tryLockCaptureAgentExecutionSlot(
+        tx,
+        tenantId,
+        candidate.id,
+      );
+      if (!slotLocked) {
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+        continue;
+      }
+      const locked = await tx.queryOne(`
+        SELECT ca.*, tenant.status AS tenant_status,
+          ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
+          ab.id AS active_auth_binding_id
+        FROM capture_agents ca
+        JOIN tenants tenant ON tenant.id = ca.tenant_id
+        LEFT JOIN auth_codes ac
+          ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+        LEFT JOIN auth_bindings ab
+          ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        WHERE ca.id = $1 AND ca.tenant_id = $2
+        FOR UPDATE OF ca
+      `, [candidate.id, tenantId]);
+      const authExpired = locked?.auth_code_expires_at &&
+        new Date(locked.auth_code_expires_at) < new Date();
+      const eligible = locked &&
+        locked.status === 'active' &&
+        locked.tenant_status === 'active' &&
+        locked.auth_code_status === 'active' &&
+        Boolean(locked.active_auth_binding_id) &&
+        !authExpired &&
+        captureAgentOnline(locked.last_heartbeat_at) &&
+        crossDeviceRetryAgentSupportsTask(locked, task, commandPayload);
+      const busy = eligible
+        ? await findCaptureAgentExecutionSlotBlocker(
+            tx,
+            tenantId,
+            locked.id,
+            {excludeTaskIds: [task.id]},
+          )
+        : {kind: 'ineligible'};
+      if (!eligible || busy) {
+        // Rolling back to the per-candidate savepoint releases both its row
+        // lock and its transaction-level advisory lock before trying the next
+        // idle browser. Locks acquired by the surrounding dispatch remain.
+        await tx.execute(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+        continue;
+      }
+      await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+      return locked;
+    } catch (error) {
+      try {
+        await tx.execute(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+      } catch {}
+      throw error;
+    }
   }
-  const busy = await findCaptureAgentExecutionSlotBlocker(
-    tx,
-    tenantId,
-    locked.id,
-    {excludeTaskIds: [task.id]},
-  );
-  return busy ? null : locked;
+  return null;
 }
 
 function promotedRetryFallbackTarget(item = {}) {
@@ -8756,25 +8999,61 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
     if (!UUID_PATTERN.test(subscriptionId)) {
       return {error: 'retry_profile_subscription_invalid'};
     }
-    const subscription = await tx.queryOne(`
+    const subscriptionSnapshot = await tx.queryOne(`
       SELECT id, status
       FROM monitor_subscriptions
       WHERE id = $1 AND tenant_id = $2
     `, [subscriptionId, tenantId]);
-    if (!subscription || subscription.status !== 'active') {
+    if (!subscriptionSnapshot || subscriptionSnapshot.status !== 'active') {
       return {error: 'retry_profile_subscription_unavailable'};
     }
+    // Profile dispatchers do not all acquire subscription/execution rows in
+    // the same order. Never wait while crossing that boundary: claim the
+    // previous execution first with SKIP LOCKED, then claim the subscription
+    // the same way. A competing manual/scheduled dispatch makes this recovery
+    // roll back and retry later instead of forming a lock cycle.
     const previousExecutionId = text(metadata.monitorExecutionId, 100);
     if (UUID_PATTERN.test(previousExecutionId)) {
-      await tx.execute(`
-        UPDATE monitor_executions
-        SET status = 'failed',
-          error_message = '原设备任务已结束，未完成账号已转交其他设备重试',
-          finished_at = COALESCE(finished_at, now()),
-          updated_at = now()
+      const previousExecutionExists = await tx.queryOne(`
+        SELECT id
+        FROM monitor_executions
         WHERE id = $1 AND tenant_id = $2
-          AND status IN ('pending', 'running')
       `, [previousExecutionId, tenantId]);
+      if (previousExecutionExists) {
+        const previousExecution = await tx.queryOne(`
+          SELECT id, status
+          FROM monitor_executions
+          WHERE id = $1 AND tenant_id = $2
+          FOR UPDATE SKIP LOCKED
+        `, [previousExecutionId, tenantId]);
+        if (!previousExecution) {
+          return {error: 'retry_profile_execution_busy'};
+        }
+        if (['pending', 'running'].includes(previousExecution.status)) {
+          await tx.execute(`
+            UPDATE monitor_executions
+            SET status = 'failed',
+              error_message =
+                '原设备任务已结束，未完成账号已转交其他设备重试',
+              finished_at = COALESCE(finished_at, now()),
+              updated_at = now()
+            WHERE id = $1 AND tenant_id = $2
+              AND status IN ('pending', 'running')
+          `, [previousExecutionId, tenantId]);
+        }
+      }
+    }
+    const subscription = await tx.queryOne(`
+      SELECT id, status
+      FROM monitor_subscriptions
+      WHERE id = $1 AND tenant_id = $2
+      FOR SHARE SKIP LOCKED
+    `, [subscriptionId, tenantId]);
+    if (!subscription) {
+      return {error: 'retry_profile_subscription_busy'};
+    }
+    if (subscription.status !== 'active') {
+      return {error: 'retry_profile_subscription_unavailable'};
     }
     const execution = await tx.queryOne(`
       INSERT INTO monitor_executions (tenant_id, subscription_id, status)
@@ -8797,22 +9076,128 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
   return {executionIdByItem};
 }
 
-async function dispatchCrossDeviceRetry({
-  tenantId,
-  taskId,
-  requestKey,
-  expectedRevision,
-  actorType = 'system',
-  requestedByUserId = '',
-  requestedByName = '自动调度中心',
-  automatic = false,
-} = {}) {
+export async function dispatchCrossDeviceRetry(options = {}) {
+  const {
+    tenantId,
+    taskId,
+    requestKey,
+    expectedRevision,
+    actorType = 'system',
+    requestedByUserId = '',
+    requestedByName = '自动调度中心',
+    automatic = false,
+    recoveryPhase = 'fast',
+    itemIds = null,
+    dutyRecoveryIntentId = '',
+    dutyRecoveryLeaseToken = '',
+    dutyRecoveryGeneration = 0,
+    expectedItemRevision,
+    expectedSourceAttemptId,
+    expectedAttemptNumber,
+    allowPreviouslyAttemptedAgents = false,
+  } = options;
+  if (!['fast', 'duty'].includes(recoveryPhase)) {
+    return {error: 'invalid_recovery_phase'};
+  }
+  const dutyRecovery = recoveryPhase === 'duty';
+  const requestedItemIds = Array.isArray(itemIds)
+    ? Array.from(new Set(
+        itemIds
+          .map(value => text(value, 100).toLowerCase())
+          .filter(Boolean),
+      ))
+    : [];
+  const itemScopeProvided = itemIds !== null && itemIds !== undefined;
+  if (
+    itemScopeProvided &&
+    (
+      !Array.isArray(itemIds) ||
+      requestedItemIds.length !== itemIds.length ||
+      requestedItemIds.some(value => !UUID_PATTERN.test(value))
+    )
+  ) {
+    return {error: 'invalid_retry_item_scope'};
+  }
+  if (
+    dutyRecovery &&
+    (
+      automatic !== true ||
+      requestedItemIds.length !== 1 ||
+      !UUID_PATTERN.test(text(tenantId, 100).toLowerCase()) ||
+      !UUID_PATTERN.test(text(taskId, 100).toLowerCase()) ||
+      !UUID_PATTERN.test(text(requestKey, 100).toLowerCase()) ||
+      !UUID_PATTERN.test(text(dutyRecoveryIntentId, 100).toLowerCase()) ||
+      !UUID_PATTERN.test(text(dutyRecoveryLeaseToken, 100).toLowerCase()) ||
+      text(dutyRecoveryIntentId, 100).toLowerCase() !==
+        text(requestKey, 100).toLowerCase() ||
+      !Number.isSafeInteger(Number(dutyRecoveryGeneration)) ||
+      Number(dutyRecoveryGeneration) < 1 ||
+      Number(dutyRecoveryGeneration) > 3 ||
+      !Number.isSafeInteger(Number(expectedRevision)) ||
+      Number(expectedRevision) < 0 ||
+      !Number.isSafeInteger(Number(expectedItemRevision)) ||
+      Number(expectedItemRevision) < 0 ||
+      !Number.isSafeInteger(Number(expectedAttemptNumber)) ||
+      Number(expectedAttemptNumber) < 0 ||
+      typeof allowPreviouslyAttemptedAgents !== 'boolean' ||
+      !(
+        expectedSourceAttemptId == null ||
+        text(expectedSourceAttemptId, 100) === '' ||
+        UUID_PATTERN.test(text(expectedSourceAttemptId, 100).toLowerCase())
+      )
+    )
+  ) {
+    return {error: 'invalid_duty_recovery_request'};
+  }
+  if (!dutyRecovery && allowPreviouslyAttemptedAgents === true) {
+    return {error: 'invalid_duty_recovery_request'};
+  }
+  const dutyIntentId = dutyRecovery
+    ? text(dutyRecoveryIntentId, 100).toLowerCase()
+    : '';
+  const dutyGeneration = dutyRecovery
+    ? Number(dutyRecoveryGeneration)
+    : 0;
+  const noIdleAgentResult = () => dutyRecovery
+    ? {
+        error: 'idle_compatible_agent_unavailable',
+        code: 'NO_IDLE_AGENT',
+        waitingForAgent: true,
+      }
+    : {error: 'idle_compatible_agent_unavailable'};
+  const supersededResult = details => ({
+    error: 'duty_recovery_source_superseded',
+    code: 'RECOVERY_SOURCE_SUPERSEDED',
+    superseded: true,
+    ...details,
+  });
+  const itemAttemptEvidence = attempt => ({
+    id: text(attempt?.id, 100).toLowerCase(),
+    itemId: text(attempt?.item_id || attempt?.itemId, 100).toLowerCase(),
+    executionTaskId: text(
+      attempt?.execution_task_id || attempt?.executionTaskId,
+      100,
+    ).toLowerCase(),
+    agentId: text(attempt?.agent_id || attempt?.agentId, 100).toLowerCase(),
+    attemptNumber: Number(
+      attempt?.attempt_number ?? attempt?.attemptNumber ?? 0,
+    ),
+    assignmentRevision: Number(
+      attempt?.assignment_revision ?? attempt?.assignmentRevision ?? 0,
+    ),
+    status: text(attempt?.status, 80).toLowerCase(),
+    requestHash: text(
+      attempt?.request_hash || attempt?.requestHash,
+      100,
+    ).toLowerCase(),
+  });
   const req = {
     tenantId,
     user: requestedByUserId ? {id: requestedByUserId} : null,
     actorName: requestedByName,
   };
-  return await withTransaction(async tx => {
+  try {
+    return await withTransaction(async tx => {
       await tx.execute(
         'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
         ['capture_cross_device_retry', requestKey],
@@ -8827,19 +9212,206 @@ async function dispatchCrossDeviceRetry({
         const replayMetadata = safeJson(replay.metadata);
         if (
           String(replay.parent_task_id || '') !== taskId ||
-          replayMetadata.crossDeviceRetryRequestKey !== requestKey
+          replayMetadata.crossDeviceRetryRequestKey !== requestKey ||
+          (
+            dutyRecovery &&
+            (
+              replayMetadata.dutyRecovery !== true ||
+              replayMetadata.dutyRecoveryIntentId !== dutyIntentId ||
+              Number(replayMetadata.dutyRecoveryGeneration || 0) !==
+                dutyGeneration ||
+              !Array.isArray(replayMetadata.itemIds) ||
+              replayMetadata.itemIds.length !== 1 ||
+              text(replayMetadata.itemIds[0], 100).toLowerCase() !==
+                requestedItemIds[0]
+            )
+          )
         ) {
           return {error: 'idempotency_key_conflict'};
         }
-        return {existing: true, child: replay};
+        const command = await tx.queryOne(`
+          SELECT id, status, expires_at
+          FROM capture_agent_commands
+          WHERE tenant_id = $1 AND task_id = $2 AND command_type = 'create'
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        `, [req.tenantId, replay.id]);
+        const itemAttempts = await tx.queryAll(`
+          SELECT id, item_id, execution_task_id, agent_id,
+            attempt_number, assignment_revision, status, request_hash
+          FROM capture_task_item_attempts
+          WHERE tenant_id = $1 AND execution_task_id = $2
+            AND (
+              cardinality($3::uuid[]) = 0 OR item_id = ANY($3::uuid[])
+            )
+          ORDER BY attempt_number, item_id, id
+        `, [req.tenantId, replay.id, requestedItemIds]);
+        const parent = await tx.queryOne(`
+          SELECT id, status, orchestration_revision
+          FROM capture_tasks
+          WHERE tenant_id = $1 AND id = $2
+        `, [req.tenantId, replay.parent_task_id]);
+        return {
+          existing: true,
+          replayed: true,
+          child: replay,
+          command,
+          agent: replay.assigned_agent_id
+            ? {id: replay.assigned_agent_id}
+            : null,
+          parent,
+          itemAttempts: itemAttempts.map(itemAttemptEvidence),
+          itemCount: itemAttempts.length,
+          targetAgentId: replay.assigned_agent_id || '',
+          recovery: dutyRecovery
+            ? {phase: 'duty', intentId: dutyIntentId, generation: dutyGeneration}
+            : {phase: 'fast'},
+        };
+      }
+
+      if (dutyRecovery) {
+        if (!dutyRecoveryGlobalActionsEnabled()) {
+          return {error: 'automatic_retry_disabled', code: 'RECOVERY_GATE_OFF'};
+        }
+        const recoverySettings = await tx.queryAll(`
+          SELECT key, value
+          FROM tenant_settings
+          WHERE tenant_id = $1 AND key = ANY($2::text[])
+          ORDER BY key
+          FOR SHARE
+        `, [req.tenantId, DUTY_RECOVERY_SETTING_KEYS]);
+        const recoverySettingMap = Object.fromEntries(
+          recoverySettings.map(row => [text(row.key, 120), text(row.value, 120)]),
+        );
+        if (
+          !DUTY_RECOVERY_TRUE_VALUES.has(
+            text(
+              recoverySettingMap.ops_control_recovery_enabled,
+              20,
+            ).toLowerCase(),
+          )
+          || text(
+            recoverySettingMap.ops_control_recovery_mode,
+            20,
+          ).toLowerCase() !== 'guarded'
+        ) {
+          return {error: 'automatic_retry_disabled', code: 'RECOVERY_GATE_OFF'};
+        }
       }
 
       const initialTask = await tx.queryOne(`
         SELECT *
         FROM capture_tasks
         WHERE id = $1 AND tenant_id = $2
+        ${dutyRecovery ? 'FOR UPDATE' : ''}
       `, [taskId, req.tenantId]);
       if (!initialTask) return {error: 'task_not_found'};
+      if (
+        dutyRecovery &&
+        (
+          ['canceled', 'skipped', 'superseded'].includes(initialTask.status) ||
+          isExplicitUserCancellationSnapshot(initialTask, {
+            status: initialTask.status,
+            error: initialTask.error,
+            metadata: initialTask.metadata,
+          })
+        )
+      ) {
+        return {
+          error: 'retry_items_not_automatically_recoverable',
+          code: 'SOURCE_STOPPED_BY_USER',
+          stoppedByUser: true,
+        };
+      }
+      if (dutyRecovery) {
+        // Lock order is task -> intent everywhere (including the user-stop
+        // trigger). The dispatcher also proves it is acting under the live
+        // worker claim instead of trusting an internal caller's boolean.
+        const durableIntent = await tx.queryOne(`
+          SELECT id, parent_task_id, item_id, generation, created_at,
+            status, action_count, recovery_task_id, dispatched_attempt_id,
+            lease_token, lease_expires_at, available_at, window_ends_at,
+            CASE
+              WHEN verification->>'reuseEligibleAt' ~
+                '^\\d{4}-\\d{2}-\\d{2}T'
+              THEN (verification->>'reuseEligibleAt')::timestamptz
+              ELSE created_at + interval '10 minutes'
+            END AS reuse_eligible_at
+          FROM capture_recovery_intents
+          WHERE id = $1::uuid
+            AND tenant_id = $2
+            AND parent_task_id = $3::uuid
+            AND item_id = $4::uuid
+            AND generation = $5::integer
+          FOR UPDATE
+        `, [
+          dutyIntentId,
+          req.tenantId,
+          taskId,
+          requestedItemIds[0],
+          dutyGeneration,
+        ]);
+        const actionClock = durableIntent ? await tx.queryOne(`
+          WITH action_clock AS (
+            SELECT clock_timestamp() AS action_time
+          )
+          SELECT action_time,
+            $1::timestamptz > action_time AS lease_valid,
+            $2::timestamptz <= action_time AS intent_due,
+            $3::timestamptz > action_time AS window_open,
+            $4::timestamptz <= action_time AS reuse_due
+          FROM action_clock
+        `, [
+          durableIntent.lease_expires_at,
+          durableIntent.available_at,
+          durableIntent.window_ends_at,
+          durableIntent.reuse_eligible_at,
+        ]) : null;
+        const durableLeaseMatches = Boolean(
+          durableIntent
+          && text(durableIntent.lease_token, 100).toLowerCase() ===
+            text(dutyRecoveryLeaseToken, 100).toLowerCase()
+        );
+        if (durableIntent && actionClock?.window_open !== true) {
+          return {
+            error: 'recovery_window_ended',
+            code: 'RECOVERY_WINDOW_ENDED',
+          };
+        }
+        if (durableLeaseMatches && actionClock?.lease_valid !== true) {
+          return {
+            error: 'duty_recovery_lease_expired',
+            code: 'RECOVERY_LEASE_EXPIRED',
+          };
+        }
+        if (durableLeaseMatches && actionClock?.intent_due !== true) {
+          return {
+            error: 'duty_recovery_not_due',
+            code: 'RECOVERY_INTENT_NOT_DUE',
+          };
+        }
+        if (
+          !durableIntent
+          || !durableLeaseMatches
+          || Number(durableIntent.action_count || 0) !== 0
+          || durableIntent.recovery_task_id
+          || durableIntent.dispatched_attempt_id
+          || !['ready', 'waiting_due', 'waiting_agent'].includes(
+            text(durableIntent.status, 80).toLowerCase(),
+          )
+        ) {
+          return {error: 'invalid_duty_recovery_request'};
+        }
+        if (
+          allowPreviouslyAttemptedAgents
+          && actionClock.reuse_due !== true
+        ) {
+          return {
+            error: 'duty_recovery_agent_reuse_not_due',
+            code: 'AGENT_REUSE_BACKOFF_ACTIVE',
+          };
+        }
+      }
       const initialPlanSnapshot = safeJson(
         safeJson(initialTask.metadata).planSnapshot,
       );
@@ -8856,7 +9428,10 @@ async function dispatchCrossDeviceRetry({
       if (!crossDeviceRetryTaskSupported(initialTask)) {
         return {error: 'task_cross_device_retry_unsupported'};
       }
-      if (!crossDeviceRetrySourceReady(initialTask, {automatic})) {
+      if (!crossDeviceRetrySourceReady(initialTask, {
+        automatic,
+        dutyRecovery,
+      })) {
         return {error: 'task_not_settled_for_retry'};
       }
       if (Number(initialTask.orchestration_revision || 0) !== expectedRevision) {
@@ -8864,6 +9439,85 @@ async function dispatchCrossDeviceRetry({
           error: 'revision_conflict',
           currentRevision: Number(initialTask.orchestration_revision || 0),
         };
+      }
+      if (dutyRecovery) {
+        const sourceItem = await tx.queryOne(`
+          SELECT *
+          FROM capture_task_items
+          WHERE id = $1 AND tenant_id = $2 AND task_id = $3
+          FOR UPDATE
+        `, [requestedItemIds[0], req.tenantId, initialTask.id]);
+        if (!sourceItem) {
+          return supersededResult({reason: 'item_scope_changed'});
+        }
+        const currentSourceAttempt = await tx.queryOne(`
+          SELECT id, item_id, agent_id, attempt_number, assignment_revision,
+            status, checkpoint, error
+          FROM capture_task_item_attempts
+          WHERE tenant_id = $1 AND item_id = $2
+          ORDER BY attempt_number DESC, created_at DESC, id DESC
+          LIMIT 1
+          FOR UPDATE
+        `, [req.tenantId, sourceItem.id]);
+        const currentSourceAttemptId = text(
+          currentSourceAttempt?.id,
+          100,
+        ).toLowerCase();
+        const normalizedExpectedSourceAttemptId = text(
+          expectedSourceAttemptId,
+          100,
+        ).toLowerCase();
+        if (
+          Number(sourceItem.assignment_revision || 0) !==
+            Number(expectedItemRevision) ||
+          currentSourceAttemptId !== normalizedExpectedSourceAttemptId ||
+          Number(
+            currentSourceAttempt?.attempt_number ?? sourceItem.attempt_count ?? 0,
+          ) !== Number(expectedAttemptNumber)
+        ) {
+          return supersededResult({
+            reason: 'source_attempt_changed',
+            currentItemRevision: Number(sourceItem.assignment_revision || 0),
+            currentSourceAttemptId,
+            currentAttemptNumber: Number(
+              currentSourceAttempt?.attempt_number ??
+                sourceItem.attempt_count ??
+                0,
+            ),
+          });
+        }
+        const sourceDisposition = classifyCaptureRecoveryDisposition(
+          {
+            ...sourceItem,
+            error: {
+              ...safeJson(sourceItem.error),
+              ...safeJson(currentSourceAttempt?.error),
+            },
+            metadata: {
+              ...safeJson(sourceItem.metadata),
+              checkpoint: {
+                ...safeJson(safeJson(sourceItem.metadata).checkpoint),
+                ...safeJson(currentSourceAttempt?.checkpoint),
+              },
+            },
+          },
+          {phase: 'duty'},
+        );
+        if (!sourceDisposition.automatic) {
+          if (sourceDisposition.kind === 'manual_current') {
+            return {
+              error: 'retry_requires_manual_safety_action',
+              code: 'HUMAN_REQUIRED',
+              humanRequired: true,
+            };
+          }
+          return {
+            error: 'retry_items_not_automatically_recoverable',
+            code: sourceDisposition.kind === 'terminal_business_failure'
+              ? 'TERMINAL_BUSINESS_FAILURE'
+              : 'ITEM_NOT_RECOVERABLE',
+          };
+        }
       }
       await expireStaleCommands(tx, req.tenantId, initialTask.id);
 
@@ -8875,20 +9529,6 @@ async function dispatchCrossDeviceRetry({
         LIMIT 1
       `, [req.tenantId, initialTask.id]);
       let targetAgent = null;
-      if (initialTask.task_type !== 'capture_orchestration') {
-        targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
-          tenantId: req.tenantId,
-          task: initialTask,
-          sourceAgentIds: [
-            initialTask.assigned_agent_id,
-            initialTask.origin_agent_id,
-          ],
-          commandPayload: safeJson(sourceCommand?.payload),
-        });
-        if (!targetAgent) {
-          return {error: 'idle_compatible_agent_unavailable'};
-        }
-      }
 
       const task = await tx.queryOne(`
         SELECT *
@@ -8899,7 +9539,7 @@ async function dispatchCrossDeviceRetry({
       if (!task) return {error: 'task_not_found'};
       if (
         !crossDeviceRetryTaskSupported(task) ||
-        !crossDeviceRetrySourceReady(task, {automatic})
+        !crossDeviceRetrySourceReady(task, {automatic, dutyRecovery})
       ) {
         return {error: 'task_not_settled_for_retry'};
       }
@@ -8926,9 +9566,29 @@ async function dispatchCrossDeviceRetry({
         parent.id,
         [...CROSS_DEVICE_RETRY_ITEM_STATUSES],
       ]);
-      let retryItems = items.filter(
-        item => classifyCaptureRecoveryDisposition(item).automatic,
+      const scopedItems = itemScopeProvided
+        ? items.filter(item => requestedItemIds.includes(
+            text(item.id, 100).toLowerCase(),
+          ))
+        : items;
+      if (
+        itemScopeProvided &&
+        scopedItems.length !== requestedItemIds.length
+      ) {
+        if (dutyRecovery) {
+          abortCrossDeviceRetry('duty_recovery_source_superseded', {
+            code: 'RECOVERY_SOURCE_SUPERSEDED',
+            reason: 'item_scope_changed',
+          });
+        }
+        abortCrossDeviceRetry('retry_items_unavailable');
+      }
+      let retryItems = scopedItems.filter(
+        item => (dutyRecovery
+          ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'}).automatic
+          : classifyCaptureRecoveryDisposition(item).automatic),
       );
+      let sourceExecutionPending = false;
       if (automatic && retryItems.length > 0) {
         const executionTaskIds = Array.from(new Set(
           retryItems
@@ -8948,22 +9608,33 @@ async function dispatchCrossDeviceRetry({
         retryItems = retryItems
           .filter(item => {
             const executionTaskId = text(item.execution_task_id, 100);
-            return !executionTaskId ||
+            const sourceSettled = !executionTaskId ||
               CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES.has(
                 sourceStatusById.get(executionTaskId),
               );
+            if (!sourceSettled) sourceExecutionPending = true;
+            return sourceSettled;
           })
           .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
           .slice(0, 1);
       }
       if (retryItems.length === 0) {
-        const hasManualSafetyItem = items.some(item =>
-          classifyCaptureRecoveryDisposition(item).kind === 'manual_current',
+        if (dutyRecovery && sourceExecutionPending) {
+          abortCrossDeviceRetry('duty_recovery_source_execution_active', {
+            code: 'SOURCE_EXECUTION_ACTIVE',
+            waitingForSource: true,
+          });
+        }
+        const hasManualSafetyItem = scopedItems.some(item =>
+          (dutyRecovery
+            ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'})
+            : classifyCaptureRecoveryDisposition(item)).kind ===
+              'manual_current',
         );
         abortCrossDeviceRetry(
           hasManualSafetyItem
             ? 'retry_requires_manual_safety_action'
-            : items.length > 0
+            : scopedItems.length > 0
               ? 'retry_items_not_automatically_recoverable'
               : 'retry_items_unavailable',
         );
@@ -8992,7 +9663,16 @@ async function dispatchCrossDeviceRetry({
         sourceExecutionTaskIds,
         [...CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES],
       ]);
-      if (activeSource) abortCrossDeviceRetry('retry_source_execution_active');
+      if (activeSource) {
+        abortCrossDeviceRetry(
+          dutyRecovery
+            ? 'duty_recovery_source_execution_active'
+            : 'retry_source_execution_active',
+          dutyRecovery
+            ? {code: 'SOURCE_EXECUTION_ACTIVE', waitingForSource: true}
+            : {},
+        );
+      }
       const activeSourceCommand = await tx.queryOne(`
         SELECT id
         FROM capture_agent_commands
@@ -9003,41 +9683,19 @@ async function dispatchCrossDeviceRetry({
         LIMIT 1
       `, [req.tenantId, [parent.id, ...sourceExecutionTaskIds]]);
       if (activeSourceCommand) {
-        abortCrossDeviceRetry('retry_source_command_active');
+        abortCrossDeviceRetry(
+          dutyRecovery
+            ? 'duty_recovery_source_command_active'
+            : 'retry_source_command_active',
+          dutyRecovery
+            ? {code: 'SOURCE_COMMAND_ACTIVE', waitingForSource: true}
+            : {},
+        );
       }
 
-      if (!targetAgent) {
-        const attemptedAgents = await tx.queryAll(`
-          SELECT item_id, agent_id
-          FROM capture_task_item_attempts
-          WHERE tenant_id = $1
-            AND item_id = ANY($2::uuid[])
-            AND agent_id IS NOT NULL
-        `, [req.tenantId, retryItems.map(item => item.id)]);
-        targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
-          tenantId: req.tenantId,
-          task: parent,
-          sourceAgentIds: crossDeviceRetrySourceAgentIdsForItems(
-            retryItems,
-            attemptedAgents,
-          ),
-          commandPayload: safeJson(sourceCommand?.payload),
-        });
-        if (!targetAgent) {
-          return {error: 'idle_compatible_agent_unavailable'};
-        }
-      }
-
-      const nextRevision = Number(parent.orchestration_revision || 0) + 1;
-      const requestHash = crypto.createHash('sha256').update(JSON.stringify({
-        action: 'cross_device_retry',
-        parentTaskId: parent.id,
-        requestKey,
-        expectedRevision,
-        targetAgentId: targetAgent.id,
-        itemIds: retryItems.map(item => item.id).sort(),
-      })).digest('hex');
-      const commandId = crypto.randomUUID();
+      // Finish profile authorization and execution-lineage preparation before
+      // acquiring an Agent slot. If no compatible Agent remains, the explicit
+      // transaction abort below rolls these writes back.
       const payloadContract = await loadPromotedRetryPayload(
         tx,
         req.tenantId,
@@ -9053,6 +9711,67 @@ async function dispatchCrossDeviceRetry({
       if (renewedExecutions.error) {
         abortCrossDeviceRetry(renewedExecutions.error);
       }
+
+      // The source create command predates this recovery and therefore does
+      // not carry the duty marker. Add a capability-only marker before Agent
+      // selection so a 0.3.92 browser (or any client without exact item
+      // attempt/request-hash lineage and remote stop) can never win the slot.
+      const agentCompatibilityPayload = dutyRecovery
+        ? {
+            ...safeJson(sourceCommand?.payload),
+            dutyRecovery: {intentId: dutyIntentId, protocolVersion: 1},
+          }
+        : safeJson(sourceCommand?.payload);
+
+      if (!targetAgent) {
+        const attemptedAgents = await tx.queryAll(`
+          SELECT item_id, agent_id, status, checkpoint, error
+          FROM capture_task_item_attempts
+          WHERE tenant_id = $1
+            AND item_id = ANY($2::uuid[])
+            AND agent_id IS NOT NULL
+        `, [req.tenantId, retryItems.map(item => item.id)]);
+        targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
+          tenantId: req.tenantId,
+          task: parent,
+          sourceAgentIds: crossDeviceRetrySourceAgentIdsForItems(
+            retryItems,
+            attemptedAgents,
+          ),
+          commandPayload: agentCompatibilityPayload,
+        });
+        if (!targetAgent && dutyRecovery && allowPreviouslyAttemptedAgents) {
+          targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
+            tenantId: req.tenantId,
+            task: parent,
+            sourceAgentIds: crossDeviceRetrySafetyAgentIdsForItems(
+              retryItems,
+              attemptedAgents,
+            ),
+            commandPayload: agentCompatibilityPayload,
+          });
+        }
+        if (!targetAgent) {
+          abortCrossDeviceRetry('idle_compatible_agent_unavailable', {
+            code: 'NO_IDLE_AGENT',
+            waitingForAgent: dutyRecovery,
+          });
+        }
+      }
+
+      const nextRevision = Number(parent.orchestration_revision || 0) + 1;
+      const requestHash = crypto.createHash('sha256').update(JSON.stringify({
+        action: 'cross_device_retry',
+        parentTaskId: parent.id,
+        requestKey,
+        expectedRevision,
+        targetAgentId: targetAgent.id,
+        itemIds: retryItems.map(item => item.id).sort(),
+        recoveryPhase: dutyRecovery ? 'duty' : 'fast',
+        dutyRecoveryIntentId: dutyIntentId,
+        dutyRecoveryGeneration: dutyGeneration,
+      })).digest('hex');
+      const commandId = crypto.randomUUID();
 
       let commandPayload;
       let childPlan = {};
@@ -9119,6 +9838,16 @@ async function dispatchCrossDeviceRetry({
           authBindingId: targetAgent.auth_binding_id,
         };
       }
+      if (dutyRecovery) {
+        commandPayload.dutyRecovery = {
+          intentId: dutyIntentId,
+          generation: dutyGeneration,
+          itemId: retryItems[0].id,
+          sourceAttemptId: text(expectedSourceAttemptId, 100).toLowerCase(),
+          sourceAssignmentRevision: Number(expectedItemRevision),
+          sourceAttemptNumber: Number(expectedAttemptNumber),
+        };
+      }
       const childMetadata = {
         ...safeJson(parent.metadata),
         promotedRetryParent: false,
@@ -9137,6 +9866,19 @@ async function dispatchCrossDeviceRetry({
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
         automaticRecovery: automatic,
+        ...(dutyRecovery
+          ? {
+              dutyRecovery: true,
+              dutyRecoveryIntentId: dutyIntentId,
+              dutyRecoveryGeneration: dutyGeneration,
+              dutyRecoverySourceItemId: retryItems[0].id,
+              dutyRecoverySourceAttemptId:
+                text(expectedSourceAttemptId, 100).toLowerCase(),
+              dutyRecoverySourceAssignmentRevision:
+                Number(expectedItemRevision),
+              dutyRecoverySourceAttemptNumber: Number(expectedAttemptNumber),
+            }
+          : {}),
         ...(sequentialResumeCheckpoint
           ? {
               resumedSequentialSearch: true,
@@ -9146,6 +9888,121 @@ async function dispatchCrossDeviceRetry({
         requestedByUserId: req.user?.id || '',
         requestedByName: text(req.actorName, 240),
       };
+      if (dutyRecovery) {
+        // Everything that can wait on another row/advisory lock has completed.
+        // Re-check authority with PostgreSQL's wall clock immediately before
+        // the first child/command write; aborting rolls back profile-renewal
+        // preparation performed earlier in this transaction.
+        const finalAgent = await tx.queryOne(`
+          SELECT ca.*, tenant.status AS tenant_status,
+            ac.status AS auth_code_status,
+            ac.expires_at AS auth_code_expires_at,
+            binding.id AS active_auth_binding_id,
+            ca.last_heartbeat_at >= clock_timestamp() - interval '2 minutes'
+              AS heartbeat_fresh,
+            (
+              ac.expires_at IS NULL OR ac.expires_at > clock_timestamp()
+            ) AS auth_not_expired,
+            NOT EXISTS (
+              SELECT 1
+              FROM capture_tasks blocking_task
+              WHERE blocking_task.tenant_id = ca.tenant_id
+                AND COALESCE(
+                  blocking_task.assigned_agent_id,
+                  blocking_task.origin_agent_id
+                ) = ca.id
+                AND blocking_task.id <> ALL($3::uuid[])
+                AND blocking_task.task_type <> 'capture_orchestration'
+                AND blocking_task.status = ANY($4::text[])
+            ) AND NOT EXISTS (
+              SELECT 1
+              FROM capture_agent_commands blocking_command
+              WHERE blocking_command.tenant_id = ca.tenant_id
+                AND blocking_command.agent_id = ca.id
+                AND blocking_command.task_id <> ALL($3::uuid[])
+                AND blocking_command.status IN ('pending', 'acknowledged')
+                AND (
+                  blocking_command.expires_at IS NULL
+                  OR blocking_command.expires_at > clock_timestamp()
+                )
+            ) AS slot_clear
+          FROM capture_agents ca
+          JOIN tenants tenant ON tenant.id = ca.tenant_id
+          JOIN auth_codes ac
+            ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+          JOIN auth_bindings binding
+            ON binding.id = ca.auth_binding_id AND binding.code_id = ac.id
+          WHERE ca.id = $1::uuid AND ca.tenant_id = $2
+          FOR SHARE OF ca, tenant, ac, binding
+        `, [
+          targetAgent.id,
+          req.tenantId,
+          [parent.id, ...sourceExecutionTaskIds],
+          CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+        ]);
+        if (
+          !finalAgent
+          || finalAgent.status !== 'active'
+          || finalAgent.tenant_status !== 'active'
+          || finalAgent.auth_code_status !== 'active'
+          || finalAgent.heartbeat_fresh !== true
+          || finalAgent.auth_not_expired !== true
+          || finalAgent.slot_clear !== true
+          || !crossDeviceRetryAgentSupportsTask(
+            finalAgent,
+            parent,
+            commandPayload,
+          )
+        ) {
+          abortCrossDeviceRetry('idle_compatible_agent_unavailable', {
+            code: 'RECOVERY_AGENT_NO_LONGER_USABLE',
+          });
+        }
+        if (businessTaskType === 'watched_content_patrol') {
+          const watchedIntent = await tx.queryOne(`
+            SELECT watched.record_id
+            FROM record_watchlist watched
+            WHERE watched.tenant_id = $1
+              AND watched.record_id = $2::uuid
+            FOR SHARE
+          `, [req.tenantId, retryItems[0].record_id]);
+          if (!watchedIntent) {
+            abortCrossDeviceRetry('duty_recovery_source_superseded', {
+              code: 'WATCHLIST_INTENT_REMOVED',
+            });
+          }
+        }
+        const finalFence = await tx.queryOne(`
+          SELECT
+            lease_token = $3::uuid AS lease_matches,
+            lease_expires_at > clock_timestamp() AS lease_valid,
+            window_ends_at > clock_timestamp() AS window_open,
+            status IN ('ready', 'waiting_due', 'waiting_agent') AS
+              status_open,
+            action_count = 0 AS action_budget_open,
+            recovery_task_id IS NULL AND dispatched_attempt_id IS NULL AS
+              lineage_open
+          FROM capture_recovery_intents
+          WHERE id = $1::uuid AND tenant_id = $2
+        `, [dutyIntentId, req.tenantId, dutyRecoveryLeaseToken]);
+        if (finalFence && finalFence.window_open !== true) {
+          abortCrossDeviceRetry('recovery_window_ended', {
+            code: 'RECOVERY_WINDOW_ENDED',
+          });
+        }
+        if (
+          !finalFence
+          || finalFence.lease_matches !== true
+          || finalFence.lease_valid !== true
+          || finalFence.status_open !== true
+          || finalFence.action_budget_open !== true
+          || finalFence.lineage_open !== true
+        ) {
+          abortCrossDeviceRetry('duty_recovery_lease_expired', {
+            code: 'RECOVERY_LEASE_EXPIRED',
+          });
+        }
+      }
       const child = await tx.queryOne(`
         INSERT INTO capture_tasks (
           id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
@@ -9204,6 +10061,7 @@ async function dispatchCrossDeviceRetry({
         text(req.actorName, 240),
       ]);
 
+      const dispatchedItemAttempts = [];
       for (const item of retryItems) {
         const attempt = await tx.queryOne(`
           SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next_attempt_number
@@ -9217,6 +10075,13 @@ async function dispatchCrossDeviceRetry({
         const monitorExecutionId = renewedExecutions.executionIdByItem.get(
           String(item.id),
         );
+        const dutyItemMetadata = dutyRecovery
+          ? {
+              dutyRecovery: true,
+              dutyRecoveryIntentId: dutyIntentId,
+              dutyRecoveryGeneration: dutyGeneration,
+            }
+          : {};
         const updatedItem = await tx.queryOne(`
           UPDATE capture_task_items
           SET status = 'dispatched',
@@ -9233,14 +10098,15 @@ async function dispatchCrossDeviceRetry({
                 'crossDeviceRetrySourceExecutionTaskId', $6::uuid::text,
                 'crossDeviceRetryRequestKey', $7::uuid::text,
                 'monitorExecutionId', $8::text
-              )),
+              )) || $9::jsonb,
             assigned_at = now(), dispatched_at = now(),
             started_at = NULL, finished_at = NULL, updated_at = now()
-          WHERE id = $9 AND tenant_id = $10 AND task_id = $11
+          WHERE id = $10 AND tenant_id = $11 AND task_id = $12
             AND execution_task_id IS NOT DISTINCT FROM $6::uuid
-            AND assignment_revision = $12
-            AND status = ANY($13::text[])
-          RETURNING id
+            AND assignment_revision = $13
+            AND status = ANY($14::text[])
+          RETURNING id, execution_task_id, assigned_agent_id,
+            attempt_count, assignment_revision, status, request_hash
         `, [
           attemptNumber,
           targetAgent.id,
@@ -9250,6 +10116,7 @@ async function dispatchCrossDeviceRetry({
           item.execution_task_id,
           requestKey,
           monitorExecutionId || null,
+          JSON.stringify(dutyItemMetadata),
           item.id,
           req.tenantId,
           parent.id,
@@ -9261,6 +10128,7 @@ async function dispatchCrossDeviceRetry({
           conflict.code = 'cross_device_retry_item_conflict';
           throw conflict;
         }
+        const itemAttemptId = crypto.randomUUID();
         await tx.execute(`
           INSERT INTO capture_task_item_attempts (
             id, tenant_id, item_id, parent_task_id, execution_task_id,
@@ -9272,7 +10140,7 @@ async function dispatchCrossDeviceRetry({
             $9, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
           )
         `, [
-          crypto.randomUUID(),
+          itemAttemptId,
           req.tenantId,
           item.id,
           parent.id,
@@ -9281,6 +10149,160 @@ async function dispatchCrossDeviceRetry({
           attemptNumber,
           nextRevision,
           requestHash,
+        ]);
+        dispatchedItemAttempts.push({
+          id: itemAttemptId,
+          itemId: updatedItem.id,
+          executionTaskId: updatedItem.execution_task_id,
+          agentId: updatedItem.assigned_agent_id,
+          attemptNumber,
+          assignmentRevision: updatedItem.assignment_revision,
+          status: updatedItem.status,
+          requestHash: updatedItem.request_hash,
+        });
+      }
+      const itemAttemptBindings = dispatchedItemAttempts.map((attempt) => {
+        const sourceItem = retryItems.find(
+          item => String(item.id) === String(attempt.itemId),
+        );
+        return {
+          itemId: attempt.itemId,
+          attemptId: attempt.id,
+          requestHash: attempt.requestHash,
+          attemptNumber: attempt.attemptNumber,
+          assignmentRevision: attempt.assignmentRevision,
+          keyword: text(sourceItem?.keyword, 120),
+          recordId: text(sourceItem?.record_id, 100),
+          externalId: text(sourceItem?.external_id, 160),
+        };
+      });
+      const attemptBindingByItemId = new Map(
+        itemAttemptBindings.map(binding => [String(binding.itemId), binding]),
+      );
+      const bindTargetAttempt = target => {
+        const source = safeJson(target);
+        const binding = attemptBindingByItemId.get(String(source.itemId));
+        return binding
+          ? {
+              ...source,
+              captureTaskItemAttemptId: binding.attemptId,
+              captureTaskItemRequestHash: binding.requestHash,
+              captureTaskItemAttemptNumber: binding.attemptNumber,
+              captureTaskItemAssignmentRevision: binding.assignmentRevision,
+            }
+          : source;
+      };
+      commandPayload = {
+        ...commandPayload,
+        itemAttempts: itemAttemptBindings,
+        ...(Array.isArray(commandPayload.targets)
+          ? {targets: commandPayload.targets.map(bindTargetAttempt)}
+          : {}),
+        ...(Array.isArray(commandPayload.items)
+          ? {items: commandPayload.items.map(bindTargetAttempt)}
+          : {}),
+        ...(commandPayload.orchestration
+          ? {
+              orchestration: {
+                ...safeJson(commandPayload.orchestration),
+                itemAttempts: itemAttemptBindings,
+              },
+            }
+          : {}),
+        ...(dutyRecovery && itemAttemptBindings[0]
+          ? {
+              dutyRecovery: {
+                ...safeJson(commandPayload.dutyRecovery),
+                captureTaskItemAttemptId: itemAttemptBindings[0].attemptId,
+                captureTaskItemRequestHash: itemAttemptBindings[0].requestHash,
+              },
+            }
+          : {}),
+      };
+      await tx.execute(`
+        UPDATE capture_agent_commands
+        SET payload = $3::jsonb, updated_at = now()
+        WHERE id = $1::uuid AND tenant_id = $2
+      `, [command.id, req.tenantId, JSON.stringify(commandPayload)]);
+      if (dutyRecovery) {
+        const dutyAttempt = dispatchedItemAttempts[0];
+        const boundIntent = await tx.queryOne(`
+          UPDATE capture_recovery_intents
+          SET status = 'verifying_collection',
+            decision = 'cross_agent_recovery',
+            recovery_task_id = $4::uuid,
+            recovery_command_id = $5::uuid,
+            recovery_agent_id = $6::uuid,
+            dispatched_attempt_id = $7::uuid,
+            dispatched_at = COALESCE(dispatched_at, clock_timestamp()),
+            expected_assignment_revision = $8::integer,
+            expected_attempt_number = $9::integer,
+            action_count = GREATEST(action_count, 1),
+            decision_payload = decision_payload || jsonb_build_object(
+              'recoveryTaskId', $4::uuid,
+              'recoveryCommandId', $5::uuid,
+              'recoveryAgentId', $6::uuid,
+              'dispatchedAttemptId', $7::uuid,
+              'executionTaskId', $4::uuid,
+              'generation', $10::integer,
+              'dispatchBoundAtomically', true
+            ),
+            verification = verification || jsonb_build_object(
+              'dispatchedAt', clock_timestamp()::text,
+              'businessEvidenceRequired', true,
+              'commandStateIsNotBusinessSuccess', true,
+              'dispatchBoundAtomically', true
+            ),
+            last_error = '',
+            updated_at = clock_timestamp()
+          WHERE id = $1::uuid AND tenant_id = $2
+            AND lease_token = $3::uuid
+            AND lease_expires_at > clock_timestamp()
+            AND window_ends_at > clock_timestamp()
+            AND status IN ('ready', 'waiting_due', 'waiting_agent')
+            AND recovery_task_id IS NULL
+            AND dispatched_attempt_id IS NULL
+            AND action_count = 0
+          RETURNING id
+        `, [
+          dutyIntentId,
+          req.tenantId,
+          dutyRecoveryLeaseToken,
+          child.id,
+          command.id,
+          targetAgent.id,
+          dutyAttempt?.id,
+          dutyAttempt?.assignmentRevision,
+          dutyAttempt?.attemptNumber,
+          dutyGeneration,
+        ]);
+        if (!boundIntent) {
+          abortCrossDeviceRetry('duty_recovery_lease_expired', {
+            code: 'RECOVERY_BIND_FENCE_REJECTED',
+          });
+        }
+        await tx.execute(`
+          SELECT enqueue_ops_control_wakeup(
+            $1::uuid,
+            'capture_recovery_dispatch_bound',
+            'capture_recovery_intent',
+            $2::text,
+            'capture-recovery-intent:' || $2::text || ':dispatch-bound',
+            clock_timestamp() + interval '2 minutes',
+            jsonb_build_object(
+              'itemId', $3::uuid,
+              'recoveryTaskId', $4::uuid,
+              'generation', $5::integer,
+              'businessEvidenceRequired', true
+            ),
+            true
+          )
+        `, [
+          req.tenantId,
+          dutyIntentId,
+          retryItems[0].id,
+          child.id,
+          dutyGeneration,
         ]);
       }
       const refreshedItems = await tx.queryAll(`
@@ -9295,15 +10317,30 @@ async function dispatchCrossDeviceRetry({
         lastCrossDeviceRetryTaskId: child.id,
         lastCrossDeviceRetryAgentId: targetAgent.id,
         lastCrossDeviceRetryRequestKey: child.id,
+        ...(dutyRecovery
+          ? {
+              lastDutyRecoveryAt: new Date().toISOString(),
+              lastDutyRecoveryTaskId: child.id,
+              lastDutyRecoveryAgentId: targetAgent.id,
+              lastDutyRecoveryIntentId: dutyIntentId,
+              lastDutyRecoveryGeneration: dutyGeneration,
+            }
+          : {}),
         ...(automatic
           ? {
-              automaticRecoveryCount:
-                Math.max(
-                  0,
-                  Number(safeJson(parent.metadata).automaticRecoveryCount) || 0,
-                ) + 1,
               lastAutomaticRecoveryAt: new Date().toISOString(),
               lastAutomaticRecoveryTaskId: child.id,
+              ...(!dutyRecovery
+                ? {
+                    automaticRecoveryCount:
+                      Math.max(
+                        0,
+                        Number(
+                          safeJson(parent.metadata).automaticRecoveryCount,
+                        ) || 0,
+                      ) + 1,
+                  }
+                : {}),
             }
           : {}),
       };
@@ -9356,17 +10393,58 @@ async function dispatchCrossDeviceRetry({
           sourceExecutionTaskIds,
           revision: parentUpdate.orchestration_revision,
           automatic,
+          ...(dutyRecovery
+            ? {
+                recoveryPhase: 'duty',
+                dutyRecoveryIntentId: dutyIntentId,
+                dutyRecoveryGeneration: dutyGeneration,
+              }
+            : {}),
         },
       });
       return {
         existing: false,
+        replayed: false,
         child,
         command,
         agent: targetAgent,
         parent: parentUpdate,
+        itemAttempts: dispatchedItemAttempts,
         itemCount: retryItems.length,
+        targetAgentId: targetAgent.id,
+        recovery: dutyRecovery
+          ? {phase: 'duty', intentId: dutyIntentId, generation: dutyGeneration}
+          : {phase: 'fast'},
       };
-  });
+    });
+  } catch (error) {
+    if (
+      error?.crossDeviceRetryError ===
+        'idle_compatible_agent_unavailable'
+    ) {
+      return noIdleAgentResult();
+    }
+    if (
+      dutyRecovery &&
+      error?.crossDeviceRetryError === 'duty_recovery_source_superseded'
+    ) {
+      return supersededResult(safeJson(error.details));
+    }
+    if (
+      dutyRecovery &&
+      [
+        'duty_recovery_source_execution_active',
+        'duty_recovery_source_command_active',
+      ].includes(error?.crossDeviceRetryError)
+    ) {
+      return {
+        error: error.crossDeviceRetryError,
+        waitingForSource: true,
+        ...safeJson(error.details),
+      };
+    }
+    throw error;
+  }
 }
 
 export async function reconcileElasticCaptureLeases(input = 50) {
@@ -9645,6 +10723,20 @@ export async function reconcileAutomaticCaptureRetries(input = 10) {
       )
       AND ($5::uuid IS NULL OR tenant_id = $5::uuid)
       AND (cardinality($6::uuid[]) = 0 OR id = ANY($6::uuid[]))
+      AND (
+        $7::boolean = false
+        OR NOT EXISTS (
+          SELECT 1
+          FROM tenant_settings recovery_enabled
+          JOIN tenant_settings recovery_mode
+            ON recovery_mode.tenant_id = recovery_enabled.tenant_id
+            AND recovery_mode.key = 'ops_control_recovery_mode'
+          WHERE recovery_enabled.tenant_id = capture_tasks.tenant_id
+            AND recovery_enabled.key = 'ops_control_recovery_enabled'
+            AND LOWER(BTRIM(recovery_enabled.value)) = ANY($8::text[])
+            AND LOWER(BTRIM(recovery_mode.value)) = 'guarded'
+        )
+      )
     ORDER BY
       CASE status WHEN 'needs_action' THEN 0 ELSE 1 END,
       updated_at,
@@ -9657,6 +10749,8 @@ export async function reconcileAutomaticCaptureRetries(input = 10) {
     normalizedLimit,
     tenantId || null,
     taskIds,
+    dutyRecoveryGlobalActionsEnabled(),
+    [...DUTY_RECOVERY_TRUE_VALUES],
   ]);
 
   const summary = {
@@ -10161,16 +11255,6 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
       ) {
         return {error: 'agent_unavailable', task};
       }
-      const allowedPlatforms = Array.isArray(task.agent_allowed_platforms)
-        ? task.agent_allowed_platforms
-        : [];
-      if (
-        task.platform !== 'multi' &&
-        allowedPlatforms.length > 0 &&
-        !allowedPlatforms.includes(task.platform)
-      ) {
-        return {error: 'agent_platform_mismatch', task};
-      }
       if (targetedStop && !clientAttemptId) {
         return {error: 'task_attempt_unavailable', task};
       }
@@ -10251,7 +11335,6 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
       task_attempt_unavailable: ['task_attempt_unavailable', '设备尚未上报当前执行轮次，请稍后重试停止'],
       agent_stop_capability_missing: ['agent_stop_capability_missing', '原执行节点版本尚不支持远程停止，请先更新扩展'],
       agent_unavailable: ['agent_unavailable', '原执行节点授权已失效、已停用或不存在'],
-      agent_platform_mismatch: ['agent_platform_mismatch', '原执行节点未配置负责该任务平台'],
     };
     if (result.error) {
       const [error, message] = messages[result.error];

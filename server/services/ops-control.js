@@ -11,9 +11,10 @@ import {
   sendTenantEmail,
 } from './email-notifier.js';
 import {runOpsControlGuardedActions} from './ops-control-actions.js';
+import {normalizeCaptureRecoverySettings} from './capture-recovery-intents.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
-export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.92';
+export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.93';
 export const OPS_CONTROL_MODE = 'observe';
 export const OPS_CONTROL_MODES = Object.freeze(['observe', 'guarded']);
 export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
@@ -26,6 +27,8 @@ export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
 export const OPS_CONTROL_SETTING_KEYS = Object.freeze({
   enabled: 'ops_control_enabled',
   mode: 'ops_control_mode',
+  recoveryEnabled: 'ops_control_recovery_enabled',
+  recoveryMode: 'ops_control_recovery_mode',
   windowStart: 'ops_control_window_start',
   windowEnd: 'ops_control_window_end',
   digestTime: 'ops_control_digest_time',
@@ -189,9 +192,19 @@ export function normalizeOpsControlSettings(settings = {}, {
   const mode = OPS_CONTROL_MODES.includes(source[OPS_CONTROL_SETTING_KEYS.mode])
     ? source[OPS_CONTROL_SETTING_KEYS.mode]
     : OPS_CONTROL_MODE;
-  const actionAllowlist = normalizeOpsControlActionAllowlist(
+  const configuredActionAllowlist = normalizeOpsControlActionAllowlist(
     source[OPS_CONTROL_SETTING_KEYS.actionAllowlist],
   );
+  const recoveryAgentEnabled = parseBoolean(
+    source[OPS_CONTROL_SETTING_KEYS.recoveryEnabled],
+    false,
+  );
+  // The item-scoped recovery ledger is the sole capture-retry owner once a
+  // tenant opts in. Keep the older broad task-level action available only for
+  // tenants that have not migrated yet.
+  const actionAllowlist = recoveryAgentEnabled
+    ? configuredActionAllowlist.filter(action => action !== 'capture_retry')
+    : configuredActionAllowlist;
   const windowStart = timeOr(source[OPS_CONTROL_SETTING_KEYS.windowStart], '05:30');
   let windowEnd = timeOr(source[OPS_CONTROL_SETTING_KEYS.windowEnd], '08:30');
   if (timeMinutes(windowEnd) <= timeMinutes(windowStart)) windowEnd = '08:30';
@@ -237,6 +250,10 @@ export function normalizeOpsControlSettings(settings = {}, {
     ),
     digestEmailTo: text(source[OPS_CONTROL_SETTING_KEYS.digestEmailTo], 2000),
     actionAllowlist,
+    configuredActionAllowlist,
+    recoveryAgentEnabled,
+    legacyCaptureRetrySuppressed: recoveryAgentEnabled
+      && configuredActionAllowlist.includes('capture_retry'),
     actionMaxPerRun: boundedInteger(
       source[OPS_CONTROL_SETTING_KEYS.actionMaxPerRun],
       3,
@@ -264,6 +281,23 @@ export function normalizeOpsControlSettings(settings = {}, {
   });
 }
 
+export function resolveOpsControlObservationPolicy(
+  policy,
+  {forceObserveOnly = false} = {},
+) {
+  if (!forceObserveOnly) return policy;
+  const configured = object(policy);
+  return Object.freeze({
+    ...configured,
+    configuredMode: text(configured.mode, 40) || OPS_CONTROL_MODE,
+    mode: 'observe',
+    actionsEnabled: false,
+    observeOnly: true,
+    forcedObserveOnly: true,
+    actionAllowlist: Object.freeze([]),
+  });
+}
+
 export class OpsControlSettingsError extends Error {
   constructor(message, code = 'invalid_ops_control_setting') {
     super(message);
@@ -285,6 +319,7 @@ export function normalizeOpsControlSettingPatch(patch = {}, current = {}) {
     if (!OPS_CONTROL_KEYS.has(key)) continue;
     if ([
       OPS_CONTROL_SETTING_KEYS.enabled,
+      OPS_CONTROL_SETTING_KEYS.recoveryEnabled,
       OPS_CONTROL_SETTING_KEYS.digestEmailEnabled,
     ].includes(key)) {
       const candidate = String(value ?? '').trim().toLowerCase();
@@ -292,6 +327,13 @@ export function normalizeOpsControlSettingPatch(patch = {}, current = {}) {
         throw new OpsControlSettingsError('值守开关必须为开启或关闭');
       }
       normalized[key] = BOOLEAN_TRUE.has(candidate) ? 'true' : 'false';
+      continue;
+    }
+    if (key === OPS_CONTROL_SETTING_KEYS.recoveryMode) {
+      if (!OPS_CONTROL_MODES.includes(String(value))) {
+        throw new OpsControlSettingsError('恢复 Agent 模式只允许 observe 或 guarded');
+      }
+      normalized[key] = String(value);
       continue;
     }
     if (key === OPS_CONTROL_SETTING_KEYS.mode) {
@@ -671,6 +713,26 @@ async function collectOperations(db, tenantId, window) {
           AND COALESCE(root.scheduled_for, task.scheduled_for, root.created_at, task.created_at) < $3
       )::int AS active_command_count,
       (
+        SELECT COUNT(*)
+        FROM capture_recovery_intents intent
+        WHERE intent.tenant_id = $1
+          AND intent.status = 'stopped_by_user'
+          AND intent.verification->>'cascadeStopState' = 'manual_required'
+      )::int AS manual_recovery_stop_count,
+      (
+        SELECT COALESCE(
+          intent.recovery_task_id::text,
+          intent.parent_task_id::text,
+          intent.id::text
+        )
+        FROM capture_recovery_intents intent
+        WHERE intent.tenant_id = $1
+          AND intent.status = 'stopped_by_user'
+          AND intent.verification->>'cascadeStopState' = 'manual_required'
+        ORDER BY intent.updated_at, intent.id
+        LIMIT 1
+      ) AS manual_recovery_stop_task_id,
+      (
         SELECT MIN(command.created_at)
         FROM capture_agent_commands command
         JOIN capture_tasks task
@@ -958,6 +1020,11 @@ export function normalizeOpsControlEvidence(evidence = {}) {
     },
     operations: {
       activeCommandCount: integer(operations.active_command_count),
+      manualRecoveryStopCount: integer(operations.manual_recovery_stop_count),
+      manualRecoveryStopTaskId: text(
+        operations.manual_recovery_stop_task_id,
+        100,
+      ),
       oldestActiveCommandAt: iso(operations.oldest_active_command_at),
       oldestActiveCommandTaskId: text(operations.oldest_active_command_task_id, 100),
       taskEventCount: integer(operations.task_event_count),
@@ -1160,6 +1227,24 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
     ));
   }
 
+  const manualRecoveryStopCount = integer(
+    current.operations?.manualRecoveryStopCount,
+  );
+  if (manualRecoveryStopCount > 0) {
+    incidents.push(incident(
+      'duty_recovery_stop_failed',
+      current.operations?.manualRecoveryStopTaskId || 'tenant',
+      'critical',
+      '值守恢复任务未能自动停止',
+      `${manualRecoveryStopCount} 个用户已停止的恢复任务仍需人工确认终止`,
+      {
+        manualRecoveryStopCount,
+        taskId: current.operations?.manualRecoveryStopTaskId || '',
+        userStopBoundaryPreserved: true,
+      },
+    ));
+  }
+
   if (consecutive && aiBacklogStalled(previous, current, policy)) {
     incidents.push(incident(
       'ai_backlog_stalled',
@@ -1236,7 +1321,9 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
   }
 
   let verdict = 'pending';
-  if (consecutive && upcomingCount === 0) {
+  if (manualRecoveryStopCount > 0) {
+    verdict = 'incident';
+  } else if (consecutive && upcomingCount === 0) {
     if (redIncidentCount > 0) verdict = 'incident';
     else if (manualBlockerCount > 0) verdict = 'blocked_manual';
     else if (finalFailureCount > 0) verdict = 'degraded';
@@ -1255,6 +1342,7 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
     historicalFailureCount: integer(current.taskSummary?.historicalFailures),
     finalFailureCount,
     manualBlockerCount,
+    manualRecoveryStopCount,
     observationCount: integer(current.persistence?.observationCount),
     pendingRecordAiCount: integer(current.persistence?.pendingRecordAiCount),
     pendingCommentAiCount: integer(current.persistence?.pendingCommentAiCount),
@@ -1332,7 +1420,7 @@ export function buildOpsControlDigestHtml(digest) {
       </table>
       <h3 style="font-size:15px;margin:22px 0 8px">事项</h3>
       <ul style="padding-left:20px;color:#374151">${rows}</ul>
-      <p style="margin:24px 0 0;color:#9ca3af;font-size:12px">规则控制面${guarded ? '受控动作模式' : '观察模式'} · 0.3.92 自愈运行时基线 · 本轮未调用大模型${guarded ? ' · 所有动作均写入幂等账本并等待后续快照验收' : '，未执行采集业务写操作'}。</p>
+      <p style="margin:24px 0 0;color:#9ca3af;font-size:12px">规则控制面${guarded ? '受控动作模式' : '观察模式'} · 0.3.93 自愈运行时基线 · 本轮未调用大模型${guarded ? ' · 所有动作均写入幂等账本并等待后续快照验收' : '，未执行采集业务写操作'}。</p>
     </div>
   `;
 }
@@ -1601,7 +1689,7 @@ export function buildOpsControlIncidentAlertHtml(incidents, {
       <h2 style="margin:0 0 8px;font-size:20px">StarVoice 值守需要关注</h2>
       <p style="margin:0 0 18px;color:#4b5563">以下事项当前没有正在等待验收的自动恢复动作，请及时查看。</p>
       <ul style="padding-left:20px">${rows}</ul>
-      <p style="margin:22px 0 0;color:#9ca3af;font-size:12px">规则控制面${mode === 'guarded' ? '受控动作模式' : '观察模式'} · 0.3.92 自愈运行时基线 · 本轮未调用大模型。</p>
+      <p style="margin:22px 0 0;color:#9ca3af;font-size:12px">规则控制面${mode === 'guarded' ? '受控动作模式' : '观察模式'} · 0.3.93 自愈运行时基线 · 本轮未调用大模型。</p>
     </div>
   `;
 }
@@ -1616,7 +1704,13 @@ export async function maybeDeliverOpsControlIncidentAlerts({
   execute = dbExecute,
   sendEmail = sendTenantEmail,
 } = {}) {
-  if (assessment?.summary?.consecutiveEvidence !== true) {
+  const immediateStopFailure = (assessment?.incidents || []).some(
+    row => row?.type === 'duty_recovery_stop_failed',
+  );
+  if (
+    assessment?.summary?.consecutiveEvidence !== true
+    && !immediateStopFailure
+  ) {
     return {status: 'awaiting_evidence', attempted: false, incidentCount: 0};
   }
   if (!policy.digestEmailEnabled || !policy.digestEmailTo) {
@@ -1822,6 +1916,7 @@ export async function runOpsControlTenantObservation({
   settings = {},
   now = new Date(),
   force = false,
+  forceObserveOnly = false,
   eventWake = null,
   getTaskWakeState = getOpsControlTaskWakeState,
   withTransaction = dbWithTransaction,
@@ -1830,9 +1925,12 @@ export async function runOpsControlTenantObservation({
   sendEmail = sendTenantEmail,
   actionHandlers,
 } = {}) {
-  const policy = settings.enabled === undefined
+  const configuredPolicy = settings.enabled === undefined
     ? normalizeOpsControlSettings(settings)
     : settings;
+  const policy = resolveOpsControlObservationPolicy(configuredPolicy, {
+    forceObserveOnly,
+  });
   const configuredWindow = buildOpsControlWindow(now, policy);
   if (!policy.enabled) {
     return {kind: 'disabled', tenantId, policy, window: configuredWindow};
@@ -2148,8 +2246,9 @@ export async function getOpsControlTenantSummary(tenantId, {
 } = {}) {
   const settings = await getSettings(tenantId);
   const policy = normalizeOpsControlSettings(settings, {env});
+  const recoveryPolicy = normalizeCaptureRecoverySettings(settings, {env});
   const {digestEmailTo: _digestEmailTo, ...safePolicy} = policy;
-  const [run, digest, incidents, actions] = await Promise.all([
+  const [run, digest, incidents, actions, recoveryIntents, recoveryCounts] = await Promise.all([
     queryOne(`
       SELECT *
       FROM ops_control_runs
@@ -2188,6 +2287,43 @@ export async function getOpsControlTenantSummary(tenantId, {
       ORDER BY created_at DESC, id DESC
       LIMIT 20
     `, [tenantId]),
+    queryAll(`
+      SELECT id, parent_task_id, item_id,
+        source_attempt_id, source_execution_attempt_id,
+        stage, fault_class, generation, status, decision,
+        expected_assignment_revision, expected_attempt_number,
+        window_ends_at, available_at, claim_count, action_count,
+        evidence, decision_payload, verification, last_error,
+        resolved_at, created_at, updated_at
+      FROM capture_recovery_intents
+      WHERE tenant_id = $1
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 20
+    `, [tenantId]),
+    queryOne(`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE status NOT IN ('resolved', 'exhausted_window', 'failed')
+            AND (
+              status <> 'stopped_by_user'
+              OR verification->>'cascadeStopState' = 'manual_required'
+            )
+        )::int AS open_count,
+        COUNT(*) FILTER (
+          WHERE status = 'waiting_human'
+            OR (
+              status = 'stopped_by_user'
+              AND verification->>'cascadeStopState' = 'manual_required'
+            )
+        )::int AS human_required_count,
+        COUNT(*) FILTER (
+          WHERE status = 'stopped_by_user'
+            AND verification->>'cascadeStopState' = 'manual_required'
+        )::int AS stop_manual_required_count,
+        COUNT(*)::int AS total_count
+      FROM capture_recovery_intents
+      WHERE tenant_id = $1
+    `, [tenantId]),
   ]);
   return {
     ok: true,
@@ -2204,6 +2340,33 @@ export async function getOpsControlTenantSummary(tenantId, {
     digest,
     incidents,
     actions,
+    recovery: {
+      mode: recoveryPolicy.actionsEnabled ? 'guarded' : 'observe',
+      requestedMode: recoveryPolicy.mode,
+      enabled: recoveryPolicy.enabled,
+      actionsEnabled: recoveryPolicy.actionsEnabled,
+      gate: {
+        globalEnabled: recoveryPolicy.globalEnabled,
+        tenantEnabled: recoveryPolicy.tenantEnabled,
+        actionsGlobalEnabled: recoveryPolicy.actionsGlobalEnabled,
+        blockedReason: !recoveryPolicy.globalEnabled
+          ? 'global_recovery_disabled'
+          : !recoveryPolicy.tenantEnabled
+            ? 'tenant_recovery_disabled'
+            : recoveryPolicy.mode !== 'guarded'
+              ? 'tenant_observe_mode'
+              : !recoveryPolicy.actionsGlobalEnabled
+                ? 'global_actions_disabled'
+                : '',
+      },
+      intents: recoveryIntents,
+      openCount: integer(recoveryCounts?.open_count),
+      humanRequiredCount: integer(recoveryCounts?.human_required_count),
+      stopManualRequiredCount: integer(
+        recoveryCounts?.stop_manual_required_count,
+      ),
+      totalCount: integer(recoveryCounts?.total_count),
+    },
     generatedAt: new Date().toISOString(),
   };
 }

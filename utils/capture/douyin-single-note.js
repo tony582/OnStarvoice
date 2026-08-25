@@ -31,6 +31,7 @@ import {
   normalizeDouyinAuthorName,
   pickDouyinAuthorName,
 } from "./douyin-author.js";
+import {findDouyinSearchSecurityChallengeNode} from "./douyin-search-guard.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const DOUYIN_DETAIL_DOM_READY_TIMEOUT_MS = 25000;
@@ -541,6 +542,9 @@ function buildPayloadFromApiDetail(detail, noteId) {
     likedAndCollectedCount: bloggerMetrics.likedAndCollectedCount,
     bloggerFollowersCount: bloggerMetrics.followersCount,
     bloggerLikedAndCollectedCount: bloggerMetrics.likedAndCollectedCount,
+    bloggerFollowersCountKnown: bloggerMetrics.followersCountKnown,
+    bloggerLikedAndCollectedCountKnown:
+      bloggerMetrics.likedAndCollectedCountKnown,
     bloggerProfileUrl: authorUrl || "",
     bloggerMetricsCaptureStatus: "not_started",
     bloggerMetricsCaptureError: "",
@@ -594,7 +598,13 @@ function hasRequiredDouyinBloggerMetrics(payload) {
     payload?.bloggerLikedAndCollectedCount ?? payload?.likedAndCollectedCount,
   );
 
-  return followersCount > 0 && likedAndCollectedCount > 0;
+  const followersCountKnown =
+    payload?.bloggerFollowersCountKnown === true || followersCount > 0;
+  const likedAndCollectedCountKnown =
+    payload?.bloggerLikedAndCollectedCountKnown === true ||
+    likedAndCollectedCount > 0;
+
+  return followersCountKnown && likedAndCollectedCountKnown;
 }
 
 // ── 主采集函数 ────────────────────────────────────────────────────────────
@@ -970,6 +980,9 @@ export async function captureDouyinSingleNote({
       likedAndCollectedCount: bloggerMetrics.likedAndCollectedCount,
       bloggerFollowersCount: bloggerMetrics.followersCount,
       bloggerLikedAndCollectedCount: bloggerMetrics.likedAndCollectedCount,
+      bloggerFollowersCountKnown: bloggerMetrics.followersCountKnown,
+      bloggerLikedAndCollectedCountKnown:
+        bloggerMetrics.likedAndCollectedCountKnown,
       bloggerProfileUrl: authorInfo.url || "",
       bloggerMetricsCaptureStatus: "not_started",
       bloggerMetricsCaptureError: "",
@@ -1015,9 +1028,14 @@ export async function captureDouyinSingleNote({
 }
 
 function assertNoCaptchaPage() {
-  const title = cleanText(document.title || "");
-  const bodyText = cleanText(document.body?.innerText || "");
-  if (/验证码中间页/i.test(title) || /请完成下列验证后继续:/i.test(bodyText)) {
+  if (
+    findDouyinSearchSecurityChallengeNode({
+      root: document,
+      pageUrl: window.location.href,
+      title: document.title || "",
+      requireStructuredContainer: true,
+    })
+  ) {
     throw new Error("当前页面触发抖音验证码或风险中间页");
   }
 }
@@ -1814,14 +1832,20 @@ function resolveDouyinNoteBloggerMetrics({
 } = {}) {
   const apiMetrics = extractDouyinBloggerMetricsFromApiDetail(apiDetail);
   const domMetrics = extractDouyinInlineBloggerMetrics(detailRoot);
+  const followersSource = domMetrics.followersCountKnown
+    ? domMetrics
+    : apiMetrics;
+  const likedAndCollectedSource = domMetrics.likedAndCollectedCountKnown
+    ? domMetrics
+    : apiMetrics;
 
   return {
-    followersCount:
-      domMetrics.followersCount || apiMetrics.followersCount || 0,
+    followersCount: followersSource.followersCount || 0,
+    followersCountKnown: followersSource.followersCountKnown === true,
     likedAndCollectedCount:
-      domMetrics.likedAndCollectedCount ||
-      apiMetrics.likedAndCollectedCount ||
-      0,
+      likedAndCollectedSource.likedAndCollectedCount || 0,
+    likedAndCollectedCountKnown:
+      likedAndCollectedSource.likedAndCollectedCountKnown === true,
     accountType: domMetrics.accountType || apiMetrics.accountType || "",
   };
 }
@@ -1840,27 +1864,36 @@ function extractDouyinBloggerMetricsFromApiDetail(detail) {
         ? safeDetail.authorUserInfo
         : {};
 
-  const followersCount = normalizeNonNegativeInteger(
-    authorUserInfo.follower_count ??
-      author.follower_count ??
-      author.mplatform_followers_count,
-  );
+  const rawFollowersCount = [
+    authorUserInfo.follower_count,
+    author.follower_count,
+    author.mplatform_followers_count,
+  ].find((value) => value !== undefined && value !== null && value !== "");
+  const rawLikedAndCollectedCount = [
+    author.total_favorited,
+    author.totalFavorited,
+    author.aweme_count_liked,
+  ].find((value) => value !== undefined && value !== null && value !== "");
+  const followersCount = normalizeNonNegativeInteger(rawFollowersCount);
   const likedAndCollectedCount = normalizeNonNegativeInteger(
-    author.total_favorited ??
-      author.totalFavorited ??
-      author.aweme_count_liked,
+    rawLikedAndCollectedCount,
   );
 
   return {
     followersCount,
+    followersCountKnown: rawFollowersCount !== undefined,
     likedAndCollectedCount,
+    likedAndCollectedCountKnown: rawLikedAndCollectedCount !== undefined,
     accountType: resolveDouyinAccountTypeFromApiAuthor(author),
   };
 }
 
 function extractDouyinInlineBloggerMetrics(detailRoot) {
   const directMetrics = extractDouyinInlineBloggerMetricsBySelectors(detailRoot);
-  if (directMetrics.followersCount > 0 && directMetrics.likedAndCollectedCount > 0) {
+  if (
+    directMetrics.followersCountKnown &&
+    directMetrics.likedAndCollectedCountKnown
+  ) {
     return directMetrics;
   }
 
@@ -1868,23 +1901,21 @@ function extractDouyinInlineBloggerMetrics(detailRoot) {
   let best = directMetrics;
 
   candidates.forEach((text) => {
+    const followersSignal = extractDouyinMetricSignalByLabels(text, ["粉丝"]);
+    const likedAndCollectedSignal = extractDouyinMetricSignalByLabels(text, [
+      "获赞与收藏",
+      "点赞与收藏",
+      "获赞",
+    ]);
     const next = {
-      followersCount: extractDouyinMetricByLabels(text, ["粉丝"]),
-      likedAndCollectedCount: extractDouyinMetricByLabels(text, [
-        "获赞与收藏",
-        "点赞与收藏",
-        "获赞",
-      ]),
+      followersCount: followersSignal.count,
+      followersCountKnown: followersSignal.known,
+      likedAndCollectedCount: likedAndCollectedSignal.count,
+      likedAndCollectedCountKnown: likedAndCollectedSignal.known,
       accountType: resolveDouyinAccountTypeFromText(text),
     };
 
-    if (
-      next.followersCount > best.followersCount ||
-      (next.followersCount === best.followersCount &&
-        next.likedAndCollectedCount > best.likedAndCollectedCount)
-    ) {
-      best = next;
-    }
+    best = pickBetterDouyinBloggerMetrics(best, next);
   });
 
   return best;
@@ -1905,28 +1936,28 @@ function extractDouyinInlineBloggerMetricsBySelectors(detailRoot) {
 
   let best = {
     followersCount: 0,
+    followersCountKnown: false,
     likedAndCollectedCount: 0,
+    likedAndCollectedCountKnown: false,
     accountType: "",
   };
 
   candidates.forEach((text) => {
+    const followersSignal = extractDouyinMetricSignalByLabels(text, ["粉丝"]);
+    const likedAndCollectedSignal = extractDouyinMetricSignalByLabels(text, [
+      "获赞与收藏",
+      "点赞与收藏",
+      "获赞",
+    ]);
     const next = {
-      followersCount: extractDouyinMetricByLabels(text, ["粉丝"]),
-      likedAndCollectedCount: extractDouyinMetricByLabels(text, [
-        "获赞与收藏",
-        "点赞与收藏",
-        "获赞",
-      ]),
+      followersCount: followersSignal.count,
+      followersCountKnown: followersSignal.known,
+      likedAndCollectedCount: likedAndCollectedSignal.count,
+      likedAndCollectedCountKnown: likedAndCollectedSignal.known,
       accountType: resolveDouyinAccountTypeFromText(text),
     };
 
-    if (
-      next.followersCount > best.followersCount ||
-      (next.followersCount === best.followersCount &&
-        next.likedAndCollectedCount > best.likedAndCollectedCount)
-    ) {
-      best = next;
-    }
+    best = pickBetterDouyinBloggerMetrics(best, next);
   });
 
   return best;
@@ -2019,9 +2050,9 @@ function collectDouyinInlineMetricsTexts(detailRoot) {
   return Array.from(textSet);
 }
 
-function extractDouyinMetricByLabels(text, labels = []) {
+function extractDouyinMetricSignalByLabels(text, labels = []) {
   const normalized = cleanText(text || "");
-  if (!normalized) return 0;
+  if (!normalized) return {count: 0, known: false};
 
   const countPattern = "(\\d+(?:\\.\\d+)?(?:亿|万|[kK])?)";
   for (const label of labels) {
@@ -2029,18 +2060,22 @@ function extractDouyinMetricByLabels(text, labels = []) {
       new RegExp(`${label}\\s*[:：]?\\s*${countPattern}`),
     );
     if (after?.[1]) {
-      return parseDouyinMetricCount(after[1]);
+      return {count: parseDouyinMetricCount(after[1]), known: true};
     }
 
     const before = normalized.match(
       new RegExp(`(?:^|[\\s|｜])${countPattern}\\s*${label}(?=$|[\\s|｜])`),
     );
     if (before?.[1]) {
-      return parseDouyinMetricCount(before[1]);
+      return {count: parseDouyinMetricCount(before[1]), known: true};
     }
   }
 
-  return 0;
+  return {count: 0, known: false};
+}
+
+function extractDouyinMetricByLabels(text, labels = []) {
+  return extractDouyinMetricSignalByLabels(text, labels).count;
 }
 
 function parseDouyinMetricCount(value) {
@@ -2119,10 +2154,16 @@ async function enrichDouyinPayloadWithBloggerMetrics(
   const resolved = await waitForDouyinBloggerMetrics(
     {
       followersCount: payload?.followersCount ?? payload?.bloggerFollowersCount ?? 0,
+      followersCountKnown:
+        payload?.bloggerFollowersCountKnown === true ||
+        payload?.followersCountKnown === true,
       likedAndCollectedCount:
         payload?.likedAndCollectedCount ??
         payload?.bloggerLikedAndCollectedCount ??
         0,
+      likedAndCollectedCountKnown:
+        payload?.bloggerLikedAndCollectedCountKnown === true ||
+        payload?.likedAndCollectedCountKnown === true,
       accountType: payload?.bloggerAccountType || "",
     },
     {
@@ -2139,6 +2180,9 @@ async function enrichDouyinPayloadWithBloggerMetrics(
     likedAndCollectedCount: resolved.likedAndCollectedCount,
     bloggerFollowersCount: resolved.followersCount,
     bloggerLikedAndCollectedCount: resolved.likedAndCollectedCount,
+    bloggerFollowersCountKnown: resolved.followersCountKnown,
+    bloggerLikedAndCollectedCountKnown:
+      resolved.likedAndCollectedCountKnown,
     bloggerAccountType: resolved.accountType || payload?.bloggerAccountType || "",
   };
 }
@@ -2159,7 +2203,7 @@ async function waitForDouyinBloggerMetrics(
   if (
     preferWorksTabForBloggerMetrics &&
     isDouyinContentFlowPage(detailRoot) &&
-    !(best.followersCount > 0 && best.likedAndCollectedCount > 0)
+    !(best.followersCountKnown && best.likedAndCollectedCountKnown)
   ) {
     await ensureDouyinWorksTabActiveForMetrics(detailRoot);
   }
@@ -2174,7 +2218,10 @@ async function waitForDouyinBloggerMetrics(
     );
     best = pickBetterDouyinBloggerMetrics(best, next);
 
-    if (best.followersCount > 0 && best.likedAndCollectedCount > 0) {
+    if (
+      best.followersCountKnown &&
+      best.likedAndCollectedCountKnown
+    ) {
       break;
     }
 
@@ -2192,13 +2239,23 @@ function pickBetterDouyinBloggerMetrics(current, next) {
 
   return {
     followersCount:
-      safeNext.followersCount > safeCurrent.followersCount
+      safeNext.followersCountKnown &&
+      (!safeCurrent.followersCountKnown ||
+        safeNext.followersCount > safeCurrent.followersCount)
         ? safeNext.followersCount
         : safeCurrent.followersCount,
+    followersCountKnown:
+      safeCurrent.followersCountKnown || safeNext.followersCountKnown,
     likedAndCollectedCount:
-      safeNext.likedAndCollectedCount > safeCurrent.likedAndCollectedCount
+      safeNext.likedAndCollectedCountKnown &&
+      (!safeCurrent.likedAndCollectedCountKnown ||
+        safeNext.likedAndCollectedCount >
+          safeCurrent.likedAndCollectedCount)
         ? safeNext.likedAndCollectedCount
         : safeCurrent.likedAndCollectedCount,
+    likedAndCollectedCountKnown:
+      safeCurrent.likedAndCollectedCountKnown ||
+      safeNext.likedAndCollectedCountKnown,
     accountType: safeCurrent.accountType || safeNext.accountType || "",
   };
 }
@@ -2207,9 +2264,15 @@ function normalizeDouyinBloggerMetrics(metrics = {}) {
   const safeMetrics = metrics && typeof metrics === "object" ? metrics : {};
   return {
     followersCount: normalizeNonNegativeInteger(safeMetrics.followersCount),
+    followersCountKnown:
+      safeMetrics.followersCountKnown === true ||
+      normalizeNonNegativeInteger(safeMetrics.followersCount) > 0,
     likedAndCollectedCount: normalizeNonNegativeInteger(
       safeMetrics.likedAndCollectedCount,
     ),
+    likedAndCollectedCountKnown:
+      safeMetrics.likedAndCollectedCountKnown === true ||
+      normalizeNonNegativeInteger(safeMetrics.likedAndCollectedCount) > 0,
     accountType: String(safeMetrics.accountType || "").trim(),
   };
 }

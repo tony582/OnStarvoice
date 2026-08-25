@@ -266,6 +266,70 @@ test('scheduled profile patrol treats attention tasks as idle and fails over wit
   false);
 });
 
+test('manual profile patrol shares the Agent execution-slot lock and rechecks blockers', async () => {
+  const {loadCompatibleProfilePatrolAgent} = await import(
+    `../server/services/profile-patrol-dispatch.js?slot=${Date.now()}`
+  );
+  const tenantId = '30000000-0000-4000-8000-000000000003';
+  const agentId = '20000000-0000-4000-8000-000000000002';
+  const blockerTaskId = '10000000-0000-4000-8000-000000000001';
+  const statements = [];
+  const tx = {
+    async execute(sql, params) {
+      statements.push({kind: 'execute', sql, params});
+      return {rowCount: 1};
+    },
+    async queryOne(sql, params) {
+      statements.push({kind: 'queryOne', sql, params});
+      if (sql.includes('FROM capture_agents ca')) {
+        return {
+          id: agentId,
+          tenant_status: 'active',
+          status: 'active',
+          auth_code_status: 'active',
+          auth_code_expires_at: null,
+          active_auth_binding_id:
+            '40000000-0000-4000-8000-000000000004',
+          allowed_platforms: ['douyin'],
+          capabilities: {
+            remoteTaskCreate: true,
+            remoteTargetedPostCaptureV1: true,
+            followedCreatorPostPatrol: true,
+            supportedPlatforms: ['douyin'],
+          },
+        };
+      }
+      if (sql.includes("SELECT blocker.kind")) {
+        return {
+          kind: 'task',
+          id: blockerTaskId,
+          task_id: blockerTaskId,
+          status: 'running',
+        };
+      }
+      throw new Error(`Unexpected queryOne: ${sql}`);
+    },
+  };
+
+  const result = await loadCompatibleProfilePatrolAgent(
+    tx,
+    tenantId,
+    agentId,
+    ['douyin'],
+    'creator',
+  );
+  assert.equal(result.failure.error, 'profile_scan_agent_busy');
+  assert.equal(result.failure.status, 409);
+  assert.equal(result.failure.details.blockerTaskId, blockerTaskId);
+  assert.match(statements[0].sql, /pg_advisory_xact_lock/u);
+  assert.ok(
+    statements.findIndex(statement =>
+      statement.sql.includes('pg_advisory_xact_lock')) <
+      statements.findIndex(statement =>
+        statement.sql.includes('FROM capture_agents ca')),
+  );
+});
+
 test('stale profile execution cleanup preserves live commands and online runners', async () => {
   const {reconcileStaleProfilePatrolExecutions} = await import(
     `../server/services/profile-patrol-dispatch.js?reconcile=${Date.now()}`

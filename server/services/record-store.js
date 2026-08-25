@@ -14,6 +14,9 @@ const VERSION_FIELDS = [
   'tags', 'image_urls', 'comments_text', 'video_url', 'audio_url', 'source_type',
   'publish_location', 'payload',
 ];
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/iu;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -392,22 +395,198 @@ function versionPayload(existing, fields) {
   return data;
 }
 
-async function insertObservation(tx, { tenantId, recordId, authCode, monitorExecutionId, record }) {
+async function loadCaptureObservationLineage(tx, {
+  tenantId,
+  captureTaskId,
+  captureAgentId,
+  captureAgentAuthCodeId,
+  captureAgentAuthBindingId,
+  captureTaskItemAttemptId,
+  captureTaskItemRequestHash,
+  recordId,
+  monitorExecutionId,
+  record,
+}) {
+  const normalizedTaskId = String(captureTaskId || '').trim().toLowerCase();
+  const normalizedAgentId = String(captureAgentId || '').trim().toLowerCase();
+  const normalizedAuthCodeId = String(captureAgentAuthCodeId || '').trim().toLowerCase();
+  const normalizedAuthBindingId = String(captureAgentAuthBindingId || '').trim().toLowerCase();
+  const normalizedItemAttemptId = String(
+    captureTaskItemAttemptId || '',
+  ).trim().toLowerCase();
+  const normalizedItemRequestHash = String(
+    captureTaskItemRequestHash || '',
+  ).trim().toLowerCase();
+  if (
+    !UUID_PATTERN.test(normalizedTaskId) ||
+    !UUID_PATTERN.test(normalizedAgentId) ||
+    !UUID_PATTERN.test(normalizedAuthCodeId) ||
+    !UUID_PATTERN.test(normalizedAuthBindingId)
+  ) {
+    return null;
+  }
+  return tx.queryOne(`
+    WITH exact_task AS (
+      SELECT task.*
+      FROM capture_tasks task
+      JOIN capture_agents agent
+        ON agent.id = $7::uuid
+        AND agent.tenant_id = task.tenant_id
+        AND agent.status = 'active'
+        AND agent.auth_code_id = $8::uuid
+        AND agent.auth_binding_id = $9::uuid
+      JOIN tenants tenant
+        ON tenant.id = task.tenant_id AND tenant.status = 'active'
+      JOIN auth_codes auth_code
+        ON auth_code.id = agent.auth_code_id
+        AND auth_code.tenant_id = task.tenant_id
+        AND auth_code.status = 'active'
+        AND (auth_code.expires_at IS NULL OR auth_code.expires_at >= now())
+      JOIN auth_bindings binding
+        ON binding.id = agent.auth_binding_id
+        AND binding.code_id = auth_code.id
+      WHERE task.id = $1::uuid
+        AND task.tenant_id = $2
+        AND COALESCE(task.assigned_agent_id, task.origin_agent_id) = agent.id
+    ), matched_items AS (
+      SELECT candidate.id
+      FROM capture_task_items candidate
+      JOIN exact_task task ON true
+      WHERE candidate.tenant_id = task.tenant_id
+        AND candidate.task_id = COALESCE(task.parent_task_id, task.id)
+        AND candidate.execution_task_id = task.id
+        AND candidate.assigned_agent_id = $7::uuid
+        AND (
+          (BTRIM(candidate.keyword) <> '' AND candidate.keyword = $4)
+          OR candidate.record_id = $3::uuid
+          OR (BTRIM(candidate.external_id) <> '' AND candidate.external_id = $5)
+          OR (
+            $6::uuid IS NOT NULL
+            AND candidate.metadata->>'monitorExecutionId' = $6::uuid::text
+          )
+        )
+    ), exact_item AS (
+      SELECT (array_agg(id ORDER BY id))[1] AS id
+      FROM matched_items
+      HAVING COUNT(*) = 1
+    ), exact_attempt AS (
+      SELECT (array_agg(attempt.id ORDER BY attempt.id))[1] AS id
+      FROM capture_task_item_attempts attempt
+      JOIN exact_task task ON true
+      JOIN exact_item item ON true
+      JOIN capture_task_items current_item
+        ON current_item.id = item.id
+        AND current_item.tenant_id = task.tenant_id
+      WHERE attempt.tenant_id = task.tenant_id
+        AND attempt.item_id = item.id
+        AND attempt.parent_task_id = current_item.task_id
+        AND attempt.execution_task_id = task.id
+        AND attempt.agent_id = $7::uuid
+        AND attempt.assignment_revision = current_item.assignment_revision
+        AND attempt.attempt_number = current_item.attempt_count
+        AND (
+          task.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'
+          OR (
+            attempt.id = $10::uuid
+            AND attempt.request_hash = $11
+            AND current_item.request_hash = $11
+            AND task.metadata->>'remoteRequestHash' = $11
+          )
+        )
+      HAVING COUNT(*) = 1
+    )
+    SELECT task.id AS capture_task_id,
+      item.id AS capture_task_item_id,
+      attempt.id AS capture_task_item_attempt_id
+    FROM exact_task task
+    JOIN exact_item item ON true
+    JOIN exact_attempt attempt ON true
+    WHERE task.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'
+      OR EXISTS (
+        SELECT 1
+        FROM capture_recovery_intents intent
+        WHERE intent.tenant_id = task.tenant_id
+          AND intent.recovery_task_id = task.id
+          AND intent.item_id = item.id
+          AND intent.dispatched_attempt_id = attempt.id
+          AND intent.recovery_agent_id = $7::uuid
+          AND intent.status = 'verifying_collection'
+          AND intent.resolved_at IS NULL
+          AND task.metadata->>'dutyRecoveryIntentId' = intent.id::text
+          AND task.metadata->>'dutyRecoveryGeneration' = intent.generation::text
+          AND task.metadata->>'dutyRecoverySourceItemId' = item.id::text
+      )
+  `, [
+    normalizedTaskId,
+    tenantId,
+    recordId,
+    record.keyword || '',
+    record.external_id || '',
+    UUID_PATTERN.test(String(monitorExecutionId || '').trim())
+      ? monitorExecutionId
+      : null,
+    normalizedAgentId,
+    normalizedAuthCodeId,
+    normalizedAuthBindingId,
+    UUID_PATTERN.test(normalizedItemAttemptId)
+      ? normalizedItemAttemptId
+      : null,
+    SHA256_PATTERN.test(normalizedItemRequestHash)
+      ? normalizedItemRequestHash
+      : '',
+  ]);
+}
+
+async function insertObservation(tx, {
+  tenantId,
+  recordId,
+  authCode,
+  monitorExecutionId,
+  captureTaskId,
+  captureAgentId,
+  captureAgentAuthCodeId,
+  captureAgentAuthBindingId,
+  captureTaskItemAttemptId,
+  captureTaskItemRequestHash,
+  commentWorkflowExpectedCount = 0,
+  record,
+}) {
+  const lineage = await loadCaptureObservationLineage(tx, {
+    tenantId,
+    captureTaskId,
+    captureAgentId,
+    captureAgentAuthCodeId,
+    captureAgentAuthBindingId,
+    captureTaskItemAttemptId,
+    captureTaskItemRequestHash,
+    recordId,
+    monitorExecutionId,
+    record,
+  });
   const result = await tx.queryOne(`
     INSERT INTO record_observations (
       tenant_id, record_id, monitor_execution_id, source_auth_code,
+      capture_task_id, capture_task_item_id, capture_task_item_attempt_id,
+      comment_workflow_status, comment_workflow_expected_count,
       platform, keyword, rank_position,
       likes, comments_count, collects, shares,
       captured_at, payload
     ) VALUES (
       $1, $2, $3, $4,
       $5, $6, $7,
-      $8, $9, $10, $11,
-      now(), $12::jsonb
+      CASE WHEN $8::integer > 0 THEN 'queued' ELSE 'not_required' END,
+      $8::integer,
+      $9, $10, $11,
+      $12, $13, $14, $15,
+      now(), $16::jsonb
     )
     RETURNING id
   `, [
     tenantId, recordId, monitorExecutionId || null, authCode || '',
+    lineage?.capture_task_id || null,
+    lineage?.capture_task_item_id || null,
+    lineage?.capture_task_item_attempt_id || null,
+    Math.max(0, Number(commentWorkflowExpectedCount) || 0),
     record.platform || 'unknown', record.keyword || '', record.rank_position || null,
     cleanNumber(record.likes), cleanNumber(record.comments_count), cleanNumber(record.collects), cleanNumber(record.shares),
     jsonText(record.payload, '{}'),
@@ -485,6 +664,16 @@ export async function upsertCapturedRecord(record, context) {
   const tenantId = context.tenantId;
   const authCode = context.authCode || '';
   const monitorExecutionId = context.monitorExecutionId || null;
+  const captureTaskId = context.captureTaskId || null;
+  const captureAgentId = context.captureAgentId || null;
+  const captureAgentAuthCodeId = context.captureAgentAuthCodeId || null;
+  const captureAgentAuthBindingId = context.captureAgentAuthBindingId || null;
+  const captureTaskItemAttemptId = context.captureTaskItemAttemptId || null;
+  const captureTaskItemRequestHash = context.captureTaskItemRequestHash || null;
+  const commentWorkflowExpectedCount = Math.max(
+    0,
+    Number(context.commentWorkflowExpectedCount) || 0,
+  );
   const canonicalUrl = normalizeUrl(record.url);
   const contentHash = buildContentHash(record, canonicalUrl);
   const tags = jsonText(record.tags, '[]');
@@ -612,6 +801,13 @@ export async function upsertCapturedRecord(record, context) {
         recordId: existing.id,
         authCode,
         monitorExecutionId,
+        captureTaskId,
+        captureAgentId,
+        captureAgentAuthCodeId,
+        captureAgentAuthBindingId,
+        captureTaskItemAttemptId,
+        captureTaskItemRequestHash,
+        commentWorkflowExpectedCount,
         record: mergeObservationMetrics({...record, payload}, existing),
       });
 
@@ -686,7 +882,20 @@ export async function upsertCapturedRecord(record, context) {
       record.publish_location || '',
     ]);
 
-    const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });
+    const observationId = await insertObservation(tx, {
+      tenantId,
+      recordId: inserted.id,
+      authCode,
+      monitorExecutionId,
+      captureTaskId,
+      captureAgentId,
+      captureAgentAuthCodeId,
+      captureAgentAuthBindingId,
+      captureTaskItemAttemptId,
+      captureTaskItemRequestHash,
+      commentWorkflowExpectedCount,
+      record: {...record, payload},
+    });
     await appendOfficialContentAudit(tx, {
       tenantId,
       recordId: inserted.id,

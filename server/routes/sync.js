@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { optionalCaptureAgent, requireAuth } from '../middleware/auth.js';
 import { labelRecord } from '../services/ai-labeler.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
 import { upsertRecordComments } from '../services/comment-workflow.js';
@@ -9,7 +9,7 @@ import {
   resolveMetricUpdateFromPayload,
 } from '../utils/metrics.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
-import { queryAll } from '../db/init.js';
+import { execute, queryAll } from '../db/init.js';
 import {
   runProcessBackgroundWork,
   scheduleProcessBackgroundWork,
@@ -141,9 +141,21 @@ export function normalizeRecord(body) {
       workflow: r.workflow || body.workflow,
       recordId: r.recordId || r.id,
       monitorExecutionId: r.monitorExecutionId || body.monitorExecutionId,
+      captureTaskId: r.captureTaskId || body.captureTaskId,
+      captureTaskItemAttemptId:
+        r.captureTaskItemAttemptId || body.captureTaskItemAttemptId,
+      captureTaskItemRequestHash:
+        r.captureTaskItemRequestHash || body.captureTaskItemRequestHash,
     }));
   } else if (body.payload && typeof body.payload === 'object' && !Array.isArray(body.payload)) {
-    rawItems = [{ ...body.payload, syncType: body.syncType, monitorExecutionId: body.monitorExecutionId }];
+    rawItems = [{
+      ...body.payload,
+      syncType: body.syncType,
+      monitorExecutionId: body.monitorExecutionId,
+      captureTaskId: body.captureTaskId,
+      captureTaskItemAttemptId: body.captureTaskItemAttemptId,
+      captureTaskItemRequestHash: body.captureTaskItemRequestHash,
+    }];
   } else {
     const payload = body.payload || body.data || body;
     rawItems = Array.isArray(payload) ? payload : [payload];
@@ -240,6 +252,11 @@ export function normalizeRecord(body) {
       keyword: String(item.keyword || body.keyword || ''),
       rank_position: Number(get('rankPosition', 'rank_position', 'rank') || item.rankPosition || item.rank_position || 0) || null,
       monitorExecutionId: item.monitorExecutionId || body.monitorExecutionId || null,
+      captureTaskId: item.captureTaskId || body.captureTaskId || null,
+      captureTaskItemAttemptId:
+        item.captureTaskItemAttemptId || body.captureTaskItemAttemptId || null,
+      captureTaskItemRequestHash:
+        item.captureTaskItemRequestHash || body.captureTaskItemRequestHash || null,
       payload: JSON.stringify(item),
     };
   });
@@ -289,10 +306,75 @@ async function applyCommentWorkflow(record, result, req) {
   }
 }
 
-function queueCommentWorkflow(record, result, context) {
+async function updateCommentWorkflowReceipt({
+  tenantId,
+  observationId,
+  status,
+  expectedCount = 0,
+  processedCount = 0,
+  error = '',
+} = {}) {
+  const update = await execute(`
+    UPDATE record_observations
+    SET comment_workflow_status = $3,
+      comment_workflow_expected_count = GREATEST(
+        comment_workflow_expected_count,
+        $4::integer
+      ),
+      comment_workflow_processed_count = GREATEST(0, $5::integer),
+      comment_workflow_error = $6,
+      comment_workflow_started_at = CASE
+        WHEN $3 IN ('running', 'persisted', 'failed')
+          THEN COALESCE(comment_workflow_started_at, now())
+        ELSE comment_workflow_started_at
+      END,
+      comment_workflow_finished_at = CASE
+        WHEN $3 IN ('persisted', 'failed') THEN now()
+        ELSE NULL
+      END,
+      comment_workflow_updated_at = now()
+    WHERE id = $1::uuid AND tenant_id = $2
+  `, [
+    observationId,
+    tenantId,
+    status,
+    Math.max(0, Number(expectedCount) || 0),
+    Math.max(0, Number(processedCount) || 0),
+    String(error || '').slice(0, 1000),
+  ]);
+  if (update.rowCount !== 1) {
+    throw new Error('comment_workflow_observation_receipt_missing');
+  }
+}
+
+async function queueCommentWorkflow(record, result, context) {
   const total = countCommentWorkflowItems(record);
+  await updateCommentWorkflowReceipt({
+    tenantId: context.tenantId,
+    observationId: context.observationId,
+    status: 'queued',
+    expectedCount: total,
+  });
   enqueueCommentWorkflow(async () => {
+    await updateCommentWorkflowReceipt({
+      tenantId: context.tenantId,
+      observationId: context.observationId,
+      status: 'running',
+      expectedCount: total,
+    });
     const commentStats = await applyCommentWorkflow(record, result, context);
+    const processedCount = Math.max(
+      0,
+      Number(commentStats.inserted || 0) + Number(commentStats.updated || 0),
+    );
+    await updateCommentWorkflowReceipt({
+      tenantId: context.tenantId,
+      observationId: context.observationId,
+      status: commentStats.error ? 'failed' : 'persisted',
+      expectedCount: total,
+      processedCount,
+      error: commentStats.error || '',
+    });
     const aiJob = buildSyncAiJob(result);
     if (aiJob && !commentStats.officialContent) {
       await labelRecordsNow([aiJob]);
@@ -307,12 +389,12 @@ async function applyOrQueueCommentWorkflow(record, result, context) {
   // (有官方评论就整条回滚)—— 那个已修,队列不再无故报错。
   const commentCount = countCommentWorkflowItems(record);
   if (commentCount > 0) {
-    return queueCommentWorkflow(record, result, context);
+    return await queueCommentWorkflow(record, result, context);
   }
   return await applyCommentWorkflow(record, result, context);
 }
 
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
   try {
     const records = normalizeRecord(req.body);
     if (records.length === 0) {
@@ -320,14 +402,23 @@ router.post('/', requireAuth, async (req, res) => {
     }
 
     const record = records[0];
+    const commentWorkflowExpectedCount = countCommentWorkflowItems(record);
     const result = await upsertCapturedRecord(record, {
       tenantId: req.tenantId,
       authCode: req.authCode,
       monitorExecutionId: record.monitorExecutionId,
+      captureTaskId: record.captureTaskId,
+      captureTaskItemAttemptId: record.captureTaskItemAttemptId,
+      captureTaskItemRequestHash: record.captureTaskItemRequestHash,
+      captureAgentId: req.captureAgent?.id || null,
+      captureAgentAuthCodeId: req.captureAgent?.auth_code_id || null,
+      captureAgentAuthBindingId: req.captureAgent?.auth_binding_id || null,
+      commentWorkflowExpectedCount,
     });
     const commentStats = await applyOrQueueCommentWorkflow(record, result, {
       tenantId: req.tenantId,
       authCode: req.authCode,
+      observationId: result.observationId,
     });
 
     const aiJob = buildSyncAiJob(result);
@@ -346,7 +437,7 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-router.post('/batch', requireAuth, async (req, res) => {
+router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
   const allRecords = normalizeRecord(req.body);
   const batchRecords = Array.isArray(req.body.records) ? req.body.records : [];
 
@@ -365,10 +456,18 @@ router.post('/batch', requireAuth, async (req, res) => {
         tenantId: req.tenantId,
         authCode: req.authCode,
         monitorExecutionId: record.monitorExecutionId,
+        captureTaskId: record.captureTaskId,
+        captureTaskItemAttemptId: record.captureTaskItemAttemptId,
+        captureTaskItemRequestHash: record.captureTaskItemRequestHash,
+        captureAgentId: req.captureAgent?.id || null,
+        captureAgentAuthCodeId: req.captureAgent?.auth_code_id || null,
+        captureAgentAuthBindingId: req.captureAgent?.auth_binding_id || null,
+        commentWorkflowExpectedCount: countCommentWorkflowItems(record),
       });
       const commentStats = await applyOrQueueCommentWorkflow(record, result, {
         tenantId: req.tenantId,
         authCode: req.authCode,
+        observationId: result.observationId,
       });
       results.push({
         ok: true,

@@ -56,6 +56,11 @@ import {
   DEFAULT_CAPTURE_SETTINGS,
 } from "../utils/capture-settings.js";
 import {createRecordSyncQueue} from "../utils/record-sync-queue.js";
+import {
+  discardUnattendedCheckpointReports,
+  enqueueUnattendedCheckpointReport,
+  flushUnattendedCheckpointReportOutbox,
+} from "../utils/unattended-report-outbox.js";
 import {runEnhancementWithSingleRetry} from "../utils/capture/enhancement-retry.js";
 import {addSyncHistoryEntry, getAuth, getRecords} from "../utils/storage.js";
 
@@ -3128,6 +3133,7 @@ export async function initSidebar() {
 
   // 初始化所有状态
   await initAllStates();
+  void flushPendingUnattendedCheckpointReports({quiet: true});
   connectCaptureTaskOwnerPort();
   syncCaptureTaskOwnerFromRuntime(getCurrentRuntime() || {});
 
@@ -13228,7 +13234,12 @@ function sleepWithStop(
 
 function createStreamingDetailAutoSyncQueue(
   settings,
-  {shouldStop = null, signal = null} = {},
+  {
+    shouldStop = null,
+    signal = null,
+    captureTaskId = "",
+    resolveCaptureTaskItemAttempt = null,
+  } = {},
 ) {
   return createRecordSyncQueue({
     enabled: Boolean(
@@ -13240,6 +13251,10 @@ function createStreamingDetailAutoSyncQueue(
     retryDelaysMs: [1000, 3000, 8000],
     shouldRetry: isTransientStreamingSyncFailure,
     processRecord: async ({recordId, meta = {}, signal: jobSignal = null}) => {
+      const captureAttempt =
+        typeof resolveCaptureTaskItemAttempt === "function"
+          ? resolveCaptureTaskItemAttempt(meta)
+          : null;
       const result = await maybeRunAutoSyncAfterDetailCapture(settings, {
         sourceLabel: String(meta?.sourceLabel || "当前笔记"),
         recordIds: [recordId],
@@ -13247,6 +13262,13 @@ function createStreamingDetailAutoSyncQueue(
         refreshAfter: false,
         shouldStop,
         signal: jobSignal || signal,
+        captureTaskId,
+        captureTaskItemAttemptId: String(
+          captureAttempt?.attemptId || "",
+        ).trim(),
+        captureTaskItemRequestHash: String(
+          captureAttempt?.requestHash || "",
+        ).trim(),
       });
       return {
         ...result,
@@ -13298,7 +13320,7 @@ function isTransientStreamingSyncFailure(result = {}) {
 function routeDetailItemToStreamingSync(
   streamingSyncQueue,
   progress = {},
-  {sourceLabel = "当前笔记"} = {},
+  {sourceLabel = "当前笔记", keyword = ""} = {},
 ) {
   if (!streamingSyncQueue?.enabled) {
     return;
@@ -13322,7 +13344,7 @@ function routeDetailItemToStreamingSync(
   if (phase !== "detail_item_done") {
     return;
   }
-  streamingSyncQueue.enqueue(recordId, {sourceLabel});
+  streamingSyncQueue.enqueue(recordId, {sourceLabel, keyword});
 }
 
 function formatStreamingSyncSummary(stats = {}) {
@@ -13486,6 +13508,29 @@ async function handleBatchKeywordCapture(options = {}) {
   const scopedUnattendedAttemptId = String(
     runOptions.unattendedAttemptId || "",
   ).trim();
+  const captureTaskItemAttempts = (Array.isArray(
+    runOptions.captureTaskItemAttempts,
+  )
+    ? runOptions.captureTaskItemAttempts
+    : [])
+    .map((entry) =>
+      entry && typeof entry === "object" && !Array.isArray(entry)
+        ? entry
+        : {},
+    )
+    .filter(
+      (entry) =>
+        String(entry.attemptId || "").trim() &&
+        String(entry.keyword || "").trim(),
+    );
+  const resolveCaptureTaskItemAttempt = (value = {}) => {
+    const keyword = String(value?.keyword || "").trim();
+    if (!keyword) return null;
+    const matches = captureTaskItemAttempts.filter(
+      (entry) => String(entry.keyword || "").trim() === keyword,
+    );
+    return matches.length === 1 ? matches[0] : null;
+  };
   const isCurrentUnattendedInvocation = () =>
     !scopedUnattendedRequestId ||
     (scopedUnattendedRequestId ===
@@ -13672,6 +13717,8 @@ async function handleBatchKeywordCapture(options = {}) {
       resolveCurrentDetailCaptureSettings(storedCaptureSettings);
     streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings, {
       shouldStop: shouldStopBatchInvocation,
+      captureTaskId: scopedUnattendedRequestId,
+      resolveCaptureTaskItemAttempt,
     });
     if (
       settings.autoDetailCaptureAfterListCapture &&
@@ -14063,6 +14110,7 @@ async function handleBatchKeywordCapture(options = {}) {
                             progress,
                             {
                               sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                              keyword: capturedKeyword,
                             },
                           )
                       : null,
@@ -14174,13 +14222,24 @@ async function handleBatchKeywordCapture(options = {}) {
               if (streamingSyncQueue?.enabled) {
                 streamingSyncQueue.enqueueMissing(recordIds, {
                   sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                  keyword: capturedKeyword,
                 });
               }
               if (!streamingSyncQueue?.enabled) {
+                const captureAttempt = resolveCaptureTaskItemAttempt({
+                  keyword: capturedKeyword,
+                });
                 await maybeRunAutoSyncAfterDetailCapture(settings, {
                   sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                   recordIds,
                   shouldStop: shouldStopBatchInvocation,
+                  captureTaskId: scopedUnattendedRequestId,
+                  captureTaskItemAttemptId: String(
+                    captureAttempt?.attemptId || "",
+                  ).trim(),
+                  captureTaskItemRequestHash: String(
+                    captureAttempt?.requestHash || "",
+                  ).trim(),
                 });
               }
               return enhanceResult;
@@ -14715,7 +14774,11 @@ function stopRejectedUnattendedAttempt(reason = "attempt_mismatch") {
 async function reportUnattendedKeywordRun(
   requestId,
   patch = {},
-  {attemptId = activeUnattendedRunAttemptId, quiet = false} = {},
+  {
+    attemptId = activeUnattendedRunAttemptId,
+    quiet = false,
+    durableCheckpoint = false,
+  } = {},
 ) {
   if (!requestId) {
     return {ok: false, accepted: false, reason: "missing_request_id", data: null};
@@ -14727,21 +14790,69 @@ async function reportUnattendedKeywordRun(
       attemptId: String(attemptId || ""),
       patch,
     });
-    const accepted = response?.accepted !== false && response?.ok !== false;
-    const reason = String(response?.reason || "");
+    const hasExplicitAcceptance = typeof response?.accepted === "boolean";
+    const accepted = response?.accepted === true && response?.ok !== false;
+    const reason = String(
+      response?.reason || (hasExplicitAcceptance ? "" : "transport_error"),
+    );
     if (
       !accepted &&
       (reason === "attempt_mismatch" || reason === "terminal")
     ) {
       stopRejectedUnattendedAttempt(reason);
     }
+    if (
+      !accepted &&
+      ["attempt_mismatch", "not_found", "terminal"].includes(reason)
+    ) {
+      await discardUnattendedCheckpointReports({requestId, attemptId});
+    }
+    if (!accepted && !hasExplicitAcceptance && durableCheckpoint) {
+      const queued = await enqueueUnattendedCheckpointReport({
+        requestId,
+        attemptId,
+        patch,
+      });
+      if (queued.ok) {
+        return {
+          ok: true,
+          accepted: true,
+          reason: "queued_durable",
+          data: null,
+          durable: true,
+        };
+      }
+    }
+    // Do not delete a queued checkpoint merely because this direct report was
+    // accepted: a newer report for the same attempt may have been queued while
+    // this message was in flight. Flush below preserves revision fencing, and
+    // the task ledger rejects an older replay as stale_progress.
+    if (accepted) {
+      void flushPendingUnattendedCheckpointReports({quiet: true});
+    }
     return {
-      ok: response?.ok !== false,
+      ok: hasExplicitAcceptance && response?.ok !== false,
       accepted,
       reason,
       data: response?.data || null,
     };
   } catch (error) {
+    if (durableCheckpoint) {
+      const queued = await enqueueUnattendedCheckpointReport({
+        requestId,
+        attemptId,
+        patch,
+      });
+      if (queued.ok) {
+        return {
+          ok: true,
+          accepted: true,
+          reason: "queued_durable",
+          data: null,
+          durable: true,
+        };
+      }
+    }
     if (!quiet) {
       console.warn("[Sidebar] Update unattended keyword run failed:", error);
     }
@@ -14753,6 +14864,31 @@ async function reportUnattendedKeywordRun(
       error,
     };
   }
+}
+
+let unattendedCheckpointOutboxFlushPromise = null;
+
+function flushPendingUnattendedCheckpointReports({quiet = false} = {}) {
+  if (unattendedCheckpointOutboxFlushPromise) {
+    return unattendedCheckpointOutboxFlushPromise;
+  }
+  unattendedCheckpointOutboxFlushPromise =
+    flushUnattendedCheckpointReportOutbox({
+      send: sendUnattendedRuntimeMessage,
+    })
+      .catch((error) => {
+        if (!quiet) {
+          console.warn(
+            "[Sidebar] Flush unattended checkpoint outbox failed:",
+            error,
+          );
+        }
+        return {ok: false, reason: "flush_error", error};
+      })
+      .finally(() => {
+        unattendedCheckpointOutboxFlushPromise = null;
+      });
+  return unattendedCheckpointOutboxFlushPromise;
 }
 
 async function reportInitialUnattendedKeywordRun(
@@ -15977,22 +16113,11 @@ function startTargetedPostRunHeartbeat(invocationToken, getCurrentRequest) {
 
     inFlight = true;
     const now = new Date().toISOString();
-    const progress =
-      current.progress &&
-      typeof current.progress === "object" &&
-      !Array.isArray(current.progress)
-        ? current.progress
-        : {};
     try {
       await updateTargetedPostRun(
         current,
         {
           heartbeatAt: now,
-          businessProgressAt: now,
-          progress: {
-            ...progress,
-            updatedAt: now,
-          },
         },
         invocationToken,
       );
@@ -16225,13 +16350,6 @@ function buildTargetedProfileCaptureTaskContext(
   request = {},
   invocationToken = null,
 ) {
-  if (
-    String(request?.workflow || "").trim() !==
-    "official_account_comment_patrol"
-  ) {
-    return null;
-  }
-
   const requestToken = getTargetedPostInvocationTokenFromRequest(request);
   if (
     !requestToken ||
@@ -16243,11 +16361,16 @@ function buildTargetedProfileCaptureTaskContext(
     );
   }
 
-  // Native Debug resources use the same physical run identity as the cloud
-  // task ledger. Keeping the attempt in the task id prevents a late cleanup
-  // from attempt A from releasing attempt B after a device retry/handoff.
+  const officialCommentPatrol =
+    String(request?.workflow || "").trim() ===
+    "official_account_comment_patrol";
+  // Native Debug resources for comment patrol use the physical run identity,
+  // while server evidence always uses the UUID cloud task identity.
   return Object.freeze({
-    taskId: `${requestToken.requestId}::${requestToken.attemptId}`,
+    taskId: officialCommentPatrol
+      ? `${requestToken.requestId}::${requestToken.attemptId}`
+      : "",
+    captureTaskId: String(request.taskId || request.id || "").trim(),
     attemptId: requestToken.attemptId,
     label: getTargetedWorkflowLabel(request.workflow),
     ownerRequired: true,
@@ -16330,6 +16453,54 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
   let executionLock = null;
   let targetTabId = null;
   let stopTargetedPostHeartbeat = () => {};
+  let targetedBusinessProgressTimer = null;
+  let pendingTargetedBusinessProgress = null;
+  let targetedBusinessProgressInFlight = Promise.resolve();
+  const publishTargetedBusinessProgress = () => {
+    if (targetedBusinessProgressTimer !== null) {
+      clearTimeout(targetedBusinessProgressTimer);
+      targetedBusinessProgressTimer = null;
+    }
+    const patch = pendingTargetedBusinessProgress;
+    pendingTargetedBusinessProgress = null;
+    if (!patch) return targetedBusinessProgressInFlight;
+    targetedBusinessProgressInFlight = targetedBusinessProgressInFlight
+      .then(async () => {
+        if (!isActiveTargetedPostInvocation(invocationToken)) return;
+        request = await updateTargetedPostRun(
+          targetedPostRunState || request,
+          patch,
+          invocationToken,
+        );
+      })
+      .catch((error) => {
+        if (isActiveTargetedPostInvocation(invocationToken)) {
+          console.warn(
+            "[Sidebar] Targeted business progress persistence failed:",
+            error,
+          );
+        }
+      });
+    return targetedBusinessProgressInFlight;
+  };
+  const queueTargetedBusinessProgress = (progress = {}, message = "") => {
+    const updatedAt =
+      String(progress?.updatedAt || "").trim() || new Date().toISOString();
+    pendingTargetedBusinessProgress = {
+      progress: {...progress, updatedAt},
+      message: String(message || progress?.message || "").trim(),
+      businessProgressAt: updatedAt,
+    };
+    if (targetedBusinessProgressTimer === null) {
+      targetedBusinessProgressTimer = setTimeout(() => {
+        void publishTargetedBusinessProgress();
+      }, 1000);
+    }
+  };
+  const flushTargetedBusinessProgress = async () => {
+    await publishTargetedBusinessProgress();
+    await targetedBusinessProgressInFlight;
+  };
   const shouldStop = () =>
     !isActiveTargetedPostInvocation(invocationToken) ||
     (isSameTargetedPostInvocationToken(
@@ -16470,7 +16641,15 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           // the legacy monitor-start endpoint would correctly reject this
           // execution because it is linked to a cloud task item.
           executionPreclaimed: true,
-          captureTaskContext: targetedProfileCaptureTaskContext,
+          captureTaskContext: {
+            ...targetedProfileCaptureTaskContext,
+            captureTaskItemAttemptId: String(
+              target.captureTaskItemAttemptId || "",
+            ).trim(),
+            captureTaskItemRequestHash: String(
+              target.captureTaskItemRequestHash || "",
+            ).trim(),
+          },
           shouldStop,
           onProgress: (progress = {}) => {
             if (!isActiveTargetedPostInvocation(invocationToken)) {
@@ -16523,6 +16702,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 message: nextProgress.message,
               },
             );
+            queueTargetedBusinessProgress(
+              nextProgress,
+              nextProgress.message,
+            );
             renderCaptureDebugSession(getCurrentRuntime() || {});
           },
         });
@@ -16553,6 +16736,17 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
               : monitorStatus === "success"
                 ? "profile_scan_completed"
                 : "profile_scan_failed",
+          scanComplete: monitorResult?.scanComplete === true,
+          partial: monitorResult?.partial === true,
+          incompleteReason: String(monitorResult?.incompleteReason || ""),
+          ...(monitorStatus === "no_hit"
+            ? {
+                noResults: true,
+                resultKind: "profile_scan_no_new_posts",
+                qualifyingCount: 0,
+                scanComplete: true,
+              }
+            : {}),
           scannedCount: Math.max(
             0,
             Number(monitorResult?.scannedCount) || 0,
@@ -16571,16 +16765,14 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           ),
           ...(monitorStatus === "failed"
             ? {
-                error: {
-                  code: String(
-                    monitorResult?.errorCode || "PROFILE_SCAN_FAILED",
-                  ),
-                  stage: "profile_scan",
-                  message: String(
-                    monitorResult?.errorMessage || "账号作品扫描失败",
-                  ).slice(0, 1000),
-                  retryable: true,
-                },
+                error: cloudTargetedPostApi.projectCaptureFailure(
+                  [monitorResult?.error, monitorResult],
+                  {
+                    fallbackCode: "PROFILE_SCAN_FAILED",
+                    stage: "profile_scan",
+                    fallbackMessage: "账号作品扫描失败",
+                  },
+                ),
               }
             : {}),
         };
@@ -16649,6 +16841,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 message: nextProgress.message,
               },
             );
+            queueTargetedBusinessProgress(
+              nextProgress,
+              nextProgress.message,
+            );
             renderCaptureDebugSession(getCurrentRuntime() || {});
           },
           shouldStop,
@@ -16694,6 +16890,13 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 {
                   trigger: targetedWorkflow,
                   syncScope: "all",
+                  captureTaskId: String(request.taskId || request.id || ""),
+                  captureTaskItemAttemptId: String(
+                    target.captureTaskItemAttemptId || "",
+                  ).trim(),
+                  captureTaskItemRequestHash: String(
+                    target.captureTaskItemRequestHash || "",
+                  ).trim(),
                   captureSettings: {
                     ...captureSettings,
                     autoSyncAfterDetailCapture: true,
@@ -16714,6 +16917,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           }
         }
       }
+      await flushTargetedBusinessProgress();
       if (!isActiveTargetedPostInvocation(invocationToken)) {
         throw createTargetedPostInvocationError();
       }
@@ -16775,6 +16979,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           ? "completed_with_warnings"
           : "failed";
     stopTargetedPostHeartbeat();
+    await flushTargetedBusinessProgress();
     request = await updateTargetedPostRun(request, {
       status: finalStatus,
       finishedAt: new Date().toISOString(),
@@ -16806,6 +17011,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     await refreshDataPool();
   } catch (error) {
     stopTargetedPostHeartbeat();
+    await flushTargetedBusinessProgress();
     console.error("[Sidebar] Targeted post workflow failed:", error);
     const staleInvocation =
       String(error?.code || "") === "stale_targeted_post_attempt" ||
@@ -16849,6 +17055,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     }
   } finally {
     stopTargetedPostHeartbeat();
+    if (targetedBusinessProgressTimer !== null) {
+      clearTimeout(targetedBusinessProgressTimer);
+      targetedBusinessProgressTimer = null;
+    }
     const cleanupOwnership =
       getTargetedPostInvocationOwnership(invocationToken);
     if (
@@ -17688,7 +17898,14 @@ function createUnattendedKeywordCheckpointReporter({
     message = "",
     waitUntil,
   } = {}) => {
-    const checkpointSummary = summary || summarizeUnattendedKeywordCheckpoint(checkpoint);
+    const checkpointSummary =
+      summary || summarizeUnattendedKeywordCheckpoint(checkpoint);
+    // Checkpoints participate in the same monotonic task fence as visible
+    // progress. If this report is queued locally and a newer direct report is
+    // accepted first, background will reject the old replay as stale_progress
+    // instead of letting it roll the durable checkpoint backwards.
+    activeUnattendedProgressSeq += 1;
+    const checkpointProgressSeq = activeUnattendedProgressSeq;
     let reportResult = null;
     for (const delayMs of [0, 300, 900]) {
       if (delayMs > 0) await sleep(delayMs);
@@ -17702,6 +17919,7 @@ function createUnattendedKeywordCheckpointReporter({
           total: taskTotal,
         }),
         message,
+        progressSeq: checkpointProgressSeq,
         businessProgressAt: checkpoint.updatedAt,
       };
       if (waitUntil !== undefined) {
@@ -17710,7 +17928,7 @@ function createUnattendedKeywordCheckpointReporter({
       reportResult = await reportUnattendedKeywordRun(
         requestId,
         reportPatch,
-        {attemptId},
+        {attemptId, durableCheckpoint: true},
       );
       if (
         reportResult?.accepted ||
@@ -18440,6 +18658,11 @@ async function runUnattendedKeywordPlanRequest(request) {
       executionMode,
       unattendedRequestId: requestId,
       unattendedAttemptId: requestAttemptId,
+      captureTaskItemAttempts: Array.isArray(
+        request?.orchestrationContext?.itemAttempts,
+      )
+        ? request.orchestrationContext.itemAttempts
+        : [],
       searchPasses: sequentialSearchEnabled ? searchPasses : null,
       searchFilters: plan.searchFilters || {},
       disableAutomaticSearchRetry:
@@ -21364,6 +21587,53 @@ async function executeMonitorRunItem({
       shouldStop,
     });
     const recordIds = collectBatchRecordIds(captureResult);
+    const captureFailure = cloudTargetedPostApi.projectCaptureFailure(
+      [
+        captureResult,
+        ...(Array.isArray(captureResult?.results)
+          ? captureResult.results
+          : []),
+      ],
+      {
+        fallbackCode: "CAPTURE_FAILED",
+        stage: "profile_scan",
+        fallbackMessage: "采集账号作品失败",
+      },
+    );
+    const incompleteCaptureEntries = Array.isArray(captureResult?.results)
+      ? captureResult.results.filter(
+          (entry) => entry?.partial === true || entry?.scanComplete === false,
+        )
+      : [];
+    const profileScanComplete = Boolean(
+      captureResult?.scanComplete === true &&
+        captureResult?.partial !== true &&
+        incompleteCaptureEntries.length === 0,
+    );
+
+    if (captureFailure.requiresManualAction === true) {
+      await finishMonitorExecutionSafely(executionId, {
+        status: "failed",
+        recordsFound: recordIds.length,
+        errorMessage: captureFailure.message,
+      });
+      return {
+        ...baseResult,
+        status: "failed",
+        scannedCount: recordIds.length,
+        hitCount: 0,
+        errorCode: captureFailure.code,
+        errorCategory: captureFailure.category || "platform_safety_block",
+        errorMessage: captureFailure.message,
+        securityBlocked: captureFailure.securityBlocked === true,
+        platformSafetyBlocked:
+          captureFailure.platformSafetyBlocked === true,
+        requiresManualAction: true,
+        retryable: false,
+        securityEvidence: captureFailure.securityEvidence || null,
+        error: captureFailure,
+      };
+    }
 
     if (captureResult?.canceled) {
       await finishMonitorExecutionSafely(executionId, {
@@ -21381,19 +21651,58 @@ async function executeMonitorRunItem({
       };
     }
 
-    if (!captureResult?.ok && recordIds.length === 0) {
-      const errorMessage =
-        captureResult?.results?.find((item) => item?.error)?.error ||
-        "采集账号作品失败";
+    if (!profileScanComplete) {
+      const incompleteFailure = cloudTargetedPostApi.projectCaptureFailure(
+        [
+          ...incompleteCaptureEntries.map((entry) => entry?.error),
+          ...incompleteCaptureEntries,
+          captureResult?.error,
+          captureResult,
+        ],
+        {
+          fallbackCode: "PROFILE_SCAN_INCOMPLETE",
+          stage: "profile_scan",
+          fallbackMessage:
+            "账号作品列表未完整采集，已保留本轮结果并等待重试",
+        },
+      );
       await finishMonitorExecutionSafely(executionId, {
         status: "failed",
-        errorMessage,
+        recordsFound: recordIds.length,
+        errorMessage: incompleteFailure.message,
       });
       return {
         ...baseResult,
         status: "failed",
-        errorCode: "capture_failed",
-        errorMessage,
+        partial: true,
+        scanComplete: false,
+        incompleteReason: String(
+          captureResult?.incompleteReason || "partial_capture",
+        ),
+        scannedCount: recordIds.length,
+        hitCount: 0,
+        errorCode: incompleteFailure.code,
+        errorCategory: incompleteFailure.category || "capture_incomplete",
+        errorMessage: incompleteFailure.message,
+        retryable: incompleteFailure.retryable !== false,
+        error: incompleteFailure,
+        captureResult,
+      };
+    }
+
+    if (!captureResult?.ok && recordIds.length === 0) {
+      await finishMonitorExecutionSafely(executionId, {
+        status: "failed",
+        errorMessage: captureFailure.message,
+      });
+      return {
+        ...baseResult,
+        status: "failed",
+        errorCode: captureFailure.code,
+        errorCategory: captureFailure.category || "",
+        errorMessage: captureFailure.message,
+        retryable: captureFailure.retryable,
+        error: captureFailure,
       };
     }
 
@@ -21408,6 +21717,11 @@ async function executeMonitorRunItem({
       return {
         ...baseResult,
         status: "no_hit",
+        noResults: true,
+        resultKind: "profile_scan_no_new_posts",
+        businessOutcome: "profile_scan_no_new_posts",
+        qualifyingCount: 0,
+        scanComplete: true,
         scannedCount: 0,
         hitCount: 0,
       };
@@ -21480,6 +21794,11 @@ async function executeMonitorRunItem({
       return {
         ...baseResult,
         status: "no_hit",
+        noResults: true,
+        resultKind: "profile_scan_no_new_posts",
+        businessOutcome: "profile_scan_no_new_posts",
+        qualifyingCount: 0,
+        scanComplete: true,
         scannedCount: publishFilterResult.scannedCount,
         hitCount: 0,
         filteredCount: publishFilterResult.filteredCount,
@@ -21631,6 +21950,15 @@ async function executeMonitorRunItem({
         trigger: "monitor_run_now",
         syncScope: "all",
         monitorExecutionId: executionId,
+        captureTaskId: String(
+          captureTaskContext?.captureTaskId || "",
+        ).trim(),
+        captureTaskItemAttemptId: String(
+          captureTaskContext?.captureTaskItemAttemptId || "",
+        ).trim(),
+        captureTaskItemRequestHash: String(
+          captureTaskContext?.captureTaskItemRequestHash || "",
+        ).trim(),
         captureSettings,
         commentLeadsConfig: buildCommentLeadsConfigFromSettings(captureSettings),
         shouldStop,
@@ -21670,6 +21998,11 @@ async function executeMonitorRunItem({
     return {
       ...baseResult,
       status: hasTaskFailure ? "failed" : "success",
+      partial: hasTaskFailure,
+      scanComplete: !hasTaskFailure,
+      incompleteReason: hasTaskFailure
+        ? "profile_postprocessing_failed"
+        : "",
       scannedCount: publishFilterResult.scannedCount,
       hitCount: syncStats.successCount,
       filteredCount: publishFilterResult.filteredCount,
@@ -23638,6 +23971,9 @@ async function maybeRunAutoSyncAfterDetailCapture(
     syncProgress = null,
     shouldStop = null,
     signal = null,
+    captureTaskId = "",
+    captureTaskItemAttemptId = "",
+    captureTaskItemRequestHash = "",
   } = {},
 ) {
   const stopRequested = () => {
@@ -23759,6 +24095,9 @@ async function maybeRunAutoSyncAfterDetailCapture(
       commentLeadsConfig,
       shouldStop: stopRequested,
       signal,
+      captureTaskId,
+      captureTaskItemAttemptId,
+      captureTaskItemRequestHash,
     });
 
     if (result?.canceled) return canceledResult();

@@ -1074,7 +1074,7 @@ test("Douyin extractor readiness failure reuses its worker and advances only to 
   }
 });
 
-test("Douyin verified direct video routes accept hidden DOM but reject a post-capture SPA route mismatch", async () => {
+test("Douyin core detail and comments survive optional metrics failure while commit identity stays strict", async () => {
   const sourceTab = {
     id: 74,
     windowId: 8,
@@ -1122,8 +1122,46 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
       ? `https://www.douyin.com/video/${scenario.postCaptureNoteId}`
       : `https://www.douyin.com/video/${scenario.noteId}`,
   }));
+  const lowFollowerScenarios = [
+    {
+      recordId: "douyin-low-follower-metrics-unknown-r1",
+      noteId: "766193585000000105",
+      comments: 9,
+      metricsOutcome: "unknown",
+    },
+    {
+      recordId: "douyin-low-follower-proven-zero-r1",
+      noteId: "766193585000000106",
+      comments: 4,
+      metricsOutcome: "zero",
+    },
+    {
+      recordId: "douyin-low-follower-above-threshold-r1",
+      noteId: "766193585000000107",
+      comments: 2,
+      metricsOutcome: "above_threshold",
+    },
+  ].map((scenario) => ({
+    ...scenario,
+    directUrl: `https://www.douyin.com/video/${scenario.noteId}`,
+    modalUrl: `${sourceTab.url}&modal_id=${scenario.noteId}`,
+    postCaptureUrl: `https://www.douyin.com/video/${scenario.noteId}`,
+  }));
+  const lowFollowerCanceledScenario = {
+    recordId: "douyin-low-follower-metrics-canceled-r1",
+    noteId: "766193585000000108",
+    comments: 3,
+    metricsOutcome: "canceled",
+    directUrl: "https://www.douyin.com/video/766193585000000108",
+    modalUrl: `${sourceTab.url}&modal_id=766193585000000108`,
+    postCaptureUrl: "https://www.douyin.com/video/766193585000000108",
+  };
   const scenarioByNoteId = new Map(
-    scenarios.map((scenario) => [scenario.noteId, scenario]),
+    [
+      ...scenarios,
+      ...lowFollowerScenarios,
+      lowFollowerCanceledScenario,
+    ].map((scenario) => [scenario.noteId, scenario]),
   );
   const navigationUrls = [];
   const contentActions = [];
@@ -1148,6 +1186,77 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
           if (action === "captureSingleNote") {
             const expectedNoteId = String(
               message.payload.expectedNoteId || "",
+            );
+            if (message.payload.includeBloggerMetrics === true) {
+              const scenario = scenarioByNoteId.get(expectedNoteId);
+              assert.ok(
+                scenario,
+                `optional metrics lost expected note identity: ${expectedNoteId}`,
+              );
+              contentActions.push({
+                action: "captureBloggerMetrics",
+                expectedNoteId,
+              });
+              events.push(`capture:metrics:${expectedNoteId}`);
+              if (scenario.metricsOutcome === "canceled") {
+                return {
+                  ok: true,
+                  data: {
+                    ok: false,
+                    platform: "douyin",
+                    type: "single_note",
+                    data: null,
+                    error: {
+                      code: "CAPTURE_CANCELED",
+                      message: "DETAIL_CAPTURE_CANCELED",
+                    },
+                  },
+                };
+              }
+              if (
+                scenario.metricsOutcome === "zero" ||
+                scenario.metricsOutcome === "above_threshold"
+              ) {
+                const followersCount =
+                  scenario.metricsOutcome === "zero" ? 0 : 9001;
+                return {
+                  ok: true,
+                  data: {
+                    ok: true,
+                    platform: "douyin",
+                    type: "single_note",
+                    data: {
+                      noteId: expectedNoteId,
+                      noteUrl: scenario.directUrl,
+                      bloggerFollowersCount: followersCount,
+                      bloggerFollowersCountKnown: true,
+                      bloggerLikedAndCollectedCount: 100,
+                      bloggerLikedAndCollectedCountKnown: true,
+                      bloggerMetricsCaptureStatus: "done",
+                    },
+                    meta: {pageType: "note_detail"},
+                    error: null,
+                  },
+                };
+              }
+              return {
+                ok: true,
+                data: {
+                  ok: false,
+                  platform: "douyin",
+                  type: "single_note",
+                  data: null,
+                  error: {
+                    code: "DOUYIN_BLOGGER_METRICS_NOT_READY",
+                    message: "optional metrics panel did not become ready",
+                  },
+                },
+              };
+            }
+            assert.equal(
+              message.payload.includeBloggerMetrics,
+              false,
+              "the core detail transaction must not request optional blogger metrics",
             );
             const scenario = scenarioByNoteId.get(expectedNoteId);
             assert.ok(scenario, `unexpected detail note: ${expectedNoteId}`);
@@ -1178,8 +1287,6 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
                   content: "The exact payload ID has been captured.",
                   author: "Direct route author",
                   likes: 18,
-                  bloggerFollowersCount: 1200,
-                  bloggerLikedAndCollectedCount: 3400,
                   bloggerProfileUrl:
                     "https://www.douyin.com/user/direct-route-author",
                   comments: scenario.comments,
@@ -1351,7 +1458,11 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
     import("../../utils/capture-sync.js"),
     import("../../utils/task-context.js"),
   ]);
-  for (const scenario of scenarios) {
+  for (const scenario of [
+    ...scenarios,
+    ...lowFollowerScenarios,
+    lowFollowerCanceledScenario,
+  ]) {
     await addRecord({
       id: scenario.recordId,
       type: "keyword_notes",
@@ -1386,6 +1497,7 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
       {
         skipAlreadyCaptured: false,
         includeComments: true,
+        includeBloggerMetrics: true,
         captureTaskId: activeTask.taskId,
         detailNavTimeoutMs: 5000,
         detailAfterNavWaitMs: 1,
@@ -1413,6 +1525,10 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
         expectedNoteId: scenarios[0].noteId,
       },
       {
+        action: "captureBloggerMetrics",
+        expectedNoteId: scenarios[0].noteId,
+      },
+      {
         action: "captureComments",
         expectedNoteId: scenarios[0].noteId,
         verifiedNoteId: scenarios[0].noteId,
@@ -1422,7 +1538,15 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
         expectedNoteId: scenarios[1].noteId,
       },
       {
+        action: "captureBloggerMetrics",
+        expectedNoteId: scenarios[1].noteId,
+      },
+      {
         action: "captureSingleNote",
+        expectedNoteId: scenarios[2].noteId,
+      },
+      {
+        action: "captureBloggerMetrics",
         expectedNoteId: scenarios[2].noteId,
       },
     ]);
@@ -1506,6 +1630,11 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
       "done",
     );
     assert.equal(
+      nonzeroRecord?.payload?.detailPayload?.bloggerMetricsCaptureStatus,
+      "failed",
+      "optional metrics failure must not roll back the core detail/comment transaction",
+    );
+    assert.equal(
       nonzeroRecord?.payload?.detailPayload?.commentsTotalCaptured,
       1,
     );
@@ -1568,6 +1697,135 @@ test("Douyin verified direct video routes accept hidden DOM but reject a post-ca
       "integrity_blocked",
     );
     assert.notEqual(mismatchRecord?.payload?.detailCaptureStatus, "done");
+
+    navigationUrls.length = 0;
+    contentActions.length = 0;
+    probeSnapshots.length = 0;
+    verifiedDetailNoteIds.clear();
+    workerCurrentUrl = workerTab.url;
+
+    const lowFollowerResult =
+      await captureSync.batchCaptureDetailsForRecords(
+        lowFollowerScenarios.map((scenario) => scenario.recordId),
+        {
+          skipAlreadyCaptured: false,
+          includeComments: false,
+          includeBloggerMetrics: false,
+          enableLowFollowerHitFilter: true,
+          lowFollowerHitThreshold: 8000,
+          captureTaskId: activeTask.taskId,
+          detailNavTimeoutMs: 5000,
+          detailAfterNavWaitMs: 1,
+        },
+      );
+
+    assert.equal(lowFollowerResult.ok, false, JSON.stringify(lowFollowerResult));
+    assert.equal(lowFollowerResult.successCount, 1);
+    assert.equal(lowFollowerResult.failedCount, 1);
+    assert.equal(lowFollowerResult.filteredCount, 1);
+    assert.equal(lowFollowerResult.processedCount, 3);
+    assert.equal(lowFollowerResult.canceled, false);
+    assert.equal(lowFollowerResult.fatal, false);
+    assert.equal(lowFollowerResult.stopBatch, false);
+    assert.equal(lowFollowerResult.securityBlocked, false);
+    assert.equal(lowFollowerResult.integrityBlocked, false);
+    assert.equal(
+      contentActions.some((item) => item.action === "captureComments"),
+      false,
+    );
+
+    const unknownScenario = lowFollowerScenarios[0];
+    const unknownResult = lowFollowerResult.results.find(
+      (item) => item.recordId === unknownScenario.recordId,
+    );
+    assert.equal(unknownResult?.ok, false);
+    assert.equal(unknownResult?.reason, "BLOGGER_METRICS_FAILED");
+    assert.equal(unknownResult?.stage, "blogger_metrics_capture");
+    assert.equal(unknownResult?.category, "page_failed");
+    assert.equal(unknownResult?.retryable, true);
+    assert.equal(unknownResult?.fatal, false);
+    assert.equal(unknownResult?.stopBatch, false);
+    assert.equal(unknownResult?.canceled, false);
+    const unknownRecord = await getRecord(unknownScenario.recordId);
+    assert.ok(unknownRecord, "unknown follower metrics must not delete the item");
+    assert.equal(unknownRecord.payload.detailCaptureStatus, "failed");
+    assert.equal(
+      unknownRecord.payload.detailCaptureFailureCode,
+      "BLOGGER_METRICS_FAILED",
+    );
+    assert.equal(
+      unknownRecord.payload.detailPayload?.noteId,
+      unknownScenario.noteId,
+      "retryable metrics failure must retain the captured core detail",
+    );
+
+    const provenZeroScenario = lowFollowerScenarios[1];
+    const provenZeroResult = lowFollowerResult.results.find(
+      (item) => item.recordId === provenZeroScenario.recordId,
+    );
+    assert.equal(provenZeroResult?.ok, true);
+    assert.notEqual(provenZeroResult?.filtered, true);
+    const provenZeroRecord = await getRecord(provenZeroScenario.recordId);
+    assert.equal(provenZeroRecord?.payload?.detailCaptureStatus, "done");
+    assert.equal(
+      provenZeroRecord?.payload?.detailPayload?.bloggerFollowersCount,
+      0,
+    );
+    assert.equal(
+      provenZeroRecord?.payload?.detailPayload?.bloggerFollowersCountKnown,
+      true,
+    );
+
+    const aboveThresholdScenario = lowFollowerScenarios[2];
+    const aboveThresholdResult = lowFollowerResult.results.find(
+      (item) => item.recordId === aboveThresholdScenario.recordId,
+    );
+    assert.equal(aboveThresholdResult?.ok, true);
+    assert.equal(aboveThresholdResult?.filtered, true);
+    assert.equal(aboveThresholdResult?.reason, "low_follower_filtered");
+    assert.equal(
+      await getRecord(aboveThresholdScenario.recordId),
+      null,
+      "a proven above-threshold follower count keeps the existing delete/filter behavior",
+    );
+
+    workerCurrentUrl = workerTab.url;
+    verifiedDetailNoteIds.clear();
+    const canceledLowFollowerResult =
+      await captureSync.batchCaptureDetailsForRecords(
+        [lowFollowerCanceledScenario.recordId],
+        {
+          skipAlreadyCaptured: false,
+          includeComments: false,
+          includeBloggerMetrics: false,
+          enableLowFollowerHitFilter: true,
+          lowFollowerHitThreshold: 8000,
+          captureTaskId: activeTask.taskId,
+          detailNavTimeoutMs: 5000,
+          detailAfterNavWaitMs: 1,
+        },
+      );
+    assert.equal(canceledLowFollowerResult.canceled, true);
+    assert.equal(canceledLowFollowerResult.successCount, 0);
+    assert.equal(canceledLowFollowerResult.failedCount, 0);
+    assert.equal(canceledLowFollowerResult.processedCount, 1);
+    const canceledItem = canceledLowFollowerResult.results[0];
+    assert.equal(canceledItem.ok, false);
+    assert.equal(canceledItem.reason, "CANCELED");
+    assert.equal(canceledItem.canceled, true);
+    const canceledRecord = await getRecord(
+      lowFollowerCanceledScenario.recordId,
+    );
+    assert.equal(canceledRecord?.payload?.detailCaptureStatus, "failed");
+    assert.equal(
+      canceledRecord?.payload?.detailCaptureFailureCode,
+      "CANCELED",
+    );
+    assert.equal(
+      canceledRecord?.payload?.detailPayload?.noteId,
+      lowFollowerCanceledScenario.noteId,
+      "mandatory low-follower metrics cancellation retains the core snapshot without committing done",
+    );
   } finally {
     await captureSync.endCaptureTaskSession({
       taskId: activeTask.taskId,
@@ -1712,7 +1970,7 @@ test("Douyin security errors stop at the direct route without trying a fallback 
   });
 });
 
-test("Douyin dedicated worker loss stops the batch for an outer fresh-worker retry", async () => {
+test("Douyin worker loss rebuilds once and retries the same expected work under the same task fence", async () => {
   const sourceTab = {
     id: 81,
     windowId: 9,
@@ -1721,27 +1979,25 @@ test("Douyin dedicated worker loss stops the batch for an outer fresh-worker ret
     status: "complete",
     url: "https://www.douyin.com/jingxuan/search/rebind?type=general",
   };
-  const workerTab = {
-    id: 493,
+  const workers = [493, 494].map((id, index) => ({
+    id,
     windowId: 9,
-    index: 3,
+    index: 3 + index,
     active: false,
     status: "complete",
     url: "about:blank",
-  };
-  const replacementTab = {
-    ...workerTab,
-    id: 494,
-  };
-  const noteIds = ["766193585000000181", "766193585000000182"];
+  }));
+  const noteId = "766193585000000181";
+  const directUrl = `https://www.douyin.com/video/${noteId}`;
   const registrations = [];
   const navigationTabs = [];
-  let replacementListener = null;
-  let replacementListenerRemoved = false;
-  let replacementTriggered = false;
-  let secondNavigationStarted = false;
-  let createCount = 0;
   const removedTabIds = [];
+  const captureCalls = [];
+  const progress = [];
+  const liveWorkerIds = new Set();
+  const currentUrls = new Map();
+  let firstWorkerLost = false;
+  let createCount = 0;
 
   globalThis.chrome = {
     storage: {local: createMemoryStorageArea()},
@@ -1754,6 +2010,39 @@ test("Douyin dedicated worker loss stops the batch for an outer fresh-worker ret
           registrations.push(structuredClone(message));
           return {ok: true, data: {taskId: message.taskId}};
         }
+        if (
+          message?.type === "onstarvoice:relay-to-content" &&
+          message?.payload?.action === "captureSingleNote"
+        ) {
+          captureCalls.push({
+            tabId: message.tabId,
+            expectedNoteId: String(message.payload.expectedNoteId || ""),
+            includeBloggerMetrics: message.payload.includeBloggerMetrics,
+          });
+          assert.equal(message.tabId, workers[1].id);
+          assert.equal(message.payload.expectedNoteId, noteId);
+          assert.equal(message.payload.includeBloggerMetrics, false);
+          return {
+            ok: true,
+            data: {
+              ok: true,
+              platform: "douyin",
+              type: "single_note",
+              data: {
+                noteId,
+                noteUrl: directUrl,
+                title: "Recovered Douyin detail",
+                content: "The replacement worker retried the same item.",
+                author: "Recovery author",
+                comments: 0,
+                commentsCountKnown: true,
+                commentsCountSource: "api_statistics",
+              },
+              meta: {pageType: "note_detail"},
+              error: null,
+            },
+          };
+        }
         return {ok: true, data: null};
       },
       getURL(path) {
@@ -1761,21 +2050,21 @@ test("Douyin dedicated worker loss stops the batch for an outer fresh-worker ret
       },
     },
     tabs: {
-      onReplaced: {
-        addListener(listener) {
-          replacementListener = listener;
-        },
-        removeListener(listener) {
-          assert.equal(listener, replacementListener);
-          replacementListenerRemoved = true;
-        },
-      },
       async query() {
         return [sourceTab];
       },
       async create(properties) {
+        const worker = workers[createCount];
         createCount += 1;
-        return {...workerTab, ...properties, id: workerTab.id};
+        assert.ok(worker, "worker recreation exceeded the bounded fixture");
+        liveWorkerIds.add(worker.id);
+        currentUrls.set(worker.id, String(properties?.url || worker.url));
+        return {
+          ...worker,
+          ...properties,
+          id: worker.id,
+          url: currentUrls.get(worker.id),
+        };
       },
       async update(tabId, patch) {
         const targetUrl = String(patch?.url || "");
@@ -1783,46 +2072,77 @@ test("Douyin dedicated worker loss stops the batch for an outer fresh-worker ret
           navigationTabs.push({tabId, url: targetUrl});
         }
         if (
-          tabId === workerTab.id &&
+          tabId === workers[0].id &&
           targetUrl &&
-          targetUrl !== workerTab.url &&
-          !replacementTriggered
+          targetUrl !== workers[0].url &&
+          !firstWorkerLost
         ) {
-          replacementTriggered = true;
-          replacementListener?.(replacementTab.id, workerTab.id);
-          throw new Error(`No tab with id: ${workerTab.id}`);
+          firstWorkerLost = true;
+          liveWorkerIds.delete(tabId);
+          throw new Error(`No tab with id: ${tabId}`);
         }
-        if (
-          tabId === replacementTab.id &&
-          targetUrl.includes(noteIds[1])
-        ) {
-          secondNavigationStarted = true;
+        if (liveWorkerIds.has(tabId) && targetUrl) {
+          currentUrls.set(tabId, targetUrl);
         }
-        return tabId === sourceTab.id
-          ? {...sourceTab, ...patch}
-          : tabId === replacementTab.id
-            ? {...replacementTab, ...patch}
-            : {...workerTab, ...patch};
+        if (tabId === sourceTab.id) return {...sourceTab, ...patch};
+        const worker = workers.find((candidate) => candidate.id === tabId);
+        if (!worker || !liveWorkerIds.has(tabId)) {
+          throw new Error(`No tab with id: ${tabId}`);
+        }
+        return {
+          ...worker,
+          ...patch,
+          url: currentUrls.get(tabId) || worker.url,
+          status: "complete",
+        };
       },
       async get(tabId) {
-        if (tabId === sourceTab.id) {
-          return {...sourceTab};
+        if (tabId === sourceTab.id) return {...sourceTab};
+        const worker = workers.find((candidate) => candidate.id === tabId);
+        if (!worker || !liveWorkerIds.has(tabId)) {
+          throw new Error(`No tab with id: ${tabId}`);
         }
-        if (tabId === replacementTab.id && replacementTriggered) {
-          return {...replacementTab};
-        }
-        if (tabId === workerTab.id && !replacementTriggered) {
-          return {...workerTab};
-        }
-        throw new Error(`No tab with id: ${tabId}`);
+        return {
+          ...worker,
+          url: currentUrls.get(tabId) || worker.url,
+          status: "complete",
+        };
       },
       async remove(tabId) {
         removedTabIds.push(tabId);
+        liveWorkerIds.delete(tabId);
       },
     },
     scripting: {
-      async executeScript() {
-        return [{result: 0}];
+      async executeScript({target, args}) {
+        if (target?.tabId === sourceTab.id) {
+          return [{result: 0}];
+        }
+        assert.equal(target?.tabId, workers[1].id);
+        assert.equal(String(args?.[0] || ""), noteId);
+        return [{
+          result: {
+            currentUrl: currentUrls.get(workers[1].id) || directUrl,
+            title: "Douyin direct detail",
+            isDouyin: true,
+            currentNoteId: noteId,
+            targetMatched: true,
+            activeWorkIds: [],
+            conflictingActiveWorkIds: [],
+            activeWorkIdentityConflict: false,
+            detailReady: false,
+            apiDetailReady: false,
+            requireVisibleDetailRoot: Boolean(args?.[1]),
+            hasBoundDetailRoot: false,
+            usedModalIdentityFallback: false,
+            isSearchModalContext: false,
+            blocked: false,
+            unavailable: false,
+            immediateUnavailable: false,
+            code: "",
+            message: "",
+          },
+        }];
       },
     },
     windows: {async update() { return {}; }},
@@ -1833,23 +2153,17 @@ test("Douyin dedicated worker loss stops the batch for an outer fresh-worker ret
     import("../../utils/capture-sync.js"),
     import("../../utils/task-context.js"),
   ]);
-  const recordIds = ["douyin-rebind-r1", "douyin-rebind-r2"];
-  for (const [index, recordId] of recordIds.entries()) {
-    await addRecord({
-      id: recordId,
-      type: "keyword_notes",
-      platform: "douyin",
-      meta: {sourceUrl: sourceTab.url},
-      payload: {
-        searchUrl: sourceTab.url,
-        items: [{
-          noteId: noteIds[index],
-          noteType: "video",
-          url: `https://www.douyin.com/video/${noteIds[index]}`,
-        }],
-      },
-    });
-  }
+  const recordId = "douyin-rebind-r1";
+  await addRecord({
+    id: recordId,
+    type: "keyword_notes",
+    platform: "douyin",
+    meta: {sourceUrl: sourceTab.url},
+    payload: {
+      searchUrl: sourceTab.url,
+      items: [{noteId, noteType: "video", url: directUrl}],
+    },
+  });
 
   const activeTask = taskContext.beginTaskContext({
     taskType: "capture",
@@ -1862,41 +2176,48 @@ test("Douyin dedicated worker loss stops the batch for an outer fresh-worker ret
     platform: "douyin",
   });
 
-  const result = await captureSync.batchCaptureDetailsForRecords(recordIds, {
+  const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
     skipAlreadyCaptured: false,
     captureTaskId: activeTask.taskId,
-    shouldStop: () => secondNavigationStarted,
+    detailNavTimeoutMs: 5000,
+    detailAfterNavWaitMs: 1,
+    onProgress(entry) {
+      progress.push(structuredClone(entry));
+    },
   });
 
-  assert.equal(createCount, 1);
-  assert.equal(replacementTriggered, true);
-  assert.equal(replacementListener, null);
-  assert.equal(replacementListenerRemoved, false);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.successCount, 1);
+  assert.equal(result.failedCount, 0);
+  assert.equal(result.runnerInterrupted, false);
+  assert.equal(result.runnerRecoveryCount, 1);
+  assert.equal(createCount, 2);
+  assert.equal(firstWorkerLost, true);
   assert.deepEqual(
     registrations.map((item) => item.tabId),
-    [workerTab.id],
+    workers.map((worker) => worker.id),
   );
-  assert.equal(
-    registrations.some((item) => item.tabId === sourceTab.id),
-    false,
+  assert.deepEqual(
+    registrations.map((item) => item.taskId),
+    [activeTask.taskId, activeTask.taskId],
+    "the replacement worker must remain under the original task attempt fence",
   );
-  assert.equal(
-    navigationTabs.some(
-      (item) => item.tabId === workerTab.id && item.url.includes(noteIds[0]),
-    ),
-    true,
+  assert.deepEqual(
+    navigationTabs.map((item) => item.url),
+    [directUrl, directUrl],
+    "the rebuilt worker must retry the interrupted item before advancing",
   );
-  assert.equal(
-    navigationTabs.some(
-      (item) => item.tabId === replacementTab.id && item.url.includes(noteIds[1]),
-    ),
-    false,
+  assert.deepEqual(captureCalls, [{
+    tabId: workers[1].id,
+    expectedNoteId: noteId,
+    includeBloggerMetrics: false,
+  }]);
+  const recoveryProgress = progress.find(
+    (entry) => entry?.phase === "detail_runner_recreated",
   );
-  assert.equal(result.processedCount, 1);
-  assert.equal(result.runnerInterrupted, true);
-  assert.equal(result.results[0]?.reason, "CONTEXT_INTERRUPTED");
-  assert.equal(result.results[0]?.runnerInterrupted, true);
-  assert.deepEqual(removedTabIds, [workerTab.id]);
+  assert.equal(recoveryProgress?.recordId, recordId);
+  assert.equal(recoveryProgress?.expectedNoteId, noteId);
+  assert.deepEqual(removedTabIds, workers.map((worker) => worker.id));
 
   await captureSync.endCaptureTaskSession({
     taskId: activeTask.taskId,

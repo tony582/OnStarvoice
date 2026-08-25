@@ -42,6 +42,19 @@ function loadAgentWithRuntimeConfig(runtimeConfig) {
   return configuredContext.OnStarvoiceCloudTaskAgent;
 }
 
+function loadAgentWithEnvironment(environment = {}) {
+  const configuredContext = vm.createContext({
+    AbortController,
+    Date,
+    URL,
+    clearTimeout,
+    setTimeout,
+    ...environment,
+  });
+  vm.runInContext(source, configuredContext, {filename: "utils/cloud-task-agent.js"});
+  return configuredContext.OnStarvoiceCloudTaskAgent;
+}
+
 test("heartbeat mirrors the newest local tasks and marks the active control request", () => {
   const payload = agent.buildHeartbeatPayload({
     runtime: {
@@ -81,6 +94,432 @@ test("heartbeat mirrors the newest local tasks and marks the active control requ
   );
   assert.equal(payload.tasks[0].controlTaskId, "task-new");
   assert.deepEqual(plain(payload.tasks[0].progress), {current: 2, total: 10});
+});
+
+test("every task carries bounded structured health evidence without page copy or URLs", () => {
+  const progressAt = new Date(Date.now() - 1500).toISOString();
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "browser-health-a",
+      appVersion: "0.3.93",
+      platform: "douyin",
+      pageType: "search_results",
+      detailReady: false,
+      detailReadyReason: "dom_not_ready",
+      lastUpdatedAt: Date.now() - 500,
+      lastCaptureProgressAt: Date.now() - 1200,
+      lastPageUrl: "https://www.douyin.com/search/private?cookie=secret",
+      healthEvidence: {
+        page: {
+          status: "complete",
+          discarded: false,
+          frozen: true,
+          fullUrl: "https://www.douyin.com/private/post/123",
+          body: "private-post-body",
+        },
+        network: {
+          status: "degraded",
+          apiRttMs: 999999999,
+          timeoutCount: 999999999,
+          cookie: "private-cookie",
+        },
+        runtime: {
+          eventLoopLagMs: 999999999,
+          heapUsedMb: 999999999,
+          heapLimitMb: 999999999,
+          serviceWorkerRestartCount: 999999999,
+          text: "private-post-text",
+        },
+      },
+    },
+    ledger: {
+      runs: [{
+        id: "health-task-1",
+        taskType: "unattended_keyword_capture",
+        platform: "douyin",
+        status: "running",
+        attemptId: "attempt-health-1",
+        progressSeq: 7,
+        businessProgressAt: progressAt,
+        progress: {
+          current: 4,
+          total: 12,
+          phase: "detail_capture",
+        },
+        stage: "comments",
+      }],
+    },
+    unattendedRequest: {
+      id: "health-task-1",
+      attemptId: "attempt-health-1",
+    },
+  });
+
+  const task = payload.tasks[0];
+  assert.equal(payload.agent.capabilities.structuredTaskHealthV1, true);
+  assert.equal(payload.agent.capabilities.dutyRecoveryLineageV1, true);
+  assert.equal(task.appVersion, "0.3.93");
+  assert.equal(task.attemptId, "attempt-health-1");
+  assert.equal(task.stage, "comments");
+  assert.equal(task.phase, "detail_capture");
+  assert.equal(task.progressObserved.observed, true);
+  assert.equal(task.progressObserved.sequence, 7);
+  assert.equal(task.progressObserved.current, 4);
+  assert.equal(task.progressObserved.total, 12);
+  assert.equal(task.healthEvidence.page.platformMatchesTask, true);
+  assert.equal(task.healthEvidence.page.tabStatus, "complete");
+  assert.equal(task.healthEvidence.page.discarded, false);
+  assert.equal(task.healthEvidence.page.frozen, true);
+  assert.equal(task.healthEvidence.network.lastRequestLatencyMs, 120000);
+  assert.equal(task.healthEvidence.network.timeoutCount, 1000000);
+  assert.equal(task.healthEvidence.runtime.eventLoopLagMs, 120000);
+  assert.equal(task.healthEvidence.runtime.heapUsedMb, 1024 * 1024);
+  assert.equal(
+    task.healthEvidence.runtime.serviceWorkerRestartCount,
+    1000000,
+  );
+
+  const serializedHealth = JSON.stringify(task.healthEvidence);
+  for (const forbidden of [
+    "https://",
+    "private-post-body",
+    "private-post-text",
+    "private-cookie",
+    "cookie=secret",
+  ]) {
+    assert.equal(serializedHealth.includes(forbidden), false);
+  }
+  assert.ok(serializedHealth.length < 1800);
+});
+
+test("a completed cloud request becomes bounded network evidence on the next task heartbeat", async () => {
+  const response = await agent.requestJson({
+    token: "agent-network-health",
+    endpoint: "/api/capture-cloud/agent/heartbeat",
+    body: {tasks: []},
+    baseUrls: ["https://voice.example.com"],
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ok: true, commands: []}),
+    }),
+  });
+  assert.equal(response.ok, true);
+
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "browser-network-health",
+      appVersion: "0.3.93",
+      platform: "douyin",
+      pageType: "search_results",
+    },
+    ledger: {runs: [{
+      id: "network-health-task",
+      attemptId: "network-health-attempt",
+      status: "running",
+    }]},
+    unattendedRequest: {
+      id: "network-health-task",
+      attemptId: "network-health-attempt",
+    },
+  });
+  const network = payload.tasks[0].healthEvidence.network;
+  assert.equal(network.available, true);
+  assert.equal(network.status, "success");
+  assert.equal(network.endpointClass, "heartbeat");
+  assert.ok(network.lastRequestLatencyMs >= 0);
+  assert.ok(network.lastRequestLatencyMs <= 120000);
+  assert.match(network.lastRequestAt, /^\d{4}-\d{2}-\d{2}T/u);
+});
+
+test("task health rejects URL, JWT, high-entropy and credential-shaped codes before transmission", () => {
+  const isolatedAgent = loadAgentWithEnvironment();
+  const payload = isolatedAgent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "browser-bad-version",
+      appVersion: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.signature123",
+      pageType: "private/path",
+      detailReadyReason: "0123456789abcdef0123456789abcdef01234567",
+      healthEvidence: {
+        network: {status: "secret_prod_ABC123"},
+      },
+    },
+    ledger: {
+      runs: [{
+        id: "bad-version-task",
+        attemptId: "bad-version-attempt",
+        status: "running",
+        stage: "apiKeyProdABC123",
+        progress: {phase: "aB3dE5fG7hJ9kL1mN3pR5tV7xZ9cD2fH"},
+      }],
+    },
+    unattendedRequest: {
+      id: "bad-version-task",
+      attemptId: "bad-version-attempt",
+    },
+  });
+
+  assert.equal(payload.agent.appVersion, "");
+  assert.equal(payload.tasks[0].appVersion, "");
+  assert.equal(payload.tasks[0].stage, "unknown");
+  assert.equal(payload.tasks[0].phase, "unknown");
+  assert.equal(payload.tasks[0].healthEvidence.page.pageType, "unknown");
+  assert.equal(payload.tasks[0].healthEvidence.page.detailReadyReason, "");
+  assert.equal(
+    payload.tasks[0].healthEvidence.network.status,
+    "unavailable",
+  );
+  const serializedHealthChannel = JSON.stringify({
+    agentVersion: payload.agent.appVersion,
+    taskVersion: payload.tasks[0].appVersion,
+    stage: payload.tasks[0].stage,
+    phase: payload.tasks[0].phase,
+    healthEvidence: payload.tasks[0].healthEvidence,
+  });
+  assert.doesNotMatch(
+    serializedHealthChannel,
+    /eyJhbGci|private\/path|secret_prod|apiKeyProd|aB3dE5fG|0123456789abcdef/iu,
+  );
+});
+
+test("historical terminal attempts never inherit a newer runtime version or live health", async () => {
+  let tabReads = 0;
+  const isolatedAgent = loadAgentWithEnvironment({
+    chrome: {
+      tabs: {
+        get: async () => {
+          tabReads += 1;
+          return {status: "complete", discarded: false, frozen: false};
+        },
+      },
+    },
+  });
+  const payload = isolatedAgent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "browser-upgraded-after-terminal",
+      appVersion: "0.3.93",
+      platform: "douyin",
+      pageType: "search_results",
+      lastActiveTabId: 99,
+      healthEvidence: {
+        network: {status: "success", apiRttMs: 12},
+        runtime: {eventLoopLagMs: 3, heapUsedMb: 64},
+      },
+    },
+    ledger: {
+      runs: [{
+        id: "old-terminal-attempt",
+        attemptId: "old-attempt-1",
+        attemptNumber: 1,
+        status: "completed",
+        platform: "douyin",
+        runnerTabId: 99,
+        appVersion: "0.3.92",
+        healthEvidence: {
+          page: {platform: "douyin", pageType: "note_detail", tabStatus: "complete"},
+          network: {status: "degraded", lastRequestLatencyMs: 88},
+          runtime: {eventLoopLagMs: 9, heapUsedMb: 48},
+        },
+      }],
+    },
+  });
+
+  assert.equal(payload.tasks[0].appVersion, "0.3.92");
+  assert.equal(payload.tasks[0].healthEvidence.page.pageType, "note_detail");
+  assert.equal(payload.tasks[0].healthEvidence.network.status, "degraded");
+  assert.equal(payload.tasks[0].healthEvidence.network.lastRequestLatencyMs, 88);
+  assert.equal(payload.tasks[0].healthEvidence.runtime.eventLoopLagMs, 9);
+
+  let transmitted;
+  await isolatedAgent.sendHeartbeat({
+    token: "history-health-token",
+    body: payload,
+    baseUrls: ["https://voice.example.com"],
+    fetchImpl: async (_url, options) => {
+      transmitted = JSON.parse(options.body);
+      return {ok: true, status: 200, json: async () => ({ok: true})};
+    },
+  });
+  assert.equal(tabReads, 0, "terminal attempts must not probe the current tab");
+  assert.equal(transmitted.tasks[0].appVersion, "0.3.92");
+  assert.equal(transmitted.tasks[0].healthEvidence.network.status, "degraded");
+  assert.equal(
+    Object.hasOwn(transmitted.tasks[0].healthEvidence.runtime, "cpuAvailable"),
+    false,
+  );
+});
+
+test("only the exact current attempt receives live health when two ledger attempts still say running", async () => {
+  const isolatedAgent = loadAgentWithEnvironment({
+    chrome: {
+      tabs: {
+        get: async () => ({status: "complete", discarded: false, frozen: false}),
+      },
+    },
+  });
+  const payload = isolatedAgent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "browser-attempt-fence",
+      appVersion: "0.3.93",
+      platform: "douyin",
+      pageType: "search_results",
+      lastActiveTabId: 77,
+      healthEvidence: {runtime: {eventLoopLagMs: 4}},
+    },
+    unattendedRequest: {
+      id: "same-business-task",
+      attemptId: "attempt-current",
+    },
+    ledger: {
+      runs: [
+        {
+          id: "same-business-task",
+          attemptId: "attempt-current",
+          attemptNumber: 2,
+          status: "running",
+          updatedAt: "2026-08-25T02:00:00.000Z",
+        },
+        {
+          id: "same-business-task",
+          attemptId: "attempt-stale",
+          attemptNumber: 1,
+          status: "running",
+          appVersion: "0.3.92",
+          updatedAt: "2026-08-25T01:00:00.000Z",
+        },
+      ],
+    },
+  });
+  const current = payload.tasks.find(task => task.attemptId === "attempt-current");
+  const stale = payload.tasks.find(task => task.attemptId === "attempt-stale");
+  assert.equal(current.appVersion, "0.3.93");
+  assert.equal(current.healthEvidence.page.pageType, "search_results");
+  assert.equal(stale.appVersion, "0.3.92");
+  assert.equal(stale.healthEvidence.page.pageType, "unknown");
+
+  let transmitted;
+  await isolatedAgent.sendHeartbeat({
+    token: "attempt-fence-token",
+    body: payload,
+    baseUrls: ["https://voice.example.com"],
+    fetchImpl: async (_url, options) => {
+      transmitted = JSON.parse(options.body);
+      return {ok: true, status: 200, json: async () => ({ok: true})};
+    },
+  });
+  const transmittedStale = transmitted.tasks.find(
+    task => task.attemptId === "attempt-stale",
+  );
+  assert.equal(
+    Object.hasOwn(transmittedStale.healthEvidence.runtime, "cpuAvailable"),
+    false,
+  );
+});
+
+test("sendHeartbeat samples runtime and tab lifecycle into every transmitted task with a short cache", async () => {
+  let performanceNowCalls = 0;
+  const tabCalls = [];
+  const sampledAgent = loadAgentWithEnvironment({
+    performance: {
+      now: () => {
+        performanceNowCalls += 1;
+        return performanceNowCalls * 10;
+      },
+      memory: {
+        usedJSHeapSize: 64 * 1024 * 1024,
+        totalJSHeapSize: 96 * 1024 * 1024,
+        jsHeapSizeLimit: 256 * 1024 * 1024,
+      },
+    },
+    chrome: {
+      tabs: {
+        get: async (tabId) => {
+          tabCalls.push(tabId);
+          return {
+            id: tabId,
+            status: tabId === 42 ? "complete" : "loading",
+            discarded: tabId !== 42,
+            frozen: tabId === 42,
+            url: `https://www.douyin.com/private/${tabId}?cookie=secret`,
+            title: "private-post-title",
+          };
+        },
+      },
+    },
+  });
+  const payload = sampledAgent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "browser-runtime-sampled",
+      appVersion: "0.3.93",
+      platform: "douyin",
+      pageType: "search_results",
+      lastActiveTabId: 99,
+    },
+    ledger: {
+      runs: [
+        {
+          id: "sampled-task-a",
+          attemptId: "sampled-attempt-a",
+          status: "running",
+          runnerTabId: 42,
+        },
+        {id: "sampled-task-b", status: "completed"},
+      ],
+    },
+    unattendedRequest: {
+      id: "sampled-task-a",
+      attemptId: "sampled-attempt-a",
+    },
+  });
+  const transmittedBodies = [];
+  const send = async () =>
+    await sampledAgent.sendHeartbeat({
+      token: "agent-runtime-sampled",
+      body: payload,
+      baseUrls: ["https://voice.example.com"],
+      fetchImpl: async (_url, options) => {
+        transmittedBodies.push(JSON.parse(options.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ok: true, commands: []}),
+        };
+      },
+    });
+
+  assert.equal((await send()).ok, true);
+  assert.equal((await send()).ok, true);
+  assert.equal(performanceNowCalls, 4, "second send should reuse the 10s sample");
+  assert.deepEqual(tabCalls, [42, 42]);
+
+  const transmitted = transmittedBodies[0];
+  assert.equal(transmitted.tasks.length, 2);
+  for (const task of transmitted.tasks.slice(0, 1)) {
+    assert.equal(task.healthEvidence.runtime.cpuAvailable, false);
+    assert.equal(task.healthEvidence.runtime.eventLoopAvailable, true);
+    assert.equal(task.healthEvidence.runtime.eventLoopSampleCount, 2);
+    assert.equal(task.healthEvidence.runtime.eventLoopLagMs, 2);
+    assert.equal(task.healthEvidence.runtime.heapAvailable, true);
+    assert.equal(task.healthEvidence.runtime.heapUsedMb, 64);
+    assert.equal(task.healthEvidence.runtime.heapTotalMb, 96);
+    assert.equal(task.healthEvidence.runtime.heapLimitMb, 256);
+    assert.match(task.healthEvidence.sampledAt, /^\d{4}-\d{2}-\d{2}T/u);
+  }
+  assert.equal(transmitted.tasks[0].healthEvidence.page.tabStatus, "complete");
+  assert.equal(transmitted.tasks[0].healthEvidence.page.discarded, false);
+  assert.equal(transmitted.tasks[0].healthEvidence.page.frozen, true);
+  assert.equal(transmitted.tasks[1].healthEvidence.page.tabStatus, "unavailable");
+  assert.equal(transmitted.tasks[1].healthEvidence.page.discarded, null);
+  assert.equal(transmitted.tasks[1].healthEvidence.page.frozen, null);
+  assert.equal(
+    Object.hasOwn(transmitted.tasks[1].healthEvidence.runtime, "cpuAvailable"),
+    false,
+  );
+
+  const serialized = JSON.stringify(transmitted);
+  assert.equal(serialized.includes("https://"), false);
+  assert.equal(serialized.includes("private-post-title"), false);
+  assert.equal(serialized.includes("cookie=secret"), false);
 });
 
 test("heartbeat body does not include the cloud credential", () => {
